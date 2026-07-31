@@ -20,6 +20,8 @@ export import :import_cache;
 export import :headless;
 export import :renderer;
 export import :vk_renderer;
+export import :cpu_renderer;
+export import :gl_renderer;
 export import :glyph_atlas;
 
 export namespace lx::gfx {
@@ -38,6 +40,10 @@ struct device_info {
     /// VK_EXT_queue_family_foreign — lets imported client buffers be acquired from the
     /// foreign queue family instead of an unsynchronised layout transition.
     bool supports_queue_family_foreign = false;
+    /// `VK_PHYSICAL_DEVICE_TYPE_CPU` — the "GPU" is a software rasterizer (llvmpipe,
+    /// SwiftShader). Vulkan still works, but every composite is CPU work reached through
+    /// an upload and a tiling pass, so the present path should prefer `cpu_compositor`.
+    bool is_software_rasterizer = false;
 };
 
 class device {
@@ -76,6 +82,9 @@ private:
     VkQueue queue_ = VK_NULL_HANDLE;
     VkCommandPool command_pool_ = VK_NULL_HANDLE;
 #endif
+    /// Owned copy of `VkPhysicalDeviceProperties::deviceName`. `info_.device_name` points
+    /// here, so both move operations must re-point it at the destination's own buffer.
+    char device_name_[256]{};
     unsigned queue_family_ = 0;
     device_info info_{};
     dmabuf_importer dmabuf_{nullptr, nullptr};
@@ -150,11 +159,15 @@ lx::gfx::device::device(device&& other) noexcept
     other.queue_ = VK_NULL_HANDLE;
     other.command_pool_ = VK_NULL_HANDLE;
 #endif
+    std::memcpy(device_name_, other.device_name_, sizeof(device_name_));
+    if (info_.device_name == other.device_name_)
+        info_.device_name = device_name_;
     other.dmabuf_ = dmabuf_importer{nullptr, nullptr};
     other.exporter_ = dmabuf_exporter{nullptr, nullptr};
     other.syncobj_ = syncobj_bridge{nullptr, -1};
     other.queue_family_ = 0;
     other.info_ = {};
+    other.device_name_[0] = '\0';
 }
 
 lx::gfx::device& lx::gfx::device::operator=(device&& other) noexcept {
@@ -178,11 +191,15 @@ lx::gfx::device& lx::gfx::device::operator=(device&& other) noexcept {
     dmabuf_ = other.dmabuf_;
     exporter_ = other.exporter_;
     syncobj_ = other.syncobj_;
+    std::memcpy(device_name_, other.device_name_, sizeof(device_name_));
+    if (info_.device_name == other.device_name_)
+        info_.device_name = device_name_;
     other.dmabuf_ = dmabuf_importer{nullptr, nullptr};
     other.exporter_ = dmabuf_exporter{nullptr, nullptr};
     other.syncobj_ = syncobj_bridge{nullptr, -1};
     other.queue_family_ = 0;
     other.info_ = {};
+    other.device_name_[0] = '\0';
     return *this;
 }
 
@@ -358,6 +375,23 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         d.info_.supports_drm_format_modifier = has_modifier;
         d.info_.supports_queue_family_foreign = has_foreign;
         d.info_.supports_timeline_semaphore = has_timeline && has_ext_sem_fd;
+
+        {
+            VkPhysicalDeviceProperties props{};
+            vkGetPhysicalDeviceProperties(phys, &props);
+            d.info_.is_software_rasterizer = props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+            // Reporting "vulkan" for every device hides the difference that matters most
+            // here — a real GPU versus llvmpipe. `props` is a stack copy, so the name has
+            // to be owned rather than pointed at.
+            static_assert(sizeof(d.device_name_) >= sizeof(props.deviceName));
+            std::memcpy(d.device_name_, props.deviceName, sizeof(props.deviceName));
+            d.device_name_[sizeof(d.device_name_) - 1] = '\0';
+            if (d.device_name_[0] != '\0')
+                d.info_.device_name = d.device_name_;
+            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
+                d.info_.tier = gpu_tier::discrete;
+        }
+
         if (!d.info_.device_name || d.info_.device_name[0] == '\0')
             d.info_.device_name = "vulkan";
         d.dmabuf_ = dmabuf_importer{static_cast<void*>(vkdev), static_cast<void*>(phys),

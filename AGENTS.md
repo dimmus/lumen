@@ -15,14 +15,51 @@ Lumen is a **greenfield Linux desktop stack** — not a port of EFL/Qt/GTK.
 |----------|--------|--------|
 | Language | **C++26**, **Clang** | Use C++20/23 downgrade without reason; MSVC-first patterns |
 | Display | **Wayland-only** | Add X11, XWayland-first paths, or Win32 display code in core modules |
-| Rendering | **Vulkan-first** | Introduce OpenGL as primary; Skia-without-Vulkan as compositor backend |
+| Rendering | **Vulkan-first, multi-backend** — see §1.1 | Add a backend outside `lx.gfx`; make GL or CPU the default on hardware with a working Vulkan driver; Skia-without-Vulkan as compositor backend |
 | Processes | **Multi-process** | Merge compositor + shell into one binary |
 | WM model | **Stacking-first**, optional tiling **plugin** | Make tiling the default or hard-code only tiling |
 | Threading | **UI / render / worker** affinities + immutable snapshots | Share mutable scene graph across threads |
-| Buffers | **dmabuf → Vulkan import**, explicit sync | SHM-only compositor path in production code |
+| Buffers | **dmabuf → GPU import**, explicit sync | SHM-only compositor path in production code |
 | Security | **Unix session UID** default; Flatpak optional | Expose `zlm_shell_v1` to all clients |
 
 **API contract version:** `lx::version` = **0.3.0** (see `lx.foundation`).
+
+### 1.1 Rendering backends
+
+"Vulkan-first" is about **defaults and design centre**, not exclusivity. Vulkan is the
+backend the architecture is shaped around and the one to reach for on hardware that has a
+Vulkan driver. It is not the only one, because a compositor that only runs on Vulkan
+hardware does not run on a large amount of real hardware.
+
+Three composite backends exist, all in `lx.gfx`, all peers behind
+`compositor::config::present`:
+
+| Backend | Module | Use |
+|---------|--------|-----|
+| `vulkan` | `lx.gfx:vk_renderer` | Default wherever a hardware Vulkan driver exists |
+| `gl` | `lx.gfx:gl_renderer` | EGL + GLES on GBM. The accelerated path on drivers Mesa ships no Vulkan driver for — vmwgfx/SVGA3D, older radeon/nouveau, many SoCs |
+| `cpu` | `lx.gfx:cpu_renderer` | When the only "GPU" is a software rasterizer, where a graphics API costs an upload and a driver stack to run the same instructions |
+
+`present_backend::automatic` picks hardware Vulkan → hardware GL → CPU, and each backend
+refuses itself when it would be a downgrade (the GL path declines a software `GL_RENDERER`).
+
+**Rules for backends:**
+
+- A backend lives entirely in `lx.gfx` as a module partition. `lx.compositor` selects one
+  and calls it; no GL, EGL, GBM or Vulkan type appears above `lx.gfx`.
+- Partition interfaces keep API types out — Vulkan, EGL and GBM handles cross the boundary
+  as `void*`, exactly as `vk_renderer` already does.
+- Every backend guards its platform code behind its `LUMEN_HAS_*` macro and returns
+  `not_implemented` when built without it. The build must succeed with any subset present.
+- **Do not add a fourth backend** without measurement showing the existing three lose on
+  hardware that matters. Each one is a full composite path to keep correct.
+- Client buffer handling stays dmabuf-first in every backend. SHM upload is the fallback
+  path, not the design target.
+
+Measurements behind this split live in
+[docs/subsystems/rendering-performance.md](docs/subsystems/rendering-performance.md) §1.2.
+Re-measure before changing a default; the right backend is host-dependent and the numbers
+are not intuitive.
 
 **Target platform for implementation:** Linux (KMS, libinput, logind). Windows stubs in
 `unique_fd` exist for dev only — do not build platform logic around them.
@@ -64,7 +101,7 @@ Foundation → Runtime → Platform → Graphics → Compositor → Desktop → 
 | Geometry, errors, handles | `lx.foundation` |
 | Event loop, executor, affinities | `lx.runtime` |
 | Wayland wire, DRM, libinput, session | `lx.wayland.*`, `lx.drm`, `lx.input`, `lx.session` |
-| Vulkan, dmabuf, text, layout | `lx.gfx`, `lx.text`, `lx.layout` |
+| Vulkan / GL / CPU composite, dmabuf, text, layout | `lx.gfx`, `lx.text`, `lx.layout` |
 | Scene graph, snapshots | `lx.scene` |
 | Display server integration | `lx.compositor`, `lx.compositor.*` |
 | WM policy, shell UI | `lx.shell.policy`, `lx.shell`, `lx.shell.bridge` |
@@ -115,7 +152,7 @@ snapshot/executor handoff patterns.
 **Never** return `{}` success from platform/integration `result<T>` stubs.
 
 When replacing a stub, remove `not_implemented` and use proper domain error codes
-(`wayland_err`, `drm_err`, `vulkan_err`, etc. from `lx.foundation.error`).
+(`wayland_err`, `drm_err`, `vulkan_err`, `gl_err`, etc. from `lx.foundation.error`).
 
 ---
 
