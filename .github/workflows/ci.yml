@@ -27,7 +27,7 @@ jobs:
             pkg-config
 
       - name: Fetch upstream protocols
-        run: ./scripts/fetch-protocols.sh
+        run: bash ./scripts/fetch-protocols.sh
 
       - name: Configure (${{ matrix.preset }})
         run: |
