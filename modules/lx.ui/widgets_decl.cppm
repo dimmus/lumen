@@ -176,7 +176,7 @@ lx::ui::child lx::ui::text(const char* label, lx::color color) {
     return describe<text_node, text_props>({label, color});
 }
 
-lx::size2i lx::ui::button_node::measure(lx::layout::constraints c, size_hint hint) const {
+lx::size2i lx::ui::button_node::measure(lx::layout::constraints c, size_hint) const {
     lx::size2i out{120, 32};
     if (out.width < c.min.width)
         out.width = c.min.width;
