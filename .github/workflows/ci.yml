@@ -21,7 +21,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             clang-18 ninja-build cmake \
-            libvulkan-dev vulkan-tools shaderc \
+            libvulkan-dev vulkan-tools glslc \
             libwayland-dev wayland-protocols \
             libdrm-dev libinput-dev libsystemd-dev \
             libharfbuzz-dev libfreetype-dev libfontconfig-dev \

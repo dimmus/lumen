@@ -2,7 +2,6 @@ module;
 
 #include <atomic>
 #include <cstddef>
-#include <new>
 #include <utility>
 
 export module lx.sync:queue;
@@ -42,9 +41,11 @@ public:
     [[nodiscard]] std::size_t capacity() const { return Capacity - 1; }
 
 private:
-    // Separate cache lines — producer and consumer must not ping-pong.
-    alignas(std::hardware_destructive_interference_size) std::atomic<std::size_t> head_{0};
-    alignas(std::hardware_destructive_interference_size) std::atomic<std::size_t> tail_{0};
+    // libstdc++ often withholds std::hardware_destructive_interference_size (ABI-sensitive);
+    // 64 is the universal x86_64/aarch64 cache-line width for this purpose.
+    static constexpr std::size_t k_cache_line = 64;
+    alignas(k_cache_line) std::atomic<std::size_t> head_{0};
+    alignas(k_cache_line) std::atomic<std::size_t> tail_{0};
     T slots_[Capacity]{};
 };
 
