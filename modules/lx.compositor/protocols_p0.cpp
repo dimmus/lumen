@@ -575,6 +575,7 @@ const struct wl_surface_interface surface_impl = {
     .set_buffer_scale = surface_set_buffer_scale,
     .damage_buffer = surface_damage_buffer,
     .offset = surface_offset,
+#if defined(WL_SURFACE_GET_RELEASE_SINCE_VERSION)
     .get_release =
         [](struct wl_client* client, struct wl_resource*, uint32_t callback) {
             // Optional v7 release callback — create and immediately complete unused.
@@ -584,6 +585,7 @@ const struct wl_surface_interface surface_impl = {
                 wl_resource_destroy(cb);
             }
         },
+#endif
 };
 
 // ── wl_compositor ──────────────────────────────────────────────────────────
@@ -643,8 +645,10 @@ void compositor_create_region(struct wl_client* client, struct wl_resource* reso
 const struct wl_compositor_interface compositor_impl = {
     .create_surface = compositor_create_surface,
     .create_region = compositor_create_region,
+#if defined(WL_COMPOSITOR_RELEASE_SINCE_VERSION)
     .release =
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
+#endif
 };
 
 p0_protocol_context* g_p0_ctx = nullptr;
@@ -1353,8 +1357,10 @@ const struct wl_data_device_manager_interface data_device_manager_impl = {
                                                    }
                                            });
         },
+#if defined(WL_DATA_DEVICE_MANAGER_RELEASE_SINCE_VERSION)
     .release =
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
+#endif
 };
 
 void bind_data_device_manager(wayland::client_connection& client, unsigned id, int version) {
