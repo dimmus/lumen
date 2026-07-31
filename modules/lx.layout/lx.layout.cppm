@@ -16,7 +16,8 @@ struct constraints {
 
 class layout_node {
 public:
-    virtual ~layout_node() = default;
+    // Out-of-line key function — see scene_node for why in-class `= default` breaks modules.
+    virtual ~layout_node();
     [[nodiscard]] virtual lx::size2i measure(constraints c) = 0;
     virtual void layout(lx::rect2i bounds) = 0;
     virtual void mark_dirty();

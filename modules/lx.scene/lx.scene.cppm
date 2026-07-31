@@ -16,7 +16,10 @@ enum class node_kind { container, widget, surface, layer };
 
 class scene_node {
 public:
-    virtual ~scene_node() = default;
+    // Out-of-line so the Itanium key function (and thus the vtable) lives in exactly one
+    // object file. An in-class `= default` makes Clang emit a strong vtable in every
+    // importer under C++ modules, which then fails at link time.
+    virtual ~scene_node();
     [[nodiscard]] virtual node_kind kind() const = 0;
 
     void set_transform(lx::point2i origin, float scale = 1.f, float opacity = 1.f);
@@ -44,7 +47,7 @@ protected:
 
 class container_node : public scene_node {
 public:
-    node_kind kind() const override { return node_kind::container; }
+    [[nodiscard]] node_kind kind() const override;
     [[nodiscard]] lx::runtime::overflow_action child_overflow_policy() const;
     void set_child_overflow_policy(lx::runtime::overflow_action policy);
     [[nodiscard]] bool add(scene_node* child);
@@ -66,7 +69,7 @@ private:
 class surface_node : public scene_node {
 public:
     explicit surface_node(lx::surface_id surface);
-    node_kind kind() const override { return node_kind::surface; }
+    [[nodiscard]] node_kind kind() const override;
 
     void attach(lx::gfx::imported_image image);
     void set_source_damage(lx::rect2i region);
@@ -117,6 +120,16 @@ private:
 } // namespace lx::scene
 
 module :private;
+
+lx::scene::scene_node::~scene_node() = default;
+
+lx::scene::node_kind lx::scene::container_node::kind() const {
+    return node_kind::container;
+}
+
+lx::scene::node_kind lx::scene::surface_node::kind() const {
+    return node_kind::surface;
+}
 
 void lx::scene::scene_node::set_transform(lx::point2i o, float s, float a) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);

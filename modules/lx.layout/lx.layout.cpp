@@ -4,6 +4,8 @@ import lx.foundation;
 
 module lx.layout;
 
+lx::layout::layout_node::~layout_node() = default;
+
 void lx::layout::layout_node::mark_dirty() { dirty_ = true; }
 lx::rect2i lx::layout::layout_node::bounds() const { return bounds_; }
 
