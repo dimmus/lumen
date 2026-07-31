@@ -21,10 +21,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             clang-18 ninja-build cmake \
-            libvulkan-dev vulkan-tools \
+            libvulkan-dev vulkan-tools shaderc \
             libwayland-dev wayland-protocols \
-            libdrm-dev libinput-dev \
-            pkg-config
+            libdrm-dev libinput-dev libsystemd-dev \
+            libharfbuzz-dev libfreetype-dev libfontconfig-dev \
+            pkg-config git
 
       - name: Fetch upstream protocols
         run: bash ./scripts/fetch-protocols.sh
