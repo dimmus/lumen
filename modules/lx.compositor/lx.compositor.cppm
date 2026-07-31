@@ -23,6 +23,23 @@ export import :protocols_p0;
 
 export namespace lx::compositor {
 
+/// Which composite path drives scanout.
+///
+/// `vulkan` is the production path: client dma-bufs are sampled by the GPU into an
+/// exported scanout image. It is the wrong trade when the only Vulkan device is a software
+/// rasterizer, because every frame then pays an upload, a tiling copy and a fullscreen
+/// fragment shader to produce pixels the CPU already had. `cpu` composites straight into a
+/// DRM dumb buffer instead — one pass over the frame, damage-limited.
+enum class present_backend {
+    /// Hardware Vulkan → `vulkan`; else hardware GL → `gl`; else `cpu`; no KMS → headless.
+    automatic,
+    vulkan,
+    /// EGL + GLES on GBM. The path Mesa gives hardware acceleration on for drivers with no
+    /// Vulkan driver — vmwgfx/SVGA3D, older radeon/nouveau, many SoCs.
+    gl,
+    cpu,
+};
+
 struct config {
     const char* socket_name = "lumen-0";
     const char* shell_binary_path = "lumen-shell";
@@ -30,6 +47,15 @@ struct config {
     bool privileged_shell_only = true;
     double target_fps = 60.0;
     unsigned worker_thread_count = 1;
+    present_backend present = present_backend::automatic;
+    /// Row-band threads for the CPU composite path, in addition to the render thread.
+    ///
+    /// Defaults to 0 on measurement, not principle: the fullscreen opaque case is a row
+    /// memcpy, which one core already saturates memory bandwidth with, so bands only add
+    /// dispatch latency (`bench_composite` shows this). Raise it on hosts with bandwidth
+    /// to spare, or for scenes dominated by blended and format-converting draws, where it
+    /// does pay.
+    unsigned composite_thread_count = 0;
     scheduler::hot_path_budget hot_path{};
     scene::snapshot_config snapshot{
         .backpressure = scene::backpressure_policy::triple_buffer,

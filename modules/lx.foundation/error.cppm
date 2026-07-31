@@ -31,6 +31,20 @@ enum class vulkan_err : int {
     import_failed = 3,
 };
 
+enum class gl_err : int {
+    none = 0,
+    /// EGL display, context or a required extension is unavailable.
+    no_context = 1,
+    /// Shader compile or program link failed.
+    program_failed = 2,
+    /// GBM allocation, EGLImage creation or FBO attachment failed.
+    target_failed = 3,
+    /// A client buffer could not be sampled (dma-buf import or upload).
+    import_failed = 4,
+    /// `glGetError` reported a failure during a frame.
+    draw_failed = 5,
+};
+
 enum class drm_err : int {
     none = 0,
     open_failed = 1,
@@ -52,6 +66,7 @@ enum class protocol_err : int {
     case error_domain::io: return "io";
     case error_domain::wayland: return "wayland";
     case error_domain::vulkan: return "vulkan";
+    case error_domain::gl: return "gl";
     case error_domain::drm: return "drm";
     case error_domain::protocol: return "protocol";
     case error_domain::invalid_argument: return "invalid_argument";
