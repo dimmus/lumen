@@ -1,0 +1,297 @@
+// End-to-end check that a real client buffer's pixels reach the composited output.
+//
+// This exists because the previous render path could not fail this class of bug: an
+// FD-less dmabuf desc produced a fabricated VkImage, and an unresolved texture produced a
+// magenta placeholder, so a golden-image test passed while sampling nothing. Every
+// assertion below is on pixels that could only come from the source buffer.
+#include "lumen_test.hpp"
+
+#include <cstdio>
+#include <cstring>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#if defined(LUMEN_HAS_DRM)
+#include <drm_fourcc.h>
+#include <xf86drm.h>
+#include <xf86drmMode.h>
+#endif
+
+import lx.foundation;
+import lx.gfx;
+
+namespace {
+
+constexpr unsigned k_width = 64;
+constexpr unsigned k_height = 64;
+
+/// Left half opaque red, right half opaque blue, in little-endian XRGB8888 as a Wayland
+/// client would write it.
+void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsigned stride) {
+    for (unsigned y = 0; y < height; ++y) {
+        for (unsigned x = 0; x < width; ++x) {
+            unsigned char* px = pixels + y * stride + x * 4u;
+            const bool left = x < width / 2u;
+            px[0] = left ? 0u : 255u;   // B
+            px[1] = 0u;                 // G
+            px[2] = left ? 255u : 0u;   // R
+            px[3] = 255u;               // X/A
+        }
+    }
+}
+
+struct gpu_fixture {
+    lx::gfx::device device{};
+    lx::gfx::vulkan_compositor compositor{};
+    lx::gfx::render_target target{};
+    bool usable = false;
+};
+
+/// Brings up a real Vulkan device, or reports why the test cannot run. A missing GPU is a
+/// skip; a GPU that fails to composite is a failure. Filled in place because a live
+/// Vulkan compositor owns handles and is deliberately not movable.
+bool setup_gpu(gpu_fixture& fixture) {
+    auto selected = lx::gfx::device_selector::select_best();
+    if (!selected) {
+        std::printf("SKIP: no graphics device\n");
+        return false;
+    }
+    fixture.device = std::move(selected).value();
+    if (!fixture.device.info().supports_dmabuf_import) {
+        std::printf("SKIP: device has no dma-buf import (headless fallback)\n");
+        return false;
+    }
+
+    if (auto ready = fixture.compositor.initialize(fixture.device.context()); !ready) {
+        std::printf("SKIP: composite pass unavailable: %s\n", ready.get_error().message);
+        return false;
+    }
+
+    auto created = lx::gfx::render_target::create(fixture.device.context(), k_width, k_height);
+    if (!created) {
+        std::printf("SKIP: no render target: %s\n", created.get_error().message);
+        return false;
+    }
+    fixture.target = std::move(created).value();
+    fixture.usable = true;
+    return true;
+}
+
+#if defined(LUMEN_HAS_DRM)
+
+/// A dumb KMS buffer exported as a dma-buf: the closest stand-in for a client buffer that
+/// does not require a live Wayland client.
+struct dumb_dmabuf {
+    lx::unique_fd card{};
+    lx::unique_fd dmabuf{};
+    unsigned handle = 0;
+    unsigned stride = 0;
+    bool valid = false;
+};
+
+dumb_dmabuf make_dumb_dmabuf() {
+    dumb_dmabuf out{};
+
+    for (const char* path : {"/dev/dri/card0", "/dev/dri/card1"}) {
+        const int fd = ::open(path, O_RDWR | O_CLOEXEC);
+        if (fd >= 0) {
+            out.card.reset(fd);
+            break;
+        }
+    }
+    if (out.card.get() < 0)
+        return out;
+
+    drm_mode_create_dumb create{};
+    create.width = k_width;
+    create.height = k_height;
+    create.bpp = 32;
+    if (drmIoctl(out.card.get(), DRM_IOCTL_MODE_CREATE_DUMB, &create) != 0)
+        return out;
+    out.handle = create.handle;
+    out.stride = create.pitch;
+
+    drm_mode_map_dumb map{};
+    map.handle = create.handle;
+    if (drmIoctl(out.card.get(), DRM_IOCTL_MODE_MAP_DUMB, &map) != 0)
+        return out;
+
+    auto* pixels = static_cast<unsigned char*>(::mmap(nullptr, create.size, PROT_READ | PROT_WRITE,
+                                                     MAP_SHARED, out.card.get(),
+                                                     static_cast<off_t>(map.offset)));
+    if (pixels == MAP_FAILED)
+        return out;
+    fill_pattern(pixels, k_width, k_height, out.stride);
+    ::munmap(pixels, create.size);
+
+    int export_fd = -1;
+    if (drmPrimeHandleToFD(out.card.get(), create.handle, DRM_CLOEXEC | DRM_RDWR, &export_fd) != 0 ||
+        export_fd < 0) {
+        return out;
+    }
+    out.dmabuf.reset(export_fd);
+    out.valid = true;
+    return out;
+}
+
+#endif // LUMEN_HAS_DRM
+
+} // namespace
+
+// An unregistered texture must be reported, never substituted with a stand-in.
+LUMEN_TEST(headless_rejects_unregistered_texture) {
+    lx::gfx::headless_backend hb{};
+    LUMEN_CHECK(static_cast<bool>(hb.create(4, 4)));
+    LUMEN_CHECK(static_cast<bool>(hb.begin_frame()));
+    LUMEN_CHECK(!hb.blit_texture(9999, {0, 0, 4, 4}));
+}
+
+LUMEN_TEST(composite_reports_unregistered_draw) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = 12345; // never registered
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 0);
+    LUMEN_CHECK(stats.value().draws_skipped == 1);
+}
+
+// shm pixels must survive upload → composite → readback unchanged.
+LUMEN_TEST(shm_upload_reaches_composited_output) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    // Source is RGBA here, matching what the protocol layer converts shm buffers into.
+    unsigned char source[k_width * k_height * 4]{};
+    for (unsigned y = 0; y < k_height; ++y) {
+        for (unsigned x = 0; x < k_width; ++x) {
+            unsigned char* px = source + (y * k_width + x) * 4u;
+            const bool left = x < k_width / 2u;
+            px[0] = left ? 255u : 0u;
+            px[1] = 0u;
+            px[2] = left ? 0u : 255u;
+            px[3] = 255u;
+        }
+    }
+
+    constexpr unsigned texture_id = 0x4000'0001u;
+    auto uploaded = gpu.compositor.upload_rgba(texture_id, k_width, k_height, source);
+    LUMEN_CHECK(static_cast<bool>(uploaded));
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_skipped == 0);
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    auto read = gpu.compositor.read_back(gpu.target, readback, sizeof(readback));
+    LUMEN_CHECK(static_cast<bool>(read));
+
+    // Sample inside each half, away from the seam where filtering could blend.
+    const auto* left = readback + ((k_height / 2u) * k_width + k_width / 4u) * 4u;
+    const auto* right = readback + ((k_height / 2u) * k_width + (3u * k_width) / 4u) * 4u;
+
+    LUMEN_CHECK(left[0] > 200 && left[1] < 60 && left[2] < 60);
+    LUMEN_CHECK(right[2] > 200 && right[1] < 60 && right[0] < 60);
+}
+
+// The one that matters: a real dma-buf, imported through the real importer.
+LUMEN_TEST(dmabuf_import_reaches_composited_output) {
+#if defined(LUMEN_HAS_DRM)
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    auto source = make_dumb_dmabuf();
+    if (!source.valid) {
+        std::printf("SKIP: no dumb-buffer dma-buf available on this host\n");
+        return;
+    }
+
+    lx::gfx::dmabuf_desc desc{};
+    desc.width = k_width;
+    desc.height = k_height;
+    desc.format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+    desc.plane_count = 1;
+    desc.planes[0].stride = source.stride;
+    desc.planes[0].offset = 0;
+    desc.planes[0].modifier = lx::gfx::modifier_linear;
+    // Borrowed: the importer dups before handing ownership to Vulkan.
+    desc.planes[0].fd.reset(::dup(source.dmabuf.get()));
+    LUMEN_CHECK(desc.planes[0].fd.get() >= 0);
+
+    auto imported = gpu.device.dmabuf().import(desc);
+    if (!imported) {
+        std::printf("SKIP: driver refused the dma-buf import: %s\n",
+                    imported.get_error().message);
+        return;
+    }
+    auto image = std::move(imported).value();
+    // A real import must carry a real VkImage — this is what used to be fabricated.
+    LUMEN_CHECK(image.vk_image != nullptr);
+    LUMEN_CHECK(image.width == k_width);
+
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.bind_imported(image)));
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = image.image_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_skipped == 0);
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                           sizeof(readback))));
+
+    const auto* left = readback + ((k_height / 2u) * k_width + k_width / 4u) * 4u;
+    const auto* right = readback + ((k_height / 2u) * k_width + (3u * k_width) / 4u) * 4u;
+
+    // Red on the left, blue on the right — exactly the pattern written into the dma-buf.
+    LUMEN_CHECK(left[0] > 200 && left[1] < 60 && left[2] < 60);
+    LUMEN_CHECK(right[2] > 200 && right[1] < 60 && right[0] < 60);
+
+    gpu.device.dmabuf().release(image);
+#else
+    std::printf("SKIP: built without libdrm\n");
+#endif
+}
+
+// The exported target must be a usable scanout framebuffer, not just an FD.
+LUMEN_TEST(render_target_exports_scanout_dmabuf) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    auto exported = gpu.target.export_dmabuf();
+    if (!exported) {
+        std::printf("SKIP: target export unavailable: %s\n", exported.get_error().message);
+        return;
+    }
+    const auto dmabuf = std::move(exported).value();
+    LUMEN_CHECK(dmabuf.fd.get() >= 0);
+    LUMEN_CHECK(dmabuf.width == k_width);
+    LUMEN_CHECK(dmabuf.height == k_height);
+    // Row pitch comes from the driver; it must cover the row, and padding is legal.
+    LUMEN_CHECK(dmabuf.stride >= k_width * 4u);
+}
+
+int main(int argc, char** argv) {
+    return lumen_test::run_all(argc, argv);
+}

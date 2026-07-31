@@ -1,0 +1,13 @@
+sequenceDiagram
+    participant User
+    participant Shell as lumen-shell
+    participant Bridge as ZlmPolicyBridge
+    participant Comp as lumen-compositor
+    participant App as focused app
+
+    User->>Shell: click window B titlebar
+    Shell->>Bridge: request_activate(toplevel_B)
+    Bridge->>Comp: activate + restack(B on top)
+    Comp->>Comp: SeatManager.setFocus(B)
+    Comp->>App: wl_keyboard.enter
+    Comp->>Shell: focus_changed(B)

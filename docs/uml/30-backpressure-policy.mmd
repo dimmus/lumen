@@ -1,0 +1,11 @@
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> CheckInFlight: try_publish()
+    CheckInFlight --> Published: in_flight < max_in_flight
+    CheckInFlight --> DropLatest: policy=drop_latest AND full
+    CheckInFlight --> StallUI: policy=stall_ui AND full
+    CheckInFlight --> TripleBuffer: policy=triple_buffer AND slots available
+    Published --> Idle: release() on render
+    DropLatest --> Idle: dropped_count++
+    StallUI --> Idle: return false to UI
+    TripleBuffer --> Published: up to 2 in flight / 3 slots

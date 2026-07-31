@@ -1,0 +1,11 @@
+flowchart LR
+    COMMIT[surface commit]
+    CHECK{client_within_budget?}
+    ACQ[import_cache.acquire]
+    EVICT[evict client LRU]
+    REJ[reject commit]
+
+    COMMIT --> CHECK
+    CHECK -->|yes| ACQ
+    CHECK -->|no| EVICT --> ACQ
+    EVICT -->|still over| REJ

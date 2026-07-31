@@ -1,0 +1,80 @@
+flowchart TB
+    subgraph Apps["Application Layer"]
+        APP["lx::app"]
+        UI["lx::ui"]
+        UIB["lx::ui.builder"]
+    end
+
+    subgraph Desktop["Desktop Layer"]
+        SHELL["lx::shell"]
+        POLICY["lx::shell.policy"]
+    end
+
+    subgraph Compositing["Compositor Layer"]
+        COMP["lx::compositor"]
+        SCENE["lx::scene"]
+        SCHED["lx::scheduler"]
+    end
+
+    subgraph Graphics["Graphics Layer"]
+        GFX["lx::gfx"]
+        TEXT["lx::text"]
+        LAYOUT["lx::layout"]
+    end
+
+    subgraph Platform["Platform Layer"]
+        WLS["lx::wayland.server"]
+        WLC["lx::wayland.client"]
+        WLPROT["lx::wayland.protocols"]
+        INPUT["lx::input"]
+        SESSION["lx::session"]
+        DRM["lx::drm"]
+    end
+
+    subgraph Runtime["Runtime Layer"]
+        RT["lx::runtime"]
+        EXEC["lx::runtime.executor"]
+        SYNC["lx::sync"]
+        IPC["lx::ipc"]
+        ASYNC["lx::async"]
+        TRACE["lx::trace"]
+        HEALTH["lx::health"]
+    end
+
+    subgraph Foundation["Foundation Layer"]
+        FOUND["lx::foundation"]
+    end
+
+    APP --> UIB
+    APP --> RT
+    UI --> SCENE
+    UI --> TEXT
+    UIB --> UI
+    SHELL --> POLICY
+    SHELL --> UI
+    SHELL --> WLC
+    POLICY --> WLC
+    COMP --> WLS
+    COMP --> SCENE
+    COMP --> SCHED
+    COMP --> INPUT
+    COMP --> DRM
+    COMP --> HEALTH
+    SCENE --> GFX
+    SCENE --> LAYOUT
+    SCENE --> SCHED
+    WLS --> WLPROT
+    WLC --> WLPROT
+    INPUT --> RT
+    DRM --> RT
+    SESSION --> RT
+    GFX --> FOUND
+    RT --> EXEC
+    RT --> SYNC
+    RT --> TRACE
+    HEALTH --> RT
+    HEALTH --> TRACE
+    ASYNC --> SYNC
+    ASYNC --> EXEC
+    SCENE --> SYNC
+    RT --> FOUND

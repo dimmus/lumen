@@ -1,0 +1,11 @@
+flowchart TD
+    COORD[memory_budget_coordinator.tick]
+    EVAL{pressure level?}
+    IC[import_cache.on_memory_pressure]
+    BL[buffer_lifecycle.on_memory_pressure]
+    SP[surface_pool.evict_on_pressure]
+    DROP[drop frames / reduce quality flag]
+
+    COORD --> EVAL
+    EVAL -->|moderate| IC
+    EVAL -->|critical| IC --> BL --> SP --> DROP

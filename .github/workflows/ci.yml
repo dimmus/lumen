@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [release, asan, tsan]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            clang-18 ninja-build cmake \
+            libvulkan-dev vulkan-tools \
+            libwayland-dev wayland-protocols \
+            libdrm-dev libinput-dev \
+            pkg-config
+
+      - name: Fetch upstream protocols
+        run: ./scripts/fetch-protocols.sh
+
+      - name: Configure (${{ matrix.preset }})
+        run: |
+          cmake --preset ${{ matrix.preset }} \
+            -DCMAKE_CXX_COMPILER=clang++-18 \
+            -DLUMEN_WERROR=ON
+
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} -j$(nproc)
+
+      - name: Test
+        env:
+          # Sanitizer findings must fail the job, not just print a report.
+          TSAN_OPTIONS: halt_on_error=1
+          ASAN_OPTIONS: halt_on_error=1:abort_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --preset ${{ matrix.preset }} --output-on-failure
+
+      - name: Scanner golden compile
+        if: matrix.preset == 'release'
+        run: |
+          ./build/${{ matrix.preset }}/wl-scanner-cpp \
+            --input protocols/lumen/zlm_shell_v1.xml \
+            --module lx.wayland.protocols.lumen \
+            --output-dir build/smoke-generated
+          test -f build/smoke-generated/lx.wayland.protocols.lumen.cppm
+          test -f build/smoke-generated/lx.wayland.protocols.lumen.gen.cpp
+          clang++-18 -std=c++20 -c \
+            build/smoke-generated/lx.wayland.protocols.lumen.gen.cpp \
+            -o /tmp/lumen-scanner-smoke.o

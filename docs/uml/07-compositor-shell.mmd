@@ -1,0 +1,24 @@
+classDiagram
+    direction TB
+
+    class Compositor {
+        +start(config) void
+        +renderFrame() void
+    }
+
+    class SurfaceManager {
+        +commit(surface, buffer) void
+        +damage(surface, region) void
+    }
+
+    class ShellPolicy {
+        <<interface>>
+        +placeWindow(surface, hints) void
+        +activate(surface) void
+    }
+
+    class StackingPolicy
+
+    ShellPolicy <|-- StackingPolicy
+    Compositor --> SurfaceManager
+    Compositor ..> ShellPolicy

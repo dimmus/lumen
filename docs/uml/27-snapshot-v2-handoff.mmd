@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant UI as UI thread
+    participant WL as write_draw_list
+    participant SB as snapshot_buffer
+    participant RT as Render thread
+
+    UI->>WL: clear + push commands
+    UI->>WL: sort_by_texture()
+    UI->>SB: try_publish(damage, frame_index)
+    Note over SB: atomic read_index swap — O(1), no copy
+
+    RT->>SB: acquire() → const immutable_frame_snapshot&
+    RT->>RT: Vulkan record/submit
+    RT->>SB: release(frame_index)
+    Note over SB: in_flight counter decremented

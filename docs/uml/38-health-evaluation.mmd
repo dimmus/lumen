@@ -1,0 +1,17 @@
+flowchart TB
+    UI[tick_ui] --> FILL[publish_health_sample]
+    FILL --> OBS[health_monitor.observe]
+    OBS --> N{frames >= N?}
+    N -->|no| WAIT[wait]
+    N -->|yes| EVAL[evaluate]
+    EVAL --> PARTS[subsystem_health x N]
+    EVAL --> PROC[process_health]
+    EVAL --> MEM[memory_health]
+    EVAL --> SPD[speed_health]
+    PARTS --> OVER[overall = worse]
+    PROC --> OVER
+    MEM --> OVER
+    SPD --> OVER
+    OVER --> RPT[health_report]
+    RPT --> LOG[trace warn/debug]
+    RPT --> EXP[health_exporter — P1]

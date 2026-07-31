@@ -1,0 +1,19 @@
+sequenceDiagram
+    participant Shell as lumen-shell
+    participant Bridge as zlm_policy_bridge_v1
+    participant Comp as lumen-compositor
+
+    Shell->>Comp: bind zlm_shell_v1
+    Comp->>Shell: capabilities(flags, version)
+    Shell->>Comp: get_policy_bridge()
+    Comp->>Shell: snapshot_begin
+    Comp->>Shell: snapshot_workspace (×N)
+    Comp->>Shell: snapshot_toplevel (×N)
+    Comp->>Shell: snapshot_output (×N)
+    Comp->>Shell: snapshot_done
+    Note over Shell: Shell UI fully initialized
+
+    Comp->>Shell: toplevel_created (new zlm_toplevel_v1)
+    Comp->>Shell: toplevel_state + toplevel_geometry
+    Shell->>Bridge: set_toplevel_stacking_index
+    Comp->>Shell: stacking_order_changed (done=1)

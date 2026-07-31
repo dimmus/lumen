@@ -1,0 +1,23 @@
+classDiagram
+    direction TB
+
+    class Widget {
+        <<abstract>>
+        +invalidate() void
+        +preferredSize(constraints) Size
+    }
+
+    class Button
+    class Label
+    class Window
+
+    Widget <|-- Button
+    Widget <|-- Label
+    Widget <|-- Window
+
+    class StyleSystem {
+        +load(themePath) Theme
+        +resolve(type, state, property) Value
+    }
+
+    Widget --> StyleSystem

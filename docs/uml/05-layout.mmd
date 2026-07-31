@@ -1,0 +1,20 @@
+classDiagram
+    direction TB
+
+    class LayoutNode {
+        +constraints: Constraints
+        +layout(rect) void
+    }
+
+    class FlexLayout
+    class GridLayout
+
+    LayoutNode <|-- FlexLayout
+    LayoutNode <|-- GridLayout
+
+    class LayoutEngine {
+        +solve(root, constraints) void
+        +incrementalDirty(node) void
+    }
+
+    LayoutEngine --> LayoutNode

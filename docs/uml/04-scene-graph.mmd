@@ -1,0 +1,28 @@
+classDiagram
+    direction TB
+
+    class GfxDevice {
+        +createSwapchain(surface) Swapchain
+        +importDmabuf(desc) VkImage
+    }
+
+    class SceneGraph {
+        +root() ContainerNode
+        +update(dt) void
+        +collectDamage() Region
+        +buildDrawList() DrawList
+    }
+
+    class SceneNode {
+        <<abstract>>
+        +markDirty(region) void
+    }
+
+    class SurfaceNode
+    class WidgetNode
+
+    SceneNode <|-- SurfaceNode
+    SceneNode <|-- WidgetNode
+    SceneGraph o-- SceneNode
+    SceneGraph --> DrawList
+    DrawList --> GfxDevice

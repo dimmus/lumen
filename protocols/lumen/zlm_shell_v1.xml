@@ -1,0 +1,357 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="zlm_shell_v1">
+  <copyright>
+    Copyright © 2026 Lumen Project
+    SPDX-License-Identifier: MIT
+
+    Private desktop environment protocol for the Lumen compositor.
+
+    PRIVILEGE MODEL (enforced by compositor, not wire-visible):
+    - Client UID must match compositor session UID (SO_PEERCRED).
+    - Client binary must match configured shell path (default: lumen-shell).
+    - Optional Flatpak build: valid portal capability token required.
+
+    Regular application clients never receive the zlm_shell_v1 global.
+  </copyright>
+
+  <!-- ── Compositor-owned toplevel handle ─────────────────────────── -->
+
+  <interface name="zlm_toplevel_v1" version="1">
+    <description summary="compositor-owned handle for a mapped xdg toplevel">
+      Shell uses this object for all window management. The compositor maps
+      zlm_toplevel_v1 to internal xdg_toplevel state. Never expose client-side
+      xdg_toplevel references to the shell.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy shell reference (does not close window)"/>
+    </request>
+  </interface>
+
+  <!-- ── Shell root ───────────────────────────────────────────────── -->
+
+  <interface name="zlm_shell_v1" version="1">
+    <description summary="Lumen desktop shell root interface"/>
+
+    <enum name="capability">
+      <description summary="compositor capability flags sent on bind"/>
+      <entry name="tiling" value="0x1" summary="tiling plugin supported"/>
+      <entry name="workspace_drag" value="0x4"/>
+      <entry name="explicit_sync" value="0x10"/>
+    </enum>
+
+    <request name="destroy" type="destructor"/>
+
+    <request name="get_workspace_manager">
+      <arg name="id" type="new_id" interface="zlm_workspace_manager_v1"/>
+    </request>
+
+    <request name="get_policy_bridge">
+      <arg name="id" type="new_id" interface="zlm_policy_bridge_v1"/>
+    </request>
+
+    <request name="get_window_rules">
+      <arg name="id" type="new_id" interface="zlm_window_rules_v1"/>
+    </request>
+
+    <event name="capabilities">
+      <description summary="sent immediately after bind"/>
+      <arg name="flags" type="uint" enum="capability"/>
+      <arg name="shell_protocol_version" type="uint" summary="compositor-supported version"/>
+    </event>
+  </interface>
+
+  <!-- ── Workspaces ───────────────────────────────────────────────── -->
+
+  <interface name="zlm_workspace_manager_v1" version="1">
+    <description summary="virtual desktop manager"/>
+
+    <enum name="error">
+      <entry name="workspace_not_empty" value="1"/>
+      <entry name="invalid_index" value="2"/>
+    </enum>
+
+    <request name="destroy" type="destructor"/>
+
+    <request name="create_workspace">
+      <arg name="id" type="new_id" interface="zlm_workspace_v1"/>
+      <arg name="name" type="string"/>
+    </request>
+
+    <request name="destroy_workspace">
+      <description summary="destroy workspace; fails if not empty"/>
+      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+    </request>
+
+    <request name="set_active">
+      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+    </request>
+
+    <request name="reorder_workspace">
+      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+      <arg name="index" type="uint"/>
+    </request>
+
+    <event name="workspace_created">
+      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+      <arg name="index" type="uint"/>
+      <arg name="name" type="string"/>
+    </event>
+
+    <event name="workspace_destroyed">
+      <arg name="index" type="uint"/>
+    </event>
+
+    <event name="workspace_activated">
+      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+      <arg name="index" type="uint"/>
+    </event>
+  </interface>
+
+  <interface name="zlm_workspace_v1" version="1">
+    <description summary="a single workspace"/>
+
+    <request name="destroy" type="destructor"/>
+
+    <request name="set_name">
+      <arg name="name" type="string"/>
+    </request>
+
+    <request name="move_toplevel">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </request>
+
+    <event name="toplevel_enter">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </event>
+
+    <event name="toplevel_leave">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </event>
+  </interface>
+
+  <!-- ── Policy bridge: shell intent → compositor execution ──────── -->
+
+  <interface name="zlm_policy_bridge_v1" version="1">
+    <description summary="window management policy bridge">
+      Shell sends placement intent; compositor executes geometry, focus, and
+      stacking. Stacking is default; tiling is an optional shell plugin.
+      On bind the compositor sends a snapshot_* event batch, then delta events.
+    </description>
+
+    <enum name="resize_edge">
+      <entry name="none" value="0"/>
+      <entry name="top" value="1"/>
+      <entry name="bottom" value="2"/>
+      <entry name="left" value="4"/>
+      <entry name="right" value="8"/>
+      <entry name="top_left" value="5"/>
+      <entry name="top_right" value="9"/>
+      <entry name="bottom_left" value="6"/>
+      <entry name="bottom_right" value="10"/>
+    </enum>
+
+    <enum name="toplevel_state">
+      <entry name="normal" value="0"/>
+      <entry name="maximized" value="1"/>
+      <entry name="fullscreen" value="2"/>
+      <entry name="minimized" value="3"/>
+      <entry name="tiled" value="4"/>
+      <entry name="modal" value="5"/>
+    </enum>
+
+    <request name="destroy" type="destructor"/>
+
+    <request name="request_activate">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </request>
+
+    <request name="request_raise">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </request>
+
+    <request name="request_lower">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </request>
+
+    <request name="set_toplevel_stacking_index">
+      <description summary="set one toplevel z-order; 0 = bottom">
+        Send multiple requests to define full order. Compositor emits
+        stacking_order_changed with done=1 after the last index in a frame.
+      </description>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="index" type="uint"/>
+    </request>
+
+    <request name="request_move">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="seat" type="object" interface="wl_seat"/>
+      <arg name="serial" type="uint"/>
+    </request>
+
+    <request name="request_resize">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="seat" type="object" interface="wl_seat"/>
+      <arg name="serial" type="uint"/>
+      <arg name="edges" type="uint" enum="resize_edge"/>
+    </request>
+
+    <request name="request_maximize">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </request>
+
+    <request name="request_unmaximize">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </request>
+
+    <request name="request_fullscreen">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="output" type="object" interface="wl_output" allow-null="true"/>
+    </request>
+
+    <request name="request_minimize">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </request>
+
+    <request name="request_close">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </request>
+
+    <!-- Initial state sync (compositor → shell) -->
+
+    <event name="snapshot_begin">
+      <description summary="start of initial state batch on bind"/>
+    </event>
+
+    <event name="snapshot_workspace">
+      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+      <arg name="index" type="uint"/>
+      <arg name="name" type="string"/>
+      <arg name="active" type="uint" summary="1 if active workspace"/>
+    </event>
+
+    <event name="snapshot_toplevel">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+      <arg name="app_id" type="string"/>
+      <arg name="title" type="string"/>
+      <arg name="state" type="uint" enum="toplevel_state"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+      <arg name="stacking_index" type="uint"/>
+    </event>
+
+    <event name="snapshot_output">
+      <arg name="output" type="object" interface="wl_output"/>
+      <arg name="name" type="string"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="scale" type="int"/>
+    </event>
+
+    <event name="snapshot_done">
+      <description summary="end of initial state batch"/>
+    </event>
+
+    <!-- Delta events -->
+
+    <event name="toplevel_created">
+      <arg name="toplevel" type="new_id" interface="zlm_toplevel_v1"/>
+      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+    </event>
+
+    <event name="toplevel_destroyed">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </event>
+
+    <event name="toplevel_state">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="app_id" type="string"/>
+      <arg name="title" type="string"/>
+      <arg name="state" type="uint" enum="toplevel_state"/>
+    </event>
+
+    <event name="toplevel_geometry">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </event>
+
+    <event name="focus_changed">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1" allow-null="true"/>
+    </event>
+
+    <event name="stacking_order_changed">
+      <description summary="one entry in stacking order; done=1 ends batch"/>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="index" type="uint"/>
+      <arg name="done" type="uint"/>
+    </event>
+  </interface>
+
+  <!-- ── Window rules (typed, session config) ─────────────────────── -->
+
+  <interface name="zlm_window_rules_v1" version="1">
+    <description summary="persistent window rules">
+      Rules are stored in the session config directory
+      ($XDG_CONFIG_HOME/lumen/window-rules.toml). Use reload_rules to apply.
+    </description>
+
+    <enum name="error">
+      <entry name="invalid_app_id" value="1"/>
+      <entry name="invalid_value" value="2"/>
+    </enum>
+
+    <request name="destroy" type="destructor"/>
+
+    <request name="reload_rules">
+      <description summary="reload rules from session config directory"/>
+    </request>
+
+    <request name="set_workspace_rule">
+      <arg name="app_id" type="string"/>
+      <arg name="workspace_index" type="uint"/>
+    </request>
+
+    <request name="set_monitor_rule">
+      <arg name="app_id" type="string"/>
+      <arg name="output_name" type="string"/>
+    </request>
+
+    <request name="set_geometry_rule">
+      <arg name="app_id" type="string"/>
+      <arg name="x" type="int"/>
+      <arg name="y" type="int"/>
+      <arg name="width" type="int"/>
+      <arg name="height" type="int"/>
+    </request>
+
+    <request name="set_state_rule">
+      <description summary="bitmask: 1=maximized 2=fullscreen 4=floating 8=tiled"/>
+      <arg name="app_id" type="string"/>
+      <arg name="state_flags" type="uint"/>
+    </request>
+
+    <request name="set_decoration_rule">
+      <arg name="app_id" type="string"/>
+      <arg name="server_side" type="uint"/>
+    </request>
+
+    <request name="clear_rules">
+      <arg name="app_id" type="string"/>
+    </request>
+
+    <request name="clear_all"/>
+
+    <event name="rule_applied">
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="app_id" type="string"/>
+      <arg name="rule_kind" type="string"/>
+    </event>
+  </interface>
+
+</protocol>

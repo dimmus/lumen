@@ -1,0 +1,13 @@
+flowchart TD
+    PUSH[push / add]
+    FULL{at capacity?}
+    DN[drop_newest — ignore]
+    DO[drop_oldest — shift]
+    RJ[reject — return false]
+    OK[accept]
+
+    PUSH --> FULL
+    FULL -->|no| OK
+    FULL -->|drop_newest| DN
+    FULL -->|drop_oldest| DO
+    FULL -->|reject| RJ

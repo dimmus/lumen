@@ -1,0 +1,21 @@
+classDiagram
+    class device {
+        +pipelines() pipeline_cache
+        +semaphores() timeline_semaphore_pool
+    }
+    class pipeline_cache {
+        +acquire(pipeline_key) unsigned
+        +hit_count() unsigned
+    }
+    class merged_render_pass {
+        +begin(damage)
+        +draw_batch(textured_quad[])
+        +end()
+    }
+    class timeline_semaphore_pool {
+        +acquire(signal_value) handle
+        +release(handle)
+    }
+    device --> pipeline_cache
+    device --> timeline_semaphore_pool
+    merged_render_pass --> pipeline_cache : uses

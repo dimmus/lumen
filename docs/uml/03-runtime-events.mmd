@@ -1,0 +1,28 @@
+classDiagram
+    direction TB
+
+    class EventLoop {
+        +run() void
+        +poll(timeout) int
+        +post(callback) void
+    }
+
+    class EventSource {
+        <<abstract>>
+        +prepare() bool
+        +dispatch() bool
+    }
+
+    class WaylandSource
+    class TimerSource
+    class FdSource
+
+    EventSource <|-- WaylandSource
+    EventSource <|-- TimerSource
+    EventSource <|-- FdSource
+    EventLoop o-- EventSource
+
+    class EventBus {
+        +subscribe~Event~(handler) Subscription
+        +publish(event) void
+    }

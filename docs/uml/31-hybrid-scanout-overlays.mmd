@@ -1,0 +1,10 @@
+flowchart TD
+    EVAL[scanout_manager.evaluate]
+    HYBRID{hybrid?}
+    PRIMARY[assign_plane — primary fullscreen]
+    OVER[assign_overlay_stack — UI layers]
+    VK[vulkan_composite remainder]
+    EVAL --> HYBRID
+    HYBRID -->|yes| PRIMARY --> OVER
+    HYBRID -->|no| VK
+    OVER --> PRESENT[DRM atomic commit + page-flip]

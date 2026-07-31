@@ -1,0 +1,31 @@
+flowchart TB
+    subgraph host [Host CPU / integrated GPU]
+        iGPU["Integrated render node<br/>/dev/dri/renderD128"]
+        scanoutIntegrated["KMS outputs wired to iGPU"]
+    end
+
+    subgraph discrete [Discrete GPU — PRIME offload]
+        dGPU["Discrete render node<br/>/dev/dri/renderD129"]
+        vulkanComposite["Vulkan composite + dmabuf import"]
+    end
+
+    subgraph compositor [lumen-compositor]
+        probe["device_selector::probe_tier()"]
+        assign["output_manager — output-to-GPU map"]
+        migrate["Cross-device buffer migration<br/>dma-buf re-export + re-import"]
+        present["KMS atomic present per output GPU"]
+    end
+
+    probe --> assign
+    assign --> iGPU
+    assign --> dGPU
+    dGPU --> vulkanComposite
+    vulkanComposite --> migrate
+    migrate --> scanoutIntegrated
+    scanoutIntegrated --> present
+    iGPU --> present
+
+    note1["Discrete tier → mailbox present mode"]
+    note2["Integrated tier → fifo_relaxed"]
+    probe -.-> note1
+    probe -.-> note2

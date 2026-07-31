@@ -1,0 +1,11 @@
+[Unit]
+Description=Lumen Wayland Socket
+Documentation=https://github.com/lumen-desktop/lumen
+
+[Socket]
+ListenStream=%t/lumen-0
+FileDescriptorName=wayland
+SocketMode=0600
+
+[Install]
+WantedBy=sockets.target

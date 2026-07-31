@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant App as App Process
+    participant WL as Wayland Server
+    participant Comp as Compositor
+    participant SG as SceneGraph
+    participant VK as Vulkan
+
+    App->>WL: wl_surface.commit(damage, dmabuf, sync)
+    WL->>Comp: SurfaceCommit event
+    Comp->>Comp: import dmabuf to VkImage
+    Comp->>SG: markDirty(region)
+    SG->>SG: incremental layout
+    SG->>SG: buildDrawList()
+    SG->>VK: record + submit + present
+    WL->>App: wl_callback.done

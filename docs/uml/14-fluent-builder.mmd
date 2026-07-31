@@ -1,0 +1,37 @@
+classDiagram
+    direction TB
+
+    class Application {
+        +run(argc, argv) int
+        +eventLoop() EventLoop&
+    }
+
+    class WindowBuilder {
+        +title(string) WindowBuilder&
+        +size(w, h) WindowBuilder&
+        +resizable(bool) WindowBuilder&
+        +build() Window&
+    }
+
+    class WidgetBuilder~T~ {
+        +text(string) WidgetBuilder~T~&
+        +style(key, value) WidgetBuilder~T~&
+        +onClick(handler) WidgetBuilder~T~&
+        +mount(Parent&) void
+    }
+
+    class FlexBuilder {
+        +spacing(px) FlexBuilder&
+        +align(main, cross) FlexBuilder&
+        +add~Button~() WidgetBuilder~Button~&
+    }
+
+    class Window {
+        +content() ContainerBuilder&
+        +show() void
+    }
+
+    Application --> WindowBuilder
+    WindowBuilder --> Window
+    Window --> FlexBuilder
+    FlexBuilder --> WidgetBuilder

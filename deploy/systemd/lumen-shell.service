@@ -1,0 +1,17 @@
+[Unit]
+Description=Lumen Desktop Shell
+Documentation=https://github.com/lumen-desktop/lumen
+Requires=lumen-compositor.service
+After=lumen-compositor.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%bindir%/lumen-shell
+Restart=on-failure
+RestartSec=1
+Environment=WAYLAND_DISPLAY=lumen-0
+Environment=XDG_CURRENT_DESKTOP=Lumen
+
+[Install]
+WantedBy=graphical-session.target

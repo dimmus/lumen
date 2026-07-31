@@ -1,0 +1,15 @@
+sequenceDiagram
+    participant DRM as lx.drm / KMS
+    participant Comp as compositor UI
+    participant Pres as presentation_tracker
+    participant RT as render thread
+    participant Out as output_manager
+
+    Comp->>Out: present_mode_for(output)
+    RT->>RT: acquire snapshot + record
+    RT->>DRM: atomic commit + page_flip
+    DRM-->>Comp: page_flip event (P1)
+    DRM-->>Pres: presentation_feedback + kms_damage (P1)
+    Pres->>Comp: on_feedback — adjust pacing
+
+    Note over Comp,Pres: P0: timer vsync stub until DRM wired

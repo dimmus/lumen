@@ -1,0 +1,37 @@
+flowchart TB
+    subgraph Process["Single Lumen process (compositor or app)"]
+        subgraph UIThread["UI affinity thread"]
+            EL["event_loop"]
+            STRAND_UI["strand ui"]
+            SCENE_MUT["scene_graph mutate"]
+            WIDGETS["widget tree"]
+            EL --> STRAND_UI
+            STRAND_UI --> SCENE_MUT --> WIDGETS
+        end
+
+        subgraph RenderThread["Render affinity thread"]
+            STRAND_R["strand render"]
+            SNAP_READ["snapshot_buffer.acquire"]
+            VK["Vulkan record/submit"]
+            STRAND_R --> SNAP_READ --> VK
+        end
+
+        subgraph WorkerPool["Worker affinity"]
+            STRAND_W["strand worker"]
+            LAYOUT["incremental layout"]
+            IO["I/O decode shape"]
+            STRAND_W --> LAYOUT
+            STRAND_W --> IO
+        end
+
+        subgraph Sync["lx.sync"]
+            SPSC["spsc_queue callbacks"]
+            ATOMIC["atomic index swap"]
+            MUTEX["mutex shared_state"]
+        end
+    end
+
+    SCENE_MUT -->|"commit_frame publish"| ATOMIC
+    ATOMIC --> SNAP_READ
+    WorkerPool -->|"executor.post ui"| SPSC
+    SPSC --> STRAND_UI

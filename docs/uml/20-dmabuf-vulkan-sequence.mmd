@@ -1,0 +1,25 @@
+sequenceDiagram
+    participant Client as Wayland Client
+    participant WL as wl_surface / linux-dmabuf
+    participant SM as SurfaceManager
+    participant IMP as DmabufImporter
+    participant VK as Vulkan Device
+    participant SG as SceneGraph
+
+    Client->>WL: zwp_linux_buffer_params_v1.create_immed
+    Note over Client,WL: fd + stride + modifier per plane
+    Client->>WL: wl_surface.attach(buffer) + damage + commit
+    WL->>SM: SurfaceCommit(buffer, syncobj)
+    SM->>SM: extract DmabufDesc from wl_buffer
+    SM->>IMP: canImport(desc)
+    IMP->>VK: vkGetPhysicalDeviceFormatProperties2 (modifier check)
+    IMP-->>SM: true
+    SM->>IMP: import(desc)
+    IMP->>VK: VkImportMemoryFdInfoKHR + vkCreateImage
+    IMP->>VK: vkAcquireSyncObject (drm-syncobj timeline)
+    IMP-->>SM: ImportedImage
+    SM->>SG: SurfaceNode.attach(image) + markDirty
+    SG->>VK: composite pass (sample client buffer)
+    VK->>VK: present to KMS framebuffer
+
+    Note over Client,VK: On release: wait semaphore → release fd → wl_buffer.release

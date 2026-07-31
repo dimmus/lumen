@@ -1,0 +1,25 @@
+flowchart TB
+    subgraph Core["Core Wayland P0"]
+        WL_COMP["wl_compositor"]
+        WL_SEAT["wl_seat"]
+        WL_OUT["wl_output / wl_output_management"]
+        WL_SHM["wl_shm / data-device"]
+    end
+
+    subgraph ShellProto["Shell P0"]
+        XDG["xdg-shell"]
+        LUMEN["zlm_shell_v1 + zlm_toplevel_v1"]
+    end
+
+    subgraph BufferProto["Zero-copy P0"]
+        DMabuf["linux-dmabuf-v1"]
+        SyncObj["linux-drm-syncobj-v1"]
+    end
+
+    subgraph Server["lx::wayland::server"]
+        DISPATCH["ProtocolDispatcher"]
+    end
+
+    Core --> DISPATCH
+    ShellProto --> DISPATCH
+    BufferProto --> DISPATCH

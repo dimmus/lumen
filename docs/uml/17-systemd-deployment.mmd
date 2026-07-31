@@ -1,0 +1,21 @@
+flowchart TB
+    subgraph Session["user session systemd --user"]
+        U_COMP["lumen-compositor.service"]
+        U_SHELL["lumen-shell.service"]
+        SK_WL["XDG_RUNTIME_DIR/lumen-0"]
+        SK_PRIV["lumen-compositor.private"]
+    end
+
+    subgraph FS["filesystem"]
+        BIN["/usr/bin/lumen-compositor"]
+        MOD["/usr/lib/lumen/modules"]
+        THEMES["/usr/share/lumen/themes"]
+        PROT["/usr/share/lumen/protocols"]
+    end
+
+    U_COMP --> SK_WL
+    U_COMP --> SK_PRIV
+    U_SHELL --> SK_WL
+    U_SHELL --> SK_PRIV
+    U_COMP --> BIN
+    U_SHELL --> BIN

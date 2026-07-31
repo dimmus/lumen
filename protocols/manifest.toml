@@ -1,0 +1,280 @@
+# Lumen Wayland protocol registry
+# Source of truth for fetch-protocols.sh, protocol_manifest.py, and CMake codegen.
+
+[upstream]
+wayland_repo = "https://gitlab.freedesktop.org/wayland/wayland.git"
+wayland_protocols_repo = "https://gitlab.freedesktop.org/wayland/wayland-protocols.git"
+wayland_protocols_tag = "1.49"
+
+[wlr]
+repo = "https://gitlab.freedesktop.org/wlroots/wlr-protocols.git"
+
+# P0 — required at compositor boot
+[[upstream.protocol]]
+name = "wayland"
+path = "wayland.xml"
+source = "wayland"
+priority = "P0"
+module = "lx.wayland.protocols.core"
+
+[[upstream.protocol]]
+name = "xdg-shell"
+path = "stable/xdg-shell/xdg-shell.xml"
+source = "wayland-protocols"
+priority = "P0"
+module = "lx.wayland.protocols.xdg"
+
+[[upstream.protocol]]
+name = "linux-dmabuf"
+path = "stable/linux-dmabuf/linux-dmabuf-v1.xml"
+source = "wayland-protocols"
+priority = "P0"
+module = "lx.wayland.protocols.dmabuf"
+
+[[upstream.protocol]]
+name = "linux-drm-syncobj"
+path = "staging/linux-drm-syncobj/linux-drm-syncobj-v1.xml"
+source = "wayland-protocols"
+priority = "P0"
+module = "lx.wayland.protocols.syncobj"
+
+[[upstream.protocol]]
+name = "xdg-output"
+path = "unstable/xdg-output/xdg-output-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P0"
+module = "lx.wayland.protocols.xdg_output"
+
+[[upstream.protocol]]
+name = "ext-session-lock"
+path = "staging/ext-session-lock/ext-session-lock-v1.xml"
+source = "wayland-protocols"
+priority = "P0"
+module = "lx.wayland.protocols.session_lock"
+
+[[upstream.protocol]]
+name = "text-input-unstable-v3"
+path = "unstable/text-input/text-input-unstable-v3.xml"
+source = "wayland-protocols"
+priority = "P0"
+module = "lx.wayland.protocols.text_input"
+
+[[wlr.protocol]]
+name = "wlr-layer-shell-unstable-v1"
+path = "unstable/wlr-layer-shell-unstable-v1.xml"
+priority = "P0"
+module = "lx.wayland.protocols.layer_shell"
+
+# P1 — enabled by default
+[[upstream.protocol]]
+name = "presentation-time"
+path = "stable/presentation-time/presentation-time.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.presentation"
+
+[[upstream.protocol]]
+name = "tablet"
+path = "unstable/tablet/tablet-unstable-v2.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.tablet"
+
+[[upstream.protocol]]
+name = "pointer-gestures"
+path = "unstable/pointer-gestures/pointer-gestures-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.pointer_gestures"
+
+[[upstream.protocol]]
+name = "xdg-activation"
+path = "staging/xdg-activation/xdg-activation-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.activation"
+
+[[upstream.protocol]]
+name = "viewporter"
+path = "stable/viewporter/viewporter.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.viewporter"
+
+[[upstream.protocol]]
+name = "xdg-dialog"
+path = "staging/xdg-dialog/xdg-dialog-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.xdg_dialog"
+
+[[upstream.protocol]]
+name = "idle-inhibit"
+path = "unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.idle_inhibit"
+
+[[upstream.protocol]]
+name = "xdg-decoration-unstable-v1"
+path = "unstable/xdg-decoration/xdg-decoration-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.xdg_decoration"
+
+[[upstream.protocol]]
+name = "ext-workspace-v1"
+path = "staging/ext-workspace/ext-workspace-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.ext_workspace"
+
+[[upstream.protocol]]
+name = "input-method-unstable-v2"
+path = "experimental/xx-input-method/xx-input-method-v2.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.input_method"
+
+[[upstream.protocol]]
+name = "pointer-constraints-unstable-v1"
+path = "unstable/pointer-constraints/pointer-constraints-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.pointer_constraints"
+
+[[upstream.protocol]]
+name = "relative-pointer-unstable-v1"
+path = "unstable/relative-pointer/relative-pointer-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.relative_pointer"
+
+[[upstream.protocol]]
+name = "wp-fractional-scale-v1"
+path = "staging/fractional-scale/fractional-scale-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.fractional_scale"
+
+[[upstream.protocol]]
+name = "cursor-shape-v1"
+path = "staging/cursor-shape/cursor-shape-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.cursor_shape"
+
+[[upstream.protocol]]
+name = "primary-selection-unstable-v1"
+path = "unstable/primary-selection/primary-selection-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.primary_selection"
+
+[[upstream.protocol]]
+name = "wp-security-context-v1"
+path = "staging/security-context/security-context-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.security_context"
+
+[[upstream.protocol]]
+name = "color-management-v1"
+path = "staging/color-management/color-management-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.color_management"
+
+[[upstream.protocol]]
+name = "xdg-session-management-v1"
+path = "staging/xdg-session-management/xdg-session-management-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.session_management"
+
+[[upstream.protocol]]
+name = "ext-foreign-toplevel-list"
+path = "staging/ext-foreign-toplevel-list/ext-foreign-toplevel-list-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.foreign_toplevel"
+
+[[wlr.protocol]]
+name = "wlr-output-management-unstable-v1"
+path = "unstable/wlr-output-management-unstable-v1.xml"
+priority = "P1"
+module = "lx.wayland.protocols.output_management"
+
+# P2 — optional globals
+[[upstream.protocol]]
+name = "xdg-toplevel-icon"
+path = "staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.toplevel_icon"
+
+[[upstream.protocol]]
+name = "ext-image-copy-capture"
+path = "staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.image_capture"
+
+[[upstream.protocol]]
+name = "single-pixel-buffer-v1"
+path = "staging/single-pixel-buffer/single-pixel-buffer-v1.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.single_pixel_buffer"
+
+[[upstream.protocol]]
+name = "alpha-modifier-v1"
+path = "staging/alpha-modifier/alpha-modifier-v1.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.alpha_modifier"
+
+[[upstream.protocol]]
+name = "xdg-foreign-unstable-v2"
+path = "unstable/xdg-foreign/xdg-foreign-unstable-v2.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.xdg_foreign"
+
+[[upstream.protocol]]
+name = "wp-tearing-control-v1"
+path = "staging/tearing-control/tearing-control-v1.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.tearing_control"
+
+[[upstream.protocol]]
+name = "wp-content-type-v1"
+path = "staging/content-type/content-type-v1.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.content_type"
+
+[[upstream.protocol]]
+name = "wp-fifo-v1"
+path = "staging/fifo/fifo-v1.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.fifo"
+
+[[upstream.protocol]]
+name = "wp-commit-timing-v1"
+path = "staging/commit-timing/commit-timing-v1.xml"
+source = "wayland-protocols"
+priority = "P2"
+module = "lx.wayland.protocols.commit_timing"
+
+# Lumen private — always from this repository
+[[lumen.protocol]]
+name = "zlm_shell"
+path = "lumen/zlm_shell_v1.xml"
+priority = "P0"
+module = "lx.wayland.protocols.lumen"
+privileged = true
+
+# Codegen priority filter: P0 always; P1 when LUMEN_PROTOCOLS_P1=ON; P2 when P2=ON

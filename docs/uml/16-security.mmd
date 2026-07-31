@@ -1,0 +1,20 @@
+flowchart TB
+    subgraph Traditional["Default: Unix permissions"]
+        SOCK["Wayland socket session dir"]
+        CRED["SO_PEERCRED UID/GID/PID"]
+        RULES["Window rules by app_id / path"]
+        SOCK --> CRED --> RULES
+    end
+
+    subgraph OptionalFlatpak["Optional Flatpak build"]
+        PORTAL["xdg-desktop-portal adapter"]
+        PORTAL --> SNAPTOK["security context token"]
+    end
+
+    subgraph CompositorCheck["Compositor enforcement"]
+        ALLOW["Allow same session UID"]
+        DENY["Deny privileged ops without policy"]
+    end
+
+    Traditional --> CompositorCheck
+    OptionalFlatpak -.-> CompositorCheck

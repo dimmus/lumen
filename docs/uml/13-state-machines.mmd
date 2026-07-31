@@ -1,0 +1,55 @@
+%% Surface lifecycle
+stateDiagram-v2
+    state Surface {
+        [*] --> Created
+        Created --> PendingAttach: attach(buffer)
+        PendingAttach --> PendingCommit: commit
+        PendingCommit --> Mapped: role + first commit
+        Mapped --> Damaged: attach + damage
+        Damaged --> PendingCommit
+        Mapped --> Unmapped: unmap
+        Unmapped --> Mapped: recommit
+        Unmapped --> Destroyed
+        Created --> Destroyed
+        Mapped --> Destroyed
+        Destroyed --> [*]
+    }
+
+---
+%% Seat / focus lifecycle
+stateDiagram-v2
+    state Seat {
+        [*] --> Idle
+        Idle --> PointerFocus: enter(surface)
+        PointerFocus --> Idle: leave
+        Idle --> KeyboardFocus: focus(surface)
+        KeyboardFocus --> Idle: unfocus
+        PointerFocus --> CompositorGrab: shell move/resize
+        CompositorGrab --> PointerFocus: release
+    }
+
+---
+%% Widget lifecycle
+stateDiagram-v2
+    state Widget {
+        [*] --> Detached
+        Detached --> Attached: mount()
+        Attached --> Styled: theme resolved
+        Styled --> LaidOut: layout pass
+        LaidOut --> Visible
+        Visible --> Dirty: property change
+        Dirty --> LaidOut
+        Attached --> Destroyed
+        Destroyed --> [*]
+    }
+
+---
+%% zlm_toplevel_v1 (compositor-owned)
+stateDiagram-v2
+    state ZlmToplevel {
+        [*] --> Created: xdg_toplevel mapped
+        Created --> Active: snapshot/delta to shell
+        Active --> Active: state/geometry updates
+        Active --> Destroyed: unmap
+        Destroyed --> [*]
+    }

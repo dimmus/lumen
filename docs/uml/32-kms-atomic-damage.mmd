@@ -1,0 +1,11 @@
+sequenceDiagram
+    participant RT as Render thread
+    participant AC as kms_atomic_commit
+    participant DRM as KMS driver
+    participant PT as presentation_tracker
+
+    RT->>AC: commit(request + kms_damage_region)
+    AC->>DRM: atomic commit + damage blob
+    DRM-->>AC: page_flip_event
+    AC->>PT: on_page_flip(event)
+    PT->>PT: on_feedback(kms_damage, hw_clock)

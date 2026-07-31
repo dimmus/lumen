@@ -1,0 +1,32 @@
+flowchart LR
+    subgraph Kernel["Linux Kernel"]
+        KMS["DRM/KMS"]
+        EV["evdev / libinput"]
+    end
+
+    subgraph CompProc["Process: lumen-compositor"]
+        WLS["Wayland Server"]
+        VK["Vulkan Compositor Engine"]
+        SURF["Surface Manager"]
+        WLS --> SURF --> VK
+        VK --> KMS
+    end
+
+    subgraph ShellProc["Process: lumen-shell"]
+        PANEL["Panel / Dock"]
+        NOTIF["Notifications"]
+        WMGR["Window Manager Client"]
+        PANEL --> WMGR
+        NOTIF --> WMGR
+    end
+
+    subgraph AppProc["Process: user apps"]
+        APPFW["lx::app runtime"]
+        WIDGETS["lx::ui widgets"]
+        APPFW --> WIDGETS
+    end
+
+    EV --> WLS
+    ShellProc -->|"Wayland client"| WLS
+    AppProc -->|"Wayland client"| WLS
+    ShellProc -.->|"zlm_shell_v1"| CompProc

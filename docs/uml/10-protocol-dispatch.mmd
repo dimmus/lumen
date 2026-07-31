@@ -1,0 +1,47 @@
+classDiagram
+    direction TB
+
+    note for WaylandServer "libwayland-backed seam\nwl_display_create + wl_display_init_shm\nadd_global -> wl_global_create\nbind trampoline -> bind_fn -> wl_resource_set_implementation"
+
+    class WaylandServer {
+        +bind(socket) result~void~
+        +dispatch(timeout) int
+        +addGlobal(desc, bind_fn) void
+        +allowPrivilegedGlobal(cred, name) bool
+        +ensureClient(wl_client) ClientConnection*
+        +eventFd() int
+        -wl_display* display_
+        -globals_ GlobalEntry[]
+    }
+
+    class ClientConnection {
+        +id: unsigned
+        +credentials: UnixCredentials
+        +native: wl_client*
+        +isPrivilegedShell: bool
+    }
+
+    class Resource {
+        +create(client, iface, version, id) Resource
+        +setImplementation(vtable, data, destroy) void
+        +postError(code, msg) void
+        +native: wl_resource*
+    }
+
+    class GlobalDescriptor {
+        +interface_name: const char*
+        +version: int
+        +privileged: bool
+        +interface_desc: const wl_interface*
+    }
+
+    class GlobalBindFn {
+        <<callback>>
+        +bind(client, id, version) void
+    }
+
+    WaylandServer o-- ClientConnection
+    WaylandServer o-- GlobalDescriptor
+    WaylandServer --> GlobalBindFn
+    GlobalBindFn --> Resource
+    ClientConnection --> Resource

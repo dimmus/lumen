@@ -1,0 +1,25 @@
+classDiagram
+    direction TB
+
+    class PolicyRegistry {
+        +instance() PolicyRegistry&
+        +active() WindowManagerPolicy&
+        +load_tiling_plugin(path) bool
+    }
+
+    class WindowManagerPolicy {
+        <<interface>>
+        +on_map(toplevel)
+        +on_focus_changed(old, new)
+        +on_geometry(toplevel, x, y, w, h)
+    }
+
+    class StackingPolicy
+    class TilingPolicy {
+        <<optional plugin>>
+    }
+
+    WindowManagerPolicy <|-- StackingPolicy
+    WindowManagerPolicy <|-- TilingPolicy
+    PolicyRegistry --> StackingPolicy
+    PolicyRegistry ..> TilingPolicy

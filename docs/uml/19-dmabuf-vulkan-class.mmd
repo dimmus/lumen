@@ -1,0 +1,57 @@
+classDiagram
+    direction TB
+
+    class LinuxDmabufV1 {
+        <<Wayland protocol>>
+        +create_params() zwp_linux_buffer_params_v1
+        +get_default_feedback() zwp_linux_dmabuf_feedback_v1
+    }
+
+    class BufferParams {
+        +add(fd, offset, stride, modifier_hi, modifier_lo)
+        +create_immed(id, width, height, format, flags)
+    }
+
+    class CompositorSurfaceManager {
+        +onCommit(surface, buffer) void
+        +extractDmabufDesc(buffer) DmabufDesc
+    }
+
+    class DmabufDesc {
+        +width: uint32
+        +height: uint32
+        +format: FourCC
+        +planes: Plane[4]
+        +modifier: uint64
+    }
+
+    class DmabufImporter {
+        +canImport(desc) bool
+        +import(desc) ImportedImage
+        +release(image) void
+    }
+
+    class ImportedImage {
+        +vkImage: VkImage
+        +memory: VkDeviceMemory
+        +layout: VkImageLayout
+        +semaphore: VkSemaphore
+    }
+
+    class GfxDevice {
+        +physicalDevice: VkPhysicalDevice
+        +device: VkDevice
+        +externalMemoryFeatures() Flags
+    }
+
+    class SurfaceNode {
+        +attach(image) void
+        +damage(region) void
+    }
+
+    LinuxDmabufV1 --> BufferParams
+    CompositorSurfaceManager --> DmabufDesc
+    CompositorSurfaceManager --> DmabufImporter
+    DmabufImporter --> ImportedImage
+    DmabufImporter --> GfxDevice
+    SurfaceNode --> ImportedImage

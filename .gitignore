@@ -1,0 +1,20 @@
+# Build artifacts
+/build/
+/out/
+/.cache/
+compile_commands.json
+
+# Generated protocol bindings
+/generated/
+
+# Fetched upstream protocols (run scripts/fetch-protocols.sh)
+/protocols/upstream/
+
+# IDE
+.vscode/
+.idea/
+*.user
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,44 @@
+classDiagram
+    direction TB
+
+    class Executor {
+        +global() Executor&
+        +post(affinity, callback) bool
+        +drain(affinity) void
+        +ui_strand() Strand&
+        +render_strand() Strand&
+        +worker_strand() Strand&
+    }
+
+    class Strand {
+        +try_post(callback) bool
+        +drain() void
+        +bound_affinity() affinity
+    }
+
+    class EventLoop {
+        +post(callback) bool
+        +run() int
+        +strand() Strand&
+    }
+
+    class SpscQueue~T~ {
+        +try_push(T) bool
+        +try_pop(T&) bool
+    }
+
+    class SnapshotBuffer {
+        +publish(draws, damage, index) void
+        +acquire() immutable_frame_snapshot
+    }
+
+    class SceneGraph {
+        +commit_frame(index) void
+        +acquire_render_snapshot() immutable_frame_snapshot
+    }
+
+    Executor o-- Strand
+    EventLoop o-- Strand
+    EventLoop --> SpscQueue
+    Strand --> SpscQueue
+    SceneGraph --> SnapshotBuffer

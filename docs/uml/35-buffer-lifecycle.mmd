@@ -1,0 +1,9 @@
+stateDiagram-v2
+    [*] --> imported: on_import
+    imported --> attached: on_attach
+    attached --> in_flight: on_present
+    in_flight --> pending_release: on_render_done
+    pending_release --> released: flush_pending_releases
+    released --> [*]
+    in_flight --> released: critical pressure
+    pending_release --> released: moderate pressure

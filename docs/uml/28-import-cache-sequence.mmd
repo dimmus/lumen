@@ -1,0 +1,18 @@
+sequenceDiagram
+    participant Surf as surface_manager
+    participant Cache as dmabuf_import_cache
+    participant Imp as dmabuf_importer
+    participant Scene as surface_node
+
+    Surf->>Cache: acquire(key, desc)
+    alt cache hit
+        Cache-->>Surf: cached imported_image
+    else cache miss
+        Cache->>Imp: import(desc)
+        Imp-->>Cache: new imported_image
+        Cache->>Cache: store(key, image)
+        Cache-->>Surf: imported_image
+    end
+    Surf->>Scene: attach(image)
+
+    Note over Cache: client disconnect → evict_client(client_id)

@@ -1,0 +1,34 @@
+classDiagram
+    direction LR
+
+    class ZlmToplevelV1 {
+        <<compositor-owned handle>>
+    }
+
+    class ZlmShell {
+        +get_workspace_manager()
+        +get_policy_bridge()
+        +get_output_manager()
+        +get_layer_shell()
+    }
+
+    class ZlmPolicyBridge {
+        +set_toplevel_stacking_index(toplevel, index)
+        +snapshot_begin..done
+        +toplevel_state()
+        +toplevel_geometry()
+        +stacking_order_changed()
+    }
+
+    class ZlmOutputManager {
+        +get_layout(output)
+    }
+
+    class ZlmLayerShell {
+        +get_layer_surface(surface, layer)
+    }
+
+    ZlmShell --> ZlmPolicyBridge
+    ZlmShell --> ZlmOutputManager
+    ZlmShell --> ZlmLayerShell
+    ZlmPolicyBridge --> ZlmToplevelV1

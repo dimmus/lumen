@@ -1,0 +1,18 @@
+sequenceDiagram
+    participant Timer as vsync timer (UI thread)
+    participant UI as tick_ui
+    participant SB as snapshot_buffer
+    participant CV as render_cv
+    participant RT as render thread
+    participant TR as tick_render
+
+    loop each vsync interval
+        Timer->>UI: on_vsync()
+        UI->>UI: wayland.dispatch + scene.update
+        UI->>SB: commit_frame(index)
+        UI->>CV: notify render_pending
+        CV->>RT: wake
+        RT->>TR: tick_render()
+        TR->>SB: acquire_render_snapshot()
+        TR->>TR: Vulkan record (P1)
+    end

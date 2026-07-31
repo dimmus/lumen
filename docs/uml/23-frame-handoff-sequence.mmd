@@ -1,0 +1,26 @@
+sequenceDiagram
+    participant UI as UI thread
+    participant SG as scene_graph
+    participant SB as snapshot_buffer
+    participant RT as Render thread
+    participant VK as Vulkan
+
+    Note over UI: affinity = ui
+    UI->>SG: update(dt), collect_damage
+    UI->>SG: build_draw_list_into(write_draw_list)
+    UI->>SG: commit_frame(frame_index)
+    SG->>SB: publish(draws, damage, index)
+    Note over SB: atomic swap write buffer
+
+    Note over RT: affinity = render
+    RT->>SG: acquire_render_snapshot()
+    SG->>SB: acquire()
+    SB-->>RT: immutable_frame_snapshot
+    RT->>VK: record draws + present
+    Note over RT,VK: snapshot is read-only; no UI mutation
+
+    participant Worker as Worker thread
+    Note over Worker: affinity = worker
+    Worker->>Worker: layout / decode / shape
+    Worker->>UI: executor.post(ui, apply_results)
+    UI->>SG: apply layout results (UI only)

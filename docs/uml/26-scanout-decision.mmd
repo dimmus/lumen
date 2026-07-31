@@ -1,0 +1,23 @@
+flowchart TD
+    START([tick_ui: evaluate frame])
+    EN{enable_direct_scanout?}
+    CAND[For each mapped surface]
+    FS{fullscreen + opaque?}
+    MOD{modifier + format OK?}
+    PLANE{plane_manager.can_direct_scanout?}
+    OCCL{occluded by translucent window?}
+    DIRECT[decision: direct_scanout]
+    HYBRID[decision: hybrid]
+    VK[decision: vulkan_composite]
+
+    START --> EN
+    EN -->|no| VK
+    EN -->|yes| CAND --> FS
+    FS -->|no| VK
+    FS -->|yes| MOD
+    MOD -->|no| VK
+    MOD -->|yes| PLANE
+    PLANE -->|no| VK
+    PLANE -->|yes| OCCL
+    OCCL -->|yes| HYBRID
+    OCCL -->|no| DIRECT
