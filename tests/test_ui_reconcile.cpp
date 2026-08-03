@@ -334,9 +334,13 @@ LUMEN_TEST(layout_invalidation_does_not_damage_the_whole_surface) {
 }
 
 LUMEN_TEST(arena_exhaustion_is_reported_not_ignored) {
-    // A tiny arena cannot hold the descriptor; the context must say so instead of
-    // silently returning a truncated tree.
+    // An exhausted arena cannot hold the descriptor; the context must say so instead of
+    // silently returning a truncated tree. Arenas are page-granular, so drain the mapping
+    // rather than assuming an 8-byte request yields an 8-byte arena.
     lx::runtime::memory_arena tiny{8};
+    LUMEN_CHECK(tiny.allocate(tiny.capacity_bytes(), 1) != nullptr);
+    LUMEN_CHECK(tiny.would_overflow(1));
+
     lx::ui::build_context ctx{tiny};
     lx::ui::build_scope scope{ctx};
 

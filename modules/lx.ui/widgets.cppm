@@ -62,14 +62,14 @@ class button : public widget {
 public:
     button();
     void set_text(const char* text);
-    void set_on_click(lx::runtime::callback handler);
+    void set_on_click(lx::runtime::task handler);
     lx::size2i preferred_size(layout::constraints c) const override;
     bool on_mouse(mouse_event event) override;
     void paint(lx::gfx::render_pass& pass) override;
 
 private:
     const char* text_ = "";
-    lx::runtime::callback on_click_{};
+    lx::runtime::task on_click_{};
     state visual_state_ = state::normal;
 };
 
@@ -78,7 +78,7 @@ public:
     entry();
     void set_text(const char* text);
     void set_placeholder(const char* text);
-    void set_on_change(lx::runtime::callback handler);
+    void set_on_change(lx::runtime::task handler);
     lx::size2i preferred_size(layout::constraints c) const override;
     bool on_key(key_event event) override;
     void insert_text(const char* utf8);
@@ -87,7 +87,7 @@ public:
 private:
     const char* text_ = "";
     const char* placeholder_ = "";
-    lx::runtime::callback on_change_{};
+    lx::runtime::task on_change_{};
     unsigned caret_ = 0;
 };
 
@@ -190,7 +190,7 @@ void lx::ui::button::set_text(const char* t) {
     text_ = t;
     a11y_name_ = t;
 }
-void lx::ui::button::set_on_click(lx::runtime::callback cb) { on_click_ = cb; }
+void lx::ui::button::set_on_click(lx::runtime::task cb) { on_click_ = cb; }
 lx::size2i lx::ui::button::preferred_size(layout::constraints c) const {
     return widget::preferred_size(c);
 }
@@ -203,7 +203,7 @@ void lx::ui::button::paint(lx::gfx::render_pass&) {}
 lx::ui::entry::entry() { a11y_role_ = a11y::role::text_field; }
 void lx::ui::entry::set_text(const char* t) { text_ = t; }
 void lx::ui::entry::set_placeholder(const char* t) { placeholder_ = t; }
-void lx::ui::entry::set_on_change(lx::runtime::callback cb) { on_change_ = cb; }
+void lx::ui::entry::set_on_change(lx::runtime::task cb) { on_change_ = cb; }
 lx::size2i lx::ui::entry::preferred_size(layout::constraints c) const {
     return widget::preferred_size(c);
 }

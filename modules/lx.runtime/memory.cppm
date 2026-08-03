@@ -1,7 +1,12 @@
 module;
 
+#include <cstddef>
+#include <sys/mman.h>
+#include <unistd.h>
+
 import lx.foundation;
 import lx.sync;
+import lx.trace;
 
 export module lx.runtime:memory;
 
@@ -31,22 +36,40 @@ struct memory_budget_config {
 
 using memory_pressure_handler = void (*)(memory_pressure level, void* user_data);
 
-/// Frame-local bump allocator — no heap after init.
+/// Frame-local bump allocator — one anonymous mapping at construction, no heap after.
+///
+/// `capacity_bytes()` is the size of storage this arena actually owns, never the size it
+/// was asked for: if the mapping fails the arena reports (and hands out) zero bytes rather
+/// than bounds-checking against memory it does not have.
 class memory_arena {
 public:
-    explicit memory_arena(unsigned capacity_bytes = 0);
+    static constexpr unsigned k_default_capacity = 65536;
 
+    explicit memory_arena(unsigned capacity_bytes = 0);
+    ~memory_arena();
+
+    memory_arena(const memory_arena&) = delete;
+    memory_arena& operator=(const memory_arena&) = delete;
+    memory_arena(memory_arena&& other) noexcept;
+    memory_arena& operator=(memory_arena&& other) noexcept;
+
+    /// Returns nullptr when the request does not fit; never returns unowned storage.
+    /// `alignment` must be a power of two.
     [[nodiscard]] void* allocate(unsigned size, unsigned alignment = alignof(void*));
     void reset();
     [[nodiscard]] unsigned used_bytes() const;
+    /// Bytes actually mapped — 0 if the mapping failed.
     [[nodiscard]] unsigned capacity_bytes() const;
     [[nodiscard]] bool would_overflow(unsigned size) const;
+    /// False when backing storage could not be obtained.
+    [[nodiscard]] bool valid() const;
 
 private:
-    static constexpr unsigned k_inline_capacity = 65536;
-    unsigned char inline_storage_[k_inline_capacity]{};
-    unsigned char* storage_ = inline_storage_;
-    unsigned capacity_ = k_inline_capacity;
+    void release();
+
+    unsigned char* storage_ = nullptr;
+    unsigned capacity_ = 0;
+    unsigned mapped_bytes_ = 0;
     unsigned offset_ = 0;
 };
 
@@ -90,18 +113,81 @@ private:
 } // namespace lx::runtime
 
 
-lx::runtime::memory_arena::memory_arena(unsigned capacity_bytes)
-    : capacity_{capacity_bytes > 0 ? capacity_bytes : k_inline_capacity} {
-    if (capacity_bytes > k_inline_capacity) {
-        /* P0: mmap or static pool backing for large arenas */
-        capacity_ = capacity_bytes;
+lx::runtime::memory_arena::memory_arena(unsigned capacity_bytes) {
+    const unsigned want = capacity_bytes > 0 ? capacity_bytes : k_default_capacity;
+
+    const long page = ::sysconf(_SC_PAGESIZE);
+    const unsigned page_size = page > 0 ? static_cast<unsigned>(page) : 4096u;
+    // Round up to a whole page; refuse rather than wrap if the round-up overflows.
+    if (want > 0xFFFFFFFFu - (page_size - 1)) {
+        lx::trace::logger::global().log(lx::trace::level::error, "runtime.memory",
+                                        "arena capacity too large to map");
+        return;
     }
+    const unsigned mapped = ((want + page_size - 1) / page_size) * page_size;
+
+    void* base = ::mmap(nullptr, static_cast<std::size_t>(mapped), PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED) {
+        // Report zero capacity so allocate() refuses rather than handing out storage we
+        // do not own. A caller that checks its result degrades; one that trusts a lied-about
+        // capacity corrupts whatever follows the arena.
+        lx::trace::logger::global().log(lx::trace::level::error, "runtime.memory",
+                                        "arena mmap failed — arena has zero capacity");
+        return;
+    }
+
+    storage_ = static_cast<unsigned char*>(base);
+    mapped_bytes_ = mapped;
+    capacity_ = mapped;
+}
+
+void lx::runtime::memory_arena::release() {
+    if (storage_ && mapped_bytes_ > 0)
+        ::munmap(storage_, static_cast<std::size_t>(mapped_bytes_));
+    storage_ = nullptr;
+    capacity_ = 0;
+    mapped_bytes_ = 0;
+    offset_ = 0;
+}
+
+lx::runtime::memory_arena::~memory_arena() { release(); }
+
+lx::runtime::memory_arena::memory_arena(memory_arena&& other) noexcept
+    : storage_{other.storage_},
+      capacity_{other.capacity_},
+      mapped_bytes_{other.mapped_bytes_},
+      offset_{other.offset_} {
+    other.storage_ = nullptr;
+    other.capacity_ = 0;
+    other.mapped_bytes_ = 0;
+    other.offset_ = 0;
+}
+
+lx::runtime::memory_arena& lx::runtime::memory_arena::operator=(memory_arena&& other) noexcept {
+    if (this == &other)
+        return *this;
+    release();
+    storage_ = other.storage_;
+    capacity_ = other.capacity_;
+    mapped_bytes_ = other.mapped_bytes_;
+    offset_ = other.offset_;
+    other.storage_ = nullptr;
+    other.capacity_ = 0;
+    other.mapped_bytes_ = 0;
+    other.offset_ = 0;
+    return *this;
 }
 
 void* lx::runtime::memory_arena::allocate(unsigned size, unsigned alignment) {
-    if (size == 0) return nullptr;
-    unsigned aligned = (offset_ + alignment - 1) & ~(alignment - 1);
-    if (aligned + size > capacity_) return nullptr;
+    if (size == 0 || !storage_) return nullptr;
+    if (alignment == 0 || (alignment & (alignment - 1)) != 0) return nullptr;
+
+    // offset_ <= capacity_ always holds, so the round-up cannot wrap for sane alignments.
+    if (offset_ > 0xFFFFFFFFu - (alignment - 1)) return nullptr;
+    const unsigned aligned = (offset_ + alignment - 1) & ~(alignment - 1);
+    if (aligned > capacity_ || size > capacity_ - aligned) return nullptr;
+
     void* ptr = storage_ + aligned;
     offset_ = aligned + size;
     return ptr;
@@ -111,9 +197,10 @@ void lx::runtime::memory_arena::reset() { offset_ = 0; }
 
 unsigned lx::runtime::memory_arena::used_bytes() const { return offset_; }
 unsigned lx::runtime::memory_arena::capacity_bytes() const { return capacity_; }
+bool lx::runtime::memory_arena::valid() const { return storage_ != nullptr; }
 
 bool lx::runtime::memory_arena::would_overflow(unsigned size) const {
-    return offset_ + size > capacity_;
+    return offset_ > capacity_ || size > capacity_ - offset_;
 }
 
 lx::runtime::memory_budget_coordinator::memory_budget_coordinator(memory_budget_config config)
@@ -122,10 +209,12 @@ lx::runtime::memory_budget_coordinator::memory_budget_coordinator(memory_budget_
       render_arena_{config.render_arena_bytes},
       worker_arena_{config.worker_arena_bytes},
       cold_arena_{config.cold_arena_bytes} {
-    pool_capacity_[0] = config.ui_arena_bytes;
-    pool_capacity_[1] = config.render_arena_bytes;
-    pool_capacity_[2] = config.worker_arena_bytes;
-    pool_capacity_[3] = config.cold_arena_bytes;
+    // Capacity comes from the arenas, not the config: pressure must be evaluated against
+    // storage that exists. A failed mapping shows up as a zero-capacity pool here.
+    pool_capacity_[0] = ui_arena_.capacity_bytes();
+    pool_capacity_[1] = render_arena_.capacity_bytes();
+    pool_capacity_[2] = worker_arena_.capacity_bytes();
+    pool_capacity_[3] = cold_arena_.capacity_bytes();
 }
 
 void lx::runtime::memory_budget_coordinator::set_config(memory_budget_config config) {

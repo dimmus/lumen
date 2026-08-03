@@ -4,6 +4,7 @@ module;
 #include <atomic>
 #include <cstddef>
 #include <new>
+#include <thread>
 #include <utility>
 
 import lx.foundation;
@@ -79,15 +80,66 @@ private:
     bool dropped_ = false;
 };
 
+/// What the producer does when no slot is free to write into.
 enum class backpressure_policy {
+    /// Skip the frame immediately. Lowest producer cost, visible frame drops.
     drop_latest,
+    /// Spin-wait (bounded) for the consumer to release a slot. No drops until the bound
+    /// is hit; costs UI-thread time. Intended for latency experiments, not production.
     stall_ui,
+    /// Use every slot before considering a drop; ignores `max_in_flight` for admission.
+    /// With one consumer a slot is always free, so this never drops.
     triple_buffer,
 };
 
 struct snapshot_config {
     backpressure_policy backpressure = backpressure_policy::triple_buffer;
+    /// Admission limit for `drop_latest` / `stall_ui`. Ignored by `triple_buffer`.
     unsigned max_in_flight = 2;
+};
+
+inline constexpr unsigned k_no_slot = ~0u;
+/// Yield iterations before `stall_ui` gives up. Bounded so a stalled or crashed consumer
+/// cannot wedge the producer thread forever.
+inline constexpr unsigned k_stall_yield_budget = 1024;
+
+class snapshot_buffer;
+
+/// Exclusive right to write one slot, held across the whole frame build.
+///
+/// Slot validation happens when the lease is taken, not when it is published: the producer
+/// mutates the slot's `draw_list` for the entire build, so checking afterwards checks the
+/// wrong instant. An invalid lease means no slot was free — build nothing.
+class write_lease {
+public:
+    write_lease() = default;
+
+    write_lease(const write_lease&) = delete;
+    write_lease& operator=(const write_lease&) = delete;
+    write_lease(write_lease&& other) noexcept { *this = std::move(other); }
+    write_lease& operator=(write_lease&& other) noexcept {
+        if (this != &other) {
+            owner_ = other.owner_;
+            draws_ = other.draws_;
+            slot_ = other.slot_;
+            other.owner_ = nullptr;
+            other.draws_ = nullptr;
+            other.slot_ = k_no_slot;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] bool valid() const { return draws_ != nullptr; }
+    /// Precondition: `valid()`.
+    [[nodiscard]] draw_list& draws() const { return *draws_; }
+    [[nodiscard]] unsigned slot() const { return slot_; }
+
+private:
+    friend class snapshot_buffer;
+
+    snapshot_buffer* owner_ = nullptr;
+    draw_list* draws_ = nullptr;
+    unsigned slot_ = k_no_slot;
 };
 
 class snapshot_buffer {
@@ -97,9 +149,11 @@ public:
     void set_config(snapshot_config config);
     [[nodiscard]] snapshot_config config() const;
 
-    [[nodiscard]] draw_list& write_draw_list();
-    [[nodiscard]] bool try_publish(lx::rect2i damage, unsigned frame_index);
-    void publish(lx::rect2i damage, unsigned frame_index);
+    /// Reserves a slot no consumer can be holding, applying the backpressure policy.
+    /// An invalid lease means the frame must be skipped — do not build a draw list.
+    [[nodiscard]] write_lease begin_frame();
+    /// Publishes a lease and consumes it. False if the lease was invalid or not ours.
+    [[nodiscard]] bool publish(write_lease& lease, lx::rect2i damage, unsigned frame_index);
 
     [[nodiscard]] const immutable_frame_snapshot& acquire();
     void release(const immutable_frame_snapshot& snapshot);
@@ -110,7 +164,10 @@ public:
     [[nodiscard]] bool would_stall() const;
 
 private:
-    [[nodiscard]] unsigned pick_write_slot() const;
+    /// A slot is writable only if it is neither the published slot nor held by a reader.
+    /// Returns `k_no_slot` when every slot is busy — never a live slot.
+    [[nodiscard]] unsigned find_free_slot() const;
+    [[nodiscard]] bool admission_blocked() const;
 
     snapshot_config config_{};
     immutable_frame_snapshot buffers_[k_snapshot_slot_count]{};
@@ -119,7 +176,6 @@ private:
     std::atomic<unsigned> publish_count_{0};
     std::atomic<unsigned> dropped_count_{0};
     std::atomic<unsigned> in_flight_{0};
-    unsigned write_hint_ = 1;
 };
 
 } // namespace lx::scene
@@ -235,60 +291,97 @@ lx::scene::snapshot_buffer::snapshot_buffer(snapshot_config config) : config_{co
 void lx::scene::snapshot_buffer::set_config(snapshot_config config) { config_ = config; }
 lx::scene::snapshot_config lx::scene::snapshot_buffer::config() const { return config_; }
 
-unsigned lx::scene::snapshot_buffer::pick_write_slot() const {
+unsigned lx::scene::snapshot_buffer::find_free_slot() const {
     const unsigned current = read_index_.load(std::memory_order_acquire);
     for (unsigned i = 1; i < k_snapshot_slot_count; ++i) {
         const unsigned idx = (current + i) % k_snapshot_slot_count;
         if (readers_[idx].load(std::memory_order_acquire) == 0)
             return idx;
     }
-    return (current + 1) % k_snapshot_slot_count;
+    // Every other slot is leased to a reader. Say so rather than handing back a slot
+    // somebody is reading — the caller drops the frame instead of tearing it.
+    return k_no_slot;
 }
 
-lx::scene::draw_list& lx::scene::snapshot_buffer::write_draw_list() {
-    write_hint_ = pick_write_slot();
-    return buffers_[write_hint_].draws_;
-}
-
-bool lx::scene::snapshot_buffer::would_stall() const {
+bool lx::scene::snapshot_buffer::admission_blocked() const {
+    if (config_.backpressure == backpressure_policy::triple_buffer)
+        return false;
     return in_flight_.load(std::memory_order_acquire) >= config_.max_in_flight;
 }
 
-bool lx::scene::snapshot_buffer::try_publish(lx::rect2i damage, unsigned frame_index) {
-    const unsigned in_flight = in_flight_.load(std::memory_order_acquire);
+bool lx::scene::snapshot_buffer::would_stall() const { return admission_blocked(); }
 
-    if (in_flight >= config_.max_in_flight) {
-        if (config_.backpressure == backpressure_policy::drop_latest) {
+lx::scene::write_lease lx::scene::snapshot_buffer::begin_frame() {
+    write_lease lease{};
+
+    switch (config_.backpressure) {
+    case backpressure_policy::drop_latest:
+        if (admission_blocked()) {
             dropped_count_.fetch_add(1, std::memory_order_relaxed);
-            return false;
+            return lease;
         }
-        if (config_.backpressure == backpressure_policy::stall_ui ||
-            config_.backpressure == backpressure_policy::triple_buffer) {
-            return false;
+        break;
+
+    case backpressure_policy::stall_ui: {
+        // Actually wait, which is what the policy name promises. Bounded: a wedged
+        // consumer must degrade to a dropped frame, not a hung producer thread.
+        unsigned spins = 0;
+        while (admission_blocked() && spins < k_stall_yield_budget) {
+            std::this_thread::yield();
+            ++spins;
+        }
+        if (admission_blocked()) {
+            dropped_count_.fetch_add(1, std::memory_order_relaxed);
+            return lease;
+        }
+        break;
+    }
+
+    case backpressure_policy::triple_buffer:
+        // Admission is slot availability alone — that is what the third slot is for.
+        break;
+    }
+
+    unsigned slot = find_free_slot();
+    if (slot == k_no_slot && config_.backpressure == backpressure_policy::stall_ui) {
+        unsigned spins = 0;
+        while (slot == k_no_slot && spins < k_stall_yield_budget) {
+            std::this_thread::yield();
+            slot = find_free_slot();
+            ++spins;
         }
     }
 
-    const unsigned write_idx = write_hint_;
-    if (write_idx == read_index_.load(std::memory_order_acquire) ||
-        readers_[write_idx].load(std::memory_order_acquire) != 0) {
+    if (slot == k_no_slot) {
         dropped_count_.fetch_add(1, std::memory_order_relaxed);
-        return false;
+        return lease;
     }
 
-    buffers_[write_idx].damage_ = damage;
-    buffers_[write_idx].frame_index_ = frame_index;
-    buffers_[write_idx].dropped_ = false;
+    lease.owner_ = this;
+    lease.slot_ = slot;
+    lease.draws_ = &buffers_[slot].draws_;
+    return lease;
+}
 
-    read_index_.store(write_idx, std::memory_order_release);
+bool lx::scene::snapshot_buffer::publish(write_lease& lease, lx::rect2i damage,
+                                         unsigned frame_index) {
+    if (!lease.valid() || lease.owner_ != this)
+        return false;
+
+    const unsigned slot = lease.slot_;
+    lease = write_lease{}; // a lease publishes at most once
+
+    // Safe without re-validation: `begin_frame` reserved a slot that was neither published
+    // nor held, and a reader can only take the slot `read_index_` names — which only this
+    // thread moves, and only here.
+    buffers_[slot].damage_ = damage;
+    buffers_[slot].frame_index_ = frame_index;
+    buffers_[slot].dropped_ = false;
+
+    read_index_.store(slot, std::memory_order_release);
     in_flight_.fetch_add(1, std::memory_order_acq_rel);
     publish_count_.fetch_add(1, std::memory_order_relaxed);
     return true;
-}
-
-void lx::scene::snapshot_buffer::publish(lx::rect2i damage, unsigned frame_index) {
-    if (!try_publish(damage, frame_index) &&
-        config_.backpressure == backpressure_policy::drop_latest) {
-    }
 }
 
 const lx::scene::immutable_frame_snapshot& lx::scene::snapshot_buffer::acquire() {

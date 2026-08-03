@@ -68,8 +68,8 @@ public:
     widget_builder& text(const char* t);
     widget_builder& enabled(bool e);
     widget_builder& style(style_ref s);
-    widget_builder& on_click(lx::runtime::callback handler);
-    widget_builder& on_change(lx::runtime::callback handler);
+    widget_builder& on_click(lx::runtime::task handler);
+    widget_builder& on_change(lx::runtime::task handler);
     void mount(window& parent);
     [[nodiscard]] WidgetT& get();
 
@@ -164,14 +164,14 @@ lx::ui::widget_builder<WidgetT>& lx::ui::widget_builder<WidgetT>::style(style_re
 }
 template<typename WidgetT>
 lx::ui::widget_builder<WidgetT>&
-lx::ui::widget_builder<WidgetT>::on_click(lx::runtime::callback cb) {
+lx::ui::widget_builder<WidgetT>::on_click(lx::runtime::task cb) {
     if constexpr (requires(WidgetT w) { w.set_on_click(nullptr); })
         widget_.set_on_click(cb);
     return *this;
 }
 template<typename WidgetT>
 lx::ui::widget_builder<WidgetT>&
-lx::ui::widget_builder<WidgetT>::on_change(lx::runtime::callback cb) {
+lx::ui::widget_builder<WidgetT>::on_change(lx::runtime::task cb) {
     if constexpr (requires(WidgetT w) { w.set_on_change(nullptr); })
         widget_.set_on_change(cb);
     return *this;
