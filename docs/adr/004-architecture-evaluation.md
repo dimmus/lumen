@@ -1,9 +1,9 @@
 > **Status:** Accepted, partially implemented — evaluation of the v0.3 tree against the
 > goals "solid, fast, efficient, bleeding edge, future oriented"
 >
-> The immediate correctness items (F1–F4, P6) and the near-term items (D1, P2, fuzzing)
-> have landed. **D2 is partial** — linear-light blending is in, ≥10-bit storage is not.
-> The structural decisions D3–D5 are open. Section 5 tracks the detail.
+> The immediate correctness items (F1–F4, P6) and all the near-term items (D1, P2, D2,
+> fuzzing) have landed. The structural decisions D3–D5 are open. Section 5 tracks the
+> detail.
 
 # ADR-004: Architecture evaluation and correction plan
 
@@ -312,8 +312,8 @@ Take A now, B at D4.
 
 ### D2 — Composite in linear space at ≥10 bits
 
-> **Status: linear space done, ≥10 bits not.** Blending is now correct in all three
-> backends. Wider storage is not, and is the remaining half — see "Needs revisiting".
+> **Status: done.** The composite blends in 16-bit float linear and an encode pass converts
+> to the output transfer function, so 8-bit sRGB and 10-bit scanout are one code path.
 
 **Decision:** render target moves to `VK_FORMAT_A2B10G10R10_UNORM_PACK32` (or
 `R16G16B16A16_SFLOAT` for the HDR path), the shader linearizes on sample per the surface's
@@ -401,17 +401,15 @@ reads like a scheduling note.
   are green. Rationale and the checks that keep it honest are in `TEST.md`.
 - `immutable_frame_snapshot::dropped()` is public and always returns false — nothing sets
   it. Either wire it or remove it.
-- **D2's second half: ≥10-bit storage and HDR output.** Linear-light blending landed; wider
-  storage did not. The blocker is structural, not effort: correct blending needs the
-  attachment to *hold* linear values, and the trick that makes 8-bit work — an sRGB
-  attachment, where the blend unit decodes, blends and re-encodes in hardware — has no
-  equivalent at 10 bits, because no 10-bit format has an sRGB variant. Wider storage
-  therefore needs a linear float intermediate (`R16G16B16A16_SFLOAT`) plus an explicit
-  encode pass that applies the output transfer function on the way to the scanout buffer.
-  That is a second render pass, pipeline, descriptor set and set of layout transitions.
-  The transfer-function math it needs is already in place (`lx::to_linear` /
-  `lx::from_linear`, including PQ and HLG), and the composite shader already decodes per
-  draw — so the encode pass is the missing piece, not the color model.
+- **HDR output is reachable but not wired to anything.** `set_output_transfer` accepts PQ
+  and HLG and the encode pass applies them, but nothing chooses them: that needs
+  `color-management-v1` to negotiate with clients and the KMS `HDR_OUTPUT_METADATA` and
+  `COLOR_ENCODING` properties to tell the display. The pipeline is ready; the plumbing
+  above and below it is not.
+- **`LUMEN_VULKAN_VALIDATION` is a no-op.** The option defines a macro that no module
+  reads, so a build configured with it enables nothing. Worth either wiring into instance
+  creation or removing — a validation switch that silently does nothing is worse than no
+  switch, because it makes "I ran it with validation" a false statement.
 - **The GL backend blends against the framebuffer in encoded space.** It decodes, shades
   and re-encodes each draw's own color correctly, but GLES 2 offers neither an sRGB
   framebuffer nor a float attachment, so the blend against what is already there stays
@@ -470,10 +468,12 @@ Follow-on from the above:
    to fit. Also removed the opaque-first partition from the comparator: it is the standard
    early-Z trick and needs a depth buffer, which this renderer does not have, so it was
    inverting z for any translucent surface behind an opaque one.
-8. [~] **D2 — partial.** Linear-light blending landed in all three backends, along with the
-   reference transfer functions (sRGB, gamma 2.2, PQ, HLG) in `lx.foundation`. **≥10-bit
-   storage did not** — see "Needs revisiting" for why it is structural rather than
-   remaining effort, and what it needs.
+8. [x] D2 — the composite renders into a 16-bit float linear intermediate and a second
+   pass encodes that into the scanout buffer, so blending happens on light and the output
+   curve is applied once, explicitly. `render_target` takes a `pixel_format`, and
+   `xrgb2101010` gives ten bits per channel through the same path; `set_output_transfer`
+   selects sRGB, gamma 2.2, PQ or HLG. The reference curves live in `lx.foundation` and the
+   CPU blitter bakes the sRGB pair into 12-bit tables.
 9. [x] Add a fuzz target for the Wayland request-dispatch path. It found a real leak on its
    second run: `server::~server()` destroyed the display without destroying clients first,
    leaking every client's server-side state and resource map.

@@ -524,6 +524,96 @@ LUMEN_TEST(opaque_draw_round_trips_through_the_linear_pipeline) {
     }
 }
 
+// ── Wide output ─────────────────────────────────────────────────────────────────────
+//
+// The composite always blends in 16-bit float linear; the encode pass converts into
+// whatever the scanout buffer holds. These check that the second half of that actually
+// works, at ten bits and with a non-sRGB output curve.
+
+LUMEN_TEST(composite_into_a_ten_bit_scanout_target) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    auto wide = lx::gfx::render_target::create(gpu.device.context(), k_width, k_height,
+                                               lx::pixel_format::xrgb2101010);
+    if (!wide) {
+        std::printf("SKIP: no 10-bit render target: %s\n", wide.get_error().message);
+        return;
+    }
+    auto target = std::move(wide).value();
+    LUMEN_CHECK(target.format() == lx::pixel_format::xrgb2101010);
+
+    constexpr unsigned texture_id = 0x4000'0030u;
+    if (!upload_split_texture(gpu, texture_id))
+        return;
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.blend = lx::blend_mode::opaque;
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+    LUMEN_CHECK(stats.value().draws_skipped == 0);
+
+    // A 10-bit target is still exportable for scanout — the whole point of rendering into
+    // it rather than an offscreen buffer.
+    auto exported = target.export_dmabuf();
+    LUMEN_CHECK(static_cast<bool>(exported));
+    LUMEN_CHECK(exported.value().fd.get() >= 0);
+}
+
+// Changing the output transfer function must change the encoded bytes. If it does not, the
+// encode pass is not running and the pipeline has quietly become a passthrough.
+LUMEN_TEST(output_transfer_function_changes_the_encoded_result) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    // Mid-grey, so the difference between transfer curves is large.
+    unsigned char source[k_width * k_height * 4]{};
+    for (unsigned i = 0; i < k_width * k_height; ++i) {
+        unsigned char* px = source + i * 4u;
+        px[0] = px[1] = px[2] = 128u;
+        px[3] = 255u;
+    }
+
+    constexpr unsigned texture_id = 0x4000'0031u;
+    if (!gpu.compositor.upload_rgba(texture_id, k_width, k_height, source))
+        return;
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.blend = lx::blend_mode::opaque;
+    cmd.opacity = 1.f;
+
+    const auto sample_center = [&](lx::transfer_function tf) -> unsigned {
+        gpu.compositor.set_output_transfer(tf);
+        auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+        LUMEN_CHECK(static_cast<bool>(stats));
+        static unsigned char readback[k_width * k_height * 4]{};
+        LUMEN_CHECK(static_cast<bool>(
+            gpu.compositor.read_back(gpu.target, readback, sizeof(readback))));
+        return readback[((k_height / 2u) * k_width + k_width / 2u) * 4u + 1u];
+    };
+
+    const unsigned as_srgb = sample_center(lx::transfer_function::srgb);
+    const unsigned as_linear = sample_center(lx::transfer_function::linear);
+    const unsigned as_pq = sample_center(lx::transfer_function::pq);
+
+    // sRGB round-trips the input; linear output leaves the decoded value, which for a
+    // mid-grey sRGB input is far darker; PQ is darker still at this signal level.
+    LUMEN_CHECK(as_srgb > 100u);
+    LUMEN_CHECK(as_linear < as_srgb);
+    LUMEN_CHECK(as_pq != as_srgb);
+
+    gpu.compositor.set_output_transfer(lx::transfer_function::srgb);
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }
