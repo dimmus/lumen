@@ -58,6 +58,10 @@ private:
     void ensure_capacity(unsigned need);
 
     draw_command* commands_ = nullptr;
+    /// Permutation scratch for `batch_for_render`, grown with `commands_`. Four bytes per
+    /// command, reused every frame — the sort must not put a `draw_command[]` on the stack
+    /// or allocate on the hot path.
+    unsigned* order_ = nullptr;
     unsigned capacity_ = 0;
     unsigned count_ = 0;
     unsigned overflow_drops_ = 0;
@@ -184,9 +188,13 @@ private:
 lx::scene::draw_list::draw_list() {
     capacity_ = k_initial_draw_commands;
     commands_ = new draw_command[capacity_];
+    order_ = new unsigned[capacity_];
 }
 
-lx::scene::draw_list::~draw_list() { delete[] commands_; }
+lx::scene::draw_list::~draw_list() {
+    delete[] commands_;
+    delete[] order_;
+}
 
 void lx::scene::draw_list::ensure_capacity(unsigned need) {
     if (need <= capacity_)
@@ -202,6 +210,11 @@ void lx::scene::draw_list::ensure_capacity(unsigned need) {
         next[i] = commands_[i];
     delete[] commands_;
     commands_ = next;
+
+    // Scratch holds no state between calls, so grow it without copying.
+    delete[] order_;
+    order_ = new unsigned[new_cap];
+
     capacity_ = new_cap;
 }
 
@@ -247,34 +260,57 @@ void lx::scene::draw_list::batch_for_render() {
     if (count_ <= 1)
         return;
 
-    unsigned indices[k_max_draw_commands];
+    if (!order_)
+        return;
+
+    unsigned* indices = order_;
     for (unsigned i = 0; i < count_; ++i)
         indices[i] = i;
 
+    // Strict painter's order: `sort_key.value` packs layer above z-order, so comparing it
+    // whole orders by layer and then back-to-front within a layer. Texture id breaks ties
+    // to batch state changes among draws that cannot overlap in z.
+    //
+    // Deliberately NOT partitioned opaque-first. That is the standard trick, but it needs
+    // a depth buffer to stay correct, and this renderer has none — one color attachment,
+    // no depth-stencil state. Without a depth test, hoisting opaque draws ahead of
+    // translucent ones inverts z for any translucent surface sitting *behind* an opaque
+    // one: the translucent surface would be painted last and blend over the window that
+    // should have covered it. `scene::surface_node::emit` marks every surface at full
+    // opacity as `blend_mode::opaque`, so an ordinary "translucent terminal behind a solid
+    // window" stack hit this. The CPU backend's occlusion cull compounds it — it scans for
+    // the topmost covering opaque draw and skips everything below, which is only sound if
+    // the list really is in paint order.
+    //
+    // Restore the partition only alongside a depth buffer.
     std::stable_sort(indices, indices + count_, [this](unsigned a, unsigned b) {
         const auto& ca = commands_[a];
         const auto& cb = commands_[b];
-        const bool opaque_a = ca.blend == lx::blend_mode::opaque;
-        const bool opaque_b = cb.blend == lx::blend_mode::opaque;
-        if (opaque_a != opaque_b)
-            return opaque_a; // opaque batch first
         if (ca.sort_key.value != cb.sort_key.value)
             return ca.sort_key.value < cb.sort_key.value;
-        if (opaque_a) {
-            // Front-to-back within opaque batch for early-Z.
-            return ca.sort_key.z_order() > cb.sort_key.z_order();
-        }
-        // Back-to-front within translucent batch.
-        if (ca.sort_key.z_order() != cb.sort_key.z_order())
-            return ca.sort_key.z_order() < cb.sort_key.z_order();
         return ca.texture.id() < cb.texture.id();
     });
 
-    draw_command tmp[k_max_draw_commands];
-    for (unsigned i = 0; i < count_; ++i)
-        tmp[i] = commands_[indices[i]];
-    for (unsigned i = 0; i < count_; ++i)
-        commands_[i] = tmp[i];
+    // Apply the permutation in place, one cycle at a time: `indices[i]` names the command
+    // that belongs at slot `i`, so walking a cycle moves each element straight to its
+    // destination with a single element held aside. One `draw_command` of scratch instead
+    // of a full second array. `indices` is consumed as it goes (entries are set to their
+    // own slot), which is why it is rebuilt at the top of every call.
+    for (unsigned i = 0; i < count_; ++i) {
+        if (indices[i] == i)
+            continue;
+        draw_command held = commands_[i];
+        unsigned slot = i;
+        for (;;) {
+            const unsigned from = indices[slot];
+            indices[slot] = slot;
+            if (from == i)
+                break;
+            commands_[slot] = commands_[from];
+            slot = from;
+        }
+        commands_[slot] = held;
+    }
 }
 
 unsigned lx::scene::draw_list::size() const { return count_; }

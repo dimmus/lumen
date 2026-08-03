@@ -55,6 +55,12 @@ struct compositor_impl {
     gfx::headless_backend headless_{};
     gfx::frame_renderer frame_renderer_{};
     gfx::pipeline_cache pipeline_cache_{};
+    /// Render affinity. Scene draw commands translated for the present backend, reused
+    /// every frame. A member and not a local: sized by the cap rather than by occupancy it
+    /// was a six-figure stack allocation touched once per frame, which evicts the working
+    /// set for no benefit.
+    gfx::blit_command* blits_ = nullptr;
+    unsigned blit_capacity_ = 0;
     gfx::vulkan_compositor vk_compositor_{};
     gfx::cpu_compositor cpu_compositor_{};
     gfx::egl_device egl_{};
@@ -179,6 +185,23 @@ struct compositor_impl {
         surfaces.set_import_cache(&import_cache);
         surfaces.set_scene(&scene);
         frame_renderer_.set_pipeline_cache(&pipeline_cache_);
+    }
+
+    ~compositor_impl() { delete[] blits_; }
+
+    compositor_impl(const compositor_impl&) = delete;
+    compositor_impl& operator=(const compositor_impl&) = delete;
+
+    /// Render affinity. Grows to fit and never shrinks; returns null if `need` is 0.
+    [[nodiscard]] gfx::blit_command* blit_storage(unsigned need) {
+        if (need == 0)
+            return nullptr;
+        if (need > blit_capacity_) {
+            delete[] blits_;
+            blits_ = new gfx::blit_command[need];
+            blit_capacity_ = need;
+        }
+        return blits_;
     }
 
     static void on_memory_pressure(lx::runtime::memory_pressure level, void* self);
@@ -1132,9 +1155,8 @@ void compositor::tick_render() {
         }
     }
 
-    static constexpr unsigned k_max_draws = 4096;
-    lx::gfx::blit_command blits[k_max_draws];
-    const unsigned blit_count = draws.size() < k_max_draws ? draws.size() : k_max_draws;
+    const unsigned blit_count = draws.size();
+    lx::gfx::blit_command* blits = impl_->blit_storage(blit_count);
     for (unsigned i = 0; i < blit_count; ++i) {
         const auto& cmd = draws.data()[i];
         blits[i].texture_id = cmd.texture.id();

@@ -5,6 +5,7 @@
 #include <thread>
 #include <vector>
 
+import lx.foundation;
 import lx.scene;
 import lx.runtime;
 
@@ -161,6 +162,117 @@ LUMEN_TEST(snapshot_backpressure_policies_differ) {
     LUMEN_CHECK(buffering.publish(t2, {}, 2));
     LUMEN_CHECK(buffering.publish_count() == 2);
     LUMEN_CHECK(buffering.dropped_count() == 0);
+}
+
+// batch_for_render applies its sort as an in-place cycle permutation over a scratch index
+// array. Getting a cycle walk subtly wrong duplicates or drops commands rather than just
+// misordering them, so check identity preservation as well as order.
+LUMEN_TEST(batch_for_render_permutes_without_losing_commands) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+
+    lx::scene::snapshot_buffer buf{};
+    auto lease = buf.begin_frame();
+    LUMEN_CHECK(lease.valid());
+    auto& draws = lease.draws();
+    draws.clear();
+
+    // Interleave opaque and translucent, with z-order deliberately out of sequence so the
+    // sort has real work to do and the permutation contains multi-element cycles.
+    constexpr unsigned k_count = 64;
+    for (unsigned i = 0; i < k_count; ++i) {
+        lx::scene::draw_command cmd{};
+        cmd.texture = lx::texture_id{i + 1}; // identity tag, survives the permutation
+        cmd.blend = (i % 3 == 0) ? lx::blend_mode::opaque : lx::blend_mode::premultiplied;
+        cmd.sort_key = lx::draw_sort_key::make(0, (k_count * 7u - i * 5u) % k_count);
+        draws.push(cmd);
+    }
+    LUMEN_CHECK(draws.size() == k_count);
+
+    draws.batch_for_render();
+    LUMEN_CHECK(draws.size() == k_count);
+
+    // Every input command appears exactly once — no duplicates, no drops.
+    bool seen[k_count + 1]{};
+    for (unsigned i = 0; i < draws.size(); ++i) {
+        const auto id = draws.data()[i].texture.id();
+        LUMEN_CHECK(id >= 1 && id <= k_count);
+        LUMEN_CHECK(!seen[id]);
+        seen[id] = true;
+    }
+    for (unsigned i = 1; i <= k_count; ++i)
+        LUMEN_CHECK(seen[i]);
+
+    // Painter's order throughout, regardless of blend mode: back-to-front, no partition.
+    for (unsigned i = 1; i < draws.size(); ++i) {
+        LUMEN_CHECK(draws.data()[i - 1].sort_key.value <= draws.data()[i].sort_key.value);
+    }
+}
+
+// Regression: batch_for_render used to hoist every opaque draw ahead of every translucent
+// one. Without a depth buffer that inverts z — a translucent surface behind an opaque one
+// ends up painted last, blending over the window that should cover it. `surface_node::emit`
+// marks anything at full opacity as opaque, so this was an ordinary two-window stack.
+LUMEN_TEST(batch_for_render_keeps_translucent_behind_opaque_behind) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+
+    lx::scene::snapshot_buffer buf{};
+    auto lease = buf.begin_frame();
+    LUMEN_CHECK(lease.valid());
+    auto& draws = lease.draws();
+    draws.clear();
+
+    // Emission order is paint order: translucent window behind, opaque window in front.
+    lx::scene::draw_command behind{};
+    behind.texture = lx::texture_id{1};
+    behind.blend = lx::blend_mode::premultiplied;
+    behind.opacity = 0.5f;
+    behind.sort_key = lx::draw_sort_key::make(0, 0);
+    draws.push(behind);
+
+    lx::scene::draw_command front{};
+    front.texture = lx::texture_id{2};
+    front.blend = lx::blend_mode::opaque;
+    front.sort_key = lx::draw_sort_key::make(0, 1);
+    draws.push(front);
+
+    draws.batch_for_render();
+
+    LUMEN_CHECK(draws.size() == 2);
+    // The opaque window must still be painted last, so it covers the one behind it.
+    LUMEN_CHECK(draws.data()[0].texture.id() == 1);
+    LUMEN_CHECK(draws.data()[1].texture.id() == 2);
+}
+
+// A sort that is already in order must be a no-op, and a full reversal is the worst case
+// for the cycle walk — one long cycle rather than many short ones.
+LUMEN_TEST(batch_for_render_handles_identity_and_reversal) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+
+    for (bool reversed : {false, true}) {
+        lx::scene::snapshot_buffer buf{};
+        auto lease = buf.begin_frame();
+        LUMEN_CHECK(lease.valid());
+        auto& draws = lease.draws();
+        draws.clear();
+
+        constexpr unsigned k_count = 32;
+        for (unsigned i = 0; i < k_count; ++i) {
+            lx::scene::draw_command cmd{};
+            cmd.texture = lx::texture_id{i + 1};
+            cmd.blend = lx::blend_mode::premultiplied;
+            // Translucent sorts ascending by z-order, so descending input reverses.
+            cmd.sort_key = lx::draw_sort_key::make(0, reversed ? (k_count - i) : i);
+            draws.push(cmd);
+        }
+
+        draws.batch_for_render();
+        LUMEN_CHECK(draws.size() == k_count);
+
+        for (unsigned i = 0; i < k_count; ++i) {
+            const auto expected = reversed ? (k_count - i) : (i + 1);
+            LUMEN_CHECK(draws.data()[i].texture.id() == expected);
+        }
+    }
 }
 
 // The publisher encodes the frame number in the draw count, so the reader can
