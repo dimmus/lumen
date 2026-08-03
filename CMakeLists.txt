@@ -256,11 +256,38 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_kms_vulkan_scanout COMMAND test_kms_vulkan_scanout)
 
     # A sanitizer report must fail the test, not just print to stderr.
+    set(LUMEN_TSAN_OPTS "halt_on_error=1")
+    set(LUMEN_ASAN_OPTS "halt_on_error=1:abort_on_error=1")
+    set(LUMEN_UBSAN_OPTS "halt_on_error=1:print_stacktrace=1")
+
+    set(LUMEN_SANITIZER_ENV
+        "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}"
+        "ASAN_OPTIONS=${LUMEN_ASAN_OPTS}"
+        "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
+
+    # Tests that bring up a Vulkan device load the system ICD, whose teardown is not
+    # sanitizer-clean. Both concessions below are scoped to these two tests alone, so the
+    # rest of the suite keeps full leak and race detection. Analysis in TEST.md.
+    set(LUMEN_SANITIZER_ENV_VULKAN_ICD
+        # Races among the driver's own threads, suppressed by object name — see
+        # tests/sanitizers/tsan.supp for why it is scoped that way and not by symbol.
+        "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}:suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/tsan.supp"
+        "ASAN_OPTIONS=${LUMEN_ASAN_OPTS}"
+        # The ICD is dlclose'd before LSan's exit check, so its frames resolve to
+        # "<unknown module>" and no `leak:` pattern can match them. Turning off the exit
+        # leak check is the only scoping available here; every other ASan check
+        # (use-after-free, overflow, out-of-bounds) stays active for these tests.
+        "LSAN_OPTIONS=detect_leaks=0"
+        "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
+
     set_tests_properties(test_result test_snapshot test_import_cache bench_frame
+        test_runtime_memory test_runtime_task
         test_headless_golden test_text_shaping test_protocol_bind test_kms_device test_kms_vkms
-        test_kms_vulkan_scanout test_dmabuf_composite test_ui_reconcile
-        PROPERTIES ENVIRONMENT
-            "TSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=halt_on_error=1:abort_on_error=1;UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
+        test_ui_reconcile
+        PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+
+    set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout
+        PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
 endif()
 
 message(STATUS "Lumen ${PROJECT_VERSION} — C++${CMAKE_CXX_STANDARD} — ${CMAKE_CXX_COMPILER_ID}")

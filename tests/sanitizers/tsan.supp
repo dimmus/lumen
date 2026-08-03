@@ -1,0 +1,28 @@
+# ThreadSanitizer suppressions — THIRD-PARTY CODE ONLY.
+#
+# Rule: every entry here must be scoped to a shared object Lumen does not build.
+# Never suppress by function name (`race_top:pthread_mutex_destroy` and friends), because
+# Lumen's own std::mutex lowers to exactly those symbols — a real "destroy while another
+# thread holds it" bug in Lumen would vanish along with the driver's.
+#
+# ── libvulkan_lvp.so (Mesa lavapipe, the software Vulkan ICD) ────────────────────────
+#
+# On teardown lavapipe calls pthread_mutex_destroy / pthread_cond_destroy on primitives
+# its own llvmpipe worker threads are still locking and broadcasting on. TSan reports it
+# as a data race on the mutex/cond object; it is a genuine race, but it is Mesa's, inside
+# Mesa's threads, on Mesa's objects.
+#
+# Verified before suppressing: across 12 runs of test_dmabuf_composite, every racing
+# access frame (#0 an intercepted libc call, #1 the driver) resolved to libvulkan_lvp.so.
+# Zero Lumen frames appeared in any racing access — Lumen shows up only at #2+ in the
+# thread-creation stack, because `gfx::device_selector::select_best()` is what caused the
+# driver to spawn those threads in the first place.
+#
+# Scope note: `race:` matches any frame in the report, so this also hides a hypothetical
+# Lumen race on memory the driver touches. That is the narrowest form that works —
+# `called_from_lib:` does not suppress these (the reports come from TSan's pthread
+# interceptors, not from instrumented driver code), verified 4/4 runs still failing.
+#
+# Reproduce the underlying reports with:
+#   TSAN_OPTIONS= ./build/tsan/test_dmabuf_composite
+race:libvulkan_lvp.so

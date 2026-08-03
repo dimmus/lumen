@@ -384,11 +384,14 @@ reads like a scheduling note.
 - `executor::post` targets an SPSC queue, so only one producer per strand is legal. The
   contract is now documented rather than mis-stated, but a compositor with UI, render, and
   worker threads all posting to the UI strand needs an MPSC queue. Next threading change.
-- The sanitizer suites are not usable as gates: `test_dmabuf_composite` fails under both
-  ASan (224 B leaked in the Vulkan ICD) and TSan (`pthread_mutex_destroy` race in
-  `libvulkan_lvp.so`) on a pristine checkout. Both are inside lavapipe, not Lumen. Without
-  a suppressions file every future sanitizer run starts red, which is how a real finding
-  gets waved through.
+- ~~The sanitizer suites are not usable as gates~~ — **fixed.** `test_dmabuf_composite`
+  failed under both ASan and TSan on a pristine checkout, entirely inside Mesa lavapipe.
+  TSan now uses `tests/sanitizers/tsan.supp` (`race:libvulkan_lvp.so`, scoped to the
+  object, never to a symbol — Lumen's `std::mutex` lowers to the same `pthread_*` calls).
+  LSan cannot be suppressed at all: the ICD is `dlclose`d before the exit check, so its
+  frames are `<unknown module>` and no `leak:` pattern matches; the two Vulkan tests run
+  with `detect_leaks=0` instead, keeping every other ASan check. All four configurations
+  are green. Rationale and the checks that keep it honest are in `TEST.md`.
 - `immutable_frame_snapshot::dropped()` is public and always returns false — nothing sets
   it. Either wire it or remove it.
 - `docs/architecture.md` §13 marks the status table honestly but the rest of the document
