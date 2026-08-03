@@ -79,7 +79,9 @@ lumen_add_module_library(lx.gfx modules/lx.gfx
     DEPENDS lx.foundation lx.runtime lx.drm)
 lumen_compile_shaders(lx.gfx
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.vert"
-    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.frag")
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.frag")
 lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.gfx)
 lumen_link_platform_modules(lx.text)
 lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.runtime)
