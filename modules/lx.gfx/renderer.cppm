@@ -34,8 +34,12 @@ struct blit_command {
     lx::blend_mode blend = lx::blend_mode::premultiplied;
     /// `wl_output.transform` for the source buffer — rotated and flipped monitors.
     lx::buffer_transform buffer_xform = lx::buffer_transform::normal;
-    /// Encoding the texture is in. Consumed once the composite works in linear space.
+    /// Primaries the texture's color is expressed in.
     lx::color_space src_space = lx::color_space::srgb;
+    /// Transfer function the texture is encoded with. The composite decodes to linear
+    /// light before blending, because alpha blending is a weighted average of light and
+    /// averaging encoded values darkens edges.
+    lx::transfer_function src_transfer = lx::transfer_function::srgb;
 };
 
 class pipeline_cache {

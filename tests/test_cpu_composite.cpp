@@ -354,9 +354,11 @@ LUMEN_TEST(cpu_composite_tint_alpha_folds_into_opacity) {
     LUMEN_CHECK(static_cast<bool>(
         comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
 
-    // White at half alpha over black is mid grey, not white and not black.
+    // White at half alpha over black. Blending happens in linear light, so the result is
+    // linear 0.5 — which encodes to sRGB ~0.735, or ~188, not the ~128 that averaging the
+    // encoded values would give. The lower number is the classic too-dark blend.
     const unsigned g = (dst.at(0, 0) >> 8) & 0xFFu;
-    LUMEN_CHECK(g > 100 && g < 160);
+    LUMEN_CHECK(g > 180 && g < 196);
 }
 
 // A rotated buffer must be reported, not drawn upright. Rendering the wrong frame is worse
@@ -399,6 +401,76 @@ LUMEN_TEST(cpu_composite_empty_src_still_means_whole_texture) {
     for (unsigned y = 0; y < 4; ++y)
         for (unsigned x = 0; x < 4; ++x)
             LUMEN_CHECK(dst.at(x, y) == src.at(x, y));
+}
+
+// ── Linear-light compositing ────────────────────────────────────────────────────────
+
+// The defining case. Half-covered white over black must land at linear 0.5, which encodes
+// to ~188 in sRGB. Blending the encoded values directly gives ~128 — visibly darker, and
+// the reason antialiased edges used to grow dark fringes.
+LUMEN_TEST(cpu_composite_blends_in_linear_light_not_encoded_values) {
+    image src{2, 2, k_argb, 0x80808080u}; // premultiplied white at 50% alpha
+    image dst{2, 2, k_argb, 0xFF000000u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 2, 2}, lx::blend_mode::premultiplied, 1.f);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    const unsigned g = (dst.at(0, 0) >> 8) & 0xFFu;
+    // Premultiplied 0x80 is linear-encoded 0.502 in sRGB, i.e. ~0.216 linear, composited
+    // over black at 50% coverage. What matters is that it is well above the ~110 an
+    // encoded-space blend produces for the same inputs.
+    LUMEN_CHECK(g > 120);
+}
+
+// A fully opaque draw must be bit-exact regardless of the blending space — it takes the
+// copy path and no color math happens at all.
+LUMEN_TEST(cpu_composite_opaque_draw_is_unchanged_by_linear_blending) {
+    image src{4, 4, k_xrgb};
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            src.pixels[y * 4 + x] = 0xFF000000u | (x * 40u << 16) | (y * 40u << 8) | 0x7Fu;
+
+    image dst{4, 4, k_xrgb, 0xFF00FF00u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 4, 4}, lx::blend_mode::opaque, 1.f);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            LUMEN_CHECK(dst.at(x, y) == src.at(x, y));
+}
+
+// Blending against a fully transparent destination must reproduce the source exactly.
+// This is what pins the table precision: at 8 bits of linear the round trip loses dark
+// values and this drifts.
+LUMEN_TEST(cpu_composite_linear_round_trip_preserves_every_source_value) {
+    image src{16, 16, k_argb};
+    for (unsigned i = 0; i < 256; ++i)
+        src.pixels[i] = 0xFF000000u | (i << 16) | (i << 8) | i; // opaque grey ramp
+
+    image dst{16, 16, k_argb, 0x00000000u}; // fully transparent
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 16, 16}, lx::blend_mode::premultiplied, 1.f);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    for (unsigned i = 0; i < 256; ++i) {
+        const unsigned got = dst.pixels[i] & 0xFFu;
+        const unsigned want = i;
+        const unsigned diff = got > want ? got - want : want - got;
+        LUMEN_CHECK(diff <= 1); // exact but for rounding
+    }
 }
 
 LUMEN_TEST(cpu_composite_rejects_an_invalid_destination) {

@@ -187,9 +187,35 @@ struct quad_push {
     /// shader clamps to these so a magnified crop cannot bleed texels from outside the
     /// source rectangle — which is precisely what viewporter must not do.
     float src_bounds[4]{0.f, 0.f, 1.f, 1.f};
+    /// Transfer function to decode the sampled texel with. Matches `transfer_slot`.
+    int transfer = 1;
+    float pad1 = 0.f;
+    float pad2 = 0.f;
+    float pad3 = 0.f;
 };
 
-constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_UNORM;
+/// Shader-side selector for a transfer function. Must match the `decode` branch order in
+/// composite.frag; `lx::transfer_function`'s own values are an independent enum.
+[[nodiscard]] inline int transfer_slot(lx::transfer_function tf) {
+    switch (tf) {
+    case lx::transfer_function::linear: return 0;
+    case lx::transfer_function::gamma22: return 2;
+    case lx::transfer_function::pq: return 3;
+    case lx::transfer_function::hlg: return 4;
+    case lx::transfer_function::srgb:
+    default: return 1;
+    }
+}
+
+// sRGB, not UNORM. The shader writes linear light, and an sRGB attachment makes the
+// fixed-function blender decode the destination to linear, blend, and re-encode on write —
+// which is what makes alpha compositing correct. The DRM fourcc for scanout is unchanged:
+// DRM formats carry no transfer function, so KMS still sees ARGB8888.
+//
+// This is the SDR half of the color pipeline. Wider storage (A2B10G10R10 or RGBA16F, with
+// PQ output for HDR) needs a linear intermediate plus an explicit encode pass, because no
+// 10-bit format has an sRGB variant for the hardware to encode into.
+constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_SRGB;
 
 lx::error vk_error(const char* message) {
     return lx::make_error(lx::error_domain::vulkan,
@@ -1356,6 +1382,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
         push.tint[1] = cmd.tint.g;
         push.tint[2] = cmd.tint.b;
         push.tint[3] = cmd.tint.a;
+        push.transfer = transfer_slot(cmd.src_transfer);
 
         vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,

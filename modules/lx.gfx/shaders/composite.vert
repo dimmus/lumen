@@ -11,6 +11,10 @@ layout(push_constant) uniform quad_push {
     vec4 src_uv;   // u0, v0, du, dv — the source rectangle, normalized
     vec4 tint;
     vec4 src_bounds;
+    int transfer;
+    float pad1;
+    float pad2;
+    float pad3;
 } push;
 
 layout(location = 0) out vec2 v_uv;

@@ -308,6 +308,9 @@ Take A now, B at D4.
 
 ### D2 — Composite in linear space at ≥10 bits
 
+> **Status: linear space done, ≥10 bits not.** Blending is now correct in all three
+> backends. Wider storage is not, and is the remaining half — see "Needs revisiting".
+
 **Decision:** render target moves to `VK_FORMAT_A2B10G10R10_UNORM_PACK32` (or
 `R16G16B16A16_SFLOAT` for the HDR path), the shader linearizes on sample per the surface's
 `transfer_function`, blends linear, and encodes on output.
@@ -394,6 +397,22 @@ reads like a scheduling note.
   are green. Rationale and the checks that keep it honest are in `TEST.md`.
 - `immutable_frame_snapshot::dropped()` is public and always returns false — nothing sets
   it. Either wire it or remove it.
+- **D2's second half: ≥10-bit storage and HDR output.** Linear-light blending landed; wider
+  storage did not. The blocker is structural, not effort: correct blending needs the
+  attachment to *hold* linear values, and the trick that makes 8-bit work — an sRGB
+  attachment, where the blend unit decodes, blends and re-encodes in hardware — has no
+  equivalent at 10 bits, because no 10-bit format has an sRGB variant. Wider storage
+  therefore needs a linear float intermediate (`R16G16B16A16_SFLOAT`) plus an explicit
+  encode pass that applies the output transfer function on the way to the scanout buffer.
+  That is a second render pass, pipeline, descriptor set and set of layout transitions.
+  The transfer-function math it needs is already in place (`lx::to_linear` /
+  `lx::from_linear`, including PQ and HLG), and the composite shader already decodes per
+  draw — so the encode pass is the missing piece, not the color model.
+- **The GL backend blends against the framebuffer in encoded space.** It decodes, shades
+  and re-encodes each draw's own color correctly, but GLES 2 offers neither an sRGB
+  framebuffer nor a float attachment, so the blend against what is already there stays
+  encoded. Vulkan is linear end to end. Worth revisiting if GL becomes a primary path
+  rather than a fallback.
 - `docs/architecture.md` §13 marks the status table honestly but the rest of the document
   reads as descriptive. Anything the render contract cannot express should be marked as
   such in the doc, not only in the status table.

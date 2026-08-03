@@ -280,6 +280,77 @@ enum class convert_op : unsigned char { copy, swap_rb, unsupported };
 
 /// Premultiplied source over destination. `src` and `dst` are already in the destination's
 /// channel order, so the arithmetic is per-byte and order-agnostic.
+// ── Linear-light blending tables ────────────────────────────────────────────────────
+//
+// Alpha blending is a weighted average of light, so it is only correct in linear space.
+// Averaging sRGB-encoded values instead darkens the result — the familiar dark fringe
+// around antialiased glyphs and window edges.
+//
+// Doing that per pixel with pow() is far too slow for a software compositor, so the two
+// conversions are baked into tables: 8-bit encoded to 12-bit linear one way, 12-bit linear
+// back to 8-bit encoded the other. 12 bits of linear is enough that the round trip is
+// exact for every 8-bit input, which the tests check — 8-bit linear would collapse dark
+// values together and band visibly.
+inline constexpr unsigned k_linear_bits = 12;
+inline constexpr unsigned k_linear_max = (1u << k_linear_bits) - 1u;
+
+struct srgb_tables {
+    std::uint16_t to_linear[256]{};
+    std::uint8_t to_srgb[k_linear_max + 1]{};
+
+    srgb_tables() {
+        for (unsigned i = 0; i < 256; ++i) {
+            const float lin = lx::srgb_to_linear(static_cast<float>(i) / 255.f);
+            to_linear[i] = static_cast<std::uint16_t>(lin * static_cast<float>(k_linear_max) + 0.5f);
+        }
+        for (unsigned i = 0; i <= k_linear_max; ++i) {
+            const float enc = lx::linear_to_srgb(static_cast<float>(i) /
+                                                 static_cast<float>(k_linear_max));
+            const float scaled = enc * 255.f + 0.5f;
+            to_srgb[i] = static_cast<std::uint8_t>(scaled < 0.f ? 0.f
+                                                                : (scaled > 255.f ? 255.f : scaled));
+        }
+    }
+};
+
+[[nodiscard]] inline const srgb_tables& tables() {
+    static const srgb_tables t{};
+    return t;
+}
+
+/// Source-over in linear light. `src` and `dst` are premultiplied sRGB-encoded words in the
+/// same channel order; `opacity_255` scales the source.
+[[nodiscard]] inline std::uint32_t blend_over_linear(std::uint32_t src, std::uint32_t dst,
+                                                     unsigned opacity_255) {
+    const auto& t = tables();
+
+    unsigned sa = (src >> 24) & 0xFFu;
+    if (opacity_255 < 255u) {
+        sa = (sa * opacity_255) / 255u;
+    }
+    if (sa == 0)
+        return dst;
+
+    const unsigned inv = 255u - sa;
+    // Alpha is a coverage fraction, not a light level — it stays linear and is not
+    // transfer-encoded. Only the color channels are decoded and re-encoded.
+    const unsigned da = (dst >> 24) & 0xFFu;
+    const unsigned out_a = sa + (da * inv) / 255u;
+
+    std::uint32_t out = (out_a > 255u ? 255u : out_a) << 24;
+    for (unsigned shift = 0; shift < 24; shift += 8) {
+        unsigned s = t.to_linear[(src >> shift) & 0xFFu];
+        if (opacity_255 < 255u)
+            s = (s * opacity_255) / 255u;
+        const unsigned d = t.to_linear[(dst >> shift) & 0xFFu];
+        unsigned lin = s + (d * inv) / 255u;
+        if (lin > k_linear_max)
+            lin = k_linear_max;
+        out |= static_cast<std::uint32_t>(t.to_srgb[lin]) << shift;
+    }
+    return out;
+}
+
 [[nodiscard]] inline std::uint32_t blend_over(std::uint32_t src, std::uint32_t dst,
                                               unsigned opacity_255) {
     if (opacity_255 < 255u) {
@@ -551,7 +622,8 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
                 if (tinted)
                     pixel = apply_tint(pixel, tint_c0, tint_g, tint_c2, 255u);
 
-                dst_row[x] = needs_blend ? blend_over(pixel, dst_row[x], opacity_255) : pixel;
+                dst_row[x] =
+                    needs_blend ? blend_over_linear(pixel, dst_row[x], opacity_255) : pixel;
             }
         }
         bytes += static_cast<unsigned long long>(area.height) * area.width * 4ull;

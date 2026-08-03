@@ -215,6 +215,7 @@ private:
     int uniform_src_uv_ = -1;
     int uniform_tint_ = -1;
     int uniform_src_bounds_ = -1;
+    int uniform_transfer_ = -1;
     int uniform_sampler_ = -1;
     texture_slot textures_[k_max_textures]{};
 };
@@ -257,13 +258,45 @@ uniform sampler2D surface;
 uniform float opacity;
 uniform vec4 tint;
 uniform vec4 src_bounds;
+// 0 linear, 1 sRGB, 2 gamma 2.2. GLES 2 has no HDR path, so PQ and HLG fall back to sRGB
+// rather than pretending — the Vulkan backend is where HDR lands.
+uniform int transfer;
+
+vec3 srgb_to_linear(vec3 v) {
+    // GLSL ES 1.00 has no mix(genType, genType, bvec), so branch per channel arithmetically.
+    vec3 lo = v / 12.92;
+    vec3 hi = pow((max(v, vec3(0.0)) + 0.055) / 1.055, vec3(2.4));
+    vec3 pick = step(vec3(0.04045), v);
+    return lo * (1.0 - pick) + hi * pick;
+}
+
+vec3 linear_to_srgb(vec3 v) {
+    vec3 lo = v * 12.92;
+    vec3 hi = 1.055 * pow(max(v, vec3(0.0)), vec3(1.0 / 2.4)) - 0.055;
+    vec3 pick = step(vec3(0.0031308), v);
+    return lo * (1.0 - pick) + hi * pick;
+}
+
 void main() {
     // Clamp to the source rectangle. Linear filtering samples between texel centers, so a
     // magnified crop would otherwise read texels from outside its own source rect.
     vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
-    // Sources are premultiplied, so opacity and the tint's alpha scale all four channels;
-    // the tint's color channels multiply the already-premultiplied RGB.
-    gl_FragColor = texture2D(surface, s) * vec4(tint.rgb, 1.0) * (opacity * tint.a);
+    vec4 texel = texture2D(surface, s);
+
+    // Blending is a weighted average of light, so it has to happen in linear space.
+    // GLES 2 has no sRGB framebuffer to do this in the blend unit and no float attachment
+    // to blend in, so the shader decodes, applies opacity and tint in linear, and re-encodes
+    // before the blend. That is correct for the draw's own color; the blend against what is
+    // already in the framebuffer still happens in encoded space, which is the limit of this
+    // backend. Vulkan blends linear end to end via an sRGB attachment.
+    vec3 straight = texel.a > 0.0 ? texel.rgb / texel.a : texel.rgb;
+    vec3 lin = transfer == 0 ? straight
+             : (transfer == 2 ? pow(max(straight, vec3(0.0)), vec3(2.2))
+                              : srgb_to_linear(straight));
+
+    float alpha = texel.a * opacity * tint.a;
+    vec3 shaded = linear_to_srgb(lin * tint.rgb);
+    gl_FragColor = vec4(shaded * alpha, alpha);
 }
 )";
 
@@ -703,6 +736,7 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     uniform_src_uv_ = glGetUniformLocation(program, "src_uv");
     uniform_tint_ = glGetUniformLocation(program, "tint");
     uniform_src_bounds_ = glGetUniformLocation(program, "src_bounds");
+    uniform_transfer_ = glGetUniformLocation(program, "transfer");
     uniform_sampler_ = glGetUniformLocation(program, "surface");
 
     // Unit quad; the vertex shader maps it onto each draw's destination rect.
@@ -1016,6 +1050,12 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite(
             glUniform4f(uniform_src_bounds_, u_lo, v_lo, u_hi, v_hi);
         if (uniform_tint_ >= 0)
             glUniform4f(uniform_tint_, cmd.tint.r, cmd.tint.g, cmd.tint.b, cmd.tint.a);
+        if (uniform_transfer_ >= 0) {
+            const int slot = cmd.src_transfer == lx::transfer_function::linear    ? 0
+                             : cmd.src_transfer == lx::transfer_function::gamma22 ? 2
+                                                                                  : 1;
+            glUniform1i(uniform_transfer_, slot);
+        }
 
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         ++stats.draws_submitted;

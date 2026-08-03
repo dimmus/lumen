@@ -436,6 +436,94 @@ LUMEN_TEST(tint_multiplies_the_sampled_color) {
     LUMEN_CHECK(right[2] > 200u); // blue survives
 }
 
+// ── Linear-light compositing ────────────────────────────────────────────────────────
+
+// Half-covered white over black must land at linear 0.5, which encodes to sRGB ~188.
+// Blending the encoded values instead gives ~128 — visibly darker, and the reason
+// antialiased edges grew dark fringes.
+LUMEN_TEST(composite_blends_in_linear_light) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    // Premultiplied white at 50% alpha, over an opaque black clear.
+    unsigned char source[k_width * k_height * 4]{};
+    for (unsigned i = 0; i < k_width * k_height; ++i) {
+        unsigned char* px = source + i * 4u;
+        px[0] = px[1] = px[2] = 128u;
+        px[3] = 128u;
+    }
+
+    constexpr unsigned texture_id = 0x4000'0020u;
+    if (!gpu.compositor.upload_rgba(texture_id, k_width, k_height, source))
+        return;
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.blend = lx::blend_mode::premultiplied;
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                            sizeof(readback))));
+    const unsigned g = readback[((k_height / 2u) * k_width + k_width / 2u) * 4u + 1u];
+    // Source 128/255 decodes to ~0.216 linear, halved by coverage over black, then
+    // re-encoded. The number that matters is that it clears the ~110 an encoded-space
+    // blend would produce for the same inputs.
+    LUMEN_CHECK(g > 120u);
+}
+
+// An opaque full-coverage draw must survive the round trip unchanged: no blending happens,
+// so the linear pipeline must not shift its values.
+LUMEN_TEST(opaque_draw_round_trips_through_the_linear_pipeline) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    unsigned char source[k_width * k_height * 4]{};
+    for (unsigned y = 0; y < k_height; ++y) {
+        for (unsigned x = 0; x < k_width; ++x) {
+            unsigned char* px = source + (y * k_width + x) * 4u;
+            px[0] = static_cast<unsigned char>(x * 4u);
+            px[1] = static_cast<unsigned char>(y * 4u);
+            px[2] = 64u;
+            px[3] = 255u;
+        }
+    }
+
+    constexpr unsigned texture_id = 0x4000'0021u;
+    if (!gpu.compositor.upload_rgba(texture_id, k_width, k_height, source))
+        return;
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.blend = lx::blend_mode::opaque;
+    cmd.opacity = 1.f;
+
+    LUMEN_CHECK(static_cast<bool>(
+        gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1)));
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                            sizeof(readback))));
+    for (unsigned y = 8; y < k_height; y += 16) {
+        for (unsigned x = 8; x < k_width; x += 16) {
+            const unsigned char* got = readback + (y * k_width + x) * 4u;
+            const unsigned char* want = source + (y * k_width + x) * 4u;
+            for (unsigned c = 0; c < 3; ++c) {
+                const int diff = static_cast<int>(got[c]) - static_cast<int>(want[c]);
+                LUMEN_CHECK(diff <= 2 && diff >= -2); // decode/encode rounding only
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }
