@@ -292,6 +292,150 @@ LUMEN_TEST(render_target_exports_scanout_dmabuf) {
     LUMEN_CHECK(dmabuf.stride >= k_width * 4u);
 }
 
+// ── Widened draw contract on the GPU path ───────────────────────────────────────────
+//
+// src / clip / tint were dropped between the scene and the renderer, so viewporter,
+// subsurface clipping and alpha-modifier could not reach a pixel. These drive the same
+// fields the CPU backend tests cover, through the Vulkan shader instead.
+
+namespace {
+
+/// Uploads a left-half-red / right-half-blue texture and returns its id.
+[[nodiscard]] bool upload_split_texture(gpu_fixture& gpu, unsigned texture_id) {
+    unsigned char source[k_width * k_height * 4]{};
+    for (unsigned y = 0; y < k_height; ++y) {
+        for (unsigned x = 0; x < k_width; ++x) {
+            unsigned char* px = source + (y * k_width + x) * 4u;
+            const bool left = x < k_width / 2u;
+            px[0] = left ? 255u : 0u;
+            px[1] = 0u;
+            px[2] = left ? 0u : 255u;
+            px[3] = 255u;
+        }
+    }
+    return static_cast<bool>(
+        gpu.compositor.upload_rgba(texture_id, k_width, k_height, source));
+}
+
+} // namespace
+
+LUMEN_TEST(src_rect_crops_what_the_shader_samples) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    constexpr unsigned texture_id = 0x4000'0010u;
+    if (!upload_split_texture(gpu, texture_id))
+        return;
+
+    // Sample only the right (blue) half, stretched over the whole target. Every pixel must
+    // come out blue — with src dropped, the left half would still be red.
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.src = {static_cast<int>(k_width / 2u), 0, static_cast<int>(k_width / 2u),
+               static_cast<int>(k_height)};
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                            sizeof(readback))));
+    for (unsigned y = 0; y < k_height; y += 8) {
+        for (unsigned x = 0; x < k_width; x += 8) {
+            const unsigned char* px = readback + (y * k_width + x) * 4u;
+            LUMEN_CHECK(px[2] > 200u); // blue
+            LUMEN_CHECK(px[0] < 64u);  // not red
+        }
+    }
+}
+
+LUMEN_TEST(clip_confines_the_draw_to_a_scissor) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    constexpr unsigned texture_id = 0x4000'0011u;
+    if (!upload_split_texture(gpu, texture_id))
+        return;
+
+    // Full-target draw, clipped to the top-left quadrant.
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.clip = {0, 0, static_cast<int>(k_width / 2u), static_cast<int>(k_height / 2u)};
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                            sizeof(readback))));
+    // Inside the clip: the texture's left half, so red. Outside: the clear color.
+    const unsigned char* inside = readback + ((k_height / 4u) * k_width + k_width / 4u) * 4u;
+    LUMEN_CHECK(inside[0] > 200u);
+
+    const unsigned char* below =
+        readback + ((k_height * 3u / 4u) * k_width + k_width / 4u) * 4u;
+    LUMEN_CHECK(below[0] < 32u && below[1] < 32u && below[2] < 32u);
+}
+
+LUMEN_TEST(clip_outside_the_target_submits_nothing) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    constexpr unsigned texture_id = 0x4000'0012u;
+    if (!upload_split_texture(gpu, texture_id))
+        return;
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.clip = {static_cast<int>(k_width) + 8, 0, 16, 16};
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 0);
+    LUMEN_CHECK(stats.value().draws_culled == 1);
+}
+
+LUMEN_TEST(tint_multiplies_the_sampled_color) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    constexpr unsigned texture_id = 0x4000'0013u;
+    if (!upload_split_texture(gpu, texture_id))
+        return;
+
+    // Drop red entirely; the left half must stop being red rather than merely dim.
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.tint = lx::color::rgb(0.f, 1.f, 1.f, 1.f);
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                            sizeof(readback))));
+    const unsigned char* left = readback + ((k_height / 2u) * k_width + k_width / 4u) * 4u;
+    LUMEN_CHECK(left[0] < 32u); // red channel killed by the tint
+    const unsigned char* right =
+        readback + ((k_height / 2u) * k_width + k_width * 3u / 4u) * 4u;
+    LUMEN_CHECK(right[2] > 200u); // blue survives
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

@@ -135,6 +135,8 @@ private:
 struct gl_composite_stats {
     unsigned draws_submitted = 0;
     unsigned draws_skipped = 0;
+    /// Clipped away entirely, so never submitted. Expected, not an error.
+    unsigned draws_culled = 0;
     unsigned uploads = 0;
     unsigned dmabuf_imports = 0;
     /// sync_file signalled when this frame's GL work completes, or -1 when the driver has
@@ -210,6 +212,9 @@ private:
     int uniform_rect_ = -1;
     int uniform_target_ = -1;
     int uniform_opacity_ = -1;
+    int uniform_src_uv_ = -1;
+    int uniform_tint_ = -1;
+    int uniform_src_bounds_ = -1;
     int uniform_sampler_ = -1;
     texture_slot textures_[k_max_textures]{};
 };
@@ -232,9 +237,12 @@ constexpr const char* k_vertex_shader = R"(#version 100
 attribute vec2 corner;
 uniform vec4 rect;
 uniform vec2 target;
+uniform vec4 src_uv;
 varying vec2 uv;
 void main() {
-    uv = corner;
+    // Sample the source sub-rectangle, so cropping and fractional scale are the same
+    // draw with different UVs rather than a separate path.
+    uv = src_uv.xy + corner * src_uv.zw;
     vec2 px = rect.xy + corner * rect.zw;
     vec2 ndc = (px / target) * 2.0 - 1.0;
     // KMS scans top to bottom; GL's origin is bottom left.
@@ -247,8 +255,15 @@ precision mediump float;
 varying vec2 uv;
 uniform sampler2D surface;
 uniform float opacity;
+uniform vec4 tint;
+uniform vec4 src_bounds;
 void main() {
-    gl_FragColor = texture2D(surface, uv) * opacity;
+    // Clamp to the source rectangle. Linear filtering samples between texel centers, so a
+    // magnified crop would otherwise read texels from outside its own source rect.
+    vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
+    // Sources are premultiplied, so opacity and the tint's alpha scale all four channels;
+    // the tint's color channels multiply the already-premultiplied RGB.
+    gl_FragColor = texture2D(surface, s) * vec4(tint.rgb, 1.0) * (opacity * tint.a);
 }
 )";
 
@@ -685,6 +700,9 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     uniform_rect_ = glGetUniformLocation(program, "rect");
     uniform_target_ = glGetUniformLocation(program, "target");
     uniform_opacity_ = glGetUniformLocation(program, "opacity");
+    uniform_src_uv_ = glGetUniformLocation(program, "src_uv");
+    uniform_tint_ = glGetUniformLocation(program, "tint");
+    uniform_src_bounds_ = glGetUniformLocation(program, "src_bounds");
     uniform_sampler_ = glGetUniformLocation(program, "surface");
 
     // Unit quad; the vertex shader maps it onto each draw's destination rect.
@@ -926,6 +944,43 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite(
             glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
         }
 
+        // Effective scissor is damage ∩ clip, computed in top-left space and flipped once
+        // at the end. Set explicitly on every draw rather than only when a clip is present:
+        // leaving the previous draw's scissor in place would silently clip the next one.
+        int sx0 = 0;
+        int sy0 = 0;
+        int sx1 = static_cast<int>(width);
+        int sy1 = static_cast<int>(height);
+        bool scissored = false;
+        if (has_damage) {
+            sx0 = damage.x;
+            sy0 = damage.y;
+            sx1 = damage.x + damage.width;
+            sy1 = damage.y + damage.height;
+            scissored = true;
+        }
+        if (cmd.clip.width > 0 && cmd.clip.height > 0) {
+            if (cmd.clip.x > sx0) sx0 = cmd.clip.x;
+            if (cmd.clip.y > sy0) sy0 = cmd.clip.y;
+            if (cmd.clip.x + cmd.clip.width < sx1) sx1 = cmd.clip.x + cmd.clip.width;
+            if (cmd.clip.y + cmd.clip.height < sy1) sy1 = cmd.clip.y + cmd.clip.height;
+            scissored = true;
+        }
+        if (scissored) {
+            if (sx0 < 0) sx0 = 0;
+            if (sy0 < 0) sy0 = 0;
+            if (sx1 > static_cast<int>(width)) sx1 = static_cast<int>(width);
+            if (sy1 > static_cast<int>(height)) sy1 = static_cast<int>(height);
+            if (sx1 <= sx0 || sy1 <= sy0) {
+                ++stats.draws_culled;
+                continue;
+            }
+            glEnable(GL_SCISSOR_TEST);
+            glScissor(sx0, static_cast<int>(height) - sy1, sx1 - sx0, sy1 - sy0);
+        } else {
+            glDisable(GL_SCISSOR_TEST);
+        }
+
         glBindTexture(GL_TEXTURE_2D, name);
         if (uniform_rect_ >= 0) {
             glUniform4f(uniform_rect_, static_cast<float>(cmd.dst.x), static_cast<float>(cmd.dst.y),
@@ -933,6 +988,34 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite(
         }
         if (uniform_opacity_ >= 0)
             glUniform1f(uniform_opacity_, cmd.opacity);
+        // An empty src means the whole texture, which is the identity rect.
+        float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
+        float u_lo = 0.f, v_lo = 0.f, u_hi = 1.f, v_hi = 1.f;
+        if (slot.width > 0 && slot.height > 0) {
+            const float tw = static_cast<float>(slot.width);
+            const float th = static_cast<float>(slot.height);
+            if (cmd.src.width > 0 && cmd.src.height > 0) {
+                u0 = static_cast<float>(cmd.src.x) / tw;
+                v0 = static_cast<float>(cmd.src.y) / th;
+                du = static_cast<float>(cmd.src.width) / tw;
+                dv = static_cast<float>(cmd.src.height) / th;
+            }
+            // Half-texel inset, so a magnified crop cannot sample across its own edge.
+            const float half_u = 0.5f / tw;
+            const float half_v = 0.5f / th;
+            u_lo = u0 + half_u;
+            v_lo = v0 + half_v;
+            u_hi = u0 + du - half_u;
+            v_hi = v0 + dv - half_v;
+            if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
+            if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
+        }
+        if (uniform_src_uv_ >= 0)
+            glUniform4f(uniform_src_uv_, u0, v0, du, dv);
+        if (uniform_src_bounds_ >= 0)
+            glUniform4f(uniform_src_bounds_, u_lo, v_lo, u_hi, v_hi);
+        if (uniform_tint_ >= 0)
+            glUniform4f(uniform_tint_, cmd.tint.r, cmd.tint.g, cmd.tint.b, cmd.tint.a);
 
         glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
         ++stats.draws_submitted;

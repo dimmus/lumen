@@ -320,9 +320,14 @@ if(LUMEN_BUILD_TESTS)
     set(LUMEN_ASAN_OPTS "halt_on_error=1:abort_on_error=1")
     set(LUMEN_UBSAN_OPTS "halt_on_error=1:print_stacktrace=1")
 
+    # Both suppression files apply everywhere. They are scoped to third-party shared
+    # objects by name, so a test that never loads a graphics driver simply matches nothing
+    # — and any test that later grows a compositor gets the right behavior without being
+    # remembered here. Only the blunt instrument below is opt-in.
     set(LUMEN_SANITIZER_ENV
-        "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}"
+        "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}:suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/tsan.supp"
         "ASAN_OPTIONS=${LUMEN_ASAN_OPTS}"
+        "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/lsan.supp"
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
     # Tests that bring up a Vulkan device load the system ICD, whose teardown is not
@@ -341,9 +346,9 @@ if(LUMEN_BUILD_TESTS)
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
     set_tests_properties(test_result test_snapshot test_import_cache bench_frame
-        test_runtime_memory test_runtime_task
+        test_runtime_memory test_runtime_task test_cpu_composite
         test_headless_golden test_text_shaping test_protocol_bind test_kms_device test_kms_vkms
-        test_ui_reconcile
+        test_ui_reconcile test_gl_composite bench_composite
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout

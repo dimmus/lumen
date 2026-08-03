@@ -73,6 +73,8 @@ struct composite_stats {
     /// Draws whose texture id was never registered. Non-zero means the commit path and
     /// the render path disagree — it must not be papered over with a placeholder.
     unsigned draws_skipped = 0;
+    /// Clipped away entirely, so never submitted. Expected, not an error.
+    unsigned draws_culled = 0;
 };
 
 /// Records and submits the compositor's textured-quad pass.
@@ -169,11 +171,22 @@ private:
 
 namespace {
 
+/// Mirrors the `quad_push` block in composite.vert/.frag. Field order matters: each vec4
+/// sits at a 16-byte-aligned offset, which the layout below satisfies naturally (dst at 0,
+/// src_uv at 32, tint at 48) for 64 bytes total — well inside the 128 every driver
+/// guarantees for push constants.
 struct quad_push {
     float dst[4]{};
     float target[2]{};
     float opacity = 1.f;
     float pad = 0.f;
+    /// Source rectangle in normalized texture coordinates: u0, v0, du, dv.
+    float src_uv[4]{0.f, 0.f, 1.f, 1.f};
+    float tint[4]{1.f, 1.f, 1.f, 1.f};
+    /// Half-texel-inset sampling bounds for `src_uv`: u_lo, v_lo, u_hi, v_hi. The fragment
+    /// shader clamps to these so a magnified crop cannot bleed texels from outside the
+    /// source rectangle — which is precisely what viewporter must not do.
+    float src_bounds[4]{0.f, 0.f, 1.f, 1.f};
 };
 
 constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_UNORM;
@@ -1280,6 +1293,28 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
                                 static_cast<VkPipelineLayout>(pipeline_layout_), 0, 1, &set, 0,
                                 nullptr);
 
+        // Clip is a scissor, which costs nothing extra here — the pipeline already
+        // declares scissor as dynamic state. An empty clip means unclipped.
+        VkRect2D draw_scissor = scissor;
+        if (cmd.clip.width > 0 && cmd.clip.height > 0) {
+            const int x0 = cmd.clip.x > 0 ? cmd.clip.x : 0;
+            const int y0 = cmd.clip.y > 0 ? cmd.clip.y : 0;
+            const int x1 = cmd.clip.x + cmd.clip.width;
+            const int y1 = cmd.clip.y + cmd.clip.height;
+            const int max_x = static_cast<int>(target.width());
+            const int max_y = static_cast<int>(target.height());
+            const int cx1 = x1 < max_x ? x1 : max_x;
+            const int cy1 = y1 < max_y ? y1 : max_y;
+            if (cx1 <= x0 || cy1 <= y0) {
+                ++stats.draws_culled;
+                continue; // clipped away entirely
+            }
+            draw_scissor.offset = {x0, y0};
+            draw_scissor.extent = {static_cast<unsigned>(cx1 - x0),
+                                   static_cast<unsigned>(cy1 - y0)};
+        }
+        vkCmdSetScissor(cb, 0, 1, &draw_scissor);
+
         quad_push push{};
         push.dst[0] = static_cast<float>(cmd.dst.x);
         push.dst[1] = static_cast<float>(cmd.dst.y);
@@ -1288,6 +1323,40 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
         push.target[0] = static_cast<float>(target.width());
         push.target[1] = static_cast<float>(target.height());
         push.opacity = cmd.opacity;
+
+        // Source rect in normalized coordinates. An empty src means the whole texture,
+        // which keeps the default {0,0,1,1} and reproduces the old behavior exactly.
+        if (slot.width > 0 && slot.height > 0) {
+            const float tw = static_cast<float>(slot.width);
+            const float th = static_cast<float>(slot.height);
+            if (cmd.src.width > 0 && cmd.src.height > 0) {
+                push.src_uv[0] = static_cast<float>(cmd.src.x) / tw;
+                push.src_uv[1] = static_cast<float>(cmd.src.y) / th;
+                push.src_uv[2] = static_cast<float>(cmd.src.width) / tw;
+                push.src_uv[3] = static_cast<float>(cmd.src.height) / th;
+            }
+            // Inset by half a texel on each side: linear filtering samples between texel
+            // centers, so without this a magnified crop reads its neighbours across the
+            // crop edge. Degenerate rects collapse to the center rather than inverting.
+            const float half_u = 0.5f / tw;
+            const float half_v = 0.5f / th;
+            float u_lo = push.src_uv[0] + half_u;
+            float v_lo = push.src_uv[1] + half_v;
+            float u_hi = push.src_uv[0] + push.src_uv[2] - half_u;
+            float v_hi = push.src_uv[1] + push.src_uv[3] - half_v;
+            if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
+            if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
+            push.src_bounds[0] = u_lo;
+            push.src_bounds[1] = v_lo;
+            push.src_bounds[2] = u_hi;
+            push.src_bounds[3] = v_hi;
+        }
+
+        push.tint[0] = cmd.tint.r;
+        push.tint[1] = cmd.tint.g;
+        push.tint[2] = cmd.tint.b;
+        push.tint[3] = cmd.tint.a;
+
         vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(push), &push);

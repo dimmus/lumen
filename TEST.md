@@ -21,9 +21,14 @@ symbol name. `race_top:pthread_mutex_destroy` would silence the driver, but Lume
 `std::mutex` lowers to exactly that symbol, so a real "destroyed while another thread held
 it" bug would disappear with it.
 
-Everything below is scoped to the two tests that bring up a Vulkan device
-(`test_dmabuf_composite`, `test_kms_vulkan_scanout`) via `LUMEN_SANITIZER_ENV_VULKAN_ICD`
-in `CMakeLists.txt`. The rest of the suite keeps full leak and race detection.
+Both suppression files apply to every test (`LUMEN_SANITIZER_ENV` in `CMakeLists.txt`).
+That is safe precisely because they match on object name: a test that never loads a
+graphics driver matches nothing, and a test that later grows a compositor gets the right
+behavior without anyone having to remember to add it to a list.
+
+Only the blunt instrument is opt-in — `LUMEN_SANITIZER_ENV_VULKAN_ICD`, which turns the
+leak check off outright and is applied to just `test_dmabuf_composite` and
+`test_kms_vulkan_scanout`.
 
 ### TSan — `tests/sanitizers/tsan.supp`
 
@@ -57,12 +62,25 @@ threads incrementing a `static long`, with a `std::this_thread::yield()` in the 
 `RelWithDebInfo` cannot collapse it to a single store) and confirm TSan still reports it
 with the suppression active.
 
-### LSan — no suppression file, `detect_leaks=0` instead
+### LSan — `tests/sanitizers/lsan.supp` for Mesa EGL/GL
+
+Bringing up an EGL display allocates Mesa driver-global state that lives until process
+exit, and creating a GL context allocates gallium state with the same lifetime. LSan
+reports both at exit. These resolve to real shared objects (`libEGL_mesa.so`,
+`libgallium-*.so`), so they get a proper object-scoped suppression. `libgallium` carries
+its Mesa version in the filename, so that pattern is deliberately a prefix.
+
+Any test that starts a compositor can reach this through
+`compositor_impl::setup_gl_present`, which is the reason the file is applied suite-wide
+rather than to a hand-maintained list of GL tests.
+
+### LSan — `detect_leaks=0` for the Vulkan ICD
 
 lavapipe leaks 224 bytes in 4 allocations of per-thread state, because the driver is
 `dlclose`d while its worker threads are still running.
 
-It cannot be suppressed. The ICD is unloaded before LSan's exit check, so its frames
+Unlike the EGL leaks above, this one cannot be suppressed. The ICD is unloaded before
+LSan's exit check, so its frames
 resolve to `<unknown module>` and no `leak:` pattern can match them — LSan matches on
 symbolized text. Two rejected alternatives:
 

@@ -1161,8 +1161,13 @@ void compositor::tick_render() {
         const auto& cmd = draws.data()[i];
         blits[i].texture_id = cmd.texture.id();
         blits[i].dst = cmd.dst;
+        blits[i].src = cmd.src;
+        blits[i].clip = cmd.clip;
+        blits[i].tint = cmd.tint;
         blits[i].opacity = cmd.opacity;
         blits[i].blend = cmd.blend;
+        blits[i].buffer_xform = cmd.buffer_xform;
+        blits[i].src_space = cmd.src_space;
     }
 
     impl_->drain_texture_updates();
