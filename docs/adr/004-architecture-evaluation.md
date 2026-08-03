@@ -1,5 +1,9 @@
-> **Status:** Proposed — evaluation of the v0.3 tree against the goals
-> "solid, fast, efficient, bleeding edge, future oriented"
+> **Status:** Accepted, partially implemented — evaluation of the v0.3 tree against the
+> goals "solid, fast, efficient, bleeding edge, future oriented"
+>
+> The immediate correctness items (F1–F4, P6) and the near-term items (D1, P2, fuzzing)
+> have landed. **D2 is partial** — linear-light blending is in, ≥10-bit storage is not.
+> The structural decisions D3–D5 are open. Section 5 tracks the detail.
 
 # ADR-004: Architecture evaluation and correction plan
 
@@ -452,11 +456,27 @@ Follow-on from the above:
   producer/consumer race on `pending_`). `tests/test_snapshot.cpp` gained coverage for
   slot starvation and for the policies actually differing.
 
-**Near term (unblocks the roadmap)**
-6. [ ] D1 — widen the renderer contract to the full `draw_command`
-7. [ ] D6/P2 — size sort scratch by `count_`; stop allocating 4096-element frames
-8. [ ] D2 — linear-space, ≥10-bit composite
-9. [x] Add a fuzz target for the Wayland request-dispatch path
+**Near term (unblocks the roadmap) — landed**
+6. [x] D1 — `blit_command` carries `src`, `clip`, `tint`, `buffer_xform` and `src_transfer`,
+   and the Vulkan, GL and CPU backends all honour them. Scale falls out of the src:dst
+   ratio rather than being a separate field, so cropping and fractional scale are one code
+   path. Fields a backend cannot express are counted in `draws_unsupported` rather than
+   ignored. Fixed a crop that bled texels from outside its own source rect: linear
+   filtering samples between texel centers, so both GPU shaders now clamp to a half-texel
+   inset — cropping that leaks adjacent pixels is exactly what `viewporter` must not do.
+7. [x] P2 — the sort's index array moved to the heap (4 bytes per command, grown with the
+   commands), the permutation applies in place one cycle at a time instead of through a
+   second full array, and the compositor's blit translation buffer is a member that grows
+   to fit. Also removed the opaque-first partition from the comparator: it is the standard
+   early-Z trick and needs a depth buffer, which this renderer does not have, so it was
+   inverting z for any translucent surface behind an opaque one.
+8. [~] **D2 — partial.** Linear-light blending landed in all three backends, along with the
+   reference transfer functions (sRGB, gamma 2.2, PQ, HLG) in `lx.foundation`. **≥10-bit
+   storage did not** — see "Needs revisiting" for why it is structural rather than
+   remaining effort, and what it needs.
+9. [x] Add a fuzz target for the Wayland request-dispatch path. It found a real leak on its
+   second run: `server::~server()` destroyed the display without destroying clients first,
+   leaking every client's server-side state and resource map.
 
 **Structural**
 10. [ ] D3 — deadline-driven repaint scheduling
