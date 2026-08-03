@@ -1,5 +1,7 @@
 module;
 
+#include <cmath>
+
 export module lx.foundation:types;
 
 export namespace lx {
@@ -146,6 +148,85 @@ struct color {
     case color_space::srgb:
     default:
         return {};
+    }
+}
+
+// ── Transfer functions ──────────────────────────────────────────────────────────────
+//
+// Compositing is only correct in linear light: alpha blending is a weighted average of
+// light, and averaging gamma-encoded values darkens edges (the classic halo around
+// antialiased text). Everything below converts between an encoded signal and linear light.
+//
+// These are the reference definitions. The composite shaders implement the same curves in
+// GLSL and the CPU blitter bakes them into lookup tables; all three must agree, so any
+// change here belongs in `shaders/composite.frag`, `shaders/encode.frag` and
+// `cpu_renderer`'s tables at the same time.
+
+/// sRGB EOTF (IEC 61966-2-1): encoded signal → linear light, both in [0, 1].
+[[nodiscard]] inline float srgb_to_linear(float v) {
+    if (v <= 0.04045f)
+        return v / 12.92f;
+    return std::pow((v + 0.055f) / 1.055f, 2.4f);
+}
+
+/// sRGB inverse EOTF: linear light → encoded signal.
+[[nodiscard]] inline float linear_to_srgb(float v) {
+    if (v <= 0.0031308f)
+        return v * 12.92f;
+    return 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+}
+
+/// SMPTE ST 2084 (PQ) EOTF, normalized so 1.0 is 10000 nits. The HDR path.
+[[nodiscard]] inline float pq_to_linear(float v) {
+    constexpr float m1 = 2610.f / 16384.f;
+    constexpr float m2 = 2523.f / 4096.f * 128.f;
+    constexpr float c1 = 3424.f / 4096.f;
+    constexpr float c2 = 2413.f / 4096.f * 32.f;
+    constexpr float c3 = 2392.f / 4096.f * 32.f;
+    const float e = std::pow(v, 1.f / m2);
+    const float num = e - c1 > 0.f ? e - c1 : 0.f;
+    const float den = c2 - c3 * e;
+    return den != 0.f ? std::pow(num / den, 1.f / m1) : 0.f;
+}
+
+/// SMPTE ST 2084 (PQ) inverse EOTF.
+[[nodiscard]] inline float linear_to_pq(float v) {
+    constexpr float m1 = 2610.f / 16384.f;
+    constexpr float m2 = 2523.f / 4096.f * 128.f;
+    constexpr float c1 = 3424.f / 4096.f;
+    constexpr float c2 = 2413.f / 4096.f * 32.f;
+    constexpr float c3 = 2392.f / 4096.f * 32.f;
+    const float y = std::pow(v < 0.f ? 0.f : v, m1);
+    return std::pow((c1 + c2 * y) / (1.f + c3 * y), m2);
+}
+
+/// Decode one channel of an encoded signal to linear light.
+[[nodiscard]] inline float to_linear(float v, transfer_function tf) {
+    switch (tf) {
+    case transfer_function::linear: return v;
+    case transfer_function::gamma22: return std::pow(v < 0.f ? 0.f : v, 2.2f);
+    case transfer_function::pq: return pq_to_linear(v);
+    // HLG's full OOTF depends on peak luminance and system gamma; the inverse OETF alone
+    // is the scene-referred part and is what a compositor without display metadata can do.
+    case transfer_function::hlg:
+        return v <= 0.5f ? (v * v) / 3.f
+                         : (std::exp((v - 0.55991073f) / 0.17883277f) + 0.28466892f) / 12.f;
+    case transfer_function::srgb:
+    default: return srgb_to_linear(v);
+    }
+}
+
+/// Encode linear light back into a transfer function.
+[[nodiscard]] inline float from_linear(float v, transfer_function tf) {
+    switch (tf) {
+    case transfer_function::linear: return v;
+    case transfer_function::gamma22: return std::pow(v < 0.f ? 0.f : v, 1.f / 2.2f);
+    case transfer_function::pq: return linear_to_pq(v);
+    case transfer_function::hlg:
+        return v <= 1.f / 12.f ? std::sqrt(3.f * (v < 0.f ? 0.f : v))
+                               : 0.17883277f * std::log(12.f * v - 0.28466892f) + 0.55991073f;
+    case transfer_function::srgb:
+    default: return linear_to_srgb(v);
     }
 }
 

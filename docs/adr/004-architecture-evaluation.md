@@ -308,6 +308,9 @@ Take A now, B at D4.
 
 ### D2 — Composite in linear space at ≥10 bits
 
+> **Status: linear space done, ≥10 bits not.** Blending is now correct in all three
+> backends. Wider storage is not, and is the remaining half — see "Needs revisiting".
+
 **Decision:** render target moves to `VK_FORMAT_A2B10G10R10_UNORM_PACK32` (or
 `R16G16B16A16_SFLOAT` for the HDR path), the shader linearizes on sample per the surface's
 `transfer_function`, blends linear, and encodes on output.
@@ -384,13 +387,32 @@ reads like a scheduling note.
 - `executor::post` targets an SPSC queue, so only one producer per strand is legal. The
   contract is now documented rather than mis-stated, but a compositor with UI, render, and
   worker threads all posting to the UI strand needs an MPSC queue. Next threading change.
-- The sanitizer suites are not usable as gates: `test_dmabuf_composite` fails under both
-  ASan (224 B leaked in the Vulkan ICD) and TSan (`pthread_mutex_destroy` race in
-  `libvulkan_lvp.so`) on a pristine checkout. Both are inside lavapipe, not Lumen. Without
-  a suppressions file every future sanitizer run starts red, which is how a real finding
-  gets waved through.
+- ~~The sanitizer suites are not usable as gates~~ — **fixed.** `test_dmabuf_composite`
+  failed under both ASan and TSan on a pristine checkout, entirely inside Mesa lavapipe.
+  TSan now uses `tests/sanitizers/tsan.supp` (`race:libvulkan_lvp.so`, scoped to the
+  object, never to a symbol — Lumen's `std::mutex` lowers to the same `pthread_*` calls).
+  LSan cannot be suppressed at all: the ICD is `dlclose`d before the exit check, so its
+  frames are `<unknown module>` and no `leak:` pattern matches; the two Vulkan tests run
+  with `detect_leaks=0` instead, keeping every other ASan check. All four configurations
+  are green. Rationale and the checks that keep it honest are in `TEST.md`.
 - `immutable_frame_snapshot::dropped()` is public and always returns false — nothing sets
   it. Either wire it or remove it.
+- **D2's second half: ≥10-bit storage and HDR output.** Linear-light blending landed; wider
+  storage did not. The blocker is structural, not effort: correct blending needs the
+  attachment to *hold* linear values, and the trick that makes 8-bit work — an sRGB
+  attachment, where the blend unit decodes, blends and re-encodes in hardware — has no
+  equivalent at 10 bits, because no 10-bit format has an sRGB variant. Wider storage
+  therefore needs a linear float intermediate (`R16G16B16A16_SFLOAT`) plus an explicit
+  encode pass that applies the output transfer function on the way to the scanout buffer.
+  That is a second render pass, pipeline, descriptor set and set of layout transitions.
+  The transfer-function math it needs is already in place (`lx::to_linear` /
+  `lx::from_linear`, including PQ and HLG), and the composite shader already decodes per
+  draw — so the encode pass is the missing piece, not the color model.
+- **The GL backend blends against the framebuffer in encoded space.** It decodes, shades
+  and re-encodes each draw's own color correctly, but GLES 2 offers neither an sRGB
+  framebuffer nor a float attachment, so the blend against what is already there stays
+  encoded. Vulkan is linear end to end. Worth revisiting if GL becomes a primary path
+  rather than a fallback.
 - `docs/architecture.md` §13 marks the status table honestly but the rest of the document
   reads as descriptive. Anything the render contract cannot express should be marked as
   such in the doc, not only in the status table.
@@ -434,7 +456,7 @@ Follow-on from the above:
 6. [ ] D1 — widen the renderer contract to the full `draw_command`
 7. [ ] D6/P2 — size sort scratch by `count_`; stop allocating 4096-element frames
 8. [ ] D2 — linear-space, ≥10-bit composite
-9. [ ] Add a fuzz target for the Wayland request-dispatch path
+9. [x] Add a fuzz target for the Wayland request-dispatch path
 
 **Structural**
 10. [ ] D3 — deadline-driven repaint scheduling

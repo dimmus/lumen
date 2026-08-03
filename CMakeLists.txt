@@ -316,11 +316,73 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_kms_vulkan_scanout COMMAND test_kms_vulkan_scanout)
 
     # A sanitizer report must fail the test, not just print to stderr.
+    set(LUMEN_TSAN_OPTS "halt_on_error=1")
+    set(LUMEN_ASAN_OPTS "halt_on_error=1:abort_on_error=1")
+    set(LUMEN_UBSAN_OPTS "halt_on_error=1:print_stacktrace=1")
+
+    # Both suppression files apply everywhere. They are scoped to third-party shared
+    # objects by name, so a test that never loads a graphics driver simply matches nothing
+    # — and any test that later grows a compositor gets the right behavior without being
+    # remembered here. Only the blunt instrument below is opt-in.
+    set(LUMEN_SANITIZER_ENV
+        "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}:suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/tsan.supp"
+        "ASAN_OPTIONS=${LUMEN_ASAN_OPTS}"
+        "LSAN_OPTIONS=suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/lsan.supp"
+        "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
+
+    # Tests that bring up a Vulkan device load the system ICD, whose teardown is not
+    # sanitizer-clean. Both concessions below are scoped to these two tests alone, so the
+    # rest of the suite keeps full leak and race detection. Analysis in TEST.md.
+    set(LUMEN_SANITIZER_ENV_VULKAN_ICD
+        # Races among the driver's own threads, suppressed by object name — see
+        # tests/sanitizers/tsan.supp for why it is scoped that way and not by symbol.
+        "TSAN_OPTIONS=${LUMEN_TSAN_OPTS}:suppressions=${CMAKE_SOURCE_DIR}/tests/sanitizers/tsan.supp"
+        "ASAN_OPTIONS=${LUMEN_ASAN_OPTS}"
+        # The ICD is dlclose'd before LSan's exit check, so its frames resolve to
+        # "<unknown module>" and no `leak:` pattern can match them. Turning off the exit
+        # leak check is the only scoping available here; every other ASan check
+        # (use-after-free, overflow, out-of-bounds) stays active for these tests.
+        "LSAN_OPTIONS=detect_leaks=0"
+        "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
+
     set_tests_properties(test_result test_snapshot test_import_cache bench_frame
+        test_runtime_memory test_runtime_task test_cpu_composite
         test_headless_golden test_text_shaping test_protocol_bind test_kms_device test_kms_vkms
-        test_kms_vulkan_scanout test_dmabuf_composite test_ui_reconcile
-        PROPERTIES ENVIRONMENT
-            "TSAN_OPTIONS=halt_on_error=1;ASAN_OPTIONS=halt_on_error=1:abort_on_error=1;UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1")
+        test_ui_reconcile test_gl_composite bench_composite
+        PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+
+    set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout
+        PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+endif()
+
+# ── Fuzzers ──────────────────────────────────────────────────────────────────
+#
+# Opt-in and clang-only. The compositor's socket is its one untrusted input, so the
+# request-dispatch path is the boundary worth fuzzing.
+if(LUMEN_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "LUMEN_BUILD_FUZZERS requires clang (libFuzzer)")
+    endif()
+
+    add_executable(fuzz_wayland_dispatch tests/fuzz_wayland_dispatch.cpp)
+    # Seeds that reach past the header into real dispatch — see tests/fuzz/corpus/README.
+    file(COPY "${CMAKE_SOURCE_DIR}/tests/fuzz/corpus" DESTINATION "${CMAKE_BINARY_DIR}")
+    target_link_libraries(fuzz_wayland_dispatch PRIVATE lx.compositor)
+    lumen_apply_module_properties(fuzz_wayland_dispatch)
+    lumen_link_platform(fuzz_wayland_dispatch)
+    target_include_directories(fuzz_wayland_dispatch PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    # address+fuzzer, not fuzzer alone: a memory-safety bug in protocol handling is the
+    # thing worth finding here, and without ASan most of them are silent.
+    target_compile_options(fuzz_wayland_dispatch PRIVATE -fsanitize=fuzzer,address -g)
+    target_link_options(fuzz_wayland_dispatch PRIVATE -fsanitize=fuzzer,address)
+
+    # A short run in CI is a smoke test, not a campaign — it catches a harness that stopped
+    # building or immediately crashes, while real fuzzing runs long and out of band.
+    add_test(NAME fuzz_wayland_dispatch_smoke
+        COMMAND fuzz_wayland_dispatch "${CMAKE_BINARY_DIR}/corpus"
+                -max_total_time=10 -rss_limit_mb=2048)
+    set_tests_properties(fuzz_wayland_dispatch_smoke PROPERTIES TIMEOUT 120
+        ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
 endif()
 
 message(STATUS "Lumen ${PROJECT_VERSION} — C++${CMAKE_CXX_STANDARD} — ${CMAKE_CXX_COMPILER_ID}")

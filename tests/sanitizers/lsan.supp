@@ -1,0 +1,24 @@
+# LeakSanitizer suppressions — THIRD-PARTY CODE ONLY.
+#
+# Same rule as tsan.supp: every entry is scoped to a shared object Lumen does not build.
+# Patterns are substring matches against the symbolized frame, so no entry may name a
+# function — only a library. A Lumen leak must never be able to match one of these.
+#
+# ── Mesa EGL / GL stack ──────────────────────────────────────────────────────────────
+#
+# Bringing up an EGL display allocates driver-global state that Mesa never frees, and
+# creating a GL context allocates gallium state with the same lifetime. Both are reachable
+# for the life of the process and released only by process exit, which is exactly what LSan
+# reports as a leak at exit.
+#
+# These resolve to a real shared object, which is why they get a proper suppression rather
+# than the blunt `detect_leaks=0` the Vulkan tests need — the Vulkan ICD is dlclose'd
+# before the leak check runs, so its frames degrade to "<unknown module>" and no pattern
+# can match them. See TEST.md.
+#
+# libgallium carries its Mesa version in the filename (libgallium-26.1.6-arch1.1.so), so
+# the pattern is deliberately a prefix.
+leak:libEGL_mesa.so
+leak:libgallium
+leak:libgbm.so
+leak:libglapi.so

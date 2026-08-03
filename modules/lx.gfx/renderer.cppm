@@ -8,11 +8,38 @@ import :headless;
 
 export namespace lx::gfx {
 
+/// One quad handed to a present backend.
+///
+/// This mirrors `scene::draw_command`. It used to carry four of its thirteen fields, and
+/// the six dropped in `tick_render` were exactly the ones `viewporter`,
+/// `wp-fractional-scale-v1`, `alpha-modifier-v1`, subsurface clipping and rotated outputs
+/// need — so those protocols could be parsed but never reach a pixel. Fields a backend
+/// cannot express are reported through `composite_stats::draws_unsupported` rather than
+/// ignored, so "not implemented here" stays visible instead of rendering the wrong frame.
 struct blit_command {
     unsigned texture_id = 0;
+    /// Destination rectangle in target pixels.
     lx::rect2i dst{};
+    /// Source sub-rectangle in texture pixels. Empty means the whole texture — which is
+    /// both a plain surface and a `wp_viewport` with no source set. Together with `dst`
+    /// this expresses viewporter cropping and fractional scaling: the backends derive the
+    /// scale factor from the src:dst ratio rather than being told it separately.
+    lx::rect2i src{};
+    /// Additional clip in target space; the draw is confined to its intersection with
+    /// `dst`. Empty means unclipped. Subsurface clipping and layer-shell regions.
+    lx::rect2i clip{};
+    /// Per-draw color multiplier, applied premultiplied. `alpha-modifier-v1`.
+    lx::color tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
     float opacity = 1.f;
     lx::blend_mode blend = lx::blend_mode::premultiplied;
+    /// `wl_output.transform` for the source buffer — rotated and flipped monitors.
+    lx::buffer_transform buffer_xform = lx::buffer_transform::normal;
+    /// Primaries the texture's color is expressed in.
+    lx::color_space src_space = lx::color_space::srgb;
+    /// Transfer function the texture is encoded with. The composite decodes to linear
+    /// light before blending, because alpha blending is a weighted average of light and
+    /// averaging encoded values darkens edges.
+    lx::transfer_function src_transfer = lx::transfer_function::srgb;
 };
 
 class pipeline_cache {

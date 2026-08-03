@@ -224,6 +224,255 @@ LUMEN_TEST(cpu_composite_multithreaded_bands_cover_every_row) {
     LUMEN_CHECK(dst.at(k_w - 1, k_h - 1) == src.at(k_w - 1, k_h - 1));
 }
 
+// ── Widened draw contract ───────────────────────────────────────────────────────────
+//
+// src / clip / tint / buffer_xform used to be dropped between the scene and the backends,
+// which is why viewporter, subsurface clipping and alpha-modifier could be parsed but
+// never reach a pixel. These check they now do.
+
+LUMEN_TEST(cpu_composite_src_rect_crops_the_source) {
+    // Four quadrants, each a distinct color, so a crop is identifiable by value alone.
+    image src{4, 4, k_xrgb};
+    for (unsigned y = 0; y < 4; ++y) {
+        for (unsigned x = 0; x < 4; ++x) {
+            const bool right = x >= 2;
+            const bool bottom = y >= 2;
+            src.pixels[y * 4 + x] = bottom ? (right ? 0xFF444444u : 0xFF333333u)
+                                           : (right ? 0xFF222222u : 0xFF111111u);
+        }
+    }
+
+    image dst{2, 2, k_xrgb, 0u};
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    // Crop to the bottom-right quadrant, unscaled into a 2x2 destination.
+    auto cmd = quad(1, {0, 0, 2, 2});
+    cmd.src = {2, 2, 2, 2};
+    auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+
+    for (unsigned y = 0; y < 2; ++y)
+        for (unsigned x = 0; x < 2; ++x)
+            LUMEN_CHECK(dst.at(x, y) == 0xFF444444u);
+}
+
+LUMEN_TEST(cpu_composite_src_rect_scales_from_the_crop) {
+    // Left half black, right half white. Cropping to the right half and stretching it over
+    // the whole destination must produce all white — proving the scale ratio comes from
+    // src:dst and not from the full texture size.
+    image src{4, 2, k_xrgb};
+    for (unsigned y = 0; y < 2; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            src.pixels[y * 4 + x] = x >= 2 ? 0xFFFFFFFFu : 0xFF000000u;
+
+    image dst{8, 4, k_xrgb, 0u};
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 8, 4});
+    cmd.src = {2, 0, 2, 2};
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 8; ++x)
+            LUMEN_CHECK(dst.at(x, y) == 0xFFFFFFFFu);
+}
+
+LUMEN_TEST(cpu_composite_clip_confines_the_draw) {
+    image src{4, 4, k_xrgb, 0xFFFFFFFFu};
+    image dst{4, 4, k_xrgb, 0xFF000000u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    // Draw covers the whole target; the clip admits only the top-left 2x2.
+    auto cmd = quad(1, {0, 0, 4, 4});
+    cmd.clip = {0, 0, 2, 2};
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    for (unsigned y = 0; y < 4; ++y) {
+        for (unsigned x = 0; x < 4; ++x) {
+            const bool inside = x < 2 && y < 2;
+            LUMEN_CHECK(dst.at(x, y) == (inside ? 0xFFFFFFFFu : 0xFF000000u));
+        }
+    }
+}
+
+LUMEN_TEST(cpu_composite_clip_outside_the_target_draws_nothing) {
+    image src{4, 4, k_xrgb, 0xFFFFFFFFu};
+    image dst{4, 4, k_xrgb, 0xFF000000u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 4, 4});
+    cmd.clip = {10, 10, 4, 4};
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            LUMEN_CHECK(dst.at(x, y) == 0xFF000000u);
+}
+
+LUMEN_TEST(cpu_composite_tint_multiplies_color_channels) {
+    image src{2, 2, k_xrgb, 0xFFFFFFFFu};
+    image dst{2, 2, k_xrgb, 0u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    // Halve red, keep green, drop blue — a tint that is wrong per-channel shows up as a
+    // color, not just a brightness.
+    auto cmd = quad(1, {0, 0, 2, 2});
+    cmd.tint = lx::color::rgb(0.5f, 1.f, 0.f, 1.f);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    // Destination is xrgb8888: word is (a<<24)|(r<<16)|(g<<8)|b.
+    const std::uint32_t px = dst.at(0, 0);
+    const unsigned r = (px >> 16) & 0xFFu;
+    const unsigned g = (px >> 8) & 0xFFu;
+    const unsigned b = px & 0xFFu;
+    LUMEN_CHECK(r >= 120 && r <= 136); // ~0.5 of 255, fixed-point rounding
+    LUMEN_CHECK(g >= 250);
+    LUMEN_CHECK(b == 0);
+}
+
+LUMEN_TEST(cpu_composite_tint_alpha_folds_into_opacity) {
+    image src{2, 2, k_argb, 0xFFFFFFFFu};
+    image dst{2, 2, k_argb, 0xFF000000u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 2, 2}, lx::blend_mode::premultiplied, 1.f);
+    cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, 0.5f);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    // White at half alpha over black. Blending happens in linear light, so the result is
+    // linear 0.5 — which encodes to sRGB ~0.735, or ~188, not the ~128 that averaging the
+    // encoded values would give. The lower number is the classic too-dark blend.
+    const unsigned g = (dst.at(0, 0) >> 8) & 0xFFu;
+    LUMEN_CHECK(g > 180 && g < 196);
+}
+
+// A rotated buffer must be reported, not drawn upright. Rendering the wrong frame is worse
+// than rendering none, because nothing upstream can tell it happened.
+LUMEN_TEST(cpu_composite_reports_unsupported_buffer_transform) {
+    image src{4, 4, k_xrgb, 0xFFFFFFFFu};
+    image dst{4, 4, k_xrgb, 0xFF000000u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 4, 4});
+    cmd.buffer_xform = lx::buffer_transform::rotate_90;
+    auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_unsupported == 1);
+    LUMEN_CHECK(stats.value().draws_submitted == 0);
+
+    // And nothing was drawn upright behind our back.
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            LUMEN_CHECK(dst.at(x, y) != 0xFFFFFFFFu);
+}
+
+// An empty src is "the whole texture" — the default path must be untouched by the widening.
+LUMEN_TEST(cpu_composite_empty_src_still_means_whole_texture) {
+    image src{4, 4, k_xrgb};
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            src.pixels[y * 4 + x] = 0xFF000000u | (x << 8) | y;
+
+    image dst{4, 4, k_xrgb, 0u};
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 4, 4}); // src left default-constructed
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            LUMEN_CHECK(dst.at(x, y) == src.at(x, y));
+}
+
+// ── Linear-light compositing ────────────────────────────────────────────────────────
+
+// The defining case. Half-covered white over black must land at linear 0.5, which encodes
+// to ~188 in sRGB. Blending the encoded values directly gives ~128 — visibly darker, and
+// the reason antialiased edges used to grow dark fringes.
+LUMEN_TEST(cpu_composite_blends_in_linear_light_not_encoded_values) {
+    image src{2, 2, k_argb, 0x80808080u}; // premultiplied white at 50% alpha
+    image dst{2, 2, k_argb, 0xFF000000u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 2, 2}, lx::blend_mode::premultiplied, 1.f);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    const unsigned g = (dst.at(0, 0) >> 8) & 0xFFu;
+    // Premultiplied 0x80 is linear-encoded 0.502 in sRGB, i.e. ~0.216 linear, composited
+    // over black at 50% coverage. What matters is that it is well above the ~110 an
+    // encoded-space blend produces for the same inputs.
+    LUMEN_CHECK(g > 120);
+}
+
+// A fully opaque draw must be bit-exact regardless of the blending space — it takes the
+// copy path and no color math happens at all.
+LUMEN_TEST(cpu_composite_opaque_draw_is_unchanged_by_linear_blending) {
+    image src{4, 4, k_xrgb};
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            src.pixels[y * 4 + x] = 0xFF000000u | (x * 40u << 16) | (y * 40u << 8) | 0x7Fu;
+
+    image dst{4, 4, k_xrgb, 0xFF00FF00u};
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 4, 4}, lx::blend_mode::opaque, 1.f);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 4; ++x)
+            LUMEN_CHECK(dst.at(x, y) == src.at(x, y));
+}
+
+// Blending against a fully transparent destination must reproduce the source exactly.
+// This is what pins the table precision: at 8 bits of linear the round trip loses dark
+// values and this drifts.
+LUMEN_TEST(cpu_composite_linear_round_trip_preserves_every_source_value) {
+    image src{16, 16, k_argb};
+    for (unsigned i = 0; i < 256; ++i)
+        src.pixels[i] = 0xFF000000u | (i << 16) | (i << 8) | i; // opaque grey ramp
+
+    image dst{16, 16, k_argb, 0x00000000u}; // fully transparent
+
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+
+    auto cmd = quad(1, {0, 0, 16, 16}, lx::blend_mode::premultiplied, 1.f);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {})));
+
+    for (unsigned i = 0; i < 256; ++i) {
+        const unsigned got = dst.pixels[i] & 0xFFu;
+        const unsigned want = i;
+        const unsigned diff = got > want ? got - want : want - got;
+        LUMEN_CHECK(diff <= 1); // exact but for rounding
+    }
+}
+
 LUMEN_TEST(cpu_composite_rejects_an_invalid_destination) {
     lx::gfx::cpu_compositor comp;
     lx::gfx::pixel_surface bad{};

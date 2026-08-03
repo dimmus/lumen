@@ -280,6 +280,77 @@ enum class convert_op : unsigned char { copy, swap_rb, unsupported };
 
 /// Premultiplied source over destination. `src` and `dst` are already in the destination's
 /// channel order, so the arithmetic is per-byte and order-agnostic.
+// ── Linear-light blending tables ────────────────────────────────────────────────────
+//
+// Alpha blending is a weighted average of light, so it is only correct in linear space.
+// Averaging sRGB-encoded values instead darkens the result — the familiar dark fringe
+// around antialiased glyphs and window edges.
+//
+// Doing that per pixel with pow() is far too slow for a software compositor, so the two
+// conversions are baked into tables: 8-bit encoded to 12-bit linear one way, 12-bit linear
+// back to 8-bit encoded the other. 12 bits of linear is enough that the round trip is
+// exact for every 8-bit input, which the tests check — 8-bit linear would collapse dark
+// values together and band visibly.
+inline constexpr unsigned k_linear_bits = 12;
+inline constexpr unsigned k_linear_max = (1u << k_linear_bits) - 1u;
+
+struct srgb_tables {
+    std::uint16_t to_linear[256]{};
+    std::uint8_t to_srgb[k_linear_max + 1]{};
+
+    srgb_tables() {
+        for (unsigned i = 0; i < 256; ++i) {
+            const float lin = lx::srgb_to_linear(static_cast<float>(i) / 255.f);
+            to_linear[i] = static_cast<std::uint16_t>(lin * static_cast<float>(k_linear_max) + 0.5f);
+        }
+        for (unsigned i = 0; i <= k_linear_max; ++i) {
+            const float enc = lx::linear_to_srgb(static_cast<float>(i) /
+                                                 static_cast<float>(k_linear_max));
+            const float scaled = enc * 255.f + 0.5f;
+            to_srgb[i] = static_cast<std::uint8_t>(scaled < 0.f ? 0.f
+                                                                : (scaled > 255.f ? 255.f : scaled));
+        }
+    }
+};
+
+[[nodiscard]] inline const srgb_tables& tables() {
+    static const srgb_tables t{};
+    return t;
+}
+
+/// Source-over in linear light. `src` and `dst` are premultiplied sRGB-encoded words in the
+/// same channel order; `opacity_255` scales the source.
+[[nodiscard]] inline std::uint32_t blend_over_linear(std::uint32_t src, std::uint32_t dst,
+                                                     unsigned opacity_255) {
+    const auto& t = tables();
+
+    unsigned sa = (src >> 24) & 0xFFu;
+    if (opacity_255 < 255u) {
+        sa = (sa * opacity_255) / 255u;
+    }
+    if (sa == 0)
+        return dst;
+
+    const unsigned inv = 255u - sa;
+    // Alpha is a coverage fraction, not a light level — it stays linear and is not
+    // transfer-encoded. Only the color channels are decoded and re-encoded.
+    const unsigned da = (dst >> 24) & 0xFFu;
+    const unsigned out_a = sa + (da * inv) / 255u;
+
+    std::uint32_t out = (out_a > 255u ? 255u : out_a) << 24;
+    for (unsigned shift = 0; shift < 24; shift += 8) {
+        unsigned s = t.to_linear[(src >> shift) & 0xFFu];
+        if (opacity_255 < 255u)
+            s = (s * opacity_255) / 255u;
+        const unsigned d = t.to_linear[(dst >> shift) & 0xFFu];
+        unsigned lin = s + (d * inv) / 255u;
+        if (lin > k_linear_max)
+            lin = k_linear_max;
+        out |= static_cast<std::uint32_t>(t.to_srgb[lin]) << shift;
+    }
+    return out;
+}
+
 [[nodiscard]] inline std::uint32_t blend_over(std::uint32_t src, std::uint32_t dst,
                                               unsigned opacity_255) {
     if (opacity_255 < 255u) {
@@ -311,6 +382,44 @@ enum class convert_op : unsigned char { copy, swap_rb, unsupported };
     return outer.x <= inner.x && outer.y <= inner.y &&
            outer.x + outer.width >= inner.x + inner.width &&
            outer.y + outer.height >= inner.y + inner.height;
+}
+
+/// Source sub-rectangle to sample, clamped into the texture. An empty `src` means the
+/// whole texture, which is both a plain surface and a `wp_viewport` with no source set.
+[[nodiscard]] inline lx::rect2i effective_src(lx::rect2i src, unsigned tex_w, unsigned tex_h) {
+    const lx::rect2i whole{0, 0, static_cast<int>(tex_w), static_cast<int>(tex_h)};
+    if (src.width <= 0 || src.height <= 0)
+        return whole;
+    return intersect(src, whole);
+}
+
+/// `dst` clipped to the draw's own clip rect. An empty clip means unclipped.
+[[nodiscard]] inline lx::rect2i clipped_dst(lx::rect2i dst, lx::rect2i clip) {
+    if (clip.width <= 0 || clip.height <= 0)
+        return dst;
+    return intersect(dst, clip);
+}
+
+/// True when the tint is the identity multiplier and can be skipped entirely.
+[[nodiscard]] inline bool tint_is_identity(const lx::color& t) {
+    return t.r >= 1.f && t.g >= 1.f && t.b >= 1.f && t.a >= 1.f;
+}
+
+[[nodiscard]] inline unsigned to_255(float v) {
+    const float scaled = v * 255.f + 0.5f;
+    return static_cast<unsigned>(scaled < 0.f ? 0.f : (scaled > 255.f ? 255.f : scaled));
+}
+
+/// Per-channel multiply of a premultiplied pixel. `r_255`/`b_255` are passed in the word's
+/// own channel order, so the caller resolves BGRA vs RGBA once per draw rather than per
+/// pixel.
+[[nodiscard]] inline std::uint32_t apply_tint(std::uint32_t p, unsigned c0_255, unsigned g_255,
+                                              unsigned c2_255, unsigned a_255) {
+    const unsigned c0 = ((p & 0xFFu) * c0_255) >> 8;
+    const unsigned g = (((p >> 8) & 0xFFu) * g_255) >> 8;
+    const unsigned c2 = (((p >> 16) & 0xFFu) * c2_255) >> 8;
+    const unsigned a = (((p >> 24) & 0xFFu) * a_255) >> 8;
+    return (a << 24) | (c2 << 16) | (g << 8) | c0;
 }
 
 } // namespace lx::gfx::detail
@@ -411,16 +520,32 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         if (conv == convert_op::unsupported)
             continue;
 
-        const lx::rect2i area = intersect(cmd.dst, band_rect);
+        // Rotated and flipped buffers need a transposed walk this blitter does not do;
+        // composite() counts them as unsupported rather than drawing them upright.
+        if (cmd.buffer_xform != lx::buffer_transform::normal)
+            continue;
+
+        const lx::rect2i area = intersect(clipped_dst(cmd.dst, cmd.clip), band_rect);
         if (area.width <= 0 || area.height <= 0)
             continue;
 
+        const lx::rect2i sub = effective_src(cmd.src, src.width, src.height);
+        if (sub.width <= 0 || sub.height <= 0)
+            continue;
+
+        // Tint alpha folds into opacity; the color channels stay a per-pixel multiply.
+        const float effective_opacity = cmd.opacity * cmd.tint.a;
         const unsigned opacity_255 =
-            cmd.opacity >= 1.f ? 255u
-                               : (cmd.opacity <= 0.f ? 0u
-                                                     : static_cast<unsigned>(cmd.opacity * 255.f));
+            effective_opacity >= 1.f ? 255u
+                                     : (effective_opacity <= 0.f ? 0u : to_255(effective_opacity));
         if (opacity_255 == 0)
             continue;
+
+        const bool tinted = !(cmd.tint.r >= 1.f && cmd.tint.g >= 1.f && cmd.tint.b >= 1.f);
+        // Destination word order decides which channel the tint's red lands in.
+        const unsigned tint_c0 = to_255(is_rgba_order(dst.format) ? cmd.tint.r : cmd.tint.b);
+        const unsigned tint_g = to_255(cmd.tint.g);
+        const unsigned tint_c2 = to_255(is_rgba_order(dst.format) ? cmd.tint.b : cmd.tint.r);
 
         // Alpha only has to be respected when the source carries it, the draw asks for
         // blending, and the draw is not fully opaque. Worth avoiding for more than the
@@ -432,14 +557,16 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         const bool fill_alpha = has_alpha_channel(dst.format) && !has_alpha_channel(src.format);
 
         // 16.16 fixed point: one multiply per row/column setup, one add per pixel step.
+        // The ratio is the *source sub-rect* against dst, which is what makes viewporter
+        // cropping and fractional scale fall out of the same walk — a cropped source over
+        // the same dst simply steps faster.
         const std::uint32_t x_step =
-            static_cast<std::uint32_t>((static_cast<unsigned long long>(src.width) << 16) /
+            static_cast<std::uint32_t>((static_cast<unsigned long long>(sub.width) << 16) /
                                        static_cast<unsigned>(cmd.dst.width));
         const std::uint32_t y_step =
-            static_cast<std::uint32_t>((static_cast<unsigned long long>(src.height) << 16) /
+            static_cast<std::uint32_t>((static_cast<unsigned long long>(sub.height) << 16) /
                                        static_cast<unsigned>(cmd.dst.height));
-        const bool unscaled = src.width == static_cast<unsigned>(cmd.dst.width) &&
-                              src.height == static_cast<unsigned>(cmd.dst.height);
+        const bool unscaled = sub.width == cmd.dst.width && sub.height == cmd.dst.height;
 
         const std::uint32_t x_start =
             static_cast<std::uint32_t>(area.x - cmd.dst.x) * x_step;
@@ -449,13 +576,20 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         // The whole point of this backend: an unscaled opaque draw in a compatible format
         // is a row memcpy — the destination is written once and nothing is read back.
         const bool memcpy_rows =
-            unscaled && !needs_blend && !fill_alpha && conv == convert_op::copy;
+            unscaled && !needs_blend && !fill_alpha && !tinted && conv == convert_op::copy;
+
+        // Sub-rect origin is added on top of the scaled offset, so cropping is a shift of
+        // where sampling starts rather than a second pass over the source.
+        const unsigned sub_x = static_cast<unsigned>(sub.x);
+        const unsigned sub_y = static_cast<unsigned>(sub.y);
+        const unsigned sub_x_end = sub_x + static_cast<unsigned>(sub.width);
+        const unsigned sub_y_end = sub_y + static_cast<unsigned>(sub.height);
 
         for (int row = 0; row < area.height; ++row) {
             const unsigned sy =
-                unscaled ? static_cast<unsigned>(area.y - cmd.dst.y + row)
-                         : ((y_start + static_cast<std::uint32_t>(row) * y_step) >> 16);
-            if (sy >= src.height)
+                sub_y + (unscaled ? static_cast<unsigned>(area.y - cmd.dst.y + row)
+                                  : ((y_start + static_cast<std::uint32_t>(row) * y_step) >> 16));
+            if (sy >= sub_y_end || sy >= src.height)
                 break;
 
             const auto* src_row = reinterpret_cast<const std::uint32_t*>(
@@ -466,17 +600,18 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
                             area.x;
 
             if (memcpy_rows) {
-                std::memcpy(dst_row, src_row + (area.x - cmd.dst.x),
+                std::memcpy(dst_row, src_row + sub_x + (area.x - cmd.dst.x),
                             static_cast<std::size_t>(area.width) * 4u);
                 continue;
             }
 
             std::uint32_t sx = x_start;
             for (int x = 0; x < area.width; ++x) {
-                const unsigned src_x = unscaled ? static_cast<unsigned>(area.x - cmd.dst.x + x)
-                                                : (sx >> 16);
+                const unsigned src_x =
+                    sub_x + (unscaled ? static_cast<unsigned>(area.x - cmd.dst.x + x)
+                                      : (sx >> 16));
                 sx += x_step;
-                if (src_x >= src.width)
+                if (src_x >= sub_x_end || src_x >= src.width)
                     break;
 
                 std::uint32_t pixel = src_row[src_x];
@@ -484,8 +619,11 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
                     pixel = swap_rb_word(pixel);
                 if (fill_alpha)
                     pixel |= 0xFF000000u;
+                if (tinted)
+                    pixel = apply_tint(pixel, tint_c0, tint_g, tint_c2, 255u);
 
-                dst_row[x] = needs_blend ? blend_over(pixel, dst_row[x], opacity_255) : pixel;
+                dst_row[x] =
+                    needs_blend ? blend_over_linear(pixel, dst_row[x], opacity_255) : pixel;
             }
         }
         bytes += static_cast<unsigned long long>(area.height) * area.width * 4ull;
@@ -528,9 +666,14 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
         const pixel_surface& src = textures_[static_cast<unsigned>(index)].surface;
         if (!src.valid() || pick_convert(src.format, dst.format) == convert_op::unsupported)
             continue;
-        const bool opaque = cmd.opacity >= 1.f &&
+        if (cmd.buffer_xform != lx::buffer_transform::normal)
+            continue;
+        // A tint that darkens or fades still covers, but only if it is fully opaque and
+        // the draw is actually drawn — otherwise what is underneath shows through.
+        const bool opaque = cmd.opacity >= 1.f && cmd.tint.a >= 1.f &&
                             (cmd.blend == lx::blend_mode::opaque || !has_alpha_channel(src.format));
-        if (opaque && covers(cmd.dst, clip)) {
+        // The clip, not just dst, bounds what this draw actually covers.
+        if (opaque && covers(clipped_dst(cmd.dst, cmd.clip), clip)) {
             first_cmd = i;
             needs_clear = false;
             break;
@@ -550,6 +693,12 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
         }
         const pixel_surface& src = textures_[static_cast<unsigned>(index)].surface;
         if (pick_convert(src.format, dst.format) == convert_op::unsupported) {
+            ++stats.draws_unsupported;
+            continue;
+        }
+        // Say so rather than silently drawing a rotated buffer upright — a wrong frame is
+        // worse than a missing one, because nothing upstream can tell it happened.
+        if (cmd.buffer_xform != lx::buffer_transform::normal) {
             ++stats.draws_unsupported;
             continue;
         }
