@@ -97,8 +97,8 @@ public:
     [[nodiscard]] int run();
     void quit(int code = 0);
 
-    /// Thread-safe: enqueue from worker/render threads via SPSC queue.
-    [[nodiscard]] bool post(callback cb);
+    /// Enqueue from one other thread — SPSC, so a single producer only.
+    [[nodiscard]] bool post(task cb);
     void add_source(event_source* source);
     void remove_source(event_source* source);
 
@@ -116,7 +116,7 @@ private:
     std::atomic<int> exit_code_{0};
     std::atomic<bool> running_{false};
     class strand ui_strand_{affinity::ui};
-    lx::sync::spsc_queue<callback, 4096> inbound_{};
+    lx::sync::spsc_queue<task, k_strand_queue_depth> inbound_{};
 };
 
 // ── Typed event bus (UI thread only) ────────────────────────────────────────
@@ -210,13 +210,13 @@ void lx::runtime::event_loop::quit(int code) {
     running_ = false;
 }
 
-bool lx::runtime::event_loop::post(callback cb) {
+bool lx::runtime::event_loop::post(task cb) {
     if (!cb) return false;
     return inbound_.try_push(cb);
 }
 
 void lx::runtime::event_loop::drain_inbound() {
-    callback fn{};
+    task fn{};
     while (inbound_.try_pop(fn)) {
         if (fn) fn();
     }

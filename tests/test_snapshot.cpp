@@ -12,10 +12,15 @@ LUMEN_TEST(snapshot_publish_acquire_basic) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
 
     lx::scene::snapshot_buffer buf{};
-    auto& draws = buf.write_draw_list();
-    draws.clear();
-    draws.push(lx::scene::draw_command{});
-    LUMEN_CHECK(buf.try_publish({}, 1));
+    auto lease = buf.begin_frame();
+    LUMEN_CHECK(lease.valid());
+    lease.draws().clear();
+    lease.draws().push(lx::scene::draw_command{});
+    LUMEN_CHECK(buf.publish(lease, {}, 1));
+    // Publishing consumes the lease, so a second publish cannot double-count the frame.
+    LUMEN_CHECK(!lease.valid());
+    LUMEN_CHECK(!buf.publish(lease, {}, 1));
+    LUMEN_CHECK(buf.publish_count() == 1);
 
     lx::runtime::set_current_affinity(lx::runtime::affinity::render);
     const auto& snap = buf.acquire();
@@ -30,12 +35,14 @@ LUMEN_TEST(snapshot_sequential_publish_matches_content) {
 
     for (unsigned frame = 1; frame <= 16; ++frame) {
         lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
-        auto& draws = buf.write_draw_list();
-        draws.clear();
+        auto lease = buf.begin_frame();
+        if (!lease.valid())
+            continue;
+        lease.draws().clear();
         for (unsigned i = 0; i < frame; ++i)
-            draws.push(lx::scene::draw_command{});
+            lease.draws().push(lx::scene::draw_command{});
 
-        if (!buf.try_publish({}, frame))
+        if (!buf.publish(lease, {}, frame))
             continue;
 
         lx::runtime::set_current_affinity(lx::runtime::affinity::render);
@@ -51,8 +58,10 @@ LUMEN_TEST(snapshot_reader_lease_survives_publish_storm) {
 
     // Publish first frame so there is something to acquire.
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
-    buf.write_draw_list().clear();
-    LUMEN_CHECK(buf.try_publish({}, 1));
+    auto first = buf.begin_frame();
+    LUMEN_CHECK(first.valid());
+    first.draws().clear();
+    LUMEN_CHECK(buf.publish(first, {}, 1));
 
     lx::runtime::set_current_affinity(lx::runtime::affinity::render);
     const auto& snap = buf.acquire();
@@ -62,16 +71,96 @@ LUMEN_TEST(snapshot_reader_lease_survives_publish_storm) {
     // UI publishes many more frames while render holds the lease.
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     for (unsigned i = 2; i < 64; ++i) {
-        auto& draws = buf.write_draw_list();
-        draws.clear();
-        // Must not overwrite the leased slot — write_draw_list skips it.
-        LUMEN_CHECK(&draws != &snap.draws());
-        (void)buf.try_publish({}, i);
+        auto lease = buf.begin_frame();
+        if (!lease.valid())
+            continue;
+        // Must never hand back the slot the reader is holding.
+        LUMEN_CHECK(&lease.draws() != &snap.draws());
+        lease.draws().clear();
+        (void)buf.publish(lease, {}, i);
     }
 
     // Held snapshot must still be intact.
     LUMEN_CHECK(snap.frame_index() == held);
     buf.release(snap);
+}
+
+// Regression for the fallback that used to hand a reader-held slot back to the writer.
+// With every non-published slot leased out, begin_frame must refuse rather than return
+// a live slot.
+LUMEN_TEST(snapshot_refuses_when_every_slot_is_leased) {
+    lx::scene::snapshot_buffer buf{
+        {.backpressure = lx::scene::backpressure_policy::triple_buffer, .max_in_flight = 8}};
+
+    // A reader can only lease whichever slot is currently published, so walk publish →
+    // acquire once per slot until every slot is held.
+    const lx::scene::immutable_frame_snapshot* held[lx::scene::k_snapshot_slot_count]{};
+    for (unsigned i = 0; i < lx::scene::k_snapshot_slot_count; ++i) {
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        auto lease = buf.begin_frame();
+        LUMEN_CHECK(lease.valid());
+        lease.draws().clear();
+        LUMEN_CHECK(buf.publish(lease, {}, i + 1));
+
+        lx::runtime::set_current_affinity(lx::runtime::affinity::render);
+        held[i] = &buf.acquire();
+        for (unsigned j = 0; j < i; ++j)
+            LUMEN_CHECK(held[j] != held[i]); // each iteration leases a distinct slot
+    }
+
+    // Every slot is now reader-held. The old fallback returned a live slot here.
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    auto starved = buf.begin_frame();
+    LUMEN_CHECK(!starved.valid());
+    LUMEN_CHECK(buf.dropped_count() >= 1);
+
+    lx::runtime::set_current_affinity(lx::runtime::affinity::render);
+    for (auto* h : held)
+        buf.release(*h);
+
+    // Once the readers let go, the producer makes progress again.
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    auto recovered = buf.begin_frame();
+    LUMEN_CHECK(recovered.valid());
+    recovered.draws().clear();
+    LUMEN_CHECK(buf.publish(recovered, {}, 3));
+}
+
+// drop_latest and triple_buffer must not be two names for the same behavior: with
+// max_in_flight exhausted, drop_latest refuses and triple_buffer keeps going.
+LUMEN_TEST(snapshot_backpressure_policies_differ) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+
+    lx::scene::snapshot_buffer dropping{
+        {.backpressure = lx::scene::backpressure_policy::drop_latest, .max_in_flight = 1}};
+    auto d1 = dropping.begin_frame();
+    LUMEN_CHECK(d1.valid());
+    d1.draws().clear();
+    LUMEN_CHECK(dropping.publish(d1, {}, 1));
+    LUMEN_CHECK(dropping.in_flight_count() == 1);
+
+    // In-flight budget is spent and nothing released it — drop_latest refuses up front.
+    LUMEN_CHECK(dropping.would_stall());
+    auto d2 = dropping.begin_frame();
+    LUMEN_CHECK(!d2.valid());
+    LUMEN_CHECK(dropping.dropped_count() == 1);
+    LUMEN_CHECK(dropping.publish_count() == 1);
+
+    lx::scene::snapshot_buffer buffering{
+        {.backpressure = lx::scene::backpressure_policy::triple_buffer, .max_in_flight = 1}};
+    auto t1 = buffering.begin_frame();
+    LUMEN_CHECK(t1.valid());
+    t1.draws().clear();
+    LUMEN_CHECK(buffering.publish(t1, {}, 1));
+
+    // Same in-flight count, but triple_buffer admits on slot availability instead.
+    LUMEN_CHECK(!buffering.would_stall());
+    auto t2 = buffering.begin_frame();
+    LUMEN_CHECK(t2.valid());
+    t2.draws().clear();
+    LUMEN_CHECK(buffering.publish(t2, {}, 2));
+    LUMEN_CHECK(buffering.publish_count() == 2);
+    LUMEN_CHECK(buffering.dropped_count() == 0);
 }
 
 // The publisher encodes the frame number in the draw count, so the reader can
@@ -88,11 +177,14 @@ LUMEN_TEST(snapshot_tsan_stress) {
         lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
         unsigned frame = 1;
         while (!stop.load(std::memory_order_acquire)) {
-            auto& draws = buf.write_draw_list();
-            draws.clear();
-            for (unsigned i = 0; i <= frame % k_period; ++i)
-                draws.push(lx::scene::draw_command{});
-            (void)buf.try_publish({}, frame++);
+            auto lease = buf.begin_frame();
+            if (lease.valid()) {
+                lease.draws().clear();
+                for (unsigned i = 0; i <= frame % k_period; ++i)
+                    lease.draws().push(lx::scene::draw_command{});
+                (void)buf.publish(lease, {}, frame);
+            }
+            ++frame;
             std::this_thread::yield();
         }
     });

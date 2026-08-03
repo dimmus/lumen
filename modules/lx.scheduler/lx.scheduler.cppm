@@ -27,7 +27,7 @@ public:
     void on_vsync(frame_tick tick);
 
     /// Thread-safe: schedule callback on target affinity strand.
-    [[nodiscard]] bool post_to(thread_affinity affinity, lx::runtime::callback fn);
+    [[nodiscard]] bool post_to(thread_affinity affinity, lx::runtime::task fn);
 
     void drain(thread_affinity affinity);
 
@@ -62,7 +62,7 @@ void lx::scheduler::frame_scheduler::on_vsync(frame_tick tick) {
 }
 
 bool lx::scheduler::frame_scheduler::post_to(thread_affinity affinity,
-                                             lx::runtime::callback fn) {
+                                             lx::runtime::task fn) {
     return lx::runtime::executor::global().post(affinity, fn);
 }
 

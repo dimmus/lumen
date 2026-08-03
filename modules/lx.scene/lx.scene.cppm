@@ -291,10 +291,18 @@ void lx::scene::scene_graph::build_draw_list_into(draw_list& out) {
 
 bool lx::scene::scene_graph::commit_frame(unsigned frame_index) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    auto& draws = snapshots_.write_draw_list();
-    build_draw_list_into(draws);
-    draws.batch_for_render();
-    const bool published = snapshots_.try_publish(scratch_damage_, frame_index);
+
+    // Take the slot before building. Beyond correctness this skips the whole scene walk
+    // and sort when there is nowhere to publish, instead of doing the work and throwing
+    // the result away.
+    auto lease = snapshots_.begin_frame();
+    if (!lease.valid())
+        return false;
+
+    build_draw_list_into(lease.draws());
+    lease.draws().batch_for_render();
+
+    const bool published = snapshots_.publish(lease, scratch_damage_, frame_index);
     // Damage accumulates per frame. Retain it when the publish was dropped, otherwise the
     // region would be lost and the next presented frame would under-report its damage.
     if (published)
