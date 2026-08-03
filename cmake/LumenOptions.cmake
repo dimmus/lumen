@@ -5,6 +5,20 @@ option(LUMEN_PROTOCOLS_P1 "Generate and enable P1 Wayland protocols" ON)
 option(LUMEN_PROTOCOLS_P2 "Generate and enable P2 Wayland protocols" OFF)
 option(LUMEN_BUILD_TESTS "Build unit / stress tests" ON)
 option(LUMEN_BUILD_XWAYLAND "Build optional rootless XWayland bridge module" OFF)
+option(LUMEN_BUILD_FUZZERS "Build libFuzzer targets (clang only)" OFF)
+
+# Coverage instrumentation has to reach the code under test, not just the harness. Without
+# this every module is an opaque blob to libFuzzer and it degenerates into random input
+# generation — the giveaway is a coverage count that never moves off single digits.
+if(LUMEN_BUILD_FUZZERS)
+    # C sources (the wayland-scanner glue) build with the system C compiler, which may not
+    # be clang and would reject fuzzer-no-link — so coverage is CXX-only and ASan is both.
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:-fsanitize=fuzzer-no-link,address>
+        $<$<COMPILE_LANGUAGE:C>:-fsanitize=address>
+        -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address)
+endif()
 set(LUMEN_SANITIZER "" CACHE STRING "Sanitizer: empty | asan | tsan")
 
 if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")

@@ -112,6 +112,12 @@ public:
     server& operator=(const server&) = delete;
 
     [[nodiscard]] lx::result<void> bind(const char* socket_name);
+
+    /// Creates the display without listening on a socket. Clients are attached directly to
+    /// a connected fd (`wl_client_create`), which is what tests and the dispatch fuzzer
+    /// want: no name to collide on, nothing left in `$XDG_RUNTIME_DIR`, and no dependency
+    /// on the filesystem at all.
+    [[nodiscard]] lx::result<void> bind_socketless();
     [[nodiscard]] int dispatch(int timeout_ms);
     void flush();
 
@@ -267,6 +273,12 @@ lx::wayland::server::~server() {
     close_listen();
 #if defined(LUMEN_HAS_WAYLAND)
     if (display_) {
+        // Clients first: wl_display_destroy tears down globals and the event loop but not
+        // connected clients, so destroying the display alone leaks every client's
+        // server-side state and its resource map. Harmless when the process is exiting
+        // anyway, but not when a server is created and destroyed repeatedly — which the
+        // dispatch fuzzer does thousands of times a second, and is how this was found.
+        wl_display_destroy_clients(display_);
         wl_display_destroy(display_);
         display_ = nullptr;
     }
@@ -387,6 +399,27 @@ lx::result<void> lx::wayland::server::bind(const char* socket_name) {
     return bind_libwayland(socket_name);
 #else
     return bind_raw_socket(socket_name);
+#endif
+}
+
+lx::result<void> lx::wayland::server::bind_socketless() {
+    if (bound_) {
+        return lx::make_error(lx::error_domain::wayland,
+                              static_cast<int>(lx::wayland_err::bind_failed),
+                              "server already bound");
+    }
+
+#if defined(LUMEN_HAS_WAYLAND)
+    display_ = wl_display_create();
+    if (!display_) {
+        return lx::make_error(lx::error_domain::wayland,
+                              static_cast<int>(lx::wayland_err::bind_failed),
+                              "wl_display_create failed");
+    }
+    bound_ = true;
+    return {};
+#else
+    return lx::not_implemented("lx::wayland::server::bind_socketless");
 #endif
 }
 

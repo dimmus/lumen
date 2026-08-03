@@ -11,6 +11,27 @@ chmod +x scripts/tty-smoke.sh && ./scripts/tty-smoke.sh lumen-smoke
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan
 cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan
 
+# Fuzzing (opt-in, clang only)
+cmake -B build/fuzz -G Ninja -DCMAKE_CXX_COMPILER=clang++ -DLUMEN_BUILD_FUZZERS=ON
+cmake --build build/fuzz
+./build/fuzz/fuzz_wayland_dispatch build/fuzz/corpus -max_total_time=600
+
+The compositor's socket is its one untrusted input, so the request-dispatch path is what
+gets fuzzed: raw bytes go down a real client connection and libwayland decodes them exactly
+as it would in production, then Lumen's handlers run.
+
+Always pass the corpus directory. The wire format rejects almost every random byte string
+at the header, so an unseeded run never reaches argument unmarshalling — coverage sits
+around 13 and stays there, versus ~108 from the seeds. See tests/fuzz/corpus/README.md.
+
+`LUMEN_BUILD_FUZZERS=ON` instruments the whole build, not just the harness: without
+coverage feedback into lx.compositor and lx.wayland.server, libFuzzer degenerates into
+random input generation. The giveaway is a coverage count that never leaves single digits.
+
+A crash here is a compositor any client can kill, so treat findings as release-blocking.
+`ctest -R fuzz` runs a 10-second smoke test — enough to catch a harness that stopped
+building or crashes immediately, not a substitute for a long out-of-band campaign.
+
 All four configurations must be green. A sanitizer suite that starts red cannot gate
 anything — the first real finding gets waved through as "the usual noise".
 

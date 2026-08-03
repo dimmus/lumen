@@ -456,7 +456,7 @@ Follow-on from the above:
 6. [ ] D1 — widen the renderer contract to the full `draw_command`
 7. [ ] D6/P2 — size sort scratch by `count_`; stop allocating 4096-element frames
 8. [ ] D2 — linear-space, ≥10-bit composite
-9. [ ] Add a fuzz target for the Wayland request-dispatch path
+9. [x] Add a fuzz target for the Wayland request-dispatch path
 
 **Structural**
 10. [ ] D3 — deadline-driven repaint scheduling

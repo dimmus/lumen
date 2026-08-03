@@ -355,4 +355,34 @@ if(LUMEN_BUILD_TESTS)
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
 endif()
 
+# ── Fuzzers ──────────────────────────────────────────────────────────────────
+#
+# Opt-in and clang-only. The compositor's socket is its one untrusted input, so the
+# request-dispatch path is the boundary worth fuzzing.
+if(LUMEN_BUILD_FUZZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        message(FATAL_ERROR "LUMEN_BUILD_FUZZERS requires clang (libFuzzer)")
+    endif()
+
+    add_executable(fuzz_wayland_dispatch tests/fuzz_wayland_dispatch.cpp)
+    # Seeds that reach past the header into real dispatch — see tests/fuzz/corpus/README.
+    file(COPY "${CMAKE_SOURCE_DIR}/tests/fuzz/corpus" DESTINATION "${CMAKE_BINARY_DIR}")
+    target_link_libraries(fuzz_wayland_dispatch PRIVATE lx.compositor)
+    lumen_apply_module_properties(fuzz_wayland_dispatch)
+    lumen_link_platform(fuzz_wayland_dispatch)
+    target_include_directories(fuzz_wayland_dispatch PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    # address+fuzzer, not fuzzer alone: a memory-safety bug in protocol handling is the
+    # thing worth finding here, and without ASan most of them are silent.
+    target_compile_options(fuzz_wayland_dispatch PRIVATE -fsanitize=fuzzer,address -g)
+    target_link_options(fuzz_wayland_dispatch PRIVATE -fsanitize=fuzzer,address)
+
+    # A short run in CI is a smoke test, not a campaign — it catches a harness that stopped
+    # building or immediately crashes, while real fuzzing runs long and out of band.
+    add_test(NAME fuzz_wayland_dispatch_smoke
+        COMMAND fuzz_wayland_dispatch "${CMAKE_BINARY_DIR}/corpus"
+                -max_total_time=10 -rss_limit_mb=2048)
+    set_tests_properties(fuzz_wayland_dispatch_smoke PROPERTIES TIMEOUT 120
+        ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+endif()
+
 message(STATUS "Lumen ${PROJECT_VERSION} — C++${CMAKE_CXX_STANDARD} — ${CMAKE_CXX_COMPILER_ID}")
