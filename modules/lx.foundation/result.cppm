@@ -14,6 +14,9 @@ enum class error_domain {
     io,
     wayland,
     vulkan,
+    /// EGL / OpenGL ES — the hardware GL present path. Separate from `vulkan` so a log
+    /// line says which renderer actually failed.
+    gl,
     drm,
     protocol,
     invalid_argument,

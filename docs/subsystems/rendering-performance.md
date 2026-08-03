@@ -38,6 +38,186 @@ errors common in legacy compositors.
 
 ---
 
+## 1.2 Present backend selection
+
+Chosen **once at startup**, in `compositor::start`, from `config::present`:
+
+| `present_backend` | Composite | Scanout buffer |
+|-------------------|-----------|----------------|
+| `vulkan` | `gfx::vulkan_compositor` — GPU render pass | Vulkan image exported as dma-buf → `drm::kms_framebuffer` |
+| `gl` | `gfx::gl_compositor` — GLES 2 quads via EGL on GBM | `gbm_bo` (SCANOUT\|RENDERING) → `EGLImage` → FBO, exported → `drm::kms_framebuffer` |
+| `cpu` | `gfx::cpu_compositor` — damage-limited row blitter | `drm::kms_dumb_framebuffer` (CREATE_DUMB + mmap) |
+| `automatic` (default) | hardware Vulkan → hardware GL → CPU; no KMS → headless | |
+
+`automatic` reads `gfx::device_info::is_software_rasterizer`
+(`VK_PHYSICAL_DEVICE_TYPE_CPU` — llvmpipe, SwiftShader) and, for GL,
+`egl_device::is_software_renderer()` (`GL_RENDERER` naming llvmpipe/softpipe/swrast). Each
+backend declines itself rather than accepting a downgrade.
+
+**Why GL exists alongside Vulkan.** Mesa ships hardware drivers for devices it has no
+Vulkan driver for — vmwgfx/SVGA3D under VMware being the case this was built for, but also
+older radeon/nouveau and many SoCs. On those, EGL/GLES is the only accelerated path, and
+without it the compositor falls back to software on hardware that is perfectly capable.
+
+**Why the CPU path exists alongside both.** With a software Vulkan device the GPU path
+still runs, but each frame then makes several passes over the whole surface to do the work
+of one:
+
+```
+client shm ──swizzle──▶ staging ──memcpy──▶ VkBuffer ──copy+tile──▶ VkImage
+                                                                      │
+                                                       fullscreen fragment shader
+                                                                      ▼
+                                                            linear scanout image ──flip──▶
+```
+
+The CPU path collapses that to a single pass:
+
+```
+client shm ──memcpy (native order)──▶ staging ──blit (damage-limited)──▶ dumb FB ──flip──▶
+```
+
+Scanout is allocated **XR24**, which is already the byte order `wl_shm` clients use, so an
+unscaled opaque surface reaches the display with no channel conversion at all.
+
+`tests/bench_composite.cpp` prints the per-pass cost on the host in question — run it
+rather than assuming these ratios transfer.
+
+### Measured: VMware SVGA3D, 1918×928
+
+Render-thread cost per frame — how long the tick is occupied, which is what the budget
+cares about:
+
+```
+CPU   composite, opaque fullscreen             1.8 ms
+GL    composite, dmabuf client (no upload)     0.1 ms
+GL    composite, shm client (full upload)      2.7 ms
+```
+
+The GL figures are **submission** cost, not GPU wall time. The composite exports a fence
+instead of blocking (see below), so the GPU work overlaps the rest of the tick and the flip
+waits on the fence rather than the compositor waiting on the GPU. The GPU still needs
+roughly 1.7 ms for a fullscreen quad; it just has a whole refresh period to do it in. Before
+the fence, the same two lines measured 5.3 ms and 11.4 ms, all of it the render thread
+sitting in `glFinish`.
+
+Two things follow, and neither is intuitive:
+
+**The client's buffer type dominates, not the backend.** A dma-buf client is sampled where
+it already lives; an shm client has to be uploaded every frame, and on a virtualised GPU
+that upload costs more than the composite. This is why `zwp_linux_dmabuf` matters more for
+frame rate than any backend choice.
+
+**For shm clients the two backends are close; for dma-buf they are not.** GL's shm figure
+(2.7 ms) is dominated by the upload, which puts it in the same range as the CPU blitter
+(1.8 ms) — and before the fence landed it was four times worse. For dma-buf clients there is
+no contest: 0.1 ms of render thread, because nothing is copied at all. The CPU backend
+cannot composite a dma-buf client without mapping tiled GPU memory, so a desktop running
+real applications wants GL or Vulkan regardless. Set `config::present` explicitly if a
+specific deployment measures otherwise.
+
+### GL → KMS synchronisation
+
+Nothing synchronises GL against the page flip that reads the scanout buffer. Rather than
+block the render thread until the GPU is done, the composite exports the frame's completion
+as a **sync_file** and the atomic commit waits on it — the display controller holds the flip
+back instead of the compositor holding the frame back.
+
+```
+composite ─ eglCreateSyncKHR(EGL_SYNC_NATIVE_FENCE_ANDROID)
+          ─ glFlush                     (the fence needs its commands submitted)
+          ─ eglDupNativeFenceFDANDROID  → sync_file
+                                          │
+                     atomic_commit_request::in_fence_fd
+                                          ▼
+                            KMS holds the flip until the GPU signals
+```
+
+The FD is **owned by the caller** (`gl_composite_stats::out_fence_fd`) and must reach a
+commit or be closed. In `compositor_impl` it travels with `composited_slot_` in
+`composited_fence_fd_`, because a commit can be deferred a tick and the fence belongs to the
+frame in that slot, not to the tick that commits it. Superseding an uncommitted frame, or
+shutting the render loop down, closes it.
+
+Without `EGL_ANDROID_native_fence_sync` the composite falls back to `glFinish`. Committing
+unsynchronised would show a partly-drawn frame, so the stall is the correct fallback — it is
+not optional.
+
+### GL composite properties
+
+| Property | Behavior |
+|----------|----------|
+| Context | EGL on `EGL_PLATFORM_GBM_KHR`, surfaceless, GLES 2 — the floor every driver supports |
+| Thread | Built on the UI thread during `start()`, released, then claimed by the render thread in `render_loop`. An EGL context is current on one thread at a time |
+| Scanout | 3 × `gbm_bo` (SCANOUT\|RENDERING) → `EGLImage` → renderbuffer → FBO, same slot rotation as the other backends |
+| dma-buf clients | `EGL_EXT_image_dma_buf_import` → sampled in place, no copy |
+| shm clients | `glTexSubImage2D` in RGBA (BGRA measured slower on SVGA3D), staged through `shm_staging_ring` like the Vulkan path |
+| Upload hazard | Each texture keeps **two** GL names and alternates. Uploading into the texture the previous frame is still sampling stalls the driver — measured 48 ms vs 22 ms per frame on SVGA3D |
+| Damage | `glScissor` over the damage rect, flipped into GL's bottom-left origin |
+| Blending | `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` — sources are premultiplied |
+| GPU sync | `EGL_ANDROID_native_fence_sync` → sync_file → `atomic_commit_request::in_fence_fd`; `glFinish` only as fallback |
+
+**Modules:** `lx.gfx.gl_renderer` — `egl_device`, `gl_scanout_target`, `gl_compositor`
+
+Errors use `error_domain::gl` with `lx::gl_err`, so a log line names the renderer that
+actually failed.
+
+### CPU composite properties
+
+| Property | Behavior |
+|----------|----------|
+| Occlusion cull | Topmost opaque draw covering the damage rect skips the clear **and** every draw beneath it |
+| Fast path | Unscaled + opaque + compatible format → row `memcpy` |
+| Conversion | Fused into the blit (`copy` / `swap_rb`); no separate pass |
+| Scaling | 16.16 fixed-point nearest, one add per pixel step |
+| Damage | Composite is clipped to `snapshot.damage()` |
+| Parallelism | `row_band_pool` — disjoint row bands, render thread participates |
+| Write-combining | Opaque draws never read the destination back; blending does, and is slow on a scanout mapping |
+
+`config::composite_thread_count` defaults to **0**. The fullscreen opaque case is a row
+memcpy, which one core already saturates memory bandwidth with, so bands only add dispatch
+latency there; raise it for scenes dominated by blended or converting draws.
+
+**Modules:** `lx.gfx.cpu_renderer` — `cpu_compositor`, `pixel_surface`, `row_band_pool` ·
+`lx.drm` — `kms_dumb_framebuffer`
+
+### SHM staging
+
+Two strategies, because the consumers differ:
+
+| Consumer | Staging | Lifetime |
+|----------|---------|----------|
+| Vulkan upload (copies pixels out during drain) | `shm_staging_ring` — one FIFO for all surfaces | Slot free once the upload is recorded |
+| CPU composite (samples staged rows in place) | `shm_pixel_store` — two slots **per texture** | Slot held until a later commit supersedes it |
+
+A shared FIFO cannot serve the CPU path: the composite reads the rows well after the
+drain, so another surface's commits would recycle the slot underneath and the texture would
+start showing the wrong pixels.
+
+### Texture retirement is dated, not immediate
+
+`texture_update::forget` carries `retire_after_frame` — the first frame index whose
+snapshot is guaranteed not to reference the texture (the frame after the buffer was
+destroyed; the surface node is detached before the next `commit_frame` publishes). The
+render thread queues the retirement and applies it only once it has composited a frame that
+recent.
+
+Queue order alone is not enough. A snapshot published while the buffer was still alive can
+still be waiting to composite, and it references the texture **by id**:
+
+```
+tick_ui(N)      commit → draw list references texture T, snapshot N published
+   (between ticks)  client disconnects → forget(T), retire_after_frame = N+1
+tick_render     acquire snapshot N → drain → composite
+                 forget applied here ⇒ snapshot N draws a texture that is gone
+```
+
+On the Vulkan path that surfaces as `draw referenced an unregistered texture`. On the CPU
+path it is worse than a warning: the retirement releases the `shm_pixel_store` slot the
+draw is still sampling, so the surface can render another client's pixels.
+
+---
+
 ## 2. Render path decision tree
 
 Evaluated **every frame** on the render thread (after snapshot acquire):
@@ -189,6 +369,36 @@ See [../uml/33-gpu-resource-pools.mmd](../uml/33-gpu-resource-pools.mmd).
 
 ---
 
+## 6.1 Frame clock and scanout rotation
+
+**Three scanout slots**, not two. With two, the slot the display is scanning and the slot a
+queued flip is about to scan leave nothing writable, so every tick that overlapped a flip
+had to be dropped. `compositor_impl::pick_back_slot` returns the slot that is neither on
+screen nor queued, so the composite always has somewhere to go.
+
+A frame composited while a flip is queued waits in `composited_slot_` and is committed as
+soon as the CRTC is free. If another frame lands first it simply takes its place — mailbox
+semantics, so what reaches the display is always the newest content.
+
+**The tick is phase-locked to the display.** A timer free-running at `target_fps` drifts
+against the real vblank cadence: ticks land while a flip is still queued and their work is
+wasted, and the visible rate settles well below the refresh rate for reasons that look like
+slow rendering. Each completed flip re-arms the frame timer just ahead of the next vblank
+via `runtime::timer_source::schedule_at`, which is valid from inside the timer's own
+callback. The interval comes from the active mode's `refresh_millihz`, not from
+`config::target_fps` — that is only the fallback when there is no mode to read.
+
+```
+flip completes ──▶ presentation_flip_handler
+                     ├─ present_completed_ = true   (frame callbacks may fire)
+                     └─ vsync_timer.schedule_at(now + refresh − margin)
+```
+
+The 250 ms stall watchdog still paces callbacks by tick if flips stop arriving, so a broken
+output cannot wedge clients.
+
+---
+
 ## 7. DRM page-flip + presentation feedback
 
 **Current (P0 stub):** timer-driven vsync on UI thread.
@@ -254,6 +464,10 @@ Compositor logs **`warn`** when a tick exceeds budget (never on every frame at `
 
 | Concern | Module |
 |---------|--------|
+| GL composite (EGL/GLES/GBM) | `lx.gfx.gl_renderer` |
+| CPU composite + row bands | `lx.gfx.cpu_renderer` |
+| CPU-writable scanout | `lx.drm` (`kms_dumb_framebuffer`) |
+| Present backend selection | `lx.compositor` (`config::present`) |
 | Snapshot v2 + back-pressure | `lx.scene.snapshot` |
 | Direct scanout + hybrid overlays | `lx.compositor.scanout` |
 | Content hints | `lx.compositor.surface` |

@@ -29,7 +29,11 @@ Lumen is a greenfield Linux desktop stack built in **C++26** with **Clang**:
 Design goals:
 
 - **Wayland-only** — no X11 layer
-- **Vulkan-first** — discrete + integrated GPU paths
+- **Vulkan-first, multi-backend** — Vulkan is the design centre and the default wherever a
+  hardware Vulkan driver exists. A GL backend (EGL/GLES on GBM) covers hardware Mesa ships
+  no Vulkan driver for, and a CPU backend covers hosts with no hardware renderer at all.
+  All three live in `lx.gfx` behind `compositor::config::present`
+  ([rendering-performance.md](subsystems/rendering-performance.md) §1.2, [AGENTS.md](../AGENTS.md) §1.1)
 - **Multi-process** — compositor owns display; shell and apps are clients
 - **Stacking-first WM** — optional tiling plugin via `lx.shell.policy`
 - **First-class threading** — UI / render / worker affinities with immutable frame handoff
@@ -281,11 +285,13 @@ flowchart LR
 | `lx.scene` | Scene graph, damage collection, `build_draw_list_into` |
 | `lx.scene.snapshot` | Triple-buffered handoff (v2: index swap, back-pressure policy) |
 | `lx.gfx` | Vulkan device, swapchain, dmabuf import, render pass |
+| `lx.gfx.gl_renderer` | EGL/GLES composite on GBM — the accelerated path on drivers with no Vulkan driver (vmwgfx/SVGA3D and similar) |
+| `lx.gfx.cpu_renderer` | Software composite into a CPU-writable scanout buffer; chosen when no hardware renderer is available ([rendering-performance.md](subsystems/rendering-performance.md) §1.2) |
 | `lx.gfx.import_cache` | LRU reuse of VkImage imports; per-client entry cap |
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
 | `lx.runtime.memory` | Per-subsystem arenas, pressure coordinator, overflow policies |
 | `lx.input` + `seat_manager` | libinput → pointer/keyboard events → focus |
-| `lx.drm` + `lx.drm.atomic` | Connectors, modes, atomic commit, KMS damage blobs |
+| `lx.drm` + `lx.drm.atomic` | Connectors, modes, atomic commit, KMS damage blobs, dumb scanout buffers |
 | `lx.scheduler.presentation` | Page-flip bridge, wp_presentation feedback |
 | `lx.scheduler.budget` | Hot-path CPU budgets per tick |
 

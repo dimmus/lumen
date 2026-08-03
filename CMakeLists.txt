@@ -131,6 +131,47 @@ add_executable(lumen-hello executables/lumen-hello/main.cpp)
 target_link_libraries(lumen-hello PRIVATE lx.app)
 lumen_apply_module_properties(lumen-hello)
 
+# Demo client: needs xdg-shell *client* glue, which the server-side codegen does not emit.
+if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
+    set(LUMEN_XDG_SHELL_XML "${CMAKE_SOURCE_DIR}/protocols/upstream/stable/xdg-shell/xdg-shell.xml")
+    if(NOT EXISTS "${LUMEN_XDG_SHELL_XML}")
+        pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+        set(LUMEN_XDG_SHELL_XML "${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml")
+    endif()
+
+    if(EXISTS "${LUMEN_XDG_SHELL_XML}")
+        set(LUMEN_CLOUDS_GEN "${CMAKE_BINARY_DIR}/generated/clients")
+        file(MAKE_DIRECTORY "${LUMEN_CLOUDS_GEN}")
+        add_custom_command(
+            OUTPUT "${LUMEN_CLOUDS_GEN}/xdg-shell-client-protocol.h"
+            COMMAND "${WAYLAND_SCANNER_EXE}" client-header "${LUMEN_XDG_SHELL_XML}"
+                    "${LUMEN_CLOUDS_GEN}/xdg-shell-client-protocol.h"
+            DEPENDS "${LUMEN_XDG_SHELL_XML}"
+            VERBATIM
+        )
+        add_custom_command(
+            OUTPUT "${LUMEN_CLOUDS_GEN}/xdg-shell-protocol.c"
+            COMMAND "${WAYLAND_SCANNER_EXE}" private-code "${LUMEN_XDG_SHELL_XML}"
+                    "${LUMEN_CLOUDS_GEN}/xdg-shell-protocol.c"
+            DEPENDS "${LUMEN_XDG_SHELL_XML}"
+            VERBATIM
+        )
+
+        add_executable(lumen-clouds
+            executables/lumen-clouds/main.cpp
+            "${LUMEN_CLOUDS_GEN}/xdg-shell-protocol.c"
+            "${LUMEN_CLOUDS_GEN}/xdg-shell-client-protocol.h"
+        )
+        target_include_directories(lumen-clouds PRIVATE "${LUMEN_CLOUDS_GEN}")
+        lumen_link_platform(lumen-clouds)
+        target_link_libraries(lumen-clouds PRIVATE m)
+    else()
+        message(STATUS "xdg-shell.xml not found — skipping lumen-clouds")
+    endif()
+else()
+    message(STATUS "wayland-client/scanner unavailable — skipping lumen-clouds")
+endif()
+
 # ── Optional Flatpak portal adapter ─────────────────────────────────────────
 if(LUMEN_BUILD_FLATPAK_PORTAL)
     lumen_add_module_library(lx.portal modules/lx.portal DEPENDS lx.foundation lx.shell.policy)
@@ -191,12 +232,31 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_import_cache PRIVATE tests)
     add_test(NAME test_import_cache COMMAND test_import_cache)
 
+    add_executable(test_cpu_composite tests/test_cpu_composite.cpp)
+    target_link_libraries(test_cpu_composite PRIVATE lx.gfx)
+    lumen_apply_module_properties(test_cpu_composite)
+    target_include_directories(test_cpu_composite PRIVATE tests)
+    add_test(NAME test_cpu_composite COMMAND test_cpu_composite)
+
+    add_executable(test_gl_composite tests/test_gl_composite.cpp)
+    target_link_libraries(test_gl_composite PRIVATE lx.gfx)
+    lumen_apply_module_properties(test_gl_composite)
+    target_include_directories(test_gl_composite PRIVATE tests)
+    # Skips itself (passing) when there is no render node or GL is a software rasterizer.
+    add_test(NAME test_gl_composite COMMAND test_gl_composite)
+
     add_executable(bench_frame tests/bench_frame_timing.cpp)
     target_link_libraries(bench_frame PRIVATE lx.gfx)
     lumen_apply_module_properties(bench_frame)
     target_include_directories(bench_frame PRIVATE tests)
     # Timing benchmark — always passes; prints avg ms for CI logs.
     add_test(NAME bench_frame COMMAND bench_frame)
+
+    add_executable(bench_composite tests/bench_composite.cpp)
+    target_link_libraries(bench_composite PRIVATE lx.gfx)
+    lumen_apply_module_properties(bench_composite)
+    target_include_directories(bench_composite PRIVATE tests)
+    add_test(NAME bench_composite COMMAND bench_composite)
 
     add_executable(test_headless_golden tests/test_headless_golden.cpp)
     target_link_libraries(test_headless_golden PRIVATE lx.gfx)

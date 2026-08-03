@@ -1,5 +1,6 @@
 module;
 
+#include <atomic>
 #include <chrono>
 
 #if defined(LUMEN_HAS_DRM)
@@ -7,6 +8,7 @@ module;
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
@@ -137,6 +139,58 @@ private:
     unsigned gem_handle_ = 0;
     unsigned width_ = 0;
     unsigned height_ = 0;
+};
+
+/// A scanout framebuffer the CPU can write into directly (DRM dumb buffer).
+///
+/// The GPU-composite path exports a Vulkan image as a dma-buf and imports it as a
+/// `kms_framebuffer`. That is the right shape when compositing happens on a real GPU. When
+/// the only Vulkan device is a software rasterizer, routing pixels through it costs an
+/// upload, a tiling pass and a fullscreen fragment shader to produce bytes the CPU already
+/// had — so this gives the CPU compositor a scanout target it can write once and flip.
+///
+/// The mapping is write-combining: read-modify-write of the mapped pixels is very slow.
+/// Writers must produce whole rows sequentially and never read back.
+class kms_dumb_framebuffer {
+public:
+    kms_dumb_framebuffer() = default;
+    ~kms_dumb_framebuffer();
+
+    kms_dumb_framebuffer(const kms_dumb_framebuffer&) = delete;
+    kms_dumb_framebuffer& operator=(const kms_dumb_framebuffer&) = delete;
+    kms_dumb_framebuffer(kms_dumb_framebuffer&& other) noexcept;
+    kms_dumb_framebuffer& operator=(kms_dumb_framebuffer&& other) noexcept;
+
+    /// Allocates via `DRM_IOCTL_MODE_CREATE_DUMB`, maps it, and registers it with
+    /// `drmModeAddFB2`. `format` must be a 32-bpp fourcc — dumb buffers are described to
+    /// the kernel by bit depth, so packed 8:8:8:8 is the only layout this allocates.
+    [[nodiscard]] static lx::result<kms_dumb_framebuffer> create(const kms_device& device,
+                                                                 unsigned width, unsigned height,
+                                                                 lx::fourcc format);
+
+    [[nodiscard]] unsigned id() const { return fb_id_; }
+    [[nodiscard]] bool valid() const { return fb_id_ != 0 && pixels_ != nullptr; }
+    [[nodiscard]] unsigned width() const { return width_; }
+    [[nodiscard]] unsigned height() const { return height_; }
+    [[nodiscard]] unsigned stride() const { return stride_; }
+    [[nodiscard]] lx::fourcc format() const { return format_; }
+    [[nodiscard]] unsigned size_bytes() const { return size_; }
+
+    /// Mapped, write-combining pixels. Null until `create` succeeds.
+    [[nodiscard]] unsigned char* pixels() const { return pixels_; }
+
+private:
+    void release();
+
+    int card_fd_ = -1;
+    unsigned fb_id_ = 0;
+    unsigned gem_handle_ = 0;
+    unsigned width_ = 0;
+    unsigned height_ = 0;
+    unsigned stride_ = 0;
+    unsigned size_ = 0;
+    lx::fourcc format_ = 0;
+    unsigned char* pixels_ = nullptr;
 };
 
 } // namespace lx::drm
@@ -480,9 +534,153 @@ lx::result<lx::drm::kms_framebuffer> lx::drm::kms_framebuffer::import_dmabuf(
 #endif
 }
 
+// ── kms_dumb_framebuffer ─────────────────────────────────────────────────────
+
+lx::drm::kms_dumb_framebuffer::~kms_dumb_framebuffer() { release(); }
+
+lx::drm::kms_dumb_framebuffer::kms_dumb_framebuffer(kms_dumb_framebuffer&& other) noexcept {
+    *this = static_cast<kms_dumb_framebuffer&&>(other);
+}
+
+lx::drm::kms_dumb_framebuffer& lx::drm::kms_dumb_framebuffer::operator=(
+    kms_dumb_framebuffer&& other) noexcept {
+    if (this == &other)
+        return *this;
+    release();
+    card_fd_ = other.card_fd_;
+    fb_id_ = other.fb_id_;
+    gem_handle_ = other.gem_handle_;
+    width_ = other.width_;
+    height_ = other.height_;
+    stride_ = other.stride_;
+    size_ = other.size_;
+    format_ = other.format_;
+    pixels_ = other.pixels_;
+    other.card_fd_ = -1;
+    other.fb_id_ = 0;
+    other.gem_handle_ = 0;
+    other.width_ = 0;
+    other.height_ = 0;
+    other.stride_ = 0;
+    other.size_ = 0;
+    other.format_ = 0;
+    other.pixels_ = nullptr;
+    return *this;
+}
+
+void lx::drm::kms_dumb_framebuffer::release() {
+#if defined(LUMEN_HAS_DRM)
+    if (pixels_ && size_ > 0)
+        munmap(pixels_, size_);
+    if (card_fd_ >= 0 && fb_id_ != 0)
+        drmModeRmFB(card_fd_, fb_id_);
+    if (card_fd_ >= 0 && gem_handle_ != 0)
+        drmModeDestroyDumbBuffer(card_fd_, gem_handle_);
+#endif
+    card_fd_ = -1;
+    fb_id_ = 0;
+    gem_handle_ = 0;
+    width_ = 0;
+    height_ = 0;
+    stride_ = 0;
+    size_ = 0;
+    format_ = 0;
+    pixels_ = nullptr;
+}
+
+lx::result<lx::drm::kms_dumb_framebuffer> lx::drm::kms_dumb_framebuffer::create(
+    const kms_device& device, unsigned width, unsigned height, lx::fourcc format) {
+#if defined(LUMEN_HAS_DRM)
+    const int fd = device.card_fd();
+    if (fd < 0 || width == 0 || height == 0) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
+                              "invalid dumb framebuffer parameters");
+    }
+
+    uint32_t handle = 0;
+    uint32_t pitch = 0;
+    uint64_t size = 0;
+    if (drmModeCreateDumbBuffer(fd, width, height, 32, 0, &handle, &pitch, &size) != 0 ||
+        handle == 0) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
+                              "drmModeCreateDumbBuffer failed");
+    }
+
+    kms_dumb_framebuffer framebuffer;
+    framebuffer.card_fd_ = fd;
+    framebuffer.gem_handle_ = handle;
+    framebuffer.width_ = width;
+    framebuffer.height_ = height;
+    framebuffer.stride_ = pitch;
+    framebuffer.size_ = static_cast<unsigned>(size);
+    framebuffer.format_ = format;
+
+    uint64_t map_offset = 0;
+    if (drmModeMapDumbBuffer(fd, handle, &map_offset) != 0) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
+                              "drmModeMapDumbBuffer failed");
+    }
+
+    void* mapped = mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE, MAP_SHARED, fd,
+                        static_cast<off_t>(map_offset));
+    if (mapped == MAP_FAILED) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
+                              "mmap of dumb buffer failed");
+    }
+    framebuffer.pixels_ = static_cast<unsigned char*>(mapped);
+
+    // No modifier: a dumb buffer is linear by construction, and passing
+    // DRM_MODE_FB_MODIFIERS with an implicit layout is rejected by drivers.
+    uint32_t handles[4] = {handle, 0, 0, 0};
+    uint32_t pitches[4] = {pitch, 0, 0, 0};
+    uint32_t offsets[4] = {0, 0, 0, 0};
+
+    uint32_t fb_id = 0;
+    if (drmModeAddFB2(fd, width, height, static_cast<uint32_t>(format), handles, pitches, offsets,
+                      &fb_id, 0) != 0 ||
+        fb_id == 0) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "drmModeAddFB2 failed for dumb buffer");
+    }
+    framebuffer.fb_id_ = fb_id;
+    return framebuffer;
+#else
+    (void)device;
+    (void)width;
+    (void)height;
+    (void)format;
+    return lx::not_implemented("lx::drm::kms_dumb_framebuffer::create");
+#endif
+}
+
 // ── kms_atomic_commit (needs complete kms_device) ───────────────────────────
 
 lx::drm::kms_atomic_commit::kms_atomic_commit(kms_device& device) : device_{&device} {}
+
+lx::drm::kms_atomic_commit::~kms_atomic_commit() {
+#if defined(LUMEN_HAS_DRM)
+    const int fd = device_ ? device_->card_fd() : -1;
+    if (fd >= 0) {
+        if (saved_crtc_) {
+            auto* saved = static_cast<drmModeCrtc*>(saved_crtc_);
+            uint32_t connector = saved_connector_;
+            // buffer_id 0 means the console had nothing attached; leave the CRTC off rather
+            // than pointing it at a framebuffer that is about to be destroyed.
+            if (saved->buffer_id && saved->mode_valid && connector) {
+                (void)drmModeSetCrtc(fd, saved->crtc_id, saved->buffer_id, saved->x, saved->y,
+                                     &connector, 1, &saved->mode);
+            }
+        }
+        if (mode_blob_id_)
+            drmModeDestroyPropertyBlob(fd, mode_blob_id_);
+        if (damage_blob_id_)
+            drmModeDestroyPropertyBlob(fd, damage_blob_id_);
+    }
+    if (saved_crtc_)
+        drmModeFreeCrtc(static_cast<drmModeCrtc*>(saved_crtc_));
+    saved_crtc_ = nullptr;
+#endif
+}
 
 void lx::drm::kms_atomic_commit::set_framebuffer(unsigned fb_id) { framebuffer_id_ = fb_id; }
 
@@ -562,6 +760,137 @@ lx::result<void> lx::drm::kms_atomic_commit::ensure_props() {
 #endif
 }
 
+#if defined(LUMEN_HAS_DRM)
+namespace {
+/// Static literals only — `error::message` must not allocate on the frame path.
+const char* atomic_commit_message(int err) {
+    switch (err) {
+    case EACCES: return "drmModeAtomicCommit rejected: DRM master lost (EACCES)";
+    case EPERM: return "drmModeAtomicCommit rejected: not permitted (EPERM)";
+    case EBUSY: return "drmModeAtomicCommit rejected: flip already pending (EBUSY)";
+    case EINVAL: return "drmModeAtomicCommit rejected: invalid state (EINVAL)";
+    case ENOSPC: return "drmModeAtomicCommit rejected: no scanout resources (ENOSPC)";
+    case ENOMEM: return "drmModeAtomicCommit rejected: out of memory (ENOMEM)";
+    case ERANGE: return "drmModeAtomicCommit rejected: mode/plane range (ERANGE)";
+    default: return "drmModeAtomicCommit failed";
+    }
+}
+
+unsigned find_object_prop(int fd, unsigned object_id, unsigned object_type, const char* name) {
+    drmModeObjectProperties* props = drmModeObjectGetProperties(fd, object_id, object_type);
+    if (!props)
+        return 0;
+    unsigned found = 0;
+    for (uint32_t i = 0; i < props->count_props && found == 0; ++i) {
+        drmModePropertyRes* p = drmModeGetProperty(fd, props->props[i]);
+        if (!p)
+            continue;
+        if (std::strcmp(p->name, name) == 0)
+            found = p->prop_id;
+        drmModeFreeProperty(p);
+    }
+    drmModeFreeObjectProperties(props);
+    return found;
+}
+} // namespace
+#endif
+
+lx::result<void> lx::drm::kms_atomic_commit::apply_modeset(unsigned connector_index, unsigned crtc,
+                                                           unsigned fb, unsigned width,
+                                                           unsigned height) {
+#if defined(LUMEN_HAS_DRM)
+    const int fd = device_ ? device_->card_fd() : -1;
+    const unsigned plane = device_ ? device_->primary_plane_id() : 0;
+    const unsigned connector_id = device_ ? device_->connector(connector_index).id : 0;
+    if (fd < 0 || !plane || !crtc || !connector_id || !fb) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "modeset missing connector/crtc/plane");
+    }
+
+    drmModeConnector* conn = drmModeGetConnector(fd, connector_id);
+    if (!conn) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "connector query failed");
+    }
+    drmModeModeInfo chosen{};
+    bool found = false;
+    for (int m = 0; m < conn->count_modes && !found; ++m) {
+        if (conn->modes[m].hdisplay == width && conn->modes[m].vdisplay == height) {
+            chosen = conn->modes[m];
+            found = true;
+        }
+    }
+    drmModeFreeConnector(conn);
+    if (!found) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "no connector mode matches the composite size");
+    }
+
+    const unsigned crtc_mode_prop = find_object_prop(fd, crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+    const unsigned crtc_active_prop = find_object_prop(fd, crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+    const unsigned conn_crtc_prop =
+        find_object_prop(fd, connector_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+    if (!crtc_mode_prop || !crtc_active_prop || !conn_crtc_prop) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "missing crtc/connector modeset props");
+    }
+
+    if (!saved_crtc_) {
+        saved_crtc_ = drmModeGetCrtc(fd, crtc);
+        saved_connector_ = connector_id;
+    }
+
+    uint32_t blob = 0;
+    if (drmModeCreatePropertyBlob(fd, &chosen, sizeof(chosen), &blob) != 0) {
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "MODE_ID blob creation failed");
+    }
+
+    drmModeAtomicReq* req = drmModeAtomicAlloc();
+    if (!req) {
+        drmModeDestroyPropertyBlob(fd, blob);
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
+                              "drmModeAtomicAlloc failed");
+    }
+
+    drmModeAtomicAddProperty(req, connector_id, conn_crtc_prop, crtc);
+    drmModeAtomicAddProperty(req, crtc, crtc_mode_prop, blob);
+    drmModeAtomicAddProperty(req, crtc, crtc_active_prop, 1);
+    drmModeAtomicAddProperty(req, plane, prop_crtc_id_, crtc);
+    drmModeAtomicAddProperty(req, plane, prop_fb_id_, fb);
+    drmModeAtomicAddProperty(req, plane, prop_src_x_, 0);
+    drmModeAtomicAddProperty(req, plane, prop_src_y_, 0);
+    drmModeAtomicAddProperty(req, plane, prop_src_w_, static_cast<uint64_t>(width) << 16);
+    drmModeAtomicAddProperty(req, plane, prop_src_h_, static_cast<uint64_t>(height) << 16);
+    drmModeAtomicAddProperty(req, plane, prop_crtc_x_, 0);
+    drmModeAtomicAddProperty(req, plane, prop_crtc_y_, 0);
+    drmModeAtomicAddProperty(req, plane, prop_crtc_w_, width);
+    drmModeAtomicAddProperty(req, plane, prop_crtc_h_, height);
+
+    // Blocking and without a flip event: the mode must be live before flips are queued.
+    const int r = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
+    const int commit_errno = r != 0 ? errno : 0;
+    drmModeAtomicFree(req);
+    if (r != 0) {
+        drmModeDestroyPropertyBlob(fd, blob);
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
+                              atomic_commit_message(commit_errno));
+    }
+
+    if (mode_blob_id_)
+        drmModeDestroyPropertyBlob(fd, mode_blob_id_);
+    mode_blob_id_ = blob;
+    return {};
+#else
+    (void)connector_index;
+    (void)crtc;
+    (void)fb;
+    (void)width;
+    (void)height;
+    return lx::not_implemented("lx::drm::kms_atomic_commit::apply_modeset");
+#endif
+}
+
 lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request& request) {
 #if defined(LUMEN_HAS_DRM)
     if (!device_) {
@@ -589,6 +918,22 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
     if (!width || !height) {
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
                               "no active mode for connector");
+    }
+
+    // A plane-only commit inherits whatever mode the console left on the CRTC, so the very
+    // first commit sets the mode our framebuffer was sized for. On failure the flip path
+    // still runs — degraded, but reported once rather than every frame.
+    if (!modeset_attempted_) {
+        modeset_attempted_ = true;
+        auto modeset = apply_modeset(request.connector, crtc, fb, width, height);
+        if (!modeset) {
+            if (request.request_page_flip)
+                emit_flip(request, false);
+            return modeset.get_error();
+        }
+        if (request.request_page_flip)
+            emit_flip(request, true);
+        return {};
     }
 
     drmModeAtomicReq* req = drmModeAtomicAlloc();
@@ -632,13 +977,18 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
         flags |= DRM_MODE_PAGE_FLIP_ASYNC;
 
     const int r = drmModeAtomicCommit(fd, req, flags, this);
+    // Capture errno before drmModeAtomicFree, which may clobber it.
+    const int commit_errno = r != 0 ? errno : 0;
     drmModeAtomicFree(req);
     if (r != 0) {
         if (request.request_page_flip)
             emit_flip(request, false);
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
-                              "drmModeAtomicCommit failed");
+                              atomic_commit_message(commit_errno));
     }
+
+    if (request.request_page_flip)
+        flip_pending_.store(true, std::memory_order_release);
 
     if (want_out_fence)
         *request.out_fence_fd_ptr = out_fence_fd;
@@ -662,7 +1012,11 @@ void lx::drm::kms_atomic_commit::dispatch_events() {
     ctx.page_flip_handler2 = [](int /*fd*/, unsigned int /*sequence*/, unsigned int tv_sec,
                                 unsigned int tv_usec, unsigned int /*crtc_id*/, void* user_data) {
         auto* self = static_cast<kms_atomic_commit*>(user_data);
-        if (!self || !self->flip_handler_)
+        if (!self)
+            return;
+        // Clear before the handler check: the CRTC is free again even with no handler bound.
+        self->flip_pending_.store(false, std::memory_order_release);
+        if (!self->flip_handler_)
             return;
         page_flip_event ev{};
         ev.sequence = ++self->flip_sequence_;
@@ -682,30 +1036,42 @@ void lx::drm::kms_atomic_commit::set_page_flip_handler(page_flip_handler handler
 
 bool lx::drm::kms_atomic_commit::supports_atomic_damage() const { return atomic_damage_; }
 
+bool lx::drm::kms_atomic_commit::flip_pending() const {
+    return flip_pending_.load(std::memory_order_acquire);
+}
+
 void lx::drm::kms_atomic_commit::build_damage_blob(const kms_damage_region& region) {
 #if defined(LUMEN_HAS_DRM)
-    if (!device_ || !atomic_damage_ || region.count == 0)
+    if (!device_ || !atomic_damage_)
         return;
     const int fd = device_->card_fd();
     if (fd < 0)
         return;
-    struct clip {
-        uint16_t x1, y1, x2, y2;
-    };
-    clip clips[16]{};
-    const unsigned n = region.count < 16 ? region.count : 16;
-    for (unsigned i = 0; i < n; ++i) {
-        clips[i].x1 = static_cast<uint16_t>(region.rects[i].x);
-        clips[i].y1 = static_cast<uint16_t>(region.rects[i].y);
-        clips[i].x2 = static_cast<uint16_t>(region.rects[i].x + region.rects[i].width);
-        clips[i].y2 = static_cast<uint16_t>(region.rects[i].y + region.rects[i].height);
+
+    // FB_DAMAGE_CLIPS is an array of struct drm_mode_rect (four s32, exclusive x2/y2).
+    // A blob whose length is not a multiple of that size is rejected with EINVAL.
+    drm_mode_rect clips[16]{};
+    unsigned n = 0;
+    const unsigned limit = region.count < 16 ? region.count : 16;
+    for (unsigned i = 0; i < limit; ++i) {
+        const auto& r = region.rects[i];
+        if (r.width <= 0 || r.height <= 0)
+            continue;
+        clips[n].x1 = r.x;
+        clips[n].y1 = r.y;
+        clips[n].x2 = r.x + r.width;
+        clips[n].y2 = r.y + r.height;
+        ++n;
     }
+
     uint32_t blob = 0;
-    if (drmModeCreatePropertyBlob(fd, clips, sizeof(clip) * n, &blob) == 0) {
-        if (damage_blob_id_)
-            drmModeDestroyPropertyBlob(fd, damage_blob_id_);
-        damage_blob_id_ = blob;
-    }
+    if (n > 0 && drmModeCreatePropertyBlob(fd, clips, sizeof(clips[0]) * n, &blob) != 0)
+        blob = 0;
+    // Replace unconditionally: keeping the old blob would attach a previous frame's damage
+    // to this commit, so the driver would refresh the wrong region.
+    if (damage_blob_id_)
+        drmModeDestroyPropertyBlob(fd, damage_blob_id_);
+    damage_blob_id_ = blob;
 #else
     (void)region;
 #endif

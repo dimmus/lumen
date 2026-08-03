@@ -209,12 +209,20 @@ extern p0_protocol_context* g_p0_ctx;
 void destroy_buffer(buffer_obj* b) {
     if (!b || !b->used)
         return;
-    // Retire the GPU-side texture. Ordering is enough here because the render thread owns
-    // the texture table; the pixel staging has its own lifetime (see shm_staging_ring).
+    // Retire the GPU-side texture — but not before the render thread has finished with it.
+    // Queue order alone is not enough: a snapshot published while this buffer was still
+    // alive can still be waiting to composite, and it references the texture by id. Date
+    // the retirement so the render thread can hold it until that snapshot has been drawn.
+    //
+    // The next frame is the first one guaranteed not to reference it: the surface node is
+    // detached on this thread before the next `commit_frame` publishes a draw list. Being
+    // one frame conservative costs a frame of texture memory; being one frame early drops
+    // a texture out from under a draw.
     if (g_p0_ctx && g_p0_ctx->textures && b->id) {
         texture_update forget{};
         forget.kind = texture_update::op::forget;
         forget.texture_id = g_p0_ctx->surfaces ? g_p0_ctx->surfaces->texture_for(b->id) : 0;
+        forget.retire_after_frame = g_p0_ctx->frame_index + 1;
         if (forget.texture_id != 0)
             (void)g_p0_ctx->textures->try_push(forget);
     }
@@ -222,11 +230,39 @@ void destroy_buffer(buffer_obj* b) {
     *b = {};
 }
 
-/// Converts the client's shm pixels into compositor-owned staging. Must run on every
-/// commit: a client is free to redraw into the same wl_buffer.
-const unsigned char* refresh_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm,
-                                        unsigned long long& seq_out) {
-    if (!buf || !shm || !g_p0_ctx || !g_p0_ctx->shm_staging)
+/// wl_shm numbers ARGB8888 and XRGB8888 0 and 1 rather than by fourcc; every other format
+/// in the enum is already a DRM fourcc.
+lx::fourcc shm_format_to_fourcc(uint32_t shm_format) {
+    switch (shm_format) {
+    case WL_SHM_FORMAT_ARGB8888:
+        return static_cast<lx::fourcc>(lx::pixel_format::argb8888);
+    case WL_SHM_FORMAT_XRGB8888:
+        return static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+    default:
+        return static_cast<lx::fourcc>(shm_format);
+    }
+}
+
+/// Channel order of the rows `stage_shm_pixels` will produce, which is not always the
+/// client's: the Vulkan path samples RGBA textures, so it pays for a swizzle.
+lx::fourcc staged_shm_format(wl_shm_buffer* shm) {
+    if (!shm)
+        return static_cast<lx::fourcc>(lx::pixel_format::rgba8888);
+    if (g_p0_ctx && g_p0_ctx->shm_native_format)
+        return shm_format_to_fourcc(wl_shm_buffer_get_format(shm));
+    return static_cast<lx::fourcc>(lx::pixel_format::rgba8888);
+}
+
+/// Copies the client's shm pixels into compositor-owned staging. Must run on every commit:
+/// a client is free to redraw into the same wl_buffer.
+///
+/// Which staging is used depends on how the render thread consumes it — see
+/// `shm_pixel_store`. Exactly one of `seq_out` / `token_out` is set.
+const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsigned texture_id,
+                                      unsigned long long& seq_out, unsigned long long& token_out) {
+    seq_out = 0;
+    token_out = 0;
+    if (!buf || !shm || !g_p0_ctx)
         return nullptr;
 
     const int stride = wl_shm_buffer_get_stride(shm);
@@ -234,29 +270,51 @@ const unsigned char* refresh_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm,
     if (buf->width == 0 || buf->height == 0 || stride <= 0)
         return nullptr;
 
-    const unsigned bytes = buf->width * buf->height * 4u;
-    unsigned char* out = g_p0_ctx->shm_staging->acquire(bytes, seq_out);
+    const unsigned dst_stride = buf->width * 4u;
+    const unsigned bytes = dst_stride * buf->height;
+
+    unsigned char* out = nullptr;
+    if (g_p0_ctx->shm_store)
+        out = g_p0_ctx->shm_store->acquire(texture_id, bytes, token_out);
+    else if (g_p0_ctx->shm_staging)
+        out = g_p0_ctx->shm_staging->acquire(bytes, seq_out);
     if (!out)
         return nullptr;
 
+    const bool native = g_p0_ctx->shm_native_format;
+
     wl_shm_buffer_begin_access(shm);
     const auto* data = static_cast<const unsigned char*>(wl_shm_buffer_get_data(shm));
-    for (unsigned y = 0; y < buf->height; ++y) {
-        for (unsigned x = 0; x < buf->width; ++x) {
-            const auto* src = data + y * static_cast<unsigned>(stride) + x * 4u;
-            auto* dst = out + (y * buf->width + x) * 4u;
-            if (fmt == WL_SHM_FORMAT_ARGB8888 || fmt == WL_SHM_FORMAT_XRGB8888) {
-                // little-endian XRGB/ARGB → RGBA
-                dst[0] = src[2];
-                dst[1] = src[1];
-                dst[2] = src[0];
-                dst[3] = (fmt == WL_SHM_FORMAT_XRGB8888) ? 255 : src[3];
-            } else {
-                dst[0] = src[0];
-                dst[1] = src[1];
-                dst[2] = src[2];
-                dst[3] = src[3];
+
+    if (native) {
+        // Nothing to reorder — a contiguous client buffer is one memcpy for the whole
+        // frame, and a padded one is a memcpy per row.
+        if (static_cast<unsigned>(stride) == dst_stride) {
+            std::memcpy(out, data, bytes);
+        } else {
+            for (unsigned y = 0; y < buf->height; ++y) {
+                std::memcpy(out + static_cast<size_t>(y) * dst_stride,
+                            data + static_cast<size_t>(y) * static_cast<unsigned>(stride),
+                            dst_stride);
             }
+        }
+        wl_shm_buffer_end_access(shm);
+        return out;
+    }
+
+    const bool swap_rb = fmt == WL_SHM_FORMAT_ARGB8888 || fmt == WL_SHM_FORMAT_XRGB8888;
+    const uint32_t alpha_fill = fmt == WL_SHM_FORMAT_XRGB8888 ? 0xFF000000u : 0u;
+    for (unsigned y = 0; y < buf->height; ++y) {
+        const auto* src_row = reinterpret_cast<const uint32_t*>(
+            data + static_cast<size_t>(y) * static_cast<unsigned>(stride));
+        auto* dst_row = reinterpret_cast<uint32_t*>(out + static_cast<size_t>(y) * dst_stride);
+        for (unsigned x = 0; x < buf->width; ++x) {
+            // Word-at-a-time so the loop vectorises; the byte-wise form did not.
+            const uint32_t p = src_row[x];
+            dst_row[x] = swap_rb ? (((p & 0xFF00FF00u) | ((p & 0x00FF0000u) >> 16) |
+                                     ((p & 0x000000FFu) << 16)) |
+                                    alpha_fill)
+                                 : p;
         }
     }
     wl_shm_buffer_end_access(shm);
@@ -450,10 +508,10 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
     if (!buf)
         return;
 
-    const unsigned char* shm_pixels = nullptr;
-    unsigned long long shm_seq = 0;
-    if (buf->is_shm)
-        shm_pixels = refresh_shm_pixels(buf, shm, shm_seq);
+    // Staging is keyed by texture id, which only exists after on_commit below, so the
+    // format is resolved here and the pixel copy waits.
+    const lx::fourcc shm_format = buf->is_shm ? staged_shm_format(shm)
+                                              : static_cast<lx::fourcc>(lx::pixel_format::rgba8888);
 
     if (buf->is_dmabuf) {
         // Duplicate plane metadata for the surface table; keep FDs owned by buffer_obj.
@@ -473,8 +531,7 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
         }
         s->ctx->surfaces->register_dmabuf(buf->id, static_cast<lx::gfx::dmabuf_desc&&>(desc));
     } else if (buf->is_shm) {
-        s->ctx->surfaces->register_shm(buf->id, buf->width, buf->height,
-                                       static_cast<lx::fourcc>(lx::pixel_format::rgba8888));
+        s->ctx->surfaces->register_shm(buf->id, buf->width, buf->height, shm_format);
     }
 
     lx::compositor::surface_commit commit{};
@@ -497,6 +554,12 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
 
     const auto img = s->ctx->surfaces->lookup(s->id);
 
+    const unsigned char* shm_pixels = nullptr;
+    unsigned long long shm_seq = 0;
+    unsigned long long shm_token = 0;
+    if (buf->is_shm && img.image_id)
+        shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_seq, shm_token);
+
     // Register SHM pixels with headless for software blit.
     if (buf->is_shm && s->ctx->headless && shm_pixels && img.image_id) {
         s->ctx->headless->register_texture(img.image_id, buf->width, buf->height, shm_pixels);
@@ -509,16 +572,34 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
         update.width = buf->width;
         update.height = buf->height;
         update.format = img.format;
-        if (buf->is_dmabuf && img.vk_image) {
+        if (buf->is_dmabuf) {
             update.kind = texture_update::op::dmabuf;
             update.vk_image = img.vk_image;
             update.vk_memory = img.vk_memory;
+            // Hand the render thread its own FD: the GL backend imports there, and the
+            // client's plane FD belongs to buffer_obj, which may be destroyed first.
+            if (buf->dmabuf.plane_count > 0) {
+                const int plane_fd = buf->dmabuf.planes[0].fd.get();
+                if (plane_fd >= 0)
+                    update.dmabuf_fd = ::dup(plane_fd);
+                update.dmabuf_offset = buf->dmabuf.planes[0].offset;
+                update.dmabuf_stride = buf->dmabuf.planes[0].stride;
+                update.dmabuf_modifier = buf->dmabuf.planes[0].modifier;
+                update.format = buf->dmabuf.format;
+            }
         } else if (buf->is_shm && shm_pixels) {
             update.kind = texture_update::op::shm;
             update.pixels = shm_pixels;
             update.shm_seq = shm_seq;
+            update.shm_token = shm_token;
+            update.format = shm_format;
+            update.stride = buf->width * 4u;
         }
         if (update.kind != texture_update::op::none && !s->ctx->textures->try_push(update)) {
+            // Nothing will consume the FD now, so it has to be closed here or the
+            // compositor leaks one per dropped update.
+            if (update.dmabuf_fd >= 0)
+                ::close(update.dmabuf_fd);
             lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
                                             "texture update queue full — frame will lag");
         }
@@ -1247,10 +1328,11 @@ void bind_output(wayland::client_connection& client, unsigned id, int version) {
 
     int w = 1920, h = 1080;
     if (g_p0_ctx->outputs && g_p0_ctx->outputs->count() > 0) {
-        // Use first output geometry if available.
-        // output_manager doesn't expose geometry by index directly in a simple way —
-        // keep defaults for now; hotplug refresh will improve this.
-        (void)w;
+        const auto first = g_p0_ctx->outputs->state(g_p0_ctx->outputs->nth(0));
+        if (first.geometry.width > 0 && first.geometry.height > 0) {
+            w = first.geometry.width;
+            h = first.geometry.height;
+        }
     }
     wl_output_send_geometry(native, 0, 0, w, h, WL_OUTPUT_SUBPIXEL_UNKNOWN, "lumen", "headless",
                             WL_OUTPUT_TRANSFORM_NORMAL);

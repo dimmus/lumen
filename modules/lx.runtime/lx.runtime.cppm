@@ -1,5 +1,6 @@
 module;
 
+#include <atomic>
 #include <chrono>
 #include <thread>
 
@@ -36,6 +37,12 @@ public:
     void set_interval(clock_time interval_ns);
     void set_enabled(bool enabled);
 
+    /// Overrides the next firing with an absolute `steady_clock` time, replacing the
+    /// interval for that one tick. Valid from inside the timer's own callback: a frame
+    /// clock learns when the next frame is due only while handling the current one, and a
+    /// deadline chosen there must not be overwritten by the plain interval on return.
+    void schedule_at(clock_time when_ns);
+
     bool prepare(clock_time& timeout) override;
     bool check() override;
     bool dispatch() override;
@@ -45,6 +52,7 @@ private:
     callback cb_{};
     bool repeat_ = true;
     bool enabled_ = true;
+    bool rescheduled_ = false;
     long long next_fire_ns_ = 0;
 };
 
@@ -104,8 +112,9 @@ private:
     void drain_inbound();
     void drain_registered_strands();
 
-    int exit_code_ = 0;
-    bool running_ = false;
+    // Atomic so quit() stays safe from a signal handler or another thread.
+    std::atomic<int> exit_code_{0};
+    std::atomic<bool> running_{false};
     class strand ui_strand_{affinity::ui};
     lx::sync::spsc_queue<task, k_strand_queue_depth> inbound_{};
 };
@@ -251,6 +260,12 @@ lx::runtime::timer_source::timer_source(clock_time interval_ns, callback cb, boo
 void lx::runtime::timer_source::set_interval(clock_time interval_ns) { interval_ns_ = interval_ns; }
 void lx::runtime::timer_source::set_enabled(bool enabled) { enabled_ = enabled; }
 
+void lx::runtime::timer_source::schedule_at(clock_time when_ns) {
+    next_fire_ns_ = static_cast<long long>(when_ns);
+    rescheduled_ = true;
+    enabled_ = true;
+}
+
 bool lx::runtime::timer_source::prepare(clock_time& timeout) {
     if (!enabled_) {
         timeout = -1;
@@ -268,7 +283,12 @@ bool lx::runtime::timer_source::check() {
 }
 
 bool lx::runtime::timer_source::dispatch() {
+    rescheduled_ = false;
     if (cb_) cb_();
+    if (rescheduled_) {
+        rescheduled_ = false;
+        return true;
+    }
     const auto now = lx_runtime_now_ns();
     if (repeat_)
         next_fire_ns_ = now + interval_ns_;

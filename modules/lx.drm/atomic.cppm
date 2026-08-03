@@ -1,5 +1,7 @@
 module;
 
+#include <atomic>
+
 import lx.foundation;
 import lx.runtime;
 
@@ -41,6 +43,12 @@ using page_flip_handler = void (*)(page_flip_event event, void* user_data);
 class kms_atomic_commit {
 public:
     explicit kms_atomic_commit(kms_device& device);
+    /// Puts the CRTC back the way the console left it, so exiting on a TTY does not leave
+    /// a dead display behind.
+    ~kms_atomic_commit();
+
+    kms_atomic_commit(const kms_atomic_commit&) = delete;
+    kms_atomic_commit& operator=(const kms_atomic_commit&) = delete;
 
     [[nodiscard]] lx::result<void> commit(const atomic_commit_request& request);
     void set_page_flip_handler(page_flip_handler handler, void* user_data = nullptr);
@@ -50,8 +58,19 @@ public:
     void build_damage_blob(const kms_damage_region& region);
     void set_framebuffer(unsigned fb_id);
 
+    /// True while a flip requested by `commit()` has not yet been reported by
+    /// `dispatch_events()`. A CRTC takes one flip at a time, so committing again before
+    /// then is rejected with EBUSY. Set on the committing thread, cleared on the thread
+    /// that drains events.
+    [[nodiscard]] bool flip_pending() const;
+
 private:
     [[nodiscard]] lx::result<void> ensure_props();
+    /// Full atomic modeset: binds connector → CRTC, sets the mode and enables the plane.
+    /// Without it the CRTC keeps the mode the console left behind and the driver never
+    /// shows our framebuffer.
+    [[nodiscard]] lx::result<void> apply_modeset(unsigned connector_index, unsigned crtc,
+                                                 unsigned fb, unsigned width, unsigned height);
     void emit_flip(const atomic_commit_request& request, bool presented);
 
     kms_device* device_ = nullptr;
@@ -61,6 +80,7 @@ private:
     unsigned flip_sequence_ = 0;
     unsigned framebuffer_id_ = 0;
     unsigned damage_blob_id_ = 0;
+    std::atomic<bool> flip_pending_{false};
 
     unsigned prop_crtc_id_ = 0;
     unsigned prop_fb_id_ = 0;
@@ -76,6 +96,12 @@ private:
     unsigned prop_in_fence_fd_ = 0;
     unsigned prop_out_fence_ptr_ = 0;
     bool props_ready_ = false;
+    unsigned mode_blob_id_ = 0;
+    bool modeset_attempted_ = false;
+    /// Owning `drmModeCrtc*` captured before the first modeset (opaque here to keep libdrm
+    /// out of the module interface).
+    void* saved_crtc_ = nullptr;
+    unsigned saved_connector_ = 0;
 };
 
 } // namespace lx::drm
