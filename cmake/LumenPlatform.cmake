@@ -7,7 +7,11 @@ if(PkgConfig_FOUND)
     pkg_check_modules(WAYLAND QUIET wayland-server wayland-client)
     pkg_check_modules(WAYLAND_SCANNER QUIET wayland-scanner)
     pkg_check_modules(LIBDRM QUIET libdrm)
-    pkg_check_modules(LIBINPUT QUIET libinput)
+    # libinput needs udev to enumerate a seat; xkbcommon turns keycodes into keysyms and
+    # tracks modifier state. All three go together — a keyboard without xkb can report that
+    # a key moved and nothing about what it means.
+    pkg_check_modules(LIBINPUT QUIET libinput libudev)
+    pkg_check_modules(XKBCOMMON QUIET xkbcommon)
     # EGL + GLES + GBM back the hardware GL present path. All three are required
     # together: GBM allocates the scanout buffer, EGL binds it, GLES draws into it.
     pkg_check_modules(LIBEGL QUIET egl glesv2 gbm)
@@ -92,9 +96,13 @@ function(lumen_link_platform target)
         target_compile_definitions(${target} PRIVATE LUMEN_HAS_DRM=1)
     endif()
 
-    if(LIBINPUT_FOUND)
-        target_include_directories(${target} PRIVATE ${LIBINPUT_INCLUDE_DIRS})
-        target_link_libraries(${target} PRIVATE ${LIBINPUT_LIBRARIES})
+    if(LIBINPUT_FOUND AND XKBCOMMON_FOUND)
+        target_include_directories(${target} PRIVATE ${LIBINPUT_INCLUDE_DIRS}
+                                                     ${XKBCOMMON_INCLUDE_DIRS})
+        target_link_libraries(${target} PRIVATE ${LIBINPUT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+        target_compile_definitions(${target} PRIVATE LUMEN_HAS_INPUT=1)
+    elseif(LIBINPUT_FOUND)
+        message(STATUS "${target}: xkbcommon missing — input stubbed")
     endif()
 
     if(LIBEGL_FOUND)

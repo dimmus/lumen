@@ -40,7 +40,9 @@ public:
     [[nodiscard]] lx::point2i position() const;
 
     void attach_to_scene(lx::scene::scene_graph& scene);
-    void update_from_pointer(const lx::input::pointer& pointer);
+    /// Tracks the seat's pointer. Takes the seat rather than a standalone pointer object
+    /// because the seat is what owns the position now — it is the thing libinput updates.
+    void update_from_seat(const lx::input::seat& seat);
 
     [[nodiscard]] cursor_kind active_kind() const;
     [[nodiscard]] cursor_image active_image() const;
@@ -70,7 +72,9 @@ void lx::compositor::cursor_manager::set_position(lx::point2i pos) { position_ =
 lx::point2i lx::compositor::cursor_manager::position() const { return position_; }
 
 void lx::compositor::cursor_manager::attach_to_scene(lx::scene::scene_graph&) {}
-void lx::compositor::cursor_manager::update_from_pointer(const lx::input::pointer&) {}
+void lx::compositor::cursor_manager::update_from_seat(const lx::input::seat& seat) {
+    position_ = {static_cast<int>(seat.pointer_x()), static_cast<int>(seat.pointer_y())};
+}
 
 lx::compositor::cursor_kind lx::compositor::cursor_manager::active_kind() const { return kind_; }
 

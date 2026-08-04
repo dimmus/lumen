@@ -37,6 +37,7 @@ import lx.foundation;
 import lx.wayland.server;
 import lx.gfx;
 import lx.trace;
+import lx.input;
 import :surface;
 import :toplevel;
 import :output;
@@ -1206,30 +1207,30 @@ struct keymap_source {
         return cached;
 
 #if !defined(_WIN32)
-    // Minimal US layout; libxkbcommon on the client expands the includes.
-    static constexpr char k_keymap[] =
-        "xkb_keymap {\n"
-        "xkb_keycodes { include \"evdev+aliases(qwerty)\" };\n"
-        "xkb_types { include \"complete\" };\n"
-        "xkb_compat { include \"complete\" };\n"
-        "xkb_symbols { include \"pc+us+inet(evdev)\" };\n"
-        "xkb_geometry { include \"pc(pc105)\" };\n"
-        "};\n";
+    // The real compiled keymap, from the same xkb state the compositor tracks modifiers
+    // with. It used to be a hardcoded US string, which meant every client saw a US layout
+    // whatever the user had configured, and the compositor's own idea of the keyboard did
+    // not exist at all.
+    //
+    // Compiled once and cached: it is identical for every client, and the fd is duped by
+    // libwayland on each send.
+    static lx::input::keyboard_keymap keymap{};
+    if (!keymap.valid()) {
+        if (auto compiled = keymap.compile(); !compiled) {
+            lx::trace::logger::global().log_error(compiled.get_error(), "compositor.seat");
+            return cached;
+        }
+    }
 
-    const int fd = ::memfd_create("lumen-keymap", MFD_CLOEXEC);
-    if (fd < 0)
-        return cached;
-
-    const auto nbytes = static_cast<uint32_t>(sizeof(k_keymap) - 1u);
-    if (::ftruncate(fd, static_cast<off_t>(nbytes)) != 0 ||
-        ::write(fd, k_keymap, nbytes) != static_cast<ssize_t>(nbytes) ||
-        ::lseek(fd, 0, SEEK_SET) != 0) {
-        ::close(fd);
+    unsigned size = 0;
+    auto fd = keymap.keymap_fd(size);
+    if (!fd) {
+        lx::trace::logger::global().log_error(fd.get_error(), "compositor.seat");
         return cached;
     }
 
-    cached.fd = fd;
-    cached.size = nbytes;
+    cached.fd = std::move(fd).value().release();
+    cached.size = size;
 #endif
     return cached;
 }

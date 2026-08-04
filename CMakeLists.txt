@@ -221,6 +221,13 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_runtime_memory PRIVATE tests)
     add_test(NAME test_runtime_memory COMMAND test_runtime_memory)
 
+    add_executable(test_input_keymap tests/test_input_keymap.cpp)
+    target_link_libraries(test_input_keymap PRIVATE lx.input)
+    lumen_apply_module_properties(test_input_keymap)
+    lumen_link_platform(test_input_keymap)
+    target_include_directories(test_input_keymap PRIVATE tests)
+    add_test(NAME test_input_keymap COMMAND test_input_keymap)
+
     add_executable(test_repaint_schedule tests/test_repaint_schedule.cpp)
     target_link_libraries(test_repaint_schedule PRIVATE lx.scheduler)
     lumen_apply_module_properties(test_repaint_schedule)
@@ -355,7 +362,7 @@ if(LUMEN_BUILD_TESTS)
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
     set_tests_properties(test_result test_snapshot test_import_cache bench_frame
-        test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule
+        test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_input_keymap
         test_headless_golden test_text_shaping test_protocol_bind test_kms_device test_kms_vkms
         test_ui_reconcile test_gl_composite bench_composite
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
