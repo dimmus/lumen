@@ -12,6 +12,7 @@ import lx.input;
 export module lx.compositor:protocols_p0;
 
 import :input_router;
+import :shell_bridge;
 import :surface;
 import :toplevel;
 import :output;
@@ -137,6 +138,8 @@ struct p0_protocol_context {
     input_router* input = nullptr;
     /// The seat's serial counter and keyboard state, owned by the compositor.
     lx::input::seat* seat = nullptr;
+    /// Compositor → shell state sync over zlm_policy_bridge_v1.
+    shell_bridge* shell = nullptr;
     surface_manager* surfaces = nullptr;
     toplevel_manager* toplevels = nullptr;
     output_manager* outputs = nullptr;

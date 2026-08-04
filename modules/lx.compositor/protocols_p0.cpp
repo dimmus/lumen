@@ -18,6 +18,7 @@ module;
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-server-protocol.h"
 #include "linux-dmabuf-v1-server-protocol.h"
+#include "zlm_shell_v1-server-protocol.h"
 #endif
 #endif
 
@@ -1335,6 +1336,123 @@ void bind_seat(wayland::client_connection& client, unsigned id, int version) {
     }
 }
 
+// ── zlm_shell_v1 (privileged) ──────────────────────────────────────────────
+//
+// The seam docs/architecture.md is built around: the shell is an ordinary Wayland client
+// except that it may bind this, and window-management intent flows over the policy bridge
+// while the compositor keeps ownership of the state. Both sides were scaffolded and the
+// global was never advertised, so lumen-shell connected and found nothing to bind.
+//
+// Advertised to every client but bound only by one that passes the privilege check —
+// rather than hidden from the registry — so a rejected bind is a protocol error the shell
+// can report, instead of a global that mysteriously does not exist.
+
+// Requests are accepted and routed to shell_bridge, which owns the decision. The bodies
+// that are still empty are the ones whose compositor-side action does not exist yet
+// (move/resize interaction, workspace objects, rule persistence) — they are declared here
+// so the shell can bind and drive what does work, rather than failing at bind.
+const struct zlm_policy_bridge_v1_interface policy_bridge_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .request_activate =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {
+            if (g_p0_ctx && g_p0_ctx->shell && toplevel) {
+                g_p0_ctx->shell->on_request_activate(
+                    lx::toplevel_id{reinterpret_cast<unsigned long long>(toplevel)});
+            }
+        },
+    .request_raise = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .request_lower = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .set_toplevel_stacking_index =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel,
+           uint32_t index) {
+            if (g_p0_ctx && g_p0_ctx->shell && toplevel) {
+                g_p0_ctx->shell->on_set_stacking_index(
+                    lx::toplevel_id{reinterpret_cast<unsigned long long>(toplevel)}, index);
+            }
+        },
+    .request_move = [](struct wl_client*, struct wl_resource*, struct wl_resource*,
+                       struct wl_resource*, uint32_t) {},
+    .request_resize = [](struct wl_client*, struct wl_resource*, struct wl_resource*,
+                         struct wl_resource*, uint32_t, uint32_t) {},
+};
+
+const struct zlm_workspace_manager_v1_interface workspace_manager_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .create_workspace = [](struct wl_client*, struct wl_resource*, uint32_t, const char*) {},
+    .destroy_workspace = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .set_active = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .reorder_workspace =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource*, uint32_t) {},
+};
+
+const struct zlm_window_rules_v1_interface window_rules_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .reload_rules = [](struct wl_client*, struct wl_resource*) {},
+    .set_workspace_rule =
+        [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
+    .set_monitor_rule = [](struct wl_client*, struct wl_resource*, const char*, const char*) {},
+    .set_geometry_rule = [](struct wl_client*, struct wl_resource*, const char*, int32_t,
+                            int32_t, int32_t, int32_t) {},
+    .set_state_rule = [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
+    .set_decoration_rule = [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
+};
+
+const struct zlm_shell_v1_interface shell_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .get_workspace_manager =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
+            wl_resource* res = wl_resource_create(client, &zlm_workspace_manager_v1_interface,
+                                                  wl_resource_get_version(resource), id);
+            if (!res)
+                return;
+            wl_resource_set_implementation(res, &workspace_manager_impl, g_p0_ctx, nullptr);
+        },
+    .get_policy_bridge =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
+            wl_resource* res = wl_resource_create(client, &zlm_policy_bridge_v1_interface,
+                                                  wl_resource_get_version(resource), id);
+            if (!res)
+                return;
+            wl_resource_set_implementation(res, &policy_bridge_impl, g_p0_ctx, nullptr);
+            // The shell's first act is to learn the current state — ADR-004 §5's
+            // session-startup path. Emitted on bridge creation rather than on shell bind,
+            // because the bridge is the object the events are addressed to.
+            if (g_p0_ctx && g_p0_ctx->shell && g_p0_ctx->toplevels) {
+                g_p0_ctx->shell->emit_snapshot(
+                    lx::client_id{reinterpret_cast<unsigned long long>(client)},
+                    *g_p0_ctx->toplevels);
+            }
+        },
+    .get_window_rules =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
+            wl_resource* res = wl_resource_create(client, &zlm_window_rules_v1_interface,
+                                                  wl_resource_get_version(resource), id);
+            if (!res)
+                return;
+            wl_resource_set_implementation(res, &window_rules_impl, g_p0_ctx, nullptr);
+        },
+};
+
+void bind_shell(wayland::client_connection& client, unsigned id, int version) {
+    if (!g_p0_ctx || !g_p0_ctx->server)
+        return;
+
+    // Privilege is checked at bind, against the connecting peer's credentials — not at
+    // advertisement. A client that is not the shell gets a protocol error naming the
+    // reason, which is debuggable; silently omitting the global is not.
+    if (!g_p0_ctx->server->allow_privileged_global(client.credentials(), "zlm_shell_v1")) {
+        auto reject = wayland::resource::create(client, &zlm_shell_v1_interface, version, id);
+        if (reject)
+            reject.post_error(0, "zlm_shell_v1 is restricted to the session shell");
+        return;
+    }
+
+    auto res = wayland::resource::create(client, &zlm_shell_v1_interface, version, id);
+    if (!res)
+        return;
+    res.set_implementation(&shell_impl, g_p0_ctx, nullptr);
+}
+
 // ── wl_output ──────────────────────────────────────────────────────────────
 
 const struct wl_output_interface output_impl = {
@@ -1519,6 +1637,12 @@ void install_core(p0_protocol_context& ctx) {
                             .privileged = false,
                             .interface_desc = &xdg_wm_base_interface},
                            &bind_xdg_wm_base);
+    ctx.server->add_global({.interface_name = "zlm_shell_v1",
+                            .version = 1,
+                            .privileged = true,
+                            .interface_desc = &zlm_shell_v1_interface},
+                           bind_shell);
+
     ctx.server->add_global({.interface_name = "zwp_linux_dmabuf_v1",
                             .version = 5,
                             .privileged = false,

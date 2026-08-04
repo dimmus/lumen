@@ -155,12 +155,21 @@ devices and permission to open them. The honest test is `wev` under a real sessi
 has not been run. Treat Phase 0 as complete in construction and unproven in the field until
 someone types into it.
 
-### Phase 1 — Make it a desktop
+### Phase 1 — Make it a desktop — **in progress**
 
-5. **Advertise `zlm_shell_v1` and the policy bridge**, gated by the existing privilege
-   checker. Connect the seam the architecture is built around; the code is already there.
-6. **wlr-layer-shell.** Without it there is no panel, dock, wallpaper, notification or OSD —
-   the shell has nowhere to put anything.
+5. [x] **`zlm_shell_v1` is advertised**, and the registry now lists nine globals rather
+   than seven. The protocol was already generated and both sides scaffolded; only the
+   `add_global` call was missing, which is why `lumen-shell` connected and found nothing.
+   `zlm_shell_v1`, `zlm_policy_bridge_v1`, `zlm_workspace_manager_v1` and
+   `zlm_window_rules_v1` all bind, and `request_activate` /
+   `set_toplevel_stacking_index` route to `shell_bridge`; binding the bridge emits the
+   startup snapshot. Advertised to every client but bound only by one that passes the
+   privilege check, so a rejected bind is a protocol error naming the reason rather than a
+   global that mysteriously does not exist. Requests whose compositor-side action does not
+   exist yet (interactive move/resize, workspace objects, rule persistence) accept and do
+   nothing, so the shell can bind and drive what does work instead of failing at bind.
+6. [ ] **wlr-layer-shell.** Next. Without it there is no panel, dock, wallpaper,
+   notification or OSD — the shell has nowhere to put anything.
 7. **ext-session-lock.** Security-critical and easy to get subtly wrong: the lock surface
    must survive a crashing locker, and input must not leak to normal clients while locked.
 8. **xdg-decoration, xdg-activation, xdg-output, primary-selection.** The unglamorous set

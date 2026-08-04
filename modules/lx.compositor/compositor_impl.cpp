@@ -393,6 +393,7 @@ void compositor_impl::register_p0_globals() {
     p0_.surfaces = &surfaces;
     p0_.input = &input_router_;
     p0_.seat = &input_seat_;
+    p0_.shell = &shell_bridge_;
     p0_.toplevels = &toplevels;
     p0_.outputs = &outputs;
     p0_.headless = &headless_;
