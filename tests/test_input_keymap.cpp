@@ -305,6 +305,39 @@ LUMEN_TEST(seat_tracks_focus_independently_for_pointer_and_keyboard) {
     LUMEN_CHECK(s.pointer_focus() == lx::surface_id{9});
 }
 
+// The compiled keymap must survive being moved. input_manager::open() builds the manager
+// as a local and returns it by value, so it is moved at least twice before the caller sees
+// it — and a seat left out of the move list arrives with no keymap. Nothing crashes; keys
+// simply stop having meaning, which is why this was only visible in a diagnostic log.
+LUMEN_TEST(seat_keymap_survives_being_moved) {
+    lx::input::seat original{};
+    if (!compile_us(original.keymap()))
+        return;
+    (void)original.keymap().update_key(k_key_leftshift, true);
+    original.note_key(k_key_a, true);
+    (void)original.next_serial();
+    const unsigned serial_before = original.last_serial();
+
+    lx::input::seat moved{std::move(original)};
+
+    LUMEN_CHECK(moved.keymap().valid());
+    LUMEN_CHECK(moved.keymap().named().shift);  // live xkb state travelled
+    LUMEN_CHECK(moved.pressed_count() == 1);    // held keys travelled
+    LUMEN_CHECK(moved.last_serial() == serial_before);
+
+    char buf[8]{};
+    LUMEN_CHECK(moved.keymap().utf8(k_key_a, buf, sizeof(buf)) == 1);
+    LUMEN_CHECK(buf[0] == 'A'); // still shifted, so the keymap is genuinely usable
+
+    // Move-assignment has to carry it too — that is the path input_manager takes when the
+    // compositor stores the opened manager.
+    lx::input::seat assigned{};
+    assigned = std::move(moved);
+    LUMEN_CHECK(assigned.keymap().valid());
+    LUMEN_CHECK(assigned.keymap().named().shift);
+    LUMEN_CHECK(assigned.pressed_count() == 1);
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

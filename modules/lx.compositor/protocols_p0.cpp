@@ -1222,16 +1222,23 @@ struct keymap_source {
     //
     // Compiled once and cached: it is identical for every client, and the fd is duped by
     // libwayland on each send.
-    static lx::input::keyboard_keymap keymap{};
-    if (!keymap.valid()) {
-        if (auto compiled = keymap.compile(); !compiled) {
+    // The seat's keymap, not a second one compiled here: clients must be told about the
+    // same layout the compositor tracks modifiers with, or the two disagree the moment the
+    // configured layout is not US.
+    static lx::input::keyboard_keymap fallback{};
+    lx::input::keyboard_keymap* keymap =
+        (g_p0_ctx && g_p0_ctx->seat && g_p0_ctx->seat->keymap().valid())
+            ? &g_p0_ctx->seat->keymap()
+            : &fallback;
+    if (!keymap->valid()) {
+        if (auto compiled = keymap->compile(); !compiled) {
             lx::trace::logger::global().log_error(compiled.get_error(), "compositor.seat");
             return cached;
         }
     }
 
     unsigned size = 0;
-    auto fd = keymap.keymap_fd(size);
+    auto fd = keymap->keymap_fd(size);
     if (!fd) {
         lx::trace::logger::global().log_error(fd.get_error(), "compositor.seat");
         return cached;
