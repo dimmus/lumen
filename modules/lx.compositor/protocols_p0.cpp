@@ -559,8 +559,25 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
     const unsigned char* shm_pixels = nullptr;
     unsigned long long shm_seq = 0;
     unsigned long long shm_token = 0;
-    if (buf->is_shm && img.image_id)
+    if (buf->is_shm && img.image_id) {
         shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_seq, shm_token);
+        if (!shm_pixels) {
+            // The one silent path to a black screen: without staged pixels no texture
+            // update is queued, so the texture is never registered, and the draw that
+            // references it is skipped every frame with nothing explaining why. Staging
+            // legitimately declines when every slot is in flight, so this is rate-limited
+            // rather than suppressed — a client that is merely running ahead recovers,
+            // one that never stages anything does not.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                lx::trace::logger::global().log(
+                    lx::trace::level::warn, "compositor.surface",
+                    "shm staging returned no buffer — the texture cannot be registered and "
+                    "the surface will not be drawn. Reported once.");
+            }
+        }
+    }
 
     // Register SHM pixels with headless for software blit.
     if (buf->is_shm && s->ctx->headless && shm_pixels && img.image_id) {
