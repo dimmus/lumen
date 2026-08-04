@@ -479,7 +479,14 @@ Follow-on from the above:
    leaking every client's server-side state and resource map.
 
 **Structural**
-10. [ ] D3 — deadline-driven repaint scheduling
+10. [x] D3 — `scheduler::repaint_scheduler` picks each repaint's start time from the
+    measured cost of recent frames, so the idle wait sits before the work instead of after
+    it and the frame carries input from as late as possible. The estimate is the peak over
+    a 16-frame window, not the mean: a mean is wrong in the direction that hurts, since
+    half the frames then miss a deadline and a miss costs a whole refresh period, while
+    over-estimating costs only latency. A repaint that no longer fits before the next
+    vblank targets the one after it rather than starting late, and `over_budget_for_refresh`
+    distinguishes "scheduled badly" from "too slow", which look identical from outside.
 11. [ ] D4 — Vulkan 1.3 baseline, timeline semaphores, non-blocking present, batched draws
 12. [ ] D5 — per-output frame loop
 

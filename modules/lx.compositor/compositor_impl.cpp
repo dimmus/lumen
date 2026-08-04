@@ -136,6 +136,15 @@ struct compositor_impl {
     /// at a fraction of its refresh. Each completed flip re-arms the timer just ahead of
     /// the next vblank, so the compositor runs at the display's cadence and in phase.
     lx::runtime::clock_time refresh_period_ns_ = 16'666'667;
+    /// UI affinity. Decides when each repaint starts so it lands just before the display
+    /// needs it, instead of at the interval boundary — see `scheduler::repaint_scheduler`.
+    /// Touched only from the UI thread, which is why the render cost reaches it through
+    /// `render_cost_us_` rather than being fed in directly from the render thread.
+    scheduler::repaint_scheduler repaint_{};
+    /// Written by render at the end of each tick, read by UI when it re-arms the frame
+    /// clock. Relaxed: it is a cost estimate, and a one-frame-stale value only shifts the
+    /// next start by the difference between two adjacent frames.
+    std::atomic<unsigned> render_cost_us_{0};
     /// Composite must finish before the vblank it targets; waking exactly on it would miss.
     static constexpr lx::runtime::clock_time k_frame_deadline_margin_ns = 2'000'000;
 
@@ -685,21 +694,25 @@ void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback
     // The flip landed, so clients may draw again regardless of how complete the feedback is.
     impl->present_completed_ = true;
 
-    // Phase-lock the frame clock to the display. A timer free-running at target_fps drifts
+    // Phase-lock the frame clock to the display, and aim each repaint at its deadline
+    // rather than at the interval boundary. A timer free-running at target_fps drifts
     // against the real vblank cadence, so ticks land while a flip is still queued and their
     // composite is wasted — the visible rate then sits well under the refresh rate for
-    // reasons that look like slow rendering. Aim the next tick just before the vblank that
-    // follows this flip. Scheduling from `now` rather than the flip timestamp keeps this
-    // free of assumptions about which clock the driver reports.
+    // reasons that look like slow rendering.
+    //
+    // The start time comes from the measured repaint cost, so the idle wait sits before the
+    // work instead of after it and the frame carries input from as late as it can. A frame
+    // that gets more expensive starts earlier on its own. Scheduling from `now` rather than
+    // the flip timestamp keeps this free of assumptions about which clock the driver
+    // reports.
     if (impl->vsync_timer) {
         const auto now = static_cast<lx::runtime::clock_time>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
-        const auto period = impl->refresh_period_ns_;
-        const auto lead = period > k_frame_deadline_margin_ns
-                              ? period - k_frame_deadline_margin_ns
-                              : period / 2;
-        impl->vsync_timer->schedule_at(now + lead);
+        impl->repaint_.observe_repaint(impl->budget_.last_tick_ui_us(),
+                                       impl->render_cost_us_.load(std::memory_order_relaxed));
+        impl->repaint_.on_present(now);
+        impl->vsync_timer->schedule_at(impl->repaint_.next_start(now));
     }
 
     if (!fb.hw_clock || !fb.vsync)
@@ -989,6 +1002,7 @@ lx::result<void> compositor::start() {
         }
     }
     impl_->refresh_period_ns_ = interval_ns;
+    impl_->repaint_.set_refresh_period(interval_ns);
 
     impl_->vsync_timer = std::make_unique<runtime::timer_source>(
         interval_ns, &detail::compositor_impl::vsync_callback, true);
@@ -1322,6 +1336,10 @@ void compositor::tick_render() {
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count());
     impl_->budget_.end_tick_render(us);
+    // Publish for the frame clock. Both phases decide when the next repaint has to start:
+    // the frame is not presentable until render is done, so the deadline applies to their
+    // sum — but the scheduler itself belongs to the UI thread.
+    impl_->render_cost_us_.store(us, std::memory_order_relaxed);
     if (impl_->budget_.tick_render_over_budget())
         ++impl_->render_over_budget_;
     if (++impl_->render_budget_window_ >= detail::compositor_impl::k_budget_report_frames) {

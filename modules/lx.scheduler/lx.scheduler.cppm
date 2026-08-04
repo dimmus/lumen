@@ -7,6 +7,7 @@ export module lx.scheduler;
 
 export import :presentation;
 export import :budget;
+export import :repaint;
 
 export namespace lx::scheduler {
 
