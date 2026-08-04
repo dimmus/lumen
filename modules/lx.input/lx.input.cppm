@@ -1,6 +1,7 @@
 module;
 
 #include <cstring>
+#include <memory>
 
 #if defined(LUMEN_HAS_INPUT)
 #include <cerrno>
@@ -82,6 +83,11 @@ struct event_sink {
     /// sending one per keystroke is wasteful and visible.
     void (*modifiers)(const modifier_state&, void*) = nullptr;
     void (*touch)(const touch_event&, void*) = nullptr;
+    /// A device appeared, with its libinput name and what it can do. Reported because
+    /// "nothing happens when I type" is usually a keyboard that was never opened, and a
+    /// device count alone cannot tell you that.
+    void (*device_added)(const char* name, bool keyboard, bool pointer, bool touch,
+                         void*) = nullptr;
     void* user = nullptr;
 };
 
@@ -199,7 +205,12 @@ private:
     void* libinput_ = nullptr;
     event_sink sink_{};
     seat seat_{};
-    device_provider provider_{};
+    /// Heap-allocated because libinput stores this pointer for the life of the context and
+    /// calls back through it — including from `libinput_unref`, to close the devices it
+    /// still holds. A by-value member would move with the manager and leave libinput
+    /// pointing at a destroyed object; the crash then lands at teardown, far from the move
+    /// that caused it, and only when devices actually opened.
+    std::unique_ptr<device_provider> provider_{};
     unsigned device_count_ = 0;
     bool suspended_ = false;
 };
@@ -278,6 +289,9 @@ lx::input::input_manager::~input_manager() { destroy(); }
 
 void lx::input::input_manager::destroy() {
 #if defined(LUMEN_HAS_INPUT)
+    // Order matters: unref closes every device libinput still holds, and each close goes
+    // back through the provider. Releasing the provider first would free it out from under
+    // those callbacks.
     if (libinput_)
         libinput_unref(static_cast<struct libinput*>(libinput_));
     if (udev_)
@@ -285,12 +299,13 @@ void lx::input::input_manager::destroy() {
 #endif
     libinput_ = nullptr;
     udev_ = nullptr;
+    provider_.reset();
     device_count_ = 0;
 }
 
 lx::input::input_manager::input_manager(input_manager&& other) noexcept
     : udev_{other.udev_}, libinput_{other.libinput_}, sink_{other.sink_},
-      provider_{other.provider_}, device_count_{other.device_count_},
+      provider_{std::move(other.provider_)}, device_count_{other.device_count_},
       suspended_{other.suspended_} {
     other.udev_ = nullptr;
     other.libinput_ = nullptr;
@@ -304,7 +319,7 @@ lx::input::input_manager& lx::input::input_manager::operator=(input_manager&& ot
     udev_ = other.udev_;
     libinput_ = other.libinput_;
     sink_ = other.sink_;
-    provider_ = other.provider_;
+    provider_ = std::move(other.provider_);
     device_count_ = other.device_count_;
     suspended_ = other.suspended_;
     other.udev_ = nullptr;
@@ -317,16 +332,18 @@ lx::result<lx::input::input_manager> lx::input::input_manager::open(device_provi
                                                                     const char* seat_name) {
 #if defined(LUMEN_HAS_INPUT)
     input_manager mgr;
-    mgr.provider_ = provider;
+    mgr.provider_ = std::make_unique<device_provider>(provider);
 
     auto* udev = udev_new();
     if (!udev)
         return lx::make_error(lx::error_domain::io, 0, "udev_new failed");
     mgr.udev_ = udev;
 
-    // The provider is handed to libinput as user data, so it must outlive the context. It
-    // lives in the manager, and the manager owns the context — moves carry both together.
-    auto* li = libinput_udev_create_context(&k_interface, &mgr.provider_, udev);
+    // The provider is handed to libinput as user data and must outlive the context, at a
+    // fixed address: libinput calls back through it from `libinput_unref` as well as at
+    // open time. The manager owns the allocation, so moves carry the pointer rather than
+    // relocating the object.
+    auto* li = libinput_udev_create_context(&k_interface, mgr.provider_.get(), udev);
     if (!li) {
         return lx::make_error(lx::error_domain::io, 0, "libinput_udev_create_context failed");
     }
@@ -389,9 +406,19 @@ void lx::input::input_manager::handle_event(void* raw) {
     const auto type = libinput_event_get_type(ev);
 
     switch (type) {
-    case LIBINPUT_EVENT_DEVICE_ADDED:
+    case LIBINPUT_EVENT_DEVICE_ADDED: {
         ++device_count_;
+        if (sink_.device_added) {
+            auto* dev = libinput_event_get_device(ev);
+            sink_.device_added(
+                libinput_device_get_name(dev),
+                libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_KEYBOARD) != 0,
+                libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_POINTER) != 0,
+                libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_TOUCH) != 0,
+                sink_.user);
+        }
         break;
+    }
     case LIBINPUT_EVENT_DEVICE_REMOVED:
         if (device_count_ > 0)
             --device_count_;

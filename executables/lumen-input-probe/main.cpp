@@ -69,7 +69,18 @@ struct probe_state {
     unsigned buttons = 0;
     unsigned motions = 0;
     unsigned axes = 0;
+    unsigned keyboards = 0;
+    unsigned pointers = 0;
 };
+
+void on_device(const char* name, bool keyboard, bool pointer, bool touch, void* user) {
+    auto* st = static_cast<probe_state*>(user);
+    if (keyboard) ++st->keyboards;
+    if (pointer) ++st->pointers;
+    std::printf("device  %-40s%s%s%s\n", name ? name : "(unnamed)",
+                keyboard ? " keyboard" : "", pointer ? " pointer" : "", touch ? " touch" : "");
+    std::fflush(stdout);
+}
 
 void on_key(const lx::input::key_event& e, void* user) {
     auto* st = static_cast<probe_state*>(user);
@@ -170,13 +181,19 @@ int main(int argc, char* argv[]) {
     sink.pointer_motion = on_motion;
     sink.pointer_button = on_button;
     sink.pointer_axis = on_axis;
+    sink.device_added = on_device;
     mgr.set_sink(sink);
 
-    // Devices arrive as events on the first dispatch, so the count is only meaningful after.
+    // Devices arrive as events on the first dispatch, so the sink has to be installed
+    // before it or the enumeration is silent.
     (void)mgr.dispatch();
-    std::printf("devices: %u\n", mgr.device_count());
+    std::printf("\ndevices: %u total, %u keyboard, %u pointer\n", mgr.device_count(),
+                state.keyboards, state.pointers);
     if (mgr.device_count() == 0) {
         std::printf("  none on this seat — nothing will be reported.\n");
+    } else if (state.keyboards == 0) {
+        std::printf("  no keyboard among them — typing cannot be reported. If you have one\n"
+                    "  attached, it was not opened: check the permission notes above.\n");
     }
 
     const int fd = mgr.fd();
@@ -216,8 +233,8 @@ int main(int argc, char* argv[]) {
         return 2;
     }
     if (state.keys == 0 && state.buttons == 0 && state.motions == 0) {
-        std::printf("Devices opened but nothing arrived — either you did not touch\n"
-                    "anything, or the devices on this seat are not the ones you are using.\n");
+        std::printf("Devices opened but nothing arrived. Either the devices listed above\n"
+                    "are not the ones you are using, or you did not touch anything.\n");
         return 2;
     }
     std::printf("Input stack works. Anything still broken is above lx.input.\n");
