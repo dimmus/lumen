@@ -25,6 +25,9 @@ struct vk_context {
     void* command_pool = nullptr;
     unsigned queue_family = 0;
     bool supports_queue_family_foreign = false;
+    /// VK_KHR_external_semaphore_fd. Lets a frame's completion be exported as a sync_file
+    /// the atomic commit waits on, instead of the render thread blocking on the GPU.
+    bool supports_external_semaphore_fd = false;
 
     [[nodiscard]] bool valid() const {
         return device && physical_device && queue && command_pool;
@@ -83,6 +86,13 @@ struct composite_stats {
     unsigned draws_skipped = 0;
     /// Clipped away entirely, so never submitted. Expected, not an error.
     unsigned draws_culled = 0;
+    /// sync_file signalled when this frame's GPU work completes, or -1 when the device
+    /// cannot export one — in which case `composite` already blocked instead.
+    ///
+    /// **Owned by the caller**, which must either hand it to an atomic commit as
+    /// `in_fence_fd` or close it. Leaking it leaks a file descriptor per frame. Mirrors
+    /// `gl_composite_stats::out_fence_fd` so the present path treats both backends alike.
+    int out_fence_fd = -1;
 };
 
 /// Records and submits the compositor's textured-quad pass.
@@ -151,7 +161,12 @@ private:
     [[nodiscard]] lx::result<void> ensure_framebuffer(const render_target& target);
     [[nodiscard]] lx::result<void> create_descriptor(texture_slot& slot);
     [[nodiscard]] lx::result<void> ensure_staging_ring(unsigned need_bytes);
-    [[nodiscard]] lx::result<void> submit_current_slot(bool wait_for_completion);
+    /// Submits the recorded slot. When `out_fence_fd` is non-null and the device can
+    /// export sync_files, the submit signals a semaphore exported into `*out_fence_fd` and
+    /// this returns without waiting — the display controller holds the flip back instead of
+    /// the render thread holding the frame back. Falls back to blocking when it cannot.
+    [[nodiscard]] lx::result<void> submit_current_slot(bool wait_for_completion,
+                                                       int* out_fence_fd = nullptr);
     /// Blocks until every submitted frame slot has completed. Required before destroying
     /// any resource a queued command buffer might reference.
     void wait_all_slots_idle();
@@ -168,6 +183,11 @@ private:
     void* sampler_ = nullptr;
     void* command_buffers_[k_frame_slots]{};
     void* fences_[k_frame_slots]{};
+    /// One binary semaphore per slot, signalled by that slot's submit and exported as a
+    /// sync_file for KMS. Per slot rather than one shared: an exported semaphore must not
+    /// be re-signalled until the export has been consumed.
+    void* slot_semaphores_[k_frame_slots]{};
+    bool can_export_fence_ = false;
     unsigned submit_slot_ = 0;
     void* staging_buffer_ = nullptr;
     void* staging_memory_ = nullptr;
@@ -814,6 +834,31 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
         fences_[i] = fence;
     }
 
+    // Exportable semaphores turn the frame's completion into a sync_file KMS can wait on,
+    // which is what lets the render thread stop blocking on the GPU. Optional: a device
+    // without the extension falls back to waiting, which is correct but serialises the CPU
+    // against the GPU every frame.
+    can_export_fence_ = ctx_.supports_external_semaphore_fd;
+    if (can_export_fence_) {
+        VkExportSemaphoreCreateInfo export_info{};
+        export_info.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+        export_info.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+
+        VkSemaphoreCreateInfo sem_ci{};
+        sem_ci.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        sem_ci.pNext = &export_info;
+
+        for (unsigned i = 0; i < k_frame_slots; ++i) {
+            VkSemaphore sem = VK_NULL_HANDLE;
+            if (vkCreateSemaphore(dev, &sem_ci, nullptr, &sem) != VK_SUCCESS) {
+                // Not fatal — drop back to the blocking path rather than failing startup.
+                can_export_fence_ = false;
+                break;
+            }
+            slot_semaphores_[i] = sem;
+        }
+    }
+
     if (auto staging = ensure_staging_ring(k_staging_ring_bytes); !staging)
         return staging.get_error();
 
@@ -853,6 +898,13 @@ void lx::gfx::vulkan_compositor::shutdown() {
         }
         if (staging_buffer_)
             vkDestroyBuffer(dev, static_cast<VkBuffer>(staging_buffer_), nullptr);
+        for (unsigned i = 0; i < k_frame_slots; ++i) {
+            if (slot_semaphores_[i])
+                vkDestroySemaphore(dev, static_cast<VkSemaphore>(slot_semaphores_[i]), nullptr);
+            slot_semaphores_[i] = nullptr;
+        }
+        can_export_fence_ = false;
+
         destroy_encode_pipeline();
         destroy_linear_target();
         if (encode_set_layout_)
@@ -1005,6 +1057,11 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
         return lx::make_error(lx::error_domain::invalid_argument, 0,
                               "upload_rgba with empty source");
     }
+
+    // Present no longer blocks, so the frame this reads may still be in flight. Read-back
+    // is for tests and screenshots and is explicitly not on the frame path, so waiting here
+    // is the right trade — the alternative is a barrier against work the caller cannot see.
+    wait_all_slots_idle();
 
     auto dev = static_cast<VkDevice>(ctx_.device);
     auto phys = static_cast<VkPhysicalDevice>(ctx_.physical_device);
@@ -1251,7 +1308,8 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_staging_ring(unsigned need_b
 #endif
 }
 
-lx::result<void> lx::gfx::vulkan_compositor::submit_current_slot(bool wait_for_completion) {
+lx::result<void> lx::gfx::vulkan_compositor::submit_current_slot(bool wait_for_completion,
+                                                                 int* out_fence_fd) {
 #if defined(LUMEN_HAS_VULKAN)
     auto dev = static_cast<VkDevice>(ctx_.device);
     auto queue = static_cast<VkQueue>(ctx_.queue);
@@ -1261,14 +1319,43 @@ lx::result<void> lx::gfx::vulkan_compositor::submit_current_slot(bool wait_for_c
     if (!dev || !queue || !cb || !fence)
         return lx::not_implemented("lx::gfx::vulkan_compositor::submit_current_slot");
 
+    // Export the frame's completion only when the caller wants it and the device can. The
+    // signal has to be requested at submit time, so this decides before the submit.
+    const bool want_export = out_fence_fd != nullptr && can_export_fence_ &&
+                             slot_semaphores_[slot] != nullptr;
+    auto sem = static_cast<VkSemaphore>(want_export ? slot_semaphores_[slot] : nullptr);
+
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cb;
+    if (want_export) {
+        submit.signalSemaphoreCount = 1;
+        submit.pSignalSemaphores = &sem;
+    }
     if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS)
         return vk_error("vkQueueSubmit failed");
 
-    if (wait_for_completion) {
+    bool exported = false;
+    if (want_export) {
+        VkSemaphoreGetFdInfoKHR get{};
+        get.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+        get.semaphore = sem;
+        get.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+
+        auto get_fd = reinterpret_cast<PFN_vkGetSemaphoreFdKHR>(
+            vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
+        int fd = -1;
+        if (get_fd && get_fd(dev, &get, &fd) == VK_SUCCESS && fd >= 0) {
+            *out_fence_fd = fd;
+            exported = true;
+        }
+    }
+
+    // Blocking is the fallback, not the design. With an exported fence the display
+    // controller waits for the GPU; without one the render thread has to, which serialises
+    // the CPU against the GPU for the whole frame.
+    if (wait_for_completion && !exported) {
         const VkResult waited = vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull);
         if (waited != VK_SUCCESS)
             return vk_error("vkWaitForFences timed out");
@@ -1278,6 +1365,7 @@ lx::result<void> lx::gfx::vulkan_compositor::submit_current_slot(bool wait_for_c
     return {};
 #else
     (void)wait_for_completion;
+    (void)out_fence_fd;
     return lx::not_implemented("lx::gfx::vulkan_compositor::submit_current_slot");
 #endif
 }
@@ -1887,7 +1975,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
 
     vkEndCommandBuffer(cb);
 
-    if (auto submitted = submit_current_slot(true); !submitted)
+    if (auto submitted = submit_current_slot(true, &stats.out_fence_fd); !submitted)
         return submitted.get_error();
     return stats;
 #else

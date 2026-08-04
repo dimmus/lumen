@@ -406,6 +406,14 @@ reads like a scheduling note.
   `color-management-v1` to negotiate with clients and the KMS `HDR_OUTPUT_METADATA` and
   `COLOR_ENCODING` properties to tell the display. The pipeline is ready; the plumbing
   above and below it is not.
+- **D4's remainder: the Vulkan 1.3 baseline and draw batching.** `apiVersion` is still
+  `VK_API_VERSION_1_1` with legacy render passes and framebuffers. Moving to 1.3 core buys
+  dynamic rendering (deleting the render-pass and framebuffer plumbing outright),
+  synchronization2, and timeline semaphores without extensions — but it is a rewrite of the
+  two passes D2 just added, so it wants doing deliberately rather than alongside them.
+  Still one queue, so staging uploads serialise against composite; and still one draw call,
+  descriptor bind and push-constant per quad, which is fine for a handful of surfaces and
+  not for a text-heavy panel emitting hundreds.
 - **`LUMEN_VULKAN_VALIDATION` is a no-op.** The option defines a macro that no module
   reads, so a build configured with it enables nothing. Worth either wiring into instance
   creation or removing — a validation switch that silently does nothing is worse than no
@@ -487,7 +495,14 @@ Follow-on from the above:
     over-estimating costs only latency. A repaint that no longer fits before the next
     vblank targets the one after it rather than starting late, and `over_budget_for_refresh`
     distinguishes "scheduled badly" from "too slow", which look identical from outside.
-11. [ ] D4 — Vulkan 1.3 baseline, timeline semaphores, non-blocking present, batched draws
+11. [~] **D4 — partial.** Present no longer blocks: the submit signals an exportable
+    semaphore, the frame's completion leaves as a sync_file, and the atomic commit waits on
+    it instead of the render thread waiting on the GPU. That was the item's whole point —
+    the CPU and GPU could not overlap at all before, so a frame cost the sum of both rather
+    than the larger. The Vulkan backend now matches the contract the GL one already had.
+    **Not done:** the Vulkan 1.3 baseline itself (still 1.1), dynamic rendering,
+    synchronization2, a dedicated transfer queue, and batched/instanced draws — see
+    "Needs revisiting".
 12. [ ] D5 — per-output frame loop
 
 ---

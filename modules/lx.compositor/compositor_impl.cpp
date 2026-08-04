@@ -1245,6 +1245,11 @@ void compositor::tick_render() {
             lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
         } else {
             composited_this_tick = true;
+            // Same contract as the GL path: this frame supersedes any uncommitted one, so
+            // its fence replaces that frame's rather than leaking alongside it. The commit
+            // waits on the GPU instead of the render thread doing so.
+            impl_->discard_composited_fence();
+            impl_->composited_fence_fd_ = composited.value().out_fence_fd;
             if (composited.value().draws_skipped > 0) {
                 // A draw with no registered texture means commit and render disagree. Say
                 // so instead of silently rendering a placeholder.
