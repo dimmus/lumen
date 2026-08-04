@@ -159,11 +159,16 @@ COMP_PID=""
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
 # Counted separately because they fail independently and mean different things.
-enter=$(grep -c "wl_keyboard.enter"   "$WEV_LOG" 2>/dev/null || echo 0)
-keys=$(grep -c  "wl_keyboard.key"     "$WEV_LOG" 2>/dev/null || echo 0)
-mods=$(grep -c  "wl_keyboard.modifiers" "$WEV_LOG" 2>/dev/null || echo 0)
-ptr=$(grep -c   "wl_pointer.motion"   "$WEV_LOG" 2>/dev/null || echo 0)
-btn=$(grep -c   "wl_pointer.button"   "$WEV_LOG" 2>/dev/null || echo 0)
+#
+# wev prints "[   14:     wl_keyboard] key:", so the interface and the event are separated
+# by "] " and not by a dot. The first version of this matched "wl_keyboard.key" and
+# therefore counted zero through a run that delivered 124 keys — a verdict that pointed at
+# the compositor when the fault was here.
+enter=$(grep -cF "wl_keyboard] enter"     "$WEV_LOG")
+keys=$(grep -cF  "wl_keyboard] key"       "$WEV_LOG")
+mods=$(grep -cF  "wl_keyboard] modifiers" "$WEV_LOG")
+ptr=$(grep -cF   "wl_pointer] motion"     "$WEV_LOG")
+btn=$(grep -cF   "wl_pointer] button"     "$WEV_LOG")
 
 echo
 echo "──────────────────────────────────────────────────────────────"
@@ -175,17 +180,28 @@ echo "      $WEV_LOG"
 [[ -f "$PROBE_LOG" ]] && echo "      $PROBE_LOG"
 echo
 
-if (( enter == 0 )); then
-  echo "VERDICT: the client never received keyboard focus. Events cannot arrive without"
-  echo "it, so this is focus, not delivery — check that the toplevel mapped and that"
+if (( keys == 0 && enter == 0 )); then
+  echo "VERDICT: the client received nothing. Check that the toplevel mapped and that"
   echo "input_router::set_keyboard_focus ran. Compositor log:"
   grep -iE "seat|input|focus|keymap" "$COMP_LOG" | tail -20
+  exit 2
+fi
+if (( enter == 0 )); then
+  echo "VERDICT: keys arrived without a wl_keyboard.enter first. That is a protocol"
+  echo "violation — the client was never told which surface has focus, and a stricter"
+  echo "client than wev would discard the keys. Usually it means the client created its"
+  echo "wl_keyboard after focus was already decided, so the enter went to a set of"
+  echo "resources that did not include it yet."
   exit 2
 fi
 if (( keys == 0 )); then
   echo "VERDICT: focus arrived but no keys did. The break is between the libinput feed"
   echo "and input_router::send_key — the probe already showed the events exist."
   exit 2
+fi
+if (( ptr == 0 && btn == 0 )); then
+  echo "NOTE: no pointer events. If you moved the mouse, pointer focus was never set —"
+  echo "keyboard and pointer focus are tracked separately and fail independently."
 fi
 echo "VERDICT: input reaches the client. Phase 0 is proven end to end."
 echo
