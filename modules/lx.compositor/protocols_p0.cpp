@@ -895,6 +895,15 @@ const struct xdg_surface_interface xdg_surface_impl = {
                 // and something has to hold focus before the shell exists.
                 if (xs->ctx->input && xs->ctx->seat) {
                     xs->ctx->input->set_keyboard_focus(xs->surface->resource, *xs->ctx->seat);
+                    // Pointer focus too. Without it `pointer_focus_` stays null and every
+                    // motion, button and scroll is dropped — the pointer is simply dead.
+                    // Following the keyboard is a placeholder until per-surface hit-testing
+                    // lands with D5's per-output loop, but a dead pointer is worse than an
+                    // approximate one.
+                    xs->ctx->input->set_pointer_focus(xs->surface->resource,
+                                                      xs->ctx->seat->pointer_x(),
+                                                      xs->ctx->seat->pointer_y(),
+                                                      *xs->ctx->seat);
                 }
             }
             // Send configure so the client can ack and commit.
@@ -1268,8 +1277,8 @@ const struct wl_seat_interface seat_impl = {
                 if (g_p0_ctx && g_p0_ctx->input)
                     g_p0_ctx->input->remove(r);
             });
-            if (g_p0_ctx && g_p0_ctx->input)
-                g_p0_ctx->input->add_pointer(res);
+            if (g_p0_ctx && g_p0_ctx->input && g_p0_ctx->seat)
+                g_p0_ctx->input->add_pointer(res, *g_p0_ctx->seat);
         },
     .get_keyboard =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -1300,8 +1309,8 @@ const struct wl_seat_interface seat_impl = {
 
             // Registered only after the keymap is sent: a client that receives `enter`
             // before it knows the layout cannot interpret the keys it is told are held.
-            if (g_p0_ctx && g_p0_ctx->input)
-                g_p0_ctx->input->add_keyboard(res);
+            if (g_p0_ctx && g_p0_ctx->input && g_p0_ctx->seat)
+                g_p0_ctx->input->add_keyboard(res, *g_p0_ctx->seat);
         },
     .get_touch =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {

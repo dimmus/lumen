@@ -271,16 +271,6 @@ const libinput_interface k_interface = {
     }
 }
 
-[[nodiscard]] lx::input::axis_source to_axis_source(libinput_pointer_axis_source src) {
-    switch (src) {
-    case LIBINPUT_POINTER_AXIS_SOURCE_WHEEL: return lx::input::axis_source::wheel;
-    case LIBINPUT_POINTER_AXIS_SOURCE_FINGER: return lx::input::axis_source::finger;
-    case LIBINPUT_POINTER_AXIS_SOURCE_CONTINUOUS: return lx::input::axis_source::continuous;
-    case LIBINPUT_POINTER_AXIS_SOURCE_WHEEL_TILT: return lx::input::axis_source::wheel_tilt;
-    default: return lx::input::axis_source::unknown;
-    }
-}
-
 } // namespace
 
 #endif // LUMEN_HAS_INPUT
@@ -474,7 +464,13 @@ void lx::input::input_manager::handle_event(void* raw) {
         auto* p = libinput_event_get_pointer_event(ev);
         pointer_axis_event out{};
         out.time_ms = libinput_event_pointer_get_time(p);
-        out.source = to_axis_source(libinput_event_pointer_get_axis_source(p));
+        // The source is the event type. libinput_event_pointer_get_axis_source() is only
+        // valid for the deprecated LIBINPUT_EVENT_POINTER_AXIS, and calling it on these
+        // makes libinput print "client bug: Invalid event type ... passed to
+        // libinput_event_pointer_get_axis_source()" — which it did, 18 times in one run.
+        out.source = type == LIBINPUT_EVENT_POINTER_SCROLL_WHEEL    ? axis_source::wheel
+                     : type == LIBINPUT_EVENT_POINTER_SCROLL_FINGER ? axis_source::finger
+                                                                    : axis_source::continuous;
         if (libinput_event_pointer_has_axis(p, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL)) {
             out.horizontal = libinput_event_pointer_get_scroll_value(
                 p, LIBINPUT_POINTER_AXIS_SCROLL_HORIZONTAL);

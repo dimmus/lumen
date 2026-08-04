@@ -29,9 +29,39 @@ PROBE_LOG="${LOG_DIR}/probe.log"
 mkdir -p "$LOG_DIR"
 : > "$COMP_LOG"; : > "$WEV_LOG"
 
+PROBE="${BUILD}/lumen-input-probe"
+
 if [[ ! -x "$COMP" ]]; then
   echo "build first:  cmake --preset release && cmake --build --preset release"
   echo "  (or LUMEN_BUILD_DIR=build/debug $0)"
+  exit 1
+fi
+
+# The probe is not optional. It is the only stage that can tell a dead input stack from a
+# routing problem, and skipping it silently — as this script first did — turns a missing
+# binary into a mysterious empty wev log.
+if [[ ! -x "$PROBE" ]]; then
+  echo "FAIL: $PROBE is missing."
+  echo "  It is built by the same command as the compositor, so its absence means this"
+  echo "  build directory predates the input work. Rebuild:"
+  echo "      cmake --build --preset release"
+  exit 1
+fi
+
+# A stale binary is the worst failure mode here, because everything appears to run and the
+# result is simply wrong. Compare against the newest tracked source: if any of them is
+# newer than the compositor, the test would be measuring yesterday's code.
+newest_src=""
+if command -v git >/dev/null && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  newest_src=$(git -C "$ROOT" ls-files -z -- modules executables \
+               | xargs -0 ls -t 2>/dev/null | head -1)
+fi
+if [[ -n "$newest_src" && "$ROOT/$newest_src" -nt "$COMP" ]]; then
+  echo "FAIL: $COMP is older than the sources."
+  echo "  newest source: $newest_src"
+  echo "  Running it would test a build that predates your changes — which is exactly how"
+  echo "  an afternoon disappears. Rebuild:"
+  echo "      cmake --build --preset release"
   exit 1
 fi
 
@@ -72,19 +102,16 @@ trap cleanup EXIT INT TERM
 
 # The probe first, on its own: if the devices cannot be opened there is no point starting a
 # compositor, and the reason is far clearer from the probe's own diagnostics.
-if [[ -x "${BUILD}/lumen-input-probe" ]]; then
-  echo "1/3  checking the input stack (2s) ..."
-  "${BUILD}/lumen-input-probe" 2 -o "$PROBE_LOG" >/dev/null 2>&1
-  probe_rc=$?
-  if (( probe_rc != 0 )); then
-    echo
-    echo "The input stack itself is not working, so a client test would only be confusing."
-    echo "Verdict from $PROBE_LOG:"
-    sed -n '/VERDICT/,$p' "$PROBE_LOG"
-    exit 1
-  fi
-  echo "     ok: $(grep -c '^\[' "$PROBE_LOG") lines, devices opened"
+echo "1/3  checking the input stack (2s) ..."
+"$PROBE" 2 -o "$PROBE_LOG" >/dev/null 2>&1
+if (( $? != 0 )); then
+  echo
+  echo "The input stack itself is not working, so a client test would only be confusing."
+  echo "Verdict from $PROBE_LOG:"
+  sed -n '/VERDICT/,$p' "$PROBE_LOG"
+  exit 1
 fi
+echo "     ok: devices opened, keymap compiled"
 
 echo "2/3  starting compositor on $SOCKET ..."
 LUMEN_LOG=info "$COMP" "$SOCKET" >"$COMP_LOG" 2>&1 &
@@ -100,6 +127,18 @@ for _ in $(seq 1 60); do
   sleep 0.1
 done
 [[ -S "$SOCKET_PATH" ]] || { echo "FAIL: no socket after 6s"; tail -20 "$COMP_LOG"; exit 1; }
+
+# The compositor opens its own seat, separately from the probe. If that line is absent the
+# client cannot receive anything and the rest of the run is noise.
+sleep 0.5
+if ! grep -q "libinput seat opened" "$COMP_LOG"; then
+  echo "FAIL: the compositor did not open an input seat."
+  echo "  The probe could open devices, so this is the compositor's own attempt failing."
+  grep -iE "input|seat" "$COMP_LOG" | tail -10
+  echo "  (no 'compositor.input' lines at all usually means a stale binary)"
+  exit 1
+fi
+echo "     compositor opened its seat"
 
 echo "3/3  starting wev; type and move the mouse for ${SECONDS_TO_RUN}s ..."
 WAYLAND_DISPLAY="$SOCKET" wev >"$WEV_LOG" 2>&1 &
@@ -120,11 +159,16 @@ COMP_PID=""
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
 # Counted separately because they fail independently and mean different things.
-enter=$(grep -c "wl_keyboard.enter"   "$WEV_LOG" 2>/dev/null || echo 0)
-keys=$(grep -c  "wl_keyboard.key"     "$WEV_LOG" 2>/dev/null || echo 0)
-mods=$(grep -c  "wl_keyboard.modifiers" "$WEV_LOG" 2>/dev/null || echo 0)
-ptr=$(grep -c   "wl_pointer.motion"   "$WEV_LOG" 2>/dev/null || echo 0)
-btn=$(grep -c   "wl_pointer.button"   "$WEV_LOG" 2>/dev/null || echo 0)
+#
+# wev prints "[   14:     wl_keyboard] key:", so the interface and the event are separated
+# by "] " and not by a dot. The first version of this matched "wl_keyboard.key" and
+# therefore counted zero through a run that delivered 124 keys — a verdict that pointed at
+# the compositor when the fault was here.
+enter=$(grep -cF "wl_keyboard] enter"     "$WEV_LOG")
+keys=$(grep -cF  "wl_keyboard] key"       "$WEV_LOG")
+mods=$(grep -cF  "wl_keyboard] modifiers" "$WEV_LOG")
+ptr=$(grep -cF   "wl_pointer] motion"     "$WEV_LOG")
+btn=$(grep -cF   "wl_pointer] button"     "$WEV_LOG")
 
 echo
 echo "──────────────────────────────────────────────────────────────"
@@ -136,17 +180,28 @@ echo "      $WEV_LOG"
 [[ -f "$PROBE_LOG" ]] && echo "      $PROBE_LOG"
 echo
 
-if (( enter == 0 )); then
-  echo "VERDICT: the client never received keyboard focus. Events cannot arrive without"
-  echo "it, so this is focus, not delivery — check that the toplevel mapped and that"
+if (( keys == 0 && enter == 0 )); then
+  echo "VERDICT: the client received nothing. Check that the toplevel mapped and that"
   echo "input_router::set_keyboard_focus ran. Compositor log:"
   grep -iE "seat|input|focus|keymap" "$COMP_LOG" | tail -20
+  exit 2
+fi
+if (( enter == 0 )); then
+  echo "VERDICT: keys arrived without a wl_keyboard.enter first. That is a protocol"
+  echo "violation — the client was never told which surface has focus, and a stricter"
+  echo "client than wev would discard the keys. Usually it means the client created its"
+  echo "wl_keyboard after focus was already decided, so the enter went to a set of"
+  echo "resources that did not include it yet."
   exit 2
 fi
 if (( keys == 0 )); then
   echo "VERDICT: focus arrived but no keys did. The break is between the libinput feed"
   echo "and input_router::send_key — the probe already showed the events exist."
   exit 2
+fi
+if (( ptr == 0 && btn == 0 )); then
+  echo "NOTE: no pointer events. If you moved the mouse, pointer focus was never set —"
+  echo "keyboard and pointer focus are tracked separately and fail independently."
 fi
 echo "VERDICT: input reaches the client. Phase 0 is proven end to end."
 echo

@@ -27,9 +27,15 @@ export namespace lx::compositor {
 /// objects from the same seat, and all of them must be fed.
 class input_router {
 public:
-    /// Registers a seat-derived resource. Unregistered automatically on destroy.
-    void add_keyboard(void* wl_keyboard_resource);
-    void add_pointer(void* wl_pointer_resource);
+    /// Registers a seat-derived resource, and brings it up to date immediately.
+    ///
+    /// Bringing it up to date is not optional. A client creates its `wl_keyboard` whenever
+    /// it likes — `wev` does so *after* mapping its toplevel — and if focus was already
+    /// decided by then, the `enter` went out to a set of resources that did not yet include
+    /// this one. The client would receive keys for a surface it was never told it had focus
+    /// on, which is a protocol violation and leaves well-behaved clients ignoring the keys.
+    void add_keyboard(void* wl_keyboard_resource, lx::input::seat& seat);
+    void add_pointer(void* wl_pointer_resource, lx::input::seat& seat);
     void add_touch(void* wl_touch_resource);
     void remove(void* resource);
 
@@ -56,6 +62,10 @@ public:
     [[nodiscard]] unsigned touch_count() const { return touches_.count; }
 
 private:
+    /// Sends `enter` plus the modifiers that must follow it to one keyboard resource.
+    /// Shared by focus changes and late resource creation so the two cannot drift.
+    void send_enter_to(void* keyboard_resource, void* surface, lx::input::seat& seat);
+
     static constexpr unsigned k_max_resources = 64;
 
     struct resource_set {
@@ -111,8 +121,63 @@ bool lx::compositor::input_router::resource_set::same_client(void* r, void* surf
 #endif
 }
 
-void lx::compositor::input_router::add_keyboard(void* r) { keyboards_.add(r); }
-void lx::compositor::input_router::add_pointer(void* r) { pointers_.add(r); }
+void lx::compositor::input_router::send_enter_to(void* keyboard_resource, void* surface,
+                                                 lx::input::seat& seat) {
+#if defined(LUMEN_HAS_WAYLAND)
+    if (!keyboard_resource || !surface)
+        return;
+    auto* kb = static_cast<wl_resource*>(keyboard_resource);
+
+    // The keys held right now. A client told it has focus but not what is pressed will
+    // hold any modifier that was down across the transition until it is tapped again.
+    wl_array keys{};
+    wl_array_init(&keys);
+    for (unsigned i = 0; i < seat.pressed_count(); ++i) {
+        if (auto* slot = static_cast<uint32_t*>(wl_array_add(&keys, sizeof(uint32_t))))
+            *slot = seat.pressed_keys()[i];
+    }
+    wl_keyboard_send_enter(kb, seat.next_serial(), static_cast<wl_resource*>(surface), &keys);
+    wl_array_release(&keys);
+
+    // Modifiers immediately after, for the same reason the key array is sent.
+    const auto mods = seat.keymap().modifiers();
+    wl_keyboard_send_modifiers(kb, seat.next_serial(), mods.depressed, mods.latched,
+                               mods.locked, mods.group);
+#else
+    (void)keyboard_resource;
+    (void)surface;
+    (void)seat;
+#endif
+}
+
+void lx::compositor::input_router::add_keyboard(void* r, lx::input::seat& seat) {
+    keyboards_.add(r);
+#if defined(LUMEN_HAS_WAYLAND)
+    // Already focused? Then this resource missed the `enter` and has to be told now.
+    if (!r || !keyboard_focus_ || !resource_set::same_client(r, keyboard_focus_))
+        return;
+    send_enter_to(r, keyboard_focus_, seat);
+#else
+    (void)seat;
+#endif
+}
+
+void lx::compositor::input_router::add_pointer(void* r, lx::input::seat& seat) {
+    pointers_.add(r);
+#if defined(LUMEN_HAS_WAYLAND)
+    if (!r || !pointer_focus_ || !resource_set::same_client(r, pointer_focus_))
+        return;
+    auto* p = static_cast<wl_resource*>(r);
+    wl_pointer_send_enter(p, seat.next_serial(), static_cast<wl_resource*>(pointer_focus_),
+                          wl_fixed_from_double(seat.pointer_x()),
+                          wl_fixed_from_double(seat.pointer_y()));
+    if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+        wl_pointer_send_frame(p);
+#else
+    (void)seat;
+#endif
+}
+
 void lx::compositor::input_router::add_touch(void* r) { touches_.add(r); }
 
 void lx::compositor::input_router::remove(void* r) {
@@ -158,15 +223,10 @@ void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::
             *slot = seat.pressed_keys()[i];
     }
 
-    const auto mods = seat.keymap().modifiers();
+    (void)serial;
     for (unsigned i = 0; i < keyboards_.count; ++i) {
-        if (!resource_set::same_client(keyboards_.items[i], surface))
-            continue;
-        auto* kb = static_cast<wl_resource*>(keyboards_.items[i]);
-        wl_keyboard_send_enter(kb, serial, static_cast<wl_resource*>(surface), &keys);
-        // Modifiers immediately after enter, for the same reason the key array is sent.
-        wl_keyboard_send_modifiers(kb, seat.next_serial(), mods.depressed, mods.latched,
-                                   mods.locked, mods.group);
+        if (resource_set::same_client(keyboards_.items[i], surface))
+            send_enter_to(keyboards_.items[i], surface, seat);
     }
     wl_array_release(&keys);
 #else
