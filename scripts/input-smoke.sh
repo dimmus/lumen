@@ -26,8 +26,15 @@ COMP_LOG="${LOG_DIR}/compositor.log"
 WEV_LOG="${LOG_DIR}/wev.log"
 PROBE_LOG="${LOG_DIR}/probe.log"
 
+RUN_LOG="${LOG_DIR}/run.log"
+
 mkdir -p "$LOG_DIR"
 : > "$COMP_LOG"; : > "$WEV_LOG"
+
+# Everything this script prints also goes to a file. On a TTY the compositor takes the
+# console, so a FAIL message scrolls past or is never seen — which is how a run that
+# stopped at stage 3 looked identical to one that completed with no events.
+exec > >(tee "$RUN_LOG") 2>&1
 
 PROBE="${BUILD}/lumen-input-probe"
 
@@ -141,7 +148,10 @@ fi
 echo "     compositor opened its seat"
 
 echo "3/3  starting wev; type and move the mouse for ${SECONDS_TO_RUN}s ..."
-WAYLAND_DISPLAY="$SOCKET" wev >"$WEV_LOG" 2>&1 &
+# stdbuf: wev writes to a file here, so libc block-buffers it and a SIGTERM discards
+# whatever has not reached 4 KiB. A run with few events then produces an empty log and
+# looks like "the client received nothing" — which is exactly what it is not.
+WAYLAND_DISPLAY="$SOCKET" stdbuf -oL -eL wev >"$WEV_LOG" 2>&1 &
 WEV_PID=$!
 sleep 1
 if ! kill -0 "$WEV_PID" 2>/dev/null; then
@@ -152,6 +162,8 @@ fi
 
 sleep "$SECONDS_TO_RUN"
 
+# SIGINT, not SIGTERM: it is what Ctrl-C sends, and it gives wev the chance to flush.
+kill -INT "$WEV_PID" 2>/dev/null; sleep 0.3
 kill -TERM "$WEV_PID" 2>/dev/null; wait "$WEV_PID" 2>/dev/null; WEV_PID=""
 kill -TERM "$COMP_PID" 2>/dev/null
 for _ in $(seq 1 30); do kill -0 "$COMP_PID" 2>/dev/null || break; sleep 0.1; done
@@ -177,6 +189,7 @@ echo "pointer.motion=$ptr    button=$btn"
 echo
 echo "logs: $COMP_LOG"
 echo "      $WEV_LOG"
+echo "      $RUN_LOG"
 [[ -f "$PROBE_LOG" ]] && echo "      $PROBE_LOG"
 echo
 
@@ -204,6 +217,11 @@ if (( ptr == 0 && btn == 0 )); then
   echo "keyboard and pointer focus are tracked separately and fail independently."
 fi
 echo "VERDICT: input reaches the client. Phase 0 is proven end to end."
+echo
+if grep -q "retire-applied" "$COMP_LOG" && grep -q "unregistered texture" "$COMP_LOG"; then
+  echo "BUT: a texture was retired and then drawn — the window will have gone black."
+  grep -E "compositor.texture|unregistered" "$COMP_LOG"
+fi
 echo
 echo "Worth checking by eye in $WEV_LOG: the first wl_keyboard.enter should carry any"
 echo "keys held at the moment of focus, and be followed immediately by modifiers. That"
