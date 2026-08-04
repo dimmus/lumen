@@ -129,6 +129,13 @@ lumen_apply_module_properties(lumen-shell)
 lumen_check_executable_layers(lumen-shell lx.shell)
 lumen_link_platform(lumen-shell)
 
+# Diagnostic: exercises lx.input alone, so "typing does nothing" can be narrowed to
+# permissions, devices, translation or routing instead of testing all four at once.
+add_executable(lumen-input-probe executables/lumen-input-probe/main.cpp)
+target_link_libraries(lumen-input-probe PRIVATE lx.input lx.session)
+lumen_apply_module_properties(lumen-input-probe)
+lumen_link_platform(lumen-input-probe)
+
 add_executable(lumen-hello executables/lumen-hello/main.cpp)
 target_link_libraries(lumen-hello PRIVATE lx.app)
 lumen_apply_module_properties(lumen-hello)
