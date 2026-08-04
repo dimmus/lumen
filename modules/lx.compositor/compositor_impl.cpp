@@ -1,6 +1,7 @@
 module;
 
 #include <atomic>
+#include <cstdio>
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
@@ -182,6 +183,12 @@ struct compositor_impl {
 
     /// UI thread. Brings up libinput and routes its events to focused clients.
     void start_input();
+    /// Render affinity. A draw whose texture was never registered means the commit path and
+    /// the render path disagree, and the screen stays black. Reporting only that it
+    /// happened is not actionable — this reports the ids involved, once, because it
+    /// otherwise fires every frame.
+    void report_unregistered_draw(const gfx::blit_command* blits, unsigned count);
+    bool reported_unregistered_ = false;
     static void input_ready_callback();
     void on_input_key(const lx::input::key_event& event);
     void on_input_pointer_motion(const lx::input::pointer_motion_event& event);
@@ -300,6 +307,31 @@ void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_ev
 
 void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
     input_router_.send_pointer_axis(event);
+}
+
+void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
+                                               unsigned count) {
+    if (reported_unregistered_)
+        return;
+    reported_unregistered_ = true;
+
+    char detail[256];
+    unsigned written = 0;
+    written += static_cast<unsigned>(std::snprintf(
+        detail + written, sizeof(detail) - written,
+        "draw references an unregistered texture — nothing will be drawn. ids:"));
+    for (unsigned i = 0; i < count && i < 4 && written + 16 < sizeof(detail); ++i) {
+        written += static_cast<unsigned>(std::snprintf(detail + written,
+                                                       sizeof(detail) - written, " %u",
+                                                       blits[i].texture_id));
+    }
+    std::snprintf(detail + written, sizeof(detail) - written,
+                  " (%u draws; backend=%s). Reported once.", count,
+                  gl_present_    ? "gl"
+                  : cpu_present_ ? "cpu"
+                  : vulkan_present_ ? "vulkan"
+                                    : "headless");
+    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render", detail);
 }
 
 void compositor_impl::start_input() {
@@ -1340,10 +1372,8 @@ void compositor::tick_render() {
             // frame's — which is dropped rather than leaked.
             impl_->discard_composited_fence();
             impl_->composited_fence_fd_ = composited.value().out_fence_fd;
-            if (composited.value().draws_skipped > 0) {
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                                "draw referenced an unregistered texture");
-            }
+            if (composited.value().draws_skipped > 0)
+                impl_->report_unregistered_draw(blits, blit_count);
         }
     } else if (impl_->cpu_present_ && impl_->scanout_slot_count_ > 0) {
         const auto& fb = impl_->dumb_fbs_[scanout_back];
@@ -1384,12 +1414,8 @@ void compositor::tick_render() {
             // waits on the GPU instead of the render thread doing so.
             impl_->discard_composited_fence();
             impl_->composited_fence_fd_ = composited.value().out_fence_fd;
-            if (composited.value().draws_skipped > 0) {
-                // A draw with no registered texture means commit and render disagree. Say
-                // so instead of silently rendering a placeholder.
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                                "draw referenced an unregistered texture");
-            }
+            if (composited.value().draws_skipped > 0)
+                impl_->report_unregistered_draw(blits, blit_count);
         }
     } else if (impl_->headless_present_ && impl_->headless_.width() > 0) {
         // Software fallback for no-GPU hosts and CI.
