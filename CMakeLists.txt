@@ -129,6 +129,13 @@ lumen_apply_module_properties(lumen-shell)
 lumen_check_executable_layers(lumen-shell lx.shell)
 lumen_link_platform(lumen-shell)
 
+# Diagnostic: exercises lx.input alone, so "typing does nothing" can be narrowed to
+# permissions, devices, translation or routing instead of testing all four at once.
+add_executable(lumen-input-probe executables/lumen-input-probe/main.cpp)
+target_link_libraries(lumen-input-probe PRIVATE lx.input lx.session)
+lumen_apply_module_properties(lumen-input-probe)
+lumen_link_platform(lumen-input-probe)
+
 add_executable(lumen-hello executables/lumen-hello/main.cpp)
 target_link_libraries(lumen-hello PRIVATE lx.app)
 lumen_apply_module_properties(lumen-hello)
@@ -220,6 +227,20 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_runtime_memory)
     target_include_directories(test_runtime_memory PRIVATE tests)
     add_test(NAME test_runtime_memory COMMAND test_runtime_memory)
+
+    add_executable(test_input_keymap tests/test_input_keymap.cpp)
+    target_link_libraries(test_input_keymap PRIVATE lx.input)
+    lumen_apply_module_properties(test_input_keymap)
+    lumen_link_platform(test_input_keymap)
+    target_include_directories(test_input_keymap PRIVATE tests)
+    add_test(NAME test_input_keymap COMMAND test_input_keymap)
+
+    add_executable(test_repaint_schedule tests/test_repaint_schedule.cpp)
+    target_link_libraries(test_repaint_schedule PRIVATE lx.scheduler)
+    lumen_apply_module_properties(test_repaint_schedule)
+    lumen_link_platform(test_repaint_schedule)
+    target_include_directories(test_repaint_schedule PRIVATE tests)
+    add_test(NAME test_repaint_schedule COMMAND test_repaint_schedule)
 
     add_executable(test_runtime_task tests/test_runtime_task.cpp)
     target_link_libraries(test_runtime_task PRIVATE lx.runtime)
@@ -348,7 +369,7 @@ if(LUMEN_BUILD_TESTS)
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
     set_tests_properties(test_result test_snapshot test_import_cache bench_frame
-        test_runtime_memory test_runtime_task test_cpu_composite
+        test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_input_keymap
         test_headless_golden test_text_shaping test_protocol_bind test_kms_device test_kms_vkms
         test_ui_reconcile test_gl_composite bench_composite
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")

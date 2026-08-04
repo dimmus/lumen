@@ -15,6 +15,7 @@ export import :surface;
 export import :toplevel;
 export import :shell_bridge;
 export import :cursor;
+export import :input_router;
 export import :output;
 export import :buffer_lifecycle;
 export import :protocol_managers;
@@ -65,10 +66,21 @@ struct config {
     runtime::memory_budget_config memory{};
 };
 
+namespace detail {
+struct compositor_impl;
+}
+
 class seat_manager {
 public:
     void set_focus(lx::surface_id surface);
     [[nodiscard]] lx::input::seat& seat();
+
+    /// Binds to the compositor that owns the real seat. Until then `seat()` hands back an
+    /// orphan instance so callers stay valid, and focus changes go nowhere.
+    void bind(detail::compositor_impl* impl);
+
+private:
+    detail::compositor_impl* impl_ = nullptr;
 };
 
 namespace detail {

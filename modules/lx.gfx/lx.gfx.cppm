@@ -33,6 +33,9 @@ struct device_info {
     const char* device_name = "";
     bool supports_dmabuf_import = false;
     bool supports_timeline_semaphore = false;
+    /// VK_KHR_external_semaphore_fd — required to export a frame's completion as a
+    /// sync_file, which is what lets present stop blocking the render thread.
+    bool supports_external_semaphore_fd = false;
     /// VK_EXT_image_drm_format_modifier — required to import tiled client buffers.
     bool supports_drm_format_modifier = false;
     /// VK_EXT_external_memory_dma_buf — required to export a scanout target.
@@ -375,6 +378,7 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         d.info_.supports_drm_format_modifier = has_modifier;
         d.info_.supports_queue_family_foreign = has_foreign;
         d.info_.supports_timeline_semaphore = has_timeline && has_ext_sem_fd;
+        d.info_.supports_external_semaphore_fd = has_ext_sem_fd;
 
         {
             VkPhysicalDeviceProperties props{};
@@ -405,6 +409,7 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
     // Headless-capable device for CI / no-GPU builds (or Vulkan fallback).
     d.info_.supports_dmabuf_import = false;
     d.info_.supports_timeline_semaphore = false;
+    d.info_.supports_external_semaphore_fd = false;
     d.info_.supports_dmabuf_export = false;
     d.info_.supports_drm_format_modifier = false;
     d.info_.supports_queue_family_foreign = false;
@@ -443,6 +448,7 @@ lx::gfx::vk_context lx::gfx::device::context() const {
     ctx.command_pool = vk_command_pool();
     ctx.queue_family = queue_family_;
     ctx.supports_queue_family_foreign = info_.supports_queue_family_foreign;
+    ctx.supports_external_semaphore_fd = info_.supports_external_semaphore_fd;
     return ctx;
 }
 

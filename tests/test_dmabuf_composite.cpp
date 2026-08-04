@@ -41,6 +41,18 @@ void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsign
     }
 }
 
+/// Composites and takes ownership of the frame's sync_file. Present is non-blocking now,
+/// so every composite hands back a fence the caller must consume or close — leaking one
+/// per call would exhaust the descriptor table in a long run.
+[[nodiscard]] lx::result<lx::gfx::composite_stats> composite_owned(
+    lx::gfx::vulkan_compositor& comp, lx::gfx::render_target& target, lx::color clear,
+    const lx::gfx::blit_command* cmds, unsigned count) {
+    auto stats = comp.composite(target, clear, cmds, count);
+    if (stats && stats.value().out_fence_fd >= 0)
+        ::close(stats.value().out_fence_fd);
+    return stats;
+}
+
 struct gpu_fixture {
     lx::gfx::device device{};
     lx::gfx::vulkan_compositor compositor{};
@@ -157,7 +169,7 @@ LUMEN_TEST(composite_reports_unregistered_draw) {
     cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_submitted == 0);
     LUMEN_CHECK(stats.value().draws_skipped == 1);
@@ -191,7 +203,7 @@ LUMEN_TEST(shm_upload_reaches_composited_output) {
     cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_skipped == 0);
     LUMEN_CHECK(stats.value().draws_submitted == 1);
@@ -251,7 +263,7 @@ LUMEN_TEST(dmabuf_import_reaches_composited_output) {
     cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_skipped == 0);
     LUMEN_CHECK(stats.value().draws_submitted == 1);
@@ -337,7 +349,7 @@ LUMEN_TEST(src_rect_crops_what_the_shader_samples) {
                static_cast<int>(k_height)};
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_submitted == 1);
 
@@ -369,7 +381,7 @@ LUMEN_TEST(clip_confines_the_draw_to_a_scissor) {
     cmd.clip = {0, 0, static_cast<int>(k_width / 2u), static_cast<int>(k_height / 2u)};
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_submitted == 1);
 
@@ -400,7 +412,7 @@ LUMEN_TEST(clip_outside_the_target_submits_nothing) {
     cmd.clip = {static_cast<int>(k_width) + 8, 0, 16, 16};
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_submitted == 0);
     LUMEN_CHECK(stats.value().draws_culled == 1);
@@ -422,7 +434,7 @@ LUMEN_TEST(tint_multiplies_the_sampled_color) {
     cmd.tint = lx::color::rgb(0.f, 1.f, 1.f, 1.f);
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_submitted == 1);
 
@@ -464,7 +476,7 @@ LUMEN_TEST(composite_blends_in_linear_light) {
     cmd.blend = lx::blend_mode::premultiplied;
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_submitted == 1);
 
@@ -507,7 +519,7 @@ LUMEN_TEST(opaque_draw_round_trips_through_the_linear_pipeline) {
     cmd.opacity = 1.f;
 
     LUMEN_CHECK(static_cast<bool>(
-        gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1)));
+        composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1)));
 
     unsigned char readback[k_width * k_height * 4]{};
     LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
@@ -554,7 +566,7 @@ LUMEN_TEST(composite_into_a_ten_bit_scanout_target) {
     cmd.blend = lx::blend_mode::opaque;
     cmd.opacity = 1.f;
 
-    auto stats = gpu.compositor.composite(target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    auto stats = composite_owned(gpu.compositor, target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().draws_submitted == 1);
     LUMEN_CHECK(stats.value().draws_skipped == 0);
@@ -593,7 +605,7 @@ LUMEN_TEST(output_transfer_function_changes_the_encoded_result) {
 
     const auto sample_center = [&](lx::transfer_function tf) -> unsigned {
         gpu.compositor.set_output_transfer(tf);
-        auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+        auto stats = composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
         LUMEN_CHECK(static_cast<bool>(stats));
         static unsigned char readback[k_width * k_height * 4]{};
         LUMEN_CHECK(static_cast<bool>(
@@ -612,6 +624,36 @@ LUMEN_TEST(output_transfer_function_changes_the_encoded_result) {
     LUMEN_CHECK(as_pq != as_srgb);
 
     gpu.compositor.set_output_transfer(lx::transfer_function::srgb);
+}
+
+// Present is only non-blocking when the frame's completion can be handed to KMS as a
+// sync_file. If the export silently fails the compositor still works — it just blocks the
+// render thread on the GPU every frame, which is the thing this was meant to stop. Assert
+// the export happens where the device claims to support it, so a regression to the
+// blocking path is visible rather than merely slow.
+LUMEN_TEST(composite_exports_a_sync_file_when_supported) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    if (!gpu.device.info().supports_external_semaphore_fd) {
+        std::printf("SKIP: device cannot export sync_files\n");
+        return;
+    }
+
+    constexpr unsigned texture_id = 0x4000'0040u;
+    if (!upload_split_texture(gpu, texture_id))
+        return;
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.opacity = 1.f;
+
+    auto stats = gpu.compositor.composite(gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().out_fence_fd >= 0);
+    ::close(stats.value().out_fence_fd);
 }
 
 int main(int argc, char** argv) {

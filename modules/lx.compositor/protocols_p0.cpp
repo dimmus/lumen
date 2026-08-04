@@ -18,6 +18,7 @@ module;
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-server-protocol.h"
 #include "linux-dmabuf-v1-server-protocol.h"
+#include "zlm_shell_v1-server-protocol.h"
 #endif
 #endif
 
@@ -37,6 +38,7 @@ import lx.foundation;
 import lx.wayland.server;
 import lx.gfx;
 import lx.trace;
+import lx.input;
 import :surface;
 import :toplevel;
 import :output;
@@ -887,6 +889,13 @@ const struct xdg_surface_interface xdg_surface_impl = {
                     if (mapped)
                         xs->surface->toplevel = mapped.value().id;
                 }
+                // A newly mapped window takes keyboard focus. This is the placeholder
+                // policy, not the final one — focus belongs to the shell over the policy
+                // bridge — but a window that can never be focused can never be typed into,
+                // and something has to hold focus before the shell exists.
+                if (xs->ctx->input && xs->ctx->seat) {
+                    xs->ctx->input->set_keyboard_focus(xs->surface->resource, *xs->ctx->seat);
+                }
             }
             // Send configure so the client can ack and commit.
             wl_array states{};
@@ -1206,30 +1215,30 @@ struct keymap_source {
         return cached;
 
 #if !defined(_WIN32)
-    // Minimal US layout; libxkbcommon on the client expands the includes.
-    static constexpr char k_keymap[] =
-        "xkb_keymap {\n"
-        "xkb_keycodes { include \"evdev+aliases(qwerty)\" };\n"
-        "xkb_types { include \"complete\" };\n"
-        "xkb_compat { include \"complete\" };\n"
-        "xkb_symbols { include \"pc+us+inet(evdev)\" };\n"
-        "xkb_geometry { include \"pc(pc105)\" };\n"
-        "};\n";
+    // The real compiled keymap, from the same xkb state the compositor tracks modifiers
+    // with. It used to be a hardcoded US string, which meant every client saw a US layout
+    // whatever the user had configured, and the compositor's own idea of the keyboard did
+    // not exist at all.
+    //
+    // Compiled once and cached: it is identical for every client, and the fd is duped by
+    // libwayland on each send.
+    static lx::input::keyboard_keymap keymap{};
+    if (!keymap.valid()) {
+        if (auto compiled = keymap.compile(); !compiled) {
+            lx::trace::logger::global().log_error(compiled.get_error(), "compositor.seat");
+            return cached;
+        }
+    }
 
-    const int fd = ::memfd_create("lumen-keymap", MFD_CLOEXEC);
-    if (fd < 0)
-        return cached;
-
-    const auto nbytes = static_cast<uint32_t>(sizeof(k_keymap) - 1u);
-    if (::ftruncate(fd, static_cast<off_t>(nbytes)) != 0 ||
-        ::write(fd, k_keymap, nbytes) != static_cast<ssize_t>(nbytes) ||
-        ::lseek(fd, 0, SEEK_SET) != 0) {
-        ::close(fd);
+    unsigned size = 0;
+    auto fd = keymap.keymap_fd(size);
+    if (!fd) {
+        lx::trace::logger::global().log_error(fd.get_error(), "compositor.seat");
         return cached;
     }
 
-    cached.fd = fd;
-    cached.size = nbytes;
+    cached.fd = std::move(fd).value().release();
+    cached.size = size;
 #endif
     return cached;
 }
@@ -1247,7 +1256,13 @@ const struct wl_seat_interface seat_impl = {
                 .release = [](struct wl_client*,
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
-            wl_resource_set_implementation(res, &impl, nullptr, nullptr);
+            // Unregister on destroy, or the router keeps sending into freed resources.
+            wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
+                if (g_p0_ctx && g_p0_ctx->input)
+                    g_p0_ctx->input->remove(r);
+            });
+            if (g_p0_ctx && g_p0_ctx->input)
+                g_p0_ctx->input->add_pointer(res);
         },
     .get_keyboard =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -1259,7 +1274,10 @@ const struct wl_seat_interface seat_impl = {
                 .release = [](struct wl_client*,
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
-            wl_resource_set_implementation(res, &impl, nullptr, nullptr);
+            wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
+                if (g_p0_ctx && g_p0_ctx->input)
+                    g_p0_ctx->input->remove(r);
+            });
 
             const keymap_source& keymap = shared_keymap();
             if (keymap.fd < 0) {
@@ -1272,6 +1290,11 @@ const struct wl_seat_interface seat_impl = {
                                    keymap.size);
             if (wl_resource_get_version(res) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
                 wl_keyboard_send_repeat_info(res, 40, 400);
+
+            // Registered only after the keymap is sent: a client that receives `enter`
+            // before it knows the layout cannot interpret the keys it is told are held.
+            if (g_p0_ctx && g_p0_ctx->input)
+                g_p0_ctx->input->add_keyboard(res);
         },
     .get_touch =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -1283,7 +1306,12 @@ const struct wl_seat_interface seat_impl = {
                 .release = [](struct wl_client*,
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
-            wl_resource_set_implementation(res, &impl, nullptr, nullptr);
+            wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
+                if (g_p0_ctx && g_p0_ctx->input)
+                    g_p0_ctx->input->remove(r);
+            });
+            if (g_p0_ctx && g_p0_ctx->input)
+                g_p0_ctx->input->add_touch(res);
         },
     .release =
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
@@ -1306,6 +1334,123 @@ void bind_seat(wayland::client_connection& client, unsigned id, int version) {
         if (version >= 2)
             wl_seat_send_name(native, "default");
     }
+}
+
+// ── zlm_shell_v1 (privileged) ──────────────────────────────────────────────
+//
+// The seam docs/architecture.md is built around: the shell is an ordinary Wayland client
+// except that it may bind this, and window-management intent flows over the policy bridge
+// while the compositor keeps ownership of the state. Both sides were scaffolded and the
+// global was never advertised, so lumen-shell connected and found nothing to bind.
+//
+// Advertised to every client but bound only by one that passes the privilege check —
+// rather than hidden from the registry — so a rejected bind is a protocol error the shell
+// can report, instead of a global that mysteriously does not exist.
+
+// Requests are accepted and routed to shell_bridge, which owns the decision. The bodies
+// that are still empty are the ones whose compositor-side action does not exist yet
+// (move/resize interaction, workspace objects, rule persistence) — they are declared here
+// so the shell can bind and drive what does work, rather than failing at bind.
+const struct zlm_policy_bridge_v1_interface policy_bridge_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .request_activate =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {
+            if (g_p0_ctx && g_p0_ctx->shell && toplevel) {
+                g_p0_ctx->shell->on_request_activate(
+                    lx::toplevel_id{reinterpret_cast<unsigned long long>(toplevel)});
+            }
+        },
+    .request_raise = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .request_lower = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .set_toplevel_stacking_index =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel,
+           uint32_t index) {
+            if (g_p0_ctx && g_p0_ctx->shell && toplevel) {
+                g_p0_ctx->shell->on_set_stacking_index(
+                    lx::toplevel_id{reinterpret_cast<unsigned long long>(toplevel)}, index);
+            }
+        },
+    .request_move = [](struct wl_client*, struct wl_resource*, struct wl_resource*,
+                       struct wl_resource*, uint32_t) {},
+    .request_resize = [](struct wl_client*, struct wl_resource*, struct wl_resource*,
+                         struct wl_resource*, uint32_t, uint32_t) {},
+};
+
+const struct zlm_workspace_manager_v1_interface workspace_manager_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .create_workspace = [](struct wl_client*, struct wl_resource*, uint32_t, const char*) {},
+    .destroy_workspace = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .set_active = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .reorder_workspace =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource*, uint32_t) {},
+};
+
+const struct zlm_window_rules_v1_interface window_rules_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .reload_rules = [](struct wl_client*, struct wl_resource*) {},
+    .set_workspace_rule =
+        [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
+    .set_monitor_rule = [](struct wl_client*, struct wl_resource*, const char*, const char*) {},
+    .set_geometry_rule = [](struct wl_client*, struct wl_resource*, const char*, int32_t,
+                            int32_t, int32_t, int32_t) {},
+    .set_state_rule = [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
+    .set_decoration_rule = [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
+};
+
+const struct zlm_shell_v1_interface shell_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .get_workspace_manager =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
+            wl_resource* res = wl_resource_create(client, &zlm_workspace_manager_v1_interface,
+                                                  wl_resource_get_version(resource), id);
+            if (!res)
+                return;
+            wl_resource_set_implementation(res, &workspace_manager_impl, g_p0_ctx, nullptr);
+        },
+    .get_policy_bridge =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
+            wl_resource* res = wl_resource_create(client, &zlm_policy_bridge_v1_interface,
+                                                  wl_resource_get_version(resource), id);
+            if (!res)
+                return;
+            wl_resource_set_implementation(res, &policy_bridge_impl, g_p0_ctx, nullptr);
+            // The shell's first act is to learn the current state — ADR-004 §5's
+            // session-startup path. Emitted on bridge creation rather than on shell bind,
+            // because the bridge is the object the events are addressed to.
+            if (g_p0_ctx && g_p0_ctx->shell && g_p0_ctx->toplevels) {
+                g_p0_ctx->shell->emit_snapshot(
+                    lx::client_id{reinterpret_cast<unsigned long long>(client)},
+                    *g_p0_ctx->toplevels);
+            }
+        },
+    .get_window_rules =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
+            wl_resource* res = wl_resource_create(client, &zlm_window_rules_v1_interface,
+                                                  wl_resource_get_version(resource), id);
+            if (!res)
+                return;
+            wl_resource_set_implementation(res, &window_rules_impl, g_p0_ctx, nullptr);
+        },
+};
+
+void bind_shell(wayland::client_connection& client, unsigned id, int version) {
+    if (!g_p0_ctx || !g_p0_ctx->server)
+        return;
+
+    // Privilege is checked at bind, against the connecting peer's credentials — not at
+    // advertisement. A client that is not the shell gets a protocol error naming the
+    // reason, which is debuggable; silently omitting the global is not.
+    if (!g_p0_ctx->server->allow_privileged_global(client.credentials(), "zlm_shell_v1")) {
+        auto reject = wayland::resource::create(client, &zlm_shell_v1_interface, version, id);
+        if (reject)
+            reject.post_error(0, "zlm_shell_v1 is restricted to the session shell");
+        return;
+    }
+
+    auto res = wayland::resource::create(client, &zlm_shell_v1_interface, version, id);
+    if (!res)
+        return;
+    res.set_implementation(&shell_impl, g_p0_ctx, nullptr);
 }
 
 // ── wl_output ──────────────────────────────────────────────────────────────
@@ -1492,6 +1637,12 @@ void install_core(p0_protocol_context& ctx) {
                             .privileged = false,
                             .interface_desc = &xdg_wm_base_interface},
                            &bind_xdg_wm_base);
+    ctx.server->add_global({.interface_name = "zlm_shell_v1",
+                            .version = 1,
+                            .privileged = true,
+                            .interface_desc = &zlm_shell_v1_interface},
+                           bind_shell);
+
     ctx.server->add_global({.interface_name = "zwp_linux_dmabuf_v1",
                             .version = 5,
                             .privileged = false,
