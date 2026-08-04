@@ -406,6 +406,30 @@ reads like a scheduling note.
   `color-management-v1` to negotiate with clients and the KMS `HDR_OUTPUT_METADATA` and
   `COLOR_ENCODING` properties to tell the display. The pipeline is ready; the plumbing
   above and below it is not.
+- **D5, in detail, because it is the largest thing left.** The frame loop is coupled to a
+  single output in about fifty places: `vk_targets_`, `scanout_fbs_`, `dumb_fbs_`,
+  `gl_targets_` are indexed by scanout slot alone, the flip state (`pending_flip_slot_`,
+  `scanout_front_`, `composited_slot_`, `composited_fence_fd_`) is scalar, `req.connector`
+  is hardcoded to 0, and the mode is read as `active_mode(0)`. `scene_graph` owns one
+  `snapshot_buffer` and `commit_frame` publishes one draw list.
+
+  A workable order, each step verifiable on its own:
+
+  1. Group the per-output state into a `present_output` struct — targets, slots, flip
+     state, fence, and its own `repaint_scheduler` — and instantiate exactly one. Pure
+     refactor, behavior unchanged, and it is what makes the rest mechanical rather than a
+     rewrite. Doing this alone is worthwhile even if the rest waits.
+  2. Give each `present_output` its own repaint schedule. Refresh rates differ per display,
+     so one clock cannot serve two: this is why the scheduler was built around a period it
+     is told rather than a global constant.
+  3. Make the scene emit a draw list per output, with per-output damage. `snapshot_buffer`
+     becomes one instance per output rather than one per compositor.
+  4. Per-output KMS commit, replacing the hardcoded connector.
+
+  Step 1 is the one that pays for itself immediately — the ADR's original point was that
+  carrying an output index costs little now and becomes a rewrite once the pipeline has
+  twenty stages.
+
 - **D4's remainder: the Vulkan 1.3 baseline and draw batching.** `apiVersion` is still
   `VK_API_VERSION_1_1` with legacy render passes and framebuffers. Moving to 1.3 core buys
   dynamic rendering (deleting the render-pass and framebuffer plumbing outright),
@@ -503,7 +527,11 @@ Follow-on from the above:
     **Not done:** the Vulkan 1.3 baseline itself (still 1.1), dynamic rendering,
     synchronization2, a dedicated transfer queue, and batched/instanced draws — see
     "Needs revisiting".
-12. [ ] D5 — per-output frame loop
+12. [ ] **D5 — not started.** Deliberately: it is the one item here that cannot be done in
+    a useful partial state. Half a per-output frame loop has ambiguous ownership of flip
+    state — which output's flip is pending, which slot is on screen — and that is worse
+    than the honest single-output loop it replaces, because the ambiguity is invisible
+    until two displays are attached. Scope and a workable order are below.
 
 ---
 
