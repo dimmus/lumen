@@ -7,6 +7,19 @@ LUMEN_TEST_VKMS=1 ./test_kms_vulkan_scanout
 # TTY (needs DRM master, not nested GNOME)
 chmod +x scripts/tty-smoke.sh && ./scripts/tty-smoke.sh lumen-smoke
 
+# Input, end to end: does a keystroke reach a client? Run from the TTY you logged into.
+./scripts/input-smoke.sh 30
+
+Runs unattended and writes logs, because there is nowhere to watch it — the compositor
+takes DRM master and puts the console into graphics mode, so there is no second terminal
+and stdout is not visible while it runs. Type and move the mouse during the countdown; the
+verdict prints once the console comes back.
+
+It checks the halves separately, because they fail for different reasons and the fix
+differs. lumen-input-probe covers devices, libinput and xkb; wev covers routing to a
+client. If the probe fails the script stops there rather than starting a compositor, since
+a client test on top of a dead input stack only adds noise.
+
 # Sanitizers
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan
 cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan

@@ -10,6 +10,10 @@ compile_commands.json
 # Fetched upstream protocols (run scripts/fetch-protocols.sh)
 /protocols/upstream/
 
+# Diagnostic output from scripts/input-smoke.sh and lumen-input-probe
+/input-smoke-logs/
+lumen-input-probe.log
+
 # IDE
 .vscode/
 .idea/
