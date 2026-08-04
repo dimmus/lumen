@@ -7,9 +7,11 @@ import lx.foundation;
 import lx.sync;
 import lx.wayland.server;
 import lx.gfx;
+import lx.input;
 
 export module lx.compositor:protocols_p0;
 
+import :input_router;
 import :surface;
 import :toplevel;
 import :output;
@@ -130,6 +132,11 @@ private:
 /// Context shared by all P0 protocol handlers (owned by compositor_impl).
 struct p0_protocol_context {
     wayland::server* server = nullptr;
+    /// Delivers seat events to focused clients. Null until the compositor supplies one, in
+    /// which case seat objects are still created but nothing is routed.
+    input_router* input = nullptr;
+    /// The seat's serial counter and keyboard state, owned by the compositor.
+    lx::input::seat* seat = nullptr;
     surface_manager* surfaces = nullptr;
     toplevel_manager* toplevels = nullptr;
     output_manager* outputs = nullptr;

@@ -1,7 +1,9 @@
 module;
 
 #include <atomic>
+#include <cerrno>
 #include <chrono>
+#include <fcntl.h>
 #include <condition_variable>
 #include <memory>
 #include <mutex>
@@ -43,6 +45,12 @@ struct compositor_impl {
     runtime::memory_budget_coordinator memory_{};
     output_manager outputs{};
     seat_manager seats{};
+    input_router input_router_{};
+    /// Owns the seat's serial counter and xkb state. `seat_manager` exposes it; the
+    /// protocol handlers and the libinput feed both drive it.
+    lx::input::seat input_seat_{};
+    lx::input::input_manager input_devices_{};
+    bool input_ready_ = false;
     scheduler::frame_scheduler scheduler_{};
     scheduler::presentation_tracker presentation_{};
     scheduler::budget_tracker budget_{};
@@ -167,6 +175,16 @@ struct compositor_impl {
     std::unique_ptr<runtime::timer_source> vsync_timer{};
     std::unique_ptr<runtime::fd_source> wayland_fd_source{};
     std::unique_ptr<runtime::fd_source> drm_fd_source{};
+    std::unique_ptr<runtime::fd_source> input_fd_source{};
+
+    /// UI thread. Brings up libinput and routes its events to focused clients.
+    void start_input();
+    static void input_ready_callback();
+    void on_input_key(const lx::input::key_event& event);
+    void on_input_pointer_motion(const lx::input::pointer_motion_event& event);
+    void on_input_pointer_button(const lx::input::pointer_button_event& event);
+    void on_input_pointer_axis(const lx::input::pointer_axis_event& event);
+    void on_input_modifiers(const lx::input::modifier_state& mods);
 
     std::thread render_thread{};
     std::thread worker_thread{};
@@ -194,6 +212,7 @@ struct compositor_impl {
         surfaces.set_import_cache(&import_cache);
         surfaces.set_scene(&scene);
         frame_renderer_.set_pipeline_cache(&pipeline_cache_);
+        seats.bind(this);
     }
 
     ~compositor_impl() { delete[] blits_; }
@@ -246,6 +265,98 @@ struct compositor_impl {
 
 compositor_impl* compositor_impl::active = nullptr;
 
+void compositor_impl::input_ready_callback() {
+    if (active)
+        (void)active->input_devices_.dispatch();
+}
+
+void compositor_impl::on_input_key(const lx::input::key_event& event) {
+    input_router_.send_key(event, input_seat_);
+}
+
+void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) {
+    input_router_.send_modifiers(mods, input_seat_);
+}
+
+void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_event& event) {
+    // Keep the pointer on screen. Output geometry is the compositor's to know — libinput
+    // reports deltas and has no idea how large the desktop is.
+    if (outputs.count() > 0)
+        input_seat_.constrain_pointer(outputs.geometry(outputs.nth(0)));
+    cursor_.update_from_seat(input_seat_);
+    // Surface-local coordinates: with one output at the origin these coincide with global
+    // ones. Per-surface hit-testing lands with D5's per-output loop, which is what makes
+    // "which surface is under this point" well defined across several displays.
+    input_router_.send_pointer_motion(input_seat_.pointer_x(), input_seat_.pointer_y(),
+                                      event.time_ms);
+}
+
+void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_event& event) {
+    input_router_.send_pointer_button(event, input_seat_);
+}
+
+void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
+    input_router_.send_pointer_axis(event);
+}
+
+void compositor_impl::start_input() {
+    // Device nodes are opened through logind when there is a session; without one libinput
+    // falls back to opening them directly, which works for root or a member of the input
+    // group and fails cleanly otherwise.
+    lx::input::device_provider provider{};
+    provider.user = this;
+    provider.open_device = [](const char* path, int flags, void* user) -> int {
+        auto* self = static_cast<compositor_impl*>(user);
+        if (self) {
+            if (auto taken = self->logind_.take_device_path(path); taken)
+                return std::move(taken).value().release();
+        }
+        const int fd = ::open(path, flags | O_CLOEXEC);
+        return fd < 0 ? -errno : fd;
+    };
+    provider.close_device = [](int fd, void*) { ::close(fd); };
+
+    auto opened = lx::input::input_manager::open(provider);
+    if (!opened) {
+        // Not fatal. A compositor with no seat still composites — it is useful headless and
+        // in CI — but say so plainly, because "nothing happens when I type" is otherwise a
+        // long debugging session.
+        lx::trace::logger::global().log_error(opened.get_error(), "compositor.input");
+        return;
+    }
+    input_devices_ = std::move(opened).value();
+
+    lx::input::event_sink sink{};
+    sink.user = this;
+    sink.key = [](const lx::input::key_event& e, void* u) {
+        static_cast<compositor_impl*>(u)->on_input_key(e);
+    };
+    sink.modifiers = [](const lx::input::modifier_state& m, void* u) {
+        static_cast<compositor_impl*>(u)->on_input_modifiers(m);
+    };
+    sink.pointer_motion = [](const lx::input::pointer_motion_event& e, void* u) {
+        static_cast<compositor_impl*>(u)->on_input_pointer_motion(e);
+    };
+    sink.pointer_button = [](const lx::input::pointer_button_event& e, void* u) {
+        static_cast<compositor_impl*>(u)->on_input_pointer_button(e);
+    };
+    sink.pointer_axis = [](const lx::input::pointer_axis_event& e, void* u) {
+        static_cast<compositor_impl*>(u)->on_input_pointer_axis(e);
+    };
+    input_devices_.set_sink(sink);
+
+    // Share the keymap the device layer compiled, so the state the compositor tracks and
+    // the state clients are told about are the same one.
+    if (const int fd = input_devices_.fd(); fd >= 0) {
+        input_fd_source = std::make_unique<runtime::fd_source>(
+            fd, &compositor_impl::input_ready_callback);
+        loop.add_source(input_fd_source.get());
+        input_ready_ = true;
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.input",
+                                        "libinput seat opened");
+    }
+}
+
 void compositor_impl::on_memory_pressure(lx::runtime::memory_pressure level, void* self) {
     if (self) static_cast<compositor_impl*>(self)->handle_memory_pressure(level);
 }
@@ -280,6 +391,8 @@ void compositor_impl::drm_fd_callback() {
 void compositor_impl::register_p0_globals() {
     p0_.server = &wayland;
     p0_.surfaces = &surfaces;
+    p0_.input = &input_router_;
+    p0_.seat = &input_seat_;
     p0_.toplevels = &toplevels;
     p0_.outputs = &outputs;
     p0_.headless = &headless_;
@@ -815,12 +928,23 @@ void compositor_impl::worker_loop() {
 
 namespace lx::compositor {
 
-void seat_manager::set_focus(lx::surface_id) {}
+void seat_manager::set_focus(lx::surface_id surface) {
+    if (impl_)
+        impl_->input_seat_.set_keyboard_focus(surface);
+}
 
 lx::input::seat& seat_manager::seat() {
-    static lx::input::seat s;
-    return s;
+    // Falls back to a shared instance only when unbound, so callers always get something
+    // valid — but an unbound manager means focus changes go nowhere, which is worth not
+    // hiding behind a silent default.
+    if (!impl_) {
+        static lx::input::seat orphan;
+        return orphan;
+    }
+    return impl_->input_seat_;
 }
+
+void seat_manager::bind(detail::compositor_impl* impl) { impl_ = impl; }
 
 compositor::compositor(config cfg) {
     impl_ = new detail::compositor_impl{this, cfg};
@@ -982,6 +1106,7 @@ lx::result<void> compositor::start() {
     }
 
     impl_->register_p0_globals();
+    impl_->start_input();
 
     if (auto installed = impl_->shell_bridge_.install(impl_->cfg.shell_binary_path); !installed) {
         lx::trace::logger::global().log_error(installed.get_error(), "compositor");

@@ -888,6 +888,13 @@ const struct xdg_surface_interface xdg_surface_impl = {
                     if (mapped)
                         xs->surface->toplevel = mapped.value().id;
                 }
+                // A newly mapped window takes keyboard focus. This is the placeholder
+                // policy, not the final one — focus belongs to the shell over the policy
+                // bridge — but a window that can never be focused can never be typed into,
+                // and something has to hold focus before the shell exists.
+                if (xs->ctx->input && xs->ctx->seat) {
+                    xs->ctx->input->set_keyboard_focus(xs->surface->resource, *xs->ctx->seat);
+                }
             }
             // Send configure so the client can ack and commit.
             wl_array states{};
@@ -1248,7 +1255,13 @@ const struct wl_seat_interface seat_impl = {
                 .release = [](struct wl_client*,
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
-            wl_resource_set_implementation(res, &impl, nullptr, nullptr);
+            // Unregister on destroy, or the router keeps sending into freed resources.
+            wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
+                if (g_p0_ctx && g_p0_ctx->input)
+                    g_p0_ctx->input->remove(r);
+            });
+            if (g_p0_ctx && g_p0_ctx->input)
+                g_p0_ctx->input->add_pointer(res);
         },
     .get_keyboard =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -1260,7 +1273,10 @@ const struct wl_seat_interface seat_impl = {
                 .release = [](struct wl_client*,
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
-            wl_resource_set_implementation(res, &impl, nullptr, nullptr);
+            wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
+                if (g_p0_ctx && g_p0_ctx->input)
+                    g_p0_ctx->input->remove(r);
+            });
 
             const keymap_source& keymap = shared_keymap();
             if (keymap.fd < 0) {
@@ -1273,6 +1289,11 @@ const struct wl_seat_interface seat_impl = {
                                    keymap.size);
             if (wl_resource_get_version(res) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
                 wl_keyboard_send_repeat_info(res, 40, 400);
+
+            // Registered only after the keymap is sent: a client that receives `enter`
+            // before it knows the layout cannot interpret the keys it is told are held.
+            if (g_p0_ctx && g_p0_ctx->input)
+                g_p0_ctx->input->add_keyboard(res);
         },
     .get_touch =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -1284,7 +1305,12 @@ const struct wl_seat_interface seat_impl = {
                 .release = [](struct wl_client*,
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
-            wl_resource_set_implementation(res, &impl, nullptr, nullptr);
+            wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
+                if (g_p0_ctx && g_p0_ctx->input)
+                    g_p0_ctx->input->remove(r);
+            });
+            if (g_p0_ctx && g_p0_ctx->input)
+                g_p0_ctx->input->add_touch(res);
         },
     .release =
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },

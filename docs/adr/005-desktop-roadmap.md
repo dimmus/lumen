@@ -112,22 +112,48 @@ no colour emoji, which caps the toolkit well below usable regardless of which AP
 Sequenced by dependency, not by appeal. Each phase is independently shippable and leaves the
 tree in a coherent state.
 
-### Phase 0 — Make it accept input (blocks everything)
+### Phase 0 — Make it accept input (blocks everything) — **DONE**
 
-1. **libinput + logind device handling.** Open devices through the existing
-   `lx.session.logind_session` (`TakeDevice`), feed the fd into the event loop as an
-   `fd_source`, handle VT switch and device add/remove.
-2. **Server-side xkbcommon.** Real keymap from config, modifier state, layout groups,
-   compose, and key repeat with the client's requested rate. Send the *compiled* keymap
-   rather than today's hardcoded string.
-3. **`wl_seat` for real.** Pointer enter/leave/motion/button/axis, keyboard
-   enter/leave/key/modifiers, correct serials, and `wl_touch`. Serial correctness matters
-   more than it looks: it gates drag-and-drop, popup grabs and activation.
-4. **Focus.** Wire `seat_manager` to `toplevel_manager` so focus follows the WM's stacking
-   decisions, with click-to-focus and keyboard focus separable.
+> **Landed.** `lx.input` went from 86 lines of empty bodies to a real xkb keyboard state
+> plus a libinput device layer, and events now reach clients. Details under each step.
+
+1. [x] **libinput + logind device handling.** Devices open through a `device_provider`, so
+   `lx.input` does not depend on `lx.session` and the seat stays testable against fixtures;
+   the compositor supplies logind `TakeDevice` with a direct-open fallback. libinput's fd is
+   an `fd_source` on the event loop. `suspend`/`resume` are exposed for VT switching — the
+   fds must be released or the next session cannot claim them. Device add/remove is counted.
+2. [x] **Server-side xkbcommon.** Real keymap compiled from configuration, with depressed,
+   latched and locked modifiers tracked separately, named-modifier lookup for compositor
+   keybindings, and per-key repeat flags. Clients receive the *compiled* keymap over a
+   sealed memfd instead of the hardcoded US string — sealed because every client maps it
+   shared, and without `F_SEAL_SHRINK` one of them could resize it under the others. Tested
+   by checking a German layout produces `z` where US produces `y`, which the old string made
+   impossible. The evdev→xkb keycode offset of 8 is applied in exactly one place; wrong by
+   eight produces plausible letters, so it hides.
+3. [x] **`wl_seat` for real.** `compositor::input_router` tracks every seat-derived
+   resource per client and delivers keyboard enter/leave/key/modifiers and pointer
+   enter/leave/motion/button/axis, with `axis_source` and v120 discrete values so a wheel
+   notch and a touchpad drag are distinguishable. `enter` carries the held-key array and is
+   followed immediately by modifiers, or a client inherits stuck modifiers across a focus
+   change. Resources unregister on destroy, so the router cannot send into freed memory.
+   Serials come from the seat's single monotonic counter.
+4. [~] **Focus — placeholder policy.** A newly mapped toplevel takes keyboard focus, and
+   `seat_manager` is bound to the compositor's real seat rather than a function-local one
+   nothing else could see. Pointer and keyboard focus are tracked separately, which is what
+   lets click-to-focus and focus-follows-mouse differ. **Not yet:** focus as a shell
+   decision over the policy bridge, and per-surface pointer hit-testing — the latter wants
+   D5's per-output loop, which is what makes "the surface under this point" well defined
+   across several displays.
 
 *Done when:* a real client receives a keystroke and a click, and `wev`/`weston-info` show a
 correct seat. This is the milestone that turns Lumen from a renderer into a compositor.
+
+**Verification status.** Everything above is unit-tested without hardware — 15 tests over
+keymap compilation, modifier tracking, locked-vs-held, serial monotonicity and the held-key
+set. The end-to-end path *cannot* be verified in this environment: it needs a seat with real
+devices and permission to open them. The honest test is `wev` under a real session, and it
+has not been run. Treat Phase 0 as complete in construction and unproven in the field until
+someone types into it.
 
 ### Phase 1 — Make it a desktop
 
