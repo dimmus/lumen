@@ -78,6 +78,10 @@ struct surface_obj {
     surface_pending pending{};
     surface_pending current{};
     bool used = false;
+    /// The buffer whose content this surface is currently showing. Kept as an id rather
+    /// than the `wl_resource*` because the client may destroy the buffer object while the
+    /// content stays on screen — which is exactly the case that has to keep working.
+    lx::buffer_id current_buffer_id{};
     // Role
     wl_resource* xdg_surface = nullptr;
     wl_resource* xdg_toplevel = nullptr;
@@ -208,26 +212,52 @@ buffer_obj* find_buffer(wl_resource* res) {
 
 extern p0_protocol_context* g_p0_ctx;
 
+/// Queues a dated retirement for a texture.
+///
+/// Dated, because queue order alone is not enough: a snapshot published while the texture
+/// was alive can still be waiting to composite, and it references the texture by id. Being
+/// one frame conservative costs a frame of texture memory; being one frame early drops a
+/// texture out from under a draw.
+void retire_texture(unsigned texture_id) {
+    if (!g_p0_ctx || !g_p0_ctx->textures || texture_id == 0)
+        return;
+    texture_update forget{};
+    forget.kind = texture_update::op::forget;
+    forget.texture_id = texture_id;
+    forget.retire_after_frame = g_p0_ctx->frame_index + 1;
+    (void)g_p0_ctx->textures->try_push(forget);
+}
+
+/// True while some surface is still showing this buffer.
+bool buffer_is_displayed(struct wl_resource* buffer_resource) {
+    if (!buffer_resource)
+        return false;
+    for (auto& s : surfaces) {
+        if (s.used && s.current.buffer == buffer_resource)
+            return true;
+    }
+    return false;
+}
+
 void destroy_buffer(buffer_obj* b) {
     if (!b || !b->used)
         return;
-    // Retire the GPU-side texture — but not before the render thread has finished with it.
-    // Queue order alone is not enough: a snapshot published while this buffer was still
-    // alive can still be waiting to composite, and it references the texture by id. Date
-    // the retirement so the render thread can hold it until that snapshot has been drawn.
+
+    // Destroying a wl_buffer does not take the content off the screen. The protocol is
+    // explicit that a surface keeps displaying what it was given until a new buffer is
+    // committed, and clients rely on it — the usual pattern is attach, commit, destroy the
+    // buffer object immediately, because the compositor has either copied the pixels (shm)
+    // or holds its own reference (dma-buf, via a duplicated fd).
     //
-    // The next frame is the first one guaranteed not to reference it: the surface node is
-    // detached on this thread before the next `commit_frame` publishes a draw list. Being
-    // one frame conservative costs a frame of texture memory; being one frame early drops
-    // a texture out from under a draw.
-    if (g_p0_ctx && g_p0_ctx->textures && b->id) {
-        texture_update forget{};
-        forget.kind = texture_update::op::forget;
-        forget.texture_id = g_p0_ctx->surfaces ? g_p0_ctx->surfaces->texture_for(b->id) : 0;
-        forget.retire_after_frame = g_p0_ctx->frame_index + 1;
-        if (forget.texture_id != 0)
-            (void)g_p0_ctx->textures->try_push(forget);
-    }
+    // Retiring here regardless is what made a window render for about a second and then
+    // vanish: the texture was dropped while the scene was still drawing it, and every
+    // frame after that skipped the draw. The retirement belongs where the surface stops
+    // referencing the content — a new commit, or the surface being destroyed.
+    const unsigned texture_id =
+        g_p0_ctx && g_p0_ctx->surfaces ? g_p0_ctx->surfaces->texture_for(b->id) : 0;
+    if (texture_id != 0 && !buffer_is_displayed(b->resource))
+        retire_texture(texture_id);
+
     b->dmabuf = {};
     *b = {};
 }
@@ -407,6 +437,10 @@ void surface_destroy_resource(struct wl_resource* resource) {
     auto* s = find_surface(resource);
     if (!s)
         return;
+    // Last chance to retire the content this surface was showing: with the surface gone,
+    // nothing else will ever reference its texture.
+    if (s->ctx && s->ctx->surfaces && s->current_buffer_id)
+        retire_texture(s->ctx->surfaces->texture_for(s->current_buffer_id));
     if (s->ctx && s->ctx->surfaces)
         s->ctx->surfaces->destroy(s->id);
     *s = {};
@@ -467,6 +501,14 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
 
     // Apply pending → current
     if (s->pending.buffer_set) {
+        // The surface is about to stop showing its previous content. If that buffer object
+        // is already gone, this is the point its texture becomes unreachable and can be
+        // retired — destroy_buffer deliberately left it alone while it was still on screen.
+        if (s->current.buffer && s->current.buffer != s->pending.buffer &&
+            !find_buffer(s->current.buffer)) {
+            if (s->ctx && s->ctx->surfaces)
+                retire_texture(s->ctx->surfaces->texture_for(s->current_buffer_id));
+        }
         s->current.buffer = s->pending.buffer;
         s->pending.buffer_set = false;
     }
@@ -544,6 +586,8 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
         commit.damage = s->current.damage;
     else
         commit.damage = {0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
+
+    s->current_buffer_id = buf->id;
 
     auto result = s->ctx->surfaces->on_commit(static_cast<lx::compositor::surface_commit&&>(commit));
     if (!result) {
