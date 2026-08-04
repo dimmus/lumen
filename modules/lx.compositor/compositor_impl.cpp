@@ -189,6 +189,14 @@ struct compositor_impl {
     /// otherwise fires every frame.
     void report_unregistered_draw(const gfx::blit_command* blits, unsigned count);
     bool reported_unregistered_ = false;
+
+    /// Render affinity. Traces the first few texture registrations and retirements.
+    /// "Content appears, then goes black" is a lifecycle question — which id was drawn,
+    /// which was retired, and whether replacements kept arriving — and none of that is
+    /// answerable from a single warning at the point the draw fails.
+    static constexpr unsigned k_texture_trace_limit = 16;
+    unsigned texture_trace_count_ = 0;
+    void trace_texture_op(const char* op, unsigned texture_id, bool ok);
     static void input_ready_callback();
     void on_input_key(const lx::input::key_event& event);
     void on_input_pointer_motion(const lx::input::pointer_motion_event& event);
@@ -307,6 +315,17 @@ void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_ev
 
 void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
     input_router_.send_pointer_axis(event);
+}
+
+void compositor_impl::trace_texture_op(const char* op, unsigned texture_id, bool ok) {
+    if (texture_trace_count_ >= k_texture_trace_limit)
+        return;
+    ++texture_trace_count_;
+    char line[128];
+    std::snprintf(line, sizeof(line), "texture %s id=%u%s%s", op, texture_id,
+                  ok ? "" : " FAILED",
+                  texture_trace_count_ == k_texture_trace_limit ? " (trace ends here)" : "");
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.texture", line);
 }
 
 void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
@@ -541,6 +560,7 @@ void compositor_impl::apply_due_forgets(unsigned composited_frame) {
         // difference stays small and this keeps working across the counter's wrap.
         if (static_cast<int>(composited_frame - pending.retire_after_frame) < 0)
             continue;
+        trace_texture_op("retire-applied", pending.texture_id, true);
         apply_forget(pending.texture_id);
         pending = {};
     }
@@ -625,6 +645,13 @@ void compositor_impl::drain_texture_updates() {
         }
         if (!applied)
             lx::trace::logger::global().log_error(applied.get_error(), "compositor.render");
+
+        if (update.kind == texture_update::op::shm)
+            trace_texture_op("upload", update.texture_id, static_cast<bool>(applied));
+        else if (update.kind == texture_update::op::dmabuf)
+            trace_texture_op("import", update.texture_id, static_cast<bool>(applied));
+        else if (update.kind == texture_update::op::forget)
+            trace_texture_op("retire-queued", update.texture_id, true);
     }
 }
 
