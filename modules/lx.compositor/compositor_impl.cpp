@@ -46,9 +46,12 @@ struct compositor_impl {
     output_manager outputs{};
     seat_manager seats{};
     input_router input_router_{};
-    /// Owns the seat's serial counter and xkb state. `seat_manager` exposes it; the
-    /// protocol handlers and the libinput feed both drive it.
-    lx::input::seat input_seat_{};
+    /// One seat, owned by the device layer. It has to be one: the libinput feed maintains
+    /// the xkb state and the held-key set on it, and the router reads both when it sends
+    /// `enter`. With two, the router's copy has no compiled keymap and every focus change
+    /// reports no modifiers and no held keys — which looks like a protocol bug and is not.
+    /// `input_manager` is default-constructible, so this is valid even when no device ever
+    /// opens, and its address is stable across the move-assignment in `start_input`.
     lx::input::input_manager input_devices_{};
     bool input_ready_ = false;
     scheduler::frame_scheduler scheduler_{};
@@ -271,28 +274,28 @@ void compositor_impl::input_ready_callback() {
 }
 
 void compositor_impl::on_input_key(const lx::input::key_event& event) {
-    input_router_.send_key(event, input_seat_);
+    input_router_.send_key(event, input_devices_.default_seat());
 }
 
 void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) {
-    input_router_.send_modifiers(mods, input_seat_);
+    input_router_.send_modifiers(mods, input_devices_.default_seat());
 }
 
 void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_event& event) {
     // Keep the pointer on screen. Output geometry is the compositor's to know — libinput
     // reports deltas and has no idea how large the desktop is.
     if (outputs.count() > 0)
-        input_seat_.constrain_pointer(outputs.geometry(outputs.nth(0)));
-    cursor_.update_from_seat(input_seat_);
+        input_devices_.default_seat().constrain_pointer(outputs.geometry(outputs.nth(0)));
+    cursor_.update_from_seat(input_devices_.default_seat());
     // Surface-local coordinates: with one output at the origin these coincide with global
     // ones. Per-surface hit-testing lands with D5's per-output loop, which is what makes
     // "which surface is under this point" well defined across several displays.
-    input_router_.send_pointer_motion(input_seat_.pointer_x(), input_seat_.pointer_y(),
-                                      event.time_ms);
+    auto& seat = input_devices_.default_seat();
+    input_router_.send_pointer_motion(seat.pointer_x(), seat.pointer_y(), event.time_ms);
 }
 
 void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_event& event) {
-    input_router_.send_pointer_button(event, input_seat_);
+    input_router_.send_pointer_button(event, input_devices_.default_seat());
 }
 
 void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
@@ -315,6 +318,11 @@ void compositor_impl::start_input() {
         return fd < 0 ? -errno : fd;
     };
     provider.close_device = [](int fd, void*) { ::close(fd); };
+
+    // Compile a keymap regardless of whether devices open. Clients are told the layout at
+    // bind time, and a compositor that never found a keyboard still has to answer that.
+    if (auto compiled = input_devices_.default_seat().keymap().compile(); !compiled)
+        lx::trace::logger::global().log_error(compiled.get_error(), "compositor.input");
 
     auto opened = lx::input::input_manager::open(provider);
     if (!opened) {
@@ -392,7 +400,7 @@ void compositor_impl::register_p0_globals() {
     p0_.server = &wayland;
     p0_.surfaces = &surfaces;
     p0_.input = &input_router_;
-    p0_.seat = &input_seat_;
+    p0_.seat = &input_devices_.default_seat();
     p0_.shell = &shell_bridge_;
     p0_.toplevels = &toplevels;
     p0_.outputs = &outputs;
@@ -931,7 +939,7 @@ namespace lx::compositor {
 
 void seat_manager::set_focus(lx::surface_id surface) {
     if (impl_)
-        impl_->input_seat_.set_keyboard_focus(surface);
+        impl_->input_devices_.default_seat().set_keyboard_focus(surface);
 }
 
 lx::input::seat& seat_manager::seat() {
@@ -942,7 +950,7 @@ lx::input::seat& seat_manager::seat() {
         static lx::input::seat orphan;
         return orphan;
     }
-    return impl_->input_seat_;
+    return impl_->input_devices_.default_seat();
 }
 
 void seat_manager::bind(detail::compositor_impl* impl) { impl_ = impl; }

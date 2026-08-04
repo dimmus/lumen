@@ -305,8 +305,8 @@ void lx::input::input_manager::destroy() {
 
 lx::input::input_manager::input_manager(input_manager&& other) noexcept
     : udev_{other.udev_}, libinput_{other.libinput_}, sink_{other.sink_},
-      provider_{std::move(other.provider_)}, device_count_{other.device_count_},
-      suspended_{other.suspended_} {
+      seat_{std::move(other.seat_)}, provider_{std::move(other.provider_)},
+      device_count_{other.device_count_}, suspended_{other.suspended_} {
     other.udev_ = nullptr;
     other.libinput_ = nullptr;
     other.device_count_ = 0;
@@ -319,6 +319,9 @@ lx::input::input_manager& lx::input::input_manager::operator=(input_manager&& ot
     udev_ = other.udev_;
     libinput_ = other.libinput_;
     sink_ = other.sink_;
+    // The seat carries the compiled keymap. Leaving it behind silently drops xkb
+    // translation — keys keep arriving, with no keysym and no modifiers.
+    seat_ = std::move(other.seat_);
     provider_ = std::move(other.provider_);
     device_count_ = other.device_count_;
     suspended_ = other.suspended_;
