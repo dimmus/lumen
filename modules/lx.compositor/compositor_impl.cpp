@@ -297,15 +297,25 @@ void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) 
 }
 
 void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_event& event) {
-    // Keep the pointer on screen. Output geometry is the compositor's to know — libinput
-    // reports deltas and has no idea how large the desktop is.
-    if (outputs.count() > 0)
-        input_devices_.default_seat().constrain_pointer(outputs.geometry(outputs.nth(0)));
-    cursor_.update_from_seat(input_devices_.default_seat());
+    auto& seat = input_devices_.default_seat();
+    // Output geometry is the compositor's to know — libinput reports deltas and has no
+    // idea how large the desktop is — so both halves of the mapping live here. An absolute
+    // device (a tablet, or the mouse of any VM console) arrives normalised to a unit box
+    // and is scaled into the output; whatever the source, the pointer is then kept on
+    // screen. lx.input accumulates only relative motion, which is why absolute devices
+    // used to leave the pointer at the origin for the whole session.
+    if (outputs.count() > 0) {
+        const lx::rect2i geometry = outputs.geometry(outputs.nth(0));
+        if (event.absolute) {
+            seat.set_pointer_position(geometry.x + event.x * geometry.width,
+                                      geometry.y + event.y * geometry.height);
+        }
+        seat.constrain_pointer(geometry);
+    }
+    cursor_.update_from_seat(seat);
     // Surface-local coordinates: with one output at the origin these coincide with global
     // ones. Per-surface hit-testing lands with D5's per-output loop, which is what makes
     // "which surface is under this point" well defined across several displays.
-    auto& seat = input_devices_.default_seat();
     input_router_.send_pointer_motion(seat.pointer_x(), seat.pointer_y(), event.time_ms);
 }
 
@@ -1496,7 +1506,7 @@ void compositor::tick_render() {
             req.damage.full_frame = false;
             req.damage.count = 1;
             req.damage.rects[0] = snap_damage;
-            impl_->kms_atomic.build_damage_blob(req.damage);
+            impl_->kms_atomic.build_damage_blob(req.damage, req.connector);
         } else {
             req.damage.full_frame = true;
         }

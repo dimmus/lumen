@@ -55,7 +55,9 @@ public:
     void dispatch_events();
 
     [[nodiscard]] bool supports_atomic_damage() const;
-    void build_damage_blob(const kms_damage_region& region);
+    /// Clips are limited to the connector's active mode, which is what the scanout
+    /// framebuffer is sized to; the kernel fails the whole commit for a clip past it.
+    void build_damage_blob(const kms_damage_region& region, unsigned connector_index = 0);
     void set_framebuffer(unsigned fb_id);
 
     /// True while a flip requested by `commit()` has not yet been reported by
