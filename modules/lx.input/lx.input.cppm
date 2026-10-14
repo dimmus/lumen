@@ -33,7 +33,9 @@ struct pointer_motion_event {
     /// Relative movement, already accelerated by libinput.
     double dx = 0.0;
     double dy = 0.0;
-    /// Absolute position in output coordinates; only meaningful when `absolute`.
+    /// Pointer position. After relative motion it is the seat position in output
+    /// coordinates; for an `absolute` device it is normalised to [0, 1] of the device's
+    /// box, and the compositor — which alone knows the output layout — scales it.
     double x = 0.0;
     double y = 0.0;
     bool absolute = false;

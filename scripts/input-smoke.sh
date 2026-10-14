@@ -35,6 +35,19 @@ mkdir -p "$LOG_DIR"
 # console, so a FAIL message scrolls past or is never seen — which is how a run that
 # stopped at stage 3 looked identical to one that completed with no events.
 exec > >(tee "$RUN_LOG") 2>&1
+TEE_PID=$!
+
+# Closing our end of the pipe is what lets the tee finish; waiting for it is what keeps
+# the last lines on disk and on the terminal before the prompt returns. Installed before
+# the early exits below, which otherwise print after the shell has already come back.
+close_log() {
+  if [[ -n "${TEE_PID:-}" ]]; then
+    exec >&- 2>&-
+    wait "$TEE_PID" 2>/dev/null
+    TEE_PID=""
+  fi
+}
+trap close_log EXIT
 
 PROBE="${BUILD}/lumen-input-probe"
 
@@ -94,18 +107,28 @@ COMP_PID=""
 WEV_PID=""
 
 cleanup() {
-  [[ -n "$WEV_PID" ]] && kill -TERM "$WEV_PID" 2>/dev/null
+  if [[ -n "$WEV_PID" ]]; then
+    kill -TERM "$WEV_PID" 2>/dev/null
+    wait "$WEV_PID" 2>/dev/null
+  fi
   if [[ -n "$COMP_PID" ]]; then
     # SIGTERM, not SIGKILL: teardown is what restores the console mode, and skipping it
     # leaves the TTY in graphics mode with no way to read anything.
     kill -TERM "$COMP_PID" 2>/dev/null
     for _ in $(seq 1 30); do kill -0 "$COMP_PID" 2>/dev/null || break; sleep 0.1; done
     kill -9 "$COMP_PID" 2>/dev/null
+    wait "$COMP_PID" 2>/dev/null
   fi
-  wait 2>/dev/null
   rm -f "$SOCKET_PATH" "${SOCKET_PATH}.lock"
+  # Last, because it closes our own output. A bare `wait` here deadlocked every run: since
+  # bash 5.1 it also waits for the tee behind `exec >(...)`, and the tee cannot exit while
+  # this script still holds its stdin open — so the verdict printed and the prompt never
+  # came back.
+  close_log
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# Ctrl-C must stop the run, not resume it after cleanup with its output already closed.
+trap 'cleanup; exit 130' INT TERM
 
 # The probe first, on its own: if the devices cannot be opened there is no point starting a
 # compositor, and the reason is far clearer from the probe's own diagnostics.
@@ -176,8 +199,12 @@ COMP_PID=""
 # by "] " and not by a dot. The first version of this matched "wl_keyboard.key" and
 # therefore counted zero through a run that delivered 124 keys — a verdict that pointed at
 # the compositor when the fault was here.
+#
+# The colon matters as well: "wl_keyboard] key" also matches the keymap line wev prints
+# when it binds the keyboard, which reported key=1 for a run in which nothing was typed —
+# and that one phantom event was enough for the verdict to declare the keyboard proven.
 enter=$(grep -cF "wl_keyboard] enter"     "$WEV_LOG")
-keys=$(grep -cF  "wl_keyboard] key"       "$WEV_LOG")
+keys=$(grep -cF  "wl_keyboard] key:"      "$WEV_LOG")
 mods=$(grep -cF  "wl_keyboard] modifiers" "$WEV_LOG")
 ptr=$(grep -cF   "wl_pointer] motion"     "$WEV_LOG")
 btn=$(grep -cF   "wl_pointer] button"     "$WEV_LOG")

@@ -457,6 +457,26 @@ void surface_attach(struct wl_client*, struct wl_resource* resource, struct wl_r
     s->pending.dy = y;
 }
 
+// Clips client damage to its buffer. "Everything" is conventionally x=0, y=0 with
+// INT32_MAX extents (wev, GTK and SDL all send it), so the sum x + width is formed in 64
+// bits. Passed through unclipped, that rectangle reached FB_DAMAGE_CLIPS as the node's
+// bounds and the frame's damage, and the kernel rejected the whole atomic commit with
+// EINVAL — one lost frame on every such commit.
+lx::rect2i clip_damage_to_buffer(lx::rect2i damage, int width, int height) {
+    const long long x0 = damage.x > 0 ? damage.x : 0;
+    const long long y0 = damage.y > 0 ? damage.y : 0;
+    long long x1 = static_cast<long long>(damage.x) + damage.width;
+    long long y1 = static_cast<long long>(damage.y) + damage.height;
+    if (x1 > width)
+        x1 = width;
+    if (y1 > height)
+        y1 = height;
+    if (x1 <= x0 || y1 <= y0)
+        return {};
+    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
+            static_cast<int>(y1 - y0)};
+}
+
 void surface_damage(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y,
                     int32_t width, int32_t height) {
     auto* s = find_surface(resource);
@@ -583,7 +603,8 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
     commit.buffer = buf->id;
     commit.client = s->client;
     if (s->current.has_damage)
-        commit.damage = s->current.damage;
+        commit.damage = clip_damage_to_buffer(s->current.damage, static_cast<int>(buf->width),
+                                              static_cast<int>(buf->height));
     else
         commit.damage = {0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
 

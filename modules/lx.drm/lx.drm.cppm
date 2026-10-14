@@ -1040,13 +1040,25 @@ bool lx::drm::kms_atomic_commit::flip_pending() const {
     return flip_pending_.load(std::memory_order_acquire);
 }
 
-void lx::drm::kms_atomic_commit::build_damage_blob(const kms_damage_region& region) {
+void lx::drm::kms_atomic_commit::build_damage_blob(const kms_damage_region& region,
+                                                   unsigned connector_index) {
 #if defined(LUMEN_HAS_DRM)
     if (!device_ || !atomic_damage_)
         return;
     const int fd = device_->card_fd();
     if (fd < 0)
         return;
+
+    // The kernel validates every clip against the framebuffer — a negative origin or an
+    // edge past it fails the whole commit with EINVAL, not just the clip — and a window
+    // hanging off the output produces exactly that rectangle. The scanout buffer is sized
+    // to the mode, so that is the bound.
+    long long max_x = 0;
+    long long max_y = 0;
+    if (auto mode = device_->active_mode(connector_index); mode) {
+        max_x = mode.value().width;
+        max_y = mode.value().height;
+    }
 
     // FB_DAMAGE_CLIPS is an array of struct drm_mode_rect (four s32, exclusive x2/y2).
     // A blob whose length is not a multiple of that size is rejected with EINVAL.
@@ -1055,12 +1067,21 @@ void lx::drm::kms_atomic_commit::build_damage_blob(const kms_damage_region& regi
     const unsigned limit = region.count < 16 ? region.count : 16;
     for (unsigned i = 0; i < limit; ++i) {
         const auto& r = region.rects[i];
-        if (r.width <= 0 || r.height <= 0)
+        // 64-bit sums: "everything" arrives as INT32_MAX extents and would overflow.
+        const long long x1 = r.x > 0 ? r.x : 0;
+        const long long y1 = r.y > 0 ? r.y : 0;
+        long long x2 = static_cast<long long>(r.x) + r.width;
+        long long y2 = static_cast<long long>(r.y) + r.height;
+        if (max_x > 0 && x2 > max_x)
+            x2 = max_x;
+        if (max_y > 0 && y2 > max_y)
+            y2 = max_y;
+        if (x2 <= x1 || y2 <= y1)
             continue;
-        clips[n].x1 = r.x;
-        clips[n].y1 = r.y;
-        clips[n].x2 = r.x + r.width;
-        clips[n].y2 = r.y + r.height;
+        clips[n].x1 = static_cast<int32_t>(x1);
+        clips[n].y1 = static_cast<int32_t>(y1);
+        clips[n].x2 = static_cast<int32_t>(x2);
+        clips[n].y2 = static_cast<int32_t>(y2);
         ++n;
     }
 
