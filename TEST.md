@@ -20,7 +20,7 @@ differs. lumen-input-probe covers devices, libinput and xkb; wev covers routing 
 client. If the probe fails the script stops there rather than starting a compositor, since
 a client test on top of a dead input stack only adds noise.
 
-# Interactive move/resize, end to end, unattended (~30 s; do not touch the mouse)
+# Interactive move/resize, end to end, unattended (~30 s; hands off, host pointer outside the VM)
 ./scripts/drag-smoke.sh                       # from the TTY you logged into
 ./scripts/drag-smoke.sh --join-seat-session   # from SSH: compositor joins the seat session
 
@@ -33,8 +33,17 @@ min-size clamp; Super+left move with no button reaching the client; click-to-foc
 with two windows; a client killed mid-grab. Two whole-run checks: frame-perfect resize (one
 configure in flight, every committed size equals its configure) and input-to-present
 latency, measured from the injector's CLOCK_MONOTONIC write time to the page flip that
-first shows the motion. Prints a PASS/FAIL table, exits 0 only if all pass, and leaves logs
-in drag-smoke-logs/.
+first shows the motion. Latency fails on a median over 1.5 refresh periods + 4 ms (Lumen's
+own pacing) and warns on a p95 over 2 periods + 4 ms, splitting every sample into queued
+(behind the previous flip), compositor, GPU (fence) and display time so a warning says
+whose time it was. On this vmwgfx host the tail is SVGA3D fence latency, not Lumen.
+
+A VM console forwards the host pointer through the same device the injector writes to, so
+a hand on the mouse corrupts the run. The script says so with a countdown, records every
+frame on every input node (inject-input.py watch), and reports any frame it did not
+inject as VERDICT: INVALID (exit 3) instead of a list of misleading failures. Exit codes:
+0 PASS (possibly with warnings), 1 FAIL, 2 could not run, 3 INVALID. Logs in
+drag-smoke-logs/.
 
 # Sanitizers
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan

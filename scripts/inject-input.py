@@ -27,6 +27,14 @@ compositor's debug log, which uses the same clock.
     sudo python3 -I scripts/inject-input.py --output 1918x928 drag 40 20 1800 20      # hover only
     sudo python3 -I scripts/inject-input.py button right click
     sudo python3 -I scripts/inject-input.py key KEY_ESC tap
+    sudo python3 -I scripts/inject-input.py watch > seen.jsonl     # until SIGTERM
+
+`watch` records every input frame the kernel delivers on every /dev/input/event* node,
+injected or not, as one JSON line each (kind "seen"; kernel timestamps on
+CLOCK_MONOTONIC). A writer's own events reach every reader of the node, so comparing this
+with the injector's records — which carry the raw device values written — shows exactly
+which input came from somewhere else: a hand on the mouse, or a VM console forwarding the
+host pointer through the very device the injector writes to.
 
 Dependency-free python3. Run with -I so nothing from the working directory is imported
 into a root process.
@@ -34,9 +42,11 @@ into a root process.
 
 import argparse
 import fcntl
+import glob
 import json
 import os
 import re
+import select
 import signal
 import struct
 import sys
@@ -60,6 +70,12 @@ ABSINFO = struct.Struct("iiiiii")
 def eviocgabs(axis):
     # _IOR('E', 0x40 + axis, struct input_absinfo)
     return (2 << 30) | (ABSINFO.size << 16) | (ord("E") << 8) | (0x40 + axis)
+
+
+# _IOW('E', 0xa0, int): which clock stamps events read from this descriptor.
+EVIOCSCLOCKID = (1 << 30) | (4 << 16) | (ord("E") << 8) | 0xA0
+CLOCK_MONOTONIC = 1
+SYN_DROPPED = 3
 
 
 def now_us():
@@ -136,12 +152,13 @@ class Injector:
             sys.exit("inject-input: the output size is unknown; pass --output WxH or "
                      "--compositor-log")
         w, h = self.output
-        data = (pack(EV_ABS, ABS_X, self.to_device(x, w, 0)) +
-                pack(EV_ABS, ABS_Y, self.to_device(y, h, 1)) +
+        ax, ay = self.to_device(x, w, 0), self.to_device(y, h, 1)
+        data = (pack(EV_ABS, ABS_X, ax) + pack(EV_ABS, ABS_Y, ay) +
                 pack(EV_SYN, SYN_REPORT, 0))
         t = now_us()
         os.write(self.pointer(), data)
-        self.record("motion", t, x=round(x, 2), y=round(y, 2), phase=phase)
+        # The raw values written, so a watcher can tell these frames from foreign ones.
+        self.record("motion", t, x=round(x, 2), y=round(y, 2), phase=phase, ax=ax, ay=ay)
 
     def button(self, name, pressed):
         t = now_us()
@@ -239,6 +256,61 @@ def run_drag(inj, a):
             inj.key(KEYS["KEY_LEFTMETA"], False)
 
 
+def run_watch():
+    """Record every frame on every event node until SIGTERM/SIGINT."""
+    fds = {}
+    for path in sorted(glob.glob("/dev/input/event*")):
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            fcntl.ioctl(fd, EVIOCSCLOCKID, struct.pack("i", CLOCK_MONOTONIC))
+        except OSError:
+            pass  # stamps stay on the realtime clock; recorded order is still valid
+        fds[fd] = (path, [])
+    if not fds:
+        sys.exit("inject-input: watch: no readable /dev/input/event* nodes")
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+    out = sys.stdout
+    out.write(json.dumps({"kind": "watch", "devices": [v[0] for v in fds.values()],
+                          "t_us": now_us()}) + "\n")
+    out.flush()
+    while not stop:
+        try:
+            ready, _, _ = select.select(list(fds), [], [], 0.2)
+        except InterruptedError:
+            continue
+        for fd in ready:
+            path, frame = fds[fd]
+            try:
+                data = os.read(fd, EVENT.size * 64)
+            except BlockingIOError:
+                continue
+            except OSError:
+                continue
+            for off in range(0, len(data) - EVENT.size + 1, EVENT.size):
+                sec, usec, etype, code, value = EVENT.unpack_from(data, off)
+                if etype != EV_SYN:
+                    frame.append([etype, code, value])
+                    continue
+                if code == SYN_DROPPED:
+                    out.write(json.dumps({"kind": "dropped", "dev": path,
+                                          "t_us": sec * 1_000_000 + usec}) + "\n")
+                    frame.clear()
+                elif code == SYN_REPORT and frame:
+                    out.write(json.dumps({"kind": "seen", "dev": path,
+                                          "t_us": sec * 1_000_000 + usec, "ev": frame},
+                                         separators=(",", ":")) + "\n")
+                    fds[fd] = (path, [])
+                    frame = fds[fd][1]
+        out.flush()
+    for fd in fds:
+        os.close(fd)
+
+
 def main():
     p = argparse.ArgumentParser(
         description="Inject pointer/keyboard input into evdev nodes (root only).",
@@ -277,11 +349,17 @@ def main():
     s.add_argument("code", type=key_code)
     s.add_argument("action", choices=("press", "release", "tap"))
 
+    sub.add_parser("watch", help="record every frame on every event node until SIGTERM")
+
     a = p.parse_args()
     # SIGTERM runs the finally blocks too, so a killed drag still releases what it held.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     if os.geteuid() != 0:
         sys.exit("inject-input: needs root to write to evdev nodes (run under sudo)")
+
+    if a.cmd == "watch":
+        run_watch()
+        return
 
     output = a.output
     if output is None and a.compositor_log:
