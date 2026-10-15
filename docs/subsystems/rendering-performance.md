@@ -152,7 +152,7 @@ not optional.
 | Scanout | 3 × `gbm_bo` (SCANOUT\|RENDERING) → `EGLImage` → renderbuffer → FBO, same slot rotation as the other backends |
 | dma-buf clients | `EGL_EXT_image_dma_buf_import` → sampled in place, no copy |
 | shm clients | `glTexSubImage2D` in RGBA (BGRA measured slower on SVGA3D), staged through `shm_staging_ring` like the Vulkan path |
-| Upload hazard | Each texture keeps **two** GL names and alternates. Uploading into the texture the previous frame is still sampling stalls the driver — measured 48 ms vs 22 ms per frame on SVGA3D |
+| Upload hazard | Each texture keeps **two** GL names and alternates. Uploading into the texture the previous frame is still sampling stalls the driver — measured 48 ms vs 22 ms per frame on SVGA3D. Each name tracks its own storage size: a client resizing every frame (interactive resize) alternates sizes across the names, and a sub-image upload into storage of another size is a GL error that leaves stale pixels on screen |
 | Damage | `glScissor` over the damage rect, flipped into GL's bottom-left origin |
 | Blending | `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` — sources are premultiplied |
 | GPU sync | `EGL_ANDROID_native_fence_sync` → sync_file → `atomic_commit_request::in_fence_fd`; `glFinish` only as fallback |
@@ -311,6 +311,58 @@ See [../uml/27-snapshot-v2-handoff.mmd](../uml/27-snapshot-v2-handoff.mmd), [../
 `scene_graph::commit_frame` calls `build_draw_list_into(write_draw_list())` directly.
 No interim `draw_list` copy.
 
+### Damage: multi-rect, buffer age, idle skip
+
+Damage is a `gfx::damage_region`: up to 16 rects, the same capacity as `kms_damage_region`,
+held inline. `add` merges two rects only when their bounding box wastes at most 25 % over
+their union, so a window dragged a few pixels stays one rect while a window moved across
+the screen stays two (old and new position) instead of one bbox spanning both. On overflow
+the pair whose merge wastes least is merged. wlroots gets the same shape from a pixman
+region in a `wlr_damage_ring`; this allocates nothing, and its rect count is exactly what
+FB_DAMAGE_CLIPS takes.
+
+| Stage | Damage used |
+|-------|-------------|
+| Scene → snapshot | Global rects noted by the window manager (old + new node rect on a move or resize) and by surface commits (client damage translated by the node origin). Carried forward over snapshots render never acquired |
+| Composite | `frame damage ∪ age(slot)`: each of the three scanout slots records what it missed since it was last drawn into. Without this a damage-limited composite into a slot two frames old leaves ghost trails behind a moving window |
+| GL | `gl_compositor::composite_region` — state set once, then per rect: scissor, clear, draw only the draws whose dst meets the rect; one fence per frame |
+| CPU | `cpu_compositor::composite_region` — the existing per-rect path (with its occlusion cull) once per rect |
+| Vulkan | Full repaint whenever anything is damaged — correct for any buffer age |
+| KMS | Every rect since the last successful commit, as separate FB_DAMAGE_CLIPS: the plane's previous framebuffer predates this frame |
+
+A tick whose snapshot carries no damage composites nothing and commits nothing. On this
+host (vmwgfx, GL path) an idle compositor with no clients went from 47 to 24 scheduler ticks
+of CPU per 5 s (9.4 % → 4.8 % of a core); the remainder is the 1 ms Wayland poll and the
+per-tick hotplug probe, not compositing.
+
+### Cursor: hardware plane, cursor-only commits, software fallback
+
+The pointer is a KMS cursor plane (`lx.drm:cursor`), so moving it costs plane properties on
+an atomic commit and **no composite**:
+
+| Piece | Choice |
+|-------|--------|
+| Plane | `type == CURSOR`, reachable from the CRTC's index, scans out ARGB8888. The primary plane is likewise chosen by `type` now — with cursor planes exposed, taking the first plane on the CRTC is no longer safe |
+| Size | First `SIZE_HINTS` entry the largest theme image fits; else `DRM_CAP_CURSOR_WIDTH/HEIGHT` (64 when absent). Images are padded to it: vmwgfx accepts nothing else |
+| Hotspot | `DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT` set at open, `HOTSPOT_X/Y` on every commit when the plane has them. Virtualised drivers (vmwgfx, virtio-gpu, qxl) hide the cursor plane from atomic clients without the cap, and draw the host pointer from the hotspot |
+| Buffers | Two dumb buffers; a new image goes into the one not on screen, shown by the commit that switches `FB_ID` (drivers re-read the image on an FB change) |
+| Validation | One `TEST_ONLY` commit before the plane first rides a frame; rejection → software for the session, never a failed frame. A content commit that fails with the cursor on it is followed by a cursor-only `TEST_ONLY` to tell which half was refused |
+| Timing | Render reads the cursor mailbox right before it builds the commit (latest position). The cursor rides the content commit when there is one — pointer and the frame under it change on the same vblank — otherwise a cursor-only commit goes out on the deadline-aligned tick. Its flip re-arms the frame clock but is not a content present: it answers no frame callbacks and does not rotate scanout slots |
+| Rule | A cursor-only commit needs the plane's CRTC in the state (`involves_crtc()`): a commit with no CRTC cannot carry a flip event (EINVAL). Turning on an off plane, moving it, or turning it off all qualify |
+
+`LUMEN_CURSOR=software` skips the plane (debugging, screenshots of the composite). The
+software cursor is a node in the scene's overlay layer: a fixed power-of-two square texture
+(`k_cursor_texture_id`, so every image change is an in-place update on every backend),
+`blend = premultiplied`, old and new rects damaged separately.
+
+Measured on this host (vmwgfx, GL path, 1918×928), 3 s of 125 Hz absolute motion with no
+clients, `render_us` from the `compositor.render` debug line:
+
+| Cursor | Render tick per frame (mean / max) | Compositor CPU during motion |
+|--------|------------------------------------|------------------------------|
+| Hardware plane | 211 µs / 3.0 ms, `composite=0 commit=cursor` on every frame | 26 ticks / 3 s |
+| Software (`LUMEN_CURSOR=software`) | 675 µs / 9.9 ms, `composite=1` (≈1.9 kpx) every frame | 42 ticks / 3 s |
+
 ---
 
 ## 4. Per-output present mode
@@ -388,10 +440,22 @@ via `runtime::timer_source::schedule_at`, which is valid from inside the timer's
 callback. The interval comes from the active mode's `refresh_millihz`, not from
 `config::target_fps` — that is only the fallback when there is no mode to read.
 
+The lock only holds if the flip is *seen* when it happens. Flip events are drained by the
+1 ms Wayland pump (`wayland_fd_callback`) whenever a flip is outstanding, not only at the
+next tick, and the phase is taken from the kernel's flip timestamp (CLOCK_MONOTONIC, the
+clock `steady_clock` reads) when it is within one period of `now`. Draining at the tick and
+using the tick's own time as the flip time put the phase up to a period late, so ticks ran
+at *period − lead*: faster than the display. Measured with `scripts/drag-smoke.sh` on
+vmwgfx at 60 Hz over the move and resize drags, about one composite in three then landed
+behind a still-pending flip (`commit=deferred`, 60 of 171) and content presents were a
+median 21.6 ms apart; with the flip drained in the pump it is 4–10 of ~160, mostly resize
+frames whose shm upload overran the period, and 15.9 ms.
+
 ```
-flip completes ──▶ presentation_flip_handler
-                     ├─ present_completed_ = true   (frame callbacks may fire)
-                     └─ vsync_timer.schedule_at(now + refresh − margin)
+flip completes ──▶ wayland pump (≤ 1 ms) ──▶ presentation_flip_handler
+                     ├─ present_completed_ = true   (frame callbacks may fire;
+                     │                               not for a cursor-only flip)
+                     └─ vsync_timer.schedule_at(next vblank − peak repaint cost − margin)
 ```
 
 The 250 ms stall watchdog still paces callbacks by tick if flips stop arriving, so a broken

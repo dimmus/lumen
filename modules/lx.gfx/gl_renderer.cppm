@@ -17,6 +17,7 @@ export module lx.gfx:gl_renderer;
 
 import :renderer;
 import :dmabuf;
+import :damage;
 
 export namespace lx::gfx {
 
@@ -183,6 +184,16 @@ public:
                                                            const blit_command* cmds,
                                                            unsigned count, lx::rect2i damage);
 
+    /// Composites only the rects of `damage`: pipeline state is set once, then each rect
+    /// is scissored, cleared and drawn, with draws that miss the rect skipped outright.
+    /// One fence covers the whole frame. Full means the whole target; empty draws nothing
+    /// but still returns a valid (fence-less) result.
+    [[nodiscard]] lx::result<gl_composite_stats> composite_region(gl_scanout_target& target,
+                                                                  lx::color clear,
+                                                                  const blit_command* cmds,
+                                                                  unsigned count,
+                                                                  const damage_region& damage);
+
     /// Reads the target back as RGBA rows, top row first. For tests and screenshots — it
     /// stalls the pipeline and is not part of the frame path.
     [[nodiscard]] lx::result<void> read_back(const gl_scanout_target& target, unsigned char* rgba,
@@ -194,6 +205,11 @@ private:
         /// Two names so an upload never targets the texture the previous frame is
         /// sampling. Unused for dma-buf slots, which are never written by the CPU.
         unsigned names[2]{};
+        /// Storage size of each name. The two alternate, so after a resize the name about
+        /// to be written may still hold the size before last — `width`/`height` (the size
+        /// being sampled) cannot tell whether it needs reallocating.
+        unsigned name_width[2]{};
+        unsigned name_height[2]{};
         unsigned current = 0;
         unsigned width = 0;
         unsigned height = 0;
@@ -205,6 +221,13 @@ private:
     [[nodiscard]] int find(unsigned texture_id) const;
     [[nodiscard]] int alloc(unsigned texture_id);
     void destroy_slot(texture_slot& slot);
+    /// Shared body: `rect_count == 0` is the whole target.
+    [[nodiscard]] lx::result<gl_composite_stats> composite_rects(gl_scanout_target& target,
+                                                                 lx::color clear,
+                                                                 const blit_command* cmds,
+                                                                 unsigned count,
+                                                                 const lx::rect2i* rects,
+                                                                 unsigned rect_count);
 
     egl_device* device_ = nullptr;
     unsigned program_ = 0;
@@ -800,7 +823,11 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsign
     slot.current ^= 1u;
     unsigned& name = slot.names[slot.current];
 
-    const bool resized = slot.width != width || slot.height != height;
+    // Per name: a client resizing every frame (an interactive resize) alternates sizes
+    // across the two names, and a sub-image upload into storage of another size is a GL
+    // error that leaves the previous frame's pixels — a mismatched frame on screen.
+    const bool resized =
+        slot.name_width[slot.current] != width || slot.name_height[slot.current] != height;
     if (!name) {
         glGenTextures(1, &name);
         if (!name)
@@ -824,6 +851,8 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsign
     }
     glBindTexture(GL_TEXTURE_2D, 0);
 
+    slot.name_width[slot.current] = width;
+    slot.name_height[slot.current] = height;
     slot.width = width;
     slot.height = height;
     slot.is_dmabuf = false;
@@ -917,6 +946,24 @@ lx::result<void> lx::gfx::gl_compositor::import_dmabuf(unsigned texture_id,
 lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite(
     gl_scanout_target& target, lx::color clear, const blit_command* cmds, unsigned count,
     lx::rect2i damage) {
+    const bool has_damage = damage.width > 0 && damage.height > 0;
+    return composite_rects(target, clear, cmds, count, has_damage ? &damage : nullptr,
+                           has_damage ? 1u : 0u);
+}
+
+lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_region(
+    gl_scanout_target& target, lx::color clear, const blit_command* cmds, unsigned count,
+    const damage_region& damage) {
+    if (damage.full)
+        return composite_rects(target, clear, cmds, count, nullptr, 0);
+    if (damage.count == 0)
+        return gl_composite_stats{};
+    return composite_rects(target, clear, cmds, count, damage.rects, damage.count);
+}
+
+lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
+    gl_scanout_target& target, lx::color clear, const blit_command* cmds, unsigned count,
+    const lx::rect2i* rects, unsigned rect_count) {
 #if defined(LUMEN_HAS_EGL)
     if (!ready())
         return lx::not_implemented("lx::gfx::gl_compositor::composite");
@@ -932,20 +979,7 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite(
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer());
     glViewport(0, 0, width, height);
 
-    // Scissor to the damage rect so the clear and every draw stay inside it. GL's origin is
-    // bottom left, so the rect is flipped to match the top-left space damage is expressed in.
-    const bool has_damage = damage.width > 0 && damage.height > 0;
-    if (has_damage) {
-        const int y = height - (damage.y + damage.height);
-        glEnable(GL_SCISSOR_TEST);
-        glScissor(damage.x, y < 0 ? 0 : y, damage.width, damage.height);
-    } else {
-        glDisable(GL_SCISSOR_TEST);
-    }
-
-    glClearColor(clear.r, clear.g, clear.b, clear.a);
-    glClear(GL_COLOR_BUFFER_BIT);
-
+    // Pipeline state is per frame, not per rect: only the scissor changes between passes.
     glUseProgram(program_);
     glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer_);
     glEnableVertexAttribArray(0);
@@ -956,109 +990,138 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite(
     if (uniform_target_ >= 0)
         glUniform2f(uniform_target_, static_cast<float>(width), static_cast<float>(height));
 
-    for (unsigned i = 0; i < count && cmds; ++i) {
-        const auto& cmd = cmds[i];
-        const int index = find(cmd.texture_id);
-        if (index < 0) {
-            ++stats.draws_skipped;
+    const unsigned passes = rect_count > 0 ? rect_count : 1u;
+    for (unsigned pass = 0; pass < passes; ++pass) {
+        const bool has_damage = rect_count > 0;
+        const lx::rect2i damage = has_damage ? rects[pass] : lx::rect2i{};
+        if (has_damage && (damage.width <= 0 || damage.height <= 0))
             continue;
-        }
-        const auto& slot = textures_[static_cast<unsigned>(index)];
-        const unsigned name = slot.names[slot.current];
-        if (!name) {
-            ++stats.draws_skipped;
-            continue;
-        }
 
-        if (cmd.blend == lx::blend_mode::opaque) {
-            glDisable(GL_BLEND);
-        } else {
-            glEnable(GL_BLEND);
-            // Sources are premultiplied, so the source factor is one.
-            glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-        }
-
-        // Effective scissor is damage ∩ clip, computed in top-left space and flipped once
-        // at the end. Set explicitly on every draw rather than only when a clip is present:
-        // leaving the previous draw's scissor in place would silently clip the next one.
-        int sx0 = 0;
-        int sy0 = 0;
-        int sx1 = static_cast<int>(width);
-        int sy1 = static_cast<int>(height);
-        bool scissored = false;
+        // Scissor to the damage rect so the clear and every draw stay inside it. GL's
+        // origin is bottom left, so the rect is flipped to match the top-left space damage
+        // is expressed in.
         if (has_damage) {
-            sx0 = damage.x;
-            sy0 = damage.y;
-            sx1 = damage.x + damage.width;
-            sy1 = damage.y + damage.height;
-            scissored = true;
-        }
-        if (cmd.clip.width > 0 && cmd.clip.height > 0) {
-            if (cmd.clip.x > sx0) sx0 = cmd.clip.x;
-            if (cmd.clip.y > sy0) sy0 = cmd.clip.y;
-            if (cmd.clip.x + cmd.clip.width < sx1) sx1 = cmd.clip.x + cmd.clip.width;
-            if (cmd.clip.y + cmd.clip.height < sy1) sy1 = cmd.clip.y + cmd.clip.height;
-            scissored = true;
-        }
-        if (scissored) {
-            if (sx0 < 0) sx0 = 0;
-            if (sy0 < 0) sy0 = 0;
-            if (sx1 > static_cast<int>(width)) sx1 = static_cast<int>(width);
-            if (sy1 > static_cast<int>(height)) sy1 = static_cast<int>(height);
-            if (sx1 <= sx0 || sy1 <= sy0) {
-                ++stats.draws_culled;
-                continue;
-            }
+            const int y = height - (damage.y + damage.height);
             glEnable(GL_SCISSOR_TEST);
-            glScissor(sx0, static_cast<int>(height) - sy1, sx1 - sx0, sy1 - sy0);
+            glScissor(damage.x, y < 0 ? 0 : y, damage.width, damage.height);
         } else {
             glDisable(GL_SCISSOR_TEST);
         }
+        // The clear ignores blend state, but a previous pass may have left blending on.
+        glDisable(GL_BLEND);
+        glClearColor(clear.r, clear.g, clear.b, clear.a);
+        glClear(GL_COLOR_BUFFER_BIT);
 
-        glBindTexture(GL_TEXTURE_2D, name);
-        if (uniform_rect_ >= 0) {
-            glUniform4f(uniform_rect_, static_cast<float>(cmd.dst.x), static_cast<float>(cmd.dst.y),
-                        static_cast<float>(cmd.dst.width), static_cast<float>(cmd.dst.height));
-        }
-        if (uniform_opacity_ >= 0)
-            glUniform1f(uniform_opacity_, cmd.opacity);
-        // An empty src means the whole texture, which is the identity rect.
-        float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
-        float u_lo = 0.f, v_lo = 0.f, u_hi = 1.f, v_hi = 1.f;
-        if (slot.width > 0 && slot.height > 0) {
-            const float tw = static_cast<float>(slot.width);
-            const float th = static_cast<float>(slot.height);
-            if (cmd.src.width > 0 && cmd.src.height > 0) {
-                u0 = static_cast<float>(cmd.src.x) / tw;
-                v0 = static_cast<float>(cmd.src.y) / th;
-                du = static_cast<float>(cmd.src.width) / tw;
-                dv = static_cast<float>(cmd.src.height) / th;
+        for (unsigned i = 0; i < count && cmds; ++i) {
+            const auto& cmd = cmds[i];
+            const int index = find(cmd.texture_id);
+            if (index < 0) {
+                ++stats.draws_skipped;
+                continue;
             }
-            // Half-texel inset, so a magnified crop cannot sample across its own edge.
-            const float half_u = 0.5f / tw;
-            const float half_v = 0.5f / th;
-            u_lo = u0 + half_u;
-            v_lo = v0 + half_v;
-            u_hi = u0 + du - half_u;
-            v_hi = v0 + dv - half_v;
-            if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
-            if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
-        }
-        if (uniform_src_uv_ >= 0)
-            glUniform4f(uniform_src_uv_, u0, v0, du, dv);
-        if (uniform_src_bounds_ >= 0)
-            glUniform4f(uniform_src_bounds_, u_lo, v_lo, u_hi, v_hi);
-        if (uniform_tint_ >= 0)
-            glUniform4f(uniform_tint_, cmd.tint.r, cmd.tint.g, cmd.tint.b, cmd.tint.a);
-        if (uniform_transfer_ >= 0) {
-            const int slot = cmd.src_transfer == lx::transfer_function::linear    ? 0
-                             : cmd.src_transfer == lx::transfer_function::gamma22 ? 2
-                                                                                  : 1;
-            glUniform1i(uniform_transfer_, slot);
-        }
+            const auto& slot = textures_[static_cast<unsigned>(index)];
+            const unsigned name = slot.names[slot.current];
+            if (!name) {
+                ++stats.draws_skipped;
+                continue;
+            }
 
-        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-        ++stats.draws_submitted;
+            // Effective scissor is damage ∩ clip ∩ dst, computed in top-left space and
+            // flipped once at the end. Set explicitly on every draw rather than only when a
+            // clip is present: leaving the previous draw's scissor in place would silently
+            // clip the next one. Intersecting with dst culls draws that miss this rect,
+            // which is most of them once damage is split into several small rects.
+            int sx0 = 0;
+            int sy0 = 0;
+            int sx1 = static_cast<int>(width);
+            int sy1 = static_cast<int>(height);
+            bool scissored = false;
+            if (has_damage) {
+                sx0 = damage.x;
+                sy0 = damage.y;
+                sx1 = damage.x + damage.width;
+                sy1 = damage.y + damage.height;
+                scissored = true;
+                if (cmd.dst.x > sx0) sx0 = cmd.dst.x;
+                if (cmd.dst.y > sy0) sy0 = cmd.dst.y;
+                if (cmd.dst.x + cmd.dst.width < sx1) sx1 = cmd.dst.x + cmd.dst.width;
+                if (cmd.dst.y + cmd.dst.height < sy1) sy1 = cmd.dst.y + cmd.dst.height;
+            }
+            if (cmd.clip.width > 0 && cmd.clip.height > 0) {
+                if (cmd.clip.x > sx0) sx0 = cmd.clip.x;
+                if (cmd.clip.y > sy0) sy0 = cmd.clip.y;
+                if (cmd.clip.x + cmd.clip.width < sx1) sx1 = cmd.clip.x + cmd.clip.width;
+                if (cmd.clip.y + cmd.clip.height < sy1) sy1 = cmd.clip.y + cmd.clip.height;
+                scissored = true;
+            }
+            if (scissored) {
+                if (sx0 < 0) sx0 = 0;
+                if (sy0 < 0) sy0 = 0;
+                if (sx1 > static_cast<int>(width)) sx1 = static_cast<int>(width);
+                if (sy1 > static_cast<int>(height)) sy1 = static_cast<int>(height);
+                if (sx1 <= sx0 || sy1 <= sy0) {
+                    ++stats.draws_culled;
+                    continue;
+                }
+                glEnable(GL_SCISSOR_TEST);
+                glScissor(sx0, static_cast<int>(height) - sy1, sx1 - sx0, sy1 - sy0);
+            } else {
+                glDisable(GL_SCISSOR_TEST);
+            }
+
+            if (cmd.blend == lx::blend_mode::opaque) {
+                glDisable(GL_BLEND);
+            } else {
+                glEnable(GL_BLEND);
+                // Sources are premultiplied, so the source factor is one.
+                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+            }
+
+            glBindTexture(GL_TEXTURE_2D, name);
+            if (uniform_rect_ >= 0) {
+                glUniform4f(uniform_rect_, static_cast<float>(cmd.dst.x), static_cast<float>(cmd.dst.y),
+                            static_cast<float>(cmd.dst.width), static_cast<float>(cmd.dst.height));
+            }
+            if (uniform_opacity_ >= 0)
+                glUniform1f(uniform_opacity_, cmd.opacity);
+            // An empty src means the whole texture, which is the identity rect.
+            float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
+            float u_lo = 0.f, v_lo = 0.f, u_hi = 1.f, v_hi = 1.f;
+            if (slot.width > 0 && slot.height > 0) {
+                const float tw = static_cast<float>(slot.width);
+                const float th = static_cast<float>(slot.height);
+                if (cmd.src.width > 0 && cmd.src.height > 0) {
+                    u0 = static_cast<float>(cmd.src.x) / tw;
+                    v0 = static_cast<float>(cmd.src.y) / th;
+                    du = static_cast<float>(cmd.src.width) / tw;
+                    dv = static_cast<float>(cmd.src.height) / th;
+                }
+                // Half-texel inset, so a magnified crop cannot sample across its own edge.
+                const float half_u = 0.5f / tw;
+                const float half_v = 0.5f / th;
+                u_lo = u0 + half_u;
+                v_lo = v0 + half_v;
+                u_hi = u0 + du - half_u;
+                v_hi = v0 + dv - half_v;
+                if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
+                if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
+            }
+            if (uniform_src_uv_ >= 0)
+                glUniform4f(uniform_src_uv_, u0, v0, du, dv);
+            if (uniform_src_bounds_ >= 0)
+                glUniform4f(uniform_src_bounds_, u_lo, v_lo, u_hi, v_hi);
+            if (uniform_tint_ >= 0)
+                glUniform4f(uniform_tint_, cmd.tint.r, cmd.tint.g, cmd.tint.b, cmd.tint.a);
+            if (uniform_transfer_ >= 0) {
+                const int slot = cmd.src_transfer == lx::transfer_function::linear    ? 0
+                                 : cmd.src_transfer == lx::transfer_function::gamma22 ? 2
+                                                                                      : 1;
+                glUniform1i(uniform_transfer_, slot);
+            }
+
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            ++stats.draws_submitted;
+        }
     }
 
     glDisableVertexAttribArray(0);
@@ -1114,7 +1177,8 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite(
     (void)clear;
     (void)cmds;
     (void)count;
-    (void)damage;
+    (void)rects;
+    (void)rect_count;
     return lx::not_implemented("lx::gfx::gl_compositor::composite");
 #endif
 }

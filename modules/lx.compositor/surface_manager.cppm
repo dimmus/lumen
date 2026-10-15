@@ -20,6 +20,8 @@ struct surface_commit {
     lx::surface_id surface{};
     lx::buffer_id buffer{};
     lx::client_id client{};
+    /// Surface-local (buffer coordinates; scale 1, normal transform). Empty = no content
+    /// damage.
     lx::rect2i damage{};
     lx::gfx::syncobj_timeline sync{};
     content_hint hint = content_hint::normal;
@@ -27,10 +29,43 @@ struct surface_commit {
     bool opaque = true;
 };
 
+/// A wl_surface input region: the exact rect set from wl_region add/subtract, in fixed
+/// storage so neither the protocol requests nor hit-testing allocate. Rects may overlap;
+/// `contains` asks whether any covers the point.
+///
+/// Both overflow paths over-accept input — `add` collapses to the bounding box, `subtract`
+/// stops cutting — because a surface that receives a click meant for the window below is a
+/// lesser failure than a window that cannot be clicked at all.
+struct input_region {
+    static constexpr unsigned k_max = 16;
+    lx::rect2i rects[k_max]{};
+    unsigned count = 0;
+    /// The wl_surface default: every point of the surface accepts input.
+    bool infinite = true;
+    /// Set when an operation had to over-approximate (overflow).
+    bool approximated = false;
+
+    /// wl_region starts empty.
+    void reset_empty() {
+        count = 0;
+        infinite = false;
+        approximated = false;
+    }
+    void add(lx::rect2i r);
+    void subtract(lx::rect2i r);
+    [[nodiscard]] bool contains(int x, int y) const;
+};
+
+/// Client surfaces' content and their scene nodes. UI affinity.
+///
+/// A commit records content; it does not decide visibility. Only a mapped role (an
+/// xdg_toplevel today) gets a node, through `ensure_node`, and the window manager owns
+/// where it sits — this class never moves a node on its own.
 class surface_manager {
 public:
     void set_import_cache(lx::gfx::dmabuf_import_cache* cache);
-    void set_scene(lx::scene::scene_graph* graph);
+    /// Nodes are created under `layer`, which must be a child of `graph`'s root.
+    void set_scene(lx::scene::scene_graph* graph, lx::scene::container_node* layer);
 
     /// Register a dmabuf description for a buffer (client attach path). Takes ownership
     /// of the plane FDs in `desc`.
@@ -57,6 +92,28 @@ public:
     [[nodiscard]] lx::gfx::imported_image lookup(lx::surface_id surface) const;
     [[nodiscard]] content_hint content_hint_for(lx::surface_id surface) const;
 
+    /// Size of the last successfully committed buffer; empty before the first one.
+    [[nodiscard]] lx::size2i buffer_size(lx::surface_id surface) const;
+    /// Creates the surface's scene node (bounds = buffer size) at the top of the layer.
+    /// True if the node exists afterwards.
+    [[nodiscard]] bool ensure_node(lx::surface_id surface);
+    /// Removes and deletes the node. Notes no damage — the caller knows what it unmapped.
+    void drop_node(lx::surface_id surface);
+    [[nodiscard]] lx::scene::surface_node* node(lx::surface_id surface) const;
+    /// Global `{origin, buffer extents}` of the node, or empty when there is none.
+    [[nodiscard]] lx::rect2i node_rect(lx::surface_id surface) const;
+    /// Moves the node. Keeps scale and opacity, notes no damage: the window manager damages
+    /// old and new rects as separate clips, which this cannot know to do.
+    void set_origin(lx::surface_id surface, lx::point2i origin);
+
+    /// Committed input region (wl_surface.set_input_region). Default: infinite.
+    void set_input_region(lx::surface_id surface, const input_region& region);
+    /// Hit test for one surface: true when the global point lies inside the node's extents
+    /// and its input region; `sx`,`sy` receive the surface-local position. One slot lookup,
+    /// no allocation — the window manager runs this per mapped window on every motion.
+    [[nodiscard]] bool hit(lx::surface_id surface, double x, double y, double& sx,
+                           double& sy) const;
+
 private:
     static constexpr unsigned k_max_surfaces = 128;
     static constexpr unsigned k_max_buffers = 256;
@@ -65,8 +122,10 @@ private:
         lx::surface_id id{};
         lx::buffer_id buffer{};
         lx::gfx::imported_image image{};
+        lx::size2i buffer_size{};
         content_hint hint = content_hint::normal;
         lx::scene::surface_node* node = nullptr;
+        input_region input{};
         bool override_redirect = false;
         bool used = false;
     };
@@ -85,6 +144,7 @@ private:
 
     lx::gfx::dmabuf_import_cache* import_cache_ = nullptr;
     lx::scene::scene_graph* scene_ = nullptr;
+    lx::scene::container_node* layer_ = nullptr;
     surface_entry surfaces_[k_max_surfaces]{};
     buffer_entry buffers_[k_max_buffers]{};
     /// shm texture ids live in a space disjoint from dmabuf import ids.
@@ -98,8 +158,10 @@ void lx::compositor::surface_manager::set_import_cache(lx::gfx::dmabuf_import_ca
     import_cache_ = cache;
 }
 
-void lx::compositor::surface_manager::set_scene(lx::scene::scene_graph* graph) {
+void lx::compositor::surface_manager::set_scene(lx::scene::scene_graph* graph,
+                                                lx::scene::container_node* layer) {
     scene_ = graph;
+    layer_ = layer;
 }
 
 void lx::compositor::surface_manager::register_dmabuf(lx::buffer_id buffer,
@@ -250,27 +312,23 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
     if (slot < 0) {
         return lx::make_error(lx::error_domain::wayland, 0, "surface table full");
     }
-    surfaces_[static_cast<unsigned>(slot)].buffer = commit.buffer;
-    surfaces_[static_cast<unsigned>(slot)].hint = commit.hint;
-    surfaces_[static_cast<unsigned>(slot)].image = image;
+    auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    entry.buffer = commit.buffer;
+    entry.hint = commit.hint;
+    entry.image = image;
+    entry.buffer_size = {static_cast<int>(desc.width), static_cast<int>(desc.height)};
 
-    if (scene_) {
-        auto& entry = surfaces_[static_cast<unsigned>(slot)];
-        if (!entry.node) {
-            entry.node = new lx::scene::surface_node{commit.surface};
-            if (!scene_->root().add(entry.node)) {
-                delete entry.node;
-                entry.node = nullptr;
-                return lx::make_error(lx::error_domain::wayland, 0, "scene child overflow");
-            }
-        }
+    // Only a mapped surface has a node. Its bounds are the buffer — never the damage rect,
+    // which for a partial redraw is a fraction of the window — and its damage is the
+    // client's surface-local rect moved to where the node actually is.
+    if (entry.node) {
         entry.node->attach(image);
-        if (commit.damage.width > 0 && commit.damage.height > 0)
-            entry.node->set_bounds(commit.damage);
-        else if (desc.width > 0 && desc.height > 0)
-            entry.node->set_bounds({0, 0, static_cast<int>(desc.width), static_cast<int>(desc.height)});
-        if (commit.damage.width > 0 && commit.damage.height > 0)
-            scene_->note_damage(commit.damage);
+        entry.node->set_bounds({0, 0, entry.buffer_size.width, entry.buffer_size.height});
+        if (scene_ && commit.damage.width > 0 && commit.damage.height > 0) {
+            const lx::point2i o = entry.node->origin();
+            scene_->note_damage({commit.damage.x + o.x, commit.damage.y + o.y,
+                                 commit.damage.width, commit.damage.height});
+        }
     }
 
     return {};
@@ -310,11 +368,78 @@ void lx::compositor::surface_manager::destroy(lx::surface_id surface) {
         return;
     auto& entry = surfaces_[static_cast<unsigned>(slot)];
     if (entry.node) {
-        if (scene_)
-            (void)scene_->root().remove(entry.node);
+        if (scene_ && entry.node->is_visible()) {
+            const lx::point2i o = entry.node->origin();
+            const lx::rect2i b = entry.node->bounds();
+            scene_->note_damage({o.x, o.y, b.width, b.height});
+        }
+        if (layer_)
+            (void)layer_->remove(entry.node);
         delete entry.node;
     }
     entry = {};
+}
+
+lx::size2i lx::compositor::surface_manager::buffer_size(lx::surface_id surface) const {
+    if (const int slot = find_surface(surface); slot >= 0)
+        return surfaces_[static_cast<unsigned>(slot)].buffer_size;
+    return {};
+}
+
+bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface) {
+    const int slot = find_surface(surface);
+    if (slot < 0 || !layer_)
+        return false;
+    auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    if (entry.node)
+        return true;
+    auto* node = new lx::scene::surface_node{surface};
+    if (!layer_->add(node)) {
+        delete node;
+        return false;
+    }
+    node->attach(entry.image);
+    node->set_bounds({0, 0, entry.buffer_size.width, entry.buffer_size.height});
+    entry.node = node;
+    return true;
+}
+
+void lx::compositor::surface_manager::drop_node(lx::surface_id surface) {
+    const int slot = find_surface(surface);
+    if (slot < 0)
+        return;
+    auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    if (!entry.node)
+        return;
+    if (layer_)
+        (void)layer_->remove(entry.node);
+    delete entry.node;
+    entry.node = nullptr;
+}
+
+lx::scene::surface_node* lx::compositor::surface_manager::node(lx::surface_id surface) const {
+    if (const int slot = find_surface(surface); slot >= 0)
+        return surfaces_[static_cast<unsigned>(slot)].node;
+    return nullptr;
+}
+
+lx::rect2i lx::compositor::surface_manager::node_rect(lx::surface_id surface) const {
+    const auto* n = node(surface);
+    if (!n)
+        return {};
+    const lx::point2i o = n->origin();
+    const lx::rect2i b = n->bounds();
+    return {o.x + b.x, o.y + b.y, b.width, b.height};
+}
+
+void lx::compositor::surface_manager::set_origin(lx::surface_id surface, lx::point2i origin) {
+    auto* n = node(surface);
+    if (!n)
+        return;
+    const lx::point2i o = n->origin();
+    if (o.x == origin.x && o.y == origin.y)
+        return;
+    n->set_transform(origin, n->scale(), n->opacity());
 }
 
 lx::gfx::imported_image lx::compositor::surface_manager::lookup(lx::surface_id surface) const {
@@ -338,4 +463,142 @@ void lx::compositor::surface_manager::set_content_hint(lx::surface_id surface,
                                                          content_hint hint) {
     if (const int slot = find_or_alloc_surface(surface); slot >= 0)
         surfaces_[static_cast<unsigned>(slot)].hint = hint;
+}
+
+// ── input_region ───────────────────────────────────────────────────────────
+
+namespace {
+
+[[nodiscard]] long long right_of(lx::rect2i r) { return static_cast<long long>(r.x) + r.width; }
+[[nodiscard]] long long bottom_of(lx::rect2i r) {
+    return static_cast<long long>(r.y) + r.height;
+}
+
+[[nodiscard]] lx::rect2i rect_from_edges(long long x0, long long y0, long long x1, long long y1) {
+    constexpr long long lo = -2147483647LL - 1;
+    constexpr long long hi = 2147483647LL;
+    const auto clamp = [](long long v) { return v < lo ? lo : (v > hi ? hi : v); };
+    x0 = clamp(x0);
+    y0 = clamp(y0);
+    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(clamp(x1 - x0)),
+            static_cast<int>(clamp(y1 - y0))};
+}
+
+} // namespace
+
+void lx::compositor::input_region::add(lx::rect2i r) {
+    if (r.width <= 0 || r.height <= 0)
+        return;
+    infinite = false;
+    // Already covered by one rect: nothing to add.
+    for (unsigned i = 0; i < count; ++i) {
+        const lx::rect2i& e = rects[i];
+        if (r.x >= e.x && r.y >= e.y && right_of(r) <= right_of(e) &&
+            bottom_of(r) <= bottom_of(e))
+            return;
+    }
+    if (count < k_max) {
+        rects[count++] = r;
+        return;
+    }
+    // Overflow: the bounding box of everything, which over-accepts.
+    long long x0 = r.x, y0 = r.y, x1 = right_of(r), y1 = bottom_of(r);
+    for (unsigned i = 0; i < count; ++i) {
+        x0 = rects[i].x < x0 ? rects[i].x : x0;
+        y0 = rects[i].y < y0 ? rects[i].y : y0;
+        x1 = right_of(rects[i]) > x1 ? right_of(rects[i]) : x1;
+        y1 = bottom_of(rects[i]) > y1 ? bottom_of(rects[i]) : y1;
+    }
+    rects[0] = rect_from_edges(x0, y0, x1, y1);
+    count = 1;
+    approximated = true;
+}
+
+void lx::compositor::input_region::subtract(lx::rect2i cut) {
+    if (cut.width <= 0 || cut.height <= 0)
+        return;
+    // Subtracting from "everything" would need a complement; wl_region never asks for that
+    // (it starts empty), and a surface's infinite default is never edited, only replaced.
+    if (infinite)
+        return;
+    const long long cx0 = cut.x, cy0 = cut.y, cx1 = right_of(cut), cy1 = bottom_of(cut);
+    lx::rect2i out[k_max]{};
+    unsigned n = 0;
+    unsigned i = 0;
+    for (; i < count; ++i) {
+        const lx::rect2i e = rects[i];
+        const long long ex0 = e.x, ey0 = e.y, ex1 = right_of(e), ey1 = bottom_of(e);
+        if (cx1 <= ex0 || cx0 >= ex1 || cy1 <= ey0 || cy0 >= ey1) {
+            out[n++] = e; // fits: n + (count - i) <= k_max holds throughout
+            continue;
+        }
+        // Up to four pieces: full-width bands above and below the cut, then the left and
+        // right remainders beside it.
+        lx::rect2i pieces[4]{};
+        unsigned p = 0;
+        const long long my0 = cy0 > ey0 ? cy0 : ey0;
+        const long long my1 = cy1 < ey1 ? cy1 : ey1;
+        if (cy0 > ey0)
+            pieces[p++] = rect_from_edges(ex0, ey0, ex1, cy0);
+        if (cy1 < ey1)
+            pieces[p++] = rect_from_edges(ex0, cy1, ex1, ey1);
+        if (cx0 > ex0)
+            pieces[p++] = rect_from_edges(ex0, my0, cx0, my1);
+        if (cx1 < ex1)
+            pieces[p++] = rect_from_edges(cx1, my0, ex1, my1);
+        // Pieces must also leave room for the rects not yet visited.
+        if (n + p + (count - i - 1) > k_max)
+            break;
+        for (unsigned j = 0; j < p; ++j)
+            out[n++] = pieces[j];
+    }
+    if (i < count) {
+        // Overflow: this rect and every one after it stay whole, which over-accepts.
+        for (; i < count && n < k_max; ++i)
+            out[n++] = rects[i];
+        approximated = true;
+    }
+    for (unsigned j = 0; j < n; ++j)
+        rects[j] = out[j];
+    count = n;
+}
+
+bool lx::compositor::input_region::contains(int x, int y) const {
+    if (infinite)
+        return true;
+    for (unsigned i = 0; i < count; ++i) {
+        const lx::rect2i& r = rects[i];
+        if (x >= r.x && y >= r.y && x < right_of(r) && y < bottom_of(r))
+            return true;
+    }
+    return false;
+}
+
+void lx::compositor::surface_manager::set_input_region(lx::surface_id surface,
+                                                       const input_region& region) {
+    if (const int slot = find_or_alloc_surface(surface); slot >= 0)
+        surfaces_[static_cast<unsigned>(slot)].input = region;
+}
+
+bool lx::compositor::surface_manager::hit(lx::surface_id surface, double x, double y,
+                                          double& sx, double& sy) const {
+    const int slot = find_surface(surface);
+    if (slot < 0)
+        return false;
+    const auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    const auto* n = entry.node;
+    if (!n || !n->is_visible())
+        return false;
+    const lx::point2i o = n->origin();
+    const lx::rect2i b = n->bounds();
+    const double lx_ = x - (o.x + b.x);
+    const double ly_ = y - (o.y + b.y);
+    if (lx_ < 0.0 || ly_ < 0.0 || lx_ >= b.width || ly_ >= b.height)
+        return false;
+    // Non-negative here, so truncation is floor.
+    if (!entry.input.contains(static_cast<int>(lx_), static_cast<int>(ly_)))
+        return false;
+    sx = lx_;
+    sy = ly_;
+    return true;
 }

@@ -60,6 +60,82 @@ Render loop ──drain──▶ render strand
 See [../uml/27-snapshot-v2-handoff.mmd](../uml/27-snapshot-v2-handoff.mmd) and
 [../uml/23-frame-handoff-sequence.mmd](../uml/23-frame-handoff-sequence.mmd).
 
+### Damage across the handoff
+
+Each snapshot carries a `gfx::damage_region` (up to 16 rects, no allocation): what changed
+since the previous *published* snapshot.
+
+- **Carry-forward (UI → render).** The mailbox keeps only the newest snapshot, so one the
+  render thread never acquired would take its damage with it. `snapshot_buffer` keeps an
+  `atomic<bool> consumed_` per slot, set by `acquire()`; `publish()` folds the damage of an
+  unconsumed previous snapshot into the new one. The race with a concurrent `acquire` can
+  only composite a rect twice, never skip one.
+- **Buffer age (render only).** Render keeps, per scanout slot, the damage that slot has
+  missed since it was last drawn into, and composites `frame damage ∪ slot age`. It also
+  keeps the damage since the last successful KMS commit, which is what FB_DAMAGE_CLIPS
+  must describe. Neither crosses a thread.
+- **Idle frames.** A tick with no damage composites and commits nothing. Frame callbacks
+  are then answered from the UI tick once render has consumed every damaged frame
+  (`last_rendered_frame_`), holds no composited-but-uncommitted frame
+  (`atomic<bool> frame_outstanding_`, lowered only after the commit raised `flip_pending`)
+  and no flip is queued.
+
+## Window management (UI affinity)
+
+`window_manager` (`lx.compositor:wm`), `toplevel_manager` and `surface_manager` are touched
+only by the UI thread: protocol handlers run inside `wayland.dispatch` in `tick_ui`, and
+`window_manager::on_tick` runs once per tick right after it. Window geometry, stacking
+order, the configure queue and focus are therefore plain data with no locks. They reach the
+render thread only as scene node origins and bounds inside the published snapshot — a
+commit that moves a window (left/top-edge resize) updates the node's origin and its buffer
+in the same UI call, so one snapshot carries both.
+
+Input takes the same path. libinput is dispatched on the UI thread, and every pointer
+event goes synchronously through `window_manager::on_pointer_motion` / `on_pointer_button`,
+which hit-test against the same node rects the scene will publish. That keeps focus and
+picture consistent without any handoff. A hit test is one pass over the stacking order with
+no allocation and no logging. When the scene changes under a still pointer (map, restack, a
+window that moved or resized), the WM does not re-test at once: it sets a flag and
+re-tests once at the next `on_tick`. An unmap of the focused window is the exception and
+re-tests immediately. Stacking changes reach the shell the same way, as one
+`stacking_order_changed` batch per tick.
+
+Interactive move/resize grabs are UI state too (`window_manager::grab()`). During a grab a
+motion event only records the pointer position (O(1), no client event); `on_tick` applies
+it once per frame, before `flush_configures` and before `cursor_manager::on_tick`. A move
+updates the record and the node origin; a resize updates the desired configure size, which
+`flush_configures` sends only when the previous one has been acked and committed. The
+cursor manager publishes its frame at the same tick during a grab (not per event), so the
+pointer and the dragged window are in the same snapshot and reach KMS in the same atomic
+commit. Escape is intercepted in the key path (`window_manager::on_key`) before
+`input_router`.
+
+Latency instrumentation crosses render → UI through one atomic: when a commit carries a
+pointer change, render stores `input_us << 1 | content` into `committed_input_us_` (only
+if it is 0, so a commit racing the flip handler drops its sample rather than being timed
+against the previous flip); the UI-side flip handler exchanges it with 0 and logs against
+the kernel flip timestamp. The sample window for percentiles is UI-only fixed storage.
+
+## Pointer cursor (UI → render)
+
+`cursor_manager` (`lx.compositor:cursor`) is UI affinity: input handlers, protocol requests
+(`wl_pointer.set_cursor`, `wp_cursor_shape_v1`) and `on_tick` all run on the UI thread. The
+KMS cursor plane (`drm::kms_cursor_plane`) is render affinity after `start`. Two
+single-producer single-consumer **latest-value triple buffers** (`latest_value<T>`, one
+atomic exchange per side, no locks, no allocation) connect them:
+
+| Mailbox | Carries | Written | Read |
+|---------|---------|---------|------|
+| `cursor_frame_mailbox` | position, visibility, hardware/software, image generation, input time | per motion event outside a grab; at `on_tick` otherwise | once per render tick, just before the commit is built |
+| `cursor_image_mailbox` | plane-sized premultiplied ARGB image + hotspot | when the resolved image changes | when the frame's image generation differs from the one staged |
+
+The reader owns the slot it last took until its next `take`, so the image it is copying into
+the plane's back buffer can never be overwritten underneath it. Render reports a rejected
+plane back through `atomic<bool> cursor_hw_failed_`, which `tick_ui` turns into
+`cursor_manager::on_hardware_failed()`; `atomic<bool> last_commit_content_` tells the UI-side
+flip handler whether the flip it is handling presented a frame or only moved the pointer.
+The software cursor is a scene node and crosses threads in the snapshot like any other.
+
 ## Modules
 
 | Module | Role |

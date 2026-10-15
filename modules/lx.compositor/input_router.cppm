@@ -45,16 +45,30 @@ public:
     void set_keyboard_focus(void* wl_surface_resource, lx::input::seat& seat);
     [[nodiscard]] void* keyboard_focus() const { return keyboard_focus_; }
 
-    /// Pointer focus, with the position in surface-local coordinates.
-    void set_pointer_focus(void* wl_surface_resource, double sx, double sy,
-                           lx::input::seat& seat);
+    /// Pointer focus, with the position in surface-local coordinates. Sends `leave` to the
+    /// old surface and `enter` (+ `frame`) to the new one. Returns the `enter` serial, or 0
+    /// when focus did not change or there is no new focus.
+    unsigned set_pointer_focus(void* wl_surface_resource, double sx, double sy,
+                               lx::input::seat& seat);
     [[nodiscard]] void* pointer_focus() const { return pointer_focus_; }
+    /// `wl_client*` owning the pointer-focus surface, or null.
+    [[nodiscard]] void* pointer_focus_client() const { return pointer_focus_client_; }
+    /// True when `serial` is an `enter` this router sent for the current pointer focus —
+    /// what wl_pointer.set_cursor and wp_cursor_shape_device_v1.set_shape must quote.
+    [[nodiscard]] bool is_pointer_enter_serial(unsigned serial) const;
+    /// Bumped on every pointer-focus change, including focus lost to a destroyed surface,
+    /// so state tied to the focused client (its cursor request) can tell it is stale.
+    [[nodiscard]] unsigned pointer_focus_generation() const { return pointer_focus_generation_; }
 
     void send_key(const lx::input::key_event& event, lx::input::seat& seat);
     void send_modifiers(const lx::input::modifier_state& mods, lx::input::seat& seat);
+    /// Surface-local position; also remembered for a `wl_pointer` created later, whose
+    /// `enter` must carry where the pointer is on that surface.
     void send_pointer_motion(double sx, double sy, unsigned time_ms);
-    void send_pointer_button(const lx::input::pointer_button_event& event,
-                             lx::input::seat& seat);
+    /// Returns the serial the button event carried, or 0 when nothing has pointer focus.
+    /// A press serial is what xdg_toplevel.move/resize must quote.
+    unsigned send_pointer_button(const lx::input::pointer_button_event& event,
+                                 lx::input::seat& seat);
     void send_pointer_axis(const lx::input::pointer_axis_event& event);
 
     [[nodiscard]] unsigned keyboard_count() const { return keyboards_.count; }
@@ -83,6 +97,19 @@ private:
     resource_set touches_{};
     void* keyboard_focus_ = nullptr;
     void* pointer_focus_ = nullptr;
+    void* pointer_focus_client_ = nullptr;
+    /// Last surface-local pointer position sent to the focus (enter or motion).
+    double pointer_sx_ = 0.0;
+    double pointer_sy_ = 0.0;
+    /// Enter serials sent for the current pointer focus: one per focus change, plus one per
+    /// wl_pointer the client creates while already focused.
+    static constexpr unsigned k_enter_serials = 4;
+    unsigned pointer_enter_serials_[k_enter_serials]{};
+    unsigned pointer_enter_count_ = 0;
+    unsigned pointer_focus_generation_ = 0;
+
+    void note_enter_serial(unsigned serial);
+    void clear_pointer_focus_state();
 };
 
 } // namespace lx::compositor
@@ -168,9 +195,10 @@ void lx::compositor::input_router::add_pointer(void* r, lx::input::seat& seat) {
     if (!r || !pointer_focus_ || !resource_set::same_client(r, pointer_focus_))
         return;
     auto* p = static_cast<wl_resource*>(r);
-    wl_pointer_send_enter(p, seat.next_serial(), static_cast<wl_resource*>(pointer_focus_),
-                          wl_fixed_from_double(seat.pointer_x()),
-                          wl_fixed_from_double(seat.pointer_y()));
+    const unsigned serial = seat.next_serial();
+    note_enter_serial(serial);
+    wl_pointer_send_enter(p, serial, static_cast<wl_resource*>(pointer_focus_),
+                          wl_fixed_from_double(pointer_sx_), wl_fixed_from_double(pointer_sy_));
     if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
         wl_pointer_send_frame(p);
 #else
@@ -188,8 +216,35 @@ void lx::compositor::input_router::remove(void* r) {
     // dangling pointer.
     if (keyboard_focus_ == r)
         keyboard_focus_ = nullptr;
-    if (pointer_focus_ == r)
+    if (pointer_focus_ == r) {
         pointer_focus_ = nullptr;
+        clear_pointer_focus_state();
+    }
+}
+
+void lx::compositor::input_router::note_enter_serial(unsigned serial) {
+    if (pointer_enter_count_ < k_enter_serials) {
+        pointer_enter_serials_[pointer_enter_count_++] = serial;
+        return;
+    }
+    for (unsigned i = 1; i < k_enter_serials; ++i)
+        pointer_enter_serials_[i - 1] = pointer_enter_serials_[i];
+    pointer_enter_serials_[k_enter_serials - 1] = serial;
+}
+
+void lx::compositor::input_router::clear_pointer_focus_state() {
+    pointer_focus_client_ = nullptr;
+    pointer_enter_count_ = 0;
+    ++pointer_focus_generation_;
+}
+
+bool lx::compositor::input_router::is_pointer_enter_serial(unsigned serial) const {
+    if (serial == 0)
+        return false;
+    for (unsigned i = 0; i < pointer_enter_count_; ++i)
+        if (pointer_enter_serials_[i] == serial)
+            return true;
+    return false;
 }
 
 void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::seat& seat) {
@@ -235,29 +290,38 @@ void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::
 #endif
 }
 
-void lx::compositor::input_router::set_pointer_focus(void* surface, double sx, double sy,
-                                                     lx::input::seat& seat) {
+unsigned lx::compositor::input_router::set_pointer_focus(void* surface, double sx, double sy,
+                                                         lx::input::seat& seat) {
 #if defined(LUMEN_HAS_WAYLAND)
     if (pointer_focus_ == surface)
-        return;
+        return 0;
 
     if (pointer_focus_) {
         const unsigned serial = seat.next_serial();
         for (unsigned i = 0; i < pointers_.count; ++i) {
             if (resource_set::same_client(pointers_.items[i], pointer_focus_)) {
-                wl_pointer_send_leave(static_cast<wl_resource*>(pointers_.items[i]), serial,
-                                      static_cast<wl_resource*>(pointer_focus_));
+                auto* p = static_cast<wl_resource*>(pointers_.items[i]);
+                wl_pointer_send_leave(p, serial, static_cast<wl_resource*>(pointer_focus_));
+                // `leave` is a frame of its own (wl_pointer v5): a client that groups
+                // events by frame would otherwise merge it with whatever comes next.
+                if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+                    wl_pointer_send_frame(p);
             }
         }
     }
 
     pointer_focus_ = surface;
+    clear_pointer_focus_state();
     seat.set_pointer_focus(surface ? lx::surface_id{reinterpret_cast<unsigned long long>(surface)}
                                    : lx::surface_id{});
     if (!surface)
-        return;
+        return 0;
 
+    pointer_focus_client_ = wl_resource_get_client(static_cast<wl_resource*>(surface));
+    pointer_sx_ = sx;
+    pointer_sy_ = sy;
     const unsigned serial = seat.next_serial();
+    note_enter_serial(serial);
     for (unsigned i = 0; i < pointers_.count; ++i) {
         if (!resource_set::same_client(pointers_.items[i], surface))
             continue;
@@ -267,11 +331,13 @@ void lx::compositor::input_router::set_pointer_focus(void* surface, double sx, d
         if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(p);
     }
+    return serial;
 #else
     (void)surface;
     (void)sx;
     (void)sy;
     (void)seat;
+    return 0;
 #endif
 }
 
@@ -318,6 +384,8 @@ void lx::compositor::input_router::send_pointer_motion(double sx, double sy,
 #if defined(LUMEN_HAS_WAYLAND)
     if (!pointer_focus_)
         return;
+    pointer_sx_ = sx;
+    pointer_sy_ = sy;
     for (unsigned i = 0; i < pointers_.count; ++i) {
         if (!resource_set::same_client(pointers_.items[i], pointer_focus_))
             continue;
@@ -333,11 +401,11 @@ void lx::compositor::input_router::send_pointer_motion(double sx, double sy,
 #endif
 }
 
-void lx::compositor::input_router::send_pointer_button(
+unsigned lx::compositor::input_router::send_pointer_button(
     const lx::input::pointer_button_event& event, lx::input::seat& seat) {
 #if defined(LUMEN_HAS_WAYLAND)
     if (!pointer_focus_)
-        return;
+        return 0;
     const unsigned serial = seat.next_serial();
     for (unsigned i = 0; i < pointers_.count; ++i) {
         if (!resource_set::same_client(pointers_.items[i], pointer_focus_))
@@ -349,9 +417,11 @@ void lx::compositor::input_router::send_pointer_button(
         if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(p);
     }
+    return serial;
 #else
     (void)event;
     (void)seat;
+    return 0;
 #endif
 }
 

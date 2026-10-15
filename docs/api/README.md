@@ -28,17 +28,19 @@ C++26 module API surface for future implementation. All modules live under `modu
 | [`lx.session.privilege`](../modules/lx.session/privilege.cppm) | Shell access control | `privilege_checker`, `shell_verification` |
 | [`lx.input`](../modules/lx.input/lx.input.cppm) | Input devices | `seat`, `pointer`, `keyboard`, `input_manager` |
 | [`lx.drm`](../modules/lx.drm/lx.drm.cppm) | KMS/DRM | `kms_device`, `plane_manager`, `mode` |
-| [`lx.drm.atomic`](../modules/lx.drm/atomic.cppm) | Atomic KMS | `kms_atomic_commit`, `kms_damage_region`, `page_flip_event` |
+| [`lx.drm.atomic`](../modules/lx.drm/atomic.cppm) | Atomic KMS; cursor-only and TEST_ONLY commits | `kms_atomic_commit`, `kms_damage_region`, `page_flip_event`, `atomic_commit_request::cursor` |
+| [`lx.drm.cursor`](../modules/lx.drm/cursor_plane.cppm) | KMS cursor plane: type-matched plane, SIZE_HINTS / `DRM_CAP_CURSOR_*` sizing, two ARGB8888 dumb buffers, HOTSPOT_X/Y | `kms_cursor_plane`, `cursor_plane_caps` |
 | [`lx.wayland.server`](../modules/lx.wayland.server/lx.wayland.server.cppm) | Compositor protocol core | `server`, `client_connection`, `resource`, `global_descriptor` (libwayland `wl_resource_set_implementation` vtables; no opcode router) |
 | [`lx.wayland.client`](../modules/lx.wayland.client/lx.wayland.client.cppm) | Client connection | `display`, `surface`, `xdg_toplevel` |
 | [`lx.gfx`](../modules/lx.gfx/lx.gfx.cppm) | Vulkan RHI | `device`, `swapchain`, `render_pass`, `dmabuf_importer` |
 | [`lx.gfx.import_cache`](../modules/lx.gfx/import_cache.cppm) | Import reuse + LRU | `dmabuf_import_cache`, `import_cache_key`, per-client limits |
 | [`lx.gfx.semaphore_pool`](../modules/lx.gfx/semaphore_pool.cppm) | Reusable timeline semaphores | `timeline_semaphore_pool`, `timeline_semaphore_handle` |
 | [`lx.gfx.syncobj`](../modules/lx.gfx/syncobj_bridge.cppm) | drm-syncobj ↔ Vulkan timelines | `syncobj_bridge`, `syncobj_timeline` |
+| [`lx.gfx.damage`](../modules/lx.gfx/damage.cppm) | Fixed-capacity multi-rect damage (16 rects = FB_DAMAGE_CLIPS), no allocation | `damage_region`, `k_damage_rects` |
 | [`lx.layout`](../modules/lx.layout/lx.layout.cppm) | Layout engine | `flex_node`, `grid_node`, `layout_engine` |
 | [`lx.text`](../modules/lx.text/lx.text.cppm) | Text shaping | `font_stack`, `text_layout` |
 | [`lx.scene`](../modules/lx.scene/lx.scene.cppm) | Scene graph | `scene_graph`, `commit_frame`, `acquire_render_snapshot` |
-| [`lx.scene.snapshot`](../modules/lx.scene/snapshot_buffer.cppm) | Immutable frames | `snapshot_buffer`, `immutable_frame_snapshot` |
+| [`lx.scene.snapshot`](../modules/lx.scene/snapshot_buffer.cppm) | Immutable frames; damage carried forward over unconsumed snapshots | `snapshot_buffer`, `immutable_frame_snapshot::damage_rects` |
 | [`lx.ui`](../modules/lx.ui/lx.ui.cppm) | Widget toolkit | `ui_node`, `element`, `reconciler`, `draw_scope` |
 | [`lx.ui.element`](../modules/lx.ui/element.cppm) | Descriptors + frame arena | `element`, `child`, `build_context`, `next_element_type_id` |
 | [`lx.ui.node`](../modules/lx.ui/node.cppm) | Retained nodes + draw emission | `ui_node`, `draw_scope`, `size_hint`, `describe<>` |
@@ -56,10 +58,12 @@ C++26 module API surface for future implementation. All modules live under `modu
 | [`lx.shell`](../modules/lx.shell/lx.shell.cppm) | Desktop shell | `shell_app`, `panel`, `workspace_controller` |
 | [`lx.compositor`](../modules/lx.compositor/lx.compositor.cppm) | Compositor | `compositor`, `output_manager`, `seat_manager` |
 | [`lx.compositor.buffer_lifecycle`](../modules/lx.compositor/buffer_lifecycle.cppm) | Buffer lifetimes | `buffer_lifecycle_tracker`, `buffer_lifecycle_state` |
-| [`lx.compositor.surface`](../modules/lx.compositor/surface_manager.cppm) | Surface commits | `surface_manager`, `surface_commit` |
-| [`lx.compositor.toplevel`](../modules/lx.compositor/toplevel_manager.cppm) | Toplevel registry | `toplevel_manager`, `toplevel_record` |
+| [`lx.compositor.surface`](../modules/lx.compositor/surface_manager.cppm) | Surface commits, scene nodes, input regions | `surface_manager`, `surface_commit`, `input_region` |
+| [`lx.compositor.toplevel`](../modules/lx.compositor/toplevel_manager.cppm) | Toplevel registry, stacking order, configure state machine (single in flight, ack matching) | `toplevel_manager`, `toplevel_record`, `toplevel_configure` |
+| [`lx.compositor.wm`](../modules/lx.compositor/window_manager.cppm) | Window geometry (source of truth), placement, configure flush, hit-testing, pointer/keyboard focus, implicit grab, stacking, interactive move/resize grabs | `window_manager`, `wm_hit`, `wm_grab`, `grab_mode`, `anchored_geometry`, `place_new_window`, `resize_target`, `edges_for_point` |
 | [`lx.compositor.shell_bridge`](../modules/lx.compositor/shell_bridge.cppm) | Shell protocol server | `shell_bridge`, snapshot/delta emitters |
-| [`lx.compositor.cursor`](../modules/lx.compositor/cursor_manager.cppm) | Cursor rendering | `cursor_manager`, `cursor_kind` |
+| [`lx.compositor.cursor`](../modules/lx.compositor/cursor_manager.cppm) | Pointer image and position: precedence (grab override → client shape/surface/hidden → default), UI→render mailboxes, software-cursor scene node | `cursor_manager`, `cursor_frame`, `latest_value`, `cursor_node` |
+| [`lx.compositor.xcursor`](../modules/lx.compositor/xcursor.cppm) | Xcursor theme loader (`XCURSOR_THEME`/`XCURSOR_SIZE`/`XCURSOR_PATH`, `Inherits=`) and the built-in vector cursors rasterized at the requested size | `xcursor_theme`, `cursor_shape`, `parse_xcursor`, `rasterize_builtin` |
 | [`lx.compositor.output`](../modules/lx.compositor/output_manager.cppm) | Output present | `output_manager`, `present_mode` |
 | [`lx.portal`](../modules/lx.portal/lx.portal.cppm) | Flatpak portal (optional) | `desktop_portal`, `capability_token` |
 | [`lx.app`](../modules/lx.app/lx.app.cppm) | Application framework | `lx::application`, `settings`, `clipboard` |
@@ -128,11 +132,11 @@ lx.foundation  → types, result, handles, error, wm_types
 lx.sync        → queue
 lx.runtime     → executor, memory
 lx.scene       → snapshot (double-buffered immutable frames)
-lx.gfx         → dmabuf, syncobj, import_cache
-lx.drm         → atomic (kms_damage, page_flip)
+lx.gfx         → damage, dmabuf, syncobj, import_cache
+lx.drm         → atomic (kms_damage, page_flip), cursor (kms_cursor_plane)
 lx.ui          → element, node, invalidate, reconcile, decorator, reducer,
                  events, style, theme.compile
-lx.compositor  → surface, toplevel, shell_bridge, cursor, output
+lx.compositor  → surface, toplevel, wm, shell_bridge, xcursor, cursor, output
 lx.session     → privilege
 lx.scheduler   → presentation, budget
 lx.shell       → bridge

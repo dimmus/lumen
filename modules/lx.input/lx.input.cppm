@@ -40,6 +40,9 @@ struct pointer_motion_event {
     double y = 0.0;
     bool absolute = false;
     unsigned time_ms = 0;
+    /// libinput's microsecond timestamp (CLOCK_MONOTONIC). `time_ms` is what the wire
+    /// carries; this is what latency is measured against.
+    unsigned long long time_us = 0;
 };
 
 struct pointer_button_event {
@@ -47,6 +50,7 @@ struct pointer_button_event {
     unsigned evdev_code = 0;
     bool pressed = false;
     unsigned time_ms = 0;
+    unsigned long long time_us = 0;
 };
 
 struct pointer_axis_event {
@@ -57,12 +61,14 @@ struct pointer_axis_event {
     double vertical_discrete = 0.0;
     axis_source source = axis_source::unknown;
     unsigned time_ms = 0;
+    unsigned long long time_us = 0;
 };
 
 struct key_event {
     unsigned evdev_keycode = 0;
     bool pressed = false;
     unsigned time_ms = 0;
+    unsigned long long time_us = 0;
 };
 
 struct touch_event {
@@ -425,6 +431,7 @@ void lx::input::input_manager::handle_event(void* raw) {
         out.dx = libinput_event_pointer_get_dx(p);
         out.dy = libinput_event_pointer_get_dy(p);
         out.time_ms = libinput_event_pointer_get_time(p);
+        out.time_us = libinput_event_pointer_get_time_usec(p);
         seat_.set_pointer_position(seat_.pointer_x() + out.dx, seat_.pointer_y() + out.dy);
         out.x = seat_.pointer_x();
         out.y = seat_.pointer_y();
@@ -442,6 +449,7 @@ void lx::input::input_manager::handle_event(void* raw) {
         out.x = libinput_event_pointer_get_absolute_x_transformed(p, 1);
         out.y = libinput_event_pointer_get_absolute_y_transformed(p, 1);
         out.time_ms = libinput_event_pointer_get_time(p);
+        out.time_us = libinput_event_pointer_get_time_usec(p);
         if (sink_.pointer_motion)
             sink_.pointer_motion(out, sink_.user);
         break;
@@ -455,6 +463,7 @@ void lx::input::input_manager::handle_event(void* raw) {
         out.pressed = libinput_event_pointer_get_button_state(p) ==
                       LIBINPUT_BUTTON_STATE_PRESSED;
         out.time_ms = libinput_event_pointer_get_time(p);
+        out.time_us = libinput_event_pointer_get_time_usec(p);
         if (sink_.pointer_button)
             sink_.pointer_button(out, sink_.user);
         break;
@@ -466,6 +475,7 @@ void lx::input::input_manager::handle_event(void* raw) {
         auto* p = libinput_event_get_pointer_event(ev);
         pointer_axis_event out{};
         out.time_ms = libinput_event_pointer_get_time(p);
+        out.time_us = libinput_event_pointer_get_time_usec(p);
         // The source is the event type. libinput_event_pointer_get_axis_source() is only
         // valid for the deprecated LIBINPUT_EVENT_POINTER_AXIS, and calling it on these
         // makes libinput print "client bug: Invalid event type ... passed to
@@ -503,6 +513,7 @@ void lx::input::input_manager::handle_event(void* raw) {
         out.pressed = libinput_event_keyboard_get_key_state(k) ==
                       LIBINPUT_KEY_STATE_PRESSED;
         out.time_ms = libinput_event_keyboard_get_time(k);
+        out.time_us = libinput_event_keyboard_get_time_usec(k);
 
         // xkb state first: a client that reads modifiers after the key event must see the
         // state that key produced, and the compositor's own bindings need it too.

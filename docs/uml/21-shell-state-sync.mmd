@@ -7,13 +7,13 @@ sequenceDiagram
     Comp->>Shell: capabilities(flags, version)
     Shell->>Comp: get_policy_bridge()
     Comp->>Shell: snapshot_begin
-    Comp->>Shell: snapshot_workspace (×N)
-    Comp->>Shell: snapshot_toplevel (×N)
-    Comp->>Shell: snapshot_output (×N)
+    Note over Comp: no snapshot_workspace / snapshot_output yet<br/>(no workspace objects; wl_output not per-client)
+    Comp->>Shell: snapshot_toplevel (×N, new zlm_toplevel_v1, workspace=null)
     Comp->>Shell: snapshot_done
     Note over Shell: Shell UI fully initialized
 
-    Comp->>Shell: toplevel_created (new zlm_toplevel_v1)
+    Comp->>Shell: toplevel_created (new zlm_toplevel_v1, workspace=null)
     Comp->>Shell: toplevel_state + toplevel_geometry
+    Comp->>Shell: toplevel_geometry (each committed size/position change)
     Shell->>Bridge: set_toplevel_stacking_index
     Comp->>Shell: stacking_order_changed (done=1)

@@ -10,6 +10,7 @@ export module lx.drm:atomic;
 export namespace lx::drm {
 
 class kms_device;
+class kms_cursor_plane;
 
 struct kms_damage_region {
     lx::rect2i rects[16]{};
@@ -29,6 +30,14 @@ struct atomic_commit_request {
     /// When set, receives an owned sync_file FD for the commit completion fence, or -1.
     /// The caller must close it.
     int* out_fence_fd_ptr = nullptr;
+    /// Borrowed. When set and `dirty()`, the cursor plane's state rides this commit — so the
+    /// pointer and the frame under it reach the screen in the same vblank.
+    kms_cursor_plane* cursor = nullptr;
+    /// False for a cursor-only commit: the primary plane is left exactly as it is (no FB,
+    /// damage or fences), and the commit fails rather than performing the first modeset.
+    bool update_primary = true;
+    /// DRM_MODE_ATOMIC_TEST_ONLY: validate, apply nothing, raise no event.
+    bool test_only = false;
 };
 
 struct page_flip_event {
@@ -66,6 +75,12 @@ public:
     /// that drains events.
     [[nodiscard]] bool flip_pending() const;
 
+    /// True when the last failed `commit()` was the kernel refusing the requested state
+    /// (EINVAL, ERANGE, ENOSPC). False when the device was unavailable instead — EACCES
+    /// after DRM master went to another VT, EBUSY, EINTR, ENOMEM — which says nothing
+    /// about the state asked for. Committing thread only.
+    [[nodiscard]] bool last_failure_rejected_state() const { return last_rejected_state_; }
+
 private:
     [[nodiscard]] lx::result<void> ensure_props();
     /// Full atomic modeset: binds connector → CRTC, sets the mode and enables the plane.
@@ -83,6 +98,7 @@ private:
     unsigned framebuffer_id_ = 0;
     unsigned damage_blob_id_ = 0;
     std::atomic<bool> flip_pending_{false};
+    bool last_rejected_state_ = false;
 
     unsigned prop_crtc_id_ = 0;
     unsigned prop_fb_id_ = 0;

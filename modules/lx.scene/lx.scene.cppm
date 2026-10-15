@@ -59,6 +59,12 @@ public:
     [[nodiscard]] unsigned child_count() const;
     [[nodiscard]] scene_node* child_at(unsigned index) const;
 
+    /// Moves `child` to paint position `index` (0 = bottom), clamped to the last slot,
+    /// preserving the relative order of the others. False if `child` is not a child.
+    bool move_to(scene_node* child, unsigned index);
+    /// `move_to` the top (painted last). False if `child` is not a child.
+    bool raise_to_top(scene_node* child);
+
 private:
     lx::layout::flex_node layout_{};
     scene_node* children_[128]{};
@@ -92,8 +98,15 @@ public:
 
     /// UI thread: mutate scene, layout, mark damage.
     void update(double dt_seconds);
+    /// Bounding box of the damage noted since the last publish.
     void collect_damage(lx::rect2i& total_damage);
+    /// Global (output) coordinates. Kept as separate rects, merged only where cheap — see
+    /// `gfx::damage_region`.
     void note_damage(lx::rect2i region);
+    /// The whole output changed (mode change, first frame).
+    void note_full_damage();
+    /// Damage noted since the last publish. Empty means the next snapshot changes nothing.
+    [[nodiscard]] const lx::gfx::damage_region& pending_damage() const;
 
     /// UI thread: traverse scene graph into target draw list (zero interim copy).
     void build_draw_list_into(draw_list& out);
@@ -114,7 +127,7 @@ private:
 
     container_node root_{};
     snapshot_buffer snapshots_{};
-    lx::rect2i scratch_damage_{};
+    lx::gfx::damage_region scratch_damage_{};
 };
 
 } // namespace lx::scene
@@ -192,6 +205,33 @@ unsigned lx::scene::container_node::child_count() const { return count_; }
 lx::scene::scene_node* lx::scene::container_node::child_at(unsigned index) const {
     return index < count_ ? children_[index] : nullptr;
 }
+bool lx::scene::container_node::move_to(scene_node* c, unsigned index) {
+    if (!c || count_ == 0)
+        return false;
+    unsigned from = count_;
+    for (unsigned i = 0; i < count_; ++i) {
+        if (children_[i] == c) {
+            from = i;
+            break;
+        }
+    }
+    if (from == count_)
+        return false;
+    const unsigned to = index < count_ ? index : count_ - 1;
+    // Order-preserving shift of the span between the two positions.
+    if (from < to) {
+        for (unsigned i = from; i < to; ++i)
+            children_[i] = children_[i + 1];
+    } else {
+        for (unsigned i = from; i > to; --i)
+            children_[i] = children_[i - 1];
+    }
+    children_[to] = c;
+    return true;
+}
+bool lx::scene::container_node::raise_to_top(scene_node* c) {
+    return count_ > 0 && move_to(c, count_ - 1);
+}
 
 lx::scene::surface_node::surface_node(lx::surface_id s) : surface_{s} {}
 void lx::scene::surface_node::attach(lx::gfx::imported_image img) {
@@ -247,26 +287,21 @@ void lx::scene::scene_graph::update(double) {
 }
 void lx::scene::scene_graph::collect_damage(lx::rect2i& d) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    d = scratch_damage_;
+    d = scratch_damage_.bounds();
 }
 
 void lx::scene::scene_graph::note_damage(lx::rect2i region) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    if (region.width <= 0 || region.height <= 0)
-        return;
-    if (scratch_damage_.width <= 0 || scratch_damage_.height <= 0) {
-        scratch_damage_ = region;
-        return;
-    }
-    const int x0 = scratch_damage_.x < region.x ? scratch_damage_.x : region.x;
-    const int y0 = scratch_damage_.y < region.y ? scratch_damage_.y : region.y;
-    const int x1 = (scratch_damage_.x + scratch_damage_.width) > (region.x + region.width)
-                       ? (scratch_damage_.x + scratch_damage_.width)
-                       : (region.x + region.width);
-    const int y1 = (scratch_damage_.y + scratch_damage_.height) > (region.y + region.height)
-                       ? (scratch_damage_.y + scratch_damage_.height)
-                       : (region.y + region.height);
-    scratch_damage_ = {x0, y0, x1 - x0, y1 - y0};
+    scratch_damage_.add(region);
+}
+
+void lx::scene::scene_graph::note_full_damage() {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    scratch_damage_.set_full();
+}
+
+const lx::gfx::damage_region& lx::scene::scene_graph::pending_damage() const {
+    return scratch_damage_;
 }
 
 void lx::scene::scene_graph::emit_node(scene_node* node, draw_list& out) {
@@ -306,7 +341,7 @@ bool lx::scene::scene_graph::commit_frame(unsigned frame_index) {
     // Damage accumulates per frame. Retain it when the publish was dropped, otherwise the
     // region would be lost and the next presented frame would under-report its damage.
     if (published)
-        scratch_damage_ = {};
+        scratch_damage_.clear();
     return published;
 }
 

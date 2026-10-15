@@ -19,6 +19,17 @@ sequenceDiagram
     RT->>VK: record draws + present
     Note over RT,VK: snapshot is read-only; no UI mutation
 
+    participant CM as cursor mailboxes
+    participant KMS as KMS (atomic)
+    UI->>CM: publish cursor_frame (per motion) / plane image (on change)
+    RT->>CM: take newest frame + image, right before the commit
+    alt frame composited
+        RT->>KMS: commit primary FB + cursor plane props (same vblank)
+    else nothing composited, pointer moved
+        RT->>KMS: cursor-only commit (no composite)
+    end
+    KMS-->>UI: flip event (cursor-only: re-arm clock, no frame callbacks)
+
     participant Worker as Worker thread
     Note over Worker: affinity = worker
     Worker->>Worker: layout / decode / shape
