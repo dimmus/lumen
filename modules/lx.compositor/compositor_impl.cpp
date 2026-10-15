@@ -15,6 +15,11 @@ module;
 #include <unistd.h>
 #include <utility>
 
+#if defined(__linux__)
+#include <linux/sync_file.h>
+#include <sys/ioctl.h>
+#endif
+
 import lx.foundation;
 import lx.sync;
 import lx.trace;
@@ -191,8 +196,21 @@ struct compositor_impl {
     /// Render affinity. A commit carrying this tick's cursor frame succeeded.
     void note_committed_input(bool content);
     /// UI affinity. Logs one present and, every `k_latency_window`, a summary.
-    void note_present_latency(unsigned long long present_ns);
+    void note_present_latency(unsigned long long present_ns, unsigned long long submit_us,
+                              unsigned long long fence_us);
     void log_latency_summary();
+    /// Render → UI. When the commit whose flip is pending was issued, and a dup of the
+    /// sync_file its plane waited on (-1 when there was none). With the flip timestamp
+    /// they split a present into compositor, GPU and display time, which is what tells a
+    /// slow tail on a VM host from one in Lumen. Published before the commit ioctl, since
+    /// its flip can be drained before the ioctl returns; taken by the flip handler. Only
+    /// filled while debug logging is on: a dup per commit is not free.
+    std::atomic<unsigned long long> committed_submit_us_{0};
+    std::atomic<int> committed_fence_fd_{-1};
+    /// Render affinity. Publishes the timing above for a commit about to be issued.
+    void publish_commit_timing(int fence_fd);
+    /// Render affinity. Takes it back after the commit failed.
+    void retract_commit_timing();
 
     /// Render affinity. Prepares the plane for this tick's commit (newest position, a new
     /// image staged into the back buffer) — only when no flip is pending, which is also the
@@ -332,7 +350,11 @@ struct compositor_impl {
         seats.bind(this);
     }
 
-    ~compositor_impl() { delete[] blits_; }
+    ~compositor_impl() {
+        delete[] blits_;
+        if (const int fd = committed_fence_fd_.exchange(-1); fd >= 0)
+            ::close(fd);
+    }
 
     compositor_impl(const compositor_impl&) = delete;
     compositor_impl& operator=(const compositor_impl&) = delete;
@@ -415,7 +437,56 @@ void compositor_impl::note_committed_input(bool content) {
                                                       std::memory_order_relaxed);
 }
 
-void compositor_impl::note_present_latency(unsigned long long present_ns) {
+namespace {
+/// CLOCK_MONOTONIC microseconds at which every fence in a sync_file signalled, or 0 when
+/// that is unknown (not signalled, an error, or more fences than this reads).
+unsigned long long sync_file_signal_us(int fd) {
+#if defined(__linux__)
+    sync_fence_info fences[4]{};
+    sync_file_info info{};
+    info.num_fences = 4;
+    info.sync_fence_info = reinterpret_cast<__u64>(fences);
+    if (::ioctl(fd, SYNC_IOC_FILE_INFO, &info) != 0 || info.status != 1)
+        return 0;
+    unsigned long long latest = 0;
+    for (unsigned i = 0; i < info.num_fences && i < 4; ++i) {
+        if (fences[i].status != 1)
+            return 0;
+        if (fences[i].timestamp_ns > latest)
+            latest = fences[i].timestamp_ns;
+    }
+    return latest / 1000ull;
+#else
+    (void)fd;
+    return 0;
+#endif
+}
+
+unsigned long long monotonic_us() {
+    return static_cast<unsigned long long>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+} // namespace
+
+void compositor_impl::publish_commit_timing(int fence_fd) {
+    if (lx::trace::logger::global().min_level() > lx::trace::level::debug)
+        return;
+    const int dup_fd = fence_fd >= 0 ? ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0) : -1;
+    if (const int old = committed_fence_fd_.exchange(dup_fd, std::memory_order_acq_rel); old >= 0)
+        ::close(old);
+    committed_submit_us_.store(monotonic_us(), std::memory_order_release);
+}
+
+void compositor_impl::retract_commit_timing() {
+    committed_submit_us_.store(0, std::memory_order_release);
+    if (const int old = committed_fence_fd_.exchange(-1, std::memory_order_acq_rel); old >= 0)
+        ::close(old);
+}
+
+void compositor_impl::note_present_latency(unsigned long long present_ns,
+                                           unsigned long long submit_us,
+                                           unsigned long long fence_us) {
     const unsigned long long packed = committed_input_us_.exchange(0, std::memory_order_acquire);
     if (packed == 0 || present_ns == 0)
         return;
@@ -426,9 +497,18 @@ void compositor_impl::note_present_latency(unsigned long long present_ns) {
     const unsigned long long latency_us = present_us - input_us;
     if (lx::trace::logger::global().min_level() > lx::trace::level::debug)
         return;
-    char line[160];
-    std::snprintf(line, sizeof(line), "present kind=%s input_us=%llu present_us=%llu latency_us=%llu",
-                  (packed & 1u) ? "content" : "cursor", input_us, present_us, latency_us);
+    // A timing submitted after this flip landed belongs to a newer commit, picked up because
+    // the flip handler raced it: report nothing rather than the wrong commit's breakdown.
+    if (submit_us > present_us || submit_us < input_us) {
+        submit_us = 0;
+        fence_us = 0;
+    }
+    char line[224];
+    std::snprintf(line, sizeof(line),
+                  "present kind=%s input_us=%llu present_us=%llu latency_us=%llu "
+                  "submit_us=%llu fence_us=%llu",
+                  (packed & 1u) ? "content" : "cursor", input_us, present_us, latency_us,
+                  submit_us, fence_us);
     lx::trace::logger::global().log(lx::trace::level::debug, "compositor.latency", line);
     latency_samples_[latency_sample_count_++] = latency_us;
     if (latency_sample_count_ == k_latency_window)
@@ -1169,8 +1249,17 @@ void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback
         impl->vsync_timer->schedule_at(impl->repaint_.next_start(now));
     }
 
+    // Taken on every flip, sampled or not, so the dup'd fence is always closed.
+    const unsigned long long submit_us =
+        impl->committed_submit_us_.exchange(0, std::memory_order_acq_rel);
+    unsigned long long fence_us = 0;
+    if (const int fd = impl->committed_fence_fd_.exchange(-1, std::memory_order_acq_rel);
+        fd >= 0) {
+        fence_us = sync_file_signal_us(fd);
+        ::close(fd);
+    }
     if (fb.hw_clock)
-        impl->note_present_latency(fb.actual_present_ns);
+        impl->note_present_latency(fb.actual_present_ns, submit_us, fence_us);
 
     if (!fb.hw_clock || !fb.vsync)
         return;
@@ -1964,7 +2053,10 @@ void compositor::tick_render() {
 
         impl_->pending_flip_slot_.store(present_slot, std::memory_order_release);
         impl_->last_commit_content_.store(true, std::memory_order_release);
+        impl_->publish_commit_timing(impl_->composited_fence_fd_);
         const auto committed = impl_->kms_atomic.commit(req);
+        if (!committed)
+            impl_->retract_commit_timing();
         if (!committed && cursor_rode) {
             // Do not let the plane take frames down with it: if the cursor state alone is
             // rejected, the plane is unusable and the frame retries without it.
@@ -2023,10 +2115,12 @@ void compositor::tick_render() {
         impl_->pending_flip_slot_.store(impl_->scanout_front_.load(std::memory_order_acquire),
                                         std::memory_order_release);
         impl_->last_commit_content_.store(false, std::memory_order_release);
+        impl_->publish_commit_timing(-1);
         if (auto committed = impl_->kms_atomic.commit(req); committed) {
             commit_kind = "cursor";
             impl_->note_committed_input(false);
         } else {
+            impl_->retract_commit_timing();
             commit_kind = "cursor-failed";
             // EBUSY (a flip raced in) and EACCES (DRM master on another VT) are transient;
             // only a state the plane itself refuses, confirmed by TEST_ONLY, disables it.

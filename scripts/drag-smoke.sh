@@ -24,7 +24,13 @@
 # LUMEN_INJECT_POINTER / LUMEN_INJECT_KEYBOARD). The VMware/QEMU console mouse is absolute.
 #
 # The scenarios move the pointer and press buttons on the real devices, so do not touch
-# the mouse or keyboard while it runs (about 30 s).
+# the mouse or keyboard while it runs (about 30 s), and keep the host pointer outside the
+# VM window: a VM console forwards it through the very device the injector writes to. The
+# script says so before it starts, then watches every input node for the whole run
+# (inject-input.py watch); any frame the injector did not write makes the run INVALID
+# rather than a list of misleading FAILs.
+#
+# Exit status: 0 PASS (possibly with warnings), 1 FAIL, 2 could not run, 3 INVALID.
 #
 #   a  client move:  press inside the square, drag (+200,+120)   → origin moved, size kept
 #   b  client resize, bottom-right corner, (+150,+100)          → resizing configures,
@@ -35,7 +41,13 @@
 #                                                                 press/release
 #   f  click-to-focus/raise with two squares                     → raise + keyboard focus,
 #                                                                 hit-test follows stacking
-#   g  latency: injected motion → first page flip that shows it (cursor; moved window)
+#   g  latency: injected motion → first page flip that shows it (cursor; moved window).
+#      FAIL when a median exceeds 1.5 refresh periods + 4 ms: that is Lumen's own pacing.
+#      WARN when a p95 exceeds 2 periods + 4 ms: tails here are often the host's. Each
+#      sample is split from the compositor's present lines into: queued (waiting for the
+#      previous frame's flip — only one is in flight), compositor (frame pacing + render,
+#      up to the commit), GPU (commit → composite fence signalled) and display (→ flip),
+#      so a WARN says whose time it was.
 #   h  frame-perfect resize over b–d: one configure in flight, every committed geometry
 #      matches its configure, no frame without one
 #   i  client killed mid-grab (Super-drag)                       → grab ends, compositor lives
@@ -52,9 +64,11 @@ KEYBOARD_DEV="${LUMEN_INJECT_KEYBOARD:-/dev/input/event1}"
 SOCKET="lumen-drag-smoke"
 LOG_DIR="${ROOT}/drag-smoke-logs"
 JOIN_SEAT=0
+COUNTDOWN=3
 while (( $# > 0 )); do
   case "$1" in
     --join-seat-session) JOIN_SEAT=1 ;;
+    --countdown) COUNTDOWN="${2:?--countdown needs seconds}"; shift ;;
     --socket) SOCKET="${2:?--socket needs a name}"; shift ;;
     --logs) LOG_DIR="${2:?--logs needs a directory}"; shift ;;
     -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
@@ -68,10 +82,11 @@ SQ1_LOG="${LOG_DIR}/square1.log"
 SQ2_LOG="${LOG_DIR}/square2.log"
 INJ_LOG="${LOG_DIR}/inject.jsonl"
 SCEN_LOG="${LOG_DIR}/scenarios.jsonl"
+WATCH_LOG="${LOG_DIR}/watch.jsonl"
 RUN_LOG="${LOG_DIR}/run.log"
 
 mkdir -p "$LOG_DIR"
-for f in "$COMP_LOG" "$SQ1_LOG" "$SQ2_LOG" "$INJ_LOG" "$SCEN_LOG"; do : > "$f"; done
+for f in "$COMP_LOG" "$SQ1_LOG" "$SQ2_LOG" "$INJ_LOG" "$SCEN_LOG" "$WATCH_LOG"; do : > "$f"; done
 
 # Everything printed also goes to run.log: the compositor owns the console while this
 # runs, so whatever scrolls by is otherwise lost.
@@ -162,7 +177,7 @@ fi
 rm -f "$SOCKET_PATH" "$LOCK_PATH"
 
 # ── Processes and cleanup ────────────────────────────────────────────────────
-COMP_PID=""; SQ1_PID=""; SQ2_PID=""; BG_INJ_PID=""
+COMP_PID=""; SQ1_PID=""; SQ2_PID=""; BG_INJ_PID=""; WATCH_PID=""
 COMP_RC="not-stopped"
 
 stop_compositor() {
@@ -179,6 +194,14 @@ stop_compositor() {
   COMP_PID=""
 }
 
+# The watcher runs under sudo; signalling sudo's PID relays the signal to it.
+stop_watch() {
+  [[ -n "$WATCH_PID" ]] || return 0
+  kill -TERM "$WATCH_PID" 2>/dev/null
+  wait "$WATCH_PID" 2>/dev/null
+  WATCH_PID=""
+}
+
 cleanup() {
   [[ -n "$BG_INJ_PID" ]] && { kill -TERM "$BG_INJ_PID" 2>/dev/null; wait "$BG_INJ_PID" 2>/dev/null; }
   for pid in "$SQ1_PID" "$SQ2_PID"; do
@@ -186,6 +209,7 @@ cleanup() {
   done
   SQ1_PID=""; SQ2_PID=""; BG_INJ_PID=""
   stop_compositor
+  stop_watch
   rm -f "$SOCKET_PATH" "$LOCK_PATH"
   close_log
 }
@@ -252,6 +276,21 @@ finish() {
 }
 
 # ── Start ────────────────────────────────────────────────────────────────────
+echo "┌──────────────────────────────────────────────────────────────────────────┐"
+echo "│ HANDS OFF for about 30 s: do not touch the mouse or keyboard, and keep   │"
+echo "│ the host pointer OUTSIDE the VM window. Real input mixes with injected   │"
+echo "│ input on the same device; if any is seen, the run is reported INVALID.   │"
+echo "└──────────────────────────────────────────────────────────────────────────┘"
+for (( n = COUNTDOWN; n > 0; n-- )); do printf '     starting in %d ...\r' "$n"; sleep 1; done
+(( COUNTDOWN > 0 )) && printf '%-30s\r' ""
+
+# Every frame on every input node from here on, injected or not.
+sudo -n python3 -I "$INJ" watch >"$WATCH_LOG" 2>&1 &
+WATCH_PID=$!
+if ! wait_for "$WATCH_LOG" '"kind": "watch"' 3; then
+  echo "FAIL: the input watcher did not start:"; cat "$WATCH_LOG"; exit 2
+fi
+
 echo "1/3  compositor on $SOCKET (LUMEN_LOG=debug) ..."
 if (( ! IN_SEAT && JOIN_SEAT )); then
   # The shell moves itself into the seat session's cgroup, then becomes the compositor:
@@ -373,6 +412,7 @@ finish alive=$ALIVE
 # ── Teardown ─────────────────────────────────────────────────────────────────
 kill -TERM "$SQ1_PID" 2>/dev/null; wait "$SQ1_PID" 2>/dev/null; SQ1_RC=$?; SQ1_PID=""
 stop_compositor
+stop_watch
 rm -f "$SOCKET_PATH" "$LOCK_PATH"
 
 # KDGETMODE on the foreground VT: 0 = text, 1 = graphics.
@@ -382,7 +422,7 @@ fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOCTTY); b=bytearray(4)
 fcntl.ioctl(fd,0x4B3B,b); print("text" if struct.unpack("i",b)[0]==0 else "graphics")' "/dev/$VT" 2>/dev/null || echo unknown)
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
-python3 -I - "$LOG_DIR" "$REFRESH_MHZ" "$COMP_RC" "$SQ1_RC" "$CONSOLE" <<'PY'
+python3 -I - "$LOG_DIR" "$REFRESH_MHZ" "$COMP_RC" "$SQ1_RC" "$CONSOLE" "$POINTER_DEV" "$KEYBOARD_DEV" <<'PY'
 import bisect, json, os, re, sys
 
 log_dir, refresh_mhz, comp_rc, sq1_rc, console = sys.argv[1:6]
@@ -404,7 +444,8 @@ CFG = R(r"configure id=(\d+) serial=(\d+) w=(-?\d+) h=(-?\d+) states=(\S+) edges
 ACK = R(r"ack id=(\d+) serial=(\d+)$")
 GBEGIN = R(r"grab begin id=(\d+) mode=(\w+) edges=(\d+) source=(\w+)")
 GEND = R(r"grab end id=(\d+) mode=(\w+) reason=(\w+)")
-PRESENT = re.compile(r"compositor\.latency: present kind=(\w+) input_us=(\d+) present_us=(\d+) latency_us=(\d+)")
+PRESENT = re.compile(r"compositor\.latency: present kind=(\w+) input_us=(\d+) present_us=(\d+) latency_us=(\d+)"
+                     r"(?: submit_us=(\d+) fence_us=(\d+))?")
 CCFG = re.compile(r"^configure serial=(\d+) size=(\d+)x(\d+) states=(\S+)")
 CCOMMIT = re.compile(r"^commit size=(\d+)x(\d+)")
 
@@ -427,10 +468,10 @@ def geometry_before(tid, upto):
             g = tuple(int(m.group(k)) for k in (2, 3, 4, 5))
     return g
 
-results = []  # (name, ok, detail)
+results = []  # (name, status, detail); status is PASS, WARN or FAIL
 
-def record(name, ok, detail):
-    results.append((name, bool(ok), detail))
+def record(name, ok, detail, warn=False):
+    results.append((name, "FAIL" if not ok else "WARN" if warn else "PASS", detail))
 
 def need(name):
     if name not in scen:
@@ -562,13 +603,15 @@ else:
     record("f click-to-focus/raise", False, "scenario did not run")
 
 # ── g: latency ─────────────────────────────────────────────────────────────
-presents = []  # (input_us, present_us, kind, reported_latency)
+presents = []  # (input_us, present_us, kind, reported_latency, submit_us, fence_us)
 for line in comp:
     m = PRESENT.search(line)
     if m:
-        presents.append((int(m.group(2)), int(m.group(3)), m.group(1), int(m.group(4))))
+        presents.append((int(m.group(2)), int(m.group(3)), m.group(1), int(m.group(4)),
+                         int(m.group(5) or 0), int(m.group(6) or 0)))
 presents.sort()
 keys = [p[0] for p in presents]
+flips = sorted(p[1] for p in presents)
 
 def pct(v, q):
     v = sorted(v)
@@ -576,34 +619,77 @@ def pct(v, q):
 
 def latency(tags, phase, kinds):
     motions = [r for r in inj if r["kind"] == "motion" and r.get("tag") in tags and r.get("phase") == phase]
-    lat, reported = [], []
+    # (latency, reported, queued, compositor, gpu, display) in µs; split parts None if unknown
+    samples = []
     for r in motions:
-        i = bisect.bisect_left(keys, r["t_us"])
+        t = r["t_us"]
+        i = bisect.bisect_left(keys, t)
         while i < len(presents) and presents[i][2] not in kinds:
             i += 1
-        if i < len(presents) and presents[i][1] - r["t_us"] < 500_000:
-            lat.append(presents[i][1] - r["t_us"])
-            reported.append(presents[i][3])
-    return motions, lat, reported
+        if i < len(presents) and presents[i][1] - t < 500_000:
+            _, present, _, reported, submit, fence = presents[i]
+            q_us = comp_us = gpu_us = disp_us = None
+            if submit:
+                # One flip in flight: a commit cannot go out before the previous flip lands,
+                # so time until then is the previous frame's, not this one's.
+                j = bisect.bisect_left(flips, submit) - 1
+                prev = flips[j] if j >= 0 else 0
+                q_us = max(0, prev - t)
+                comp_us = submit - max(t, prev)
+                gpu_us = max(0, fence - submit) if fence else None
+                disp_us = present - max(submit, fence)
+            samples.append((present - t, reported, q_us, comp_us, gpu_us, disp_us))
+    return motions, samples
 
-budget = 2 * period_us + 4000
-lat_ok = True
+PARTS = ("queued", "compositor", "gpu", "display")
+
+def split(samples):
+    """Median queued/compositor/GPU/display split."""
+    parts = [s for s in samples if s[2] is not None]
+    med = lambda k: pct([s[k] for s in parts if s[k] is not None], .5) / 1000
+    has_fence = any(s[4] is not None for s in parts)
+    text = (f"median split queued={med(2):.1f} compositor={med(3):.1f} "
+            + (f"gpu={med(4):.1f} " if has_fence else "gpu=n/a(no fence) ")
+            + f"display={med(5):.1f}ms")
+    return parts, text
+
+median_budget = 1.5 * period_us + 4000
+tail_budget = 2 * period_us + 4000
+lat_ok, lat_warn = True, False
 lat_detail = []
 for label, tags, phase, kinds in (("cursor (hover)", ("g",), "hover", ("cursor", "content")),
                                   ("window move", ("a", "e"), "drag", ("content",))):
-    motions, lat, reported = latency(tags, phase, kinds)
+    motions, samples = latency(tags, phase, kinds)
+    lat = [s[0] for s in samples]
+    reported = [s[1] for s in samples]
     covered = len(lat) / len(motions) if motions else 0
+    notes = []
     if len(lat) < 20 or covered < 0.8:
         lat_ok = False
-    over = pct(lat, 0.95) > budget
+        notes.append(f"FAIL: only {len(lat)} of {len(motions)} motions reached a flip")
+    if pct(lat, .5) > median_budget:
+        lat_ok = False
+        notes.append(f"FAIL: median over {median_budget/1000:.1f}ms")
+    parts, split_text = split(samples)
+    if pct(lat, .95) > tail_budget:
+        lat_warn = True
+        slow = [s for s in parts if s[0] > tail_budget]
+        whose = {k: 0 for k in PARTS}
+        for s in slow:
+            values = (s[2], s[3], s[4] or 0, s[5])
+            whose[PARTS[max(range(4), key=lambda k: values[k])]] += 1
+        unsplit = sum(1 for s in samples if s[0] > tail_budget) - len(slow)
+        notes.append(f"WARN: p95 over {tail_budget/1000:.1f}ms; slow samples by largest part: "
+                     + ", ".join(f"{k} {v}" for k, v in whose.items())
+                     + (f", unsplit {unsplit}" if unsplit else ""))
     lat_detail.append(f"{label}: n={len(lat)}/{len(motions)} median={pct(lat, .5)/1000:.1f}ms "
-                      f"p95={pct(lat, .95)/1000:.1f}ms max={max(lat or [0])/1000:.1f}ms"
-                      f"{' (p95 over %.1fms budget)' % (budget/1000) if over else ''}; "
-                      f"newest-input→flip median={pct(reported, .5)/1000:.1f}ms")
+                      f"p95={pct(lat, .95)/1000:.1f}ms max={max(lat or [0])/1000:.1f}ms; "
+                      f"{split_text}; newest-input→flip median={pct(reported, .5)/1000:.1f}ms"
+                      + "".join(f"; {n}" for n in notes))
 cursor_kinds = {}
 for p in presents:
     cursor_kinds[p[2]] = cursor_kinds.get(p[2], 0) + 1
-record("g latency", lat_ok, " | ".join(lat_detail))
+record("g latency", lat_ok, " | ".join(lat_detail), warn=lat_warn)
 
 # ── h: frame-perfect resize ────────────────────────────────────────────────
 sent = {}
@@ -696,17 +782,88 @@ record("run: no error/warning, clean exit, console text",
        f"lumen-square exit={sq1_rc} console={console}"
        + (f"; first: {errors[0]}" if errors else ""))
 
+# ── Foreign input ──────────────────────────────────────────────────────────
+# Every frame the kernel delivered, against what the injector wrote. Writes reach every
+# reader of a node, so injected frames appear in the watch log too, with the same raw
+# values; anything else came from a person or from the host. Absolute values are matched
+# per axis (the kernel drops an axis whose value did not change), buttons and keys by
+# count per (code, value), ignoring the kernel's own autorepeat (value 2).
+pointer_dev, keyboard_dev = sys.argv[6], sys.argv[7]
+watch = [json.loads(l) for l in read("watch.jsonl") if l.startswith("{")]
+inj_ax = {r["ax"] for r in inj if r["kind"] == "motion" and "ax" in r}
+inj_ay = {r["ay"] for r in inj if r["kind"] == "motion" and "ay" in r}
+BTN = {"left": 0x110, "right": 0x111, "middle": 0x112}
+inj_keys = {}
+for r in inj:
+    if r["kind"] == "button":
+        k = (pointer_dev, BTN[r["button"]], 1 if r["pressed"] else 0)
+    elif r["kind"] == "key":
+        k = (keyboard_dev, r["code"], 1 if r["pressed"] else 0)
+    else:
+        continue
+    inj_keys[k] = inj_keys.get(k, 0) + 1
+seen_keys, foreign = {}, []  # foreign: (t_us, what)
+for w in watch:
+    if w.get("kind") == "dropped":
+        foreign.append((w["t_us"], f"{w['dev']}: SYN_DROPPED (events lost; cannot vouch)"))
+        continue
+    if w.get("kind") != "seen":
+        continue
+    dev = w["dev"]
+    for etype, code, value in w["ev"]:
+        if dev not in (pointer_dev, keyboard_dev):
+            foreign.append((w["t_us"], f"{dev}: type={etype} code={code} value={value}"))
+        elif etype == 3 and dev == pointer_dev and code in (0, 1):
+            if value not in (inj_ax if code == 0 else inj_ay):
+                foreign.append((w["t_us"], f"{dev}: {'ABS_X' if code == 0 else 'ABS_Y'}={value}"))
+        elif etype == 1 and value != 2:
+            k = (dev, code, value)
+            seen_keys[k] = seen_keys.get(k, 0) + 1
+            if seen_keys[k] > inj_keys.get(k, 0):
+                foreign.append((w["t_us"], f"{dev}: key/button {code}={value}"))
+        elif etype == 4:
+            pass  # EV_MSC: scan codes ride along with a real key, which is counted above
+        elif etype != 1:
+            foreign.append((w["t_us"], f"{dev}: type={etype} code={code} value={value}"))
+
+def scenario_at(t):
+    spans = {}
+    for r in inj:
+        tag = r.get("tag")
+        if tag:
+            a, b = spans.get(tag, (r["t_us"], r["t_us"]))
+            spans[tag] = (min(a, r["t_us"]), max(b, r["t_us"]))
+    best = None
+    for tag, (a, b) in spans.items():
+        if a - 500_000 <= t <= b + 1_000_000:
+            best = tag
+    return best or "between scenarios"
+
 width = max(len(r[0]) for r in results)
 print()
 print("─" * 78)
-for name, ok, detail in results:
-    print(f"{'PASS' if ok else 'FAIL'}  {name:<{width}}  {detail}")
+for name, status, detail in results:
+    print(f"{status}  {name:<{width}}  {detail}")
 print("─" * 78)
 print(f"presents logged: {cursor_kinds}; refresh period {period_us/1000:.2f} ms")
 print(f"logs: {log_dir}")
-sys.exit(0 if all(r[1] for r in results) else 1)
+print()
+if foreign:
+    where = {}
+    for t, _ in foreign:
+        s = scenario_at(t)
+        where[s] = where.get(s, 0) + 1
+    print(f"VERDICT: INVALID — {len(foreign)} input event(s) the injector did not send, during: "
+          + ", ".join(f"{k} ({v})" for k, v in where.items()) + ".")
+    print(f"         first: {foreign[0][1]}")
+    print("         Real input mixed with the test's; the results above are not a judgement")
+    print("         of the compositor. Re-run hands off, host pointer outside the VM window.")
+    sys.exit(3)
+if any(r[1] == "FAIL" for r in results):
+    print("VERDICT: FAIL")
+    sys.exit(1)
+warned = [r[0] for r in results if r[1] == "WARN"]
+print("VERDICT: PASS" + (f" (warnings: {', '.join(warned)})" if warned else ""))
+sys.exit(0)
 PY
-VERDICT=$?
-echo
-if (( VERDICT == 0 )); then echo "VERDICT: PASS"; else echo "VERDICT: FAIL"; fi
-exit "$VERDICT"
+exit $?
