@@ -398,6 +398,8 @@ if(LUMEN_BUILD_TESTS)
     add_executable(test_gl_composite tests/test_gl_composite.cpp)
     target_link_libraries(test_gl_composite PRIVATE lx.gfx)
     lumen_apply_module_properties(test_gl_composite)
+    # GLES, to read the scanout framebuffer raw, independently of read_back.
+    lumen_link_platform(test_gl_composite)
     target_include_directories(test_gl_composite PRIVATE tests)
     # Skips itself (passing) when there is no render node or GL is a software rasterizer.
     add_test(NAME test_gl_composite COMMAND test_gl_composite)
