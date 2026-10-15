@@ -13,6 +13,10 @@
 #include <unistd.h>
 #include <vector>
 
+#if defined(LUMEN_HAS_EGL)
+#include <GLES2/gl2.h>
+#endif
+
 import lx.foundation;
 import lx.gfx;
 
@@ -166,6 +170,54 @@ LUMEN_TEST(gl_composite_clears_and_draws_an_uploaded_texture) {
     LUMEN_CHECK(near(left.r, 255) && near(left.g, 0) && near(left.b, 0));
     const pixel right = at(out, W, W - 4, 4);
     LUMEN_CHECK(near(right.r, 0) && near(right.g, 255) && near(right.b, 0));
+}
+
+// What the display shows: row 0 of the scanout buffer is the top line. read_back alone
+// cannot pin orientation — a flip in the composite and a matching
+// flip in the read-back agree with each other and both disagree with the screen, which is
+// exactly how every frame once went out upside down with these tests green.
+LUMEN_TEST(gl_composite_scanout_memory_row_0_is_the_top) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+
+    constexpr unsigned W = 64, H = 32;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+
+    const auto red = solid(8, 8, 255, 0, 0);
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(1, 8, 8, red.data())));
+    // Green clear with a red band across the top eight rows.
+    const auto cmd = quad(1, {0, 0, static_cast<int>(W), 8});
+    auto stats = comp.composite(target.value(), lx::color::rgb(0.f, 1.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    close_fence(stats);
+
+    // read_back synchronises with the GPU, and must agree with the display.
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    const pixel rb_top = at(out, W, W / 2, 2);
+    LUMEN_CHECK(near(rb_top.r, 255) && near(rb_top.g, 0));
+
+#if defined(LUMEN_HAS_EGL)
+    // Independent of read_back, which a matching flip would make agree with a wrong
+    // composite. Raw glReadPixels on this framebuffer object returns window y = 0 first,
+    // and that is the order the display shows: with the old y-negating shader the screen
+    // was upside down, and so was this raw read (the old read_back reversed it to hide
+    // that). Row 0 here is the top line of the screen.
+    std::vector<unsigned char> raw(static_cast<std::size_t>(W) * H * 4);
+    glBindFramebuffer(GL_FRAMEBUFFER, target.value().framebuffer());
+    glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, raw.data());
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    LUMEN_CHECK(glGetError() == GL_NO_ERROR);
+    const pixel top = at(raw, W, W / 2, 2);
+    const pixel bottom = at(raw, W, W / 2, H - 3);
+    LUMEN_CHECK(near(top.r, 255) && near(top.g, 0) && near(top.b, 0));
+    LUMEN_CHECK(near(bottom.r, 0) && near(bottom.g, 255) && near(bottom.b, 0));
+#endif
 }
 
 LUMEN_TEST(gl_composite_places_a_draw_at_its_destination_rect) {

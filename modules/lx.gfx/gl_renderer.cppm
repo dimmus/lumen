@@ -268,9 +268,15 @@ void main() {
     // draw with different UVs rather than a separate path.
     uv = src_uv.xy + corner * src_uv.zw;
     vec2 px = rect.xy + corner * rect.zw;
+    // Top-left pixel space straight to NDC, unflipped. The target is a framebuffer object
+    // over a GBM buffer, and in a framebuffer object window y = 0 is row 0 of the buffer's
+    // memory — the line KMS scans out first, the top of the screen. GL's bottom-left origin
+    // only matters for a default (window-system) framebuffer, which this never is.
+    // Negating y here, as this once did, put every frame on screen upside down; the
+    // read-back below reversed rows too, so the tests agreed with each other and not with
+    // the display. test_gl_composite now checks the scanout memory itself.
     vec2 ndc = (px / target) * 2.0 - 1.0;
-    // KMS scans top to bottom; GL's origin is bottom left.
-    gl_Position = vec4(ndc.x, -ndc.y, 0.0, 1.0);
+    gl_Position = vec4(ndc, 0.0, 1.0);
 }
 )";
 
@@ -1008,13 +1014,12 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
         if (has_damage && (damage.width <= 0 || damage.height <= 0))
             continue;
 
-        // Scissor to the damage rect so the clear and every draw stay inside it. GL's
-        // origin is bottom left, so the rect is flipped to match the top-left space damage
-        // is expressed in.
+        // Scissor to the damage rect so the clear and every draw stay inside it. Window
+        // y = 0 is memory row 0, the top (see the vertex shader), so the top-left rect is
+        // used as is.
         if (has_damage) {
-            const int y = height - (damage.y + damage.height);
             glEnable(GL_SCISSOR_TEST);
-            glScissor(damage.x, y < 0 ? 0 : y, damage.width, damage.height);
+            glScissor(damage.x, damage.y < 0 ? 0 : damage.y, damage.width, damage.height);
         } else {
             glDisable(GL_SCISSOR_TEST);
         }
@@ -1037,8 +1042,8 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 continue;
             }
 
-            // Effective scissor is damage ∩ clip ∩ dst, computed in top-left space and
-            // flipped once at the end. Set explicitly on every draw rather than only when a
+            // Effective scissor is damage ∩ clip ∩ dst, in top-left space, which is also
+            // window space here (row 0 is the top). Set explicitly on every draw rather than only when a
             // clip is present: leaving the previous draw's scissor in place would silently
             // clip the next one. Intersecting with dst culls draws that miss this rect,
             // which is most of them once damage is split into several small rects.
@@ -1075,7 +1080,7 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                     continue;
                 }
                 glEnable(GL_SCISSOR_TEST);
-                glScissor(sx0, static_cast<int>(height) - sy1, sx1 - sx0, sy1 - sy0);
+                glScissor(sx0, sy0, sx1 - sx0, sy1 - sy0);
             } else {
                 glDisable(GL_SCISSOR_TEST);
             }
@@ -1212,19 +1217,9 @@ lx::result<void> lx::gfx::gl_compositor::read_back(const gl_scanout_target& targ
     if (const GLenum err = glGetError(); err != GL_NO_ERROR)
         return detail::gl_error(lx::gl_err::draw_failed, "glReadPixels failed");
 
-    // glReadPixels hands back rows bottom-up; flip so row 0 is the top, matching every
-    // other surface in the compositor.
-    const unsigned stride = target.width() * 4u;
-    for (unsigned y = 0; y < target.height() / 2; ++y) {
-        unsigned char* top = rgba + static_cast<std::size_t>(y) * stride;
-        unsigned char* bottom =
-            rgba + static_cast<std::size_t>(target.height() - 1 - y) * stride;
-        for (unsigned i = 0; i < stride; ++i) {
-            const unsigned char tmp = top[i];
-            top[i] = bottom[i];
-            bottom[i] = tmp;
-        }
-    }
+    // glReadPixels returns window y = 0 first, which for this framebuffer object is memory
+    // row 0: the top line KMS scans. Rows are therefore already top-down and are returned
+    // as the display sees them, not reordered.
     return {};
 #else
     (void)target;
