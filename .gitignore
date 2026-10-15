@@ -29,3 +29,4 @@ Thumbs.db
 
 # Python bytecode from the test scripts
 __pycache__/
+/run-desktop-logs/

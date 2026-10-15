@@ -28,6 +28,10 @@ ctest --test-dir build -R test_protocol_bind --output-on-failure
 # Direct binary
 ./build/test_kms_device
 
+# Run a session on the console: compositor + lumen-shell panel + foot (ends when foot exits)
+./scripts/run-desktop.sh                       # from a text console (tty)
+./scripts/run-desktop.sh --join-seat-session   # over SSH; see --help for -t, --decorations, -- CMD
+
 # Opt-in vkms KMS test
 LUMEN_TEST_VKMS=1 ctest --test-dir build -R test_kms_vkms.
 
