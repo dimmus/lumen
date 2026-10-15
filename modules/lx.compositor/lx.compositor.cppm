@@ -14,6 +14,7 @@ export module lx.compositor;
 export import :surface;
 export import :toplevel;
 export import :shell_bridge;
+export import :xcursor;
 export import :cursor;
 export import :input_router;
 export import :output;
@@ -21,6 +22,7 @@ export import :buffer_lifecycle;
 export import :protocol_managers;
 export import :hotplug;
 export import :protocols_p0;
+export import :wm;
 
 export namespace lx::compositor {
 
@@ -103,6 +105,7 @@ public:
     [[nodiscard]] wayland::server& wayland();
     [[nodiscard]] surface_manager& surfaces();
     [[nodiscard]] toplevel_manager& toplevels();
+    [[nodiscard]] window_manager& windows();
     [[nodiscard]] shell_bridge& shell_bridge();
     [[nodiscard]] cursor_manager& cursor();
     [[nodiscard]] scene::scene_graph& scene();

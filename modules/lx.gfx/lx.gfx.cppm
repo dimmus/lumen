@@ -9,10 +9,10 @@ module;
 
 import lx.foundation;
 import lx.runtime;
-import lx.drm;
 
 export module lx.gfx;
 
+export import :damage;
 export import :dmabuf;
 export import :syncobj;
 export import :semaphore_pool;

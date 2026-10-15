@@ -231,8 +231,13 @@
     </event>
 
     <event name="snapshot_toplevel">
-      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
-      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+      <description summary="one mapped toplevel, introducing its handle">
+        Introduces the compositor-created handle for an already-mapped toplevel, so it is
+        a new_id: the shell has never seen this object before. workspace is null while
+        the compositor has no workspace objects.
+      </description>
+      <arg name="toplevel" type="new_id" interface="zlm_toplevel_v1"/>
+      <arg name="workspace" type="object" interface="zlm_workspace_v1" allow-null="true"/>
       <arg name="app_id" type="string"/>
       <arg name="title" type="string"/>
       <arg name="state" type="uint" enum="toplevel_state"/>
@@ -258,8 +263,13 @@
     <!-- Delta events -->
 
     <event name="toplevel_created">
+      <description summary="a toplevel was mapped">
+        Followed by toplevel_state and toplevel_geometry for the same handle. workspace
+        is null while the compositor has no workspace objects (a workspace object cannot
+        be introduced by the compositor in this version).
+      </description>
       <arg name="toplevel" type="new_id" interface="zlm_toplevel_v1"/>
-      <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
+      <arg name="workspace" type="object" interface="zlm_workspace_v1" allow-null="true"/>
     </event>
 
     <event name="toplevel_destroyed">
@@ -274,6 +284,12 @@
     </event>
 
     <event name="toplevel_geometry">
+      <description summary="window geometry in global coordinates">
+        x,y,width,height is the window geometry (xdg_surface.set_window_geometry, or the
+        whole surface when unset) in global compositor coordinates. Sent on map, on
+        every committed size or position change, and at most once per frame during an
+        interactive move.
+      </description>
       <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
       <arg name="x" type="int"/>
       <arg name="y" type="int"/>

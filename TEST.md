@@ -20,6 +20,22 @@ differs. lumen-input-probe covers devices, libinput and xkb; wev covers routing 
 client. If the probe fails the script stops there rather than starting a compositor, since
 a client test on top of a dead input stack only adds noise.
 
+# Interactive move/resize, end to end, unattended (~30 s; do not touch the mouse)
+./scripts/drag-smoke.sh                       # from the TTY you logged into
+./scripts/drag-smoke.sh --join-seat-session   # from SSH: compositor joins the seat session
+
+Runs the compositor at LUMEN_LOG=debug with lumen-square and drives it with injected evdev
+events (scripts/inject-input.py, root via sudo -n; needs an absolute pointer such as a VM
+console mouse at /dev/input/event2 and a keyboard at event1). Each scenario is judged from
+both the compositor's window-manager log and lumen-square's stdout: client move; client
+resize from the bottom-right and top-left corners (opposite corner fixed); the 120x90
+min-size clamp; Super+left move with no button reaching the client; click-to-focus/raise
+with two windows; a client killed mid-grab. Two whole-run checks: frame-perfect resize (one
+configure in flight, every committed size equals its configure) and input-to-present
+latency, measured from the injector's CLOCK_MONOTONIC write time to the page flip that
+first shows the motion. Prints a PASS/FAIL table, exits 0 only if all pass, and leaves logs
+in drag-smoke-logs/.
+
 # Sanitizers
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan
 cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan

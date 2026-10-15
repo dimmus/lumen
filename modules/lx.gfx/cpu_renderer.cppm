@@ -12,6 +12,7 @@ import lx.foundation;
 export module lx.gfx:cpu_renderer;
 
 import :renderer;
+import :damage;
 
 export namespace lx::gfx {
 
@@ -122,6 +123,15 @@ public:
                                                             lx::color clear,
                                                             const blit_command* cmds,
                                                             unsigned count, lx::rect2i damage);
+
+    /// Composites only the rects of `damage`, each with its own occlusion cull; stats are
+    /// summed. A full region is the whole surface; an empty one does nothing. Rects may
+    /// overlap — each is cleared and redrawn, so overlap costs overdraw, never correctness.
+    [[nodiscard]] lx::result<cpu_composite_stats> composite_region(const pixel_surface& dst,
+                                                                   lx::color clear,
+                                                                   const blit_command* cmds,
+                                                                   unsigned count,
+                                                                   const damage_region& damage);
 
 private:
     struct texture_slot {
@@ -741,4 +751,31 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
 
     stats.bytes_written = job.bytes.load(std::memory_order_relaxed);
     return stats;
+}
+
+lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite_region(
+    const pixel_surface& dst, lx::color clear, const blit_command* cmds, unsigned count,
+    const damage_region& damage) {
+    if (damage.full)
+        return composite(dst, clear, cmds, count, lx::rect2i{});
+
+    cpu_composite_stats total{};
+    for (unsigned i = 0; i < damage.count; ++i) {
+        const lx::rect2i r = damage.rects[i];
+        // An empty rect means "everything" to `composite`; a region never carries one, but
+        // guard anyway rather than turn a no-op into a full repaint.
+        if (r.width <= 0 || r.height <= 0)
+            continue;
+        auto pass = composite(dst, clear, cmds, count, r);
+        if (!pass)
+            return pass.get_error();
+        const cpu_composite_stats& s = pass.value();
+        total.draws_submitted += s.draws_submitted;
+        total.draws_skipped += s.draws_skipped;
+        total.draws_culled += s.draws_culled;
+        total.draws_unsupported += s.draws_unsupported;
+        total.bytes_written += s.bytes_written;
+        total.cleared = total.cleared || s.cleared;
+    }
+    return total;
 }

@@ -76,7 +76,7 @@ lumen_add_module_library(lx.wayland.client modules/lx.wayland.client
 
 # ── Graphics & UI ────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.gfx modules/lx.gfx
-    DEPENDS lx.foundation lx.runtime lx.drm)
+    DEPENDS lx.foundation lx.runtime)
 lumen_compile_shaders(lx.gfx
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.vert"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.frag"
@@ -174,11 +174,55 @@ if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
         target_include_directories(lumen-clouds PRIVATE "${LUMEN_CLOUDS_GEN}")
         lumen_link_platform(lumen-clouds)
         target_link_libraries(lumen-clouds PRIVATE m)
+
+        # Interactive move/resize demo. Hovering its border sets resize cursors through
+        # wp_cursor_shape_v1 when that protocol's XML is available; the glue references
+        # zwp_tablet_tool_v2, so tablet-v2 interface code is generated alongside it.
+        add_executable(lumen-square
+            executables/lumen-square/main.cpp
+            "${LUMEN_CLOUDS_GEN}/xdg-shell-protocol.c"
+            "${LUMEN_CLOUDS_GEN}/xdg-shell-client-protocol.h"
+        )
+        set(LUMEN_CURSOR_SHAPE_XML "${CMAKE_SOURCE_DIR}/protocols/upstream/staging/cursor-shape/cursor-shape-v1.xml")
+        set(LUMEN_TABLET_XML "${CMAKE_SOURCE_DIR}/protocols/upstream/unstable/tablet/tablet-unstable-v2.xml")
+        if(EXISTS "${LUMEN_CURSOR_SHAPE_XML}" AND EXISTS "${LUMEN_TABLET_XML}")
+            add_custom_command(
+                OUTPUT "${LUMEN_CLOUDS_GEN}/cursor-shape-v1-client-protocol.h"
+                COMMAND "${WAYLAND_SCANNER_EXE}" client-header "${LUMEN_CURSOR_SHAPE_XML}"
+                        "${LUMEN_CLOUDS_GEN}/cursor-shape-v1-client-protocol.h"
+                DEPENDS "${LUMEN_CURSOR_SHAPE_XML}"
+                VERBATIM
+            )
+            add_custom_command(
+                OUTPUT "${LUMEN_CLOUDS_GEN}/cursor-shape-v1-protocol.c"
+                COMMAND "${WAYLAND_SCANNER_EXE}" private-code "${LUMEN_CURSOR_SHAPE_XML}"
+                        "${LUMEN_CLOUDS_GEN}/cursor-shape-v1-protocol.c"
+                DEPENDS "${LUMEN_CURSOR_SHAPE_XML}"
+                VERBATIM
+            )
+            add_custom_command(
+                OUTPUT "${LUMEN_CLOUDS_GEN}/tablet-unstable-v2-protocol.c"
+                COMMAND "${WAYLAND_SCANNER_EXE}" private-code "${LUMEN_TABLET_XML}"
+                        "${LUMEN_CLOUDS_GEN}/tablet-unstable-v2-protocol.c"
+                DEPENDS "${LUMEN_TABLET_XML}"
+                VERBATIM
+            )
+            target_sources(lumen-square PRIVATE
+                "${LUMEN_CLOUDS_GEN}/cursor-shape-v1-protocol.c"
+                "${LUMEN_CLOUDS_GEN}/cursor-shape-v1-client-protocol.h"
+                "${LUMEN_CLOUDS_GEN}/tablet-unstable-v2-protocol.c"
+            )
+            target_compile_definitions(lumen-square PRIVATE LUMEN_SQUARE_HAS_CURSOR_SHAPE)
+        else()
+            message(STATUS "cursor-shape-v1.xml not found — lumen-square builds without resize cursors")
+        endif()
+        target_include_directories(lumen-square PRIVATE "${LUMEN_CLOUDS_GEN}")
+        lumen_link_platform(lumen-square)
     else()
-        message(STATUS "xdg-shell.xml not found — skipping lumen-clouds")
+        message(STATUS "xdg-shell.xml not found — skipping lumen-clouds and lumen-square")
     endif()
 else()
-    message(STATUS "wayland-client/scanner unavailable — skipping lumen-clouds")
+    message(STATUS "wayland-client/scanner unavailable — skipping lumen-clouds and lumen-square")
 endif()
 
 # ── Optional Flatpak portal adapter ─────────────────────────────────────────
@@ -221,6 +265,26 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_snapshot)
     target_include_directories(test_snapshot PRIVATE tests)
     add_test(NAME test_snapshot COMMAND test_snapshot)
+
+    add_executable(test_damage_region tests/test_damage_region.cpp)
+    target_link_libraries(test_damage_region PRIVATE lx.scene lx.gfx lx.runtime)
+    lumen_apply_module_properties(test_damage_region)
+    target_include_directories(test_damage_region PRIVATE tests)
+    add_test(NAME test_damage_region COMMAND test_damage_region)
+
+    add_executable(test_wm_geometry tests/test_wm_geometry.cpp)
+    target_link_libraries(test_wm_geometry PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_wm_geometry)
+    lumen_link_platform(test_wm_geometry)
+    target_include_directories(test_wm_geometry PRIVATE tests)
+    add_test(NAME test_wm_geometry COMMAND test_wm_geometry)
+
+    add_executable(test_xcursor tests/test_xcursor.cpp)
+    target_link_libraries(test_xcursor PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_xcursor)
+    lumen_link_platform(test_xcursor)
+    target_include_directories(test_xcursor PRIVATE tests)
+    add_test(NAME test_xcursor COMMAND test_xcursor)
 
     add_executable(test_runtime_memory tests/test_runtime_memory.cpp)
     target_link_libraries(test_runtime_memory PRIVATE lx.runtime)
@@ -368,7 +432,8 @@ if(LUMEN_BUILD_TESTS)
         "LSAN_OPTIONS=detect_leaks=0"
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
-    set_tests_properties(test_result test_snapshot test_import_cache bench_frame
+    set_tests_properties(test_result test_snapshot test_damage_region test_wm_geometry test_xcursor
+        test_import_cache bench_frame
         test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_input_keymap
         test_headless_golden test_text_shaping test_protocol_bind test_kms_device test_kms_vkms
         test_ui_reconcile test_gl_composite bench_composite

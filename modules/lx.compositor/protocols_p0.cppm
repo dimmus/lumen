@@ -17,6 +17,8 @@ import :surface;
 import :toplevel;
 import :output;
 import :buffer_lifecycle;
+import :wm;
+import :cursor;
 
 export namespace lx::compositor {
 
@@ -142,6 +144,12 @@ struct p0_protocol_context {
     shell_bridge* shell = nullptr;
     surface_manager* surfaces = nullptr;
     toplevel_manager* toplevels = nullptr;
+    /// Window placement, configure flow and focus. Receives its wire ops from
+    /// `install_p0_protocols`.
+    window_manager* wm = nullptr;
+    /// Pointer image: wl_pointer.set_cursor, wp_cursor_shape_v1 and cursor-role commits
+    /// land here. Receives its texture-staging hook from `install_p0_protocols`.
+    cursor_manager* cursor = nullptr;
     output_manager* outputs = nullptr;
     gfx::headless_backend* headless = nullptr;
     gfx::dmabuf_importer* dmabuf = nullptr;

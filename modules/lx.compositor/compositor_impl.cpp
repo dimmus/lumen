@@ -1,11 +1,14 @@
 module;
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cerrno>
 #include <chrono>
 #include <fcntl.h>
 #include <condition_variable>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -38,9 +41,19 @@ struct compositor_impl {
     shell_bridge shell_bridge_;
     cursor_manager cursor_{};
     scene::scene_graph scene{};
+    /// Paint order under the scene root: client windows, then compositor overlays (the
+    /// software cursor) which must draw above every window.
+    scene::container_node windows_layer_{};
+    scene::container_node overlay_layer_{};
+    /// UI affinity. Window geometry, configure flow and focus — see `:wm`.
+    window_manager wm_{};
     gfx::device graphics{};
     drm::kms_device kms{};
     drm::kms_atomic_commit kms_atomic{kms};
+    /// Render affinity after `start`. Declared after `kms_atomic` so it is destroyed first:
+    /// removing its framebuffers takes the pointer off the CRTC before `kms_atomic` hands
+    /// the CRTC back to the console.
+    drm::kms_cursor_plane cursor_plane_{};
     gfx::dmabuf_import_cache import_cache;
     buffer_lifecycle_tracker buffer_lifecycle_;
     runtime::memory_budget_coordinator memory_{};
@@ -101,12 +114,92 @@ struct compositor_impl {
 
     /// Render affinity. Drops a pending fence without committing it.
     void discard_composited_fence();
+
+    // ── damage tracking (render affinity unless noted) ──
+    /// Extent of the scanout target; damage is clipped to it.
+    lx::rect2i scanout_rect_{};
+    /// Per scanout slot: damage the slot has *missed* since it was last composited into.
+    /// With three slots a slot is two or three frames old when it is reused, so compositing
+    /// only the newest frame's damage into it would leave the intervening frames' changes
+    /// as ghost trails behind a moving window. Starts full: nothing has been drawn yet.
+    gfx::damage_region slot_age_damage_[k_scanout_slots]{};
+    /// Damage since the last successful KMS commit. FB_DAMAGE_CLIPS describe how the new
+    /// framebuffer differs from the one the plane showed before it, which spans every frame
+    /// composited since that commit — not just the newest. Starts full.
+    gfx::damage_region kms_pending_damage_{};
+    /// Damage a failed composite could not draw, retried on the next tick.
+    gfx::damage_region missed_damage_{};
+    /// Frame index of the snapshot whose damage was last consumed; a re-acquired snapshot
+    /// has nothing new to say.
+    unsigned last_seen_frame_ = ~0u;
+    /// Set by render while it holds a composited frame that is not committed yet; read by
+    /// UI before it answers frame callbacks on an idle tick.
+    std::atomic<bool> frame_outstanding_{false};
+    /// UI affinity. Newest frame index published with non-empty damage.
+    long long last_damaged_frame_ = -1;
+    /// UI affinity. Output 0's geometry as of the last tick; a change repaints everything.
+    lx::rect2i last_output_rect_{};
+    bool initial_damage_noted_ = false;
     /// Written by render after compositing, read by UI to retire client buffers. -1 until
     /// the first frame completes.
     std::atomic<long long> last_rendered_frame_{-1};
     texture_update_queue texture_updates_{};
     shm_staging_ring shm_staging_{};
     shm_pixel_store shm_store_{};
+
+    // ── cursor ──
+    /// UI affinity; loaded once in `start`.
+    xcursor_theme cursor_theme_{};
+    /// UI → render. Pointer position/visibility, and plane-sized images.
+    cursor_frame_mailbox cursor_frames_{};
+    cursor_image_mailbox cursor_images_{};
+    /// Render affinity. The newest cursor frame taken from the mailbox.
+    cursor_frame cursor_cur_{};
+    /// Render affinity. Generation of the image staged into the plane's back buffer.
+    unsigned cursor_staged_gen_ = 0;
+    /// Render affinity. The plane passed a TEST_ONLY commit with an image on it.
+    bool cursor_tested_ = false;
+    /// Render affinity. A content commit has gone through: the CRTC is ours (the first one
+    /// is the modeset, which the cursor does not join).
+    bool content_committed_once_ = false;
+    /// Render → UI. The plane is unusable; UI switches the cursor to software.
+    std::atomic<bool> cursor_hw_failed_{false};
+    /// Render → UI. The commit whose flip is pending carried a frame (false: cursor only).
+    /// A cursor-only flip is not a content present: it must not answer frame callbacks.
+    std::atomic<bool> last_commit_content_{true};
+
+    // ── Input-to-present latency (ADR-005 cross-cutting). libinput µs and the KMS flip
+    //    timestamp are both CLOCK_MONOTONIC, so the difference is what the user feels, up
+    //    to the scanout of the line the pointer is on. ──
+    /// Render affinity. Newest input time already attributed to a commit.
+    unsigned long long latency_reported_input_us_ = 0;
+    /// Render affinity. Pointer state of the last commit: a commit samples latency only
+    /// when what the pointer shows changed, so a later unrelated present (a client mapping
+    /// after the pointer went idle) is not timed against stale input.
+    int latency_cursor_x_ = -2147483647 - 1;
+    int latency_cursor_y_ = 0;
+    unsigned latency_cursor_gen_ = 0;
+    bool latency_cursor_visible_ = false;
+    /// Render → UI. `input_us << 1 | content` of the commit whose flip is pending; 0 when
+    /// none. Written only when 0 (compare-exchange), so a commit racing the flip handler
+    /// drops its sample instead of being timed against the previous commit's flip.
+    std::atomic<unsigned long long> committed_input_us_{0};
+    /// UI affinity. Fixed sample window for the periodic summary; no allocation.
+    static constexpr unsigned k_latency_window = 600;
+    unsigned long long latency_samples_[k_latency_window]{};
+    unsigned latency_sample_count_ = 0;
+    /// Render affinity. A commit carrying this tick's cursor frame succeeded.
+    void note_committed_input(bool content);
+    /// UI affinity. Logs one present and, every `k_latency_window`, a summary.
+    void note_present_latency(unsigned long long present_ns);
+    void log_latency_summary();
+
+    /// Render affinity. Prepares the plane for this tick's commit (newest position, a new
+    /// image staged into the back buffer) — only when no flip is pending, which is also the
+    /// only time a commit can happen.
+    void prepare_cursor_plane();
+    /// Render affinity. Marks the plane unusable after a rejected test, once.
+    void fail_cursor_plane(const char* why);
 
     /// Render affinity. The `shm_pixel_store` slot each texture is currently sampled from.
     /// A texture holds at most one: staging a new commit supersedes the previous slot, and
@@ -227,8 +320,14 @@ struct compositor_impl {
           buffer_lifecycle_{import_cache},
           memory_{c.memory}, budget_{c.hot_path} {
         scene.snapshots().set_config(c.snapshot);
+        (void)scene.root().add(&windows_layer_);
+        (void)scene.root().add(&overlay_layer_);
         surfaces.set_import_cache(&import_cache);
-        surfaces.set_scene(&scene);
+        surfaces.set_scene(&scene, &windows_layer_);
+        shell_bridge_.set_toplevels(&toplevels);
+        for (auto& slot : slot_age_damage_)
+            slot.set_full();
+        kms_pending_damage_.set_full();
         frame_renderer_.set_pipeline_cache(&pipeline_cache_);
         seats.bind(this);
     }
@@ -289,11 +388,135 @@ void compositor_impl::input_ready_callback() {
 }
 
 void compositor_impl::on_input_key(const lx::input::key_event& event) {
+    // Keys the window manager claims (Escape during a grab) never reach the client.
+    if (wm_.on_key(event))
+        return;
     input_router_.send_key(event, input_devices_.default_seat());
+}
+
+void compositor_impl::note_committed_input(bool content) {
+    const cursor_frame& f = cursor_cur_;
+    const bool changed = f.x != latency_cursor_x_ || f.y != latency_cursor_y_ ||
+                         f.image_generation != latency_cursor_gen_ ||
+                         f.visible != latency_cursor_visible_;
+    latency_cursor_x_ = f.x;
+    latency_cursor_y_ = f.y;
+    latency_cursor_gen_ = f.image_generation;
+    latency_cursor_visible_ = f.visible;
+    if (!changed)
+        return;
+    const unsigned long long in = f.input_time_us;
+    if (in == 0 || in <= latency_reported_input_us_)
+        return;
+    latency_reported_input_us_ = in;
+    unsigned long long expected = 0;
+    (void)committed_input_us_.compare_exchange_strong(expected, (in << 1) | (content ? 1u : 0u),
+                                                      std::memory_order_release,
+                                                      std::memory_order_relaxed);
+}
+
+void compositor_impl::note_present_latency(unsigned long long present_ns) {
+    const unsigned long long packed = committed_input_us_.exchange(0, std::memory_order_acquire);
+    if (packed == 0 || present_ns == 0)
+        return;
+    const unsigned long long input_us = packed >> 1;
+    const unsigned long long present_us = present_ns / 1000ull;
+    if (present_us < input_us)
+        return; // clocks disagree (a driver without monotonic timestamps): no sample
+    const unsigned long long latency_us = present_us - input_us;
+    if (lx::trace::logger::global().min_level() > lx::trace::level::debug)
+        return;
+    char line[160];
+    std::snprintf(line, sizeof(line), "present kind=%s input_us=%llu present_us=%llu latency_us=%llu",
+                  (packed & 1u) ? "content" : "cursor", input_us, present_us, latency_us);
+    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.latency", line);
+    latency_samples_[latency_sample_count_++] = latency_us;
+    if (latency_sample_count_ == k_latency_window)
+        log_latency_summary();
+}
+
+void compositor_impl::log_latency_summary() {
+    const unsigned n = latency_sample_count_;
+    latency_sample_count_ = 0;
+    if (n == 0)
+        return;
+    // Exact percentiles over the fixed window, in place: nth_element allocates nothing.
+    unsigned long long* b = latency_samples_;
+    const unsigned i50 = (n - 1) / 2;
+    const unsigned i95 = (n - 1) * 95 / 100;
+    std::nth_element(b, b + i95, b + n);
+    const unsigned long long p95 = b[i95];
+    std::nth_element(b, b + i50, b + i95 + 1);
+    const unsigned long long p50 = b[i50];
+    const unsigned long long max = *std::max_element(b + i95, b + n);
+    char line[128];
+    std::snprintf(line, sizeof(line), "latency summary n=%u p50_us=%llu p95_us=%llu max_us=%llu",
+                  n, p50, p95, max);
+    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.latency", line);
 }
 
 void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) {
     input_router_.send_modifiers(mods, input_devices_.default_seat());
+}
+
+void compositor_impl::prepare_cursor_plane() {
+    if (!cursor_plane_.valid())
+        return;
+    if (!content_committed_once_ || kms_atomic.flip_pending())
+        return;
+
+    const bool failed = cursor_hw_failed_.load(std::memory_order_relaxed);
+    bool want = !failed && cursor_cur_.visible && cursor_cur_.hardware;
+    if (want && cursor_cur_.image_generation != cursor_staged_gen_) {
+        // The image mailbox may already hold a newer one than this frame references; the
+        // newest is always right to show.
+        (void)cursor_images_.take();
+        const cursor_plane_image& img = cursor_images_.front();
+        if (img.generation != 0 && img.generation != cursor_staged_gen_) {
+            if (auto staged = cursor_plane_.stage_image(img.pixels.data(), img.width,
+                                                        img.height, img.width, img.hot_x,
+                                                        img.hot_y);
+                staged) {
+                cursor_staged_gen_ = img.generation;
+            } else {
+                fail_cursor_plane("image does not fit the plane");
+                want = false;
+            }
+        }
+        if (cursor_staged_gen_ == 0)
+            want = false; // nothing staged yet: do not show an empty buffer
+    }
+    cursor_plane_.set_visible(want);
+    cursor_plane_.set_position(cursor_cur_.x, cursor_cur_.y);
+
+    // Validate once, before the plane's state rides a content commit: a rejection there
+    // would fail the frame too. TEST_ONLY applies nothing and raises no event.
+    if (want && !cursor_tested_ && cursor_plane_.dirty()) {
+        drm::atomic_commit_request test{};
+        test.connector = 0;
+        test.update_primary = false;
+        test.cursor = &cursor_plane_;
+        test.request_page_flip = false;
+        test.test_only = true;
+        if (auto ok = kms_atomic.commit(test); ok) {
+            cursor_tested_ = true;
+        } else if (kms_atomic.last_failure_rejected_state()) {
+            lx::trace::logger::global().log_error(ok.get_error(), "compositor.cursor");
+            fail_cursor_plane("TEST_ONLY commit rejected");
+            cursor_plane_.set_visible(false);
+        }
+        // Otherwise the device was unavailable (DRM master on another VT): that says
+        // nothing about the plane, so the test runs again on a later tick.
+    }
+}
+
+void compositor_impl::fail_cursor_plane(const char* why) {
+    if (cursor_hw_failed_.exchange(true, std::memory_order_acq_rel))
+        return;
+    char line[128];
+    std::snprintf(line, sizeof(line), "cursor plane rejected: %s — falling back to software",
+                  why);
+    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.cursor", line);
 }
 
 void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_event& event) {
@@ -312,19 +535,34 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
         }
         seat.constrain_pointer(geometry);
     }
-    cursor_.update_from_seat(seat);
-    // Surface-local coordinates: with one output at the origin these coincide with global
-    // ones. Per-surface hit-testing lands with D5's per-output loop, which is what makes
-    // "which surface is under this point" well defined across several displays.
-    input_router_.send_pointer_motion(seat.pointer_x(), seat.pointer_y(), event.time_ms);
+    // O(1): records the position and, outside a grab, publishes it for render's next
+    // commit. No composite is involved while the cursor plane is in use.
+    // During an interactive grab the pointer is published at the tick instead, so it and
+    // the dragged window reach the display in the same commit.
+    cursor_.on_motion(seat.pointer_x(), seat.pointer_y(),
+                      event.time_us ? event.time_us
+                                    : static_cast<unsigned long long>(event.time_ms) * 1000ull,
+                      wm_.grab_active());
+    // Hit-testing, enter/leave and the implicit grab are the window manager's; it sends
+    // the motion in the focused surface's local coordinates.
+    wm_.on_pointer_motion(event.time_ms);
 }
 
 void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_event& event) {
-    input_router_.send_pointer_button(event, input_devices_.default_seat());
+    const bool grab_before = wm_.grab_active();
+    wm_.on_pointer_button(event);
+    // A button that starts or ends a grab changes the pointer image without moving it:
+    // re-publish the same position stamped with this event, so latency is measured from
+    // the button and not from the last motion.
+    if (event.time_us != 0 && grab_before != wm_.grab_active()) {
+        auto& seat = input_devices_.default_seat();
+        cursor_.on_motion(seat.pointer_x(), seat.pointer_y(), event.time_us,
+                          wm_.grab_active());
+    }
 }
 
 void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
-    input_router_.send_pointer_axis(event);
+    wm_.on_pointer_axis(event);
 }
 
 void compositor_impl::trace_texture_op(const char* op, unsigned texture_id, bool ok) {
@@ -447,6 +685,12 @@ void compositor_impl::wayland_fd_callback() {
     if (!active)
         return;
     (void)active->wayland.dispatch(0);
+    // A flip is drained within this 1 ms pump rather than at the next tick: the flip
+    // handler phase-locks the frame clock, and seeing the flip a tick late is what let the
+    // clock drift ahead of the display. Only while a flip is outstanding, so an idle loop
+    // makes no extra syscall; the fd is non-blocking.
+    if (active->drm_present_ && active->kms_atomic.flip_pending())
+        active->kms_atomic.dispatch_events();
     active->wayland.flush();
     active->logind_.dispatch();
 }
@@ -464,6 +708,11 @@ void compositor_impl::register_p0_globals() {
     p0_.seat = &input_devices_.default_seat();
     p0_.shell = &shell_bridge_;
     p0_.toplevels = &toplevels;
+    wm_.bind(toplevels, surfaces, scene, windows_layer_, input_router_,
+             input_devices_.default_seat(), shell_bridge_, outputs);
+    p0_.wm = &wm_;
+    wm_.set_cursor(&cursor_);
+    p0_.cursor = &cursor_;
     p0_.outputs = &outputs;
     p0_.headless = &headless_;
     p0_.dmabuf = &graphics.dmabuf();
@@ -687,6 +936,7 @@ lx::result<void> compositor_impl::setup_vulkan_present() {
                               "no usable mode for composite target");
 
     const unsigned slots = drm_present_ ? k_scanout_slots : 1u;
+    scanout_rect_ = {0, 0, static_cast<int>(width), static_cast<int>(height)};
     scanout_slot_count_ = 0;
     for (unsigned slot = 0; slot < slots; ++slot) {
         auto created = gfx::render_target::create(graphics.context(), width, height);
@@ -757,6 +1007,7 @@ lx::result<void> compositor_impl::setup_cpu_present() {
     // row copy with no conversion at all.
     const auto format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
 
+    scanout_rect_ = {0, 0, static_cast<int>(width), static_cast<int>(height)};
     scanout_slot_count_ = 0;
     for (unsigned slot = 0; slot < k_scanout_slots; ++slot) {
         auto created = drm::kms_dumb_framebuffer::create(kms, width, height, format);
@@ -815,6 +1066,7 @@ lx::result<void> compositor_impl::setup_gl_present() {
         return initialized.get_error();
 
     const auto format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+    scanout_rect_ = {0, 0, static_cast<int>(width), static_cast<int>(height)};
     scanout_slot_count_ = 0;
     for (unsigned slot = 0; slot < k_scanout_slots; ++slot) {
         auto created = gfx::gl_scanout_target::create(egl_, width, height, format);
@@ -882,8 +1134,10 @@ void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback
     if (!user_data)
         return;
     auto* impl = static_cast<compositor_impl*>(user_data);
-    // The flip landed, so clients may draw again regardless of how complete the feedback is.
-    impl->present_completed_ = true;
+    // The flip landed, so clients may draw again regardless of how complete the feedback is
+    // — unless it only moved the pointer: no client content was presented by it.
+    if (impl->last_commit_content_.load(std::memory_order_acquire))
+        impl->present_completed_ = true;
 
     // Phase-lock the frame clock to the display, and aim each repaint at its deadline
     // rather than at the interval boundary. A timer free-running at target_fps drifts
@@ -893,18 +1147,30 @@ void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback
     //
     // The start time comes from the measured repaint cost, so the idle wait sits before the
     // work instead of after it and the frame carries input from as late as it can. A frame
-    // that gets more expensive starts earlier on its own. Scheduling from `now` rather than
-    // the flip timestamp keeps this free of assumptions about which clock the driver
-    // reports.
+    // that gets more expensive starts earlier on its own.
+    //
+    // The phase comes from the kernel's flip timestamp when it is on our clock (KMS reports
+    // CLOCK_MONOTONIC, which is what steady_clock reads on Linux) and plausibly recent;
+    // otherwise from `now`, which is within the 1 ms loop pump of the flip because flips
+    // are drained there (wayland_fd_callback). Taking `now` at the next tick instead put the
+    // phase up to a whole period late, so ticks ran at period − lead: faster than the
+    // display, every few frames composited behind a still-pending flip ("deferred").
     if (impl->vsync_timer) {
         const auto now = static_cast<lx::runtime::clock_time>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count());
         impl->repaint_.observe_repaint(impl->budget_.last_tick_ui_us(),
                                        impl->render_cost_us_.load(std::memory_order_relaxed));
-        impl->repaint_.on_present(now);
+        auto flip_ns = now;
+        if (fb.hw_clock && fb.actual_present_ns > 0 && fb.actual_present_ns <= now &&
+            now - fb.actual_present_ns < impl->repaint_.refresh_period())
+            flip_ns = fb.actual_present_ns;
+        impl->repaint_.on_present(flip_ns);
         impl->vsync_timer->schedule_at(impl->repaint_.next_start(now));
     }
+
+    if (fb.hw_clock)
+        impl->note_present_latency(fb.actual_present_ns);
 
     if (!fb.hw_clock || !fb.vsync)
         return;
@@ -1177,14 +1443,86 @@ lx::result<void> compositor::start() {
     }
 
     (void)impl_->hotplug_.start(impl_->outputs, impl_->kms);
+    if (impl_->outputs.count() > 0) {
+        const lx::rect2i g = impl_->outputs.geometry(impl_->outputs.nth(0));
+        unsigned refresh_mhz = 0;
+        if (auto mode = impl_->kms.active_mode(0); mode)
+            refresh_mhz = mode.value().refresh_millihz;
+        char line[96];
+        std::snprintf(line, sizeof(line), "output 0 mode=%dx%d refresh_mhz=%u", g.width, g.height,
+                      refresh_mhz);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+    }
 
     if (auto bound = impl_->wayland.bind(impl_->cfg.socket_name); !bound) {
         lx::trace::logger::global().log_error(bound.get_error(), "compositor");
         return bound.get_error();
     }
 
+    // Cursor: theme first (it decides how large the plane's buffers must be), then the
+    // plane, then the manager that feeds both. Startup-only file I/O.
+    {
+        auto* impl = impl_;
+        impl->cursor_theme_.load(nullptr, 0);
+        char line[160];
+        std::snprintf(line, sizeof(line), "cursor theme=%s size=%u from_theme=%u builtin=%u",
+                      impl->cursor_theme_.name(), impl->cursor_theme_.size(),
+                      impl->cursor_theme_.from_theme(), impl->cursor_theme_.builtin());
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
+
+        const char* mode = std::getenv("LUMEN_CURSOR");
+        const bool force_software = mode && std::strcmp(mode, "software") == 0;
+        const char* why_software = nullptr;
+        if (force_software) {
+            why_software = "LUMEN_CURSOR=software";
+        } else if (!impl->drm_present_) {
+            why_software = "no KMS scanout";
+        } else {
+            const unsigned need = impl->cursor_theme_.max_dimension();
+            auto plane = drm::kms_cursor_plane::create(impl->kms.card_fd(),
+                                                       impl->kms.crtc_id_for(0),
+                                                       impl->kms.crtc_index(), need, need);
+            if (plane) {
+                impl->cursor_plane_ = std::move(plane).value();
+            } else {
+                why_software = plane.get_error().message;
+            }
+        }
+        if (impl->cursor_plane_.valid()) {
+            const auto caps = impl->cursor_plane_.caps();
+            std::snprintf(line, sizeof(line), "hardware cursor plane=%u size=%ux%u hotspot=%d",
+                          caps.plane_id, caps.width, caps.height, caps.hotspot ? 1 : 0);
+        } else {
+            std::snprintf(line, sizeof(line), "software cursor: %s",
+                          why_software ? why_software : "no cursor plane");
+        }
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
+
+        cursor_manager::setup setup{};
+        setup.theme = &impl->cursor_theme_;
+        setup.frames = &impl->cursor_frames_;
+        setup.images = &impl->cursor_images_;
+        setup.router = &impl->input_router_;
+        setup.scene = &impl->scene;
+        setup.overlay = &impl->overlay_layer_;
+        setup.hardware = impl->cursor_plane_.valid();
+        if (setup.hardware) {
+            const auto caps = impl->cursor_plane_.caps();
+            setup.plane_size = {static_cast<int>(caps.width), static_cast<int>(caps.height)};
+        }
+        impl->cursor_.init(setup);
+    }
+
     impl_->register_p0_globals();
     impl_->start_input();
+
+    // The pointer starts in the middle of output 0, where it is easy to find.
+    if (impl_->outputs.count() > 0) {
+        const lx::rect2i g = impl_->outputs.geometry(impl_->outputs.nth(0));
+        auto& seat = impl_->input_devices_.default_seat();
+        seat.set_pointer_position(g.x + g.width / 2, g.y + g.height / 2);
+        impl_->cursor_.on_motion(seat.pointer_x(), seat.pointer_y(), 0, false);
+    }
 
     if (auto installed = impl_->shell_bridge_.install(impl_->cfg.shell_binary_path); !installed) {
         lx::trace::logger::global().log_error(installed.get_error(), "compositor");
@@ -1219,8 +1557,9 @@ lx::result<void> compositor::start() {
             wfd, &detail::compositor_impl::wayland_fd_callback, 1'000'000);
         impl_->loop.add_source(impl_->wayland_fd_source.get());
     }
-    // DRM page-flip events are drained from tick_ui (see dispatch_events call), not via
-    // a dedicated fd_source — DRM fds often report POLLIN continuously and would busy-spin.
+    // DRM page-flip events are drained by the Wayland pump above while a flip is pending
+    // (and again in tick_ui), not via a dedicated fd_source — DRM fds often report POLLIN
+    // continuously and would busy-spin.
 
     impl_->start_threads();
 
@@ -1240,6 +1579,8 @@ int compositor::run() {
     runtime::set_current_affinity(runtime::affinity::ui);
     const int code = impl_->loop.run();
     impl_->stop_threads();
+    // Whatever the last window collected; a short session still reports its numbers.
+    impl_->log_latency_summary();
     detail::compositor_impl::active = nullptr;
     return code;
 }
@@ -1253,6 +1594,7 @@ config compositor::configuration() const { return impl_ ? impl_->cfg : config{};
 wayland::server& compositor::wayland() { return impl_->wayland; }
 surface_manager& compositor::surfaces() { return impl_->surfaces; }
 toplevel_manager& compositor::toplevels() { return impl_->toplevels; }
+window_manager& compositor::windows() { return impl_->wm_; }
 shell_bridge& compositor::shell_bridge() { return impl_->shell_bridge_; }
 cursor_manager& compositor::cursor() { return impl_->cursor_; }
 scene::scene_graph& compositor::scene() { return impl_->scene; }
@@ -1290,6 +1632,21 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
             impl_->outputs.set_scale(impl_->outputs.nth(i), scale);
     }
 
+    // Nothing has been drawn yet on the first tick, and a mode change invalidates every
+    // pixel; anything else is repainted only where it changed.
+    if (impl_->outputs.count() > 0) {
+        const lx::rect2i g = impl_->outputs.geometry(impl_->outputs.nth(0));
+        const lx::rect2i& last = impl_->last_output_rect_;
+        if (g.x != last.x || g.y != last.y || g.width != last.width || g.height != last.height) {
+            impl_->last_output_rect_ = g;
+            scene().note_full_damage();
+        }
+    }
+    if (!impl_->initial_damage_noted_) {
+        impl_->initial_damage_noted_ = true;
+        scene().note_full_damage();
+    }
+
     (void)wayland().dispatch(0);
     if (impl_->drm_present_)
         impl_->kms_atomic.dispatch_events();
@@ -1318,23 +1675,51 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         fire_frame_callbacks(impl_->p0_, frame_time_ms);
     }
 
+    // Window management for this frame — configures coalesced since the last tick go out
+    // here, once, rather than once per request that changed them.
+    impl_->wm_.on_tick(tick.timestamp_ns);
+    // The pointer image, after the window manager (a grab sets the override) and before the
+    // scene is published (the software cursor is a scene node).
+    if (impl_->cursor_hw_failed_.load(std::memory_order_acquire))
+        impl_->cursor_.on_hardware_failed();
+    impl_->cursor_.on_tick();
+
     scheduler().on_vsync(tick);
     scene().update(tick.delta_seconds);
 
-    lx::rect2i damage{};
-    scene().collect_damage(damage);
-
+    const bool nothing_changed = scene().pending_damage().empty();
     if (scene().commit_frame(tick.frame_index)) {
         impl_->buffer_lifecycle_.on_frame_submitted(tick.frame_index);
+        if (!nothing_changed)
+            impl_->last_damaged_frame_ = tick.frame_index;
     } else {
         lx::trace::logger::global().log(lx::trace::level::trace, "compositor",
                                         "frame dropped (backpressure)");
+    }
+
+    // An idle tick produces no flip, and frame callbacks otherwise wait for one — a client
+    // that commits a frame request without new content would then stall until the
+    // watchdog. Once every damaged frame has been composited and committed and no flip is
+    // queued, nothing is waiting on the display: answer now (wlroots' "frame done without
+    // a commit"). The reads are ordered against render's writes: last_rendered_frame_ is
+    // published after frame_outstanding_ is raised, and frame_outstanding_ is lowered only
+    // after the commit has set flip_pending.
+    if (impl_->drm_present_ && nothing_changed &&
+        impl_->last_rendered_frame_.load(std::memory_order_acquire) >= impl_->last_damaged_frame_ &&
+        !impl_->frame_outstanding_.load(std::memory_order_acquire) &&
+        !impl_->kms_atomic.flip_pending()) {
+        impl_->last_callback_ns_ = tick.timestamp_ns;
+        fire_frame_callbacks(impl_->p0_,
+                             static_cast<unsigned>(tick.timestamp_ns / 1'000'000ull));
     }
 
     // Release client buffers the render thread has finished sampling. Done here because
     // sending wl_buffer.release requires the UI thread's ownership of Wayland dispatch.
     (void)impl_->buffer_lifecycle_.retire_completed_frames(
         impl_->last_rendered_frame_.load(std::memory_order_acquire));
+
+    // Configures and events produced by this tick leave now, not at the next poll.
+    wayland().flush();
 
     const auto us = static_cast<unsigned>(
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1372,20 +1757,34 @@ void compositor::tick_render() {
         }
     }
 
-    const unsigned blit_count = draws.size();
-    lx::gfx::blit_command* blits = impl_->blit_storage(blit_count);
-    for (unsigned i = 0; i < blit_count; ++i) {
-        const auto& cmd = draws.data()[i];
-        blits[i].texture_id = cmd.texture.id();
-        blits[i].dst = cmd.dst;
-        blits[i].src = cmd.src;
-        blits[i].clip = cmd.clip;
-        blits[i].tint = cmd.tint;
-        blits[i].opacity = cmd.opacity;
-        blits[i].blend = cmd.blend;
-        blits[i].buffer_xform = cmd.buffer_xform;
-        blits[i].src_space = cmd.src_space;
+    // What changed since the last frame this thread saw. A re-acquired snapshot (the UI
+    // published nothing new) contributes nothing; a skipped one was folded into this one
+    // by `snapshot_buffer::publish`.
+    gfx::damage_region frame_damage = impl_->missed_damage_;
+    impl_->missed_damage_.clear();
+    if (idx != impl_->last_seen_frame_) {
+        frame_damage.add_region(snapshot.damage_rects());
+        impl_->last_seen_frame_ = idx;
     }
+
+    // Translated only when something is drawn: an idle tick touches no draw data at all.
+    const unsigned blit_count = draws.size();
+    const auto build_blits = [&]() -> lx::gfx::blit_command* {
+        lx::gfx::blit_command* out = impl_->blit_storage(blit_count);
+        for (unsigned i = 0; i < blit_count; ++i) {
+            const auto& cmd = draws.data()[i];
+            out[i].texture_id = cmd.texture.id();
+            out[i].dst = cmd.dst;
+            out[i].src = cmd.src;
+            out[i].clip = cmd.clip;
+            out[i].tint = cmd.tint;
+            out[i].opacity = cmd.opacity;
+            out[i].blend = cmd.blend;
+            out[i].buffer_xform = cmd.buffer_xform;
+            out[i].src_space = cmd.src_space;
+        }
+        return out;
+    };
 
     impl_->drain_texture_updates();
 
@@ -1393,73 +1792,107 @@ void compositor::tick_render() {
     // shown yet — but with three scanout slots it no longer has to be thrown away either.
     // It composites into the slot that is neither on screen nor queued, and the commit is
     // what waits. The frame clock is phase-locked to the flips, so this is rare.
-    const unsigned scanout_back = impl_->pick_back_slot();
     const bool flip_in_flight = impl_->drm_present_ && impl_->kms_atomic.flip_pending();
+    const bool scanout_path = (impl_->gl_present_ || impl_->cpu_present_ ||
+                               impl_->vulkan_present_) &&
+                              impl_->scanout_slot_count_ > 0;
     bool composited_this_tick = false;
+    unsigned scanout_back = 0;
+    gfx::damage_region region{};
 
-    if (impl_->gl_present_ && impl_->scanout_slot_count_ > 0) {
-        auto composited = impl_->gl_compositor_.composite(
-            impl_->gl_targets_[scanout_back], lx::color::rgb(0.f, 0.f, 0.f), blits, blit_count,
-            snapshot.damage());
-        if (!composited) {
-            lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
-        } else {
-            composited_this_tick = true;
-            // This frame supersedes any uncommitted one, so its fence replaces that
-            // frame's — which is dropped rather than leaked.
-            impl_->discard_composited_fence();
-            impl_->composited_fence_fd_ = composited.value().out_fence_fd;
-            if (composited.value().draws_skipped > 0)
-                impl_->report_unregistered_draw(blits, blit_count);
-        }
-    } else if (impl_->cpu_present_ && impl_->scanout_slot_count_ > 0) {
-        const auto& fb = impl_->dumb_fbs_[scanout_back];
-        gfx::pixel_surface target{};
-        target.pixels = fb.pixels();
-        target.width = fb.width();
-        target.height = fb.height();
-        target.stride = fb.stride();
-        target.format = fb.format();
-        target.write_combining = true;
+    if (scanout_path) {
+        frame_damage.clip(impl_->scanout_rect_);
+    }
 
-        auto composited = impl_->cpu_compositor_.composite(
-            target, lx::color::rgb(0.f, 0.f, 0.f), blits, blit_count, snapshot.damage());
-        if (!composited) {
-            lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
-        } else {
-            composited_this_tick = true;
-            const auto stats = composited.value();
-            if (stats.draws_skipped > 0) {
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                                "draw referenced an unregistered texture");
+    if (scanout_path && !frame_damage.empty()) {
+        // Buffer age: the slot about to be drawn into also missed every frame composited
+        // since it was last used, so its region is this frame's damage plus that.
+        scanout_back = impl_->pick_back_slot();
+        region = frame_damage;
+        region.add_region(impl_->slot_age_damage_[scanout_back]);
+        region.clip(impl_->scanout_rect_);
+        lx::gfx::blit_command* blits = build_blits();
+
+        if (impl_->gl_present_) {
+            auto composited = impl_->gl_compositor_.composite_region(
+                impl_->gl_targets_[scanout_back], lx::color::rgb(0.f, 0.f, 0.f), blits,
+                blit_count, region);
+            if (!composited) {
+                lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
+            } else {
+                composited_this_tick = true;
+                // This frame supersedes any uncommitted one, so its fence replaces that
+                // frame's — which is dropped rather than leaked.
+                impl_->discard_composited_fence();
+                impl_->composited_fence_fd_ = composited.value().out_fence_fd;
+                if (composited.value().draws_skipped > 0)
+                    impl_->report_unregistered_draw(blits, blit_count);
             }
-            if (stats.draws_unsupported > 0) {
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                                "draw format has no conversion to the scanout "
-                                                "format — surface not shown");
+        } else if (impl_->cpu_present_) {
+            const auto& fb = impl_->dumb_fbs_[scanout_back];
+            gfx::pixel_surface target{};
+            target.pixels = fb.pixels();
+            target.width = fb.width();
+            target.height = fb.height();
+            target.stride = fb.stride();
+            target.format = fb.format();
+            target.write_combining = true;
+
+            auto composited = impl_->cpu_compositor_.composite_region(
+                target, lx::color::rgb(0.f, 0.f, 0.f), blits, blit_count, region);
+            if (!composited) {
+                lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
+            } else {
+                composited_this_tick = true;
+                const auto stats = composited.value();
+                if (stats.draws_skipped > 0) {
+                    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
+                                                    "draw referenced an unregistered texture");
+                }
+                if (stats.draws_unsupported > 0) {
+                    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
+                                                    "draw format has no conversion to the scanout "
+                                                    "format — surface not shown");
+                }
+            }
+        } else {
+            // Vulkan repaints the whole target, which is correct for any buffer age.
+            auto composited = impl_->vk_compositor_.composite(
+                impl_->vk_targets_[scanout_back], lx::color::rgb(0.f, 0.f, 0.f), blits,
+                blit_count);
+            if (!composited) {
+                lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
+            } else {
+                composited_this_tick = true;
+                // Same contract as the GL path: this frame supersedes any uncommitted one,
+                // so its fence replaces that frame's rather than leaking alongside it. The
+                // commit waits on the GPU instead of the render thread doing so.
+                impl_->discard_composited_fence();
+                impl_->composited_fence_fd_ = composited.value().out_fence_fd;
+                if (composited.value().draws_skipped > 0)
+                    impl_->report_unregistered_draw(blits, blit_count);
             }
         }
-    } else if (impl_->vulkan_present_ && impl_->scanout_slot_count_ > 0) {
-        auto composited = impl_->vk_compositor_.composite(
-            impl_->vk_targets_[scanout_back], lx::color::rgb(0.f, 0.f, 0.f), blits, blit_count);
-        if (!composited) {
-            lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
+
+        if (composited_this_tick) {
+            for (unsigned slot = 0; slot < impl_->scanout_slot_count_; ++slot) {
+                if (slot != scanout_back)
+                    impl_->slot_age_damage_[slot].add_region(frame_damage);
+            }
+            impl_->slot_age_damage_[scanout_back].clear();
+            impl_->kms_pending_damage_.add_region(frame_damage);
+            impl_->frame_outstanding_.store(true, std::memory_order_release);
         } else {
-            composited_this_tick = true;
-            // Same contract as the GL path: this frame supersedes any uncommitted one, so
-            // its fence replaces that frame's rather than leaking alongside it. The commit
-            // waits on the GPU instead of the render thread doing so.
-            impl_->discard_composited_fence();
-            impl_->composited_fence_fd_ = composited.value().out_fence_fd;
-            if (composited.value().draws_skipped > 0)
-                impl_->report_unregistered_draw(blits, blit_count);
+            // Not drawn: try again next tick rather than lose it.
+            impl_->missed_damage_.add_region(frame_damage);
         }
-    } else if (impl_->headless_present_ && impl_->headless_.width() > 0) {
+    } else if (!scanout_path && impl_->headless_present_ && impl_->headless_.width() > 0) {
         // Software fallback for no-GPU hosts and CI.
         (void)impl_->headless_.begin_frame();
         (void)impl_->headless_.clear(lx::color::rgb(0.f, 0.f, 0.f));
         if (blit_count > 0)
-            (void)impl_->frame_renderer_.draw_to_headless(blits, blit_count, impl_->headless_);
+            (void)impl_->frame_renderer_.draw_to_headless(build_blits(), blit_count,
+                                                          impl_->headless_);
         (void)impl_->headless_.end_frame_and_dump(nullptr);
     }
 
@@ -1478,17 +1911,25 @@ void compositor::tick_render() {
     if (composited_this_tick)
         impl_->composited_slot_ = static_cast<int>(scanout_back);
 
-    const auto submit_ns = static_cast<runtime::clock_time>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-    // Nothing is submitted while a flip is queued: recording it would measure the
-    // in-flight flip's latency from the wrong timestamp.
-    if (!flip_in_flight)
-        presentation().on_present_submitted(idx, submit_ns);
+    const char* commit_kind = "none";
+    if (impl_->drm_present_ && impl_->composited_slot_ >= 0 && flip_in_flight)
+        commit_kind = "deferred";
+
+    // As late as possible: the cursor position used is the newest the UI has published.
+    // Taken whether or not a plane exists — its input time is what latency is measured from.
+    if (impl_->cursor_frames_.take())
+        impl_->cursor_cur_ = impl_->cursor_frames_.front();
+    if (impl_->drm_present_)
+        impl_->prepare_cursor_plane();
+    bool cursor_rode = false;
 
     if (impl_->drm_present_ && !flip_in_flight && impl_->composited_slot_ >= 0) {
         const auto present_slot = static_cast<unsigned>(impl_->composited_slot_);
-        impl_->composited_slot_ = -1;
+
+        const auto submit_ns = static_cast<runtime::clock_time>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+        presentation().on_present_submitted(idx, submit_ns);
 
         drm::atomic_commit_request req{};
         req.connector = 0;
@@ -1501,21 +1942,61 @@ void compositor::tick_render() {
         else if (impl_->scanout_slot_count_ > 0 && impl_->scanout_fbs_[present_slot].id())
             req.framebuffer_id = impl_->scanout_fbs_[present_slot].id();
 
-        const lx::rect2i snap_damage = snapshot.damage();
-        if (snap_damage.width > 0 && snap_damage.height > 0) {
-            req.damage.full_frame = false;
-            req.damage.count = 1;
-            req.damage.rects[0] = snap_damage;
-            impl_->kms_atomic.build_damage_blob(req.damage, req.connector);
-        } else {
+        // Every rect since the last commit, as separate clips: the plane's previous
+        // framebuffer is older than this frame's damage alone describes.
+        const gfx::damage_region& pending = impl_->kms_pending_damage_;
+        if (pending.full || pending.count == 0) {
             req.damage.full_frame = true;
+        } else {
+            req.damage.full_frame = false;
+            req.damage.count = pending.count;
+            for (unsigned i = 0; i < pending.count; ++i)
+                req.damage.rects[i] = pending.rects[i];
+            impl_->kms_atomic.build_damage_blob(req.damage, req.connector);
+        }
+
+        // The pointer rides the frame: both change on the same vblank.
+        if (impl_->content_committed_once_ && impl_->cursor_plane_.valid() &&
+            impl_->cursor_plane_.dirty()) {
+            req.cursor = &impl_->cursor_plane_;
+            cursor_rode = true;
         }
 
         impl_->pending_flip_slot_.store(present_slot, std::memory_order_release);
+        impl_->last_commit_content_.store(true, std::memory_order_release);
         const auto committed = impl_->kms_atomic.commit(req);
-        // The kernel has taken its own reference by now, so the compositor's copy goes
-        // regardless of whether the commit succeeded.
-        impl_->discard_composited_fence();
+        if (!committed && cursor_rode) {
+            // Do not let the plane take frames down with it: if the cursor state alone is
+            // rejected, the plane is unusable and the frame retries without it.
+            drm::atomic_commit_request test{};
+            test.update_primary = false;
+            test.cursor = &impl_->cursor_plane_;
+            test.request_page_flip = false;
+            test.test_only = true;
+            // Blame the plane only for a state the kernel refused: losing DRM master
+            // (a VT switch) fails TEST_ONLY too, and must not cost the session its
+            // hardware cursor.
+            if (!impl_->kms_atomic.commit(test) &&
+                impl_->kms_atomic.last_failure_rejected_state()) {
+                impl_->fail_cursor_plane("commit rejected the cursor state");
+                impl_->cursor_plane_.set_visible(false);
+            }
+        }
+        if (committed) {
+            impl_->content_committed_once_ = true;
+            impl_->composited_slot_ = -1;
+            // The kernel has taken its own reference to the fence.
+            impl_->discard_composited_fence();
+            impl_->kms_pending_damage_.clear();
+            commit_kind = "content";
+            impl_->note_committed_input(true);
+        } else {
+            // Keep the slot and its fence: the commit is retried next tick without
+            // compositing the frame again.
+            commit_kind = "failed";
+        }
+        // Lowered after the commit raised flip_pending (see the idle-callback check).
+        impl_->frame_outstanding_.store(!committed, std::memory_order_release);
         // Log on transition only: a failing commit every frame must not flood the hot
         // path, but silently discarding it is how a dead present path stayed invisible.
         if (!committed && !impl_->drm_commit_failing_) {
@@ -1526,10 +2007,56 @@ void compositor::tick_render() {
             lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm",
                                             "atomic commit recovered");
         }
+    } else if (impl_->drm_present_ && !composited_this_tick && impl_->composited_slot_ < 0 &&
+               impl_->content_committed_once_ && impl_->cursor_plane_.valid() &&
+               impl_->cursor_plane_.dirty() && impl_->cursor_plane_.involves_crtc() &&
+               !impl_->kms_atomic.flip_pending()) {
+        // Nothing to composite, but the pointer moved: a commit of the cursor plane alone.
+        // The scene is not touched — this is what keeps pointer motion off the GPU.
+        drm::atomic_commit_request req{};
+        req.connector = 0;
+        req.update_primary = false;
+        req.cursor = &impl_->cursor_plane_;
+        req.request_page_flip = true;
+        // Its flip re-arms the frame clock but presents no client content, and must not
+        // rotate the scanout slots.
+        impl_->pending_flip_slot_.store(impl_->scanout_front_.load(std::memory_order_acquire),
+                                        std::memory_order_release);
+        impl_->last_commit_content_.store(false, std::memory_order_release);
+        if (auto committed = impl_->kms_atomic.commit(req); committed) {
+            commit_kind = "cursor";
+            impl_->note_committed_input(false);
+        } else {
+            commit_kind = "cursor-failed";
+            // EBUSY (a flip raced in) and EACCES (DRM master on another VT) are transient;
+            // only a state the plane itself refuses, confirmed by TEST_ONLY, disables it.
+            drm::atomic_commit_request test{};
+            test.update_primary = false;
+            test.cursor = &impl_->cursor_plane_;
+            test.request_page_flip = false;
+            test.test_only = true;
+            if (!impl_->kms_atomic.commit(test) &&
+                impl_->kms_atomic.last_failure_rejected_state()) {
+                lx::trace::logger::global().log_error(committed.get_error(), "compositor.cursor");
+                impl_->fail_cursor_plane("cursor-only commit rejected");
+                impl_->cursor_plane_.set_visible(false);
+            }
+        }
     }
 
-    if (draws.size() > 0) {
-        lx::trace::logger::global().log(lx::trace::level::trace, "compositor.render", "draw");
+    // One line per tick that did something; an idle tick is silent. Checked before
+    // formatting so the frame path pays nothing when debug is off.
+    if ((composited_this_tick || commit_kind[0] != 'n') &&
+        lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+        const auto so_far_us = static_cast<unsigned>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+        char line[160];
+        std::snprintf(line, sizeof(line),
+                      "frame=%u composite=%d rects=%u area=%llu commit=%s render_us=%u", idx,
+                      composited_this_tick ? 1 : 0, region.count, region.area(), commit_kind,
+                      so_far_us);
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.render", line);
     }
 
     scene().release_render_frame(snapshot);

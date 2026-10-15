@@ -137,13 +137,55 @@ tree in a coherent state.
    followed immediately by modifiers, or a client inherits stuck modifiers across a focus
    change. Resources unregister on destroy, so the router cannot send into freed memory.
    Serials come from the seat's single monotonic counter.
-4. [~] **Focus — placeholder policy.** A newly mapped toplevel takes keyboard focus, and
-   `seat_manager` is bound to the compositor's real seat rather than a function-local one
-   nothing else could see. Pointer and keyboard focus are tracked separately, which is what
-   lets click-to-focus and focus-follows-mouse differ. **Not yet:** focus as a shell
-   decision over the policy bridge, and per-surface pointer hit-testing — the latter wants
-   D5's per-output loop, which is what makes "the surface under this point" well defined
-   across several displays.
+4. [~] **Focus: hit-testing landed, policy still a placeholder.** `seat_manager` is bound
+   to the compositor's real seat, not to a function-local one that nothing else could see.
+   Pointer focus and keyboard focus are tracked separately, which is what lets
+   click-to-focus and focus-follows-mouse differ.
+
+   **Pointer focus.** It comes from per-surface hit-testing in `lx.compositor.wm`: one pass
+   from top to bottom over the stacking order, against the surface extents intersected
+   with the `wl_surface` input region (`set_input_region` is implemented). It allocates
+   nothing. `enter`/`leave` are paired, with surface-local coordinates. While a button is
+   held, the pressed surface keeps focus (the implicit grab): motion outside it still goes
+   to it, and the window under the pointer gets `enter` only after release. When the scene
+   changes under a still pointer (map, unmap, restack, a window that moved), focus is
+   re-evaluated without waiting for motion.
+
+   **Keyboard focus and stacking (placeholder policy).** A newly mapped toplevel takes
+   keyboard focus. A press on any button focuses and raises the window under the pointer
+   (click-to-focus, raise-on-press). The shell can already override this with
+   `request_activate`, `request_raise`, `request_lower`, `set_toplevel_stacking_index` and
+   `request_close` over the policy bridge.
+
+   **Interactive move and resize.** One executor in `lx.compositor.wm`
+   (`window_manager::begin_grab`) with three entry points:
+   - `xdg_toplevel.move` / `.resize`. The serial must be the press serial delivered to
+     that client, and the button must still be held (the `wlr_seat_validate_pointer_grab_serial`
+     rule). An invalid edge is the `invalid_resize_edge` protocol error.
+   - `zlm_policy_bridge_v1.request_move` / `request_resize`. The shell names the toplevel,
+     but the serial must still be the live press serial, from any client.
+   - **Placeholder binding: Super+left-drag moves, Super+right-drag resizes** from the
+     edges of the third (corner by quadrant at the centre) the window was grabbed in. Neither
+     press nor release reaches the client. It is temporary and moves to shell policy over
+     the bridge.
+
+   During a grab the client gets `leave` and no pointer events; the cursor shows the
+   move or resize shape. Pointer motion is coalesced and applied once per tick. A move
+   changes only the scene node's origin (no texture work), with the old and new rects as
+   separate damage clips. A resize sends `xdg_toplevel.configure` with `resizing`, one in
+   flight at a time: the next size goes out only after the previous serial was acked and
+   its buffer committed, so every pointer position in between is coalesced. Geometry
+   changes only when the client commits, and left/top edges shift the origin in the same
+   snapshot as the new buffer, so no frame is stretched, cropped or mismatched. Release
+   sends a final configure without `resizing`. Escape cancels and restores the start
+   geometry; a client that disconnects or unmaps mid-grab ends it. Pointer-to-present
+   latency is logged per present (`compositor.latency`, debug).
+
+   **Not yet:**
+   - Focus as the shell's decision, in place of the placeholder defaults.
+   - Hit-testing across several outputs. It uses output 0's coordinate space until D5's
+     per-output loop.
+   - Subsurfaces and popups in the hit test, since both are still stubs.
 
 *Done when:* a real client receives a keystroke and a click, and `wev`/`weston-info` show a
 correct seat. This is the milestone that turns Lumen from a renderer into a compositor.
@@ -166,8 +208,8 @@ someone types into it.
    startup snapshot. Advertised to every client but bound only by one that passes the
    privilege check, so a rejected bind is a protocol error naming the reason rather than a
    global that mysteriously does not exist. Requests whose compositor-side action does not
-   exist yet (interactive move/resize, workspace objects, rule persistence) accept and do
-   nothing, so the shell can bind and drive what does work instead of failing at bind.
+   exist yet (maximize/fullscreen/minimize, workspace objects, rule persistence) accept and
+   do nothing, so the shell can bind and drive what does work instead of failing at bind.
 6. [ ] **wlr-layer-shell.** Next. Without it there is no panel, dock, wallpaper,
    notification or OSD — the shell has nowhere to put anything.
 7. **ext-session-lock.** Security-critical and easy to get subtly wrong: the lock surface

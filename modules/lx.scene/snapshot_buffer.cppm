@@ -8,6 +8,7 @@ module;
 #include <utility>
 
 import lx.foundation;
+import lx.gfx;
 import lx.runtime;
 import lx.trace;
 
@@ -71,14 +72,19 @@ private:
 class immutable_frame_snapshot {
 public:
     [[nodiscard]] const draw_list& draws() const { return draws_; }
-    [[nodiscard]] lx::rect2i damage() const { return damage_; }
+    /// Bounding box of `damage_rects()`; empty when nothing changed or when full.
+    [[nodiscard]] lx::rect2i damage() const { return damage_.bounds(); }
+    /// What changed since the previous *published* snapshot — including the damage of any
+    /// snapshot the render thread never acquired (see `snapshot_buffer::publish`). Empty
+    /// means nothing changed: the frame need not be composited at all.
+    [[nodiscard]] const lx::gfx::damage_region& damage_rects() const { return damage_; }
     [[nodiscard]] unsigned frame_index() const { return frame_index_; }
     [[nodiscard]] bool dropped() const { return dropped_; }
 
 private:
     friend class snapshot_buffer;
     draw_list draws_{};
-    lx::rect2i damage_{};
+    lx::gfx::damage_region damage_{};
     unsigned frame_index_ = 0;
     unsigned slot_ = 0;
     bool dropped_ = false;
@@ -157,7 +163,13 @@ public:
     /// An invalid lease means the frame must be skipped — do not build a draw list.
     [[nodiscard]] write_lease begin_frame();
     /// Publishes a lease and consumes it. False if the lease was invalid or not ours.
-    [[nodiscard]] bool publish(write_lease& lease, lx::rect2i damage, unsigned frame_index);
+    ///
+    /// The mailbox keeps only the newest snapshot, so a snapshot the consumer never
+    /// acquired would take its damage with it and leave stale pixels on screen. Publishing
+    /// over an unconsumed snapshot therefore carries that snapshot's damage forward into
+    /// this one. The race with a concurrent `acquire` can only over-report damage.
+    [[nodiscard]] bool publish(write_lease& lease, const lx::gfx::damage_region& damage,
+                               unsigned frame_index);
 
     [[nodiscard]] const immutable_frame_snapshot& acquire();
     void release(const immutable_frame_snapshot& snapshot);
@@ -176,6 +188,9 @@ private:
     snapshot_config config_{};
     immutable_frame_snapshot buffers_[k_snapshot_slot_count]{};
     std::atomic<unsigned> readers_[k_snapshot_slot_count]{};
+    /// Set by `acquire` once the consumer holds a slot; cleared when the slot is published.
+    /// Starts true: nothing unpublished has damage to carry.
+    std::atomic<bool> consumed_[k_snapshot_slot_count]{true, true, true};
     std::atomic<unsigned> read_index_{0};
     std::atomic<unsigned> publish_count_{0};
     std::atomic<unsigned> dropped_count_{0};
@@ -399,7 +414,7 @@ lx::scene::write_lease lx::scene::snapshot_buffer::begin_frame() {
     return lease;
 }
 
-bool lx::scene::snapshot_buffer::publish(write_lease& lease, lx::rect2i damage,
+bool lx::scene::snapshot_buffer::publish(write_lease& lease, const lx::gfx::damage_region& damage,
                                          unsigned frame_index) {
     if (!lease.valid() || lease.owner_ != this)
         return false;
@@ -411,8 +426,14 @@ bool lx::scene::snapshot_buffer::publish(write_lease& lease, lx::rect2i damage,
     // nor held, and a reader can only take the slot `read_index_` names — which only this
     // thread moves, and only here.
     buffers_[slot].damage_ = damage;
+    // Carry forward what the consumer never saw. Reading the previous slot is safe: only
+    // this thread writes slots, and a reader only ever reads them.
+    const unsigned prev = read_index_.load(std::memory_order_acquire);
+    if (prev != slot && !consumed_[prev].load(std::memory_order_acquire))
+        buffers_[slot].damage_.add_region(buffers_[prev].damage_);
     buffers_[slot].frame_index_ = frame_index;
     buffers_[slot].dropped_ = false;
+    consumed_[slot].store(false, std::memory_order_release);
 
     read_index_.store(slot, std::memory_order_release);
     in_flight_.fetch_add(1, std::memory_order_acq_rel);
@@ -424,8 +445,10 @@ const lx::scene::immutable_frame_snapshot& lx::scene::snapshot_buffer::acquire()
     for (;;) {
         const unsigned idx = read_index_.load(std::memory_order_acquire);
         readers_[idx].fetch_add(1, std::memory_order_acq_rel);
-        if (read_index_.load(std::memory_order_acquire) == idx)
+        if (read_index_.load(std::memory_order_acquire) == idx) {
+            consumed_[idx].store(true, std::memory_order_release);
             return buffers_[idx];
+        }
         readers_[idx].fetch_sub(1, std::memory_order_acq_rel);
     }
 }

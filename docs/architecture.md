@@ -170,9 +170,10 @@ flowchart TB
     subgraph L4["Compositor layer"]
         COMP["lx.compositor"]
         CTOP["lx.compositor.toplevel"]
+        CWM["lx.compositor.wm"]
         CBR["lx.compositor.shell_bridge"]
         CSURF["lx.compositor.surface"]
-        CCUR["lx.compositor.cursor"]
+        CCUR["lx.compositor.cursor / xcursor"]
         SCENE["lx.scene / snapshot"]
         SCHED["lx.scheduler / presentation"]
     end
@@ -209,11 +210,11 @@ flowchart TB
     SH --> UI
     COMP --> WLS --> WLPR
     COMP --> CTOP --> CBR
+    COMP --> CWM --> CTOP
     COMP --> CSURF --> GFX
     COMP --> SCENE --> GFX
     UI --> SCENE
     WLS --> SESS
-    GFX --> DRM
     RT --> SYNC
     RT --> TRACE
     L1 --> L0
@@ -248,18 +249,24 @@ flowchart LR
     LOOP["event_loop (UI thread)"]
     WL["wayland.server"]
     TOP["toplevel_manager"]
+    WM["window_manager"]
     SURF["surface_manager"]
     SC["scene_graph"]
     SB["snapshot_buffer"]
     GFX["gfx.device"]
     BR["shell_bridge"]
     CUR["cursor_manager"]
+    KCUR["drm.kms_cursor_plane (render)"]
     OUT["output_manager"]
     SEAT["seat_manager"]
 
     VSYNC --> LOOP
     LOOP --> WL
-    WL -->|"xdg map"| TOP
+    WL -->|"xdg role, ack"| TOP
+    WL -->|"commit, configure"| WM
+    WM -->|"geometry, focus"| TOP
+    WM -->|"node origin, damage"| SC
+    WM --> BR
     WL -->|"surface commit"| SURF
     SURF -->|"import dmabuf"| GFX
     SURF --> SC
@@ -269,7 +276,8 @@ flowchart LR
     LOOP -->|"tick_ui"| SC
     SC -->|"commit_frame"| SB
     SB -->|"tick_render"| GFX
-    CUR --> SC
+    CUR -->|"software fallback node"| SC
+    CUR -->|"cursor mailbox"| KCUR
 ```
 
 ### Subsystem roles
@@ -277,12 +285,13 @@ flowchart LR
 | Module | Responsibility |
 |--------|----------------|
 | `lx.wayland.server` | Socket, client connections, protocol dispatch, global registry |
-| `lx.compositor.toplevel` | Maps `xdg_toplevel` → `zlm_toplevel_v1` + internal `toplevel_record` |
-| `lx.compositor.surface` | Commit handler: damage, dmabuf desc, syncobj timeline, `content_hint` |
-| `lx.compositor.shell_bridge` | Emits snapshot/deltas on `zlm_policy_bridge_v1`; receives WM requests |
-| `lx.compositor.cursor` | Pointer sprite, hotspot, scene overlay |
+| `lx.compositor.toplevel` | `toplevel_record` per `xdg_toplevel`, stacking order, configure state machine (one configure in flight, serials matched on ack) |
+| `lx.compositor.wm` | The executor of window state: owns `toplevel_record::geometry` (the one source of truth for where a window is), places new windows (centred, cascaded), derives node origin from geometry and node bounds from the buffer, sends configures once per tick. Input routing: hit-testing (one top→bottom pass over the stacking order, surface extents ∩ `wl_surface` input region), enter/leave pairing, the implicit grab while a button is held, click-to-focus and raise-on-press (placeholder policy until the shell drives it), stacking and the shell's activate/raise/lower/restack/close requests. Interactive move/resize grabs (xdg, shell bridge and the placeholder Super+drag binding share one executor): move is an origin change applied once per tick, resize keeps one configure in flight and anchors left/top edges on the matching commit, Escape cancels. UI affinity |
+| `lx.compositor.surface` | Commit handler: damage, dmabuf desc, syncobj timeline, `content_hint`; creates a scene node only for a mapped role |
+| `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state, geometry, focus) on `zlm_policy_bridge_v1`; receives WM requests |
+| `lx.compositor.cursor` | Pointer image and position. Hardware cursor plane (`lx.drm:cursor`) by default: pointer motion is a plane update on the next atomic commit — or a cursor-only commit when nothing else changed — and never a composite. Software fallback is a node in the scene's overlay layer, damaged old+new. Images from the Xcursor theme (`lx.compositor.xcursor`) with a compiled-in vector set, `wp_cursor_shape_v1` and `wl_pointer.set_cursor` |
 | `lx.compositor.output` | Per-output present mode, KMS damage flags |
-| `lx.scene` | Scene graph, damage collection, `build_draw_list_into` |
+| `lx.scene` | Scene graph (windows layer, overlay layer), multi-rect damage (`gfx::damage_region`), `build_draw_list_into` |
 | `lx.scene.snapshot` | Triple-buffered handoff (v2: index swap, back-pressure policy) |
 | `lx.gfx` | Vulkan device, swapchain, dmabuf import, render pass |
 | `lx.gfx.gl_renderer` | EGL/GLES composite on GBM — the accelerated path on drivers with no Vulkan driver (vmwgfx/SVGA3D and similar) |
@@ -290,7 +299,7 @@ flowchart LR
 | `lx.gfx.import_cache` | LRU reuse of VkImage imports; per-client entry cap |
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
 | `lx.runtime.memory` | Per-subsystem arenas, pressure coordinator, overflow policies |
-| `lx.input` + `seat_manager` | libinput → pointer/keyboard events → focus |
+| `lx.input` + `seat_manager` | libinput → pointer/keyboard events (ms wire time plus µs CLOCK_MONOTONIC time for latency) → `lx.compositor.wm` decides focus |
 | `lx.drm` + `lx.drm.atomic` | Connectors, modes, atomic commit, KMS damage blobs, dumb scanout buffers |
 | `lx.scheduler.presentation` | Page-flip bridge, wp_presentation feedback |
 | `lx.scheduler.budget` | Hot-path CPU budgets per tick |
@@ -331,8 +340,15 @@ sequenceDiagram
 
 | Direction | Mechanism | Examples |
 |-----------|-----------|----------|
-| Compositor → Shell | `zlm_policy_bridge_v1` events | `snapshot_*`, `toplevel_created`, `focus_changed` |
-| Shell → Compositor | `zlm_policy_bridge_v1` requests | `request_activate`, `set_toplevel_stacking_index`, `request_close` |
+| Compositor → Shell | `zlm_policy_bridge_v1` events | `snapshot_*`, `toplevel_created`, `toplevel_geometry`, `focus_changed` |
+| Shell → Compositor | `zlm_policy_bridge_v1` requests | `request_activate`, `set_toplevel_stacking_index`, `request_close`, `request_move`, `request_resize` |
+
+Interactive move/resize has one executor in the compositor (`window_manager::begin_grab`)
+and three entry points: the client's `xdg_toplevel.move`/`.resize`, the shell's
+`request_move`/`request_resize`, and a placeholder Super+left/right-drag binding. The shell
+decides *that* a window is dragged; the compositor runs the grab, because pointer motion,
+configure throttling and the scene origin are all compositor state on the UI thread. The
+keybinding is temporary and moves to shell policy over the bridge.
 
 C++ API mirrors the wire protocol:
 

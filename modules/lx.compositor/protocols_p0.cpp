@@ -4,7 +4,10 @@ module;
 #define _GNU_SOURCE
 #endif
 
+#include <algorithm>
 #include <cerrno>
+#include <climits>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -19,6 +22,7 @@ module;
 #include "xdg-shell-server-protocol.h"
 #include "linux-dmabuf-v1-server-protocol.h"
 #include "zlm_shell_v1-server-protocol.h"
+#include "cursor-shape-v1-server-protocol.h"
 #endif
 #endif
 
@@ -64,11 +68,21 @@ struct surface_pending {
     int dy = 0;
     int scale = 1;
     int32_t transform = 0;
+    /// Union of every damage / damage_buffer since the last commit, surface-local. Both
+    /// requests are treated alike: scale is 1 and the transform normal, so the two
+    /// coordinate spaces coincide.
     lx::rect2i damage{};
     bool has_damage = false;
     frame_callback frame_cbs[k_max_frame_cbs]{};
     unsigned frame_cb_count = 0;
 };
+
+/// A wl_surface's role. Fixed for the surface's lifetime once assigned (wl_surface: a
+/// surface has at most one role), which is what lets a second role request be rejected.
+enum class surface_role : unsigned char { none, xdg_toplevel, cursor, subsurface, popup };
+
+struct xdg_surface_obj;
+struct xdg_toplevel_obj;
 
 struct surface_obj {
     wl_resource* resource = nullptr;
@@ -82,14 +96,22 @@ struct surface_obj {
     /// than the `wl_resource*` because the client may destroy the buffer object while the
     /// content stays on screen — which is exactly the case that has to keep working.
     lx::buffer_id current_buffer_id{};
-    // Role
-    wl_resource* xdg_surface = nullptr;
-    wl_resource* xdg_toplevel = nullptr;
+    surface_role role = surface_role::none;
+    /// Back-pointers into the xdg tables. Every destructor nulls the others' pointers to
+    /// it, because libwayland destroys a client's objects in id order — wl_surface first —
+    /// and a pointer left behind addresses a slot the next surface will reuse.
+    xdg_surface_obj* xdg = nullptr;
     lx::toplevel_id toplevel{};
+    /// wl_surface.set_input_region: the region is copied when the request arrives (the
+    /// wl_region may be destroyed right after) and applied on commit. Infinite by default.
+    lx::compositor::input_region input_pending{};
+    bool input_pending_set = false;
+    lx::compositor::input_region input_current{};
 };
 
 struct region_obj {
     wl_resource* resource = nullptr;
+    lx::compositor::input_region region{};
     bool used = false;
 };
 
@@ -113,8 +135,7 @@ struct xdg_surface_obj {
     wl_resource* resource = nullptr;
     p0_protocol_context* ctx = nullptr;
     surface_obj* surface = nullptr;
-    uint32_t configure_serial = 1;
-    bool configured = false;
+    xdg_toplevel_obj* toplevel = nullptr;
     bool used = false;
 };
 
@@ -122,6 +143,8 @@ struct xdg_toplevel_obj {
     wl_resource* resource = nullptr;
     p0_protocol_context* ctx = nullptr;
     xdg_surface_obj* xdg_surface = nullptr;
+    /// The compositor-side record; null once any of the three objects is gone.
+    lx::toplevel_id id{};
     char title[256]{};
     char app_id[256]{};
     bool used = false;
@@ -389,8 +412,18 @@ const struct wl_buffer_interface buffer_impl = {
 const struct wl_region_interface region_impl = {
     .destroy =
         [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
-    .add = [](struct wl_client*, struct wl_resource*, int32_t, int32_t, int32_t, int32_t) {},
-    .subtract = [](struct wl_client*, struct wl_resource*, int32_t, int32_t, int32_t, int32_t) {},
+    .add =
+        [](struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y, int32_t w,
+           int32_t h) {
+            if (auto* r = static_cast<region_obj*>(wl_resource_get_user_data(resource)))
+                r->region.add({x, y, w, h});
+        },
+    .subtract =
+        [](struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y, int32_t w,
+           int32_t h) {
+            if (auto* r = static_cast<region_obj*>(wl_resource_get_user_data(resource)))
+                r->region.subtract({x, y, w, h});
+        },
 };
 
 void region_destroy_resource(struct wl_resource* resource) {
@@ -437,6 +470,19 @@ void surface_destroy_resource(struct wl_resource* resource) {
     auto* s = find_surface(resource);
     if (!s)
         return;
+    // Drop input focus without a `leave`: the surface is going, and focus must not keep
+    // pointing at it for the focus change the unmap below makes.
+    if (s->ctx && s->ctx->input)
+        s->ctx->input->remove(resource);
+    if (s->toplevel && s->ctx && s->ctx->wm)
+        s->ctx->wm->on_destroyed(s->toplevel);
+    if (s->role == surface_role::cursor && s->ctx && s->ctx->cursor)
+        s->ctx->cursor->on_surface_destroyed(s->id);
+    if (s->xdg) {
+        s->xdg->surface = nullptr;
+        if (s->xdg->toplevel)
+            s->xdg->toplevel->id = {};
+    }
     // Last chance to retire the content this surface was showing: with the surface gone,
     // nothing else will ever reference its texture.
     if (s->ctx && s->ctx->surfaces && s->current_buffer_id)
@@ -480,10 +526,29 @@ lx::rect2i clip_damage_to_buffer(lx::rect2i damage, int width, int height) {
 void surface_damage(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y,
                     int32_t width, int32_t height) {
     auto* s = find_surface(resource);
-    if (!s)
+    if (!s || width <= 0 || height <= 0)
         return;
-    s->pending.damage = {x, y, width, height};
-    s->pending.has_damage = true;
+    // Accumulate: a client may send several damage requests per commit, and keeping only
+    // the last one under-reports what changed. A bbox union is enough here — the client's
+    // rects all land inside one window, and the window's damage is split from the others'
+    // in the scene's region. Formed in 64 bits: INT32_MAX extents are common.
+    const lx::rect2i incoming = clip_damage_to_buffer({x, y, width, height}, INT32_MAX, INT32_MAX);
+    if (incoming.width <= 0 || incoming.height <= 0)
+        return;
+    if (!s->pending.has_damage) {
+        s->pending.damage = incoming;
+        s->pending.has_damage = true;
+        return;
+    }
+    const lx::rect2i& d = s->pending.damage;
+    const int x0 = d.x < incoming.x ? d.x : incoming.x;
+    const int y0 = d.y < incoming.y ? d.y : incoming.y;
+    const long long x1 = std::max(static_cast<long long>(d.x) + d.width,
+                                  static_cast<long long>(incoming.x) + incoming.width);
+    const long long y1 = std::max(static_cast<long long>(d.y) + d.height,
+                                  static_cast<long long>(incoming.y) + incoming.height);
+    s->pending.damage = {x0, y0, static_cast<int>(std::min<long long>(x1 - x0, INT32_MAX)),
+                         static_cast<int>(std::min<long long>(y1 - y0, INT32_MAX))};
 }
 
 void surface_frame(struct wl_client* client, struct wl_resource* resource, uint32_t callback_id) {
@@ -503,7 +568,30 @@ void surface_frame(struct wl_client* client, struct wl_resource* resource, uint3
 }
 
 void surface_set_opaque_region(struct wl_client*, struct wl_resource*, struct wl_resource*) {}
-void surface_set_input_region(struct wl_client*, struct wl_resource*, struct wl_resource*) {}
+void surface_set_input_region(struct wl_client*, struct wl_resource* resource,
+                              struct wl_resource* region) {
+    auto* s = find_surface(resource);
+    if (!s)
+        return;
+    // Copied now, applied on commit (wl_surface: double-buffered; the wl_region may be
+    // destroyed immediately after this request). Null means infinite.
+    if (const auto* r = region ? static_cast<region_obj*>(wl_resource_get_user_data(region))
+                               : nullptr)
+        s->input_pending = r->region;
+    else
+        s->input_pending = {};
+    s->input_pending_set = true;
+    if (s->input_pending.approximated &&
+        lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.wm",
+                                            "input region exceeds 16 rects — over-approximated "
+                                            "(accepts more input than asked). Reported once.");
+        }
+    }
+}
 
 /// A client that keeps committing an unimportable buffer would otherwise log once per
 /// frame on the commit hot path. Report the first failure and then periodically.
@@ -514,10 +602,116 @@ void log_commit_failure(const lx::error& err) {
         lx::trace::logger::global().log_error(err, "compositor.surface");
 }
 
+/// Hands a toplevel's commit to the window manager once the surface manager has the
+/// content — on every exit of `surface_commit` past the protocol checks, including a
+/// state-only commit and a buffer that failed to import, since an ack or a window
+/// geometry change can ride either.
+struct toplevel_commit_finisher {
+    surface_obj* surface = nullptr;
+    lx::rect2i old_node_rect{};
+
+    ~toplevel_commit_finisher() {
+        if (!surface || !surface->toplevel || !surface->ctx || !surface->ctx->wm ||
+            !surface->ctx->surfaces)
+            return;
+        lx::compositor::toplevel_commit_info info{};
+        info.buffer_size = surface->ctx->surfaces->buffer_size(surface->id);
+        info.has_buffer = surface->current.buffer != nullptr && !info.buffer_size.empty();
+        info.old_node_rect = old_node_rect;
+        surface->ctx->wm->on_toplevel_commit(surface->toplevel, info);
+    }
+};
+
+/// A cursor-role surface's new content. The pixels are copied out at once (the cursor
+/// manager keeps its own image), so the buffer goes straight back to the client.
+void commit_cursor_surface(surface_obj* s) {
+    auto* cursor = s->ctx ? s->ctx->cursor : nullptr;
+    wl_resource* buffer = s->current.buffer;
+    if (!cursor) {
+        if (buffer)
+            wl_buffer_send_release(buffer);
+        return;
+    }
+    if (!buffer) {
+        cursor->on_client_surface_commit(s->id, nullptr, 0, 0, 0, false, s->current.dx,
+                                         s->current.dy);
+        return;
+    }
+    wl_shm_buffer* shm = wl_shm_buffer_get(buffer);
+    const uint32_t format = shm ? wl_shm_buffer_get_format(shm) : 0;
+    if (shm && (format == WL_SHM_FORMAT_ARGB8888 || format == WL_SHM_FORMAT_XRGB8888)) {
+        const int width = wl_shm_buffer_get_width(shm);
+        const int height = wl_shm_buffer_get_height(shm);
+        const int stride = wl_shm_buffer_get_stride(shm);
+        if (width > 0 && height > 0 && stride >= width * 4) {
+            wl_shm_buffer_begin_access(shm);
+            cursor->on_client_surface_commit(
+                s->id, static_cast<const uint32_t*>(wl_shm_buffer_get_data(shm)),
+                static_cast<unsigned>(width), static_cast<unsigned>(height),
+                static_cast<unsigned>(stride) / 4u, format == WL_SHM_FORMAT_XRGB8888,
+                s->current.dx, s->current.dy);
+            wl_shm_buffer_end_access(shm);
+        }
+    } else {
+        // Recorded trade-off: a dma-buf or non-8888 cursor keeps the previous image —
+        // reading one back for a 64x64 plane is not worth a GPU round trip.
+        static bool reported = false;
+        if (!reported && lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+            reported = true;
+            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.cursor",
+                                            "cursor surface buffer is not ARGB/XRGB shm — "
+                                            "keeping the previous image");
+        }
+    }
+    wl_buffer_send_release(buffer);
+}
+
+void remember_cursor_candidate(surface_obj* s) {
+    wl_shm_buffer* shm = wl_shm_buffer_get(s->current.buffer);
+    if (!shm)
+        return;
+    const uint32_t format = wl_shm_buffer_get_format(shm);
+    const int width = wl_shm_buffer_get_width(shm);
+    const int height = wl_shm_buffer_get_height(shm);
+    const int stride = wl_shm_buffer_get_stride(shm);
+    constexpr int k_max = static_cast<int>(lx::compositor::k_cursor_max_px);
+    if ((format != WL_SHM_FORMAT_ARGB8888 && format != WL_SHM_FORMAT_XRGB8888) || width <= 0 ||
+        height <= 0 || width > k_max || height > k_max || stride < width * 4)
+        return;
+    wl_shm_buffer_begin_access(shm);
+    s->ctx->cursor->on_client_surface_commit(
+        s->id, static_cast<const uint32_t*>(wl_shm_buffer_get_data(shm)),
+        static_cast<unsigned>(width), static_cast<unsigned>(height),
+        static_cast<unsigned>(stride) / 4u, format == WL_SHM_FORMAT_XRGB8888, 0, 0);
+    wl_shm_buffer_end_access(shm);
+}
+
 void surface_commit(struct wl_client*, struct wl_resource* resource) {
     auto* s = find_surface(resource);
     if (!s || !s->ctx || !s->ctx->surfaces)
         return;
+
+    // xdg-shell rules that reject the whole commit come first, before any state moves.
+    lx::compositor::toplevel_record* tl = nullptr;
+    if (s->role == surface_role::xdg_toplevel && s->toplevel && s->ctx->toplevels)
+        tl = s->ctx->toplevels->find_mut(s->toplevel);
+    if (tl) {
+        const bool attaching = s->pending.buffer_set && s->pending.buffer;
+        if (attaching && !tl->ever_acked) {
+            wl_resource_post_error(static_cast<wl_resource*>(tl->xdg_surface_resource),
+                                   XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER,
+                                   "buffer attached before the first configure was acked");
+            return;
+        }
+        if (!lx::compositor::toplevel_manager::apply_pending_state(*tl)) {
+            wl_resource_post_error(static_cast<wl_resource*>(tl->xdg_toplevel_resource),
+                                   XDG_TOPLEVEL_ERROR_INVALID_SIZE,
+                                   "min_size is larger than max_size");
+            return;
+        }
+    }
+
+    const bool new_buffer = s->pending.buffer_set;
 
     // Apply pending → current
     if (s->pending.buffer_set) {
@@ -532,24 +726,70 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
         s->current.buffer = s->pending.buffer;
         s->pending.buffer_set = false;
     }
+    // The attach/offset delta applies to this commit only (wl_surface.offset).
     s->current.dx = s->pending.dx;
     s->current.dy = s->pending.dy;
+    s->pending.dx = 0;
+    s->pending.dy = 0;
     s->current.scale = s->pending.scale;
     s->current.transform = s->pending.transform;
-    if (s->pending.has_damage) {
-        s->current.damage = s->pending.damage;
-        s->current.has_damage = true;
-        s->pending.has_damage = false;
-    }
+    // Damage is per commit: it describes this commit's change and nothing after it.
+    const bool had_damage = s->pending.has_damage;
+    const lx::rect2i pending_damage = s->pending.damage;
+    s->pending.has_damage = false;
+    s->pending.damage = {};
     for (unsigned i = 0; i < s->pending.frame_cb_count; ++i) {
         if (s->pending.frame_cbs[i].used)
             queue_frame_callback(s->pending.frame_cbs[i].resource);
         s->pending.frame_cbs[i] = {};
     }
     s->pending.frame_cb_count = 0;
+    if (s->input_pending_set) {
+        s->input_pending_set = false;
+        s->input_current = s->input_pending;
+        // Only a drawn role is hit-tested; a surface that takes the toplevel role later
+        // hands its current region over at get_toplevel.
+        if (s->role == surface_role::xdg_toplevel)
+            s->ctx->surfaces->set_input_region(s->id, s->input_current);
+    }
 
-    // Buffer-less commit: still valid (state-only).
-    if (!s->current.buffer) {
+    if (s->role == surface_role::cursor) {
+        if (new_buffer)
+            commit_cursor_surface(s);
+        return;
+    }
+
+    if (tl && !tl->initial_commit_seen) {
+        // The initial commit carries no buffer (rejected above) and asks for the first
+        // configure, which the window manager sends right away.
+        if (s->ctx->wm)
+            s->ctx->wm->on_initial_commit(s->toplevel);
+        return;
+    }
+
+    toplevel_commit_finisher finisher{};
+    if (tl) {
+        finisher.surface = s;
+        finisher.old_node_rect = s->ctx->surfaces->node_rect(s->id);
+    }
+
+    // State-only commit, or a null buffer: there is no new content to import. A commit
+    // without an attach does not re-read the old buffer — an shm buffer was copied and
+    // released, and its storage now belongs to the client again.
+    if (!new_buffer || !s->current.buffer) {
+        return;
+    }
+
+    // Only a toplevel is drawn. Content on any other surface — roleless, a cursor surface,
+    // a subsurface or popup (both still stubs) — would be imported and staged for nothing,
+    // so the buffer goes straight back to the client instead.
+    if (!tl) {
+        // A role-less surface may still become the cursor: wl_pointer.set_cursor may name it
+        // after this commit, and then shows the content committed here. Cursor-sized shm
+        // content is kept for that; anything else is not a cursor candidate.
+        if (s->role == surface_role::none && s->ctx->cursor)
+            remember_cursor_candidate(s);
+        wl_buffer_send_release(s->current.buffer);
         return;
     }
 
@@ -602,8 +842,10 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
     commit.surface = s->id;
     commit.buffer = buf->id;
     commit.client = s->client;
-    if (s->current.has_damage)
-        commit.damage = clip_damage_to_buffer(s->current.damage, static_cast<int>(buf->width),
+    // A new buffer with no damage request is treated as fully damaged: strictly the
+    // client said nothing changed, but every real client that does this means "all of it".
+    if (had_damage)
+        commit.damage = clip_damage_to_buffer(pending_damage, static_cast<int>(buf->width),
                                               static_cast<int>(buf->height));
     else
         commit.damage = {0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
@@ -797,6 +1039,7 @@ void compositor_create_region(struct wl_client* client, struct wl_resource* reso
         return;
     }
     r->used = true;
+    r->region.reset_empty();
     r->resource = wl_resource_create(client, &wl_region_interface,
                                      wl_resource_get_version(resource), id);
     if (!r->resource) {
@@ -867,24 +1110,66 @@ void bind_subcompositor(wayland::client_connection& client, unsigned id, int ver
 // ── xdg_wm_base ────────────────────────────────────────────────────────────
 
 void xdg_toplevel_destroy_resource(struct wl_resource* resource) {
-    for (auto& t : xdg_toplevels) {
-        if (t.used && t.resource == resource) {
-            if (t.ctx && t.ctx->toplevels && t.xdg_surface && t.xdg_surface->surface)
-                t.ctx->toplevels->on_xdg_unmap(t.xdg_surface->surface->toplevel);
-            t = {};
-            return;
-        }
+    auto* t = static_cast<xdg_toplevel_obj*>(wl_resource_get_user_data(resource));
+    if (!t || !t->used || t->resource != resource)
+        return;
+    // Destroying the role object unmaps the window and ends the record (xdg-shell).
+    if (t->id && t->ctx && t->ctx->wm)
+        t->ctx->wm->on_destroyed(t->id);
+    if (t->xdg_surface) {
+        t->xdg_surface->toplevel = nullptr;
+        if (t->xdg_surface->surface)
+            t->xdg_surface->surface->toplevel = {};
     }
+    *t = {};
 }
 
 void xdg_surface_destroy_resource(struct wl_resource* resource) {
-    for (auto& xs : xdg_surfaces) {
-        if (xs.used && xs.resource == resource) {
-            if (xs.surface)
-                xs.surface->xdg_surface = nullptr;
-            xs = {};
-            return;
-        }
+    auto* xs = static_cast<xdg_surface_obj*>(wl_resource_get_user_data(resource));
+    if (!xs || !xs->used || xs->resource != resource)
+        return;
+    // Only reachable with a live toplevel at client disconnect (the destroy request
+    // rejects it otherwise). The record cannot outlive its xdg_surface.
+    if (xs->toplevel) {
+        if (xs->toplevel->id && xs->ctx && xs->ctx->wm)
+            xs->ctx->wm->on_destroyed(xs->toplevel->id);
+        xs->toplevel->id = {};
+        xs->toplevel->xdg_surface = nullptr;
+    }
+    if (xs->surface) {
+        xs->surface->xdg = nullptr;
+        xs->surface->toplevel = {};
+    }
+    *xs = {};
+}
+
+xdg_toplevel_obj* toplevel_of(wl_resource* resource) {
+    auto* t = static_cast<xdg_toplevel_obj*>(wl_resource_get_user_data(resource));
+    return t && t->used ? t : nullptr;
+}
+
+lx::compositor::toplevel_record* record_of(xdg_toplevel_obj* t) {
+    if (!t || !t->id || !t->ctx || !t->ctx->toplevels)
+        return nullptr;
+    return t->ctx->toplevels->find_mut(t->id);
+}
+
+/// set_min_size / set_max_size: double-buffered, applied on the next wl_surface.commit.
+void toplevel_set_size_limit(wl_resource* resource, int32_t width, int32_t height, bool max) {
+    if (width < 0 || height < 0) {
+        wl_resource_post_error(resource, XDG_TOPLEVEL_ERROR_INVALID_SIZE,
+                               "negative size limit");
+        return;
+    }
+    auto* rec = record_of(toplevel_of(resource));
+    if (!rec)
+        return;
+    if (max) {
+        rec->max_pending = {width, height};
+        rec->max_pending_set = true;
+    } else {
+        rec->min_pending = {width, height};
+        rec->min_pending_set = true;
     }
 }
 
@@ -894,33 +1179,61 @@ const struct xdg_toplevel_interface xdg_toplevel_impl = {
     .set_parent = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
     .set_title =
         [](struct wl_client*, struct wl_resource* resource, const char* title) {
-            for (auto& t : xdg_toplevels) {
-                if (!t.used || t.resource != resource)
-                    continue;
-                std::snprintf(t.title, sizeof(t.title), "%s", title ? title : "");
-                if (t.ctx && t.ctx->toplevels && t.xdg_surface && t.xdg_surface->surface)
-                    t.ctx->toplevels->on_xdg_title(t.xdg_surface->surface->toplevel, t.title);
+            auto* t = toplevel_of(resource);
+            if (!t)
                 return;
+            std::snprintf(t->title, sizeof(t->title), "%s", title ? title : "");
+            if (t->id && t->ctx && t->ctx->toplevels) {
+                t->ctx->toplevels->on_xdg_title(t->id, t->title);
+                if (auto* rec = record_of(t); rec && rec->mapped && t->ctx->shell)
+                    t->ctx->shell->emit_toplevel_state(*rec);
             }
         },
     .set_app_id =
         [](struct wl_client*, struct wl_resource* resource, const char* app_id) {
-            for (auto& t : xdg_toplevels) {
-                if (!t.used || t.resource != resource)
-                    continue;
-                std::snprintf(t.app_id, sizeof(t.app_id), "%s", app_id ? app_id : "");
-                if (t.ctx && t.ctx->toplevels && t.xdg_surface && t.xdg_surface->surface)
-                    t.ctx->toplevels->on_xdg_app_id(t.xdg_surface->surface->toplevel, t.app_id);
+            auto* t = toplevel_of(resource);
+            if (!t)
                 return;
+            std::snprintf(t->app_id, sizeof(t->app_id), "%s", app_id ? app_id : "");
+            if (t->id && t->ctx && t->ctx->toplevels) {
+                t->ctx->toplevels->on_xdg_app_id(t->id, t->app_id);
+                if (auto* rec = record_of(t); rec && rec->mapped && t->ctx->shell)
+                    t->ctx->shell->emit_toplevel_state(*rec);
             }
         },
     .show_window_menu = [](struct wl_client*, struct wl_resource*, struct wl_resource*,
                            uint32_t, int32_t, int32_t) {},
-    .move = [](struct wl_client*, struct wl_resource*, struct wl_resource*, uint32_t) {},
-    .resize = [](struct wl_client*, struct wl_resource*, struct wl_resource*, uint32_t,
-                 uint32_t) {},
-    .set_max_size = [](struct wl_client*, struct wl_resource*, int32_t, int32_t) {},
-    .set_min_size = [](struct wl_client*, struct wl_resource*, int32_t, int32_t) {},
+    .move =
+        [](struct wl_client* client, struct wl_resource* resource, struct wl_resource*,
+           uint32_t serial) {
+            auto* t = toplevel_of(resource);
+            if (!t || !t->id || !t->ctx || !t->ctx->wm)
+                return;
+            (void)t->ctx->wm->request_client_grab(t->id, client, serial,
+                                                  lx::compositor::grab_mode::move, 0);
+        },
+    .resize =
+        [](struct wl_client* client, struct wl_resource* resource, struct wl_resource*,
+           uint32_t serial, uint32_t edges) {
+            if (!lx::compositor::valid_resize_edges(edges)) {
+                wl_resource_post_error(resource, XDG_TOPLEVEL_ERROR_INVALID_RESIZE_EDGE,
+                                       "invalid resize edge %u", edges);
+                return;
+            }
+            auto* t = toplevel_of(resource);
+            if (!t || !t->id || !t->ctx || !t->ctx->wm)
+                return;
+            (void)t->ctx->wm->request_client_grab(t->id, client, serial,
+                                                  lx::compositor::grab_mode::resize, edges);
+        },
+    .set_max_size =
+        [](struct wl_client*, struct wl_resource* resource, int32_t width, int32_t height) {
+            toplevel_set_size_limit(resource, width, height, true);
+        },
+    .set_min_size =
+        [](struct wl_client*, struct wl_resource* resource, int32_t width, int32_t height) {
+            toplevel_set_size_limit(resource, width, height, false);
+        },
     .set_maximized = [](struct wl_client*, struct wl_resource*) {},
     .unset_maximized = [](struct wl_client*, struct wl_resource*) {},
     .set_fullscreen = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
@@ -930,17 +1243,37 @@ const struct xdg_toplevel_interface xdg_toplevel_impl = {
 
 const struct xdg_surface_interface xdg_surface_impl = {
     .destroy =
-        [](struct wl_client*, struct wl_resource* resource) { wl_resource_destroy(resource); },
+        [](struct wl_client*, struct wl_resource* resource) {
+            auto* xs = static_cast<xdg_surface_obj*>(wl_resource_get_user_data(resource));
+            if (xs && xs->toplevel) {
+                wl_resource_post_error(resource, XDG_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT,
+                                       "xdg_surface destroyed before its xdg_toplevel");
+                return;
+            }
+            wl_resource_destroy(resource);
+        },
     .get_toplevel =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
-            xdg_surface_obj* xs = nullptr;
-            for (auto& s : xdg_surfaces)
-                if (s.used && s.resource == resource) {
-                    xs = &s;
-                    break;
-                }
-            if (!xs || !xs->ctx)
+            auto* xs = static_cast<xdg_surface_obj*>(wl_resource_get_user_data(resource));
+            if (!xs || !xs->used || !xs->ctx)
                 return;
+            if (xs->toplevel) {
+                wl_resource_post_error(resource, XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED,
+                                       "xdg_surface already has a role object");
+                return;
+            }
+            surface_obj* surf = xs->surface;
+            if (!surf) {
+                wl_resource_post_error(resource, XDG_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT,
+                                       "the wl_surface is gone");
+                return;
+            }
+            // A surface keeps its role for life: once a toplevel, only ever a toplevel.
+            if (surf->role != surface_role::none && surf->role != surface_role::xdg_toplevel) {
+                wl_resource_post_error(resource, XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED,
+                                       "wl_surface already has another role");
+                return;
+            }
             xdg_toplevel_obj* top = nullptr;
             for (auto& t : xdg_toplevels)
                 if (!t.used) {
@@ -959,41 +1292,30 @@ const struct xdg_surface_interface xdg_surface_impl = {
                                                wl_resource_get_version(resource), id);
             if (!top->resource) {
                 top->used = false;
+                wl_client_post_no_memory(client);
                 return;
             }
             wl_resource_set_implementation(top->resource, &xdg_toplevel_impl, top,
                                            xdg_toplevel_destroy_resource);
-            if (xs->surface) {
-                xs->surface->xdg_toplevel = top->resource;
-                if (xs->ctx->toplevels) {
-                    auto mapped = xs->ctx->toplevels->on_xdg_map(xs->surface->client,
-                                                                 xs->surface->id, "");
-                    if (mapped)
-                        xs->surface->toplevel = mapped.value().id;
+            xs->toplevel = top;
+            surf->role = surface_role::xdg_toplevel;
+
+            // No configure and no focus here: the client still has to make its initial
+            // commit, and the first configure answers that (xdg-shell). Focus is taken when
+            // the window maps, not when it is merely announced.
+            if (xs->ctx->toplevels) {
+                auto created = xs->ctx->toplevels->create(surf->client, surf->id,
+                                                          surf->resource, xs->resource,
+                                                          top->resource);
+                if (!created) {
+                    wl_client_post_no_memory(client);
+                    return;
                 }
-                // A newly mapped window takes keyboard focus. This is the placeholder
-                // policy, not the final one — focus belongs to the shell over the policy
-                // bridge — but a window that can never be focused can never be typed into,
-                // and something has to hold focus before the shell exists.
-                if (xs->ctx->input && xs->ctx->seat) {
-                    xs->ctx->input->set_keyboard_focus(xs->surface->resource, *xs->ctx->seat);
-                    // Pointer focus too. Without it `pointer_focus_` stays null and every
-                    // motion, button and scroll is dropped — the pointer is simply dead.
-                    // Following the keyboard is a placeholder until per-surface hit-testing
-                    // lands with D5's per-output loop, but a dead pointer is worse than an
-                    // approximate one.
-                    xs->ctx->input->set_pointer_focus(xs->surface->resource,
-                                                      xs->ctx->seat->pointer_x(),
-                                                      xs->ctx->seat->pointer_y(),
-                                                      *xs->ctx->seat);
-                }
+                top->id = created.value();
+                surf->toplevel = top->id;
             }
-            // Send configure so the client can ack and commit.
-            wl_array states{};
-            wl_array_init(&states);
-            xdg_toplevel_send_configure(top->resource, 0, 0, &states);
-            wl_array_release(&states);
-            xdg_surface_send_configure(xs->resource, xs->configure_serial);
+            if (!surf->input_current.infinite && xs->ctx->surfaces)
+                xs->ctx->surfaces->set_input_region(surf->id, surf->input_current);
         },
     .get_popup =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id,
@@ -1013,15 +1335,45 @@ const struct xdg_surface_interface xdg_surface_impl = {
             };
             wl_resource_set_implementation(res, &impl, nullptr, nullptr);
         },
-    .set_window_geometry = [](struct wl_client*, struct wl_resource*, int32_t, int32_t, int32_t,
-                              int32_t) {},
+    .set_window_geometry =
+        [](struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y, int32_t width,
+           int32_t height) {
+            if (width <= 0 || height <= 0) {
+                wl_resource_post_error(resource, XDG_SURFACE_ERROR_INVALID_SIZE,
+                                       "window geometry must have a positive size");
+                return;
+            }
+            auto* xs = static_cast<xdg_surface_obj*>(wl_resource_get_user_data(resource));
+            if (!xs || !xs->toplevel)
+                return;
+            if (auto* rec = record_of(xs->toplevel)) {
+                rec->window_geometry_pending = {x, y, width, height};
+                rec->window_geometry_pending_set = true;
+            }
+        },
     .ack_configure =
         [](struct wl_client*, struct wl_resource* resource, uint32_t serial) {
-            for (auto& xs : xdg_surfaces) {
-                if (xs.used && xs.resource == resource && serial >= xs.configure_serial) {
-                    xs.configured = true;
-                    return;
-                }
+            auto* xs = static_cast<xdg_surface_obj*>(wl_resource_get_user_data(resource));
+            if (!xs || !xs->toplevel) {
+                wl_resource_post_error(resource, XDG_SURFACE_ERROR_NOT_CONSTRUCTED,
+                                       "ack_configure on an xdg_surface without a role");
+                return;
+            }
+            auto* rec = record_of(xs->toplevel);
+            if (!rec)
+                return;
+            using ack = lx::compositor::toplevel_manager::ack_result;
+            const ack result = lx::compositor::toplevel_manager::on_ack(*rec, serial);
+            if (result == ack::invalid) {
+                wl_resource_post_error(resource, XDG_SURFACE_ERROR_INVALID_SERIAL,
+                                       "ack_configure with a serial never sent");
+                return;
+            }
+            if (result == ack::ok &&
+                lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+                char line[96];
+                std::snprintf(line, sizeof(line), "ack id=%llu serial=%u", rec->id.id(), serial);
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.wm", line);
             }
         },
 };
@@ -1063,6 +1415,15 @@ const struct xdg_wm_base_interface xdg_wm_base_impl = {
                                        "unknown surface");
                 return;
             }
+            // One xdg_surface per wl_surface, and none on a surface with a non-xdg role
+            // (a cursor, a subsurface) — the same rule wlroots applies.
+            if (surf->xdg || (surf->role != surface_role::none &&
+                              surf->role != surface_role::xdg_toplevel &&
+                              surf->role != surface_role::popup)) {
+                wl_resource_post_error(resource, XDG_WM_BASE_ERROR_ROLE,
+                                       "wl_surface already has a role");
+                return;
+            }
             xdg_surface_obj* xs = nullptr;
             for (auto& s : xdg_surfaces)
                 if (!s.used) {
@@ -1077,19 +1438,77 @@ const struct xdg_wm_base_interface xdg_wm_base_impl = {
             xs->used = true;
             xs->ctx = ctx;
             xs->surface = surf;
-            xs->configure_serial = 1;
             xs->resource = wl_resource_create(client, &xdg_surface_interface,
                                               wl_resource_get_version(resource), id);
             if (!xs->resource) {
                 xs->used = false;
+                wl_client_post_no_memory(client);
                 return;
             }
-            surf->xdg_surface = xs->resource;
+            surf->xdg = xs;
             wl_resource_set_implementation(xs->resource, &xdg_surface_impl, xs,
                                            xdg_surface_destroy_resource);
         },
     .pong = [](struct wl_client*, struct wl_resource*, uint32_t) {},
 };
+
+// ── window manager wire ops ────────────────────────────────────────────────
+
+void wm_send_configure(void* toplevel_res, void* xdg_surface_res,
+                       const lx::compositor::toplevel_configure& c, lx::size2i bounds,
+                       bool initial) {
+    auto* tl = static_cast<wl_resource*>(toplevel_res);
+    auto* xs = static_cast<wl_resource*>(xdg_surface_res);
+    if (!tl || !xs)
+        return;
+    const int version = wl_resource_get_version(tl);
+
+    // A wl_array over stack storage, never released: wl_array_add would reallocate per
+    // configure, and a resize sends one per frame.
+    uint32_t storage[8];
+    wl_array array{};
+    array.data = storage;
+    array.alloc = sizeof(storage);
+    array.size = 0;
+
+    // An empty capability list: Lumen has no window menu, maximize or minimize yet, and a
+    // CSD client hides the buttons it is told the compositor does not honour.
+    if (initial && version >= XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION)
+        xdg_toplevel_send_wm_capabilities(tl, &array);
+    if (bounds.width > 0 && bounds.height > 0 &&
+        version >= XDG_TOPLEVEL_CONFIGURE_BOUNDS_SINCE_VERSION)
+        xdg_toplevel_send_configure_bounds(tl, bounds.width, bounds.height);
+
+    unsigned n = 0;
+    if (c.states & lx::compositor::tl_maximized)
+        storage[n++] = XDG_TOPLEVEL_STATE_MAXIMIZED;
+    if (c.states & lx::compositor::tl_fullscreen)
+        storage[n++] = XDG_TOPLEVEL_STATE_FULLSCREEN;
+    if (c.states & lx::compositor::tl_resizing)
+        storage[n++] = XDG_TOPLEVEL_STATE_RESIZING;
+    if (c.states & lx::compositor::tl_activated)
+        storage[n++] = XDG_TOPLEVEL_STATE_ACTIVATED;
+    array.size = n * sizeof(uint32_t);
+    xdg_toplevel_send_configure(tl, c.size.width, c.size.height, &array);
+    xdg_surface_send_configure(xs, c.serial);
+}
+
+void wm_send_close(void* toplevel_res) {
+    if (toplevel_res)
+        xdg_toplevel_send_close(static_cast<wl_resource*>(toplevel_res));
+}
+
+unsigned wm_next_serial(void* user) {
+    // The seat's counter, not wl_display_next_serial: every input event already draws from
+    // it, and one serial space is what lets a move/resize request's serial be checked
+    // against the press that allowed it without colliding with a configure serial.
+    auto* ctx = static_cast<p0_protocol_context*>(user);
+    if (ctx && ctx->seat)
+        return ctx->seat->next_serial();
+    if (ctx && ctx->server && ctx->server->native_display())
+        return wl_display_next_serial(static_cast<wl_display*>(ctx->server->native_display()));
+    return 0;
+}
 
 void bind_xdg_wm_base(wayland::client_connection& client, unsigned id, int version) {
     if (!g_p0_ctx)
@@ -1341,6 +1760,176 @@ struct keymap_source {
     return cached;
 }
 
+// ── pointer cursor ─────────────────────────────────────────────────────────
+
+/// A cursor request counts only from the client holding pointer focus, quoting an `enter`
+/// serial it was sent for that focus (wl_pointer.set_cursor, cursor-shape-v1). Anything
+/// else — a stale request racing a focus change, another client — is ignored, not an error.
+bool cursor_request_allowed(wl_client* client, uint32_t serial) {
+    return g_p0_ctx && g_p0_ctx->input && g_p0_ctx->cursor &&
+           g_p0_ctx->input->pointer_focus_client() == client &&
+           g_p0_ctx->input->is_pointer_enter_serial(serial);
+}
+
+void pointer_set_cursor(struct wl_client* client, struct wl_resource* pointer, uint32_t serial,
+                        struct wl_resource* surface_res, int32_t hot_x, int32_t hot_y) {
+    surface_obj* surf = surface_res ? find_surface(surface_res) : nullptr;
+    if (surface_res && !surf)
+        return;
+    if (surf) {
+        // The surface becomes a cursor for life — and only a role-less one can.
+        if (surf->role != surface_role::none && surf->role != surface_role::cursor) {
+            wl_resource_post_error(pointer, WL_POINTER_ERROR_ROLE,
+                                   "wl_surface already has another role");
+            return;
+        }
+        surf->role = surface_role::cursor;
+    }
+    if (!cursor_request_allowed(client, serial))
+        return;
+    g_p0_ctx->cursor->set_client_surface(surf ? surf->id : lx::surface_id{}, hot_x, hot_y);
+}
+
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+/// wp_cursor_shape_device_v1 objects for wl_pointers. Fixed table: a client has one per
+/// pointer, and the pointer's destructor makes its devices inert.
+struct shape_device_obj {
+    wl_resource* resource = nullptr;
+    wl_resource* pointer = nullptr;
+    bool used = false;
+};
+shape_device_obj shape_devices[64]{};
+
+void shape_devices_drop_pointer(wl_resource* pointer) {
+    for (auto& d : shape_devices)
+        if (d.used && d.pointer == pointer)
+            d.pointer = nullptr;
+}
+
+const struct wp_cursor_shape_device_v1_interface shape_device_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .set_shape =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t serial,
+           uint32_t shape) {
+            if (!wp_cursor_shape_device_v1_shape_is_valid(shape,
+                                                          wl_resource_get_version(resource))) {
+                wl_resource_post_error(resource, WP_CURSOR_SHAPE_DEVICE_V1_ERROR_INVALID_SHAPE,
+                                       "invalid cursor shape");
+                return;
+            }
+            // Null user data: a tablet-tool device (no tablet support) — inert.
+            auto* dev = static_cast<shape_device_obj*>(wl_resource_get_user_data(resource));
+            if (!dev || !dev->used || !dev->pointer)
+                return;
+            if (!cursor_request_allowed(client, serial))
+                return;
+            g_p0_ctx->cursor->set_client_shape(static_cast<lx::compositor::cursor_shape>(shape));
+        },
+};
+
+const struct wp_cursor_shape_manager_v1_interface shape_manager_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+    .get_pointer =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t id,
+           struct wl_resource* pointer) {
+            shape_device_obj* dev = nullptr;
+            for (auto& d : shape_devices)
+                if (!d.used) {
+                    dev = &d;
+                    break;
+                }
+            if (!dev) {
+                wl_client_post_no_memory(client);
+                return;
+            }
+            wl_resource* res = wl_resource_create(client, &wp_cursor_shape_device_v1_interface,
+                                                  wl_resource_get_version(resource), id);
+            if (!res) {
+                wl_client_post_no_memory(client);
+                return;
+            }
+            *dev = {};
+            dev->used = true;
+            dev->resource = res;
+            dev->pointer = pointer;
+            wl_resource_set_implementation(res, &shape_device_impl, dev, [](wl_resource* r) {
+                auto* d = static_cast<shape_device_obj*>(wl_resource_get_user_data(r));
+                if (d && d->resource == r)
+                    *d = {};
+            });
+        },
+    .get_tablet_tool_v2 =
+        [](struct wl_client* client, struct wl_resource* resource, uint32_t id,
+           struct wl_resource*) {
+            wl_resource* res = wl_resource_create(client, &wp_cursor_shape_device_v1_interface,
+                                                  wl_resource_get_version(resource), id);
+            if (!res) {
+                wl_client_post_no_memory(client);
+                return;
+            }
+            wl_resource_set_implementation(res, &shape_device_impl, nullptr, nullptr);
+        },
+};
+
+void bind_cursor_shape(wayland::client_connection& client, unsigned id, int version) {
+    if (!g_p0_ctx)
+        return;
+    auto res = wayland::resource::create(client, &wp_cursor_shape_manager_v1_interface, version,
+                                         id);
+    if (!res)
+        return;
+    res.set_implementation(&shape_manager_impl, g_p0_ctx, nullptr);
+}
+#endif
+
+/// The cursor manager's texture hook: a premultiplied ARGB image padded into a fixed
+/// `canvas` square and queued like any shm texture, in the order the active backend
+/// samples (native for CPU, RGBA otherwise).
+bool stage_compositor_argb(void* user, unsigned texture_id, const uint32_t* argb, unsigned width,
+                           unsigned height, unsigned stride_px, unsigned canvas) {
+    auto* ctx = static_cast<p0_protocol_context*>(user);
+    if (!ctx || !ctx->textures || !argb || canvas == 0)
+        return false;
+    const unsigned bytes = canvas * canvas * 4u;
+    unsigned long long seq = 0;
+    unsigned long long token = 0;
+    unsigned char* out = nullptr;
+    if (ctx->shm_store)
+        out = ctx->shm_store->acquire(texture_id, bytes, token);
+    else if (ctx->shm_staging)
+        out = ctx->shm_staging->acquire(bytes, seq);
+    if (!out)
+        return false;
+    const bool native = ctx->shm_native_format;
+    for (unsigned y = 0; y < canvas; ++y) {
+        auto* row = reinterpret_cast<uint32_t*>(out + static_cast<size_t>(y) * canvas * 4u);
+        for (unsigned x = 0; x < canvas; ++x) {
+            const uint32_t p =
+                (y < height && x < width) ? argb[static_cast<size_t>(y) * stride_px + x] : 0u;
+            row[x] = native ? p
+                            : ((p & 0xFF00FF00u) | ((p & 0x00FF0000u) >> 16) |
+                               ((p & 0x000000FFu) << 16));
+        }
+    }
+    texture_update update{};
+    update.kind = texture_update::op::shm;
+    update.texture_id = texture_id;
+    update.width = canvas;
+    update.height = canvas;
+    update.stride = canvas * 4u;
+    update.format = native ? static_cast<lx::fourcc>(lx::pixel_format::argb8888)
+                           : static_cast<lx::fourcc>(lx::pixel_format::rgba8888);
+    update.pixels = out;
+    update.shm_seq = seq;
+    update.shm_token = token;
+    if (!ctx->textures->try_push(update)) {
+        if (token && ctx->shm_store)
+            ctx->shm_store->release(token);
+        return false;
+    }
+    return true;
+}
+
 const struct wl_seat_interface seat_impl = {
     .get_pointer =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -1349,8 +1938,7 @@ const struct wl_seat_interface seat_impl = {
             if (!res)
                 return;
             static const struct wl_pointer_interface impl = {
-                .set_cursor = [](struct wl_client*, struct wl_resource*, uint32_t,
-                                 struct wl_resource*, int32_t, int32_t) {},
+                .set_cursor = pointer_set_cursor,
                 .release = [](struct wl_client*,
                               struct wl_resource* r) { wl_resource_destroy(r); },
             };
@@ -1358,6 +1946,9 @@ const struct wl_seat_interface seat_impl = {
             wl_resource_set_implementation(res, &impl, nullptr, [](wl_resource* r) {
                 if (g_p0_ctx && g_p0_ctx->input)
                     g_p0_ctx->input->remove(r);
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+                shape_devices_drop_pointer(r);
+#endif
             });
             if (g_p0_ctx && g_p0_ctx->input && g_p0_ctx->seat)
                 g_p0_ctx->input->add_pointer(res, *g_p0_ctx->seat);
@@ -1445,33 +2036,68 @@ void bind_seat(wayland::client_connection& client, unsigned id, int version) {
 // rather than hidden from the registry — so a rejected bind is a protocol error the shell
 // can report, instead of a global that mysteriously does not exist.
 
-// Requests are accepted and routed to shell_bridge, which owns the decision. The bodies
-// that are still empty are the ones whose compositor-side action does not exist yet
-// (move/resize interaction, workspace objects, rule persistence) — they are declared here
-// so the shell can bind and drive what does work, rather than failing at bind.
+// Requests name toplevels by the compositor-created zlm_toplevel_v1 handle, whose user data
+// is the toplevel_id (shell_bridge::toplevel_from_handle); an inert handle decodes to 0.
+// The bodies that are still empty are the ones whose compositor-side action does not exist
+// yet (maximize/fullscreen/minimize, workspace objects, rule
+// persistence) — they are declared here so the shell can bind and drive what does work,
+// rather than failing at bind. Every request has a body: libwayland calls the slot
+// unconditionally, so a missing one is a NULL call.
+lx::compositor::window_manager* bridge_wm() { return g_p0_ctx ? g_p0_ctx->wm : nullptr; }
+
 const struct zlm_policy_bridge_v1_interface policy_bridge_impl = {
     .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
     .request_activate =
         [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {
-            if (g_p0_ctx && g_p0_ctx->shell && toplevel) {
-                g_p0_ctx->shell->on_request_activate(
-                    lx::toplevel_id{reinterpret_cast<unsigned long long>(toplevel)});
-            }
+            if (auto* wm = bridge_wm())
+                wm->activate(lx::compositor::shell_bridge::toplevel_from_handle(toplevel));
         },
-    .request_raise = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
-    .request_lower = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .request_raise =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {
+            if (auto* wm = bridge_wm())
+                (void)wm->raise(lx::compositor::shell_bridge::toplevel_from_handle(toplevel));
+        },
+    .request_lower =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {
+            if (auto* wm = bridge_wm())
+                (void)wm->lower(lx::compositor::shell_bridge::toplevel_from_handle(toplevel));
+        },
     .set_toplevel_stacking_index =
-        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel,
-           uint32_t index) {
-            if (g_p0_ctx && g_p0_ctx->shell && toplevel) {
-                g_p0_ctx->shell->on_set_stacking_index(
-                    lx::toplevel_id{reinterpret_cast<unsigned long long>(toplevel)}, index);
-            }
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel, uint32_t index) {
+            if (auto* wm = bridge_wm())
+                (void)wm->restack(lx::compositor::shell_bridge::toplevel_from_handle(toplevel),
+                                  index);
         },
-    .request_move = [](struct wl_client*, struct wl_resource*, struct wl_resource*,
-                       struct wl_resource*, uint32_t) {},
-    .request_resize = [](struct wl_client*, struct wl_resource*, struct wl_resource*,
-                         struct wl_resource*, uint32_t, uint32_t) {},
+    // Same executor as xdg_toplevel.move/resize and the keybinding; the press serial is
+    // checked but may belong to any client (normally the shell's own panel surface).
+    .request_move =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel,
+           struct wl_resource*, uint32_t serial) {
+            if (auto* wm = bridge_wm())
+                (void)wm->request_shell_grab(
+                    lx::compositor::shell_bridge::toplevel_from_handle(toplevel), serial,
+                    lx::compositor::grab_mode::move, 0);
+        },
+    .request_resize =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel,
+           struct wl_resource*, uint32_t serial, uint32_t edges) {
+            // The shell is trusted: an invalid edge is ignored (logged by the WM), not
+            // a protocol error that would kill the desktop.
+            if (auto* wm = bridge_wm())
+                (void)wm->request_shell_grab(
+                    lx::compositor::shell_bridge::toplevel_from_handle(toplevel), serial,
+                    lx::compositor::grab_mode::resize, edges);
+        },
+    .request_maximize = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .request_unmaximize = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .request_fullscreen = [](struct wl_client*, struct wl_resource*, struct wl_resource*,
+                             struct wl_resource*) {},
+    .request_minimize = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .request_close =
+        [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {
+            if (auto* wm = bridge_wm())
+                wm->request_close(lx::compositor::shell_bridge::toplevel_from_handle(toplevel));
+        },
 };
 
 const struct zlm_workspace_manager_v1_interface workspace_manager_impl = {
@@ -1511,15 +2137,16 @@ const struct zlm_shell_v1_interface shell_impl = {
                                                   wl_resource_get_version(resource), id);
             if (!res)
                 return;
-            wl_resource_set_implementation(res, &policy_bridge_impl, g_p0_ctx, nullptr);
+            wl_resource_set_implementation(res, &policy_bridge_impl, g_p0_ctx,
+                                           [](struct wl_resource* r) {
+                                               if (g_p0_ctx && g_p0_ctx->shell)
+                                                   g_p0_ctx->shell->on_bridge_destroyed(r);
+                                           });
             // The shell's first act is to learn the current state — ADR-004 §5's
             // session-startup path. Emitted on bridge creation rather than on shell bind,
             // because the bridge is the object the events are addressed to.
-            if (g_p0_ctx && g_p0_ctx->shell && g_p0_ctx->toplevels) {
-                g_p0_ctx->shell->emit_snapshot(
-                    lx::client_id{reinterpret_cast<unsigned long long>(client)},
-                    *g_p0_ctx->toplevels);
-            }
+            if (g_p0_ctx && g_p0_ctx->shell)
+                g_p0_ctx->shell->on_bridge_bound(res);
         },
     .get_window_rules =
         [](struct wl_client* client, struct wl_resource* resource, uint32_t id) {
@@ -1704,6 +2331,8 @@ void install_core(p0_protocol_context& ctx) {
     g_p0_ctx = &ctx;
     if (!ctx.server)
         return;
+    if (ctx.cursor)
+        ctx.cursor->set_stage_fn(&stage_compositor_argb, &ctx);
     ctx.server->add_global({.interface_name = "wl_compositor",
                             .version = 6,
                             .privileged = false,
@@ -1730,6 +2359,14 @@ void install_core(p0_protocol_context& ctx) {
                             .interface_desc = &wl_data_device_manager_interface},
                            &bind_data_device_manager);
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
+    if (ctx.wm) {
+        lx::compositor::wm_protocol_ops ops{};
+        ops.send_configure = &wm_send_configure;
+        ops.next_serial = &wm_next_serial;
+        ops.send_close = &wm_send_close;
+        ops.user = &ctx;
+        ctx.wm->set_protocol_ops(ops);
+    }
     ctx.server->add_global({.interface_name = "xdg_wm_base",
                             .version = 6,
                             .privileged = false,
@@ -1740,6 +2377,12 @@ void install_core(p0_protocol_context& ctx) {
                             .privileged = true,
                             .interface_desc = &zlm_shell_v1_interface},
                            bind_shell);
+
+    ctx.server->add_global({.interface_name = "wp_cursor_shape_manager_v1",
+                            .version = 2,
+                            .privileged = false,
+                            .interface_desc = &wp_cursor_shape_manager_v1_interface},
+                           &bind_cursor_shape);
 
     ctx.server->add_global({.interface_name = "zwp_linux_dmabuf_v1",
                             .version = 5,

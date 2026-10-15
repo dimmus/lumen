@@ -12,6 +12,10 @@ module;
 #include <unistd.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
+// Linux 6.8 uapi; libdrm's bundled drm.h predates it.
+#ifndef DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT
+#define DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT 6
+#endif
 #endif
 
 import lx.foundation;
@@ -20,6 +24,7 @@ import lx.runtime;
 export module lx.drm;
 
 export import :atomic;
+export import :cursor;
 
 export namespace lx::drm {
 
@@ -75,6 +80,12 @@ public:
 
     [[nodiscard]] unsigned crtc_id_for(unsigned connector_index) const;
     [[nodiscard]] unsigned primary_plane_id() const { return primary_plane_id_; }
+    /// Index of the driving CRTC in the resource list — the bit planes' `possible_crtcs`
+    /// masks are expressed in.
+    [[nodiscard]] unsigned crtc_index() const { return crtc_index_; }
+    /// DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT was accepted. Virtualised drivers hide their
+    /// cursor plane from atomic clients that have not set it.
+    [[nodiscard]] bool cursor_hotspot_cap() const { return cursor_hotspot_cap_; }
 
 private:
     friend class kms_atomic_commit;
@@ -97,6 +108,8 @@ private:
     unsigned connector_count_ = 0;
     unsigned primary_plane_id_ = 0;
     unsigned crtc_id_ = 0;
+    unsigned crtc_index_ = 0;
+    bool cursor_hotspot_cap_ = false;
 };
 
 class plane_manager {
@@ -209,11 +222,15 @@ lx::drm::kms_device& lx::drm::kms_device::operator=(kms_device&& other) noexcept
     connector_count_ = other.connector_count_;
     primary_plane_id_ = other.primary_plane_id_;
     crtc_id_ = other.crtc_id_;
+    crtc_index_ = other.crtc_index_;
+    cursor_hotspot_cap_ = other.cursor_hotspot_cap_;
     for (unsigned i = 0; i < k_max_connectors; ++i)
         connectors_[i] = other.connectors_[i];
     other.connector_count_ = 0;
     other.primary_plane_id_ = 0;
     other.crtc_id_ = 0;
+    other.crtc_index_ = 0;
+    other.cursor_hotspot_cap_ = false;
     return *this;
 }
 
@@ -222,6 +239,8 @@ void lx::drm::kms_device::release() {
     connector_count_ = 0;
     primary_plane_id_ = 0;
     crtc_id_ = 0;
+    crtc_index_ = 0;
+    cursor_hotspot_cap_ = false;
     for (auto& c : connectors_)
         c = {};
 }
@@ -243,6 +262,11 @@ lx::result<void> lx::drm::kms_device::init_from_fd() {
                               "DRM_CLIENT_CAP_ATOMIC failed");
     }
     (void)drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+    // Declares that this client sets HOTSPOT_X/Y on cursor planes. Virtualised drivers
+    // (vmwgfx, virtio-gpu, qxl, vboxvideo) only expose their cursor plane to atomic
+    // clients that do, because the host draws the pointer and needs the hotspot to place
+    // it. Other drivers reject the cap, which is expected and harmless.
+    cursor_hotspot_cap_ = drmSetClientCap(fd, DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, 1) == 0;
     return refresh();
 #else
     return lx::not_implemented("lx::drm::kms_device::init_from_fd");
@@ -342,23 +366,56 @@ lx::result<void> lx::drm::kms_device::refresh() {
         ++connector_count_;
     }
 
-    // Primary plane for the first CRTC.
+    // `possible_crtcs` is a bitmask over the resource list's CRTC order, not over ids.
+    crtc_index_ = 0;
+    for (int i = 0; i < res->count_crtcs; ++i) {
+        if (res->crtcs[i] == crtc_id_) {
+            crtc_index_ = static_cast<unsigned>(i);
+            break;
+        }
+    }
+
+    // The primary plane for that CRTC, chosen by its `type`. Taking the first plane that
+    // can reach the CRTC worked only while the primary happened to be enumerated first;
+    // with cursor planes exposed (the hotspot cap) a cursor or overlay plane can precede it.
+    primary_plane_id_ = 0;
+    unsigned first_usable = 0;
     drmModePlaneRes* planes = drmModeGetPlaneResources(fd);
     if (planes) {
-        for (uint32_t i = 0; i < planes->count_planes; ++i) {
+        for (uint32_t i = 0; i < planes->count_planes && primary_plane_id_ == 0; ++i) {
             drmModePlane* p = drmModeGetPlane(fd, planes->planes[i]);
             if (!p)
                 continue;
-            // Prefer a plane that can use our CRTC.
-            if (crtc_id_ == 0 || (p->possible_crtcs & 1u)) {
-                primary_plane_id_ = p->plane_id;
-                drmModeFreePlane(p);
-                break;
-            }
+            const bool usable = crtc_id_ == 0 || (p->possible_crtcs & (1u << crtc_index_));
+            const unsigned plane_id = p->plane_id;
             drmModeFreePlane(p);
+            if (!usable)
+                continue;
+            if (!first_usable)
+                first_usable = plane_id;
+            drmModeObjectProperties* props =
+                drmModeObjectGetProperties(fd, plane_id, DRM_MODE_OBJECT_PLANE);
+            if (!props)
+                continue;
+            for (uint32_t k = 0; k < props->count_props; ++k) {
+                drmModePropertyRes* prop = drmModeGetProperty(fd, props->props[k]);
+                if (!prop)
+                    continue;
+                const bool is_type = std::strcmp(prop->name, "type") == 0;
+                drmModeFreeProperty(prop);
+                if (is_type) {
+                    if (props->prop_values[k] == DRM_PLANE_TYPE_PRIMARY)
+                        primary_plane_id_ = plane_id;
+                    break;
+                }
+            }
+            drmModeFreeObjectProperties(props);
         }
         drmModeFreePlaneResources(planes);
     }
+    // A driver without a `type` property (pre-universal-planes): the old rule.
+    if (primary_plane_id_ == 0)
+        primary_plane_id_ = first_usable;
 
     drmModeFreeResources(res);
     return {};
@@ -901,12 +958,22 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
     const unsigned fb = request.framebuffer_id ? request.framebuffer_id : framebuffer_id_;
     const unsigned plane = device_->primary_plane_id();
     const unsigned crtc = device_->crtc_id_for(request.connector);
+    const bool primary = request.update_primary;
+    // Flip events and their failure notifications describe frames; a cursor-only or
+    // test-only commit is not one.
+    const bool frame_event = primary && request.request_page_flip && !request.test_only;
 
-    if (fd < 0 || !fb || !plane || !crtc) {
-        if (request.request_page_flip)
+    if (fd < 0 || !plane || !crtc || (primary && !fb)) {
+        if (frame_event)
             emit_flip(request, false);
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
                               "atomic commit missing fb/plane/crtc");
+    }
+    if (!primary && (!request.cursor || !modeset_attempted_ || !props_ready_)) {
+        // Nothing to commit, or the CRTC is not ours yet — the first commit is the
+        // modeset, and it carries a frame.
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "cursor-only commit before the first modeset");
     }
 
     if (auto props = ensure_props(); !props)
@@ -923,15 +990,16 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
     // A plane-only commit inherits whatever mode the console left on the CRTC, so the very
     // first commit sets the mode our framebuffer was sized for. On failure the flip path
     // still runs — degraded, but reported once rather than every frame.
-    if (!modeset_attempted_) {
+    // The cursor plane is not part of it: it joins on the next commit.
+    if (!modeset_attempted_ && !request.test_only) {
         modeset_attempted_ = true;
         auto modeset = apply_modeset(request.connector, crtc, fb, width, height);
         if (!modeset) {
-            if (request.request_page_flip)
+            if (frame_event)
                 emit_flip(request, false);
             return modeset.get_error();
         }
-        if (request.request_page_flip)
+        if (frame_event)
             emit_flip(request, true);
         return {};
     }
@@ -942,53 +1010,79 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
                               "drmModeAtomicAlloc failed");
     }
 
-    drmModeAtomicAddProperty(req, plane, prop_crtc_id_, crtc);
-    drmModeAtomicAddProperty(req, plane, prop_fb_id_, fb);
-    drmModeAtomicAddProperty(req, plane, prop_src_x_, 0);
-    drmModeAtomicAddProperty(req, plane, prop_src_y_, 0);
-    drmModeAtomicAddProperty(req, plane, prop_src_w_, static_cast<uint64_t>(width) << 16);
-    drmModeAtomicAddProperty(req, plane, prop_src_h_, static_cast<uint64_t>(height) << 16);
-    drmModeAtomicAddProperty(req, plane, prop_crtc_x_, 0);
-    drmModeAtomicAddProperty(req, plane, prop_crtc_y_, 0);
-    drmModeAtomicAddProperty(req, plane, prop_crtc_w_, width);
-    drmModeAtomicAddProperty(req, plane, prop_crtc_h_, height);
-
-    if (atomic_damage_ && prop_fb_damage_clips_ && !request.damage.full_frame &&
-        request.damage.count > 0 && damage_blob_id_) {
-        drmModeAtomicAddProperty(req, plane, prop_fb_damage_clips_, damage_blob_id_);
-    }
-
-    if (prop_in_fence_fd_ && request.in_fence_fd >= 0)
-        drmModeAtomicAddProperty(req, plane, prop_in_fence_fd_,
-                                 static_cast<uint64_t>(request.in_fence_fd));
+    const bool with_cursor = request.cursor && request.cursor->dirty();
+    if (with_cursor)
+        request.cursor->append_props(req);
 
     // OUT_FENCE_PTR takes the address of a signed 32-bit slot that the kernel fills with a
     // ready-to-use sync_file FD — not a syncobj handle needing a separate export.
     int32_t out_fence_fd = -1;
-    const bool want_out_fence = prop_out_fence_ptr_ && request.out_fence_fd_ptr;
-    if (want_out_fence)
-        drmModeAtomicAddProperty(req, plane, prop_out_fence_ptr_,
-                                 reinterpret_cast<uint64_t>(&out_fence_fd));
+    const bool want_out_fence =
+        primary && !request.test_only && prop_out_fence_ptr_ && request.out_fence_fd_ptr;
 
-    uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
-    if (request.request_page_flip)
-        flags |= DRM_MODE_PAGE_FLIP_EVENT;
-    if (request.async)
-        flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+    if (primary) {
+        drmModeAtomicAddProperty(req, plane, prop_crtc_id_, crtc);
+        drmModeAtomicAddProperty(req, plane, prop_fb_id_, fb);
+        drmModeAtomicAddProperty(req, plane, prop_src_x_, 0);
+        drmModeAtomicAddProperty(req, plane, prop_src_y_, 0);
+        drmModeAtomicAddProperty(req, plane, prop_src_w_, static_cast<uint64_t>(width) << 16);
+        drmModeAtomicAddProperty(req, plane, prop_src_h_, static_cast<uint64_t>(height) << 16);
+        drmModeAtomicAddProperty(req, plane, prop_crtc_x_, 0);
+        drmModeAtomicAddProperty(req, plane, prop_crtc_y_, 0);
+        drmModeAtomicAddProperty(req, plane, prop_crtc_w_, width);
+        drmModeAtomicAddProperty(req, plane, prop_crtc_h_, height);
 
+        if (atomic_damage_ && prop_fb_damage_clips_ && !request.damage.full_frame &&
+            request.damage.count > 0 && damage_blob_id_) {
+            drmModeAtomicAddProperty(req, plane, prop_fb_damage_clips_, damage_blob_id_);
+        }
+
+        if (prop_in_fence_fd_ && request.in_fence_fd >= 0)
+            drmModeAtomicAddProperty(req, plane, prop_in_fence_fd_,
+                                     static_cast<uint64_t>(request.in_fence_fd));
+
+        if (want_out_fence)
+            drmModeAtomicAddProperty(req, plane, prop_out_fence_ptr_,
+                                     reinterpret_cast<uint64_t>(&out_fence_fd));
+    }
+
+    // TEST_ONLY takes neither NONBLOCK semantics nor an event (an event is EINVAL with it).
+    uint32_t flags = DRM_MODE_ATOMIC_TEST_ONLY;
+    if (!request.test_only) {
+        flags = DRM_MODE_ATOMIC_NONBLOCK;
+        if (request.request_page_flip)
+            flags |= DRM_MODE_PAGE_FLIP_EVENT;
+        if (request.async)
+            flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+    }
+
+    // Raised before the ioctl, not after: the flip event can be drained on the UI thread
+    // before drmModeAtomicCommit even returns here, and a late store would then re-raise
+    // a flag no event is left to clear, wedging every later commit as "flip in flight".
+    // Only a flag this commit raised is lowered again on failure — a flip already pending
+    // still owns its event.
+    const bool raises_flip = request.request_page_flip && !request.test_only &&
+                             !flip_pending_.exchange(true, std::memory_order_acq_rel);
     const int r = drmModeAtomicCommit(fd, req, flags, this);
     // Capture errno before drmModeAtomicFree, which may clobber it.
     const int commit_errno = r != 0 ? errno : 0;
     drmModeAtomicFree(req);
     if (r != 0) {
-        if (request.request_page_flip)
+        if (raises_flip)
+            flip_pending_.store(false, std::memory_order_release);
+        last_rejected_state_ =
+            commit_errno == EINVAL || commit_errno == ERANGE || commit_errno == ENOSPC;
+        if (frame_event)
             emit_flip(request, false);
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
                               atomic_commit_message(commit_errno));
     }
+    last_rejected_state_ = false;
+    if (request.test_only)
+        return {};
 
-    if (request.request_page_flip)
-        flip_pending_.store(true, std::memory_order_release);
+    if (with_cursor)
+        request.cursor->on_committed();
 
     if (want_out_fence)
         *request.out_fence_fd_ptr = out_fence_fd;
