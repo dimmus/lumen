@@ -3,6 +3,7 @@ module;
 import lx.foundation;
 import lx.gfx;
 import lx.scene;
+import lx.trace;
 import lx.wayland.server;
 
 export module lx.compositor:surface;
@@ -26,7 +27,9 @@ struct surface_commit {
     lx::gfx::syncobj_timeline sync{};
     content_hint hint = content_hint::normal;
     bool fullscreen = false;
-    bool opaque = true;
+    /// The content has no translucent pixel: a format without alpha, or an opaque region
+    /// covering the buffer. False (blend) unless the protocol layer proves it.
+    bool opaque = false;
 };
 
 /// A wl_surface input region: the exact rect set from wl_region add/subtract, in fixed
@@ -56,16 +59,100 @@ struct input_region {
     [[nodiscard]] bool contains(int x, int y) const;
 };
 
+/// Open-addressing map from a nonzero id to a table slot, in fixed storage: linear
+/// probing at a load factor of at most one half, and backward-shift deletion, so lookups
+/// stay O(1) however much the table churns (no tombstones). The hit test runs one lookup
+/// per surface per pointer motion; a linear scan of the table there is not affordable.
+template<unsigned Buckets>
+class id_slot_index {
+    static_assert(Buckets != 0 && (Buckets & (Buckets - 1)) == 0, "power of two");
+
+public:
+    [[nodiscard]] int find(unsigned long long id) const {
+        if (id == 0)
+            return -1;
+        for (unsigned i = home(id), n = 0; n < Buckets; ++n, i = (i + 1) & k_mask) {
+            if (keys_[i] == id)
+                return slots_[i];
+            if (keys_[i] == 0)
+                return -1;
+        }
+        return -1;
+    }
+    /// False when `id` is 0 or the index is full. An existing id is updated in place.
+    bool insert(unsigned long long id, int slot) {
+        if (id == 0)
+            return false;
+        for (unsigned i = home(id), n = 0; n < Buckets; ++n, i = (i + 1) & k_mask) {
+            if (keys_[i] == id || keys_[i] == 0) {
+                keys_[i] = id;
+                slots_[i] = slot;
+                return true;
+            }
+        }
+        return false;
+    }
+    void erase(unsigned long long id) {
+        if (id == 0)
+            return;
+        unsigned i = home(id);
+        unsigned n = 0;
+        for (; n < Buckets; ++n, i = (i + 1) & k_mask) {
+            if (keys_[i] == id)
+                break;
+            if (keys_[i] == 0)
+                return;
+        }
+        if (n == Buckets)
+            return;
+        // Backward shift: pull every later member of the probe run whose home does not lie
+        // cyclically in (hole, j] into the hole, so no lookup ever stops short of its key.
+        unsigned hole = i;
+        for (unsigned j = (hole + 1) & k_mask; keys_[j] != 0; j = (j + 1) & k_mask) {
+            const unsigned h = home(keys_[j]);
+            const bool stays = hole <= j ? (hole < h && h <= j) : (hole < h || h <= j);
+            if (stays)
+                continue;
+            keys_[hole] = keys_[j];
+            slots_[hole] = slots_[j];
+            hole = j;
+        }
+        keys_[hole] = 0;
+        slots_[hole] = -1;
+    }
+
+private:
+    static constexpr unsigned k_mask = Buckets - 1;
+    [[nodiscard]] static unsigned home(unsigned long long id) {
+        return static_cast<unsigned>((id * 0x9E3779B97F4A7C15ull) >> 40) & k_mask;
+    }
+    unsigned long long keys_[Buckets]{};
+    int slots_[Buckets]{};
+};
+
 /// Client surfaces' content and their scene nodes. UI affinity.
 ///
-/// A commit records content; it does not decide visibility. Only a mapped role (an
-/// xdg_toplevel today) gets a node, through `ensure_node`, and the window manager owns
-/// where it sits — this class never moves a node on its own.
+/// A commit records content; it does not decide visibility. Only a mapped surface (part of
+/// a mapped root's surface tree) gets a node, through `ensure_node`, and `surface_tree`
+/// owns where it sits — this class never moves or restacks a node on its own.
 class surface_manager {
 public:
+    static constexpr unsigned k_max_surfaces = 256;
+
     void set_import_cache(lx::gfx::dmabuf_import_cache* cache);
-    /// Nodes are created under `layer`, which must be a child of `graph`'s root.
-    void set_scene(lx::scene::scene_graph* graph, lx::scene::container_node* layer);
+    /// The composite backend imports dma-bufs itself, on the render thread (GL: an
+    /// EGLImage per commit). Then a dma-buf gets a stable compositor texture id like an shm
+    /// buffer, and the UI-side (Vulkan) import cache is not used — on a host whose only
+    /// Vulkan device is a software rasterizer that import cannot succeed at all.
+    void set_render_thread_import(bool enabled) { render_thread_import_ = enabled; }
+    /// Damage goes to `graph`. Nodes live in whatever container `ensure_node` names.
+    void set_scene(lx::scene::scene_graph* graph);
+
+    /// wl_compositor.create_surface: makes the entry and remembers its `wl_resource*`
+    /// (void*: no Wayland types here). False when the table is full.
+    [[nodiscard]] bool register_surface(lx::surface_id surface, void* resource);
+    /// The surface's `wl_resource*`, or null.
+    [[nodiscard]] void* resource(lx::surface_id surface) const;
 
     /// Register a dmabuf description for a buffer (client attach path). Takes ownership
     /// of the plane FDs in `desc`.
@@ -78,6 +165,10 @@ public:
 
     /// Stable texture id assigned to a registered shm buffer, or 0.
     [[nodiscard]] unsigned texture_for(lx::buffer_id buffer) const;
+    /// The wl_buffer object is gone: frees its record (and any plane fds it holds). Content
+    /// a surface already shows is unaffected — it lives in the surface entry and texture.
+    /// Without this the table filled after 256 buffers and every later commit failed.
+    void forget_buffer(lx::buffer_id buffer);
 
     [[nodiscard]] lx::result<void> on_commit(surface_commit commit);
 
@@ -94,11 +185,23 @@ public:
 
     /// Size of the last successfully committed buffer; empty before the first one.
     [[nodiscard]] lx::size2i buffer_size(lx::surface_id surface) const;
-    /// Creates the surface's scene node (bounds = buffer size) at the top of the layer.
-    /// True if the node exists afterwards.
-    [[nodiscard]] bool ensure_node(lx::surface_id surface);
-    /// Removes and deletes the node. Notes no damage — the caller knows what it unmapped.
+    /// Creates the surface's scene node (bounds = buffer size) at the top of `parent`.
+    /// True if the node exists afterwards. A full container fails (warned once).
+    [[nodiscard]] bool ensure_node(lx::surface_id surface, lx::scene::container_node& parent);
+    /// Removes the node from its container and deletes it. Notes no damage — the caller
+    /// knows what it unmapped.
     void drop_node(lx::surface_id surface);
+    /// Content opacity (see `surface_commit::opaque`); pushed into the node, damaging it
+    /// when the blend changes.
+    void set_opaque(lx::surface_id surface, bool opaque);
+    /// Something under a still pointer may have changed: a node appeared, went away,
+    /// moved or changed size. The window manager re-hit-tests once per tick on it.
+    void note_layout_changed() { layout_changed_ = true; }
+    [[nodiscard]] bool consume_layout_changed() {
+        const bool changed = layout_changed_;
+        layout_changed_ = false;
+        return changed;
+    }
     [[nodiscard]] lx::scene::surface_node* node(lx::surface_id surface) const;
     /// Global `{origin, buffer extents}` of the node, or empty when there is none.
     [[nodiscard]] lx::rect2i node_rect(lx::surface_id surface) const;
@@ -115,17 +218,20 @@ public:
                            double& sy) const;
 
 private:
-    static constexpr unsigned k_max_surfaces = 128;
     static constexpr unsigned k_max_buffers = 256;
 
     struct surface_entry {
         lx::surface_id id{};
+        void* resource = nullptr;
         lx::buffer_id buffer{};
         lx::gfx::imported_image image{};
         lx::size2i buffer_size{};
         content_hint hint = content_hint::normal;
         lx::scene::surface_node* node = nullptr;
+        /// The container `node` was added to.
+        lx::scene::container_node* node_parent = nullptr;
         input_region input{};
+        bool opaque = false;
         bool override_redirect = false;
         bool used = false;
     };
@@ -144,10 +250,14 @@ private:
 
     lx::gfx::dmabuf_import_cache* import_cache_ = nullptr;
     lx::scene::scene_graph* scene_ = nullptr;
-    lx::scene::container_node* layer_ = nullptr;
     surface_entry surfaces_[k_max_surfaces]{};
+    id_slot_index<k_max_surfaces * 2> index_{};
+    bool layout_changed_ = false;
+    bool warned_container_full_ = false;
+    bool render_thread_import_ = false;
     buffer_entry buffers_[k_max_buffers]{};
-    /// shm texture ids live in a space disjoint from dmabuf import ids.
+    /// Compositor-assigned texture ids (shm, render-thread dma-buf) live in a space disjoint
+    /// from import-cache ids.
     unsigned next_shm_texture_id_ = 0x4000'0000u;
 };
 
@@ -158,10 +268,22 @@ void lx::compositor::surface_manager::set_import_cache(lx::gfx::dmabuf_import_ca
     import_cache_ = cache;
 }
 
-void lx::compositor::surface_manager::set_scene(lx::scene::scene_graph* graph,
-                                                lx::scene::container_node* layer) {
+void lx::compositor::surface_manager::set_scene(lx::scene::scene_graph* graph) {
     scene_ = graph;
-    layer_ = layer;
+}
+
+bool lx::compositor::surface_manager::register_surface(lx::surface_id surface, void* resource) {
+    const int slot = find_or_alloc_surface(surface);
+    if (slot < 0)
+        return false;
+    surfaces_[static_cast<unsigned>(slot)].resource = resource;
+    return true;
+}
+
+void* lx::compositor::surface_manager::resource(lx::surface_id surface) const {
+    if (const int slot = find_surface(surface); slot >= 0)
+        return surfaces_[static_cast<unsigned>(slot)].resource;
+    return nullptr;
 }
 
 void lx::compositor::surface_manager::register_dmabuf(lx::buffer_id buffer,
@@ -172,6 +294,8 @@ void lx::compositor::surface_manager::register_dmabuf(lx::buffer_id buffer,
         auto& entry = buffers_[static_cast<unsigned>(existing)];
         entry.desc = static_cast<lx::gfx::dmabuf_desc&&>(desc);
         entry.kind = buffer_kind::dmabuf;
+        if (render_thread_import_ && entry.texture_id == 0)
+            entry.texture_id = next_shm_texture_id_++;
         return;
     }
     for (unsigned i = 0; i < k_max_buffers; ++i) {
@@ -181,6 +305,8 @@ void lx::compositor::surface_manager::register_dmabuf(lx::buffer_id buffer,
         buffers_[i].id = buffer;
         buffers_[i].desc = static_cast<lx::gfx::dmabuf_desc&&>(desc);
         buffers_[i].kind = buffer_kind::dmabuf;
+        if (render_thread_import_)
+            buffers_[i].texture_id = next_shm_texture_id_++;
         return;
     }
 }
@@ -220,19 +346,26 @@ unsigned lx::compositor::surface_manager::texture_for(lx::buffer_id buffer) cons
     return 0;
 }
 
+void lx::compositor::surface_manager::forget_buffer(lx::buffer_id buffer) {
+    if (const int slot = find_buffer(buffer); slot >= 0)
+        buffers_[static_cast<unsigned>(slot)] = {};
+}
+
 int lx::compositor::surface_manager::find_surface(lx::surface_id id) const {
-    for (unsigned i = 0; i < k_max_surfaces; ++i)
-        if (surfaces_[i].used && surfaces_[i].id == id)
-            return static_cast<int>(i);
-    return -1;
+    return index_.find(id.id());
 }
 
 int lx::compositor::surface_manager::find_or_alloc_surface(lx::surface_id id) {
+    if (!id)
+        return -1;
     if (const int existing = find_surface(id); existing >= 0)
         return existing;
     for (unsigned i = 0; i < k_max_surfaces; ++i) {
         if (surfaces_[i].used)
             continue;
+        if (!index_.insert(id.id(), static_cast<int>(i)))
+            return -1;
+        surfaces_[i] = {};
         surfaces_[i].used = true;
         surfaces_[i].id = id;
         return static_cast<int>(i);
@@ -274,9 +407,10 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
     }
 
     lx::gfx::imported_image image{};
-    if (buffer_entry_ref.kind == buffer_kind::shm) {
-        // shm pixels are uploaded by the render backend against a stable texture id;
-        // there is no dmabuf to import.
+    if (buffer_entry_ref.kind == buffer_kind::shm ||
+        (render_thread_import_ && buffer_entry_ref.texture_id != 0)) {
+        // shm pixels are uploaded, and a render-thread dma-buf is imported, by the render
+        // backend against a stable texture id; nothing is imported here.
         image.image_id = buffer_entry_ref.texture_id;
         image.memory_id = image.image_id;
         image.width = desc.width;
@@ -313,21 +447,34 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
         return lx::make_error(lx::error_domain::wayland, 0, "surface table full");
     }
     auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    const lx::size2i old_size = entry.buffer_size;
     entry.buffer = commit.buffer;
     entry.hint = commit.hint;
     entry.image = image;
     entry.buffer_size = {static_cast<int>(desc.width), static_cast<int>(desc.height)};
+    const bool opacity_changed = entry.opaque != commit.opaque;
+    entry.opaque = commit.opaque;
 
     // Only a mapped surface has a node. Its bounds are the buffer — never the damage rect,
     // which for a partial redraw is a fraction of the window — and its damage is the
     // client's surface-local rect moved to where the node actually is.
     if (entry.node) {
+        const lx::point2i o = entry.node->origin();
         entry.node->attach(image);
+        entry.node->set_opaque(entry.opaque);
         entry.node->set_bounds({0, 0, entry.buffer_size.width, entry.buffer_size.height});
-        if (scene_ && commit.damage.width > 0 && commit.damage.height > 0) {
-            const lx::point2i o = entry.node->origin();
-            scene_->note_damage({commit.damage.x + o.x, commit.damage.y + o.y,
-                                 commit.damage.width, commit.damage.height});
+        if (scene_) {
+            if (old_size.width != entry.buffer_size.width ||
+                old_size.height != entry.buffer_size.height || opacity_changed) {
+                // A size change uncovers or covers what lies outside the other extent, and a
+                // blend change repaints everything under the node: both rects, separately.
+                scene_->note_damage({o.x, o.y, old_size.width, old_size.height});
+                scene_->note_damage({o.x, o.y, entry.buffer_size.width, entry.buffer_size.height});
+                layout_changed_ = true;
+            } else if (commit.damage.width > 0 && commit.damage.height > 0) {
+                scene_->note_damage({commit.damage.x + o.x, commit.damage.y + o.y,
+                                     commit.damage.width, commit.damage.height});
+            }
         }
     }
 
@@ -373,10 +520,12 @@ void lx::compositor::surface_manager::destroy(lx::surface_id surface) {
             const lx::rect2i b = entry.node->bounds();
             scene_->note_damage({o.x, o.y, b.width, b.height});
         }
-        if (layer_)
-            (void)layer_->remove(entry.node);
+        if (entry.node_parent)
+            (void)entry.node_parent->remove(entry.node);
         delete entry.node;
+        layout_changed_ = true;
     }
+    index_.erase(surface.id());
     entry = {};
 }
 
@@ -386,21 +535,31 @@ lx::size2i lx::compositor::surface_manager::buffer_size(lx::surface_id surface) 
     return {};
 }
 
-bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface) {
+bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface,
+                                                  lx::scene::container_node& parent) {
     const int slot = find_surface(surface);
-    if (slot < 0 || !layer_)
+    if (slot < 0)
         return false;
     auto& entry = surfaces_[static_cast<unsigned>(slot)];
     if (entry.node)
         return true;
     auto* node = new lx::scene::surface_node{surface};
-    if (!layer_->add(node)) {
+    if (!parent.add(node)) {
         delete node;
+        if (!warned_container_full_) {
+            warned_container_full_ = true;
+            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.surface",
+                                            "scene container full — surface not drawn. "
+                                            "Reported once.");
+        }
         return false;
     }
     node->attach(entry.image);
+    node->set_opaque(entry.opaque);
     node->set_bounds({0, 0, entry.buffer_size.width, entry.buffer_size.height});
     entry.node = node;
+    entry.node_parent = &parent;
+    layout_changed_ = true;
     return true;
 }
 
@@ -411,10 +570,28 @@ void lx::compositor::surface_manager::drop_node(lx::surface_id surface) {
     auto& entry = surfaces_[static_cast<unsigned>(slot)];
     if (!entry.node)
         return;
-    if (layer_)
-        (void)layer_->remove(entry.node);
+    if (entry.node_parent)
+        (void)entry.node_parent->remove(entry.node);
     delete entry.node;
     entry.node = nullptr;
+    entry.node_parent = nullptr;
+    layout_changed_ = true;
+}
+
+void lx::compositor::surface_manager::set_opaque(lx::surface_id surface, bool opaque) {
+    const int slot = find_surface(surface);
+    if (slot < 0)
+        return;
+    auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    if (entry.opaque == opaque)
+        return;
+    entry.opaque = opaque;
+    if (!entry.node)
+        return;
+    entry.node->set_opaque(opaque);
+    // Blending changes every pixel the node covers that is not fully opaque.
+    if (scene_)
+        scene_->note_damage(node_rect(surface));
 }
 
 lx::scene::surface_node* lx::compositor::surface_manager::node(lx::surface_id surface) const {
@@ -440,6 +617,7 @@ void lx::compositor::surface_manager::set_origin(lx::surface_id surface, lx::poi
     if (o.x == origin.x && o.y == origin.y)
         return;
     n->set_transform(origin, n->scale(), n->opacity());
+    layout_changed_ = true;
 }
 
 lx::gfx::imported_image lx::compositor::surface_manager::lookup(lx::surface_id surface) const {

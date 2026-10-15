@@ -26,6 +26,11 @@ enum resize_edge_bits : unsigned {
     edge_right = 8,
 };
 
+/// Who draws the window frame (zxdg_toplevel_decoration_v1.mode, minus "unset").
+enum class decoration_mode : unsigned char { client, server };
+/// What the client asked for with set_mode / unset_mode.
+enum class decoration_request : unsigned char { unset, client, server };
+
 /// One xdg configure: what the compositor asks of the client.
 struct toplevel_configure {
     unsigned serial = 0;
@@ -40,10 +45,22 @@ struct toplevel_configure {
     unsigned anchor_edges = 0;
     /// Global window geometry the anchor is computed from (the grab's start rect).
     lx::rect2i anchor{};
+    /// Decoration mode this configure tells the client (zxdg_toplevel_decoration_v1); it
+    /// takes effect with the commit that answers it, so the frame and the content drawn
+    /// for it reach the screen in the same snapshot.
+    decoration_mode decoration = decoration_mode::client;
+    /// Maximize / unmaximize: the commit answering this configure puts the window-geometry
+    /// origin at `place_at` (global) instead of keeping or anchoring it — the window lands
+    /// at its maximized (or restored) position with the content drawn for that size, in the
+    /// same snapshot. Not part of `same_request`: a position is the compositor's to apply.
+    bool place = false;
+    lx::point2i place_at{};
 
-    /// Size and states only: two configures that ask the client for the same thing.
+    /// Size, states and decoration mode: two configures that ask the client for the same
+    /// thing.
     [[nodiscard]] bool same_request(const toplevel_configure& o) const {
-        return size.width == o.size.width && size.height == o.size.height && states == o.states;
+        return size.width == o.size.width && size.height == o.size.height &&
+               states == o.states && decoration == o.decoration;
     }
 };
 
@@ -111,6 +128,34 @@ struct toplevel_record {
     bool initial_configure_sent = false;
     bool ever_acked = false;
     bool mapped = false;
+
+    // ── xdg-decoration (zxdg_toplevel_decoration_v1) ──
+    /// The live decoration object (`wl_resource*`), or null.
+    void* deco_resource = nullptr;
+    unsigned deco_version = 0;
+    decoration_request deco_requested = decoration_request::unset;
+    /// The mode in effect: applied by the commit answering the configure that carried it;
+    /// always client-side while no decoration object exists (`deco_resource` null).
+    decoration_mode decoration_current = decoration_mode::client;
+    /// Version 1 object with no decoration configure sent yet: attaching a buffer now is
+    /// `unconfigured_buffer`.
+    bool deco_awaiting_configure = false;
+    /// The next configure must carry a decoration configure even if nothing else changed
+    /// (a new decoration object, set_mode / unset_mode, which the spec says are answered by
+    /// a configure).
+    bool deco_configure_due = false;
+
+    // ── maximize ──
+    /// Window geometry before maximize, restored by unmaximize (`restore_set`: there was
+    /// one — a window maximized before it ever mapped has none).
+    lx::rect2i restore{};
+    bool restore_set = false;
+    /// xdg_toplevel.set_maximized before the initial configure: that configure maximizes.
+    bool want_maximized = false;
+    /// The next configure must go out even if it asks for nothing new: set_maximized /
+    /// unset_maximized are always answered by a configure (xdg-shell), maximized already or
+    /// not.
+    bool configure_due = false;
 
     lx::workspace_id workspace{};
     unsigned wire_id = 0;           ///< zlm_toplevel_v1 Wayland object id (P0)
@@ -197,8 +242,12 @@ public:
     /// Applies double-buffered window geometry and size limits on wl_surface.commit.
     /// False when the result is invalid (min > max on an axis); nothing is applied then.
     [[nodiscard]] static bool apply_pending_state(toplevel_record& rec);
-    /// True iff the desired configure differs from the last one sent and either nothing is
-    /// in flight or the one in flight has timed out.
+    /// The mode the compositor's policy picks: the client's explicit `client_side` is
+    /// respected (KWin, sway); `server_side` or no preference gets the compositor's frame.
+    /// Without a decoration object a client decorates itself.
+    [[nodiscard]] static decoration_mode wanted_decoration(const toplevel_record& rec);
+    /// True iff the desired configure differs from the last one sent (or a decoration
+    /// configure is due) and either nothing is in flight or the one in flight has timed out.
     [[nodiscard]] static bool want_send(const toplevel_record& rec, lx::runtime::clock_time now_ns);
     /// True when `want_send` holds only because of the timeout.
     [[nodiscard]] static bool timed_out(const toplevel_record& rec, lx::runtime::clock_time now_ns);
@@ -414,6 +463,13 @@ bool lx::compositor::toplevel_manager::apply_pending_state(toplevel_record& rec)
     return true;
 }
 
+lx::compositor::decoration_mode
+lx::compositor::toplevel_manager::wanted_decoration(const toplevel_record& rec) {
+    if (!rec.deco_resource || rec.deco_requested == decoration_request::client)
+        return decoration_mode::client;
+    return decoration_mode::server;
+}
+
 bool lx::compositor::toplevel_manager::timed_out(const toplevel_record& rec,
                                                  lx::runtime::clock_time now_ns) {
     return rec.inflight && now_ns - rec.inflight_since_ns >= k_configure_timeout_ns;
@@ -423,7 +479,7 @@ bool lx::compositor::toplevel_manager::want_send(const toplevel_record& rec,
                                                  lx::runtime::clock_time now_ns) {
     // Never resend what the client already has: a no-op configure is exactly what some
     // clients ignore, and waiting on its ack is how KWin once deadlocked (D20397).
-    if (rec.desired.same_request(rec.last_sent))
+    if (rec.desired.same_request(rec.last_sent) && !rec.deco_configure_due && !rec.configure_due)
         return false;
     return !rec.inflight || timed_out(rec, now_ns);
 }
@@ -489,6 +545,8 @@ void lx::compositor::toplevel_manager::reset_for_remap(toplevel_record& rec) {
     rec.desired = {};
     rec.last_sent = {};
     rec.bounds_sent = {};
+    rec.configure_due = false;
+    rec.state = lx::toplevel_state::normal;
     rec.geometry = {};
     rec.geometry_offset = {};
 }

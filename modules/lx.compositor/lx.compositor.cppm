@@ -12,6 +12,7 @@ import lx.runtime;
 export module lx.compositor;
 
 export import :surface;
+export import :surface_tree;
 export import :toplevel;
 export import :shell_bridge;
 export import :xcursor;
@@ -23,6 +24,10 @@ export import :protocol_managers;
 export import :hotplug;
 export import :protocols_p0;
 export import :wm;
+export import :positioner;
+export import :popup;
+export import :decoration;
+export import :layer_shell;
 
 export namespace lx::compositor {
 
@@ -45,12 +50,19 @@ enum class present_backend {
 
 struct config {
     const char* socket_name = "lumen-0";
+    /// The only executable allowed to bind zlm_shell_v1 (`--shell PATH`). A bare name is
+    /// looked up next to the compositor's own binary, so the default is the lumen-shell
+    /// installed or built alongside it; resolved to a canonical path at start.
     const char* shell_binary_path = "lumen-shell";
     bool enable_tiling = false;
     bool privileged_shell_only = true;
     double target_fps = 60.0;
     unsigned worker_thread_count = 1;
     present_backend present = present_backend::automatic;
+    /// Advertise zxdg_decoration_manager_v1 and draw server-side frames for clients that do
+    /// not insist on their own. False (`--decorations=client`) leaves every client to
+    /// decorate itself.
+    bool server_side_decorations = true;
     /// Row-band threads for the CPU composite path, in addition to the render thread.
     ///
     /// Defaults to 0 on measurement, not principle: the fullscreen opaque case is a row

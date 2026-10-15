@@ -156,6 +156,13 @@ The software cursor is a scene node and crosses threads in the snapshot like any
 | **Render** | `render` | `render_loop()` waits on `condition_variable` → `tick_render()` |
 | **Worker** | `worker` | `worker_loop()` drains `executor` worker strand |
 
+Client content crosses UI → render as `texture_update`s on an SPSC queue. Each carries the
+index of the snapshot that was being built when it was queued, and the render thread
+applies it no earlier than when it composites that snapshot (later ones wait, in order):
+pixels committed after a publish never reach the screen under the previous snapshot's
+geometry. Surface trees (`lx.compositor:surface_tree`) are UI-affinity state like the
+scene graph they edit.
+
 ### Vsync wiring (current → future)
 
 **Current (P0/P1):** DRM/KMS page-flip when `kms_device::open()` succeeds; `timer_source` remains

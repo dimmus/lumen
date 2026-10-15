@@ -14,6 +14,8 @@ compile_commands.json
 /input-smoke-logs/
 # ... and from scripts/drag-smoke.sh
 /drag-smoke-logs/
+# ... and from scripts/app-smoke.sh
+/app-smoke-logs/
 lumen-input-probe.log
 
 # IDE

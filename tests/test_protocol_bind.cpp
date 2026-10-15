@@ -12,6 +12,14 @@
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 #include "xdg-shell-client-protocol.h"
 #include "linux-dmabuf-v1-client-protocol.h"
+#include "xdg-decoration-unstable-v1-client-protocol.h"
+// wayland-scanner names an argument `namespace`, a C++ keyword.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#define namespace name_space
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#undef namespace
+#pragma clang diagnostic pop
 #endif
 #endif
 
@@ -69,6 +77,10 @@ const wl_interface* lookup_interface(const std::string& name) {
         return &xdg_wm_base_interface;
     if (name == "zwp_linux_dmabuf_v1")
         return &zwp_linux_dmabuf_v1_interface;
+    if (name == "zxdg_decoration_manager_v1")
+        return &zxdg_decoration_manager_v1_interface;
+    if (name == "zwlr_layer_shell_v1")
+        return &zwlr_layer_shell_v1_interface;
 #endif
     return nullptr;
 }

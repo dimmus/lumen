@@ -17,18 +17,23 @@ export module lx.compositor:wm;
 
 import :toplevel;
 import :surface;
+import :surface_tree;
 import :shell_bridge;
 import :output;
 import :input_router;
 import :xcursor;
 import :cursor;
+import :popup;
+import :decoration;
+import :layer_shell;
 
 export namespace lx::compositor {
 
 /// Interactive grab kinds. One grab at a time, seat-wide.
 enum class grab_mode : unsigned char { none, move, resize };
-/// Who started the grab. The executor is the same for all three; only validation differs.
-enum class grab_source : unsigned char { client, shell, keybinding };
+/// Who started the grab. The executor is the same for all four; only validation differs.
+/// `decoration` is a press on a server-side frame — compositor-originated, like a keybinding.
+enum class grab_source : unsigned char { client, shell, keybinding, decoration };
 enum class grab_end_reason : unsigned char { release, escape, destroyed, unmapped };
 
 /// State of the interactive move/resize in progress. UI affinity.
@@ -57,9 +62,11 @@ struct wm_grab {
 /// Wayland type appears in this partition.
 struct wm_protocol_ops {
     /// Sends `wm_capabilities` (when `initial`, v5+), `configure_bounds` (when `bounds`
-    /// is non-empty, v4+), `xdg_toplevel.configure` and `xdg_surface.configure(serial)`.
+    /// is non-empty, v4+), `xdg_toplevel.configure`, `zxdg_toplevel_decoration_v1.configure`
+    /// (when `decoration` is non-null) and `xdg_surface.configure(serial)` — in that order:
+    /// the decoration mode is part of the configure sequence the serial closes.
     void (*send_configure)(void* xdg_toplevel, void* xdg_surface, const toplevel_configure& c,
-                           lx::size2i bounds, bool initial) = nullptr;
+                           lx::size2i bounds, bool initial, void* decoration) = nullptr;
     /// Next serial in the seat's serial space, which input events share.
     unsigned (*next_serial)(void* user) = nullptr;
     /// `xdg_toplevel.close` — the shell's request_close.
@@ -67,14 +74,33 @@ struct wm_protocol_ops {
     void* user = nullptr;
 };
 
-/// The topmost mapped toplevel under a point, from `window_manager::hit_test`.
+/// What kind of root the hit surface's tree has.
+enum class hit_owner : unsigned char { toplevel, popup, layer };
+/// What was hit: a client surface, or the compositor's frame around a window.
+enum class hit_target : unsigned char { surface, decoration };
+
+/// The topmost mapped surface under a point, from `window_manager::hit_test`.
 struct wm_hit {
+    /// The window the point is in (the owner, for click-to-focus): for a popup, the toplevel
+    /// at the root of its chain; null for a layer surface and a chain rooted at one.
     lx::toplevel_id id{};
-    /// Its `wl_surface` resource (void*: no Wayland types in this partition).
+    /// The `wl_surface` resource of the surface actually hit — the toplevel's own or one of
+    /// its subsurfaces (void*: no Wayland types in this partition).
     void* surface_resource = nullptr;
-    /// Surface-local position of the point.
+    /// Surface-local position of the point, in the hit surface.
     double sx = 0.0;
     double sy = 0.0;
+    /// The surface hit, and the root of its tree (the toplevel's, popup's or layer
+    /// surface's surface).
+    lx::surface_id surface{};
+    lx::surface_id root{};
+    hit_owner owner = hit_owner::toplevel;
+    /// The client owning the hit surface — what a popup grab's owner-events test compares.
+    lx::client_id client{};
+    /// `decoration`: the point is on window `id`'s server-side frame, in `zone`;
+    /// `surface_resource` and `surface` are null then.
+    hit_target target = hit_target::surface;
+    deco_zone zone = deco_zone::none;
 };
 
 /// What a commit on a toplevel's surface carried, as far as the window manager cares.
@@ -82,9 +108,9 @@ struct toplevel_commit_info {
     /// The surface has content after this commit (false: never had any, or null attached).
     bool has_buffer = false;
     lx::size2i buffer_size{};
-    /// Global node rect before the commit reached the scene, so a size change damages the
-    /// rect the window used to cover.
-    lx::rect2i old_node_rect{};
+    /// Surface-local bounding box of the surface and its mapped subsurfaces after this
+    /// commit (`surface_tree::subtree_bbox`) — what the window geometry is clamped to.
+    lx::rect2i tree_bbox{};
 };
 
 /// Window placement, configure flow and focus. UI affinity.
@@ -95,9 +121,22 @@ struct toplevel_commit_info {
 /// the defaults here are the placeholder policy.
 class window_manager {
 public:
-    void bind(toplevel_manager& toplevels, surface_manager& surfaces, scene::scene_graph& scene,
-              scene::container_node& windows_layer, input_router& router, lx::input::seat& seat,
-              shell_bridge& shell, output_manager& outputs);
+    /// `windows_layer` holds exactly the mapped toplevels' tree containers, in stacking
+    /// order — nothing else may be added to it.
+    void bind(toplevel_manager& toplevels, surface_manager& surfaces, surface_tree& tree,
+              scene::scene_graph& scene, scene::container_node& windows_layer,
+              input_router& router, lx::input::seat& seat, shell_bridge& shell,
+              output_manager& outputs);
+    /// Popups (optional): their layer is hit before the windows, their grab filters pointer
+    /// focus (owner events) and takes the keyboard, and their parents' moves reach them.
+    void set_popups(popup_manager* popups);
+    /// Server-side frames (optional): placement and constraints use the frame, presses on it
+    /// move, resize, close and lower the window.
+    void set_decorations(decoration_manager* decorations) { decorations_ = decorations; }
+    /// Layer-shell (optional): its exclusive zones make the usable area, its surfaces are hit
+    /// above (overlay, top) and below (bottom, background) the windows, and its keyboard
+    /// interactivity takes part in keyboard-focus resolution.
+    void set_layers(layer_shell* layers);
     void set_protocol_ops(wm_protocol_ops ops) { ops_ = ops; }
 
     /// First commit after get_toplevel (or after an unmap): sends the initial configure
@@ -110,15 +149,52 @@ public:
     void on_unmap(lx::toplevel_id id, const char* reason);
     /// One of the toplevel's protocol objects is being destroyed; the record goes with it.
     void on_destroyed(lx::toplevel_id id);
+    /// xdg_toplevel.set_title (the frame's title is redrawn at the tick).
+    void on_title_changed(lx::toplevel_id id);
+    /// A decoration object was created, or set_mode / unset_mode changed what the client
+    /// wants. The policy's answer goes into the desired configure and is sent now when no
+    /// configure is in flight; with `immediate` (a new object after the initial configure)
+    /// regardless, so a version 1 client is never left between creation and its first
+    /// decoration configure.
+    void on_decoration_request(lx::toplevel_id id, bool immediate);
 
     /// Once per frame tick, before the scene is published.
     void on_tick(lx::runtime::clock_time now_ns);
+    /// Output 0's mode changed: layer surfaces are arranged again, and with them the usable
+    /// area.
+    void on_output_changed();
+    /// The usable area changed (layer-shell exclusive zones, or the output). Windows in the
+    /// normal state stay where they are (sway, KWin); maximized ones are configured to fill
+    /// the new area.
+    void on_usable_area_changed(lx::rect2i usable);
+    /// xdg_toplevel.set_maximized / unset_maximized, zlm_policy_bridge_v1.request_maximize /
+    /// request_unmaximize, a title-bar double click. Always answered by a configure (the
+    /// spec: also when nothing changes). Maximized fills the usable area minus the frame;
+    /// unmaximize restores the geometry it had. Position and state change with the commit
+    /// that answers the configure, so the window never shows its new size at its old place.
+    /// `source` is logged (`client`, `shell`, `decoration`).
+    void set_maximized(lx::toplevel_id id, bool on, const char* source);
     /// Sends every desired configure the single-in-flight rule allows.
     void flush_configures(lx::runtime::clock_time now_ns);
 
+    /// The window manager's toplevel focus decision (activation, the shell's focus_changed).
+    /// The surface that actually receives keys follows from `resolve_keyboard_focus`.
     void set_keyboard_focus(lx::toplevel_id id);
+    /// Decides which surface gets keys: an `exclusive` layer surface on top/overlay first
+    /// (only its own popups can take them from it), then the topmost mapped grabbing popup
+    /// (unless its layer root has interactivity `none`), then a clicked `on_demand` layer
+    /// surface, then the focused toplevel. The toplevel owning the result is the activated
+    /// one. Run after every change to any of them.
+    void resolve_keyboard_focus();
     [[nodiscard]] lx::toplevel_id keyboard_focus() const { return keyboard_focus_; }
     [[nodiscard]] lx::toplevel_id pointer_focus() const { return pointer_focus_; }
+    /// The surface with pointer focus — the toplevel's own or a subsurface of it.
+    [[nodiscard]] lx::surface_id pointer_surface() const { return pointer_surface_; }
+
+    /// The surface tree dropped `surface`'s node. If it had the pointer, focus moves now:
+    /// to nothing while a button is held (no `enter` mid-press), else to what is under the
+    /// pointer.
+    void on_surface_unmapped(lx::surface_id surface);
 
     // ── Pointer input (UI affinity; once per libinput event, after the seat position and
     //    the cursor have been updated). No allocation, no logging above debug. ──
@@ -161,8 +237,16 @@ public:
     bool request_shell_grab(lx::toplevel_id id, unsigned serial, grab_mode mode, unsigned edges);
     void end_grab(grab_end_reason reason);
 
-    /// Topmost mapped toplevel whose surface extents and input region contain the global
-    /// point. One top→bottom pass over the stacking order; stops at the first hit.
+    /// xdg_popup.grab: the serial must be the last button press or key press (or that key's
+    /// release) this client (`wl_client*`) received — stricter than wlroots, as Mutter and
+    /// Smithay are — and no move/resize may be running.
+    [[nodiscard]] popup_manager::grab_result request_popup_grab(lx::surface_id popup,
+                                                                void* client, unsigned serial);
+
+    /// Topmost surface whose extents and input region contain the global point: popups
+    /// top→bottom first, then the overlay and top layer surfaces, every mapped toplevel's
+    /// tree in stacking order (reverse paint order within each; the frame after the
+    /// client), then the bottom and background layer surfaces; stops at the first hit.
     [[nodiscard]] bool hit_test(double x, double y, wm_hit& out) const;
 
     /// Pointer buttons currently held (implicit grab active when non-zero).
@@ -184,14 +268,22 @@ public:
     bool restack(lx::toplevel_id id, unsigned index);
     void request_close(lx::toplevel_id id);
 
-    /// Output the window manager places and constrains against (output 0 — single output
-    /// until D5).
-    [[nodiscard]] lx::rect2i work_area() const;
+    /// Output 0's geometry (single output until D5): what layer surfaces are arranged
+    /// against and layer-surface popups constrained to.
+    [[nodiscard]] lx::rect2i output_area() const;
+    /// The output minus layer-shell exclusive zones: where windows are placed, how far a
+    /// move may push them, what configure_bounds and maximize use, and what window popups
+    /// are constrained to.
+    [[nodiscard]] lx::rect2i usable_area() const;
+    /// The frame the compositor draws around `rec` in its current state (none: client-side).
+    [[nodiscard]] static frame_extents extents_of(const toplevel_record& rec);
 
 private:
     void send_configure(toplevel_record& rec, lx::runtime::clock_time now_ns, bool initial,
                         bool watchdog);
-    void map(toplevel_record& rec);
+    /// `placed`: the commit answered a configure that placed the window (maximized before
+    /// it ever mapped); placement is skipped.
+    void map(toplevel_record& rec, bool placed);
     /// Moves pointer focus to `hit` (or to nothing when null), sending leave/enter.
     void set_pointer_focus(const wm_hit* hit);
     /// Re-runs the hit test at the current pointer position and moves focus if the window
@@ -199,7 +291,7 @@ private:
     /// With `motion_if_same`, a focus that stays but whose local position moved (its
     /// window moved under the pointer) gets a `motion`.
     void refresh_pointer_focus(unsigned time_ms, bool motion_if_same);
-    /// Restacks the scene node to match the toplevel order and damages it.
+    /// Restacks the window's tree container to match the toplevel order and damages it.
     void sync_node_stacking(const toplevel_record& rec, const char* verb);
     void emit_stacking_order();
     void log_geometry(const toplevel_record& rec, const char* cause, unsigned serial) const;
@@ -210,9 +302,22 @@ private:
     /// separately and telling the shell.
     void move_window(toplevel_record& rec, lx::point2i p, const char* cause);
     void log_grab_reject(lx::toplevel_id id, grab_source source, const char* reason) const;
+    /// `hit_test` filtered by an active popup grab: surfaces of other clients do not get
+    /// the pointer (owner events).
+    [[nodiscard]] bool pointer_hit(double x, double y, wm_hit& out) const;
+    /// The pointer is already where `h` says (same window, surface or frame zone).
+    [[nodiscard]] bool same_pointer_focus(const wm_hit& h) const;
+    /// A press on window `id`'s frame. Never reaches a client.
+    void decoration_press(lx::toplevel_id id, deco_zone zone,
+                          const lx::input::pointer_button_event& event);
+    /// The frame hover (close-button look, pointer shape) follows pointer focus.
+    void set_decoration_hover(lx::toplevel_id id, deco_zone zone);
+    /// Keeps the frame of `rec` in line with it (after any geometry, mapping or mode change).
+    void sync_decoration(const toplevel_record& rec);
 
     toplevel_manager* toplevels_ = nullptr;
     surface_manager* surfaces_ = nullptr;
+    surface_tree* tree_ = nullptr;
     scene::scene_graph* scene_ = nullptr;
     scene::container_node* windows_layer_ = nullptr;
     input_router* router_ = nullptr;
@@ -220,6 +325,9 @@ private:
     shell_bridge* shell_ = nullptr;
     output_manager* outputs_ = nullptr;
     cursor_manager* cursor_ = nullptr;
+    popup_manager* popups_ = nullptr;
+    decoration_manager* decorations_ = nullptr;
+    layer_shell* layers_ = nullptr;
     wm_protocol_ops ops_{};
     wm_grab grab_{};
     /// Buttons whose press never reached a client (the Super binding, presses during a
@@ -228,7 +336,37 @@ private:
     /// Escape pressed to cancel a grab: its release is withheld too.
     bool swallowed_escape_ = false;
     lx::toplevel_id keyboard_focus_{};
+    /// The window owning the pointer focus (click-to-focus target) and the surface that
+    /// actually has it, which may be one of the window's subsurfaces.
     lx::toplevel_id pointer_focus_{};
+    lx::surface_id pointer_surface_{};
+    /// What the pointer focus belongs to, and the root of its tree.
+    hit_owner pointer_owner_ = hit_owner::toplevel;
+    lx::surface_id pointer_root_{};
+    /// An `on_demand` layer surface given the keyboard by a click (taken back by a click on
+    /// a window or on nothing).
+    lx::surface_id layer_focus_{};
+    /// The toplevel whose desired configure carries `activated`: the owner of the surface
+    /// resolve_keyboard_focus gave the keyboard to (none while a layer surface has it).
+    lx::toplevel_id activated_{};
+    /// Last usable area logged (`usable area …` on change only).
+    lx::rect2i usable_logged_{};
+    /// The frame zone with pointer focus (none: the focus, if any, is a client surface).
+    deco_zone pointer_zone_ = deco_zone::none;
+    /// A close-button press waiting for its release (the click happens on release over it).
+    struct deco_press {
+        lx::toplevel_id id{};
+        unsigned button = 0;
+    } deco_press_{};
+    /// The last left press on a title bar, for double-click detection.
+    struct title_click {
+        lx::toplevel_id id{};
+        unsigned time_ms = 0;
+        double x = 0.0;
+        double y = 0.0;
+    } last_title_click_{};
+    /// The window whose frame shows the active colours (the effective keyboard owner).
+    lx::toplevel_id deco_active_{};
 
     /// Held pointer buttons, bit (code - k_button_base). Codes outside the window are
     /// forwarded but do not hold the implicit grab.
@@ -247,10 +385,12 @@ private:
 
 // ── Pure helpers (exported for tests) ──────────────────────────────────────
 
-/// The window geometry actually in effect: the requested rect intersected with the
-/// surface extents, or the whole surface when the client never set one (xdg-shell).
+/// The window geometry actually in effect (xdg-shell): the requested rect clamped to the
+/// bounding box of the surface and its subsurfaces, or that bounding box when the client
+/// never set one. `tree_bbox` is surface-local and may extend left of or above the surface
+/// (a CSD title bar is a subsurface at y < 0), so the result may have a negative origin.
 [[nodiscard]] lx::rect2i effective_window_geometry(bool set, lx::rect2i requested,
-                                                   lx::size2i buffer);
+                                                   lx::rect2i tree_bbox);
 
 /// Global window geometry after a commit of size `committed` that answers `applied`.
 /// For each anchor edge the *opposite* edge stays where it was in `applied.anchor` — so a
@@ -345,9 +485,17 @@ constexpr unsigned k_key_esc = 1;
 }
 
 [[nodiscard]] const char* grab_source_name(lx::compositor::grab_source s) {
-    return s == lx::compositor::grab_source::client  ? "client"
-           : s == lx::compositor::grab_source::shell ? "shell"
-                                                     : "keybinding";
+    switch (s) {
+    case lx::compositor::grab_source::client:
+        return "client";
+    case lx::compositor::grab_source::shell:
+        return "shell";
+    case lx::compositor::grab_source::keybinding:
+        return "keybinding";
+    case lx::compositor::grab_source::decoration:
+        return "decoration";
+    }
+    return "-";
 }
 
 [[nodiscard]] const char* grab_end_name(lx::compositor::grab_end_reason r) {
@@ -374,6 +522,18 @@ constexpr unsigned k_key_esc = 1;
         return -1'000'000'000;
     return static_cast<int>(std::lround(d));
 }
+
+/// The point is on the close button of a mapped, server-side decorated window.
+[[nodiscard]] bool in_close(const lx::compositor::toplevel_record& rec, double x, double y) {
+    return rec.mapped && rec.decoration_current == lx::compositor::decoration_mode::server &&
+           lx::compositor::deco_hit(rec.geometry,
+                                    lx::compositor::window_manager::extents_of(rec), x, y) ==
+               lx::compositor::deco_zone::close;
+}
+
+/// Double click on a title bar: within 400 ms and 4 px of the previous press.
+constexpr unsigned k_double_click_ms = 400;
+constexpr double k_double_click_px = 4.0;
 
 } // namespace
 
@@ -450,19 +610,20 @@ void lx::compositor::shift_anchors(toplevel_record& rec, int dx, int dy) {
 }
 
 lx::rect2i lx::compositor::effective_window_geometry(bool set, lx::rect2i requested,
-                                                     lx::size2i buffer) {
-    const lx::rect2i whole{0, 0, buffer.width > 0 ? buffer.width : 0,
-                           buffer.height > 0 ? buffer.height : 0};
-    if (!set || rect_empty(requested))
+                                                     lx::rect2i tree_bbox) {
+    const lx::rect2i whole = rect_empty(tree_bbox) ? lx::rect2i{} : tree_bbox;
+    if (!set || rect_empty(requested) || rect_empty(whole))
         return whole;
-    const long long x0 = requested.x > 0 ? requested.x : 0;
-    const long long y0 = requested.y > 0 ? requested.y : 0;
+    const long long bx1 = static_cast<long long>(whole.x) + whole.width;
+    const long long by1 = static_cast<long long>(whole.y) + whole.height;
+    const long long x0 = requested.x > whole.x ? requested.x : whole.x;
+    const long long y0 = requested.y > whole.y ? requested.y : whole.y;
     long long x1 = static_cast<long long>(requested.x) + requested.width;
     long long y1 = static_cast<long long>(requested.y) + requested.height;
-    if (x1 > whole.width)
-        x1 = whole.width;
-    if (y1 > whole.height)
-        y1 = whole.height;
+    if (x1 > bx1)
+        x1 = bx1;
+    if (y1 > by1)
+        y1 = by1;
     // A geometry entirely outside the surface is meaningless; fall back to the surface.
     if (x1 <= x0 || y1 <= y0)
         return whole;
@@ -538,12 +699,18 @@ lx::point2i lx::compositor::constrain_on_output(lx::rect2i output, lx::rect2i ge
 // ── window_manager ─────────────────────────────────────────────────────────
 
 void lx::compositor::window_manager::bind(toplevel_manager& toplevels, surface_manager& surfaces,
-                                          scene::scene_graph& scene,
+                                          surface_tree& tree, scene::scene_graph& scene,
                                           scene::container_node& windows_layer,
                                           input_router& router, lx::input::seat& seat,
                                           shell_bridge& shell, output_manager& outputs) {
     toplevels_ = &toplevels;
     surfaces_ = &surfaces;
+    tree_ = &tree;
+    tree.set_unmap_hook(
+        [](void* user, lx::surface_id surface) {
+            static_cast<window_manager*>(user)->on_surface_unmapped(surface);
+        },
+        this);
     scene_ = &scene;
     windows_layer_ = &windows_layer;
     router_ = &router;
@@ -552,7 +719,85 @@ void lx::compositor::window_manager::bind(toplevel_manager& toplevels, surface_m
     outputs_ = &outputs;
 }
 
-lx::rect2i lx::compositor::window_manager::work_area() const {
+void lx::compositor::window_manager::set_popups(popup_manager* popups) {
+    popups_ = popups;
+    if (!popups)
+        return;
+    popup_host host{};
+    host.user = this;
+    // Window popups stay inside the usable area (Mutter, KWin: a menu opened under a top
+    // panel opens below it), layer-surface popups inside the whole output (sway: a panel's
+    // own menus may cover its exclusive zone).
+    host.constraint_area = [](void* user, popup_parent_kind root) {
+        const auto* wm = static_cast<window_manager*>(user);
+        return root == popup_parent_kind::layer ? wm->output_area() : wm->usable_area();
+    };
+    host.focus_changed = [](void* user) {
+        static_cast<window_manager*>(user)->resolve_keyboard_focus();
+    };
+    popups->set_host(host);
+}
+
+void lx::compositor::window_manager::set_layers(layer_shell* layers) {
+    layers_ = layers;
+    if (popups_)
+        popups_->set_layers(layers);
+    if (!layers)
+        return;
+    layer_host host{};
+    host.user = this;
+    host.output_area = [](void* user) {
+        return static_cast<window_manager*>(user)->output_area();
+    };
+    host.usable_changed = [](void* user, lx::rect2i usable) {
+        static_cast<window_manager*>(user)->on_usable_area_changed(usable);
+    };
+    host.focus_changed = [](void* user) {
+        auto* wm = static_cast<window_manager*>(user);
+        // An on_demand surface that unmapped or lost its interactivity gives the keyboard
+        // back.
+        if (wm->layer_focus_ && !(wm->layers_ && wm->layers_->focusable(wm->layer_focus_))) {
+            if (wm_debug_enabled()) {
+                char line[128];
+                std::snprintf(line, sizeof(line),
+                              "layer focus surface=0 interactivity=none cause=unmap previous=%llu",
+                              wm->layer_focus_.id());
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.layer", line);
+            }
+            wm->layer_focus_ = {};
+        }
+        wm->resolve_keyboard_focus();
+        wm->rehit_pending_ = true;
+    };
+    host.surface_moved = [](void* user, lx::surface_id surface) {
+        auto* wm = static_cast<window_manager*>(user);
+        if (wm->popups_)
+            wm->popups_->on_parent_moved(surface);
+        wm->rehit_pending_ = true;
+    };
+    host.surface_unmapped = [](void* user, lx::surface_id surface, const char* reason) {
+        auto* wm = static_cast<window_manager*>(user);
+        if (!wm->popups_)
+            return;
+        if (reason && std::strcmp(reason, "destroyed") == 0)
+            wm->popups_->on_parent_destroyed(surface);
+        else
+            wm->popups_->on_parent_unmapped(surface, "parent-unmapped");
+    };
+    layers->set_host(host);
+}
+
+lx::compositor::frame_extents
+lx::compositor::window_manager::extents_of(const toplevel_record& rec) {
+    return extents_for(rec.decoration_current, rec.state == lx::toplevel_state::maximized);
+}
+
+void lx::compositor::window_manager::sync_decoration(const toplevel_record& rec) {
+    if (decorations_)
+        decorations_->sync(rec);
+}
+
+lx::rect2i lx::compositor::window_manager::output_area() const {
     if (outputs_ && outputs_->count() > 0) {
         const lx::rect2i g = outputs_->geometry(outputs_->nth(0));
         if (!rect_empty(g))
@@ -560,6 +805,130 @@ lx::rect2i lx::compositor::window_manager::work_area() const {
     }
     // Headless / no mode yet: a nominal desktop so placement still produces sane numbers.
     return {0, 0, 1920, 1080};
+}
+
+lx::rect2i lx::compositor::window_manager::usable_area() const {
+    if (layers_ && layers_->arranged()) {
+        const lx::rect2i u = layers_->usable();
+        // Zones that ate the whole output leave nothing to place into; the output then.
+        if (!rect_empty(u))
+            return u;
+    }
+    return output_area();
+}
+
+void lx::compositor::window_manager::on_output_changed() {
+    if (layers_)
+        layers_->arrange(); // reports a changed usable area through the host
+    else
+        on_usable_area_changed(output_area());
+}
+
+void lx::compositor::window_manager::on_usable_area_changed(lx::rect2i usable) {
+    if (rect_empty(usable))
+        usable = output_area();
+    if (!rect_equal(usable, usable_logged_)) {
+        usable_logged_ = usable;
+        if (wm_debug_enabled()) {
+            char line[128];
+            std::snprintf(line, sizeof(line), "usable area x=%d y=%d w=%d h=%d", usable.x,
+                          usable.y, usable.width, usable.height);
+            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        }
+    }
+    if (!toplevels_)
+        return;
+    rehit_pending_ = true;
+    // Normal windows stay put (sway, KWin); maximized ones fill the new area.
+    toplevels_->for_each_mut([&](toplevel_record& rec) {
+        if (!(rec.desired.states & tl_maximized))
+            return;
+        const frame_extents ext = extents_for(rec.desired.decoration, true);
+        const lx::size2i size{usable.width - ext.left - ext.right,
+                              usable.height - ext.top - ext.bottom};
+        const lx::point2i at{usable.x + ext.left, usable.y + ext.top};
+        // A placing configure still unanswered names the old place: a new configure must
+        // carry the new one, or the answer to the old would land the window there.
+        bool stale_inflight = false;
+        for (unsigned i = 0; i < rec.sent_count; ++i)
+            if (rec.sent[i].place &&
+                (rec.sent[i].place_at.x != at.x || rec.sent[i].place_at.y != at.y))
+                stale_inflight = true;
+        if (size.width != rec.desired.size.width || size.height != rec.desired.size.height) {
+            rec.desired.size = size;
+            rec.desired.place = true;
+            rec.desired.place_at = at;
+        } else if (rec.desired.place || stale_inflight) {
+            rec.desired.place = true;
+            rec.desired.place_at = at;
+            if (stale_inflight)
+                rec.configure_due = true;
+        } else if (rec.mapped && rec.state == lx::toplevel_state::maximized &&
+                   (rec.geometry.x != at.x || rec.geometry.y != at.y)) {
+            // Same size, new place (a panel moved edges): no configure needed.
+            move_window(rec, at, "usable");
+        }
+    });
+}
+
+void lx::compositor::window_manager::set_maximized(lx::toplevel_id id, bool on,
+                                                   const char* source) {
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec)
+        return;
+    if (wm_debug_enabled()) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "maximize id=%llu on=%d source=%s", id.id(), on ? 1 : 0,
+                      source ? source : "-");
+        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    }
+    // Before the initial configure, that configure answers it.
+    if (!rec->initial_configure_sent) {
+        rec->want_maximized = on;
+        return;
+    }
+    // A move or resize of this window does not survive it changing size under the pointer.
+    if (grab_.mode != grab_mode::none && grab_.toplevel == id) {
+        end_grab(grab_end_reason::release);
+        rec = toplevels_->find_mut(id);
+        if (!rec)
+            return;
+    }
+    const bool is_max = (rec->desired.states & tl_maximized) != 0;
+    if (on && !is_max) {
+        if (rec->mapped && rec->state == lx::toplevel_state::normal) {
+            rec->restore = rec->geometry;
+            rec->restore_set = true;
+        }
+        const lx::rect2i area = usable_area();
+        const frame_extents ext = extents_for(rec->desired.decoration, true);
+        rec->desired.states |= tl_maximized;
+        rec->desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
+        rec->desired.place = true;
+        rec->desired.place_at = {area.x + ext.left, area.y + ext.top};
+        rec->desired.anchor_edges = 0;
+    } else if (!on && is_max) {
+        rec->desired.states &= ~static_cast<unsigned>(tl_maximized);
+        if (rec->restore_set) {
+            // Back where it was — kept reachable if the usable area changed meanwhile (a
+            // panel appeared over the old title bar), as a move would be.
+            const frame_extents ext = extents_for(rec->desired.decoration, false);
+            const lx::point2i p = constrain_on_output(usable_area(),
+                                                      frame_rect(rec->restore, ext));
+            rec->desired.size = {rec->restore.width, rec->restore.height};
+            rec->desired.place = true;
+            rec->desired.place_at = {p.x + ext.left, p.y + ext.top};
+            rec->restore_set = false;
+        } else {
+            // Maximized before it ever mapped: nothing to restore to; the client picks.
+            rec->desired.size = {};
+            rec->desired.place = false;
+        }
+    }
+    // xdg-shell: answered by a configure even when the state does not change.
+    rec->configure_due = true;
+    if (!rec->inflight)
+        send_configure(*rec, wm_now_ns(), false, false);
 }
 
 void lx::compositor::window_manager::log_geometry(const toplevel_record& rec, const char* cause,
@@ -580,18 +949,59 @@ void lx::compositor::window_manager::send_configure(toplevel_record& rec,
         return;
     toplevel_configure c = rec.desired;
     c.serial = ops_.next_serial ? ops_.next_serial(ops_.user) : rec.last_sent.serial + 1;
+    // A placing configure (maximize, restore) still unanswered hands its placement on: the
+    // client may answer only the newest configure, and the window must still land there.
+    if (!c.place) {
+        for (unsigned i = rec.sent_count; i-- > 0;) {
+            if (rec.sent[i].place) {
+                c.place = true;
+                c.place_at = rec.sent[i].place_at;
+                break;
+            }
+        }
+    }
 
     // configure_bounds only when it changed: it is a hint for the client's initial size,
-    // and resending an unchanged one on every configure is noise.
-    const lx::rect2i area = work_area();
+    // and resending an unchanged one on every configure is noise. A server-side frame takes
+    // its extents out of what the window geometry may use.
+    const lx::rect2i area = usable_area();
+    const frame_extents ext =
+        extents_for(c.decoration, (c.states & tl_maximized) != 0);
+    const lx::size2i room{area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
     lx::size2i bounds{};
-    if (rec.bounds_sent.width != area.width || rec.bounds_sent.height != area.height) {
-        bounds = {area.width, area.height};
+    if (rec.bounds_sent.width != room.width || rec.bounds_sent.height != room.height) {
+        bounds = room;
         rec.bounds_sent = bounds;
     }
 
-    ops_.send_configure(rec.xdg_toplevel_resource, rec.xdg_surface_resource, c, bounds, initial);
+    // The decoration mode goes with every configure that changes it, the first one, and the
+    // one answering a new decoration object or a set_mode (the spec: "the compositor will
+    // respond by emitting an xdg_surface.configure event").
+    const bool send_deco =
+        rec.deco_resource && (initial || c.decoration != rec.last_sent.decoration ||
+                              rec.deco_configure_due || rec.deco_awaiting_configure);
+    ops_.send_configure(rec.xdg_toplevel_resource, rec.xdg_surface_resource, c, bounds, initial,
+                        send_deco ? rec.deco_resource : nullptr);
+    if (send_deco) {
+        rec.deco_configure_due = false;
+        rec.deco_awaiting_configure = false;
+        if (wm_debug_enabled()) {
+            const char* req = rec.deco_requested == decoration_request::client   ? "client"
+                              : rec.deco_requested == decoration_request::server ? "server"
+                                                                                 : "unset";
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                          "decoration mode id=%llu requested=%s sent=%s serial=%u", rec.id.id(),
+                          req, c.decoration == decoration_mode::server ? "server" : "client",
+                          c.serial);
+            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
+        }
+    }
     toplevel_manager::on_sent(rec, c, now_ns);
+    // The placement travels with the configures now on the wire; the answering commit
+    // applies it.
+    rec.desired.place = false;
+    rec.configure_due = false;
     // The anchor travels with each sent configure. Once the last one a grab needs (its
     // final or Escape configure) is on the wire, later configures — an activation change,
     // say — must not anchor to a rect the window may since have left.
@@ -622,14 +1032,27 @@ void lx::compositor::window_manager::on_initial_commit(lx::toplevel_id id) {
     // 0x0: the client picks its own size. Activated, because it takes focus when it maps
     // (placeholder policy) — saying so now saves a second configure right after.
     rec->desired = {};
-    rec->desired.states = tl_activated;
+    // An exclusive layer surface keeps the keyboard: the new window will not be activated.
+    rec->desired.states = layers_ && layers_->exclusive_focus() ? 0u : unsigned{tl_activated};
+    rec->desired.decoration = toplevel_manager::wanted_decoration(*rec);
+    if (rec->want_maximized) {
+        // set_maximized before the initial commit: the first configure maximizes, and the
+        // commit answering it maps the window in place.
+        rec->want_maximized = false;
+        const lx::rect2i area = usable_area();
+        const frame_extents ext = extents_for(rec->desired.decoration, true);
+        rec->desired.states |= tl_maximized;
+        rec->desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
+        rec->desired.place = true;
+        rec->desired.place_at = {area.x + ext.left, area.y + ext.top};
+    }
     send_configure(*rec, wm_now_ns(), true, false);
     rec->initial_configure_sent = true;
 }
 
 void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
                                                         const toplevel_commit_info& info) {
-    if (!toplevels_ || !surfaces_ || !scene_)
+    if (!toplevels_ || !surfaces_ || !scene_ || !tree_)
         return;
     auto* rec = toplevels_->find_mut(id);
     if (!rec)
@@ -638,9 +1061,11 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
     const lx::rect2i previous = rec->geometry;
     if (info.has_buffer)
         rec->buffer_size = info.buffer_size;
+    // Clamped to the whole tree, not the root buffer: a CSD title bar drawn as a subsurface
+    // above the main surface is part of the window.
     const lx::rect2i eff = effective_window_geometry(rec->window_geometry_set,
                                                      rec->window_geometry_requested,
-                                                     rec->buffer_size);
+                                                     info.tree_bbox);
     rec->geometry_offset = {eff.x, eff.y};
 
     // The commit that follows an ack carries the buffer for that configure, so this is
@@ -649,17 +1074,63 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
     // the same snapshot.
     toplevel_configure applied{};
     unsigned applied_serial = 0;
+    decoration_mode mode = rec->decoration_current;
+    bool placed = false;
+    bool state_changed = false;
     if (toplevel_manager::consume_ack(*rec, applied)) {
-        rec->geometry = anchored_geometry(rec->geometry, applied, {eff.width, eff.height});
+        if (applied.place) {
+            // Maximize / restore: the origin the configure named, with the size the client
+            // drew — in this same snapshot as that content.
+            rec->geometry = {applied.place_at.x, applied.place_at.y, eff.width, eff.height};
+            placed = true;
+        } else {
+            rec->geometry = anchored_geometry(rec->geometry, applied, {eff.width, eff.height});
+        }
         applied_serial = applied.serial;
+        mode = applied.decoration;
+        // The state the client now draws for. Only normal ↔ maximized is decided here.
+        const lx::toplevel_state st = (applied.states & tl_maximized)
+                                          ? lx::toplevel_state::maximized
+                                          : lx::toplevel_state::normal;
+        if (rec->state != st && (rec->state == lx::toplevel_state::normal ||
+                                 rec->state == lx::toplevel_state::maximized)) {
+            rec->state = st;
+            state_changed = true;
+        }
     } else {
         rec->geometry.width = eff.width;
         rec->geometry.height = eff.height;
     }
+    // The decoration object went away: "no server-side decoration at the next commit" —
+    // and at every commit after it until a new object is created. Server-side mode only
+    // exists through a decoration object, so a configure that carried `server` and is
+    // acked after the object's destruction (a resize keeps several in flight) must not
+    // turn the frame back on around a client that now draws its own.
+    if (!rec->deco_resource)
+        mode = decoration_mode::client;
+    // The mode answering a configure takes effect with the content drawn for it: frame and
+    // client buffer reach the scene in this same UI call, so the same snapshot.
+    const bool mode_changed = mode != rec->decoration_current;
+    rec->decoration_current = mode;
+    // Logged once the window is where this commit puts it (a first map places it).
+    const auto log_apply = [&](const toplevel_record& r) {
+        if (!mode_changed || !wm_debug_enabled())
+            return;
+        const lx::rect2i f = frame_rect(r.geometry, extents_of(r));
+        char line[160];
+        std::snprintf(line, sizeof(line), "decoration apply id=%llu mode=%s frame=%d,%d,%dx%d",
+                      r.id.id(), r.decoration_current == decoration_mode::server ? "server"
+                                                                                 : "client",
+                      f.x, f.y, f.width, f.height);
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
+    };
 
     if (!rec->mapped) {
-        if (info.has_buffer && !rect_empty(eff))
-            map(*rec);
+        if (info.has_buffer && !rect_empty(eff)) {
+            map(*rec, placed);
+            if (const auto* r = toplevels_->find(id))
+                log_apply(*r);
+        }
         return;
     }
 
@@ -671,50 +1142,61 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
         return;
     }
 
-    const lx::point2i origin{rec->geometry.x - rec->geometry_offset.x,
-                             rec->geometry.y - rec->geometry_offset.y};
-    surfaces_->set_origin(rec->surface, origin);
-    const lx::rect2i now_rect = surfaces_->node_rect(rec->surface);
-    if (!rect_equal(now_rect, info.old_node_rect)) {
-        // Separate clips: a window that moved far damages two small rects, not the bbox.
-        scene_->note_damage(info.old_node_rect);
-        scene_->note_damage(now_rect);
-        // What is under a still pointer may have changed.
-        rehit_pending_ = true;
-    }
+    // The whole tree follows in this same UI call (and so the same snapshot): every node is
+    // moved here, and the caller syncs the tree's scene right after. Damage per node, old
+    // and new rects apart; a size change was damaged where the content landed.
+    tree_->set_root_origin(rec->surface, {rec->geometry.x - rec->geometry_offset.x,
+                                          rec->geometry.y - rec->geometry_offset.y});
+    sync_decoration(*rec);
+    log_apply(*rec);
+    if (state_changed && shell_)
+        shell_->emit_toplevel_state(*rec);
     if (!rect_equal(previous, rec->geometry)) {
         if (shell_)
             shell_->emit_toplevel_geometry(*rec);
         log_geometry(*rec, "commit", applied_serial);
+        // Popups are placed relative to the window geometry: an anchored resize moves its
+        // origin, and reactive popups are placed again for the new size.
+        if (popups_)
+            popups_->on_parent_moved(rec->surface);
     }
 }
 
-void lx::compositor::window_manager::map(toplevel_record& rec) {
-    const lx::rect2i area = work_area();
+void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
+    const lx::rect2i area = usable_area();
 
     // Stack array, not a heap one: mapping is rare, but it must not allocate either.
+    // Placement is of the whole frame — a server-side title bar must land on the output too,
+    // and the cascade compares frames, which is what the user sees.
     lx::rect2i existing[toplevel_manager::k_max];
     unsigned n = 0;
     toplevels_->for_each_bottom_up([&](const toplevel_record& other) {
         if (n < toplevel_manager::k_max)
-            existing[n++] = other.geometry;
+            existing[n++] = frame_rect(other.geometry, extents_of(other));
     });
 
-    lx::point2i p = place_new_window(area, {rec.geometry.width, rec.geometry.height}, existing, n);
-    p = constrain_on_output(area, {p.x, p.y, rec.geometry.width, rec.geometry.height});
-    rec.geometry.x = p.x;
-    rec.geometry.y = p.y;
+    const frame_extents ext = extents_of(rec);
+    if (!placed) {
+        const lx::rect2i frame0 = frame_rect(rec.geometry, ext);
+        lx::point2i p = place_new_window(area, {frame0.width, frame0.height}, existing, n);
+        p = constrain_on_output(area, {p.x, p.y, frame0.width, frame0.height});
+        rec.geometry.x = p.x + ext.left;
+        rec.geometry.y = p.y + ext.top;
+    }
 
     toplevels_->set_mapped(rec.id, true);
-    if (!surfaces_->ensure_node(rec.surface)) {
+    // The tree container goes on top of the window layer, matching the stacking order the
+    // record was just pushed onto; mapping it creates (and damages) every node.
+    tree_->set_root_tag(rec.surface, rec.id.id());
+    tree_->set_root_origin(rec.surface, {rec.geometry.x - rec.geometry_offset.x,
+                                         rec.geometry.y - rec.geometry_offset.y});
+    if (!tree_->map_root(rec.surface, *windows_layer_, ~0u) || !surfaces_->node(rec.surface)) {
+        tree_->unmap_root(rec.surface);
         toplevels_->set_mapped(rec.id, false);
         lx::trace::logger::global().log(lx::trace::level::warn, k_wm_category,
                                         "map failed: no scene node for surface");
         return;
     }
-    surfaces_->set_origin(rec.surface, {rec.geometry.x - rec.geometry_offset.x,
-                                        rec.geometry.y - rec.geometry_offset.y});
-    scene_->note_damage(surfaces_->node_rect(rec.surface));
 
     {
         char line[192];
@@ -724,6 +1206,7 @@ void lx::compositor::window_manager::map(toplevel_record& rec) {
         lx::trace::logger::global().log(lx::trace::level::info, k_wm_category, line);
     }
     log_geometry(rec, "map", 0);
+    sync_decoration(rec);
 
     const lx::toplevel_id id = rec.id;
     if (shell_)
@@ -753,9 +1236,19 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
             return;
     }
 
-    scene_->note_damage(surfaces_->node_rect(rec->surface));
-    surfaces_->drop_node(rec->surface);
+    // Its popups go first (popup_done, top-down): none may stay on screen without it.
+    if (popups_)
+        popups_->on_parent_unmapped(rec->surface, "parent-unmapped");
+    // Every node of the window goes (each damaged); the unmap hook moves pointer focus off
+    // any of them that had it.
+    tree_->unmap_root(rec->surface);
     toplevels_->set_mapped(id, false);
+    sync_decoration(*rec); // not mapped: the frame goes (damaged) with the window
+    if (deco_press_.id == id) {
+        deco_press_ = {};
+        if (decorations_)
+            decorations_->set_button(id, deco_button::normal);
+    }
     if (shell_)
         shell_->emit_toplevel_destroyed(*rec);
 
@@ -791,15 +1284,37 @@ void lx::compositor::window_manager::on_destroyed(lx::toplevel_id id) {
         return;
     if (const auto* rec = toplevels_->find(id); rec && rec->mapped)
         on_unmap(id, "destroyed");
+    if (const auto* rec = toplevels_->find(id); rec && popups_)
+        popups_->on_parent_destroyed(rec->surface);
+    if (const auto* rec = toplevels_->find(id); rec && decorations_)
+        decorations_->on_destroyed(id, rec->surface);
+    if (deco_press_.id == id)
+        deco_press_ = {};
+    if (last_title_click_.id == id)
+        last_title_click_ = {};
+    if (deco_active_ == id)
+        deco_active_ = {};
+    if (activated_ == id)
+        activated_ = {};
     if (keyboard_focus_ == id)
         keyboard_focus_ = {};
-    if (pointer_focus_ == id)
+    if (pointer_focus_ == id) {
         pointer_focus_ = {};
+        pointer_surface_ = {};
+        if (pointer_zone_ != deco_zone::none) {
+            pointer_zone_ = deco_zone::none;
+            if (cursor_)
+                cursor_->clear_hover_shape();
+        }
+    }
     toplevels_->destroy(id);
 }
 
 void lx::compositor::window_manager::on_tick(lx::runtime::clock_time now_ns) {
     lx::trace::scoped_span span{"compositor.wm", "on_tick"};
+    // A node appeared, went, moved or changed size since the last tick.
+    if (surfaces_ && surfaces_->consume_layout_changed())
+        rehit_pending_ = true;
     if (rehit_pending_) {
         rehit_pending_ = false;
         // With a button held the implicit grab owns focus; release re-hit-tests anyway.
@@ -837,14 +1352,18 @@ void lx::compositor::window_manager::flush_configures(lx::runtime::clock_time no
 void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
     if (!toplevels_ || id == keyboard_focus_)
         return;
-    if (auto* old = toplevels_->find_mut(keyboard_focus_))
-        old->desired.states &= ~static_cast<unsigned>(tl_activated);
+    // Activating another client's window (a new window mapping, the shell's
+    // request_activate) ends a popup grab: its menu must not keep the keyboard of a window
+    // that is no longer active. A click there already ended it as an outside click.
+    if (popups_ && popups_->grab_active()) {
+        const auto* next = toplevels_->find(id);
+        if (!next || !(next->client == popups_->grab_client()))
+            popups_->dismiss_all("focus-change");
+    }
     keyboard_focus_ = id;
     auto* rec = toplevels_->find_mut(id);
-    if (rec)
-        rec->desired.states |= tl_activated;
-    if (router_ && seat_)
-        router_->set_keyboard_focus(rec ? rec->surface_resource : nullptr, *seat_);
+    // Activation follows the surface that actually gets the keys (resolve_keyboard_focus).
+    resolve_keyboard_focus();
     if (shell_)
         shell_->emit_focus_changed(rec);
     if (wm_debug_enabled()) {
@@ -854,30 +1373,214 @@ void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
     }
 }
 
+void lx::compositor::window_manager::resolve_keyboard_focus() {
+    if (!toplevels_)
+        return;
+    void* target = nullptr;
+    const char* kind = "none";
+    lx::surface_id surface{};
+    lx::toplevel_id owner{};
+    // "For the top and overlay layers, the seat will always give exclusive keyboard focus to
+    // the top-most layer which has keyboard interactivity set to exclusive."
+    lx::surface_id exclusive{};
+    if (layers_) {
+        if (const layer_record* l = layers_->exclusive_focus()) {
+            target = l->surface_res;
+            kind = "layer";
+            surface = l->surface;
+            exclusive = l->surface;
+        }
+    }
+    // A popup grab gives the keyboard to its topmost mapped popup; its toplevel stays
+    // activated meanwhile (the window decision is unchanged), which is what GTK expects. A
+    // layer surface's popups inherit its interactivity (`none`: pointer grab only), and only
+    // an exclusive surface's own popups can take the keyboard from it.
+    if (popups_) {
+        if (const popup_record* p = popups_->keyboard_target()) {
+            const lx::surface_id root_layer = popups_->root_layer(*p);
+            const bool allowed = root_layer
+                                     ? layers_ && layers_->focusable(root_layer) &&
+                                           (!exclusive || root_layer == exclusive)
+                                     : !exclusive;
+            if (allowed) {
+                target = p->surface_res;
+                kind = "popup";
+                surface = p->surface;
+                owner = p->owner;
+            }
+        }
+    }
+    // A clicked on_demand layer surface, until a click elsewhere.
+    if (!target && layer_focus_ && layers_ && layers_->focusable(layer_focus_)) {
+        if (const layer_record* l = layers_->find(layer_focus_)) {
+            target = l->surface_res;
+            kind = "layer";
+            surface = l->surface;
+        }
+    }
+    if (!target) {
+        if (const auto* rec = toplevels_->find(keyboard_focus_)) {
+            target = rec->surface_resource;
+            kind = "toplevel";
+            surface = rec->surface;
+            owner = rec->id;
+        }
+    }
+    // The window owning the keys is the activated one; while a layer surface has them, none
+    // is (sway). The configure carrying it goes out with the next flush.
+    if (owner != activated_) {
+        if (auto* old = toplevels_->find_mut(activated_))
+            old->desired.states &= ~static_cast<unsigned>(tl_activated);
+        if (auto* now = toplevels_->find_mut(owner))
+            now->desired.states |= tl_activated;
+        activated_ = owner;
+    }
+    // The frame of the window that owns the keyboard is drawn active, at once (KWin): not
+    // tied to a configure, since the frame is the compositor's own.
+    if (owner != deco_active_) {
+        deco_active_ = owner;
+        if (decorations_)
+            decorations_->set_active(owner);
+    }
+    if (!router_ || !seat_ || router_->keyboard_focus() == target)
+        return;
+    router_->set_keyboard_focus(target, *seat_);
+    if (wm_debug_enabled()) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "focus keyboard-surface kind=%s surface=%llu", kind,
+                      surface.id());
+        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    }
+}
+
 // ── Pointer focus and hit-testing ──────────────────────────────────────────
 
-bool lx::compositor::window_manager::hit_test(double x, double y, wm_hit& out) const {
-    if (!toplevels_ || !surfaces_)
+bool lx::compositor::window_manager::pointer_hit(double x, double y, wm_hit& out) const {
+    if (!hit_test(x, y, out))
         return false;
+    // Owner events: during a popup grab only the grabbing client's surfaces get the pointer
+    // (not its frame either: that is the compositor's).
+    return !(popups_ && popups_->grab_active() &&
+             (out.target != hit_target::surface || !(out.client == popups_->grab_client())));
+}
+
+bool lx::compositor::window_manager::hit_test(double x, double y, wm_hit& out) const {
+    if (!toplevels_ || !surfaces_ || !tree_)
+        return false;
+    // Popups sit above every window (the popup layer), newest on top.
+    if (popups_ && popups_->mapped_count() > 0) {
+        tree_hit th{};
+        const popup_record* pr = nullptr;
+        if (popups_->hit(x, y, th, pr)) {
+            out = {};
+            out.id = pr->owner;
+            out.surface_resource = surfaces_->resource(th.surface);
+            out.sx = th.sx;
+            out.sy = th.sy;
+            out.surface = th.surface;
+            out.root = pr->surface;
+            out.owner = hit_owner::popup;
+            out.client = pr->client;
+            return out.surface_resource != nullptr;
+        }
+    }
+    const auto hit_layer = [&](layer_level level) {
+        if (!layers_ || layers_->mapped_count() == 0)
+            return false;
+        tree_hit th{};
+        const layer_record* lr = nullptr;
+        if (!layers_->hit(level, x, y, th, lr))
+            return false;
+        out = {};
+        out.surface_resource = surfaces_->resource(th.surface);
+        out.sx = th.sx;
+        out.sy = th.sy;
+        out.surface = th.surface;
+        out.root = lr->surface;
+        out.owner = hit_owner::layer;
+        out.client = lr->client;
+        return out.surface_resource != nullptr;
+    };
+    if (hit_layer(layer_level::overlay) || hit_layer(layer_level::top))
+        return true;
     bool found = false;
     // Surface extents ∩ input region, not window geometry: a CSD client's resize margins
     // lie outside its geometry and must still receive the press (wlroots, Smithay alike).
+    // Every surface of the tree counts, each clipped to its own extents — a subsurface is
+    // not clipped to its parent.
     toplevels_->for_each_top_down([&](const toplevel_record& rec) {
-        double sx = 0.0;
-        double sy = 0.0;
-        if (!surfaces_->hit(rec.surface, x, y, sx, sy))
-            return true; // keep looking further down
-        out = {rec.id, rec.surface_resource, sx, sy};
-        found = true;
-        return false;
+        tree_hit th{};
+        if (!tree_->hit(rec.surface, x, y, th)) {
+            // Not on a surface of this window: perhaps on its frame. The client is on top
+            // inside the window, so the frame's bands only ever catch what it leaves.
+            if (rec.decoration_current != decoration_mode::server || !decorations_)
+                return true; // keep looking further down
+            const deco_zone zone = deco_hit(rec.geometry, extents_of(rec), x, y);
+            if (zone == deco_zone::none)
+                return true;
+            out = {};
+            out.id = rec.id;
+            out.root = rec.surface;
+            out.client = rec.client;
+            out.target = hit_target::decoration;
+            out.zone = zone;
+            found = true;
+            return false;
+        }
+        out = {};
+        out.id = rec.id;
+        out.surface_resource =
+            th.surface == rec.surface ? rec.surface_resource : surfaces_->resource(th.surface);
+        out.sx = th.sx;
+        out.sy = th.sy;
+        out.surface = th.surface;
+        out.root = rec.surface;
+        out.client = rec.client;
+        found = out.surface_resource != nullptr;
+        return !found;
     });
-    return found;
+    if (found)
+        return true;
+    return hit_layer(layer_level::bottom) || hit_layer(layer_level::background);
+}
+
+void lx::compositor::window_manager::set_decoration_hover(lx::toplevel_id id, deco_zone zone) {
+    const lx::toplevel_id old_id = pointer_zone_ != deco_zone::none ? pointer_focus_
+                                                                    : lx::toplevel_id{};
+    if (decorations_) {
+        if (old_id && !(old_id == id && zone != deco_zone::none))
+            decorations_->set_button(old_id, deco_button::normal);
+        if (zone != deco_zone::none)
+            decorations_->set_button(id, zone == deco_zone::close ? deco_button::hover
+                                                                  : deco_button::normal);
+    }
+    if (cursor_) {
+        if (zone != deco_zone::none)
+            cursor_->set_hover_shape(cursor_for_zone(zone));
+        else if (pointer_zone_ != deco_zone::none)
+            cursor_->clear_hover_shape();
+    }
+    pointer_zone_ = zone;
+}
+
+bool lx::compositor::window_manager::same_pointer_focus(const wm_hit& h) const {
+    if (h.target == hit_target::decoration)
+        return h.id == pointer_focus_ && h.zone == pointer_zone_ && !router_->pointer_focus();
+    return pointer_zone_ == deco_zone::none && h.id == pointer_focus_ &&
+           router_->pointer_focus() == h.surface_resource;
 }
 
 void lx::compositor::window_manager::set_pointer_focus(const wm_hit* hit) {
+    const bool on_frame = hit && hit->target == hit_target::decoration;
+    set_decoration_hover(on_frame ? hit->id : lx::toplevel_id{},
+                         on_frame ? hit->zone : deco_zone::none);
     pointer_focus_ = hit ? hit->id : lx::toplevel_id{};
+    pointer_surface_ = hit && !on_frame ? hit->surface : lx::surface_id{};
+    pointer_owner_ = hit ? hit->owner : hit_owner::toplevel;
+    pointer_root_ = hit && !on_frame ? hit->root : lx::surface_id{};
     if (router_ && seat_) {
-        if (hit)
+        // On the frame no client has the pointer: the one it came from gets `leave`.
+        if (hit && !on_frame)
             (void)router_->set_pointer_focus(hit->surface_resource, hit->sx, hit->sy, *seat_);
         else
             (void)router_->set_pointer_focus(nullptr, 0.0, 0.0, *seat_);
@@ -885,12 +1588,39 @@ void lx::compositor::window_manager::set_pointer_focus(const wm_hit* hit) {
     if (!wm_debug_enabled())
         return;
     char line[96];
-    if (hit)
+    if (on_frame)
+        // Deliberately not `focus pointer id=…`: no client has the pointer.
+        std::snprintf(line, sizeof(line), "focus pointer decoration id=%llu zone=%s",
+                      hit->id.id(), deco_zone_name(hit->zone));
+    else if (hit && hit->owner == hit_owner::popup)
+        // Deliberately not `focus pointer id=…`: the drag smoke counts those as windows.
+        std::snprintf(line, sizeof(line), "focus pointer popup surface=%llu sx=%.1f sy=%.1f",
+                      hit->surface.id(), hit->sx, hit->sy);
+    else if (hit && hit->owner == hit_owner::layer)
+        std::snprintf(line, sizeof(line), "focus pointer layer surface=%llu sx=%.1f sy=%.1f",
+                      hit->surface.id(), hit->sx, hit->sy);
+    else if (hit)
         std::snprintf(line, sizeof(line), "focus pointer id=%llu sx=%.1f sy=%.1f", hit->id.id(),
                       hit->sx, hit->sy);
     else
         std::snprintf(line, sizeof(line), "focus pointer none");
     lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    if (hit && !on_frame && hit->owner == hit_owner::toplevel && !(hit->surface == hit->root)) {
+        std::snprintf(line, sizeof(line), "focus pointer-surface surface=%llu root=%llu",
+                      hit->surface.id(), hit->root.id());
+        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    }
+}
+
+void lx::compositor::window_manager::on_surface_unmapped(lx::surface_id surface) {
+    if (!surface || !(surface == pointer_surface_))
+        return;
+    // As for a focused window unmapping: focus must not name a surface that is not drawn
+    // for even one more event.
+    if (button_mask_ != 0)
+        set_pointer_focus(nullptr);
+    else
+        refresh_pointer_focus(0, false);
 }
 
 void lx::compositor::window_manager::refresh_pointer_focus(unsigned time_ms,
@@ -898,17 +1628,17 @@ void lx::compositor::window_manager::refresh_pointer_focus(unsigned time_ms,
     if (!seat_ || !router_)
         return;
     wm_hit h{};
-    const bool any = hit_test(seat_->pointer_x(), seat_->pointer_y(), h);
+    const bool any = pointer_hit(seat_->pointer_x(), seat_->pointer_y(), h);
     if (!any) {
         if (pointer_focus_ || router_->pointer_focus())
             set_pointer_focus(nullptr);
         return;
     }
-    if (h.id != pointer_focus_ || router_->pointer_focus() != h.surface_resource) {
+    if (!same_pointer_focus(h)) {
         set_pointer_focus(&h);
         return;
     }
-    if (motion_if_same)
+    if (motion_if_same && h.target == hit_target::surface)
         router_->send_pointer_motion(h.sx, h.sy, time_ms);
 }
 
@@ -928,28 +1658,38 @@ void lx::compositor::window_manager::on_pointer_motion(unsigned time_ms) {
 
     if (button_mask_ == 0) {
         wm_hit h{};
-        const bool any = hit_test(px, py, h);
+        const bool any = pointer_hit(px, py, h);
         if (!any) {
             if (pointer_focus_ || router_->pointer_focus())
                 set_pointer_focus(nullptr);
             return;
         }
-        if (h.id != pointer_focus_ || router_->pointer_focus() != h.surface_resource) {
+        if (!same_pointer_focus(h)) {
             // `enter` carries the position; a motion with the same one would be noise.
             set_pointer_focus(&h);
             return;
         }
-        router_->send_pointer_motion(h.sx, h.sy, time_ms);
+        if (h.target == hit_target::surface)
+            router_->send_pointer_motion(h.sx, h.sy, time_ms);
+        return;
+    }
+
+    // A close-button press shows pressed only while the pointer is still over the button —
+    // releasing elsewhere cancels, and the look says so beforehand.
+    if (deco_press_.id && decorations_) {
+        const auto* rec = toplevels_->find(deco_press_.id);
+        const bool over = rec && in_close(*rec, px, py);
+        decorations_->set_button(deco_press_.id, over ? deco_button::pressed : deco_button::normal);
         return;
     }
 
     // Implicit grab: the surface that took the press keeps every motion until release,
     // wherever the pointer goes — coordinates outside its extents included, which is how
-    // a drag-select keeps scrolling past the window edge.
-    const auto* rec = toplevels_->find(pointer_focus_);
-    if (!rec || !router_->pointer_focus())
+    // a drag-select keeps scrolling past the window edge. In that surface's coordinates: a
+    // subsurface that took the press (a CSD title bar) is not the window's main surface.
+    if (!pointer_surface_ || !router_->pointer_focus() || !surfaces_->node(pointer_surface_))
         return;
-    const lx::rect2i n = surfaces_->node_rect(rec->surface);
+    const lx::rect2i n = surfaces_->node_rect(pointer_surface_);
     router_->send_pointer_motion(px - n.x, py - n.y, time_ms);
 }
 
@@ -973,21 +1713,36 @@ void lx::compositor::window_manager::on_pointer_button(
             swallowed_mask_ |= bit;
             return;
         }
+        // A popup grab ends with a press outside the grabbing client's surfaces. The press
+        // is consumed (wlroots and Mutter alike): the menu closes and nothing under it is
+        // clicked. Checked before the Super binding and click-to-focus.
+        if (popups_ && popups_->grab_active()) {
+            wm_hit h{};
+            const bool inside = hit_test(seat_->pointer_x(), seat_->pointer_y(), h) &&
+                                h.target == hit_target::surface &&
+                                h.client == popups_->grab_client();
+            if (!inside) {
+                swallowed_mask_ |= bit;
+                popups_->dismiss_all("outside-click");
+                return;
+            }
+        }
         // TEMPORARY placeholder binding (Super+drag) — moves to shell policy over
         // zlm_policy_bridge_v1. Super+left moves, Super+right resizes from the edges
         // nearest the grab point. Neither press nor release reaches the client.
         if (bit && (event.evdev_code == k_btn_left || event.evdev_code == k_btn_right) &&
             seat_->keymap().named().super) {
             wm_hit h{};
-            if (hit_test(seat_->pointer_x(), seat_->pointer_y(), h)) {
+            if (hit_test(seat_->pointer_x(), seat_->pointer_y(), h) && h.id) {
                 swallowed_mask_ |= bit;
                 set_keyboard_focus(h.id);
                 (void)raise(h.id);
                 const bool move = event.evdev_code == k_btn_left;
                 unsigned edges = 0;
+                // The thirds of what the user sees: the frame, title bar included.
                 if (const auto* rec = toplevels_->find(h.id); rec && !move)
-                    edges = edges_for_point(rec->geometry, seat_->pointer_x(),
-                                            seat_->pointer_y());
+                    edges = edges_for_point(frame_rect(rec->geometry, extents_of(*rec)),
+                                            seat_->pointer_x(), seat_->pointer_y());
                 (void)begin_grab(h.id, move ? grab_mode::move : grab_mode::resize, edges,
                                  grab_source::keybinding, event.evdev_code);
                 return;
@@ -997,9 +1752,50 @@ void lx::compositor::window_manager::on_pointer_button(
         // still pointer) must still land on the window under the pointer.
         if (first)
             refresh_pointer_focus(event.time_ms, false);
+        // The compositor's frame: the press is the window manager's, never a client's.
+        if (pointer_zone_ != deco_zone::none && pointer_focus_ &&
+            toplevels_->find(pointer_focus_)) {
+            swallowed_mask_ |= bit;
+            decoration_press(pointer_focus_, pointer_zone_, event);
+            return;
+        }
+        // Layer-shell keyboard: a press on an on_demand surface (or an exclusive one below
+        // the windows) gives it the keyboard; a press on a window or on nothing takes it
+        // back. Popups leave it as it is. Before the button, as for click-to-focus.
+        if (layers_) {
+            if (pointer_owner_ == hit_owner::layer && pointer_root_ && router_->pointer_focus()) {
+                if (!(layer_focus_ == pointer_root_) && layers_->click_focusable(pointer_root_)) {
+                    layer_focus_ = pointer_root_;
+                    if (wm_debug_enabled()) {
+                        const layer_record* l = layers_->find(layer_focus_);
+                        char line[128];
+                        std::snprintf(line, sizeof(line),
+                                      "layer focus surface=%llu interactivity=%s cause=click",
+                                      layer_focus_.id(),
+                                      l && l->current.interactivity == 1 ? "exclusive"
+                                                                         : "on_demand");
+                        lx::trace::logger::global().log(lx::trace::level::debug,
+                                                        "compositor.layer", line);
+                    }
+                    resolve_keyboard_focus();
+                }
+            } else if (pointer_owner_ != hit_owner::popup && layer_focus_) {
+                if (wm_debug_enabled()) {
+                    char line[128];
+                    std::snprintf(line, sizeof(line),
+                                  "layer focus surface=0 interactivity=none cause=click "
+                                  "previous=%llu",
+                                  layer_focus_.id());
+                    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.layer",
+                                                    line);
+                }
+                layer_focus_ = {};
+                resolve_keyboard_focus();
+            }
+        }
         // Placeholder policy until the shell decides: click-to-focus, raise-on-press, on
         // any button — focus before the button so the client sees keyboard `enter` first.
-        if (pointer_focus_) {
+        if (pointer_focus_ && toplevels_->find(pointer_focus_)) {
             set_keyboard_focus(pointer_focus_);
             (void)raise(pointer_focus_);
         }
@@ -1022,6 +1818,24 @@ void lx::compositor::window_manager::on_pointer_button(
         if (grab_.mode != grab_mode::none && event.evdev_code == grab_.button) {
             end_grab(grab_end_reason::release); // re-hit-tests once no button is held
             return;
+        }
+        // The close button clicks on release, and only over the button it was pressed on.
+        if (deco_press_.id && event.evdev_code == deco_press_.button) {
+            const lx::toplevel_id id = deco_press_.id;
+            deco_press_ = {};
+            const auto* rec = toplevels_->find(id);
+            const bool over = rec && in_close(*rec, seat_->pointer_x(), seat_->pointer_y());
+            if (decorations_)
+                decorations_->set_button(id, over ? deco_button::hover : deco_button::normal);
+            if (over) {
+                if (wm_debug_enabled()) {
+                    char line[64];
+                    std::snprintf(line, sizeof(line), "decoration close id=%llu", id.id());
+                    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco",
+                                                    line);
+                }
+                request_close(id);
+            }
         }
         if (swallowed) {
             if (button_mask_ == 0 && grab_.mode == grab_mode::none)
@@ -1056,6 +1870,91 @@ bool lx::compositor::window_manager::on_key(const lx::input::key_event& event) {
     return false;
 }
 
+// ── Server-side frame ──────────────────────────────────────────────────────
+
+void lx::compositor::window_manager::decoration_press(
+    lx::toplevel_id id, deco_zone zone, const lx::input::pointer_button_event& event) {
+    if (wm_debug_enabled()) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "decoration press id=%llu zone=%s button=%u", id.id(),
+                      deco_zone_name(zone), event.evdev_code);
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
+    }
+    constexpr unsigned k_btn_middle = 0x112;
+    // Middle on the title lowers (the KWin and Mutter default). Without click-to-focus: a
+    // window just sent to the back does not take the keyboard on its way down.
+    if (event.evdev_code == k_btn_middle && zone == deco_zone::title) {
+        (void)lower(id);
+        return;
+    }
+    // Any other press on the frame focuses and raises, as a press on the window does.
+    set_keyboard_focus(id);
+    (void)raise(id);
+    if (event.evdev_code != k_btn_left)
+        return; // right on the title: no window menu yet
+    const double px = seat_->pointer_x();
+    const double py = seat_->pointer_y();
+    switch (zone) {
+    case deco_zone::title: {
+        const title_click prev = last_title_click_;
+        const double dx = px - prev.x;
+        const double dy = py - prev.y;
+        if (prev.id == id && event.time_ms - prev.time_ms <= k_double_click_ms &&
+            dx * dx + dy * dy <= k_double_click_px * k_double_click_px) {
+            last_title_click_ = {};
+            // Double click on the title toggles maximize (every desktop's default).
+            const auto* rec = toplevels_->find(id);
+            const bool maximized = rec && (rec->desired.states & tl_maximized) != 0;
+            if (wm_debug_enabled()) {
+                char line[96];
+                std::snprintf(line, sizeof(line), "decoration double-click id=%llu maximize=%d",
+                              id.id(), maximized ? 0 : 1);
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
+            }
+            set_maximized(id, !maximized, "decoration");
+            return;
+        }
+        last_title_click_ = {id, event.time_ms, px, py};
+        (void)begin_grab(id, grab_mode::move, 0, grab_source::decoration, event.evdev_code);
+        return;
+    }
+    case deco_zone::close:
+        deco_press_ = {id, event.evdev_code};
+        if (decorations_)
+            decorations_->set_button(id, deco_button::pressed);
+        return;
+    case deco_zone::none:
+        return;
+    default:
+        (void)begin_grab(id, grab_mode::resize, edges_for_zone(zone), grab_source::decoration,
+                         event.evdev_code);
+        return;
+    }
+}
+
+void lx::compositor::window_manager::on_title_changed(lx::toplevel_id id) {
+    if (!decorations_ || !toplevels_)
+        return;
+    if (const auto* rec = toplevels_->find(id))
+        decorations_->on_title_changed(*rec);
+}
+
+void lx::compositor::window_manager::on_decoration_request(lx::toplevel_id id, bool immediate) {
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec)
+        return;
+    rec->desired.decoration = toplevel_manager::wanted_decoration(*rec);
+    if (!rec->deco_resource)
+        return;
+    rec->deco_configure_due = true;
+    // Before the initial commit the initial configure carries it. Afterwards the answer
+    // goes out now when nothing is in flight (or for a new object, which a version 1 client
+    // may not attach a buffer before); else the flush sends it once the one in flight is
+    // answered, as for any configure.
+    if (rec->initial_configure_sent && (immediate || !rec->inflight))
+        send_configure(*rec, wm_now_ns(), false, false);
+}
+
 // ── Interactive grabs ──────────────────────────────────────────────────────
 
 void lx::compositor::window_manager::log_grab_reject(lx::toplevel_id id, grab_source source,
@@ -1084,7 +1983,7 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
         reject = "unmapped";
     else if (!bit || !(button_mask_ & bit))
         reject = "no-button";
-    else if (rec->state != lx::toplevel_state::normal)
+    else if (rec->state != lx::toplevel_state::normal || (rec->desired.states & tl_maximized))
         reject = "state";
     else if (mode == grab_mode::resize && (edges == edge_none || !valid_resize_edges(edges)))
         reject = "edges";
@@ -1092,6 +1991,9 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
         log_grab_reject(id, source, reject);
         return false;
     }
+    // A move or resize ends any popup grab: menus do not travel with an interactive grab.
+    if (popups_ && popups_->grab_active())
+        popups_->dismiss_all("wm-grab");
 
     grab_ = {};
     grab_.mode = mode;
@@ -1145,6 +2047,18 @@ bool lx::compositor::window_manager::request_client_grab(lx::toplevel_id id, voi
     return begin_grab(id, mode, edges, grab_source::client, last_press_button_);
 }
 
+lx::compositor::popup_manager::grab_result
+lx::compositor::window_manager::request_popup_grab(lx::surface_id popup, void* client,
+                                                   unsigned serial) {
+    if (!popups_)
+        return popup_manager::grab_result::denied;
+    const bool serial_ok =
+        serial != 0 && client != nullptr &&
+        ((serial == last_press_serial_ && client == last_press_client_) ||
+         (router_ && router_->is_key_grab_serial(serial, client)));
+    return popups_->grab(popup, serial_ok, grab_.mode != grab_mode::none);
+}
+
 bool lx::compositor::window_manager::request_shell_grab(lx::toplevel_id id, unsigned serial,
                                                         grab_mode mode, unsigned edges) {
     if (serial == 0 || serial != last_press_serial_) {
@@ -1160,19 +2074,24 @@ void lx::compositor::window_manager::move_window(toplevel_record& rec, lx::point
         return;
     const int dx = p.x - rec.geometry.x;
     const int dy = p.y - rec.geometry.y;
-    const lx::rect2i old_rect = surfaces_->node_rect(rec.surface);
     rec.geometry.x = p.x;
     rec.geometry.y = p.y;
     shift_anchors(rec, dx, dy);
-    // An origin change only: the buffer, its texture and the node's bounds are untouched.
-    surfaces_->set_origin(rec.surface, {rec.geometry.x - rec.geometry_offset.x,
-                                        rec.geometry.y - rec.geometry_offset.y});
-    // Two clips, not their bounding box: a fast drag repaints two window-sized rects.
-    scene_->note_damage(old_rect);
-    scene_->note_damage(surfaces_->node_rect(rec.surface));
+    // An origin change only: buffers, textures and node bounds are untouched. Every node of
+    // the tree moves; old and new rects are damaged as separate clips per node, never one
+    // window-sized bounding box.
+    // The geometry line first: the tree's dump of the moved nodes follows it, as it follows
+    // the geometry line of a commit.
+    log_geometry(rec, cause, 0);
+    tree_->set_root_origin(rec.surface, {rec.geometry.x - rec.geometry_offset.x,
+                                         rec.geometry.y - rec.geometry_offset.y});
+    tree_->sync_scene(rec.surface, "move");
+    sync_decoration(rec);
+    // Popups follow their window in the same UI call, so in the same snapshot.
+    if (popups_)
+        popups_->on_parent_moved(rec.surface);
     if (shell_)
         shell_->emit_toplevel_geometry(rec);
-    log_geometry(rec, cause, 0);
 }
 
 void lx::compositor::window_manager::apply_grab() {
@@ -1184,10 +2103,13 @@ void lx::compositor::window_manager::apply_grab() {
     const int dx = round_delta(grab_.now_x - grab_.start_x);
     const int dy = round_delta(grab_.now_y - grab_.start_y);
     if (grab_.mode == grab_mode::move) {
-        const lx::point2i p = constrain_on_output(
-            work_area(),
-            {grab_.start.x + dx, grab_.start.y + dy, rec->geometry.width, rec->geometry.height});
-        move_window(*rec, p, "move");
+        // The frame is what must stay reachable: a server-side title bar stays on the output.
+        const frame_extents ext = extents_of(*rec);
+        const lx::rect2i f = frame_rect(
+            {grab_.start.x + dx, grab_.start.y + dy, rec->geometry.width, rec->geometry.height},
+            ext);
+        const lx::point2i p = constrain_on_output(usable_area(), f);
+        move_window(*rec, {p.x + ext.left, p.y + ext.top}, "move");
         return;
     }
     // Resize: only the request changes here. Geometry follows the client's commit of the
@@ -1253,15 +2175,17 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
 
 void lx::compositor::window_manager::sync_node_stacking(const toplevel_record& rec,
                                                         const char* verb) {
-    auto* node = surfaces_->node(rec.surface);
-    if (!node || !windows_layer_)
+    auto* box = tree_ ? tree_->container(rec.surface) : nullptr;
+    if (!box || !windows_layer_)
         return;
-    // The layer holds exactly the mapped toplevels' nodes, in the same order, so the
-    // toplevel's stacking index is its node's index.
-    (void)windows_layer_->move_to(node, toplevels_->stacking_index(rec.id));
-    // Everything that changed lies inside the restacked window's rect: it now covers, or
-    // uncovers, part of what overlapped it.
-    scene_->note_damage(surfaces_->node_rect(rec.surface));
+    // The layer holds exactly the mapped toplevels' tree containers, in the same order, so
+    // the toplevel's stacking index is its container's index.
+    (void)windows_layer_->move_to(box, toplevels_->stacking_index(rec.id));
+    // Everything that changed lies inside the restacked window's node rects: it now covers,
+    // or uncovers, part of what overlapped it.
+    tree_->damage_root(rec.surface);
+    if (decorations_)
+        decorations_->damage(rec.id);
     rehit_pending_ = true;
     stacking_dirty_ = true;
     if (wm_debug_enabled()) {

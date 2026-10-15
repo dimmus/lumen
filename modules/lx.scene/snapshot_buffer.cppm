@@ -291,9 +291,9 @@ void lx::scene::draw_list::batch_for_render() {
     // no depth-stencil state. Without a depth test, hoisting opaque draws ahead of
     // translucent ones inverts z for any translucent surface sitting *behind* an opaque
     // one: the translucent surface would be painted last and blend over the window that
-    // should have covered it. `scene::surface_node::emit` marks every surface at full
-    // opacity as `blend_mode::opaque`, so an ordinary "translucent terminal behind a solid
-    // window" stack hit this. The CPU backend's occlusion cull compounds it — it scans for
+    // should have covered it. `scene::surface_node::emit` marks opaque content (no alpha,
+    // or a full opaque region) as `blend_mode::opaque`, so an ordinary "translucent
+    // terminal behind a solid window" stack hits this. The CPU backend's occlusion cull compounds it — it scans for
     // the topmost covering opaque draw and skips everything below, which is only sound if
     // the list really is in paint order.
     //

@@ -58,7 +58,8 @@ ABS_X, ABS_Y = 0x00, 0x01
 
 BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
 KEYS = {"KEY_ESC": 1, "KEY_LEFTMETA": 125, "KEY_LEFTSHIFT": 42, "KEY_LEFTCTRL": 29,
-        "KEY_LEFTALT": 56, "KEY_ENTER": 28, "KEY_SPACE": 57, "KEY_A": 30}
+        "KEY_LEFTALT": 56, "KEY_ENTER": 28, "KEY_SPACE": 57, "KEY_A": 30, "KEY_F10": 68,
+        "KEY_UP": 103, "KEY_LEFT": 105, "KEY_RIGHT": 106, "KEY_DOWN": 108}
 
 # struct input_event on 64-bit Linux: struct timeval (two longs), __u16 type, __u16 code,
 # __s32 value. The kernel ignores the time of a written event and stamps its own.
@@ -343,7 +344,7 @@ def main():
 
     s = sub.add_parser("button", help="pointer button")
     s.add_argument("name", choices=sorted(BUTTONS))
-    s.add_argument("action", choices=("press", "release", "click"))
+    s.add_argument("action", choices=("press", "release", "click", "dblclick"))
 
     s = sub.add_parser("key", help="keyboard key (evdev code or KEY_* name)")
     s.add_argument("code", type=key_code)
@@ -371,11 +372,19 @@ def main():
         elif a.cmd == "drag":
             run_drag(inj, a)
         elif a.cmd == "button":
-            if a.action in ("press", "click"):
+            if a.action == "dblclick":
+                # Two clicks 170 ms apart: inside every toolkit's double-click time (GTK and
+                # the compositor's frame both use 400 ms), which two separate injector runs
+                # cannot promise.
                 inj.button(a.name, True)
-            if a.action == "click":
                 time.sleep(0.05)
-            if a.action in ("release", "click"):
+                inj.button(a.name, False)
+                time.sleep(0.12)
+            if a.action in ("press", "click", "dblclick"):
+                inj.button(a.name, True)
+            if a.action in ("click", "dblclick"):
+                time.sleep(0.05)
+            if a.action in ("release", "click", "dblclick"):
                 inj.button(a.name, False)
         elif a.cmd == "key":
             if a.action in ("press", "tap"):

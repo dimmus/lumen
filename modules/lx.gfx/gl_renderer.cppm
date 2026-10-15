@@ -880,6 +880,17 @@ lx::result<void> lx::gfx::gl_compositor::import_dmabuf(unsigned texture_id,
         return lx::make_error(lx::error_domain::invalid_argument, 0,
                               "gl import: dmabuf has no planes");
     }
+    // The same buffer committed again: the EGLImage already samples its memory, and the
+    // client's new pixels are visible through it. A texture id names one buffer for its
+    // whole life (it is retired when the wl_buffer is destroyed), so only the size could
+    // differ — and a buffer's size never changes. Re-creating the image every commit cost
+    // an EGLImage and a texture per frame for nothing.
+    if (const int known = find(texture_id); known >= 0) {
+        const auto& slot = textures_[static_cast<unsigned>(known)];
+        if (slot.is_dmabuf && slot.image && slot.width == desc.width &&
+            slot.height == desc.height)
+            return {};
+    }
 
     auto create_image =
         reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));

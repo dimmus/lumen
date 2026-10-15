@@ -25,7 +25,7 @@ C++26 module API surface for future implementation. All modules live under `modu
 | [`lx.scheduler.presentation`](../modules/lx.scheduler/presentation.cppm) | Present timing | `presentation_tracker`, `presentation_feedback`, `kms_damage` |
 | [`lx.scheduler.budget`](../modules/lx.scheduler/budget.cppm) | Hot-path CPU limits | `hot_path_budget`, `budget_tracker` |
 | [`lx.session`](../modules/lx.session/lx.session.cppm) | logind session | `logind_session`, `credentials` |
-| [`lx.session.privilege`](../modules/lx.session/privilege.cppm) | Shell access control | `privilege_checker`, `shell_verification` |
+| [`lx.session.privilege`](../modules/lx.session/privilege.cppm) | Shell access control: same UID and the peer's executable equal to the configured shell binary (`check_shell_bind`, used by `lx::wayland::server::allow_privileged_global`) | `privilege_checker`, `shell_verification`, `privilege_result` |
 | [`lx.input`](../modules/lx.input/lx.input.cppm) | Input devices | `seat`, `pointer`, `keyboard`, `input_manager` |
 | [`lx.drm`](../modules/lx.drm/lx.drm.cppm) | KMS/DRM | `kms_device`, `plane_manager`, `mode` |
 | [`lx.drm.atomic`](../modules/lx.drm/atomic.cppm) | Atomic KMS; cursor-only and TEST_ONLY commits | `kms_atomic_commit`, `kms_damage_region`, `page_flip_event`, `atomic_commit_request::cursor` |
@@ -38,7 +38,7 @@ C++26 module API surface for future implementation. All modules live under `modu
 | [`lx.gfx.syncobj`](../modules/lx.gfx/syncobj_bridge.cppm) | drm-syncobj ↔ Vulkan timelines | `syncobj_bridge`, `syncobj_timeline` |
 | [`lx.gfx.damage`](../modules/lx.gfx/damage.cppm) | Fixed-capacity multi-rect damage (16 rects = FB_DAMAGE_CLIPS), no allocation | `damage_region`, `k_damage_rects` |
 | [`lx.layout`](../modules/lx.layout/lx.layout.cppm) | Layout engine | `flex_node`, `grid_node`, `layout_engine` |
-| [`lx.text`](../modules/lx.text/lx.text.cppm) | Text shaping | `font_stack`, `text_layout` |
+| [`lx.text`](../modules/lx.text/lx.text.cppm) | Text shaping; single-line CPU rasterization (HarfBuzz shaping, FreeType grayscale glyphs, fixed glyph cache, cluster-boundary ellipsis) into premultiplied ARGB, for text drawn as a texture (server-side titles, the panel) | `font_stack`, `text_layout`, `shaped_line`, `shape_line`, `fit_line`, `render_line`, `raster_target` |
 | [`lx.scene`](../modules/lx.scene/lx.scene.cppm) | Scene graph | `scene_graph`, `commit_frame`, `acquire_render_snapshot` |
 | [`lx.scene.snapshot`](../modules/lx.scene/snapshot_buffer.cppm) | Immutable frames; damage carried forward over unconsumed snapshots | `snapshot_buffer`, `immutable_frame_snapshot::damage_rects` |
 | [`lx.ui`](../modules/lx.ui/lx.ui.cppm) | Widget toolkit | `ui_node`, `element`, `reconciler`, `draw_scope` |
@@ -54,15 +54,22 @@ C++26 module API surface for future implementation. All modules live under `modu
 | [`lx.ui.theme.compile`](../modules/lx.ui/theme_compile.cppm) | Theme compiler API | `theme_compiler`, `theme_source` |
 | [`lx.ui.builder`](../modules/lx.ui.builder/lx.ui.builder.cppm) | Fluent UI builders | `make_window()`, `widget_builder<T>`, `flex_builder` |
 | [`lx.shell.policy`](../modules/lx.shell.policy/lx.shell.policy.cppm) | WM policies | `stacking_policy`, `tiling_policy`, `policy_registry` |
-| [`lx.shell.bridge`](../modules/lx.shell/bridge.cppm) | Shell state sync client | `policy_bridge`, `bridge_callbacks` |
-| [`lx.shell`](../modules/lx.shell/lx.shell.cppm) | Desktop shell | `shell_app`, `panel`, `workspace_controller` |
+| [`lx.shell.task_model`](../modules/lx.shell/task_model.cppm) | The shell's window list (pure): snapshot + deltas into a fixed 256-entry table, generation-checked handles, creation order, UTF-8-safe title cut at 255 bytes, change bits | `task_model`, `task_handle`, `task_entry`, `task_change`, `copy_utf8` |
+| [`lx.shell.bridge`](../modules/lx.shell/bridge.cppm) | Shell state sync client over libwayland-client (no Wayland type exported): listens on `zlm_shell_v1` (`capabilities`), creates `zlm_policy_bridge_v1`, applies its events to the task model, sends requests by task handle | `policy_bridge` |
+| [`lx.shell.panel`](../modules/lx.shell/panel.cppm) | The top panel: a wlr-layer-shell surface (top, 32 px, exclusive zone 32) with one entry per window, focus highlighted, click → raise + activate; pure layout and layout diff (repaint and damage only what changed), `lx::text` labels, two-buffer shm | `panel`, `panel_globals`, `panel_layout`, `layout_panel`, `panel_hit`, `panel_diff` |
+| [`lx.shell`](../modules/lx.shell/lx.shell.cppm) | lumen-shell: connect, bind, one-thread `ppoll` loop (display fd + signalfd), teardown; exit 1 when refused or disconnected | `shell_app`, `shell_config` |
 | [`lx.compositor`](../modules/lx.compositor/lx.compositor.cppm) | Compositor | `compositor`, `output_manager`, `seat_manager` |
 | [`lx.compositor.buffer_lifecycle`](../modules/lx.compositor/buffer_lifecycle.cppm) | Buffer lifetimes | `buffer_lifecycle_tracker`, `buffer_lifecycle_state` |
-| [`lx.compositor.surface`](../modules/lx.compositor/surface_manager.cppm) | Surface commits, scene nodes, input regions | `surface_manager`, `surface_commit`, `input_region` |
-| [`lx.compositor.toplevel`](../modules/lx.compositor/toplevel_manager.cppm) | Toplevel registry, stacking order, configure state machine (single in flight, ack matching) | `toplevel_manager`, `toplevel_record`, `toplevel_configure` |
-| [`lx.compositor.wm`](../modules/lx.compositor/window_manager.cppm) | Window geometry (source of truth), placement, configure flush, hit-testing, pointer/keyboard focus, implicit grab, stacking, interactive move/resize grabs | `window_manager`, `wm_hit`, `wm_grab`, `grab_mode`, `anchored_geometry`, `place_new_window`, `resize_target`, `edges_for_point` |
-| [`lx.compositor.shell_bridge`](../modules/lx.compositor/shell_bridge.cppm) | Shell protocol server | `shell_bridge`, snapshot/delta emitters |
-| [`lx.compositor.cursor`](../modules/lx.compositor/cursor_manager.cppm) | Pointer image and position: precedence (grab override → client shape/surface/hidden → default), UI→render mailboxes, software-cursor scene node | `cursor_manager`, `cursor_frame`, `latest_value`, `cursor_node` |
+| [`lx.compositor.surface`](../modules/lx.compositor/surface_manager.cppm) | Surface commits, content opacity, scene nodes (created in a container the caller names), input regions, O(1) id index, `wl_resource` registry | `surface_manager`, `surface_commit`, `input_region`, `id_slot_index` |
+| [`lx.compositor.surface_tree`](../modules/lx.compositor/surface_tree.cppm) | Subsurface trees (Wayland-free): parentage, pending/cached/current child position and order, effective sync, mapping, one scene container per root with the tree flattened in paint order, global origins, per-node damage, tree hit-testing, bounding box | `surface_tree`, `tree_order`, `tree_hit`, `root_kind` |
+| [`lx.compositor.positioner`](../modules/lx.compositor/positioner.cppm) | xdg_positioner placement, pure: the base rectangle (anchor point, offset, gravity) and constraint adjustment in the spec's precedence flip → slide → resize, per axis | `positioner_rules`, `positioner_result`, `positioner_base`, `positioner_place` |
+| [`lx.compositor.popup`](../modules/lx.compositor/popup_manager.cppm) | xdg_popup records (Wayland-free; wire ops and window-manager callbacks installed): configure/ack ring, placement relative to the parent's window geometry against the constraint area, map (each popup a surface-tree root in the popup layer), reposition and reactive re-placement, the grab stack (owner events, keyboard to the topmost mapped grabbing popup), dismissal top-down | `popup_manager`, `popup_record`, `popup_ops`, `popup_host`, `popup_parent_kind` |
+| [`lx.compositor.layer_shell`](../modules/lx.compositor/layer_shell.cppm) | wlr-layer-shell (Wayland-free; wire ops and window-manager callbacks installed): records and double-buffered properties, commit rules (`validate_layer_state`), configure/ack ring, arrangement against the output (`arrange_layers`, pure: two passes, exclusive zones first, zone -1 against the whole output, a smaller committed size centred) and the usable area it leaves, map/unmap/closed, `set_layer`, exclusive / on-demand keyboard queries, hit-testing per layer | `layer_shell`, `layer_record`, `layer_props`, `layer_ops`, `layer_host`, `layer_level`, `arrange_layers`, `layer_exclusive_edge`, `validate_layer_state` |
+| [`lx.compositor.toplevel`](../modules/lx.compositor/toplevel_manager.cppm) | Toplevel registry, stacking order, configure state machine (single in flight, ack matching; the decoration mode and a maximize/restore position travel with the configure and apply with the commit answering it) | `toplevel_manager`, `toplevel_record`, `toplevel_configure`, `decoration_mode` |
+| [`lx.compositor.decoration`](../modules/lx.compositor/decoration.cppm) | Server-side frames (Wayland-free): extents, frame rect and hit zones (title, close, resize bands with an invisible 8 px margin and corner precedence), the 64x64 atlas (baked colour swatches, close glyph, button circles), the frame scene node (the window container's underlay, 7–8 draws through the existing composite path), per-window title textures re-rasterized only when the title or its ellipsis cut changes, strip-only damage | `decoration_manager`, `frame_node`, `frame_extents`, `deco_zone`, `extents_for`, `frame_rect`, `deco_hit`, `build_deco_atlas` |
+| [`lx.compositor.wm`](../modules/lx.compositor/window_manager.cppm) | Window geometry (source of truth, clamped to the window's whole surface tree), placement and constraint of the whole frame within the usable area (`output_area` minus layer-shell exclusive zones: `usable_area`), maximize/unmaximize, configure flush (decoration configure included), hit-testing (popups, overlay and top layers, each window's tree then its frame zones, bottom and background layers), pointer focus (owning window + actual surface, or a frame zone)/keyboard focus resolution (exclusive layer surface, grabbing popup, on-demand layer surface, toplevel), implicit grab, stacking (one tree container per window), interactive move/resize grabs (client, shell, keybinding and frame presses share one executor) | `window_manager`, `wm_hit`, `hit_target`, `wm_grab`, `grab_mode`, `grab_source`, `effective_window_geometry`, `anchored_geometry`, `place_new_window`, `resize_target`, `edges_for_point` |
+| [`lx.compositor.shell_bridge`](../modules/lx.compositor/shell_bridge.cppm) | Shell protocol server: snapshot then `focus_changed` on bridge creation, deltas, inert handles | `shell_bridge`, snapshot/delta emitters |
+| [`lx.compositor.cursor`](../modules/lx.compositor/cursor_manager.cppm) | Pointer image and position: precedence (grab override → frame hover → client shape/surface/hidden → default), UI→render mailboxes, software-cursor scene node; the staging hook for every compositor-owned texture | `cursor_manager`, `cursor_frame`, `latest_value`, `cursor_node`, `compositor_texture_ops` |
 | [`lx.compositor.xcursor`](../modules/lx.compositor/xcursor.cppm) | Xcursor theme loader (`XCURSOR_THEME`/`XCURSOR_SIZE`/`XCURSOR_PATH`, `Inherits=`) and the built-in vector cursors rasterized at the requested size | `xcursor_theme`, `cursor_shape`, `parse_xcursor`, `rasterize_builtin` |
 | [`lx.compositor.output`](../modules/lx.compositor/output_manager.cppm) | Output present | `output_manager`, `present_mode` |
 | [`lx.portal`](../modules/lx.portal/lx.portal.cppm) | Flatpak portal (optional) | `desktop_portal`, `capability_token` |
@@ -136,10 +143,11 @@ lx.gfx         → damage, dmabuf, syncobj, import_cache
 lx.drm         → atomic (kms_damage, page_flip), cursor (kms_cursor_plane)
 lx.ui          → element, node, invalidate, reconcile, decorator, reducer,
                  events, style, theme.compile
-lx.compositor  → surface, toplevel, wm, shell_bridge, xcursor, cursor, output
+lx.compositor  → surface, surface_tree, positioner, popup, layer_shell, decoration, toplevel, wm, shell_bridge,
+                 xcursor, cursor, output
 lx.session     → privilege
 lx.scheduler   → presentation, budget
-lx.shell       → bridge
+lx.shell       → task_model, bridge, panel
 ```
 
 Generated protocol modules: `lx.wayland.protocols.*` (from `protocols/manifest.toml`).

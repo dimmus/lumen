@@ -4,16 +4,23 @@ sequenceDiagram
     participant Comp as lumen-compositor
 
     Shell->>Comp: bind zlm_shell_v1
+    Note over Comp: privilege check: same UID and /proc/pid/exe<br/>== configured shell binary, else wl_display error
     Comp->>Shell: capabilities(flags, version)
     Shell->>Comp: get_policy_bridge()
     Comp->>Shell: snapshot_begin
     Note over Comp: no snapshot_workspace / snapshot_output yet<br/>(no workspace objects; wl_output not per-client)
     Comp->>Shell: snapshot_toplevel (×N, new zlm_toplevel_v1, workspace=null)
     Comp->>Shell: snapshot_done
-    Note over Shell: Shell UI fully initialized
+    Comp->>Shell: focus_changed (the focused handle, or null)
+    Note over Shell: task model complete: the panel draws<br/>(never while a snapshot is in progress)
 
     Comp->>Shell: toplevel_created (new zlm_toplevel_v1, workspace=null)
     Comp->>Shell: toplevel_state + toplevel_geometry
     Comp->>Shell: toplevel_geometry (each committed size/position change)
+    Comp->>Shell: toplevel_state (title / app_id change)
+    Comp->>Shell: toplevel_destroyed (handle inert)
+    Shell->>Comp: zlm_toplevel_v1.destroy
+    Shell->>Bridge: request_raise + request_activate (panel click)
+    Comp->>Shell: focus_changed
     Shell->>Bridge: set_toplevel_stacking_index
     Comp->>Shell: stacking_order_changed (done=1)

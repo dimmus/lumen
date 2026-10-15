@@ -1,5 +1,7 @@
 #include <csignal>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 import lx.compositor;
 
@@ -22,6 +24,22 @@ int main(int argc, char* argv[]) {
             cfg.socket_name = arg;
         } else if (arg[1] == 'f' && arg[2] == '\0' && i + 1 < argc) {
             cfg.target_fps = std::atof(argv[++i]);
+        } else if (std::strcmp(arg, "--decorations=server") == 0) {
+            cfg.server_side_decorations = true;
+        } else if (std::strcmp(arg, "--decorations=client") == 0) {
+            // No xdg-decoration global: every client draws its own frame.
+            cfg.server_side_decorations = false;
+        } else if (std::strncmp(arg, "--decorations", 13) == 0) {
+            std::fprintf(stderr, "lumen-compositor: --decorations=server|client\n");
+            return 2;
+        } else if (std::strcmp(arg, "--shell") == 0) {
+            // The one binary zlm_shell_v1 binds are accepted from (default: lumen-shell
+            // next to this executable).
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "lumen-compositor: --shell PATH\n");
+                return 2;
+            }
+            cfg.shell_binary_path = argv[++i];
         }
     }
 

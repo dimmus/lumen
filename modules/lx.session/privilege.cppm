@@ -1,5 +1,7 @@
 module;
 
+#include <cstring>
+
 import lx.foundation;
 import lx.runtime;
 
@@ -32,6 +34,9 @@ class privilege_checker {
 public:
     explicit privilege_checker(shell_verification config = {});
 
+    /// `client_binary_path` is the peer's executable as the kernel names it
+    /// (`/proc/<pid>/exe`); it must equal `shell_binary_path` exactly, which the caller
+    /// resolves to a canonical absolute path once. Null (unknown) is a mismatch.
     [[nodiscard]] privilege_result check_shell_bind(const credentials& peer,
                                                     const char* client_binary_path,
                                                     const char* portal_token) const;
@@ -60,10 +65,9 @@ lx::session::privilege_checker::check_shell_bind(const credentials& peer,
         return privilege_result::denied_uid_mismatch;
     if (config_.require_flatpak_token && (!portal_token || portal_token[0] == '\0'))
         return privilege_result::denied_missing_portal_token;
-    if (client_binary_path && config_.shell_binary_path) {
-        // P0: real path comparison via /proc/self/exe or SO_PEERSEC
-        (void)client_binary_path;
-    }
+    if (config_.shell_binary_path &&
+        (!client_binary_path || std::strcmp(client_binary_path, config_.shell_binary_path) != 0))
+        return privilege_result::denied_binary_mismatch;
     (void)portal_token;
     return privilege_result::allowed;
 }
