@@ -95,9 +95,16 @@ lumen_add_module_library(lx.ui.builder modules/lx.ui.builder DEPENDS lx.ui)
 lumen_add_module_library(lx.shell.policy modules/lx.shell.policy
     DEPENDS lx.wayland.client lx.wayland.protocols)
 lumen_add_module_library(lx.compositor modules/lx.compositor
-    DEPENDS lx.wayland.server lx.gfx lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session)
+    DEPENDS lx.wayland.server lx.gfx lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session)
+# lumen-shell talks libwayland-client directly (lx.wayland.client is still a stub): the
+# zlm_shell_v1, wlr-layer-shell and cursor-shape client glue comes from lumen-protocol-glue.
 lumen_add_module_library(lx.shell modules/lx.shell
-    DEPENDS lx.shell.policy lx.ui lx.wayland.client)
+    DEPENDS lx.shell.policy lx.text lx.trace)
+lumen_link_platform_modules(lx.shell)
+if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
+    target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
+    target_compile_definitions(lx.shell PRIVATE LUMEN_SHELL_WAYLAND=1)
+endif()
 
 if(LUMEN_BUILD_XWAYLAND)
     lumen_add_module_library(lx.compositor.xwayland modules/lx.compositor.xwayland
@@ -218,6 +225,41 @@ if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
         endif()
         target_include_directories(lumen-square PRIVATE "${LUMEN_CLOUDS_GEN}")
         lumen_link_platform(lumen-square)
+
+        # Deterministic xdg_popup client for scripts/app-smoke.sh (group B).
+        if(LUMEN_BUILD_TESTS)
+            add_executable(lumen-probe
+                tests/clients/lumen-probe.cpp
+                "${LUMEN_CLOUDS_GEN}/xdg-shell-protocol.c"
+                "${LUMEN_CLOUDS_GEN}/xdg-shell-client-protocol.h"
+            )
+            target_include_directories(lumen-probe PRIVATE "${LUMEN_CLOUDS_GEN}")
+            lumen_link_platform(lumen-probe)
+            # Layer mode (group D): wlr-layer-shell client glue. Its get_popup takes an
+            # xdg_popup, whose interface comes from the xdg-shell code above.
+            set(LUMEN_LAYER_SHELL_XML "${CMAKE_SOURCE_DIR}/protocols/upstream/unstable/wlr-layer-shell-unstable-v1.xml")
+            if(EXISTS "${LUMEN_LAYER_SHELL_XML}")
+                add_custom_command(
+                    OUTPUT "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-client-protocol.h"
+                    COMMAND "${WAYLAND_SCANNER_EXE}" client-header "${LUMEN_LAYER_SHELL_XML}"
+                            "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-client-protocol.h"
+                    DEPENDS "${LUMEN_LAYER_SHELL_XML}"
+                    VERBATIM
+                )
+                add_custom_command(
+                    OUTPUT "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-protocol.c"
+                    COMMAND "${WAYLAND_SCANNER_EXE}" private-code "${LUMEN_LAYER_SHELL_XML}"
+                            "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-protocol.c"
+                    DEPENDS "${LUMEN_LAYER_SHELL_XML}"
+                    VERBATIM
+                )
+                target_sources(lumen-probe PRIVATE
+                    "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-protocol.c"
+                    "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-client-protocol.h"
+                )
+                target_compile_definitions(lumen-probe PRIVATE LUMEN_PROBE_HAS_LAYER_SHELL)
+            endif()
+        endif()
     else()
         message(STATUS "xdg-shell.xml not found — skipping lumen-clouds and lumen-square")
     endif()
@@ -278,6 +320,34 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_wm_geometry)
     target_include_directories(test_wm_geometry PRIVATE tests)
     add_test(NAME test_wm_geometry COMMAND test_wm_geometry)
+
+    add_executable(test_positioner tests/test_positioner.cpp)
+    target_link_libraries(test_positioner PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_positioner)
+    lumen_link_platform(test_positioner)
+    target_include_directories(test_positioner PRIVATE tests)
+    add_test(NAME test_positioner COMMAND test_positioner)
+
+    add_executable(test_decoration_geometry tests/test_decoration_geometry.cpp)
+    target_link_libraries(test_decoration_geometry PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_decoration_geometry)
+    lumen_link_platform(test_decoration_geometry)
+    target_include_directories(test_decoration_geometry PRIVATE tests)
+    add_test(NAME test_decoration_geometry COMMAND test_decoration_geometry)
+
+    add_executable(test_layer_arrange tests/test_layer_arrange.cpp)
+    target_link_libraries(test_layer_arrange PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_layer_arrange)
+    lumen_link_platform(test_layer_arrange)
+    target_include_directories(test_layer_arrange PRIVATE tests)
+    add_test(NAME test_layer_arrange COMMAND test_layer_arrange)
+
+    add_executable(test_surface_tree tests/test_surface_tree.cpp)
+    target_link_libraries(test_surface_tree PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_surface_tree)
+    lumen_link_platform(test_surface_tree)
+    target_include_directories(test_surface_tree PRIVATE tests)
+    add_test(NAME test_surface_tree COMMAND test_surface_tree)
 
     add_executable(test_xcursor tests/test_xcursor.cpp)
     target_link_libraries(test_xcursor PRIVATE lx.compositor)
@@ -358,6 +428,13 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_text_shaping PRIVATE tests)
     add_test(NAME test_text_shaping COMMAND test_text_shaping)
 
+    add_executable(test_text_raster tests/test_text_raster.cpp)
+    target_link_libraries(test_text_raster PRIVATE lx.text)
+    lumen_apply_module_properties(test_text_raster)
+    lumen_link_platform(test_text_raster)
+    target_include_directories(test_text_raster PRIVATE tests)
+    add_test(NAME test_text_raster COMMAND test_text_raster)
+
     add_executable(test_protocol_bind tests/test_protocol_bind.cpp)
     target_link_libraries(test_protocol_bind PRIVATE lx.compositor)
     lumen_apply_module_properties(test_protocol_bind)
@@ -365,6 +442,31 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_protocol_bind PRIVATE tests "${LUMEN_GENERATED_DIR}")
     add_test(NAME test_protocol_bind COMMAND test_protocol_bind)
     set_tests_properties(test_protocol_bind PROPERTIES TIMEOUT 30)
+
+    add_executable(test_task_model tests/test_task_model.cpp)
+    target_link_libraries(test_task_model PRIVATE lx.shell)
+    lumen_apply_module_properties(test_task_model)
+    lumen_link_platform(test_task_model)
+    target_include_directories(test_task_model PRIVATE tests)
+    add_test(NAME test_task_model COMMAND test_task_model)
+
+    # Compositor and lx.shell's bridge in one process: the shell side of zlm_policy_bridge_v1
+    # against the real server side, with the privilege check configured to accept this binary.
+    add_executable(test_shell_bridge tests/test_shell_bridge.cpp)
+    target_link_libraries(test_shell_bridge PRIVATE lx.compositor lx.shell)
+    lumen_apply_module_properties(test_shell_bridge)
+    lumen_link_platform(test_shell_bridge)
+    target_include_directories(test_shell_bridge PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_shell_bridge COMMAND test_shell_bridge)
+    set_tests_properties(test_shell_bridge PROPERTIES TIMEOUT 30)
+
+    add_executable(test_protocol_conformance tests/test_protocol_conformance.cpp)
+    target_link_libraries(test_protocol_conformance PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_protocol_conformance)
+    lumen_link_platform(test_protocol_conformance)
+    target_include_directories(test_protocol_conformance PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_protocol_conformance COMMAND test_protocol_conformance)
+    set_tests_properties(test_protocol_conformance PROPERTIES TIMEOUT 30)
 
     add_executable(test_kms_device tests/test_kms_device.cpp)
     target_link_libraries(test_kms_device PRIVATE lx.drm)
@@ -432,10 +534,13 @@ if(LUMEN_BUILD_TESTS)
         "LSAN_OPTIONS=detect_leaks=0"
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
-    set_tests_properties(test_result test_snapshot test_damage_region test_wm_geometry test_xcursor
+    set_tests_properties(test_result test_snapshot test_damage_region test_wm_geometry
+        test_surface_tree test_positioner test_layer_arrange test_xcursor
         test_import_cache bench_frame
         test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_input_keymap
-        test_headless_golden test_text_shaping test_protocol_bind test_kms_device test_kms_vkms
+        test_headless_golden test_text_shaping test_protocol_bind test_protocol_conformance
+        test_task_model test_shell_bridge
+        test_kms_device test_kms_vkms
         test_ui_reconcile test_gl_composite bench_composite
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
 

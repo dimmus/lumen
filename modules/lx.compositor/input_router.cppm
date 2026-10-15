@@ -61,6 +61,10 @@ public:
     [[nodiscard]] unsigned pointer_focus_generation() const { return pointer_focus_generation_; }
 
     void send_key(const lx::input::key_event& event, lx::input::seat& seat);
+    /// True when `serial` is the last key press delivered to `client` (`wl_client*`), or
+    /// the release of that same key — what xdg_popup.grab may quote for a keyboard-opened
+    /// menu (Mutter's rule: a toolkit may open the menu only once the key is released).
+    [[nodiscard]] bool is_key_grab_serial(unsigned serial, void* client) const;
     void send_modifiers(const lx::input::modifier_state& mods, lx::input::seat& seat);
     /// Surface-local position; also remembered for a `wl_pointer` created later, whose
     /// `enter` must carry where the pointer is on that surface.
@@ -107,6 +111,11 @@ private:
     unsigned pointer_enter_serials_[k_enter_serials]{};
     unsigned pointer_enter_count_ = 0;
     unsigned pointer_focus_generation_ = 0;
+    /// Last key press delivered, its key and its client; the release serial of that key.
+    unsigned last_key_press_serial_ = 0;
+    unsigned last_key_press_code_ = 0;
+    unsigned last_key_release_serial_ = 0;
+    void* last_key_client_ = nullptr;
 
     void note_enter_serial(unsigned serial);
     void clear_pointer_focus_state();
@@ -347,6 +356,14 @@ void lx::compositor::input_router::send_key(const lx::input::key_event& event,
     if (!keyboard_focus_)
         return;
     const unsigned serial = seat.next_serial();
+    if (event.pressed) {
+        last_key_press_serial_ = serial;
+        last_key_press_code_ = event.evdev_keycode;
+        last_key_release_serial_ = 0;
+        last_key_client_ = wl_resource_get_client(static_cast<wl_resource*>(keyboard_focus_));
+    } else if (event.evdev_keycode == last_key_press_code_) {
+        last_key_release_serial_ = serial;
+    }
     for (unsigned i = 0; i < keyboards_.count; ++i) {
         if (!resource_set::same_client(keyboards_.items[i], keyboard_focus_))
             continue;
@@ -359,6 +376,11 @@ void lx::compositor::input_router::send_key(const lx::input::key_event& event,
     (void)event;
     (void)seat;
 #endif
+}
+
+bool lx::compositor::input_router::is_key_grab_serial(unsigned serial, void* client) const {
+    return serial != 0 && client != nullptr && client == last_key_client_ &&
+           (serial == last_key_press_serial_ || serial == last_key_release_serial_);
 }
 
 void lx::compositor::input_router::send_modifiers(const lx::input::modifier_state& mods,

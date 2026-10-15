@@ -1,6 +1,7 @@
 module;
 
 #include <cstdint>
+#include <cstdio>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -10,6 +11,7 @@ module;
 #endif
 
 import lx.foundation;
+import lx.trace;
 import lx.wayland.server;
 
 export module lx.compositor:shell_bridge;
@@ -33,8 +35,10 @@ public:
     void set_toplevels(toplevel_manager* toplevels);
 
     /// A shell created its policy bridge. Replaces any previous bridge and sends the
-    /// snapshot batch (snapshot_begin … snapshot_done).
-    void on_bridge_bound(void* policy_bridge_resource);
+    /// snapshot batch (snapshot_begin … snapshot_done), then `focus_changed(focused)`: the
+    /// snapshot carries no focus, and without it a task list could highlight nothing until
+    /// the next focus change.
+    void on_bridge_bound(void* policy_bridge_resource, lx::toplevel_id focused);
     /// The bridge resource is being destroyed. Handles it introduced become inert.
     void on_bridge_destroyed(void* policy_bridge_resource);
     [[nodiscard]] bool has_bridge() const { return bridge_ != nullptr; }
@@ -166,10 +170,16 @@ void lx::compositor::shell_bridge::detach_all_handles() {
 #endif
 }
 
-void lx::compositor::shell_bridge::on_bridge_bound(void* resource) {
+void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_id focused) {
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
-    if (bridge_ && bridge_ != resource)
+    if (bridge_ && bridge_ != resource) {
+        // Only the configured shell binary gets here (the privilege check), so this is a
+        // second instance of it: the newest wins and the old one's handles go inert.
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.shell",
+                                        "bridge replaced: a second shell bound "
+                                        "zlm_policy_bridge_v1; the previous one goes inert");
         detach_all_handles();
+    }
     bridge_ = resource;
     if (!bridge_ || !toplevels_)
         return;
@@ -179,21 +189,52 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource) {
     // reason (see zlm_shell_v1.xml), so no snapshot_workspace is sent. snapshot_output is
     // skipped too: its wl_output is not nullable and this client may not have bound one.
     zlm_policy_bridge_v1_send_snapshot_begin(bridge);
+    // Creation order (toplevel ids only grow), each with its stacking index: a shell lists
+    // windows the way they appeared, and a restarted shell then shows the same order it
+    // built from deltas before — stacking order would reshuffle its task list. Once per
+    // bind, into fixed storage.
+    lx::toplevel_id ids[toplevel_manager::k_max];
     unsigned index = 0;
-    toplevels_->for_each_bottom_up([&](const toplevel_record& crec) {
-        auto& rec = *toplevels_->find_mut(crec.id);
-        void* handle = create_handle(rec);
+    toplevels_->for_each_bottom_up([&](const toplevel_record& rec) {
+        if (index < toplevel_manager::k_max)
+            ids[index++] = rec.id;
+    });
+    for (unsigned i = 1; i < index; ++i)
+        for (unsigned j = i; j > 0 && ids[j].id() < ids[j - 1].id(); --j) {
+            const lx::toplevel_id t = ids[j];
+            ids[j] = ids[j - 1];
+            ids[j - 1] = t;
+        }
+    for (unsigned i = 0; i < index; ++i) {
+        auto* rec = toplevels_->find_mut(ids[i]);
+        void* handle = rec ? create_handle(*rec) : nullptr;
         if (handle) {
             zlm_policy_bridge_v1_send_snapshot_toplevel(
-                bridge, static_cast<wl_resource*>(handle), nullptr, rec.app_id, rec.title,
-                wire_state(rec.state), rec.geometry.x, rec.geometry.y, rec.geometry.width,
-                rec.geometry.height, index);
+                bridge, static_cast<wl_resource*>(handle), nullptr, rec->app_id, rec->title,
+                wire_state(rec->state), rec->geometry.x, rec->geometry.y, rec->geometry.width,
+                rec->geometry.height, toplevels_->stacking_index(rec->id));
         }
-        ++index;
-    });
+    }
     zlm_policy_bridge_v1_send_snapshot_done(bridge);
+    // A delta valid in v1, sent at once so the shell starts with the focus as it is.
+    const toplevel_record* rec = focused ? toplevels_->find(focused) : nullptr;
+    zlm_policy_bridge_v1_send_focus_changed(
+        bridge, rec && rec->shell_handle ? static_cast<wl_resource*>(rec->shell_handle)
+                                         : nullptr);
+
+    {
+        unsigned cid = 0;
+        if (server_)
+            if (auto* conn = server_->find_client_by_native(wl_resource_get_client(bridge)))
+                cid = conn->id();
+        char line[128];
+        std::snprintf(line, sizeof(line), "bridge bound client=%u snapshot=%u focus=%llu", cid,
+                      index, rec && rec->shell_handle ? rec->id.id() : 0ull);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.shell", line);
+    }
 #else
     (void)resource;
+    (void)focused;
 #endif
 }
 
@@ -202,6 +243,8 @@ void lx::compositor::shell_bridge::on_bridge_destroyed(void* resource) {
         return;
     detach_all_handles();
     bridge_ = nullptr;
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.shell",
+                                    "bridge destroyed");
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {

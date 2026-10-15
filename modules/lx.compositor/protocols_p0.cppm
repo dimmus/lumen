@@ -14,11 +14,15 @@ export module lx.compositor:protocols_p0;
 import :input_router;
 import :shell_bridge;
 import :surface;
+import :surface_tree;
 import :toplevel;
 import :output;
 import :buffer_lifecycle;
 import :wm;
+import :popup;
 import :cursor;
+import :decoration;
+import :layer_shell;
 
 export namespace lx::compositor {
 
@@ -65,6 +69,12 @@ struct texture_update {
     /// this texture. Applying the forget before that frame has been composited drops a
     /// texture an in-flight snapshot still draws. See `drain_texture_updates`.
     unsigned retire_after_frame = 0;
+    /// Index of the first snapshot allowed to see this update: the one being built when it
+    /// was queued (`p0_protocol_context::building_frame`). The render thread holds back
+    /// every update, and every later one (FIFO), until it composites a snapshot at least
+    /// this new — otherwise a re-committed buffer would show its new pixels under the
+    /// previous snapshot's geometry, a parent/child mismatch inside one frame.
+    unsigned visible_from_frame = 0;
 };
 
 using texture_update_queue = lx::sync::spsc_queue<texture_update, 256>;
@@ -93,7 +103,7 @@ private:
     std::atomic<unsigned long long> consumed_{0};
 };
 
-/// Per-surface staging for shm pixels, used by the CPU composite path.
+/// Per-texture staging for shm pixels, used by the CPU and GL composite paths.
 ///
 /// `shm_staging_ring` is a single FIFO shared by every surface, which is right when the
 /// consumer copies the pixels out during the drain (the Vulkan upload does). The CPU
@@ -104,9 +114,15 @@ private:
 /// Two slots per texture: the UI thread stages the next commit into one while the render
 /// thread still reads the other. A client that runs more than one commit ahead of the
 /// present is told to wait (`acquire` returns nullptr) rather than served a slot in flight.
+///
+/// GL uploads during the drain and releases the slot right after, so for it this is only
+/// isolation: one busy client cannot exhaust a global ring and starve another's commits,
+/// which is what an 8-slot FIFO did as soon as a CSD client committed nine subsurfaces in
+/// one frame. The cost is a staging copy per live shm texture instead of 8 shared slots.
 class shm_pixel_store {
 public:
-    static constexpr unsigned k_max_textures = 64;
+    /// Matches the GL and CPU compositors' texture tables.
+    static constexpr unsigned k_max_textures = 256;
     static constexpr unsigned k_slots = 2;
 
     /// UI affinity. Writable storage of `bytes` for `texture_id`, or nullptr when both
@@ -143,26 +159,48 @@ struct p0_protocol_context {
     /// Compositor → shell state sync over zlm_policy_bridge_v1.
     shell_bridge* shell = nullptr;
     surface_manager* surfaces = nullptr;
+    /// Subsurface parentage, cached child state and each root's scene container.
+    surface_tree* tree = nullptr;
     toplevel_manager* toplevels = nullptr;
+    /// xdg_popup records, placement, grab and dismissal. Receives its wire ops from
+    /// `install_p0_protocols`.
+    popup_manager* popups = nullptr;
+    /// wlr-layer-shell records, arrangement and exclusive zones. Receives its wire ops from
+    /// `install_p0_protocols`.
+    layer_shell* layers = nullptr;
     /// Window placement, configure flow and focus. Receives its wire ops from
     /// `install_p0_protocols`.
     window_manager* wm = nullptr;
     /// Pointer image: wl_pointer.set_cursor, wp_cursor_shape_v1 and cursor-role commits
     /// land here. Receives its texture-staging hook from `install_p0_protocols`.
     cursor_manager* cursor = nullptr;
+    /// Server-side frames: title changes and the decoration mode reach it through the window
+    /// manager; it receives its texture-staging hook from `install_p0_protocols`.
+    decoration_manager* decorations = nullptr;
+    /// Advertise zxdg_decoration_manager_v1 (`config::server_side_decorations`).
+    bool server_side_decorations = true;
     output_manager* outputs = nullptr;
     gfx::headless_backend* headless = nullptr;
     gfx::dmabuf_importer* dmabuf = nullptr;
     texture_update_queue* textures = nullptr;
     buffer_lifecycle_tracker* lifecycle = nullptr;
     shm_staging_ring* shm_staging = nullptr;
-    /// Set instead of `shm_staging` when the CPU composite path is active.
+    /// Set instead of `shm_staging` when the CPU or GL composite path is active.
     shm_pixel_store* shm_store = nullptr;
+    /// dev_t sent as zwp_linux_dmabuf_feedback_v1.main_device and tranche target: the
+    /// render node of the KMS device. 0 when there is none (headless).
+    unsigned long long dmabuf_main_device = 0;
 
     /// UI affinity. The frame index currently being built, refreshed by `tick_ui`. Used to
     /// date a texture retirement so the render thread can tell which in-flight snapshots
     /// might still draw it.
     unsigned frame_index = 0;
+    /// UI affinity. Index of the next snapshot to be published — the first one that may
+    /// show what is committed now. `tick_ui` sets it to the tick's frame before dispatch
+    /// and to the one after once that frame is published (commits dispatched between ticks
+    /// belong to the next snapshot); a dropped publish leaves it, since its damage — and so
+    /// its visibility — carries forward. Every queued texture update is stamped with it.
+    unsigned building_frame = 0;
 
     /// Stage shm pixels in the client's own channel order instead of converting them to
     /// RGBA. The Vulkan composite path samples RGBA textures, so it needs the conversion;

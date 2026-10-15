@@ -181,11 +181,42 @@ tree in a coherent state.
    geometry; a client that disconnects or unmaps mid-grab ends it. Pointer-to-present
    latency is logged per present (`compositor.latency`, debug).
 
+   **Subsurfaces (done).** `wl_subcompositor`/`wl_subsurface` are real
+   (`lx.compositor:surface_tree`): position and `place_above`/`place_below` are
+   double-buffered on the parent, synchronized children's content is cached and applied
+   atomically with the parent's (same UI call, same snapshot, texture updates held back to
+   that snapshot), `set_desync` and a parent going away apply what was cached, every
+   protocol error (`bad_surface`, `bad_parent`, `wl_subsurface.bad_surface`,
+   `wl_surface.defunct_role_object`) is posted, and every destruction order is safe. Each
+   window's tree is one scene container flattened in paint order; the hit test walks it
+   top-down, each surface clipped to its own extents and input region, and pointer focus
+   follows the actual surface (a CSD title bar receives the press and its motion). Window
+   geometry is clamped to the whole tree. foot's and alacritty's client-side frames, and
+   GTK 4, now render (`scripts/app-smoke.sh` group A).
+
+   **Popups (done).** `xdg_positioner` and `xdg_popup` are real
+   (`lx.compositor:positioner`, `lx.compositor:popup`): the positioner rules are validated
+   (`invalid_input`) and placed with the spec's precedence flip → slide → resize against
+   the usable area (the whole output for a layer surface's popups), parent-relative, honouring
+   `set_parent_size`/`set_parent_configure` and `reactive`; configures and `reposition`
+   (v3) apply at the commit after the ack, so a popup moves in the same snapshot as its new
+   content; every popup is the root of its own surface tree in a popup layer above every
+   window and below the cursor, hit before the windows. The grab is a stack of one client's
+   grabbing popups: the serial must be that client's last button or key press (stricter
+   than wlroots, as Mutter and Smithay), pointer events are owner-events, a press outside
+   the client dismisses the chain top-down and is consumed, the topmost mapped grabbing
+   popup has the keyboard while its window stays activated, and an interactive move/resize
+   or activating another client's window ends the grab. Every xdg-shell error on the popup
+   path is posted (`invalid_positioner`, `invalid_popup_parent`, `not_the_topmost_popup`,
+   `defunct_surfaces`, `invalid_grab`, `unconfigured_buffer`, `invalid_serial`,
+   `defunct_role_object`). GTK 4 menus, context menus and popovers work
+   (`scripts/app-smoke.sh` group B).
+
    **Not yet:**
    - Focus as the shell's decision, in place of the placeholder defaults.
    - Hit-testing across several outputs. It uses output 0's coordinate space until D5's
      per-output loop.
-   - Subsurfaces and popups in the hit test, since both are still stubs.
+   - Touch: a popup grab can only be taken with a pointer or keyboard serial.
 
 *Done when:* a real client receives a keystroke and a click, and `wev`/`weston-info` show a
 correct seat. This is the milestone that turns Lumen from a renderer into a compositor.
@@ -210,14 +241,63 @@ someone types into it.
    global that mysteriously does not exist. Requests whose compositor-side action does not
    exist yet (maximize/fullscreen/minimize, workspace objects, rule persistence) accept and
    do nothing, so the shell can bind and drive what does work instead of failing at bind.
-6. [ ] **wlr-layer-shell.** Next. Without it there is no panel, dock, wallpaper,
-   notification or OSD — the shell has nowhere to put anything.
+   - [x] **A real `lumen-shell`** consumes it. A one-thread libwayland-client process
+     (`ppoll` on the display fd and a signalfd; no timers) binds `zlm_shell_v1`, keeps a task
+     model from the snapshot and deltas (`lx.shell:task_model`), and draws a 32 px top
+     panel through layer-shell (`lx.shell:panel`): one entry per window with its title, the
+     focused one highlighted; a click sends `request_raise` + `request_activate`; entries
+     follow create/destroy/title/focus live, repainting and damaging only the entries that
+     changed. The compositor now sends `capabilities` on bind and `focus_changed` right
+     after `snapshot_done` (no XML change), logs every bridge request with its result, and
+     **enforces the binary half of the privilege model**: the peer's `/proc/<pid>/exe` must
+     be the configured shell (`--shell PATH`, default `lumen-shell` next to the
+     compositor), so another same-UID client can no longer bind the global and replace the
+     shell's bridge (`scripts/app-smoke.sh` group E, `test_shell_bridge`,
+     `test_task_model`). A restarted shell gets a fresh snapshot. Found on the way: the
+     Wayland server's per-client destroy listener was indexed by a slot that compaction
+     moves, so out-of-order disconnects corrupted a client's destroy list and the
+     compositor could spin forever in it (shell restarts hit it); fixed, with a regression
+     case in `test_protocol_conformance`. Not yet: workspaces, a launcher, a clock or tray,
+     minimize (no compositor side), the shell owning focus policy.
+6. [x] **wlr-layer-shell** (v5, `lx.compositor:layer_shell`). Panels, docks, wallpapers,
+   notifications and OSDs now have somewhere to go. Every layer surface roots a surface tree
+   in one of four layer containers (background and bottom under the windows, top and
+   overlay above them, all under the popup layer). Arrangement is wlroots' (two passes,
+   exclusive zones first, zone -1 against the whole output) with two deliberate deviations:
+   a smaller committed size is centred between opposite anchors (the spec's text) and a zone
+   counts only once mapped. The usable area it leaves drives placement, move constraints,
+   `configure_bounds`, window popups and the new **maximize** (`xdg_toplevel.set_maximized`,
+   the bridge's `request_maximize`, a title-bar double click; position, size, state and
+   frame extents apply with the answering commit; maximized windows follow usable-area
+   changes; `wm_capabilities` lists maximize). Keyboard interactivity is exact: `exclusive`
+   on top/overlay takes every key (only its own popups can take them back), `on_demand` is
+   focused by a click, `none` never, and popups of a `none` surface grab without the
+   keyboard. Layer popups (`get_popup`) are constrained to the whole output. Every
+   layer-shell error is posted with the spec's code (`role`, `invalid_layer`,
+   `already_constructed`, `invalid_size`, `invalid_anchor`,
+   `invalid_keyboard_interactivity`, `invalid_exclusive_edge`, `invalid_surface_state`)
+   (`scripts/app-smoke.sh` group D). Not yet: several outputs (every layer surface is on
+   output 0 until D5, and `output_gone` is never sent), drag-to-restore a maximized window,
+   fullscreen.
 7. **ext-session-lock.** Security-critical and easy to get subtly wrong: the lock surface
    must survive a crashing locker, and input must not leak to normal clients while locked.
 8. **xdg-decoration, xdg-activation, xdg-output, primary-selection.** The unglamorous set
    that makes real applications behave.
+   - [x] **xdg-decoration** (v2): foot and alacritty negotiate server-side and get a Lumen
+     frame — title bar with the client's title (ellipsized when narrow), close button,
+     1 px borders with an invisible 8 px resize band — whose presses drive the same grab
+     executor as `xdg_toplevel.move/resize`; middle-click on the title lowers. A client that
+     insists on `client_side` (GTK, `foot -o csd.preferred=client`) keeps its own frame;
+     `--decorations=client` withdraws the global. The mode applies with the commit
+     answering its configure (frame-perfect). Text comes from `lx.text`'s new single-line
+     rasterizer (HarfBuzz + FreeType into a cached texture); missing glyphs render as the
+     face's .notdef until font fallback (step 14). A title double click maximizes (step 6).
+     Not yet: a window menu (right-click), drag-to-restore a maximized window, theming.
+   - [ ] xdg-activation, xdg-output, primary-selection.
 
 *Done when:* `lumen-shell` draws a panel, switches workspaces, and locks the session.
+Status: the panel — yes (task list over the bridge, step 5). Workspaces — not yet (no
+`zlm_workspace_v1` objects exist). Session lock — not yet (step 7, not started).
 
 ### Phase 2 — Cash in the pipeline work
 

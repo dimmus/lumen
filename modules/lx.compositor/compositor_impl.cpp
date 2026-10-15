@@ -16,8 +16,11 @@ module;
 #include <utility>
 
 #if defined(__linux__)
+#include <dirent.h>
 #include <linux/sync_file.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #endif
 
 import lx.foundation;
@@ -42,14 +45,30 @@ struct compositor_impl {
 
     wayland::server wayland{};
     surface_manager surfaces{};
+    /// UI affinity. Subsurface trees and each root's scene container — see `:surface_tree`.
+    surface_tree tree_{};
     toplevel_manager toplevels{};
     shell_bridge shell_bridge_;
     cursor_manager cursor_{};
     scene::scene_graph scene{};
-    /// Paint order under the scene root: client windows, then compositor overlays (the
-    /// software cursor) which must draw above every window.
+    /// Paint order under the scene root, bottom→top (sway's): layer-shell background and
+    /// bottom, the windows, layer-shell top and overlay, every popup, then the software
+    /// cursor. Popups sit above the overlay layer so no panel or window ever covers a menu.
+    /// The four layer-shell containers hold layer surfaces' tree containers (`:layer_shell`).
+    scene::container_node background_layer_{};
+    scene::container_node bottom_layer_{};
     scene::container_node windows_layer_{};
-    scene::container_node overlay_layer_{};
+    scene::container_node top_layer_{};
+    scene::container_node overlay_shell_layer_{};
+    scene::container_node popup_layer_{};
+    scene::container_node cursor_layer_{};
+    /// UI affinity. xdg_popup placement, grab and dismissal — see `:popup`.
+    popup_manager popups_{};
+    /// UI affinity. wlr-layer-shell surfaces, arrangement, exclusive zones — see
+    /// `:layer_shell`.
+    layer_shell layers_{};
+    /// UI affinity. Server-side frames (xdg-decoration) — see `:decoration`.
+    decoration_manager decorations_{};
     /// UI affinity. Window geometry, configure flow and focus — see `:wm`.
     window_manager wm_{};
     gfx::device graphics{};
@@ -149,6 +168,15 @@ struct compositor_impl {
     /// the first frame completes.
     std::atomic<long long> last_rendered_frame_{-1};
     texture_update_queue texture_updates_{};
+    /// Render affinity. Updates popped from `texture_updates_` that belong to a snapshot
+    /// newer than the one being composited (`texture_update::visible_from_frame`), oldest
+    /// first. Everything behind the first such update waits too, so FIFO order holds across
+    /// a forget and a re-registration of the same id.
+    static constexpr unsigned k_deferred_updates = 256;
+    texture_update deferred_updates_[k_deferred_updates]{};
+    unsigned deferred_head_ = 0;
+    unsigned deferred_count_ = 0;
+    bool warned_deferred_full_ = false;
     shm_staging_ring shm_staging_{};
     shm_pixel_store shm_store_{};
 
@@ -338,10 +366,16 @@ struct compositor_impl {
           buffer_lifecycle_{import_cache},
           memory_{c.memory}, budget_{c.hot_path} {
         scene.snapshots().set_config(c.snapshot);
+        (void)scene.root().add(&background_layer_);
+        (void)scene.root().add(&bottom_layer_);
         (void)scene.root().add(&windows_layer_);
-        (void)scene.root().add(&overlay_layer_);
+        (void)scene.root().add(&top_layer_);
+        (void)scene.root().add(&overlay_shell_layer_);
+        (void)scene.root().add(&popup_layer_);
+        (void)scene.root().add(&cursor_layer_);
         surfaces.set_import_cache(&import_cache);
-        surfaces.set_scene(&scene, &windows_layer_);
+        surfaces.set_scene(&scene);
+        tree_.bind(surfaces, scene);
         shell_bridge_.set_toplevels(&toplevels);
         for (auto& slot : slot_age_damage_)
             slot.set_full();
@@ -352,6 +386,12 @@ struct compositor_impl {
 
     ~compositor_impl() {
         delete[] blits_;
+        // A deferred dma-buf update still owns the fd the UI thread duplicated for it.
+        for (unsigned i = 0; i < deferred_count_; ++i) {
+            texture_update& u = deferred_updates_[(deferred_head_ + i) % k_deferred_updates];
+            if (u.dmabuf_fd >= 0)
+                ::close(u.dmabuf_fd);
+        }
         if (const int fd = committed_fence_fd_.exchange(-1); fd >= 0)
             ::close(fd);
     }
@@ -385,8 +425,11 @@ struct compositor_impl {
     void on_scanout_flip(unsigned slot);
     static void presentation_flip_handler(scheduler::presentation_feedback fb, void* user_data);
 
-    /// Render-affinity only: apply queued client-buffer updates before compositing.
-    void drain_texture_updates();
+    /// Render-affinity only: apply queued client-buffer updates before compositing the
+    /// snapshot of `frame` — only those that snapshot may show (see `deferred_updates_`).
+    void drain_texture_updates(unsigned frame);
+    /// Render-affinity only: one update, applied now.
+    void apply_texture_update(texture_update& update);
     /// Render-affinity only: bring up the GPU composite target and its scanout FB.
     [[nodiscard]] lx::result<void> setup_vulkan_present();
     /// Bring up CPU-writable dumb-buffer scanout. Requires DRM master.
@@ -781,15 +824,67 @@ void compositor_impl::drm_fd_callback() {
     active->kms_atomic.dispatch_events();
 }
 
+/// dev_t clients should allocate dma-bufs on (zwp_linux_dmabuf_feedback_v1.main_device):
+/// the render node of the KMS card when it has one, else the card itself; 0 without DRM.
+/// Startup-only sysfs I/O.
+[[nodiscard]] static unsigned long long dmabuf_main_device(int card_fd) {
+#if defined(__linux__)
+    struct stat st {};
+    if (card_fd < 0 || ::fstat(card_fd, &st) != 0 || !S_ISCHR(st.st_mode))
+        return 0;
+    char dir[96];
+    std::snprintf(dir, sizeof(dir), "/sys/dev/char/%u:%u/device/drm", major(st.st_rdev),
+                  minor(st.st_rdev));
+    if (DIR* d = ::opendir(dir)) {
+        unsigned long long found = 0;
+        while (const dirent* e = ::readdir(d)) {
+            if (std::strncmp(e->d_name, "renderD", 7) != 0)
+                continue;
+            char node[64];
+            std::snprintf(node, sizeof(node), "/dev/dri/%s", e->d_name);
+            struct stat rs {};
+            if (::stat(node, &rs) == 0 && S_ISCHR(rs.st_mode)) {
+                found = rs.st_rdev;
+                break;
+            }
+        }
+        ::closedir(d);
+        if (found)
+            return found;
+    }
+    return st.st_rdev;
+#else
+    (void)card_fd;
+    return 0;
+#endif
+}
+
 void compositor_impl::register_p0_globals() {
     p0_.server = &wayland;
+    if (drm_present_)
+        p0_.dmabuf_main_device = dmabuf_main_device(kms.card_fd());
     p0_.surfaces = &surfaces;
     p0_.input = &input_router_;
     p0_.seat = &input_devices_.default_seat();
     p0_.shell = &shell_bridge_;
     p0_.toplevels = &toplevels;
-    wm_.bind(toplevels, surfaces, scene, windows_layer_, input_router_,
+    p0_.tree = &tree_;
+    wm_.bind(toplevels, surfaces, tree_, scene, windows_layer_, input_router_,
              input_devices_.default_seat(), shell_bridge_, outputs);
+    popups_.bind(toplevels, surfaces, tree_, popup_layer_);
+    wm_.set_popups(&popups_);
+    p0_.popups = &popups_;
+    {
+        scene::container_node* const containers[k_layer_levels] = {
+            &background_layer_, &bottom_layer_, &top_layer_, &overlay_shell_layer_};
+        layers_.bind(surfaces, tree_, containers);
+    }
+    wm_.set_layers(&layers_);
+    p0_.layers = &layers_;
+    decorations_.bind(tree_, scene);
+    wm_.set_decorations(&decorations_);
+    p0_.decorations = &decorations_;
+    p0_.server_side_decorations = cfg.server_side_decorations;
     p0_.wm = &wm_;
     wm_.set_cursor(&cursor_);
     p0_.cursor = &cursor_;
@@ -800,19 +895,28 @@ void compositor_impl::register_p0_globals() {
     p0_.lifecycle = &buffer_lifecycle_;
     // Exactly one staging strategy: the CPU path samples staged rows in place during the
     // composite, which a shared FIFO cannot keep alive that long (see shm_pixel_store).
-    // GL copies the pixels out during the drain, like Vulkan, so it uses the ring — and it
-    // uploads RGBA, so it wants the same conversion.
+    // GL copies the pixels out during the drain, but still stages per texture: a global
+    // 8-slot ring starves as soon as one client commits more surfaces than that in a frame
+    // (a CSD client's subsurfaces alone do), and the dropped update never shows. GL uploads
+    // RGBA, so it wants the conversion. Vulkan keeps the ring.
     if (cpu_present_) {
         p0_.shm_store = &shm_store_;
         p0_.shm_staging = nullptr;
         // Scanout is XR24, so keeping the client's channel order means an unscaled opaque
         // surface reaches the display with no conversion pass at all.
         p0_.shm_native_format = true;
+    } else if (gl_present_) {
+        p0_.shm_store = &shm_store_;
+        p0_.shm_staging = nullptr;
+        p0_.shm_native_format = false;
     } else {
         p0_.shm_staging = &shm_staging_;
         p0_.shm_store = nullptr;
         p0_.shm_native_format = false;
     }
+    // GL imports client dma-bufs on the render thread, where its context lives (an EGLImage
+    // per commit); the UI-side Vulkan import cache is only for the Vulkan path.
+    surfaces.set_render_thread_import(gl_present_);
     buffer_lifecycle_.set_release_callback(&release_wl_buffer_resource, nullptr);
     protocols_.set_surface_manager(&surfaces);
     if (auto installed = install_p0_protocols(p0_); !installed) {
@@ -905,93 +1009,137 @@ void compositor_impl::apply_due_forgets(unsigned composited_frame) {
     }
 }
 
-void compositor_impl::drain_texture_updates() {
+void compositor_impl::drain_texture_updates(unsigned frame) {
     // Always drain, even without a Vulkan target: leaving entries queued would stall the
     // staging ring and starve the UI thread of slots.
+    //
+    // Signed difference, not `<`: frame indices only advance, so this survives the wrap.
+    const auto too_new = [frame](const texture_update& u) {
+        return static_cast<int>(u.visible_from_frame - frame) > 0;
+    };
+
+    // Held-back updates first, in order, up to the first one this snapshot may not show.
+    while (deferred_count_ > 0) {
+        texture_update& held = deferred_updates_[deferred_head_];
+        if (too_new(held))
+            break;
+        apply_texture_update(held);
+        held = {};
+        deferred_head_ = (deferred_head_ + 1) % k_deferred_updates;
+        --deferred_count_;
+    }
+
     texture_update update{};
     while (texture_updates_.try_pop(update)) {
-        lx::result<void> applied{};
-        switch (update.kind) {
-        case texture_update::op::dmabuf: {
-            // Owns the FD the UI thread duplicated, so it is closed however this branch
-            // exits — including when no backend wants it.
-            gfx::dmabuf_desc desc{};
-            if (update.dmabuf_fd >= 0) {
-                desc.width = update.width;
-                desc.height = update.height;
-                desc.format = update.format;
-                desc.plane_count = 1;
-                desc.planes[0].fd.reset(update.dmabuf_fd);
-                desc.planes[0].offset = update.dmabuf_offset;
-                desc.planes[0].stride = update.dmabuf_stride;
-                desc.planes[0].modifier = update.dmabuf_modifier;
-            }
-
-            if (vulkan_present_) {
-                gfx::imported_image image{};
-                image.image_id = update.texture_id;
-                image.width = update.width;
-                image.height = update.height;
-                image.format = update.format;
-                image.vk_image = update.vk_image;
-                image.vk_memory = update.vk_memory;
-                applied = vk_compositor_.bind_imported(image);
-            } else if (gl_present_ && desc.plane_count > 0) {
-                // The whole point of the GL path: the client's buffer is sampled where it
-                // already lives, so a window costs a textured quad and no upload at all.
-                applied = gl_compositor_.import_dmabuf(update.texture_id, desc);
-            }
-            break;
+        if (deferred_count_ == 0 && !too_new(update)) {
+            apply_texture_update(update);
+            continue;
         }
-        case texture_update::op::shm:
-            if (cpu_present_) {
-                // No upload: the CPU compositor samples the staged rows in place, so the
-                // pixels are read exactly once, during the composite itself.
-                gfx::pixel_surface src{};
-                src.pixels = const_cast<unsigned char*>(update.pixels);
-                src.width = update.width;
-                src.height = update.height;
-                src.stride = update.stride ? update.stride : update.width * 4u;
-                src.format = update.format;
-                applied = cpu_compositor_.register_texture(update.texture_id, src);
-                if (applied)
-                    hold_shm_slot(update.texture_id, update.shm_token);
-                else
-                    shm_store_.release(update.shm_token);
-            } else if (gl_present_) {
-                applied = gl_compositor_.upload_rgba(update.texture_id, update.width,
-                                                     update.height, update.pixels, update.stride);
-                shm_staging_.publish_consumed(update.shm_seq);
-            } else if (vulkan_present_) {
-                applied = vk_compositor_.upload_rgba(update.texture_id, update.width,
-                                                     update.height, update.pixels);
-                // The ring slot is free the moment the upload has been recorded.
-                shm_staging_.publish_consumed(update.shm_seq);
-            } else {
-                shm_staging_.publish_consumed(update.shm_seq);
-                shm_store_.release(update.shm_token);
+        if (deferred_count_ == k_deferred_updates) {
+            // Out of room: applying early beats dropping. The oldest goes first, so order
+            // still holds; the cost is a frame that may show new pixels a frame early.
+            if (!warned_deferred_full_) {
+                warned_deferred_full_ = true;
+                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
+                                                "texture update deferral full — applying "
+                                                "ahead of its snapshot. Reported once.");
             }
-            break;
-        case texture_update::op::forget:
-            // Deferred, not applied: a snapshot published before the buffer was destroyed
-            // may still be waiting to composite, and it draws this texture by id. Dropping
-            // it now costs a warning on the Vulkan path — and on the CPU path it frees the
-            // staging slot the draw is still reading from.
-            queue_forget(update.texture_id, update.retire_after_frame);
-            break;
-        case texture_update::op::none:
-            break;
+            texture_update& oldest = deferred_updates_[deferred_head_];
+            apply_texture_update(oldest);
+            oldest = {};
+            deferred_head_ = (deferred_head_ + 1) % k_deferred_updates;
+            --deferred_count_;
         }
-        if (!applied)
-            lx::trace::logger::global().log_error(applied.get_error(), "compositor.render");
-
-        if (update.kind == texture_update::op::shm)
-            trace_texture_op("upload", update.texture_id, static_cast<bool>(applied));
-        else if (update.kind == texture_update::op::dmabuf)
-            trace_texture_op("import", update.texture_id, static_cast<bool>(applied));
-        else if (update.kind == texture_update::op::forget)
-            trace_texture_op("retire-queued", update.texture_id, true);
+        deferred_updates_[(deferred_head_ + deferred_count_) % k_deferred_updates] = update;
+        ++deferred_count_;
     }
+}
+
+void compositor_impl::apply_texture_update(texture_update& update) {
+    lx::result<void> applied{};
+    switch (update.kind) {
+    case texture_update::op::dmabuf: {
+        // Owns the FD the UI thread duplicated, so it is closed however this branch
+        // exits — including when no backend wants it.
+        gfx::dmabuf_desc desc{};
+        if (update.dmabuf_fd >= 0) {
+            desc.width = update.width;
+            desc.height = update.height;
+            desc.format = update.format;
+            desc.plane_count = 1;
+            desc.planes[0].fd.reset(update.dmabuf_fd);
+            desc.planes[0].offset = update.dmabuf_offset;
+            desc.planes[0].stride = update.dmabuf_stride;
+            desc.planes[0].modifier = update.dmabuf_modifier;
+        }
+
+        if (vulkan_present_) {
+            gfx::imported_image image{};
+            image.image_id = update.texture_id;
+            image.width = update.width;
+            image.height = update.height;
+            image.format = update.format;
+            image.vk_image = update.vk_image;
+            image.vk_memory = update.vk_memory;
+            applied = vk_compositor_.bind_imported(image);
+        } else if (gl_present_ && desc.plane_count > 0) {
+            // The whole point of the GL path: the client's buffer is sampled where it
+            // already lives, so a window costs a textured quad and no upload at all.
+            applied = gl_compositor_.import_dmabuf(update.texture_id, desc);
+        }
+        break;
+    }
+    case texture_update::op::shm:
+        if (cpu_present_) {
+            // No upload: the CPU compositor samples the staged rows in place, so the
+            // pixels are read exactly once, during the composite itself.
+            gfx::pixel_surface src{};
+            src.pixels = const_cast<unsigned char*>(update.pixels);
+            src.width = update.width;
+            src.height = update.height;
+            src.stride = update.stride ? update.stride : update.width * 4u;
+            src.format = update.format;
+            applied = cpu_compositor_.register_texture(update.texture_id, src);
+            if (applied)
+                hold_shm_slot(update.texture_id, update.shm_token);
+            else
+                shm_store_.release(update.shm_token);
+        } else if (gl_present_) {
+            applied = gl_compositor_.upload_rgba(update.texture_id, update.width,
+                                                 update.height, update.pixels, update.stride);
+            // glTexImage2D/glTexSubImage2D copy out of client memory before returning,
+            // so the staging slot is free again right away.
+            shm_store_.release(update.shm_token);
+            shm_staging_.publish_consumed(update.shm_seq);
+        } else if (vulkan_present_) {
+            applied = vk_compositor_.upload_rgba(update.texture_id, update.width,
+                                                 update.height, update.pixels);
+            // The ring slot is free the moment the upload has been recorded.
+            shm_staging_.publish_consumed(update.shm_seq);
+        } else {
+            shm_staging_.publish_consumed(update.shm_seq);
+            shm_store_.release(update.shm_token);
+        }
+        break;
+    case texture_update::op::forget:
+        // Deferred, not applied: a snapshot published before the buffer was destroyed
+        // may still be waiting to composite, and it draws this texture by id. Dropping
+        // it now costs a warning on the Vulkan path — and on the CPU path it frees the
+        // staging slot the draw is still reading from.
+        queue_forget(update.texture_id, update.retire_after_frame);
+        break;
+    case texture_update::op::none:
+        break;
+    }
+    if (!applied)
+        lx::trace::logger::global().log_error(applied.get_error(), "compositor.render");
+
+    if (update.kind == texture_update::op::shm)
+        trace_texture_op("upload", update.texture_id, static_cast<bool>(applied));
+    else if (update.kind == texture_update::op::dmabuf)
+        trace_texture_op("import", update.texture_id, static_cast<bool>(applied));
+    else if (update.kind == texture_update::op::forget)
+        trace_texture_op("retire-queued", update.texture_id, true);
 }
 
 lx::result<void> compositor_impl::setup_vulkan_present() {
@@ -1593,7 +1741,7 @@ lx::result<void> compositor::start() {
         setup.images = &impl->cursor_images_;
         setup.router = &impl->input_router_;
         setup.scene = &impl->scene;
-        setup.overlay = &impl->overlay_layer_;
+        setup.overlay = &impl->cursor_layer_;
         setup.hardware = impl->cursor_plane_.valid();
         if (setup.hardware) {
             const auto caps = impl->cursor_plane_.caps();
@@ -1707,8 +1855,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
 
     const auto t0 = std::chrono::steady_clock::now();
     // Protocol handlers date texture retirements against this, so it has to be current
-    // before any Wayland dispatch below.
+    // before any Wayland dispatch below. What is committed from here on belongs to this
+    // tick's snapshot at the earliest.
     impl_->p0_.frame_index = tick.frame_index;
+    impl_->p0_.building_frame = tick.frame_index;
     impl_->budget_.begin_frame(tick.frame_index);
     impl_->memory_.tick(tick.frame_index);
     impl_->memory_.reset_frame_arenas(lx::runtime::memory_pool::ui);
@@ -1729,6 +1879,8 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         if (g.x != last.x || g.y != last.y || g.width != last.width || g.height != last.height) {
             impl_->last_output_rect_ = g;
             scene().note_full_damage();
+            // Layer surfaces are arranged against the output, and the usable area with them.
+            impl_->wm_.on_output_changed();
         }
     }
     if (!impl_->initial_damage_noted_) {
@@ -1767,6 +1919,9 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // Window management for this frame — configures coalesced since the last tick go out
     // here, once, rather than once per request that changed them.
     impl_->wm_.on_tick(tick.timestamp_ns);
+    // Frames: the atlas on first use and changed titles, rasterized once per tick however
+    // many set_title requests arrived — in this tick's snapshot, with the geometry they fit.
+    impl_->decorations_.on_tick();
     // The pointer image, after the window manager (a grab sets the override) and before the
     // scene is published (the software cursor is a scene node).
     if (impl_->cursor_hw_failed_.load(std::memory_order_acquire))
@@ -1778,6 +1933,9 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
 
     const bool nothing_changed = scene().pending_damage().empty();
     if (scene().commit_frame(tick.frame_index)) {
+        // Published: commits dispatched between now and the next tick are the next
+        // snapshot's. A dropped publish keeps this frame, whose damage carries forward.
+        impl_->p0_.building_frame = tick.frame_index + 1;
         impl_->buffer_lifecycle_.on_frame_submitted(tick.frame_index);
         if (!nothing_changed)
             impl_->last_damaged_frame_ = tick.frame_index;
@@ -1875,7 +2033,7 @@ void compositor::tick_render() {
         return out;
     };
 
-    impl_->drain_texture_updates();
+    impl_->drain_texture_updates(idx);
 
     // A CRTC takes one flip at a time, so a frame arriving while one is queued cannot be
     // shown yet — but with three scanout slots it no longer has to be thrown away either.

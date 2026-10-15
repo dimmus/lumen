@@ -14,8 +14,18 @@
 //   press button=<code> x=<x> y=<y> -> move | -> resize edges=<n> | -> none
 //   release button=<code>
 //   cursor shape=<name>
+//   sub commit size=<w>x<h>          (with --sub / --sub-desync)
 //
-//   lumen-square [-t seconds]
+//   lumen-square [-t seconds] [--sub | --sub-desync] [--destroy-parent-first]
+//
+// --sub adds a 32 px strip along the top as a wl_subsurface at 0,0, full window width. It
+// is synchronized: every resize commits the strip at the new width first and the parent
+// after it, so a compositor that honours synchronized commits shows both sizes in the same
+// frame and never the strip at a width the window does not have. The strip takes no input
+// (empty input region), so presses go through to the window underneath. --sub-desync makes
+// it desynchronized instead: its commits apply on their own. --destroy-parent-first tears
+// down in the order parent wl_surface before the child's wl_subsurface (role objects still
+// before their surfaces), which a compositor must survive without an error.
 //
 // Behaviour that matters for a frame-perfect compositor:
 //   - A configure is acked in the same dispatch as the commit of a buffer of exactly the
@@ -64,6 +74,8 @@ constexpr int k_buffer_count = 2;
 
 constexpr uint32_t k_fill_colour = 0xff3d7bd9;   // XRGB: mid blue
 constexpr uint32_t k_border_colour = 0xff1c3a6b; // same hue, much darker
+constexpr uint32_t k_strip_colour = 0xffe08a2c;  // XRGB: orange, for the --sub strip
+constexpr int k_strip_height = 32;
 
 // xdg_toplevel.resize_edge values form a bitmask: top=1, bottom=2, left=4, right=8.
 constexpr uint32_t k_edge_top = 1;
@@ -90,6 +102,7 @@ struct app {
     wl_display* display = nullptr;
     wl_registry* registry = nullptr;
     wl_compositor* compositor = nullptr;
+    wl_subcompositor* subcompositor = nullptr;
     wl_shm* shm = nullptr;
     xdg_wm_base* wm_base = nullptr;
     wl_seat* seat = nullptr;
@@ -104,6 +117,14 @@ struct app {
     xdg_toplevel* toplevel = nullptr;
 
     shm_slot slots[k_buffer_count]{};
+
+    // --sub: the strip subsurface.
+    bool sub_enabled = false;
+    bool sub_desync = false;
+    bool destroy_parent_first = false;
+    wl_surface* sub_surface = nullptr;
+    wl_subsurface* subsurface = nullptr;
+    shm_slot sub_slots[k_buffer_count]{};
 
     // Committed state.
     int width = k_initial_width;
@@ -152,6 +173,10 @@ uint32_t edges_at(const app& a, double x, double y) {
 
 // ── painting ────────────────────────────────────────────────────────────────
 
+void paint_strip(uint32_t* pixels, int width, int height) {
+    std::fill_n(pixels, static_cast<size_t>(width) * static_cast<size_t>(height), k_strip_colour);
+}
+
 void paint(uint32_t* pixels, int width, int height) {
     const auto w = static_cast<size_t>(width);
     const int band_x = std::min(k_border, (width + 1) / 2);
@@ -194,9 +219,9 @@ void destroy_slot(shm_slot& s) {
     s = shm_slot{};
 }
 
-// Makes `s` hold a wl_buffer of exactly width x height with the square painted into it.
-// Returns false on allocation failure.
-bool prepare_slot(app& a, shm_slot& s, int width, int height) {
+// Makes `s` hold a wl_buffer of exactly width x height with the square (or, with `strip`,
+// the --sub strip) painted into it. Returns false on allocation failure.
+bool prepare_slot(app& a, shm_slot& s, int width, int height, bool strip = false) {
     if (s.buffer && s.width == width && s.height == height)
         return true; // pixels depend only on size: nothing to repaint
 
@@ -249,7 +274,33 @@ bool prepare_slot(app& a, shm_slot& s, int width, int height) {
     wl_buffer_add_listener(s.buffer, &buffer_listener, &a);
     s.width = width;
     s.height = height;
-    paint(static_cast<uint32_t*>(s.map), width, height);
+    if (strip)
+        paint_strip(static_cast<uint32_t*>(s.map), width, height);
+    else
+        paint(static_cast<uint32_t*>(s.map), width, height);
+    return true;
+}
+
+shm_slot* free_slot(shm_slot* slots) {
+    for (int i = 0; i < k_buffer_count; ++i)
+        if (!slots[i].busy)
+            return &slots[i];
+    return nullptr;
+}
+
+// Commits the strip at `width`. Synchronized, this only caches it until the parent's next
+// commit; desynchronized, it is shown at once.
+bool commit_strip(app& a, int width) {
+    shm_slot* slot = free_slot(a.sub_slots);
+    if (!slot)
+        return false;
+    if (!prepare_slot(a, *slot, width, k_strip_height, true))
+        return false;
+    wl_surface_attach(a.sub_surface, slot->buffer, 0, 0);
+    wl_surface_damage_buffer(a.sub_surface, 0, 0, width, k_strip_height);
+    wl_surface_commit(a.sub_surface);
+    slot->busy = true;
+    std::printf("sub commit size=%dx%d\n", width, k_strip_height);
     return true;
 }
 
@@ -275,17 +326,19 @@ void apply_configure(app& a) {
         xdg_surface_ack_configure(a.xdg_surf, a.pending_serial);
         wl_surface_commit(a.surface);
     } else {
-        shm_slot* slot = nullptr;
-        for (auto& s : a.slots) {
-            if (!s.busy) {
-                slot = &s;
-                break;
-            }
-        }
-        if (!slot)
-            return; // both buffers held: ack together with the commit once one is released
+        shm_slot* slot = free_slot(a.slots);
+        // Both buffers held (of the window, or of the strip that must change with it): ack
+        // together with the commit once one is released.
+        if (!slot || (a.sub_surface && !free_slot(a.sub_slots)))
+            return;
 
         if (!prepare_slot(a, *slot, width, height)) {
+            g_running = 0;
+            return;
+        }
+        // The strip first: synchronized, it is applied together with the parent commit
+        // below, in the same frame.
+        if (a.sub_surface && (!a.committed_once || width != a.width) && !commit_strip(a, width)) {
             g_running = 0;
             return;
         }
@@ -311,6 +364,10 @@ void apply_configure(app& a) {
 void buffer_release(void* data, wl_buffer* buffer) {
     auto& a = *static_cast<app*>(data);
     for (auto& s : a.slots) {
+        if (s.buffer == buffer)
+            s.busy = false;
+    }
+    for (auto& s : a.sub_slots) {
         if (s.buffer == buffer)
             s.busy = false;
     }
@@ -569,6 +626,9 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
     if (std::strcmp(interface, wl_compositor_interface.name) == 0) {
         a.compositor = static_cast<wl_compositor*>(
             wl_registry_bind(registry, name, &wl_compositor_interface, std::min(version, 4u)));
+    } else if (std::strcmp(interface, wl_subcompositor_interface.name) == 0) {
+        a.subcompositor = static_cast<wl_subcompositor*>(
+            wl_registry_bind(registry, name, &wl_subcompositor_interface, 1));
     } else if (std::strcmp(interface, wl_shm_interface.name) == 0) {
         a.shm = static_cast<wl_shm*>(wl_registry_bind(registry, name, &wl_shm_interface, 1));
     } else if (std::strcmp(interface, xdg_wm_base_interface.name) == 0) {
@@ -590,6 +650,17 @@ void registry_global(void* data, wl_registry* registry, uint32_t name, const cha
 void registry_global_remove(void*, wl_registry*, uint32_t) {}
 const wl_registry_listener registry_listener = {registry_global, registry_global_remove};
 
+void destroy_strip(app& a) {
+    if (a.subsurface)
+        wl_subsurface_destroy(a.subsurface);
+    if (a.sub_surface)
+        wl_surface_destroy(a.sub_surface);
+    a.subsurface = nullptr;
+    a.sub_surface = nullptr;
+    for (auto& s : a.sub_slots)
+        destroy_slot(s);
+}
+
 void destroy_app(app& a) {
     for (auto& s : a.slots)
         destroy_slot(s);
@@ -598,12 +669,24 @@ void destroy_app(app& a) {
     if (a.cursor_manager)
         wp_cursor_shape_manager_v1_destroy(a.cursor_manager);
 #endif
+    // Normally the strip goes first. --destroy-parent-first takes the parent wl_surface down
+    // while the strip's wl_subsurface still lives (each role object still before its own
+    // surface), so the compositor has to orphan and unmap it.
+    if (!a.destroy_parent_first)
+        destroy_strip(a);
     if (a.toplevel)
         xdg_toplevel_destroy(a.toplevel);
     if (a.xdg_surf)
         xdg_surface_destroy(a.xdg_surf);
     if (a.surface)
         wl_surface_destroy(a.surface);
+    if (a.destroy_parent_first) {
+        wl_display_roundtrip(a.display);
+        destroy_strip(a);
+        wl_display_roundtrip(a.display);
+    }
+    if (a.subcompositor)
+        wl_subcompositor_destroy(a.subcompositor);
     if (a.seat) {
         if (wl_seat_get_version(a.seat) >= WL_SEAT_RELEASE_SINCE_VERSION)
             wl_seat_release(a.seat);
@@ -626,11 +709,22 @@ void destroy_app(app& a) {
 
 int main(int argc, char* argv[]) {
     double duration = 0.0;
+    bool sub = false;
+    bool sub_desync = false;
+    bool destroy_parent_first = false;
     for (int i = 1; i < argc; ++i) {
         if (std::strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
             duration = std::atof(argv[++i]);
+        } else if (std::strcmp(argv[i], "--sub") == 0) {
+            sub = true;
+        } else if (std::strcmp(argv[i], "--sub-desync") == 0) {
+            sub = true;
+            sub_desync = true;
+        } else if (std::strcmp(argv[i], "--destroy-parent-first") == 0) {
+            destroy_parent_first = true;
         } else {
-            std::fprintf(stderr, "usage: lumen-square [-t seconds]\n");
+            std::fprintf(stderr, "usage: lumen-square [-t seconds] [--sub | --sub-desync] "
+                                 "[--destroy-parent-first]\n");
             return 2;
         }
     }
@@ -655,6 +749,9 @@ int main(int argc, char* argv[]) {
     sigdelset(&wait_mask, SIGTERM);
 
     app a{};
+    a.sub_enabled = sub;
+    a.sub_desync = sub_desync;
+    a.destroy_parent_first = destroy_parent_first;
     a.display = wl_display_connect(nullptr);
     if (!a.display) {
         std::fprintf(stderr, "lumen-square: cannot connect to a Wayland display\n");
@@ -674,6 +771,22 @@ int main(int argc, char* argv[]) {
         std::fprintf(stderr, "lumen-square: no wl_seat — the window cannot be dragged\n");
 
     a.surface = wl_compositor_create_surface(a.compositor);
+    if (a.sub_enabled) {
+        if (!a.subcompositor) {
+            std::fprintf(stderr, "lumen-square: --sub needs wl_subcompositor\n");
+            destroy_app(a);
+            return 1;
+        }
+        a.sub_surface = wl_compositor_create_surface(a.compositor);
+        a.subsurface = wl_subcompositor_get_subsurface(a.subcompositor, a.sub_surface, a.surface);
+        wl_subsurface_set_position(a.subsurface, 0, 0);
+        if (a.sub_desync)
+            wl_subsurface_set_desync(a.subsurface);
+        // No input: presses on the strip belong to the window under it.
+        wl_region* none = wl_compositor_create_region(a.compositor);
+        wl_surface_set_input_region(a.sub_surface, none);
+        wl_region_destroy(none);
+    }
     a.xdg_surf = xdg_wm_base_get_xdg_surface(a.wm_base, a.surface);
     xdg_surface_add_listener(a.xdg_surf, &xdg_surface_listener_impl, &a);
     a.toplevel = xdg_surface_get_toplevel(a.xdg_surf);

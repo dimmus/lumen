@@ -84,12 +84,21 @@ struct cursor_plane_image {
 using cursor_frame_mailbox = latest_value<cursor_frame>;
 using cursor_image_mailbox = latest_value<cursor_plane_image>;
 
-/// Stages a premultiplied ARGB image as compositor texture `texture_id`, padded into a
-/// `canvas`-square texture (a fixed size keeps every backend on its in-place update path).
-/// Installed by the protocol layer, which owns the staging and the texture queue.
-using cursor_stage_fn = bool (*)(void* user, unsigned texture_id, const std::uint32_t* argb,
-                                 unsigned width, unsigned height, unsigned stride_px,
-                                 unsigned canvas);
+/// Compositor-owned textures (the software cursor, server-side frames), staged through the
+/// same queue as client shm content. Installed by the protocol layer, which owns the staging
+/// and the texture queue; no Wayland or backend type crosses it.
+struct compositor_texture_ops {
+    /// Stages a premultiplied ARGB image (`width` x `height`, `stride_px` words per row) as
+    /// texture `texture_id`, padded with transparent pixels to `canvas_w` x `canvas_h`
+    /// (a fixed canvas keeps every backend on its in-place update path). The update becomes
+    /// visible with the snapshot being built. False when staging is full this frame: retry.
+    bool (*stage)(void* user, unsigned texture_id, const std::uint32_t* argb, unsigned width,
+                  unsigned height, unsigned stride_px, unsigned canvas_w,
+                  unsigned canvas_h) = nullptr;
+    /// Dated retirement: dropped once no snapshot that may still draw it is in flight.
+    void (*retire)(void* user, unsigned texture_id) = nullptr;
+    void* user = nullptr;
+};
 
 /// The software cursor: a scene node drawn after every window. Used only when there is
 /// no usable cursor plane, the plane rejected the image, or `LUMEN_CURSOR=software`.
@@ -114,8 +123,9 @@ private:
 ///
 /// Precedence, resolved when an input to it changes (never per frame):
 ///   1. the compositor's override (an interactive move/resize sets one), else
-///   2. the pointer-focus client's request — a shape, a surface, or hidden, else
-///   3. `default`.
+///   2. the compositor's hover shape (the pointer is over a server-side frame), else
+///   3. the pointer-focus client's request — a shape, a surface, or hidden, else
+///   4. `default`.
 /// A pointer-focus change resets the client request to `default`: clients set their cursor
 /// on every `enter`, and a shape left over from the previous window must not persist.
 class cursor_manager {
@@ -133,7 +143,7 @@ public:
     };
 
     void init(const setup& s);
-    void set_stage_fn(cursor_stage_fn fn, void* user);
+    void set_texture_ops(compositor_texture_ops ops) { tex_ops_ = ops; }
 
     // Client requests. The protocol layer has already checked that the client holds
     // pointer focus and quoted the enter serial.
@@ -150,6 +160,10 @@ public:
     // Compositor.
     void set_override(cursor_shape shape);
     void clear_override();
+    /// The pointer is over something the compositor draws (a server-side frame): its shape
+    /// wins over the client's, below a grab's override.
+    void set_hover_shape(cursor_shape shape);
+    void clear_hover_shape();
     /// Per input event, O(1), no allocation. Outside a grab the new position is published
     /// at once, so render picks up the newest one when it builds its commit; inside a grab
     /// it waits for `on_tick`, so pointer and dragged window land in the same commit.
@@ -187,8 +201,7 @@ private:
     cursor_image_mailbox* images_ = nullptr;
     const input_router* router_ = nullptr;
     scene::scene_graph* scene_ = nullptr;
-    cursor_stage_fn stage_fn_ = nullptr;
-    void* stage_user_ = nullptr;
+    compositor_texture_ops tex_ops_{};
     cursor_node node_{};
 
     bool hardware_ = false;
@@ -197,6 +210,7 @@ private:
     unsigned canvas_ = 64;
 
     cursor_shape override_ = cursor_shape::none;
+    cursor_shape hover_ = cursor_shape::none;
     client_mode mode_ = client_mode::none;
     cursor_shape client_shape_ = cursor_shape::default_;
     lx::surface_id client_surface_{};
@@ -312,11 +326,6 @@ void lx::compositor::cursor_manager::init(const setup& s) {
         focus_generation_ = router_->pointer_focus_generation();
     needs_resolve_ = true;
     frame_pending_ = true;
-}
-
-void lx::compositor::cursor_manager::set_stage_fn(cursor_stage_fn fn, void* user) {
-    stage_fn_ = fn;
-    stage_user_ = user;
 }
 
 void lx::compositor::cursor_manager::sync_focus() {
@@ -457,6 +466,15 @@ void lx::compositor::cursor_manager::set_override(cursor_shape shape) {
 
 void lx::compositor::cursor_manager::clear_override() { set_override(cursor_shape::none); }
 
+void lx::compositor::cursor_manager::set_hover_shape(cursor_shape shape) {
+    if (hover_ == shape)
+        return;
+    hover_ = shape;
+    needs_resolve_ = true;
+}
+
+void lx::compositor::cursor_manager::clear_hover_shape() { set_hover_shape(cursor_shape::none); }
+
 void lx::compositor::cursor_manager::on_motion(double x, double y, unsigned long long time_us,
                                                bool in_grab) {
     x_ = x;
@@ -492,6 +510,10 @@ void lx::compositor::cursor_manager::resolve() {
         shape = override_;
         v = theme_->image(shape);
         source = "override";
+    } else if (hover_ != cursor_shape::none) {
+        shape = hover_;
+        v = theme_->image(shape);
+        source = "hover";
     } else {
         switch (mode_) {
         case client_mode::shape:
@@ -598,8 +620,9 @@ void lx::compositor::cursor_manager::update_software(bool want) {
         const unsigned need = view_.width > view_.height ? view_.width : view_.height;
         while (canvas_ < need && canvas_ < k_cursor_max_px)
             canvas_ *= 2;
-        if (!stage_fn_ || !stage_fn_(stage_user_, k_cursor_texture_id, view_.pixels,
-                                     view_.width, view_.height, view_.stride_px, canvas_)) {
+        if (!tex_ops_.stage ||
+            !tex_ops_.stage(tex_ops_.user, k_cursor_texture_id, view_.pixels, view_.width,
+                            view_.height, view_.stride_px, canvas_, canvas_)) {
             // Staging full this frame; keep the previous image and retry next tick.
             return;
         }

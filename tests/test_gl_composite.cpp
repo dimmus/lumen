@@ -379,6 +379,55 @@ LUMEN_TEST(gl_composite_exports_a_completion_fence) {
     close_fence(stats);
 }
 
+// Server-side frames fill rects by stretching the centre 2x2 of a 4x4 swatch in an atlas
+// (lx.compositor:decoration). The half-texel inset must keep linear filtering inside the
+// swatch: no bleed from the neighbouring swatch at any edge of a large stretch.
+LUMEN_TEST(gl_composite_stretches_a_swatch_centre_without_bleed) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned W = 64, H = 32;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+
+    // 8x4: a dark grey swatch, then a bright red one right beside it.
+    std::vector<unsigned char> atlas(8 * 4 * 4);
+    for (unsigned y = 0; y < 4; ++y)
+        for (unsigned x = 0; x < 8; ++x) {
+            unsigned char* p = &atlas[(y * 8 + x) * 4];
+            const bool red = x >= 4;
+            p[0] = red ? 0xE0 : 0x30;
+            p[1] = red ? 0x44 : 0x30;
+            p[2] = red ? 0x3E : 0x33;
+            p[3] = 0xFF;
+        }
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(1, 8, 4, atlas.data())));
+
+    lx::gfx::blit_command cmds[2] = {quad(1, {0, 0, 40, 16}), quad(1, {0, 16, 64, 16})};
+    cmds[0].src = {1, 1, 2, 2}; // grey centre
+    cmds[1].src = {5, 1, 2, 2}; // red centre
+    {
+        auto drawn = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f), cmds, 2, {});
+        LUMEN_CHECK(static_cast<bool>(drawn));
+        close_fence(drawn);
+    }
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    for (unsigned y = 0; y < 16; ++y)
+        for (unsigned x = 0; x < 40; ++x) {
+            const pixel p = at(out, W, x, y);
+            LUMEN_CHECK(near(p.r, 0x30, 1) && near(p.g, 0x30, 1) && near(p.b, 0x33, 1));
+        }
+    for (unsigned y = 16; y < 32; ++y)
+        for (unsigned x = 0; x < 64; ++x) {
+            const pixel p = at(out, W, x, y);
+            LUMEN_CHECK(near(p.r, 0xE0, 1) && near(p.g, 0x44, 1) && near(p.b, 0x3E, 1));
+        }
+}
+
 int main(int argc, char** argv) {
     const int rc = lumen_test::run_all(argc, argv);
     if (g_drm_fd >= 0)

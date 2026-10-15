@@ -72,16 +72,37 @@ LUMEN_TEST(wm_anchor_without_edges_keeps_the_position) {
 
 LUMEN_TEST(wm_window_geometry_defaults_to_the_surface_and_clamps_to_it) {
     using lx::compositor::effective_window_geometry;
-    LUMEN_CHECK(same(effective_window_geometry(false, {}, {640, 480}), {0, 0, 640, 480}));
+    const lx::rect2i surface{0, 0, 640, 480};
+    LUMEN_CHECK(same(effective_window_geometry(false, {}, surface), {0, 0, 640, 480}));
     // CSD shadow: 24 px margin all round.
-    LUMEN_CHECK(same(effective_window_geometry(true, {24, 24, 592, 432}, {640, 480}),
+    LUMEN_CHECK(same(effective_window_geometry(true, {24, 24, 592, 432}, surface),
                      {24, 24, 592, 432}));
     // Larger than the surface: intersected with it.
-    LUMEN_CHECK(same(effective_window_geometry(true, {-10, -10, 1000, 1000}, {640, 480}),
+    LUMEN_CHECK(same(effective_window_geometry(true, {-10, -10, 1000, 1000}, surface),
                      {0, 0, 640, 480}));
     // Entirely outside: meaningless, so the whole surface.
-    LUMEN_CHECK(same(effective_window_geometry(true, {700, 700, 10, 10}, {640, 480}),
+    LUMEN_CHECK(same(effective_window_geometry(true, {700, 700, 10, 10}, surface),
                      {0, 0, 640, 480}));
+    // No content at all: nothing.
+    LUMEN_CHECK(same(effective_window_geometry(false, {}, {}), {}));
+    LUMEN_CHECK(same(effective_window_geometry(true, {0, 0, 10, 10}, {}), {}));
+}
+
+LUMEN_TEST(wm_window_geometry_includes_subsurfaces) {
+    using lx::compositor::effective_window_geometry;
+    // foot-style CSD: a 30 px title bar subsurface above the main surface and 5 px border
+    // subsurfaces around both — the tree's bounding box reaches above and left of 0,0.
+    const lx::rect2i tree{-5, -35, 650, 520};
+    // Unset: the whole tree, negative origin included.
+    LUMEN_CHECK(same(effective_window_geometry(false, {}, tree), tree));
+    // Set to the title bar plus main surface (no borders): kept, though y < 0.
+    LUMEN_CHECK(same(effective_window_geometry(true, {0, -30, 640, 510}, tree),
+                     {0, -30, 640, 510}));
+    // Clamped to the tree, not to the main surface's buffer.
+    LUMEN_CHECK(same(effective_window_geometry(true, {-20, -50, 700, 600}, tree), tree));
+    // Clamped on one side only.
+    LUMEN_CHECK(same(effective_window_geometry(true, {0, -40, 640, 400}, tree),
+                     {0, -35, 640, 395}));
 }
 
 // ── placement ────────────────────────────────────────────────────────────────

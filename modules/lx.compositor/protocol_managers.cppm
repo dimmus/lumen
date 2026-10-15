@@ -9,23 +9,6 @@ import :surface;
 
 export namespace lx::compositor {
 
-enum class layer_shell_layer { background, bottom, top, overlay };
-enum class decoration_mode { client, server };
-
-struct layer_surface_state {
-    lx::surface_id surface{};
-    layer_shell_layer layer = layer_shell_layer::top;
-    lx::output_id output{};
-    lx::rect2i geometry{};
-    bool mapped = false;
-};
-
-struct decoration_state {
-    lx::toplevel_id toplevel{};
-    decoration_mode mode = decoration_mode::client;
-    bool negotiated = false;
-};
-
 struct workspace_entry {
     lx::workspace_id id{};
     const char* name = "";
@@ -56,7 +39,9 @@ struct color_management_state {
     lx::color_space compositing_space = lx::color_space::scrgb;
 };
 
-/// Registers and tracks standard public Wayland globals (layer-shell, decoration, workspace, …).
+/// Registers and tracks standard public Wayland globals (workspace, …). xdg-decoration and
+/// wlr-layer-shell are served by protocols_p0 (`:decoration` and `:layer_shell` hold their
+/// logic).
 class protocol_managers {
 public:
     [[nodiscard]] lx::result<void> install(wayland::server& server);
@@ -70,15 +55,6 @@ public:
     // wp-fractional-scale-v1
     void set_fractional_scale(unsigned output_index, float scale);
     [[nodiscard]] float fractional_scale(unsigned output_index) const;
-
-    // wlr-layer-shell-v1
-    [[nodiscard]] lx::result<layer_surface_state> map_layer_surface(lx::surface_id surface,
-                                                                     layer_shell_layer layer);
-    void unmap_layer_surface(lx::surface_id surface);
-
-    // xdg-decoration-v1
-    void negotiate_decoration(lx::toplevel_id toplevel, decoration_mode mode);
-    [[nodiscard]] decoration_mode decoration_for(lx::toplevel_id toplevel) const;
 
     // ext-workspace-v1 (read path)
     void set_workspaces(const workspace_entry* entries, unsigned count);
@@ -112,10 +88,6 @@ private:
     surface_manager* surfaces_ = nullptr;
     session_lock_state session_lock_{};
     float output_scales_[16]{};
-    layer_surface_state layers_[32]{};
-    unsigned layer_count_ = 0;
-    decoration_state decorations_[64]{};
-    unsigned decoration_count_ = 0;
     workspace_entry workspaces_[16]{};
     unsigned workspace_count_ = 0;
     output_config_head output_configs_[16]{};
@@ -139,8 +111,6 @@ lx::result<void> lx::compositor::protocol_managers::install(wayland::server& ser
     };
 
     static constexpr global_spec k_public_globals[] = {
-        {"zwlr_layer_shell_v1", 4, false},
-        {"zxdg_decoration_manager_v1", 1, false},
         {"ext_workspace_manager_v1", 1, false},
         {"zwlr_output_manager_v1", 4, false},
         {"ext_session_lock_manager_v1", 1, false},
@@ -192,48 +162,6 @@ void lx::compositor::protocol_managers::set_fractional_scale(unsigned output_ind
 
 float lx::compositor::protocol_managers::fractional_scale(unsigned output_index) const {
     return output_index < 16 ? output_scales_[output_index] : 1.f;
-}
-
-lx::result<lx::compositor::layer_surface_state>
-lx::compositor::protocol_managers::map_layer_surface(lx::surface_id surface,
-                                                     layer_shell_layer layer) {
-    if (layer_count_ >= 32)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "layer surface table full");
-    auto& entry = layers_[layer_count_++];
-    entry.surface = surface;
-    entry.layer = layer;
-    entry.mapped = true;
-    return entry;
-}
-
-void lx::compositor::protocol_managers::unmap_layer_surface(lx::surface_id surface) {
-    for (unsigned i = 0; i < layer_count_; ++i) {
-        if (layers_[i].surface == surface) {
-            layers_[i] = layers_[--layer_count_];
-            return;
-        }
-    }
-}
-
-void lx::compositor::protocol_managers::negotiate_decoration(lx::toplevel_id toplevel,
-                                                             decoration_mode mode) {
-    for (unsigned i = 0; i < decoration_count_; ++i) {
-        if (decorations_[i].toplevel == toplevel) {
-            decorations_[i].mode = mode;
-            decorations_[i].negotiated = true;
-            return;
-        }
-    }
-    if (decoration_count_ < 64) {
-        decorations_[decoration_count_++] = {toplevel, mode, true};
-    }
-}
-
-lx::compositor::decoration_mode
-lx::compositor::protocol_managers::decoration_for(lx::toplevel_id toplevel) const {
-    for (unsigned i = 0; i < decoration_count_; ++i)
-        if (decorations_[i].toplevel == toplevel) return decorations_[i].mode;
-    return decoration_mode::client;
 }
 
 void lx::compositor::protocol_managers::set_workspaces(const workspace_entry* entries,

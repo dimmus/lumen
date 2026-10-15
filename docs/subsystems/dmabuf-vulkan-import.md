@@ -67,6 +67,23 @@ struct dmabuf_desc {
 | Integrated | Linear/optimal based on scanout caps | FIFO relaxed |
 | Embedded | Single-plane RGB formats only; strict allow-list | Direct scanout when possible |
 
+## Other composite backends and the feedback protocol
+
+The GL backend (`lx.gfx:gl_renderer`) imports client dma-bufs itself, on the render thread
+where its context lives: `surface_manager::set_render_thread_import(true)` gives each
+dma-buf `wl_buffer` a compositor texture id (as for shm), the UI-side Vulkan import cache
+is skipped, and the drain makes one `EGLImage` per buffer, reused while the client
+re-commits it. On hosts that pick GL, the only Vulkan device is usually a software
+rasterizer whose import fails outright (`vkAllocateMemory`), which is why the UI-side
+import is not attempted there.
+
+`zwp_linux_dmabuf_v1` v4+ feedback sends what the protocol requires: `format_table` (one
+sealed memfd for the process: ARGB8888/XRGB8888, linear), `main_device` and one tranche
+for it (the render node of the KMS card, found through sysfs at startup), then `done`. The
+legacy `format`/`modifier` events go only to v1–v3 binds. A feedback with no format table
+crashed GTK 4 at display open. Formats and modifiers beyond linear 8888 are a follow-up
+(they need the EGL/Vulkan query per format).
+
 ## Error handling
 
 | Condition | Action |

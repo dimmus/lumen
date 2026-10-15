@@ -35,6 +35,24 @@ LUMEN_TEST_VKMS=1 ctest --test-dir build -R test_kms_vkms.
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan (same for tsan)
 ```
 
+## Running the desktop
+
+From the active console session (or from SSH inside the seat session's cgroup, so logind
+lets libinput open devices — see `scripts/drag-smoke.sh --join-seat-session`):
+
+```bash
+./build/release/lumen-compositor lumen-0 &           # socket $XDG_RUNTIME_DIR/lumen-0
+./build/release/lumen-shell --display lumen-0 &      # the top panel / task list
+WAYLAND_DISPLAY=lumen-0 foot &                       # any Wayland application
+```
+
+`lumen-shell` is privileged: the compositor accepts its `zlm_shell_v1` bind only from the
+configured shell binary — by default the `lumen-shell` next to `lumen-compositor`, or
+`lumen-compositor --shell PATH`. A copy elsewhere is refused (it exits 1 and the
+compositor logs both paths). The shell exits 0 on SIGTERM and 1 when refused or when the
+compositor goes away; `lumen-shell.service` restarts it. `LUMEN_LOG=debug` on either
+process shows the bridge traffic (`compositor.shell`, `shell.bridge`, `shell.panel`).
+
 ## Architecture
 
 **Full architecture guide:** [docs/architecture.md](docs/architecture.md) — processes, module layers, workflows, protocols.

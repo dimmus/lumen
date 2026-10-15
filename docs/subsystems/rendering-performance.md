@@ -150,8 +150,8 @@ not optional.
 | Context | EGL on `EGL_PLATFORM_GBM_KHR`, surfaceless, GLES 2 — the floor every driver supports |
 | Thread | Built on the UI thread during `start()`, released, then claimed by the render thread in `render_loop`. An EGL context is current on one thread at a time |
 | Scanout | 3 × `gbm_bo` (SCANOUT\|RENDERING) → `EGLImage` → renderbuffer → FBO, same slot rotation as the other backends |
-| dma-buf clients | `EGL_EXT_image_dma_buf_import` → sampled in place, no copy |
-| shm clients | `glTexSubImage2D` in RGBA (BGRA measured slower on SVGA3D), staged through `shm_staging_ring` like the Vulkan path |
+| dma-buf clients | `EGL_EXT_image_dma_buf_import` → sampled in place, no copy. Imported **on the render thread** (where the context lives) against a compositor texture id per `wl_buffer` (`surface_manager::set_render_thread_import`); the UI-side Vulkan import cache is not used, since on hosts that pick GL its only Vulkan device is usually a software rasterizer that cannot import at all. The `EGLImage` is made once per buffer and reused while the client re-commits it |
+| shm clients | `glTexSubImage2D` in RGBA (BGRA measured slower on SVGA3D), staged per texture through `shm_pixel_store` (slot released right after the upload) |
 | Upload hazard | Each texture keeps **two** GL names and alternates. Uploading into the texture the previous frame is still sampling stalls the driver — measured 48 ms vs 22 ms per frame on SVGA3D. Each name tracks its own storage size: a client resizing every frame (interactive resize) alternates sizes across the names, and a sub-image upload into storage of another size is a GL error that leaves stale pixels on screen |
 | Damage | `glScissor` over the damage rect, flipped into GL's bottom-left origin |
 | Blending | `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` — sources are premultiplied |
@@ -188,11 +188,57 @@ Two strategies, because the consumers differ:
 | Consumer | Staging | Lifetime |
 |----------|---------|----------|
 | Vulkan upload (copies pixels out during drain) | `shm_staging_ring` — one FIFO for all surfaces | Slot free once the upload is recorded |
-| CPU composite (samples staged rows in place) | `shm_pixel_store` — two slots **per texture** | Slot held until a later commit supersedes it |
+| GL upload (copies pixels out during drain) | `shm_pixel_store` — two slots **per texture** (256 textures) | Slot free right after `glTexImage2D`/`glTexSubImage2D` |
+| CPU composite (samples staged rows in place) | `shm_pixel_store` | Slot held until a later commit supersedes it |
 
 A shared FIFO cannot serve the CPU path: the composite reads the rows well after the
 drain, so another surface's commits would recycle the slot underneath and the texture would
-start showing the wrong pixels.
+start showing the wrong pixels. GL left the shared 8-slot ring when subsurfaces arrived: a
+client-side-decorated window commits about nine surfaces in one frame, the ring ran out,
+and the updates it refused were never shown. Per-texture staging costs a staging copy per
+live shm texture instead of 8 shared slots; one busy client can no longer starve another.
+(Every shm commit still copies and uploads the whole buffer; damage-limited sub-uploads are
+a follow-up.)
+
+### Texture updates wait for their snapshot
+
+Every `texture_update` carries `visible_from_frame`: the index of the snapshot that was being
+built when it was queued (`p0_protocol_context::building_frame` — the tick's frame during
+its dispatch, the next one once that frame is published, unchanged when a publish is
+dropped). The render thread applies an update only when it composites a snapshot at least
+that new; anything newer waits in a fixed 256-entry ring, and so does everything queued
+behind it, which keeps FIFO order across a forget and a re-registration. Without it, a
+buffer re-committed under the same texture id between two ticks was uploaded before the
+*previous* snapshot composited, and its new pixels showed under the previous frame's
+geometry — a window drawn at its new size inside its old frame, a synchronized subsurface
+ahead of its parent. A full ring applies the oldest early (one warn).
+
+### Blend from content
+
+`surface_node` draws with `blend_mode::opaque` only when the content is opaque — a client
+format without alpha (`XRGB8888`, `XBGR8888`, …), or an opaque region covering the whole
+buffer — and the node opacity is 1. Everything else blends (premultiplied). Blending used
+to be chosen from opacity alone, which drew every ARGB client's transparent pixels (GTK
+shadows, rounded corners, CSD borders) as black. The CPU occlusion cull and `memcpy` fast
+path still apply to XRGB and fully opaque ARGB windows. Opaque-region sub-rects (splitting a
+draw into an opaque and a blended part) are a follow-up.
+
+### Server-side frames: no new draw type
+
+A window frame (`lx.compositor:decoration`) is drawn with the existing textured-quad path on
+every backend: there is no solid-fill draw, and none was added. Border and title fills
+stretch the centre 2x2 of a 4x4 colour swatch in one 64x64 atlas texture (the GL path's
+half-texel inset keeps linear filtering inside the swatch; CPU nearest sampling is exact),
+with `blend_mode::opaque`, so the CPU occlusion cull and the GL blend-off path still apply.
+Colours are baked into the swatches rather than produced by `tint`, whose encoding semantics
+would have to be proven identical on GL, CPU and Vulkan. The title is one premultiplied
+texture per window and focus colour, rasterized on the UI thread by `lx.text` when the title
+changes or its ellipsis cut moves (≈0.1–0.3 ms, not per frame); a focus change swaps the
+texture id, a move or a resize that keeps the cut costs no texture work. 7–8 draws per
+decorated window. Title texture ids are allocated upward and never reused, so a dated
+retirement can never drop a later texture that happened to get the same id. Damage is the
+frame's four strips (title bar plus borders, old and new apart), never the client area,
+which the window's own nodes account for; a hover or press repaints the close button only.
 
 ### Texture retirement is dated, not immediate
 
@@ -215,6 +261,12 @@ tick_render     acquire snapshot N → drain → composite
 On the Vulkan path that surfaces as `draw referenced an unregistered texture`. On the CPU
 path it is worse than a warning: the retirement releases the `shm_pixel_store` slot the
 draw is still sampling, so the surface can render another client's pixels.
+
+A texture is retired when its `wl_buffer` is destroyed and no surface shows it, or — when
+the buffer object went first — when the surface stops showing it (a new buffer, or the
+surface destroyed). The surface manager's buffer record goes with the `wl_buffer` object
+(`forget_buffer`); it used to be kept forever, and after 256 buffers every later commit
+failed.
 
 ---
 

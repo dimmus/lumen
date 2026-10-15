@@ -9,5 +9,21 @@ sequenceDiagram
     Shell->>Bridge: request_activate(toplevel_B)
     Bridge->>Comp: activate + restack(B on top)
     Comp->>Comp: SeatManager.setFocus(B)
-    Comp->>App: wl_keyboard.enter
+    Comp->>Comp: resolve_keyboard_focus()
+    alt exclusive layer surface mapped on top/overlay
+        Note over Comp,App: keys stay with it (only its own popups can take them); B is the WM's choice but not activated
+    else popup grab active and its topmost grabbing popup mapped
+        Note over Comp,App: keys stay with that popup (B is another client: the grab is dismissed first)
+    else
+        Comp->>App: wl_keyboard.enter(B's surface)
+    end
     Comp->>Shell: focus_changed(B)
+
+    User->>App: right-click (press serial S)
+    App->>Comp: xdg_surface.get_popup + xdg_popup.grab(S)
+    Comp->>Comp: S == App's last press? push on the grab stack
+    Comp->>App: configure -> ack -> commit (popup maps)
+    Comp->>App: wl_keyboard.enter(popup): B stays activated
+    User->>Comp: press outside App's surfaces
+    Comp->>App: popup_done (topmost first), press consumed
+    Comp->>App: wl_keyboard.enter(B's surface)

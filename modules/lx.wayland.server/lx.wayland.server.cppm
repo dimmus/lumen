@@ -11,6 +11,7 @@ module;
 #include <cstring>
 
 #if !defined(_WIN32)
+#include <climits>
 #include <unistd.h>
 #endif
 
@@ -20,6 +21,7 @@ module;
 
 import lx.foundation;
 import lx.runtime;
+import lx.session;
 import lx.trace;
 import lx.wayland.protocols;
 
@@ -122,10 +124,18 @@ public:
     void flush();
 
     void add_global(global_descriptor desc, global_bind_fn bind_fn);
+    /// The privilege check for `zlm_shell_v1` (architecture §9): the peer runs as this
+    /// session's UID **and** its executable (`/proc/<pid>/exe`, as the kernel names it) is
+    /// the configured shell binary. A denial is logged at warn with both paths.
     [[nodiscard]] bool allow_privileged_global(const unix_credentials& cred,
                                                const char* global_name) const;
 
+    /// The shell binary privileged binds must come from. A bare name ("lumen-shell", the
+    /// default) is looked up next to the running compositor's own executable; any other
+    /// path is taken relative to the working directory. Either way it is resolved once
+    /// here, to the canonical path the kernel reports for a running executable.
     void set_shell_binary_path(const char* path);
+    [[nodiscard]] const char* shell_binary_path() const { return shell_binary_path_; }
 
     [[nodiscard]] client_connection* find_client(unsigned id);
     [[nodiscard]] client_connection* find_client_by_native(void* wl_client);
@@ -170,7 +180,11 @@ private:
     int listen_fd_ = -1;
     char socket_path_[108]{};
     bool bound_ = false;
-    const char* shell_binary_path_ = "lumen-shell";
+#if defined(_WIN32)
+    char shell_binary_path_[260]{};
+#else
+    char shell_binary_path_[PATH_MAX]{};
+#endif
 
 #if defined(LUMEN_HAS_WAYLAND)
     wl_display* display_ = nullptr;
@@ -505,17 +519,88 @@ void lx::wayland::server::add_global(global_descriptor desc, global_bind_fn bind
 
 bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
                                                   const char* global_name) const {
-    (void)global_name;
 #if defined(_WIN32)
     (void)cred;
+    (void)global_name;
     return false;
 #else
-    return cred.uid == static_cast<unsigned>(::getuid());
+    const char* name = global_name ? global_name : "?";
+    if (cred.uid != static_cast<unsigned>(::getuid())) {
+        char line[160];
+        std::snprintf(line, sizeof(line), "privileged global %s denied: client uid=%u pid=%u",
+                      name, cred.uid, cred.pid);
+        lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+        return false;
+    }
+    // The peer's pid comes from SO_PEERCRED at connect, and the connection is still open,
+    // so the process is alive and the pid cannot have been reused. Same check as KWin's
+    // restricted interfaces (it reads /proc/<pid>/exe too). It is not a boundary against a
+    // same-UID attacker that can ptrace the shell — nothing at this layer is.
+    char exe[PATH_MAX]{};
+    bool have_exe = false;
+    if (cred.pid != 0) {
+        char proc[32];
+        std::snprintf(proc, sizeof(proc), "/proc/%u/exe", cred.pid);
+        const ssize_t n = ::readlink(proc, exe, sizeof(exe) - 1);
+        if (n > 0) {
+            exe[n] = '\0';
+            have_exe = true;
+        }
+    }
+    const lx::session::privilege_checker checker{
+        {.expected_uid = static_cast<unsigned>(::getuid()),
+         .shell_binary_path = shell_binary_path_,
+         .require_flatpak_token = false}};
+    const auto verdict = checker.check_shell_bind(
+        lx::session::credentials{.uid = cred.uid, .gid = cred.gid, .pid = cred.pid},
+        have_exe ? exe : nullptr, nullptr);
+    if (verdict == lx::session::privilege_result::allowed)
+        return true;
+    char line[2 * PATH_MAX + 160];
+    std::snprintf(line, sizeof(line),
+                  "privileged global %s denied: client pid=%u exe=%s is not the shell binary %s",
+                  name, cred.pid, have_exe ? exe : "(unknown)", shell_binary_path_);
+    lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+    return false;
 #endif
 }
 
 void lx::wayland::server::set_shell_binary_path(const char* path) {
-    shell_binary_path_ = path ? path : "lumen-shell";
+    if (!path || !path[0])
+        path = "lumen-shell";
+#if defined(_WIN32)
+    std::snprintf(shell_binary_path_, sizeof(shell_binary_path_), "%s", path);
+#else
+    char candidate[PATH_MAX]{};
+    if (std::strchr(path, '/') == nullptr) {
+        // Next to this executable: an installed or freshly built pair always matches.
+        char self[PATH_MAX]{};
+        const ssize_t n = ::readlink("/proc/self/exe", self, sizeof(self) - 1);
+        char* slash = n > 0 ? std::strrchr(self, '/') : nullptr;
+        if (slash) {
+            *slash = '\0';
+            std::snprintf(candidate, sizeof(candidate), "%s/%s", self, path);
+        } else {
+            std::snprintf(candidate, sizeof(candidate), "%s", path);
+        }
+    } else {
+        std::snprintf(candidate, sizeof(candidate), "%s", path);
+    }
+    if (::realpath(candidate, shell_binary_path_) == nullptr) {
+        // Kept as given: nothing can match it, so every privileged bind is denied (and
+        // each denial names this path), rather than the check silently passing.
+        std::snprintf(shell_binary_path_, sizeof(shell_binary_path_), "%s", candidate);
+        char line[PATH_MAX + 96];
+        std::snprintf(line, sizeof(line),
+                      "shell binary %s not found: zlm_shell_v1 binds will be denied",
+                      shell_binary_path_);
+        lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+        return;
+    }
+    char line[PATH_MAX + 32];
+    std::snprintf(line, sizeof(line), "shell binary %s", shell_binary_path_);
+    lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+#endif
 }
 
 lx::wayland::client_connection* lx::wayland::server::find_client(unsigned id) {
@@ -563,24 +648,42 @@ lx::wayland::client_connection* lx::wayland::server::ensure_client(void* wl_clie
 #endif
 
 #if defined(LUMEN_HAS_WAYLAND)
-    const unsigned idx = client_count_ - 1;
-    auto& link = destroy_links_[idx];
-    link.server = this;
-    link.client_id = slot.id();
-    wl_list_init(&link.listener.link);
-    link.listener.notify = [](struct wl_listener* listener, void* /*data*/) {
+    // A link stays where it is for its client's whole life: the listener is an element of
+    // that client's destroy-signal list. Links are not tied to slot indices, because
+    // remove_client_slot moves the last slot into the hole — a link indexed by slot would be
+    // re-initialised for the next client while still linked into another client's list, and
+    // that client's destroy then loops forever. A link is free again once it has fired
+    // (libwayland unlinks each listener of a client's final destroy emission).
+    client_destroy_link* link = nullptr;
+    for (auto& l : destroy_links_) {
+        if (!l.server) {
+            link = &l;
+            break;
+        }
+    }
+    if (!link) {
+        --client_count_;
+        slot = {};
+        return nullptr;
+    }
+    link->server = this;
+    link->client_id = slot.id();
+    wl_list_init(&link->listener.link);
+    link->listener.notify = [](struct wl_listener* listener, void* /*data*/) {
         auto* self = reinterpret_cast<client_destroy_link*>(
             reinterpret_cast<char*>(listener) - offsetof(client_destroy_link, listener));
-        if (!self->server)
+        server* srv = self->server;
+        if (!srv)
             return;
-        for (unsigned i = 0; i < self->server->client_count_; ++i) {
-            if (self->server->clients_[i].id() == self->client_id) {
-                self->server->remove_client_slot(i);
+        self->server = nullptr;
+        for (unsigned i = 0; i < srv->client_count_; ++i) {
+            if (srv->clients_[i].id() == self->client_id) {
+                srv->remove_client_slot(i);
                 break;
             }
         }
     };
-    wl_client_add_destroy_listener(static_cast<struct wl_client*>(wl_client), &link.listener);
+    wl_client_add_destroy_listener(static_cast<struct wl_client*>(wl_client), &link->listener);
 #endif
     return &slot;
 }

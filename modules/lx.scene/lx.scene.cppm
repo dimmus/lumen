@@ -84,12 +84,19 @@ public:
     [[nodiscard]] lx::surface_id surface() const;
     [[nodiscard]] lx::texture_id texture() const;
     [[nodiscard]] lx::gfx::imported_image image() const;
+    /// The content covers its bounds with no translucency: a format without alpha, or an
+    /// opaque region spanning the whole buffer. Only then may a draw skip blending, so the
+    /// default is false — an ARGB client's transparent pixels (shadows, rounded corners)
+    /// must blend, never be drawn as black.
+    void set_opaque(bool opaque);
+    [[nodiscard]] bool opaque() const;
     void emit_draws(draw_list& out) const override;
 
 private:
     lx::surface_id surface_{};
     lx::gfx::imported_image image_{};
     lx::texture_id texture_{};
+    bool opaque_ = false;
 };
 
 class scene_graph {
@@ -247,6 +254,13 @@ void lx::scene::surface_node::set_bounds(lx::rect2i b) {
 lx::surface_id lx::scene::surface_node::surface() const { return surface_; }
 lx::texture_id lx::scene::surface_node::texture() const { return texture_; }
 lx::gfx::imported_image lx::scene::surface_node::image() const { return image_; }
+void lx::scene::surface_node::set_opaque(bool opaque) {
+    if (opaque_ != opaque) {
+        opaque_ = opaque;
+        dirty_ = true;
+    }
+}
+bool lx::scene::surface_node::opaque() const { return opaque_; }
 
 void lx::scene::surface_node::emit_draws(draw_list& out) const {
     if (!texture() || !is_visible())
@@ -273,7 +287,9 @@ void lx::scene::surface_node::emit_draws(draw_list& out) const {
         cmd.transform = lx::transform2d::scale(scale(), scale());
     cmd.opacity = opacity();
     cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, opacity());
-    cmd.blend = opacity() >= 1.f ? lx::blend_mode::opaque : lx::blend_mode::premultiplied;
+    // Blend from content, not from opacity: an ARGB buffer at opacity 1 still has to blend.
+    cmd.blend = opaque_ && opacity() >= 1.f ? lx::blend_mode::opaque
+                                            : lx::blend_mode::premultiplied;
     cmd.sort_key = lx::draw_sort_key::make(0, out.size());
     out.push(cmd);
 }
