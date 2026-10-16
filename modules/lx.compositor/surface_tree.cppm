@@ -14,7 +14,8 @@ import :surface;
 export namespace lx::compositor {
 
 /// What a root surface plays. A subsurface is never a root: it always has a parent.
-enum class root_kind : unsigned char { none, toplevel, popup, layer };
+/// `dnd_icon`: a drag-and-drop icon (wl_data_device.start_drag), drawn above the popups.
+enum class root_kind : unsigned char { none, toplevel, popup, layer, dnd_icon };
 
 inline constexpr unsigned k_tree_max_surfaces = 256;
 /// Children per parent; one more slot holds the parent's own "self" marker.
@@ -89,6 +90,10 @@ public:
     /// Called for every node the tree drops (unmap, unlink, destroy), after the drop. The
     /// window manager moves pointer focus off a surface that stops being drawn.
     using unmap_hook = void (*)(void* user, lx::surface_id surface);
+    /// Called whenever a node's global rect changes — created, moved, resized, or dropped
+    /// (with an empty rect) — at the three places node rects are set. What output
+    /// membership (wl_surface.enter/leave) is computed from. No allocation.
+    using rect_hook = void (*)(void* user, lx::surface_id surface, lx::rect2i rect);
 
     void bind(surface_manager& surfaces, scene::scene_graph& scene) {
         surfaces_ = &surfaces;
@@ -98,6 +103,12 @@ public:
         unmap_hook_ = fn;
         unmap_user_ = user;
     }
+    void set_rect_hook(rect_hook fn, void* user) {
+        rect_hook_ = fn;
+        rect_user_ = user;
+    }
+    /// The global rect of `id`'s node as last placed, empty when it has none.
+    [[nodiscard]] lx::rect2i node_rect(lx::surface_id id) const;
 
     // ── membership ──
 
@@ -201,6 +212,10 @@ public:
     [[nodiscard]] scene::container_node* container(lx::surface_id root) const;
     /// Notes every node rect of a mapped root as damaged (a restack).
     void damage_root(lx::surface_id root) const;
+    /// Draws every node of the root's tree — including nodes created later — through a grey
+    /// tint (a client that stopped answering pings), damaging the tree when it changes.
+    void set_root_dim(lx::surface_id root, bool dim);
+    [[nodiscard]] bool root_dimmed(lx::surface_id root) const;
     /// Topmost surface of the root's tree whose extents and input region contain the global
     /// point, in reverse paint order. No allocation; one O(1) lookup per node.
     [[nodiscard]] bool hit(lx::surface_id root, double gx, double gy, tree_hit& out) const;
@@ -239,6 +254,7 @@ private:
         unsigned long long tag = 0;
         bool root_mapped = false;
         bool scene_dirty = false;
+        bool dim = false;
     };
     struct paint_item {
         lx::surface_id id{};
@@ -282,6 +298,8 @@ private:
     scene::scene_graph* scene_ = nullptr;
     unmap_hook unmap_hook_ = nullptr;
     void* unmap_user_ = nullptr;
+    rect_hook rect_hook_ = nullptr;
+    void* rect_user_ = nullptr;
     entry entries_[k_tree_max_surfaces]{};
     id_slot_index<k_tree_max_surfaces * 2> index_{};
     /// sync_scene scratch: the root's mapped surfaces in paint order.
@@ -302,6 +320,10 @@ constexpr const char* k_scene_category = "compositor.scene";
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
 }
 
+/// The not-responding tint: Mutter and KWin grey a hung window out; 0.65 keeps it legible.
+constexpr lx::color k_dim_tint = lx::color::rgb(0.65f, 0.65f, 0.65f, 1.f);
+constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
+
 [[nodiscard]] const char* kind_name(lx::compositor::root_kind k) {
     switch (k) {
     case lx::compositor::root_kind::toplevel:
@@ -310,6 +332,8 @@ constexpr const char* k_scene_category = "compositor.scene";
         return "popup";
     case lx::compositor::root_kind::layer:
         return "layer";
+    case lx::compositor::root_kind::dnd_icon:
+        return "dnd_icon";
     case lx::compositor::root_kind::none:
         break;
     }
@@ -367,7 +391,10 @@ bool lx::compositor::surface_tree::add_surface(lx::surface_id id) {
 
 void lx::compositor::surface_tree::drop_one(entry& e, const char* reason) {
     e.mapped = false;
+    const bool had_rect = e.last_rect.width > 0 && e.last_rect.height > 0;
     e.last_rect = {};
+    if (had_rect && rect_hook_)
+        rect_hook_(rect_user_, e.id, {});
     if (!surfaces_ || !surfaces_->node(e.id))
         return;
     if (scene_)
@@ -827,8 +854,11 @@ void lx::compositor::surface_tree::set_root_origin(lx::surface_id root, lx::poin
             scene_->note_damage(old_rect);
             scene_->note_damage(new_rect);
         }
-        if (entry* s = find(sid))
+        if (entry* s = find(sid)) {
             s->last_rect = new_rect;
+            if (rect_hook_)
+                rect_hook_(rect_user_, sid, new_rect);
+        }
     }
     log_tree(root, "move");
 }
@@ -902,6 +932,8 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
                 continue;
             }
             created = true;
+            if (r->dim)
+                surfaces_->node(it.id)->set_tint(k_dim_tint);
         }
         const lx::rect2i old_rect = surfaces_->node_rect(it.id);
         surfaces_->set_origin(it.id, it.origin);
@@ -922,9 +954,12 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
                           new_rect.height);
             log_line(k_surface_category, line);
         }
-        if (created || !rect_same(e->last_rect, new_rect))
+        const bool moved = created || !rect_same(e->last_rect, new_rect);
+        if (moved)
             changed = true;
         e->last_rect = new_rect;
+        if (moved && rect_hook_)
+            rect_hook_(rect_user_, it.id, new_rect);
     }
 
     // 4. Paint order: underlay, then the flattened tree.
@@ -1015,6 +1050,37 @@ void lx::compositor::surface_tree::damage_root(lx::surface_id root) const {
             continue;
         scene_->note_damage(surfaces_->node_rect(static_cast<scene::surface_node*>(n)->surface()));
     }
+}
+
+void lx::compositor::surface_tree::set_root_dim(lx::surface_id root, bool dim) {
+    entry* e = find(root);
+    if (!e || e->dim == dim)
+        return;
+    e->dim = dim;
+    if (!e->root_mapped || !e->container || !surfaces_)
+        return;
+    for (unsigned i = 0; i < e->container->child_count(); ++i) {
+        scene::scene_node* n = e->container->child_at(i);
+        if (!n || n == e->underlay || n->kind() != scene::node_kind::surface)
+            continue;
+        n->set_tint(dim ? k_dim_tint : k_no_tint);
+    }
+    damage_root(root);
+    if (debug()) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "tree root=%llu dim=%d", root.id(), dim ? 1 : 0);
+        log_line(k_scene_category, line);
+    }
+}
+
+bool lx::compositor::surface_tree::root_dimmed(lx::surface_id root) const {
+    const entry* e = find(root);
+    return e && e->dim;
+}
+
+lx::rect2i lx::compositor::surface_tree::node_rect(lx::surface_id id) const {
+    const entry* e = find(id);
+    return e ? e->last_rect : lx::rect2i{};
 }
 
 bool lx::compositor::surface_tree::hit(lx::surface_id root, double gx, double gy,

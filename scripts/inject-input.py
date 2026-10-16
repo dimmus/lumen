@@ -25,8 +25,12 @@ compositor's debug log, which uses the same clock.
     sudo python3 -I scripts/inject-input.py --output 1918x928 drag 500 400 700 520 --button left
     sudo python3 -I scripts/inject-input.py --output 1918x928 drag 500 400 700 520 --button left --super
     sudo python3 -I scripts/inject-input.py --output 1918x928 drag 40 20 1800 20      # hover only
+    sudo python3 -I scripts/inject-input.py --output 1918x928 drag 500 400 900 400 --mods ctrl
+    sudo python3 -I scripts/inject-input.py --output 1918x928 drag 500 400 900 400 --mods-at 20:shift
     sudo python3 -I scripts/inject-input.py button right click
     sudo python3 -I scripts/inject-input.py key KEY_ESC tap
+    sudo python3 -I scripts/inject-input.py key KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_C tap
+    sudo python3 -I scripts/inject-input.py type lumen-1
     sudo python3 -I scripts/inject-input.py watch > seen.jsonl     # until SIGTERM
 
 `watch` records every input frame the kernel delivers on every /dev/input/event* node,
@@ -57,9 +61,19 @@ SYN_REPORT = 0
 ABS_X, ABS_Y = 0x00, 0x01
 
 BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
-KEYS = {"KEY_ESC": 1, "KEY_LEFTMETA": 125, "KEY_LEFTSHIFT": 42, "KEY_LEFTCTRL": 29,
-        "KEY_LEFTALT": 56, "KEY_ENTER": 28, "KEY_SPACE": 57, "KEY_A": 30, "KEY_F10": 68,
-        "KEY_UP": 103, "KEY_LEFT": 105, "KEY_RIGHT": 106, "KEY_DOWN": 108}
+KEYS = {"KEY_ESC": 1, "KEY_LEFTMETA": 125, "KEY_LEFTSHIFT": 42, "KEY_RIGHTSHIFT": 54,
+        "KEY_LEFTCTRL": 29, "KEY_LEFTALT": 56, "KEY_ENTER": 28, "KEY_SPACE": 57,
+        "KEY_F10": 68, "KEY_UP": 103, "KEY_LEFT": 105, "KEY_RIGHT": 106, "KEY_DOWN": 108,
+        "KEY_MINUS": 12, "KEY_INSERT": 110, "KEY_BACKSPACE": 14, "KEY_TAB": 15}
+# Letters and digits by their evdev codes (US layout rows).
+for _row, _first in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
+    for _i, _ch in enumerate(_row):
+        KEYS[f"KEY_{_ch.upper()}"] = _first + _i
+for _i, _ch in enumerate("1234567890"):
+    KEYS[f"KEY_{_ch}"] = 2 + _i
+# `type`: characters reachable without a modifier on a US layout.
+TYPEABLE = {ch: KEYS[f"KEY_{ch.upper()}"] for ch in "abcdefghijklmnopqrstuvwxyz0123456789"}
+TYPEABLE.update({"-": KEYS["KEY_MINUS"], " ": KEYS["KEY_SPACE"]})
 
 # struct input_event on 64-bit Linux: struct timeval (two longs), __u16 type, __u16 code,
 # __s32 value. The kernel ignores the time of a written event and stamps its own.
@@ -96,6 +110,10 @@ class Injector:
         self.ptr = None
         self.kbd = None
         self.range = None
+        # What this run has pressed and not yet released, in press order: a real evdev node
+        # (not uinput) releases nothing by itself when the writer dies.
+        self.down_keys = []
+        self.down_buttons = []
 
     # ── devices ─────────────────────────────────────────────────────────────
 
@@ -165,13 +183,36 @@ class Injector:
         t = now_us()
         os.write(self.pointer(), pack(EV_KEY, BUTTONS[name], 1 if pressed else 0) +
                  pack(EV_SYN, SYN_REPORT, 0))
+        self.track(self.down_buttons, name, pressed)
         self.record("button", t, button=name, pressed=pressed)
 
     def key(self, code, pressed):
         t = now_us()
         os.write(self.keyboard(), pack(EV_KEY, code, 1 if pressed else 0) +
                  pack(EV_SYN, SYN_REPORT, 0))
+        self.track(self.down_keys, code, pressed)
         self.record("key", t, code=code, pressed=pressed)
+
+    @staticmethod
+    def track(down, what, pressed):
+        if pressed and what not in down:
+            down.append(what)
+        elif not pressed and what in down:
+            down.remove(what)
+
+    def release_held(self):
+        """Releases every button and key this run left down, buttons first, keys in reverse
+        press order. Best effort: one failed write does not keep the rest down."""
+        for name in reversed(list(self.down_buttons)):
+            try:
+                self.button(name, False)
+            except OSError:
+                pass
+        for code in reversed(list(self.down_keys)):
+            try:
+                self.key(code, False)
+            except OSError:
+                pass
 
     def close(self):
         for fd in (self.ptr, self.kbd):
@@ -214,10 +255,49 @@ def key_code(text):
                                      f"{', '.join(sorted(KEYS))}")
 
 
-def run_drag(inj, a):
-    """Press (optionally under Super), move in even steps `interval` apart, release.
+def key_combo(text):
+    """KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_C: pressed in order, released in reverse."""
+    return [key_code(part) for part in text.split("+")]
 
-    With --button none it is a hover sweep. --esc-at N taps Escape after step N.
+
+def run_type(inj, text):
+    for ch in text:
+        if ch not in TYPEABLE:
+            sys.exit(f"inject-input: type: {ch!r} needs a modifier or is not mapped; "
+                     f"use [a-z0-9 -]")
+        inj.key(TYPEABLE[ch], True)
+        time.sleep(0.02)
+        inj.key(TYPEABLE[ch], False)
+        time.sleep(0.03)
+
+
+MODIFIERS = {"super": "KEY_LEFTMETA", "shift": "KEY_LEFTSHIFT", "ctrl": "KEY_LEFTCTRL",
+             "alt": "KEY_LEFTALT"}
+
+
+def mod_list(text):
+    """ctrl,shift: modifier names in press order ("" or "none" for none)."""
+    names = [] if text in ("", "none") else text.split(",")
+    for n in names:
+        if n not in MODIFIERS:
+            raise argparse.ArgumentTypeError(f"unknown modifier {n!r}; use {', '.join(MODIFIERS)}")
+    return names
+
+
+def mods_at(text):
+    """STEP:LIST — after motion STEP the held modifiers become LIST."""
+    step, _, names = text.partition(":")
+    if not step.isdigit():
+        raise argparse.ArgumentTypeError(f"--mods-at wants STEP:LIST, got {text!r}")
+    return int(step), mod_list(names)
+
+
+def run_drag(inj, a):
+    """Press (optionally under modifiers), move in even steps `interval` apart, release.
+
+    With --button none it is a hover sweep. --esc-at N taps Escape after step N. --mods holds
+    modifiers around the whole drag (--super is --mods super); --mods-at N:LIST changes the
+    held set after step N (released ones first).
     """
     interval_ns = int(a.interval_ms * 1e6)
     steps = a.steps
@@ -226,11 +306,14 @@ def run_drag(inj, a):
         steps = max(1, int(round(dist / a.step_px)))
     inj.move(a.x0, a.y0, "pre")
     time.sleep(0.05)
-    super_down = button_down = False
+    held = []  # modifier names currently down, in press order
+    button_down = False
+    wanted = list(a.mods) + (["super"] if a.super and "super" not in a.mods else [])
+    changes = dict(a.mods_at)
     try:
-        if a.super:
-            inj.key(KEYS["KEY_LEFTMETA"], True)
-            super_down = True
+        for name in wanted:
+            inj.key(KEYS[MODIFIERS[name]], True)
+            held.append(name)
             time.sleep(0.03)
         if a.button != "none":
             inj.button(a.button, True)
@@ -244,6 +327,13 @@ def run_drag(inj, a):
             if i == a.esc_at:
                 inj.key(KEYS["KEY_ESC"], True)
                 inj.key(KEYS["KEY_ESC"], False)
+            if i in changes:
+                for name in [n for n in held if n not in changes[i]]:
+                    inj.key(KEYS[MODIFIERS[name]], False)
+                    held.remove(name)
+                for name in [n for n in changes[i] if n not in held]:
+                    inj.key(KEYS[MODIFIERS[name]], True)
+                    held.append(name)
         # Hold still briefly before release, as a hand does: the last position is shown
         # before the grab ends, so the final geometry is the drag's end and not a racing one.
         time.sleep(a.hold_ms / 1000.0)
@@ -253,8 +343,8 @@ def run_drag(inj, a):
         if button_down:
             inj.button(a.button, False)
             time.sleep(0.03)
-        if super_down:
-            inj.key(KEYS["KEY_LEFTMETA"], False)
+        for name in reversed(held):
+            inj.key(KEYS[MODIFIERS[name]], False)
 
 
 def run_watch():
@@ -335,6 +425,10 @@ def main():
         s.add_argument(name, type=float)
     s.add_argument("--button", choices=sorted(BUTTONS) + ["none"], default="left")
     s.add_argument("--super", action="store_true", help="hold KEY_LEFTMETA around the drag")
+    s.add_argument("--mods", type=mod_list, default=[],
+                   help="modifiers held around the drag: comma list of super,shift,ctrl,alt")
+    s.add_argument("--mods-at", type=mods_at, action="append", default=[],
+                   help="STEP:LIST — after motion STEP the held modifiers become LIST")
     s.add_argument("--steps", type=int, default=0,
                    help="motion events (default: one per --step-px of distance)")
     s.add_argument("--step-px", type=float, default=4.0)
@@ -346,9 +440,14 @@ def main():
     s.add_argument("name", choices=sorted(BUTTONS))
     s.add_argument("action", choices=("press", "release", "click", "dblclick"))
 
-    s = sub.add_parser("key", help="keyboard key (evdev code or KEY_* name)")
-    s.add_argument("code", type=key_code)
+    s = sub.add_parser("key", help="keyboard key or chord (evdev code or KEY_* name; "
+                                   "KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_C presses in order and "
+                                   "releases in reverse)")
+    s.add_argument("code", type=key_combo)
     s.add_argument("action", choices=("press", "release", "tap"))
+
+    s = sub.add_parser("type", help="tap each character of TEXT ([a-z0-9 -], US layout)")
+    s.add_argument("text")
 
     sub.add_parser("watch", help="record every frame on every event node until SIGTERM")
 
@@ -366,6 +465,7 @@ def main():
     if output is None and a.compositor_log:
         output = output_from_log(a.compositor_log)
     inj = Injector(a.pointer, a.keyboard, output, a.tag)
+    completed = False
     try:
         if a.cmd == "move":
             inj.move(a.x, a.y)
@@ -388,14 +488,28 @@ def main():
                 inj.button(a.name, False)
         elif a.cmd == "key":
             if a.action in ("press", "tap"):
-                inj.key(a.code, True)
+                for code in a.code:
+                    inj.key(code, True)
+                    if len(a.code) > 1:
+                        time.sleep(0.02)
             if a.action == "tap":
                 time.sleep(0.03)
             if a.action in ("release", "tap"):
-                inj.key(a.code, False)
+                for code in reversed(a.code):
+                    inj.key(code, False)
+                    if len(a.code) > 1:
+                        time.sleep(0.02)
+        elif a.cmd == "type":
+            run_type(inj, a.text)
+        completed = True
     except OSError as e:
         sys.exit(f"inject-input: {e}")
     finally:
+        # Interrupted (Ctrl+C, SIGTERM, a failed write) between a press and its release: let
+        # go of what this run pressed, or the session keeps a modifier or a letter held until
+        # someone taps it. Only a completed `press` means to leave something down.
+        if not (completed and getattr(a, "action", None) == "press"):
+            inj.release_held()
         inj.close()
 
 

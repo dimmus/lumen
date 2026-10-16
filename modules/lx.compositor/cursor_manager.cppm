@@ -156,6 +156,19 @@ public:
                                   unsigned width, unsigned height, unsigned stride_px,
                                   bool opaque, int dx, int dy);
     void on_surface_destroyed(lx::surface_id surface);
+    /// Called when the client cursor surface being shown changes (either may be null): the
+    /// protocol layer sends it wl_surface.enter/leave for the output under the pointer — a
+    /// client picks its cursor buffer scale from that (GTK does).
+    using surface_hook = void (*)(void* user, lx::surface_id old_surface,
+                                  lx::surface_id new_surface);
+    void set_surface_hook(surface_hook fn, void* user) {
+        surface_hook_ = fn;
+        surface_hook_user_ = user;
+    }
+    /// The client surface the pointer shows, null when it shows a shape or nothing.
+    [[nodiscard]] lx::surface_id shown_surface() const {
+        return mode_ == client_mode::surface ? client_surface_ : lx::surface_id{};
+    }
 
     // Compositor.
     void set_override(cursor_shape shape);
@@ -189,6 +202,8 @@ private:
     };
 
     void sync_focus();
+    /// Fires the surface hook when `shown_surface()` changed since it last did.
+    void notify_surface();
     void resolve();
     void publish_frame();
     void update_software(bool want);
@@ -221,6 +236,9 @@ private:
     unsigned long long cache_stamp_ = 0;
     bool needs_resolve_ = true;
     bool force_image_ = false;
+    surface_hook surface_hook_ = nullptr;
+    void* surface_hook_user_ = nullptr;
+    lx::surface_id notified_surface_{};
 
     // Resolved.
     cursor_image_view view_{};
@@ -338,6 +356,17 @@ void lx::compositor::cursor_manager::sync_focus() {
     mode_ = client_mode::none;
     client_surface_ = {};
     needs_resolve_ = true;
+    notify_surface();
+}
+
+void lx::compositor::cursor_manager::notify_surface() {
+    const lx::surface_id now = shown_surface();
+    if (now == notified_surface_)
+        return;
+    const lx::surface_id old = notified_surface_;
+    notified_surface_ = now;
+    if (surface_hook_)
+        surface_hook_(surface_hook_user_, old, now);
 }
 
 lx::compositor::cursor_manager::surface_image*
@@ -355,6 +384,7 @@ void lx::compositor::cursor_manager::set_client_shape(cursor_shape shape) {
     mode_ = client_mode::shape;
     client_shape_ = shape;
     needs_resolve_ = true;
+    notify_surface();
 }
 
 void lx::compositor::cursor_manager::set_client_surface(lx::surface_id surface, int hot_x,
@@ -370,6 +400,7 @@ void lx::compositor::cursor_manager::set_client_surface(lx::surface_id surface, 
         client_hot_y_ = hot_y;
         force_image_ = true;
     }
+    notify_surface();
     needs_resolve_ = true;
 }
 
@@ -455,6 +486,7 @@ void lx::compositor::cursor_manager::on_surface_destroyed(lx::surface_id surface
         client_surface_ = {};
         needs_resolve_ = true;
     }
+    notify_surface();
 }
 
 void lx::compositor::cursor_manager::set_override(cursor_shape shape) {

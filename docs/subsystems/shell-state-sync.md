@@ -11,14 +11,38 @@ Implemented in `zlm_policy_bridge_v1` (`protocols/lumen/zlm_shell_v1.xml`):
 
 | Phase | Events |
 |-------|--------|
-| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 1) |
-| Initial sync | `snapshot_begin` → `snapshot_workspace*` → `snapshot_toplevel*` → `snapshot_output*` → `snapshot_done` → `focus_changed` |
-| Runtime deltas | `toplevel_created`, `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `focus_changed`, `stacking_order_changed` |
+| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 2) |
+| Initial sync | `snapshot_begin` → `snapshot_workspace*` → (`snapshot_toplevel` [→ `toplevel_flags`])* → `snapshot_output*` → `snapshot_done` → `focus_changed` |
+| Runtime deltas | `toplevel_created` (→ `toplevel_state`, `toplevel_geometry` [, `toplevel_flags`]), `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `toplevel_flags` (v2), `focus_changed`, `stacking_order_changed` |
 
 The snapshot carries no focus, so the compositor follows `snapshot_done` at once with a
 `focus_changed` naming the focused window (or null). It is an ordinary v1 delta: no XML
 change and no version bump, and a shell can highlight the focused window from its first
 frame instead of waiting for the next focus change.
+
+### Version 2: attention flags
+
+Every zlm interface is at version 2 (the family moves together: child objects take their
+parent's version, and `zlm_toplevel_v1` handles take the bridge's). Version 2 adds the
+bitfield enum `toplevel_flag` (`not_responding` = 1, `demands_attention` = 2) and the event
+`toplevel_flags(toplevel, flags)`, sent right after `snapshot_toplevel` and after
+`toplevel_created` when the flags are non-zero, and whenever they change. Only bridges bound
+at version 2 receive it; a version 1 shell binds version 1 and never sees it. lumen-shell
+binds `min(advertised, 2)`.
+
+- **`not_responding`**: the client left an `xdg_wm_base.ping` unanswered past the
+  compositor's timeout (`--ping-timeout`, 5 s). The compositor only shows it — "(Not
+  Responding)" in its server-side title, the window dimmed, pointer motion withheld — and
+  clears it when the client answers. It never kills the client: the shell may offer "wait /
+  force quit", and that is the user's decision.
+- **`demands_attention`**: an `xdg_activation_v1.activate` of the window was refused focus
+  (focus-stealing prevention: the token was unknown, expired, issued without a serial or
+  not from the issuer's own input, or the user pressed a key or button in another window
+  after it was issued). The window keeps its place in the stacking order — a new window
+  refused at map opens just below the focused one — and the shell is expected to draw
+  attention to its task (lumen-shell: an amber fill). Never set on the window that has the
+  keyboard; cleared when the window gets the keyboard (a `request_activate` from the shell
+  included) or unmaps.
 
 ## Compositor-owned handles
 
@@ -151,7 +175,7 @@ and the compositor warns `bridge replaced`).
 libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phase 3):
 
 - **Startup.** Bind `wl_compositor` (v4+), `wl_shm`, `zwlr_layer_shell_v1` (v4),
-  `zlm_shell_v1` (v1) and, if present, `wp_cursor_shape_manager_v1`; the bridge listens on
+  `zlm_shell_v1` (v2, or what the compositor advertises) and, if present, `wp_cursor_shape_manager_v1`; the bridge listens on
   `zlm_shell_v1` in the same dispatch as the bind, because `capabilities` follows at once
   and libwayland drops events for a proxy with no listener. A second roundtrip surfaces a
   refused bind as a protocol error: the shell logs why and exits 1. Then
@@ -175,7 +199,8 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   exclusive zone 32, keyboard interactivity `none`, namespace `lumen-panel`. One entry per
   window, left to right: 24 px tall, 4 px apart, width `(W − 8 − 4·(n−1)) / n` clamped to
   48–220 px; entries that do not fit at 48 px collapse into a "+k" label. The focused
-  entry is highlighted; hover and press are shown. Labels are the title (else the app_id),
+  entry is highlighted; hover and press are shown; an entry demanding attention gets an
+  amber fill, and a not-responding window's label is drawn dimmed (`toplevel_flags`). Labels are the title (else the app_id),
   rasterized with `lx::text` (`shape_line` / `fit_line` / `render_line`, Sans 10, ellipsized
   at a cluster boundary). XRGB8888 in two buffers of one sealed memfd pool, re-created only
   when the width changes.
@@ -192,7 +217,7 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   `wp_cursor_shape_v1` on enter.
 - **Logs** (`LUMEN_LOG` as for the compositor): `shell` (startup, exit), `shell.bridge`
   (`capabilities`, `snapshot toplevels=<n>` at info; `snapshot toplevel`, `add`, `remove`,
-  `title`, `state`, `focus handle=<slot|none>` at debug), `shell.panel` (`configure` at info;
+  `title`, `state`, `focus handle=<slot|none>`, `flags handle=<slot> flags=<bits>` at debug), `shell.panel` (`configure` at info;
   `layout idx=<i> x=<x> w=<w> handle=<slot> title="…"` on every re-layout, `draw entries=<n>
   hidden=<k> focused=<i> damage=<rects>[(full)] repaint=<rects> buffer=<b>` and
   `click idx=<i> handle=<slot>` at debug).

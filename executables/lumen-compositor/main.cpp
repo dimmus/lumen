@@ -32,6 +32,17 @@ int main(int argc, char* argv[]) {
         } else if (std::strncmp(arg, "--decorations", 13) == 0) {
             std::fprintf(stderr, "lumen-compositor: --decorations=server|client\n");
             return 2;
+        } else if (std::strcmp(arg, "--ping-timeout") == 0) {
+            // xdg_wm_base.ping timeout in ms before a client is shown as not responding;
+            // 0 disables pinging.
+            char* end = nullptr;
+            const long ms = i + 1 < argc ? std::strtol(argv[i + 1], &end, 10) : -1;
+            if (ms < 0 || !end || *end != '\0') {
+                std::fprintf(stderr, "lumen-compositor: --ping-timeout MS\n");
+                return 2;
+            }
+            cfg.ping_timeout_ms = static_cast<unsigned>(ms);
+            ++i;
         } else if (std::strcmp(arg, "--shell") == 0) {
             // The one binary zlm_shell_v1 binds are accepted from (default: lumen-shell
             // next to this executable).

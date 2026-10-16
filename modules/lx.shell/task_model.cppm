@@ -45,6 +45,14 @@ struct task_entry {
     /// Bumped whenever app_id or title changes, so a renderer can tell "same label" from
     /// "same handle" without comparing strings.
     unsigned label_rev = 0;
+    /// zlm_policy_bridge_v1.toplevel_flags (v2): `task_flag_*` bits.
+    unsigned flags = 0;
+};
+
+/// zlm_policy_bridge_v1.toplevel_flag values.
+enum task_flag : unsigned {
+    task_flag_not_responding = 0x1,
+    task_flag_demands_attention = 0x2,
 };
 
 /// What changed since the last `take_changes()` (a bit set).
@@ -55,6 +63,7 @@ enum task_change : unsigned {
     task_change_geometry = 1u << 3,
     task_change_focus = 1u << 4,
     task_change_stacking = 1u << 5,
+    task_change_flags = 1u << 6,    ///< not responding / demands attention
 };
 
 /// Copies `src` into `dst` (`cap` bytes including the terminator). A string that does not
@@ -93,6 +102,8 @@ public:
     unsigned set_state(task_handle h, const char* app_id, const char* title, unsigned state);
     bool set_geometry(task_handle h, lx::rect2i geometry);
     bool set_stacking(task_handle h, unsigned index);
+    /// toplevel_flags. Returns the change bits it caused.
+    unsigned set_flags(task_handle h, unsigned flags);
     /// focus_changed. A null or stale handle means no focus.
     void set_focus(task_handle h);
 
@@ -275,6 +286,15 @@ bool lx::shell::task_model::set_stacking(task_handle h, unsigned index) {
         changes_ |= task_change_stacking;
     }
     return true;
+}
+
+unsigned lx::shell::task_model::set_flags(task_handle h, unsigned flags) {
+    task_entry* e = get_mut(h);
+    if (!e || e->flags == flags)
+        return 0;
+    e->flags = flags;
+    changes_ |= task_change_flags;
+    return task_change_flags;
 }
 
 void lx::shell::task_model::set_focus(task_handle h) {

@@ -142,6 +142,9 @@ public:
     /// Width of the drawn text (the fit, ellipsis included), for centring.
     int title_text_width = 0;
     bool title_ready = false;
+    /// The client stopped answering pings: the frame is drawn through the same grey tint
+    /// as the window's surfaces.
+    bool dimmed = false;
     /// The atlas has been staged; nothing is drawn before (no draw of an unknown texture).
     const bool* atlas_ready = nullptr;
 };
@@ -168,6 +171,10 @@ public:
     void on_title_changed(const toplevel_record& rec);
     /// The window that owns the keyboard gets the active colours (null: none).
     void set_active(lx::toplevel_id id);
+    /// The client stopped (or resumed) answering pings: the title reads
+    /// "<title> (Not Responding)" — the suffix always visible, the title part ellipsized to
+    /// the room left (KWin) — and the frame is dimmed. Rasterized at the next `on_tick`.
+    void set_not_responding(lx::toplevel_id id, bool on);
     /// Close-button look (hover / pressed). Damages the button only.
     void set_button(lx::toplevel_id id, deco_button state);
     /// Damages the whole visible frame (the window was restacked).
@@ -197,6 +204,7 @@ private:
         unsigned glyph_end = 0;
         bool ellipsized = false;
         bool textures_staged = false;
+        bool not_responding = false;
     };
 
     [[nodiscard]] slot* find(lx::toplevel_id id);
@@ -218,6 +226,9 @@ private:
     bool warned_no_text_ = false;
     /// Scratch, reused: the shaped title and the raster buffer (grown, never shrunk).
     lx::text::shaped_line line_{};
+    /// " (Not Responding)", shaped once on first use.
+    lx::text::shaped_line suffix_line_{};
+    bool suffix_shaped_ = false;
     std::vector<std::uint32_t> raster_{};
 };
 
@@ -279,8 +290,15 @@ constexpr lx::text::raster_color k_text_inactive{0xA8, 0xA8, 0xAC, 0xFF};
 constexpr lx::text::font_desc k_title_font{"Sans", 10.f, lx::text::weight::bold,
                                            lx::text::style::normal};
 
+/// Appended to the title of a window whose client does not answer pings (KWin's wording).
+constexpr const char* k_not_responding_suffix = " (Not Responding)";
+/// The tint of a not-responding window, as `surface_tree::set_root_dim` uses for its
+/// surfaces.
+constexpr lx::color k_dim_tint = lx::color::rgb(0.65f, 0.65f, 0.65f, 1.f);
+constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
+
 void push_draw(lx::scene::draw_list& out, unsigned texture, lx::rect2i src, lx::rect2i dst,
-               lx::rect2i clip, lx::blend_mode blend) {
+               lx::rect2i clip, lx::blend_mode blend, lx::color tint = k_no_tint) {
     if (dst.width <= 0 || dst.height <= 0)
         return;
     lx::scene::draw_command cmd{};
@@ -289,7 +307,7 @@ void push_draw(lx::scene::draw_list& out, unsigned texture, lx::rect2i src, lx::
     cmd.dst = dst;
     cmd.clip = clip;
     cmd.opacity = 1.f;
-    cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
+    cmd.tint = tint;
     cmd.blend = blend;
     cmd.sort_key = lx::draw_sort_key::make(0, out.size());
     out.push(cmd);
@@ -489,28 +507,29 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out) const {
         return;
     const lx::rect2i g = geometry;
     const lx::rect2i f = frame_rect(g, extents);
+    const lx::color tint = dimmed ? k_dim_tint : k_no_tint;
     const unsigned atlas = k_deco_atlas_texture_id;
     const lx::rect2i border =
         swatch_centre(active ? deco_atlas::border_active : deco_atlas::border_inactive);
     // Borders: left and right full height, top and bottom between them.
     if (extents.left > 0)
         push_draw(out, atlas, border, {f.x, f.y, extents.left, f.height}, {},
-                  lx::blend_mode::opaque);
+                  lx::blend_mode::opaque, tint);
     if (extents.right > 0)
         push_draw(out, atlas, border, {g.x + g.width, f.y, extents.right, f.height}, {},
-                  lx::blend_mode::opaque);
+                  lx::blend_mode::opaque, tint);
     if (extents.top > k_deco_title_height)
         push_draw(out, atlas, border,
                   {g.x, f.y, g.width, extents.top - k_deco_title_height}, {},
-                  lx::blend_mode::opaque);
+                  lx::blend_mode::opaque, tint);
     if (extents.bottom > 0)
         push_draw(out, atlas, border, {g.x, g.y + g.height, g.width, extents.bottom}, {},
-                  lx::blend_mode::opaque);
+                  lx::blend_mode::opaque, tint);
 
     const lx::rect2i title = title_rect(g);
     push_draw(out, atlas,
               swatch_centre(active ? deco_atlas::title_active : deco_atlas::title_inactive),
-              title, {}, lx::blend_mode::opaque);
+              title, {}, lx::blend_mode::opaque, tint);
 
     if (title_ready && title_size.width > 0 && title_size.height > 0) {
         const int room = title_text_room(g.width);
@@ -520,7 +539,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out) const {
         push_draw(out, title_texture[active ? 0 : 1], {0, 0, title_size.width, title_size.height},
                   {x - title_pad, y, title_size.width, title_size.height},
                   {title.x, title.y, g.width - k_deco_title_height, k_deco_title_height},
-                  lx::blend_mode::premultiplied);
+                  lx::blend_mode::premultiplied, tint);
     }
 
     const lx::rect2i close = close_rect(g);
@@ -530,14 +549,14 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out) const {
         push_draw(out, atlas, c,
                   {close.x + (close.width - c.width) / 2, close.y + (close.height - c.height) / 2,
                    c.width, c.height},
-                  title, lx::blend_mode::premultiplied);
+                  title, lx::blend_mode::premultiplied, tint);
     }
     const lx::rect2i glyph = button != deco_button::normal || active ? deco_atlas::close_light
                                                                      : deco_atlas::close_dim;
     push_draw(out, atlas, glyph,
               {close.x + (close.width - glyph.width) / 2,
                close.y + (close.height - glyph.height) / 2, glyph.width, glyph.height},
-              title, lx::blend_mode::premultiplied);
+              title, lx::blend_mode::premultiplied, tint);
 }
 
 // ── decoration_manager ─────────────────────────────────────────────────────
@@ -587,6 +606,8 @@ lx::compositor::decoration_manager::alloc(const toplevel_record& rec) {
         s.glyph_end = 0;
         s.ellipsized = false;
         s.textures_staged = false;
+        s.not_responding = false;
+        s.node.dimmed = false;
         s.node.geometry = {};
         s.node.extents = {};
         s.node.shown = false;
@@ -661,6 +682,8 @@ void lx::compositor::decoration_manager::sync(const toplevel_record& rec) {
         s->title_changed = true;
         any_dirty_ = true;
     }
+    if (s->not_responding != rec.not_responding)
+        set_not_responding(rec.id, rec.not_responding);
     if (!s->installed && tree_) {
         tree_->set_underlay(s->root, &s->node);
         s->installed = true;
@@ -714,6 +737,17 @@ void lx::compositor::decoration_manager::set_active(lx::toplevel_id id) {
                       previous.id());
         log(line);
     }
+}
+
+void lx::compositor::decoration_manager::set_not_responding(lx::toplevel_id id, bool on) {
+    slot* s = find(id);
+    if (!s || s->not_responding == on)
+        return;
+    s->not_responding = on;
+    s->node.dimmed = on;
+    s->title_changed = true;
+    any_dirty_ = true;
+    damage_strips(s->node);
 }
 
 void lx::compositor::decoration_manager::set_button(lx::toplevel_id id, deco_button state) {
@@ -776,33 +810,61 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
         s.glyph_end = 0;
         s.ellipsized = false;
     };
-    if (room <= 0 || s.title[0] == '\0') {
-        drop();
-        return;
-    }
-    if (auto shaped = lx::text::shape_line(s.title, k_title_font, line_); !shaped) {
+    const auto warn_no_text = [&] {
         if (!warned_no_text_) {
             warned_no_text_ = true;
             lx::trace::logger::global().log(lx::trace::level::warn, k_deco_category,
                                             "no title text: lx.text cannot shape (no font "
                                             "face, or built without HarfBuzz). Reported once.");
         }
+    };
+    // A not-responding window shows the suffix whatever the title's length: the title part
+    // gets what room the suffix leaves (KWin).
+    int suffix_w = 0;
+    if (s.not_responding) {
+        if (!suffix_shaped_) {
+            if (auto shaped = lx::text::shape_line(k_not_responding_suffix, k_title_font,
+                                                   suffix_line_);
+                !shaped) {
+                warn_no_text();
+                drop();
+                return;
+            }
+            suffix_shaped_ = true;
+        }
+        suffix_w = suffix_line_.width_px;
+    }
+    if (room <= 0 || (s.title[0] == '\0' && !s.not_responding)) {
         drop();
         return;
     }
-    const lx::text::line_fit fit = lx::text::fit_line(line_, room);
-    if (fit.width_px <= 0) {
+    lx::text::line_fit fit{};
+    if (s.title[0] != '\0') {
+        if (auto shaped = lx::text::shape_line(s.title, k_title_font, line_); !shaped) {
+            warn_no_text();
+            drop();
+            return;
+        }
+        fit = lx::text::fit_line(line_, room - suffix_w);
+    }
+    // The suffix alone when the title gets no room; then it may be ellipsized itself.
+    lx::text::line_fit suffix_fit{};
+    if (s.not_responding)
+        suffix_fit = lx::text::fit_line(suffix_line_, fit.width_px > 0 ? suffix_w : room);
+    const int text_w = fit.width_px + suffix_fit.width_px;
+    if (text_w <= 0) {
         drop();
         return;
     }
     // A resize that leaves the cut where it was costs nothing: same pixels, same texture.
     if (!changed && n.title_ready && fit.glyph_end == s.glyph_end &&
-        fit.ellipsized == s.ellipsized)
+        fit.ellipsized == s.ellipsized && !s.not_responding)
         return;
 
     constexpr int k_pad = 2; // glyph ink may overhang the advance box
-    const int w = fit.width_px + 2 * k_pad;
-    const int h = line_.ascent_px + line_.descent_px;
+    const int w = text_w + 2 * k_pad;
+    const lx::text::shaped_line& metrics = fit.width_px > 0 ? line_ : suffix_line_;
+    const int h = metrics.ascent_px + metrics.descent_px;
     if (w <= 0 || h <= 0 || !ops_.stage) {
         drop();
         return;
@@ -813,8 +875,13 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     const lx::text::raster_color colours[2] = {k_text_active, k_text_inactive};
     for (unsigned i = 0; i < 2; ++i) {
         std::memset(raster_.data(), 0, px * sizeof(std::uint32_t));
-        (void)lx::text::render_line(line_, fit, colours[i], {raster_.data(), w, h, w},
-                                    {k_pad, line_.ascent_px});
+        if (fit.width_px > 0)
+            (void)lx::text::render_line(line_, fit, colours[i], {raster_.data(), w, h, w},
+                                        {k_pad, metrics.ascent_px});
+        if (suffix_fit.width_px > 0)
+            (void)lx::text::render_line(suffix_line_, suffix_fit, colours[i],
+                                        {raster_.data(), w, h, w},
+                                        {k_pad + fit.width_px, metrics.ascent_px});
         if (!ops_.stage(ops_.user, n.title_texture[i], raster_.data(), static_cast<unsigned>(w),
                         static_cast<unsigned>(h), static_cast<unsigned>(w),
                         static_cast<unsigned>(w), static_cast<unsigned>(h))) {
@@ -829,7 +896,7 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     damage_title(n); // old extent
     n.title_size = {w, h};
     n.title_pad = k_pad;
-    n.title_text_width = fit.width_px;
+    n.title_text_width = text_w;
     n.title_ready = true;
     s.glyph_end = fit.glyph_end;
     s.ellipsized = fit.ellipsized;
@@ -837,8 +904,9 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     if (deco_debug()) {
         char line[320];
         std::snprintf(line, sizeof(line),
-                      "decoration title id=%llu width=%d ellipsized=%d title=\"%.200s\"",
-                      s.id.id(), fit.width_px, fit.ellipsized ? 1 : 0, s.title);
+                      "decoration title id=%llu width=%d ellipsized=%d title=\"%.200s%s\"",
+                      s.id.id(), text_w, fit.ellipsized ? 1 : 0, s.title,
+                      s.not_responding ? k_not_responding_suffix : "");
         log(line);
     }
 }

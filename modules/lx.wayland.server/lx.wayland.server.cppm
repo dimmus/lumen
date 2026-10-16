@@ -141,6 +141,15 @@ public:
     [[nodiscard]] client_connection* find_client_by_native(void* wl_client);
     [[nodiscard]] client_connection* ensure_client(void* wl_client);
 
+    /// Called once per client from its destroy signal, after it has left this table and
+    /// before libwayland destroys its objects: state keyed by the `wl_client*` (which may
+    /// be reused afterwards) is dropped here. One hook; installed by the protocol layer.
+    using client_destroyed_fn = void (*)(void* user, unsigned client_id, void* wl_client);
+    void set_client_destroyed_hook(client_destroyed_fn fn, void* user) {
+        client_destroyed_ = fn;
+        client_destroyed_user_ = user;
+    }
+
     /// Native `wl_display*` (nullptr when unavailable).
     [[nodiscard]] void* native_display() const;
     /// Wayland event-loop fd for `lx.runtime::event_loop` integration.
@@ -180,6 +189,8 @@ private:
     int listen_fd_ = -1;
     char socket_path_[108]{};
     bool bound_ = false;
+    client_destroyed_fn client_destroyed_ = nullptr;
+    void* client_destroyed_user_ = nullptr;
 #if defined(_WIN32)
     char shell_binary_path_[260]{};
 #else
@@ -347,6 +358,23 @@ void lx::wayland::server::advertise_pending_globals() {
     }
 }
 
+#if defined(LUMEN_HAS_WAYLAND)
+namespace {
+/// Per-client connection buffer: 1 MiB instead of libwayland's 4 KiB default (KWin MR 5984,
+/// "1 MiB ≈ 30 s of unprocessed motion"). With 4 KiB libwayland disconnects a client that
+/// stops reading for a hundred pointer motions — a stopped or hung client would be killed by
+/// the protocol library, and Lumen never kills clients for being slow. The memory is only
+/// used while a client is behind.
+void raise_client_buffers(wl_display* display) {
+#if WAYLAND_VERSION_MAJOR > 1 || (WAYLAND_VERSION_MAJOR == 1 && WAYLAND_VERSION_MINOR >= 23)
+    wl_display_set_default_max_buffer_size(display, 1u << 20);
+#else
+    (void)display;
+#endif
+}
+} // namespace
+#endif
+
 lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
     const char* name = (socket_name && socket_name[0] != '\0') ? socket_name : "lumen-0";
 
@@ -356,6 +384,7 @@ lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
                               static_cast<int>(lx::wayland_err::bind_failed),
                               "wl_display_create failed");
     }
+    raise_client_buffers(display_);
 
     if (wl_display_add_socket(display_, name) != 0) {
         wl_display_destroy(display_);
@@ -430,6 +459,7 @@ lx::result<void> lx::wayland::server::bind_socketless() {
                               static_cast<int>(lx::wayland_err::bind_failed),
                               "wl_display_create failed");
     }
+    raise_client_buffers(display_);
     bound_ = true;
     return {};
 #else
@@ -669,7 +699,7 @@ lx::wayland::client_connection* lx::wayland::server::ensure_client(void* wl_clie
     link->server = this;
     link->client_id = slot.id();
     wl_list_init(&link->listener.link);
-    link->listener.notify = [](struct wl_listener* listener, void* /*data*/) {
+    link->listener.notify = [](struct wl_listener* listener, void* data) {
         auto* self = reinterpret_cast<client_destroy_link*>(
             reinterpret_cast<char*>(listener) - offsetof(client_destroy_link, listener));
         server* srv = self->server;
@@ -682,6 +712,8 @@ lx::wayland::client_connection* lx::wayland::server::ensure_client(void* wl_clie
                 break;
             }
         }
+        if (srv->client_destroyed_)
+            srv->client_destroyed_(srv->client_destroyed_user_, self->client_id, data);
     };
     wl_client_add_destroy_listener(static_cast<struct wl_client*>(wl_client), &link->listener);
 #endif

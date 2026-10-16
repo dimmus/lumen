@@ -40,8 +40,8 @@ struct color_management_state {
 };
 
 /// Registers and tracks standard public Wayland globals (workspace, …). xdg-decoration and
-/// wlr-layer-shell are served by protocols_p0 (`:decoration` and `:layer_shell` hold their
-/// logic).
+/// wlr-layer-shell are served by the protocol wire units (`wire_*.cpp`; `:decoration` and
+/// `:layer_shell` hold their logic).
 class protocol_managers {
 public:
     [[nodiscard]] lx::result<void> install(wayland::server& server);
@@ -70,9 +70,8 @@ public:
     void set_text_input_focus(lx::surface_id surface);
     [[nodiscard]] const text_input_state& text_input() const;
 
-    // pointer / selection / latency / color (state tracked for shell + render)
+    // pointer / latency / color (state tracked for shell + render)
     void set_pointer_locked(lx::surface_id surface, bool locked);
-    void set_primary_selection(const char* utf8);
     void set_surface_manager(surface_manager* surfaces);
     void set_content_type(lx::surface_id surface, content_hint hint);
     void set_tearing_allowed(lx::surface_id surface, bool allowed);
@@ -94,7 +93,6 @@ private:
     unsigned output_config_count_ = 0;
     text_input_state text_input_{};
     lx::surface_id pointer_locked_surface_{};
-    const char* primary_selection_ = "";
     color_management_state color_{};
 };
 
@@ -121,7 +119,6 @@ lx::result<void> lx::compositor::protocol_managers::install(wayland::server& ser
         {"zwp_relative_pointer_manager_v1", 1, false},
         {"wp_fractional_scale_manager_v1", 1, false},
         {"wp_cursor_shape_manager_v1", 1, false},
-        {"zwp_primary_selection_device_manager_v1", 1, false},
         {"wp_single_pixel_buffer_manager_v1", 1, false},
         {"wp_alpha_modifier_v1", 1, false},
         {"wp_tearing_control_manager_v1", 1, false},
@@ -204,10 +201,6 @@ const lx::compositor::text_input_state& lx::compositor::protocol_managers::text_
 
 void lx::compositor::protocol_managers::set_pointer_locked(lx::surface_id surface, bool locked) {
     pointer_locked_surface_ = locked ? surface : lx::surface_id{};
-}
-
-void lx::compositor::protocol_managers::set_primary_selection(const char* utf8) {
-    primary_selection_ = utf8 ? utf8 : "";
 }
 
 void lx::compositor::protocol_managers::set_surface_manager(surface_manager* surfaces) {

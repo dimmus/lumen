@@ -57,6 +57,12 @@ compositor logs both paths). The shell exits 0 on SIGTERM and 1 when refused or 
 compositor goes away; `lumen-shell.service` restarts it. `LUMEN_LOG=debug` on either
 process shows the bridge traffic (`compositor.shell`, `shell.bridge`, `shell.panel`).
 
+`lumen-compositor` options: `[socket-name]`, `-f FPS` (frame clock without a display mode),
+`--decorations=server|client`, `--shell PATH`, and `--ping-timeout MS` — how long a client
+may leave an `xdg_wm_base.ping` unanswered before it is shown as not responding (title
+suffix, dimmed window, the shell's flag; it is never killed). Default 5000 (Mutter's); 0
+disables pinging.
+
 ## Architecture
 
 **Full architecture guide:** [docs/architecture.md](docs/architecture.md) — processes, module layers, workflows, protocols.

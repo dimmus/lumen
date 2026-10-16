@@ -7,6 +7,8 @@ import lx.runtime;
 
 export module lx.compositor:toplevel;
 
+import :activation;
+
 export namespace lx::compositor {
 
 /// Compositor-side toplevel states, mapped to the xdg_toplevel values on the wire.
@@ -156,6 +158,25 @@ struct toplevel_record {
     /// unset_maximized are always answered by a configure (xdg-shell), maximized already or
     /// not.
     bool configure_due = false;
+
+    // ── attention (zlm_policy_bridge_v1.toplevel_flags) ──
+    /// The client did not answer an xdg_wm_base.ping in time (`liveness_tracker`). Shown —
+    /// title suffix, dimmed tree, the shell's flag — never acted on: the compositor does not
+    /// kill clients.
+    bool not_responding = false;
+    /// An xdg_activation_v1.activate of this window was refused focus (focus-stealing
+    /// prevention); the shell shows it. Cleared when the window gets the keyboard or unmaps.
+    bool demands_attention = false;
+
+    // ── xdg-activation before map ──
+    /// activate arrived before the window mapped: decided again at map by the same rules
+    /// (`decide_activation`), with the request's time. A refused one keeps the new window
+    /// from taking the keyboard.
+    bool activation_pending = false;
+    /// The token was known (`pending_grant` is meaningful); false: an unknown token.
+    bool activation_token_known = false;
+    activation_grant pending_grant{};
+    lx::runtime::clock_time activation_requested_ns = 0;
 
     lx::workspace_id workspace{};
     unsigned wire_id = 0;           ///< zlm_toplevel_v1 Wayland object id (P0)

@@ -400,9 +400,18 @@ finish
 begin i
 read -r X Y W H < <(geom 2)
 CX=$((X + W / 2)); CY=$((Y + H / 2))
+GRABS_BEFORE=$(grep -c "compositor.wm: grab begin id=2 " "$COMP_LOG")
 inject drag "$CX" "$CY" $((CX + 200)) $((CY + 100)) --button left --super --steps 80 &
 BG_INJ_PID=$!
-sleep 0.4
+# Kill once the grab has really begun, not after a fixed delay: sudo and Python start-up
+# sometimes took longer than the old 0.4 s, so the press arrived after the window was
+# gone, no grab began, and the scenario failed on timing alone. Bounded, so a grab that
+# never starts still ends in an honest FAIL rather than a hang.
+for _ in $(seq 1 60); do
+  (( $(grep -c "compositor.wm: grab begin id=2 " "$COMP_LOG") > GRABS_BEFORE )) && break
+  sleep 0.05
+done
+sleep 0.15  # a few motions into the grab
 kill -9 "$SQ2_PID" 2>/dev/null; wait "$SQ2_PID" 2>/dev/null; SQ2_PID=""
 wait "$BG_INJ_PID"; BG_INJ_PID=""
 sleep 0.4

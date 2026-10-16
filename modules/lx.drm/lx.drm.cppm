@@ -41,8 +41,21 @@ struct connector_info {
     unsigned id = 0;
     unsigned crtc_id = 0;
     connector_status status = connector_status::unknown;
+    /// The kernel's connector name, `<type>-<type id>` ("DP-1", "HDMI-A-2", "Virtual-1"):
+    /// what wlroots, Mutter and KWin call the output, so a name is the same everywhere.
     const char* name = "";
+    /// DRM_MODE_CONNECTOR_* and its per-type index.
+    unsigned type = 0;
+    unsigned type_id = 0;
+    /// Physical size of the display, 0 when unknown (projectors, virtual outputs).
+    unsigned phys_w_mm = 0;
+    unsigned phys_h_mm = 0;
 };
+
+/// "DP", "HDMI-A", "Virtual", … for a DRM_MODE_CONNECTOR_* value — the kernel's own names,
+/// as a static table so no libdrm version (drmModeGetConnectorTypeName is 2.4.112+) is
+/// needed. "Unknown" past the table.
+[[nodiscard]] const char* connector_type_name(unsigned type);
 
 class kms_device {
 public:
@@ -323,7 +336,12 @@ lx::result<void> lx::drm::kms_device::refresh() {
         slot = {};
         slot.used = true;
         slot.info.id = conn->connector_id;
-        std::snprintf(slot.name_buf, sizeof(slot.name_buf), "DP-%u", connector_count_);
+        slot.info.type = conn->connector_type;
+        slot.info.type_id = conn->connector_type_id;
+        slot.info.phys_w_mm = conn->mmWidth;
+        slot.info.phys_h_mm = conn->mmHeight;
+        std::snprintf(slot.name_buf, sizeof(slot.name_buf), "%s-%u",
+                      connector_type_name(conn->connector_type), conn->connector_type_id);
         slot.info.name = slot.name_buf;
         if (conn->connection == DRM_MODE_CONNECTED)
             slot.info.status = connector_status::connected;
@@ -426,10 +444,24 @@ lx::result<void> lx::drm::kms_device::refresh() {
 
 unsigned lx::drm::kms_device::connector_count() const { return connector_count_; }
 
+const char* lx::drm::connector_type_name(unsigned type) {
+    // Indexed by DRM_MODE_CONNECTOR_* (drm_mode.h; the values are uapi and never change).
+    static constexpr const char* k_names[] = {
+        "Unknown",   "VGA",  "DVI-I",  "DVI-D",  "DVI-A", "Composite", "SVIDEO",
+        "LVDS",      "Component", "DIN", "DP", "HDMI-A", "HDMI-B", "TV", "eDP",
+        "Virtual",   "DSI",  "DPI",    "Writeback", "SPI", "USB",
+    };
+    return type < sizeof(k_names) / sizeof(k_names[0]) ? k_names[type] : "Unknown";
+}
+
 lx::drm::connector_info lx::drm::kms_device::connector(unsigned index) const {
     if (index >= connector_count_ || !connectors_[index].used)
         return {};
-    return connectors_[index].info;
+    connector_info info = connectors_[index].info;
+    // Into this object's own buffer: a kms_device is moved after open (open_fd returns it
+    // by value), which leaves a pointer stored at refresh() aimed at the old object.
+    info.name = connectors_[index].name_buf;
+    return info;
 }
 
 lx::result<lx::drm::mode> lx::drm::kms_device::active_mode(unsigned connector_index) const {

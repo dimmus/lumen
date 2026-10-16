@@ -28,6 +28,10 @@ export import :positioner;
 export import :popup;
 export import :decoration;
 export import :layer_shell;
+export import :data_transfer;
+export import :dnd;
+export import :liveness;
+export import :activation;
 
 export namespace lx::compositor {
 
@@ -63,6 +67,10 @@ struct config {
     /// not insist on their own. False (`--decorations=client`) leaves every client to
     /// decorate itself.
     bool server_side_decorations = true;
+    /// xdg_wm_base.ping timeout (`--ping-timeout MS`): a client that does not answer a ping
+    /// this long is shown as not responding (title suffix, dimmed window, the shell's
+    /// flag) until it answers. Mutter's default. 0 disables pinging.
+    unsigned ping_timeout_ms = 5000;
     /// Row-band threads for the CPU composite path, in addition to the render thread.
     ///
     /// Defaults to 0 on measurement, not principle: the fullscreen opaque case is a row
@@ -124,6 +132,8 @@ public:
     [[nodiscard]] gfx::device& graphics();
     [[nodiscard]] gfx::dmabuf_import_cache& import_cache();
     [[nodiscard]] output_manager& outputs();
+    /// xdg_wm_base.ping/pong liveness (tests read who is not responding).
+    [[nodiscard]] liveness_tracker& liveness();
     [[nodiscard]] seat_manager& seats();
     [[nodiscard]] scheduler::frame_scheduler& scheduler();
     [[nodiscard]] scheduler::presentation_tracker& presentation();
@@ -135,6 +145,14 @@ public:
 
     void tick_ui(scheduler::frame_tick tick);
     void tick_render();
+
+    /// Virtual input for headless tests: each runs the same path a libinput event takes
+    /// (window manager, router, serials, focus). UI affinity. A key updates the keymap
+    /// state and the held keys first and sends the modifiers it changes after, exactly as
+    /// the seat does; a motion puts the pointer at (`x`, `y`) in global coordinates.
+    void inject_key(const lx::input::key_event& event);
+    void inject_pointer_motion(const lx::input::pointer_motion_event& event);
+    void inject_pointer_button(const lx::input::pointer_button_event& event);
 
     [[nodiscard]] unsigned frame_index() const;
     [[nodiscard]] bool is_running() const;

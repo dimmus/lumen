@@ -25,6 +25,10 @@ public:
     void set_transform(lx::point2i origin, float scale = 1.f, float opacity = 1.f);
     void set_visible(bool visible);
     void mark_dirty(lx::rect2i region);
+    /// Colour multiplier for what the node draws (white: none). A dimmed window (a client
+    /// that stopped answering pings) is drawn through a grey tint; every backend applies
+    /// `draw_command::tint`. The caller damages what changed.
+    void set_tint(lx::color tint);
 
     [[nodiscard]] lx::rect2i bounds() const;
     [[nodiscard]] bool is_dirty() const;
@@ -32,6 +36,7 @@ public:
     [[nodiscard]] lx::point2i origin() const;
     [[nodiscard]] float scale() const;
     [[nodiscard]] float opacity() const;
+    [[nodiscard]] lx::color tint() const;
 
     /// Optional draw emission hook (surface + widget nodes).
     virtual void emit_draws(draw_list& out) const;
@@ -40,6 +45,7 @@ protected:
     lx::point2i origin_{};
     float scale_ = 1.f;
     float opacity_ = 1.f;
+    lx::color tint_ = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
     bool visible_ = true;
     lx::rect2i bounds_{};
     bool dirty_ = true;
@@ -173,6 +179,12 @@ bool lx::scene::scene_node::is_visible() const { return visible_; }
 lx::point2i lx::scene::scene_node::origin() const { return origin_; }
 float lx::scene::scene_node::scale() const { return scale_; }
 float lx::scene::scene_node::opacity() const { return opacity_; }
+lx::color lx::scene::scene_node::tint() const { return tint_; }
+void lx::scene::scene_node::set_tint(lx::color t) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    tint_ = t;
+    dirty_ = true;
+}
 void lx::scene::scene_node::emit_draws(draw_list&) const {}
 
 void lx::scene::container_node::set_child_overflow_policy(lx::runtime::overflow_action policy) {
@@ -286,7 +298,7 @@ void lx::scene::surface_node::emit_draws(draw_list& out) const {
     if (scale() != 1.f)
         cmd.transform = lx::transform2d::scale(scale(), scale());
     cmd.opacity = opacity();
-    cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, opacity());
+    cmd.tint = lx::color::rgb(tint_.r, tint_.g, tint_.b, tint_.a * opacity());
     // Blend from content, not from opacity: an ARGB buffer at opacity 1 still has to blend.
     cmd.blend = opaque_ && opacity() >= 1.f ? lx::blend_mode::opaque
                                             : lx::blend_mode::premultiplied;
