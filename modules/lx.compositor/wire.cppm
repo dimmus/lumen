@@ -105,6 +105,8 @@ struct surface_obj {
     /// Compositor texture of the current content (0 for an import-cache dma-buf), retired
     /// once nothing shows it.
     unsigned current_texture = 0;
+    /// Damage of this surface's recent content updates, for buffer-age shm uploads.
+    surface_damage_history damage_history{};
     /// The surface shows content: the last applied attach was non-null.
     bool has_content = false;
     /// The current buffer's format carries no alpha channel.
@@ -155,6 +157,8 @@ struct buffer_obj {
     unsigned width = 0;
     unsigned height = 0;
     lx::gfx::dmabuf_desc dmabuf{};
+    /// What has been staged for this buffer's texture (GL path, buffer-age uploads).
+    buffer_upload_state upload{};
     bool used = false;
 };
 
@@ -387,7 +391,9 @@ void destroy_buffer(buffer_obj* b);
 lx::fourcc shm_format_to_fourcc(uint32_t shm_format);
 lx::fourcc staged_shm_format(wl_shm_buffer* shm);
 const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsigned texture_id,
-                                      unsigned long long& seq_out, unsigned long long& token_out);
+                                      lx::rect2i region, unsigned long long& seq_out,
+                                      unsigned long long& token_out,
+                                      unsigned long long& pool_token_out);
 lx::buffer_id next_buffer_id();
 void buffer_destroy_resource(struct wl_resource* resource);
 /// The dma-buf wl_buffer implementation. One definition: `find_buffer` tells the buffers

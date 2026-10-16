@@ -151,7 +151,7 @@ not optional.
 | Thread | Built on the UI thread during `start()`, released, then claimed by the render thread in `render_loop`. An EGL context is current on one thread at a time |
 | Scanout | 3 × `gbm_bo` (SCANOUT\|RENDERING) → `EGLImage` → renderbuffer → FBO, same slot rotation as the other backends |
 | dma-buf clients | `EGL_EXT_image_dma_buf_import` → sampled in place, no copy. Imported **on the render thread** (where the context lives) against a compositor texture id per `wl_buffer` (`surface_manager::set_render_thread_import`); the UI-side Vulkan import cache is not used, since on hosts that pick GL its only Vulkan device is usually a software rasterizer that cannot import at all. The `EGLImage` is made once per buffer and reused while the client re-commits it |
-| shm clients | `glTexSubImage2D` in RGBA (BGRA measured slower on SVGA3D), staged per texture through `shm_pixel_store` (slot released right after the upload) |
+| shm clients | `glTexSubImage2D` in RGBA (BGRA measured slower on SVGA3D) of only the **buffer-age region**: the union of surface damage since that buffer's texture was last written, plus the previous upload's damage (the other GL name missed it). Staged through `shm_upload_pool` — a transient block per update, sized by the region, returned right after the upload |
 | Upload hazard | Each texture keeps **two** GL names and alternates. Uploading into the texture the previous frame is still sampling stalls the driver — measured 48 ms vs 22 ms per frame on SVGA3D. Each name tracks its own storage size: a client resizing every frame (interactive resize) alternates sizes across the names, and a sub-image upload into storage of another size is a GL error that leaves stale pixels on screen |
 | Damage | `glScissor` over the damage rect, unflipped: the target is a framebuffer object over the scanout buffer, where window y = 0 is memory row 0, the top line KMS scans (GL's bottom-left origin applies only to window-system framebuffers) |
 | Blending | `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` — sources are premultiplied |
@@ -188,17 +188,32 @@ Two strategies, because the consumers differ:
 | Consumer | Staging | Lifetime |
 |----------|---------|----------|
 | Vulkan upload (copies pixels out during drain) | `shm_staging_ring` — one FIFO for all surfaces | Slot free once the upload is recorded |
-| GL upload (copies pixels out during drain) | `shm_pixel_store` — two slots **per texture** (256 textures) | Slot free right after `glTexImage2D`/`glTexSubImage2D` |
-| CPU composite (samples staged rows in place) | `shm_pixel_store` | Slot held until a later commit supersedes it |
+| GL upload (copies pixels out during drain) | `shm_upload_pool` — a block per in-flight update, sized by the damaged region | Block returned right after `glTexSubImage2D`; blocks idle 1 s are unmapped |
+| CPU composite (samples staged rows in place) | `shm_pixel_store` — two slots per texture | Slot held until a later commit supersedes it; a retired texture's storage is freed once neither slot is in flight |
 
 A shared FIFO cannot serve the CPU path: the composite reads the rows well after the
 drain, so another surface's commits would recycle the slot underneath and the texture would
 start showing the wrong pixels. GL left the shared 8-slot ring when subsurfaces arrived: a
 client-side-decorated window commits about nine surfaces in one frame, the ring ran out,
-and the updates it refused were never shown. Per-texture staging costs a staging copy per
-live shm texture instead of 8 shared slots; one busy client can no longer starve another.
-(Every shm commit still copies and uploads the whole buffer; damage-limited sub-uploads are
-a follow-up.)
+and the updates it refused were never shown.
+
+It then used per-texture staging, and that leaked in practice: nothing retired an entry
+when its texture went, `vector::clear` kept the capacity even when something did, and
+slots only grew. Every buffer the compositor had ever seen kept two window-sized copies
+resident — a session's heap grew by about 120 MB in minutes of normal use (measured: glibc
+reported 169 MB of a 174 MB heap in use). GL now stages through `shm_upload_pool`: blocks
+live only from commit to upload, carry only the buffer-age region, are mmap'd directly
+(large freed malloc blocks raise glibc's dynamic mmap threshold and fragment the brk heap),
+recycle in steady state without syscalls, and are unmapped after 1 s idle. One busy client
+still cannot starve another: blocks are per update, not a fixed shared ring.
+
+Buffer age, not plain damage: Wayland damage is relative to the surface's previous
+content, whichever buffer held it, while a texture belongs to one buffer. A client cycling
+three buffers would otherwise leave each texture missing what changed while the others were
+shown. `shm_upload_region` keeps an 8-commit damage history per surface; a buffer moved to
+another surface, or one not shown for longer than the history, is staged whole, as are a
+texture's first two uploads (both GL names). The CPU and Vulkan paths still stage whole
+buffers: the CPU store *is* the texture, and the Vulkan upload takes whole images.
 
 ### Texture updates wait for their snapshot
 

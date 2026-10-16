@@ -15,6 +15,10 @@ module;
 #include <unistd.h>
 #include <utility>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
+
 #if defined(__linux__)
 #include <dirent.h>
 #include <linux/sync_file.h>
@@ -188,6 +192,12 @@ struct compositor_impl {
     bool warned_deferred_full_ = false;
     shm_staging_ring shm_staging_{};
     shm_pixel_store shm_store_{};
+    /// GL path: transient staging, a block per in-flight update (see shm_upload_pool).
+    shm_upload_pool shm_pool_{};
+    /// Staging blocks unused this long are unmapped; long enough to ride out a pause in
+    /// an animation, short enough that an idle desktop holds none.
+    static constexpr unsigned long long k_staging_idle_ns = 1'000'000'000ull;
+    bool reported_partial_fresh_ = false;
 
     // ── cursor ──
     /// UI affinity; loaded once in `start`.
@@ -445,6 +455,10 @@ struct compositor_impl {
     void apply_texture_update(texture_update& update);
     /// Render-affinity only: bring up the GPU composite target and its scanout FB.
     [[nodiscard]] lx::result<void> setup_vulkan_present();
+    /// Creates the Vulkan device if it does not exist yet (start-up defers it when Vulkan
+    /// will not composite). Idempotent; failure leaves the soft-import default in place.
+    void ensure_graphics_device();
+    bool graphics_created_ = false;
     /// Bring up CPU-writable dumb-buffer scanout. Requires DRM master.
     [[nodiscard]] lx::result<void> setup_cpu_present();
     /// Render-affinity only: bring up EGL/GBM and the GL scanout targets.
@@ -821,6 +835,10 @@ void compositor_impl::on_memory_pressure(lx::runtime::memory_pressure level, voi
 void compositor_impl::handle_memory_pressure(lx::runtime::memory_pressure level) {
     import_cache.on_memory_pressure(level);
     buffer_lifecycle_.on_memory_pressure(level);
+    // Cached staging blocks are pure spare capacity: drop them at the first sign of
+    // pressure. (Retired CPU-path storage is already freed every tick.)
+    if (level != lx::runtime::memory_pressure::normal)
+        shm_pool_.trim();
     if (level == lx::runtime::memory_pressure::critical) {
         lx::trace::logger::global().log(lx::trace::level::warn, "compositor.memory",
                                         "critical pressure — evicting caches");
@@ -923,7 +941,11 @@ void compositor_impl::register_p0_globals() {
     p0_.liveness = &liveness_;
     p0_.activation = &activation_;
     p0_.outputs = &outputs;
-    p0_.headless = &headless_;
+    // Only when frames are actually composited in software. The headless backend keeps a
+    // full copy of every registered texture; handed it on a GPU path, the commit path
+    // copied every shm buffer into a table nothing read and nothing pruned — the bulk of
+    // the compositor's heap growth (measured with heaptrack: 60 MB over a 30-resize run).
+    p0_.headless = headless_present_ ? &headless_ : nullptr;
     p0_.dmabuf = &graphics.dmabuf();
     p0_.textures = &texture_updates_;
     p0_.lifecycle = &buffer_lifecycle_;
@@ -933,6 +955,7 @@ void compositor_impl::register_p0_globals() {
     // 8-slot ring starves as soon as one client commits more surfaces than that in a frame
     // (a CSD client's subsurfaces alone do), and the dropped update never shows. GL uploads
     // RGBA, so it wants the conversion. Vulkan keeps the ring.
+    p0_.shm_pool = nullptr;
     if (cpu_present_) {
         p0_.shm_store = &shm_store_;
         p0_.shm_staging = nullptr;
@@ -940,7 +963,11 @@ void compositor_impl::register_p0_globals() {
         // surface reaches the display with no conversion pass at all.
         p0_.shm_native_format = true;
     } else if (gl_present_) {
-        p0_.shm_store = &shm_store_;
+        // GL reads staged pixels once, during the drain, so staging only has to outlive
+        // the trip to the render thread: transient blocks sized by the damage they carry,
+        // not a persistent window-sized copy per texture.
+        p0_.shm_pool = &shm_pool_;
+        p0_.shm_store = nullptr;
         p0_.shm_staging = nullptr;
         p0_.shm_native_format = false;
     } else {
@@ -992,6 +1019,25 @@ void compositor_impl::release_shm_slot(unsigned texture_id) {
         shm_store_.release(held.token);
         held = {};
         return;
+    }
+}
+
+void compositor_impl::ensure_graphics_device() {
+    if (graphics_created_)
+        return;
+    graphics_created_ = true;
+    if (auto dev = gfx::device_selector::select_best(); dev) {
+        graphics = std::move(dev).value();
+        headless_present_ = !graphics.info().supports_dmabuf_import;
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
+                                        graphics.info().device_name);
+        if (kms.card_fd() >= 0) {
+            graphics.syncobj().set_drm_fd(kms.card_fd());
+            graphics.syncobj().set_device(graphics.vk_device());
+        }
+    } else {
+        lx::trace::logger::global().log_error(dev.get_error(), "compositor.gfx");
+        headless_present_ = true;
     }
 }
 
@@ -1139,12 +1185,19 @@ void compositor_impl::apply_texture_update(texture_update& update) {
             else
                 shm_store_.release(update.shm_token);
         } else if (gl_present_) {
-            applied = gl_compositor_.upload_rgba(update.texture_id, update.width,
-                                                 update.height, update.pixels, update.stride);
+            applied = gl_compositor_.upload_rgba_region(update.texture_id, update.width,
+                                                        update.height, update.region,
+                                                        update.pixels);
             // glTexImage2D/glTexSubImage2D copy out of client memory before returning,
-            // so the staging slot is free again right away.
-            shm_store_.release(update.shm_token);
-            shm_staging_.publish_consumed(update.shm_seq);
+            // so the staging block is free again right away.
+            shm_pool_.release(update.shm_pool_token);
+            if (!reported_partial_fresh_ && gl_compositor_.partial_into_fresh() > 0) {
+                reported_partial_fresh_ = true;
+                lx::trace::logger::global().log(
+                    lx::trace::level::warn, "compositor.render",
+                    "partial shm upload into a texture with no prior content — staging "
+                    "bookkeeping disagrees with the GL slot (reported once)");
+            }
         } else if (vulkan_present_) {
             applied = vk_compositor_.upload_rgba(update.texture_id, update.width,
                                                  update.height, update.pixels);
@@ -1153,6 +1206,7 @@ void compositor_impl::apply_texture_update(texture_update& update) {
         } else {
             shm_staging_.publish_consumed(update.shm_seq);
             shm_store_.release(update.shm_token);
+            shm_pool_.release(update.shm_pool_token);
         }
         break;
     case texture_update::op::forget:
@@ -1582,17 +1636,23 @@ lx::result<void> compositor::start() {
 
     impl_->scheduler_.set_target_fps(impl_->cfg.target_fps);
 
-    // Graphics: Vulkan when available, otherwise headless-capable device.
-    // Failure must not abort compositor start — fall back to default soft-import device.
-    if (auto dev = gfx::device_selector::select_best(); dev) {
-        impl_->graphics = std::move(dev).value();
-        impl_->headless_present_ = !impl_->graphics.info().supports_dmabuf_import;
-        lx::trace::logger::global().log(
-            lx::trace::level::info, "compositor.gfx",
-            impl_->graphics.info().device_name);
-    } else {
-        lx::trace::logger::global().log_error(dev.get_error(), "compositor.gfx");
-        impl_->headless_present_ = true;
+    // Graphics. A Vulkan device is not free: where the only Vulkan driver is a software
+    // rasterizer (lavapipe), creating one initialises LLVM and its JIT — about 28 MB of heap
+    // (heaptrack) for a device the GL path never composites with. So probe with an instance
+    // only, and create the device now only when Vulkan may composite; the fallbacks below
+    // create it on demand. Failure must not abort compositor start.
+    {
+        const auto want = impl_->cfg.present;
+        const bool vulkan_may_composite =
+            want == present_backend::vulkan || want == present_backend::cpu ||
+            (want == present_backend::automatic && gfx::device_selector::has_hardware_vulkan());
+        if (vulkan_may_composite) {
+            impl_->ensure_graphics_device();
+        } else {
+            impl_->headless_present_ = true;
+            lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
+                                            "no hardware Vulkan — Vulkan device not created");
+        }
     }
 
     if (impl_->headless_present_) {
@@ -1681,6 +1741,8 @@ lx::result<void> compositor::start() {
         }
 
         if (!present && (requested == present_backend::cpu || automatic)) {
+            // The CPU path imports client dma-bufs through the Vulkan importer.
+            impl_->ensure_graphics_device();
             present = impl_->setup_cpu_present();
             if (present) {
                 lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
@@ -1693,6 +1755,7 @@ lx::result<void> compositor::start() {
         // Last resort when nothing above came up — commonly a nested session with no DRM
         // master, where there is no scanout buffer to composite into at all.
         if (!present && requested == present_backend::automatic && !impl_->drm_present_) {
+            impl_->ensure_graphics_device();
             present = impl_->setup_vulkan_present();
             if (present) {
                 lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
@@ -1712,6 +1775,23 @@ lx::result<void> compositor::start() {
             }
         }
     }
+
+    // GL composites, and imports client dma-bufs, through EGL. A Vulkan device exists here
+    // only if start-up expected to composite with it (hardware Vulkan, or an explicit
+    // request) and GL won anyway; kept, it would hold its driver for nothing. Nothing on
+    // the GL path reaches it: dma-buf feedback takes its device from the KMS card, and the
+    // UI-side import cache serves Vulkan only.
+    if (impl_->gl_present_ && impl_->graphics.vk_device()) {
+        impl_->graphics = gfx::device{};
+        impl_->graphics.syncobj().set_drm_fd(impl_->kms.card_fd());
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
+                                        "Vulkan device released (unused on the GL path)");
+    }
+#if defined(__GLIBC__)
+    // Start-up frees a lot (instance probing, a released device, driver set-up), and glibc
+    // keeps freed heap pages resident until told otherwise. Once, here — never per frame.
+    (void)::malloc_trim(0);
+#endif
 
     (void)impl_->hotplug_.start(impl_->outputs, impl_->kms);
     if (impl_->outputs.count() > 0) {
@@ -1924,6 +2004,18 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     impl_->p0_.frame_index = tick.frame_index;
     impl_->p0_.building_frame = tick.frame_index;
     impl_->budget_.begin_frame(tick.frame_index);
+    impl_->p0_.now_ns = static_cast<unsigned long long>(tick.timestamp_ns);
+    // Staging: free retired CPU-path storage the render thread has let go of, unmap GL
+    // blocks idle past the threshold, and report what is left against the budget.
+    impl_->shm_store_.collect();
+    impl_->shm_pool_.collect(impl_->p0_.now_ns, detail::compositor_impl::k_staging_idle_ns);
+    {
+        const unsigned long long staged = impl_->shm_store_.bytes_held() +
+                                          impl_->shm_pool_.bytes_mapped();
+        const unsigned clamped =
+            staged > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<unsigned>(staged);
+        impl_->memory_.report_usage(lx::runtime::memory_pool::staging, clamped, 0);
+    }
     impl_->memory_.tick(tick.frame_index);
     impl_->memory_.reset_frame_arenas(lx::runtime::memory_pool::ui);
 

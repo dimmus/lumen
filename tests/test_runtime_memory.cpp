@@ -92,6 +92,46 @@ LUMEN_TEST(budget_coordinator_reports_mapped_capacity) {
     LUMEN_CHECK(ui.used_bytes() == 0);
 }
 
+namespace {
+lx::runtime::memory_pressure g_last = lx::runtime::memory_pressure::normal;
+int g_calls = 0;
+void on_pressure(lx::runtime::memory_pressure level, void*) {
+    g_last = level;
+    ++g_calls;
+}
+} // namespace
+
+LUMEN_TEST(staging_over_budget_raises_pressure_by_itself) {
+    lx::runtime::memory_budget_config cfg{};
+    cfg.staging_budget_bytes = 100u * 1024u * 1024u;
+    lx::runtime::memory_budget_coordinator coord{cfg};
+    coord.set_pressure_handler(&on_pressure);
+    g_calls = 0;
+    // 80 MiB of 100: moderate, even though the frame arenas are empty. Summing every pool
+    // used to dilute this; the fullest pool decides now. (80 MiB * 100 also overflows 32
+    // bits, which the old arithmetic did.)
+    coord.report_usage(lx::runtime::memory_pool::staging, 80u * 1024u * 1024u, 0);
+    LUMEN_CHECK(coord.current_pressure() == lx::runtime::memory_pressure::moderate);
+    LUMEN_CHECK(g_last == lx::runtime::memory_pressure::moderate && g_calls == 1);
+    coord.report_usage(lx::runtime::memory_pool::staging, 95u * 1024u * 1024u, 0);
+    LUMEN_CHECK(coord.current_pressure() == lx::runtime::memory_pressure::critical);
+    coord.report_usage(lx::runtime::memory_pool::staging, 1024u, 0);
+    LUMEN_CHECK(coord.current_pressure() == lx::runtime::memory_pressure::normal);
+    // An arena tick must not erase the staging figure.
+    coord.report_usage(lx::runtime::memory_pool::staging, 92u * 1024u * 1024u, 0);
+    coord.tick(1);
+    LUMEN_CHECK(coord.current_pressure() == lx::runtime::memory_pressure::critical);
+}
+
+LUMEN_TEST(staging_is_not_an_arena) {
+    lx::runtime::memory_budget_coordinator coord{};
+    auto& ui = coord.arena(lx::runtime::memory_pool::ui);
+    (void)ui.allocate(64);
+    const unsigned used = ui.used_bytes();
+    coord.reset_frame_arenas(lx::runtime::memory_pool::staging);
+    LUMEN_CHECK(ui.used_bytes() == used); // resetting "staging" must not reset the UI arena
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

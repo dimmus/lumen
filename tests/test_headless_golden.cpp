@@ -23,6 +23,19 @@ LUMEN_TEST(headless_blit_golden_pixel) {
     LUMEN_CHECK(px[2] == 0);
 }
 
+// The table is keyed by texture id and ids never repeat: without forget_texture every
+// buffer ever registered stayed resident (60 MB over a 30-resize session).
+LUMEN_TEST(headless_forget_drops_the_texture) {
+    lx::gfx::headless_backend hb;
+    LUMEN_CHECK(static_cast<bool>(hb.create(8, 8)));
+    const unsigned char px[4 * 4 * 4] = {};
+    hb.register_texture(3, 4, 4, px);
+    LUMEN_CHECK(static_cast<bool>(hb.begin_frame()));
+    LUMEN_CHECK(static_cast<bool>(hb.blit_texture(3, {0, 0, 4, 4})));
+    hb.forget_texture(3);
+    LUMEN_CHECK(!hb.blit_texture(3, {0, 0, 4, 4}));
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

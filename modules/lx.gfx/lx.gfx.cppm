@@ -99,6 +99,12 @@ class device_selector {
 public:
     [[nodiscard]] static lx::result<device> select_best();
     [[nodiscard]] static gpu_tier probe_tier();
+    /// True when Vulkan exposes a device that is not a software rasterizer
+    /// (`VK_PHYSICAL_DEVICE_TYPE_CPU`). Creates and destroys an instance only — no logical
+    /// device, so a software ICD never builds its JIT or worker threads just to be asked.
+    /// `select_best` (the same first device) creates a lavapipe device for about 28 MB of
+    /// heap; a caller that would not composite with it should not pay that to find out.
+    [[nodiscard]] static bool has_hardware_vulkan();
 };
 
 /// Recording handle threaded through widget paint. The real composite pass lives in
@@ -465,6 +471,35 @@ lx::result<lx::gfx::device> lx::gfx::device_selector::select_best() {
     info.device_name = "headless";
     info.supports_dmabuf_import = false;
     return device::create(info);
+}
+
+bool lx::gfx::device_selector::has_hardware_vulkan() {
+#if defined(LUMEN_HAS_VULKAN)
+    VkApplicationInfo app{};
+    app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+    app.pApplicationName = "lumen";
+    app.apiVersion = VK_API_VERSION_1_1;
+    VkInstanceCreateInfo ici{};
+    ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+    ici.pApplicationInfo = &app;
+    VkInstance instance = VK_NULL_HANDLE;
+    if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS)
+        return false;
+    // `device::create` uses the first physical device, so that is the one that matters.
+    VkPhysicalDevice first = VK_NULL_HANDLE;
+    uint32_t n = 1;
+    const VkResult r = vkEnumeratePhysicalDevices(instance, &n, &first);
+    bool hardware = false;
+    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && n > 0 && first != VK_NULL_HANDLE) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(first, &props);
+        hardware = props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU;
+    }
+    vkDestroyInstance(instance, nullptr);
+    return hardware;
+#else
+    return false;
+#endif
 }
 
 lx::gfx::gpu_tier lx::gfx::device_selector::probe_tier() {

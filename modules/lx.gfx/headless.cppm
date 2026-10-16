@@ -28,6 +28,9 @@ public:
     /// Register or replace a CPU texture for software blit (tests / headless clients).
     void register_texture(unsigned tex_id, unsigned width, unsigned height,
                           const unsigned char* rgba);
+    /// Drops a texture's pixels. The table is keyed by texture id and ids never repeat, so
+    /// without this every buffer ever registered stays resident.
+    void forget_texture(unsigned tex_id);
     [[nodiscard]] lx::result<void> end_frame_and_dump(const char* path);
     [[nodiscard]] double last_frame_ms() const;
 
@@ -100,6 +103,8 @@ void lx::gfx::headless_backend::register_texture(unsigned tex_id, unsigned width
     tex.rgba.assign(rgba, rgba + static_cast<std::size_t>(width) * height * 4u);
     textures_[tex_id] = std::move(tex);
 }
+
+void lx::gfx::headless_backend::forget_texture(unsigned tex_id) { textures_.erase(tex_id); }
 
 void lx::gfx::headless_backend::blit_rgba_nearest(const headless_texture& tex, lx::rect2i dst) {
     if (tex.rgba.empty() || dst.width <= 0 || dst.height <= 0)

@@ -13,7 +13,10 @@ export module lx.runtime:memory;
 export namespace lx::runtime {
 
 /// Per-subsystem bump arenas — reset each frame on UI/render/worker tick.
-enum class memory_pool { ui, render, worker, cold };
+/// `staging` is not an arena: it is the compositor's pixel staging (shm copies waiting for
+/// or backing an upload), reported against `memory_budget_config::staging_budget_bytes`.
+enum class memory_pool { ui, render, worker, cold, staging };
+inline constexpr unsigned k_memory_pool_count = 5;
 
 enum class memory_pressure { normal, moderate, critical };
 
@@ -30,6 +33,10 @@ struct memory_budget_config {
     unsigned render_arena_bytes = 8 * 1024 * 1024;
     unsigned worker_arena_bytes = 4 * 1024 * 1024;
     unsigned cold_arena_bytes = 512 * 1024;
+    /// Pixel staging the compositor may hold before it counts as pressure. Staging is
+    /// transient (an upload in flight) or a CPU-composited texture; at 75 % of this the
+    /// compositor drops cached spare blocks, at 90 % it reports critical.
+    unsigned staging_budget_bytes = 64u * 1024u * 1024u;
     unsigned pressure_moderate_used_pct = 75;
     unsigned pressure_critical_used_pct = 90;
 };
@@ -106,8 +113,8 @@ private:
     void* handler_user_ = nullptr;
     memory_pressure pressure_ = memory_pressure::normal;
     unsigned frame_index_ = 0;
-    unsigned pool_used_[4]{};
-    unsigned pool_capacity_[4]{};
+    unsigned pool_used_[k_memory_pool_count]{};
+    unsigned pool_capacity_[k_memory_pool_count]{};
 };
 
 } // namespace lx::runtime
@@ -215,10 +222,12 @@ lx::runtime::memory_budget_coordinator::memory_budget_coordinator(memory_budget_
     pool_capacity_[1] = render_arena_.capacity_bytes();
     pool_capacity_[2] = worker_arena_.capacity_bytes();
     pool_capacity_[3] = cold_arena_.capacity_bytes();
+    pool_capacity_[4] = config.staging_budget_bytes;
 }
 
 void lx::runtime::memory_budget_coordinator::set_config(memory_budget_config config) {
     config_ = config;
+    pool_capacity_[4] = config.staging_budget_bytes;
 }
 
 lx::runtime::memory_budget_config lx::runtime::memory_budget_coordinator::config() const {
@@ -235,6 +244,8 @@ lx::runtime::memory_arena& lx::runtime::memory_budget_coordinator::arena(memory_
 }
 
 void lx::runtime::memory_budget_coordinator::reset_frame_arenas(memory_pool pool) {
+    if (pool == memory_pool::staging)
+        return; // not an arena; `arena()` would hand back the UI arena
     arena(pool).reset();
 }
 
@@ -248,7 +259,7 @@ void lx::runtime::memory_budget_coordinator::report_usage(memory_pool pool,
                                                           unsigned used,
                                                           unsigned capacity) {
     const unsigned idx = static_cast<unsigned>(pool);
-    if (idx < 4) {
+    if (idx < k_memory_pool_count) {
         pool_used_[idx] = used;
         if (capacity > 0) pool_capacity_[idx] = capacity;
     }
@@ -262,15 +273,23 @@ void lx::runtime::memory_budget_coordinator::on_external_pressure(memory_pressur
 }
 
 void lx::runtime::memory_budget_coordinator::evaluate_pressure() {
-    unsigned total_used = 0;
-    unsigned total_cap = 0;
-    for (unsigned i = 0; i < 4; ++i) {
-        total_used += pool_used_[i];
-        total_cap += pool_capacity_[i];
+    // The fullest pool decides, not the sum. Summing let one large budget dilute another
+    // pool that is actually at its limit: a 64 MiB staging budget would hide a frame arena
+    // that is 100 % used, and vice versa. 64-bit arithmetic: used * 100 overflows 32 bits
+    // past 42 MiB.
+    unsigned pct = 0;
+    bool any = false;
+    for (unsigned i = 0; i < k_memory_pool_count; ++i) {
+        if (pool_capacity_[i] == 0)
+            continue;
+        any = true;
+        const auto p = static_cast<unsigned>(
+            (static_cast<unsigned long long>(pool_used_[i]) * 100ull) / pool_capacity_[i]);
+        if (p > pct)
+            pct = p;
     }
-    if (total_cap == 0) return;
+    if (!any) return;
 
-    const unsigned pct = (total_used * 100) / total_cap;
     const memory_pressure prev = pressure_;
     if (pct >= config_.pressure_critical_used_pct)
         pressure_ = memory_pressure::critical;

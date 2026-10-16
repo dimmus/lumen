@@ -173,11 +173,22 @@ public:
     [[nodiscard]] lx::result<void> upload_rgba(unsigned texture_id, unsigned width,
                                                unsigned height, const unsigned char* rgba,
                                                unsigned stride = 0);
+    /// Updates `region` of the texture's `width` x `height` storage from packed rows
+    /// (`region.width * 4` bytes each). The texture name being written must already hold
+    /// the rest of the image — the caller stages the union of what changed since that name
+    /// was last written (buffer age 2, see the two names per slot). A name with no storage
+    /// of this size is allocated and only the region filled, and counted in
+    /// `partial_into_fresh()`: it means the caller's bookkeeping and the slot disagree.
+    [[nodiscard]] lx::result<void> upload_rgba_region(unsigned texture_id, unsigned width,
+                                                      unsigned height, lx::rect2i region,
+                                                      const unsigned char* rgba);
 
     /// Samples a client dma-buf in place via EGL_EXT_image_dma_buf_import.
     [[nodiscard]] lx::result<void> import_dmabuf(unsigned texture_id, const dmabuf_desc& desc);
 
     void forget_texture(unsigned texture_id);
+    /// Partial uploads that landed in a name without prior content (should stay 0).
+    [[nodiscard]] unsigned partial_into_fresh() const { return partial_into_fresh_; }
 
     [[nodiscard]] lx::result<gl_composite_stats> composite(gl_scanout_target& target,
                                                            lx::color clear,
@@ -231,6 +242,7 @@ private:
 
     egl_device* device_ = nullptr;
     unsigned program_ = 0;
+    unsigned partial_into_fresh_ = 0;
     unsigned vertex_buffer_ = 0;
     int uniform_rect_ = -1;
     int uniform_target_ = -1;
@@ -796,6 +808,69 @@ void lx::gfx::gl_compositor::shutdown() {
     vertex_buffer_ = 0;
     program_ = 0;
     device_ = nullptr;
+}
+
+lx::result<void> lx::gfx::gl_compositor::upload_rgba_region(unsigned texture_id,
+                                                            unsigned width, unsigned height,
+                                                            lx::rect2i region,
+                                                            const unsigned char* rgba) {
+    const bool whole = region.width <= 0 || region.height <= 0 ||
+                       (region.x == 0 && region.y == 0 &&
+                        static_cast<unsigned>(region.width) == width &&
+                        static_cast<unsigned>(region.height) == height);
+    if (whole)
+        return upload_rgba(texture_id, width, height, rgba, 0);
+#if defined(LUMEN_HAS_EGL)
+    if (!ready() || !rgba || width == 0 || height == 0 || region.x < 0 || region.y < 0 ||
+        static_cast<unsigned>(region.x + region.width) > width ||
+        static_cast<unsigned>(region.y + region.height) > height)
+        return lx::make_error(lx::error_domain::invalid_argument, 0,
+                              "gl region upload: bad arguments");
+    const int index = alloc(texture_id);
+    if (index < 0)
+        return lx::make_error(lx::error_domain::invalid_argument, 0, "gl texture table full");
+    auto& slot = textures_[static_cast<unsigned>(index)];
+    if (slot.is_dmabuf) {
+        destroy_slot(slot);
+        slot.used = true;
+        slot.id = texture_id;
+    }
+    // Same alternation as a whole upload: never write the name the previous frame samples.
+    slot.current ^= 1u;
+    unsigned& name = slot.names[slot.current];
+    const bool fresh = !name || slot.name_width[slot.current] != width ||
+                       slot.name_height[slot.current] != height;
+    if (!name) {
+        glGenTextures(1, &name);
+        if (!name)
+            return detail::gl_error(lx::gl_err::import_failed, "glGenTextures failed");
+        glBindTexture(GL_TEXTURE_2D, name);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, name);
+    }
+    if (fresh) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(width),
+                     static_cast<GLsizei>(height), 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        ++partial_into_fresh_; // reported by the caller: the rest of this texture is undefined
+    }
+    // Rows are packed RGBA (4-byte aligned), so GLES 2's default unpack state fits.
+    glTexSubImage2D(GL_TEXTURE_2D, 0, region.x, region.y, region.width, region.height,
+                    GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    slot.name_width[slot.current] = width;
+    slot.name_height[slot.current] = height;
+    slot.width = width;
+    slot.height = height;
+    slot.is_dmabuf = false;
+    return {};
+#else
+    (void)region;
+    return lx::not_implemented("lx::gfx::gl_compositor::upload_rgba_region");
+#endif
 }
 
 lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsigned width,

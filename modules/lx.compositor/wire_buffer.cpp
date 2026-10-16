@@ -67,6 +67,12 @@ void retire_texture(unsigned texture_id) {
     forget.retire_after_frame = g_p0_ctx->frame_index + 1;
     forget.visible_from_frame = g_p0_ctx->building_frame;
     (void)g_p0_ctx->textures->try_push(forget);
+    // The CPU store keeps a texture's pixels for its lifetime; once the render thread has
+    // applied this forget and let go of the slots, `collect` frees them.
+    if (g_p0_ctx->shm_store)
+        g_p0_ctx->shm_store->retire(texture_id);
+    if (g_p0_ctx->headless)
+        g_p0_ctx->headless->forget_texture(texture_id);
 }
 
 namespace {
@@ -140,9 +146,12 @@ lx::fourcc staged_shm_format(wl_shm_buffer* shm) {
 /// Which staging is used depends on how the render thread consumes it — see
 /// `shm_pixel_store`. Exactly one of `seq_out` / `token_out` is set.
 const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsigned texture_id,
-                                      unsigned long long& seq_out, unsigned long long& token_out) {
+                                      lx::rect2i region, unsigned long long& seq_out,
+                                      unsigned long long& token_out,
+                                      unsigned long long& pool_token_out) {
     seq_out = 0;
     token_out = 0;
+    pool_token_out = 0;
     if (!buf || !shm || !g_p0_ctx)
         return nullptr;
 
@@ -151,11 +160,25 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
     if (buf->width == 0 || buf->height == 0 || stride <= 0)
         return nullptr;
 
-    const unsigned dst_stride = buf->width * 4u;
-    const unsigned bytes = dst_stride * buf->height;
+    // Only the transient GL pool can carry part of an image: the CPU store is the texture
+    // itself, and the Vulkan upload takes whole images.
+    const bool whole = region.width <= 0 || region.height <= 0 || !g_p0_ctx->shm_pool ||
+                       (region.x == 0 && region.y == 0 &&
+                        static_cast<unsigned>(region.width) == buf->width &&
+                        static_cast<unsigned>(region.height) == buf->height);
+    if (whole)
+        region = {0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
+    const unsigned rx = static_cast<unsigned>(region.x);
+    const unsigned ry = static_cast<unsigned>(region.y);
+    const unsigned rw = static_cast<unsigned>(region.width);
+    const unsigned rh = static_cast<unsigned>(region.height);
+    const unsigned dst_stride = rw * 4u;
+    const unsigned bytes = dst_stride * rh;
 
     unsigned char* out = nullptr;
-    if (g_p0_ctx->shm_store)
+    if (g_p0_ctx->shm_pool)
+        out = g_p0_ctx->shm_pool->acquire(bytes, pool_token_out, g_p0_ctx->now_ns);
+    else if (g_p0_ctx->shm_store)
         out = g_p0_ctx->shm_store->acquire(texture_id, bytes, token_out);
     else if (g_p0_ctx->shm_staging)
         out = g_p0_ctx->shm_staging->acquire(bytes, seq_out);
@@ -165,15 +188,17 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
     const bool native = g_p0_ctx->shm_native_format;
 
     wl_shm_buffer_begin_access(shm);
-    const auto* data = static_cast<const unsigned char*>(wl_shm_buffer_get_data(shm));
+    const auto* data = static_cast<const unsigned char*>(wl_shm_buffer_get_data(shm)) +
+                       static_cast<size_t>(ry) * static_cast<unsigned>(stride) +
+                       static_cast<size_t>(rx) * 4u;
 
     if (native) {
-        // Nothing to reorder — a contiguous client buffer is one memcpy for the whole
-        // frame, and a padded one is a memcpy per row.
+        // Nothing to reorder — a contiguous client buffer staged whole is one memcpy for
+        // the frame, and anything else is a memcpy per row.
         if (static_cast<unsigned>(stride) == dst_stride) {
             std::memcpy(out, data, bytes);
         } else {
-            for (unsigned y = 0; y < buf->height; ++y) {
+            for (unsigned y = 0; y < rh; ++y) {
                 std::memcpy(out + static_cast<size_t>(y) * dst_stride,
                             data + static_cast<size_t>(y) * static_cast<unsigned>(stride),
                             dst_stride);
@@ -185,11 +210,11 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
 
     const bool swap_rb = fmt == WL_SHM_FORMAT_ARGB8888 || fmt == WL_SHM_FORMAT_XRGB8888;
     const uint32_t alpha_fill = fmt == WL_SHM_FORMAT_XRGB8888 ? 0xFF000000u : 0u;
-    for (unsigned y = 0; y < buf->height; ++y) {
+    for (unsigned y = 0; y < rh; ++y) {
         const auto* src_row = reinterpret_cast<const uint32_t*>(
             data + static_cast<size_t>(y) * static_cast<unsigned>(stride));
         auto* dst_row = reinterpret_cast<uint32_t*>(out + static_cast<size_t>(y) * dst_stride);
-        for (unsigned x = 0; x < buf->width; ++x) {
+        for (unsigned x = 0; x < rw; ++x) {
             // Word-at-a-time so the loop vectorises; the byte-wise form did not.
             const uint32_t p = src_row[x];
             dst_row[x] = swap_rb ? (((p & 0xFF00FF00u) | ((p & 0x00FF0000u) >> 16) |
@@ -314,8 +339,11 @@ bool stage_image(void* user, unsigned texture_id, const uint32_t* argb, unsigned
     const unsigned bytes = canvas_w * canvas_h * 4u;
     unsigned long long seq = 0;
     unsigned long long token = 0;
+    unsigned long long pool_token = 0;
     unsigned char* out = nullptr;
-    if (ctx->shm_store)
+    if (ctx->shm_pool)
+        out = ctx->shm_pool->acquire(bytes, pool_token, ctx->now_ns);
+    else if (ctx->shm_store)
         out = ctx->shm_store->acquire(texture_id, bytes, token);
     else if (ctx->shm_staging)
         out = ctx->shm_staging->acquire(bytes, seq);
@@ -344,9 +372,12 @@ bool stage_image(void* user, unsigned texture_id, const uint32_t* argb, unsigned
     update.pixels = out;
     update.shm_seq = seq;
     update.shm_token = token;
+    update.shm_pool_token = pool_token;
     if (!ctx->textures->try_push(update)) {
         if (token && ctx->shm_store)
             ctx->shm_store->release(token);
+        if (pool_token && ctx->shm_pool)
+            ctx->shm_pool->release(pool_token);
         return false;
     }
     return true;
