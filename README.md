@@ -28,7 +28,8 @@ ctest --test-dir build -R test_protocol_bind --output-on-failure
 # Direct binary
 ./build/test_kms_device
 
-# Run a session on the console: compositor + lumen-shell panel + foot (ends when foot exits)
+# Run a session on the console: compositor + lumen-shell panel + foot. Leave with the panel's
+# "Log out" button (click, then "Confirm?") or Ctrl+Alt+Backspace; exiting foot also ends it
 ./scripts/run-desktop.sh                       # from a text console (tty)
 ./scripts/run-desktop.sh --join-seat-session   # over SSH; see --help for -t, --decorations, -- CMD
 

@@ -244,9 +244,26 @@ const struct zlm_shell_v1_interface shell_impl = {
                 return;
             wl_resource_set_implementation(res, &window_rules_impl, g_p0_ctx, nullptr);
         },
+    .request_logout =
+        [](struct wl_client*, struct wl_resource*) {
+            if (g_p0_ctx && g_p0_ctx->request_logout)
+                g_p0_ctx->request_logout(g_p0_ctx->logout_user, "shell");
+        },
 };
 
 } // namespace
+
+namespace {
+/// The bound shells (normally one), told when the session is ending.
+constexpr unsigned k_max_shell_res = 4;
+wl_resource* shell_resources[k_max_shell_res]{};
+} // namespace
+
+void shell_send_session_ending() {
+    for (auto* r : shell_resources)
+        if (r && wl_resource_get_version(r) >= ZLM_SHELL_V1_SESSION_ENDING_SINCE_VERSION)
+            zlm_shell_v1_send_session_ending(r);
+}
 
 void bind_shell(wayland::client_connection& client, unsigned id, int version) {
     if (!g_p0_ctx || !g_p0_ctx->server)
@@ -265,12 +282,22 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
     auto res = wayland::resource::create(client, &zlm_shell_v1_interface, version, id);
     if (!res)
         return;
-    res.set_implementation(&shell_impl, g_p0_ctx, nullptr);
+    res.set_implementation(&shell_impl, g_p0_ctx, [](void* r) {
+        for (auto*& s : shell_resources)
+            if (s == r)
+                s = nullptr;
+    });
+    for (auto*& s : shell_resources) {
+        if (!s) {
+            s = static_cast<wl_resource*>(res.native());
+            break;
+        }
+    }
     // "Sent immediately after bind". No optional capability is implemented yet (tiling
     // plugin, workspace drag, explicit sync), so the flags are empty.
     // shell_protocol_version: the zlm family's version this compositor implements (2:
-    // toplevel_flags).
-    zlm_shell_v1_send_capabilities(static_cast<wl_resource*>(res.native()), 0u, 2u);
+    // toplevel_flags; 3: request_logout).
+    zlm_shell_v1_send_capabilities(static_cast<wl_resource*>(res.native()), 0u, 3u);
 }
 
 } // namespace lx::compositor::p0

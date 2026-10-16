@@ -206,8 +206,8 @@ int main() {
     conn sh{};
     sh.bridge = &bridge;
     check(connect(sh) && sh.shell, "shell binds zlm_shell_v1 (exe matches the configured path)");
-    check(bridge.has_capabilities() && bridge.compositor_version() == 2,
-          "capabilities arrive right after bind (the compositor implements version 2)");
+    check(bridge.has_capabilities() && bridge.compositor_version() == 3,
+          "capabilities arrive right after bind (the compositor implements version 3)");
     check(static_cast<bool>(bridge.attach(sh.shell)), "get_policy_bridge");
     (void)wl_display_roundtrip(sh.display);
     const auto& model = bridge.model();

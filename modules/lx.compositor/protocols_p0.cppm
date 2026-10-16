@@ -327,6 +327,13 @@ struct p0_protocol_context {
     unsigned building_frame = 0;
     /// Monotonic time of the current UI tick, for staging-pool idle tracking.
     unsigned long long now_ns = 0;
+    /// Ends the session cleanly (zlm_shell_v1.request_logout). `source` names who asked,
+    /// for the log. Null until the compositor supplies it.
+    void (*request_logout)(void* user, const char* source) = nullptr;
+    void* logout_user = nullptr;
+    /// Tells bound shells the session is ending (zlm_shell_v1.session_ending). Set by
+    /// `install_p0_protocols`.
+    void (*notify_session_ending)() = nullptr;
 
     /// Stage shm pixels in the client's own channel order instead of converting them to
     /// RGBA. The Vulkan composite path samples RGBA textures, so it needs the conversion;

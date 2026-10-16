@@ -459,6 +459,18 @@ struct compositor_impl {
     /// will not composite). Idempotent; failure leaves the soft-import default in place.
     void ensure_graphics_device();
     bool graphics_created_ = false;
+
+    // ── logout (UI affinity) ──
+    /// Asks every window to close, then stops at `logout_deadline_ns_` or as soon as no
+    /// toplevel is left, whichever comes first. Idempotent.
+    void begin_logout(const char* source);
+    /// tick_ui: stops the loop once the logout may finish.
+    void advance_logout(lx::runtime::clock_time now_ns);
+    static constexpr lx::runtime::clock_time k_logout_grace_ns = 5'000'000'000ull;
+    bool logout_active_ = false;
+    lx::runtime::clock_time logout_deadline_ns_ = 0;
+    /// Ctrl+Alt+Backspace was taken for logout: its release must not reach a client either.
+    bool logout_key_held_ = false;
     /// Bring up CPU-writable dumb-buffer scanout. Requires DRM master.
     [[nodiscard]] lx::result<void> setup_cpu_present();
     /// Render-affinity only: bring up EGL/GBM and the GL scanout targets.
@@ -480,6 +492,21 @@ void compositor_impl::input_ready_callback() {
 }
 
 void compositor_impl::on_input_key(const lx::input::key_event& event) {
+    // Ctrl+Alt+Backspace logs out: the way out that does not depend on the shell being
+    // alive. The X server's "zap" chord, here graceful — windows are asked to close first.
+    constexpr unsigned k_key_backspace = 14;
+    if (event.evdev_keycode == k_key_backspace) {
+        if (!event.pressed && logout_key_held_) {
+            logout_key_held_ = false;
+            return;
+        }
+        const auto mods = input_devices_.default_seat().keymap().named();
+        if (event.pressed && mods.ctrl && mods.alt) {
+            logout_key_held_ = true;
+            begin_logout("Ctrl+Alt+Backspace");
+            return;
+        }
+    }
     // Keys the window manager claims (Escape during a grab) never reach the client.
     if (wm_.on_key(event))
         return;
@@ -948,6 +975,10 @@ void compositor_impl::register_p0_globals() {
     p0_.headless = headless_present_ ? &headless_ : nullptr;
     p0_.dmabuf = &graphics.dmabuf();
     p0_.textures = &texture_updates_;
+    p0_.request_logout = [](void* self, const char* source) {
+        static_cast<compositor_impl*>(self)->begin_logout(source);
+    };
+    p0_.logout_user = this;
     p0_.lifecycle = &buffer_lifecycle_;
     // Exactly one staging strategy: the CPU path samples staged rows in place during the
     // composite, which a shared FIFO cannot keep alive that long (see shm_pixel_store).
@@ -1020,6 +1051,45 @@ void compositor_impl::release_shm_slot(unsigned texture_id) {
         held = {};
         return;
     }
+}
+
+void compositor_impl::begin_logout(const char* source) {
+    if (logout_active_)
+        return;
+    logout_active_ = true;
+    const auto now = static_cast<lx::runtime::clock_time>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    logout_deadline_ns_ = now + k_logout_grace_ns;
+    // The shell learns first, so it reads the disconnect that follows as a normal end.
+    if (p0_.notify_session_ending)
+        p0_.notify_session_ending();
+    // Every window, mapped or not, gets xdg_toplevel.close: a client decides how to exit
+    // (an editor may save), and nothing is killed. Clients still connected at the
+    // deadline are disconnected by the compositor's own teardown.
+    unsigned asked = 0;
+    toplevels.for_each([&](const toplevel_record& rec) {
+        wm_.request_close(rec.id);
+        ++asked;
+    });
+    char line[128];
+    std::snprintf(line, sizeof(line), "logout requested by %s: closing %u window%s", source,
+                  asked, asked == 1 ? "" : "s");
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+}
+
+void compositor_impl::advance_logout(lx::runtime::clock_time now_ns) {
+    if (!logout_active_)
+        return;
+    const unsigned left = toplevels.count();
+    if (left > 0 && now_ns < logout_deadline_ns_)
+        return;
+    char line[128];
+    std::snprintf(line, sizeof(line), "logout: stopping (%u window%s still open)", left,
+                  left == 1 ? "" : "s");
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+    logout_active_ = false;
+    loop.quit(0);
 }
 
 void compositor_impl::ensure_graphics_device() {
@@ -2005,6 +2075,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     impl_->p0_.building_frame = tick.frame_index;
     impl_->budget_.begin_frame(tick.frame_index);
     impl_->p0_.now_ns = static_cast<unsigned long long>(tick.timestamp_ns);
+    impl_->advance_logout(tick.timestamp_ns);
     // Staging: free retired CPU-path storage the render thread has let go of, unmap GL
     // blocks idle past the threshold, and report what is left against the budget.
     impl_->shm_store_.collect();

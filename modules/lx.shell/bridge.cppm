@@ -58,6 +58,12 @@ public:
     void request_maximize(task_handle h);
     void request_unmaximize(task_handle h);
     void request_minimize(task_handle h);
+    /// zlm_shell_v1 v3: whether the compositor can end the session on request.
+    [[nodiscard]] bool can_logout() const;
+    /// Asks the compositor to close every window and end the session.
+    void request_logout();
+    /// The shell asked for the session to end: losing the connection is then expected.
+    [[nodiscard]] bool logout_requested() const { return logout_requested_; }
 
     /// Wire events, one per protocol event (defined with the listeners).
     struct events;
@@ -72,6 +78,7 @@ private:
     unsigned caps_ = 0;
     unsigned caps_version_ = 0;
     bool has_caps_ = false;
+    bool logout_requested_ = false;
 };
 
 } // namespace lx::shell
@@ -125,6 +132,11 @@ struct lx::shell::policy_bridge::events {
         char line[96];
         std::snprintf(line, sizeof(line), "capabilities flags=0x%x version=%u", flags, version);
         bridge_log(lx::trace::level::info, line);
+    }
+    static void session_ending(void* data, zlm_shell_v1*) {
+        // Whoever started the logout, the disconnect that follows is the session ending.
+        self(data).logout_requested_ = true;
+        bridge_log(lx::trace::level::info, "session ending");
     }
 
     // ── zlm_policy_bridge_v1: snapshot ──
@@ -255,6 +267,7 @@ namespace {
 
 const zlm_shell_v1_listener k_shell_listener = {
     .capabilities = lx::shell::policy_bridge::events::capabilities,
+    .session_ending = lx::shell::policy_bridge::events::session_ending,
 };
 
 const zlm_policy_bridge_v1_listener k_bridge_listener = {
@@ -336,6 +349,18 @@ LX_BRIDGE_REQUEST(request_unmaximize, zlm_policy_bridge_v1_request_unmaximize)
 LX_BRIDGE_REQUEST(request_minimize, zlm_policy_bridge_v1_request_minimize)
 #undef LX_BRIDGE_REQUEST
 
+bool lx::shell::policy_bridge::can_logout() const {
+    return shell_ && wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) >=
+                         ZLM_SHELL_V1_REQUEST_LOGOUT_SINCE_VERSION;
+}
+
+void lx::shell::policy_bridge::request_logout() {
+    if (!can_logout() || logout_requested_)
+        return;
+    logout_requested_ = true;
+    zlm_shell_v1_request_logout(static_cast<zlm_shell_v1*>(shell_));
+}
+
 lx::shell::policy_bridge::~policy_bridge() { detach(); }
 
 #else // !LUMEN_SHELL_WAYLAND
@@ -357,6 +382,8 @@ void lx::shell::policy_bridge::request_close(task_handle) {}
 void lx::shell::policy_bridge::request_maximize(task_handle) {}
 void lx::shell::policy_bridge::request_unmaximize(task_handle) {}
 void lx::shell::policy_bridge::request_minimize(task_handle) {}
+bool lx::shell::policy_bridge::can_logout() const { return false; }
+void lx::shell::policy_bridge::request_logout() {}
 lx::shell::policy_bridge::~policy_bridge() = default;
 
 #endif

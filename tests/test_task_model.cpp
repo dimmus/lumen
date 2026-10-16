@@ -264,6 +264,59 @@ LUMEN_TEST(diff_damages_only_changed_entries_or_everything) {
     LUMEN_CHECK(lx::shell::panel_diff(a, b, r, 8) == 1 && r[0].width == 1300);
 }
 
+// ── Logout button ──
+
+LUMEN_TEST(logout_button_takes_the_right_end_and_leaves_entries_the_rest) {
+    static lx::shell::panel_layout l;
+    task_model& many = snapshot_of(10);
+    lx::shell::layout_panel(many, 400, 32, -1, -1, {}, l, lx::shell::panel_logout{true});
+    LUMEN_CHECK(l.logout_w == lx::shell::k_logout_width);
+    LUMEN_CHECK(l.logout_x == 400 - 4 - lx::shell::k_logout_width);
+    // Entries share 400 - 8 - (84 + 4) = 304: (304 - 44) / 52 = 5 shown, +5, all left of it.
+    LUMEN_CHECK(l.count == 5 && l.hidden == 5);
+    LUMEN_CHECK(l.cells[4].x + l.cells[4].w < l.logout_x);
+    LUMEN_CHECK(l.more_x + lx::shell::k_panel_more_width <= l.logout_x);
+
+    // No windows at all: the button is still there.
+    task_model& none = snapshot_of(0);
+    lx::shell::layout_panel(none, 1000, 32, -1, -1, {}, l, lx::shell::panel_logout{true});
+    LUMEN_CHECK(l.count == 0 && l.logout_w == lx::shell::k_logout_width);
+
+    // Not supported by the compositor: no button, entries as before. (snapshot_of reuses
+    // one model, so the ten windows are rebuilt.)
+    task_model& again = snapshot_of(10);
+    lx::shell::layout_panel(again, 400, 32, -1, -1, {}, l);
+    LUMEN_CHECK(l.logout_w == 0 && l.count == 6);
+}
+
+LUMEN_TEST(logout_button_hit_hover_and_armed_flags) {
+    static lx::shell::panel_layout l;
+    task_model& m = snapshot_of(2);
+    const double bx = 1000 - 4 - lx::shell::k_logout_width + 10;
+    lx::shell::layout_panel(m, 1000, 32, bx, 16, {}, l,
+                            lx::shell::panel_logout{true, true, false});
+    LUMEN_CHECK(lx::shell::panel_hit_logout(l, bx, 16));
+    LUMEN_CHECK(!lx::shell::panel_hit_logout(l, bx, 1));   // above the row
+    LUMEN_CHECK(!lx::shell::panel_hit_logout(l, 10, 16));  // an entry
+    LUMEN_CHECK(lx::shell::panel_hit(l, bx, 16) == -1);    // never counted as an entry
+    LUMEN_CHECK(l.logout_flags == (lx::shell::logout_hover | lx::shell::logout_armed));
+}
+
+LUMEN_TEST(arming_the_logout_button_damages_only_the_button) {
+    static lx::shell::panel_layout a, b;
+    task_model& m = snapshot_of(3);
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, a, lx::shell::panel_logout{true});
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, b,
+                            lx::shell::panel_logout{true, true, false});
+    lx::rect2i r[8];
+    LUMEN_CHECK(lx::shell::panel_diff(a, b, r, 8) == 1);
+    LUMEN_CHECK(r[0].x == b.logout_x && r[0].width == b.logout_w);
+    // The button appearing (a compositor that supports logout) re-lays out everything.
+    static lx::shell::panel_layout c;
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, c);
+    LUMEN_CHECK(lx::shell::panel_diff(c, a, r, 8) == 1 && r[0].width == 1000);
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }
