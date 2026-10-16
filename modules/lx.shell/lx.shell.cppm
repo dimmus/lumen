@@ -132,7 +132,10 @@ struct lx::shell::shell_app::events {
             a.layer_shell_ = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface,
                                               min_version(version, 4));
         } else if (std::strcmp(iface, zlm_shell_v1_interface.name) == 0) {
-            a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface, 1);
+            // Version 2 brings toplevel_flags (not responding, demands attention); a v1
+            // compositor simply never sends them.
+            a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface,
+                                        min_version(version, 2));
             // capabilities follows the bind at once; listen before it is dispatched.
             (void)a.bridge_.observe(a.shell_);
         } else if (std::strcmp(iface, wp_cursor_shape_manager_v1_interface.name) == 0) {

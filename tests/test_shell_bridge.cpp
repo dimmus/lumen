@@ -5,11 +5,13 @@
 // the bridge connection. One connection plays the applications (xdg toplevels), another
 // the shell (lx::shell::policy_bridge and the panel), and every check reads the shell's
 // task model: the snapshot, the focus sent right after it, title/create/destroy deltas,
-// and a request_activate that comes back as focus_changed.
+// and a request_activate that comes back as focus_changed. Version 2: toplevel_flags reach
+// a shell bound at v2 (with the snapshot and as deltas) and never one bound at v1.
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <thread>
 
 #include <sys/mman.h>
@@ -46,6 +48,8 @@ int main() {
 namespace {
 
 const char* const k_socket = "lumen-test-shell-bridge";
+/// zlm_shell_v1 version the next shell connection binds.
+uint32_t g_zlm_version = 1;
 int g_failed = 0;
 int g_ran = 0;
 
@@ -80,7 +84,8 @@ void on_global(void* data, wl_registry* r, uint32_t name, const char* iface, uin
         c->layer_shell = static_cast<zwlr_layer_shell_v1*>(
             wl_registry_bind(r, name, &zwlr_layer_shell_v1_interface, 4));
     else if (c->bridge && std::strcmp(iface, zlm_shell_v1_interface.name) == 0) {
-        c->shell = static_cast<zlm_shell_v1*>(wl_registry_bind(r, name, &zlm_shell_v1_interface, 1));
+        c->shell = static_cast<zlm_shell_v1*>(wl_registry_bind(
+            r, name, &zlm_shell_v1_interface, g_zlm_version < version ? g_zlm_version : version));
         (void)c->bridge->observe(c->shell);
     }
 }
@@ -165,13 +170,30 @@ int main() {
         return 1;
     }
     std::atomic<bool> pump{true};
+    // Held around each dispatch, so the test can change compositor state between them.
+    std::mutex dispatch_lock;
     std::thread pump_thread([&] {
         lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
         while (pump.load(std::memory_order_acquire)) {
+            std::lock_guard<std::mutex> hold(dispatch_lock);
             (void)comp.wayland().dispatch(10);
             comp.wayland().flush();
         }
     });
+    // The liveness tracker's verdict on the client owning the window titled `title`, as it
+    // reaches the window manager (UI affinity: under the dispatch lock).
+    const auto set_not_responding = [&](const char* title, bool on) {
+        std::lock_guard<std::mutex> hold(dispatch_lock);
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        lx::client_id client{};
+        comp.toplevels().for_each([&](const lx::compositor::toplevel_record& r) {
+            if (r.title && std::strcmp(r.title, title) == 0)
+                client = r.client;
+        });
+        const unsigned n = comp.windows().set_client_not_responding(client, on);
+        comp.wayland().flush();
+        return n;
+    };
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     conn app{};
@@ -184,8 +206,8 @@ int main() {
     conn sh{};
     sh.bridge = &bridge;
     check(connect(sh) && sh.shell, "shell binds zlm_shell_v1 (exe matches the configured path)");
-    check(bridge.has_capabilities() && bridge.compositor_version() == 1,
-          "capabilities arrive right after bind (version 1)");
+    check(bridge.has_capabilities() && bridge.compositor_version() == 2,
+          "capabilities arrive right after bind (the compositor implements version 2)");
     check(static_cast<bool>(bridge.attach(sh.shell)), "get_policy_bridge");
     (void)wl_display_roundtrip(sh.display);
     const auto& model = bridge.model();
@@ -228,8 +250,11 @@ int main() {
     (void)wl_display_roundtrip(sh.display);
     check(model.focused() == h_one, "request_activate comes back as focus_changed");
 
+    // Another client's window (flags are per client: liveness is a client's).
+    conn app2{};
+    check(connect(app2) && app2.compositor, "a second application connects");
     window three{};
-    map_window(app, three, "three");
+    map_window(app2, three, "three");
     (void)wl_display_roundtrip(sh.display);
     const auto h_three = find_title(model, "three");
     check(model.count() == 3 && h_three && model.focused() == h_three,
@@ -243,6 +268,12 @@ int main() {
     bridge.request_raise(h_two);
     check(wl_display_roundtrip(sh.display) >= 0, "a request on a stale handle is not sent");
 
+    // A shell bound at version 1 never sees toplevel_flags.
+    check(set_not_responding("one renamed", true) == 1, "one toplevel marked not responding");
+    (void)wl_display_roundtrip(sh.display);
+    check(wl_display_get_error(sh.display) == 0 && model.get(h_one)->flags == 0,
+          "toplevel_flags is not sent to a v1 bridge");
+
     // Raise the older window, so stacking order (three, one) differs from creation order.
     bridge.request_activate(h_one);
     (void)wl_display_roundtrip(sh.display);
@@ -255,6 +286,7 @@ int main() {
     static lx::shell::policy_bridge again;
     conn sh2{};
     sh2.bridge = &again;
+    g_zlm_version = 2;
     check(connect(sh2) && sh2.shell && static_cast<bool>(again.attach(sh2.shell)),
           "a restarted shell binds again");
     (void)wl_display_roundtrip(sh2.display);
@@ -271,10 +303,22 @@ int main() {
                   again.model().get(r_three)->stacking == 0,
               "re-snapshot lists creation order, each with its stacking index");
     }
+    check(again.model().get(r_one)->flags == lx::shell::task_flag_not_responding &&
+              again.model().get(r_three)->flags == 0,
+          "v2 snapshot: toplevel_flags follows snapshot_toplevel for the flagged window only");
+    check(set_not_responding("one renamed", false) == 1, "the client answers again");
+    (void)wl_display_roundtrip(sh2.display);
+    check(again.model().get(r_one)->flags == 0, "toplevel_flags delta: not responding cleared");
+    (void)set_not_responding("three", true);
+    (void)wl_display_roundtrip(sh2.display);
+    check(again.model().get(r_three)->flags == lx::shell::task_flag_not_responding &&
+              again.model().get(r_one)->flags == 0,
+          "toplevel_flags delta: set on the right window");
     again.detach();
     zlm_shell_v1_destroy(sh2.shell);
     wl_display_disconnect(sh2.display);
     wl_display_disconnect(app.display);
+    wl_display_disconnect(app2.display);
     pump.store(false, std::memory_order_release);
     pump_thread.join();
     std::printf("%d checks, %d failed\n", g_ran, g_failed);

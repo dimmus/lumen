@@ -26,6 +26,9 @@ import :cursor;
 import :popup;
 import :decoration;
 import :layer_shell;
+import :dnd;
+import :liveness;
+import :activation;
 
 export namespace lx::compositor {
 
@@ -71,6 +74,9 @@ struct wm_protocol_ops {
     unsigned (*next_serial)(void* user) = nullptr;
     /// `xdg_toplevel.close` — the shell's request_close.
     void (*send_close)(void* xdg_toplevel) = nullptr;
+    /// The newest key or button press serial delivered to the client owning `surface` (a
+    /// `wl_surface` resource); 0 when none. xdg-activation's user-time rule reads it.
+    unsigned (*last_user_serial)(void* user, void* surface) = nullptr;
     void* user = nullptr;
 };
 
@@ -138,6 +144,27 @@ public:
     /// interactivity takes part in keyboard-focus resolution.
     void set_layers(layer_shell* layers);
     void set_protocol_ops(wm_protocol_ops ops) { ops_ = ops; }
+    /// Ping/pong liveness (optional): activation and the configure watchdog ping the
+    /// client, and the client with the keyboard is pinged periodically from `on_tick`.
+    void set_liveness(liveness_tracker* liveness) { liveness_ = liveness; }
+    /// The liveness tracker's verdict on `client` changed: each of its toplevels is marked
+    /// (`toplevel_record::not_responding`), its frame title gets the suffix, its tree is
+    /// dimmed and the shell is told (`toplevel_flags`). Returns the number of toplevels.
+    unsigned set_client_not_responding(lx::client_id client, bool on);
+
+    // ── xdg-activation: focus-stealing prevention (the wire owns the tokens) ──
+
+    /// xdg_activation_v1.activate of toplevel `id`, presenting a token whose grant is
+    /// `grant` (null: an unknown token), at `now`. Decided by `decide_activation`: granted →
+    /// focus and raise; urgent → `demands_attention`, which the shell shows; before the
+    /// window maps, the request is kept and decided at map (`decide_activation_at_map`:
+    /// only a token the user moved on from, or a stale one, keeps a new window from taking
+    /// the keyboard).
+    activation_result request_activation(lx::toplevel_id id, const activation_grant* grant,
+                                         lx::runtime::clock_time now, activation_reason& why);
+    /// Sets or clears the window's `demands_attention` and tells the shell (on change). The
+    /// window with the keyboard is never marked.
+    void set_demands_attention(toplevel_record& rec, bool on);
 
     /// First commit after get_toplevel (or after an unmap): sends the initial configure
     /// right away rather than at the next tick, so the client is not held up a frame.
@@ -211,8 +238,28 @@ public:
     void on_pointer_button(const lx::input::pointer_button_event& event);
     void on_pointer_axis(const lx::input::pointer_axis_event& event);
     /// True when the key is the window manager's and must not reach the client: Escape
-    /// during a grab cancels it, and both its press and release are withheld.
+    /// during a grab or a drag cancels it, and both its press and release are withheld.
     [[nodiscard]] bool on_key(const lx::input::key_event& event);
+    /// The seat's modifiers changed (after the router sent them): during a drag they choose
+    /// the user's action (Shift move, Ctrl copy, Alt ask).
+    void on_modifiers();
+
+    // ── Drag-and-drop: the third pointer mode (`:dnd`). The grab follows the pointer path
+    //    here; the wire owns the objects and the negotiation. ──
+
+    void set_dnd(dnd_grab* dnd) { dnd_ = dnd; }
+    [[nodiscard]] bool drag_active() const { return dnd_ && dnd_->active(); }
+    /// wl_data_device.start_drag's serial rule (wlroots'
+    /// `wlr_seat_validate_pointer_grab_serial`, as for move/resize): the serial of the last
+    /// button press, delivered to `client` (`wl_client*`), that button still held, and no
+    /// move/resize or drag already running. Null when valid, else the reason (`serial`,
+    /// `no-button`, `grab-active`, `dnd-active`). A touch serial never matches: touch input
+    /// is not routed.
+    [[nodiscard]] const char* validate_drag_serial(void* client, unsigned serial) const;
+    /// After `dnd_grab::begin`: popup grabs end, every held button is withheld from clients
+    /// until release, the origin client gets `wl_pointer.leave`, and the surface under the
+    /// pointer becomes the first drag target without waiting for motion.
+    void begin_drag();
 
     // ── Interactive move/resize: one executor, three entry points ──
 
@@ -239,7 +286,7 @@ public:
 
     /// xdg_popup.grab: the serial must be the last button press or key press (or that key's
     /// release) this client (`wl_client*`) received — stricter than wlroots, as Mutter and
-    /// Smithay are — and no move/resize may be running.
+    /// Smithay are — and no move/resize or drag may be running.
     [[nodiscard]] popup_manager::grab_result request_popup_grab(lx::surface_id popup,
                                                                 void* client, unsigned serial);
 
@@ -284,6 +331,13 @@ private:
     /// `placed`: the commit answered a configure that placed the window (maximized before
     /// it ever mapped); placement is skipped.
     void map(toplevel_record& rec, bool placed);
+    /// What `decide_activation` needs about `rec` (null: no toplevel) and the focus now.
+    [[nodiscard]] activation_context activation_context_for(const toplevel_record* rec,
+                                                            const activation_grant* grant,
+                                                            lx::runtime::clock_time now) const;
+    /// The pending activation of a window being mapped (`decide_activation_at_map` in
+    /// :activation): true when it may take the keyboard; a refused one is marked.
+    [[nodiscard]] bool decide_activation_at_map(toplevel_record& rec);
     /// Moves pointer focus to `hit` (or to nothing when null), sending leave/enter.
     void set_pointer_focus(const wm_hit* hit);
     /// Re-runs the hit test at the current pointer position and moves focus if the window
@@ -305,6 +359,9 @@ private:
     /// `hit_test` filtered by an active popup grab: surfaces of other clients do not get
     /// the pointer (owner events).
     [[nodiscard]] bool pointer_hit(double x, double y, wm_hit& out) const;
+    /// The drag's target at the pointer (a client surface; a frame is not one). Without
+    /// `send_motion` only a change of target is reported (the scene changed, not the pointer).
+    void drag_hit(unsigned time_ms, bool send_motion);
     /// The pointer is already where `h` says (same window, surface or frame zone).
     [[nodiscard]] bool same_pointer_focus(const wm_hit& h) const;
     /// A press on window `id`'s frame. Never reaches a client.
@@ -328,6 +385,8 @@ private:
     popup_manager* popups_ = nullptr;
     decoration_manager* decorations_ = nullptr;
     layer_shell* layers_ = nullptr;
+    dnd_grab* dnd_ = nullptr;
+    liveness_tracker* liveness_ = nullptr;
     wm_protocol_ops ops_{};
     wm_grab grab_{};
     /// Buttons whose press never reached a client (the Super binding, presses during a
@@ -1185,6 +1244,9 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
     }
 
     toplevels_->set_mapped(rec.id, true);
+    // A new window of a client already known not to answer pings is shown as such too.
+    rec.not_responding = liveness_ && liveness_->not_responding(rec.client);
+    tree_->set_root_dim(rec.surface, rec.not_responding);
     // The tree container goes on top of the window layer, matching the stacking order the
     // record was just pushed onto; mapping it creates (and damages) every node.
     tree_->set_root_tag(rec.surface, rec.id.id());
@@ -1209,12 +1271,22 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
     sync_decoration(rec);
 
     const lx::toplevel_id id = rec.id;
+    // An activation requested before the map is decided now; a refused one marks the window
+    // (before the shell hears of it, so toplevel_created carries the flag).
+    const bool take_focus = decide_activation_at_map(rec);
     if (shell_)
         shell_->emit_toplevel_created(rec);
-    // Placeholder policy until the shell drives focus: a newly mapped window takes the
-    // keyboard. The pointer is a different matter — it enters the window only if the
-    // window appeared under it, which the hit test at the next tick decides.
-    set_keyboard_focus(id);
+    if (take_focus) {
+        // Placeholder policy until the shell drives focus: a newly mapped window takes the
+        // keyboard. The pointer is a different matter — it enters the window only if the
+        // window appeared under it, which the hit test at the next tick decides.
+        set_keyboard_focus(id);
+    } else if (const unsigned below = toplevels_->stacking_index(keyboard_focus_);
+               below != ~0u) {
+        // Refused focus: it opens just below the window that has the keyboard (Mutter,
+        // KWin), not on top of what the user is working in.
+        (void)restack(id, below);
+    }
     rehit_pending_ = true;
     stacking_dirty_ = true;
 }
@@ -1243,6 +1315,8 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     // any of them that had it.
     tree_->unmap_root(rec->surface);
     toplevels_->set_mapped(id, false);
+    // The shell forgets the window (toplevel_destroyed below): its attention goes with it.
+    rec->demands_attention = false;
     sync_decoration(*rec); // not mapped: the frame goes (damaged) with the window
     if (deco_press_.id == id) {
         deco_press_ = {};
@@ -1317,8 +1391,12 @@ void lx::compositor::window_manager::on_tick(lx::runtime::clock_time now_ns) {
         rehit_pending_ = true;
     if (rehit_pending_) {
         rehit_pending_ = false;
-        // With a button held the implicit grab owns focus; release re-hit-tests anyway.
-        if (button_mask_ == 0)
+        // With a button held the implicit grab owns focus; release re-hit-tests anyway. A
+        // drag's target is re-hit instead: a window mapped or moved under a still pointer
+        // becomes the target without waiting for motion.
+        if (drag_active())
+            drag_hit(static_cast<unsigned>(now_ns / 1'000'000), false);
+        else if (button_mask_ == 0)
             refresh_pointer_focus(static_cast<unsigned>(now_ns / 1'000'000), true);
     }
     if (stacking_dirty_) {
@@ -1329,7 +1407,15 @@ void lx::compositor::window_manager::on_tick(lx::runtime::clock_time now_ns) {
     // snapshot (and, with the cursor plane, the same atomic commit) as the pointer.
     if (grab_.mode != grab_mode::none && grab_.motion_pending)
         apply_grab();
+    // The drag icon likewise: once per tick, in the snapshot that carries the pointer.
+    if (dnd_)
+        dnd_->on_tick();
     flush_configures(now_ns);
+    // O(1) unless a ping deadline passed; the focused client is pinged every 10 s.
+    if (liveness_) {
+        const auto* focused = toplevels_ ? toplevels_->find(keyboard_focus_) : nullptr;
+        liveness_->tick(now_ns, focused ? focused->client : lx::client_id{});
+    }
 }
 
 void lx::compositor::window_manager::flush_configures(lx::runtime::clock_time now_ns) {
@@ -1346,6 +1432,10 @@ void lx::compositor::window_manager::flush_configures(lx::runtime::clock_time no
             lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
         }
         send_configure(rec, now_ns, false, watchdog);
+        // A configure unanswered past the watchdog is the strongest hint of a hung client
+        // there is: ask it.
+        if (watchdog && liveness_)
+            liveness_->request(rec.client, now_ns, ping_reason::watchdog);
     });
 }
 
@@ -1362,8 +1452,19 @@ void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
     }
     keyboard_focus_ = id;
     auto* rec = toplevels_->find_mut(id);
+    // The window the user wanted is the one they now have.
+    if (rec && rec->demands_attention)
+        set_demands_attention(*rec, false);
     // Activation follows the surface that actually gets the keys (resolve_keyboard_focus).
     resolve_keyboard_focus();
+    // Mutter pings on activation: a window given focus that never answers is the one the
+    // user is about to wait on.
+    if (rec && liveness_)
+        liveness_->request(rec->client,
+                           std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count(),
+                           ping_reason::activate);
     if (shell_)
         shell_->emit_focus_changed(rec);
     if (wm_debug_enabled()) {
@@ -1613,6 +1714,9 @@ void lx::compositor::window_manager::set_pointer_focus(const wm_hit* hit) {
 }
 
 void lx::compositor::window_manager::on_surface_unmapped(lx::surface_id surface) {
+    // A drag target that stops being drawn is left at once (the next motion finds another).
+    if (dnd_)
+        dnd_->on_surface_unmapped(surface);
     if (!surface || !(surface == pointer_surface_))
         return;
     // As for a focused window unmapping: focus must not name a surface that is not drawn
@@ -1647,6 +1751,13 @@ void lx::compositor::window_manager::on_pointer_motion(unsigned time_ms) {
         return;
     const double px = seat_->pointer_x();
     const double py = seat_->pointer_y();
+
+    // A drag: one hit test (the cost of any motion), then `wl_data_device.motion` to the
+    // target or a focus change. No client has pointer focus meanwhile.
+    if (drag_active()) {
+        drag_hit(time_ms, true);
+        return;
+    }
 
     if (grab_.mode != grab_mode::none) {
         // O(1): the grab is applied at the tick. No client hears the pointer meanwhile.
@@ -1700,6 +1811,30 @@ void lx::compositor::window_manager::on_pointer_button(
     const unsigned offset = event.evdev_code - k_button_base;
     const std::uint64_t bit =
         event.evdev_code >= k_button_base && offset < 64 ? (std::uint64_t{1} << offset) : 0;
+
+    // A drag: no button reaches a client. Every press is withheld (and so is its release);
+    // the release that lets go of the last button drops or cancels, then the pointer goes
+    // back to whatever is under it with a normal `enter`.
+    if (drag_active()) {
+        if (!bit)
+            return;
+        if (event.pressed) {
+            if (!(button_mask_ & bit)) {
+                button_mask_ |= bit;
+                swallowed_mask_ |= bit;
+            }
+            return;
+        }
+        if (!(button_mask_ & bit))
+            return;
+        button_mask_ &= ~bit;
+        swallowed_mask_ &= ~bit;
+        if (button_mask_ == 0) {
+            dnd_->on_released();
+            refresh_pointer_focus(event.time_ms, false);
+        }
+        return;
+    }
 
     if (event.pressed) {
         // A second press of a held button (two mice on one seat) would desynchronise the
@@ -1850,8 +1985,8 @@ void lx::compositor::window_manager::on_pointer_button(
 }
 
 void lx::compositor::window_manager::on_pointer_axis(const lx::input::pointer_axis_event& event) {
-    // Pointer focus is empty during a grab anyway; say so rather than rely on it.
-    if (router_ && grab_.mode == grab_mode::none)
+    // Pointer focus is empty during a grab or a drag anyway; say so rather than rely on it.
+    if (router_ && grab_.mode == grab_mode::none && !drag_active())
         router_->send_pointer_axis(event);
 }
 
@@ -1863,11 +1998,82 @@ bool lx::compositor::window_manager::on_key(const lx::input::key_event& event) {
         end_grab(grab_end_reason::escape);
         return true;
     }
+    // Escape cancels a drag (Mutter, sway). Held buttons stay withheld: their releases reach
+    // no client, and the last one gives the pointer back.
+    if (event.pressed && drag_active()) {
+        swallowed_escape_ = true;
+        dnd_->on_escape();
+        return true;
+    }
     if (!event.pressed && swallowed_escape_) {
         swallowed_escape_ = false;
         return true;
     }
     return false;
+}
+
+void lx::compositor::window_manager::on_modifiers() {
+    if (!drag_active() || !seat_)
+        return;
+    const lx::input::named_modifiers m = seat_->keymap().named();
+    dnd_->on_modifiers(m.shift, m.ctrl, m.alt);
+}
+
+// ── Drag-and-drop ──────────────────────────────────────────────────────────
+
+const char* lx::compositor::window_manager::validate_drag_serial(void* client,
+                                                                 unsigned serial) const {
+    if (drag_active())
+        return "dnd-active";
+    if (grab_.mode != grab_mode::none)
+        return "grab-active";
+    if (serial == 0 || client == nullptr || serial != last_press_serial_ ||
+        client != last_press_client_)
+        return "serial";
+    const unsigned offset = last_press_button_ - k_button_base;
+    const std::uint64_t bit = last_press_button_ >= k_button_base && offset < 64
+                                  ? (std::uint64_t{1} << offset)
+                                  : 0;
+    if (!bit || !(button_mask_ & bit))
+        return "no-button";
+    return nullptr;
+}
+
+void lx::compositor::window_manager::begin_drag() {
+    if (!drag_active() || !seat_)
+        return;
+    // Menus do not travel with a drag (as for move/resize).
+    if (popups_ && popups_->grab_active())
+        popups_->dismiss_all("dnd");
+    // The releases of the buttons held now (the one that started the drag included) reach
+    // no client, wherever the drop lands.
+    swallowed_mask_ |= button_mask_;
+    // The origin client's implicit grab ends with `leave` (wlroots, Weston, Mutter): from
+    // here on it hears the drag through its data device, like any other target.
+    set_pointer_focus(nullptr);
+    on_modifiers();
+    drag_hit(0, false);
+}
+
+void lx::compositor::window_manager::drag_hit(unsigned time_ms, bool send_motion) {
+    if (!seat_)
+        return;
+    const double px = seat_->pointer_x();
+    const double py = seat_->pointer_y();
+    // Not `pointer_hit`: popup owner-events ended with the drag. The icon layer is never
+    // hit ("the input region is ignored").
+    wm_hit h{};
+    if (hit_test(px, py, h) && h.target == hit_target::surface && h.surface_resource) {
+        dnd_target t{};
+        t.surface_resource = h.surface_resource;
+        t.surface = h.surface;
+        t.client = h.client;
+        t.sx = h.sx;
+        t.sy = h.sy;
+        dnd_->on_motion(&t, px, py, time_ms, send_motion);
+        return;
+    }
+    dnd_->on_motion(nullptr, px, py, time_ms, send_motion);
 }
 
 // ── Server-side frame ──────────────────────────────────────────────────────
@@ -1979,6 +2185,8 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
     const char* reject = nullptr;
     if (grab_.mode != grab_mode::none)
         reject = "grab-active";
+    else if (drag_active())
+        reject = "dnd-active";
     else if (!rec || !rec->mapped)
         reject = "unmapped";
     else if (!bit || !(button_mask_ & bit))
@@ -2056,7 +2264,8 @@ lx::compositor::window_manager::request_popup_grab(lx::surface_id popup, void* c
         serial != 0 && client != nullptr &&
         ((serial == last_press_serial_ && client == last_press_client_) ||
          (router_ && router_->is_key_grab_serial(serial, client)));
-    return popups_->grab(popup, serial_ok, grab_.mode != grab_mode::none);
+    // No menu grab while a move/resize or a drag owns the pointer.
+    return popups_->grab(popup, serial_ok, grab_.mode != grab_mode::none || drag_active());
 }
 
 bool lx::compositor::window_manager::request_shell_grab(lx::toplevel_id id, unsigned serial,
@@ -2232,6 +2441,133 @@ void lx::compositor::window_manager::activate(lx::toplevel_id id) {
         return;
     set_keyboard_focus(id);
     (void)raise(id);
+}
+
+// ── xdg-activation ─────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr const char* k_activation_category = "compositor.activation";
+
+void log_activation(const char* token_prefix, const lx::compositor::toplevel_record& rec,
+                    lx::compositor::activation_result r, lx::compositor::activation_reason why,
+                    const char* cause) {
+    if (!wm_debug_enabled())
+        return;
+    char line[192];
+    std::snprintf(line, sizeof(line), "activate token=%.8s surface=%llu id=%llu result=%s reason=%s%s",
+                  token_prefix && token_prefix[0] ? token_prefix : "-", rec.surface.id(),
+                  rec.id.id(), lx::compositor::activation_result_name(r),
+                  lx::compositor::activation_reason_name(why), cause);
+    lx::trace::logger::global().log(lx::trace::level::debug, k_activation_category, line);
+}
+
+} // namespace
+
+lx::compositor::activation_context
+lx::compositor::window_manager::activation_context_for(const toplevel_record* rec,
+                                                       const activation_grant* grant,
+                                                       lx::runtime::clock_time now) const {
+    activation_context c{};
+    c.token = grant;
+    c.now = now;
+    if (rec) {
+        c.target_client = rec->client;
+        c.target_is_toplevel = true;
+        c.target_is_mapped = rec->mapped;
+        c.target_already_focused = rec->mapped && keyboard_focus_ == rec->id;
+    }
+    const toplevel_record* focused = toplevels_ ? toplevels_->find(keyboard_focus_) : nullptr;
+    if (focused && focused->mapped && focused != rec) {
+        c.focused_exists = true;
+        c.focused_client = focused->client;
+        if (ops_.last_user_serial)
+            c.focused_last_user_serial = ops_.last_user_serial(ops_.user, focused->surface_resource);
+    }
+    return c;
+}
+
+lx::compositor::activation_result
+lx::compositor::window_manager::request_activation(lx::toplevel_id id,
+                                                   const activation_grant* grant,
+                                                   lx::runtime::clock_time now,
+                                                   activation_reason& why) {
+    toplevel_record* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    const activation_result r = decide_activation(activation_context_for(rec, grant, now), why);
+    if (!rec)
+        return r;
+    if (!rec->mapped) {
+        if (r == activation_result::pending || r == activation_result::urgent) {
+            rec->activation_pending = true;
+            rec->activation_token_known = grant != nullptr;
+            rec->pending_grant = grant ? *grant : activation_grant{};
+            rec->activation_requested_ns = now;
+        }
+        return r;
+    }
+    if (r == activation_result::granted)
+        activate(id);
+    else if (r == activation_result::urgent)
+        set_demands_attention(*rec, true);
+    return r;
+}
+
+bool lx::compositor::window_manager::decide_activation_at_map(toplevel_record& rec) {
+    if (!rec.activation_pending)
+        return true;
+    rec.activation_pending = false;
+    const activation_grant* grant = rec.activation_token_known ? &rec.pending_grant : nullptr;
+    activation_reason why{};
+    activation_reason token_reason{};
+    const activation_result r = lx::compositor::decide_activation_at_map(
+        activation_context_for(&rec, grant, rec.activation_requested_ns), why, token_reason);
+    if (wm_debug_enabled()) {
+        // The token's own verdict too when the map overrode it.
+        char cause[48];
+        std::snprintf(cause, sizeof(cause), " cause=map%s%s",
+                      why != token_reason ? " refused=" : "",
+                      why != token_reason ? activation_reason_name(token_reason) : "");
+        log_activation(grant ? grant->prefix : nullptr, rec, r, why, cause);
+    }
+    if (r != activation_result::urgent)
+        return true;
+    set_demands_attention(rec, true);
+    return false;
+}
+
+void lx::compositor::window_manager::set_demands_attention(toplevel_record& rec, bool on) {
+    // The window the user is typing into needs no attention drawn to it (Mutter does not
+    // mark a window that is in plain view either).
+    if (rec.demands_attention == on || (on && rec.id == keyboard_focus_))
+        return;
+    rec.demands_attention = on;
+    if (wm_debug_enabled()) {
+        char line[64];
+        std::snprintf(line, sizeof(line), "urgent id=%llu on=%d", rec.id.id(), on ? 1 : 0);
+        lx::trace::logger::global().log(lx::trace::level::debug, k_activation_category, line);
+    }
+    if (shell_)
+        shell_->emit_toplevel_flags(rec);
+}
+
+unsigned lx::compositor::window_manager::set_client_not_responding(lx::client_id client,
+                                                                   bool on) {
+    if (!toplevels_ || !client)
+        return 0;
+    unsigned n = 0;
+    toplevels_->for_each_mut([&](toplevel_record& rec) {
+        if (!(rec.client == client) || rec.not_responding == on)
+            return;
+        rec.not_responding = on;
+        ++n;
+        if (decorations_)
+            decorations_->set_not_responding(rec.id, on);
+        if (tree_)
+            tree_->set_root_dim(rec.surface, on);
+        if (shell_)
+            shell_->emit_toplevel_flags(rec);
+    });
+    return n;
 }
 
 void lx::compositor::window_manager::request_close(lx::toplevel_id id) {

@@ -20,6 +20,14 @@ import :toplevel;
 
 export namespace lx::compositor {
 
+/// zlm_policy_bridge_v1.toplevel_flag bits.
+enum toplevel_flag_bits : unsigned {
+    toplevel_flag_not_responding = 0x1,
+    toplevel_flag_demands_attention = 0x2,
+};
+/// The flags the shell is told for `rec`.
+[[nodiscard]] unsigned toplevel_flags_of(const toplevel_record& rec);
+
 /// Server side of zlm_policy_bridge_v1: the shell's view of window state. UI affinity.
 ///
 /// The compositor executes and the shell observes, so every state the shell may act on is
@@ -50,6 +58,9 @@ public:
     void emit_toplevel_geometry(const toplevel_record& rec);
     void emit_focus_changed(const toplevel_record* focused);
     void emit_stacking_order_changed(const toplevel_record& rec, unsigned index, bool done);
+    /// toplevel_flags (zlm v2): the attention flags of `rec` changed. Bridges bound at
+    /// version 1 never see it.
+    void emit_toplevel_flags(const toplevel_record& rec);
 
     /// Decodes a `zlm_toplevel_v1` handle from a request. Null id for an inert handle.
     [[nodiscard]] static lx::toplevel_id toplevel_from_handle(void* zlm_toplevel_resource);
@@ -96,9 +107,26 @@ std::uint32_t wire_state(lx::toplevel_state state) {
     default: return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_NORMAL;
     }
 }
+/// toplevel_flags to a bridge that knows it (v2), when `flags` is worth sending.
+void send_flags(wl_resource* bridge, wl_resource* handle, unsigned flags) {
+#if defined(ZLM_POLICY_BRIDGE_V1_TOPLEVEL_FLAGS_SINCE_VERSION)
+    if (bridge && handle &&
+        wl_resource_get_version(bridge) >= ZLM_POLICY_BRIDGE_V1_TOPLEVEL_FLAGS_SINCE_VERSION)
+        zlm_policy_bridge_v1_send_toplevel_flags(bridge, handle, flags);
+#else
+    (void)bridge;
+    (void)handle;
+    (void)flags;
+#endif
+}
 #endif
 
 } // namespace
+
+unsigned lx::compositor::toplevel_flags_of(const toplevel_record& rec) {
+    return (rec.not_responding ? static_cast<unsigned>(toplevel_flag_not_responding) : 0u) |
+           (rec.demands_attention ? static_cast<unsigned>(toplevel_flag_demands_attention) : 0u);
+}
 
 lx::compositor::shell_bridge::shell_bridge(wayland::server& server) : server_{&server} {}
 
@@ -139,8 +167,10 @@ void* lx::compositor::shell_bridge::create_handle(toplevel_record& rec) {
     auto* bridge = static_cast<wl_resource*>(bridge_);
     // id 0: server-allocated, introduced to the client by the new_id argument of the event
     // it is first sent in (toplevel_created / snapshot_toplevel).
+    // The handle takes the bridge's version: the family moves together.
     wl_resource* handle = wl_resource_create(wl_resource_get_client(bridge),
-                                             &zlm_toplevel_v1_interface, 1, 0);
+                                             &zlm_toplevel_v1_interface,
+                                             wl_resource_get_version(bridge), 0);
     if (!handle) {
         wl_client_post_no_memory(wl_resource_get_client(bridge));
         return nullptr;
@@ -213,6 +243,8 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
                 bridge, static_cast<wl_resource*>(handle), nullptr, rec->app_id, rec->title,
                 wire_state(rec->state), rec->geometry.x, rec->geometry.y, rec->geometry.width,
                 rec->geometry.height, toplevels_->stacking_index(rec->id));
+            if (const unsigned flags = toplevel_flags_of(*rec))
+                send_flags(bridge, static_cast<wl_resource*>(handle), flags);
         }
     }
     zlm_policy_bridge_v1_send_snapshot_done(bridge);
@@ -261,6 +293,19 @@ void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {
                                              wire_state(rec.state));
     zlm_policy_bridge_v1_send_toplevel_geometry(bridge, h, rec.geometry.x, rec.geometry.y,
                                                 rec.geometry.width, rec.geometry.height);
+    if (const unsigned flags = toplevel_flags_of(rec))
+        send_flags(bridge, h, flags);
+#else
+    (void)rec;
+#endif
+}
+
+void lx::compositor::shell_bridge::emit_toplevel_flags(const toplevel_record& rec) {
+#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+    if (!bridge_ || !rec.shell_handle)
+        return;
+    send_flags(static_cast<wl_resource*>(bridge_), static_cast<wl_resource*>(rec.shell_handle),
+               toplevel_flags_of(rec));
 #else
     (void)rec;
 #endif

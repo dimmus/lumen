@@ -58,6 +58,10 @@ enum panel_cell_flag : unsigned {
     cell_focused = 1u << 0,
     cell_hover = 1u << 1,
     cell_pressed = 1u << 2,
+    /// The window asked for attention (an activation that was not granted focus).
+    cell_attention = 1u << 3,
+    /// Its client does not answer pings: the label is drawn dimmed.
+    cell_not_responding = 1u << 4,
 };
 
 struct panel_cell {
@@ -234,6 +238,10 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
         c.flags = 0;
         if (c.task == focused)
             c.flags |= cell_focused;
+        if (e && (e->flags & task_flag_demands_attention))
+            c.flags |= cell_attention;
+        if (e && (e->flags & task_flag_not_responding))
+            c.flags |= cell_not_responding;
         if (pressed && c.task == pressed)
             c.flags |= cell_pressed;
         if (px >= c.x && px < c.x + c.w && py >= out.cell_y && py < out.cell_y + out.cell_h)
@@ -312,6 +320,8 @@ constexpr std::uint32_t k_bg = 0xFF1E1E22u;
 constexpr std::uint32_t k_hover = 0xFF34343Au;
 constexpr std::uint32_t k_pressed = 0xFF2A2A30u;
 constexpr std::uint32_t k_focused = 0xFF3D6FB4u;
+/// Demands attention: an amber accent, as GNOME's and KDE's task bars use.
+constexpr std::uint32_t k_attention = 0xFFB4782Du;
 constexpr lx::text::raster_color k_text{0xE6, 0xE6, 0xE6, 0xFF};
 constexpr lx::text::raster_color k_text_focused{0xFF, 0xFF, 0xFF, 0xFF};
 constexpr lx::text::raster_color k_text_more{0xA8, 0xA8, 0xAC, 0xFF};
@@ -403,6 +413,8 @@ void lx::shell::panel::paint_cell(buffer& b, const panel_layout& l, unsigned i) 
         bgc = k_pressed;
     else if (c.flags & cell_focused)
         bgc = k_focused;
+    else if (c.flags & cell_attention)
+        bgc = k_attention;
     else if (c.flags & cell_hover)
         bgc = k_hover;
     if (bgc != k_bg)
@@ -412,7 +424,9 @@ void lx::shell::panel::paint_cell(buffer& b, const panel_layout& l, unsigned i) 
     if (e)
         label = e->title[0] ? e->title : (e->app_id[0] ? e->app_id : "untitled");
     paint_text(b, c.x + k_text_pad, l.cell_y, c.w - 2 * k_text_pad, l.cell_h, label,
-               (c.flags & cell_focused) ? k_text_focused : k_text);
+               (c.flags & cell_not_responding) ? k_text_more
+               : (c.flags & cell_focused)      ? k_text_focused
+                                               : k_text);
 }
 
 void lx::shell::panel::paint_more(buffer& b, const panel_layout& l) {
@@ -732,7 +746,7 @@ void lx::shell::panel::after_dispatch() {
     if (model.in_snapshot())
         return;
     const unsigned changes = model.take_changes();
-    if (changes & (task_change_list | task_change_label | task_change_focus)) {
+    if (changes & (task_change_list | task_change_label | task_change_focus | task_change_flags)) {
         dirty_ = true;
         // The entry under a still pointer may be a different one now.
         if (changes & task_change_list)

@@ -293,7 +293,54 @@ someone types into it.
      rasterizer (HarfBuzz + FreeType into a cached texture); missing glyphs render as the
      face's .notdef until font fallback (step 14). A title double click maximizes (step 6).
      Not yet: a window menu (right-click), drag-to-restore a maximized window, theming.
-   - [ ] xdg-activation, xdg-output, primary-selection.
+   - [x] **primary-selection** (`zwp_primary_selection_device_manager_v1`) and the
+     **clipboard** done properly (`wl_data_device_manager` v4): one selection per seat and
+     kind, offered — every mime type — to the keyboard-focused client before its `enter` and
+     again on every change, inert once that client loses the keyboard; `set_selection` must
+     quote an input serial the client was sent (per-client serial log), not older than the
+     selection in place, and a refused source is cancelled; `receive` passes the fd to the
+     owner only for an offered type; an owner exiting clears the selection. Copy and paste
+     work between foot, alacritty and GTK 4 both ways, by keyboard and by middle click
+     (app-smoke group F). Not yet: a selection that outlives its owner (a clipboard
+     manager on `ext-data-control-v1`).
+   - [x] **drag-and-drop** (`wl_data_device.start_drag`): the serial of the held press,
+     a drag icon in its own scene layer moved once per tick with the pointer, enter / motion
+     / drop / leave to the surface under the pointer (the source client's own surfaces
+     included; a drag without a source stays in its client), action negotiation with the
+     modifiers' user action (Shift move, Ctrl copy, Alt ask) and `ask`, the pointer showing
+     the outcome, cancellation on Escape, a release over nothing, nothing accepted and
+     client death. Probe-to-probe drags and GTK 4 → foot work (app-smoke group G). Not yet:
+     touch-initiated drags (no touch routing).
+   - [x] **xdg-output** (`zxdg_output_manager_v1` v3) and the output contracts: outputs
+     named after their connector (`Virtual-1`), a virtual HEADLESS-1 without KMS, logical
+     rect, name and description closed by `wl_output.done`; `wl_surface.enter` / `leave` from
+     scene-node rects for every surface (toplevels, subsurfaces, popups, layer surfaces, the
+     drag icon, the cursor surface), replayed to a `wl_output` bound late; the v6 preferred
+     buffer scale and transform (sent only off the defaults; scale capped at 1 until buffer
+     scale is honoured). foot and GTK 4 receive enter (app-smoke group H).
+   - [x] **ping/pong liveness** (`xdg_wm_base.ping`): pings on activation, presses, the
+     configure watchdog and periodically to the focused client; unanswered past
+     `--ping-timeout` (5 s) the client is shown not responding — "(Not Responding)" in the
+     server-side title, its windows dimmed, `toplevel_flags` to the shell (zlm v2), pointer
+     motion withheld — and never killed; libwayland's per-client buffer is 1 MiB, so a
+     stopped foot survives hundreds of motions and recovers on SIGCONT (app-smoke group I).
+     Not yet: a "wait / force quit" offer in the shell.
+   - [x] **xdg-activation** (`xdg_activation_v1`): 128-bit random tokens, single use,
+     30 s lifetime; a token can grant focus when its serial is an input serial delivered to
+     the issuer and the issuer had the keyboard or it is the issuer's own last click or key
+     press (so a layer-shell launcher can issue from a click). Presenting it focuses and
+     raises the window unless the user has since pressed a key or button in another window
+     (the X11 user-time rule, as in Mutter) — then, and for tokens that are unknown,
+     expired, serial-less (foot's bell) or never grantable, the window is marked
+     demands-attention instead of stealing focus, and the shell highlights its task
+     (`toplevel_flags`, zlm v2). A token presented before the window maps is decided at map:
+     a launch token the user moved on from (or that expired) opens the new window below the
+     focused one without the keyboard, while a token that proves nothing (GTK's self-issued
+     serial-0 token) leaves the new-window policy alone. foot started
+     with `XDG_ACTIVATION_TOKEN` is focused, and no longer warns (app-smoke group J). Not
+     yet: focus-stealing prevention for new windows that present no token (still the
+     placeholder "a new window takes the keyboard"; it belongs in shell policy), a frame
+     accent for an urgent window (the shell shows it).
 
 *Done when:* `lumen-shell` draws a panel, switches workspaces, and locks the session.
 Status: the panel — yes (task list over the bridge, step 5). Workspaces — not yet (no

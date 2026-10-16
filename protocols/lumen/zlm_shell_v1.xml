@@ -16,7 +16,7 @@
 
   <!-- ── Compositor-owned toplevel handle ─────────────────────────── -->
 
-  <interface name="zlm_toplevel_v1" version="1">
+  <interface name="zlm_toplevel_v1" version="2">
     <description summary="compositor-owned handle for a mapped xdg toplevel">
       Shell uses this object for all window management. The compositor maps
       zlm_toplevel_v1 to internal xdg_toplevel state. Never expose client-side
@@ -30,7 +30,7 @@
 
   <!-- ── Shell root ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_shell_v1" version="1">
+  <interface name="zlm_shell_v1" version="2">
     <description summary="Lumen desktop shell root interface"/>
 
     <enum name="capability">
@@ -63,7 +63,7 @@
 
   <!-- ── Workspaces ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_workspace_manager_v1" version="1">
+  <interface name="zlm_workspace_manager_v1" version="2">
     <description summary="virtual desktop manager"/>
 
     <enum name="error">
@@ -108,7 +108,7 @@
     </event>
   </interface>
 
-  <interface name="zlm_workspace_v1" version="1">
+  <interface name="zlm_workspace_v1" version="2">
     <description summary="a single workspace"/>
 
     <request name="destroy" type="destructor"/>
@@ -132,7 +132,7 @@
 
   <!-- ── Policy bridge: shell intent → compositor execution ──────── -->
 
-  <interface name="zlm_policy_bridge_v1" version="1">
+  <interface name="zlm_policy_bridge_v1" version="2">
     <description summary="window management policy bridge">
       Shell sends placement intent; compositor executes geometry, focus, and
       stacking. Stacking is default; tiling is an optional shell plugin.
@@ -307,11 +307,28 @@
       <arg name="index" type="uint"/>
       <arg name="done" type="uint"/>
     </event>
+
+    <!-- Version 2 -->
+
+    <enum name="toplevel_flag" bitfield="true" since="2">
+      <entry name="not_responding" value="0x1" summary="the client did not answer a ping in time"/>
+      <entry name="demands_attention" value="0x2" summary="an activation request was not granted focus"/>
+    </enum>
+
+    <event name="toplevel_flags" since="2">
+      <description summary="attention flags of a toplevel">
+        Sent after snapshot_toplevel and after toplevel_created when non-zero, and whenever
+        the flags change. The compositor never acts on not_responding beyond showing it; the
+        shell may offer to terminate the client.
+      </description>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="flags" type="uint" enum="toplevel_flag"/>
+    </event>
   </interface>
 
   <!-- ── Window rules (typed, session config) ─────────────────────── -->
 
-  <interface name="zlm_window_rules_v1" version="1">
+  <interface name="zlm_window_rules_v1" version="2">
     <description summary="persistent window rules">
       Rules are stored in the session config directory
       ($XDG_CONFIG_HOME/lumen/window-rules.toml). Use reload_rules to apply.

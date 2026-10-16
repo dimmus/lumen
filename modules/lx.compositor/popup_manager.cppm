@@ -162,8 +162,8 @@ public:
     enum class grab_result : unsigned char { ok, denied, invalid_grab, invalid_parent,
                                              not_topmost };
     /// xdg_popup.grab. `serial_ok`: the serial is this client's last press (button or key);
-    /// `wm_grab`: an interactive move/resize is running. A denied grab dismisses the popup
-    /// at once; the errors are the caller's to post.
+    /// `wm_grab`: an interactive move/resize or a drag is running. A denied grab dismisses
+    /// the popup at once; the errors are the caller's to post.
     [[nodiscard]] grab_result grab(lx::surface_id surface, bool serial_ok, bool wm_grab);
     [[nodiscard]] bool grab_active() const { return grab_count_ > 0; }
     [[nodiscard]] lx::client_id grab_client() const { return grab_client_; }

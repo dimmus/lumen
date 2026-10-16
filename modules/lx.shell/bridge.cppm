@@ -238,6 +238,17 @@ struct lx::shell::policy_bridge::events {
         auto& b = self(data);
         (void)b.model_.set_stacking(find(b, t), index);
     }
+    // ── zlm_policy_bridge_v1 v2 ──
+    static void toplevel_flags(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
+                               uint32_t flags) {
+        auto& b = self(data);
+        const task_handle th = find(b, t);
+        if (b.model_.set_flags(th, flags) && bridge_debug()) {
+            char line[64];
+            std::snprintf(line, sizeof(line), "flags handle=%u flags=%u", th.index, flags);
+            bridge_log(lx::trace::level::debug, line);
+        }
+    }
 };
 
 namespace {
@@ -258,6 +269,7 @@ const zlm_policy_bridge_v1_listener k_bridge_listener = {
     .toplevel_geometry = lx::shell::policy_bridge::events::toplevel_geometry,
     .focus_changed = lx::shell::policy_bridge::events::focus_changed,
     .stacking_order_changed = lx::shell::policy_bridge::events::stacking_order_changed,
+    .toplevel_flags = lx::shell::policy_bridge::events::toplevel_flags,
 };
 
 } // namespace

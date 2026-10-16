@@ -45,16 +45,18 @@ inject as VERDICT: INVALID (exit 3) instead of a list of misleading failures. Ex
 0 PASS (possibly with warnings), 1 FAIL, 2 could not run, 3 INVALID. Logs in
 drag-smoke-logs/.
 
-# Real applications, end to end, unattended (~2 min; hands off, as drag-smoke)
-./scripts/app-smoke.sh --join-seat-session [--only A,B,C,D,E,X] [--skip-gtk]
+# Real applications, end to end, unattended (~6 min; hands off, as drag-smoke)
+./scripts/app-smoke.sh --join-seat-session [--only A,B,C,D,E,F,G,H,I,J,X] [--skip-gtk]
 
 Same machinery as drag-smoke (seat session, injector, foreign-input watch, SIGTERM-only
 cleanup of the PIDs it started, exit codes 0/1/2/3, logs in app-smoke-logs/), with real
 clients. Judged from the compositor log, chiefly the surface tree's
 `compositor.scene: tree root=… nodes=<sid>[*]@x,y,wxh;…` dumps, which list every drawn
 surface of a window in paint order at each change, and from the clients' side too: the
-probes' and lumen-square's stdout, `WAYLAND_DEBUG=client` traces of foot (A, C) and
-gtk4-widget-factory (B6/B7), and lumen-shell's own log (E). Group A (subsurfaces):
+probes' and lumen-square's stdout, `WAYLAND_DEBUG=client` traces of foot (A, C, F, G11, H5,
+I3, J6), alacritty (F) and gtk4-widget-factory (B6/B7, F4, G11, H5), and lumen-shell's own log
+(E, I1, J2). About 6 minutes for all groups (91 checks); `--only` runs a subset.
+Group A (subsurfaces):
 A1 foot with client-side decorations (`-o csd.preferred=client`: since step C the compositor
 offers server-side ones, and a client that insists on its own keeps them) maps its title bar
 and borders as subsurfaces, the
@@ -171,9 +173,115 @@ area return. E6 a copy of the lumen-shell binary at another path exits 1 —
 `zlm_shell_v1 bind rejected` in its own log, the compositor's warning naming both paths, no
 new bridge — while the real shell keeps running. Neither shell log has an error or warning.
 
-Whole run, both sides of the wire: exactly two protocol errors happen, the two provoked (D7's
-probe and E6's copy): libwayland-server's `error in client communication (pid N)` appears in
-the compositor log for those two PIDs only, each of them saw its error, and no other client
+Group F (clipboard and primary selection; `compositor.selection` lines, foot's
+`WAYLAND_DEBUG=client` traces, the files the pasting terminal's `cat` writes, compared byte
+for byte; foot runs with `LC_ALL=C.UTF-8`, as in "C" it prints a locale warning into the
+terminal). F1 foot shows a word, a double click selects it and Ctrl+Shift+C copies it; a new
+alacritty running `cat > F1.out` is offered the selection as it takes the keyboard
+(`selection offer … cause=focus`), Ctrl+Shift+V, Enter and Ctrl+D leave exactly the word and
+a newline in the file, and the log has `selection set` by foot, the offer to alacritty and
+`selection receive … result=sent`. F2 the mirror, alacritty → foot. F3 primary: alacritty
+running `cat` maps first, foot showing a word maps over it and is moved aside (Super+drag),
+the word is double-clicked (no copy key), and a middle click on alacritty — which has no
+keyboard until that click — pastes it; the primary offer goes out before the click's
+`focus keyboard` line and so before the press. F3r the reverse into foot, whose own trace
+shows the primary offer before its middle press. F4 GTK both ways through widget-factory's
+text widget (B6's point): typed text copied with Ctrl+C pastes into foot, and text copied in
+foot pastes into GTK with Ctrl+V and back out again (GTK's trace has
+`wl_data_offer.receive("text/plain;charset=utf-8"`); WARN when GTK never set a selection
+(its layout put no text widget there). F5 foot copies, then alacritty: foot's source is
+`cancelled`; alacritty exits with foot left focused: `selection clear kind=clipboard
+cause=source-destroyed` and foot is told `selection(nil)`. F6 every `wl_keyboard.enter` in
+foot's traces is immediately preceded by `wl_data_device.selection` and
+`zwp_primary_selection_device_v1.selection` (alacritty reads selections on a queue of its
+own, so its trace is dispatch order, not wire order), and a `lumen-probe selection
+--receive` that lost the keyboard is offered nothing while foot copies, then on a click is
+offered the selection and reads it. F7 a probe quoting serial 1 is refused (`selection
+reject … reason=serial`) and its source cancelled, the selection unchanged; F7r a probe
+setting one source twice gets `wl_data_device` error 1 (used_source), provoked on purpose.
+
+Group G (drag-and-drop; `compositor.dnd` lines, the probes' stdout, `tree root=… kind=dnd_icon`
+dumps). Each scenario starts a `lumen-probe dnd-target` and a `lumen-probe dnd-source`, puts
+them side by side (Super+drag; the source's optional second window to the right) and drags
+from the source's centre in 100 injected steps. G1 copy|move offered, the target prefers
+move: one `dnd focus` on the target, at least 10 `dnd motion` lines before `dnd drop`, the
+data read and finished, the source's `drop_performed`, `finished` and last action 2, `dnd end
+reason=drop`, and no button release reaching either probe. G9 (G1's 32x32 icon attached at
+-16,-16): every `cause=move` dump of the icon node is an injected position plus that offset
+(±1 px), the icon is unmapped at the end, and no frame during the drag damages the whole
+output. G2 Ctrl held → copy (action 1 to the end); G2b Ctrl, then Shift over the target →
+copy, then move. G3 a release over the empty desktop: `cancelled`, no `drop_performed`,
+`reason=no_target`. G4 Escape over the target: `leave` without `drop`, `cancelled`,
+`reason=escape`, and no Escape key event at either probe. G5 a target that accepts nothing:
+`leave`, no drop, `cancelled`, `reason=not_accepted`. G6 a drop on the source client's own
+second window. G7 a drag with no source: the target probe it crosses sees nothing, the own
+second window gets `enter … offer=nil` and the drop. G8 the source probe exits abruptly while
+the pointer rests on the target: `leave`, `reason=source_destroyed`, the compositor alive,
+and `focus pointer id=` again after the release. G10 start_drag quoting the pointer enter's
+serial: `dnd start rejected … reason=serial`, the source `cancelled`, and it keeps the pointer
+until its own release. G11 GTK → foot (WARN-level): widget-factory is moved left, its text
+view filled with twelve numbered lines through the clipboard (a probe owns it), all of it
+selected and dragged onto foot running `cat`; the file must equal the lines.
+
+Group H (outputs; `compositor.output` lines, `lumen-probe outputs` stdout, foot's, alacritty's
+and GTK's traces).
+H1 a probe binding `wl_output` v4 and `zxdg_output_manager_v1` v3 before mapping reports the
+output's name (the compositor's `output 0 name=` line, `Virtual-1` here), mode and logical
+rect, and its toplevel gets `enter`. H2 foot's own traces from A1 (client-side frame) and C1
+(server-side): the main surface gets `wl_surface.enter`, and so does every CSD subsurface
+the compositor mapped (foot listens on its main surface only, so libwayland-client logs the
+others as `discarded … enter`). H3 a probe binding `wl_output` a second after its first
+configure: the compositor's `output bind … replayed=1`, then the probe's enter. H4 a
+grabbing popup gets `enter` when it maps and `leave` when an outside click dismisses it, and
+the toplevel `leave` when it unmaps (null attach). H5 real clients from their own side: a
+traced foot and a traced gtk4-widget-factory map; in each trace `wl_output.mode` and `name`
+and `zxdg_output_v1.logical_position` (0,0), `logical_size` (the mode) and `name` equal the
+compositor's output, and the toplevel's `wl_surface` (from `get_xdg_surface` +
+`get_toplevel`) gets `enter`; the compositor logs an `xdg-output create … w= h= name=` with
+the same values for both and `output enter … resources>0` to both. H6 every traced
+real-client log of the run (foot, alacritty and GTK from A, B6, C, F, G11, H5, I3, J6): the
+same values, and per (surface, output) `enter`/`leave` alternate starting with `enter` — no
+double enter, no leave without enter — and name a `wl_output` the client bound (object ids
+are followed through `create_surface`/`destroy`, since libwayland reuses them; GTK's menus
+are counted as popups entered/created).
+
+Group I (liveness; the compositor runs with `--ping-timeout 1500`; `compositor.liveness`
+lines). I1 lumen-shell up, then a probe with a server-side frame that leaves the activation
+ping unanswered for 4 s: exactly one `not-responding` (after 1500–2500 ms), the frame title
+`lumen-probe-i1 (Not Responding)`, `tree root=… dim=1`, the shell's `flags handle=…
+flags=1`; when the probe answers: `responsive`, the plain title, `dim=0`, `flags=0`. I2 a
+probe that never answers is marked once and, three timeouts later, still connected and
+still receiving clicks. I3 a real hang: foot (server-side frame) is stopped with SIGSTOP and
+clicked (`ping … reason=press`): `not-responding` and the title suffix; 600 injected motions
+over it reach it as at most three (the motion before it was marked and the one resync
+motion after) — none of them queue up while it is stopped, and libwayland's 1 MiB buffer
+keeps it connected anyway; after SIGCONT it is `responsive` and receives a key.
+
+Group J (xdg-activation; `compositor.activation` lines, `lumen-probe activation-issuer` /
+`activation-target` stdout, lumen-shell's log, foot's trace). A target probe maps first,
+then an issuer probe (which takes the keyboard) is clicked and writes the token it got for
+that press; the script hands it to the target. J1 `token create … grantable=1 reason=ok`,
+`activate … result=granted reason=ok`, the target ends with the keyboard and sees
+`keyboard enter`. J2 lumen-shell up; between the issue and the hand-over foot maps and is
+clicked: `result=urgent reason=user_moved_on`, `urgent id=<target> on=1`, focus stays on
+foot, the shell's `flags handle=<target> flags=2`; a click on the target's panel entry
+focuses it, `on=0`, `flags=0`. J3 a token issued without a serial: `result=urgent
+reason=no_serial`. J4 a token nobody issued (`deadbeef`): `result=urgent
+reason=unknown_token`, no protocol error. J5 a target presenting the token before its first
+commit: `result=pending`, then `result=granted reason=ok cause=map` and the new window has the
+keyboard; J5b a launch token the user moved on from (a click in the J5 window after it was
+issued): at map `result=urgent reason=user_moved_on`, the new window never takes the keyboard
+and is marked; J5c an unknown token before the first commit proves nothing: at map
+`result=granted reason=new_window` and the new window has the keyboard (GTK presents a
+self-issued token, serial 0, for every new window). J6 a real foot started with
+`XDG_ACTIVATION_TOKEN` set to the issuer's token presents it (`xdg_activation_v1.activate`
+in its trace), is granted and has the keyboard, and logs nothing about XDG activation (it
+warned "compositor does not implement XDG activation" while the global was missing).
+
+Whole run, both sides of the wire: exactly three protocol errors happen, the provoked ones
+(D7's probe, E6's copy and F7r's probe): libwayland-server's `error in client communication
+(pid N)` appears in the compositor log for those PIDs only, each of them saw its error, and
+no other client
 log (foot, GTK, the probes, lumen-square, the shell) has a libwayland-client
 `<interface>#<id>: error <code>:` line, `wl_display.error`, GTK's `Protocol error` or
 `Lost connection`, or foot's `err:`.
@@ -191,12 +299,72 @@ included, and every wlr-layer-shell error: `role`, `invalid_layer` (also from `s
 `already_constructed`, `invalid_anchor`, `invalid_keyboard_interactivity` (also on_demand on
 v3), `invalid_size` ×2, `invalid_exclusive_edge` ×2, `invalid_surface_state` ×2, layer
 `get_popup` on a committed popup, `defunct_role_object`; a `zlm_shell_v1` bind from a binary
-that is not the configured shell is the display's `implementation` error; and out-of-order
+that is not the configured shell is the display's `implementation` error; the data device's
+`used_source`, `invalid_source` (a drag source as the selection), `invalid_action_mask`
+(twice, an undefined bit, after use) and a selection offer's `invalid_finish` and
+`invalid_offer`; the clipboard's selection reaching a client before its keyboard `enter`, a
+receive's fd round trip, no forwarding of a type not offered, an offer going inert when its
+client loses the keyboard, a serial never sent refused and cancelled, a new owner
+cancelling the old source, `selection(NULL)` when the owner destroys its source, and the
+same for the primary selection; drag-and-drop's `role` (an icon with another role) and
+`used_source` on the data device, the source's `invalid_action_mask` after start_drag, the
+offer's `invalid_action_mask`, `invalid_action` (two preferred bits) and `invalid_finish`
+(before the drop), and a drag across two clients — the origin's `wl_pointer.leave`, the
+target's `source_actions`, `enter`, `action`, `motion`, `drop`, `leave`, the source's
+`target`, `action`, `dnd_drop_performed`, `send`, `dnd_finished`, the data read through the
+dropped offer, no button release reaching a client — then a stale serial cancelled with
+pointer focus untouched, a target that accepted nothing (leave, cancelled), Escape, and the
+source's client exiting mid-drag; xdg-activation's `already_used` (a token committed
+twice), an unknown token and requests after commit ignored without error, a token whose
+requesting surface is gone still usable, a popup's surface ignored, and the policy on the
+wire — a token from the focused issuer's click focuses another client's window, a spent
+token does not mark the focused window, a click in a third window between issue and use
+marks the target demands-attention without focusing it, a serial never delivered marks it
+too, focusing the window clears the mark, and a token presented before the first commit is
+decided at map (granted: the new window takes the keyboard; unknown: it does not, and opens
+marked just below the focused window) — these use the compositor's `inject_*` virtual input
+seam where they need input; one client hoarding activation token builders, data sources,
+data devices and `wl_output` objects (as many as the old shared tables held) must not cost
+another client its token, source, device or `wl_output.done` (it used to get `no_memory`,
+fatal); destroying the `xdg_wm_base` a ping went out on drops that ping (the client used to
+stay awaited, then "not responding", for good); and out-of-order
 client disconnects must leave no server client slot behind — they used to corrupt a
 client's destroy list and could spin the compositor forever), positioner placement and the popup
 grab/dismissal state machine by `test_positioner` (pure), and layer arrangement (every
 anchor combination, margins, zones, the two passes, exclusive-edge deduction, closing) and
-the layer shell's configure/map/keyboard state machine by `test_layer_arrange` (pure).
+the layer shell's configure/map/keyboard state machine by `test_layer_arrange` (pure). The
+data-transfer pieces with no Wayland in them are `test_data_transfer` (the inline mime list:
+order, duplicates, overflow by count and by bytes, reset; drag-and-drop mask checks, the
+modifier-chosen action and the whole negotiation table, version-2 sides included) and
+`test_input_serials` (the per-client serial log: delivered ranges only, compression of
+consecutive serials, the ring keeping the newest 32 ranges and rejecting older serials,
+wraparound at 2^32, the newest-press queries, LRU eviction and forget). `test_dnd_grab`
+drives the drag-and-drop grab with fake wire ops over a real surface tree: target changes vs
+motion, drop vs cancel and their reasons, Escape, the source-less drag kept inside its
+client, the modifier-chosen action on change only, a target unmapped or destroyed, the icon
+following the pointer per tick with its accumulated offset (mapped in its layer, gone at the
+end, reusable), and no allocation on the motion and tick paths (a counting `operator new`).
+`test_output_membership` covers output membership (rects over one, two and three outputs,
+edge-touching rects, the primary output by area, the preferred scale — ceiling of the
+largest — and transform) and the output manager (stable slots, the generation counter, the
+virtual HEADLESS-1 without connectors). `test_liveness` drives the ping/pong tracker on a
+fake clock: one outstanding ping per client and 2 s between pings, timeout → not
+responding, a late pong → responsive, a wrong serial ignored, the periodic ping of the
+focused client, a client without an `xdg_wm_base`, a ping cancelled with the object it went
+out on (also clearing "not responding"), forget, disabled with 0, a full table never
+evicting a hung client. `test_output_contract` checks the output contracts on the wire
+against an in-process compositor: `wl_output` v4 and xdg-output v3/v2 values and their
+`done`s, `enter` on map for toplevels, subsurfaces and popups, `leave` on unmap, the enter
+replayed to a late `wl_output` bind, nothing preferred at scale 1, and an output change seen
+by a frame tick (a transform) resent to the bound `wl_output` and as
+`preferred_buffer_transform` to the surface on it. `test_shell_bridge` also checks that
+`toplevel_flags` reaches a v2 bridge (after `snapshot_toplevel`, and as deltas on the
+right window) and never a v1 one. `test_activation_policy` checks xdg-activation's policy
+row by row (`decide_grantable`; `decide_activation`'s nine rows in order, the user-time rule
+with the issuer or the target focused, a focused client with no press, nothing focused),
+serial wraparound, the lifetime boundary, and the token table (exact-text lookup only,
+`forget_surface`, single use, eviction of the oldest and of an expired token) and the token
+text (32 lowercase hex characters, 10 000 unique).
 
 # Sanitizers
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan

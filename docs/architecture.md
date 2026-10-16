@@ -308,8 +308,14 @@ flowchart LR
 | `lx.compositor.decoration` | Server-side frames (xdg-decoration), Wayland-free: frame extents and hit zones, the shared atlas, the frame scene node (underlay of the window's tree container), cached title textures rasterized with `lx.text`. UI affinity |
 | `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state, geometry, focus) on `zlm_policy_bridge_v1`; receives WM requests |
 | `lx.compositor.cursor` | Pointer image and position (grab override → frame hover → client → default). Hardware cursor plane (`lx.drm:cursor`) by default: pointer motion is a plane update on the next atomic commit — or a cursor-only commit when nothing else changed — and never a composite. Software fallback is a node in the scene's overlay layer, damaged old+new. Images from the Xcursor theme (`lx.compositor.xcursor`) with a compiled-in vector set, `wp_cursor_shape_v1` and `wl_pointer.set_cursor` |
-| `lx.compositor.output` | Per-output present mode, KMS damage flags |
-| `lx.scene` | Scene graph (layers bottom→top: layer-shell background and bottom, windows — per-window tree containers —, layer-shell top and overlay, popups, cursor), multi-rect damage (`gfx::damage_region`), `build_draw_list_into` |
+| `lx.compositor.output` | The outputs, in **stable slots** (an output keeps its slot while its connector stays connected): geometry, refresh, name (the kernel's connector name, "Virtual-1"), physical size, scale, transform, present mode, KMS damage flags, and a `generation` that moves only when something a client sees changed. Without a connected connector there is one virtual output, HEADLESS-1 (1920x1080 at 60 Hz). Pure membership helpers: the outputs a rect is on (one bit per slot), the primary output (largest overlap), the preferred buffer scale (ceiling of the largest) and transform. UI affinity |
+| `lx.compositor.liveness` | xdg_wm_base.ping/pong liveness, Wayland-free: pings on activation, delivered button and key presses, the configure watchdog and every 10 s to the focused client — one outstanding per client, at least 2 s apart; a ping unanswered past the timeout (`--ping-timeout`, 5 s) marks the client not responding until it answers. Never kills. O(1) per tick unless a deadline passed. UI affinity |
+| `lx.compositor.input_router` | Seat event delivery to the focused client's resources (enter/leave pairing, held keys, frames) and the per-client **input serial log**: the serials of input and focus events each client was sent, as compressed ranges — what `set_selection` and xdg-activation tokens quote is checked against it. The focus-client hook runs between a focus change's `leave`s and `enter`s; the user-input hook after a delivered key or button press (liveness pings on it). Pointer motion to a client that is not responding is withheld (keys, buttons and enter/leave are not). UI affinity |
+| `lx.compositor.activation` | xdg-activation's focus-stealing-prevention policy, Wayland-free: `decide_grantable` (at token commit) and `decide_activation` (at `activate`, and again at map for a window that asked before mapping) — pure functions over what the wire and the window manager gather; the token table (64 fixed slots, 128-bit random text from `getrandom`, single use, 30 s lifetime, constant-time lookup, eviction of expired then oldest). UI affinity |
+| `lx.compositor.data_transfer` | Wayland-free data-transfer pieces: `mime_list` (a source's offered types, inline, never allocating) and drag-and-drop action negotiation (`negotiate_dnd_action`, the modifier-chosen user action) |
+| `lx.compositor.dnd` | The drag-and-drop grab, Wayland-free: a third pointer mode beside the implicit grab and move/resize, driven by the window manager's pointer path (hit test, button mask, Escape, modifiers) and calling the wire through `dnd_ops` (focus, motion, drop, cancel, user action). Owns the drag icon's placement (a `dnd_icon` surface-tree root in its own scene layer, moved once per tick with the pointer) and the pointer shape that shows the negotiated action. No allocation per motion. UI affinity |
+| `lx.compositor.wire` (internal) | The libwayland glue, one translation unit per protocol area: `wire_surface.cpp` (wl_compositor, wl_surface, wl_region, frame callbacks, the commit), `wire_subsurface.cpp`, `wire_buffer.cpp` (wl_buffer tracking, shm staging, texture retirement), `wire_xdg_shell.cpp` (xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, the window manager's wire ops), `wire_xdg_popup.cpp`, `wire_decoration.cpp`, `wire_layer_shell.cpp`, `wire_dmabuf.cpp`, `wire_seat.cpp`, `wire_cursor_shape.cpp`, `wire_shell.cpp` (zlm_shell_v1, policy bridge), `wire_output.cpp` (wl_output, xdg-output, wl_surface.enter/leave and the preferred buffer scale/transform), `wire_selection.cpp` (the selection model both selection families share), `wire_data_device.cpp` (wl_data_*), `wire_primary_selection.cpp` (zwp_primary_selection_*_v1), `wire_dnd.cpp` (start_drag, drag offers and action negotiation), `wire_activation.cpp` (xdg_activation_v1: token builders, the grant decision at commit, `activate`), and `wire_install.cpp` (every global, in registry order, and the `:protocols_p0` entry points). The implementation partition `:wire` (`wire.cppm`, not exported) holds the wire object records and what more than one unit uses; everything else stays in each unit's anonymous namespace. The Wayland-free state stays in the partitions above. UI affinity |
+| `lx.scene` | Scene graph (layers bottom→top: layer-shell background and bottom, windows — per-window tree containers —, layer-shell top and overlay, popups, cursor), multi-rect damage (`gfx::damage_region`), a per-node tint (the not-responding dim), `build_draw_list_into` |
 | `lx.scene.snapshot` | Triple-buffered handoff (v2: index swap, back-pressure policy) |
 | `lx.gfx` | Vulkan device, swapchain, dmabuf import, render pass |
 | `lx.gfx.gl_renderer` | EGL/GLES composite on GBM — the accelerated path on drivers with no Vulkan driver (vmwgfx/SVGA3D and similar) |
@@ -324,7 +330,7 @@ flowchart LR
 
 ### Content updates and subsurfaces
 
-`wl_surface.commit` is four steps in `protocols_p0.cpp`: role pre-checks on the pending
+`wl_surface.commit` is four steps in `wire_surface.cpp`: role pre-checks on the pending
 state (xdg rules that reject the whole commit), **merge** pending into the surface's cached
 state (later state replaces earlier, damage and frame callbacks accumulate, a buffer
 superseded before use is released), let the tree cache the children's pending positions and
@@ -337,6 +343,14 @@ constraints (fences, transactions) can later hold updates back there without tou
 semantics. A surface that stops being effectively synchronized (`set_desync`, its
 `wl_subsurface` or parent destroyed) applies what it had cached, top-down.
 
+Follow-up, recorded: the double-buffered state (`surface_pending`, `merge_pending_into_cached`,
+`apply_core`) is meant to become a Wayland-free `:surface_state` partition, unit-tested on
+its own. It is not split out yet because its logic is interleaved with wire actions
+(`wl_buffer.release`, answering frame callbacks, `wl_shm_buffer` reads) and the queue has no
+logic of its own until commit constraints (explicit sync, fences, transactions) hold updates
+in the cached state; extracting it now would need an ops table on the commit hot path. The
+records already live in `:wire`, so the extraction moves one struct and two functions.
+
 A window's geometry is clamped to the bounding box of its whole tree, so a client-side
 title bar drawn as a subsurface above the main surface is part of the window (its origin
 may be negative in surface coordinates). Texture updates carry the index of the snapshot
@@ -347,8 +361,8 @@ composites that snapshot, so new pixels never show under the previous frame's ge
 ### Popups
 
 Every `xdg_popup` is the root of its own surface tree, with its container in the scene's
-popup layer: above every window and every layer-shell surface, below the cursor (sway's
-order — no panel or window ever covers a menu), newest on top. The hit test visits popups
+popup layer: above every window and every layer-shell surface, below the drag-and-drop icon
+layer and the cursor (sway's order — no panel or window ever covers a menu), newest on top. The hit test visits popups
 top-down before any window. A popup is placed relative to its parent's window geometry
 (`positioner_place`: flip, then slide, then resize, per axis, against the usable area for a
 window's popups and the whole output for a layer surface's — Mutter/KWin and sway
@@ -444,6 +458,206 @@ but not the keyboard ("inherited by child surfaces set by the get_popup request"
 test order is popups, overlay, top, windows, bottom, background. A layer surface's popup is
 created with a null parent and adopted by `zwlr_layer_surface_v1.get_popup` before its initial
 commit; doing that later is `xdg_wm_base.invalid_popup_parent` (the spec names no error).
+
+### Selections: clipboard and primary
+
+`wl_data_device_manager` (v4; v3 without libwayland's `release`) and
+`zwp_primary_selection_device_manager_v1` (v1, a P1 protocol built only when its glue is
+generated) share one model in `wire_selection.cpp`; each family's unit only marshals. There
+is one selection per seat and family, owned by a source.
+
+- **Who may set it.** `set_selection` must quote the serial of an input or focus event the
+  compositor delivered *to that client* (`input_router`'s serial log; configure serials do
+  not count), not older than the selection in place (wraparound-safe). That is wlroots' rule
+  restricted to input serials; keyboard focus is not required, so Ctrl+C followed at once by
+  a click elsewhere still copies (Mutter would drop it). A refused source is `cancelled`
+  (Mutter) instead of being left dangling (wlroots). A source used twice is
+  `wl_data_device.used_source`; one that declared drag-and-drop actions is
+  `wl_data_source.invalid_source`. The primary selection has no error enum: a reused source
+  is refused and cancelled.
+- **Who is offered it.** Every data device of the client holding keyboard focus, on three
+  occasions: when focus moves to that client — from the router's focus-client hook, between
+  the old surface's `leave` and the new one's `enter`, so the selection arrives "immediately
+  before" keyboard focus as the spec says —, when the selection changes, and when the focused
+  client creates a device. Each delivery is a fresh offer carrying every mime type, read in
+  place from the source's inline `mime_list`. A source whose client is being torn down is
+  offered as no selection.
+- **Offer validity.** An offer goes inert when its client loses keyboard focus (the spec's
+  "valid until … the client loses keyboard focus"; Mutter), when the selection moves on, or
+  when its source goes. An unfocused client cannot read the clipboard through an offer it
+  kept.
+- **Transfer.** `receive` is forwarded as the source's `send` only for a type the source
+  offered, from a live offer of a live source (Smithay validates the type too; wlroots does
+  not). The compositor closes its copy of the fd in every path; libwayland dups it into the
+  message.
+- **Lifetimes.** Sources and devices are allocated per request and freed by their destructor
+  hooks (wlroots, KWin) — from a shared fixed table, a client that never destroys them would
+  make the next client's request fail with `no_memory`, fatal to a client that did nothing
+  wrong. Offers, which the compositor creates, are a fixed table of 512 with destructor
+  hooks; a source unlinks its offers, so nothing dangles in any destruction order. The owner
+  destroying its source (or exiting) clears the selection and tells the focused client
+  `selection(NULL)` (wlroots). One client may hold 32 live offers; past that, or with the
+  table full, it is sent `selection(NULL)` and one warning per client is logged.
+- **Not done (recorded).** The selection does not outlive its owner: keeping it needs
+  asynchronous reads into the compositor, whose right home is a clipboard manager on
+  `ext-data-control-v1` in the shell.
+
+### Drag-and-drop
+
+`wl_data_device.start_drag` begins a drag; the grab is the Wayland-free `:dnd` partition,
+driven by the window manager's pointer path (which already owns hit-testing, the implicit
+grab and Escape), and everything with a `wl_resource` — offers, negotiation, events — is
+`wire_dnd.cpp` (its `dnd_ops`). The offers come from the selection tables, so the clipboard's
+lifetime rules (destructor hooks, inert offers, the per-client cap) hold for drags too.
+
+- **Starting.** The serial must be the last button press delivered to that client with the
+  button still held, and no move/resize or drag may be running — wlroots' pointer-grab rule,
+  as for `xdg_toplevel.move`. A refused drag's version 3 source is `cancelled`. The icon
+  takes the `dnd_icon` role before the serial is checked and keeps it (wlroots); a surface
+  with another role is `wl_data_device.role`, a source used before is `used_source`. Touch
+  drags are refused (no touch routing yet). When the drag starts, popup grabs end, every
+  held button is withheld from clients until its release, the origin gets `wl_pointer.leave`,
+  and the surface under the pointer becomes the first target at once.
+- **During.** No client has pointer focus. Each motion is one hit test (as any motion) and
+  one `wl_data_device.motion` per data device of the target — no allocation, no logging. A
+  change of target surface is `leave` to the old one (its offer goes inert, the source hears
+  `target(NULL)`) and, per device of the new one, a fresh offer (every mime type, then
+  `source_actions`) and `enter`. A drag without a source stays inside its client: other
+  clients' surfaces are no target, and `enter` carries no offer. A target surface that
+  unmaps or is destroyed is left at once; a window that maps under a still pointer becomes
+  the target at the next tick.
+- **Actions.** Of what both sides accept, the user's (Shift move, Ctrl copy, Alt ask —
+  Mutter's choice and the spec's advice; wlroots ignores modifiers) before the drop, then
+  the destination's preferred action, then the lowest bit. A side bound below version 3
+  counts as copy, as does a version 3 source that never called `set_actions` (Weston).
+  `action` goes to the source and the offer on change only. The pointer shows the outcome
+  (copy, move, dnd-ask, no-drop), as in Mutter and KWin; wlroots leaves the source's stale
+  cursor, which it cannot update without pointer focus.
+- **The icon** is a surface-tree root of kind `dnd_icon` whose container lives in its own
+  scene layer, above the popups and below the cursor; its subsurfaces and damage come with
+  the tree. Its top-left starts at the hotspot and moves by each commit's offset (attach
+  `x,y` or `wl_surface.offset`). It is moved once per tick, with the pointer published at
+  the tick too, so icon and cursor reach the display in the same commit — the interactive
+  move's pattern. Hit tests never visit the icon layer ("the input region is ignored").
+- **The end.** Releasing the last button over a target that accepted an offered type with a
+  negotiated action other than none delivers `drop` (and `dnd_drop_performed` to a version 3
+  source), then `leave`; the offer stays live for `receive` and `finish`, and a version 2
+  target, which never finishes, gets its source `dnd_finished` at once (wlroots, Mutter,
+  Weston). Otherwise — over nothing, a frame, a client without a data device, nothing
+  accepted, no action — `leave` and `cancelled`. Escape cancels the same way, and its press
+  and release reach no client. After the drop an `ask` must be answered by one last
+  `set_actions` whose preferred action the source offers; an offer destroyed without
+  `finish` (or an `ask` dismissed by destroying it) cancels the source. The source destroyed
+  mid-drag, or the origin client of a drag without a source exiting, ends the grab and
+  leaves the target; nothing is sent to a client being torn down. `cancelled` and every
+  drag-only event go to version 3+ sources only: for older ones the spec allows `cancelled`
+  on replacement alone.
+
+### Outputs and output membership
+
+`output_manager` keeps each output in a stable slot (a surface's output set is a bit mask by
+slot) and names it after its connector, as wlroots, Mutter and KWin do (`Virtual-1` on
+vmwgfx, `DP-1`, `HDMI-A-2`); without a connected connector the virtual HEADLESS-1 stands in,
+so headless and nested sessions have an output clients can see. `tick_ui` compares the
+manager's `generation` (the hotplug poll refreshes every tick, so values are compared, not
+"refreshed"): on a change every bound `wl_output` is sent geometry, mode, scale and `done`
+(each `zxdg_output_v1` its logical rect first), and every surface's membership is
+recomputed.
+
+- **Membership from node rects** (wlroots' scene does the same). `surface_tree` reports every
+  change of a node's global rect — created, moved, resized, dropped — through one hook, at
+  the three places it sets them; `wire_output.cpp` turns the rect into a slot mask and sends
+  `wl_surface.enter` / `leave` for the difference to every `wl_output` the surface's client
+  bound for that output. Toplevels, subsurfaces, popups, layer surfaces and the drag icon
+  are all tree nodes; unmapping sends `leave` (wlroots, Mutter). A cursor surface follows
+  the pointer's output through the cursor manager's surface hook. A `wl_output` bound after
+  mapping replays the enters it missed (wlroots); clients often bind outputs lazily.
+- **Preferred buffer scale and transform** (`wl_surface` v6): the scale is the ceiling of
+  the largest scale among the surface's outputs (KWin: sharp on every output it shows on;
+  Mutter and wlroots use one output's), the transform the primary output's (largest
+  overlap, wlroots). Sent only when it differs from what was last sent, starting from the
+  spec's defaults, so nothing goes out at scale 1. **Constraint:** Lumen sizes nodes by
+  buffer size and ignores `wl_surface.set_buffer_scale`, so the preferred scale is capped at
+  1 until surface_manager honours buffer scale — a client told 2 would come out twice as
+  large.
+- **Per-request objects.** Bound `wl_output` and `zxdg_output_v1` objects are allocated per
+  request, kept in intrusive lists and freed by their destructors (so are
+  `xdg_activation_token_v1` builders), never taken from a shared table one client could fill
+  for all.
+- **xdg-output** v3: logical position and size (the mode divided by the scale), name and
+  description, closed by `wl_output.done` (v3) or `zxdg_output_v1.done` (v1–2), in wlroots'
+  order. `wl_output` v4 carries the same name; make is "Lumen", model the output name, the
+  refresh the mode's.
+- **Several outputs (D5).** The single `wl_output` global stands for the first output today;
+  masks are per slot and enter/leave per resource already, so D5 adds a global per output
+  and the leave for an output's bit before its global goes.
+
+### Liveness: ping/pong and "not responding"
+
+`liveness_tracker` (Wayland-free) decides when to ping and when a client is not responding;
+the wire sends `xdg_wm_base.ping` and feeds `pong` back. Pings go out on suspicion, not to
+everyone on a schedule (Mutter): when a toplevel is activated, when a button or key press is
+delivered, when a configure goes unanswered past the 200 ms watchdog, and every 10 s to the
+client with the keyboard — one outstanding per client, at least 2 s apart. A ping unanswered
+for the timeout (`config::ping_timeout_ms`, `--ping-timeout MS`, 5000 ms: Mutter's default;
+0 disables) marks the client not responding; its pong, whenever it catches up, clears it.
+A ping is tied to the `xdg_wm_base` it went out on: destroying that object drops the ping
+(nothing can answer it any more) and clears "not responding" — the client is dispatching
+(Mutter drops a window's ping with the window).
+
+- **Shown, never acted on.** Each of the client's toplevels: the server-side title reads
+  "<title> (Not Responding)", the suffix always visible and the title ellipsized to the room
+  left (KWin's wording); the whole tree and its frame are drawn through a 0.65 grey tint
+  (every backend applies `draw_command::tint`; Mutter and KWin dim too); the shell gets
+  `zlm_policy_bridge_v1.toplevel_flags` (v2) with `not_responding`, so it can offer "wait /
+  force quit" — the compositor never kills a client and never posts
+  `xdg_wm_base.error.unresponsive`.
+- **Not fed what it cannot read.** Pointer motion (and drag-and-drop motion) to a
+  not-responding client is withheld — coalescable state a hung client would only queue up
+  (Mutter stops pointer events to an unanswered client too); keys, buttons and enter/leave
+  keep flowing, because a client that catches up must see them. On recovery a client that
+  has pointer focus gets one motion at the current position.
+- **Not killed by the protocol library either.** libwayland disconnects a client whose
+  connection buffer fills (4 KiB by default, about a hundred motions); the server raises it
+  to 1 MiB per client (`wl_display_set_default_max_buffer_size`, as KWin does), so a stopped
+  client survives long stalls.
+
+### Activation: xdg-activation and focus-stealing prevention
+
+A client that wants another window focused — a launcher starting an application, a terminal
+whose link opens a browser, a notification's "open" — asks for an `xdg_activation_token_v1`
+and hands the token over; the window presents it with `xdg_activation_v1.activate`. Whether
+that focuses the window is the compositor's decision, made in two places:
+
+- **At commit, by the wire** (`decide_grantable`): a token can grant focus only when its
+  serial (`set_serial`) is an input or focus serial the issuer was really sent (the per-client
+  serial log — configure serials do not count) **and** the issuer holds the keyboard or the
+  serial is its own last button or key press. The second clause lets a layer-shell launcher,
+  which never takes the keyboard, issue from a click. The token is 32 hex characters of
+  `getrandom` (unguessable, like Mutter's UUIDs, unlike KWin's counter); logs show 8.
+- **At `activate`, by the window manager** (`decide_activation`, rows in order): not a
+  toplevel's surface (a subsurface counts as its root's) → ignored; unknown or expired (30 s)
+  token → urgent; window not mapped yet → pending, decided again at map; window already
+  focused → granted; no serial → urgent (foot's bell); not grantable → urgent; the user
+  pressed a key or button in a third client after the token's serial (the X11 user-time
+  rule, as Mutter applies it) → urgent; otherwise granted — focus and raise.
+
+*Urgent* sets `toplevel_record::demands_attention` (never on the window that has the
+keyboard) and sends `toplevel_flags` with `demands_attention` to the shell (zlm v2), which
+highlights the task; focusing the window or unmapping it clears it. A window that presented a
+token before mapping is decided at map (`decide_activation_at_map`) with the time of the
+request — a token valid when presented stays valid however long the window takes to appear.
+A new window takes the keyboard (the new-window policy) unless the token is positive
+evidence that this would steal it: the user moved on since it was issued, or it expired.
+Then the window opens without the keyboard, marked, just below the focused window (Mutter,
+KWin). A token that proves nothing — unknown, serial-less, or self-issued from a serial that
+was never the issuer's input, as GTK does with serial 0 for every new window it presents —
+leaves the window no worse off than one that presented none; with no window holding the
+keyboard there is nothing to steal from either. Tokens are
+single use and outlive their issuer (a launcher may exit before what it launched maps); the
+requesting surface's destruction only clears the token's reference to it. A window that
+presents no token at all keeps the placeholder policy (a new window takes the keyboard); real
+focus-stealing prevention for those belongs in shell policy.
 
 ---
 

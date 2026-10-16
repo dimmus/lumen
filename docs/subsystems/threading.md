@@ -110,6 +110,35 @@ pointer and the dragged window are in the same snapshot and reach KMS in the sam
 commit. Escape is intercepted in the key path (`window_manager::on_key`) before
 `input_router`.
 
+Selections (clipboard, primary) are UI state with no render involvement: the per-client
+input serial log is written by `input_router` as it delivers each event, the focus-client
+hook runs inside `input_router::set_keyboard_focus` between the `leave`s and the `enter`s,
+and every source, offer and device table in `wire_selection.cpp` is touched only from
+protocol handlers and that hook. The data itself never passes through the compositor: a
+`receive` hands the reader's fd to the owner as `send` (libwayland dups it) and the
+compositor closes its copy at once — no I/O on the UI thread.
+
+Drag-and-drop is UI state too. The grab (`dnd_grab`, Wayland-free) is driven from the
+window manager's pointer path, key path (Escape) and modifier path, all on the UI thread;
+the wire side (`wire_dnd.cpp`) runs in protocol handlers and in the grab's `dnd_ops`. The
+icon is moved once per tick in `window_manager::on_tick` (after the move/resize grab, before
+`flush_configures`), and during a drag the cursor manager publishes the pointer at the tick
+as for a grab, so icon and pointer reach KMS in the same commit. Render only sees the icon
+as nodes in the published snapshot; dropped data passes client to client by fd, never
+through the compositor.
+
+Output membership and liveness are UI state. `surface_tree`'s rect hook runs wherever a
+node rect is set (a commit's scene sync, a window move at the tick, an unmap), and the wire
+sends `wl_surface.enter`/`leave` from it on the UI thread; `tick_ui` compares the output
+manager's generation once per tick and only then resends output state. `liveness_tracker`
+is driven from the window manager (activation, the configure watchdog, `on_tick`'s O(1)
+deadline check), from the router's user-input hook and from `pong` handlers — UI thread
+only, fixed storage, no allocation. Its verdict reaches render solely as a node tint in the
+published snapshot. xdg-activation is UI state too: tokens are issued and presented by
+protocol handlers, the grant reads the router's serial log and keyboard focus, and the
+decision (`decide_activation`, pure) runs in the window manager — at the request or at map —
+with no render involvement and no allocation (a fixed 64-slot token table).
+
 Latency instrumentation crosses render → UI through one atomic: when a commit carries a
 pointer change, render stores `input_us << 1 | content` into `committed_input_us_` (only
 if it is 0, so a commit racing the flip handler drops its sample rather than being timed

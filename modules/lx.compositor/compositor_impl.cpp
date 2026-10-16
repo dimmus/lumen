@@ -52,8 +52,9 @@ struct compositor_impl {
     cursor_manager cursor_{};
     scene::scene_graph scene{};
     /// Paint order under the scene root, bottom→top (sway's): layer-shell background and
-    /// bottom, the windows, layer-shell top and overlay, every popup, then the software
-    /// cursor. Popups sit above the overlay layer so no panel or window ever covers a menu.
+    /// bottom, the windows, layer-shell top and overlay, every popup, the drag-and-drop
+    /// icon, then the software cursor. Popups sit above the overlay layer so no panel or
+    /// window ever covers a menu; the drag icon above everything a client draws.
     /// The four layer-shell containers hold layer surfaces' tree containers (`:layer_shell`).
     scene::container_node background_layer_{};
     scene::container_node bottom_layer_{};
@@ -61,7 +62,10 @@ struct compositor_impl {
     scene::container_node top_layer_{};
     scene::container_node overlay_shell_layer_{};
     scene::container_node popup_layer_{};
+    scene::container_node dnd_icon_layer_{};
     scene::container_node cursor_layer_{};
+    /// UI affinity. The drag-and-drop grab and its icon — see `:dnd`.
+    dnd_grab dnd_{};
     /// UI affinity. xdg_popup placement, grab and dismissal — see `:popup`.
     popup_manager popups_{};
     /// UI affinity. wlr-layer-shell surfaces, arrangement, exclusive zones — see
@@ -163,6 +167,11 @@ struct compositor_impl {
     long long last_damaged_frame_ = -1;
     /// UI affinity. Output 0's geometry as of the last tick; a change repaints everything.
     lx::rect2i last_output_rect_{};
+    /// UI affinity. `outputs.generation()` clients were last told about.
+    unsigned output_generation_ = 0;
+    /// UI affinity. xdg_wm_base.ping/pong: who is not responding.
+    liveness_tracker liveness_{};
+    activation_tokens activation_{};
     bool initial_damage_noted_ = false;
     /// Written by render after compositing, read by UI to retire client buffers. -1 until
     /// the first frame completes.
@@ -227,6 +236,9 @@ struct compositor_impl {
     void note_present_latency(unsigned long long present_ns, unsigned long long submit_us,
                               unsigned long long fence_us);
     void log_latency_summary();
+    /// `output N name=… mode=WxH refresh_mhz=…` (info) for every output: at start and on
+    /// every change clients are told about.
+    void log_outputs() const;
     /// Render → UI. When the commit whose flip is pending was issued, and a dup of the
     /// sync_file its plane waited on (-1 when there was none). With the flip timestamp
     /// they split a present into compositor, GPU and display time, which is what tells a
@@ -372,6 +384,7 @@ struct compositor_impl {
         (void)scene.root().add(&top_layer_);
         (void)scene.root().add(&overlay_shell_layer_);
         (void)scene.root().add(&popup_layer_);
+        (void)scene.root().add(&dnd_icon_layer_);
         (void)scene.root().add(&cursor_layer_);
         surfaces.set_import_cache(&import_cache);
         surfaces.set_scene(&scene);
@@ -558,6 +571,18 @@ void compositor_impl::note_present_latency(unsigned long long present_ns,
         log_latency_summary();
 }
 
+void compositor_impl::log_outputs() const {
+    for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+        if (!outputs.slot_live(slot))
+            continue;
+        const output_state& o = outputs.slot_state(slot);
+        char line[128];
+        std::snprintf(line, sizeof(line), "output %u name=%s mode=%dx%d refresh_mhz=%u", slot,
+                      o.name, o.geometry.width, o.geometry.height, o.refresh_mhz);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+    }
+}
+
 void compositor_impl::log_latency_summary() {
     const unsigned n = latency_sample_count_;
     latency_sample_count_ = 0;
@@ -580,6 +605,8 @@ void compositor_impl::log_latency_summary() {
 
 void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) {
     input_router_.send_modifiers(mods, input_devices_.default_seat());
+    // During a drag the modifiers choose the user's action.
+    wm_.on_modifiers();
 }
 
 void compositor_impl::prepare_cursor_plane() {
@@ -660,27 +687,27 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     }
     // O(1): records the position and, outside a grab, publishes it for render's next
     // commit. No composite is involved while the cursor plane is in use.
-    // During an interactive grab the pointer is published at the tick instead, so it and
-    // the dragged window reach the display in the same commit.
+    // During an interactive grab or a drag the pointer is published at the tick instead,
+    // so it and the dragged window (or the drag icon) reach the display in the same commit.
     cursor_.on_motion(seat.pointer_x(), seat.pointer_y(),
                       event.time_us ? event.time_us
                                     : static_cast<unsigned long long>(event.time_ms) * 1000ull,
-                      wm_.grab_active());
+                      wm_.grab_active() || wm_.drag_active());
     // Hit-testing, enter/leave and the implicit grab are the window manager's; it sends
     // the motion in the focused surface's local coordinates.
     wm_.on_pointer_motion(event.time_ms);
 }
 
 void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_event& event) {
-    const bool grab_before = wm_.grab_active();
+    const bool grab_before = wm_.grab_active() || wm_.drag_active();
     wm_.on_pointer_button(event);
-    // A button that starts or ends a grab changes the pointer image without moving it:
-    // re-publish the same position stamped with this event, so latency is measured from
-    // the button and not from the last motion.
-    if (event.time_us != 0 && grab_before != wm_.grab_active()) {
+    // A button that starts or ends a grab (or ends a drag) changes the pointer image without
+    // moving it: re-publish the same position stamped with this event, so latency is
+    // measured from the button and not from the last motion.
+    const bool grab_after = wm_.grab_active() || wm_.drag_active();
+    if (event.time_us != 0 && grab_before != grab_after) {
         auto& seat = input_devices_.default_seat();
-        cursor_.on_motion(seat.pointer_x(), seat.pointer_y(), event.time_us,
-                          wm_.grab_active());
+        cursor_.on_motion(seat.pointer_x(), seat.pointer_y(), event.time_us, grab_after);
     }
 }
 
@@ -888,6 +915,13 @@ void compositor_impl::register_p0_globals() {
     p0_.wm = &wm_;
     wm_.set_cursor(&cursor_);
     p0_.cursor = &cursor_;
+    dnd_.bind(tree_, dnd_icon_layer_, &cursor_);
+    wm_.set_dnd(&dnd_);
+    p0_.dnd = &dnd_;
+    liveness_.set_timeout_ns(static_cast<runtime::clock_time>(cfg.ping_timeout_ms) * 1'000'000);
+    wm_.set_liveness(&liveness_);
+    p0_.liveness = &liveness_;
+    p0_.activation = &activation_;
     p0_.outputs = &outputs;
     p0_.headless = &headless_;
     p0_.dmabuf = &graphics.dmabuf();
@@ -1685,11 +1719,15 @@ lx::result<void> compositor::start() {
         unsigned refresh_mhz = 0;
         if (auto mode = impl_->kms.active_mode(0); mode)
             refresh_mhz = mode.value().refresh_millihz;
+        else // the virtual output (headless, nested)
+            refresh_mhz = impl_->outputs.state(impl_->outputs.nth(0)).refresh_mhz;
         char line[96];
         std::snprintf(line, sizeof(line), "output 0 mode=%dx%d refresh_mhz=%u", g.width, g.height,
                       refresh_mhz);
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
     }
+    impl_->log_outputs();
+    impl_->output_generation_ = impl_->outputs.generation();
 
     if (auto bound = impl_->wayland.bind(impl_->cfg.socket_name); !bound) {
         lx::trace::logger::global().log_error(bound.get_error(), "compositor");
@@ -1827,6 +1865,31 @@ void compositor::request_stop() {
     impl_->loop.quit(0);
 }
 
+void compositor::inject_key(const lx::input::key_event& event) {
+    if (!impl_)
+        return;
+    auto& seat = impl_->input_devices_.default_seat();
+    const bool mods_changed = seat.keymap().update_key(event.evdev_keycode, event.pressed);
+    seat.note_key(event.evdev_keycode, event.pressed);
+    impl_->on_input_key(event);
+    if (mods_changed)
+        impl_->on_input_modifiers(seat.keymap().modifiers());
+}
+
+void compositor::inject_pointer_motion(const lx::input::pointer_motion_event& event) {
+    if (!impl_)
+        return;
+    lx::input::pointer_motion_event e = event;
+    e.absolute = false;
+    impl_->input_devices_.default_seat().set_pointer_position(event.x, event.y);
+    impl_->on_input_pointer_motion(e);
+}
+
+void compositor::inject_pointer_button(const lx::input::pointer_button_event& event) {
+    if (impl_)
+        impl_->on_input_pointer_button(event);
+}
+
 config compositor::configuration() const { return impl_ ? impl_->cfg : config{}; }
 wayland::server& compositor::wayland() { return impl_->wayland; }
 surface_manager& compositor::surfaces() { return impl_->surfaces; }
@@ -1838,6 +1901,7 @@ scene::scene_graph& compositor::scene() { return impl_->scene; }
 gfx::device& compositor::graphics() { return impl_->graphics; }
 gfx::dmabuf_import_cache& compositor::import_cache() { return impl_->import_cache; }
 output_manager& compositor::outputs() { return impl_->outputs; }
+liveness_tracker& compositor::liveness() { return impl_->liveness_; }
 seat_manager& compositor::seats() { return impl_->seats; }
 scheduler::frame_scheduler& compositor::scheduler() { return impl_->scheduler_; }
 scheduler::presentation_tracker& compositor::presentation() { return impl_->presentation_; }
@@ -1869,6 +1933,15 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         const float scale = impl_->protocols_.fractional_scale(i);
         if (scale > 0.f)
             impl_->outputs.set_scale(impl_->outputs.nth(i), scale);
+    }
+
+    // An output appeared, went, or changed mode, position or scale: clients are told (each
+    // wl_output and xdg_output, then done) and every surface's membership is recomputed.
+    // Compared by generation: the hotplug poll refreshes every tick.
+    if (impl_->outputs.generation() != impl_->output_generation_) {
+        impl_->output_generation_ = impl_->outputs.generation();
+        impl_->log_outputs();
+        notify_outputs_changed(impl_->p0_);
     }
 
     // Nothing has been drawn yet on the first tick, and a mode change invalidates every

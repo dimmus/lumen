@@ -23,6 +23,9 @@ import :popup;
 import :cursor;
 import :decoration;
 import :layer_shell;
+import :dnd;
+import :liveness;
+import :activation;
 
 export namespace lx::compositor {
 
@@ -177,6 +180,16 @@ struct p0_protocol_context {
     /// Server-side frames: title changes and the decoration mode reach it through the window
     /// manager; it receives its texture-staging hook from `install_p0_protocols`.
     decoration_manager* decorations = nullptr;
+    /// The drag-and-drop grab: wl_data_device.start_drag begins it (after the window
+    /// manager validated the serial), the icon role's commits and surface destruction reach
+    /// it. Receives its wire ops from `install_p0_protocols`.
+    dnd_grab* dnd = nullptr;
+    /// xdg_wm_base.ping/pong liveness: pongs land here, and it receives its wire ops (send
+    /// a ping, the not-responding change) from `install_p0_protocols`.
+    liveness_tracker* liveness = nullptr;
+    /// xdg-activation tokens issued to clients (wire_activation.cpp); the window manager
+    /// decides what presenting one does.
+    activation_tokens* activation = nullptr;
     /// Advertise zxdg_decoration_manager_v1 (`config::server_side_decorations`).
     bool server_side_decorations = true;
     output_manager* outputs = nullptr;
@@ -218,6 +231,10 @@ void fire_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms);
 
 /// Sends wl_buffer.release for a dmabuf buffer once the render path is done with it.
 void release_wl_buffer_resource(void* wl_buffer_resource, void* user_data);
+/// `output_manager::generation` moved: every bound wl_output and zxdg_output_v1 is sent
+/// the new state (then `done`), and every surface's output membership is recomputed from
+/// its node rect. UI affinity; rare (a mode change, an output added or removed).
+void notify_outputs_changed(p0_protocol_context& ctx);
 
 } // namespace lx::compositor
 

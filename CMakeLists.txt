@@ -226,39 +226,14 @@ if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
         target_include_directories(lumen-square PRIVATE "${LUMEN_CLOUDS_GEN}")
         lumen_link_platform(lumen-square)
 
-        # Deterministic xdg_popup client for scripts/app-smoke.sh (group B).
-        if(LUMEN_BUILD_TESTS)
-            add_executable(lumen-probe
-                tests/clients/lumen-probe.cpp
-                "${LUMEN_CLOUDS_GEN}/xdg-shell-protocol.c"
-                "${LUMEN_CLOUDS_GEN}/xdg-shell-client-protocol.h"
-            )
-            target_include_directories(lumen-probe PRIVATE "${LUMEN_CLOUDS_GEN}")
+        # Deterministic protocol client for scripts/app-smoke.sh (popups, layer shell,
+        # selections). Its client glue is lumen-protocol-glue's — every manifest protocol —
+        # rather than private copies, which would define xdg_wm_base_interface twice.
+        if(LUMEN_BUILD_TESTS AND TARGET lumen-protocol-glue)
+            add_executable(lumen-probe tests/clients/lumen-probe.cpp)
+            target_link_libraries(lumen-probe PRIVATE lumen-protocol-glue)
             lumen_link_platform(lumen-probe)
-            # Layer mode (group D): wlr-layer-shell client glue. Its get_popup takes an
-            # xdg_popup, whose interface comes from the xdg-shell code above.
-            set(LUMEN_LAYER_SHELL_XML "${CMAKE_SOURCE_DIR}/protocols/upstream/unstable/wlr-layer-shell-unstable-v1.xml")
-            if(EXISTS "${LUMEN_LAYER_SHELL_XML}")
-                add_custom_command(
-                    OUTPUT "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-client-protocol.h"
-                    COMMAND "${WAYLAND_SCANNER_EXE}" client-header "${LUMEN_LAYER_SHELL_XML}"
-                            "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-client-protocol.h"
-                    DEPENDS "${LUMEN_LAYER_SHELL_XML}"
-                    VERBATIM
-                )
-                add_custom_command(
-                    OUTPUT "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-protocol.c"
-                    COMMAND "${WAYLAND_SCANNER_EXE}" private-code "${LUMEN_LAYER_SHELL_XML}"
-                            "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-protocol.c"
-                    DEPENDS "${LUMEN_LAYER_SHELL_XML}"
-                    VERBATIM
-                )
-                target_sources(lumen-probe PRIVATE
-                    "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-protocol.c"
-                    "${LUMEN_CLOUDS_GEN}/wlr-layer-shell-unstable-v1-client-protocol.h"
-                )
-                target_compile_definitions(lumen-probe PRIVATE LUMEN_PROBE_HAS_LAYER_SHELL)
-            endif()
+            target_compile_definitions(lumen-probe PRIVATE LUMEN_PROBE_HAS_LAYER_SHELL)
         endif()
     else()
         message(STATUS "xdg-shell.xml not found — skipping lumen-clouds and lumen-square")
@@ -327,6 +302,48 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_positioner)
     target_include_directories(test_positioner PRIVATE tests)
     add_test(NAME test_positioner COMMAND test_positioner)
+
+    add_executable(test_data_transfer tests/test_data_transfer.cpp)
+    target_link_libraries(test_data_transfer PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_data_transfer)
+    lumen_link_platform(test_data_transfer)
+    target_include_directories(test_data_transfer PRIVATE tests)
+    add_test(NAME test_data_transfer COMMAND test_data_transfer)
+
+    add_executable(test_input_serials tests/test_input_serials.cpp)
+    target_link_libraries(test_input_serials PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_input_serials)
+    lumen_link_platform(test_input_serials)
+    target_include_directories(test_input_serials PRIVATE tests)
+    add_test(NAME test_input_serials COMMAND test_input_serials)
+
+    add_executable(test_dnd_grab tests/test_dnd_grab.cpp)
+    target_link_libraries(test_dnd_grab PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_dnd_grab)
+    lumen_link_platform(test_dnd_grab)
+    target_include_directories(test_dnd_grab PRIVATE tests)
+    add_test(NAME test_dnd_grab COMMAND test_dnd_grab)
+
+    add_executable(test_output_membership tests/test_output_membership.cpp)
+    target_link_libraries(test_output_membership PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_output_membership)
+    lumen_link_platform(test_output_membership)
+    target_include_directories(test_output_membership PRIVATE tests)
+    add_test(NAME test_output_membership COMMAND test_output_membership)
+
+    add_executable(test_liveness tests/test_liveness.cpp)
+    target_link_libraries(test_liveness PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_liveness)
+    lumen_link_platform(test_liveness)
+    target_include_directories(test_liveness PRIVATE tests)
+    add_test(NAME test_liveness COMMAND test_liveness)
+
+    add_executable(test_activation_policy tests/test_activation_policy.cpp)
+    target_link_libraries(test_activation_policy PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_activation_policy)
+    lumen_link_platform(test_activation_policy)
+    target_include_directories(test_activation_policy PRIVATE tests)
+    add_test(NAME test_activation_policy COMMAND test_activation_policy)
 
     add_executable(test_decoration_geometry tests/test_decoration_geometry.cpp)
     target_link_libraries(test_decoration_geometry PRIVATE lx.compositor)
@@ -468,7 +485,18 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_protocol_conformance)
     target_include_directories(test_protocol_conformance PRIVATE tests "${LUMEN_GENERATED_DIR}")
     add_test(NAME test_protocol_conformance COMMAND test_protocol_conformance)
-    set_tests_properties(test_protocol_conformance PROPERTIES TIMEOUT 30)
+    # ~25 s of round trips and settle waits on a 2-core VM, with jitter: 30 s was marginal.
+    set_tests_properties(test_protocol_conformance PROPERTIES TIMEOUT 60)
+
+    # Client contracts on the wire: wl_output and xdg-output values, wl_surface.enter/leave
+    # (map, unmap, a late wl_output bind, subsurfaces, popups), against the headless output.
+    add_executable(test_output_contract tests/test_output_contract.cpp)
+    target_link_libraries(test_output_contract PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_output_contract)
+    lumen_link_platform(test_output_contract)
+    target_include_directories(test_output_contract PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_output_contract COMMAND test_output_contract)
+    set_tests_properties(test_output_contract PROPERTIES TIMEOUT 30)
 
     add_executable(test_kms_device tests/test_kms_device.cpp)
     target_link_libraries(test_kms_device PRIVATE lx.drm)
@@ -538,9 +566,12 @@ if(LUMEN_BUILD_TESTS)
 
     set_tests_properties(test_result test_snapshot test_damage_region test_wm_geometry
         test_surface_tree test_positioner test_layer_arrange test_xcursor
+        test_data_transfer test_input_serials test_dnd_grab test_output_membership test_liveness
+        test_activation_policy
         test_import_cache bench_frame
         test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_input_keymap
         test_headless_golden test_text_shaping test_protocol_bind test_protocol_conformance
+        test_output_contract
         test_task_model test_shell_bridge
         test_kms_device test_kms_vkms
         test_ui_reconcile test_gl_composite bench_composite
