@@ -185,6 +185,23 @@ The software cursor is a scene node and crosses threads in the snapshot like any
 | **Render** | `render` | `render_loop()` waits on `condition_variable` → `tick_render()` |
 | **Worker** | `worker` | `worker_loop()` drains `executor` worker strand |
 
+No thread polls. The UI loop blocks in `epoll_wait` on every fd it serves (Wayland display,
+DRM card, libinput, the logind bus), one `timerfd` armed at the earliest timer deadline
+(absolute, CLOCK_MONOTONIC) and one `eventfd` that `event_loop::post`, `quit` and posts to
+the UI strand write. A flip wakes it the moment the card turns readable. The render thread
+waits for a tick's snapshot or a post to its strand; the worker only for a post (each
+strand's `set_waker`). An `fd_source` with a nonzero `poll_interval_ns` still dispatches on
+a period, for an fd whose readiness cannot be trusted; nothing uses one.
+
+**The frame clock runs on demand.** Two consecutive ticks with nothing to do stop it.
+Nothing to do means no damage, nothing the render thread has not reached, no flip or commit
+outstanding, no frame callback or buffer waiting on a frame, and nothing the window manager
+deferred. A client request, an input event or a flip restarts it at the display's next
+deadline (`repaint_scheduler::next_start`). While it is stopped a 1 s housekeeping timer
+ticks for the deadlines only a tick notices: liveness pings, the configure watchdog,
+unmapping idle staging. An idle desktop measured 730 wakeups/s across the three threads
+before this and 5/s after (vmwgfx, shell and one terminal).
+
 Client content crosses UI → render as `texture_update`s on an SPSC queue. Each carries the
 index of the snapshot that was being built when it was queued, and the render thread
 applies it no earlier than when it composites that snapshot (later ones wait, in order):
@@ -195,7 +212,9 @@ scene graph they edit.
 ### Vsync wiring (current → future)
 
 **Current (P0/P1):** DRM/KMS page-flip when `kms_device::open()` succeeds; `timer_source` remains
-fallback for headless/CI. `hotplug_monitor` refreshes outputs each UI tick.
+fallback for headless/CI. `hotplug_monitor` refreshes outputs each UI tick. A repeating
+`timer_source` advances from its deadline, skipping missed periods; re-arming at
+`now + interval` let every tick's lateness push the rest back (60 Hz measured 57).
 
 ### CLI
 

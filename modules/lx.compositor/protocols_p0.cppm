@@ -1,6 +1,8 @@
 module;
 
 #include <atomic>
+#include <cstring>
+#include <mutex>
 #include <vector>
 
 #if !defined(_WIN32)
@@ -74,6 +76,9 @@ struct texture_update {
     unsigned long long shm_token = 0;
     /// `shm_upload_pool` block backing `pixels` (GL path), released once uploaded.
     unsigned long long shm_pool_token = 0;
+    /// `shm_direct_uploads` handle: the pixels are read from the client's buffer, through
+    /// that table, instead of from `pixels`. Set only on the GL client-upload path.
+    unsigned shm_direct = 0;
     /// The part of the `width` x `height` image that `pixels` carries, packed (row stride
     /// `region.width * 4`). Empty means the whole image. A partial region updates texture
     /// storage that already holds the rest — see `shm_upload_region`.
@@ -165,6 +170,170 @@ private:
     void unmap(block& b);
     block blocks_[k_max_blocks]{};
     unsigned long long mapped_bytes_ = 0;
+};
+
+/// GL path: client shm buffers uploaded by the render thread straight from the client's
+/// memory. Staging copied every damaged pixel once on the UI thread and the driver copied
+/// it again; now the driver's read is the only one, and the UI thread copies nothing.
+///
+/// The price is holding the client's buffer until the upload has happened. The
+/// wl_buffer.release that went out at commit goes out from `retire` once the render thread
+/// is done, and an external wl_shm_pool reference keeps the mapping where it is (libwayland
+/// defers a pool resize while one is held). A client may still destroy the wl_buffer in
+/// between: `on_buffer_gone` runs while the buffer is still readable and copies the region
+/// out under the lock, so the render thread never reads a buffer that no longer exists and
+/// the UI thread never waits on a frame.
+///
+/// Handles are index + 1; 0 means none. UI affinity throughout, except `upload` (render).
+class shm_direct_uploads {
+public:
+    static constexpr unsigned k_max = 64;
+
+    /// The libwayland calls, kept out of this class so it can be tested without a client.
+    struct hooks {
+        void (*begin_access)(void* shm_buffer) = nullptr;
+        void (*end_access)(void* shm_buffer) = nullptr;
+        void (*release)(void* wl_buffer) = nullptr;
+        void (*unref_pool)(void* shm_pool) = nullptr;
+    };
+
+    void bind(hooks h, shm_upload_pool* staging) {
+        hooks_ = h;
+        staging_ = staging;
+    }
+
+    /// `pixels` is `region`'s first pixel in the client's memory, rows `stride` apart.
+    /// Returns 0 when every entry is in use (the caller stages instead).
+    [[nodiscard]] unsigned add(void* wl_buffer, void* shm_buffer, void* shm_pool,
+                               const unsigned char* pixels, unsigned stride, lx::rect2i region) {
+        for (unsigned i = 0; i < k_max; ++i) {
+            entry& e = entries_[i];
+            if (e.used)
+                continue;
+            e.used = true;
+            e.buffer = wl_buffer;
+            e.shm = shm_buffer;
+            e.pool = shm_pool;
+            e.pixels = pixels;
+            e.stride = stride;
+            e.region = region;
+            e.fallback_token = 0;
+            e.done.store(false, std::memory_order_relaxed);
+            ++used_;
+            return i + 1;
+        }
+        return 0;
+    }
+
+    /// The update naming `handle` was never queued: nothing will upload it.
+    void drop(unsigned handle) {
+        if (handle == 0 || handle > k_max)
+            return;
+        entries_[handle - 1].done.store(true, std::memory_order_release);
+        retire();
+    }
+
+    /// Render affinity. Calls `fn(pixels, stride)` — `pixels` null when the client
+    /// destroyed the buffer and its region could not be kept — with the client's memory
+    /// guarded against a truncated pool, then marks the entry finished.
+    template <class Fn>
+    void upload(unsigned handle, Fn&& fn) {
+        if (handle == 0 || handle > k_max)
+            return;
+        entry& e = entries_[handle - 1];
+        unsigned long long staged = 0;
+        {
+            std::lock_guard lock{mutex_};
+            if (e.shm && hooks_.begin_access)
+                hooks_.begin_access(e.shm);
+            fn(e.pixels, e.stride);
+            if (e.shm && hooks_.end_access)
+                hooks_.end_access(e.shm);
+            staged = e.fallback_token;
+            e.fallback_token = 0;
+        }
+        if (staged && staging_)
+            staging_->release(staged);
+        e.done.store(true, std::memory_order_release);
+    }
+
+    /// The wl_buffer is being destroyed (its destroy listener; still readable). Uploads not
+    /// yet done keep a copy of their region; finished ones just forget the object.
+    void on_buffer_gone(void* wl_buffer) {
+        if (used_ == 0 || !wl_buffer)
+            return;
+        std::lock_guard lock{mutex_};
+        for (auto& e : entries_) {
+            if (!e.used || e.buffer != wl_buffer)
+                continue;
+            if (!e.done.load(std::memory_order_acquire) && e.shm && e.pixels) {
+                const unsigned row = static_cast<unsigned>(e.region.width) * 4u;
+                const unsigned rows = static_cast<unsigned>(e.region.height);
+                unsigned long long token = 0;
+                unsigned char* copy = staging_ ? staging_->acquire(row * rows, token) : nullptr;
+                if (copy) {
+                    if (hooks_.begin_access)
+                        hooks_.begin_access(e.shm);
+                    for (unsigned y = 0; y < rows; ++y)
+                        std::memcpy(copy + static_cast<size_t>(y) * row,
+                                    e.pixels + static_cast<size_t>(y) * e.stride, row);
+                    if (hooks_.end_access)
+                        hooks_.end_access(e.shm);
+                }
+                e.pixels = copy;
+                e.stride = row;
+                e.fallback_token = token;
+            }
+            e.buffer = nullptr;
+            e.shm = nullptr;
+        }
+    }
+
+    /// Sends the release of every buffer whose upload is done — unless a later commit of
+    /// the same buffer is still waiting, which then releases it — and drops pool refs.
+    void retire() {
+        if (used_ == 0)
+            return;
+        for (auto& e : entries_) {
+            if (!e.used || !e.done.load(std::memory_order_acquire))
+                continue;
+            bool reused = false;
+            for (const auto& other : entries_)
+                if (&other != &e && other.used && other.buffer == e.buffer && e.buffer &&
+                    !other.done.load(std::memory_order_acquire))
+                    reused = true;
+            if (e.buffer && !reused && hooks_.release)
+                hooks_.release(e.buffer);
+            if (e.pool && hooks_.unref_pool)
+                hooks_.unref_pool(e.pool);
+            e.used = false;
+            e.buffer = e.shm = e.pool = nullptr;
+            e.pixels = nullptr;
+            --used_;
+        }
+    }
+
+    /// A client buffer is held for an upload, so a later frame has work to do.
+    [[nodiscard]] bool idle() const { return used_ == 0; }
+    [[nodiscard]] unsigned in_use() const { return used_; }
+
+private:
+    struct entry {
+        void* buffer = nullptr; // wl_resource*; null once destroyed
+        void* shm = nullptr;    // wl_shm_buffer*; null once destroyed
+        void* pool = nullptr;   // wl_shm_pool*, externally referenced
+        const unsigned char* pixels = nullptr;
+        unsigned stride = 0;
+        lx::rect2i region{};
+        unsigned long long fallback_token = 0;
+        bool used = false;
+        std::atomic<bool> done{false};
+    };
+    entry entries_[k_max]{};
+    unsigned used_ = 0;
+    std::mutex mutex_{};
+    hooks hooks_{};
+    shm_upload_pool* staging_ = nullptr;
 };
 
 /// Damage history of one surface, for buffer-age uploads: commit `seq` (1-based) has its
@@ -311,6 +480,9 @@ struct p0_protocol_context {
     /// GL path: transient per-update staging. Exactly one of shm_store / shm_pool /
     /// shm_staging is set.
     shm_upload_pool* shm_pool = nullptr;
+    /// GL path with client-memory uploads (`gl_compositor::supports_client_upload`): shm
+    /// commits skip staging and are uploaded from the client's buffer. Requires shm_pool.
+    shm_direct_uploads* shm_direct = nullptr;
     /// dev_t sent as zwp_linux_dmabuf_feedback_v1.main_device and tranche target: the
     /// render node of the KMS device. 0 when there is none (headless).
     unsigned long long dmabuf_main_device = 0;
@@ -348,6 +520,8 @@ struct p0_protocol_context {
 
 /// Fire pending wl_surface.frame callbacks after a present (presentation feedback).
 void fire_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms);
+/// A client is waiting on a wl_surface.frame callback.
+[[nodiscard]] bool frame_callbacks_pending(const p0_protocol_context& ctx);
 
 /// Sends wl_buffer.release for a dmabuf buffer once the render path is done with it.
 void release_wl_buffer_resource(void* wl_buffer_resource, void* user_data);

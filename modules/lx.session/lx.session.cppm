@@ -5,6 +5,7 @@ module;
 #endif
 
 #include <cerrno>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -14,6 +15,7 @@ module;
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -60,6 +62,10 @@ public:
     /// Process pending sd-bus messages (PauseDevice / ResumeDevice / Active).
     void dispatch();
     [[nodiscard]] int bus_fd() const;
+    /// When `dispatch` is next due, in ns from now: 0 when sd-bus already holds a message
+    /// (read during a synchronous call, so the socket will not report it), -1 when only
+    /// the socket becoming readable can bring work.
+    [[nodiscard]] long long dispatch_timeout_ns() const;
 
 private:
     void release();
@@ -287,6 +293,23 @@ void lx::session::logind_session::dispatch() {
         return;
     while (sd_bus_process(bus_, nullptr) > 0) {
     }
+#endif
+}
+
+long long lx::session::logind_session::dispatch_timeout_ns() const {
+#if defined(LUMEN_HAS_LOGIND)
+    std::uint64_t at_us = 0;
+    if (!bus_ || sd_bus_get_timeout(bus_, &at_us) <= 0 || at_us == UINT64_MAX)
+        return -1;
+    if (at_us == 0)
+        return 0;
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    const long long now_us = static_cast<long long>(ts.tv_sec) * 1'000'000 + ts.tv_nsec / 1000;
+    const long long left_us = static_cast<long long>(at_us) - now_us;
+    return left_us > 0 ? left_us * 1000 : 0;
+#else
+    return -1;
 #endif
 }
 

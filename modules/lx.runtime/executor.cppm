@@ -122,9 +122,14 @@ public:
 
     [[nodiscard]] affinity bound_affinity() const;
     [[nodiscard]] unsigned pending() const;
+    /// Called after every successful post, from the posting thread: how the consumer's
+    /// event loop learns there is work without polling for it. Set before producers start.
+    void set_waker(void (*wake)(void*), void* user);
 
 private:
     affinity bound_ = affinity::ui;
+    void (*wake_)(void*) = nullptr;
+    void* wake_user_ = nullptr;
     lx::sync::spsc_queue<task, k_strand_queue_depth> queue_{};
     std::atomic<unsigned> pending_{0};
 };
@@ -194,7 +199,14 @@ bool lx::runtime::strand::try_post(task fn) {
     // Producer and consumer touch this from different threads: load-then-store would drop
     // counts under any concurrency at all.
     pending_.fetch_add(1, std::memory_order_release);
+    if (wake_)
+        wake_(wake_user_);
     return true;
+}
+
+void lx::runtime::strand::set_waker(void (*wake)(void*), void* user) {
+    wake_ = wake;
+    wake_user_ = user;
 }
 
 void lx::runtime::strand::drain() {

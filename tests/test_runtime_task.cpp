@@ -1,7 +1,10 @@
 #include "lumen_test.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <thread>
+
+#include <unistd.h>
 
 import lx.runtime;
 
@@ -142,6 +145,89 @@ LUMEN_TEST(executor_routes_by_affinity) {
 
     ex.drain(lx::runtime::affinity::worker);
     LUMEN_CHECK(worker_subject.value == 1);
+}
+
+// ── event_loop: waits on its sources instead of polling them ──────────────────────────
+
+namespace {
+long long now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+} // namespace
+
+// Re-arming at `now + interval` after the callback let each tick's lateness and duration
+// push every later one back: a 60 Hz clock ran at 57.
+LUMEN_TEST(timer_repeats_from_its_deadline_not_from_its_dispatch) {
+    lx::runtime::event_loop loop;
+    int fired = 0;
+    const long long start = now_ms();
+    lx::runtime::timer_source timer{10'000'000, lx::runtime::task{[&] {
+                                        ++fired;
+                                        std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                                        if (fired == 21)
+                                            loop.quit(0);
+                                    }},
+                                    true};
+    loop.add_source(&timer);
+    (void)loop.run();
+    loop.remove_source(&timer);
+    const long long elapsed = now_ms() - start;
+    // 20 periods after the first firing: 200 ms on schedule, 260+ ms if each drifted.
+    LUMEN_CHECK(elapsed >= 195);
+    LUMEN_CHECK(elapsed < 240);
+}
+
+LUMEN_TEST(loop_sleeps_until_another_thread_posts) {
+    lx::runtime::event_loop loop;
+    std::thread poster{[&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        (void)loop.post(lx::runtime::task{[&] { loop.quit(7); }});
+    }};
+    const int code = loop.run();
+    poster.join();
+    LUMEN_CHECK(code == 7);
+    // Woken by the post, not on a period: a polling loop would have woken several times.
+    LUMEN_CHECK(loop.wakeups() <= 2);
+}
+
+LUMEN_TEST(loop_wakes_for_work_posted_to_the_ui_strand) {
+    lx::runtime::event_loop loop;
+    std::thread poster{[&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        (void)lx::runtime::executor::global().post(lx::runtime::affinity::ui,
+                                                   lx::runtime::task{[&] { loop.quit(3); }});
+    }};
+    const int code = loop.run();
+    poster.join();
+    LUMEN_CHECK(code == 3);
+    LUMEN_CHECK(loop.wakeups() <= 2);
+}
+
+LUMEN_TEST(fd_source_dispatches_when_readable_and_only_then) {
+    int fds[2];
+    LUMEN_CHECK(::pipe(fds) == 0);
+    lx::runtime::event_loop loop;
+    int dispatched = 0;
+    lx::runtime::fd_source source{fds[0], lx::runtime::task{[&] {
+                                      ++dispatched;
+                                      char c = 0;
+                                      (void)!::read(fds[0], &c, 1);
+                                      loop.quit(0);
+                                  }}};
+    loop.add_source(&source);
+    std::thread writer{[&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        (void)!::write(fds[1], "x", 1);
+    }};
+    (void)loop.run();
+    writer.join();
+    loop.remove_source(&source);
+    ::close(fds[0]);
+    ::close(fds[1]);
+    LUMEN_CHECK(dispatched == 1);
+    LUMEN_CHECK(loop.wakeups() <= 2);
 }
 
 int main(int argc, char** argv) {

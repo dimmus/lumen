@@ -266,6 +266,10 @@ public:
     /// Cursor the grab overrides (move / resize shapes). Optional.
     void set_cursor(cursor_manager* cursor) { cursor_ = cursor; }
     [[nodiscard]] bool grab_active() const { return grab_.mode != grab_mode::none; }
+    /// Work `on_tick` has yet to do, or a deadline only a tick notices: a re-hit, a
+    /// stacking change, grab motion, or a configure held back until the client acks (or
+    /// the 200 ms watchdog fires). The frame clock keeps running while this is true.
+    [[nodiscard]] bool needs_tick() const;
     [[nodiscard]] const wm_grab& grab() const { return grab_; }
     /// The executor. Requires: no grab active, a mapped toplevel in the normal state,
     /// `button` (an evdev code) still held, and for a resize valid non-zero `edges`.
@@ -1416,6 +1420,23 @@ void lx::compositor::window_manager::on_tick(lx::runtime::clock_time now_ns) {
         const auto* focused = toplevels_ ? toplevels_->find(keyboard_focus_) : nullptr;
         liveness_->tick(now_ns, focused ? focused->client : lx::client_id{});
     }
+}
+
+bool lx::compositor::window_manager::needs_tick() const {
+    if (rehit_pending_ || stacking_dirty_ || (grab_.mode != grab_mode::none && grab_.motion_pending))
+        return true;
+    if (surfaces_ && surfaces_->layout_changed())
+        return true;
+    bool waiting = false;
+    if (toplevels_) {
+        toplevels_->for_each([&](const toplevel_record& rec) {
+            if (rec.initial_configure_sent && rec.inflight &&
+                (!rec.desired.same_request(rec.last_sent) || rec.deco_configure_due ||
+                 rec.configure_due))
+                waiting = true;
+        });
+    }
+    return waiting;
 }
 
 void lx::compositor::window_manager::flush_configures(lx::runtime::clock_time now_ns) {

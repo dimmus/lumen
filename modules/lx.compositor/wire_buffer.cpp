@@ -149,6 +149,7 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
                                       lx::rect2i region, unsigned long long& seq_out,
                                       unsigned long long& token_out,
                                       unsigned long long& pool_token_out) {
+    lx::trace::scoped_span span{"wayland", "shm.stage"};
     seq_out = 0;
     token_out = 0;
     pool_token_out = 0;
@@ -227,6 +228,45 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
     return out;
 }
 
+unsigned direct_shm_upload(wl_resource* buffer, wl_shm_buffer* shm, buffer_obj* buf,
+                           lx::rect2i region, const unsigned char*& pixels, unsigned& stride) {
+    if (!g_p0_ctx || !g_p0_ctx->shm_direct || !g_p0_ctx->textures || !buffer || !shm || !buf)
+        return 0;
+    const uint32_t fmt = wl_shm_buffer_get_format(shm);
+    const int client_stride = wl_shm_buffer_get_stride(shm);
+    if ((fmt != WL_SHM_FORMAT_ARGB8888 && fmt != WL_SHM_FORMAT_XRGB8888) || client_stride <= 0 ||
+        buf->width == 0 || buf->height == 0)
+        return 0;
+    if (region.width <= 0 || region.height <= 0)
+        region = {0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
+    // The pointer is computed here, where the buffer is known to be alive; the pool
+    // reference keeps the mapping it points into until `retire`.
+    const auto* base = static_cast<const unsigned char*>(wl_shm_buffer_get_data(shm));
+    const auto* first = base + static_cast<size_t>(region.y) * static_cast<unsigned>(client_stride) +
+                        static_cast<size_t>(region.x) * 4u;
+    wl_shm_pool* pool = wl_shm_buffer_ref_pool(shm);
+    const unsigned handle = g_p0_ctx->shm_direct->add(buffer, shm, pool, first,
+                                                      static_cast<unsigned>(client_stride), region);
+    if (!handle) {
+        wl_shm_pool_unref(pool);
+        return 0;
+    }
+    pixels = first;
+    stride = static_cast<unsigned>(client_stride);
+    return handle;
+}
+
+void bind_shm_direct(p0_protocol_context& ctx) {
+    if (!ctx.shm_direct)
+        return;
+    shm_direct_uploads::hooks h{};
+    h.begin_access = [](void* shm) { wl_shm_buffer_begin_access(static_cast<wl_shm_buffer*>(shm)); };
+    h.end_access = [](void* shm) { wl_shm_buffer_end_access(static_cast<wl_shm_buffer*>(shm)); };
+    h.release = [](void* buffer) { wl_buffer_send_release(static_cast<wl_resource*>(buffer)); };
+    h.unref_pool = [](void* pool) { wl_shm_pool_unref(static_cast<wl_shm_pool*>(pool)); };
+    ctx.shm_direct->bind(h, ctx.shm_pool);
+}
+
 lx::buffer_id next_buffer_id() {
     static unsigned n = 1;
     return lx::buffer_id{n++};
@@ -242,6 +282,9 @@ void buffer_gone(struct wl_resource* resource, buffer_obj* b) {
     // resource now rather than release it after the client freed it.
     if (g_p0_ctx && g_p0_ctx->lifecycle)
         g_p0_ctx->lifecycle->on_buffer_destroyed(resource);
+    // Likewise an upload still to read it: it keeps a copy, made now while it is readable.
+    if (g_p0_ctx && g_p0_ctx->shm_direct)
+        g_p0_ctx->shm_direct->on_buffer_gone(resource);
     // Before the references below are dropped: it asks whether a surface still shows it.
     if (b)
         destroy_buffer(b);

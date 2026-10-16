@@ -10,6 +10,7 @@ import lx.foundation;
 import lx.compositor;
 
 using lx::compositor::buffer_upload_state;
+using lx::compositor::shm_direct_uploads;
 using lx::compositor::shm_pixel_store;
 using lx::compositor::shm_upload_pool;
 using lx::compositor::shm_upload_region;
@@ -197,6 +198,118 @@ LUMEN_TEST(region_is_whole_when_the_history_ran_out_or_the_surface_changed) {
     surface_damage_history other;
     other.record({1, 1, 1, 1});
     LUMEN_CHECK(same(shm_upload_region(other, st, lx::surface_id{2}, 100, 50), {0, 0, 100, 50}));
+}
+
+// ── direct uploads: the client's buffer is held until the render thread has read it ──
+
+namespace {
+int g_released = 0;
+void* g_last_released = nullptr;
+int g_unrefs = 0;
+int g_access_depth = 0;
+int g_accesses = 0;
+
+shm_direct_uploads::hooks counting_hooks() {
+    g_released = g_unrefs = g_access_depth = g_accesses = 0;
+    g_last_released = nullptr;
+    shm_direct_uploads::hooks h{};
+    h.begin_access = [](void*) { ++g_access_depth; ++g_accesses; };
+    h.end_access = [](void*) { --g_access_depth; };
+    h.release = [](void* b) { ++g_released; g_last_released = b; };
+    h.unref_pool = [](void*) { ++g_unrefs; };
+    return h;
+}
+
+// Stand-ins for the wl_buffer, wl_shm_buffer and wl_shm_pool: only identity matters.
+int g_buffer_a, g_buffer_b, g_shm_a, g_shm_b, g_pool;
+} // namespace
+
+LUMEN_TEST(direct_upload_releases_only_after_the_render_thread_read_it) {
+    shm_direct_uploads t;
+    shm_upload_pool staging;
+    t.bind(counting_hooks(), &staging);
+    unsigned char pixels[16 * 4]{};
+    const unsigned h = t.add(&g_buffer_a, &g_shm_a, &g_pool, pixels, 16 * 4, {0, 0, 16, 1});
+    LUMEN_CHECK(h != 0);
+    t.retire();
+    LUMEN_CHECK(g_released == 0); // the client must not draw into it yet
+    LUMEN_CHECK(!t.idle());
+
+    const unsigned char* seen = nullptr;
+    t.upload(h, [&](const unsigned char* p, unsigned) {
+        seen = p;
+        LUMEN_CHECK(g_access_depth == 1); // read inside the SIGBUS guard
+    });
+    LUMEN_CHECK(seen == pixels);
+    LUMEN_CHECK(g_access_depth == 0);
+    t.retire();
+    LUMEN_CHECK(g_released == 1 && g_last_released == &g_buffer_a);
+    LUMEN_CHECK(g_unrefs == 1);
+    LUMEN_CHECK(t.idle());
+}
+
+LUMEN_TEST(direct_upload_of_a_recommitted_buffer_releases_it_once_after_the_last_read) {
+    shm_direct_uploads t;
+    t.bind(counting_hooks(), nullptr);
+    unsigned char pixels[4]{};
+    const unsigned first = t.add(&g_buffer_a, &g_shm_a, &g_pool, pixels, 4, {0, 0, 1, 1});
+    const unsigned second = t.add(&g_buffer_a, &g_shm_a, &g_pool, pixels, 4, {0, 0, 1, 1});
+    t.upload(first, [](const unsigned char*, unsigned) {});
+    t.retire();
+    // The second commit still has to read it: releasing now would hand the client a
+    // buffer the compositor is about to read.
+    LUMEN_CHECK(g_released == 0);
+    t.upload(second, [](const unsigned char*, unsigned) {});
+    t.retire();
+    LUMEN_CHECK(g_released == 1);
+    LUMEN_CHECK(g_unrefs == 2); // each commit held its own pool reference
+}
+
+LUMEN_TEST(direct_upload_keeps_a_copy_when_the_client_destroys_the_buffer_first) {
+    shm_direct_uploads t;
+    shm_upload_pool staging;
+    t.bind(counting_hooks(), &staging);
+    // A 4x2 region of a buffer with an 8-pixel stride, rows marked so the copy is checkable.
+    unsigned char buffer[8 * 4 * 2]{};
+    for (unsigned i = 0; i < sizeof(buffer); ++i)
+        buffer[i] = static_cast<unsigned char>(i);
+    const unsigned h = t.add(&g_buffer_b, &g_shm_b, &g_pool, buffer, 8 * 4, {0, 0, 4, 2});
+    t.on_buffer_gone(&g_buffer_b);
+    LUMEN_CHECK(g_accesses == 1); // copied under the guard, while still readable
+
+    bool ok = true;
+    unsigned stride_seen = 0;
+    t.upload(h, [&](const unsigned char* p, unsigned stride) {
+        stride_seen = stride;
+        ok = p && p != buffer && std::memcmp(p, buffer, 16) == 0 &&
+             std::memcmp(p + 16, buffer + 32, 16) == 0;
+    });
+    LUMEN_CHECK(ok);
+    LUMEN_CHECK(stride_seen == 16); // packed
+    LUMEN_CHECK(g_accesses == 1);   // the upload did not touch the destroyed buffer
+    t.retire();
+    LUMEN_CHECK(g_released == 0); // nothing to release: the object is gone
+    LUMEN_CHECK(g_unrefs == 1);
+    staging.trim();
+    LUMEN_CHECK(staging.bytes_mapped() == 0); // the copy's block went back
+}
+
+LUMEN_TEST(direct_upload_dropped_before_queueing_releases_at_once) {
+    shm_direct_uploads t;
+    t.bind(counting_hooks(), nullptr);
+    unsigned char pixels[4]{};
+    const unsigned h = t.add(&g_buffer_a, &g_shm_a, &g_pool, pixels, 4, {0, 0, 1, 1});
+    t.drop(h);
+    LUMEN_CHECK(g_released == 1 && g_unrefs == 1 && t.idle());
+}
+
+LUMEN_TEST(direct_upload_table_full_falls_back) {
+    shm_direct_uploads t;
+    t.bind(counting_hooks(), nullptr);
+    unsigned char pixels[4]{};
+    for (unsigned i = 0; i < shm_direct_uploads::k_max; ++i)
+        LUMEN_CHECK(t.add(&g_buffer_a, &g_shm_a, &g_pool, pixels, 4, {0, 0, 1, 1}) != 0);
+    LUMEN_CHECK(t.add(&g_buffer_a, &g_shm_a, &g_pool, pixels, 4, {0, 0, 1, 1}) == 0);
 }
 
 int main(int argc, char** argv) {

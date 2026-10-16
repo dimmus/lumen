@@ -224,6 +224,7 @@ lx::result<void> lx::compositor::install_p0_protocols(p0_protocol_context& ctx) 
                               "p0 install: null server");
     }
     p0::install_core(ctx);
+    p0::bind_shm_direct(ctx);
     return {};
 #else
     (void)ctx;
@@ -240,6 +241,15 @@ void lx::compositor::fire_frame_callbacks(p0_protocol_context& ctx, unsigned fra
 #else
     (void)ctx;
     (void)frame_time_ms;
+#endif
+}
+
+bool lx::compositor::frame_callbacks_pending(const p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    return p0::frames_pending();
+#else
+    return false;
 #endif
 }
 
