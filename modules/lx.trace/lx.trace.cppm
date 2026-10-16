@@ -75,7 +75,8 @@ private:
 /// Starts recording when `LUMEN_TRACE_FILE` is set (`LUMEN_TRACE_EVENTS` caps the buffer,
 /// default 2,000,000 events). Idempotent.
 void timeline_start_from_env();
-/// Names the calling thread for the OS (perf, top, gdb) and in the timeline.
+/// Names the calling thread in the timeline, and for the OS (perf, top -H, gdb) unless it
+/// is the main thread, whose OS name is the process name.
 void name_thread(const char* name);
 /// A counter sample now. `name` must be a string literal.
 void timeline_counter(const char* name, long long value);
@@ -314,12 +315,16 @@ void lx::trace::name_thread(const char* name) {
 #if defined(__linux__)
     if (!name)
         return;
-    char os_name[16];
-    std::snprintf(os_name, sizeof(os_name), "%s", name); // the kernel keeps 15 bytes
-    (void)pthread_setname_np(pthread_self(), os_name);
+    const int tid = current_tid();
+    // Not the main thread: its name is the process name that ps, top and pkill show, and
+    // renaming it turned "lumen-compositor" into "lx-ui". The timeline still labels it.
+    if (tid != static_cast<int>(::getpid())) {
+        char os_name[16];
+        std::snprintf(os_name, sizeof(os_name), "%s", name); // the kernel keeps 15 bytes
+        (void)pthread_setname_np(pthread_self(), os_name);
+    }
     tl_state& s = tl();
     std::lock_guard lock{s.names_mutex};
-    const int tid = current_tid();
     for (unsigned i = 0; i < s.name_count; ++i) {
         if (s.names[i].tid == tid) {
             std::snprintf(s.names[i].name, sizeof(s.names[i].name), "%s", name);
