@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run a Lumen session on the console: compositor, lumen-shell's panel, and one client.
+# Run a Lumen session on the console: compositor, lumen-shell's panel, and a first client.
 #
 #   ./scripts/run-desktop.sh                      # foot, from the TTY you are logged into
 #   ./scripts/run-desktop.sh -- gtk4-widget-factory
@@ -7,10 +7,11 @@
 #   ./scripts/run-desktop.sh --join-seat-session  # from SSH: join the active seat session
 #
 # The session ends when you log out — the panel's "Log out" button (click, then click
-# "Confirm?"), or Ctrl+Alt+Backspace, which works even without the panel — when the client
-# exits (type `exit` in foot, or use its close button), or after the time limit, whichever
-# comes first. Logging out asks every window to close and then stops the compositor. The limit is a safety net: the
-# compositor owns the console while it runs, so a client that cannot be closed would
+# "Confirm?"), or Ctrl+Alt+Backspace, which works even without the panel — or after the
+# time limit, whichever comes first. Closing a window, the first client's included, closes
+# only that window: the session, and anything started from it, keeps running. Logging out
+# asks every window to close and then stops the compositor. The limit is a safety net: the
+# compositor owns the console while it runs, so a session whose way out broke would
 # otherwise leave no way back to the text console. Teardown stops everything with SIGTERM,
 # which is what restores the console's text mode.
 #
@@ -18,8 +19,8 @@
 # holds it; a summary is printed once the console is back.
 #
 # Options:
-#   -t SECONDS            time limit (default 600; 0 = none — only when you are sure the
-#                         client can be closed)
+#   -t SECONDS            time limit (default 600; 0 = none — only when you are sure you
+#                         can log out: the panel's button or Ctrl+Alt+Backspace)
 #   --socket NAME         Wayland socket name (default lumen-0)
 #   --decorations=MODE    server (Lumen draws window frames) or client; passed to the
 #                         compositor
@@ -217,7 +218,9 @@ else
   "${CLIENT[@]}" >"$CLIENT_LOG" 2>&1 &
   CLIENT_PID=$!
 
-  # Until the client exits, the compositor dies, or the limit passes.
+  # Until a logout, the compositor dies, or the limit passes. The first client exiting is
+  # not an ending: it is one window of the session, and closing it (its close button,
+  # `exit` in foot) must not take the other windows and the panel down with it.
   deadline=$(( $(date +%s) + LIMIT ))
   while :; do
     if grep -q "compositor.session: logout requested" "$COMP_LOG" 2>/dev/null; then
@@ -227,10 +230,8 @@ else
       ENDED_BY="logged out"
       break
     fi
-    if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+    if [[ -n "$CLIENT_PID" ]] && ! kill -0 "$CLIENT_PID" 2>/dev/null; then
       wait "$CLIENT_PID" 2>/dev/null; CLIENT_RC=$?; CLIENT_PID=""
-      ENDED_BY="client exited"
-      break
     fi
     if ! kill -0 "$COMP_PID" 2>/dev/null; then
       ENDED_BY="compositor exited"
@@ -256,4 +257,4 @@ errors=$(grep -cE '^\[(ERROR|WARN)\]' "$COMP_LOG" 2>/dev/null || true)
 echo "  logs: $COMP_LOG"
 (( WITH_SHELL )) && echo "        $SHELL_LOG"
 echo "        $CLIENT_LOG"
-[[ ( "$ENDED_BY" == "client exited" || "$ENDED_BY" == "logged out" ) && "${COMP_RC:-1}" == "0" ]]
+[[ "$ENDED_BY" == "logged out" && "${COMP_RC:-1}" == "0" ]]
