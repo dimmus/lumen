@@ -11,7 +11,7 @@ Implemented in `zlm_policy_bridge_v1` (`protocols/lumen/zlm_shell_v1.xml`):
 
 | Phase | Events |
 |-------|--------|
-| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 2) |
+| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 3) |
 | Initial sync | `snapshot_begin` → `snapshot_workspace*` → (`snapshot_toplevel` [→ `toplevel_flags`])* → `snapshot_output*` → `snapshot_done` → `focus_changed` |
 | Runtime deltas | `toplevel_created` (→ `toplevel_state`, `toplevel_geometry` [, `toplevel_flags`]), `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `toplevel_flags` (v2), `focus_changed`, `stacking_order_changed` |
 
@@ -27,8 +27,18 @@ parent's version, and `zlm_toplevel_v1` handles take the bridge's). Version 2 ad
 bitfield enum `toplevel_flag` (`not_responding` = 1, `demands_attention` = 2) and the event
 `toplevel_flags(toplevel, flags)`, sent right after `snapshot_toplevel` and after
 `toplevel_created` when the flags are non-zero, and whenever they change. Only bridges bound
-at version 2 receive it; a version 1 shell binds version 1 and never sees it. lumen-shell
-binds `min(advertised, 2)`.
+at version 2 receive it; a version 1 shell binds version 1 and never sees it.
+
+### Version 3: logout
+
+The family moves to version 3 together. `zlm_shell_v1.request_logout` asks the compositor
+to end the session: it sends `xdg_toplevel.close` to every window, stops once none is left
+or after a 5 s grace, and its teardown restores the console — nothing is killed. The
+compositor's own Ctrl+Alt+Backspace runs the same logout, so there is a way out even with
+no shell. Either way the bound shell first receives `zlm_shell_v1.session_ending`, so it
+reads the disconnect that follows as the end of the session, not a crash. lumen-shell binds
+`min(advertised, 3)` and shows a "Log out" button only when version 3 is bound: one click
+arms it ("Confirm?"), a second sends the request, moving off disarms it.
 
 - **`not_responding`**: the client left an `xdg_wm_base.ping` unanswered past the
   compositor's timeout (`--ping-timeout`, 5 s). The compositor only shows it — "(Not

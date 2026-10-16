@@ -6,8 +6,10 @@
 #   ./scripts/run-desktop.sh -t 60 -- alacritty
 #   ./scripts/run-desktop.sh --join-seat-session  # from SSH: join the active seat session
 #
-# The session ends when the client exits — type `exit` in foot, or use its close button —
-# or after the time limit, whichever comes first. The limit is a safety net: the
+# The session ends when you log out — the panel's "Log out" button (click, then click
+# "Confirm?"), or Ctrl+Alt+Backspace, which works even without the panel — when the client
+# exits (type `exit` in foot, or use its close button), or after the time limit, whichever
+# comes first. Logging out asks every window to close and then stops the compositor. The limit is a safety net: the
 # compositor owns the console while it runs, so a client that cannot be closed would
 # otherwise leave no way back to the text console. Teardown stops everything with SIGTERM,
 # which is what restores the console's text mode.
@@ -218,6 +220,13 @@ else
   # Until the client exits, the compositor dies, or the limit passes.
   deadline=$(( $(date +%s) + LIMIT ))
   while :; do
+    if grep -q "compositor.session: logout requested" "$COMP_LOG" 2>/dev/null; then
+      # The compositor is closing every window and will stop on its own (5 s grace).
+      # Stopping it here would cut that short for windows still saving or closing.
+      for _ in $(seq 1 100); do kill -0 "$COMP_PID" 2>/dev/null || break; sleep 0.1; done
+      ENDED_BY="logged out"
+      break
+    fi
     if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
       wait "$CLIENT_PID" 2>/dev/null; CLIENT_RC=$?; CLIENT_PID=""
       ENDED_BY="client exited"
@@ -247,4 +256,4 @@ errors=$(grep -cE '^\[(ERROR|WARN)\]' "$COMP_LOG" 2>/dev/null || true)
 echo "  logs: $COMP_LOG"
 (( WITH_SHELL )) && echo "        $SHELL_LOG"
 echo "        $CLIENT_LOG"
-[[ "$ENDED_BY" == "client exited" && "${COMP_RC:-1}" == "0" ]]
+[[ ( "$ENDED_BY" == "client exited" || "$ENDED_BY" == "logged out" ) && "${COMP_RC:-1}" == "0" ]]

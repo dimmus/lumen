@@ -125,6 +125,7 @@ void install_core(p0_protocol_context& ctx) {
         ops.send_configure = &wm_send_configure;
         ops.next_serial = &wm_next_serial;
         ops.send_close = &wm_send_close;
+        ctx.notify_session_ending = &shell_send_session_ending;
         ops.last_user_serial = &wm_last_user_serial;
         ops.user = &ctx;
         ctx.wm->set_protocol_ops(ops);
@@ -153,7 +154,7 @@ void install_core(p0_protocol_context& ctx) {
                             .interface_desc = &xdg_wm_base_interface},
                            &bind_xdg_wm_base);
     ctx.server->add_global({.interface_name = "zlm_shell_v1",
-                            .version = 2,
+                            .version = 3,
                             .privileged = true,
                             .interface_desc = &zlm_shell_v1_interface},
                            bind_shell);

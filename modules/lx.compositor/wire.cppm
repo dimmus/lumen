@@ -458,6 +458,8 @@ void bind_cursor_shape(wayland::client_connection& client, unsigned id, int vers
 bool cursor_request_allowed(wl_client* client, uint32_t serial);
 void bind_seat(wayland::client_connection& client, unsigned id, int version);
 void bind_shell(wayland::client_connection& client, unsigned id, int version);
+/// Sends zlm_shell_v1.session_ending (v3) to every bound shell.
+void shell_send_session_ending();
 void bind_output(wayland::client_connection& client, unsigned id, int version);
 
 // ── wire_output.cpp: wl_output, xdg-output, output membership ───────────────

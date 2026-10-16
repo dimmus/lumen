@@ -16,7 +16,7 @@
 
   <!-- ── Compositor-owned toplevel handle ─────────────────────────── -->
 
-  <interface name="zlm_toplevel_v1" version="2">
+  <interface name="zlm_toplevel_v1" version="3">
     <description summary="compositor-owned handle for a mapped xdg toplevel">
       Shell uses this object for all window management. The compositor maps
       zlm_toplevel_v1 to internal xdg_toplevel state. Never expose client-side
@@ -30,7 +30,7 @@
 
   <!-- ── Shell root ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_shell_v1" version="2">
+  <interface name="zlm_shell_v1" version="3">
     <description summary="Lumen desktop shell root interface"/>
 
     <enum name="capability">
@@ -59,11 +59,29 @@
       <arg name="flags" type="uint" enum="capability"/>
       <arg name="shell_protocol_version" type="uint" summary="compositor-supported version"/>
     </event>
+
+    <request name="request_logout" since="3">
+      <description summary="end the session cleanly">
+        The user asked to log out. The compositor sends xdg_toplevel.close to every
+        window so clients can exit on their own terms, waits a few seconds for them to
+        go, then stops; its teardown restores the console. Nothing is killed: a client
+        still connected at the deadline is disconnected when the compositor exits.
+        Repeated requests while a logout is in progress are ignored.
+      </description>
+    </request>
+
+    <event name="session_ending" since="3">
+      <description summary="the session is about to end">
+        A logout has begun, whoever asked for it (this shell, or the compositor's own
+        Ctrl+Alt+Backspace). Windows are being asked to close; the connection will be
+        closed when the compositor stops. A shell can treat that as a normal end.
+      </description>
+    </event>
   </interface>
 
   <!-- ── Workspaces ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_workspace_manager_v1" version="2">
+  <interface name="zlm_workspace_manager_v1" version="3">
     <description summary="virtual desktop manager"/>
 
     <enum name="error">
@@ -108,7 +126,7 @@
     </event>
   </interface>
 
-  <interface name="zlm_workspace_v1" version="2">
+  <interface name="zlm_workspace_v1" version="3">
     <description summary="a single workspace"/>
 
     <request name="destroy" type="destructor"/>
@@ -132,7 +150,7 @@
 
   <!-- ── Policy bridge: shell intent → compositor execution ──────── -->
 
-  <interface name="zlm_policy_bridge_v1" version="2">
+  <interface name="zlm_policy_bridge_v1" version="3">
     <description summary="window management policy bridge">
       Shell sends placement intent; compositor executes geometry, focus, and
       stacking. Stacking is default; tiling is an optional shell plugin.
@@ -328,7 +346,7 @@
 
   <!-- ── Window rules (typed, session config) ─────────────────────── -->
 
-  <interface name="zlm_window_rules_v1" version="2">
+  <interface name="zlm_window_rules_v1" version="3">
     <description summary="persistent window rules">
       Rules are stored in the session config directory
       ($XDG_CONFIG_HOME/lumen/window-rules.toml). Use reload_rules to apply.

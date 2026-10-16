@@ -52,6 +52,8 @@ inline constexpr int k_entry_min_width = 48;
 inline constexpr int k_entry_max_width = 220;
 /// Room for the "+k" label of entries that do not fit.
 inline constexpr int k_panel_more_width = 44;
+/// The logout button at the right end.
+inline constexpr int k_logout_width = 84;
 inline constexpr unsigned k_max_panel_cells = 128;
 
 enum panel_cell_flag : unsigned {
@@ -72,6 +74,21 @@ struct panel_cell {
     unsigned flags = 0;
 };
 
+/// The logout button's input to a layout. Two clicks log out: the first arms it ("Confirm?"),
+/// the second sends the request; moving off the button disarms it. No timer, so nothing
+/// runs while the panel is idle, and a stray click cannot end the session.
+struct panel_logout {
+    bool shown = false; // the compositor supports zlm_shell_v1.request_logout
+    bool armed = false;
+    bool pressed = false;
+};
+
+enum panel_logout_flag : unsigned {
+    logout_hover = 1u << 0,
+    logout_pressed = 1u << 1,
+    logout_armed = 1u << 2,
+};
+
 struct panel_layout {
     /// 0 = nothing (an unpainted buffer, nothing committed yet).
     int width = 0;
@@ -83,13 +100,18 @@ struct panel_layout {
     /// Entries that did not fit, shown as "+hidden" at more_x.
     unsigned hidden = 0;
     int more_x = 0;
+    /// The logout button; logout_w 0 = not shown.
+    int logout_x = 0;
+    int logout_w = 0;
+    unsigned logout_flags = 0;
 };
 
 /// Lays out `model`'s entries on a `width`×`height` panel. The pointer (surface
 /// coordinates; negative = not on the panel) marks the entry under it as hovered;
 /// `pressed` marks the entry a button went down on.
 void layout_panel(const task_model& model, int width, int height, double pointer_x,
-                  double pointer_y, task_handle pressed, panel_layout& out);
+                  double pointer_y, task_handle pressed, panel_layout& out,
+                  panel_logout logout = {});
 /// Copies the used part of `from` (the cells in use, not all k_max_panel_cells).
 ///
 /// Also a workaround: Clang 23.1 finds no viable copy assignment for this class here and
@@ -97,6 +119,8 @@ void layout_panel(const task_model& model, int width, int height, double pointer
 void copy_layout(panel_layout& to, const panel_layout& from);
 /// Index of the cell under (x, y), or -1.
 [[nodiscard]] int panel_hit(const panel_layout& layout, double x, double y);
+/// Whether (x, y) is on the logout button.
+[[nodiscard]] bool panel_hit_logout(const panel_layout& layout, double x, double y);
 /// Rects of `to` that differ from `from`: the whole panel when the arrangement changed
 /// (size, entry count, any position or width, the "+k" label), else one rect per entry
 /// whose task, label or state changed. Returns how many were written (≤ cap; a full-panel
@@ -161,6 +185,7 @@ private:
     void paint(buffer& b, const panel_layout& l, const lx::rect2i* rects, unsigned n);
     void paint_cell(buffer& b, const panel_layout& l, unsigned i);
     void paint_more(buffer& b, const panel_layout& l);
+    void paint_logout(buffer& b, const panel_layout& l);
     void paint_text(buffer& b, int x, int y, int w, int h, const char* text,
                     lx::text::raster_color color);
     void pointer_moved(double x, double y);
@@ -191,6 +216,9 @@ private:
     double pointer_y_ = -1.0;
     task_handle hovered_{};
     task_handle pressed_{};
+    bool logout_hovered_ = false;
+    bool logout_pressed_ = false;
+    bool logout_armed_ = false;
     panel_layout committed_{};
     panel_layout next_{};
     lx::text::shaped_line line_{};
@@ -201,7 +229,8 @@ private:
 // ── Layout ───────────────────────────────────────────────────────────────────
 
 void lx::shell::layout_panel(const task_model& model, int width, int height, double px,
-                             double py, task_handle pressed, panel_layout& out) {
+                             double py, task_handle pressed, panel_layout& out,
+                             panel_logout logout) {
     out.width = width;
     out.height = height;
     out.cell_h = height < k_entry_height ? height : k_entry_height;
@@ -209,11 +238,28 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
     out.count = 0;
     out.hidden = 0;
     out.more_x = 0;
+    out.logout_x = 0;
+    out.logout_w = 0;
+    out.logout_flags = 0;
+    // The logout button takes the right end; entries share what is left.
+    int reserve = 0;
+    if (logout.shown && width >= 2 * k_panel_pad + k_logout_width + k_entry_min_width) {
+        out.logout_w = k_logout_width;
+        out.logout_x = width - k_panel_pad - k_logout_width;
+        reserve = k_logout_width + k_panel_gap;
+        if (logout.armed)
+            out.logout_flags |= logout_armed;
+        if (logout.pressed)
+            out.logout_flags |= logout_pressed;
+        if (px >= out.logout_x && px < out.logout_x + out.logout_w && py >= out.cell_y &&
+            py < out.cell_y + out.cell_h)
+            out.logout_flags |= logout_hover;
+    }
     task_handle order[k_max_tasks];
     const unsigned n = model.ordered(order, k_max_tasks);
-    if (n == 0 || width <= 2 * k_panel_pad)
+    if (n == 0 || width <= 2 * k_panel_pad + reserve)
         return;
-    const int avail = width - 2 * k_panel_pad;
+    const int avail = width - 2 * k_panel_pad - reserve;
     const int ni = static_cast<int>(n);
     unsigned visible = n;
     int w = k_entry_min_width;
@@ -261,6 +307,9 @@ void lx::shell::copy_layout(panel_layout& to, const panel_layout& from) {
     to.count = from.count;
     to.hidden = from.hidden;
     to.more_x = from.more_x;
+    to.logout_x = from.logout_x;
+    to.logout_w = from.logout_w;
+    to.logout_flags = from.logout_flags;
     for (unsigned i = 0; i < from.count && i < k_max_panel_cells; ++i) {
         panel_cell& d = to.cells[i];
         const panel_cell& c = from.cells[i];
@@ -282,6 +331,11 @@ int lx::shell::panel_hit(const panel_layout& l, double x, double y) {
     return -1;
 }
 
+bool lx::shell::panel_hit_logout(const panel_layout& l, double x, double y) {
+    return l.logout_w > 0 && x >= l.logout_x && x < l.logout_x + l.logout_w &&
+           y >= l.cell_y && y < l.cell_y + l.cell_h;
+}
+
 unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx::rect2i* out,
                                unsigned cap) {
     if (cap == 0 || b.width <= 0 || b.height <= 0)
@@ -289,7 +343,8 @@ unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx:
     const lx::rect2i whole{0, 0, b.width, b.height};
     bool arrangement = a.width != b.width || a.height != b.height || a.count != b.count ||
                        a.hidden != b.hidden || a.more_x != b.more_x || a.cell_y != b.cell_y ||
-                       a.cell_h != b.cell_h;
+                       a.cell_h != b.cell_h || a.logout_x != b.logout_x ||
+                       a.logout_w != b.logout_w;
     for (unsigned i = 0; !arrangement && i < b.count; ++i)
         arrangement = a.cells[i].x != b.cells[i].x || a.cells[i].w != b.cells[i].w;
     if (arrangement) {
@@ -308,6 +363,13 @@ unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx:
         }
         out[n++] = lx::rect2i{y.x, b.cell_y, y.w, b.cell_h};
     }
+    if (b.logout_w > 0 && a.logout_flags != b.logout_flags) {
+        if (n == cap) {
+            out[0] = whole;
+            return 1;
+        }
+        out[n++] = lx::rect2i{b.logout_x, b.cell_y, b.logout_w, b.cell_h};
+    }
     return n;
 }
 
@@ -322,6 +384,8 @@ constexpr std::uint32_t k_pressed = 0xFF2A2A30u;
 constexpr std::uint32_t k_focused = 0xFF3D6FB4u;
 /// Demands attention: an amber accent, as GNOME's and KDE's task bars use.
 constexpr std::uint32_t k_attention = 0xFFB4782Du;
+/// The armed logout button: a second click ends the session.
+constexpr std::uint32_t k_danger = 0xFFB43C3Cu;
 constexpr lx::text::raster_color k_text{0xE6, 0xE6, 0xE6, 0xFF};
 constexpr lx::text::raster_color k_text_focused{0xFF, 0xFF, 0xFF, 0xFF};
 constexpr lx::text::raster_color k_text_more{0xA8, 0xA8, 0xAC, 0xFF};
@@ -434,9 +498,29 @@ void lx::shell::panel::paint_more(buffer& b, const panel_layout& l) {
         return;
     char more[16];
     std::snprintf(more, sizeof(more), "+%u", l.hidden);
-    int w = width_ - k_panel_pad - l.more_x;
+    const int right = l.logout_w > 0 ? l.logout_x - k_panel_gap : width_ - k_panel_pad;
+    int w = right - l.more_x;
     w = w < k_panel_more_width ? w : k_panel_more_width;
     paint_text(b, l.more_x + 4, l.cell_y, w - 4, l.cell_h, more, k_text_more);
+}
+
+void lx::shell::panel::paint_logout(buffer& b, const panel_layout& l) {
+    if (l.logout_w <= 0)
+        return;
+    const lx::rect2i box{l.logout_x, l.cell_y, l.logout_w, l.cell_h};
+    fill(b.pixels, width_, box, k_bg);
+    std::uint32_t bgc = k_bg;
+    if (l.logout_flags & logout_pressed)
+        bgc = k_pressed;
+    else if (l.logout_flags & logout_armed)
+        bgc = k_danger;
+    else if (l.logout_flags & logout_hover)
+        bgc = k_hover;
+    if (bgc != k_bg)
+        fill_rounded(b.pixels, width_, box, bgc);
+    const bool armed = (l.logout_flags & logout_armed) != 0;
+    paint_text(b, l.logout_x + k_text_pad, l.cell_y, l.logout_w - 2 * k_text_pad, l.cell_h,
+               armed ? "Confirm?" : "Log out", armed ? k_text_focused : k_text_more);
 }
 
 void lx::shell::panel::paint(buffer& b, const panel_layout& l, const lx::rect2i* rects,
@@ -449,11 +533,14 @@ void lx::shell::panel::paint(buffer& b, const panel_layout& l, const lx::rect2i*
             for (unsigned i = 0; i < l.count; ++i)
                 paint_cell(b, l, i);
             paint_more(b, l);
+            paint_logout(b, l);
             return;
         }
         for (unsigned i = 0; i < l.count; ++i)
             if (intersects(rect, l.cells[i].x, l.cells[i].w))
                 paint_cell(b, l, i);
+        if (l.logout_w > 0 && intersects(rect, l.logout_x, l.logout_w))
+            paint_logout(b, l);
     }
 }
 
@@ -533,9 +620,11 @@ struct lx::shell::panel::events {
     }
     static void leave(void* data, wl_pointer*, uint32_t, wl_surface*) {
         auto& p = self(data);
-        if (p.pressed_)
+        if (p.pressed_ || p.logout_pressed_ || p.logout_armed_)
             p.dirty_ = true;
         p.pressed_ = {};
+        p.logout_pressed_ = false;
+        p.logout_armed_ = false;
         p.pointer_moved(-1.0, -1.0);
     }
     static void motion(void* data, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y) {
@@ -547,6 +636,27 @@ struct lx::shell::panel::events {
         auto& p = self(data);
         if (button != k_btn_left)
             return;
+        const bool on_logout = panel_hit_logout(p.committed_, p.pointer_x_, p.pointer_y_);
+        if (state == WL_POINTER_BUTTON_STATE_PRESSED && on_logout) {
+            p.logout_pressed_ = true;
+            p.dirty_ = true;
+            return;
+        }
+        if (state != WL_POINTER_BUTTON_STATE_PRESSED && p.logout_pressed_) {
+            p.logout_pressed_ = false;
+            p.dirty_ = true;
+            if (!on_logout || !p.bridge_)
+                return;
+            if (!p.logout_armed_) {
+                p.logout_armed_ = true; // first click: "Confirm?"
+                panel_log(lx::trace::level::debug, "logout armed");
+                return;
+            }
+            p.logout_armed_ = false;
+            panel_log(lx::trace::level::info, "logout requested");
+            p.bridge_->request_logout();
+            return;
+        }
         const int hit = panel_hit(p.committed_, p.pointer_x_, p.pointer_y_);
         const task_handle under = hit >= 0 ? p.committed_.cells[hit].task : task_handle{};
         if (state == WL_POINTER_BUTTON_STATE_PRESSED) {
@@ -639,6 +749,14 @@ void lx::shell::panel::pointer_moved(double x, double y) {
     if (!(under == hovered_)) {
         hovered_ = under;
         dirty_ = true;
+    }
+    const bool on_logout = panel_hit_logout(committed_, x, y);
+    if (on_logout != logout_hovered_) {
+        logout_hovered_ = on_logout;
+        dirty_ = true;
+        // Moving off the armed button cancels: confirmation is one deliberate gesture.
+        if (!on_logout)
+            logout_armed_ = false;
     }
 }
 
@@ -796,7 +914,8 @@ void lx::shell::panel::draw(bool force) {
     }
     buffer& b = buffers_[bi];
 
-    layout_panel(bridge_->model(), width_, height_, pointer_x_, pointer_y_, pressed_, next_);
+    layout_panel(bridge_->model(), width_, height_, pointer_x_, pointer_y_, pressed_, next_,
+                 panel_logout{bridge_->can_logout(), logout_armed_, logout_pressed_});
     lx::rect2i damage[k_max_panel_cells];
     const unsigned nd = panel_diff(committed_, next_, damage, k_max_panel_cells);
     if (nd == 0 && !force) {

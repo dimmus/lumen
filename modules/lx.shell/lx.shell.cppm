@@ -135,7 +135,7 @@ struct lx::shell::shell_app::events {
             // Version 2 brings toplevel_flags (not responding, demands attention); a v1
             // compositor simply never sends them.
             a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface,
-                                        min_version(version, 2));
+                                        min_version(version, 3));
             // capabilities follows the bind at once; listen before it is dispatched.
             (void)a.bridge_.observe(a.shell_);
         } else if (std::strcmp(iface, wp_cursor_shape_manager_v1_interface.name) == 0) {
@@ -152,9 +152,15 @@ const wl_registry_listener k_registry_listener = {
     .global_remove = lx::shell::shell_app::events::global_remove,
 };
 
-/// Why the connection ended, in words: the protocol error if there was one.
-void describe_connection_error(wl_display* d, const char* when) {
+/// Why the connection ended, in words: the protocol error if there was one. Returns the
+/// exit code: 0 when the shell itself asked to log out and the compositor simply went away,
+/// which is how a logout ends — not an error.
+int describe_connection_error(wl_display* d, const char* when, bool logout_requested = false) {
     const int err = wl_display_get_error(d);
+    if (logout_requested && err != EPROTO) {
+        shell_log(lx::trace::level::info, "session ended (logged out)");
+        return 0;
+    }
     char line[256];
     if (err == EPROTO) {
         const wl_interface* iface = nullptr;
@@ -166,6 +172,7 @@ void describe_connection_error(wl_display* d, const char* when) {
         std::snprintf(line, sizeof(line), "%s: connection lost (%s)", when, std::strerror(err));
     }
     shell_log(lx::trace::level::error, line);
+    return 1;
 }
 
 } // namespace
@@ -257,8 +264,7 @@ int lx::shell::shell_app::run() {
         // sleep until the socket or a signal has something.
         while (wl_display_prepare_read(d) != 0) {
             if (wl_display_dispatch_pending(d) < 0) {
-                describe_connection_error(d, "dispatch failed");
-                code = 1;
+                code = describe_connection_error(d, "dispatch failed", bridge_.logout_requested());
                 break;
             }
         }
@@ -277,8 +283,7 @@ int lx::shell::shell_app::run() {
                 fds[0].events |= POLLOUT;
             } else {
                 wl_display_cancel_read(d);
-                describe_connection_error(d, "flush failed");
-                code = 1;
+                code = describe_connection_error(d, "flush failed", bridge_.logout_requested());
                 break;
             }
         }
@@ -290,16 +295,14 @@ int lx::shell::shell_app::run() {
         }
         if (n > 0 && (fds[0].revents & (POLLIN | POLLERR | POLLHUP))) {
             if (wl_display_read_events(d) < 0) {
-                describe_connection_error(d, "compositor gone");
-                code = 1;
+                code = describe_connection_error(d, "compositor gone", bridge_.logout_requested());
                 break;
             }
         } else {
             wl_display_cancel_read(d);
         }
         if (wl_display_dispatch_pending(d) < 0) {
-            describe_connection_error(d, "dispatch failed");
-            code = 1;
+            code = describe_connection_error(d, "dispatch failed", bridge_.logout_requested());
             break;
         }
         if (n > 0 && (fds[1].revents & POLLIN)) {
