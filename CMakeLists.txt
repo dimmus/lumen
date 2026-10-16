@@ -296,6 +296,13 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_wm_geometry PRIVATE tests)
     add_test(NAME test_wm_geometry COMMAND test_wm_geometry)
 
+    add_executable(test_shm_staging tests/test_shm_staging.cpp)
+    target_link_libraries(test_shm_staging PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_shm_staging)
+    lumen_link_platform(test_shm_staging)
+    target_include_directories(test_shm_staging PRIVATE tests)
+    add_test(NAME test_shm_staging COMMAND test_shm_staging)
+
     add_executable(test_positioner tests/test_positioner.cpp)
     target_link_libraries(test_positioner PRIVATE lx.compositor)
     lumen_apply_module_properties(test_positioner)

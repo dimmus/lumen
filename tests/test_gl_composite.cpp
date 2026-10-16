@@ -220,6 +220,51 @@ LUMEN_TEST(gl_composite_scanout_memory_row_0_is_the_top) {
 #endif
 }
 
+// The GL path uploads only what changed (buffer age). Two names alternate per texture, so
+// after two whole uploads a region upload must land in the name being sampled next and
+// leave the rest of that name's image intact.
+LUMEN_TEST(gl_region_upload_updates_only_its_region) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned W = 32, H = 16;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+
+    const auto blue = solid(W, H, 0, 0, 255);
+    // Both names get the whole image, as the staging side guarantees.
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(5, W, H, blue.data())));
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(5, W, H, blue.data())));
+    const auto red = solid(8, 4, 255, 0, 0);
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba_region(5, W, H, {4, 2, 8, 4}, red.data())));
+    LUMEN_CHECK(comp.partial_into_fresh() == 0);
+
+    const auto cmd = quad(5, {0, 0, static_cast<int>(W), static_cast<int>(H)});
+    auto stats = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    close_fence(stats);
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    const pixel inside = at(out, W, 6, 3);
+    const pixel outside = at(out, W, 20, 10);
+    LUMEN_CHECK(near(inside.r, 255) && near(inside.b, 0));
+    LUMEN_CHECK(near(outside.r, 0) && near(outside.b, 255));
+}
+
+LUMEN_TEST(gl_region_upload_into_a_fresh_texture_is_counted) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+    const auto red = solid(4, 4, 255, 0, 0);
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba_region(9, 16, 16, {0, 0, 4, 4}, red.data())));
+    LUMEN_CHECK(comp.partial_into_fresh() == 1);
+}
+
 LUMEN_TEST(gl_composite_places_a_draw_at_its_destination_rect) {
     auto* device = shared_device();
     if (!device)

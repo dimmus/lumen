@@ -776,8 +776,20 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
     const unsigned char* shm_pixels = nullptr;
     unsigned long long shm_seq = 0;
     unsigned long long shm_token = 0;
+    unsigned long long shm_pool_token = 0;
+    lx::rect2i shm_region{};
     if (buf->is_shm && img.image_id) {
-        shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_seq, shm_token);
+        // Buffer age: only what changed since this buffer's texture was last written (plus
+        // what its other GL name missed) is copied and uploaded. A scaled or transformed
+        // buffer's damage is not in buffer coordinates here, so it is staged whole.
+        const lx::rect2i whole{0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
+        const bool identity = s->current.scale <= 1 && s->current.transform == 0;
+        s->damage_history.record(identity ? commit.damage : whole);
+        if (s->ctx->shm_pool)
+            shm_region = shm_upload_region(s->damage_history, buf->upload, s->id, buf->width,
+                                           buf->height);
+        shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_region, shm_seq, shm_token,
+                                      shm_pool_token);
         if (!shm_pixels) {
             // The one silent path to a black screen: without staged pixels no texture
             // update is queued, so the texture is never registered, and the draw that
@@ -796,8 +808,12 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
         }
     }
 
-    // Register SHM pixels with headless for software blit.
-    if (buf->is_shm && s->ctx->headless && shm_pixels && img.image_id) {
+    // Register SHM pixels with headless for software blit — only when headless is the
+    // present path (the context carries it only then) and the pixels are the whole image.
+    const bool whole_image = shm_region.width <= 0 || shm_region.height <= 0 ||
+                             (static_cast<unsigned>(shm_region.width) == buf->width &&
+                              static_cast<unsigned>(shm_region.height) == buf->height);
+    if (buf->is_shm && s->ctx->headless && shm_pixels && img.image_id && whole_image) {
         s->ctx->headless->register_texture(img.image_id, buf->width, buf->height, shm_pixels);
     }
 
@@ -829,8 +845,14 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
             update.pixels = shm_pixels;
             update.shm_seq = shm_seq;
             update.shm_token = shm_token;
+            update.shm_pool_token = shm_pool_token;
             update.format = shm_format;
-            update.stride = buf->width * 4u;
+            // A partial region is packed at its own width; the whole image at the buffer's.
+            const bool partial = shm_region.width > 0 && shm_region.height > 0 &&
+                                 (static_cast<unsigned>(shm_region.width) != buf->width ||
+                                  static_cast<unsigned>(shm_region.height) != buf->height);
+            update.region = partial ? shm_region : lx::rect2i{};
+            update.stride = (partial ? static_cast<unsigned>(shm_region.width) : buf->width) * 4u;
         }
         if (update.kind != texture_update::op::none && !s->ctx->textures->try_push(update)) {
             // Nothing will consume the FD now, so it has to be closed here or the
@@ -839,6 +861,11 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
                 ::close(update.dmabuf_fd);
             if (update.shm_token && s->ctx->shm_store)
                 s->ctx->shm_store->release(update.shm_token);
+            if (update.shm_pool_token && s->ctx->shm_pool)
+                s->ctx->shm_pool->release(update.shm_pool_token);
+            // The texture never received this content, so the next upload of the buffer
+            // cannot assume it: restage it whole.
+            buf->upload = {};
             lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
                                             "texture update queue full — frame will lag");
         }

@@ -32,16 +32,44 @@ memory_budget_coordinator
   ├── ui_arena      (default 4 MiB, reset each tick_ui)
   ├── render_arena  (default 8 MiB, reset each tick_render)
   ├── worker_arena  (default 4 MiB)
-  └── cold_arena    (default 512 KiB — protocol parsing, etc.)
+  ├── cold_arena    (default 512 KiB — protocol parsing, etc.)
+  └── staging       (not an arena: the compositor's shm pixel staging, reported each
+                     tick_ui against staging_budget_bytes, default 64 MiB)
 ```
 
 ### Pressure levels
 
 | Level | Trigger (default) | Compositor response |
 |-------|-------------------|---------------------|
-| `normal` | Used < 75% across pools | None |
-| `moderate` | Used ≥ 75% | Evict 25% import cache LRU |
-| `critical` | Used ≥ 90% | Evict 50% cache, flush pending releases, evict surface pool |
+| `normal` | Every pool < 75% | None |
+| `moderate` | Fullest pool ≥ 75% | Evict 25% import cache LRU; unmap every spare staging block |
+| `critical` | Fullest pool ≥ 90% | Evict 50% cache, flush pending releases, evict surface pool; unmap spare staging |
+
+The fullest pool decides, not the sum of all pools: summing let a large budget dilute a
+pool that was actually full (a 64 MiB staging budget would hide a 100 % used frame arena).
+
+### Pixel staging
+
+shm pixels are copied at commit (the client may reuse its buffer at once) and consumed on
+the render thread. GL: `shm_upload_pool` — transient mmap'd blocks sized by the buffer-age
+region, returned right after the upload, unmapped after 1 s idle; an idle desktop holds
+none. CPU: `shm_pixel_store` — the staged rows are the texture, freed by `collect` once a
+retired texture's slots are no longer sampled. Both are reported as `memory_pool::staging`.
+See rendering-performance.md, SHM staging, for why per-texture staging used to grow
+without bound.
+
+Start-up probes Vulkan with an instance only (`device_selector::has_hardware_vulkan`) and
+creates a Vulkan device only when Vulkan may composite: hardware Vulkan, or an explicit
+`vulkan`/`cpu` request. A software ICD (lavapipe) costs about 28 MB of heap to create a
+device on (LLVM and its JIT, measured with heaptrack) — paid before for a device the GL
+path never used. The CPU and nested fallbacks create it on demand; on the GL path any
+device that exists is destroyed. Start-up then calls `malloc_trim(0)` once, since glibc
+keeps freed heap pages resident.
+
+The other heap leak found with heaptrack: on GPU paths the commit path still copied every
+shm buffer into the headless software backend, whose table was keyed by never-repeating
+texture ids and never pruned — 60 MB over a 30-resize run. The headless backend is now
+handed to the protocols only when it is the present path, and retired textures are erased.
 
 Register handler via `memory_budget_coordinator::set_pressure_handler`.
 
