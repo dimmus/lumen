@@ -72,6 +72,9 @@ public:
     void on_memory_pressure(lx::runtime::memory_pressure level);
 
     [[nodiscard]] unsigned pending_release_count() const;
+    /// A buffer is attached or in flight: it is released only by a later frame, so the
+    /// frame clock must keep running until it has been.
+    [[nodiscard]] bool has_unreleased_frames() const;
     [[nodiscard]] buffer_lifecycle_state state_for(lx::surface_id surface) const;
 
 private:
@@ -269,6 +272,15 @@ unsigned lx::compositor::buffer_lifecycle_tracker::pending_release_count() const
     for (unsigned i = 0; i < count_; ++i)
         if (records_[i].state == buffer_lifecycle_state::pending_release) ++n;
     return n;
+}
+
+bool lx::compositor::buffer_lifecycle_tracker::has_unreleased_frames() const {
+    for (unsigned i = 0; i < count_; ++i) {
+        const auto s = records_[i].state;
+        if (s == buffer_lifecycle_state::attached || s == buffer_lifecycle_state::in_flight)
+            return true;
+    }
+    return false;
 }
 
 lx::compositor::buffer_lifecycle_state

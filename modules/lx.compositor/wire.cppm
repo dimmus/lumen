@@ -390,6 +390,14 @@ void retire_texture(unsigned texture_id);
 void destroy_buffer(buffer_obj* b);
 lx::fourcc shm_format_to_fourcc(uint32_t shm_format);
 lx::fourcc staged_shm_format(wl_shm_buffer* shm);
+/// GL client-upload path: registers `region` of the buffer for the render thread to read
+/// in place. Sets `pixels` (the region's first byte) and `stride`; returns the
+/// `shm_direct_uploads` handle, or 0 to stage instead.
+[[nodiscard]] unsigned direct_shm_upload(wl_resource* buffer, wl_shm_buffer* shm, buffer_obj* buf,
+                                         lx::rect2i region, const unsigned char*& pixels,
+                                         unsigned& stride);
+/// Binds `ctx.shm_direct` to libwayland (access guards, release, pool unref).
+void bind_shm_direct(p0_protocol_context& ctx);
 const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsigned texture_id,
                                       lx::rect2i region, unsigned long long& seq_out,
                                       unsigned long long& token_out,
@@ -412,6 +420,7 @@ void flush_desync(surface_obj* s, const char* cause);
 void discard_cached(surface_obj* s);
 void bind_compositor(wayland::client_connection& client, unsigned id, int version);
 void fire_frames(unsigned frame_time_ms);
+[[nodiscard]] bool frames_pending();
 
 // ── wire_subsurface.cpp ────────────────────────────────────────────────────
 

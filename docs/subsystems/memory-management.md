@@ -51,7 +51,9 @@ pool that was actually full (a 64 MiB staging budget would hide a 100 % used fra
 ### Pixel staging
 
 shm pixels are copied at commit (the client may reuse its buffer at once) and consumed on
-the render thread. GL: `shm_upload_pool` — transient mmap'd blocks sized by the buffer-age
+the render thread — except on GL with client-memory uploads (`shm_direct_uploads`), where
+nothing is staged and the client's buffer is held until the render thread has read it.
+GL otherwise: `shm_upload_pool` — transient mmap'd blocks sized by the buffer-age
 region, returned right after the upload, unmapped after 1 s idle; an idle desktop holds
 none. CPU: `shm_pixel_store` — the staged rows are the texture, freed by `collect` once a
 retired texture's slots are no longer sampled. Both are reported as `memory_pool::staging`.

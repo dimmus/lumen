@@ -197,6 +197,7 @@ public:
     /// Something under a still pointer may have changed: a node appeared, went away,
     /// moved or changed size. The window manager re-hit-tests once per tick on it.
     void note_layout_changed() { layout_changed_ = true; }
+    [[nodiscard]] bool layout_changed() const { return layout_changed_; }
     [[nodiscard]] bool consume_layout_changed() {
         const bool changed = layout_changed_;
         layout_changed_ = false;

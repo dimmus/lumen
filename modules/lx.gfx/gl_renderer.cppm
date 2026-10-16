@@ -183,6 +183,20 @@ public:
                                                       unsigned height, lx::rect2i region,
                                                       const unsigned char* rgba);
 
+    /// Uploads `region` of a client's shm buffer straight from its memory: `pixels` is the
+    /// region's first pixel, rows `stride` bytes apart, in wl_shm ARGB8888/XRGB8888 order
+    /// (BGRA bytes). An empty region is the whole `width` x `height` image.
+    /// No staging copy and no swizzle on the CPU — the driver reads the client's rows
+    /// once. `opaque` (XRGB) makes the sampler treat alpha as one. Needs
+    /// `supports_client_upload`.
+    [[nodiscard]] lx::result<void> upload_client_region(unsigned texture_id, unsigned width,
+                                                        unsigned height, lx::rect2i region,
+                                                        const unsigned char* pixels,
+                                                        unsigned stride, bool opaque);
+    /// GL_EXT_texture_format_BGRA8888 and GL_EXT_unpack_subimage: client rows can be
+    /// uploaded as they are, at their own stride.
+    [[nodiscard]] bool supports_client_upload() const { return bgra_ && unpack_subimage_; }
+
     /// Samples a client dma-buf in place via EGL_EXT_image_dma_buf_import.
     [[nodiscard]] lx::result<void> import_dmabuf(unsigned texture_id, const dmabuf_desc& desc);
 
@@ -221,6 +235,10 @@ private:
         /// being sampled) cannot tell whether it needs reallocating.
         unsigned name_width[2]{};
         unsigned name_height[2]{};
+        /// GL format each name's storage was allocated with (GL_RGBA or GL_BGRA_EXT): a
+        /// sub-image upload must match it. Sampled alpha is forced to one where opaque.
+        unsigned name_format[2]{};
+        bool name_opaque[2]{};
         unsigned current = 0;
         unsigned width = 0;
         unsigned height = 0;
@@ -251,6 +269,9 @@ private:
     int uniform_tint_ = -1;
     int uniform_src_bounds_ = -1;
     int uniform_transfer_ = -1;
+    int uniform_alpha_one_ = -1;
+    bool bgra_ = false;
+    bool unpack_subimage_ = false;
     int uniform_sampler_ = -1;
     texture_slot textures_[k_max_textures]{};
 };
@@ -302,6 +323,8 @@ uniform vec4 src_bounds;
 // 0 linear, 1 sRGB, 2 gamma 2.2. GLES 2 has no HDR path, so PQ and HLG fall back to sRGB
 // rather than pretending — the Vulkan backend is where HDR lands.
 uniform int transfer;
+// 1.0 for a format without alpha (XRGB): its fourth byte is undefined, not transparency.
+uniform float alpha_one;
 
 vec3 srgb_to_linear(vec3 v) {
     // GLSL ES 1.00 has no mix(genType, genType, bvec), so branch per channel arithmetically.
@@ -323,6 +346,7 @@ void main() {
     // magnified crop would otherwise read texels from outside its own source rect.
     vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
     vec4 texel = texture2D(surface, s);
+    texel.a = max(texel.a, alpha_one);
 
     // Blending is a weighted average of light, so it has to happen in linear space.
     // GLES 2 has no sRGB framebuffer to do this in the blend unit and no float attachment
@@ -778,7 +802,12 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     uniform_tint_ = glGetUniformLocation(program, "tint");
     uniform_src_bounds_ = glGetUniformLocation(program, "src_bounds");
     uniform_transfer_ = glGetUniformLocation(program, "transfer");
+    uniform_alpha_one_ = glGetUniformLocation(program, "alpha_one");
     uniform_sampler_ = glGetUniformLocation(program, "surface");
+
+    const char* gl_ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
+    bgra_ = detail::egl_has_extension(gl_ext, "GL_EXT_texture_format_BGRA8888");
+    unpack_subimage_ = detail::egl_has_extension(gl_ext, "GL_EXT_unpack_subimage");
 
     // Unit quad; the vertex shader maps it onto each draw's destination rect.
     static const float corners[] = {0.f, 0.f, 1.f, 0.f, 0.f, 1.f, 1.f, 1.f};
@@ -839,7 +868,8 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba_region(unsigned texture_id,
     slot.current ^= 1u;
     unsigned& name = slot.names[slot.current];
     const bool fresh = !name || slot.name_width[slot.current] != width ||
-                       slot.name_height[slot.current] != height;
+                       slot.name_height[slot.current] != height ||
+                       slot.name_format[slot.current] != GL_RGBA;
     if (!name) {
         glGenTextures(1, &name);
         if (!name)
@@ -863,6 +893,8 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba_region(unsigned texture_id,
     glBindTexture(GL_TEXTURE_2D, 0);
     slot.name_width[slot.current] = width;
     slot.name_height[slot.current] = height;
+    slot.name_format[slot.current] = GL_RGBA;
+    slot.name_opaque[slot.current] = false;
     slot.width = width;
     slot.height = height;
     slot.is_dmabuf = false;
@@ -870,6 +902,95 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba_region(unsigned texture_id,
 #else
     (void)region;
     return lx::not_implemented("lx::gfx::gl_compositor::upload_rgba_region");
+#endif
+}
+
+lx::result<void> lx::gfx::gl_compositor::upload_client_region(unsigned texture_id,
+                                                              unsigned width, unsigned height,
+                                                              lx::rect2i region,
+                                                              const unsigned char* pixels,
+                                                              unsigned stride, bool opaque) {
+#if defined(LUMEN_HAS_EGL)
+    if (!ready() || !supports_client_upload() || !pixels || width == 0 || height == 0 ||
+        stride % 4u != 0)
+        return lx::make_error(lx::error_domain::invalid_argument, 0,
+                              "gl client upload: bad arguments");
+    const bool whole = region.width <= 0 || region.height <= 0 ||
+                       (region.x == 0 && region.y == 0 &&
+                        static_cast<unsigned>(region.width) == width &&
+                        static_cast<unsigned>(region.height) == height);
+    if (whole)
+        region = {0, 0, static_cast<int>(width), static_cast<int>(height)};
+    if (region.x < 0 || region.y < 0 || static_cast<unsigned>(region.x + region.width) > width ||
+        static_cast<unsigned>(region.y + region.height) > height)
+        return lx::make_error(lx::error_domain::invalid_argument, 0,
+                              "gl client upload: region outside the buffer");
+    if (stride < static_cast<unsigned>(region.width) * 4u)
+        return lx::make_error(lx::error_domain::invalid_argument, 0,
+                              "gl client upload: stride shorter than a row");
+    const int index = alloc(texture_id);
+    if (index < 0)
+        return lx::make_error(lx::error_domain::invalid_argument, 0, "gl texture table full");
+    auto& slot = textures_[static_cast<unsigned>(index)];
+    if (slot.is_dmabuf) {
+        destroy_slot(slot);
+        slot.used = true;
+        slot.id = texture_id;
+    }
+    // Same alternation as the staged uploads: never write the name the previous frame
+    // samples.
+    slot.current ^= 1u;
+    unsigned& name = slot.names[slot.current];
+    const bool fresh = !name || slot.name_width[slot.current] != width ||
+                       slot.name_height[slot.current] != height ||
+                       slot.name_format[slot.current] != GL_BGRA_EXT;
+    if (!name) {
+        glGenTextures(1, &name);
+        if (!name)
+            return detail::gl_error(lx::gl_err::import_failed, "glGenTextures failed");
+        glBindTexture(GL_TEXTURE_2D, name);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    } else {
+        glBindTexture(GL_TEXTURE_2D, name);
+    }
+    // The client's rows, at the client's stride: one pass by the driver, nothing staged.
+    glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, static_cast<GLint>(stride / 4u));
+    const unsigned char* first = pixels;
+    if (fresh && whole) {
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, static_cast<GLsizei>(width),
+                     static_cast<GLsizei>(height), 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE, first);
+    } else {
+        if (fresh) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_BGRA_EXT, static_cast<GLsizei>(width),
+                         static_cast<GLsizei>(height), 0, GL_BGRA_EXT, GL_UNSIGNED_BYTE,
+                         nullptr);
+            ++partial_into_fresh_; // reported by the caller: the rest is undefined
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, region.x, region.y, region.width, region.height,
+                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, first);
+    }
+    glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    slot.name_width[slot.current] = width;
+    slot.name_height[slot.current] = height;
+    slot.name_format[slot.current] = GL_BGRA_EXT;
+    slot.name_opaque[slot.current] = opaque;
+    slot.width = width;
+    slot.height = height;
+    slot.is_dmabuf = false;
+    return {};
+#else
+    (void)texture_id;
+    (void)width;
+    (void)height;
+    (void)region;
+    (void)pixels;
+    (void)stride;
+    (void)opaque;
+    return lx::not_implemented("lx::gfx::gl_compositor::upload_client_region");
 #endif
 }
 
@@ -908,7 +1029,8 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsign
     // across the two names, and a sub-image upload into storage of another size is a GL
     // error that leaves the previous frame's pixels — a mismatched frame on screen.
     const bool resized =
-        slot.name_width[slot.current] != width || slot.name_height[slot.current] != height;
+        slot.name_width[slot.current] != width || slot.name_height[slot.current] != height ||
+        slot.name_format[slot.current] != GL_RGBA;
     if (!name) {
         glGenTextures(1, &name);
         if (!name)
@@ -934,6 +1056,8 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsign
 
     slot.name_width[slot.current] = width;
     slot.name_height[slot.current] = height;
+    slot.name_format[slot.current] = GL_RGBA;
+    slot.name_opaque[slot.current] = false;
     slot.width = width;
     slot.height = height;
     slot.is_dmabuf = false;
@@ -1209,6 +1333,8 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                                                                                       : 1;
                 glUniform1i(uniform_transfer_, slot);
             }
+            if (uniform_alpha_one_ >= 0)
+                glUniform1f(uniform_alpha_one_, slot.name_opaque[slot.current] ? 1.f : 0.f);
 
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             ++stats.draws_submitted;

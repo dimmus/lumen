@@ -188,8 +188,29 @@ Two strategies, because the consumers differ:
 | Consumer | Staging | Lifetime |
 |----------|---------|----------|
 | Vulkan upload (copies pixels out during drain) | `shm_staging_ring` — one FIFO for all surfaces | Slot free once the upload is recorded |
-| GL upload (copies pixels out during drain) | `shm_upload_pool` — a block per in-flight update, sized by the damaged region | Block returned right after `glTexSubImage2D`; blocks idle 1 s are unmapped |
+| GL upload, driver takes BGRA at any stride (`GL_EXT_texture_format_BGRA8888` + `GL_EXT_unpack_subimage`) | None: `shm_direct_uploads` — the render thread uploads the damaged region straight from the client's buffer | The `wl_buffer` is held, with an external `wl_shm_pool` reference, until the upload; released from `tick_ui` after it |
+| GL upload, otherwise (and compositor images) | `shm_upload_pool` — a block per in-flight update, sized by the damaged region | Block returned right after `glTexSubImage2D`; blocks idle 1 s are unmapped |
 | CPU composite (samples staged rows in place) | `shm_pixel_store` — two slots per texture | Slot held until a later commit supersedes it; a retired texture's storage is freed once neither slot is in flight |
+
+**GL uploads from client memory.** Staging copied every damaged pixel on the UI thread
+(with an RGBA swizzle) and the driver then copied it again. Where the driver takes the
+client's BGRA rows at the client's stride, the render thread uploads them in place, inside
+`wl_shm_buffer_begin_access`/`end_access` against a truncated pool. Two rules keep this sound:
+
+- **Release timing.** The release that went out at commit now waits until the upload.
+  A buffer committed again before that is released once, after the last read.
+- **Early destroy.** A client may destroy the `wl_buffer` before the upload. Its destroy
+  listener runs while the buffer is still readable and copies the region out under the
+  table's lock. The render thread never reads a dead buffer, and the UI thread never waits
+  on a frame.
+
+Measured on vmwgfx across an interactive resize of `foot`, A/B in one build with two runs
+each:
+
+- The UI thread's share fell from 4.3–4.8% to 2.4–2.8%: `shm.stage` is gone.
+- The render thread's `texture_update` rose from 3.8–4.4% to 5.7–7.3%. The copy now happens
+  in the driver, so total CPU is about the same on SVGA.
+- The median flip gap went from 19.3 ms to 16.3 ms. The resize now lands on vblank.
 
 A shared FIFO cannot serve the CPU path: the composite reads the rows well after the
 drain, so another surface's commits would recycle the slot underneath and the texture would
@@ -399,8 +420,10 @@ FB_DAMAGE_CLIPS takes.
 
 A tick whose snapshot carries no damage composites nothing and commits nothing. On this
 host (vmwgfx, GL path) an idle compositor with no clients went from 47 to 24 scheduler ticks
-of CPU per 5 s (9.4 % → 4.8 % of a core); the remainder is the 1 ms Wayland poll and the
-per-tick hotplug probe, not compositing.
+of CPU per 5 s (9.4 % → 4.8 % of a core); the remainder was the 1 ms Wayland poll and the
+free-running 60 Hz tick, not compositing. Both are gone: the loop waits on its fds and the
+frame clock stops when idle, so an idle desktop (shell and a terminal) now costs no
+measurable CPU (0 ticks per 5 s, 5 wakeups/s).
 
 ### Cursor: hardware plane, cursor-only commits, software fallback
 
@@ -507,19 +530,24 @@ via `runtime::timer_source::schedule_at`, which is valid from inside the timer's
 callback. The interval comes from the active mode's `refresh_millihz`, not from
 `config::target_fps` — that is only the fallback when there is no mode to read.
 
-The lock only holds if the flip is *seen* when it happens. Flip events are drained by the
-1 ms Wayland pump (`wayland_fd_callback`) whenever a flip is outstanding, not only at the
-next tick, and the phase is taken from the kernel's flip timestamp (CLOCK_MONOTONIC, the
+The lock only holds if the flip is *seen* when it happens. The DRM card is an `fd_source`
+in the UI loop's epoll set, so the flip handler runs the moment the flip event is queued
+(`drm_fd_callback`), not at the next tick or poll, and the phase is taken from the kernel's flip timestamp (CLOCK_MONOTONIC, the
 clock `steady_clock` reads) when it is within one period of `now`. Draining at the tick and
 using the tick's own time as the flip time put the phase up to a period late, so ticks ran
 at *period − lead*: faster than the display. Measured with `scripts/drag-smoke.sh` on
 vmwgfx at 60 Hz over the move and resize drags, about one composite in three then landed
 behind a still-pending flip (`commit=deferred`, 60 of 171) and content presents were a
-median 21.6 ms apart; with the flip drained in the pump it is 4–10 of ~160, mostly resize
-frames whose shm upload overran the period, and 15.9 ms.
+median 21.6 ms apart; with the flip drained promptly it is 4–10 of ~160, mostly resize
+frames whose shm upload overran the period, and 15.9 ms. (That fix drained flips from a
+1 ms polling pump. The loop now waits on the card fd instead, which sees the flip sooner
+and costs nothing while idle.)
+
+**Between bursts the clock stops** — see [threading.md](threading.md). A restart is aimed
+at the next deadline extrapolated from the last flip, so it stays on the display's phase.
 
 ```
-flip completes ──▶ wayland pump (≤ 1 ms) ──▶ presentation_flip_handler
+flip completes ──▶ card fd readable (epoll) ──▶ presentation_flip_handler
                      ├─ present_completed_ = true   (frame callbacks may fire;
                      │                               not for a cursor-only flip)
                      └─ vsync_timer.schedule_at(next vblank − peak repaint cost − margin)

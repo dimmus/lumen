@@ -198,6 +198,8 @@ struct compositor_impl {
     /// an animation, short enough that an idle desktop holds none.
     static constexpr unsigned long long k_staging_idle_ns = 1'000'000'000ull;
     bool reported_partial_fresh_ = false;
+    /// GL path: shm commits uploaded from the client's memory, no staging (see the class).
+    shm_direct_uploads shm_direct_{};
 
     // ── cursor ──
     /// UI affinity; loaded once in `start`.
@@ -341,6 +343,24 @@ struct compositor_impl {
     std::unique_ptr<runtime::fd_source> wayland_fd_source{};
     std::unique_ptr<runtime::fd_source> drm_fd_source{};
     std::unique_ptr<runtime::fd_source> input_fd_source{};
+    std::unique_ptr<runtime::event_source> logind_source{};
+
+    /// The frame clock runs only while there is something to do. Two consecutive ticks that
+    /// find nothing — no damage, no frame callback or buffer waiting on a later frame, no
+    /// flip or commit outstanding, nothing the window manager deferred — stop it; any
+    /// client request, input event or flip starts it again, aligned to the display. An
+    /// idle desktop then wakes once a second for `housekeeping_timer` instead of 60 times.
+    static constexpr unsigned k_idle_ticks = 2;
+    unsigned quiet_ticks_ = 0;
+    bool tick_quiet_ = false;
+    /// While the clock is stopped: one tick a second for the deadlines only a tick notices
+    /// (liveness pings, unmapping idle staging blocks).
+    std::unique_ptr<runtime::timer_source> housekeeping_timer{};
+    static constexpr runtime::clock_time k_housekeeping_ns = 1'000'000'000;
+    /// UI thread. Starts the frame clock if it is stopped.
+    void request_frame();
+    /// UI thread, after each tick: stop the clock if this tick was the k-th quiet one.
+    void settle_frame_clock();
 
     /// UI thread. Brings up libinput and routes its events to focused clients.
     void start_input();
@@ -373,6 +393,7 @@ struct compositor_impl {
     bool render_pending = false;
 
     std::mutex worker_mutex{};
+    bool worker_wake_ = false; // guarded by worker_mutex
     std::condition_variable worker_cv{};
 
     std::atomic<bool> running{false};
@@ -482,16 +503,21 @@ struct compositor_impl {
     static void vsync_callback();
     static void wayland_fd_callback();
     static void drm_fd_callback();
+    static void housekeeping_callback();
+    static void after_dispatch_callback();
 };
 
 compositor_impl* compositor_impl::active = nullptr;
 
 void compositor_impl::input_ready_callback() {
-    if (active)
-        (void)active->input_devices_.dispatch();
+    if (!active)
+        return;
+    (void)active->input_devices_.dispatch();
+    active->request_frame();
 }
 
 void compositor_impl::on_input_key(const lx::input::key_event& event) {
+    lx::trace::scoped_span span{"input", "key"};
     // Ctrl+Alt+Backspace logs out: the way out that does not depend on the shell being
     // alive. The X server's "zap" chord, here graceful — windows are asked to close first.
     constexpr unsigned k_key_backspace = 14;
@@ -535,6 +561,30 @@ void compositor_impl::note_committed_input(bool content) {
 }
 
 namespace {
+/// The logind bus. Dispatched when its socket is readable — and also when sd-bus already
+/// holds a message, which it reads into its queue during a synchronous call: that one
+/// arrives with no readability left to report it.
+class logind_bus_source final : public lx::runtime::event_source {
+public:
+    explicit logind_bus_source(lx::session::logind_session& session) : session_{&session} {}
+    bool prepare(lx::runtime::clock_time& timeout) override {
+        timeout = session_->dispatch_timeout_ns();
+        return ready_ || timeout == 0;
+    }
+    bool check() override { return ready_ || session_->dispatch_timeout_ns() == 0; }
+    bool dispatch() override {
+        ready_ = false;
+        session_->dispatch();
+        return true;
+    }
+    [[nodiscard]] int poll_fd() const override { return session_->bus_fd(); }
+    void on_readable() override { ready_ = true; }
+
+private:
+    lx::session::logind_session* session_;
+    bool ready_ = false;
+};
+
 /// CLOCK_MONOTONIC microseconds at which every fence in a sync_file signalled, or 0 when
 /// that is unknown (not signalled, an error, or more fences than this reads).
 unsigned long long sync_file_signal_us(int fd) {
@@ -711,6 +761,7 @@ void compositor_impl::fail_cursor_plane(const char* why) {
 }
 
 void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_event& event) {
+    lx::trace::scoped_span span{"input", "pointer_motion"};
     auto& seat = input_devices_.default_seat();
     // Output geometry is the compositor's to know — libinput reports deltas and has no
     // idea how large the desktop is — so both halves of the mapping live here. An absolute
@@ -879,21 +930,69 @@ void compositor_impl::vsync_callback() {
 void compositor_impl::wayland_fd_callback() {
     if (!active)
         return;
+    lx::trace::scoped_span span{"ui", "wayland.pump"};
     (void)active->wayland.dispatch(0);
-    // A flip is drained within this 1 ms pump rather than at the next tick: the flip
-    // handler phase-locks the frame clock, and seeing the flip a tick late is what let the
-    // clock drift ahead of the display. Only while a flip is outstanding, so an idle loop
-    // makes no extra syscall; the fd is non-blocking.
-    if (active->drm_present_ && active->kms_atomic.flip_pending())
-        active->kms_atomic.dispatch_events();
-    active->wayland.flush();
-    active->logind_.dispatch();
+    // Whatever a client asked for is applied, configured and composited by a tick.
+    active->request_frame();
 }
 
 void compositor_impl::drm_fd_callback() {
     if (!active || !active->drm_present_)
         return;
+    // The moment the flip lands, not at the next poll: the flip handler phase-locks the
+    // frame clock to it, and frame callbacks wait for it.
     active->kms_atomic.dispatch_events();
+}
+
+void compositor_impl::housekeeping_callback() {
+    if (!active)
+        return;
+    active->request_frame();
+    // Nothing woke the clock but the calendar: one quiet tick is enough to stop again.
+    active->quiet_ticks_ = k_idle_ticks - 1;
+}
+
+void compositor_impl::after_dispatch_callback() {
+    // Events produced anywhere in this iteration (input, protocol replies, releases) leave
+    // in one flush rather than waiting for the next tick.
+    if (active)
+        active->wayland.flush();
+}
+
+void compositor_impl::request_frame() {
+    if (!vsync_timer || vsync_timer->enabled())
+        return;
+    const auto now = static_cast<lx::runtime::clock_time>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
+    // On the display's phase: the vblank cadence continues while the clock is stopped, so
+    // the last flip still predicts the next deadline.
+    vsync_timer->schedule_at(repaint_.next_start(now));
+    if (housekeeping_timer)
+        housekeeping_timer->set_enabled(false);
+    quiet_ticks_ = 0;
+    // Time spent stopped is neither a frame interval nor a stalled present.
+    last_vsync_time = std::chrono::steady_clock::now();
+    last_callback_ns_ = 0;
+}
+
+void compositor_impl::settle_frame_clock() {
+    if (!vsync_timer)
+        return;
+    if (!tick_quiet_) {
+        quiet_ticks_ = 0;
+        return;
+    }
+    if (++quiet_ticks_ < k_idle_ticks)
+        return;
+    vsync_timer->set_enabled(false);
+    if (housekeeping_timer)
+        housekeeping_timer->schedule_at(
+            static_cast<lx::runtime::clock_time>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count()) +
+            k_housekeeping_ns);
+    lx::trace::timeline_instant("ui", "clock.idle");
 }
 
 /// dev_t clients should allocate dma-bufs on (zwp_linux_dmabuf_feedback_v1.main_device):
@@ -1001,6 +1100,16 @@ void compositor_impl::register_p0_globals() {
         p0_.shm_store = nullptr;
         p0_.shm_staging = nullptr;
         p0_.shm_native_format = false;
+        // Where the driver takes BGRA rows at any stride, the client's buffer is uploaded
+        // as it is: no staging copy and no swizzle on the UI thread. What is still staged
+        // (a full table, compositor images) keeps the same channel order, so a texture
+        // never changes format between uploads.
+        if (gl_compositor_.supports_client_upload()) {
+            p0_.shm_direct = &shm_direct_;
+            p0_.shm_native_format = true;
+            lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
+                                            "shm: uploaded from client memory (no staging)");
+        }
     } else {
         p0_.shm_staging = &shm_staging_;
         p0_.shm_store = nullptr;
@@ -1206,6 +1315,7 @@ void compositor_impl::drain_texture_updates(unsigned frame) {
 }
 
 void compositor_impl::apply_texture_update(texture_update& update) {
+    lx::trace::scoped_span span{"render", "texture_update"};
     lx::result<void> applied{};
     switch (update.kind) {
     case texture_update::op::dmabuf: {
@@ -1255,9 +1365,30 @@ void compositor_impl::apply_texture_update(texture_update& update) {
             else
                 shm_store_.release(update.shm_token);
         } else if (gl_present_) {
-            applied = gl_compositor_.upload_rgba_region(update.texture_id, update.width,
-                                                        update.height, update.region,
-                                                        update.pixels);
+            const bool bgra =
+                update.format == static_cast<lx::fourcc>(lx::pixel_format::argb8888) ||
+                update.format == static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+            const bool opaque =
+                update.format == static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+            if (update.shm_direct) {
+                // The client's own rows, read under its buffer's access guard.
+                shm_direct_.upload(update.shm_direct,
+                                   [&](const unsigned char* pixels, unsigned stride) {
+                                       applied = pixels ? gl_compositor_.upload_client_region(
+                                                              update.texture_id, update.width,
+                                                              update.height, update.region,
+                                                              pixels, stride, opaque)
+                                                        : lx::result<void>{};
+                                   });
+            } else if (bgra) {
+                applied = gl_compositor_.upload_client_region(
+                    update.texture_id, update.width, update.height, update.region,
+                    update.pixels, update.stride, opaque);
+            } else {
+                applied = gl_compositor_.upload_rgba_region(update.texture_id, update.width,
+                                                            update.height, update.region,
+                                                            update.pixels);
+            }
             // glTexImage2D/glTexSubImage2D copy out of client memory before returning,
             // so the staging block is free again right away.
             shm_pool_.release(update.shm_pool_token);
@@ -1564,6 +1695,7 @@ void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback
         fence_us = sync_file_signal_us(fd);
         ::close(fd);
     }
+    lx::trace::timeline_instant("kms", "flip");
     if (fb.hw_clock)
         impl->note_present_latency(fb.actual_present_ns, submit_us, fence_us);
 
@@ -1579,6 +1711,30 @@ void compositor_impl::start_threads() {
     running.store(true, std::memory_order_release);
     last_vsync_time = std::chrono::steady_clock::now();
 
+    // Work posted to the render or worker strand wakes that thread. Neither polls, and
+    // the render thread otherwise runs only when a tick hands it a snapshot.
+    auto& ex = runtime::executor::global();
+    ex.render_strand().set_waker(
+        [](void* self) {
+            auto* impl = static_cast<compositor_impl*>(self);
+            {
+                std::lock_guard lock{impl->render_mutex};
+                impl->render_pending = true;
+            }
+            impl->render_cv.notify_one();
+        },
+        this);
+    ex.worker_strand().set_waker(
+        [](void* self) {
+            auto* impl = static_cast<compositor_impl*>(self);
+            {
+                std::lock_guard lock{impl->worker_mutex};
+                impl->worker_wake_ = true;
+            }
+            impl->worker_cv.notify_one();
+        },
+        this);
+
     render_thread = std::thread([this] { render_loop(); });
 
     if (cfg.worker_thread_count > 0)
@@ -1589,11 +1745,21 @@ void compositor_impl::stop_threads() {
     if (!threads_started.exchange(false)) return;
 
     running.store(false, std::memory_order_release);
+    {
+        // Under each mutex: a waiter between its predicate check and its wait would
+        // otherwise miss the notify and sleep forever, now that nothing times out.
+        std::lock_guard lock{render_mutex};
+    }
     render_cv.notify_all();
+    {
+        std::lock_guard lock{worker_mutex};
+    }
     worker_cv.notify_all();
 
     if (render_thread.joinable()) render_thread.join();
     if (worker_thread.joinable()) worker_thread.join();
+    runtime::executor::global().render_strand().set_waker(nullptr, nullptr);
+    runtime::executor::global().worker_strand().set_waker(nullptr, nullptr);
 }
 
 void compositor_impl::on_vsync() {
@@ -1617,11 +1783,12 @@ void compositor_impl::on_vsync() {
         render_pending = true;
     }
     render_cv.notify_one();
-    worker_cv.notify_one();
+    settle_frame_clock();
 }
 
 void compositor_impl::render_loop() {
     scheduler::frame_scheduler::affinity_scope scope{scheduler::thread_affinity::render};
+    lx::trace::name_thread("lx-render");
 
     // The GL context was built on the UI thread during start() and released there; claim it
     // here, because every GL call from now on happens on this thread.
@@ -1653,13 +1820,16 @@ void compositor_impl::render_loop() {
 
 void compositor_impl::worker_loop() {
     scheduler::frame_scheduler::affinity_scope scope{scheduler::thread_affinity::worker};
+    lx::trace::name_thread("lx-worker");
 
     while (running.load(std::memory_order_acquire)) {
         runtime::executor::global().drain(runtime::affinity::worker);
+        // Woken by a post (the strand's waker), not on a period: an idle worker sleeps.
         std::unique_lock lock{worker_mutex};
-        worker_cv.wait_for(lock, std::chrono::milliseconds(16), [this] {
-            return !running.load(std::memory_order_acquire);
+        worker_cv.wait(lock, [this] {
+            return worker_wake_ || !running.load(std::memory_order_acquire);
         });
+        worker_wake_ = false;
     }
 }
 
@@ -1698,6 +1868,9 @@ compositor::~compositor() {
 }
 
 lx::result<void> compositor::start() {
+    // LUMEN_TRACE_FILE=path records a Perfetto-readable timeline of this run.
+    lx::trace::timeline_start_from_env();
+    lx::trace::name_thread("lx-ui");
     if (!impl_) {
         const auto err = lx::make_error(lx::error_domain::invalid_argument, 0, "null impl");
         lx::trace::logger::global().log_error(err, "compositor");
@@ -1973,18 +2146,31 @@ lx::result<void> compositor::start() {
     impl_->vsync_timer = std::make_unique<runtime::timer_source>(
         interval_ns, &detail::compositor_impl::vsync_callback, true);
     impl_->loop.add_source(impl_->vsync_timer.get());
+    impl_->housekeeping_timer = std::make_unique<runtime::timer_source>(
+        detail::compositor_impl::k_housekeeping_ns,
+        &detail::compositor_impl::housekeeping_callback, true);
+    impl_->housekeeping_timer->set_enabled(false); // only while the frame clock is stopped
+    impl_->loop.add_source(impl_->housekeeping_timer.get());
 
+    // Every fd the UI thread serves is waited on, not polled: the loop sleeps until one is
+    // readable or a timer is due.
     if (const int wfd = impl_->wayland.event_fd(); wfd >= 0) {
-        // Poll Wayland at 1ms cadence and always pump when the source dispatches —
-        // relying solely on epoll readability of the display fd is brittle when other
-        // sources busy-wake the loop.
         impl_->wayland_fd_source = std::make_unique<runtime::fd_source>(
-            wfd, &detail::compositor_impl::wayland_fd_callback, 1'000'000);
+            wfd, &detail::compositor_impl::wayland_fd_callback);
         impl_->loop.add_source(impl_->wayland_fd_source.get());
     }
-    // DRM page-flip events are drained by the Wayland pump above while a flip is pending
-    // (and again in tick_ui), not via a dedicated fd_source — DRM fds often report POLLIN
-    // continuously and would busy-spin.
+    // The card reports readable only while a DRM event (a flip) is queued, and
+    // drmHandleEvent consumes it — so the flip handler runs the moment the flip lands.
+    if (impl_->drm_present_ && impl_->kms.card_fd() >= 0) {
+        impl_->drm_fd_source = std::make_unique<runtime::fd_source>(
+            impl_->kms.card_fd(), &detail::compositor_impl::drm_fd_callback);
+        impl_->loop.add_source(impl_->drm_fd_source.get());
+    }
+    if (impl_->logind_.bus_fd() >= 0) {
+        impl_->logind_source = std::make_unique<detail::logind_bus_source>(impl_->logind_);
+        impl_->loop.add_source(impl_->logind_source.get());
+    }
+    impl_->loop.set_after_dispatch(&detail::compositor_impl::after_dispatch_callback);
 
     impl_->start_threads();
 
@@ -2004,6 +2190,8 @@ int compositor::run() {
     runtime::set_current_affinity(runtime::affinity::ui);
     const int code = impl_->loop.run();
     impl_->stop_threads();
+    // Every recording thread has stopped: the timeline is complete.
+    (void)lx::trace::timeline_flush();
     // Whatever the last window collected; a short session still reports its numbers.
     impl_->log_latency_summary();
     detail::compositor_impl::active = nullptr;
@@ -2066,6 +2254,7 @@ runtime::executor& compositor::executor() {
 
 void compositor::tick_ui(scheduler::frame_tick tick) {
     runtime::assert_affinity(runtime::affinity::ui);
+    lx::trace::scoped_span span{"ui", "tick_ui"};
 
     const auto t0 = std::chrono::steady_clock::now();
     // Protocol handlers date texture retirements against this, so it has to be current
@@ -2083,6 +2272,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     {
         const unsigned long long staged = impl_->shm_store_.bytes_held() +
                                           impl_->shm_pool_.bytes_mapped();
+        lx::trace::timeline_counter("staging_bytes", static_cast<long long>(staged));
         const unsigned clamped =
             staged > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<unsigned>(staged);
         impl_->memory_.report_usage(lx::runtime::memory_pool::staging, clamped, 0);
@@ -2124,10 +2314,13 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         scene().note_full_damage();
     }
 
-    (void)wayland().dispatch(0);
-    if (impl_->drm_present_)
-        impl_->kms_atomic.dispatch_events();
-    impl_->logind_.dispatch();
+    {
+        // DRM flips and the logind bus have sources of their own and are handled the
+        // moment they are readable; requests that arrived since the loop last looked are
+        // taken now, so they make this frame.
+        lx::trace::scoped_span dispatch_span{"ui", "dispatch"};
+        (void)wayland().dispatch(0);
+    }
 
     // wl_surface.frame means "the content you committed has been shown". Answering it once
     // per vsync tick instead makes clients render frames that are composited over and never
@@ -2154,7 +2347,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
 
     // Window management for this frame — configures coalesced since the last tick go out
     // here, once, rather than once per request that changed them.
-    impl_->wm_.on_tick(tick.timestamp_ns);
+    {
+        lx::trace::scoped_span wm_span{"ui", "wm.on_tick"};
+        impl_->wm_.on_tick(tick.timestamp_ns);
+    }
     // Frames: the atlas on first use and changed titles, rasterized once per tick however
     // many set_title requests arrived — in this tick's snapshot, with the geometry they fit.
     impl_->decorations_.on_tick();
@@ -2165,10 +2361,14 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     impl_->cursor_.on_tick();
 
     scheduler().on_vsync(tick);
-    scene().update(tick.delta_seconds);
+    {
+        lx::trace::scoped_span scene_span{"ui", "scene.update"};
+        scene().update(tick.delta_seconds);
+    }
 
     const bool nothing_changed = scene().pending_damage().empty();
-    if (scene().commit_frame(tick.frame_index)) {
+    const bool published = scene().commit_frame(tick.frame_index);
+    if (published) {
         // Published: commits dispatched between now and the next tick are the next
         // snapshot's. A dropped publish keeps this frame, whose damage carries forward.
         impl_->p0_.building_frame = tick.frame_index + 1;
@@ -2176,6 +2376,9 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         if (!nothing_changed)
             impl_->last_damaged_frame_ = tick.frame_index;
     } else {
+        // The render thread still holds every other slot. Visible on the timeline as an
+        // instant, so a stutter can be told apart from a frame that had nothing new.
+        lx::trace::timeline_instant("ui", "publish_dropped");
         lx::trace::logger::global().log(lx::trace::level::trace, "compositor",
                                         "frame dropped (backpressure)");
     }
@@ -2198,8 +2401,21 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
 
     // Release client buffers the render thread has finished sampling. Done here because
     // sending wl_buffer.release requires the UI thread's ownership of Wayland dispatch.
-    (void)impl_->buffer_lifecycle_.retire_completed_frames(
-        impl_->last_rendered_frame_.load(std::memory_order_acquire));
+    const long long rendered = impl_->last_rendered_frame_.load(std::memory_order_acquire);
+    (void)impl_->buffer_lifecycle_.retire_completed_frames(rendered);
+    // Likewise shm buffers the render thread has uploaded from client memory.
+    impl_->shm_direct_.retire();
+
+    // Whether the next tick has anything to do. Each term is something only a later tick
+    // finishes: damage to composite, a frame the render thread has not reached, a flip or
+    // commit outstanding, a frame callback or buffer waiting on one, deferred WM work.
+    impl_->tick_quiet_ =
+        published && nothing_changed && rendered >= impl_->last_damaged_frame_ &&
+        !impl_->frame_outstanding_.load(std::memory_order_acquire) &&
+        !(impl_->drm_present_ && impl_->kms_atomic.flip_pending()) &&
+        !frame_callbacks_pending(impl_->p0_) &&
+        !impl_->buffer_lifecycle_.has_unreleased_frames() && impl_->shm_direct_.idle() &&
+        !impl_->wm_.needs_tick() && !impl_->logout_active_; // logout ends on a tick
 
     // Configures and events produced by this tick leave now, not at the next poll.
     wayland().flush();
@@ -2221,6 +2437,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
 
 void compositor::tick_render() {
     runtime::assert_affinity(runtime::affinity::render);
+    lx::trace::scoped_span span{"render", "tick_render"};
 
     const auto t0 = std::chrono::steady_clock::now();
 
@@ -2244,6 +2461,11 @@ void compositor::tick_render() {
     // published nothing new) contributes nothing; a skipped one was folded into this one
     // by `snapshot_buffer::publish`.
     gfx::damage_region frame_damage = impl_->missed_damage_;
+    if (lx::trace::timeline_enabled()) {
+        const lx::rect2i bounds = snapshot.damage();
+        lx::trace::timeline_counter("damage_px",
+                                    static_cast<long long>(bounds.width) * bounds.height);
+    }
     impl_->missed_damage_.clear();
     if (idx != impl_->last_seen_frame_) {
         frame_damage.add_region(snapshot.damage_rects());
@@ -2269,7 +2491,10 @@ void compositor::tick_render() {
         return out;
     };
 
-    impl_->drain_texture_updates(idx);
+    {
+        lx::trace::scoped_span drain_span{"render", "drain_textures"};
+        impl_->drain_texture_updates(idx);
+    }
 
     // A CRTC takes one flip at a time, so a frame arriving while one is queued cannot be
     // shown yet — but with three scanout slots it no longer has to be thrown away either.
@@ -2297,6 +2522,7 @@ void compositor::tick_render() {
         lx::gfx::blit_command* blits = build_blits();
 
         if (impl_->gl_present_) {
+            lx::trace::scoped_span composite_span{"render", "composite"};
             auto composited = impl_->gl_compositor_.composite_region(
                 impl_->gl_targets_[scanout_back], lx::color::rgb(0.f, 0.f, 0.f), blits,
                 blit_count, region);
@@ -2448,6 +2674,7 @@ void compositor::tick_render() {
         impl_->pending_flip_slot_.store(present_slot, std::memory_order_release);
         impl_->last_commit_content_.store(true, std::memory_order_release);
         impl_->publish_commit_timing(impl_->composited_fence_fd_);
+        lx::trace::scoped_span commit_span{"render", "kms.commit"};
         const auto committed = impl_->kms_atomic.commit(req);
         if (!committed)
             impl_->retract_commit_timing();

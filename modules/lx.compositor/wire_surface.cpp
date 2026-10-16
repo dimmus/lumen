@@ -777,6 +777,8 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
     unsigned long long shm_seq = 0;
     unsigned long long shm_token = 0;
     unsigned long long shm_pool_token = 0;
+    unsigned shm_direct = 0;
+    unsigned shm_stride = 0;
     lx::rect2i shm_region{};
     if (buf->is_shm && img.image_id) {
         // Buffer age: only what changed since this buffer's texture was last written (plus
@@ -788,8 +790,14 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
         if (s->ctx->shm_pool)
             shm_region = shm_upload_region(s->damage_history, buf->upload, s->id, buf->width,
                                            buf->height);
-        shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_region, shm_seq, shm_token,
-                                      shm_pool_token);
+        // Read straight from the client's buffer by the render thread when the backend can
+        // take its rows as they are; staged (a copy here) otherwise, or when the table is
+        // full.
+        shm_direct = direct_shm_upload(s->current.buffer, shm, buf, shm_region, shm_pixels,
+                                       shm_stride);
+        if (!shm_direct)
+            shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_region, shm_seq,
+                                          shm_token, shm_pool_token);
         if (!shm_pixels) {
             // The one silent path to a black screen: without staged pixels no texture
             // update is queued, so the texture is never registered, and the draw that
@@ -853,6 +861,10 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
                                   static_cast<unsigned>(shm_region.height) != buf->height);
             update.region = partial ? shm_region : lx::rect2i{};
             update.stride = (partial ? static_cast<unsigned>(shm_region.width) : buf->width) * 4u;
+            if (shm_direct) {
+                update.shm_direct = shm_direct;
+                update.stride = shm_stride;
+            }
         }
         if (update.kind != texture_update::op::none && !s->ctx->textures->try_push(update)) {
             // Nothing will consume the FD now, so it has to be closed here or the
@@ -863,6 +875,10 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
                 s->ctx->shm_store->release(update.shm_token);
             if (update.shm_pool_token && s->ctx->shm_pool)
                 s->ctx->shm_pool->release(update.shm_pool_token);
+            if (update.shm_direct && s->ctx->shm_direct) {
+                // Releases the buffer; `shm_direct` stays set so it is not released twice.
+                s->ctx->shm_direct->drop(update.shm_direct);
+            }
             // The texture never received this content, so the next upload of the buffer
             // cannot assume it: restage it whole.
             buf->upload = {};
@@ -881,7 +897,9 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
             key.modifier = buf->dmabuf.planes[0].modifier;
         (void)s->ctx->lifecycle->on_import(s->client, s->id, buf->id, key, s->current.buffer);
         s->ctx->lifecycle->on_attach(s->id);
-    } else if (buf->is_shm) {
+    } else if (buf->is_shm && !shm_direct) {
+        // Copied, so the client may have it back. A direct upload releases it once the
+        // render thread has read it (`shm_direct_uploads::retire`).
         wl_buffer_send_release(s->current.buffer);
     }
 }
@@ -889,6 +907,7 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
 /// cached → current for one surface: the body of a content update. The buffer is applied
 /// before all other state (wl_surface.commit).
 void apply_core(surface_obj* s) {
+    lx::trace::scoped_span span{"wayland", "surface.apply"};
     surface_pending& c = s->cached;
     const bool new_buffer = c.buffer_set;
     if (new_buffer) {
@@ -1280,6 +1299,8 @@ void fire_frames(unsigned frame_time_ms) {
     }
     g_pending_frame_count = 0;
 }
+
+bool frames_pending() { return g_pending_frame_count > 0; }
 
 } // namespace lx::compositor::p0
 
