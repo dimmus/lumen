@@ -28,6 +28,8 @@ constexpr unsigned L = lx::compositor::k_layer_anchor_left;
 constexpr unsigned R = lx::compositor::k_layer_anchor_right;
 
 constexpr lx::rect2i k_out{0, 0, 1000, 800};
+/// A second output to the right of the first (ADR 008 M12: layer surfaces per output).
+constexpr lx::rect2i k_out2{1000, 0, 640, 480};
 
 bool same(lx::rect2i a, lx::rect2i b) {
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
@@ -256,6 +258,8 @@ struct wire_log {
     unsigned serial = 100;
     unsigned usable_changes = 0;
     lx::rect2i usable{};
+    lx::rect2i usable1{};
+    bool second_output = false;
     unsigned focus_changes = 0;
     unsigned moved = 0;
     unsigned unmapped = 0;
@@ -296,10 +300,16 @@ struct fixture {
         ops.client_alive = [](void*) { return true; };
         layers.set_ops(ops);
         lx::compositor::layer_host host{};
-        host.output_area = [](void*) { return k_out; };
-        host.usable_changed = [](void*, lx::rect2i u) {
+        // Output 0 is k_out; output 1 (a second monitor to its right) is k_out2.
+        host.output_area = [](void*, unsigned slot) {
+            return slot == 0 ? k_out : slot == 1 && g_wire->second_output ? k_out2 : lx::rect2i{};
+        };
+        host.usable_changed = [](void*, unsigned slot, lx::rect2i u) {
             ++g_wire->usable_changes;
-            g_wire->usable = u;
+            if (slot == 0)
+                g_wire->usable = u;
+            else
+                g_wire->usable1 = u;
         };
         host.focus_changed = [](void*) { ++g_wire->focus_changes; };
         host.surface_moved = [](void*, lx::surface_id) { ++g_wire->moved; };
@@ -333,10 +343,10 @@ struct fixture {
     }
 
     /// get_layer_surface + props + initial commit.
-    lx::surface_id create(unsigned n, unsigned level, const layer_props& p) {
+    lx::surface_id create(unsigned n, unsigned level, const layer_props& p, unsigned output = 0) {
         const lx::surface_id s = make(n);
         LUMEN_CHECK(layers.create(s, lx::client_id{1}, &res[0], &res[n % 64], &res[n % 64], 5,
-                                  level, "test") == layer_shell::create_error::none);
+                                  level, "test", output) == layer_shell::create_error::none);
         layers.find(s)->pending = p;
         layers.find(s)->pending.layer = level;
         layers.apply_pending(s);
@@ -368,13 +378,13 @@ LUMEN_TEST(layer_initial_commit_configures_and_ack_commit_maps_at_its_box) {
     LUMEN_CHECK(f->wire.configures == 1);
     LUMEN_CHECK(f->wire.last_w == 1000 && f->wire.last_h == 32);
     // Not mapped: the zone does not count yet.
-    LUMEN_CHECK(f->layers.arranged() && same(f->layers.usable(), k_out));
+    LUMEN_CHECK(f->layers.arranged(0) && same(f->layers.usable(0), k_out));
     f->map(s);
     const auto* r = f->layers.find(s);
     LUMEN_CHECK(r && r->mapped);
     LUMEN_CHECK(same(r->box, {0, 0, 1000, 32}));
     LUMEN_CHECK(same(f->surfaces.node_rect(s), {0, 0, 1000, 32}));
-    LUMEN_CHECK(same(f->layers.usable(), {0, 32, 1000, 768}));
+    LUMEN_CHECK(same(f->layers.usable(0), {0, 32, 1000, 768}));
     LUMEN_CHECK(same(f->wire.usable, {0, 32, 1000, 768}));
     LUMEN_CHECK(f->levels[2].child_count() == 1);
     // Mapping the same size again sends no new configure.
@@ -397,7 +407,7 @@ LUMEN_TEST(layer_second_panel_is_pushed_and_moved_with_the_first) {
     const auto b = f->create(2, 2, props(T | L | R, 0, 20, 20));
     f->map(b);
     LUMEN_CHECK(same(f->layers.find(b)->box, {0, 30, 1000, 20}));
-    LUMEN_CHECK(same(f->layers.usable(), {0, 50, 1000, 750}));
+    LUMEN_CHECK(same(f->layers.usable(0), {0, 50, 1000, 750}));
     // The first panel unmaps (null buffer): the second moves up, in the same call.
     const unsigned moved = f->wire.moved;
     f->layers.on_commit(a, {});
@@ -405,17 +415,17 @@ LUMEN_TEST(layer_second_panel_is_pushed_and_moved_with_the_first) {
     LUMEN_CHECK(same(f->layers.find(b)->box, {0, 0, 1000, 20}));
     LUMEN_CHECK(same(f->surfaces.node_rect(b), {0, 0, 1000, 20}));
     LUMEN_CHECK(f->wire.moved == moved + 1);
-    LUMEN_CHECK(same(f->layers.usable(), {0, 20, 1000, 780}));
+    LUMEN_CHECK(same(f->layers.usable(0), {0, 20, 1000, 780}));
 }
 
 LUMEN_TEST(layer_destroy_releases_the_zone) {
     auto f = make_fixture();
     const auto a = f->create(1, 1, props(L | T | B, 64, 0, 64));
     f->map(a);
-    LUMEN_CHECK(same(f->layers.usable(), {64, 0, 936, 800}));
+    LUMEN_CHECK(same(f->layers.usable(0), {64, 0, 936, 800}));
     f->layers.destroy(a);
     LUMEN_CHECK(!f->layers.find(a));
-    LUMEN_CHECK(same(f->layers.usable(), k_out));
+    LUMEN_CHECK(same(f->layers.usable(0), k_out));
     LUMEN_CHECK(f->levels[1].child_count() == 0);
 }
 
@@ -500,7 +510,7 @@ LUMEN_TEST(layer_closed_when_no_room_is_left_and_inert_afterwards) {
     auto f = make_fixture();
     const auto wall = f->create(1, 2, props(L | T | B, 50, 0, 1000));
     f->map(wall);
-    LUMEN_CHECK(f->layers.usable().width == 0);
+    LUMEN_CHECK(f->layers.usable(0).width == 0);
     const auto fill = f->create(2, 2, props(T | B | L | R, 0, 0, 0));
     LUMEN_CHECK(f->wire.closed == 1);
     const auto* r = f->layers.find(fill);
@@ -508,6 +518,32 @@ LUMEN_TEST(layer_closed_when_no_room_is_left_and_inert_afterwards) {
     const unsigned configures = f->wire.configures;
     f->layers.on_commit(fill, {});
     LUMEN_CHECK(f->wire.configures == configures);
+}
+
+// Several outputs (ADR 008 M12): each layer surface belongs to one output, is arranged
+// against it alone, and its exclusive zone shrinks that output's usable area only; when the
+// output goes, its surfaces are sent `closed` and their zones go with them.
+LUMEN_TEST(layer_surfaces_per_output) {
+    auto f = make_fixture();
+    f->wire.second_output = true;
+    const auto a = f->create(1, 2, props(T | L | R, 0, 32, 32), 0);
+    f->map(a);
+    const auto b = f->create(2, 2, props(T | L | R, 0, 24, 24), 1);
+    LUMEN_CHECK(f->wire.last_w == 640 && f->wire.last_h == 24);
+    f->map(b);
+    LUMEN_CHECK(same(f->layers.find(a)->box, {0, 0, 1000, 32}));
+    LUMEN_CHECK(same(f->layers.find(b)->box, {1000, 0, 640, 24}));
+    LUMEN_CHECK(f->layers.output_of(b) == 1 && f->layers.output_of(a) == 0);
+    LUMEN_CHECK(same(f->layers.usable(0), {0, 32, 1000, 768}));
+    LUMEN_CHECK(same(f->layers.usable(1), {1000, 24, 640, 456}));
+    LUMEN_CHECK(same(f->wire.usable1, {1000, 24, 640, 456}));
+    // The second output goes: its panel is closed and unmapped, output 0's stays.
+    const unsigned closed = f->wire.closed;
+    f->layers.close_output(1);
+    LUMEN_CHECK(f->wire.closed == closed + 1);
+    LUMEN_CHECK(f->layers.find(b) && f->layers.find(b)->closed && !f->layers.find(b)->mapped);
+    LUMEN_CHECK(f->layers.find(a)->mapped && same(f->layers.usable(0), {0, 32, 1000, 768}));
+    LUMEN_CHECK(!f->layers.arranged(1));
 }
 
 int main(int argc, char** argv) {

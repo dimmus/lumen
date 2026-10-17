@@ -1,6 +1,7 @@
 module;
 
 #include <cmath>
+#include <cstdint>
 
 import lx.foundation;
 import lx.gfx;
@@ -16,6 +17,9 @@ export namespace lx::scene {
 
 enum class node_kind { container, widget, surface, layer };
 
+/// Output views a scene publishes to (one per output slot, ADR 008 M3).
+inline constexpr unsigned k_max_views = 16;
+
 /// How layout (logical) coordinates reach one output's pixels: `origin` is the output's
 /// top-left in the layout, `scale` its scale (n/120 for a fractional one). The scene, the
 /// window manager and input all work in logical coordinates; this is applied in exactly one
@@ -27,7 +31,19 @@ struct output_projection {
     /// The output's mode in pixels: what the visibility pass clips draws to. Empty means
     /// unbounded (tests, one-off emission).
     lx::size2i size{};
+    /// wl_output.transform (ADR 008 §C.4): the output's pixels hold the projected content
+    /// turned by it (`lx::gfx::transform_rect`). Emitters never see it — they draw into the
+    /// untransformed content space (`content_size`), and the view turns every draw (its
+    /// rect, clip and buffer transform) once, after emission; `project_damage` turns damage.
+    lx::buffer_transform transform = lx::buffer_transform::normal;
 };
+
+/// The size of the content space a projection's draws are emitted in: `size`, with width and
+/// height swapped for a 90° or 270° transform.
+[[nodiscard]] constexpr lx::size2i content_size(const output_projection& p) {
+    return (static_cast<unsigned>(p.transform) & 1u) != 0 ? lx::size2i{p.size.height, p.size.width}
+                                                          : p.size;
+}
 
 /// The output-pixel rect of a node of `size` at logical `node`, in a tree whose root sits at
 /// logical `root`: the root is anchored on the pixel grid (`R = round((root − origin)·s)`)
@@ -40,7 +56,8 @@ struct output_projection {
                                       lx::point2i node, lx::size2i size);
 /// A logical damage rect in output pixels: start floored, end ceiled, then one pixel wider
 /// on every side at a non-integer scale (edge rounding moves a node's edges by up to half a
-/// pixel either way relative to the exact product).
+/// pixel either way relative to the exact product), then turned by the output's transform.
+/// (`project_node` is the emitters' and works in the untransformed content space.)
 [[nodiscard]] lx::rect2i project_damage(const output_projection& p, lx::rect2i logical);
 
 /// The visibility pass, run once per published frame on draws in paint order (bottom
@@ -59,6 +76,16 @@ struct emit_context {
     output_projection projection{};
     lx::point2i anchor{};
     bool anchored = false;
+    /// The output view being built (`scene_graph::commit_frame`); 0 for one-off emission.
+    unsigned view = 0;
+};
+
+/// One output as the scene sees it: where it sits in the layout and how layout coordinates
+/// reach its pixels. An empty `logical` rect is unbounded (tests, one-off emission): damage
+/// anywhere reaches it.
+struct output_view_config {
+    lx::rect2i logical{};
+    output_projection projection{};
 };
 
 class scene_node {
@@ -90,8 +117,12 @@ public:
     virtual void emit_draws(draw_list& out, const emit_context& ctx) const;
     /// The same at the identity projection (tests, one-off emission).
     void emit_draws(draw_list& out) const { emit_draws(out, emit_context{}); }
-    /// The visibility pass found a draw of this node on screen in published frame `frame`.
-    virtual void on_shown(unsigned frame) { (void)frame; }
+    /// The visibility pass found a draw of this node on screen in published frame `frame` of
+    /// output view `view`.
+    virtual void on_shown(unsigned frame, unsigned view) {
+        (void)frame;
+        (void)view;
+    }
 
 protected:
     lx::point2i origin_{};
@@ -163,17 +194,31 @@ public:
     [[nodiscard]] bool opaque() const;
     using scene_node::emit_draws;
     void emit_draws(draw_list& out, const emit_context& ctx) const override;
-    void on_shown(unsigned frame) override { visible_frame_ = frame; }
-    /// Whether this surface was on screen in published frame `frame`: its draw was emitted,
-    /// reaches the output and is not covered by an opaque draw above it. O(1). What
-    /// presentation feedback samples and frame callbacks are paced by.
-    [[nodiscard]] bool visible_in(unsigned frame) const {
-        return visible_frame_ == frame && frame != k_never_shown;
+    void on_shown(unsigned frame, unsigned view) override {
+        if (view < k_max_views)
+            visible_frame_[view] = frame;
+    }
+    /// Whether this surface was on screen in published frame `frame` of output view `view`:
+    /// its draw was emitted, reaches the output and is not covered by an opaque draw above
+    /// it. O(1). What presentation feedback samples and frame callbacks are paced by.
+    [[nodiscard]] bool visible_in(unsigned frame, unsigned view) const {
+        return view < k_max_views && visible_frame_[view] == frame && frame != k_never_shown;
+    }
+    /// The single-view form (view 0): tests and one-output callers.
+    [[nodiscard]] bool visible_in(unsigned frame) const { return visible_in(frame, 0); }
+    /// The newest frame of `view` this surface was shown in (`k_never_shown`: never).
+    [[nodiscard]] unsigned shown_frame(unsigned view) const {
+        return view < k_max_views ? visible_frame_[view] : k_never_shown;
     }
     static constexpr unsigned k_never_shown = ~0u;
 
 private:
-    unsigned visible_frame_ = k_never_shown;
+    unsigned visible_frame_[k_max_views] = {k_never_shown, k_never_shown, k_never_shown,
+                                            k_never_shown, k_never_shown, k_never_shown,
+                                            k_never_shown, k_never_shown, k_never_shown,
+                                            k_never_shown, k_never_shown, k_never_shown,
+                                            k_never_shown, k_never_shown, k_never_shown,
+                                            k_never_shown};
     lx::surface_id surface_{};
     lx::gfx::imported_image image_{};
     lx::texture_id texture_{};
@@ -184,63 +229,111 @@ private:
 
 class scene_graph {
 public:
+    scene_graph();
+    ~scene_graph();
+    scene_graph(const scene_graph&) = delete;
+    scene_graph& operator=(const scene_graph&) = delete;
+
     [[nodiscard]] container_node& root();
 
     /// UI thread: mutate scene, layout, mark damage.
     void update(double dt_seconds);
-    /// Bounding box of the damage noted since the last publish.
+    /// Bounding box of view 0's damage noted since its last publish.
     void collect_damage(lx::rect2i& total_damage);
-    /// Layout (logical) coordinates, projected to output pixels at once (`project_damage`).
-    /// `margin_px` widens the result on every side: a resampled draw's linear filter reaches
-    /// up to half a source texel past its own pixels. Kept as separate rects, merged only
-    /// where cheap — see `gfx::damage_region`.
+
+    // ── Output views (one per output slot; ADR 008 M3) ──
+    /// Adds or reconfigures view `slot`. A changed rect or projection repaints the view (full
+    /// damage). Its snapshot buffer (triple-buffered, index swap) is created on first use
+    /// and kept.
+    void set_output_view(unsigned slot, const output_view_config& config);
+    /// The view stops being built; its snapshots stay (render may still hold one).
+    void remove_output_view(unsigned slot);
+    [[nodiscard]] bool has_view(unsigned slot) const;
+    /// Bit per live view.
+    [[nodiscard]] std::uint32_t view_mask() const { return live_views_; }
+    [[nodiscard]] const output_view_config& view_config(unsigned slot) const;
+
+    /// Layout (logical) coordinates, projected into the pending damage of every live view
+    /// whose rect it touches (`project_damage`, ≤ 16 rect tests, no allocation): a rect that
+    /// spans two outputs damages both. `margin_px` widens the result on every side: a
+    /// resampled draw's linear filter reaches up to half a source texel past its own pixels.
+    /// Kept as separate rects, merged only where cheap — see `gfx::damage_region`.
     void note_damage(lx::rect2i region, int margin_px = 0);
-    /// Damage already in output pixels (the cursor, which is placed in pixels).
-    void note_damage_physical(lx::rect2i region);
-    /// The whole output changed (mode change, first frame).
+    /// Damage already in view `slot`'s output pixels.
+    void note_damage_output(unsigned slot, lx::rect2i region);
+    /// View 0's pixels (single-output callers and tests).
+    void note_damage_physical(lx::rect2i region) { note_damage_output(0, region); }
+    /// Every pixel of every live view changed (the clear colour, a lock, the first frame).
     void note_full_damage();
-    /// The output projection draws and damage use. A change means every pixel moved: the
-    /// caller notes full damage with it.
-    void set_projection(output_projection projection) { projection_ = projection; }
-    [[nodiscard]] const output_projection& projection() const { return projection_; }
+    /// Every pixel of view `slot` changed (its mode or position, another master drew on it).
+    void note_full_damage_output(unsigned slot);
+    /// Views with damage pending: what needs a frame.
+    [[nodiscard]] std::uint32_t pending_damage_mask() const;
+    /// Damage noted for view `slot` since its last publish. Empty: its next snapshot
+    /// changes nothing.
+    [[nodiscard]] const lx::gfx::damage_region& pending_damage(unsigned slot) const;
+    /// View 0's (single-output callers and tests).
+    [[nodiscard]] const lx::gfx::damage_region& pending_damage() const { return pending_damage(0); }
+
+    /// View 0 at `projection` (single-output callers and tests): its rect is the projected
+    /// size at the origin, unbounded when the size is empty.
+    void set_projection(output_projection projection);
+    [[nodiscard]] const output_projection& projection() const { return view_config(0).projection; }
     /// What every published snapshot shows where no draw does (the session lock's solid
     /// colour; black otherwise). A change repaints: the caller notes full damage with it.
     void set_clear_color(lx::color c) { clear_color_ = c; }
     [[nodiscard]] lx::color clear_color() const { return clear_color_; }
-    /// Damage noted since the last publish. Empty means the next snapshot changes nothing.
-    [[nodiscard]] const lx::gfx::damage_region& pending_damage() const;
+    /// The snapshot policy of every view, current and future.
+    void set_snapshot_config(snapshot_config config);
 
-    /// UI thread: traverse scene graph into target draw list (zero interim copy).
-    void build_draw_list_into(draw_list& out);
+    /// UI thread: traverse the scene into `out` for view `slot` (zero interim copy).
+    void build_draw_list_into(draw_list& out, unsigned slot = 0);
 
-    /// UI thread: build draw list in write slot, run the visibility pass (`mark_occlusion`;
-    /// every shown node learns `frame_index`), sort, publish (index swap only).
-    [[nodiscard]] bool commit_frame(unsigned frame_index);
-    /// Draws the last visibility pass marked occluded (skipped by the backend).
-    [[nodiscard]] unsigned last_culled() const { return last_culled_; }
+    /// UI thread: build view `slot`'s draw list in its write slot, run the visibility pass
+    /// (`mark_occlusion` against the view's mode; every shown node learns `frame_index` for
+    /// this view), sort, publish (index swap only). False when the view has no free slot
+    /// (back-pressure): its damage is kept for the next publish.
+    [[nodiscard]] bool commit_frame(unsigned slot, unsigned frame_index);
+    /// View 0 (single-output callers and tests).
+    [[nodiscard]] bool commit_frame(unsigned frame_index) { return commit_frame(0, frame_index); }
+    /// Draws the last visibility pass of view `slot` marked occluded (skipped by the backend).
+    [[nodiscard]] unsigned last_culled(unsigned slot = 0) const;
 
-    /// Render thread: const ref to latest snapshot (no copy). Takes a reader lease.
-    [[nodiscard]] const immutable_frame_snapshot& acquire_render_snapshot();
+    /// Render thread: const ref to view `slot`'s latest snapshot (no copy). Takes a reader
+    /// lease.
+    [[nodiscard]] const immutable_frame_snapshot& acquire_render_snapshot(unsigned slot);
+    [[nodiscard]] const immutable_frame_snapshot& acquire_render_snapshot() {
+        return acquire_render_snapshot(0);
+    }
+    /// Render thread: after present — releases the in-flight slot.
+    void release_render_frame(unsigned slot, const immutable_frame_snapshot& snapshot);
+    void release_render_frame(const immutable_frame_snapshot& snapshot) {
+        release_render_frame(0, snapshot);
+    }
 
-    /// Render thread: after present — releases in-flight slot.
-    void release_render_frame(const immutable_frame_snapshot& snapshot);
-
-    [[nodiscard]] snapshot_buffer& snapshots();
+    [[nodiscard]] snapshot_buffer& snapshots(unsigned slot = 0);
 
 private:
+    struct view {
+        output_view_config config{};
+        lx::gfx::damage_region damage{};
+        snapshot_buffer snapshots{};
+        unsigned last_culled = 0;
+    };
     void emit_node(scene_node* node, draw_list& out, const emit_context& ctx);
+    [[nodiscard]] view& ensure_view(unsigned slot);
 
     container_node root_{};
-    output_projection projection_{};
     lx::color clear_color_ = lx::color::rgb(0.f, 0.f, 0.f);
-    snapshot_buffer snapshots_{};
-    lx::gfx::damage_region scratch_damage_{};
+    snapshot_config snapshot_config_{};
+    view* views_[k_max_views]{};
+    std::uint32_t live_views_ = 0;
     /// UI scratch of the visibility pass, parallel to the draw list being built: the node
     /// that emitted each draw, and whether the pass found it on screen. Never leaves the UI
-    /// thread (the snapshot carries only `draw_command::occluded`).
+    /// thread (the snapshot carries only `draw_command::occluded`). Shared by every view:
+    /// views are built one after another on UI.
     scene_node* emitters_[k_max_draw_commands]{};
     bool shown_[k_max_draw_commands]{};
-    unsigned last_culled_ = 0;
 };
 
 } // namespace lx::scene
@@ -307,8 +400,13 @@ lx::rect2i lx::scene::project_node(const output_projection& p, lx::point2i root,
 lx::rect2i lx::scene::project_damage(const output_projection& p, lx::rect2i r) {
     if (r.width <= 0 || r.height <= 0)
         return {};
-    if (p.scale == 1.0)
-        return {r.x - p.origin.x, r.y - p.origin.y, r.width, r.height};
+    if (p.scale == 1.0) {
+        const lx::rect2i out{r.x - p.origin.x, r.y - p.origin.y, r.width, r.height};
+        if (p.transform == lx::buffer_transform::normal || p.size.width <= 0 || p.size.height <= 0)
+            return out;
+        const lx::size2i c = content_size(p);
+        return lx::gfx::transform_rect(out, p.transform, c.width, c.height);
+    }
     const double s = p.scale;
     constexpr double lo = -1.0e9, hi = 1.0e9;
     const auto clamp = [](double v) { return v < lo ? lo : (v > hi ? hi : v); };
@@ -323,8 +421,12 @@ lx::rect2i lx::scene::project_damage(const output_projection& p, lx::rect2i r) {
     const long y0 = static_cast<long>(fy0) - widen;
     const long x1 = static_cast<long>(fx1) + widen;
     const long y1 = static_cast<long>(fy1) + widen;
-    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
-            static_cast<int>(y1 - y0)};
+    const lx::rect2i out{static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
+                         static_cast<int>(y1 - y0)};
+    if (p.transform == lx::buffer_transform::normal || p.size.width <= 0 || p.size.height <= 0)
+        return out;
+    const lx::size2i c = content_size(p);
+    return lx::gfx::transform_rect(out, p.transform, c.width, c.height);
 }
 
 void lx::scene::container_node::set_child_overflow_policy(lx::runtime::overflow_action policy) {
@@ -438,6 +540,12 @@ void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx
     cmd.texture = texture();
     // A root on its own rounds relative to itself; inside a window, relative to the window.
     cmd.dst = project_node(ctx.projection, ctx.anchored ? ctx.anchor : at, at, size);
+    // Off this view entirely (another output's window): not emitted at all, so a view's draw
+    // list holds only what can reach its pixels.
+    if (ctx.projection.size.width > 0 && ctx.projection.size.height > 0 &&
+        (cmd.dst.x >= ctx.projection.size.width || cmd.dst.y >= ctx.projection.size.height ||
+         cmd.dst.x + cmd.dst.width <= 0 || cmd.dst.y + cmd.dst.height <= 0))
+        return;
     cmd.src = src_;
     cmd.buffer_xform = transform_;
     // 1:1 or resampled: the source box, turned the way the transform turns it, against dst.
@@ -468,6 +576,28 @@ void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx
     out.push(cmd);
 }
 
+lx::scene::scene_graph::scene_graph() {
+    // View 0 exists from the start, unbounded at the identity projection: a scene nobody
+    // configured (tests, one-off emission) behaves as one output.
+    (void)ensure_view(0);
+    live_views_ = 1u;
+}
+
+lx::scene::scene_graph::~scene_graph() {
+    for (view*& v : views_) {
+        delete v;
+        v = nullptr;
+    }
+}
+
+lx::scene::scene_graph::view& lx::scene::scene_graph::ensure_view(unsigned slot) {
+    if (!views_[slot]) {
+        views_[slot] = new view{};
+        views_[slot]->snapshots.set_config(snapshot_config_);
+    }
+    return *views_[slot];
+}
+
 lx::scene::container_node& lx::scene::scene_graph::root() { return root_; }
 void lx::scene::scene_graph::update(double) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
@@ -477,31 +607,154 @@ void lx::scene::scene_graph::update(double) {
 }
 void lx::scene::scene_graph::collect_damage(lx::rect2i& d) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    d = scratch_damage_.bounds();
+    d = pending_damage(0).bounds();
+}
+
+namespace {
+[[nodiscard]] bool same_config(const lx::scene::output_view_config& a,
+                               const lx::scene::output_view_config& b) {
+    return a.logical.x == b.logical.x && a.logical.y == b.logical.y &&
+           a.logical.width == b.logical.width && a.logical.height == b.logical.height &&
+           a.projection.origin.x == b.projection.origin.x &&
+           a.projection.origin.y == b.projection.origin.y &&
+           a.projection.scale == b.projection.scale &&
+           a.projection.size.width == b.projection.size.width &&
+           a.projection.size.height == b.projection.size.height &&
+           a.projection.transform == b.projection.transform;
+}
+} // namespace
+
+void lx::scene::scene_graph::set_output_view(unsigned slot, const output_view_config& config) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    if (slot >= k_max_views)
+        return;
+    view& v = ensure_view(slot);
+    const bool live = (live_views_ >> slot) & 1u;
+    if (live && same_config(v.config, config))
+        return;
+    v.config = config;
+    live_views_ |= 1u << slot;
+    // Every pixel moved (or none was drawn yet).
+    v.damage.set_full();
+}
+
+void lx::scene::scene_graph::remove_output_view(unsigned slot) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    if (slot >= k_max_views)
+        return;
+    live_views_ &= ~(1u << slot);
+    if (views_[slot])
+        views_[slot]->damage.clear();
+}
+
+bool lx::scene::scene_graph::has_view(unsigned slot) const {
+    return slot < k_max_views && ((live_views_ >> slot) & 1u) != 0;
+}
+
+const lx::scene::output_view_config& lx::scene::scene_graph::view_config(unsigned slot) const {
+    static const output_view_config k_none{};
+    return slot < k_max_views && views_[slot] ? views_[slot]->config : k_none;
+}
+
+void lx::scene::scene_graph::set_projection(output_projection projection) {
+    output_view_config c{};
+    c.projection = projection;
+    if (projection.size.width > 0 && projection.size.height > 0) {
+        const double sc = projection.scale > 0.0 ? projection.scale : 1.0;
+        c.logical = {projection.origin.x, projection.origin.y,
+                     static_cast<int>(std::lround(projection.size.width / sc)),
+                     static_cast<int>(std::lround(projection.size.height / sc))};
+    }
+    view& v = ensure_view(0);
+    v.config = c;
+    live_views_ |= 1u;
+}
+
+void lx::scene::scene_graph::set_snapshot_config(snapshot_config config) {
+    snapshot_config_ = config;
+    for (view* v : views_)
+        if (v)
+            v->snapshots.set_config(config);
 }
 
 void lx::scene::scene_graph::note_damage(lx::rect2i region, int margin_px) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    lx::rect2i r = project_damage(projection_, region);
-    if (r.width <= 0 || r.height <= 0)
+    if (region.width <= 0 || region.height <= 0)
         return;
-    if (margin_px > 0)
-        r = {r.x - margin_px, r.y - margin_px, r.width + 2 * margin_px, r.height + 2 * margin_px};
-    scratch_damage_.add(r);
+    // One logical pixel of slack for the projection's edge rounding and the margin.
+    const long long rx0 = static_cast<long long>(region.x) - 1;
+    const long long ry0 = static_cast<long long>(region.y) - 1;
+    const long long rx1 = static_cast<long long>(region.x) + region.width + 1;
+    const long long ry1 = static_cast<long long>(region.y) + region.height + 1;
+    for (unsigned slot = 0; slot < k_max_views; ++slot) {
+        if (!((live_views_ >> slot) & 1u))
+            continue;
+        view& v = *views_[slot];
+        const lx::rect2i l = v.config.logical;
+        if (l.width > 0 && l.height > 0 &&
+            (rx1 <= l.x || ry1 <= l.y || rx0 >= static_cast<long long>(l.x) + l.width ||
+             ry0 >= static_cast<long long>(l.y) + l.height))
+            continue;
+        lx::rect2i r = project_damage(v.config.projection, region);
+        if (r.width <= 0 || r.height <= 0)
+            continue;
+        if (margin_px > 0)
+            r = {r.x - margin_px, r.y - margin_px, r.width + 2 * margin_px,
+                 r.height + 2 * margin_px};
+        // Only what lands on the view's pixels: the slack above lets a rect at a
+        // neighbour's edge through, which must not make this output repaint (and then wait
+        // for a flip that has nothing to show).
+        const lx::size2i px = v.config.projection.size;
+        if (px.width > 0 && px.height > 0) {
+            const int x0 = r.x > 0 ? r.x : 0;
+            const int y0 = r.y > 0 ? r.y : 0;
+            const long long x1e = static_cast<long long>(r.x) + r.width;
+            const long long y1e = static_cast<long long>(r.y) + r.height;
+            const int x1 = x1e < px.width ? static_cast<int>(x1e) : px.width;
+            const int y1 = y1e < px.height ? static_cast<int>(y1e) : px.height;
+            if (x1 <= x0 || y1 <= y0)
+                continue;
+            r = {x0, y0, x1 - x0, y1 - y0};
+        }
+        v.damage.add(r);
+    }
 }
 
-void lx::scene::scene_graph::note_damage_physical(lx::rect2i region) {
+void lx::scene::scene_graph::note_damage_output(unsigned slot, lx::rect2i region) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    scratch_damage_.add(region);
+    if (!has_view(slot))
+        return;
+    views_[slot]->damage.add(region);
 }
 
 void lx::scene::scene_graph::note_full_damage() {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    scratch_damage_.set_full();
+    for (unsigned slot = 0; slot < k_max_views; ++slot)
+        if ((live_views_ >> slot) & 1u)
+            views_[slot]->damage.set_full();
 }
 
-const lx::gfx::damage_region& lx::scene::scene_graph::pending_damage() const {
-    return scratch_damage_;
+void lx::scene::scene_graph::note_full_damage_output(unsigned slot) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    if (has_view(slot))
+        views_[slot]->damage.set_full();
+}
+
+std::uint32_t lx::scene::scene_graph::pending_damage_mask() const {
+    std::uint32_t mask = 0;
+    for (unsigned slot = 0; slot < k_max_views; ++slot)
+        if (((live_views_ >> slot) & 1u) && !views_[slot]->damage.empty())
+            mask |= 1u << slot;
+    return mask;
+}
+
+const lx::gfx::damage_region& lx::scene::scene_graph::pending_damage(unsigned slot) const {
+    static const lx::gfx::damage_region k_none{};
+    return slot < k_max_views && views_[slot] ? views_[slot]->damage : k_none;
+}
+
+unsigned lx::scene::scene_graph::last_culled(unsigned slot) const {
+    return slot < k_max_views && views_[slot] ? views_[slot]->last_culled : 0;
 }
 
 void lx::scene::scene_graph::emit_node(scene_node* node, draw_list& out,
@@ -606,52 +859,84 @@ unsigned lx::scene::mark_occlusion(draw_command* draws, unsigned count, lx::rect
     return marked;
 }
 
-void lx::scene::scene_graph::build_draw_list_into(draw_list& out) {
+void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     out.clear();
     emit_context ctx{};
-    ctx.projection = projection_;
+    ctx.projection = view_config(slot).projection;
+    ctx.view = slot;
+    const lx::buffer_transform t = ctx.projection.transform;
+    if (t == lx::buffer_transform::normal || ctx.projection.size.width <= 0 ||
+        ctx.projection.size.height <= 0) {
+        emit_node(&root_, out, ctx);
+        return;
+    }
+    // A turned output (ADR 008 §C.4): emitters draw into the untransformed content space;
+    // every draw is then turned into the output's pixels once — its rect, its clip, and its
+    // buffer transform composed with the output's — so no emitter knows about transforms
+    // and occlusion still runs on axis-aligned output-pixel rects.
+    const lx::size2i c = content_size(ctx.projection);
+    ctx.projection.size = c;
+    ctx.projection.transform = lx::buffer_transform::normal;
     emit_node(&root_, out, ctx);
+    draw_command* d = out.data();
+    for (unsigned i = 0; i < out.size(); ++i) {
+        d[i].dst = lx::gfx::transform_rect(d[i].dst, t, c.width, c.height);
+        if (d[i].clip.width > 0 && d[i].clip.height > 0)
+            d[i].clip = lx::gfx::transform_rect(d[i].clip, t, c.width, c.height);
+        d[i].buffer_xform = lx::gfx::compose_output_transform(d[i].buffer_xform, t);
+    }
 }
 
-bool lx::scene::scene_graph::commit_frame(unsigned frame_index) {
+bool lx::scene::scene_graph::commit_frame(unsigned slot, unsigned frame_index) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    if (!has_view(slot))
+        return false;
+    view& v = *views_[slot];
 
     // Take the slot before building. Beyond correctness this skips the whole scene walk
     // and sort when there is nowhere to publish, instead of doing the work and throwing
     // the result away.
-    auto lease = snapshots_.begin_frame();
+    auto lease = v.snapshots.begin_frame();
     if (!lease.valid())
         return false;
 
-    build_draw_list_into(lease.draws());
+    build_draw_list_into(lease.draws(), slot);
     // The visibility pass, in paint order (before batching reorders opaque draws): what is
     // covered is skipped by the backend, and every node with a draw on screen learns this
     // frame — presentation feedback and frame-callback pacing ask it.
     draw_list& draws = lease.draws();
     const unsigned n = draws.size() < k_max_draw_commands ? draws.size() : k_max_draw_commands;
-    const lx::rect2i output{0, 0, projection_.size.width, projection_.size.height};
-    last_culled_ = mark_occlusion(draws.data(), n, output, shown_);
+    const output_projection& p = v.config.projection;
+    const lx::rect2i output{0, 0, p.size.width, p.size.height};
+    v.last_culled = mark_occlusion(draws.data(), n, output, shown_);
     for (unsigned i = 0; i < n; ++i)
         if (shown_[i] && emitters_[i])
-            emitters_[i]->on_shown(frame_index);
+            emitters_[i]->on_shown(frame_index, slot);
     draws.batch_for_render();
 
-    const bool published = snapshots_.publish(lease, scratch_damage_, frame_index, clear_color_);
+    const bool published = v.snapshots.publish(lease, v.damage, frame_index, clear_color_);
     // Damage accumulates per frame. Retain it when the publish was dropped, otherwise the
     // region would be lost and the next presented frame would under-report its damage.
     if (published)
-        scratch_damage_.clear();
+        v.damage.clear();
     return published;
 }
 
-const lx::scene::immutable_frame_snapshot& lx::scene::scene_graph::acquire_render_snapshot() {
+const lx::scene::immutable_frame_snapshot&
+lx::scene::scene_graph::acquire_render_snapshot(unsigned slot) {
     lx::runtime::assert_affinity(lx::runtime::affinity::render);
-    return snapshots_.acquire();
+    return snapshots(slot).acquire();
 }
 
-void lx::scene::scene_graph::release_render_frame(const immutable_frame_snapshot& snapshot) {
+void lx::scene::scene_graph::release_render_frame(unsigned slot,
+                                                  const immutable_frame_snapshot& snapshot) {
     lx::runtime::assert_affinity(lx::runtime::affinity::render);
-    snapshots_.release(snapshot);
+    snapshots(slot).release(snapshot);
 }
-lx::scene::snapshot_buffer& lx::scene::scene_graph::snapshots() { return snapshots_; }
+
+lx::scene::snapshot_buffer& lx::scene::scene_graph::snapshots(unsigned slot) {
+    // Never creates a view: render asks only for views UI configured (views are created on
+    // UI by `set_output_view` and never freed while the scene lives). View 0 always exists.
+    return slot < k_max_views && views_[slot] ? views_[slot]->snapshots : views_[0]->snapshots;
+}

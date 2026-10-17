@@ -203,8 +203,8 @@ namespace {
 
 void layer_shell_get_layer_surface(struct wl_client* client, struct wl_resource* resource,
                                    uint32_t id, struct wl_resource* surface_res,
-                                   struct wl_resource* /*output: output 0 until D5*/,
-                                   uint32_t layer, const char* name_space) {
+                                   struct wl_resource* output_res, uint32_t layer,
+                                   const char* name_space) {
     surface_obj* s = surface_from(surface_res);
     if (!s || !s->ctx || !s->ctx->layers)
         return;
@@ -244,10 +244,21 @@ void layer_shell_get_layer_surface(struct wl_client* client, struct wl_resource*
         wl_client_post_no_memory(client);
         return;
     }
+    // The output (ADR 008 M12): the one given, else the one under the pointer (sway takes
+    // the focused output; in a stacking desktop the pointer marks where the user works). A
+    // wl_output whose output is gone gives a surface that is closed at once (wlroots).
+    int slot = output_res ? output_resource_slot(output_res) : -1;
+    const bool gone = output_res && slot < 0;
+    if (slot < 0 && s->ctx->outputs && s->ctx->seat)
+        slot = lx::compositor::output_at(*s->ctx->outputs, s->ctx->seat->pointer_x(),
+                                         s->ctx->seat->pointer_y());
+    if (slot < 0 && s->ctx->outputs && s->ctx->outputs->count() > 0)
+        slot = s->ctx->outputs->slot_of(s->ctx->outputs->nth(0));
     using created = lx::compositor::layer_shell::create_error;
     if (s->ctx->layers->create(s->id, s->client, client, s->resource, res,
                                static_cast<unsigned>(wl_resource_get_version(resource)), layer,
-                               name_space) != created::none) {
+                               name_space, slot >= 0 ? static_cast<unsigned>(slot) : 0u) !=
+        created::none) {
         wl_resource_destroy(res);
         wl_client_post_no_memory(client);
         return;
@@ -260,6 +271,8 @@ void layer_shell_get_layer_surface(struct wl_client* client, struct wl_resource*
     s->layer = o;
     s->role = surface_role::layer;
     wl_resource_set_implementation(res, &layer_surface_impl, o, layer_surface_destroy_resource);
+    if (gone)
+        s->ctx->layers->close_surface(s->id);
 }
 
 const struct zwlr_layer_shell_v1_interface layer_shell_impl = {

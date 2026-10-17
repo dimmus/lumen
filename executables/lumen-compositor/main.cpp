@@ -24,6 +24,7 @@ void on_screenshot(int) {
 
 int main(int argc, char* argv[]) {
     lx::compositor::config cfg{};
+    static char output_scales[512] = {};
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -60,6 +61,29 @@ int main(int argc, char* argv[]) {
             }
             cfg.output_scale = scale;
             ++i;
+        } else if (std::strcmp(arg, "--output-scale") == 0) {
+            // One connector's scale over --scale: NAME=S (repeatable), e.g. Virtual-2=1.5.
+            const char* spec = i + 1 < argc ? argv[i + 1] : nullptr;
+            const char* eq = spec ? std::strchr(spec, '=') : nullptr;
+            char* end = nullptr;
+            const double scale = eq ? std::strtod(eq + 1, &end) : 0.0;
+            if (!eq || eq == spec || !(scale >= 0.25 && scale <= 8.0) || !end || *end != '\0' ||
+                std::strlen(output_scales) + std::strlen(spec) + 2 > sizeof(output_scales)) {
+                std::fprintf(stderr, "lumen-compositor: --output-scale NAME=S (0.25 .. 8)\n");
+                return 2;
+            }
+            if (output_scales[0])
+                std::strcat(output_scales, ",");
+            std::strcat(output_scales, spec);
+            cfg.output_scales = output_scales;
+            ++i;
+        } else if (std::strcmp(arg, "--virtual-outputs") == 0) {
+            // Without a KMS display: WxH[@S][,WxH[@S]...] virtual outputs (tests).
+            if (i + 1 >= argc) {
+                std::fprintf(stderr, "lumen-compositor: --virtual-outputs WxH[@S][,...]\n");
+                return 2;
+            }
+            cfg.virtual_outputs = argv[++i];
         } else if (std::strcmp(arg, "--shell") == 0) {
             // The one binary zlm_shell_v1 binds are accepted from (default: lumen-shell
             // next to this executable).

@@ -51,6 +51,14 @@ enum class drm_err : int {
     mode_invalid = 2,
     page_flip_failed = 3,
     sync_failed = 4,
+    /// A connector probe (GETRESOURCES / GETCONNECTOR) failed.
+    probe_failed = 5,
+    /// No CRTC (or primary plane) is left for an output.
+    no_crtc = 6,
+    /// The kernel refused a TEST_ONLY of the configuration.
+    test_rejected = 7,
+    /// The hotplug monitor (udev netlink) could not be opened.
+    monitor_failed = 8,
 };
 
 enum class protocol_err : int {

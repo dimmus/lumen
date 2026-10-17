@@ -150,7 +150,29 @@ const struct xdg_toplevel_interface xdg_toplevel_impl = {
             }
             wl_resource_destroy(resource);
         },
-    .set_parent = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
+    .set_parent =
+        [](struct wl_client*, struct wl_resource* resource, struct wl_resource* parent_res) {
+            auto* t = toplevel_of(resource);
+            if (!t || !t->id || !t->ctx || !t->ctx->wm || !t->ctx->toplevels)
+                return;
+            lx::toplevel_id parent{};
+            if (parent_res) {
+                auto* p = toplevel_of(parent_res);
+                parent = p ? p->id : lx::toplevel_id{};
+                // "The parent toplevel must not be one of the child toplevel's descendants,
+                // and the parent must be different from the child toplevel."
+                for (lx::toplevel_id at = parent; at; ) {
+                    if (at == t->id) {
+                        wl_resource_post_error(resource, XDG_TOPLEVEL_ERROR_INVALID_PARENT,
+                                               "the parent is the toplevel or a descendant of it");
+                        return;
+                    }
+                    const auto* rec = t->ctx->toplevels->find(at);
+                    at = rec ? rec->parent : lx::toplevel_id{};
+                }
+            }
+            t->ctx->wm->set_parent(t->id, parent);
+        },
     .set_title =
         [](struct wl_client*, struct wl_resource* resource, const char* title) {
             auto* t = toplevel_of(resource);
@@ -220,8 +242,19 @@ const struct xdg_toplevel_interface xdg_toplevel_impl = {
             if (auto* t = toplevel_of(resource); t && t->id && t->ctx && t->ctx->wm)
                 t->ctx->wm->set_maximized(t->id, false, "client");
         },
-    .set_fullscreen = [](struct wl_client*, struct wl_resource*, struct wl_resource*) {},
-    .unset_fullscreen = [](struct wl_client*, struct wl_resource*) {},
+    .set_fullscreen =
+        [](struct wl_client*, struct wl_resource* resource, struct wl_resource* output) {
+            // The output asked for (null: the window's own); one whose output is gone is
+            // the window's own too.
+            if (auto* t = toplevel_of(resource); t && t->id && t->ctx && t->ctx->wm)
+                t->ctx->wm->set_fullscreen(t->id, true, output ? output_resource_slot(output) : -1,
+                                           "client");
+        },
+    .unset_fullscreen =
+        [](struct wl_client*, struct wl_resource* resource) {
+            if (auto* t = toplevel_of(resource); t && t->id && t->ctx && t->ctx->wm)
+                t->ctx->wm->set_fullscreen(t->id, false, -1, "client");
+        },
     .set_minimized = [](struct wl_client*, struct wl_resource*) {},
 };
 
@@ -617,11 +650,12 @@ void wm_send_configure(void* toplevel_res, void* xdg_surface_res,
     array.alloc = sizeof(storage);
     array.size = 0;
 
-    // Maximize only: Lumen has no window menu, fullscreen or minimize yet, and a CSD client
+    // Maximize and fullscreen: Lumen has no window menu or minimize yet, and a CSD client
     // hides the buttons it is told the compositor does not honour.
     if (initial && version >= XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION) {
         storage[0] = XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE;
-        array.size = sizeof(uint32_t);
+        storage[1] = XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN;
+        array.size = 2 * sizeof(uint32_t);
         xdg_toplevel_send_wm_capabilities(tl, &array);
         array.size = 0;
     }

@@ -57,6 +57,14 @@ Render loop ──drain──▶ render strand
 5. **Render** records Vulkan / headless blit from snapshot; **UI** may already be writing the next slot.
 6. **Render** calls `release_render_frame()` after present to return the reader lease.
 
+**Several outputs (ADR 008).** Every output slot has its own view in the scene and its own
+`snapshot_buffer` (`commit_frame(slot, frame)`, `acquire_render_snapshot(slot)`,
+`release_render_frame(slot, …)`), created by UI with the view and never freed while the
+scene lives, so render never creates one. UI publishes only the due outputs with damage and
+ORs their bits into `atomic<uint32_t> render_mask_` (release); render exchanges the mask
+(acquire) and acquires exactly those views. One output's flip-pending slots never hold back
+another's publish.
+
 See [../uml/27-snapshot-v2-handoff.mmd](../uml/27-snapshot-v2-handoff.mmd) and
 [../uml/23-frame-handoff-sequence.mmd](../uml/23-frame-handoff-sequence.mmd).
 
@@ -75,10 +83,15 @@ since the previous *published* snapshot.
   keeps the damage since the last successful KMS commit, which is what FB_DAMAGE_CLIPS
   must describe. Neither crosses a thread.
 - **Idle frames.** A tick with no damage composites and commits nothing. Frame callbacks
-  are then answered from the UI tick once render has consumed every damaged frame
-  (`last_rendered_frame_`), holds no composited-but-uncommitted frame
-  (`atomic<bool> frame_outstanding_`, lowered only after the commit raised `flip_pending`)
-  and no flip is queued.
+  are then answered from the UI tick once render has consumed every damaged frame of that
+  output (the pipeline's `atomic<long long> rendered_frame`), holds no
+  composited-but-uncommitted frame (`atomic<bool> frame_outstanding`, lowered only after the
+  commit raised `flip_pending`) and no flip is queued on it. With content, they are answered
+  by the UI's flip handler of the surface's pace output.
+- **Buffer release (render → UI).** Client buffers are released at the **low-water mark**,
+  `atomic<long long> render_low_water_`: the oldest frame any live output may still sample
+  (its newest consumed publish, or the frame its composited-but-uncommitted slot holds).
+  Render stores it after each tick; UI feeds it to `retire_completed_frames()`.
 
 ## Window management (UI affinity)
 
@@ -156,7 +169,7 @@ atomic exchange per side, no locks, no allocation) connect them:
 | Mailbox | Carries | Written | Read |
 |---------|---------|---------|------|
 | `cursor_frame_mailbox` | position, visibility, hardware/software, image generation, input time | per motion event outside a grab; at `on_tick` otherwise | once per render tick, just before the commit is built |
-| `cursor_image_mailbox` | plane-sized premultiplied ARGB image + hotspot | when the resolved image changes | when the frame's image generation differs from the one staged |
+| `cursor_image_mailbox` | a set of plane-sized premultiplied ARGB images + hotspots, one per distinct output scale (≤ 4) | when the resolved image changes | when the frame's image generation differs from the one staged |
 
 The reader owns the slot it last took until its next `take`, so the image it is copying into
 the plane's back buffer can never be overwritten underneath it. Render reports a rejected
@@ -164,9 +177,10 @@ plane back through `atomic<bool> cursor_hw_failed_`, which `tick_ui` turns into
 `cursor_manager::on_hardware_failed()`; `atomic<bool> last_commit_content_` tells the UI-side
 flip handler whether the flip it is handling presented a frame or only moved the pointer.
 The software cursor is a scene node and crosses threads in the snapshot like any other.
-The output scale never crosses: the UI thread projects the pointer into output pixels
-(`cursor_manager::set_projection`) before publishing a frame, and resamples client cursor
-images to their output-pixel size when they change, so render only ever sees pixels.
+The cursor frame is in logical layout coordinates; render places it on each pipeline's
+cursor plane with that output's origin and scale (and hides it on outputs it is not on),
+using the image of that output's scale. UI resamples client cursor images to each scale
+when they change, so render only ever copies pixels.
 
 **Debug screenshot (UI → render).** `compositor::request_screenshot` (SIGUSR1) stores
 `screenshot_requested_` (async-signal-safe) and wakes the loop; the UI thread turns it into
@@ -290,9 +304,52 @@ scene graph they edit.
 ### Vsync wiring (current → future)
 
 **Current (P0/P1):** DRM/KMS page-flip when `kms_device::open()` succeeds; `timer_source` remains
-fallback for headless/CI. `hotplug_monitor` refreshes outputs each UI tick. A repeating
+fallback for headless/CI. Outputs follow hotplug (below). One shared `vsync_timer` serves every output's frame clock (`frame_clocks`): it is
+armed at the earliest output start, a tick serves the outputs due within 1 ms of it, and a
+flip event re-phases only its own output's clock. Flip events are read once per DRM device
+(`kms_device::dispatch_events`) on the UI thread and routed to the pipeline by CRTC. A repeating
 `timer_source` advances from its deadline, skipping missed periods; re-arming at
 `now + interval` let every tick's lateness push the rest back (60 Hz measured 57).
+
+### Hotplug and output plans (ADR 008 Part B)
+
+| Step | Thread | What |
+|------|--------|------|
+| udev `change` HOTPLUG=1 | UI | the netlink fd is a loop source (`hotplug_controller`); `drain` folds a burst into one batch |
+| Connector probe | worker | `kms_device::probe_connectors(hint, scan, record=false)` into the worker's own `connector_scan`; one in flight, the rest merged into the next; the result goes back through `event_loop::post` (the worker is that queue's one producer) |
+| Diff and policy | UI | `diff_scan` → added / removed / changed; removals first, then mode changes, then additions; an identical scan does nothing |
+| Output ops | UI → render | `output_op` (add, test_mode, switch_mode, retire, set_vrr) in a mutex-guarded array of 32, read at the start of `tick_render` and again right after the snapshots are acquired; retires run first, a KMS add (and later ops of its slot) waits on render while a retiring CRTC is lit |
+| Answers | render → UI | `on_add_result`, `on_mode_tested`, `on_retired` as UI tasks (render is the UI strand's producer) |
+
+Ownership of a pipeline crosses threads only by message. Render owns `pipes_`; UI reaches a
+pipeline through `outs_[slot].pipe`, set by the add's answer and cleared **before** UI
+asks for the retire, so neither thread ever sees one the other has let go of. UI never
+passes that pointer in a task: render's copy of an output's projection (origin, scale,
+transform) is posted by slot and looked up in `pipes_` on render. A retired
+pipeline leaves the device's event registry on render (no flip is routed to it, no
+`commit_modeset` counts its CRTC) and is destroyed on UI — the thread draining KMS events,
+which may hold it until its dispatch returns. GL objects of a retired or switched pipeline
+are released on render, where the context is current. A mode switch is tagged with the
+first frame built at the new size: render applies it right before compositing that frame
+and never composites an older one into the new targets (snapshot publish is a release,
+acquire an acquire, so the op is visible whenever its frame is). The old targets stay
+until the new mode's first flip. While the VT is away nothing is probed (only the master's
+probe is forced); the resume waits ≤ 250 ms for a full probe before its modeset.
+
+### Output configuration (ADR 008 Part C)
+
+| Step | Thread | What |
+|------|--------|------|
+| Configuration requests | UI | `wire_output_management.cpp` checks every protocol error and queues a passed apply/test (`mgmt::job_queue`, a copy of the configuration) |
+| Validation | UI | `mgmt::resolve` against the heads clients were last told about; one job at a time, none while an output is being added or retired |
+| TEST_ONLY | UI → render → UI | one `config_test` (a single slot under `ops_mutex_`) taken by `run_output_ops`: staged targets at new modes (kept in the pipeline for the switch), disables, new outputs through the CRTC allocator; the answer is a UI task (`on_config_tested`) |
+| Switch | UI | the logical state, then the usual ops (`add`, `switch_mode`, `retire`, `set_vrr`) carrying a ticket |
+| Commit | render → UI | the combined modeset posts each ticketed pipeline's outcome (`on_modeset_result`); a timer bounds the wait (3 s) |
+| Save | UI → worker | `outputs.toml` serialised on UI 2 s after a client's apply; written on the worker (write, fsync, rename) — UI is that strand's one producer; flushed synchronously before the threads stop |
+
+A job's serial is checked at its start and again when its test answers (a hotplug in
+between makes it `cancelled`); after the switch it is answered from the commit, whatever
+moved meanwhile.
 
 ### CLI
 

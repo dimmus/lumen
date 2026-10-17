@@ -47,14 +47,16 @@ public:
     kms_cursor_plane(kms_cursor_plane&& other) noexcept;
     kms_cursor_plane& operator=(kms_cursor_plane&& other) noexcept;
 
-    /// Finds a cursor-type plane usable on `crtc_index` that scans out ARGB8888, sizes its
-    /// buffers from SIZE_HINTS (the first hint that fits `max_image_*`) or else
+    /// Finds a cursor-type plane usable on `crtc_index` that scans out ARGB8888 (exactly
+    /// `plane_id` when nonzero — the one the CRTC allocation chose), sizes its buffers from
+    /// SIZE_HINTS (the first hint that fits `max_image_*`) or else
     /// DRM_CAP_CURSOR_WIDTH/HEIGHT, and allocates both buffers. The card fd is borrowed and
     /// must outlive the plane.
     [[nodiscard]] static lx::result<kms_cursor_plane> create(int card_fd, unsigned crtc_id,
                                                              unsigned crtc_index,
                                                              unsigned max_image_w,
-                                                             unsigned max_image_h);
+                                                             unsigned max_image_h,
+                                                             unsigned plane_id = 0);
 
     [[nodiscard]] bool valid() const { return fd_ >= 0 && fbs_[0].fb != 0 && fbs_[1].fb != 0; }
     [[nodiscard]] cursor_plane_caps caps() const { return caps_; }
@@ -234,7 +236,8 @@ struct plane_size_hint {
 lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, unsigned crtc_id,
                                                                         unsigned crtc_index,
                                                                         unsigned max_image_w,
-                                                                        unsigned max_image_h) {
+                                                                        unsigned max_image_h,
+                                                                        unsigned want_plane) {
 #if defined(LUMEN_HAS_DRM)
     if (fd < 0 || crtc_id == 0 || crtc_index >= 32) {
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
@@ -258,7 +261,7 @@ lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, 
         const bool on_crtc = (p->possible_crtcs & (1u << crtc_index)) != 0;
         const unsigned plane_id = p->plane_id;
         drmModeFreePlane(p);
-        if (!argb || !on_crtc)
+        if (!argb || !on_crtc || (want_plane != 0 && plane_id != want_plane))
             continue;
 
         drmModeObjectProperties* props = drmModeObjectGetProperties(fd, plane_id,
@@ -374,6 +377,7 @@ lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, 
     (void)crtc_index;
     (void)max_image_w;
     (void)max_image_h;
+    (void)want_plane;
     return lx::not_implemented("lx::drm::kms_cursor_plane::create");
 #endif
 }

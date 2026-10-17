@@ -144,8 +144,9 @@ Shell never references client-side `xdg_toplevel` objects. All WM operations use
   objects exist: a compositor cannot introduce a `zlm_workspace_v1` in this protocol
   version (no event carries one as `new_id`), and an unknown object id is fatal to the
   client. No `snapshot_workspace` is sent for the same reason, and no `snapshot_output`
-  (its `wl_output` is not nullable and the shell may not have bound one) — a known gap
-  until per-client output objects are tracked (D5).
+  (its `wl_output` is not nullable and the shell may not have bound one): the shell learns
+  the outputs from `wl_output` and `zxdg_output_v1` (one global per output, ADR 008) and
+  places each window on the output its geometry overlaps most.
 
 ## Geometry and state deltas
 
@@ -265,16 +266,18 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   `get_policy_bridge`, and the panel's layer surface. `wl_seat` (v5 at most) gets its
   listener in the bind's own dispatch, for the same reason as `zlm_shell_v1`; the shell owns
   the seat's pointer and keyboard and routes them by surface to the panel or the launcher.
-  Also bound: the first `wl_output` (v2, its mode sizes the launcher) and
-  `xdg_activation_v1` (tokens for launched windows).
+  Also bound: **every** `wl_output` (v4, each with a `zxdg_output_v1` v3 for its logical
+  rect; outputs advertised later are bound as they come, and a `global_remove` drops that
+  output's panel and records) and `xdg_activation_v1` (tokens for launched windows). Each
+  output gets its panel at its first `wl_output.done` (after the bridge is up).
 - **Loop.** `wl_display_prepare_read` / `dispatch_pending` / `flush` (POLLOUT on EAGAIN),
   then `ppoll` on the display fd, a `signalfd` for SIGINT/SIGTERM, the catalog's inotify
   fd, one `timerfd` (earliest of: key repeat, panel-notice expiry, catalog debounce,
   activation-token timeout — disarmed when none is due) and, after the first launch opened
   it, the user bus (`sd_bus_get_events` / `sd_bus_get_timeout`) plus any fallback-launch
   pipes. An idle shell sleeps. SIGINT/SIGTERM exit 0 after destroying every object; a refused bind, a lost
-  compositor or a `closed` panel exit 1, and `lumen-shell.service` (`Restart=on-failure`)
-  starts it again.
+  compositor exits 1, and `lumen-shell.service` (`Restart=on-failure`)
+  starts it again. A `closed` panel (its output went away) is destroyed; the shell runs on.
 - **Task model** (`lx.shell:task_model`, pure). A fixed table of 256 entries — app_id, title
   (cut at 255 bytes on a UTF-8 code point boundary), state, geometry, stacking — addressed
   by a `task_handle {index, gen}` whose generation never repeats, so a handle kept across a
@@ -284,8 +287,11 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   `stacking_index`), so a restarted shell shows the order it had. While a snapshot is in progress the
   model reports `in_snapshot()` and the panel keeps what it last drew, so half a snapshot is
   never shown. On `toplevel_destroyed` the shell removes the entry and destroys its proxy.
-- **Panel** (`lx.shell:panel`). A layer surface on `top`, anchored top/left/right, 32 px,
-  exclusive zone 32, keyboard interactivity `none`, namespace `lumen-panel`. One entry per
+- **Panel** (`lx.shell:panel`), **one per output** (waybar's default; ADR 008 M13). A layer
+  surface on `top` of its `wl_output`, anchored top/left/right, 32 px, exclusive zone 32,
+  keyboard interactivity `none`, namespace `lumen-panel`. Each lists the windows on its
+  output (`task_output`: the output their geometry overlaps most, Plasma's "tasks from the
+  current screen"); pointer input is routed to the panel under it. One entry per
   window, left to right: 24 px tall, 4 px apart, width `(W − 8 − 4·(n−1)) / n` clamped to
   48–220 px; entries that do not fit at 48 px collapse into a "+k" label. The focused
   entry is highlighted; hover and press are shown; an entry demanding attention gets an
@@ -304,7 +310,8 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   launcher and stays latched while it is open. A launch that fails while the launcher is
   closed (Super+Return without a terminal, a start job that failed) shows "Could not start
   <Name>: <reason>" in place of the task entries for 6 s or until clicked.
-- **Launcher** (`lx.shell:launcher`). A separate layer surface on `overlay`, anchored
+- **Launcher** (`lx.shell:launcher`). On the focused window's output, else the output of
+  the panel last pointed at, else the first. A separate layer surface on `overlay`, anchored
   top/left with 4 px margins and exclusive zone 0 (so it sits under the panel), keyboard
   interactivity `on_demand`, namespace `lumen-launcher`; 420 px wide (less on a narrow
   output), a 40 px search row, 4–14 rows of 32 px, a 24 px status row. It exists only while

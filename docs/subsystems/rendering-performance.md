@@ -365,6 +365,14 @@ try_publish(d, idx) ──swap──▶   read_idx
                                    release(idx)
 ```
 
+**One snapshot buffer per output view** (ADR 008 M3). Damage is noted once in layout
+coordinates and fanned out to the pending region of every view it touches (≤ 16 rect tests,
+no allocation), projected per view and clipped to the view's pixels; a tick builds and
+publishes only the views of the outputs that are due *and* damaged, each with its own
+projection, so a flip-pending output never holds another output's slots, and an output
+nothing happened on costs nothing. A view's draw list holds only draws that reach its
+pixels (each surface node culls itself against the view's rect when it emits).
+
 ### Back-pressure policies
 
 | Policy | Behavior |
@@ -452,6 +460,16 @@ multiplies per draw in `project_node`, none per pixel; nothing allocates.
   region that changed, not the whole buffer, for scaled, cropped and rotated clients.
 - **Compositor-drawn pixels**: titles rasterized at `10 pt·s` and drawn 1:1, xcursor themes
   loaded at `round(24·s)`, client cursor images resampled once per change — never per frame.
+  A scale that appears later (an output configuration) loads its theme then, once.
+- **Output transform** (ADR 008 §C.4): emitters draw in the untransformed content space;
+  the view turns each draw once after emission (`gfx::transform_rect` on its rect and clip,
+  `gfx::compose_output_transform` on its buffer transform — integer arithmetic, a table
+  lookup) and `project_damage` turns damage. Cost: a few integer operations per draw per
+  turned output, nothing at normal transform; no renderer changed (every backend already
+  samples through `source_basis_for` for all eight transforms), occlusion and KMS damage
+  stay axis-aligned rects. A rotated output with a fractional scale is still 1:1: the
+  turned rect of a whole-pixel rect is whole pixels. The cursor plane's image is turned
+  once per image change on render, not per motion.
 
 ### Occlusion culling and frame-callback throttling (the visibility pass)
 
@@ -598,6 +616,24 @@ and costs nothing while idle.)
 **Between bursts the clock stops** — see [threading.md](threading.md). A restart is aimed
 at the next deadline extrapolated from the last flip, so it stays on the display's phase.
 
+**Several outputs** (ADR 008 M6). Each output has its own `repaint_scheduler` (phase from
+its own CRTC's flips, its own repaint estimate and quiet count) inside
+`scheduler::frame_clocks`; **one** `vsync_timer` is armed at the earliest start among the
+running clocks, and a tick serves every output due within 1 ms of it (two outputs in phase
+cost one wakeup). An output's clock stops after its own two quiet ticks while the others
+run; a dark output's never starts. A served clock's next start is never sooner than one
+period after the one just served, so a repaint estimate above the period ("run flat out")
+means a tick per refresh, not one per millisecond. Measured on vmwgfx: with three outputs an
+idle desktop costs 7 context switches in 5 s and no CPU tick; with two, a client
+presenting 180 frames on one output left the other at 0 composites and 0 commits.
+
+**Frame callbacks go out at the flip** (UI flip handler of the surface's pace output), not
+at the next tick. The tick runs at the repaint start (deadline − lead), so a callback sent
+there gave the client's reply no repaint to catch until the following one: a frame every
+two periods. Measured on vmwgfx with `lumen-probe presentation` (400x300, 180 frames):
+33 ms between presents with callbacks at the tick, 17.6 ms (one output) and 19 ms (each of
+two outputs) with callbacks at the flip; app-smoke P1 17.0 ms.
+
 **While the output is powered off** (zwlr_output_power_v1, ADR 007 I4) the display gate is
 up exactly as for a paused session: no composite, no commit, the frame clock stopped and the
 1 Hz paused tick answering frame callbacks. The CRTC goes off with one blocking ACTIVE=0
@@ -610,10 +646,13 @@ first frame after the wake is one rect of the full 1914x924. The idle timer adds
 wakeup per notification timeout, never one per input event (`:idle`'s lazy deadline).
 
 ```
-flip completes ──▶ card fd readable (epoll) ──▶ presentation_flip_handler
-                     ├─ present_completed_ = true   (frame callbacks may fire;
-                     │                               not for a cursor-only flip)
-                     └─ vsync_timer.schedule_at(next vblank − peak repaint cost − margin)
+flip completes ──▶ card fd readable (epoll) ──▶ kms_device::dispatch_events
+                     └─ routed by CRTC ──▶ presentation_flip_handler(pipeline)
+                          ├─ clocks.on_present(slot) → shared timer re-armed at the
+                          │    earliest start (next vblank − peak repaint cost − margin)
+                          ├─ wp_presentation feedback of that output
+                          └─ frame callbacks of the surfaces it paces
+                               (not for a cursor-only flip)
 ```
 
 The 250 ms stall watchdog still paces callbacks by tick if flips stop arriving, so a broken
@@ -626,13 +665,13 @@ output cannot wedge clients.
 The frame clock is phase-locked to page flips (§6.1); every flip also resolves
 `wp_presentation` feedback:
 
-1. `lx.drm.atomic` — `kms_atomic_commit` keeps the in-flight commit's `user_tag` (the
+1. `lx.drm.atomic` — `kms_pipeline` (one per CRTC) keeps the in-flight commit's `user_tag` (the
    composited frame index) and whether it carried a frame, and reports them in
    `page_flip_event` with the kernel's `sequence`, CLOCK_MONOTONIC timestamp, CRTC and
    whether the driver timestamps vblanks (`vblank_timestamp`; probed once with
    `drmCrtcGetSequence`). A blocking modeset's completion is reported as a synthetic flip
    (`hw = false`, sequence 0).
-2. `presentation_tracker::bind_page_flip(kms_atomic)` — wires flip → `presentation_feedback`
+2. `presentation_tracker::bind_page_flip(pipeline)` — wires flip → `presentation_feedback`
    (tag, content, hw, vblank clock, seq) → the compositor's flip handler (UI).
 3. The flip handler calls `presentation_flipped(frame = tag, {time, refresh, seq, flags})`;
    the table presents every update sampled at or before that frame whose surface that very
@@ -643,9 +682,67 @@ The frame clock is phase-locked to page flips (§6.1); every flip also resolves
    handful per frame; nothing allocates and nothing logs above debug.
 
 ```cpp
-presentation.bind_page_flip(compositor.kms_atomic());
-// on flip: presentation.on_page_flip(event) → handler → presentation_flipped(tag, info)
+p.presentation.bind_page_flip(*p.kms);      // per output pipeline
+// on flip: kms_device::dispatch_events → pipeline → handler → presentation_flipped(tag, slot, info)
 ```
+
+**Per-CRTC flips, combined modesets** (ADR 008 M5). Frames are one nonblocking atomic
+commit per CRTC with its own flip event, so outputs flip independently: a combined frame
+commit would tie every output to the slowest and fail with EBUSY whenever any CRTC still
+has a flip pending (wlroots, KWin, Mutter and niri all flip per CRTC). Configuration — the
+first frames at start, a resume — is one `commit_modeset` of every pipeline that needs one
+(TEST_ONLY first, CRTCs no output uses disabled, the neutral properties of each pipeline),
+carrying each output's first frame; it waits up to 100 ms for every such output to have a
+frame, then falls back to per-output modesets. The flip events of one card are read once
+(`kms_device::dispatch_events`) and routed to the pipeline by CRTC id; a combined commit's
+event is recognised by its cookie (device, generations, and a bit per pipeline the commit
+armed and that pipeline's event consumes — separate modesets in flight together on one
+cookie keep their own events). CRTCs another master lit are read again at each resume, and
+the resume's modesets turn them off with every connector the kernel has on them.
+
+**Hotplug** (ADR 008 Part B) uses the same two commit kinds and adds nothing per frame:
+
+- A **connected monitor** gets its pipeline from render: targets at the preferred mode, a
+  CRTC and planes no other pipeline holds, and a TEST_ONLY of the new pipeline with its real
+  first framebuffer (the kernel tests it against the state the other CRTCs are in, so it is
+  a test of the whole state); refused, the next mode in sway's order (preferred, then area ×
+  refresh) is tried. Its first frame is a modeset of that pipeline alone; the other outputs
+  keep flipping.
+- A **mode change** (a VM window resize: the preferred mode changed) is tested the same way
+  with a real framebuffer of the new size (`modeset_entry::mode` overrides the pipeline's
+  mode for the test) before anything a client sees changes; then the output switches, and
+  render takes the new targets right before compositing the first frame built at the new
+  size — never compositing an older one into them — and modesets with it. The old targets
+  stay until that modeset's flip. At a VT resume the probe comes first and the switch is
+  part of the resume's one combined modeset, so a resize while away no longer fails the
+  resume.
+- A **disconnected monitor**'s CRTC is turned off once its last flip drained (CRTC off,
+  connector unrouted, its planes detached, `connector_gone` for an MST port that vanished),
+  then its targets and pipeline go. Retires run before the adds of the same batch, and an
+  add waits (≤ 1 s) while a retiring CRTC is still lit, so a new output is allocated and
+  tested with the CRTCs and bandwidth of the gone ones free.
+- **Zero work when nothing changes**: without a uevent nothing runs (the netlink socket is
+  filtered to drm in the kernel); a uevent whose probe matches the outputs (an identical
+  layout, our own probe's detect) costs one worker probe (≈ 0.6 ms of ioctls on vmwgfx) and
+  a diff on UI — no client event, no render work, no allocation.
+
+**Output configuration** (ADR 008 Part C) adds nothing per frame either:
+
+- **Test**: one TEST_ONLY of every pipeline the configuration changes, with real
+  framebuffers of the new modes (kept staged ≤ 5 s for the switch, so the apply allocates
+  nothing more) and new outputs through the CRTC allocator with the same test. A `test` or
+  `--dryrun` stops there: nothing on screen moves even for a mode the kernel refuses.
+- **Apply**: changed modes go through the hotplug path's switch (at the first frame of the
+  new size, in the combined modeset); position, scale and transform repaint the views they
+  touch without a modeset; adaptive sync is a modeset (`VRR_ENABLED`). Measured on vmwgfx:
+  wlr-randr `--mode` = 1 TEST_ONLY + 1 modeset of that output; `--pos`/`--scale`/`--transform`
+  0 modesets; kanshi re-applying the restored state 0 modesets.
+- **Start**: the persisted state is applied before the first modeset, so a configured
+  session still comes up in one combined modeset.
+- **Adaptive sync clock**: with VRR the output's `repaint_scheduler` has no vblank phase; a
+  repaint starts on demand, no sooner than one refresh period (the mode's maximum rate)
+  after the last flip, minus the repaint estimate (niri's VRR clock). Cursor-only commits
+  still go out at once (pointer latency over refresh stability, §G of the design).
 
 Measured on vmwgfx (no vblank counter, flags `vsync | hw_completion`, seq 0): 180/180 frames
 presented with strictly increasing timestamps 34 ms apart (the SVGA3D host's flip rate),

@@ -66,6 +66,11 @@ enum task_change : unsigned {
     task_change_flags = 1u << 6,    ///< not responding / demands attention
 };
 
+/// The output a window of `geometry` belongs to, for the task list of each output's panel
+/// (ADR 008 M13, Plasma's "only tasks from the current screen"): the one among `outputs`
+/// (logical rects) it overlaps most, ties to the lower index; -1 when it overlaps none.
+[[nodiscard]] int task_output(lx::rect2i geometry, const lx::rect2i* outputs, unsigned count);
+
 /// Copies `src` into `dst` (`cap` bytes including the terminator). A string that does not
 /// fit is cut at the last code point boundary that does — never inside a UTF-8 sequence,
 /// which a shaper would turn into U+FFFD. Returns true when it was cut.
@@ -342,4 +347,26 @@ unsigned lx::shell::task_model::take_changes() {
     const unsigned c = changes_;
     changes_ = 0;
     return c;
+}
+
+int lx::shell::task_output(lx::rect2i g, const lx::rect2i* outputs, unsigned count) {
+    int best = -1;
+    long long best_area = 0;
+    for (unsigned i = 0; i < count && outputs; ++i) {
+        const lx::rect2i& o = outputs[i];
+        const long long x0 = g.x > o.x ? g.x : o.x;
+        const long long y0 = g.y > o.y ? g.y : o.y;
+        const long long x1 = static_cast<long long>(g.x) + g.width < static_cast<long long>(o.x) + o.width
+                                 ? static_cast<long long>(g.x) + g.width
+                                 : static_cast<long long>(o.x) + o.width;
+        const long long y1 = static_cast<long long>(g.y) + g.height < static_cast<long long>(o.y) + o.height
+                                 ? static_cast<long long>(g.y) + g.height
+                                 : static_cast<long long>(o.y) + o.height;
+        const long long a = x1 > x0 && y1 > y0 ? (x1 - x0) * (y1 - y0) : 0;
+        if (a > best_area) {
+            best_area = a;
+            best = static_cast<int>(i);
+        }
+    }
+    return best;
 }

@@ -20,6 +20,12 @@ module;
 // discarded. A surface hidden in F keeps its feedback for a later flip that shows it, until
 // a newer update supersedes it (wlroots keeps unrendered feedback the same way). A queued
 // update replaced before it was sampled is discarded at once.
+//
+// Several outputs (ADR 008 M8): feedback is sampled only by a publish of the surface's pace
+// output — the output showing most of it among those that show it (wlroots' scene
+// `primary_output`) — and from then on belongs to that output: only its flips present it,
+// with its refresh and MSC, and its visibility is recorded from that output's publishes. A
+// surface shown on two outputs is paced once.
 
 #include <initializer_list>
 
@@ -55,8 +61,12 @@ struct feedback_sink {
     void* user = nullptr;
 };
 
-/// Whether `surface` was on screen in published frame `frame` (the scene's visibility pass).
-using surface_visible_fn = bool (*)(void* user, lx::surface_id surface, unsigned frame);
+/// Whether `surface` was on screen on output `output` in published frame `frame` (the
+/// scene's visibility pass of that output's view).
+using surface_visible_fn = bool (*)(void* user, lx::surface_id surface, unsigned frame,
+                                    unsigned output);
+/// The surface's pace output (`pace_output`), -1 when it is shown nowhere.
+using surface_pace_fn = int (*)(void* user, lx::surface_id surface);
 
 class presentation_feedback_table {
 public:
@@ -84,11 +94,19 @@ public:
     /// is discarded (never sampled), sampled feedback becomes superseded at `building_frame`.
     void on_apply(lx::surface_id surface, list& cached, unsigned building_frame,
                   const feedback_sink& sink);
-    /// Frame `frame` was published: queued feedback whose surface it showed is sampled, and
-    /// sampled feedback records whether its surface is on screen in `frame`.
-    void on_publish(unsigned frame, surface_visible_fn visible, void* user);
-    /// A content flip of the composite of frame `frame` completed (see the class comment).
-    void on_flip(unsigned frame, const present_info& info, const feedback_sink& sink);
+    /// Frame `frame` was published to output `output`: queued feedback whose surface it
+    /// showed and that `output` paces (`pace`; null: any) is sampled for that output, and
+    /// feedback sampled for it records whether its surface is on screen in `frame`.
+    void on_publish(unsigned frame, unsigned output, surface_visible_fn visible,
+                    surface_pace_fn pace, void* user);
+    /// A content flip of the composite of frame `frame` on output `output` completed (see
+    /// the class comment): only feedback sampled for that output is decided.
+    void on_flip(unsigned frame, unsigned output, const present_info& info,
+                 const feedback_sink& sink);
+    /// Output `output` went dark (powered off): feedback sampled for it, and queued feedback
+    /// it paces, is discarded — nothing it paces reaches a screen.
+    void discard_output(unsigned output, surface_pace_fn pace, void* user,
+                        const feedback_sink& sink);
     /// The surface is destroyed or unmapped: its queued, sampled and superseded feedback is
     /// discarded (its pending and cached lists stay with the surface state — see
     /// `discard_list`).
@@ -131,6 +149,8 @@ private:
         /// Global list (queued or sampled/superseded): index + 1, 0 = end.
         unsigned gprev = 0;
         unsigned gnext = 0;
+        /// The output it was sampled for (its pace output then).
+        unsigned output = 0;
         state st = state::free;
     };
 
@@ -329,24 +349,30 @@ bool presentation_feedback_table::shown_in(const slot& s, unsigned frame) const 
     return d < 64 && ((s.seen_mask >> d) & 1ull) != 0;
 }
 
-void presentation_feedback_table::on_publish(unsigned frame, surface_visible_fn visible,
+void presentation_feedback_table::on_publish(unsigned frame, unsigned output,
+                                             surface_visible_fn visible, surface_pace_fn pace,
                                              void* user) {
     if (!visible)
         return;
-    // Already sampled: whether this frame still shows the surface. A superseded update is
-    // not the surface's content from its superseding frame on; nothing to record there.
+    // Already sampled for this output: whether this frame still shows the surface. A
+    // superseded update is not the surface's content from its superseding frame on; nothing
+    // to record there.
     for (unsigned h = sampled_head_; h; h = slots_[h - 1].gnext) {
         slot& s = slots_[h - 1];
+        if (s.output != output)
+            continue;
         if (s.st == state::superseded && at_or_after(frame, s.superseded_frame))
             continue;
-        note_seen(s, frame, visible(user, s.surface, frame));
+        note_seen(s, frame, visible(user, s.surface, frame, output));
     }
     for (unsigned h = queued_head_; h;) {
         const unsigned next = slots_[h - 1].gnext;
         slot& s = slots_[h - 1];
-        if (visible(user, s.surface, frame)) {
+        if (visible(user, s.surface, frame, output) &&
+            (!pace || pace(user, s.surface) == static_cast<int>(output))) {
             unlink(queued_head_, h - 1);
             s.st = state::sampled;
+            s.output = output;
             s.sampled_frame = frame;
             s.seen_base = frame;
             s.seen_last = frame;
@@ -357,11 +383,15 @@ void presentation_feedback_table::on_publish(unsigned frame, surface_visible_fn 
     }
 }
 
-void presentation_feedback_table::on_flip(unsigned frame, const present_info& info,
-                                          const feedback_sink& sink) {
+void presentation_feedback_table::on_flip(unsigned frame, unsigned output,
+                                          const present_info& info, const feedback_sink& sink) {
     for (unsigned h = sampled_head_; h;) {
         const unsigned next = slots_[h - 1].gnext;
         slot& s = slots_[h - 1];
+        if (s.output != output) {
+            h = next;
+            continue;
+        }
         if (s.st == state::superseded && at_or_after(frame, s.superseded_frame)) {
             // The newer update was already in this frame: this one never reached the screen
             // after its sampling (or it would have been presented by that flip).
@@ -376,6 +406,28 @@ void presentation_feedback_table::on_flip(unsigned frame, const present_info& in
             release(h - 1);
             if (sink.presented)
                 sink.presented(sink.user, resource, surface, info);
+        }
+        h = next;
+    }
+}
+
+void presentation_feedback_table::discard_output(unsigned output, surface_pace_fn pace,
+                                                 void* user, const feedback_sink& sink) {
+    for (unsigned h = sampled_head_; h;) {
+        const unsigned next = slots_[h - 1].gnext;
+        if (slots_[h - 1].output == output) {
+            unlink(sampled_head_, h - 1);
+            discard(h - 1, sink);
+        }
+        h = next;
+    }
+    if (!pace)
+        return;
+    for (unsigned h = queued_head_; h;) {
+        const unsigned next = slots_[h - 1].gnext;
+        if (pace(user, slots_[h - 1].surface) == static_cast<int>(output)) {
+            unlink(queued_head_, h - 1);
+            discard(h - 1, sink);
         }
         h = next;
     }

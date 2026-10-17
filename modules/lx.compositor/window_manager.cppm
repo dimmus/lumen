@@ -146,6 +146,27 @@ struct toplevel_commit_info {
     lx::rect2i tree_bbox{};
 };
 
+/// The black under a fullscreen window (M11): covers its output's logical rect, so nothing
+/// else shows on that output whatever the window draws (xdg-shell: a non-opaque or smaller
+/// fullscreen surface is shown over black). One per output, in the fullscreen layer.
+class fullscreen_backdrop final : public scene::scene_node {
+public:
+    ~fullscreen_backdrop() override;
+    [[nodiscard]] scene::node_kind kind() const override;
+    using scene::scene_node::emit_draws;
+    void emit_draws(scene::draw_list& out, const scene::emit_context& ctx) const override;
+    /// Texture id of the 1×1 opaque black image it draws scaled.
+    static constexpr unsigned k_texture_id = 0x7FFF'FE00u;
+    void show(lx::rect2i logical);
+    void hide();
+    [[nodiscard]] bool shown() const { return shown_; }
+    [[nodiscard]] lx::rect2i rect() const { return rect_; }
+
+private:
+    lx::rect2i rect_{};
+    bool shown_ = false;
+};
+
 /// Window placement, configure flow and focus. UI affinity.
 ///
 /// The executor of window-management *state*: `toplevel_record::geometry` changes only
@@ -214,13 +235,27 @@ public:
 
     /// Once per frame tick, before the scene is published.
     void on_tick(lx::runtime::clock_time now_ns);
-    /// Output 0's mode changed: layer surfaces are arranged again, and with them the usable
-    /// area.
+    /// The layout changed (an output's mode, position or scale; an output added or gone):
+    /// every output's layer surfaces are arranged again, and with them the usable areas;
+    /// fullscreen windows follow their outputs.
     void on_output_changed();
-    /// The usable area changed (layer-shell exclusive zones, or the output). Windows in the
-    /// normal state stay where they are (sway, KWin); maximized ones are configured to fill
-    /// the new area.
-    void on_usable_area_changed(lx::rect2i usable);
+    /// Output `slot` is about to go (ADR 008 §B.5): every window on it moves to `fallback`,
+    /// keeping its relative position (`evacuate_rect`; shrunk with a configure when it does
+    /// not fit), maximized and fullscreen ones are configured for `fallback`, and each
+    /// remembers the output's `identifier` and its place there (its home). Unmapped windows
+    /// placed on it are placed on `fallback`. Returns how many mapped windows moved.
+    /// `fallback` -1 (no output is left, one is on its way): the windows are stranded
+    /// (`toplevel_record::stranded`) until `on_output_added`, unmapped ones unplaced.
+    unsigned evacuate_output(unsigned slot, int fallback, const char* identifier);
+    /// Output `slot` was added: windows whose home it is (and that the user did not move or
+    /// resize since they left it) go back to their place there, maximized or fullscreen
+    /// again if they were; stranded windows are evacuated onto it. Returns how many went
+    /// back or were taken in.
+    unsigned on_output_added(unsigned slot);
+    /// Output `slot`'s usable area changed (layer-shell exclusive zones, or the output).
+    /// Windows in the normal state stay where they are (sway, KWin); maximized ones on that
+    /// output are configured to fill the new area.
+    void on_usable_area_changed(unsigned slot, lx::rect2i usable);
     /// xdg_toplevel.set_maximized / unset_maximized, zlm_policy_bridge_v1.request_maximize /
     /// request_unmaximize, a title-bar double click. Always answered by a configure (the
     /// spec: also when nothing changes). Maximized fills the usable area minus the frame;
@@ -228,6 +263,15 @@ public:
     /// that answers the configure, so the window never shows its new size at its old place.
     /// `source` is logged (`client`, `shell`, `decoration`).
     void set_maximized(lx::toplevel_id id, bool on, const char* source);
+    /// xdg_toplevel.set_fullscreen / unset_fullscreen, zlm_policy_bridge_v1.request_fullscreen
+    /// (M11). `output`: the slot asked for, -1 for none (the window's output). Always
+    /// answered by a configure carrying `fullscreen` and the output's logical size; the
+    /// commit answering it moves the window to the fullscreen layer at the output's origin,
+    /// over a black backdrop, frame hidden. Unset restores the geometry and the maximized
+    /// state it had.
+    void set_fullscreen(lx::toplevel_id id, bool on, int output, const char* source);
+    /// xdg_toplevel.set_parent: the child is placed on its parent's output.
+    void set_parent(lx::toplevel_id id, lx::toplevel_id parent);
     /// Sends every desired configure the single-in-flight rule allows.
     void flush_configures(lx::runtime::clock_time now_ns);
 
@@ -387,13 +431,33 @@ public:
     bool restack(lx::toplevel_id id, unsigned index);
     void request_close(lx::toplevel_id id);
 
-    /// Output 0's geometry (single output until D5): what layer surfaces are arranged
-    /// against and layer-surface popups constrained to.
-    [[nodiscard]] lx::rect2i output_area() const;
-    /// The output minus layer-shell exclusive zones: where windows are placed, how far a
-    /// move may push them, what configure_bounds and maximize use, and what window popups
+    /// Output `slot`'s logical rect: what its layer surfaces are arranged against, what a
+    /// fullscreen window there fills, and what layer-surface popups are constrained to. A
+    /// dead or negative slot means the first output; a nominal 1920x1080 without any.
+    [[nodiscard]] lx::rect2i output_area(int slot) const;
+    /// Output `slot` minus its layer-shell exclusive zones: where windows are placed, how far
+    /// a move may push them, what configure_bounds and maximize use, and what window popups
     /// are constrained to.
-    [[nodiscard]] lx::rect2i usable_area() const;
+    [[nodiscard]] lx::rect2i usable_area(int slot) const;
+    /// The output a window is on (§A.9): mapped, the one its frame overlaps most (else the
+    /// one it was on); not yet mapped, its placement output.
+    [[nodiscard]] int window_output(const toplevel_record& rec) const;
+    /// Moves a mapped window off an output whose usable area was `from` onto output
+    /// `fallback` (`evacuate_output`, and a stranded window taken in by a new output).
+    void relocate_window(toplevel_record& rec, lx::rect2i from, int fallback);
+    /// The output under the pointer (the nearest one in a gap), -1 without outputs.
+    [[nodiscard]] int pointer_output() const;
+    /// The fullscreen layer (between the top layer-shell layer and the overlay one) and the
+    /// staging of its backdrop texture. Optional: without it fullscreen windows stay in the
+    /// window layer.
+    void set_fullscreen_layer(scene::container_node* layer) {
+        fullscreen_layer_ = layer;
+        // The backdrops first: every fullscreen window's tree goes above them.
+        if (layer)
+            for (auto& b : backdrops_)
+                (void)layer->add(&b);
+    }
+    void set_texture_ops(compositor_texture_ops ops) { tex_ops_ = ops; }
     /// The frame the compositor draws around `rec` in its current state (none: client-side).
     [[nodiscard]] static frame_extents extents_of(const toplevel_record& rec);
 
@@ -441,8 +505,16 @@ private:
                           const lx::input::pointer_button_event& event);
     /// The frame hover (close-button look, pointer shape) follows pointer focus.
     void set_decoration_hover(lx::toplevel_id id, deco_zone zone);
-    /// Keeps the frame of `rec` in line with it (after any geometry, mapping or mode change).
+    /// Keeps the frame of `rec` in line with it (after any geometry, mapping or mode change),
+    /// its title rasterized at the largest scale among its outputs.
     void sync_decoration(const toplevel_record& rec);
+    /// The window entered or left the fullscreen state (its committed state): its tree moves
+    /// between the window layer and the fullscreen layer, and its output's backdrop follows.
+    void sync_fullscreen(toplevel_record& rec, bool was_fullscreen);
+    /// The backdrops follow the fullscreen windows (after any of them changed).
+    void sync_backdrops();
+    /// The placement output of a window about to get its initial configure.
+    [[nodiscard]] int placement_output(const toplevel_record& rec) const;
 
     toplevel_manager* toplevels_ = nullptr;
     surface_manager* surfaces_ = nullptr;
@@ -486,8 +558,12 @@ private:
     /// The toplevel whose desired configure carries `activated`: the owner of the surface
     /// resolve_keyboard_focus gave the keyboard to (none while a layer surface has it).
     lx::toplevel_id activated_{};
-    /// Last usable area logged (`usable area …` on change only).
-    lx::rect2i usable_logged_{};
+    /// Last usable area logged per output (`usable area …` on change only).
+    lx::rect2i usable_logged_[output_manager::k_max]{};
+    scene::container_node* fullscreen_layer_ = nullptr;
+    compositor_texture_ops tex_ops_{};
+    bool backdrop_staged_ = false;
+    fullscreen_backdrop backdrops_[output_manager::k_max]{};
     /// The frame zone with pointer focus (none: the focus, if any, is a client surface).
     deco_zone pointer_zone_ = deco_zone::none;
     /// A close-button press waiting for its release (the click happens on release over it).
@@ -545,6 +621,11 @@ private:
 /// grabbable, as in Mutter), and at least 64x32 px of it stays inside horizontally and
 /// vertically.
 [[nodiscard]] lx::point2i constrain_on_output(lx::rect2i output, lx::rect2i geometry);
+/// Where frame `f`, in an area `from` that goes away, lands in `to` (ADR 008 §B.5): its
+/// relative position kept — x' = to.x + (f.x − from.x)·(to.w − w)/(from.w − f.w), likewise
+/// for y — its size kept when it fits, else shrunk to `to`, and the result clamped inside
+/// `to`. Pure; exported for tests.
+[[nodiscard]] lx::rect2i evacuate_rect(lx::rect2i f, lx::rect2i from, lx::rect2i to);
 
 /// One of the nine `resize_edge` values (none, four sides, four corners).
 [[nodiscard]] bool valid_resize_edges(unsigned edges);
@@ -815,6 +896,32 @@ lx::point2i lx::compositor::place_new_window(lx::rect2i output, lx::size2i size,
     return p;
 }
 
+lx::rect2i lx::compositor::evacuate_rect(lx::rect2i f, lx::rect2i from, lx::rect2i to) {
+    lx::rect2i r{0, 0, f.width < to.width ? f.width : to.width,
+                 f.height < to.height ? f.height : to.height};
+    if (r.width < 1)
+        r.width = 1;
+    if (r.height < 1)
+        r.height = 1;
+    // The fraction of the free room on the left (top) of the old area, applied to the free
+    // room of the new one: a window at the right edge stays at the right edge.
+    const auto place = [](int pos, int size, int from_pos, int from_size, int to_pos, int to_size) {
+        const long long room_from = static_cast<long long>(from_size) - size;
+        const long long room_to = static_cast<long long>(to_size) - size;
+        long long p = to_pos;
+        if (room_from > 0 && room_to > 0) {
+            long long off = static_cast<long long>(pos) - from_pos;
+            off = off < 0 ? 0 : (off > room_from ? room_from : off);
+            p = to_pos + (off * room_to + room_from / 2) / room_from;
+        }
+        const long long hi = static_cast<long long>(to_pos) + (room_to > 0 ? room_to : 0);
+        return static_cast<int>(p < to_pos ? to_pos : (p > hi ? hi : p));
+    };
+    r.x = place(f.x, r.width, from.x, from.width, to.x, to.width);
+    r.y = place(f.y, r.height, from.y, from.height, to.y, to.height);
+    return r;
+}
+
 lx::point2i lx::compositor::constrain_on_output(lx::rect2i output, lx::rect2i geometry) {
     const int keep_w = geometry.width < 64 ? geometry.width : 64;
     const int keep_h = geometry.height < 32 ? geometry.height : 32;
@@ -833,6 +940,48 @@ lx::point2i lx::compositor::constrain_on_output(lx::rect2i output, lx::rect2i ge
     if (y < min_y)
         y = min_y;
     return {x, y};
+}
+
+// ── fullscreen_backdrop ────────────────────────────────────────────────────
+
+lx::compositor::fullscreen_backdrop::~fullscreen_backdrop() = default;
+
+lx::scene::node_kind lx::compositor::fullscreen_backdrop::kind() const {
+    // Not a container, so `scene_graph::emit_node` asks it for draws.
+    return scene::node_kind::surface;
+}
+
+void lx::compositor::fullscreen_backdrop::emit_draws(scene::draw_list& out,
+                                                    const scene::emit_context& ctx) const {
+    if (!shown_ || rect_.width <= 0 || rect_.height <= 0)
+        return;
+    scene::draw_command cmd{};
+    cmd.texture = lx::texture_id{k_texture_id};
+    cmd.dst = scene::project_node(ctx.projection, {rect_.x, rect_.y}, {rect_.x, rect_.y},
+                                  {rect_.width, rect_.height});
+    if (ctx.projection.size.width > 0 && ctx.projection.size.height > 0 &&
+        (cmd.dst.x >= ctx.projection.size.width || cmd.dst.y >= ctx.projection.size.height ||
+         cmd.dst.x + cmd.dst.width <= 0 || cmd.dst.y + cmd.dst.height <= 0))
+        return; // another output's
+    cmd.src = lx::rect2f{0.f, 0.f, 1.f, 1.f};
+    cmd.scaled = false; // one texel: nearest is exact
+    cmd.opacity = 1.f;
+    cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
+    // Opaque: whatever is under it on this output is occluded and never composited.
+    cmd.blend = lx::blend_mode::opaque;
+    cmd.sort_key = lx::draw_sort_key::make(0, out.size());
+    out.push(cmd);
+}
+
+void lx::compositor::fullscreen_backdrop::show(lx::rect2i logical) {
+    rect_ = logical;
+    shown_ = true;
+    mark_dirty({});
+}
+
+void lx::compositor::fullscreen_backdrop::hide() {
+    shown_ = false;
+    mark_dirty({});
 }
 
 // ── window_manager ─────────────────────────────────────────────────────────
@@ -867,9 +1016,16 @@ void lx::compositor::window_manager::set_popups(popup_manager* popups) {
     // Window popups stay inside the usable area (Mutter, KWin: a menu opened under a top
     // panel opens below it), layer-surface popups inside the whole output (sway: a panel's
     // own menus may cover its exclusive zone).
-    host.constraint_area = [](void* user, popup_parent_kind root) {
+    host.constraint_area = [](void* user, popup_parent_kind root, lx::surface_id root_surface) {
         const auto* wm = static_cast<window_manager*>(user);
-        return root == popup_parent_kind::layer ? wm->output_area() : wm->usable_area();
+        // The output of the chain's root: the layer surface's own, the window's.
+        int slot = -1;
+        if (root == popup_parent_kind::layer && wm->layers_)
+            slot = wm->layers_->output_of(root_surface);
+        else if (wm->toplevels_)
+            if (const auto* rec = wm->toplevels_->find_by_surface(root_surface))
+                slot = wm->window_output(*rec);
+        return root == popup_parent_kind::layer ? wm->output_area(slot) : wm->usable_area(slot);
     };
     host.focus_changed = [](void* user) {
         static_cast<window_manager*>(user)->resolve_keyboard_focus();
@@ -885,11 +1041,16 @@ void lx::compositor::window_manager::set_layers(layer_shell* layers) {
         return;
     layer_host host{};
     host.user = this;
-    host.output_area = [](void* user) {
-        return static_cast<window_manager*>(user)->output_area();
+    host.output_area = [](void* user, unsigned slot) {
+        const auto* wm = static_cast<window_manager*>(user);
+        // A gone output has no area: its surfaces are closed by the arrangement.
+        if (!wm->outputs_ || !wm->outputs_->slot_live(slot))
+            return wm->outputs_ && wm->outputs_->count() > 0 ? lx::rect2i{}
+                                                             : lx::rect2i{0, 0, 1920, 1080};
+        return wm->output_area(static_cast<int>(slot));
     };
-    host.usable_changed = [](void* user, lx::rect2i usable) {
-        static_cast<window_manager*>(user)->on_usable_area_changed(usable);
+    host.usable_changed = [](void* user, unsigned slot, lx::rect2i usable) {
+        static_cast<window_manager*>(user)->on_usable_area_changed(slot, usable);
     };
     host.focus_changed = [](void* user) {
         auto* wm = static_cast<window_manager*>(user);
@@ -948,18 +1109,87 @@ void lx::compositor::window_manager::set_layers(layer_shell* layers) {
 
 lx::compositor::frame_extents
 lx::compositor::window_manager::extents_of(const toplevel_record& rec) {
+    // No frame around a fullscreen window.
+    if (rec.state == lx::toplevel_state::fullscreen)
+        return {};
     return extents_for(rec.decoration_current, rec.state == lx::toplevel_state::maximized);
 }
 
 void lx::compositor::window_manager::sync_decoration(const toplevel_record& rec) {
-    if (decorations_)
-        decorations_->sync(rec);
+    if (!decorations_)
+        return;
+    decorations_->sync(rec);
+    // The title at the largest scale among the outputs the frame is on (sharp on each).
+    if (rec.mapped && outputs_ && rec.decoration_current == decoration_mode::server) {
+        const std::uint32_t mask = outputs_for_rect(*outputs_, frame_rect(rec.geometry, extents_of(rec)));
+        double best = 0.0;
+        for (unsigned s = 0; s < output_manager::k_max; ++s)
+            if ((mask & (1u << s)) && outputs_->slot_state(s).scale > best)
+                best = outputs_->slot_state(s).scale;
+        if (best > 0.0)
+            decorations_->set_window_scale(rec.id, best);
+    }
 }
 
-lx::rect2i lx::compositor::window_manager::output_area() const {
+void lx::compositor::window_manager::sync_backdrops() {
+    // One backdrop per output with a fullscreen window on it (committed state).
+    bool want[output_manager::k_max]{};
+    if (toplevels_)
+        toplevels_->for_each([&](const toplevel_record& rec) {
+            if (rec.mapped && rec.state == lx::toplevel_state::fullscreen &&
+                rec.fullscreen_output >= 0 &&
+                static_cast<unsigned>(rec.fullscreen_output) < output_manager::k_max)
+                want[rec.fullscreen_output] = true;
+        });
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        fullscreen_backdrop& b = backdrops_[s];
+        const bool live = outputs_ && outputs_->slot_live(s);
+        if (want[s] && live && fullscreen_layer_) {
+            const lx::rect2i area = output_area(static_cast<int>(s));
+            if (b.shown() && rect_equal(b.rect(), area))
+                continue;
+            if (!backdrop_staged_ && tex_ops_.stage) {
+                const std::uint32_t black = 0xFF000000u;
+                backdrop_staged_ =
+                    tex_ops_.stage(tex_ops_.user, fullscreen_backdrop::k_texture_id, &black, 1, 1, 1,
+                                   1, 1);
+            }
+            if (b.shown() && scene_)
+                scene_->note_damage(b.rect());
+            b.show(area);
+            if (scene_)
+                scene_->note_damage(area);
+        } else if (b.shown()) {
+            if (scene_)
+                scene_->note_damage(b.rect());
+            b.hide();
+        }
+    }
+}
+
+void lx::compositor::window_manager::sync_fullscreen(toplevel_record& rec, bool was_fullscreen) {
+    const bool full = rec.state == lx::toplevel_state::fullscreen;
+    if (full == was_fullscreen || !fullscreen_layer_ || !tree_ || !windows_layer_)
+        return;
+    if (full) {
+        // Above the top layer-shell layer (a panel) and every window, under the overlay
+        // layer and popups (sway).
+        (void)tree_->move_root(rec.surface, *fullscreen_layer_);
+    } else {
+        (void)tree_->move_root(rec.surface, *windows_layer_);
+        sync_node_stacking(rec, "unfullscreen");
+    }
+    tree_->damage_root(rec.surface);
+    sync_backdrops();
+    rehit_pending_ = true;
+}
+
+lx::rect2i lx::compositor::window_manager::output_area(int slot) const {
     if (outputs_ && outputs_->count() > 0) {
+        if (slot < 0 || !outputs_->slot_live(static_cast<unsigned>(slot)))
+            slot = outputs_->slot_of(outputs_->nth(0));
         // Logical: windows, layers and popups are placed in layout coordinates.
-        const lx::rect2i g = outputs_->logical_rect(outputs_->nth(0));
+        const lx::rect2i g = outputs_->slot_state(static_cast<unsigned>(slot)).logical_rect();
         if (!rect_empty(g))
             return g;
     }
@@ -967,41 +1197,309 @@ lx::rect2i lx::compositor::window_manager::output_area() const {
     return {0, 0, 1920, 1080};
 }
 
-lx::rect2i lx::compositor::window_manager::usable_area() const {
-    if (layers_ && layers_->arranged()) {
-        const lx::rect2i u = layers_->usable();
+lx::rect2i lx::compositor::window_manager::usable_area(int slot) const {
+    if (outputs_ && outputs_->count() > 0 &&
+        (slot < 0 || !outputs_->slot_live(static_cast<unsigned>(slot))))
+        slot = outputs_->slot_of(outputs_->nth(0));
+    if (layers_ && slot >= 0 && layers_->arranged(static_cast<unsigned>(slot))) {
+        const lx::rect2i u = layers_->usable(static_cast<unsigned>(slot));
         // Zones that ate the whole output leave nothing to place into; the output then.
         if (!rect_empty(u))
             return u;
     }
-    return output_area();
+    return output_area(slot);
+}
+
+int lx::compositor::window_manager::pointer_output() const {
+    if (!outputs_ || outputs_->count() == 0)
+        return -1;
+    double x = seat_ ? seat_->pointer_x() : 0.0;
+    double y = seat_ ? seat_->pointer_y() : 0.0;
+    (void)closest_point(*outputs_, x, y);
+    const int at = output_at(*outputs_, x, y);
+    return at >= 0 ? at : outputs_->slot_of(outputs_->nth(0));
+}
+
+int lx::compositor::window_manager::window_output(const toplevel_record& rec) const {
+    if (!outputs_ || outputs_->count() == 0)
+        return -1;
+    if (rec.state == lx::toplevel_state::fullscreen && rec.fullscreen_output >= 0 &&
+        outputs_->slot_live(static_cast<unsigned>(rec.fullscreen_output)))
+        return rec.fullscreen_output;
+    if (rec.mapped) {
+        const int primary = primary_output_for_rect(*outputs_, frame_rect(rec.geometry, extents_of(rec)));
+        if (primary >= 0)
+            return primary;
+    }
+    if (rec.output >= 0 && outputs_->slot_live(static_cast<unsigned>(rec.output)))
+        return rec.output;
+    return pointer_output();
+}
+
+int lx::compositor::window_manager::placement_output(const toplevel_record& rec) const {
+    // M10: a child on its parent's output; anything else on the output under the pointer —
+    // in a stacking desktop the pointer marks where the user works (Mutter).
+    for (unsigned depth = 0; rec.parent && depth < 8; ++depth) {
+        if (const auto* parent = toplevels_ ? toplevels_->find(rec.parent) : nullptr) {
+            if (parent->mapped || parent->output >= 0)
+                return window_output(*parent);
+        }
+        break;
+    }
+    return pointer_output();
+}
+
+void lx::compositor::window_manager::set_parent(lx::toplevel_id id, lx::toplevel_id parent) {
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec)
+        return;
+    rec->parent = parent;
 }
 
 void lx::compositor::window_manager::on_output_changed() {
     if (layers_)
-        layers_->arrange(); // reports a changed usable area through the host
-    else
-        on_usable_area_changed(output_area());
+        layers_->arrange(); // reports each changed usable area through the host
+    else if (outputs_)
+        for (unsigned s = 0; s < output_manager::k_max; ++s)
+            if (outputs_->slot_live(s))
+                on_usable_area_changed(s, output_area(static_cast<int>(s)));
+    if (!toplevels_)
+        return;
+    // Fullscreen windows follow their output's rect (a mode or scale change); one whose
+    // output went is fullscreen on the window's output now.
+    toplevels_->for_each_mut([&](toplevel_record& rec) {
+        // A stranded window waits for the output on its way (`on_output_added`).
+        if (!(rec.desired.states & tl_fullscreen) || rec.stranded)
+            return;
+        if (rec.fullscreen_output < 0 || !outputs_ ||
+            !outputs_->slot_live(static_cast<unsigned>(rec.fullscreen_output)))
+            rec.fullscreen_output = pointer_output();
+        const lx::rect2i area = output_area(rec.fullscreen_output);
+        if (rec.desired.size.width != area.width || rec.desired.size.height != area.height ||
+            rec.geometry.x != area.x || rec.geometry.y != area.y) {
+            rec.desired.size = {area.width, area.height};
+            rec.desired.place = true;
+            rec.desired.place_at = {area.x, area.y};
+            rec.configure_due = true;
+        }
+    });
+    sync_backdrops();
+    // Decorations follow the scales of the outputs their windows are on.
+    toplevels_->for_each([&](const toplevel_record& rec) {
+        if (rec.mapped)
+            sync_decoration(rec);
+    });
 }
 
-void lx::compositor::window_manager::on_usable_area_changed(lx::rect2i usable) {
+unsigned lx::compositor::window_manager::evacuate_output(unsigned slot, int fallback,
+                                                         const char* identifier) {
+    if (!toplevels_ || !outputs_ || static_cast<unsigned>(fallback) == slot)
+        return 0;
+    const lx::rect2i from = usable_area(static_cast<int>(slot));
+    const lx::rect2i out = output_area(static_cast<int>(slot));
+    unsigned moved = 0;
+    toplevels_->for_each_mut([&](toplevel_record& rec) {
+        if (!rec.mapped) {
+            // Placed there, not shown yet: placed on the fallback instead (none: placed
+            // again when it maps).
+            if (rec.output == static_cast<int>(slot))
+                rec.output = fallback;
+            if (rec.want_fullscreen_output == static_cast<int>(slot))
+                rec.want_fullscreen_output = fallback;
+            return;
+        }
+        if (window_output(rec) != static_cast<int>(slot))
+            return;
+        ++moved;
+        // Home: the first output it was moved off (moved again before returning, it still
+        // goes back to where it started).
+        if (!rec.home_identifier[0] && identifier && *identifier) {
+            std::snprintf(rec.home_identifier, sizeof(rec.home_identifier), "%s", identifier);
+            rec.home_rect = {rec.geometry.x - out.x, rec.geometry.y - out.y, rec.geometry.width,
+                             rec.geometry.height};
+            rec.home_maximized = (rec.desired.states & tl_maximized) != 0;
+            rec.home_fullscreen = (rec.desired.states & tl_fullscreen) != 0;
+        }
+        if (fallback < 0) {
+            // Nowhere to go yet: the output on its way takes it in.
+            rec.stranded = true;
+            rec.stranded_from = from;
+            return;
+        }
+        relocate_window(rec, from, fallback);
+    });
+    if (moved > 0) {
+        rehit_pending_ = true;
+        if (wm_debug_enabled()) {
+            char line[160];
+            std::snprintf(line, sizeof(line), "evacuate output=%u to=%d windows=%u%s", slot,
+                          fallback, moved, fallback < 0 ? " (stranded until an output comes)" : "");
+            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        }
+    }
+    return moved;
+}
+
+void lx::compositor::window_manager::relocate_window(toplevel_record& rec, lx::rect2i from,
+                                                     int fallback) {
+    const lx::rect2i to = usable_area(fallback);
+    const bool fullscreen = (rec.desired.states & tl_fullscreen) != 0;
+    const bool maximized = (rec.desired.states & tl_maximized) != 0;
+    rec.stranded = false;
+    rec.output = fallback;
+    if (fullscreen) {
+        rec.fullscreen_output = fallback;
+        const lx::rect2i area = output_area(fallback);
+        rec.desired.size = {area.width, area.height};
+        rec.desired.place = true;
+        rec.desired.place_at = {area.x, area.y};
+        rec.configure_due = true;
+        // What unset_fullscreen goes back to moves along.
+        if (rec.fullscreen_restore_set)
+            rec.fullscreen_restore = evacuate_rect(rec.fullscreen_restore, from, to);
+        return;
+    }
+    if (maximized) {
+        const frame_extents ext = extents_for(rec.desired.decoration, true);
+        rec.desired.size = {to.width - ext.left - ext.right, to.height - ext.top - ext.bottom};
+        rec.desired.place = true;
+        rec.desired.place_at = {to.x + ext.left, to.y + ext.top};
+        rec.configure_due = true;
+        if (rec.restore_set)
+            rec.restore = evacuate_rect(rec.restore, from, to);
+        return;
+    }
+    const frame_extents ext = extents_of(rec);
+    const lx::rect2i f = frame_rect(rec.geometry, ext);
+    const lx::rect2i nf = evacuate_rect(f, from, to);
+    const lx::point2i at{nf.x + ext.left, nf.y + ext.top};
+    if (nf.width == f.width && nf.height == f.height) {
+        move_window(rec, at, "evacuate");
+        return;
+    }
+    // Too large for the fallback: shrunk by a configure, placed by its answer.
+    rec.desired.size = {nf.width - ext.left - ext.right, nf.height - ext.top - ext.bottom};
+    rec.desired.place = true;
+    rec.desired.place_at = at;
+    rec.configure_due = true;
+}
+
+unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
+    if (!toplevels_ || !outputs_ || !outputs_->slot_live(slot))
+        return 0;
+    const output_state& o = outputs_->slot_state(slot);
+    const lx::rect2i out = output_area(static_cast<int>(slot));
+    const lx::rect2i usable = usable_area(static_cast<int>(slot));
+    unsigned back = 0;
+    // Stranded windows (their output went with none left): this one takes them in. One whose
+    // home this is goes back to its place below instead.
+    unsigned adopted = 0;
+    toplevels_->for_each_mut([&](toplevel_record& rec) {
+        if (!rec.stranded)
+            return;
+        if (o.identifier[0] && rec.home_identifier[0] &&
+            std::strcmp(rec.home_identifier, o.identifier) == 0) {
+            rec.stranded = false;
+            return;
+        }
+        if (!rec.mapped) {
+            rec.stranded = false;
+            return;
+        }
+        ++adopted;
+        relocate_window(rec, rec.stranded_from, static_cast<int>(slot));
+    });
+    if (adopted > 0) {
+        rehit_pending_ = true;
+        if (wm_debug_enabled()) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "stranded windows taken in by output=%u windows=%u",
+                          slot, adopted);
+            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        }
+    }
+    if (!o.identifier[0])
+        return adopted;
+    toplevels_->for_each_mut([&](toplevel_record& rec) {
+        if (!rec.home_identifier[0] || std::strcmp(rec.home_identifier, o.identifier) != 0)
+            return;
+        rec.home_identifier[0] = '\0';
+        rec.stranded = false;
+        if (!rec.mapped)
+            return;
+        ++back;
+        rec.output = static_cast<int>(slot);
+        const bool fullscreen = (rec.desired.states & tl_fullscreen) != 0;
+        const bool maximized = (rec.desired.states & tl_maximized) != 0;
+        if (fullscreen) {
+            rec.fullscreen_output = static_cast<int>(slot);
+            rec.desired.size = {out.width, out.height};
+            rec.desired.place = true;
+            rec.desired.place_at = {out.x, out.y};
+            rec.configure_due = true;
+            return;
+        }
+        if (maximized) {
+            const frame_extents ext = extents_for(rec.desired.decoration, true);
+            rec.desired.size = {usable.width - ext.left - ext.right,
+                                usable.height - ext.top - ext.bottom};
+            rec.desired.place = true;
+            rec.desired.place_at = {usable.x + ext.left, usable.y + ext.top};
+            rec.configure_due = true;
+            if (rec.restore_set)
+                rec.restore = {out.x + rec.home_rect.x, out.y + rec.home_rect.y, rec.restore.width,
+                               rec.restore.height};
+            return;
+        }
+        // Its old place on the output, kept reachable (the output may have come back
+        // smaller, or with a panel over the old title bar).
+        const frame_extents ext = extents_of(rec);
+        const lx::rect2i want{out.x + rec.home_rect.x, out.y + rec.home_rect.y,
+                              rec.home_rect.width, rec.home_rect.height};
+        const lx::point2i p = constrain_on_output(usable, frame_rect(want, ext));
+        const lx::point2i at{p.x + ext.left, p.y + ext.top};
+        if (want.width == rec.geometry.width && want.height == rec.geometry.height) {
+            move_window(rec, at, "home");
+            return;
+        }
+        // It was shrunk to fit where it went: its size back with a configure.
+        rec.desired.size = {want.width, want.height};
+        rec.desired.place = true;
+        rec.desired.place_at = at;
+        rec.configure_due = true;
+    });
+    if (back > 0) {
+        rehit_pending_ = true;
+        if (wm_debug_enabled()) {
+            char line[160];
+            std::snprintf(line, sizeof(line), "home output=%u identifier=\"%s\" windows=%u", slot,
+                          o.identifier, back);
+            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        }
+    }
+    return back + adopted;
+}
+
+void lx::compositor::window_manager::on_usable_area_changed(unsigned slot, lx::rect2i usable) {
     if (rect_empty(usable))
-        usable = output_area();
-    if (!rect_equal(usable, usable_logged_)) {
-        usable_logged_ = usable;
+        usable = output_area(static_cast<int>(slot));
+    if (slot < output_manager::k_max && !rect_equal(usable, usable_logged_[slot])) {
+        usable_logged_[slot] = usable;
         if (wm_debug_enabled()) {
             char line[128];
-            std::snprintf(line, sizeof(line), "usable area x=%d y=%d w=%d h=%d", usable.x,
-                          usable.y, usable.width, usable.height);
+            std::snprintf(line, sizeof(line), "usable area x=%d y=%d w=%d h=%d output=%u",
+                          usable.x, usable.y, usable.width, usable.height, slot);
             lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
         }
     }
     if (!toplevels_)
         return;
     rehit_pending_ = true;
-    // Normal windows stay put (sway, KWin); maximized ones fill the new area.
+    // Normal windows stay put (sway, KWin); maximized ones on this output fill the new area.
     toplevels_->for_each_mut([&](toplevel_record& rec) {
-        if (!(rec.desired.states & tl_maximized))
+        if (!(rec.desired.states & tl_maximized) || (rec.desired.states & tl_fullscreen))
+            return;
+        if (window_output(rec) != static_cast<int>(slot))
             return;
         const frame_extents ext = extents_for(rec.desired.decoration, true);
         const lx::size2i size{usable.width - ext.left - ext.right,
@@ -1054,13 +1552,22 @@ void lx::compositor::window_manager::set_maximized(lx::toplevel_id id, bool on,
         if (!rec)
             return;
     }
+    if (rec->desired.states & tl_fullscreen) {
+        // Fullscreen: what unset_fullscreen goes back to; the configure still answers it.
+        rec->fullscreen_was_maximized = on;
+        rec->configure_due = true;
+        if (!rec->inflight)
+            send_configure(*rec, wm_now_ns(), false, false);
+        return;
+    }
     const bool is_max = (rec->desired.states & tl_maximized) != 0;
+    const int slot = window_output(*rec);
     if (on && !is_max) {
         if (rec->mapped && rec->state == lx::toplevel_state::normal) {
             rec->restore = rec->geometry;
             rec->restore_set = true;
         }
-        const lx::rect2i area = usable_area();
+        const lx::rect2i area = usable_area(slot);
         const frame_extents ext = extents_for(rec->desired.decoration, true);
         rec->desired.states |= tl_maximized;
         rec->desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
@@ -1073,7 +1580,7 @@ void lx::compositor::window_manager::set_maximized(lx::toplevel_id id, bool on,
             // Back where it was — kept reachable if the usable area changed meanwhile (a
             // panel appeared over the old title bar), as a move would be.
             const frame_extents ext = extents_for(rec->desired.decoration, false);
-            const lx::point2i p = constrain_on_output(usable_area(),
+            const lx::point2i p = constrain_on_output(usable_area(slot),
                                                       frame_rect(rec->restore, ext));
             rec->desired.size = {rec->restore.width, rec->restore.height};
             rec->desired.place = true;
@@ -1084,6 +1591,82 @@ void lx::compositor::window_manager::set_maximized(lx::toplevel_id id, bool on,
             rec->desired.size = {};
             rec->desired.place = false;
         }
+    }
+    // xdg-shell: answered by a configure even when the state does not change.
+    rec->configure_due = true;
+    if (!rec->inflight)
+        send_configure(*rec, wm_now_ns(), false, false);
+}
+
+void lx::compositor::window_manager::set_fullscreen(lx::toplevel_id id, bool on, int output,
+                                                    const char* source) {
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec)
+        return;
+    if (output >= 0 && !(outputs_ && outputs_->slot_live(static_cast<unsigned>(output))))
+        output = -1; // a wl_output whose output is gone: the window's own
+    if (wm_debug_enabled()) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "fullscreen id=%llu on=%d output=%d source=%s", id.id(),
+                      on ? 1 : 0, output, source ? source : "-");
+        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    }
+    // Before the initial configure, that configure answers it.
+    if (!rec->initial_configure_sent) {
+        rec->want_fullscreen = on;
+        rec->want_fullscreen_output = output;
+        return;
+    }
+    if (grab_.mode != grab_mode::none && grab_.toplevel == id) {
+        end_grab(grab_end_reason::release);
+        rec = toplevels_->find_mut(id);
+        if (!rec)
+            return;
+    }
+    const bool is_full = (rec->desired.states & tl_fullscreen) != 0;
+    if (on) {
+        const int slot = output >= 0 ? output : window_output(*rec);
+        if (!is_full) {
+            rec->fullscreen_was_maximized = (rec->desired.states & tl_maximized) != 0;
+            rec->fullscreen_restore_set = rec->mapped && rec->state == lx::toplevel_state::normal;
+            if (rec->fullscreen_restore_set)
+                rec->fullscreen_restore = rec->geometry;
+            else if (rec->restore_set)
+                rec->fullscreen_restore = rec->restore; // maximized: the normal geometry
+            rec->fullscreen_restore_set = rec->fullscreen_restore_set || rec->restore_set;
+        }
+        rec->fullscreen_output = slot;
+        // The whole output, no frame: xdg-shell's fullscreen size is the output's.
+        const lx::rect2i area = output_area(slot);
+        rec->desired.states |= tl_fullscreen;
+        rec->desired.states &= ~static_cast<unsigned>(tl_maximized);
+        rec->desired.size = {area.width, area.height};
+        rec->desired.place = true;
+        rec->desired.place_at = {area.x, area.y};
+        rec->desired.anchor_edges = 0;
+    } else if (is_full) {
+        rec->desired.states &= ~static_cast<unsigned>(tl_fullscreen);
+        const int slot = window_output(*rec);
+        if (rec->fullscreen_was_maximized) {
+            const lx::rect2i area = usable_area(slot);
+            const frame_extents ext = extents_for(rec->desired.decoration, true);
+            rec->desired.states |= tl_maximized;
+            rec->desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
+            rec->desired.place = true;
+            rec->desired.place_at = {area.x + ext.left, area.y + ext.top};
+        } else if (rec->fullscreen_restore_set) {
+            const frame_extents ext = extents_for(rec->desired.decoration, false);
+            const lx::point2i p = constrain_on_output(usable_area(slot),
+                                                      frame_rect(rec->fullscreen_restore, ext));
+            rec->desired.size = {rec->fullscreen_restore.width, rec->fullscreen_restore.height};
+            rec->desired.place = true;
+            rec->desired.place_at = {p.x + ext.left, p.y + ext.top};
+        } else {
+            // Fullscreen before it ever mapped: nothing to restore to; the client picks.
+            rec->desired.size = {};
+            rec->desired.place = false;
+        }
+        rec->fullscreen_restore_set = false;
     }
     // xdg-shell: answered by a configure even when the state does not change.
     rec->configure_due = true;
@@ -1123,8 +1706,8 @@ void lx::compositor::window_manager::send_configure(toplevel_record& rec,
 
     // configure_bounds only when it changed: it is a hint for the client's initial size,
     // and resending an unchanged one on every configure is noise. A server-side frame takes
-    // its extents out of what the window geometry may use.
-    const lx::rect2i area = usable_area();
+    // its extents out of what the window geometry may use. The window's own output's.
+    const lx::rect2i area = usable_area(window_output(rec));
     const frame_extents ext =
         extents_for(c.decoration, (c.states & tl_maximized) != 0);
     const lx::size2i room{area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
@@ -1189,6 +1772,10 @@ void lx::compositor::window_manager::on_initial_commit(lx::toplevel_id id) {
     if (!rec)
         return;
     rec->initial_commit_seen = true;
+    // Where it will map (M10): its parent's output, else the one under the pointer. The
+    // initial configure's bounds, a pre-map maximize and the fractional scale it is told
+    // all follow from it.
+    rec->output = placement_output(*rec);
     // 0x0: the client picks its own size. Activated, because it takes focus when it maps
     // (placeholder policy) — saying so now saves a second configure right after.
     rec->desired = {};
@@ -1201,12 +1788,29 @@ void lx::compositor::window_manager::on_initial_commit(lx::toplevel_id id) {
         // set_maximized before the initial commit: the first configure maximizes, and the
         // commit answering it maps the window in place.
         rec->want_maximized = false;
-        const lx::rect2i area = usable_area();
+        const lx::rect2i area = usable_area(rec->output);
         const frame_extents ext = extents_for(rec->desired.decoration, true);
         rec->desired.states |= tl_maximized;
         rec->desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
         rec->desired.place = true;
         rec->desired.place_at = {area.x + ext.left, area.y + ext.top};
+    }
+    if (rec->want_fullscreen) {
+        // set_fullscreen before the initial commit: the first configure is fullscreen on the
+        // output asked for (else the placement output).
+        rec->want_fullscreen = false;
+        const int slot = rec->want_fullscreen_output >= 0 && outputs_ &&
+                                 outputs_->slot_live(static_cast<unsigned>(rec->want_fullscreen_output))
+                             ? rec->want_fullscreen_output
+                             : rec->output;
+        const lx::rect2i area = output_area(slot);
+        rec->fullscreen_was_maximized = (rec->desired.states & tl_maximized) != 0;
+        rec->fullscreen_output = slot;
+        rec->desired.states |= tl_fullscreen;
+        rec->desired.states &= ~static_cast<unsigned>(tl_maximized);
+        rec->desired.size = {area.width, area.height};
+        rec->desired.place = true;
+        rec->desired.place_at = {area.x, area.y};
     }
     send_configure(*rec, wm_now_ns(), true, false);
     rec->initial_configure_sent = true;
@@ -1239,6 +1843,8 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
     decoration_mode mode = rec->decoration_current;
     bool placed = false;
     bool state_changed = false;
+    bool fullscreen_changed = false;
+    const bool was_fullscreen = rec->state == lx::toplevel_state::fullscreen;
     if (toplevel_manager::consume_ack(*rec, applied)) {
         if (applied.place) {
             // Maximize / restore: the origin the configure named, with the size the client
@@ -1250,12 +1856,18 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
         }
         applied_serial = applied.serial;
         mode = applied.decoration;
-        // The state the client now draws for. Only normal ↔ maximized is decided here.
-        const lx::toplevel_state st = (applied.states & tl_maximized)
-                                          ? lx::toplevel_state::maximized
-                                          : lx::toplevel_state::normal;
+        // The state the client now draws for: normal, maximized or fullscreen.
+        const lx::toplevel_state st = (applied.states & tl_fullscreen)
+                                          ? lx::toplevel_state::fullscreen
+                                          : (applied.states & tl_maximized)
+                                                ? lx::toplevel_state::maximized
+                                                : lx::toplevel_state::normal;
         if (rec->state != st && (rec->state == lx::toplevel_state::normal ||
-                                 rec->state == lx::toplevel_state::maximized)) {
+                                 rec->state == lx::toplevel_state::maximized ||
+                                 rec->state == lx::toplevel_state::fullscreen)) {
+            if (rec->state == lx::toplevel_state::fullscreen ||
+                st == lx::toplevel_state::fullscreen)
+                fullscreen_changed = true;
             rec->state = st;
             state_changed = true;
         }
@@ -1290,8 +1902,13 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
     if (!rec->mapped) {
         if (info.has_buffer && !rect_empty(eff)) {
             map(*rec, placed);
-            if (const auto* r = toplevels_->find(id))
+            if (auto* r = toplevels_->find_mut(id)) {
                 log_apply(*r);
+                // Mapped fullscreen (asked before its first buffer): straight into the
+                // fullscreen layer.
+                if (r->mapped && r->state == lx::toplevel_state::fullscreen)
+                    sync_fullscreen(*r, false);
+            }
         }
         return;
     }
@@ -1309,6 +1926,10 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
     // and new rects apart; a size change was damaged where the content landed.
     tree_->set_root_origin(rec->surface, {rec->geometry.x - rec->geometry_offset.x,
                                           rec->geometry.y - rec->geometry_offset.y});
+    if (fullscreen_changed)
+        sync_fullscreen(*rec, was_fullscreen);
+    else if (rec->state == lx::toplevel_state::fullscreen && !rect_equal(previous, rec->geometry))
+        sync_backdrops();
     sync_decoration(*rec);
     log_apply(*rec);
     if (state_changed && shell_)
@@ -1325,7 +1946,10 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
 }
 
 void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
-    const lx::rect2i area = usable_area();
+    // Placed on its placement output (M10), cascading among the windows there.
+    if (rec.output < 0)
+        rec.output = placement_output(rec);
+    const lx::rect2i area = usable_area(rec.output);
 
     // Stack array, not a heap one: mapping is rare, but it must not allocate either.
     // Placement is of the whole frame — a server-side title bar must land on the output too,
@@ -1418,6 +2042,8 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     // any of them that had it.
     tree_->unmap_root(rec->surface);
     toplevels_->set_mapped(id, false);
+    if (rec->state == lx::toplevel_state::fullscreen)
+        sync_backdrops();
     // The shell forgets the window (toplevel_destroyed below): its attention goes with it.
     rec->demands_attention = false;
     sync_decoration(*rec); // not mapped: the frame goes (damaged) with the window
@@ -1740,7 +2366,39 @@ bool lx::compositor::window_manager::hit_test(double x, double y, wm_hit& out) c
         out.client = lr->client;
         return out.surface_resource != nullptr;
     };
-    if (hit_layer(layer_level::overlay) || hit_layer(layer_level::top))
+    if (hit_layer(layer_level::overlay))
+        return true;
+    // A fullscreen window covers its whole output above the top layer (its backdrop takes
+    // what the window leaves): only it is reachable there (M11).
+    if (fullscreen_layer_) {
+        bool covered = false;
+        bool hit = false;
+        toplevels_->for_each_top_down([&](const toplevel_record& rec) {
+            if (rec.state != lx::toplevel_state::fullscreen || rec.fullscreen_output < 0)
+                return true;
+            const lx::rect2i area = output_area(rec.fullscreen_output);
+            if (x < area.x || y < area.y || x >= area.x + area.width || y >= area.y + area.height)
+                return true;
+            covered = true;
+            tree_hit th{};
+            if (tree_->hit(rec.surface, x, y, th)) {
+                out = {};
+                out.id = rec.id;
+                out.surface_resource =
+                    th.surface == rec.surface ? rec.surface_resource : surfaces_->resource(th.surface);
+                out.sx = th.sx;
+                out.sy = th.sy;
+                out.surface = th.surface;
+                out.root = rec.surface;
+                out.client = rec.client;
+                hit = out.surface_resource != nullptr;
+            }
+            return false;
+        });
+        if (covered)
+            return hit;
+    }
+    if (hit_layer(layer_level::top))
         return true;
     bool found = false;
     // Surface extents ∩ input region, not window geometry: a CSD client's resize margins
@@ -2576,7 +3234,9 @@ void lx::compositor::window_manager::apply_grab() {
         const lx::rect2i f = frame_rect(
             {grab_.start.x + dx, grab_.start.y + dy, rec->geometry.width, rec->geometry.height},
             ext);
-        const lx::point2i p = constrain_on_output(usable_area(), f);
+        // The title bar stays reachable on *some* output: the one the pointer drags it over
+        // (the nearest one in a gap between outputs, §A.9) — so a window crosses outputs.
+        const lx::point2i p = constrain_on_output(usable_area(pointer_output()), f);
         move_window(*rec, {p.x + ext.left, p.y + ext.top}, "move");
         return;
     }
@@ -2603,6 +3263,9 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
     auto* rec = toplevels_ ? toplevels_->find_mut(g.toplevel) : nullptr;
     const bool live = rec && rec->mapped && (reason == grab_end_reason::release ||
                                              reason == grab_end_reason::escape);
+    // The user placed it: it no longer goes back to an output it was moved off (H5).
+    if (rec && reason == grab_end_reason::release)
+        rec->home_identifier[0] = '\0';
     if (live && g.mode == grab_mode::resize) {
         // The final configure, without `resizing`, goes out through the normal flush once
         // the one in flight is answered. Escape asks for the start size, anchored to the
@@ -2646,9 +3309,21 @@ void lx::compositor::window_manager::sync_node_stacking(const toplevel_record& r
     auto* box = tree_ ? tree_->container(rec.surface) : nullptr;
     if (!box || !windows_layer_)
         return;
-    // The layer holds exactly the mapped toplevels' tree containers, in the same order, so
-    // the toplevel's stacking index is its container's index.
-    (void)windows_layer_->move_to(box, toplevels_->stacking_index(rec.id));
+    if (rec.state == lx::toplevel_state::fullscreen && fullscreen_layer_) {
+        // In the fullscreen layer, above the backdrops: a raise there is to its top.
+        (void)fullscreen_layer_->raise_to_top(box);
+    } else {
+        // The window layer holds the mapped toplevels' tree containers that are not
+        // fullscreen, in stacking order: the container's index is the number of those below.
+        unsigned below = 0;
+        const unsigned at = toplevels_->stacking_index(rec.id);
+        unsigned i = 0;
+        toplevels_->for_each_bottom_up([&](const toplevel_record& other) {
+            if (i++ < at && !(other.state == lx::toplevel_state::fullscreen && fullscreen_layer_))
+                ++below;
+        });
+        (void)windows_layer_->move_to(box, below);
+    }
     // Everything that changed lies inside the restacked window's node rects: it now covers,
     // or uncovers, part of what overlapped it.
     tree_->damage_root(rec.surface);

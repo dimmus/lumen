@@ -6,6 +6,7 @@ module;
 
 #include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,12 +42,28 @@ class server;
 
 /// Opaque bind callback: client, object id, interface version.
 using global_bind_fn = void (*)(client_connection& client, unsigned id, int version);
+/// The same with the global's own user pointer (`server::add_global_ex`); null once the
+/// global was removed (`server::remove_global`) — a bind racing the removal gets an inert
+/// object.
+using global_bind_ex_fn = void (*)(client_connection& client, unsigned id, int version,
+                                   void* user);
+
+/// A global added with `server::add_global_ex`: its table slot, and the slot's generation
+/// (a slot is reused once its old global is destroyed, so a stale handle never matches).
+struct global_handle {
+    unsigned index = ~0u;
+    unsigned generation = 0;
+    [[nodiscard]] bool valid() const { return index != ~0u; }
+};
 
 class client_connection {
 public:
     [[nodiscard]] unsigned id() const;
     [[nodiscard]] unix_credentials credentials() const;
     [[nodiscard]] bool is_privileged_shell() const;
+    /// The client runs in a sandbox (Flatpak: `/proc/<pid>/root/.flatpak-info` exists).
+    /// Checked once, at the first global filtered for it, and cached for its life.
+    [[nodiscard]] bool sandboxed();
 
     /// Native `wl_client*` (nullptr when LUMEN_HAS_WAYLAND is off).
     [[nodiscard]] void* native() const;
@@ -65,6 +82,8 @@ private:
     void* native_ = nullptr; // wl_client*
     server* server_ = nullptr;
     bool privileged_shell_ = false;
+    /// 0 not checked yet, 1 not sandboxed, 2 sandboxed.
+    unsigned char sandbox_ = 0;
 };
 
 class resource {
@@ -101,6 +120,13 @@ struct global_descriptor {
     const char* interface_name = "";
     int version = 1;
     bool privileged = false;
+    /// Hidden from sandboxed clients (`server`'s global filter, ADR 008 C5): globals that
+    /// configure or watch the whole session — output management and power, idle
+    /// notification, input methods, virtual keyboards, the session lock, layer shell — are
+    /// for same-UID tools (wlr-randr, kanshi, swayidle, fcitx5, a panel), not for a Flatpak
+    /// app. Hidden means absent from its registry, and a bind by name is refused by
+    /// libwayland as an invalid global.
+    bool deny_sandboxed = false;
     /// `const wl_interface*` — required for real `wl_global_create`.
     const void* interface_desc = nullptr;
 };
@@ -122,8 +148,28 @@ public:
     [[nodiscard]] lx::result<void> bind_socketless();
     [[nodiscard]] int dispatch(int timeout_ms);
     void flush();
+    /// Disconnects every client now (their objects' destructors run here), so an owner can
+    /// tear down while what those destructors touch is still alive. Idempotent; the
+    /// destructor does it too.
+    void destroy_clients();
 
     void add_global(global_descriptor desc, global_bind_fn bind_fn);
+    /// A global with a user pointer of its own, which can be removed again — one
+    /// `wl_output` per output (ADR 008 H4). Invalid handle when the table is full.
+    [[nodiscard]] global_handle add_global_ex(global_descriptor desc, global_bind_ex_fn bind_fn,
+                                              void* user);
+    /// Withdraws a global the safe way (wlroots' `wlr_global_destroy_safe`):
+    /// `wl_global_remove` now, so clients get `global_remove`, and `wl_global_destroy`
+    /// `k_global_destroy_delay_ns` later (`collect_globals`), so a client that binds before
+    /// it has processed the removal does not bind a destroyed global — a fatal error for it.
+    /// Binds in between reach the bind function with a null user pointer.
+    void remove_global(global_handle handle, unsigned long long now_ns);
+    /// Destroys removed globals whose delay is over and frees their table slots (the
+    /// housekeeping tick). Cheap when there is none.
+    void collect_globals(unsigned long long now_ns);
+    /// Removed globals still waiting to be destroyed.
+    [[nodiscard]] unsigned removed_global_count() const { return removed_count_; }
+    static constexpr unsigned long long k_global_destroy_delay_ns = 5'000'000'000ull;
     /// The privilege check for `zlm_shell_v1` (architecture §9): the peer runs as this
     /// session's UID **and** its executable (`/proc/<pid>/exe`, as the kernel names it) is
     /// the configured shell binary. A denial is logged at warn with both paths.
@@ -165,16 +211,29 @@ private:
     struct global_entry {
         global_descriptor desc{};
         global_bind_fn bind_fn = nullptr;
+        global_bind_ex_fn bind_ex_fn = nullptr;
+        void* user = nullptr;
         void* wl_global = nullptr; // wl_global*
         server* owner = nullptr;
+        /// Bumped whenever the slot is (re)used.
+        unsigned generation = 0;
+        /// Removed (`global_remove` sent); destroyed at `destroy_at_ns`.
+        bool removed = false;
+        unsigned long long destroy_at_ns = 0;
         bool used = false;
     };
+    /// A free table slot (one freed by `collect_globals` first), or `k_max_globals`.
+    [[nodiscard]] unsigned alloc_global_slot();
+    void create_wl_global(global_entry& slot);
 
     [[nodiscard]] lx::result<void> bind_raw_socket(const char* socket_name);
 #if defined(LUMEN_HAS_WAYLAND)
     [[nodiscard]] lx::result<void> bind_libwayland(const char* socket_name);
     static void global_bind_trampoline(struct wl_client* client, void* data, uint32_t version,
                                        uint32_t id);
+    /// `wl_display_set_global_filter`: hides `deny_sandboxed` globals from sandboxed clients.
+    static bool global_filter(const struct wl_client* client, const struct wl_global* global,
+                              void* data);
 #endif
     void close_listen();
     void remove_client_slot(unsigned index);
@@ -185,6 +244,7 @@ private:
     unsigned next_client_id_ = 1;
     global_entry globals_[k_max_globals]{};
     unsigned global_count_ = 0;
+    unsigned removed_count_ = 0;
 
     int listen_fd_ = -1;
     char socket_path_[108]{};
@@ -224,6 +284,32 @@ void lx::wayland::client_connection::set_native(void* wl_client) { native_ = wl_
 void lx::wayland::client_connection::set_server(server* s) { server_ = s; }
 void lx::wayland::client_connection::set_privileged_shell(bool privileged) {
     privileged_shell_ = privileged;
+}
+
+bool lx::wayland::client_connection::sandboxed() {
+    if (sandbox_ != 0)
+        return sandbox_ == 2;
+    sandbox_ = 1;
+#if !defined(_WIN32)
+    // The peer's pid (SO_PEERCRED at connect) names a live process while its connection is
+    // open. Flatpak puts /.flatpak-info at the root of every sandbox (xdg-desktop-portal
+    // reads the same file to identify apps); a same-UID process may look into another's
+    // root. A failed lookup other than "no such file" (the process is gone, /proc hidden)
+    // counts as not sandboxed: the global stays as it was before filters existed.
+    if (cred_.pid != 0) {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/%u/root/.flatpak-info", cred_.pid);
+        if (::access(path, F_OK) == 0) {
+            sandbox_ = 2;
+            char line[128];
+            std::snprintf(line, sizeof(line),
+                          "client pid=%u is sandboxed (Flatpak): session-wide globals hidden",
+                          cred_.pid);
+            lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+        }
+    }
+#endif
+    return sandbox_ == 2;
 }
 
 lx::wayland::resource lx::wayland::resource::create(client_connection& client,
@@ -344,7 +430,8 @@ void lx::wayland::server::advertise_pending_globals() {
         return;
     for (unsigned i = 0; i < global_count_; ++i) {
         auto& g = globals_[i];
-        if (!g.used || g.wl_global || !g.desc.interface_desc || !g.bind_fn)
+        if (!g.used || g.removed || g.wl_global || !g.desc.interface_desc ||
+            (!g.bind_fn && !g.bind_ex_fn))
             continue;
         auto* iface = static_cast<const struct wl_interface*>(g.desc.interface_desc);
         g.wl_global = wl_global_create(display_, iface, g.desc.version, &g, &global_bind_trampoline);
@@ -395,6 +482,7 @@ lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
     }
 
     wl_display_init_shm(display_);
+    wl_display_set_global_filter(display_, &global_filter, this);
 
     const char* runtime = std::getenv("XDG_RUNTIME_DIR");
     if (runtime && runtime[0] != '\0')
@@ -409,7 +497,7 @@ lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
 void lx::wayland::server::global_bind_trampoline(struct wl_client* client, void* data,
                                                  uint32_t version, uint32_t id) {
     auto* entry = static_cast<global_entry*>(data);
-    if (!entry || !entry->bind_fn || !entry->owner || !client)
+    if (!entry || (!entry->bind_fn && !entry->bind_ex_fn) || !entry->owner || !client)
         return;
 
     server* srv = entry->owner;
@@ -425,7 +513,31 @@ void lx::wayland::server::global_bind_trampoline(struct wl_client* client, void*
     }
 
     const int ver = static_cast<int>(version);
+    if (entry->bind_ex_fn) {
+        // A removed global's bind: the user pointer is gone, the object will be inert.
+        entry->bind_ex_fn(*conn, static_cast<unsigned>(id), ver,
+                          entry->removed ? nullptr : entry->user);
+        return;
+    }
     entry->bind_fn(*conn, static_cast<unsigned>(id), ver);
+}
+
+bool lx::wayland::server::global_filter(const struct wl_client* client,
+                                        const struct wl_global* global, void* data) {
+    auto* srv = static_cast<server*>(data);
+    if (!srv || !client || !global)
+        return true;
+    // Only globals of this table carry a descriptor; libwayland's own (wl_shm) are visible.
+    const auto at = reinterpret_cast<std::uintptr_t>(wl_global_get_user_data(global));
+    const auto lo = reinterpret_cast<std::uintptr_t>(srv->globals_);
+    const auto hi = reinterpret_cast<std::uintptr_t>(srv->globals_ + k_max_globals);
+    if (at < lo || at >= hi)
+        return true;
+    const auto* entry = reinterpret_cast<const global_entry*>(at);
+    if (!entry->desc.deny_sandboxed)
+        return true;
+    client_connection* conn = srv->ensure_client(const_cast<struct wl_client*>(client));
+    return !conn || !conn->sandboxed();
 }
 #else
 void lx::wayland::server::advertise_pending_globals() {}
@@ -460,6 +572,7 @@ lx::result<void> lx::wayland::server::bind_socketless() {
                               "wl_display_create failed");
     }
     raise_client_buffers(display_);
+    wl_display_set_global_filter(display_, &global_filter, this);
     bound_ = true;
     return {};
 #else
@@ -496,6 +609,13 @@ int lx::wayland::server::dispatch(int timeout_ms) {
     return 0;
 }
 
+void lx::wayland::server::destroy_clients() {
+#if defined(LUMEN_HAS_WAYLAND)
+    if (display_)
+        wl_display_destroy_clients(display_);
+#endif
+}
+
 void lx::wayland::server::flush() {
 #if defined(LUMEN_HAS_WAYLAND)
     if (display_)
@@ -503,15 +623,97 @@ void lx::wayland::server::flush() {
 #endif
 }
 
-void lx::wayland::server::add_global(global_descriptor desc, global_bind_fn bind_fn) {
-    if (global_count_ >= k_max_globals) {
+unsigned lx::wayland::server::alloc_global_slot() {
+    for (unsigned i = 0; i < global_count_; ++i)
+        if (!globals_[i].used)
+            return i;
+    return global_count_ < k_max_globals ? global_count_++ : k_max_globals;
+}
+
+void lx::wayland::server::create_wl_global(global_entry& slot) {
+#if defined(LUMEN_HAS_WAYLAND)
+    if (display_ && bound_) {
+        auto* iface = static_cast<const struct wl_interface*>(slot.desc.interface_desc);
+        slot.wl_global =
+            wl_global_create(display_, iface, slot.desc.version, &slot, &global_bind_trampoline);
+        if (!slot.wl_global) {
+            lx::trace::logger::global().log_error(
+                lx::make_error(lx::error_domain::wayland,
+                               static_cast<int>(lx::wayland_err::bind_failed),
+                               "wl_global_create failed"),
+                "wayland");
+        }
+    }
+#else
+    (void)slot;
+#endif
+}
+
+lx::wayland::global_handle lx::wayland::server::add_global_ex(global_descriptor desc,
+                                                              global_bind_ex_fn bind_fn,
+                                                              void* user) {
+    if (!bind_fn || !desc.interface_desc) {
+        lx::trace::logger::global().log(lx::trace::level::warn, "wayland",
+                                        "add_global_ex without a bind function or interface");
+        return {};
+    }
+    const unsigned index = alloc_global_slot();
+    if (index >= k_max_globals) {
         lx::trace::logger::global().log_error(
             lx::make_error(lx::error_domain::wayland,
                            static_cast<int>(lx::wayland_err::bind_failed),
                            "global table full — interface not advertised"),
             "wayland");
-        return;
+        return {};
     }
+    auto& slot = globals_[index];
+    const unsigned generation = slot.generation + 1;
+    slot = {};
+    slot.desc = desc;
+    slot.bind_ex_fn = bind_fn;
+    slot.user = user;
+    slot.owner = this;
+    slot.used = true;
+    slot.generation = generation;
+    create_wl_global(slot);
+    return {index, generation};
+}
+
+void lx::wayland::server::remove_global(global_handle handle, unsigned long long now_ns) {
+    if (!handle.valid() || handle.index >= global_count_)
+        return;
+    auto& slot = globals_[handle.index];
+    if (!slot.used || slot.removed || slot.generation != handle.generation)
+        return;
+    slot.removed = true;
+    slot.user = nullptr;
+    slot.destroy_at_ns = now_ns + k_global_destroy_delay_ns;
+    ++removed_count_;
+#if defined(LUMEN_HAS_WAYLAND)
+    if (slot.wl_global)
+        wl_global_remove(static_cast<wl_global*>(slot.wl_global));
+#endif
+}
+
+void lx::wayland::server::collect_globals(unsigned long long now_ns) {
+    if (removed_count_ == 0)
+        return;
+    for (unsigned i = 0; i < global_count_; ++i) {
+        auto& slot = globals_[i];
+        if (!slot.used || !slot.removed || now_ns < slot.destroy_at_ns)
+            continue;
+#if defined(LUMEN_HAS_WAYLAND)
+        if (slot.wl_global)
+            wl_global_destroy(static_cast<wl_global*>(slot.wl_global));
+#endif
+        const unsigned generation = slot.generation;
+        slot = {};
+        slot.generation = generation;
+        --removed_count_;
+    }
+}
+
+void lx::wayland::server::add_global(global_descriptor desc, global_bind_fn bind_fn) {
     if (!bind_fn) {
         lx::trace::logger::global().log(lx::trace::level::warn, "wayland",
                                         "add_global with null bind_fn — not advertised");
@@ -522,29 +724,24 @@ void lx::wayland::server::add_global(global_descriptor desc, global_bind_fn bind
                                         "add_global with null interface_desc — not advertised");
         return;
     }
-
-    auto& slot = globals_[global_count_];
+    const unsigned index = alloc_global_slot();
+    if (index >= k_max_globals) {
+        lx::trace::logger::global().log_error(
+            lx::make_error(lx::error_domain::wayland,
+                           static_cast<int>(lx::wayland_err::bind_failed),
+                           "global table full — interface not advertised"),
+            "wayland");
+        return;
+    }
+    auto& slot = globals_[index];
+    const unsigned generation = slot.generation + 1;
+    slot = {};
     slot.desc = desc;
     slot.bind_fn = bind_fn;
-    slot.wl_global = nullptr;
     slot.owner = this;
     slot.used = true;
-    ++global_count_;
-
-#if defined(LUMEN_HAS_WAYLAND)
-    if (display_ && bound_) {
-        auto* iface = static_cast<const struct wl_interface*>(desc.interface_desc);
-        slot.wl_global =
-            wl_global_create(display_, iface, desc.version, &slot, &global_bind_trampoline);
-        if (!slot.wl_global) {
-            lx::trace::logger::global().log_error(
-                lx::make_error(lx::error_domain::wayland,
-                               static_cast<int>(lx::wayland_err::bind_failed),
-                               "wl_global_create failed"),
-                "wayland");
-        }
-    }
-#endif
+    slot.generation = generation;
+    create_wl_global(slot);
 }
 
 bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,

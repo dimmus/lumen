@@ -22,6 +22,7 @@ module;
 #include <wayland-client.h>
 #include "cursor-shape-v1-client-protocol.h"
 #include "zlm_shell_v1-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
 #if __has_include("xdg-activation-v1-client-protocol.h")
 #include "xdg-activation-v1-client-protocol.h"
 #define LUMEN_SHELL_ACTIVATION 1
@@ -75,7 +76,8 @@ struct shell_config {
 ///
 /// One thread. It binds zlm_shell_v1 (the compositor accepts that only from its configured
 /// shell binary), keeps the window list from zlm_policy_bridge_v1, and shows it as a top
-/// panel on wlr-layer-shell. It also launches applications: the panel's Apps button and the
+/// panel on wlr-layer-shell — one per output, each listing the windows on its output (ADR
+/// 008 M13; waybar's default, Plasma's "only tasks from the current screen"). It also launches applications: the panel's Apps button and the
 /// Super tap (a zlm_shell_v1 v4 key grab) toggle the launcher, Super+Return starts a
 /// terminal, and every launch is its own systemd user service (app_launch). It is also the
 /// default idle policy: after `--blank-after` seconds without input (idle inhibitors obeyed;
@@ -99,7 +101,6 @@ public:
 
     [[nodiscard]] policy_registry& policies();
     [[nodiscard]] policy_bridge& bridge() { return bridge_; }
-    [[nodiscard]] panel& primary_panel() { return panel_; }
 
     /// Registry, seat and activation bookkeeping (defined with the listeners).
     struct events;
@@ -118,6 +119,27 @@ private:
         t_count
     };
     enum class pointer_target : unsigned char { none, panel, launcher };
+    /// One bound wl_output: its xdg-output rect, its panel and its power control. Created on
+    /// `global`, destroyed on `global_remove` (panel first) — never per frame.
+    struct output_record {
+        shell_app* app = nullptr;
+        void* output = nullptr; // wl_output*
+        unsigned name = 0;      // registry name
+        void* xdg = nullptr;    // zxdg_output_v1*
+        char connector[32]{};
+        /// Logical rect (xdg-output; else the mode over the scale at the origin).
+        lx::rect2i logical{};
+        bool have_xdg = false;
+        int mode_w = 0;
+        int mode_h = 0;
+        int scale = 1;
+        /// The first wl_output.done arrived: the state above is complete.
+        bool done = false;
+        std::unique_ptr<panel> bar{};
+        void* power = nullptr; // zwlr_output_power_v1*
+        /// zwlr_output_power_v1.mode: off.
+        bool off = false;
+    };
     struct pending_token {
         void* token = nullptr; // xdg_activation_token_v1*
         std::unique_ptr<prepared_launch> launch;
@@ -153,11 +175,30 @@ private:
     // ── Keyboard ──
     void on_key(unsigned serial, unsigned code, bool pressed);
 
+    // ── Outputs ──
+    /// The output's first done (or the setup, for outputs bound before it): its panel and
+    /// its power control.
+    void output_ready(output_record& o);
+    /// The output's global went: its panel and objects go.
+    void remove_output(unsigned name);
+    void destroy_output(output_record& o);
+    [[nodiscard]] output_record* output_of_panel_surface(void* surface);
+    /// Where the launcher opens (M13): the active window's output, else the one whose panel
+    /// was last pointed at, else the first.
+    [[nodiscard]] output_record* launcher_output();
+    /// Every panel's task filter after the outputs' rects changed.
+    void outputs_moved();
+    [[nodiscard]] bool any_panel_drawn() const;
+    void set_apps_all(bool open);
+    void set_notice_all(const char* text);
+
     // ── Idle policy ──
-    /// After the binds: the idle notification and the output's power control, as the policy
-    /// asks; logs why not otherwise.
+    /// After the binds: the idle notification and the outputs' power controls, as the
+    /// policy asks; logs why not otherwise.
     void setup_idle();
     void teardown_idle();
+    /// The power control of one output (for one bound after the setup too).
+    void add_power(output_record& o);
     /// Powers every output off (zwlr_output_power_v1), logging `why`.
     void blank_outputs(const char* why);
 
@@ -172,7 +213,12 @@ private:
 
     shell_config config_{};
     policy_bridge bridge_{};
-    panel panel_{};
+    std::vector<std::unique_ptr<output_record>> outputs_{};
+    /// The panels exist (after the setup): an output bound later gets its panel at its done.
+    bool panels_enabled_ = false;
+    /// The panel the pointer is on, and the output whose panel was pointed at last.
+    panel* pointer_panel_ = nullptr;
+    unsigned last_panel_output_ = 0;
     app_catalog catalog_{};
     launcher launcher_{};
     app_launcher apps_{};
@@ -185,17 +231,16 @@ private:
     void* layer_shell_ = nullptr;  // zwlr_layer_shell_v1*
     void* shell_ = nullptr;        // zlm_shell_v1*
     void* cursor_shape_ = nullptr; // wp_cursor_shape_manager_v1*
-    void* output_ = nullptr;       // wl_output*
+    void* xdg_output_manager_ = nullptr; // zxdg_output_manager_v1*
     void* activation_ = nullptr;   // xdg_activation_v1*
     void* viewporter_ = nullptr;   // wp_viewporter*
     void* fractional_ = nullptr;   // wp_fractional_scale_manager_v1*
     void* idle_notifier_ = nullptr;      // ext_idle_notifier_v1*
     void* idle_notification_ = nullptr;  // ext_idle_notification_v1*
     void* power_manager_ = nullptr;      // zwlr_output_power_manager_v1*
-    void* output_power_ = nullptr;       // zwlr_output_power_v1*
+    /// Blanking is set up (the power controls are made per output, also for later ones).
+    bool power_enabled_ = false;
     void* locked_notification_ = nullptr; // ext_idle_notification_v1* (while locked)
-    /// The outputs are off (zwlr_output_power_v1.mode): a second blank request is not sent.
-    bool outputs_off_ = false;
     idle_policy idle_{};
     void* pointer_ = nullptr;      // wl_pointer*
     void* keyboard_ = nullptr;     // wl_keyboard*
@@ -203,9 +248,6 @@ private:
     unsigned compositor_version_ = 0;
     unsigned seat_name_ = 0;
     unsigned seat_version_ = 0;
-    unsigned output_name_ = 0;
-    int output_w_ = 0;
-    int output_h_ = 0;
     int timer_fd_ = -1;
     long long deadline_[t_count]{};
     pointer_target pointer_target_ = pointer_target::none;
@@ -289,25 +331,62 @@ struct lx::shell::shell_app::events {
     static void global(void* data, wl_registry* reg, uint32_t name, const char* iface,
                        uint32_t version);
     static void global_remove(void* data, wl_registry*, uint32_t name) {
-        auto& a = self(data);
-        if (name == a.output_name_ && a.output_) {
-            wl_output_destroy(static_cast<wl_output*>(a.output_));
-            a.output_ = nullptr;
-            a.output_name_ = 0;
-        }
+        self(data).remove_output(name);
     }
 
-    // ── wl_output (v2): the size the launcher is fitted to ──
-    static void output_geometry(void*, wl_output*, int32_t, int32_t, int32_t, int32_t, int32_t,
-                                const char*, const char*, int32_t) {}
-    static void output_mode(void* data, wl_output*, uint32_t flags, int32_t w, int32_t h, int32_t) {
-        if (flags & WL_OUTPUT_MODE_CURRENT) {
-            self(data).output_w_ = w;
-            self(data).output_h_ = h;
+    // ── wl_output (v4): one record each; the panel at its first done ──
+    static output_record& out(void* data) { return *static_cast<output_record*>(data); }
+    static void output_geometry(void* data, wl_output*, int32_t x, int32_t y, int32_t, int32_t,
+                                int32_t, const char*, const char*, int32_t) {
+        auto& o = out(data);
+        if (!o.have_xdg) {
+            o.logical.x = x;
+            o.logical.y = y;
         }
     }
-    static void output_done(void*, wl_output*) {}
-    static void output_scale(void*, wl_output*, int32_t) {}
+    static void output_mode(void* data, wl_output*, uint32_t flags, int32_t w, int32_t h, int32_t) {
+        if (flags & WL_OUTPUT_MODE_CURRENT) {
+            out(data).mode_w = w;
+            out(data).mode_h = h;
+        }
+    }
+    static void output_done(void* data, wl_output*) {
+        auto& o = out(data);
+        if (!o.have_xdg && o.mode_w > 0) {
+            // No xdg-output: the mode over the integer scale (logical for integer scales).
+            const int sc = o.scale > 0 ? o.scale : 1;
+            o.logical.width = o.mode_w / sc;
+            o.logical.height = o.mode_h / sc;
+        }
+        const bool first = !o.done;
+        o.done = true;
+        if (first)
+            o.app->output_ready(o);
+        else
+            o.app->outputs_moved();
+    }
+    static void output_scale(void* data, wl_output*, int32_t factor) { out(data).scale = factor; }
+    static void output_name(void* data, wl_output*, const char* name) {
+        std::snprintf(out(data).connector, sizeof(out(data).connector), "%s", name ? name : "");
+    }
+    static void output_description(void*, wl_output*, const char*) {}
+
+    // ── zxdg_output_v1 (v3: closed by wl_output.done) ──
+    static void xdg_position(void* data, zxdg_output_v1*, int32_t x, int32_t y) {
+        auto& o = out(data);
+        o.have_xdg = true;
+        o.logical.x = x;
+        o.logical.y = y;
+    }
+    static void xdg_size(void* data, zxdg_output_v1*, int32_t w, int32_t h) {
+        auto& o = out(data);
+        o.have_xdg = true;
+        o.logical.width = w;
+        o.logical.height = h;
+    }
+    static void xdg_done(void*, zxdg_output_v1*) {}
+    static void xdg_name(void*, zxdg_output_v1*, const char*) {}
+    static void xdg_description(void*, zxdg_output_v1*, const char*) {}
 
     // ── wl_seat ──
     static void seat_caps(void* data, wl_seat* seat, uint32_t caps);
@@ -322,9 +401,11 @@ struct lx::shell::shell_app::events {
                 static_cast<wp_cursor_shape_device_v1*>(a.cursor_device_), serial,
                 WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
         const double px = wl_fixed_to_double(x), py = wl_fixed_to_double(y);
-        if (s && s == a.panel_.surface()) {
+        if (output_record* o = s ? a.output_of_panel_surface(s) : nullptr) {
             a.pointer_target_ = pointer_target::panel;
-            a.panel_.pointer_enter(px, py);
+            a.pointer_panel_ = o->bar.get();
+            a.last_panel_output_ = o->name;
+            a.pointer_panel_->pointer_enter(px, py);
         } else if (s && s == a.launcher_.surface()) {
             a.pointer_target_ = pointer_target::launcher;
             a.launcher_.pointer_enter(px, py);
@@ -334,17 +415,18 @@ struct lx::shell::shell_app::events {
     }
     static void ptr_leave(void* data, wl_pointer*, uint32_t, wl_surface*) {
         auto& a = self(data);
-        if (a.pointer_target_ == pointer_target::panel)
-            a.panel_.pointer_leave();
+        if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
+            a.pointer_panel_->pointer_leave();
         else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_leave();
+        a.pointer_panel_ = nullptr;
         a.pointer_target_ = pointer_target::none;
     }
     static void ptr_motion(void* data, wl_pointer*, uint32_t, wl_fixed_t x, wl_fixed_t y) {
         auto& a = self(data);
         const double px = wl_fixed_to_double(x), py = wl_fixed_to_double(y);
-        if (a.pointer_target_ == pointer_target::panel)
-            a.panel_.pointer_motion(px, py);
+        if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
+            a.pointer_panel_->pointer_motion(px, py);
         else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_motion(px, py);
     }
@@ -352,8 +434,8 @@ struct lx::shell::shell_app::events {
                            uint32_t state) {
         auto& a = self(data);
         const bool down = state == WL_POINTER_BUTTON_STATE_PRESSED;
-        if (a.pointer_target_ == pointer_target::panel)
-            a.panel_.pointer_button(button, down);
+        if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
+            a.pointer_panel_->pointer_button(button, down);
         else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_button(serial, button, down);
     }
@@ -406,7 +488,7 @@ struct lx::shell::shell_app::events {
         if (s && s == a.launcher_.surface()) {
             a.launcher_.keyboard_leave();
             if (!a.launcher_.is_open())
-                a.panel_.set_apps(true, false);
+                a.set_apps_all(false);
         }
     }
     static void kb_key(void* data, wl_keyboard*, uint32_t serial, uint32_t, uint32_t key,
@@ -448,6 +530,15 @@ const wl_output_listener k_output_listener = {
     .mode = lx::shell::shell_app::events::output_mode,
     .done = lx::shell::shell_app::events::output_done,
     .scale = lx::shell::shell_app::events::output_scale,
+    .name = lx::shell::shell_app::events::output_name,
+    .description = lx::shell::shell_app::events::output_description,
+};
+const zxdg_output_v1_listener k_xdg_output_listener = {
+    .logical_position = lx::shell::shell_app::events::xdg_position,
+    .logical_size = lx::shell::shell_app::events::xdg_size,
+    .done = lx::shell::shell_app::events::xdg_done,
+    .name = lx::shell::shell_app::events::xdg_name,
+    .description = lx::shell::shell_app::events::xdg_description,
 };
 const wl_seat_listener k_seat_listener = {
     .capabilities = lx::shell::shell_app::events::seat_caps,
@@ -552,10 +643,34 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         a.seat_version_ = version;
         a.seat_ = wl_registry_bind(reg, name, &wl_seat_interface, min_version(version, 5));
         wl_seat_add_listener(static_cast<wl_seat*>(a.seat_), &k_seat_listener, &a);
-    } else if (std::strcmp(iface, wl_output_interface.name) == 0 && !a.output_) {
-        a.output_name_ = name;
-        a.output_ = wl_registry_bind(reg, name, &wl_output_interface, min_version(version, 2));
-        wl_output_add_listener(static_cast<wl_output*>(a.output_), &k_output_listener, &a);
+    } else if (std::strcmp(iface, wl_output_interface.name) == 0) {
+        // Every output (v4: its name); a record each, its panel at its first done.
+        auto rec = std::make_unique<output_record>();
+        rec->app = &a;
+        rec->name = name;
+        rec->output = wl_registry_bind(reg, name, &wl_output_interface, min_version(version, 4));
+        wl_output_add_listener(static_cast<wl_output*>(rec->output), &k_output_listener, rec.get());
+        if (a.xdg_output_manager_) {
+            rec->xdg = zxdg_output_manager_v1_get_xdg_output(
+                static_cast<zxdg_output_manager_v1*>(a.xdg_output_manager_),
+                static_cast<wl_output*>(rec->output));
+            zxdg_output_v1_add_listener(static_cast<zxdg_output_v1*>(rec->xdg),
+                                        &k_xdg_output_listener, rec.get());
+        }
+        a.outputs_.push_back(std::move(rec));
+    } else if (std::strcmp(iface, zxdg_output_manager_v1_interface.name) == 0) {
+        // v3: zxdg_output_v1 closed by wl_output.done. Outputs bound before it get theirs now.
+        a.xdg_output_manager_ =
+            wl_registry_bind(reg, name, &zxdg_output_manager_v1_interface, min_version(version, 3));
+        for (auto& rec : a.outputs_) {
+            if (rec->xdg)
+                continue;
+            rec->xdg = zxdg_output_manager_v1_get_xdg_output(
+                static_cast<zxdg_output_manager_v1*>(a.xdg_output_manager_),
+                static_cast<wl_output*>(rec->output));
+            zxdg_output_v1_add_listener(static_cast<zxdg_output_v1*>(rec->xdg),
+                                        &k_xdg_output_listener, rec.get());
+        }
     } else if (std::strcmp(iface, zwlr_layer_shell_v1_interface.name) == 0) {
         a.layer_shell_ = wl_registry_bind(reg, name, &zwlr_layer_shell_v1_interface,
                                           min_version(version, 4));
@@ -677,32 +792,42 @@ void lx::shell::shell_app::events::resumed(void* data, ext_idle_notification_v1*
 }
 
 void lx::shell::shell_app::events::power_mode(void* data, zwlr_output_power_v1*, uint32_t mode) {
-    self(data).outputs_off_ = mode == ZWLR_OUTPUT_POWER_V1_MODE_OFF;
-    if (shell_debug())
-        lx::trace::logger::global().log(lx::trace::level::debug, "shell.idle",
-                                        mode == ZWLR_OUTPUT_POWER_V1_MODE_ON ? "output power on"
-                                                                             : "output power off");
+    auto& o = out(data);
+    o.off = mode == ZWLR_OUTPUT_POWER_V1_MODE_OFF;
+    if (shell_debug()) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "output power %s (%s)", o.off ? "off" : "on",
+                      o.connector);
+        lx::trace::logger::global().log(lx::trace::level::debug, "shell.idle", line);
+    }
 }
 
 void lx::shell::shell_app::events::power_failed(void* data, zwlr_output_power_v1* p) {
-    auto& a = self(data);
-    lx::trace::logger::global().log(lx::trace::level::warn, "shell.idle",
-                                    "output power control failed (the output went?) — blanking "
-                                    "is off until the shell restarts");
+    auto& o = out(data);
+    char line[128];
+    std::snprintf(line, sizeof(line),
+                  "output power control failed (output %s went?) — not blanked any more",
+                  o.connector);
+    lx::trace::logger::global().log(lx::trace::level::warn, "shell.idle", line);
     zwlr_output_power_v1_destroy(p);
-    if (a.output_power_ == p)
-        a.output_power_ = nullptr;
+    if (o.power == p)
+        o.power = nullptr;
 }
 #endif
 
 void lx::shell::shell_app::blank_outputs(const char* why) {
     set_timer(t_lock_blank, 0);
 #if defined(LUMEN_SHELL_IDLE)
-    if (!output_power_ || outputs_off_)
+    bool any = false;
+    for (auto& o : outputs_)
+        any = any || (o->power && !o->off);
+    if (!any)
         return; // already dark (the other timeout, or the lock's blank, came first)
     lx::trace::logger::global().log(lx::trace::level::info, "shell.idle", why);
-    zwlr_output_power_v1_set_mode(static_cast<zwlr_output_power_v1*>(output_power_),
-                                  ZWLR_OUTPUT_POWER_V1_MODE_OFF);
+    for (auto& o : outputs_)
+        if (o->power && !o->off)
+            zwlr_output_power_v1_set_mode(static_cast<zwlr_output_power_v1*>(o->power),
+                                          ZWLR_OUTPUT_POWER_V1_MODE_OFF);
 #else
     (void)why;
 #endif
@@ -710,8 +835,8 @@ void lx::shell::shell_app::blank_outputs(const char* why) {
 
 void lx::shell::shell_app::update_locked_notification() {
 #if defined(LUMEN_SHELL_IDLE)
-    const unsigned timeout_ms = idle_.locked_timeout_ms(
-        idle_notifier_ != nullptr, power_manager_ != nullptr && output_power_ != nullptr);
+    const unsigned timeout_ms =
+        idle_.locked_timeout_ms(idle_notifier_ != nullptr, power_manager_ != nullptr && power_enabled_);
     if (timeout_ms != 0 && !locked_notification_ && seat_) {
         locked_notification_ = ext_idle_notifier_v1_get_idle_notification(
             static_cast<ext_idle_notifier_v1*>(idle_notifier_), timeout_ms,
@@ -736,20 +861,20 @@ void lx::shell::shell_app::setup_idle() {
     }
 #if defined(LUMEN_SHELL_IDLE)
     const unsigned timeout_ms = idle_.blank_timeout_ms(idle_notifier_ != nullptr,
-                                                       power_manager_ != nullptr && output_);
+                                                       power_manager_ != nullptr && !outputs_.empty());
     if (timeout_ms == 0) {
         char line[160];
         std::snprintf(line, sizeof(line), "no screen blanking:%s%s%s",
                       config_.idle.blank_after_s == 0 ? " --blank-after 0" : "",
                       !idle_notifier_ ? " no ext_idle_notifier_v1" : "",
-                      !power_manager_ || !output_ ? " no zwlr_output_power_manager_v1" : "");
+                      !power_manager_ || outputs_.empty() ? " no zwlr_output_power_manager_v1" : "");
         lx::trace::logger::global().log(lx::trace::level::info, "shell.idle", line);
         return;
     }
-    output_power_ = zwlr_output_power_manager_v1_get_output_power(
-        static_cast<zwlr_output_power_manager_v1*>(power_manager_), static_cast<wl_output*>(output_));
-    zwlr_output_power_v1_add_listener(static_cast<zwlr_output_power_v1*>(output_power_),
-                                      &k_power_listener, this);
+    // One power control per output, for outputs that come later too (M13).
+    power_enabled_ = true;
+    for (auto& o : outputs_)
+        add_power(*o);
     if (seat_) {
         idle_notification_ = ext_idle_notifier_v1_get_idle_notification(
             static_cast<ext_idle_notifier_v1*>(idle_notifier_), timeout_ms,
@@ -778,13 +903,183 @@ void lx::shell::shell_app::teardown_idle() {
         ext_idle_notification_v1_destroy(static_cast<ext_idle_notification_v1*>(idle_notification_));
     if (idle_notifier_)
         ext_idle_notifier_v1_destroy(static_cast<ext_idle_notifier_v1*>(idle_notifier_));
-    if (output_power_)
-        zwlr_output_power_v1_destroy(static_cast<zwlr_output_power_v1*>(output_power_));
+    for (auto& o : outputs_) {
+        if (o->power)
+            zwlr_output_power_v1_destroy(static_cast<zwlr_output_power_v1*>(o->power));
+        o->power = nullptr;
+    }
     if (power_manager_)
         zwlr_output_power_manager_v1_destroy(
             static_cast<zwlr_output_power_manager_v1*>(power_manager_));
 #endif
-    idle_notification_ = idle_notifier_ = output_power_ = power_manager_ = nullptr;
+    power_enabled_ = false;
+    idle_notification_ = idle_notifier_ = power_manager_ = nullptr;
+}
+
+void lx::shell::shell_app::add_power(output_record& o) {
+#if defined(LUMEN_SHELL_IDLE)
+    if (!power_enabled_ || !power_manager_ || o.power || !o.output)
+        return;
+    o.power = zwlr_output_power_manager_v1_get_output_power(
+        static_cast<zwlr_output_power_manager_v1*>(power_manager_), static_cast<wl_output*>(o.output));
+    zwlr_output_power_v1_add_listener(static_cast<zwlr_output_power_v1*>(o.power),
+                                      &k_power_listener, &o);
+#else
+    (void)o;
+#endif
+}
+
+// ── Outputs ──
+
+lx::shell::shell_app::output_record* lx::shell::shell_app::output_of_panel_surface(void* surface) {
+    for (auto& o : outputs_)
+        if (o->bar && o->bar->surface() == surface)
+            return o.get();
+    return nullptr;
+}
+
+bool lx::shell::shell_app::any_panel_drawn() const {
+    for (const auto& o : outputs_)
+        if (o->bar && o->bar->first_frame_committed())
+            return true;
+    return false;
+}
+
+void lx::shell::shell_app::set_apps_all(bool open) {
+    for (auto& o : outputs_)
+        if (o->bar)
+            o->bar->set_apps(true, open);
+}
+
+void lx::shell::shell_app::set_notice_all(const char* text) {
+    for (auto& o : outputs_)
+        if (o->bar)
+            o->bar->set_notice(text);
+}
+
+void lx::shell::shell_app::output_ready(output_record& o) {
+    add_power(o);
+    if (!panels_enabled_ || o.bar)
+        return;
+    o.bar = std::make_unique<panel>();
+    o.bar->set_apps(true, launcher_.is_open());
+    o.bar->set_action_handler(
+        [](panel_action action, void* user) {
+            auto& a = *static_cast<shell_app*>(user);
+            if (action == panel_action::apps)
+                a.toggle_launcher();
+            else if (action == panel_action::task && a.launcher_.is_open())
+                a.close_launcher();
+        },
+        this);
+    // This output's windows only: the one each overlaps most among the outputs.
+    o.bar->set_filter({[](const task_entry& e, void* user) {
+                           const auto& rec = *static_cast<const output_record*>(user);
+                           const auto& all = rec.app->outputs_;
+                           lx::rect2i rects[16];
+                           unsigned n = 0;
+                           unsigned self = 0;
+                           for (const auto& other : all) {
+                               if (n == 16 || !other->done)
+                                   continue;
+                               if (other.get() == &rec)
+                                   self = n;
+                               rects[n++] = other->logical;
+                           }
+                           const int at = task_output(e.geometry, rects, n);
+                           // A window on no output is listed by the first panel, never lost.
+                           return at < 0 ? self == 0 : static_cast<unsigned>(at) == self;
+                       },
+                       &o});
+    if (auto created = o.bar->create({.compositor = compositor_,
+                                      .shm = shm_,
+                                      .layer_shell = layer_shell_,
+                                      .viewporter = viewporter_,
+                                      .fractional = fractional_},
+                                     bridge_, o.output);
+        !created) {
+        lx::trace::logger::global().log_error(created.get_error(), k_shell_category);
+        o.bar.reset();
+        return;
+    }
+    char line[128];
+    std::snprintf(line, sizeof(line), "panel requested on output %s (%dx%d+%d+%d)", o.connector,
+                  o.logical.width, o.logical.height, o.logical.x, o.logical.y);
+    shell_log(lx::trace::level::info, line);
+    outputs_moved();
+}
+
+void lx::shell::shell_app::outputs_moved() {
+    for (auto& o : outputs_)
+        if (o->bar)
+            o->bar->filter_changed();
+}
+
+void lx::shell::shell_app::destroy_output(output_record& o) {
+    if (o.bar.get() == pointer_panel_) {
+        pointer_panel_ = nullptr;
+        if (pointer_target_ == pointer_target::panel)
+            pointer_target_ = pointer_target::none;
+    }
+    if (o.bar)
+        o.bar->destroy();
+    o.bar.reset();
+#if defined(LUMEN_SHELL_IDLE)
+    if (o.power)
+        zwlr_output_power_v1_destroy(static_cast<zwlr_output_power_v1*>(o.power));
+#endif
+    o.power = nullptr;
+    if (o.xdg)
+        zxdg_output_v1_destroy(static_cast<zxdg_output_v1*>(o.xdg));
+    o.xdg = nullptr;
+    if (o.output) {
+        if (wl_output_get_version(static_cast<wl_output*>(o.output)) >= WL_OUTPUT_RELEASE_SINCE_VERSION)
+            wl_output_release(static_cast<wl_output*>(o.output));
+        else
+            wl_output_destroy(static_cast<wl_output*>(o.output));
+    }
+    o.output = nullptr;
+}
+
+void lx::shell::shell_app::remove_output(unsigned name) {
+    for (auto it = outputs_.begin(); it != outputs_.end(); ++it) {
+        if ((*it)->name != name)
+            continue;
+        char line[96];
+        std::snprintf(line, sizeof(line), "output %s removed: its panel goes", (*it)->connector);
+        shell_log(lx::trace::level::info, line);
+        destroy_output(**it);
+        outputs_.erase(it);
+        outputs_moved();
+        return;
+    }
+}
+
+lx::shell::shell_app::output_record* lx::shell::shell_app::launcher_output() {
+    output_record* first = nullptr;
+    output_record* pointed = nullptr;
+    lx::rect2i rects[16];
+    output_record* recs[16];
+    unsigned n = 0;
+    for (auto& o : outputs_) {
+        if (!o->done)
+            continue;
+        if (!first)
+            first = o.get();
+        if (o->name == last_panel_output_)
+            pointed = o.get();
+        if (n < 16) {
+            recs[n] = o.get();
+            rects[n++] = o->logical;
+        }
+    }
+    // The active window's output (KRunner's "active screen").
+    if (const task_entry* e = bridge_.model().get(bridge_.model().focused())) {
+        const int at = task_output(e->geometry, rects, n);
+        if (at >= 0)
+            return recs[at];
+    }
+    return pointed ? pointed : first;
 }
 
 int lx::shell::shell_app::fail(const char* what) {
@@ -831,7 +1126,7 @@ void lx::shell::shell_app::on_timer() {
     }
     if (deadline_[t_notice] && deadline_[t_notice] <= now) {
         deadline_[t_notice] = 0;
-        panel_.set_notice(nullptr);
+        set_notice_all(nullptr);
     }
     if (deadline_[t_debounce] && deadline_[t_debounce] <= now) {
         deadline_[t_debounce] = 0;
@@ -954,7 +1249,7 @@ void lx::shell::shell_app::on_key(unsigned serial, unsigned code, bool pressed) 
         set_timer(t_repeat, 0);
     }
     if (!launcher_.is_open())
-        panel_.set_apps(true, false);
+        set_apps_all(false);
 }
 
 // ── Launching ──
@@ -969,26 +1264,29 @@ void lx::shell::shell_app::ensure_catalog() {
 
 void lx::shell::shell_app::open_launcher() {
     ensure_catalog();
-    // Logical: the panel spans the output (its configured width), and wl_output's mode is
-    // in pixels — divided by the output's scale, as the panel's surface was told it.
-    const unsigned s120 = panel_.scale120() ? panel_.scale120() : 120;
-    const int w = panel_.width() > 0 ? panel_.width()
-                                     : static_cast<int>((static_cast<long>(output_w_) * 120 + s120 / 2) / s120);
-    const int h = output_h_ > 0 ? static_cast<int>((static_cast<long>(output_h_) * 120 + s120 / 2) / s120)
-                                : 768;
-    if (!launcher_.open(w, h, k_panel_height)) {
+    // On the active window's output, else the one whose panel was pointed at last (M13),
+    // sized to its logical rect (xdg-output).
+    output_record* o = launcher_output();
+    const int w = o && o->logical.width > 0 ? o->logical.width : 1024;
+    const int h = o && o->logical.height > 0 ? o->logical.height : 768;
+    if (!launcher_.open(w, h, k_panel_height, o ? o->output : nullptr)) {
         shell_log(lx::trace::level::warn, "launcher: cannot open");
         return;
     }
-    panel_.set_apps(true, true);
+    if (o && shell_debug()) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "launcher on output %s", o->connector);
+        shell_log(lx::trace::level::debug, line);
+    }
+    set_apps_all(true);
     // A panel notice belongs to the closed launcher; the launcher has its own status row.
-    panel_.set_notice(nullptr);
+    set_notice_all(nullptr);
     set_timer(t_notice, 0);
 }
 
 void lx::shell::shell_app::close_launcher() {
     launcher_.close();
-    panel_.set_apps(true, false);
+    set_apps_all(false);
     repeat_code_ = 0;
     set_timer(t_repeat, 0);
     set_timer(t_debounce, 0);
@@ -1006,7 +1304,7 @@ void lx::shell::shell_app::show_notice(const char* text) {
         launcher_.set_notice(text);
         return;
     }
-    panel_.set_notice(text);
+    set_notice_all(text);
     set_timer(t_notice, now_ns() + k_notice_ns);
 }
 
@@ -1083,7 +1381,12 @@ void lx::shell::shell_app::launch_terminal(unsigned serial) {
         report_failure("terminal", "a terminal", f, nullptr, 0, nullptr);
         return;
     }
-    void* surface = launcher_.is_open() ? launcher_.surface() : panel_.surface();
+    void* surface = launcher_.is_open() ? launcher_.surface()
+                    : pointer_panel_       ? pointer_panel_->surface()
+                                           : nullptr;
+    for (auto& o : outputs_)
+        if (!surface && o->bar)
+            surface = o->bar->surface();
     begin_launch(std::move(p), serial, surface);
     if (launcher_.is_open())
         close_launcher();
@@ -1234,27 +1537,12 @@ int lx::shell::shell_app::run() {
         close(sfd);
         return 1;
     }
-    panel_.set_apps(true, false);
-    panel_.set_action_handler(
-        [](panel_action action, void* user) {
-            auto& a = *static_cast<shell_app*>(user);
-            if (action == panel_action::apps)
-                a.toggle_launcher();
-            else if (action == panel_action::task && a.launcher_.is_open())
-                a.close_launcher();
-        },
-        this);
-    if (auto created = panel_.create({.compositor = compositor_,
-                                      .shm = shm_,
-                                      .layer_shell = layer_shell_,
-                                      .viewporter = viewporter_,
-                                      .fractional = fractional_},
-                                     bridge_);
-        !created) {
-        lx::trace::logger::global().log_error(created.get_error(), k_shell_category);
-        close(sfd);
-        return 1;
-    }
+    // One panel per output (M13): those known now get theirs here, later ones at their
+    // first wl_output.done.
+    panels_enabled_ = true;
+    for (auto& o : outputs_)
+        if (o->done)
+            output_ready(*o);
     catalog_.configure(catalog_config::from_env());
     apps_.configure_from_env();
     apps_.set_outcome_handler(
@@ -1271,7 +1559,7 @@ int lx::shell::shell_app::run() {
                    },
                    [](void* user) {
                        auto& a = *static_cast<shell_app*>(user);
-                       a.panel_.set_apps(true, false);
+                       a.set_apps_all(false);
                        a.repeat_code_ = 0;
                        a.set_timer(t_repeat, 0);
                    },
@@ -1339,16 +1627,33 @@ int lx::shell::shell_app::run() {
         }
         if (code)
             break;
-        panel_.after_dispatch();
-        launcher_.after_dispatch();
-        if (panel_.closed()) {
-            wl_display_cancel_read(d);
-            shell_log(lx::trace::level::error, "panel closed; exiting so the shell is restarted");
-            code = 1;
-            break;
+        {
+            // The model's changes are taken once and handed to every panel. A snapshot in
+            // progress keeps them until it is done.
+            task_model& model = bridge_.model();
+            const unsigned changes = model.in_snapshot() ? 0u : model.take_changes();
+            for (auto& o : outputs_)
+                if (o->bar)
+                    o->bar->after_dispatch(changes);
         }
-        // The catalog is read once the panel is on screen: it never delays the panel.
-        if (!catalog_scanned_after_frame_ && panel_.first_frame_committed()) {
+        launcher_.after_dispatch();
+        for (auto& o : outputs_) {
+            if (!o->bar || !o->bar->closed())
+                continue;
+            // The compositor closed it (its output went), or a buffer could not be made:
+            // that output goes without a panel; the others stay.
+            char line[128];
+            std::snprintf(line, sizeof(line), "panel on output %s closed", o->connector);
+            shell_log(lx::trace::level::warn, line);
+            if (o->bar.get() == pointer_panel_) {
+                pointer_panel_ = nullptr;
+                pointer_target_ = pointer_target::none;
+            }
+            o->bar->destroy();
+            o->bar.reset();
+        }
+        // The catalog is read once a panel is on screen: it never delays the panel.
+        if (!catalog_scanned_after_frame_ && any_panel_drawn()) {
             catalog_scanned_after_frame_ = true;
             if (!catalog_.scanned())
                 catalog_.scan();
@@ -1432,7 +1737,10 @@ void lx::shell::shell_app::teardown() {
         t.launch.reset();
     }
     launcher_.close();
-    panel_.destroy();
+    pointer_panel_ = nullptr;
+    for (auto& o : outputs_)
+        if (o->bar)
+            o->bar->destroy();
     bridge_.detach();
     teardown_idle();
     if (cursor_device_)
@@ -1456,12 +1764,11 @@ void lx::shell::shell_app::teardown() {
         zlm_shell_v1_destroy(static_cast<zlm_shell_v1*>(shell_));
     if (layer_shell_)
         zwlr_layer_shell_v1_destroy(static_cast<zwlr_layer_shell_v1*>(layer_shell_));
-    if (output_) {
-        if (wl_output_get_version(static_cast<wl_output*>(output_)) >= WL_OUTPUT_RELEASE_SINCE_VERSION)
-            wl_output_release(static_cast<wl_output*>(output_));
-        else
-            wl_output_destroy(static_cast<wl_output*>(output_));
-    }
+    for (auto& o : outputs_)
+        destroy_output(*o);
+    outputs_.clear();
+    if (xdg_output_manager_)
+        zxdg_output_manager_v1_destroy(static_cast<zxdg_output_manager_v1*>(xdg_output_manager_));
     if (seat_) {
         if (wl_seat_get_version(static_cast<wl_seat*>(seat_)) >= WL_SEAT_RELEASE_SINCE_VERSION)
             wl_seat_release(static_cast<wl_seat*>(seat_));
@@ -1477,7 +1784,7 @@ void lx::shell::shell_app::teardown() {
     (void)wl_display_flush(d);
     wl_display_disconnect(d);
     display_ = registry_ = compositor_ = shm_ = seat_ = layer_shell_ = shell_ = cursor_shape_ =
-        output_ = activation_ = pointer_ = keyboard_ = cursor_device_ = viewporter_ =
+        xdg_output_manager_ = activation_ = pointer_ = keyboard_ = cursor_device_ = viewporter_ =
             fractional_ = nullptr;
     if (timer_fd_ >= 0)
         close(timer_fd_);

@@ -1,0 +1,43 @@
+sequenceDiagram
+    participant C as client (wlr-randr, kanshi)
+    participant UI as compositor UI (wire_output_management, output_management, compositor_impl)
+    participant RT as render thread
+    participant K as kernel (KMS)
+    participant W as worker
+
+    C->>UI: create_configuration(serial); enable_head / disable_head; set_mode … set_adaptive_sync
+    UI->>UI: every protocol error checked at its request (already_configured_head, already_set, invalid_*)
+    C->>UI: apply (or test)
+    alt used already
+        UI-->>C: protocol error already_used
+    else serial not current (a hotplug since its done)
+        UI-->>C: cancelled
+    else a head left out
+        UI-->>C: protocol error unconfigured_head
+    else
+        UI->>UI: queued (one job at a time, four waiting)
+    end
+    UI->>UI: resolve → target (every head disabled, custom mode > 16384, scale > 10, VRR without vrr_capable, more heads than CRTCs → failed)
+    alt the target is the current state (kanshi at login)
+        UI-->>C: succeeded (nothing done)
+    else a KMS change (mode, enable, disable, VRR)
+        UI->>RT: config_test (staged targets at new modes, CRTC allocation for new outputs)
+        RT->>K: TEST_ONLY | ALLOW_MODESET of every changed pipeline
+        RT-->>UI: on_config_tested(ok)
+    end
+    alt test, or refused
+        UI-->>C: succeeded / failed (nothing on screen changed)
+    else apply
+        UI->>UI: switch: enables, modes, VRR, transform, scale, position, disables
+        UI->>RT: output ops with a ticket (add, switch_mode, set_vrr, retire)
+        UI->>C: wl_output / xdg-output / heads events, done(new serial)
+        RT->>K: one combined modeset carrying each changed output's first frame
+        RT-->>UI: on_modeset_result(slot, ticket, ok)
+        alt every changed output committed
+            UI-->>C: succeeded
+            UI->>W: 2 s later: outputs.toml (write, fsync, rename)
+        else a modeset refused
+            UI->>UI: switch back to the previous state
+            UI-->>C: failed
+        end
+    end

@@ -513,16 +513,26 @@ void apply_cached(surface_obj* s, const char* cause, unsigned depth);
 void flush_desync(surface_obj* s, const char* cause);
 void discard_cached(surface_obj* s);
 void bind_compositor(wayland::client_connection& client, unsigned id, int version);
+/// `fire_frames`' output argument: every output.
+inline constexpr unsigned k_any_output = ~0u;
 /// Answers pending frame callbacks: all of them (`throttle` false), or those of surfaces
-/// on screen in published frame `visible_frame` plus the throttled ones that are due
-/// (see `fire_visible_frame_callbacks`).
-void fire_frames(unsigned frame_time_ms, bool throttle, unsigned visible_frame,
-                 unsigned long long now_ns);
+/// output `slot` paces (`k_any_output`: shown on any output) plus the throttled ones that
+/// are due (see `fire_output_frame_callbacks`).
+void fire_frames(unsigned frame_time_ms, bool throttle, unsigned slot, unsigned long long now_ns);
 [[nodiscard]] bool frames_pending();
+/// The outputs whose ticks the pending (not throttled) callbacks wait on: bit per pace
+/// output; ~0 when one of them is not paced by a single output.
+[[nodiscard]] std::uint32_t frames_pending_outputs();
 [[nodiscard]] bool frames_throttled();
-/// Whether `surface` was on screen in published frame `frame` (its scene node's
-/// visibility-pass mark).
-[[nodiscard]] bool surface_visible(lx::surface_id surface, unsigned frame);
+/// Whether `surface` was on screen on output `slot` in published frame `frame` (its scene
+/// node's visibility-pass mark for that view).
+[[nodiscard]] bool surface_visible(lx::surface_id surface, unsigned frame, unsigned slot);
+/// The outputs `surface` is on screen on now: bit per view whose newest published frame
+/// showed it.
+[[nodiscard]] std::uint32_t surface_shown_mask(lx::surface_id surface);
+/// The surface's pace output (ADR 008 M8, `pace_output` over its shown mask and node rect);
+/// -1 when it is shown nowhere.
+[[nodiscard]] int surface_pace_output(lx::surface_id surface);
 
 // ── wire_presentation.cpp (wp_presentation) ────────────────────────────────
 
@@ -659,7 +669,7 @@ void shell_fire_key_grab(void* grab_resource, unsigned time_ms);
 void shell_send_lock_state(unsigned state);
 /// True when one was told.
 bool shell_send_lock_requested(unsigned reason);
-void bind_output(wayland::client_connection& client, unsigned id, int version);
+void bind_output_ex(wayland::client_connection& client, unsigned id, int version, void* user);
 
 // ── wire_output.cpp: wl_output, xdg-output, output membership ───────────────
 
@@ -690,6 +700,8 @@ void for_each_output_resource(wl_client* client, unsigned slot, void (*fn)(wl_re
 void bind_idle_notifier(wayland::client_connection& client, unsigned id, int version);
 void bind_idle_inhibit_manager(wayland::client_connection& client, unsigned id, int version);
 void bind_output_power_manager(wayland::client_connection& client, unsigned id, int version);
+/// zwlr_output_manager_v1 v4 (wire_output_management.cpp; defined only with its glue).
+void bind_output_manager(wayland::client_connection& client, unsigned id, int version);
 /// Outputs changed: a zwlr_output_power_v1 whose wl_output stands for no output any more is
 /// sent `failed` and goes inert (wire_output.cpp calls it; a no-op without the glue).
 void output_power_outputs_changed();

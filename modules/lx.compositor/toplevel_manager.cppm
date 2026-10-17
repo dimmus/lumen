@@ -150,6 +150,43 @@ struct toplevel_record {
     /// a configure).
     bool deco_configure_due = false;
 
+    // ── outputs (ADR 008 §A.9) ──
+    /// xdg_toplevel.set_parent: the window it is a dialog or child of (null: none). A child
+    /// is placed on its parent's output.
+    lx::toplevel_id parent{};
+    /// The output (slot) it is placed on before it maps (its parent's, else the one under
+    /// the pointer), and the one it was last on since; -1 before the initial configure.
+    int output = -1;
+
+    // ── migration (ADR 008 H5) ──
+    /// The output this window was moved off when it went (its identifier, "" for none), the
+    /// window geometry relative to that output's origin, and its state there. When an output
+    /// with that identifier comes back the window returns — unless the user moved or resized
+    /// it since, which clears this.
+    char home_identifier[208]{};
+    lx::rect2i home_rect{};
+    bool home_maximized = false;
+    bool home_fullscreen = false;
+    /// Its output went while no other was live, only one on its way (a configuration that
+    /// enables one output and disables the only other, a dock's saved setup): it waits
+    /// for the next output that comes up, which takes it in as an evacuation from
+    /// `stranded_from` (the gone output's usable area).
+    bool stranded = false;
+    lx::rect2i stranded_from{};
+
+    // ── fullscreen (M11) ──
+    /// The output (slot) it is fullscreen on — or is asked to be, once the configure is
+    /// answered; -1 when not fullscreen.
+    int fullscreen_output = -1;
+    /// Geometry and maximized state before fullscreen, restored by unset_fullscreen.
+    lx::rect2i fullscreen_restore{};
+    bool fullscreen_restore_set = false;
+    bool fullscreen_was_maximized = false;
+    /// xdg_toplevel.set_fullscreen before the initial configure (on `want_fullscreen_output`,
+    /// -1: the placement output).
+    bool want_fullscreen = false;
+    int want_fullscreen_output = -1;
+
     // ── maximize ──
     /// Window geometry before maximize, restored by unmaximize (`restore_set`: there was
     /// one — a window maximized before it ever mapped has none).
@@ -573,4 +610,7 @@ void lx::compositor::toplevel_manager::reset_for_remap(toplevel_record& rec) {
     rec.state = lx::toplevel_state::normal;
     rec.geometry = {};
     rec.geometry_offset = {};
+    rec.output = -1;
+    rec.fullscreen_output = -1;
+    rec.fullscreen_restore_set = false;
 }

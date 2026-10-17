@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <set>
 #include <string>
+#include <tuple>
 #include <vector>
 
 import lx.foundation;
@@ -60,7 +61,7 @@ void* res(int id) { return reinterpret_cast<void*>(static_cast<std::uintptr_t>(i
 struct screen {
     std::set<std::pair<unsigned long long, unsigned>> shown;
     void show(lx::surface_id s, unsigned frame) { shown.insert({s.id(), frame}); }
-    static bool visible(void* u, lx::surface_id s, unsigned frame) {
+    static bool visible(void* u, lx::surface_id s, unsigned frame, unsigned) {
         return static_cast<screen*>(u)->shown.count({s.id(), frame}) != 0;
     }
 };
@@ -114,12 +115,12 @@ LUMEN_TEST(presentation_sampled_then_flipped_is_presented) {
     (void)t.create(res(2), s.id, s.pending); // two objects for one update: same feedback
     commit(t, s, 5, r.sink());
     scr.show(s.id, 5);
-    t.on_publish(5, &screen::visible, &scr);
+    t.on_publish(5, 0, &screen::visible, nullptr, &scr);
     LUMEN_CHECK(t.count(table_state::sampled) == 2);
     // A flip of an older composite does not show it yet.
-    t.on_flip(4, flip_info(100), r.sink());
+    t.on_flip(4, 0, flip_info(100), r.sink());
     LUMEN_CHECK(r.events.empty());
-    t.on_flip(5, flip_info(101), r.sink());
+    t.on_flip(5, 0, flip_info(101), r.sink());
     LUMEN_CHECK(r.events.size() == 2 && r.has("presented", 1) && r.has("presented", 2));
     LUMEN_CHECK(r.events[0].seq == 101);
     LUMEN_CHECK(t.in_use() == 0);
@@ -134,14 +135,14 @@ LUMEN_TEST(presentation_not_visible_stays_queued) {
     commit(t, s, 3, r.sink());
     // Occluded in 3 and 4: occlusion is not a reason to discard (the spec lists
     // "superseded or its surface destroyed").
-    t.on_publish(3, &screen::visible, &scr);
-    t.on_publish(4, &screen::visible, &scr);
-    t.on_flip(4, flip_info(1), r.sink());
+    t.on_publish(3, 0, &screen::visible, nullptr, &scr);
+    t.on_publish(4, 0, &screen::visible, nullptr, &scr);
+    t.on_flip(4, 0, flip_info(1), r.sink());
     LUMEN_CHECK(r.events.empty() && t.count(table_state::queued) == 1);
     // Uncovered in 6: sampled, and presented by its flip.
     scr.show(s.id, 6);
-    t.on_publish(6, &screen::visible, &scr);
-    t.on_flip(6, flip_info(2), r.sink());
+    t.on_publish(6, 0, &screen::visible, nullptr, &scr);
+    t.on_flip(6, 0, flip_info(2), r.sink());
     LUMEN_CHECK(r.events.size() == 1 && r.has("presented", 1));
 }
 
@@ -157,20 +158,20 @@ LUMEN_TEST(presentation_superseded_update_resolves_by_flip_frame) {
         (void)t.create(res(1), s.id, s.pending);
         commit(t, s, 10, r.sink());
         scr.show(s.id, 10);
-        t.on_publish(10, &screen::visible, &scr);
+        t.on_publish(10, 0, &screen::visible, nullptr, &scr);
         (void)t.create(res(2), s.id, s.pending);
         commit(t, s, 12, r.sink());
         LUMEN_CHECK(t.count(table_state::superseded) == 1);
         scr.show(s.id, 12);
-        t.on_publish(12, &screen::visible, &scr);
+        t.on_publish(12, 0, &screen::visible, nullptr, &scr);
         if (variant == 0) {
-            t.on_flip(11, flip_info(50), r.sink());
+            t.on_flip(11, 0, flip_info(50), r.sink());
             LUMEN_CHECK(r.events.size() == 1 && r.has("presented", 1));
-            t.on_flip(12, flip_info(51), r.sink());
+            t.on_flip(12, 0, flip_info(51), r.sink());
             LUMEN_CHECK(r.events.size() == 2 && r.has("presented", 2));
         } else {
             // Frames 10 and 11 were composited but never committed (newest wins).
-            t.on_flip(13, flip_info(50), r.sink());
+            t.on_flip(13, 0, flip_info(50), r.sink());
             LUMEN_CHECK(r.events.size() == 2 && r.has("discarded", 1) && r.has("presented", 2));
         }
         LUMEN_CHECK(t.in_use() == 0);
@@ -186,10 +187,10 @@ LUMEN_TEST(presentation_composited_not_committed_frames_present_later) {
     commit(t, s, 20, r.sink());
     scr.show(s.id, 20);
     scr.show(s.id, 21);
-    t.on_publish(20, &screen::visible, &scr);
-    t.on_publish(21, &screen::visible, &scr);
+    t.on_publish(20, 0, &screen::visible, nullptr, &scr);
+    t.on_publish(21, 0, &screen::visible, nullptr, &scr);
     // 20 and 21 were composited, only 22 reached the CRTC: it still shows the update.
-    t.on_flip(22, flip_info(9), r.sink());
+    t.on_flip(22, 0, flip_info(9), r.sink());
     LUMEN_CHECK(r.events.size() == 1 && r.has("presented", 1));
 }
 
@@ -205,27 +206,27 @@ LUMEN_TEST(presentation_hidden_in_the_flipped_frame_is_not_presented) {
         (void)t.create(res(1), s.id, s.pending);
         commit(t, s, 30, r.sink());
         scr.show(s.id, 30);
-        t.on_publish(30, &screen::visible, &scr);
+        t.on_publish(30, 0, &screen::visible, nullptr, &scr);
         LUMEN_CHECK(t.count(table_state::sampled) == 1);
-        t.on_publish(31, &screen::visible, &scr); // covered in 31
-        t.on_flip(31, flip_info(7), r.sink());    // 30 was never composited
+        t.on_publish(31, 0, &screen::visible, nullptr, &scr); // covered in 31
+        t.on_flip(31, 0, flip_info(7), r.sink());    // 30 was never composited
         LUMEN_CHECK(r.events.empty() && t.count(table_state::sampled) == 1);
         if (variant == 0) {
             // Uncovered in 33 with the update still current: presented by that flip.
-            t.on_publish(32, &screen::visible, &scr);
+            t.on_publish(32, 0, &screen::visible, nullptr, &scr);
             scr.show(s.id, 33);
-            t.on_publish(33, &screen::visible, &scr);
-            t.on_flip(32, flip_info(8), r.sink());
+            t.on_publish(33, 0, &screen::visible, nullptr, &scr);
+            t.on_flip(32, 0, flip_info(8), r.sink());
             LUMEN_CHECK(r.events.empty());
-            t.on_flip(33, flip_info(9), r.sink());
+            t.on_flip(33, 0, flip_info(9), r.sink());
             LUMEN_CHECK(r.events.size() == 1 && r.has("presented", 1) && r.events[0].seq == 9);
         } else {
             // The client's next update replaces it before it was ever seen.
             (void)t.create(res(2), s.id, s.pending);
             commit(t, s, 32, r.sink());
             scr.show(s.id, 32);
-            t.on_publish(32, &screen::visible, &scr);
-            t.on_flip(32, flip_info(8), r.sink());
+            t.on_publish(32, 0, &screen::visible, nullptr, &scr);
+            t.on_flip(32, 0, flip_info(8), r.sink());
             LUMEN_CHECK(r.events.size() == 2 && r.has("discarded", 1) && r.has("presented", 2));
         }
         LUMEN_CHECK(t.in_use() == 0);
@@ -242,15 +243,15 @@ LUMEN_TEST(presentation_visibility_window_slides) {
     (void)t.create(res(1), s.id, s.pending);
     commit(t, s, 100, r.sink());
     scr.show(s.id, 100);
-    t.on_publish(100, &screen::visible, &scr);
+    t.on_publish(100, 0, &screen::visible, nullptr, &scr);
     for (unsigned f = 101; f < 300; ++f) {
-        t.on_publish(f, &screen::visible, &scr);
-        t.on_flip(f, flip_info(f), r.sink());
+        t.on_publish(f, 0, &screen::visible, nullptr, &scr);
+        t.on_flip(f, 0, flip_info(f), r.sink());
     }
     LUMEN_CHECK(r.events.empty());
     scr.show(s.id, 300);
-    t.on_publish(300, &screen::visible, &scr);
-    t.on_flip(300, flip_info(300), r.sink());
+    t.on_publish(300, 0, &screen::visible, nullptr, &scr);
+    t.on_flip(300, 0, flip_info(300), r.sink());
     LUMEN_CHECK(r.events.size() == 1 && r.has("presented", 1) && r.events[0].seq == 300);
 }
 
@@ -262,8 +263,8 @@ LUMEN_TEST(presentation_frame_counter_wraps) {
     (void)t.create(res(1), s.id, s.pending);
     commit(t, s, 0xFFFFFFFEu, r.sink());
     scr.show(s.id, 0xFFFFFFFEu);
-    t.on_publish(0xFFFFFFFEu, &screen::visible, &scr);
-    t.on_flip(1, flip_info(3), r.sink()); // three frames later, past the wrap
+    t.on_publish(0xFFFFFFFEu, 0, &screen::visible, nullptr, &scr);
+    t.on_flip(1, 0, flip_info(3), r.sink()); // three frames later, past the wrap
     LUMEN_CHECK(r.has("presented", 1));
 }
 
@@ -276,7 +277,7 @@ LUMEN_TEST(presentation_stopped_display_discards) {
     (void)t.create(res(1), a.id, a.pending);
     commit(t, a, 1, r.sink());
     scr.show(a.id, 1);
-    t.on_publish(1, &screen::visible, &scr); // sampled, its flip not yet drained
+    t.on_publish(1, 0, &screen::visible, nullptr, &scr); // sampled, its flip not yet drained
     (void)t.create(res(2), b.id, b.pending);
     commit(t, b, 2, r.sink()); // queued
     (void)t.create(res(3), b.id, b.pending); // pending: not part of anything in flight
@@ -302,7 +303,7 @@ LUMEN_TEST(presentation_surface_gone) {
     (void)t.create(res(1), s.id, s.pending);
     commit(t, s, 1, r.sink());
     scr.show(s.id, 1);
-    t.on_publish(1, &screen::visible, &scr);
+    t.on_publish(1, 0, &screen::visible, nullptr, &scr);
     (void)t.create(res(2), s.id, s.pending);
     commit(t, s, 2, r.sink()); // 1 superseded, 2 queued
     (void)t.create(res(3), other.id, other.pending);
@@ -349,8 +350,8 @@ LUMEN_TEST(presentation_client_disconnect_forgets_resources) {
     const unsigned h3 = t.create(res(3), s.id, s.pending);
     commit(t, s, 2, r.sink());
     scr.show(s.id, 2);
-    t.on_publish(2, &screen::visible, &scr);
-    t.on_flip(2, flip_info(1), r.sink());
+    t.on_publish(2, 0, &screen::visible, nullptr, &scr);
+    t.on_flip(2, 0, flip_info(1), r.sink());
     LUMEN_CHECK(r.has("presented", 3));
     const unsigned h4 = t.create(res(4), s.id, s.pending); // likely reuses h3's slot
     t.forget_resource(h3, res(3));
@@ -427,6 +428,81 @@ LUMEN_TEST(presentation_flip_event_carries_tag_sequence_and_hw) {
     ev.hw = true;
     tracker.on_page_flip(ev);
     LUMEN_CHECK(!got.content && got.tag == 0);
+}
+
+// ── Several outputs (ADR 008 M8): only the pace output samples and presents ──
+
+namespace {
+/// Two outputs' visibility passes, faked, and each surface's pace output.
+struct screens {
+    std::set<std::tuple<unsigned long long, unsigned, unsigned>> shown; // surface, frame, output
+    std::vector<std::pair<unsigned long long, int>> pace;
+    void show(lx::surface_id s, unsigned frame, unsigned output) {
+        shown.insert({s.id(), frame, output});
+    }
+    static bool visible(void* u, lx::surface_id s, unsigned frame, unsigned output) {
+        return static_cast<screens*>(u)->shown.count({s.id(), frame, output}) != 0;
+    }
+    static int pace_of(void* u, lx::surface_id s) {
+        for (const auto& [id, out] : static_cast<screens*>(u)->pace)
+            if (id == s.id())
+                return out;
+        return -1;
+    }
+};
+} // namespace
+
+LUMEN_TEST(presentation_two_outputs_pace_output_presents) {
+    presentation_feedback_table t{};
+    recorder r{};
+    screens sc{};
+    surface s{lx::surface_id{7}};
+    // The surface straddles both outputs; output 1 shows most of it: output 1 paces it.
+    sc.pace.push_back({7, 1});
+    LUMEN_CHECK(t.create(res(1), s.id, s.pending) != 0);
+    commit(t, s, 30, r.sink());
+    sc.show(s.id, 30, 0);
+    sc.show(s.id, 30, 1);
+    // Output 0 publishes first: shown there, but not its pace output — still queued.
+    t.on_publish(30, 0, &screens::visible, &screens::pace_of, &sc);
+    LUMEN_CHECK(t.count(table_state::queued) == 1);
+    t.on_publish(30, 1, &screens::visible, &screens::pace_of, &sc);
+    LUMEN_CHECK(t.count(table_state::sampled) == 1);
+    // A flip of output 0 presents nothing of output 1's...
+    t.on_flip(30, 0, flip_info(5), r.sink());
+    LUMEN_CHECK(r.events.empty());
+    // ...output 1's flip presents it, once, with that flip's MSC.
+    t.on_flip(30, 1, flip_info(9), r.sink());
+    LUMEN_CHECK(r.events.size() == 1 && r.has("presented", 1) && r.events[0].seq == 9);
+    LUMEN_CHECK(t.in_use() == 0);
+}
+
+LUMEN_TEST(presentation_output_dark_discards_what_it_paces) {
+    presentation_feedback_table t{};
+    recorder r{};
+    screens sc{};
+    surface a{lx::surface_id{1}};
+    surface b{lx::surface_id{2}};
+    surface c{lx::surface_id{3}};
+    sc.pace = {{1, 0}, {2, 1}, {3, 1}};
+    LUMEN_CHECK(t.create(res(1), a.id, a.pending) != 0);
+    LUMEN_CHECK(t.create(res(2), b.id, b.pending) != 0);
+    LUMEN_CHECK(t.create(res(3), c.id, c.pending) != 0);
+    commit(t, a, 40, r.sink());
+    commit(t, b, 40, r.sink());
+    commit(t, c, 40, r.sink());
+    sc.show(a.id, 40, 0);
+    sc.show(b.id, 40, 1);
+    t.on_publish(40, 0, &screens::visible, &screens::pace_of, &sc);
+    t.on_publish(40, 1, &screens::visible, &screens::pace_of, &sc);
+    LUMEN_CHECK(t.count(table_state::sampled) == 2 && t.count(table_state::queued) == 1);
+    // Output 1 powered off: b (sampled for it) and c (queued, paced by it) are discarded;
+    // a on output 0 is untouched and presented by output 0's flip.
+    t.discard_output(1, &screens::pace_of, &sc, r.sink());
+    LUMEN_CHECK(r.has("discarded", 2) && r.has("discarded", 3) && !r.has("discarded", 1));
+    t.on_flip(40, 0, flip_info(3), r.sink());
+    LUMEN_CHECK(r.has("presented", 1));
+    LUMEN_CHECK(t.in_use() == 0);
 }
 
 int main(int argc, char** argv) {

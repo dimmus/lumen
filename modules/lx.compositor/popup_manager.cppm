@@ -92,9 +92,11 @@ struct popup_ops {
 /// What the popup manager needs from the window manager, as callbacks (the window manager
 /// sits above this partition).
 struct popup_host {
-    /// Global rectangle a popup rooted at `root` is kept inside: the usable area for window
+    /// Global rectangle a popup rooted at `root` (a toplevel's or layer surface's
+    /// `root_surface`) is kept inside: the usable area of its window's output for window
     /// popups, the whole output for layer-surface popups.
-    lx::rect2i (*constraint_area)(void* user, popup_parent_kind root) = nullptr;
+    lx::rect2i (*constraint_area)(void* user, popup_parent_kind root,
+                                  lx::surface_id root_surface) = nullptr;
     /// The grab stack or a grabbing popup's mapping changed: keyboard focus is re-resolved.
     void (*focus_changed)(void* user) = nullptr;
     void* user = nullptr;
@@ -410,8 +412,15 @@ lx::compositor::popup_manager::root_kind(const popup_record& rec) const {
 }
 
 lx::rect2i lx::compositor::popup_manager::constraint_for(const popup_record& rec) const {
-    lx::rect2i area = host_.constraint_area ? host_.constraint_area(host_.user, root_kind(rec))
-                                            : lx::rect2i{};
+    // The chain's root: the toplevel or layer surface the first popup hangs off.
+    const popup_record* root = &rec;
+    for (unsigned depth = 0; root && root->parent_kind == popup_parent_kind::popup && depth < k_max;
+         ++depth)
+        root = find(root->parent);
+    lx::rect2i area = host_.constraint_area
+                          ? host_.constraint_area(host_.user, root_kind(rec),
+                                                  root ? root->parent : lx::surface_id{})
+                          : lx::rect2i{};
     lx::rect2i parent{};
     (void)parent_geometry(rec, parent);
     lx::point2i origin{parent.x, parent.y};

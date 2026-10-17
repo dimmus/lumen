@@ -1,6 +1,7 @@
 module;
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 #include <vector>
@@ -37,6 +38,7 @@ import :keybindings;
 import :presentation_feedback;
 import :idle;
 import :session_lock;
+import :output_management;
 import :text_input;
 
 export namespace lx::compositor {
@@ -505,6 +507,14 @@ struct p0_protocol_context {
     unsigned building_frame = 0;
     /// Monotonic time of the current UI tick, for staging-pool idle tracking.
     unsigned long long now_ns = 0;
+    /// UI affinity. Per output view (slot): the newest published frame, and the views that
+    /// ever published. A surface is on an output now when the visibility pass of that
+    /// view's newest frame found it (`surface_node::visible_in(frame, slot)`).
+    unsigned published_frame[16]{};
+    std::uint32_t published_mask = 0;
+    /// UI affinity. Outputs whose display runs (not powered off, session not paused): what
+    /// an idle inhibitor's surface must be shown on.
+    std::uint32_t lit_mask = 0;
     /// Ends the session cleanly (zlm_shell_v1.request_logout). `source` names who asked,
     /// for the log. Null until the compositor supplies it.
     void (*request_logout)(void* user, const char* source) = nullptr;
@@ -555,6 +565,11 @@ struct p0_protocol_context {
     /// none of the three globals is advertised.
     text_input_relay* text_input = nullptr;
     scene::container_node* ime_popup_layer = nullptr;
+    /// zwlr_output_manager_v1 (wire_output_management.cpp): an apply or test passed its
+    /// protocol checks and was queued (`output_mgmt_jobs`); the compositor runs it when it is
+    /// free (one at a time, ADR 008 §C.3). Null: the global is not advertised.
+    void (*output_mgmt_kick)(void* user) = nullptr;
+    void* output_mgmt_user = nullptr;
 
     /// Stage shm pixels in the client's own channel order instead of converting them to
     /// RGBA. The Vulkan composite path samples RGBA textures, so it needs the conversion;
@@ -570,39 +585,51 @@ struct p0_protocol_context {
 /// Answers every pending wl_surface.frame callback (the 1 Hz paused tick: the display is
 /// stopped, and a client blocked on its callback keeps running).
 void fire_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms);
-/// Answers the pending wl_surface.frame callbacks of surfaces on screen in published frame
-/// `visible_frame` (the visibility pass; cursor surfaces always count) and, for the others —
-/// occluded, off the output, unmapped, hidden — only once 995 ms have passed since their
-/// surface's last callback (niri's throttle). What is held back is throttled: it does not
-/// count for `frame_callbacks_pending`, so the frame clock may stop with it queued.
-/// `now_ns`: CLOCK_MONOTONIC.
+/// Answers the pending wl_surface.frame callbacks of surfaces on screen on any output (the
+/// visibility pass of each view's newest frame; cursor surfaces always count) and, for the
+/// others — occluded, off every output, unmapped, hidden — only once 995 ms have passed
+/// since their surface's last callback (niri's throttle). What is held back is throttled:
+/// it does not count for `frame_callbacks_pending`, so the frame clocks may stop with it
+/// queued. `now_ns`: CLOCK_MONOTONIC. (The housekeeping tick.)
 void fire_visible_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms,
-                                  unsigned visible_frame, unsigned long long now_ns);
+                                  unsigned long long now_ns);
+/// The same for one output's flip (ADR 008 M8): the callbacks of surfaces whose pace output
+/// is `slot` — the output showing most of them among those that showed them in their newest
+/// frame — are answered; surfaces another output paces wait for that output's flip; those
+/// shown nowhere follow the 995 ms throttle.
+void fire_output_frame_callbacks(p0_protocol_context& ctx, unsigned slot, unsigned frame_time_ms,
+                                 unsigned long long now_ns);
 /// A client is waiting on a wl_surface.frame callback that the next present answers
 /// (throttled ones excluded).
 [[nodiscard]] bool frame_callbacks_pending(const p0_protocol_context& ctx);
+/// The outputs the pending callbacks wait on (bit per pace output; ~0 when one waits on any).
+[[nodiscard]] std::uint32_t frame_callbacks_pending_outputs(const p0_protocol_context& ctx);
 /// Throttled frame callbacks are queued (answered by `fire_visible_frame_callbacks` at
 /// the next site after their 995 ms, or the housekeeping tick while the clock is stopped).
 [[nodiscard]] bool frame_callbacks_throttled(const p0_protocol_context& ctx);
 
-/// wp_presentation: frame `frame` was published; queued feedback of the surfaces it shows
-/// is sampled into it. UI affinity, once per published frame (not while the display is
-/// stopped: nothing is shown then).
-void presentation_published(p0_protocol_context& ctx, unsigned frame);
-/// A content flip of the composite of frame `frame` completed with `info`: sampled feedback
-/// is presented or discarded (`presentation_feedback_table::on_flip`). UI affinity.
-void presentation_flipped(p0_protocol_context& ctx, unsigned frame, const present_info& info);
+/// wp_presentation: frame `frame` was published to output `slot`; queued feedback of the
+/// surfaces it shows and paces is sampled into it. UI affinity, once per published view
+/// (not while the display is stopped: nothing is shown then).
+void presentation_published(p0_protocol_context& ctx, unsigned frame, unsigned slot);
+/// A content flip of the composite of frame `frame` on output `slot` completed with `info`:
+/// feedback that output paces is presented or discarded
+/// (`presentation_feedback_table::on_flip`). UI affinity.
+void presentation_flipped(p0_protocol_context& ctx, unsigned frame, unsigned slot,
+                          const present_info& info);
 /// The display stopped (`queued_only` false: everything in flight is discarded), or the
 /// stopped display's 1 Hz tick (`queued_only` true).
 void presentation_discard(p0_protocol_context& ctx, bool queued_only);
+/// Output `slot` went dark (powered off): the feedback it paces is discarded.
+void presentation_discard_output(p0_protocol_context& ctx, unsigned slot);
 
 /// ext_idle_notification_v1.idled / resumed, as the compositor's idle tracker emits them
 /// (wire_idle.cpp). A sink with no functions without the protocol's glue.
 [[nodiscard]] idle_sink idle_events(p0_protocol_context& ctx);
-/// Whether an idle inhibitor is honoured in published frame `frame`: its surface was on
-/// screen (the visibility pass — not covered, on the output). The caller adds what the frame
-/// cannot know: the display must be running. UI affinity.
-[[nodiscard]] bool idle_inhibitor_visible(p0_protocol_context& ctx, unsigned frame);
+/// Whether an idle inhibitor is honoured: its surface is on screen on a lit output (the
+/// visibility pass of that view's newest frame — not covered, on the output). The caller
+/// adds what the frames cannot know: the session must be running. UI affinity.
+[[nodiscard]] bool idle_inhibitor_visible(p0_protocol_context& ctx);
 /// zwlr_output_power_v1.mode to every object of output `slot` (the power state machine
 /// reports a change). UI affinity.
 void notify_output_power(p0_protocol_context& ctx, unsigned slot, bool on);
@@ -626,6 +653,21 @@ void session_lock_send(p0_protocol_context& ctx, const lock_actions& a);
 
 /// Sends wl_buffer.release for a dmabuf buffer once the render path is done with it.
 void release_wl_buffer_resource(void* wl_buffer_resource, void* user_data);
+/// wlr-output-management (wire_output_management.cpp, ADR 008 Part C). The heads as the
+/// compositor sees them now: every bound zwlr_output_manager_v1 is sent what changed since
+/// the last call (heads introduced or finished, modes, state), then `done` with a new serial.
+/// Nothing at all when nothing changed. UI affinity; called when outputs or connectors
+/// changed, coalesced to once per loop iteration.
+void output_heads_changed(p0_protocol_context& ctx, const mgmt::head_set& heads);
+/// The heads managers were last told about, and the serial of that `done`.
+[[nodiscard]] const mgmt::head_set& output_mgmt_heads(const p0_protocol_context& ctx);
+[[nodiscard]] unsigned output_mgmt_serial(const p0_protocol_context& ctx);
+/// Applies and tests waiting for the compositor.
+[[nodiscard]] mgmt::job_queue& output_mgmt_jobs(p0_protocol_context& ctx);
+enum class mgmt_result : unsigned char { succeeded, failed, cancelled };
+/// A job's answer to its configuration object, unless the client destroyed it meanwhile.
+void output_mgmt_finish(p0_protocol_context& ctx, unsigned long long token, mgmt_result result);
+
 /// `output_manager::generation` moved: every bound wl_output and zxdg_output_v1 is sent
 /// the new state (then `done`), and every surface's output membership is recomputed from
 /// its node rect. UI affinity; rare (a mode change, an output added or removed).
