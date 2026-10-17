@@ -32,6 +32,14 @@ export import :data_transfer;
 export import :dnd;
 export import :liveness;
 export import :activation;
+export import :keybindings;
+export import :session_state;
+export import :viewport;
+export import :presentation_feedback;
+export import :idle;
+export import :display_power;
+export import :session_lock;
+export import :text_input;
 
 export namespace lx::compositor {
 
@@ -71,6 +79,11 @@ struct config {
     /// this long is shown as not responding (title suffix, dimmed window, the shell's
     /// flag) until it answers. Mutter's default. 0 disables pinging.
     unsigned ping_timeout_ms = 5000;
+    /// Output scale (`--scale`), for every output: 1.25 shows a 1366x768 mode as a
+    /// 1093x614 logical desktop. Rounded to the nearest n/120 — the unit
+    /// wp_fractional_scale_v1 speaks — and logged. Fractional-scale clients render at
+    /// exactly this; others at the integer ceiling, downscaled.
+    double output_scale = 1.0;
     /// Row-band threads for the CPU composite path, in addition to the render thread.
     ///
     /// Defaults to 0 on measurement, not principle: the fullscreen opaque case is a row
@@ -120,6 +133,10 @@ public:
     [[nodiscard]] lx::result<void> start();
     [[nodiscard]] int run();
     void request_stop();
+    /// Debug aid: the next frame is repainted in full, read back and written as a PPM to
+    /// $LUMEN_SCREENSHOT_DIR (else $XDG_RUNTIME_DIR) — GL path only. Async-signal-safe
+    /// (lumen-compositor maps SIGUSR1 to it).
+    void request_screenshot();
 
     [[nodiscard]] config configuration() const;
     [[nodiscard]] wayland::server& wayland();
@@ -135,6 +152,8 @@ public:
     /// xdg_wm_base.ping/pong liveness (tests read who is not responding).
     [[nodiscard]] liveness_tracker& liveness();
     [[nodiscard]] seat_manager& seats();
+    /// Seat event delivery: focus, forwarded keys, the per-client input serials.
+    [[nodiscard]] input_router& input();
     [[nodiscard]] scheduler::frame_scheduler& scheduler();
     [[nodiscard]] scheduler::presentation_tracker& presentation();
     [[nodiscard]] scheduler::budget_tracker& budget();
@@ -153,6 +172,11 @@ public:
     void inject_key(const lx::input::key_event& event);
     void inject_pointer_motion(const lx::input::pointer_motion_event& event);
     void inject_pointer_button(const lx::input::pointer_button_event& event);
+    /// logind's Session.Unlock, as the signal delivers it (`loginctl unlock-session`): for
+    /// headless tests. UI affinity.
+    void inject_logind_unlock();
+    /// The session lock's state (ext-session-lock-v1).
+    [[nodiscard]] lock_state session_lock_state() const;
 
     [[nodiscard]] unsigned frame_index() const;
     [[nodiscard]] bool is_running() const;

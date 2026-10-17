@@ -317,6 +317,63 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_data_transfer PRIVATE tests)
     add_test(NAME test_data_transfer COMMAND test_data_transfer)
 
+    add_executable(test_session_pause tests/test_session_pause.cpp)
+    target_link_libraries(test_session_pause PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_session_pause)
+    lumen_link_platform(test_session_pause)
+    target_include_directories(test_session_pause PRIVATE tests)
+    add_test(NAME test_session_pause COMMAND test_session_pause)
+
+    add_executable(test_viewport_geometry tests/test_viewport_geometry.cpp)
+    target_link_libraries(test_viewport_geometry PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_viewport_geometry)
+    lumen_link_platform(test_viewport_geometry)
+    target_include_directories(test_viewport_geometry PRIVATE tests)
+    add_test(NAME test_viewport_geometry COMMAND test_viewport_geometry)
+
+    add_executable(test_presentation_feedback tests/test_presentation_feedback.cpp)
+    target_link_libraries(test_presentation_feedback PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_presentation_feedback)
+    lumen_link_platform(test_presentation_feedback)
+    target_include_directories(test_presentation_feedback PRIVATE tests)
+    add_test(NAME test_presentation_feedback COMMAND test_presentation_feedback)
+
+    add_executable(test_display_power tests/test_display_power.cpp)
+    target_link_libraries(test_display_power PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_display_power)
+    lumen_link_platform(test_display_power)
+    target_include_directories(test_display_power PRIVATE tests)
+    add_test(NAME test_display_power COMMAND test_display_power)
+
+    add_executable(test_session_lock tests/test_session_lock.cpp)
+    target_link_libraries(test_session_lock PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_session_lock)
+    lumen_link_platform(test_session_lock)
+    target_include_directories(test_session_lock PRIVATE tests)
+    add_test(NAME test_session_lock COMMAND test_session_lock)
+
+    add_executable(test_text_input tests/test_text_input.cpp)
+    target_link_libraries(test_text_input PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_text_input)
+    lumen_link_platform(test_text_input)
+    target_include_directories(test_text_input PRIVATE tests)
+    add_test(NAME test_text_input COMMAND test_text_input)
+
+    # Idle tracking and inhibitors (compositor) with lumen-shell's idle policy (shell).
+    add_executable(test_idle_notify tests/test_idle_notify.cpp)
+    target_link_libraries(test_idle_notify PRIVATE lx.compositor lx.shell)
+    lumen_apply_module_properties(test_idle_notify)
+    lumen_link_platform(test_idle_notify)
+    target_include_directories(test_idle_notify PRIVATE tests)
+    add_test(NAME test_idle_notify COMMAND test_idle_notify)
+
+    add_executable(test_keybindings tests/test_keybindings.cpp)
+    target_link_libraries(test_keybindings PRIVATE lx.compositor lx.input)
+    lumen_apply_module_properties(test_keybindings)
+    lumen_link_platform(test_keybindings)
+    target_include_directories(test_keybindings PRIVATE tests)
+    add_test(NAME test_keybindings COMMAND test_keybindings)
+
     add_executable(test_input_serials tests/test_input_serials.cpp)
     target_link_libraries(test_input_serials PRIVATE lx.compositor)
     lumen_apply_module_properties(test_input_serials)
@@ -476,6 +533,17 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_task_model PRIVATE tests)
     add_test(NAME test_task_model COMMAND test_task_model)
 
+    # lumen-shell's launcher: desktop entries, the catalog, launching, the launcher layout.
+    foreach(shell_test test_desktop_entry test_app_catalog test_app_launch test_launcher_layout)
+        add_executable(${shell_test} tests/${shell_test}.cpp)
+        target_link_libraries(${shell_test} PRIVATE lx.shell)
+        lumen_apply_module_properties(${shell_test})
+        lumen_link_platform(${shell_test})
+        target_include_directories(${shell_test} PRIVATE tests)
+        add_test(NAME ${shell_test} COMMAND ${shell_test})
+    endforeach()
+    set_tests_properties(test_app_launch PROPERTIES TIMEOUT 30)
+
     # Compositor and lx.shell's bridge in one process: the shell side of zlm_policy_bridge_v1
     # against the real server side, with the privilege check configured to accept this binary.
     add_executable(test_shell_bridge tests/test_shell_bridge.cpp)
@@ -573,13 +641,16 @@ if(LUMEN_BUILD_TESTS)
 
     set_tests_properties(test_result test_snapshot test_damage_region test_wm_geometry
         test_surface_tree test_positioner test_layer_arrange test_xcursor
-        test_data_transfer test_input_serials test_dnd_grab test_output_membership test_liveness
+        test_data_transfer test_input_serials test_session_pause test_keybindings
+        test_viewport_geometry test_presentation_feedback
+        test_dnd_grab test_output_membership test_liveness
         test_activation_policy
         test_import_cache bench_frame
         test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_input_keymap
         test_headless_golden test_text_shaping test_protocol_bind test_protocol_conformance
         test_output_contract
         test_task_model test_shell_bridge
+        test_desktop_entry test_app_catalog test_app_launch test_launcher_layout
         test_kms_device test_kms_vkms
         test_ui_reconcile test_gl_composite bench_composite
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")

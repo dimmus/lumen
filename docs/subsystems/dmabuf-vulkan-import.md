@@ -84,6 +84,17 @@ legacy `format`/`modifier` events go only to v1–v3 binds. A feedback with no f
 crashed GTK 4 at display open. Formats and modifiers beyond linear 8888 are a follow-up
 (they need the EGL/Vulkan query per format).
 
+### How an imported buffer is drawn
+
+Whatever the backend, a client buffer reaches the composite as a `blit_command` whose
+`dst` is in output pixels and whose `src` is a **float** source box in buffer pixels
+(`wp_viewport.set_source` × the buffer scale, turned into the buffer by the inverse
+transform), plus `buffer_xform` (`wl_surface.set_buffer_transform`). Each backend samples it
+through the same affine basis (`gfx::source_basis_for`): GL as uniforms, Vulkan in the push
+constants (`src_uv` = origin and +x, `uv_dy` = +y), CPU by inverse mapping. A dma-buf client
+at a fractional output scale that renders `round(size·scale)` pixels is drawn 1:1 from its
+imported image — no intermediate copy, no resampling (ADR 007).
+
 ## Error handling
 
 | Condition | Action |
@@ -113,6 +124,7 @@ crashed GTK 4 at display open. Formats and modifiers beyond linear 8888 are a fo
 - `linux-dmabuf-v1` (P0) — buffer submission
 - `linux-drm-syncobj-v1` (P0) — explicit sync
 - `wp_presentation` (P1) — frame timing feedback
+- `wp_viewporter`, `wp_fractional_scale_v1` (P1) — source crop, destination size, scale
 
 ## Code stubs
 

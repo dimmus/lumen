@@ -8,12 +8,37 @@ flowchart TB
 
     subgraph ShellProto["Shell P0"]
         XDG["xdg-shell"]
-        LUMEN["zlm_shell_v1 + zlm_toplevel_v1"]
+        LUMEN["zlm_shell_v1 v5 + zlm_toplevel_v1"]
     end
 
     subgraph BufferProto["Zero-copy P0"]
         DMabuf["linux-dmabuf-v1"]
         SyncObj["linux-drm-syncobj-v1"]
+    end
+
+    subgraph ScaleProto["Scaling P1 (ADR 007)"]
+        Viewporter["wp_viewporter"]
+        Fractional["wp_fractional_scale_v1"]
+    end
+
+    subgraph TimingProto["Frame timing P1 (ADR 007)"]
+        Presentation["wp_presentation v2 (CLOCK_MONOTONIC)"]
+    end
+
+    subgraph IdleProto["Idle and power P1 (ADR 007)"]
+        IdleNotify["ext_idle_notifier_v1 v2"]
+        IdleInhibit["zwp_idle_inhibit_manager_v1"]
+        OutputPower["zwlr_output_power_manager_v1"]
+    end
+
+    subgraph LockProto["Session lock (ADR 007)"]
+        SessionLock["ext_session_lock_manager_v1"]
+    end
+
+    subgraph ImeProto["Text input and input methods (ADR 007)"]
+        TextInput["zwp_text_input_manager_v3 v2"]
+        InputMethod["zwp_input_method_manager_v2 (wlroots)"]
+        VirtualKeyboard["zwp_virtual_keyboard_manager_v1 (wlroots)"]
     end
 
     subgraph Server["lx::wayland::server"]
@@ -23,3 +48,8 @@ flowchart TB
     Core --> DISPATCH
     ShellProto --> DISPATCH
     BufferProto --> DISPATCH
+    ScaleProto --> DISPATCH
+    TimingProto --> DISPATCH
+    IdleProto --> DISPATCH
+    LockProto --> DISPATCH
+    ImeProto --> DISPATCH

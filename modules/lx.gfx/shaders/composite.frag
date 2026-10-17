@@ -18,8 +18,7 @@ layout(push_constant) uniform quad_push {
     vec4 src_bounds;  // u_lo, v_lo, u_hi, v_hi — half-texel inset sampling bounds
     int transfer;     // 0 linear, 1 sRGB, 2 gamma 2.2, 3 PQ, 4 HLG
     float pad1;
-    float pad2;
-    float pad3;
+    vec2 uv_dy;
 } push;
 
 layout(set = 0, binding = 0) uniform sampler2D surface_texture;

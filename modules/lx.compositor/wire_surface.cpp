@@ -42,11 +42,13 @@ import lx.wayland.server;
 import lx.gfx;
 import lx.trace;
 import lx.input;
+import lx.scene;
 import :surface;
 import :surface_tree;
 import :toplevel;
 import :output;
 import :dnd;
+import :viewport;
 import :wire;
 
 #if defined(LUMEN_HAS_WAYLAND)
@@ -62,9 +64,20 @@ region_obj regions[k_max_regions]{};
 // Pending frame callbacks across all surfaces (fired after present).
 struct pending_frame {
     wl_resource* resource = nullptr;
+    /// The surface whose content update queued it: its visibility paces the answer.
+    lx::surface_id surface{};
+    /// Held back by the throttle (its surface was not on screen at the last answer).
+    bool throttled = false;
 };
 pending_frame g_pending_frames[512]{};
 unsigned g_pending_frame_count = 0;
+/// Entries of `g_pending_frames` flagged `throttled`.
+unsigned g_throttled_frame_count = 0;
+
+/// A surface that is not on screen gets its frame callbacks at most this often (niri's
+/// FRAME_CALLBACK_THROTTLE): a window under another, off the output or hidden by the lock
+/// stops rendering at the display rate without being starved.
+constexpr unsigned long long k_frame_throttle_ns = 995'000'000ull;
 
 surface_obj* alloc_surface() {
     for (auto& s : surfaces)
@@ -83,6 +96,41 @@ lx::surface_id next_surface_id() {
 
 lx::client_id client_handle(wayland::client_connection& c) {
     return lx::client_id{c.id()};
+}
+
+/// Pixel size of a wl_buffer (shm or dma-buf); false for null or an unknown kind.
+bool buffer_dims(wl_resource* buffer, int& w, int& h) {
+    if (!buffer)
+        return false;
+    if (wl_shm_buffer* shm = wl_shm_buffer_get(buffer)) {
+        w = wl_shm_buffer_get_width(shm);
+        h = wl_shm_buffer_get_height(shm);
+        return w > 0 && h > 0;
+    }
+    if (const buffer_obj* b = find_buffer(buffer)) {
+        w = static_cast<int>(b->width);
+        h = static_cast<int>(b->height);
+        return w > 0 && h > 0;
+    }
+    return false;
+}
+
+lx::compositor::surface_geometry_in geometry_from(const surface_pending& st, int buffer_w,
+                                                  int buffer_h) {
+    lx::compositor::surface_geometry_in in{};
+    in.buffer_w = buffer_w;
+    in.buffer_h = buffer_h;
+    in.scale = st.scale > 0 ? st.scale : 1;
+    in.transform = static_cast<lx::buffer_transform>(st.transform & 7);
+    in.has_src = st.viewport.has_src;
+    in.src_x = st.viewport.src_x;
+    in.src_y = st.viewport.src_y;
+    in.src_w = st.viewport.src_w;
+    in.src_h = st.viewport.src_h;
+    in.has_dst = st.viewport.has_dst;
+    in.dst_w = st.viewport.dst_w;
+    in.dst_h = st.viewport.dst_h;
+    return in;
 }
 
 // ── wl_region ──────────────────────────────────────────────────────────────
@@ -131,14 +179,17 @@ void fire_frame_callback_now(wl_resource* cb) {
     wl_resource_destroy(cb);
 }
 
-void queue_frame_callback(wl_resource* cb) {
+void queue_frame_callback(wl_resource* cb, lx::surface_id surface) {
     if (!cb)
         return;
     if (g_pending_frame_count >= 512) {
         fire_frame_callback_now(cb);
         return;
     }
-    g_pending_frames[g_pending_frame_count++].resource = cb;
+    pending_frame& e = g_pending_frames[g_pending_frame_count++];
+    e.resource = cb;
+    e.surface = surface;
+    e.throttled = false;
 }
 
 /// libwayland destroys a client's resources on disconnect, so every table holding a
@@ -170,9 +221,41 @@ void frame_callback_destroy_resource(struct wl_resource* resource) {
 
 // ── wl_surface ─────────────────────────────────────────────────────────────
 
+lx::compositor::surface_geometry_in pending_geometry(const surface_obj* s) {
+    // The buffer the commit leaves in place: newly attached, else one a synchronized
+    // update still holds, else the one on screen.
+    int w = 0, h = 0;
+    const surface_pending& p = s->pending;
+    if (p.buffer_set) {
+        (void)buffer_dims(p.buffer, w, h);
+    } else if (s->has_cached && s->cached.buffer_set) {
+        (void)buffer_dims(s->cached.buffer, w, h);
+    } else if (s->has_content) {
+        if (!buffer_dims(s->current.buffer, w, h) && s->ctx && s->ctx->surfaces) {
+            // The wl_buffer object is gone; its content (and size) stays on screen.
+            const lx::size2i b = s->ctx->surfaces->buffer_size(s->id);
+            w = b.width;
+            h = b.height;
+        }
+    }
+    // Scale, transform and viewport are sticky in `pending`.
+    return geometry_from(p, w, h);
+}
+
+lx::compositor::surface_geometry_in current_geometry(const surface_obj* s) {
+    int w = 0, h = 0;
+    if (s->has_content && !buffer_dims(s->current.buffer, w, h) && s->ctx && s->ctx->surfaces) {
+        const lx::size2i b = s->ctx->surfaces->buffer_size(s->id);
+        w = b.width;
+        h = b.height;
+    }
+    return geometry_from(s->current, w, h);
+}
+
 /// Drops a surface's cached content update without applying it — for a client that is
 /// being torn down, whose buffers and callbacks libwayland is destroying anyway.
 void discard_cached(surface_obj* s) {
+    presentation_drop_cached(s);
     s->cached = {};
     s->has_cached = false;
 }
@@ -206,12 +289,23 @@ void surface_destroy_resource(struct wl_resource* resource) {
     }
     if (s->role == surface_role::cursor && s->ctx && s->ctx->cursor)
         s->ctx->cursor->on_surface_destroyed(s->id);
+    // A lock surface: its object goes inert, its output shows the solid colour.
+    if (s->lock_surface)
+        lock_surface_surface_destroyed(s);
+    // An input-method popup: hidden, its object inert.
+    if (s->input_popup)
+        input_popup_surface_destroyed(s);
     // A drag's icon or target: the drag goes on without it (the icon leaves its layer while
     // the tree still knows the root).
     if (s->ctx && s->ctx->dnd)
         s->ctx->dnd->on_surface_destroyed(s->id);
     // Activation tokens that name it as their requester (by id: nothing dangles).
     activation_surface_destroyed(s->id);
+    // Its wp_viewport and wp_fractional_scale_v1 go inert.
+    viewport_surface_destroyed(s);
+    // Every wp_presentation_feedback of its updates — pending, cached or in flight — is
+    // discarded ("its surface destroyed").
+    presentation_surface_destroyed(s);
     if (s->xdg) {
         s->xdg->surface = nullptr;
         if (s->xdg->toplevel)
@@ -260,6 +354,12 @@ void surface_attach(struct wl_client*, struct wl_resource* resource, struct wl_r
     auto* s = surface_from(resource);
     if (!s)
         return;
+    // wl_surface v5: the offset moved to wl_surface.offset; attach must pass 0, 0.
+    if (wl_resource_get_version(resource) >= WL_SURFACE_OFFSET_SINCE_VERSION && (x != 0 || y != 0)) {
+        wl_resource_post_error(resource, WL_SURFACE_ERROR_INVALID_OFFSET,
+                               "attach with a non-zero offset (use wl_surface.offset)");
+        return;
+    }
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
     // xdg-decoration v1: "any attempts by a client to attach or manipulate a buffer prior to
     // the first xdg_toplevel_decoration.configure event must also be treated as errors".
@@ -278,8 +378,10 @@ void surface_attach(struct wl_client*, struct wl_resource* resource, struct wl_r
         (void)track_shm_buffer(buffer, wl_shm_buffer_get(buffer));
     s->pending.buffer = buffer;
     s->pending.buffer_set = true;
-    s->pending.dx = x;
-    s->pending.dy = y;
+    if (wl_resource_get_version(resource) < WL_SURFACE_OFFSET_SINCE_VERSION) {
+        s->pending.dx = x;
+        s->pending.dy = y;
+    }
 }
 
 // Clips client damage to its buffer. "Everything" is conventionally x=0, y=0 with
@@ -302,32 +404,28 @@ lx::rect2i clip_damage_to_buffer(lx::rect2i damage, int width, int height) {
             static_cast<int>(y1 - y0)};
 }
 
-void surface_damage(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y,
-                    int32_t width, int32_t height) {
-    auto* s = surface_from(resource);
-    if (!s || width <= 0 || height <= 0)
+/// Adds `x, y, width, height` to an accumulated damage bbox. A client may send several
+/// damage requests per commit, and keeping only the last one under-reports what changed. A
+/// bbox union is enough here — the client's rects all land inside one window, and the
+/// window's damage is split from the others' in the scene's region. Formed in 64 bits:
+/// INT32_MAX extents are common ("everything", wev, GTK, SDL).
+void accumulate_damage(lx::rect2i& acc, bool& has, int32_t x, int32_t y, int32_t width,
+                       int32_t height) {
+    if (width <= 0 || height <= 0)
         return;
-    // Accumulate: a client may send several damage requests per commit, and keeping only
-    // the last one under-reports what changed. A bbox union is enough here — the client's
-    // rects all land inside one window, and the window's damage is split from the others'
-    // in the scene's region. Formed in 64 bits: INT32_MAX extents are common.
     const lx::rect2i incoming = clip_damage_to_buffer({x, y, width, height}, INT32_MAX, INT32_MAX);
     if (incoming.width <= 0 || incoming.height <= 0)
         return;
-    if (!s->pending.has_damage) {
-        s->pending.damage = incoming;
-        s->pending.has_damage = true;
-        return;
-    }
-    const lx::rect2i& d = s->pending.damage;
-    const int x0 = d.x < incoming.x ? d.x : incoming.x;
-    const int y0 = d.y < incoming.y ? d.y : incoming.y;
-    const long long x1 = std::max(static_cast<long long>(d.x) + d.width,
-                                  static_cast<long long>(incoming.x) + incoming.width);
-    const long long y1 = std::max(static_cast<long long>(d.y) + d.height,
-                                  static_cast<long long>(incoming.y) + incoming.height);
-    s->pending.damage = {x0, y0, static_cast<int>(std::min<long long>(x1 - x0, INT32_MAX)),
-                         static_cast<int>(std::min<long long>(y1 - y0, INT32_MAX))};
+    acc = has ? lx::compositor::union_rect(acc, incoming) : incoming;
+    has = true;
+}
+
+/// wl_surface.damage: surface-local (logical) coordinates.
+void surface_damage(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y,
+                    int32_t width, int32_t height) {
+    if (auto* s = surface_from(resource))
+        accumulate_damage(s->pending.damage_surface, s->pending.has_damage_surface, x, y, width,
+                          height);
 }
 
 void surface_frame(struct wl_client* client, struct wl_resource* resource, uint32_t callback_id) {
@@ -387,6 +485,30 @@ void surface_set_input_region(struct wl_client*, struct wl_resource* resource,
     }
 }
 
+/// wl_surface.invalid_size on the state the commit produces: without a viewport source,
+/// the buffer must be a multiple of the scale. Cursor and role-less surfaces are tolerated
+/// with one debug line (wlroots does the same; wayland#194 — cursor themes ship odd sizes).
+bool geometry_prechecks(surface_obj* s) {
+    const lx::compositor::surface_geometry_in in = pending_geometry(s);
+    if (lx::compositor::check_buffer_scale(in) == lx::compositor::surface_size_error::none)
+        return true;
+    if (s->role == surface_role::none || s->role == surface_role::cursor) {
+        if (!s->invalid_size_logged && surface_debug()) {
+            s->invalid_size_logged = true;
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                          "client bug: buffer %dx%d is not divisible by scale %d (surface=%llu, "
+                          "tolerated for this role)",
+                          in.buffer_w, in.buffer_h, in.scale, s->id.id());
+            surface_log(line);
+        }
+        return true;
+    }
+    wl_resource_post_error(s->resource, WL_SURFACE_ERROR_INVALID_SIZE,
+                           "buffer size is not divisible by the buffer scale");
+    return false;
+}
+
 /// A client that keeps committing an unimportable buffer would otherwise log once per
 /// frame on the commit hot path. Report the first failure and then periodically.
 void log_commit_failure(const lx::error& err) {
@@ -423,7 +545,7 @@ void commit_cursor_surface(surface_obj* s) {
                 s->id, static_cast<const uint32_t*>(wl_shm_buffer_get_data(shm)),
                 static_cast<unsigned>(width), static_cast<unsigned>(height),
                 static_cast<unsigned>(stride) / 4u, format == WL_SHM_FORMAT_XRGB8888,
-                s->current.dx, s->current.dy);
+                s->current.dx, s->current.dy, s->surface_size.width, s->surface_size.height);
             wl_shm_buffer_end_access(shm);
         }
     } else {
@@ -456,7 +578,8 @@ void remember_cursor_candidate(surface_obj* s) {
     s->ctx->cursor->on_client_surface_commit(
         s->id, static_cast<const uint32_t*>(wl_shm_buffer_get_data(shm)),
         static_cast<unsigned>(width), static_cast<unsigned>(height),
-        static_cast<unsigned>(stride) / 4u, format == WL_SHM_FORMAT_XRGB8888, 0, 0);
+        static_cast<unsigned>(stride) / 4u, format == WL_SHM_FORMAT_XRGB8888, 0, 0,
+        s->surface_size.width, s->surface_size.height);
     wl_shm_buffer_end_access(shm);
 }
 
@@ -497,9 +620,11 @@ void remember_cursor_candidate(surface_obj* s) {
 }
 
 /// Opaque content, for blending: a format without alpha, or an opaque region covering the
-/// whole buffer. Sub-rect opaque regions (split draws) are a follow-up.
-[[nodiscard]] bool content_opaque(const surface_obj* s, int width, int height) {
-    return s->format_opaque || region_covers(s->opaque_current, width, height);
+/// whole surface (the region is surface-local, so it is compared with the logical size).
+/// Sub-rect opaque regions (split draws) are a follow-up.
+[[nodiscard]] bool content_opaque(const surface_obj* s) {
+    return s->format_opaque ||
+           region_covers(s->opaque_current, s->surface_size.width, s->surface_size.height);
 }
 
 /// Content on this surface is drawn (once mapped), so a buffer must be imported and staged
@@ -523,6 +648,12 @@ void remember_cursor_candidate(surface_obj* s) {
     case surface_role::dnd_icon:
         // While the drag it was given to runs.
         return s->ctx->dnd && s->ctx->dnd->active() && s->ctx->dnd->icon() == s->id;
+    case surface_role::lock:
+        // While its ext_session_lock_surface_v1 lives and belongs to the lock in charge.
+        return lock_surface_drawable(s);
+    case surface_role::input_popup:
+        // While its zwp_input_popup_surface_v2 lives and its input method is the seat's.
+        return input_popup_drawable(s);
     default:
         return false;
     }
@@ -605,6 +736,8 @@ bool layer_prechecks(surface_obj* s) {
 bool role_prechecks(surface_obj* s) {
     if (s->role == surface_role::popup)
         return popup_prechecks(s);
+    if (s->role == surface_role::lock)
+        return lock_surface_precheck(s);
     if (s->role == surface_role::layer)
         return layer_prechecks(s);
     lx::compositor::toplevel_record* tl = nullptr;
@@ -648,22 +781,20 @@ void merge_pending_into_cached(surface_obj* s) {
     c.dy += p.dy;
     c.scale = p.scale;
     c.transform = p.transform;
-    if (p.has_damage) {
-        if (!c.has_damage) {
-            c.damage = p.damage;
-            c.has_damage = true;
-        } else {
-            const lx::rect2i& d = c.damage;
-            const lx::rect2i& n = p.damage;
-            const int x0 = d.x < n.x ? d.x : n.x;
-            const int y0 = d.y < n.y ? d.y : n.y;
-            const long long x1 = std::max(static_cast<long long>(d.x) + d.width,
-                                          static_cast<long long>(n.x) + n.width);
-            const long long y1 = std::max(static_cast<long long>(d.y) + d.height,
-                                          static_cast<long long>(n.y) + n.height);
-            c.damage = {x0, y0, static_cast<int>(std::min<long long>(x1 - x0, INT32_MAX)),
-                        static_cast<int>(std::min<long long>(y1 - y0, INT32_MAX))};
-        }
+    c.viewport = p.viewport;
+    // Damage of updates that were never applied accumulates, each kind in its own space:
+    // converting at apply time uses the geometry of the state that is finally applied.
+    if (p.has_damage_surface) {
+        c.damage_surface = c.has_damage_surface
+                               ? lx::compositor::union_rect(c.damage_surface, p.damage_surface)
+                               : p.damage_surface;
+        c.has_damage_surface = true;
+    }
+    if (p.has_damage_buffer) {
+        c.damage_buffer = c.has_damage_buffer
+                              ? lx::compositor::union_rect(c.damage_buffer, p.damage_buffer)
+                              : p.damage_buffer;
+        c.has_damage_buffer = true;
     }
     for (unsigned i = 0; i < p.frame_cb_count; ++i) {
         frame_callback cb = p.frame_cbs[i];
@@ -683,6 +814,8 @@ void merge_pending_into_cached(surface_obj* s) {
         c.frame_cbs[c.frame_cb_count++] = cb;
     }
     p.frame_cb_count = 0;
+    // Presentation feedback moves with the update; a cached update it replaces is discarded.
+    presentation_merge(s);
     if (p.input_set) {
         c.input = p.input;
         c.input_set = true;
@@ -695,17 +828,29 @@ void merge_pending_into_cached(surface_obj* s) {
     p.buffer_set = false;
     p.dx = 0;
     p.dy = 0;
-    p.damage = {};
-    p.has_damage = false;
+    p.damage_surface = {};
+    p.has_damage_surface = false;
+    p.damage_buffer = {};
+    p.has_damage_buffer = false;
     p.input_set = false;
     p.opaque_set = false;
     s->has_cached = true;
 }
 
+/// What one applied update damaged, in both spaces.
+struct update_damage {
+    bool any = false;
+    /// Surface-local (logical): what the scene repaints.
+    lx::rect2i surface{};
+    /// Buffer pixels: what the texture upload copies.
+    lx::rect2i buffer{};
+};
+
 /// The import path: hands a newly applied buffer to the surface manager, stages its pixels
 /// (shm) or describes the import (dma-buf) for the render thread, and releases or tracks
 /// the wl_buffer. Every texture update is stamped with the snapshot that may first show it.
-void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_damage) {
+void import_current_buffer(surface_obj* s, const update_damage& damage,
+                           const lx::compositor::surface_geometry& geo) {
     buffer_obj* buf = find_buffer(s->current.buffer);
     wl_shm_buffer* shm = wl_shm_buffer_get(s->current.buffer);
     if (!buf && shm)
@@ -749,15 +894,15 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
     commit.surface = s->id;
     commit.buffer = buf->id;
     commit.client = s->client;
-    commit.opaque =
-        content_opaque(s, static_cast<int>(buf->width), static_cast<int>(buf->height));
+    commit.opaque = content_opaque(s);
+    commit.surface_size = geo.size;
+    commit.src = geo.src;
+    commit.transform = geo.transform;
     // A new buffer with no damage request is treated as fully damaged: strictly the
     // client said nothing changed, but every real client that does this means "all of it".
-    if (had_damage)
-        commit.damage = clip_damage_to_buffer(pending_damage, static_cast<int>(buf->width),
-                                              static_cast<int>(buf->height));
-    else
-        commit.damage = {0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
+    const lx::rect2i whole{0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
+    commit.damage = damage.any ? damage.surface : lx::rect2i{0, 0, geo.size.width, geo.size.height};
+    const lx::rect2i buffer_damage = damage.any ? damage.buffer : whole;
 
     s->current_buffer_id = buf->id;
     s->current_texture = s->ctx->surfaces->texture_for(buf->id);
@@ -782,11 +927,9 @@ void import_current_buffer(surface_obj* s, bool had_damage, lx::rect2i pending_d
     lx::rect2i shm_region{};
     if (buf->is_shm && img.image_id) {
         // Buffer age: only what changed since this buffer's texture was last written (plus
-        // what its other GL name missed) is copied and uploaded. A scaled or transformed
-        // buffer's damage is not in buffer coordinates here, so it is staged whole.
-        const lx::rect2i whole{0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
-        const bool identity = s->current.scale <= 1 && s->current.transform == 0;
-        s->damage_history.record(identity ? commit.damage : whole);
+        // what its other GL name missed) is copied and uploaded — in buffer pixels, so a
+        // scaled, transformed or cropped client keeps partial uploads too.
+        s->damage_history.record(buffer_damage);
         if (s->ctx->shm_pool)
             shm_region = shm_upload_region(s->damage_history, buf->upload, s->id, buf->width,
                                            buf->height);
@@ -926,16 +1069,22 @@ void apply_core(surface_obj* s) {
     s->current.dy = c.dy;
     s->current.scale = c.scale;
     s->current.transform = c.transform;
+    s->current.viewport = c.viewport;
     // Damage is per update: it describes this change and nothing after it.
-    const bool had_damage = c.has_damage;
-    const lx::rect2i pending_damage = c.damage;
+    const bool had_surface_damage = c.has_damage_surface;
+    const lx::rect2i surface_dmg = c.damage_surface;
+    const bool had_buffer_damage = c.has_damage_buffer;
+    const lx::rect2i buffer_dmg = c.damage_buffer;
     for (unsigned i = 0; i < c.frame_cb_count; ++i) {
         const frame_callback cb = c.frame_cbs[i];
         c.frame_cbs[i] = {};
         if (cb.used)
-            queue_frame_callback(cb.resource);
+            queue_frame_callback(cb.resource, s->id);
     }
     c.frame_cb_count = 0;
+    // Its presentation feedback is queued, dated by the snapshot that first shows it; the
+    // update it replaces is discarded or superseded.
+    presentation_apply(s);
     if (c.input_set) {
         s->input_current = c.input;
         s->ctx->surfaces->set_input_region(s->id, s->input_current);
@@ -946,6 +1095,29 @@ void apply_core(surface_obj* s) {
     c = {};
     s->has_cached = false;
 
+    // The new current state's geometry: logical size, source box, transform (`:viewport`).
+    const lx::compositor::surface_geometry_in gin = current_geometry(s);
+    const lx::compositor::surface_geometry geo = lx::compositor::compute_geometry(gin);
+    const lx::size2i old_size = s->surface_size;
+    s->surface_size = geo.size;
+    if (surface_debug() && (old_size.width != geo.size.width || old_size.height != geo.size.height ||
+                            s->logged_buffer.width != gin.buffer_w ||
+                            s->logged_buffer.height != gin.buffer_h)) {
+        s->logged_buffer = {gin.buffer_w, gin.buffer_h};
+        // On a change only: what the client rendered against what it covers, which says
+        // whether its draw is 1:1 at the output scale.
+        const auto& vp = s->current.viewport;
+        char line[256];
+        std::snprintf(line, sizeof(line),
+                      "surface geometry surface=%llu buffer=%dx%d scale=%d transform=%d "
+                      "src=%s%.2f,%.2f,%.2fx%.2f dst=%s%dx%d size=%dx%d",
+                      s->id.id(), gin.buffer_w, gin.buffer_h, gin.scale,
+                      static_cast<int>(gin.transform), vp.has_src ? "" : "-",
+                      vp.src_x / 256.0, vp.src_y / 256.0, vp.src_w / 256.0, vp.src_h / 256.0,
+                      vp.has_dst ? "" : "-", vp.dst_w, vp.dst_h, geo.size.width, geo.size.height);
+        surface_log(line);
+    }
+
     if (s->role == surface_role::cursor) {
         if (new_buffer)
             commit_cursor_surface(s);
@@ -954,13 +1126,31 @@ void apply_core(surface_obj* s) {
 
     // State-only update, or a null buffer: there is no new content to import. An update
     // without an attach does not re-read the old buffer — an shm buffer was copied and
-    // released, and its storage now belongs to the client again.
+    // released, and its storage now belongs to the client again. Its geometry may still
+    // change (a new viewport, scale or transform on the content already shown).
     if (!new_buffer || !s->current.buffer) {
-        if (opaque_changed && s->has_content) {
-            const lx::size2i size = s->ctx->surfaces->buffer_size(s->id);
-            s->ctx->surfaces->set_opaque(s->id, content_opaque(s, size.width, size.height));
+        if (s->has_content && !new_buffer) {
+            s->ctx->surfaces->set_geometry(s->id, geo.size, geo.src, geo.transform);
+            if (opaque_changed || old_size.width != geo.size.width ||
+                old_size.height != geo.size.height)
+                s->ctx->surfaces->set_opaque(s->id, content_opaque(s));
         }
         return;
+    }
+
+    // Each damage kind converted into the other's space (wlroots' surface_update_damage):
+    // the scene repaints surface-local damage, the upload copies buffer damage.
+    update_damage damage{};
+    damage.any = had_surface_damage || had_buffer_damage;
+    if (had_surface_damage) {
+        damage.surface = lx::compositor::clip_to(surface_dmg, geo.size.width, geo.size.height);
+        damage.buffer = lx::compositor::surface_to_buffer_damage(surface_dmg, gin);
+    }
+    if (had_buffer_damage) {
+        damage.surface = lx::compositor::union_rect(
+            damage.surface, lx::compositor::buffer_to_surface_damage(buffer_dmg, gin));
+        damage.buffer = lx::compositor::union_rect(
+            damage.buffer, lx::compositor::clip_to(buffer_dmg, gin.buffer_w, gin.buffer_h));
     }
 
     // A role-less surface may still become the cursor: wl_pointer.set_cursor may name it
@@ -972,7 +1162,7 @@ void apply_core(surface_obj* s) {
         wl_buffer_send_release(s->current.buffer);
         return;
     }
-    import_current_buffer(s, had_damage, pending_damage);
+    import_current_buffer(s, damage, geo);
 }
 
 } // namespace
@@ -986,8 +1176,8 @@ void apply_cached(surface_obj* s, const char* cause, unsigned depth) {
     auto* tree = s->ctx->tree;
     if (!tree)
         return;
-    const lx::size2i size = s->ctx->surfaces->buffer_size(s->id);
-    tree->set_has_buffer(s->id, s->has_content && !size.empty());
+    const lx::size2i size = s->surface_size;
+    tree->set_has_buffer(s->id, s->has_content && !s->surface_size.empty());
     if (s->role == surface_role::subsurface && surface_debug()) {
         char line[192];
         std::snprintf(line, sizeof(line),
@@ -1006,12 +1196,23 @@ void apply_cached(surface_obj* s, const char* cause, unsigned depth) {
             apply_cached(child, "parent-commit", depth + 1);
     }
     tree->mark_dirty(s->id);
+    // text-input v2: a cursor rectangle staged for this surface applies with its content.
+    text_input_surface_applied(s);
 }
 
 namespace {
 
 /// The role's part of a commit of a root surface, after its tree has been applied.
 void finish_role(surface_obj* s) {
+    if (s->role == surface_role::lock) {
+        lock_surface_committed(s);
+        return;
+    }
+    if (s->role == surface_role::input_popup) {
+        // Shown or hidden, and placed at the text input's cursor, by the relay.
+        input_popup_committed(s);
+        return;
+    }
     if (s->role == surface_role::dnd_icon) {
         // The offset moves the icon relative to the hotspot; the tree sync that follows
         // places its nodes (and maps them, the first time it has content).
@@ -1023,7 +1224,7 @@ void finish_role(surface_obj* s) {
         if (!s->layer)
             return;
         lx::compositor::layer_commit_info info{};
-        info.size = s->ctx->surfaces->buffer_size(s->id);
+        info.size = s->surface_size;
         info.has_buffer = s->has_content && !info.size.empty();
         s->ctx->layers->on_commit(s->id, info);
         return;
@@ -1033,7 +1234,7 @@ void finish_role(surface_obj* s) {
         if (!rec)
             return;
         lx::compositor::popup_commit_info info{};
-        const lx::size2i size = s->ctx->surfaces->buffer_size(s->id);
+        const lx::size2i size = s->surface_size;
         info.has_buffer = s->has_content && !size.empty();
         const lx::rect2i bbox = s->ctx->tree ? s->ctx->tree->subtree_bbox(s->id)
                                              : lx::rect2i{0, 0, size.width, size.height};
@@ -1055,13 +1256,13 @@ void finish_role(surface_obj* s) {
         return;
     }
     lx::compositor::toplevel_commit_info info{};
-    info.buffer_size = s->ctx->surfaces->buffer_size(s->id);
-    info.has_buffer = s->has_content && !info.buffer_size.empty();
+    info.surface_size = s->surface_size;
+    info.has_buffer = s->has_content && !info.surface_size.empty();
     // After apply_cached, so this commit's synchronized subsurfaces are in it.
     if (s->ctx->tree)
         info.tree_bbox = s->ctx->tree->subtree_bbox(s->id);
     else if (info.has_buffer)
-        info.tree_bbox = {0, 0, info.buffer_size.width, info.buffer_size.height};
+        info.tree_bbox = {0, 0, info.surface_size.width, info.surface_size.height};
     s->ctx->wm->on_toplevel_commit(s->toplevel, info);
 }
 
@@ -1104,8 +1305,10 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
     if (!s || !s->ctx || !s->ctx->surfaces)
         return;
 
-    // Role rules that reject the whole commit come first, before any state moves.
-    if (!role_prechecks(s))
+    // Role rules that reject the whole commit come first, before any state moves; then
+    // the geometry the commit would produce (D5: checked here, at the client's commit, as
+    // wlroots does — the values are fixed by now).
+    if (!role_prechecks(s) || !geometry_prechecks(s) || !viewport_precheck(s))
         return;
 
     merge_pending_into_cached(s);
@@ -1136,18 +1339,31 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
 
 void surface_set_buffer_transform(struct wl_client*, struct wl_resource* resource,
                                   int32_t transform) {
+    if (transform < WL_OUTPUT_TRANSFORM_NORMAL || transform > WL_OUTPUT_TRANSFORM_FLIPPED_270) {
+        wl_resource_post_error(resource, WL_SURFACE_ERROR_INVALID_TRANSFORM,
+                               "buffer transform is not a wl_output.transform value");
+        return;
+    }
     if (auto* s = surface_from(resource))
         s->pending.transform = transform;
 }
 
 void surface_set_buffer_scale(struct wl_client*, struct wl_resource* resource, int32_t scale) {
+    if (scale <= 0) {
+        wl_resource_post_error(resource, WL_SURFACE_ERROR_INVALID_SCALE,
+                               "buffer scale is not positive");
+        return;
+    }
     if (auto* s = surface_from(resource))
-        s->pending.scale = scale > 0 ? scale : 1;
+        s->pending.scale = scale;
 }
 
+/// wl_surface.damage_buffer (v4): buffer pixels.
 void surface_damage_buffer(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y,
                            int32_t width, int32_t height) {
-    surface_damage(nullptr, resource, x, y, width, height);
+    if (auto* s = surface_from(resource))
+        accumulate_damage(s->pending.damage_buffer, s->pending.has_damage_buffer, x, y, width,
+                          height);
 }
 
 void surface_offset(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y) {
@@ -1157,10 +1373,11 @@ void surface_offset(struct wl_client*, struct wl_resource* resource, int32_t x, 
     }
 }
 
-/// A role object (wl_subsurface, xdg_toplevel, xdg_popup, zwlr_layer_surface_v1) still
-/// alive for this surface.
+/// A role object (wl_subsurface, xdg_toplevel, xdg_popup, zwlr_layer_surface_v1,
+/// ext_session_lock_surface_v1, zwp_input_popup_surface_v2) still alive for this surface.
 [[nodiscard]] bool has_live_role_object(const surface_obj* s) {
-    return s->sub != nullptr || s->layer != nullptr ||
+    return s->sub != nullptr || s->layer != nullptr || s->lock_surface != nullptr ||
+           s->input_popup != nullptr ||
            (s->xdg && (s->xdg->toplevel || s->xdg->popup));
 }
 
@@ -1286,21 +1503,59 @@ void bind_compositor(wayland::client_connection& client, unsigned id, int versio
     res.set_implementation(&compositor_impl, g_p0_ctx, nullptr);
 }
 
-void fire_frames(unsigned frame_time_ms) {
-    for (unsigned i = 0; i < g_pending_frame_count; ++i) {
-        auto* cb = g_pending_frames[i].resource;
+bool surface_visible(lx::surface_id surface, unsigned frame) {
+    if (!g_p0_ctx || !g_p0_ctx->surfaces)
+        return false;
+    const lx::scene::surface_node* n = g_p0_ctx->surfaces->node(surface);
+    return n && n->visible_in(frame);
+}
+
+void fire_frames(unsigned frame_time_ms, bool throttle, unsigned visible_frame,
+                 unsigned long long now_ns) {
+    if (g_pending_frame_count == 0)
+        return;
+    if (now_ns == 0) {
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        now_ns = static_cast<unsigned long long>(ts.tv_sec) * 1'000'000'000ull +
+                 static_cast<unsigned long long>(ts.tv_nsec);
+    }
+    unsigned kept = 0;
+    const unsigned count = g_pending_frame_count;
+    for (unsigned i = 0; i < count; ++i) {
+        const pending_frame e = g_pending_frames[i];
         // Clear the slot before destroying: wl_resource_destroy runs the destructor, which
         // scans this same table.
         g_pending_frames[i] = {};
-        if (cb) {
-            wl_callback_send_done(cb, frame_time_ms);
-            wl_resource_destroy(cb);
+        if (!e.resource)
+            continue;
+        surface_obj* s = surface_by_id(e.surface);
+        bool answer = !throttle || !s || s->role == surface_role::cursor ||
+                      surface_visible(e.surface, visible_frame);
+        // Not on screen: answered once its surface's throttle interval has passed. A
+        // surface answered earlier in this same pass counts as due (`frame_done_ns == now`),
+        // so all of one surface's callbacks go together.
+        if (!answer)
+            answer = s->frame_done_ns == 0 || s->frame_done_ns == now_ns ||
+                     now_ns - s->frame_done_ns >= k_frame_throttle_ns;
+        if (!answer) {
+            pending_frame& k = g_pending_frames[kept++];
+            k = e;
+            k.throttled = true;
+            continue;
         }
+        if (s)
+            s->frame_done_ns = now_ns;
+        wl_callback_send_done(e.resource, frame_time_ms);
+        wl_resource_destroy(e.resource);
     }
-    g_pending_frame_count = 0;
+    g_pending_frame_count = kept;
+    g_throttled_frame_count = kept;
 }
 
-bool frames_pending() { return g_pending_frame_count > 0; }
+bool frames_pending() { return g_pending_frame_count > g_throttled_frame_count; }
+
+bool frames_throttled() { return g_throttled_frame_count > 0; }
 
 } // namespace lx::compositor::p0
 

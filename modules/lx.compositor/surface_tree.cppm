@@ -15,7 +15,7 @@ export namespace lx::compositor {
 
 /// What a root surface plays. A subsurface is never a root: it always has a parent.
 /// `dnd_icon`: a drag-and-drop icon (wl_data_device.start_drag), drawn above the popups.
-enum class root_kind : unsigned char { none, toplevel, popup, layer, dnd_icon };
+enum class root_kind : unsigned char { none, toplevel, popup, layer, dnd_icon, lock, input_popup };
 
 inline constexpr unsigned k_tree_max_surfaces = 256;
 /// Children per parent; one more slot holds the parent's own "self" marker.
@@ -334,6 +334,10 @@ constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
         return "layer";
     case lx::compositor::root_kind::dnd_icon:
         return "dnd_icon";
+    case lx::compositor::root_kind::lock:
+        return "lock";
+    case lx::compositor::root_kind::input_popup:
+        return "input_popup";
     case lx::compositor::root_kind::none:
         break;
     }
@@ -728,6 +732,10 @@ bool lx::compositor::surface_tree::make_root(lx::surface_id id, root_kind kind) 
     if (e->linked || e->parent)
         return false;
     e->container = new scene::container_node{};
+    // The window's nodes round their edges relative to its root origin (`project_node`),
+    // which the container carries.
+    e->container->set_anchor(true);
+    e->container->set_transform(e->root_origin);
     e->kind = kind;
     return true;
 }
@@ -836,6 +844,8 @@ void lx::compositor::surface_tree::set_root_origin(lx::surface_id root, lx::poin
     const int dx = origin.x - e->root_origin.x;
     const int dy = origin.y - e->root_origin.y;
     e->root_origin = origin;
+    if (e->container)
+        e->container->set_transform(origin);
     // A dirty tree is recomputed from `root_origin` by the sync its caller runs next (a
     // commit's finish, or the window manager right after a move), which damages what moved.
     if (!e->root_mapped || !e->container || !surfaces_ || e->scene_dirty)
@@ -995,7 +1005,7 @@ void lx::compositor::surface_tree::bbox_walk(const entry& e, lx::point2i origin,
     for (unsigned i = 0; i < e.order.count; ++i) {
         const lx::surface_id sid = e.order.ids[i];
         if (sid == e.id) {
-            const lx::size2i size = surfaces_ ? surfaces_->buffer_size(sid) : lx::size2i{};
+            const lx::size2i size = surfaces_ ? surfaces_->surface_size(sid) : lx::size2i{};
             if (size.empty())
                 continue;
             const long long ax = origin.x, ay = origin.y;

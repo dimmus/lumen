@@ -259,6 +259,8 @@ struct wire_log {
     unsigned focus_changes = 0;
     unsigned moved = 0;
     unsigned unmapped = 0;
+    unsigned mapped = 0;
+    lx::surface_id last_mapped{};
 };
 wire_log* g_wire = nullptr;
 
@@ -302,6 +304,10 @@ struct fixture {
         host.focus_changed = [](void*) { ++g_wire->focus_changes; };
         host.surface_moved = [](void*, lx::surface_id) { ++g_wire->moved; };
         host.surface_unmapped = [](void*, lx::surface_id, const char*) { ++g_wire->unmapped; };
+        host.surface_mapped = [](void*, lx::surface_id s) {
+            ++g_wire->mapped;
+            g_wire->last_mapped = s;
+        };
         layers.set_host(host);
     }
 
@@ -457,6 +463,37 @@ LUMEN_TEST(layer_exclusive_focus_is_the_newest_on_the_highest_layer) {
     f->map(on_demand);
     LUMEN_CHECK(f->layers.focusable(on_demand) && f->layers.click_focusable(on_demand));
     LUMEN_CHECK(!f->layers.click_focusable(top)); // exclusive above the windows: not by click
+}
+
+LUMEN_TEST(layer_on_demand_on_top_or_overlay_takes_focus_on_map) {
+    auto f = make_fixture();
+    auto od = props(0, 100, 100);
+    od.interactivity = 2; // on_demand
+    const auto overlay = f->create(1, 3, od);
+    LUMEN_CHECK(!f->layers.focus_on_map(overlay)); // not mapped yet
+    const unsigned before = f->wire.mapped;
+    f->map(overlay);
+    LUMEN_CHECK(f->wire.mapped == before + 1 && f->wire.last_mapped == overlay);
+    LUMEN_CHECK(f->layers.focus_on_map(overlay));
+    LUMEN_CHECK(f->layers.mapped_level(overlay) == 3);
+    const auto top = f->create(2, 2, od);
+    f->map(top);
+    LUMEN_CHECK(f->layers.focus_on_map(top));
+    // Below the windows on_demand keeps click-to-focus; none never takes the keyboard.
+    const auto bottom = f->create(3, 1, od);
+    f->map(bottom);
+    LUMEN_CHECK(!f->layers.focus_on_map(bottom) && f->layers.click_focusable(bottom));
+    const auto quiet = f->create(4, 3, props(0, 10, 10));
+    f->map(quiet);
+    LUMEN_CHECK(!f->layers.focus_on_map(quiet));
+    // Exclusive is exclusive_focus's, not this rule's.
+    auto ex = props(0, 10, 10);
+    ex.interactivity = 1;
+    const auto excl = f->create(5, 3, ex);
+    f->map(excl);
+    LUMEN_CHECK(!f->layers.focus_on_map(excl));
+    f->layers.on_commit(overlay, {}); // unmapped
+    LUMEN_CHECK(!f->layers.focus_on_map(overlay) && f->layers.mapped_level(overlay) == -1);
 }
 
 LUMEN_TEST(layer_closed_when_no_room_is_left_and_inert_afterwards) {

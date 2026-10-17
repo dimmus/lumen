@@ -86,6 +86,13 @@ struct keymap_source {
 
 } // namespace
 
+bool seat_keymap(int& fd, unsigned& size) {
+    const keymap_source& k = shared_keymap();
+    fd = k.fd;
+    size = k.size;
+    return k.fd >= 0;
+}
+
 // ── pointer cursor ─────────────────────────────────────────────────────────
 
 /// A cursor request counts only from the client holding pointer focus, quoting an `enter`

@@ -259,7 +259,7 @@ int main() {
     }
     {
         const auto st = comp.outputs().state(comp.outputs().nth(0));
-        g_want = {st.name, st.geometry.x, st.geometry.y, st.geometry.width, st.geometry.height,
+        g_want = {st.name, st.position.x, st.position.y, st.mode.width, st.mode.height,
                   static_cast<int>(st.refresh_mhz)};
         std::printf("  output under test: %s %dx%d+%d+%d @%d mHz\n", g_want.name.c_str(),
                     g_want.w, g_want.h, g_want.x, g_want.y, g_want.refresh);

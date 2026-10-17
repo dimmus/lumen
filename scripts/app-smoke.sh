@@ -76,8 +76,9 @@
 #     D3 an overlay anchored bottom-right with margins sits exactly at the corner minus them
 #     D4 an exclusive overlay takes every key from the focused window, a click on the window
 #        does not take them back, and when it unmaps the keys return
-#     D5 an on_demand surface gets no keys when it maps, gets them when clicked, and loses
-#        them to a click on the window
+#     D5 an on_demand surface on the top layer takes the keys when it maps (sway's rule, which
+#        the launcher relies on), keeps them through a click on itself, and loses them to a
+#        click on the window
 #     D6 maximize fills the usable area exactly and restore returns to the previous rect:
 #        foot (server-side frame, title-bar double click; the frame's extents come off) and
 #        gtk4-demo (client-side, header-bar double click → xdg_toplevel.set_maximized)
@@ -181,6 +182,74 @@
 #        marked; J5c an unknown token proves nothing: at map `result=granted reason=new_window`
 #     J6 real foot started with XDG_ACTIVATION_TOKEN from the issuer: granted, and foot logs
 #        nothing about XDG activation (it warned while the global was missing)
+#   S  wp_viewporter and wp_fractional_scale_v1 at the run's scale (1; the fractional
+#      scales are scripts/scale-smoke.sh's, which restarts the compositor per scale)
+#     S1 lumen-probe scale: preferred_scale 120 arrives before the first configure, the
+#        client renders a buffer exactly its viewport destination (1:1), the compositor's
+#        `surface geometry` line agrees, and hit-testing ends at the surface's last pixel
+#        (the probe sees its last column, then leave one pixel further)
+#     S2 a viewport crop scaled up: --buffer 200x100 cropped to its top-right quadrant
+#        (100,0 100x50) and scaled to 300x150 maps at 300x150; a screenshot of the frame
+#        (SIGUSR1) shows the quadrant's green, its white frame at the edges, nothing of the
+#        neighbouring quadrants
+#     S3 real clients: no foot log of the run warns that fractional scaling is missing;
+#        GTK's trace (H5) binds wp_fractional_scale_manager_v1 and wp_viewporter and is told
+#        preferred_scale 120
+#   P  wp_presentation (lumen-probe presentation: one wp_presentation_feedback per commit)
+#     P1 a client drawing continuously, paced by frame callbacks (180 frames): clock_id is
+#        CLOCK_MONOTONIC; every frame is presented (none discarded, none left pending), each
+#        preceded by sync_output for its wl_output; refresh is the output mode's period;
+#        flags always carry vsync and hw_completion, and hw_clock exactly when the driver
+#        gives a vblank counter (seq > 0, then strictly increasing; vmwgfx has none: seq 0);
+#        presentation times strictly increase, no faster than the refresh, after the commit
+#     P2 superseded commits: three commits per frame (--burst 3, 90 commits): the first two
+#        of every frame are discarded, the last presented
+#     P3 occlusion: a maximized opaque probe covers an animating one; while covered the
+#        lower one presents nothing (its updates are not on screen), its frame callbacks are
+#        throttled to about one a second and each throttled commit discards the previous;
+#        uncovered, it presents again at the display rate
+#   K  idle, inhibition and display power (lumen-probe idle / inhibit / power)
+#     K1 ext_idle_notification_v1 with a 1.5 s timeout: idled 1.5 s after it was created
+#        (no input meanwhile), resumed by an injected motion, idled again 1.5 s later
+#     K2 a visible zwp_idle_inhibitor_v1 holds an inhibitor-obeying notification back (an
+#        input-only one, v2, idles regardless); covered by a maximized opaque window the
+#        inhibitor is not honoured and the notification idles 1.5 s after the cover mapped
+#     K3 zwlr_output_power_v1 off: the CRTC goes off (ACTIVE=0), nothing is composited or
+#        committed while dark; an injected key wakes it — the key reaches no client (nor its
+#        release), the next key does — with one full repaint, and every power object hears
+#        `mode off` then `mode on`
+#   L  session lock (lumen-probe lock: a minimal locker; ext-session-lock-v1)
+#     L1 a locker with a lock surface: input leaves the focused window at the lock request,
+#        `locked` follows the first locked frame (awaiting → locking → locked, within 0.5 s),
+#        the lock surface takes the keyboard; keys and a click reach the lock surface only (the
+#        window sees neither); a wrong test password is refused, the right one unlocks, and
+#        the window has the keyboard again (its next key reaches it)
+#     L2 the locker dies while locked: the session stays locked (abandoned, dark red over the
+#        whole output in a screenshot), keys reach nobody; a new locker takes over and is
+#        `locked` at once, then unlocks
+#     L3 a locker without lock surfaces: `locked` after the compositor's 1 s wait, the output
+#        a solid colour (screenshot black)
+#     L4 logind's Unlock (loginctl unlock-session): the live locker is sent `finished`,
+#        answers with unlock_and_destroy, the session is unlocked
+#   M  text input and input methods (lumen-probe text-input / im: text-input-v3 v2,
+#      input-method-v2, virtual-keyboard-v1; foot and GTK 4 as real text inputs)
+#     M1 the probe window's text input is entered once the input method binds and enables;
+#        the input method is activated with the window's state; two KEY_A presses go to the
+#        input method's grab (never to the window) and come back as preedit "α", "αα"; space
+#        commits "αα" (done carries the window's commit count); KEY_B is forwarded through the
+#        virtual keyboard and reaches the window. The popup is shown exactly below the cursor
+#        rectangle (window origin + 20,40+18; v2: once the window's surface commit applied
+#        it), told text_input_rectangle 0,-18 2x18, and is on screen (screenshot)
+#     M2 focus moves to another window: the text input is left, the input method deactivated,
+#        the popup hidden, and KEY_C reaches the other window directly (the grab never sees
+#        it); the other window goes: entered, activated, the popup back, KEY_D forwarded
+#     M3 the session locks while the text input is active: left, deactivated, the popup
+#        hidden, KEY_E reaches the lock surface only; unlocked: entered and active again
+#     M4 foot: no "text input" warning; the probe input method composes "αα" into foot
+#        running `cat` (foot is sent preedit_string "α"/"αα" and commit_string "αα"), keys
+#        typed after it arrive through the virtual keyboard — the file holds "ααxyz"
+#     M5 GTK 4 (gtk4-demo entry_undo, WARN-level): binds text input v2, gets preedit "αα"
+#        and commit_string "αα" from the probe input method
 #   X  robustness: lumen-square --sub --destroy-parent-first tears the parent wl_surface
 #      down before the strip's wl_subsurface; no protocol error, compositor alive
 #
@@ -213,7 +282,7 @@ SOCKET="lumen-app-smoke"
 LOG_DIR="${ROOT}/app-smoke-logs"
 JOIN_SEAT=0
 COUNTDOWN=3
-ONLY="A,B,C,D,E,F,G,H,I,J,X"
+ONLY="A,B,C,D,E,F,G,H,I,J,S,P,K,L,M,X"
 SKIP_GTK=0
 while (( $# > 0 )); do
   case "$1" in
@@ -231,7 +300,7 @@ done
 want() { [[ ",${ONLY}," == *",$1,"* ]]; }
 for g in ${ONLY//,/ }; do
   case "$g" in
-    A|B|C|D|E|F|G|H|I|J|X) ;;
+    A|B|C|D|E|F|G|H|I|J|S|P|K|L|M|X) ;;
     *) echo "unknown group '$g' (see --help)"; exit 2 ;;
   esac
 done
@@ -246,7 +315,7 @@ mkdir -p "$LOG_DIR"
 for f in "$COMP_LOG" "$INJ_LOG" "$SCEN_LOG" "$WATCH_LOG"; do : > "$f"; done
 rm -f "$LOG_DIR"/foot*.log "$LOG_DIR"/gtk*.log "$LOG_DIR"/square*.log "$LOG_DIR"/probe*.log \
   "$LOG_DIR"/shell*.log "$LOG_DIR"/fake-shell* "$LOG_DIR"/alacritty*.log "$LOG_DIR"/F*.out \
-  "$LOG_DIR"/J*.token "$LOG_DIR"/J*.go
+  "$LOG_DIR"/J*.token "$LOG_DIR"/J*.go "$LOG_DIR"/lumen-screenshot-*.ppm
 
 exec > >(tee "$RUN_LOG") 2>&1
 TEE_PID=$!
@@ -457,10 +526,11 @@ fi
 
 echo "1/2  compositor on $SOCKET (LUMEN_LOG=debug) ..."
 if (( ! IN_SEAT && JOIN_SEAT )); then
-  bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && exec env LUMEN_LOG=debug "$2" "$3" --ping-timeout 1500' \
-    _ "$SEAT_SCOPE" "$COMP" "$SOCKET" >"$COMP_LOG" 2>&1 &
+  bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && exec env LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$4" "$2" "$3" --ping-timeout 1500' \
+    _ "$SEAT_SCOPE" "$COMP" "$SOCKET" "$LOG_DIR" >"$COMP_LOG" 2>&1 &
 else
-  LUMEN_LOG=debug "$COMP" "$SOCKET" --ping-timeout 1500 >"$COMP_LOG" 2>&1 &
+  LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$LOG_DIR" "$COMP" "$SOCKET" --ping-timeout 1500 \
+    >"$COMP_LOG" 2>&1 &
 fi
 COMP_PID=$!
 if ! wait_for "$COMP_LOG" "output 0 mode=" 10 || ! wait_for "$COMP_LOG" "libinput seat opened" 3; then
@@ -921,8 +991,8 @@ if want D; then
   finish id="$TOP_ID"
   SCEN=park; inject move 20 $((OUT_H - 20))
 
-  # D5 — an on_demand surface under the panel. Keys: A after clicking it, B after a (right)
-  # click on the window.
+  # D5 — an on_demand surface under the panel. It has the keys from its map; A after a click
+  # on it (which keeps them), B after a (right) click on the window.
   begin D5
   start_client probe-d5-window "$PROBE" popup --size 400x300 --exit-after 600
   TOP_PID=$LAST_PID
@@ -1846,6 +1916,307 @@ if want J; then
   SCEN=park; inject move 20 $((OUT_H - 20))
 fi
 
+if want S; then
+  # S1 — the fractional-scale protocol at scale 1, and hit-testing at the last pixel.
+  begin S1
+  start_client probe-s1 "$PROBE" scale --size 300x200 --exit-after 30
+  S_PID=$LAST_PID
+  S_ID=$(wait_map lumen-probe 5) && settle "$S_ID"
+  if (( S_ID > 0 )); then
+    read -r X Y W H < <(geom "$S_ID")
+    inject move $((X + W / 2)) $((Y + H / 2)); sleep 0.3
+    inject move $((X + W - 1)) $((Y + H / 2)); sleep 0.3
+    inject move $((X + W + 1)) $((Y + H / 2)); sleep 0.4
+  fi
+  stop_client "$S_PID"; forget_client "$S_PID"
+  finish id="${S_ID:-0}"
+  SCEN=park; inject move 20 $((OUT_H - 20))
+
+  # S2 — a cropped, scaled viewport, judged from a screenshot of the frame.
+  begin S2
+  start_client probe-s2 "$PROBE" scale --buffer 200x100 --crop 100,0,100,50 --dst 300x150 \
+    --exit-after 30
+  S_PID=$LAST_PID
+  S_ID=$(wait_map lumen-probe 5) && settle "$S_ID"
+  SHOT=""
+  if (( S_ID > 0 )); then
+    sleep 0.3
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    if wait_for "$COMP_LOG" "screenshot [0-9]+x[0-9]+ written to " 4; then
+      SHOT=$(grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //')
+    fi
+  fi
+  stop_client "$S_PID"; forget_client "$S_PID"
+  finish id="${S_ID:-0}" shot="\"${SHOT}\""
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want P; then
+  wait_exit() { # pid seconds — the client ends on its own (it prints its summary first)
+    local deadline=$(( $(date +%s%N) + ${2}000000000 ))
+    while kill -0 "$1" 2>/dev/null && (( $(date +%s%N) < deadline )); do sleep 0.1; done
+    stop_client "$1"; forget_client "$1"
+  }
+  # P1 — a continuously drawing client: every frame presented, with the flip's timing.
+  begin P1
+  start_client probe-p1 "$PROBE" presentation --frames 180 --size 400x300 --exit-after 40
+  P_PID=$LAST_PID
+  P_ID=$(wait_map lumen-probe 5)
+  wait_exit "$P_PID" 30
+  finish id="${P_ID:-0}"
+
+  # P2 — three commits per frame: two superseded before they can be shown.
+  begin P2
+  start_client probe-p2 "$PROBE" presentation --burst 3 --frames 90 --size 300x200 --exit-after 30
+  P_PID=$LAST_PID
+  P_ID=$(wait_map lumen-probe 5)
+  wait_exit "$P_PID" 25
+  finish id="${P_ID:-0}"
+
+  # P3 — covered by a maximized opaque window: nothing presented, callbacks throttled.
+  begin P3
+  start_client probe-p3a "$PROBE" presentation --frames 0 --size 300x200 --exit-after 40
+  P3A_PID=$LAST_PID
+  P3A_ID=$(wait_map lumen-probe 5)
+  sleep 1
+  start_client probe-p3b "$PROBE" presentation --maximize --frames 120 --title lumen-p3b \
+    --exit-after 30
+  P3B_PID=$LAST_PID
+  wait_exit "$P3B_PID" 25
+  sleep 2
+  stop_client "$P3A_PID"; forget_client "$P3A_PID"
+  finish id="${P3A_ID:-0}"
+fi
+
+if want K; then
+  # K1 — idle after the timeout, resumed by input, idle again.
+  begin K1
+  start_client probe-k1 "$PROBE" idle --timeout 1500 --exit-after 20
+  K1_PID=$LAST_PID
+  sleep 3
+  inject move 333 222
+  sleep 2.5
+  stop_client "$K1_PID"; forget_client "$K1_PID"
+  finish
+
+  # K2 — a visible inhibitor holds idling back; covered, it does not.
+  begin K2
+  start_client probe-k2i "$PROBE" inhibit --size 360x240 --title lumen-k2-inhibit --exit-after 40
+  K2I_PID=$LAST_PID
+  wait_map lumen-probe 5 >/dev/null
+  sleep 0.5
+  start_client probe-k2 "$PROBE" idle --timeout 1500 --exit-after 30
+  K2_PID=$LAST_PID
+  start_client probe-k2in "$PROBE" idle --timeout 1500 --input-only --exit-after 30
+  K2IN_PID=$LAST_PID
+  sleep 3.5
+  K2_COVER_AT=$(python3 -c 'import time;print("%.3f"%time.clock_gettime(time.CLOCK_MONOTONIC))')
+  start_client probe-k2c "$PROBE" popup --maximize --title lumen-k2-cover --exit-after 30
+  K2C_PID=$LAST_PID
+  sleep 3
+  for pid in "$K2C_PID" "$K2_PID" "$K2IN_PID" "$K2I_PID"; do stop_client "$pid"; forget_client "$pid"; done
+  finish cover_at="$K2_COVER_AT"
+
+  # K3 — power off, nothing committed while dark, a key wakes it and is swallowed.
+  begin K3
+  start_client probe-k3k "$PROBE" popup --size 300x200 --title lumen-k3-keys --exit-after 40
+  K3K_PID=$LAST_PID
+  wait_map lumen-probe 5 >/dev/null
+  sleep 1
+  start_client probe-k3p "$PROBE" power --set off --exit-after 30
+  K3P_PID=$LAST_PID
+  sleep 2.5
+  inject key KEY_A tap
+  sleep 1.5
+  inject key KEY_B tap
+  sleep 1
+  for pid in "$K3P_PID" "$K3K_PID"; do stop_client "$pid"; forget_client "$pid"; done
+  finish
+fi
+
+if want L; then
+  shot() { # a screenshot of the next frame; prints its path (empty when none came)
+    local n
+    n=$(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG")
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    local deadline=$(( $(date +%s%N) + 4000000000 ))
+    while (( $(date +%s%N) < deadline )); do
+      if (( $(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG") > n )); then
+        grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //'
+        return 0
+      fi
+      sleep 0.05
+    done
+  }
+  # L1 — lock, keys and clicks only to the lock surface, a test password unlocks.
+  begin L1
+  start_client probe-l1w "$PROBE" popup --size 360x240 --title lumen-l1-win --exit-after 60
+  L1W_PID=$LAST_PID
+  L1_ID=$(wait_map lumen-probe 5) && settle "$L1_ID"
+  read -r L1X L1Y L1WW L1WH < <(geom "$L1_ID")
+  sleep 0.5
+  start_client probe-l1 "$PROBE" lock --password 42 --exit-after 30
+  L1_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-l1.log" "^lock locked" 3
+  sleep 0.5
+  inject key KEY_A tap
+  inject move $((L1X + L1WW / 2)) $((L1Y + L1WH / 2))
+  inject button left click
+  inject type 41
+  inject key KEY_ENTER tap
+  sleep 0.5
+  inject type 42
+  inject key KEY_ENTER tap
+  wait_for "$LOG_DIR/probe-l1.log" "^lock unlocked" 3
+  sleep 0.5
+  inject key KEY_B tap
+  sleep 0.5
+  stop_client "$L1_PID"; forget_client "$L1_PID"
+  finish id="${L1_ID:-0}"
+
+  # L2 — the locker dies: abandoned (dark red), keys reach nobody; a replacement unlocks.
+  begin L2
+  start_client probe-l2 "$PROBE" lock --crash-after 1 --exit-after 20
+  L2_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-l2.log" "^lock crash" 5
+  sleep 0.5
+  L2_SHOT=$(shot)
+  inject key KEY_C tap
+  sleep 0.3
+  stop_client "$L2_PID"; forget_client "$L2_PID"
+  start_client probe-l2r "$PROBE" lock --unlock-after 1 --exit-after 20
+  L2R_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-l2r.log" "^lock unlocked" 5
+  sleep 0.3
+  stop_client "$L2R_PID"; forget_client "$L2R_PID"
+  finish shot="\"${L2_SHOT}\""
+
+  # L3 — no lock surface: locked after the 1 s wait, a solid colour.
+  begin L3
+  start_client probe-l3 "$PROBE" lock --no-surfaces --unlock-after 1.5 --exit-after 20
+  L3_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-l3.log" "^lock locked" 3
+  sleep 0.3
+  L3_SHOT=$(shot)
+  wait_for "$LOG_DIR/probe-l3.log" "^lock unlocked" 5
+  stop_client "$L3_PID"; forget_client "$L3_PID"
+  finish shot="\"${L3_SHOT}\""
+
+  # L4 — logind's Unlock finishes a live locker.
+  begin L4
+  start_client probe-l4 "$PROBE" lock --exit-after 20
+  L4_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-l4.log" "^lock locked" 3
+  L4_SESSION=$(grep -m1 -oE "compositor.session: session [^ ]+ vt=" "$COMP_LOG" | awk '{print $3}')
+  [[ -n "$L4_SESSION" && "$L4_SESSION" != "-" ]] && sudo -n loginctl unlock-session "$L4_SESSION"
+  wait_for "$LOG_DIR/probe-l4.log" "^lock finished" 3
+  sleep 0.5
+  stop_client "$L4_PID"; forget_client "$L4_PID"
+  stop_client "$L1W_PID"; forget_client "$L1W_PID"
+  finish
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want M; then
+  mshot() { # a screenshot of the next frame; prints its path (empty when none came)
+    local n
+    n=$(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG")
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    local deadline=$(( $(date +%s%N) + 4000000000 ))
+    while (( $(date +%s%N) < deadline )); do
+      if (( $(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG") > n )); then
+        grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //'
+        return 0
+      fi
+      sleep 0.05
+    done
+  }
+  # M1 — compose into the probe window; the popup at its cursor.
+  begin M1
+  start_client probe-m1 "$PROBE" text-input --size 500x300 --title lumen-m1-ti --exit-after 90
+  M1_PID=$LAST_PID
+  M1_ID=$(wait_map lumen-probe 5) && settle "$M1_ID"
+  start_client probe-m1im "$PROBE" im --exit-after 90
+  M1IM_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-m1im.log" "^im grab keymap" 4
+  sleep 0.5
+  inject key KEY_A tap; sleep 0.3
+  inject key KEY_A tap; sleep 0.5
+  M1_SHOT=$(mshot)
+  inject key KEY_SPACE tap; sleep 0.3
+  inject key KEY_B tap; sleep 0.5
+  # A click on the popup (a candidate): the input method gets it, the keyboard stays.
+  read -r M1X M1Y M1W M1H < <(geom "${M1_ID:-0}")
+  inject move $((M1X + 20 + 60)) $((M1Y + 58 + 20 + 2))
+  inject move $((M1X + 20 + 60)) $((M1Y + 58 + 20))
+  inject button left click; sleep 0.3
+  inject key KEY_F tap; sleep 0.4
+  inject move $((M1X + 250)) $((M1Y + 250))
+  sleep 0.3
+  finish id="${M1_ID:-0}" shot="\"${M1_SHOT}\""
+
+  # M2 — focus elsewhere and back.
+  begin M2
+  start_client probe-m2 "$PROBE" popup --size 300x200 --title lumen-m2-other --exit-after 30
+  M2_PID=$LAST_PID
+  wait_map lumen-probe 5 >/dev/null
+  sleep 0.8
+  inject key KEY_C tap; sleep 0.5
+  stop_client "$M2_PID"; forget_client "$M2_PID"
+  wait_for "$LOG_DIR/probe-m1im.log" "^im activate" 3
+  sleep 0.8
+  inject key KEY_D tap; sleep 0.5
+  finish
+
+  # M3 — locked while active: no text-input focus until unlocked.
+  begin M3
+  start_client probe-m3 "$PROBE" lock --unlock-after 2 --exit-after 20
+  M3_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-m3.log" "^lock locked" 3
+  sleep 0.3
+  inject key KEY_E tap
+  wait_for "$LOG_DIR/probe-m3.log" "^lock unlocked" 5
+  sleep 0.8
+  stop_client "$M3_PID"; forget_client "$M3_PID"
+  stop_client "$M1_PID"; forget_client "$M1_PID"
+  finish
+
+  # M4 — foot: compose into `cat`.
+  begin M4
+  rm -f "$LOG_DIR/M4.out"
+  start_client foot-m4 env WAYLAND_DEBUG=client foot -d info sh -c "cat > '$LOG_DIR/M4.out'"
+  M4_PID=$LAST_PID
+  wait_map foot 8 >/dev/null
+  sleep 1.5
+  inject key KEY_A tap; sleep 0.3
+  inject key KEY_A tap; sleep 0.4
+  inject key KEY_SPACE tap; sleep 0.3
+  inject type xyz; sleep 0.3
+  inject key KEY_ENTER tap; sleep 0.3
+  inject key KEY_LEFTCTRL+KEY_D tap
+  for _ in $(seq 1 30); do kill -0 "$M4_PID" 2>/dev/null || break; sleep 0.1; done
+  stop_client "$M4_PID"; forget_client "$M4_PID"
+  finish
+
+  # M5 — GTK 4's entry.
+  begin M5
+  if (( SKIP_GTK )) || ! command -v gtk4-demo >/dev/null; then
+    finish gtk_skipped=1
+  else
+    start_client gtk-m5 env NO_AT_BRIDGE=1 GTK_A11Y=none GSK_RENDERER=cairo WAYLAND_DEBUG=client \
+      gtk4-demo --run=entry_undo
+    M5_PID=$LAST_PID
+    wait_map org.gtk.Demo4 10 >/dev/null
+    sleep 2
+    inject key KEY_A tap; sleep 0.3
+    inject key KEY_A tap; sleep 0.5
+    inject key KEY_SPACE tap; sleep 0.8
+    stop_client "$M5_PID"; forget_client "$M5_PID"
+    finish gtk_skipped=0
+  fi
+  stop_client "$M1IM_PID"; forget_client "$M1IM_PID"
+fi
+
 # ── Teardown ─────────────────────────────────────────────────────────────────
 for pid in "${CLIENT_PIDS[@]}"; do stop_client "$pid"; done
 CLIENT_PIDS=()
@@ -2609,16 +2980,16 @@ if s is not None:
     kb = [(i, m.group(1), int(m.group(2))) for i in r if (m := KBSURF.search(comp[i]))]
     early = [i for i, k, x in kb if k == "layer" and i < s["mapped"]]
     focus = [(i, m) for i in r if (m := LFOCUS.search(comp[i]))]
-    clicked = [i for i, m in focus if int(m.group(1)) == sid and m.group(3) == "click"]
-    released = [i for i, m in focus if int(m.group(1)) == 0 and clicked and i > clicked[0]]
+    on_map = [i for i, m in focus if int(m.group(1)) == sid and m.group(3) == "map"]
+    released = [i for i, m in focus if int(m.group(1)) == 0 and on_map and i > on_map[0]]
     od_log = probe_log("probe-d5-od")
     od_keys = key_lines(od_log)
     win_keys = key_lines(probe_log("probe-d5-window"))
-    ok = not early and bool(clicked) and bool(released) and \
+    ok = bool(early) and bool(on_map) and bool(released) and \
         any(l.startswith("keyboard enter surface=layer") for l in od_log) and \
         od_keys == [30] and win_keys == [48] and mp is not None and int(mp.group(5)) == 32
-    record("D5 on_demand: focused by a click, released by a click elsewhere", ok,
-           f"focused on map={bool(early)}, by click={bool(clicked)}, released={bool(released)}; "
+    record("D5 on_demand: focused on map, released by a click elsewhere", ok,
+           f"keys to the layer on map={bool(early)} (cause=map {bool(on_map)}), released={bool(released)}; "
            f"surface keys {od_keys} (want [30]), window keys {win_keys} (want [48]); placed at "
            f"y={mp.group(5) if mp else '-'} under the panel (want 32)")
 
@@ -3671,6 +4042,447 @@ if s is not None:
            f"keyboard={focused}; foot lines about XDG activation={len(warned)}"
            + (f" (first: {warned[0][:100]})" if warned else ""))
 
+# ── S: viewporter, fractional scale ─────────────────────────────────────────
+SGEOM = re.compile(r"compositor\.surface: surface geometry surface=(\d+) buffer=(\d+)x(\d+) scale=(\d+) "
+                   r"transform=(\d+) src=(\S+) dst=(\S+) size=(\d+)x(\d+)")
+
+s = scen.get("S1")
+if s is not None:
+    p = probe_lines("s1")
+    i_pref = next((i for i, l in enumerate(p) if l.startswith("preferred-scale ")), None)
+    i_cfg = next((i for i, l in enumerate(p) if l.startswith("toplevel configure ")), None)
+    pref = p[i_pref].split()[1] if i_pref is not None else "-"
+    bufs = [l for l in p if l.startswith("buffer ")]
+    m = re.match(r"buffer (\d+)x(\d+) dst (\d+)x(\d+)", bufs[0]) if bufs else None
+    one_to_one = bool(m) and m.group(1) == m.group(3) and m.group(2) == m.group(4)
+    geo = [g for i in rng(s) if (g := SGEOM.search(comp[i]))]
+    comp_ok = bool(geo) and bool(m) and geo[0].group(2) == m.group(1) and \
+        geo[0].group(8) == m.group(3) and geo[0].group(9) == m.group(4)
+    xs = [float(re.search(r"x=(-?[\d.]+)", l).group(1)) for l in p if l.startswith("pointer position ")]
+    w = int(m.group(3)) if m else 0
+    last_col = any(w - 1 <= x < w for x in xs)
+    left = any(l == "pointer leave" for l in p[next((i for i, l in enumerate(p) if l.startswith("pointer position ") and w - 1 <= float(re.search(r"x=(-?[\d.]+)", l).group(1)) < w), len(p)):])
+    ok = pref == "120" and i_cfg is not None and i_pref < i_cfg and one_to_one and comp_ok and last_col and left
+    record("S1 fractional-scale: preferred 120 before the first configure, a 1:1 buffer, hit-testing to the last pixel",
+           ok, f"preferred={pref} first={'preferred' if i_pref is not None and (i_cfg is None or i_pref < i_cfg) else 'configure'}; "
+           f"{bufs[0] if bufs else 'no buffer line'}; compositor {geo[0].group(0)[len('compositor.surface: '):] if geo else '-'}; "
+           f"last column seen={last_col} (x={max(xs) if xs else '-'}), then leave={left}")
+
+def ppm(path):
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        return None
+    parts, i = [], 0
+    while len(parts) < 4:
+        while data[i:i + 1].isspace():
+            i += 1
+        j = i
+        while not data[j:j + 1].isspace():
+            j += 1
+        parts.append(data[i:j])
+        i = j
+    w, h = int(parts[1]), int(parts[2])
+    return w, h, data[i + 1:]
+
+s = scen.get("S2")
+if s is not None:
+    tid = s["id"]
+    g = geometry_at(tid, s["comp"][1]) if tid else None
+    geo = [m for i in rng(s) if (m := SGEOM.search(comp[i]))]
+    geo_ok = bool(geo) and geo[-1].group(6) == "100.00,0.00,100.00x50.00" and geo[-1].group(7) == "300x150"
+    img = ppm(s.get("shot", "")) if s.get("shot") else None
+    detail_px = "no screenshot"
+    px_ok = False
+    if img and g:
+        w, h, px = img
+        x, y, gw, gh = g
+        def at(u, v):
+            o = (v * w + u) * 3
+            return tuple(px[o:o + 3])
+        interior = [at(u, v) for v in range(y + 6, y + gh - 6, 7) for u in range(x + 6, x + gw - 6, 7)]
+        green = sum(1 for c in interior if c == (0, 255, 0))
+        frame = [at(x, y + gh // 2), at(x + gw - 1, y + gh // 2), at(x + gw // 2, y), at(x + gw // 2, y + gh - 1)]
+        frame_ok = all(c[0] >= 200 and c[1] >= 200 and c[2] >= 200 for c in frame)
+        px_ok = interior and green == len(interior) and frame_ok
+        detail_px = f"interior green {green}/{len(interior)}; frame {frame}"
+    ok = bool(g) and g[2] == 300 and g[3] == 150 and geo_ok and px_ok
+    record("S2 viewport crop + destination: mapped at the destination, the quadrant shown, framed", ok,
+           f"geometry={g}; compositor {geo[-1].group(0)[len('compositor.surface: '):] if geo else '-'}; {detail_px}")
+
+# ── P: wp_presentation ──────────────────────────────────────────────────────
+PSUM = re.compile(r"presentation summary frames=(\d+) presented=(\d+) discarded=(\d+) pending=(\d+) "
+                  r"seq_monotonic=(\d) seq_first=(\d+) seq_last=(\d+) refresh=(\d+) flags=0x([0-9a-f]+) "
+                  r"dt_mean=([\d.]+) dt_max=([\d.]+) latency_mean=([\d.]+) sync_output=(\d+) "
+                  r"clock_id=(\d+) t_monotonic=(\d)")
+PPRES = re.compile(r"presented frame=(\d+) seq=(\d+) t=(\d+)\.(\d+) dt=([\d.]+) refresh=(\d+) "
+                   r"flags=0x([0-9a-f]+) sync_output=(\d+) latency=(-?[\d.]+)")
+PDISC = re.compile(r"discarded frame=(\d+) at=([\d.]+)")
+PFLIP = re.compile(r"compositor\.presentation: flip frame=(\d+) ")
+OUTMODE = re.compile(r"compositor\.output: output 0 (?:name=\S+ )?mode=\d+x\d+ refresh_mhz=(\d+)")
+out_mhz = next((int(m.group(1)) for l in comp if (m := OUTMODE.search(l))), 0)
+want_refresh = (10**12 + out_mhz // 2) // out_mhz if out_mhz else 0
+
+def pres(name):
+    lines = probe_lines(name)
+    summ = next((m for l in lines if (m := PSUM.search(l))), None)
+    shown = [(int(m.group(1)), int(m.group(2)), int(m.group(3)) + int(m.group(4)) / 1e9,
+              int(m.group(6)), int(m.group(7), 16), int(m.group(8)), float(m.group(9)))
+             for l in lines if (m := PPRES.search(l))]
+    gone = [(int(m.group(1)), float(m.group(2))) for l in lines if (m := PDISC.search(l))]
+    return summ, shown, gone
+
+s = scen.get("P1")
+if s is not None:
+    summ, shown, gone = pres("p1")
+    flips = sum(1 for i in rng(s) if PFLIP.search(comp[i]))
+    if not summ:
+        record("P1 continuous client: every frame presented with the flip's timing", False,
+               "no summary from the probe")
+    else:
+        n, presented, discarded, pending = (int(summ.group(k)) for k in (1, 2, 3, 4))
+        flags_ok = all(f & 0x5 == 0x5 and not f & 0x8 and bool(f & 0x2) == (seq > 0)
+                       for _, seq, _, _, f, _, _ in shown)
+        hw = any(f & 0x2 for _, _, _, _, f, _, _ in shown)
+        seqs = [seq for _, seq, _, _, _, _, _ in shown]
+        seq_ok = all(b > a for a, b in zip(seqs, seqs[1:])) if hw else all(q == 0 for q in seqs)
+        refresh_ok = want_refresh > 0 and all(abs(r - want_refresh) <= 1 for _, _, _, r, _, _, _ in shown)
+        ts = [t for _, _, t, _, _, _, _ in shown]
+        dts = [b - a for a, b in zip(ts, ts[1:])]
+        pace_ok = bool(dts) and min(dts) > 0 and sum(dts) / len(dts) >= 0.9 * want_refresh / 1e9
+        lat = [l for _, _, _, _, _, _, l in shown]
+        lat_ok = bool(lat) and min(lat) > 0 and sum(lat) / len(lat) < 100.0
+        sync_ok = all(k >= 1 for _, _, _, _, _, k, _ in shown)
+        ok = (summ.group(14) == "1" and n == 180 and presented >= 178 and discarded <= 2 and
+              pending == 0 and flags_ok and seq_ok and refresh_ok and pace_ok and lat_ok and
+              sync_ok and flips > 0)
+        record("P1 continuous client: every frame presented with the flip's timing", ok,
+               f"clock_id={summ.group(14)} frames={n} presented={presented} discarded={discarded} "
+               f"pending={pending}; flags {sorted({hex(f) for _, _, _, _, f, _, _ in shown})} "
+               f"(hw_clock={'yes' if hw else 'no: no vblank counter'}, consistent={flags_ok}); "
+               f"seq {seqs[0] if seqs else '-'}..{seqs[-1] if seqs else '-'} ok={seq_ok}; "
+               f"refresh {shown[0][3] if shown else '-'} want {want_refresh}; dt mean "
+               f"{(sum(dts) / len(dts) * 1e3) if dts else 0:.2f} ms min {(min(dts) * 1e3) if dts else 0:.2f}; "
+               f"latency mean {(sum(lat) / len(lat)) if lat else 0:.2f} ms; sync_output={sync_ok}; "
+               f"compositor flip lines={flips}")
+
+s = scen.get("P2")
+if s is not None:
+    summ, shown, gone = pres("p2")
+    if not summ:
+        record("P2 superseded commits are discarded, the last of each frame presented", False,
+               "no summary from the probe")
+    else:
+        n, presented, discarded, pending = (int(summ.group(k)) for k in (1, 2, 3, 4))
+        ok = n == 90 and presented + discarded == 90 and pending == 0 and discarded >= 55 and \
+            presented >= 25
+        record("P2 superseded commits are discarded, the last of each frame presented", ok,
+               f"commits={n} presented={presented} discarded={discarded} pending={pending}")
+
+s = scen.get("P3")
+if s is not None:
+    _, a_shown, a_gone = pres("p3a")
+    _, b_shown, _ = pres("p3b")
+    if not b_shown or not a_shown:
+        record("P3 a covered client presents nothing and is throttled to ~1 Hz", False,
+               f"presented: lower {len(a_shown)}, cover {len(b_shown)}")
+    else:
+        b0, b1 = b_shown[0][2], b_shown[-1][2]
+        covered = [t for _, _, t, _, _, _, _ in a_shown if b0 + 0.1 < t < b1 - 0.1]
+        throttled = [at for _, at in a_gone if b0 + 0.1 < at < b1]
+        gaps = [y - x for x, y in zip(throttled, throttled[1:])]
+        after = [t for _, _, t, _, _, _, _ in a_shown if t > b1 + 0.2]
+        ok = (not covered and len(throttled) >= 2 and all(0.9 <= g <= 1.6 for g in gaps) and
+              len(after) >= 10)
+        record("P3 a covered client presents nothing and is throttled to ~1 Hz", ok,
+               f"covered for {b1 - b0:.2f} s: lower presented {len(covered)}, discarded "
+               f"{len(throttled)} at intervals {[round(g, 2) for g in gaps]} s; presented "
+               f"{len(after)} after the cover left")
+
+# ── K: idle, inhibition, display power ─────────────────────────────────────
+KIDLED = re.compile(r"^idled t=([\d.]+) at=([\d.]+)")
+KRESUMED = re.compile(r"^resumed t=([\d.]+) at=([\d.]+)")
+
+def k_events(name):
+    out = []
+    for l in probe_lines(name):
+        if (m := KIDLED.match(l)):
+            out.append(("idled", float(m.group(1)), float(m.group(2))))
+        elif (m := KRESUMED.match(l)):
+            out.append(("resumed", float(m.group(1)), float(m.group(2))))
+    return out
+
+s = scen.get("K1")
+if s is not None:
+    ev = k_events("k1")
+    moves = [r["t_us"] / 1e6 for r in inj if r.get("tag") == "K1" and r["kind"] == "motion"]
+    kinds = [e[0] for e in ev]
+    ok = kinds[:3] == ["idled", "resumed", "idled"] and bool(moves)
+    if ok:
+        first, resumed, again = ev[0], ev[1], ev[2]
+        ok = (1.45 <= first[1] <= 1.9 and moves[0] <= resumed[2] <= moves[0] + 0.3 and
+              1.45 <= again[2] - resumed[2] <= 1.9)
+    record("K1 idled after the timeout, resumed by input, idled again", ok,
+           f"events {[(k, round(t, 3)) for k, t, _ in ev]}; injected motion at "
+           f"{round(moves[0], 3) if moves else '-'} (resumed at "
+           f"{round(ev[1][2], 3) if len(ev) > 1 else '-'})")
+
+s = scen.get("K2")
+if s is not None:
+    obey, inonly = k_events("k2"), k_events("k2in")
+    cover = s.get("cover_at", 0.0)
+    idled_obey = [at for k, _, at in obey if k == "idled"]
+    idled_in = [t for k, t, _ in inonly if k == "idled"]
+    inhibited = any("compositor.idle: idle inhibited=1" in comp[i] for i in rng(s))
+    ok = (inhibited and bool(idled_in) and 1.45 <= idled_in[0] <= 1.9 and
+          len(idled_obey) == 1 and cover + 1.4 <= idled_obey[0] <= cover + 2.4 and
+          not any(k == "resumed" for k, _, _ in obey))
+    record("K2 a visible inhibitor holds idling back; covered, it does not (input-only ignores it)", ok,
+           f"inhibited seen={inhibited}; input-only idled at t={idled_in[0] if idled_in else '-'}; "
+           f"obeying idled {round(idled_obey[0] - cover, 3) if idled_obey else '-'} s after the cover "
+           f"started (want 1.5 + map time); obeying events {[(k, round(t, 3)) for k, t, _ in obey]}")
+
+s = scen.get("K3")
+if s is not None:
+    r = rng(s)
+    off = next((i for i in r if "display power off (CRTC ACTIVE=0" in comp[i]), None)
+    woke = next((i for i in r if "display woken by input" in comp[i]), None)
+    on = next((i for i in r if "compositor.power: display power on" in comp[i]), None)
+    dark_commits = [comp[i] for i in range(off + 1, woke)] if off is not None and woke else []
+    dark_commits = [l for l in dark_commits if re.search(r"compositor\.render: .*commit=(content|cursor) ", l)]
+    full = f"area={out_w * out_h} " if out_w and out_h else "area=?"
+    repaint = woke is not None and any(
+        "composite=1 rects=1 " + full in comp[i] and "commit=content" in comp[i]
+        for i in range(woke, min(r.stop, woke + 40)))
+    modes = [l.split()[1] for l in probe_lines("k3p") if l.startswith("power mode=")]
+    keys = [l.strip() for l in probe_lines("k3k") if l.startswith("key code=")]
+    ok = (off is not None and woke is not None and on is not None and off < woke < on and
+          not dark_commits and repaint and modes == ["mode=on", "mode=off", "mode=on"] and
+          keys == ["key code=48 state=1", "key code=48 state=0"])
+    record("K3 power off: dark with no commits; a key wakes it (swallowed), full repaint, mode events", ok,
+           f"off/woken/on lines={off is not None}/{woke is not None}/{on is not None}; commits while "
+           f"dark={len(dark_commits)}; full repaint after wake={repaint}; power object {modes}; "
+           f"keys at the focused client {keys}")
+
+# ── L: session lock ──────────────────────────────────────────────────────────
+LOCKT = re.compile(r"compositor\.lock: session lock: (\w+) -> (\w+)")
+LLOCKED = re.compile(r"^lock locked at=([\d.]+) after=([\d.]+)")
+
+def lock_transitions(r):
+    return [(m.group(1), m.group(2)) for i in r if (m := LOCKT.search(comp[i]))]
+
+def shot_colour(path):
+    img = ppm(path) if path else None
+    if not img:
+        return None, 0.0
+    w, h, px = img
+    counts = {}
+    n = 0
+    for v in range(0, h, 9):
+        for u in range(0, w, 9):
+            o = (v * w + u) * 3
+            c = tuple(px[o:o + 3])
+            counts[c] = counts.get(c, 0) + 1
+            n += 1
+    c, k = max(counts.items(), key=lambda kv: kv[1])
+    return c, k / n if n else 0.0
+
+s = scen.get("L1")
+if s is not None:
+    t = lock_transitions(rng(s))
+    lk = probe_lines("l1")
+    win = probe_lines("l1w")
+    locked = [m for l in lk if (m := LLOCKED.match(l))]
+    after = float(locked[0].group(2)) if locked else -1.0
+    lock_keys = [l for l in lk if l.startswith("key code=") and l.endswith("state=1")]
+    lock_kb = any(l.startswith("keyboard enter surface=lock") for l in lk)
+    # The window: the keyboard leaves at the request; it sees none of the keys typed while
+    # locked (A=30, the digits 4/1/2 = 5/2/3) and no press; afterwards B (48) reaches it.
+    leave_i = next((i for i, l in enumerate(win) if l.startswith("keyboard leave")), None)
+    leaked = [l for l in win if re.match(r"key code=(30|5|2|3) state=1", l)]
+    pressed_after = [l for l in win[(leave_i or 0):] if l.startswith("press surface=")]
+    b_after = any(l == "key code=48 state=1" for l in win[(leave_i or 0):])
+    ok = (t[:3] == [("unlocked", "awaiting_surfaces"), ("awaiting_surfaces", "locking"),
+                    ("locking", "locked")] and ("locked", "unlocked") in t and
+          0.0 <= after <= 0.5 and lock_kb and len(lock_keys) >= 7 and
+          "lock password wrong" in lk and "lock password accepted" in lk and
+          any(l.startswith("lock unlocked") for l in lk) and leave_i is not None and
+          not leaked and not pressed_after and b_after)
+    record("L1 lock: locked after the locked frame, input to the lock surface only, a test password unlocks", ok,
+           f"transitions {t}; locked {after:.3f} s after the request; lock surface keyboard={lock_kb}, "
+           f"keys {len(lock_keys)}; window: leave={leave_i is not None}, leaked keys {leaked}, "
+           f"presses while locked {len(pressed_after)}, B after unlock={b_after}")
+
+s = scen.get("L2")
+if s is not None:
+    t = lock_transitions(rng(s))
+    colour, share = shot_colour(s.get("shot", ""))
+    win = probe_lines("l1w")
+    leaked = [l for l in win if l.startswith("key code=46 ")]
+    rep = [m for l in probe_lines("l2r") if (m := LLOCKED.match(l))]
+    rep_after = float(rep[0].group(2)) if rep else -1.0
+    ok = (("locked", "abandoned") in t and ("abandoned", "locked") in t and
+          ("locked", "unlocked") in t and colour == (0x3f, 0, 0) and share > 0.99 and
+          not leaked and 0.0 <= rep_after <= 0.1)
+    record("L2 locker died: stays locked (dark red), keys to nobody; a replacement is locked at once", ok,
+           f"transitions {t}; screenshot {colour} over {share:.3f} of the output; keys leaked {len(leaked)}; "
+           f"replacement locked {rep_after:.3f} s after its request")
+
+s = scen.get("L3")
+if s is not None:
+    t = lock_transitions(rng(s))
+    rep = [m for l in probe_lines("l3") if (m := LLOCKED.match(l))]
+    after = float(rep[0].group(2)) if rep else -1.0
+    colour, share = shot_colour(s.get("shot", ""))
+    ok = (0.95 <= after <= 1.6 and ("locking", "locked") in t and colour == (0, 0, 0) and
+          share > 0.99)
+    record("L3 no lock surface: locked after the 1 s wait, the output a solid colour", ok,
+           f"locked {after:.3f} s after the request; transitions {t}; screenshot {colour} over {share:.3f}")
+
+s = scen.get("L4")
+if s is not None:
+    t = lock_transitions(rng(s))
+    lk = probe_lines("l4")
+    logind = any("compositor.lock: logind Unlock: unlocking the session" in comp[i] for i in rng(s))
+    ok = (logind and any(l.startswith("lock finished") and l.endswith("locked=1") for l in lk) and
+          ("locked", "unlocked") in t)
+    record("L4 logind Unlock: the live locker is finished, the session unlocked", ok,
+           f"logind line={logind}; locker {[l for l in lk if l.startswith('lock ')]}; transitions {t}")
+
+# ── M: text input and input methods ────────────────────────────────────────
+IMESHOW = re.compile(r"compositor\.ime: ime popup show surface=(\d+) popup=\d+ x=(-?\d+) y=(-?\d+) (\d+)x(\d+)")
+
+s = scen.get("M1")
+if s is not None:
+    ti = probe_lines("m1")
+    im = probe_lines("m1im")
+    tid = s.get("id", 0)
+    g = geometry_at(tid, s["comp"][1]) if tid else None
+    shows = [m for i in rng(s) if (m := IMESHOW.search(comp[i]))]
+    first = shows[0] if shows else None
+    want_xy = (g[0] + 20, g[1] + 40 + 18) if g else None
+    at_cursor = bool(first) and want_xy is not None and (int(first.group(2)), int(first.group(3))) == want_xy
+    rect = any(l.startswith("im popup rect x=0 y=-18 w=2 h=18") for l in im)
+    pre = [l for l in ti if l.startswith("ti preedit ")]
+    commit = [l for l in ti if l.startswith("ti commit ")]
+    done_commit = [l for l in ti if l.startswith('ti done ') and 'text="αα"' in l]
+    window_keys = [l for l in ti if re.match(r"key code=(30|57) ", l)]
+    b_fwd = "key code=48 state=1" in ti and any(l.startswith("im forwarded code=48 state=1") for l in im)
+    # The input method serves M1–M5: count M1's presses, those before its first commit.
+    first_commit = next((k for k, l in enumerate(im) if l.startswith("im commit ")), len(im))
+    grab_a = sum(1 for l in im[:first_commit] if l == "im key code=30 state=1")
+    entered = "ti enter surface=toplevel" in ti and any(l.startswith("im activate") for l in im)
+    img = ppm(s.get("shot", "")) if s.get("shot") else None
+    on_screen = False
+    if img and first:
+        w, h, px = img
+        x, y = int(first.group(2)) + 5, int(first.group(3)) + 5
+        if 0 <= x < w and 0 <= y < h:
+            o = (y * w + x) * 3
+            on_screen = tuple(px[o:o + 3]) == (0xe0, 0xc0, 0x40)
+    # The click on the popup: pointer focus `ime-popup`, the input method gets the press, no
+    # keyboard change (KEY_F still goes to the grab and is forwarded to the window).
+    r = rng(s)
+    ptr = any("compositor.wm: focus pointer ime-popup" in comp[i] for i in r)
+    pressed = any(l.startswith("press surface=im-popup") for l in im)
+    kept = (not any("compositor.ime: text input leave" in comp[i] for i in r) and
+            any(l.startswith("im forwarded code=33 state=1") for l in im) and "key code=33 state=1" in ti)
+    ok = (entered and pre[:2] == ['ti preedit "α" 2 2', 'ti preedit "αα" 4 4'] and
+          commit[:1] == ['ti commit "αα"'] and bool(done_commit) and not window_keys and
+          grab_a == 2 and b_fwd and at_cursor and rect and on_screen and ptr and pressed and kept)
+    record("M1 compose: keys to the grab, preedit and commit back; the popup at the cursor", ok,
+           f"entered+activated={entered}; preedit {pre[:2]}; commit {commit[:1]}; done with the text="
+           f"{bool(done_commit)}; KEY_A at the grab {grab_a}, at the window {len(window_keys)}; B forwarded="
+           f"{b_fwd}; popup first shown at {(first.group(2), first.group(3)) if first else None} want {want_xy}; "
+           f"text_input_rectangle={rect}; on screen={on_screen}; click on it: pointer={ptr} "
+           f"press at the input method={pressed} keyboard kept={kept}")
+
+s = scen.get("M2")
+if s is not None:
+    r = rng(s)
+    ti = probe_lines("m1")
+    im = probe_lines("m1im")
+    other = probe_lines("m2")
+    lines_ = [comp[i] for i in r]
+    left = any("compositor.ime: text input leave" in l for l in lines_)
+    hidden = any("compositor.ime: ime popup hide" in l for l in lines_)
+    deact = any("compositor.ime: input method deactivate" in l for l in lines_)
+    back = [i for i in r if "compositor.ime: input method activate" in comp[i]]
+    c_other = "key code=46 state=1" in other
+    c_grab = any(l.startswith("im key code=46") for l in im)
+    d_fwd = any(l.startswith("im forwarded code=32 state=1") for l in im) and "key code=32 state=1" in ti
+    ok = left and hidden and deact and bool(back) and c_other and not c_grab and d_fwd
+    record("M2 focus elsewhere: left, deactivated, popup hidden, keys direct; back: active again", ok,
+           f"leave={left} deactivate={deact} hide={hidden}; KEY_C at the other window={c_other}, at the "
+           f"grab={c_grab}; re-activated={bool(back)}; KEY_D forwarded to the window={d_fwd}")
+
+s = scen.get("M3")
+if s is not None:
+    r = rng(s)
+    lines_ = [comp[i] for i in r]
+    lk = probe_lines("m3")
+    im = probe_lines("m1im")
+    left = any("compositor.ime: text input leave" in l for l in lines_)
+    deact = any("compositor.ime: input method deactivate" in l for l in lines_)
+    hidden = any("compositor.ime: ime popup hide" in l for l in lines_)
+    e_lock = "key code=18 state=1" in lk
+    e_grab = any(l.startswith("im key code=18") for l in im)
+    unlocked = any(l.startswith("lock unlocked") for l in lk)
+    again = any("compositor.ime: input method activate" in l for l in lines_)
+    ok = left and deact and hidden and e_lock and not e_grab and unlocked and again
+    record("M3 locked: no text-input focus, keys to the lock surface; unlocked: active again", ok,
+           f"leave={left} deactivate={deact} hide={hidden}; KEY_E at the lock surface={e_lock}, at the "
+           f"grab={e_grab}; unlocked={unlocked}; re-activated={again}")
+
+s = scen.get("M4")
+if s is not None:
+    raw = read("foot-m4.log")
+    warn_ti = [l for l in raw if re.search(r"text.input", l, re.I) and not WLDBG.match(l)]
+    dbg = wl_debug("foot-m4")
+    pre = [a for req, i, _, msg, a in dbg if not req and i == "zwp_text_input_v3" and msg == "preedit_string"]
+    com = [a for req, i, _, msg, a in dbg if not req and i == "zwp_text_input_v3" and msg == "commit_string"]
+    try:
+        out = open(os.path.join(log_dir, "M4.out"), encoding="utf-8").read()
+    except OSError:
+        out = None
+    ok = (not warn_ti and any(a.startswith('"α"') for a in pre) and any(a.startswith('"αα"') for a in pre)
+          and any(a.startswith('"αα"') for a in com) and out == "ααxyz\n")
+    record("M4 foot: composes through text-input-v3; the file holds the committed text and the forwarded keys", ok,
+           f"foot text-input warnings={len(warn_ti)}; preedit {pre[:3]}; commit {com[:2]}; file {out!r}")
+
+s = scen.get("M5")
+if s is not None:
+    if s.get("gtk_skipped"):
+        record("M5 GTK 4 entry composes", True, "skipped (no GTK)", warn=True)
+    else:
+        dbg = wl_debug("gtk-m5")
+        binds = [a for req, i, _, msg, a in dbg if req and msg == "bind" and "zwp_text_input_manager_v3" in a]
+        pre = [a for req, i, _, msg, a in dbg if not req and i == "zwp_text_input_v3" and msg == "preedit_string"]
+        com = [a for req, i, _, msg, a in dbg if not req and i == "zwp_text_input_v3" and msg == "commit_string"]
+        ok = (bool(binds) and any(a.startswith('"αα"') for a in pre) and any(a.startswith('"αα"') for a in com))
+        # WARN-level: GTK's own focus and IM-context choices are not this compositor's.
+        record("M5 GTK 4 entry composes: preedit and commit through text-input v2", True,
+               f"bind {binds[:1]}; preedit {pre[:2]}; commit {com[:1]}", warn=not ok)
+
+if "S1" in scen:
+    warned = []
+    for name in sorted(os.listdir(log_dir)):
+        if name.startswith("foot") and name.endswith(".log"):
+            warned += [f"{name}: {l.strip()[:100]}" for l in read(name)
+                       if re.search(r"fractional scal", l, re.I) and not WLDBG.match(l)]
+    dbg = wl_debug("gtk-factory-h5") if "H5" in scen and not scen["H5"].get("gtk_skipped") else []
+    gtk_bound = {i for req, i, _, msg, a in dbg if req and msg == "bind"} if dbg else set()
+    gtk_raw = read("gtk-factory-h5.log") if dbg else []
+    gtk_frac = any("wp_fractional_scale_manager_v1" in l and "bind" in l for l in gtk_raw)
+    gtk_vp = any("wp_viewporter" in l and "bind" in l for l in gtk_raw)
+    gtk_pref = any(re.search(r"wp_fractional_scale_v1[#@]\d+\.preferred_scale\(120\)", l) for l in gtk_raw)
+    gtk_ok = (not dbg) or (gtk_frac and gtk_vp and gtk_pref)
+    ok = not warned and gtk_ok
+    record("S3 real clients: foot does not miss fractional scaling; GTK binds both and is told 120", ok,
+           f"foot warnings={len(warned)}" + (f" (first: {warned[0]})" if warned else "") +
+           (f"; GTK bound fractional={gtk_frac} viewporter={gtk_vp} preferred_scale(120)={gtk_pref}"
+            if dbg else "; GTK trace not run (H5 skipped)"))
+
 # ── Protocol errors, both sides ────────────────────────────────────────────
 # A protocol error the compositor posts ends with libwayland-server's "error in client
 # communication (pid N)"; the client side prints libwayland-client's "<iface>#<id>: error
@@ -3706,6 +4518,8 @@ record("run: no protocol error except the provoked ones (D7, E6, F7r), either si
 BUDGET = ("over budget in recent frames",)
 # E6 provokes exactly one: a copy of lumen-shell refused at bind.
 EXPECTED_WARN = ("privileged global zlm_shell_v1 denied: client pid=",)
+# L2 provokes these: its locker exits while locked.
+LOCK_WARN = ("session lock: locked -> abandoned", "session lock abandoned (the locker exited)")
 # The present watchdog fires when a queued flip has not completed for 250 ms. With a flip
 # demonstrably queued (a `commit=content` or `commit=deferred` render line just before it:
 # a flip was submitted, or the next one is waiting behind it) that is the host's
@@ -3721,6 +4535,8 @@ for i, l in enumerate(comp):
         host_stalls.append(l)
     elif l.startswith("[WARN]") and "E6" in scen and any(e in l for e in EXPECTED_WARN) and \
             "fake-shell" in l:
+        pass
+    elif l.startswith("[WARN]") and "L2" in scen and any(e in l for e in LOCK_WARN):
         pass
     elif l.startswith("[ERROR]") or (l.startswith("[WARN]") and not any(b in l for b in BUDGET)):
         errors.append(l)

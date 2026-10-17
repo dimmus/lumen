@@ -1,15 +1,19 @@
 sequenceDiagram
-    participant DRM as lx.drm / KMS
-    participant Comp as compositor UI
-    participant Pres as presentation_tracker
+    participant C as client
+    participant UI as compositor UI (wire, scene, feedback table)
     participant RT as render thread
-    participant Out as output_manager
+    participant DRM as lx.drm / KMS
+    participant Pres as presentation_tracker
 
-    Comp->>Out: present_mode_for(output)
-    RT->>RT: acquire snapshot + record
-    RT->>DRM: atomic commit + page_flip
-    DRM-->>Comp: page_flip event (P1)
-    DRM-->>Pres: presentation_feedback + kms_damage (P1)
-    Pres->>Comp: on_feedback — adjust pacing
+    C->>UI: wp_presentation.feedback(surface) + wl_surface.commit
+    UI->>UI: apply: feedback queued (building_frame M); the previous update's<br/>queued feedback discarded, sampled one superseded at M
+    UI->>UI: tick_ui publishes frame N: visibility pass (mark_occlusion),<br/>queued feedback of on-screen surfaces sampled at N
+    RT->>RT: acquire snapshot N, composite (occluded draws skipped)
+    RT->>DRM: atomic commit, user_tag = N (stored before the ioctl)
+    DRM-->>Pres: page_flip_event (UI): tag N, content, kernel sequence,<br/>CLOCK_MONOTONIC time, hw, vblank_timestamp
+    Pres->>UI: presentation_feedback → flip handler (frame clock phase-lock)
+    UI->>UI: presentation_flipped(N): sampled ≤ N presented,<br/>superseded at ≤ N discarded
+    UI-->>C: sync_output(wl_output) + presented(t, refresh, seq, flags) | discarded
 
-    Note over Comp,Pres: P0: timer vsync stub until DRM wired
+    Note over UI,DRM: VT switched away: everything in flight discarded at the pause edge,<br/>queued feedback discarded at each 1 Hz paused tick, nothing sampled
+    Note over UI: no display (headless): a published frame counts as presented at the tick, flags 0

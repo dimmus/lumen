@@ -5,6 +5,7 @@ module;
 #include <cstdio>
 #include <cerrno>
 #include <chrono>
+#include <cmath>
 #include <fcntl.h>
 #include <condition_variable>
 #include <cstdlib>
@@ -14,6 +15,7 @@ module;
 #include <thread>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -57,9 +59,14 @@ struct compositor_impl {
     scene::scene_graph scene{};
     /// Paint order under the scene root, bottom→top (sway's): layer-shell background and
     /// bottom, the windows, layer-shell top and overlay, every popup, the drag-and-drop
-    /// icon, then the software cursor. Popups sit above the overlay layer so no panel or
-    /// window ever covers a menu; the drag icon above everything a client draws.
-    /// The four layer-shell containers hold layer surfaces' tree containers (`:layer_shell`).
+    /// icon, the session lock's surfaces, input-method popups, then the software cursor. Popups
+    /// sit above the overlay layer so no panel or window ever covers a menu; the drag icon
+    /// above everything a client draws. The four layer-shell containers hold layer surfaces'
+    /// tree containers (`:layer_shell`); the lock layer holds lock surfaces'
+    /// (wire_session_lock.cpp). While the session is locked every layer below the lock layer
+    /// is hidden. Input-method popups (wire_input_method.cpp) are above the lock layer: they
+    /// are only ever shown for the focused text input, which while locked is a lock
+    /// surface's.
     scene::container_node background_layer_{};
     scene::container_node bottom_layer_{};
     scene::container_node windows_layer_{};
@@ -67,6 +74,8 @@ struct compositor_impl {
     scene::container_node overlay_shell_layer_{};
     scene::container_node popup_layer_{};
     scene::container_node dnd_icon_layer_{};
+    scene::container_node lock_layer_{};
+    scene::container_node ime_popup_layer_{};
     scene::container_node cursor_layer_{};
     /// UI affinity. The drag-and-drop grab and its icon — see `:dnd`.
     dnd_grab dnd_{};
@@ -108,6 +117,155 @@ struct compositor_impl {
     gfx::device_recovery device_recovery_{graphics};
     session::logind_session logind_{};
     p0_protocol_context p0_{};
+
+    // ── Session pause/resume (VT switching) — docs/architecture.md "Session pause/resume" ──
+    /// UI affinity. The state machine; `apply_session_actions` executes what it returns.
+    session_state session_{};
+    /// UI affinity. VT and logout bindings, the shell's key grabs, tap observation.
+    keybindings keys_{};
+    /// The display gate (design §2.3). UI writes (release), render reads (acquire) at tick
+    /// start and again right before every commit ioctl: while any bit is set, render
+    /// composites nothing and commits nothing, the frame clock gives way to the 1 Hz paused
+    /// tick, and nothing is presented. `gate_vt`: the session is paused (VT away, display
+    /// lost). `gate_power`: the output is powered off (display power, I4). Only input
+    /// suspension stays tied to `gate_vt` — a dark output is woken by input.
+    static constexpr unsigned gate_vt = 1u << 0;
+    static constexpr unsigned gate_power = 1u << 1;
+    std::atomic<unsigned> display_gate_{0};
+    /// UI stores the resume generation (release) *before* clearing a gate bit, and render
+    /// loads them in the opposite order: seeing "ungated" guarantees seeing the new
+    /// generation, so render never commits without running the resume procedure first.
+    /// One counter for every resume (VT and power-on), owned by UI (`render_gen_counter_`).
+    std::atomic<unsigned> resume_gen_{0};
+    /// UI affinity. The last render generation handed out, and which resume each answers:
+    /// the session machine's (with its own generation) and the power machine's.
+    unsigned render_gen_counter_ = 0;
+    unsigned vt_resume_render_gen_ = 0;
+    unsigned vt_resume_session_gen_ = 0;
+    unsigned power_resume_render_gen_ = 0;
+    /// Render affinity. The generation whose resume procedure ran, and a result owed to UI.
+    unsigned resume_done_gen_ = 0;
+    bool resume_result_pending_ = false;
+    /// Render affinity. Commits have failed for lack of DRM master since then (0: they do
+    /// not) — reported once if no pause follows within a second.
+    lx::runtime::clock_time master_lost_since_ns_ = 0;
+    bool master_lost_reported_ = false;
+    /// UI affinity. The resume modeset's flip has not arrived yet: a full modeset can take
+    /// longer than the 250 ms present watchdog on some drivers, which is not a stall.
+    bool awaiting_resume_flip_ = false;
+    static constexpr lx::runtime::clock_time k_resume_flip_grace_ns = 1'000'000'000;
+    /// The card's device number (what logind's signals name) and how it was opened.
+    unsigned drm_major_ = 0;
+    unsigned drm_minor_ = 0;
+    bool drm_via_logind_ = false;
+    bool drm_start_inactive_ = false;
+    /// UI affinity. logind signals recorded inside sd_bus_process, handled right after it
+    /// (`on_session_events`): the callbacks only record.
+    struct session_event {
+        enum class kind : unsigned char { paused, resumed, active, vt_failed, lock, unlock, sleep };
+        kind what = kind::paused;
+        unsigned major = 0;
+        unsigned minor = 0;
+        session_pause_kind pause = session_pause_kind::force;
+        bool active = false;
+        const char* error = "";
+    };
+    /// Never drops an event: an unacknowledged `pause` would hold the seat's switch
+    /// forever (logind waits for every device), and nothing in logind's state says which
+    /// one was missed. Reserved at startup; only a burst past that allocates, on the UI
+    /// thread, at a VT switch — never in a frame.
+    std::vector<session_event> session_events_;
+    void record_session_event(const session_event& ev);
+    /// UI. After every logind dispatch: feeds the recorded signals to the state machine.
+    void on_session_events();
+    /// UI. Executes a state-machine decision (A.3 pause edge, A.5 resume edge).
+    void apply_session_actions(const session_actions& a);
+    void enter_display_pause(unsigned quiesce_gen);
+    void suspend_input_for_pause();
+    void resume_input_after_pause();
+    void begin_display_resume(unsigned gen);
+
+    // ── Idle, inhibition and display power — docs/architecture.md "Idle, inhibition and
+    //    display power" ──
+    /// UI affinity. ext_idle_notifier_v1 notifications and zwp_idle_inhibitor_v1 objects.
+    idle_tracker idle_{};
+    inhibitor_set inhibitors_{};
+    /// UI affinity. Armed at the tracker's next deadline (lazily: activity does not re-arm it).
+    std::unique_ptr<runtime::timer_source> idle_timer_{};
+    static void idle_timer_callback();
+    /// UI. Arms (or disarms) the idle timer at `idle_.next_deadline()`.
+    void rearm_idle_timer();
+    /// UI. Real input arrived (design I2): idle notifications resume and their timers
+    /// restart; a dark output is woken (I5). True when this event woke it — the caller then
+    /// consumes a press (and so its release).
+    bool on_user_activity();
+    /// UI affinity. The output's power state machine (`:display_power`).
+    display_power power_{};
+    /// UI writes the newest power-off generation (release); the render task compares (acquire)
+    /// and does nothing when a later request superseded it.
+    std::atomic<unsigned> power_gen_{0};
+    /// UI. Executes a power decision (the gate, the render task, the resume, `mode` events).
+    void apply_power_actions(const power_actions& a);
+    /// UI. zwlr_output_power_v1.set_mode.
+    void request_output_power(bool on);
+    /// UI → render → UI. The power-off task for `gen`.
+    void post_power_off(unsigned gen);
+    /// Render. Turns the CRTC off (or, refused, commits a black frame).
+    power_off_outcome run_power_off(unsigned gen);
+    /// Render. The soft blank: one black frame, cursor off, CRTC left on.
+    void commit_black_frame();
+    bool power_rejected_logged_ = false;
+    // ── Session lock — docs/architecture.md "Session lock" ──
+    /// UI affinity. ext-session-lock-v1's state machine (`:session_lock`); the wire unit and
+    /// the compositor execute what it returns (`apply_lock_actions`).
+    session_lock lock_{};
+    /// UI affinity. text-input-v3 ↔ input-method-v2 relay (`:text_input`); the wire units
+    /// (wire_text_input.cpp, wire_input_method.cpp) send what it decides, the router routes
+    /// keys to the input method's grab while it is active.
+    text_input_relay text_input_{};
+    /// UI affinity. The first snapshot built with the scene locked: a content flip of it (or
+    /// a later one) on the output is what lets `locked` go out (design L1).
+    unsigned lock_frame_ = 0;
+    /// UI affinity. The 1 s wait for lock surfaces, and the sleep delay's 2 s.
+    std::unique_ptr<runtime::timer_source> lock_timer_{};
+    static void lock_timer_callback();
+    void rearm_lock_timer();
+    /// UI affinity. While the system prepares to sleep with a lock asked for: the logind
+    /// delay inhibitor is held until `locked` or this deadline (0: none).
+    lx::runtime::clock_time sleep_lock_deadline_ns_ = 0;
+    static constexpr lx::runtime::clock_time k_sleep_lock_wait_ns = 2'000'000'000;
+    void release_sleep_delay(const char* why);
+    /// Render → UI. A content commit of ours has reached the CRTC since start: before it, the
+    /// console (or nothing) is on screen — none of the session.
+    std::atomic<bool> ever_lit_{false};
+    /// The state last logged (one info line per transition).
+    lock_state logged_lock_state_ = lock_state::unlocked;
+    /// UI. Executes a lock decision (the wire half through `session_lock_send`).
+    void apply_lock_actions(const lock_actions& a);
+    /// UI. Nothing of the session can be on screen right now: the VT is away, the output is
+    /// powered off (or blanked black), or nothing of ours was ever committed. A lock that
+    /// reaches `locking` then is `locked` at once.
+    [[nodiscard]] bool display_dark() const;
+    /// UI. `locking` ends when the display is dark (see above). After every edge that can
+    /// darken it.
+    void advance_lock();
+    /// UI. logind's Lock / Unlock / PrepareForSleep.
+    void on_logind_lock();
+    void on_logind_unlock();
+    void on_prepare_for_sleep(bool start);
+    /// UI. Ctrl+Alt+F<n> (XF86Switch_VT_<n>).
+    void request_vt_switch(unsigned vt);
+    /// Render. The resume procedure (A.5) for generation `gen`.
+    void run_resume_procedure(unsigned gen);
+    /// Render → UI.
+    void post_resume_result(unsigned gen, session_resume_outcome outcome);
+    void post_flip_dispatch();
+    [[nodiscard]] static lx::runtime::clock_time now_ns() {
+        return static_cast<lx::runtime::clock_time>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count());
+    }
     runtime::event_loop loop{};
     gfx::headless_backend headless_{};
     gfx::frame_renderer frame_renderer_{};
@@ -138,6 +296,10 @@ struct compositor_impl {
     /// composited while a flip was queued waits here instead of being thrown away; if
     /// another frame lands first it simply takes its place (mailbox — show the newest).
     int composited_slot_ = -1;
+    /// Render affinity. Frame index of the snapshot composited into `composited_slot_`: the
+    /// commit's `user_tag`, echoed by its flip event, which presentation feedback is
+    /// resolved against (`presentation_flipped`).
+    unsigned composited_frame_ = 0;
     /// Render affinity. sync_file for the composite that produced `composited_slot_`, or
     /// -1. Travels with the slot because the commit can be deferred a tick, and the fence
     /// belongs to the frame in that slot rather than to whichever tick commits it. Owned
@@ -169,8 +331,22 @@ struct compositor_impl {
     std::atomic<bool> frame_outstanding_{false};
     /// UI affinity. Newest frame index published with non-empty damage.
     long long last_damaged_frame_ = -1;
+    /// UI affinity. Newest published frame index: frame callbacks go to the surfaces the
+    /// visibility pass found on screen in it.
+    unsigned last_published_frame_ = 0;
+    /// UI affinity. wp_presentation feedback in flight (`p0_.presentation`).
+    presentation_feedback_table presentation_feedback_{};
     /// UI affinity. Output 0's geometry as of the last tick; a change repaints everything.
+    /// Debug screenshot (`compositor::request_screenshot`, SIGUSR1 in lumen-compositor):
+    /// requested from any thread or a signal handler; UI forces a full repaint, render reads
+    /// back the frame it composites next and writes a PPM. Never set in normal operation.
+    std::atomic<bool> screenshot_requested_{false};
+    std::atomic<bool> screenshot_pending_{false};
+    unsigned screenshot_count_ = 0;
+    void write_screenshot(unsigned slot);
+    /// Output 0's logical rect and scale as last applied to the scene projection.
     lx::rect2i last_output_rect_{};
+    double last_output_scale_ = 1.0;
     /// UI affinity. `outputs.generation()` clients were last told about.
     unsigned output_generation_ = 0;
     /// UI affinity. xdg_wm_base.ping/pong: who is not responding.
@@ -416,6 +592,8 @@ struct compositor_impl {
         (void)scene.root().add(&overlay_shell_layer_);
         (void)scene.root().add(&popup_layer_);
         (void)scene.root().add(&dnd_icon_layer_);
+        (void)scene.root().add(&lock_layer_);
+        (void)scene.root().add(&ime_popup_layer_);
         (void)scene.root().add(&cursor_layer_);
         surfaces.set_import_cache(&import_cache);
         surfaces.set_scene(&scene);
@@ -429,6 +607,9 @@ struct compositor_impl {
     }
 
     ~compositor_impl() {
+        // libinput closes its devices through the provider, which hands them back to
+        // logind: that has to happen while the session object is still alive.
+        input_devices_ = lx::input::input_manager{};
         delete[] blits_;
         // A deferred dma-buf update still owns the fd the UI thread duplicated for it.
         for (unsigned i = 0; i < deferred_count_; ++i) {
@@ -490,8 +671,6 @@ struct compositor_impl {
     static constexpr lx::runtime::clock_time k_logout_grace_ns = 5'000'000'000ull;
     bool logout_active_ = false;
     lx::runtime::clock_time logout_deadline_ns_ = 0;
-    /// Ctrl+Alt+Backspace was taken for logout: its release must not reach a client either.
-    bool logout_key_held_ = false;
     /// Bring up CPU-writable dumb-buffer scanout. Requires DRM master.
     [[nodiscard]] lx::result<void> setup_cpu_present();
     /// Render-affinity only: bring up EGL/GBM and the GL scanout targets.
@@ -518,25 +697,77 @@ void compositor_impl::input_ready_callback() {
 
 void compositor_impl::on_input_key(const lx::input::key_event& event) {
     lx::trace::scoped_span span{"input", "key"};
-    // Ctrl+Alt+Backspace logs out: the way out that does not depend on the shell being
-    // alive. The X server's "zap" chord, here graceful — windows are asked to close first.
-    constexpr unsigned k_key_backspace = 14;
-    if (event.evdev_keycode == k_key_backspace) {
-        if (!event.pressed && logout_key_held_) {
-            logout_key_held_ = false;
-            return;
-        }
-        const auto mods = input_devices_.default_seat().keymap().named();
-        if (event.pressed && mods.ctrl && mods.alt) {
-            logout_key_held_ = true;
+    auto& seat = input_devices_.default_seat();
+    const auto& km = seat.keymap();
+    key_input in{};
+    in.code = event.evdev_keycode;
+    in.pressed = event.pressed;
+    in.time_ms = event.time_ms;
+    in.sym = km.keysym(in.code);
+    in.raw = km.level1_keysym(in.code, km.active_layout());
+    in.raw0 = km.level1_keysym(in.code, 0);
+    const auto named = km.named();
+    in.mods = (named.shift ? key_mod_shift : 0u) | (named.ctrl ? key_mod_ctrl : 0u) |
+              (named.alt ? key_mod_alt : 0u) | (named.super ? key_mod_super : 0u);
+    // The seat already counts this key on a press (and no longer on a release).
+    in.others_held = seat.pressed_count() > (event.pressed ? 1u : 0u) || wm_.buttons_down() > 0;
+
+    // 0. Activity, before any binding or routing, so a consumed key still counts (I2). A
+    //    release made by the device going away is not the user. A press that woke the
+    //    display does nothing else (I5) — except the compositor's own bindings below.
+    const bool woke = !event.device_removed && on_user_activity();
+    // 1. The compositor's own bindings — always, also during a grab and with no shell: the
+    //    keyboard ways out (Ctrl+Alt+F<n> to a text console, Ctrl+Alt+Backspace to log
+    //    out). A consumed press is never forwarded, so the router swallows its release.
+    if (const key_decision d =
+            keybindings::internal(in, logind_.can_switch_vt(), logind_.vt_number());
+        d.consume) {
+        keys_.reset();
+        if (d.action == key_action::switch_vt)
+            request_vt_switch(d.vt);
+        else if (d.action == key_action::logout)
             begin_logout("Ctrl+Alt+Backspace");
+        return;
+    }
+    // The waking press: not forwarded, so the router swallows its release too (Enter that
+    // wakes the screen does not also confirm a dialog — KWin's DpmsInputEventFilter).
+    if (woke && event.pressed) {
+        keys_.reset();
+        return;
+    }
+    // 2. Keys the window manager claims (Escape during a grab or drag).
+    if (wm_.on_key(event)) {
+        keys_.reset();
+        return;
+    }
+    // 3. The shell's grabs: never during a move, resize or drag, never while paused.
+    const bool wm_busy = wm_.grab_active() || wm_.drag_active();
+    if (!wm_busy && display_gate_.load(std::memory_order_relaxed) == 0) {
+        if (const key_decision d = keys_.match_grab(in); d.consume) {
+            if (p0_.fire_key_grab)
+                p0_.fire_key_grab(d.grab, event.time_ms);
             return;
         }
     }
-    // Keys the window manager claims (Escape during a grab) never reach the client.
-    if (wm_.on_key(event))
+    // 4. Tap observation: the key still reaches the client; a tap fires after it. A
+    //    release made by the device going away (logind revokes the fd at a VT switch
+    //    before it signals the pause; an unplug) is not the user letting go of Super.
+    if (event.device_removed)
+        keys_.reset();
+    void* tap = keys_.observe_tap(in);
+    input_router_.send_key(event, seat);
+    if (tap && !wm_busy && p0_.fire_key_grab)
+        p0_.fire_key_grab(tap, event.time_ms);
+}
+
+void compositor_impl::request_vt_switch(unsigned vt) {
+    if (auto switched = logind_.switch_vt(vt); !switched) {
+        lx::trace::logger::global().log_error(switched.get_error(), "compositor.session");
         return;
-    input_router_.send_key(event, input_devices_.default_seat());
+    }
+    char line[64];
+    std::snprintf(line, sizeof(line), "VT switch to %u requested", vt);
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
 }
 
 void compositor_impl::note_committed_input(bool content) {
@@ -566,7 +797,8 @@ namespace {
 /// arrives with no readability left to report it.
 class logind_bus_source final : public lx::runtime::event_source {
 public:
-    explicit logind_bus_source(lx::session::logind_session& session) : session_{&session} {}
+    logind_bus_source(lx::session::logind_session& session, void (*after)(void*), void* user)
+        : session_{&session}, after_{after}, user_{user} {}
     bool prepare(lx::runtime::clock_time& timeout) override {
         timeout = session_->dispatch_timeout_ns();
         return ready_ || timeout == 0;
@@ -575,6 +807,10 @@ public:
     bool dispatch() override {
         ready_ = false;
         session_->dispatch();
+        // The signal callbacks only recorded; acting on them (D-Bus calls, libinput) is
+        // done here, after sd_bus_process has returned.
+        if (after_)
+            after_(user_);
         return true;
     }
     [[nodiscard]] int poll_fd() const override { return session_->bus_fd(); }
@@ -582,6 +818,8 @@ public:
 
 private:
     lx::session::logind_session* session_;
+    void (*after_)(void*) = nullptr;
+    void* user_ = nullptr;
     bool ready_ = false;
 };
 
@@ -667,9 +905,13 @@ void compositor_impl::log_outputs() const {
         if (!outputs.slot_live(slot))
             continue;
         const output_state& o = outputs.slot_state(slot);
-        char line[128];
-        std::snprintf(line, sizeof(line), "output %u name=%s mode=%dx%d refresh_mhz=%u", slot,
-                      o.name, o.geometry.width, o.geometry.height, o.refresh_mhz);
+        const lx::rect2i l = o.logical_rect();
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "output %u name=%s mode=%dx%d refresh_mhz=%u scale=%g (%ld/120) "
+                      "logical=%dx%d+%d+%d",
+                      slot, o.name, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
+                      std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y);
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
     }
 }
@@ -703,7 +945,11 @@ void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) 
 void compositor_impl::prepare_cursor_plane() {
     if (!cursor_plane_.valid())
         return;
-    if (!content_committed_once_ || kms_atomic.flip_pending())
+    // Before the first content commit the plane joins the modeset only once it has passed
+    // its test (a resume); at startup it is stated off there and joins the next commit.
+    if ((!content_committed_once_ && !cursor_tested_) || kms_atomic.flip_pending())
+        return;
+    if (display_gate_.load(std::memory_order_acquire) != 0)
         return;
 
     const bool failed = cursor_hw_failed_.load(std::memory_order_relaxed);
@@ -762,6 +1008,8 @@ void compositor_impl::fail_cursor_plane(const char* why) {
 
 void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_event& event) {
     lx::trace::scoped_span span{"input", "pointer_motion"};
+    // Activity; motion that wakes the display is delivered all the same (I5).
+    (void)on_user_activity();
     auto& seat = input_devices_.default_seat();
     // Output geometry is the compositor's to know — libinput reports deltas and has no
     // idea how large the desktop is — so both halves of the mapping live here. An absolute
@@ -769,8 +1017,10 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     // and is scaled into the output; whatever the source, the pointer is then kept on
     // screen. lx.input accumulates only relative motion, which is why absolute devices
     // used to leave the pointer at the origin for the whole session.
+    // Layout (logical) coordinates: the pointer moves in logical units at any scale
+    // (wlroots, Mutter), and an absolute device covers the output's logical rect.
     if (outputs.count() > 0) {
-        const lx::rect2i geometry = outputs.geometry(outputs.nth(0));
+        const lx::rect2i geometry = outputs.logical_rect(outputs.nth(0));
         if (event.absolute) {
             seat.set_pointer_position(geometry.x + event.x * geometry.width,
                                       geometry.y + event.y * geometry.height);
@@ -791,6 +1041,19 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
 }
 
 void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_event& event) {
+    // A press that wakes the display is consumed, and so is its release (I5).
+    if (!event.device_removed && on_user_activity() && event.pressed) {
+        keys_.reset();
+        wm_.swallow_button_press(event);
+        return;
+    }
+    if (event.pressed)
+        keys_.note_other_input(); // Super+click is not a Super tap
+    // The device is going away under a held button (the revoke at a VT switch comes before
+    // logind's signal; an unplug): a move ends as Escape would and a drag is cancelled, so
+    // the release cannot land a window or become a drop.
+    if (!event.pressed && event.device_removed)
+        wm_.cancel_for_pause();
     const bool grab_before = wm_.grab_active() || wm_.drag_active();
     wm_.on_pointer_button(event);
     // A button that starts or ends a grab (or ends a drag) changes the pointer image without
@@ -804,6 +1067,8 @@ void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_ev
 }
 
 void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
+    (void)on_user_activity(); // a scroll that wakes the display is delivered too
+    keys_.note_other_input();
     wm_.on_pointer_axis(event);
 }
 
@@ -858,7 +1123,13 @@ void compositor_impl::start_input() {
         const int fd = ::open(path, flags | O_CLOEXEC);
         return fd < 0 ? -errno : fd;
     };
-    provider.close_device = [](int fd, void*) { ::close(fd); };
+    // Every device libinput closes — at suspend, on unplug, at exit — goes back to logind:
+    // without ReleaseDevice the TakeDevice of a resume fails with "Device already taken".
+    provider.close_device = [](int fd, void* user) {
+        if (auto* self = static_cast<compositor_impl*>(user))
+            self->logind_.release_device_fd(fd);
+        ::close(fd);
+    };
 
     // Compile a keymap regardless of whether devices open. Clients are told the layout at
     // bind time, and a compositor that never found a keyboard still has to answer that.
@@ -891,6 +1162,10 @@ void compositor_impl::start_input() {
     };
     sink.pointer_axis = [](const lx::input::pointer_axis_event& e, void* u) {
         static_cast<compositor_impl*>(u)->on_input_pointer_axis(e);
+    };
+    // Touch is not routed to clients yet; it is still the user, and wakes the display.
+    sink.touch = [](const lx::input::touch_event&, void* u) {
+        (void)static_cast<compositor_impl*>(u)->on_user_activity();
     };
     input_devices_.set_sink(sink);
 
@@ -947,12 +1222,74 @@ void compositor_impl::drm_fd_callback() {
 void compositor_impl::housekeeping_callback() {
     if (!active)
         return;
+    if (active->session_.display_stopped() ||
+        (active->display_gate_.load(std::memory_order_relaxed) & gate_power) != 0) {
+        // The paused tick, once a second (VT away, or the output powered off): a lost
+        // ResumeDevice (or a card logind does not manage) is noticed here, and clients
+        // still get their frame callbacks.
+        if (active->session_.display_stopped()) {
+            const bool session_active =
+                !active->logind_.has_control() || active->logind_.is_active();
+            const bool master = session_active && active->kms.is_master();
+            active->apply_session_actions(active->session_.on_paused_tick(session_active, master));
+        }
+        if (active->display_gate_.load(std::memory_order_relaxed) != 0)
+            active->on_vsync();
+        return;
+    }
+    // The frame clock is stopped: surfaces not on screen get their throttled frame
+    // callbacks here, about once a second, without restarting it for them.
+    if (frame_callbacks_throttled(active->p0_)) {
+        const auto now = now_ns();
+        fire_visible_frame_callbacks(active->p0_, static_cast<unsigned>(now / 1'000'000ull),
+                                     active->last_published_frame_, now);
+    }
     active->request_frame();
     // Nothing woke the clock but the calendar: one quiet tick is enough to stop again.
     active->quiet_ticks_ = k_idle_ticks - 1;
 }
 
+void compositor_impl::write_screenshot(unsigned slot) {
+    // Render thread, on request only: a full-frame read back and a synchronous write. Not a
+    // hot-path operation and never part of a normal frame.
+    const auto& target = gl_targets_[slot];
+    const unsigned w = target.width();
+    const unsigned h = target.height();
+    std::vector<unsigned char> rgba(static_cast<std::size_t>(w) * h * 4u);
+    if (auto read = gl_compositor_.read_back(target, rgba.data(), static_cast<unsigned>(rgba.size()));
+        !read) {
+        lx::trace::logger::global().log_error(read.get_error(), "compositor.render");
+        return;
+    }
+    const char* dir = std::getenv("LUMEN_SCREENSHOT_DIR");
+    if (!dir || !*dir)
+        dir = std::getenv("XDG_RUNTIME_DIR");
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/lumen-screenshot-%u.ppm", dir ? dir : "/tmp",
+                  ++screenshot_count_);
+    std::FILE* f = std::fopen(path, "wb");
+    if (!f) {
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
+                                        "screenshot: cannot open the output file");
+        return;
+    }
+    std::fprintf(f, "P6\n%u %u\n255\n", w, h);
+    // GL_RGBA read-back yields R, G, B, A per pixel whatever the renderbuffer's storage.
+    for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i)
+        std::fwrite(&rgba[i * 4u], 1, 3, f);
+    std::fclose(f);
+    char line[600];
+    std::snprintf(line, sizeof(line), "screenshot %ux%u written to %s", w, h, path);
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.render", line);
+}
+
 void compositor_impl::after_dispatch_callback() {
+    if (active && active->screenshot_requested_.exchange(false, std::memory_order_acq_rel)) {
+        // Every pixel repainted into the slot that is read back.
+        active->scene.note_full_damage();
+        active->screenshot_pending_.store(true, std::memory_order_release);
+        active->request_frame();
+    }
     // Events produced anywhere in this iteration (input, protocol replies, releases) leave
     // in one flush rather than waiting for the next tick.
     if (active)
@@ -960,7 +1297,10 @@ void compositor_impl::after_dispatch_callback() {
 }
 
 void compositor_impl::request_frame() {
-    if (!vsync_timer || vsync_timer->enabled())
+    // Paused or dark: the 1 Hz paused tick is the only clock; requests and flips do not
+    // start one.
+    if (!vsync_timer || vsync_timer->enabled() ||
+        display_gate_.load(std::memory_order_relaxed) != 0)
         return;
     const auto now = static_cast<lx::runtime::clock_time>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -977,7 +1317,7 @@ void compositor_impl::request_frame() {
 }
 
 void compositor_impl::settle_frame_clock() {
-    if (!vsync_timer)
+    if (!vsync_timer || display_gate_.load(std::memory_order_relaxed) != 0)
         return;
     if (!tick_quiet_) {
         quiet_ticks_ = 0;
@@ -1066,6 +1406,89 @@ void compositor_impl::register_p0_globals() {
     wm_.set_liveness(&liveness_);
     p0_.liveness = &liveness_;
     p0_.activation = &activation_;
+    p0_.presentation = &presentation_feedback_;
+    p0_.idle = &idle_;
+    p0_.inhibitors = &inhibitors_;
+    p0_.idle_user = this;
+    p0_.idle_changed = [](void* u) {
+        auto* self = static_cast<compositor_impl*>(u);
+        self->rearm_idle_timer();
+        self->request_frame(); // a tick evaluates inhibition with the newest frame
+    };
+    // Display power needs a display: without KMS (headless, nested) the objects are failed.
+    if (drm_present_) {
+        p0_.set_output_power = [](void* u, unsigned, bool on) {
+            static_cast<compositor_impl*>(u)->request_output_power(on);
+        };
+        p0_.output_power_on = [](void* u, unsigned) {
+            return static_cast<compositor_impl*>(u)->power_.reported_on();
+        };
+    }
+    p0_.text_input = &text_input_;
+    p0_.ime_popup_layer = &ime_popup_layer_;
+    {
+        wm_ime_ops ops{};
+        ops.user = this;
+        ops.hit = [](void* u, double x, double y, wm_hit& out) {
+            auto* self = static_cast<compositor_impl*>(u);
+            void* res = nullptr;
+            lx::surface_id surface{};
+            double sx = 0.0;
+            double sy = 0.0;
+            if (!input_popup_hit(self->p0_, x, y, res, surface, sx, sy))
+                return false;
+            out = {};
+            out.surface_resource = res;
+            out.surface = surface;
+            out.root = surface;
+            out.sx = sx;
+            out.sy = sy;
+            out.owner = hit_owner::ime_popup;
+            return true;
+        };
+        wm_.set_ime_ops(ops);
+    }
+    p0_.lock = &lock_;
+    p0_.lock_layer = &lock_layer_;
+    p0_.lock_user = this;
+    p0_.lock_apply = [](void* u, const lock_actions& a) {
+        static_cast<compositor_impl*>(u)->apply_lock_actions(a);
+    };
+    {
+        wm_lock_ops ops{};
+        ops.user = this;
+        ops.hit = [](void* u, double x, double y, wm_hit& out) {
+            auto* self = static_cast<compositor_impl*>(u);
+            void* res = nullptr;
+            lx::surface_id surface{};
+            lx::surface_id root{};
+            double sx = 0.0;
+            double sy = 0.0;
+            if (!session_lock_hit(self->p0_, x, y, res, surface, root, sx, sy))
+                return false;
+            out = {};
+            out.surface_resource = res;
+            out.surface = surface;
+            out.root = root;
+            out.sx = sx;
+            out.sy = sy;
+            out.owner = hit_owner::lock;
+            return true;
+        };
+        ops.keyboard = [](void* u, lx::surface_id& surface) -> void* {
+            auto* self = static_cast<compositor_impl*>(u);
+            // Only once the lock layer is shown: before that, nothing has the keyboard.
+            if (!self->lock_.scene_locked())
+                return nullptr;
+            surface = self->lock_.keyboard_surface();
+            return self->lock_.keyboard_resource();
+        };
+        ops.clicked = [](void* u, lx::surface_id surface) {
+            auto* self = static_cast<compositor_impl*>(u);
+            self->apply_lock_actions(self->lock_.clicked(surface));
+        };
+        wm_.set_lock_ops(ops);
+    }
     p0_.outputs = &outputs;
     // Only when frames are actually composited in software. The headless backend keeps a
     // full copy of every registered texture; handed it on a GPU path, the commit path
@@ -1078,6 +1501,13 @@ void compositor_impl::register_p0_globals() {
         static_cast<compositor_impl*>(self)->begin_logout(source);
     };
     p0_.logout_user = this;
+    p0_.keys = &keys_;
+    keys_.set_layout_query(
+        [](unsigned keysym, void* u) {
+            auto& km = static_cast<compositor_impl*>(u)->input_devices_.default_seat().keymap();
+            return km.layout_has_keysym(keysym, km.active_layout());
+        },
+        this);
     p0_.lifecycle = &buffer_lifecycle_;
     // Exactly one staging strategy: the CPU path samples staged rows in place during the
     // composite, which a shared FIFO cannot keep alive that long (see shm_pixel_store).
@@ -1651,10 +2081,28 @@ void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback
     if (!user_data)
         return;
     auto* impl = static_cast<compositor_impl*>(user_data);
+    // A flip of a commit made before the pause, drained after it: the slot it showed is
+    // noted, its timing dropped. It must not restart the frame clock or pace callbacks.
+    if (impl->display_gate_.load(std::memory_order_relaxed) != 0) {
+        impl->committed_submit_us_.store(0, std::memory_order_relaxed);
+        (void)impl->committed_input_us_.exchange(0, std::memory_order_acq_rel);
+        if (const int fd = impl->committed_fence_fd_.exchange(-1, std::memory_order_acq_rel);
+            fd >= 0)
+            ::close(fd);
+        // Its presentation feedback was discarded at the pause edge (nothing presented
+        // while the session is away — wlroots reports such flips `presented = false`).
+        if (fb.vsync)
+            impl->on_scanout_flip(impl->pending_flip_slot_.load(std::memory_order_acquire));
+        // A power-off waiting for this flip (the CRTC takes one commit at a time) goes now.
+        if (impl->power_.waiting_for_flip() && !impl->kms_atomic.flip_pending())
+            impl->apply_power_actions(impl->power_.on_flip_drained());
+        return;
+    }
     // The flip landed, so clients may draw again regardless of how complete the feedback is
     // — unless it only moved the pointer: no client content was presented by it.
     if (impl->last_commit_content_.load(std::memory_order_acquire))
         impl->present_completed_ = true;
+    impl->awaiting_resume_flip_ = false;
 
     // Phase-lock the frame clock to the display, and aim each repaint at its deadline
     // rather than at the interval boundary. A timer free-running at target_fps drifts
@@ -1699,10 +2147,705 @@ void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback
     if (fb.hw_clock)
         impl->note_present_latency(fb.actual_present_ns, submit_us, fence_us);
 
-    if (!fb.hw_clock || !fb.vsync)
+    if (!fb.vsync)
         return;
     const unsigned slot = impl->pending_flip_slot_.load(std::memory_order_acquire);
     impl->on_scanout_flip(slot);
+
+    // wp_presentation: the composite of frame `tag` is on screen. A kernel flip event is
+    // vsync'd and hardware-signalled; its time is the hardware's (hw_clock) when the driver
+    // timestamps vblanks, with the CRTC's vblank counter as MSC (wlroots' handle_page_flip).
+    // A driver without vblank support samples the time when it sends the event and has no
+    // counter (seq 0, as the spec asks): no hw_clock. A blocking modeset's completion is
+    // timed here, in software: vsync only.
+    if (fb.content && fb.tag != 0) {
+        present_info info{};
+        info.timestamp_ns = static_cast<unsigned long long>(fb.actual_present_ns);
+        info.seq = fb.vblank_clock ? fb.seq : 0;
+        info.flags = k_present_vsync;
+        if (fb.hw_clock)
+            info.flags |= k_present_hw_completion;
+        if (fb.vblank_clock)
+            info.flags |= k_present_hw_clock;
+        if (impl->outputs.count() > 0) {
+            const unsigned mhz = impl->outputs.state(impl->outputs.nth(0)).refresh_mhz;
+            if (mhz > 0)
+                info.refresh_ns = static_cast<unsigned>(
+                    (1'000'000'000'000ull + mhz / 2) / mhz);
+        }
+        presentation_flipped(impl->p0_, fb.tag, info);
+        // ext-session-lock (L1): a locked frame is on the output — `locked` may go out.
+        if (impl->lock_.state() == lock_state::locking &&
+            static_cast<int>(fb.tag - impl->lock_frame_) >= 0)
+            impl->apply_lock_actions(impl->lock_.locked_frame_shown());
+    }
+}
+
+// ── Session pause/resume (VT switching) ────────────────────────────────────
+
+void compositor_impl::record_session_event(const session_event& ev) {
+    session_events_.push_back(ev);
+}
+
+namespace {
+const char* pause_kind_name(session_pause_kind k) {
+    switch (k) {
+    case session_pause_kind::pause: return "pause";
+    case session_pause_kind::force: return "force";
+    case session_pause_kind::gone: return "gone";
+    }
+    return "?";
+}
+} // namespace
+
+void compositor_impl::on_session_events() {
+    const std::size_t n = session_events_.size();
+    const bool debug = lx::trace::logger::global().min_level() <= lx::trace::level::debug;
+    for (std::size_t i = 0; i < n; ++i) {
+        const session_event ev = session_events_[i];
+        char line[128];
+        switch (ev.what) {
+        case session_event::kind::paused:
+            if (debug) {
+                std::snprintf(line, sizeof(line), "PauseDevice %u:%u type=%s", ev.major, ev.minor,
+                              pause_kind_name(ev.pause));
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.session",
+                                                line);
+            }
+            // evdev `pause`s (seats without VTs) are acknowledged after the batch, below.
+            if (session_.is_drm(ev.major, ev.minor))
+                apply_session_actions(session_.on_device_paused(ev.major, ev.minor, ev.pause));
+            break;
+        case session_event::kind::resumed:
+            if (debug) {
+                std::snprintf(line, sizeof(line), "ResumeDevice %u:%u", ev.major, ev.minor);
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.session",
+                                                line);
+            }
+            // evdev: we released every input device at the pause, so this is a leftover of
+            // a race; the fd is sd-bus's and libinput re-takes its devices itself.
+            if (session_.is_drm(ev.major, ev.minor))
+                apply_session_actions(session_.on_device_resumed(ev.major, ev.minor));
+            break;
+        case session_event::kind::active:
+            if (debug) {
+                std::snprintf(line, sizeof(line), "Active=%d", ev.active ? 1 : 0);
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.session",
+                                                line);
+            }
+            apply_session_actions(
+                session_.on_active_changed(ev.active, ev.active && kms.is_master()));
+            break;
+        case session_event::kind::vt_failed:
+            std::snprintf(line, sizeof(line), "VT switch failed: %s", ev.error);
+            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.session", line);
+            break;
+        case session_event::kind::lock:
+            on_logind_lock();
+            break;
+        case session_event::kind::unlock:
+            on_logind_unlock();
+            break;
+        case session_event::kind::sleep:
+            on_prepare_for_sleep(ev.active);
+            break;
+        }
+    }
+    // evdev `pause`s (seats without VTs): every one acknowledged, if still held — a DRM
+    // pause in the same batch suspended libinput first, which released them all. logind
+    // completes the switch only once no device of the session is active.
+    for (std::size_t i = 0; i < n; ++i) {
+        const session_event& ev = session_events_[i];
+        if (ev.what == session_event::kind::paused && ev.pause == session_pause_kind::pause &&
+            !session_.is_drm(ev.major, ev.minor) && logind_.holds_device(ev.major, ev.minor))
+            logind_.complete_pause(ev.major, ev.minor);
+    }
+    // Only this batch: a signal recorded meanwhile (none today — the handlers above make
+    // synchronous calls at most, which queue but do not dispatch) waits for the next one.
+    session_events_.erase(session_events_.begin(),
+                          session_events_.begin() + static_cast<std::ptrdiff_t>(n));
+}
+
+void compositor_impl::apply_session_actions(const session_actions& a) {
+    if (a.empty())
+        return;
+    char line[128];
+    if (a.has(session_actions::stop_display))
+        enter_display_pause(a.quiesce_gen);
+    if (a.has(session_actions::suspend_input))
+        suspend_input_for_pause();
+    if (a.has(session_actions::stop_display))
+        wm_.set_suspend_reason(window_manager::suspend_vt, true);
+    if (a.has(session_actions::log_paused)) {
+        if (a.by_active)
+            std::snprintf(line, sizeof(line), "session paused (active=false)");
+        else
+            std::snprintf(line, sizeof(line), "session paused (drm=%u:%u kind=%s)", drm_major_,
+                          drm_minor_, pause_kind_name(a.kind));
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+    }
+    if (a.has(session_actions::log_display_lost))
+        lx::trace::logger::global().log(lx::trace::level::error, "compositor.session",
+                                        "DRM device removed — no display");
+    if (a.has(session_actions::log_resume_rejected))
+        lx::trace::logger::global().log(
+            lx::trace::level::error, "compositor.session",
+            "resume modeset rejected (the mode is no longer offered?) — the display stays off "
+            "until the session is switched to again");
+    if (a.has(session_actions::begin_resume))
+        begin_display_resume(a.resume_gen);
+    if (a.has(session_actions::resume_input))
+        resume_input_after_pause();
+    if (a.has(session_actions::complete_pause)) {
+        logind_.complete_pause(a.ack_major, a.ack_minor);
+        std::snprintf(line, sizeof(line), "PauseDeviceComplete %u:%u", a.ack_major, a.ack_minor);
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.session", line);
+    }
+    if (a.has(session_actions::log_resumed))
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.session",
+                                        "session resumed");
+    // A lock under way when the VT went away is locked now (nothing of it is visible).
+    advance_lock();
+    wayland.flush();
+}
+
+void compositor_impl::enter_display_pause(unsigned quiesce_gen) {
+    // 1. Gate the render thread: from its next check on, nothing is composited or
+    //    committed. A commit already past the check fails with EACCES (logind dropped
+    //    master before signalling), which render then classifies as paused.
+    display_gate_.fetch_or(gate_vt, std::memory_order_release);
+    // 2. Render runs this after its current tick; the reply times a `pause` acknowledgement.
+    auto& ex = runtime::executor::global();
+    if (threads_started.load(std::memory_order_acquire)) {
+        compositor_impl* self = this;
+        (void)ex.post(runtime::affinity::render, [self, quiesce_gen] {
+            compositor_impl* s = self;
+            const unsigned g = quiesce_gen;
+            (void)runtime::executor::global().post(runtime::affinity::ui, [s, g] {
+                s->apply_session_actions(s->session_.on_render_quiesced(g));
+            });
+        });
+    } else {
+        apply_session_actions(session_.on_render_quiesced(quiesce_gen));
+    }
+    // 3. The frame clock stops; the housekeeping timer becomes the 1 Hz paused tick. Nothing
+    //    in flight will be presented: its feedback is discarded now (the flips still to
+    //    drain are dropped by the paused branch of the flip handler).
+    presentation_discard(p0_, false);
+    if (vsync_timer)
+        vsync_timer->set_enabled(false);
+    if (housekeeping_timer)
+        housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
+    // 4. End what a release must not complete: a move/resize ends as Escape would, a drag
+    //    is cancelled. A half-typed tap is no tap.
+    wm_.cancel_for_pause();
+    keys_.reset();
+}
+
+void compositor_impl::suspend_input_for_pause() {
+    auto& seat = input_devices_.default_seat();
+    // 5. libinput closes every device (back to logind with ReleaseDevice) and emits a
+    //    release for every key and button still down; those were drained through the
+    //    normal path just now, so clients saw them in order.
+    input_devices_.suspend();
+    // Whatever libinput did not cover (injected input, a device that vanished uncleanly):
+    // released here, so no client is left with a stuck key or button.
+    const auto time_ms = static_cast<unsigned>(now_ns() / 1'000'000ull);
+    input_router_.release_forwarded_keys(time_ms, seat);
+    wm_.release_held_buttons(time_ms);
+    if (seat.keymap().reset_depressed())
+        input_router_.send_modifiers(seat.keymap().modifiers(), seat);
+    seat.clear_pressed();
+    // 6. The focused client is told it lost the keyboard; the window manager's decision is
+    //    kept for the resume.
+    input_router_.suspend_keyboard_focus(seat);
+}
+
+void compositor_impl::resume_input_after_pause() {
+    auto& seat = input_devices_.default_seat();
+    if (input_devices_.suspended()) {
+        // Re-enumerates the seat and re-takes every device through logind; a device that
+        // fails stays closed (libinput logs it).
+        if (auto resumed = input_devices_.resume(); !resumed)
+            lx::trace::logger::global().log_error(resumed.get_error(), "compositor.input");
+        // The DEVICE_ADDED events are queued now; deliver them (and the LED updates).
+        (void)input_devices_.dispatch();
+    }
+    // The window manager decides again first (a session lock may have started while away):
+    // the surface the resume gives the keys to is its decision now, never the one from
+    // before the switch.
+    wm_.resolve_keyboard_focus();
+    // `enter` with an empty key array and the modifiers (only locks survive): a full resync.
+    input_router_.resume_keyboard_focus(seat);
+}
+
+void compositor_impl::begin_display_resume(unsigned gen) {
+    // A flip completed before the pause is consumed under the old generation first, which
+    // keeps the order obvious in the log (the cookies make it safe either way).
+    if (drm_present_)
+        kms_atomic.dispatch_events();
+    // The VT coming back is activity (I2), and it brings a dark output back on: this
+    // resume's own modeset turns the CRTC on, so the power gate just goes.
+    apply_power_actions(power_.on_vt_resumed());
+    const unsigned render_gen = ++render_gen_counter_;
+    vt_resume_render_gen_ = render_gen;
+    vt_resume_session_gen_ = gen;
+    resume_gen_.store(render_gen, std::memory_order_release);
+    display_gate_.fetch_and(~gate_vt, std::memory_order_release);
+    resume_input_after_pause();
+    wm_.set_suspend_reason(window_manager::suspend_vt, false);
+    if (idle_.note_activity(now_ns(), idle_events(p0_)))
+        rearm_idle_timer();
+    // Another master drew on the CRTC: every pixel is repainted.
+    scene.note_full_damage();
+    if (housekeeping_timer)
+        housekeeping_timer->set_enabled(false);
+    last_callback_ns_ = 0;
+    present_completed_ = false;
+    awaiting_resume_flip_ = true;
+    request_frame();
+}
+
+// ── Idle, inhibition and display power ─────────────────────────────────────
+
+void compositor_impl::idle_timer_callback() {
+    if (!active)
+        return;
+    active->idle_.on_timer(static_cast<unsigned long long>(now_ns()), idle_events(active->p0_));
+    active->rearm_idle_timer();
+}
+
+void compositor_impl::rearm_idle_timer() {
+    if (!idle_timer_)
+        return;
+    const unsigned long long deadline = idle_.next_deadline();
+    if (deadline == 0)
+        idle_timer_->set_enabled(false);
+    else
+        idle_timer_->schedule_at(static_cast<lx::runtime::clock_time>(deadline));
+}
+
+bool compositor_impl::on_user_activity() {
+    // Per input event: one clock read, one store, and a branch on the idle count.
+    if (idle_.note_activity(static_cast<unsigned long long>(now_ns()), idle_events(p0_)))
+        rearm_idle_timer();
+    if (!power_.wants_wake())
+        return false;
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.power",
+                                    "display woken by input");
+    apply_power_actions(
+        power_.wake((display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0));
+    return true;
+}
+
+void compositor_impl::request_output_power(bool on) {
+    const bool vt_away = (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0;
+    apply_power_actions(on ? power_.request_on(vt_away) : power_.request_off(vt_away));
+}
+
+void compositor_impl::apply_power_actions(const power_actions& a) {
+    if (a.empty())
+        return;
+    if (a.has(power_actions::gate)) {
+        // The display stops as at a VT pause (A.3 step 3), but input stays live: it is what
+        // wakes the output. Keyboard focus is kept.
+        power_gen_.store(power_.generation(), std::memory_order_release);
+        display_gate_.fetch_or(gate_power, std::memory_order_release);
+        presentation_discard(p0_, false);
+        if (vsync_timer)
+            vsync_timer->set_enabled(false);
+        if (housekeeping_timer)
+            housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
+        awaiting_resume_flip_ = false;
+        wm_.set_suspend_reason(window_manager::suspend_power, true);
+        lx::trace::timeline_instant("ui", "power.gate");
+    }
+    if (a.has(power_actions::post_off))
+        post_power_off(a.gen);
+    if (a.has(power_actions::ungate)) {
+        // Whatever off task is still in flight is stale from here on.
+        power_gen_.store(power_.generation(), std::memory_order_release);
+        wm_.set_suspend_reason(window_manager::suspend_power, false);
+        if (a.resume) {
+            // The CRTC is down: the resume procedure (full repaint, a full modeset with
+            // ACTIVE=1) brings it back. The generation is stored before the gate opens.
+            const unsigned render_gen = ++render_gen_counter_;
+            power_resume_render_gen_ = render_gen;
+            resume_gen_.store(render_gen, std::memory_order_release);
+        }
+        display_gate_.fetch_and(~gate_power, std::memory_order_release);
+        if ((display_gate_.load(std::memory_order_relaxed) & gate_vt) == 0) {
+            scene.note_full_damage();
+            if (housekeeping_timer)
+                housekeeping_timer->set_enabled(false);
+            last_callback_ns_ = 0;
+            present_completed_ = false;
+            awaiting_resume_flip_ = a.resume;
+            request_frame();
+        }
+        lx::trace::timeline_instant("ui", "power.ungate");
+    }
+    if (a.has(power_actions::wait_flip) && !kms_atomic.flip_pending())
+        apply_power_actions(power_.on_flip_drained());
+    if (a.has(power_actions::send_mode) && outputs.count() > 0) {
+        const int slot = outputs.slot_of(outputs.nth(0));
+        if (slot >= 0)
+            notify_output_power(p0_, static_cast<unsigned>(slot), a.mode_on);
+    }
+    if (a.has(power_actions::log_off))
+        lx::trace::logger::global().log(
+            lx::trace::level::info, "compositor.power",
+            (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0
+                ? "display power off (session away: nothing to commit)"
+                : "display power off (CRTC ACTIVE=0, cursor plane off)");
+    if (a.has(power_actions::log_soft_blank))
+        lx::trace::logger::global().log(
+            lx::trace::level::warn, "compositor.power",
+            "display power off refused by the driver — showing black instead (no power saving)");
+    if (a.has(power_actions::log_on))
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.power",
+                                        "display power on");
+    if (a.has(power_actions::log_on_failed))
+        lx::trace::logger::global().log(
+            lx::trace::level::error, "compositor.power",
+            "display power on: the modeset was refused (the mode is no longer offered?) — the "
+            "output stays dark until the next input");
+    // A lock under way when the output went dark is locked now.
+    advance_lock();
+    wayland.flush();
+}
+
+void compositor_impl::post_power_off(unsigned gen) {
+    power_gen_.store(gen, std::memory_order_release);
+    if (!threads_started.load(std::memory_order_acquire) || !drm_present_) {
+        apply_power_actions(power_.on_off_result(gen, power_off_outcome::deferred));
+        return;
+    }
+    compositor_impl* self = this;
+    (void)runtime::executor::global().post(runtime::affinity::render, [self, gen] {
+        const power_off_outcome outcome = self->run_power_off(gen);
+        (void)runtime::executor::global().post(runtime::affinity::ui, [self, gen, outcome] {
+            self->apply_power_actions(self->power_.on_off_result(gen, outcome));
+        });
+    });
+}
+
+power_off_outcome compositor_impl::run_power_off(unsigned gen) {
+    // Render thread, after a tick: the gate is up, so nothing else commits meanwhile.
+    if (power_gen_.load(std::memory_order_acquire) != gen)
+        return power_off_outcome::stale;
+    if ((display_gate_.load(std::memory_order_acquire) & gate_vt) != 0)
+        return power_off_outcome::deferred;
+    if (kms_atomic.flip_pending())
+        return power_off_outcome::retry_after_flip;
+    // Nothing of ours is lit: never modeset yet, or the CRTC is still off from the previous
+    // power-off (a resume whose modeset has not happened).
+    if (!content_committed_once_)
+        return power_off_outcome::deferred;
+    lx::trace::scoped_span span{"render", "kms.power_off"};
+    auto off = kms_atomic.commit_power_off(cursor_plane_.valid() ? &cursor_plane_ : nullptr);
+    if (off) {
+        // What the plane shows is unknown to it now: the power-on modeset states it in full.
+        if (cursor_plane_.valid())
+            cursor_plane_.invalidate();
+        return power_off_outcome::done;
+    }
+    if (kms_atomic.last_failure_lost_master())
+        return power_off_outcome::deferred; // a VT switch raced the request
+    if (!power_rejected_logged_) {
+        power_rejected_logged_ = true;
+        lx::trace::logger::global().log_error(off.get_error(), "compositor.power");
+    }
+    commit_black_frame();
+    return power_off_outcome::rejected;
+}
+
+void compositor_impl::commit_black_frame() {
+    if (scanout_slot_count_ == 0 || kms_atomic.flip_pending())
+        return;
+    const unsigned slot = pick_back_slot();
+    gfx::damage_region region{};
+    region.set_full();
+    region.clip(scanout_rect_);
+    bool drawn = false;
+    int fence = -1;
+    const lx::color black = lx::color::rgb(0.f, 0.f, 0.f);
+    if (gl_present_) {
+        if (auto c = gl_compositor_.composite_region(gl_targets_[slot], black, nullptr, 0, region);
+            c) {
+            drawn = true;
+            fence = c.value().out_fence_fd;
+        }
+    } else if (cpu_present_) {
+        const auto& fb = dumb_fbs_[slot];
+        gfx::pixel_surface target{};
+        target.pixels = fb.pixels();
+        target.width = fb.width();
+        target.height = fb.height();
+        target.stride = fb.stride();
+        target.format = fb.format();
+        target.write_combining = true;
+        drawn = static_cast<bool>(
+            cpu_compositor_.composite_region(target, black, nullptr, 0, region));
+    } else if (vulkan_present_) {
+        if (auto c = vk_compositor_.composite(vk_targets_[slot], black, nullptr, 0); c) {
+            drawn = true;
+            fence = c.value().out_fence_fd;
+        }
+    }
+    if (!drawn)
+        return;
+    drm::atomic_commit_request req{};
+    req.connector = 0;
+    req.request_page_flip = true;
+    req.in_fence_fd = fence;
+    req.damage.full_frame = true;
+    req.framebuffer_id = cpu_present_ ? dumb_fbs_[slot].id() : scanout_fbs_[slot].id();
+    if (cursor_plane_.valid()) {
+        cursor_plane_.set_visible(false);
+        req.cursor = &cursor_plane_;
+    }
+    // Its flip lands while gated: it rotates the slot and answers nothing.
+    pending_flip_slot_.store(slot, std::memory_order_release);
+    last_commit_content_.store(false, std::memory_order_release);
+    if (auto committed = kms_atomic.commit(req); committed && kms_atomic.completion_needs_dispatch())
+        post_flip_dispatch();
+    if (fence >= 0)
+        ::close(fence);
+    // Every slot is stale against what a power-on shows (the resume repaints it all anyway).
+    for (unsigned i = 0; i < k_scanout_slots; ++i)
+        slot_age_damage_[i].set_full();
+    kms_pending_damage_.set_full();
+}
+
+// ── Session lock (ext-session-lock-v1) ──────────────────────────────────────
+
+void compositor_impl::lock_timer_callback() {
+    if (!active)
+        return;
+    const auto now = now_ns();
+    active->apply_lock_actions(active->lock_.on_timer(static_cast<unsigned long long>(now)));
+    if (active->sleep_lock_deadline_ns_ != 0 && now >= active->sleep_lock_deadline_ns_)
+        active->release_sleep_delay("no lock within 2 s");
+    active->rearm_lock_timer();
+}
+
+void compositor_impl::rearm_lock_timer() {
+    if (!lock_timer_)
+        return;
+    lx::runtime::clock_time next = static_cast<lx::runtime::clock_time>(lock_.deadline());
+    if (sleep_lock_deadline_ns_ != 0 && (next == 0 || sleep_lock_deadline_ns_ < next))
+        next = sleep_lock_deadline_ns_;
+    if (next == 0)
+        lock_timer_->set_enabled(false);
+    else
+        lock_timer_->schedule_at(next);
+}
+
+void compositor_impl::release_sleep_delay(const char* why) {
+    if (sleep_lock_deadline_ns_ == 0)
+        return;
+    sleep_lock_deadline_ns_ = 0;
+    logind_.release_sleep_inhibitor();
+    char line[96];
+    std::snprintf(line, sizeof(line), "sleep may proceed (%s)", why);
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock", line);
+}
+
+bool compositor_impl::display_dark() const {
+    const unsigned gate = display_gate_.load(std::memory_order_relaxed);
+    if ((gate & gate_vt) != 0)
+        return true; // another VT (or nothing) is on the CRTC
+    // Powered off, or the black frame of a refused power-off — not while the off task is
+    // still pending (the last frame is on screen until it runs).
+    if (power_.phase() == power_phase::off || power_.phase() == power_phase::soft_blank)
+        return true;
+    // KMS, and nothing of ours ever reached the CRTC: the console is on screen.
+    return drm_present_ && !ever_lit_.load(std::memory_order_acquire);
+}
+
+void compositor_impl::advance_lock() {
+    if (lock_.state() == lock_state::locking && display_dark())
+        apply_lock_actions(lock_.locked_frame_shown());
+}
+
+void compositor_impl::apply_lock_actions(const lock_actions& a) {
+    if (a.empty())
+        return;
+    const lx::color black = lx::color::rgb(0.f, 0.f, 0.f);
+    if (a.has(lock_actions::input_lock)) {
+        // L1: input leaves normal clients at the request, before anything is hidden. The
+        // lock layer stays hidden until the scene locks (lock surfaces are not shown before).
+        lock_layer_.set_visible(false);
+        keys_.set_locked(true);
+        wm_.set_session_locked(true);
+    }
+    if (a.has(lock_actions::scene_lock)) {
+        for (scene::container_node* layer :
+             {&background_layer_, &bottom_layer_, &windows_layer_, &top_layer_,
+              &overlay_shell_layer_, &popup_layer_, &dnd_icon_layer_})
+            layer->set_visible(false);
+        lock_layer_.set_visible(true);
+        // The first snapshot built from here on is a locked frame.
+        lock_frame_ = p0_.building_frame;
+        wm_.set_suspend_reason(window_manager::suspend_lock, true);
+        scene.note_full_damage();
+        request_frame();
+    }
+    // The wire half: finished, locked, and lock surfaces dropped when the lock ended.
+    session_lock_send(p0_, a);
+    if (a.has(lock_actions::scene_unlock)) {
+        for (scene::container_node* layer :
+             {&background_layer_, &bottom_layer_, &windows_layer_, &top_layer_,
+              &overlay_shell_layer_, &popup_layer_, &dnd_icon_layer_})
+            layer->set_visible(true);
+        lock_layer_.set_visible(false);
+        wm_.set_suspend_reason(window_manager::suspend_lock, false);
+        scene.note_full_damage();
+        request_frame();
+    }
+    if (a.has(lock_actions::input_unlock)) {
+        keys_.set_locked(false);
+        wm_.set_session_locked(false);
+    }
+    if (a.has(lock_actions::refocus))
+        wm_.lock_focus_changed();
+    // The solid colour: dark red once the locker is gone (sway), so whoever sits down sees
+    // why the screen is locked and empty; black otherwise.
+    const lx::color clear = lock_.state() == lock_state::abandoned
+                                ? lx::color::rgb(0x3f / 255.f, 0.f, 0.f)
+                                : black;
+    const lx::color old = scene.clear_color();
+    if (old.r != clear.r || old.g != clear.g || old.b != clear.b) {
+        scene.set_clear_color(clear);
+        scene.note_full_damage();
+        request_frame();
+    }
+    if (a.has(lock_actions::locked_hint) && logind_.has_control())
+        logind_.set_locked_hint(a.hint);
+    if (a.has(lock_actions::notify_shell) && p0_.notify_lock_state)
+        p0_.notify_lock_state(shell_lock_state(lock_.state()));
+    if (a.has(lock_actions::activity)) {
+        // An unlock is the user (I2) — but not a wake: unlocking while blanked stays dark
+        // until input (the unlock itself was input, which already woke it).
+        if (idle_.note_activity(static_cast<unsigned long long>(now_ns()), idle_events(p0_)))
+            rearm_idle_timer();
+    }
+    if (a.has(lock_actions::rearm_timer))
+        rearm_lock_timer();
+    if (lock_.state() != logged_lock_state_) {
+        const lock_state from = logged_lock_state_;
+        logged_lock_state_ = lock_.state();
+        char line[128];
+        std::snprintf(line, sizeof(line), "session lock: %s -> %s", lock_state_name(from),
+                      lock_state_name(logged_lock_state_));
+        lx::trace::logger::global().log(logged_lock_state_ == lock_state::abandoned
+                                            ? lx::trace::level::warn
+                                            : lx::trace::level::info,
+                                        "compositor.lock", line);
+        if (logged_lock_state_ == lock_state::abandoned)
+            lx::trace::logger::global().log(
+                lx::trace::level::warn, "compositor.lock",
+                "session lock abandoned (the locker exited) — staying locked until a new "
+                "locker takes over or logind unlocks");
+    }
+    // `locked` is what before-sleep locking waits for.
+    if ((lock_.state() == lock_state::locked || lock_.state() == lock_state::abandoned ||
+         lock_.state() == lock_state::unlocked) &&
+        sleep_lock_deadline_ns_ != 0)
+        release_sleep_delay(lock_.state() == lock_state::unlocked ? "lock ended" : "locked");
+    // A lock reaching `locking` while nothing of the session is visible is locked at once.
+    advance_lock();
+    wayland.flush();
+}
+
+void compositor_impl::on_logind_lock() {
+    // loginctl lock-session, a lid policy: the shell starts its locker (Lumen ships none).
+    if (lock_.state() != lock_state::unlocked) {
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock",
+                                        "logind Lock: already locked");
+        return;
+    }
+    const bool told = p0_.notify_lock_requested && p0_.notify_lock_requested(0);
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock",
+                                    told ? "logind Lock: shell asked to lock"
+                                         : "logind Lock: no shell to start a locker — ignored");
+}
+
+void compositor_impl::on_logind_unlock() {
+    // loginctl unlock-session (polkit-gated by logind): the secure way back from a lock whose
+    // locker is gone (L2). A live locker is sent `finished`.
+    if (lock_.state() == lock_state::unlocked)
+        return;
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock",
+                                    "logind Unlock: unlocking the session");
+    apply_lock_actions(lock_.force_unlock());
+}
+
+void compositor_impl::on_prepare_for_sleep(bool start) {
+    if (!start) {
+        // Resumed from sleep: the user is back (I2), and the next sleep gets its delay again.
+        (void)on_user_activity();
+        if (logind_.has_control())
+            logind_.take_sleep_inhibitor();
+        return;
+    }
+    if (lock_.state() == lock_state::locked || lock_.state() == lock_state::abandoned) {
+        release_sleep_delay("already locked");
+        logind_.release_sleep_inhibitor();
+        return;
+    }
+    bool wait = lock_.state() != lock_state::unlocked; // a lock is under way: wait for it
+    if (!wait)
+        wait = p0_.notify_lock_requested && p0_.notify_lock_requested(1);
+    if (!wait || !logind_.holds_sleep_inhibitor()) {
+        logind_.release_sleep_inhibitor();
+        return;
+    }
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock",
+                                    "system going to sleep: holding it until the session is "
+                                    "locked (at most 2 s)");
+    sleep_lock_deadline_ns_ = now_ns() + k_sleep_lock_wait_ns;
+    rearm_lock_timer();
+}
+
+void compositor_impl::run_resume_procedure(unsigned gen) {
+    discard_composited_fence();
+    composited_slot_ = -1;
+    frame_outstanding_.store(false, std::memory_order_release);
+    kms_atomic.prepare_resume();
+    if (cursor_plane_.valid())
+        cursor_plane_.invalidate();
+    content_committed_once_ = false;
+    for (unsigned slot = 0; slot < k_scanout_slots; ++slot)
+        slot_age_damage_[slot].set_full();
+    kms_pending_damage_.set_full();
+    missed_damage_.set_full();
+    resume_done_gen_ = gen;
+    resume_result_pending_ = true;
+}
+
+void compositor_impl::post_resume_result(unsigned gen, session_resume_outcome outcome) {
+    compositor_impl* self = this;
+    (void)runtime::executor::global().post(runtime::affinity::ui, [self, gen, outcome] {
+        // `gen` is the render generation: it answers the VT resume, a power-on, or both
+        // (whichever asked for it last).
+        if (gen == self->vt_resume_render_gen_)
+            self->apply_session_actions(
+                self->session_.on_resume_result(self->vt_resume_session_gen_, outcome));
+        if (gen == self->power_resume_render_gen_)
+            self->apply_power_actions(self->power_.on_resume_result(
+                outcome == session_resume_outcome::ok ? power_on_outcome::ok
+                : outcome == session_resume_outcome::rejected
+                    ? power_on_outcome::rejected
+                    : power_on_outcome::device_unavailable));
+    });
+}
+
+void compositor_impl::post_flip_dispatch() {
+    compositor_impl* self = this;
+    (void)runtime::executor::global().post(runtime::affinity::ui,
+                                           [self] { self->kms_atomic.dispatch_events(); });
 }
 
 void compositor_impl::start_threads() {
@@ -1912,7 +3055,10 @@ lx::result<void> compositor::start() {
         lx::result<drm::kms_device> opened =
             lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
                            "kms not opened");
-        if (auto taken = impl_->logind_.take_device_path("/dev/dri/card0"); taken) {
+        bool inactive = false;
+        if (auto taken = impl_->logind_.take_device_path("/dev/dri/card0", &inactive); taken) {
+            impl_->drm_via_logind_ = impl_->logind_.has_control();
+            impl_->drm_start_inactive_ = impl_->drm_via_logind_ && inactive;
             opened = drm::kms_device::open_fd(std::move(taken).value());
         } else {
             opened = drm::kms_device::open("/dev/dri/card0");
@@ -1922,9 +3068,23 @@ lx::result<void> compositor::start() {
             impl_->graphics.syncobj().set_drm_fd(impl_->kms.card_fd());
             impl_->graphics.syncobj().set_device(impl_->graphics.vk_device());
             // Presenting needs DRM master, not merely an open card. Claiming the
-            // page-flip path without it produces a commit failure on every frame.
-            impl_->drm_present_ = impl_->kms.card_fd() >= 0 && impl_->kms.is_master();
-            if (impl_->drm_present_) {
+            // page-flip path without it produces a commit failure on every frame — unless
+            // logind gave us the card for a session that is merely not in front yet: then
+            // master arrives with ResumeDevice, and the session starts paused.
+            impl_->drm_present_ = impl_->kms.card_fd() >= 0 &&
+                                  (impl_->kms.is_master() || impl_->drm_start_inactive_);
+            if (impl_->kms.card_fd() >= 0) {
+                struct stat st {};
+                if (::fstat(impl_->kms.card_fd(), &st) == 0 && S_ISCHR(st.st_mode)) {
+                    impl_->drm_major_ = major(st.st_rdev);
+                    impl_->drm_minor_ = minor(st.st_rdev);
+                }
+            }
+            if (impl_->drm_present_ && impl_->drm_start_inactive_) {
+                lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm",
+                                                "KMS device open, session inactive — scanout "
+                                                "starts when the session is switched to");
+            } else if (impl_->drm_present_) {
                 lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm",
                                                 "KMS device open — page-flip present path");
             } else if (impl_->kms.card_fd() >= 0) {
@@ -2036,17 +3196,23 @@ lx::result<void> compositor::start() {
     (void)::malloc_trim(0);
 #endif
 
+    // Every connector takes the configured scale (n/120) when it first appears.
+    impl_->outputs.set_default_scale(impl_->cfg.output_scale);
     (void)impl_->hotplug_.start(impl_->outputs, impl_->kms);
     if (impl_->outputs.count() > 0) {
-        const lx::rect2i g = impl_->outputs.geometry(impl_->outputs.nth(0));
+        const output_state o0 = impl_->outputs.state(impl_->outputs.nth(0));
+        const lx::rect2i g = o0.mode_rect();
+        const lx::rect2i l = o0.logical_rect();
         unsigned refresh_mhz = 0;
         if (auto mode = impl_->kms.active_mode(0); mode)
             refresh_mhz = mode.value().refresh_millihz;
         else // the virtual output (headless, nested)
-            refresh_mhz = impl_->outputs.state(impl_->outputs.nth(0)).refresh_mhz;
-        char line[96];
-        std::snprintf(line, sizeof(line), "output 0 mode=%dx%d refresh_mhz=%u", g.width, g.height,
-                      refresh_mhz);
+            refresh_mhz = o0.refresh_mhz;
+        char line[160];
+        std::snprintf(line, sizeof(line),
+                      "output 0 mode=%dx%d refresh_mhz=%u scale=%g (%ld/120) logical=%dx%d",
+                      g.width, g.height, refresh_mhz, o0.scale, std::lround(o0.scale * 120.0),
+                      l.width, l.height);
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
     }
     impl_->log_outputs();
@@ -2061,7 +3227,21 @@ lx::result<void> compositor::start() {
     // plane, then the manager that feeds both. Startup-only file I/O.
     {
         auto* impl = impl_;
-        impl->cursor_theme_.load(nullptr, 0);
+        // Themes are loaded at the output's pixel size: XCURSOR_SIZE (or 24) is a logical
+        // size, so a 1.25 output shows 30 px images — sharp, not a 24 px image stretched.
+        {
+            unsigned base = 24;
+            if (const char* env = std::getenv("XCURSOR_SIZE")) {
+                const long v = std::strtol(env, nullptr, 10);
+                if (v > 0 && v <= 256)
+                    base = static_cast<unsigned>(v);
+            }
+            const double scale = impl->outputs.count() > 0
+                                     ? impl->outputs.scale(impl->outputs.nth(0))
+                                     : impl->outputs.default_scale();
+            const long px = std::lround(static_cast<double>(base) * scale);
+            impl->cursor_theme_.load(nullptr, px > 0 ? static_cast<unsigned>(px) : base);
+        }
         char line[160];
         std::snprintf(line, sizeof(line), "cursor theme=%s size=%u from_theme=%u builtin=%u",
                       impl->cursor_theme_.name(), impl->cursor_theme_.size(),
@@ -2116,7 +3296,7 @@ lx::result<void> compositor::start() {
 
     // The pointer starts in the middle of output 0, where it is easy to find.
     if (impl_->outputs.count() > 0) {
-        const lx::rect2i g = impl_->outputs.geometry(impl_->outputs.nth(0));
+        const lx::rect2i g = impl_->outputs.logical_rect(impl_->outputs.nth(0));
         auto& seat = impl_->input_devices_.default_seat();
         seat.set_pointer_position(g.x + g.width / 2, g.y + g.height / 2);
         impl_->cursor_.on_motion(seat.pointer_x(), seat.pointer_y(), 0, false);
@@ -2151,6 +3331,17 @@ lx::result<void> compositor::start() {
         &detail::compositor_impl::housekeeping_callback, true);
     impl_->housekeeping_timer->set_enabled(false); // only while the frame clock is stopped
     impl_->loop.add_source(impl_->housekeeping_timer.get());
+    // ext-idle-notify: one timer for every notification, armed at the next deadline only.
+    impl_->idle_timer_ = std::make_unique<runtime::timer_source>(
+        0, &detail::compositor_impl::idle_timer_callback, false);
+    impl_->idle_timer_->set_enabled(false);
+    impl_->loop.add_source(impl_->idle_timer_.get());
+    impl_->rearm_idle_timer();
+    // ext-session-lock: the 1 s wait for lock surfaces and the 2 s sleep delay.
+    impl_->lock_timer_ = std::make_unique<runtime::timer_source>(
+        0, &detail::compositor_impl::lock_timer_callback, false);
+    impl_->lock_timer_->set_enabled(false);
+    impl_->loop.add_source(impl_->lock_timer_.get());
 
     // Every fd the UI thread serves is waited on, not polled: the loop sleeps until one is
     // readable or a timer is due.
@@ -2167,7 +3358,72 @@ lx::result<void> compositor::start() {
         impl_->loop.add_source(impl_->drm_fd_source.get());
     }
     if (impl_->logind_.bus_fd() >= 0) {
-        impl_->logind_source = std::make_unique<detail::logind_bus_source>(impl_->logind_);
+        // Signals are recorded by these callbacks and acted on after each dispatch. A VT
+        // switch brings one PauseDevice/ResumeDevice per taken device plus Active.
+        impl_->session_events_.reserve(64);
+        lx::session::session_listener listener{};
+        listener.user = impl_;
+        listener.device_paused = [](unsigned maj, unsigned min, lx::session::device_pause k,
+                                    void* u) {
+            detail::compositor_impl::session_event ev{};
+            ev.what = detail::compositor_impl::session_event::kind::paused;
+            ev.major = maj;
+            ev.minor = min;
+            ev.pause = k == lx::session::device_pause::pause  ? session_pause_kind::pause
+                       : k == lx::session::device_pause::gone ? session_pause_kind::gone
+                                                              : session_pause_kind::force;
+            static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
+        };
+        listener.device_resumed = [](unsigned maj, unsigned min, int, void* u) {
+            detail::compositor_impl::session_event ev{};
+            ev.what = detail::compositor_impl::session_event::kind::resumed;
+            ev.major = maj;
+            ev.minor = min;
+            static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
+        };
+        listener.active_changed = [](bool on, void* u) {
+            detail::compositor_impl::session_event ev{};
+            ev.what = detail::compositor_impl::session_event::kind::active;
+            ev.active = on;
+            static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
+        };
+        listener.vt_switch_failed = [](const char* name, void* u) {
+            detail::compositor_impl::session_event ev{};
+            ev.what = detail::compositor_impl::session_event::kind::vt_failed;
+            // D-Bus error names in the reply are freed with it: keep only the known ones.
+            ev.error = std::strstr(name, "AccessDenied")    ? "access denied"
+                       : std::strstr(name, "NotSupported")  ? "not supported"
+                       : std::strstr(name, "InvalidArgs")   ? "invalid VT"
+                       : std::strstr(name, "NoSuchSeat")    ? "no such seat"
+                                                            : "logind error";
+            static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
+        };
+        listener.lock_requested = [](void* u) {
+            detail::compositor_impl::session_event ev{};
+            ev.what = detail::compositor_impl::session_event::kind::lock;
+            static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
+        };
+        listener.unlock_requested = [](void* u) {
+            detail::compositor_impl::session_event ev{};
+            ev.what = detail::compositor_impl::session_event::kind::unlock;
+            static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
+        };
+        listener.prepare_for_sleep = [](bool start, void* u) {
+            detail::compositor_impl::session_event ev{};
+            ev.what = detail::compositor_impl::session_event::kind::sleep;
+            ev.active = start;
+            static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
+        };
+        if (auto listening = impl_->logind_.set_listener(listener); !listening)
+            lx::trace::logger::global().log_error(listening.get_error(), "compositor.session");
+        // Before-sleep locking: sleep waits (at most 2 s of ours) for the lock a shell starts
+        // on lock_requested(sleep). Only the session's display server holds it.
+        if (impl_->logind_.has_control())
+            impl_->logind_.take_sleep_inhibitor();
+        impl_->logind_source = std::make_unique<detail::logind_bus_source>(
+            impl_->logind_,
+            [](void* u) { static_cast<detail::compositor_impl*>(u)->on_session_events(); },
+            impl_);
         impl_->loop.add_source(impl_->logind_source.get());
     }
     impl_->loop.set_after_dispatch(&detail::compositor_impl::after_dispatch_callback);
@@ -2177,6 +3433,19 @@ lx::result<void> compositor::start() {
     impl_->memory_.set_pressure_handler(&detail::compositor_impl::on_memory_pressure, impl_);
     impl_->presentation_.bind_page_flip(impl_->kms_atomic);
     impl_->presentation_.set_handler(&detail::compositor_impl::presentation_flip_handler, impl_);
+
+    // The pause/resume machine runs only where there is a display to lose. Starting while
+    // the session is in the background pauses right away (input is held until the switch).
+    {
+        char line[160];
+        std::snprintf(line, sizeof(line), "session %s vt=%u can_switch_vt=%d active=%d drm=%u:%u",
+                      impl_->logind_.session_id()[0] ? impl_->logind_.session_id() : "-",
+                      impl_->logind_.vt_number(), impl_->logind_.can_switch_vt() ? 1 : 0,
+                      impl_->logind_.is_active() ? 1 : 0, impl_->drm_major_, impl_->drm_minor_);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+        impl_->apply_session_actions(impl_->session_.init(
+            impl_->drm_present_, impl_->drm_major_, impl_->drm_minor_, impl_->drm_start_inactive_));
+    }
 
     lx::trace::logger::global().log(lx::trace::level::info, "compositor",
                                     "threads: ui(main)+render+worker; vsync timer armed");
@@ -2201,6 +3470,13 @@ int compositor::run() {
 void compositor::request_stop() {
     if (!impl_) return;
     impl_->loop.quit(0);
+}
+
+void compositor::request_screenshot() {
+    if (!impl_)
+        return;
+    impl_->screenshot_requested_.store(true, std::memory_order_release);
+    impl_->loop.wake();
 }
 
 void compositor::inject_key(const lx::input::key_event& event) {
@@ -2228,6 +3504,15 @@ void compositor::inject_pointer_button(const lx::input::pointer_button_event& ev
         impl_->on_input_pointer_button(event);
 }
 
+void compositor::inject_logind_unlock() {
+    if (impl_)
+        impl_->on_logind_unlock();
+}
+
+lock_state compositor::session_lock_state() const {
+    return impl_ ? impl_->lock_.state() : lock_state::unlocked;
+}
+
 config compositor::configuration() const { return impl_ ? impl_->cfg : config{}; }
 wayland::server& compositor::wayland() { return impl_->wayland; }
 surface_manager& compositor::surfaces() { return impl_->surfaces; }
@@ -2241,6 +3526,7 @@ gfx::dmabuf_import_cache& compositor::import_cache() { return impl_->import_cach
 output_manager& compositor::outputs() { return impl_->outputs; }
 liveness_tracker& compositor::liveness() { return impl_->liveness_; }
 seat_manager& compositor::seats() { return impl_->seats; }
+input_router& compositor::input() { return impl_->input_router_; }
 scheduler::frame_scheduler& compositor::scheduler() { return impl_->scheduler_; }
 scheduler::presentation_tracker& compositor::presentation() { return impl_->presentation_; }
 scheduler::budget_tracker& compositor::budget() { return impl_->budget_; }
@@ -2282,12 +3568,6 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
 
     impl_->hotplug_.poll();
 
-    for (unsigned i = 0; i < impl_->outputs.count(); ++i) {
-        const float scale = impl_->protocols_.fractional_scale(i);
-        if (scale > 0.f)
-            impl_->outputs.set_scale(impl_->outputs.nth(i), scale);
-    }
-
     // An output appeared, went, or changed mode, position or scale: clients are told (each
     // wl_output and xdg_output, then done) and every surface's membership is recomputed.
     // Compared by generation: the hotplug poll refreshes every tick.
@@ -2300,10 +3580,19 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // Nothing has been drawn yet on the first tick, and a mode change invalidates every
     // pixel; anything else is repainted only where it changed.
     if (impl_->outputs.count() > 0) {
-        const lx::rect2i g = impl_->outputs.geometry(impl_->outputs.nth(0));
+        const output_state o0 = impl_->outputs.state(impl_->outputs.nth(0));
+        const lx::rect2i g = o0.logical_rect();
         const lx::rect2i& last = impl_->last_output_rect_;
-        if (g.x != last.x || g.y != last.y || g.width != last.width || g.height != last.height) {
+        if (g.x != last.x || g.y != last.y || g.width != last.width || g.height != last.height ||
+            o0.scale != impl_->last_output_scale_) {
             impl_->last_output_rect_ = g;
+            impl_->last_output_scale_ = o0.scale;
+            // Layout → output pixels, applied where draws and damage are made. Every pixel
+            // moves with it.
+            const scene::output_projection projection{{g.x, g.y}, o0.scale, o0.mode};
+            scene().set_projection(projection);
+            impl_->cursor_.set_projection(projection);
+            impl_->decorations_.set_scale(o0.scale);
             scene().note_full_damage();
             // Layer surfaces are arranged against the output, and the usable area with them.
             impl_->wm_.on_output_changed();
@@ -2329,8 +3618,23 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     if (impl_->last_callback_ns_ == 0)
         impl_->last_callback_ns_ = tick.timestamp_ns;
     const bool stalled =
-        tick.timestamp_ns - impl_->last_callback_ns_ >= detail::compositor_impl::k_callback_stall_ns;
-    if (!impl_->drm_present_ || impl_->present_completed_ || stalled) {
+        tick.timestamp_ns - impl_->last_callback_ns_ >=
+        (impl_->awaiting_resume_flip_ ? detail::compositor_impl::k_resume_flip_grace_ns
+                                      : detail::compositor_impl::k_callback_stall_ns);
+    // Paused: this is the 1 Hz paused tick, and every callback is answered by it — a
+    // client blocked in eglSwapBuffers keeps running, and one that honours `suspended`
+    // stops drawing on its own (niri's 995 ms throttle, for the same reason).
+    const bool paused = impl_->display_gate_.load(std::memory_order_relaxed) != 0;
+    if (paused) {
+        impl_->awaiting_resume_flip_ = false;
+        impl_->last_callback_ns_ = tick.timestamp_ns;
+        fire_frame_callbacks(impl_->p0_, static_cast<unsigned>(tick.timestamp_ns / 1'000'000ull));
+        // Nothing reaches the screen while stopped: queued presentation feedback is
+        // discarded once a second, so a client pacing by it (mpv) falls back to its timer.
+        presentation_discard(impl_->p0_, true);
+        // A lock under way while nothing is shown is locked now.
+        impl_->advance_lock();
+    } else if (!impl_->drm_present_ || impl_->present_completed_ || stalled) {
         if (stalled && !impl_->present_completed_) {
             lx::trace::logger::global().log(lx::trace::level::warn, "compositor",
                                             "no present in 250ms — pacing frame callbacks by tick");
@@ -2342,7 +3646,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         const auto last_present = impl_->presentation_.last_feedback();
         if (last_present.hw_clock && last_present.actual_present_ns > 0)
             frame_time_ms = static_cast<unsigned>(last_present.actual_present_ns / 1'000'000ull);
-        fire_frame_callbacks(impl_->p0_, frame_time_ms);
+        // Surfaces on screen in the last published frame now; the others (covered, off the
+        // output, unmapped) at most once per 995 ms.
+        fire_visible_frame_callbacks(impl_->p0_, frame_time_ms, impl_->last_published_frame_,
+                                     static_cast<unsigned long long>(tick.timestamp_ns));
     }
 
     // Window management for this frame — configures coalesced since the last tick go out
@@ -2375,12 +3682,52 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         impl_->buffer_lifecycle_.on_frame_submitted(tick.frame_index);
         if (!nothing_changed)
             impl_->last_damaged_frame_ = tick.frame_index;
+        impl_->last_published_frame_ = tick.frame_index;
+        // wp_presentation: queued feedback of the surfaces this frame shows is sampled
+        // into it (the visibility pass just ran). Not while stopped: nothing is shown.
+        if (!paused) {
+            presentation_published(impl_->p0_, tick.frame_index);
+            if (!impl_->drm_present_) {
+                // No display to flip (headless, nested): the tick is the only presentation
+                // clock there is, so the frame counts as presented when it is published —
+                // in software, so no flags (wlroots' headless backend does the same).
+                present_info info{};
+                info.timestamp_ns = static_cast<unsigned long long>(tick.timestamp_ns);
+                if (impl_->outputs.count() > 0) {
+                    const unsigned mhz =
+                        impl_->outputs.state(impl_->outputs.nth(0)).refresh_mhz;
+                    if (mhz > 0)
+                        info.refresh_ns =
+                            static_cast<unsigned>((1'000'000'000'000ull + mhz / 2) / mhz);
+                }
+                presentation_flipped(impl_->p0_, tick.frame_index, info);
+                // Likewise a locked frame counts as shown once published.
+                if (impl_->lock_.state() == lock_state::locking &&
+                    static_cast<int>(tick.frame_index - impl_->lock_frame_) >= 0)
+                    impl_->apply_lock_actions(impl_->lock_.locked_frame_shown());
+            }
+        }
     } else {
         // The render thread still holds every other slot. Visible on the timeline as an
         // instant, so a stutter can be told apart from a frame that had nothing new.
         lx::trace::timeline_instant("ui", "publish_dropped");
         lx::trace::logger::global().log(lx::trace::level::trace, "compositor",
                                         "frame dropped (backpressure)");
+    }
+
+    // Idle inhibitors (I3): honoured while their surface was on screen in the newest
+    // published frame, on a running display. Only looked at while one exists, or while
+    // inhibition still has to end — an empty set costs nothing.
+    if (impl_->inhibitors_.count() > 0 || impl_->idle_.inhibited()) {
+        const bool inhibited =
+            !paused && idle_inhibitor_visible(impl_->p0_, impl_->last_published_frame_);
+        if (impl_->idle_.set_inhibited(inhibited,
+                                       static_cast<unsigned long long>(tick.timestamp_ns))) {
+            impl_->rearm_idle_timer();
+            if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.idle",
+                                                inhibited ? "idle inhibited=1" : "idle inhibited=0");
+        }
     }
 
     // An idle tick produces no flip, and frame callbacks otherwise wait for one — a client
@@ -2390,13 +3737,15 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // a commit"). The reads are ordered against render's writes: last_rendered_frame_ is
     // published after frame_outstanding_ is raised, and frame_outstanding_ is lowered only
     // after the commit has set flip_pending.
-    if (impl_->drm_present_ && nothing_changed &&
+    if (impl_->drm_present_ && !paused && nothing_changed &&
         impl_->last_rendered_frame_.load(std::memory_order_acquire) >= impl_->last_damaged_frame_ &&
         !impl_->frame_outstanding_.load(std::memory_order_acquire) &&
         !impl_->kms_atomic.flip_pending()) {
         impl_->last_callback_ns_ = tick.timestamp_ns;
-        fire_frame_callbacks(impl_->p0_,
-                             static_cast<unsigned>(tick.timestamp_ns / 1'000'000ull));
+        fire_visible_frame_callbacks(impl_->p0_,
+                                     static_cast<unsigned>(tick.timestamp_ns / 1'000'000ull),
+                                     impl_->last_published_frame_,
+                                     static_cast<unsigned long long>(tick.timestamp_ns));
     }
 
     // Release client buffers the render thread has finished sampling. Done here because
@@ -2440,6 +3789,14 @@ void compositor::tick_render() {
     lx::trace::scoped_span span{"render", "tick_render"};
 
     const auto t0 = std::chrono::steady_clock::now();
+
+    // The pause gate, in this order (see `resume_gen_`). A resume runs its procedure before
+    // anything else this tick: the KMS state, the cursor plane and every slot's history are
+    // whatever the last master left.
+    const bool paused = impl_->display_gate_.load(std::memory_order_acquire) != 0;
+    const unsigned resume_gen = impl_->resume_gen_.load(std::memory_order_acquire);
+    if (impl_->drm_present_ && !paused && resume_gen != impl_->resume_done_gen_)
+        impl_->run_resume_procedure(resume_gen);
 
     const auto& snapshot = scene().acquire_render_snapshot();
     const unsigned idx = snapshot.frame_index();
@@ -2487,6 +3844,8 @@ void compositor::tick_render() {
             out[i].blend = cmd.blend;
             out[i].buffer_xform = cmd.buffer_xform;
             out[i].src_space = cmd.src_space;
+            out[i].scaled = cmd.scaled;
+            out[i].occluded = cmd.occluded;
         }
         return out;
     };
@@ -2494,6 +3853,16 @@ void compositor::tick_render() {
     {
         lx::trace::scoped_span drain_span{"render", "drain_textures"};
         impl_->drain_texture_updates(idx);
+    }
+
+    if (paused && impl_->drm_present_) {
+        // Client buffers keep being applied and released (a client committing once a second
+        // never runs out), so the scene is current at resume — but nothing is composited
+        // or committed: master is gone. The damage is dropped; resume repaints everything.
+        impl_->last_rendered_frame_.store(static_cast<long long>(idx), std::memory_order_release);
+        impl_->apply_due_forgets(idx);
+        scene().release_render_frame(snapshot);
+        return;
     }
 
     // A CRTC takes one flip at a time, so a frame arriving while one is queued cannot be
@@ -2524,8 +3893,8 @@ void compositor::tick_render() {
         if (impl_->gl_present_) {
             lx::trace::scoped_span composite_span{"render", "composite"};
             auto composited = impl_->gl_compositor_.composite_region(
-                impl_->gl_targets_[scanout_back], lx::color::rgb(0.f, 0.f, 0.f), blits,
-                blit_count, region);
+                impl_->gl_targets_[scanout_back], snapshot.clear_color(), blits, blit_count,
+                region);
             if (!composited) {
                 lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
             } else {
@@ -2536,6 +3905,12 @@ void compositor::tick_render() {
                 impl_->composited_fence_fd_ = composited.value().out_fence_fd;
                 if (composited.value().draws_skipped > 0)
                     impl_->report_unregistered_draw(blits, blit_count);
+                // A requested debug screenshot of a fully repainted frame.
+                if (impl_->screenshot_pending_.load(std::memory_order_relaxed) &&
+                    region.count == 1 && region.rects[0].width == impl_->scanout_rect_.width &&
+                    region.rects[0].height == impl_->scanout_rect_.height &&
+                    impl_->screenshot_pending_.exchange(false, std::memory_order_acq_rel))
+                    impl_->write_screenshot(scanout_back);
             }
         } else if (impl_->cpu_present_) {
             const auto& fb = impl_->dumb_fbs_[scanout_back];
@@ -2548,7 +3923,7 @@ void compositor::tick_render() {
             target.write_combining = true;
 
             auto composited = impl_->cpu_compositor_.composite_region(
-                target, lx::color::rgb(0.f, 0.f, 0.f), blits, blit_count, region);
+                target, snapshot.clear_color(), blits, blit_count, region);
             if (!composited) {
                 lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
             } else {
@@ -2567,8 +3942,7 @@ void compositor::tick_render() {
         } else {
             // Vulkan repaints the whole target, which is correct for any buffer age.
             auto composited = impl_->vk_compositor_.composite(
-                impl_->vk_targets_[scanout_back], lx::color::rgb(0.f, 0.f, 0.f), blits,
-                blit_count);
+                impl_->vk_targets_[scanout_back], snapshot.clear_color(), blits, blit_count);
             if (!composited) {
                 lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
             } else {
@@ -2617,8 +3991,10 @@ void compositor::tick_render() {
 
     // Newest wins: a frame that could not be shown yet is superseded by this one rather
     // than queued behind it, so what reaches the display is always the latest content.
-    if (composited_this_tick)
+    if (composited_this_tick) {
         impl_->composited_slot_ = static_cast<int>(scanout_back);
+        impl_->composited_frame_ = idx;
+    }
 
     const char* commit_kind = "none";
     if (impl_->drm_present_ && impl_->composited_slot_ >= 0 && flip_in_flight)
@@ -2643,6 +4019,8 @@ void compositor::tick_render() {
         drm::atomic_commit_request req{};
         req.connector = 0;
         req.request_page_flip = true;
+        // The flip event names the frame it shows (presentation feedback).
+        req.user_tag = impl_->composited_frame_;
         // Borrowed by the commit; closed below once it has returned. When the GL backend
         // produced no fence it already blocked, so an absent fence is still correct.
         req.in_fence_fd = impl_->composited_fence_fd_;
@@ -2664,9 +4042,13 @@ void compositor::tick_render() {
             impl_->kms_atomic.build_damage_blob(req.damage, req.connector);
         }
 
-        // The pointer rides the frame: both change on the same vblank.
-        if (impl_->content_committed_once_ && impl_->cursor_plane_.valid() &&
-            impl_->cursor_plane_.dirty()) {
+        // The pointer rides the frame: both change on the same vblank. The first commit
+        // (a modeset) states the plane in full: on resume where the pointer is (the plane
+        // passed its test before), at startup off — it joins once tested.
+        if (impl_->cursor_plane_.valid() &&
+            (impl_->content_committed_once_
+                 ? impl_->cursor_plane_.dirty()
+                 : (impl_->cursor_tested_ || !impl_->cursor_plane_.visible()))) {
             req.cursor = &impl_->cursor_plane_;
             cursor_rode = true;
         }
@@ -2675,10 +4057,50 @@ void compositor::tick_render() {
         impl_->last_commit_content_.store(true, std::memory_order_release);
         impl_->publish_commit_timing(impl_->composited_fence_fd_);
         lx::trace::scoped_span commit_span{"render", "kms.commit"};
-        const auto committed = impl_->kms_atomic.commit(req);
+        // Checked again right before the ioctl: a pause that landed during the composite
+        // keeps the frame (resume discards it) and commits nothing.
+        const bool paused_now = impl_->display_gate_.load(std::memory_order_acquire) != 0;
+        const auto committed =
+            paused_now ? lx::result<void>{lx::make_error(
+                             lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
+                             "session paused")}
+                       : impl_->kms_atomic.commit(req);
+        // A commit that raced the pause is expected, not a failure of the present path:
+        // logind drops master *before* it signals, so EACCES usually arrives first and the
+        // pause a moment later. Master lost with no pause following is reported below.
+        const bool lost_to_pause =
+            !committed && (paused_now || impl_->display_gate_.load(std::memory_order_acquire) != 0 ||
+                           impl_->kms_atomic.last_failure_lost_master());
+        if (!committed && lost_to_pause && !paused_now) {
+            const auto now = detail::compositor_impl::now_ns();
+            if (impl_->master_lost_since_ns_ == 0)
+                impl_->master_lost_since_ns_ = now;
+            else if (now - impl_->master_lost_since_ns_ > 1'000'000'000 &&
+                     !impl_->master_lost_reported_) {
+                impl_->master_lost_reported_ = true;
+                lx::trace::logger::global().log_error(committed.get_error(), "compositor.drm");
+                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.drm",
+                                                "DRM master lost and the session did not pause "
+                                                "(no logind?) — retrying every frame");
+            }
+        } else if (committed) {
+            impl_->master_lost_since_ns_ = 0;
+            impl_->master_lost_reported_ = false;
+        }
         if (!committed)
             impl_->retract_commit_timing();
-        if (!committed && cursor_rode) {
+        if (committed && impl_->kms_atomic.completion_needs_dispatch())
+            impl_->post_flip_dispatch();
+        if (impl_->resume_result_pending_ && !paused_now) {
+            impl_->resume_result_pending_ = false;
+            impl_->post_resume_result(
+                impl_->resume_done_gen_,
+                committed ? session_resume_outcome::ok
+                : !lost_to_pause && impl_->kms_atomic.last_failure_rejected_state()
+                    ? session_resume_outcome::rejected
+                    : session_resume_outcome::device_unavailable);
+        }
+        if (!committed && cursor_rode && !lost_to_pause) {
             // Do not let the plane take frames down with it: if the cursor state alone is
             // rejected, the plane is unusable and the frame retries without it.
             drm::atomic_commit_request test{};
@@ -2697,6 +4119,7 @@ void compositor::tick_render() {
         }
         if (committed) {
             impl_->content_committed_once_ = true;
+            impl_->ever_lit_.store(true, std::memory_order_release);
             impl_->composited_slot_ = -1;
             // The kernel has taken its own reference to the fence.
             impl_->discard_composited_fence();
@@ -2705,14 +4128,16 @@ void compositor::tick_render() {
             impl_->note_committed_input(true);
         } else {
             // Keep the slot and its fence: the commit is retried next tick without
-            // compositing the frame again.
-            commit_kind = "failed";
+            // compositing the frame again (or, paused, discarded by the resume).
+            commit_kind = lost_to_pause ? "paused" : "failed";
         }
         // Lowered after the commit raised flip_pending (see the idle-callback check).
         impl_->frame_outstanding_.store(!committed, std::memory_order_release);
         // Log on transition only: a failing commit every frame must not flood the hot
         // path, but silently discarding it is how a dead present path stayed invisible.
-        if (!committed && !impl_->drm_commit_failing_) {
+        if (!committed && lost_to_pause) {
+            // Expected; nothing to report.
+        } else if (!committed && !impl_->drm_commit_failing_) {
             impl_->drm_commit_failing_ = true;
             lx::trace::logger::global().log_error(committed.get_error(), "compositor.drm");
         } else if (committed && impl_->drm_commit_failing_) {
@@ -2723,7 +4148,8 @@ void compositor::tick_render() {
     } else if (impl_->drm_present_ && !composited_this_tick && impl_->composited_slot_ < 0 &&
                impl_->content_committed_once_ && impl_->cursor_plane_.valid() &&
                impl_->cursor_plane_.dirty() && impl_->cursor_plane_.involves_crtc() &&
-               !impl_->kms_atomic.flip_pending()) {
+               !impl_->kms_atomic.flip_pending() &&
+               impl_->display_gate_.load(std::memory_order_acquire) == 0) {
         // Nothing to composite, but the pointer moved: a commit of the cursor plane alone.
         // The scene is not touched — this is what keeps pointer motion off the GPU.
         drm::atomic_commit_request req{};
@@ -2740,6 +4166,9 @@ void compositor::tick_render() {
         if (auto committed = impl_->kms_atomic.commit(req); committed) {
             commit_kind = "cursor";
             impl_->note_committed_input(false);
+        } else if (impl_->display_gate_.load(std::memory_order_acquire) != 0) {
+            impl_->retract_commit_timing();
+            commit_kind = "paused";
         } else {
             impl_->retract_commit_timing();
             commit_kind = "cursor-failed";

@@ -638,6 +638,9 @@ void wm_send_configure(void* toplevel_res, void* xdg_surface_res,
         storage[n++] = XDG_TOPLEVEL_STATE_RESIZING;
     if (c.states & lx::compositor::tl_activated)
         storage[n++] = XDG_TOPLEVEL_STATE_ACTIVATED;
+    if ((c.states & lx::compositor::tl_suspended) &&
+        version >= XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION)
+        storage[n++] = XDG_TOPLEVEL_STATE_SUSPENDED;
     array.size = n * sizeof(uint32_t);
     xdg_toplevel_send_configure(tl, c.size.width, c.size.height, &array);
     if (decoration_res)

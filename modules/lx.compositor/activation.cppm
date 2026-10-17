@@ -54,6 +54,8 @@ enum class activation_reason : unsigned char {
     /// new window), so the window is treated as one that presented none: the new-window
     /// policy applies.
     new_window,
+    /// The session is locked (ext-session-lock-v1): no window takes the keyboard behind it.
+    session_locked,
 };
 
 [[nodiscard]] const char* activation_result_name(activation_result r);
@@ -200,6 +202,7 @@ const char* lx::compositor::activation_reason_name(activation_reason r) {
     case activation_reason::not_toplevel: return "not_toplevel";
     case activation_reason::nothing_focused: return "nothing_focused";
     case activation_reason::new_window: return "new_window";
+    case activation_reason::session_locked: return "session_locked";
     }
     return "-";
 }

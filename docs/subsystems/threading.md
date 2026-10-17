@@ -164,6 +164,82 @@ plane back through `atomic<bool> cursor_hw_failed_`, which `tick_ui` turns into
 `cursor_manager::on_hardware_failed()`; `atomic<bool> last_commit_content_` tells the UI-side
 flip handler whether the flip it is handling presented a frame or only moved the pointer.
 The software cursor is a scene node and crosses threads in the snapshot like any other.
+The output scale never crosses: the UI thread projects the pointer into output pixels
+(`cursor_manager::set_projection`) before publishing a frame, and resamples client cursor
+images to their output-pixel size when they change, so render only ever sees pixels.
+
+**Debug screenshot (UI → render).** `compositor::request_screenshot` (SIGUSR1) stores
+`screenshot_requested_` (async-signal-safe) and wakes the loop; the UI thread turns it into
+full damage, a frame request and `screenshot_pending_`; render reads back the slot it
+composited with a full-frame region and writes the PPM. Two `std::atomic<bool>`, exchanged,
+never read on the hot path otherwise (one relaxed load per GL composite).
+
+## Session pause and resume (UI ↔ render)
+
+logind, libinput and the pause/resume state machine (`lx.compositor:session_state`) are UI
+affinity; every KMS commit — including the resume modeset — is render affinity.
+
+| Step | Thread | Shared state crossing threads |
+|---|---|---|
+| logind signals, `SwitchTo`, `ReleaseDevice`, `PauseDeviceComplete` | UI (sd-bus, `logind_bus_source`; callbacks only record, actions run after `sd_bus_process`) | — |
+| State machine, libinput suspend/resume, the key and button sweep, keyboard leave/enter, `suspended` configures, the frame clock | UI | — |
+| Display gate | UI sets and clears bits of `display_gate_` (release): `gate_vt` (session paused) and `gate_power` (output powered off); render reads it (acquire) at tick start and again right before each commit ioctl, and every reader means "any bit" | `std::atomic<unsigned>` |
+| `pause` acknowledgement | UI posts a quiesce task to the render strand; render posts `render_quiesced(gen)` back to the UI strand | executor strands, one producer each |
+| Resume | UI stores `resume_gen_` (release), *then* clears its gate bit (release); render loads `display_gate_`, then `resume_gen_` (acquire) — seeing "unpaused" implies seeing the new generation | `std::atomic<unsigned>` |
+| Resume procedure (`prepare_resume`, cursor plane invalidation, full damage, the modeset) | render | — |
+| Resume result | render posts `(gen, outcome)` to the UI strand; `gen` comes from one UI counter for every resume (VT or power-on), and the UI routes the result to whichever machine asked for that generation | strand |
+| Power off | UI posts the power-off task with its generation to the render strand (after the tick, so nothing else commits meanwhile); render compares it with `power_gen_` (acquire; stale → nothing), checks `gate_vt` and `flip_pending()`, makes the blocking ACTIVE=0 commit, and posts the outcome back; "retry after flip" is re-posted by the UI flip handler | `power_gen_` (atomic), strands |
+| Flip events (generation cookie check, `flip_pending_` clear, the handler) | UI only | `flip_pending_` (atomic) |
+
+**The flip handler never runs on the committing thread.** A failed commit is reported by
+`commit()`'s return value alone; a blocking modeset (a driver that refuses a nonblocking one)
+completes without a kernel event, so render posts `dispatch_events()` to the UI strand, which
+reports it as the flip.
+
+**Presentation feedback across the flip (render → UI).** Render tags each content commit
+with the frame index of the snapshot it composited (`atomic_commit_request::user_tag`,
+render-affine `composited_frame_`). `kms_atomic_commit` stores the tag and "carries a frame"
+in two atomics *before* the ioctl that raises `flip_pending_` (the event can be drained on
+the UI thread before the ioctl returns; a CRTC takes one flip at a time, so the in-flight
+commit is unambiguous) and the UI-side flip handler reads them with the kernel's sequence
+and timestamp. Whether the driver timestamps vblanks is probed once by render after the first
+modeset (`drmCrtcGetSequence`) and published through an atomic. Everything else of
+wp_presentation — the visibility pass, the feedback table, sampling at publish, the events —
+is UI affinity; the pause edge discards what is in flight on the UI thread, and a flip
+drained after it is ignored by the paused branch of the handler.
+
+**The paused tick.** While paused the frame clock is stopped and `request_frame()` is a
+no-op; the housekeeping timer runs at 1 s and calls `on_vsync()` itself: one `tick_ui`
+(dispatch, configures, scene publish, buffer retirement, frame callbacks answered
+unconditionally) and one `tick_render` that only drains texture updates and publishes the
+frame index — no composite, no commit. Hot-path cost of the gate: one acquire load per tick
+and one per commit; no lock, allocation or log. The paused tick also discards queued
+presentation feedback, so clients pacing by it are not left waiting on a display that is off.
+
+**Display power** reuses all of it. The off edge sets `gate_power` on the UI thread (the
+frame clock stops, the paused tick runs, presentation feedback is discarded, windows are
+`suspended`), then the render thread's power-off task turns the CRTC off with one blocking
+`ALLOW_MODESET` commit — render stays the only committer. Input is not suspended: libinput
+events keep arriving on the UI thread, and the first real one wakes the output (a new resume
+generation, then the gate bit cleared). The idle tracker, the inhibitor evaluation after each
+publish and the idle timer are UI affinity; per input event they cost one clock read and a
+store.
+
+**Session lock** is UI affinity throughout: the state machine, the input gate, hiding the
+normal layers (scene mutation, published with the next snapshot), the lock timer (the 1 s
+wait for lock surfaces, the 2 s sleep delay) and logind calls. The render thread sees only a
+snapshot whose clear colour is the lock's and whose draws are the lock surfaces. `locked`
+waits for the render thread's work to reach the screen through the existing flip path: the
+UI flip handler compares the flip's frame tag with the first locked frame. One atomic is new,
+`ever_lit_` (render stores it with release after its first successful content commit; UI
+loads it with acquire): before it, nothing of the session was ever on the CRTC, so a lock
+completes at once.
+
+**Text input and input methods** are UI affinity throughout: the relay (`:text_input`), the
+router's grab routing and virtual-keyboard keymap switching run inside the protocol dispatch
+and the libinput key path, and the input-method popups are ordinary scene trees mutated on
+the UI thread and published with the next snapshot. Nothing new crosses to the render thread;
+per key the cost is one branch while no input method is active.
 
 ## Modules
 
@@ -195,7 +271,9 @@ a period, for an fd whose readiness cannot be trusted; nothing uses one.
 
 **The frame clock runs on demand.** Two consecutive ticks with nothing to do stop it.
 Nothing to do means no damage, nothing the render thread has not reached, no flip or commit
-outstanding, no frame callback or buffer waiting on a frame, and nothing the window manager
+outstanding, no frame callback or buffer waiting on a frame (one held back by the 995 ms
+throttle of a surface that is not on screen does not count: the housekeeping timer answers
+those), and nothing the window manager
 deferred. A client request, an input event or a flip restarts it at the display's next
 deadline (`repaint_scheduler::next_start`). While it is stopped a 1 s housekeeping timer
 ticks for the deadlines only a tick notices: liveness pings, the configure watchdog,
@@ -219,7 +297,7 @@ fallback for headless/CI. `hotplug_monitor` refreshes outputs each UI tick. A re
 ### CLI
 
 ```bash
-lumen-compositor [socket-name] [-f fps]
+lumen-compositor [socket-name] [-f fps] [--scale S]
 ```
 
 ## Process-level vs thread-level

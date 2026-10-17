@@ -6,6 +6,7 @@ sequenceDiagram
     Shell->>Comp: bind zlm_shell_v1
     Note over Comp: privilege check: same UID and /proc/pid/exe<br/>== configured shell binary, else wl_display error
     Comp->>Shell: capabilities(flags, version)
+    Comp->>Shell: lock_state(state) (v5: on bind and on every change)
     Shell->>Comp: get_policy_bridge()
     Comp->>Shell: snapshot_begin
     Note over Comp: no snapshot_workspace / snapshot_output yet<br/>(no workspace objects; wl_output not per-client)
@@ -13,6 +14,8 @@ sequenceDiagram
     Comp->>Shell: snapshot_done
     Comp->>Shell: focus_changed (the focused handle, or null)
     Note over Shell: task model complete: the panel draws<br/>(never while a snapshot is in progress)
+    Shell->>Comp: grab_key(keysym, modifiers, flags) (v4, ×N: Super_L/Super_R taps)
+    Comp-->>Shell: zlm_key_grab_v1.refused(reason) (reserved / taken / invalid only)
 
     Comp->>Shell: toplevel_created (new zlm_toplevel_v1, workspace=null)
     Comp->>Shell: toplevel_state + toplevel_geometry
@@ -24,3 +27,13 @@ sequenceDiagram
     Comp->>Shell: focus_changed
     Shell->>Bridge: set_toplevel_stacking_index
     Comp->>Shell: stacking_order_changed (done=1)
+    Comp->>Shell: zlm_key_grab_v1.activated(serial, time) (a grabbed key, or a tap on release)
+    Note over Shell: serial = a key press delivered to the shell<br/>(usable for xdg_activation_token_v1.set_serial)
+
+    Note over Shell,Comp: Session lock (v5)
+    Comp->>Shell: lock_requested(logind | sleep)
+    Note over Shell: starts --lock-command (an ordinary client)
+    Comp->>Shell: lock_state(locking) → lock_state(locked)
+    Note over Shell: launcher closed; nothing of the shell shown or reachable,<br/>no key grab delivered until lock_state(unlocked)
+    Comp->>Shell: lock_state(abandoned) (the locker died)
+    Note over Shell: starts the locker again (≤ once per 5 s, three times)

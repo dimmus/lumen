@@ -65,6 +65,42 @@ public:
     /// The shell asked for the session to end: losing the connection is then expected.
     [[nodiscard]] bool logout_requested() const { return logout_requested_; }
 
+    // ── Key grabs (zlm_shell_v1 v4) ──
+    /// zlm_key_grab_v1.modifier / .flag bits.
+    static constexpr unsigned k_mod_shift = 0x1, k_mod_ctrl = 0x2, k_mod_alt = 0x4,
+                              k_mod_super = 0x8;
+    static constexpr unsigned k_grab_tap = 0x1;
+    static constexpr unsigned k_max_key_grabs = 8;
+    /// The combination was pressed (or the modifier tapped). `serial` is an input serial
+    /// delivered to the shell — what xdg_activation_token_v1.set_serial wants.
+    using key_grab_fn = void (*)(unsigned serial, unsigned time_ms, void* user);
+    /// The compositor takes key grabs (bound at version 4 or later).
+    [[nodiscard]] bool can_grab_keys() const;
+    /// zlm_shell_v1.grab_key: the slot of the new grab. Below version 4, not_implemented
+    /// (logged once at info: the keybindings are then simply absent).
+    [[nodiscard]] lx::result<unsigned> grab_key(unsigned keysym, unsigned modifiers,
+                                                unsigned flags, key_grab_fn fn, void* user);
+    /// Gives the combination back to clients.
+    void ungrab_key(unsigned slot);
+    /// zlm_key_grab_v1.refusal for the grab in `slot` (0: held, or not answered yet).
+    [[nodiscard]] unsigned key_grab_refusal(unsigned slot) const;
+    /// Times the grab in `slot` was activated.
+    [[nodiscard]] unsigned key_grab_activations(unsigned slot) const;
+
+    // ── Session lock (zlm_shell_v1 v5) ──
+    /// zlm_shell_v1.lock_state (0 unlocked, 1 locking, 2 locked, 3 abandoned) and
+    /// lock_requested (0 logind, 1 sleep).
+    using lock_state_fn = void (*)(unsigned state, void* user);
+    using lock_requested_fn = void (*)(unsigned reason, void* user);
+    void set_lock_handlers(lock_state_fn state, lock_requested_fn requested, void* user) {
+        lock_state_fn_ = state;
+        lock_requested_fn_ = requested;
+        lock_user_ = user;
+    }
+    /// The compositor reports the session lock (bound at version 5 or later).
+    [[nodiscard]] bool has_lock_state() const;
+    [[nodiscard]] unsigned lock_state() const { return lock_state_; }
+
     /// Wire events, one per protocol event (defined with the listeners).
     struct events;
 
@@ -72,13 +108,30 @@ private:
     friend struct events;
     [[nodiscard]] void* proxy_of(task_handle h) const;
 
+    struct key_grab {
+        void* proxy = nullptr; // zlm_key_grab_v1*
+        policy_bridge* owner = nullptr;
+        key_grab_fn fn = nullptr;
+        void* user = nullptr;
+        unsigned keysym = 0;
+        unsigned refusal = 0;
+        unsigned activations = 0;
+    };
+    void destroy_key_grabs();
+
     task_model model_{};
+    key_grab grabs_[k_max_key_grabs]{};
+    bool told_no_grabs_ = false;
     void* shell_ = nullptr;  // zlm_shell_v1*, not owned
     void* bridge_ = nullptr; // zlm_policy_bridge_v1*
     unsigned caps_ = 0;
     unsigned caps_version_ = 0;
     bool has_caps_ = false;
     bool logout_requested_ = false;
+    unsigned lock_state_ = 0;
+    lock_state_fn lock_state_fn_ = nullptr;
+    lock_requested_fn lock_requested_fn_ = nullptr;
+    void* lock_user_ = nullptr;
 };
 
 } // namespace lx::shell
@@ -114,6 +167,15 @@ void destroy_handle(void* proxy, void*) {
     zlm_toplevel_v1_destroy(static_cast<zlm_toplevel_v1*>(proxy));
 }
 
+const char* refusal_name(unsigned r) {
+    switch (r) {
+    case ZLM_KEY_GRAB_V1_REFUSAL_RESERVED: return "reserved by the compositor";
+    case ZLM_KEY_GRAB_V1_REFUSAL_TAKEN: return "already taken";
+    case ZLM_KEY_GRAB_V1_REFUSAL_INVALID: return "invalid";
+    default: return "unknown";
+    }
+}
+
 } // namespace
 
 struct lx::shell::policy_bridge::events {
@@ -137,6 +199,51 @@ struct lx::shell::policy_bridge::events {
         // Whoever started the logout, the disconnect that follows is the session ending.
         self(data).logout_requested_ = true;
         bridge_log(lx::trace::level::info, "session ending");
+    }
+    static void lock_state(void* data, zlm_shell_v1*, uint32_t state) {
+        auto& b = self(data);
+        const bool changed = b.lock_state_ != state;
+        b.lock_state_ = state;
+        if (changed || bridge_debug()) {
+            static constexpr const char* k_names[] = {"unlocked", "locking", "locked",
+                                                      "abandoned"};
+            char line[64];
+            std::snprintf(line, sizeof(line), "session lock %s", state < 4 ? k_names[state] : "?");
+            bridge_log(lx::trace::level::info, line);
+        }
+        if (b.lock_state_fn_)
+            b.lock_state_fn_(state, b.lock_user_);
+    }
+    static void lock_requested(void* data, zlm_shell_v1*, uint32_t reason) {
+        auto& b = self(data);
+        bridge_log(lx::trace::level::info, reason == ZLM_SHELL_V1_LOCK_REASON_SLEEP
+                                               ? "lock requested (the system is going to sleep)"
+                                               : "lock requested (logind)");
+        if (b.lock_requested_fn_)
+            b.lock_requested_fn_(reason, b.lock_user_);
+    }
+
+    // ── zlm_key_grab_v1 (v4); `data` is the grab's slot ──
+    static void key_grab_activated(void* data, zlm_key_grab_v1*, uint32_t serial,
+                                   uint32_t time) {
+        auto* g = static_cast<key_grab*>(data);
+        ++g->activations;
+        if (bridge_debug()) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "key grab activated keysym=0x%x serial=%u",
+                          g->keysym, serial);
+            bridge_log(lx::trace::level::debug, line);
+        }
+        if (g->fn)
+            g->fn(serial, time, g->user);
+    }
+    static void key_grab_refused(void* data, zlm_key_grab_v1*, uint32_t reason) {
+        auto* g = static_cast<key_grab*>(data);
+        g->refusal = reason;
+        char line[128];
+        std::snprintf(line, sizeof(line), "key grab keysym=0x%x refused: %s", g->keysym,
+                      refusal_name(reason));
+        bridge_log(lx::trace::level::warn, line);
     }
 
     // ── zlm_policy_bridge_v1: snapshot ──
@@ -265,9 +372,16 @@ struct lx::shell::policy_bridge::events {
 
 namespace {
 
+const zlm_key_grab_v1_listener k_key_grab_listener = {
+    .activated = lx::shell::policy_bridge::events::key_grab_activated,
+    .refused = lx::shell::policy_bridge::events::key_grab_refused,
+};
+
 const zlm_shell_v1_listener k_shell_listener = {
     .capabilities = lx::shell::policy_bridge::events::capabilities,
     .session_ending = lx::shell::policy_bridge::events::session_ending,
+    .lock_state = lx::shell::policy_bridge::events::lock_state,
+    .lock_requested = lx::shell::policy_bridge::events::lock_requested,
 };
 
 const zlm_policy_bridge_v1_listener k_bridge_listener = {
@@ -318,6 +432,7 @@ lx::result<void> lx::shell::policy_bridge::attach(void* zlm_shell) {
 }
 
 void lx::shell::policy_bridge::detach() {
+    destroy_key_grabs();
     if (!bridge_)
         return;
     task_handle all[k_max_tasks];
@@ -361,6 +476,71 @@ void lx::shell::policy_bridge::request_logout() {
     zlm_shell_v1_request_logout(static_cast<zlm_shell_v1*>(shell_));
 }
 
+bool lx::shell::policy_bridge::has_lock_state() const {
+    return shell_ && wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) >=
+                         ZLM_SHELL_V1_LOCK_STATE_SINCE_VERSION;
+}
+
+bool lx::shell::policy_bridge::can_grab_keys() const {
+    return shell_ && wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) >=
+                         ZLM_SHELL_V1_GRAB_KEY_SINCE_VERSION;
+}
+
+lx::result<unsigned> lx::shell::policy_bridge::grab_key(unsigned keysym, unsigned modifiers,
+                                                        unsigned flags, key_grab_fn fn,
+                                                        void* user) {
+    if (!can_grab_keys()) {
+        if (!told_no_grabs_) {
+            told_no_grabs_ = true;
+            char line[96];
+            std::snprintf(line, sizeof(line), "compositor has no key grabs (v%u): no shell keybindings",
+                          shell_ ? wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) : 0u);
+            bridge_log(lx::trace::level::info, line);
+        }
+        return lx::not_implemented("lx::shell::policy_bridge::grab_key");
+    }
+    for (unsigned i = 0; i < k_max_key_grabs; ++i) {
+        key_grab& g = grabs_[i];
+        if (g.proxy)
+            continue;
+        zlm_key_grab_v1* proxy =
+            zlm_shell_v1_grab_key(static_cast<zlm_shell_v1*>(shell_), keysym, modifiers, flags);
+        if (!proxy)
+            return lx::make_error(lx::error_domain::wayland,
+                                  static_cast<int>(lx::wayland_err::bind_failed),
+                                  "zlm_shell_v1.grab_key failed");
+        g = {};
+        g.proxy = proxy;
+        g.owner = this;
+        g.fn = fn;
+        g.user = user;
+        g.keysym = keysym;
+        zlm_key_grab_v1_add_listener(proxy, &k_key_grab_listener, &g);
+        return i;
+    }
+    return lx::make_error(lx::error_domain::invalid_argument, 0, "key grab table full");
+}
+
+void lx::shell::policy_bridge::ungrab_key(unsigned slot) {
+    if (slot >= k_max_key_grabs || !grabs_[slot].proxy)
+        return;
+    zlm_key_grab_v1_destroy(static_cast<zlm_key_grab_v1*>(grabs_[slot].proxy));
+    grabs_[slot] = {};
+}
+
+unsigned lx::shell::policy_bridge::key_grab_refusal(unsigned slot) const {
+    return slot < k_max_key_grabs ? grabs_[slot].refusal : 0u;
+}
+
+unsigned lx::shell::policy_bridge::key_grab_activations(unsigned slot) const {
+    return slot < k_max_key_grabs ? grabs_[slot].activations : 0u;
+}
+
+void lx::shell::policy_bridge::destroy_key_grabs() {
+    for (unsigned i = 0; i < k_max_key_grabs; ++i)
+        ungrab_key(i);
+}
+
 lx::shell::policy_bridge::~policy_bridge() { detach(); }
 
 #else // !LUMEN_SHELL_WAYLAND
@@ -384,6 +564,16 @@ void lx::shell::policy_bridge::request_unmaximize(task_handle) {}
 void lx::shell::policy_bridge::request_minimize(task_handle) {}
 bool lx::shell::policy_bridge::can_logout() const { return false; }
 void lx::shell::policy_bridge::request_logout() {}
+bool lx::shell::policy_bridge::can_grab_keys() const { return false; }
+bool lx::shell::policy_bridge::has_lock_state() const { return false; }
+lx::result<unsigned> lx::shell::policy_bridge::grab_key(unsigned, unsigned, unsigned, key_grab_fn,
+                                                        void*) {
+    return lx::not_implemented("lx::shell::policy_bridge::grab_key");
+}
+void lx::shell::policy_bridge::ungrab_key(unsigned) {}
+unsigned lx::shell::policy_bridge::key_grab_refusal(unsigned) const { return 0; }
+unsigned lx::shell::policy_bridge::key_grab_activations(unsigned) const { return 0; }
+void lx::shell::policy_bridge::destroy_key_grabs() {}
 lx::shell::policy_bridge::~policy_bridge() = default;
 
 #endif

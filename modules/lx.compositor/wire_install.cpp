@@ -36,6 +36,46 @@ module;
 #include "xdg-activation-v1-server-protocol.h"
 #define LUMEN_HAS_XDG_ACTIVATION 1
 #endif
+#if __has_include("viewporter-server-protocol.h")
+#include "viewporter-server-protocol.h"
+#define LUMEN_HAS_VIEWPORTER 1
+#endif
+#if __has_include("fractional-scale-v1-server-protocol.h")
+#include "fractional-scale-v1-server-protocol.h"
+#define LUMEN_HAS_FRACTIONAL_SCALE 1
+#endif
+#if __has_include("presentation-time-server-protocol.h")
+#include "presentation-time-server-protocol.h"
+#define LUMEN_HAS_PRESENTATION 1
+#endif
+#if __has_include("ext-idle-notify-v1-server-protocol.h")
+#include "ext-idle-notify-v1-server-protocol.h"
+#define LUMEN_HAS_IDLE_NOTIFY 1
+#endif
+#if __has_include("idle-inhibit-unstable-v1-server-protocol.h")
+#include "idle-inhibit-unstable-v1-server-protocol.h"
+#define LUMEN_HAS_IDLE_INHIBIT 1
+#endif
+#if __has_include("wlr-output-power-management-unstable-v1-server-protocol.h")
+#include "wlr-output-power-management-unstable-v1-server-protocol.h"
+#define LUMEN_HAS_OUTPUT_POWER 1
+#endif
+#if __has_include("ext-session-lock-v1-server-protocol.h")
+#include "ext-session-lock-v1-server-protocol.h"
+#define LUMEN_HAS_SESSION_LOCK 1
+#endif
+#if __has_include("text-input-unstable-v3-server-protocol.h")
+#include "text-input-unstable-v3-server-protocol.h"
+#define LUMEN_HAS_TEXT_INPUT 1
+#endif
+#if __has_include("input-method-unstable-v2-server-protocol.h")
+#include "input-method-unstable-v2-server-protocol.h"
+#define LUMEN_HAS_INPUT_METHOD 1
+#endif
+#if __has_include("virtual-keyboard-unstable-v1-server-protocol.h")
+#include "virtual-keyboard-unstable-v1-server-protocol.h"
+#define LUMEN_HAS_VIRTUAL_KEYBOARD 1
+#endif
 #endif
 
 module lx.compositor;
@@ -126,6 +166,9 @@ void install_core(p0_protocol_context& ctx) {
         ops.next_serial = &wm_next_serial;
         ops.send_close = &wm_send_close;
         ctx.notify_session_ending = &shell_send_session_ending;
+        ctx.fire_key_grab = &shell_fire_key_grab;
+        ctx.notify_lock_state = &shell_send_lock_state;
+        ctx.notify_lock_requested = &shell_send_lock_requested;
         ops.last_user_serial = &wm_last_user_serial;
         ops.user = &ctx;
         ctx.wm->set_protocol_ops(ops);
@@ -154,7 +197,7 @@ void install_core(p0_protocol_context& ctx) {
                             .interface_desc = &xdg_wm_base_interface},
                            &bind_xdg_wm_base);
     ctx.server->add_global({.interface_name = "zlm_shell_v1",
-                            .version = 3,
+                            .version = 5,
                             .privileged = true,
                             .interface_desc = &zlm_shell_v1_interface},
                            bind_shell);
@@ -210,6 +253,101 @@ void install_core(p0_protocol_context& ctx) {
                                 .interface_desc = &xdg_activation_v1_interface},
                                &bind_activation);
 #endif
+#if defined(LUMEN_HAS_VIEWPORTER)
+    // wp_viewporter: per-surface source crop and destination size, applied in the draw
+    // (float source box, buffer transform) with every error of the protocol.
+    ctx.server->add_global({.interface_name = "wp_viewporter",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &wp_viewporter_interface},
+                           &bind_viewporter);
+#endif
+#if defined(LUMEN_HAS_FRACTIONAL_SCALE)
+    // wp_fractional_scale_v1: the preferred scale in 120ths from the outputs a surface is
+    // on; a client renders round(w·scale) pixels and sets a viewport destination of w.
+    ctx.server->add_global({.interface_name = "wp_fractional_scale_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &wp_fractional_scale_manager_v1_interface},
+                           &bind_fractional_scale);
+#endif
+#if defined(LUMEN_HAS_PRESENTATION)
+    // wp_presentation v2: CLOCK_MONOTONIC; feedback presented with the KMS flip's timestamp
+    // and vblank sequence, or discarded when superseded, unmapped or never shown.
+    if (ctx.presentation)
+        ctx.server->add_global({.interface_name = "wp_presentation",
+                                .version = 2,
+                                .privileged = false,
+                                .interface_desc = &wp_presentation_interface},
+                               &bind_presentation);
+#endif
+#if defined(LUMEN_HAS_IDLE_NOTIFY)
+    // ext_idle_notifier_v1 v2: idle and resumed per notification, from real input only;
+    // `get_idle_notification` obeys visible idle inhibitors, `get_input_idle_notification`
+    // does not. lumen-shell's blanking policy and swayidle are its clients.
+    if (ctx.idle)
+        ctx.server->add_global({.interface_name = "ext_idle_notifier_v1",
+                                .version = 2,
+                                .privileged = false,
+                                .interface_desc = &ext_idle_notifier_v1_interface},
+                               &bind_idle_notifier);
+#endif
+#if defined(LUMEN_HAS_IDLE_INHIBIT)
+    // zwp_idle_inhibit_manager_v1: honoured while the inhibiting surface is on screen.
+    if (ctx.inhibitors)
+        ctx.server->add_global({.interface_name = "zwp_idle_inhibit_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zwp_idle_inhibit_manager_v1_interface},
+                               &bind_idle_inhibit_manager);
+#endif
+#if defined(LUMEN_HAS_OUTPUT_POWER)
+    // zwlr_output_power_manager_v1: display power (atomic ACTIVE=0, woken by input). Always
+    // advertised; without a display to power every object is `failed`.
+    ctx.server->add_global({.interface_name = "zwlr_output_power_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &zwlr_output_power_manager_v1_interface},
+                           &bind_output_power_manager);
+#endif
+#if defined(LUMEN_HAS_SESSION_LOCK)
+    // ext_session_lock_manager_v1: lock surfaces per output; `locked` only once a locked frame
+    // is on every output; a locker that dies leaves the session locked (abandoned).
+    if (ctx.lock)
+        ctx.server->add_global({.interface_name = "ext_session_lock_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &ext_session_lock_manager_v1_interface},
+                               &bind_session_lock_manager);
+#endif
+    // text-input-v3 v2 + input-method-v2 + virtual-keyboard-v1: the focused client's text
+    // inputs relayed to the seat's one input method (fcitx5, ibus), its candidate popups at
+    // the cursor, its keyboard grab and its forwarded keys.
+    install_text_input(ctx);
+#if defined(LUMEN_HAS_TEXT_INPUT)
+    if (ctx.text_input)
+        ctx.server->add_global({.interface_name = "zwp_text_input_manager_v3",
+                                .version = 2,
+                                .privileged = false,
+                                .interface_desc = &zwp_text_input_manager_v3_interface},
+                               &bind_text_input_manager);
+#endif
+#if defined(LUMEN_HAS_INPUT_METHOD)
+    if (ctx.text_input)
+        ctx.server->add_global({.interface_name = "zwp_input_method_manager_v2",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zwp_input_method_manager_v2_interface},
+                               &bind_input_method_manager);
+#endif
+#if defined(LUMEN_HAS_VIRTUAL_KEYBOARD)
+    if (ctx.text_input)
+        ctx.server->add_global({.interface_name = "zwp_virtual_keyboard_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zwp_virtual_keyboard_manager_v1_interface},
+                               &bind_virtual_keyboard_manager);
+#endif
 }
 
 } // namespace lx::compositor::p0
@@ -237,10 +375,33 @@ lx::result<void> lx::compositor::install_p0_protocols(p0_protocol_context& ctx) 
 void lx::compositor::fire_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms) {
 #if defined(LUMEN_HAS_WAYLAND)
     (void)ctx;
-    p0::fire_frames(frame_time_ms);
+    p0::fire_frames(frame_time_ms, false, 0, 0);
 #else
     (void)ctx;
     (void)frame_time_ms;
+#endif
+}
+
+void lx::compositor::fire_visible_frame_callbacks(p0_protocol_context& ctx,
+                                                  unsigned frame_time_ms, unsigned visible_frame,
+                                                  unsigned long long now_ns) {
+#if defined(LUMEN_HAS_WAYLAND)
+    (void)ctx;
+    p0::fire_frames(frame_time_ms, true, visible_frame, now_ns);
+#else
+    (void)ctx;
+    (void)frame_time_ms;
+    (void)visible_frame;
+    (void)now_ns;
+#endif
+}
+
+bool lx::compositor::frame_callbacks_throttled(const p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    return p0::frames_throttled();
+#else
+    return false;
 #endif
 }
 

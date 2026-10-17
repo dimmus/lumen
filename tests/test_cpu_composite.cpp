@@ -1,6 +1,7 @@
 #include "lumen_test.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 
 import lx.foundation;
@@ -32,6 +33,9 @@ struct image {
     }
 
     [[nodiscard]] std::uint32_t at(unsigned x, unsigned y) const {
+        return pixels[static_cast<std::size_t>(y) * width + x];
+    }
+    [[nodiscard]] std::uint32_t& at(unsigned x, unsigned y) {
         return pixels[static_cast<std::size_t>(y) * width + x];
     }
 };
@@ -361,26 +365,85 @@ LUMEN_TEST(cpu_composite_tint_alpha_folds_into_opacity) {
     LUMEN_CHECK(g > 180 && g < 196);
 }
 
-// A rotated buffer must be reported, not drawn upright. Rendering the wrong frame is worse
-// than rendering none, because nothing upstream can tell it happened.
-LUMEN_TEST(cpu_composite_reports_unsupported_buffer_transform) {
-    image src{4, 4, k_xrgb, 0xFFFFFFFFu};
-    image dst{4, 4, k_xrgb, 0xFF000000u};
-
+// A viewport crop with fractional edges, magnified 20x and bilinear: nothing from outside
+// the source box bleeds in, and the result matches the box's own (uniform) colour.
+LUMEN_TEST(cpu_composite_fractional_crop_does_not_bleed) {
+    image src{8, 1, k_xrgb, 0xFF000000u};
+    for (unsigned x = 2; x < 6; ++x)
+        src.at(x, 0) = 0xFFFFFFFFu;
+    image dst{60, 4, k_xrgb, 0xFF0000FFu};
     lx::gfx::cpu_compositor comp;
     LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
-
-    auto cmd = quad(1, {0, 0, 4, 4});
-    cmd.buffer_xform = lx::buffer_transform::rotate_90;
+    auto cmd = quad(1, {0, 0, 60, 4});
+    cmd.src = lx::rect2f{2.5f, 0.f, 3.f, 1.f};
     auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
     LUMEN_CHECK(static_cast<bool>(stats));
-    LUMEN_CHECK(stats.value().draws_unsupported == 1);
-    LUMEN_CHECK(stats.value().draws_submitted == 0);
+    for (unsigned x = 0; x < 60; ++x)
+        LUMEN_CHECK(dst.at(x, 2) == 0xFFFFFFFFu);
+}
 
-    // And nothing was drawn upright behind our back.
+// Integer magnification of whole texels is nearest (exact, no smear): a scale-2 client's
+// one-pixel checker on a scale-4 output stays a crisp checker of 2x2 blocks.
+LUMEN_TEST(cpu_composite_integer_magnification_is_exact) {
+    image src{4, 4, k_xrgb};
     for (unsigned y = 0; y < 4; ++y)
         for (unsigned x = 0; x < 4; ++x)
-            LUMEN_CHECK(dst.at(x, y) != 0xFFFFFFFFu);
+            src.at(x, y) = ((x ^ y) & 1u) ? 0xFFFFFFFFu : 0xFF000000u;
+    image dst{8, 8, k_xrgb, 0xFF0000FFu};
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+    const auto cmd = quad(1, {0, 0, 8, 8});
+    auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    for (unsigned y = 0; y < 8; ++y)
+        for (unsigned x = 0; x < 8; ++x)
+            LUMEN_CHECK(dst.at(x, y) == src.at(x / 2, y / 2));
+}
+
+// Every buffer transform shows the buffer turned by its inverse (wl_surface
+// .set_buffer_transform). Expected positions come from the spec's own description — the
+// buffer is the surface image with `t` applied (90: a quarter turn counter-clockwise;
+// flipped: mirrored about the vertical axis, then turned) — not from the shared basis
+// table the backends use, so the two are checked against each other.
+LUMEN_TEST(cpu_composite_applies_every_buffer_transform) {
+    constexpr unsigned k_sw = 3, k_sh = 2; // surface size; the buffer is turned
+    for (unsigned t = 0; t < 8; ++t) {
+        const bool quarter = (t & 1u) != 0;
+        const unsigned bw = quarter ? k_sh : k_sw;
+        const unsigned bh = quarter ? k_sw : k_sh;
+        image src{bw, bh, k_xrgb};
+        for (unsigned y = 0; y < bh; ++y)
+            for (unsigned x = 0; x < bw; ++x)
+                src.at(x, y) = 0xFF000000u | (x << 16) | (y << 8) | 0x40u;
+        image dst{k_sw, k_sh, k_xrgb, 0xFF000000u};
+        lx::gfx::cpu_compositor comp;
+        LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+        auto cmd = quad(1, {0, 0, static_cast<int>(k_sw), static_cast<int>(k_sh)});
+        cmd.buffer_xform = static_cast<lx::buffer_transform>(t);
+        auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+        LUMEN_CHECK(static_cast<bool>(stats));
+        LUMEN_CHECK(stats.value().draws_unsupported == 0);
+        for (unsigned y = 0; y < k_sh; ++y)
+            for (unsigned x = 0; x < k_sw; ++x) {
+                const unsigned W = k_sw, H = k_sh;
+                unsigned bx = 0, by = 0;
+                switch (t) {
+                case 0: bx = x, by = y; break;
+                case 1: bx = y, by = W - 1 - x; break;           // 90
+                case 2: bx = W - 1 - x, by = H - 1 - y; break;   // 180
+                case 3: bx = H - 1 - y, by = x; break;           // 270
+                case 4: bx = W - 1 - x, by = y; break;           // flipped
+                case 5: bx = y, by = x; break;                   // flipped 90
+                case 6: bx = x, by = H - 1 - y; break;           // flipped 180
+                case 7: bx = H - 1 - y, by = W - 1 - x; break;   // flipped 270
+                }
+                const std::uint32_t want = 0xFF000000u | (bx << 16) | (by << 8) | 0x40u;
+                if (dst.at(x, y) != want)
+                    std::printf("    transform %u surface (%u,%u): got %08x want %08x\n", t, x,
+                                y, dst.at(x, y), want);
+                LUMEN_CHECK(dst.at(x, y) == want);
+            }
+    }
 }
 
 // An empty src is "the whole texture" — the default path must be untouched by the widening.

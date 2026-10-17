@@ -80,8 +80,9 @@ struct wm_protocol_ops {
     void* user = nullptr;
 };
 
-/// What kind of root the hit surface's tree has.
-enum class hit_owner : unsigned char { toplevel, popup, layer };
+/// What kind of root the hit surface's tree has. `ime_popup`: an input method's popup
+/// (zwp_input_popup_surface_v2) — it takes the pointer, never the keyboard.
+enum class hit_owner : unsigned char { toplevel, popup, layer, lock, ime_popup };
 /// What was hit: a client surface, or the compositor's frame around a window.
 enum class hit_target : unsigned char { surface, decoration };
 
@@ -109,11 +110,37 @@ struct wm_hit {
     deco_zone zone = deco_zone::none;
 };
 
+struct wm_hit;
+
+/// The session lock's side of input (ext-session-lock-v1), installed by the compositor so
+/// the lock records stay out of this partition. Consulted only while the session is locked.
+struct wm_lock_ops {
+    /// The topmost lock surface under the global point (`out.owner` = lock). False when none
+    /// is shown there (no lock surface on that output yet: the solid colour takes nothing).
+    bool (*hit)(void* user, double x, double y, wm_hit& out) = nullptr;
+    /// The lock surface with the keyboard (its `wl_surface` resource), and its id; null when
+    /// none has content yet.
+    void* (*keyboard)(void* user, lx::surface_id& surface) = nullptr;
+    /// A press landed on lock surface `surface` (click-to-focus among lock surfaces).
+    void (*clicked)(void* user, lx::surface_id surface) = nullptr;
+    void* user = nullptr;
+};
+
+/// Input-method popups (text-input / input-method-v2), installed by the compositor: they are
+/// drawn above everything a client draws — the lock layer included, for a lock surface's text
+/// input — so they are hit first. A press on one moves neither keyboard focus nor stacking.
+struct wm_ime_ops {
+    /// The topmost shown input popup under the global point (`out.owner` = ime_popup).
+    bool (*hit)(void* user, double x, double y, wm_hit& out) = nullptr;
+    void* user = nullptr;
+};
+
 /// What a commit on a toplevel's surface carried, as far as the window manager cares.
 struct toplevel_commit_info {
     /// The surface has content after this commit (false: never had any, or null attached).
     bool has_buffer = false;
-    lx::size2i buffer_size{};
+    /// Logical surface size (buffer scale, transform and viewport applied).
+    lx::size2i surface_size{};
     /// Surface-local bounding box of the surface and its mapped subsurfaces after this
     /// commit (`surface_tree::subtree_bbox`) — what the window geometry is clamped to.
     lx::rect2i tree_bbox{};
@@ -302,6 +329,47 @@ public:
 
     /// Pointer buttons currently held (implicit grab active when non-zero).
     [[nodiscard]] unsigned buttons_down() const { return std::popcount(button_mask_); }
+
+    // ── Session pause (VT switch away) ──
+    /// Ends what a pause must not leave half-done: an interactive move or resize ends as
+    /// Escape would, a drag is cancelled (so no release can become a drop). Popups stay —
+    /// they are client state. Also for a button released by its device going away.
+    void cancel_for_pause();
+    /// Releases, stamped `time_ms`, of every held button whose press reached a client;
+    /// afterwards no button is held. For what libinput's own releases did not cover.
+    void release_held_buttons(unsigned time_ms);
+    /// Why windows are `suspended` (xdg-shell: "outputs switched off due to screen
+    /// locking" is one of the spec's own cases). Any reason held suspends them.
+    enum suspend_reason : unsigned {
+        /// The VT is away (session pause).
+        suspend_vt = 1u << 0,
+        /// The display is powered off (zwlr_output_power_v1, idle blanking).
+        suspend_power = 1u << 1,
+        /// The session is locked (ext_session_lock_v1).
+        suspend_lock = 1u << 2,
+    };
+    // ── Session lock (ext-session-lock-v1) ──
+    void set_lock_ops(wm_lock_ops ops) { lock_ops_ = ops; }
+    // ── Input-method popups ──
+    void set_ime_ops(wm_ime_ops ops) { ime_ops_ = ops; }
+    /// The session is locked (from the lock request on, design L1): normal clients lose the
+    /// pointer and the keyboard at once — a move or resize ends as Escape would, a drag is
+    /// cancelled, popups are dismissed, held buttons' releases reach nobody — and from then
+    /// on only lock surfaces are hit-tested and given the keyboard (`wm_lock_ops`). Unlocked,
+    /// focus resolves as before; the window decision taken meanwhile is kept.
+    void set_session_locked(bool locked);
+    [[nodiscard]] bool session_locked() const { return locked_; }
+    /// The lock surfaces changed (one mapped, went, or took the keyboard): keyboard focus is
+    /// resolved again and the pointer re-hit-tested.
+    void lock_focus_changed();
+    /// Holds or releases one reason. While any is held, every toplevel's desired configure
+    /// carries `suspended` (windows created meanwhile too); the configures go out through
+    /// the normal flush.
+    void set_suspend_reason(unsigned reason, bool on);
+    [[nodiscard]] bool session_suspended() const { return suspend_reasons_ != 0; }
+    /// A button press that woke the display (I5): consumed — it reaches no client and starts
+    /// nothing — and its release is withheld like that of any swallowed press.
+    void swallow_button_press(const lx::input::pointer_button_event& event);
     /// Serial of the last button press delivered to a client, and that client
     /// (`wl_client*`). What xdg_toplevel.move/resize are validated against.
     [[nodiscard]] unsigned last_press_serial() const { return last_press_serial_; }
@@ -392,12 +460,18 @@ private:
     dnd_grab* dnd_ = nullptr;
     liveness_tracker* liveness_ = nullptr;
     wm_protocol_ops ops_{};
+    wm_lock_ops lock_ops_{};
+    wm_ime_ops ime_ops_{};
+    /// The session is locked: input goes to lock surfaces only.
+    bool locked_ = false;
     wm_grab grab_{};
     /// Buttons whose press never reached a client (the Super binding, presses during a
     /// grab): their release must not reach one either.
     std::uint64_t swallowed_mask_ = 0;
     /// Escape pressed to cancel a grab: its release is withheld too.
     bool swallowed_escape_ = false;
+    /// `suspend_reason` bits held: while any is, windows carry `tl_suspended`.
+    unsigned suspend_reasons_ = 0;
     lx::toplevel_id keyboard_focus_{};
     /// The window owning the pointer focus (click-to-focus target) and the surface that
     /// actually has it, which may be one of the window's subsurfaces.
@@ -533,6 +607,8 @@ void format_states(unsigned states, char* out, unsigned cap) {
         put("maximized");
     if (states & lx::compositor::tl_fullscreen)
         put("fullscreen");
+    if (states & lx::compositor::tl_suspended)
+        put("suspended");
     if (n == 0)
         std::snprintf(out, cap, "-");
 }
@@ -832,6 +908,26 @@ void lx::compositor::window_manager::set_layers(layer_shell* layers) {
         wm->resolve_keyboard_focus();
         wm->rehit_pending_ = true;
     };
+    host.surface_mapped = [](void* user, lx::surface_id surface) {
+        auto* wm = static_cast<window_manager*>(user);
+        // sway's handle_map: an on_demand surface on the top or overlay layer takes the
+        // keyboard as it maps — unless an interactive move, resize or drag is running, or
+        // a surface on a higher layer already has it. focus_changed resolves it next.
+        if (!wm->layers_ || !wm->layers_->focus_on_map(surface) || wm->grab_active() ||
+            wm->drag_active())
+            return;
+        if (wm->layer_focus_ && wm->layers_->focusable(wm->layer_focus_) &&
+            wm->layers_->mapped_level(wm->layer_focus_) > wm->layers_->mapped_level(surface))
+            return;
+        wm->layer_focus_ = surface;
+        if (wm_debug_enabled()) {
+            char line[128];
+            std::snprintf(line, sizeof(line),
+                          "layer focus surface=%llu interactivity=on_demand cause=map",
+                          surface.id());
+            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.layer", line);
+        }
+    };
     host.surface_moved = [](void* user, lx::surface_id surface) {
         auto* wm = static_cast<window_manager*>(user);
         if (wm->popups_)
@@ -862,7 +958,8 @@ void lx::compositor::window_manager::sync_decoration(const toplevel_record& rec)
 
 lx::rect2i lx::compositor::window_manager::output_area() const {
     if (outputs_ && outputs_->count() > 0) {
-        const lx::rect2i g = outputs_->geometry(outputs_->nth(0));
+        // Logical: windows, layers and popups are placed in layout coordinates.
+        const lx::rect2i g = outputs_->logical_rect(outputs_->nth(0));
         if (!rect_empty(g))
             return g;
     }
@@ -1097,6 +1194,8 @@ void lx::compositor::window_manager::on_initial_commit(lx::toplevel_id id) {
     rec->desired = {};
     // An exclusive layer surface keeps the keyboard: the new window will not be activated.
     rec->desired.states = layers_ && layers_->exclusive_focus() ? 0u : unsigned{tl_activated};
+    if (suspend_reasons_ != 0)
+        rec->desired.states |= tl_suspended;
     rec->desired.decoration = toplevel_manager::wanted_decoration(*rec);
     if (rec->want_maximized) {
         // set_maximized before the initial commit: the first configure maximizes, and the
@@ -1123,7 +1222,7 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
 
     const lx::rect2i previous = rec->geometry;
     if (info.has_buffer)
-        rec->buffer_size = info.buffer_size;
+        rec->surface_size = info.surface_size;
     // Clamped to the whole tree, not the root buffer: a CSD title bar drawn as a subsurface
     // above the main surface is part of the window.
     const lx::rect2i eff = effective_window_geometry(rec->window_geometry_set,
@@ -1505,7 +1604,13 @@ void lx::compositor::window_manager::resolve_keyboard_focus() {
     // "For the top and overlay layers, the seat will always give exclusive keyboard focus to
     // the top-most layer which has keyboard interactivity set to exclusive."
     lx::surface_id exclusive{};
-    if (layers_) {
+    // Locked: the lock surface with the keyboard, or nothing — no layer surface, popup or
+    // window, and no window is activated meanwhile.
+    if (locked_) {
+        if (lock_ops_.keyboard)
+            target = lock_ops_.keyboard(lock_ops_.user, surface);
+        kind = target ? "lock" : "none";
+    } else if (layers_) {
         if (const layer_record* l = layers_->exclusive_focus()) {
             target = l->surface_res;
             kind = "layer";
@@ -1517,7 +1622,7 @@ void lx::compositor::window_manager::resolve_keyboard_focus() {
     // activated meanwhile (the window decision is unchanged), which is what GTK expects. A
     // layer surface's popups inherit its interactivity (`none`: pointer grab only), and only
     // an exclusive surface's own popups can take the keyboard from it.
-    if (popups_) {
+    if (popups_ && !locked_) {
         if (const popup_record* p = popups_->keyboard_target()) {
             const lx::surface_id root_layer = popups_->root_layer(*p);
             const bool allowed = root_layer
@@ -1533,14 +1638,14 @@ void lx::compositor::window_manager::resolve_keyboard_focus() {
         }
     }
     // A clicked on_demand layer surface, until a click elsewhere.
-    if (!target && layer_focus_ && layers_ && layers_->focusable(layer_focus_)) {
+    if (!target && !locked_ && layer_focus_ && layers_ && layers_->focusable(layer_focus_)) {
         if (const layer_record* l = layers_->find(layer_focus_)) {
             target = l->surface_res;
             kind = "layer";
             surface = l->surface;
         }
     }
-    if (!target) {
+    if (!target && !locked_) {
         if (const auto* rec = toplevels_->find(keyboard_focus_)) {
             target = rec->surface_resource;
             kind = "toplevel";
@@ -1564,7 +1669,10 @@ void lx::compositor::window_manager::resolve_keyboard_focus() {
         if (decorations_)
             decorations_->set_active(owner);
     }
-    if (!router_ || !seat_ || router_->keyboard_focus() == target)
+    // Compared with what the router will deliver, not what it delivers now: while the
+    // keyboard is suspended (VT away) the focus is null, and a lock deciding "nobody" then
+    // must still replace the surface the resume would give the keys to.
+    if (!router_ || !seat_ || router_->chosen_keyboard_focus() == target)
         return;
     router_->set_keyboard_focus(target, *seat_);
     if (wm_debug_enabled()) {
@@ -1582,13 +1690,22 @@ bool lx::compositor::window_manager::pointer_hit(double x, double y, wm_hit& out
         return false;
     // Owner events: during a popup grab only the grabbing client's surfaces get the pointer
     // (not its frame either: that is the compositor's).
-    return !(popups_ && popups_->grab_active() &&
+    // An input method's popup serves the text input inside the grabbing client's menu: it
+    // stays reachable (its candidates are clicked).
+    return !(popups_ && popups_->grab_active() && out.owner != hit_owner::ime_popup &&
              (out.target != hit_target::surface || !(out.client == popups_->grab_client())));
 }
 
 bool lx::compositor::window_manager::hit_test(double x, double y, wm_hit& out) const {
     if (!toplevels_ || !surfaces_ || !tree_)
         return false;
+    // Input-method popups are above everything (only ever shown for the focused text input,
+    // which while locked is a lock surface's).
+    if (ime_ops_.hit && ime_ops_.hit(ime_ops_.user, x, y, out))
+        return true;
+    // Locked: lock surfaces only. Nothing else is drawn, and nothing else may be reached.
+    if (locked_)
+        return lock_ops_.hit && lock_ops_.hit(lock_ops_.user, x, y, out);
     // Popups sit above every window (the popup layer), newest on top.
     if (popups_ && popups_->mapped_count() > 0) {
         tree_hit th{};
@@ -1720,6 +1837,9 @@ void lx::compositor::window_manager::set_pointer_focus(const wm_hit* hit) {
                       hit->surface.id(), hit->sx, hit->sy);
     else if (hit && hit->owner == hit_owner::layer)
         std::snprintf(line, sizeof(line), "focus pointer layer surface=%llu sx=%.1f sy=%.1f",
+                      hit->surface.id(), hit->sx, hit->sy);
+    else if (hit && hit->owner == hit_owner::ime_popup)
+        std::snprintf(line, sizeof(line), "focus pointer ime-popup surface=%llu sx=%.1f sy=%.1f",
                       hit->surface.id(), hit->sx, hit->sy);
     else if (hit)
         std::snprintf(line, sizeof(line), "focus pointer id=%llu sx=%.1f sy=%.1f", hit->id.id(),
@@ -1869,6 +1989,21 @@ void lx::compositor::window_manager::on_pointer_button(
             swallowed_mask_ |= bit;
             return;
         }
+        // Locked: no binding, frame, layer or window focus — the press goes to the lock
+        // surface under the pointer (which takes the keyboard), or to nobody.
+        if (locked_) {
+            if (first)
+                refresh_pointer_focus(event.time_ms, false);
+            if (pointer_owner_ == hit_owner::lock && pointer_root_ && router_->pointer_focus() &&
+                lock_ops_.clicked)
+                lock_ops_.clicked(lock_ops_.user, pointer_root_);
+            if (const unsigned serial = router_->send_pointer_button(event, *seat_); serial) {
+                last_press_serial_ = serial;
+                last_press_client_ = router_->pointer_focus_client();
+                last_press_button_ = event.evdev_code;
+            }
+            return;
+        }
         // A popup grab ends with a press outside the grabbing client's surfaces. The press
         // is consumed (wlroots and Mutter alike): the menu closes and nothing under it is
         // clicked. Checked before the Super binding and click-to-focus.
@@ -1876,7 +2011,8 @@ void lx::compositor::window_manager::on_pointer_button(
             wm_hit h{};
             const bool inside = hit_test(seat_->pointer_x(), seat_->pointer_y(), h) &&
                                 h.target == hit_target::surface &&
-                                h.client == popups_->grab_client();
+                                (h.client == popups_->grab_client() ||
+                                 h.owner == hit_owner::ime_popup);
             if (!inside) {
                 swallowed_mask_ |= bit;
                 popups_->dismiss_all("outside-click");
@@ -1935,7 +2071,8 @@ void lx::compositor::window_manager::on_pointer_button(
                     }
                     resolve_keyboard_focus();
                 }
-            } else if (pointer_owner_ != hit_owner::popup && layer_focus_) {
+            } else if (pointer_owner_ != hit_owner::popup &&
+                       pointer_owner_ != hit_owner::ime_popup && layer_focus_) {
                 if (wm_debug_enabled()) {
                     char line[128];
                     std::snprintf(line, sizeof(line),
@@ -2031,6 +2168,107 @@ bool lx::compositor::window_manager::on_key(const lx::input::key_event& event) {
         return true;
     }
     return false;
+}
+
+void lx::compositor::window_manager::cancel_for_pause() {
+    if (grab_.mode != grab_mode::none)
+        end_grab(grab_end_reason::escape);
+    if (drag_active())
+        dnd_->on_escape();
+    swallowed_escape_ = false;
+}
+
+void lx::compositor::window_manager::release_held_buttons(unsigned time_ms) {
+    if (!router_ || !seat_) {
+        button_mask_ = 0;
+        swallowed_mask_ = 0;
+        return;
+    }
+    for (std::uint64_t b = button_mask_; b; b &= b - 1) {
+        const unsigned offset = static_cast<unsigned>(__builtin_ctzll(b));
+        const std::uint64_t bit = std::uint64_t{1} << offset;
+        if (swallowed_mask_ & bit)
+            continue;
+        lx::input::pointer_button_event release{};
+        release.evdev_code = k_button_base + offset;
+        release.pressed = false;
+        release.time_ms = time_ms;
+        (void)router_->send_pointer_button(release, *seat_);
+    }
+    button_mask_ = 0;
+    swallowed_mask_ = 0;
+}
+
+void lx::compositor::window_manager::swallow_button_press(
+    const lx::input::pointer_button_event& event) {
+    if (!event.pressed || event.evdev_code < k_button_base ||
+        event.evdev_code - k_button_base >= 64)
+        return;
+    const std::uint64_t bit = std::uint64_t{1} << (event.evdev_code - k_button_base);
+    if (button_mask_ & bit)
+        return; // already held: its release belongs to that press
+    button_mask_ |= bit;
+    swallowed_mask_ |= bit;
+}
+
+void lx::compositor::window_manager::set_session_locked(bool locked) {
+    if (locked == locked_)
+        return;
+    if (locked) {
+        // What a lock must not leave half-done or reachable: a move or resize ends as Escape
+        // would, a drag is cancelled (no release may become a drop), every popup is
+        // dismissed (popup_done), and the releases of buttons held now reach nobody.
+        if (grab_.mode != grab_mode::none)
+            end_grab(grab_end_reason::escape);
+        if (drag_active())
+            dnd_->on_escape();
+        if (popups_)
+            popups_->dismiss_all("session-lock");
+        swallowed_mask_ |= button_mask_;
+        deco_press_ = {};
+        locked_ = true;
+        // The pointer leaves whatever it was on (a lock surface takes it once shown).
+        set_pointer_focus(nullptr);
+        resolve_keyboard_focus();
+        if (button_mask_ == 0)
+            refresh_pointer_focus(0, false);
+    } else {
+        locked_ = false;
+        resolve_keyboard_focus();
+        if (button_mask_ == 0)
+            refresh_pointer_focus(0, false);
+        else
+            set_pointer_focus(nullptr);
+    }
+    if (wm_debug_enabled())
+        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category,
+                                        locked ? "input locked (lock surfaces only)"
+                                               : "input unlocked");
+}
+
+void lx::compositor::window_manager::lock_focus_changed() {
+    if (!locked_)
+        return;
+    resolve_keyboard_focus();
+    if (button_mask_ == 0)
+        refresh_pointer_focus(0, false);
+}
+
+void lx::compositor::window_manager::set_suspend_reason(unsigned reason, bool on) {
+    const unsigned before = suspend_reasons_;
+    if (on)
+        suspend_reasons_ |= reason;
+    else
+        suspend_reasons_ &= ~reason;
+    if ((before != 0) == (suspend_reasons_ != 0) || !toplevels_)
+        return;
+    on = suspend_reasons_ != 0;
+    toplevels_->for_each_mut([on](toplevel_record& rec) {
+        if (on)
+            rec.desired.states |= tl_suspended;
+        else
+            rec.desired.states &= ~static_cast<unsigned>(tl_suspended);
+    });
 }
 
 void lx::compositor::window_manager::on_modifiers() {
@@ -2514,9 +2752,15 @@ lx::compositor::window_manager::request_activation(lx::toplevel_id id,
                                                    lx::runtime::clock_time now,
                                                    activation_reason& why) {
     toplevel_record* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
-    const activation_result r = decide_activation(activation_context_for(rec, grant, now), why);
+    activation_result r = decide_activation(activation_context_for(rec, grant, now), why);
     if (!rec)
         return r;
+    // Locked: no window takes the keyboard behind the lock; it is marked instead, which the
+    // shell shows once the session is unlocked.
+    if (locked_ && rec->mapped && r == activation_result::granted && keyboard_focus_ != rec->id) {
+        r = activation_result::urgent;
+        why = activation_reason::session_locked;
+    }
     if (!rec->mapped) {
         if (r == activation_result::pending || r == activation_result::urgent) {
             rec->activation_pending = true;
@@ -2534,6 +2778,13 @@ lx::compositor::window_manager::request_activation(lx::toplevel_id id,
 }
 
 bool lx::compositor::window_manager::decide_activation_at_map(toplevel_record& rec) {
+    // A window mapping while the session is locked does not take the keyboard decision from
+    // the window the user left: it opens marked, below the focused one.
+    if (locked_ && toplevels_ && toplevels_->find(keyboard_focus_)) {
+        rec.activation_pending = false;
+        set_demands_attention(rec, true);
+        return false;
+    }
     if (!rec.activation_pending)
         return true;
     rec.activation_pending = false;

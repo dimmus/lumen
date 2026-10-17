@@ -79,6 +79,64 @@ private:
     unsigned long long clock_ = 0;
 };
 
+/// The keys whose press reached a client, seat-wide (an evdev-code bitset). A release is
+/// sent only for a key in it, and `wl_keyboard.enter` lists only keys in it: a press the
+/// compositor kept (a VT switch, the logout chord, a shell key grab, Escape cancelling a
+/// grab) then has its release swallowed with no per-binding bookkeeping, and a window that
+/// gains focus while such a key is still down is never told it is held. Fixed storage.
+class forwarded_keys {
+public:
+    static constexpr unsigned k_codes = 0x300; // KEY_CNT
+    void set(unsigned code) {
+        if (code < k_codes)
+            bits_[code / 64] |= std::uint64_t{1} << (code % 64);
+    }
+    void clear(unsigned code) {
+        if (code < k_codes)
+            bits_[code / 64] &= ~(std::uint64_t{1} << (code % 64));
+    }
+    [[nodiscard]] bool test(unsigned code) const {
+        return code < k_codes && (bits_[code / 64] >> (code % 64)) & 1u;
+    }
+    [[nodiscard]] bool any() const {
+        for (const auto w : bits_)
+            if (w)
+                return true;
+        return false;
+    }
+    /// Calls `fn(code)` for every key held, lowest first.
+    template<typename Fn>
+    void for_each(Fn&& fn) const {
+        for (unsigned w = 0; w < k_codes / 64; ++w)
+            for (std::uint64_t b = bits_[w]; b; b &= b - 1)
+                fn(w * 64 + static_cast<unsigned>(__builtin_ctzll(b)));
+    }
+    void reset() {
+        for (auto& w : bits_)
+            w = 0;
+    }
+
+private:
+    std::uint64_t bits_[k_codes / 64]{};
+};
+
+/// The input method's keyboard grab (zwp_input_method_keyboard_grab_v2), as the wire unit
+/// installs it: where keys and modifiers go while the input method is active (design T2).
+struct im_grab_ops {
+    /// The grab object (opaque); null: no grab.
+    void* grab = nullptr;
+    void (*key)(void* grab, unsigned serial, unsigned time_ms, unsigned key, bool pressed) = nullptr;
+    void (*modifiers)(void* grab, unsigned serial, const lx::input::modifier_state& mods) = nullptr;
+};
+
+/// A keymap clients' `wl_keyboard`s may be switched to: a virtual keyboard's
+/// (zwp_virtual_keyboard_v1), sealed and owned by its record. `id` 0 is the seat's own.
+struct keymap_ref {
+    unsigned id = 0;
+    int fd = -1;
+    unsigned size = 0;
+};
+
 /// Delivers seat events to the clients that should receive them.
 ///
 /// Translating input is only half the job; the other half is deciding *who* hears it and
@@ -109,6 +167,13 @@ public:
     /// held so the client starts from the right state.
     void set_keyboard_focus(void* wl_surface_resource, lx::input::seat& seat);
     [[nodiscard]] void* keyboard_focus() const { return keyboard_focus_; }
+    /// The surface the last `set_keyboard_focus` chose: the focus, or while suspended the
+    /// one the resume gives the keyboard to. What a caller compares a new decision with —
+    /// `keyboard_focus()` is null while suspended, so a decision for "nobody" made then
+    /// would look like a no-op and the resume would hand the keys to the stale surface.
+    [[nodiscard]] void* chosen_keyboard_focus() const {
+        return keyboard_suspended_ ? suspended_focus_ : keyboard_focus_;
+    }
     /// `wl_client*` owning the keyboard-focus surface, or null.
     [[nodiscard]] void* keyboard_focus_client() const { return keyboard_focus_client_; }
 
@@ -120,6 +185,15 @@ public:
     void set_focus_client_hook(focus_client_hook fn, void* user) {
         focus_hook_ = fn;
         focus_hook_user_ = user;
+    }
+
+    /// Called after the keyboard-focus surface changed — its `leave`s and `enter`s sent — with
+    /// the new surface (null: none) and its client; `destroyed` is a focused surface that lost
+    /// focus by being destroyed (no `leave`: it is gone). Text-input focus follows it.
+    using focus_surface_hook = void (*)(void* user, void* surface, void* client, void* destroyed);
+    void set_focus_surface_hook(focus_surface_hook fn, void* user) {
+        surface_hook_ = fn;
+        surface_hook_user_ = user;
     }
 
     /// Called after a key press or a button press reached `client` (`wl_client*`, with at
@@ -162,7 +236,46 @@ public:
     /// so state tied to the focused client (its cursor request) can tell it is stale.
     [[nodiscard]] unsigned pointer_focus_generation() const { return pointer_focus_generation_; }
 
+    /// A press is sent (and recorded as forwarded) only when something has keyboard focus;
+    /// a release only for a forwarded key — see `forwarded_keys`. While the input method is
+    /// active and holds a keyboard grab, a press goes to the grab instead (recorded in
+    /// `to_input_method`), and a release goes wherever its press went.
     void send_key(const lx::input::key_event& event, lx::input::seat& seat);
+    /// A virtual keyboard's key (zwp_virtual_keyboard_v1): to the keyboard focus like a
+    /// physical one — never to the input method's grab (an input method's own forwarded keys
+    /// must not loop back), never through the liveness hook. The focused client's keyboards
+    /// are switched to `keymap` first when they show another one (wlroots' keyboard switching).
+    void send_virtual_key(const lx::input::key_event& event, const keymap_ref& keymap,
+                          lx::input::seat& seat);
+    void send_virtual_modifiers(const lx::input::modifier_state& mods, const keymap_ref& keymap,
+                                lx::input::seat& seat);
+    /// The virtual keyboard whose keymap is `id` is going: clients shown it get the seat's
+    /// keymap back now (its fd is about to close).
+    void virtual_keymap_gone(unsigned id, lx::input::seat& seat);
+    /// Where the seat's keymap comes from — the one every `wl_keyboard` is first sent (the fd
+    /// stays owned by the source). Asked when a client is switched back to it, not before:
+    /// the seat compiles its keymap once input starts.
+    using seat_keymap_source = bool (*)(int& fd, unsigned& size);
+    void set_seat_keymap_source(seat_keymap_source fn) { seat_keymap_ = fn; }
+    /// The input method's keyboard grab came (`ops.grab` set) or went (null).
+    void set_im_grab(const im_grab_ops& ops, lx::input::seat& seat);
+    /// The input method became active (keys go to its grab, when it has one) or inactive.
+    void set_im_routing(bool on, lx::input::seat& seat);
+    /// Keys go to the input method's grab now.
+    [[nodiscard]] bool im_routing_active() const { return im_grab_.grab != nullptr && im_routing_; }
+    /// Keys whose press went to the input method's grab.
+    [[nodiscard]] const forwarded_keys& to_input_method() const { return to_im_; }
+    [[nodiscard]] const forwarded_keys& forwarded() const { return forwarded_; }
+    /// Session pause: a release, stamped `time_ms`, for every forwarded key still down, to
+    /// the keyboard focus. Afterwards nothing is forwarded.
+    void release_forwarded_keys(unsigned time_ms, lx::input::seat& seat);
+    /// Session pause: the focus gets `wl_keyboard.leave`, while the window manager's
+    /// decision is kept — focus changes made while suspended are recorded, not sent.
+    void suspend_keyboard_focus(lx::input::seat& seat);
+    /// Session resume: `enter` (with no keys: none is down) and the modifiers to the
+    /// surface the window manager wants now.
+    void resume_keyboard_focus(lx::input::seat& seat);
+    [[nodiscard]] bool keyboard_suspended() const { return keyboard_suspended_; }
     /// True when `serial` is the last key press delivered to `client` (`wl_client*`), or
     /// the release of that same key — what xdg_popup.grab may quote for a keyboard-opened
     /// menu (Mutter's rule: a toolkit may open the menu only once the key is released).
@@ -182,6 +295,20 @@ public:
     [[nodiscard]] unsigned touch_count() const { return touches_.count; }
 
 private:
+    /// The client half of `send_key`: forwarded-key bookkeeping, serials and the event to the
+    /// focused client's keyboards. `user_input`: run the liveness hook for a press.
+    void deliver_key(const lx::input::key_event& event, lx::input::seat& seat, bool user_input);
+    void deliver_modifiers(const lx::input::modifier_state& mods, lx::input::seat& seat);
+    /// Sends `fd` (`size` bytes, xkb v1) as the keymap of every keyboard of `client`.
+    void send_keymap_to(void* client, int fd, unsigned size);
+    /// The focused client's keyboards show `keymap` (switching them when they do not).
+    void use_keymap(const keymap_ref& keymap, lx::input::seat& seat);
+    /// A client was switched to a virtual keyboard's keymap: it gets the seat's back, then the
+    /// seat's modifiers (its xkb state restarts with a new keymap).
+    void restore_seat_keymap(lx::input::seat& seat);
+    /// Keys routed to the input method stopped or started: the side that now receives
+    /// modifiers is told the current ones.
+    void routing_changed(bool was, lx::input::seat& seat);
     /// Sends `enter` plus the modifiers that must follow it to one keyboard resource.
     /// Shared by focus changes and late resource creation so the two cannot drift.
     void send_enter_to(void* keyboard_resource, void* surface, lx::input::seat& seat);
@@ -205,6 +332,21 @@ private:
                      input_serial_kind kind);
     void notify_focus_client(void* new_client);
 
+    forwarded_keys forwarded_{};
+    /// Keys whose press went to the input method's grab: their releases go there too.
+    forwarded_keys to_im_{};
+    im_grab_ops im_grab_{};
+    bool im_routing_ = false;
+    /// The seat's keymap, and the client (`wl_client*`) whose keyboards were switched to a
+    /// virtual keyboard's keymap (`override_`), if any.
+    seat_keymap_source seat_keymap_ = nullptr;
+    void* override_client_ = nullptr;
+    keymap_ref override_{};
+    focus_surface_hook surface_hook_ = nullptr;
+    void* surface_hook_user_ = nullptr;
+    /// While the session is paused: the surface the keyboard would have.
+    bool keyboard_suspended_ = false;
+    void* suspended_focus_ = nullptr;
     resource_set keyboards_{};
     resource_set pointers_{};
     resource_set touches_{};
@@ -423,6 +565,10 @@ bool lx::compositor::input_router::motion_muted(void* client) const {
 
 void lx::compositor::input_router::forget_client(void* client) {
     serials_.forget(client);
+    if (override_client_ == client) {
+        override_client_ = nullptr;
+        override_ = {};
+    }
     for (unsigned i = 0; i < muted_count_; ++i) {
         if (muted_[i] == client) {
             muted_[i] = muted_[--muted_count_];
@@ -457,7 +603,8 @@ void lx::compositor::input_router::send_enter_to(void* keyboard_resource, void* 
     uint32_t held[k_max_held];
     unsigned n = 0;
     for (unsigned i = 0; i < seat.pressed_count() && n < k_max_held; ++i)
-        held[n++] = seat.pressed_keys()[i];
+        if (forwarded_.test(seat.pressed_keys()[i]))
+            held[n++] = seat.pressed_keys()[i];
     wl_array keys{};
     keys.data = held;
     keys.size = n * sizeof(uint32_t);
@@ -482,6 +629,12 @@ void lx::compositor::input_router::send_enter_to(void* keyboard_resource, void* 
 void lx::compositor::input_router::add_keyboard(void* r, lx::input::seat& seat) {
     keyboards_.add(r);
 #if defined(LUMEN_HAS_WAYLAND)
+    // Its client is switched to a virtual keyboard's keymap: so is this keyboard (it was
+    // sent the seat's at creation).
+    if (r && override_client_ && override_.fd >= 0 &&
+        wl_resource_get_client(static_cast<wl_resource*>(r)) == override_client_)
+        wl_keyboard_send_keymap(static_cast<wl_resource*>(r), WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+                                override_.fd, override_.size);
     // Already focused? Then this resource missed the `enter` and has to be told now.
     if (!r || !keyboard_focus_ || !resource_set::same_client(r, keyboard_focus_))
         return;
@@ -521,7 +674,11 @@ void lx::compositor::input_router::remove(void* r) {
     if (keyboard_focus_ == r) {
         keyboard_focus_ = nullptr;
         notify_focus_client(nullptr);
+        if (surface_hook_)
+            surface_hook_(surface_hook_user_, nullptr, nullptr, r);
     }
+    if (suspended_focus_ == r)
+        suspended_focus_ = nullptr;
     if (pointer_focus_ == r) {
         pointer_focus_ = nullptr;
         clear_pointer_focus_state();
@@ -555,8 +712,17 @@ bool lx::compositor::input_router::is_pointer_enter_serial(unsigned serial) cons
 
 void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::seat& seat) {
 #if defined(LUMEN_HAS_WAYLAND)
+    if (keyboard_suspended_) {
+        // Recorded for the resume; nobody is told anything while the session is away.
+        suspended_focus_ = surface;
+        return;
+    }
     if (keyboard_focus_ == surface)
         return;
+    // A client switched to a virtual keyboard's keymap gets the seat's back before it loses
+    // the keyboard: the next client to type into it must not inherit the other layout.
+    if (override_client_)
+        restore_seat_keymap(seat);
 
     if (keyboard_focus_) {
         const unsigned serial = seat.next_serial();
@@ -576,15 +742,17 @@ void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::
     // it has the keyboard (its selection) goes out here.
     notify_focus_client(surface ? wl_resource_get_client(static_cast<wl_resource*>(surface))
                                 : nullptr);
-    if (!surface)
-        return;
-
-    // `enter` carries the keys already held. Without it the client believes nothing is
-    // pressed and any modifier held across the focus change is stuck until it is tapped.
-    for (unsigned i = 0; i < keyboards_.count; ++i) {
-        if (resource_set::same_client(keyboards_.items[i], surface))
-            send_enter_to(keyboards_.items[i], surface, seat);
+    if (surface) {
+        // `enter` carries the keys already held. Without it the client believes nothing is
+        // pressed and any modifier held across the focus change is stuck until it is tapped.
+        for (unsigned i = 0; i < keyboards_.count; ++i) {
+            if (resource_set::same_client(keyboards_.items[i], surface))
+                send_enter_to(keyboards_.items[i], surface, seat);
+        }
     }
+    // After the keyboard's own leave/enter: text-input focus follows (text-input-v3).
+    if (surface_hook_)
+        surface_hook_(surface_hook_user_, surface, keyboard_focus_client_, nullptr);
 #else
     (void)surface;
     (void)seat;
@@ -646,9 +814,157 @@ unsigned lx::compositor::input_router::set_pointer_focus(void* surface, double s
 
 void lx::compositor::input_router::send_key(const lx::input::key_event& event,
                                             lx::input::seat& seat) {
-#if defined(LUMEN_HAS_WAYLAND)
+    if (event.pressed) {
+        if (!keyboard_focus_)
+            return; // not forwarded: its release will not be either
+        // The input method composes text from the keys of the text input it serves (T2): the
+        // press goes to its grab, and nothing else sees it.
+        if (im_routing_active() && im_grab_.key) {
+            to_im_.set(event.evdev_keycode);
+            im_grab_.key(im_grab_.grab, seat.next_serial(), event.time_ms, event.evdev_keycode,
+                         true);
+            return;
+        }
+    } else if (to_im_.test(event.evdev_keycode)) {
+        // Its press went to the input method: so does the release, while its grab lives (a
+        // grab released meanwhile never sees it — and the client never saw the press).
+        to_im_.clear(event.evdev_keycode);
+        if (im_grab_.grab && im_grab_.key)
+            im_grab_.key(im_grab_.grab, seat.next_serial(), event.time_ms, event.evdev_keycode,
+                         false);
+        return;
+    }
+    if (override_client_)
+        restore_seat_keymap(seat);
+    deliver_key(event, seat, true);
+}
+
+void lx::compositor::input_router::send_virtual_key(const lx::input::key_event& event,
+                                                    const keymap_ref& keymap,
+                                                    lx::input::seat& seat) {
+    if (event.pressed && !keyboard_focus_)
+        return;
+    if (event.pressed || forwarded_.test(event.evdev_keycode))
+        use_keymap(keymap, seat);
+    deliver_key(event, seat, false);
+}
+
+void lx::compositor::input_router::send_virtual_modifiers(const lx::input::modifier_state& mods,
+                                                          const keymap_ref& keymap,
+                                                          lx::input::seat& seat) {
     if (!keyboard_focus_)
         return;
+    use_keymap(keymap, seat);
+    deliver_modifiers(mods, seat);
+}
+
+void lx::compositor::input_router::virtual_keymap_gone(unsigned id, lx::input::seat& seat) {
+    if (id != 0 && override_client_ && override_.id == id)
+        restore_seat_keymap(seat);
+}
+
+void lx::compositor::input_router::send_keymap_to(void* client, int fd, unsigned size) {
+#if defined(LUMEN_HAS_WAYLAND)
+    if (!client || fd < 0)
+        return;
+    for (unsigned i = 0; i < keyboards_.count; ++i) {
+        auto* kb = static_cast<wl_resource*>(keyboards_.items[i]);
+        if (wl_resource_get_client(kb) == client)
+            wl_keyboard_send_keymap(kb, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, size);
+    }
+#else
+    (void)client;
+    (void)fd;
+    (void)size;
+#endif
+}
+
+void lx::compositor::input_router::use_keymap(const keymap_ref& keymap, lx::input::seat& seat) {
+    if (keymap.id == 0 || keymap.fd < 0) {
+        if (override_client_)
+            restore_seat_keymap(seat);
+        return;
+    }
+    if (override_client_ == keyboard_focus_client_ && override_.id == keymap.id)
+        return;
+    if (override_client_)
+        restore_seat_keymap(seat);
+    if (!keyboard_focus_client_)
+        return;
+    send_keymap_to(keyboard_focus_client_, keymap.fd, keymap.size);
+    override_client_ = keyboard_focus_client_;
+    override_ = keymap;
+}
+
+void lx::compositor::input_router::restore_seat_keymap(lx::input::seat& seat) {
+    void* client = override_client_;
+    override_client_ = nullptr;
+    override_ = {};
+    int fd = -1;
+    unsigned size = 0;
+    if (!client || !seat_keymap_ || !seat_keymap_(fd, size))
+        return;
+    send_keymap_to(client, fd, size);
+#if defined(LUMEN_HAS_WAYLAND)
+    // A new keymap restarts the client's xkb state: it is told the seat's modifiers again.
+    const auto mods = seat.keymap().modifiers();
+    const unsigned serial = seat.next_serial();
+    for (unsigned i = 0; i < keyboards_.count; ++i) {
+        auto* kb = static_cast<wl_resource*>(keyboards_.items[i]);
+        if (wl_resource_get_client(kb) == client)
+            wl_keyboard_send_modifiers(kb, serial, mods.depressed, mods.latched, mods.locked,
+                                       mods.group);
+    }
+#else
+    (void)seat;
+#endif
+}
+
+void lx::compositor::input_router::routing_changed(bool was, lx::input::seat& seat) {
+    const bool now = im_routing_active();
+    if (was == now)
+        return;
+    const auto mods = seat.keymap().modifiers();
+    if (now) {
+        // The grab starts from the seat's modifiers.
+        if (im_grab_.modifiers)
+            im_grab_.modifiers(im_grab_.grab, seat.next_serial(), mods);
+        return;
+    }
+    // Keys reach the client directly again: whatever the input method's virtual keyboard last
+    // told it, it is told the seat's state now.
+    if (override_client_)
+        restore_seat_keymap(seat);
+    else
+        deliver_modifiers(mods, seat);
+}
+
+void lx::compositor::input_router::set_im_grab(const im_grab_ops& ops, lx::input::seat& seat) {
+    const bool was = im_routing_active();
+    im_grab_ = ops.grab ? ops : im_grab_ops{};
+    routing_changed(was, seat);
+}
+
+void lx::compositor::input_router::set_im_routing(bool on, lx::input::seat& seat) {
+    const bool was = im_routing_active();
+    im_routing_ = on;
+    routing_changed(was, seat);
+}
+
+void lx::compositor::input_router::deliver_key(const lx::input::key_event& event,
+                                               lx::input::seat& seat, bool user_input) {
+#if defined(LUMEN_HAS_WAYLAND)
+    if (event.pressed) {
+        if (!keyboard_focus_)
+            return; // not forwarded: its release will not be either
+        forwarded_.set(event.evdev_keycode);
+    } else {
+        if (!forwarded_.test(event.evdev_keycode))
+            return; // its press was kept by the compositor, or went nowhere
+        forwarded_.clear(event.evdev_keycode);
+        if (!keyboard_focus_)
+            return;
+    }
     const unsigned serial = seat.next_serial();
     if (event.pressed) {
         last_key_press_serial_ = serial;
@@ -668,13 +984,61 @@ void lx::compositor::input_router::send_key(const lx::input::key_event& event,
                              event.pressed ? WL_KEYBOARD_KEY_STATE_PRESSED
                                            : WL_KEYBOARD_KEY_STATE_RELEASED);
     }
-    if (event.pressed && input_hook_ && keyboards_.has_client(keyboard_focus_client_))
+    if (event.pressed && user_input && input_hook_ &&
+        keyboards_.has_client(keyboard_focus_client_))
         input_hook_(input_hook_user_, keyboard_focus_client_, serial,
                     input_serial_kind::key_press);
 #else
     (void)event;
     (void)seat;
+    (void)user_input;
 #endif
+}
+
+void lx::compositor::input_router::release_forwarded_keys(unsigned time_ms,
+                                                          lx::input::seat& seat) {
+    // Keys held on the input method's grab are released there.
+    if (to_im_.any()) {
+        to_im_.for_each([&](unsigned code) {
+            if (im_grab_.grab && im_grab_.key)
+                im_grab_.key(im_grab_.grab, seat.next_serial(), time_ms, code, false);
+        });
+        to_im_.reset();
+    }
+    if (!forwarded_.any())
+        return;
+    unsigned codes[forwarded_keys::k_codes / 8];
+    unsigned n = 0;
+    forwarded_.for_each([&](unsigned code) {
+        if (n < sizeof(codes) / sizeof(codes[0]))
+            codes[n++] = code;
+    });
+    for (unsigned i = 0; i < n; ++i) {
+        lx::input::key_event release{};
+        release.evdev_keycode = codes[i];
+        release.pressed = false;
+        release.time_ms = time_ms;
+        send_key(release, seat);
+    }
+    forwarded_.reset();
+}
+
+void lx::compositor::input_router::suspend_keyboard_focus(lx::input::seat& seat) {
+    if (keyboard_suspended_)
+        return;
+    void* focus = keyboard_focus_;
+    set_keyboard_focus(nullptr, seat);
+    keyboard_suspended_ = true;
+    suspended_focus_ = focus;
+}
+
+void lx::compositor::input_router::resume_keyboard_focus(lx::input::seat& seat) {
+    if (!keyboard_suspended_)
+        return;
+    keyboard_suspended_ = false;
+    void* focus = suspended_focus_;
+    suspended_focus_ = nullptr;
+    set_keyboard_focus(focus, seat);
 }
 
 bool lx::compositor::input_router::is_key_grab_serial(unsigned serial, void* client) const {
@@ -684,6 +1048,22 @@ bool lx::compositor::input_router::is_key_grab_serial(unsigned serial, void* cli
 
 void lx::compositor::input_router::send_modifiers(const lx::input::modifier_state& mods,
                                                   lx::input::seat& seat) {
+    if (im_routing_active()) {
+        // The input method sees the physical modifiers; the client gets those its virtual
+        // keyboard forwards.
+        if (im_grab_.modifiers)
+            im_grab_.modifiers(im_grab_.grab, seat.next_serial(), mods);
+        return;
+    }
+    if (override_client_) {
+        restore_seat_keymap(seat); // sends these very modifiers after the keymap
+        return;
+    }
+    deliver_modifiers(mods, seat);
+}
+
+void lx::compositor::input_router::deliver_modifiers(const lx::input::modifier_state& mods,
+                                                     lx::input::seat& seat) {
 #if defined(LUMEN_HAS_WAYLAND)
     if (!keyboard_focus_)
         return;

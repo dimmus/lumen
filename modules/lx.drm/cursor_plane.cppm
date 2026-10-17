@@ -77,8 +77,18 @@ public:
     [[nodiscard]] bool involves_crtc() const { return valid() && (visible_ || hw_fb_ >= 0); }
     /// Adds the plane's properties to a `drmModeAtomicReq*` (kept out of this interface).
     void append_props(void* drm_atomic_req) const;
+    /// Adds properties that take the plane off its CRTC (CRTC_ID 0, FB_ID 0) without changing
+    /// what is wanted — for a commit that turns the CRTC off (display power). Follow a
+    /// successful one with `invalidate`, so the next commit states the plane in full again.
+    void append_off_props(void* drm_atomic_req) const;
     /// The commit carrying `append_props` succeeded: what was wanted is now what is shown.
     void on_committed();
+    /// What the hardware shows is unknown (another DRM master had the CRTC): the next commit
+    /// states the plane in full, either way. Staged images and capabilities are kept.
+    void invalidate() {
+        never_committed_ = true;
+        hw_fb_ = -1;
+    }
 
 private:
     struct dumb_buffer {
@@ -454,6 +464,18 @@ void lx::drm::kms_cursor_plane::append_props(void* drm_atomic_req) const {
         drmModeAtomicAddProperty(req, plane, p_hot_x_, signed_prop(hot_x_));
         drmModeAtomicAddProperty(req, plane, p_hot_y_, signed_prop(hot_y_));
     }
+#else
+    (void)drm_atomic_req;
+#endif
+}
+
+void lx::drm::kms_cursor_plane::append_off_props(void* drm_atomic_req) const {
+#if defined(LUMEN_HAS_DRM)
+    auto* req = static_cast<drmModeAtomicReq*>(drm_atomic_req);
+    if (!req || !valid())
+        return;
+    drmModeAtomicAddProperty(req, caps_.plane_id, p_fb_id_, 0);
+    drmModeAtomicAddProperty(req, caps_.plane_id, p_crtc_id_, 0);
 #else
     (void)drm_atomic_req;
 #endif

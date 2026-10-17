@@ -5,6 +5,7 @@
 
 import lx.compositor;
 
+using lx::compositor::forwarded_keys;
 using lx::compositor::input_serial_kind;
 using lx::compositor::input_serial_log;
 using lx::compositor::serial_newer;
@@ -126,6 +127,28 @@ LUMEN_TEST(serials_lru_eviction_and_forget) {
     LUMEN_CHECK(!g_log.delivered(A, 3) && g_log.last_user_serial(A) == 0);
     g_log.note(A, 700, input_serial_kind::focus);
     LUMEN_CHECK(g_log.delivered(A, 700) && !g_log.delivered(A, 3));
+}
+
+LUMEN_TEST(forwarded_keys_set) {
+    forwarded_keys f{};
+    LUMEN_CHECK(!f.any() && !f.test(30));
+    f.set(30);  // KEY_A
+    f.set(125); // KEY_LEFTMETA
+    f.set(0x2ff);
+    f.set(0x300); // out of range: ignored
+    LUMEN_CHECK(f.test(30) && f.test(125) && f.test(0x2ff) && !f.test(0x300) && !f.test(31));
+    unsigned seen[4]{};
+    unsigned n = 0;
+    f.for_each([&](unsigned code) {
+        if (n < 4)
+            seen[n] = code;
+        ++n;
+    });
+    LUMEN_CHECK(n == 3 && seen[0] == 30 && seen[1] == 125 && seen[2] == 0x2ff);
+    f.clear(125);
+    LUMEN_CHECK(!f.test(125) && f.test(30));
+    f.reset();
+    LUMEN_CHECK(!f.any());
 }
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

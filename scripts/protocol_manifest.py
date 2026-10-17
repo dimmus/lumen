@@ -29,6 +29,7 @@ def all_protocol_entries(manifest: dict) -> list[dict]:
     return (
         protocol_entries(manifest, "upstream")
         + protocol_entries(manifest, "wlr")
+        + [dict(e, path=f"wlroots/{e['path']}") for e in protocol_entries(manifest, "wlroots")]
         + protocol_entries(manifest, "lumen")
     )
 
@@ -118,6 +119,16 @@ def emit_fetch_list(manifest: dict, out: Path) -> None:
         if key not in seen:
             lines.append(key)
             seen.add(key)
+
+    # wlroots' protocol/ directory, fetched to protocols/upstream/wlroots/.
+    wlroots = manifest.get("wlroots", {})
+    for entry in protocol_entries(manifest, "wlroots"):
+        key = f"wlroots|{entry['path']}"
+        if key not in seen:
+            lines.append(key)
+            seen.add(key)
+    if protocol_entries(manifest, "wlroots"):
+        lines.append(f"WLROOTS_TAG={wlroots.get('tag', 'master')}")
 
     if "wayland|wayland.xml" not in seen:
         lines.append("wayland|wayland.xml")

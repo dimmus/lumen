@@ -20,10 +20,20 @@ enum class present_mode {
     fifo_relaxed, ///< adaptive fifo when supported
 };
 
+/// The nearest scale a fractional-scale client can be told exactly: n/120
+/// (wp_fractional_scale_v1.preferred_scale is in 120ths), never below 1/120 — niri's
+/// `closest_representable_scale`. A non-positive or non-finite request is 1.
+[[nodiscard]] double representable_scale(double requested);
+
 struct output_state {
     lx::output_id id{};
-    lx::rect2i geometry{};
-    float scale = 1.f;
+    /// Top-left in the layout (logical coordinates): where this output's logical rect sits
+    /// among the others.
+    lx::point2i position{};
+    /// The current mode, in pixels.
+    lx::size2i mode{};
+    /// Output scale, n/120 (`representable_scale`). Logical size = mode / scale.
+    double scale = 1.0;
     present_mode present = present_mode::auto_select;
     bool supports_kms_damage = false;
     /// wl_output.name / zxdg_output_v1.name: the connector name ("Virtual-1", "DP-2"), or
@@ -39,6 +49,13 @@ struct output_state {
     int phys_h_mm = 0;
     /// The headless/nested stand-in, not a connector.
     bool virtual_output = false;
+
+    /// The output in the layout: `position`, and the mode divided by the scale, rounded
+    /// half away from zero (wlroots' `wlr_output_effective_resolution`). A fractional
+    /// product leaves the last row and column partly outside, which the scanout clips.
+    [[nodiscard]] lx::rect2i logical_rect() const;
+    /// The output's own pixels: `{0, 0, mode}`.
+    [[nodiscard]] lx::rect2i mode_rect() const { return {0, 0, mode.width, mode.height}; }
 };
 
 /// The outputs, in stable slots: an output keeps its slot for as long as its connector stays
@@ -57,12 +74,21 @@ public:
     [[nodiscard]] lx::output_id nth(unsigned index) const;
     [[nodiscard]] output_state state(lx::output_id output) const;
 
-    [[nodiscard]] lx::rect2i geometry(lx::output_id output) const;
-    [[nodiscard]] float scale(lx::output_id output) const;
+    /// Layout (logical) rect of `output`: what the window manager, input and the scene
+    /// place against. Empty for an unknown output.
+    [[nodiscard]] lx::rect2i logical_rect(lx::output_id output) const;
+    /// `{0, 0, mode}` of `output`: what scanout, KMS damage and the cursor plane use.
+    [[nodiscard]] lx::rect2i mode_rect(lx::output_id output) const;
+    [[nodiscard]] double scale(lx::output_id output) const;
     [[nodiscard]] present_mode present_mode_for(lx::output_id output) const;
 
     void set_present_mode(lx::output_id output, present_mode mode);
-    void set_scale(lx::output_id output, float scale);
+    /// Rounded through `representable_scale`. Moves `generation` on a change.
+    void set_scale(lx::output_id output, double scale);
+    /// The scale a connector gets when it first appears (`config::output_scale`, i.e.
+    /// `--scale`). Rounded through `representable_scale`.
+    void set_default_scale(double scale) { default_scale_ = representable_scale(scale); }
+    [[nodiscard]] double default_scale() const { return default_scale_; }
     /// wl_output transform of `output` (nothing rotates outputs yet; tests, and D5).
     void set_transform(lx::output_id output, unsigned transform);
     /// Brings the outputs in line with the connected connectors and their modes. Called
@@ -86,9 +112,11 @@ public:
     [[nodiscard]] unsigned generation() const { return generation_; }
 
     /// Puts an output that is not a connector in the first free slot (the headless one;
-    /// tests). Returns the slot, -1 when every slot is taken.
-    int add_virtual(const char* name, lx::rect2i geometry, unsigned refresh_mhz,
-                    float scale = 1.f);
+    /// tests): `layout.x/y` is its logical position, `layout.width/height` its mode in
+    /// pixels. `scale` 0 means the default scale. Returns the slot, -1 when every slot is
+    /// taken.
+    int add_virtual(const char* name, lx::rect2i layout, unsigned refresh_mhz,
+                    double scale = 0.0);
     void remove_slot(unsigned slot);
 
 private:
@@ -99,6 +127,7 @@ private:
     unsigned count_ = 0;
     unsigned generation_ = 0;
     unsigned next_virtual_id_ = 1;
+    double default_scale_ = 1.0;
 };
 
 [[nodiscard]] present_mode resolve_present_mode(present_mode requested,
@@ -113,9 +142,13 @@ private:
 /// lower slot.
 [[nodiscard]] int primary_output_for_rect(const output_manager& outputs, lx::rect2i r);
 /// wl_surface.preferred_buffer_scale for a surface on the outputs in `mask`: the ceiling of
-/// the largest scale among them (KWin), so the content is sharp on every output it shows
-/// on; 1 when it is on none.
+/// the largest scale among them (wlroots, KWin), so the content is sharp on every output it
+/// shows on; 1 when it is on none.
 [[nodiscard]] int preferred_buffer_scale(const output_manager& outputs, std::uint32_t mask);
+/// wp_fractional_scale_v1.preferred_scale for a surface on the outputs in `mask`: the
+/// largest scale among them in 120ths (wlroots' scene uses the maximum too); 120 when it is
+/// on none.
+[[nodiscard]] unsigned preferred_scale_120(const output_manager& outputs, std::uint32_t mask);
 /// wl_surface.preferred_buffer_transform: the primary output's transform, normal (0) when
 /// there is none.
 [[nodiscard]] unsigned preferred_buffer_transform(const output_manager& outputs, int primary);
@@ -124,14 +157,12 @@ private:
 
 namespace {
 
-[[nodiscard]] bool same_rect(lx::rect2i a, lx::rect2i b) {
-    return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
-}
-
-/// What a client can see of an output (scale and present mode aside).
+/// What a client can see of an output (present mode aside).
 [[nodiscard]] bool same_visible(const lx::compositor::output_state& a,
                                 const lx::compositor::output_state& b) {
-    return a.id == b.id && same_rect(a.geometry, b.geometry) && a.refresh_mhz == b.refresh_mhz &&
+    return a.id == b.id && a.position.x == b.position.x && a.position.y == b.position.y &&
+           a.mode.width == b.mode.width && a.mode.height == b.mode.height &&
+           a.scale == b.scale && a.refresh_mhz == b.refresh_mhz &&
            a.transform == b.transform && a.phys_w_mm == b.phys_w_mm &&
            a.phys_h_mm == b.phys_h_mm && std::strcmp(a.name, b.name) == 0 &&
            std::strcmp(a.description, b.description) == 0;
@@ -186,12 +217,33 @@ lx::compositor::output_state lx::compositor::output_manager::state(lx::output_id
     return s >= 0 ? outputs_[s] : output_state{};
 }
 
-lx::rect2i lx::compositor::output_manager::geometry(lx::output_id output) const {
-    return state(output).geometry;
+double lx::compositor::representable_scale(double requested) {
+    if (!(requested > 0.0) || requested > 1.0e6)
+        return 1.0;
+    const double n = std::round(requested * 120.0);
+    return (n < 1.0 ? 1.0 : n) / 120.0;
 }
 
-float lx::compositor::output_manager::scale(lx::output_id output) const {
-    return state(output).scale;
+lx::rect2i lx::compositor::output_state::logical_rect() const {
+    const double s = scale > 0.0 ? scale : 1.0;
+    return {position.x, position.y,
+            static_cast<int>(std::lround(static_cast<double>(mode.width) / s)),
+            static_cast<int>(std::lround(static_cast<double>(mode.height) / s))};
+}
+
+lx::rect2i lx::compositor::output_manager::logical_rect(lx::output_id output) const {
+    const int s = slot_of(output);
+    return s >= 0 ? outputs_[s].logical_rect() : lx::rect2i{};
+}
+
+lx::rect2i lx::compositor::output_manager::mode_rect(lx::output_id output) const {
+    const int s = slot_of(output);
+    return s >= 0 ? outputs_[s].mode_rect() : lx::rect2i{};
+}
+
+double lx::compositor::output_manager::scale(lx::output_id output) const {
+    const int s = slot_of(output);
+    return s >= 0 ? outputs_[s].scale : 1.0;
 }
 
 std::uint32_t lx::compositor::output_manager::live_mask() const {
@@ -216,9 +268,10 @@ void lx::compositor::output_manager::set_present_mode(lx::output_id output, pres
         outputs_[s].present = mode;
 }
 
-void lx::compositor::output_manager::set_scale(lx::output_id output, float scale) {
+void lx::compositor::output_manager::set_scale(lx::output_id output, double requested) {
     const int s = slot_of(output);
-    if (s < 0 || !(scale > 0.f) || outputs_[s].scale == scale)
+    const double scale = representable_scale(requested);
+    if (s < 0 || outputs_[s].scale == scale)
         return;
     outputs_[s].scale = scale;
     ++generation_;
@@ -232,15 +285,16 @@ void lx::compositor::output_manager::set_transform(lx::output_id output, unsigne
     ++generation_;
 }
 
-int lx::compositor::output_manager::add_virtual(const char* name, lx::rect2i geometry,
-                                                unsigned refresh_mhz, float scale) {
+int lx::compositor::output_manager::add_virtual(const char* name, lx::rect2i layout,
+                                                unsigned refresh_mhz, double scale) {
     for (unsigned s = 0; s < k_max; ++s) {
         if (live_[s])
             continue;
         output_state o{};
         o.id = lx::output_id{k_virtual_id_base + next_virtual_id_++};
-        o.geometry = geometry;
-        o.scale = scale > 0.f ? scale : 1.f;
+        o.position = {layout.x, layout.y};
+        o.mode = {layout.width, layout.height};
+        o.scale = scale > 0.0 ? representable_scale(scale) : default_scale_;
         o.refresh_mhz = refresh_mhz;
         o.virtual_output = true;
         std::snprintf(o.name, sizeof(o.name), "%s", name ? name : "HEADLESS-1");
@@ -293,7 +347,8 @@ void lx::compositor::output_manager::refresh_from_drm(lx::drm::kms_device& devic
         output_state next = live_[slot] ? outputs_[slot] : output_state{};
         next.id = id;
         next.virtual_output = false;
-        next.geometry = {cursor_x, 0, static_cast<int>(m.width), static_cast<int>(m.height)};
+        next.position = {cursor_x, 0};
+        next.mode = {static_cast<int>(m.width), static_cast<int>(m.height)};
         next.refresh_mhz = m.refresh_millihz;
         next.phys_w_mm = static_cast<int>(info.phys_w_mm);
         next.phys_h_mm = static_cast<int>(info.phys_h_mm);
@@ -301,8 +356,10 @@ void lx::compositor::output_manager::refresh_from_drm(lx::drm::kms_device& devic
             std::snprintf(next.name, sizeof(next.name), "%s", info.name ? info.name : "");
             std::snprintf(next.description, sizeof(next.description), "%s", next.name);
         }
-        if (!(next.scale > 0.f))
-            next.scale = 1.f;
+        // A connector seen for the first time takes the configured scale; one already in a
+        // slot keeps its own.
+        if (!live_[slot] || !(next.scale > 0.0))
+            next.scale = default_scale_;
         if (!live_[slot] || !same_visible(outputs_[slot], next)) {
             outputs_[slot] = next;
             live_[slot] = true;
@@ -310,7 +367,8 @@ void lx::compositor::output_manager::refresh_from_drm(lx::drm::kms_device& devic
         }
         seen[slot] = true;
         any_real = true;
-        cursor_x += static_cast<int>(m.width);
+        // Laid out left to right in logical units (a 2x output takes half its mode).
+        cursor_x += next.logical_rect().width;
     }
 
     bool changed = false;
@@ -345,7 +403,7 @@ std::uint32_t lx::compositor::outputs_for_rect(const output_manager& outputs, lx
         return 0;
     std::uint32_t mask = 0;
     for (unsigned s = 0; s < output_manager::k_max; ++s)
-        if (outputs.slot_live(s) && overlap_area(r, outputs.slot_state(s).geometry) > 0)
+        if (outputs.slot_live(s) && overlap_area(r, outputs.slot_state(s).logical_rect()) > 0)
             mask |= 1u << s;
     return mask;
 }
@@ -358,7 +416,7 @@ int lx::compositor::primary_output_for_rect(const output_manager& outputs, lx::r
     for (unsigned s = 0; s < output_manager::k_max; ++s) {
         if (!outputs.slot_live(s))
             continue;
-        const long long a = overlap_area(r, outputs.slot_state(s).geometry);
+        const long long a = overlap_area(r, outputs.slot_state(s).logical_rect());
         if (a > best_area) {
             best_area = a;
             best = static_cast<int>(s);
@@ -367,15 +425,33 @@ int lx::compositor::primary_output_for_rect(const output_manager& outputs, lx::r
     return best;
 }
 
-int lx::compositor::preferred_buffer_scale(const output_manager& outputs, std::uint32_t mask) {
-    float best = 0.f;
-    for (unsigned s = 0; s < output_manager::k_max; ++s)
+namespace {
+
+[[nodiscard]] double max_scale(const lx::compositor::output_manager& outputs, std::uint32_t mask) {
+    double best = 0.0;
+    for (unsigned s = 0; s < lx::compositor::output_manager::k_max; ++s)
         if ((mask & (1u << s)) && outputs.slot_live(s) && outputs.slot_state(s).scale > best)
             best = outputs.slot_state(s).scale;
-    if (!(best > 0.f))
+    return best;
+}
+
+} // namespace
+
+int lx::compositor::preferred_buffer_scale(const output_manager& outputs, std::uint32_t mask) {
+    const double best = max_scale(outputs, mask);
+    if (!(best > 0.0))
         return 1;
-    const int c = static_cast<int>(std::ceil(best - 1e-4f));
+    // Scales are n/120, so the ceiling is exact without an epsilon.
+    const int c = static_cast<int>(std::ceil(best));
     return c < 1 ? 1 : c;
+}
+
+unsigned lx::compositor::preferred_scale_120(const output_manager& outputs, std::uint32_t mask) {
+    const double best = max_scale(outputs, mask);
+    if (!(best > 0.0))
+        return 120;
+    const long n = std::lround(best * 120.0);
+    return n < 1 ? 1u : static_cast<unsigned>(n);
 }
 
 unsigned lx::compositor::preferred_buffer_transform(const output_manager& outputs, int primary) {

@@ -53,3 +53,59 @@ stateDiagram-v2
         Active --> Destroyed: unmap
         Destroyed --> [*]
     }
+
+---
+%% Session pause/resume (lx.compositor:session_state; VT switching via logind)
+stateDiagram-v2
+    state Session {
+        [*] --> Active: drm present, TakeDevice active
+        [*] --> Paused: TakeDevice inactive
+        Active --> Paused: PauseDevice(drm, pause|force) / Active=false (gate render, 1 Hz paused tick, libinput_suspend)
+        Resuming --> Paused: PauseDevice / Active=false (resume superseded)
+        Paused --> Paused: PauseDevice(drm, pause) → ack after render quiesced
+        Paused --> Resuming: ResumeDevice(drm) / Active=true and drmIsMaster / paused tick (1 Hz)
+        Resuming --> Active: resume modeset ok
+        Resuming --> Paused: device unavailable (retry) / rejected (wait for ResumeDevice)
+        Active --> DisplayLost: PauseDevice(drm, gone)
+        Paused --> DisplayLost: PauseDevice(drm, gone)
+        DisplayLost --> DisplayLost: input follows Active
+    }
+
+---
+%% Display power (lx.compositor:display_power; zwlr_output_power_v1, wake on input)
+stateDiagram-v2
+    state DisplayPower {
+        [*] --> On
+        On --> OffPending: set_mode(off) (gate_power, 1 Hz paused tick, suspended, presentation discarded)
+        OnPending --> OffPending: set_mode(off)
+        OffPending --> Off: render ACTIVE=0 committed / VT away (deferred) → mode(off)
+        OffPending --> OffPending: flip queued → posted again from the flip handler
+        OffPending --> SoftBlank: kernel refused ACTIVE=0 → black frame, mode(off)
+        Off --> OnPending: real input (press swallowed) / set_mode(on) → resume procedure
+        SoftBlank --> OnPending: real input / set_mode(on)
+        OffPending --> OnPending: real input / set_mode(on) (off task goes stale)
+        OnPending --> On: resume modeset ok → mode(on)
+        OnPending --> Off: modeset rejected (next input retries)
+        Off --> On: VT resume (activity; its modeset powers on) → mode(on)
+    }
+
+---
+%% Session lock (lx.compositor:session_lock; ext_session_lock_v1, zlm_shell_v1 v5 lock_state)
+stateDiagram-v2
+    state SessionLock {
+        [*] --> Unlocked
+        Unlocked --> AwaitingSurfaces: lock (input leaves normal clients; lock_state locking)
+        AwaitingSurfaces --> Locking: a lock surface with content on every output / 1 s (scene locked: normal layers hidden, solid colour)
+        AwaitingSurfaces --> Unlocked: destroy (the locker gave up)
+        Locking --> Unlocked: destroy (the locker gave up)
+        Locking --> Locked: content flip of a locked frame / display dark (VT away, off, never lit) → locked, LockedHint
+        Locked --> Unlocked: unlock_and_destroy (activity, LockedHint cleared)
+        AwaitingSurfaces --> Abandoned: the locker died (fails closed)
+        Locking --> Abandoned: the locker died
+        Locked --> Abandoned: the locker died (dark red, warn, lock_state abandoned)
+        Abandoned --> Locked: lock by a new locker (locked at once)
+        AwaitingSurfaces --> Unlocked: logind Unlock (finished)
+        Locking --> Unlocked: logind Unlock (finished)
+        Locked --> Unlocked: logind Unlock (finished)
+        Abandoned --> Unlocked: logind Unlock
+    }

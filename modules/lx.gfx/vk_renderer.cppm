@@ -235,15 +235,17 @@ namespace {
 
 /// Mirrors the `quad_push` block in composite.vert/.frag. Field order matters: each vec4
 /// sits at a 16-byte-aligned offset, which the layout below satisfies naturally (dst at 0,
-/// src_uv at 32, tint at 48) for 64 bytes total — well inside the 128 every driver
-/// guarantees for push constants.
+/// src_uv at 32, tint at 48, src_bounds at 64, transfer at 80, uv_dy at 88) for 96 bytes
+/// total — inside the 128 every driver guarantees for push constants.
 struct quad_push {
     float dst[4]{};
     float target[2]{};
     float opacity = 1.f;
     float pad = 0.f;
-    /// Source rectangle in normalized texture coordinates: u0, v0, du, dv.
-    float src_uv[4]{0.f, 0.f, 1.f, 1.f};
+    /// The source box as an affine basis in normalized texture coordinates: where the
+    /// destination's top-left lands (u, v) and its +x direction (du, dv); `uv_dy` is the +y
+    /// direction. Crop, scale and the buffer transform in one (`source_basis_for`).
+    float src_uv[4]{0.f, 0.f, 1.f, 0.f};
     float tint[4]{1.f, 1.f, 1.f, 1.f};
     /// Half-texel-inset sampling bounds for `src_uv`: u_lo, v_lo, u_hi, v_hi. The fragment
     /// shader clamps to these so a magnified crop cannot bleed texels from outside the
@@ -252,8 +254,7 @@ struct quad_push {
     /// Transfer function to decode the sampled texel with. Matches `transfer_slot`.
     int transfer = 1;
     float pad1 = 0.f;
-    float pad2 = 0.f;
-    float pad3 = 0.f;
+    float uv_dy[2]{0.f, 1.f};
 };
 
 /// Mirrors the `encode_push` block in encode.frag.
@@ -1851,6 +1852,10 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
     composite_stats stats{};
     for (unsigned i = 0; i < count && cmds; ++i) {
         const auto& cmd = cmds[i];
+        if (cmd.occluded) {
+            ++stats.draws_culled;
+            continue;
+        }
         const int index = find_texture(cmd.texture_id);
         if (index < 0) {
             ++stats.draws_skipped;
@@ -1898,32 +1903,42 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
         push.target[1] = static_cast<float>(target.height());
         push.opacity = cmd.opacity;
 
-        // Source rect in normalized coordinates. An empty src means the whole texture,
-        // which keeps the default {0,0,1,1} and reproduces the old behavior exactly.
-        if (slot.width > 0 && slot.height > 0) {
-            const float tw = static_cast<float>(slot.width);
-            const float th = static_cast<float>(slot.height);
-            if (cmd.src.width > 0 && cmd.src.height > 0) {
-                push.src_uv[0] = static_cast<float>(cmd.src.x) / tw;
-                push.src_uv[1] = static_cast<float>(cmd.src.y) / th;
-                push.src_uv[2] = static_cast<float>(cmd.src.width) / tw;
-                push.src_uv[3] = static_cast<float>(cmd.src.height) / th;
+        // Source box in normalized coordinates (empty src: the whole texture), turned by
+        // the buffer transform — the same basis the GL backend uses.
+        {
+            float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
+            if (slot.width > 0 && slot.height > 0) {
+                const float tw = static_cast<float>(slot.width);
+                const float th = static_cast<float>(slot.height);
+                const lx::rect2f box = effective_source(cmd.src, slot.width, slot.height);
+                u0 = box.x / tw;
+                v0 = box.y / th;
+                du = box.width / tw;
+                dv = box.height / th;
+                // Inset by half a texel on each side: linear filtering samples between
+                // texel centers, so without this a magnified crop reads its neighbours
+                // across the crop edge. Degenerate rects collapse to the center rather than
+                // inverting.
+                const float half_u = 0.5f / tw;
+                const float half_v = 0.5f / th;
+                float u_lo = u0 + half_u;
+                float v_lo = v0 + half_v;
+                float u_hi = u0 + du - half_u;
+                float v_hi = v0 + dv - half_v;
+                if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
+                if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
+                push.src_bounds[0] = u_lo;
+                push.src_bounds[1] = v_lo;
+                push.src_bounds[2] = u_hi;
+                push.src_bounds[3] = v_hi;
             }
-            // Inset by half a texel on each side: linear filtering samples between texel
-            // centers, so without this a magnified crop reads its neighbours across the
-            // crop edge. Degenerate rects collapse to the center rather than inverting.
-            const float half_u = 0.5f / tw;
-            const float half_v = 0.5f / th;
-            float u_lo = push.src_uv[0] + half_u;
-            float v_lo = push.src_uv[1] + half_v;
-            float u_hi = push.src_uv[0] + push.src_uv[2] - half_u;
-            float v_hi = push.src_uv[1] + push.src_uv[3] - half_v;
-            if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
-            if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
-            push.src_bounds[0] = u_lo;
-            push.src_bounds[1] = v_lo;
-            push.src_bounds[2] = u_hi;
-            push.src_bounds[3] = v_hi;
+            const source_basis b = source_basis_for(cmd.buffer_xform);
+            push.src_uv[0] = u0 + b.origin[0] * du;
+            push.src_uv[1] = v0 + b.origin[1] * dv;
+            push.src_uv[2] = b.dx[0] * du;
+            push.src_uv[3] = b.dx[1] * dv;
+            push.uv_dy[0] = b.dy[0] * du;
+            push.uv_dy[1] = b.dy[1] * dv;
         }
 
         push.tint[0] = cmd.tint.r;

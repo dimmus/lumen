@@ -235,6 +235,35 @@ LUMEN_TEST(keymap_move_transfers_ownership) {
     LUMEN_CHECK(!km.valid());         // NOLINT(bugprone-use-after-move)
 }
 
+// zwp_virtual_keyboard_v1.keymap: the client's fd is read, never mapped. A file shorter than
+// the size the client claims (or truncated meanwhile) is refused; through a mapping it would
+// have raised SIGBUS and killed the compositor.
+LUMEN_TEST(client_keymap_fd_shorter_than_its_size_is_refused) {
+    lx::input::keyboard_keymap km{};
+    if (!compile_us(km))
+        return;
+    unsigned size = 0;
+    auto seat_fd = km.keymap_fd(size);
+    LUMEN_CHECK(static_cast<bool>(seat_fd) && size > 0);
+    if (!seat_fd)
+        return;
+    unsigned out = 0;
+    auto same = lx::input::normalize_keymap_fd(seat_fd.value().get(), size, out);
+    LUMEN_CHECK(static_cast<bool>(same) && out == size);
+
+    const int tiny = ::memfd_create("lumen-test-keymap", MFD_CLOEXEC);
+    LUMEN_CHECK(tiny >= 0);
+    if (tiny < 0)
+        return;
+    LUMEN_CHECK(::write(tiny, "x", 1) == 1);
+    out = 7;
+    auto refused = lx::input::normalize_keymap_fd(tiny, 65536, out);
+    LUMEN_CHECK(!refused && out == 0);
+    LUMEN_CHECK(!lx::input::normalize_keymap_fd(tiny, 0, out));
+    LUMEN_CHECK(!lx::input::normalize_keymap_fd(tiny, lx::input::k_max_client_keymap + 1, out));
+    ::close(tiny);
+}
+
 // ── Seat ────────────────────────────────────────────────────────────────────────────
 
 // Serials gate popup grabs, drag starts and activation. A repeated serial gets a grab
@@ -336,6 +365,27 @@ LUMEN_TEST(seat_keymap_survives_being_moved) {
     LUMEN_CHECK(assigned.keymap().valid());
     LUMEN_CHECK(assigned.keymap().named().shift);
     LUMEN_CHECK(assigned.pressed_count() == 1);
+}
+
+LUMEN_TEST(reset_depressed_keeps_locks) {
+    lx::input::keyboard_keymap km;
+    if (!compile_us(km))
+        return;
+    (void)km.update_key(k_key_capslock, true);
+    (void)km.update_key(k_key_capslock, false);
+    (void)km.update_key(k_key_leftshift, true);
+    (void)km.update_key(k_key_leftctrl, true);
+    LUMEN_CHECK(km.named().shift && km.named().ctrl && km.named().caps_lock);
+    LUMEN_CHECK((km.led_mask() & 2u) != 0); // caps LED
+    // A pause lets go of everything held; Caps Lock is a lock, not a held key.
+    LUMEN_CHECK(km.reset_depressed());
+    LUMEN_CHECK(!km.named().shift && !km.named().ctrl && km.named().caps_lock);
+    LUMEN_CHECK(km.modifiers().depressed == 0 && km.modifiers().locked != 0);
+    LUMEN_CHECK((km.led_mask() & 2u) != 0);
+    LUMEN_CHECK(!km.reset_depressed()); // nothing left to change
+    // Level 1 ignores the modifiers: Shift+a is still `a` for a binding.
+    (void)km.update_key(k_key_leftshift, true);
+    LUMEN_CHECK(km.level1_keysym(k_key_a, km.active_layout()) == 'a');
 }
 
 int main(int argc, char** argv) {

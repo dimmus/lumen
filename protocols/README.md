@@ -10,6 +10,7 @@ protocols/
 ├── lumen/                 # Private Lumen DE protocols
 │   └── zlm_shell_v1.xml
 └── upstream/              # Fetched by scripts/fetch-protocols.sh
+    └── wlroots/           # wlroots' protocol/ (input-method-v2, virtual-keyboard-v1)
 ```
 
 ## Lumen private protocols
@@ -22,7 +23,8 @@ Interfaces in `protocols/lumen/zlm_shell_v1.xml`:
 
 | Interface | Role |
 |-----------|------|
-| `zlm_shell_v1` | Root; exposes workspace manager, policy bridge, window rules |
+| `zlm_shell_v1` | Root (version 5); exposes workspace manager, policy bridge, window rules; logout (v3); key grabs (v4); the session lock's `lock_state` and `lock_requested` (v5) |
+| `zlm_key_grab_v1` | A key combination held by the shell (v4): `activated(serial, time)`, `refused(reason)` |
 | `zlm_toplevel_v1` | Compositor-owned handle for mapped xdg toplevels |
 | `zlm_workspace_manager_v1` / `zlm_workspace_v1` | Virtual desktops |
 | `zlm_policy_bridge_v1` | Shell intent → compositor execution (focus, geometry, stacking) |
@@ -61,6 +63,15 @@ Outputs per protocol:
 
 See `manifest.toml` for the P0–P2 matrix. P0/P1 codegen is enabled via CMake options
 `LUMEN_PROTOCOLS_P1`, `LUMEN_PROTOCOLS_P2`.
+
+Sources: `[upstream]` (wayland, wayland-protocols at `wayland_protocols_tag`), `[wlr]`
+(wlr-protocols), and `[wlroots]` — wlroots' own `protocol/` directory at a release tag
+(0.20.2), fetched with a sparse checkout into `upstream/wlroots/`. It provides
+`input-method-unstable-v2` and `virtual-keyboard-unstable-v1`, the pair fcitx5 and ibus
+speak. wayland-protocols' experimental `xx-input-method` (`xx_input_method_v1`) is not
+generated: no shipping input method speaks it, and an interface nothing uses would only cost
+build time. The newer `zwp_virtual_keyboard_v1.invalid_keymap_format` error (value 1) is in
+wlroots main but not in the 0.20.2 XML; the compositor posts its wire value.
 
 ## Privileged client model
 

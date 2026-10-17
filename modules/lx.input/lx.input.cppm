@@ -51,6 +51,9 @@ struct pointer_button_event {
     bool pressed = false;
     unsigned time_ms = 0;
     unsigned long long time_us = 0;
+    /// A release libinput made because the device is going away (revoked at a VT switch,
+    /// unplugged, the seat suspended) — not the user letting go.
+    bool device_removed = false;
 };
 
 struct pointer_axis_event {
@@ -69,6 +72,8 @@ struct key_event {
     bool pressed = false;
     unsigned time_ms = 0;
     unsigned long long time_us = 0;
+    /// As `pointer_button_event::device_removed`.
+    bool device_removed = false;
 };
 
 struct touch_event {
@@ -157,6 +162,8 @@ public:
     [[nodiscard]] const unsigned* pressed_keys() const { return pressed_; }
     [[nodiscard]] unsigned pressed_count() const { return pressed_count_; }
     void note_key(unsigned evdev_keycode, bool pressed);
+    /// No key is held any more (a session pause released them all).
+    void clear_pressed() { pressed_count_ = 0; }
 
 private:
     static constexpr unsigned k_max_pressed = 32;
@@ -200,14 +207,25 @@ public:
     /// Devices currently attached. Zero is legitimate — a machine can boot with none.
     [[nodiscard]] unsigned device_count() const { return device_count_; }
 
+
     /// Suspend and resume for VT switching: on switch away the fds must be released or the
-    /// next session cannot claim them.
+    /// next session cannot claim them. `suspend` closes every device (each close goes back
+    /// through the provider) and drains the queue at once: libinput emits a release for
+    /// every key and button still down, and those must reach the sink now, through the
+    /// normal path, so clients end with balanced state (Clutter drains the same way).
+    /// `resume` re-enumerates the seat and reopens every device through the provider.
     void suspend();
     [[nodiscard]] lx::result<void> resume();
+    [[nodiscard]] bool suspended() const { return suspended_; }
 
 private:
     void destroy();
     void handle_event(void* libinput_event);
+    /// Hands every queued event to `handle_event`, a fixed-size batch at a time. A device
+    /// going away (a revoked fd, an unplug, `suspend`) has libinput release its held keys
+    /// and buttons before DEVICE_REMOVED, in the same batch: those releases are marked
+    /// `device_removed`, so a Super tap or a drop is not read into them.
+    unsigned drain();
 
     void* udev_ = nullptr;
     void* libinput_ = nullptr;
@@ -221,6 +239,8 @@ private:
     std::unique_ptr<device_provider> provider_{};
     unsigned device_count_ = 0;
     bool suspended_ = false;
+    /// The event being handled comes from a device that is going away (see `dispatch`).
+    bool removing_ = false;
 };
 
 } // namespace lx::input
@@ -381,8 +401,12 @@ int lx::input::input_manager::fd() const {
 void lx::input::input_manager::suspend() {
 #if defined(LUMEN_HAS_INPUT)
     if (libinput_ && !suspended_) {
-        libinput_suspend(static_cast<struct libinput*>(libinput_));
+        auto* li = static_cast<struct libinput*>(libinput_);
+        libinput_suspend(li);
         suspended_ = true;
+        // The neutral-state events libinput_suspend queued: key and button releases, touch
+        // cancels, then DEVICE_REMOVED for each device.
+        (void)drain();
     }
 #endif
 }
@@ -409,8 +433,14 @@ void lx::input::input_manager::handle_event(void* raw) {
     switch (type) {
     case LIBINPUT_EVENT_DEVICE_ADDED: {
         ++device_count_;
+        auto* added = libinput_event_get_device(ev);
+        // The LEDs follow the xkb state, not whatever the text console (or another session)
+        // left on the keyboard.
+        if (libinput_device_has_capability(added, LIBINPUT_DEVICE_CAP_KEYBOARD))
+            libinput_device_led_update(added,
+                                       static_cast<libinput_led>(seat_.keymap().led_mask()));
         if (sink_.device_added) {
-            auto* dev = libinput_event_get_device(ev);
+            auto* dev = added;
             sink_.device_added(
                 libinput_device_get_name(dev),
                 libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_KEYBOARD) != 0,
@@ -464,6 +494,7 @@ void lx::input::input_manager::handle_event(void* raw) {
                       LIBINPUT_BUTTON_STATE_PRESSED;
         out.time_ms = libinput_event_pointer_get_time(p);
         out.time_us = libinput_event_pointer_get_time_usec(p);
+        out.device_removed = removing_;
         if (sink_.pointer_button)
             sink_.pointer_button(out, sink_.user);
         break;
@@ -514,6 +545,7 @@ void lx::input::input_manager::handle_event(void* raw) {
                       LIBINPUT_KEY_STATE_PRESSED;
         out.time_ms = libinput_event_keyboard_get_time(k);
         out.time_us = libinput_event_keyboard_get_time_usec(k);
+        out.device_removed = removing_;
 
         // xkb state first: a client that reads modifiers after the key event must see the
         // state that key produced, and the compositor's own bindings need it too.
@@ -558,6 +590,49 @@ void lx::input::input_manager::handle_event(void* raw) {
 
 #endif // LUMEN_HAS_INPUT
 
+unsigned lx::input::input_manager::drain() {
+#if defined(LUMEN_HAS_INPUT)
+    auto* li = static_cast<struct libinput*>(libinput_);
+    if (!li)
+        return 0;
+    constexpr unsigned k_batch = 64;
+    constexpr unsigned k_max_gone = 8;
+    unsigned handled = 0;
+    for (;;) {
+        libinput_event* batch[k_batch];
+        unsigned n = 0;
+        while (n < k_batch) {
+            libinput_event* ev = libinput_get_event(li);
+            if (!ev)
+                break;
+            batch[n++] = ev;
+        }
+        if (n == 0)
+            break;
+        libinput_device* gone[k_max_gone];
+        unsigned gone_count = 0;
+        for (unsigned i = 0; i < n && gone_count < k_max_gone; ++i)
+            if (libinput_event_get_type(batch[i]) == LIBINPUT_EVENT_DEVICE_REMOVED)
+                gone[gone_count++] = libinput_event_get_device(batch[i]);
+        for (unsigned i = 0; i < n; ++i) {
+            removing_ = false;
+            if (gone_count) {
+                libinput_device* dev = libinput_event_get_device(batch[i]);
+                for (unsigned g = 0; g < gone_count; ++g)
+                    removing_ = removing_ || gone[g] == dev;
+            }
+            handle_event(batch[i]);
+            libinput_event_destroy(batch[i]);
+            ++handled;
+        }
+        removing_ = false;
+    }
+    return handled;
+#else
+    return 0;
+#endif
+}
+
 unsigned lx::input::input_manager::dispatch() {
 #if defined(LUMEN_HAS_INPUT)
     if (!libinput_)
@@ -566,13 +641,7 @@ unsigned lx::input::input_manager::dispatch() {
     if (libinput_dispatch(li) != 0)
         return 0;
 
-    unsigned handled = 0;
-    while (auto* ev = libinput_get_event(li)) {
-        handle_event(ev);
-        libinput_event_destroy(ev);
-        ++handled;
-    }
-    return handled;
+    return drain();
 #else
     return 0;
 #endif

@@ -16,7 +16,7 @@
 
   <!-- ── Compositor-owned toplevel handle ─────────────────────────── -->
 
-  <interface name="zlm_toplevel_v1" version="3">
+  <interface name="zlm_toplevel_v1" version="5">
     <description summary="compositor-owned handle for a mapped xdg toplevel">
       Shell uses this object for all window management. The compositor maps
       zlm_toplevel_v1 to internal xdg_toplevel state. Never expose client-side
@@ -30,7 +30,7 @@
 
   <!-- ── Shell root ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_shell_v1" version="3">
+  <interface name="zlm_shell_v1" version="5">
     <description summary="Lumen desktop shell root interface"/>
 
     <enum name="capability">
@@ -77,11 +77,119 @@
         closed when the compositor stops. A shell can treat that as a normal end.
       </description>
     </event>
+
+    <!-- Version 4 -->
+
+    <request name="grab_key" since="4">
+      <description summary="take a key combination before any client sees it">
+        Creates a key grab. While it exists, a press of the combination is not sent to the
+        focused client but reported to the shell as zlm_key_grab_v1.activated; the key's
+        release reaches no client either. With the tap flag the grab describes a modifier
+        key pressed and released alone, and is observed rather than taken: the key still
+        reaches the focused client, and activated is sent on its release when no other key,
+        pointer button or scroll happened while it was held.
+
+        keysym is an xkb keysym as the key produces it at its first shift level, in the
+        active layout or, when that layout has no key producing it, in the first layout
+        (so a Latin binding works under a non-Latin layout). modifiers lists exactly the
+        modifiers that must be held; Caps Lock and Num Lock are ignored. For a tap grab
+        keysym must be a modifier keysym and modifiers must be 0.
+
+        Grabs are not delivered during an interactive move, resize or drag, nor while the
+        session is inactive or locked (lock_state other than unlocked). A combination the compositor keeps for itself (Ctrl+Alt+
+        BackSpace, the XF86Switch_VT_* keysyms) or one another grab already holds is
+        refused: the new object receives refused and stays inert until destroyed.
+      </description>
+      <arg name="id" type="new_id" interface="zlm_key_grab_v1"/>
+      <arg name="keysym" type="uint" summary="xkb keysym"/>
+      <arg name="modifiers" type="uint" enum="zlm_key_grab_v1.modifier"/>
+      <arg name="flags" type="uint" enum="zlm_key_grab_v1.flag"/>
+    </request>
+
+    <!-- Version 5 -->
+
+    <enum name="lock_state" since="5">
+      <entry name="unlocked" value="0"/>
+      <entry name="locking" value="1"
+        summary="a locker asked; normal content is no longer interactive"/>
+      <entry name="locked" value="2"/>
+      <entry name="abandoned" value="3"
+        summary="locked, and the locker is gone: start a new one"/>
+    </enum>
+
+    <event name="lock_state" since="5">
+      <description summary="the session lock changed">
+        The ext-session-lock-v1 state of the session. Sent on bind and on every change.
+        While it is not unlocked no shell surface is shown and none receives input, and key
+        grabs are not delivered: the compositor guarantees this, the shell need not. On
+        locking the shell should drop transient UI (an open launcher). On abandoned the
+        session stays locked on a solid colour until a new locker takes over: a shell that
+        has a lock command starts it again. The compositor's own keyboard ways out (VT
+        switching, the logout chord) keep working while locked; logging out ends the
+        session without revealing it.
+      </description>
+      <arg name="state" type="uint" enum="lock_state"/>
+    </event>
+
+    <enum name="lock_reason" since="5">
+      <entry name="logind" value="0" summary="loginctl lock-session, or the system asked"/>
+      <entry name="sleep" value="1" summary="the system is about to sleep"/>
+    </enum>
+
+    <event name="lock_requested" since="5">
+      <description summary="lock the session now">
+        Something other than the shell asked for the session to be locked: logind's Lock
+        signal (loginctl lock-session, a lid policy), or the system is about to sleep (the
+        compositor holds a sleep delay until the session is locked, at most two seconds).
+        The shell starts its locker if it has one configured; the compositor itself ships
+        none. Not sent while the session is already locked.
+      </description>
+      <arg name="reason" type="uint" enum="lock_reason"/>
+    </event>
+  </interface>
+
+  <interface name="zlm_key_grab_v1" version="5">
+    <description summary="a key combination held by the shell">
+      Created by zlm_shell_v1.grab_key. Destroying it gives the combination back to clients.
+    </description>
+
+    <enum name="modifier" bitfield="true">
+      <entry name="shift" value="0x1"/>
+      <entry name="ctrl" value="0x2"/>
+      <entry name="alt" value="0x4"/>
+      <entry name="super" value="0x8"/>
+    </enum>
+
+    <enum name="flag" bitfield="true">
+      <entry name="tap" value="0x1" summary="a modifier pressed and released alone"/>
+    </enum>
+
+    <enum name="refusal">
+      <entry name="reserved" value="1" summary="the compositor's own binding"/>
+      <entry name="taken" value="2" summary="another grab holds this combination"/>
+      <entry name="invalid" value="3" summary="unknown modifier or flag bits, or a tap grab on a non-modifier keysym"/>
+    </enum>
+
+    <request name="destroy" type="destructor"/>
+
+    <event name="activated">
+      <description summary="the combination was pressed (or the modifier tapped)">
+        serial is an input serial delivered to this client: it may be used with
+        xdg_activation_token_v1.set_serial (and xdg_popup.grab) as the triggering event.
+        time is the key event's timestamp in milliseconds, as in wl_keyboard.key.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="time" type="uint"/>
+    </event>
+
+    <event name="refused">
+      <arg name="reason" type="uint" enum="refusal"/>
+    </event>
   </interface>
 
   <!-- ── Workspaces ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_workspace_manager_v1" version="3">
+  <interface name="zlm_workspace_manager_v1" version="5">
     <description summary="virtual desktop manager"/>
 
     <enum name="error">
@@ -126,7 +234,7 @@
     </event>
   </interface>
 
-  <interface name="zlm_workspace_v1" version="3">
+  <interface name="zlm_workspace_v1" version="5">
     <description summary="a single workspace"/>
 
     <request name="destroy" type="destructor"/>
@@ -150,7 +258,7 @@
 
   <!-- ── Policy bridge: shell intent → compositor execution ──────── -->
 
-  <interface name="zlm_policy_bridge_v1" version="3">
+  <interface name="zlm_policy_bridge_v1" version="5">
     <description summary="window management policy bridge">
       Shell sends placement intent; compositor executes geometry, focus, and
       stacking. Stacking is default; tiling is an optional shell plugin.
@@ -346,7 +454,7 @@
 
   <!-- ── Window rules (typed, session config) ─────────────────────── -->
 
-  <interface name="zlm_window_rules_v1" version="3">
+  <interface name="zlm_window_rules_v1" version="5">
     <description summary="persistent window rules">
       Rules are stored in the session config directory
       ($XDG_CONFIG_HOME/lumen/window-rules.toml). Use reload_rules to apply.

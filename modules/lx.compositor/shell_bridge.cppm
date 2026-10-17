@@ -50,6 +50,9 @@ public:
     /// The bridge resource is being destroyed. Handles it introduced become inert.
     void on_bridge_destroyed(void* policy_bridge_resource);
     [[nodiscard]] bool has_bridge() const { return bridge_ != nullptr; }
+    /// The `zlm_policy_bridge_v1` resource of the current bridge (null without one) — its
+    /// client is the shell.
+    [[nodiscard]] void* bridge_resource() const { return bridge_; }
 
     /// Runtime deltas (compositor → shell). No-ops without a bridge.
     void emit_toplevel_created(toplevel_record& rec);

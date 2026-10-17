@@ -33,15 +33,15 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [10-protocol-dispatch.mmd](10-protocol-dispatch.mmd) | Class | libwayland-backed Wayland server seam |
 | [11-lumen-private-protocols.mmd](11-lumen-private-protocols.mmd) | Class | zlm_* DE protocols |
 | [12-window-management.mmd](12-window-management.mmd) | Class | Stacking-first + tiling plugin |
-| [13-state-machines.mmd](13-state-machines.mmd) | State | Surface, Seat, Widget, ZlmToplevel |
+| [13-state-machines.mmd](13-state-machines.mmd) | State | Surface, Seat, Widget, ZlmToplevel, Session pause/resume, Display power, Session lock |
 | [14-fluent-builder.mmd](14-fluent-builder.mmd) | Class | Fluent builder API |
 | [15-dual-gpu.mmd](15-dual-gpu.mmd) | Class | Discrete vs integrated render paths |
 | [16-security.mmd](16-security.mmd) | Component | Unix creds + optional Flatpak |
-| [17-systemd-deployment.mmd](17-systemd-deployment.mmd) | Deployment | systemd user session units |
+| [17-systemd-deployment.mmd](17-systemd-deployment.mmd) | Deployment | systemd user session units; each launched app a transient service |
 | [18-focus-sequence.mmd](18-focus-sequence.mmd) | Sequence | Stacking focus change |
 | [19-dmabuf-vulkan-class.mmd](19-dmabuf-vulkan-class.mmd) | Class | dmabuf → Vulkan import |
 | [20-dmabuf-vulkan-sequence.mmd](20-dmabuf-vulkan-sequence.mmd) | Sequence | Frame commit import path |
-| [21-shell-state-sync.mmd](21-shell-state-sync.mmd) | Sequence | Compositor → shell snapshot |
+| [21-shell-state-sync.mmd](21-shell-state-sync.mmd) | Sequence | Compositor → shell snapshot, key grabs, session lock (v5) |
 | [22-thread-model.mmd](22-thread-model.mmd) | Component | UI / render / worker threads |
 | [23-frame-handoff-sequence.mmd](23-frame-handoff-sequence.mmd) | Sequence | Immutable snapshot handoff |
 | [24-executor-class.mmd](24-executor-class.mmd) | Class | executor, strand, snapshot_buffer |
