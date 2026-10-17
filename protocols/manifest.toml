@@ -9,6 +9,12 @@ wayland_protocols_tag = "1.49"
 [wlr]
 repo = "https://gitlab.freedesktop.org/wlroots/wlr-protocols.git"
 
+# wlroots' own protocol/ directory: the input-method-v2 and virtual-keyboard-v1 that
+# shipping input methods (fcitx5, ibus) speak. Fetched to protocols/upstream/wlroots/.
+[wlroots]
+repo = "https://gitlab.freedesktop.org/wlroots/wlroots.git"
+tag = "0.20.2"
+
 # P0 — required at compositor boot
 [[upstream.protocol]]
 name = "wayland"
@@ -109,6 +115,13 @@ priority = "P1"
 module = "lx.wayland.protocols.xdg_dialog"
 
 [[upstream.protocol]]
+name = "ext-idle-notify"
+path = "staging/ext-idle-notify/ext-idle-notify-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.idle_notify"
+
+[[upstream.protocol]]
 name = "idle-inhibit"
 path = "unstable/idle-inhibit/idle-inhibit-unstable-v1.xml"
 source = "wayland-protocols"
@@ -128,13 +141,6 @@ path = "staging/ext-workspace/ext-workspace-v1.xml"
 source = "wayland-protocols"
 priority = "P1"
 module = "lx.wayland.protocols.ext_workspace"
-
-[[upstream.protocol]]
-name = "input-method-unstable-v2"
-path = "experimental/xx-input-method/xx-input-method-v2.xml"
-source = "wayland-protocols"
-priority = "P1"
-module = "lx.wayland.protocols.input_method"
 
 [[upstream.protocol]]
 name = "pointer-constraints-unstable-v1"
@@ -204,6 +210,12 @@ name = "wlr-output-management-unstable-v1"
 path = "unstable/wlr-output-management-unstable-v1.xml"
 priority = "P1"
 module = "lx.wayland.protocols.output_management"
+
+[[wlr.protocol]]
+name = "wlr-output-power-management-unstable-v1"
+path = "unstable/wlr-output-power-management-unstable-v1.xml"
+priority = "P1"
+module = "lx.wayland.protocols.output_power"
 
 # P2 — optional globals
 [[upstream.protocol]]
@@ -276,5 +288,20 @@ path = "lumen/zlm_shell_v1.xml"
 priority = "P0"
 module = "lx.wayland.protocols.lumen"
 privileged = true
+
+# zwp_input_method_v2 + zwp_virtual_keyboard_v1 (wlroots protocol/): what fcitx5 and ibus
+# speak to wlroots-family compositors. wayland-protocols' experimental xx-input-method is
+# not generated: no shipping input method speaks it (protocols/README.md).
+[[wlroots.protocol]]
+name = "input-method-unstable-v2"
+path = "input-method-unstable-v2.xml"
+priority = "P1"
+module = "lx.wayland.protocols.input_method"
+
+[[wlroots.protocol]]
+name = "virtual-keyboard-unstable-v1"
+path = "virtual-keyboard-unstable-v1.xml"
+priority = "P1"
+module = "lx.wayland.protocols.virtual_keyboard"
 
 # Codegen priority filter: P0 always; P1 when LUMEN_PROTOCOLS_P1=ON; P2 when P2=ON

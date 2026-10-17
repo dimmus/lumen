@@ -8,8 +8,14 @@
 #
 # The session ends when you log out — the panel's "Log out" button (click, then click
 # "Confirm?"), or Ctrl+Alt+Backspace, which works even without the panel — or after the
-# time limit, whichever comes first. Closing a window, the first client's included, closes
-# only that window: the session, and anything started from it, keeps running. Logging out
+# time limit, whichever comes first. Ctrl+Alt+F<n> switches to another VT and back (the
+# compositor executes it, so it works without the panel too); the session pauses while away
+# and its windows keep running. Closing a window, the first client's included, closes
+# only that window: the session, and anything started from it, keeps running. More
+# windows: the panel's Apps button or a Super tap opens the launcher, Super+Return a
+# terminal; what the launcher starts runs as its own systemd user service, not as a child of
+# this script's client or of the shell, and is told WAYLAND_DISPLAY from the shell (apps
+# still end with the session, when the compositor goes). Logging out
 # asks every window to close and then stops the compositor. The limit is a safety net: the
 # compositor owns the console while it runs, so a session whose way out broke would
 # otherwise leave no way back to the text console. Teardown stops everything with SIGTERM,
@@ -24,7 +30,17 @@
 #   --socket NAME         Wayland socket name (default lumen-0)
 #   --decorations=MODE    server (Lumen draws window frames) or client; passed to the
 #                         compositor
+#   --scale S             output scale, fractional allowed (1.25, 1.5, 2); passed to the
+#                         compositor
 #   --no-shell            do not start lumen-shell
+#   --blank-after S       lumen-shell powers the outputs off after S seconds without input
+#                         (default 600; 0 = never); any input wakes them
+#   --idle-policy=none    lumen-shell leaves blanking to an external daemon (swayidle)
+#   --lock-command CMD    lumen-shell's screen locker (an Exec line, e.g. 'swaylock -f'):
+#                         Super+L, loginctl lock-session, before sleep and the blank timeout
+#                         start it (lock first, then blank); none by default
+#   --blank-locked-after S  outputs off after S seconds without input while locked (60)
+#   --no-lock-on-blank    the blank timeout blanks without locking first
 #   --debug               LUMEN_LOG=debug for the compositor and the shell (default info)
 #   --logs DIR            log directory (default <repo>/run-desktop-logs)
 #   --join-seat-session   move the compositor into the active seat0 logind session's
@@ -49,13 +65,20 @@ LOG_LEVEL=info
 WITH_SHELL=1
 JOIN_SEAT=0
 COMP_ARGS=()
+SHELL_ARGS=()
 CLIENT=()
 while (( $# > 0 )); do
   case "$1" in
     -t) LIMIT="${2:?-t needs seconds}"; shift ;;
     --socket) SOCKET="${2:?--socket needs a name}"; shift ;;
     --decorations=server|--decorations=client) COMP_ARGS+=("$1") ;;
+    --scale) COMP_ARGS+=(--scale "${2:?--scale needs a value}"); shift ;;
     --no-shell) WITH_SHELL=0 ;;
+    --blank-after) SHELL_ARGS+=(--blank-after "${2:?--blank-after needs seconds}"); shift ;;
+    --idle-policy=shell|--idle-policy=none) SHELL_ARGS+=("$1") ;;
+    --lock-command) SHELL_ARGS+=(--lock-command "${2:?--lock-command needs a command}"); shift ;;
+    --blank-locked-after) SHELL_ARGS+=(--blank-locked-after "${2:?--blank-locked-after needs seconds}"); shift ;;
+    --no-lock-on-blank) SHELL_ARGS+=(--no-lock-on-blank) ;;
     --debug) LOG_LEVEL=debug ;;
     --logs) LOG_DIR="${2:?--logs needs a directory}"; shift ;;
     --join-seat-session) JOIN_SEAT=1 ;;
@@ -204,7 +227,7 @@ else
   export GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland SDL_VIDEODRIVER=wayland
 
   if (( WITH_SHELL )); then
-    LUMEN_LOG="$LOG_LEVEL" "$SHELL_BIN" >"$SHELL_LOG" 2>&1 &
+    LUMEN_LOG="$LOG_LEVEL" "$SHELL_BIN" "${SHELL_ARGS[@]}" >"$SHELL_LOG" 2>&1 &
     SHELL_PID=$!
     # Let the panel reserve its strip before the first window is placed, or that window
     # is placed against the whole output and sits under the panel. Bounded: a shell that

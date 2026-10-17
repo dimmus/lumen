@@ -13,6 +13,13 @@ void on_signal(int) {
     if (g_compositor)
         g_compositor->request_stop();
 }
+
+// Debug aid: SIGUSR1 writes the next (fully repainted) frame as a PPM (see
+// compositor::request_screenshot).
+void on_screenshot(int) {
+    if (g_compositor)
+        g_compositor->request_screenshot();
+}
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -43,6 +50,16 @@ int main(int argc, char* argv[]) {
             }
             cfg.ping_timeout_ms = static_cast<unsigned>(ms);
             ++i;
+        } else if (std::strcmp(arg, "--scale") == 0) {
+            // Output scale, fractional allowed (1.25, 1.5, 2): rounded to n/120.
+            char* end = nullptr;
+            const double scale = i + 1 < argc ? std::strtod(argv[i + 1], &end) : 0.0;
+            if (!(scale >= 0.25 && scale <= 8.0) || !end || *end != '\0') {
+                std::fprintf(stderr, "lumen-compositor: --scale S (0.25 .. 8, e.g. 1.25)\n");
+                return 2;
+            }
+            cfg.output_scale = scale;
+            ++i;
         } else if (std::strcmp(arg, "--shell") == 0) {
             // The one binary zlm_shell_v1 binds are accepted from (default: lumen-shell
             // next to this executable).
@@ -63,6 +80,11 @@ int main(int argc, char* argv[]) {
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, nullptr);
     sigaction(SIGTERM, &sa, nullptr);
+    struct sigaction shot {};
+    shot.sa_handler = on_screenshot;
+    sigemptyset(&shot.sa_mask);
+    shot.sa_flags = SA_RESTART;
+    sigaction(SIGUSR1, &shot, nullptr);
 
     if (auto started = comp.start(); !started)
         return 1;

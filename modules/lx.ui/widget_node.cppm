@@ -16,7 +16,8 @@ public:
 
     lx::scene::node_kind kind() const override { return lx::scene::node_kind::widget; }
     void sync_bounds();
-    void emit_draws(lx::scene::draw_list& out) const override;
+    using lx::scene::scene_node::emit_draws;
+    void emit_draws(lx::scene::draw_list& out, const lx::scene::emit_context& ctx) const override;
 
     [[nodiscard]] widget& ui_widget() const;
 
@@ -34,7 +35,8 @@ void lx::ui::widget_node::sync_bounds() {
     mark_dirty(widget_->bounds());
 }
 
-void lx::ui::widget_node::emit_draws(lx::scene::draw_list& out) const {
+void lx::ui::widget_node::emit_draws(lx::scene::draw_list& out,
+                                     const lx::scene::emit_context&) const {
     if (!widget_ || !is_visible()) return;
     lx::gfx::render_pass pass{};
     const_cast<widget*>(widget_)->paint(pass);

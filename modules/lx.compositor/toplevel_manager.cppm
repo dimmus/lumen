@@ -17,6 +17,9 @@ enum toplevel_state_bit : unsigned {
     tl_resizing = 1u << 1,
     tl_maximized = 1u << 2,
     tl_fullscreen = 1u << 3,
+    /// The session is paused (VT switched away): nothing is repainted. Sent as
+    /// XDG_TOPLEVEL_STATE_SUSPENDED to xdg_wm_base v6 clients.
+    tl_suspended = 1u << 4,
 };
 
 /// Same values as `xdg_toplevel.resize_edge` and `zlm_policy_bridge_v1.resize_edge`.
@@ -92,8 +95,8 @@ struct toplevel_record {
     lx::rect2i geometry{};
     /// Committed window-geometry origin inside the surface (CSD shadow width, typically).
     lx::point2i geometry_offset{};
-    /// Committed surface extents.
-    lx::size2i buffer_size{};
+    /// Committed surface extents (logical).
+    lx::size2i surface_size{};
 
     // ── double-buffered xdg state (pending → current on wl_surface.commit) ──
     lx::rect2i window_geometry_pending{};

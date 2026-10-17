@@ -45,10 +45,6 @@ namespace lx::compositor::p0 {
 namespace {
 
 constexpr const char* k_category = "compositor.output";
-/// Lumen sizes nodes by buffer size and ignores wl_surface.set_buffer_scale, so a client told
-/// to render at 2x would come out twice as large. Until surface_manager honours buffer scale,
-/// the preferred scale never goes above this (every output is at scale 1 today anyway).
-constexpr int k_max_preferred_scale = 1;
 
 /// One bound wl_output. A slot of the output manager, by index (outputs never move slot
 /// while connected).
@@ -113,8 +109,10 @@ int global_slot() {
     return om->slot_of(om->nth(0));
 }
 
-int ceil_scale(float scale) {
-    const int c = static_cast<int>(std::ceil(scale - 1e-4f));
+/// wl_output.scale: the integer a client without fractional-scale renders at, the ceiling
+/// (wlroots, KWin) — downscaled 2x content is sharper than upscaled 1x.
+int ceil_scale(double scale) {
+    const int c = static_cast<int>(std::ceil(scale));
     return c < 1 ? 1 : c;
 }
 
@@ -123,11 +121,12 @@ int ceil_scale(float scale) {
 void send_output_state(wl_resource* res, const lx::compositor::output_state& o,
                        bool with_identity) {
     const int version = wl_resource_get_version(res);
-    wl_output_send_geometry(res, o.geometry.x, o.geometry.y, o.phys_w_mm, o.phys_h_mm,
+    // geometry's x, y are the position in the global (logical) space; mode is in pixels.
+    wl_output_send_geometry(res, o.position.x, o.position.y, o.phys_w_mm, o.phys_h_mm,
                             WL_OUTPUT_SUBPIXEL_UNKNOWN, "Lumen", o.name,
                             static_cast<int32_t>(o.transform));
     wl_output_send_mode(res, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
-                        o.geometry.width, o.geometry.height,
+                        o.mode.width, o.mode.height,
                         static_cast<int32_t>(o.refresh_mhz));
     if (version >= WL_OUTPUT_SCALE_SINCE_VERSION)
         wl_output_send_scale(res, ceil_scale(o.scale));
@@ -143,12 +142,9 @@ void send_output_done(wl_resource* res) {
 }
 
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
-/// The logical rect: the mode divided by the scale (they coincide at scale 1).
-lx::rect2i logical_rect(const lx::compositor::output_state& o) {
-    const float s = o.scale > 0.f ? o.scale : 1.f;
-    return {o.geometry.x, o.geometry.y, static_cast<int>(std::lround(o.geometry.width / s)),
-            static_cast<int>(std::lround(o.geometry.height / s))};
-}
+/// The logical rect: the mode divided by the scale, rounded (wlroots' effective
+/// resolution); they coincide at scale 1.
+lx::rect2i logical_rect(const lx::compositor::output_state& o) { return o.logical_rect(); }
 
 /// logical_position, logical_size, and with `with_identity` name and description (v2+);
 /// then zxdg_output_v1.done for v1–2 (v3 objects are closed by wl_output.done).
@@ -206,11 +202,17 @@ void update_membership(surface_obj* s, std::uint32_t mask, int primary) {
     // Recomputed only while the surface is on an output: one that left them all keeps
     // rendering for where it was (wlroots does the same).
     auto* om = outputs();
-    if (!om || mask == 0 || wl_resource_get_version(s->resource) < 6)
+    if (!om || mask == 0)
         return;
-    int scale = lx::compositor::preferred_buffer_scale(*om, mask);
-    if (scale > k_max_preferred_scale)
-        scale = k_max_preferred_scale;
+    if (wl_resource_get_version(s->resource) < 6) {
+        fractional_scale_update(s, lx::compositor::preferred_scale_120(*om, mask));
+        return;
+    }
+    // wp_fractional_scale_v1 first (a client with both uses the fractional value and
+    // ignores the integer one), then the wl_surface v6 events.
+    if (!s->destroying)
+        fractional_scale_update(s, lx::compositor::preferred_scale_120(*om, mask));
+    const int scale = lx::compositor::preferred_buffer_scale(*om, mask);
     const unsigned transform = lx::compositor::preferred_buffer_transform(*om, primary);
     bool changed = false;
 #if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
@@ -345,6 +347,43 @@ const struct zxdg_output_manager_v1_interface xdg_output_manager_impl = {
 
 void output_node_rect(void*, lx::surface_id surface, lx::rect2i rect) {
     membership_from_rect(surface_by_id(surface), rect);
+    // An empty rect is the tree dropping the node (unmapped): what the surface had in
+    // flight will not be shown, and its presentation feedback says so.
+    if (rect.width <= 0 || rect.height <= 0)
+        presentation_surface_unmapped(surface);
+    // The text input's surface moved: input-method popups follow it.
+    text_input_surface_moved(surface);
+}
+
+std::uint32_t expected_scale_120(const surface_obj* s) {
+    auto* om = outputs();
+    if (!om)
+        return 120;
+    if (s && s->outputs)
+        return lx::compositor::preferred_scale_120(*om, s->outputs);
+    // A subsurface shows where its parent does.
+    if (s && g_p0_ctx && g_p0_ctx->tree) {
+        const surface_obj* p = surface_by_id(g_p0_ctx->tree->parent_of(s->id));
+        if (p && p->outputs)
+            return lx::compositor::preferred_scale_120(*om, p->outputs);
+    }
+    // Toplevels and layer surfaces map on output 0, the only output until D5; popups on
+    // their parent's, which is output 0 as well.
+    const int slot = global_slot();
+    return slot >= 0 ? lx::compositor::preferred_scale_120(*om, 1u << slot) : 120u;
+}
+
+void for_each_output_resource(wl_client* client, unsigned slot, void (*fn)(wl_resource*, void*),
+                              void* user) {
+    for (output_res* r = output_resources; r; r = r->next)
+        if (r->client == client && r->slot == slot && fn)
+            fn(r->resource, user);
+}
+
+int output_resource_slot(wl_resource* output) {
+    const output_res* o = output_from(output);
+    auto* om = outputs();
+    return o && om && om->slot_live(o->slot) ? static_cast<int>(o->slot) : -1;
 }
 
 void install_outputs(p0_protocol_context& ctx) {
@@ -462,6 +501,12 @@ void outputs_changed() {
                 wl_resource_get_client(s.resource) == r->client)
                 wl_surface_send_enter(s.resource, r->resource);
     }
+    // 3. Power controls of a wl_output that no longer stands for an output are `failed`.
+    output_power_outputs_changed();
+    // 4. Lock surfaces follow their output's size and origin (a new configure).
+    session_lock_outputs_changed();
+    // 5. Input-method popups are placed within the new output bounds.
+    text_input_outputs_changed();
 }
 
 } // namespace

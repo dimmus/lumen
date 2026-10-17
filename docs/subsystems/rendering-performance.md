@@ -155,6 +155,7 @@ not optional.
 | Upload hazard | Each texture keeps **two** GL names and alternates. Uploading into the texture the previous frame is still sampling stalls the driver — measured 48 ms vs 22 ms per frame on SVGA3D. Each name tracks its own storage size: a client resizing every frame (interactive resize) alternates sizes across the names, and a sub-image upload into storage of another size is a GL error that leaves stale pixels on screen |
 | Damage | `glScissor` over the damage rect, unflipped: the target is a framebuffer object over the scanout buffer, where window y = 0 is memory row 0, the top line KMS scans (GL's bottom-left origin applies only to window-system framebuffers) |
 | Blending | `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` — sources are premultiplied |
+| Sampling | The source box (float, wp_viewport) and the buffer transform as an affine basis in three uniforms (`gfx::source_basis_for`, shared with Vulkan and CPU); UVs `highp` where the fragment stage has it (mediump cannot address texels past ~2048); `GL_LINEAR` throughout — a 1:1 draw on whole pixels samples texel centres exactly; a half-texel clamp keeps crops from bleeding |
 | GPU sync | `EGL_ANDROID_native_fence_sync` → sync_file → `atomic_commit_request::in_fence_fd`; `glFinish` only as fallback |
 
 **Modules:** `lx.gfx.gl_renderer` — `egl_device`, `gl_scanout_target`, `gl_compositor`
@@ -167,9 +168,9 @@ actually failed.
 | Property | Behavior |
 |----------|----------|
 | Occlusion cull | Topmost opaque draw covering the damage rect skips the clear **and** every draw beneath it |
-| Fast path | Unscaled + opaque + compatible format → row `memcpy` |
+| Fast path | Identity (whole-texel source the size of dst, normal transform) + opaque + compatible format → row `memcpy` |
 | Conversion | Fused into the blit (`copy` / `swap_rb`); no separate pass |
-| Scaling | 16.16 fixed-point nearest, one add per pixel step |
+| Scaling, crop, transform | Every non-identity draw inverse-maps pixel centres through the shared source basis, 16.16 fixed point, two adds per pixel: nearest for an integer magnification of whole texels (exact), bilinear otherwise, taps clamped to the source box |
 | Damage | Composite is clipped to `snapshot.damage()` |
 | Parallelism | `row_band_pool` — disjoint row bands, render thread participates |
 | Write-combining | Opaque draws never read the destination back; blending does, and is slow on a scanout mapping |
@@ -425,6 +426,57 @@ free-running 60 Hz tick, not compositing. Both are gone: the loop waits on its f
 frame clock stops when idle, so an idle desktop (shell and a terminal) now costs no
 measurable CPU (0 ticks per 5 s, 5 wakeups/s).
 
+### Output scale: projection, edge rounding, pixel exactness
+
+The scene is laid out in logical coordinates; `scene::output_projection` (origin, scale
+n/120) is applied only when draws are emitted and damage is noted, so snapshots carry
+output pixels and the render thread does no scale arithmetic (ADR 007, D1). Costs: a few
+multiplies per draw in `project_node`, none per pixel; nothing allocates.
+
+- **Edge rounding relative to the window** (D2): a window's tree container is an anchor; its
+  root lands on `round((root − origin)·s)` and every node (subsurfaces, the server-side
+  frame) rounds both edges relative to it. A fractional-scale client renders `round(w·s)`
+  pixels, which is exactly the root's projected width wherever it sits: **1:1, no
+  resampling**. Measured, not asserted: `test_viewport_geometry` checks the property for
+  every root offset 0..119 and width 1..2000 at six scales; `test_gl_composite` draws a
+  1949-pixel one-pixel checker 1:1 and reads it back bit for bit; `scripts/scale-smoke.sh`
+  screenshots the live frame at 1.25, 1.5, 1.75 and 2 and finds every pixel of a probe's
+  checker in place (0 pixels off, foot and GTK 4 buffers `round(size·s)`).
+- **Damage** is projected by flooring the start and ceiling the end, widened by one pixel at
+  a non-integer scale (edge rounding moves an edge by up to half a pixel either way); a
+  resampled surface's content damage is widened by half a source texel in output pixels
+  (`surface_manager::resample_margin`, wlroots' buffer-bleed rule). Whole-node damage (map,
+  move, resize) needs no margin: a draw never paints outside its destination.
+- **Buffer damage stays partial at any scale**: `damage` and `damage_buffer` are converted
+  into each other's space at apply (`:viewport`), so the shm upload copies the buffer
+  region that changed, not the whole buffer, for scaled, cropped and rotated clients.
+- **Compositor-drawn pixels**: titles rasterized at `10 pt·s` and drawn 1:1, xcursor themes
+  loaded at `round(24·s)`, client cursor images resampled once per change — never per frame.
+
+### Occlusion culling and frame-callback throttling (the visibility pass)
+
+`scene_graph::commit_frame` runs one top-down pass over the draws of each published frame
+(`scene::mark_occlusion`, ADR 007 P3), in paint order before batching:
+
+- Up to **eight opaque rects** are kept, seeded from draws that cover their destination with
+  full alpha: `blend_mode::opaque` (a format without alpha or an opaque region over the whole
+  buffer), opacity and tint alpha 1, translation only. When more are found the eight largest
+  stay. A draw inside one of them, or outside the output, is marked `occluded`; GL, Vulkan
+  and CPU skip it (`draws_culled`). The pixels are identical, so damage and buffer age are
+  untouched — what is saved is the GPU fill of windows under a maximized one.
+- Cost: O(draws × 8) compares per published frame, a parallel `scene_node*`/`bool` scratch
+  array of `k_max_draw_commands` in the scene graph (no allocation), one virtual call per
+  on-screen node. Conservative by construction: overlaps the eight rects cannot express count
+  as visible.
+- Each surface node with a draw on screen records the frame; `surface_node::visible_in(f)`
+  is an O(1) compare. **Presentation feedback** samples by it (a covered surface's update is
+  not "shown"), and **frame callbacks** are paced by it: surfaces on screen in the last
+  published frame are answered at the flip, the others at most every 995 ms (niri's
+  `FRAME_CALLBACK_THROTTLE`). Those throttled callbacks do not keep the frame clock running;
+  the 1 s housekeeping timer answers them while it is stopped. Measured on SVGA3D: a probe
+  covered by a maximized opaque window drops from ~30 commits/s to one per 1.00 s (app-smoke
+  P3) and is back at the display rate the frame it is uncovered.
+
 ### Cursor: hardware plane, cursor-only commits, software fallback
 
 The pointer is a KMS cursor plane (`lx.drm:cursor`), so moving it costs plane properties on
@@ -546,6 +598,17 @@ and costs nothing while idle.)
 **Between bursts the clock stops** — see [threading.md](threading.md). A restart is aimed
 at the next deadline extrapolated from the last flip, so it stays on the display's phase.
 
+**While the output is powered off** (zwlr_output_power_v1, ADR 007 I4) the display gate is
+up exactly as for a paused session: no composite, no commit, the frame clock stopped and the
+1 Hz paused tick answering frame callbacks. The CRTC goes off with one blocking ACTIVE=0
+commit (the cursor plane with it); coming back is the resume procedure — full damage and one
+full modeset with ACTIVE=1, then partial damage again. Measured on vmwgfx (app-smoke K3, a
+Perfetto trace of `lumen-probe power --set off` and an injected key): 0 `kms.commit` and 0
+`composite` spans over 3.1 s dark, one `kms.power_off`, 3 `tick_ui` and 4 `tick_render` (the
+paused tick and the posted task) — 2.0 thread wakeups a second for the whole compositor; the
+first frame after the wake is one rect of the full 1914x924. The idle timer adds at most one
+wakeup per notification timeout, never one per input event (`:idle`'s lazy deadline).
+
 ```
 flip completes ──▶ card fd readable (epoll) ──▶ presentation_flip_handler
                      ├─ present_completed_ = true   (frame callbacks may fire;
@@ -560,19 +623,34 @@ output cannot wedge clients.
 
 ## 7. DRM page-flip + presentation feedback
 
-**Current (P0 stub):** timer-driven vsync on UI thread.
+The frame clock is phase-locked to page flips (§6.1); every flip also resolves
+`wp_presentation` feedback:
 
-**Scaffold (R3):**
-
-1. `lx.drm.atomic` — `kms_atomic_commit`, `kms_damage_region`, `page_flip_handler`
-2. `presentation_tracker::bind_page_flip(kms_atomic)` — wires flip → feedback
-3. `on_page_flip(page_flip_event)` — populates `kms_damage`, `frame_latency_ms`
-4. `wp_presentation` — `on_feedback()` (P0 Wayland wire)
+1. `lx.drm.atomic` — `kms_atomic_commit` keeps the in-flight commit's `user_tag` (the
+   composited frame index) and whether it carried a frame, and reports them in
+   `page_flip_event` with the kernel's `sequence`, CLOCK_MONOTONIC timestamp, CRTC and
+   whether the driver timestamps vblanks (`vblank_timestamp`; probed once with
+   `drmCrtcGetSequence`). A blocking modeset's completion is reported as a synthetic flip
+   (`hw = false`, sequence 0).
+2. `presentation_tracker::bind_page_flip(kms_atomic)` — wires flip → `presentation_feedback`
+   (tag, content, hw, vblank clock, seq) → the compositor's flip handler (UI).
+3. The flip handler calls `presentation_flipped(frame = tag, {time, refresh, seq, flags})`;
+   the table presents every update sampled at or before that frame whose surface that very
+   frame shows (each publish records a sampled surface's visibility in a 64-frame bitmask;
+   render composites only the newest snapshot, so the sampling frame may never have been
+   shown) and discards the ones a newer update replaced in it; one hidden in the flipped
+   frame waits for a flip that shows it or for its supersession. Two lists (queued, sampled) of in-flight slots are walked, a
+   handful per frame; nothing allocates and nothing logs above debug.
 
 ```cpp
 presentation.bind_page_flip(compositor.kms_atomic());
-// on flip: presentation.on_page_flip(event) → handler callback
+// on flip: presentation.on_page_flip(event) → handler → presentation_flipped(tag, info)
 ```
+
+Measured on vmwgfx (no vblank counter, flags `vsync | hw_completion`, seq 0): 180/180 frames
+presented with strictly increasing timestamps 34 ms apart (the SVGA3D host's flip rate),
+commit → presented 21 ms on average; weston-presentation-shm reports `[s_e_]`, mpv binds
+`wp_presentation` v2 and paces by it.
 
 See [../uml/29-present-feedback-sequence.mmd](../uml/29-present-feedback-sequence.mmd), [../uml/32-kms-atomic-damage.mmd](../uml/32-kms-atomic-damage.mmd).
 

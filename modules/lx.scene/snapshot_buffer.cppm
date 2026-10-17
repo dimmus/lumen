@@ -18,7 +18,10 @@ export namespace lx::scene {
 
 struct draw_command {
     lx::texture_id texture{};
-    lx::rect2i src{};
+    /// Source box in buffer pixels, before `buffer_xform` (wl_surface + wp_viewport). Empty
+    /// means the whole texture. Fractional edges are a viewport crop.
+    lx::rect2f src{};
+    /// Output pixels (the scene's projection already applied).
     lx::rect2i dst{};
     lx::transform2d transform = lx::transform2d::identity();
     lx::rect2i clip{};
@@ -30,6 +33,12 @@ struct draw_command {
     lx::buffer_transform buffer_xform = lx::buffer_transform::normal;
     float scale = 1.f;
     lx::draw_sort_key sort_key{};
+    /// `dst` differs from the (transformed) source size: the draw resamples. A hint for
+    /// filtering; a 1:1 draw on whole pixels samples texel centres exactly.
+    bool scaled = false;
+    /// Fully covered by an opaque draw above it, or entirely off the output: every backend
+    /// skips it (identical pixels). Set by the scene's visibility pass (`mark_occlusion`).
+    bool occluded = false;
 };
 
 inline constexpr unsigned k_initial_draw_commands = 256;
@@ -80,11 +89,14 @@ public:
     [[nodiscard]] const lx::gfx::damage_region& damage_rects() const { return damage_; }
     [[nodiscard]] unsigned frame_index() const { return frame_index_; }
     [[nodiscard]] bool dropped() const { return dropped_; }
+    /// What shows where no draw does: black, or the session lock's solid colour.
+    [[nodiscard]] lx::color clear_color() const { return clear_; }
 
 private:
     friend class snapshot_buffer;
     draw_list draws_{};
     lx::gfx::damage_region damage_{};
+    lx::color clear_ = lx::color::rgb(0.f, 0.f, 0.f);
     unsigned frame_index_ = 0;
     unsigned slot_ = 0;
     bool dropped_ = false;
@@ -169,7 +181,8 @@ public:
     /// over an unconsumed snapshot therefore carries that snapshot's damage forward into
     /// this one. The race with a concurrent `acquire` can only over-report damage.
     [[nodiscard]] bool publish(write_lease& lease, const lx::gfx::damage_region& damage,
-                               unsigned frame_index);
+                               unsigned frame_index,
+                               lx::color clear = lx::color::rgb(0.f, 0.f, 0.f));
 
     [[nodiscard]] const immutable_frame_snapshot& acquire();
     void release(const immutable_frame_snapshot& snapshot);
@@ -415,7 +428,7 @@ lx::scene::write_lease lx::scene::snapshot_buffer::begin_frame() {
 }
 
 bool lx::scene::snapshot_buffer::publish(write_lease& lease, const lx::gfx::damage_region& damage,
-                                         unsigned frame_index) {
+                                         unsigned frame_index, lx::color clear) {
     if (!lease.valid() || lease.owner_ != this)
         return false;
 
@@ -432,6 +445,7 @@ bool lx::scene::snapshot_buffer::publish(write_lease& lease, const lx::gfx::dama
     if (prev != slot && !consumed_[prev].load(std::memory_order_acquire))
         buffers_[slot].damage_.add_region(buffers_[prev].damage_);
     buffers_[slot].frame_index_ = frame_index;
+    buffers_[slot].clear_ = clear;
     buffers_[slot].dropped_ = false;
     consumed_[slot].store(false, std::memory_order_release);
 

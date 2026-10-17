@@ -6,6 +6,7 @@
 #include <vector>
 
 import lx.foundation;
+import lx.gfx;
 import lx.scene;
 import lx.runtime;
 
@@ -323,6 +324,135 @@ LUMEN_TEST(snapshot_tsan_stress) {
     publisher.join();
     LUMEN_CHECK(reader_tears.load() == 0);
     LUMEN_CHECK(content_mismatches.load() == 0);
+}
+
+// ── The visibility pass (`mark_occlusion`, run by `scene_graph::commit_frame`) ──
+
+namespace {
+
+lx::scene::draw_command opaque_draw(lx::rect2i dst) {
+    lx::scene::draw_command d{};
+    d.dst = dst;
+    d.transform = lx::transform2d::translate(dst.x, dst.y);
+    d.blend = lx::blend_mode::opaque;
+    return d;
+}
+
+lx::scene::draw_command translucent_draw(lx::rect2i dst) {
+    lx::scene::draw_command d = opaque_draw(dst);
+    d.blend = lx::blend_mode::premultiplied;
+    return d;
+}
+
+} // namespace
+
+LUMEN_TEST(occlusion_opaque_cover_hides_what_is_below) {
+    // Paint order: bottom first.
+    lx::scene::draw_command d[3] = {opaque_draw({10, 10, 50, 50}),      // fully covered
+                                    opaque_draw({100, 100, 50, 50}),    // partly covered
+                                    opaque_draw({0, 0, 120, 120})};     // on top
+    bool shown[3]{};
+    const unsigned marked = lx::scene::mark_occlusion(d, 3, {0, 0, 640, 480}, shown);
+    LUMEN_CHECK(marked == 1);
+    LUMEN_CHECK(d[0].occluded && !shown[0]);
+    LUMEN_CHECK(!d[1].occluded && shown[1]);
+    LUMEN_CHECK(!d[2].occluded && shown[2]);
+}
+
+LUMEN_TEST(occlusion_translucent_never_occludes) {
+    lx::scene::draw_command d[4] = {opaque_draw({10, 10, 50, 50}), translucent_draw({0, 0, 200, 200}),
+                                    opaque_draw({300, 0, 50, 50}), opaque_draw({0, 0, 400, 400})};
+    d[3].opacity = 0.5f; // a fading window
+    lx::scene::draw_command tinted = opaque_draw({300, 0, 100, 100});
+    tinted.tint = lx::color::rgb(1.f, 1.f, 1.f, 0.9f);
+    lx::scene::draw_command scaled = opaque_draw({300, 0, 100, 100});
+    scaled.transform = lx::transform2d::scale(2.f, 2.f);
+    LUMEN_CHECK(lx::scene::mark_occlusion(d, 4, {0, 0, 640, 480}, nullptr) == 0);
+    lx::scene::draw_command e[2] = {opaque_draw({310, 10, 10, 10}), tinted};
+    LUMEN_CHECK(lx::scene::mark_occlusion(e, 2, {0, 0, 640, 480}, nullptr) == 0);
+    lx::scene::draw_command f[2] = {opaque_draw({310, 10, 10, 10}), scaled};
+    LUMEN_CHECK(lx::scene::mark_occlusion(f, 2, {0, 0, 640, 480}, nullptr) == 0);
+}
+
+LUMEN_TEST(occlusion_off_output_and_clip) {
+    lx::scene::draw_command d[3] = {opaque_draw({700, 10, 50, 50}),   // off the output
+                                    opaque_draw({10, 10, 50, 50}),    // under the clipped top
+                                    opaque_draw({0, 0, 200, 200})};
+    // The top draw is clipped to its left half: it covers x < 30 only.
+    d[2].clip = {0, 0, 30, 200};
+    bool shown[3]{};
+    LUMEN_CHECK(lx::scene::mark_occlusion(d, 3, {0, 0, 640, 480}, shown) == 1);
+    LUMEN_CHECK(d[0].occluded && !shown[0]);
+    LUMEN_CHECK(!d[1].occluded && shown[1]);
+    // The part of a draw past the output does not count against covering it.
+    lx::scene::draw_command e[2] = {opaque_draw({600, 400, 80, 80}), opaque_draw({590, 390, 50, 90})};
+    LUMEN_CHECK(lx::scene::mark_occlusion(e, 2, {0, 0, 640, 480}, nullptr) == 1);
+    LUMEN_CHECK(e[0].occluded);
+    // Unbounded (no output size): nothing is off-screen.
+    lx::scene::draw_command g[1] = {opaque_draw({5000, 5000, 10, 10})};
+    LUMEN_CHECK(lx::scene::mark_occlusion(g, 1, {}, nullptr) == 0);
+}
+
+LUMEN_TEST(occlusion_keeps_the_eight_largest_occluders) {
+    // Paint order: the target, a small cover of it, then eight large disjoint opaque draws.
+    // Walking top-down, the eight large ones fill the set first; the small cover is smaller
+    // than all of them and is not kept, so the target counts as visible (conservative).
+    lx::scene::draw_command d[10]{};
+    d[0] = opaque_draw({1000, 1000, 10, 10});
+    d[1] = opaque_draw({995, 995, 20, 20});
+    for (int i = 0; i < 8; ++i)
+        d[2 + i] = opaque_draw({i * 110, 0, 100, 100});
+    LUMEN_CHECK(lx::scene::mark_occlusion(d, 10, {}, nullptr) == 0);
+    LUMEN_CHECK(!d[0].occluded);
+    // A cover larger than the smallest kept one replaces it, and hides the target.
+    d[1] = opaque_draw({900, 900, 200, 200});
+    LUMEN_CHECK(lx::scene::mark_occlusion(d, 10, {}, nullptr) == 1);
+    LUMEN_CHECK(d[0].occluded);
+}
+
+LUMEN_TEST(occlusion_commit_frame_marks_surface_visibility) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    lx::scene::scene_graph scene{};
+    scene.set_projection({{0, 0}, 1.0, {640, 480}});
+    lx::gfx::imported_image img{};
+    img.width = 100;
+    img.height = 100;
+    lx::scene::surface_node below{lx::surface_id{1}};
+    img.image_id = 11;
+    below.attach(img);
+    below.set_bounds({0, 0, 100, 100});
+    below.set_transform({20, 20});
+    below.set_opaque(true);
+    lx::scene::surface_node above{lx::surface_id{2}};
+    img.image_id = 12;
+    above.attach(img);
+    above.set_bounds({0, 0, 100, 100});
+    above.set_transform({20, 20});
+    above.set_opaque(true);
+    lx::scene::surface_node away{lx::surface_id{3}};
+    img.image_id = 13;
+    away.attach(img);
+    away.set_bounds({0, 0, 100, 100});
+    away.set_transform({900, 20}); // off the 640-wide output
+    LUMEN_CHECK(scene.root().add(&below) && scene.root().add(&above) && scene.root().add(&away));
+    LUMEN_CHECK(scene.commit_frame(5));
+    LUMEN_CHECK(above.visible_in(5) && !below.visible_in(5) && !away.visible_in(5));
+    LUMEN_CHECK(scene.last_culled() == 2);
+    // The top one moves aside: the one below is on screen in the next frame.
+    above.set_transform({300, 20});
+    LUMEN_CHECK(scene.commit_frame(6));
+    LUMEN_CHECK(above.visible_in(6) && below.visible_in(6) && !above.visible_in(5));
+    lx::runtime::set_current_affinity(lx::runtime::affinity::render);
+    const auto& snap = scene.acquire_render_snapshot();
+    unsigned occluded = 0;
+    for (unsigned i = 0; i < snap.draws().size(); ++i)
+        occluded += snap.draws().data()[i].occluded ? 1u : 0u;
+    LUMEN_CHECK(snap.frame_index() == 6 && occluded == 1);
+    scene.release_render_frame(snap);
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    (void)scene.root().remove(&below);
+    (void)scene.root().remove(&above);
+    (void)scene.root().remove(&away);
 }
 
 int main(int argc, char** argv) {

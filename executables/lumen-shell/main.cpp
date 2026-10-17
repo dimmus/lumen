@@ -4,22 +4,61 @@
 
 import lx.shell;
 
-// lumen-shell [--display NAME]
+// lumen-shell [--display NAME] [--idle-policy shell|none] [--blank-after S]
+//             [--blank-locked-after S] [--lock-command CMD] [--[no-]lock-on-blank]
 //
-// The desktop shell: the top panel and its task list. Started after lumen-compositor (the
+// The desktop shell: the top panel and its task list, the launcher, and the default idle
+// and lock policy (outputs off after --blank-after seconds without input, 600 by default; 0
+// never; --idle-policy none leaves it to an external daemon; with --lock-command, Super+L,
+// logind's Lock, before-sleep and the blank timeout start that locker). Started after
+// lumen-compositor (the
 // systemd unit orders it), it binds zlm_shell_v1 — which the compositor accepts only from
 // the shell binary it was configured with — and exits 1 when the compositor refuses it or
 // goes away, so the unit restarts it.
 int main(int argc, char* argv[]) {
     lx::shell::shell_config cfg{};
     for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--display") == 0 && i + 1 < argc) {
+        const char* a = argv[i];
+        if (std::strcmp(a, "--display") == 0 && i + 1 < argc) {
             cfg.display = argv[++i];
-        } else if (std::strcmp(argv[i], "-h") == 0 || std::strcmp(argv[i], "--help") == 0) {
-            std::printf("usage: lumen-shell [--display NAME]   (default: $WAYLAND_DISPLAY)\n");
+        } else if ((std::strcmp(a, "--idle-policy") == 0 && i + 1 < argc &&
+                    lx::shell::parse_idle_policy(argv[++i], cfg.idle.enabled)) ||
+                   (std::strncmp(a, "--idle-policy=", 14) == 0 &&
+                    lx::shell::parse_idle_policy(a + 14, cfg.idle.enabled))) {
+        } else if ((std::strcmp(a, "--blank-after") == 0 && i + 1 < argc &&
+                    lx::shell::parse_idle_seconds(argv[++i], cfg.idle.blank_after_s)) ||
+                   (std::strncmp(a, "--blank-after=", 14) == 0 &&
+                    lx::shell::parse_idle_seconds(a + 14, cfg.idle.blank_after_s))) {
+        } else if ((std::strcmp(a, "--blank-locked-after") == 0 && i + 1 < argc &&
+                    lx::shell::parse_idle_seconds(argv[++i], cfg.idle.blank_locked_after_s)) ||
+                   (std::strncmp(a, "--blank-locked-after=", 21) == 0 &&
+                    lx::shell::parse_idle_seconds(a + 21, cfg.idle.blank_locked_after_s))) {
+        } else if (std::strcmp(a, "--lock-command") == 0 && i + 1 < argc) {
+            cfg.idle.lock_command = argv[++i];
+        } else if (std::strncmp(a, "--lock-command=", 15) == 0) {
+            cfg.idle.lock_command = a + 15;
+        } else if (std::strcmp(a, "--lock-on-blank") == 0) {
+            cfg.idle.lock_on_blank = true;
+        } else if (std::strcmp(a, "--no-lock-on-blank") == 0) {
+            cfg.idle.lock_on_blank = false;
+        } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
+            std::printf(
+                "usage: lumen-shell [--display NAME] [--idle-policy shell|none] [--blank-after S]\n"
+                "                   [--blank-locked-after S] [--lock-command CMD]\n"
+                "                   [--lock-on-blank | --no-lock-on-blank]\n"
+                "  --display NAME         Wayland display (default: $WAYLAND_DISPLAY)\n"
+                "  --idle-policy MODE     shell: blank the outputs after --blank-after seconds\n"
+                "                         without input (idle inhibitors obeyed); none: leave it\n"
+                "                         to an external daemon such as swayidle + wlopm\n"
+                "  --blank-after S        seconds (default 600; 0 = never)\n"
+                "  --blank-locked-after S the same while the session is locked (default 60)\n"
+                "  --lock-command CMD     the screen locker, an Exec line (e.g. 'swaylock -f');\n"
+                "                         started by Super+L, loginctl lock-session, before\n"
+                "                         sleep, and again if it exits while locked\n"
+                "  --no-lock-on-blank     blank without locking first (default: lock, then blank)\n");
             return 0;
         } else {
-            std::fprintf(stderr, "lumen-shell: unknown argument '%s' (see --help)\n", argv[i]);
+            std::fprintf(stderr, "lumen-shell: bad or unknown argument '%s' (see --help)\n", a);
             return 2;
         }
     }

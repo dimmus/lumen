@@ -15,11 +15,12 @@ using lx::compositor::preferred_buffer_transform;
 using lx::compositor::primary_output_for_rect;
 
 namespace {
-/// Three outputs in a row: 1920x1080 at scale 1, 1280x1024 at 1.5, 2560x1440 at 2.
+/// Three outputs in a row, laid out in logical units: 1920x1080 at scale 1 (logical
+/// 1920x1080 at 0), 1280x1024 at 1.5 (853x683 at 1920), 2560x1440 at 2 (1280x720 at 2773).
 void three(output_manager& m) {
-    (void)m.add_virtual("A-1", {0, 0, 1920, 1080}, 60000, 1.f);
-    (void)m.add_virtual("B-1", {1920, 0, 1280, 1024}, 75000, 1.5f);
-    (void)m.add_virtual("C-1", {3200, 0, 2560, 1440}, 144000, 2.f);
+    (void)m.add_virtual("A-1", {0, 0, 1920, 1080}, 60000, 1.0);
+    (void)m.add_virtual("B-1", {1920, 0, 1280, 1024}, 75000, 1.5);
+    (void)m.add_virtual("C-1", {2773, 0, 2560, 1440}, 144000, 2.0);
 }
 } // namespace
 
@@ -43,8 +44,9 @@ LUMEN_TEST(membership_two_and_three_outputs) {
     LUMEN_CHECK(m.count() == 3);
     LUMEN_CHECK(outputs_for_rect(m, {1800, 100, 200, 100}) == 0b011u); // straddles A|B
     LUMEN_CHECK(outputs_for_rect(m, {1900, 0, 1400, 50}) == 0b111u);   // spans all three
-    LUMEN_CHECK(outputs_for_rect(m, {1920, 1030, 50, 50}) == 0b000u);  // below B (1024 high)
-    LUMEN_CHECK(outputs_for_rect(m, {3199, 0, 2, 2}) == 0b110u);
+    LUMEN_CHECK(outputs_for_rect(m, {1920, 683, 50, 50}) == 0b000u);   // below B (683 logical)
+    LUMEN_CHECK(outputs_for_rect(m, {1920, 682, 50, 50}) == 0b010u);   // B's last logical row
+    LUMEN_CHECK(outputs_for_rect(m, {2772, 0, 2, 2}) == 0b110u);
     // Largest overlap wins: 120 px on A, 80 on B.
     LUMEN_CHECK(primary_output_for_rect(m, {1800, 0, 200, 10}) == 0);
     LUMEN_CHECK(primary_output_for_rect(m, {1860, 0, 200, 10}) == 1);
@@ -69,6 +71,38 @@ LUMEN_TEST(membership_preferred_scale_and_transform) {
     LUMEN_CHECK(preferred_buffer_transform(m, 12) == 0);
 }
 
+// Fractional scales: the logical rect is the mode over the scale, rounded (wlroots'
+// effective resolution); wp_fractional_scale_v1 gets the largest scale in 120ths; the
+// integer preferred buffer scale is its ceiling — no clamp to 1 any more.
+LUMEN_TEST(fractional_scales_and_logical_rects) {
+    output_manager m;
+    LUMEN_CHECK(m.add_virtual("V-1", {0, 0, 1366, 768}, 60000, 1.25) == 0);
+    const auto o = m.state(m.nth(0));
+    LUMEN_CHECK(o.scale == 150.0 / 120.0);
+    const lx::rect2i l = o.logical_rect();
+    LUMEN_CHECK(l.width == 1093 && l.height == 614); // 1092.8, 614.4
+    LUMEN_CHECK(m.logical_rect(m.nth(0)).width == 1093);
+    const lx::rect2i px = m.mode_rect(m.nth(0));
+    LUMEN_CHECK(px.x == 0 && px.width == 1366 && px.height == 768);
+    // Membership is logical: the last logical column is on the output, the next is not.
+    LUMEN_CHECK(outputs_for_rect(m, {1092, 0, 1, 1}) == 1u);
+    LUMEN_CHECK(outputs_for_rect(m, {1093, 0, 1, 1}) == 0u);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 1u) == 150);
+    LUMEN_CHECK(preferred_buffer_scale(m, 1u) == 2);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 0u) == 120);
+    // The default scale applies to outputs added later; the maximum wins across outputs.
+    m.set_default_scale(1.5);
+    LUMEN_CHECK(m.add_virtual("V-2", {1093, 0, 1920, 1080}, 60000) == 1);
+    LUMEN_CHECK(m.state(m.nth(1)).scale == 1.5);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 0b11u) == 180);
+    LUMEN_CHECK(preferred_buffer_scale(m, 0b11u) == 2);
+    m.set_scale(m.nth(1), 2.0);
+    LUMEN_CHECK(preferred_buffer_scale(m, 0b10u) == 2);
+    m.set_scale(m.nth(1), 2.5);
+    LUMEN_CHECK(preferred_buffer_scale(m, 0b10u) == 3);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 0b10u) == 300);
+}
+
 LUMEN_TEST(outputs_keep_their_slot) {
     output_manager m;
     three(m);
@@ -85,9 +119,11 @@ LUMEN_TEST(outputs_keep_their_slot) {
     LUMEN_CHECK(m.live_mask() == 0b111u);
     // An unchanged scale moves nothing; a changed one does.
     const unsigned g1 = m.generation();
-    m.set_scale(m.nth(1), 1.5f);
+    m.set_scale(m.nth(1), 1.5);
     LUMEN_CHECK(m.generation() == g1);
-    m.set_scale(m.nth(1), 2.f);
+    m.set_scale(m.nth(1), 1.5000001); // the same n/120
+    LUMEN_CHECK(m.generation() == g1);
+    m.set_scale(m.nth(1), 2.0);
     LUMEN_CHECK(m.generation() != g1);
 }
 
@@ -98,7 +134,7 @@ LUMEN_TEST(headless_output_without_connectors) {
     LUMEN_CHECK(m.count() == 1);
     const auto o = m.state(m.nth(0));
     LUMEN_CHECK(o.virtual_output);
-    LUMEN_CHECK(o.geometry.width == 1920 && o.geometry.height == 1080);
+    LUMEN_CHECK(o.mode.width == 1920 && o.mode.height == 1080);
     LUMEN_CHECK(o.refresh_mhz == 60000);
     LUMEN_CHECK(o.name[0] == 'H' && std::strcmp(o.name, "HEADLESS-1") == 0);
     // The hotplug poll refreshes every tick: nothing changed, nothing to tell clients.

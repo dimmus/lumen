@@ -99,6 +99,16 @@ Compositor wires this in `compositor::start()` — see `compositor_impl::handle_
 | `dmabuf_import_cache` | 512 global / 64 per client | LRU evict before reject |
 | `event_loop` sources | 32 | Silent reject on add |
 | `buffer_lifecycle_tracker` | 1024 records | `reject` |
+| `presentation_feedback_table` (wp_presentation) | 1024 slots, 16 per content update | `reject`: the new feedback is sent `discarded` at once, one `warn` a minute |
+| `idle_tracker` (ext_idle_notification_v1) | 64 notifications, 16 per client | `reject`: the client gets `no_memory`, one `warn` per run |
+| `inhibitor_set` (zwp_idle_inhibitor_v1) | 64 inhibitors, 16 per client | `reject`: as above |
+| zwlr_output_power_v1 objects | per request (an intrusive list, freed by the resource destructor) | — (bounded by the client's own objects) |
+| `session_lock` lock surfaces (ext_session_lock_surface_v1 of the lock in charge) | 16, each with 16 outstanding configures | `reject`: no_memory past 16; past 16 configures the oldest is forgotten (acking it is `invalid_serial`) |
+| ext_session_lock_v1 / lock-surface wire objects | per request (freed by the resource destructor) | — (bounded by the client's own objects) |
+| text-input, input-method, input-popup, keyboard-grab and virtual-keyboard wire objects | per request (freed by the resource destructor); a text input holds two 4 KiB state copies, an input method two 4 KiB strings; never per frame or per key | — (bounded by the client's own objects) |
+| virtual-keyboard keymaps | one sealed memfd per virtual keyboard whose keymap differs from the seat's (the seat's is shared) | refused (logged, the keyboard keeps its previous keymap): larger than 4 MiB or not compiling |
+| Pending frame callbacks | 512 | answered at once (a dropped callback stalls its client) |
+| Visibility-pass scratch (`scene_graph`) | 4096 node pointers + flags, parallel to the draw list | fixed array, reused per frame |
 
 ---
 

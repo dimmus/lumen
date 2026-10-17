@@ -14,6 +14,7 @@ import lx.sync;
 import lx.wayland.server;
 import lx.gfx;
 import lx.input;
+import lx.scene;
 
 export module lx.compositor:protocols_p0;
 
@@ -32,6 +33,11 @@ import :layer_shell;
 import :dnd;
 import :liveness;
 import :activation;
+import :keybindings;
+import :presentation_feedback;
+import :idle;
+import :session_lock;
+import :text_input;
 
 export namespace lx::compositor {
 
@@ -506,6 +512,49 @@ struct p0_protocol_context {
     /// Tells bound shells the session is ending (zlm_shell_v1.session_ending). Set by
     /// `install_p0_protocols`.
     void (*notify_session_ending)() = nullptr;
+    /// The shell's key grabs (zlm_shell_v1 v4 grab_key) are recorded here; owned by the
+    /// compositor, which consults it for every key.
+    keybindings* keys = nullptr;
+    /// Sends zlm_key_grab_v1.activated to the grab `grab_resource` with a fresh input serial
+    /// noted as a key press delivered to the shell. Set by `install_p0_protocols`.
+    void (*fire_key_grab)(void* grab_resource, unsigned time_ms) = nullptr;
+    /// wp_presentation feedback in flight (owned by the compositor). Null: the global is not
+    /// advertised.
+    presentation_feedback_table* presentation = nullptr;
+    /// ext_idle_notifier_v1 notifications and zwp_idle_inhibit_manager_v1 inhibitors
+    /// (wire_idle.cpp), owned by the compositor. Null: neither global is advertised.
+    idle_tracker* idle = nullptr;
+    inhibitor_set* inhibitors = nullptr;
+    /// A notification was added or removed, or an inhibitor came or went: the compositor
+    /// re-arms its idle timer (and re-evaluates inhibition at the next tick).
+    void (*idle_changed)(void* user) = nullptr;
+    /// zwlr_output_power_manager_v1 (wire_output_power.cpp): output `slot`'s power mode is
+    /// asked for (UI). Null without a display to power (headless, nested): every
+    /// zwlr_output_power_v1 is sent `failed`.
+    void (*set_output_power)(void* user, unsigned slot, bool on) = nullptr;
+    /// What zwlr_output_power_v1.mode reports for output `slot` right now.
+    bool (*output_power_on)(void* user, unsigned slot) = nullptr;
+    void* idle_user = nullptr;
+    /// ext-session-lock-v1 (wire_session_lock.cpp): the lock state machine, owned by the
+    /// compositor, and the scene layer lock surfaces map into (above everything a client
+    /// draws, under the cursor). Null `lock`: the global is not advertised.
+    session_lock* lock = nullptr;
+    scene::container_node* lock_layer = nullptr;
+    /// Executes a lock decision (the compositor's half: input, scene, logind, the shell, the
+    /// timer; it calls back `session_lock_send` for the wire half). UI affinity.
+    void (*lock_apply)(void* user, const lock_actions& a) = nullptr;
+    void* lock_user = nullptr;
+    /// zlm_shell_v1.lock_state / lock_requested (v5) to every bound shell. Set by
+    /// `install_p0_protocols`.
+    void (*notify_lock_state)(unsigned state) = nullptr;
+    /// True when a shell that speaks v5 was told (it may start a locker).
+    bool (*notify_lock_requested)(unsigned reason) = nullptr;
+    /// text-input-v3 / input-method-v2 / virtual-keyboard-v1 (wire_text_input.cpp,
+    /// wire_input_method.cpp): the relay, owned by the compositor, and the scene layer input
+    /// method popups map into (above the lock layer, under the cursor). Null `text_input`:
+    /// none of the three globals is advertised.
+    text_input_relay* text_input = nullptr;
+    scene::container_node* ime_popup_layer = nullptr;
 
     /// Stage shm pixels in the client's own channel order instead of converting them to
     /// RGBA. The Vulkan composite path samples RGBA textures, so it needs the conversion;
@@ -518,10 +567,62 @@ struct p0_protocol_context {
 /// wl_seat, wl_output, wl_data_device_manager with real bind handlers.
 [[nodiscard]] lx::result<void> install_p0_protocols(p0_protocol_context& ctx);
 
-/// Fire pending wl_surface.frame callbacks after a present (presentation feedback).
+/// Answers every pending wl_surface.frame callback (the 1 Hz paused tick: the display is
+/// stopped, and a client blocked on its callback keeps running).
 void fire_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms);
-/// A client is waiting on a wl_surface.frame callback.
+/// Answers the pending wl_surface.frame callbacks of surfaces on screen in published frame
+/// `visible_frame` (the visibility pass; cursor surfaces always count) and, for the others —
+/// occluded, off the output, unmapped, hidden — only once 995 ms have passed since their
+/// surface's last callback (niri's throttle). What is held back is throttled: it does not
+/// count for `frame_callbacks_pending`, so the frame clock may stop with it queued.
+/// `now_ns`: CLOCK_MONOTONIC.
+void fire_visible_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms,
+                                  unsigned visible_frame, unsigned long long now_ns);
+/// A client is waiting on a wl_surface.frame callback that the next present answers
+/// (throttled ones excluded).
 [[nodiscard]] bool frame_callbacks_pending(const p0_protocol_context& ctx);
+/// Throttled frame callbacks are queued (answered by `fire_visible_frame_callbacks` at
+/// the next site after their 995 ms, or the housekeeping tick while the clock is stopped).
+[[nodiscard]] bool frame_callbacks_throttled(const p0_protocol_context& ctx);
+
+/// wp_presentation: frame `frame` was published; queued feedback of the surfaces it shows
+/// is sampled into it. UI affinity, once per published frame (not while the display is
+/// stopped: nothing is shown then).
+void presentation_published(p0_protocol_context& ctx, unsigned frame);
+/// A content flip of the composite of frame `frame` completed with `info`: sampled feedback
+/// is presented or discarded (`presentation_feedback_table::on_flip`). UI affinity.
+void presentation_flipped(p0_protocol_context& ctx, unsigned frame, const present_info& info);
+/// The display stopped (`queued_only` false: everything in flight is discarded), or the
+/// stopped display's 1 Hz tick (`queued_only` true).
+void presentation_discard(p0_protocol_context& ctx, bool queued_only);
+
+/// ext_idle_notification_v1.idled / resumed, as the compositor's idle tracker emits them
+/// (wire_idle.cpp). A sink with no functions without the protocol's glue.
+[[nodiscard]] idle_sink idle_events(p0_protocol_context& ctx);
+/// Whether an idle inhibitor is honoured in published frame `frame`: its surface was on
+/// screen (the visibility pass — not covered, on the output). The caller adds what the frame
+/// cannot know: the display must be running. UI affinity.
+[[nodiscard]] bool idle_inhibitor_visible(p0_protocol_context& ctx, unsigned frame);
+/// zwlr_output_power_v1.mode to every object of output `slot` (the power state machine
+/// reports a change). UI affinity.
+void notify_output_power(p0_protocol_context& ctx, unsigned slot, bool on);
+
+/// ext_session_lock_v1: the wire half of a lock decision — `finished` and `locked` to the
+/// objects named, then (`drop_surfaces`) every lock surface leaves the lock layer and goes
+/// inert. UI affinity.
+void session_lock_send(p0_protocol_context& ctx, const lock_actions& a);
+/// Topmost lock surface under the global point (the window manager's lock hit-test). Fills
+/// `surface_res`, the surface, its root and the surface-local position.
+[[nodiscard]] bool session_lock_hit(p0_protocol_context& ctx, double x, double y,
+                                    void*& surface_res, lx::surface_id& surface,
+                                    lx::surface_id& root, double& sx, double& sy);
+
+/// Topmost input-method popup shown under the global point (the window manager's hit-test:
+/// candidate windows take clicks, never the keyboard). Fills the surface, its resource and
+/// the surface-local position.
+[[nodiscard]] bool input_popup_hit(p0_protocol_context& ctx, double x, double y,
+                                   void*& surface_res, lx::surface_id& surface, double& sx,
+                                   double& sy);
 
 /// Sends wl_buffer.release for a dmabuf buffer once the render path is done with it.
 void release_wl_buffer_resource(void* wl_buffer_resource, void* user_data);

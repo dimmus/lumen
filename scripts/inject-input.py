@@ -64,7 +64,13 @@ BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
 KEYS = {"KEY_ESC": 1, "KEY_LEFTMETA": 125, "KEY_LEFTSHIFT": 42, "KEY_RIGHTSHIFT": 54,
         "KEY_LEFTCTRL": 29, "KEY_LEFTALT": 56, "KEY_ENTER": 28, "KEY_SPACE": 57,
         "KEY_F10": 68, "KEY_UP": 103, "KEY_LEFT": 105, "KEY_RIGHT": 106, "KEY_DOWN": 108,
-        "KEY_MINUS": 12, "KEY_INSERT": 110, "KEY_BACKSPACE": 14, "KEY_TAB": 15}
+        "KEY_MINUS": 12, "KEY_INSERT": 110, "KEY_BACKSPACE": 14, "KEY_TAB": 15,
+        "KEY_RIGHTMETA": 126, "KEY_RIGHTCTRL": 97, "KEY_RIGHTALT": 100}
+# F1–F10 are consecutive; F11 and F12 are not (VT switching is Ctrl+Alt+F<n>).
+for _i in range(10):
+    KEYS[f"KEY_F{_i + 1}"] = 59 + _i
+KEYS["KEY_F11"] = 87
+KEYS["KEY_F12"] = 88
 # Letters and digits by their evdev codes (US layout rows).
 for _row, _first in (("qwertyuiop", 16), ("asdfghjkl", 30), ("zxcvbnm", 44)):
     for _i, _ch in enumerate(_row):

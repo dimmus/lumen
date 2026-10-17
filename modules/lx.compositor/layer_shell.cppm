@@ -156,6 +156,9 @@ struct layer_host {
     void (*usable_changed)(void* user, lx::rect2i usable) = nullptr;
     /// A layer surface mapped, unmapped or changed its keyboard interactivity.
     void (*focus_changed)(void* user) = nullptr;
+    /// A layer surface just mapped (called before `focus_changed`): where a surface that
+    /// `focus_on_map` accepts takes the keyboard.
+    void (*surface_mapped)(void* user, lx::surface_id surface) = nullptr;
     /// A mapped layer surface moved: its popups follow.
     void (*surface_moved)(void* user, lx::surface_id surface) = nullptr;
     /// A layer surface is unmapped (`reason`) or, with "destroyed", going away: its popups
@@ -226,6 +229,12 @@ public:
     /// A press on it may focus it: on_demand anywhere, exclusive on bottom/background
     /// ("normal focus semantics" there).
     [[nodiscard]] bool click_focusable(lx::surface_id surface) const;
+    /// An on_demand surface mapped on the top or overlay layer takes the keyboard when it
+    /// maps (sway's and Hyprland's rule: a launcher or menu opened from a key binding can
+    /// be typed into at once). Exclusive ones take it through `exclusive_focus` anyway.
+    [[nodiscard]] bool focus_on_map(lx::surface_id surface) const;
+    /// The layer a mapped surface is in (`layer_level` as unsigned), or -1.
+    [[nodiscard]] int mapped_level(lx::surface_id surface) const;
 
     /// Topmost mapped surface (any surface of its tree) of `level` under the global point.
     [[nodiscard]] bool hit(layer_level level, double gx, double gy, tree_hit& out,
@@ -714,6 +723,8 @@ void lx::compositor::layer_shell::map(layer_record& r) {
                       r.box.width, r.box.height);
         lx::trace::logger::global().log(lx::trace::level::info, k_layer_category, line);
     }
+    if (host_.surface_mapped)
+        host_.surface_mapped(host_.user, r.surface);
     if (host_.focus_changed)
         host_.focus_changed(host_.user);
 }
@@ -877,6 +888,18 @@ bool lx::compositor::layer_shell::click_focusable(lx::surface_id surface) const 
         return true;
     return r->current.interactivity == static_cast<unsigned>(layer_interactivity::exclusive) &&
            r->mapped_layer < static_cast<unsigned>(layer_level::top);
+}
+
+bool lx::compositor::layer_shell::focus_on_map(lx::surface_id surface) const {
+    const layer_record* r = find(surface);
+    return r && r->mapped && !r->closed &&
+           r->current.interactivity == static_cast<unsigned>(layer_interactivity::on_demand) &&
+           r->mapped_layer >= static_cast<unsigned>(layer_level::top);
+}
+
+int lx::compositor::layer_shell::mapped_level(lx::surface_id surface) const {
+    const layer_record* r = find(surface);
+    return r && r->mapped ? static_cast<int>(r->mapped_layer) : -1;
 }
 
 bool lx::compositor::layer_shell::hit(layer_level level, double gx, double gy, tree_hit& out,

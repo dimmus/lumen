@@ -16,14 +16,18 @@ python3 "$ROOT/scripts/protocol_manifest.py" \
     --fetch-out "$LIST"
 
 TAG="$(grep '^TAG=' "$LIST" | cut -d= -f2)"
+WLROOTS_TAG="$(grep '^WLROOTS_TAG=' "$LIST" | cut -d= -f2 || true)"
 WP_REPO="https://gitlab.freedesktop.org/wayland/wayland-protocols.git"
 WAYLAND_REPO="https://gitlab.freedesktop.org/wayland/wayland.git"
 WLR_REPO="https://gitlab.freedesktop.org/wlroots/wlr-protocols.git"
+WLROOTS_REPO="https://gitlab.freedesktop.org/wlroots/wlroots.git"
 
 NEED_WLR=0
+NEED_WLROOTS=0
 while IFS='|' read -r source relpath; do
-    [[ -z "${source:-}" || "$source" == "TAG" ]] && continue
+    [[ -z "${source:-}" || "$source" == TAG* || "$source" == WLROOTS_TAG* ]] && continue
     [[ "$source" == "wlr" ]] && NEED_WLR=1
+    [[ "$source" == "wlroots" ]] && NEED_WLROOTS=1
 done < "$LIST"
 
 echo "==> Cloning wayland-protocols (${TAG})..."
@@ -37,6 +41,14 @@ if [[ "$NEED_WLR" -eq 1 ]]; then
     git clone --depth 1 "$WLR_REPO" "$TMP/wlr-protocols"
 fi
 
+if [[ "$NEED_WLROOTS" -eq 1 ]]; then
+    # Only protocol/ is needed: a blobless sparse checkout keeps this a few hundred KiB.
+    echo "==> Cloning wlroots (${WLROOTS_TAG}, protocol/ only)..."
+    git clone --depth 1 --branch "$WLROOTS_TAG" --filter=blob:none --sparse \
+        "$WLROOTS_REPO" "$TMP/wlroots"
+    git -C "$TMP/wlroots" sparse-checkout set protocol
+fi
+
 while IFS='|' read -r source relpath; do
     [[ -z "${source:-}" || "$source" == "TAG" ]] && continue
     out="$DEST/$relpath"
@@ -47,6 +59,11 @@ while IFS='|' read -r source relpath; do
             ;;
         wlr)
             src="$TMP/wlr-protocols/$relpath"
+            ;;
+        wlroots)
+            src="$TMP/wlroots/protocol/$relpath"
+            out="$DEST/wlroots/$relpath"
+            mkdir -p "$(dirname "$out")"
             ;;
         *)
             src="$TMP/wayland-protocols/$relpath"
@@ -60,7 +77,7 @@ while IFS='|' read -r source relpath; do
     fi
     cp "$src" "$out"
     echo "  copied $relpath"
-done < <(grep -v '^TAG=' "$LIST")
+done < <(grep -v -e '^TAG=' -e '^WLROOTS_TAG=' "$LIST")
 
 rm -rf "$TMP" "$LIST"
 

@@ -22,39 +22,19 @@ struct output_config_head {
     bool enabled = true;
 };
 
-struct session_lock_state {
-    bool active = false;
-    lx::surface_id lock_surface{};
-};
-
-struct text_input_state {
-    lx::surface_id focused_surface{};
-    const char* preedit = "";
-    const char* commit_text = "";
-};
-
 struct color_management_state {
     lx::image_description_id surface_desc{};
     lx::image_description_id output_desc{};
     lx::color_space compositing_space = lx::color_space::scrgb;
 };
 
-/// Registers and tracks standard public Wayland globals (workspace, …). xdg-decoration and
-/// wlr-layer-shell are served by the protocol wire units (`wire_*.cpp`; `:decoration` and
-/// `:layer_shell` hold their logic).
+/// Registers and tracks standard public Wayland globals (workspace, …). xdg-decoration,
+/// wlr-layer-shell, ext-session-lock and text-input/input-method are served by the protocol
+/// wire units (`wire_*.cpp`; `:decoration`, `:layer_shell`, `:session_lock` and `:text_input`
+/// hold their logic).
 class protocol_managers {
 public:
     [[nodiscard]] lx::result<void> install(wayland::server& server);
-
-    // ext-session-lock-v1
-    void set_session_locked(bool locked);
-    [[nodiscard]] bool session_locked() const;
-    void set_lock_surface(lx::surface_id surface);
-    [[nodiscard]] lx::surface_id lock_surface() const;
-
-    // wp-fractional-scale-v1
-    void set_fractional_scale(unsigned output_index, float scale);
-    [[nodiscard]] float fractional_scale(unsigned output_index) const;
 
     // ext-workspace-v1 (read path)
     void set_workspaces(const workspace_entry* entries, unsigned count);
@@ -65,10 +45,6 @@ public:
     void apply_output_configuration(const output_config_head* heads, unsigned count);
     [[nodiscard]] unsigned output_config_count() const;
     [[nodiscard]] output_config_head output_config(unsigned index) const;
-
-    // text-input-v3 / input-method-v2
-    void set_text_input_focus(lx::surface_id surface);
-    [[nodiscard]] const text_input_state& text_input() const;
 
     // pointer / latency / color (state tracked for shell + render)
     void set_pointer_locked(lx::surface_id surface, bool locked);
@@ -85,13 +61,10 @@ public:
 private:
     wayland::server* server_ = nullptr;
     surface_manager* surfaces_ = nullptr;
-    session_lock_state session_lock_{};
-    float output_scales_[16]{};
     workspace_entry workspaces_[16]{};
     unsigned workspace_count_ = 0;
     output_config_head output_configs_[16]{};
     unsigned output_config_count_ = 0;
-    text_input_state text_input_{};
     lx::surface_id pointer_locked_surface_{};
     color_management_state color_{};
 };
@@ -111,13 +84,9 @@ lx::result<void> lx::compositor::protocol_managers::install(wayland::server& ser
     static constexpr global_spec k_public_globals[] = {
         {"ext_workspace_manager_v1", 1, false},
         {"zwlr_output_manager_v1", 4, false},
-        {"ext_session_lock_manager_v1", 1, false},
         {"ext_foreign_toplevel_list_v1", 1, false},
-        {"zwp_text_input_manager_v3", 1, false},
-        {"zwp_input_method_manager_v2", 1, false},
         {"zwp_pointer_constraints_v1", 1, false},
         {"zwp_relative_pointer_manager_v1", 1, false},
-        {"wp_fractional_scale_manager_v1", 1, false},
         {"wp_cursor_shape_manager_v1", 1, false},
         {"wp_single_pixel_buffer_manager_v1", 1, false},
         {"wp_alpha_modifier_v1", 1, false},
@@ -133,32 +102,7 @@ lx::result<void> lx::compositor::protocol_managers::install(wayland::server& ser
     // Do not advertise globals without real bind handlers + wl_interface descriptors.
     // State tables below remain available for when handlers land (reassessment gate).
     (void)k_public_globals;
-    for (unsigned i = 0; i < 16; ++i)
-        output_scales_[i] = 1.f;
     return {};
-}
-
-void lx::compositor::protocol_managers::set_session_locked(bool locked) {
-    session_lock_.active = locked;
-}
-
-bool lx::compositor::protocol_managers::session_locked() const { return session_lock_.active; }
-
-void lx::compositor::protocol_managers::set_lock_surface(lx::surface_id surface) {
-    session_lock_.lock_surface = surface;
-}
-
-lx::surface_id lx::compositor::protocol_managers::lock_surface() const {
-    return session_lock_.lock_surface;
-}
-
-void lx::compositor::protocol_managers::set_fractional_scale(unsigned output_index, float scale) {
-    if (output_index < 16)
-        output_scales_[output_index] = scale;
-}
-
-float lx::compositor::protocol_managers::fractional_scale(unsigned output_index) const {
-    return output_index < 16 ? output_scales_[output_index] : 1.f;
 }
 
 void lx::compositor::protocol_managers::set_workspaces(const workspace_entry* entries,
@@ -189,14 +133,6 @@ unsigned lx::compositor::protocol_managers::output_config_count() const {
 lx::compositor::output_config_head
 lx::compositor::protocol_managers::output_config(unsigned index) const {
     return index < output_config_count_ ? output_configs_[index] : output_config_head{};
-}
-
-void lx::compositor::protocol_managers::set_text_input_focus(lx::surface_id surface) {
-    text_input_.focused_surface = surface;
-}
-
-const lx::compositor::text_input_state& lx::compositor::protocol_managers::text_input() const {
-    return text_input_;
 }
 
 void lx::compositor::protocol_managers::set_pointer_locked(lx::surface_id surface, bool locked) {

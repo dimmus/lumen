@@ -1,5 +1,7 @@
 module;
 
+#include <cmath>
+
 import lx.foundation;
 import lx.gfx;
 import lx.scene;
@@ -21,9 +23,14 @@ struct surface_commit {
     lx::surface_id surface{};
     lx::buffer_id buffer{};
     lx::client_id client{};
-    /// Surface-local (buffer coordinates; scale 1, normal transform). Empty = no content
-    /// damage.
+    /// Surface-local (logical) damage of this update, already merged from wl_surface.damage
+    /// and the converted damage_buffer. Empty = no content damage.
     lx::rect2i damage{};
+    /// Logical surface size (buffer scale, transform and viewport applied).
+    lx::size2i surface_size{};
+    /// Buffer box shown (empty: all of it) and the buffer transform (`:viewport`).
+    lx::rect2f src{};
+    lx::buffer_transform transform = lx::buffer_transform::normal;
     lx::gfx::syncobj_timeline sync{};
     content_hint hint = content_hint::normal;
     bool fullscreen = false;
@@ -183,9 +190,17 @@ public:
     [[nodiscard]] lx::gfx::imported_image lookup(lx::surface_id surface) const;
     [[nodiscard]] content_hint content_hint_for(lx::surface_id surface) const;
 
-    /// Size of the last successfully committed buffer; empty before the first one.
+    /// Size of the last successfully committed buffer, in pixels; empty before the first
+    /// one. Texture-side only — geometry uses `surface_size`.
     [[nodiscard]] lx::size2i buffer_size(lx::surface_id surface) const;
-    /// Creates the surface's scene node (bounds = buffer size) at the top of `parent`.
+    /// Logical size of the surface's content (buffer scale, transform, viewport applied):
+    /// its extents in the layout, what roles, the tree and hit-testing use.
+    [[nodiscard]] lx::size2i surface_size(lx::surface_id surface) const;
+    /// A state-only update changed the geometry (a new viewport, scale or transform on the
+    /// buffer already shown): bounds and source follow, damaged like a resize.
+    void set_geometry(lx::surface_id surface, lx::size2i size, lx::rect2f src,
+                      lx::buffer_transform transform);
+    /// Creates the surface's scene node (bounds = surface size) at the top of `parent`.
     /// True if the node exists afterwards. A full container fails (warned once).
     [[nodiscard]] bool ensure_node(lx::surface_id surface, lx::scene::container_node& parent);
     /// Removes the node from its container and deletes it. Notes no damage — the caller
@@ -204,7 +219,7 @@ public:
         return changed;
     }
     [[nodiscard]] lx::scene::surface_node* node(lx::surface_id surface) const;
-    /// Global `{origin, buffer extents}` of the node, or empty when there is none.
+    /// Global (logical) `{origin, surface extents}` of the node, or empty when there is none.
     [[nodiscard]] lx::rect2i node_rect(lx::surface_id surface) const;
     /// Moves the node. Keeps scale and opacity, notes no damage: the window manager damages
     /// old and new rects as separate clips, which this cannot know to do.
@@ -227,6 +242,9 @@ private:
         lx::buffer_id buffer{};
         lx::gfx::imported_image image{};
         lx::size2i buffer_size{};
+        lx::size2i surface_size{};
+        lx::rect2f src{};
+        lx::buffer_transform transform = lx::buffer_transform::normal;
         content_hint hint = content_hint::normal;
         lx::scene::surface_node* node = nullptr;
         /// The container `node` was added to.
@@ -248,6 +266,9 @@ private:
     [[nodiscard]] int find_surface(lx::surface_id id) const;
     [[nodiscard]] int find_or_alloc_surface(lx::surface_id id);
     [[nodiscard]] int find_buffer(lx::buffer_id id) const;
+    /// Output pixels a content change of `e` may reach beyond its own rect: a resampled
+    /// draw's linear filter extends half a source texel (in output pixels) past it.
+    [[nodiscard]] int resample_margin(const surface_entry& e) const;
 
     lx::gfx::dmabuf_import_cache* import_cache_ = nullptr;
     lx::scene::scene_graph* scene_ = nullptr;
@@ -448,33 +469,46 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
         return lx::make_error(lx::error_domain::wayland, 0, "surface table full");
     }
     auto& entry = surfaces_[static_cast<unsigned>(slot)];
-    const lx::size2i old_size = entry.buffer_size;
+    const lx::size2i old_size = entry.surface_size;
+    const int old_margin = resample_margin(entry);
     entry.buffer = commit.buffer;
     entry.hint = commit.hint;
     entry.image = image;
     entry.buffer_size = {static_cast<int>(desc.width), static_cast<int>(desc.height)};
+    entry.surface_size = commit.surface_size.empty() ? entry.buffer_size : commit.surface_size;
+    const bool source_changed = entry.src.x != commit.src.x || entry.src.y != commit.src.y ||
+                                entry.src.width != commit.src.width ||
+                                entry.src.height != commit.src.height ||
+                                entry.transform != commit.transform;
+    entry.src = commit.src;
+    entry.transform = commit.transform;
     const bool opacity_changed = entry.opaque != commit.opaque;
     entry.opaque = commit.opaque;
 
-    // Only a mapped surface has a node. Its bounds are the buffer — never the damage rect,
-    // which for a partial redraw is a fraction of the window — and its damage is the
-    // client's surface-local rect moved to where the node actually is.
+    // Only a mapped surface has a node. Its bounds are the surface (logical) — never the
+    // damage rect, which for a partial redraw is a fraction of the window — and its damage
+    // is the client's surface-local rect moved to where the node actually is.
     if (entry.node) {
         const lx::point2i o = entry.node->origin();
         entry.node->attach(image);
         entry.node->set_opaque(entry.opaque);
-        entry.node->set_bounds({0, 0, entry.buffer_size.width, entry.buffer_size.height});
+        entry.node->set_bounds({0, 0, entry.surface_size.width, entry.surface_size.height});
+        entry.node->set_content(entry.src, entry.transform);
         if (scene_) {
-            if (old_size.width != entry.buffer_size.width ||
-                old_size.height != entry.buffer_size.height || opacity_changed) {
+            const int margin = resample_margin(entry);
+            if (old_size.width != entry.surface_size.width ||
+                old_size.height != entry.surface_size.height || opacity_changed ||
+                source_changed) {
                 // A size change uncovers or covers what lies outside the other extent, and a
                 // blend change repaints everything under the node: both rects, separately.
-                scene_->note_damage({o.x, o.y, old_size.width, old_size.height});
-                scene_->note_damage({o.x, o.y, entry.buffer_size.width, entry.buffer_size.height});
+                scene_->note_damage({o.x, o.y, old_size.width, old_size.height}, old_margin);
+                scene_->note_damage({o.x, o.y, entry.surface_size.width, entry.surface_size.height},
+                                    margin);
                 layout_changed_ = true;
             } else if (commit.damage.width > 0 && commit.damage.height > 0) {
                 scene_->note_damage({commit.damage.x + o.x, commit.damage.y + o.y,
-                                     commit.damage.width, commit.damage.height});
+                                     commit.damage.width, commit.damage.height},
+                                    margin);
             }
         }
     }
@@ -519,7 +553,7 @@ void lx::compositor::surface_manager::destroy(lx::surface_id surface) {
         if (scene_ && entry.node->is_visible()) {
             const lx::point2i o = entry.node->origin();
             const lx::rect2i b = entry.node->bounds();
-            scene_->note_damage({o.x, o.y, b.width, b.height});
+            scene_->note_damage({o.x, o.y, b.width, b.height}, resample_margin(entry));
         }
         if (entry.node_parent)
             (void)entry.node_parent->remove(entry.node);
@@ -534,6 +568,61 @@ lx::size2i lx::compositor::surface_manager::buffer_size(lx::surface_id surface) 
     if (const int slot = find_surface(surface); slot >= 0)
         return surfaces_[static_cast<unsigned>(slot)].buffer_size;
     return {};
+}
+
+lx::size2i lx::compositor::surface_manager::surface_size(lx::surface_id surface) const {
+    if (const int slot = find_surface(surface); slot >= 0)
+        return surfaces_[static_cast<unsigned>(slot)].surface_size;
+    return {};
+}
+
+int lx::compositor::surface_manager::resample_margin(const surface_entry& e) const {
+    const double s = scene_ ? scene_->projection().scale : 1.0;
+    double sw = e.src.empty() ? e.buffer_size.width : e.src.width;
+    double sh = e.src.empty() ? e.buffer_size.height : e.src.height;
+    if ((static_cast<unsigned>(e.transform) & 1u) != 0) {
+        const double t = sw;
+        sw = sh;
+        sh = t;
+    }
+    if (!(sw > 0.0) || !(sh > 0.0) || e.surface_size.empty())
+        return 0;
+    const double kx = s * e.surface_size.width / sw;
+    const double ky = s * e.surface_size.height / sh;
+    const bool whole = e.src.x == std::floor(e.src.x) && e.src.y == std::floor(e.src.y);
+    if (kx == 1.0 && ky == 1.0 && whole)
+        return 0;
+    const double k = kx > ky ? kx : ky;
+    const int m = static_cast<int>(std::ceil((k > 1.0 ? k : 1.0) / 2.0));
+    return m < 1 ? 1 : m;
+}
+
+void lx::compositor::surface_manager::set_geometry(lx::surface_id surface, lx::size2i size,
+                                                   lx::rect2f src,
+                                                   lx::buffer_transform transform) {
+    const int slot = find_surface(surface);
+    if (slot < 0)
+        return;
+    auto& e = surfaces_[static_cast<unsigned>(slot)];
+    if (size.width == e.surface_size.width && size.height == e.surface_size.height &&
+        src.x == e.src.x && src.y == e.src.y && src.width == e.src.width &&
+        src.height == e.src.height && transform == e.transform)
+        return;
+    const lx::size2i old_size = e.surface_size;
+    const int old_margin = resample_margin(e);
+    e.surface_size = size;
+    e.src = src;
+    e.transform = transform;
+    if (!e.node)
+        return;
+    const lx::point2i o = e.node->origin();
+    e.node->set_bounds({0, 0, size.width, size.height});
+    e.node->set_content(src, transform);
+    if (scene_) {
+        scene_->note_damage({o.x, o.y, old_size.width, old_size.height}, old_margin);
+        scene_->note_damage({o.x, o.y, size.width, size.height}, resample_margin(e));
+    }
+    layout_changed_ = true;
 }
 
 bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface,
@@ -557,7 +646,8 @@ bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface,
     }
     node->attach(entry.image);
     node->set_opaque(entry.opaque);
-    node->set_bounds({0, 0, entry.buffer_size.width, entry.buffer_size.height});
+    node->set_bounds({0, 0, entry.surface_size.width, entry.surface_size.height});
+    node->set_content(entry.src, entry.transform);
     entry.node = node;
     entry.node_parent = &parent;
     layout_changed_ = true;
@@ -592,7 +682,7 @@ void lx::compositor::surface_manager::set_opaque(lx::surface_id surface, bool op
     entry.node->set_opaque(opaque);
     // Blending changes every pixel the node covers that is not fully opaque.
     if (scene_)
-        scene_->note_damage(node_rect(surface));
+        scene_->note_damage(node_rect(surface), resample_margin(entry));
 }
 
 lx::scene::surface_node* lx::compositor::surface_manager::node(lx::surface_id surface) const {

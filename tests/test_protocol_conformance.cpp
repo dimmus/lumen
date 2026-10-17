@@ -7,7 +7,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <functional>
+#include <initializer_list>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -17,6 +19,10 @@
 
 #include <fcntl.h>
 #include <poll.h>
+#if __has_include(<xkbcommon/xkbcommon.h>)
+#include <xkbcommon/xkbcommon.h>
+#define LUMEN_TEST_XKB 1
+#endif
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -42,11 +48,41 @@
 #include "xdg-activation-v1-client-protocol.h"
 #define LUMEN_TEST_ACTIVATION 1
 #endif
+#if __has_include("viewporter-client-protocol.h") && __has_include("fractional-scale-v1-client-protocol.h")
+#include "viewporter-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
+#define LUMEN_TEST_VIEWPORTER 1
+#endif
+#if __has_include("presentation-time-client-protocol.h")
+#include "presentation-time-client-protocol.h"
+#define LUMEN_TEST_PRESENTATION 1
+#endif
+#if __has_include("ext-idle-notify-v1-client-protocol.h") && \
+    __has_include("idle-inhibit-unstable-v1-client-protocol.h") && \
+    __has_include("wlr-output-power-management-unstable-v1-client-protocol.h")
+#include "ext-idle-notify-v1-client-protocol.h"
+#include "idle-inhibit-unstable-v1-client-protocol.h"
+#include "wlr-output-power-management-unstable-v1-client-protocol.h"
+#define LUMEN_TEST_IDLE 1
+#endif
+#if __has_include("ext-session-lock-v1-client-protocol.h")
+#include "ext-session-lock-v1-client-protocol.h"
+#define LUMEN_TEST_SESSION_LOCK 1
+#endif
+#if __has_include("text-input-unstable-v3-client-protocol.h") && \
+    __has_include("input-method-unstable-v2-client-protocol.h") && \
+    __has_include("virtual-keyboard-unstable-v1-client-protocol.h")
+#include "text-input-unstable-v3-client-protocol.h"
+#include "input-method-unstable-v2-client-protocol.h"
+#include "virtual-keyboard-unstable-v1-client-protocol.h"
+#define LUMEN_TEST_IME 1
+#endif
 #endif
 #endif
 
 import lx.foundation;
 import lx.runtime;
+import lx.scheduler;
 import lx.input;
 import lx.compositor;
 
@@ -85,6 +121,29 @@ struct client {
 #endif
 #if defined(LUMEN_TEST_ACTIVATION)
     xdg_activation_v1* activation = nullptr;
+#endif
+#if defined(LUMEN_TEST_VIEWPORTER)
+    wp_viewporter* viewporter = nullptr;
+    wp_fractional_scale_manager_v1* fractional = nullptr;
+#endif
+#if defined(LUMEN_TEST_PRESENTATION)
+    wp_presentation* presentation = nullptr;
+    /// wp_presentation.clock_id as received (~0u: none yet).
+    uint32_t clock_id = ~0u;
+#endif
+#if defined(LUMEN_TEST_IDLE)
+    ext_idle_notifier_v1* idle_notifier = nullptr;
+    zwp_idle_inhibit_manager_v1* inhibit_manager = nullptr;
+    zwlr_output_power_manager_v1* power_manager = nullptr;
+#endif
+#if defined(LUMEN_TEST_SESSION_LOCK)
+    ext_session_lock_manager_v1* lock_manager = nullptr;
+#endif
+#if defined(LUMEN_TEST_IME)
+    zwp_text_input_manager_v3* ti_manager = nullptr;
+    uint32_t ti_version = 0;
+    zwp_input_method_manager_v2* im_manager = nullptr;
+    zwp_virtual_keyboard_manager_v1* vk_manager = nullptr;
 #endif
 };
 
@@ -134,6 +193,53 @@ void on_global(void* data, wl_registry* registry, uint32_t name, const char* ifa
     else if (std::strcmp(iface, xdg_activation_v1_interface.name) == 0)
         c->activation = static_cast<xdg_activation_v1*>(
             wl_registry_bind(registry, name, &xdg_activation_v1_interface, 1));
+#endif
+#if defined(LUMEN_TEST_VIEWPORTER)
+    else if (std::strcmp(iface, wp_viewporter_interface.name) == 0)
+        c->viewporter = static_cast<wp_viewporter*>(
+            wl_registry_bind(registry, name, &wp_viewporter_interface, 1));
+    else if (std::strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0)
+        c->fractional = static_cast<wp_fractional_scale_manager_v1*>(
+            wl_registry_bind(registry, name, &wp_fractional_scale_manager_v1_interface, 1));
+#endif
+#if defined(LUMEN_TEST_PRESENTATION)
+    else if (std::strcmp(iface, wp_presentation_interface.name) == 0) {
+        static const wp_presentation_listener presentation_listener = {
+            [](void* data, wp_presentation*, uint32_t clk) {
+                static_cast<client*>(data)->clock_id = clk;
+            }};
+        c->presentation = static_cast<wp_presentation*>(
+            wl_registry_bind(registry, name, &wp_presentation_interface, version < 2 ? version : 2));
+        wp_presentation_add_listener(c->presentation, &presentation_listener, c);
+    }
+#endif
+#if defined(LUMEN_TEST_IDLE)
+    else if (std::strcmp(iface, ext_idle_notifier_v1_interface.name) == 0)
+        c->idle_notifier = static_cast<ext_idle_notifier_v1*>(
+            wl_registry_bind(registry, name, &ext_idle_notifier_v1_interface, version < 2 ? version : 2));
+    else if (std::strcmp(iface, zwp_idle_inhibit_manager_v1_interface.name) == 0)
+        c->inhibit_manager = static_cast<zwp_idle_inhibit_manager_v1*>(
+            wl_registry_bind(registry, name, &zwp_idle_inhibit_manager_v1_interface, 1));
+    else if (std::strcmp(iface, zwlr_output_power_manager_v1_interface.name) == 0)
+        c->power_manager = static_cast<zwlr_output_power_manager_v1*>(
+            wl_registry_bind(registry, name, &zwlr_output_power_manager_v1_interface, 1));
+#endif
+#if defined(LUMEN_TEST_SESSION_LOCK)
+    else if (std::strcmp(iface, ext_session_lock_manager_v1_interface.name) == 0)
+        c->lock_manager = static_cast<ext_session_lock_manager_v1*>(
+            wl_registry_bind(registry, name, &ext_session_lock_manager_v1_interface, 1));
+#endif
+#if defined(LUMEN_TEST_IME)
+    else if (std::strcmp(iface, zwp_text_input_manager_v3_interface.name) == 0) {
+        c->ti_version = version < 2 ? version : 2;
+        c->ti_manager = static_cast<zwp_text_input_manager_v3*>(
+            wl_registry_bind(registry, name, &zwp_text_input_manager_v3_interface, c->ti_version));
+    } else if (std::strcmp(iface, zwp_input_method_manager_v2_interface.name) == 0)
+        c->im_manager = static_cast<zwp_input_method_manager_v2*>(
+            wl_registry_bind(registry, name, &zwp_input_method_manager_v2_interface, 1));
+    else if (std::strcmp(iface, zwp_virtual_keyboard_manager_v1_interface.name) == 0)
+        c->vk_manager = static_cast<zwp_virtual_keyboard_manager_v1*>(
+            wl_registry_bind(registry, name, &zwp_virtual_keyboard_manager_v1_interface, 1));
 #endif
 }
 void on_global_remove(void*, wl_registry*, uint32_t) {}
@@ -780,10 +886,18 @@ int main() {
     std::mutex dispatch_lock;
     std::thread pump_thread([&] {
         lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        const int loop_fd = comp.wayland().event_fd();
         while (pump.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> hold(dispatch_lock);
-            (void)comp.wayland().dispatch(10);
-            comp.wayland().flush();
+            {
+                std::lock_guard<std::mutex> hold(dispatch_lock);
+                (void)comp.wayland().dispatch(0);
+                comp.wayland().flush();
+            }
+            // Wait for client traffic without the lock: a dispatch sleeping in epoll while
+            // holding it starved every case that reads compositor state or injects input
+            // (std::mutex is not fair), stretching the run from ~15 s to over a minute.
+            pollfd pf{loop_fd, POLLIN, 0};
+            (void)poll(&pf, 1, 10);
         }
     });
     // Surfaces that have a scene node, i.e. are drawn.
@@ -891,6 +1005,341 @@ int main() {
         wl_surface_commit(a);
         wl_surface_commit(p);
     });
+
+    // ── wl_surface: scale, transform, offset, size ──
+    expect("surface: set_buffer_scale 0", "wl_surface", WL_SURFACE_ERROR_INVALID_SCALE,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wl_surface_set_buffer_scale(s, 0);
+           });
+    expect("surface: set_buffer_transform 8", "wl_surface", WL_SURFACE_ERROR_INVALID_TRANSFORM,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wl_surface_set_buffer_transform(s, 8);
+           });
+    expect("surface: v5+ attach with a non-zero offset", "wl_surface",
+           WL_SURFACE_ERROR_INVALID_OFFSET, [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wl_surface_attach(s, make_buffer(c, 10, 10), 3, 0);
+           });
+    expect("surface: toplevel buffer not divisible by its scale", "wl_surface",
+           WL_SURFACE_ERROR_INVALID_SIZE, [](client& c) {
+               window w{};
+               w.surface = wl_compositor_create_surface(c.compositor);
+               w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+               xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
+               w.toplevel = xdg_surface_get_toplevel(w.xdg);
+               wl_surface_commit(w.surface);
+               (void)wl_display_roundtrip(c.display);
+               xdg_surface_ack_configure(w.xdg, w.cfg.serial);
+               wl_surface_set_buffer_scale(w.surface, 2);
+               wl_surface_attach(w.surface, make_buffer(c, 201, 150), 0, 0);
+               wl_surface_commit(w.surface);
+           });
+    expect("surface: role-less buffer not divisible by its scale is tolerated", "none", 0,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wl_surface_set_buffer_scale(s, 2);
+               wl_surface_attach(s, make_buffer(c, 33, 33), 0, 0);
+               wl_surface_commit(s);
+           });
+    expect("surface: scale 2 and every transform, damage in both spaces", "none", 0,
+           [](client& c) {
+               for (int t = 0; t < 8; ++t) {
+                   wl_surface* s = wl_compositor_create_surface(c.compositor);
+                   wl_surface_set_buffer_scale(s, 2);
+                   wl_surface_set_buffer_transform(s, t);
+                   wl_surface_attach(s, make_buffer(c, 40, 20), 0, 0);
+                   wl_surface_damage(s, 0, 0, INT32_MAX, INT32_MAX);
+                   wl_surface_damage_buffer(s, 3, 4, 5, 6);
+                   wl_surface_commit(s);
+                   wl_surface_offset(s, 2, -2);
+                   wl_surface_commit(s);
+               }
+           });
+
+#if defined(LUMEN_TEST_VIEWPORTER)
+    // ── wp_viewporter ──
+    expect("viewporter: second viewport for a surface", "wp_viewporter",
+           WP_VIEWPORTER_ERROR_VIEWPORT_EXISTS, [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               (void)wp_viewporter_get_viewport(c.viewporter, s);
+               (void)wp_viewporter_get_viewport(c.viewporter, s);
+           });
+    expect("viewport: source with a negative x", "wp_viewport", WP_VIEWPORT_ERROR_BAD_VALUE,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wp_viewport_set_source(v, wl_fixed_from_int(-1), 0, wl_fixed_from_int(10),
+                                      wl_fixed_from_int(10));
+           });
+    expect("viewport: source with zero width", "wp_viewport", WP_VIEWPORT_ERROR_BAD_VALUE,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wp_viewport_set_source(v, 0, 0, 0, wl_fixed_from_int(10));
+           });
+    expect("viewport: destination 0x5", "wp_viewport", WP_VIEWPORT_ERROR_BAD_VALUE,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wp_viewport_set_destination(v, 0, 5);
+           });
+    expect("viewport: destination -1x5 (only -1x-1 unsets)", "wp_viewport",
+           WP_VIEWPORT_ERROR_BAD_VALUE, [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wp_viewport_set_destination(v, -1, 5);
+           });
+    expect("viewport: fractional source size without a destination", "wp_viewport",
+           WP_VIEWPORT_ERROR_BAD_SIZE, [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wl_surface_attach(s, make_buffer(c, 40, 40), 0, 0);
+               wp_viewport_set_source(v, 0, 0, wl_fixed_from_double(10.5),
+                                      wl_fixed_from_int(10));
+               wl_surface_commit(s);
+           });
+    expect("viewport: source past the buffer", "wp_viewport", WP_VIEWPORT_ERROR_OUT_OF_BUFFER,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wl_surface_attach(s, make_buffer(c, 40, 40), 0, 0);
+               wp_viewport_set_source(v, wl_fixed_from_int(30), 0, wl_fixed_from_int(11),
+                                      wl_fixed_from_int(10));
+               wl_surface_commit(s);
+           });
+    expect("viewport: source past a scale-2, 90-degree buffer", "wp_viewport",
+           WP_VIEWPORT_ERROR_OUT_OF_BUFFER, [](client& c) {
+               // 80x40 at scale 2 turned by 90 is 20x40 in surface units: 21 wide is out.
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wl_surface_set_buffer_scale(s, 2);
+               wl_surface_set_buffer_transform(s, WL_OUTPUT_TRANSFORM_90);
+               wl_surface_attach(s, make_buffer(c, 80, 40), 0, 0);
+               wp_viewport_set_source(v, 0, 0, wl_fixed_from_int(21), wl_fixed_from_int(40));
+               wl_surface_commit(s);
+           });
+    expect("viewport: exactly the scale-2, 90-degree buffer is inside", "none", 0,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wl_surface_set_buffer_scale(s, 2);
+               wl_surface_set_buffer_transform(s, WL_OUTPUT_TRANSFORM_90);
+               wl_surface_attach(s, make_buffer(c, 80, 40), 0, 0);
+               wp_viewport_set_source(v, 0, 0, wl_fixed_from_int(20), wl_fixed_from_int(40));
+               wp_viewport_set_destination(v, 33, 17);
+               wl_surface_commit(s);
+           });
+    expect("viewport: request after its wl_surface is gone", "wp_viewport",
+           WP_VIEWPORT_ERROR_NO_SURFACE, [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wl_surface_destroy(s);
+               wp_viewport_set_destination(v, 10, 10);
+           });
+    expect("viewport: destroyed before the commit — its state goes with it", "none", 0,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wl_surface_attach(s, make_buffer(c, 40, 40), 0, 0);
+               wp_viewport_set_source(v, 0, 0, wl_fixed_from_double(10.5),
+                                      wl_fixed_from_int(10));
+               wp_viewport_destroy(v);
+               wl_surface_commit(s);
+               // And a new one may be created.
+               (void)wp_viewporter_get_viewport(c.viewporter, s);
+           });
+    expect("viewport: -1 everywhere unsets the source", "none", 0, [](client& c) {
+        wl_surface* s = wl_compositor_create_surface(c.compositor);
+        wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+        wl_surface_attach(s, make_buffer(c, 40, 40), 0, 0);
+        wp_viewport_set_source(v, 0, 0, wl_fixed_from_int(99), wl_fixed_from_int(99));
+        const wl_fixed_t unset = wl_fixed_from_int(-1);
+        wp_viewport_set_source(v, unset, unset, unset, unset);
+        wp_viewport_set_destination(v, -1, -1);
+        wl_surface_commit(s);
+    });
+    expect("viewport: a viewport surviving its wl_surface may still be destroyed", "none", 0,
+           [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, s);
+               wl_surface_destroy(s);
+               wp_viewport_destroy(v);
+           });
+    {
+        // A toplevel whose buffer is 1.25x its viewport destination maps at the destination
+        // size: the window geometry is in surface coordinates, as a fractional-scale client
+        // expects.
+        unsigned gw = 0, gh = 0;
+        expect("viewport: toplevel geometry is the destination size", "none", 0,
+               [&](client& c) {
+                   window w{};
+                   w.surface = wl_compositor_create_surface(c.compositor);
+                   wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, w.surface);
+                   w.xdg = xdg_wm_base_get_xdg_surface(c.wm_base, w.surface);
+                   xdg_surface_add_listener(w.xdg, &xdg_listener, &w.cfg);
+                   w.toplevel = xdg_surface_get_toplevel(w.xdg);
+                   xdg_toplevel_set_app_id(w.toplevel, "conformance-viewport");
+                   wl_surface_commit(w.surface);
+                   (void)wl_display_roundtrip(c.display);
+                   xdg_surface_ack_configure(w.xdg, w.cfg.serial);
+                   wp_viewport_set_destination(v, 200, 120);
+                   wl_surface_attach(w.surface, make_buffer(c, 250, 150), 0, 0);
+                   wl_surface_commit(w.surface);
+                   (void)wl_display_roundtrip(c.display);
+                   std::lock_guard<std::mutex> hold(dispatch_lock);
+                   comp.toplevels().for_each([&](const lx::compositor::toplevel_record& r) {
+                       if (r.app_id && std::strcmp(r.app_id, "conformance-viewport") == 0) {
+                           gw = static_cast<unsigned>(r.geometry.width);
+                           gh = static_cast<unsigned>(r.geometry.height);
+                       }
+                   });
+               });
+        const bool ok = gw == 200 && gh == 120;
+        ++g_ran;
+        std::printf("  %s  viewport: mapped at the destination size (%ux%u)\n",
+                    ok ? "PASS" : "FAIL", gw, gh);
+        if (!ok)
+            ++g_failed;
+    }
+
+    // ── wp_fractional_scale_v1 ──
+    expect("fractional scale: second object for a surface", "wp_fractional_scale_manager_v1",
+           WP_FRACTIONAL_SCALE_MANAGER_V1_ERROR_FRACTIONAL_SCALE_EXISTS, [](client& c) {
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               (void)wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
+               (void)wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
+           });
+    {
+        // The first preferred_scale arrives with the object, before the first configure,
+        // so the first frame is already drawn at the right scale (120: the test output is
+        // at scale 1).
+        struct order {
+            std::vector<std::string> events;
+            uint32_t scale = 0;
+        } o{};
+        static const wp_fractional_scale_v1_listener frac_listener = {
+            [](void* data, wp_fractional_scale_v1*, uint32_t scale) {
+                auto* p = static_cast<order*>(data);
+                p->scale = scale;
+                p->events.emplace_back("preferred");
+            }};
+        static const xdg_surface_listener order_xdg = {
+            [](void* data, xdg_surface* xs, uint32_t serial) {
+                static_cast<order*>(data)->events.emplace_back("configure");
+                xdg_surface_ack_configure(xs, serial);
+            }};
+        expect("fractional scale: destroy and recreate is fine", "none", 0, [&](client& c) {
+            wl_surface* s = wl_compositor_create_surface(c.compositor);
+            wp_fractional_scale_v1* f =
+                wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
+            wp_fractional_scale_v1_add_listener(f, &frac_listener, &o);
+            xdg_surface* xs = xdg_wm_base_get_xdg_surface(c.wm_base, s);
+            xdg_surface_add_listener(xs, &order_xdg, &o);
+            (void)xdg_surface_get_toplevel(xs);
+            wl_surface_commit(s);
+            (void)wl_display_roundtrip(c.display);
+            wp_fractional_scale_v1_destroy(f);
+            (void)wp_fractional_scale_manager_v1_get_fractional_scale(c.fractional, s);
+        });
+        const bool ok = o.events.size() >= 2 && o.events[0] == "preferred" &&
+                        o.events[1] == "configure" && o.scale == 120;
+        ++g_ran;
+        std::printf("  %s  fractional scale: preferred_scale (%u) before the first configure\n",
+                    ok ? "PASS" : "FAIL", o.scale);
+        if (!ok)
+            ++g_failed;
+    }
+#endif
+
+#if defined(LUMEN_TEST_PRESENTATION)
+    // ── wp_presentation ──
+    // No request can raise an error; what matters is the clock and which feedback is
+    // discarded. Presented feedback needs a flip (KMS), covered by the presentation probe
+    // in app-smoke; here nothing is ever published, so nothing is sampled either.
+    {
+        struct fb_log {
+            std::vector<std::string> events;
+        };
+        static const wp_presentation_feedback_listener fb_listener = {
+            [](void*, struct wp_presentation_feedback*, wl_output*) {},
+            [](void* data, struct wp_presentation_feedback* f, uint32_t, uint32_t, uint32_t, uint32_t,
+               uint32_t, uint32_t, uint32_t) {
+                static_cast<fb_log*>(data)->events.emplace_back("presented");
+                wp_presentation_feedback_destroy(f);
+            },
+            [](void* data, struct wp_presentation_feedback* f) {
+                static_cast<fb_log*>(data)->events.emplace_back("discarded");
+                wp_presentation_feedback_destroy(f);
+            }};
+        const auto watch = [](wp_presentation* p, wl_surface* s, fb_log& log) {
+            struct wp_presentation_feedback* f = wp_presentation_feedback(p, s);
+            wp_presentation_feedback_add_listener(f, &fb_listener, &log);
+        };
+
+        uint32_t clock = ~0u;
+        expect("presentation: bind", "none", 0, [&](client& c) {
+            (void)wl_display_roundtrip(c.display);
+            clock = c.clock_id;
+        });
+        check("presentation: clock_id is CLOCK_MONOTONIC on bind", clock == CLOCK_MONOTONIC,
+              "clock_id " + std::to_string(clock));
+
+        fb_log first{}, second{};
+        expect("presentation: feedback on a superseded commit", "none", 0, [&](client& c) {
+            window w{};
+            map_window(c, w);
+            watch(c.presentation, w.surface, first);
+            wl_surface_attach(w.surface, make_buffer(c, 200, 150), 0, 0);
+            wl_surface_damage(w.surface, 0, 0, 200, 150);
+            wl_surface_commit(w.surface);
+            watch(c.presentation, w.surface, second);
+            wl_surface_attach(w.surface, make_buffer(c, 200, 150), 0, 0);
+            wl_surface_damage(w.surface, 0, 0, 200, 150);
+            wl_surface_commit(w.surface);
+            (void)wl_display_roundtrip(c.display);
+        });
+        check("presentation: a commit superseded before it was shown is discarded",
+              first.events.size() == 1 && first.events[0] == "discarded" &&
+                  second.events.empty(),
+              "first " + std::to_string(first.events.size()) + " event(s), second " +
+                  std::to_string(second.events.size()));
+
+        fb_log gone{};
+        expect("presentation: feedback whose surface is destroyed", "none", 0, [&](client& c) {
+            wl_surface* s = wl_compositor_create_surface(c.compositor);
+            watch(c.presentation, s, gone); // pending: before any commit
+            wl_surface_destroy(s);
+            (void)wl_display_roundtrip(c.display);
+        });
+        check("presentation: a destroyed surface's feedback is discarded",
+              gone.events.size() == 1 && gone.events[0] == "discarded",
+              std::to_string(gone.events.size()) + " event(s)");
+
+        fb_log cached{}, applied{};
+        expect("presentation: synchronized subsurface cache replaced", "none", 0,
+               [&](client& c) {
+                   window w{};
+                   map_window(c, w);
+                   wl_surface* a = wl_compositor_create_surface(c.compositor);
+                   (void)wl_subcompositor_get_subsurface(c.subcompositor, a, w.surface);
+                   watch(c.presentation, a, cached);
+                   wl_surface_attach(a, make_buffer(c, 20, 20), 0, 0);
+                   wl_surface_commit(a); // cached, waiting for the parent
+                   watch(c.presentation, a, applied);
+                   wl_surface_attach(a, make_buffer(c, 20, 20), 0, 0);
+                   wl_surface_commit(a); // replaces the cached update
+                   wl_surface_commit(w.surface);
+                   (void)wl_display_roundtrip(c.display);
+               });
+        check("presentation: a cached update replaced before its parent's commit is discarded",
+              cached.events.size() == 1 && cached.events[0] == "discarded" &&
+                  applied.events.empty(),
+              "replaced " + std::to_string(cached.events.size()) + " event(s), applied " +
+                  std::to_string(applied.events.size()));
+    }
+#endif
 
     // ── wl_surface.destroy before the role object ──
     expect("surface: destroyed before its wl_subsurface", "[destroyed]",
@@ -2247,6 +2696,921 @@ int main() {
             wl_display_disconnect(c.display);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
+
+#if defined(LUMEN_TEST_IDLE)
+    // ── ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1, zwlr_output_power_manager_v1 ──
+    // Neither idle protocol defines an error; what matters is the event order. Timers need
+    // the event loop (live: app-smoke group K), so the timing here uses a 0 ms notification,
+    // which is idled in the same dispatch and again right after each resume.
+    {
+        struct idle_log {
+            std::vector<std::string> events;
+        };
+        static const ext_idle_notification_v1_listener idle_listener = {
+            [](void* data, ext_idle_notification_v1*) {
+                static_cast<idle_log*>(data)->events.emplace_back("idled");
+            },
+            [](void* data, ext_idle_notification_v1*) {
+                static_cast<idle_log*>(data)->events.emplace_back("resumed");
+            }};
+        const auto joined_events = [](const idle_log& l) {
+            std::string out;
+            for (const auto& e : l.events)
+                out += (out.empty() ? "" : ",") + e;
+            return out.empty() ? std::string("(none)") : out;
+        };
+
+        idle_log zero{}, input_only{}, long_timeout{}, orphan{};
+        bool v2 = false;
+        expect("idle: notifications, then input", "none", 0, [&](client& c) {
+            if (!c.idle_notifier || !c.seat)
+                return;
+            v2 = ext_idle_notifier_v1_get_version(c.idle_notifier) >= 2;
+            auto* n = ext_idle_notifier_v1_get_idle_notification(c.idle_notifier, 0, c.seat);
+            ext_idle_notification_v1_add_listener(n, &idle_listener, &zero);
+            auto* l = ext_idle_notifier_v1_get_idle_notification(c.idle_notifier, 60000, c.seat);
+            ext_idle_notification_v1_add_listener(l, &idle_listener, &long_timeout);
+            ext_idle_notification_v1* i = nullptr;
+            if (v2) {
+                i = ext_idle_notifier_v1_get_input_idle_notification(c.idle_notifier, 0, c.seat);
+                ext_idle_notification_v1_add_listener(i, &idle_listener, &input_only);
+            }
+            // Notifications outlive their notifier ("All objects created via this interface
+            // remain valid").
+            auto* o = ext_idle_notifier_v1_get_idle_notification(c.idle_notifier, 0, c.seat);
+            ext_idle_notification_v1_add_listener(o, &idle_listener, &orphan);
+            ext_idle_notifier_v1_destroy(c.idle_notifier);
+            (void)wl_display_roundtrip(c.display);
+            inject_move(300, 200);
+            (void)wl_display_roundtrip(c.display);
+            ext_idle_notification_v1_destroy(n);
+            ext_idle_notification_v1_destroy(l);
+            ext_idle_notification_v1_destroy(o);
+            if (i)
+                ext_idle_notification_v1_destroy(i);
+            inject_move(310, 210); // destroyed: nothing more may arrive
+            (void)wl_display_roundtrip(c.display);
+        });
+        check("idle: a 0 ms notification is idled at once, resumed by input, idled again",
+              joined_events(zero) == "idled,resumed,idled", joined_events(zero));
+        check("idle: a 60 s notification sends nothing (and input does not resume it)",
+              long_timeout.events.empty(), joined_events(long_timeout));
+        check("idle: get_input_idle_notification (v2) behaves the same without inhibitors",
+              !v2 || joined_events(input_only) == "idled,resumed,idled",
+              v2 ? joined_events(input_only) : std::string("notifier below v2"));
+        check("idle: a notification outlives its destroyed notifier",
+              joined_events(orphan) == "idled,resumed,idled", joined_events(orphan));
+
+        expect("idle inhibitor: surface destroyed before the inhibitor", "none", 0,
+               [](client& c) {
+                   if (!c.inhibit_manager)
+                       return;
+                   wl_surface* s = wl_compositor_create_surface(c.compositor);
+                   auto* i = zwp_idle_inhibit_manager_v1_create_inhibitor(c.inhibit_manager, s);
+                   wl_surface_destroy(s); // the inhibitor goes inert, not an error
+                   (void)wl_display_roundtrip(c.display);
+                   zwp_idle_inhibitor_v1_destroy(i);
+               });
+        expect("idle inhibitor: manager destroyed first, inhibitors live on", "none", 0,
+               [](client& c) {
+                   if (!c.inhibit_manager)
+                       return;
+                   window w{};
+                   map_window(c, w);
+                   auto* i =
+                       zwp_idle_inhibit_manager_v1_create_inhibitor(c.inhibit_manager, w.surface);
+                   zwp_idle_inhibit_manager_v1_destroy(c.inhibit_manager);
+                   (void)wl_display_roundtrip(c.display);
+                   zwp_idle_inhibitor_v1_destroy(i);
+               });
+
+        struct power_log {
+            std::vector<std::string> events;
+        };
+        static const zwlr_output_power_v1_listener power_listener = {
+            [](void* data, zwlr_output_power_v1*, uint32_t mode) {
+                static_cast<power_log*>(data)->events.emplace_back(
+                    mode == ZWLR_OUTPUT_POWER_V1_MODE_ON ? "on" : "off");
+            },
+            [](void* data, zwlr_output_power_v1*) {
+                static_cast<power_log*>(data)->events.emplace_back("failed");
+            }};
+        const auto get_power = [](client& c, power_log* log) -> zwlr_output_power_v1* {
+            if (!c.power_manager || !c.output_name)
+                return nullptr;
+            auto* out = static_cast<wl_output*>(
+                wl_registry_bind(c.registry, c.output_name, &wl_output_interface, 1));
+            auto* p = zwlr_output_power_manager_v1_get_output_power(c.power_manager, out);
+            if (log)
+                zwlr_output_power_v1_add_listener(p, &power_listener, log);
+            return p;
+        };
+        expect("output power: set_mode outside {off, on}", "zwlr_output_power_v1",
+               ZWLR_OUTPUT_POWER_V1_ERROR_INVALID_MODE, [&](client& c) {
+                   if (auto* p = get_power(c, nullptr))
+                       zwlr_output_power_v1_set_mode(p, 2);
+               });
+        power_log first{};
+        expect("output power: the mode on creation", "none", 0, [&](client& c) {
+            if (get_power(c, &first))
+                (void)wl_display_roundtrip(c.display);
+        });
+        // With KMS (this in-process compositor takes the card when it can) the output is on;
+        // headless or nested there is nothing to power, and the object is failed at once.
+        check("output power: exactly one event on creation — mode on, or failed without KMS",
+              first.events.size() == 1 &&
+                  (first.events[0] == "on" || first.events[0] == "failed"),
+              first.events.empty() ? std::string("(none)") : first.events[0]);
+    }
+#endif
+
+#if defined(LUMEN_TEST_SESSION_LOCK)
+    // ── ext_session_lock_v1: every error, and the lock's life ──
+    // `locked` needs a locked frame on the output: this compositor never lit its CRTC (no
+    // render loop runs here), so nothing of the session is visible and a lock with a lock
+    // surface on every output is locked at once; without KMS the tick below publishes it.
+    {
+        struct lock_log {
+            unsigned locked = 0;
+            unsigned finished = 0;
+            uint32_t serial = 0;
+            uint32_t width = 0;
+            uint32_t height = 0;
+            unsigned configures = 0;
+        };
+        static const ext_session_lock_v1_listener lock_listener = {
+            [](void* d, ext_session_lock_v1*) { ++static_cast<lock_log*>(d)->locked; },
+            [](void* d, ext_session_lock_v1*) { ++static_cast<lock_log*>(d)->finished; }};
+        static const ext_session_lock_surface_v1_listener lock_surface_listener = {
+            [](void* d, ext_session_lock_surface_v1*, uint32_t serial, uint32_t w, uint32_t h) {
+                auto* l = static_cast<lock_log*>(d);
+                l->serial = serial;
+                l->width = w;
+                l->height = h;
+                ++l->configures;
+            }};
+        unsigned long long tick_frame = 1'000'000;
+        const auto tick = [&] {
+            std::lock_guard<std::mutex> hold(dispatch_lock);
+            lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+            lx::scheduler::frame_tick t{};
+            t.timestamp_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now().time_since_epoch())
+                                 .count();
+            t.delta_seconds = 1.0 / 30.0;
+            t.frame_index = static_cast<unsigned>(++tick_frame);
+            comp.tick_ui(t);
+            comp.wayland().flush();
+        };
+        const auto state = [&] {
+            std::lock_guard<std::mutex> hold(dispatch_lock);
+            return comp.session_lock_state();
+        };
+        const auto logind_unlock = [&] {
+            std::lock_guard<std::mutex> hold(dispatch_lock);
+            comp.inject_logind_unlock();
+            comp.wayland().flush();
+        };
+        const auto output = [](client& c) {
+            return static_cast<wl_output*>(
+                wl_registry_bind(c.registry, c.output_name, &wl_output_interface, 1));
+        };
+        // A lock with one configured lock surface; `commit` maps it at the configured size.
+        struct locker {
+            ext_session_lock_v1* lock = nullptr;
+            wl_surface* surface = nullptr;
+            ext_session_lock_surface_v1* ls = nullptr;
+            lock_log log{};
+        };
+        const auto start_lock = [&](client& c, locker& l, bool with_surface) {
+            l.lock = ext_session_lock_manager_v1_lock(c.lock_manager);
+            ext_session_lock_v1_add_listener(l.lock, &lock_listener, &l.log);
+            if (!with_surface)
+                return;
+            l.surface = wl_compositor_create_surface(c.compositor);
+            l.ls = ext_session_lock_v1_get_lock_surface(l.lock, l.surface, output(c));
+            ext_session_lock_surface_v1_add_listener(l.ls, &lock_surface_listener, &l.log);
+            (void)wl_display_roundtrip(c.display);
+        };
+        const auto map_lock = [&](client& c, locker& l) {
+            ext_session_lock_surface_v1_ack_configure(l.ls, l.log.serial);
+            wl_surface_attach(l.surface,
+                              make_buffer(c, static_cast<int>(l.log.width),
+                                          static_cast<int>(l.log.height)),
+                              0, 0);
+            wl_surface_commit(l.surface);
+            (void)wl_display_roundtrip(c.display);
+            tick();
+            (void)wl_display_roundtrip(c.display);
+        };
+        const bool up = [&] {
+            client probe{};
+            const bool ok = connect(probe) && probe.lock_manager && probe.output_name;
+            if (probe.display)
+                wl_display_disconnect(probe.display);
+            return ok;
+        }();
+        check("session lock: ext_session_lock_manager_v1 is advertised (with a wl_output)", up,
+              up ? "" : "missing global or output");
+
+        if (up) {
+            expect("session lock: get_lock_surface on a surface with another role",
+                   "ext_session_lock_v1", EXT_SESSION_LOCK_V1_ERROR_ROLE, [&](client& c) {
+                       window w{};
+                       map_window(c, w);
+                       locker l{};
+                       start_lock(c, l, false);
+                       (void)ext_session_lock_v1_get_lock_surface(l.lock, w.surface, output(c));
+                   });
+            // Each error kills its locker before `locked`: the session is abandoned (fails
+            // closed, checked below) and logind's Unlock clears it for the next case.
+            logind_unlock();
+            expect("session lock: a second lock surface for one output",
+                   "ext_session_lock_v1", EXT_SESSION_LOCK_V1_ERROR_DUPLICATE_OUTPUT,
+                   [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, true);
+                       wl_output* o = output(c);
+                       (void)ext_session_lock_v1_get_lock_surface(
+                           l.lock, wl_compositor_create_surface(c.compositor), o);
+                   });
+            logind_unlock();
+            expect("session lock: get_lock_surface on a surface with a buffer attached",
+                   "ext_session_lock_v1", EXT_SESSION_LOCK_V1_ERROR_ALREADY_CONSTRUCTED,
+                   [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, false);
+                       wl_surface* s = wl_compositor_create_surface(c.compositor);
+                       wl_surface_attach(s, make_buffer(c, 10, 10), 0, 0);
+                       (void)ext_session_lock_v1_get_lock_surface(l.lock, s, output(c));
+                   });
+            logind_unlock();
+            expect("session lock: unlock_and_destroy before locked", "[destroyed]",
+                   EXT_SESSION_LOCK_V1_ERROR_INVALID_UNLOCK, [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, false);
+                       ext_session_lock_v1_unlock_and_destroy(l.lock);
+                   });
+            check("session lock: a locker dying of a protocol error before locked leaves the "
+                  "session abandoned (fails closed)",
+                  state() == lx::compositor::lock_state::abandoned,
+                  lx::compositor::lock_state_name(state()));
+            logind_unlock();
+            check("session lock: logind Unlock ends an abandoned lock",
+                  state() == lx::compositor::lock_state::unlocked,
+                  lx::compositor::lock_state_name(state()));
+
+            expect("session lock: lock surface committed before the first ack",
+                   "ext_session_lock_surface_v1",
+                   EXT_SESSION_LOCK_SURFACE_V1_ERROR_COMMIT_BEFORE_FIRST_ACK, [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, true);
+                       wl_surface_attach(l.surface, make_buffer(c, 10, 10), 0, 0);
+                       wl_surface_commit(l.surface);
+                   });
+            logind_unlock();
+            expect("session lock: lock surface committed with a null buffer",
+                   "ext_session_lock_surface_v1", EXT_SESSION_LOCK_SURFACE_V1_ERROR_NULL_BUFFER,
+                   [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, true);
+                       ext_session_lock_surface_v1_ack_configure(l.ls, l.log.serial);
+                       wl_surface_commit(l.surface);
+                   });
+            logind_unlock();
+            expect("session lock: lock surface not the acked size",
+                   "ext_session_lock_surface_v1",
+                   EXT_SESSION_LOCK_SURFACE_V1_ERROR_DIMENSIONS_MISMATCH, [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, true);
+                       ext_session_lock_surface_v1_ack_configure(l.ls, l.log.serial);
+                       wl_surface_attach(l.surface, make_buffer(c, 10, 10), 0, 0);
+                       wl_surface_commit(l.surface);
+                   });
+            logind_unlock();
+            expect("session lock: ack_configure of a serial never sent",
+                   "ext_session_lock_surface_v1", EXT_SESSION_LOCK_SURFACE_V1_ERROR_INVALID_SERIAL,
+                   [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, true);
+                       ext_session_lock_surface_v1_ack_configure(l.ls, l.log.serial + 1000);
+                   });
+            logind_unlock();
+            expect("session lock: ack_configure of a serial already acked",
+                   "ext_session_lock_surface_v1", EXT_SESSION_LOCK_SURFACE_V1_ERROR_INVALID_SERIAL,
+                   [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, true);
+                       ext_session_lock_surface_v1_ack_configure(l.ls, l.log.serial);
+                       ext_session_lock_surface_v1_ack_configure(l.ls, l.log.serial);
+                   });
+            logind_unlock();
+
+            // The whole life: configure at the output's size, locked after the locked frame,
+            // destroy is then invalid_destroy (the client dies: abandoned). A destructor
+            // request removes the proxy at once, so libwayland reports no interface for it.
+            lock_log life{};
+            expect("session lock: destroy after locked", "[destroyed]",
+                   EXT_SESSION_LOCK_V1_ERROR_INVALID_DESTROY, [&](client& c) {
+                       locker l{};
+                       start_lock(c, l, true);
+                       map_lock(c, l);
+                       life = l.log;
+                       ext_session_lock_v1_destroy(l.lock);
+                   });
+            check("session lock: configure at the output's logical size, then locked",
+                  life.configures == 1 && life.width > 0 && life.height > 0 && life.locked == 1 &&
+                      life.finished == 0,
+                  "configure " + std::to_string(life.width) + "x" + std::to_string(life.height) +
+                      ", locked " + std::to_string(life.locked));
+            check("session lock: the locker died while locked — abandoned, still locked",
+                  state() == lx::compositor::lock_state::abandoned,
+                  lx::compositor::lock_state_name(state()));
+
+            // A new locker takes an abandoned lock over: locked at once; then a second locker
+            // is finished; unlock_and_destroy unlocks.
+            locker taker{}, second{};
+            expect("session lock: a new locker replaces an abandoned lock, then unlocks", "none",
+                   0, [&](client& c) {
+                       start_lock(c, taker, false);
+                       (void)wl_display_roundtrip(c.display);
+                       client other{};
+                       if (connect(other) && other.lock_manager) {
+                           start_lock(other, second, false);
+                           (void)wl_display_roundtrip(other.display);
+                           ext_session_lock_v1_destroy(second.lock); // finished: allowed
+                           (void)wl_display_roundtrip(other.display);
+                           wl_display_disconnect(other.display);
+                       }
+                       ext_session_lock_v1_unlock_and_destroy(taker.lock);
+                       (void)wl_display_roundtrip(c.display);
+                   });
+            check("session lock: an abandoned lock's replacement is locked at once",
+                  taker.log.locked == 1 && taker.log.finished == 0,
+                  "locked " + std::to_string(taker.log.locked));
+            check("session lock: a second locker while one holds the lock gets finished",
+                  second.log.finished == 1 && second.log.locked == 0,
+                  "finished " + std::to_string(second.log.finished));
+            check("session lock: unlock_and_destroy unlocks",
+                  state() == lx::compositor::lock_state::unlocked,
+                  lx::compositor::lock_state_name(state()));
+
+            // logind's Unlock while a live locker holds the lock: `finished`, after which
+            // destroy is allowed even though `locked` was sent.
+            locker held{};
+            expect("session lock: logind Unlock finishes a live locker; destroy is then allowed",
+                   "none", 0, [&](client& c) {
+                       start_lock(c, held, true);
+                       map_lock(c, held);
+                       logind_unlock();
+                       (void)wl_display_roundtrip(c.display);
+                       ext_session_lock_v1_destroy(held.lock);
+                       (void)wl_display_roundtrip(c.display);
+                   });
+            check("session lock: locked, then finished by logind",
+                  held.log.locked == 1 && held.log.finished == 1 &&
+                      state() == lx::compositor::lock_state::unlocked,
+                  "locked " + std::to_string(held.log.locked) + ", finished " +
+                      std::to_string(held.log.finished));
+
+            // Input while locked: a normal window loses the keyboard at the request, and the
+            // lock surface gets it once it has content.
+            {
+                client app{};
+                window w{};
+                bool ok = connect(app) && app.seat;
+                static unsigned app_enters = 0, app_leaves = 0, lock_enters = 0;
+                static wl_surface* lock_surface_ptr = nullptr;
+                static const wl_keyboard_listener kl = {
+                    [](void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) { close(fd); },
+                    [](void*, wl_keyboard*, uint32_t, wl_surface* s, wl_array*) {
+                        if (s && s == lock_surface_ptr)
+                            ++lock_enters;
+                        else
+                            ++app_enters;
+                    },
+                    [](void*, wl_keyboard*, uint32_t, wl_surface* s) {
+                        if (!(s && s == lock_surface_ptr))
+                            ++app_leaves;
+                    },
+                    [](void*, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t) {},
+                    [](void*, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {},
+                    [](void*, wl_keyboard*, int32_t, int32_t) {}};
+                wl_keyboard* kb = nullptr;
+                if (ok) {
+                    kb = wl_seat_get_keyboard(app.seat);
+                    wl_keyboard_add_listener(kb, &kl, nullptr);
+                    map_window(app, w);
+                    (void)wl_display_roundtrip(app.display);
+                }
+                const unsigned enters0 = app_enters;
+                locker l{};
+                // The locker is the same client here: the lock surface's enter is told apart
+                // by its surface.
+                if (ok) {
+                    start_lock(app, l, true);
+                    lock_surface_ptr = l.surface;
+                    (void)wl_display_roundtrip(app.display);
+                }
+                const unsigned leaves_at_request = app_leaves;
+                if (ok)
+                    map_lock(app, l);
+                const bool lock_has_kb = lock_enters == 1;
+                if (ok) {
+                    ext_session_lock_v1_unlock_and_destroy(l.lock);
+                    (void)wl_display_roundtrip(app.display);
+                    (void)wl_display_roundtrip(app.display);
+                }
+                check("session lock: the focused window loses the keyboard at the lock request, "
+                      "the lock surface gets it, the window gets it back at unlock",
+                      ok && enters0 >= 1 && leaves_at_request >= 1 && lock_has_kb &&
+                          app_enters >= enters0 + 1 && l.log.locked == 1,
+                      "app enters " + std::to_string(enters0) + "→" +
+                          std::to_string(app_enters) + ", leaves " +
+                          std::to_string(leaves_at_request) + ", lock enters " +
+                          std::to_string(lock_enters));
+                if (kb)
+                    wl_keyboard_destroy(kb);
+                if (app.display)
+                    wl_display_disconnect(app.display);
+            }
+            if (state() != lx::compositor::lock_state::unlocked)
+                logind_unlock();
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+#endif
+
+#if defined(LUMEN_TEST_IME)
+    // ── text-input-v3, input-method-v2, virtual-keyboard-v1: every error, and the relay ──
+    {
+        static const zwp_input_method_v2_listener quiet_im = {
+            [](void*, zwp_input_method_v2*) {}, [](void*, zwp_input_method_v2*) {},
+            [](void*, zwp_input_method_v2*, const char*, uint32_t, uint32_t) {},
+            [](void*, zwp_input_method_v2*, uint32_t) {},
+            [](void*, zwp_input_method_v2*, uint32_t, uint32_t) {},
+            [](void*, zwp_input_method_v2*) {},
+            [](void* d, zwp_input_method_v2*) {
+                if (d)
+                    ++*static_cast<unsigned*>(d);
+            }};
+        const auto actions = [](client& c, std::initializer_list<uint32_t> list) {
+            zwp_text_input_v3* ti = zwp_text_input_manager_v3_get_text_input(c.ti_manager, c.seat);
+            wl_array a{};
+            wl_array_init(&a);
+            for (uint32_t v : list)
+                *static_cast<uint32_t*>(wl_array_add(&a, sizeof(uint32_t))) = v;
+            zwp_text_input_v3_set_available_actions(ti, &a);
+            wl_array_release(&a);
+        };
+        client probe{};
+        const bool up = connect(probe) && probe.ti_manager && probe.im_manager &&
+                        probe.vk_manager && probe.ti_version == 2;
+        check("ime: zwp_text_input_manager_v3 v2, zwp_input_method_manager_v2 and "
+              "zwp_virtual_keyboard_manager_v1 are advertised",
+              up, "text input v" + std::to_string(probe.ti_version));
+        if (probe.display)
+            wl_display_disconnect(probe.display);
+        if (up) {
+            expect("text input: available actions holding none", "zwp_text_input_v3",
+                   ZWP_TEXT_INPUT_V3_ERROR_INVALID_ACTION,
+                   [&](client& c) { actions(c, {ZWP_TEXT_INPUT_V3_ACTION_NONE}); });
+            expect("text input: an action twice", "zwp_text_input_v3",
+                   ZWP_TEXT_INPUT_V3_ERROR_INVALID_ACTION, [&](client& c) {
+                       actions(c, {ZWP_TEXT_INPUT_V3_ACTION_SUBMIT, ZWP_TEXT_INPUT_V3_ACTION_SUBMIT});
+                   });
+            expect("text input: a value that is not an action", "zwp_text_input_v3",
+                   ZWP_TEXT_INPUT_V3_ERROR_INVALID_ACTION, [&](client& c) { actions(c, {7}); });
+            expect("text input: submit, and an empty list, are fine", "none", 0, [&](client& c) {
+                actions(c, {ZWP_TEXT_INPUT_V3_ACTION_SUBMIT});
+                actions(c, {});
+            });
+            expect("input method: popup surface on a surface with another role",
+                   "zwp_input_method_v2", ZWP_INPUT_METHOD_V2_ERROR_ROLE, [&](client& c) {
+                       zwp_input_method_v2* im =
+                           zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       wl_surface* s = wl_compositor_create_surface(c.compositor);
+                       (void)xdg_surface_get_toplevel(xdg_wm_base_get_xdg_surface(c.wm_base, s));
+                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                   });
+            expect("input method: a second popup object for one surface", "zwp_input_method_v2",
+                   ZWP_INPUT_METHOD_V2_ERROR_ROLE, [&](client& c) {
+                       zwp_input_method_v2* im =
+                           zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       wl_surface* s = wl_compositor_create_surface(c.compositor);
+                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                   });
+            expect("input method: the popup object goes, its surface may take a new one", "none",
+                   0, [&](client& c) {
+                       zwp_input_method_v2* im =
+                           zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       wl_surface* s = wl_compositor_create_surface(c.compositor);
+                       zwp_input_popup_surface_v2_destroy(
+                           zwp_input_method_v2_get_input_popup_surface(im, s));
+                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                   });
+            expect("input method: wl_surface destroyed before its popup object", "[destroyed]",
+                   WL_SURFACE_ERROR_DEFUNCT_ROLE_OBJECT, [&](client& c) {
+                       zwp_input_method_v2* im =
+                           zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       wl_surface* s = wl_compositor_create_surface(c.compositor);
+                       (void)zwp_input_method_v2_get_input_popup_surface(im, s);
+                       wl_surface_destroy(s);
+                   });
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            unsigned unavailable_first = 0, unavailable_second = 0;
+            expect("input method: a second one on the seat is unavailable (and inert)", "none", 0,
+                   [&](client& c) {
+                       zwp_input_method_v2* first =
+                           zwp_input_method_manager_v2_get_input_method(c.im_manager, c.seat);
+                       zwp_input_method_v2_add_listener(first, &quiet_im, &unavailable_first);
+                       (void)wl_display_roundtrip(c.display);
+                       client other{};
+                       if (connect(other) && other.im_manager && other.seat) {
+                           zwp_input_method_v2* second =
+                               zwp_input_method_manager_v2_get_input_method(other.im_manager,
+                                                                            other.seat);
+                           zwp_input_method_v2_add_listener(second, &quiet_im, &unavailable_second);
+                           (void)wl_display_roundtrip(other.display);
+                           // Inert: its requests are accepted and ignored.
+                           zwp_input_method_v2_commit_string(second, "x");
+                           zwp_input_method_v2_commit(second, 0);
+                           (void)wl_display_roundtrip(other.display);
+                           wl_display_disconnect(other.display);
+                       }
+                   });
+            check("input method: unavailable is the second one's only event, not the first's",
+                  unavailable_first == 0 && unavailable_second == 1,
+                  "first " + std::to_string(unavailable_first) + ", second " +
+                      std::to_string(unavailable_second));
+            expect("virtual keyboard: key before a keymap", "zwp_virtual_keyboard_v1",
+                   ZWP_VIRTUAL_KEYBOARD_V1_ERROR_NO_KEYMAP, [&](client& c) {
+                       zwp_virtual_keyboard_v1_key(zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+                                                       c.vk_manager, c.seat),
+                                                   0, 30, 1);
+                   });
+            expect("virtual keyboard: modifiers before a keymap", "zwp_virtual_keyboard_v1",
+                   ZWP_VIRTUAL_KEYBOARD_V1_ERROR_NO_KEYMAP, [&](client& c) {
+                       zwp_virtual_keyboard_v1_modifiers(
+                           zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager,
+                                                                                   c.seat),
+                           1, 0, 0, 0);
+                   });
+            expect("virtual keyboard: a keymap format that is not one", "zwp_virtual_keyboard_v1",
+                   1 /* invalid_keymap_format */, [&](client& c) {
+                       const int fd = memfd_create("lumen-vk", MFD_CLOEXEC);
+                       zwp_virtual_keyboard_v1_keymap(
+                           zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager,
+                                                                                   c.seat),
+                           5, fd, 0);
+                       close(fd);
+                   });
+            expect("virtual keyboard: a keymap that does not compile leaves it without one",
+                   "zwp_virtual_keyboard_v1", ZWP_VIRTUAL_KEYBOARD_V1_ERROR_NO_KEYMAP,
+                   [&](client& c) {
+                       const int fd = memfd_create("lumen-vk", MFD_CLOEXEC);
+                       const char junk[] = "xkb_keymap { this is not a keymap";
+                       (void)!write(fd, junk, sizeof(junk));
+                       zwp_virtual_keyboard_v1* vk =
+                           zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager,
+                                                                                   c.seat);
+                       zwp_virtual_keyboard_v1_keymap(vk, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
+                                                      sizeof(junk));
+                       close(fd);
+                       zwp_virtual_keyboard_v1_key(vk, 0, 30, 1);
+                   });
+            expect("virtual keyboard: no_keymap format, then keys", "none", 0, [&](client& c) {
+                const int fd = open("/dev/null", O_RDONLY | O_CLOEXEC);
+                zwp_virtual_keyboard_v1* vk =
+                    zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(c.vk_manager, c.seat);
+                zwp_virtual_keyboard_v1_keymap(vk, WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP, fd, 0);
+                close(fd);
+                zwp_virtual_keyboard_v1_key(vk, 0, 30, 1);
+                zwp_virtual_keyboard_v1_key(vk, 0, 30, 0);
+                zwp_virtual_keyboard_v1_modifiers(vk, 0, 0, 0, 0);
+            });
+
+            // The relay end to end: an app's text input and an input method on another
+            // connection, keys routed to the grab while it is active, text back to the app.
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+            struct app_log {
+                unsigned enters = 0, leaves = 0, dones = 0, last_serial = 0, kb_keys = 0;
+                unsigned keymaps = 0;
+                std::string preedit, commit;
+                unsigned last_kb_key = 0;
+            };
+            struct im_log {
+                unsigned activates = 0, deactivates = 0, dones = 0, grab_keys = 0, grab_mods = 0;
+                unsigned keymaps = 0, repeat = 0, last_key = 0, last_state = 0, unavailable = 0;
+                std::string surrounding;
+                uint32_t hint = 0, purpose = 0;
+                int rect_x = 0, rect_y = 0, rect_w = -1, rect_h = -1;
+                int keymap_fd = -1;
+                uint32_t keymap_size = 0;
+            };
+            static app_log al{};
+            static im_log il{};
+            al = {};
+            il = {};
+            static const zwp_text_input_v3_listener ti_l = {
+                [](void*, zwp_text_input_v3*, wl_surface*) { ++al.enters; },
+                [](void*, zwp_text_input_v3*, wl_surface*) { ++al.leaves; },
+                [](void*, zwp_text_input_v3*, const char* t, int32_t, int32_t) {
+                    al.preedit = t ? t : "";
+                },
+                [](void*, zwp_text_input_v3*, const char* t) { al.commit = t ? t : ""; },
+                [](void*, zwp_text_input_v3*, uint32_t, uint32_t) {},
+                [](void*, zwp_text_input_v3*, uint32_t serial) {
+                    ++al.dones;
+                    al.last_serial = serial;
+                },
+                [](void*, zwp_text_input_v3*, uint32_t, uint32_t) {},
+                [](void*, zwp_text_input_v3*, const char*) {},
+                [](void*, zwp_text_input_v3*, uint32_t, uint32_t, uint32_t) {}};
+            static const zwp_input_method_v2_listener im_l = {
+                [](void*, zwp_input_method_v2*) { ++il.activates; },
+                [](void*, zwp_input_method_v2*) { ++il.deactivates; },
+                [](void*, zwp_input_method_v2*, const char* t, uint32_t, uint32_t) {
+                    il.surrounding = t ? t : "";
+                },
+                [](void*, zwp_input_method_v2*, uint32_t) {},
+                [](void*, zwp_input_method_v2*, uint32_t h, uint32_t p) {
+                    il.hint = h;
+                    il.purpose = p;
+                },
+                [](void*, zwp_input_method_v2*) { ++il.dones; },
+                [](void*, zwp_input_method_v2*) { ++il.unavailable; }};
+            static const zwp_input_method_keyboard_grab_v2_listener grab_l = {
+                [](void*, zwp_input_method_keyboard_grab_v2*, uint32_t, int32_t fd, uint32_t size) {
+                    ++il.keymaps;
+                    if (il.keymap_fd >= 0)
+                        close(il.keymap_fd);
+                    il.keymap_fd = fd;
+                    il.keymap_size = size;
+                },
+                [](void*, zwp_input_method_keyboard_grab_v2*, uint32_t, uint32_t, uint32_t key,
+                   uint32_t state) {
+                    ++il.grab_keys;
+                    il.last_key = key;
+                    il.last_state = state;
+                },
+                [](void*, zwp_input_method_keyboard_grab_v2*, uint32_t, uint32_t, uint32_t,
+                   uint32_t, uint32_t) { ++il.grab_mods; },
+                [](void*, zwp_input_method_keyboard_grab_v2*, int32_t, int32_t) { ++il.repeat; }};
+            static const zwp_input_popup_surface_v2_listener popup_l = {
+                [](void*, zwp_input_popup_surface_v2*, int32_t x, int32_t y, int32_t w, int32_t h) {
+                    il.rect_x = x;
+                    il.rect_y = y;
+                    il.rect_w = w;
+                    il.rect_h = h;
+                }};
+            static const wl_keyboard_listener app_kb = {
+                [](void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) {
+                    ++al.keymaps;
+                    close(fd);
+                },
+                [](void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {},
+                [](void*, wl_keyboard*, uint32_t, wl_surface*) {},
+                [](void*, wl_keyboard*, uint32_t, uint32_t, uint32_t key, uint32_t state) {
+                    if (state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+                        ++al.kb_keys;
+                        al.last_kb_key = key;
+                    }
+                },
+                [](void*, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {},
+                [](void*, wl_keyboard*, int32_t, int32_t) {}};
+            const auto key = [&](unsigned code, bool pressed) {
+                std::lock_guard<std::mutex> hold(dispatch_lock);
+                lx::input::key_event k{};
+                k.evdev_keycode = code;
+                k.pressed = pressed;
+                comp.inject_key(k);
+                comp.wayland().flush();
+            };
+            client app{};
+            client ime{};
+            window w{};
+            bool ok = connect(app) && app.seat && app.ti_manager && connect(ime) &&
+                      ime.im_manager && ime.vk_manager && ime.seat;
+            zwp_text_input_v3* ti = nullptr;
+            zwp_input_method_v2* im = nullptr;
+            zwp_input_method_keyboard_grab_v2* grab = nullptr;
+            wl_keyboard* kb = nullptr;
+            const auto both = [&] {
+                (void)wl_display_roundtrip(app.display);
+                (void)wl_display_roundtrip(ime.display);
+                (void)wl_display_roundtrip(app.display);
+            };
+            if (ok) {
+                kb = wl_seat_get_keyboard(app.seat);
+                wl_keyboard_add_listener(kb, &app_kb, nullptr);
+                map_window(app, w);
+                ti = zwp_text_input_manager_v3_get_text_input(app.ti_manager, app.seat);
+                zwp_text_input_v3_add_listener(ti, &ti_l, nullptr);
+                both();
+            }
+            check("ime: no text-input focus while no input method is bound", ok && al.enters == 0,
+                  "enters " + std::to_string(al.enters));
+            if (ok) {
+                im = zwp_input_method_manager_v2_get_input_method(ime.im_manager, ime.seat);
+                zwp_input_method_v2_add_listener(im, &im_l, nullptr);
+                both();
+            }
+            check("ime: the focused window's text input is entered once an input method binds",
+                  ok && al.enters == 1 && il.unavailable == 0,
+                  "enters " + std::to_string(al.enters));
+            unsigned commits = 0;
+            if (ok) {
+                zwp_text_input_v3_enable(ti);
+                zwp_text_input_v3_set_surrounding_text(ti, "abc", 3, 3);
+                zwp_text_input_v3_set_content_type(ti, ZWP_TEXT_INPUT_V3_CONTENT_HINT_SPELLCHECK,
+                                                   ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+                zwp_text_input_v3_set_cursor_rectangle(ti, 20, 30, 2, 18);
+                zwp_text_input_v3_commit(ti);
+                ++commits;
+                both();
+            }
+            check("ime: enable → activate, surrounding text, content type, done",
+                  ok && il.activates == 1 && il.dones == 1 && il.surrounding == "abc" &&
+                      il.hint == ZWP_TEXT_INPUT_V3_CONTENT_HINT_SPELLCHECK,
+                  "activates " + std::to_string(il.activates) + ", dones " +
+                      std::to_string(il.dones) + ", surrounding '" + il.surrounding + "'");
+            if (ok) {
+                grab = zwp_input_method_v2_grab_keyboard(im);
+                zwp_input_method_keyboard_grab_v2_add_listener(grab, &grab_l, nullptr);
+                both();
+            }
+            check("ime: the grab gets the seat keymap, repeat info and the modifiers",
+                  ok && il.keymaps == 1 && il.keymap_size > 0 && il.repeat == 1 && il.grab_mods >= 1,
+                  "keymaps " + std::to_string(il.keymaps) + ", repeat " +
+                      std::to_string(il.repeat) + ", mods " + std::to_string(il.grab_mods));
+            const unsigned app_keys0 = al.kb_keys;
+            if (ok) {
+                key(30, true); // KEY_A
+                both();
+            }
+            check("ime: a key press while active goes to the grab, not the window",
+                  ok && il.grab_keys == 1 && il.last_key == 30 && al.kb_keys == app_keys0,
+                  "grab keys " + std::to_string(il.grab_keys) + ", window keys " +
+                      std::to_string(al.kb_keys - app_keys0));
+            if (ok) {
+                zwp_input_method_v2_set_preedit_string(im, "\xce\xb1", 2, 2); // α
+                zwp_input_method_v2_commit(im, il.dones);
+                both();
+            }
+            check("ime: preedit reaches the text input with done(its commit count)",
+                  ok && al.preedit == "\xce\xb1" && al.last_serial == commits,
+                  "preedit '" + al.preedit + "', serial " + std::to_string(al.last_serial));
+            if (ok) {
+                zwp_input_method_v2_commit_string(im, "\xce\xb1");
+                zwp_input_method_v2_commit(im, il.dones + 7); // stale: dropped
+                zwp_input_method_v2_commit(im, il.dones);
+                both();
+            }
+            check("ime: a stale commit is dropped (its commit string never arrives)",
+                  ok && al.commit.empty(), "commit '" + al.commit + "'");
+            if (ok) {
+                zwp_input_method_v2_commit_string(im, "\xce\xb1");
+                zwp_input_method_v2_commit(im, il.dones);
+                both();
+            }
+            check("ime: commit_string reaches the text input", ok && al.commit == "\xce\xb1",
+                  "commit '" + al.commit + "'");
+            // A popup at the cursor: the v2 rectangle applies with the window's next commit.
+            wl_surface* ps = nullptr;
+            zwp_input_popup_surface_v2* popup = nullptr;
+            if (ok) {
+                ps = wl_compositor_create_surface(ime.compositor);
+                popup = zwp_input_method_v2_get_input_popup_surface(im, ps);
+                zwp_input_popup_surface_v2_add_listener(popup, &popup_l, nullptr);
+                wl_surface_attach(ps, make_buffer(ime, 120, 40), 0, 0);
+                wl_surface_commit(ps);
+                both();
+            }
+            const int before_commit_w = il.rect_w;
+            if (ok) {
+                wl_surface_commit(w.surface);
+                both();
+            }
+            check("ime: the popup is told the cursor rectangle once the window commits (v2)",
+                  ok && before_commit_w == -1 && il.rect_w == 2 && il.rect_h == 18 &&
+                      il.rect_x == 0 && il.rect_y == -18,
+                  "before " + std::to_string(before_commit_w) + ", rect " +
+                      std::to_string(il.rect_x) + "," + std::to_string(il.rect_y) + " " +
+                      std::to_string(il.rect_w) + "x" + std::to_string(il.rect_h));
+            // The virtual keyboard with the grab's keymap types into the window.
+            zwp_virtual_keyboard_v1* vk = nullptr;
+            if (ok && il.keymap_fd >= 0) {
+                vk = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(ime.vk_manager,
+                                                                             ime.seat);
+                zwp_virtual_keyboard_v1_keymap(vk, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, il.keymap_fd,
+                                               il.keymap_size);
+                zwp_virtual_keyboard_v1_key(vk, 0, 48, WL_KEYBOARD_KEY_STATE_PRESSED); // KEY_B
+                zwp_virtual_keyboard_v1_key(vk, 0, 48, WL_KEYBOARD_KEY_STATE_RELEASED);
+                both();
+            }
+            check("ime: the input method's virtual keyboard types into the window, not the grab",
+                  ok && al.last_kb_key == 48 && il.grab_keys == 1,
+                  "window key " + std::to_string(al.last_kb_key) + ", grab keys " +
+                      std::to_string(il.grab_keys));
+            // The seat's keymap forwarded verbatim switches nothing; another keymap is sent to
+            // the window before the virtual key, and the seat's is restored before the next
+            // physical key reaches it (below, once the input method is inactive).
+            const unsigned keymaps_seat = al.keymaps;
+            bool other_layout = false;
+#if defined(LUMEN_TEST_XKB)
+            if (ok) {
+                xkb_context* xc = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+                xkb_rule_names names{};
+                names.layout = "de";
+                xkb_keymap* km = xc ? xkb_keymap_new_from_names(xc, &names,
+                                                                XKB_KEYMAP_COMPILE_NO_FLAGS)
+                                    : nullptr;
+                char* text = km ? xkb_keymap_get_as_string(km, XKB_KEYMAP_FORMAT_TEXT_V1) : nullptr;
+                if (text) {
+                    const size_t len = std::strlen(text) + 1;
+                    const int fd = memfd_create("lumen-vk-de", MFD_CLOEXEC);
+                    if (fd >= 0 && write(fd, text, len) == static_cast<ssize_t>(len)) {
+                        zwp_virtual_keyboard_v1* vk2 =
+                            zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(ime.vk_manager,
+                                                                                    ime.seat);
+                        zwp_virtual_keyboard_v1_keymap(vk2, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
+                                                       static_cast<uint32_t>(len));
+                        zwp_virtual_keyboard_v1_key(vk2, 0, 21, WL_KEYBOARD_KEY_STATE_PRESSED);
+                        zwp_virtual_keyboard_v1_key(vk2, 0, 21, WL_KEYBOARD_KEY_STATE_RELEASED);
+                        both();
+                        other_layout = true;
+                    }
+                    if (fd >= 0)
+                        close(fd);
+                    free(text);
+                }
+                if (km)
+                    xkb_keymap_unref(km);
+                if (xc)
+                    xkb_context_unref(xc);
+            }
+#endif
+            const unsigned keymaps_other = al.keymaps;
+            check("ime: the seat's keymap through a virtual keyboard switches nothing; another "
+                  "layout is sent to the window before its key",
+                  ok && keymaps_seat == 1 && (!other_layout || (keymaps_other == 2 &&
+                                                                al.last_kb_key == 21)),
+                  "keymaps " + std::to_string(keymaps_seat) + " then " +
+                      std::to_string(keymaps_other) + (other_layout ? "" : " (no xkb: skipped)"));
+            // Disable: deactivate. The release of KEY_A goes where its press went (the grab).
+            if (ok) {
+                zwp_text_input_v3_disable(ti);
+                zwp_text_input_v3_commit(ti);
+                ++commits;
+                both();
+                key(30, false);
+                both();
+            }
+            check("ime: disable deactivates; the held key's release still goes to the grab",
+                  ok && il.deactivates == 1 && il.grab_keys == 2 && il.last_state == 0,
+                  "deactivates " + std::to_string(il.deactivates) + ", grab keys " +
+                      std::to_string(il.grab_keys));
+            const unsigned app_keys1 = al.kb_keys;
+            if (ok) {
+                key(31, true); // KEY_S
+                key(31, false);
+                both();
+            }
+            check("ime: inactive, keys reach the window again (the seat's keymap restored first)",
+                  ok && al.kb_keys == app_keys1 + 1 && al.last_kb_key == 31 && il.grab_keys == 2 &&
+                      (!other_layout || al.keymaps == keymaps_other + 1),
+                  "window keys +" + std::to_string(al.kb_keys - app_keys1) + ", keymaps " +
+                      std::to_string(al.keymaps));
+            // The input method goes: the text input is left (and entered again by the next).
+            if (ok) {
+                zwp_text_input_v3_enable(ti);
+                zwp_text_input_v3_commit(ti);
+                both();
+                // Its virtual keyboard and grab go with it.
+                wl_display_disconnect(ime.display);
+                ime.display = nullptr;
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                (void)wl_display_roundtrip(app.display);
+            }
+            check("ime: the input method's client goes — its text input is left",
+                  ok && al.leaves == 1, "leaves " + std::to_string(al.leaves));
+            (void)vk;
+            if (il.keymap_fd >= 0) {
+                close(il.keymap_fd);
+                il.keymap_fd = -1;
+            }
+            if (kb)
+                wl_keyboard_destroy(kb);
+            if (ime.display)
+                wl_display_disconnect(ime.display);
+            if (app.display)
+                wl_display_disconnect(app.display);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+#endif
 
     // ── Client churn: disconnects out of connection order ──
     // The server's per-client destroy listener must survive its slot being compacted. It

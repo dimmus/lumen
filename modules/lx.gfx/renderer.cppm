@@ -20,11 +20,12 @@ struct blit_command {
     unsigned texture_id = 0;
     /// Destination rectangle in target pixels.
     lx::rect2i dst{};
-    /// Source sub-rectangle in texture pixels. Empty means the whole texture — which is
-    /// both a plain surface and a `wp_viewport` with no source set. Together with `dst`
-    /// this expresses viewporter cropping and fractional scaling: the backends derive the
-    /// scale factor from the src:dst ratio rather than being told it separately.
-    lx::rect2i src{};
+    /// Source box in texture pixels, before `buffer_xform`; fractional edges are a
+    /// `wp_viewport` crop. Empty means the whole texture — which is both a plain surface
+    /// and a `wp_viewport` with no source set. Together with `dst` this expresses
+    /// viewporter cropping and fractional scaling: the backends derive the scale factor
+    /// from the src:dst ratio rather than being told it separately.
+    lx::rect2f src{};
     /// Additional clip in target space; the draw is confined to its intersection with
     /// `dst`. Empty means unclipped. Subsurface clipping and layer-shell regions.
     lx::rect2i clip{};
@@ -40,7 +41,66 @@ struct blit_command {
     /// light before blending, because alpha blending is a weighted average of light and
     /// averaging encoded values darkens edges.
     lx::transfer_function src_transfer = lx::transfer_function::srgb;
+    /// The draw resamples (`dst` is not the transformed source size, or the crop is off
+    /// whole texels). A 1:1 draw on whole pixels samples texel centres exactly.
+    bool scaled = false;
+    /// Covered by an opaque draw above it: skipped (identical pixels).
+    bool occluded = false;
 };
+
+/// Where a draw's top-left, +x and +y directions land in its source box, in the box's own
+/// normalized coordinates (0..1 across the box): the source point of normalized
+/// destination (u, v) is `origin + u·dx + v·dy`. `transform` is the buffer transform
+/// (wl_surface.set_buffer_transform): the compositor shows the buffer turned by its
+/// inverse, as wlroots' `wlr_box_transform(…, invert(t), …)` maps a surface box into the
+/// buffer. Shared by every backend so the eight transforms cannot disagree.
+struct source_basis {
+    float origin[2]{0.f, 0.f};
+    float dx[2]{1.f, 0.f};
+    float dy[2]{0.f, 1.f};
+};
+
+[[nodiscard]] constexpr source_basis source_basis_for(lx::buffer_transform transform) {
+    // Indexed by the transform; each row is the inverse transform's point map.
+    switch (transform) {
+    case lx::buffer_transform::normal:
+        return {{0.f, 0.f}, {1.f, 0.f}, {0.f, 1.f}};
+    case lx::buffer_transform::rotate_90: // shown turned by 270: (v, 1 − u)
+        return {{0.f, 1.f}, {0.f, -1.f}, {1.f, 0.f}};
+    case lx::buffer_transform::rotate_180:
+        return {{1.f, 1.f}, {-1.f, 0.f}, {0.f, -1.f}};
+    case lx::buffer_transform::rotate_270: // shown turned by 90: (1 − v, u)
+        return {{1.f, 0.f}, {0.f, 1.f}, {-1.f, 0.f}};
+    case lx::buffer_transform::flipped:
+        return {{1.f, 0.f}, {-1.f, 0.f}, {0.f, 1.f}};
+    case lx::buffer_transform::flipped_90:
+        return {{0.f, 0.f}, {0.f, 1.f}, {1.f, 0.f}};
+    case lx::buffer_transform::flipped_180:
+        return {{0.f, 1.f}, {1.f, 0.f}, {0.f, -1.f}};
+    case lx::buffer_transform::flipped_270:
+        return {{1.f, 1.f}, {0.f, -1.f}, {-1.f, 0.f}};
+    }
+    return {};
+}
+
+/// The source box a draw samples, in texture pixels: `src`, or the whole texture when it
+/// is empty, clamped into the texture.
+[[nodiscard]] constexpr lx::rect2f effective_source(lx::rect2f src, unsigned tex_w,
+                                                    unsigned tex_h) {
+    const float tw = static_cast<float>(tex_w);
+    const float th = static_cast<float>(tex_h);
+    if (src.empty())
+        return {0.f, 0.f, tw, th};
+    float x0 = src.x < 0.f ? 0.f : src.x;
+    float y0 = src.y < 0.f ? 0.f : src.y;
+    float x1 = src.x + src.width > tw ? tw : src.x + src.width;
+    float y1 = src.y + src.height > th ? th : src.y + src.height;
+    if (x1 < x0)
+        x1 = x0;
+    if (y1 < y0)
+        y1 = y0;
+    return {x0, y0, x1 - x0, y1 - y0};
+}
 
 class pipeline_cache {
 public:

@@ -128,7 +128,10 @@ class frame_node final : public scene::scene_node {
 public:
     ~frame_node() override;
     [[nodiscard]] scene::node_kind kind() const override;
-    void emit_draws(scene::draw_list& out) const override;
+    using scene::scene_node::emit_draws;
+    /// Rects are laid out in logical coordinates and projected relative to the window's
+    /// tree anchor, so the frame's edges round with the client's (no seam at 1.25).
+    void emit_draws(scene::draw_list& out, const scene::emit_context& ctx) const override;
 
     lx::rect2i geometry{};
     frame_extents extents{};
@@ -136,11 +139,14 @@ public:
     bool active = false;
     deco_button button = deco_button::normal;
     /// Title textures (active text colour, inactive), padded by `title_pad` on each side.
+    /// Rasterized at the output scale (`title_scale`): size, pad and text width are output
+    /// pixels, drawn 1:1 — text is never resampled.
     unsigned title_texture[2]{};
     lx::size2i title_size{};
     int title_pad = 0;
     /// Width of the drawn text (the fit, ellipsis included), for centring.
     int title_text_width = 0;
+    double title_scale = 1.0;
     bool title_ready = false;
     /// The client stopped answering pings: the frame is drawn through the same grey tint
     /// as the window's surfaces.
@@ -184,6 +190,9 @@ public:
     /// Once per frame tick, before the scene is published: stages the atlas the first time a
     /// frame is shown, rasterizes changed titles.
     void on_tick();
+    /// The output scale titles are rasterized at (text at 10 pt × scale, in output pixels).
+    /// A change re-rasterizes every title at the next `on_tick`.
+    void set_scale(double scale);
 
     [[nodiscard]] bool shown(lx::toplevel_id id) const;
     [[nodiscard]] const frame_node* node(lx::toplevel_id id) const;
@@ -230,6 +239,8 @@ private:
     lx::text::shaped_line suffix_line_{};
     bool suffix_shaped_ = false;
     std::vector<std::uint32_t> raster_{};
+    double scale_ = 1.0;
+    [[nodiscard]] lx::text::font_desc title_font() const;
 };
 
 } // namespace lx::compositor
@@ -502,10 +513,22 @@ lx::scene::node_kind lx::compositor::frame_node::kind() const {
     return scene::node_kind::surface;
 }
 
-void lx::compositor::frame_node::emit_draws(scene::draw_list& out) const {
+void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
+                                           const scene::emit_context& ctx) const {
     if (!shown || !atlas_ready || !*atlas_ready || geometry.width <= 0 || geometry.height <= 0)
         return;
     const lx::rect2i g = geometry;
+    const lx::point2i anchor = ctx.anchored ? ctx.anchor : lx::point2i{g.x, g.y};
+    const auto project = [&](lx::rect2i r) {
+        if (r.width <= 0 || r.height <= 0)
+            return lx::rect2i{};
+        return scene::project_node(ctx.projection, anchor, {r.x, r.y}, {r.width, r.height});
+    };
+    const auto push_draw = [&](lx::scene::draw_list& list, unsigned texture, lx::rect2i src,
+                               lx::rect2i dst, lx::rect2i clip, lx::blend_mode blend,
+                               lx::color tint) {
+        ::push_draw(list, texture, src, project(dst), project(clip), blend, tint);
+    };
     const lx::rect2i f = frame_rect(g, extents);
     const lx::color tint = dimmed ? k_dim_tint : k_no_tint;
     const unsigned atlas = k_deco_atlas_texture_id;
@@ -532,14 +555,18 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out) const {
               title, {}, lx::blend_mode::opaque, tint);
 
     if (title_ready && title_size.width > 0 && title_size.height > 0) {
-        const int room = title_text_room(g.width);
-        const int x0 = title.x + k_deco_title_padding;
+        // Placed in output pixels: the texture is rasterized at the output scale and drawn
+        // 1:1. Centred in the room left of the close button, within the projected bar.
+        const double ts = title_scale > 0.0 ? title_scale : 1.0;
+        const lx::rect2i bar = project(title);
+        const int room = static_cast<int>(std::lround(title_text_room(g.width) * ts));
+        const int x0 = bar.x + static_cast<int>(std::lround(k_deco_title_padding * ts));
         const int x = x0 + (room > title_text_width ? (room - title_text_width) / 2 : 0);
-        const int y = title.y + (k_deco_title_height - title_size.height) / 2;
-        push_draw(out, title_texture[active ? 0 : 1], {0, 0, title_size.width, title_size.height},
-                  {x - title_pad, y, title_size.width, title_size.height},
-                  {title.x, title.y, g.width - k_deco_title_height, k_deco_title_height},
-                  lx::blend_mode::premultiplied, tint);
+        const int y = bar.y + (bar.height - title_size.height) / 2;
+        ::push_draw(out, title_texture[active ? 0 : 1], {0, 0, title_size.width, title_size.height},
+                    {x - title_pad, y, title_size.width, title_size.height},
+                    project({title.x, title.y, g.width - k_deco_title_height, k_deco_title_height}),
+                    lx::blend_mode::premultiplied, tint);
     }
 
     const lx::rect2i close = close_rect(g);
@@ -796,12 +823,30 @@ lx::compositor::decoration_manager::node(lx::toplevel_id id) const {
     return s ? &s->node : nullptr;
 }
 
+lx::text::font_desc lx::compositor::decoration_manager::title_font() const {
+    lx::text::font_desc f = k_title_font;
+    f.size_pt = static_cast<float>(f.size_pt * scale_);
+    return f;
+}
+
+void lx::compositor::decoration_manager::set_scale(double scale) {
+    if (!(scale > 0.0) || scale == scale_)
+        return;
+    scale_ = scale;
+    suffix_shaped_ = false;
+    for (auto& s : slots_)
+        if (s.used)
+            s.title_changed = true;
+    any_dirty_ = true;
+}
+
 void lx::compositor::decoration_manager::raster_title(slot& s) {
     const bool changed = s.title_changed;
     s.title_changed = false;
     s.refit = false;
     frame_node& n = s.node;
-    const int room = title_text_room(n.geometry.width);
+    // Output pixels: the text is shaped at 10 pt × scale.
+    const int room = static_cast<int>(std::lround(title_text_room(n.geometry.width) * scale_));
 
     const auto drop = [&] {
         if (n.title_ready)
@@ -823,7 +868,7 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     int suffix_w = 0;
     if (s.not_responding) {
         if (!suffix_shaped_) {
-            if (auto shaped = lx::text::shape_line(k_not_responding_suffix, k_title_font,
+            if (auto shaped = lx::text::shape_line(k_not_responding_suffix, title_font(),
                                                    suffix_line_);
                 !shaped) {
                 warn_no_text();
@@ -840,7 +885,7 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     }
     lx::text::line_fit fit{};
     if (s.title[0] != '\0') {
-        if (auto shaped = lx::text::shape_line(s.title, k_title_font, line_); !shaped) {
+        if (auto shaped = lx::text::shape_line(s.title, title_font(), line_); !shaped) {
             warn_no_text();
             drop();
             return;
@@ -861,7 +906,8 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
         fit.ellipsized == s.ellipsized && !s.not_responding)
         return;
 
-    constexpr int k_pad = 2; // glyph ink may overhang the advance box
+    // Glyph ink may overhang the advance box.
+    const int k_pad = static_cast<int>(std::ceil(2.0 * scale_));
     const int w = text_w + 2 * k_pad;
     const lx::text::shaped_line& metrics = fit.width_px > 0 ? line_ : suffix_line_;
     const int h = metrics.ascent_px + metrics.descent_px;
@@ -897,6 +943,7 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     n.title_size = {w, h};
     n.title_pad = k_pad;
     n.title_text_width = text_w;
+    n.title_scale = scale_;
     n.title_ready = true;
     s.glyph_end = fit.glyph_end;
     s.ellipsized = fit.ellipsized;

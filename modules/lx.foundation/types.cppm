@@ -32,6 +32,24 @@ struct rect2i {
     [[nodiscard]] constexpr bool contains(point2i p) const;
 };
 
+/// A rectangle with fractional edges: a buffer source box (wp_viewport.set_source is in
+/// 24.8 fixed point, then multiplied by the buffer scale). `float` holds every 24.8 value
+/// up to 2^15 exactly, which covers every buffer a GPU can allocate.
+struct rect2f {
+    float x = 0.f;
+    float y = 0.f;
+    float width = 0.f;
+    float height = 0.f;
+    constexpr rect2f() = default;
+    constexpr rect2f(float x_, float y_, float w, float h) : x{x_}, y{y_}, width{w}, height{h} {}
+    constexpr rect2f(int x_, int y_, int w, int h)
+        : x{static_cast<float>(x_)}, y{static_cast<float>(y_)}, width{static_cast<float>(w)},
+          height{static_cast<float>(h)} {}
+    /// Every integer rect is a fractional one (a crop on whole texels).
+    constexpr rect2f(rect2i r) : rect2f{r.x, r.y, r.width, r.height} {}
+    [[nodiscard]] constexpr bool empty() const { return !(width > 0.f) || !(height > 0.f); }
+};
+
 struct inset {
     int top = 0;
     int right = 0;

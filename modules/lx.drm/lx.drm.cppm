@@ -744,13 +744,18 @@ lx::result<lx::drm::kms_dumb_framebuffer> lx::drm::kms_dumb_framebuffer::create(
 
 // ── kms_atomic_commit (needs complete kms_device) ───────────────────────────
 
-lx::drm::kms_atomic_commit::kms_atomic_commit(kms_device& device) : device_{&device} {}
+lx::drm::kms_atomic_commit::kms_atomic_commit(kms_device& device) : device_{&device} {
+    for (auto& c : cookies_)
+        c.owner = this;
+}
 
 lx::drm::kms_atomic_commit::~kms_atomic_commit() {
 #if defined(LUMEN_HAS_DRM)
     const int fd = device_ ? device_->card_fd() : -1;
     if (fd >= 0) {
-        if (saved_crtc_) {
+        // Without master (exiting while another VT is in front) the restore can only fail;
+        // logind gives the VT back to the console when control is released.
+        if (saved_crtc_ && drmIsMaster(fd)) {
             auto* saved = static_cast<drmModeCrtc*>(saved_crtc_);
             uint32_t connector = saved_connector_;
             // buffer_id 0 means the console had nothing attached; leave the CRTC off rather
@@ -773,18 +778,33 @@ lx::drm::kms_atomic_commit::~kms_atomic_commit() {
 
 void lx::drm::kms_atomic_commit::set_framebuffer(unsigned fb_id) { framebuffer_id_ = fb_id; }
 
-void lx::drm::kms_atomic_commit::emit_flip(const atomic_commit_request& request, bool presented) {
+void lx::drm::kms_atomic_commit::emit_flip(lx::runtime::clock_time timestamp_ns,
+                                           unsigned sequence, unsigned crtc_id, bool hw) {
     if (!flip_handler_)
         return;
     page_flip_event ev{};
-    ev.sequence = ++flip_sequence_;
-    ev.timestamp_ns = static_cast<lx::runtime::clock_time>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch())
-            .count());
-    ev.applied_damage = request.damage;
-    ev.presented = presented;
+    // The kernel's own vblank counter (MSC), not a count of our events: a client pacing by
+    // it (wp_presentation seq) sees skipped vblanks as gaps.
+    ev.sequence = sequence;
+    ev.timestamp_ns = timestamp_ns;
+    ev.presented = true;
+    ev.hw = hw;
+    ev.vblank_timestamp = hw && vblank_timestamps_.load(std::memory_order_acquire);
+    ev.crtc_id = crtc_id;
+    ev.content = inflight_content_.load(std::memory_order_acquire);
+    ev.tag = inflight_tag_.load(std::memory_order_relaxed);
     flip_handler_(ev, flip_user_);
+}
+
+void lx::drm::kms_atomic_commit::prepare_resume() {
+    // Events of commits made before the pause belong to the old generation: drained later,
+    // they must neither clear the resume modeset's flip_pending nor be reported.
+    flip_generation_.fetch_add(1, std::memory_order_acq_rel);
+    flip_pending_.store(false, std::memory_order_release);
+    synthetic_flip_.store(false, std::memory_order_release);
+    modeset_attempted_ = false;
+    last_rejected_state_ = false;
+    last_lost_master_ = false;
 }
 
 lx::result<void> lx::drm::kms_atomic_commit::ensure_props() {
@@ -849,8 +869,84 @@ lx::result<void> lx::drm::kms_atomic_commit::ensure_props() {
 #endif
 }
 
+bool lx::drm::neutral_property_value(const kms_property_shape& p, neutral_rule rule,
+                                     const char* enum_name, unsigned long long& out) {
+    if (p.immutable)
+        return false;
+    using kind = kms_property_shape::kind;
+    const bool ranged = p.type == kind::range || p.type == kind::signed_range;
+    switch (rule) {
+    case neutral_rule::zero:
+        if (p.type == kind::blob || p.type == kind::object) {
+            out = 0;
+            return true;
+        }
+        if (p.type == kind::signed_range ? static_cast<long long>(p.min) <= 0 &&
+                                               static_cast<long long>(p.max) >= 0
+                                         : p.type == kind::range && p.min == 0) {
+            out = 0;
+            return true;
+        }
+        return false;
+    case neutral_rule::range_min:
+    case neutral_rule::range_max:
+        if (!ranged)
+            return false;
+        out = rule == neutral_rule::range_min ? p.min : p.max;
+        return true;
+    case neutral_rule::enum_entry:
+        if ((p.type != kind::enumeration && p.type != kind::bitmask) || !enum_name ||
+            !p.enum_names || !p.enum_values)
+            return false;
+        for (unsigned i = 0; i < p.enum_count; ++i) {
+            if (!p.enum_names[i] || std::strcmp(p.enum_names[i], enum_name) != 0)
+                continue;
+            if (p.type == kind::bitmask) {
+                if (p.enum_values[i] >= 64)
+                    return false;
+                out = 1ull << p.enum_values[i];
+            } else {
+                out = p.enum_values[i];
+            }
+            return true;
+        }
+        return false;
+    }
+    return false;
+}
+
 #if defined(LUMEN_HAS_DRM)
 namespace {
+/// What a modeset resets (`kms_atomic_commit::commit`): state a previous master — the
+/// console, KWin with HDR or night light, Mutter on a rotated monitor — can leave behind
+/// and Lumen does not manage, back to the value the driver starts with. zpos: the primary
+/// plane at the bottom of its range, the cursor plane at the top of its.
+struct neutral_spec {
+    unsigned object_type;
+    const char* name;
+    lx::drm::neutral_rule rule;
+    const char* entry;
+};
+constexpr neutral_spec k_neutral_specs[] = {
+    {DRM_MODE_OBJECT_CRTC, "GAMMA_LUT", lx::drm::neutral_rule::zero, nullptr},
+    {DRM_MODE_OBJECT_CRTC, "DEGAMMA_LUT", lx::drm::neutral_rule::zero, nullptr},
+    {DRM_MODE_OBJECT_CRTC, "CTM", lx::drm::neutral_rule::zero, nullptr},
+    {DRM_MODE_OBJECT_CRTC, "VRR_ENABLED", lx::drm::neutral_rule::zero, nullptr},
+    {DRM_MODE_OBJECT_CONNECTOR, "link-status", lx::drm::neutral_rule::enum_entry, "Good"},
+    {DRM_MODE_OBJECT_CONNECTOR, "Colorspace", lx::drm::neutral_rule::enum_entry, "Default"},
+    {DRM_MODE_OBJECT_CONNECTOR, "HDR_OUTPUT_METADATA", lx::drm::neutral_rule::zero, nullptr},
+    // The kernel starts every connector at the top of the range (the link may still use
+    // less); another master may have capped it.
+    {DRM_MODE_OBJECT_CONNECTOR, "max bpc", lx::drm::neutral_rule::range_max, nullptr},
+    {DRM_MODE_OBJECT_CONNECTOR, "Broadcast RGB", lx::drm::neutral_rule::enum_entry,
+     "Automatic"},
+    {DRM_MODE_OBJECT_PLANE, "rotation", lx::drm::neutral_rule::enum_entry, "rotate-0"},
+    {DRM_MODE_OBJECT_PLANE, "alpha", lx::drm::neutral_rule::range_max, nullptr},
+    {DRM_MODE_OBJECT_PLANE, "pixel blend mode", lx::drm::neutral_rule::enum_entry,
+     "Pre-multiplied"},
+    {DRM_MODE_OBJECT_PLANE, "zpos", lx::drm::neutral_rule::range_min, nullptr},
+};
+
 /// Static literals only — `error::message` must not allocate on the frame path.
 const char* atomic_commit_message(int err) {
     switch (err) {
@@ -884,20 +980,94 @@ unsigned find_object_prop(int fd, unsigned object_id, unsigned object_type, cons
 } // namespace
 #endif
 
-lx::result<void> lx::drm::kms_atomic_commit::apply_modeset(unsigned connector_index, unsigned crtc,
-                                                           unsigned fb, unsigned width,
-                                                           unsigned height) {
+void lx::drm::kms_atomic_commit::resolve_neutral(int fd, unsigned object, unsigned object_type,
+                                                bool cursor_plane) {
+#if defined(LUMEN_HAS_DRM)
+    drmModeObjectProperties* props = drmModeObjectGetProperties(fd, object, object_type);
+    if (!props)
+        return;
+    for (uint32_t i = 0; i < props->count_props && neutral_count_ < k_max_neutral; ++i) {
+        drmModePropertyRes* p = drmModeGetProperty(fd, props->props[i]);
+        if (!p)
+            continue;
+        for (const neutral_spec& spec : k_neutral_specs) {
+            if (spec.object_type != object_type || std::strcmp(spec.name, p->name) != 0)
+                continue;
+            constexpr unsigned k_entries = 32;
+            const char* names[k_entries];
+            unsigned long long values[k_entries];
+            kms_property_shape shape{};
+            shape.immutable = (p->flags & DRM_MODE_PROP_IMMUTABLE) != 0;
+            using kind = kms_property_shape::kind;
+            if (drm_property_type_is(p, DRM_MODE_PROP_SIGNED_RANGE))
+                shape.type = kind::signed_range;
+            else if (drm_property_type_is(p, DRM_MODE_PROP_RANGE))
+                shape.type = kind::range;
+            else if (drm_property_type_is(p, DRM_MODE_PROP_ENUM))
+                shape.type = kind::enumeration;
+            else if (drm_property_type_is(p, DRM_MODE_PROP_BITMASK))
+                shape.type = kind::bitmask;
+            else if (drm_property_type_is(p, DRM_MODE_PROP_BLOB))
+                shape.type = kind::blob;
+            else
+                shape.type = kind::object;
+            if ((shape.type == kind::range || shape.type == kind::signed_range) &&
+                p->count_values >= 2) {
+                shape.min = p->values[0];
+                shape.max = p->values[1];
+            }
+            if (shape.type == kind::enumeration || shape.type == kind::bitmask) {
+                const unsigned n = p->count_enums < 0 ? 0u
+                                   : static_cast<unsigned>(p->count_enums) < k_entries
+                                       ? static_cast<unsigned>(p->count_enums)
+                                       : k_entries;
+                for (unsigned e = 0; e < n; ++e) {
+                    names[e] = p->enums[e].name;
+                    values[e] = p->enums[e].value;
+                }
+                shape.enum_names = names;
+                shape.enum_values = values;
+                shape.enum_count = n;
+            }
+            const neutral_rule rule =
+                cursor_plane && std::strcmp(spec.name, "zpos") == 0 ? neutral_rule::range_max
+                                                                    : spec.rule;
+            unsigned long long value = 0;
+            if (neutral_property_value(shape, rule, spec.entry, value))
+                neutral_[neutral_count_++] = {object, p->prop_id, value};
+            break;
+        }
+        drmModeFreeProperty(p);
+    }
+    drmModeFreeObjectProperties(props);
+#else
+    (void)fd;
+    (void)object;
+    (void)object_type;
+    (void)cursor_plane;
+#endif
+}
+
+lx::result<void> lx::drm::kms_atomic_commit::apply_modeset(const atomic_commit_request& request,
+                                                           unsigned crtc, unsigned fb,
+                                                           unsigned width, unsigned height) {
 #if defined(LUMEN_HAS_DRM)
     const int fd = device_ ? device_->card_fd() : -1;
     const unsigned plane = device_ ? device_->primary_plane_id() : 0;
-    const unsigned connector_id = device_ ? device_->connector(connector_index).id : 0;
+    const unsigned connector_id = device_ ? device_->connector(request.connector).id : 0;
     if (fd < 0 || !plane || !crtc || !connector_id || !fb) {
+        last_rejected_state_ = true;
+        last_lost_master_ = false;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
                               "modeset missing connector/crtc/plane");
     }
 
+    // The mode is looked up again every time: after a VT switch the connector may no longer
+    // offer it (a VM window resized while away), which is a refused state, not a retry.
     drmModeConnector* conn = drmModeGetConnector(fd, connector_id);
     if (!conn) {
+        last_rejected_state_ = false;
+        last_lost_master_ = false;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
                               "connector query failed");
     }
@@ -911,15 +1081,28 @@ lx::result<void> lx::drm::kms_atomic_commit::apply_modeset(unsigned connector_in
     }
     drmModeFreeConnector(conn);
     if (!found) {
+        last_rejected_state_ = true;
+        last_lost_master_ = false;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
                               "no connector mode matches the composite size");
     }
 
-    const unsigned crtc_mode_prop = find_object_prop(fd, crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID");
-    const unsigned crtc_active_prop = find_object_prop(fd, crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
-    const unsigned conn_crtc_prop =
-        find_object_prop(fd, connector_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
-    if (!crtc_mode_prop || !crtc_active_prop || !conn_crtc_prop) {
+    if (!modeset_props_ready_) {
+        prop_crtc_mode_ = find_object_prop(fd, crtc, DRM_MODE_OBJECT_CRTC, "MODE_ID");
+        prop_crtc_active_ = find_object_prop(fd, crtc, DRM_MODE_OBJECT_CRTC, "ACTIVE");
+        prop_conn_crtc_ = find_object_prop(fd, connector_id, DRM_MODE_OBJECT_CONNECTOR, "CRTC_ID");
+        // Optional: back to neutral, so another master's night-light LUT, colour matrix,
+        // VRR, HDR signalling or plane rotation does not leak into this session (Lumen
+        // manages none of them).
+        neutral_count_ = 0;
+        resolve_neutral(fd, crtc, DRM_MODE_OBJECT_CRTC, false);
+        resolve_neutral(fd, connector_id, DRM_MODE_OBJECT_CONNECTOR, false);
+        resolve_neutral(fd, plane, DRM_MODE_OBJECT_PLANE, false);
+        modeset_props_ready_ = true;
+    }
+    if (!prop_crtc_mode_ || !prop_crtc_active_ || !prop_conn_crtc_) {
+        last_rejected_state_ = true;
+        last_lost_master_ = false;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
                               "missing crtc/connector modeset props");
     }
@@ -931,6 +1114,8 @@ lx::result<void> lx::drm::kms_atomic_commit::apply_modeset(unsigned connector_in
 
     uint32_t blob = 0;
     if (drmModeCreatePropertyBlob(fd, &chosen, sizeof(chosen), &blob) != 0) {
+        last_rejected_state_ = false;
+        last_lost_master_ = false;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
                               "MODE_ID blob creation failed");
     }
@@ -938,13 +1123,15 @@ lx::result<void> lx::drm::kms_atomic_commit::apply_modeset(unsigned connector_in
     drmModeAtomicReq* req = drmModeAtomicAlloc();
     if (!req) {
         drmModeDestroyPropertyBlob(fd, blob);
+        last_rejected_state_ = false;
+        last_lost_master_ = false;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
                               "drmModeAtomicAlloc failed");
     }
 
-    drmModeAtomicAddProperty(req, connector_id, conn_crtc_prop, crtc);
-    drmModeAtomicAddProperty(req, crtc, crtc_mode_prop, blob);
-    drmModeAtomicAddProperty(req, crtc, crtc_active_prop, 1);
+    drmModeAtomicAddProperty(req, connector_id, prop_conn_crtc_, crtc);
+    drmModeAtomicAddProperty(req, crtc, prop_crtc_mode_, blob);
+    drmModeAtomicAddProperty(req, crtc, prop_crtc_active_, 1);
     drmModeAtomicAddProperty(req, plane, prop_crtc_id_, crtc);
     drmModeAtomicAddProperty(req, plane, prop_fb_id_, fb);
     drmModeAtomicAddProperty(req, plane, prop_src_x_, 0);
@@ -955,23 +1142,124 @@ lx::result<void> lx::drm::kms_atomic_commit::apply_modeset(unsigned connector_in
     drmModeAtomicAddProperty(req, plane, prop_crtc_y_, 0);
     drmModeAtomicAddProperty(req, plane, prop_crtc_w_, width);
     drmModeAtomicAddProperty(req, plane, prop_crtc_h_, height);
+    // The composite may still be running on the GPU: the first frame waits for it too.
+    if (prop_in_fence_fd_ && request.in_fence_fd >= 0)
+        drmModeAtomicAddProperty(req, plane, prop_in_fence_fd_,
+                                 static_cast<uint64_t>(request.in_fence_fd));
 
-    // Blocking and without a flip event: the mode must be live before flips are queued.
-    const int r = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
-    const int commit_errno = r != 0 ? errno : 0;
+    // The cursor plane in full (visible where the pointer is, or off), so nothing another
+    // master put there survives into the first frame.
+    const bool with_cursor = request.cursor && request.cursor->valid();
+    if (with_cursor)
+        request.cursor->append_props(req);
+    const unsigned cursor_plane = with_cursor ? request.cursor->caps().plane_id : 0;
+
+    // Every other plane still on this CRTC — an overlay another compositor left on — goes
+    // off, or it would cover the frame. Read here, at a modeset, never per frame.
+    if (drmModePlaneRes* planes = drmModeGetPlaneResources(fd)) {
+        for (uint32_t i = 0; i < planes->count_planes; ++i) {
+            const uint32_t id = planes->planes[i];
+            if (id == plane || id == cursor_plane)
+                continue;
+            drmModePlane* p = drmModeGetPlane(fd, id);
+            if (!p)
+                continue;
+            const bool ours = p->crtc_id == crtc;
+            drmModeFreePlane(p);
+            if (!ours)
+                continue;
+            const unsigned p_crtc = find_object_prop(fd, id, DRM_MODE_OBJECT_PLANE, "CRTC_ID");
+            const unsigned p_fb = find_object_prop(fd, id, DRM_MODE_OBJECT_PLANE, "FB_ID");
+            if (p_crtc && p_fb) {
+                drmModeAtomicAddProperty(req, id, p_crtc, 0);
+                drmModeAtomicAddProperty(req, id, p_fb, 0);
+            }
+        }
+        drmModeFreePlaneResources(planes);
+    }
+
+    // The neutral settings last, so a driver that refuses one of them can be asked again
+    // without (the request is cut back to `essential`).
+    if (with_cursor && neutral_cursor_plane_ == 0) {
+        neutral_cursor_plane_ = cursor_plane;
+        resolve_neutral(fd, cursor_plane, DRM_MODE_OBJECT_PLANE, true);
+    }
+    const int essential = drmModeAtomicGetCursor(req);
+    for (unsigned i = 0; i < neutral_count_; ++i) {
+        const neutral_setting& n = neutral_[i];
+        // The cursor plane's only while it is part of this commit.
+        if (n.object == neutral_cursor_plane_ && !with_cursor)
+            continue;
+        drmModeAtomicAddProperty(req, n.object, n.prop, n.value);
+    }
+    const bool with_neutral = drmModeAtomicGetCursor(req) != essential;
+
+    // Nonblocking, with an event: completion arrives on the card fd and is drained by the
+    // event thread, like any flip. The flag is raised before the ioctl (see `commit`).
+    const unsigned gen = flip_generation_.load(std::memory_order_acquire);
+    flip_cookie& cookie = cookies_[gen & 1u];
+    cookie.generation.store(gen, std::memory_order_release);
+    const bool want_event = request.request_page_flip;
+    const bool raises_flip = want_event && !flip_pending_.exchange(true, std::memory_order_acq_rel);
+    if (raises_flip)
+        note_inflight(request);
+    uint32_t flags = DRM_MODE_ATOMIC_ALLOW_MODESET | DRM_MODE_ATOMIC_NONBLOCK;
+    if (want_event)
+        flags |= DRM_MODE_PAGE_FLIP_EVENT;
+    int r = drmModeAtomicCommit(fd, req, flags, &cookie);
+    int commit_errno = r != 0 ? errno : 0;
+    bool blocking = false;
+    if (r != 0 && commit_errno == EINVAL) {
+        // Some drivers take a modeset only blocking. Once more, without the event; the
+        // completion is then reported through `dispatch_events`.
+        r = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
+        commit_errno = r != 0 ? errno : 0;
+        if (r != 0 && commit_errno == EINVAL && with_neutral) {
+            // A driver that takes one of the resets badly: the modeset matters more.
+            drmModeAtomicSetCursor(req, essential);
+            r = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
+            commit_errno = r != 0 ? errno : 0;
+        }
+        blocking = r == 0;
+    }
     drmModeAtomicFree(req);
     if (r != 0) {
+        if (raises_flip)
+            flip_pending_.store(false, std::memory_order_release);
         drmModeDestroyPropertyBlob(fd, blob);
+        last_rejected_state_ =
+            commit_errno == EINVAL || commit_errno == ERANGE || commit_errno == ENOSPC;
+        last_lost_master_ = commit_errno == EACCES || commit_errno == EPERM;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
                               atomic_commit_message(commit_errno));
     }
+    last_rejected_state_ = false;
+    last_lost_master_ = false;
+    if (with_cursor)
+        request.cursor->on_committed();
+    // Whether flip timestamps are the CRTC's vblank timestamps: a driver without vblank
+    // support (vmwgfx, some virtual GPUs) answers EOPNOTSUPP, and its flip events then
+    // carry sequence 0 and a time sampled when the event was sent (drm_crtc_send_vblank_event).
+    // Asked once, after the first modeset; any other failure (the CRTC not on yet) leaves
+    // the assumption that it has them.
+    if (!vblank_probed_) {
+        vblank_probed_ = true;
+        uint64_t seq = 0;
+        uint64_t ns = 0;
+        if (drmCrtcGetSequence(fd, crtc, &seq, &ns) != 0 && errno == EOPNOTSUPP)
+            vblank_timestamps_.store(false, std::memory_order_release);
+    }
+    if (blocking && want_event)
+        synthetic_flip_.store(true, std::memory_order_release);
+    else if (blocking && raises_flip)
+        flip_pending_.store(false, std::memory_order_release);
 
     if (mode_blob_id_)
         drmModeDestroyPropertyBlob(fd, mode_blob_id_);
     mode_blob_id_ = blob;
     return {};
 #else
-    (void)connector_index;
+    (void)request;
     (void)crtc;
     (void)fb;
     (void)width;
@@ -991,19 +1279,18 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
     const unsigned plane = device_->primary_plane_id();
     const unsigned crtc = device_->crtc_id_for(request.connector);
     const bool primary = request.update_primary;
-    // Flip events and their failure notifications describe frames; a cursor-only or
-    // test-only commit is not one.
-    const bool frame_event = primary && request.request_page_flip && !request.test_only;
 
     if (fd < 0 || !plane || !crtc || (primary && !fb)) {
-        if (frame_event)
-            emit_flip(request, false);
+        last_rejected_state_ = false;
+        last_lost_master_ = false;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
                               "atomic commit missing fb/plane/crtc");
     }
     if (!primary && (!request.cursor || !modeset_attempted_ || !props_ready_)) {
         // Nothing to commit, or the CRTC is not ours yet — the first commit is the
-        // modeset, and it carries a frame.
+        // modeset, and it carries a frame. Says nothing about the plane's state.
+        last_rejected_state_ = false;
+        last_lost_master_ = false;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
                               "cursor-only commit before the first modeset");
     }
@@ -1020,20 +1307,15 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
     }
 
     // A plane-only commit inherits whatever mode the console left on the CRTC, so the very
-    // first commit sets the mode our framebuffer was sized for. On failure the flip path
-    // still runs — degraded, but reported once rather than every frame.
-    // The cursor plane is not part of it: it joins on the next commit.
+    // first commit sets the mode our framebuffer was sized for — and so does the first one
+    // after a resume (`prepare_resume`), when another master has had the CRTC. A failure
+    // the device caused (EACCES: master went away again) leaves the modeset to the next
+    // commit; one the kernel refused is not retried every frame.
     if (!modeset_attempted_ && !request.test_only) {
-        modeset_attempted_ = true;
-        auto modeset = apply_modeset(request.connector, crtc, fb, width, height);
-        if (!modeset) {
-            if (frame_event)
-                emit_flip(request, false);
-            return modeset.get_error();
-        }
-        if (frame_event)
-            emit_flip(request, true);
-        return {};
+        auto modeset = apply_modeset(request, crtc, fb, width, height);
+        if (modeset || last_rejected_state_)
+            modeset_attempted_ = true;
+        return modeset;
     }
 
     drmModeAtomicReq* req = drmModeAtomicAlloc();
@@ -1095,7 +1377,12 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
     // still owns its event.
     const bool raises_flip = request.request_page_flip && !request.test_only &&
                              !flip_pending_.exchange(true, std::memory_order_acq_rel);
-    const int r = drmModeAtomicCommit(fd, req, flags, this);
+    if (raises_flip)
+        note_inflight(request);
+    const unsigned gen = flip_generation_.load(std::memory_order_acquire);
+    flip_cookie& cookie = cookies_[gen & 1u];
+    cookie.generation.store(gen, std::memory_order_release);
+    const int r = drmModeAtomicCommit(fd, req, flags, &cookie);
     // Capture errno before drmModeAtomicFree, which may clobber it.
     const int commit_errno = r != 0 ? errno : 0;
     drmModeAtomicFree(req);
@@ -1104,12 +1391,12 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
             flip_pending_.store(false, std::memory_order_release);
         last_rejected_state_ =
             commit_errno == EINVAL || commit_errno == ERANGE || commit_errno == ENOSPC;
-        if (frame_event)
-            emit_flip(request, false);
+        last_lost_master_ = commit_errno == EACCES || commit_errno == EPERM;
         return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
                               atomic_commit_message(commit_errno));
     }
     last_rejected_state_ = false;
+    last_lost_master_ = false;
     if (request.test_only)
         return {};
 
@@ -1126,6 +1413,67 @@ lx::result<void> lx::drm::kms_atomic_commit::commit(const atomic_commit_request&
 #endif
 }
 
+lx::result<void> lx::drm::kms_atomic_commit::commit_power_off(kms_cursor_plane* cursor,
+                                                              unsigned connector) {
+#if defined(LUMEN_HAS_DRM)
+    const int fd = device_ ? device_->card_fd() : -1;
+    const unsigned crtc = device_ ? device_->crtc_id_for(connector) : 0;
+    const unsigned plane = device_ ? device_->primary_plane_id() : 0;
+    if (fd < 0 || !crtc || !modeset_props_ready_ || !prop_crtc_active_) {
+        last_rejected_state_ = false;
+        last_lost_master_ = false;
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "power off before the first modeset");
+    }
+    if (flip_pending_.load(std::memory_order_acquire)) {
+        last_rejected_state_ = false;
+        last_lost_master_ = false;
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
+                              "power off while a flip is pending");
+    }
+    drmModeAtomicReq* req = drmModeAtomicAlloc();
+    if (!req) {
+        last_rejected_state_ = false;
+        last_lost_master_ = false;
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
+                              "drmModeAtomicAlloc failed");
+    }
+    // ACTIVE=0 alone is the atomic DPMS off: MODE_ID, the connector's CRTC and the planes'
+    // state are kept, so the resources stay reserved and power-on cannot fail on them.
+    drmModeAtomicAddProperty(req, crtc, prop_crtc_active_, 0);
+    if (cursor && cursor->valid())
+        cursor->append_off_props(req);
+    const int essential = drmModeAtomicGetCursor(req);
+    // Blocking, no event: the caller needs none, and drivers differ on sending one for a
+    // CRTC that goes off. Nothing else is in flight (checked above).
+    int r = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
+    int commit_errno = r != 0 ? errno : 0;
+    if (r != 0 && commit_errno == EINVAL && plane && props_ready_) {
+        // A driver that wants an inactive CRTC's primary plane detached as well.
+        drmModeAtomicSetCursor(req, essential);
+        drmModeAtomicAddProperty(req, plane, prop_crtc_id_, 0);
+        drmModeAtomicAddProperty(req, plane, prop_fb_id_, 0);
+        r = drmModeAtomicCommit(fd, req, DRM_MODE_ATOMIC_ALLOW_MODESET, nullptr);
+        commit_errno = r != 0 ? errno : 0;
+    }
+    drmModeAtomicFree(req);
+    if (r != 0) {
+        last_rejected_state_ =
+            commit_errno == EINVAL || commit_errno == ERANGE || commit_errno == ENOSPC;
+        last_lost_master_ = commit_errno == EACCES || commit_errno == EPERM;
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
+                              atomic_commit_message(commit_errno));
+    }
+    last_rejected_state_ = false;
+    last_lost_master_ = false;
+    return {};
+#else
+    (void)cursor;
+    (void)connector;
+    return lx::not_implemented("lx::drm::kms_atomic_commit::commit_power_off");
+#endif
+}
+
 void lx::drm::kms_atomic_commit::dispatch_events() {
 #if defined(LUMEN_HAS_DRM)
     if (!device_)
@@ -1133,24 +1481,37 @@ void lx::drm::kms_atomic_commit::dispatch_events() {
     const int fd = device_->card_fd();
     if (fd < 0)
         return;
+    // A blocking modeset has no event of its own: its completion is reported here, on this
+    // thread, as the flip it stands for.
+    if (synthetic_flip_.exchange(false, std::memory_order_acq_rel)) {
+        flip_pending_.store(false, std::memory_order_release);
+        // Sampled in software, and no vblank counter: hw = false, sequence 0.
+        emit_flip(static_cast<lx::runtime::clock_time>(
+                      std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count()),
+                  0, 0, false);
+    }
     drmEventContext ctx{};
     ctx.version = 3;
-    ctx.page_flip_handler2 = [](int /*fd*/, unsigned int /*sequence*/, unsigned int tv_sec,
-                                unsigned int tv_usec, unsigned int /*crtc_id*/, void* user_data) {
-        auto* self = static_cast<kms_atomic_commit*>(user_data);
+    ctx.page_flip_handler2 = [](int /*fd*/, unsigned int sequence, unsigned int tv_sec,
+                                unsigned int tv_usec, unsigned int crtc_id, void* user_data) {
+        auto* cookie = static_cast<flip_cookie*>(user_data);
+        kms_atomic_commit* self = cookie ? cookie->owner : nullptr;
         if (!self)
+            return;
+        // A commit from before the last resume: its CRTC state is gone and its flag was
+        // already cleared. Reporting it would clear the resume modeset's flag instead.
+        if (cookie->generation.load(std::memory_order_acquire) !=
+            self->flip_generation_.load(std::memory_order_acquire))
             return;
         // Clear before the handler check: the CRTC is free again even with no handler bound.
         self->flip_pending_.store(false, std::memory_order_release);
-        if (!self->flip_handler_)
-            return;
-        page_flip_event ev{};
-        ev.sequence = ++self->flip_sequence_;
-        ev.timestamp_ns = static_cast<lx::runtime::clock_time>(tv_sec) * 1'000'000'000ull +
-                          static_cast<lx::runtime::clock_time>(tv_usec) * 1'000ull;
-        ev.presented = true;
-        self->flip_handler_(ev, self->flip_user_);
+        self->emit_flip(static_cast<lx::runtime::clock_time>(tv_sec) * 1'000'000'000ull +
+                            static_cast<lx::runtime::clock_time>(tv_usec) * 1'000ull,
+                        sequence, crtc_id, true);
     };
+    // The card fd is nonblocking (`init_from_fd`): with nothing queued this returns at once.
     (void)drmHandleEvent(fd, &ctx);
 #endif
 }

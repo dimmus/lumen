@@ -1,7 +1,8 @@
 flowchart TB
     subgraph Session["user session systemd --user"]
         U_COMP["lumen-compositor.service"]
-        U_SHELL["lumen-shell.service"]
+        U_SHELL["lumen-shell.service (session.slice)"]
+        U_APP["app-lumen-ID@RANDOM.service (app.slice, transient)"]
         SK_WL["XDG_RUNTIME_DIR/lumen-0"]
         SK_PRIV["lumen-compositor.private"]
     end
@@ -19,3 +20,5 @@ flowchart TB
     U_SHELL --> SK_PRIV
     U_COMP --> BIN
     U_SHELL --> BIN
+    U_SHELL -->|"StartTransientUnit (user bus)"| U_APP
+    U_APP --> SK_WL

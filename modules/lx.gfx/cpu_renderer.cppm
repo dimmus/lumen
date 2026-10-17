@@ -1,6 +1,7 @@
 module;
 
 #include <atomic>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
@@ -394,15 +395,6 @@ struct srgb_tables {
            outer.y + outer.height >= inner.y + inner.height;
 }
 
-/// Source sub-rectangle to sample, clamped into the texture. An empty `src` means the
-/// whole texture, which is both a plain surface and a `wp_viewport` with no source set.
-[[nodiscard]] inline lx::rect2i effective_src(lx::rect2i src, unsigned tex_w, unsigned tex_h) {
-    const lx::rect2i whole{0, 0, static_cast<int>(tex_w), static_cast<int>(tex_h)};
-    if (src.width <= 0 || src.height <= 0)
-        return whole;
-    return intersect(src, whole);
-}
-
 /// `dst` clipped to the draw's own clip rect. An empty clip means unclipped.
 [[nodiscard]] inline lx::rect2i clipped_dst(lx::rect2i dst, lx::rect2i clip) {
     if (clip.width <= 0 || clip.height <= 0)
@@ -519,6 +511,8 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
 
     for (unsigned i = job.first_cmd; i < job.count; ++i) {
         const auto& cmd = job.cmds[i];
+        if (cmd.occluded)
+            continue;
         const int index = job.self->find(cmd.texture_id);
         if (index < 0)
             continue;
@@ -530,17 +524,12 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         if (conv == convert_op::unsupported)
             continue;
 
-        // Rotated and flipped buffers need a transposed walk this blitter does not do;
-        // composite() counts them as unsupported rather than drawing them upright.
-        if (cmd.buffer_xform != lx::buffer_transform::normal)
-            continue;
-
         const lx::rect2i area = intersect(clipped_dst(cmd.dst, cmd.clip), band_rect);
         if (area.width <= 0 || area.height <= 0)
             continue;
 
-        const lx::rect2i sub = effective_src(cmd.src, src.width, src.height);
-        if (sub.width <= 0 || sub.height <= 0)
+        const lx::rect2f box = effective_source(cmd.src, src.width, src.height);
+        if (box.empty())
             continue;
 
         // Tint alpha folds into opacity; the color channels stay a per-pixel multiply.
@@ -566,74 +555,132 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
                                  (has_alpha_channel(src.format) || opacity_255 < 255u);
         const bool fill_alpha = has_alpha_channel(dst.format) && !has_alpha_channel(src.format);
 
-        // 16.16 fixed point: one multiply per row/column setup, one add per pixel step.
-        // The ratio is the *source sub-rect* against dst, which is what makes viewporter
-        // cropping and fractional scale fall out of the same walk — a cropped source over
-        // the same dst simply steps faster.
-        const std::uint32_t x_step =
-            static_cast<std::uint32_t>((static_cast<unsigned long long>(sub.width) << 16) /
-                                       static_cast<unsigned>(cmd.dst.width));
-        const std::uint32_t y_step =
-            static_cast<std::uint32_t>((static_cast<unsigned long long>(sub.height) << 16) /
-                                       static_cast<unsigned>(cmd.dst.height));
-        const bool unscaled = sub.width == cmd.dst.width && sub.height == cmd.dst.height;
+        const auto finish = [&](std::uint32_t pixel, std::uint32_t& out) {
+            if (conv == convert_op::swap_rb)
+                pixel = swap_rb_word(pixel);
+            if (fill_alpha)
+                pixel |= 0xFF000000u;
+            if (tinted)
+                pixel = apply_tint(pixel, tint_c0, tint_g, tint_c2, 255u);
+            out = needs_blend ? blend_over_linear(pixel, out, opacity_255) : pixel;
+        };
 
-        const std::uint32_t x_start =
-            static_cast<std::uint32_t>(area.x - cmd.dst.x) * x_step;
-        const std::uint32_t y_start =
-            static_cast<std::uint32_t>(area.y - cmd.dst.y) * y_step;
-
-        // The whole point of this backend: an unscaled opaque draw in a compatible format
-        // is a row memcpy — the destination is written once and nothing is read back.
-        const bool memcpy_rows =
-            unscaled && !needs_blend && !fill_alpha && !tinted && conv == convert_op::copy;
-
-        // Sub-rect origin is added on top of the scaled offset, so cropping is a shift of
-        // where sampling starts rather than a second pass over the source.
-        const unsigned sub_x = static_cast<unsigned>(sub.x);
-        const unsigned sub_y = static_cast<unsigned>(sub.y);
-        const unsigned sub_x_end = sub_x + static_cast<unsigned>(sub.width);
-        const unsigned sub_y_end = sub_y + static_cast<unsigned>(sub.height);
-
-        for (int row = 0; row < area.height; ++row) {
-            const unsigned sy =
-                sub_y + (unscaled ? static_cast<unsigned>(area.y - cmd.dst.y + row)
-                                  : ((y_start + static_cast<std::uint32_t>(row) * y_step) >> 16));
-            if (sy >= sub_y_end || sy >= src.height)
-                break;
-
-            const auto* src_row = reinterpret_cast<const std::uint32_t*>(
-                src.pixels + static_cast<std::size_t>(sy) * src.stride);
-            auto* dst_row = reinterpret_cast<std::uint32_t*>(
-                                dst.pixels +
-                                static_cast<std::size_t>(area.y + row) * dst.stride) +
-                            area.x;
-
-            if (memcpy_rows) {
-                std::memcpy(dst_row, src_row + sub_x + (area.x - cmd.dst.x),
-                            static_cast<std::size_t>(area.width) * 4u);
-                continue;
+        // The identity draw: whole-texel source the size of dst, no transform. A row walk,
+        // and with nothing to convert, blend or tint a row memcpy — the destination is
+        // written once and nothing is read back. This is every unscaled window.
+        const lx::rect2i sub{static_cast<int>(box.x), static_cast<int>(box.y),
+                             static_cast<int>(box.width), static_cast<int>(box.height)};
+        const bool whole_texels = static_cast<float>(sub.x) == box.x &&
+                                  static_cast<float>(sub.y) == box.y &&
+                                  static_cast<float>(sub.width) == box.width &&
+                                  static_cast<float>(sub.height) == box.height;
+        const bool identity = whole_texels && cmd.buffer_xform == lx::buffer_transform::normal &&
+                              sub.width == cmd.dst.width && sub.height == cmd.dst.height;
+        if (identity) {
+            const bool memcpy_rows = !needs_blend && !fill_alpha && !tinted &&
+                                     conv == convert_op::copy;
+            const unsigned sx0 = static_cast<unsigned>(sub.x + (area.x - cmd.dst.x));
+            for (int row = 0; row < area.height; ++row) {
+                const unsigned sy = static_cast<unsigned>(sub.y + (area.y - cmd.dst.y) + row);
+                const auto* src_row = reinterpret_cast<const std::uint32_t*>(
+                    src.pixels + static_cast<std::size_t>(sy) * src.stride);
+                auto* dst_row = reinterpret_cast<std::uint32_t*>(
+                                    dst.pixels +
+                                    static_cast<std::size_t>(area.y + row) * dst.stride) +
+                                area.x;
+                if (memcpy_rows) {
+                    std::memcpy(dst_row, src_row + sx0,
+                                static_cast<std::size_t>(area.width) * 4u);
+                    continue;
+                }
+                for (int x = 0; x < area.width; ++x)
+                    finish(src_row[sx0 + static_cast<unsigned>(x)], dst_row[x]);
             }
+            bytes += static_cast<unsigned long long>(area.height) * area.width * 4ull;
+            continue;
+        }
 
-            std::uint32_t sx = x_start;
-            for (int x = 0; x < area.width; ++x) {
-                const unsigned src_x =
-                    sub_x + (unscaled ? static_cast<unsigned>(area.x - cmd.dst.x + x)
-                                      : (sx >> 16));
-                sx += x_step;
-                if (src_x >= sub_x_end || src_x >= src.width)
-                    break;
+        // Everything else inverse-maps each destination pixel centre into the source box
+        // through the buffer transform's basis (the same `source_basis_for` the GPU paths
+        // use). The map is affine, so it is two 16.16 steps per pixel. Nearest sampling for
+        // an integer magnification of whole texels (exact, and what a scale-2 client on a
+        // scale-2 output wants); bilinear otherwise, like GL_LINEAR, with taps clamped to
+        // the box so a crop never bleeds.
+        const source_basis basis = source_basis_for(cmd.buffer_xform);
+        const bool quarter = (static_cast<unsigned>(cmd.buffer_xform) & 1u) != 0;
+        const float box_w_oriented = quarter ? box.height : box.width;
+        const float box_h_oriented = quarter ? box.width : box.height;
+        const float kx = static_cast<float>(cmd.dst.width) / box_w_oriented;
+        const float ky = static_cast<float>(cmd.dst.height) / box_h_oriented;
+        const bool nearest = whole_texels && kx >= 1.f && ky >= 1.f && kx == std::floor(kx) &&
+                             ky == std::floor(ky);
 
-                std::uint32_t pixel = src_row[src_x];
-                if (conv == convert_op::swap_rb)
-                    pixel = swap_rb_word(pixel);
-                if (fill_alpha)
-                    pixel |= 0xFF000000u;
-                if (tinted)
-                    pixel = apply_tint(pixel, tint_c0, tint_g, tint_c2, 255u);
-
-                dst_row[x] =
-                    needs_blend ? blend_over_linear(pixel, dst_row[x], opacity_255) : pixel;
+        // Source position (texture pixels) of destination point (px, py) relative to dst.
+        const double inv_w = 1.0 / cmd.dst.width;
+        const double inv_h = 1.0 / cmd.dst.height;
+        const double ax = static_cast<double>(basis.dx[0]) * box.width * inv_w;
+        const double ay = static_cast<double>(basis.dx[1]) * box.height * inv_w;
+        const double bx = static_cast<double>(basis.dy[0]) * box.width * inv_h;
+        const double by = static_cast<double>(basis.dy[1]) * box.height * inv_h;
+        const double ox = box.x + static_cast<double>(basis.origin[0]) * box.width;
+        const double oy = box.y + static_cast<double>(basis.origin[1]) * box.height;
+        // Inclusive texel bounds of the box (bilinear taps and nearest picks stay inside).
+        const int tx_lo = static_cast<int>(std::floor(box.x));
+        const int ty_lo = static_cast<int>(std::floor(box.y));
+        int tx_hi = static_cast<int>(std::ceil(box.x + box.width)) - 1;
+        int ty_hi = static_cast<int>(std::ceil(box.y + box.height)) - 1;
+        if (tx_hi >= static_cast<int>(src.width))
+            tx_hi = static_cast<int>(src.width) - 1;
+        if (ty_hi >= static_cast<int>(src.height))
+            ty_hi = static_cast<int>(src.height) - 1;
+        if (tx_hi < tx_lo || ty_hi < ty_lo)
+            continue;
+        constexpr double k_one = 65536.0;
+        const long long step_x = std::llround(ax * k_one);
+        const long long step_y = std::llround(ay * k_one);
+        // Bilinear samples at (s − ½): texel centres sit on half-integers.
+        const double centre = nearest ? 0.0 : 0.5;
+        const auto texel = [&](int tx, int ty) {
+            tx = tx < tx_lo ? tx_lo : (tx > tx_hi ? tx_hi : tx);
+            ty = ty < ty_lo ? ty_lo : (ty > ty_hi ? ty_hi : ty);
+            return reinterpret_cast<const std::uint32_t*>(
+                src.pixels + static_cast<std::size_t>(ty) * src.stride)[tx];
+        };
+        for (int row = 0; row < area.height; ++row) {
+            auto* dst_row = reinterpret_cast<std::uint32_t*>(
+                                dst.pixels + static_cast<std::size_t>(area.y + row) * dst.stride) +
+                            area.x;
+            const double py = (area.y + row - cmd.dst.y) + 0.5;
+            const double px = (area.x - cmd.dst.x) + 0.5;
+            long long fs = std::llround((ox + px * ax + py * bx - centre) * k_one);
+            long long ft = std::llround((oy + px * ay + py * by - centre) * k_one);
+            for (int x = 0; x < area.width; ++x, fs += step_x, ft += step_y) {
+                std::uint32_t pixel = 0;
+                if (nearest) {
+                    pixel = texel(static_cast<int>(fs >> 16), static_cast<int>(ft >> 16));
+                } else {
+                    const int ix = static_cast<int>(fs >> 16);
+                    const int iy = static_cast<int>(ft >> 16);
+                    const unsigned wx = static_cast<unsigned>((fs >> 8) & 0xFF);
+                    const unsigned wy = static_cast<unsigned>((ft >> 8) & 0xFF);
+                    const std::uint32_t p00 = texel(ix, iy);
+                    const std::uint32_t p10 = texel(ix + 1, iy);
+                    const std::uint32_t p01 = texel(ix, iy + 1);
+                    const std::uint32_t p11 = texel(ix + 1, iy + 1);
+                    const unsigned w00 = (256u - wx) * (256u - wy);
+                    const unsigned w10 = wx * (256u - wy);
+                    const unsigned w01 = (256u - wx) * wy;
+                    const unsigned w11 = wx * wy;
+                    for (unsigned shift = 0; shift < 32; shift += 8) {
+                        const unsigned c = (((p00 >> shift) & 0xFFu) * w00 +
+                                            ((p10 >> shift) & 0xFFu) * w10 +
+                                            ((p01 >> shift) & 0xFFu) * w01 +
+                                            ((p11 >> shift) & 0xFFu) * w11 + 32768u) >>
+                                           16;
+                        pixel |= (c > 255u ? 255u : c) << shift;
+                    }
+                }
+                finish(pixel, dst_row[x]);
             }
         }
         bytes += static_cast<unsigned long long>(area.height) * area.width * 4ull;
@@ -673,10 +720,10 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
         const int index = find(cmd.texture_id);
         if (index < 0)
             continue;
+        if (cmd.occluded)
+            continue;
         const pixel_surface& src = textures_[static_cast<unsigned>(index)].surface;
         if (!src.valid() || pick_convert(src.format, dst.format) == convert_op::unsupported)
-            continue;
-        if (cmd.buffer_xform != lx::buffer_transform::normal)
             continue;
         // A tint that darkens or fades still covers, but only if it is fully opaque and
         // the draw is actually drawn — otherwise what is underneath shows through.
@@ -697,18 +744,12 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
             ++stats.draws_skipped;
             continue;
         }
-        if (i < first_cmd) {
+        if (i < first_cmd || cmd.occluded) {
             ++stats.draws_culled;
             continue;
         }
         const pixel_surface& src = textures_[static_cast<unsigned>(index)].surface;
         if (pick_convert(src.format, dst.format) == convert_op::unsupported) {
-            ++stats.draws_unsupported;
-            continue;
-        }
-        // Say so rather than silently drawing a rotated buffer upright — a wrong frame is
-        // worse than a missing one, because nothing upstream can tell it happened.
-        if (cmd.buffer_xform != lx::buffer_transform::normal) {
             ++stats.draws_unsupported;
             continue;
         }

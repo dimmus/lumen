@@ -26,6 +26,8 @@ import :popup;
 import :layer_shell;
 import :protocols_p0;
 import :data_transfer;
+import :viewport;
+import :text_input;
 
 #if defined(LUMEN_HAS_WAYLAND)
 
@@ -40,6 +42,20 @@ struct frame_callback {
     bool used = false;
 };
 
+/// wp_viewport state (sticky: set once, it holds until changed or the viewport goes). The
+/// source is kept as the raw 24.8 fixed values: the "unset" sentinel and the integer test
+/// (bad_size) compare them exactly, never as doubles.
+struct viewport_state {
+    bool has_src = false;
+    std::int32_t src_x = 0; // wl_fixed_t
+    std::int32_t src_y = 0;
+    std::int32_t src_w = 0;
+    std::int32_t src_h = 0;
+    bool has_dst = false;
+    int dst_w = 0;
+    int dst_h = 0;
+};
+
 /// One content update's worth of wl_surface state. Used three times per surface: the
 /// pending state requests edit, the cached state a synchronized subsurface accumulates
 /// until its parent's state is applied, and the current state.
@@ -50,13 +66,22 @@ struct surface_pending {
     int dy = 0;
     int scale = 1;
     int32_t transform = 0;
-    /// Union of every damage / damage_buffer since the last commit, surface-local. Both
-    /// requests are treated alike: scale is 1 and the transform normal, so the two
-    /// coordinate spaces coincide.
-    lx::rect2i damage{};
-    bool has_damage = false;
+    /// Union of every wl_surface.damage since the last commit (surface-local, logical) and,
+    /// separately, of every damage_buffer (buffer pixels). The two spaces differ as soon as
+    /// a buffer scale, transform or viewport applies; each is converted into the other
+    /// when the update is applied (`:viewport`).
+    lx::rect2i damage_surface{};
+    bool has_damage_surface = false;
+    lx::rect2i damage_buffer{};
+    bool has_damage_buffer = false;
+    /// wp_viewport state, merged like scale and transform.
+    viewport_state viewport{};
     frame_callback frame_cbs[k_max_frame_cbs]{};
     unsigned frame_cb_count = 0;
+    /// wp_presentation_feedback objects of this update: a list in the compositor's
+    /// `presentation_feedback_table` (0: none). Moved with the update — merged into the
+    /// cached state, queued when applied — like frame callbacks.
+    unsigned feedback = 0;
     /// set_input_region / set_opaque_region: the region is copied when the request arrives
     /// (the wl_region may be destroyed right after) and applied with the rest.
     bool input_set = false;
@@ -68,6 +93,8 @@ struct surface_pending {
 /// A wl_surface's role. Fixed for the surface's lifetime once assigned (wl_surface: a
 /// surface has at most one role), which is what lets a second role request be rejected.
 /// `dnd_icon`: wl_data_device.start_drag's icon (kept after the drag, as in wlroots).
+/// `lock`: ext_session_lock_v1.get_lock_surface (wire_session_lock.cpp).
+/// `input_popup`: zwp_input_method_v2.get_input_popup_surface (wire_input_method.cpp).
 enum class surface_role : unsigned char {
     none,
     xdg_toplevel,
@@ -75,13 +102,19 @@ enum class surface_role : unsigned char {
     subsurface,
     popup,
     layer,
-    dnd_icon
+    dnd_icon,
+    lock,
+    input_popup
 };
 
 struct xdg_surface_obj;
 struct xdg_toplevel_obj;
 struct subsurface_obj;
 struct layer_surface_obj;
+struct viewport_obj;
+struct fractional_obj;
+struct lock_surface_obj;
+struct input_popup_obj;
 
 struct surface_obj {
     wl_resource* resource = nullptr;
@@ -121,6 +154,24 @@ struct surface_obj {
     subsurface_obj* sub = nullptr;
     /// The live zwlr_layer_surface_v1 for this surface, or null.
     layer_surface_obj* layer = nullptr;
+    /// The live wp_viewport / wp_fractional_scale_v1 for this surface, or null (at most one
+    /// of each: a second is `viewport_exists` / `fractional_scale_exists`).
+    viewport_obj* viewport = nullptr;
+    fractional_obj* fractional = nullptr;
+    /// The live ext_session_lock_surface_v1 for this surface, or null (the role stays).
+    lock_surface_obj* lock_surface = nullptr;
+    /// The live zwp_input_popup_surface_v2 for this surface, or null (the role stays).
+    input_popup_obj* input_popup = nullptr;
+    /// Logical surface size of the current state (buffer / scale, transformed, or the
+    /// viewport's): what roles, the tree and hit-testing use. 0x0 without content.
+    lx::size2i surface_size{};
+    /// Buffer size the last `surface geometry` debug line reported.
+    lx::size2i logged_buffer{};
+    /// wp_fractional_scale_v1.preferred_scale as last sent (120ths); 0 = never.
+    std::uint32_t pref_scale120 = 0;
+    /// invalid_size on a cursor or role-less surface is tolerated (wlroots; wayland#194)
+    /// and logged once per surface.
+    bool invalid_size_logged = false;
     /// Applied input region (infinite by default) and opaque region (empty by default).
     lx::compositor::input_region input_current{};
     lx::compositor::input_region opaque_current{};
@@ -133,6 +184,9 @@ struct surface_obj {
     std::uint32_t pref_transform = 0;
     /// In wl_surface's destructor: membership changes are recorded, never sent.
     bool destroying = false;
+    /// CLOCK_MONOTONIC of the last wl_surface.frame callback answered for this surface:
+    /// what the 995 ms throttle of a surface not on screen counts from (0: never).
+    unsigned long long frame_done_ns = 0;
 };
 
 /// wl_subsurface. Inert once its surface is gone; a surface whose parent is gone keeps its
@@ -141,6 +195,42 @@ struct subsurface_obj {
     wl_resource* resource = nullptr;
     surface_obj* surface = nullptr;
     bool used = false;
+};
+
+/// wp_viewport. Inert once its wl_surface is gone (`surface` null): every request but
+/// destroy is then `no_surface`.
+struct viewport_obj {
+    wl_resource* resource = nullptr;
+    surface_obj* surface = nullptr;
+    bool used = false;
+};
+
+/// wp_fractional_scale_v1. Inert once its wl_surface is gone: nothing more is sent.
+struct fractional_obj {
+    wl_resource* resource = nullptr;
+    surface_obj* surface = nullptr;
+    bool used = false;
+};
+
+/// ext_session_lock_surface_v1 (wire_session_lock.cpp). Inert when `record` is 0: another
+/// lock's, its lock ended, or its wl_surface went. Allocated per request.
+struct lock_surface_obj {
+    wl_resource* resource = nullptr;
+    surface_obj* surface = nullptr;
+    /// The `session_lock` record id (0: inert).
+    unsigned record = 0;
+    unsigned output = 0;
+    /// The size of the last configure sent, and where the surface is placed (its output's
+    /// logical origin).
+    lx::size2i sent{};
+    lx::point2i origin{};
+};
+
+/// zwp_input_popup_surface_v2 (wire_input_method.cpp): the relay's record and the wl_surface.
+/// Inert once its surface or its input method is gone. Allocated per request.
+struct input_popup_obj {
+    lx::compositor::input_popup_record record{};
+    surface_obj* surface = nullptr;
 };
 
 struct region_obj {
@@ -416,11 +506,102 @@ void retire_image(void*, unsigned texture_id);
 // ── wire_surface.cpp ───────────────────────────────────────────────────────
 
 void apply_cached(surface_obj* s, const char* cause, unsigned depth);
+/// Geometry inputs (`:viewport`) of the state a wl_surface.commit of `s` would produce now
+/// (pending over cached over current), and of its current state.
+[[nodiscard]] lx::compositor::surface_geometry_in pending_geometry(const surface_obj* s);
+[[nodiscard]] lx::compositor::surface_geometry_in current_geometry(const surface_obj* s);
 void flush_desync(surface_obj* s, const char* cause);
 void discard_cached(surface_obj* s);
 void bind_compositor(wayland::client_connection& client, unsigned id, int version);
-void fire_frames(unsigned frame_time_ms);
+/// Answers pending frame callbacks: all of them (`throttle` false), or those of surfaces
+/// on screen in published frame `visible_frame` plus the throttled ones that are due
+/// (see `fire_visible_frame_callbacks`).
+void fire_frames(unsigned frame_time_ms, bool throttle, unsigned visible_frame,
+                 unsigned long long now_ns);
 [[nodiscard]] bool frames_pending();
+[[nodiscard]] bool frames_throttled();
+/// Whether `surface` was on screen in published frame `frame` (its scene node's
+/// visibility-pass mark).
+[[nodiscard]] bool surface_visible(lx::surface_id surface, unsigned frame);
+
+// ── wire_presentation.cpp (wp_presentation) ────────────────────────────────
+
+/// wp_presentation (a P1 protocol; defined only when its glue exists — wire_install.cpp
+/// calls it under the same `__has_include` guard).
+void bind_presentation(wayland::client_connection& client, unsigned id, int version);
+/// The content-update hooks of wl_surface (wire_surface.cpp calls them; no-ops without a
+/// feedback table): pending → cached, cached → current, and the surface going away —
+/// destroyed (`presentation_surface_destroyed`: its pending and cached feedback too) or
+/// unmapped (`presentation_surface_unmapped`: what is in flight).
+void presentation_merge(surface_obj* s);
+void presentation_apply(surface_obj* s);
+void presentation_surface_destroyed(surface_obj* s);
+void presentation_surface_unmapped(lx::surface_id surface);
+/// A cached update is dropped unapplied (`discard_cached`): its feedback is discarded.
+void presentation_drop_cached(surface_obj* s);
+
+// ── wire_viewporter.cpp, wire_fractional_scale.cpp ──────────────────────────
+
+/// wp_viewporter / wp_fractional_scale_manager_v1 (P1 protocols; defined only when their
+/// glue exists — wire_install.cpp calls them under the same `__has_include` guard).
+void bind_viewporter(wayland::client_connection& client, unsigned id, int version);
+void bind_fractional_scale(wayland::client_connection& client, unsigned id, int version);
+/// wl_surface commit precheck: `bad_size` / `out_of_buffer` on the state this commit
+/// produces (wlroots checks at client commit too). False when an error was posted.
+bool viewport_precheck(surface_obj* s);
+/// A wl_surface is going: its viewport and fractional-scale objects go inert.
+void viewport_surface_destroyed(surface_obj* s);
+/// Sends wp_fractional_scale_v1.preferred_scale when `scale120` differs from what the
+/// surface was last told (no-op without a fractional-scale object or its glue).
+void fractional_scale_update(surface_obj* s, std::uint32_t scale120);
+
+// ── wire_session_lock.cpp (ext-session-lock-v1) ────────────────────────────
+
+/// ext_session_lock_manager_v1 (defined only when its glue exists — wire_install.cpp calls it
+/// under the same `__has_include` guard).
+void bind_session_lock_manager(wayland::client_connection& client, unsigned id, int version);
+/// wl_surface commit precheck of a lock surface: commit_before_first_ack, null_buffer,
+/// dimensions_mismatch on the state the commit produces. False when an error was posted.
+bool lock_surface_precheck(surface_obj* s);
+/// A lock surface's commit was applied: it maps into the lock layer (at its output's
+/// origin) and counts as content for the lock.
+void lock_surface_committed(surface_obj* s);
+/// The lock surface's content is drawn (its object lives and belongs to the lock in charge).
+[[nodiscard]] bool lock_surface_drawable(const surface_obj* s);
+/// A wl_surface with a live lock surface object is going (client teardown only — a
+/// destroy request is defunct_role_object): the object goes inert.
+void lock_surface_surface_destroyed(surface_obj* s);
+/// Outputs changed: lock surfaces are configured to their output's new logical size and
+/// placed at its origin (wire_output.cpp calls it; a no-op without the glue).
+void session_lock_outputs_changed();
+
+// ── wire_text_input.cpp, wire_input_method.cpp (text-input-v3, input-method-v2, virtual
+//    keyboard v1) ─────────────────────────────────────────────────────────────
+
+/// zwp_text_input_manager_v3 v2 / zwp_input_method_manager_v2 v1 /
+/// zwp_virtual_keyboard_manager_v1 v1 (defined only when their glue exists — wire_install.cpp
+/// calls them under the same `__has_include` guards).
+void bind_text_input_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_input_method_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_virtual_keyboard_manager(wayland::client_connection& client, unsigned id, int version);
+/// The relay's sink (both halves), the router's focus hook and the seat keymap the router
+/// restores clients to. A no-op without a relay.
+void install_text_input(p0_protocol_context& ctx);
+/// The zwp_text_input_v3 half of the relay's sink (wire_text_input.cpp; no-op without glue).
+void text_input_sink_events(lx::compositor::text_input_sink& sink);
+/// wl_surface hooks: an input popup's commit was applied (it shows or hides, and is placed);
+/// whether its content is drawn; its surface is going (the object goes inert).
+void input_popup_committed(surface_obj* s);
+[[nodiscard]] bool input_popup_drawable(const surface_obj* s);
+void input_popup_surface_destroyed(surface_obj* s);
+/// A wl_surface's state was applied: v2 cursor rectangles staged for it become current.
+void text_input_surface_applied(surface_obj* s);
+/// `surface`'s node moved (the tree's rect hook) / the outputs changed: popups follow.
+void text_input_surface_moved(lx::surface_id surface);
+void text_input_outputs_changed();
+/// Topmost shown input popup under the global point (the window manager's hit-test).
+[[nodiscard]] bool input_popup_hit_impl(double x, double y, void*& surface_res,
+                                        lx::surface_id& surface, double& sx, double& sy);
 
 // ── wire_subsurface.cpp ────────────────────────────────────────────────────
 
@@ -465,10 +646,19 @@ void bind_cursor_shape(wayland::client_connection& client, unsigned id, int vers
 // ── wire_seat.cpp, wire_shell.cpp, wire_output.cpp, wire_data_device.cpp ───
 
 bool cursor_request_allowed(wl_client* client, uint32_t serial);
+/// The seat's keymap as every wl_keyboard is sent it: a sealed memfd owned for the process
+/// lifetime. False when there is none (no keyboard is advertised then).
+bool seat_keymap(int& fd, unsigned& size);
 void bind_seat(wayland::client_connection& client, unsigned id, int version);
 void bind_shell(wayland::client_connection& client, unsigned id, int version);
 /// Sends zlm_shell_v1.session_ending (v3) to every bound shell.
 void shell_send_session_ending();
+/// zlm_key_grab_v1.activated (v4): see `p0_protocol_context::fire_key_grab`.
+void shell_fire_key_grab(void* grab_resource, unsigned time_ms);
+/// zlm_shell_v1.lock_state / lock_requested (v5) to every bound shell of version 5.
+void shell_send_lock_state(unsigned state);
+/// True when one was told.
+bool shell_send_lock_requested(unsigned reason);
 void bind_output(wayland::client_connection& client, unsigned id, int version);
 
 // ── wire_output.cpp: wl_output, xdg-output, output membership ───────────────
@@ -478,8 +668,31 @@ void bind_xdg_output_manager(wayland::client_connection& client, unsigned id, in
 /// Installs the surface tree's rect hook and the cursor's surface hook.
 void install_outputs(p0_protocol_context& ctx);
 /// `surface_tree` rect hook: recomputes the surface's output membership from its node rect
-/// (empty: unmapped) and sends enter/leave and the preferred scale/transform.
+/// (empty: unmapped) and sends enter/leave and the preferred scale/transform. Unmapped, the
+/// surface's in-flight presentation feedback is discarded.
 void output_node_rect(void* user, lx::surface_id surface, lx::rect2i rect);
+/// The 120ths scale a surface not yet on any output is expected to show at (D7: the first
+/// wp_fractional_scale_v1.preferred_scale): its current one when it is on outputs,
+/// otherwise its parent's, otherwise output 0's (toplevels and layer surfaces map there).
+[[nodiscard]] std::uint32_t expected_scale_120(const surface_obj* s);
+/// Calls `fn(resource)` for every wl_output resource `client` bound for output `slot`.
+void for_each_output_resource(wl_client* client, unsigned slot, void (*fn)(wl_resource*, void*),
+                              void* user);
+
+/// The output slot a wl_output resource stands for now, or -1 (inert, or no output left).
+[[nodiscard]] int output_resource_slot(wl_resource* output);
+
+// ── wire_idle.cpp, wire_output_power.cpp (ext-idle-notify, idle-inhibit, wlr output power) ──
+
+/// ext_idle_notifier_v1 v2 / zwp_idle_inhibit_manager_v1 v1 / zwlr_output_power_manager_v1
+/// v1 (P1 protocols; defined only when their glue exists — wire_install.cpp calls them under
+/// the same `__has_include` guards).
+void bind_idle_notifier(wayland::client_connection& client, unsigned id, int version);
+void bind_idle_inhibit_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_output_power_manager(wayland::client_connection& client, unsigned id, int version);
+/// Outputs changed: a zwlr_output_power_v1 whose wl_output stands for no output any more is
+/// sent `failed` and goes inert (wire_output.cpp calls it; a no-op without the glue).
+void output_power_outputs_changed();
 
 // ── wire_xdg_shell.cpp: liveness ───────────────────────────────────────────
 

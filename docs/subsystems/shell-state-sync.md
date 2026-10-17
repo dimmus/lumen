@@ -11,7 +11,7 @@ Implemented in `zlm_policy_bridge_v1` (`protocols/lumen/zlm_shell_v1.xml`):
 
 | Phase | Events |
 |-------|--------|
-| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 3) |
+| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 5), then (v5) `zlm_shell_v1.lock_state` |
 | Initial sync | `snapshot_begin` → `snapshot_workspace*` → (`snapshot_toplevel` [→ `toplevel_flags`])* → `snapshot_output*` → `snapshot_done` → `focus_changed` |
 | Runtime deltas | `toplevel_created` (→ `toplevel_state`, `toplevel_geometry` [, `toplevel_flags`]), `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `toplevel_flags` (v2), `focus_changed`, `stacking_order_changed` |
 
@@ -39,6 +39,79 @@ no shell. Either way the bound shell first receives `zlm_shell_v1.session_ending
 reads the disconnect that follows as the end of the session, not a crash. lumen-shell binds
 `min(advertised, 3)` and shows a "Log out" button only when version 3 is bound: one click
 arms it ("Confirm?"), a second sends the request, moving off disarms it.
+
+### Version 4: key grabs
+
+The family moves to version 4 together (`zlm_key_grab_v1` is created at its parent's
+version too). `zlm_shell_v1.grab_key(id, keysym, modifiers, flags)` creates a
+`zlm_key_grab_v1`: while it exists, a press of the combination reaches no client and is
+reported as `activated(serial, time)`; the key's release reaches no client either (the
+compositor's forwarded-key rule). Matching: exact modifiers (shift, ctrl, alt, super; Caps
+Lock and Num Lock ignored); the keysym at the key's first shift level in the active layout,
+or in layout 0 when the active layout has no key producing it (Super+Return still works
+under a Cyrillic layout). With the `tap` flag the grab names a bare modifier pressed and
+released alone and is *observed*: the key still reaches the client, and `activated` comes on
+its release when no other key, button or scroll happened meanwhile (Super+drag is not a tap).
+Grabs are not delivered during an interactive move, resize or drag, or while the session is
+paused (VT switched away).
+
+A grab is refused — `refused(reason)`, then inert until destroyed — when it names the
+compositor's own bindings (`reserved`: Ctrl+Alt+BackSpace, the `XF86Switch_VT_*` keysyms,
+Ctrl+Alt+F1…F12), a combination another grab holds (`taken`), or unknown bits or a tap grab
+on a non-modifier (`invalid`). The compositor keeps its own bindings regardless, so a dead
+or misbehaving shell cannot take the keyboard ways out; a shell's grabs vanish with its
+connection.
+
+**Serial semantics.** `activated`'s serial is a fresh seat serial that the compositor records
+in its per-client input serial log as a *key press delivered to the shell*: the shell may
+quote it to `xdg_activation_token_v1.set_serial`, and the focus-stealing policy grants the
+token (the shell's last key press), so an application launched from a key binding takes the
+keyboard. It also satisfies `xdg_popup.grab`.
+
+**Startup sequence (v5 shell):** bind `zlm_shell_v1` (min(advertised, 5)) → `capabilities`
+(version 5) → `lock_state` → `get_policy_bridge` → snapshot … `focus_changed` → `grab_key`
+×N. lumen-shell
+registers the Super_L and Super_R taps (toggle the launcher) and Super+Return (start a
+terminal; its `activated` serial is the one the launch's activation token quotes). Bound below
+version 4, `policy_bridge::grab_key` returns `not_implemented` and logs once at info that the
+compositor has no key grabs; the launcher is then reachable from the panel only.
+
+### Version 5: the session lock
+
+The family moves to version 5 together. Two `zlm_shell_v1` events, both Wayland-free on the
+compositor side (`:session_lock` decides, `wire_shell.cpp` sends):
+
+- `lock_state(state)` — `unlocked` 0, `locking` 1 (a locker asked: input has left normal
+  clients; the scene locks within 1 s), `locked` 2, `abandoned` 3 (locked, and the locker
+  died: the session stays locked on dark red until a new locker takes over or logind's
+  `Unlock`). Sent on bind (after `capabilities`) and on every change of that value. While it
+  is not `unlocked` **no shell surface is shown and none receives input, and key grabs and
+  taps are not delivered** — the compositor guarantees that by construction (hidden layers,
+  lock-surface-only hit-testing and keyboard focus, `keybindings::set_locked`); the shell
+  only reacts.
+- `lock_requested(reason)` — `logind` 0 (`loginctl lock-session`, a lid policy: logind's
+  `Session.Lock`) or `sleep` 1 (`Manager.PrepareForSleep(true)`; the compositor holds a
+  logind sleep delay until `locked` or 2 s). Not sent while already locked. Lumen ships no
+  locker: the shell starts its configured one; with none, the compositor logs that nothing
+  locks.
+
+lumen-shell binds `min(advertised, 5)` and, below 5, logs once at info that there is no
+session-lock integration. Its lock policy (`lx.shell:idle_policy`, pure; `--lock-command`,
+`--[no-]lock-on-blank`, `--blank-locked-after`):
+
+- on `locking`/`locked`/`abandoned`: close the launcher, drop pointer and key-repeat state;
+- on `abandoned`: start the locker again — at once the first time, then at most once per
+  5 s, giving up after the third relaunch (an `error`: `loginctl unlock-session` unlocks);
+  the count resets at the next unlock;
+- on `lock_requested`, and on Super+L (a v5 key grab registered only with a lock command):
+  start the locker when unlocked;
+- the blank timeout (`--blank-after`) starts the locker first and powers the outputs off
+  once `locked` arrives (5 s at most), so the screen never goes dark unlocked (GNOME's
+  order); while locked a second `ext_idle_notification_v1` (`--blank-locked-after`, 60 s)
+  blanks the lock screen; a blank request is not repeated while the outputs are off.
+
+The locker is an ordinary client launched like any application (`app-lumen-locker@<random>
+.service`, no activation token: lock surfaces take the keyboard as such).
 
 - **`not_responding`**: the client left an `xdg_wm_base.ping` unanswered past the
   compositor's timeout (`--ping-timeout`, 5 s). The compositor only shows it — "(Not
@@ -185,15 +258,21 @@ and the compositor warns `bridge replaced`).
 libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phase 3):
 
 - **Startup.** Bind `wl_compositor` (v4+), `wl_shm`, `zwlr_layer_shell_v1` (v4),
-  `zlm_shell_v1` (v2, or what the compositor advertises) and, if present, `wp_cursor_shape_manager_v1`; the bridge listens on
+  `zlm_shell_v1` (v5, or what the compositor advertises) and, if present, `wp_cursor_shape_manager_v1`; the bridge listens on
   `zlm_shell_v1` in the same dispatch as the bind, because `capabilities` follows at once
   and libwayland drops events for a proxy with no listener. A second roundtrip surfaces a
   refused bind as a protocol error: the shell logs why and exits 1. Then
-  `get_policy_bridge`, and the panel's layer surface. `wl_seat` is bound just before the
-  panel is created, for the same reason as `zlm_shell_v1`.
+  `get_policy_bridge`, and the panel's layer surface. `wl_seat` (v5 at most) gets its
+  listener in the bind's own dispatch, for the same reason as `zlm_shell_v1`; the shell owns
+  the seat's pointer and keyboard and routes them by surface to the panel or the launcher.
+  Also bound: the first `wl_output` (v2, its mode sizes the launcher) and
+  `xdg_activation_v1` (tokens for launched windows).
 - **Loop.** `wl_display_prepare_read` / `dispatch_pending` / `flush` (POLLOUT on EAGAIN),
-  then `ppoll` on the display fd and a `signalfd` for SIGINT/SIGTERM. No timers: an idle
-  shell sleeps. SIGINT/SIGTERM exit 0 after destroying every object; a refused bind, a lost
+  then `ppoll` on the display fd, a `signalfd` for SIGINT/SIGTERM, the catalog's inotify
+  fd, one `timerfd` (earliest of: key repeat, panel-notice expiry, catalog debounce,
+  activation-token timeout — disarmed when none is due) and, after the first launch opened
+  it, the user bus (`sd_bus_get_events` / `sd_bus_get_timeout`) plus any fallback-launch
+  pipes. An idle shell sleeps. SIGINT/SIGTERM exit 0 after destroying every object; a refused bind, a lost
   compositor or a `closed` panel exit 1, and `lumen-shell.service` (`Restart=on-failure`)
   starts it again.
 - **Task model** (`lx.shell:task_model`, pure). A fixed table of 256 entries — app_id, title
@@ -221,6 +300,38 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   against what was last committed (only differing entries are damaged with
   `wl_surface.damage_buffer`). A focus change damages two entries, a retitle one, a hover
   change one or two; adding or removing a window re-lays out and damages the panel.
+- **Apps button and notices.** An "Apps" button at the left end (64 px) toggles the
+  launcher and stays latched while it is open. A launch that fails while the launcher is
+  closed (Super+Return without a terminal, a start job that failed) shows "Could not start
+  <Name>: <reason>" in place of the task entries for 6 s or until clicked.
+- **Launcher** (`lx.shell:launcher`). A separate layer surface on `overlay`, anchored
+  top/left with 4 px margins and exclusive zone 0 (so it sits under the panel), keyboard
+  interactivity `on_demand`, namespace `lumen-launcher`; 420 px wide (less on a narrow
+  output), a 40 px search row, 4–14 rows of 32 px, a 24 px status row. It exists only while
+  open (its surface, pool and buffers are created on open and freed on close). The
+  compositor gives it the keyboard on map (an `on_demand` top/overlay surface does); it
+  closes on Escape with an empty query, on its toggle, on launch, and on
+  `wl_keyboard.leave` — a click on a window or on nothing takes the keyboard back, so an
+  outside click dismisses it with standard protocol only. Typing filters (Name prefix, a
+  word of Name, Name substring, GenericName/Keywords, the Exec program), Up/Down,
+  Tab/Shift+Tab, Page Up/Down, Home/End move, Return launches, BackSpace / Ctrl+BackSpace /
+  Ctrl+W / Ctrl+U edit; keys repeat per `repeat_info`. A press and release on a row
+  launches it; the wheel scrolls three rows a notch. Layout, diff and model are pure, as the
+  panel's.
+- **Catalog and launching** (`lx.shell:desktop_entry`, `:app_catalog`, `:app_launch`). The
+  catalog is read once after the panel's first commit, then inotify only marks it stale;
+  it is rescanned when the launcher opens (or, while open, 250 ms after a burst of
+  changes). A launch is checked first (the program in `PATH`, a terminal for
+  `Terminal=true`) — a failure shows in the launcher's status row and it stays open — then
+  an `xdg_activation_v1` token is requested with the triggering input's serial (the Return
+  key press, the row's button press, or the grab's `activated`), the launcher closes, and
+  on `done` (or after 100 ms without one) the app starts as its own systemd user service
+  (`StartTransientUnit`, `app-lumen-<id>@<random>.service`, `Type=exec`, `ExitType=cgroup`,
+  `Slice=app.slice`, `CollectMode=inactive-or-failed`, the launch environment, the absolute
+  program path); below systemd 250 (`Manager.Version`, read once) as a double fork held
+  before `execve` until it is in its transient scope `app-lumen-<id>-<random>.scope`; or,
+  without systemd --user, by double fork + `setsid`. A `NoReply` is never retried by fork
+  (systemd may still start the unit).
 - **Input.** A left press and release on the same entry sends `request_raise` then
   `request_activate` (activate raises too; raise is sent so the intent stays explicit if
   focus and stacking policy ever separate). The pointer shape is `default` through
@@ -230,7 +341,13 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   `title`, `state`, `focus handle=<slot|none>`, `flags handle=<slot> flags=<bits>` at debug), `shell.panel` (`configure` at info;
   `layout idx=<i> x=<x> w=<w> handle=<slot> title="…"` on every re-layout, `draw entries=<n>
   hidden=<k> focused=<i> damage=<rects>[(full)] repaint=<rects> buffer=<b>` and
-  `click idx=<i> handle=<slot>` at debug).
+  `click idx=<i> handle=<slot>` at debug), `shell.launcher` (`launcher: open (…)` and
+  `launcher: close` at info; `launcher: close (<why>)` and `launcher: draw …` at debug),
+  `shell.apps` (`apps: catalog <n> entries, <m> listed (…) in <ms> ms; terminal <source>`
+  and `apps: launched <id> as <unit>` at info; failures at warn, once per desktop ID and
+  reason per catalog generation), `shell.lock` (`lock command: …`, `lock: starting <path>
+  (<why>)` at info; giving up on a locker that keeps exiting at error), `shell.bridge`
+  (`session lock <state>`, `lock requested (…)` at info).
 
 ## Window rules
 

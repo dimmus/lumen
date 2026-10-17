@@ -9,6 +9,7 @@ module;
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -33,6 +34,38 @@ export import :privilege;
 
 export namespace lx::session {
 
+/// How logind took a device away (org.freedesktop.login1.Session.PauseDevice, its type
+/// string). Only `pause` asks for PauseDeviceComplete; logind sends it on seats without VTs,
+/// where it waits for the acknowledgement before switching. `force` comes with a VT switch
+/// (the device is already revoked) and `gone` with an unplug.
+enum class device_pause : unsigned char { pause, force, gone };
+
+/// Session signals, fired from inside `dispatch()` on the thread that owns the session (the
+/// compositor's UI thread). A callback must only record what happened: sd-bus is in the
+/// middle of processing, so no D-Bus call and no libinput work belongs in it.
+struct session_listener {
+    void (*device_paused)(unsigned major, unsigned minor, device_pause kind,
+                          void* user) = nullptr;
+    /// `fd` is borrowed and valid only during the call (sd-bus owns it). For DRM it is the
+    /// device already held, with master restored; for evdev a *new* fd.
+    void (*device_resumed)(unsigned major, unsigned minor, int fd, void* user) = nullptr;
+    /// Session.Active changed (from PropertiesChanged, or the Get issued when the property
+    /// was only invalidated).
+    void (*active_changed)(bool active, void* user) = nullptr;
+    /// Seat.SwitchTo failed. `error_name` is the D-Bus error name (static for the call).
+    void (*vt_switch_failed)(const char* error_name, void* user) = nullptr;
+    /// Session.Lock / Session.Unlock (`loginctl lock-session` / `unlock-session`, a lid
+    /// policy; Unlock is polkit-gated by logind, org.freedesktop.login1.lock-sessions).
+    void (*lock_requested)(void* user) = nullptr;
+    void (*unlock_requested)(void* user) = nullptr;
+    /// Manager.PrepareForSleep: true before suspend or hibernate, false after resume.
+    void (*prepare_for_sleep)(bool start, void* user) = nullptr;
+    void* user = nullptr;
+};
+
+/// The logind session this process runs in: session control (TakeControl), devices
+/// (TakeDevice / ReleaseDevice / PauseDeviceComplete), the pause and resume signals, and
+/// VT switching (Seat.SwitchTo). Owned by one thread.
 class logind_session {
 public:
     logind_session() = default;
@@ -40,24 +73,65 @@ public:
 
     logind_session(const logind_session&) = delete;
     logind_session& operator=(const logind_session&) = delete;
+    /// Moves re-point the signal matches at the new object; a pending asynchronous call
+    /// (SwitchTo, an Active Get) still names the old one, so move only before using them.
     logind_session(logind_session&& other) noexcept;
     logind_session& operator=(logind_session&& other) noexcept;
 
+    /// Connects to logind, takes control of the session and reads Session.Seat, VTNr and
+    /// Active and Seat.CanTTY (startup-only synchronous calls).
     [[nodiscard]] static lx::result<logind_session> open();
 
     [[nodiscard]] credentials peer_credentials(int socket_fd) const;
+    /// Session.Active as last seen: read at `open`, then tracked from PropertiesChanged.
     [[nodiscard]] bool is_active() const;
     [[nodiscard]] const char* session_id() const;
+    /// TakeControl succeeded: devices come from TakeDevice.
+    [[nodiscard]] bool has_control() const { return has_control_; }
+    /// Seat.CanTTY: the seat has virtual terminals (seat0 on a machine with a console).
+    [[nodiscard]] bool can_switch_vt() const { return can_tty_; }
+    /// Session.VTNr; 0 when the session has no VT.
+    [[nodiscard]] unsigned vt_number() const { return vt_nr_; }
 
-    /// Acquire a device via logind TakeDevice (major/minor). Falls back to path open
-    /// when LUMEN_HAS_LOGIND is unavailable.
-    [[nodiscard]] lx::result<lx::unique_fd> take_device(unsigned major, unsigned minor);
-    [[nodiscard]] lx::result<lx::unique_fd> take_device_path(const char* path);
+    /// Acquire a device via logind TakeDevice (major/minor). `inactive`, when given,
+    /// receives logind's flag: the session is not in the foreground and the device is
+    /// paused (DRM without master, evdev revoked) until ResumeDevice.
+    [[nodiscard]] lx::result<lx::unique_fd> take_device(unsigned major, unsigned minor,
+                                                        bool* inactive = nullptr);
+    /// TakeDevice for a device node, with a direct-open fallback (which logind does not
+    /// track, and `release_device` therefore leaves alone).
+    [[nodiscard]] lx::result<lx::unique_fd> take_device_path(const char* path,
+                                                             bool* inactive = nullptr);
 
-    void lock();
-    void unlock();
-    [[nodiscard]] lx::result<void> pause_devices();
-    [[nodiscard]] lx::result<void> resume_devices();
+    /// Installs the signal matches (PauseDevice, ResumeDevice, PropertiesChanged on the
+    /// session path). Call on the object's final address. Synchronous, at startup.
+    [[nodiscard]] lx::result<void> set_listener(session_listener listener);
+
+    /// ReleaseDevice, sent without waiting for a reply — ordered before any later
+    /// TakeDevice on the same connection, so a device can be taken again at once. Only for
+    /// devices this object took (a fixed table of 64); anything else is ignored.
+    void release_device(unsigned major, unsigned minor);
+    /// `fstat` → character device → `release_device`.
+    void release_device_fd(int fd);
+    /// True while `major:minor` was taken through this object and not released.
+    [[nodiscard]] bool holds_device(unsigned major, unsigned minor) const;
+    /// PauseDeviceComplete for one device. Only for a pause of type `pause`; no reply.
+    void complete_pause(unsigned major, unsigned minor);
+    /// org.freedesktop.login1.Seat.SwitchTo(vt) on this session's seat, asynchronously
+    /// (logind starts sending signals at once; a blocking call would stall on them). A
+    /// failure reaches `session_listener::vt_switch_failed`. Refused now: vt 0 or > 63, no
+    /// seat, or a seat without VTs.
+    [[nodiscard]] lx::result<void> switch_vt(unsigned vt);
+
+    /// Session.SetLockedHint(locked), asynchronously (what `loginctl` and desktop components
+    /// read as "this session is locked"). No-op without a session.
+    void set_locked_hint(bool locked);
+    /// Manager.Inhibit("sleep", …, "delay"), asynchronously: sleep waits (logind's
+    /// InhibitDelayMaxSec, 5 s by default) until `release_sleep_inhibitor` or this process
+    /// goes — the time to lock the screen before the system sleeps. Idempotent.
+    void take_sleep_inhibitor();
+    void release_sleep_inhibitor();
+    [[nodiscard]] bool holds_sleep_inhibitor() const { return sleep_fd_ >= 0; }
 
     /// Process pending sd-bus messages (PauseDevice / ResumeDevice / Active).
     void dispatch();
@@ -69,14 +143,51 @@ public:
 
 private:
     void release();
+    void track_taken(unsigned major, unsigned minor);
+    /// The ReleaseDevice message itself, tracked or not.
+    void send_release(unsigned major, unsigned minor);
+    void fire_active(bool active);
+
+    static constexpr unsigned k_max_taken = 64;
+    struct taken_device {
+        unsigned major = 0;
+        unsigned minor = 0;
+        bool used = false;
+    };
 
     char session_id_buf_[64]{};
     const char* session_id_ = "";
     bool active_ = false;
     bool has_control_ = false;
+    bool can_tty_ = false;
+    unsigned vt_nr_ = 0;
+    taken_device taken_[k_max_taken]{};
+    session_listener listener_{};
+    /// The sleep delay inhibitor's fd (-1: none held).
+    int sleep_fd_ = -1;
 #if defined(LUMEN_HAS_LOGIND)
     sd_bus* bus_ = nullptr;
     char session_path_[256]{};
+    char seat_path_[256]{};
+    sd_bus_slot* pause_slot_ = nullptr;
+    sd_bus_slot* resume_slot_ = nullptr;
+    sd_bus_slot* props_slot_ = nullptr;
+    sd_bus_slot* lock_slot_ = nullptr;
+    sd_bus_slot* unlock_slot_ = nullptr;
+    sd_bus_slot* sleep_slot_ = nullptr;
+    /// The Inhibit call in flight (its reply carries the fd).
+    sd_bus_slot* inhibit_call_ = nullptr;
+
+    static int on_lock(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_unlock(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_prepare_for_sleep(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_inhibit_reply(sd_bus_message* m, void* user, sd_bus_error* err);
+
+    static int on_pause_device(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_resume_device(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_properties_changed(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_active_reply(sd_bus_message* m, void* user, sd_bus_error* err);
+    static int on_switch_reply(sd_bus_message* m, void* user, sd_bus_error* err);
 #endif
 };
 
@@ -98,20 +209,55 @@ lx::session::logind_session& lx::session::logind_session::operator=(logind_sessi
     session_id_ = session_id_buf_[0] ? session_id_buf_ : "";
     active_ = other.active_;
     has_control_ = other.has_control_;
+    can_tty_ = other.can_tty_;
+    vt_nr_ = other.vt_nr_;
+    std::memcpy(taken_, other.taken_, sizeof(taken_));
+    listener_ = other.listener_;
+    sleep_fd_ = other.sleep_fd_;
+    other.sleep_fd_ = -1;
 #if defined(LUMEN_HAS_LOGIND)
     bus_ = other.bus_;
     other.bus_ = nullptr;
     std::memcpy(session_path_, other.session_path_, sizeof(session_path_));
+    std::memcpy(seat_path_, other.seat_path_, sizeof(seat_path_));
+    pause_slot_ = other.pause_slot_;
+    resume_slot_ = other.resume_slot_;
+    props_slot_ = other.props_slot_;
+    lock_slot_ = other.lock_slot_;
+    unlock_slot_ = other.unlock_slot_;
+    sleep_slot_ = other.sleep_slot_;
+    inhibit_call_ = other.inhibit_call_;
+    other.pause_slot_ = other.resume_slot_ = other.props_slot_ = nullptr;
+    other.lock_slot_ = other.unlock_slot_ = other.sleep_slot_ = other.inhibit_call_ = nullptr;
+    // The matches carry the object's address as their userdata.
+    for (sd_bus_slot* s :
+         {pause_slot_, resume_slot_, props_slot_, lock_slot_, unlock_slot_, sleep_slot_,
+          inhibit_call_})
+        if (s)
+            (void)sd_bus_slot_set_userdata(s, this);
+    other.session_path_[0] = '\0';
+    other.seat_path_[0] = '\0';
 #endif
     other.session_id_buf_[0] = '\0';
     other.session_id_ = "";
     other.active_ = false;
     other.has_control_ = false;
+    other.can_tty_ = false;
+    other.vt_nr_ = 0;
+    std::memset(other.taken_, 0, sizeof(other.taken_));
+    other.listener_ = {};
     return *this;
 }
 
 void lx::session::logind_session::release() {
 #if defined(LUMEN_HAS_LOGIND)
+    // The matches go first: nothing may call back into an object being torn down.
+    for (sd_bus_slot** s : {&pause_slot_, &resume_slot_, &props_slot_, &lock_slot_,
+                            &unlock_slot_, &sleep_slot_, &inhibit_call_}) {
+        if (*s)
+            sd_bus_slot_unref(*s);
+        *s = nullptr;
+    }
     if (bus_ && has_control_ && session_path_[0] != '\0') {
         sd_bus_call_method(bus_, "org.freedesktop.login1", session_path_,
                            "org.freedesktop.login1.Session", "ReleaseControl", nullptr, nullptr,
@@ -122,11 +268,21 @@ void lx::session::logind_session::release() {
         bus_ = nullptr;
     }
     session_path_[0] = '\0';
+    seat_path_[0] = '\0';
 #endif
     has_control_ = false;
     active_ = false;
+    can_tty_ = false;
+    vt_nr_ = 0;
+    std::memset(taken_, 0, sizeof(taken_));
+    listener_ = {};
     session_id_buf_[0] = '\0';
     session_id_ = "";
+#if !defined(_WIN32)
+    if (sleep_fd_ >= 0)
+        ::close(sleep_fd_);
+#endif
+    sleep_fd_ = -1;
 }
 
 lx::result<lx::session::logind_session> lx::session::logind_session::open() {
@@ -167,6 +323,49 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
     std::snprintf(s.session_path_, sizeof(s.session_path_), "%s", path);
     sd_bus_message_unref(reply);
 
+    // Session.Seat (so), VTNr (u), Active (b); Seat.CanTTY (b). One call each, at startup.
+    {
+        sd_bus_error perr = SD_BUS_ERROR_NULL;
+        sd_bus_message* seat_reply = nullptr;
+        if (sd_bus_get_property(s.bus_, "org.freedesktop.login1", s.session_path_,
+                                "org.freedesktop.login1.Session", "Seat", &perr, &seat_reply,
+                                "(so)") >= 0 &&
+            seat_reply) {
+            const char* seat_id = nullptr;
+            const char* seat_path = nullptr;
+            if (sd_bus_message_read(seat_reply, "(so)", &seat_id, &seat_path) >= 0 && seat_path)
+                std::snprintf(s.seat_path_, sizeof(s.seat_path_), "%s", seat_path);
+            sd_bus_message_unref(seat_reply);
+        }
+        sd_bus_error_free(&perr);
+
+        std::uint32_t vt = 0;
+        perr = SD_BUS_ERROR_NULL;
+        if (sd_bus_get_property_trivial(s.bus_, "org.freedesktop.login1", s.session_path_,
+                                        "org.freedesktop.login1.Session", "VTNr", &perr, 'u',
+                                        &vt) >= 0)
+            s.vt_nr_ = vt;
+        sd_bus_error_free(&perr);
+
+        int active = 0;
+        perr = SD_BUS_ERROR_NULL;
+        if (sd_bus_get_property_trivial(s.bus_, "org.freedesktop.login1", s.session_path_,
+                                        "org.freedesktop.login1.Session", "Active", &perr, 'b',
+                                        &active) >= 0)
+            s.active_ = active != 0;
+        sd_bus_error_free(&perr);
+
+        if (s.seat_path_[0] != '\0') {
+            int can_tty = 0;
+            perr = SD_BUS_ERROR_NULL;
+            if (sd_bus_get_property_trivial(s.bus_, "org.freedesktop.login1", s.seat_path_,
+                                            "org.freedesktop.login1.Seat", "CanTTY", &perr, 'b',
+                                            &can_tty) >= 0)
+                s.can_tty_ = can_tty != 0;
+            sd_bus_error_free(&perr);
+        }
+    }
+
     sd_bus_error take_err = SD_BUS_ERROR_NULL;
     if (sd_bus_call_method(s.bus_, "org.freedesktop.login1", s.session_path_,
                            "org.freedesktop.login1.Session", "TakeControl", &take_err, nullptr, "b",
@@ -174,11 +373,9 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
         sd_bus_error_free(&take_err);
         // Continue without control — direct open fallback still works for render nodes.
         s.has_control_ = false;
-        s.active_ = true;
         return s;
     }
     s.has_control_ = true;
-    s.active_ = true;
     return s;
 #else
     return lx::not_implemented("lx::session::logind_session::open");
@@ -206,7 +403,29 @@ lx::session::credentials lx::session::logind_session::peer_credentials(int socke
 bool lx::session::logind_session::is_active() const { return active_; }
 const char* lx::session::logind_session::session_id() const { return session_id_; }
 
-lx::result<lx::unique_fd> lx::session::logind_session::take_device(unsigned major, unsigned minor) {
+void lx::session::logind_session::track_taken(unsigned major, unsigned minor) {
+    taken_device* free_slot = nullptr;
+    for (auto& t : taken_) {
+        if (t.used && t.major == major && t.minor == minor)
+            return;
+        if (!t.used && !free_slot)
+            free_slot = &t;
+    }
+    // Past 64 devices the extra one is not tracked: it is never released explicitly, and
+    // logind releases it with the session. No seat has that many input devices.
+    if (free_slot)
+        *free_slot = {major, minor, true};
+}
+
+bool lx::session::logind_session::holds_device(unsigned major, unsigned minor) const {
+    for (const auto& t : taken_)
+        if (t.used && t.major == major && t.minor == minor)
+            return true;
+    return false;
+}
+
+lx::result<lx::unique_fd> lx::session::logind_session::take_device(unsigned major, unsigned minor,
+                                                                    bool* inactive) {
 #if defined(LUMEN_HAS_LOGIND)
     if (bus_ && has_control_ && session_path_[0] != '\0') {
         sd_bus_error err = SD_BUS_ERROR_NULL;
@@ -216,13 +435,21 @@ lx::result<lx::unique_fd> lx::session::logind_session::take_device(unsigned majo
                                          &reply, "uu", major, minor);
         if (r >= 0 && reply) {
             int fd = -1;
-            int inactive = 0;
-            if (sd_bus_message_read(reply, "hb", &fd, &inactive) >= 0 && fd >= 0) {
-                // sd-bus duplicates the fd into the message; dup again for ownership.
-                const int owned = ::dup(fd);
+            int paused = 0;
+            if (sd_bus_message_read(reply, "hb", &fd, &paused) >= 0 && fd >= 0) {
+                // sd-bus owns the fd in the message; dup for ownership.
+                const int owned = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
                 sd_bus_message_unref(reply);
-                if (owned >= 0)
+                if (owned >= 0) {
+                    track_taken(major, minor);
+                    if (inactive)
+                        *inactive = paused != 0;
                     return lx::unique_fd{owned};
+                }
+                // logind holds it now and we do not (EMFILE): give it back. It was never
+                // tracked, so not through `release_device`, which would skip it — and every
+                // later TakeDevice of it would fail with "Device already taken".
+                send_release(major, minor);
             } else {
                 sd_bus_message_unref(reply);
             }
@@ -234,57 +461,343 @@ lx::result<lx::unique_fd> lx::session::logind_session::take_device(unsigned majo
     (void)major;
     (void)minor;
 #endif
+    (void)inactive;
     return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::permission_denied),
                           "TakeDevice failed");
 }
 
-lx::result<lx::unique_fd> lx::session::logind_session::take_device_path(const char* path) {
+lx::result<lx::unique_fd> lx::session::logind_session::take_device_path(const char* path,
+                                                                         bool* inactive) {
 #if !defined(_WIN32)
     if (!path || path[0] == '\0') {
         return lx::make_error(lx::error_domain::invalid_argument, 0, "null device path");
     }
     struct stat st{};
     if (::stat(path, &st) == 0 && S_ISCHR(st.st_mode)) {
-        auto taken = take_device(major(st.st_rdev), minor(st.st_rdev));
+        auto taken = take_device(major(st.st_rdev), minor(st.st_rdev), inactive);
         if (taken)
             return taken;
     }
     // Direct-open fallback (video group / root / render node world-writable).
     const int fd = ::open(path, O_RDWR | O_CLOEXEC);
-    if (fd >= 0)
+    if (fd >= 0) {
+        if (inactive)
+            *inactive = false;
         return lx::unique_fd{fd};
+    }
     return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::permission_denied),
                           "failed to open device path");
 #else
     (void)path;
+    (void)inactive;
     return lx::not_implemented("lx::session::logind_session::take_device_path");
 #endif
 }
 
-void lx::session::logind_session::lock() { active_ = false; }
-void lx::session::logind_session::unlock() { active_ = true; }
+void lx::session::logind_session::release_device(unsigned major, unsigned minor) {
+    bool tracked = false;
+    for (auto& t : taken_) {
+        if (t.used && t.major == major && t.minor == minor) {
+            t = {};
+            tracked = true;
+        }
+    }
+    if (tracked)
+        send_release(major, minor);
+}
 
-lx::result<void> lx::session::logind_session::pause_devices() {
-#if defined(LUMEN_HAS_LOGIND)
-    active_ = false;
-    return {};
+void lx::session::logind_session::send_release(unsigned major, unsigned minor) {
+#if !defined(LUMEN_HAS_LOGIND)
+    (void)major;
+    (void)minor;
 #else
-    return lx::not_implemented("lx::session::logind_session::pause_devices");
+    if (!bus_ || session_path_[0] == '\0')
+        return;
+    // No callback: sent with NO_REPLY_EXPECTED. The flush writes it now (a local socket, a
+    // few hundred bytes), so it is ahead of the TakeDevice a resume issues.
+    (void)sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", session_path_,
+                                   "org.freedesktop.login1.Session", "ReleaseDevice", nullptr,
+                                   nullptr, "uu", major, minor);
+    (void)sd_bus_flush(bus_);
 #endif
 }
 
-lx::result<void> lx::session::logind_session::resume_devices() {
+void lx::session::logind_session::release_device_fd(int fd) {
+#if !defined(_WIN32)
+    struct stat st{};
+    if (fd < 0 || ::fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode))
+        return;
+    release_device(major(st.st_rdev), minor(st.st_rdev));
+#else
+    (void)fd;
+#endif
+}
+
+void lx::session::logind_session::complete_pause(unsigned major, unsigned minor) {
 #if defined(LUMEN_HAS_LOGIND)
-    if (bus_ && has_control_ && session_path_[0] != '\0') {
-        sd_bus_call_method(bus_, "org.freedesktop.login1", session_path_,
-                           "org.freedesktop.login1.Session", "PauseDeviceComplete", nullptr, nullptr,
-                           "uu", 0u, 0u);
-    }
-    active_ = true;
+    if (!bus_ || !has_control_ || session_path_[0] == '\0')
+        return;
+    (void)sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", session_path_,
+                                   "org.freedesktop.login1.Session", "PauseDeviceComplete",
+                                   nullptr, nullptr, "uu", major, minor);
+    (void)sd_bus_flush(bus_);
+#else
+    (void)major;
+    (void)minor;
+#endif
+}
+
+lx::result<void> lx::session::logind_session::switch_vt(unsigned vt) {
+    if (vt == 0 || vt > 63)
+        return lx::make_error(lx::error_domain::invalid_argument, 0, "VT number out of range");
+#if defined(LUMEN_HAS_LOGIND)
+    if (!bus_ || seat_path_[0] == '\0')
+        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
+                              "no logind seat to switch VTs on");
+    if (!can_tty_)
+        return lx::make_error(lx::error_domain::io,
+                              static_cast<int>(lx::io_err::permission_denied),
+                              "seat has no virtual terminals");
+    const int r = sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", seat_path_,
+                                           "org.freedesktop.login1.Seat", "SwitchTo",
+                                           &logind_session::on_switch_reply, this, "u", vt);
+    if (r < 0)
+        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::broken_pipe),
+                              "Seat.SwitchTo could not be sent");
+    (void)sd_bus_flush(bus_);
     return {};
 #else
-    return lx::not_implemented("lx::session::logind_session::resume_devices");
+    return lx::not_implemented("lx::session::logind_session::switch_vt");
 #endif
+}
+
+void lx::session::logind_session::fire_active(bool active) {
+    if (active == active_)
+        return;
+    active_ = active;
+    if (listener_.active_changed)
+        listener_.active_changed(active, listener_.user);
+}
+
+#if defined(LUMEN_HAS_LOGIND)
+
+int lx::session::logind_session::on_pause_device(sd_bus_message* m, void* user, sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    std::uint32_t maj = 0;
+    std::uint32_t min = 0;
+    const char* type = nullptr;
+    if (!self || sd_bus_message_read(m, "uus", &maj, &min, &type) < 0)
+        return 0;
+    // logind_session_device.c: TRY_PAUSE → "pause", PAUSE → "force", RELEASE → "gone".
+    // Anything newer is treated as the safe case: already taken, nothing to acknowledge.
+    device_pause kind = device_pause::force;
+    if (type && std::strcmp(type, "pause") == 0)
+        kind = device_pause::pause;
+    else if (type && std::strcmp(type, "gone") == 0)
+        kind = device_pause::gone;
+    if (self->listener_.device_paused)
+        self->listener_.device_paused(maj, min, kind, self->listener_.user);
+    return 0;
+}
+
+int lx::session::logind_session::on_resume_device(sd_bus_message* m, void* user, sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    std::uint32_t maj = 0;
+    std::uint32_t min = 0;
+    int fd = -1;
+    if (!self || sd_bus_message_read(m, "uuh", &maj, &min, &fd) < 0)
+        return 0;
+    if (self->listener_.device_resumed)
+        self->listener_.device_resumed(maj, min, fd, self->listener_.user);
+    return 0;
+}
+
+int lx::session::logind_session::on_active_reply(sd_bus_message* m, void* user, sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    if (!self || sd_bus_message_is_method_error(m, nullptr))
+        return 0;
+    int active = 0;
+    if (sd_bus_message_read(m, "v", "b", &active) >= 0)
+        self->fire_active(active != 0);
+    return 0;
+}
+
+int lx::session::logind_session::on_properties_changed(sd_bus_message* m, void* user,
+                                                       sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    const char* iface = nullptr;
+    if (!self || sd_bus_message_read(m, "s", &iface) < 0 || !iface ||
+        std::strcmp(iface, "org.freedesktop.login1.Session") != 0)
+        return 0;
+    if (sd_bus_message_enter_container(m, 'a', "{sv}") < 0)
+        return 0;
+    while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
+        const char* name = nullptr;
+        if (sd_bus_message_read(m, "s", &name) < 0)
+            return 0;
+        if (name && std::strcmp(name, "Active") == 0) {
+            int active = 0;
+            if (sd_bus_message_read(m, "v", "b", &active) < 0)
+                return 0;
+            self->fire_active(active != 0);
+        } else if (sd_bus_message_skip(m, "v") < 0) {
+            return 0;
+        }
+        if (sd_bus_message_exit_container(m) < 0)
+            return 0;
+    }
+    if (sd_bus_message_exit_container(m) < 0)
+        return 0;
+    // Invalidated without a value: ask for it.
+    if (sd_bus_message_enter_container(m, 'a', "s") < 0)
+        return 0;
+    const char* name = nullptr;
+    while (sd_bus_message_read(m, "s", &name) > 0) {
+        if (name && std::strcmp(name, "Active") == 0) {
+            (void)sd_bus_call_method_async(self->bus_, nullptr, "org.freedesktop.login1",
+                                           self->session_path_,
+                                           "org.freedesktop.DBus.Properties", "Get",
+                                           &logind_session::on_active_reply, self, "ss",
+                                           "org.freedesktop.login1.Session", "Active");
+        }
+    }
+    (void)sd_bus_message_exit_container(m);
+    return 0;
+}
+
+int lx::session::logind_session::on_lock(sd_bus_message*, void* user, sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    if (self && self->listener_.lock_requested)
+        self->listener_.lock_requested(self->listener_.user);
+    return 0;
+}
+
+int lx::session::logind_session::on_unlock(sd_bus_message*, void* user, sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    if (self && self->listener_.unlock_requested)
+        self->listener_.unlock_requested(self->listener_.user);
+    return 0;
+}
+
+int lx::session::logind_session::on_prepare_for_sleep(sd_bus_message* m, void* user,
+                                                      sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    int start = 0;
+    if (!self || sd_bus_message_read(m, "b", &start) < 0)
+        return 0;
+    if (self->listener_.prepare_for_sleep)
+        self->listener_.prepare_for_sleep(start != 0, self->listener_.user);
+    return 0;
+}
+
+int lx::session::logind_session::on_inhibit_reply(sd_bus_message* m, void* user, sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    if (!self)
+        return 0;
+    if (self->inhibit_call_) {
+        sd_bus_slot_unref(self->inhibit_call_);
+        self->inhibit_call_ = nullptr;
+    }
+    if (sd_bus_message_is_method_error(m, nullptr))
+        return 0; // no inhibitor: sleep simply does not wait (logged by nobody; not an error)
+    int fd = -1;
+    if (sd_bus_message_read(m, "h", &fd) < 0 || fd < 0)
+        return 0;
+    // sd-bus owns the fd in the message.
+    const int owned = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (owned < 0)
+        return 0;
+    if (self->sleep_fd_ >= 0)
+        ::close(self->sleep_fd_);
+    self->sleep_fd_ = owned;
+    return 0;
+}
+
+int lx::session::logind_session::on_switch_reply(sd_bus_message* m, void* user, sd_bus_error*) {
+    auto* self = static_cast<logind_session*>(user);
+    if (!self || !sd_bus_message_is_method_error(m, nullptr))
+        return 0;
+    const sd_bus_error* e = sd_bus_message_get_error(m);
+    if (self->listener_.vt_switch_failed)
+        self->listener_.vt_switch_failed(e && e->name ? e->name : "unknown",
+                                         self->listener_.user);
+    return 0;
+}
+
+#endif // LUMEN_HAS_LOGIND
+
+lx::result<void> lx::session::logind_session::set_listener(session_listener listener) {
+    listener_ = listener;
+#if defined(LUMEN_HAS_LOGIND)
+    if (!bus_ || session_path_[0] == '\0')
+        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
+                              "no logind session to listen on");
+    if (pause_slot_)
+        return {}; // already installed; the listener above replaced the callbacks
+    int r = sd_bus_match_signal(bus_, &pause_slot_, "org.freedesktop.login1", session_path_,
+                                "org.freedesktop.login1.Session", "PauseDevice",
+                                &logind_session::on_pause_device, this);
+    if (r >= 0)
+        r = sd_bus_match_signal(bus_, &resume_slot_, "org.freedesktop.login1", session_path_,
+                                "org.freedesktop.login1.Session", "ResumeDevice",
+                                &logind_session::on_resume_device, this);
+    if (r >= 0)
+        r = sd_bus_match_signal(bus_, &props_slot_, "org.freedesktop.login1", session_path_,
+                                "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                &logind_session::on_properties_changed, this);
+    if (r >= 0)
+        r = sd_bus_match_signal(bus_, &lock_slot_, "org.freedesktop.login1", session_path_,
+                                "org.freedesktop.login1.Session", "Lock",
+                                &logind_session::on_lock, this);
+    if (r >= 0)
+        r = sd_bus_match_signal(bus_, &unlock_slot_, "org.freedesktop.login1", session_path_,
+                                "org.freedesktop.login1.Session", "Unlock",
+                                &logind_session::on_unlock, this);
+    if (r >= 0)
+        r = sd_bus_match_signal(bus_, &sleep_slot_, "org.freedesktop.login1",
+                                "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                                "PrepareForSleep", &logind_session::on_prepare_for_sleep, this);
+    if (r < 0)
+        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::broken_pipe),
+                              "logind signal match failed");
+    return {};
+#else
+    return lx::not_implemented("lx::session::logind_session::set_listener");
+#endif
+}
+
+void lx::session::logind_session::set_locked_hint(bool locked) {
+#if defined(LUMEN_HAS_LOGIND)
+    if (!bus_ || session_path_[0] == '\0')
+        return;
+    (void)sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", session_path_,
+                                   "org.freedesktop.login1.Session", "SetLockedHint", nullptr,
+                                   nullptr, "b", locked ? 1 : 0);
+    (void)sd_bus_flush(bus_);
+#else
+    (void)locked;
+#endif
+}
+
+void lx::session::logind_session::take_sleep_inhibitor() {
+#if defined(LUMEN_HAS_LOGIND)
+    if (!bus_ || sleep_fd_ >= 0 || inhibit_call_)
+        return;
+    (void)sd_bus_call_method_async(bus_, &inhibit_call_, "org.freedesktop.login1",
+                                   "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
+                                   "Inhibit", &logind_session::on_inhibit_reply, this, "ssss",
+                                   "sleep", "lumen-compositor", "lock the screen before sleeping",
+                                   "delay");
+    (void)sd_bus_flush(bus_);
+#endif
+}
+
+void lx::session::logind_session::release_sleep_inhibitor() {
+#if !defined(_WIN32)
+    if (sleep_fd_ >= 0)
+        ::close(sleep_fd_);
+#endif
+    sleep_fd_ = -1;
 }
 
 void lx::session::logind_session::dispatch() {

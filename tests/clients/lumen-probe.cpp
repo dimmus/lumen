@@ -13,6 +13,8 @@
 //   repositioned idx=0 token=<t>
 //   popup_done idx=<k>
 //   keyboard enter surface=<toplevel|popup<k>>             key code=<evdev> state=<0|1>
+//   keyboard keys=[<evdev>,…] (after every enter)          keyboard leave
+//   keyboard modifiers depressed=<m> latched=<m> locked=<m> group=<g>
 //
 //   lumen-probe popup --size WxH --popup WxH --anchor-rect x,y,w,h --anchor N --gravity N
 //                     --adjust BITS --offset x,y [--reactive] [--chain N] [--grab]
@@ -117,6 +119,122 @@
 //
 //   activation activate token=<first 8 chars> mapped=<0|1>
 //   toplevel activated=<0|1>              keyboard enter surface=toplevel
+//
+// Scale mode maps the toplevel through wp_viewporter and wp_fractional_scale_v1, the way
+// foot and GTK 4 do: it renders a one-pixel black/white checker at round(size × scale/120)
+// and sets the viewport destination to the logical size, so every pixel on screen is a
+// texel (any resampling turns the checker grey). It redraws when the preferred scale
+// changes. --integer renders at wl_surface.preferred_buffer_scale with set_buffer_scale
+// instead (a client without fractional-scale). Viewport tests: --buffer WxH draws a buffer
+// of four coloured quadrants (red, green / blue, yellow, each with a 1 px white frame) at
+// --buffer-scale N and --transform T, cropped to --crop x,y,w,h (surface units, fractions
+// allowed) and scaled to --dst WxH (default: the configured size).
+//
+//   lumen-probe scale [--integer] [--buffer WxH] [--buffer-scale N] [--transform T]
+//                     [--crop x,y,w,h] [--dst WxH] [popup and toplevel options]
+//
+//   preferred-scale <120ths>              preferred-buffer-scale <n>
+//   buffer <w>x<h> dst <w>x<h> scale120=<n> buffer-scale=<n>
+//   pointer position x=<sx> y=<sy>        (surface-local, on enter and motion)
+//
+// Presentation mode maps the toplevel and animates it, paced by frame callbacks: every frame
+// is a new buffer (a different colour), committed with a wp_presentation_feedback. --frames N
+// stops after N frames (0: until --exit-after), waits up to 2 s for the outstanding feedback
+// and prints a summary. --burst K commits K updates per frame (all but the last are
+// superseded before they can be shown: discarded). --maximize asks to be maximized (an
+// opaque window covering the others: theirs stops being presented). It binds wl_output for
+// sync_output.
+//
+//   lumen-probe presentation [--frames N] [--burst K] [--maximize] [toplevel options]
+//
+//   clock_id <id>
+//   presented frame=<n> seq=<msc> t=<s.ns> dt=<ms since the previous> refresh=<ns>
+//             flags=0x<kind> sync_output=<k> latency=<ms commit → light>
+//   discarded frame=<n> at=<s, CLOCK_MONOTONIC when it arrived>
+//   presentation summary frames=<n> presented=<n> discarded=<n> pending=<n>
+//             seq_monotonic=<0|1> seq_first=<n> seq_last=<n> refresh=<ns> flags=0x<or>
+//             dt_mean=<ms> dt_max=<ms> latency_mean=<ms> sync_output=<n> clock_id=<id>
+//             t_monotonic=<0|1>
+//
+// Idle mode maps nothing: it creates one ext_idle_notification_v1 (--timeout MS, default
+// 3000; --input-only uses get_input_idle_notification, v2, which ignores idle inhibitors)
+// and prints every event with the seconds since the notification was created and the
+// CLOCK_MONOTONIC time (to line up with injected input). --count N exits after N `idled`.
+//
+//   lumen-probe idle [--timeout MS] [--input-only] [--count N] [--exit-after S]
+//
+//   idle notification timeout=<ms> input_only=<0|1> version=<v>
+//   idled t=<s> at=<s>                    resumed t=<s> at=<s>
+//
+// Inhibit mode maps the toplevel and puts a zwp_idle_inhibitor_v1 on it (before its first
+// commit); --unmap-after S unmaps it (null attach), --destroy-after S destroys the inhibitor.
+//
+//   lumen-probe inhibit [--unmap-after S] [--destroy-after S] [toplevel options]
+//
+//   inhibitor created                     inhibitor destroyed
+//
+// Power mode maps nothing: it binds wl_output and zwlr_output_power_manager_v1 and makes one
+// zwlr_output_power_v1. --set off|on is requested once the first `mode` arrived (--set-after
+// S later); --then off|on --then-after S a second request. --invalid sends mode 2 (the
+// object's invalid_mode protocol error).
+//
+//   lumen-probe power [--set off|on] [--set-after S] [--then off|on] [--then-after S]
+//                     [--invalid] [--exit-after S]
+//
+//   power mode=<on|off> at=<s>            power failed            power set mode=<on|off>
+//
+// Lock mode is a minimal screen locker (ext-session-lock-v1): it locks, makes one lock
+// surface for the output (bound like power mode's), acks every configure and fills it with
+// a solid colour (--colour 0xAARRGGBB, default dark blue). --unlock-after S unlocks S seconds
+// after `locked` (unlock_and_destroy, then a roundtrip as the spec asks); --password STR
+// unlocks when STR (lower-case letters and digits, US keymap) followed by Enter is typed into
+// the lock surface — a test password, never a real one; --crash-after S exits without
+// unlocking S seconds after `locked` (the session must stay locked); --no-surfaces locks
+// without a lock surface (the compositor must lock after its 1 s wait); --surface-after S
+// creates the lock surface S seconds after the lock request; --wrong-size commits a buffer 10
+// pixels narrower than configured (dimensions_mismatch). `finished` after `locked` (logind
+// Unlock) is answered with unlock_and_destroy, before it with destroy; the probe then exits.
+//
+//   lumen-probe lock [--unlock-after S] [--password STR] [--crash-after S] [--no-surfaces]
+//                    [--surface-after S] [--wrong-size] [--colour 0xAARRGGBB] [--exit-after S]
+//
+//   lock requested at=<s>                 lock configure WxH serial=<n> at=<s>
+//   lock locked at=<s> after=<s since the request>
+//   lock finished at=<s> locked=<0|1>     lock unlocked at=<s>       lock crash
+//   keyboard enter surface=lock           key code=<evdev> state=<0|1>
+//   pointer enter surface=lock …          lock password wrong        lock password accepted
+//
+// Text-input mode maps the toplevel with a zwp_text_input_v3 (v2 when offered), the way GTK
+// and foot use it: on `enter` it enables, sends its text model as the surrounding text, a
+// content type and the cursor rectangle --cursor x,y,w,h (surface-local, default 20,40,2,18),
+// commits, then commits the wl_surface (v2 applies the rectangle with it). Every `done` applies
+// preedit / deletion / commit string to the model in the spec's order and, when the text
+// changed and the serial matches, sends the new surrounding text. --disable-after S disables
+// (and --enable-after S enables again, counted from the disable); --no-enable never enables.
+//
+//   lumen-probe text-input [--cursor x,y,w,h] [--disable-after S] [--enable-after S]
+//                          [--no-enable] [toplevel options]
+//
+//   ti enter surface=toplevel             ti leave             ti enable commits=<n>
+//   ti preedit "<s>" <begin> <end>        ti commit "<s>"      ti delete <before> <after>
+//   ti done serial=<n> commits=<n> text="<model>" preedit="<s>"      ti disable commits=<n>
+//
+// Input-method mode is a minimal input method (input-method-v2 + virtual-keyboard-v1, the way
+// fcitx5 and ibus work): it binds the seat's input method and a virtual keyboard, grabs the
+// keyboard on activate (released on deactivate, as fcitx5 does), forwards the grab's keymap
+// to its virtual keyboard verbatim, and composes: `a` adds "α" to the preedit, Backspace
+// removes the last preedit character, space commits the preedit; every other key (and every
+// modifier change) is forwarded through the virtual keyboard. A popup surface of --popup WxH
+// (default 120x40) shows while active. Commits quote the number of `done` events received.
+//
+//   lumen-probe im [--popup WxH] [--no-popup] [--exit-after S]
+//
+//   im bound                              im unavailable
+//   im activate                           im deactivate
+//   im done n=<dones> active=<0|1> surrounding="<s>" cursor=<n> purpose=<p> hint=<h>
+//   im grab keymap size=<n>               im key code=<evdev> state=<0|1>
+//   im preedit "<s>"                      im commit "<s>"       im forwarded code=<c> state=<s>
+//   im popup rect x=<x> y=<y> w=<w> h=<h>  (zwp_input_popup_surface_v2.text_input_rectangle)
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -153,6 +271,39 @@
 #if __has_include("xdg-activation-v1-client-protocol.h")
 #include "xdg-activation-v1-client-protocol.h"
 #define LUMEN_PROBE_HAS_ACTIVATION 1
+#endif
+#if __has_include("viewporter-client-protocol.h") && __has_include("fractional-scale-v1-client-protocol.h")
+#include "viewporter-client-protocol.h"
+#include "fractional-scale-v1-client-protocol.h"
+#define LUMEN_PROBE_HAS_SCALE 1
+#endif
+#if __has_include("presentation-time-client-protocol.h")
+#include "presentation-time-client-protocol.h"
+#define LUMEN_PROBE_HAS_PRESENTATION 1
+#endif
+#if __has_include("ext-idle-notify-v1-client-protocol.h")
+#include "ext-idle-notify-v1-client-protocol.h"
+#define LUMEN_PROBE_HAS_IDLE_NOTIFY 1
+#endif
+#if __has_include("idle-inhibit-unstable-v1-client-protocol.h")
+#include "idle-inhibit-unstable-v1-client-protocol.h"
+#define LUMEN_PROBE_HAS_IDLE_INHIBIT 1
+#endif
+#if __has_include("wlr-output-power-management-unstable-v1-client-protocol.h")
+#include "wlr-output-power-management-unstable-v1-client-protocol.h"
+#define LUMEN_PROBE_HAS_OUTPUT_POWER 1
+#endif
+#if __has_include("ext-session-lock-v1-client-protocol.h")
+#include "ext-session-lock-v1-client-protocol.h"
+#define LUMEN_PROBE_HAS_SESSION_LOCK 1
+#endif
+#if __has_include("text-input-unstable-v3-client-protocol.h") && \
+    __has_include("input-method-unstable-v2-client-protocol.h") && \
+    __has_include("virtual-keyboard-unstable-v1-client-protocol.h")
+#include "text-input-unstable-v3-client-protocol.h"
+#include "input-method-unstable-v2-client-protocol.h"
+#include "virtual-keyboard-unstable-v1-client-protocol.h"
+#define LUMEN_PROBE_HAS_IME 1
 #endif
 #if defined(LUMEN_PROBE_HAS_LAYER_SHELL)
 // wayland-scanner names an argument `namespace`, a C++ keyword (Wayfire renames it the same
@@ -227,6 +378,50 @@ struct options {
     const char* token = nullptr;
     bool no_serial = false;
     bool early = false;
+    // scale mode
+    bool scale_mode = false;
+    bool integer_scale = false;
+    int vp_buffer_w = 0, vp_buffer_h = 0;
+    int buffer_scale = 1;
+    int transform = 0;
+    bool crop = false;
+    double crop_x = 0, crop_y = 0, crop_w = 0, crop_h = 0;
+    int dst_w = 0, dst_h = 0;
+    // presentation mode
+    bool presentation_mode = false;
+    int frames = 300;
+    int burst = 1;
+    bool maximize = false;
+    // idle / inhibit / power modes
+    bool idle_mode = false;
+    unsigned idle_timeout_ms = 3000;
+    bool input_only = false;
+    int idle_count = 0;
+    bool inhibit_mode = false;
+    double destroy_after = 0.0;
+    bool power_mode = false;
+    int power_set = -1; // -1 none, 0 off, 1 on
+    double power_set_after = 0.0;
+    int power_then = -1;
+    double power_then_after = 0.0;
+    bool power_invalid = false;
+    // lock mode
+    bool lock_mode = false;
+    double unlock_after = 0.0;
+    double crash_after = 0.0;
+    double surface_after = 0.0;
+    bool no_surfaces = false;
+    bool wrong_size = false;
+    const char* password = nullptr;
+    uint32_t lock_colour = 0xff1c2a44;
+    // text-input / input-method modes
+    bool text_input_mode = false;
+    bool im_mode = false;
+    int cursor_x = 20, cursor_y = 40, cursor_w = 2, cursor_h = 18;
+    double disable_after = 0.0;
+    double enable_after = 0.0;
+    bool no_enable = false;
+    bool no_popup = false;
 };
 
 struct surface_state {
@@ -325,10 +520,62 @@ struct app {
 #endif
     bool activated = false;     // the target presented its token
     bool token_requested = false;
+    // scale mode
+#if defined(LUMEN_PROBE_HAS_SCALE)
+    wp_viewporter* viewporter = nullptr;
+    wp_fractional_scale_manager_v1* fractional_manager = nullptr;
+    wp_viewport* viewport = nullptr;
+    wp_fractional_scale_v1* fractional = nullptr;
+#endif
+    uint32_t scale120 = 0;
+    int preferred_buffer_scale = 1;
+    int last_w = 0, last_h = 0;
+    // presentation mode
+#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+    wp_presentation* presentation = nullptr;
+#endif
+    // idle / inhibit / power modes
+#if defined(LUMEN_PROBE_HAS_IDLE_NOTIFY)
+    ext_idle_notifier_v1* idle_notifier = nullptr;
+    ext_idle_notification_v1* idle_notification = nullptr;
+#endif
+#if defined(LUMEN_PROBE_HAS_IDLE_INHIBIT)
+    zwp_idle_inhibit_manager_v1* inhibit_manager = nullptr;
+    zwp_idle_inhibitor_v1* inhibitor = nullptr;
+#endif
+#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+    zwlr_output_power_manager_v1* power_manager = nullptr;
+    zwlr_output_power_v1* power = nullptr;
+#endif
+    double idle_created_at = 0.0;
+    int idled_count = 0;
+    double destroy_inhibitor_at = 0.0;
+    bool power_seen_mode = false;
+    double power_set_at = 0.0;
+    double power_then_at = 0.0;
+    // lock mode
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+    ext_session_lock_manager_v1* lock_manager = nullptr;
+    ext_session_lock_v1* lock = nullptr;
+    ext_session_lock_surface_v1* lock_surface = nullptr;
+#endif
+    surface_state lock_surf{};
+    double lock_requested_at = 0.0;
+    bool lock_locked = false;
+    double lock_surface_at = 0.0;
+    double unlock_at = 0.0;
+    double crash_at = 0.0;
+    bool lock_done = false;
+    char typed[64]{};
+    unsigned typed_len = 0;
 };
 
 app g{};
 volatile sig_atomic_t g_stop = 0;
+/// The input-method mode's popup surface, and the wl_surface the pointer is on (for naming a
+/// surface that has no surface_state: "im-popup").
+wl_surface* g_im_popup_surface = nullptr;
+wl_surface* g_pointer_wl = nullptr;
 
 double now_s() {
     timespec ts{};
@@ -341,6 +588,8 @@ const char* name_of(const surface_state* s, char* buf, size_t cap) {
         return "none";
     if (s->index == -2)
         return "second";
+    if (s->index == -3)
+        return "lock";
     if (s->index < 0)
         return g.opt.layer_mode ? "layer" : "toplevel";
     std::snprintf(buf, cap, "popup%d", s->index);
@@ -352,6 +601,8 @@ surface_state* find(wl_surface* surface) {
         return &g.top;
     if (g.second.surface && g.second.surface == surface)
         return &g.second;
+    if (g.lock_surf.surface && g.lock_surf.surface == surface)
+        return &g.lock_surf;
     for (int i = 0; i < g.popup_count; ++i)
         if (g.popups[i].surface == surface)
             return &g.popups[i];
@@ -379,9 +630,24 @@ wl_buffer* make_buffer(int w, int h, uint32_t colour) {
     return b;
 }
 
+void draw_scaled(int w, int h);
+#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+void present_configure(int w, int h);
+#endif
+
 void draw(surface_state& s, int w, int h) {
     if (w <= 0 || h <= 0)
         return;
+    if (g.opt.scale_mode && &s == &g.top) {
+        draw_scaled(w, h);
+        return;
+    }
+#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+    if (g.opt.presentation_mode && &s == &g.top) {
+        present_configure(w, h);
+        return;
+    }
+#endif
     if (!s.buffer || s.buffer_w != w || s.buffer_h != h) {
         if (s.buffer)
             wl_buffer_destroy(s.buffer);
@@ -393,6 +659,508 @@ void draw(surface_state& s, int w, int h) {
     wl_surface_damage_buffer(s.surface, 0, 0, w, h);
     wl_surface_commit(s.surface);
 }
+
+// ── scale mode: wp_viewporter + wp_fractional_scale_v1 ──
+
+/// The surface's content in one buffer of `bw`x`bh`, filled by `px(x, y)`.
+template <typename Fill>
+wl_buffer* make_pattern(int bw, int bh, Fill px) {
+    const int stride = bw * 4;
+    const size_t size = static_cast<size_t>(stride) * static_cast<size_t>(bh);
+    const int fd = memfd_create("lumen-probe-scale", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, static_cast<off_t>(size)) != 0)
+        return nullptr;
+    void* data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (data != MAP_FAILED) {
+        auto* p = static_cast<uint32_t*>(data);
+        for (int y = 0; y < bh; ++y)
+            for (int x = 0; x < bw; ++x)
+                p[static_cast<size_t>(y) * bw + x] = px(x, y);
+        munmap(data, size);
+    }
+    wl_shm_pool* pool = wl_shm_create_pool(g.shm, fd, static_cast<int>(size));
+    wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, bw, bh, stride, WL_SHM_FORMAT_XRGB8888);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    return b;
+}
+
+void on_buffer_release(void*, wl_buffer* b) { wl_buffer_destroy(b); }
+const wl_buffer_listener scale_buffer_listener = {on_buffer_release};
+
+void draw_scaled(int w, int h) {
+    g.last_w = w;
+    g.last_h = h;
+    const options& o = g.opt;
+    int bw = 0, bh = 0, bs = 1;
+    wl_buffer* b = nullptr;
+    if (o.vp_buffer_w > 0) {
+        // Viewport test: quadrants with 1 px white frames.
+        bw = o.vp_buffer_w;
+        bh = o.vp_buffer_h;
+        bs = o.buffer_scale;
+        b = make_pattern(bw, bh, [&](int x, int y) -> uint32_t {
+            const int qx = x < bw / 2 ? 0 : 1;
+            const int qy = y < bh / 2 ? 0 : 1;
+            const int x0 = qx ? bw / 2 : 0, y0 = qy ? bh / 2 : 0;
+            const int x1 = qx ? bw - 1 : bw / 2 - 1, y1 = qy ? bh - 1 : bh / 2 - 1;
+            if (x == x0 || x == x1 || y == y0 || y == y1)
+                return 0xffffffffu;
+            static const uint32_t k_quad[4] = {0xffff0000u, 0xff00ff00u, 0xff0000ffu,
+                                               0xffffff00u};
+            return k_quad[qy * 2 + qx];
+        });
+    } else {
+        // The client's own pixels at the output's scale: round(size·scale), as foot and
+        // GTK compute it; --integer renders at the integer preferred buffer scale instead.
+        const uint32_t s120 = g.scale120 ? g.scale120 : 120;
+        if (o.integer_scale) {
+            bs = g.preferred_buffer_scale > 0 ? g.preferred_buffer_scale : 1;
+            bw = w * bs;
+            bh = h * bs;
+        } else {
+            bw = static_cast<int>((static_cast<long>(w) * s120 + 60) / 120);
+            bh = static_cast<int>((static_cast<long>(h) * s120 + 60) / 120);
+        }
+        b = make_pattern(bw, bh, [](int x, int y) -> uint32_t {
+            return ((x ^ y) & 1) ? 0xffffffffu : 0xff000000u;
+        });
+    }
+    if (!b)
+        return;
+    wl_buffer_add_listener(b, &scale_buffer_listener, nullptr);
+    wl_surface_set_buffer_scale(g.top.surface, bs);
+    wl_surface_set_buffer_transform(g.top.surface, o.transform);
+    int dw = 0, dh = 0;
+#if defined(LUMEN_PROBE_HAS_SCALE)
+    if (g.viewport) {
+        if (o.crop)
+            wp_viewport_set_source(g.viewport, wl_fixed_from_double(o.crop_x),
+                                   wl_fixed_from_double(o.crop_y), wl_fixed_from_double(o.crop_w),
+                                   wl_fixed_from_double(o.crop_h));
+        dw = o.dst_w > 0 ? o.dst_w : w;
+        dh = o.dst_h > 0 ? o.dst_h : h;
+        if (o.integer_scale && o.vp_buffer_w <= 0)
+            wp_viewport_set_destination(g.viewport, -1, -1);
+        else
+            wp_viewport_set_destination(g.viewport, dw, dh);
+    }
+#endif
+    wl_surface_attach(g.top.surface, b, 0, 0);
+    wl_surface_damage_buffer(g.top.surface, 0, 0, INT32_MAX, INT32_MAX);
+    wl_surface_commit(g.top.surface);
+    std::printf("buffer %dx%d dst %dx%d scale120=%u buffer-scale=%d\n", bw, bh, dw, dh,
+                g.scale120, bs);
+}
+
+#if defined(LUMEN_PROBE_HAS_SCALE)
+void on_preferred_scale(void*, wp_fractional_scale_v1*, uint32_t scale) {
+    std::printf("preferred-scale %u\n", scale);
+    const bool changed = scale != g.scale120;
+    g.scale120 = scale;
+    // Redraw only once there is a configured size; the first value arrives before it.
+    if (changed && g.last_w > 0 && !g.opt.integer_scale && g.opt.vp_buffer_w <= 0)
+        draw_scaled(g.last_w, g.last_h);
+}
+const wp_fractional_scale_v1_listener fractional_listener = {on_preferred_scale};
+#endif
+
+// ── presentation mode: wp_presentation feedback per commit ──
+
+#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+
+/// One shm buffer of the animation, reused once released.
+struct anim_buffer {
+    wl_buffer* buffer = nullptr;
+    uint32_t* pixels = nullptr;
+    size_t bytes = 0;
+    int w = 0, h = 0;
+    bool busy = false;
+};
+
+/// One wp_presentation_feedback in flight: which frame it belongs to and when it was
+/// committed (CLOCK_MONOTONIC, the presentation clock this probe checks it is told).
+struct feedback_rec {
+    struct wp_presentation_feedback* fb = nullptr;
+    int frame = 0;
+    unsigned long long commit_ns = 0;
+    unsigned sync_outputs = 0;
+    bool used = false;
+};
+
+struct presentation_state {
+    anim_buffer buffers[8]{};
+    feedback_rec recs[64]{};
+    int w = 0, h = 0;
+    int frame = 0;       // frames committed
+    bool started = false;
+    bool finished = false; // --frames reached: no more commits
+    bool waiting_buffer = false; // a frame is due but every buffer is held
+    bool summarized = false;
+    double finish_deadline = 0.0;
+    uint32_t clock_id = ~0u;
+    unsigned presented = 0, discarded = 0, sync_outputs = 0;
+    unsigned long long first_seq = 0, last_seq = 0;
+    bool seq_monotonic = true;
+    bool t_monotonic = true;
+    unsigned long long last_t = 0;
+    double dt_sum = 0.0, dt_max = 0.0;
+    unsigned dt_n = 0;
+    double latency_sum = 0.0;
+    unsigned refresh = 0;
+    unsigned flags_or = 0;
+};
+presentation_state g_pres{};
+
+unsigned long long mono_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<unsigned long long>(ts.tv_sec) * 1'000'000'000ull +
+           static_cast<unsigned long long>(ts.tv_nsec);
+}
+
+void present_frame();
+
+void on_anim_release(void* data, wl_buffer*) {
+    static_cast<anim_buffer*>(data)->busy = false;
+    if (g_pres.waiting_buffer)
+        present_frame();
+}
+const wl_buffer_listener anim_buffer_listener = {on_anim_release};
+
+anim_buffer* anim_take(int w, int h) {
+    for (auto& b : g_pres.buffers) {
+        if (b.buffer && !b.busy && b.w == w && b.h == h)
+            return &b;
+    }
+    for (auto& b : g_pres.buffers) {
+        if (b.buffer && b.busy)
+            continue;
+        if (b.buffer) {
+            wl_buffer_destroy(b.buffer);
+            munmap(b.pixels, b.bytes);
+            b = {};
+        }
+        const int stride = w * 4;
+        b.bytes = static_cast<size_t>(stride) * static_cast<size_t>(h);
+        const int fd = memfd_create("lumen-probe-anim", MFD_CLOEXEC);
+        if (fd < 0 || ftruncate(fd, static_cast<off_t>(b.bytes)) != 0)
+            return nullptr;
+        void* data = mmap(nullptr, b.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        if (data == MAP_FAILED) {
+            close(fd);
+            return nullptr;
+        }
+        wl_shm_pool* pool = wl_shm_create_pool(g.shm, fd, static_cast<int>(b.bytes));
+        b.buffer = wl_shm_pool_create_buffer(pool, 0, w, h, stride, WL_SHM_FORMAT_XRGB8888);
+        wl_shm_pool_destroy(pool);
+        close(fd);
+        wl_buffer_add_listener(b.buffer, &anim_buffer_listener, &b);
+        b.pixels = static_cast<uint32_t*>(data);
+        b.w = w;
+        b.h = h;
+        return &b;
+    }
+    return nullptr; // every buffer is still held by the compositor
+}
+
+feedback_rec* rec_of(struct wp_presentation_feedback* fb) {
+    for (auto& r : g_pres.recs)
+        if (r.used && r.fb == fb)
+            return &r;
+    return nullptr;
+}
+
+void on_fb_sync_output(void* data, struct wp_presentation_feedback*, wl_output*) {
+    ++static_cast<feedback_rec*>(data)->sync_outputs;
+}
+
+void on_fb_presented(void* data, struct wp_presentation_feedback* fb, uint32_t sec_hi,
+                     uint32_t sec_lo, uint32_t nsec, uint32_t refresh, uint32_t seq_hi,
+                     uint32_t seq_lo, uint32_t flags) {
+    auto* r = static_cast<feedback_rec*>(data);
+    const unsigned long long t =
+        ((static_cast<unsigned long long>(sec_hi) << 32 | sec_lo) * 1'000'000'000ull) + nsec;
+    const unsigned long long seq = static_cast<unsigned long long>(seq_hi) << 32 | seq_lo;
+    double dt = 0.0;
+    if (g_pres.last_t != 0) {
+        dt = static_cast<double>(t - g_pres.last_t) / 1e6;
+        g_pres.dt_sum += dt;
+        g_pres.dt_n += 1;
+        if (dt > g_pres.dt_max)
+            g_pres.dt_max = dt;
+        if (seq <= g_pres.last_seq)
+            g_pres.seq_monotonic = false;
+        if (t <= g_pres.last_t)
+            g_pres.t_monotonic = false;
+    } else {
+        g_pres.first_seq = seq;
+    }
+    const double latency = static_cast<double>(t - r->commit_ns) / 1e6;
+    g_pres.latency_sum += latency;
+    g_pres.last_t = t;
+    g_pres.last_seq = seq;
+    g_pres.refresh = refresh;
+    g_pres.flags_or |= flags;
+    g_pres.sync_outputs += r->sync_outputs;
+    ++g_pres.presented;
+    std::printf("presented frame=%d seq=%llu t=%llu.%09llu dt=%.3f refresh=%u flags=0x%x "
+                "sync_output=%u latency=%.3f\n",
+                r->frame, seq, t / 1'000'000'000ull, t % 1'000'000'000ull, dt, refresh, flags,
+                r->sync_outputs, latency);
+    wp_presentation_feedback_destroy(fb);
+    *r = {};
+}
+
+void on_fb_discarded(void* data, struct wp_presentation_feedback* fb) {
+    auto* r = static_cast<feedback_rec*>(data);
+    ++g_pres.discarded;
+    std::printf("discarded frame=%d at=%.6f\n", r->frame, now_s());
+    wp_presentation_feedback_destroy(fb);
+    *r = {};
+}
+
+const wp_presentation_feedback_listener fb_listener = {on_fb_sync_output, on_fb_presented,
+                                                       on_fb_discarded};
+
+void on_clock_id(void*, wp_presentation*, uint32_t clk) {
+    g_pres.clock_id = clk;
+    std::printf("clock_id %u\n", clk);
+}
+const wp_presentation_listener presentation_listener = {on_clock_id};
+
+unsigned feedback_pending() {
+    unsigned n = 0;
+    for (const auto& r : g_pres.recs)
+        n += r.used ? 1u : 0u;
+    return n;
+}
+
+void present_summary() {
+    std::printf("presentation summary frames=%d presented=%u discarded=%u pending=%u "
+                "seq_monotonic=%d seq_first=%llu seq_last=%llu refresh=%u flags=0x%x "
+                "dt_mean=%.3f dt_max=%.3f latency_mean=%.3f sync_output=%u clock_id=%u "
+                "t_monotonic=%d\n",
+                g_pres.frame, g_pres.presented, g_pres.discarded, feedback_pending(),
+                g_pres.seq_monotonic ? 1 : 0, g_pres.first_seq, g_pres.last_seq, g_pres.refresh,
+                g_pres.flags_or, g_pres.dt_n ? g_pres.dt_sum / g_pres.dt_n : 0.0, g_pres.dt_max,
+                g_pres.presented ? g_pres.latency_sum / g_pres.presented : 0.0,
+                g_pres.sync_outputs, g_pres.clock_id, g_pres.t_monotonic ? 1 : 0);
+}
+
+void present_frame();
+
+void on_anim_frame_done(void*, wl_callback* cb, uint32_t) {
+    wl_callback_destroy(cb);
+    present_frame();
+}
+const wl_callback_listener anim_frame_listener = {on_anim_frame_done};
+
+/// One frame: `--burst` commits, each a new colour with its own feedback; the first also
+/// asks for the frame callback that paces the next (a superseded update's callback is still
+/// answered). With every buffer still held, the frame waits for a release instead.
+void present_frame() {
+    g_pres.waiting_buffer = false;
+    if (g_pres.finished || g.unmapped)
+        return;
+    if (g.opt.frames > 0 && g_pres.frame >= g.opt.frames) {
+        g_pres.finished = true;
+        g_pres.finish_deadline = now_s() + 2.0;
+        return;
+    }
+    const int w = g_pres.w, h = g_pres.h;
+    for (int k = 0; k < g.opt.burst; ++k) {
+        if (g.opt.frames > 0 && g_pres.frame >= g.opt.frames)
+            break;
+        anim_buffer* b = anim_take(w, h);
+        if (!b) {
+            // All held: the compositor releases one once it has read it.
+            g_pres.waiting_buffer = k == 0;
+            break;
+        }
+        ++g_pres.frame;
+        // A hue that moves every frame: every commit is new content.
+        const uint32_t v = static_cast<uint32_t>(g_pres.frame * 7 % 256);
+        const uint32_t colour = 0xff000000u | (v << 16) | ((255u - v) << 8) | 0x60u;
+        for (size_t i = 0; i < b->bytes / 4; ++i)
+            b->pixels[i] = colour;
+        feedback_rec* r = nullptr;
+        for (auto& x : g_pres.recs)
+            if (!x.used) {
+                r = &x;
+                break;
+            }
+        if (r) {
+            r->used = true;
+            r->frame = g_pres.frame;
+            r->sync_outputs = 0;
+            r->fb = wp_presentation_feedback(g.presentation, g.top.surface);
+            wp_presentation_feedback_add_listener(r->fb, &fb_listener, r);
+        }
+        if (k == 0) {
+            wl_callback* cb = wl_surface_frame(g.top.surface);
+            wl_callback_add_listener(cb, &anim_frame_listener, nullptr);
+        }
+        wl_surface_attach(g.top.surface, b->buffer, 0, 0);
+        wl_surface_damage_buffer(g.top.surface, 0, 0, w, h);
+        b->busy = true;
+        if (r)
+            r->commit_ns = mono_ns();
+        wl_surface_commit(g.top.surface);
+    }
+}
+
+void present_configure(int w, int h) {
+    g_pres.w = w;
+    g_pres.h = h;
+    if (g_pres.started)
+        return; // the animation picks the new size up with its next frame
+    g_pres.started = true;
+    present_frame();
+}
+
+#endif
+
+// ── idle mode: ext_idle_notification_v1 ──
+#if defined(LUMEN_PROBE_HAS_IDLE_NOTIFY)
+void on_idled(void*, ext_idle_notification_v1*) {
+    const double now = now_s();
+    std::printf("idled t=%.3f at=%.3f\n", now - g.idle_created_at, now);
+    if (g.opt.idle_count > 0 && ++g.idled_count >= g.opt.idle_count)
+        g.closed = true;
+}
+void on_resumed(void*, ext_idle_notification_v1*) {
+    const double now = now_s();
+    std::printf("resumed t=%.3f at=%.3f\n", now - g.idle_created_at, now);
+}
+const ext_idle_notification_v1_listener idle_listener = {on_idled, on_resumed};
+#endif
+
+// ── power mode: zwlr_output_power_v1 ──
+#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+void power_request(int mode) {
+    if (!g.power || mode < 0)
+        return;
+    std::printf("power set mode=%s\n", mode ? "on" : "off");
+    zwlr_output_power_v1_set_mode(g.power, static_cast<uint32_t>(mode));
+}
+void on_power_mode(void*, zwlr_output_power_v1*, uint32_t mode) {
+    std::printf("power mode=%s at=%.3f\n", mode == ZWLR_OUTPUT_POWER_V1_MODE_ON ? "on" : "off",
+                now_s());
+    if (g.power_seen_mode)
+        return;
+    g.power_seen_mode = true;
+    if (g.opt.power_invalid) {
+        std::printf("power set mode=2 (invalid)\n");
+        zwlr_output_power_v1_set_mode(g.power, 2);
+        return;
+    }
+    if (g.opt.power_set >= 0)
+        g.power_set_at = now_s() + g.opt.power_set_after;
+}
+void on_power_failed(void*, zwlr_output_power_v1*) { std::printf("power failed\n"); }
+const zwlr_output_power_v1_listener power_listener = {on_power_mode, on_power_failed};
+#endif
+
+// ── lock mode: ext-session-lock-v1 ──
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+void lock_unlock(const char* why) {
+    if (!g.lock || g.lock_done)
+        return;
+    g.lock_done = true;
+    ext_session_lock_v1_unlock_and_destroy(g.lock);
+    g.lock = nullptr;
+    // "A correct client that wishes to exit directly after unlocking the session must use
+    // the wl_display.sync request to ensure the server receives and processes the
+    // unlock_and_destroy request."
+    wl_display_roundtrip(g.display);
+    std::printf("lock unlocked at=%.3f (%s)\n", now_s(), why);
+    g.closed = true;
+}
+void on_lock_locked(void*, ext_session_lock_v1*) {
+    const double now = now_s();
+    g.lock_locked = true;
+    std::printf("lock locked at=%.3f after=%.3f\n", now, now - g.lock_requested_at);
+    if (g.opt.unlock_after > 0.0)
+        g.unlock_at = now + g.opt.unlock_after;
+    if (g.opt.crash_after > 0.0)
+        g.crash_at = now + g.opt.crash_after;
+}
+void on_lock_finished(void*, ext_session_lock_v1*) {
+    std::printf("lock finished at=%.3f locked=%d\n", now_s(), g.lock_locked ? 1 : 0);
+    if (!g.lock || g.lock_done)
+        return;
+    g.lock_done = true;
+    if (g.lock_locked)
+        ext_session_lock_v1_unlock_and_destroy(g.lock);
+    else
+        ext_session_lock_v1_destroy(g.lock);
+    g.lock = nullptr;
+    wl_display_roundtrip(g.display);
+    g.closed = true;
+}
+const ext_session_lock_v1_listener lock_listener = {on_lock_locked, on_lock_finished};
+
+void on_lock_configure(void*, ext_session_lock_surface_v1* ls, uint32_t serial, uint32_t w,
+                       uint32_t h) {
+    std::printf("lock configure %ux%u serial=%u at=%.3f\n", w, h, serial, now_s());
+    ext_session_lock_surface_v1_ack_configure(ls, serial);
+    const int bw = static_cast<int>(w) - (g.opt.wrong_size ? 10 : 0);
+    draw(g.lock_surf, bw, static_cast<int>(h));
+}
+const ext_session_lock_surface_v1_listener lock_surface_listener = {on_lock_configure};
+
+void lock_make_surface() {
+    if (!g.lock || g.lock_surface || !g.output)
+        return;
+    g.lock_surf.index = -3;
+    g.lock_surf.colour = g.opt.lock_colour;
+    g.lock_surf.surface = wl_compositor_create_surface(g.compositor);
+    g.lock_surface = ext_session_lock_v1_get_lock_surface(g.lock, g.lock_surf.surface, g.output);
+    ext_session_lock_surface_v1_add_listener(g.lock_surface, &lock_surface_listener, nullptr);
+}
+
+/// US-layout evdev codes of a-z and 0-9 (enough for a test password).
+char lock_char(uint32_t code) {
+    static const char row1[] = "qwertyuiop"; // 16..25
+    static const char row2[] = "asdfghjkl";  // 30..38
+    static const char row3[] = "zxcvbnm";    // 44..50
+    if (code >= 16 && code <= 25)
+        return row1[code - 16];
+    if (code >= 30 && code <= 38)
+        return row2[code - 30];
+    if (code >= 44 && code <= 50)
+        return row3[code - 44];
+    if (code >= 2 && code <= 10)
+        return static_cast<char>('1' + (code - 2));
+    if (code == 11)
+        return '0';
+    return 0;
+}
+
+void lock_key(uint32_t code) {
+    if (!g.opt.password)
+        return;
+    if (code == 28 /* Enter */) {
+        g.typed[g.typed_len] = '\0';
+        if (std::strcmp(g.typed, g.opt.password) == 0) {
+            std::printf("lock password accepted\n");
+            lock_unlock("password");
+        } else {
+            std::printf("lock password wrong\n");
+        }
+        g.typed_len = 0;
+        return;
+    }
+    if (code == 14 /* Backspace */) {
+        if (g.typed_len)
+            --g.typed_len;
+        return;
+    }
+    if (const char c = lock_char(code); c && g.typed_len + 1 < sizeof(g.typed))
+        g.typed[g.typed_len++] = c;
+}
+#endif
 
 // ── outputs mode: wl_output, xdg-output, wl_surface.enter/leave ──
 
@@ -407,6 +1175,14 @@ void on_surface_leave(void*, wl_surface* surface, wl_output*) {
                 g.output_name[0] ? g.output_name : "?");
 }
 void on_surface_scale(void*, wl_surface*, int32_t s) {
+    if (g.opt.scale_mode) {
+        std::printf("preferred-buffer-scale %d\n", s);
+        const bool changed = s != g.preferred_buffer_scale;
+        g.preferred_buffer_scale = s;
+        if (changed && g.opt.integer_scale && g.last_w > 0)
+            draw_scaled(g.last_w, g.last_h);
+        return;
+    }
     std::printf("surface preferred_scale=%d\n", s);
 }
 void on_surface_transform(void*, wl_surface*, uint32_t t) {
@@ -1068,23 +1844,37 @@ void try_activate(bool mapped) {
 
 // ── seat ──
 
-void on_pointer_enter(void*, wl_pointer*, uint32_t serial, wl_surface* surface, wl_fixed_t,
-                      wl_fixed_t) {
+void on_pointer_enter(void*, wl_pointer*, uint32_t serial, wl_surface* surface, wl_fixed_t sx,
+                      wl_fixed_t sy) {
     g.pointer_on = find(surface);
+    g_pointer_wl = surface;
     g.enter_serial = serial;
     char buf[16];
-    std::printf("pointer enter surface=%s serial=%u\n", name_of(g.pointer_on, buf, sizeof(buf)),
+    std::printf("pointer enter surface=%s serial=%u\n",
+                surface && surface == g_im_popup_surface ? "im-popup"
+                                                         : name_of(g.pointer_on, buf, sizeof(buf)),
                 serial);
+    // Scale mode: surface-local (logical) coordinates, for hit-testing at the edges.
+    if (g.opt.scale_mode)
+        std::printf("pointer position x=%.2f y=%.2f\n", wl_fixed_to_double(sx),
+                    wl_fixed_to_double(sy));
 }
 void on_pointer_leave(void*, wl_pointer*, uint32_t, wl_surface*) {
     g.pointer_on = nullptr;
+    g_pointer_wl = nullptr;
     std::printf("pointer leave\n");
 }
-void on_pointer_motion(void*, wl_pointer*, uint32_t, wl_fixed_t, wl_fixed_t) {}
+void on_pointer_motion(void*, wl_pointer*, uint32_t, wl_fixed_t sx, wl_fixed_t sy) {
+    if (g.opt.scale_mode)
+        std::printf("pointer position x=%.2f y=%.2f\n", wl_fixed_to_double(sx),
+                    wl_fixed_to_double(sy));
+}
 void on_pointer_button(void*, wl_pointer*, uint32_t serial, uint32_t, uint32_t button,
                        uint32_t state) {
     char buf[16];
-    const char* where = name_of(g.pointer_on, buf, sizeof(buf));
+    const char* where = g_pointer_wl && g_pointer_wl == g_im_popup_surface
+                            ? "im-popup"
+                            : name_of(g.pointer_on, buf, sizeof(buf));
     if (state != WL_POINTER_BUTTON_STATE_PRESSED) {
         std::printf("release surface=%s button=%u\n", where, button);
         return;
@@ -1128,23 +1918,359 @@ const wl_pointer_listener pointer_listener = {on_pointer_enter, on_pointer_leave
                                               on_axis_source, on_axis_stop, on_axis_discrete};
 
 void on_keymap(void*, wl_keyboard*, uint32_t, int32_t fd, uint32_t) { close(fd); }
-void on_key_enter(void*, wl_keyboard*, uint32_t serial, wl_surface* surface, wl_array*) {
+void on_key_enter(void*, wl_keyboard*, uint32_t serial, wl_surface* surface, wl_array* keys) {
     char buf[16];
     std::printf("keyboard enter surface=%s\n", name_of(find(surface), buf, sizeof(buf)));
+    // The keys the compositor says are already down (its own line, so parsers of the enter
+    // line are unaffected): after a VT switch back this must be empty.
+    char list[128];
+    unsigned n = 0;
+    list[0] = '\0';
+    const auto* k = static_cast<const uint32_t*>(keys->data);
+    for (size_t i = 0; i < keys->size / sizeof(uint32_t) && n + 12 < sizeof(list); ++i)
+        n += static_cast<unsigned>(
+            std::snprintf(list + n, sizeof(list) - n, "%s%u", i ? "," : "", k[i]));
+    std::printf("keyboard keys=[%s]\n", list);
     if (g.opt.selection_mode && g.opt.trigger == options::set_on::focus)
         set_selection(serial);
 }
 void on_key_leave(void*, wl_keyboard*, uint32_t, wl_surface*) { std::printf("keyboard leave\n"); }
 void on_key(void*, wl_keyboard*, uint32_t serial, uint32_t, uint32_t key, uint32_t state) {
     std::printf("key code=%u state=%u\n", key, state);
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+    if (g.opt.lock_mode && state == WL_KEYBOARD_KEY_STATE_PRESSED)
+        lock_key(key);
+#endif
     if (g.opt.selection_mode && g.opt.trigger == options::set_on::key &&
         state == WL_KEYBOARD_KEY_STATE_PRESSED)
         set_selection(serial);
 }
-void on_mods(void*, wl_keyboard*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t) {}
+void on_mods(void*, wl_keyboard*, uint32_t, uint32_t depressed, uint32_t latched,
+             uint32_t locked, uint32_t group) {
+    std::printf("keyboard modifiers depressed=%u latched=%u locked=%u group=%u\n", depressed,
+                latched, locked, group);
+}
 void on_repeat(void*, wl_keyboard*, int32_t, int32_t) {}
 const wl_keyboard_listener keyboard_listener = {on_keymap, on_key_enter, on_key_leave,
                                                 on_key, on_mods, on_repeat};
+
+// ── text-input and input-method modes ──────────────────────────────────────
+
+#if defined(LUMEN_PROBE_HAS_IME)
+
+constexpr unsigned k_text = 4000;
+
+struct ime_state {
+    // text-input mode
+    zwp_text_input_manager_v3* ti_manager = nullptr;
+    uint32_t ti_version = 0;
+    zwp_text_input_v3* ti = nullptr;
+    wl_surface* ti_focus = nullptr;
+    unsigned commits = 0;
+    bool enabled = false;
+    char text[k_text + 1]{};
+    unsigned len = 0;
+    unsigned cursor = 0;
+    char preedit[k_text + 1]{};
+    bool p_preedit = false;
+    char p_preedit_text[k_text + 1]{};
+    bool p_commit = false;
+    char p_commit_text[k_text + 1]{};
+    unsigned p_before = 0, p_after = 0;
+    double disable_at = 0.0;
+    double enable_at = 0.0;
+    // input-method mode
+    zwp_input_method_manager_v2* im_manager = nullptr;
+    zwp_virtual_keyboard_manager_v1* vk_manager = nullptr;
+    zwp_input_method_v2* im = nullptr;
+    zwp_input_method_keyboard_grab_v2* grab = nullptr;
+    zwp_virtual_keyboard_v1* vk = nullptr;
+    bool vk_ready = false;
+    bool active = false;
+    bool pending_activate = false;
+    bool pending_deactivate = false;
+    unsigned dones = 0;
+    char composing[k_text + 1]{};
+    unsigned composing_len = 0;
+    char surrounding[k_text + 1]{};
+    unsigned s_cursor = 0;
+    uint32_t purpose = 0, hint = 0;
+    wl_surface* popup_surface = nullptr;
+    zwp_input_popup_surface_v2* popup = nullptr;
+    bool forwarded[256]{};
+};
+ime_state gi{};
+
+void copy_text(char* dst, const char* src) {
+    const size_t n = src ? std::strlen(src) : 0;
+    const size_t m = n > k_text ? k_text : n;
+    if (m)
+        std::memcpy(dst, src, m);
+    dst[m] = '\0';
+}
+
+void ti_send_state(const char* why) {
+    zwp_text_input_v3_set_surrounding_text(gi.ti, gi.text, static_cast<int32_t>(gi.cursor),
+                                           static_cast<int32_t>(gi.cursor));
+    zwp_text_input_v3_set_content_type(gi.ti, ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
+                                       ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+    zwp_text_input_v3_set_cursor_rectangle(gi.ti, g.opt.cursor_x, g.opt.cursor_y, g.opt.cursor_w,
+                                           g.opt.cursor_h);
+    zwp_text_input_v3_commit(gi.ti);
+    ++gi.commits;
+    // Version 2 applies the rectangle with the surface's next commit (the frame that shows it).
+    if (g.top.surface)
+        wl_surface_commit(g.top.surface);
+    (void)why;
+}
+
+void ti_enable_now() {
+    if (!gi.ti || !gi.ti_focus)
+        return;
+    zwp_text_input_v3_enable(gi.ti);
+    gi.enabled = true;
+    ti_send_state("enable");
+    std::printf("ti enable commits=%u\n", gi.commits);
+    if (g.opt.disable_after > 0.0)
+        gi.disable_at = now_s() + g.opt.disable_after;
+}
+
+void ti_disable_now() {
+    if (!gi.ti || !gi.ti_focus)
+        return;
+    zwp_text_input_v3_disable(gi.ti);
+    zwp_text_input_v3_commit(gi.ti);
+    ++gi.commits;
+    gi.enabled = false;
+    std::printf("ti disable commits=%u\n", gi.commits);
+    if (g.opt.enable_after > 0.0)
+        gi.enable_at = now_s() + g.opt.enable_after;
+}
+
+void ti_on_enter(void*, zwp_text_input_v3*, wl_surface* s) {
+    char buf[16];
+    gi.ti_focus = s;
+    std::printf("ti enter surface=%s\n", name_of(find(s), buf, sizeof(buf)));
+    if (!g.opt.no_enable)
+        ti_enable_now();
+}
+void ti_on_leave(void*, zwp_text_input_v3*, wl_surface*) {
+    gi.ti_focus = nullptr;
+    gi.enabled = false;
+    gi.preedit[0] = '\0';
+    std::printf("ti leave\n");
+}
+void ti_on_preedit(void*, zwp_text_input_v3*, const char* text, int32_t b, int32_t e) {
+    gi.p_preedit = true;
+    copy_text(gi.p_preedit_text, text);
+    std::printf("ti preedit \"%s\" %d %d\n", text ? text : "", b, e);
+}
+void ti_on_commit(void*, zwp_text_input_v3*, const char* text) {
+    gi.p_commit = true;
+    copy_text(gi.p_commit_text, text);
+    std::printf("ti commit \"%s\"\n", text ? text : "");
+}
+void ti_on_delete(void*, zwp_text_input_v3*, uint32_t before, uint32_t after) {
+    gi.p_before = before;
+    gi.p_after = after;
+    std::printf("ti delete %u %u\n", before, after);
+}
+void ti_on_done(void*, zwp_text_input_v3*, uint32_t serial) {
+    // The spec's order: preedit replaced by the cursor, deletion, the commit string, preedit.
+    bool changed = false;
+    if (gi.p_before || gi.p_after) {
+        const unsigned from = gi.p_before > gi.cursor ? 0 : gi.cursor - gi.p_before;
+        const unsigned to = gi.cursor + gi.p_after > gi.len ? gi.len : gi.cursor + gi.p_after;
+        std::memmove(gi.text + from, gi.text + to, gi.len - to + 1);
+        gi.len -= to - from;
+        gi.cursor = from;
+        changed = true;
+    }
+    if (gi.p_commit) {
+        const unsigned n = static_cast<unsigned>(std::strlen(gi.p_commit_text));
+        if (n && gi.len + n <= k_text) {
+            std::memmove(gi.text + gi.cursor + n, gi.text + gi.cursor, gi.len - gi.cursor + 1);
+            std::memcpy(gi.text + gi.cursor, gi.p_commit_text, n);
+            gi.len += n;
+            gi.cursor += n;
+            changed = true;
+        }
+    }
+    copy_text(gi.preedit, gi.p_preedit ? gi.p_preedit_text : "");
+    gi.p_preedit = gi.p_commit = false;
+    gi.p_before = gi.p_after = 0;
+    std::printf("ti done serial=%u commits=%u text=\"%s\" preedit=\"%s\"\n", serial, gi.commits,
+                gi.text, gi.preedit);
+    // Up to date with the compositor: tell it what the text is now (GTK and foot do).
+    if (changed && serial == gi.commits && gi.enabled)
+        ti_send_state("done");
+}
+void ti_on_action(void*, zwp_text_input_v3*, uint32_t, uint32_t) {}
+void ti_on_language(void*, zwp_text_input_v3*, const char*) {}
+void ti_on_preedit_hint(void*, zwp_text_input_v3*, uint32_t, uint32_t, uint32_t) {}
+const zwp_text_input_v3_listener ti_listener = {
+    ti_on_enter, ti_on_leave, ti_on_preedit, ti_on_commit, ti_on_delete,
+    ti_on_done, ti_on_action, ti_on_language, ti_on_preedit_hint};
+
+// input method
+
+void im_commit_state() { zwp_input_method_v2_commit(gi.im, gi.dones); }
+
+void grab_on_keymap(void*, zwp_input_method_keyboard_grab_v2*, uint32_t format, int32_t fd,
+                    uint32_t size) {
+    std::printf("im grab keymap size=%u\n", size);
+    // Forwarded verbatim, as fcitx5 and ibus do: the compositor sees the seat's own keymap.
+    if (gi.vk) {
+        zwp_virtual_keyboard_v1_keymap(gi.vk, format, fd, size);
+        gi.vk_ready = true;
+    }
+    close(fd);
+}
+void grab_on_key(void*, zwp_input_method_keyboard_grab_v2*, uint32_t, uint32_t time, uint32_t key,
+                 uint32_t state) {
+    std::printf("im key code=%u state=%u\n", key, state);
+    const bool press = state == WL_KEYBOARD_KEY_STATE_PRESSED;
+    const bool mine = key == 30 || key == 57 || (key == 14 && gi.composing_len > 0);
+    if (mine && press) {
+        if (key == 30) { // a → α
+            if (gi.composing_len + 2 <= k_text) {
+                std::memcpy(gi.composing + gi.composing_len, "\xce\xb1", 2);
+                gi.composing_len += 2;
+                gi.composing[gi.composing_len] = '\0';
+            }
+            zwp_input_method_v2_set_preedit_string(gi.im, gi.composing,
+                                                   static_cast<int32_t>(gi.composing_len),
+                                                   static_cast<int32_t>(gi.composing_len));
+            im_commit_state();
+            std::printf("im preedit \"%s\"\n", gi.composing);
+        } else if (key == 14) { // Backspace inside the preedit
+            unsigned n = gi.composing_len;
+            while (n > 0 && (static_cast<unsigned char>(gi.composing[n - 1]) & 0xC0) == 0x80)
+                --n;
+            gi.composing_len = n > 0 ? n - 1 : 0;
+            gi.composing[gi.composing_len] = '\0';
+            zwp_input_method_v2_set_preedit_string(gi.im, gi.composing,
+                                                   static_cast<int32_t>(gi.composing_len),
+                                                   static_cast<int32_t>(gi.composing_len));
+            im_commit_state();
+            std::printf("im preedit \"%s\"\n", gi.composing);
+        } else if (gi.composing_len > 0) { // space commits the preedit
+            zwp_input_method_v2_commit_string(gi.im, gi.composing);
+            im_commit_state();
+            std::printf("im commit \"%s\"\n", gi.composing);
+            gi.composing_len = 0;
+            gi.composing[0] = '\0';
+        } else {
+            zwp_input_method_v2_commit_string(gi.im, " ");
+            im_commit_state();
+            std::printf("im commit \" \"\n");
+        }
+        return;
+    }
+    if (key < 256 && !press && !gi.forwarded[key])
+        return; // its press was composed, not forwarded
+    if (!gi.vk_ready)
+        return;
+    if (key < 256)
+        gi.forwarded[key] = press;
+    zwp_virtual_keyboard_v1_key(gi.vk, time, key, state);
+    std::printf("im forwarded code=%u state=%u\n", key, state);
+}
+void grab_on_modifiers(void*, zwp_input_method_keyboard_grab_v2*, uint32_t, uint32_t d,
+                       uint32_t l, uint32_t k, uint32_t group) {
+    if (gi.vk_ready)
+        zwp_virtual_keyboard_v1_modifiers(gi.vk, d, l, k, group);
+}
+void grab_on_repeat(void*, zwp_input_method_keyboard_grab_v2*, int32_t, int32_t) {}
+const zwp_input_method_keyboard_grab_v2_listener grab_listener = {
+    grab_on_keymap, grab_on_key, grab_on_modifiers, grab_on_repeat};
+
+void im_on_activate(void*, zwp_input_method_v2*) {
+    gi.pending_activate = true;
+    std::printf("im activate\n");
+}
+void im_on_deactivate(void*, zwp_input_method_v2*) {
+    gi.pending_deactivate = true;
+    std::printf("im deactivate\n");
+}
+void im_on_surrounding(void*, zwp_input_method_v2*, const char* text, uint32_t cursor, uint32_t) {
+    copy_text(gi.surrounding, text);
+    gi.s_cursor = cursor;
+}
+void im_on_cause(void*, zwp_input_method_v2*, uint32_t) {}
+void im_on_content_type(void*, zwp_input_method_v2*, uint32_t hint, uint32_t purpose) {
+    gi.hint = hint;
+    gi.purpose = purpose;
+}
+void im_on_done(void*, zwp_input_method_v2*) {
+    ++gi.dones;
+    if (gi.pending_deactivate) {
+        gi.pending_deactivate = false;
+        gi.active = false;
+        // fcitx5: the grab goes with the context; whatever was composing is dropped.
+        if (gi.grab) {
+            zwp_input_method_keyboard_grab_v2_release(gi.grab);
+            gi.grab = nullptr;
+        }
+        for (unsigned k = 0; k < 256; ++k)
+            if (gi.forwarded[k] && gi.vk_ready) {
+                zwp_virtual_keyboard_v1_key(gi.vk, 0, k, WL_KEYBOARD_KEY_STATE_RELEASED);
+                gi.forwarded[k] = false;
+            }
+        gi.composing_len = 0;
+        gi.composing[0] = '\0';
+    }
+    if (gi.pending_activate) {
+        gi.pending_activate = false;
+        gi.active = true;
+        if (gi.grab)
+            zwp_input_method_keyboard_grab_v2_release(gi.grab);
+        gi.grab = zwp_input_method_v2_grab_keyboard(gi.im);
+        zwp_input_method_keyboard_grab_v2_add_listener(gi.grab, &grab_listener, nullptr);
+    }
+    std::printf("im done n=%u active=%d surrounding=\"%s\" cursor=%u purpose=%u hint=%u\n",
+                gi.dones, gi.active ? 1 : 0, gi.surrounding, gi.s_cursor, gi.purpose, gi.hint);
+}
+void im_on_unavailable(void*, zwp_input_method_v2*) {
+    std::printf("im unavailable\n");
+    g.closed = true;
+}
+const zwp_input_method_v2_listener im_listener = {im_on_activate, im_on_deactivate,
+                                                  im_on_surrounding, im_on_cause,
+                                                  im_on_content_type, im_on_done,
+                                                  im_on_unavailable};
+
+void popup_on_rect(void*, zwp_input_popup_surface_v2*, int32_t x, int32_t y, int32_t w, int32_t h) {
+    std::printf("im popup rect x=%d y=%d w=%d h=%d\n", x, y, w, h);
+}
+const zwp_input_popup_surface_v2_listener popup_rect_listener = {popup_on_rect};
+
+/// Binds the input method, its virtual keyboard and its popup.
+bool im_start() {
+    if (!gi.im_manager || !gi.vk_manager) {
+        std::fprintf(stderr, "lumen-probe: no zwp_input_method_manager_v2 / "
+                             "zwp_virtual_keyboard_manager_v1\n");
+        return false;
+    }
+    gi.vk = zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(gi.vk_manager, g.seat);
+    gi.im = zwp_input_method_manager_v2_get_input_method(gi.im_manager, g.seat);
+    zwp_input_method_v2_add_listener(gi.im, &im_listener, nullptr);
+    std::printf("im bound\n");
+    if (!g.opt.no_popup) {
+        const int w = g.opt.layer_popup ? g.opt.popup_w : 120;
+        const int h = g.opt.layer_popup ? g.opt.popup_h : 40;
+        gi.popup_surface = wl_compositor_create_surface(g.compositor);
+        g_im_popup_surface = gi.popup_surface;
+        gi.popup = zwp_input_method_v2_get_input_popup_surface(gi.im, gi.popup_surface);
+        zwp_input_popup_surface_v2_add_listener(gi.popup, &popup_rect_listener, nullptr);
+        wl_surface_attach(gi.popup_surface, make_buffer(w, h, 0xffe0c040), 0, 0);
+        wl_surface_damage(gi.popup_surface, 0, 0, w, h);
+        wl_surface_commit(gi.popup_surface);
+    }
+    return true;
+}
+
+#endif // LUMEN_PROBE_HAS_IME
 
 void on_caps(void*, wl_seat* seat, uint32_t caps) {
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !g.pointer) {
@@ -1164,9 +2290,60 @@ void bind_layer_shell(wl_registry* r, uint32_t name, const char* iface, uint32_t
 #endif
 
 void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t version) {
-    if (std::strcmp(iface, wl_compositor_interface.name) == 0)
+    if (std::strcmp(iface, wl_compositor_interface.name) == 0) {
+        // v4 by default (dnd-source attaches with an offset, an error from v5 on); scale
+        // mode takes v6 for wl_surface.preferred_buffer_scale.
+        const uint32_t want = g.opt.scale_mode ? 6 : 4;
         g.compositor = static_cast<wl_compositor*>(
-            wl_registry_bind(r, name, &wl_compositor_interface, version < 4 ? version : 4));
+            wl_registry_bind(r, name, &wl_compositor_interface, version < want ? version : want));
+    }
+#if defined(LUMEN_PROBE_HAS_SCALE)
+    else if (std::strcmp(iface, wp_viewporter_interface.name) == 0)
+        g.viewporter = static_cast<wp_viewporter*>(
+            wl_registry_bind(r, name, &wp_viewporter_interface, 1));
+    else if (std::strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0)
+        g.fractional_manager = static_cast<wp_fractional_scale_manager_v1*>(
+            wl_registry_bind(r, name, &wp_fractional_scale_manager_v1_interface, 1));
+#endif
+#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+    else if (std::strcmp(iface, wp_presentation_interface.name) == 0) {
+        g.presentation = static_cast<wp_presentation*>(
+            wl_registry_bind(r, name, &wp_presentation_interface, version < 2 ? version : 2));
+        wp_presentation_add_listener(g.presentation, &presentation_listener, nullptr);
+    }
+#endif
+#if defined(LUMEN_PROBE_HAS_IDLE_NOTIFY)
+    else if (std::strcmp(iface, ext_idle_notifier_v1_interface.name) == 0)
+        g.idle_notifier = static_cast<ext_idle_notifier_v1*>(
+            wl_registry_bind(r, name, &ext_idle_notifier_v1_interface, version < 2 ? version : 2));
+#endif
+#if defined(LUMEN_PROBE_HAS_IDLE_INHIBIT)
+    else if (std::strcmp(iface, zwp_idle_inhibit_manager_v1_interface.name) == 0)
+        g.inhibit_manager = static_cast<zwp_idle_inhibit_manager_v1*>(
+            wl_registry_bind(r, name, &zwp_idle_inhibit_manager_v1_interface, 1));
+#endif
+#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+    else if (std::strcmp(iface, zwlr_output_power_manager_v1_interface.name) == 0)
+        g.power_manager = static_cast<zwlr_output_power_manager_v1*>(
+            wl_registry_bind(r, name, &zwlr_output_power_manager_v1_interface, 1));
+#endif
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+    else if (std::strcmp(iface, ext_session_lock_manager_v1_interface.name) == 0)
+        g.lock_manager = static_cast<ext_session_lock_manager_v1*>(
+            wl_registry_bind(r, name, &ext_session_lock_manager_v1_interface, 1));
+#endif
+#if defined(LUMEN_PROBE_HAS_IME)
+    else if (std::strcmp(iface, zwp_text_input_manager_v3_interface.name) == 0) {
+        gi.ti_version = version < 2 ? version : 2;
+        gi.ti_manager = static_cast<zwp_text_input_manager_v3*>(
+            wl_registry_bind(r, name, &zwp_text_input_manager_v3_interface, gi.ti_version));
+    } else if (std::strcmp(iface, zwp_input_method_manager_v2_interface.name) == 0)
+        gi.im_manager = static_cast<zwp_input_method_manager_v2*>(
+            wl_registry_bind(r, name, &zwp_input_method_manager_v2_interface, 1));
+    else if (std::strcmp(iface, zwp_virtual_keyboard_manager_v1_interface.name) == 0)
+        gi.vk_manager = static_cast<zwp_virtual_keyboard_manager_v1*>(
+            wl_registry_bind(r, name, &zwp_virtual_keyboard_manager_v1_interface, 1));
+#endif
     else if (std::strcmp(iface, wl_shm_interface.name) == 0)
         g.shm = static_cast<wl_shm*>(wl_registry_bind(r, name, &wl_shm_interface, 1));
     else if (std::strcmp(iface, xdg_wm_base_interface.name) == 0)
@@ -1296,6 +2473,18 @@ int usage() {
                  "       lumen-probe outputs [--late S] [--unmap-after S] [popup options]\n"
                  "       lumen-probe activation-issuer --token-file F [--no-serial]\n"
                  "       lumen-probe activation-target (--token STR | --token-file F) [--early]\n"
+                 "       lumen-probe scale [--integer] [--buffer WxH] [--buffer-scale N]\n"
+                 "         [--transform T] [--crop x,y,w,h] [--dst WxH]\n"
+                 "       lumen-probe presentation [--frames N] [--burst K] [--maximize]\n"
+                 "       lumen-probe idle [--timeout MS] [--input-only] [--count N]\n"
+                 "       lumen-probe inhibit [--unmap-after S] [--destroy-after S]\n"
+                 "       lumen-probe power [--set off|on] [--set-after S] [--then off|on]\n"
+                 "         [--then-after S] [--invalid]\n"
+                 "       lumen-probe lock [--unlock-after S] [--password STR] [--crash-after S]\n"
+                 "         [--no-surfaces] [--surface-after S] [--wrong-size] [--colour C]\n"
+                 "       lumen-probe text-input [--cursor x,y,w,h] [--disable-after S]\n"
+                 "         [--enable-after S] [--no-enable]\n"
+                 "       lumen-probe im [--popup WxH] [--no-popup] [--exit-after S]\n"
                  "       any toplevel mode: [--ignore-ping-for S] [--freeze S] [--ssd]\n"
                  "         [--title T]\n");
     return 2;
@@ -1311,7 +2500,12 @@ int main(int argc, char** argv) {
                      std::strcmp(argv[1], "dnd-target") != 0 &&
                      std::strcmp(argv[1], "outputs") != 0 &&
                      std::strcmp(argv[1], "activation-issuer") != 0 &&
-                     std::strcmp(argv[1], "activation-target") != 0))
+                     std::strcmp(argv[1], "activation-target") != 0 &&
+                     std::strcmp(argv[1], "scale") != 0 &&
+                     std::strcmp(argv[1], "presentation") != 0 &&
+                     std::strcmp(argv[1], "idle") != 0 && std::strcmp(argv[1], "inhibit") != 0 &&
+                     std::strcmp(argv[1], "power") != 0 && std::strcmp(argv[1], "lock") != 0 &&
+                     std::strcmp(argv[1], "text-input") != 0 && std::strcmp(argv[1], "im") != 0))
         return usage();
     options& o = g.opt;
     o.layer_mode = std::strcmp(argv[1], "layer") == 0;
@@ -1321,6 +2515,14 @@ int main(int argc, char** argv) {
     o.outputs_mode = std::strcmp(argv[1], "outputs") == 0;
     o.activation_issuer = std::strcmp(argv[1], "activation-issuer") == 0;
     o.activation_target = std::strcmp(argv[1], "activation-target") == 0;
+    o.scale_mode = std::strcmp(argv[1], "scale") == 0;
+    o.presentation_mode = std::strcmp(argv[1], "presentation") == 0;
+    o.idle_mode = std::strcmp(argv[1], "idle") == 0;
+    o.inhibit_mode = std::strcmp(argv[1], "inhibit") == 0;
+    o.power_mode = std::strcmp(argv[1], "power") == 0;
+    o.lock_mode = std::strcmp(argv[1], "lock") == 0;
+    o.text_input_mode = std::strcmp(argv[1], "text-input") == 0;
+    o.im_mode = std::strcmp(argv[1], "im") == 0;
     if (o.dnd_source_mode || o.dnd_target_mode)
         o.mimes = "text/plain;charset=utf-8,text/plain";
 #if !defined(LUMEN_PROBE_HAS_LAYER_SHELL)
@@ -1395,6 +2597,45 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--token") && v) { o.token = v; ++i; }
         else if (!std::strcmp(a, "--no-serial")) o.no_serial = true;
         else if (!std::strcmp(a, "--early")) o.early = true;
+        else if (!std::strcmp(a, "--integer")) o.integer_scale = true;
+        else if (!std::strcmp(a, "--buffer") && v && parse_pair(v, o.vp_buffer_w, o.vp_buffer_h, 'x')) ++i;
+        else if (!std::strcmp(a, "--buffer-scale") && v) { o.buffer_scale = std::atoi(v); ++i; }
+        else if (!std::strcmp(a, "--transform") && v) { o.transform = std::atoi(v); ++i; }
+        else if (!std::strcmp(a, "--crop") && v &&
+                 std::sscanf(v, "%lf,%lf,%lf,%lf", &o.crop_x, &o.crop_y, &o.crop_w, &o.crop_h) == 4) {
+            o.crop = true;
+            ++i;
+        }
+        else if (!std::strcmp(a, "--dst") && v && parse_pair(v, o.dst_w, o.dst_h, 'x')) ++i;
+        else if (!std::strcmp(a, "--frames") && v) { o.frames = std::atoi(v); ++i; }
+        else if (!std::strcmp(a, "--burst") && v) { o.burst = std::atoi(v) > 0 ? std::atoi(v) : 1; ++i; }
+        else if (!std::strcmp(a, "--maximize")) o.maximize = true;
+        else if (!std::strcmp(a, "--timeout") && v) { o.idle_timeout_ms = static_cast<unsigned>(std::atol(v)); ++i; }
+        else if (!std::strcmp(a, "--input-only")) o.input_only = true;
+        else if (!std::strcmp(a, "--count") && v) { o.idle_count = std::atoi(v); ++i; }
+        else if (!std::strcmp(a, "--destroy-after") && v) { o.destroy_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--set") && v) { o.power_set = !std::strcmp(v, "on") ? 1 : 0; ++i; }
+        else if (!std::strcmp(a, "--set-after") && v) { o.power_set_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--then") && v) { o.power_then = !std::strcmp(v, "on") ? 1 : 0; ++i; }
+        else if (!std::strcmp(a, "--then-after") && v) { o.power_then_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--invalid")) o.power_invalid = true;
+        else if (!std::strcmp(a, "--unlock-after") && v) { o.unlock_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--crash-after") && v) { o.crash_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--surface-after") && v) { o.surface_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--no-surfaces")) o.no_surfaces = true;
+        else if (!std::strcmp(a, "--wrong-size")) o.wrong_size = true;
+        else if (!std::strcmp(a, "--password") && v) { o.password = v; ++i; }
+        else if (!std::strcmp(a, "--cursor") && v &&
+                 std::sscanf(v, "%d,%d,%d,%d", &o.cursor_x, &o.cursor_y, &o.cursor_w,
+                             &o.cursor_h) == 4) ++i;
+        else if (!std::strcmp(a, "--disable-after") && v) { o.disable_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--enable-after") && v) { o.enable_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--no-enable")) o.no_enable = true;
+        else if (!std::strcmp(a, "--no-popup")) o.no_popup = true;
+        else if (!std::strcmp(a, "--colour") && v) {
+            o.lock_colour = static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+            ++i;
+        }
         else return usage();
     }
     if (o.chain < 1)
@@ -1449,16 +2690,153 @@ int main(int argc, char** argv) {
 #endif
     if (o.outputs_mode && o.late_output <= 0.0)
         bind_outputs();
-    if (!o.layer_mode) {
+#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+    if (o.presentation_mode) {
+        if (!g.presentation) {
+            std::fprintf(stderr, "lumen-probe: no wp_presentation\n");
+            return 1;
+        }
+        bind_outputs(); // sync_output names the wl_output it was presented on
+    }
+#else
+    if (o.presentation_mode) {
+        std::fprintf(stderr, "lumen-probe: built without presentation-time\n");
+        return 2;
+    }
+#endif
+#if defined(LUMEN_PROBE_HAS_IDLE_NOTIFY)
+    if (o.idle_mode) {
+        if (!g.idle_notifier) {
+            std::fprintf(stderr, "lumen-probe: no ext_idle_notifier_v1\n");
+            return 1;
+        }
+        const uint32_t v = ext_idle_notifier_v1_get_version(g.idle_notifier);
+        if (o.input_only && v < 2) {
+            std::fprintf(stderr, "lumen-probe: ext_idle_notifier_v1 v%u has no input-only\n", v);
+            return 1;
+        }
+        g.idle_notification =
+            o.input_only ? ext_idle_notifier_v1_get_input_idle_notification(
+                               g.idle_notifier, o.idle_timeout_ms, g.seat)
+                         : ext_idle_notifier_v1_get_idle_notification(g.idle_notifier,
+                                                                      o.idle_timeout_ms, g.seat);
+        ext_idle_notification_v1_add_listener(g.idle_notification, &idle_listener, nullptr);
+        g.idle_created_at = now_s();
+        std::printf("idle notification timeout=%u input_only=%d version=%u\n", o.idle_timeout_ms,
+                    o.input_only ? 1 : 0, v);
+    }
+#else
+    if (o.idle_mode) {
+        std::fprintf(stderr, "lumen-probe: built without ext-idle-notify\n");
+        return 2;
+    }
+#endif
+#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+    if (o.power_mode) {
+        bind_outputs();
+        if (!g.power_manager || !g.output) {
+            std::fprintf(stderr, "lumen-probe: no zwlr_output_power_manager_v1 or wl_output\n");
+            return 1;
+        }
+        g.power = zwlr_output_power_manager_v1_get_output_power(g.power_manager, g.output);
+        zwlr_output_power_v1_add_listener(g.power, &power_listener, nullptr);
+    }
+#else
+    if (o.power_mode) {
+        std::fprintf(stderr, "lumen-probe: built without wlr-output-power-management\n");
+        return 2;
+    }
+#endif
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+    if (o.lock_mode) {
+        bind_outputs();
+        if (!g.lock_manager || !g.output) {
+            std::fprintf(stderr, "lumen-probe: no ext_session_lock_manager_v1 or wl_output\n");
+            return 1;
+        }
+        g.lock = ext_session_lock_manager_v1_lock(g.lock_manager);
+        ext_session_lock_v1_add_listener(g.lock, &lock_listener, nullptr);
+        g.lock_requested_at = now_s();
+        std::printf("lock requested at=%.3f\n", g.lock_requested_at);
+        // "Clients should immediately create lock surfaces for all outputs."
+        if (!o.no_surfaces) {
+            if (o.surface_after > 0.0)
+                g.lock_surface_at = now_s() + o.surface_after;
+            else
+                lock_make_surface();
+        }
+    }
+#else
+    if (o.lock_mode) {
+        std::fprintf(stderr, "lumen-probe: built without ext-session-lock\n");
+        return 2;
+    }
+#endif
+#if defined(LUMEN_PROBE_HAS_IME)
+    if (o.im_mode && !im_start())
+        return 1;
+#else
+    if (o.im_mode || o.text_input_mode) {
+        std::fprintf(stderr, "lumen-probe: built without text-input / input-method\n");
+        return 2;
+    }
+#endif
+    if (!o.layer_mode && !o.idle_mode && !o.power_mode && !o.lock_mode && !o.im_mode) {
         g.top.surface = wl_compositor_create_surface(g.compositor);
-        if (o.outputs_mode)
+#if defined(LUMEN_PROBE_HAS_IME)
+        if (o.text_input_mode) {
+            if (!gi.ti_manager) {
+                std::fprintf(stderr, "lumen-probe: no zwp_text_input_manager_v3\n");
+                return 1;
+            }
+            gi.ti = zwp_text_input_manager_v3_get_text_input(gi.ti_manager, g.seat);
+            zwp_text_input_v3_add_listener(gi.ti, &ti_listener, nullptr);
+            std::printf("ti created version=%u\n", gi.ti_version);
+        }
+#endif
+#if defined(LUMEN_PROBE_HAS_IDLE_INHIBIT)
+        if (o.inhibit_mode) {
+            if (!g.inhibit_manager) {
+                std::fprintf(stderr, "lumen-probe: no zwp_idle_inhibit_manager_v1\n");
+                return 1;
+            }
+            g.inhibitor =
+                zwp_idle_inhibit_manager_v1_create_inhibitor(g.inhibit_manager, g.top.surface);
+            std::printf("inhibitor created\n");
+            if (o.destroy_after > 0.0)
+                g.destroy_inhibitor_at = now_s() + o.destroy_after;
+        }
+#else
+        if (o.inhibit_mode) {
+            std::fprintf(stderr, "lumen-probe: built without idle-inhibit\n");
+            return 2;
+        }
+#endif
+        if (o.outputs_mode || o.scale_mode)
             wl_surface_add_listener(g.top.surface, &surface_listener, nullptr);
+#if defined(LUMEN_PROBE_HAS_SCALE)
+        if (o.scale_mode) {
+            if (!g.viewporter || !g.fractional_manager) {
+                std::fprintf(stderr, "lumen-probe: no wp_viewporter / wp_fractional_scale\n");
+                return 1;
+            }
+            g.viewport = wp_viewporter_get_viewport(g.viewporter, g.top.surface);
+            if (!o.integer_scale) {
+                g.fractional =
+                    wp_fractional_scale_manager_v1_get_fractional_scale(g.fractional_manager,
+                                                                        g.top.surface);
+                wp_fractional_scale_v1_add_listener(g.fractional, &fractional_listener, nullptr);
+            }
+        }
+#endif
         g.top.xdg = xdg_wm_base_get_xdg_surface(g.wm_base, g.top.surface);
         xdg_surface_add_listener(g.top.xdg, &xdg_listener, &g.top);
         g.top.toplevel = xdg_surface_get_toplevel(g.top.xdg);
         xdg_toplevel_add_listener(g.top.toplevel, &toplevel_listener, &g.top);
         xdg_toplevel_set_title(g.top.toplevel, o.title);
         xdg_toplevel_set_app_id(g.top.toplevel, "lumen-probe");
+        if (o.maximize)
+            xdg_toplevel_set_maximized(g.top.toplevel);
 #if defined(LUMEN_PROBE_HAS_DECORATION)
         if (o.ssd && g.deco_manager) {
             // Before the initial commit: the first configure then carries the mode.
@@ -1506,6 +2884,61 @@ int main(int argc, char** argv) {
         }
         if (o.activation_target && !o.early && g.top.configured)
             try_activate(true);
+#if defined(LUMEN_PROBE_HAS_IME)
+        if (gi.disable_at > 0.0 && now_s() >= gi.disable_at) {
+            gi.disable_at = 0.0;
+            ti_disable_now();
+        }
+        if (gi.enable_at > 0.0 && now_s() >= gi.enable_at) {
+            gi.enable_at = 0.0;
+            ti_enable_now();
+        }
+#endif
+#if defined(LUMEN_PROBE_HAS_IDLE_INHIBIT)
+        if (g.destroy_inhibitor_at > 0.0 && now_s() >= g.destroy_inhibitor_at && g.inhibitor) {
+            g.destroy_inhibitor_at = 0.0;
+            zwp_idle_inhibitor_v1_destroy(g.inhibitor);
+            g.inhibitor = nullptr;
+            std::printf("inhibitor destroyed\n");
+        }
+#endif
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+        if (g.lock_surface_at > 0.0 && now_s() >= g.lock_surface_at) {
+            g.lock_surface_at = 0.0;
+            lock_make_surface();
+        }
+        if (g.unlock_at > 0.0 && now_s() >= g.unlock_at) {
+            g.unlock_at = 0.0;
+            lock_unlock("--unlock-after");
+            break;
+        }
+        if (g.crash_at > 0.0 && now_s() >= g.crash_at) {
+            // A locker that dies: no unlock, no goodbye — the socket just closes.
+            std::printf("lock crash\n");
+            std::fflush(stdout);
+            _exit(0);
+        }
+#endif
+#if defined(LUMEN_PROBE_HAS_OUTPUT_POWER)
+        if (g.power_set_at > 0.0 && now_s() >= g.power_set_at) {
+            g.power_set_at = 0.0;
+            power_request(o.power_set);
+            if (o.power_then >= 0)
+                g.power_then_at = now_s() + o.power_then_after;
+        }
+        if (g.power_then_at > 0.0 && now_s() >= g.power_then_at) {
+            g.power_then_at = 0.0;
+            power_request(o.power_then);
+        }
+#endif
+#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+        if (o.presentation_mode && g_pres.finished &&
+            (feedback_pending() == 0 || now_s() >= g_pres.finish_deadline)) {
+            present_summary();
+            g_pres.summarized = true;
+            break;
+        }
+#endif
         if (g.bind_output_at > 0.0 && now_s() >= g.bind_output_at) {
             g.bind_output_at = 0.0;
             bind_outputs();
@@ -1560,6 +2993,10 @@ int main(int argc, char** argv) {
             break;
         }
     }
+#if defined(LUMEN_PROBE_HAS_PRESENTATION)
+    if (o.presentation_mode && !g_pres.summarized)
+        present_summary(); // stopped early (signal, --exit-after, closed)
+#endif
     if (wl_display_get_error(g.display) == EPROTO) {
         const wl_interface* iface = nullptr;
         uint32_t id = 0;

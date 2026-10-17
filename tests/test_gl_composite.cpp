@@ -525,6 +525,188 @@ LUMEN_TEST(gl_composite_stretches_a_swatch_centre_without_bleed) {
         }
 }
 
+// Every buffer transform shows the buffer turned by its inverse. The expected positions
+// come from the spec's description (the buffer is the surface with `t` applied: 90 is a
+// quarter turn counter-clockwise; flipped mirrors about the vertical axis, then turns), not
+// from the basis table the shader is fed, so the two are checked against each other. A 5x
+// magnification puts pixel 2 of each 5-pixel block exactly on a texel centre, where linear
+// filtering returns the texel itself.
+LUMEN_TEST(gl_composite_applies_every_buffer_transform) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned k_sw = 3, k_sh = 2, k_mag = 5;
+    constexpr unsigned W = k_sw * k_mag, H = k_sh * k_mag;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+    // Channels of 0 or 255 only: they survive the shader's decode/encode exactly.
+    const auto colour = [](unsigned bx, unsigned by) {
+        const unsigned i = by * 3 + bx + 1; // 1..6, never black
+        return pixel{static_cast<unsigned char>(i & 1u ? 255 : 0),
+                     static_cast<unsigned char>(i & 2u ? 255 : 0),
+                     static_cast<unsigned char>(i & 4u ? 255 : 0), 255};
+    };
+    for (unsigned t = 0; t < 8; ++t) {
+        const bool quarter = (t & 1u) != 0;
+        const unsigned bw = quarter ? k_sh : k_sw;
+        const unsigned bh = quarter ? k_sw : k_sh;
+        std::vector<unsigned char> buf(static_cast<std::size_t>(bw) * bh * 4);
+        // The buffer is laid out as the transform's own coordinates: texel (x, y) of a
+        // `bw`-wide buffer gets the colour of logical index (x, y) in a 3-wide grid.
+        for (unsigned y = 0; y < bh; ++y)
+            for (unsigned x = 0; x < bw; ++x) {
+                const unsigned i = y * bw + x;
+                const pixel c = colour(i % 3, i / 3);
+                unsigned char* q = &buf[(static_cast<std::size_t>(y) * bw + x) * 4];
+                q[0] = c.r, q[1] = c.g, q[2] = c.b, q[3] = 255;
+            }
+        LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(1, bw, bh, buf.data())));
+        auto cmd = quad(1, {0, 0, static_cast<int>(W), static_cast<int>(H)});
+        cmd.buffer_xform = static_cast<lx::buffer_transform>(t);
+        auto drawn = comp.composite(target.value(), lx::color::rgb(0.5f, 0.5f, 0.5f), &cmd, 1, {});
+        LUMEN_CHECK(static_cast<bool>(drawn));
+        close_fence(drawn);
+        std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+        LUMEN_CHECK(static_cast<bool>(
+            comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+        for (unsigned y = 0; y < k_sh; ++y)
+            for (unsigned x = 0; x < k_sw; ++x) {
+                const unsigned Wl = k_sw, Hl = k_sh;
+                unsigned bx = 0, by = 0;
+                switch (t) {
+                case 0: bx = x, by = y; break;
+                case 1: bx = y, by = Wl - 1 - x; break;
+                case 2: bx = Wl - 1 - x, by = Hl - 1 - y; break;
+                case 3: bx = Hl - 1 - y, by = x; break;
+                case 4: bx = Wl - 1 - x, by = y; break;
+                case 5: bx = y, by = x; break;
+                case 6: bx = x, by = Hl - 1 - y; break;
+                case 7: bx = Hl - 1 - y, by = Wl - 1 - x; break;
+                }
+                const unsigned i = by * bw + bx;
+                const pixel want = colour(i % 3, i / 3);
+                const pixel got = at(out, W, x * k_mag + 2, y * k_mag + 2);
+                if (got.r != want.r || got.g != want.g || got.b != want.b)
+                    std::printf("    transform %u surface (%u,%u): got %u,%u,%u want %u,%u,%u\n", t,
+                                x, y, got.r, got.g, got.b, want.r, want.g, want.b);
+                LUMEN_CHECK(got.r == want.r && got.g == want.g && got.b == want.b);
+            }
+        comp.forget_texture(1);
+    }
+}
+
+// The pixel-exactness gate for fractional scale: a client at 1.25 renders round(w·1.25)
+// pixels; the scene places its root on the pixel grid and its draw is exactly that wide
+// (test_viewport_geometry checks the projection). Drawn 1:1 at an integer position, a
+// one-pixel black/white checker — the pattern any resampling would smear to grey — must
+// come back bit for bit, including the last row and column. mediump UVs failed this past
+// 2048 texels; the target here is wider than that.
+LUMEN_TEST(gl_composite_fractional_client_draw_is_bit_exact) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    // A 1949-wide buffer (GTK at 1.25 on a 1559-wide logical window), placed at x = 300 on
+    // a 2400-wide target: texel addresses past 2048 included.
+    constexpr unsigned W = 2400, H = 64;
+    constexpr unsigned bw = 1949, bh = 41; // round(1559·1.25), round(33·1.25)
+    constexpr int ox = 300, oy = 9;        // round(240·1.25), round(7·1.25)
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+    std::vector<unsigned char> buf(static_cast<std::size_t>(bw) * bh * 4);
+    for (unsigned y = 0; y < bh; ++y)
+        for (unsigned x = 0; x < bw; ++x) {
+            const unsigned char v = ((x ^ y) & 1u) ? 255 : 0;
+            unsigned char* q = &buf[(static_cast<std::size_t>(y) * bw + x) * 4];
+            q[0] = q[1] = q[2] = v;
+            q[3] = 255;
+        }
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(1, bw, bh, buf.data())));
+    const auto cmd = quad(1, {ox, oy, static_cast<int>(bw), static_cast<int>(bh)});
+    auto drawn = comp.composite(target.value(), lx::color::rgb(0.5f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(drawn));
+    close_fence(drawn);
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    unsigned wrong = 0;
+    for (unsigned y = 0; y < bh; ++y)
+        for (unsigned x = 0; x < bw; ++x) {
+            const pixel p = at(out, W, ox + x, oy + y);
+            const unsigned char v = ((x ^ y) & 1u) ? 255 : 0;
+            if (p.r != v || p.g != v || p.b != v) {
+                if (wrong < 4)
+                    std::printf("    (%u,%u): %u,%u,%u want %u\n", x, y, p.r, p.g, p.b, v);
+                ++wrong;
+            }
+        }
+    LUMEN_CHECK(wrong == 0);
+    // Nothing outside the draw.
+    LUMEN_CHECK(at(out, W, ox - 1, oy).r == 128 && at(out, W, ox + bw, oy).r == 128);
+    LUMEN_CHECK(at(out, W, ox, oy - 1).r == 128 && at(out, W, ox, oy + bh).r == 128);
+}
+
+// A viewport crop with fractional edges, magnified: nothing from outside the source box may
+// bleed in (half-texel clamp), and a fractional origin is honoured.
+LUMEN_TEST(gl_composite_fractional_crop_does_not_bleed) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned W = 60, H = 10;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+    // 8x1: black, black, then four white, then black, black.
+    std::vector<unsigned char> buf(8 * 4);
+    for (unsigned x = 0; x < 8; ++x) {
+        const unsigned char v = x >= 2 && x < 6 ? 255 : 0;
+        buf[x * 4] = buf[x * 4 + 1] = buf[x * 4 + 2] = v;
+        buf[x * 4 + 3] = 255;
+    }
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(1, 8, 1, buf.data())));
+    auto cmd = quad(1, {0, 0, static_cast<int>(W), static_cast<int>(H)});
+    cmd.src = lx::rect2f{2.5f, 0.f, 3.f, 1.f}; // inside the white run, 20x magnified
+    cmd.scaled = true;
+    auto drawn = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 1.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(drawn));
+    close_fence(drawn);
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    for (unsigned x = 0; x < W; ++x) {
+        const pixel p = at(out, W, x, H / 2);
+        LUMEN_CHECK(p.r == 255 && p.g == 255 && p.b == 255);
+    }
+}
+
+// The visibility pass marks fully covered draws; every backend skips them.
+LUMEN_TEST(gl_composite_skips_occluded_draws) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned W = 16, H = 16;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+    const auto red = solid(4, 4, 255, 0, 0);
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(1, 4, 4, red.data())));
+    auto cmd = quad(1, {0, 0, 16, 16});
+    cmd.occluded = true;
+    auto drawn = comp.composite(target.value(), lx::color::rgb(0.f, 1.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(drawn));
+    LUMEN_CHECK(drawn.value().draws_submitted == 0 && drawn.value().draws_culled == 1);
+    close_fence(drawn);
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    LUMEN_CHECK(at(out, W, 8, 8).g == 255 && at(out, W, 8, 8).r == 0);
+}
+
 int main(int argc, char** argv) {
     const int rc = lumen_test::run_all(argc, argv);
     if (g_drm_fd >= 0)

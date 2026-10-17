@@ -122,6 +122,12 @@ tree in a coherent state.
    the compositor supplies logind `TakeDevice` with a direct-open fallback. libinput's fd is
    an `fd_source` on the event loop. `suspend`/`resume` are exposed for VT switching — the
    fds must be released or the next session cannot claim them. Device add/remove is counted.
+   **VT switching (done, ADR-006):** Ctrl+Alt+F*n* goes through logind `Seat.SwitchTo`; the
+   compositor pauses on PauseDevice / `Active`=false (render gated, libinput suspended with
+   every device handed back by ReleaseDevice, held keys and buttons released, windows
+   `suspended`, frame callbacks at 1 Hz) and resumes on ResumeDevice with a full modeset,
+   the cursor plane restated and a full repaint. `chvt` and another session ending resume
+   the same way.
 2. [x] **Server-side xkbcommon.** Real keymap compiled from configuration, with depressed,
    latched and locked modifiers tracked separately, named-modifier lookup for compositor
    keybindings, and per-key repeat flags. Clients receive the *compiled* keymap over a
@@ -257,8 +263,21 @@ someone types into it.
      Wayland server's per-client destroy listener was indexed by a slot that compaction
      moves, so out-of-order disconnects corrupted a client's destroy list and the
      compositor could spin forever in it (shell restarts hit it); fixed, with a regression
-     case in `test_protocol_conformance`. Not yet: workspaces, a launcher, a clock or tray,
+     case in `test_protocol_conformance`. Not yet: workspaces, a clock or tray,
      minimize (no compositor side), the shell owning focus policy.
+   - [x] **A launcher, and apps that outlive their launcher** (ADR-006 Part B). The panel's
+     Apps button and the Super tap (a zlm v4 tap grab) toggle an overlay-layer launcher
+     listing the XDG desktop entries (Desktop Entry Specification 1.5: ID shadowing,
+     Hidden, NoDisplay, OnlyShowIn/NotShowIn, TryExec, localised names, Exec quoting and
+     field codes; inotify marks the catalog stale, rescanned on open); Super+Return starts
+     a terminal. Each launch is its own systemd user service
+     (`app-lumen-<id>@<random>.service`, `StartTransientUnit`, `Type=exec`, `app.slice`;
+     a transient scope per launch below systemd 250), double fork + `setsid` without
+     systemd --user, with an activation token from the
+     triggering input so the new window takes the keyboard. Launched apps survive the shell
+     and the terminal that started the session. The compositor gained sway's rule that an
+     `on_demand` top/overlay layer surface takes the keyboard on map. Not yet: icons,
+     desktop actions, `DBusActivatable` launching, recently-used ordering.
 6. [x] **wlr-layer-shell** (v5, `lx.compositor:layer_shell`). Panels, docks, wallpapers,
    notifications and OSDs now have somewhere to go. Every layer surface roots a surface tree
    in one of four layer containers (background and bottom under the windows, top and
@@ -281,6 +300,18 @@ someone types into it.
    fullscreen.
 7. **ext-session-lock.** Security-critical and easy to get subtly wrong: the lock surface
    must survive a crashing locker, and input must not leak to normal clients while locked.
+   - [x] **ext_session_lock_manager_v1** (ADR 007 §2d): input leaves normal clients at the
+     lock request, `locked` only after a locked frame reached the output (or nothing of the
+     session can be on screen), a locker that dies leaves the session locked on dark red
+     until a new locker takes over or logind's `Unlock`, every protocol error; lock across VT
+     switches and display power; logind Lock/Unlock/LockedHint/before-sleep;
+     zlm_shell_v1 v5 `lock_state`/`lock_requested`; lumen-shell's `--lock-command` (Super+L,
+     lock before blanking, relaunch of a dead locker). Verified with swaylock and with
+     lumen-probe's locker (app-smoke group L). Lumen ships no locker of its own.
+   - [x] **text-input-v3 (v2), input-method-v2, virtual-keyboard-v1** (ADR 007 §2e): fcitx5
+     and ibus run as ordinary clients; keys reach the input method's grab only while a
+     focused text input is enabled, preedit and commits reach GTK 4 and foot, the candidate
+     window sits at the cursor (app-smoke group M). The toolkit side (item 15) is separate.
 8. **xdg-decoration, xdg-activation, xdg-output, primary-selection.** The unglamorous set
    that makes real applications behave.
    - [x] **xdg-decoration** (v2): foot and alacritty negotiate server-side and get a Lumen
@@ -343,8 +374,9 @@ someone types into it.
      accent for an urgent window (the shell shows it).
 
 *Done when:* `lumen-shell` draws a panel, switches workspaces, and locks the session.
-Status: the panel — yes (task list over the bridge, step 5). Workspaces — not yet (no
-`zlm_workspace_v1` objects exist). Session lock — not yet (step 7, not started).
+Status: the panel — yes (task list over the bridge, step 5), with a launcher. Workspaces — not yet (no
+`zlm_workspace_v1` objects exist). Session lock — yes (step 7; the locker is an external
+client such as swaylock, started by the shell's `--lock-command`).
 
 ### Phase 2 — Cash in the pipeline work
 

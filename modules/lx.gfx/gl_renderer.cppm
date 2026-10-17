@@ -265,7 +265,8 @@ private:
     int uniform_rect_ = -1;
     int uniform_target_ = -1;
     int uniform_opacity_ = -1;
-    int uniform_src_uv_ = -1;
+    int uniform_uv_origin_dx_ = -1;
+    int uniform_uv_dy_ = -1;
     int uniform_tint_ = -1;
     int uniform_src_bounds_ = -1;
     int uniform_transfer_ = -1;
@@ -294,12 +295,18 @@ constexpr const char* k_vertex_shader = R"(#version 100
 attribute vec2 corner;
 uniform vec4 rect;
 uniform vec2 target;
-uniform vec4 src_uv;
-varying vec2 uv;
+// The source box as an affine basis in texture coordinates: where the destination's
+// top-left lands (xy) and where its +x (zw) and +y (uv_dy) directions go. Cropping,
+// fractional scale and the eight buffer transforms are then the same draw with different
+// vectors rather than separate paths (lx::gfx::source_basis_for).
+uniform vec4 uv_origin_dx;
+uniform vec2 uv_dy;
+// highp: the vertex stage is highp by definition, and the fragment side declares the same
+// varying highp where it can. mediump (fp16 on some hardware) cannot address texels past
+// about 2048, which shows as smeared columns on a wide buffer.
+varying highp vec2 uv;
 void main() {
-    // Sample the source sub-rectangle, so cropping and fractional scale are the same
-    // draw with different UVs rather than a separate path.
-    uv = src_uv.xy + corner * src_uv.zw;
+    uv = uv_origin_dx.xy + corner.x * uv_origin_dx.zw + corner.y * uv_dy;
     vec2 px = rect.xy + corner * rect.zw;
     // Top-left pixel space straight to NDC, unflipped. The target is a framebuffer object
     // over a GBM buffer, and in a framebuffer object window y = 0 is row 0 of the buffer's
@@ -314,12 +321,17 @@ void main() {
 )";
 
 constexpr const char* k_fragment_shader = R"(#version 100
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+#define UV_PRECISION highp
+#else
+#define UV_PRECISION mediump
+#endif
 precision mediump float;
-varying vec2 uv;
+varying UV_PRECISION vec2 uv;
 uniform sampler2D surface;
 uniform float opacity;
 uniform vec4 tint;
-uniform vec4 src_bounds;
+uniform UV_PRECISION vec4 src_bounds;
 // 0 linear, 1 sRGB, 2 gamma 2.2. GLES 2 has no HDR path, so PQ and HLG fall back to sRGB
 // rather than pretending — the Vulkan backend is where HDR lands.
 uniform int transfer;
@@ -344,7 +356,7 @@ vec3 linear_to_srgb(vec3 v) {
 void main() {
     // Clamp to the source rectangle. Linear filtering samples between texel centers, so a
     // magnified crop would otherwise read texels from outside its own source rect.
-    vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
+    UV_PRECISION vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
     vec4 texel = texture2D(surface, s);
     texel.a = max(texel.a, alpha_one);
 
@@ -798,7 +810,8 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     uniform_rect_ = glGetUniformLocation(program, "rect");
     uniform_target_ = glGetUniformLocation(program, "target");
     uniform_opacity_ = glGetUniformLocation(program, "opacity");
-    uniform_src_uv_ = glGetUniformLocation(program, "src_uv");
+    uniform_uv_origin_dx_ = glGetUniformLocation(program, "uv_origin_dx");
+    uniform_uv_dy_ = glGetUniformLocation(program, "uv_dy");
     uniform_tint_ = glGetUniformLocation(program, "tint");
     uniform_src_bounds_ = glGetUniformLocation(program, "src_bounds");
     uniform_transfer_ = glGetUniformLocation(program, "transfer");
@@ -1229,6 +1242,10 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
 
         for (unsigned i = 0; i < count && cmds; ++i) {
             const auto& cmd = cmds[i];
+            if (cmd.occluded) {
+                ++stats.draws_culled;
+                continue;
+            }
             const int index = find(cmd.texture_id);
             if (index < 0) {
                 ++stats.draws_skipped;
@@ -1299,18 +1316,20 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             }
             if (uniform_opacity_ >= 0)
                 glUniform1f(uniform_opacity_, cmd.opacity);
-            // An empty src means the whole texture, which is the identity rect.
+            // The source box (empty: the whole texture) in normalized texture coordinates,
+            // turned by the buffer transform. On a 1:1 draw at whole pixels every fragment
+            // centre lands on a texel centre, so linear filtering is exact; a resampled
+            // draw filters linearly (wlroots, KWin).
             float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
             float u_lo = 0.f, v_lo = 0.f, u_hi = 1.f, v_hi = 1.f;
             if (slot.width > 0 && slot.height > 0) {
                 const float tw = static_cast<float>(slot.width);
                 const float th = static_cast<float>(slot.height);
-                if (cmd.src.width > 0 && cmd.src.height > 0) {
-                    u0 = static_cast<float>(cmd.src.x) / tw;
-                    v0 = static_cast<float>(cmd.src.y) / th;
-                    du = static_cast<float>(cmd.src.width) / tw;
-                    dv = static_cast<float>(cmd.src.height) / th;
-                }
+                const lx::rect2f box = effective_source(cmd.src, slot.width, slot.height);
+                u0 = box.x / tw;
+                v0 = box.y / th;
+                du = box.width / tw;
+                dv = box.height / th;
                 // Half-texel inset, so a magnified crop cannot sample across its own edge.
                 const float half_u = 0.5f / tw;
                 const float half_v = 0.5f / th;
@@ -1321,8 +1340,14 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
                 if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
             }
-            if (uniform_src_uv_ >= 0)
-                glUniform4f(uniform_src_uv_, u0, v0, du, dv);
+            {
+                const source_basis b = source_basis_for(cmd.buffer_xform);
+                if (uniform_uv_origin_dx_ >= 0)
+                    glUniform4f(uniform_uv_origin_dx_, u0 + b.origin[0] * du,
+                                v0 + b.origin[1] * dv, b.dx[0] * du, b.dx[1] * dv);
+                if (uniform_uv_dy_ >= 0)
+                    glUniform2f(uniform_uv_dy_, b.dy[0] * du, b.dy[1] * dv);
+            }
             if (uniform_src_bounds_ >= 0)
                 glUniform4f(uniform_src_bounds_, u_lo, v_lo, u_hi, v_hi);
             if (uniform_tint_ >= 0)

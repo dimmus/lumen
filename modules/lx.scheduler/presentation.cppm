@@ -14,11 +14,25 @@ struct presentation_feedback {
     lx::runtime::clock_time target_present_ns = 0;
     lx::runtime::clock_time actual_present_ns = 0;
     unsigned refresh_nanos = 16'666'667;
+    /// The CRTC's vblank counter at the flip (MSC); 0 when there is none (a synthetic
+    /// completion).
     unsigned seq = 0;
     lx::rect2i kms_damage{};
+    /// The timestamp and `seq` come from the kernel's flip event (hardware vblank); false
+    /// for a blocking modeset's completion, sampled in software.
     bool hw_clock = false;
+    /// The flip completed (scanout switched to the committed state).
     bool vsync = true;
+    /// `actual_present_ns` and `seq` are the CRTC's vblank time and counter, not a time the
+    /// driver sampled when it sent the event (a driver without vblank support).
+    bool vblank_clock = false;
     bool kms_damage_valid = false;
+    /// The commit carried a frame (primary plane), not only the cursor plane.
+    bool content = false;
+    /// `drm::atomic_commit_request::user_tag` of that commit: the compositor's frame index
+    /// of the composite it scanned out (0 = none).
+    unsigned tag = 0;
+    unsigned crtc_id = 0;
 };
 
 using presentation_handler = void (*)(presentation_feedback feedback, void* user_data);
@@ -78,8 +92,12 @@ void lx::scheduler::presentation_tracker::on_page_flip(lx::drm::page_flip_event 
     fb.actual_present_ns = event.timestamp_ns;
     fb.compositor_clock_ns = event.timestamp_ns;
     fb.seq = event.sequence;
-    fb.hw_clock = true;
+    fb.hw_clock = event.hw;
+    fb.vblank_clock = event.vblank_timestamp;
     fb.vsync = event.presented;
+    fb.content = event.content;
+    fb.tag = event.tag;
+    fb.crtc_id = event.crtc_id;
     if (!event.applied_damage.full_frame && event.applied_damage.count > 0) {
         fb.kms_damage_valid = true;
         fb.kms_damage = event.applied_damage.rects[0];

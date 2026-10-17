@@ -28,6 +28,9 @@ import :surface;
 import :surface_tree;
 import :toplevel;
 import :output;
+import :keybindings;
+import :input_router;
+import :session_lock;
 import :wire;
 
 #if defined(LUMEN_HAS_WAYLAND)
@@ -208,6 +211,53 @@ const struct zlm_window_rules_v1_interface window_rules_impl = {
     .set_decoration_rule = [](struct wl_client*, struct wl_resource*, const char*, uint32_t) {},
 };
 
+// ── zlm_key_grab_v1 (v4) ───────────────────────────────────────────────────
+//
+// The grab table lives in `keybindings` (Wayland-free); the resource is its owner key, and
+// its destructor gives the combination back — so a dead shell's grabs go with its
+// connection, and the compositor's own bindings never depended on them.
+
+const struct zlm_key_grab_v1_interface key_grab_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+};
+
+void key_grab_destroyed(struct wl_resource* r) {
+    if (g_p0_ctx && g_p0_ctx->keys)
+        g_p0_ctx->keys->remove_grab(r);
+}
+
+const char* refusal_name(lx::compositor::key_grab_refusal r) {
+    switch (r) {
+    case lx::compositor::key_grab_refusal::none: return "none";
+    case lx::compositor::key_grab_refusal::reserved: return "reserved";
+    case lx::compositor::key_grab_refusal::taken: return "taken";
+    case lx::compositor::key_grab_refusal::invalid: return "invalid";
+    }
+    return "?";
+}
+
+void shell_grab_key(struct wl_client* client, struct wl_resource* resource, uint32_t id,
+                    uint32_t keysym, uint32_t modifiers, uint32_t flags) {
+    wl_resource* res = wl_resource_create(client, &zlm_key_grab_v1_interface,
+                                          wl_resource_get_version(resource), id);
+    if (!res) {
+        wl_client_post_no_memory(client);
+        return;
+    }
+    wl_resource_set_implementation(res, &key_grab_impl, g_p0_ctx, &key_grab_destroyed);
+    lx::compositor::key_grab_refusal refusal = lx::compositor::key_grab_refusal::reserved;
+    if (g_p0_ctx && g_p0_ctx->keys)
+        refusal = g_p0_ctx->keys->add_grab(keysym, modifiers, flags, res);
+    if (refusal != lx::compositor::key_grab_refusal::none)
+        zlm_key_grab_v1_send_refused(res, static_cast<uint32_t>(refusal));
+    if (surface_debug()) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "grab_key keysym=0x%x mods=0x%x flags=0x%x result=%s",
+                      keysym, modifiers, flags, refusal_name(refusal));
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.shell", line);
+    }
+}
+
 const struct zlm_shell_v1_interface shell_impl = {
     .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
     .get_workspace_manager =
@@ -249,6 +299,7 @@ const struct zlm_shell_v1_interface shell_impl = {
             if (g_p0_ctx && g_p0_ctx->request_logout)
                 g_p0_ctx->request_logout(g_p0_ctx->logout_user, "shell");
         },
+    .grab_key = &shell_grab_key,
 };
 
 } // namespace
@@ -263,6 +314,42 @@ void shell_send_session_ending() {
     for (auto* r : shell_resources)
         if (r && wl_resource_get_version(r) >= ZLM_SHELL_V1_SESSION_ENDING_SINCE_VERSION)
             zlm_shell_v1_send_session_ending(r);
+}
+
+void shell_send_lock_state(unsigned state) {
+    for (auto* r : shell_resources)
+        if (r && wl_resource_get_version(r) >= ZLM_SHELL_V1_LOCK_STATE_SINCE_VERSION)
+            zlm_shell_v1_send_lock_state(r, state);
+}
+
+bool shell_send_lock_requested(unsigned reason) {
+    bool told = false;
+    for (auto* r : shell_resources) {
+        if (r && wl_resource_get_version(r) >= ZLM_SHELL_V1_LOCK_REQUESTED_SINCE_VERSION) {
+            zlm_shell_v1_send_lock_requested(r, reason);
+            told = true;
+        }
+    }
+    return told;
+}
+
+void shell_fire_key_grab(void* grab_resource, unsigned time_ms) {
+    auto* res = static_cast<wl_resource*>(grab_resource);
+    if (!res || !g_p0_ctx || !g_p0_ctx->seat)
+        return;
+    // An input serial, recorded as a key press delivered to the shell: the shell may quote
+    // it to xdg_activation_token_v1.set_serial for the window it launches, and the focus-
+    // stealing policy accepts it as the shell's last press.
+    const unsigned serial = g_p0_ctx->seat->next_serial();
+    if (g_p0_ctx->input)
+        g_p0_ctx->input->serials().note(wl_resource_get_client(res), serial,
+                                        lx::compositor::input_serial_kind::key_press);
+    zlm_key_grab_v1_send_activated(res, serial, time_ms);
+    if (surface_debug()) {
+        char line[64];
+        std::snprintf(line, sizeof(line), "grab activated serial=%u", serial);
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.shell", line);
+    }
 }
 
 void bind_shell(wayland::client_connection& client, unsigned id, int version) {
@@ -296,8 +383,13 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
     // "Sent immediately after bind". No optional capability is implemented yet (tiling
     // plugin, workspace drag, explicit sync), so the flags are empty.
     // shell_protocol_version: the zlm family's version this compositor implements (2:
-    // toplevel_flags; 3: request_logout).
-    zlm_shell_v1_send_capabilities(static_cast<wl_resource*>(res.native()), 0u, 3u);
+    // toplevel_flags; 3: request_logout; 4: grab_key; 5: lock_state, lock_requested).
+    auto* native = static_cast<wl_resource*>(res.native());
+    zlm_shell_v1_send_capabilities(native, 0u, 5u);
+    // "Sent on bind and on every change": a shell restarted behind a lock learns it at once.
+    if (wl_resource_get_version(native) >= ZLM_SHELL_V1_LOCK_STATE_SINCE_VERSION)
+        zlm_shell_v1_send_lock_state(
+            native, g_p0_ctx->lock ? lx::compositor::shell_lock_state(g_p0_ctx->lock->state()) : 0u);
 }
 
 } // namespace lx::compositor::p0
