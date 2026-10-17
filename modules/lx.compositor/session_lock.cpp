@@ -14,6 +14,17 @@ import :session_lock;
 
 namespace lx::compositor {
 
+void lock_frame_tracker::begin() { shown_ = 0; }
+
+void lock_frame_tracker::shown(unsigned slot) {
+    if (slot < 32)
+        shown_ |= 1u << slot;
+}
+
+bool lock_frame_tracker::complete(unsigned live, unsigned dark) const {
+    return ((shown_ | dark) & live) == live;
+}
+
 lock_actions session_lock::set_outputs(unsigned mask) {
     lock_actions a{};
     outputs_ = mask;

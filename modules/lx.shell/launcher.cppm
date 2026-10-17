@@ -230,8 +230,9 @@ public:
 
     void init(launcher_globals g, app_catalog& catalog, launch_fn on_launch, closed_fn on_closed,
               void* user);
-    /// Opens on an output of `output_w`×`output_h`; false when it cannot.
-    bool open(int output_w, int output_h, int panel_h);
+    /// Opens on `output` (wl_output*; null: the compositor picks), `output_w`×`output_h`
+    /// logical; false when it cannot.
+    bool open(int output_w, int output_h, int panel_h, void* output = nullptr);
     void close();
     [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
     [[nodiscard]] void* surface() const { return surface_; }
@@ -957,7 +958,7 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
     model_.bind(&catalog);
 }
 
-bool lx::shell::launcher::open(int output_w, int output_h, int panel_h) {
+bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, void* output) {
     if (is_open())
         return true;
     if (!g_.compositor || !g_.layer_shell || !g_.shm || output_w <= 0)
@@ -968,8 +969,8 @@ bool lx::shell::launcher::open(int output_w, int output_h, int panel_h) {
         return false;
     surface_ = surface;
     auto* layer = zwlr_layer_shell_v1_get_layer_surface(
-        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface, nullptr,
-        ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "lumen-launcher");
+        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,
+        static_cast<wl_output*>(output), ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "lumen-launcher");
     layer_ = layer;
     zwlr_layer_surface_v1_add_listener(layer, &k_launcher_layer_listener, this);
     canvas_.attach_scale(g_.viewporter, g_.fractional, surface);
@@ -1091,7 +1092,7 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
     user_ = user;
     model_.bind(&catalog);
 }
-bool lx::shell::launcher::open(int, int, int) { return false; }
+bool lx::shell::launcher::open(int, int, int, void*) { return false; }
 void lx::shell::launcher::close() {}
 void lx::shell::launcher::after_dispatch() {}
 void lx::shell::launcher::draw(bool) {}

@@ -431,6 +431,28 @@ void session_lock_outputs_changed() {
     if (!m || !om)
         return;
     const std::uint32_t mask = live_outputs();
+    // A lock surface of an output that went is dropped (ADR 008 §B.5): its tree leaves the
+    // lock layer and the lock forgets it, and the lock in charge may make one for a new
+    // output in that slot later (no duplicate_output). Collected first: dropping one
+    // changes the machine's list.
+    lock_surface_obj* gone[lx::compositor::output_manager::k_max * 2]{};
+    unsigned gone_count = 0;
+    m->for_each_surface([&](const lx::compositor::lock_surface_record& r) {
+        auto* o = lock_surface_from(static_cast<wl_resource*>(r.resource));
+        if (o && o->record && !(mask & (1u << o->output)) &&
+            gone_count < sizeof(gone) / sizeof(gone[0]))
+            gone[gone_count++] = o;
+    });
+    for (unsigned i = 0; i < gone_count; ++i) {
+        lock_surface_obj* o = gone[i];
+        if (lock_obj* lo = lock_from(static_cast<wl_resource*>(m->current())))
+            lo->outputs_used &= ~(1u << o->output);
+        char line[96];
+        std::snprintf(line, sizeof(line), "lock surface dropped surface=%llu output=%u (output gone)",
+                      o->surface ? o->surface->id.id() : 0ull, o->output);
+        lock_log(lx::trace::level::info, line);
+        make_inert(o, true);
+    }
     // Every lock surface of a live output follows its size (a new configure) and origin.
     m->for_each_surface([&](const lx::compositor::lock_surface_record& r) {
         auto* o = lock_surface_from(static_cast<wl_resource*>(r.resource));

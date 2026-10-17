@@ -152,6 +152,46 @@ When a client exceeds its quota, LRU eviction runs **within that client** before
 | `prefer_composite` | Release scanout quickly |
 | `auto_select` | Pin video/game hints; release UI |
 
+### Scanout targets per output
+
+Every output pipeline (ADR 008) owns three scanout targets of its mode's size — GL
+renderbuffers on GBM, CPU dumb buffers, or Vulkan images — `3 × W × H × 4` bytes each
+(≈ 21 MB for 1914×924, 15 MB for 1280×1024), allocated when the pipeline is created at
+start and freed with it; nothing per frame. The CRTC allocation's TEST_ONLY commits reuse
+those targets' framebuffers. Each output view also has its own `snapshot_buffer` (three
+draw lists, grown to the largest frame seen), created on the UI thread with the view and
+kept for the scene's lifetime. A connector probe fills a fixed `connector_scan` (16
+connectors × 96 modes with their 68-byte blobs) — no allocation.
+
+Hotplug (ADR 008 Part B) changes this only at the edges, never per frame:
+
+- A **new output**'s pipeline and targets are made by render when the output is added
+  (one set per candidate mode size tried, the failed ones freed at once) and freed when it
+  goes: the CRTC is turned off first, GL/Vulkan objects are released on render, the rest
+  of the pipeline on UI.
+- A **mode change** allocates the new size's targets once, for its TEST_ONLY ("staged"),
+  and switches to them; the old mode's targets stay until the new mode's first flip (one
+  of them is on screen until then) — for one or two frames both sets exist (≈ 21 MB more
+  for a 1914×924 output).
+- The hotplug controller allocates its `connector_scan` (≈ 140 KB, the worker's) once at
+  start, and the compositor a table of pending adds (16 probes, ≈ 150 KB) at the first
+  hotplug. A probe, a diff and an identical scan allocate nothing.
+
+Output configuration (ADR 008 Part C), also only at the edges:
+
+- A configuration's **TEST_ONLY** allocates targets at every new mode it tests (staged:
+  a changed output's are kept ≤ 5 s for its switch, an enabled output's dropped after the
+  test — its add allocates its own); a refused test frees them at once.
+- The compositor keeps a copy of the newest `connector_scan` (≈ 150 KB, for the heads of
+  monitors that are not outputs), the heads it builds (`mgmt::head_set`, ≈ 50 KB, and the
+  wire's copy of what clients were told, the same), the job being run (two targets and a
+  configuration, ≈ 6 KB) and the persisted `output_config` (64 monitors, 64 setups:
+  ≈ 250 KB) — each allocated once. Heads are rebuilt only when outputs or connectors
+  changed; an apply or a save allocates the file's text (a few hundred bytes) on UI.
+- Each turned output's render pipeline grows one cursor-image buffer (plane-sized) once.
+- Head, mode and configuration objects of `zwlr_output_manager_v1` are allocated per object
+  and freed by their destructors (intrusive lists), never from a shared table.
+
 ---
 
 ## 5. Buffer lifetime loop
@@ -175,6 +215,11 @@ client disconnect
 ```
 
 States: `imported → attached → in_flight → pending_release → released`
+
+With several outputs a buffer is released at the **render low-water mark**: the oldest
+frame any live output may still sample (a view's newest consumed publish, or the frame its
+composited-but-uncommitted slot holds). An output that is not due keeps its last snapshot,
+so a buffer it shows stays held until that output publishes again.
 
 On memory pressure, `pending_release` and (critical) `in_flight` buffers are flushed early.
 

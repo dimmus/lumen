@@ -230,7 +230,7 @@ if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
         # selections). Its client glue is lumen-protocol-glue's — every manifest protocol —
         # rather than private copies, which would define xdg_wm_base_interface twice.
         if(LUMEN_BUILD_TESTS AND TARGET lumen-protocol-glue)
-            add_executable(lumen-probe tests/clients/lumen-probe.cpp)
+            add_executable(lumen-probe tests/clients/lumen-probe.cpp tests/clients/lumen-probe-output-mgmt.cpp)
             target_link_libraries(lumen-probe PRIVATE lumen-protocol-glue)
             lumen_link_platform(lumen-probe)
             target_compile_definitions(lumen-probe PRIVATE LUMEN_PROBE_HAS_LAYER_SHELL)
@@ -282,6 +282,12 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_snapshot)
     target_include_directories(test_snapshot PRIVATE tests)
     add_test(NAME test_snapshot COMMAND test_snapshot)
+
+    add_executable(test_scene_outputs tests/test_scene_outputs.cpp)
+    target_link_libraries(test_scene_outputs PRIVATE lx.scene lx.runtime)
+    lumen_apply_module_properties(test_scene_outputs)
+    target_include_directories(test_scene_outputs PRIVATE tests)
+    add_test(NAME test_scene_outputs COMMAND test_scene_outputs)
 
     add_executable(test_damage_region tests/test_damage_region.cpp)
     target_link_libraries(test_damage_region PRIVATE lx.scene lx.gfx lx.runtime)
@@ -395,6 +401,13 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_output_membership PRIVATE tests)
     add_test(NAME test_output_membership COMMAND test_output_membership)
 
+    add_executable(test_output_layout tests/test_output_layout.cpp)
+    target_link_libraries(test_output_layout PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_output_layout)
+    lumen_link_platform(test_output_layout)
+    target_include_directories(test_output_layout PRIVATE tests)
+    add_test(NAME test_output_layout COMMAND test_output_layout)
+
     add_executable(test_liveness tests/test_liveness.cpp)
     target_link_libraries(test_liveness PRIVATE lx.compositor)
     lumen_apply_module_properties(test_liveness)
@@ -456,6 +469,13 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_repaint_schedule)
     target_include_directories(test_repaint_schedule PRIVATE tests)
     add_test(NAME test_repaint_schedule COMMAND test_repaint_schedule)
+
+    add_executable(test_frame_clocks tests/test_frame_clocks.cpp)
+    target_link_libraries(test_frame_clocks PRIVATE lx.scheduler)
+    lumen_apply_module_properties(test_frame_clocks)
+    lumen_link_platform(test_frame_clocks)
+    target_include_directories(test_frame_clocks PRIVATE tests)
+    add_test(NAME test_frame_clocks COMMAND test_frame_clocks)
 
     add_executable(test_runtime_task tests/test_runtime_task.cpp)
     target_link_libraries(test_runtime_task PRIVATE lx.runtime)
@@ -573,12 +593,82 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_output_contract COMMAND test_output_contract)
     set_tests_properties(test_output_contract PROPERTIES TIMEOUT 30)
 
+    add_executable(test_multi_output_contract tests/test_multi_output_contract.cpp)
+    target_link_libraries(test_multi_output_contract PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_multi_output_contract)
+    lumen_link_platform(test_multi_output_contract)
+    target_include_directories(test_multi_output_contract PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_multi_output_contract COMMAND test_multi_output_contract)
+    set_tests_properties(test_multi_output_contract PROPERTIES TIMEOUT 30)
+
+    add_executable(test_hotplug_contract tests/test_hotplug_contract.cpp)
+    target_link_libraries(test_hotplug_contract PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_hotplug_contract)
+    lumen_link_platform(test_hotplug_contract)
+    target_include_directories(test_hotplug_contract PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_hotplug_contract COMMAND test_hotplug_contract)
+    set_tests_properties(test_hotplug_contract PROPERTIES TIMEOUT 30)
+
+    add_executable(test_output_management_contract tests/test_output_management_contract.cpp)
+    target_link_libraries(test_output_management_contract PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_output_management_contract)
+    lumen_link_platform(test_output_management_contract)
+    target_include_directories(test_output_management_contract PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_output_management_contract COMMAND test_output_management_contract)
+    set_tests_properties(test_output_management_contract PROPERTIES TIMEOUT 60)
+
     add_executable(test_kms_device tests/test_kms_device.cpp)
     target_link_libraries(test_kms_device PRIVATE lx.drm)
     lumen_apply_module_properties(test_kms_device)
     lumen_link_platform(test_kms_device)
     target_include_directories(test_kms_device PRIVATE tests)
     add_test(NAME test_kms_device COMMAND test_kms_device)
+
+    add_executable(test_crtc_alloc tests/test_crtc_alloc.cpp)
+    target_link_libraries(test_crtc_alloc PRIVATE lx.drm)
+    lumen_apply_module_properties(test_crtc_alloc)
+    lumen_link_platform(test_crtc_alloc)
+    target_include_directories(test_crtc_alloc PRIVATE tests)
+    add_test(NAME test_crtc_alloc COMMAND test_crtc_alloc)
+
+    # The VMware host helper for live hotplug tests (scripts/monitor-smoke.sh): sets the
+    # virtual monitors' layout as open-vm-tools does. Built where the vmwgfx uapi header is,
+    # never installed.
+    include(CheckIncludeFile)
+    if(LIBDRM_FOUND)
+        set(CMAKE_REQUIRED_INCLUDES ${LIBDRM_INCLUDE_DIRS})
+        check_include_file("libdrm/vmwgfx_drm.h" LUMEN_HAS_VMWGFX_DRM_H)
+        unset(CMAKE_REQUIRED_INCLUDES)
+    endif()
+    if(LUMEN_HAS_VMWGFX_DRM_H)
+        add_executable(lumen-vmw-layout tests/tools/lumen-vmw-layout.c)
+        set_target_properties(lumen-vmw-layout PROPERTIES LINKER_LANGUAGE C)
+        target_include_directories(lumen-vmw-layout PRIVATE ${LIBDRM_INCLUDE_DIRS})
+        target_link_libraries(lumen-vmw-layout PRIVATE ${LIBDRM_LIBRARIES})
+    endif()
+
+    add_executable(test_cvt tests/test_cvt.cpp)
+    target_link_libraries(test_cvt PRIVATE lx.drm)
+    lumen_apply_module_properties(test_cvt)
+    lumen_link_platform(test_cvt)
+    add_test(NAME test_cvt COMMAND test_cvt)
+
+    add_executable(test_uevent_parse tests/test_uevent_parse.cpp)
+    target_link_libraries(test_uevent_parse PRIVATE lx.drm)
+    lumen_apply_module_properties(test_uevent_parse)
+    lumen_link_platform(test_uevent_parse)
+    target_include_directories(test_uevent_parse PRIVATE tests)
+    add_test(NAME test_uevent_parse COMMAND test_uevent_parse)
+
+    foreach(t test_output_scan_diff test_output_policy test_window_migration
+              test_output_management test_output_config_store)
+        add_executable(${t} tests/${t}.cpp)
+        target_link_libraries(${t} PRIVATE lx.compositor)
+        lumen_apply_module_properties(${t})
+        lumen_link_platform(${t})
+        target_include_directories(${t} PRIVATE tests)
+        add_test(NAME ${t} COMMAND ${t})
+    endforeach()
 
     add_executable(test_dmabuf_composite tests/test_dmabuf_composite.cpp)
     target_link_libraries(test_dmabuf_composite PRIVATE lx.gfx)
@@ -639,19 +729,22 @@ if(LUMEN_BUILD_TESTS)
         "LSAN_OPTIONS=detect_leaks=0"
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
-    set_tests_properties(test_result test_snapshot test_damage_region test_wm_geometry
+    set_tests_properties(test_result test_snapshot test_scene_outputs test_damage_region test_wm_geometry
         test_surface_tree test_positioner test_layer_arrange test_xcursor
         test_data_transfer test_input_serials test_session_pause test_keybindings
         test_viewport_geometry test_presentation_feedback
         test_dnd_grab test_output_membership test_liveness
         test_activation_policy
         test_import_cache bench_frame
-        test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_input_keymap
+        test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_frame_clocks test_input_keymap
         test_headless_golden test_text_shaping test_protocol_bind test_protocol_conformance
-        test_output_contract
+        test_output_contract test_multi_output_contract test_hotplug_contract
+        test_output_management_contract
         test_task_model test_shell_bridge
         test_desktop_entry test_app_catalog test_app_launch test_launcher_layout
-        test_kms_device test_kms_vkms
+        test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
+        test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
+        test_cvt test_output_management test_output_config_store
         test_ui_reconcile test_gl_composite bench_composite
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
 

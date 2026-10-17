@@ -236,7 +236,9 @@ struct fixture {
         ops.client_alive = [](void*) { return true; };
         popups.set_ops(ops);
         lx::compositor::popup_host host{};
-        host.constraint_area = [](void*, popup_parent_kind) { return lx::rect2i{0, 0, 1000, 800}; };
+        host.constraint_area = [](void*, popup_parent_kind, lx::surface_id) {
+            return lx::rect2i{0, 0, 1000, 800};
+        };
         host.focus_changed = [](void*) { ++g_wire->focus_changes; };
         popups.set_host(host);
 

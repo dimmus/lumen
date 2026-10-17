@@ -132,12 +132,19 @@ struct panel_layout {
     unsigned notice_rev = 0;
 };
 
-/// Lays out `model`'s entries on a `width`×`height` panel. The pointer (surface
-/// coordinates; negative = not on the panel) marks the entry under it as hovered;
-/// `pressed` marks the entry a button went down on.
+/// Which entries a panel lists (the tasks of its output, M13); null: all of them.
+struct panel_filter {
+    bool (*keep)(const task_entry& e, void* user) = nullptr;
+    void* user = nullptr;
+};
+
+/// Lays out `model`'s entries (those `filter` keeps) on a `width`×`height` panel. The
+/// pointer (surface coordinates; negative = not on the panel) marks the entry under it as
+/// hovered; `pressed` marks the entry a button went down on.
 void layout_panel(const task_model& model, int width, int height, double pointer_x,
                   double pointer_y, task_handle pressed, panel_layout& out,
-                  panel_logout logout = {}, panel_apps apps = {}, panel_notice notice = {});
+                  panel_logout logout = {}, panel_apps apps = {}, panel_notice notice = {},
+                  panel_filter filter = {});
 /// Copies the used part of `from` (the cells in use, not all k_max_panel_cells).
 ///
 /// Also a workaround: Clang 23.1 finds no viable copy assignment for this class here and
@@ -196,11 +203,24 @@ public:
     panel(const panel&) = delete;
     panel& operator=(const panel&) = delete;
 
-    /// Creates the layer surface and sends its initial commit.
-    [[nodiscard]] lx::result<void> create(panel_globals globals, policy_bridge& bridge);
+    /// Creates the layer surface on `output` (wl_output*; null: the compositor picks) and
+    /// sends its initial commit.
+    [[nodiscard]] lx::result<void> create(panel_globals globals, policy_bridge& bridge,
+                                          void* output = nullptr);
     void destroy();
-    /// Call after every dispatch: consumes model changes and draws if needed.
+    /// Call after every dispatch: consumes model changes and draws if needed. With several
+    /// panels the shell takes the model's changes once and hands them to each
+    /// (`after_dispatch(changes)`).
     void after_dispatch();
+    void after_dispatch(unsigned changes);
+    /// Lists only the tasks `filter` keeps (the windows on this panel's output).
+    void set_filter(panel_filter filter) {
+        filter_ = filter;
+        dirty_ = true;
+    }
+    /// The output's windows may have changed (a window moved, an output moved): redraw if
+    /// the list differs.
+    void filter_changed() { dirty_ = true; }
     /// The compositor closed the layer surface (its output went away) or a buffer could
     /// not be made: the shell should exit and be restarted.
     [[nodiscard]] bool closed() const { return closed_; }
@@ -277,6 +297,7 @@ private:
     unsigned notice_rev_ = 0;
     action_fn action_fn_ = nullptr;
     void* action_user_ = nullptr;
+    panel_filter filter_{};
     panel_layout committed_{};
     panel_layout next_{};
 };
@@ -295,7 +316,8 @@ namespace {
 
 void lx::shell::layout_panel(const task_model& model, int width, int height, double px,
                              double py, task_handle pressed, panel_layout& out,
-                             panel_logout logout, panel_apps apps, panel_notice notice) {
+                             panel_logout logout, panel_apps apps, panel_notice notice,
+                             panel_filter filter) {
     out.width = width;
     out.height = height;
     out.cell_h = height < k_entry_height ? height : k_entry_height;
@@ -347,7 +369,14 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
         return;
     }
     task_handle order[k_max_tasks];
-    const unsigned n = model.ordered(order, k_max_tasks);
+    unsigned n = model.ordered(order, k_max_tasks);
+    if (filter.keep) {
+        unsigned kept = 0;
+        for (unsigned i = 0; i < n; ++i)
+            if (const task_entry* e = model.get(order[i]); e && filter.keep(*e, filter.user))
+                order[kept++] = order[i];
+        n = kept;
+    }
     if (n == 0 || avail <= 0)
         return;
     const int ni = static_cast<int>(n);
@@ -830,7 +859,8 @@ const zwlr_layer_surface_v1_listener k_layer_listener = {
 
 } // namespace
 
-lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& bridge) {
+lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& bridge,
+                                          void* output) {
     if (!globals.compositor || !globals.shm || !globals.layer_shell)
         return lx::make_error(lx::error_domain::invalid_argument, 0,
                               "panel needs wl_compositor, wl_shm and zwlr_layer_shell_v1");
@@ -843,8 +873,8 @@ lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& 
                               "wl_compositor.create_surface failed");
     surface_ = surface;
     auto* layer = zwlr_layer_shell_v1_get_layer_surface(
-        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface, nullptr,
-        ZWLR_LAYER_SHELL_V1_LAYER_TOP, "lumen-panel");
+        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,
+        static_cast<wl_output*>(output), ZWLR_LAYER_SHELL_V1_LAYER_TOP, "lumen-panel");
     layer_ = layer;
     zwlr_layer_surface_v1_add_listener(layer, &k_layer_listener, this);
     // Rendered at the output's pixel density (wp_fractional_scale_v1), shown at its logical
@@ -874,8 +904,20 @@ void lx::shell::panel::after_dispatch() {
     // A snapshot in progress is never shown half-done; its changes wait for snapshot_done.
     if (model.in_snapshot())
         return;
-    const unsigned changes = model.take_changes();
-    if (changes & (task_change_list | task_change_label | task_change_focus | task_change_flags)) {
+    after_dispatch(model.take_changes());
+}
+
+void lx::shell::panel::after_dispatch(unsigned changes) {
+    if (!bridge_ || !surface_ || closed_)
+        return;
+    task_model& model = bridge_->model();
+    if (model.in_snapshot())
+        return;
+    // With a filter, a window moving between outputs changes which panel lists it.
+    const unsigned relevant = task_change_list | task_change_label | task_change_focus |
+                              task_change_flags |
+                              (filter_.keep ? unsigned{task_change_geometry} : 0u);
+    if (changes & relevant) {
         dirty_ = true;
         // The entry under a still pointer may be a different one now.
         if (changes & task_change_list)
@@ -924,7 +966,7 @@ void lx::shell::panel::draw(bool force) {
     layout_panel(bridge_->model(), width_, height_, pointer_x_, pointer_y_, pressed_, next_,
                  panel_logout{bridge_->can_logout(), logout_armed_, logout_pressed_},
                  panel_apps{apps_shown_, apps_open_, apps_pressed_},
-                 panel_notice{notice_[0] != '\0', notice_rev_});
+                 panel_notice{notice_[0] != '\0', notice_rev_}, filter_);
     lx::rect2i damage[k_max_panel_cells];
     const unsigned nd = panel_diff(committed_, next_, damage, k_max_panel_cells);
     if (nd == 0 && !force) {
@@ -976,11 +1018,12 @@ void lx::shell::panel::destroy() {
 
 struct lx::shell::panel::events {};
 
-lx::result<void> lx::shell::panel::create(panel_globals, policy_bridge&) {
+lx::result<void> lx::shell::panel::create(panel_globals, policy_bridge&, void*) {
     return lx::not_implemented("lx::shell::panel::create");
 }
 void lx::shell::panel::destroy() {}
 void lx::shell::panel::after_dispatch() {}
+void lx::shell::panel::after_dispatch(unsigned) {}
 void lx::shell::panel::draw(bool) {}
 
 #endif

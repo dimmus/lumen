@@ -15,6 +15,11 @@ injector needs the output size — from --output WxH, or read from the composito
 which it reads with EVIOCGABS. Each position is aimed at the centre of the pixel, so
 rounding on either side cannot land it on a neighbour.
 
+With several outputs the compositor maps an absolute device onto the bounding box of the
+layout (ADR 008 M9). `--layout LOG` reads every `output N name=… logical=WxH+X+Y` line of
+the compositor's log, and positions are then LAYOUT (logical) coordinates: the point a
+move names is where the pointer lands, on whichever output holds it.
+
 Every write is recorded as one JSON line on stdout (nothing else goes there), with the
 CLOCK_MONOTONIC time read just before the write. The kernel stamps the event when the
 SYN_REPORT is processed, so the recorded time is never later than the timestamp libinput
@@ -22,6 +27,7 @@ reports. That is what lets a test measure input-to-present latency against the
 compositor's debug log, which uses the same clock.
 
     sudo python3 -I scripts/inject-input.py --compositor-log comp.log move 400 300
+    sudo python3 -I scripts/inject-input.py --layout comp.log move 2400 300   # on output 1
     sudo python3 -I scripts/inject-input.py --output 1918x928 drag 500 400 700 520 --button left
     sudo python3 -I scripts/inject-input.py --output 1918x928 drag 500 400 700 520 --button left --super
     sudo python3 -I scripts/inject-input.py --output 1918x928 drag 40 20 1800 20      # hover only
@@ -108,10 +114,12 @@ def pack(etype, code, value):
 
 
 class Injector:
-    def __init__(self, pointer, keyboard, output, tag):
+    def __init__(self, pointer, keyboard, output, tag, origin=(0, 0)):
         self.pointer_path = pointer
         self.keyboard_path = keyboard
         self.output = output
+        # The top-left of the area the device spans (the layout's bounding box).
+        self.origin = origin
         self.tag = tag
         self.ptr = None
         self.kbd = None
@@ -177,7 +185,8 @@ class Injector:
             sys.exit("inject-input: the output size is unknown; pass --output WxH or "
                      "--compositor-log")
         w, h = self.output
-        ax, ay = self.to_device(x, w, 0), self.to_device(y, h, 1)
+        ax = self.to_device(x - self.origin[0], w, 0)
+        ay = self.to_device(y - self.origin[1], h, 1)
         data = (pack(EV_ABS, ABS_X, ax) + pack(EV_ABS, ABS_Y, ay) +
                 pack(EV_SYN, SYN_REPORT, 0))
         t = now_us()
@@ -250,6 +259,34 @@ def output_from_log(path):
     except OSError as e:
         sys.exit(f"inject-input: cannot read {path}: {e}")
     sys.exit(f"inject-input: no 'output 0 mode=WxH' line in {path} yet")
+
+
+def layout_from_log(path):
+    """The bounding box of every output's logical rect, from the compositor's
+    `output N name=… logical=WxH+X+Y` lines (the newest line per output wins; an
+    `output N removed` line takes output N out until it is logged again — hotplug)."""
+    pattern = re.compile(r"output (\d+) name=\S+ .*logical=(\d+)x(\d+)\+(-?\d+)\+(-?\d+)")
+    removed = re.compile(r"output (\d+) removed ")
+    rects = {}
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = pattern.search(line)
+                if m:
+                    rects[int(m.group(1))] = tuple(int(m.group(i)) for i in range(2, 6))
+                    continue
+                m = removed.search(line)
+                if m:
+                    rects.pop(int(m.group(1)), None)
+    except OSError as e:
+        sys.exit(f"inject-input: cannot read {path}: {e}")
+    if not rects:
+        sys.exit(f"inject-input: no 'output N name=… logical=WxH+X+Y' line in {path} yet")
+    x0 = min(r[2] for r in rects.values())
+    y0 = min(r[3] for r in rects.values())
+    x1 = max(r[2] + r[0] for r in rects.values())
+    y1 = max(r[3] + r[1] for r in rects.values())
+    return (x1 - x0, y1 - y0), (x0, y0)
 
 
 def key_code(text):
@@ -419,6 +456,8 @@ def main():
     g = p.add_mutually_exclusive_group()
     g.add_argument("--output", type=parse_size, help="output size WxH in pixels")
     g.add_argument("--compositor-log", help="read the size from 'output 0 mode=WxH' in this log")
+    g.add_argument("--layout", help="read every output from this compositor log: positions "
+                                    "are layout coordinates over the outputs' bounding box")
     p.add_argument("--tag", default="", help="label copied into every record")
     sub = p.add_subparsers(dest="cmd", required=True)
 
@@ -468,9 +507,12 @@ def main():
         return
 
     output = a.output
+    origin = (0, 0)
     if output is None and a.compositor_log:
         output = output_from_log(a.compositor_log)
-    inj = Injector(a.pointer, a.keyboard, output, a.tag)
+    if output is None and a.layout:
+        output, origin = layout_from_log(a.layout)
+    inj = Injector(a.pointer, a.keyboard, output, a.tag, origin)
     completed = False
     try:
         if a.cmd == "move":

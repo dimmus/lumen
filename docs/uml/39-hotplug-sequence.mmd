@@ -1,0 +1,44 @@
+sequenceDiagram
+    participant K as kernel (drm, udev)
+    participant UI as compositor UI (hotplug_controller, output_policy, wire)
+    participant W as worker
+    participant RT as render thread
+    participant C as clients
+
+    K->>UI: uevent change HOTPLUG=1 [CONNECTOR=id] (udev netlink, BPF-filtered to drm)
+    UI->>UI: drain: fold the burst into one batch (hints deduplicated)
+    alt VT away
+        UI->>UI: owed to the resume (only the master's probe is forced)
+    else a probe in flight
+        UI->>UI: merged into the next probe
+    else
+        UI->>W: probe(hint)
+        W->>K: drmModeGetConnector (forced probe: modes, EDID, link-status, suggested X/Y)
+        W-->>UI: event_loop::post: scan ready
+    end
+    UI->>UI: diff_scan: removed, changed, added (identical: nothing at all)
+    opt removed
+        UI->>UI: evacuate windows (home kept), layer surfaces closed, pointer re-clamped
+        UI->>C: wl_surface.leave, then wl_registry.global_remove (destroyed 5 s later)
+        UI->>RT: output_op retire (UI has let go of the pipeline)
+        RT->>K: after the last flip: CRTC off, connector unrouted, planes detached
+        RT-->>UI: retired: pipeline destroyed on UI, slot free again
+    end
+    opt changed: new preferred mode (VM window resize)
+        UI->>RT: output_op test_mode (candidates)
+        RT->>K: TEST_ONLY with a real framebuffer of the new size (staged)
+        RT-->>UI: tested ok (mode i)
+        UI->>RT: output_op switch_mode (from frame F)
+        UI->>C: wl_output.mode/geometry, xdg_output size, done; layers, maximized windows re-fit
+        UI->>RT: frame F published at the new size
+        RT->>RT: take the staged targets, composite F
+        RT->>K: ALLOW_MODESET with frame F (old targets kept until its flip)
+    end
+    opt added
+        UI->>RT: output_op add (connector, candidate modes)
+        RT->>K: targets, free CRTC + planes (assign_crtcs), TEST_ONLY
+        RT-->>UI: added (pipeline, mode i)
+        UI->>C: wl_registry.global wl_output; others' new positions; windows whose home it is return
+        UI->>RT: first frame published
+        RT->>K: ALLOW_MODESET of the new pipeline with its first frame
+    end

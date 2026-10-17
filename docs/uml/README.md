@@ -59,6 +59,8 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [36-gpu-memory-budget.mmd](36-gpu-memory-budget.mmd) | Activity | Per-client GPU import limits |
 | [37-overflow-policies.mmd](37-overflow-policies.mmd) | Activity | Fixed-cap overflow behavior |
 | [38-health-evaluation.mmd](38-health-evaluation.mmd) | Activity | Health sample → report |
+| [39-hotplug-sequence.mmd](39-hotplug-sequence.mmd) | Sequence | Hotplug: uevent → worker probe → diff → output ops (add, test/switch mode, retire) → clients (ADR 008 Part B) |
+| [40-output-config-sequence.mmd](40-output-config-sequence.mmd) | Sequence | Output configuration: a wlr-output-management apply/test → protocol checks → whole-configuration TEST_ONLY → switch → combined modeset → succeeded/failed (revert) → outputs.toml on the worker |
 
 **Narrative architecture doc:** [../architecture.md](../architecture.md)
 

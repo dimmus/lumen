@@ -2245,8 +2245,10 @@ int main() {
         check("dnd: the origin client gets wl_pointer.leave when its drag starts",
               up && left_origin, "origin events: " + joined(a.events));
         check("dnd: target gets enter, motion, drop, leave; offer source_actions and action",
-              in_order(b.events, {"source_actions:3", "enter", "offer-action:2", "motion",
-                                  "drop", "leave"}) &&
+              // The action follows the target's own accept/set_actions, so it may land on
+              // either side of the first motion; the protocol orders neither.
+              in_order(b.events, {"source_actions:3", "enter", "offer-action:2", "drop", "leave"}) &&
+                  in_order(b.events, {"enter", "motion", "drop"}) &&
                   std::count(b.events.begin(), b.events.end(), "drop") == 1,
               "target events: " + joined(b.events));
         check("dnd: source gets target, action move, drop_performed, send, finished",

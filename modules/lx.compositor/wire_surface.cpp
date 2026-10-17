@@ -1503,15 +1503,41 @@ void bind_compositor(wayland::client_connection& client, unsigned id, int versio
     res.set_implementation(&compositor_impl, g_p0_ctx, nullptr);
 }
 
-bool surface_visible(lx::surface_id surface, unsigned frame) {
+bool surface_visible(lx::surface_id surface, unsigned frame, unsigned slot) {
     if (!g_p0_ctx || !g_p0_ctx->surfaces)
         return false;
     const lx::scene::surface_node* n = g_p0_ctx->surfaces->node(surface);
-    return n && n->visible_in(frame);
+    return n && n->visible_in(frame, slot);
 }
 
-void fire_frames(unsigned frame_time_ms, bool throttle, unsigned visible_frame,
-                 unsigned long long now_ns) {
+std::uint32_t surface_shown_mask(lx::surface_id surface) {
+    if (!g_p0_ctx || !g_p0_ctx->surfaces)
+        return 0;
+    const lx::scene::surface_node* n = g_p0_ctx->surfaces->node(surface);
+    if (!n)
+        return 0;
+    std::uint32_t mask = 0;
+    for (unsigned v = 0; v < 16; ++v)
+        if ((g_p0_ctx->published_mask & (1u << v)) && n->visible_in(g_p0_ctx->published_frame[v], v))
+            mask |= 1u << v;
+    return mask;
+}
+
+int surface_pace_output(lx::surface_id surface) {
+    const std::uint32_t shown = surface_shown_mask(surface);
+    if (shown == 0 || !g_p0_ctx || !g_p0_ctx->outputs)
+        return -1;
+    if ((shown & (shown - 1)) == 0) {
+        // Shown on one output: that one (the common case, no rect needed).
+        for (unsigned v = 0; v < 16; ++v)
+            if (shown & (1u << v))
+                return static_cast<int>(v);
+    }
+    const lx::rect2i rect = g_p0_ctx->tree ? g_p0_ctx->tree->node_rect(surface) : lx::rect2i{};
+    return lx::compositor::pace_output(*g_p0_ctx->outputs, shown, rect);
+}
+
+void fire_frames(unsigned frame_time_ms, bool throttle, unsigned slot, unsigned long long now_ns) {
     if (g_pending_frame_count == 0)
         return;
     if (now_ns == 0) {
@@ -1521,6 +1547,7 @@ void fire_frames(unsigned frame_time_ms, bool throttle, unsigned visible_frame,
                  static_cast<unsigned long long>(ts.tv_nsec);
     }
     unsigned kept = 0;
+    unsigned throttled = 0;
     const unsigned count = g_pending_frame_count;
     for (unsigned i = 0; i < count; ++i) {
         const pending_frame e = g_pending_frames[i];
@@ -1530,18 +1557,29 @@ void fire_frames(unsigned frame_time_ms, bool throttle, unsigned visible_frame,
         if (!e.resource)
             continue;
         surface_obj* s = surface_by_id(e.surface);
-        bool answer = !throttle || !s || s->role == surface_role::cursor ||
-                      surface_visible(e.surface, visible_frame);
+        bool answer = !throttle || !s || s->role == surface_role::cursor;
+        bool paced_elsewhere = false;
+        if (!answer) {
+            // Paced by one output (M8): answered by that output's flip only; a surface on no
+            // output falls to the throttle below.
+            const int pace = surface_pace_output(e.surface);
+            if (pace >= 0) {
+                answer = slot == k_any_output || static_cast<unsigned>(pace) == slot;
+                paced_elsewhere = !answer;
+            }
+        }
         // Not on screen: answered once its surface's throttle interval has passed. A
         // surface answered earlier in this same pass counts as due (`frame_done_ns == now`),
         // so all of one surface's callbacks go together.
-        if (!answer)
+        if (!answer && !paced_elsewhere)
             answer = s->frame_done_ns == 0 || s->frame_done_ns == now_ns ||
                      now_ns - s->frame_done_ns >= k_frame_throttle_ns;
         if (!answer) {
             pending_frame& k = g_pending_frames[kept++];
             k = e;
-            k.throttled = true;
+            k.throttled = !paced_elsewhere;
+            if (k.throttled)
+                ++throttled;
             continue;
         }
         if (s)
@@ -1550,10 +1588,25 @@ void fire_frames(unsigned frame_time_ms, bool throttle, unsigned visible_frame,
         wl_resource_destroy(e.resource);
     }
     g_pending_frame_count = kept;
-    g_throttled_frame_count = kept;
+    g_throttled_frame_count = throttled;
 }
 
 bool frames_pending() { return g_pending_frame_count > g_throttled_frame_count; }
+
+std::uint32_t frames_pending_outputs() {
+    std::uint32_t mask = 0;
+    for (unsigned i = 0; i < g_pending_frame_count; ++i) {
+        const pending_frame& e = g_pending_frames[i];
+        if (!e.resource || e.throttled)
+            continue;
+        const surface_obj* s = surface_by_id(e.surface);
+        const int pace = s && s->role != surface_role::cursor ? surface_pace_output(e.surface) : -1;
+        if (pace < 0)
+            return ~0u; // answered by whichever output ticks first
+        mask |= 1u << static_cast<unsigned>(pace);
+    }
+    return mask;
+}
 
 bool frames_throttled() { return g_throttled_frame_count > 0; }
 

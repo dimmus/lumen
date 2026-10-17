@@ -71,19 +71,14 @@ struct counters {
 };
 counters g_counts{};
 
+/// The output whose flip is presenting feedback right now (set around `on_flip`): the
+/// `sync_output` of what it presents.
+int g_flip_output = -1;
+
 #if defined(LUMEN_HAS_PRESENTATION)
 
 void send_sync_output(wl_resource* output, void* feedback) {
     wp_presentation_feedback_send_sync_output(static_cast<wl_resource*>(feedback), output);
-}
-
-/// The output presentation is synchronized to: output 0's slot (the scene is built for it
-/// alone until multi-output, D5), -1 without outputs.
-[[nodiscard]] int primary_slot() {
-    auto* om = g_p0_ctx ? g_p0_ctx->outputs : nullptr;
-    if (!om || om->count() == 0)
-        return -1;
-    return om->slot_of(om->nth(0));
 }
 
 void sink_presented(void*, void* resource, lx::surface_id, const present_info& info) {
@@ -93,8 +88,9 @@ void sink_presented(void*, void* resource, lx::surface_id, const present_info& i
     // finds the slot already free).
     if (client_dying(client))
         return;
-    if (const int slot = primary_slot(); slot >= 0)
-        for_each_output_resource(client, static_cast<unsigned>(slot), &send_sync_output, r);
+    // sync_output: the output whose flip presented it — the surface's pace output (M8).
+    if (g_flip_output >= 0)
+        for_each_output_resource(client, static_cast<unsigned>(g_flip_output), &send_sync_output, r);
     const unsigned long long sec = info.timestamp_ns / 1'000'000'000ull;
     const auto nsec = static_cast<std::uint32_t>(info.timestamp_ns % 1'000'000'000ull);
     wp_presentation_feedback_send_presented(
@@ -231,43 +227,63 @@ void presentation_drop_cached(surface_obj* s) {
 
 #endif // LUMEN_HAS_WAYLAND
 
-void lx::compositor::presentation_published(p0_protocol_context& ctx, unsigned frame) {
+void lx::compositor::presentation_published(p0_protocol_context& ctx, unsigned frame,
+                                            unsigned slot) {
 #if defined(LUMEN_HAS_WAYLAND)
     if (!ctx.presentation)
         return;
     ctx.presentation->on_publish(
-        frame,
-        [](void*, lx::surface_id surface, unsigned f) { return p0::surface_visible(surface, f); },
-        nullptr);
+        frame, slot,
+        [](void*, lx::surface_id surface, unsigned f, unsigned output) {
+            return p0::surface_visible(surface, f, output);
+        },
+        [](void*, lx::surface_id surface) { return p0::surface_pace_output(surface); }, nullptr);
 #else
     (void)ctx;
     (void)frame;
+    (void)slot;
 #endif
 }
 
-void lx::compositor::presentation_flipped(p0_protocol_context& ctx, unsigned frame,
+void lx::compositor::presentation_flipped(p0_protocol_context& ctx, unsigned frame, unsigned slot,
                                           const present_info& info) {
 #if defined(LUMEN_HAS_WAYLAND)
     if (!ctx.presentation)
         return;
-    ctx.presentation->on_flip(frame, info, p0::sink());
+    p0::g_flip_output = static_cast<int>(slot);
+    ctx.presentation->on_flip(frame, slot, info, p0::sink());
+    p0::g_flip_output = -1;
     if (p0::g_counts.presented + p0::g_counts.discarded == 0)
         return;
     if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        char line[192];
+        char line[200];
         std::snprintf(line, sizeof(line),
-                      "flip frame=%u t=%llu.%09llu seq=%llu refresh_ns=%u flags=0x%x presented=%u "
-                      "discarded=%u",
+                      "flip frame=%u t=%llu.%09llu seq=%llu refresh_ns=%u flags=0x%x "
+                      "presented=%u discarded=%u output=%u",
                       frame, info.timestamp_ns / 1'000'000'000ull,
                       info.timestamp_ns % 1'000'000'000ull, info.seq, info.refresh_ns, info.flags,
-                      p0::g_counts.presented, p0::g_counts.discarded);
+                      p0::g_counts.presented, p0::g_counts.discarded, slot);
         lx::trace::logger::global().log(lx::trace::level::debug, "compositor.presentation", line);
     }
     p0::g_counts = {};
 #else
     (void)ctx;
     (void)frame;
+    (void)slot;
     (void)info;
+#endif
+}
+
+void lx::compositor::presentation_discard_output(p0_protocol_context& ctx, unsigned slot) {
+#if defined(LUMEN_HAS_WAYLAND)
+    if (!ctx.presentation)
+        return;
+    ctx.presentation->discard_output(
+        slot, [](void*, lx::surface_id surface) { return p0::surface_pace_output(surface); },
+        nullptr, p0::sink());
+#else
+    (void)ctx;
+    (void)slot;
 #endif
 }
 

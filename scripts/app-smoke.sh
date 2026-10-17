@@ -4220,7 +4220,9 @@ if s is not None:
     ok = kinds[:3] == ["idled", "resumed", "idled"] and bool(moves)
     if ok:
         first, resumed, again = ev[0], ev[1], ev[2]
-        ok = (1.45 <= first[1] <= 1.9 and moves[0] <= resumed[2] <= moves[0] + 0.3 and
+        # The probe prints milliseconds (%.3f, rounded) and the injector microseconds: a
+        # resume within the same millisecond as the motion can read up to 0.5 ms "early".
+        ok = (1.45 <= first[1] <= 1.9 and moves[0] - 0.001 <= resumed[2] <= moves[0] + 0.3 and
               1.45 <= again[2] - resumed[2] <= 1.9)
     record("K1 idled after the timeout, resumed by input, idled again", ok,
            f"events {[(k, round(t, 3)) for k, t, _ in ev]}; injected motion at "

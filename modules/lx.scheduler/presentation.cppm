@@ -41,8 +41,8 @@ class presentation_tracker {
 public:
     void set_handler(presentation_handler handler, void* user_data = nullptr);
 
-    /// Wire from lx::drm::kms_atomic_commit page-flip handler.
-    void bind_page_flip(lx::drm::kms_atomic_commit& atomic_commit);
+    /// Wire from one pipeline's page-flip handler (one tracker per output).
+    void bind_page_flip(lx::drm::kms_pipeline& pipeline);
 
     /// Called when wp_presentation.feedback or DRM page-flip event arrives.
     void on_feedback(presentation_feedback feedback);
@@ -77,8 +77,8 @@ void lx::scheduler::presentation_tracker::set_handler(presentation_handler handl
     user_data_ = user_data;
 }
 
-void lx::scheduler::presentation_tracker::bind_page_flip(lx::drm::kms_atomic_commit& atomic) {
-    atomic.set_page_flip_handler(&presentation_tracker::page_flip_bridge, this);
+void lx::scheduler::presentation_tracker::bind_page_flip(lx::drm::kms_pipeline& pipeline) {
+    pipeline.set_page_flip_handler(&presentation_tracker::page_flip_bridge, this);
 }
 
 void lx::scheduler::presentation_tracker::page_flip_bridge(lx::drm::page_flip_event event,

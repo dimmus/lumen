@@ -116,7 +116,7 @@ Runs **three logical threads** (see [threading.md](subsystems/threading.md)):
 |--------|----------|------|
 | Main | `ui` | Event loop, vsync timer, `tick_ui()`, Wayland dispatch |
 | Render | `render` | `tick_render()`, snapshot acquire, Vulkan record |
-| Worker | `worker` | Executor drain — layout assist, I/O |
+| Worker | `worker` | Executor drain — layout assist, I/O, the hotplug connector probe |
 
 ### 2.2 Shell process
 
@@ -347,12 +347,13 @@ flowchart LR
 | `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state, geometry, focus) on `zlm_policy_bridge_v1`; receives WM requests |
 | `lx.compositor.cursor` | Pointer image and position (grab override → frame hover → client → default). Hardware cursor plane (`lx.drm:cursor`) by default: pointer motion is a plane update on the next atomic commit — or a cursor-only commit when nothing else changed — and never a composite. Software fallback is a node in the scene's overlay layer, damaged old+new. Images from the Xcursor theme (`lx.compositor.xcursor`) with a compiled-in vector set, `wp_cursor_shape_v1` and `wl_pointer.set_cursor` |
 | `lx.compositor.output` | The outputs, in **stable slots** (an output keeps its slot while its connector stays connected): geometry, refresh, name (the kernel's connector name, "Virtual-1"), physical size, scale, transform, present mode, KMS damage flags, and a `generation` that moves only when something a client sees changed. Without a connected connector there is one virtual output, HEADLESS-1 (1920x1080 at 60 Hz). Pure membership helpers: the outputs a rect is on (one bit per slot), the primary output (largest overlap), the preferred buffer scale (ceiling of the largest) and transform. UI affinity |
+| `lx.compositor.output_management` / `.output_config_store` / `.toml_lite` | wlr-output-management's wire-free model (heads, mode identity, every configuration error, validation into a target, the job queue), the persisted `outputs.toml` model (per monitor, per setup) and its file (debounced atomic saves on the worker), and the strict TOML subset they are written in. Pure apart from the file; UI affinity |
 | `lx.compositor.liveness` | xdg_wm_base.ping/pong liveness, Wayland-free: pings on activation, delivered button and key presses, the configure watchdog and every 10 s to the focused client — one outstanding per client, at least 2 s apart; a ping unanswered past the timeout (`--ping-timeout`, 5 s) marks the client not responding until it answers. Never kills. O(1) per tick unless a deadline passed. UI affinity |
 | `lx.compositor.input_router` | Seat event delivery to the focused client's resources (enter/leave pairing, held keys, frames) and the per-client **input serial log**: the serials of input and focus events each client was sent, as compressed ranges — what `set_selection` and xdg-activation tokens quote is checked against it. The focus-client hook runs between a focus change's `leave`s and `enter`s; the user-input hook after a delivered key or button press (liveness pings on it). Pointer motion to a client that is not responding is withheld (keys, buttons and enter/leave are not). UI affinity |
 | `lx.compositor.activation` | xdg-activation's focus-stealing-prevention policy, Wayland-free: `decide_grantable` (at token commit) and `decide_activation` (at `activate`, and again at map for a window that asked before mapping) — pure functions over what the wire and the window manager gather; the token table (64 fixed slots, 128-bit random text from `getrandom`, single use, 30 s lifetime, constant-time lookup, eviction of expired then oldest). UI affinity |
 | `lx.compositor.data_transfer` | Wayland-free data-transfer pieces: `mime_list` (a source's offered types, inline, never allocating) and drag-and-drop action negotiation (`negotiate_dnd_action`, the modifier-chosen user action) |
 | `lx.compositor.dnd` | The drag-and-drop grab, Wayland-free: a third pointer mode beside the implicit grab and move/resize, driven by the window manager's pointer path (hit test, button mask, Escape, modifiers) and calling the wire through `dnd_ops` (focus, motion, drop, cancel, user action). Owns the drag icon's placement (a `dnd_icon` surface-tree root in its own scene layer, moved once per tick with the pointer) and the pointer shape that shows the negotiated action. No allocation per motion. UI affinity |
-| `lx.compositor.wire` (internal) | The libwayland glue, one translation unit per protocol area: `wire_surface.cpp` (wl_compositor, wl_surface, wl_region, frame callbacks, the commit), `wire_subsurface.cpp`, `wire_buffer.cpp` (wl_buffer tracking, shm staging, texture retirement), `wire_xdg_shell.cpp` (xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, the window manager's wire ops), `wire_xdg_popup.cpp`, `wire_decoration.cpp`, `wire_layer_shell.cpp`, `wire_dmabuf.cpp`, `wire_seat.cpp`, `wire_cursor_shape.cpp`, `wire_shell.cpp` (zlm_shell_v1, policy bridge), `wire_output.cpp` (wl_output, xdg-output, wl_surface.enter/leave and the preferred buffer scale/transform), `wire_selection.cpp` (the selection model both selection families share), `wire_data_device.cpp` (wl_data_*), `wire_primary_selection.cpp` (zwp_primary_selection_*_v1), `wire_dnd.cpp` (start_drag, drag offers and action negotiation), `wire_activation.cpp` (xdg_activation_v1: token builders, the grant decision at commit, `activate`), `wire_idle.cpp` (ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1), `wire_output_power.cpp` (zwlr_output_power_manager_v1), `wire_session_lock.cpp` (ext_session_lock_manager_v1, lock objects, lock surfaces), `wire_text_input.cpp` (zwp_text_input_manager_v3, text inputs and the events the relay sends them), `wire_input_method.cpp` (zwp_input_method_manager_v2, input-method popups and keyboard grabs, zwp_virtual_keyboard_manager_v1, the relay's installation), and `wire_install.cpp` (every global, in registry order, and the `:protocols_p0` entry points). The implementation partition `:wire` (`wire.cppm`, not exported) holds the wire object records and what more than one unit uses; everything else stays in each unit's anonymous namespace. The Wayland-free state stays in the partitions above. UI affinity |
+| `lx.compositor.wire` (internal) | The libwayland glue, one translation unit per protocol area: `wire_surface.cpp` (wl_compositor, wl_surface, wl_region, frame callbacks, the commit), `wire_subsurface.cpp`, `wire_buffer.cpp` (wl_buffer tracking, shm staging, texture retirement), `wire_xdg_shell.cpp` (xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, the window manager's wire ops), `wire_xdg_popup.cpp`, `wire_decoration.cpp`, `wire_layer_shell.cpp`, `wire_dmabuf.cpp`, `wire_seat.cpp`, `wire_cursor_shape.cpp`, `wire_shell.cpp` (zlm_shell_v1, policy bridge), `wire_output.cpp` (wl_output, xdg-output, wl_surface.enter/leave and the preferred buffer scale/transform), `wire_selection.cpp` (the selection model both selection families share), `wire_data_device.cpp` (wl_data_*), `wire_primary_selection.cpp` (zwp_primary_selection_*_v1), `wire_dnd.cpp` (start_drag, drag offers and action negotiation), `wire_activation.cpp` (xdg_activation_v1: token builders, the grant decision at commit, `activate`), `wire_idle.cpp` (ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1), `wire_output_power.cpp` (zwlr_output_power_manager_v1), `wire_output_management.cpp` (zwlr_output_manager_v1: heads, modes, configurations), `wire_session_lock.cpp` (ext_session_lock_manager_v1, lock objects, lock surfaces), `wire_text_input.cpp` (zwp_text_input_manager_v3, text inputs and the events the relay sends them), `wire_input_method.cpp` (zwp_input_method_manager_v2, input-method popups and keyboard grabs, zwp_virtual_keyboard_manager_v1, the relay's installation), and `wire_install.cpp` (every global, in registry order, and the `:protocols_p0` entry points). The implementation partition `:wire` (`wire.cppm`, not exported) holds the wire object records and what more than one unit uses; everything else stays in each unit's anonymous namespace. The Wayland-free state stays in the partitions above. UI affinity |
 | `lx.scene` | Scene graph (layers bottom→top: layer-shell background and bottom, windows — per-window tree containers —, layer-shell top and overlay, popups, drag icon, session-lock surfaces, cursor), a clear colour per snapshot (the lock's solid colour), multi-rect damage (`gfx::damage_region`), a per-node tint (the not-responding dim), `build_draw_list_into` |
 | `lx.scene.snapshot` | Triple-buffered handoff (v2: index swap, back-pressure policy) |
 | `lx.gfx` | Vulkan device, swapchain, dmabuf import, render pass |
@@ -362,7 +363,7 @@ flowchart LR
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
 | `lx.runtime.memory` | Per-subsystem arenas, pressure coordinator, overflow policies |
 | `lx.input` + `seat_manager` | libinput → pointer/keyboard events (ms wire time plus µs CLOCK_MONOTONIC time for latency) → `lx.compositor.wm` decides focus |
-| `lx.drm` + `lx.drm.atomic` | Connectors, modes, atomic commit, KMS damage blobs, dumb scanout buffers |
+| `lx.drm` + `lx.drm.atomic` | Connector probe (`connector_scan`, EDID identity via `:edid`; a worker may run it), CRTC/plane allocation (`:crtc_alloc`, pure, TEST_ONLY-checked), one `kms_pipeline` per CRTC (atomic page flips, KMS damage blobs, power-off), combined multi-output `commit_modeset` (TEST_ONLY of another mode, disabling a removed output, VRR_ENABLED), per-device flip-event routing, dumb scanout buffers, the udev hotplug monitor (`:uevent`), CVT custom modes (`:modes`) |
 | `lx.scheduler.presentation` | Page-flip bridge: flip time, vblank sequence, the commit's frame tag |
 | `lx.compositor.presentation_feedback` | wp_presentation bookkeeping: sampled → flipped → presented / discarded |
 | `lx.compositor.idle` | ext-idle-notify notifications (lazy single timer, real input only) and idle-inhibitor objects, Wayland-free. UI affinity |
@@ -599,22 +600,62 @@ lifetime rules (destructor hooks, inert offers, the per-client cap) hold for dra
   drag-only event go to version 3+ sources only: for older ones the spec allows `cancelled`
   on replacement alone.
 
-### Outputs and output membership
+### Outputs, layout and hotplug
 
-`output_manager` keeps each output in a stable slot (a surface's output set is a bit mask by
-slot) and names it after its connector, as wlroots, Mutter and KWin do (`Virtual-1` on
-vmwgfx, `DP-1`, `HDMI-A-2`); without a connected connector the virtual HEADLESS-1 stands in,
-so headless and nested sessions have an output clients can see. `tick_ui` compares the
-manager's `generation` (the hotplug poll refreshes every tick, so values are compared, not
-"refreshed"): on a change every bound `wl_output` is sent geometry, mode, scale and `done`
-(each `zxdg_output_v1` its logical rect first), and every surface's membership is
-recomputed.
+Several monitors, each composited and flipped on its own (ADR 008, Part 1), plugged in,
+unplugged and resized while Lumen runs (Part 2), configured by clients (wlr-randr, kanshi)
+and remembered across sessions (Part 3, below). One
+`output_manager` (UI affinity) holds up to 16 outputs in stable **slots** (a surface's
+output set is a bit mask by slot); an `output_id` is never reused, a slot is.
 
+- **Discovery.** `kms_device::probe_connectors` reads every connected desktop
+  connector into a plain `connector_scan` (modes with their 68-byte mode blobs, physical
+  size, subpixel, `possible_crtcs`, the CRTC routed to it now, `hotplug_mode_update` and
+  `suggested X/Y`, and the EDID identity — make, model, serial — through libdisplay-info
+  when present, a base-block parser otherwise). `output_manager::configure_from_scan` turns
+  it into outputs. An output is named after its connector (`Virtual-1`, `DP-1`), described
+  as "make model serial (NAME)", and carries an **identifier** "make model serial" (or
+  `connector:NAME` without an EDID; a duplicate gets ` connector:NAME` appended) for the
+  persistence of later phases. Without a display: one virtual HEADLESS-1, or the outputs
+  `--virtual-outputs WxH[@S],…` asks for (no card is opened then). The probe runs at start
+  and again at every hotplug and every VT resume (below).
+- **Layout** (logical px, integer origins). Auto placement puts each output to the right
+  of the rightmost one, top-aligned, by logical width (`wlr_output_layout_add_auto`);
+  explicitly placed outputs stay where they are. On connectors with `hotplug_mode_update`
+  (VMs) the kernel's `suggested X/Y` is used, as Mutter does, unless it overlaps. A gap
+  between outputs is allowed (a scaled VM monitor at its host position).
+- **Scale per output**: `--output-scale NAME=S` over `--scale`, else sway's rule (2 on a
+  panel above 192 DPI with at least 1200 rows, else 1) — never a guessed fractional one.
+- **One `wl_output` global per output** (`server::add_global_ex` with the output's id as
+  user data). A withdrawn global is removed from the registry and destroyed 5 s later
+  (`collect_globals`, wlroots' delay); binds of a gone output get an inert resource. Each
+  bound object hears only its own output's changes: `tick_ui` compares the manager's
+  `generation` and sends geometry, mode, scale, name, description and `done` (each
+  `zxdg_output_v1` its logical rect first) to the objects of the outputs that changed.
+- **Pointer** moves over the union of the output rects (`closest_point`: a move into a gap
+  or past an edge lands on the nearest point of the nearest output), absolute devices map
+  to the layout's bounding box; the pointer starts on the leftmost, topmost output.
+- **Windows.** A new toplevel maps on its parent's output, else the pointer's (sway).
+  Maximize fills the usable area of the window's output (largest overlap); a move is
+  constrained by the usable area of the output the pointer is on; popups by their root's
+  output. `xdg_toplevel.set_fullscreen(output)` (and zlm `request_fullscreen`) covers that
+  output, or the window's own, in a fullscreen layer between top and overlay with a black
+  backdrop; unfullscreen restores the previous rect (and maximized state). Server-side
+  frames are drawn at the window's output scale.
+- **Layer shell per output**: a layer surface lives on the output it asked for (else the
+  pointer's), is arranged against that output's rect, and its exclusive zones reduce that
+  output's usable area only. lumen-shell runs one panel per `wl_output`, each listing the
+  windows on its output (`task_output`: largest overlap); the launcher opens on the focused
+  window's output.
+- **Pace output** (M8, wlroots' scene `primary_output`): a surface shown on several outputs
+  is paced by the one it overlaps most (an output with 10 % of its area or less counts only
+  when it is the only one). Its frame callbacks and presentation feedback follow that
+  output's flips; `sync_output` names that output.
 - **Membership from node rects** (wlroots' scene does the same). `surface_tree` reports every
   change of a node's global rect — created, moved, resized, dropped — through one hook, at
   the three places it sets them; `wire_output.cpp` turns the rect into a slot mask and sends
   `wl_surface.enter` / `leave` for the difference to every `wl_output` the surface's client
-  bound for that output. Toplevels, subsurfaces, popups, layer surfaces and the drag icon
+  bound for that output (each output has its own global). Toplevels, subsurfaces, popups, layer surfaces and the drag icon
   are all tree nodes; unmapping sends `leave` (wlroots, Mutter). A cursor surface follows
   the pointer's output through the cursor manager's surface hook. A `wl_output` bound after
   mapping replays the enters it missed (wlroots); clients often bind outputs lazily.
@@ -631,11 +672,110 @@ recomputed.
   for all.
 - **xdg-output** v3: logical position and size (the mode divided by the scale), name and
   description, closed by `wl_output.done` (v3) or `zxdg_output_v1.done` (v1–2), in wlroots'
-  order. `wl_output` v4 carries the same name; make is "Lumen", model the output name, the
-  refresh the mode's.
-- **Several outputs (D5).** The single `wl_output` global stands for the first output today;
-  masks are per slot and enter/leave per resource already, so D5 adds a global per output
-  and the leave for an output's bit before its global goes.
+  order. `wl_output` v4 carries the same name; make and model are the EDID's ("Lumen" and
+  the output name without one), the refresh the mode's.
+
+**Hotplug** (ADR 008 Part B, H1–H5). Event-driven, zero work while nothing changes:
+
+- **Monitor** (`lx.drm:uevent`): a libudev monitor on the "udev" netlink group, filtered in
+  the kernel to drm minors, is a source on the UI loop (`hotplug_controller`). Only
+  `change` with HOTPLUG=1 of our card starts a probe (a CONNECTOR= hint narrows it to that
+  connector; vmwgfx's layout update names none); `remove` of the card ends every output
+  (the session goes on with HEADLESS-1). Without libudev, or when udev refuses, connectors
+  are probed again only at VT resume.
+- **Probe** on the worker, on the master fd (only the master's probe is a forced one — the
+  kernel answers anyone else from its cache), into the worker's own scan; one in flight,
+  what arrives meanwhile merged into one more. While the VT is away nothing is probed; the
+  uevents are owed to the resume, which probes everything and waits for it (≤ 250 ms)
+  before its modeset — a monitor plugged or a VM window resized while away is lit at its
+  new mode on return.
+- **Diff and policy** (`:output_policy`, pure): removed (disconnected, gone, or another
+  monitor on the connector), changed (preferred mode, mode list, Bad link-status, the
+  host's suggested position), added; an identical scan is nothing — no generation, no client
+  event, no render work. An output follows its connector's preferred mode (H3): the
+  VMware window resize is a new preferred mode, so the output is re-modeset to it; an
+  explicit mode (wlr-output-management, `outputs.toml`) is kept while offered, a custom
+  one always. Bad link-status retrains with a modeset of the same mode.
+- **Plans** (UI → render → UI, `output_op`): an added output's pipeline is made by render
+  (targets at the mode, a free CRTC and planes, a TEST_ONLY of it with its real first
+  framebuffer; refused, the next mode in sway's order) and only then does the output exist
+  for clients. A mode change is TEST_ONLY'd with a framebuffer of the new size before the
+  output switches; render takes the new targets right before compositing the first frame
+  of the new size and modesets with it, the other outputs flipping on. A removed output's
+  CRTC is turned off once its last flip drained; its slot is reused only after that.
+- **`wl_output` lifecycle** (H4): the global is created once the output is complete, after
+  which the outputs-changed pass sends the others' new positions; a removal recomputes
+  membership first (`leave` on objects that still stand for it), then removes the global
+  (destroyed 5 s later), its objects go inert, its `zwlr_output_power_v1` objects `failed`,
+  its lock surfaces are dropped, its layer surfaces `closed` (sway). A bind racing the
+  removal gets an inert object. The last output going is replaced by HEADLESS-1 *before*
+  its global goes, so clients always see one; a real one plugged in later replaces it.
+- **Migration** (H5): windows whose output goes move to the output under the pointer (else
+  the first in layout order), keeping their relative position in its usable area (shrunk
+  with a configure when they do not fit); maximized and fullscreen ones are configured
+  for it. Each remembers its home (the output's identifier and its rect there) and goes
+  back when that output returns — unless the user moved or resized it meanwhile (KWin,
+  Mutter). The pointer on a removed output moves to the fallback's middle; any layout
+  change re-clamps it with a synthesized motion.
+- **With power and lock**: a monitor plugged in while every other output is off stays off
+  until the next input wakes them all (Mutter); otherwise it comes up lit. While locked the
+  new output's first frame is the lock colour (the scene's layers are hidden) until the
+  locker's surface for it maps, and `locking` waits for it too (M14).
+
+### Output configuration
+
+`zwlr_output_manager_v1` v4 (ADR 008 Part C, C1–C8) and `outputs.toml`. The model —
+heads, mode identity, every protocol error, validation, the job queue — is
+`lx.compositor:output_management` (pure, `test_output_management`); the wire is
+`wire_output_management.cpp`; what an apply does is `compositor_impl`'s.
+
+- **Heads**: one per connected monitor, enabled or not (a disabled one keeps its last
+  explicit position and mode, as wlroots keeps head state), and per virtual output. A
+  monitor being plugged in appears once its output is live. Modes are identified by
+  (size, refresh, preferred); a custom mode in use is one more mode object. Heads are
+  rebuilt and diffed after anything about outputs or connectors moved, once per loop
+  iteration: only what changed is sent, then `done` with a new serial — nothing at all when
+  nothing changed.
+- **Errors**: all of the protocol's, `already_set` and `unconfigured_head` included; at
+  apply/test `already_used` first, then the serial (stale → `cancelled`), then
+  `unconfigured_head`. A finished mode used in a configuration of the current serial is
+  `invalid_mode`; with a stale serial the apply is just `cancelled`.
+- **Jobs**: one at a time, four waiting (more: `cancelled`); a job waits while an output is
+  being added or retired. Validation (every head disabled, a custom mode outside
+  1..16384, a scale above 10, adaptive sync without `vrr_capable`, more enabled heads than
+  CRTCs → `failed`), then a whole-configuration TEST_ONLY on render — new modes with real
+  framebuffers (kept for the switch), disables, and newly enabled outputs through the CRTC
+  allocator with the same test. `test` ends there (wlr-randr `--dryrun` really asks the
+  kernel). Restating the current state is `succeeded` with nothing done (kanshi at login).
+- **Apply**: enables, then per output mode (switched at the first frame of the new size),
+  adaptive sync, transform, scale and position, then disables; position and scale need no
+  modeset. A restated position or mode keeps an automatic output automatic and a following
+  one following its preferred mode (wlr-randr restates everything). The answer waits for
+  each changed output's modeset (a ticket render reports from the combined modeset, ≤ 3 s;
+  a dark or VT-paused output does not hold it up); a refused one reverts the whole state and
+  answers `failed`. Heads and `done` go out before `succeeded`.
+- **Custom modes**: CVT 2.0 timings (`lx.drm:modes`: reduced blanking v2 on digital
+  connectors, standard on analog; libdisplay-info's `di_cvt_compute` when built with it).
+- **Transform**: see *Coordinate spaces*; the logical rect of a 90°/270° output swaps width
+  and height, `preferred_buffer_transform` follows the primary output.
+- **Adaptive sync**: `VRR_ENABLED` is part of every modeset of the pipeline; a VRR output's
+  frame clock starts repaints on demand, no sooner than one refresh period after the last
+  flip (niri). vmwgfx has no `vrr_capable`: there it is always disabled.
+- **Persistence** (`lx.compositor:output_config_store`, `:toml_lite`):
+  `$XDG_CONFIG_HOME/lumen/outputs.toml` (`LUMEN_OUTPUT_CONFIG=PATH` for another file, `0` for
+  none; `--virtual-outputs` reads it only when that names one). `[[output]]` per monitor
+  identifier: mode (absent: preferred), scale, transform, adaptive sync — only what differs
+  from the defaults; `[[setup]]` per set of connected monitors: enabled and position. A VM's
+  monitor stores neither mode nor position (Mutter). Written 2 s after a client's apply, on
+  the worker (write, fsync, rename; flushed at exit). Read at start: the outputs come up in
+  it with their first modeset (a persisted mode that fails its test falls back to the
+  preferred one). Whenever the set of connected monitors changes, its setup decides which
+  are enabled and where (an unknown set: everything enabled, placed outputs stay). A file
+  that does not parse is logged with its line and renamed `.bad` at the next save.
+- **kanshi** is a layer on top: its profile applies on hotplug through the protocol; after
+  a restart Lumen has restored the same state, so kanshi's apply changes nothing.
+- **Cursor themes** for a scale no theme was loaded for are loaded when that scale appears
+  (four at most; the nearest serves beyond).
 
 ### Coordinate spaces and output scale
 
@@ -658,30 +798,48 @@ Four spaces, and the conversions between them live in exactly two places (ADR 00
   `invalid_scale`, `invalid_transform`, `invalid_offset` (v5 attach), `invalid_size` (not for
   cursor or role-less surfaces, wlroots' exemption), and all of `wp_viewport`'s
   (`bad_value`, `bad_size`, `out_of_buffer`, `no_surface`) and `wp_viewporter`'s.
-- **The output projection** (`scene::output_projection`, origin + scale) is applied only
-  when the scene emits draw commands and converts damage; the render thread sees output
+- **The output projection** (`scene::output_projection`, origin + scale + transform) is
+  applied only when the scene emits draw commands and converts damage; the render thread sees output
   pixels and float source boxes and is unchanged by scale. Node edges are rounded relative to
   the window's root origin (`project_node`: `R = round((root − origin)·s)`, each edge `R +
   round(Δ·s)`, wlroots' `scale_box`), so a fractional-scale client that renders
   `round(w·s)` pixels is drawn 1:1 — pixel-exact — and a window's surfaces and server-side
   frame tile without seams. Damage is floored/ceiled and widened by a pixel at a
   non-integer scale, plus half a source texel for resampled content.
-- **Output scale**: `--scale` (`config::output_scale`), rounded to n/120. An output's logical
-  rect is its mode divided by its scale (rounded, wlroots' effective resolution);
-  `output_manager::logical_rect` and `mode_rect` keep the two meanings apart (the window
-  manager, layer shell, popups and input use the first, scanout, KMS and the cursor plane
-  the second). The pointer moves in logical units; absolute devices span the logical rect.
+- **One view per output** (`scene_graph::set_output_view(slot, {logical rect,
+  projection})`): each output's view has its own pending damage, snapshot buffer and
+  visibility pass. Damage in layout coordinates fans out to every view whose rect it
+  touches, projected per view and clipped to that view's pixels (a rect at a neighbour's
+  edge does not make an output repaint); a view's draw list holds only draws that reach its
+  pixels. A surface node remembers the newest frame it was shown in per view.
+- **Output transform** (`wl_output.transform`): an output's pixels hold its content turned
+  the way a buffer with that buffer transform holds its surface (90° is counter-clockwise),
+  so a client rendering with the output's transform could be scanned out as it is. Emitters
+  draw in the untransformed content space (the mode with width and height swapped for
+  90°/270°); the view turns every draw once after emission — its rect and clip
+  (`gfx::transform_rect`) and its buffer transform (`gfx::compose_output_transform`:
+  `R_buffer ∘ R_output⁻¹`) — and `project_damage` turns damage, so occlusion and KMS damage
+  stay axis-aligned rects in output pixels and no renderer changed. The cursor plane gets
+  its image and hotspot turned per output when they are staged.
+- **Output scale**, per output: `--output-scale NAME=S`, `--scale` for the rest
+  (`config::output_scale`, 0 = sway's HiDPI rule), rounded to n/120. An output's logical
+  rect is its mode divided by its scale (rounded, wlroots' effective resolution) at its
+  layout position; `output_state::logical_rect` and `mode_rect` keep the two meanings apart
+  (the window manager, layer shell, popups and input use the first, scanout, KMS and the
+  cursor plane the second). The pointer moves in logical units over the union of the
+  outputs; absolute devices span the layout's bounding box.
 - **Renderers** sample the source box through an affine basis (origin, +x, +y) built from
   the eight buffer transforms (`gfx::source_basis_for`, shared by GL, Vulkan and CPU): crop,
   scale and transform are one draw. GL takes the basis as uniforms with `highp` UVs; a 1:1
   draw on whole pixels samples texel centres, so linear filtering is exact. The CPU backend
   keeps the row-copy fast path for identity draws and inverse-maps everything else (nearest
   for integer magnification, bilinear otherwise).
-- **Compositor-drawn pixels follow the scale**: xcursor themes load at `round(24·s)`,
-  client cursor images are resampled once per change to their logical size in output
-  pixels, server-side titles are rasterized at `10 pt · s` and drawn 1:1, and lumen-shell
-  renders its panel and launcher through `wp_fractional_scale_v1` + `wp_viewporter` like any
-  client.
+- **Compositor-drawn pixels follow the scale** of the output they are drawn on: xcursor
+  themes load at `round(24·s)` once per distinct output scale (up to four) and the cursor
+  image matching each output is used there, client cursor images are kept as sent and
+  resampled per scale, server-side titles are rasterized at `10 pt · s` of the window's
+  output and drawn 1:1, and lumen-shell renders each panel and the launcher through
+  `wp_fractional_scale_v1` + `wp_viewporter` like any client.
 
 ### Presentation feedback and the visibility pass
 
@@ -711,13 +869,18 @@ affinity except the tag the render thread carries:
   only when the driver timestamps vblanks (`drmCrtcGetSequence` is not EOPNOTSUPP — vmwgfx
   has no vblank counter: seq 0, flags 0x5); a blocking modeset's software-timed completion
   is `vsync` only; headless publishes count as presented with no flags. Never `zero_copy`
-  (no direct scanout yet). `sync_output` names every wl_output the client bound for output 0.
+  (no direct scanout yet). Everything is per output: a feedback is sampled by the publish
+  of its surface's pace output and presented by that output's flip; `sync_output` names
+  every wl_output the client bound for it.
 
 **Frame-callback throttling** reuses the pass: callbacks of surfaces on screen in the last
-published frame are answered at the flip as before; the others (covered, off the output,
-unmapped) at most once per 995 ms (niri's throttle), and they do not keep the frame clock
-running — the 1 s housekeeping timer answers them while it is stopped. Cursor surfaces
-always count as on screen. The paused tick still answers everything.
+published frame of their pace output are answered **at that output's flip event** (not at
+its next tick: a client then has the whole period before the next repaint starts, as with
+wlroots' frame event); an output with nothing in flight answers them at its tick. The
+others (covered, off every output, unmapped) at most once per 995 ms (niri's throttle), and
+they do not keep a frame clock running — the 1 s housekeeping timer answers them while
+every clock is stopped. Cursor surfaces always count as on screen. The paused tick still
+answers everything.
 
 ### Idle, inhibition and display power
 
@@ -746,8 +909,10 @@ screen never blanks (as in sway, niri, Weston). lumen-shell is the default polic
   after each publish, only while an inhibitor exists. Becoming inhibited never resumes an
   idle notification (the protocol: "isn't honored if the system was already idled"; wlroots
   resumes instead); when inhibition ends, obeying timers restart from that moment.
-- **Display power** (`:display_power`, `zwlr_output_power_manager_v1`, I4): *off* is the
-  kernel's atomic DPMS off — CRTC `ACTIVE=0` with `MODE_ID` and routing kept, the cursor
+- **Display power** (`:display_power`, `zwlr_output_power_manager_v1`, I4), **per output**
+  (one machine per slot; a dark output's clock stops and its bit is in the power gate,
+  the others keep running; the paused tick takes over only when every output is dark):
+  *off* is the kernel's atomic DPMS off — CRTC `ACTIVE=0` with `MODE_ID` and routing kept, the cursor
   plane off — as one **blocking** `ALLOW_MODESET` commit by the render thread (the only
   committer), after any queued flip has landed. A driver that refuses it is asked again
   with the primary plane detached; refused again, a black frame is committed instead
@@ -784,7 +949,8 @@ guarantee is the compositor's. `:session_lock` holds the state; the compositor a
   layer is hidden, the lock surfaces' trees (in `lock_layer_`, above the drag icon, under
   the cursor) and a clear colour (black) are what is drawn, toplevels get `suspended`, and
   the frame the next snapshot will be is noted. `locked` is sent when a **content flip of
-  that frame or a later one** completes (the flip handler; the publish without KMS) — or at
+  that frame or a later one** has completed on **every live output** that is not dark
+  (`lock_frame_tracker`: the flip handler of each output; the publish without KMS) — or at
   once when nothing of the session can be on screen: the VT is away, the output is powered
   off or blanked black, or nothing of ours was ever committed (`display_dark`). sway sends
   `locked` immediately, which the spec forbids. `SetLockedHint(true)` goes to logind with it.
@@ -954,8 +1120,13 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
   the CRTC disabled, and everything a previous master may have left (gamma/degamma/CTM,
   VRR, link-status, Colorspace, HDR_OUTPUT_METADATA, max bpc, Broadcast RGB, plane rotation,
   alpha, blend mode, zpos) back at the driver's initial value. The result returns to the
-  state machine: a refused mode (EINVAL, e.g. a
-  resized VM window) keeps the display off until the next switch back.
+  state machine: a refused mode keeps the display off until the next switch back. The
+  resume probes the connectors first (≤ 250 ms, see Outputs, layout and hotplug), so a VM
+  window resized or a monitor swapped while away is modeset at what is connected now.
+- **Several outputs.** The resume procedure runs per pipeline (each with its own
+  generation), the first commits after it are one combined modeset of every lit output, and
+  the state machine gets one result: the worst over the outputs (one refused modeset is a
+  refused resume).
 
 ### Key bindings
 
@@ -1190,10 +1361,21 @@ The flip handler only ever runs on the UI thread: a failed commit is reported by
 value, and a blocking modeset's completion is posted to UI. Details:
 [threading.md](subsystems/threading.md) § Session pause and resume.
 
-Presentation timing: the frame clock is phase-locked to DRM page flips
-(`lx.scheduler.presentation`), and each flip event carries the frame index render tagged its
-commit with, so the UI resolves `wp_presentation` feedback against exactly the frame that
-reached the screen (§4 Presentation feedback).
+Presentation timing: each output has its own frame clock phase-locked to its CRTC's page
+flips (`lx.scheduler:repaint` `frame_clocks`: one shared timer armed at the earliest start,
+outputs due within 1 ms served by one tick, each clock stopped by its own quiet ticks), and
+each flip event carries the frame index render tagged its commit with, so the UI resolves
+`wp_presentation` feedback against exactly the frame that reached that screen (§4
+Presentation feedback).
+
+**Several outputs.** `tick_ui` publishes, per due output with damage, that output's view
+into its own snapshot buffer (`commit_frame(slot, frame)`) and sets its bit in
+`render_mask_`. The render thread composites each published view into its output's targets
+and commits each output's frame with its own nonblocking page flip (`kms_pipeline`, one per
+CRTC); a modeset of several outputs is one combined `ALLOW_MODESET` commit
+(`commit_modeset`). Flip events are read once per device (`kms_device::dispatch_events`)
+and routed by CRTC. Client buffers are released at the **low-water mark** — the oldest
+frame any live output may still sample.
 
 ---
 
@@ -1205,7 +1387,7 @@ into `lx.wayland.protocols.*` modules.
 | Priority | Protocols | Consumer |
 |----------|-----------|----------|
 | **P0** | `wayland`, `xdg-shell`, `linux-dmabuf`, `linux-drm-syncobj`, `xdg-output`, output-management | Compositor boot |
-| **P1** | `presentation-time`, `xdg-decoration`, `viewporter`, `fractional-scale-v1`, `ext-idle-notify-v1`, `idle-inhibit-unstable-v1`, `wlr-output-power-management-unstable-v1`, `ext-session-lock-v1` and `text-input-unstable-v3` (generated with P0), `input-method-unstable-v2` and `virtual-keyboard-unstable-v1` (wlroots' `protocol/`), … | Frame timing, decorations, scaling, idle, display power, screen locking, input methods |
+| **P1** | `presentation-time`, `xdg-decoration`, `viewporter`, `fractional-scale-v1`, `ext-idle-notify-v1`, `idle-inhibit-unstable-v1`, `wlr-output-power-management-unstable-v1`, `wlr-output-management-unstable-v1` (v4: wlr-randr, kanshi), `ext-session-lock-v1` and `text-input-unstable-v3` (generated with P0), `input-method-unstable-v2` and `virtual-keyboard-unstable-v1` (wlroots' `protocol/`), … | Frame timing, decorations, scaling, idle, display power, output configuration, screen locking, input methods |
 | **Private** | `zlm_shell_v1` (+ bridge, workspace, layer, rules) | Shell only |
 
 ```mermaid
@@ -1294,6 +1476,15 @@ Window rules (`zlm_window_rules_v1`) load from `$XDG_CONFIG_HOME/lumen/window-ru
 Key grabs (`zlm_shell_v1.grab_key`, v4) exist only on the privileged global: an application
 cannot take keys from other clients.
 
+**Output configuration and sandboxes (ADR 008, C5).** `zwlr_output_manager_v1` is not
+privileged: any session-UID client may bind it (wlr-randr from a terminal, kanshi as a user
+service), as in sway and niri. Sandboxed clients do not see it: `lx.wayland.server`
+installs a global filter (`wl_display_set_global_filter`) that hides every global marked
+`deny_sandboxed` from a client whose `/proc/<pid>/root/.flatpak-info` exists (checked once
+per client, cached on its `client_connection`); a bind by name is refused by libwayland as
+an invalid global. Marked: output management, output power, idle notification, session
+lock, layer shell, input method and virtual keyboard.
+
 **Exposure of the everyday globals (ADR 007, X1).** `ext_idle_notifier_v1`,
 `zwp_idle_inhibit_manager_v1`, `zwlr_output_power_manager_v1` and
 `ext_session_lock_manager_v1` are public to every session-UID client, as in sway and niri:
@@ -1305,7 +1496,7 @@ typed while a text input it serves is active (T2), and a virtual keyboard never 
 compositor bindings or counts as activity. When sandboxing arrives
 (`wp_security_context_v1`), sandboxed clients lose idle notification, output power, session
 lock, input method and virtual keyboard (`zwp_text_input_manager_v3` stays public); the list
-is recorded so that change is mechanical. The lock itself does not trust its client: a
+is recorded so that change is mechanical — Flatpak clients already lose them (above). The lock itself does not trust its client: a
 locker that dies leaves the session locked, and only another locker or logind's
 polkit-gated `Unlock` can end it.
 
@@ -1401,6 +1592,7 @@ returning `not_implemented` until P0 lands.
 | Key bindings, shell key grabs (zlm v4) | Done — Super tap (launcher), Super+Return (terminal) |
 | Launcher, detached app launching | Done — XDG desktop entries, systemd transient services, activation tokens |
 | DRM page-flip vsync | P1 — timer stub today |
+| Multiple monitors, hotplug (ADR 008 Parts 1–2) | Done — per-CRTC flips, udev hotplug with worker probe, mode follow (VM resize), migration and return, resume probe (monitor-smoke) |
 | Fractional output scale, wp_viewporter, wp_fractional_scale_v1 | Done — `--scale`, pixel-exact 1:1 draws (scale-smoke), every protocol error |
 | wp_presentation, occlusion culling, frame-callback throttling | Done — kernel flip time and MSC per commit, discarded when superseded/unmapped/stopped (app-smoke P) |
 | ext_idle_notifier_v1, idle inhibitors, display power | Done — lazy idle timer, visibility-gated inhibitors, atomic ACTIVE=0 with wake on input; lumen-shell blanks after 600 s (app-smoke K) |

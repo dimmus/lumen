@@ -83,11 +83,32 @@ outlives both — with its output in the journal:
 
 `lumen-compositor` options: `[socket-name]`, `-f FPS` (frame clock without a display mode),
 `--decorations=server|client`, `--shell PATH`, `--scale S` — the output scale, fractional
-allowed (`1.25`, `1.5`, `2`; rounded to n/120, the unit `wp_fractional_scale_v1` speaks),
-and `--ping-timeout MS` — how long a client may leave an `xdg_wm_base.ping` unanswered
-before it is shown as not responding (title suffix, dimmed window, the shell's flag; it is
-never killed). Default 5000 (Mutter's); 0 disables pinging. `run-desktop.sh --scale S`
-passes the scale on.
+allowed (`1.25`, `1.5`, `2`; rounded to n/120, the unit `wp_fractional_scale_v1` speaks;
+default: 2 on a HiDPI panel, else 1), `--output-scale NAME=S` — one output's scale
+(repeatable, e.g. `--output-scale DP-2=1.5`), `--virtual-outputs WxH[@S],…` — virtual
+outputs instead of the display (tests; no card is opened), and `--ping-timeout MS` — how
+long a client may leave an `xdg_wm_base.ping` unanswered before it is shown as not
+responding (title suffix, dimmed window, the shell's flag; it is never killed). Default
+5000 (Mutter's); 0 disables pinging. `run-desktop.sh --scale S` passes the scale on.
+
+Every connected monitor is used (ADR 008): each is composited and flipped on its own, laid
+out left to right (a VM host's arrangement on VMware/virtio), with its own `wl_output`,
+scale, panel and frame clock. New windows open on the monitor under the pointer. Monitors
+may come and go while Lumen runs (udev hotplug): a new one is lit and laid out, a resized VM
+window re-modesets its monitor, an unplugged one's windows move to another and come back
+when it returns — also across VT switches, display power-off and the session lock.
+`scripts/monitor-smoke.sh --join-seat-session` checks all of this on a VMware guest, whose
+virtual monitors `build/release/lumen-vmw-layout` (a test tool) adds, resizes and removes.
+
+Monitors are configured with any `wlr-output-management` client — `wlr-randr` (mode, custom
+mode, position, scale, transform, adaptive sync, on/off; `--dryrun` asks the kernel without
+changing anything) or `kanshi` (profiles per set of monitors, applied on hotplug); any
+same-user client that is not a Flatpak may. What a client applies is remembered in
+`$XDG_CONFIG_HOME/lumen/outputs.toml` — per monitor (mode, scale, transform, adaptive sync)
+and per set of monitors connected together (enabled, position) — and restored at the next
+start and whenever that set is connected again, before the first modeset. The file can be
+edited while Lumen is not running; `LUMEN_OUTPUT_CONFIG=PATH` uses another one,
+`LUMEN_OUTPUT_CONFIG=0` none.
 
 At a fractional scale, clients that speak `wp_fractional_scale_v1` + `wp_viewporter`
 (foot, GTK 4, Qt 6, Chromium, Firefox, lumen-shell) render at the output's pixel density

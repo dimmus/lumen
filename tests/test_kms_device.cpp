@@ -91,8 +91,69 @@ int check_neutral_values() {
 }
 } // namespace
 
+// Probing needs a KMS fd: anything else is a typed error, never an empty success.
+int check_probe_errors() {
+    lx::drm::kms_device none{};
+    lx::drm::connector_scan scan{};
+    auto probed = none.probe_connectors(0, scan);
+    if (probed) {
+        std::fprintf(stderr, "FAIL: probe_connectors on a device that was never opened\n");
+        return 1;
+    }
+    if (probed.get_error().domain != lx::error_domain::drm &&
+        probed.get_error().domain != lx::error_domain::not_implemented) {
+        std::fprintf(stderr, "FAIL: probe error domain %d\n",
+                     static_cast<int>(probed.get_error().domain));
+        return 1;
+    }
+    if (none.connector_count() != 0 || none.last_scan().count != 0) {
+        std::fprintf(stderr, "FAIL: an unopened device reports connectors\n");
+        return 1;
+    }
+    std::printf("probe without a device: typed error ok\n");
+    return 0;
+}
+
+// Flip-event routing through a cookie several commits share (the device's two combined
+// cookies, reused round-robin): each commit arms its pipelines' bits, each event consumes
+// its own; a later commit on the same cookie never takes an earlier one's event.
+int check_flip_cookie() {
+    int failures = 0;
+    const auto expect = [&](bool ok, const char* what) {
+        if (!ok) {
+            std::fprintf(stderr, "FAIL: %s\n", what);
+            ++failures;
+        }
+    };
+    lx::drm::flip_cookie c0{};
+    lx::drm::flip_cookie c1{};
+    // Three separate modesets within one flip latency: A on cookie 0, B on 1, C on 0.
+    c0.arm(0, 0);
+    c1.arm(1, 0);
+    c0.arm(2, 0);
+    expect(c0.take(0, 0), "A's event after C reused its cookie is still A's");
+    expect(c1.take(1, 0), "B's event");
+    expect(c0.take(2, 0), "C's event");
+    expect(!c0.take(0, 0), "an event is consumed once");
+    // A resume moved A's generation: the old commit's event is dropped (and consumed).
+    c0.arm(0, 3);
+    expect(!c0.take(0, 4), "an event from before a resume is dropped");
+    expect(!c0.take(0, 4), "and does not linger");
+    // A refused commit owes no event.
+    c1.arm(5, 0);
+    c1.arm(6, 0);
+    c1.disarm((1u << 5) | (1u << 6));
+    expect(!c1.take(5, 0) && !c1.take(6, 0), "a refused commit's bits are disarmed");
+    expect(!c1.take(lx::drm::k_max_pipelines, 0), "an unregistered pipeline is never owed one");
+    return failures;
+}
+
 int main() {
+    if (check_flip_cookie() != 0)
+        return 1;
     if (check_neutral_values() != 0)
+        return 1;
+    if (check_probe_errors() != 0)
         return 1;
     auto opened = lx::drm::kms_device::open("/dev/dri/card0");
     if (!opened) {
@@ -114,7 +175,7 @@ int main() {
     std::printf("kms: card_fd=%d connectors=%u\n", dev.card_fd(), n);
     for (unsigned i = 0; i < n; ++i) {
         const auto c = dev.connector(i);
-        auto mode = dev.active_mode(i);
+        auto mode = dev.preferred_mode(i);
         std::printf("  connector[%u] id=%u status=%d", i, c.id, static_cast<int>(c.status));
         if (mode)
             std::printf(" mode=%ux%u", mode.value().width, mode.value().height);
@@ -125,8 +186,12 @@ int main() {
     if (render)
         std::printf("render node fd=%d\n", render.value().get());
 
+    std::printf("kms: crtcs=%u planes=%u stale_crtcs=0x%x\n", dev.crtc_count(), dev.plane_count(),
+                dev.stale_crtc_mask());
+
     // Atomic commit without FB must fail loudly (not synthesize success).
-    lx::drm::kms_atomic_commit atomic{dev};
+    const auto desc = dev.pipeline_desc_for(0);
+    lx::drm::kms_pipeline atomic{dev, desc ? desc.value() : lx::drm::kms_pipeline_desc{}};
     lx::drm::atomic_commit_request req{};
     req.request_page_flip = true;
     auto committed = atomic.commit(req);
@@ -135,5 +200,24 @@ int main() {
         return 1;
     }
     std::printf("atomic commit without FB correctly failed\n");
+
+    // A combined modeset is validated before anything reaches the kernel: no entries, a
+    // null pipeline, or an enabled entry without a mode or framebuffer are typed errors.
+    if (lx::drm::commit_modeset(dev, nullptr, 0, true)) {
+        std::fprintf(stderr, "FAIL: commit_modeset with no entries should not succeed\n");
+        return 1;
+    }
+    lx::drm::modeset_entry null_entry{};
+    if (lx::drm::commit_modeset(dev, &null_entry, 1, true)) {
+        std::fprintf(stderr, "FAIL: commit_modeset with a null pipeline should not succeed\n");
+        return 1;
+    }
+    lx::drm::modeset_entry no_fb{};
+    no_fb.pipe = &atomic;
+    if (lx::drm::commit_modeset(dev, &no_fb, 1, true)) {
+        std::fprintf(stderr, "FAIL: commit_modeset without a mode/framebuffer should not succeed\n");
+        return 1;
+    }
+    std::printf("commit_modeset argument validation ok\n");
     return 0;
 }

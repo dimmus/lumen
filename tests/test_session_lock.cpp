@@ -265,4 +265,27 @@ LUMEN_TEST(lock_decided_while_suspended_replaces_the_resume_focus) {
     LUMEN_CHECK(router.keyboard_focus() == nullptr && router.chosen_keyboard_focus() == nullptr);
 }
 
+LUMEN_TEST(lock_frame_tracker_waits_for_every_live_output) {
+    lx::compositor::lock_frame_tracker t{};
+    t.begin();
+    // Three outputs live; output 2 is powered off (dark): it never flips, so it does not
+    // hold the lock back — it shows nothing, and wakes into the locked scene.
+    LUMEN_CHECK(!t.complete(0b111, 0b100));
+    t.shown(0);
+    LUMEN_CHECK(!t.complete(0b111, 0b100));
+    t.shown(1);
+    LUMEN_CHECK(t.complete(0b111, 0b100) && t.shown_mask() == 0b011);
+    // An output that went away mid-wait leaves the live mask: the others complete it.
+    t.begin();
+    t.shown(0);
+    LUMEN_CHECK(t.complete(0b001, 0));
+    // No live output at all (every one unplugged): nothing to wait for.
+    t.begin();
+    LUMEN_CHECK(t.complete(0, 0));
+    // A new lock starts over.
+    t.shown(5);
+    t.begin();
+    LUMEN_CHECK(t.shown_mask() == 0 && !t.complete(0b100000, 0));
+}
+
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

@@ -104,6 +104,9 @@ struct layer_record {
     void* surface_res = nullptr;
     void* layer_res = nullptr;
     unsigned version = 1;
+    /// The output it belongs to (slot), resolved at creation: the one given, else the one
+    /// under the pointer (ADR 008 M12). Arranged against that output only.
+    unsigned output = 0;
     char name_space[64]{};
     /// Requests edit `pending`; a commit copies it to `current`.
     layer_props pending{};
@@ -150,10 +153,11 @@ struct layer_ops {
 
 /// What the layer shell needs from the window manager (which sits above it).
 struct layer_host {
-    /// Output 0's geometry — what layer surfaces are arranged against.
-    lx::rect2i (*output_area)(void* user) = nullptr;
-    /// The usable area (output minus exclusive zones) changed.
-    void (*usable_changed)(void* user, lx::rect2i usable) = nullptr;
+    /// Output `slot`'s logical rect — what its layer surfaces are arranged against; empty
+    /// when the output is gone.
+    lx::rect2i (*output_area)(void* user, unsigned slot) = nullptr;
+    /// Output `slot`'s usable area (its rect minus its exclusive zones) changed.
+    void (*usable_changed)(void* user, unsigned slot, lx::rect2i usable) = nullptr;
     /// A layer surface mapped, unmapped or changed its keyboard interactivity.
     void (*focus_changed)(void* user) = nullptr;
     /// A layer surface just mapped (called before `focus_changed`): where a surface that
@@ -192,10 +196,12 @@ public:
 
     enum class create_error : unsigned char { none, no_memory };
     /// zwlr_layer_shell_v1.get_layer_surface, after the protocol layer validated the role,
-    /// the buffer and the layer. Makes the surface a layer root.
+    /// the buffer and the layer, and resolved the output (`output`, a slot). Makes the
+    /// surface a layer root.
     [[nodiscard]] create_error create(lx::surface_id surface, lx::client_id client,
                                       void* client_native, void* surface_res, void* layer_res,
-                                      unsigned version, unsigned layer, const char* name_space);
+                                      unsigned version, unsigned layer, const char* name_space,
+                                      unsigned output = 0);
     [[nodiscard]] layer_record* find(lx::surface_id surface);
     [[nodiscard]] const layer_record* find(lx::surface_id surface) const;
     /// Content committed to the surface is imported and drawn (until closed).
@@ -212,13 +218,27 @@ public:
     /// Any of the surface's objects is going away. Idempotent.
     void destroy(lx::surface_id surface);
 
-    /// Re-arranges every layer surface against the output (an output mode change). The
-    /// commit path arranges by itself.
-    void arrange() { arrange_all(lx::surface_id{}); }
-    /// Output minus exclusive zones, from the last arrangement.
-    [[nodiscard]] lx::rect2i usable() const { return usable_; }
-    /// An arrangement has run (before that, `usable` means nothing).
-    [[nodiscard]] bool arranged() const { return arranged_; }
+    /// Re-arranges every output's layer surfaces against it (the layout changed). The
+    /// commit path arranges the committing surface's output by itself.
+    void arrange();
+    /// Re-arranges output `slot`'s layer surfaces.
+    void arrange_output(unsigned slot) { arrange_all(slot, lx::surface_id{}); }
+    /// Output `slot` minus its exclusive zones, from its last arrangement.
+    [[nodiscard]] lx::rect2i usable(unsigned slot) const {
+        return slot < k_max_outputs ? usable_[slot] : lx::rect2i{};
+    }
+    /// An arrangement of output `slot` has run (before that, `usable` means nothing).
+    [[nodiscard]] bool arranged(unsigned slot) const {
+        return slot < k_max_outputs && arranged_[slot];
+    }
+    /// The output (slot) a layer surface belongs to, -1 for none.
+    [[nodiscard]] int output_of(lx::surface_id surface) const;
+    /// Output `slot` went away: its layer surfaces are sent `closed` and unmapped (sway);
+    /// the records stay until the client destroys them, and their zones go with them.
+    void close_output(unsigned slot);
+    /// Sends `closed` to one layer surface (created for an output that is already gone).
+    void close_surface(lx::surface_id surface);
+    static constexpr unsigned k_max_outputs = 16;
 
     /// The surface that takes the keyboard from everything but its own popups: the topmost
     /// mapped surface with `exclusive` interactivity on the top or overlay layer (overlay
@@ -243,7 +263,9 @@ public:
 
 private:
     [[nodiscard]] int slot_of(lx::surface_id surface) const { return index_.find(surface.id()); }
-    void arrange_all(lx::surface_id committing);
+    /// Arranges output `output`'s surfaces (`committing`: the surface whose own commit
+    /// places it).
+    void arrange_all(unsigned output, lx::surface_id committing);
     void send_configure(layer_record& r, lx::size2i size);
     void map(layer_record& r);
     void unmap(layer_record& r, const char* reason);
@@ -267,8 +289,8 @@ private:
     unsigned mapped_[k_layer_levels][k_max]{};
     unsigned mapped_count_[k_layer_levels]{};
     unsigned mapped_total_ = 0;
-    lx::rect2i usable_{};
-    bool arranged_ = false;
+    lx::rect2i usable_[k_max_outputs]{};
+    bool arranged_[k_max_outputs]{};
     unsigned long long next_seq_ = 1;
 };
 
@@ -498,7 +520,8 @@ bool lx::compositor::layer_shell::drawable(lx::surface_id surface) const {
 lx::compositor::layer_shell::create_error
 lx::compositor::layer_shell::create(lx::surface_id surface, lx::client_id client,
                                     void* client_native, void* surface_res, void* layer_res,
-                                    unsigned version, unsigned layer, const char* name_space) {
+                                    unsigned version, unsigned layer, const char* name_space,
+                                    unsigned output) {
     if (find(surface) || all_count_ >= k_max)
         return create_error::no_memory;
     for (unsigned i = 0; i < k_max; ++i) {
@@ -516,6 +539,7 @@ lx::compositor::layer_shell::create(lx::surface_id surface, lx::client_id client
         r.surface_res = surface_res;
         r.layer_res = layer_res;
         r.version = version;
+        r.output = output < k_max_outputs ? output : 0;
         r.pending.layer = layer;
         r.current.layer = layer;
         std::snprintf(r.name_space, sizeof(r.name_space), "%s", name_space ? name_space : "");
@@ -525,8 +549,8 @@ lx::compositor::layer_shell::create(lx::surface_id surface, lx::client_id client
         if (layer_debug()) {
             char line[192];
             std::snprintf(line, sizeof(line),
-                          "layer create surface=%llu layer=%s namespace=%s output=0",
-                          surface.id(), level_name(layer), r.name_space);
+                          "layer create surface=%llu layer=%s namespace=%s output=%u",
+                          surface.id(), level_name(layer), r.name_space, r.output);
             log_line(line);
         }
         return create_error::none;
@@ -620,9 +644,40 @@ void lx::compositor::layer_shell::mapped_remove(unsigned level, unsigned slot) {
     }
 }
 
-void lx::compositor::layer_shell::arrange_all(lx::surface_id committing) {
-    const lx::rect2i full =
-        host_.output_area ? host_.output_area(host_.user) : lx::rect2i{0, 0, 1920, 1080};
+void lx::compositor::layer_shell::arrange() {
+    for (unsigned o = 0; o < k_max_outputs; ++o) {
+        const lx::rect2i area = host_.output_area ? host_.output_area(host_.user, o) : lx::rect2i{};
+        if (area.width > 0 && area.height > 0)
+            arrange_all(o, lx::surface_id{});
+        else
+            arranged_[o] = false;
+    }
+}
+
+int lx::compositor::layer_shell::output_of(lx::surface_id surface) const {
+    const layer_record* r = find(surface);
+    return r ? static_cast<int>(r->output) : -1;
+}
+
+void lx::compositor::layer_shell::close_output(unsigned slot) {
+    for (unsigned i = 0; i < all_count_; ++i) {
+        layer_record& r = records_[all_[i]];
+        if (r.used && r.output == slot && !r.closed)
+            close(r, "output-removed");
+    }
+    arranged_[slot < k_max_outputs ? slot : 0] = false;
+}
+
+void lx::compositor::layer_shell::close_surface(lx::surface_id surface) {
+    if (layer_record* r = find(surface))
+        close(*r, "output-gone");
+}
+
+void lx::compositor::layer_shell::arrange_all(unsigned output, lx::surface_id committing) {
+    if (output >= k_max_outputs)
+        return;
+    const lx::rect2i full = host_.output_area ? host_.output_area(host_.user, output)
+                                              : lx::rect2i{0, 0, 1920, 1080};
     lx::rect2i usable = full;
     unsigned n = 0;
     // Bounded: a round that closes surfaces runs once more without them.
@@ -634,7 +689,7 @@ void lx::compositor::layer_shell::arrange_all(lx::surface_id committing) {
         for (unsigned lv = k_layer_levels; lv-- > 0;) {
             for (unsigned i = 0; i < all_count_; ++i) {
                 layer_record& r = records_[all_[i]];
-                if (!r.used || r.current.layer != lv)
+                if (!r.used || r.current.layer != lv || r.output != output)
                     continue;
                 in[n] = {&r.current, r.committed, r.mapped, r.initial_commit_seen && !r.closed};
                 slots[n++] = all_[i];
@@ -685,15 +740,15 @@ void lx::compositor::layer_shell::arrange_all(lx::surface_id committing) {
     }
     if (layer_debug()) {
         char line[160];
-        std::snprintf(line, sizeof(line), "layer arrange output=0 usable=%d,%d,%dx%d surfaces=%u",
-                      usable.x, usable.y, usable.width, usable.height, n);
+        std::snprintf(line, sizeof(line), "layer arrange output=%u usable=%d,%d,%dx%d surfaces=%u",
+                      output, usable.x, usable.y, usable.width, usable.height, n);
         log_line(line);
     }
-    if (!arranged_ || !same_rect(usable, usable_)) {
-        arranged_ = true;
-        usable_ = usable;
+    if (!arranged_[output] || !same_rect(usable, usable_[output])) {
+        arranged_[output] = true;
+        usable_[output] = usable;
         if (host_.usable_changed)
-            host_.usable_changed(host_.user, usable_);
+            host_.usable_changed(host_.user, output, usable_[output]);
     }
 }
 
@@ -707,12 +762,12 @@ void lx::compositor::layer_shell::map(layer_record& r) {
     r.mapped_layer = level;
     // Placed first (the tree only records the origin while unmapped), so mapping creates
     // every node where it belongs; the arrangement also counts the zone now that it maps.
-    arrange_all(r.surface);
+    arrange_all(r.output, r.surface);
     if (!tree_->map_root(r.surface, *layer, ~0u)) {
         r.mapped = false;
         lx::trace::logger::global().log(lx::trace::level::warn, k_layer_category,
                                         "layer map failed: layer container full");
-        arrange_all(lx::surface_id{});
+        arrange_all(r.output, lx::surface_id{});
         return;
     }
     mapped_add(level, static_cast<unsigned>(slot));
@@ -795,7 +850,7 @@ void lx::compositor::layer_shell::on_commit(lx::surface_id surface,
         // The initial commit (no buffer: the commit rules rejected one) gets the first
         // configure, sent in the same dispatch by the arrangement.
         r->initial_commit_seen = true;
-        arrange_all(surface);
+        arrange_all(r->output, surface);
         return;
     }
     if (!r->mapped) {
@@ -803,14 +858,14 @@ void lx::compositor::layer_shell::on_commit(lx::surface_id surface,
             r->committed = info.size;
             map(*r);
         } else if (props_changed) {
-            arrange_all(surface); // not mapped yet: a new size or anchor gets a new configure
+            arrange_all(r->output, surface); // not mapped yet: a new size or anchor gets a new configure
         }
         return;
     }
     if (!info.has_buffer) {
         unmap(*r, "null-buffer");
         reset_after_unmap(*r);
-        arrange_all(lx::surface_id{});
+        arrange_all(r->output, lx::surface_id{});
         return;
     }
     // set_layer: the tree moves to the other layer's container, on top there.
@@ -829,7 +884,7 @@ void lx::compositor::layer_shell::on_commit(lx::surface_id surface,
         info.size.width != r->committed.width || info.size.height != r->committed.height;
     r->committed = info.size;
     if (props_changed || resized)
-        arrange_all(surface);
+        arrange_all(r->output, surface);
     // Exclusive keyboard focus depends on the layer too (top/overlay take it, bottom and
     // background behave as on_demand), so a layer move re-resolves focus like an
     // interactivity change does.
@@ -842,6 +897,7 @@ void lx::compositor::layer_shell::destroy(lx::surface_id surface) {
     if (!r)
         return;
     const bool participated = r->initial_commit_seen && !r->closed;
+    const unsigned output = r->output;
     if (r->mapped)
         unmap(*r, "destroyed");
     else if (host_.surface_unmapped)
@@ -859,7 +915,7 @@ void lx::compositor::layer_shell::destroy(lx::surface_id surface) {
     *r = {};
     // Its exclusive zone goes with it.
     if (participated)
-        arrange_all(lx::surface_id{});
+        arrange_all(output, lx::surface_id{});
 }
 
 const lx::compositor::layer_record* lx::compositor::layer_shell::exclusive_focus() const {

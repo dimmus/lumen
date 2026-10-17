@@ -83,6 +83,73 @@ struct source_basis {
     return {};
 }
 
+/// Output transforms (wl_output.transform, ADR 008 §C.4). An output with transform `t`
+/// scans out its content turned the way a buffer with buffer transform `t` holds its
+/// surface's content — so a client that renders with the output's transform hands over a
+/// buffer the output can show as it is (the reason wl_output.transform exists). Both maps
+/// are `source_basis_for(t)`: content → buffer, content → output pixels.
+///
+/// The draw transform that shows a buffer of transform `buffer` on an output of transform
+/// `output`: the content of the output's pixel p is `R_output⁻¹(p)`, and that content is
+/// the buffer's `R_buffer(·)`, so the draw samples through `R_buffer ∘ R_output⁻¹` (wlroots'
+/// `compose(invert(buffer), output)` in its own convention).
+[[nodiscard]] constexpr lx::buffer_transform compose_output_transform(lx::buffer_transform buffer,
+                                                                      lx::buffer_transform output) {
+    // Each transform as the 2×2 matrix of its basis on centred coordinates (columns dx, dy);
+    // all eight are signed permutations, so integer arithmetic is exact.
+    const auto mat = [](lx::buffer_transform t, int (&m)[4]) {
+        const source_basis b = source_basis_for(t);
+        m[0] = static_cast<int>(b.dx[0]);
+        m[1] = static_cast<int>(b.dy[0]);
+        m[2] = static_cast<int>(b.dx[1]);
+        m[3] = static_cast<int>(b.dy[1]);
+    };
+    int mb[4]{}, mo[4]{};
+    mat(buffer, mb);
+    mat(output, mo);
+    // R_output⁻¹ is its transpose (orthogonal).
+    const int inv[4] = {mo[0], mo[2], mo[1], mo[3]};
+    const int want[4] = {mb[0] * inv[0] + mb[1] * inv[2], mb[0] * inv[1] + mb[1] * inv[3],
+                         mb[2] * inv[0] + mb[3] * inv[2], mb[2] * inv[1] + mb[3] * inv[3]};
+    for (unsigned i = 0; i < 8; ++i) {
+        int m[4]{};
+        mat(static_cast<lx::buffer_transform>(i), m);
+        if (m[0] == want[0] && m[1] == want[1] && m[2] == want[2] && m[3] == want[3])
+            return static_cast<lx::buffer_transform>(i);
+    }
+    return lx::buffer_transform::normal;
+}
+
+/// Where rect `r` of a `width` × `height` content space lands in the pixels of an output of
+/// transform `t` (whose pixel space is `height` × `width` for the 90° ones): the same map,
+/// exact on whole pixels. An empty rect stays empty.
+[[nodiscard]] constexpr lx::rect2i transform_rect(lx::rect2i r, lx::buffer_transform t, int width,
+                                                  int height) {
+    if (t == lx::buffer_transform::normal || r.width <= 0 || r.height <= 0)
+        return r;
+    const source_basis b = source_basis_for(t);
+    const bool turned = b.dx[0] == 0.f;
+    const long long fw = turned ? height : width;
+    const long long fh = turned ? width : height;
+    // A content point (x, y) → (ox·fw + dx.x·x + dy.x·y, oy·fh + dx.y·x + dy.y·y): each
+    // non-zero coefficient pairs the coordinate with the axis of the same length.
+    const auto map = [&](long long x, long long y, long long& ox, long long& oy) {
+        ox = static_cast<long long>(b.origin[0]) * fw + static_cast<long long>(b.dx[0]) * x +
+             static_cast<long long>(b.dy[0]) * y;
+        oy = static_cast<long long>(b.origin[1]) * fh + static_cast<long long>(b.dx[1]) * x +
+             static_cast<long long>(b.dy[1]) * y;
+    };
+    long long ax = 0, ay = 0, bx = 0, by = 0;
+    map(r.x, r.y, ax, ay);
+    map(static_cast<long long>(r.x) + r.width, static_cast<long long>(r.y) + r.height, bx, by);
+    const long long x0 = ax < bx ? ax : bx;
+    const long long y0 = ay < by ? ay : by;
+    const long long x1 = ax < bx ? bx : ax;
+    const long long y1 = ay < by ? by : ay;
+    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
+            static_cast<int>(y1 - y0)};
+}
+
 /// The source box a draw samples, in texture pixels: `src`, or the whole texture when it
 /// is empty, clamped into the texture.
 [[nodiscard]] constexpr lx::rect2f effective_source(lx::rect2f src, unsigned tex_w,

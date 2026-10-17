@@ -171,11 +171,16 @@ const struct zlm_policy_bridge_v1_interface policy_bridge_impl = {
                 return true;
             });
         },
-    // No compositor-side fullscreen or minimize yet: logged as ignored, never an error.
+    // Fullscreen on the output asked for (null: the window's own). No minimize yet: logged
+    // as ignored, never an error.
     .request_fullscreen =
         [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel,
-           struct wl_resource*) {
-            bridge_request("fullscreen", toplevel, [](auto&, lx::toplevel_id) { return false; });
+           struct wl_resource* output) {
+            const int slot = output ? output_resource_slot(output) : -1;
+            bridge_request("fullscreen", toplevel, [slot](auto& wm, lx::toplevel_id id) {
+                wm.set_fullscreen(id, true, slot, "shell");
+                return true;
+            });
         },
     .request_minimize =
         [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {

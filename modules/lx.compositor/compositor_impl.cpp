@@ -45,6 +45,201 @@ module lx.compositor;
 
 namespace lx::compositor::detail {
 
+struct compositor_impl;
+
+/// One output's half of the render path (ADR 008 M4): its CRTC pipeline and cursor plane,
+/// its scanout slots with their buffer-age damage, the composited frame waiting for its
+/// commit, and the flip state. Render affinity; UI reads only the atomics. Created per
+/// output at start (and by output plans later), never per frame.
+struct output_pipeline {
+    static constexpr unsigned k_slots = 3;
+    compositor_impl* impl = nullptr;
+    unsigned slot = 0;
+    lx::output_id id{};
+    /// Null for a virtual output (no KMS): it "presents" when its frame is published.
+    std::unique_ptr<drm::kms_pipeline> kms{};
+    /// Render affinity after `start`. Declared after `kms` so it is destroyed first:
+    /// removing its framebuffers takes the pointer off the CRTC before `kms` hands the CRTC
+    /// back to the console.
+    drm::kms_cursor_plane cursor{};
+    scheduler::presentation_tracker presentation{};
+    /// Where layout coordinates reach this output's pixels (render's copy).
+    lx::point2i origin{};
+    double scale = 1.0;
+    /// wl_output.transform (render's copy): the cursor plane's position and image turn with it.
+    lx::buffer_transform transform = lx::buffer_transform::normal;
+    lx::size2i mode{};
+    /// Three, not two: with two, the slot the display is scanning and the slot a queued
+    /// flip is about to scan leave nothing writable, so every frame overlapping a flip had
+    /// to be dropped. A third slot means the composite always has somewhere to go.
+    gfx::gl_scanout_target gl[k_slots]{};
+    gfx::render_target vk[k_slots]{};
+    drm::kms_framebuffer fb[k_slots]{};
+    /// CPU-writable scanout for the `cpu` present backend; parallel to `fb`.
+    drm::kms_dumb_framebuffer dumb[k_slots]{};
+    unsigned slot_count = 0;
+    lx::rect2i scanout_rect{};
+    std::atomic<unsigned> front{0};
+    std::atomic<unsigned> pending_flip_slot{0};
+    /// Newest composited slot not yet handed to the CRTC, or -1. A frame composited while a
+    /// flip was queued waits here; another frame landing first takes its place (mailbox).
+    int composited_slot = -1;
+    /// Frame index of the snapshot composited into `composited_slot`: the commit's
+    /// `user_tag`, echoed by its flip event (presentation feedback).
+    unsigned composited_frame = 0;
+    /// sync_file of the composite in `composited_slot`, or -1; owned here.
+    int composited_fence = -1;
+    /// Per scanout slot: damage the slot missed since it was last composited into (buffer
+    /// age). Starts full.
+    gfx::damage_region slot_age[k_slots]{};
+    /// Damage since the last successful KMS commit (FB_DAMAGE_CLIPS). Starts full.
+    gfx::damage_region kms_pending{};
+    /// Damage a failed composite could not draw, retried on the next tick.
+    gfx::damage_region missed{};
+    /// Frame index of the snapshot whose damage was last consumed.
+    unsigned last_seen_frame = ~0u;
+    /// Newest snapshot of this view acquired and composited (or skipped): -1 before any.
+    std::atomic<long long> rendered_frame{-1};
+    /// A composited frame is not committed yet (read by UI before it answers frame
+    /// callbacks on an idle tick).
+    std::atomic<bool> frame_outstanding{false};
+    /// The plane passed a TEST_ONLY commit with an image on it.
+    bool cursor_tested = false;
+    /// A content commit has gone through since the last modeset need (the CRTC is ours).
+    bool content_committed_once = false;
+    unsigned cursor_staged_gen = 0;
+    /// Render → UI. The commit whose flip is pending carried a frame (false: cursor only).
+    std::atomic<bool> last_commit_content{true};
+    /// Render → UI. A content commit of ours reached this CRTC since start.
+    std::atomic<bool> ever_lit{false};
+    /// Render affinity. The resume generation whose procedure ran on this pipeline, and a
+    /// result owed to UI.
+    unsigned resume_done_gen = 0;
+    bool resume_result_pending = false;
+    /// Written by render after each composite of this output, read by UI for its clock.
+    std::atomic<unsigned> render_cost_us{0};
+    bool drm_commit_failing = false;
+    lx::runtime::clock_time master_lost_since_ns = 0;
+    bool master_lost_reported = false;
+    /// Waiting for the combined modeset (every pipeline needing one has a frame) since.
+    lx::runtime::clock_time modeset_wait_since_ns = 0;
+    /// The view's publish count when render last acquired it (the low-water mark).
+    unsigned consumed_publishes = 0;
+    // ── output plans (ADR 008 §A.4, §B.3), render affinity ──
+    /// A mode change the UI switched the output to: applied right before the first snapshot
+    /// of frame `switch_from_frame` or later is composited (older ones are the old size).
+    bool switch_pending = false;
+    unsigned switch_from_frame = 0;
+    drm::kms_mode switch_mode{};
+    /// Targets allocated and checked by TEST_ONLY for a mode change, waiting for the switch;
+    /// dropped when no switch came within `k_staged_keep_ns` (the change was superseded).
+    std::unique_ptr<output_pipeline> staged{};
+    lx::runtime::clock_time staged_since_ns = 0;
+    static constexpr lx::runtime::clock_time k_staged_keep_ns = 5'000'000'000;
+    /// The previous mode's targets: one of them is on screen until the modeset's flip.
+    std::unique_ptr<output_pipeline> graveyard{};
+    /// The output went: its CRTC is turned off once no flip is pending, then the pipeline is
+    /// handed to UI to be destroyed (`retire`).
+    bool retiring = false;
+    unsigned retire_gen = 0;
+    bool retire_connector_gone = false;
+    /// The first frame built for this pipeline's output: the view's snapshots of an output
+    /// that had the slot before (the views are per slot and outlive outputs) are never
+    /// composited here.
+    unsigned first_frame = 0;
+    bool has_first_frame = false;
+    /// An output configuration (ADR 008 §C.3) waits for this pipeline's next modeset: its
+    /// outcome goes to UI (`on_modeset_result`) with this ticket. 0: nobody waits. A mode
+    /// switch's ticket moves here when the switch is applied (`switch_ticket`).
+    unsigned apply_ticket = 0;
+    unsigned switch_ticket = 0;
+    /// Adaptive sync asked for while a mode switch is pending (-1: none): programmed by the
+    /// switch's modeset, so both changes are one modeset in the new mode (and the switch,
+    /// not a modeset still in the old mode, answers the configuration).
+    int switch_vrr = -1;
+    /// The cursor image turned for this output's transform (render; grows, never shrinks).
+    std::vector<std::uint32_t> cursor_turned{};
+    // ── input-to-present latency (debug) ──
+    std::atomic<unsigned long long> committed_input_us{0};
+    std::atomic<unsigned long long> committed_submit_us{0};
+    std::atomic<int> committed_fence_fd{-1};
+
+    output_pipeline() {
+        for (auto& d : slot_age)
+            d.set_full();
+        kms_pending.set_full();
+    }
+    ~output_pipeline() {
+        if (composited_fence >= 0)
+            ::close(composited_fence);
+        if (const int fd = committed_fence_fd.exchange(-1); fd >= 0)
+            ::close(fd);
+    }
+    output_pipeline(const output_pipeline&) = delete;
+    output_pipeline& operator=(const output_pipeline&) = delete;
+
+    [[nodiscard]] bool scanout() const { return slot_count > 0; }
+    void discard_fence() {
+        if (composited_fence >= 0) {
+            ::close(composited_fence);
+            composited_fence = -1;
+        }
+    }
+    /// The scanout slot that is neither on screen nor queued for a flip.
+    [[nodiscard]] unsigned back_slot() const {
+        if (slot_count <= 1)
+            return 0;
+        const unsigned f = front.load(std::memory_order_acquire);
+        const unsigned pending = kms && kms->flip_pending()
+                                     ? pending_flip_slot.load(std::memory_order_acquire)
+                                     : f;
+        for (unsigned i = 0; i < slot_count; ++i)
+            if (i != f && i != pending)
+                return i;
+        return (f + 1u) % slot_count;
+    }
+    [[nodiscard]] unsigned framebuffer(unsigned i, bool cpu) const {
+        return cpu ? dumb[i].id() : fb[i].id();
+    }
+};
+
+/// UI's per-output state (ADR 008 M6, M14, M15). UI affinity.
+struct output_ui {
+    bool live = false;
+    lx::output_id id{};
+    /// UI's handle on the output's render pipeline (ADR 008 §B.3): set when render installed
+    /// it, cleared before UI asks render to retire it — render owns `pipes_`, UI only ever
+    /// reads through this, so neither thread sees a pipeline the other has let go of.
+    output_pipeline* pipe = nullptr;
+    /// A content flip landed since frame callbacks were last answered for this output.
+    bool present_completed = false;
+    /// The resume modeset's flip has not arrived yet (a full modeset can outlast the 250 ms
+    /// present watchdog on some drivers, which is not a stall).
+    bool awaiting_resume_flip = false;
+    /// Frame callbacks paced by this output were last answered (the stall watchdog).
+    lx::runtime::clock_time last_callback_ns = 0;
+    /// Newest frame index published to this view with non-empty damage, and the newest
+    /// published.
+    long long last_damaged_frame = -1;
+    unsigned last_published_frame = 0;
+    bool published_once = false;
+    /// The view's projection as last applied (a change repaints the view).
+    lx::rect2i logical{};
+    double scale = 0.0;
+    lx::size2i mode{};
+    unsigned transform = 0;
+    /// The refresh its frame clock runs at (mHz; 0: 60 Hz assumed).
+    unsigned refresh_mhz = 0;
+    /// The output's power state machine (`:display_power`), one per output (M15).
+    display_power power{};
+    /// The render generation a power-on asked for on this output.
+    unsigned power_resume_render_gen = 0;
+    /// The first frame built with the scene locked (M14).
+    unsigned lock_frame = 0;
+    /// The flip handler's last feedback (frame callback timestamps).
+    scheduler::presentation_feedback last_feedback{};
+};
+
 struct compositor_impl {
     compositor* owner = nullptr;
     config cfg{};
@@ -71,6 +266,9 @@ struct compositor_impl {
     scene::container_node bottom_layer_{};
     scene::container_node windows_layer_{};
     scene::container_node top_layer_{};
+    /// Fullscreen windows over their outputs' black backdrops (M11): above a panel, under
+    /// the overlay layer and popups (sway).
+    scene::container_node fullscreen_layer_{};
     scene::container_node overlay_shell_layer_{};
     scene::container_node popup_layer_{};
     scene::container_node dnd_icon_layer_{};
@@ -90,11 +288,6 @@ struct compositor_impl {
     window_manager wm_{};
     gfx::device graphics{};
     drm::kms_device kms{};
-    drm::kms_atomic_commit kms_atomic{kms};
-    /// Render affinity after `start`. Declared after `kms_atomic` so it is destroyed first:
-    /// removing its framebuffers takes the pointer off the CRTC before `kms_atomic` hands
-    /// the CRTC back to the console.
-    drm::kms_cursor_plane cursor_plane_{};
     gfx::dmabuf_import_cache import_cache;
     buffer_lifecycle_tracker buffer_lifecycle_;
     runtime::memory_budget_coordinator memory_{};
@@ -110,10 +303,9 @@ struct compositor_impl {
     lx::input::input_manager input_devices_{};
     bool input_ready_ = false;
     scheduler::frame_scheduler scheduler_{};
-    scheduler::presentation_tracker presentation_{};
     scheduler::budget_tracker budget_{};
     protocol_managers protocols_{};
-    hotplug_monitor hotplug_{};
+    hotplug_controller hotplug_{};
     gfx::device_recovery device_recovery_{graphics};
     session::logind_session logind_{};
     p0_protocol_context p0_{};
@@ -124,35 +316,30 @@ struct compositor_impl {
     /// UI affinity. VT and logout bindings, the shell's key grabs, tap observation.
     keybindings keys_{};
     /// The display gate (design §2.3). UI writes (release), render reads (acquire) at tick
-    /// start and again right before every commit ioctl: while any bit is set, render
-    /// composites nothing and commits nothing, the frame clock gives way to the 1 Hz paused
-    /// tick, and nothing is presented. `gate_vt`: the session is paused (VT away, display
-    /// lost). `gate_power`: the output is powered off (display power, I4). Only input
-    /// suspension stays tied to `gate_vt` — a dark output is woken by input.
+    /// start and again right before every commit ioctl: while it is set, render composites
+    /// nothing and commits nothing on any output, the frame clocks give way to the 1 Hz
+    /// paused tick, and nothing is presented. `gate_vt`: the session is paused (VT away,
+    /// display lost). Display power gates one output at a time (`gate_power_mask_`, M15).
+    /// Only input suspension stays tied to `gate_vt` — a dark output is woken by input.
     static constexpr unsigned gate_vt = 1u << 0;
-    static constexpr unsigned gate_power = 1u << 1;
     std::atomic<unsigned> display_gate_{0};
-    /// UI stores the resume generation (release) *before* clearing a gate bit, and render
-    /// loads them in the opposite order: seeing "ungated" guarantees seeing the new
-    /// generation, so render never commits without running the resume procedure first.
+    /// Bit per output slot powered off (zwlr_output_power_v1, idle blanking): render skips
+    /// that pipeline; the others go on.
+    std::atomic<std::uint32_t> gate_power_mask_{0};
+    /// Per output: UI stores the resume generation (release) *before* clearing a gate bit,
+    /// and render loads them in the opposite order: seeing "ungated" guarantees seeing the
+    /// new generation, so render never commits without running the resume procedure first.
     /// One counter for every resume (VT and power-on), owned by UI (`render_gen_counter_`).
-    std::atomic<unsigned> resume_gen_{0};
+    std::atomic<unsigned> resume_gen_[output_manager::k_max]{};
     /// UI affinity. The last render generation handed out, and which resume each answers:
-    /// the session machine's (with its own generation) and the power machine's.
+    /// the session machine's (with its own generation) and each output's power machine.
     unsigned render_gen_counter_ = 0;
     unsigned vt_resume_render_gen_ = 0;
     unsigned vt_resume_session_gen_ = 0;
-    unsigned power_resume_render_gen_ = 0;
-    /// Render affinity. The generation whose resume procedure ran, and a result owed to UI.
-    unsigned resume_done_gen_ = 0;
-    bool resume_result_pending_ = false;
-    /// Render affinity. Commits have failed for lack of DRM master since then (0: they do
-    /// not) — reported once if no pause follows within a second.
-    lx::runtime::clock_time master_lost_since_ns_ = 0;
-    bool master_lost_reported_ = false;
-    /// UI affinity. The resume modeset's flip has not arrived yet: a full modeset can take
-    /// longer than the 250 ms present watchdog on some drivers, which is not a stall.
-    bool awaiting_resume_flip_ = false;
+    /// UI affinity. Outputs whose VT-resume result is still owed, and the worst one so far:
+    /// the session machine hears once, when every output answered.
+    std::uint32_t vt_resume_pending_ = 0;
+    session_resume_outcome vt_resume_outcome_ = session_resume_outcome::ok;
     static constexpr lx::runtime::clock_time k_resume_flip_grace_ns = 1'000'000'000;
     /// The card's device number (what logind's signals name) and how it was opened.
     unsigned drm_major_ = 0;
@@ -196,24 +383,23 @@ struct compositor_impl {
     /// UI. Arms (or disarms) the idle timer at `idle_.next_deadline()`.
     void rearm_idle_timer();
     /// UI. Real input arrived (design I2): idle notifications resume and their timers
-    /// restart; a dark output is woken (I5). True when this event woke it — the caller then
-    /// consumes a press (and so its release).
+    /// restart; every dark output is woken (I5). True when this event woke one — the caller
+    /// then consumes a press (and so its release).
     bool on_user_activity();
-    /// UI affinity. The output's power state machine (`:display_power`).
-    display_power power_{};
-    /// UI writes the newest power-off generation (release); the render task compares (acquire)
-    /// and does nothing when a later request superseded it.
-    std::atomic<unsigned> power_gen_{0};
-    /// UI. Executes a power decision (the gate, the render task, the resume, `mode` events).
-    void apply_power_actions(const power_actions& a);
-    /// UI. zwlr_output_power_v1.set_mode.
-    void request_output_power(bool on);
-    /// UI → render → UI. The power-off task for `gen`.
-    void post_power_off(unsigned gen);
-    /// Render. Turns the CRTC off (or, refused, commits a black frame).
-    power_off_outcome run_power_off(unsigned gen);
-    /// Render. The soft blank: one black frame, cursor off, CRTC left on.
-    void commit_black_frame();
+    /// UI writes the newest power-off generation per output (release); the render task
+    /// compares (acquire) and does nothing when a later request superseded it.
+    std::atomic<unsigned> power_gen_[output_manager::k_max]{};
+    /// UI. Executes output `slot`'s power decision (its gate bit, the render task, the
+    /// resume, `mode` events).
+    void apply_power_actions(unsigned slot, const power_actions& a);
+    /// UI. zwlr_output_power_v1.set_mode on output `slot`.
+    void request_output_power(unsigned slot, bool on);
+    /// UI → render → UI. The power-off task of output `slot` for `gen`.
+    void post_power_off(unsigned slot, unsigned gen);
+    /// Render. Turns the output's CRTC off (or, refused, commits a black frame).
+    power_off_outcome run_power_off(unsigned slot, unsigned gen);
+    /// Render. The soft blank of one output: one black frame, cursor off, CRTC left on.
+    void commit_black_frame(output_pipeline& p);
     bool power_rejected_logged_ = false;
     // ── Session lock — docs/architecture.md "Session lock" ──
     /// UI affinity. ext-session-lock-v1's state machine (`:session_lock`); the wire unit and
@@ -223,9 +409,9 @@ struct compositor_impl {
     /// (wire_text_input.cpp, wire_input_method.cpp) send what it decides, the router routes
     /// keys to the input method's grab while it is active.
     text_input_relay text_input_{};
-    /// UI affinity. The first snapshot built with the scene locked: a content flip of it (or
-    /// a later one) on the output is what lets `locked` go out (design L1).
-    unsigned lock_frame_ = 0;
+    /// UI affinity. Which outputs have shown a locked frame since the scene locked (M14):
+    /// `locked` goes out once every live output has, or is dark.
+    lock_frame_tracker lock_shown_{};
     /// UI affinity. The 1 s wait for lock surfaces, and the sleep delay's 2 s.
     std::unique_ptr<runtime::timer_source> lock_timer_{};
     static void lock_timer_callback();
@@ -235,19 +421,21 @@ struct compositor_impl {
     lx::runtime::clock_time sleep_lock_deadline_ns_ = 0;
     static constexpr lx::runtime::clock_time k_sleep_lock_wait_ns = 2'000'000'000;
     void release_sleep_delay(const char* why);
-    /// Render → UI. A content commit of ours has reached the CRTC since start: before it, the
-    /// console (or nothing) is on screen — none of the session.
-    std::atomic<bool> ever_lit_{false};
     /// The state last logged (one info line per transition).
     lock_state logged_lock_state_ = lock_state::unlocked;
     /// UI. Executes a lock decision (the wire half through `session_lock_send`).
     void apply_lock_actions(const lock_actions& a);
-    /// UI. Nothing of the session can be on screen right now: the VT is away, the output is
-    /// powered off (or blanked black), or nothing of ours was ever committed. A lock that
-    /// reaches `locking` then is `locked` at once.
+    /// UI. Nothing of the session can be on output `slot` right now: the VT is away, it is
+    /// powered off (or blanked black), or nothing of ours was ever committed to it.
+    [[nodiscard]] bool output_dark(unsigned slot) const;
+    /// UI. Every live output is dark (`output_dark`): a lock reaching `locking` is `locked`
+    /// at once.
     [[nodiscard]] bool display_dark() const;
-    /// UI. `locking` ends when the display is dark (see above). After every edge that can
-    /// darken it.
+    /// UI. Output `slot` showed a locked frame (or went dark): `locking` ends once every live
+    /// output has.
+    void note_lock_shown(unsigned slot);
+    /// UI. `locking` ends when every output is dark or showed a locked frame. After every
+    /// edge that can darken one.
     void advance_lock();
     /// UI. logind's Lock / Unlock / PrepareForSleep.
     void on_logind_lock();
@@ -255,10 +443,10 @@ struct compositor_impl {
     void on_prepare_for_sleep(bool start);
     /// UI. Ctrl+Alt+F<n> (XF86Switch_VT_<n>).
     void request_vt_switch(unsigned vt);
-    /// Render. The resume procedure (A.5) for generation `gen`.
-    void run_resume_procedure(unsigned gen);
+    /// Render. The resume procedure (A.5) of one pipeline for generation `gen`.
+    void run_resume_procedure(output_pipeline& p, unsigned gen);
     /// Render → UI.
-    void post_resume_result(unsigned gen, session_resume_outcome outcome);
+    void post_resume_result(unsigned slot, unsigned gen, session_resume_outcome outcome);
     void post_flip_dispatch();
     [[nodiscard]] static lx::runtime::clock_time now_ns() {
         return static_cast<lx::runtime::clock_time>(
@@ -280,82 +468,377 @@ struct compositor_impl {
     gfx::cpu_compositor cpu_compositor_{};
     gfx::egl_device egl_{};
     gfx::gl_compositor gl_compositor_{};
-    gfx::gl_scanout_target gl_targets_[3]{};
-    /// Three, not two: with two, the slot the display is scanning and the slot a queued
-    /// flip is about to scan leave nothing writable, so every frame overlapping a flip had
-    /// to be dropped. A third slot means the composite always has somewhere to go.
-    static constexpr unsigned k_scanout_slots = 3;
-    gfx::render_target vk_targets_[k_scanout_slots]{};
-    drm::kms_framebuffer scanout_fbs_[k_scanout_slots]{};
-    /// CPU-writable scanout for the `cpu` present backend; parallel to `scanout_fbs_`.
-    drm::kms_dumb_framebuffer dumb_fbs_[k_scanout_slots]{};
-    unsigned scanout_slot_count_ = 0;
-    std::atomic<unsigned> scanout_front_{0};
-    std::atomic<unsigned> pending_flip_slot_{0};
-    /// Render affinity. Newest composited slot not yet handed to the CRTC, or -1. A frame
-    /// composited while a flip was queued waits here instead of being thrown away; if
-    /// another frame lands first it simply takes its place (mailbox — show the newest).
-    int composited_slot_ = -1;
-    /// Render affinity. Frame index of the snapshot composited into `composited_slot_`: the
-    /// commit's `user_tag`, echoed by its flip event, which presentation feedback is
-    /// resolved against (`presentation_flipped`).
-    unsigned composited_frame_ = 0;
-    /// Render affinity. sync_file for the composite that produced `composited_slot_`, or
-    /// -1. Travels with the slot because the commit can be deferred a tick, and the fence
-    /// belongs to the frame in that slot rather than to whichever tick commits it. Owned
-    /// here: superseding a slot or committing it closes the FD.
-    int composited_fence_fd_ = -1;
+    /// Render affinity (created at start, before the render thread; at runtime by output
+    /// ops). One per output slot with a pipeline; null for a free slot. UI reaches a
+    /// pipeline only through `outs_[slot].pipe`.
+    std::unique_ptr<output_pipeline> pipes_[output_manager::k_max]{};
 
-    /// Render affinity. Drops a pending fence without committing it.
-    void discard_composited_fence();
+    // ── Hotplug: output plans UI → render → UI (ADR 008 §A.4, Part B) ──
+    /// What UI asks render to do with an output's pipeline. Applied at the start of the next
+    /// `tick_render`; the answer comes back as a UI task.
+    struct output_op {
+        enum class kind : unsigned char { add, test_mode, switch_mode, retire, set_vrr };
+        static constexpr unsigned k_modes = 8;
+        kind what = kind::add;
+        unsigned slot = 0;
+        unsigned gen = 0;
+        /// add: a KMS output (else a composite-only pipeline: virtual outputs, no display).
+        bool kms = false;
+        /// add: give it a cursor plane (the hardware cursor is in use).
+        bool cursor_plane = false;
+        /// retire: its connector no longer exists (only the CRTC is turned off).
+        bool connector_gone = false;
+        unsigned connector_id = 0;
+        unsigned possible_crtcs = 0;
+        unsigned routed_crtc_id = 0;
+        /// add / test_mode: the modes to try, in order; switch_mode: [0].
+        drm::kms_mode modes[k_modes]{};
+        unsigned mode_count = 0;
+        /// add: the size of a composite-only pipeline.
+        lx::size2i size{};
+        lx::point2i origin{};
+        double scale = 1.0;
+        /// switch_mode: the first frame built at the new mode; add: the first frame built for
+        /// the new output.
+        unsigned from_frame = 0;
+        /// add / switch_mode / set_vrr: an output configuration waits for the modeset that
+        /// makes it real (`output_pipeline::apply_ticket`); 0: nobody waits.
+        unsigned ticket = 0;
+        /// add / set_vrr: adaptive sync; add: the output's transform.
+        bool vrr = false;
+        lx::buffer_transform transform = lx::buffer_transform::normal;
+    };
+    /// A TEST_ONLY of a whole output configuration (ADR 008 §C.3 step 3): every pipeline it
+    /// changes — a new mode (with real framebuffers of that size, staged for the switch),
+    /// adaptive sync, disabled — and every output it enables (a CRTC allocation among the
+    /// CRTCs left, checked by the same test). Outputs it leaves alone are in the kernel's
+    /// current state the test runs against.
+    struct config_test_entry {
+        /// The output's slot; -1 for an output being enabled.
+        int slot = -1;
+        bool enable = true;
+        unsigned connector_id = 0;
+        unsigned possible_crtcs = 0;
+        unsigned routed_crtc_id = 0;
+        drm::kms_mode mode{};
+        bool mode_change = false;
+        /// -1: unchanged; 0/1: adaptive sync off/on.
+        int vrr = -1;
+    };
+    struct config_test {
+        unsigned gen = 0;
+        unsigned count = 0;
+        config_test_entry entries[output_manager::k_max]{};
+    };
+    /// One at a time (one job runs at a time): UI fills it under `ops_mutex_`, render takes it.
+    config_test config_test_{};
+    bool config_test_pending_ = false;
+    config_test config_test_work_{};
+    /// Render. Runs the test; the answer goes to UI (`on_config_tested`).
+    void render_test_config(const config_test& t);
+    static constexpr unsigned k_max_ops = 32;
+    std::mutex ops_mutex_{};
+    output_op ops_[k_max_ops]{};      // guarded by ops_mutex_
+    unsigned ops_count_ = 0;          // guarded by ops_mutex_
+    /// Render affinity: the ops taken from the queue, run outside the lock.
+    output_op ops_work_[k_max_ops]{};
+    std::atomic<bool> ops_pending_{false};
+    /// Render affinity. Ops held back until every retiring KMS pipeline has turned its CRTC
+    /// off (a KMS add, and every later op of the same slot, in order): an add's CRTC
+    /// allocation and TEST_ONLY then see the state its configuration was tested in — the
+    /// outputs it disables already off — not one with them still lit (shared PLLs, MST
+    /// bandwidth). Bounded by the queue; run by `run_deferred_output_ops`.
+    output_op ops_deferred_[k_max_ops]{};
+    unsigned ops_deferred_count_ = 0;
+    std::uint32_t ops_deferred_slots_ = 0;
+    lx::runtime::clock_time ops_deferred_since_ns_ = 0;
+    /// A retiring pipeline's flip that never lands does not hold an add back longer.
+    static constexpr lx::runtime::clock_time k_ops_defer_max_ns = 1'000'000'000;
+    /// UI. Queues `op` for render and wakes it.
+    void post_output_op(const output_op& op);
+    /// Render, at the start of `tick_render`. Retires first (each one that is the first op
+    /// of its slot in the batch), then the rest in order.
+    void run_output_ops();
+    /// Render. One op.
+    void run_output_op(const output_op& op);
+    /// Render. Runs `op` now, or holds it back (see `ops_deferred_`).
+    void run_or_defer_output_op(const output_op& op);
+    /// Render, in `tick_render` once retiring pipelines were given their turn.
+    void run_deferred_output_ops();
+    [[nodiscard]] bool kms_retire_in_flight() const;
+    void render_add_output(const output_op& op);
+    void render_test_mode(const output_op& op);
+    /// Render. A pending mode switch of `p`, before compositing frame `frame`; false when it
+    /// has to wait (the previous switch's targets are still on screen).
+    bool apply_mode_switch(output_pipeline& p, unsigned frame);
+    /// Render. A retiring pipeline whose flip has drained: CRTC off, targets released,
+    /// handed to UI.
+    void finish_retire(unsigned slot);
+    /// Render → UI: pipelines in transit to be destroyed on UI (the thread draining KMS
+    /// events, which may still hold them). Deleted by `on_retired`, or at exit.
+    std::atomic<output_pipeline*> in_transit_[output_manager::k_max]{};
+    void wake_render();
+    /// UI. The answers.
+    void on_add_result(unsigned slot, unsigned gen, bool ok, unsigned mode_index,
+                       output_pipeline* pipe);
+    void on_mode_tested(unsigned slot, unsigned gen, bool ok, unsigned mode_index);
+    void on_retired(unsigned slot, unsigned gen);
 
-    // ── damage tracking (render affinity unless noted) ──
-    /// Extent of the scanout target; damage is clipped to it.
-    lx::rect2i scanout_rect_{};
-    /// Per scanout slot: damage the slot has *missed* since it was last composited into.
-    /// With three slots a slot is two or three frames old when it is reused, so compositing
-    /// only the newest frame's damage into it would leave the intervening frames' changes
-    /// as ghost trails behind a moving window. Starts full: nothing has been drawn yet.
-    gfx::damage_region slot_age_damage_[k_scanout_slots]{};
-    /// Damage since the last successful KMS commit. FB_DAMAGE_CLIPS describe how the new
-    /// framebuffer differs from the one the plane showed before it, which spans every frame
-    /// composited since that commit — not just the newest. Starts full.
-    gfx::damage_region kms_pending_damage_{};
-    /// Damage a failed composite could not draw, retried on the next tick.
-    gfx::damage_region missed_damage_{};
-    /// Frame index of the snapshot whose damage was last consumed; a re-acquired snapshot
-    /// has nothing new to say.
-    unsigned last_seen_frame_ = ~0u;
-    /// Set by render while it holds a composited frame that is not committed yet; read by
-    /// UI before it answers frame callbacks on an idle tick.
-    std::atomic<bool> frame_outstanding_{false};
-    /// UI affinity. Newest frame index published with non-empty damage.
-    long long last_damaged_frame_ = -1;
-    /// UI affinity. Newest published frame index: frame callbacks go to the surfaces the
-    /// visibility pass found on screen in it.
-    unsigned last_published_frame_ = 0;
+    /// UI. Where each slot is in its life: an output being added (its pipeline is being
+    /// made), live, or retiring (its pipeline is being taken down). A slot is reused only
+    /// once free (ADR 008 M1).
+    enum class slot_phase : unsigned char { free, adding, live, retiring };
+    slot_phase slot_phase_[output_manager::k_max]{};
+    unsigned slot_gen_[output_manager::k_max]{};
+    [[nodiscard]] std::uint32_t reserved_slots() const {
+        std::uint32_t m = 0;
+        for (unsigned s = 0; s < output_manager::k_max; ++s)
+            if (slot_phase_[s] == slot_phase::adding || slot_phase_[s] == slot_phase::retiring)
+                m |= 1u << s;
+        return m;
+    }
+    /// UI. What an add is waiting for: the connector's probe (the strings the output's
+    /// description points into), the modes tried, whether a later scan cancelled it, and
+    /// whether it is HEADLESS-1 (already live, only its pipeline is coming).
+    struct pending_output {
+        drm::connector_probe probe{};
+        drm::kms_mode modes[output_op::k_modes]{};
+        unsigned mode_count = 0;
+        bool cancelled = false;
+        bool headless = false;
+        bool kms = false;
+        /// A newer probe saw this connector change while its add was under way: probed
+        /// again once the output is up, so it ends at what is connected now.
+        bool stale = false;
+        /// What it comes up with when a configuration chose it (a client's apply, the
+        /// persisted monitor and setup — ADR 008 §C.5): 0 scale is the default one.
+        double scale = 0.0;
+        unsigned transform = 0;
+        bool adaptive_sync = false;
+        bool has_position = false;
+        lx::point2i position{};
+        bool follow_preferred = true;
+        unsigned ticket = 0;
+        /// Its head was advertised already (a disabled monitor being enabled): it stays a
+        /// head while it comes up. A newly plugged monitor's head appears once it is live.
+        bool head_known = false;
+    };
+    std::unique_ptr<pending_output[]> pending_{};
+    /// UI. Connectors whose add failed (no CRTC, no mode passed TEST_ONLY), with the mode
+    /// list they failed with: the same scan again is not retried.
+    struct failed_connector {
+        unsigned connector_id = 0;
+        unsigned modes_hash = 0;
+    };
+    failed_connector failed_[output_manager::k_max]{};
+    unsigned failed_count_ = 0;
+    /// UI. HEADLESS-1 standing in for a display with nothing connected (-1: none): removed
+    /// once a real output is added, added before the last one is removed.
+    int fallback_headless_slot_ = -1;
+    /// The card was removed: no more KMS (render reads it before touching the device).
+    std::atomic<bool> card_gone_{false};
+    /// UI. The VT resume waits (≤ 250 ms) for its connector probe, so its modeset uses what
+    /// is connected now (a resize while away) — ADR 008 §A.14.
+    bool resume_probe_wait_ = false;
+    unsigned resume_probe_gen_ = 0;
+    /// The hotplug controller can probe (KMS present): the resume waits for its probe.
+    bool hotplug_ready_ = false;
+    std::unique_ptr<runtime::timer_source> hotplug_timer_{};
+    static constexpr lx::runtime::clock_time k_resume_probe_wait_ns = 250'000'000;
+    static void hotplug_timer_callback();
+    /// Render-read after start: the cursor plane size the start-up themes need.
+    unsigned cursor_plane_px_ = 0;
+    /// UI. A finished probe (the hotplug controller's `scan_ready`).
+    void apply_connector_scan(const drm::connector_scan& scan, bool forced);
+    /// What an output made from a connector comes up with (ADR 008 §C.5): the modes to try,
+    /// and the scale, transform, adaptive sync and position a configuration chose.
+    struct connect_choice {
+        bool enabled = true;
+        drm::kms_mode modes[output_op::k_modes]{};
+        unsigned mode_count = 0;
+        double scale = 0.0;
+        unsigned transform = 0;
+        bool adaptive_sync = false;
+        bool has_position = false;
+        lx::point2i position{};
+        bool follow_preferred = true;
+        unsigned ticket = 0;
+    };
+    /// UI. Brings the output of connector `probe` up (null `choice`: the defaults). Returns
+    /// the slot it is being added in, -1 when it cannot be.
+    int add_output_from(const drm::connector_probe& probe, const connect_choice* choice = nullptr);
+    void change_output(unsigned slot, const drm::connector_probe& probe, bool forced);
+    /// UI. The output in `slot` goes: unplugged, or (`why` set) disabled by a configuration
+    /// while its connector stays connected.
+    void remove_output(unsigned slot, bool connector_gone, const char* why = nullptr);
+    /// UI. The output in `slot` takes `mode` now (logical state, the render switch).
+    /// `follow`: it keeps following its connector's preferred mode (H3); `custom`: a mode the
+    /// connector does not list; `ticket`: an output configuration waits for its modeset.
+    void switch_output_mode(unsigned slot, const drm::kms_mode& mode, const char* why);
+    void switch_output_mode(unsigned slot, const drm::kms_mode& mode, const char* why, bool follow,
+                            bool custom, unsigned ticket);
+    /// UI. Adds HEADLESS-1 (no connected display), its pipeline following.
+    void add_fallback_headless();
+    void on_card_removed();
+    /// UI. Output state changed: views, clocks, clients told now (not at the next tick),
+    /// the pointer kept on the outputs.
+    void outputs_changed_now();
+    void reclamp_pointer();
+    /// UI. The VT resume, after its probe (or the 250 ms wait).
+    void finish_display_resume(unsigned gen);
+
+    // ── Output configuration: wlr-output-management and persistence (ADR 008 Part C) ──
+    /// UI. The persisted configuration (`outputs.toml`); the model is kept in memory even
+    /// when persistence is off (setups still decide which monitors are enabled).
+    output_config_file outcfg_{};
+    std::unique_ptr<runtime::timer_source> outcfg_timer_{};
+    static void outcfg_timer_callback();
+    /// UI. The newest connector scan applied (a copy: the hotplug controller reuses its
+    /// buffer): the heads of connectors that are not outputs, and every head's mode list.
+    std::unique_ptr<drm::connector_scan> last_scan_{};
+    /// UI. Connectors connected but disabled — by a client's configuration or the setup —
+    /// and the set of connected connectors those decisions were made for.
+    unsigned disabled_connectors_[output_manager::k_max]{};
+    unsigned disabled_count_ = 0;
+    unsigned connected_set_[output_manager::k_max]{};
+    unsigned connected_count_ = 0;
+    [[nodiscard]] bool connector_disabled(unsigned connector_id) const;
+    void set_connector_disabled(unsigned connector_id, bool disabled);
+    /// UI. Where a disabled monitor was placed and the mode it had, when chosen explicitly:
+    /// enabling it again without them brings them back (wlroots keeps a head's last state).
+    struct kept_position {
+        unsigned connector_id = 0;
+        bool has_position = false;
+        lx::point2i position{};
+        bool has_mode = false;
+        drm::kms_mode mode{};
+    };
+    kept_position kept_positions_[output_manager::k_max]{};
+    unsigned kept_position_count_ = 0;
+    void keep_position(unsigned connector_id, const output_state& o);
+    [[nodiscard]] const kept_position* kept_position_of(unsigned connector_id) const;
+    /// UI. Virtual outputs as heads (HEADLESS-n, `--virtual-outputs`): their key, and what a
+    /// disabled one comes back as.
+    struct virtual_head {
+        unsigned key = 0;
+        char name[32]{};
+        bool disabled = false;
+        lx::size2i mode{};
+        unsigned refresh_mhz = 60000;
+        double scale = 1.0;
+        unsigned transform = 0;
+        lx::point2i position{};
+        bool auto_position = true;
+    };
+    virtual_head virtual_heads_[output_manager::k_max]{};
+    unsigned virtual_head_count_ = 0;
+    unsigned next_virtual_key_ = 1;
+    [[nodiscard]] unsigned virtual_key(const char* name);
+    /// UI. The heads as zwlr_output_manager_v1 shows them, rebuilt and sent (only what
+    /// changed) once per loop iteration after anything about outputs or connectors moved.
+    std::unique_ptr<mgmt::head_set> heads_scratch_{};
+    bool heads_dirty_ = true;
+    void mark_heads_dirty() { heads_dirty_ = true; }
+    void build_heads(mgmt::head_set& out);
+    void flush_output_heads();
+    /// UI. The identifiers of the connected desktop connectors of `scan` (duplicates told
+    /// apart as `output_manager` does), with each one's index in the scan.
+    unsigned connected_identifiers(const drm::connector_scan& scan,
+                                   char (*ids)[monitor_config::k_id], unsigned* entries) const;
+    /// UI. What connector `e` (identifier `id`) comes up with: the monitor's persisted mode,
+    /// scale, transform and adaptive sync, and the setup's enabled flag and position.
+    void choose_for_connector(const drm::connector_probe& e, const char* id,
+                              const setup_config* setup, connect_choice& out) const;
+    /// UI, at start: the outputs of the start-up scan as the persisted configuration says.
+    void configure_outputs_at_start(const drm::connector_scan& scan);
+    /// UI, after a scan's removals and changes: new connectors come up, and when the set of
+    /// connected monitors changed, the setup decides which are enabled and where.
+    void apply_connected_setup(const drm::connector_scan& scan);
+    /// UI. The current state into the persisted configuration (after a client's apply).
+    void record_output_config();
+    /// The kms mode a head target asks for on connector `e` (null: a virtual output).
+    [[nodiscard]] drm::kms_mode target_kms_mode(const mgmt::head_target& t,
+                                                const drm::connector_probe* e) const;
+    /// The live slot of head `key`, -1 when it is not an output now.
+    [[nodiscard]] int slot_of_head(unsigned key) const;
+    [[nodiscard]] unsigned max_enabled_heads() const;
+    /// The apply or test running (one at a time, §C.3 step 7).
+    struct mgmt_run {
+        bool active = false;
+        mgmt::job job{};
+        mgmt::target target{};
+        mgmt::target previous{};
+        enum class phase : unsigned char { testing, committing } stage = phase::testing;
+        unsigned test_gen = 0;
+        unsigned ticket = 0;
+        /// Slots whose modeset is awaited, and whether one failed.
+        std::uint32_t waiting = 0;
+        bool failed = false;
+        lx::runtime::clock_time deadline_ns = 0;
+    };
+    std::unique_ptr<mgmt_run> mgmt_{};
+    unsigned config_test_gen_ = 0;
+    unsigned apply_ticket_counter_ = 0;
+    static constexpr lx::runtime::clock_time k_mgmt_deadline_ns = 3'000'000'000;
+    /// UI. Starts the next queued job when none runs and no output is mid-way.
+    void run_next_mgmt_job();
+    /// UI. Fills `out` with what the kernel must be asked about; false when nothing.
+    bool plan_config_test(const mgmt::target& t, config_test& out) const;
+    void on_config_tested(unsigned gen, bool ok, unsigned tests);
+    /// UI. Makes the outputs what `t` says (C.3 step 4): disables, modes, adaptive sync,
+    /// transforms, scales, positions, enables. `waiting` receives the slots whose modeset
+    /// will report to `ticket` (0: a revert, nobody waits).
+    void switch_to_target(const mgmt::target& t, unsigned ticket, std::uint32_t& waiting);
+    void on_modeset_result(unsigned slot, unsigned ticket, bool ok);
+    void complete_apply(const char* why);
+    void finish_mgmt_job(mgmt_result result, const char* why);
+    /// Render affinity. The KMS state every output's pipeline was last modeset with (the
+    /// combined modeset waits for every pipeline that needs one, M5).
+    static constexpr lx::runtime::clock_time k_modeset_wait_ns = 100'000'000;
+    /// Creates the scanout targets of `p` at its mode (GL, CPU or Vulkan per the present
+    /// backend) — the per-output half of the old `setup_*_present`.
+    [[nodiscard]] lx::result<void> create_targets(output_pipeline& p, bool scanout);
+
+    // ── per-output state (UI affinity unless noted) ──
+    output_ui outs_[output_manager::k_max]{};
+    /// One frame clock per output over one shared timer (ADR 008 M6).
+    scheduler::frame_clocks clocks_{};
+    /// UI → render: bit per output whose view published since render last looked.
+    std::atomic<std::uint32_t> render_mask_{0};
+    /// UI affinity. The outputs `on_vsync` is serving (`tick_ui`); 0 outside a vsync tick
+    /// (a test driving `tick_ui` directly serves every live output).
+    std::uint32_t due_mask_ = 0;
+    bool in_vsync_ = false;
+    /// UI affinity. Served outputs whose tick found nothing to do (`settle_frame_clocks`).
+    std::uint32_t tick_quiet_mask_ = 0;
+    /// UI affinity. Newest frame index published to any view.
+    long long last_published_any_ = -1;
+    /// UI affinity. `outputs.layout_generation()` the views and clocks were synced to.
+    unsigned applied_layout_generation_ = ~0u;
     /// UI affinity. wp_presentation feedback in flight (`p0_.presentation`).
     presentation_feedback_table presentation_feedback_{};
-    /// UI affinity. Output 0's geometry as of the last tick; a change repaints everything.
     /// Debug screenshot (`compositor::request_screenshot`, SIGUSR1 in lumen-compositor):
     /// requested from any thread or a signal handler; UI forces a full repaint, render reads
     /// back the frame it composites next and writes a PPM. Never set in normal operation.
     std::atomic<bool> screenshot_requested_{false};
-    std::atomic<bool> screenshot_pending_{false};
+    /// Render affinity: outputs still to write a screenshot of (bit per slot).
+    std::atomic<std::uint32_t> screenshot_pending_{0};
     unsigned screenshot_count_ = 0;
-    void write_screenshot(unsigned slot);
-    /// Output 0's logical rect and scale as last applied to the scene projection.
-    lx::rect2i last_output_rect_{};
-    double last_output_scale_ = 1.0;
+    void write_screenshot(const output_pipeline& p, unsigned slot);
     /// UI affinity. `outputs.generation()` clients were last told about.
     unsigned output_generation_ = 0;
     /// UI affinity. xdg_wm_base.ping/pong: who is not responding.
     liveness_tracker liveness_{};
     activation_tokens activation_{};
     bool initial_damage_noted_ = false;
-    /// Written by render after compositing, read by UI to retire client buffers. -1 until
-    /// the first frame completes.
-    std::atomic<long long> last_rendered_frame_{-1};
+    /// The render low-water mark (ADR 008 §A.4): the oldest frame an output can still
+    /// sample — the newest rendered frame of any output whose view has an unconsumed
+    /// snapshot or missed damage, else the newest frame rendered at all. Written by render
+    /// after each tick; UI retires client buffers against it, render forgets textures by it.
+    /// -1 until the first frame completes.
+    std::atomic<long long> render_low_water_{-1};
+    /// Render affinity. Computes the mark from every pipeline.
+    [[nodiscard]] long long compute_low_water() const;
     texture_update_queue texture_updates_{};
     /// Render affinity. Updates popped from `texture_updates_` that belong to a snapshot
     /// newer than the one being composited (`texture_update::visible_from_frame`), oldest
@@ -378,25 +861,24 @@ struct compositor_impl {
     shm_direct_uploads shm_direct_{};
 
     // ── cursor ──
-    /// UI affinity; loaded once in `start`.
-    xcursor_theme cursor_theme_{};
-    /// UI → render. Pointer position/visibility, and plane-sized images.
+    /// UI affinity; one theme per distinct output scale (≤ 4), loaded once in `start` at the
+    /// scale's pixel size (ADR 008 §A.7).
+    xcursor_theme cursor_themes_[k_cursor_scales]{};
+    unsigned cursor_theme_count_ = 0;
+    /// The scale (120ths) each theme was loaded for, and XCURSOR_SIZE (logical px).
+    unsigned cursor_theme_scale120_[k_cursor_scales]{};
+    unsigned cursor_base_px_ = 24;
+    /// UI. A scale no theme is loaded for came with an output configuration or a hotplug:
+    /// its theme is loaded (a free slot, or one of a scale no output uses any more), so the
+    /// pointer is as sharp there as anywhere (file I/O on a configuration change only).
+    void sync_cursor_themes();
+    /// UI → render. Pointer position/visibility, and plane-sized images per scale.
     cursor_frame_mailbox cursor_frames_{};
     cursor_image_mailbox cursor_images_{};
     /// Render affinity. The newest cursor frame taken from the mailbox.
     cursor_frame cursor_cur_{};
-    /// Render affinity. Generation of the image staged into the plane's back buffer.
-    unsigned cursor_staged_gen_ = 0;
-    /// Render affinity. The plane passed a TEST_ONLY commit with an image on it.
-    bool cursor_tested_ = false;
-    /// Render affinity. A content commit has gone through: the CRTC is ours (the first one
-    /// is the modeset, which the cursor does not join).
-    bool content_committed_once_ = false;
-    /// Render → UI. The plane is unusable; UI switches the cursor to software.
+    /// Render → UI. A plane is unusable; UI switches the cursor to software everywhere.
     std::atomic<bool> cursor_hw_failed_{false};
-    /// Render → UI. The commit whose flip is pending carried a frame (false: cursor only).
-    /// A cursor-only flip is not a content present: it must not answer frame callbacks.
-    std::atomic<bool> last_commit_content_{true};
 
     // ── Input-to-present latency (ADR-005 cross-cutting). libinput µs and the KMS flip
     //    timestamp are both CLOCK_MONOTONIC, so the difference is what the user feels, up
@@ -410,40 +892,36 @@ struct compositor_impl {
     int latency_cursor_y_ = 0;
     unsigned latency_cursor_gen_ = 0;
     bool latency_cursor_visible_ = false;
-    /// Render → UI. `input_us << 1 | content` of the commit whose flip is pending; 0 when
-    /// none. Written only when 0 (compare-exchange), so a commit racing the flip handler
-    /// drops its sample instead of being timed against the previous commit's flip.
-    std::atomic<unsigned long long> committed_input_us_{0};
     /// UI affinity. Fixed sample window for the periodic summary; no allocation.
     static constexpr unsigned k_latency_window = 600;
     unsigned long long latency_samples_[k_latency_window]{};
     unsigned latency_sample_count_ = 0;
-    /// Render affinity. A commit carrying this tick's cursor frame succeeded.
-    void note_committed_input(bool content);
+    /// Render affinity. A commit of `p` carrying this tick's cursor frame succeeded: its
+    /// pipeline's `committed_input_us` gets `input_us << 1 | content` when free (0), so a
+    /// commit racing the flip handler drops its sample instead of being timed against the
+    /// previous commit's flip.
+    void note_committed_input(output_pipeline& p, bool content);
     /// UI affinity. Logs one present and, every `k_latency_window`, a summary.
-    void note_present_latency(unsigned long long present_ns, unsigned long long submit_us,
-                              unsigned long long fence_us);
+    void note_present_latency(output_pipeline& p, unsigned long long present_ns,
+                              unsigned long long submit_us, unsigned long long fence_us);
     void log_latency_summary();
     /// `output N name=… mode=WxH refresh_mhz=…` (info) for every output: at start and on
     /// every change clients are told about.
     void log_outputs() const;
-    /// Render → UI. When the commit whose flip is pending was issued, and a dup of the
-    /// sync_file its plane waited on (-1 when there was none). With the flip timestamp
-    /// they split a present into compositor, GPU and display time, which is what tells a
-    /// slow tail on a VM host from one in Lumen. Published before the commit ioctl, since
-    /// its flip can be drained before the ioctl returns; taken by the flip handler. Only
-    /// filled while debug logging is on: a dup per commit is not free.
-    std::atomic<unsigned long long> committed_submit_us_{0};
-    std::atomic<int> committed_fence_fd_{-1};
-    /// Render affinity. Publishes the timing above for a commit about to be issued.
-    void publish_commit_timing(int fence_fd);
+    /// Render affinity. When the commit of `p` whose flip is pending was issued, and a dup
+    /// of the sync_file its plane waited on (-1 when there was none). With the flip
+    /// timestamp they split a present into compositor, GPU and display time, which is what
+    /// tells a slow tail on a VM host from one in Lumen. Published before the commit ioctl,
+    /// since its flip can be drained before the ioctl returns; taken by the flip handler.
+    /// Only filled while debug logging is on: a dup per commit is not free.
+    void publish_commit_timing(output_pipeline& p, int fence_fd);
     /// Render affinity. Takes it back after the commit failed.
-    void retract_commit_timing();
+    void retract_commit_timing(output_pipeline& p);
 
-    /// Render affinity. Prepares the plane for this tick's commit (newest position, a new
-    /// image staged into the back buffer) — only when no flip is pending, which is also the
-    /// only time a commit can happen.
-    void prepare_cursor_plane();
+    /// Render affinity. Prepares output `p`'s plane for this tick's commit (newest
+    /// position on this output, the image of its scale staged into the back buffer) —
+    /// only when no flip is pending, which is also the only time a commit can happen.
+    void prepare_cursor_plane(output_pipeline& p);
     /// Render affinity. Marks the plane unusable after a rejected test, once.
     void fail_cursor_plane(const char* why);
 
@@ -473,36 +951,14 @@ struct compositor_impl {
 
     void queue_forget(unsigned texture_id, unsigned retire_after_frame);
     void apply_forget(unsigned texture_id);
-    /// Applies every retirement whose frame has now been composited.
-    void apply_due_forgets(unsigned composited_frame);
+    /// Applies every retirement whose frame no output can still sample (the low-water mark).
+    void apply_due_forgets(long long low_water);
     bool headless_present_ = true;
     bool drm_present_ = false;
     bool vulkan_present_ = false;
     bool cpu_present_ = false;
     bool gl_present_ = false;
-    bool drm_commit_failing_ = false;
 
-    /// Frame clock. A free-running timer drifts against the display: ticks land while a
-    /// flip is still queued and their work is wasted, which is how a 60 Hz output settles
-    /// at a fraction of its refresh. Each completed flip re-arms the timer just ahead of
-    /// the next vblank, so the compositor runs at the display's cadence and in phase.
-    lx::runtime::clock_time refresh_period_ns_ = 16'666'667;
-    /// UI affinity. Decides when each repaint starts so it lands just before the display
-    /// needs it, instead of at the interval boundary — see `scheduler::repaint_scheduler`.
-    /// Touched only from the UI thread, which is why the render cost reaches it through
-    /// `render_cost_us_` rather than being fed in directly from the render thread.
-    scheduler::repaint_scheduler repaint_{};
-    /// Written by render at the end of each tick, read by UI when it re-arms the frame
-    /// clock. Relaxed: it is a cost estimate, and a one-frame-stale value only shifts the
-    /// next start by the difference between two adjacent frames.
-    std::atomic<unsigned> render_cost_us_{0};
-    /// Composite must finish before the vblank it targets; waking exactly on it would miss.
-    static constexpr lx::runtime::clock_time k_frame_deadline_margin_ns = 2'000'000;
-
-    /// Frame-callback pacing. UI affinity: set by the page-flip handler (drained from
-    /// tick_ui) and consumed there. `last_callback_ns_` backs the stall watchdog below.
-    bool present_completed_ = false;
-    lx::runtime::clock_time last_callback_ns_ = 0;
     /// If the present path stops reporting flips, clients would never be told to draw
     /// again. Past this gap, fall back to tick pacing so a broken output cannot wedge them.
     static constexpr lx::runtime::clock_time k_callback_stall_ns = 250'000'000;
@@ -511,6 +967,7 @@ struct compositor_impl {
     /// ticks — the hot path must not emit a warn per frame.
     static constexpr unsigned k_budget_report_frames = 600;
     unsigned ui_over_budget_ = 0;
+    unsigned ui_over_budget_max_us_ = 0;
     unsigned ui_budget_window_ = 0;
     unsigned render_over_budget_ = 0;
     unsigned render_budget_window_ = 0;
@@ -521,22 +978,31 @@ struct compositor_impl {
     std::unique_ptr<runtime::fd_source> input_fd_source{};
     std::unique_ptr<runtime::event_source> logind_source{};
 
-    /// The frame clock runs only while there is something to do. Two consecutive ticks that
-    /// find nothing — no damage, no frame callback or buffer waiting on a later frame, no
-    /// flip or commit outstanding, nothing the window manager deferred — stop it; any
-    /// client request, input event or flip starts it again, aligned to the display. An
-    /// idle desktop then wakes once a second for `housekeeping_timer` instead of 60 times.
-    static constexpr unsigned k_idle_ticks = 2;
-    unsigned quiet_ticks_ = 0;
-    bool tick_quiet_ = false;
-    /// While the clock is stopped: one tick a second for the deadlines only a tick notices
+    /// The frame clocks run only while there is something to do. An output whose two
+    /// consecutive ticks find nothing for it — no damage, no frame of it the render thread
+    /// has not reached, no flip or commit outstanding on it — stops (unless something only
+    /// a tick finishes is pending anywhere: a frame callback, a buffer, deferred WM work);
+    /// any client request, input event or flip starts it again, aligned to its display.
+    /// With every clock stopped, an idle desktop wakes once a second for
+    /// `housekeeping_timer` instead of 60 times per output.
+    /// While every clock is stopped: one tick a second for the deadlines only a tick notices
     /// (liveness pings, unmapping idle staging blocks).
     std::unique_ptr<runtime::timer_source> housekeeping_timer{};
     static constexpr runtime::clock_time k_housekeeping_ns = 1'000'000'000;
-    /// UI thread. Starts the frame clock if it is stopped.
-    void request_frame();
-    /// UI thread, after each tick: stop the clock if this tick was the k-th quiet one.
-    void settle_frame_clock();
+    /// UI thread. Starts the frame clocks of `mask` (default: every live output) that are
+    /// stopped and not dark, and re-arms the shared timer.
+    void request_frame(std::uint32_t mask = ~0u);
+    /// UI. Output `slot` flipped a frame with client content: its frame callbacks now.
+    void fire_flip_callbacks(unsigned slot);
+    /// UI thread: arms the shared timer at the earliest running clock, or the housekeeping
+    /// timer when none runs.
+    void rearm_frame_timer();
+    /// UI thread, after each tick: per served output, stop its clock if this was its k-th
+    /// quiet tick.
+    void settle_frame_clocks(std::uint32_t served, std::uint32_t quiet);
+    /// UI thread: the per-output state follows the output manager (views, clocks, the
+    /// lock's outputs) — at start and whenever the layout moved.
+    void sync_output_views();
 
     /// UI thread. Brings up libinput and routes its events to focused clients.
     void start_input();
@@ -584,11 +1050,12 @@ struct compositor_impl {
           import_cache{graphics.dmabuf(), c.import_cache},
           buffer_lifecycle_{import_cache},
           memory_{c.memory}, budget_{c.hot_path} {
-        scene.snapshots().set_config(c.snapshot);
+        scene.set_snapshot_config(c.snapshot);
         (void)scene.root().add(&background_layer_);
         (void)scene.root().add(&bottom_layer_);
         (void)scene.root().add(&windows_layer_);
         (void)scene.root().add(&top_layer_);
+        (void)scene.root().add(&fullscreen_layer_);
         (void)scene.root().add(&overlay_shell_layer_);
         (void)scene.root().add(&popup_layer_);
         (void)scene.root().add(&dnd_icon_layer_);
@@ -599,14 +1066,15 @@ struct compositor_impl {
         surfaces.set_scene(&scene);
         tree_.bind(surfaces, scene);
         shell_bridge_.set_toplevels(&toplevels);
-        for (auto& slot : slot_age_damage_)
-            slot.set_full();
-        kms_pending_damage_.set_full();
         frame_renderer_.set_pipeline_cache(&pipeline_cache_);
         seats.bind(this);
     }
 
     ~compositor_impl() {
+        // Clients first, while everything their objects' destructors reach (the scene, the
+        // window manager, the tree) is still alive: members are destroyed in reverse order,
+        // and the server is declared first.
+        wayland.destroy_clients();
         // libinput closes its devices through the provider, which hands them back to
         // logind: that has to happen while the session object is still alive.
         input_devices_ = lx::input::input_manager{};
@@ -617,8 +1085,12 @@ struct compositor_impl {
             if (u.dmabuf_fd >= 0)
                 ::close(u.dmabuf_fd);
         }
-        if (const int fd = committed_fence_fd_.exchange(-1); fd >= 0)
-            ::close(fd);
+        // Pipelines before the device they restore the console's CRTCs through.
+        for (auto& p : pipes_)
+            p.reset();
+        // Retired pipelines whose hand-over to UI never ran (the loop stopped first).
+        for (auto& t : in_transit_)
+            delete t.exchange(nullptr);
     }
 
     compositor_impl(const compositor_impl&) = delete;
@@ -641,21 +1113,23 @@ struct compositor_impl {
 
     void start_threads();
     void stop_threads();
-    void on_vsync();
+    /// One tick of the frame clocks: the outputs due now (`frame_clocks::take_due`) plus
+    /// `forced` (the housekeeping and paused ticks serve outputs whose clock is stopped).
+    void on_vsync(std::uint32_t forced = 0);
     void render_loop();
     void worker_loop();
     void register_p0_globals();
 
-    /// UI thread: rotate scanout front buffer after a successful page flip.
-    void on_scanout_flip(unsigned slot);
+    /// A flip of one output's pipeline (UI thread; `user_data` is the `output_pipeline`).
     static void presentation_flip_handler(scheduler::presentation_feedback fb, void* user_data);
+    void on_output_flip(output_pipeline& p, const scheduler::presentation_feedback& fb);
 
     /// Render-affinity only: apply queued client-buffer updates before compositing the
     /// snapshot of `frame` — only those that snapshot may show (see `deferred_updates_`).
     void drain_texture_updates(unsigned frame);
     /// Render-affinity only: one update, applied now.
     void apply_texture_update(texture_update& update);
-    /// Render-affinity only: bring up the GPU composite target and its scanout FB.
+    /// Bring up the Vulkan composite (targets per output come from `create_targets`).
     [[nodiscard]] lx::result<void> setup_vulkan_present();
     /// Creates the Vulkan device if it does not exist yet (start-up defers it when Vulkan
     /// will not composite). Idempotent; failure leaves the soft-import default in place.
@@ -673,10 +1147,23 @@ struct compositor_impl {
     lx::runtime::clock_time logout_deadline_ns_ = 0;
     /// Bring up CPU-writable dumb-buffer scanout. Requires DRM master.
     [[nodiscard]] lx::result<void> setup_cpu_present();
-    /// Render-affinity only: bring up EGL/GBM and the GL scanout targets.
+    /// Bring up EGL/GBM for the GL composite (targets per output from `create_targets`).
     [[nodiscard]] lx::result<void> setup_gl_present();
-    /// The scanout slot that is neither on screen nor queued for a flip.
-    [[nodiscard]] unsigned pick_back_slot() const;
+    /// UI, at start: the CRTC allocation (`drm::assign_crtcs`, each candidate checked by a
+    /// TEST_ONLY of the full state with the real framebuffers) and one pipeline per output.
+    [[nodiscard]] lx::result<void> create_pipelines();
+    /// UI, at start: the pipelines' cursor planes.
+    void create_cursor_planes(unsigned need_px);
+    /// Render. Composites output `p` from `snapshot` (its view's, acquired) and releases
+    /// it; true when it drew.
+    bool composite_output(output_pipeline& p, unsigned slot,
+                          const scene::immutable_frame_snapshot& snapshot, unsigned& rects,
+                          unsigned long long& area);
+    /// Render. Commits `p`'s composited frame (and its cursor), or a cursor-only commit.
+    const char* commit_output(output_pipeline& p, unsigned slot, bool composited);
+    /// Render. Every pipeline that needs a modeset and has a frame: one combined commit (M5).
+    /// `kinds[slot]` receives what each pipeline committed.
+    void commit_pending_modesets(const char** kinds);
 
     static compositor_impl* active;
     static void vsync_callback();
@@ -770,13 +1257,15 @@ void compositor_impl::request_vt_switch(unsigned vt) {
     lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
 }
 
-void compositor_impl::note_committed_input(bool content) {
+void compositor_impl::note_committed_input(output_pipeline& p, bool content) {
     const cursor_frame& f = cursor_cur_;
-    const bool changed = f.x != latency_cursor_x_ || f.y != latency_cursor_y_ ||
+    const int fx = static_cast<int>(std::floor(f.x * 256.0));
+    const int fy = static_cast<int>(std::floor(f.y * 256.0));
+    const bool changed = fx != latency_cursor_x_ || fy != latency_cursor_y_ ||
                          f.image_generation != latency_cursor_gen_ ||
                          f.visible != latency_cursor_visible_;
-    latency_cursor_x_ = f.x;
-    latency_cursor_y_ = f.y;
+    latency_cursor_x_ = fx;
+    latency_cursor_y_ = fy;
     latency_cursor_gen_ = f.image_generation;
     latency_cursor_visible_ = f.visible;
     if (!changed)
@@ -786,9 +1275,9 @@ void compositor_impl::note_committed_input(bool content) {
         return;
     latency_reported_input_us_ = in;
     unsigned long long expected = 0;
-    (void)committed_input_us_.compare_exchange_strong(expected, (in << 1) | (content ? 1u : 0u),
-                                                      std::memory_order_release,
-                                                      std::memory_order_relaxed);
+    (void)p.committed_input_us.compare_exchange_strong(expected, (in << 1) | (content ? 1u : 0u),
+                                                       std::memory_order_release,
+                                                       std::memory_order_relaxed);
 }
 
 namespace {
@@ -854,25 +1343,25 @@ unsigned long long monotonic_us() {
 }
 } // namespace
 
-void compositor_impl::publish_commit_timing(int fence_fd) {
+void compositor_impl::publish_commit_timing(output_pipeline& p, int fence_fd) {
     if (lx::trace::logger::global().min_level() > lx::trace::level::debug)
         return;
     const int dup_fd = fence_fd >= 0 ? ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0) : -1;
-    if (const int old = committed_fence_fd_.exchange(dup_fd, std::memory_order_acq_rel); old >= 0)
+    if (const int old = p.committed_fence_fd.exchange(dup_fd, std::memory_order_acq_rel); old >= 0)
         ::close(old);
-    committed_submit_us_.store(monotonic_us(), std::memory_order_release);
+    p.committed_submit_us.store(monotonic_us(), std::memory_order_release);
 }
 
-void compositor_impl::retract_commit_timing() {
-    committed_submit_us_.store(0, std::memory_order_release);
-    if (const int old = committed_fence_fd_.exchange(-1, std::memory_order_acq_rel); old >= 0)
+void compositor_impl::retract_commit_timing(output_pipeline& p) {
+    p.committed_submit_us.store(0, std::memory_order_release);
+    if (const int old = p.committed_fence_fd.exchange(-1, std::memory_order_acq_rel); old >= 0)
         ::close(old);
 }
 
-void compositor_impl::note_present_latency(unsigned long long present_ns,
+void compositor_impl::note_present_latency(output_pipeline& p, unsigned long long present_ns,
                                            unsigned long long submit_us,
                                            unsigned long long fence_us) {
-    const unsigned long long packed = committed_input_us_.exchange(0, std::memory_order_acquire);
+    const unsigned long long packed = p.committed_input_us.exchange(0, std::memory_order_acquire);
     if (packed == 0 || present_ns == 0)
         return;
     const unsigned long long input_us = packed >> 1;
@@ -891,9 +1380,9 @@ void compositor_impl::note_present_latency(unsigned long long present_ns,
     char line[224];
     std::snprintf(line, sizeof(line),
                   "present kind=%s input_us=%llu present_us=%llu latency_us=%llu "
-                  "submit_us=%llu fence_us=%llu",
+                  "submit_us=%llu fence_us=%llu output=%u",
                   (packed & 1u) ? "content" : "cursor", input_us, present_us, latency_us,
-                  submit_us, fence_us);
+                  submit_us, fence_us, p.slot);
     lx::trace::logger::global().log(lx::trace::level::debug, "compositor.latency", line);
     latency_samples_[latency_sample_count_++] = latency_us;
     if (latency_sample_count_ == k_latency_window)
@@ -906,14 +1395,112 @@ void compositor_impl::log_outputs() const {
             continue;
         const output_state& o = outputs.slot_state(slot);
         const lx::rect2i l = o.logical_rect();
-        char line[192];
+        char line[448];
         std::snprintf(line, sizeof(line),
                       "output %u name=%s mode=%dx%d refresh_mhz=%u scale=%g (%ld/120) "
-                      "logical=%dx%d+%d+%d",
+                      "logical=%dx%d+%d+%d identifier=\"%s\"",
                       slot, o.name, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
-                      std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y);
+                      std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y, o.identifier);
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
     }
+}
+
+void compositor_impl::sync_output_views() {
+    // UI. Views, clocks and per-output state follow the output manager: a live output gets
+    // its view (projection, full damage on change), its frame clock at its refresh, and its
+    // render pipeline's projection; a gone one loses them.
+    bool changed = false;
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        output_ui& o = outs_[s];
+        if (!outputs.slot_live(s)) {
+            if (!o.live)
+                continue;
+            scene.remove_output_view(s);
+            clocks_.set_live(s, false, 0);
+            o = output_ui{};
+            changed = true;
+            continue;
+        }
+        const output_state& st = outputs.slot_state(s);
+        const lx::rect2i l = st.logical_rect();
+        const bool fresh = !o.live || o.id != st.id;
+        if (fresh) {
+            // The pipeline handle is set by whoever made the pipeline (start, an add's
+            // answer) and survives the reset.
+            output_pipeline* const pipe = o.pipe;
+            o = output_ui{};
+            o.pipe = pipe;
+            o.live = true;
+            o.id = st.id;
+            const unsigned mhz = st.refresh_mhz > 0 ? st.refresh_mhz : 60000u;
+            clocks_.set_live(s, true,
+                             static_cast<lx::runtime::clock_time>(1'000'000'000'000.0 / mhz));
+            clocks_.set_vrr(s, st.adaptive_sync);
+            changed = true;
+            o.refresh_mhz = st.refresh_mhz;
+        } else if (st.refresh_mhz != o.refresh_mhz) {
+            // A new mode (a refresh-only change too: 2560x1440@60 to @144): its refresh is
+            // the clock's period now.
+            o.refresh_mhz = st.refresh_mhz;
+            const unsigned mhz = st.refresh_mhz > 0 ? st.refresh_mhz : 60000u;
+            clocks_.clock(s).set_refresh_period(
+                static_cast<lx::runtime::clock_time>(1'000'000'000'000.0 / mhz));
+        }
+        if (fresh || l.x != o.logical.x || l.y != o.logical.y || l.width != o.logical.width ||
+            l.height != o.logical.height || st.scale != o.scale ||
+            st.mode.width != o.mode.width || st.mode.height != o.mode.height ||
+            st.transform != o.transform) {
+            o.logical = l;
+            o.scale = st.scale;
+            o.mode = st.mode;
+            o.transform = st.transform;
+            // Layout → this output's pixels, applied where draws and damage are made. Every
+            // pixel of the view moves with it (`set_output_view` notes full damage).
+            const auto transform = static_cast<lx::buffer_transform>(st.transform & 7u);
+            scene::output_view_config v{};
+            v.logical = l;
+            v.projection = {{l.x, l.y}, st.scale, st.mode, transform};
+            scene.set_output_view(s, v);
+            changed = true;
+            // Render's copy of the projection (the cursor plane's position on this output).
+            if (output_pipeline* p = o.pipe) {
+                const lx::point2i origin{l.x, l.y};
+                const double scale = st.scale;
+                if (threads_started.load(std::memory_order_acquire)) {
+                    // By slot, looked up on render, never the pointer: the output may be
+                    // retired, and its pipeline freed on UI, before render drains this task
+                    // (a dock unplug re-arranges the second monitor, then removes it in the
+                    // same scan). The task is drained no later than the render iteration
+                    // that runs the retire, and a slot is reused only after that, so the
+                    // pipeline found is this output's or none.
+                    compositor_impl* self = this;
+                    (void)runtime::executor::global().post(
+                        runtime::affinity::render, [self, s, origin, scale, transform] {
+                            output_pipeline* rp = self->pipes_[s].get();
+                            if (!rp || rp->retiring)
+                                return;
+                            rp->origin = origin;
+                            rp->scale = scale;
+                            if (rp->transform != transform) {
+                                rp->transform = transform;
+                                rp->cursor_staged_gen = 0;
+                            }
+                        });
+                } else {
+                    p->origin = origin;
+                    p->scale = scale;
+                    p->transform = transform;
+                }
+            }
+        }
+    }
+    applied_layout_generation_ = outputs.layout_generation();
+    if (!changed)
+        return;
+    // Layer surfaces are arranged against their outputs, and the usable areas with them;
+    // window decorations follow their outputs' scales.
+    wm_.on_output_changed();
+    request_frame();
 }
 
 void compositor_impl::log_latency_summary() {
@@ -942,55 +1529,101 @@ void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) 
     wm_.on_modifiers();
 }
 
-void compositor_impl::prepare_cursor_plane() {
-    if (!cursor_plane_.valid())
+void compositor_impl::prepare_cursor_plane(output_pipeline& p) {
+    if (!p.kms || !p.cursor.valid())
         return;
     // Before the first content commit the plane joins the modeset only once it has passed
     // its test (a resume); at startup it is stated off there and joins the next commit.
-    if ((!content_committed_once_ && !cursor_tested_) || kms_atomic.flip_pending())
+    if ((!p.content_committed_once && !p.cursor_tested) || p.kms->flip_pending())
         return;
-    if (display_gate_.load(std::memory_order_acquire) != 0)
+    if (display_gate_.load(std::memory_order_acquire) != 0 ||
+        (gate_power_mask_.load(std::memory_order_acquire) & (1u << p.slot)) != 0)
         return;
 
     const bool failed = cursor_hw_failed_.load(std::memory_order_relaxed);
     bool want = !failed && cursor_cur_.visible && cursor_cur_.hardware;
-    if (want && cursor_cur_.image_generation != cursor_staged_gen_) {
-        // The image mailbox may already hold a newer one than this frame references; the
-        // newest is always right to show.
-        (void)cursor_images_.take();
-        const cursor_plane_image& img = cursor_images_.front();
-        if (img.generation != 0 && img.generation != cursor_staged_gen_) {
-            if (auto staged = cursor_plane_.stage_image(img.pixels.data(), img.width,
-                                                        img.height, img.width, img.hot_x,
-                                                        img.hot_y);
-                staged) {
-                cursor_staged_gen_ = img.generation;
-            } else {
-                fail_cursor_plane("image does not fit the plane");
-                want = false;
-            }
+    const unsigned scale120 = static_cast<unsigned>(std::lround(p.scale * 120.0));
+    const cursor_image_set& set = cursor_images_.front();
+    const cursor_plane_image* img = set.for_scale(scale120);
+    // A turned output (ADR 008 §C.4) shows the image turned the same way, its hotspot with it:
+    // turned once per image change, never per motion.
+    const lx::buffer_transform t = p.transform;
+    const bool turned = t != lx::buffer_transform::normal;
+    unsigned img_w = img ? img->width : 0;
+    unsigned img_h = img ? img->height : 0;
+    int hot_x = img ? img->hot_x : 0;
+    int hot_y = img ? img->hot_y : 0;
+    if (img && turned) {
+        if ((static_cast<unsigned>(t) & 1u) != 0) {
+            img_w = img->height;
+            img_h = img->width;
         }
-        if (cursor_staged_gen_ == 0)
-            want = false; // nothing staged yet: do not show an empty buffer
+        const lx::rect2i h = gfx::transform_rect({img->hot_x, img->hot_y, 1, 1}, t,
+                                                 static_cast<int>(img->width),
+                                                 static_cast<int>(img->height));
+        hot_x = h.x;
+        hot_y = h.y;
     }
-    cursor_plane_.set_visible(want);
-    cursor_plane_.set_position(cursor_cur_.x, cursor_cur_.y);
+    if (want && img && set.generation != 0 && set.generation != p.cursor_staged_gen) {
+        const std::uint32_t* pixels = img->pixels.data();
+        if (turned) {
+            const std::size_t px_count = static_cast<std::size_t>(img->width) * img->height;
+            if (p.cursor_turned.size() < px_count)
+                p.cursor_turned.resize(px_count);
+            for (unsigned y = 0; y < img->height; ++y)
+                for (unsigned x = 0; x < img->width; ++x) {
+                    const lx::rect2i d = gfx::transform_rect(
+                        {static_cast<int>(x), static_cast<int>(y), 1, 1}, t,
+                        static_cast<int>(img->width), static_cast<int>(img->height));
+                    p.cursor_turned[static_cast<std::size_t>(d.y) * img_w + static_cast<unsigned>(d.x)] =
+                        img->pixels[static_cast<std::size_t>(y) * img->width + x];
+                }
+            pixels = p.cursor_turned.data();
+        }
+        if (auto staged = p.cursor.stage_image(pixels, img_w, img_h, img_w, hot_x, hot_y); staged) {
+            p.cursor_staged_gen = set.generation;
+        } else {
+            fail_cursor_plane("image does not fit the plane");
+            want = false;
+        }
+    }
+    if (p.cursor_staged_gen == 0 || !img)
+        want = false; // nothing staged yet: do not show an empty buffer
+    // The hotspot's pixel on this output; the plane is on only where its image reaches the
+    // output — a pointer straddling two outputs shows a half on each (wlroots).
+    int px = static_cast<int>(std::floor((cursor_cur_.x - p.origin.x) * p.scale));
+    int py = static_cast<int>(std::floor((cursor_cur_.y - p.origin.y) * p.scale));
+    if (turned) {
+        const bool swap = (static_cast<unsigned>(t) & 1u) != 0;
+        const int cw = swap ? p.mode.height : p.mode.width;
+        const int ch = swap ? p.mode.width : p.mode.height;
+        const lx::rect2i d = gfx::transform_rect({px, py, 1, 1}, t, cw, ch);
+        px = d.x;
+        py = d.y;
+    }
+    if (want && img) {
+        const int x0 = px - hot_x;
+        const int y0 = py - hot_y;
+        want = x0 < p.mode.width && y0 < p.mode.height &&
+               x0 + static_cast<int>(img_w) > 0 && y0 + static_cast<int>(img_h) > 0;
+    }
+    p.cursor.set_visible(want);
+    p.cursor.set_position(px, py);
 
     // Validate once, before the plane's state rides a content commit: a rejection there
     // would fail the frame too. TEST_ONLY applies nothing and raises no event.
-    if (want && !cursor_tested_ && cursor_plane_.dirty()) {
+    if (want && !p.cursor_tested && p.cursor.dirty()) {
         drm::atomic_commit_request test{};
-        test.connector = 0;
         test.update_primary = false;
-        test.cursor = &cursor_plane_;
+        test.cursor = &p.cursor;
         test.request_page_flip = false;
         test.test_only = true;
-        if (auto ok = kms_atomic.commit(test); ok) {
-            cursor_tested_ = true;
-        } else if (kms_atomic.last_failure_rejected_state()) {
+        if (auto ok = p.kms->commit(test); ok) {
+            p.cursor_tested = true;
+        } else if (p.kms->last_failure_rejected_state()) {
             lx::trace::logger::global().log_error(ok.get_error(), "compositor.cursor");
             fail_cursor_plane("TEST_ONLY commit rejected");
-            cursor_plane_.set_visible(false);
+            p.cursor.set_visible(false);
         }
         // Otherwise the device was unavailable (DRM master on another VT): that says
         // nothing about the plane, so the test runs again on a later tick.
@@ -1018,14 +1651,20 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     // screen. lx.input accumulates only relative motion, which is why absolute devices
     // used to leave the pointer at the origin for the whole session.
     // Layout (logical) coordinates: the pointer moves in logical units at any scale
-    // (wlroots, Mutter), and an absolute device covers the output's logical rect.
+    // (wlroots, Mutter). An absolute device covers the layout's bounding box (the VMware
+    // mouse spans the host window, which is the bounding box of the guest topology), and
+    // the pointer stays on the union of the outputs: the nearest point of the nearest
+    // output when it would leave them or fall into a gap (ADR 008 M9).
     if (outputs.count() > 0) {
-        const lx::rect2i geometry = outputs.logical_rect(outputs.nth(0));
         if (event.absolute) {
-            seat.set_pointer_position(geometry.x + event.x * geometry.width,
-                                      geometry.y + event.y * geometry.height);
+            const lx::rect2i bounds = layout_bounds(outputs);
+            seat.set_pointer_position(bounds.x + event.x * bounds.width,
+                                      bounds.y + event.y * bounds.height);
         }
-        seat.constrain_pointer(geometry);
+        double x = seat.pointer_x();
+        double y = seat.pointer_y();
+        if (closest_point(outputs, x, y) && (x != seat.pointer_x() || y != seat.pointer_y()))
+            seat.set_pointer_position(x, y);
     }
     // O(1): records the position and, outside a grab, publishes it for render's next
     // commit. No composite is involved while the cursor plane is in use.
@@ -1207,24 +1846,29 @@ void compositor_impl::wayland_fd_callback() {
         return;
     lx::trace::scoped_span span{"ui", "wayland.pump"};
     (void)active->wayland.dispatch(0);
-    // Whatever a client asked for is applied, configured and composited by a tick.
-    active->request_frame();
+    // Whatever a client asked for is applied, configured and composited by a tick — of the
+    // outputs it damaged when it damaged any (each on its own phase), else of every output
+    // (a frame callback or a configure answer is served by whichever ticks).
+    const std::uint32_t damaged = active->scene.pending_damage_mask();
+    active->request_frame(damaged != 0 ? damaged : ~0u);
 }
 
 void compositor_impl::drm_fd_callback() {
     if (!active || !active->drm_present_)
         return;
-    // The moment the flip lands, not at the next poll: the flip handler phase-locks the
-    // frame clock to it, and frame callbacks wait for it.
-    active->kms_atomic.dispatch_events();
+    // The moment a flip lands, not at the next poll: the flip handler phase-locks that
+    // output's frame clock to it, and frame callbacks wait for it. One drain serves every
+    // pipeline: the device routes each event to the pipeline whose CRTC it names.
+    active->kms.dispatch_events();
 }
 
 void compositor_impl::housekeeping_callback() {
     if (!active)
         return;
-    if (active->session_.display_stopped() ||
-        (active->display_gate_.load(std::memory_order_relaxed) & gate_power) != 0) {
-        // The paused tick, once a second (VT away, or the output powered off): a lost
+    const std::uint32_t live = active->outputs.live_mask();
+    const std::uint32_t dark = active->gate_power_mask_.load(std::memory_order_relaxed);
+    if (active->session_.display_stopped() || (live != 0 && (dark & live) == live)) {
+        // The paused tick, once a second (VT away, or every output powered off): a lost
         // ResumeDevice (or a card logind does not manage) is noticed here, and clients
         // still get their frame callbacks.
         if (active->session_.display_stopped()) {
@@ -1233,26 +1877,29 @@ void compositor_impl::housekeeping_callback() {
             const bool master = session_active && active->kms.is_master();
             active->apply_session_actions(active->session_.on_paused_tick(session_active, master));
         }
-        if (active->display_gate_.load(std::memory_order_relaxed) != 0)
-            active->on_vsync();
+        active->on_vsync();
+        if (active->clocks_.running_mask() == 0 && active->housekeeping_timer)
+            active->housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
         return;
     }
-    // The frame clock is stopped: surfaces not on screen get their throttled frame
-    // callbacks here, about once a second, without restarting it for them.
+    // Every frame clock is stopped: surfaces not on screen get their throttled frame
+    // callbacks here, about once a second, without restarting a clock for them.
     if (frame_callbacks_throttled(active->p0_)) {
         const auto now = now_ns();
         fire_visible_frame_callbacks(active->p0_, static_cast<unsigned>(now / 1'000'000ull),
-                                     active->last_published_frame_, now);
+                                     now);
     }
-    active->request_frame();
-    // Nothing woke the clock but the calendar: one quiet tick is enough to stop again.
-    active->quiet_ticks_ = k_idle_ticks - 1;
+    // One tick of every lit output for the deadlines only a tick notices; nothing woke the
+    // clocks but the calendar, so one quiet tick is enough to stop them again.
+    active->on_vsync();
+    if (active->clocks_.running_mask() == 0 && active->housekeeping_timer)
+        active->housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
 }
 
-void compositor_impl::write_screenshot(unsigned slot) {
+void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) {
     // Render thread, on request only: a full-frame read back and a synchronous write. Not a
     // hot-path operation and never part of a normal frame.
-    const auto& target = gl_targets_[slot];
+    const auto& target = p.gl[slot];
     const unsigned w = target.width();
     const unsigned h = target.height();
     std::vector<unsigned char> rgba(static_cast<std::size_t>(w) * h * 4u);
@@ -1264,9 +1911,11 @@ void compositor_impl::write_screenshot(unsigned slot) {
     const char* dir = std::getenv("LUMEN_SCREENSHOT_DIR");
     if (!dir || !*dir)
         dir = std::getenv("XDG_RUNTIME_DIR");
+    // lumen-screenshot-<n>-<output>.ppm: one file per output of the same request.
+    const output_state& o = outputs.slot_state(p.slot);
     char path[512];
-    std::snprintf(path, sizeof(path), "%s/lumen-screenshot-%u.ppm", dir ? dir : "/tmp",
-                  ++screenshot_count_);
+    std::snprintf(path, sizeof(path), "%s/lumen-screenshot-%u-%s.ppm", dir ? dir : "/tmp",
+                  screenshot_count_, outputs.slot_live(p.slot) ? o.name : "gone");
     std::FILE* f = std::fopen(path, "wb");
     if (!f) {
         lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
@@ -1279,60 +1928,70 @@ void compositor_impl::write_screenshot(unsigned slot) {
         std::fwrite(&rgba[i * 4u], 1, 3, f);
     std::fclose(f);
     char line[600];
-    std::snprintf(line, sizeof(line), "screenshot %ux%u written to %s", w, h, path);
+    std::snprintf(line, sizeof(line), "screenshot %ux%u written to %s (output %u)", w, h, path,
+                  p.slot);
     lx::trace::logger::global().log(lx::trace::level::info, "compositor.render", line);
 }
 
 void compositor_impl::after_dispatch_callback() {
     if (active && active->screenshot_requested_.exchange(false, std::memory_order_acq_rel)) {
-        // Every pixel repainted into the slot that is read back.
+        // Every pixel of every output repainted into the slot that is read back.
+        ++active->screenshot_count_;
         active->scene.note_full_damage();
-        active->screenshot_pending_.store(true, std::memory_order_release);
+        active->screenshot_pending_.store(active->outputs.live_mask(), std::memory_order_release);
         active->request_frame();
     }
+    // Output heads that changed in this iteration (hotplug, an apply, a mode switch): one
+    // round of events and one `done` for all of it.
+    if (active)
+        active->flush_output_heads();
     // Events produced anywhere in this iteration (input, protocol replies, releases) leave
     // in one flush rather than waiting for the next tick.
     if (active)
         active->wayland.flush();
 }
 
-void compositor_impl::request_frame() {
-    // Paused or dark: the 1 Hz paused tick is the only clock; requests and flips do not
-    // start one.
-    if (!vsync_timer || vsync_timer->enabled() ||
-        display_gate_.load(std::memory_order_relaxed) != 0)
-        return;
-    const auto now = static_cast<lx::runtime::clock_time>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count());
-    // On the display's phase: the vblank cadence continues while the clock is stopped, so
-    // the last flip still predicts the next deadline.
-    vsync_timer->schedule_at(repaint_.next_start(now));
-    if (housekeeping_timer)
-        housekeeping_timer->set_enabled(false);
-    quiet_ticks_ = 0;
-    // Time spent stopped is neither a frame interval nor a stalled present.
-    last_vsync_time = std::chrono::steady_clock::now();
-    last_callback_ns_ = 0;
-}
-
-void compositor_impl::settle_frame_clock() {
+void compositor_impl::request_frame(std::uint32_t mask) {
+    // Paused: the 1 Hz paused tick is the only clock; requests and flips do not start one.
+    // A dark output (powered off) is never started (`frame_clocks::set_dark`).
     if (!vsync_timer || display_gate_.load(std::memory_order_relaxed) != 0)
         return;
-    if (!tick_quiet_) {
-        quiet_ticks_ = 0;
+    const std::uint32_t started = clocks_.request(mask, now_ns());
+    if (started == 0)
+        return;
+    // Time spent stopped is neither a frame interval nor a stalled present.
+    for (unsigned s = 0; s < output_manager::k_max; ++s)
+        if (started & (1u << s))
+            outs_[s].last_callback_ns = 0;
+    last_vsync_time = std::chrono::steady_clock::now();
+    rearm_frame_timer();
+}
+
+void compositor_impl::rearm_frame_timer() {
+    if (!vsync_timer)
+        return;
+    const lx::runtime::clock_time next = clocks_.next_wakeup();
+    if (next != 0) {
+        vsync_timer->schedule_at(next);
+        if (housekeeping_timer)
+            housekeeping_timer->set_enabled(false);
         return;
     }
-    if (++quiet_ticks_ < k_idle_ticks)
-        return;
     vsync_timer->set_enabled(false);
-    if (housekeeping_timer)
-        housekeeping_timer->schedule_at(
-            static_cast<lx::runtime::clock_time>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now().time_since_epoch()).count()) +
-            k_housekeeping_ns);
-    lx::trace::timeline_instant("ui", "clock.idle");
+    if (housekeeping_timer && !housekeeping_timer->enabled())
+        housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
+}
+
+void compositor_impl::settle_frame_clocks(std::uint32_t served, std::uint32_t quiet) {
+    if (!vsync_timer || display_gate_.load(std::memory_order_relaxed) != 0)
+        return;
+    bool stopped_any = false;
+    for (unsigned s = 0; s < output_manager::k_max; ++s)
+        if (served & (1u << s))
+            stopped_any = clocks_.settle(s, (quiet & (1u << s)) != 0) || stopped_any;
+    rearm_frame_timer();
+    if (stopped_any && clocks_.running_mask() == 0)
+        lx::trace::timeline_instant("ui", "clock.idle");
 }
 
 /// dev_t clients should allocate dma-bufs on (zwp_linux_dmabuf_feedback_v1.main_device):
@@ -1382,6 +2041,7 @@ void compositor_impl::register_p0_globals() {
     p0_.tree = &tree_;
     wm_.bind(toplevels, surfaces, tree_, scene, windows_layer_, input_router_,
              input_devices_.default_seat(), shell_bridge_, outputs);
+    wm_.set_fullscreen_layer(&fullscreen_layer_);
     popups_.bind(toplevels, surfaces, tree_, popup_layer_);
     wm_.set_popups(&popups_);
     p0_.popups = &popups_;
@@ -1417,15 +2077,19 @@ void compositor_impl::register_p0_globals() {
     };
     // Display power needs a display: without KMS (headless, nested) the objects are failed.
     if (drm_present_) {
-        p0_.set_output_power = [](void* u, unsigned, bool on) {
-            static_cast<compositor_impl*>(u)->request_output_power(on);
+        p0_.set_output_power = [](void* u, unsigned slot, bool on) {
+            static_cast<compositor_impl*>(u)->request_output_power(slot, on);
         };
-        p0_.output_power_on = [](void* u, unsigned) {
-            return static_cast<compositor_impl*>(u)->power_.reported_on();
+        p0_.output_power_on = [](void* u, unsigned slot) {
+            auto* self = static_cast<compositor_impl*>(u);
+            return slot < output_manager::k_max ? self->outs_[slot].power.reported_on() : true;
         };
     }
     p0_.text_input = &text_input_;
     p0_.ime_popup_layer = &ime_popup_layer_;
+    // wlr-output-management: a queued apply/test runs when nothing else does.
+    p0_.output_mgmt_user = this;
+    p0_.output_mgmt_kick = [](void* u) { static_cast<compositor_impl*>(u)->run_next_mgmt_job(); };
     {
         wm_ime_ops ops{};
         ops.user = this;
@@ -1553,6 +2217,9 @@ void compositor_impl::register_p0_globals() {
     if (auto installed = install_p0_protocols(p0_); !installed) {
         lx::trace::logger::global().log_error(installed.get_error(), "compositor");
     }
+    // The heads every zwlr_output_manager_v1 is told about from its first bind.
+    mark_heads_dirty();
+    flush_output_heads();
     // Standard protocol state tables — globals are not advertised until bind handlers exist
     // (see reassessment gate after the dispatch seam lands).
     (void)protocols_.install(wayland);
@@ -1650,13 +2317,6 @@ void compositor_impl::ensure_graphics_device() {
     }
 }
 
-void compositor_impl::discard_composited_fence() {
-    if (composited_fence_fd_ >= 0) {
-        ::close(composited_fence_fd_);
-        composited_fence_fd_ = -1;
-    }
-}
-
 void compositor_impl::apply_forget(unsigned texture_id) {
     if (cpu_present_) {
         cpu_compositor_.forget_texture(texture_id);
@@ -1684,13 +2344,16 @@ void compositor_impl::queue_forget(unsigned texture_id, unsigned retire_after_fr
     apply_forget(texture_id);
 }
 
-void compositor_impl::apply_due_forgets(unsigned composited_frame) {
+void compositor_impl::apply_due_forgets(long long low_water) {
+    if (low_water < 0)
+        return;
+    const auto mark = static_cast<unsigned>(low_water);
     for (auto& pending : deferred_forgets_) {
         if (!pending.used)
             continue;
         // Signed difference rather than `<`: frame indices only advance, so their
         // difference stays small and this keeps working across the counter's wrap.
-        if (static_cast<int>(composited_frame - pending.retire_after_frame) < 0)
+        if (static_cast<int>(mark - pending.retire_after_frame) < 0)
             continue;
         trace_texture_op("retire-applied", pending.texture_id, true);
         apply_forget(pending.texture_id);
@@ -1864,69 +2527,8 @@ void compositor_impl::apply_texture_update(texture_update& update) {
 lx::result<void> compositor_impl::setup_vulkan_present() {
     if (!graphics.info().supports_dmabuf_import)
         return lx::not_implemented("lx::compositor::setup_vulkan_present");
-
     if (auto initialized = vk_compositor_.initialize(graphics.context()); !initialized)
         return initialized.get_error();
-
-    // Size the composite target to the active mode when there is a real output, so the
-    // exported dmabuf can be scanned out without scaling.
-    unsigned width = 1920;
-    unsigned height = 1080;
-    if (drm_present_) {
-        if (auto active = kms.active_mode(0); active) {
-            width = active.value().width;
-            height = active.value().height;
-        }
-    }
-    if (width == 0 || height == 0)
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
-                              "no usable mode for composite target");
-
-    const unsigned slots = drm_present_ ? k_scanout_slots : 1u;
-    scanout_rect_ = {0, 0, static_cast<int>(width), static_cast<int>(height)};
-    scanout_slot_count_ = 0;
-    for (unsigned slot = 0; slot < slots; ++slot) {
-        auto created = gfx::render_target::create(graphics.context(), width, height);
-        if (!created) {
-            if (slot == 0)
-                return created.get_error();
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
-                                            "second scanout slot unavailable — single-buffer");
-            break;
-        }
-        vk_targets_[slot] = std::move(created).value();
-
-        if (drm_present_) {
-            auto exported = vk_targets_[slot].export_dmabuf();
-            if (!exported) {
-                if (slot == 0)
-                    return exported.get_error();
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
-                                                "second scanout FB import failed — single-buffer");
-                break;
-            }
-            const auto dmabuf = std::move(exported).value();
-            auto framebuffer = drm::kms_framebuffer::import_dmabuf(
-                kms, dmabuf.fd.get(), dmabuf.width, dmabuf.height, dmabuf.stride, dmabuf.offset,
-                static_cast<lx::fourcc>(lx::pixel_format::xrgb8888), dmabuf.modifier);
-            if (!framebuffer) {
-                if (slot == 0)
-                    return framebuffer.get_error();
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
-                                                "second scanout FB import failed — single-buffer");
-                break;
-            }
-            scanout_fbs_[slot] = std::move(framebuffer).value();
-        }
-        ++scanout_slot_count_;
-    }
-
-    if (drm_present_ && scanout_slot_count_ > 0) {
-        kms_atomic.set_framebuffer(scanout_fbs_[0].id());
-        scanout_front_.store(0, std::memory_order_release);
-        pending_flip_slot_.store(0, std::memory_order_release);
-    }
-
     vulkan_present_ = true;
     headless_present_ = false;
     return {};
@@ -1938,43 +2540,7 @@ lx::result<void> compositor_impl::setup_cpu_present() {
         // into memory nobody reads is not a present path.
         return lx::not_implemented("lx::compositor::setup_cpu_present");
     }
-
-    unsigned width = 0;
-    unsigned height = 0;
-    if (auto active = kms.active_mode(0); active) {
-        width = active.value().width;
-        height = active.value().height;
-    }
-    if (width == 0 || height == 0)
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
-                              "no usable mode for CPU scanout target");
-
-    // XR24 is what the primary plane takes everywhere, and it is the byte order wl_shm
-    // clients already use — so an unscaled opaque surface reaches the display as a plain
-    // row copy with no conversion at all.
-    const auto format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
-
-    scanout_rect_ = {0, 0, static_cast<int>(width), static_cast<int>(height)};
-    scanout_slot_count_ = 0;
-    for (unsigned slot = 0; slot < k_scanout_slots; ++slot) {
-        auto created = drm::kms_dumb_framebuffer::create(kms, width, height, format);
-        if (!created) {
-            if (slot < 2) // fewer than two buffers cannot page-flip without tearing
-                return created.get_error();
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
-                                            "third scanout slot unavailable — double-buffered");
-            break;
-        }
-        dumb_fbs_[slot] = std::move(created).value();
-        ++scanout_slot_count_;
-    }
-
     cpu_compositor_.set_worker_threads(cfg.composite_thread_count);
-
-    kms_atomic.set_framebuffer(dumb_fbs_[0].id());
-    scanout_front_.store(0, std::memory_order_release);
-    pending_flip_slot_.store(0, std::memory_order_release);
-
     cpu_present_ = true;
     vulkan_present_ = false;
     headless_present_ = false;
@@ -1984,16 +2550,6 @@ lx::result<void> compositor_impl::setup_cpu_present() {
 lx::result<void> compositor_impl::setup_gl_present() {
     if (!drm_present_)
         return lx::not_implemented("lx::compositor::setup_gl_present");
-
-    unsigned width = 0;
-    unsigned height = 0;
-    if (auto active = kms.active_mode(0); active) {
-        width = active.value().width;
-        height = active.value().height;
-    }
-    if (width == 0 || height == 0)
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
-                              "no usable mode for GL scanout target");
 
     // The card node, not a render node: the scanout buffers have to be allocated on the
     // device that will scan them out, and this fd is the one holding DRM master.
@@ -2012,43 +2568,6 @@ lx::result<void> compositor_impl::setup_gl_present() {
     if (auto initialized = gl_compositor_.initialize(egl_); !initialized)
         return initialized.get_error();
 
-    const auto format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
-    scanout_rect_ = {0, 0, static_cast<int>(width), static_cast<int>(height)};
-    scanout_slot_count_ = 0;
-    for (unsigned slot = 0; slot < k_scanout_slots; ++slot) {
-        auto created = gfx::gl_scanout_target::create(egl_, width, height, format);
-        if (!created) {
-            if (slot < 2)
-                return created.get_error();
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
-                                            "third scanout slot unavailable — double-buffered");
-            break;
-        }
-        gl_targets_[slot] = std::move(created).value();
-
-        auto exported = gl_targets_[slot].export_dmabuf();
-        if (!exported) {
-            if (slot < 2)
-                return exported.get_error();
-            break;
-        }
-        const auto dmabuf = std::move(exported).value();
-        auto framebuffer = drm::kms_framebuffer::import_dmabuf(
-            kms, dmabuf.fd.get(), dmabuf.width, dmabuf.height, dmabuf.stride, dmabuf.offset,
-            format, dmabuf.modifier);
-        if (!framebuffer) {
-            if (slot < 2)
-                return framebuffer.get_error();
-            break;
-        }
-        scanout_fbs_[slot] = std::move(framebuffer).value();
-        ++scanout_slot_count_;
-    }
-
-    kms_atomic.set_framebuffer(scanout_fbs_[0].id());
-    scanout_front_.store(0, std::memory_order_release);
-    pending_flip_slot_.store(0, std::memory_order_release);
-
     gl_present_ = true;
     vulkan_present_ = false;
     cpu_present_ = false;
@@ -2057,107 +2576,412 @@ lx::result<void> compositor_impl::setup_gl_present() {
     return {};
 }
 
-unsigned compositor_impl::pick_back_slot() const {
-    if (scanout_slot_count_ <= 1)
-        return 0;
-    const unsigned front = scanout_front_.load(std::memory_order_acquire);
-    const unsigned pending = kms_atomic.flip_pending()
-                                 ? pending_flip_slot_.load(std::memory_order_acquire)
-                                 : front;
-    for (unsigned slot = 0; slot < scanout_slot_count_; ++slot) {
-        if (slot != front && slot != pending)
-            return slot;
+lx::result<void> compositor_impl::create_targets(output_pipeline& p, bool scanout) {
+    // Sized to the output's mode, so the scanout buffer is shown without scaling.
+    const unsigned width = static_cast<unsigned>(p.mode.width);
+    const unsigned height = static_cast<unsigned>(p.mode.height);
+    if (width == 0 || height == 0)
+        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+                              "no usable mode for the scanout targets");
+    const auto format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+    const bool kms_out = drm_present_ && scanout;
+    p.scanout_rect = {0, 0, static_cast<int>(width), static_cast<int>(height)};
+    p.slot_count = 0;
+    const unsigned slots = kms_out ? output_pipeline::k_slots : 1u;
+    for (unsigned i = 0; i < slots; ++i) {
+        if (gl_present_) {
+            auto created = gfx::gl_scanout_target::create(egl_, width, height, format);
+            if (!created) {
+                if (i < 2)
+                    return created.get_error();
+                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
+                                                "third scanout slot unavailable — double-buffered");
+                break;
+            }
+            p.gl[i] = std::move(created).value();
+            auto exported = p.gl[i].export_dmabuf();
+            if (!exported) {
+                if (i < 2)
+                    return exported.get_error();
+                break;
+            }
+            const auto dmabuf = std::move(exported).value();
+            auto framebuffer = drm::kms_framebuffer::import_dmabuf(
+                kms, dmabuf.fd.get(), dmabuf.width, dmabuf.height, dmabuf.stride, dmabuf.offset,
+                format, dmabuf.modifier);
+            if (!framebuffer) {
+                if (i < 2)
+                    return framebuffer.get_error();
+                break;
+            }
+            p.fb[i] = std::move(framebuffer).value();
+        } else if (cpu_present_) {
+            // XR24 is what the primary plane takes everywhere, and it is the byte order
+            // wl_shm clients already use — so an unscaled opaque surface reaches the display
+            // as a plain row copy with no conversion at all.
+            auto created = drm::kms_dumb_framebuffer::create(kms, width, height, format);
+            if (!created) {
+                if (i < 2) // fewer than two buffers cannot page-flip without tearing
+                    return created.get_error();
+                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
+                                                "third scanout slot unavailable — double-buffered");
+                break;
+            }
+            p.dumb[i] = std::move(created).value();
+        } else if (vulkan_present_) {
+            auto created = gfx::render_target::create(graphics.context(), width, height);
+            if (!created) {
+                if (i == 0)
+                    return created.get_error();
+                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
+                                                "second scanout slot unavailable — single-buffer");
+                break;
+            }
+            p.vk[i] = std::move(created).value();
+            if (kms_out) {
+                auto exported = p.vk[i].export_dmabuf();
+                if (!exported) {
+                    if (i == 0)
+                        return exported.get_error();
+                    break;
+                }
+                const auto dmabuf = std::move(exported).value();
+                auto framebuffer = drm::kms_framebuffer::import_dmabuf(
+                    kms, dmabuf.fd.get(), dmabuf.width, dmabuf.height, dmabuf.stride,
+                    dmabuf.offset, format, dmabuf.modifier);
+                if (!framebuffer) {
+                    if (i == 0)
+                        return framebuffer.get_error();
+                    break;
+                }
+                p.fb[i] = std::move(framebuffer).value();
+            }
+        } else {
+            break; // headless: nothing to composite into
+        }
+        ++p.slot_count;
     }
-    return (front + 1u) % scanout_slot_count_;
+    if (p.kms && p.slot_count > 0)
+        p.kms->set_framebuffer(p.framebuffer(0, cpu_present_));
+    p.front.store(0, std::memory_order_release);
+    p.pending_flip_slot.store(0, std::memory_order_release);
+    return {};
 }
 
-void compositor_impl::on_scanout_flip(unsigned slot) {
-    if (slot < scanout_slot_count_)
-        scanout_front_.store(slot, std::memory_order_release);
+namespace {
+
+/// The allocator's test: a TEST_ONLY of the whole candidate state with each output's real
+/// first framebuffer (ADR 008 M7). Temporary pipelines carry the candidate routing.
+struct crtc_test_ctx {
+    compositor_impl* impl = nullptr;
+    drm::kms_device* kms = nullptr;
+    const unsigned* slots = nullptr;
+    unsigned count = 0;
+    const drm::crtc_alloc_input* in = nullptr;
+    const drm::kms_plane_info* planes = nullptr;
+    unsigned framebuffers[output_manager::k_max]{};
+    const lx::drm::kms_mode* modes[output_manager::k_max]{};
+    unsigned connectors[output_manager::k_max]{};
+    /// Adaptive sync asked of every candidate (an output a configuration enables with it).
+    bool vrr = false;
+};
+
+[[nodiscard]] drm::kms_pipeline_desc desc_for(const drm::kms_device& kms,
+                                              const drm::crtc_alloc_result& r, unsigned i,
+                                              unsigned connector_id) {
+    drm::kms_pipeline_desc d{};
+    d.crtc_index = static_cast<unsigned>(r.crtc[i]);
+    for (unsigned c = 0; c < kms.crtc_count(); ++c)
+        if (kms.crtc(c).index == d.crtc_index)
+            d.crtc_id = kms.crtc(c).id;
+    d.primary_plane_id = kms.plane(static_cast<unsigned>(r.primary_plane[i])).id;
+    d.connector_id = connector_id;
+    return d;
+}
+
+bool crtc_test(const drm::crtc_alloc_result& r, void* user) {
+    auto* t = static_cast<crtc_test_ctx*>(user);
+    std::unique_ptr<drm::kms_pipeline> pipes[output_manager::k_max];
+    drm::modeset_entry entries[output_manager::k_max]{};
+    for (unsigned i = 0; i < t->count; ++i) {
+        // Unregistered: no event can reach a candidate, and no other thread sees it.
+        pipes[i] = std::make_unique<drm::kms_pipeline>(
+            *t->kms, desc_for(*t->kms, r, i, t->connectors[i]), false);
+        pipes[i]->set_mode(*t->modes[i]);
+        entries[i].pipe = pipes[i].get();
+        entries[i].framebuffer_id = t->framebuffers[i];
+        entries[i].request_page_flip = false;
+        entries[i].vrr = t->vrr ? 1 : 0;
+    }
+    return static_cast<bool>(drm::commit_modeset(*t->kms, entries, t->count, true));
+}
+
+} // namespace
+
+namespace {
+void release_targets(output_pipeline& p);
+} // namespace
+
+lx::result<void> compositor_impl::create_pipelines() {
+    // One pipeline per live output. Without KMS (headless, nested) the pipelines have no
+    // CRTC and only composite (Vulkan without scanout) or nothing at all.
+    unsigned slots[output_manager::k_max];
+    unsigned n = 0;
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        if (!outputs.slot_live(s))
+            continue;
+        const output_state& o = outputs.slot_state(s);
+        auto p = std::make_unique<output_pipeline>();
+        p->impl = this;
+        p->slot = s;
+        p->id = o.id;
+        p->origin = o.position;
+        p->scale = o.scale;
+        p->transform = static_cast<lx::buffer_transform>(o.transform & 7u);
+        p->mode = o.mode;
+        outs_[s].pipe = p.get();
+        pipes_[s] = std::move(p);
+        slot_phase_[s] = slot_phase::live;
+        if (drm_present_ && !o.virtual_output && o.connector_id != 0)
+            slots[n++] = s;
+    }
+    if (!drm_present_ || n == 0) {
+        for (auto& p : pipes_)
+            if (p && (vulkan_present_ || gl_present_ || cpu_present_))
+                if (auto made = create_targets(*p, false); !made)
+                    lx::trace::logger::global().log_error(made.get_error(), "compositor.gfx");
+        return {};
+    }
+
+    // Scanout targets first (they depend on the mode only), so the allocator's TEST_ONLY
+    // runs with the real framebuffers.
+    crtc_test_ctx t{};
+    t.impl = this;
+    t.kms = &kms;
+    t.count = n;
+    drm::crtc_alloc_input in{};
+    in.connector_count = n;
+    in.crtc_count = kms.crtc_count();
+    for (unsigned i = 0; i < n; ++i) {
+        const output_state& o = outputs.slot_state(slots[i]);
+        output_pipeline& p = *pipes_[slots[i]];
+        if (auto made = create_targets(p, true); !made)
+            return made.get_error();
+        t.framebuffers[i] = p.framebuffer(0, cpu_present_);
+        t.modes[i] = &o.kms_mode;
+        t.connectors[i] = o.connector_id;
+        in.connectors[i].possible_crtcs = o.possible_crtcs;
+        in.connectors[i].routed_crtc = o.routed_crtc_id ? kms.crtc_index_of(o.routed_crtc_id) : -1;
+    }
+    in.plane_count = kms.plane_count() < drm::k_alloc_max_planes ? kms.plane_count()
+                                                                  : drm::k_alloc_max_planes;
+    for (unsigned k = 0; k < in.plane_count; ++k) {
+        const drm::kms_plane_info pl = kms.plane(k);
+        in.planes[k].kind = pl.kind;
+        in.planes[k].possible_crtcs = pl.possible_crtcs;
+        in.planes[k].bound_crtc = pl.crtc_id ? kms.crtc_index_of(pl.crtc_id) : -1;
+        in.planes[k].usable = pl.kind == drm::plane_kind::cursor ? pl.argb8888 : pl.xrgb8888;
+    }
+    drm::crtc_alloc_result r{};
+    const bool master = kms.is_master();
+    bool assigned = drm::assign_crtcs(in, r, master ? &crtc_test : nullptr, &t);
+    if (!assigned && master) {
+        // A persisted mode the monitor no longer takes (or a custom mode the link cannot
+        // carry): those outputs fall back to their preferred mode, and the test runs again
+        // (§C.3's fallback search, at start).
+        unsigned changed = 0;
+        for (unsigned i = 0; i < n; ++i) {
+            const output_state& o = outputs.slot_state(slots[i]);
+            if (o.follow_preferred || !o.preferred_mode.valid() ||
+                o.preferred_mode.same_timings(o.kms_mode))
+                continue;
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                          "output %u %s: its configured mode %dx%d failed TEST_ONLY — preferred "
+                          "mode instead",
+                          slots[i], o.name, o.mode.width, o.mode.height);
+            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.outputcfg", line);
+            outputs.set_mode(slots[i], o.preferred_mode, true, false);
+            output_pipeline& p = *pipes_[slots[i]];
+            release_targets(p);
+            p.mode = outputs.slot_state(slots[i]).mode;
+            if (auto made = create_targets(p, true); !made)
+                return made.get_error();
+            t.framebuffers[i] = p.framebuffer(0, cpu_present_);
+            t.modes[i] = &outputs.slot_state(slots[i]).kms_mode;
+            ++changed;
+        }
+        if (changed > 0) {
+            r = drm::crtc_alloc_result{};
+            assigned = drm::assign_crtcs(in, r, &crtc_test, &t);
+        }
+    }
+    // Without master yet (a session starting in the background) TEST_ONLY cannot run; the
+    // structural assignment is taken and the first modeset decides.
+    if (!assigned) {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+                      "CRTC allocation failed for %u output%s (steps=%u tests=%u) — trying "
+                      "without the test",
+                      n, n == 1 ? "" : "s", r.steps, r.tests);
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.drm", line);
+        if (!drm::assign_crtcs(in, r, nullptr, nullptr))
+            return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::no_crtc),
+                                  "no CRTC assignment for the connected outputs");
+    }
+    for (unsigned i = 0; i < n; ++i) {
+        output_pipeline& p = *pipes_[slots[i]];
+        const output_state& o = outputs.slot_state(slots[i]);
+        const drm::kms_pipeline_desc d = desc_for(kms, r, i, o.connector_id);
+        p.kms = std::make_unique<drm::kms_pipeline>(kms, d);
+        p.kms->set_mode(o.kms_mode);
+        p.kms->set_vrr(o.adaptive_sync);
+        p.kms->set_framebuffer(p.framebuffer(0, cpu_present_));
+        p.presentation.bind_page_flip(*p.kms);
+        p.presentation.set_handler(&compositor_impl::presentation_flip_handler, &p);
+        char line[224];
+        std::snprintf(line, sizeof(line),
+                      "output %u pipeline crtc=%u (index %u) primary=%u connector=%u mode=%ux%u@%u "
+                      "cursor_plane=%d",
+                      p.slot, d.crtc_id, d.crtc_index, d.primary_plane_id, d.connector_id,
+                      o.kms_mode.width, o.kms_mode.height, o.kms_mode.refresh_mhz,
+                      r.cursor_plane[i] >= 0
+                          ? static_cast<int>(kms.plane(static_cast<unsigned>(r.cursor_plane[i])).id)
+                          : -1);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm", line);
+    }
+    {
+        char line[128];
+        std::snprintf(line, sizeof(line), "CRTC allocation: %u output%s, %u TEST_ONLY, %u steps",
+                      n, n == 1 ? "" : "s", r.tests, r.steps);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm", line);
+    }
+    return {};
+}
+
+void compositor_impl::create_cursor_planes(unsigned need_px) {
+    for (auto& up : pipes_) {
+        if (!up || !up->kms)
+            continue;
+        output_pipeline& p = *up;
+        const drm::kms_pipeline_desc& d = p.kms->desc();
+        // The cursor plane the allocation picked for this CRTC: the one usable on it that
+        // no other pipeline holds.
+        unsigned want = 0;
+        for (unsigned k = 0; k < kms.plane_count() && !want; ++k) {
+            const drm::kms_plane_info pl = kms.plane(k);
+            if (pl.kind != drm::plane_kind::cursor || !(pl.possible_crtcs & (1u << d.crtc_index)))
+                continue;
+            bool taken = false;
+            for (const auto& other : pipes_)
+                taken = taken || (other && other.get() != &p && other->cursor.valid() &&
+                                  other->cursor.caps().plane_id == pl.id);
+            if (!taken)
+                want = pl.id;
+        }
+        if (!want)
+            continue;
+        if (auto plane = drm::kms_cursor_plane::create(kms.card_fd(), d.crtc_id, d.crtc_index,
+                                                       need_px, need_px, want);
+            plane)
+            p.cursor = std::move(plane).value();
+    }
 }
 
 void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback fb,
                                                 void* user_data) {
-    if (!user_data)
+    auto* p = static_cast<output_pipeline*>(user_data);
+    if (!p || !p->impl)
         return;
-    auto* impl = static_cast<compositor_impl*>(user_data);
-    // A flip of a commit made before the pause, drained after it: the slot it showed is
-    // noted, its timing dropped. It must not restart the frame clock or pace callbacks.
-    if (impl->display_gate_.load(std::memory_order_relaxed) != 0) {
-        impl->committed_submit_us_.store(0, std::memory_order_relaxed);
-        (void)impl->committed_input_us_.exchange(0, std::memory_order_acq_rel);
-        if (const int fd = impl->committed_fence_fd_.exchange(-1, std::memory_order_acq_rel);
-            fd >= 0)
+    p->impl->on_output_flip(*p, fb);
+}
+
+void compositor_impl::on_output_flip(output_pipeline& p, const scheduler::presentation_feedback& fb) {
+    const unsigned slot = p.slot;
+    output_ui& o = outs_[slot];
+    if (o.pipe != &p) {
+        // A pipeline UI let go of (its output went): its last flip landed, so render can turn
+        // its CRTC off and hand it back now. Nothing of it is presented or paced any more.
+        if (fb.vsync) {
+            const unsigned flipped = p.pending_flip_slot.load(std::memory_order_acquire);
+            if (flipped < p.slot_count)
+                p.front.store(flipped, std::memory_order_release);
+        }
+        wake_render();
+        return;
+    }
+    const bool gated = display_gate_.load(std::memory_order_relaxed) != 0 ||
+                       (gate_power_mask_.load(std::memory_order_relaxed) & (1u << slot)) != 0;
+    // A flip of a commit made before the pause (or the power-off), drained after it: the
+    // slot it showed is noted, its timing dropped. It must not restart the frame clock or
+    // pace callbacks.
+    if (gated) {
+        p.committed_submit_us.store(0, std::memory_order_relaxed);
+        (void)p.committed_input_us.exchange(0, std::memory_order_acq_rel);
+        if (const int fd = p.committed_fence_fd.exchange(-1, std::memory_order_acq_rel); fd >= 0)
             ::close(fd);
         // Its presentation feedback was discarded at the pause edge (nothing presented
         // while the session is away — wlroots reports such flips `presented = false`).
-        if (fb.vsync)
-            impl->on_scanout_flip(impl->pending_flip_slot_.load(std::memory_order_acquire));
+        if (fb.vsync) {
+            const unsigned flipped = p.pending_flip_slot.load(std::memory_order_acquire);
+            if (flipped < p.slot_count)
+                p.front.store(flipped, std::memory_order_release);
+        }
         // A power-off waiting for this flip (the CRTC takes one commit at a time) goes now.
-        if (impl->power_.waiting_for_flip() && !impl->kms_atomic.flip_pending())
-            impl->apply_power_actions(impl->power_.on_flip_drained());
+        if (o.power.waiting_for_flip() && !(p.kms && p.kms->flip_pending()))
+            apply_power_actions(slot, o.power.on_flip_drained());
         return;
     }
     // The flip landed, so clients may draw again regardless of how complete the feedback is
     // — unless it only moved the pointer: no client content was presented by it.
-    if (impl->last_commit_content_.load(std::memory_order_acquire))
-        impl->present_completed_ = true;
-    impl->awaiting_resume_flip_ = false;
+    if (p.last_commit_content.load(std::memory_order_acquire))
+        o.present_completed = true;
+    o.awaiting_resume_flip = false;
+    o.last_feedback = fb;
 
-    // Phase-lock the frame clock to the display, and aim each repaint at its deadline
-    // rather than at the interval boundary. A timer free-running at target_fps drifts
-    // against the real vblank cadence, so ticks land while a flip is still queued and their
-    // composite is wasted — the visible rate then sits well under the refresh rate for
-    // reasons that look like slow rendering.
-    //
-    // The start time comes from the measured repaint cost, so the idle wait sits before the
-    // work instead of after it and the frame carries input from as late as it can. A frame
-    // that gets more expensive starts earlier on its own.
-    //
-    // The phase comes from the kernel's flip timestamp when it is on our clock (KMS reports
-    // CLOCK_MONOTONIC, which is what steady_clock reads on Linux) and plausibly recent;
+    // Phase-lock this output's frame clock to its display, and aim each repaint at its
+    // deadline rather than at the interval boundary (`repaint_scheduler`). The phase comes
+    // from the kernel's flip timestamp when it is on our clock and plausibly recent;
     // otherwise from `now`, which is within the 1 ms loop pump of the flip because flips
-    // are drained there (wayland_fd_callback). Taking `now` at the next tick instead put the
-    // phase up to a whole period late, so ticks ran at period − lead: faster than the
-    // display, every few frames composited behind a still-pending flip ("deferred").
-    if (impl->vsync_timer) {
-        const auto now = static_cast<lx::runtime::clock_time>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-        impl->repaint_.observe_repaint(impl->budget_.last_tick_ui_us(),
-                                       impl->render_cost_us_.load(std::memory_order_relaxed));
+    // are drained there.
+    if (vsync_timer) {
+        const auto now = now_ns();
+        scheduler::repaint_scheduler& clock = clocks_.clock(slot);
+        clock.observe_repaint(budget_.last_tick_ui_us(),
+                              p.render_cost_us.load(std::memory_order_relaxed));
         auto flip_ns = now;
         if (fb.hw_clock && fb.actual_present_ns > 0 && fb.actual_present_ns <= now &&
-            now - fb.actual_present_ns < impl->repaint_.refresh_period())
+            now - fb.actual_present_ns < clock.refresh_period())
             flip_ns = fb.actual_present_ns;
-        impl->repaint_.on_present(flip_ns);
-        impl->vsync_timer->schedule_at(impl->repaint_.next_start(now));
+        clocks_.on_present(slot, flip_ns, now);
+        rearm_frame_timer();
     }
 
     // Taken on every flip, sampled or not, so the dup'd fence is always closed.
-    const unsigned long long submit_us =
-        impl->committed_submit_us_.exchange(0, std::memory_order_acq_rel);
+    const unsigned long long submit_us = p.committed_submit_us.exchange(0, std::memory_order_acq_rel);
     unsigned long long fence_us = 0;
-    if (const int fd = impl->committed_fence_fd_.exchange(-1, std::memory_order_acq_rel);
-        fd >= 0) {
+    if (const int fd = p.committed_fence_fd.exchange(-1, std::memory_order_acq_rel); fd >= 0) {
         fence_us = sync_file_signal_us(fd);
         ::close(fd);
     }
     lx::trace::timeline_instant("kms", "flip");
     if (fb.hw_clock)
-        impl->note_present_latency(fb.actual_present_ns, submit_us, fence_us);
+        note_present_latency(p, fb.actual_present_ns, submit_us, fence_us);
 
-    if (!fb.vsync)
+    if (!fb.vsync) {
+        fire_flip_callbacks(slot);
         return;
-    const unsigned slot = impl->pending_flip_slot_.load(std::memory_order_acquire);
-    impl->on_scanout_flip(slot);
+    }
+    const unsigned flipped = p.pending_flip_slot.load(std::memory_order_acquire);
+    if (flipped < p.slot_count)
+        p.front.store(flipped, std::memory_order_release);
 
-    // wp_presentation: the composite of frame `tag` is on screen. A kernel flip event is
-    // vsync'd and hardware-signalled; its time is the hardware's (hw_clock) when the driver
-    // timestamps vblanks, with the CRTC's vblank counter as MSC (wlroots' handle_page_flip).
-    // A driver without vblank support samples the time when it sends the event and has no
-    // counter (seq 0, as the spec asks): no hw_clock. A blocking modeset's completion is
-    // timed here, in software: vsync only.
+    // wp_presentation: the composite of frame `tag` is on this output now. A kernel flip
+    // event is vsync'd and hardware-signalled; its time is the hardware's (hw_clock) when
+    // the driver timestamps vblanks, with the CRTC's vblank counter as MSC. A driver
+    // without vblank support samples the time when it sends the event and has no counter
+    // (seq 0, as the spec asks): no hw_clock. A blocking modeset's completion is timed
+    // here, in software: vsync only. Only feedback this output paces is presented (M8).
     if (fb.content && fb.tag != 0) {
         present_info info{};
         info.timestamp_ns = static_cast<unsigned long long>(fb.actual_present_ns);
@@ -2167,18 +2991,36 @@ void compositor_impl::presentation_flip_handler(scheduler::presentation_feedback
             info.flags |= k_present_hw_completion;
         if (fb.vblank_clock)
             info.flags |= k_present_hw_clock;
-        if (impl->outputs.count() > 0) {
-            const unsigned mhz = impl->outputs.state(impl->outputs.nth(0)).refresh_mhz;
+        if (outputs.slot_live(slot)) {
+            const unsigned mhz = outputs.slot_state(slot).refresh_mhz;
             if (mhz > 0)
-                info.refresh_ns = static_cast<unsigned>(
-                    (1'000'000'000'000ull + mhz / 2) / mhz);
+                info.refresh_ns = static_cast<unsigned>((1'000'000'000'000ull + mhz / 2) / mhz);
         }
-        presentation_flipped(impl->p0_, fb.tag, info);
-        // ext-session-lock (L1): a locked frame is on the output — `locked` may go out.
-        if (impl->lock_.state() == lock_state::locking &&
-            static_cast<int>(fb.tag - impl->lock_frame_) >= 0)
-            impl->apply_lock_actions(impl->lock_.locked_frame_shown());
+        presentation_flipped(p0_, fb.tag, slot, info);
+        // ext-session-lock (M14): a locked frame is on this output.
+        if (lock_.state() == lock_state::locking && static_cast<int>(fb.tag - o.lock_frame) >= 0)
+            note_lock_shown(slot);
     }
+    fire_flip_callbacks(slot);
+}
+
+void compositor_impl::fire_flip_callbacks(unsigned slot) {
+    // The frame callbacks this output paces go out at the flip itself (after its
+    // presentation feedback): what their surfaces committed is on screen now, and a client
+    // drawing its next frame has the whole period until this output's next repaint starts
+    // (wlroots answers them from the output's frame event, at the flip). Left to the next
+    // tick they went out at the repaint start, and the reply missed that repaint: a frame
+    // every two periods.
+    output_ui& o = outs_[slot];
+    if (!o.present_completed)
+        return;
+    const auto now = now_ns();
+    o.present_completed = false;
+    o.last_callback_ns = now;
+    unsigned ms = static_cast<unsigned>(static_cast<unsigned long long>(now) / 1'000'000ull);
+    if (o.last_feedback.hw_clock && o.last_feedback.actual_present_ns > 0)
+        ms = static_cast<unsigned>(o.last_feedback.actual_present_ns / 1'000'000ull);
+    fire_output_frame_callbacks(p0_, slot, ms, static_cast<unsigned long long>(now));
 }
 
 // ── Session pause/resume (VT switching) ────────────────────────────────────
@@ -2310,6 +3152,12 @@ void compositor_impl::apply_session_actions(const session_actions& a) {
 }
 
 void compositor_impl::enter_display_pause(unsigned quiesce_gen) {
+    // Uevents while away are owed to the resume, which probes everything (not master now:
+    // the kernel would only answer from its cache).
+    hotplug_.set_paused(true);
+    resume_probe_wait_ = false;
+    if (hotplug_timer_)
+        hotplug_timer_->set_enabled(false);
     // 1. Gate the render thread: from its next check on, nothing is composited or
     //    committed. A commit already past the check fails with EACCES (logind dropped
     //    master before signalling), which render then classifies as paused.
@@ -2332,6 +3180,8 @@ void compositor_impl::enter_display_pause(unsigned quiesce_gen) {
     //    in flight will be presented: its feedback is discarded now (the flips still to
     //    drain are dropped by the paused branch of the flip handler).
     presentation_discard(p0_, false);
+    for (unsigned s = 0; s < output_manager::k_max; ++s)
+        clocks_.stop(s);
     if (vsync_timer)
         vsync_timer->set_enabled(false);
     if (housekeeping_timer)
@@ -2380,29 +3230,64 @@ void compositor_impl::resume_input_after_pause() {
 }
 
 void compositor_impl::begin_display_resume(unsigned gen) {
+    // What is connected now comes first (ADR 008 §A.14): a monitor plugged in, unplugged, or
+    // a VM window resized while the session was away — the resume modeset uses it, rather
+    // than failing on a mode that is gone and leaving the display off. Only the master's
+    // probe is a forced one, so it could not run while away; it waits ≤ 250 ms.
+    hotplug_.set_paused(false);
+    if (hotplug_ready_ && drm_present_ && !card_gone_.load(std::memory_order_acquire)) {
+        resume_probe_wait_ = true;
+        resume_probe_gen_ = gen;
+        if (hotplug_timer_)
+            hotplug_timer_->schedule_at(now_ns() + k_resume_probe_wait_ns);
+        hotplug_.request_full(true);
+        return; // `scan_ready` (or the timer) finishes the resume
+    }
+    finish_display_resume(gen);
+}
+
+void compositor_impl::finish_display_resume(unsigned gen) {
+    if (hotplug_timer_)
+        hotplug_timer_->set_enabled(false);
     // A flip completed before the pause is consumed under the old generation first, which
     // keeps the order obvious in the log (the cookies make it safe either way).
     if (drm_present_)
-        kms_atomic.dispatch_events();
-    // The VT coming back is activity (I2), and it brings a dark output back on: this
-    // resume's own modeset turns the CRTC on, so the power gate just goes.
-    apply_power_actions(power_.on_vt_resumed());
+        kms.dispatch_events();
+    // The VT coming back is activity (I2), and it brings every dark output back on: this
+    // resume's own modeset turns each CRTC on, so the power gates just go.
+    for (unsigned s = 0; s < output_manager::k_max; ++s)
+        if (outs_[s].live)
+            apply_power_actions(s, outs_[s].power.on_vt_resumed());
     const unsigned render_gen = ++render_gen_counter_;
     vt_resume_render_gen_ = render_gen;
     vt_resume_session_gen_ = gen;
-    resume_gen_.store(render_gen, std::memory_order_release);
+    vt_resume_outcome_ = session_resume_outcome::ok;
+    vt_resume_pending_ = 0;
+    // Every output with a CRTC answers this resume (its result comes from its first commit,
+    // the combined modeset of all of them); with none, the resume is answered at once.
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        if (!outs_[s].live)
+            continue;
+        resume_gen_[s].store(render_gen, std::memory_order_release);
+        if (outs_[s].pipe && outs_[s].pipe->kms)
+            vt_resume_pending_ |= 1u << s;
+    }
     display_gate_.fetch_and(~gate_vt, std::memory_order_release);
     resume_input_after_pause();
     wm_.set_suspend_reason(window_manager::suspend_vt, false);
     if (idle_.note_activity(now_ns(), idle_events(p0_)))
         rearm_idle_timer();
-    // Another master drew on the CRTC: every pixel is repainted.
+    // Another master drew on the CRTCs: every pixel is repainted.
     scene.note_full_damage();
     if (housekeeping_timer)
         housekeeping_timer->set_enabled(false);
-    last_callback_ns_ = 0;
-    present_completed_ = false;
-    awaiting_resume_flip_ = true;
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        outs_[s].last_callback_ns = 0;
+        outs_[s].present_completed = false;
+        outs_[s].awaiting_resume_flip = outs_[s].live;
+    }
+    if (vt_resume_pending_ == 0 && drm_present_)
+        apply_session_actions(session_.on_resume_result(gen, session_resume_outcome::ok));
     request_frame();
 }
 
@@ -2426,158 +3311,192 @@ void compositor_impl::rearm_idle_timer() {
 }
 
 bool compositor_impl::on_user_activity() {
-    // Per input event: one clock read, one store, and a branch on the idle count.
+    // Per input event: one clock read, one store, and a branch per output on its power.
     if (idle_.note_activity(static_cast<unsigned long long>(now_ns()), idle_events(p0_)))
         rearm_idle_timer();
-    if (!power_.wants_wake())
-        return false;
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.power",
-                                    "display woken by input");
-    apply_power_actions(
-        power_.wake((display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0));
-    return true;
-}
-
-void compositor_impl::request_output_power(bool on) {
+    if (gate_power_mask_.load(std::memory_order_relaxed) == 0) {
+        bool any = false;
+        for (unsigned s = 0; s < output_manager::k_max && !any; ++s)
+            any = outs_[s].live && outs_[s].power.wants_wake();
+        if (!any)
+            return false;
+    }
+    // I5: input wakes every output the compositor powered off.
     const bool vt_away = (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0;
-    apply_power_actions(on ? power_.request_on(vt_away) : power_.request_off(vt_away));
+    bool woke = false;
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        if (!outs_[s].live || !outs_[s].power.wants_wake())
+            continue;
+        woke = true;
+        apply_power_actions(s, outs_[s].power.wake(vt_away));
+    }
+    if (woke)
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.power",
+                                        "display woken by input");
+    return woke;
 }
 
-void compositor_impl::apply_power_actions(const power_actions& a) {
-    if (a.empty())
+void compositor_impl::request_output_power(unsigned slot, bool on) {
+    if (slot >= output_manager::k_max || !outs_[slot].live)
         return;
+    const bool vt_away = (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0;
+    apply_power_actions(slot, on ? outs_[slot].power.request_on(vt_away)
+                                 : outs_[slot].power.request_off(vt_away));
+}
+
+void compositor_impl::apply_power_actions(unsigned slot, const power_actions& a) {
+    if (a.empty() || slot >= output_manager::k_max)
+        return;
+    output_ui& o = outs_[slot];
+    const std::uint32_t bit = 1u << slot;
+    char line[160];
+    const char* name = outputs.slot_live(slot) ? outputs.slot_state(slot).name : "?";
     if (a.has(power_actions::gate)) {
-        // The display stops as at a VT pause (A.3 step 3), but input stays live: it is what
-        // wakes the output. Keyboard focus is kept.
-        power_gen_.store(power_.generation(), std::memory_order_release);
-        display_gate_.fetch_or(gate_power, std::memory_order_release);
-        presentation_discard(p0_, false);
-        if (vsync_timer)
-            vsync_timer->set_enabled(false);
-        if (housekeeping_timer)
-            housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
-        awaiting_resume_flip_ = false;
-        wm_.set_suspend_reason(window_manager::suspend_power, true);
+        // This output stops as at a VT pause (A.3 step 3), but input stays live: it is what
+        // wakes it. The other outputs go on. Keyboard focus is kept.
+        power_gen_[slot].store(o.power.generation(), std::memory_order_release);
+        gate_power_mask_.fetch_or(bit, std::memory_order_release);
+        presentation_discard_output(p0_, slot);
+        clocks_.set_dark(slot, true);
+        rearm_frame_timer();
+        o.awaiting_resume_flip = false;
+        // Windows are suspended only once every output is dark (a window on one blanked
+        // monitor and one lit monitor is not, §A.6).
+        const std::uint32_t live = outputs.live_mask();
+        if ((gate_power_mask_.load(std::memory_order_relaxed) & live) == live)
+            wm_.set_suspend_reason(window_manager::suspend_power, true);
         lx::trace::timeline_instant("ui", "power.gate");
     }
     if (a.has(power_actions::post_off))
-        post_power_off(a.gen);
+        post_power_off(slot, a.gen);
     if (a.has(power_actions::ungate)) {
         // Whatever off task is still in flight is stale from here on.
-        power_gen_.store(power_.generation(), std::memory_order_release);
+        power_gen_[slot].store(o.power.generation(), std::memory_order_release);
         wm_.set_suspend_reason(window_manager::suspend_power, false);
         if (a.resume) {
             // The CRTC is down: the resume procedure (full repaint, a full modeset with
             // ACTIVE=1) brings it back. The generation is stored before the gate opens.
             const unsigned render_gen = ++render_gen_counter_;
-            power_resume_render_gen_ = render_gen;
-            resume_gen_.store(render_gen, std::memory_order_release);
+            o.power_resume_render_gen = render_gen;
+            resume_gen_[slot].store(render_gen, std::memory_order_release);
         }
-        display_gate_.fetch_and(~gate_power, std::memory_order_release);
+        gate_power_mask_.fetch_and(~bit, std::memory_order_release);
+        clocks_.set_dark(slot, false);
         if ((display_gate_.load(std::memory_order_relaxed) & gate_vt) == 0) {
-            scene.note_full_damage();
-            if (housekeeping_timer)
-                housekeeping_timer->set_enabled(false);
-            last_callback_ns_ = 0;
-            present_completed_ = false;
-            awaiting_resume_flip_ = a.resume;
-            request_frame();
+            scene.note_full_damage_output(slot);
+            o.last_callback_ns = 0;
+            o.present_completed = false;
+            o.awaiting_resume_flip = a.resume;
+            request_frame(bit);
         }
         lx::trace::timeline_instant("ui", "power.ungate");
     }
-    if (a.has(power_actions::wait_flip) && !kms_atomic.flip_pending())
-        apply_power_actions(power_.on_flip_drained());
-    if (a.has(power_actions::send_mode) && outputs.count() > 0) {
-        const int slot = outputs.slot_of(outputs.nth(0));
-        if (slot >= 0)
-            notify_output_power(p0_, static_cast<unsigned>(slot), a.mode_on);
+    if (a.has(power_actions::wait_flip) &&
+        !(o.pipe && o.pipe->kms && o.pipe->kms->flip_pending()))
+        apply_power_actions(slot, o.power.on_flip_drained());
+    if (a.has(power_actions::send_mode))
+        notify_output_power(p0_, slot, a.mode_on);
+    if (a.has(power_actions::log_off)) {
+        std::snprintf(line, sizeof(line), "%s (output %u %s)",
+                      (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0
+                          ? "display power off (session away: nothing to commit)"
+                          : "display power off (CRTC ACTIVE=0, cursor plane off)",
+                      slot, name);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.power", line);
     }
-    if (a.has(power_actions::log_off))
-        lx::trace::logger::global().log(
-            lx::trace::level::info, "compositor.power",
-            (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0
-                ? "display power off (session away: nothing to commit)"
-                : "display power off (CRTC ACTIVE=0, cursor plane off)");
-    if (a.has(power_actions::log_soft_blank))
-        lx::trace::logger::global().log(
-            lx::trace::level::warn, "compositor.power",
-            "display power off refused by the driver — showing black instead (no power saving)");
-    if (a.has(power_actions::log_on))
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.power",
-                                        "display power on");
-    if (a.has(power_actions::log_on_failed))
-        lx::trace::logger::global().log(
-            lx::trace::level::error, "compositor.power",
-            "display power on: the modeset was refused (the mode is no longer offered?) — the "
-            "output stays dark until the next input");
-    // A lock under way when the output went dark is locked now.
+    if (a.has(power_actions::log_soft_blank)) {
+        std::snprintf(line, sizeof(line),
+                      "display power off refused by the driver — showing black instead (no power "
+                      "saving) (output %u %s)",
+                      slot, name);
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.power", line);
+    }
+    if (a.has(power_actions::log_on)) {
+        std::snprintf(line, sizeof(line), "display power on (output %u %s)", slot, name);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.power", line);
+    }
+    if (a.has(power_actions::log_on_failed)) {
+        std::snprintf(line, sizeof(line),
+                      "display power on: the modeset was refused (the mode is no longer "
+                      "offered?) — output %u %s stays dark until the next input",
+                      slot, name);
+        lx::trace::logger::global().log(lx::trace::level::error, "compositor.power", line);
+    }
+    // A lock under way when the output went dark is locked now if nothing else shows.
+    if (a.has(power_actions::log_off) || a.has(power_actions::log_soft_blank))
+        note_lock_shown(slot);
     advance_lock();
     wayland.flush();
 }
 
-void compositor_impl::post_power_off(unsigned gen) {
-    power_gen_.store(gen, std::memory_order_release);
-    if (!threads_started.load(std::memory_order_acquire) || !drm_present_) {
-        apply_power_actions(power_.on_off_result(gen, power_off_outcome::deferred));
+void compositor_impl::post_power_off(unsigned slot, unsigned gen) {
+    power_gen_[slot].store(gen, std::memory_order_release);
+    if (!threads_started.load(std::memory_order_acquire) || !drm_present_ || !outs_[slot].pipe ||
+        !outs_[slot].pipe->kms) {
+        apply_power_actions(slot, outs_[slot].power.on_off_result(gen, power_off_outcome::deferred));
         return;
     }
     compositor_impl* self = this;
-    (void)runtime::executor::global().post(runtime::affinity::render, [self, gen] {
-        const power_off_outcome outcome = self->run_power_off(gen);
-        (void)runtime::executor::global().post(runtime::affinity::ui, [self, gen, outcome] {
-            self->apply_power_actions(self->power_.on_off_result(gen, outcome));
+    (void)runtime::executor::global().post(runtime::affinity::render, [self, slot, gen] {
+        const power_off_outcome outcome = self->run_power_off(slot, gen);
+        (void)runtime::executor::global().post(runtime::affinity::ui, [self, slot, gen, outcome] {
+            self->apply_power_actions(slot, self->outs_[slot].power.on_off_result(gen, outcome));
         });
     });
 }
 
-power_off_outcome compositor_impl::run_power_off(unsigned gen) {
-    // Render thread, after a tick: the gate is up, so nothing else commits meanwhile.
-    if (power_gen_.load(std::memory_order_acquire) != gen)
+power_off_outcome compositor_impl::run_power_off(unsigned slot, unsigned gen) {
+    // Render thread, after a tick: the output's gate is up, so nothing else commits on it.
+    if (power_gen_[slot].load(std::memory_order_acquire) != gen)
         return power_off_outcome::stale;
     if ((display_gate_.load(std::memory_order_acquire) & gate_vt) != 0)
         return power_off_outcome::deferred;
-    if (kms_atomic.flip_pending())
+    output_pipeline* p = pipes_[slot].get();
+    if (!p || !p->kms)
+        return power_off_outcome::deferred;
+    if (p->retiring)
+        return power_off_outcome::stale;
+    if (p->kms->flip_pending())
         return power_off_outcome::retry_after_flip;
     // Nothing of ours is lit: never modeset yet, or the CRTC is still off from the previous
     // power-off (a resume whose modeset has not happened).
-    if (!content_committed_once_)
+    if (!p->content_committed_once)
         return power_off_outcome::deferred;
     lx::trace::scoped_span span{"render", "kms.power_off"};
-    auto off = kms_atomic.commit_power_off(cursor_plane_.valid() ? &cursor_plane_ : nullptr);
+    auto off = p->kms->commit_power_off(p->cursor.valid() ? &p->cursor : nullptr);
     if (off) {
         // What the plane shows is unknown to it now: the power-on modeset states it in full.
-        if (cursor_plane_.valid())
-            cursor_plane_.invalidate();
+        if (p->cursor.valid())
+            p->cursor.invalidate();
         return power_off_outcome::done;
     }
-    if (kms_atomic.last_failure_lost_master())
+    if (p->kms->last_failure_lost_master())
         return power_off_outcome::deferred; // a VT switch raced the request
     if (!power_rejected_logged_) {
         power_rejected_logged_ = true;
         lx::trace::logger::global().log_error(off.get_error(), "compositor.power");
     }
-    commit_black_frame();
+    commit_black_frame(*p);
     return power_off_outcome::rejected;
 }
 
-void compositor_impl::commit_black_frame() {
-    if (scanout_slot_count_ == 0 || kms_atomic.flip_pending())
+void compositor_impl::commit_black_frame(output_pipeline& p) {
+    if (p.slot_count == 0 || !p.kms || p.kms->flip_pending())
         return;
-    const unsigned slot = pick_back_slot();
+    const unsigned slot = p.back_slot();
     gfx::damage_region region{};
     region.set_full();
-    region.clip(scanout_rect_);
+    region.clip(p.scanout_rect);
     bool drawn = false;
     int fence = -1;
     const lx::color black = lx::color::rgb(0.f, 0.f, 0.f);
     if (gl_present_) {
-        if (auto c = gl_compositor_.composite_region(gl_targets_[slot], black, nullptr, 0, region);
-            c) {
+        if (auto c = gl_compositor_.composite_region(p.gl[slot], black, nullptr, 0, region); c) {
             drawn = true;
             fence = c.value().out_fence_fd;
         }
     } else if (cpu_present_) {
-        const auto& fb = dumb_fbs_[slot];
+        const auto& fb = p.dumb[slot];
         gfx::pixel_surface target{};
         target.pixels = fb.pixels();
         target.width = fb.width();
@@ -2588,7 +3507,7 @@ void compositor_impl::commit_black_frame() {
         drawn = static_cast<bool>(
             cpu_compositor_.composite_region(target, black, nullptr, 0, region));
     } else if (vulkan_present_) {
-        if (auto c = vk_compositor_.composite(vk_targets_[slot], black, nullptr, 0); c) {
+        if (auto c = vk_compositor_.composite(p.vk[slot], black, nullptr, 0); c) {
             drawn = true;
             fence = c.value().out_fence_fd;
         }
@@ -2596,26 +3515,25 @@ void compositor_impl::commit_black_frame() {
     if (!drawn)
         return;
     drm::atomic_commit_request req{};
-    req.connector = 0;
     req.request_page_flip = true;
     req.in_fence_fd = fence;
     req.damage.full_frame = true;
-    req.framebuffer_id = cpu_present_ ? dumb_fbs_[slot].id() : scanout_fbs_[slot].id();
-    if (cursor_plane_.valid()) {
-        cursor_plane_.set_visible(false);
-        req.cursor = &cursor_plane_;
+    req.framebuffer_id = p.framebuffer(slot, cpu_present_);
+    if (p.cursor.valid()) {
+        p.cursor.set_visible(false);
+        req.cursor = &p.cursor;
     }
     // Its flip lands while gated: it rotates the slot and answers nothing.
-    pending_flip_slot_.store(slot, std::memory_order_release);
-    last_commit_content_.store(false, std::memory_order_release);
-    if (auto committed = kms_atomic.commit(req); committed && kms_atomic.completion_needs_dispatch())
+    p.pending_flip_slot.store(slot, std::memory_order_release);
+    p.last_commit_content.store(false, std::memory_order_release);
+    if (auto committed = p.kms->commit(req); committed && p.kms->completion_needs_dispatch())
         post_flip_dispatch();
     if (fence >= 0)
         ::close(fence);
     // Every slot is stale against what a power-on shows (the resume repaints it all anyway).
-    for (unsigned i = 0; i < k_scanout_slots; ++i)
-        slot_age_damage_[i].set_full();
-    kms_pending_damage_.set_full();
+    for (unsigned i = 0; i < output_pipeline::k_slots; ++i)
+        p.slot_age[i].set_full();
+    p.kms_pending.set_full();
 }
 
 // ── Session lock (ext-session-lock-v1) ──────────────────────────────────────
@@ -2652,20 +3570,45 @@ void compositor_impl::release_sleep_delay(const char* why) {
     lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock", line);
 }
 
-bool compositor_impl::display_dark() const {
-    const unsigned gate = display_gate_.load(std::memory_order_relaxed);
-    if ((gate & gate_vt) != 0)
-        return true; // another VT (or nothing) is on the CRTC
+bool compositor_impl::output_dark(unsigned slot) const {
+    if ((display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0)
+        return true; // another VT (or nothing) is on the CRTCs
+    if (slot >= output_manager::k_max || !outs_[slot].live)
+        return true;
     // Powered off, or the black frame of a refused power-off — not while the off task is
     // still pending (the last frame is on screen until it runs).
-    if (power_.phase() == power_phase::off || power_.phase() == power_phase::soft_blank)
+    const power_phase ph = outs_[slot].power.phase();
+    if (ph == power_phase::off || ph == power_phase::soft_blank)
         return true;
-    // KMS, and nothing of ours ever reached the CRTC: the console is on screen.
-    return drm_present_ && !ever_lit_.load(std::memory_order_acquire);
+    // KMS, and nothing of ours ever reached this CRTC: the console is on screen.
+    const output_pipeline* p = outs_[slot].pipe;
+    return drm_present_ && p && p->kms && !p->ever_lit.load(std::memory_order_acquire);
+}
+
+bool compositor_impl::display_dark() const {
+    for (unsigned s = 0; s < output_manager::k_max; ++s)
+        if (outs_[s].live && !output_dark(s))
+            return false;
+    return true;
+}
+
+void compositor_impl::note_lock_shown(unsigned slot) {
+    if (lock_.state() != lock_state::locking)
+        return;
+    lock_shown_.shown(slot);
+    advance_lock();
 }
 
 void compositor_impl::advance_lock() {
-    if (lock_.state() == lock_state::locking && display_dark())
+    if (lock_.state() != lock_state::locking)
+        return;
+    // ext-session-lock: `locked` once a locked frame is on every live output (M14) — an
+    // output that is dark counts, nothing of the session being visible on it.
+    std::uint32_t dark = 0;
+    for (unsigned s = 0; s < output_manager::k_max; ++s)
+        if (outs_[s].live && output_dark(s))
+            dark |= 1u << s;
+    if (lock_shown_.complete(outputs.live_mask(), dark))
         apply_lock_actions(lock_.locked_frame_shown());
 }
 
@@ -2683,11 +3626,13 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
     if (a.has(lock_actions::scene_lock)) {
         for (scene::container_node* layer :
              {&background_layer_, &bottom_layer_, &windows_layer_, &top_layer_,
-              &overlay_shell_layer_, &popup_layer_, &dnd_icon_layer_})
+              &fullscreen_layer_, &overlay_shell_layer_, &popup_layer_, &dnd_icon_layer_})
             layer->set_visible(false);
         lock_layer_.set_visible(true);
-        // The first snapshot built from here on is a locked frame.
-        lock_frame_ = p0_.building_frame;
+        // The first snapshot built from here on is a locked frame, on every output.
+        for (auto& o : outs_)
+            o.lock_frame = p0_.building_frame;
+        lock_shown_.begin();
         wm_.set_suspend_reason(window_manager::suspend_lock, true);
         scene.note_full_damage();
         request_frame();
@@ -2697,7 +3642,7 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
     if (a.has(lock_actions::scene_unlock)) {
         for (scene::container_node* layer :
              {&background_layer_, &bottom_layer_, &windows_layer_, &top_layer_,
-              &overlay_shell_layer_, &popup_layer_, &dnd_icon_layer_})
+              &fullscreen_layer_, &overlay_shell_layer_, &popup_layer_, &dnd_icon_layer_})
             layer->set_visible(true);
         lock_layer_.set_visible(false);
         wm_.set_suspend_reason(window_manager::suspend_lock, false);
@@ -2809,43 +3754,2435 @@ void compositor_impl::on_prepare_for_sleep(bool start) {
     rearm_lock_timer();
 }
 
-void compositor_impl::run_resume_procedure(unsigned gen) {
-    discard_composited_fence();
-    composited_slot_ = -1;
-    frame_outstanding_.store(false, std::memory_order_release);
-    kms_atomic.prepare_resume();
-    if (cursor_plane_.valid())
-        cursor_plane_.invalidate();
-    content_committed_once_ = false;
-    for (unsigned slot = 0; slot < k_scanout_slots; ++slot)
-        slot_age_damage_[slot].set_full();
-    kms_pending_damage_.set_full();
-    missed_damage_.set_full();
-    resume_done_gen_ = gen;
-    resume_result_pending_ = true;
+void compositor_impl::run_resume_procedure(output_pipeline& p, unsigned gen) {
+    p.discard_fence();
+    p.composited_slot = -1;
+    p.frame_outstanding.store(false, std::memory_order_release);
+    if (p.kms)
+        p.kms->prepare_resume();
+    if (p.cursor.valid())
+        p.cursor.invalidate();
+    p.content_committed_once = false;
+    for (unsigned i = 0; i < output_pipeline::k_slots; ++i)
+        p.slot_age[i].set_full();
+    p.kms_pending.set_full();
+    p.missed.set_full();
+    p.resume_done_gen = gen;
+    p.resume_result_pending = p.kms != nullptr;
+    p.modeset_wait_since_ns = 0;
 }
 
-void compositor_impl::post_resume_result(unsigned gen, session_resume_outcome outcome) {
+void compositor_impl::post_resume_result(unsigned slot, unsigned gen,
+                                         session_resume_outcome outcome) {
     compositor_impl* self = this;
-    (void)runtime::executor::global().post(runtime::affinity::ui, [self, gen, outcome] {
-        // `gen` is the render generation: it answers the VT resume, a power-on, or both
-        // (whichever asked for it last).
-        if (gen == self->vt_resume_render_gen_)
-            self->apply_session_actions(
-                self->session_.on_resume_result(self->vt_resume_session_gen_, outcome));
-        if (gen == self->power_resume_render_gen_)
-            self->apply_power_actions(self->power_.on_resume_result(
-                outcome == session_resume_outcome::ok ? power_on_outcome::ok
-                : outcome == session_resume_outcome::rejected
-                    ? power_on_outcome::rejected
-                    : power_on_outcome::device_unavailable));
+    (void)runtime::executor::global().post(runtime::affinity::ui, [self, slot, gen, outcome] {
+        // `gen` is the render generation: it answers the VT resume, this output's power-on,
+        // or both (whichever asked for it last).
+        if (gen == self->vt_resume_render_gen_ && (self->vt_resume_pending_ & (1u << slot))) {
+            self->vt_resume_pending_ &= ~(1u << slot);
+            // The worst outcome over every output: one refused modeset is a refused resume.
+            if (outcome == session_resume_outcome::rejected ||
+                (outcome == session_resume_outcome::device_unavailable &&
+                 self->vt_resume_outcome_ == session_resume_outcome::ok))
+                self->vt_resume_outcome_ = outcome;
+            if (self->vt_resume_pending_ == 0)
+                self->apply_session_actions(self->session_.on_resume_result(
+                    self->vt_resume_session_gen_, self->vt_resume_outcome_));
+        }
+        if (slot < output_manager::k_max && gen == self->outs_[slot].power_resume_render_gen)
+            self->apply_power_actions(
+                slot, self->outs_[slot].power.on_resume_result(
+                          outcome == session_resume_outcome::ok ? power_on_outcome::ok
+                          : outcome == session_resume_outcome::rejected
+                              ? power_on_outcome::rejected
+                              : power_on_outcome::device_unavailable));
     });
 }
 
 void compositor_impl::post_flip_dispatch() {
     compositor_impl* self = this;
     (void)runtime::executor::global().post(runtime::affinity::ui,
-                                           [self] { self->kms_atomic.dispatch_events(); });
+                                           [self] { self->kms.dispatch_events(); });
+}
+
+// ── Hotplug: output plans UI → render → UI (ADR 008 §A.4, Part B) ─────────────
+
+void compositor_impl::wake_render() {
+    {
+        std::lock_guard lock{render_mutex};
+        render_pending = true;
+    }
+    render_cv.notify_one();
+}
+
+void compositor_impl::post_output_op(const output_op& op) {
+    {
+        std::lock_guard lock{ops_mutex_};
+        if (ops_count_ >= k_max_ops) {
+            // Bounded by the slots (one op in flight per slot and a few behind it): not
+            // reachable by any sequence of uevents, which coalesce before they get here.
+            lx::trace::logger::global().log(lx::trace::level::error, "compositor.hotplug",
+                                            "output op queue full — op dropped");
+            return;
+        }
+        ops_[ops_count_++] = op;
+    }
+    ops_pending_.store(true, std::memory_order_release);
+    if (threads_started.load(std::memory_order_acquire))
+        wake_render();
+    else
+        run_output_ops(); // before the render thread exists, UI stands in for it
+}
+
+void compositor_impl::run_output_ops() {
+    if (!ops_pending_.exchange(false, std::memory_order_acq_rel))
+        return;
+    unsigned n = 0;
+    bool test = false;
+    {
+        std::lock_guard lock{ops_mutex_};
+        n = ops_count_;
+        for (unsigned i = 0; i < n; ++i)
+            ops_work_[i] = ops_[i];
+        ops_count_ = 0;
+        if (config_test_pending_) {
+            config_test_work_ = config_test_;
+            config_test_pending_ = false;
+            test = true;
+        }
+    }
+    // Retires first: the CRTCs, planes and bandwidth they hold are free before any add in the
+    // same batch allocates and tests (an output configuration that disables one output and
+    // enables another posts the add first — §C.3). Only a retire that is the first op of its
+    // slot moves ahead: one cancelling an add of the same batch stays behind it.
+    bool done[k_max_ops]{};
+    for (unsigned i = 0; i < n; ++i) {
+        const output_op& op = ops_work_[i];
+        if (op.what != output_op::kind::retire || op.slot >= output_manager::k_max ||
+            (ops_deferred_slots_ & (1u << op.slot)))
+            continue;
+        bool first = true;
+        for (unsigned k = 0; k < i && first; ++k)
+            first = ops_work_[k].slot != op.slot;
+        if (!first)
+            continue;
+        run_output_op(op);
+        done[i] = true;
+    }
+    for (unsigned i = 0; i < n; ++i)
+        if (!done[i])
+            run_or_defer_output_op(ops_work_[i]);
+    if (test)
+        render_test_config(config_test_work_);
+}
+
+bool compositor_impl::kms_retire_in_flight() const {
+    for (const auto& up : pipes_)
+        if (up && up->retiring && up->kms)
+            return true;
+    return false;
+}
+
+void compositor_impl::run_or_defer_output_op(const output_op& op) {
+    if (op.slot >= output_manager::k_max)
+        return;
+    const std::uint32_t bit = 1u << op.slot;
+    const bool hold = (ops_deferred_slots_ & bit) ||
+                      (op.what == output_op::kind::add && op.kms && kms_retire_in_flight() &&
+                       (ops_deferred_count_ == 0 ||
+                        now_ns() - ops_deferred_since_ns_ < k_ops_defer_max_ns));
+    if (!hold || ops_deferred_count_ >= k_max_ops) {
+        run_output_op(op);
+        return;
+    }
+    if (ops_deferred_count_ == 0)
+        ops_deferred_since_ns_ = now_ns();
+    ops_deferred_[ops_deferred_count_++] = op;
+    ops_deferred_slots_ |= bit;
+}
+
+void compositor_impl::run_deferred_output_ops() {
+    if (ops_deferred_count_ == 0)
+        return;
+    if (kms_retire_in_flight() && now_ns() - ops_deferred_since_ns_ < k_ops_defer_max_ns)
+        return;
+    output_op held[k_max_ops];
+    const unsigned n = ops_deferred_count_;
+    for (unsigned i = 0; i < n; ++i)
+        held[i] = ops_deferred_[i];
+    ops_deferred_count_ = 0;
+    ops_deferred_slots_ = 0;
+    // Still a retire in flight: the wait timed out — they run now, in order, regardless.
+    const bool timed_out = kms_retire_in_flight();
+    for (unsigned i = 0; i < n; ++i) {
+        if (timed_out)
+            run_output_op(held[i]);
+        else
+            run_or_defer_output_op(held[i]);
+    }
+}
+
+void compositor_impl::run_output_op(const output_op& op) {
+    if (op.slot >= output_manager::k_max)
+        return;
+    output_pipeline* p = pipes_[op.slot].get();
+    switch (op.what) {
+    case output_op::kind::add:
+        render_add_output(op);
+        break;
+    case output_op::kind::test_mode:
+        render_test_mode(op);
+        break;
+    case output_op::kind::switch_mode:
+        if (p && !p->retiring && op.mode_count > 0) {
+            p->switch_pending = true;
+            p->switch_mode = op.modes[0];
+            p->switch_from_frame = op.from_frame;
+            p->switch_ticket = op.ticket;
+            // The same configuration's adaptive-sync change queued before it: the
+            // switch's modeset answers for both.
+            if (op.ticket && p->apply_ticket == op.ticket)
+                p->apply_ticket = 0;
+        } else if (op.ticket) {
+            compositor_impl* self = this;
+            const unsigned slot = op.slot;
+            const unsigned ticket = op.ticket;
+            (void)runtime::executor::global().post(runtime::affinity::ui, [self, slot, ticket] {
+                self->on_modeset_result(slot, ticket, false);
+            });
+        }
+        break;
+    case output_op::kind::set_vrr:
+        if (p && !p->retiring && p->kms) {
+            if (p->switch_pending) {
+                // A mode switch is on its way: VRR goes with its modeset, which carries
+                // the configuration's ticket (a modeset still in the old mode must not
+                // answer it).
+                p->switch_vrr = op.vrr ? 1 : 0;
+                if (op.ticket && !p->switch_ticket)
+                    p->switch_ticket = op.ticket;
+            } else {
+                p->kms->set_vrr(op.vrr);
+                p->apply_ticket = op.ticket;
+            }
+        } else if (op.ticket) {
+            compositor_impl* self = this;
+            const unsigned slot = op.slot;
+            const unsigned ticket = op.ticket;
+            const bool ok = p != nullptr; // composite-only: nothing to program
+            (void)runtime::executor::global().post(runtime::affinity::ui, [self, slot, ticket, ok] {
+                self->on_modeset_result(slot, ticket, ok);
+            });
+        }
+        break;
+    case output_op::kind::retire:
+        if (!p) {
+            compositor_impl* self = this;
+            const unsigned slot = op.slot;
+            const unsigned gen = op.gen;
+            (void)runtime::executor::global().post(
+                runtime::affinity::ui, [self, slot, gen] { self->on_retired(slot, gen); });
+        } else {
+            p->retiring = true;
+            p->retire_gen = op.gen;
+            p->retire_connector_gone = op.connector_gone;
+            // At once when nothing is in flight on its CRTC: an output configuration that
+            // disables this output and enables another may need its CRTC for the next op.
+            finish_retire(op.slot);
+        }
+        break;
+    }
+}
+
+namespace {
+void release_targets(output_pipeline& p) {
+    for (unsigned i = 0; i < output_pipeline::k_slots; ++i) {
+        p.gl[i] = gfx::gl_scanout_target{};
+        p.vk[i] = gfx::render_target{};
+        p.fb[i] = drm::kms_framebuffer{};
+        p.dumb[i] = drm::kms_dumb_framebuffer{};
+    }
+    p.slot_count = 0;
+}
+} // namespace
+
+void compositor_impl::render_add_output(const output_op& op) {
+    const unsigned slot = op.slot;
+    compositor_impl* self = this;
+    const unsigned gen = op.gen;
+    const auto answer = [self, slot, gen](bool ok, unsigned index, output_pipeline* pipe) {
+        (void)runtime::executor::global().post(runtime::affinity::ui,
+                                               [self, slot, gen, ok, index, pipe] {
+                                                   self->on_add_result(slot, gen, ok, index, pipe);
+                                               });
+    };
+    if (pipes_[slot]) {
+        // The slot is reserved until its last pipeline is retired: not reachable.
+        answer(false, 0, nullptr);
+        return;
+    }
+    auto p = std::make_unique<output_pipeline>();
+    p->impl = this;
+    p->slot = slot;
+    p->origin = op.origin;
+    p->scale = op.scale;
+    // A resume or power-on asked for before this pipeline existed is not its business.
+    p->resume_done_gen = resume_gen_[slot].load(std::memory_order_acquire);
+    p->first_frame = op.from_frame;
+    p->has_first_frame = true;
+    p->transform = op.transform;
+    p->apply_ticket = op.ticket;
+    bool ok = true;
+    unsigned chosen = 0;
+    const bool kms_out = op.kms && drm_present_ && !card_gone_.load(std::memory_order_acquire);
+    if (kms_out) {
+        ok = false;
+        // The CRTC allocation for the new output alone (ADR 008 M7): every CRTC and plane
+        // another pipeline holds is out of reach, and a TEST_ONLY of the new pipeline with
+        // its real first framebuffer decides — the kernel tests it against the state the
+        // other CRTCs are in, so this is the full state's test.
+        unsigned used_crtcs = 0;
+        unsigned used_planes[2 * output_manager::k_max]{};
+        unsigned used_plane_count = 0;
+        for (const auto& up : pipes_) {
+            if (!up || !up->kms)
+                continue;
+            used_crtcs |= 1u << up->kms->desc().crtc_index;
+            used_planes[used_plane_count++] = up->kms->desc().primary_plane_id;
+            if (up->cursor.valid())
+                used_planes[used_plane_count++] = up->cursor.caps().plane_id;
+        }
+        drm::crtc_alloc_input in{};
+        in.connector_count = 1;
+        in.crtc_count = kms.crtc_count();
+        in.connectors[0].possible_crtcs = op.possible_crtcs & ~used_crtcs;
+        const int routed = op.routed_crtc_id ? kms.crtc_index_of(op.routed_crtc_id) : -1;
+        in.connectors[0].routed_crtc = routed >= 0 && !(used_crtcs & (1u << routed)) ? routed : -1;
+        in.plane_count = kms.plane_count() < drm::k_alloc_max_planes ? kms.plane_count()
+                                                                      : drm::k_alloc_max_planes;
+        for (unsigned k = 0; k < in.plane_count; ++k) {
+            const drm::kms_plane_info pl = kms.plane(k);
+            bool taken = false;
+            for (unsigned u = 0; u < used_plane_count; ++u)
+                taken = taken || used_planes[u] == pl.id;
+            in.planes[k].kind = pl.kind;
+            in.planes[k].possible_crtcs = pl.possible_crtcs;
+            in.planes[k].bound_crtc = pl.crtc_id ? kms.crtc_index_of(pl.crtc_id) : -1;
+            in.planes[k].usable =
+                !taken && (pl.kind == drm::plane_kind::cursor ? pl.argb8888 : pl.xrgb8888);
+        }
+        const bool master = kms.is_master();
+        lx::size2i made{};
+        unsigned tests = 0;
+        // Adaptive sync asked for and refused in every mode: the modes again without it
+        // (sway's `search_valid_config` order: modes first, then VRR off).
+        bool vrr = op.vrr;
+        for (unsigned j = 0; j < op.mode_count * (op.vrr ? 2u : 1u) && !ok; ++j) {
+            const unsigned i = j % op.mode_count;
+            vrr = op.vrr && j < op.mode_count;
+            const drm::kms_mode& m = op.modes[i];
+            const lx::size2i size{static_cast<int>(m.width), static_cast<int>(m.height)};
+            if (size.width != made.width || size.height != made.height) {
+                release_targets(*p);
+                p->mode = size;
+                if (auto targets = create_targets(*p, true); !targets) {
+                    lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+                    made = {};
+                    continue;
+                }
+                made = size;
+            }
+            crtc_test_ctx t{};
+            t.impl = this;
+            t.kms = &kms;
+            t.count = 1;
+            t.framebuffers[0] = p->framebuffer(0, cpu_present_);
+            t.modes[0] = &m;
+            t.connectors[0] = op.connector_id;
+            t.vrr = vrr;
+            drm::crtc_alloc_result r{};
+            const bool assigned = drm::assign_crtcs(in, r, master ? &crtc_test : nullptr, &t);
+            tests += r.tests;
+            if (!assigned)
+                continue;
+            const drm::kms_pipeline_desc d = desc_for(kms, r, 0, op.connector_id);
+            p->kms = std::make_unique<drm::kms_pipeline>(kms, d);
+            p->kms->set_mode(m);
+            p->kms->set_vrr(vrr);
+            p->kms->set_framebuffer(p->framebuffer(0, cpu_present_));
+            p->presentation.bind_page_flip(*p->kms);
+            p->presentation.set_handler(&compositor_impl::presentation_flip_handler, p.get());
+            int cursor_plane = -1;
+            if (op.cursor_plane) {
+                const int k = r.cursor_plane[0];
+                if (k >= 0) {
+                    if (auto plane = drm::kms_cursor_plane::create(
+                            kms.card_fd(), d.crtc_id, d.crtc_index, cursor_plane_px_,
+                            cursor_plane_px_, kms.plane(static_cast<unsigned>(k)).id);
+                        plane) {
+                        p->cursor = std::move(plane).value();
+                        cursor_plane = static_cast<int>(kms.plane(static_cast<unsigned>(k)).id);
+                    }
+                }
+                // A cursor drawn by a plane on some outputs and by the scene on others would
+                // show twice where they meet: software everywhere (Part 1's rule).
+                if (!p->cursor.valid())
+                    fail_cursor_plane("a hotplugged output has no cursor plane");
+            }
+            chosen = i;
+            ok = true;
+            char line[224];
+            std::snprintf(line, sizeof(line),
+                          "output %u pipeline crtc=%u (index %u) primary=%u connector=%u "
+                          "mode=%ux%u@%u cursor_plane=%d tests=%u%s%s",
+                          slot, d.crtc_id, d.crtc_index, d.primary_plane_id, d.connector_id,
+                          m.width, m.height, m.refresh_mhz, cursor_plane, tests,
+                          i > 0 ? " (fallback mode)" : "",
+                          op.vrr ? (vrr ? " vrr" : " (vrr refused: off)") : "");
+            lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm", line);
+        }
+        if (!ok)
+            release_targets(*p);
+    } else {
+        p->mode = op.size;
+        if (vulkan_present_ || gl_present_ || cpu_present_)
+            if (auto targets = create_targets(*p, false); !targets)
+                lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+    }
+    output_pipeline* raw = p.get();
+    if (ok)
+        pipes_[slot] = std::move(p);
+    answer(ok, chosen, ok ? raw : nullptr);
+}
+
+void compositor_impl::render_test_mode(const output_op& op) {
+    const unsigned slot = op.slot;
+    compositor_impl* self = this;
+    const unsigned gen = op.gen;
+    const auto answer = [self, slot, gen](bool ok, unsigned index) {
+        (void)runtime::executor::global().post(runtime::affinity::ui, [self, slot, gen, ok, index] {
+            self->on_mode_tested(slot, gen, ok, index);
+        });
+    };
+    output_pipeline* p = pipes_[slot].get();
+    if (!p || p->retiring || card_gone_.load(std::memory_order_acquire)) {
+        answer(false, 0);
+        return;
+    }
+    if (!p->kms) {
+        answer(true, 0); // composite-only: nothing the kernel has to accept
+        return;
+    }
+    // TEST_ONLY of the pipeline in each candidate mode with a real framebuffer of that size
+    // (a test with real buffers, as sway's swapchain prepare): what passes is kept staged for
+    // the switch. The pipeline itself keeps flipping in its current mode meanwhile.
+    for (unsigned i = 0; i < op.mode_count; ++i) {
+        const drm::kms_mode& m = op.modes[i];
+        const lx::size2i size{static_cast<int>(m.width), static_cast<int>(m.height)};
+        std::unique_ptr<output_pipeline> staged;
+        if (p->staged && p->staged->mode.width == size.width && p->staged->mode.height == size.height)
+            staged = std::move(p->staged);
+        else {
+            staged = std::make_unique<output_pipeline>();
+            staged->mode = size;
+            if (auto targets = create_targets(*staged, true); !targets) {
+                lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+                continue;
+            }
+        }
+        drm::modeset_entry e{};
+        e.pipe = p->kms.get();
+        e.mode = &m;
+        e.framebuffer_id = staged->framebuffer(0, cpu_present_);
+        e.request_page_flip = false;
+        if (drm::commit_modeset(kms, &e, 1, true)) {
+            p->staged = std::move(staged);
+            p->staged_since_ns = now_ns();
+            answer(true, i);
+            return;
+        }
+        p->staged = std::move(staged); // reused when the next candidate has its size
+    }
+    p->staged.reset();
+    answer(false, 0);
+}
+
+namespace {
+/// A whole output configuration's TEST_ONLY (`render_test_config`): the entries of pipelines
+/// that exist, and the outputs being enabled, whose CRTCs a candidate assignment names.
+struct config_test_ctx {
+    drm::kms_device* kms = nullptr;
+    const drm::modeset_entry* fixed = nullptr;
+    unsigned fixed_count = 0;
+    unsigned count = 0;
+    unsigned framebuffers[output_manager::k_max]{};
+    const drm::kms_mode* modes[output_manager::k_max]{};
+    unsigned connectors[output_manager::k_max]{};
+    int vrr[output_manager::k_max]{};
+};
+
+bool config_crtc_test(const drm::crtc_alloc_result& r, void* user) {
+    auto* t = static_cast<config_test_ctx*>(user);
+    std::unique_ptr<drm::kms_pipeline> pipes[output_manager::k_max];
+    drm::modeset_entry entries[2 * output_manager::k_max]{};
+    unsigned n = 0;
+    for (unsigned i = 0; i < t->fixed_count; ++i)
+        entries[n++] = t->fixed[i];
+    for (unsigned i = 0; i < t->count; ++i) {
+        // Unregistered: no event can reach a candidate, and no other thread sees it.
+        pipes[i] = std::make_unique<drm::kms_pipeline>(
+            *t->kms, desc_for(*t->kms, r, i, t->connectors[i]), false);
+        pipes[i]->set_mode(*t->modes[i]);
+        drm::modeset_entry& e = entries[n++];
+        e.pipe = pipes[i].get();
+        e.framebuffer_id = t->framebuffers[i];
+        e.request_page_flip = false;
+        e.vrr = t->vrr[i] > 0 ? 1 : 0;
+    }
+    return static_cast<bool>(drm::commit_modeset(*t->kms, entries, n, true));
+}
+} // namespace
+
+void compositor_impl::render_test_config(const config_test& t) {
+    compositor_impl* self = this;
+    const unsigned gen = t.gen;
+    const auto answer = [self, gen](bool ok, unsigned tests) {
+        (void)runtime::executor::global().post(runtime::affinity::ui, [self, gen, ok, tests] {
+            self->on_config_tested(gen, ok, tests);
+        });
+    };
+    const bool vt_paused = (display_gate_.load(std::memory_order_acquire) & gate_vt) != 0;
+    if (!drm_present_ || card_gone_.load(std::memory_order_acquire) || vt_paused ||
+        !kms.is_master()) {
+        // Nothing can be asked of the kernel (the VT is away): the configuration cannot be
+        // checked, so it is not taken (wlroots' commits fail the same way then).
+        answer(t.count == 0, 0);
+        return;
+    }
+    drm::modeset_entry fixed[output_manager::k_max]{};
+    unsigned nf = 0;
+    unsigned released_crtcs = 0; // CRTCs of outputs this configuration disables
+    // Staged targets: a mode change's go to its pipeline for the switch; an enabled output's
+    // are dropped after the test (its add makes its own).
+    std::unique_ptr<output_pipeline> fresh[output_manager::k_max];
+    unsigned fresh_count = 0;
+    const auto stage = [&](lx::size2i size, std::unique_ptr<output_pipeline>& out) {
+        out = std::make_unique<output_pipeline>();
+        out->mode = size;
+        if (auto targets = create_targets(*out, true); !targets) {
+            lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+            out.reset();
+            return false;
+        }
+        return true;
+    };
+    for (unsigned i = 0; i < t.count; ++i) {
+        const config_test_entry& c = t.entries[i];
+        if (c.slot < 0)
+            continue;
+        output_pipeline* p = pipes_[c.slot].get();
+        if (!p || !p->kms || p->retiring)
+            continue;
+        drm::modeset_entry& e = fixed[nf];
+        e.pipe = p->kms.get();
+        e.request_page_flip = false;
+        if (!c.enable) {
+            e.enable = false;
+            e.cursor = p->cursor.valid() ? &p->cursor : nullptr;
+            released_crtcs |= 1u << p->kms->desc().crtc_index;
+            ++nf;
+            continue;
+        }
+        if (c.mode_change) {
+            const lx::size2i size{static_cast<int>(c.mode.width), static_cast<int>(c.mode.height)};
+            if (!p->staged || p->staged->mode.width != size.width ||
+                p->staged->mode.height != size.height) {
+                if (!stage(size, p->staged)) {
+                    answer(false, 0);
+                    return;
+                }
+            }
+            p->staged_since_ns = now_ns();
+            e.mode = &c.mode;
+            e.framebuffer_id = p->staged->framebuffer(0, cpu_present_);
+        } else {
+            e.framebuffer_id = p->framebuffer(p->front.load(std::memory_order_acquire), cpu_present_);
+        }
+        e.vrr = c.vrr;
+        ++nf;
+    }
+    // Outputs being enabled: a CRTC each among those nothing else keeps, the whole state
+    // checked by every candidate's test (KWin's checkCrtcAssignment).
+    config_test_ctx ctx{};
+    ctx.kms = &kms;
+    ctx.fixed = fixed;
+    ctx.fixed_count = nf;
+    drm::crtc_alloc_input in{};
+    unsigned used_crtcs = 0;
+    unsigned used_planes[2 * output_manager::k_max]{};
+    unsigned used_plane_count = 0;
+    for (const auto& up : pipes_) {
+        if (!up || !up->kms || up->retiring)
+            continue;
+        if (released_crtcs & (1u << up->kms->desc().crtc_index))
+            continue;
+        used_crtcs |= 1u << up->kms->desc().crtc_index;
+        used_planes[used_plane_count++] = up->kms->desc().primary_plane_id;
+        if (up->cursor.valid())
+            used_planes[used_plane_count++] = up->cursor.caps().plane_id;
+    }
+    // A released CRTC is not offered to another output in the same test: the disable and the
+    // enable would state the same CRTC twice in one commit. Swapping a CRTC between outputs
+    // takes two configurations (rare: it needs more enabled outputs than CRTCs).
+    used_crtcs |= released_crtcs;
+    for (unsigned i = 0; i < t.count; ++i) {
+        const config_test_entry& c = t.entries[i];
+        if (c.slot >= 0 || !c.enable || ctx.count >= output_manager::k_max)
+            continue;
+        const unsigned k = ctx.count++;
+        in.connectors[k].possible_crtcs = c.possible_crtcs & ~used_crtcs;
+        const int routed = c.routed_crtc_id ? kms.crtc_index_of(c.routed_crtc_id) : -1;
+        in.connectors[k].routed_crtc = routed >= 0 && !(used_crtcs & (1u << routed)) ? routed : -1;
+        const lx::size2i size{static_cast<int>(c.mode.width), static_cast<int>(c.mode.height)};
+        if (!stage(size, fresh[fresh_count])) {
+            answer(false, 0);
+            return;
+        }
+        ctx.framebuffers[k] = fresh[fresh_count]->framebuffer(0, cpu_present_);
+        ++fresh_count;
+        ctx.modes[k] = &c.mode;
+        ctx.connectors[k] = c.connector_id;
+        ctx.vrr[k] = c.vrr;
+    }
+    bool ok = false;
+    unsigned tests = 0;
+    if (ctx.count == 0) {
+        ok = nf == 0 || static_cast<bool>(drm::commit_modeset(kms, fixed, nf, true));
+        tests = nf > 0 ? 1u : 0u;
+    } else {
+        in.connector_count = ctx.count;
+        in.crtc_count = kms.crtc_count();
+        in.plane_count = kms.plane_count() < drm::k_alloc_max_planes ? kms.plane_count()
+                                                                      : drm::k_alloc_max_planes;
+        for (unsigned k = 0; k < in.plane_count; ++k) {
+            const drm::kms_plane_info pl = kms.plane(k);
+            bool taken = false;
+            for (unsigned u = 0; u < used_plane_count; ++u)
+                taken = taken || used_planes[u] == pl.id;
+            in.planes[k].kind = pl.kind;
+            in.planes[k].possible_crtcs = pl.possible_crtcs;
+            in.planes[k].bound_crtc = pl.crtc_id ? kms.crtc_index_of(pl.crtc_id) : -1;
+            in.planes[k].usable =
+                !taken && (pl.kind == drm::plane_kind::cursor ? pl.argb8888 : pl.xrgb8888);
+        }
+        drm::crtc_alloc_result r{};
+        ok = drm::assign_crtcs(in, r, &config_crtc_test, &ctx);
+        tests = r.tests;
+    }
+    answer(ok, tests);
+}
+
+bool compositor_impl::apply_mode_switch(output_pipeline& p, unsigned frame) {
+    if (!p.switch_pending || static_cast<int>(frame - p.switch_from_frame) < 0)
+        return true;
+    const lx::size2i size{static_cast<int>(p.switch_mode.width),
+                          static_cast<int>(p.switch_mode.height)};
+    const bool scanout = p.kms != nullptr;
+    if (size.width != p.mode.width || size.height != p.mode.height) {
+        // What is on screen: the current targets once a content commit of them went out,
+        // else the previous switch's (the graveyard) until this pipeline's modeset flipped.
+        const bool current_shown = !scanout || p.content_committed_once;
+        if (p.graveyard && current_shown) {
+            if (scanout && p.kms->flip_pending())
+                return false; // the graveyard may still be scanned out: next tick
+            p.graveyard.reset();
+        }
+        std::unique_ptr<output_pipeline> fresh;
+        if (p.staged && p.staged->mode.width == size.width && p.staged->mode.height == size.height) {
+            fresh = std::move(p.staged);
+        } else {
+            fresh = std::make_unique<output_pipeline>();
+            fresh->mode = size;
+            if (auto targets = create_targets(*fresh, scanout); !targets) {
+                lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+                p.switch_pending = false;
+                // Adaptive sync asked for with it still applies, by itself.
+                if (p.switch_vrr >= 0 && p.kms)
+                    p.kms->set_vrr(p.switch_vrr != 0);
+                p.switch_vrr = -1;
+                // An output configuration waiting for this switch has failed (and reverts).
+                if (p.switch_ticket) {
+                    compositor_impl* self = this;
+                    const unsigned slot = p.slot;
+                    const unsigned ticket = p.switch_ticket;
+                    p.switch_ticket = 0;
+                    (void)runtime::executor::global().post(runtime::affinity::ui, [self, slot, ticket] {
+                        self->on_modeset_result(slot, ticket, false);
+                    });
+                }
+                return true;
+            }
+        }
+        for (unsigned i = 0; i < output_pipeline::k_slots; ++i) {
+            std::swap(p.gl[i], fresh->gl[i]);
+            std::swap(p.vk[i], fresh->vk[i]);
+            std::swap(p.fb[i], fresh->fb[i]);
+            std::swap(p.dumb[i], fresh->dumb[i]);
+        }
+        std::swap(p.slot_count, fresh->slot_count);
+        fresh->mode = p.mode;
+        // The old targets stay until the new mode's first flip when one of them may be on
+        // screen (removing a framebuffer the CRTC scans out turns the CRTC off); else now.
+        if (scanout && current_shown)
+            p.graveyard = std::move(fresh);
+        p.mode = size;
+        p.scanout_rect = {0, 0, size.width, size.height};
+        p.front.store(0, std::memory_order_release);
+        p.pending_flip_slot.store(0, std::memory_order_release);
+    }
+    p.staged.reset();
+    if (p.kms) {
+        p.kms->set_mode(p.switch_mode);
+        if (p.switch_vrr >= 0)
+            p.kms->set_vrr(p.switch_vrr != 0);
+        if (p.slot_count > 0)
+            p.kms->set_framebuffer(p.framebuffer(0, cpu_present_));
+    }
+    p.switch_vrr = -1;
+    // Nothing composited for the old mode is committed; every slot is repainted.
+    p.discard_fence();
+    p.composited_slot = -1;
+    p.frame_outstanding.store(false, std::memory_order_release);
+    for (unsigned i = 0; i < output_pipeline::k_slots; ++i)
+        p.slot_age[i].set_full();
+    p.kms_pending.set_full();
+    p.missed.clear();
+    p.content_committed_once = false;
+    p.modeset_wait_since_ns = 0;
+    if (p.cursor.valid())
+        p.cursor.invalidate();
+    p.switch_pending = false;
+    // The switch's modeset is the one an output configuration waits for.
+    if (p.switch_ticket) {
+        p.apply_ticket = p.switch_ticket;
+        p.switch_ticket = 0;
+    }
+    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+        char line[128];
+        std::snprintf(line, sizeof(line), "output %u switched to %ux%u@%u from frame %u", p.slot,
+                      p.switch_mode.width, p.switch_mode.height, p.switch_mode.refresh_mhz, frame);
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.drm", line);
+    }
+    return true;
+}
+
+void compositor_impl::finish_retire(unsigned slot) {
+    output_pipeline* p = pipes_[slot].get();
+    if (!p || !p->retiring)
+        return;
+    // A CRTC takes one commit at a time: its last flip drains first (the flip handler wakes
+    // render when it lands).
+    if (p->kms && p->kms->flip_pending())
+        return;
+    const bool vt_paused = (display_gate_.load(std::memory_order_acquire) & gate_vt) != 0;
+    if (p->kms && drm_present_ && !vt_paused && !card_gone_.load(std::memory_order_acquire) &&
+        p->ever_lit.load(std::memory_order_acquire)) {
+        // CRTC off, connector unrouted, planes detached — otherwise the CRTC keeps scanning
+        // out a frame of ours on a monitor the session no longer drives (wlroots MR 3967).
+        drm::modeset_entry e{};
+        e.pipe = p->kms.get();
+        e.enable = false;
+        e.request_page_flip = false;
+        e.connector_gone = p->retire_connector_gone;
+        e.cursor = p->cursor.valid() ? &p->cursor : nullptr;
+        lx::trace::scoped_span span{"render", "kms.disable"};
+        if (auto off = drm::commit_modeset(kms, &e, 1, false); !off)
+            lx::trace::logger::global().log_error(off.get_error(), "compositor.drm");
+    }
+    if (p->kms) {
+        // Nothing to give back to the console, and no event will be routed to it again.
+        p->kms->forget_saved_state();
+        p->kms->leave_registry();
+    }
+    p->discard_fence();
+    p->staged.reset();
+    p->graveyard.reset();
+    release_targets(*p);
+    p->cursor = drm::kms_cursor_plane{};
+    const unsigned gen = p->retire_gen;
+    // Destroyed on UI: the thread draining KMS events may hold it until its dispatch returns.
+    output_pipeline* raw = pipes_[slot].release();
+    delete in_transit_[slot].exchange(raw, std::memory_order_acq_rel);
+    compositor_impl* self = this;
+    (void)runtime::executor::global().post(runtime::affinity::ui,
+                                           [self, slot, gen] { self->on_retired(slot, gen); });
+}
+
+void compositor_impl::on_retired(unsigned slot, unsigned gen) {
+    if (slot >= output_manager::k_max)
+        return;
+    delete in_transit_[slot].exchange(nullptr, std::memory_order_acq_rel);
+    if (slot_phase_[slot] == slot_phase::retiring && gen == slot_gen_[slot]) {
+        slot_phase_[slot] = slot_phase::free;
+        run_next_mgmt_job(); // a job may have waited for this slot
+    }
+    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+        char line[64];
+        std::snprintf(line, sizeof(line), "output %u pipeline retired", slot);
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.hotplug", line);
+    }
+}
+
+namespace {
+[[nodiscard]] const drm::connector_probe* scan_entry(const drm::connector_scan& scan,
+                                                     unsigned connector_id) {
+    for (unsigned i = 0; i < scan.count; ++i)
+        if (scan.entries[i].connector_id == connector_id)
+            return &scan.entries[i];
+    return nullptr;
+}
+} // namespace
+
+void compositor_impl::apply_connector_scan(const drm::connector_scan& scan, bool forced) {
+    if (card_gone_.load(std::memory_order_acquire))
+        return;
+    lx::trace::scoped_span span{"ui", "hotplug.apply"};
+    if (!pending_)
+        pending_ = std::make_unique<pending_output[]>(output_manager::k_max);
+    // The heads of connectors that are not outputs, and every head's mode list.
+    if (!last_scan_)
+        last_scan_ = std::make_unique<drm::connector_scan>();
+    // memcpy, not `=`: a POD, and Clang 23 loses the implicit copy assignment across the
+    // module boundary (the copy constructor survives).
+    std::memcpy(static_cast<void*>(last_scan_.get()), &scan, sizeof(scan));
+    mark_heads_dirty();
+    // Adds the scan no longer backs (unplugged again before their pipeline was up) are
+    // cancelled: the pipeline, made or not, is retired.
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        if (slot_phase_[s] != slot_phase::adding || pending_[s].headless)
+            continue;
+        const drm::connector_probe* e = scan_entry(scan, pending_[s].probe.connector_id);
+        if (e && desktop_connector(*e))
+            continue;
+        slot_phase_[s] = slot_phase::retiring;
+        output_op op{};
+        op.what = output_op::kind::retire;
+        op.slot = s;
+        op.gen = ++slot_gen_[s];
+        op.connector_gone = e == nullptr;
+        post_output_op(op);
+        char line[96];
+        std::snprintf(line, sizeof(line), "output %u add cancelled (%s gone again)", s,
+                      pending_[s].probe.name);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.hotplug", line);
+    }
+    // A connector that failed is tried again once it changed (or was unplugged), and at every
+    // resume (a failure may have been the VT switch racing the test).
+    if (forced)
+        failed_count_ = 0;
+    for (unsigned i = 0; i < failed_count_;) {
+        const drm::connector_probe* e = scan_entry(scan, failed_[i].connector_id);
+        if (e && desktop_connector(*e) && mode_list_hash(*e) == failed_[i].modes_hash) {
+            ++i;
+            continue;
+        }
+        failed_[i] = failed_[--failed_count_];
+    }
+
+    output_changes ch{};
+    diff_scan(outputs, scan, ch);
+    // A disabled connector (by a configuration or the setup) is not an output to add.
+    {
+        unsigned w = 0;
+        for (unsigned i = 0; i < ch.count; ++i) {
+            const output_change& c = ch.items[i];
+            if (c.what == output_change::kind::added && c.entry >= 0 &&
+                connector_disabled(scan.entries[c.entry].connector_id))
+                continue;
+            ch.items[w++] = c;
+        }
+        ch.count = w;
+    }
+    if (ch.empty()) {
+        // An identical scan (our own probe's detect, `udevadm trigger`, a same-layout
+        // update): nothing moves, nobody is told (§B.7).
+        if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.hotplug",
+                                            "hotplug: no change");
+        // A disabled monitor unplugged or plugged in changes no output, but the set of
+        // connected monitors, whose setup may say otherwise.
+        apply_connected_setup(scan);
+        return;
+    }
+    // Removals first (their slots and CRTCs are needed by what comes), then changes, then
+    // the new outputs (wlroots creates outputs only after the old ones are destroyed).
+    for (unsigned i = 0; i < ch.count; ++i) {
+        const output_change& c = ch.items[i];
+        if (c.what != output_change::kind::removed || c.slot < 0)
+            continue;
+        const unsigned slot = static_cast<unsigned>(c.slot);
+        if (!outputs.slot_live(slot))
+            continue;
+        remove_output(slot, scan_entry(scan, outputs.slot_state(slot).connector_id) == nullptr);
+    }
+    for (unsigned i = 0; i < ch.count; ++i) {
+        const output_change& c = ch.items[i];
+        if (c.what != output_change::kind::changed || c.slot < 0 || c.entry < 0)
+            continue;
+        if (outputs.slot_live(static_cast<unsigned>(c.slot)))
+            change_output(static_cast<unsigned>(c.slot), scan.entries[c.entry], forced);
+    }
+    // New connectors come up as the monitor's persisted state and the setup of what is
+    // connected now say; a changed set of monitors applies its setup (ADR 008 §C.5).
+    apply_connected_setup(scan);
+    if (ch.dropped > 0)
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug",
+                                        "more connected monitors than output slots — the rest "
+                                        "stay off");
+    outputs_changed_now();
+}
+
+int compositor_impl::add_output_from(const drm::connector_probe& e, const connect_choice* choice) {
+    if (!pending_)
+        pending_ = std::make_unique<pending_output[]>(output_manager::k_max);
+    const int slot = outputs.free_slot(reserved_slots());
+    if (slot < 0)
+        return -1;
+    const unsigned s = static_cast<unsigned>(slot);
+    pending_output& pd = pending_[s];
+    pd = pending_output{};
+    pd.probe = e;
+    pd.kms = drm_present_;
+    pd.head_known = output_mgmt_heads(p0_).find(e.connector_id) != nullptr;
+    if (choice) {
+        for (unsigned i = 0; i < choice->mode_count && i < output_op::k_modes; ++i)
+            pd.modes[i] = choice->modes[i];
+        pd.mode_count = choice->mode_count;
+        pd.scale = choice->scale;
+        pd.transform = choice->transform;
+        pd.adaptive_sync = choice->adaptive_sync && e.vrr_capable;
+        pd.has_position = choice->has_position;
+        pd.position = choice->position;
+        pd.follow_preferred = choice->follow_preferred;
+        pd.ticket = choice->ticket;
+    } else {
+        pd.mode_count = mode_candidates(e, choose_mode(e, nullptr), pd.modes, output_op::k_modes);
+    }
+    if (pd.mode_count == 0)
+        return -1;
+    output_op op{};
+    op.what = output_op::kind::add;
+    op.slot = s;
+    op.gen = ++slot_gen_[s];
+    op.kms = pd.kms;
+    op.cursor_plane = pd.kms && cursor_.hardware_active();
+    op.connector_id = e.connector_id;
+    op.possible_crtcs = e.possible_crtcs;
+    op.routed_crtc_id = e.current_crtc_id;
+    for (unsigned i = 0; i < pd.mode_count; ++i)
+        op.modes[i] = pd.modes[i];
+    op.mode_count = pd.mode_count;
+    op.size = {static_cast<int>(pd.modes[0].width), static_cast<int>(pd.modes[0].height)};
+    op.from_frame = static_cast<unsigned>(last_published_any_ + 1);
+    op.ticket = pd.ticket;
+    op.vrr = pd.adaptive_sync;
+    op.transform = static_cast<lx::buffer_transform>(pd.transform & 7u);
+    slot_phase_[s] = slot_phase::adding;
+    post_output_op(op);
+    char line[160];
+    std::snprintf(line, sizeof(line), "output %u connecting name=%s preferred=%ux%u@%u modes=%u", s,
+                  e.name, pd.modes[0].width, pd.modes[0].height, pd.modes[0].refresh_mhz,
+                  e.mode_count);
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.hotplug", line);
+    mark_heads_dirty();
+    return slot;
+}
+
+void compositor_impl::on_add_result(unsigned slot, unsigned gen, bool ok, unsigned mode_index,
+                                    output_pipeline* pipe) {
+    if (slot >= output_manager::k_max || gen != slot_gen_[slot] || !pending_)
+        return; // superseded: a retire of this slot is queued behind it
+    pending_output& pd = pending_[slot];
+    if (pd.headless) {
+        // HEADLESS-1 is live already; its (composite-only) pipeline is here now.
+        if (ok && outputs.slot_live(slot))
+            outs_[slot].pipe = pipe;
+        return;
+    }
+    if (slot_phase_[slot] != slot_phase::adding)
+        return;
+    if (!ok) {
+        slot_phase_[slot] = slot_phase::free;
+        mark_heads_dirty();
+        if (pd.ticket) {
+            // An output configuration enabled it: its apply fails (and is reverted); the
+            // connector is not marked failed — the client chose this mode, not the policy.
+            on_modeset_result(slot, pd.ticket, false);
+            if (outputs.count() == 0)
+                add_fallback_headless();
+            run_next_mgmt_job();
+            return;
+        }
+        if (outputs.count() == 0)
+            add_fallback_headless();
+        if (failed_count_ < output_manager::k_max)
+            failed_[failed_count_++] = {pd.probe.connector_id, mode_list_hash(pd.probe)};
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "output %s not enabled: no CRTC, or none of its %u modes passed "
+                      "TEST_ONLY — it stays off until it changes",
+                      pd.probe.name, pd.mode_count);
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug", line);
+        return;
+    }
+    const drm::kms_mode& m = pd.modes[mode_index < pd.mode_count ? mode_index : 0];
+    output_desc d = desc_from_probe(pd.probe, m);
+    d.virtual_output = !pd.kms;
+    // What a configuration chose (a client's apply, the persisted monitor and setup).
+    d.scale = pd.scale;
+    d.transform = pd.transform;
+    // As render could program it (a refused VRR falls back to off).
+    d.adaptive_sync = pd.adaptive_sync && (!pipe || !pipe->kms || pipe->kms->vrr());
+    d.follow_preferred = mode_index == 0 ? pd.follow_preferred : true;
+    {
+        bool listed = false;
+        for (unsigned k = 0; k < pd.probe.mode_count && !listed; ++k)
+            listed = pd.probe.modes[k].same_timings(m);
+        d.custom_mode = !listed;
+    }
+    if (pd.has_position) {
+        d.position = pd.position;
+        d.auto_position = false;
+    }
+    if (outputs.add_output(d, static_cast<int>(slot)) < 0) {
+        slot_phase_[slot] = slot_phase::retiring;
+        output_op op{};
+        op.what = output_op::kind::retire;
+        op.slot = slot;
+        op.gen = ++slot_gen_[slot];
+        post_output_op(op);
+        return;
+    }
+    slot_phase_[slot] = slot_phase::live;
+    // UI takes the handle before the view and clock are made (`sync_output_views` keeps it).
+    outs_[slot].pipe = pipe;
+    // While locked a new output comes up locked (M14): the scene's layers are hidden, so its
+    // first frame is the lock colour, and `locking` waits for this output's locked frame too.
+    lock_shown_.forget(slot);
+    // The stand-in goes now that a display is here (after the add: never zero outputs).
+    if (fallback_headless_slot_ >= 0 && fallback_headless_slot_ != static_cast<int>(slot) &&
+        outputs.slot_live(static_cast<unsigned>(fallback_headless_slot_))) {
+        const unsigned fs = static_cast<unsigned>(fallback_headless_slot_);
+        fallback_headless_slot_ = -1;
+        remove_output(fs, true);
+    }
+    outputs_changed_now();
+    // Every other output powered off by idle (or a client): the new one stays dark too until
+    // the next input wakes them all (Mutter).
+    {
+        bool others = false;
+        bool all_off = true;
+        for (unsigned s = 0; s < output_manager::k_max; ++s) {
+            if (s == slot || !outs_[s].live)
+                continue;
+            others = true;
+            const power_phase ph = outs_[s].power.phase();
+            all_off = all_off && (ph == power_phase::off || ph == power_phase::off_pending ||
+                                  ph == power_phase::soft_blank);
+        }
+        if (others && all_off) {
+            const bool vt_away = (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0;
+            apply_power_actions(slot, outs_[slot].power.request_off(vt_away));
+        }
+    }
+    const unsigned back = wm_.on_output_added(slot);
+    // Changed while it was being added (a resize right after the plug): what it is now.
+    if (pd.stale && hotplug_ready_)
+        hotplug_.request_full(false);
+    if (pd.ticket) {
+        // An output configuration waits for its first modeset — unless there is none to wait
+        // for: no KMS (a virtual output), or it stays dark until the next wake.
+        const std::uint32_t bit = 1u << slot;
+        const bool vt_away = (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0;
+        if (!pd.kms || vt_away || (gate_power_mask_.load(std::memory_order_relaxed) & bit))
+            on_modeset_result(slot, pd.ticket, true);
+    }
+    clocks_.set_vrr(slot, outputs.slot_state(slot).adaptive_sync);
+    mark_heads_dirty();
+    const output_state& o = outputs.slot_state(slot);
+    const lx::rect2i l = o.logical_rect();
+    char line[448];
+    std::snprintf(line, sizeof(line),
+                  "output %u added name=%s identifier=\"%s\" mode=%dx%d@%u scale=%g "
+                  "logical=%dx%d+%d+%d windows_returned=%u",
+                  slot, o.name, o.identifier, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
+                  l.width, l.height, l.x, l.y, back);
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+    request_frame(1u << slot);
+    run_next_mgmt_job();
+}
+
+void compositor_impl::change_output(unsigned slot, const drm::connector_probe& e, bool forced) {
+    const output_state& o = outputs.slot_state(slot);
+    // A custom mode is not in any list: the output keeps it whatever the connector offers
+    // (only a link retrain modesets it again).
+    const drm::kms_mode* m = o.custom_mode ? &o.kms_mode : choose_mode(e, &o);
+    const bool mode_change = m && !m->same_timings(o.kms_mode);
+    const bool retrain = e.link_bad;
+    const drm::kms_mode current = o.kms_mode;
+    // Everything else about the head (preferred mode, the mode list, the host's suggested
+    // position, physical size) is taken now; a moved suggestion re-runs the layout.
+    outputs.update_head(slot, e);
+    if (!mode_change && !retrain)
+        return;
+    const drm::kms_mode target = mode_change ? *m : current;
+    output_pipeline* pipe = outs_[slot].pipe;
+    // The resume switches at once (its modeset is the test, and it must not light the old
+    // size); a composite-only output has nothing to test; a retrain keeps the mode.
+    if (forced || !pipe || !pipe->kms || !mode_change) {
+        switch_output_mode(slot, target, !mode_change ? "link-retrain" : forced ? "resume" : "hotplug");
+        return;
+    }
+    pending_output& pd = pending_[slot];
+    pd.probe = e;
+    pd.mode_count = mode_candidates(e, &target, pd.modes, output_op::k_modes);
+    output_op op{};
+    op.what = output_op::kind::test_mode;
+    op.slot = slot;
+    op.gen = ++slot_gen_[slot];
+    for (unsigned i = 0; i < pd.mode_count; ++i)
+        op.modes[i] = pd.modes[i];
+    op.mode_count = pd.mode_count;
+    post_output_op(op);
+}
+
+void compositor_impl::on_mode_tested(unsigned slot, unsigned gen, bool ok, unsigned mode_index) {
+    if (slot >= output_manager::k_max || gen != slot_gen_[slot] ||
+        slot_phase_[slot] != slot_phase::live || !outputs.slot_live(slot) || !pending_)
+        return;
+    if (!ok) {
+        const output_state& o = outputs.slot_state(slot);
+        char line[192];
+        std::snprintf(line, sizeof(line),
+                      "output %u %s: no mode of its new list passed TEST_ONLY — staying at %dx%d",
+                      slot, o.name, o.mode.width, o.mode.height);
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug", line);
+        return;
+    }
+    const pending_output& pd = pending_[slot];
+    switch_output_mode(slot, pd.modes[mode_index < pd.mode_count ? mode_index : 0],
+                       mode_index > 0 ? "hotplug (fallback mode)" : "hotplug");
+}
+
+void compositor_impl::switch_output_mode(unsigned slot, const drm::kms_mode& mode, const char* why) {
+    const output_state& o = outputs.slot_state(slot);
+    switch_output_mode(slot, mode, why, o.follow_preferred, o.custom_mode, 0);
+}
+
+void compositor_impl::switch_output_mode(unsigned slot, const drm::kms_mode& mode, const char* why,
+                                         bool follow, bool custom, unsigned ticket) {
+    const output_state& o = outputs.slot_state(slot);
+    const lx::size2i was = o.mode;
+    if (outs_[slot].pipe) {
+        // Render takes the new targets right before compositing the first frame built at
+        // the new size — every frame built from here on (§A.4).
+        output_op op{};
+        op.what = output_op::kind::switch_mode;
+        op.slot = slot;
+        op.gen = ++slot_gen_[slot];
+        op.modes[0] = mode;
+        op.mode_count = 1;
+        op.from_frame = static_cast<unsigned>(last_published_any_ + 1);
+        op.ticket = ticket;
+        post_output_op(op);
+    }
+    outputs.set_mode(slot, mode, follow, custom);
+    outputs_changed_now();
+    char line[160];
+    std::snprintf(line, sizeof(line), "output %u mode %ux%u@%u (was %dx%d) — %s", slot, mode.width,
+                  mode.height, mode.refresh_mhz, was.width, was.height, why);
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+    request_frame(1u << slot);
+}
+
+void compositor_impl::add_fallback_headless() {
+    if (!pending_)
+        pending_ = std::make_unique<pending_output[]>(output_manager::k_max);
+    const int slot = outputs.free_slot(reserved_slots());
+    if (slot < 0)
+        return;
+    const unsigned s = static_cast<unsigned>(slot);
+    output_desc d{};
+    d.name = "HEADLESS-1";
+    d.mode = {1920, 1080};
+    d.refresh_mhz = 60000;
+    d.virtual_output = true;
+    if (outputs.add_output(d, slot) < 0)
+        return;
+    fallback_headless_slot_ = slot;
+    slot_phase_[s] = slot_phase::live;
+    pending_[s] = pending_output{};
+    pending_[s].headless = true;
+    outs_[s].pipe = nullptr;
+    output_op op{};
+    op.what = output_op::kind::add;
+    op.slot = s;
+    op.gen = ++slot_gen_[s];
+    op.kms = false;
+    op.size = d.mode;
+    op.from_frame = static_cast<unsigned>(last_published_any_ + 1);
+    post_output_op(op);
+    // Windows stranded by an output that went while another was on its way, which then
+    // failed to come up: the stand-in takes them in.
+    (void)wm_.on_output_added(s);
+    char line[96];
+    std::snprintf(line, sizeof(line), "output %u HEADLESS-1 stands in (no display connected)", s);
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+}
+
+void compositor_impl::remove_output(unsigned slot, bool connector_gone, const char* why) {
+    if (!outputs.slot_live(slot))
+        return;
+    char name[32];
+    char identifier[208];
+    std::snprintf(name, sizeof(name), "%s", outputs.slot_state(slot).name);
+    std::snprintf(identifier, sizeof(identifier), "%s", outputs.slot_state(slot).identifier);
+    const std::uint32_t bit = 1u << slot;
+    // Clients always see at least one output: the stand-in comes before this one goes —
+    // unless another is on its way (an output configuration enabling one).
+    bool coming = false;
+    for (unsigned s = 0; s < output_manager::k_max && !coming; ++s)
+        coming = slot_phase_[s] == slot_phase::adding;
+    if ((outputs.live_mask() & ~bit) == 0 && !coming)
+        add_fallback_headless();
+    auto& seat = input_devices_.default_seat();
+    const int under = output_at(outputs, seat.pointer_x(), seat.pointer_y());
+    const int fallback = fallback_output(outputs, slot, under);
+    // §B.5: windows move (and remember this output), layer surfaces are closed (sway), lock
+    // surfaces are dropped by the outputs-changed pass below.
+    const unsigned moved = wm_.evacuate_output(slot, fallback, identifier);
+    layers_.close_output(slot);
+    // UI lets go of the pipeline before render takes it down.
+    outs_[slot].pipe = nullptr;
+    gate_power_mask_.fetch_and(~bit, std::memory_order_acq_rel);
+    power_gen_[slot].fetch_add(1, std::memory_order_acq_rel); // a power-off task in flight is stale
+    presentation_discard_output(p0_, slot);
+    // Nothing is shown on it any more: a surface last shown only here is paced by the
+    // fallback throttle (or the output it shows on next), never by this dead slot.
+    p0_.published_mask &= ~bit;
+    p0_.published_frame[slot] = 0;
+    lock_shown_.forget(slot);
+    if (fallback_headless_slot_ == static_cast<int>(slot))
+        fallback_headless_slot_ = -1;
+    outputs.remove_slot(slot);
+    slot_phase_[slot] = slot_phase::retiring;
+    {
+        output_op op{};
+        op.what = output_op::kind::retire;
+        op.slot = slot;
+        op.gen = ++slot_gen_[slot];
+        op.connector_gone = connector_gone;
+        post_output_op(op);
+    }
+    // An output configuration waiting for this output's modeset no longer does.
+    if (mgmt_ && mgmt_->active && mgmt_->stage == mgmt_run::phase::committing &&
+        (mgmt_->waiting & bit)) {
+        mgmt_->waiting &= ~bit;
+        // Finished from the timer, not from the middle of this removal.
+        if (mgmt_->waiting == 0 && outcfg_timer_) {
+            mgmt_->deadline_ns = now_ns();
+            outcfg_timer_->schedule_at(mgmt_->deadline_ns + 1'000'000);
+        }
+    }
+    // A VT resume waiting for this output's answer no longer does.
+    if (vt_resume_pending_ & bit) {
+        vt_resume_pending_ &= ~bit;
+        if (vt_resume_pending_ == 0)
+            apply_session_actions(session_.on_resume_result(vt_resume_session_gen_, vt_resume_outcome_));
+    }
+    // The pointer was on it: the middle of the fallback, where it is easy to find.
+    const bool pointer_moved = under == static_cast<int>(slot) && fallback >= 0 &&
+                               outputs.slot_live(static_cast<unsigned>(fallback));
+    if (pointer_moved) {
+        const lx::rect2i l = outputs.slot_state(static_cast<unsigned>(fallback)).logical_rect();
+        seat.set_pointer_position(l.x + l.width / 2, l.y + l.height / 2);
+    }
+    // Membership first (leave on the objects that still stand for it), then the global goes,
+    // its power objects fail, its lock surfaces drop (wire_output.cpp `outputs_changed`).
+    outputs_changed_now();
+    if (pointer_moved) {
+        cursor_.on_motion(seat.pointer_x(), seat.pointer_y(), 0, wm_.grab_active() || wm_.drag_active());
+        wm_.on_pointer_motion(static_cast<unsigned>(now_ns() / 1'000'000ull));
+    }
+    // Windows are suspended only while every output that is left is dark.
+    {
+        const std::uint32_t live = outputs.live_mask();
+        const std::uint32_t dark = gate_power_mask_.load(std::memory_order_relaxed) & live;
+        wm_.set_suspend_reason(window_manager::suspend_power, live != 0 && dark == live);
+    }
+    advance_lock();
+    char line[320];
+    if (why)
+        std::snprintf(line, sizeof(line), "output %u disabled name=%s identifier=\"%s\" windows_moved=%u (%s)",
+                      slot, name, identifier, moved, why);
+    else
+        std::snprintf(line, sizeof(line), "output %u removed name=%s identifier=\"%s\" windows_moved=%u%s",
+                      slot, name, identifier, moved, connector_gone ? " (connector gone)" : "");
+    lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+    mark_heads_dirty();
+}
+
+void compositor_impl::on_card_removed() {
+    if (card_gone_.exchange(true, std::memory_order_acq_rel))
+        return;
+    lx::trace::logger::global().log(lx::trace::level::error, "compositor.hotplug",
+                                    "DRM card removed — every display is gone; the session goes "
+                                    "on without one");
+    hotplug_.stop();
+    for (unsigned s = 0; s < output_manager::k_max; ++s)
+        if (outputs.slot_live(s) && outputs.slot_state(s).connector_id != 0)
+            remove_output(s, true);
+}
+
+void compositor_impl::reclamp_pointer() {
+    if (outputs.count() == 0)
+        return;
+    auto& seat = input_devices_.default_seat();
+    double x = seat.pointer_x();
+    double y = seat.pointer_y();
+    if (!closest_point(outputs, x, y) || (x == seat.pointer_x() && y == seat.pointer_y()))
+        return;
+    seat.set_pointer_position(x, y);
+    // A synthesized motion: the cursor follows and pointer focus is re-evaluated (§A.8).
+    cursor_.on_motion(x, y, 0, wm_.grab_active() || wm_.drag_active());
+    wm_.on_pointer_motion(static_cast<unsigned>(now_ns() / 1'000'000ull));
+}
+
+void compositor_impl::sync_cursor_themes() {
+    if (cursor_theme_count_ == 0)
+        return; // before start's themes (or without a cursor at all)
+    unsigned used[output_manager::k_max];
+    unsigned n = 0;
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        if (!outputs.slot_live(s))
+            continue;
+        const unsigned s120 = static_cast<unsigned>(std::lround(outputs.slot_state(s).scale * 120.0));
+        bool seen = false;
+        for (unsigned i = 0; i < n; ++i)
+            seen = seen || used[i] == s120;
+        if (!seen)
+            used[n++] = s120;
+    }
+    bool changed = false;
+    for (unsigned u = 0; u < n; ++u) {
+        bool loaded = false;
+        for (unsigned i = 0; i < cursor_theme_count_ && !loaded; ++i)
+            loaded = cursor_theme_scale120_[i] == used[u];
+        if (loaded)
+            continue;
+        int slot = cursor_theme_count_ < k_cursor_scales ? static_cast<int>(cursor_theme_count_) : -1;
+        for (unsigned i = 0; i < cursor_theme_count_ && slot < 0; ++i) {
+            bool in_use = false;
+            for (unsigned k = 0; k < n && !in_use; ++k)
+                in_use = used[k] == cursor_theme_scale120_[i];
+            if (!in_use)
+                slot = static_cast<int>(i);
+        }
+        if (slot < 0)
+            break; // more distinct scales than themes: the nearest serves (§A.7)
+        const unsigned i = static_cast<unsigned>(slot);
+        const long px = std::lround(static_cast<double>(cursor_base_px_) * used[u] / 120.0);
+        cursor_themes_[i].load(nullptr, px > 0 ? static_cast<unsigned>(px) : cursor_base_px_);
+        cursor_theme_scale120_[i] = used[u];
+        if (i == cursor_theme_count_)
+            ++cursor_theme_count_;
+        changed = true;
+        char line[160];
+        std::snprintf(line, sizeof(line), "cursor theme=%s size=%u scale=%u/120 (new output scale)",
+                      cursor_themes_[i].name(), cursor_themes_[i].size(), used[u]);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
+    }
+    if (!changed)
+        return;
+    const xcursor_theme* themes[k_cursor_scales]{};
+    for (unsigned i = 0; i < cursor_theme_count_; ++i)
+        themes[i] = &cursor_themes_[i];
+    cursor_.set_themes(themes, cursor_theme_scale120_, cursor_theme_count_);
+}
+
+void compositor_impl::outputs_changed_now() {
+    mark_heads_dirty();
+    // The layout moved (an output's mode, position or scale; an output added or gone): the
+    // views, clocks and render projections follow, layer surfaces are re-arranged.
+    if (outputs.layout_generation() != applied_layout_generation_) {
+        sync_output_views();
+        sync_cursor_themes();
+    }
+    // Anything a client sees of an output changed: clients are told (each wl_output and
+    // xdg_output, then done) and every surface's membership is recomputed.
+    if (outputs.generation() != output_generation_) {
+        output_generation_ = outputs.generation();
+        log_outputs();
+        lx::trace::scoped_span outputs_span{"ui", "outputs_changed"};
+        notify_outputs_changed(p0_);
+    }
+    reclamp_pointer();
+}
+
+// ── Output configuration: wlr-output-management and persistence (ADR 008 Part C) ──────
+
+bool compositor_impl::connector_disabled(unsigned connector_id) const {
+    for (unsigned i = 0; i < disabled_count_; ++i)
+        if (disabled_connectors_[i] == connector_id)
+            return true;
+    return false;
+}
+
+void compositor_impl::keep_position(unsigned connector_id, const output_state& o) {
+    kept_position k{};
+    k.connector_id = connector_id;
+    k.has_position = !o.auto_position;
+    k.position = o.position;
+    k.has_mode = !o.follow_preferred && o.kms_mode.valid();
+    k.mode = o.kms_mode;
+    for (unsigned i = 0; i < kept_position_count_; ++i) {
+        if (kept_positions_[i].connector_id != connector_id)
+            continue;
+        if (!k.has_position && !k.has_mode)
+            kept_positions_[i] = kept_positions_[--kept_position_count_];
+        else
+            kept_positions_[i] = k;
+        return;
+    }
+    if ((k.has_position || k.has_mode) && kept_position_count_ < output_manager::k_max)
+        kept_positions_[kept_position_count_++] = k;
+}
+
+const compositor_impl::kept_position* compositor_impl::kept_position_of(unsigned connector_id) const {
+    for (unsigned i = 0; i < kept_position_count_; ++i)
+        if (kept_positions_[i].connector_id == connector_id)
+            return &kept_positions_[i];
+    return nullptr;
+}
+
+void compositor_impl::set_connector_disabled(unsigned connector_id, bool disabled) {
+    for (unsigned i = 0; i < disabled_count_; ++i) {
+        if (disabled_connectors_[i] != connector_id)
+            continue;
+        if (!disabled) {
+            disabled_connectors_[i] = disabled_connectors_[--disabled_count_];
+            mark_heads_dirty();
+        }
+        return;
+    }
+    if (disabled && disabled_count_ < output_manager::k_max) {
+        disabled_connectors_[disabled_count_++] = connector_id;
+        mark_heads_dirty();
+    }
+}
+
+unsigned compositor_impl::virtual_key(const char* name) {
+    for (unsigned i = 0; i < virtual_head_count_; ++i)
+        if (!std::strcmp(virtual_heads_[i].name, name))
+            return virtual_heads_[i].key;
+    if (virtual_head_count_ >= output_manager::k_max)
+        return mgmt::k_virtual_key; // never matched by anything
+    virtual_head& v = virtual_heads_[virtual_head_count_++];
+    v = virtual_head{};
+    v.key = mgmt::k_virtual_key | next_virtual_key_++;
+    std::snprintf(v.name, sizeof(v.name), "%s", name);
+    return v.key;
+}
+
+int compositor_impl::slot_of_head(unsigned key) const {
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        if (!outputs.slot_live(s))
+            continue;
+        const output_state& o = outputs.slot_state(s);
+        if (o.connector_id != 0) {
+            if (o.connector_id == key)
+                return static_cast<int>(s);
+            continue;
+        }
+        for (unsigned i = 0; i < virtual_head_count_; ++i)
+            if (virtual_heads_[i].key == key && !std::strcmp(virtual_heads_[i].name, o.name))
+                return static_cast<int>(s);
+    }
+    return -1;
+}
+
+unsigned compositor_impl::max_enabled_heads() const {
+    if (!drm_present_)
+        return output_manager::k_max;
+    const unsigned crtcs = kms.crtc_count();
+    return crtcs < output_manager::k_max ? crtcs : output_manager::k_max;
+}
+
+unsigned compositor_impl::connected_identifiers(const drm::connector_scan& scan,
+                                                char (*ids)[monitor_config::k_id],
+                                                unsigned* entries) const {
+    unsigned n = 0;
+    for (unsigned i = 0; i < scan.count && n < output_manager::k_max; ++i) {
+        const drm::connector_probe& e = scan.entries[i];
+        if (!desktop_connector(e))
+            continue;
+        monitor_identity(e.name, e.make, e.model, e.serial, e.edid, ids[n], monitor_config::k_id,
+                         nullptr, 0);
+        // Two identical monitors: the connector tells them apart (as `output_manager` does).
+        for (unsigned j = 0; j < n; ++j) {
+            if (std::strcmp(ids[j], ids[n]) != 0)
+                continue;
+            const std::size_t len = std::strlen(ids[n]);
+            std::snprintf(ids[n] + len, monitor_config::k_id - len, " connector:%s", e.name);
+            break;
+        }
+        entries[n++] = i;
+    }
+    return n;
+}
+
+void compositor_impl::choose_for_connector(const drm::connector_probe& e, const char* id,
+                                           const setup_config* setup, connect_choice& out) const {
+    out = connect_choice{};
+    const output_config& cfg = outcfg_.config();
+    const monitor_config* mon = find_monitor(cfg, id);
+    const setup_output_config* so = nullptr;
+    for (unsigned i = 0; setup && i < setup->count && !so; ++i)
+        if (!std::strcmp(setup->outputs[i].identifier, id))
+            so = &setup->outputs[i];
+    out.enabled = so ? so->enabled : true;
+    // A VM's monitor (`hotplug_mode_update`): the host owns its size and place (Mutter).
+    const bool vm = e.hotplug_mode_update;
+    drm::kms_mode custom{};
+    const drm::kms_mode* first = nullptr;
+    if (mon && mon->has_mode && !mon->mode_preferred && !vm) {
+        for (unsigned k = 0; k < e.mode_count; ++k) {
+            const drm::kms_mode& m = e.modes[k];
+            if (m.width != mon->width || m.height != mon->height)
+                continue;
+            if (mon->refresh_mhz != 0 && m.refresh_mhz != mon->refresh_mhz)
+                continue;
+            if (!first || m.refresh_mhz > first->refresh_mhz)
+                first = &m;
+        }
+        if (!first) {
+            // Not listed: it was a custom mode (the monitor is the same, so its list is).
+            custom = drm::cvt_mode(mon->width, mon->height, mon->refresh_mhz,
+                                   drm::cvt_blanking_for_connector(e.type));
+            if (custom.valid())
+                first = &custom;
+        }
+        if (first)
+            out.follow_preferred = false;
+    }
+    out.mode_count = mode_candidates(e, first ? first : choose_mode(e, nullptr), out.modes,
+                                     output_op::k_modes);
+    if (mon && mon->has_scale)
+        out.scale = mon->scale;
+    if (mon && mon->has_transform)
+        out.transform = mon->transform;
+    out.adaptive_sync = mon && mon->has_adaptive_sync && mon->adaptive_sync && e.vrr_capable;
+    if (so && so->has_position && !vm) {
+        out.has_position = true;
+        out.position = {so->x, so->y};
+    }
+}
+
+void compositor_impl::configure_outputs_at_start(const drm::connector_scan& scan) {
+    last_scan_ = std::make_unique<drm::connector_scan>(scan);
+    char ids[output_manager::k_max][monitor_config::k_id];
+    unsigned entries[output_manager::k_max];
+    const unsigned n = connected_identifiers(scan, ids, entries);
+    const char* ptrs[output_manager::k_max];
+    for (unsigned k = 0; k < n; ++k) {
+        ptrs[k] = ids[k];
+        connected_set_[k] = scan.entries[entries[k]].connector_id;
+    }
+    connected_count_ = n;
+    std::sort(connected_set_, connected_set_ + n);
+    const setup_config* setup = find_setup(outcfg_.config(), ptrs, n);
+    unsigned added = 0;
+    for (unsigned k = 0; k < n; ++k) {
+        const drm::connector_probe& e = scan.entries[entries[k]];
+        connect_choice c{};
+        choose_for_connector(e, ids[k], setup, c);
+        if (!c.enabled || c.mode_count == 0) {
+            if (c.has_position) {
+                output_state at{};
+                at.position = c.position;
+                at.auto_position = false;
+                keep_position(e.connector_id, at);
+            }
+            set_connector_disabled(e.connector_id, true);
+            continue;
+        }
+        output_desc d = desc_from_probe(e, c.modes[0]);
+        d.scale = c.scale;
+        d.transform = c.transform;
+        d.adaptive_sync = c.adaptive_sync;
+        d.follow_preferred = c.follow_preferred;
+        bool listed = false;
+        for (unsigned m = 0; m < e.mode_count && !listed; ++m)
+            listed = e.modes[m].same_timings(c.modes[0]);
+        d.custom_mode = !listed;
+        if (c.has_position) {
+            d.position = c.position;
+            d.auto_position = false;
+        }
+        if (outputs.add_output(d) >= 0)
+            ++added;
+    }
+    // A file that disables every connected monitor (only a hand edit can): the first comes up.
+    if (added == 0 && n > 0) {
+        const drm::connector_probe& e = scan.entries[entries[0]];
+        set_connector_disabled(e.connector_id, false);
+        (void)outputs.add_output(desc_from_probe(e, *e.preferred_mode()));
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.outputcfg",
+                                        "the persisted setup disables every monitor — enabling "
+                                        "the first");
+    }
+    if (setup || outcfg_.config().monitor_count > 0) {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+                      "output configuration at start: %u monitor%s, setup %s, %u disabled", n,
+                      n == 1 ? "" : "s", setup ? "restored" : "new", disabled_count_);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.outputcfg", line);
+    }
+    if (outputs.count() == 0)
+        (void)outputs.add_virtual("HEADLESS-1", {0, 0, 1920, 1080}, 60000);
+    mark_heads_dirty();
+}
+
+void compositor_impl::apply_connected_setup(const drm::connector_scan& scan) {
+    char ids[output_manager::k_max][monitor_config::k_id];
+    unsigned entries[output_manager::k_max];
+    const unsigned n = connected_identifiers(scan, ids, entries);
+    const char* ptrs[output_manager::k_max];
+    unsigned now_set[output_manager::k_max];
+    for (unsigned k = 0; k < n; ++k) {
+        ptrs[k] = ids[k];
+        now_set[k] = scan.entries[entries[k]].connector_id;
+    }
+    std::sort(now_set, now_set + n);
+    const bool set_changed =
+        n != connected_count_ || std::memcmp(now_set, connected_set_, n * sizeof(unsigned)) != 0;
+    std::memcpy(connected_set_, now_set, n * sizeof(unsigned));
+    connected_count_ = n;
+    // Disabled marks of connectors no longer connected go with them.
+    for (unsigned i = 0; i < disabled_count_;) {
+        bool still = false;
+        for (unsigned k = 0; k < n && !still; ++k)
+            still = now_set[k] == disabled_connectors_[i];
+        if (still) {
+            ++i;
+            continue;
+        }
+        disabled_connectors_[i] = disabled_connectors_[--disabled_count_];
+        mark_heads_dirty();
+    }
+    for (unsigned i = 0; i < kept_position_count_;) {
+        bool still = false;
+        for (unsigned k = 0; k < n && !still; ++k)
+            still = now_set[k] == kept_positions_[i].connector_id;
+        if (still)
+            ++i;
+        else
+            kept_positions_[i] = kept_positions_[--kept_position_count_];
+    }
+    // When the set of connected monitors changed, its setup (if one was saved) decides which
+    // are enabled and where; an unknown set enables everything and keeps what is placed
+    // where it is (KWin 6). Otherwise only new connectors are brought up.
+    const setup_config* setup = set_changed ? find_setup(outcfg_.config(), ptrs, n) : nullptr;
+    unsigned to_disable[output_manager::k_max];
+    unsigned disable_count = 0;
+    for (unsigned k = 0; k < n; ++k) {
+        const drm::connector_probe& e = scan.entries[entries[k]];
+        const setup_output_config* so = nullptr;
+        for (unsigned i = 0; setup && i < setup->count && !so; ++i)
+            if (!std::strcmp(setup->outputs[i].identifier, ids[k]))
+                so = &setup->outputs[i];
+        const bool want = set_changed ? (so ? so->enabled : true) : !connector_disabled(e.connector_id);
+        int slot = -1;
+        for (unsigned s = 0; s < output_manager::k_max && slot < 0; ++s)
+            if (outputs.slot_live(s) && outputs.slot_state(s).connector_id == e.connector_id)
+                slot = static_cast<int>(s);
+        if (slot >= 0) {
+            if (!want) {
+                to_disable[disable_count++] = static_cast<unsigned>(slot);
+                keep_position(e.connector_id, outputs.slot_state(static_cast<unsigned>(slot)));
+                set_connector_disabled(e.connector_id, true);
+            } else if (so && !e.hotplug_mode_update) {
+                const lx::output_id id = outputs.slot_state(static_cast<unsigned>(slot)).id;
+                if (so->has_position)
+                    outputs.set_position(id, {so->x, so->y});
+                else
+                    outputs.set_auto_position(id);
+            }
+            continue;
+        }
+        bool busy = false;
+        for (unsigned s = 0; s < output_manager::k_max && !busy; ++s) {
+            busy = slot_phase_[s] == slot_phase::adding && !pending_[s].headless &&
+                   pending_[s].probe.connector_id == e.connector_id;
+            if (busy && mode_list_hash(e) != mode_list_hash(pending_[s].probe))
+                pending_[s].stale = true;
+        }
+        for (unsigned f = 0; f < failed_count_ && !busy; ++f)
+            busy = failed_[f].connector_id == e.connector_id;
+        if (busy)
+            continue;
+        if (!want) {
+            if (so && so->has_position && !e.hotplug_mode_update) {
+                output_state at{};
+                at.position = {so->x, so->y};
+                at.auto_position = false;
+                keep_position(e.connector_id, at);
+            }
+            set_connector_disabled(e.connector_id, true);
+            continue;
+        }
+        set_connector_disabled(e.connector_id, false);
+        connect_choice c{};
+        choose_for_connector(e, ids[k], setup ? setup : find_setup(outcfg_.config(), ptrs, n), c);
+        (void)add_output_from(e, &c);
+    }
+    // Disables last: whatever this setup enables is on its way first, so clients never see
+    // the stand-in output in between.
+    for (unsigned i = 0; i < disable_count; ++i)
+        if (outputs.slot_live(to_disable[i]))
+            remove_output(to_disable[i], false, "disabled by the setup");
+    if (setup)
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.outputcfg",
+                                        "connected monitors changed: their saved setup applied");
+    mark_heads_dirty();
+}
+
+void compositor_impl::build_heads(mgmt::head_set& hs) {
+    hs.count = 0;
+    const auto fill_modes = [](mgmt::head& h, const drm::connector_probe& e) {
+        h.mode_count = 0;
+        for (unsigned k = 0; k < e.mode_count && h.mode_count < mgmt::k_max_modes; ++k) {
+            const drm::kms_mode& m = e.modes[k];
+            const mgmt::mode mm{static_cast<int>(m.width), static_cast<int>(m.height),
+                                static_cast<int>(m.refresh_mhz), m.preferred};
+            // Distinct timings with one tuple are one mode to a client (the first is used).
+            bool dup = false;
+            for (unsigned j = 0; j < h.mode_count && !dup; ++j)
+                dup = h.modes[j].same(mm);
+            if (!dup)
+                h.modes[h.mode_count++] = mm;
+        }
+    };
+    const auto set_current = [](mgmt::head& h, int w, int ht, int mhz, bool custom) {
+        h.current = -1;
+        for (unsigned k = 0; k < h.mode_count && !custom; ++k)
+            if (h.modes[k].width == w && h.modes[k].height == ht && h.modes[k].refresh_mhz == mhz &&
+                (h.current < 0 || h.modes[k].preferred))
+                h.current = static_cast<int>(k);
+        if (h.current < 0)
+            h.custom = {w, ht, mhz, false};
+    };
+    // Outputs, in slot order.
+    for (unsigned s = 0; s < output_manager::k_max && hs.count < mgmt::k_max_heads; ++s) {
+        if (!outputs.slot_live(s))
+            continue;
+        const output_state& o = outputs.slot_state(s);
+        mgmt::head& h = hs.heads[hs.count++];
+        h = mgmt::head{};
+        h.key = o.connector_id ? o.connector_id : virtual_key(o.name);
+        std::snprintf(h.name, sizeof(h.name), "%s", o.name);
+        std::snprintf(h.description, sizeof(h.description), "%s", o.description);
+        std::snprintf(h.make, sizeof(h.make), "%s", o.make);
+        std::snprintf(h.model, sizeof(h.model), "%s", o.model);
+        std::snprintf(h.serial, sizeof(h.serial), "%s", o.serial);
+        h.phys_w_mm = o.phys_w_mm;
+        h.phys_h_mm = o.phys_h_mm;
+        const drm::connector_probe* e =
+            o.connector_id && last_scan_ ? scan_entry(*last_scan_, o.connector_id) : nullptr;
+        if (e)
+            fill_modes(h, *e);
+        if (h.mode_count == 0) {
+            // A virtual output's one mode is the one it has.
+            h.modes[0] = {o.mode.width, o.mode.height, static_cast<int>(o.refresh_mhz), true};
+            h.mode_count = 1;
+        }
+        set_current(h, o.mode.width, o.mode.height, static_cast<int>(o.refresh_mhz),
+                    o.custom_mode && e != nullptr);
+        h.enabled = true;
+        h.x = o.position.x;
+        h.y = o.position.y;
+        h.transform = o.transform;
+        h.scale = o.scale;
+        h.adaptive_sync = o.adaptive_sync;
+        h.vrr_capable = o.vrr_capable;
+        h.auto_position = o.auto_position;
+    }
+    // Connected monitors that are not outputs (disabled, refused, being brought up).
+    if (last_scan_) {
+        for (unsigned i = 0; i < last_scan_->count && hs.count < mgmt::k_max_heads; ++i) {
+            const drm::connector_probe& e = last_scan_->entries[i];
+            if (!desktop_connector(e))
+                continue;
+            bool live = false;
+            for (unsigned s = 0; s < output_manager::k_max && !live; ++s)
+                live = outputs.slot_live(s) && outputs.slot_state(s).connector_id == e.connector_id;
+            // A monitor being brought up is not a head yet: it appears once, enabled, when
+            // its output is live (a client configuring it meanwhile would only be cancelled).
+            for (unsigned s = 0; s < output_manager::k_max && !live && pending_; ++s)
+                live = slot_phase_[s] == slot_phase::adding && !pending_[s].headless &&
+                       !pending_[s].head_known && pending_[s].probe.connector_id == e.connector_id;
+            if (live)
+                continue;
+            mgmt::head& h = hs.heads[hs.count++];
+            h = mgmt::head{};
+            h.key = e.connector_id;
+            std::snprintf(h.name, sizeof(h.name), "%s", e.name);
+            char id[monitor_config::k_id];
+            monitor_identity(e.name, e.make, e.model, e.serial, e.edid, id, sizeof(id),
+                             h.description, sizeof(h.description));
+            std::snprintf(h.make, sizeof(h.make), "%s", e.make);
+            std::snprintf(h.model, sizeof(h.model), "%s", e.model);
+            std::snprintf(h.serial, sizeof(h.serial), "%s", e.serial);
+            h.phys_w_mm = static_cast<int>(e.phys_w_mm);
+            h.phys_h_mm = static_cast<int>(e.phys_h_mm);
+            fill_modes(h, e);
+            // What enabling it without setting anything gives: its persisted monitor state,
+            // else the defaults.
+            connect_choice c{};
+            choose_for_connector(e, id, nullptr, c);
+            const drm::kms_mode& first = c.mode_count > 0 ? c.modes[0] : *e.preferred_mode();
+            bool listed = false;
+            for (unsigned k = 0; k < e.mode_count && !listed; ++k)
+                listed = e.modes[k].same_timings(first);
+            set_current(h, static_cast<int>(first.width), static_cast<int>(first.height),
+                        static_cast<int>(first.refresh_mhz), !listed);
+            h.enabled = false;
+            h.scale = c.scale > 0.0 ? representable_scale(c.scale)
+                                    : outputs.default_scale_for(e.name, static_cast<int>(first.width),
+                                                                static_cast<int>(first.height),
+                                                                h.phys_w_mm, h.phys_h_mm);
+            h.transform = c.transform;
+            h.adaptive_sync = c.adaptive_sync;
+            h.vrr_capable = e.vrr_capable;
+            h.auto_position = true;
+            if (const kept_position* kp = kept_position_of(e.connector_id)) {
+                if (kp->has_position) {
+                    h.x = kp->position.x;
+                    h.y = kp->position.y;
+                    h.auto_position = false;
+                }
+                if (kp->has_mode) {
+                    bool in_list = false;
+                    for (unsigned k = 0; k < e.mode_count && !in_list; ++k)
+                        in_list = e.modes[k].same_timings(kp->mode);
+                    set_current(h, static_cast<int>(kp->mode.width), static_cast<int>(kp->mode.height),
+                                static_cast<int>(kp->mode.refresh_mhz), !in_list);
+                }
+            }
+        }
+    }
+    // Virtual outputs a configuration disabled.
+    for (unsigned i = 0; i < virtual_head_count_ && hs.count < mgmt::k_max_heads; ++i) {
+        const virtual_head& v = virtual_heads_[i];
+        if (!v.disabled)
+            continue;
+        mgmt::head& h = hs.heads[hs.count++];
+        h = mgmt::head{};
+        h.key = v.key;
+        std::snprintf(h.name, sizeof(h.name), "%s", v.name);
+        std::snprintf(h.description, sizeof(h.description), "%s", v.name);
+        h.modes[0] = {v.mode.width, v.mode.height, static_cast<int>(v.refresh_mhz), true};
+        h.mode_count = 1;
+        h.current = 0;
+        h.scale = v.scale;
+        h.transform = v.transform;
+        h.x = v.position.x;
+        h.y = v.position.y;
+        h.auto_position = v.auto_position;
+    }
+}
+
+void compositor_impl::flush_output_heads() {
+    if (!heads_dirty_)
+        return;
+    heads_dirty_ = false;
+    if (!p0_.output_mgmt_kick)
+        return; // no zwlr_output_manager_v1 global
+    if (!heads_scratch_)
+        heads_scratch_ = std::make_unique<mgmt::head_set>();
+    build_heads(*heads_scratch_);
+    output_heads_changed(p0_, *heads_scratch_);
+}
+
+drm::kms_mode compositor_impl::target_kms_mode(const mgmt::head_target& t,
+                                               const drm::connector_probe* e) const {
+    if (!e) {
+        drm::kms_mode m{};
+        m.width = static_cast<unsigned>(t.mode.width);
+        m.height = static_cast<unsigned>(t.mode.height);
+        m.refresh_mhz = t.mode.refresh_mhz > 0 ? static_cast<unsigned>(t.mode.refresh_mhz) : 60000u;
+        m.preferred = true;
+        return m;
+    }
+    if (!t.custom) {
+        for (unsigned k = 0; k < e->mode_count; ++k) {
+            const drm::kms_mode& m = e->modes[k];
+            if (static_cast<int>(m.width) == t.mode.width &&
+                static_cast<int>(m.height) == t.mode.height &&
+                static_cast<int>(m.refresh_mhz) == t.mode.refresh_mhz && m.preferred == t.mode.preferred)
+                return m;
+        }
+    }
+    return drm::cvt_mode(static_cast<unsigned>(t.mode.width), static_cast<unsigned>(t.mode.height),
+                         static_cast<unsigned>(t.mode.refresh_mhz > 0 ? t.mode.refresh_mhz : 0),
+                         drm::cvt_blanking_for_connector(e->type));
+}
+
+namespace {
+
+/// "Virtual-1 1600x900@60000+0+0 x1.5 90, Virtual-2 off" — for the log.
+void describe_target(const mgmt::target& t, const mgmt::head_set& heads, char* out, unsigned size) {
+    unsigned w = 0;
+    out[0] = '\0';
+    for (unsigned i = 0; i < t.count && w + 1 < size; ++i) {
+        const mgmt::head_target& h = t.heads[i];
+        const mgmt::head* hd = heads.find(h.key);
+        const char* name = hd ? hd->name : "?";
+        int n = 0;
+        if (!h.enabled)
+            n = std::snprintf(out + w, size - w, "%s%s off", i ? ", " : "", name);
+        else
+            n = std::snprintf(out + w, size - w, "%s%s %dx%d@%d%s %s%d,%d x%g t%u%s", i ? ", " : "",
+                              name, h.mode.width, h.mode.height, h.mode.refresh_mhz,
+                              h.custom ? " (custom)" : "", h.position_explicit ? "at " : "auto ",
+                              h.x, h.y, h.scale, h.transform, h.adaptive_sync ? " vrr" : "");
+        if (n < 0)
+            break;
+        w += static_cast<unsigned>(n);
+        if (w >= size)
+            w = size - 1;
+    }
+}
+
+[[nodiscard]] bool same_targets(const mgmt::target& a, const mgmt::target& b) {
+    if (a.count != b.count)
+        return false;
+    for (unsigned i = 0; i < a.count; ++i) {
+        const mgmt::head_target& x = a.heads[i];
+        const mgmt::head_target* y = b.find(x.key);
+        if (!y || x.enabled != y->enabled)
+            return false;
+        if (!x.enabled)
+            continue;
+        if (!x.mode.same_size_refresh(y->mode) || x.custom != y->custom || x.x != y->x ||
+            x.y != y->y || x.position_explicit != y->position_explicit ||
+            x.transform != y->transform || x.scale != y->scale ||
+            x.adaptive_sync != y->adaptive_sync)
+            return false;
+    }
+    return true;
+}
+
+bool post_to_worker(void (*fn)(void*), void* arg);
+
+} // namespace
+
+bool compositor_impl::plan_config_test(const mgmt::target& t, config_test& out) const {
+    out.count = 0;
+    if (!drm_present_ || !last_scan_)
+        return false;
+    for (unsigned i = 0; i < t.count && out.count < output_manager::k_max; ++i) {
+        const mgmt::head_target& ht = t.heads[i];
+        const int slot = slot_of_head(ht.key);
+        config_test_entry c{};
+        if (slot >= 0) {
+            const output_state& o = outputs.slot_state(static_cast<unsigned>(slot));
+            const output_pipeline* p = outs_[slot].pipe;
+            if (o.connector_id == 0 || !p || !p->kms)
+                continue; // composite-only: nothing for the kernel
+            c.slot = slot;
+            if (!ht.enabled) {
+                c.enable = false;
+                out.entries[out.count++] = c;
+                continue;
+            }
+            const drm::kms_mode m = target_kms_mode(ht, scan_entry(*last_scan_, o.connector_id));
+            c.mode = m;
+            c.mode_change = !m.same_timings(o.kms_mode) || static_cast<int>(m.width) != o.mode.width ||
+                            static_cast<int>(m.height) != o.mode.height;
+            c.vrr = ht.adaptive_sync != o.adaptive_sync ? (ht.adaptive_sync ? 1 : 0) : -1;
+            if (c.mode_change || c.vrr >= 0)
+                out.entries[out.count++] = c;
+            continue;
+        }
+        if (!ht.enabled || (ht.key & mgmt::k_virtual_key))
+            continue;
+        const drm::connector_probe* e = scan_entry(*last_scan_, ht.key);
+        if (!e)
+            continue;
+        c.slot = -1;
+        c.connector_id = e->connector_id;
+        c.possible_crtcs = e->possible_crtcs;
+        c.routed_crtc_id = e->current_crtc_id;
+        c.mode = target_kms_mode(ht, e);
+        c.vrr = ht.adaptive_sync ? 1 : 0;
+        out.entries[out.count++] = c;
+    }
+    return out.count > 0;
+}
+
+void compositor_impl::run_next_mgmt_job() {
+    if (mgmt_ && mgmt_->active)
+        return;
+    mgmt::job_queue& q = output_mgmt_jobs(p0_);
+    while (!q.empty()) {
+        // An output mid-way (being added or retired): its answer kicks this again.
+        if (reserved_slots() != 0)
+            return;
+        // The serial must reflect every change made so far.
+        flush_output_heads();
+        const mgmt::job j = q.front();
+        q.pop();
+        if (!mgmt_)
+            mgmt_ = std::make_unique<mgmt_run>();
+        mgmt_run& r = *mgmt_;
+        r = mgmt_run{};
+        r.job = j;
+        if (j.config.serial != output_mgmt_serial(p0_)) {
+            r.active = true;
+            finish_mgmt_job(mgmt_result::cancelled, "the outputs changed since its serial");
+            return;
+        }
+        const mgmt::head_set& heads = output_mgmt_heads(p0_);
+        mgmt::current_target(heads, r.previous);
+        if (const auto f = mgmt::resolve(j.config, heads, max_enabled_heads(), r.target);
+            f != mgmt::resolve_failure::none) {
+            r.active = true;
+            finish_mgmt_job(mgmt_result::failed, mgmt::failure_text(f));
+            return;
+        }
+        r.active = true;
+        if (same_targets(r.target, r.previous)) {
+            // What is already there (kanshi re-applying the restored state at login, C4):
+            // no modeset, no save.
+            finish_mgmt_job(mgmt_result::succeeded, "nothing to change");
+            return;
+        }
+        r.test_gen = ++config_test_gen_;
+        config_test test{};
+        if (plan_config_test(r.target, test)) {
+            test.gen = r.test_gen;
+            r.stage = mgmt_run::phase::testing;
+            r.deadline_ns = now_ns() + k_mgmt_deadline_ns;
+            if (outcfg_timer_)
+                outcfg_timer_->schedule_at(r.deadline_ns);
+            {
+                std::lock_guard lock{ops_mutex_};
+                config_test_ = test;
+                config_test_pending_ = true;
+            }
+            ops_pending_.store(true, std::memory_order_release);
+            if (threads_started.load(std::memory_order_acquire))
+                wake_render();
+            else
+                run_output_ops();
+            return;
+        }
+        on_config_tested(r.test_gen, true, 0);
+        return;
+    }
+}
+
+void compositor_impl::on_config_tested(unsigned gen, bool ok, unsigned tests) {
+    if (!mgmt_ || !mgmt_->active || mgmt_->stage != mgmt_run::phase::testing ||
+        gen != mgmt_->test_gen)
+        return;
+    mgmt_run& r = *mgmt_;
+    flush_output_heads();
+    if (r.job.config.serial != output_mgmt_serial(p0_)) {
+        finish_mgmt_job(mgmt_result::cancelled, "the outputs changed during its test");
+        return;
+    }
+    if (!ok) {
+        char why[64];
+        std::snprintf(why, sizeof(why), "TEST_ONLY refused (%u tested)", tests);
+        finish_mgmt_job(mgmt_result::failed, tests ? why : "TEST_ONLY refused");
+        return;
+    }
+    if (r.job.test) {
+        finish_mgmt_job(mgmt_result::succeeded, tests ? "TEST_ONLY passed" : "valid");
+        return;
+    }
+    r.ticket = ++apply_ticket_counter_;
+    if (r.ticket == 0)
+        r.ticket = ++apply_ticket_counter_;
+    std::uint32_t waiting = 0;
+    r.stage = mgmt_run::phase::committing;
+    switch_to_target(r.target, r.ticket, waiting);
+    r.waiting |= waiting;
+    r.deadline_ns = now_ns() + k_mgmt_deadline_ns;
+    if (outcfg_timer_)
+        outcfg_timer_->schedule_at(r.deadline_ns);
+    if (r.waiting == 0)
+        complete_apply(r.failed ? "an output could not be enabled" : "no modeset needed");
+}
+
+void compositor_impl::switch_to_target(const mgmt::target& t, unsigned ticket,
+                                       std::uint32_t& waiting) {
+    waiting = 0;
+    const bool vt_paused = (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0;
+    const std::uint32_t gated =
+        vt_paused ? ~0u : gate_power_mask_.load(std::memory_order_relaxed);
+    // 1. Enables first, so the outputs being disabled are never the last ones left (no
+    //    stand-in output flashes up in between); they come up asynchronously.
+    for (unsigned i = 0; i < t.count; ++i) {
+        const mgmt::head_target& ht = t.heads[i];
+        if (!ht.enabled || slot_of_head(ht.key) >= 0)
+            continue;
+        if (ht.key & mgmt::k_virtual_key) {
+            for (unsigned v = 0; v < virtual_head_count_; ++v) {
+                virtual_head& vh = virtual_heads_[v];
+                if (vh.key != ht.key)
+                    continue;
+                vh.disabled = false;
+                output_desc d{};
+                d.name = vh.name;
+                d.mode = {ht.mode.width, ht.mode.height};
+                d.refresh_mhz = ht.mode.refresh_mhz > 0 ? static_cast<unsigned>(ht.mode.refresh_mhz) : 60000u;
+                d.scale = ht.scale;
+                d.transform = ht.transform;
+                d.virtual_output = true;
+                d.position = {ht.x, ht.y};
+                d.auto_position = !ht.position_explicit;
+                const int s = outputs.add_output(d);
+                if (s < 0)
+                    break;
+                const unsigned us = static_cast<unsigned>(s);
+                slot_phase_[us] = slot_phase::live;
+                if (!pending_)
+                    pending_ = std::make_unique<pending_output[]>(output_manager::k_max);
+                pending_[us] = pending_output{};
+                pending_[us].headless = true;
+                outs_[us].pipe = nullptr;
+                output_op op{};
+                op.what = output_op::kind::add;
+                op.slot = us;
+                op.gen = ++slot_gen_[us];
+                op.kms = false;
+                op.size = d.mode;
+                op.transform = static_cast<lx::buffer_transform>(ht.transform & 7u);
+                op.from_frame = static_cast<unsigned>(last_published_any_ + 1);
+                post_output_op(op);
+                (void)wm_.on_output_added(us);
+                break;
+            }
+            continue;
+        }
+        const drm::connector_probe* e = last_scan_ ? scan_entry(*last_scan_, ht.key) : nullptr;
+        if (!e) {
+            if (ticket && mgmt_)
+                mgmt_->failed = true;
+            continue;
+        }
+        connect_choice c{};
+        c.modes[0] = target_kms_mode(ht, e);
+        c.mode_count = c.modes[0].valid() ? 1u : 0u;
+        c.scale = ht.scale;
+        c.transform = ht.transform;
+        c.adaptive_sync = ht.adaptive_sync;
+        c.has_position = ht.position_explicit;
+        c.position = {ht.x, ht.y};
+        // Following the preferred mode exactly when that is the mode it gets.
+        c.follow_preferred = ht.mode.preferred && !ht.custom;
+        c.ticket = ticket;
+        set_connector_disabled(ht.key, false);
+        const int s = add_output_from(*e, &c);
+        if (s < 0) {
+            if (ticket && mgmt_)
+                mgmt_->failed = true;
+            continue;
+        }
+        if (ticket)
+            waiting |= 1u << s; // answered by the add (refused, dark, or its first modeset)
+    }
+    // 2. Outputs that stay: mode, adaptive sync, transform, scale, position.
+    for (unsigned i = 0; i < t.count; ++i) {
+        const mgmt::head_target& ht = t.heads[i];
+        if (!ht.enabled)
+            continue;
+        const int si = slot_of_head(ht.key);
+        if (si < 0 || slot_phase_[si] != slot_phase::live)
+            continue;
+        const unsigned slot = static_cast<unsigned>(si);
+        const std::uint32_t bit = 1u << slot;
+        const output_state o = outputs.slot_state(slot); // a copy: the setters change it
+        const drm::connector_probe* e =
+            o.connector_id && last_scan_ ? scan_entry(*last_scan_, o.connector_id) : nullptr;
+        const drm::kms_mode m = target_kms_mode(ht, e);
+        const bool follow = ht.mode_explicit ? (ht.mode.preferred && !ht.custom) : o.follow_preferred;
+        const output_pipeline* pipe = outs_[slot].pipe;
+        const bool kms_pipe = pipe && pipe->kms;
+        const bool wait = ticket && kms_pipe && !(gated & bit);
+        if (static_cast<int>(m.width) != o.mode.width || static_cast<int>(m.height) != o.mode.height ||
+            m.refresh_mhz != o.refresh_mhz || (e && !m.same_timings(o.kms_mode))) {
+            switch_output_mode(slot, m, "output configuration", follow, ht.custom && e != nullptr,
+                               wait ? ticket : 0);
+            if (wait)
+                waiting |= bit;
+        } else {
+            outputs.set_follow_preferred(slot, follow);
+        }
+        if (ht.adaptive_sync != o.adaptive_sync) {
+            outputs.set_adaptive_sync(slot, ht.adaptive_sync);
+            clocks_.set_vrr(slot, ht.adaptive_sync);
+            if (pipe) {
+                output_op op{};
+                op.what = output_op::kind::set_vrr;
+                op.slot = slot;
+                op.gen = slot_gen_[slot];
+                op.vrr = ht.adaptive_sync;
+                op.ticket = wait ? ticket : 0;
+                post_output_op(op);
+                if (wait)
+                    waiting |= bit;
+                scene.note_full_damage_output(slot);
+            }
+        }
+        if (ht.transform != o.transform)
+            outputs.set_transform(o.id, ht.transform);
+        if (ht.scale != o.scale)
+            outputs.set_scale(o.id, ht.scale);
+        if (ht.position_explicit) {
+            if (o.auto_position || o.position.x != ht.x || o.position.y != ht.y)
+                outputs.set_position(o.id, {ht.x, ht.y});
+        } else if (!o.auto_position) {
+            outputs.set_auto_position(o.id);
+        }
+    }
+    // 3. Disables last.
+    for (unsigned i = 0; i < t.count; ++i) {
+        const mgmt::head_target& ht = t.heads[i];
+        if (ht.enabled)
+            continue;
+        const int si = slot_of_head(ht.key);
+        if (si < 0)
+            continue;
+        const unsigned slot = static_cast<unsigned>(si);
+        const output_state o = outputs.slot_state(slot);
+        if (o.connector_id) {
+            keep_position(o.connector_id, o);
+            set_connector_disabled(o.connector_id, true);
+        } else {
+            for (unsigned v = 0; v < virtual_head_count_; ++v) {
+                virtual_head& vh = virtual_heads_[v];
+                if (vh.key != ht.key)
+                    continue;
+                vh.disabled = true;
+                vh.mode = o.mode;
+                vh.refresh_mhz = o.refresh_mhz;
+                vh.scale = o.scale;
+                vh.transform = o.transform;
+                vh.position = o.position;
+                vh.auto_position = o.auto_position;
+            }
+            if (fallback_headless_slot_ == si)
+                fallback_headless_slot_ = -1;
+        }
+        remove_output(slot, false, "disabled by an output configuration");
+    }
+    outputs_changed_now();
+    mark_heads_dirty();
+    request_frame();
+}
+
+void compositor_impl::on_modeset_result(unsigned slot, unsigned ticket, bool ok) {
+    if (!mgmt_ || !mgmt_->active || mgmt_->stage != mgmt_run::phase::committing ||
+        ticket != mgmt_->ticket || slot >= output_manager::k_max)
+        return;
+    mgmt_run& r = *mgmt_;
+    const std::uint32_t bit = 1u << slot;
+    if (!(r.waiting & bit))
+        return;
+    r.waiting &= ~bit;
+    if (!ok)
+        r.failed = true;
+    if (r.waiting == 0)
+        complete_apply(r.failed ? "a modeset was refused" : "committed");
+}
+
+void compositor_impl::complete_apply(const char* why) {
+    if (!mgmt_ || !mgmt_->active)
+        return;
+    mgmt_run& r = *mgmt_;
+    if (r.failed) {
+        // "The compositor should revert any changes made by the apply request" — back the
+        // same way (no test: it is the state that was running).
+        std::uint32_t ignore = 0;
+        r.stage = mgmt_run::phase::testing; // stray results of the failed apply are ignored
+        switch_to_target(r.previous, 0, ignore);
+        finish_mgmt_job(mgmt_result::failed, "a modeset was refused after its test — reverted");
+        return;
+    }
+    record_output_config();
+    finish_mgmt_job(mgmt_result::succeeded, why);
+}
+
+void compositor_impl::finish_mgmt_job(mgmt_result result, const char* why) {
+    if (!mgmt_)
+        return;
+    mgmt_run& r = *mgmt_;
+    // The new state (heads and `done`) first, then the answer: a client that reads the state
+    // when it hears `succeeded` (wlr-randr exits then) sees what it asked for.
+    mark_heads_dirty();
+    flush_output_heads();
+    output_mgmt_finish(p0_, r.job.token, result);
+    {
+        char what[1024];
+        describe_target(r.target, output_mgmt_heads(p0_), what, sizeof(what));
+        char line[1200];
+        std::snprintf(line, sizeof(line), "output configuration %s %s: %s (%s)",
+                      r.job.test ? "test" : "apply",
+                      result == mgmt_result::succeeded ? "succeeded"
+                      : result == mgmt_result::failed  ? "failed"
+                                                       : "cancelled",
+                      what[0] ? what : "-", why ? why : "");
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.outputcfg", line);
+    }
+    r.active = false;
+    r.waiting = 0;
+    r.deadline_ns = 0;
+    mark_heads_dirty();
+    run_next_mgmt_job();
+}
+
+void compositor_impl::record_output_config() {
+    if (!last_scan_)
+        return;
+    output_config& cfg = outcfg_.config();
+    char ids[output_manager::k_max][monitor_config::k_id];
+    unsigned entries[output_manager::k_max];
+    const unsigned n = connected_identifiers(*last_scan_, ids, entries);
+    bool changed = false;
+    setup_config setup{};
+    for (unsigned k = 0; k < n; ++k) {
+        const drm::connector_probe& e = last_scan_->entries[entries[k]];
+        int slot = -1;
+        for (unsigned s = 0; s < output_manager::k_max && slot < 0; ++s)
+            if (outputs.slot_live(s) && outputs.slot_state(s).connector_id == e.connector_id)
+                slot = static_cast<int>(s);
+        setup_output_config& so = setup.outputs[setup.count++];
+        std::snprintf(so.identifier, sizeof(so.identifier), "%s", ids[k]);
+        so.enabled = slot >= 0;
+        if (slot < 0) {
+            if (const kept_position* kp = kept_position_of(e.connector_id);
+                kp && kp->has_position && !e.hotplug_mode_update) {
+                so.has_position = true;
+                so.x = kp->position.x;
+                so.y = kp->position.y;
+            }
+            continue;
+        }
+        const output_state& o = outputs.slot_state(static_cast<unsigned>(slot));
+        const bool vm = e.hotplug_mode_update;
+        if (!o.auto_position && !vm) {
+            so.has_position = true;
+            so.x = o.position.x;
+            so.y = o.position.y;
+        }
+        // The monitor's own: only what differs from what it gets anyway (the preferred mode,
+        // the default scale, normal, VRR off), so a later default (`--scale`) still applies
+        // where nothing was chosen.
+        monitor_config m{};
+        std::snprintf(m.identifier, sizeof(m.identifier), "%s", ids[k]);
+        if (!vm && !o.follow_preferred) {
+            m.has_mode = true;
+            m.width = static_cast<unsigned>(o.mode.width);
+            m.height = static_cast<unsigned>(o.mode.height);
+            m.refresh_mhz = o.refresh_mhz;
+        }
+        const double def = outputs.default_scale_for(o.name, o.mode.width, o.mode.height,
+                                                     o.phys_w_mm, o.phys_h_mm);
+        if (o.scale != def) {
+            m.has_scale = true;
+            m.scale = o.scale;
+        }
+        if (o.transform != 0) {
+            m.has_transform = true;
+            m.transform = o.transform;
+        }
+        if (o.vrr_capable && o.adaptive_sync) {
+            m.has_adaptive_sync = true;
+            m.adaptive_sync = true;
+        }
+        const bool any = m.has_mode || m.has_scale || m.has_transform || m.has_adaptive_sync;
+        if (any || find_monitor(cfg, ids[k]))
+            changed = record_monitor(cfg, m) || changed;
+    }
+    if (setup.count > 0)
+        changed = record_setup(cfg, setup) || changed;
+    if (!changed)
+        return;
+    outcfg_.schedule_save(static_cast<unsigned long long>(now_ns()));
+    if (outcfg_timer_ && outcfg_.save_due_ns() != 0) {
+        const lx::runtime::clock_time due = static_cast<lx::runtime::clock_time>(outcfg_.save_due_ns());
+        const bool job_due = mgmt_ && mgmt_->active && mgmt_->deadline_ns != 0 && mgmt_->deadline_ns < due;
+        outcfg_timer_->schedule_at(job_due ? mgmt_->deadline_ns : due);
+    }
+}
+
+void compositor_impl::outcfg_timer_callback() {
+    compositor_impl* self = active;
+    if (!self)
+        return;
+    const lx::runtime::clock_time now = now_ns();
+    if (self->mgmt_ && self->mgmt_->active && self->mgmt_->deadline_ns != 0 &&
+        now >= self->mgmt_->deadline_ns) {
+        mgmt_run& r = *self->mgmt_;
+        if (r.stage == mgmt_run::phase::testing) {
+            self->finish_mgmt_job(mgmt_result::failed, "the TEST_ONLY did not answer");
+        } else if (r.waiting == 0) {
+            self->complete_apply("an output it waited for went");
+        } else {
+            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.outputcfg",
+                                            "apply: no modeset report within 3 s (an output is "
+                                            "waiting for its frame) — answered succeeded");
+            r.waiting = 0;
+            self->complete_apply("modeset still pending");
+        }
+    }
+    (void)self->outcfg_.run_due_save(static_cast<unsigned long long>(now), &post_to_worker);
+    lx::runtime::clock_time next = 0;
+    if (self->mgmt_ && self->mgmt_->active && self->mgmt_->deadline_ns != 0)
+        next = self->mgmt_->deadline_ns;
+    if (const auto due = static_cast<lx::runtime::clock_time>(self->outcfg_.save_due_ns());
+        due != 0 && (next == 0 || due < next))
+        next = due;
+    if (self->outcfg_timer_) {
+        if (next != 0)
+            self->outcfg_timer_->schedule_at(next > now ? next : now + 1'000'000);
+        else
+            self->outcfg_timer_->set_enabled(false);
+    }
+}
+
+namespace {
+bool post_to_worker(void (*fn)(void*), void* arg) {
+    compositor_impl* self = compositor_impl::active;
+    if (!self || !self->threads_started.load(std::memory_order_acquire) ||
+        self->cfg.worker_thread_count == 0)
+        return false;
+    return runtime::executor::global().post(runtime::affinity::worker, runtime::task{fn, arg});
+}
+} // namespace
+
+void compositor_impl::hotplug_timer_callback() {
+    if (!active || !active->resume_probe_wait_)
+        return;
+    active->resume_probe_wait_ = false;
+    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug",
+                                    "VT resume: the connector probe took over 250 ms — resuming "
+                                    "with the outputs as they were");
+    active->finish_display_resume(active->resume_probe_gen_);
 }
 
 void compositor_impl::start_threads() {
@@ -2885,6 +6222,9 @@ void compositor_impl::start_threads() {
 }
 
 void compositor_impl::stop_threads() {
+    // A save of outputs.toml still pending is written now, while the worker that may be
+    // writing the previous one still runs.
+    outcfg_.flush();
     if (!threads_started.exchange(false)) return;
 
     running.store(false, std::memory_order_release);
@@ -2905,7 +6245,7 @@ void compositor_impl::stop_threads() {
     runtime::executor::global().worker_strand().set_waker(nullptr, nullptr);
 }
 
-void compositor_impl::on_vsync() {
+void compositor_impl::on_vsync(std::uint32_t forced) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
 
     const auto now = std::chrono::steady_clock::now();
@@ -2919,14 +6259,23 @@ void compositor_impl::on_vsync() {
     tick.frame_index = frame_index.fetch_add(1, std::memory_order_relaxed) + 1;
     last_tick = tick;
 
+    // The outputs whose start is due (two in phase share this tick, M6), plus those the
+    // caller forces (the housekeeping tick).
+    const std::uint32_t due = (clocks_.take_due(tick.timestamp_ns) | forced) & outputs.live_mask();
+    due_mask_ = due;
+    in_vsync_ = true;
+    tick_quiet_mask_ = 0;
     if (owner) owner->tick_ui(tick);
+    in_vsync_ = false;
 
+    // Render runs after every tick: composites of the views just published, a frame still
+    // waiting for its flip, and cursor-only commits (the pointer moved, nothing else did).
     {
         std::lock_guard lock{render_mutex};
         render_pending = true;
     }
     render_cv.notify_one();
-    settle_frame_clock();
+    settle_frame_clocks(due, tick_quiet_mask_);
 }
 
 void compositor_impl::render_loop() {
@@ -2958,7 +6307,9 @@ void compositor_impl::render_loop() {
     }
 
     // A frame composited but never committed still holds its fence; this thread owns it.
-    discard_composited_fence();
+    for (auto& p : pipes_)
+        if (p)
+            p->discard_fence();
 }
 
 void compositor_impl::worker_loop() {
@@ -3050,8 +6401,11 @@ lx::result<void> compositor::start() {
     if (auto session = session::logind_session::open(); session)
         impl_->logind_ = std::move(session).value();
 
-    // Prefer logind TakeDevice for the card node; fall back to direct open.
-    {
+    // Prefer logind TakeDevice for the card node; fall back to direct open. `--virtual-outputs`
+    // asks for virtual outputs instead of the display: no card is opened (headless and
+    // multi-output protocol tests on a host whose display is free to take).
+    const bool want_virtual = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
+    if (!want_virtual) {
         lx::result<drm::kms_device> opened =
             lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
                            "kms not opened");
@@ -3133,9 +6487,8 @@ lx::result<void> compositor::start() {
         if (!present && (requested == present_backend::gl || automatic)) {
             present = impl_->setup_gl_present();
             if (present) {
-                // The context has to move to the render thread, which claims it in
-                // render_loop; it cannot be current on two threads at once.
-                impl_->egl_.release_current();
+                // The context stays current here until the outputs' scanout targets exist
+                // (`create_pipelines`); then it moves to the render thread.
                 lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
                                                 "GL composite path active (EGL/GLES on GBM)");
             } else if (requested == present_backend::gl) {
@@ -3196,22 +6549,85 @@ lx::result<void> compositor::start() {
     (void)::malloc_trim(0);
 #endif
 
-    // Every connector takes the configured scale (n/120) when it first appears.
+    // Outputs (ADR 008 Part A): every connected desktop connector from the device's
+    // start-up probe, each in its own slot with its own pipeline. `--scale` is the default
+    // for every output (0: sway's HiDPI rule), `--output-scale NAME=S` per connector.
     impl_->outputs.set_default_scale(impl_->cfg.output_scale);
-    (void)impl_->hotplug_.start(impl_->outputs, impl_->kms);
+    if (const char* spec = impl_->cfg.output_scales; spec && *spec) {
+        // NAME=S[,NAME=S...]
+        char buf[512];
+        std::snprintf(buf, sizeof(buf), "%s", spec);
+        for (char* tok = std::strtok(buf, ","); tok; tok = std::strtok(nullptr, ",")) {
+            char* eq = std::strchr(tok, '=');
+            if (!eq)
+                continue;
+            *eq = '\0';
+            impl_->outputs.set_scale_override(tok, std::strtod(eq + 1, nullptr));
+        }
+    }
+    // The persisted output configuration (ADR 008 §C.5), read before the first modeset so
+    // the outputs come up as they were left. `--virtual-outputs` is a test mode: the user's
+    // file is not read there unless LUMEN_OUTPUT_CONFIG names one.
+    {
+        const char* env = std::getenv("LUMEN_OUTPUT_CONFIG");
+        const bool virtual_mode = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
+        if (!virtual_mode || (env && *env && std::strcmp(env, "0") != 0))
+            (void)impl_->outcfg_.load();
+    }
+    if (!impl_->drm_present_ && impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs) {
+        // --virtual-outputs WxH[@S][,WxH[@S]...]: N virtual outputs, laid out automatically,
+        // each with its own clock (multi-output protocol tests without hardware).
+        char buf[512];
+        std::snprintf(buf, sizeof(buf), "%s", impl_->cfg.virtual_outputs);
+        unsigned n = 0;
+        for (char* tok = std::strtok(buf, ","); tok; tok = std::strtok(nullptr, ",")) {
+            int w = 0, h = 0;
+            double sc = 0.0;
+            if (std::sscanf(tok, "%dx%d@%lf", &w, &h, &sc) < 2 || w <= 0 || h <= 0)
+                continue;
+            output_desc d{};
+            char name[32];
+            std::snprintf(name, sizeof(name), "HEADLESS-%u", ++n);
+            d.name = name;
+            d.mode = {w, h};
+            d.refresh_mhz = 60000;
+            d.scale = sc;
+            d.virtual_output = true;
+            (void)impl_->outputs.add_output(d);
+        }
+    }
+    if (impl_->outputs.count() == 0) {
+        impl_->configure_outputs_at_start(impl_->kms.last_scan());
+        // Nothing connected (or no display at all): HEADLESS-1 stands in, and a display
+        // that is plugged in later replaces it.
+        if (impl_->outputs.count() == 1) {
+            const int s = impl_->outputs.slot_of(impl_->outputs.nth(0));
+            if (s >= 0 && impl_->outputs.slot_state(static_cast<unsigned>(s)).connector_id == 0)
+                impl_->fallback_headless_slot_ = s;
+        }
+    }
+    if (auto made = impl_->create_pipelines(); !made) {
+        lx::trace::logger::global().log_error(made.get_error(), "compositor.drm");
+        if (impl_->drm_present_) {
+            // No output can be driven: composite nowhere rather than fail every frame.
+            for (auto& p : impl_->pipes_)
+                if (p)
+                    p->kms.reset();
+        }
+    }
+    // The GL context has to move to the render thread, which claims it in render_loop; it
+    // cannot be current on two threads at once.
+    if (impl_->gl_present_)
+        impl_->egl_.release_current();
     if (impl_->outputs.count() > 0) {
+        // Kept for output 0 in slot order: the smokes and inject-input.py parse this line.
         const output_state o0 = impl_->outputs.state(impl_->outputs.nth(0));
         const lx::rect2i g = o0.mode_rect();
         const lx::rect2i l = o0.logical_rect();
-        unsigned refresh_mhz = 0;
-        if (auto mode = impl_->kms.active_mode(0); mode)
-            refresh_mhz = mode.value().refresh_millihz;
-        else // the virtual output (headless, nested)
-            refresh_mhz = o0.refresh_mhz;
         char line[160];
         std::snprintf(line, sizeof(line),
                       "output 0 mode=%dx%d refresh_mhz=%u scale=%g (%ld/120) logical=%dx%d",
-                      g.width, g.height, refresh_mhz, o0.scale, std::lround(o0.scale * 120.0),
+                      g.width, g.height, o0.refresh_mhz, o0.scale, std::lround(o0.scale * 120.0),
                       l.width, l.height);
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
     }
@@ -3223,80 +6639,137 @@ lx::result<void> compositor::start() {
         return bound.get_error();
     }
 
-    // Cursor: theme first (it decides how large the plane's buffers must be), then the
-    // plane, then the manager that feeds both. Startup-only file I/O.
+    // Cursor: themes first (they decide how large the planes' buffers must be), then one
+    // plane per pipeline, then the manager that feeds them. Startup-only file I/O.
     {
         auto* impl = impl_;
-        // Themes are loaded at the output's pixel size: XCURSOR_SIZE (or 24) is a logical
-        // size, so a 1.25 output shows 30 px images — sharp, not a 24 px image stretched.
-        {
-            unsigned base = 24;
-            if (const char* env = std::getenv("XCURSOR_SIZE")) {
-                const long v = std::strtol(env, nullptr, 10);
-                if (v > 0 && v <= 256)
-                    base = static_cast<unsigned>(v);
-            }
-            const double scale = impl->outputs.count() > 0
-                                     ? impl->outputs.scale(impl->outputs.nth(0))
-                                     : impl->outputs.default_scale();
-            const long px = std::lround(static_cast<double>(base) * scale);
-            impl->cursor_theme_.load(nullptr, px > 0 ? static_cast<unsigned>(px) : base);
+        // One theme per distinct output scale, at that scale's pixel size: XCURSOR_SIZE (or
+        // 24) is a logical size, so a 1.25 output shows 30 px images — sharp, not a 24 px
+        // image stretched (§A.7). At most k_cursor_scales; past that, the nearest is used.
+        unsigned base = 24;
+        if (const char* env = std::getenv("XCURSOR_SIZE")) {
+            const long v = std::strtol(env, nullptr, 10);
+            if (v > 0 && v <= 256)
+                base = static_cast<unsigned>(v);
         }
-        char line[160];
-        std::snprintf(line, sizeof(line), "cursor theme=%s size=%u from_theme=%u builtin=%u",
-                      impl->cursor_theme_.name(), impl->cursor_theme_.size(),
-                      impl->cursor_theme_.from_theme(), impl->cursor_theme_.builtin());
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
+        unsigned scales[k_cursor_scales]{};
+        unsigned n = 0;
+        for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+            if (!impl->outputs.slot_live(slot))
+                continue;
+            const unsigned s120 =
+                static_cast<unsigned>(std::lround(impl->outputs.slot_state(slot).scale * 120.0));
+            bool seen = false;
+            for (unsigned i = 0; i < n; ++i)
+                seen = seen || scales[i] == s120;
+            if (!seen && n < k_cursor_scales)
+                scales[n++] = s120;
+        }
+        if (n == 0)
+            scales[n++] = static_cast<unsigned>(std::lround(impl->outputs.default_scale() * 120.0));
+        unsigned need = 0;
+        for (unsigned i = 0; i < n; ++i) {
+            const long px = std::lround(static_cast<double>(base) * scales[i] / 120.0);
+            impl->cursor_themes_[i].load(nullptr, px > 0 ? static_cast<unsigned>(px) : base);
+            if (impl->cursor_themes_[i].max_dimension() > need)
+                need = impl->cursor_themes_[i].max_dimension();
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "cursor theme=%s size=%u scale=%u/120 from_theme=%u builtin=%u",
+                          impl->cursor_themes_[i].name(), impl->cursor_themes_[i].size(), scales[i],
+                          impl->cursor_themes_[i].from_theme(), impl->cursor_themes_[i].builtin());
+            lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
+        }
+        impl->cursor_theme_count_ = n;
+        impl->cursor_base_px_ = base;
+        for (unsigned i = 0; i < n; ++i)
+            impl->cursor_theme_scale120_[i] = scales[i];
 
         const char* mode = std::getenv("LUMEN_CURSOR");
         const bool force_software = mode && std::strcmp(mode, "software") == 0;
         const char* why_software = nullptr;
+        unsigned planes = 0;
+        unsigned pipelines = 0;
+        lx::size2i plane_size{};
         if (force_software) {
             why_software = "LUMEN_CURSOR=software";
         } else if (!impl->drm_present_) {
             why_software = "no KMS scanout";
         } else {
-            const unsigned need = impl->cursor_theme_.max_dimension();
-            auto plane = drm::kms_cursor_plane::create(impl->kms.card_fd(),
-                                                       impl->kms.crtc_id_for(0),
-                                                       impl->kms.crtc_index(), need, need);
-            if (plane) {
-                impl->cursor_plane_ = std::move(plane).value();
-            } else {
-                why_software = plane.get_error().message;
+            impl->cursor_plane_px_ = need;
+            impl->create_cursor_planes(need);
+            for (const auto& p : impl->pipes_) {
+                if (!p || !p->kms)
+                    continue;
+                ++pipelines;
+                if (!p->cursor.valid())
+                    continue;
+                ++planes;
+                const auto caps = p->cursor.caps();
+                // The image set is staged into every plane: the smallest plane bounds it.
+                if (plane_size.width == 0 || static_cast<int>(caps.width) < plane_size.width)
+                    plane_size.width = static_cast<int>(caps.width);
+                if (plane_size.height == 0 || static_cast<int>(caps.height) < plane_size.height)
+                    plane_size.height = static_cast<int>(caps.height);
             }
+            if (pipelines == 0)
+                why_software = "no CRTC pipeline";
+            else if (planes < pipelines)
+                why_software = "an output has no cursor plane";
         }
-        if (impl->cursor_plane_.valid()) {
-            const auto caps = impl->cursor_plane_.caps();
-            std::snprintf(line, sizeof(line), "hardware cursor plane=%u size=%ux%u hotspot=%d",
-                          caps.plane_id, caps.width, caps.height, caps.hotspot ? 1 : 0);
+        char line[160];
+        if (!why_software && planes > 0) {
+            std::snprintf(line, sizeof(line),
+                          "hardware cursor planes=%u size=%dx%d hotspot=%d", planes,
+                          plane_size.width, plane_size.height,
+                          impl->kms.cursor_hotspot_cap() ? 1 : 0);
         } else {
+            // Software everywhere: the planes stay off (a cursor shown on some outputs by a
+            // plane and on others by the scene would draw it twice where they meet).
+            for (auto& p : impl->pipes_)
+                if (p && p->cursor.valid())
+                    p->cursor = drm::kms_cursor_plane{};
             std::snprintf(line, sizeof(line), "software cursor: %s",
                           why_software ? why_software : "no cursor plane");
         }
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
 
         cursor_manager::setup setup{};
-        setup.theme = &impl->cursor_theme_;
+        for (unsigned i = 0; i < n; ++i) {
+            setup.themes[i] = &impl->cursor_themes_[i];
+            setup.theme_scale120[i] = scales[i];
+        }
+        setup.theme_count = n;
         setup.frames = &impl->cursor_frames_;
         setup.images = &impl->cursor_images_;
         setup.router = &impl->input_router_;
         setup.scene = &impl->scene;
         setup.overlay = &impl->cursor_layer_;
-        setup.hardware = impl->cursor_plane_.valid();
-        if (setup.hardware) {
-            const auto caps = impl->cursor_plane_.caps();
-            setup.plane_size = {static_cast<int>(caps.width), static_cast<int>(caps.height)};
-        }
+        setup.hardware = !why_software && planes > 0;
+        setup.plane_size = plane_size;
         impl->cursor_.init(setup);
     }
 
     impl_->register_p0_globals();
     impl_->start_input();
 
-    // The pointer starts in the middle of output 0, where it is easy to find.
+    // The pointer starts in the middle of the first output in layout order (leftmost, then
+    // topmost), where it is easy to find.
     if (impl_->outputs.count() > 0) {
-        const lx::rect2i g = impl_->outputs.logical_rect(impl_->outputs.nth(0));
+        int first = -1;
+        for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+            if (!impl_->outputs.slot_live(slot))
+                continue;
+            const lx::rect2i l = impl_->outputs.slot_state(slot).logical_rect();
+            if (first < 0) {
+                first = static_cast<int>(slot);
+                continue;
+            }
+            const lx::rect2i f = impl_->outputs.slot_state(static_cast<unsigned>(first)).logical_rect();
+            if (l.x < f.x || (l.x == f.x && l.y < f.y))
+                first = static_cast<int>(slot);
+        }
+        const lx::rect2i g = impl_->outputs.slot_state(static_cast<unsigned>(first)).logical_rect();
         auto& seat = impl_->input_devices_.default_seat();
         seat.set_pointer_position(g.x + g.width / 2, g.y + g.height / 2);
         impl_->cursor_.on_motion(seat.pointer_x(), seat.pointer_y(), 0, false);
@@ -3309,28 +6782,22 @@ lx::result<void> compositor::start() {
 
     detail::compositor_impl::active = impl_;
 
-    // The frame clock follows the display, not a configured target: a 60 Hz timer against
-    // a 75 Hz panel (or the reverse) beats against the flips and wastes composites. The
-    // configured fps is the fallback for when there is no mode to read.
-    runtime::clock_time interval_ns = static_cast<runtime::clock_time>(
-        1'000'000'000.0 / impl_->cfg.target_fps);
-    if (impl_->drm_present_) {
-        if (auto active = impl_->kms.active_mode(0); active && active.value().refresh_millihz > 0) {
-            interval_ns = static_cast<runtime::clock_time>(1'000'000'000'000.0 /
-                                                           active.value().refresh_millihz);
-        }
-    }
-    impl_->refresh_period_ns_ = interval_ns;
-    impl_->repaint_.set_refresh_period(interval_ns);
-
+    // One frame clock per output, each following its own display's refresh (not a
+    // configured target: a 60 Hz timer against a 75 Hz panel beats against the flips), over
+    // one shared timer armed at the earliest due output (ADR 008 M6). The configured fps is
+    // the period of an output with no refresh to read.
+    const runtime::clock_time fallback_ns =
+        static_cast<runtime::clock_time>(1'000'000'000.0 / impl_->cfg.target_fps);
     impl_->vsync_timer = std::make_unique<runtime::timer_source>(
-        interval_ns, &detail::compositor_impl::vsync_callback, true);
+        fallback_ns, &detail::compositor_impl::vsync_callback, true);
+    impl_->vsync_timer->set_enabled(false);
     impl_->loop.add_source(impl_->vsync_timer.get());
     impl_->housekeeping_timer = std::make_unique<runtime::timer_source>(
         detail::compositor_impl::k_housekeeping_ns,
         &detail::compositor_impl::housekeeping_callback, true);
-    impl_->housekeeping_timer->set_enabled(false); // only while the frame clock is stopped
+    impl_->housekeeping_timer->set_enabled(false); // only while every frame clock is stopped
     impl_->loop.add_source(impl_->housekeeping_timer.get());
+    impl_->sync_output_views();
     // ext-idle-notify: one timer for every notification, armed at the next deadline only.
     impl_->idle_timer_ = std::make_unique<runtime::timer_source>(
         0, &detail::compositor_impl::idle_timer_callback, false);
@@ -3342,6 +6809,11 @@ lx::result<void> compositor::start() {
         0, &detail::compositor_impl::lock_timer_callback, false);
     impl_->lock_timer_->set_enabled(false);
     impl_->loop.add_source(impl_->lock_timer_.get());
+    // Output configuration: an apply's deadline and the debounced save of outputs.toml.
+    impl_->outcfg_timer_ = std::make_unique<runtime::timer_source>(
+        0, &detail::compositor_impl::outcfg_timer_callback, false);
+    impl_->outcfg_timer_->set_enabled(false);
+    impl_->loop.add_source(impl_->outcfg_timer_.get());
 
     // Every fd the UI thread serves is waited on, not polled: the loop sleeps until one is
     // readable or a timer is due.
@@ -3356,6 +6828,44 @@ lx::result<void> compositor::start() {
         impl_->drm_fd_source = std::make_unique<runtime::fd_source>(
             impl_->kms.card_fd(), &detail::compositor_impl::drm_fd_callback);
         impl_->loop.add_source(impl_->drm_fd_source.get());
+        // Hotplug (ADR 008 Part B): drm uevents of this card wake the UI loop; the probe runs
+        // on the worker. Without a monitor the connectors are still probed at every resume.
+        hotplug_host host{};
+        host.user = impl_;
+        host.scan_ready = [](void* u, const drm::connector_scan& scan, bool forced) {
+            auto* self = static_cast<detail::compositor_impl*>(u);
+            // A probe that finished after the VT went away may be the kernel's cache: the
+            // resume probes everything again.
+            if (!forced && self->session_.display_stopped())
+                return;
+            self->apply_connector_scan(scan, forced);
+            if (forced && self->resume_probe_wait_) {
+                self->resume_probe_wait_ = false;
+                self->finish_display_resume(self->resume_probe_gen_);
+            }
+        };
+        host.card_removed = [](void* u) { static_cast<detail::compositor_impl*>(u)->on_card_removed(); };
+        const unsigned long long card =
+            static_cast<unsigned long long>(makedev(impl_->drm_major_, impl_->drm_minor_));
+        const bool worker = impl_->cfg.worker_thread_count > 0;
+        if (auto monitor = impl_->hotplug_.start(impl_->kms, card, impl_->loop, worker, host);
+            monitor) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "hotplug: udev monitor on drm %u:%u", impl_->drm_major_,
+                          impl_->drm_minor_);
+            lx::trace::logger::global().log(lx::trace::level::info, "compositor.hotplug", line);
+        } else {
+            lx::trace::logger::global().log_error(monitor.get_error(), "compositor.hotplug");
+            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug",
+                                            "no hotplug monitor — connectors are probed again "
+                                            "only when the session resumes");
+            impl_->hotplug_.attach(impl_->kms, impl_->loop, worker, host);
+        }
+        impl_->hotplug_ready_ = true;
+        impl_->hotplug_timer_ = std::make_unique<runtime::timer_source>(
+            0, &detail::compositor_impl::hotplug_timer_callback, false);
+        impl_->hotplug_timer_->set_enabled(false);
+        impl_->loop.add_source(impl_->hotplug_timer_.get());
     }
     if (impl_->logind_.bus_fd() >= 0) {
         // Signals are recorded by these callbacks and acted on after each dispatch. A VT
@@ -3431,8 +6941,6 @@ lx::result<void> compositor::start() {
     impl_->start_threads();
 
     impl_->memory_.set_pressure_handler(&detail::compositor_impl::on_memory_pressure, impl_);
-    impl_->presentation_.bind_page_flip(impl_->kms_atomic);
-    impl_->presentation_.set_handler(&detail::compositor_impl::presentation_flip_handler, impl_);
 
     // The pause/resume machine runs only where there is a display to lose. Starting while
     // the session is in the background pauses right away (input is held until the switch).
@@ -3447,8 +6955,9 @@ lx::result<void> compositor::start() {
             impl_->drm_present_, impl_->drm_major_, impl_->drm_minor_, impl_->drm_start_inactive_));
     }
 
+    impl_->request_frame();
     lx::trace::logger::global().log(lx::trace::level::info, "compositor",
-                                    "threads: ui(main)+render+worker; vsync timer armed");
+                                    "threads: ui(main)+render+worker; frame clocks armed");
 
     return {};
 }
@@ -3504,6 +7013,27 @@ void compositor::inject_pointer_button(const lx::input::pointer_button_event& ev
         impl_->on_input_pointer_button(event);
 }
 
+void compositor::simulate_connector_scan(const lx::drm::connector_scan& scan) {
+    runtime::assert_affinity(runtime::affinity::ui);
+    if (impl_)
+        impl_->apply_connector_scan(scan, false);
+}
+
+void compositor::run_posted_ui_tasks() {
+    runtime::assert_affinity(runtime::affinity::ui);
+    runtime::executor::global().drain(runtime::affinity::ui);
+    if (impl_)
+        impl_->flush_output_heads();
+}
+
+const output_config& compositor::persisted_outputs() const { return impl_->outcfg_.config(); }
+
+void compositor::save_output_config_now() {
+    runtime::assert_affinity(runtime::affinity::ui);
+    if (impl_)
+        impl_->outcfg_.flush();
+}
+
 void compositor::inject_logind_unlock() {
     if (impl_)
         impl_->on_logind_unlock();
@@ -3528,9 +7058,7 @@ liveness_tracker& compositor::liveness() { return impl_->liveness_; }
 seat_manager& compositor::seats() { return impl_->seats; }
 input_router& compositor::input() { return impl_->input_router_; }
 scheduler::frame_scheduler& compositor::scheduler() { return impl_->scheduler_; }
-scheduler::presentation_tracker& compositor::presentation() { return impl_->presentation_; }
 scheduler::budget_tracker& compositor::budget() { return impl_->budget_; }
-drm::kms_atomic_commit& compositor::kms_atomic() { return impl_->kms_atomic; }
 buffer_lifecycle_tracker& compositor::buffer_lifecycle() { return impl_->buffer_lifecycle_; }
 runtime::memory_budget_coordinator& compositor::memory() { return impl_->memory_; }
 
@@ -3541,67 +7069,51 @@ runtime::executor& compositor::executor() {
 void compositor::tick_ui(scheduler::frame_tick tick) {
     runtime::assert_affinity(runtime::affinity::ui);
     lx::trace::scoped_span span{"ui", "tick_ui"};
+    auto* impl = impl_;
 
     const auto t0 = std::chrono::steady_clock::now();
     // Protocol handlers date texture retirements against this, so it has to be current
     // before any Wayland dispatch below. What is committed from here on belongs to this
     // tick's snapshot at the earliest.
-    impl_->p0_.frame_index = tick.frame_index;
-    impl_->p0_.building_frame = tick.frame_index;
-    impl_->budget_.begin_frame(tick.frame_index);
-    impl_->p0_.now_ns = static_cast<unsigned long long>(tick.timestamp_ns);
-    impl_->advance_logout(tick.timestamp_ns);
+    impl->p0_.frame_index = tick.frame_index;
+    impl->p0_.building_frame = tick.frame_index;
+    impl->budget_.begin_frame(tick.frame_index);
+    impl->p0_.now_ns = static_cast<unsigned long long>(tick.timestamp_ns);
+    impl->advance_logout(tick.timestamp_ns);
+    // Output heads changed since the last loop iteration (tests drive ticks without the loop).
+    impl->flush_output_heads();
     // Staging: free retired CPU-path storage the render thread has let go of, unmap GL
     // blocks idle past the threshold, and report what is left against the budget.
-    impl_->shm_store_.collect();
-    impl_->shm_pool_.collect(impl_->p0_.now_ns, detail::compositor_impl::k_staging_idle_ns);
+    impl->shm_store_.collect();
+    impl->shm_pool_.collect(impl->p0_.now_ns, detail::compositor_impl::k_staging_idle_ns);
     {
-        const unsigned long long staged = impl_->shm_store_.bytes_held() +
-                                          impl_->shm_pool_.bytes_mapped();
+        const unsigned long long staged = impl->shm_store_.bytes_held() +
+                                          impl->shm_pool_.bytes_mapped();
         lx::trace::timeline_counter("staging_bytes", static_cast<long long>(staged));
         const unsigned clamped =
             staged > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<unsigned>(staged);
-        impl_->memory_.report_usage(lx::runtime::memory_pool::staging, clamped, 0);
+        impl->memory_.report_usage(lx::runtime::memory_pool::staging, clamped, 0);
     }
-    impl_->memory_.tick(tick.frame_index);
-    impl_->memory_.reset_frame_arenas(lx::runtime::memory_pool::ui);
+    impl->memory_.tick(tick.frame_index);
+    impl->memory_.reset_frame_arenas(lx::runtime::memory_pool::ui);
 
-    impl_->hotplug_.poll();
-
-    // An output appeared, went, or changed mode, position or scale: clients are told (each
-    // wl_output and xdg_output, then done) and every surface's membership is recomputed.
-    // Compared by generation: the hotplug poll refreshes every tick.
-    if (impl_->outputs.generation() != impl_->output_generation_) {
-        impl_->output_generation_ = impl_->outputs.generation();
-        impl_->log_outputs();
-        notify_outputs_changed(impl_->p0_);
-    }
-
-    // Nothing has been drawn yet on the first tick, and a mode change invalidates every
-    // pixel; anything else is repainted only where it changed.
-    if (impl_->outputs.count() > 0) {
-        const output_state o0 = impl_->outputs.state(impl_->outputs.nth(0));
-        const lx::rect2i g = o0.logical_rect();
-        const lx::rect2i& last = impl_->last_output_rect_;
-        if (g.x != last.x || g.y != last.y || g.width != last.width || g.height != last.height ||
-            o0.scale != impl_->last_output_scale_) {
-            impl_->last_output_rect_ = g;
-            impl_->last_output_scale_ = o0.scale;
-            // Layout → output pixels, applied where draws and damage are made. Every pixel
-            // moves with it.
-            const scene::output_projection projection{{g.x, g.y}, o0.scale, o0.mode};
-            scene().set_projection(projection);
-            impl_->cursor_.set_projection(projection);
-            impl_->decorations_.set_scale(o0.scale);
-            scene().note_full_damage();
-            // Layer surfaces are arranged against the output, and the usable area with them.
-            impl_->wm_.on_output_changed();
-        }
-    }
-    if (!impl_->initial_damage_noted_) {
-        impl_->initial_damage_noted_ = true;
+    // wl_output globals withdrawn 5 s ago are destroyed now (`server::remove_global`).
+    wayland().collect_globals(static_cast<unsigned long long>(tick.timestamp_ns));
+    // Outputs changed since the last tick (a test moved one; hotplug applies its changes
+    // at once, so usually nothing is left here): views, clocks, clients, the pointer.
+    if (impl->outputs.layout_generation() != impl->applied_layout_generation_ ||
+        impl->outputs.generation() != impl->output_generation_)
+        impl->outputs_changed_now();
+    if (!impl->initial_damage_noted_) {
+        impl->initial_damage_noted_ = true;
         scene().note_full_damage();
     }
+
+    // The outputs this tick serves: the due ones from the vsync timer; every live one when
+    // a test drives `tick_ui` directly.
+    const std::uint32_t live = impl->outputs.live_mask();
+    const std::uint32_t served = impl->in_vsync_ ? (impl->due_mask_ & live) : live;
+    const std::uint32_t dark = impl->gate_power_mask_.load(std::memory_order_relaxed);
 
     {
         // DRM flips and the logind bus have sources of their own and are handled the
@@ -3612,60 +7124,80 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     }
 
     // wl_surface.frame means "the content you committed has been shown". Answering it once
-    // per vsync tick instead makes clients render frames that are composited over and never
-    // reach the display, so on the KMS path the callbacks wait for an actual flip. Without
-    // a present path (headless, nested) the tick is the only clock there is.
-    if (impl_->last_callback_ns_ == 0)
-        impl_->last_callback_ns_ = tick.timestamp_ns;
-    const bool stalled =
-        tick.timestamp_ns - impl_->last_callback_ns_ >=
-        (impl_->awaiting_resume_flip_ ? detail::compositor_impl::k_resume_flip_grace_ns
-                                      : detail::compositor_impl::k_callback_stall_ns);
-    // Paused: this is the 1 Hz paused tick, and every callback is answered by it — a
-    // client blocked in eglSwapBuffers keeps running, and one that honours `suspended`
-    // stops drawing on its own (niri's 995 ms throttle, for the same reason).
-    const bool paused = impl_->display_gate_.load(std::memory_order_relaxed) != 0;
+    // per tick instead makes clients render frames that are composited over and never reach
+    // the display, so on the KMS path a surface's callbacks wait for a flip of its pace
+    // output (M8). Without a present path for an output (virtual) its tick is the clock.
+    const bool paused = impl->display_gate_.load(std::memory_order_relaxed) != 0;
+    const auto frame_ms = static_cast<unsigned>(tick.timestamp_ns / 1'000'000ull);
     if (paused) {
-        impl_->awaiting_resume_flip_ = false;
-        impl_->last_callback_ns_ = tick.timestamp_ns;
-        fire_frame_callbacks(impl_->p0_, static_cast<unsigned>(tick.timestamp_ns / 1'000'000ull));
+        // The 1 Hz paused tick: every callback is answered by it — a client blocked in
+        // eglSwapBuffers keeps running, and one that honours `suspended` stops drawing on
+        // its own (niri's 995 ms throttle, for the same reason).
+        for (auto& o : impl->outs_) {
+            o.awaiting_resume_flip = false;
+            o.last_callback_ns = tick.timestamp_ns;
+        }
+        fire_frame_callbacks(impl->p0_, frame_ms);
         // Nothing reaches the screen while stopped: queued presentation feedback is
         // discarded once a second, so a client pacing by it (mpv) falls back to its timer.
-        presentation_discard(impl_->p0_, true);
+        presentation_discard(impl->p0_, true);
         // A lock under way while nothing is shown is locked now.
-        impl_->advance_lock();
-    } else if (!impl_->drm_present_ || impl_->present_completed_ || stalled) {
-        if (stalled && !impl_->present_completed_) {
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor",
-                                            "no present in 250ms — pacing frame callbacks by tick");
+        impl->advance_lock();
+    } else {
+        for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+            detail::output_ui& o = impl->outs_[slot];
+            if (!(served & (1u << slot)) || (dark & (1u << slot)))
+                continue;
+            const detail::output_pipeline* p = o.pipe;
+            const bool kms_output = p && p->kms;
+            if (o.last_callback_ns == 0)
+                o.last_callback_ns = tick.timestamp_ns;
+            const bool stalled =
+                tick.timestamp_ns - o.last_callback_ns >=
+                (o.awaiting_resume_flip ? detail::compositor_impl::k_resume_flip_grace_ns
+                                        : detail::compositor_impl::k_callback_stall_ns);
+            if (!kms_output || o.present_completed || stalled) {
+                if (stalled && !o.present_completed && kms_output) {
+                    char line[96];
+                    std::snprintf(line, sizeof(line),
+                                  "no present in 250ms on output %u — pacing frame callbacks by "
+                                  "tick",
+                                  slot);
+                    lx::trace::logger::global().log(lx::trace::level::warn, "compositor", line);
+                }
+                o.present_completed = false;
+                o.last_callback_ns = tick.timestamp_ns;
+                unsigned ms = frame_ms;
+                if (o.last_feedback.hw_clock && o.last_feedback.actual_present_ns > 0)
+                    ms = static_cast<unsigned>(o.last_feedback.actual_present_ns / 1'000'000ull);
+                // Surfaces this output paces now; the ones on no output (covered, off every
+                // output, unmapped) at most once per 995 ms.
+                fire_output_frame_callbacks(impl->p0_, slot, ms,
+                                            static_cast<unsigned long long>(tick.timestamp_ns));
+            }
         }
-        impl_->present_completed_ = false;
-        impl_->last_callback_ns_ = tick.timestamp_ns;
-
-        unsigned frame_time_ms = static_cast<unsigned>(tick.timestamp_ns / 1'000'000ull);
-        const auto last_present = impl_->presentation_.last_feedback();
-        if (last_present.hw_clock && last_present.actual_present_ns > 0)
-            frame_time_ms = static_cast<unsigned>(last_present.actual_present_ns / 1'000'000ull);
-        // Surfaces on screen in the last published frame now; the others (covered, off the
-        // output, unmapped) at most once per 995 ms.
-        fire_visible_frame_callbacks(impl_->p0_, frame_time_ms, impl_->last_published_frame_,
-                                     static_cast<unsigned long long>(tick.timestamp_ns));
     }
 
     // Window management for this frame — configures coalesced since the last tick go out
     // here, once, rather than once per request that changed them.
     {
         lx::trace::scoped_span wm_span{"ui", "wm.on_tick"};
-        impl_->wm_.on_tick(tick.timestamp_ns);
+        impl->wm_.on_tick(tick.timestamp_ns);
     }
     // Frames: the atlas on first use and changed titles, rasterized once per tick however
     // many set_title requests arrived — in this tick's snapshot, with the geometry they fit.
-    impl_->decorations_.on_tick();
+    {
+        lx::trace::scoped_span deco_span{"ui", "decorations"};
+        impl->decorations_.on_tick();
+    }
     // The pointer image, after the window manager (a grab sets the override) and before the
     // scene is published (the software cursor is a scene node).
-    if (impl_->cursor_hw_failed_.load(std::memory_order_acquire))
-        impl_->cursor_.on_hardware_failed();
-    impl_->cursor_.on_tick();
+    if (impl->cursor_hw_failed_.load(std::memory_order_acquire))
+        impl->cursor_.on_hardware_failed();
+    {
+        lx::trace::scoped_span cursor_span{"ui", "cursor"};
+        impl->cursor_.on_tick();
+    }
 
     scheduler().on_vsync(tick);
     {
@@ -3673,98 +7205,144 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         scene().update(tick.delta_seconds);
     }
 
-    const bool nothing_changed = scene().pending_damage().empty();
-    const bool published = scene().commit_frame(tick.frame_index);
-    if (published) {
+    // Publish the served outputs that have something new: each view is built with its own
+    // projection and damage (M3), and a view with nothing new publishes nothing — its last
+    // snapshot is still what it shows.
+    const std::uint32_t damaged = scene().pending_damage_mask();
+    std::uint32_t published = 0;
+    std::uint32_t dropped = 0;
+    for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+        const std::uint32_t bit = 1u << slot;
+        detail::output_ui& o = impl->outs_[slot];
+        if (!(served & bit) || !o.live || (dark & bit))
+            continue;
+        if (!(damaged & bit) && o.published_once)
+            continue;
+        lx::trace::scoped_span publish_span{"ui", "publish"};
+        if (!scene().commit_frame(slot, tick.frame_index)) {
+            dropped |= bit;
+            continue;
+        }
+        published |= bit;
+        o.published_once = true;
+        o.last_published_frame = tick.frame_index;
+        impl->p0_.published_frame[slot] = tick.frame_index;
+        impl->p0_.published_mask |= bit;
+        if (damaged & bit)
+            o.last_damaged_frame = tick.frame_index;
+    }
+    impl->p0_.lit_mask = paused ? 0u : (live & ~dark);
+    if (published != 0) {
         // Published: commits dispatched between now and the next tick are the next
         // snapshot's. A dropped publish keeps this frame, whose damage carries forward.
-        impl_->p0_.building_frame = tick.frame_index + 1;
-        impl_->buffer_lifecycle_.on_frame_submitted(tick.frame_index);
-        if (!nothing_changed)
-            impl_->last_damaged_frame_ = tick.frame_index;
-        impl_->last_published_frame_ = tick.frame_index;
-        // wp_presentation: queued feedback of the surfaces this frame shows is sampled
-        // into it (the visibility pass just ran). Not while stopped: nothing is shown.
-        if (!paused) {
-            presentation_published(impl_->p0_, tick.frame_index);
-            if (!impl_->drm_present_) {
-                // No display to flip (headless, nested): the tick is the only presentation
+        impl->p0_.building_frame = tick.frame_index + 1;
+        impl->last_published_any_ = tick.frame_index;
+        impl->buffer_lifecycle_.on_frame_submitted(tick.frame_index);
+        impl->render_mask_.fetch_or(published, std::memory_order_release);
+        for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+            if (!(published & (1u << slot)))
+                continue;
+            // wp_presentation: queued feedback this output paces is sampled into the frame
+            // (the visibility pass just ran). Not while stopped: nothing is shown.
+            if (paused)
+                continue;
+            presentation_published(impl->p0_, tick.frame_index, slot);
+            const detail::output_pipeline* p = impl->outs_[slot].pipe;
+            if (!(p && p->kms)) {
+                // No display to flip (a virtual output): the tick is the only presentation
                 // clock there is, so the frame counts as presented when it is published —
                 // in software, so no flags (wlroots' headless backend does the same).
                 present_info info{};
                 info.timestamp_ns = static_cast<unsigned long long>(tick.timestamp_ns);
-                if (impl_->outputs.count() > 0) {
-                    const unsigned mhz =
-                        impl_->outputs.state(impl_->outputs.nth(0)).refresh_mhz;
-                    if (mhz > 0)
-                        info.refresh_ns =
-                            static_cast<unsigned>((1'000'000'000'000ull + mhz / 2) / mhz);
-                }
-                presentation_flipped(impl_->p0_, tick.frame_index, info);
+                const unsigned mhz = impl->outputs.slot_state(slot).refresh_mhz;
+                if (mhz > 0)
+                    info.refresh_ns = static_cast<unsigned>((1'000'000'000'000ull + mhz / 2) / mhz);
+                presentation_flipped(impl->p0_, tick.frame_index, slot, info);
                 // Likewise a locked frame counts as shown once published.
-                if (impl_->lock_.state() == lock_state::locking &&
-                    static_cast<int>(tick.frame_index - impl_->lock_frame_) >= 0)
-                    impl_->apply_lock_actions(impl_->lock_.locked_frame_shown());
+                if (impl->lock_.state() == lock_state::locking &&
+                    static_cast<int>(tick.frame_index - impl->outs_[slot].lock_frame) >= 0)
+                    impl->note_lock_shown(slot);
             }
         }
-    } else {
-        // The render thread still holds every other slot. Visible on the timeline as an
-        // instant, so a stutter can be told apart from a frame that had nothing new.
+    }
+    if (dropped != 0) {
+        // The render thread still holds every other slot of that view. Visible on the
+        // timeline as an instant, so a stutter can be told apart from a frame that had
+        // nothing new.
         lx::trace::timeline_instant("ui", "publish_dropped");
         lx::trace::logger::global().log(lx::trace::level::trace, "compositor",
                                         "frame dropped (backpressure)");
     }
 
-    // Idle inhibitors (I3): honoured while their surface was on screen in the newest
-    // published frame, on a running display. Only looked at while one exists, or while
-    // inhibition still has to end — an empty set costs nothing.
-    if (impl_->inhibitors_.count() > 0 || impl_->idle_.inhibited()) {
-        const bool inhibited =
-            !paused && idle_inhibitor_visible(impl_->p0_, impl_->last_published_frame_);
-        if (impl_->idle_.set_inhibited(inhibited,
-                                       static_cast<unsigned long long>(tick.timestamp_ns))) {
-            impl_->rearm_idle_timer();
+    // Idle inhibitors (I3): honoured while their surface was on screen on a lit output in
+    // its newest published frame. Only looked at while one exists, or while inhibition
+    // still has to end — an empty set costs nothing.
+    if (impl->inhibitors_.count() > 0 || impl->idle_.inhibited()) {
+        const bool inhibited = !paused && idle_inhibitor_visible(impl->p0_);
+        if (impl->idle_.set_inhibited(inhibited,
+                                      static_cast<unsigned long long>(tick.timestamp_ns))) {
+            impl->rearm_idle_timer();
             if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
                 lx::trace::logger::global().log(lx::trace::level::debug, "compositor.idle",
                                                 inhibited ? "idle inhibited=1" : "idle inhibited=0");
         }
     }
 
-    // An idle tick produces no flip, and frame callbacks otherwise wait for one — a client
-    // that commits a frame request without new content would then stall until the
-    // watchdog. Once every damaged frame has been composited and committed and no flip is
-    // queued, nothing is waiting on the display: answer now (wlroots' "frame done without
-    // a commit"). The reads are ordered against render's writes: last_rendered_frame_ is
-    // published after frame_outstanding_ is raised, and frame_outstanding_ is lowered only
-    // after the commit has set flip_pending.
-    if (impl_->drm_present_ && !paused && nothing_changed &&
-        impl_->last_rendered_frame_.load(std::memory_order_acquire) >= impl_->last_damaged_frame_ &&
-        !impl_->frame_outstanding_.load(std::memory_order_acquire) &&
-        !impl_->kms_atomic.flip_pending()) {
-        impl_->last_callback_ns_ = tick.timestamp_ns;
-        fire_visible_frame_callbacks(impl_->p0_,
-                                     static_cast<unsigned>(tick.timestamp_ns / 1'000'000ull),
-                                     impl_->last_published_frame_,
-                                     static_cast<unsigned long long>(tick.timestamp_ns));
+    // An idle tick of an output produces no flip there, and its frame callbacks otherwise
+    // wait for one — a client that commits a frame request without new content would then
+    // stall until the watchdog. Once every damaged frame of the output has been composited
+    // and committed and no flip is queued on it, nothing is waiting on its display: answer
+    // the callbacks it paces now (wlroots' "frame done without a commit"). The reads are
+    // ordered against render's writes: `rendered_frame` is published after
+    // `frame_outstanding` is raised, and `frame_outstanding` is lowered only after the
+    // commit has set flip_pending.
+    std::uint32_t quiet = 0;
+    for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+        const std::uint32_t bit = 1u << slot;
+        if (!(served & bit))
+            continue;
+        detail::output_ui& o = impl->outs_[slot];
+        const detail::output_pipeline* p = o.pipe;
+        const long long rendered = p ? p->rendered_frame.load(std::memory_order_acquire)
+                                     : static_cast<long long>(o.last_published_frame);
+        const bool outstanding = p && p->frame_outstanding.load(std::memory_order_acquire);
+        const bool flip = p && p->kms && p->kms->flip_pending();
+        const bool settled = !(damaged & bit) && rendered >= o.last_damaged_frame &&
+                             !outstanding && !flip;
+        if (p && p->kms && !paused && !(dark & bit) && settled) {
+            o.last_callback_ns = tick.timestamp_ns;
+            fire_output_frame_callbacks(impl->p0_, slot, frame_ms,
+                                        static_cast<unsigned long long>(tick.timestamp_ns));
+        }
+        if (settled && !(published & bit))
+            quiet |= bit;
     }
 
-    // Release client buffers the render thread has finished sampling. Done here because
-    // sending wl_buffer.release requires the UI thread's ownership of Wayland dispatch.
-    const long long rendered = impl_->last_rendered_frame_.load(std::memory_order_acquire);
-    (void)impl_->buffer_lifecycle_.retire_completed_frames(rendered);
+    // Release client buffers no output can still sample (the render low-water mark).
+    // Done here because sending wl_buffer.release requires the UI thread's ownership of
+    // Wayland dispatch.
+    const long long low_water = impl->render_low_water_.load(std::memory_order_acquire);
+    (void)impl->buffer_lifecycle_.retire_completed_frames(low_water);
     // Likewise shm buffers the render thread has uploaded from client memory.
-    impl_->shm_direct_.retire();
+    impl->shm_direct_.retire();
 
-    // Whether the next tick has anything to do. Each term is something only a later tick
-    // finishes: damage to composite, a frame the render thread has not reached, a flip or
-    // commit outstanding, a frame callback or buffer waiting on one, deferred WM work.
-    impl_->tick_quiet_ =
-        published && nothing_changed && rendered >= impl_->last_damaged_frame_ &&
-        !impl_->frame_outstanding_.load(std::memory_order_acquire) &&
-        !(impl_->drm_present_ && impl_->kms_atomic.flip_pending()) &&
-        !frame_callbacks_pending(impl_->p0_) &&
-        !impl_->buffer_lifecycle_.has_unreleased_frames() && impl_->shm_direct_.idle() &&
-        !impl_->wm_.needs_tick() && !impl_->logout_active_; // logout ends on a tick
+    // Whether the next tick has anything to do. Per output: damage to composite, a frame
+    // the render thread has not reached, a flip or commit outstanding (`quiet` above);
+    // anywhere: a frame callback or buffer waiting on a later frame, deferred WM work.
+    const bool global_busy = impl->buffer_lifecycle_.has_unreleased_frames() ||
+                             !impl->shm_direct_.idle() || impl->wm_.needs_tick() ||
+                             impl->logout_active_; // logout ends on a tick
+    // A frame callback keeps the output that paces it ticking (its flip or its idle rule
+    // answers it), not every output.
+    const std::uint32_t waiting = frame_callbacks_pending(impl->p0_)
+                                      ? frame_callbacks_pending_outputs(impl->p0_)
+                                      : 0u;
+    impl->tick_quiet_mask_ = global_busy ? 0u : (quiet & ~waiting);
+    // New damage on outputs this tick did not serve (a client of another output committed):
+    // their clocks start, on their own phase.
+    if (const std::uint32_t pending = scene().pending_damage_mask() & ~served & live & ~dark;
+        pending != 0 && !paused)
+        impl->request_frame(pending);
 
     // Configures and events produced by this tick leave now, not at the next poll.
     wayland().flush();
@@ -3772,67 +7350,286 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     const auto us = static_cast<unsigned>(
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count());
-    impl_->budget_.end_tick_ui(us);
-    if (impl_->budget_.tick_ui_over_budget())
-        ++impl_->ui_over_budget_;
-    if (++impl_->ui_budget_window_ >= detail::compositor_impl::k_budget_report_frames) {
-        if (impl_->ui_over_budget_ > 0)
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor",
-                                            "tick_ui over budget in recent frames");
-        impl_->ui_over_budget_ = 0;
-        impl_->ui_budget_window_ = 0;
+    impl->budget_.end_tick_ui(us);
+    if (impl->budget_.tick_ui_over_budget()) {
+        ++impl->ui_over_budget_;
+        if (us > impl->ui_over_budget_max_us_)
+            impl->ui_over_budget_max_us_ = us;
+    }
+    if (++impl->ui_budget_window_ >= detail::compositor_impl::k_budget_report_frames) {
+        if (impl->ui_over_budget_ > 0) {
+            char line[96];
+            std::snprintf(line, sizeof(line),
+                          "tick_ui over budget in recent frames (%u of %u, worst %u us)",
+                          impl->ui_over_budget_, impl->ui_budget_window_,
+                          impl->ui_over_budget_max_us_);
+            lx::trace::logger::global().log(lx::trace::level::warn, "compositor", line);
+        }
+        impl->ui_over_budget_ = 0;
+        impl->ui_over_budget_max_us_ = 0;
+        impl->ui_budget_window_ = 0;
     }
 }
 
 void compositor::tick_render() {
     runtime::assert_affinity(runtime::affinity::render);
     lx::trace::scoped_span span{"render", "tick_render"};
-
-    const auto t0 = std::chrono::steady_clock::now();
+    auto* impl = impl_;
 
     // The pause gate, in this order (see `resume_gen_`). A resume runs its procedure before
     // anything else this tick: the KMS state, the cursor plane and every slot's history are
     // whatever the last master left.
-    const bool paused = impl_->display_gate_.load(std::memory_order_acquire) != 0;
-    const unsigned resume_gen = impl_->resume_gen_.load(std::memory_order_acquire);
-    if (impl_->drm_present_ && !paused && resume_gen != impl_->resume_done_gen_)
-        impl_->run_resume_procedure(resume_gen);
+    // Output plans first (ADR 008 §A.4): pipelines added, tested, switched, retired.
+    impl->run_output_ops();
+    const bool vt_paused =
+        (impl->display_gate_.load(std::memory_order_acquire) & detail::compositor_impl::gate_vt) != 0;
+    const std::uint32_t dark = impl->gate_power_mask_.load(std::memory_order_acquire);
+    for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+        detail::output_pipeline* p = impl->pipes_[slot].get();
+        if (!p)
+            continue;
+        if (p->retiring) {
+            impl->finish_retire(slot);
+            continue;
+        }
+        // The previous mode's targets, once the new mode's first frame has flipped.
+        if (p->graveyard && (!p->kms || (p->content_committed_once && !p->kms->flip_pending())))
+            p->graveyard.reset();
+        // Tested targets no switch came for (a newer change superseded the test).
+        if (p->staged && !p->switch_pending &&
+            detail::compositor_impl::now_ns() - p->staged_since_ns >
+                detail::output_pipeline::k_staged_keep_ns)
+            p->staged.reset();
+    }
+    // Adds held back behind a retire whose CRTC was still lit (its flip has landed now).
+    impl->run_deferred_output_ops();
+    bool reread = false;
+    for (auto& up : impl->pipes_) {
+        if (!up || up->retiring || !impl->drm_present_ || vt_paused || (dark & (1u << up->slot)))
+            continue;
+        const unsigned gen = impl->resume_gen_[up->slot].load(std::memory_order_acquire);
+        if (gen == up->resume_done_gen)
+            continue;
+        if (!reread && !impl->card_gone_.load(std::memory_order_acquire)) {
+            // Whatever lit CRTCs while we were away (fbcon on every connected connector, a
+            // disabled monitor included, or on another CRTC than ours): read again, so the
+            // resume modesets turn off every CRTC none of our pipelines drives (wlroots
+            // does on every modeset) — else it keeps showing the console, or the kernel
+            // refuses the resume for a CRTC left enabled without connectors.
+            reread = true;
+            if (auto again = impl->kms.enumerate_resources(); !again)
+                lx::trace::logger::global().log_error(again.get_error(), "compositor.drm");
+        }
+        impl->run_resume_procedure(*up, gen);
+    }
 
-    const auto& snapshot = scene().acquire_render_snapshot();
-    const unsigned idx = snapshot.frame_index();
-    const auto& draws = snapshot.draws();
-
-    import_cache().tick(idx);
-    impl_->memory_.reset_frame_arenas(lx::runtime::memory_pool::render);
-
-    if (impl_->device_recovery_.needs_recovery()) {
-        if (auto recovered = impl_->device_recovery_.handle_device_lost(); recovered) {
-            impl_->import_cache = gfx::dmabuf_import_cache{impl_->graphics.dmabuf(),
-                                                           impl_->cfg.import_cache};
-            impl_->pipeline_cache_ = gfx::pipeline_cache{};
-            impl_->frame_renderer_.set_pipeline_cache(&impl_->pipeline_cache_);
+    impl->memory_.reset_frame_arenas(lx::runtime::memory_pool::render);
+    if (impl->device_recovery_.needs_recovery()) {
+        if (auto recovered = impl->device_recovery_.handle_device_lost(); recovered) {
+            impl->import_cache = gfx::dmabuf_import_cache{impl->graphics.dmabuf(),
+                                                          impl->cfg.import_cache};
+            impl->pipeline_cache_ = gfx::pipeline_cache{};
+            impl->frame_renderer_.set_pipeline_cache(&impl->pipeline_cache_);
         }
     }
 
-    // What changed since the last frame this thread saw. A re-acquired snapshot (the UI
+    // As late as possible: the cursor position used is the newest the UI has published.
+    // Taken whether or not a plane exists — its input time is what latency is measured from.
+    if (impl->cursor_frames_.take())
+        impl->cursor_cur_ = impl->cursor_frames_.front();
+    (void)impl->cursor_images_.take();
+
+    // The views to composite: those UI published since render last looked, and those with
+    // damage a failed composite left. Oldest frame first, each composited right after the
+    // texture updates its snapshot may show are applied (one GL texture serves every output).
+    const std::uint32_t published = impl->render_mask_.exchange(0, std::memory_order_acq_rel);
+    unsigned order[output_manager::k_max];
+    unsigned n = 0;
+    for (auto& up : impl->pipes_) {
+        if (!up || up->retiring)
+            continue;
+        const std::uint32_t bit = 1u << up->slot;
+        if ((published & bit) || !up->missed.empty())
+            order[n++] = up->slot;
+    }
+    // Acquired first (each view's newest snapshot, a reader lease), then composited in frame
+    // order: the texture updates drained before each composite are exactly those its
+    // snapshot may show.
+    const scene::immutable_frame_snapshot* snaps[output_manager::k_max]{};
+    for (unsigned i = 0; i < n; ++i) {
+        detail::output_pipeline& p = *impl->pipes_[order[i]];
+        // Before the acquire: the snapshot taken is at least this new, so "every publish was
+        // consumed" can only be over-reported (the low-water mark stays conservative).
+        const unsigned publishes = scene().snapshots(p.slot).publish_count();
+        snaps[p.slot] = &scene().acquire_render_snapshot(p.slot);
+        p.consumed_publishes = publishes;
+    }
+    // Again, after the acquire: a mode switch UI posted before publishing a snapshot of the
+    // new size is seen whenever that snapshot is (the publish is a release, the acquire an
+    // acquire), so no frame of the new size is composited into targets of the old one.
+    impl->run_output_ops();
+    for (unsigned i = 1; i < n; ++i)
+        for (unsigned j = i; j > 0 && static_cast<int>(snaps[order[j]]->frame_index() -
+                                                       snaps[order[j - 1]]->frame_index()) < 0;
+             --j) {
+            const unsigned t = order[j];
+            order[j] = order[j - 1];
+            order[j - 1] = t;
+        }
+    const char* commit_kinds[output_manager::k_max]{};
+    bool composited[output_manager::k_max]{};
+    unsigned rects[output_manager::k_max]{};
+    unsigned long long areas[output_manager::k_max]{};
+    unsigned frames[output_manager::k_max]{};
+    for (unsigned i = 0; i < n; ++i) {
+        if (!impl->pipes_[order[i]]) {
+            // Retired and handed over by the ops just run (its CRTC was free at once).
+            scene().release_render_frame(order[i], *snaps[order[i]]);
+            continue;
+        }
+        detail::output_pipeline& p = *impl->pipes_[order[i]];
+        // Retired by the ops just run, or a switch that has to wait a tick (the previous
+        // switch's targets may still be on screen): the snapshot is released undrawn and
+        // its damage kept.
+        // Stale for this pipeline: built for the output that had the slot before, or at the
+        // mode it is switching away from — never composited (a modeset of the old mode after
+        // a resize while the VT was away could be refused; it would at least show a frame
+        // of the old size). The new mode's first frame follows at once.
+        const unsigned snap_frame = snaps[p.slot]->frame_index();
+        const bool stale =
+            (p.has_first_frame && static_cast<int>(snap_frame - p.first_frame) < 0) ||
+            (p.switch_pending && static_cast<int>(snap_frame - p.switch_from_frame) < 0);
+        if (p.retiring || stale || !impl->apply_mode_switch(p, snap_frame)) {
+            if (!p.retiring && !stale)
+                p.missed.set_full();
+            scene().release_render_frame(p.slot, *snaps[p.slot]);
+            continue;
+        }
+        const auto t_out = std::chrono::steady_clock::now();
+        composited[p.slot] =
+            impl->composite_output(p, p.slot, *snaps[p.slot], rects[p.slot], areas[p.slot]);
+        frames[p.slot] = static_cast<unsigned>(p.rendered_frame.load(std::memory_order_relaxed));
+        p.render_cost_us.store(static_cast<unsigned>(
+                                   std::chrono::duration_cast<std::chrono::microseconds>(
+                                       std::chrono::steady_clock::now() - t_out)
+                                       .count()),
+                               std::memory_order_relaxed);
+    }
+    if (n > 0) {
+        import_cache().tick(frames[order[n - 1]]);
+    } else {
+        // Nothing to composite (no output published): client updates are applied all the
+        // same, up to the frame being built, so the staging they hold is handed back and a
+        // client committing to a surface no output shows never runs out of buffers.
+        impl->drain_texture_updates(impl->frame_index.load(std::memory_order_acquire));
+    }
+
+    // Commits: every pipeline with a frame waiting (or only the pointer moved), each its own
+    // nonblocking commit and flip (M5) — then the pipelines that need a modeset, together.
+    if (impl->drm_present_) {
+        for (auto& up : impl->pipes_) {
+            if (!up || !up->kms || up->retiring)
+                continue;
+            impl->prepare_cursor_plane(*up);
+            if (up->kms->needs_modeset())
+                continue;
+            commit_kinds[up->slot] = impl->commit_output(*up, up->slot, composited[up->slot]);
+        }
+        impl->commit_pending_modesets(commit_kinds);
+    }
+
+    // Nothing an output can still sample is kept: client buffers (UI retires them against
+    // the mark) and textures whose retirement waited for every view to move past them.
+    const long long low_water = impl->compute_low_water();
+    impl->render_low_water_.store(low_water, std::memory_order_release);
+    impl->apply_due_forgets(low_water);
+
+    // One line per output that did something; an idle tick is silent. Checked before
+    // formatting so the frame path pays nothing when debug is off.
+    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+        for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+            const char* kind = commit_kinds[slot] ? commit_kinds[slot] : "none";
+            if (!composited[slot] && kind[0] == 'n')
+                continue;
+            const detail::output_pipeline* p = impl->pipes_[slot].get();
+            char line[192];
+            std::snprintf(line, sizeof(line),
+                          "frame=%lld composite=%d rects=%u area=%llu commit=%s render_us=%u "
+                          "output=%u",
+                          p ? p->rendered_frame.load(std::memory_order_relaxed) : -1LL,
+                          composited[slot] ? 1 : 0, rects[slot], areas[slot], kind,
+                          p ? p->render_cost_us.load(std::memory_order_relaxed) : 0u, slot);
+            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.render", line);
+        }
+    }
+}
+
+namespace detail {
+
+long long compositor_impl::compute_low_water() const {
+    long long low = -1;
+    bool any_pending = false;
+    long long newest = -1;
+    for (const auto& up : pipes_) {
+        if (!up || up->retiring)
+            continue;
+        const long long rendered = up->rendered_frame.load(std::memory_order_relaxed);
+        if (rendered > newest)
+            newest = rendered;
+        const unsigned published = const_cast<scene::scene_graph&>(scene).snapshots(up->slot).publish_count();
+        const bool pending = published != up->consumed_publishes || !up->missed.empty();
+        if (!pending)
+            continue;
+        if (!any_pending || rendered < low)
+            low = rendered;
+        any_pending = true;
+    }
+    return any_pending ? low : newest;
+}
+
+bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
+                                       const scene::immutable_frame_snapshot& snapshot,
+                                       unsigned& rects, unsigned long long& area) {
+    rects = 0;
+    area = 0;
+    const unsigned idx = snapshot.frame_index();
+    const auto& draws = snapshot.draws();
+    {
+        lx::trace::scoped_span drain_span{"render", "drain_textures"};
+        drain_texture_updates(idx);
+    }
+
+    // What changed since the last frame this output saw. A re-acquired snapshot (the UI
     // published nothing new) contributes nothing; a skipped one was folded into this one
     // by `snapshot_buffer::publish`.
-    gfx::damage_region frame_damage = impl_->missed_damage_;
+    gfx::damage_region frame_damage = p.missed;
     if (lx::trace::timeline_enabled()) {
         const lx::rect2i bounds = snapshot.damage();
         lx::trace::timeline_counter("damage_px",
                                     static_cast<long long>(bounds.width) * bounds.height);
     }
-    impl_->missed_damage_.clear();
-    if (idx != impl_->last_seen_frame_) {
+    p.missed.clear();
+    if (idx != p.last_seen_frame) {
         frame_damage.add_region(snapshot.damage_rects());
-        impl_->last_seen_frame_ = idx;
+        p.last_seen_frame = idx;
+    }
+
+    const bool vt_paused = (display_gate_.load(std::memory_order_acquire) & gate_vt) != 0;
+    const bool dark = (gate_power_mask_.load(std::memory_order_acquire) & (1u << slot)) != 0;
+    if ((vt_paused || dark) && p.kms) {
+        // Client buffers keep being applied and released (a client committing once a second
+        // never runs out), so the scene is current at resume — but nothing is composited or
+        // committed: master is gone, or the output is off. The damage is dropped; the
+        // resume repaints everything.
+        p.rendered_frame.store(static_cast<long long>(idx), std::memory_order_release);
+        scene.release_render_frame(slot, snapshot);
+        return false;
     }
 
     // Translated only when something is drawn: an idle tick touches no draw data at all.
     const unsigned blit_count = draws.size();
     const auto build_blits = [&]() -> lx::gfx::blit_command* {
-        lx::gfx::blit_command* out = impl_->blit_storage(blit_count);
+        lx::gfx::blit_command* out = blit_storage(blit_count);
         for (unsigned i = 0; i < blit_count; ++i) {
             const auto& cmd = draws.data()[i];
             out[i].texture_id = cmd.texture.id();
@@ -3850,70 +7647,41 @@ void compositor::tick_render() {
         return out;
     };
 
-    {
-        lx::trace::scoped_span drain_span{"render", "drain_textures"};
-        impl_->drain_texture_updates(idx);
-    }
-
-    if (paused && impl_->drm_present_) {
-        // Client buffers keep being applied and released (a client committing once a second
-        // never runs out), so the scene is current at resume — but nothing is composited
-        // or committed: master is gone. The damage is dropped; resume repaints everything.
-        impl_->last_rendered_frame_.store(static_cast<long long>(idx), std::memory_order_release);
-        impl_->apply_due_forgets(idx);
-        scene().release_render_frame(snapshot);
-        return;
-    }
-
-    // A CRTC takes one flip at a time, so a frame arriving while one is queued cannot be
-    // shown yet — but with three scanout slots it no longer has to be thrown away either.
-    // It composites into the slot that is neither on screen nor queued, and the commit is
-    // what waits. The frame clock is phase-locked to the flips, so this is rare.
-    const bool flip_in_flight = impl_->drm_present_ && impl_->kms_atomic.flip_pending();
-    const bool scanout_path = (impl_->gl_present_ || impl_->cpu_present_ ||
-                               impl_->vulkan_present_) &&
-                              impl_->scanout_slot_count_ > 0;
-    bool composited_this_tick = false;
-    unsigned scanout_back = 0;
-    gfx::damage_region region{};
-
-    if (scanout_path) {
-        frame_damage.clip(impl_->scanout_rect_);
-    }
-
-    if (scanout_path && !frame_damage.empty()) {
+    bool drawn = false;
+    if (p.scanout())
+        frame_damage.clip(p.scanout_rect);
+    if (p.scanout() && !frame_damage.empty()) {
         // Buffer age: the slot about to be drawn into also missed every frame composited
         // since it was last used, so its region is this frame's damage plus that.
-        scanout_back = impl_->pick_back_slot();
-        region = frame_damage;
-        region.add_region(impl_->slot_age_damage_[scanout_back]);
-        region.clip(impl_->scanout_rect_);
+        const unsigned back = p.back_slot();
+        gfx::damage_region region = frame_damage;
+        region.add_region(p.slot_age[back]);
+        region.clip(p.scanout_rect);
         lx::gfx::blit_command* blits = build_blits();
-
-        if (impl_->gl_present_) {
-            lx::trace::scoped_span composite_span{"render", "composite"};
-            auto composited = impl_->gl_compositor_.composite_region(
-                impl_->gl_targets_[scanout_back], snapshot.clear_color(), blits, blit_count,
-                region);
-            if (!composited) {
-                lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
+        lx::trace::scoped_span composite_span{"render", "composite"};
+        if (gl_present_) {
+            auto c = gl_compositor_.composite_region(p.gl[back], snapshot.clear_color(), blits,
+                                                     blit_count, region);
+            if (!c) {
+                lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
-                composited_this_tick = true;
+                drawn = true;
                 // This frame supersedes any uncommitted one, so its fence replaces that
                 // frame's — which is dropped rather than leaked.
-                impl_->discard_composited_fence();
-                impl_->composited_fence_fd_ = composited.value().out_fence_fd;
-                if (composited.value().draws_skipped > 0)
-                    impl_->report_unregistered_draw(blits, blit_count);
-                // A requested debug screenshot of a fully repainted frame.
-                if (impl_->screenshot_pending_.load(std::memory_order_relaxed) &&
-                    region.count == 1 && region.rects[0].width == impl_->scanout_rect_.width &&
-                    region.rects[0].height == impl_->scanout_rect_.height &&
-                    impl_->screenshot_pending_.exchange(false, std::memory_order_acq_rel))
-                    impl_->write_screenshot(scanout_back);
+                p.discard_fence();
+                p.composited_fence = c.value().out_fence_fd;
+                if (c.value().draws_skipped > 0)
+                    report_unregistered_draw(blits, blit_count);
+                // A requested debug screenshot of a fully repainted frame of this output.
+                const std::uint32_t bit = 1u << slot;
+                if ((screenshot_pending_.load(std::memory_order_relaxed) & bit) &&
+                    region.count == 1 && region.rects[0].width == p.scanout_rect.width &&
+                    region.rects[0].height == p.scanout_rect.height &&
+                    (screenshot_pending_.fetch_and(~bit, std::memory_order_acq_rel) & bit))
+                    write_screenshot(p, back);
             }
-        } else if (impl_->cpu_present_) {
-            const auto& fb = impl_->dumb_fbs_[scanout_back];
+        } else if (cpu_present_) {
+            const auto& fb = p.dumb[back];
             gfx::pixel_surface target{};
             target.pixels = fb.pixels();
             target.width = fb.width();
@@ -3921,117 +7689,90 @@ void compositor::tick_render() {
             target.stride = fb.stride();
             target.format = fb.format();
             target.write_combining = true;
-
-            auto composited = impl_->cpu_compositor_.composite_region(
-                target, snapshot.clear_color(), blits, blit_count, region);
-            if (!composited) {
-                lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
+            auto c = cpu_compositor_.composite_region(target, snapshot.clear_color(), blits,
+                                                      blit_count, region);
+            if (!c) {
+                lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
-                composited_this_tick = true;
-                const auto stats = composited.value();
-                if (stats.draws_skipped > 0) {
+                drawn = true;
+                const auto stats = c.value();
+                if (stats.draws_skipped > 0)
                     lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
                                                     "draw referenced an unregistered texture");
-                }
-                if (stats.draws_unsupported > 0) {
+                if (stats.draws_unsupported > 0)
                     lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                                    "draw format has no conversion to the scanout "
-                                                    "format — surface not shown");
-                }
+                                                    "draw format has no conversion to the "
+                                                    "scanout format — surface not shown");
             }
-        } else {
+        } else if (vulkan_present_) {
             // Vulkan repaints the whole target, which is correct for any buffer age.
-            auto composited = impl_->vk_compositor_.composite(
-                impl_->vk_targets_[scanout_back], snapshot.clear_color(), blits, blit_count);
-            if (!composited) {
-                lx::trace::logger::global().log_error(composited.get_error(), "compositor.render");
+            auto c = vk_compositor_.composite(p.vk[back], snapshot.clear_color(), blits, blit_count);
+            if (!c) {
+                lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
-                composited_this_tick = true;
-                // Same contract as the GL path: this frame supersedes any uncommitted one,
-                // so its fence replaces that frame's rather than leaking alongside it. The
-                // commit waits on the GPU instead of the render thread doing so.
-                impl_->discard_composited_fence();
-                impl_->composited_fence_fd_ = composited.value().out_fence_fd;
-                if (composited.value().draws_skipped > 0)
-                    impl_->report_unregistered_draw(blits, blit_count);
+                drawn = true;
+                p.discard_fence();
+                p.composited_fence = c.value().out_fence_fd;
+                if (c.value().draws_skipped > 0)
+                    report_unregistered_draw(blits, blit_count);
             }
         }
-
-        if (composited_this_tick) {
-            for (unsigned slot = 0; slot < impl_->scanout_slot_count_; ++slot) {
-                if (slot != scanout_back)
-                    impl_->slot_age_damage_[slot].add_region(frame_damage);
-            }
-            impl_->slot_age_damage_[scanout_back].clear();
-            impl_->kms_pending_damage_.add_region(frame_damage);
-            impl_->frame_outstanding_.store(true, std::memory_order_release);
+        if (drawn) {
+            for (unsigned i = 0; i < p.slot_count; ++i)
+                if (i != back)
+                    p.slot_age[i].add_region(frame_damage);
+            p.slot_age[back].clear();
+            p.kms_pending.add_region(frame_damage);
+            p.frame_outstanding.store(p.kms != nullptr, std::memory_order_release);
+            // Newest wins: a frame that could not be shown yet is superseded by this one
+            // rather than queued behind it.
+            p.composited_slot = static_cast<int>(back);
+            p.composited_frame = idx;
+            rects = region.count;
+            area = region.area();
         } else {
             // Not drawn: try again next tick rather than lose it.
-            impl_->missed_damage_.add_region(frame_damage);
+            p.missed.add_region(frame_damage);
         }
-    } else if (!scanout_path && impl_->headless_present_ && impl_->headless_.width() > 0) {
+    } else if (!p.scanout() && headless_present_ && headless_.width() > 0) {
         // Software fallback for no-GPU hosts and CI.
-        (void)impl_->headless_.begin_frame();
-        (void)impl_->headless_.clear(lx::color::rgb(0.f, 0.f, 0.f));
+        (void)headless_.begin_frame();
+        (void)headless_.clear(lx::color::rgb(0.f, 0.f, 0.f));
         if (blit_count > 0)
-            (void)impl_->frame_renderer_.draw_to_headless(build_blits(), blit_count,
-                                                          impl_->headless_);
-        (void)impl_->headless_.end_frame_and_dump(nullptr);
+            (void)frame_renderer_.draw_to_headless(build_blits(), blit_count, headless_);
+        (void)headless_.end_frame_and_dump(nullptr);
     }
 
-    // The composite above waits for GPU completion, so the client buffers sampled by this
-    // snapshot are free — as are those of a dropped frame, which was never sampled at all.
-    // Publish the frame index; the UI thread owns Wayland dispatch and sends the
-    // wl_buffer.release events.
-    impl_->last_rendered_frame_.store(static_cast<long long>(idx), std::memory_order_release);
+    // The composite above waits for GPU completion (or carries its fence to the commit), so
+    // the client buffers this snapshot sampled are done with from render's side.
+    p.rendered_frame.store(static_cast<long long>(idx), std::memory_order_release);
+    scene.release_render_frame(slot, snapshot);
+    return drawn;
+}
 
-    // This snapshot has been drawn, so any texture whose retirement was waiting on a frame
-    // this recent is now genuinely unreferenced.
-    impl_->apply_due_forgets(idx);
-
-    // Newest wins: a frame that could not be shown yet is superseded by this one rather
-    // than queued behind it, so what reaches the display is always the latest content.
-    if (composited_this_tick) {
-        impl_->composited_slot_ = static_cast<int>(scanout_back);
-        impl_->composited_frame_ = idx;
-    }
-
-    const char* commit_kind = "none";
-    if (impl_->drm_present_ && impl_->composited_slot_ >= 0 && flip_in_flight)
-        commit_kind = "deferred";
-
-    // As late as possible: the cursor position used is the newest the UI has published.
-    // Taken whether or not a plane exists — its input time is what latency is measured from.
-    if (impl_->cursor_frames_.take())
-        impl_->cursor_cur_ = impl_->cursor_frames_.front();
-    if (impl_->drm_present_)
-        impl_->prepare_cursor_plane();
-    bool cursor_rode = false;
-
-    if (impl_->drm_present_ && !flip_in_flight && impl_->composited_slot_ >= 0) {
-        const auto present_slot = static_cast<unsigned>(impl_->composited_slot_);
-
-        const auto submit_ns = static_cast<runtime::clock_time>(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(
-                std::chrono::steady_clock::now().time_since_epoch()).count());
-        presentation().on_present_submitted(idx, submit_ns);
+const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bool composited) {
+    const unsigned bit = 1u << slot;
+    const bool gated = display_gate_.load(std::memory_order_acquire) != 0 ||
+                       (gate_power_mask_.load(std::memory_order_acquire) & bit) != 0;
+    const bool flip_in_flight = p.kms->flip_pending();
+    if (p.composited_slot >= 0 && flip_in_flight)
+        return "deferred";
+    if (p.composited_slot >= 0) {
+        const auto present_slot = static_cast<unsigned>(p.composited_slot);
+        p.presentation.on_present_submitted(p.composited_frame, now_ns());
 
         drm::atomic_commit_request req{};
-        req.connector = 0;
         req.request_page_flip = true;
         // The flip event names the frame it shows (presentation feedback).
-        req.user_tag = impl_->composited_frame_;
+        req.user_tag = p.composited_frame;
         // Borrowed by the commit; closed below once it has returned. When the GL backend
         // produced no fence it already blocked, so an absent fence is still correct.
-        req.in_fence_fd = impl_->composited_fence_fd_;
-        if (impl_->cpu_present_ && impl_->dumb_fbs_[present_slot].id())
-            req.framebuffer_id = impl_->dumb_fbs_[present_slot].id();
-        else if (impl_->scanout_slot_count_ > 0 && impl_->scanout_fbs_[present_slot].id())
-            req.framebuffer_id = impl_->scanout_fbs_[present_slot].id();
+        req.in_fence_fd = p.composited_fence;
+        req.framebuffer_id = p.framebuffer(present_slot, cpu_present_);
 
         // Every rect since the last commit, as separate clips: the plane's previous
         // framebuffer is older than this frame's damage alone describes.
-        const gfx::damage_region& pending = impl_->kms_pending_damage_;
+        const gfx::damage_region& pending = p.kms_pending;
         if (pending.full || pending.count == 0) {
             req.damage.full_frame = true;
         } else {
@@ -4039,190 +7780,261 @@ void compositor::tick_render() {
             req.damage.count = pending.count;
             for (unsigned i = 0; i < pending.count; ++i)
                 req.damage.rects[i] = pending.rects[i];
-            impl_->kms_atomic.build_damage_blob(req.damage, req.connector);
+            p.kms->build_damage_blob(req.damage);
         }
 
-        // The pointer rides the frame: both change on the same vblank. The first commit
-        // (a modeset) states the plane in full: on resume where the pointer is (the plane
-        // passed its test before), at startup off — it joins once tested.
-        if (impl_->cursor_plane_.valid() &&
-            (impl_->content_committed_once_
-                 ? impl_->cursor_plane_.dirty()
-                 : (impl_->cursor_tested_ || !impl_->cursor_plane_.visible()))) {
-            req.cursor = &impl_->cursor_plane_;
+        // The pointer rides the frame: both change on the same vblank.
+        bool cursor_rode = false;
+        if (p.cursor.valid() && p.content_committed_once && p.cursor.dirty()) {
+            req.cursor = &p.cursor;
             cursor_rode = true;
         }
 
-        impl_->pending_flip_slot_.store(present_slot, std::memory_order_release);
-        impl_->last_commit_content_.store(true, std::memory_order_release);
-        impl_->publish_commit_timing(impl_->composited_fence_fd_);
+        p.pending_flip_slot.store(present_slot, std::memory_order_release);
+        p.last_commit_content.store(true, std::memory_order_release);
+        publish_commit_timing(p, p.composited_fence);
         lx::trace::scoped_span commit_span{"render", "kms.commit"};
         // Checked again right before the ioctl: a pause that landed during the composite
         // keeps the frame (resume discards it) and commits nothing.
-        const bool paused_now = impl_->display_gate_.load(std::memory_order_acquire) != 0;
+        const bool paused_now =
+            display_gate_.load(std::memory_order_acquire) != 0 ||
+            (gate_power_mask_.load(std::memory_order_acquire) & bit) != 0;
         const auto committed =
             paused_now ? lx::result<void>{lx::make_error(
                              lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
                              "session paused")}
-                       : impl_->kms_atomic.commit(req);
+                       : p.kms->commit(req);
         // A commit that raced the pause is expected, not a failure of the present path:
         // logind drops master *before* it signals, so EACCES usually arrives first and the
         // pause a moment later. Master lost with no pause following is reported below.
         const bool lost_to_pause =
-            !committed && (paused_now || impl_->display_gate_.load(std::memory_order_acquire) != 0 ||
-                           impl_->kms_atomic.last_failure_lost_master());
+            !committed && (paused_now || display_gate_.load(std::memory_order_acquire) != 0 ||
+                           p.kms->last_failure_lost_master());
         if (!committed && lost_to_pause && !paused_now) {
-            const auto now = detail::compositor_impl::now_ns();
-            if (impl_->master_lost_since_ns_ == 0)
-                impl_->master_lost_since_ns_ = now;
-            else if (now - impl_->master_lost_since_ns_ > 1'000'000'000 &&
-                     !impl_->master_lost_reported_) {
-                impl_->master_lost_reported_ = true;
+            const auto now = now_ns();
+            if (p.master_lost_since_ns == 0)
+                p.master_lost_since_ns = now;
+            else if (now - p.master_lost_since_ns > 1'000'000'000 && !p.master_lost_reported) {
+                p.master_lost_reported = true;
                 lx::trace::logger::global().log_error(committed.get_error(), "compositor.drm");
                 lx::trace::logger::global().log(lx::trace::level::warn, "compositor.drm",
                                                 "DRM master lost and the session did not pause "
                                                 "(no logind?) — retrying every frame");
             }
         } else if (committed) {
-            impl_->master_lost_since_ns_ = 0;
-            impl_->master_lost_reported_ = false;
+            p.master_lost_since_ns = 0;
+            p.master_lost_reported = false;
         }
         if (!committed)
-            impl_->retract_commit_timing();
-        if (committed && impl_->kms_atomic.completion_needs_dispatch())
-            impl_->post_flip_dispatch();
-        if (impl_->resume_result_pending_ && !paused_now) {
-            impl_->resume_result_pending_ = false;
-            impl_->post_resume_result(
-                impl_->resume_done_gen_,
-                committed ? session_resume_outcome::ok
-                : !lost_to_pause && impl_->kms_atomic.last_failure_rejected_state()
-                    ? session_resume_outcome::rejected
-                    : session_resume_outcome::device_unavailable);
-        }
+            retract_commit_timing(p);
         if (!committed && cursor_rode && !lost_to_pause) {
             // Do not let the plane take frames down with it: if the cursor state alone is
             // rejected, the plane is unusable and the frame retries without it.
             drm::atomic_commit_request test{};
             test.update_primary = false;
-            test.cursor = &impl_->cursor_plane_;
+            test.cursor = &p.cursor;
             test.request_page_flip = false;
             test.test_only = true;
-            // Blame the plane only for a state the kernel refused: losing DRM master
-            // (a VT switch) fails TEST_ONLY too, and must not cost the session its
-            // hardware cursor.
-            if (!impl_->kms_atomic.commit(test) &&
-                impl_->kms_atomic.last_failure_rejected_state()) {
-                impl_->fail_cursor_plane("commit rejected the cursor state");
-                impl_->cursor_plane_.set_visible(false);
+            if (!p.kms->commit(test) && p.kms->last_failure_rejected_state()) {
+                fail_cursor_plane("commit rejected the cursor state");
+                p.cursor.set_visible(false);
             }
         }
+        const char* kind = "failed";
         if (committed) {
-            impl_->content_committed_once_ = true;
-            impl_->ever_lit_.store(true, std::memory_order_release);
-            impl_->composited_slot_ = -1;
+            if (p.kms->completion_needs_dispatch())
+                post_flip_dispatch();
+            p.content_committed_once = true;
+            p.ever_lit.store(true, std::memory_order_release);
+            p.composited_slot = -1;
             // The kernel has taken its own reference to the fence.
-            impl_->discard_composited_fence();
-            impl_->kms_pending_damage_.clear();
-            commit_kind = "content";
-            impl_->note_committed_input(true);
+            p.discard_fence();
+            p.kms_pending.clear();
+            kind = "content";
+            note_committed_input(p, true);
         } else {
             // Keep the slot and its fence: the commit is retried next tick without
             // compositing the frame again (or, paused, discarded by the resume).
-            commit_kind = lost_to_pause ? "paused" : "failed";
+            kind = lost_to_pause ? "paused" : "failed";
         }
         // Lowered after the commit raised flip_pending (see the idle-callback check).
-        impl_->frame_outstanding_.store(!committed, std::memory_order_release);
+        p.frame_outstanding.store(!committed, std::memory_order_release);
         // Log on transition only: a failing commit every frame must not flood the hot
         // path, but silently discarding it is how a dead present path stayed invisible.
         if (!committed && lost_to_pause) {
             // Expected; nothing to report.
-        } else if (!committed && !impl_->drm_commit_failing_) {
-            impl_->drm_commit_failing_ = true;
+        } else if (!committed && !p.drm_commit_failing) {
+            p.drm_commit_failing = true;
             lx::trace::logger::global().log_error(committed.get_error(), "compositor.drm");
-        } else if (committed && impl_->drm_commit_failing_) {
-            impl_->drm_commit_failing_ = false;
+        } else if (committed && p.drm_commit_failing) {
+            p.drm_commit_failing = false;
             lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm",
                                             "atomic commit recovered");
         }
-    } else if (impl_->drm_present_ && !composited_this_tick && impl_->composited_slot_ < 0 &&
-               impl_->content_committed_once_ && impl_->cursor_plane_.valid() &&
-               impl_->cursor_plane_.dirty() && impl_->cursor_plane_.involves_crtc() &&
-               !impl_->kms_atomic.flip_pending() &&
-               impl_->display_gate_.load(std::memory_order_acquire) == 0) {
-        // Nothing to composite, but the pointer moved: a commit of the cursor plane alone.
-        // The scene is not touched — this is what keeps pointer motion off the GPU.
-        drm::atomic_commit_request req{};
-        req.connector = 0;
-        req.update_primary = false;
-        req.cursor = &impl_->cursor_plane_;
-        req.request_page_flip = true;
-        // Its flip re-arms the frame clock but presents no client content, and must not
-        // rotate the scanout slots.
-        impl_->pending_flip_slot_.store(impl_->scanout_front_.load(std::memory_order_acquire),
-                                        std::memory_order_release);
-        impl_->last_commit_content_.store(false, std::memory_order_release);
-        impl_->publish_commit_timing(-1);
-        if (auto committed = impl_->kms_atomic.commit(req); committed) {
-            commit_kind = "cursor";
-            impl_->note_committed_input(false);
-        } else if (impl_->display_gate_.load(std::memory_order_acquire) != 0) {
-            impl_->retract_commit_timing();
-            commit_kind = "paused";
-        } else {
-            impl_->retract_commit_timing();
-            commit_kind = "cursor-failed";
-            // EBUSY (a flip raced in) and EACCES (DRM master on another VT) are transient;
-            // only a state the plane itself refuses, confirmed by TEST_ONLY, disables it.
-            drm::atomic_commit_request test{};
-            test.update_primary = false;
-            test.cursor = &impl_->cursor_plane_;
-            test.request_page_flip = false;
-            test.test_only = true;
-            if (!impl_->kms_atomic.commit(test) &&
-                impl_->kms_atomic.last_failure_rejected_state()) {
-                lx::trace::logger::global().log_error(committed.get_error(), "compositor.cursor");
-                impl_->fail_cursor_plane("cursor-only commit rejected");
-                impl_->cursor_plane_.set_visible(false);
-            }
+        (void)composited;
+        return kind;
+    }
+    if (gated || flip_in_flight || !p.content_committed_once || !p.cursor.valid() ||
+        !p.cursor.dirty() || !p.cursor.involves_crtc())
+        return "none";
+    // Nothing to composite, but the pointer moved on this output: a commit of the cursor
+    // plane alone. The scene is not touched — this is what keeps pointer motion off the GPU.
+    drm::atomic_commit_request req{};
+    req.update_primary = false;
+    req.cursor = &p.cursor;
+    req.request_page_flip = true;
+    // Its flip re-arms the frame clock but presents no client content, and must not rotate
+    // the scanout slots.
+    p.pending_flip_slot.store(p.front.load(std::memory_order_acquire), std::memory_order_release);
+    p.last_commit_content.store(false, std::memory_order_release);
+    publish_commit_timing(p, -1);
+    if (auto committed = p.kms->commit(req); committed) {
+        note_committed_input(p, false);
+        return "cursor";
+    } else if (display_gate_.load(std::memory_order_acquire) != 0) {
+        retract_commit_timing(p);
+        return "paused";
+    } else {
+        retract_commit_timing(p);
+        // EBUSY (a flip raced in) and EACCES (DRM master on another VT) are transient;
+        // only a state the plane itself refuses, confirmed by TEST_ONLY, disables it.
+        drm::atomic_commit_request test{};
+        test.update_primary = false;
+        test.cursor = &p.cursor;
+        test.request_page_flip = false;
+        test.test_only = true;
+        if (!p.kms->commit(test) && p.kms->last_failure_rejected_state()) {
+            lx::trace::logger::global().log_error(committed.get_error(), "compositor.cursor");
+            fail_cursor_plane("cursor-only commit rejected");
+            p.cursor.set_visible(false);
         }
-    }
-
-    // One line per tick that did something; an idle tick is silent. Checked before
-    // formatting so the frame path pays nothing when debug is off.
-    if ((composited_this_tick || commit_kind[0] != 'n') &&
-        lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        const auto so_far_us = static_cast<unsigned>(
-            std::chrono::duration_cast<std::chrono::microseconds>(
-                std::chrono::steady_clock::now() - t0).count());
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "frame=%u composite=%d rects=%u area=%llu commit=%s render_us=%u", idx,
-                      composited_this_tick ? 1 : 0, region.count, region.area(), commit_kind,
-                      so_far_us);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.render", line);
-    }
-
-    scene().release_render_frame(snapshot);
-
-    const auto us = static_cast<unsigned>(
-        std::chrono::duration_cast<std::chrono::microseconds>(
-            std::chrono::steady_clock::now() - t0).count());
-    impl_->budget_.end_tick_render(us);
-    // Publish for the frame clock. Both phases decide when the next repaint has to start:
-    // the frame is not presentable until render is done, so the deadline applies to their
-    // sum — but the scheduler itself belongs to the UI thread.
-    impl_->render_cost_us_.store(us, std::memory_order_relaxed);
-    if (impl_->budget_.tick_render_over_budget())
-        ++impl_->render_over_budget_;
-    if (++impl_->render_budget_window_ >= detail::compositor_impl::k_budget_report_frames) {
-        if (impl_->render_over_budget_ > 0)
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                            "tick_render over budget in recent frames");
-        impl_->render_over_budget_ = 0;
-        impl_->render_budget_window_ = 0;
+        return "cursor-failed";
     }
 }
+
+void compositor_impl::commit_pending_modesets(const char** kinds) {
+    // The pipelines that need a modeset (start, VT resume, power-on): one ALLOW_MODESET for
+    // all of them, carrying each one's first frame (M5) — once every one has a frame, or
+    // after `k_modeset_wait_ns` with those that do.
+    if ((display_gate_.load(std::memory_order_acquire) & gate_vt) != 0)
+        return;
+    const std::uint32_t dark = gate_power_mask_.load(std::memory_order_acquire);
+    output_pipeline* group[output_manager::k_max];
+    unsigned want = 0;
+    unsigned ready = 0;
+    const auto now = now_ns();
+    bool waited_out = false;
+    for (auto& up : pipes_) {
+        if (!up || !up->kms || up->retiring || !up->kms->needs_modeset() ||
+            (dark & (1u << up->slot)) || up->kms->flip_pending())
+            continue;
+        ++want;
+        if (up->modeset_wait_since_ns == 0)
+            up->modeset_wait_since_ns = now;
+        if (now - up->modeset_wait_since_ns >= k_modeset_wait_ns)
+            waited_out = true;
+        if (up->composited_slot >= 0)
+            group[ready++] = up.get();
+    }
+    if (ready == 0 || (ready < want && !waited_out))
+        return;
+
+    drm::modeset_entry entries[output_manager::k_max]{};
+    for (unsigned i = 0; i < ready; ++i) {
+        output_pipeline& p = *group[i];
+        entries[i].pipe = p.kms.get();
+        entries[i].framebuffer_id = p.framebuffer(static_cast<unsigned>(p.composited_slot), cpu_present_);
+        entries[i].in_fence_fd = p.composited_fence;
+        entries[i].user_tag = p.composited_frame;
+        // On a resume the plane passed its test before and is stated where the pointer is;
+        // at start it is stated off and joins the next commit once tested.
+        entries[i].cursor = p.cursor.valid() && (p.cursor_tested || !p.cursor.visible())
+                                ? &p.cursor
+                                : nullptr;
+        p.pending_flip_slot.store(static_cast<unsigned>(p.composited_slot), std::memory_order_release);
+        p.last_commit_content.store(true, std::memory_order_release);
+        publish_commit_timing(p, p.composited_fence);
+    }
+    lx::trace::scoped_span commit_span{"render", "kms.modeset"};
+    auto committed = drm::commit_modeset(kms, entries, ready, false);
+    bool fallback = false;
+    if (!committed && group[0]->kms->last_failure_rejected_state()) {
+        // The combined state was refused: each output on its own, so one output the driver
+        // cannot drive does not keep the others dark.
+        lx::trace::logger::global().log_error(committed.get_error(), "compositor.drm");
+        if (ready > 1)
+            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.drm",
+                                            "combined modeset refused — modesetting each output "
+                                            "on its own");
+        fallback = true;
+    }
+    for (unsigned i = 0; i < ready; ++i) {
+        output_pipeline& p = *group[i];
+        lx::result<void> r = committed;
+        if (fallback) {
+            drm::atomic_commit_request req{};
+            req.request_page_flip = true;
+            req.user_tag = p.composited_frame;
+            req.in_fence_fd = p.composited_fence;
+            req.framebuffer_id = entries[i].framebuffer_id;
+            req.cursor = entries[i].cursor;
+            r = p.kms->commit(req);
+        }
+        const bool lost = !r && (p.kms->last_failure_lost_master() ||
+                                 display_gate_.load(std::memory_order_acquire) != 0);
+        if (r) {
+            if (p.kms->completion_needs_dispatch())
+                post_flip_dispatch();
+            p.content_committed_once = true;
+            p.ever_lit.store(true, std::memory_order_release);
+            p.composited_slot = -1;
+            p.discard_fence();
+            p.kms_pending.clear();
+            p.frame_outstanding.store(false, std::memory_order_release);
+            p.modeset_wait_since_ns = 0;
+            note_committed_input(p, true);
+            // A content commit that is also the modeset (the frame rides it).
+            kinds[p.slot] = "content";
+            if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+                char line[128];
+                std::snprintf(line, sizeof(line), "modeset output=%u frame=%u outputs=%u%s",
+                              p.slot, p.composited_frame, fallback ? 1u : ready,
+                              fallback ? " (alone)" : "");
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.drm",
+                                                line);
+            }
+        } else {
+            kinds[p.slot] = lost ? "paused" : "failed";
+            retract_commit_timing(p);
+            if (!lost && !p.drm_commit_failing) {
+                p.drm_commit_failing = true;
+                lx::trace::logger::global().log_error(r.get_error(), "compositor.drm");
+            }
+        }
+        if (p.apply_ticket) {
+            // An output configuration waits for this modeset. Lost to a pause is not a
+            // refusal: the resume modesets the same state.
+            compositor_impl* self = this;
+            const unsigned slot = p.slot;
+            const unsigned ticket = p.apply_ticket;
+            const bool ok = static_cast<bool>(r) || lost;
+            p.apply_ticket = 0;
+            (void)runtime::executor::global().post(runtime::affinity::ui, [self, slot, ticket, ok] {
+                self->on_modeset_result(slot, ticket, ok);
+            });
+        }
+        if (p.resume_result_pending && !(display_gate_.load(std::memory_order_acquire) != 0)) {
+            p.resume_result_pending = false;
+            post_resume_result(p.slot, p.resume_done_gen,
+                               r ? session_resume_outcome::ok
+                               : !lost && p.kms->last_failure_rejected_state()
+                                   ? session_resume_outcome::rejected
+                                   : session_resume_outcome::device_unavailable);
+        }
+    }
+}
+
+} // namespace detail
 
 unsigned compositor::frame_index() const {
     return impl_ ? impl_->frame_index.load(std::memory_order_acquire) : 0;

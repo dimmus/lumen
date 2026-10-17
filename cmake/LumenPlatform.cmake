@@ -7,11 +7,17 @@ if(PkgConfig_FOUND)
     pkg_check_modules(WAYLAND QUIET wayland-server wayland-client)
     pkg_check_modules(WAYLAND_SCANNER QUIET wayland-scanner)
     pkg_check_modules(LIBDRM QUIET libdrm)
+    # libdisplay-info parses EDID into the make/model/serial a monitor is identified by
+    # (wlroots, Mutter, Weston use it); lx.drm has a base-block fallback without it.
+    pkg_check_modules(LIBDISPLAYINFO QUIET libdisplay-info)
     # libinput needs udev to enumerate a seat; xkbcommon turns keycodes into keysyms and
     # tracks modifier state. All three go together — a keyboard without xkb can report that
     # a key moved and nothing about what it means.
     pkg_check_modules(LIBINPUT QUIET libinput libudev)
     pkg_check_modules(XKBCOMMON QUIET xkbcommon)
+    # Display hotplug (lx.drm:uevent): a udev netlink monitor for drm change events. The
+    # same libudev libinput needs, checked on its own so hotplug does not depend on input.
+    pkg_check_modules(LIBUDEV QUIET libudev)
     # EGL + GLES + GBM back the hardware GL present path. All three are required
     # together: GBM allocates the scanout buffer, EGL binds it, GLES draws into it.
     pkg_check_modules(LIBEGL QUIET egl glesv2 gbm)
@@ -94,6 +100,18 @@ function(lumen_link_platform target)
         target_include_directories(${target} PRIVATE ${LIBDRM_INCLUDE_DIRS})
         target_link_libraries(${target} PRIVATE ${LIBDRM_LIBRARIES})
         target_compile_definitions(${target} PRIVATE LUMEN_HAS_DRM=1)
+    endif()
+
+    if(LIBDISPLAYINFO_FOUND)
+        target_include_directories(${target} PRIVATE ${LIBDISPLAYINFO_INCLUDE_DIRS})
+        target_link_libraries(${target} PRIVATE ${LIBDISPLAYINFO_LIBRARIES})
+        target_compile_definitions(${target} PRIVATE LUMEN_HAS_DISPLAY_INFO=1)
+    endif()
+
+    if(LIBUDEV_FOUND)
+        target_include_directories(${target} PRIVATE ${LIBUDEV_INCLUDE_DIRS})
+        target_link_libraries(${target} PRIVATE ${LIBUDEV_LIBRARIES})
+        target_compile_definitions(${target} PRIVATE LUMEN_HAS_UDEV=1)
     endif()
 
     if(LIBINPUT_FOUND AND XKBCOMMON_FOUND)

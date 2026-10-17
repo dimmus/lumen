@@ -8,6 +8,12 @@ module;
 // tree reports every change of a node's global rect through one hook, and each surface keeps
 // a mask of the output slots it overlaps. enter/leave go to every wl_output the surface's
 // client bound for that output; a wl_output bound late replays the enters it missed.
+//
+// One wl_output global per output (ADR 008 H4). A global is created once the output's state
+// is complete; when the output goes, membership is recomputed first (so `leave` goes out on
+// objects that still stand for it), then the global is removed — `global_remove` now,
+// `wl_global_destroy` 5 s later (wlroots' `wlr_global_destroy_safe`) — and its objects go
+// inert: a bind racing the removal gets an inert object too, and nothing is sent to them.
 
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
@@ -15,6 +21,7 @@ module;
 
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <cstdio>
 #include <new>
 
@@ -46,8 +53,9 @@ namespace {
 
 constexpr const char* k_category = "compositor.output";
 
-/// One bound wl_output. A slot of the output manager, by index (outputs never move slot
-/// while connected).
+/// One bound wl_output: the output it stands for, by slot and id (a slot is reused by a
+/// later output; the id never is). Records exist only for live objects of live outputs — an
+/// inert object (its output gone, or bound to a removed global) has none.
 ///
 /// Bound wl_output and zxdg_output_v1 objects are allocated per bind / get_xdg_output and
 /// freed with the object, in intrusive lists (wlroots keeps a resource list per output):
@@ -57,6 +65,7 @@ struct output_res {
     wl_resource* resource = nullptr;
     wl_client* client = nullptr;
     unsigned slot = 0;
+    lx::output_id id{};
     bool live = false;
     output_res* prev = nullptr;
     output_res* next = nullptr;
@@ -101,12 +110,23 @@ lx::compositor::output_manager* outputs() {
     return g_p0_ctx ? g_p0_ctx->outputs : nullptr;
 }
 
-/// The slot the (single, until D5) wl_output global stands for: the first live output.
-int global_slot() {
+/// One wl_output global per live output (by slot), and what its objects were last told.
+struct output_global {
+    wayland::global_handle handle{};
+    lx::output_id id{};
+    unsigned slot = 0;
+    bool live = false;
+    /// The state last sent to this output's objects (`outputs_changed` sends only changes).
+    lx::compositor::output_state sent{};
+};
+output_global g_globals[lx::compositor::output_manager::k_max]{};
+
+/// The state of the output a record stands for, or null when it is gone.
+const lx::compositor::output_state* state_of(const output_res* r) {
     auto* om = outputs();
-    if (!om || om->count() == 0)
-        return -1;
-    return om->slot_of(om->nth(0));
+    if (!r || !om || !om->slot_live(r->slot) || om->slot_state(r->slot).id != r->id)
+        return nullptr;
+    return &om->slot_state(r->slot);
 }
 
 /// wl_output.scale: the integer a client without fractional-scale renders at, the ceiling
@@ -122,9 +142,10 @@ void send_output_state(wl_resource* res, const lx::compositor::output_state& o,
                        bool with_identity) {
     const int version = wl_resource_get_version(res);
     // geometry's x, y are the position in the global (logical) space; mode is in pixels.
+    // make and model from EDID; without one (virtual outputs, VMs) Lumen and the connector.
     wl_output_send_geometry(res, o.position.x, o.position.y, o.phys_w_mm, o.phys_h_mm,
-                            WL_OUTPUT_SUBPIXEL_UNKNOWN, "Lumen", o.name,
-                            static_cast<int32_t>(o.transform));
+                            static_cast<int32_t>(o.subpixel), o.make[0] ? o.make : "Lumen",
+                            o.model[0] ? o.model : o.name, static_cast<int32_t>(o.transform));
     wl_output_send_mode(res, WL_OUTPUT_MODE_CURRENT | WL_OUTPUT_MODE_PREFERRED,
                         o.mode.width, o.mode.height,
                         static_cast<int32_t>(o.refresh_mhz));
@@ -270,7 +291,7 @@ output_res* output_from(wl_resource* r) {
 void output_destroy_resource(wl_resource* r) {
     output_res* o = output_from(r);
     if (!o)
-        return;
+        return; // inert: no record
     for (xdg_output_res* x = xdg_output_resources; x; x = x->next)
         if (x->output == o)
             x->output = nullptr;
@@ -320,10 +341,10 @@ const struct zxdg_output_manager_v1_interface xdg_output_manager_impl = {
             wl_resource_set_implementation(res, &xdg_output_impl, x,
                                            xdg_output_destroy_resource);
             // An output that is gone (its wl_output inert) gets an inert xdg_output.
-            auto* om = outputs();
-            if (!x->output || !om || !om->slot_live(x->output->slot))
+            const lx::compositor::output_state* st = state_of(x->output);
+            if (!st)
                 return;
-            const auto& o = om->slot_state(x->output->slot);
+            const auto& o = *st;
             send_xdg_output_state(res, o, true);
             // Version 3: the atomic group closes with wl_output.done (wlroots' order).
             if (version >= 3)
@@ -367,10 +388,24 @@ std::uint32_t expected_scale_120(const surface_obj* s) {
         if (p && p->outputs)
             return lx::compositor::preferred_scale_120(*om, p->outputs);
     }
-    // Toplevels and layer surfaces map on output 0, the only output until D5; popups on
-    // their parent's, which is output 0 as well.
-    const int slot = global_slot();
-    return slot >= 0 ? lx::compositor::preferred_scale_120(*om, 1u << slot) : 120u;
+    // Not on an output yet: the output it will map on — a toplevel's placement output (its
+    // parent's, else the one under the pointer), a layer surface's own output, anything else
+    // the output under the pointer (ADR 008 §A.11).
+    int slot = -1;
+    if (s && g_p0_ctx) {
+        if (g_p0_ctx->toplevels && g_p0_ctx->wm) {
+            if (const auto* rec = g_p0_ctx->toplevels->find_by_surface(s->id))
+                slot = g_p0_ctx->wm->window_output(*rec);
+        }
+        if (slot < 0 && g_p0_ctx->layers)
+            slot = g_p0_ctx->layers->output_of(s->id);
+    }
+    if (slot < 0 && g_p0_ctx && g_p0_ctx->seat)
+        slot = lx::compositor::output_at(*om, g_p0_ctx->seat->pointer_x(), g_p0_ctx->seat->pointer_y());
+    if (slot < 0 && om->count() > 0)
+        slot = om->slot_of(om->nth(0));
+    return slot >= 0 ? lx::compositor::preferred_scale_120(*om, 1u << static_cast<unsigned>(slot))
+                     : 120u;
 }
 
 void for_each_output_resource(wl_client* client, unsigned slot, void (*fn)(wl_resource*, void*),
@@ -382,18 +417,13 @@ void for_each_output_resource(wl_client* client, unsigned slot, void (*fn)(wl_re
 
 int output_resource_slot(wl_resource* output) {
     const output_res* o = output_from(output);
-    auto* om = outputs();
-    return o && om && om->slot_live(o->slot) ? static_cast<int>(o->slot) : -1;
+    return state_of(o) ? static_cast<int>(o->slot) : -1;
 }
 
-void install_outputs(p0_protocol_context& ctx) {
-    if (ctx.tree)
-        ctx.tree->set_rect_hook(&output_node_rect, &ctx);
-    if (ctx.cursor)
-        ctx.cursor->set_surface_hook(&cursor_surface_changed, &ctx);
-}
-
-void bind_output(wayland::client_connection& client, unsigned id, int version) {
+/// A wl_output global's bind. `user` is its `output_global`, null when the global was
+/// removed (or its output is gone): the object is then inert — implementation set, no
+/// record, no events; `release` works (wlroots' `output_bind` on a destroyed output).
+void bind_output_ex(wayland::client_connection& client, unsigned id, int version, void* user) {
     if (!g_p0_ctx)
         return;
     auto res = wayland::resource::create(client, &wl_output_interface, version, id);
@@ -403,20 +433,23 @@ void bind_output(wayland::client_connection& client, unsigned id, int version) {
     if (!native)
         return;
     auto* om = outputs();
-    const int slot = global_slot();
-    // Never without an output: the output manager falls back to HEADLESS-1 in the same
-    // refresh that removes the last connector, and the socket opens after the first one.
-    output_res* o = om && slot >= 0 ? new (std::nothrow) output_res{} : nullptr;
+    const auto* g = static_cast<const output_global*>(user);
+    const bool live = g && g->live && om && om->slot_live(g->slot) &&
+                      om->slot_state(g->slot).id == g->id;
+    output_res* o = live ? new (std::nothrow) output_res{} : nullptr;
     if (!o) {
         wl_resource_set_implementation(native, &output_impl, nullptr, nullptr);
-        if (om && slot >= 0)
+        if (live)
             wl_client_post_no_memory(wl_resource_get_client(native));
+        else if (surface_debug())
+            out_log("output bind inert (the output is gone)");
         return;
     }
     o->live = true;
     o->resource = native;
     o->client = wl_resource_get_client(native);
-    o->slot = static_cast<unsigned>(slot);
+    o->slot = g->slot;
+    o->id = g->id;
     list_push(output_resources, o);
     wl_resource_set_implementation(native, &output_impl, o, output_destroy_resource);
 
@@ -457,6 +490,83 @@ void bind_xdg_output_manager(wayland::client_connection& client, unsigned id, in
 
 namespace {
 
+[[nodiscard]] unsigned long long monotonic_now_ns() {
+    timespec ts{};
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<unsigned long long>(ts.tv_sec) * 1'000'000'000ull +
+           static_cast<unsigned long long>(ts.tv_nsec);
+}
+
+/// The objects of output `slot` go inert: their records go (nothing more is sent to them),
+/// their xdg_outputs with them. The client learns from `global_remove`.
+void make_inert(unsigned slot, lx::output_id id) {
+    for (output_res* r = output_resources; r;) {
+        output_res* next = r->next;
+        if (r->slot == slot && r->id == id) {
+            for (xdg_output_res* x = xdg_output_resources; x; x = x->next)
+                if (x->output == r)
+                    x->output = nullptr;
+            wl_resource_set_user_data(r->resource, nullptr);
+            list_unlink(output_resources, r);
+            delete r;
+        }
+        r = next;
+    }
+}
+
+/// Globals follow the outputs: one per live output, created once its state is complete;
+/// a gone output's global is removed (destroyed 5 s later) and its objects go inert.
+/// Returns true when a global came or went.
+bool sync_globals() {
+    auto* om = outputs();
+    if (!om || !g_p0_ctx || !g_p0_ctx->server)
+        return false;
+    bool changed = false;
+    const unsigned long long now = monotonic_now_ns();
+    for (unsigned slot = 0; slot < lx::compositor::output_manager::k_max; ++slot) {
+        output_global& g = g_globals[slot];
+        const bool live = om->slot_live(slot);
+        if (g.live && (!live || om->slot_state(slot).id != g.id)) {
+            g_p0_ctx->server->remove_global(g.handle, now);
+            make_inert(slot, g.id);
+            if (surface_debug()) {
+                char line[96];
+                std::snprintf(line, sizeof(line), "output global remove output=%u", slot);
+                out_log(line);
+            }
+            g = {};
+            changed = true;
+        }
+        if (live && !g.live) {
+            g.slot = slot;
+            g.id = om->slot_state(slot).id;
+            g.sent = om->slot_state(slot);
+            g.live = true;
+            g.handle = g_p0_ctx->server->add_global_ex({.interface_name = "wl_output",
+                                                        .version = 4,
+                                                        .privileged = false,
+                                                        .interface_desc = &wl_output_interface},
+                                                       &bind_output_ex, &g);
+            if (surface_debug()) {
+                char line[128];
+                std::snprintf(line, sizeof(line), "output global add output=%u name=%s", slot,
+                              om->slot_state(slot).name);
+                out_log(line);
+            }
+            changed = true;
+        }
+    }
+    return changed;
+}
+
+[[nodiscard]] bool same_wire_state(const lx::compositor::output_state& a,
+                                   const lx::compositor::output_state& b) {
+    return a.position.x == b.position.x && a.position.y == b.position.y &&
+           a.mode.width == b.mode.width && a.mode.height == b.mode.height &&
+           a.refresh_mhz == b.refresh_mhz && a.scale == b.scale && a.transform == b.transform &&
+           a.phys_w_mm == b.phys_w_mm && a.phys_h_mm == b.phys_h_mm && a.subpixel == b.subpixel;
+}
+
 void outputs_changed() {
     auto* om = outputs();
     if (!om || !g_p0_ctx)
@@ -469,47 +579,48 @@ void outputs_changed() {
             continue;
         membership_from_rect(&s, g_p0_ctx->tree->node_rect(s.id));
     }
-    // 2. Every wl_output (and its xdg_outputs) gets the new state, then done. One whose
-    //    output went follows the global to the output now behind it (a single wl_output
-    //    global until D5), and the surfaces already there get enter on it.
-    const int primary = global_slot();
-    for (output_res* r = output_resources; r; r = r->next) {
-        if (client_dying(r->client))
+    // 2. Globals: a gone output's removed (its objects inert), a new output's created.
+    (void)sync_globals();
+    // 3. Every object of an output whose state changed (and its xdg_outputs) gets the new
+    //    state, then done. name never changes for an object (v4), and description is not
+    //    re-sent either.
+    for (output_global& g : g_globals) {
+        if (!g.live || !om->slot_live(g.slot))
             continue;
-        bool moved = false;
-        if (!om->slot_live(r->slot)) {
-            if (primary < 0)
+        const auto& st = om->slot_state(g.slot);
+        if (same_wire_state(g.sent, st))
+            continue;
+        g.sent = st;
+        for (output_res* r = output_resources; r; r = r->next) {
+            if (r->slot != g.slot || r->id != g.id || client_dying(r->client))
                 continue;
-            r->slot = static_cast<unsigned>(primary);
-            moved = true;
-        }
-        const auto& st = om->slot_state(r->slot);
-        // name never changes for an object (v4); description is not re-sent either, as it
-        // is derived from the name.
-        send_output_state(r->resource, st, false);
+            send_output_state(r->resource, st, false);
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
-        for (xdg_output_res* x = xdg_output_resources; x; x = x->next)
-            if (x->output == r)
-                send_xdg_output_state(x->resource, st, false);
+            for (xdg_output_res* x = xdg_output_resources; x; x = x->next)
+                if (x->output == r)
+                    send_xdg_output_state(x->resource, st, false);
 #endif
-        send_output_done(r->resource);
-        if (!moved)
-            continue;
-        const std::uint32_t bit = 1u << r->slot;
-        for (auto& s : surfaces)
-            if (s.used && s.resource && !s.destroying && (s.outputs & bit) &&
-                wl_resource_get_client(s.resource) == r->client)
-                wl_surface_send_enter(s.resource, r->resource);
+            send_output_done(r->resource);
+        }
     }
-    // 3. Power controls of a wl_output that no longer stands for an output are `failed`.
+    // 4. Power controls of a wl_output that no longer stands for an output are `failed`.
     output_power_outputs_changed();
-    // 4. Lock surfaces follow their output's size and origin (a new configure).
+    // 5. Lock surfaces follow their output's size and origin (a new configure).
     session_lock_outputs_changed();
-    // 5. Input-method popups are placed within the new output bounds.
+    // 6. Input-method popups are placed within the new output bounds.
     text_input_outputs_changed();
 }
 
 } // namespace
+
+void install_outputs(p0_protocol_context& ctx) {
+    if (ctx.tree)
+        ctx.tree->set_rect_hook(&output_node_rect, &ctx);
+    if (ctx.cursor)
+        ctx.cursor->set_surface_hook(&cursor_surface_changed, &ctx);
+    // The outputs known at start: one wl_output global each.
+    (void)sync_globals();
+}
 
 } // namespace lx::compositor::p0
 

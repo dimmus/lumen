@@ -130,18 +130,14 @@ LUMEN_TEST(outputs_keep_their_slot) {
 LUMEN_TEST(headless_output_without_connectors) {
     output_manager m;
     lx::drm::kms_device none; // never opened: no connectors
-    m.refresh_from_drm(none);
+    m.configure_from_scan(none.last_scan());
     LUMEN_CHECK(m.count() == 1);
     const auto o = m.state(m.nth(0));
     LUMEN_CHECK(o.virtual_output);
     LUMEN_CHECK(o.mode.width == 1920 && o.mode.height == 1080);
     LUMEN_CHECK(o.refresh_mhz == 60000);
     LUMEN_CHECK(o.name[0] == 'H' && std::strcmp(o.name, "HEADLESS-1") == 0);
-    // The hotplug poll refreshes every tick: nothing changed, nothing to tell clients.
-    const unsigned g = m.generation();
-    m.refresh_from_drm(none);
-    m.refresh_from_drm(none);
-    LUMEN_CHECK(m.generation() == g);
+    LUMEN_CHECK(std::strcmp(o.identifier, "connector:HEADLESS-1") == 0);
     LUMEN_CHECK(m.count() == 1 && m.slot_of(m.nth(0)) == 0);
 }
 

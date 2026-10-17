@@ -287,18 +287,19 @@ lx::compositor::idle_sink lx::compositor::idle_events(p0_protocol_context& ctx) 
 #endif
 }
 
-bool lx::compositor::idle_inhibitor_visible(p0_protocol_context& ctx, unsigned frame) {
+bool lx::compositor::idle_inhibitor_visible(p0_protocol_context& ctx) {
 #if defined(LUMEN_HAS_WAYLAND)
     if (!ctx.inhibitors || ctx.inhibitors->count() == 0)
         return false;
+    // On screen on a lit output (a blanked monitor's windows inhibit nothing).
     return ctx.inhibitors->any(
         [](void* user, lx::surface_id surface) {
-            return p0::surface_visible(surface, *static_cast<const unsigned*>(user));
+            const auto* c = static_cast<const p0_protocol_context*>(user);
+            return (p0::surface_shown_mask(surface) & c->lit_mask) != 0;
         },
-        &frame);
+        &ctx);
 #else
     (void)ctx;
-    (void)frame;
     return false;
 #endif
 }

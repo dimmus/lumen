@@ -19,6 +19,10 @@ export import :xcursor;
 export import :cursor;
 export import :input_router;
 export import :output;
+export import :output_policy;
+export import :output_management;
+export import :toml_lite;
+export import :output_config_store;
 export import :buffer_lifecycle;
 export import :protocol_managers;
 export import :hotplug;
@@ -82,8 +86,17 @@ struct config {
     /// Output scale (`--scale`), for every output: 1.25 shows a 1366x768 mode as a
     /// 1093x614 logical desktop. Rounded to the nearest n/120 — the unit
     /// wp_fractional_scale_v1 speaks — and logged. Fractional-scale clients render at
-    /// exactly this; others at the integer ceiling, downscaled.
-    double output_scale = 1.0;
+    /// exactly this; others at the integer ceiling, downscaled. 0 (the default): sway's
+    /// HiDPI rule per monitor (2 on a dense panel of 1200 rows or more, else 1).
+    double output_scale = 0.0;
+    /// Per-connector scales over `output_scale` (`--output-scale NAME=S`, repeatable):
+    /// "NAME=S[,NAME=S...]".
+    const char* output_scales = nullptr;
+    /// Virtual outputs instead of the KMS display (`--virtual-outputs`, headless and
+    /// multi-output protocol tests; no card is opened when set): "WxH[@S][,WxH[@S]...]",
+    /// laid out left to right, each with its own frame clock. Null: the display's
+    /// connectors, or one HEADLESS-1 without a display.
+    const char* virtual_outputs = nullptr;
     /// Row-band threads for the CPU composite path, in addition to the render thread.
     ///
     /// Defaults to 0 on measurement, not principle: the fullscreen opaque case is a row
@@ -155,9 +168,7 @@ public:
     /// Seat event delivery: focus, forwarded keys, the per-client input serials.
     [[nodiscard]] input_router& input();
     [[nodiscard]] scheduler::frame_scheduler& scheduler();
-    [[nodiscard]] scheduler::presentation_tracker& presentation();
     [[nodiscard]] scheduler::budget_tracker& budget();
-    [[nodiscard]] drm::kms_atomic_commit& kms_atomic();
     [[nodiscard]] buffer_lifecycle_tracker& buffer_lifecycle();
     [[nodiscard]] runtime::memory_budget_coordinator& memory();
     [[nodiscard]] runtime::executor& executor();
@@ -175,6 +186,18 @@ public:
     /// logind's Session.Unlock, as the signal delivers it (`loginctl unlock-session`): for
     /// headless tests. UI affinity.
     void inject_logind_unlock();
+    /// A connector probe, as the hotplug monitor's would deliver it (ADR 008 §D.2): the
+    /// diff, the policy, the output plans, the wl_output lifecycle and window migration run
+    /// exactly as for a uevent. Without a KMS display the outputs it adds are virtual
+    /// (composite-only), so headless tests reach every hotplug path. UI affinity.
+    void simulate_connector_scan(const lx::drm::connector_scan& scan);
+    /// Runs the work other threads posted to the UI thread (the event loop does this between
+    /// dispatches; a test that drives `tick_ui` itself calls it). UI affinity.
+    void run_posted_ui_tasks();
+    /// The persisted output configuration as the compositor holds it (ADR 008 §C.5), and a
+    /// save written now instead of after its 2 s debounce (tests). UI affinity.
+    [[nodiscard]] const output_config& persisted_outputs() const;
+    void save_output_config_now();
     /// The session lock's state (ext-session-lock-v1).
     [[nodiscard]] lock_state session_lock_state() const;
 

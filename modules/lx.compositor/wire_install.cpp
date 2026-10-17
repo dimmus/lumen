@@ -60,6 +60,10 @@ module;
 #include "wlr-output-power-management-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_OUTPUT_POWER 1
 #endif
+#if __has_include("wlr-output-management-unstable-v1-server-protocol.h")
+#include "wlr-output-management-unstable-v1-server-protocol.h"
+#define LUMEN_HAS_OUTPUT_MANAGEMENT 1
+#endif
 #if __has_include("ext-session-lock-v1-server-protocol.h")
 #include "ext-session-lock-v1-server-protocol.h"
 #define LUMEN_HAS_SESSION_LOCK 1
@@ -110,6 +114,8 @@ void install_core(p0_protocol_context& ctx) {
             ctx.cursor->set_texture_ops(ops);
         if (ctx.decorations)
             ctx.decorations->set_texture_ops(ops);
+        if (ctx.wm)
+            ctx.wm->set_texture_ops(ops); // the fullscreen backdrop
     }
     ctx.server->add_global({.interface_name = "wl_compositor",
                             .version = 6,
@@ -126,12 +132,9 @@ void install_core(p0_protocol_context& ctx) {
                             .privileged = false,
                             .interface_desc = &wl_seat_interface},
                            &bind_seat);
-    ctx.server->add_global({.interface_name = "wl_output",
-                            .version = 4,
-                            .privileged = false,
-                            .interface_desc = &wl_output_interface},
-                           &bind_output);
-    // Output membership: every node rect change and the cursor surface feed enter/leave.
+    // Output membership: every node rect change and the cursor surface feed enter/leave;
+    // and one wl_output global per output (created here for the outputs known at start,
+    // then with the outputs).
     install_outputs(ctx);
     // Selections: per-client input serials and keyboard focus decide who may set one and
     // who is offered it; client teardown drops what is keyed by its wl_client*.
@@ -218,6 +221,7 @@ void install_core(p0_protocol_context& ctx) {
         ctx.server->add_global({.interface_name = "zwlr_layer_shell_v1",
                                 .version = 5,
                                 .privileged = false,
+                                .deny_sandboxed = true,
                                 .interface_desc = &zwlr_layer_shell_v1_interface},
                                &bind_layer_shell);
 
@@ -289,6 +293,7 @@ void install_core(p0_protocol_context& ctx) {
         ctx.server->add_global({.interface_name = "ext_idle_notifier_v1",
                                 .version = 2,
                                 .privileged = false,
+                                .deny_sandboxed = true,
                                 .interface_desc = &ext_idle_notifier_v1_interface},
                                &bind_idle_notifier);
 #endif
@@ -307,8 +312,21 @@ void install_core(p0_protocol_context& ctx) {
     ctx.server->add_global({.interface_name = "zwlr_output_power_manager_v1",
                             .version = 1,
                             .privileged = false,
+                            .deny_sandboxed = true,
                             .interface_desc = &zwlr_output_power_manager_v1_interface},
                            &bind_output_power_manager);
+#endif
+#if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
+    // zwlr_output_manager_v1 v4 (ADR 008 C1, C5): heads, modes, test and apply with a real
+    // TEST_ONLY. Open to every same-UID client that is not sandboxed, as in sway and niri —
+    // wlr-randr and kanshi run from a terminal or a user service, not as the shell.
+    if (ctx.output_mgmt_kick)
+        ctx.server->add_global({.interface_name = "zwlr_output_manager_v1",
+                                .version = 4,
+                                .privileged = false,
+                                .deny_sandboxed = true,
+                                .interface_desc = &zwlr_output_manager_v1_interface},
+                               &bind_output_manager);
 #endif
 #if defined(LUMEN_HAS_SESSION_LOCK)
     // ext_session_lock_manager_v1: lock surfaces per output; `locked` only once a locked frame
@@ -317,6 +335,7 @@ void install_core(p0_protocol_context& ctx) {
         ctx.server->add_global({.interface_name = "ext_session_lock_manager_v1",
                                 .version = 1,
                                 .privileged = false,
+                                .deny_sandboxed = true,
                                 .interface_desc = &ext_session_lock_manager_v1_interface},
                                &bind_session_lock_manager);
 #endif
@@ -337,6 +356,7 @@ void install_core(p0_protocol_context& ctx) {
         ctx.server->add_global({.interface_name = "zwp_input_method_manager_v2",
                                 .version = 1,
                                 .privileged = false,
+                                .deny_sandboxed = true,
                                 .interface_desc = &zwp_input_method_manager_v2_interface},
                                &bind_input_method_manager);
 #endif
@@ -345,6 +365,7 @@ void install_core(p0_protocol_context& ctx) {
         ctx.server->add_global({.interface_name = "zwp_virtual_keyboard_manager_v1",
                                 .version = 1,
                                 .privileged = false,
+                                .deny_sandboxed = true,
                                 .interface_desc = &zwp_virtual_keyboard_manager_v1_interface},
                                &bind_virtual_keyboard_manager);
 #endif
@@ -375,7 +396,7 @@ lx::result<void> lx::compositor::install_p0_protocols(p0_protocol_context& ctx) 
 void lx::compositor::fire_frame_callbacks(p0_protocol_context& ctx, unsigned frame_time_ms) {
 #if defined(LUMEN_HAS_WAYLAND)
     (void)ctx;
-    p0::fire_frames(frame_time_ms, false, 0, 0);
+    p0::fire_frames(frame_time_ms, false, p0::k_any_output, 0);
 #else
     (void)ctx;
     (void)frame_time_ms;
@@ -383,15 +404,28 @@ void lx::compositor::fire_frame_callbacks(p0_protocol_context& ctx, unsigned fra
 }
 
 void lx::compositor::fire_visible_frame_callbacks(p0_protocol_context& ctx,
-                                                  unsigned frame_time_ms, unsigned visible_frame,
+                                                  unsigned frame_time_ms,
                                                   unsigned long long now_ns) {
 #if defined(LUMEN_HAS_WAYLAND)
     (void)ctx;
-    p0::fire_frames(frame_time_ms, true, visible_frame, now_ns);
+    p0::fire_frames(frame_time_ms, true, p0::k_any_output, now_ns);
 #else
     (void)ctx;
     (void)frame_time_ms;
-    (void)visible_frame;
+    (void)now_ns;
+#endif
+}
+
+void lx::compositor::fire_output_frame_callbacks(p0_protocol_context& ctx, unsigned slot,
+                                                 unsigned frame_time_ms,
+                                                 unsigned long long now_ns) {
+#if defined(LUMEN_HAS_WAYLAND)
+    (void)ctx;
+    p0::fire_frames(frame_time_ms, true, slot, now_ns);
+#else
+    (void)ctx;
+    (void)slot;
+    (void)frame_time_ms;
     (void)now_ns;
 #endif
 }
@@ -411,6 +445,15 @@ bool lx::compositor::frame_callbacks_pending(const p0_protocol_context& ctx) {
     return p0::frames_pending();
 #else
     return false;
+#endif
+}
+
+std::uint32_t lx::compositor::frame_callbacks_pending_outputs(const p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    return p0::frames_pending_outputs();
+#else
+    return 0;
 #endif
 }
 

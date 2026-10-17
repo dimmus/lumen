@@ -317,6 +317,50 @@ LUMEN_TEST(arming_the_logout_button_damages_only_the_button) {
     LUMEN_CHECK(lx::shell::panel_diff(c, a, r, 8) == 1 && r[0].width == 1000);
 }
 
+LUMEN_TEST(task_output_is_the_output_with_most_of_the_window) {
+    const lx::rect2i outs[2] = {{0, 0, 1000, 800}, {1000, 0, 800, 600}};
+    LUMEN_CHECK(lx::shell::task_output({100, 100, 300, 200}, outs, 2) == 0);
+    LUMEN_CHECK(lx::shell::task_output({1100, 100, 300, 200}, outs, 2) == 1);
+    // Straddling: the larger share wins (700 px on the right, 100 on the left).
+    LUMEN_CHECK(lx::shell::task_output({900, 100, 800, 200}, outs, 2) == 1);
+    // On no output (moved off, or minimized to nowhere): none.
+    LUMEN_CHECK(lx::shell::task_output({5000, 5000, 10, 10}, outs, 2) == -1);
+    LUMEN_CHECK(lx::shell::task_output({0, 0, 10, 10}, nullptr, 0) == -1);
+}
+
+namespace {
+struct on_output {
+    lx::rect2i outs[2];
+    int mine;
+};
+bool keep_on_output(const lx::shell::task_entry& e, void* user) {
+    const auto* o = static_cast<const on_output*>(user);
+    return lx::shell::task_output(e.geometry, o->outs, 2) == o->mine;
+}
+} // namespace
+
+LUMEN_TEST(panel_filter_lists_only_its_outputs_windows) {
+    static task_model m;
+    m.clear();
+    m.begin_snapshot();
+    (void)m.snapshot_add(proxy(0), "app", "left", 0, {10, 10, 100, 100}, 0);
+    (void)m.snapshot_add(proxy(1), "app", "right", 0, {1200, 10, 100, 100}, 1);
+    (void)m.snapshot_add(proxy(2), "app", "left2", 0, {300, 300, 100, 100}, 2);
+    m.end_snapshot();
+    (void)m.take_changes();
+    on_output left{{{0, 0, 1000, 800}, {1000, 0, 800, 600}}, 0};
+    on_output right{{{0, 0, 1000, 800}, {1000, 0, 800, 600}}, 1};
+    static lx::shell::panel_layout a, b;
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, a, {}, {}, {}, {&keep_on_output, &left});
+    lx::shell::layout_panel(m, 800, 32, -1, -1, {}, b, {}, {}, {}, {&keep_on_output, &right});
+    LUMEN_CHECK(a.count == 2 && b.count == 1);
+    LUMEN_CHECK(std::strcmp(m.get(b.cells[0].task)->title, "right") == 0);
+    // No filter: every window.
+    static lx::shell::panel_layout c;
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, c);
+    LUMEN_CHECK(c.count == 3);
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

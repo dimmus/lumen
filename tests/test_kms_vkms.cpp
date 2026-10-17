@@ -86,7 +86,7 @@ int main() {
         std::fprintf(stderr, "FAIL: vkms reported 0 connectors\n");
         return 1;
     }
-    auto mode = dev.active_mode(0);
+    auto mode = dev.preferred_mode(0);
     if (!mode) {
         std::fprintf(stderr, "FAIL: vkms has no active mode\n");
         return 1;
@@ -113,7 +113,14 @@ int main() {
         return 1;
     }
 
-    lx::drm::kms_atomic_commit atomic{dev};
+    auto desc = dev.pipeline_desc_for(0);
+    if (!desc) {
+        std::fprintf(stderr, "FAIL: no CRTC pipeline for connector 0\n");
+        return 1;
+    }
+    lx::drm::kms_pipeline atomic{dev, desc.value()};
+    if (const auto* pm = dev.last_scan().entries[0].preferred_mode())
+        atomic.set_mode(*pm);
     atomic.set_framebuffer(fb_id);
     bool flipped = false;
     atomic.set_page_flip_handler(
@@ -123,7 +130,6 @@ int main() {
         &flipped);
 
     lx::drm::atomic_commit_request req{};
-    req.connector = 0;
     req.framebuffer_id = fb_id;
     req.request_page_flip = true;
     auto committed = atomic.commit(req);
@@ -132,7 +138,7 @@ int main() {
     }
 
     for (int i = 0; i < 50 && !flipped; ++i) {
-        atomic.dispatch_events();
+        dev.dispatch_events();
         usleep(10000);
     }
 

@@ -437,7 +437,9 @@ LUMEN_TEST(occlusion_commit_frame_marks_surface_visibility) {
     LUMEN_CHECK(scene.root().add(&below) && scene.root().add(&above) && scene.root().add(&away));
     LUMEN_CHECK(scene.commit_frame(5));
     LUMEN_CHECK(above.visible_in(5) && !below.visible_in(5) && !away.visible_in(5));
-    LUMEN_CHECK(scene.last_culled() == 2);
+    // The covered draw is marked; the one off the output is not even emitted (a view's
+    // draw list holds only what can reach its pixels).
+    LUMEN_CHECK(scene.last_culled() == 1);
     // The top one moves aside: the one below is on screen in the next frame.
     above.set_transform({300, 20});
     LUMEN_CHECK(scene.commit_frame(6));
@@ -447,7 +449,7 @@ LUMEN_TEST(occlusion_commit_frame_marks_surface_visibility) {
     unsigned occluded = 0;
     for (unsigned i = 0; i < snap.draws().size(); ++i)
         occluded += snap.draws().data()[i].occluded ? 1u : 0u;
-    LUMEN_CHECK(snap.frame_index() == 6 && occluded == 1);
+    LUMEN_CHECK(snap.frame_index() == 6 && occluded == 0 && snap.draws().size() == 2);
     scene.release_render_frame(snap);
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     (void)scene.root().remove(&below);

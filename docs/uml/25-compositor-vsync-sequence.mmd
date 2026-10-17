@@ -1,18 +1,22 @@
 sequenceDiagram
-    participant Timer as vsync timer (UI thread)
+    participant Timer as shared vsync timer (UI thread)
+    participant FC as frame_clocks (one per output)
     participant UI as tick_ui
-    participant SB as snapshot_buffer
+    participant SB as snapshot_buffer[slot] (one per output view)
     participant CV as render_cv
     participant RT as render thread
     participant TR as tick_render
+    participant KMS as kms_pipeline[slot] (one per CRTC)
 
-    loop each vsync interval
+    loop each wakeup (earliest start among running clocks)
         Timer->>UI: on_vsync()
+        UI->>FC: take_due(now): outputs due within 1 ms
         UI->>UI: wayland.dispatch + scene.update
-        UI->>SB: commit_frame(index)
-        UI->>CV: notify render_pending
+        UI->>SB: commit_frame(slot, frame) for each due output with damage
+        UI->>CV: render_mask |= published; notify render_pending
         CV->>RT: wake
         RT->>TR: tick_render()
-        TR->>SB: acquire_render_snapshot()
-        TR->>TR: Vulkan record (P1)
+        TR->>SB: acquire_render_snapshot(slot) for each bit of render_mask
+        TR->>KMS: composite + nonblocking commit per output<br/>(first frames: one combined commit_modeset)
+        KMS-->>UI: flip event (routed by CRTC): clocks.on_present(slot),<br/>feedback and frame callbacks of that output
     end

@@ -93,6 +93,13 @@
 //   wl_output name=<n> mode=<w>x<h> refresh=<mHz> scale=<s> done=<k>
 //   xdg_output position=<x>,<y> size=<w>x<h> name=<n> description=<d>
 //   surface enter surface=<toplevel|popup<k>> output=<n>   surface leave …   toplevel unmapped
+//   wl_output added global=<g>          wl_output removed name=<n>
+//
+// Every wl_output is bound (one line group each, `done` counted per output), and outputs
+// advertised later are bound as they come; enter/leave name the output they refer to.
+// --output NAME makes layer, power and lock act on that output (and --fullscreen ask for it:
+// `toplevel fullscreen=<0|1> w=<w> h=<h>` per configure; --unset-fullscreen-after S leaves
+// it); lock --all-outputs makes one lock surface per output.
 //
 // Liveness, in any mode with a toplevel: --ignore-ping-for S leaves xdg_wm_base.ping
 // unanswered for S seconds after the first configure, then answers the newest one held
@@ -392,6 +399,13 @@ struct options {
     int frames = 300;
     int burst = 1;
     bool maximize = false;
+    // Multi-output: --output NAME picks the wl_output for layer / power / lock / fullscreen;
+    // --all-outputs gives lock mode one surface per output; --fullscreen asks for it
+    // (on --output when given) and --unset-fullscreen-after S leaves it again.
+    const char* output_name = nullptr;
+    bool all_outputs = false;
+    bool fullscreen = false;
+    double unfullscreen_after = 0.0;
     // idle / inhibit / power modes
     bool idle_mode = false;
     unsigned idle_timeout_ms = 3000;
@@ -437,6 +451,30 @@ struct surface_state {
     int index = -1; // -1: the toplevel
     bool done = false;
     bool configured = false;
+};
+
+/// One wl_output global and what it last said.
+inline constexpr unsigned k_max_outputs = 8;
+struct probe_output {
+    uint32_t global = 0;
+    uint32_t version = 0;
+    wl_output* out = nullptr;
+#if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
+    zxdg_output_v1* xo = nullptr;
+#endif
+    bool gone = false;
+    char name[64]{};
+    int w = 0, h = 0, refresh = 0, scale = 0;
+    unsigned dones = 0;
+    int xo_x = 0, xo_y = 0, xo_w = 0, xo_h = 0;
+    char xo_name[64]{};
+    char xo_description[128]{};
+    bool xo_seen = false;
+    /// Lock mode with --all-outputs: this output's lock surface.
+    surface_state lock_surf{};
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+    ext_session_lock_surface_v1* lock_surface = nullptr;
+#endif
 };
 
 struct app {
@@ -493,19 +531,17 @@ struct app {
     wl_registry* registry = nullptr;
     uint32_t output_global = 0;
     uint32_t output_version = 0;
+    /// The output the probe acts on (layer, power, lock, fullscreen): --output NAME, else
+    /// the first one advertised.
     wl_output* output = nullptr;
     double bind_output_at = 0.0;
-    char output_name[64]{};
-    int output_w = 0, output_h = 0, output_refresh = 0, output_scale = 0;
-    unsigned output_dones = 0;
+    double unfullscreen_at = 0.0;
+    /// Every wl_output global advertised, in order (outputs come and go: hotplug).
+    probe_output outs[k_max_outputs]{};
+    unsigned out_count = 0;
 #if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
     zxdg_output_manager_v1* xom = nullptr;
-    zxdg_output_v1* xdg_output = nullptr;
 #endif
-    int xo_x = 0, xo_y = 0, xo_w = 0, xo_h = 0;
-    char xo_name[64]{};
-    char xo_description[128]{};
-    bool xo_seen = false;
     // liveness
     double ignore_until = 0.0;
     uint32_t deferred_ping = 0;
@@ -603,6 +639,9 @@ surface_state* find(wl_surface* surface) {
         return &g.second;
     if (g.lock_surf.surface && g.lock_surf.surface == surface)
         return &g.lock_surf;
+    for (unsigned i = 0; i < g.out_count; ++i)
+        if (g.outs[i].lock_surf.surface && g.outs[i].lock_surf.surface == surface)
+            return &g.outs[i].lock_surf;
     for (int i = 0; i < g.popup_count; ++i)
         if (g.popups[i].surface == surface)
             return &g.popups[i];
@@ -1101,14 +1140,27 @@ void on_lock_finished(void*, ext_session_lock_v1*) {
 }
 const ext_session_lock_v1_listener lock_listener = {on_lock_locked, on_lock_finished};
 
-void on_lock_configure(void*, ext_session_lock_surface_v1* ls, uint32_t serial, uint32_t w,
+void on_lock_configure(void* data, ext_session_lock_surface_v1* ls, uint32_t serial, uint32_t w,
                        uint32_t h) {
+    auto* s = data ? static_cast<surface_state*>(data) : &g.lock_surf;
     std::printf("lock configure %ux%u serial=%u at=%.3f\n", w, h, serial, now_s());
     ext_session_lock_surface_v1_ack_configure(ls, serial);
     const int bw = static_cast<int>(w) - (g.opt.wrong_size ? 10 : 0);
-    draw(g.lock_surf, bw, static_cast<int>(h));
+    draw(*s, bw, static_cast<int>(h));
 }
 const ext_session_lock_surface_v1_listener lock_surface_listener = {on_lock_configure};
+
+/// --all-outputs: a lock surface for output `o` (one plugged in while locked too, as swaylock
+/// does: "clients should create lock surfaces for all outputs").
+void lock_add_output_surface(probe_output& o) {
+    if (!g.lock || !o.out || o.out == g.output || o.lock_surface || o.gone)
+        return;
+    o.lock_surf.index = -3;
+    o.lock_surf.colour = g.opt.lock_colour;
+    o.lock_surf.surface = wl_compositor_create_surface(g.compositor);
+    o.lock_surface = ext_session_lock_v1_get_lock_surface(g.lock, o.lock_surf.surface, o.out);
+    ext_session_lock_surface_v1_add_listener(o.lock_surface, &lock_surface_listener, &o.lock_surf);
+}
 
 void lock_make_surface() {
     if (!g.lock || g.lock_surface || !g.output)
@@ -1118,6 +1170,11 @@ void lock_make_surface() {
     g.lock_surf.surface = wl_compositor_create_surface(g.compositor);
     g.lock_surface = ext_session_lock_v1_get_lock_surface(g.lock, g.lock_surf.surface, g.output);
     ext_session_lock_surface_v1_add_listener(g.lock_surface, &lock_surface_listener, nullptr);
+    if (!g.opt.all_outputs)
+        return;
+    // "Clients should immediately create lock surfaces for all outputs": one per other output.
+    for (unsigned i = 0; i < g.out_count; ++i)
+        lock_add_output_surface(g.outs[i]);
 }
 
 /// US-layout evdev codes of a-z and 0-9 (enough for a test password).
@@ -1164,15 +1221,22 @@ void lock_key(uint32_t code) {
 
 // ── outputs mode: wl_output, xdg-output, wl_surface.enter/leave ──
 
-void on_surface_enter(void*, wl_surface* surface, wl_output*) {
+const char* output_name_of(const wl_output* out) {
+    for (unsigned i = 0; i < g.out_count; ++i)
+        if (g.outs[i].out && g.outs[i].out == out)
+            return g.outs[i].name[0] ? g.outs[i].name : "?";
+    return "?";
+}
+
+void on_surface_enter(void*, wl_surface* surface, wl_output* out) {
     char buf[16];
     std::printf("surface enter surface=%s output=%s\n", name_of(find(surface), buf, sizeof(buf)),
-                g.output_name[0] ? g.output_name : "?");
+                output_name_of(out));
 }
-void on_surface_leave(void*, wl_surface* surface, wl_output*) {
+void on_surface_leave(void*, wl_surface* surface, wl_output* out) {
     char buf[16];
     std::printf("surface leave surface=%s output=%s\n", name_of(find(surface), buf, sizeof(buf)),
-                g.output_name[0] ? g.output_name : "?");
+                output_name_of(out));
 }
 void on_surface_scale(void*, wl_surface*, int32_t s) {
     if (g.opt.scale_mode) {
@@ -1193,24 +1257,28 @@ const wl_surface_listener surface_listener = {on_surface_enter, on_surface_leave
 
 void on_output_geometry(void*, wl_output*, int32_t, int32_t, int32_t, int32_t, int32_t,
                         const char*, const char*, int32_t) {}
-void on_output_mode(void*, wl_output*, uint32_t flags, int32_t w, int32_t h, int32_t refresh) {
+void on_output_mode(void* data, wl_output*, uint32_t flags, int32_t w, int32_t h,
+                    int32_t refresh) {
+    auto* o = static_cast<probe_output*>(data);
     if (flags & WL_OUTPUT_MODE_CURRENT) {
-        g.output_w = w;
-        g.output_h = h;
-        g.output_refresh = refresh;
+        o->w = w;
+        o->h = h;
+        o->refresh = refresh;
     }
 }
-void on_output_done(void*, wl_output*) {
-    ++g.output_dones;
-    std::printf("wl_output name=%s mode=%dx%d refresh=%d scale=%d done=%u\n", g.output_name,
-                g.output_w, g.output_h, g.output_refresh, g.output_scale, g.output_dones);
-    if (g.xo_seen)
-        std::printf("xdg_output position=%d,%d size=%dx%d name=%s description=%s\n", g.xo_x,
-                    g.xo_y, g.xo_w, g.xo_h, g.xo_name, g.xo_description);
+void on_output_done(void* data, wl_output*) {
+    auto* o = static_cast<probe_output*>(data);
+    ++o->dones;
+    std::printf("wl_output name=%s mode=%dx%d refresh=%d scale=%d done=%u\n", o->name, o->w,
+                o->h, o->refresh, o->scale, o->dones);
+    if (o->xo_seen)
+        std::printf("xdg_output position=%d,%d size=%dx%d name=%s description=%s\n", o->xo_x,
+                    o->xo_y, o->xo_w, o->xo_h, o->xo_name, o->xo_description);
 }
-void on_output_scale(void*, wl_output*, int32_t s) { g.output_scale = s; }
-void on_output_name(void*, wl_output*, const char* n) {
-    std::snprintf(g.output_name, sizeof(g.output_name), "%s", n);
+void on_output_scale(void* data, wl_output*, int32_t s) { static_cast<probe_output*>(data)->scale = s; }
+void on_output_name(void* data, wl_output*, const char* n) {
+    auto* o = static_cast<probe_output*>(data);
+    std::snprintf(o->name, sizeof(o->name), "%s", n);
 }
 void on_output_description(void*, wl_output*, const char*) {}
 const wl_output_listener output_listener = {on_output_geometry, on_output_mode,
@@ -1218,40 +1286,63 @@ const wl_output_listener output_listener = {on_output_geometry, on_output_mode,
                                             on_output_name,     on_output_description};
 
 #if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
-void on_xo_position(void*, zxdg_output_v1*, int32_t x, int32_t y) {
-    g.xo_x = x;
-    g.xo_y = y;
-    g.xo_seen = true;
+void on_xo_position(void* data, zxdg_output_v1*, int32_t x, int32_t y) {
+    auto* o = static_cast<probe_output*>(data);
+    o->xo_x = x;
+    o->xo_y = y;
+    o->xo_seen = true;
 }
-void on_xo_size(void*, zxdg_output_v1*, int32_t w, int32_t h) {
-    g.xo_w = w;
-    g.xo_h = h;
+void on_xo_size(void* data, zxdg_output_v1*, int32_t w, int32_t h) {
+    auto* o = static_cast<probe_output*>(data);
+    o->xo_w = w;
+    o->xo_h = h;
 }
 void on_xo_done(void*, zxdg_output_v1*) {} // v3: wl_output.done closes the group
-void on_xo_name(void*, zxdg_output_v1*, const char* n) {
-    std::snprintf(g.xo_name, sizeof(g.xo_name), "%s", n);
+void on_xo_name(void* data, zxdg_output_v1*, const char* n) {
+    auto* o = static_cast<probe_output*>(data);
+    std::snprintf(o->xo_name, sizeof(o->xo_name), "%s", n);
 }
-void on_xo_description(void*, zxdg_output_v1*, const char* d) {
-    std::snprintf(g.xo_description, sizeof(g.xo_description), "%s", d);
+void on_xo_description(void* data, zxdg_output_v1*, const char* d) {
+    auto* o = static_cast<probe_output*>(data);
+    std::snprintf(o->xo_description, sizeof(o->xo_description), "%s", d);
 }
 const zxdg_output_v1_listener xdg_output_listener = {on_xo_position, on_xo_size, on_xo_done,
                                                      on_xo_name, on_xo_description};
 #endif
 
-void bind_outputs() {
-    if (g.output || !g.output_global)
+void bind_one_output(probe_output& o) {
+    if (o.out || o.gone)
         return;
-    const uint32_t v = g.output_version < 4 ? g.output_version : 4;
+    const uint32_t v = o.version < 4 ? o.version : 4;
     std::printf("wl_output bind version=%u\n", v);
-    g.output = static_cast<wl_output*>(
-        wl_registry_bind(g.registry, g.output_global, &wl_output_interface, v));
-    wl_output_add_listener(g.output, &output_listener, nullptr);
+    o.out = static_cast<wl_output*>(wl_registry_bind(g.registry, o.global, &wl_output_interface, v));
+    wl_output_add_listener(o.out, &output_listener, &o);
 #if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
     if (g.xom) {
-        g.xdg_output = zxdg_output_manager_v1_get_xdg_output(g.xom, g.output);
-        zxdg_output_v1_add_listener(g.xdg_output, &xdg_output_listener, nullptr);
+        o.xo = zxdg_output_manager_v1_get_xdg_output(g.xom, o.out);
+        zxdg_output_v1_add_listener(o.xo, &xdg_output_listener, &o);
     }
 #endif
+}
+
+/// Binds every advertised wl_output and picks the one the probe acts on: --output NAME
+/// (a roundtrip learns the names), else the first.
+void bind_outputs() {
+    if (g.output || g.out_count == 0)
+        return;
+    for (unsigned i = 0; i < g.out_count; ++i)
+        bind_one_output(g.outs[i]);
+    if (g.opt.output_name) {
+        wl_display_roundtrip(g.display);
+        for (unsigned i = 0; i < g.out_count && !g.output; ++i)
+            if (g.outs[i].out && std::strcmp(g.outs[i].name, g.opt.output_name) == 0)
+                g.output = g.outs[i].out;
+        if (!g.output)
+            std::fprintf(stderr, "lumen-probe: no wl_output named %s\n", g.opt.output_name);
+    } else {
+        for (unsigned i = 0; i < g.out_count && !g.output; ++i)
+            g.output = g.outs[i].out;
+    }
 }
 
 #if defined(LUMEN_PROBE_HAS_DECORATION)
@@ -1314,6 +1405,13 @@ void on_toplevel_configure(void* data, xdg_toplevel*, int32_t w, int32_t h, wl_a
     auto* s = static_cast<surface_state*>(data);
     s->pending_w = w;
     s->pending_h = h;
+    if (g.opt.fullscreen) {
+        bool fs = false;
+        const auto* st = static_cast<const uint32_t*>(states->data);
+        for (size_t i = 0; i < states->size / sizeof(uint32_t); ++i)
+            fs = fs || st[i] == XDG_TOPLEVEL_STATE_FULLSCREEN;
+        std::printf("toplevel fullscreen=%d w=%d h=%d\n", fs ? 1 : 0, w, h);
+    }
     if (g.opt.activation_issuer || g.opt.activation_target) {
         bool active = false;
         const auto* st = static_cast<const uint32_t*>(states->data);
@@ -2292,8 +2390,8 @@ void bind_layer_shell(wl_registry* r, uint32_t name, const char* iface, uint32_t
 void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t version) {
     if (std::strcmp(iface, wl_compositor_interface.name) == 0) {
         // v4 by default (dnd-source attaches with an offset, an error from v5 on); scale
-        // mode takes v6 for wl_surface.preferred_buffer_scale.
-        const uint32_t want = g.opt.scale_mode ? 6 : 4;
+        // and outputs modes take v6 for wl_surface.preferred_buffer_scale (per output).
+        const uint32_t want = g.opt.scale_mode || g.opt.outputs_mode ? 6 : 4;
         g.compositor = static_cast<wl_compositor*>(
             wl_registry_bind(r, name, &wl_compositor_interface, version < want ? version : want));
     }
@@ -2360,9 +2458,26 @@ void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t
         g.psm = static_cast<zwp_primary_selection_device_manager_v1*>(
             wl_registry_bind(r, name, &zwp_primary_selection_device_manager_v1_interface, 1));
 #endif
-    else if (std::strcmp(iface, wl_output_interface.name) == 0 && !g.output_global) {
-        g.output_global = name;
-        g.output_version = version;
+    else if (std::strcmp(iface, wl_output_interface.name) == 0) {
+        if (!g.output_global) {
+            g.output_global = name;
+            g.output_version = version;
+        }
+        if (g.out_count < k_max_outputs) {
+            probe_output& o = g.outs[g.out_count++];
+            o.global = name;
+            o.version = version;
+            // An output plugged in after the probe bound its outputs: watched as well; a
+            // locker with --all-outputs covers it with a lock surface of its own.
+            if ((g.opt.outputs_mode || (g.opt.lock_mode && g.opt.all_outputs)) && g.output) {
+                std::printf("wl_output added global=%u\n", name);
+                bind_one_output(o);
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+                if (g.opt.lock_mode && g.lock_surface)
+                    lock_add_output_surface(o);
+#endif
+            }
+        }
     }
 #if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
     else if (std::strcmp(iface, zxdg_output_manager_v1_interface.name) == 0)
@@ -2440,7 +2555,38 @@ unsigned kbd_value(const char* v) {
 }
 #endif
 
-void on_global_remove(void*, wl_registry*, uint32_t) {}
+void on_global_remove(void*, wl_registry*, uint32_t name) {
+    for (unsigned i = 0; i < g.out_count; ++i) {
+        probe_output& o = g.outs[i];
+        if (o.global != name || o.gone)
+            continue;
+        o.gone = true;
+        std::printf("wl_output removed name=%s\n", o.name[0] ? o.name : "?");
+#if defined(LUMEN_PROBE_HAS_SESSION_LOCK)
+        // Its lock surface goes with it (the compositor already dropped it).
+        if (o.lock_surface) {
+            ext_session_lock_surface_v1_destroy(o.lock_surface);
+            o.lock_surface = nullptr;
+            if (o.lock_surf.surface)
+                wl_surface_destroy(o.lock_surf.surface);
+            o.lock_surf.surface = nullptr;
+        }
+#endif
+#if defined(LUMEN_PROBE_HAS_XDG_OUTPUT)
+        if (o.xo)
+            zxdg_output_v1_destroy(o.xo);
+        o.xo = nullptr;
+#endif
+        // The object stays until released; the compositor keeps the global inert until then.
+        if (o.out && wl_output_get_version(o.out) >= WL_OUTPUT_RELEASE_SINCE_VERSION)
+            wl_output_release(o.out);
+        else if (o.out)
+            wl_output_destroy(o.out);
+        if (g.output == o.out)
+            g.output = nullptr;
+        o.out = nullptr;
+    }
+}
 const wl_registry_listener registry_listener = {on_global, on_global_remove};
 
 bool parse_pair(const char* s, int& a, int& b, char sep) {
@@ -2486,14 +2632,25 @@ int usage() {
                  "         [--enable-after S] [--no-enable]\n"
                  "       lumen-probe im [--popup WxH] [--no-popup] [--exit-after S]\n"
                  "       any toplevel mode: [--ignore-ping-for S] [--freeze S] [--ssd]\n"
-                 "         [--title T]\n");
+                 "         [--title T] [--fullscreen] [--unset-fullscreen-after S]\n"
+                 "       multi-output: [--output NAME] (layer, power, lock, fullscreen)\n"
+                 "         [--all-outputs] (lock: a surface on every output)\n"
+                 "       lumen-probe output-mgmt [--watch S] [--apply SPEC | --test SPEC]\n"
+                 "         [--stale-serial] [--error KIND]  (SPEC: NAME:mode=WxH[@mHz],custom=WxH,\n"
+                 "         pos=X,Y,scale=S,transform=T,vrr=0|1;NAME:off)\n");
     return 2;
 }
 
 } // namespace
 
+int output_mgmt_main(int argc, char** argv);
+
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    // wlr-output-management has its own connection and no surfaces
+    // (lumen-probe-output-mgmt.cpp).
+    if (argc >= 2 && std::strcmp(argv[1], "output-mgmt") == 0)
+        return output_mgmt_main(argc, argv);
     if (argc < 2 || (std::strcmp(argv[1], "popup") != 0 && std::strcmp(argv[1], "layer") != 0 &&
                      std::strcmp(argv[1], "selection") != 0 &&
                      std::strcmp(argv[1], "dnd-source") != 0 &&
@@ -2610,6 +2767,13 @@ int main(int argc, char** argv) {
         else if (!std::strcmp(a, "--frames") && v) { o.frames = std::atoi(v); ++i; }
         else if (!std::strcmp(a, "--burst") && v) { o.burst = std::atoi(v) > 0 ? std::atoi(v) : 1; ++i; }
         else if (!std::strcmp(a, "--maximize")) o.maximize = true;
+        else if (!std::strcmp(a, "--output") && v) { o.output_name = v; ++i; }
+        else if (!std::strcmp(a, "--all-outputs")) o.all_outputs = true;
+        else if (!std::strcmp(a, "--fullscreen")) o.fullscreen = true;
+        else if (!std::strcmp(a, "--unset-fullscreen-after") && v) {
+            o.unfullscreen_after = std::atof(v);
+            ++i;
+        }
         else if (!std::strcmp(a, "--timeout") && v) { o.idle_timeout_ms = static_cast<unsigned>(std::atol(v)); ++i; }
         else if (!std::strcmp(a, "--input-only")) o.input_only = true;
         else if (!std::strcmp(a, "--count") && v) { o.idle_count = std::atoi(v); ++i; }
@@ -2673,7 +2837,14 @@ int main(int argc, char** argv) {
         }
         g.top.colour = 0xff3a7a50;
         g.top.surface = wl_compositor_create_surface(g.compositor);
-        g.layer = zwlr_layer_shell_v1_get_layer_surface(g.layer_shell, g.top.surface, nullptr,
+        // --output NAME: on that output; otherwise the compositor picks (null).
+        if (o.output_name) {
+            bind_outputs();
+            if (!g.output)
+                return 1;
+        }
+        g.layer = zwlr_layer_shell_v1_get_layer_surface(g.layer_shell, g.top.surface,
+                                                        o.output_name ? g.output : nullptr,
                                                         o.layer, o.ns);
         zwlr_layer_surface_v1_add_listener(g.layer, &layer_listener, nullptr);
         zwlr_layer_surface_v1_set_size(g.layer, static_cast<uint32_t>(o.width),
@@ -2837,6 +3008,16 @@ int main(int argc, char** argv) {
         xdg_toplevel_set_app_id(g.top.toplevel, "lumen-probe");
         if (o.maximize)
             xdg_toplevel_set_maximized(g.top.toplevel);
+        if (o.fullscreen) {
+            if (o.output_name) {
+                bind_outputs();
+                if (!g.output)
+                    return 1;
+            }
+            xdg_toplevel_set_fullscreen(g.top.toplevel, o.output_name ? g.output : nullptr);
+            if (o.unfullscreen_after > 0.0)
+                g.unfullscreen_at = now_s() + o.unfullscreen_after;
+        }
 #if defined(LUMEN_PROBE_HAS_DECORATION)
         if (o.ssd && g.deco_manager) {
             // Before the initial commit: the first configure then carries the mode.
@@ -2942,6 +3123,11 @@ int main(int argc, char** argv) {
         if (g.bind_output_at > 0.0 && now_s() >= g.bind_output_at) {
             g.bind_output_at = 0.0;
             bind_outputs();
+        }
+        if (g.unfullscreen_at > 0.0 && now_s() >= g.unfullscreen_at) {
+            g.unfullscreen_at = 0.0;
+            std::printf("toplevel unset_fullscreen\n");
+            xdg_toplevel_unset_fullscreen(g.top.toplevel);
         }
         if (g.deferred_ping && g.ignore_until > 0.0 && now_s() >= g.ignore_until) {
             std::printf("pong serial=%u late\n", g.deferred_ping);

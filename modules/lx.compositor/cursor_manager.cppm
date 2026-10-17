@@ -55,11 +55,12 @@ private:
     unsigned front_ = 2;
 };
 
-/// Pointer state, UI → render. Plain data: crossing threads is a 32-byte copy.
+/// Pointer state, UI → render. Plain data: crossing threads is a 40-byte copy.
 struct cursor_frame {
-    /// Pointer (hotspot) position, output pixels.
-    int x = 0;
-    int y = 0;
+    /// Pointer (hotspot) position, layout (logical) coordinates: each output's pipeline
+    /// places its plane from it with its own projection (ADR 008 §A.7).
+    double x = 0.0;
+    double y = 0.0;
     /// Input event that produced this frame, CLOCK_MONOTONIC µs (latency
     /// instrumentation); 0 when the frame was not input-driven (a client set its cursor, a
     /// window under a still pointer unmapped), so such changes are not timed against
@@ -82,8 +83,38 @@ struct cursor_plane_image {
     unsigned generation = 0;
 };
 
+/// Distinct output scales a cursor image set covers (outputs with more distinct scales
+/// share the nearest).
+inline constexpr unsigned k_cursor_scales = 4;
+
+/// The pointer image at every distinct output scale (ADR 008 §A.7): an output's pipeline
+/// stages the one of its scale, so the pointer is sharp on a 1.0 and a 1.5 output alike.
+/// Prepared when the image or the set of scales changes, never per motion.
+struct cursor_image_set {
+    cursor_plane_image images[k_cursor_scales]{};
+    /// Scale of `images[i]`, in 120ths.
+    unsigned scale120[k_cursor_scales]{};
+    unsigned count = 0;
+    /// Bumped with every new set.
+    unsigned generation = 0;
+
+    /// The image for an output at `s120`: its own scale's, else the nearest. Null when empty.
+    [[nodiscard]] const cursor_plane_image* for_scale(unsigned s120) const {
+        const cursor_plane_image* best = nullptr;
+        unsigned best_d = ~0u;
+        for (unsigned i = 0; i < count; ++i) {
+            const unsigned d = scale120[i] > s120 ? scale120[i] - s120 : s120 - scale120[i];
+            if (d < best_d) {
+                best_d = d;
+                best = &images[i];
+            }
+        }
+        return best;
+    }
+};
+
 using cursor_frame_mailbox = latest_value<cursor_frame>;
-using cursor_image_mailbox = latest_value<cursor_plane_image>;
+using cursor_image_mailbox = latest_value<cursor_image_set>;
 
 /// Compositor-owned textures (the software cursor, server-side frames), staged through the
 /// same queue as client shm content. Installed by the protocol layer, which owns the staging
@@ -108,18 +139,27 @@ public:
     ~cursor_node() override;
     [[nodiscard]] scene::node_kind kind() const override;
     using scene::scene_node::emit_draws;
-    /// `dst` is already in output pixels (the pointer is placed in pixels, like the plane):
-    /// the projection is not applied again.
+    /// Placed per output view: the hotspot's pixel there, the image (rasterized for
+    /// `image_scale`) resampled to the view's scale where it differs.
     void emit_draws(scene::draw_list& out, const scene::emit_context& ctx) const override;
 
-    /// `dst`: output pixels.
-    void show(lx::rect2i dst);
+    /// The hotspot at layout (`x`, `y`); a `w`x`h` image with its hotspot at (`hot_x`,
+    /// `hot_y`), in pixels at `image_scale`.
+    void show(double x, double y, unsigned w, unsigned h, int hot_x, int hot_y,
+              double image_scale);
     void hide();
     [[nodiscard]] bool shown() const { return shown_; }
-    [[nodiscard]] lx::rect2i rect() const { return dst_; }
+    /// The layout rect the image covers (a pixel wider on every side for rounding).
+    [[nodiscard]] lx::rect2i logical_rect() const;
 
 private:
-    lx::rect2i dst_{};
+    double x_ = 0.0;
+    double y_ = 0.0;
+    unsigned w_ = 0;
+    unsigned h_ = 0;
+    int hot_x_ = 0;
+    int hot_y_ = 0;
+    double image_scale_ = 1.0;
     bool shown_ = false;
 };
 
@@ -136,18 +176,25 @@ private:
 class cursor_manager {
 public:
     struct setup {
-        const xcursor_theme* theme = nullptr;
+        /// One theme per distinct output scale, at that scale's pixel size, and the scale
+        /// (120ths) each is for.
+        const xcursor_theme* themes[k_cursor_scales]{};
+        unsigned theme_scale120[k_cursor_scales]{};
+        unsigned theme_count = 0;
         cursor_frame_mailbox* frames = nullptr;
         cursor_image_mailbox* images = nullptr;
         const input_router* router = nullptr;
         scene::scene_graph* scene = nullptr;
         scene::container_node* overlay = nullptr;
-        /// A cursor plane exists; images up to `plane_size` go to it.
+        /// Every output has a cursor plane; images up to `plane_size` go to them.
         bool hardware = false;
         lx::size2i plane_size{};
     };
 
     void init(const setup& s);
+    /// The themes changed (an output configuration brought a new scale, ADR 008 §C.4): the
+    /// image is resolved again at the next tick for every scale. Same shape as `setup`.
+    void set_themes(const xcursor_theme* const* themes, const unsigned* scale120, unsigned count);
     void set_texture_ops(compositor_texture_ops ops) { tex_ops_ = ops; }
 
     // Client requests. The protocol layer has already checked that the client holds
@@ -158,9 +205,10 @@ public:
     /// A cursor-role surface committed. `argb` null = no content. XRGB content (`opaque`) is
     /// given full alpha. `dx`/`dy` is the attach offset (logical), which moves the hotspot
     /// by −d. `logical_w`×`logical_h` is the surface's size after its buffer scale and
-    /// viewport (0: the buffer's): the image is resampled once, here, to that size in output
-    /// pixels when the buffer differs (a scale-2 cursor on a 1.25 output), so the plane and
-    /// the software node always show it at its logical size.
+    /// viewport (0: the buffer's): the image is resampled once per output scale, when it is
+    /// resolved, to that size in that scale's pixels where the buffer differs (a scale-2
+    /// cursor on a 1.25 output), so planes and the software node always show it at its
+    /// logical size.
     void on_client_surface_commit(lx::surface_id surface, const std::uint32_t* argb,
                                   unsigned width, unsigned height, unsigned stride_px,
                                   bool opaque, int dx, int dy, int logical_w = 0,
@@ -193,11 +241,8 @@ public:
     void on_motion(double x, double y, unsigned long long time_us, bool in_grab);
     /// Once per frame, before the scene is published.
     void on_tick();
-    /// Render reported the plane unusable: software from now on.
+    /// Render reported a plane unusable: software from now on.
     void on_hardware_failed();
-    /// Layout → output pixels for the pointer position, client hotspots and image sizes.
-    /// Theme images are loaded at the output's pixel size already (compositor start).
-    void set_projection(scene::output_projection projection);
 
     [[nodiscard]] bool hardware_active() const { return hardware_ && !hw_failed_; }
     [[nodiscard]] cursor_shape shape() const { return shown_shape_; }
@@ -207,9 +252,12 @@ private:
 
     struct surface_image {
         lx::surface_id surface{};
+        /// The client's buffer as committed (premultiplied, packed), and its logical size.
         std::vector<std::uint32_t> pixels{};
         unsigned width = 0;
         unsigned height = 0;
+        int logical_w = 0;
+        int logical_h = 0;
         bool has_content = false;
         unsigned long long stamp = 0;
     };
@@ -224,7 +272,15 @@ private:
 
     static constexpr unsigned k_surface_cache = 4;
 
-    const xcursor_theme* theme_ = nullptr;
+    const xcursor_theme* themes_[k_cursor_scales]{};
+    unsigned theme_scale120_[k_cursor_scales]{};
+    unsigned theme_count_ = 0;
+    /// The theme of the largest scale: what the software cursor draws (resampled down on
+    /// smaller outputs).
+    unsigned sw_index_ = 0;
+    /// A client surface's image at each scale (resampled when its logical size in that
+    /// scale's pixels differs from its buffer). Grows to the largest seen, then stays.
+    std::vector<std::uint32_t> scaled_[k_cursor_scales]{};
     cursor_frame_mailbox* frames_ = nullptr;
     cursor_image_mailbox* images_ = nullptr;
     const input_router* router_ = nullptr;
@@ -253,14 +309,13 @@ private:
     void* surface_hook_user_ = nullptr;
     lx::surface_id notified_surface_{};
 
-    // Resolved.
-    cursor_image_view view_{};
+    // Resolved, per scale.
+    cursor_image_view views_[k_cursor_scales]{};
     bool visible_ = false;
     bool frame_hardware_ = false;
     unsigned image_generation_ = 0;
     cursor_shape shown_shape_ = cursor_shape::default_;
 
-    scene::output_projection projection_{};
     double x_ = 0.0;
     double y_ = 0.0;
     unsigned long long input_time_us_ = 0;
@@ -283,13 +338,26 @@ lx::scene::node_kind lx::compositor::cursor_node::kind() const {
 }
 
 void lx::compositor::cursor_node::emit_draws(scene::draw_list& out,
-                                            const scene::emit_context&) const {
-    if (!shown_)
+                                            const scene::emit_context& ctx) const {
+    if (!shown_ || w_ == 0 || h_ == 0)
         return;
+    const scene::output_projection& p = ctx.projection;
+    const double vs = p.scale > 0.0 ? p.scale : 1.0;
+    const double k = vs / (image_scale_ > 0.0 ? image_scale_ : 1.0);
+    // The hotspot's pixel on this output, as the plane is placed.
+    const long px = static_cast<long>(std::floor((x_ - p.origin.x) * vs));
+    const long py = static_cast<long>(std::floor((y_ - p.origin.y) * vs));
     scene::draw_command cmd{};
     cmd.texture = lx::texture_id{k_cursor_texture_id};
-    cmd.dst = dst_;
-    cmd.src = {0, 0, dst_.width, dst_.height};
+    cmd.dst = {static_cast<int>(px - std::lround(hot_x_ * k)),
+               static_cast<int>(py - std::lround(hot_y_ * k)),
+               static_cast<int>(std::lround(w_ * k)), static_cast<int>(std::lround(h_ * k))};
+    if (p.size.width > 0 && p.size.height > 0 &&
+        (cmd.dst.x >= p.size.width || cmd.dst.y >= p.size.height ||
+         cmd.dst.x + cmd.dst.width <= 0 || cmd.dst.y + cmd.dst.height <= 0))
+        return; // not on this output
+    cmd.src = lx::rect2f{0.f, 0.f, static_cast<float>(w_), static_cast<float>(h_)};
+    cmd.scaled = k != 1.0;
     cmd.opacity = 1.f;
     cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
     // Set explicitly: the surface path calls anything at full opacity opaque, and a cursor
@@ -299,15 +367,33 @@ void lx::compositor::cursor_node::emit_draws(scene::draw_list& out,
     out.push(cmd);
 }
 
-void lx::compositor::cursor_node::show(lx::rect2i dst) {
-    dst_ = dst;
+void lx::compositor::cursor_node::show(double x, double y, unsigned w, unsigned h, int hot_x,
+                                       int hot_y, double image_scale) {
+    x_ = x;
+    y_ = y;
+    w_ = w;
+    h_ = h;
+    hot_x_ = hot_x;
+    hot_y_ = hot_y;
+    image_scale_ = image_scale > 0.0 ? image_scale : 1.0;
     shown_ = true;
-    set_transform({dst.x, dst.y});
+    mark_dirty({});
 }
 
 void lx::compositor::cursor_node::hide() {
     shown_ = false;
     mark_dirty({});
+}
+
+lx::rect2i lx::compositor::cursor_node::logical_rect() const {
+    const double s = image_scale_ > 0.0 ? image_scale_ : 1.0;
+    const double x0 = x_ - hot_x_ / s;
+    const double y0 = y_ - hot_y_ / s;
+    const int lx0 = static_cast<int>(std::floor(x0)) - 1;
+    const int ly0 = static_cast<int>(std::floor(y0)) - 1;
+    const int lx1 = static_cast<int>(std::ceil(x0 + w_ / s)) + 1;
+    const int ly1 = static_cast<int>(std::ceil(y0 + h_ / s)) + 1;
+    return {lx0, ly0, lx1 - lx0, ly1 - ly0};
 }
 
 // ── cursor_manager ─────────────────────────────────────────────────────────
@@ -320,11 +406,6 @@ namespace {
 
 [[nodiscard]] bool rects_equal(lx::rect2i a, lx::rect2i b) {
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
-}
-
-[[nodiscard]] int floor_px(double v) {
-    const int i = static_cast<int>(v);
-    return static_cast<double>(i) > v ? i - 1 : i;
 }
 
 /// Bilinear resample of a premultiplied ARGB image (`sw`×`sh`, `stride` words a row) into
@@ -369,7 +450,14 @@ void resample_bilinear(const std::uint32_t* src, unsigned sw, unsigned sh, unsig
 } // namespace
 
 void lx::compositor::cursor_manager::init(const setup& s) {
-    theme_ = s.theme;
+    theme_count_ = s.theme_count < k_cursor_scales ? s.theme_count : k_cursor_scales;
+    sw_index_ = 0;
+    for (unsigned i = 0; i < theme_count_; ++i) {
+        themes_[i] = s.themes[i];
+        theme_scale120_[i] = s.theme_scale120[i] ? s.theme_scale120[i] : 120u;
+        if (theme_scale120_[i] > theme_scale120_[sw_index_])
+            sw_index_ = i;
+    }
     frames_ = s.frames;
     images_ = s.images;
     router_ = s.router;
@@ -382,11 +470,13 @@ void lx::compositor::cursor_manager::init(const setup& s) {
         const std::size_t px = static_cast<std::size_t>(plane_size_.width) *
                                static_cast<std::size_t>(plane_size_.height);
         for (unsigned i = 0; i < 3; ++i)
-            images_->slot(i).pixels.assign(px, 0u);
+            for (unsigned k = 0; k < k_cursor_scales; ++k)
+                images_->slot(i).images[k].pixels.assign(px, 0u);
     }
     // The software cursor's texture is one fixed square, so every image change is an
     // in-place update on each backend: the smallest power of two the theme fits in.
-    unsigned need = theme_ ? theme_->max_dimension() : 32u;
+    unsigned need = theme_count_ > 0 && themes_[sw_index_] ? themes_[sw_index_]->max_dimension()
+                                                           : 32u;
     canvas_ = 32;
     while (canvas_ < need && canvas_ < k_cursor_max_px)
         canvas_ *= 2;
@@ -396,6 +486,22 @@ void lx::compositor::cursor_manager::init(const setup& s) {
         (void)s.overlay->add(&node_);
     if (router_)
         focus_generation_ = router_->pointer_focus_generation();
+    needs_resolve_ = true;
+    frame_pending_ = true;
+}
+
+void lx::compositor::cursor_manager::set_themes(const xcursor_theme* const* themes,
+                                                const unsigned* scale120, unsigned count) {
+    theme_count_ = count < k_cursor_scales ? count : k_cursor_scales;
+    sw_index_ = 0;
+    for (unsigned i = 0; i < theme_count_; ++i) {
+        themes_[i] = themes[i];
+        theme_scale120_[i] = scale120[i] ? scale120[i] : 120u;
+        if (theme_scale120_[i] > theme_scale120_[sw_index_])
+            sw_index_ = i;
+        views_[i] = {};
+    }
+    force_image_ = true;
     needs_resolve_ = true;
     frame_pending_ = true;
 }
@@ -505,42 +611,26 @@ void lx::compositor::cursor_manager::on_client_surface_commit(lx::surface_id sur
         }
         return;
     } else {
-        // The size it shows at: its logical size in output pixels. A buffer of exactly that
-        // size is copied; any other is resampled once, here.
-        unsigned out_w = width;
-        unsigned out_h = height;
-        if (logical_w > 0 && logical_h > 0) {
-            const long pw = std::lround(logical_w * projection_.scale);
-            const long ph = std::lround(logical_h * projection_.scale);
-            out_w = pw < 1 ? 1u : (pw > static_cast<long>(k_cursor_max_px) ? k_cursor_max_px
-                                                                             : static_cast<unsigned>(pw));
-            out_h = ph < 1 ? 1u : (ph > static_cast<long>(k_cursor_max_px) ? k_cursor_max_px
-                                                                             : static_cast<unsigned>(ph));
-        }
-        // Grows to the largest image the surface has used, then stays: no steady-state
-        // allocation.
-        const std::size_t n = static_cast<std::size_t>(out_w) * out_h;
+        // Kept as the client drew it; each output scale's image is made from it when the
+        // cursor is resolved. Grows to the largest buffer the surface has used, then stays:
+        // no steady-state allocation.
+        const std::size_t n = static_cast<std::size_t>(width) * height;
         if (slot->pixels.size() < n)
             slot->pixels.resize(n);
-        if (out_w == width && out_h == height) {
-            for (unsigned y = 0; y < height; ++y) {
-                const std::uint32_t* src = argb + static_cast<std::size_t>(y) * stride_px;
-                std::uint32_t* dst = slot->pixels.data() + static_cast<std::size_t>(y) * width;
-                if (opaque) {
-                    for (unsigned x = 0; x < width; ++x)
-                        dst[x] = src[x] | 0xFF000000u;
-                } else {
-                    std::memcpy(dst, src, static_cast<std::size_t>(width) * 4u);
-                }
+        for (unsigned y = 0; y < height; ++y) {
+            const std::uint32_t* src = argb + static_cast<std::size_t>(y) * stride_px;
+            std::uint32_t* dst = slot->pixels.data() + static_cast<std::size_t>(y) * width;
+            if (opaque) {
+                for (unsigned x = 0; x < width; ++x)
+                    dst[x] = src[x] | 0xFF000000u;
+            } else {
+                std::memcpy(dst, src, static_cast<std::size_t>(width) * 4u);
             }
-        } else {
-            resample_bilinear(argb, width, height, stride_px, slot->pixels.data(), out_w, out_h);
-            if (opaque)
-                for (std::size_t i = 0; i < n; ++i)
-                    slot->pixels[i] |= 0xFF000000u;
         }
-        slot->width = out_w;
-        slot->height = out_h;
+        slot->width = width;
+        slot->height = height;
+        slot->logical_w = logical_w > 0 ? logical_w : static_cast<int>(width);
+        slot->logical_h = logical_h > 0 ? logical_h : static_cast<int>(height);
         slot->has_content = true;
     }
     if (surface == client_surface_ && mode_ == client_mode::surface) {
@@ -605,43 +695,33 @@ void lx::compositor::cursor_manager::on_hardware_failed() {
 
 void lx::compositor::cursor_manager::resolve() {
     needs_resolve_ = false;
-    if (!theme_)
+    if (theme_count_ == 0)
         return;
 
-    cursor_image_view v{};
     bool show = true;
     cursor_shape shape = cursor_shape::default_;
     const char* source = "default";
+    const surface_image* client = nullptr;
     if (override_ != cursor_shape::none) {
         shape = override_;
-        v = theme_->image(shape);
         source = "override";
     } else if (hover_ != cursor_shape::none) {
         shape = hover_;
-        v = theme_->image(shape);
         source = "hover";
     } else {
         switch (mode_) {
         case client_mode::shape:
             shape = client_shape_;
-            v = theme_->image(shape);
             source = "client-shape";
             break;
         case client_mode::surface: {
             shape = cursor_shape::none;
             source = "client-surface";
             const surface_image* img = find_surface(client_surface_);
-            if (img && img->has_content) {
-                v.pixels = img->pixels.data();
-                v.width = img->width;
-                v.height = img->height;
-                v.stride_px = img->width;
-                // set_cursor's hotspot is surface-local (logical); the image is in pixels.
-                v.hot_x = static_cast<int>(std::lround(client_hot_x_ * projection_.scale));
-                v.hot_y = static_cast<int>(std::lround(client_hot_y_ * projection_.scale));
-            } else {
+            if (img && img->has_content)
+                client = img;
+            else
                 show = false; // a surface without content draws nothing
-            }
             break;
         }
         case client_mode::hidden:
@@ -650,39 +730,91 @@ void lx::compositor::cursor_manager::resolve() {
             show = false;
             break;
         case client_mode::none:
-            v = theme_->image(cursor_shape::default_);
+            shape = cursor_shape::default_;
             break;
         }
     }
-    if (show && v.empty())
+
+    // One view per scale: the theme loaded at that scale's size, or the client's image at
+    // its logical size in that scale's pixels (resampled only where they differ).
+    cursor_image_view v[k_cursor_scales]{};
+    for (unsigned k = 0; k < theme_count_; ++k) {
+        const double sc = theme_scale120_[k] / 120.0;
+        if (!show)
+            continue;
+        if (!client) {
+            if (themes_[k])
+                v[k] = themes_[k]->image(shape);
+            continue;
+        }
+        const long pw = std::lround(client->logical_w * sc);
+        const long ph = std::lround(client->logical_h * sc);
+        const unsigned out_w = pw < 1 ? 1u : (pw > static_cast<long>(k_cursor_max_px)
+                                                  ? k_cursor_max_px
+                                                  : static_cast<unsigned>(pw));
+        const unsigned out_h = ph < 1 ? 1u : (ph > static_cast<long>(k_cursor_max_px)
+                                                  ? k_cursor_max_px
+                                                  : static_cast<unsigned>(ph));
+        if (out_w == client->width && out_h == client->height) {
+            v[k].pixels = client->pixels.data();
+        } else {
+            const std::size_t n = static_cast<std::size_t>(out_w) * out_h;
+            if (scaled_[k].size() < n)
+                scaled_[k].resize(n);
+            resample_bilinear(client->pixels.data(), client->width, client->height,
+                              client->width, scaled_[k].data(), out_w, out_h);
+            v[k].pixels = scaled_[k].data();
+        }
+        v[k].width = out_w;
+        v[k].height = out_h;
+        v[k].stride_px = out_w;
+        // set_cursor's hotspot is surface-local (logical); the image is in pixels.
+        v[k].hot_x = static_cast<int>(std::lround(client_hot_x_ * sc));
+        v[k].hot_y = static_cast<int>(std::lround(client_hot_y_ * sc));
+    }
+    if (show && v[sw_index_].empty())
         show = false;
 
-    const bool changed = force_image_ || show != visible_ || v.pixels != view_.pixels ||
-                         v.width != view_.width || v.height != view_.height ||
-                         v.hot_x != view_.hot_x || v.hot_y != view_.hot_y;
+    bool changed = force_image_ || show != visible_;
+    for (unsigned k = 0; k < theme_count_; ++k)
+        changed = changed || v[k].pixels != views_[k].pixels || v[k].width != views_[k].width ||
+                  v[k].height != views_[k].height || v[k].hot_x != views_[k].hot_x ||
+                  v[k].hot_y != views_[k].hot_y;
+    // A client image resampled into the same buffer changes without its pointer changing.
+    changed = changed || client != nullptr;
     force_image_ = false;
-    view_ = v;
+    for (unsigned k = 0; k < theme_count_; ++k)
+        views_[k] = v[k];
     visible_ = show;
     shown_shape_ = shape;
 
-    // Hardware unless the plane is gone or cannot hold this image.
-    const bool fits = static_cast<int>(v.width) <= plane_size_.width &&
-                      static_cast<int>(v.height) <= plane_size_.height;
+    // Hardware unless a plane is gone or cannot hold an image.
+    bool fits = true;
+    for (unsigned k = 0; k < theme_count_; ++k)
+        fits = fits && static_cast<int>(v[k].width) <= plane_size_.width &&
+               static_cast<int>(v[k].height) <= plane_size_.height;
     frame_hardware_ = hardware_ && !hw_failed_ && fits;
 
     if (changed) {
         ++image_generation_;
         if (show && frame_hardware_ && images_) {
-            cursor_plane_image& slot = images_->back();
-            for (unsigned y = 0; y < v.height; ++y)
-                std::memcpy(slot.pixels.data() + static_cast<std::size_t>(y) * v.width,
-                            v.pixels + static_cast<std::size_t>(y) * v.stride_px,
-                            static_cast<std::size_t>(v.width) * 4u);
-            slot.width = v.width;
-            slot.height = v.height;
-            slot.hot_x = v.hot_x;
-            slot.hot_y = v.hot_y;
-            slot.generation = image_generation_;
+            cursor_image_set& set = images_->back();
+            for (unsigned k = 0; k < theme_count_; ++k) {
+                cursor_plane_image& img = set.images[k];
+                const cursor_image_view& iv = v[k];
+                for (unsigned y = 0; y < iv.height; ++y)
+                    std::memcpy(img.pixels.data() + static_cast<std::size_t>(y) * iv.width,
+                                iv.pixels + static_cast<std::size_t>(y) * iv.stride_px,
+                                static_cast<std::size_t>(iv.width) * 4u);
+                img.width = iv.width;
+                img.height = iv.height;
+                img.hot_x = iv.hot_x;
+                img.hot_y = iv.hot_y;
+                img.generation = image_generation_;
+                set.scale120[k] = theme_scale120_[k];
+            }
+            set.count = theme_count_;
+            set.generation = image_generation_;
             images_->publish();
         }
         if (cursor_debug()) {
@@ -700,9 +832,9 @@ void lx::compositor::cursor_manager::publish_frame() {
     if (!frames_)
         return;
     cursor_frame& f = frames_->back();
-    // The pixel the hotspot is in: output pixels, like the plane.
-    f.x = floor_px((x_ - projection_.origin.x) * projection_.scale);
-    f.y = floor_px((y_ - projection_.origin.y) * projection_.scale);
+    // Layout coordinates: each pipeline projects them onto its own output.
+    f.x = x_;
+    f.y = y_;
     f.input_time_us = input_time_us_ != published_input_us_ ? input_time_us_ : 0;
     published_input_us_ = input_time_us_;
     f.image_generation = image_generation_;
@@ -716,52 +848,42 @@ void lx::compositor::cursor_manager::update_software(bool want) {
         return;
     if (!want) {
         if (node_.shown()) {
-            scene_->note_damage_physical(node_.rect());
+            scene_->note_damage(node_.logical_rect());
             node_.hide();
         }
         return;
     }
+    const cursor_image_view& view = views_[sw_index_];
     if (sw_staged_generation_ != image_generation_) {
         // The canvas only grows: a client cursor larger than the theme's (a HiDPI client's
         // 48 px image over a 24 px theme) must not be cropped, hotspot and all. Growing
         // reallocates the texture once; later changes are in-place again.
-        const unsigned need = view_.width > view_.height ? view_.width : view_.height;
+        const unsigned need = view.width > view.height ? view.width : view.height;
         while (canvas_ < need && canvas_ < k_cursor_max_px)
             canvas_ *= 2;
         if (!tex_ops_.stage ||
-            !tex_ops_.stage(tex_ops_.user, k_cursor_texture_id, view_.pixels, view_.width,
-                            view_.height, view_.stride_px, canvas_, canvas_)) {
+            !tex_ops_.stage(tex_ops_.user, k_cursor_texture_id, view.pixels, view.width,
+                            view.height, view.stride_px, canvas_, canvas_)) {
             // Staging full this frame; keep the previous image and retry next tick.
             return;
         }
         sw_staged_generation_ = image_generation_;
         if (node_.shown())
-            scene_->note_damage_physical(node_.rect()); // same rect, new pixels
+            scene_->note_damage(node_.logical_rect()); // same rect, new pixels
     }
-    const int w = static_cast<int>(view_.width < canvas_ ? view_.width : canvas_);
-    const int h = static_cast<int>(view_.height < canvas_ ? view_.height : canvas_);
-    // Output pixels, as the plane is placed: the image is already at its pixel size.
-    const int px = floor_px((x_ - projection_.origin.x) * projection_.scale);
-    const int py = floor_px((y_ - projection_.origin.y) * projection_.scale);
-    const lx::rect2i dst{px - view_.hot_x, py - view_.hot_y, w, h};
-    if (node_.shown() && rects_equal(dst, node_.rect()))
+    const unsigned w = view.width < canvas_ ? view.width : canvas_;
+    const unsigned h = view.height < canvas_ ? view.height : canvas_;
+    const lx::rect2i before = node_.logical_rect();
+    const bool was_shown = node_.shown();
+    node_.show(x_, y_, w, h, view.hot_x, view.hot_y, theme_scale120_[sw_index_] / 120.0);
+    const lx::rect2i after = node_.logical_rect();
+    if (was_shown && rects_equal(before, after))
         return;
-    // Old and new as separate rects: a pointer that jumped far is two small repaints.
-    if (node_.shown())
-        scene_->note_damage_physical(node_.rect());
-    scene_->note_damage_physical(dst);
-    node_.show(dst);
-}
-
-void lx::compositor::cursor_manager::set_projection(scene::output_projection projection) {
-    if (projection.origin.x == projection_.origin.x && projection.origin.y == projection_.origin.y &&
-        projection.scale == projection_.scale)
-        return;
-    projection_ = projection;
-    // The hotspot of a client image is scaled at resolve; the position at publish.
-    force_image_ = true;
-    needs_resolve_ = true;
-    frame_pending_ = true;
+    // Old and new as separate rects: a pointer that jumped far is two small repaints, and
+    // each reaches every output it touches (the damage fans out).
+    if (was_shown)
+        scene_->note_damage(before);
+    scene_->note_damage(after);
 }
 
 void lx::compositor::cursor_manager::on_tick() {

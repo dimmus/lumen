@@ -12,10 +12,36 @@ export namespace lx::drm {
 class kms_device;
 class kms_cursor_plane;
 
+/// Outputs (CRTC pipelines) one device drives at most; also the width of every mask over
+/// pipelines.
+inline constexpr unsigned k_max_pipelines = 16;
+
 struct kms_damage_region {
     lx::rect2i rects[16]{};
     unsigned count = 0;
     bool full_frame = true;
+};
+
+/// A `drmModeModeInfo`, kept as its 68 uapi bytes so libdrm stays out of interfaces.
+struct drm_mode_blob {
+    unsigned char bytes[68]{};
+};
+
+/// One mode of a connector, as probed (`kms_device::probe_connectors`).
+struct kms_mode {
+    unsigned width = 0;
+    unsigned height = 0;
+    /// mHz, from the timings (not the kernel's rounded `vrefresh`): 59.94 Hz is 59940.
+    unsigned refresh_mhz = 0;
+    /// DRM_MODE_TYPE_PREFERRED.
+    bool preferred = false;
+    /// DRM_MODE_FLAG_* (interlace, doublescan, …).
+    unsigned flags = 0;
+    drm_mode_blob kms{};
+
+    [[nodiscard]] bool valid() const { return width > 0 && height > 0; }
+    /// Same timings (what a modeset would program), whatever the type bits say.
+    [[nodiscard]] bool same_timings(const kms_mode& o) const;
 };
 
 /// A KMS property as `neutral_property_value` sees it (libdrm stays out of the interface).
@@ -51,7 +77,6 @@ enum class neutral_rule : unsigned char {
                                           const char* enum_name, unsigned long long& out);
 
 struct atomic_commit_request {
-    unsigned connector = 0;
     unsigned framebuffer_id = 0;
     kms_damage_region damage{};
     bool request_page_flip = true;
@@ -97,76 +122,149 @@ struct page_flip_event {
     bool content = false;
     /// `atomic_commit_request::user_tag` of the commit this event completes.
     unsigned tag = 0;
-    /// The CRTC the event came from (0 for a synthetic completion).
+    /// The CRTC the event came from.
     unsigned crtc_id = 0;
 };
 
 using page_flip_handler = void (*)(page_flip_event event, void* user_data);
 
-class kms_atomic_commit {
-public:
-    explicit kms_atomic_commit(kms_device& device);
-    /// Puts the CRTC back the way the console left it, so exiting on a TTY does not leave
-    /// a dead display behind.
-    ~kms_atomic_commit();
+/// What a pipeline drives: one CRTC, the primary plane scanning out on it and the connector
+/// it is routed to. Chosen by `assign_crtcs` (`:crtc_alloc`).
+struct kms_pipeline_desc {
+    unsigned crtc_id = 0;
+    /// Index of the CRTC in the resource list: the bit `possible_crtcs` masks use.
+    unsigned crtc_index = 0;
+    unsigned primary_plane_id = 0;
+    unsigned connector_id = 0;
+};
 
-    kms_atomic_commit(const kms_atomic_commit&) = delete;
-    kms_atomic_commit& operator=(const kms_atomic_commit&) = delete;
+class kms_pipeline;
+struct modeset_entry;
+[[nodiscard]] lx::result<void> commit_modeset(kms_device& device, const modeset_entry* entries,
+                                              unsigned count, bool test_only);
+
+/// `drmModeAtomicCommit` user data. One shape for a single pipeline's commit and for a
+/// combined modeset: the pipelines whose event it still owes (registry bits) and each one's
+/// flip generation when it was issued. The device routes every event by its CRTC; an event
+/// whose pipeline's generation moved since (a resume disowned it) is dropped.
+///
+/// The bits are per pipeline, armed by the commit and consumed by that pipeline's event: a
+/// cookie shared by several commits in flight at once (the device's combined cookies, when
+/// separate modesets are issued within one flip latency) never loses an earlier commit's
+/// event to a later one. A pipeline has at most one commit in flight, so its bit and
+/// generation are never armed twice before its event consumes them.
+struct flip_cookie {
+    kms_device* device = nullptr;
+    std::atomic<unsigned> mask{0};
+    std::atomic<unsigned> generation[k_max_pipelines]{};
+
+    /// Committing thread, before the ioctl (the event can be drained before it returns).
+    void arm(unsigned slot, unsigned flip_generation) {
+        if (slot >= k_max_pipelines)
+            return;
+        generation[slot].store(flip_generation, std::memory_order_release);
+        mask.fetch_or(1u << slot, std::memory_order_acq_rel);
+    }
+    /// A commit that raised no event after all (refused, or retried blocking without one).
+    void disarm(unsigned slots) { mask.fetch_and(~slots, std::memory_order_acq_rel); }
+    /// Event-draining thread: the event for pipeline `slot`, now at `flip_generation`.
+    /// True when the cookie owed it one from that generation; the bit is consumed either way.
+    [[nodiscard]] bool take(unsigned slot, unsigned flip_generation) {
+        if (slot >= k_max_pipelines)
+            return false;
+        const unsigned bit = 1u << slot;
+        if (!(mask.fetch_and(~bit, std::memory_order_acq_rel) & bit))
+            return false;
+        return generation[slot].load(std::memory_order_acquire) == flip_generation;
+    }
+};
+
+/// One CRTC pipeline: the per-output half of KMS (wlroots' `wlr_drm_connector` + its CRTC,
+/// KWin's `DrmPipeline`). Frames are committed per pipeline — one nonblocking atomic commit
+/// and one flip event per CRTC, so outputs flip independently (ADR 008 M5); configuration
+/// changes of several pipelines go through `commit_modeset` together.
+///
+/// Render affinity for commits; the flip handler runs on the thread that calls
+/// `kms_device::dispatch_events` (UI).
+class kms_pipeline {
+public:
+    /// `route_events` false: the pipeline is never entered in the device's registry, so no
+    /// flip event reaches it and no other thread can see it — a candidate checked by
+    /// TEST_ONLY on the committing thread (`commit_modeset` with `test_only`) and dropped.
+    kms_pipeline(kms_device& device, const kms_pipeline_desc& desc, bool route_events = true);
+    /// Puts the CRTC back the way the console left it, so exiting on a TTY does not leave
+    /// a dead display behind, and leaves the device's registry.
+    ~kms_pipeline();
+
+    kms_pipeline(const kms_pipeline&) = delete;
+    kms_pipeline& operator=(const kms_pipeline&) = delete;
+
+    [[nodiscard]] const kms_pipeline_desc& desc() const { return desc_; }
+    [[nodiscard]] unsigned crtc_id() const { return desc_.crtc_id; }
+    [[nodiscard]] unsigned connector_id() const { return desc_.connector_id; }
+
+    /// The mode the next modeset programs. Taking a new one makes the next content commit a
+    /// modeset again (`needs_modeset`). The framebuffer must be sized to it.
+    void set_mode(const kms_mode& mode);
+    [[nodiscard]] const kms_mode& mode() const { return mode_; }
+    /// The next content commit is a full modeset: never modeset, `set_mode`, or
+    /// `prepare_resume` since.
+    [[nodiscard]] bool needs_modeset() const { return !modeset_attempted_; }
+    /// Adaptive sync (VRR_ENABLED on the CRTC, ADR 008 §C.4): stated by every modeset of this
+    /// pipeline (off unless set; the neutral reset leaves another master's VRR behind). A
+    /// change makes the next content commit a modeset. Only meaningful on a connector with
+    /// `vrr_capable`; the CRTC must have the property.
+    void set_vrr(bool on) {
+        if (vrr_ != on) {
+            vrr_ = on;
+            modeset_attempted_ = false;
+        }
+    }
+    [[nodiscard]] bool vrr() const { return vrr_; }
 
     /// Committing thread (render). The first commit — and the first after
-    /// `prepare_resume` — is a full modeset: connector → CRTC, MODE_ID and ACTIVE, the
-    /// primary plane with its in-fence, the cursor plane when given, and every other plane
-    /// left on this CRTC (another master's overlay) disabled. Everything else a previous
-    /// master can leave behind is reset to the driver's initial state where the object has
-    /// it (`neutral_property_value`): CRTC gamma/degamma LUT, CTM and VRR; connector
-    /// link-status, Colorspace, HDR_OUTPUT_METADATA, max bpc and Broadcast RGB; rotation,
-    /// alpha, pixel blend mode and zpos of the primary and cursor planes. A driver that
-    /// refuses those (EINVAL) gets the modeset once more without them. Nonblocking, with a flip event; a
-    /// driver that refuses a nonblocking modeset (EINVAL) gets it once more blocking, and
-    /// that completion is reported by the next `dispatch_events` (see
-    /// `completion_needs_dispatch`). The flip handler never runs on the committing thread:
-    /// a failure is reported by the return value only.
+    /// `prepare_resume` or `set_mode` — is a full modeset of this pipeline alone (see
+    /// `commit_modeset`); several pipelines that all need one are better committed together
+    /// through `commit_modeset`. Nonblocking, with a flip event; the flip handler never runs
+    /// on the committing thread: a failure is reported by the return value only.
     [[nodiscard]] lx::result<void> commit(const atomic_commit_request& request);
     void set_page_flip_handler(page_flip_handler handler, void* user_data = nullptr);
-    /// The thread that owns the flip handler (UI): drains flip events (the card fd is
-    /// nonblocking, so this never waits) and reports a blocking modeset's completion.
-    /// An event from before the last `prepare_resume` is dropped unreported.
-    void dispatch_events();
     /// The last successful commit completed synchronously (a blocking modeset), so no
     /// event will arrive on the card fd: the committing thread must have the event-draining
-    /// thread call `dispatch_events`, which reports it as the flip.
+    /// thread call `kms_device::dispatch_events`, which reports it as the flip.
     [[nodiscard]] bool completion_needs_dispatch() const {
         return synthetic_flip_.load(std::memory_order_acquire);
     }
     /// Committing thread, before the first commit after the session regained the device
-    /// (VT switch back): the KMS state is whatever the last master left, so the next
-    /// content commit is a full modeset again. Flip events still in flight are disowned
-    /// (their generation is stale), `flip_pending` is cleared. The CRTC state saved at the
-    /// first modeset (the console's, restored at exit) is kept.
+    /// (VT switch back) or the CRTC was powered off: the KMS state is whatever the last
+    /// master left, so the next content commit is a full modeset again. Flip events still in
+    /// flight are disowned (their generation is stale), `flip_pending` is cleared. The CRTC
+    /// state saved at the first modeset (the console's, restored at exit) is kept.
     void prepare_resume();
     /// Committing thread. Display power off (zwlr_output_power_v1 off): the kernel's atomic
     /// "DPMS off" — CRTC ACTIVE=0 with MODE_ID and the connector routing kept, and `cursor`
-    /// (when given) taken off its CRTC. One **blocking** ALLOW_MODESET commit with no event:
-    /// drivers differ on whether a disabled CRTC sends one, and the caller needs none. The
-    /// primary plane stays attached (an inactive CRTC's planes are not scanned out, and the
-    /// power-on modeset states it again); a driver that refuses that (EINVAL) is asked once
-    /// more with the primary plane detached too. Requires a CRTC this object has modeset
-    /// before (mode_invalid otherwise). Power comes back on through `prepare_resume`: the
-    /// next content commit is a full modeset with ACTIVE=1. Fails with EBUSY semantics while
-    /// a flip is pending — check `flip_pending` first.
-    [[nodiscard]] lx::result<void> commit_power_off(kms_cursor_plane* cursor,
-                                                    unsigned connector = 0);
+    /// (when given) taken off its CRTC. One **blocking** ALLOW_MODESET commit with no event.
+    /// A driver that refuses it (EINVAL) is asked once more with the primary plane detached
+    /// too. Requires a CRTC this object has modeset before (mode_invalid otherwise). Power
+    /// comes back on through `prepare_resume`. Fails with EBUSY semantics while a flip is
+    /// pending — check `flip_pending` first.
+    [[nodiscard]] lx::result<void> commit_power_off(kms_cursor_plane* cursor);
+
+    /// The console state saved at the first modeset is not put back when this object goes:
+    /// its output was unplugged or disabled at runtime, so there is nothing to give back
+    /// (and lighting a monitor the session turned off would be wrong).
+    void forget_saved_state();
 
     [[nodiscard]] bool supports_atomic_damage() const;
-    /// Clips are limited to the connector's active mode, which is what the scanout
-    /// framebuffer is sized to; the kernel fails the whole commit for a clip past it.
-    void build_damage_blob(const kms_damage_region& region, unsigned connector_index = 0);
+    /// Clips are limited to the pipeline's mode, which is what the scanout framebuffer is
+    /// sized to; the kernel fails the whole commit for a clip past it.
+    void build_damage_blob(const kms_damage_region& region);
     void set_framebuffer(unsigned fb_id);
 
     /// True while a flip requested by `commit()` has not yet been reported by
-    /// `dispatch_events()`. A CRTC takes one flip at a time, so committing again before
-    /// then is rejected with EBUSY. Set on the committing thread, cleared on the thread
-    /// that drains events.
+    /// `kms_device::dispatch_events()`. A CRTC takes one flip at a time, so committing again
+    /// before then is rejected with EBUSY. Set on the committing thread, cleared on the
+    /// thread that drains events.
     [[nodiscard]] bool flip_pending() const;
 
     /// True when the last failed `commit()` was the kernel refusing the requested state
@@ -178,33 +276,47 @@ public:
     /// is in front. logind drops master before it signals the pause, so a commit can lose
     /// this race. Committing thread only.
     [[nodiscard]] bool last_failure_lost_master() const { return last_lost_master_; }
+    /// Registry slot in the device (0..15), the bit of masks over pipelines.
+    [[nodiscard]] unsigned registry_slot() const { return reg_slot_; }
+    /// Leaves the device's registry now (the committing thread, when its output is retired):
+    /// no event is routed to it any more and `commit_modeset` no longer counts its CRTC as
+    /// owned. The thread draining events may still hold it until its current dispatch
+    /// returns, so the object itself is destroyed there (ADR 008 §B.3). Idempotent.
+    void leave_registry();
 
 private:
+    friend class kms_device;
+    friend lx::result<void> commit_modeset(kms_device& device, const modeset_entry* entries,
+                                           unsigned count, bool test_only);
+
     [[nodiscard]] lx::result<void> ensure_props();
-    /// Full atomic modeset: binds connector → CRTC, sets the mode and enables the plane.
-    /// Without it the CRTC keeps the mode the console left behind and the driver never
-    /// shows our framebuffer.
-    [[nodiscard]] lx::result<void> apply_modeset(const atomic_commit_request& request,
-                                                 unsigned crtc, unsigned fb, unsigned width,
-                                                 unsigned height);
+    /// Looks up the modeset-only properties (CRTC MODE_ID/ACTIVE/VRR_ENABLED, connector
+    /// CRTC_ID) and the neutral settings, once.
+    [[nodiscard]] bool ensure_modeset_props(int fd);
     /// Reports one flip to the handler (event-draining thread only). `hw`: a kernel event
     /// (its sequence and CRTC are real), else a blocking modeset's synthetic completion.
-    void emit_flip(lx::runtime::clock_time timestamp_ns, unsigned sequence, unsigned crtc_id,
-                   bool hw);
+    void emit_flip(lx::runtime::clock_time timestamp_ns, unsigned sequence, bool hw);
     /// Records what the commit about to raise the flip shows (committing thread, before the
     /// ioctl — the event can be drained before the ioctl returns).
     void note_inflight(const atomic_commit_request& request) {
         inflight_tag_.store(request.user_tag, std::memory_order_relaxed);
         inflight_content_.store(request.update_primary, std::memory_order_release);
     }
+    /// A kernel event for this pipeline (event-draining thread).
+    void on_kernel_flip(flip_cookie* cookie, unsigned sequence,
+                        lx::runtime::clock_time timestamp_ns);
+    /// A blocking modeset of this pipeline completed: reported at the next dispatch.
+    void sweep_synthetic();
+    /// The cookie this pipeline's next single commit carries; armed (generation stamped)
+    /// when the commit asks for an event.
+    [[nodiscard]] flip_cookie& next_cookie(bool with_event);
+    void set_failure(int commit_errno);
 
-    /// `drmModeAtomicCommit` user data: which generation of commits an event belongs to.
-    /// Two slots, so the one the in-flight commits point at is not rewritten by the
-    /// generation after it.
-    struct flip_cookie {
-        kms_atomic_commit* owner = nullptr;
-        std::atomic<unsigned> generation{0};
-    };
+    kms_device* device_ = nullptr;
+    kms_pipeline_desc desc_{};
+    unsigned reg_slot_ = ~0u;
+    kms_mode mode_{};
+
     flip_cookie cookies_[2]{};
     std::atomic<unsigned> flip_generation_{0};
     /// A blocking modeset completed; `dispatch_events` reports it.
@@ -215,9 +327,11 @@ private:
     unsigned prop_conn_crtc_ = 0;
     unsigned prop_crtc_mode_ = 0;
     unsigned prop_crtc_active_ = 0;
+    unsigned prop_crtc_vrr_ = 0;
+    bool vrr_ = false;
 
-    /// Neutral values a modeset writes (see `commit`), resolved at the first modeset —
-    /// the cursor plane's when it is first part of one.
+    /// Neutral values a modeset writes (see `commit_modeset`), resolved at the first
+    /// modeset — the cursor plane's when it is first part of one.
     struct neutral_setting {
         unsigned object = 0;
         unsigned prop = 0;
@@ -230,7 +344,6 @@ private:
     /// Appends the neutral settings of one object (`object_type` = DRM_MODE_OBJECT_*).
     void resolve_neutral(int fd, unsigned object, unsigned object_type, bool cursor_plane);
 
-    kms_device* device_ = nullptr;
     page_flip_handler flip_handler_ = nullptr;
     void* flip_user_ = nullptr;
     bool atomic_damage_ = false;
@@ -270,5 +383,53 @@ private:
     void* saved_crtc_ = nullptr;
     unsigned saved_connector_ = 0;
 };
+
+/// One pipeline's part of a combined modeset (`commit_modeset`).
+struct modeset_entry {
+    kms_pipeline* pipe = nullptr;
+    /// False: the pipeline goes dark — CRTC off (ACTIVE=0, no MODE_ID), connector unrouted,
+    /// planes detached (an output being disabled or removed).
+    bool enable = true;
+    /// The first frame of the new configuration (sized to the pipeline's mode).
+    unsigned framebuffer_id = 0;
+    /// Borrowed sync_file the primary plane waits on, -1 for none.
+    int in_fence_fd = -1;
+    /// Borrowed; stated in full when given (shown where wanted, or off).
+    kms_cursor_plane* cursor = nullptr;
+    unsigned user_tag = 0;
+    bool request_page_flip = true;
+    /// TEST_ONLY of another mode than the pipeline's own (`set_mode` would make its next
+    /// commit a modeset): a mode change is tested before the output switches to it. Null:
+    /// `pipe->mode()`.
+    const kms_mode* mode = nullptr;
+    /// A disabled entry whose connector object no longer exists (an MST port that went):
+    /// only its CRTC and planes are turned off.
+    bool connector_gone = false;
+    /// VRR_ENABLED for this modeset: -1 the pipeline's own (`set_vrr`), 0 or 1 to TEST_ONLY
+    /// another (an output configuration that changes adaptive sync).
+    int vrr = -1;
+};
+
+/// A configuration change of several pipelines in **one** ALLOW_MODESET commit (sway's
+/// `wlr_backend_commit`, KWin's pipeline commit): each enabled entry gets connector → CRTC,
+/// its `mode()` as MODE_ID, ACTIVE=1, its primary plane (with the in-fence) and cursor plane,
+/// and every other plane left on its CRTC detached; a disabled entry goes dark. Everything
+/// a previous master can leave behind is reset to the driver's initial state where the
+/// object has it (`neutral_property_value`): CRTC gamma/degamma LUT, CTM and VRR; connector
+/// link-status, Colorspace, HDR_OUTPUT_METADATA, max bpc and Broadcast RGB; rotation, alpha,
+/// pixel blend mode and zpos of the primary and cursor planes. CRTCs no registered pipeline
+/// owns that a previous master left active are turned off in the same commit, with their
+/// planes and the connectors routed to them — otherwise the console or another compositor
+/// keeps scanning a stale picture out on a monitor this session does not use (wlroots MR
+/// 3967).
+///
+/// `test_only`: DRM_MODE_ATOMIC_TEST_ONLY of exactly that state (no event, nothing applied).
+/// Otherwise nonblocking with one flip event per CRTC; a driver that refuses a nonblocking
+/// modeset (EINVAL) gets it once more blocking — then each pipeline's completion is reported
+/// by the next `kms_device::dispatch_events` (`completion_needs_dispatch`) — and, refused
+/// again, once more without the neutral settings. Every pipeline must have no flip pending.
+/// On failure no pipeline changed state; `last_failure_*` of every entry's pipeline says why.
+[[nodiscard]] lx::result<void> commit_modeset(kms_device& device, const modeset_entry* entries,
+                                              unsigned count, bool test_only);
 
 } // namespace lx::drm

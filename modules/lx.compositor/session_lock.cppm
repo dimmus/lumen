@@ -243,4 +243,27 @@ private:
     bool hint_ = false;
 };
 
+/// Which outputs have shown a locked frame since the scene locked (ADR 008 M14): `locked`
+/// goes out only once every live output has flipped a frame at least as new as the first
+/// locked one, or is dark (VT away, powered off, never lit) — never while one output may
+/// still show the session. An output added while locking is one more that must show it.
+class lock_frame_tracker {
+public:
+    /// The scene locked: nothing counts as shown yet.
+    void begin();
+    /// Output `slot` flipped (or published, without KMS) a locked frame.
+    void shown(unsigned slot);
+    /// Output `slot` went, or a new output took the slot: nothing of it was shown locked.
+    void forget(unsigned slot) {
+        if (slot < 32)
+            shown_ &= ~(1u << slot);
+    }
+    /// Every output in `live` is in `shown` or `dark` (no live output: nothing to wait for).
+    [[nodiscard]] bool complete(unsigned live, unsigned dark) const;
+    [[nodiscard]] unsigned shown_mask() const { return shown_; }
+
+private:
+    unsigned shown_ = 0;
+};
+
 } // namespace lx::compositor
