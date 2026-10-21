@@ -29,7 +29,7 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("viewporter-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_VIEWPORTER)
 #include "viewporter-server-protocol.h"
 #define LUMEN_HAS_VIEWPORTER 1
 #endif

@@ -28,55 +28,55 @@ module;
 #undef namespace
 #pragma clang diagnostic pop
 #endif
-#if __has_include("primary-selection-unstable-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_PRIMARY_SELECTION_UNSTABLE_V1)
 #include "primary-selection-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_PRIMARY_SELECTION 1
 #endif
-#if __has_include("xdg-activation-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
 #include "xdg-activation-v1-server-protocol.h"
 #define LUMEN_HAS_XDG_ACTIVATION 1
 #endif
-#if __has_include("viewporter-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_VIEWPORTER)
 #include "viewporter-server-protocol.h"
 #define LUMEN_HAS_VIEWPORTER 1
 #endif
-#if __has_include("fractional-scale-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1)
 #include "fractional-scale-v1-server-protocol.h"
 #define LUMEN_HAS_FRACTIONAL_SCALE 1
 #endif
-#if __has_include("presentation-time-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_PRESENTATION_TIME)
 #include "presentation-time-server-protocol.h"
 #define LUMEN_HAS_PRESENTATION 1
 #endif
-#if __has_include("ext-idle-notify-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1)
 #include "ext-idle-notify-v1-server-protocol.h"
 #define LUMEN_HAS_IDLE_NOTIFY 1
 #endif
-#if __has_include("idle-inhibit-unstable-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_IDLE_INHIBIT_UNSTABLE_V1)
 #include "idle-inhibit-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_IDLE_INHIBIT 1
 #endif
-#if __has_include("wlr-output-power-management-unstable-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
 #include "wlr-output-power-management-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_OUTPUT_POWER 1
 #endif
-#if __has_include("wlr-output-management-unstable-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1)
 #include "wlr-output-management-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_OUTPUT_MANAGEMENT 1
 #endif
-#if __has_include("ext-session-lock-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
 #include "ext-session-lock-v1-server-protocol.h"
 #define LUMEN_HAS_SESSION_LOCK 1
 #endif
-#if __has_include("text-input-unstable-v3-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3)
 #include "text-input-unstable-v3-server-protocol.h"
 #define LUMEN_HAS_TEXT_INPUT 1
 #endif
-#if __has_include("input-method-unstable-v2-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2)
 #include "input-method-unstable-v2-server-protocol.h"
 #define LUMEN_HAS_INPUT_METHOD 1
 #endif
-#if __has_include("virtual-keyboard-unstable-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_VIRTUAL_KEYBOARD_UNSTABLE_V1)
 #include "virtual-keyboard-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_VIRTUAL_KEYBOARD 1
 #endif

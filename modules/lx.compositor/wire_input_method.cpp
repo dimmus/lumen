@@ -47,11 +47,11 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("input-method-unstable-v2-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2)
 #include "input-method-unstable-v2-server-protocol.h"
 #define LUMEN_HAS_INPUT_METHOD 1
 #endif
-#if __has_include("virtual-keyboard-unstable-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_VIRTUAL_KEYBOARD_UNSTABLE_V1)
 #include "virtual-keyboard-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_VIRTUAL_KEYBOARD 1
 #endif

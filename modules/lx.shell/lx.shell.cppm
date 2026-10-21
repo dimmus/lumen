@@ -23,17 +23,17 @@ module;
 #include "cursor-shape-v1-client-protocol.h"
 #include "zlm_shell_v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
-#if __has_include("xdg-activation-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
 #include "xdg-activation-v1-client-protocol.h"
 #define LUMEN_SHELL_ACTIVATION 1
 #endif
-#if __has_include("viewporter-client-protocol.h") && __has_include("fractional-scale-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_VIEWPORTER) && defined(LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1)
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #define LUMEN_SHELL_FRACTIONAL 1
 #endif
-#if __has_include("ext-idle-notify-v1-client-protocol.h") && \
-    __has_include("wlr-output-power-management-unstable-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1) && \
+    defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
 #include "ext-idle-notify-v1-client-protocol.h"
 #include "wlr-output-power-management-unstable-v1-client-protocol.h"
 #define LUMEN_SHELL_IDLE 1

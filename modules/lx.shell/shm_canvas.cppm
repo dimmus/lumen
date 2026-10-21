@@ -16,7 +16,7 @@ module;
 #include <unistd.h>
 
 #include <wayland-client.h>
-#if __has_include("viewporter-client-protocol.h") && __has_include("fractional-scale-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_VIEWPORTER) && defined(LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1)
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #define LUMEN_SHELL_FRACTIONAL 1

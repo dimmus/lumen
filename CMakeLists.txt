@@ -54,6 +54,9 @@ if(LUMEN_HAS_WAYLAND_SCANNER AND LUMEN_PROTOCOL_GLUE_SOURCES)
         add_dependencies(lumen-protocol-glue lumen-protocol-glue-headers)
     endif()
     target_include_directories(lumen-protocol-glue PUBLIC "${LUMEN_GENERATED_DIR}")
+    # LUMEN_PROTOCOL_<XML_STEM>=1 per generated protocol: code gates on these, so a protocol
+    # that appears or goes changes the compile commands and nothing stale survives a rebuild.
+    target_compile_definitions(lumen-protocol-glue PUBLIC ${LUMEN_PROTOCOL_DEFINITIONS})
     if(WAYLAND_FOUND)
         target_include_directories(lumen-protocol-glue PUBLIC ${WAYLAND_INCLUDE_DIRS})
     endif()

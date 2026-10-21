@@ -33,7 +33,7 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
-#if __has_include("ext-session-lock-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_TEST_SESSION_LOCK 1
 #endif

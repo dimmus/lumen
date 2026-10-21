@@ -40,38 +40,38 @@
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
-#if __has_include("primary-selection-unstable-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_PRIMARY_SELECTION_UNSTABLE_V1)
 #include "primary-selection-unstable-v1-client-protocol.h"
 #define LUMEN_TEST_PRIMARY_SELECTION 1
 #endif
-#if __has_include("xdg-activation-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
 #include "xdg-activation-v1-client-protocol.h"
 #define LUMEN_TEST_ACTIVATION 1
 #endif
-#if __has_include("viewporter-client-protocol.h") && __has_include("fractional-scale-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_VIEWPORTER) && defined(LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1)
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #define LUMEN_TEST_VIEWPORTER 1
 #endif
-#if __has_include("presentation-time-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_PRESENTATION_TIME)
 #include "presentation-time-client-protocol.h"
 #define LUMEN_TEST_PRESENTATION 1
 #endif
-#if __has_include("ext-idle-notify-v1-client-protocol.h") && \
-    __has_include("idle-inhibit-unstable-v1-client-protocol.h") && \
-    __has_include("wlr-output-power-management-unstable-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1) && \
+    defined(LUMEN_PROTOCOL_IDLE_INHIBIT_UNSTABLE_V1) && \
+    defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
 #include "ext-idle-notify-v1-client-protocol.h"
 #include "idle-inhibit-unstable-v1-client-protocol.h"
 #include "wlr-output-power-management-unstable-v1-client-protocol.h"
 #define LUMEN_TEST_IDLE 1
 #endif
-#if __has_include("ext-session-lock-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_TEST_SESSION_LOCK 1
 #endif
-#if __has_include("text-input-unstable-v3-client-protocol.h") && \
-    __has_include("input-method-unstable-v2-client-protocol.h") && \
-    __has_include("virtual-keyboard-unstable-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3) && \
+    defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2) && \
+    defined(LUMEN_PROTOCOL_VIRTUAL_KEYBOARD_UNSTABLE_V1)
 #include "text-input-unstable-v3-client-protocol.h"
 #include "input-method-unstable-v2-client-protocol.h"
 #include "virtual-keyboard-unstable-v1-client-protocol.h"

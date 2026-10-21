@@ -97,4 +97,27 @@ if(NOT _LUMEN_MANIFEST_RESULT EQUAL 0)
 endif()
 
 include("${LUMEN_GENERATED_PROTOCOLS_CMAKE}")
+
+# Re-run configure when the protocol set can have changed: the manifest, its generator, or a
+# fetch (fetch-protocols.sh touches the stamp). Without this a fetch after configure leaves the
+# build on the old protocol set until someone runs cmake by hand.
+set(LUMEN_PROTOCOL_FETCH_STAMP "${CMAKE_SOURCE_DIR}/protocols/upstream/.fetch-stamp")
+if(NOT EXISTS "${LUMEN_PROTOCOL_FETCH_STAMP}")
+    file(MAKE_DIRECTORY "${CMAKE_SOURCE_DIR}/protocols/upstream")
+    file(TOUCH "${LUMEN_PROTOCOL_FETCH_STAMP}")
+endif()
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${LUMEN_PROTOCOL_MANIFEST}"
+    "${CMAKE_SOURCE_DIR}/scripts/protocol_manifest.py"
+    "${LUMEN_PROTOCOL_FETCH_STAMP}")
+
+if(LUMEN_PROTOCOLS_MISSING)
+    list(LENGTH LUMEN_PROTOCOLS_MISSING _LUMEN_MISSING_COUNT)
+    list(JOIN LUMEN_PROTOCOLS_MISSING "\n    " _LUMEN_MISSING_LIST)
+    message(WARNING
+        "${_LUMEN_MISSING_COUNT} protocol XML file(s) from protocols/manifest.toml are missing:\n"
+        "    ${_LUMEN_MISSING_LIST}\n"
+        "Lumen builds without them and does not offer those protocols. "
+        "Run ./scripts/fetch-protocols.sh; the next build re-configures by itself.")
+endif()
 # LUMEN_GENERATED_PROTOCOL_SOURCES / LUMEN_PROTOCOL_GLUE_* set by included file.
