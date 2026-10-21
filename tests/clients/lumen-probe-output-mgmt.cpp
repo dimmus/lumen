@@ -29,7 +29,7 @@
 #include <vector>
 
 #include <wayland-client.h>
-#if __has_include("wlr-output-management-unstable-v1-client-protocol.h")
+#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_MANAGEMENT_UNSTABLE_V1)
 #include "wlr-output-management-unstable-v1-client-protocol.h"
 #define PROBE_HAS_OUTPUT_MANAGEMENT 1
 #endif

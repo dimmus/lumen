@@ -81,6 +81,9 @@ done < <(grep -v -e '^TAG=' -e '^WLROOTS_TAG=' "$LIST")
 
 rm -rf "$TMP" "$LIST"
 
+# The build lists this stamp as a configure dependency, so the next build picks up what changed.
+touch "$DEST/.fetch-stamp"
+
 if [[ "$FAILED" -ne 0 ]]; then
     echo "==> Failed: ${#MISSING[@]} protocol path(s) not found:" >&2
     for p in "${MISSING[@]}"; do

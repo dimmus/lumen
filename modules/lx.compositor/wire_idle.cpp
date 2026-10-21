@@ -32,11 +32,11 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("ext-idle-notify-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1)
 #include "ext-idle-notify-v1-server-protocol.h"
 #define LUMEN_HAS_IDLE_NOTIFY 1
 #endif
-#if __has_include("idle-inhibit-unstable-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_IDLE_INHIBIT_UNSTABLE_V1)
 #include "idle-inhibit-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_IDLE_INHIBIT 1
 #endif

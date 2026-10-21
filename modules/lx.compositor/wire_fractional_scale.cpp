@@ -27,7 +27,7 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("fractional-scale-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_FRACTIONAL_SCALE_V1)
 #include "fractional-scale-v1-server-protocol.h"
 #define LUMEN_HAS_FRACTIONAL_SCALE 1
 #endif

@@ -29,7 +29,7 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("text-input-unstable-v3-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3)
 #include "text-input-unstable-v3-server-protocol.h"
 #define LUMEN_HAS_TEXT_INPUT 1
 #endif

@@ -537,7 +537,7 @@ void fire_frames(unsigned frame_time_ms, bool throttle, unsigned slot, unsigned 
 // ── wire_presentation.cpp (wp_presentation) ────────────────────────────────
 
 /// wp_presentation (a P1 protocol; defined only when its glue exists — wire_install.cpp
-/// calls it under the same `__has_include` guard).
+/// calls it under the same `LUMEN_PROTOCOL_*` guard).
 void bind_presentation(wayland::client_connection& client, unsigned id, int version);
 /// The content-update hooks of wl_surface (wire_surface.cpp calls them; no-ops without a
 /// feedback table): pending → cached, cached → current, and the surface going away —
@@ -553,7 +553,7 @@ void presentation_drop_cached(surface_obj* s);
 // ── wire_viewporter.cpp, wire_fractional_scale.cpp ──────────────────────────
 
 /// wp_viewporter / wp_fractional_scale_manager_v1 (P1 protocols; defined only when their
-/// glue exists — wire_install.cpp calls them under the same `__has_include` guard).
+/// glue exists — wire_install.cpp calls them under the same `LUMEN_PROTOCOL_*` guard).
 void bind_viewporter(wayland::client_connection& client, unsigned id, int version);
 void bind_fractional_scale(wayland::client_connection& client, unsigned id, int version);
 /// wl_surface commit precheck: `bad_size` / `out_of_buffer` on the state this commit
@@ -568,7 +568,7 @@ void fractional_scale_update(surface_obj* s, std::uint32_t scale120);
 // ── wire_session_lock.cpp (ext-session-lock-v1) ────────────────────────────
 
 /// ext_session_lock_manager_v1 (defined only when its glue exists — wire_install.cpp calls it
-/// under the same `__has_include` guard).
+/// under the same `LUMEN_PROTOCOL_*` guard).
 void bind_session_lock_manager(wayland::client_connection& client, unsigned id, int version);
 /// wl_surface commit precheck of a lock surface: commit_before_first_ack, null_buffer,
 /// dimensions_mismatch on the state the commit produces. False when an error was posted.
@@ -590,7 +590,7 @@ void session_lock_outputs_changed();
 
 /// zwp_text_input_manager_v3 v2 / zwp_input_method_manager_v2 v1 /
 /// zwp_virtual_keyboard_manager_v1 v1 (defined only when their glue exists — wire_install.cpp
-/// calls them under the same `__has_include` guards).
+/// calls them under the same `LUMEN_PROTOCOL_*` guards).
 void bind_text_input_manager(wayland::client_connection& client, unsigned id, int version);
 void bind_input_method_manager(wayland::client_connection& client, unsigned id, int version);
 void bind_virtual_keyboard_manager(wayland::client_connection& client, unsigned id, int version);
@@ -696,7 +696,7 @@ void for_each_output_resource(wl_client* client, unsigned slot, void (*fn)(wl_re
 
 /// ext_idle_notifier_v1 v2 / zwp_idle_inhibit_manager_v1 v1 / zwlr_output_power_manager_v1
 /// v1 (P1 protocols; defined only when their glue exists — wire_install.cpp calls them under
-/// the same `__has_include` guards).
+/// the same `LUMEN_PROTOCOL_*` guards).
 void bind_idle_notifier(wayland::client_connection& client, unsigned id, int version);
 void bind_idle_inhibit_manager(wayland::client_connection& client, unsigned id, int version);
 void bind_output_power_manager(wayland::client_connection& client, unsigned id, int version);
@@ -766,7 +766,7 @@ void dnd_source_destroyed(xfer_source* source);
 void dnd_client_destroyed(wl_client* client);
 void install_dnd(p0_protocol_context& ctx);
 /// Defined only when the primary-selection glue exists (a P1 protocol); wire_install.cpp
-/// calls them under the same `__has_include` guard.
+/// calls them under the same `LUMEN_PROTOCOL_*` guard.
 void bind_primary_selection_manager(wayland::client_connection& client, unsigned id,
                                     int version);
 void install_primary_selection(p0_protocol_context& ctx);
@@ -779,7 +779,7 @@ unsigned wm_last_user_serial(void* user, void* surface);
 /// A wl_surface is going: tokens naming it as their requester forget it.
 void activation_surface_destroyed(lx::surface_id surface);
 /// Defined only when the xdg-activation glue exists (a P1 protocol); wire_install.cpp calls
-/// it under the same `__has_include` guard.
+/// it under the same `LUMEN_PROTOCOL_*` guard.
 void bind_activation(wayland::client_connection& client, unsigned id, int version);
 
 // ── wire_install.cpp ───────────────────────────────────────────────────────

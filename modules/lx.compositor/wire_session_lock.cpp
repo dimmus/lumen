@@ -41,7 +41,7 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("ext-session-lock-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
 #include "ext-session-lock-v1-server-protocol.h"
 #define LUMEN_HAS_SESSION_LOCK 1
 #endif

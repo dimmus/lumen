@@ -73,6 +73,19 @@ generated: no shipping input method speaks it, and an interface nothing uses wou
 build time. The newer `zwp_virtual_keyboard_v1.invalid_keymap_format` error (value 1) is in
 wlroots main but not in the 0.20.2 XML; the compositor posts its wire value.
 
+### Building with a protocol, or without it
+
+Every manifest protocol whose XML is present gets C glue and a compile definition,
+`LUMEN_PROTOCOL_<XML_STEM>=1` (`ext-idle-notify-v1.xml` gives
+`LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1`), on `lumen-protocol-glue` and so on every target that
+links it. Code that needs a protocol's generated header tests that definition, never
+`__has_include` on the header: a header that appears after a first build changes no compile
+command, so ninja would not recompile and ccache would hand back the object built without it.
+
+A missing XML is a configure warning that lists every missing file. `fetch-protocols.sh`
+touches `upstream/.fetch-stamp`, which the build lists as a configure dependency together with
+`manifest.toml`, so the next `cmake --build` after a fetch re-configures by itself.
+
 ## Privileged client model
 
 The compositor advertises `zlm_shell_v1` only to clients that pass:

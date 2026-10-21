@@ -21,7 +21,7 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("xdg-activation-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
 #include "xdg-activation-v1-server-protocol.h"
 #define LUMEN_HAS_XDG_ACTIVATION 1
 #endif

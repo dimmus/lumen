@@ -31,7 +31,7 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("presentation-time-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_PRESENTATION_TIME)
 #include "presentation-time-server-protocol.h"
 #define LUMEN_HAS_PRESENTATION 1
 #endif

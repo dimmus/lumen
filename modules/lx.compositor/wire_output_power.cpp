@@ -31,7 +31,7 @@ module;
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
-#if __has_include("wlr-output-power-management-unstable-v1-server-protocol.h")
+#if defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
 #include "wlr-output-power-management-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_OUTPUT_POWER 1
 #endif
