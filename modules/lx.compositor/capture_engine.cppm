@@ -25,12 +25,9 @@ module;
 // Bounded: one job per session in flight (the protocol has one frame per session), fixed
 // tables, no allocation per frame (a session's staging is sized once).
 
-#include <atomic>
-#include <cstdint>
-#include <mutex>
-#include <vector>
-
 export module lx.compositor:capture_engine;
+
+import std;
 
 import lx.foundation;
 import lx.gfx;

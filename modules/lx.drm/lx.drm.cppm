@@ -1,13 +1,7 @@
 module;
 
-#include <atomic>
-#include <chrono>
-#include <memory>
-
 #if defined(LUMEN_HAS_DRM)
-#include <cerrno>
-#include <cstdio>
-#include <cstring>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -19,11 +13,15 @@ module;
 #define DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT 6
 #endif
 #endif
+#include <stdint.h>
+#include <stddef.h>
 
 import lx.foundation;
 import lx.runtime;
 
 export module lx.drm;
+
+import std;
 
 export import :atomic;
 export import :cursor;

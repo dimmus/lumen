@@ -1,9 +1,5 @@
 module;
 
-#include <atomic>
-#include <chrono>
-#include <thread>
-
 #if !defined(_WIN32)
 #include <poll.h>
 #include <sys/epoll.h>
@@ -11,12 +7,16 @@ module;
 #include <sys/timerfd.h>
 #include <unistd.h>
 #endif
+#include <errno.h>
+#include <time.h>
 
 import lx.foundation;
 import lx.sync;
 import lx.trace;
 
 export module lx.runtime;
+
+import std;
 
 export import :executor;
 export import :memory;

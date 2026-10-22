@@ -4,19 +4,11 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cerrno>
-#include <climits>
-#include <csignal>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
+#include <time.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -36,6 +28,8 @@ import lx.foundation;
 import lx.trace;
 
 export module lx.shell:app_launch;
+
+import std;
 
 import :desktop_entry;
 import :app_catalog;
@@ -302,6 +296,11 @@ void launch_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, k_launch_category, line);
 }
 
+template <typename... Args>
+void launch_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_launch_category, fmt, std::forward<Args>(args)...);
+}
+
 [[nodiscard]] bool launch_debug() {
     return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
 }
@@ -362,9 +361,8 @@ void set_workdir(std::string_view path, std::string_view home, char (&out)[PATH_
         if (is_dir(out))
             return;
         if (launch_debug()) {
-            char line[PATH_MAX + 64];
-            std::snprintf(line, sizeof(line), "apps: Path %s is not a directory: using $HOME", out);
-            launch_log(lx::trace::level::debug, line);
+            launch_log(lx::trace::level::debug, "apps: Path {} is not a directory: using $HOME",
+                       out);
         }
     }
     copy_str(out, PATH_MAX, home.empty() ? std::string_view{"/"} : home);
@@ -696,12 +694,10 @@ void lx::shell::app_launcher::systemd_gone(const char* why) {
     if (told_fallback_)
         return;
     told_fallback_ = true;
-    char line[256];
-    std::snprintf(line, sizeof(line),
-                  "apps: systemd --user unavailable (%s) — launching with double fork (not "
-                  "resource-tracked)",
-                  why);
-    launch_log(lx::trace::level::info, line);
+    launch_log(lx::trace::level::info,
+               "apps: systemd --user unavailable ({}) — launching with double fork (not "
+               "resource-tracked)",
+               why);
 }
 
 void lx::shell::app_launcher::finish_pipe(pending_pipe& pp) {
@@ -844,11 +840,9 @@ void lx::shell::app_launcher::run_deadlines() {
             now = monotonic_us();
         if (now >= pp.release_at_us) {
             if (launch_debug()) {
-                char line[192];
-                std::snprintf(line, sizeof(line),
-                              "apps: %s: scope not ready in time — started outside it for now",
-                              pp.outcome.id);
-                launch_log(lx::trace::level::debug, line);
+                launch_log(lx::trace::level::debug,
+                           "apps: {}: scope not ready in time — started outside it for now",
+                           pp.outcome.id);
             }
             release_hold(pp);
         }
@@ -930,9 +924,8 @@ void lx::shell::app_launcher::dispatch(const pollfd* fds, unsigned n) {
             const int r = sd_bus_process(bus, nullptr);
             if (r <= 0) {
                 if (r < 0) {
-                    char line[128];
-                    std::snprintf(line, sizeof(line), "apps: user bus failed: %s", std::strerror(-r));
-                    launch_log(lx::trace::level::warn, line);
+                    launch_log(lx::trace::level::warn, "apps: user bus failed: {}",
+                               std::strerror(-r));
                     for (auto& u : units_)
                         if (u.used && u.slot)
                             u.slot = sd_bus_slot_unref(static_cast<sd_bus_slot*>(u.slot));
@@ -1020,9 +1013,7 @@ struct lx::shell::app_launcher::events {
                         u.scope_for->outcome.unit[0] = '\0'; // not in it
                 }
                 if (launch_debug() && result && std::strcmp(result, "done") != 0) {
-                    char line[384];
-                    std::snprintf(line, sizeof(line), "apps: scope %s: %s", unit, result);
-                    launch_log(lx::trace::level::debug, line);
+                    launch_log(lx::trace::level::debug, "apps: scope {}: {}", unit, result);
                 }
                 if (u.slot)
                     sd_bus_slot_unref(static_cast<sd_bus_slot*>(u.slot));
@@ -1062,10 +1053,8 @@ struct lx::shell::app_launcher::events {
         const char* name = err && err->name ? err->name : "unknown";
         const start_error_class kind = classify_start_error(name);
         if (err && err->message && launch_debug()) {
-            char line[384];
-            std::snprintf(line, sizeof(line), "apps: StartTransientUnit %s: %s: %s", u->unit, name,
-                          err->message);
-            launch_log(lx::trace::level::debug, line);
+            launch_log(lx::trace::level::debug, "apps: StartTransientUnit {}: {}: {}", u->unit,
+                       name, err->message);
         }
         if (kind == start_error_class::unknown_outcome) {
             // The call timed out, but systemd may still run it: never launched a second
@@ -1123,10 +1112,8 @@ struct lx::shell::app_launcher::events {
     static int subscribed(sd_bus_message* m, void*, sd_bus_error*) {
         if (sd_bus_message_is_method_error(m, nullptr)) {
             const sd_bus_error* err = sd_bus_message_get_error(m);
-            char line[192];
-            std::snprintf(line, sizeof(line), "apps: systemd Subscribe failed: %s",
-                          err && err->name ? err->name : "?");
-            launch_log(lx::trace::level::debug, line);
+            launch_log(lx::trace::level::debug, "apps: systemd Subscribe failed: {}",
+                       err && err->name ? err->name : "?");
         }
         return 0;
     }
@@ -1166,15 +1153,13 @@ bool lx::shell::app_launcher::open_bus() {
     }
     mode_ = version ? launch_mode_for_version(version) : systemd_launch_mode::scope;
     {
-        char line[256];
-        std::snprintf(line, sizeof(line), "apps: systemd --user %s: %s",
-                      version ? version : (err.name ? err.name : "version unknown"),
-                      mode_ == systemd_launch_mode::service
-                          ? "one transient service per launch"
-                          : "one transient scope per launch (no ExitType=cgroup before 250)");
         launch_log(mode_ == systemd_launch_mode::service ? lx::trace::level::debug
                                                          : lx::trace::level::info,
-                   line);
+                   "apps: systemd --user {}: {}",
+                   version ? version : (err.name ? err.name : "version unknown"),
+                   mode_ == systemd_launch_mode::service
+                       ? "one transient service per launch"
+                       : "one transient scope per launch (no ExitType=cgroup before 250)");
     }
     sd_bus_message_unref(reply);
     sd_bus_error_free(&err);
@@ -1279,9 +1264,8 @@ bool lx::shell::app_launcher::start_unit(const prepared_launch& p, std::string_v
         r = sd_bus_call_async(bus, &slot, m, events::started, u, 0);
     sd_bus_message_unref(m);
     if (r < 0) {
-        char line[160];
-        std::snprintf(line, sizeof(line), "apps: StartTransientUnit not sent: %s", std::strerror(-r));
-        launch_log(lx::trace::level::warn, line);
+        launch_log(lx::trace::level::warn, "apps: StartTransientUnit not sent: {}",
+                   std::strerror(-r));
         return false;
     }
     u->owner = this;

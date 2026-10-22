@@ -1,22 +1,19 @@
 module;
 
-#include <cstdint>
-#include <cstring>
-#include <new>
-
 #if defined(LUMEN_HAS_TEXT)
 #include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <hb-ft.h>
 #include <hb.h>
-#include <mutex>
 #endif
 
 import lx.foundation;
 import lx.gfx;
 
 export module lx.text;
+
+import std;
 
 export namespace lx::text {
 

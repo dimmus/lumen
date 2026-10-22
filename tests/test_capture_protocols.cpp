@@ -15,17 +15,8 @@
 // wrong-size buffer; stopped and failed(stopped) when the window unmaps; the session lock
 // (the curtain, then nothing until unlock, then a full frame); wlr-screencopy copy and
 // copy_with_damage (waits for damage, reports it).
-#include <atomic>
-#include <cerrno>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <functional>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
+#include <errno.h>
+#include <stdio.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -47,7 +38,9 @@
 #define LUMEN_TEST_CAPTURE 1
 #endif
 #endif
+#include <stdint.h>
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.scheduler;

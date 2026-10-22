@@ -1,7 +1,6 @@
 #include "lumen_test.hpp"
 
-#include <cstring>
-
+import std;
 import lx.runtime;
 
 // The arena used to set capacity_ to the requested size while storage_ stayed on a 64 KiB

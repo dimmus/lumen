@@ -1,8 +1,7 @@
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <signal.h>
+#include <stdio.h>
 
+import std;
 import lx.compositor;
 
 namespace {

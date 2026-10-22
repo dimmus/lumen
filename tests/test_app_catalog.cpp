@@ -2,17 +2,14 @@
 // inotify staleness, search ranking and terminal selection — against temporary directories.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.shell;
 

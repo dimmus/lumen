@@ -34,9 +34,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <new>
+#include <stdint.h>
 
 #include <unistd.h>
 
@@ -45,6 +43,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -87,6 +87,12 @@ const char* kind_name(xfer_family f) { return f == xfer_family::clipboard ? "cli
 
 void sel_log(const char* line) {
     lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+}
+
+template <typename... Args>
+void sel_log(std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_category, fmt,
+                                     std::forward<Args>(args)...);
 }
 
 unsigned res_id(wl_resource* r) { return r ? wl_resource_get_id(r) : 0; }
@@ -158,10 +164,9 @@ void warn_offer_table_full(wl_client* client) {
         if (w == id)
             return;
     warned_full[warned_next++ % 16] = id;
-    char line[96];
-    std::snprintf(line, sizeof(line),
-                  "selection offer table full client=%u — sending no selection", id);
-    lx::trace::logger::global().log(lx::trace::level::warn, k_category, line);
+    lx::trace::logger::global().logf(lx::trace::level::warn, k_category,
+                                     "selection offer table full client={} — sending no selection",
+                                     id);
 }
 
 /// The source's own marshalling: a data-control source owning the clipboard is sent
@@ -239,12 +244,9 @@ void deliver(xfer_device* dev, const char* cause) {
     }
     ops.send_selection(dev->resource, o ? o->resource : nullptr);
     if (surface_debug()) {
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "selection offer kind=%s client=%u offer=%u mimes=%u cause=%s",
-                      kind_name(dev->family), wire_client_id(dev->client),
-                      res_id(o ? o->resource : nullptr), o ? src->mimes.count() : 0u, cause);
-        sel_log(line);
+        sel_log("selection offer kind={} client={} offer={} mimes={} cause={}",
+                kind_name(dev->family), wire_client_id(dev->client),
+                res_id(o ? o->resource : nullptr), o ? src->mimes.count() : 0u, cause);
     }
 }
 
@@ -272,10 +274,7 @@ void source_destroy_resource(wl_resource* r) {
         // job (ext-data-control), not the compositor's.
         sel.source = nullptr;
         if (surface_debug()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "selection clear kind=%s cause=source-destroyed",
-                          kind_name(s->family));
-            sel_log(line);
+            sel_log("selection clear kind={} cause=source-destroyed", kind_name(s->family));
         }
         deliver_to_client(s->family, focus_client, "clear");
         data_control_selection_changed(s->family);
@@ -299,10 +298,8 @@ void device_destroy_resource(wl_resource* r) {
 void log_reject(xfer_family f, wl_client* client, uint32_t serial, const char* why) {
     if (!surface_debug())
         return;
-    char line[128];
-    std::snprintf(line, sizeof(line), "selection reject kind=%s client=%u serial=%u reason=%s",
-                  kind_name(f), wire_client_id(client), serial, why);
-    sel_log(line);
+    sel_log("selection reject kind={} client={} serial={} reason={}", kind_name(f),
+            wire_client_id(client), serial, why);
 }
 
 } // namespace
@@ -348,12 +345,9 @@ void xfer_set_selection_control(xfer_family f, xfer_source* src) {
     if (src)
         src->role = source_role::selection;
     if (surface_debug()) {
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "selection set kind=%s client=%u source=%u mimes=%u by=data-control",
-                      kind_name(f), src ? wire_client_id(src->client) : 0u,
-                      res_id(src ? src->resource : nullptr), src ? src->mimes.count() : 0u);
-        sel_log(line);
+        sel_log("selection set kind={} client={} source={} mimes={} by=data-control", kind_name(f),
+                src ? wire_client_id(src->client) : 0u, res_id(src ? src->resource : nullptr),
+                src ? src->mimes.count() : 0u);
     }
     deliver_to_client(f, focus_client, "set");
     data_control_selection_changed(f);
@@ -453,24 +447,18 @@ void xfer_source_offer(xfer_source* s, const char* mime) {
     if (s->used) {
         // Offers already sent cannot grow; the type would be refused at receive anyway.
         if (surface_debug()) {
-            char line[192];
-            std::snprintf(line, sizeof(line),
-                          "selection offer-late kind=%s client=%u source=%u mime=%.96s",
-                          kind_name(s->family), wire_client_id(s->client), res_id(s->resource),
-                          mime ? mime : "-");
-            sel_log(line);
+            sel_log("selection offer-late kind={} client={} source={} mime={:.96}",
+                    kind_name(s->family), wire_client_id(s->client), res_id(s->resource),
+                    mime ? mime : "-");
         }
         return;
     }
     if (!s->mimes.add(mime) && !s->mime_overflow_logged) {
         s->mime_overflow_logged = true;
         if (surface_debug()) {
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "selection offer-overflow kind=%s client=%u source=%u mimes=%u",
-                          kind_name(s->family), wire_client_id(s->client), res_id(s->resource),
-                          s->mimes.count());
-            sel_log(line);
+            sel_log("selection offer-overflow kind={} client={} source={} mimes={}",
+                    kind_name(s->family), wire_client_id(s->client), res_id(s->resource),
+                    s->mimes.count());
         }
     }
 }
@@ -565,14 +553,10 @@ void xfer_offer_receive(xfer_offer* o, const char* mime, int32_t fd) {
     // Marshalling dup'ed it (or nothing was sent): the compositor's copy is closed either way.
     ::close(fd);
     if (surface_debug()) {
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "selection receive kind=%s client=%u source_client=%u mime=%.96s "
-                      "result=%s%s%s",
-                      kind_name(o->family), wire_client_id(o->client),
-                      src ? wire_client_id(src->client) : 0u, mime ? mime : "-",
-                      why ? "ignored" : "sent", why ? " reason=" : "", why ? why : "");
-        sel_log(line);
+        sel_log("selection receive kind={} client={} source_client={} mime={:.96} result={}{}{}",
+                kind_name(o->family), wire_client_id(o->client),
+                src ? wire_client_id(src->client) : 0u, mime ? mime : "-", why ? "ignored" : "sent",
+                why ? " reason=" : "", why ? why : "");
     }
 }
 
@@ -591,12 +575,9 @@ void xfer_focus_changed(void*, void* old_client_ptr, void* new_client_ptr) {
             for (unsigned f = 0; f < k_xfer_families; ++f) {
                 if (!inert[f])
                     continue;
-                char line[128];
-                std::snprintf(line, sizeof(line),
-                              "selection inert kind=%s client=%u offers=%u cause=focus-lost",
-                              kind_name(static_cast<xfer_family>(f)), wire_client_id(old_client),
-                              inert[f]);
-                sel_log(line);
+                sel_log("selection inert kind={} client={} offers={} cause=focus-lost",
+                        kind_name(static_cast<xfer_family>(f)), wire_client_id(old_client),
+                        inert[f]);
             }
         }
     }

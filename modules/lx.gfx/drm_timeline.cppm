@@ -1,5 +1,7 @@
 module;
 
+#include <signal.h>
+
 // DRM timeline syncobjs for linux-drm-syncobj-v1 (explicit sync): the client's timelines,
 // imported once as handles on the compositor's DRM fd, and the operations the protocol needs
 // on their points — is the acquire point signalled, wake me when it is (an eventfd the UI
@@ -7,10 +9,9 @@ module;
 // and behind an ops table so the protocol logic is tested without a syncobj-capable driver.
 // Bodies are in drm_timeline.cpp.
 
-#include <atomic>
-#include <mutex>
-
 export module lx.gfx:drm_timeline;
+
+import std;
 
 import lx.foundation;
 

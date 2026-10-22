@@ -4,10 +4,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cerrno>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
+#include <stdint.h>
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
@@ -26,6 +23,8 @@ import lx.text;
 import lx.trace;
 
 export module lx.shell:panel;
+
+import std;
 
 import :task_model;
 import :bridge;
@@ -597,6 +596,11 @@ void panel_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, k_panel_category, line);
 }
 
+template <typename... Args>
+void panel_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_panel_category, fmt, std::forward<Args>(args)...);
+}
+
 [[nodiscard]] bool intersects(lx::rect2i a, int x, int w) {
     return w > 0 && x < a.x + a.width && x + w > a.x;
 }
@@ -754,20 +758,14 @@ void lx::shell::panel::log_layout(const panel_layout& l) const {
         return;
     for (unsigned i = 0; i < l.count; ++i) {
         const task_entry* e = bridge_->model().get(l.cells[i].task);
-        char line[384];
-        std::snprintf(line, sizeof(line), "layout idx=%u x=%d w=%d handle=%u title=\"%s\"", i,
-                      l.cells[i].x, l.cells[i].w, l.cells[i].task.index, e ? e->title : "");
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug, "layout idx={} x={} w={} handle={} title=\"{}\"", i,
+                  l.cells[i].x, l.cells[i].w, l.cells[i].task.index, e ? e->title : "");
     }
     if (l.hidden) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "layout more=%u x=%d", l.hidden, l.more_x);
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug, "layout more={} x={}", l.hidden, l.more_x);
     }
     if (l.apps_w > 0) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "layout apps x=%d w=%d", l.apps_x, l.apps_w);
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug, "layout apps x={} w={}", l.apps_x, l.apps_w);
     }
 }
 
@@ -895,10 +893,8 @@ void lx::shell::panel::pointer_button(unsigned button, bool down) {
         return;
     if (panel_debug()) {
         const task_entry* e = bridge_->model().get(pressed);
-        char line[384];
-        std::snprintf(line, sizeof(line), "click idx=%d handle=%u title=\"%s\"", hit,
-                      pressed.index, e ? e->title : "");
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug, "click idx={} handle={} title=\"{}\"", hit,
+                  pressed.index, e ? e->title : "");
     }
     if (action_fn_)
         action_fn_(panel_action::task, action_user_);
@@ -924,9 +920,7 @@ struct lx::shell::panel::events {
             p.width_ = nw;
             p.height_ = nh;
             p.resized_ = true;
-            char line[96];
-            std::snprintf(line, sizeof(line), "configure serial=%u w=%d h=%d", serial, nw, nh);
-            panel_log(lx::trace::level::info, line);
+            panel_log(lx::trace::level::info, "configure serial={} w={} h={}", serial, nw, nh);
         }
         p.configured_ = true;
         // The ack takes effect with the next commit: make one even if nothing changed.
@@ -1086,12 +1080,9 @@ void lx::shell::panel::draw(bool force) {
         for (unsigned i = 0; i < next_.count; ++i)
             if (next_.cells[i].flags & cell_focused)
                 focused = static_cast<int>(i);
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "draw entries=%u hidden=%u focused=%d damage=%u%s repaint=%u buffer=%d",
-                      next_.count, next_.hidden, focused, nd, arrangement ? "(full)" : "", nr,
-                      bi);
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug,
+                  "draw entries={} hidden={} focused={} damage={}{} repaint={} buffer={}",
+                  next_.count, next_.hidden, focused, nd, arrangement ? "(full)" : "", nr, bi);
     }
 }
 

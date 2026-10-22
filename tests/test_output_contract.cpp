@@ -11,13 +11,7 @@
 //   - at scale 1 no preferred_buffer_scale / _transform is sent (they equal the defaults);
 //   - an output change seen by a frame tick (here: a transform) is sent to every bound
 //     wl_output (geometry … done) and as preferred_buffer_transform to the v6 surfaces on it.
-#include <atomic>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <thread>
+#include <stdio.h>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -30,7 +24,9 @@
 #include "xdg-output-unstable-v1-client-protocol.h"
 #endif
 #endif
+#include <stdint.h>
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.scheduler;

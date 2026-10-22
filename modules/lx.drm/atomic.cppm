@@ -1,11 +1,11 @@
 module;
 
-#include <atomic>
-
 import lx.foundation;
 import lx.runtime;
 
 export module lx.drm:atomic;
+
+import std;
 
 export namespace lx::drm {
 

@@ -2,11 +2,6 @@ module;
 
 // Bodies of `lx.gfx:gl_capture`. See gl_capture.cppm for the model.
 
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
 #if defined(LUMEN_HAS_EGL)
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -17,6 +12,8 @@ module;
 #endif
 
 module lx.gfx;
+
+import std;
 
 import lx.foundation;
 import :damage;

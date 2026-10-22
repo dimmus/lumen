@@ -1,8 +1,6 @@
-module;
-
-#include <cstdint>
-
 export module lx.compositor:keybindings;
+
+import std;
 
 // The compositor's key bindings: its own (VT switching, the logout chord) and the key grabs
 // the shell registers over zlm_shell_v1 v4. Wayland-free and allocation-free, UI affinity:

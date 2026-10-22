@@ -6,8 +6,7 @@
 // one batch: hints deduplicated, past eight (or after a hint-less event) all connectors.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-
+import std;
 import lx.drm;
 
 using lx::drm::hotplug_batch;

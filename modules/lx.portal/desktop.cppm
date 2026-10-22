@@ -16,13 +16,9 @@ module;
 // No Wayland type crosses this interface; the overlay reaches the raw objects through the
 // `void*` accessors.
 
-#include <cstdint>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <vector>
-
 export module lx.portal:desktop;
+
+import std;
 
 import lx.foundation;
 import :compose;

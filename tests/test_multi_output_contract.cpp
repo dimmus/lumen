@@ -8,13 +8,7 @@
 //     width, enters it only, and gets its scales (preferred_buffer_scale 2, fractional 180);
 //   - moving an output re-sends its wl_output/xdg-output group (geometry, position, done) to
 //     every bound object of that output only.
-#include <atomic>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <thread>
+#include <stdio.h>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -35,7 +29,9 @@
 #include "fractional-scale-v1-client-protocol.h"
 #endif
 #endif
+#include <stdint.h>
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.scheduler;

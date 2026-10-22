@@ -27,9 +27,9 @@ module;
 // with its refresh and MSC, and its visibility is recorded from that output's publishes. A
 // surface shown on two outputs is paced once.
 
-#include <initializer_list>
-
 export module lx.compositor:presentation_feedback;
+
+import std;
 
 import lx.foundation;
 

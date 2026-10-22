@@ -5,18 +5,16 @@
 // URIs, user-dirs.dirs, and xdg-desktop-portal-wlr's chooser lines.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <ctime>
-#include <string>
-#include <vector>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.gfx;
 import lx.portal;

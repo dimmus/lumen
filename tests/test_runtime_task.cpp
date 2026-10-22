@@ -1,11 +1,9 @@
 #include "lumen_test.hpp"
 
-#include <atomic>
-#include <chrono>
-#include <thread>
 
 #include <unistd.h>
 
+import std;
 import lx.runtime;
 
 namespace {

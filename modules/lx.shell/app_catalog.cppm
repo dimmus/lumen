@@ -1,29 +1,20 @@
 module;
 
-#include <algorithm>
-#include <chrono>
-#include <climits>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <unordered_set>
-#include <vector>
+#include <limits.h>
 
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/inotify.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <errno.h>
 
 import lx.foundation;
 import lx.trace;
 
 export module lx.shell:app_catalog;
+
+import std;
 
 import :desktop_entry;
 
@@ -158,6 +149,11 @@ void apps_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, k_apps_category, line);
 }
 
+template <typename... Args>
+void apps_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_apps_category, fmt, std::forward<Args>(args)...);
+}
+
 [[nodiscard]] bool starts_with(std::string_view s, std::string_view p) {
     return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
 }
@@ -273,10 +269,7 @@ void lx::shell::app_catalog::read_entry(walk_state& w, int dirfd, const char* na
     ++w.files;
     if (too_large) {
         if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-            char line[512];
-            std::snprintf(line, sizeof(line), "desktop file %.*s: larger than 64 KiB: skipped",
-                          static_cast<int>(file.size()), file.data());
-            apps_log(lx::trace::level::debug, line);
+            apps_log(lx::trace::level::debug, "desktop file {}: larger than 64 KiB: skipped", file);
         }
         e.id = w.arena->store(id);
         e.file = w.arena->store(file);
@@ -406,13 +399,10 @@ void lx::shell::app_catalog::scan() {
     stats_.dirs = w.dirs;
     stats_.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
                     .count();
-    char line[192];
-    std::snprintf(line, sizeof(line),
-                  "apps: catalog %u entries, %u listed (%u files, %u dirs) in %.2f ms; "
-                  "terminal %s",
-                  stats_.entries, stats_.listed, stats_.files, stats_.dirs, stats_.ms,
-                  terminal_.found ? terminal_.source : "none");
-    apps_log(lx::trace::level::info, line);
+    apps_log(lx::trace::level::info,
+             "apps: catalog {} entries, {} listed ({} files, {} dirs) in {:.2f} ms; terminal {}",
+             stats_.entries, stats_.listed, stats_.files, stats_.dirs, stats_.ms,
+             terminal_.found ? terminal_.source : "none");
 }
 
 bool lx::shell::app_catalog::on_watch_readable() {

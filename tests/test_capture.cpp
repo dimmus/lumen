@@ -7,10 +7,7 @@
 // curtains, window views).
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstring>
-#include <vector>
-
+import std;
 import lx.foundation;
 import lx.gfx;
 import lx.compositor;

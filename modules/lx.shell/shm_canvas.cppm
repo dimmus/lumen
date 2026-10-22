@@ -4,11 +4,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
+#include <stdint.h>
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <fcntl.h>
@@ -22,12 +18,15 @@ module;
 #define LUMEN_SHELL_FRACTIONAL 1
 #endif
 #endif
+#include <stdlib.h>
 
 import lx.foundation;
 import lx.text;
 import lx.trace;
 
 export module lx.shell:shm_canvas;
+
+import std;
 
 export namespace lx::shell {
 

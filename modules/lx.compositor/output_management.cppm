@@ -22,9 +22,9 @@ module;
 //
 // Member bodies are in output_management.cpp (Clang 23 module-partition workaround).
 
-#include <cstdint>
-
 export module lx.compositor:output_management;
+
+import std;
 
 export namespace lx::compositor::mgmt {
 

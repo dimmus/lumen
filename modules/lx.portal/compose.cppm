@@ -17,12 +17,9 @@ module;
 // Pixels are 0xAARRGGBB words (WL_SHM_FORMAT_XRGB8888 / ARGB8888 little-endian, what the
 // compositor offers for shm captures); every composed pixel is opaque.
 
-#include <cstdint>
-#include <span>
-#include <string>
-#include <vector>
-
 export module lx.portal:compose;
+
+import std;
 
 import lx.foundation;
 

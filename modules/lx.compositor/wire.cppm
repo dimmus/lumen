@@ -6,13 +6,16 @@ module;
 // unit keeps its own helpers in an anonymous namespace, so only what is declared here has
 // module linkage.
 
-#include <cstdint>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #endif
+#include <signal.h>
 
 module lx.compositor:wire;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -555,6 +558,12 @@ inline bool client_dying(wl_client* client) {
 
 inline void surface_log(const char* line) {
     lx::trace::logger::global().log(lx::trace::level::debug, "compositor.surface", line);
+}
+
+template <typename... Args>
+void surface_log(std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.surface", fmt,
+                                     std::forward<Args>(args)...);
 }
 
 /// Every wl_surface record (wire_surface.cpp). Scanned by buffer and frame-callback

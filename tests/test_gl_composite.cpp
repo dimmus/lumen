@@ -6,17 +6,14 @@
 // software rasterizer has nothing to say about this path.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
-#include <vector>
 
 #if defined(LUMEN_HAS_EGL)
 #include <GLES2/gl2.h>
 #endif
 
+import std;
 import lx.foundation;
 import lx.gfx;
 

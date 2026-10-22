@@ -3,8 +3,7 @@
 // bookkeeping over a real surface_manager and scene graph — no Wayland.
 #include "lumen_test.hpp"
 
-#include <memory>
-
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.gfx;

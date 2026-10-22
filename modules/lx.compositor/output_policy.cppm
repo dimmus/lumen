@@ -14,13 +14,12 @@ module;
 // KWin). The fallback order when a mode fails its TEST_ONLY is sway's `search_valid_config`:
 // the chosen mode, the preferred one, then the rest by area × refresh.
 
-#include <cstdint>
-#include <cstring>
-
 import lx.foundation;
 import lx.drm;
 
 export module lx.compositor:output_policy;
+
+import std;
 
 import :output;
 

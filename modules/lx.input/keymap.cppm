@@ -1,12 +1,9 @@
 module;
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <stdlib.h>
 
 #if defined(LUMEN_HAS_INPUT)
-#include <cerrno>
-#include <new>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -16,6 +13,8 @@ module;
 import lx.foundation;
 
 export module lx.input:keymap;
+
+import std;
 
 export namespace lx::input {
 

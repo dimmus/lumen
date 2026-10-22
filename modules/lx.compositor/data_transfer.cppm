@@ -1,9 +1,6 @@
-module;
-
-#include <cstdint>
-#include <cstring>
-
 export module lx.compositor:data_transfer;
+
+import std;
 
 export namespace lx::compositor {
 

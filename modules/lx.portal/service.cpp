@@ -2,17 +2,10 @@ module;
 
 // Bodies of `:service`. See service.cppm for the model.
 
-#include <cerrno>
-#include <csignal>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <errno.h>
+#include <signal.h>
+#include <stdint.h>
+#include <time.h>
 
 #include <poll.h>
 #include <sys/signalfd.h>
@@ -24,6 +17,8 @@ module;
 #endif
 
 module lx.portal;
+
+import std;
 
 import lx.foundation;
 import lx.trace;
@@ -43,14 +38,9 @@ constexpr const char* k_category = "portal";
 constexpr int k_capture_timeout_ms = 3000;
 constexpr long k_private_max_age_s = 3600;
 
-void log_line(lx::trace::level lvl, const char* fmt, auto... args) {
-    if constexpr (sizeof...(args) == 0) {
-        lx::trace::logger::global().log(lvl, k_category, fmt);
-    } else {
-        char buf[1024];
-        std::snprintf(buf, sizeof buf, fmt, args...);
-        lx::trace::logger::global().log(lvl, k_category, buf);
-    }
+template <typename... Args>
+void log_line(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_category, fmt, std::forward<Args>(args)...);
 }
 
 double now_ms() {
@@ -77,7 +67,8 @@ std::string save_screenshot(const image& img, bool interactive) {
     } else {
         const char* runtime = std::getenv("XDG_RUNTIME_DIR");
         if (!runtime || runtime[0] != '/') {
-            log_line(lx::trace::level::error, "XDG_RUNTIME_DIR is not set: nowhere private to save to");
+            log_line(lx::trace::level::error,
+                     "XDG_RUNTIME_DIR is not set: nowhere private to save to");
             return {};
         }
         dir = std::string(runtime) + "/lumen-portal";
@@ -285,7 +276,7 @@ int service::accept(sd_bus_message* m, request_state::kind what) {
     sd_bus_message_exit_container(m);
 
     if (req_) {
-        log_line(lx::trace::level::warn, "%s from '%s' while another request runs: answered 2",
+        log_line(lx::trace::level::warn, "{} from '{}' while another request runs: answered 2",
                  what == request_state::kind::pick ? "PickColor" : "Screenshot", app_id);
         return sd_bus_reply_method_return(m, "ua{sv}", 2u, 0);
     }
@@ -303,8 +294,9 @@ int service::accept(sd_bus_message* m, request_state::kind what) {
         sd_bus_message_unref(req->call);
         return r;
     }
-    log_line(lx::trace::level::info, "%s app='%s' interactive=%d target=%u",
-             what == request_state::kind::pick ? "PickColor" : "Screenshot", app_id, interactive ? 1 : 0, target);
+    log_line(lx::trace::level::info, "{} app='{}' interactive={} target={}",
+             what == request_state::kind::pick ? "PickColor" : "Screenshot", app_id,
+             interactive ? 1 : 0, target);
     req_ = std::move(req);
     start();
     return 1; // answered later (or already, by start)
@@ -343,9 +335,9 @@ void service::answer(unsigned response, const std::string& uri, const std::uint3
         r = sd_bus_reply_method_return(call, "ua{sv}", response == 0 ? 2u : response, 0);
     }
     if (r < 0)
-        log_line(lx::trace::level::warn, "could not answer the request: %s", std::strerror(-r));
-    log_line(lx::trace::level::info, "request answered %u in %.0f ms%s%s", response, now_ms() - req_->started_ms,
-             uri.empty() ? "" : " uri=", uri.c_str());
+        log_line(lx::trace::level::warn, "could not answer the request: {}", std::strerror(-r));
+    log_line(lx::trace::level::info, "request answered {} in {:.0f} ms{}{}", response,
+             now_ms() - req_->started_ms, uri.empty() ? "" : " uri=", uri.c_str());
     sd_bus_message_unref(call);
     sd_bus_slot_unref(req_->slot);
     // The overlay before the connection it draws on.
@@ -365,8 +357,8 @@ void service::save_and_answer(const image& img, const char* what) {
         answer(2);
         return;
     }
-    log_line(lx::trace::level::info, "screenshot (%s) %dx%d written to %s in %.0f ms", what, img.width, img.height,
-             path.c_str(), now_ms() - t0);
+    log_line(lx::trace::level::info, "screenshot ({}) {}x{} written to {} in {:.0f} ms", what,
+             img.width, img.height, path.c_str(), now_ms() - t0);
     answer(0, file_uri(path));
 }
 
@@ -439,12 +431,12 @@ void service::complete_overlay() {
     case overlay_result::kind::pending: return;
     case overlay_result::kind::cancelled: answer(1); return;
     case overlay_result::kind::failed:
-        log_line(lx::trace::level::warn, "overlay failed: %s", res.reason);
+        log_line(lx::trace::level::warn, "overlay failed: {}", res.reason);
         answer(2);
         return;
     case overlay_result::kind::colour: {
         const std::uint32_t c = res.colour;
-        log_line(lx::trace::level::info, "colour picked #%06X", c & 0xFFFFFFu);
+        log_line(lx::trace::level::info, "colour picked #{:06X}", c & 0xFFFFFFu);
         answer(0, {}, &c);
         return;
     }
@@ -504,28 +496,31 @@ void service::after_events() {
 int service::run() {
     int r = sd_bus_open_user(&bus_);
     if (r < 0) {
-        log_line(lx::trace::level::error, "cannot connect to the session bus: %s", std::strerror(-r));
+        log_line(lx::trace::level::error, "cannot connect to the session bus: {}",
+                 std::strerror(-r));
         return 1;
     }
     r = sd_bus_add_object_vtable(bus_, &object_slot_, k_object_path, "org.freedesktop.impl.portal.Screenshot",
                                  k_screenshot_vtable, this);
     if (r < 0) {
-        log_line(lx::trace::level::error, "cannot export the Screenshot object: %s", std::strerror(-r));
+        log_line(lx::trace::level::error, "cannot export the Screenshot object: {}",
+                 std::strerror(-r));
         return 1;
     }
     r = sd_bus_match_signal(bus_, &match_slot_, "org.freedesktop.DBus", "/org/freedesktop/DBus",
                             "org.freedesktop.DBus", "NameLost", on_name_lost, this);
     if (r < 0)
-        log_line(lx::trace::level::warn, "cannot watch for losing the bus name: %s", std::strerror(-r));
+        log_line(lx::trace::level::warn, "cannot watch for losing the bus name: {}",
+                 std::strerror(-r));
     const uint64_t flags = SD_BUS_NAME_ALLOW_REPLACEMENT | (options_.replace ? SD_BUS_NAME_REPLACE_EXISTING : 0);
     r = sd_bus_request_name(bus_, k_bus_name, flags);
     if (r < 0) {
-        log_line(lx::trace::level::error, "cannot own %s: %s%s", k_bus_name, std::strerror(-r),
+        log_line(lx::trace::level::error, "cannot own {}: {}{}", k_bus_name, std::strerror(-r),
                  options_.replace ? "" : " (another instance? -r replaces it)");
         return 1;
     }
-    log_line(lx::trace::level::info, "serving %s (Screenshot v%u, targets 0x%x) on display %s", k_bus_name,
-             k_screenshot_version, k_screenshot_targets,
+    log_line(lx::trace::level::info, "serving {} (Screenshot v{}, targets 0x{:x}) on display {}",
+             k_bus_name, k_screenshot_version, k_screenshot_targets,
              std::getenv("WAYLAND_DISPLAY") ? std::getenv("WAYLAND_DISPLAY") : "(unset)");
 
     sigset_t mask;
@@ -541,7 +536,7 @@ int service::run() {
         for (;;) {
             r = sd_bus_process(bus_, nullptr);
             if (r < 0) {
-                log_line(lx::trace::level::error, "D-Bus processing failed: %s", std::strerror(-r));
+                log_line(lx::trace::level::error, "D-Bus processing failed: {}", std::strerror(-r));
                 quit_ = true;
                 status = 1;
                 break;
@@ -579,7 +574,7 @@ int service::run() {
         if (fds[1].revents & POLLIN) {
             signalfd_siginfo si{};
             if (read(sfd, &si, sizeof si) > 0) {
-                log_line(lx::trace::level::info, "signal %u: exiting", si.ssi_signo);
+                log_line(lx::trace::level::info, "signal {}: exiting", si.ssi_signo);
                 quit_ = true;
             }
         }
@@ -662,7 +657,7 @@ int run_chooser(std::string_view input, std::string& chosen) {
         return res.what == overlay_result::kind::failed ? 2 : 1;
     }
     chosen = entries[static_cast<std::size_t>(res.choice)].line;
-    log_line(lx::trace::level::info, "chooser: chose '%s'", chosen.c_str());
+    log_line(lx::trace::level::info, "chooser: chose '{}'", chosen.c_str());
     return 0;
 }
 

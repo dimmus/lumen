@@ -8,8 +8,6 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
@@ -156,8 +154,11 @@ module;
 #include "wlr-screencopy-unstable-v1-server-protocol.h"
 #endif
 #endif
+#include <signal.h>
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;

@@ -10,19 +10,15 @@
 // Skips (passes) without a hardware GL renderer with ES 3.0 and EGL dma-buf import.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
 #include <fcntl.h>
 #include <poll.h>
-#include <thread>
 #include <unistd.h>
-#include <vector>
 
 #if defined(LUMEN_HAS_EGL)
 #include <gbm.h>
 #endif
 
+import std;
 import lx.foundation;
 import lx.gfx;
 import lx.compositor;

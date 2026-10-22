@@ -4,12 +4,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <string_view>
-#include <vector>
+#include <stdint.h>
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
@@ -32,6 +27,8 @@ import lx.text;
 import lx.trace;
 
 export module lx.shell:launcher;
+
+import std;
 
 import :desktop_entry;
 import :app_catalog;
@@ -690,6 +687,11 @@ void launcher_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, k_launcher_category, line);
 }
 
+template <typename... Args>
+void launcher_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_launcher_category, fmt, std::forward<Args>(args)...);
+}
+
 [[nodiscard]] bool launcher_debug() {
     return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
 }
@@ -899,9 +901,7 @@ void lx::shell::launcher::pointer_scroll_steps(int steps) {
 
 void lx::shell::launcher::closed_by_itself(const char* why) {
     if (launcher_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "launcher: close (%s)", why);
-        launcher_log(lx::trace::level::debug, line);
+        launcher_log(lx::trace::level::debug, "launcher: close ({})", why);
     }
     close();
     if (on_closed_)
@@ -1002,10 +1002,8 @@ bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, void* ou
     model_.set_rows(rows_);
     committed_.width = 0;
     dirty_ = true;
-    char line[160];
-    std::snprintf(line, sizeof(line), "launcher: open (%u applications, %dx%d, %u rows)",
-                  model_.count(), geo.width, geo.height, geo.rows);
-    launcher_log(lx::trace::level::info, line);
+    launcher_log(lx::trace::level::info, "launcher: open ({} applications, {}x{}, {} rows)",
+                 model_.count(), geo.width, geo.height, geo.rows);
     return true;
 }
 
@@ -1073,10 +1071,9 @@ void lx::shell::launcher::draw(bool force) {
     dirty_ = false;
     must_commit_ = false;
     if (launcher_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "launcher: draw matches=%u selection=%u first=%u damage=%u",
-                      next_.total, model_.selection(), next_.first, nd);
-        launcher_log(lx::trace::level::debug, line);
+        launcher_log(lx::trace::level::debug,
+                     "launcher: draw matches={} selection={} first={} damage={}", next_.total,
+                     model_.selection(), next_.first, nd);
     }
 }
 

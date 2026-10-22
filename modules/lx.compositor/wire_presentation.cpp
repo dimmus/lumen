@@ -25,9 +25,8 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <ctime>
+#include <stdint.h>
+#include <time.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -38,6 +37,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -261,14 +262,13 @@ void lx::compositor::presentation_flipped(p0_protocol_context& ctx, unsigned fra
     if (p0::g_counts.presented + p0::g_counts.discarded == 0)
         return;
     if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        char line[200];
-        std::snprintf(line, sizeof(line),
-                      "flip frame=%u t=%llu.%09llu seq=%llu refresh_ns=%u flags=0x%x "
-                      "presented=%u discarded=%u output=%u",
-                      frame, info.timestamp_ns / 1'000'000'000ull,
-                      info.timestamp_ns % 1'000'000'000ull, info.seq, info.refresh_ns, info.flags,
-                      p0::g_counts.presented, p0::g_counts.discarded, slot);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.presentation", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.presentation",
+                                         "flip frame={} t={}.{:09} seq={} refresh_ns={} "
+                                         "flags=0x{:x} presented={} discarded={} output={}",
+                                         frame, info.timestamp_ns / 1'000'000'000ull,
+                                         info.timestamp_ns % 1'000'000'000ull, info.seq,
+                                         info.refresh_ns, info.flags, p0::g_counts.presented,
+                                         p0::g_counts.discarded, slot);
     }
     p0::g_counts = {};
 #else

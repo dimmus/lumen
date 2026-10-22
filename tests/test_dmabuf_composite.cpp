@@ -6,8 +6,6 @@
 // assertion below is on pixels that could only come from the source buffer.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -18,6 +16,7 @@
 #include <xf86drmMode.h>
 #endif
 
+import std;
 import lx.foundation;
 import lx.gfx;
 

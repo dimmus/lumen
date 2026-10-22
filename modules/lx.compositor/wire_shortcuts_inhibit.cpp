@@ -28,9 +28,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <new>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -41,6 +39,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -84,10 +84,9 @@ bool locked() {
 void inhibit_log(lx::trace::level lvl, const inhibitor_obj* i, const char* what) {
     if (lvl == lx::trace::level::debug && !surface_debug())
         return;
-    char line[128];
-    std::snprintf(line, sizeof(line), "shortcuts inhibitor client=%u surface=%llu %s",
-                  wire_client_id(i->client), i->surface ? i->surface->id.id() : 0ull, what);
-    lx::trace::logger::global().log(lvl, k_category, line);
+    lx::trace::logger::global().logf(lvl, k_category, "shortcuts inhibitor client={} surface={} {}",
+                                     wire_client_id(i->client),
+                                     i->surface ? i->surface->id.id() : 0ull, what);
 }
 
 /// Sends `active` to the inhibitor that comes into effect; one that leaves it just stops.

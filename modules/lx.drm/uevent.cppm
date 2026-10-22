@@ -12,10 +12,6 @@ module;
 // (`kms_device::probe_connectors`). An idle monitor costs nothing: its socket is readable
 // only when a drm uevent arrives.
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
 #if defined(LUMEN_HAS_UDEV)
 #include <libudev.h>
 #include <sys/sysmacros.h>
@@ -25,6 +21,8 @@ module;
 import lx.foundation;
 
 export module lx.drm:uevent;
+
+import std;
 
 export namespace lx::drm {
 

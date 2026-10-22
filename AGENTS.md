@@ -164,6 +164,11 @@ When replacing a stub, remove `not_implemented` and use proper domain error code
 - Partitions: `export module lx.foo:bar` in separate `.cppm` files; re-export from facade with `export import :bar`
 - Implementation: `module :private;` section at bottom of `.cppm`, or `*.cpp` with `module lx.foo;`
 - **Imports:** `import lx.foundation;` — prefer facade imports over deep partition imports
+- **Standard library:** `import std;` right after the module declaration, never `#include <vector>`
+  or `<cstdio>`. Only C and platform headers (`<wayland-server.h>`, `<unistd.h>`, `<errno.h>`)
+  go in the global module fragment — include the plain C header when a file needs a macro
+  (`errno`, `stderr`, `UINT32_MAX`) or an unqualified C name, since modules export no macros.
+  The `std` module is built from the toolchain's own source by `cmake/LumenStdModule.cmake`
 - **Exports:** public API in `export module` / `export namespace`; hide details in private sections
 - Use **`[[nodiscard]]`** on fallible and pure query functions
 - Use **typed handles** (`toplevel_id`, `surface_id`, `client_id`, `texture_id`) — not raw pointers in public API
@@ -198,6 +203,9 @@ return err;
 ### 4.3 Logging
 
 - Default sink: stderr; override with `LUMEN_LOG` env (see errors-and-logging doc)
+- Formatted lines: `logger.logf(level, category, "id={} cause={}", …)` (`std::format` syntax,
+  checked at compile time, no allocation; a `bool` prints as `1`/`0`) — not `snprintf` into a
+  stack buffer. Scripts grep log lines: keep their text stable
 - Categories: stable, grep-friendly (`compositor`, `compositor.render`, `wayland`, `drm`, `gfx`, `shell`)
 - **Frame hot path** (`tick_ui`, `tick_render`): only `LX_TRACE_SCOPE` / `trace` level — no `info`+ logs, no heap alloc, no sync I/O
 - Startup / errors: `info`, `warn`, `error` as appropriate

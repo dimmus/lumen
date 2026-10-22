@@ -2,15 +2,9 @@ module;
 
 // Bodies of `:desktop`. See desktop.cppm for the model.
 
-#include <cerrno>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <ctime>
-#include <memory>
-#include <string>
-#include <string_view>
-#include <vector>
+#include <errno.h>
+#include <stdint.h>
+#include <time.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -37,6 +31,8 @@ module;
 
 module lx.portal;
 
+import std;
+
 import lx.foundation;
 import lx.trace;
 import :compose;
@@ -50,14 +46,9 @@ namespace {
 
 constexpr const char* k_category = "portal.wayland";
 
-void log_line(lx::trace::level lvl, const char* fmt, auto... args) {
-    if constexpr (sizeof...(args) == 0) {
-        lx::trace::logger::global().log(lvl, k_category, fmt);
-    } else {
-        char buf[512];
-        std::snprintf(buf, sizeof buf, fmt, args...);
-        lx::trace::logger::global().log(lvl, k_category, buf);
-    }
+template <typename... Args>
+void log_line(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_category, fmt, std::forward<Args>(args)...);
 }
 
 double now_ms() {
@@ -589,12 +580,14 @@ lx::result<std::vector<output_shot>> desktop::capture_outputs(bool paint_cursor,
             s.pixels = upright(static_cast<const std::uint32_t*>(j->map), j->buffer_size.width,
                                j->buffer_size.height, j->buffer_size.width,
                                static_cast<lx::buffer_transform>(j->transform & 7));
-            log_line(lx::trace::level::debug, "captured output %s %dx%d transform=%d layout=%d,%d %dx%d",
-                     s.name.c_str(), j->buffer_size.width, j->buffer_size.height, j->transform,
-                     s.logical.x, s.logical.y, s.logical.width, s.logical.height);
+            log_line(lx::trace::level::debug,
+                     "captured output {} {}x{} transform={} layout={},{} {}x{}", s.name.c_str(),
+                     j->buffer_size.width, j->buffer_size.height, j->transform, s.logical.x,
+                     s.logical.y, s.logical.width, s.logical.height);
             shots.push_back(std::move(s));
         }
-        log_line(lx::trace::level::debug, "captured %zu output(s) in %.1f ms", shots.size(), now_ms() - t0);
+        log_line(lx::trace::level::debug, "captured {} output(s) in {:.1f} ms", shots.size(),
+                 now_ms() - t0);
     }
     for (capture_job* j : jobs)
         j->destroy();

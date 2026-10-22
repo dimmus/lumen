@@ -7,8 +7,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -19,6 +18,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -51,6 +52,12 @@ void deco_log(const char* line) {
     lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
 }
 
+template <typename... Args>
+void deco_log(std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.deco", fmt,
+                                     std::forward<Args>(args)...);
+}
+
 void decoration_destroy_resource(wl_resource* r) {
     auto* d = decoration_from(r);
     if (!d)
@@ -69,9 +76,7 @@ void decoration_destroy_resource(wl_resource* r) {
             rec->desired.decoration = lx::compositor::decoration_mode::client;
             rec->last_sent.decoration = lx::compositor::decoration_mode::client;
             if (surface_debug()) {
-                char line[64];
-                std::snprintf(line, sizeof(line), "decoration destroy id=%llu", rec->id.id());
-                deco_log(line);
+                deco_log("decoration destroy id={}", rec->id.id());
             }
         }
     }
@@ -86,12 +91,10 @@ void decoration_set_request(wl_resource* resource, lx::compositor::decoration_re
         return; // inert
     rec->deco_requested = req;
     if (surface_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "decoration request id=%llu mode=%s", rec->id.id(),
-                      req == lx::compositor::decoration_request::server   ? "server"
-                      : req == lx::compositor::decoration_request::client ? "client"
-                                                                          : "unset");
-        deco_log(line);
+        deco_log("decoration request id={} mode={}", rec->id.id(),
+                 req == lx::compositor::decoration_request::server   ? "server"
+                 : req == lx::compositor::decoration_request::client ? "client"
+                                                                     : "unset");
     }
     if (d->ctx && d->ctx->wm)
         d->ctx->wm->on_decoration_request(rec->id, false);
@@ -173,10 +176,7 @@ const struct zxdg_decoration_manager_v1_interface decoration_manager_impl = {
             // called off.
             rec->deco_awaiting_configure = version < 2;
             if (surface_debug()) {
-                char line[96];
-                std::snprintf(line, sizeof(line), "decoration create id=%llu version=%d",
-                              rec->id.id(), version);
-                deco_log(line);
+                deco_log("decoration create id={} version={}", rec->id.id(), version);
             }
             if (g_p0_ctx && g_p0_ctx->wm)
                 g_p0_ctx->wm->on_decoration_request(rec->id, true);

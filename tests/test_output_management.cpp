@@ -4,9 +4,8 @@
 // of the checks at apply/test (`already_used`, then the serial → `cancelled`, then
 // `unconfigured_head`), validation into a complete target (custom modes, restated values,
 // scale rounding, adaptive sync, all-disabled, CRTC count), and the job FIFO.
-#include <cstdio>
-#include <cstring>
 
+import std;
 import lx.compositor;
 
 namespace {

@@ -8,10 +8,6 @@ module;
 // string or number — the same strings libdisplay-info falls back to, minus the vendor
 // table.
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
 #if defined(LUMEN_HAS_DISPLAY_INFO)
 // A C library whose headers carry no `extern "C"` of their own.
 extern "C" {
@@ -20,6 +16,8 @@ extern "C" {
 #endif
 
 export module lx.drm:edid;
+
+import std;
 
 export namespace lx::drm {
 

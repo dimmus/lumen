@@ -2,11 +2,10 @@
 // from the libinput device layer. These run on any machine with xkbcommon data installed.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstring>
 #include <sys/mman.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.input;
 

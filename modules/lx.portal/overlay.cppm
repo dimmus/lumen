@@ -18,13 +18,9 @@ module;
 // else. The backdrop is composed once per output at the surface's pixel size (the
 // compositor's preferred fractional scale), so it shows pixel for pixel.
 
-#include <cstdint>
-#include <memory>
-#include <span>
-#include <string>
-#include <vector>
-
 export module lx.portal:overlay;
+
+import std;
 
 import lx.foundation;
 import :compose;

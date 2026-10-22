@@ -29,13 +29,11 @@ module;
 // parse is logged once with its line and left alone until the next save, which renames it
 // to `outputs.toml.bad` first. Member bodies are in output_config_store.cpp.
 
-#include <atomic>
-#include <cstddef>
-#include <string>
-
 import lx.foundation;
 
 export module lx.compositor:output_config_store;
+
+import std;
 
 import :toml_lite;
 

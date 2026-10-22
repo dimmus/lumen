@@ -10,7 +10,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
+#include <stdint.h>
 
 #include <unistd.h>
 
@@ -19,6 +19,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;

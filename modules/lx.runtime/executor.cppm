@@ -1,19 +1,12 @@
 module;
 
-#include <atomic>
-#include <cstddef>
-#include <cstdlib>
-#include <cstring>
-#include <new>
-#include <thread>
-#include <type_traits>
-#include <utility>
-
 import lx.foundation;
 import lx.sync;
 import lx.trace;
 
 export module lx.runtime:executor;
+
+import std;
 
 export namespace lx::runtime {
 

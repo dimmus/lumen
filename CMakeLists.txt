@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 include(LumenOptions)
+include(LumenStdModule)
 include(LumenCXXModules)
 include(LumenPlatform)
 
@@ -377,6 +378,12 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_result)
     target_include_directories(test_result PRIVATE tests)
     add_test(NAME test_result COMMAND test_result)
+
+    add_executable(test_logf tests/test_logf.cpp)
+    target_link_libraries(test_logf PRIVATE lx.trace)
+    lumen_apply_module_properties(test_logf)
+    target_include_directories(test_logf PRIVATE tests)
+    add_test(NAME test_logf COMMAND test_logf)
 
     add_executable(test_snapshot tests/test_snapshot.cpp)
     target_link_libraries(test_snapshot PRIVATE lx.scene lx.runtime)

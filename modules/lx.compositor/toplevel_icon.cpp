@@ -6,10 +6,6 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-
 #if defined(__linux__)
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -17,6 +13,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import :toplevel_icon;
 

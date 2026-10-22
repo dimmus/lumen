@@ -34,10 +34,8 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <ctime>
-#include <new>
+#include <stdint.h>
+#include <time.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -48,6 +46,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -80,6 +80,11 @@ namespace {
 
 void lock_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, "compositor.lock", line);
+}
+
+template <typename... Args>
+void lock_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, "compositor.lock", fmt, std::forward<Args>(args)...);
 }
 
 [[nodiscard]] lx::compositor::session_lock* machine() {
@@ -154,11 +159,9 @@ void send_configure(lock_surface_obj* o, lx::size2i size) {
                                                static_cast<uint32_t>(size.width > 0 ? size.width : 0),
                                                static_cast<uint32_t>(size.height > 0 ? size.height : 0));
     if (lock_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "lock surface configure surface=%llu output=%u %dx%d serial=%u",
-                      o->surface ? o->surface->id.id() : 0ull, o->output, size.width, size.height,
-                      serial);
-        lock_log(lx::trace::level::debug, line);
+        lock_log(
+            lx::trace::level::debug, "lock surface configure surface={} output={} {}x{} serial={}",
+            o->surface ? o->surface->id.id() : 0ull, o->output, size.width, size.height, serial);
     }
 }
 
@@ -286,10 +289,8 @@ void lock_get_lock_surface(struct wl_client* client, struct wl_resource* lock_re
     // "On binding this interface the compositor will immediately send the first configure."
     send_configure(o, {r.width, r.height});
     {
-        char line[128];
-        std::snprintf(line, sizeof(line), "lock surface create surface=%llu output=%u %dx%d",
-                      s->id.id(), o->output, r.width, r.height);
-        lock_log(lx::trace::level::info, line);
+        lock_log(lx::trace::level::info, "lock surface create surface={} output={} {}x{}",
+                 s->id.id(), o->output, r.width, r.height);
     }
 }
 
@@ -408,10 +409,8 @@ void lock_surface_committed(surface_obj* s) {
             lock_log(lx::trace::level::warn, "lock surface map failed: lock layer full");
             return;
         }
-        char line[96];
-        std::snprintf(line, sizeof(line), "lock surface map surface=%llu output=%u",
-                      s->id.id(), o->output);
-        lock_log(lx::trace::level::info, line);
+        lock_log(lx::trace::level::info, "lock surface map surface={} output={}", s->id.id(),
+                 o->output);
     }
     apply(m->content(o->record));
 }
@@ -447,10 +446,8 @@ void session_lock_outputs_changed() {
         lock_surface_obj* o = gone[i];
         if (lock_obj* lo = lock_from(static_cast<wl_resource*>(m->current())))
             lo->outputs_used &= ~(1u << o->output);
-        char line[96];
-        std::snprintf(line, sizeof(line), "lock surface dropped surface=%llu output=%u (output gone)",
-                      o->surface ? o->surface->id.id() : 0ull, o->output);
-        lock_log(lx::trace::level::info, line);
+        lock_log(lx::trace::level::info, "lock surface dropped surface={} output={} (output gone)",
+                 o->surface ? o->surface->id.id() : 0ull, o->output);
         make_inert(o, true);
     }
     // Every lock surface of a live output follows its size (a new configure) and origin.

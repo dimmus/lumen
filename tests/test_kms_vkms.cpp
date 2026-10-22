@@ -1,8 +1,6 @@
 // Opt-in vkms KMS test. Enable with LUMEN_TEST_VKMS=1 and a loaded vkms module.
 // Asserts connector enumeration + one atomic commit attempt against the virtual card.
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <stdio.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -12,7 +10,9 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #endif
+#include <stdint.h>
 
+import std;
 import lx.foundation;
 import lx.drm;
 

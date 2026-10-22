@@ -3,10 +3,10 @@
 // periodic ping of the focused client, clients without an xdg_wm_base, a ping cancelled
 // with the object it went out on, forget, disabled with 0, and that nothing is ever killed
 // (the tracker has no such op).
-#include <vector>
 
 #include "lumen_test.hpp"
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.compositor;

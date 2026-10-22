@@ -7,14 +7,15 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -55,11 +56,9 @@ void subsurface_log_sync(const surface_obj* s) {
     if (!surface_debug())
         return;
     const auto* tree = s->ctx->tree;
-    char line[128];
-    std::snprintf(line, sizeof(line), "subsurface sync surface=%llu mode=%s effective=%s",
-                  s->id.id(), tree->sync_flag(s->id) ? "sync" : "desync",
-                  tree->effectively_sync(s->id) ? "sync" : "desync");
-    surface_log(line);
+    surface_log("subsurface sync surface={} mode={} effective={}", s->id.id(),
+                tree->sync_flag(s->id) ? "sync" : "desync",
+                tree->effectively_sync(s->id) ? "sync" : "desync");
 }
 
 void subsurface_place(wl_resource* resource, wl_resource* sibling_res, bool above) {
@@ -193,10 +192,8 @@ void subcompositor_get_subsurface(struct wl_client* client, struct wl_resource* 
     s->role = surface_role::subsurface;
     wl_resource_set_implementation(res, &subsurface_impl, o, subsurface_destroy_resource);
     if (surface_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "subsurface create surface=%llu parent=%llu root=%llu",
-                      s->id.id(), p->id.id(), s->ctx->tree->root_of(s->id).id());
-        surface_log(line);
+        surface_log("subsurface create surface={} parent={} root={}", s->id.id(), p->id.id(),
+                    s->ctx->tree->root_of(s->id).id());
     }
 }
 

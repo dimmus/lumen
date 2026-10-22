@@ -8,14 +8,15 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <utility>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;

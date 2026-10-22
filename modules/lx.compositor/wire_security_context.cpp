@@ -27,10 +27,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <new>
+#include <stdint.h>
 
 #include <sys/socket.h>
 #include <unistd.h>
@@ -44,6 +41,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -183,13 +182,12 @@ const struct wp_security_context_v1_interface context_impl = {
                 lx::trace::logger::global().log_error(added.get_error(), "wayland");
                 return;
             }
-            char line[192];
-            std::snprintf(line, sizeof(line),
-                          "security context listener: engine=%s app_id=%s instance=%s",
-                          c->ctx.sandbox_engine[0] ? c->ctx.sandbox_engine : "-",
-                          c->ctx.app_id[0] ? c->ctx.app_id : "-",
-                          c->ctx.instance_id[0] ? c->ctx.instance_id : "-");
-            lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+            lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
+                                             "security context listener: engine={} app_id={} "
+                                             "instance={}",
+                                             c->ctx.sandbox_engine[0] ? c->ctx.sandbox_engine : "-",
+                                             c->ctx.app_id[0] ? c->ctx.app_id : "-",
+                                             c->ctx.instance_id[0] ? c->ctx.instance_id : "-");
         },
 };
 

@@ -18,14 +18,10 @@
 // permissions, per-device open results, keymap, every event, and a verdict — so it can be
 // read without asking follow-up questions.
 
-#include <cerrno>
-#include <chrono>
-#include <csignal>
-#include <cstdarg>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
+#include <errno.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <grp.h>
@@ -34,6 +30,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.input;
 import lx.session;

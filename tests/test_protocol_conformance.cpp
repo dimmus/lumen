@@ -1,21 +1,9 @@
 // Protocol conformance: requests that must end in a specific protocol error, and request
 // orders that must not. In-process compositor, one libwayland-client connection per case
 // (a protocol error is fatal to its connection), asserting wl_display_get_protocol_error.
-#include <algorithm>
-#include <atomic>
-#include <cerrno>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <ctime>
-#include <functional>
-#include <initializer_list>
-#include <mutex>
-#include <thread>
-#include <utility>
-
-#include <string>
-#include <vector>
+#include <errno.h>
+#include <stdio.h>
+#include <time.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -90,7 +78,11 @@
 #endif
 #endif
 #endif
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.scheduler;

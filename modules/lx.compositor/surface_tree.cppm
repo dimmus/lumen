@@ -1,13 +1,14 @@
 module;
 
-#include <cstdio>
-#include <cstring>
+#include <stdio.h>
 
 import lx.foundation;
 import lx.trace;
 import lx.scene;
 
 export module lx.compositor:surface_tree;
+
+import std;
 
 import :surface;
 
@@ -308,6 +309,8 @@ private:
     void bbox_walk(const entry& e, lx::point2i origin, unsigned depth, long long& x0,
                    long long& y0, long long& x1, long long& y1, bool& any) const;
     void log_line(const char* category, const char* line) const;
+    template <typename... Args>
+    void log_line(const char* category, std::format_string<Args...> fmt, Args&&... args) const;
     [[nodiscard]] bool debug() const;
 
     surface_manager* surfaces_ = nullptr;
@@ -383,6 +386,13 @@ void lx::compositor::surface_tree::log_line(const char* category, const char* li
     lx::trace::logger::global().log(lx::trace::level::debug, category, line);
 }
 
+template <typename... Args>
+void lx::compositor::surface_tree::log_line(const char* category, std::format_string<Args...> fmt,
+                                            Args&&... args) const {
+    lx::trace::logger::global().logf(lx::trace::level::debug, category, fmt,
+                                     std::forward<Args>(args)...);
+}
+
 // ── membership ─────────────────────────────────────────────────────────────
 
 
@@ -421,10 +431,7 @@ void lx::compositor::surface_tree::drop_one(entry& e, const char* reason) {
         scene_->note_damage(surfaces_->node_rect(e.id));
     surfaces_->drop_node(e.id);
     if (reason && e.parent && debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "subsurface unmap surface=%llu reason=%s", e.id.id(),
-                      reason);
-        log_line(k_surface_category, line);
+        log_line(k_surface_category, "subsurface unmap surface={} reason={}", e.id.id(), reason);
     }
     if (unmap_hook_)
         unmap_hook_(unmap_user_, e.id);
@@ -691,10 +698,8 @@ void lx::compositor::surface_tree::apply_child_state(lx::surface_id parent) {
         c->pos = c->pos_cached;
         changed = true;
         if (debug()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "subsurface position surface=%llu x=%d y=%d",
-                          cid.id(), c->pos.x, c->pos.y);
-            log_line(k_surface_category, line);
+            log_line(k_surface_category, "subsurface position surface={} x={} y={}", cid.id(),
+                     c->pos.x, c->pos.y);
         }
     }
     if (p->order_cached_dirty) {
@@ -1031,12 +1036,9 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
             }
         }
         if (created && e->parent && debug()) {
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "subsurface map surface=%llu root=%llu x=%d y=%d w=%d h=%d",
-                          it.id.id(), root.id(), new_rect.x, new_rect.y, new_rect.width,
-                          new_rect.height);
-            log_line(k_surface_category, line);
+            log_line(k_surface_category, "subsurface map surface={} root={} x={} y={} w={} h={}",
+                     it.id.id(), root.id(), new_rect.x, new_rect.y, new_rect.width,
+                     new_rect.height);
         }
         const bool moved = created || !rect_same(e->last_rect, new_rect);
         if (moved)
@@ -1151,9 +1153,7 @@ void lx::compositor::surface_tree::set_root_dim(lx::surface_id root, bool dim) {
     }
     damage_root(root);
     if (debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "tree root=%llu dim=%d", root.id(), dim ? 1 : 0);
-        log_line(k_scene_category, line);
+        log_line(k_scene_category, "tree root={} dim={}", root.id(), dim ? 1 : 0);
     }
 }
 

@@ -12,10 +12,9 @@ module;
 // Member bodies are in toml_lite.cpp (Clang 23 module-partition workaround, as
 // session_lock.cpp).
 
-#include <cstddef>
-#include <string>
-
 export module lx.compositor:toml_lite;
+
+import std;
 
 export namespace lx::compositor::toml {
 

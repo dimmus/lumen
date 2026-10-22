@@ -12,12 +12,7 @@
 // compositor's own bindings, the tap grab, giving a key back, the version gate, and the
 // router's forwarded-key rule (no release without a forwarded press; `enter` lists only
 // forwarded keys).
-#include <atomic>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <mutex>
-#include <thread>
+#include <stdio.h>
 
 #include <sys/mman.h>
 #include <unistd.h>
@@ -46,7 +41,10 @@
 #endif
 #endif
 #endif
+#include <stdint.h>
+#include <stddef.h>
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.compositor;

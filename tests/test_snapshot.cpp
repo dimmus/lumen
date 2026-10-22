@@ -1,10 +1,6 @@
 #include "lumen_test.hpp"
 
-#include <atomic>
-#include <chrono>
-#include <thread>
-#include <vector>
-
+import std;
 import lx.foundation;
 import lx.gfx;
 import lx.scene;

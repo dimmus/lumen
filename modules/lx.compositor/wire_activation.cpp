@@ -13,11 +13,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <new>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -28,6 +24,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -179,14 +177,12 @@ void token_commit(wl_client* client, wl_resource* resource) {
     xdg_activation_token_v1_send_done(resource, t->text);
 
     if (activation_debug()) {
-        char line[320];
-        std::snprintf(line, sizeof(line),
-                      "token create client=%llu token=%.8s serial=%u surface=%llu app_id=%s "
-                      "grantable=%d reason=%s",
-                      b->client.id(), t->text, b->has_serial ? b->serial : 0u, b->surface.id(),
-                      b->app_id[0] ? b->app_id : "-", t->grant.grantable ? 1 : 0,
-                      activation_reason_name(why));
-        lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
+                                         "token create client={} token={:.8} serial={} surface={} "
+                                         "app_id={} grantable={} reason={}",
+                                         b->client.id(), t->text, b->has_serial ? b->serial : 0u,
+                                         b->surface.id(), b->app_id[0] ? b->app_id : "-",
+                                         t->grant.grantable ? 1 : 0, activation_reason_name(why));
     }
 }
 
@@ -249,11 +245,10 @@ void activation_activate(wl_client*, wl_resource*, const char* token, wl_resourc
     if (activation_debug()) {
         char prefix[9];
         log_prefix(token, prefix);
-        char line[192];
-        std::snprintf(line, sizeof(line), "activate token=%s surface=%llu id=%llu result=%s reason=%s",
-                      prefix, s ? s->id.id() : 0ull, target.id(), activation_result_name(r),
-                      activation_reason_name(why));
-        lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
+                                         "activate token={} surface={} id={} result={} reason={}",
+                                         prefix, s ? s->id.id() : 0ull, target.id(),
+                                         activation_result_name(r), activation_reason_name(why));
     }
     // Single use (KWin, Mutter, niri): presenting it for a window spends it, whatever the
     // outcome. Presented for no window, it stays.

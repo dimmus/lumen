@@ -4,8 +4,7 @@
 // growing by two window-sized copies per buffer it had ever seen.
 #include "lumen_test.hpp"
 
-#include <cstring>
-
+import std;
 import lx.foundation;
 import lx.compositor;
 

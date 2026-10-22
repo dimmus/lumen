@@ -7,17 +7,8 @@
 // ext-data-control-v1 and zwlr-data-control v2 (selections both ways, errors), and
 // security-context-v1 (every error, a client on the listener sees no session-wide global,
 // close_fd stops accepting, listening outlives the creator).
-#include <atomic>
-#include <cerrno>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <functional>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
+#include <errno.h>
+#include <stdio.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -49,7 +40,9 @@
 #define LUMEN_TEST_PART_B 1
 #endif
 #endif
+#include <stdint.h>
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.input;

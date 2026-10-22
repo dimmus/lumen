@@ -1,18 +1,20 @@
 module;
 
-#include <cstdint>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_DRM)
-#include <cstring>
 #include <drm_fourcc.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #endif
+#include <stddef.h>
 
 import lx.foundation;
 
 export module lx.drm:cursor;
+
+import std;
 
 export namespace lx::drm {
 

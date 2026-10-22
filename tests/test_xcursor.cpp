@@ -1,13 +1,10 @@
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <string>
+#include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#include <vector>
 
+import std;
 import lx.foundation;
 import lx.compositor;
 

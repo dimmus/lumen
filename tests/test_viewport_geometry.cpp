@@ -6,10 +6,7 @@
 // fractional-scale client relies on. Pure functions — no Wayland, no GPU.
 #include "lumen_test.hpp"
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-
+import std;
 import lx.foundation;
 import lx.scene;
 import lx.compositor;

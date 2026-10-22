@@ -1,9 +1,6 @@
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <vector>
-
+import std;
 import lx.foundation;
 import lx.gfx;
 

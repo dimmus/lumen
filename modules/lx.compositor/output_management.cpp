@@ -2,11 +2,9 @@ module;
 
 // wlr-output-management's wire-free model (`:output_management`). See the partition.
 
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-
 module lx.compositor;
+
+import std;
 
 import :output;
 import :output_management;

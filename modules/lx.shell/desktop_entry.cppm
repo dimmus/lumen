@@ -1,14 +1,7 @@
 module;
 
-#include <climits>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
-#include <string_view>
-#include <vector>
+#include <limits.h>
+#include <stdint.h>
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -18,6 +11,8 @@ import lx.foundation;
 import lx.trace;
 
 export module lx.shell:desktop_entry;
+
+import std;
 
 export namespace lx::shell {
 
@@ -203,10 +198,8 @@ constexpr const char* k_entry_category = "shell.apps";
 void entry_log_debug(std::string_view file, const char* what) {
     if (!entry_debug())
         return;
-    char line[512];
-    std::snprintf(line, sizeof(line), "desktop file %.*s: %s", static_cast<int>(file.size()),
-                  file.data(), what);
-    lx::trace::logger::global().log(lx::trace::level::debug, k_entry_category, line);
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_entry_category,
+                                     "desktop file {}: {}", file, what);
 }
 
 [[nodiscard]] bool valid_utf8(std::string_view s) {

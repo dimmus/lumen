@@ -3,8 +3,7 @@
 // over a real surface tree, surface manager and toplevel manager, with recording wire ops.
 #include "lumen_test.hpp"
 
-#include <memory>
-
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.gfx;

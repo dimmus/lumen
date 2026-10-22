@@ -13,13 +13,7 @@
 //   - it comes back: a new global, and the window returns to its place there (H5);
 //   - a monitor plugged and unplugged before its pipeline is up never appears, and comes up
 //     when plugged again (the cancelled add freed its slot).
-#include <atomic>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <thread>
+#include <stdio.h>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -38,9 +32,11 @@
 #pragma clang diagnostic pop
 #endif
 #endif
+#include <stdint.h>
 
 #include "scan_builder.hpp"
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.scheduler;

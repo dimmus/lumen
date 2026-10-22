@@ -22,9 +22,9 @@ module;
 //
 // UI affinity. Bodies in capture.cpp (the Clang 23 partition rule, see session_lock.cpp).
 
-#include <cstdint>
-
 export module lx.compositor:capture;
+
+import std;
 
 import lx.foundation;
 import lx.gfx;
