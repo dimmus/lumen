@@ -198,6 +198,8 @@ public:
 
     /// Native `wl_display*` (nullptr when unavailable).
     [[nodiscard]] void* native_display() const;
+    /// At least one client is connected.
+    [[nodiscard]] bool has_clients() const;
     /// Wayland event-loop fd for `lx.runtime::event_loop` integration.
     [[nodiscard]] int event_fd() const;
 
@@ -922,6 +924,14 @@ void* lx::wayland::server::native_display() const {
     return display_;
 #else
     return nullptr;
+#endif
+}
+
+bool lx::wayland::server::has_clients() const {
+#if defined(LUMEN_HAS_WAYLAND)
+    return display_ && !wl_list_empty(wl_display_get_client_list(display_));
+#else
+    return client_count_ > 0;
 #endif
 }
 

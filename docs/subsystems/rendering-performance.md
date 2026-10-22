@@ -489,7 +489,8 @@ multiplies per draw in `project_node`, none per pixel; nothing allocates.
 - Each surface node with a draw on screen records the frame; `surface_node::visible_in(f)`
   is an O(1) compare. **Presentation feedback** samples by it (a covered surface's update is
   not "shown"), and **frame callbacks** are paced by it: surfaces on screen in the last
-  published frame are answered at the flip, the others at most every 995 ms (niri's
+  published frame are answered after the flip (held to the repaint deadline, §6.1), the
+  others at most every 995 ms (niri's
   `FRAME_CALLBACK_THROTTLE`). Those throttled callbacks do not keep the frame clock running;
   the 1 s housekeeping timer answers them while it is stopped. Measured on SVGA3D: a probe
   covered by a maximized opaque window drops from ~30 commits/s to one per 1.00 s (app-smoke
@@ -627,12 +628,36 @@ means a tick per refresh, not one per millisecond. Measured on vmwgfx: with thre
 idle desktop costs 7 context switches in 5 s and no CPU tick; with two, a client
 presenting 180 frames on one output left the other at 0 composites and 0 commits.
 
-**Frame callbacks go out at the flip** (UI flip handler of the surface's pace output), not
-at the next tick. The tick runs at the repaint start (deadline − lead), so a callback sent
-there gave the client's reply no repaint to catch until the following one: a frame every
-two periods. Measured on vmwgfx with `lumen-probe presentation` (400x300, 180 frames):
-33 ms between presents with callbacks at the tick, 17.6 ms (one output) and 19 ms (each of
-two outputs) with callbacks at the flip; app-smoke P1 17.0 ms.
+**Frame callbacks are answered after the flip, timed to the next repaint.** Sent at the
+repaint start (the tick), the client's reply has no repaint to catch until the following one:
+a frame every two periods (33 ms between presents measured with `lumen-probe presentation`).
+Sent at the flip itself (wlroots, at the output's frame event), a client that draws at once
+commits a whole period before the repaint that shows it: commit-to-present is a full
+refresh. So the flip handler holds them until the output's next repaint start minus its
+clients' **answer time** — the peak, over the last 8 answers, of release-to-first-damaging-
+commit, plus 1.5 ms — and `callback_timer_` releases them (sway's per-view
+`max_render_time`, measured instead of configured). Until an answer was measured, and when
+the lead exceeds the period, they go out at the flip as before; a late answer raises the
+lead for the next frame, and its worst case is the flip-time behaviour. A tick that finds
+callbacks still held answers them itself.
+
+**An output's first frame starts at once** (`repaint_scheduler::next_start` with no flip
+yet: no phase to aim at, where it used to wait for half a period), and **waits for a
+starting client**: while clients are connected — or a connection is still in the socket's
+backlog — and none has mapped a surface, an output that has never shown a frame is left out
+of the tick (which still runs: it sends the configures) for at most one refresh period. The
+client's first commit restarts the stopped clock, so the modeset carries its window. Without
+that the empty desktop went out first and the window a flip later — on vmwgfx the second
+flip after a modeset lands 15–50 ms after its commit. With no client, the output lights at
+once.
+
+Measured on vmwgfx (SVGA3D, 2 vCPUs, 1914×924) with a 256×256 shm client drawing on every
+frame callback, commit to `wp_presentation` presented, 10 runs × 300 frames, medians:
+
+| Callbacks | p50 | p95 | fps | compositor CPU |
+|-----------|-----|-----|-----|----------------|
+| at the flip | 16.7 ms | 19.3 ms | 56.6 | 7.0 % |
+| held to the repaint deadline | 5.1 ms | 7.1 ms | 60.0 | 8.0 % |
 
 **While the output is powered off** (zwlr_output_power_v1, ADR 007 I4) the display gate is
 up exactly as for a paused session: no composite, no commit, the frame clock stopped and the
@@ -651,14 +676,58 @@ flip completes ──▶ card fd readable (epoll) ──▶ kms_device::dispatch
                           ├─ clocks.on_present(slot) → shared timer re-armed at the
                           │    earliest start (next vblank − peak repaint cost − margin)
                           ├─ wp_presentation feedback of that output
-                          └─ frame callbacks of the surfaces it paces
-                               (not for a cursor-only flip)
+                          └─ frame callbacks of the surfaces it paces (not for a
+                               cursor-only flip): released by callback_timer_ at
+                               next start − clients' answer time, or now
 ```
 
 The 250 ms stall watchdog still paces callbacks by tick if flips stop arriving, so a broken
 output cannot wedge clients.
 
 ---
+
+## 6.2 Start-up
+
+The start-up path is part of the product: a desktop that appears late is slow however fast
+its frames are. `compositor::start` records an instant per phase on the timeline
+(`LUMEN_TRACE_FILE`, category `startup`): `start entered`, `kms opened`, `graphics probed`,
+`egl ready`, `gl program ready`, `present path ready`, `gl paths warmed`, `outputs ready`,
+`socket bound`, `cursor ready`, `globals registered`, `input started`, `shell bridge
+installed`. What keeps it short:
+
+- **Overlap.** The hardware-Vulkan probe runs beside the logind/KMS open; input devices and
+  the cursor theme load beside the EGL/GL set-up (threading.md, start-up helpers). The probe
+  skips software Vulkan drivers (`gfx::hardware_probe_scope`): 20 ms → 5 ms here.
+- **Warm GL paths.** `warm_gl_paths` draws once through each client texture path (shm BGRA
+  opaque and with alpha, resampled, RGBA) into a scanout slot not yet shown, flushed and not
+  waited for: a virtual GPU builds its shader and surface variants during start-up instead
+  of on the first client frame.
+- **First frame**: starts at once and carries a starting client's window (§6.1).
+
+What remains is Mesa: `egl ready` takes 50–65 ms on vmwgfx (loading the driver and its LLVM,
+creating the screen), which every GL compositor pays.
+
+Measured against other compositors on the same host (vmwgfx, 2 vCPUs, one 1914×924 output,
+GL renderers, bare compositors: weston `--shell=kiosk --no-config`, sway with an empty
+config, Hyprland with logo/splash/news off and its default Xwayland start), each started on
+tty1 by a probe that execs it, connects as soon as the socket exists, maps a 256×256 shm
+window and waits for its `wp_presentation` presented timestamp; 10 interleaved rounds,
+medians:
+
+| | Lumen | weston 15.0 | sway 1.12 | Hyprland 0.56 |
+|---|---|---|---|---|
+| socket ready | 84 ms | 80 | 88 | 224 |
+| window configured | 96 ms | 89 | 171 | 527 |
+| **first frame presented** | **106 ms** (94–117) | 115 (104–134) | 379 | 617 |
+| commit → present p50 / p95 | **5.1 / 7.1 ms** | 11.1 / 15.8 | 1.2 / 4.8 at 561 fps | 9.2 / 18.8 |
+| compositor CPU, client animating | **8.0 %** | 9.4 | 34.9 | 73.5 |
+| private memory (RssAnon) | **19.1 MB** | 23.1 | 20.2 | 89.8 |
+| shutdown | **29 ms** | 33 | 34 | 126 |
+
+That table predates the cursor theme moving off the critical path: three traced runs since
+put the window's configure 4–6 ms after the socket. sway's latency comes from compositing
+every commit as it arrives (561 fps on a virtual display whose flips do not wait for a
+vblank), at four times Lumen's CPU.
 
 ## 7. DRM page-flip + presentation feedback
 

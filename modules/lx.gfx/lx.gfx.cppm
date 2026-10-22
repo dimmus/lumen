@@ -3,6 +3,7 @@ module;
 #if defined(LUMEN_HAS_VULKAN)
 #include <vulkan/vulkan.h>
 #endif
+#include <cstdlib>
 #include <cstring>
 #include <unistd.h>
 #include <utility>
@@ -105,6 +106,23 @@ public:
     /// `select_best` (the same first device) creates a lavapipe device for about 28 MB of
     /// heap; a caller that would not composite with it should not pay that to find out.
     [[nodiscard]] static bool has_hardware_vulkan();
+};
+
+/// While alive, the Vulkan loader skips software drivers (`VK_LOADER_DRIVERS_DISABLE`), for
+/// `device_selector::has_hardware_vulkan`: a software rasterizer cannot be its answer, and
+/// loading one is most of the probe's cost (lavapipe initialises LLVM: about 15 of 20 ms on
+/// a VM). Left alone when the environment already chooses drivers. It edits the process
+/// environment: create and destroy it while no other thread can write the environment, and
+/// create no Vulkan instance under it that outlives it.
+class hardware_probe_scope {
+public:
+    hardware_probe_scope();
+    ~hardware_probe_scope();
+    hardware_probe_scope(const hardware_probe_scope&) = delete;
+    hardware_probe_scope& operator=(const hardware_probe_scope&) = delete;
+
+private:
+    bool set_ = false;
 };
 
 /// Recording handle threaded through widget paint. The real composite pass lives in
@@ -471,6 +489,20 @@ lx::result<lx::gfx::device> lx::gfx::device_selector::select_best() {
     info.device_name = "headless";
     info.supports_dmabuf_import = false;
     return device::create(info);
+}
+
+lx::gfx::hardware_probe_scope::hardware_probe_scope() {
+    if (std::getenv("VK_LOADER_DRIVERS_DISABLE") || std::getenv("VK_LOADER_DRIVERS_SELECT") ||
+        std::getenv("VK_DRIVER_FILES") || std::getenv("VK_ICD_FILENAMES") ||
+        std::getenv("VK_ADD_DRIVER_FILES"))
+        return;
+    // Mesa's lavapipe and Google's SwiftShader, matched on their manifest names.
+    set_ = ::setenv("VK_LOADER_DRIVERS_DISABLE", "*lvp_icd*,*swiftshader*", 0) == 0;
+}
+
+lx::gfx::hardware_probe_scope::~hardware_probe_scope() {
+    if (set_)
+        ::unsetenv("VK_LOADER_DRIVERS_DISABLE");
 }
 
 bool lx::gfx::device_selector::has_hardware_vulkan() {

@@ -108,6 +108,11 @@ public:
             const auto earliest = last_present_ns_ + period_ns_ - (estimate_ns() + k_margin_ns);
             return earliest > now ? earliest : now;
         }
+        // No flip yet, so no display phase to aim at: start now. Aiming at "one period out"
+        // only delays the first frame (by the default estimate's half period); a clock
+        // that never flips (virtual outputs) is still paced by `frame_clocks::take_due`.
+        if (last_present_ns_ <= 0)
+            return now;
         const auto deadline = next_deadline(now);
         const auto lead = estimate_ns() + k_margin_ns;
 
