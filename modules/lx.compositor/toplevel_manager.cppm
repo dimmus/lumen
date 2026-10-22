@@ -267,7 +267,7 @@ public:
     [[nodiscard]] const toplevel_record* find_by_surface(lx::surface_id surface) const;
     /// Records in use (mapped or not).
     [[nodiscard]] unsigned count() const { return used_count_; }
-    [[nodiscard]] unsigned mapped_count() const { return order_count_; }
+    [[nodiscard]] unsigned mapped_count() const { return static_cast<unsigned>(order_.size()); }
 
     /// Mapping pushes the toplevel on top of the stacking order; unmapping removes it.
     void set_mapped(lx::toplevel_id id, bool mapped);
@@ -282,7 +282,7 @@ public:
     /// Mapped toplevels top→bottom. `fn(const toplevel_record&) -> bool` returns false to stop.
     template<typename Fn>
     void for_each_top_down(Fn&& fn) const {
-        for (unsigned i = order_count_; i-- > 0;) {
+        for (unsigned i = static_cast<unsigned>(order_.size()); i-- > 0;) {
             if (!fn(records_[order_[i]]))
                 return;
         }
@@ -290,7 +290,7 @@ public:
     /// Mapped toplevels bottom→top.
     template<typename Fn>
     void for_each_bottom_up(Fn&& fn) const {
-        for (unsigned i = 0; i < order_count_; ++i)
+        for (unsigned i = 0; i < order_.size(); ++i)
             fn(records_[order_[i]]);
     }
     /// Every record in use, mapped or not, in slot order.
@@ -348,8 +348,7 @@ private:
     bool used_[k_max]{};
     unsigned used_count_ = 0;
     /// Slot indices of mapped toplevels, bottom→top.
-    std::uint16_t order_[k_max]{};
-    unsigned order_count_ = 0;
+    std::inplace_vector<std::uint16_t, k_max> order_{};
     unsigned long long next_id_ = 1;
 };
 
@@ -376,11 +375,8 @@ int lx::compositor::toplevel_manager::slot_of(lx::toplevel_id id) const {
 }
 
 int lx::compositor::toplevel_manager::order_of(unsigned slot) const {
-    for (unsigned i = 0; i < order_count_; ++i) {
-        if (order_[i] == slot)
-            return static_cast<int>(i);
-    }
-    return -1;
+    const auto it = std::ranges::find(order_, slot);
+    return it == order_.end() ? -1 : static_cast<int>(it - order_.begin());
 }
 
 lx::result<lx::toplevel_id>
@@ -403,7 +399,7 @@ lx::compositor::toplevel_manager::create(lx::client_id client, lx::surface_id su
         rec.wire_id = static_cast<unsigned>(rec.id.id());
         return rec.id;
     }
-    return lx::make_error(lx::error_domain::invalid_argument, 0, "toplevel table full");
+    return lx::invalid_argument("toplevel table full");
 }
 
 void lx::compositor::toplevel_manager::destroy(lx::toplevel_id id) {
@@ -445,13 +441,11 @@ void lx::compositor::toplevel_manager::set_mapped(lx::toplevel_id id, bool mappe
     auto& rec = records_[static_cast<unsigned>(slot)];
     const int pos = order_of(static_cast<unsigned>(slot));
     if (mapped) {
-        if (pos < 0 && order_count_ < k_max)
-            order_[order_count_++] = static_cast<std::uint16_t>(slot);
+        if (pos < 0 && order_.size() < k_max)
+            order_.push_back(static_cast<std::uint16_t>(slot));
     } else if (pos >= 0) {
         // Order-preserving removal: the stacking of everything else must not change.
-        for (unsigned i = static_cast<unsigned>(pos) + 1; i < order_count_; ++i)
-            order_[i - 1] = order_[i];
-        --order_count_;
+        order_.erase(order_.begin() + pos);
     }
     rec.mapped = mapped;
 }
@@ -464,7 +458,8 @@ bool lx::compositor::toplevel_manager::move_to(lx::toplevel_id id, unsigned inde
     if (from_i < 0)
         return false;
     const unsigned from = static_cast<unsigned>(from_i);
-    const unsigned to = index < order_count_ ? index : order_count_ - 1;
+    const unsigned n = static_cast<unsigned>(order_.size());
+    const unsigned to = index < n ? index : n - 1;
     if (from == to)
         return false;
     if (from < to) {
@@ -479,7 +474,7 @@ bool lx::compositor::toplevel_manager::move_to(lx::toplevel_id id, unsigned inde
 }
 
 bool lx::compositor::toplevel_manager::raise(lx::toplevel_id id) {
-    return order_count_ > 0 && move_to(id, order_count_ - 1);
+    return !order_.empty() && move_to(id, static_cast<unsigned>(order_.size()) - 1);
 }
 
 bool lx::compositor::toplevel_manager::lower(lx::toplevel_id id) { return move_to(id, 0); }
@@ -493,7 +488,7 @@ unsigned lx::compositor::toplevel_manager::stacking_index(lx::toplevel_id id) co
 }
 
 lx::toplevel_id lx::compositor::toplevel_manager::top() const {
-    return order_count_ > 0 ? records_[order_[order_count_ - 1]].id : lx::toplevel_id{};
+    return !order_.empty() ? records_[order_.back()].id : lx::toplevel_id{};
 }
 
 void lx::compositor::toplevel_manager::on_xdg_title(lx::toplevel_id id, const char* title) {

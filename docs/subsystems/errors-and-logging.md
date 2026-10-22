@@ -40,13 +40,15 @@ Each subsystem defines an `*_err` enum in `lx.foundation.error`:
 | `drm_err` | `lx.drm` — `open_failed`, `mode_invalid`, `page_flip_failed`, `sync_failed`, `probe_failed` (a connector probe ioctl failed), `no_crtc` (no CRTC or primary plane left for an output), `test_rejected` (the kernel refused a TEST_ONLY of a configuration), `monitor_failed` (the udev hotplug monitor could not be opened) |
 | `protocol_err` | Wire protocol violations, `zlm_*` |
 
-Example:
+Each enum maps to its domain through `error_domain_of`, so `make_error` takes the code alone:
 
 ```cpp
-return lx::make_error(lx::error_domain::wayland,
-                      static_cast<int>(lx::wayland_err::bind_failed),
-                      "failed to bind socket");
+return lx::make_error(lx::wayland_err::bind_failed, "failed to bind socket");
 ```
+
+`result<T>` is a `std::expected<T, lx::error>` that also converts from an `error`, so
+`transform`, `and_then` (with a callable returning `std::expected<U, lx::error>`) and
+`value_or` work on it. `value()` on a failed result throws `std::bad_expected_access`.
 
 ### Propagation helpers
 
@@ -73,7 +75,7 @@ lx::result<lx::gfx::device> pick_device() {
 | Situation | Return |
 |-----------|--------|
 | Stub not yet wired | `lx::not_implemented("fully::qualified::name")` |
-| Invalid caller input | `make_error(invalid_argument, 0, "...")` |
+| Invalid caller input | `lx::invalid_argument("...")` |
 | Real failure | Domain-specific code + message |
 
 ### Intentional placeholder success (offline dev only)
@@ -231,9 +233,7 @@ Recommended pattern at subsystem boundaries:
 ```cpp
 lx::result<void> kms_device::open(const char* path) {
     // ... real open ...
-    auto err = lx::make_error(lx::error_domain::drm,
-                              static_cast<int>(lx::drm_err::open_failed),
-                              "cannot open DRM device");
+    auto err = lx::make_error(lx::drm_err::open_failed, "cannot open DRM device");
     lx::trace::logger::global().log_error(err, "drm");
     return err;
 }

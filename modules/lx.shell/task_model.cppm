@@ -140,7 +140,7 @@ public:
     [[nodiscard]] const task_entry* get(task_handle h) const;
     /// The live entry holding `proxy`; `index_hint` (the proxy's user data) is tried first.
     [[nodiscard]] task_handle find_proxy(unsigned index_hint, const void* proxy) const;
-    [[nodiscard]] unsigned count() const { return count_; }
+    [[nodiscard]] unsigned count() const { return static_cast<unsigned>(order_.size()); }
     /// Live entries in creation order (snapshot entries first, bottom-up as the compositor
     /// listed them). Returns how many were written.
     unsigned ordered(task_handle* out, unsigned cap) const;
@@ -153,8 +153,7 @@ private:
     [[nodiscard]] task_handle insert(void* proxy);
 
     task_entry entries_[k_max_tasks]{};
-    std::uint16_t order_[k_max_tasks]{};
-    unsigned count_ = 0;
+    std::inplace_vector<std::uint16_t, k_max_tasks> order_;
     task_handle focused_{};
     /// Global, never reused: a handle from before a snapshot cannot match after it.
     unsigned next_gen_ = 1;
@@ -191,13 +190,13 @@ void lx::shell::task_model::begin_snapshot(void (*drop)(void* proxy, void* user)
 }
 
 void lx::shell::task_model::clear(void (*drop)(void* proxy, void* user), void* user) {
-    for (unsigned i = 0; i < count_; ++i) {
-        task_entry& e = entries_[order_[i]];
+    for (std::uint16_t idx : order_) {
+        task_entry& e = entries_[idx];
         if (drop && e.proxy)
             drop(e.proxy, user);
         e = task_entry{};
     }
-    count_ = 0;
+    order_.clear();
     focused_ = {};
     in_snapshot_ = false;
     synced_ = false;
@@ -226,7 +225,7 @@ void lx::shell::task_model::end_snapshot() {
 }
 
 lx::shell::task_handle lx::shell::task_model::insert(void* proxy) {
-    if (count_ >= k_max_tasks)
+    if (order_.size() >= k_max_tasks)
         return {};
     for (unsigned i = 0; i < k_max_tasks; ++i) {
         task_entry& e = entries_[i];
@@ -236,7 +235,7 @@ lx::shell::task_handle lx::shell::task_model::insert(void* proxy) {
         e.used = true;
         e.gen = next_gen_++;
         e.proxy = proxy;
-        order_[count_++] = static_cast<std::uint16_t>(i);
+        order_.push_back(static_cast<std::uint16_t>(i));
         changes_ |= task_change_list;
         return task_handle{i, e.gen};
     }
@@ -249,14 +248,8 @@ bool lx::shell::task_model::remove(task_handle h) {
     task_entry* e = get_mut(h);
     if (!e)
         return false;
-    for (unsigned i = 0; i < count_; ++i) {
-        if (order_[i] != h.index)
-            continue;
-        for (unsigned j = i + 1; j < count_; ++j)
-            order_[j - 1] = order_[j];
-        --count_;
-        break;
-    }
+    if (const auto it = std::ranges::find(order_, h.index); it != order_.end())
+        order_.erase(it);
     *e = task_entry{};
     changes_ |= task_change_list;
     if (focused_ == h) {
@@ -377,18 +370,21 @@ lx::shell::task_handle lx::shell::task_model::find_proxy(unsigned index_hint,
     if (index_hint < k_max_tasks && entries_[index_hint].used &&
         entries_[index_hint].proxy == proxy)
         return {index_hint, entries_[index_hint].gen};
-    for (unsigned i = 0; i < count_; ++i) {
-        const task_entry& e = entries_[order_[i]];
+    for (std::uint16_t idx : order_) {
+        const task_entry& e = entries_[idx];
         if (e.proxy == proxy)
-            return {order_[i], e.gen};
+            return {idx, e.gen};
     }
     return {};
 }
 
 unsigned lx::shell::task_model::ordered(task_handle* out, unsigned cap) const {
     unsigned n = 0;
-    for (unsigned i = 0; i < count_ && n < cap; ++i)
-        out[n++] = task_handle{order_[i], entries_[order_[i]].gen};
+    for (std::uint16_t idx : order_) {
+        if (n >= cap)
+            break;
+        out[n++] = task_handle{idx, entries_[idx].gen};
+    }
     return n;
 }
 

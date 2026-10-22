@@ -9,6 +9,8 @@ import lx.foundation;
 
 export module lx.gfx:dmabuf;
 
+import std;
+
 export namespace lx::gfx {
 
 struct dmabuf_plane {
@@ -75,8 +77,7 @@ private:
     void* physical_device_ = nullptr;
     bool drm_format_modifier_ = false;
     unsigned next_image_id_ = 1;
-    unsigned long long allowed_modifiers_[k_max_allowed_modifiers]{};
-    unsigned allowed_modifier_count_ = 0;
+    std::inplace_vector<unsigned long long, k_max_allowed_modifiers> allowed_modifiers_;
 };
 
 /// Export a Vulkan image as a dmabuf FD for DRM scanout (`drmModeAddFB2WithModifiers`).
@@ -117,13 +118,9 @@ lx::gfx::dmabuf_importer::dmabuf_importer(void* dev, void* phys, bool drm_format
 bool lx::gfx::dmabuf_importer::can_import(const dmabuf_desc& desc) const {
     if (desc.width == 0 || desc.height == 0 || desc.plane_count == 0 || desc.plane_count > 4)
         return false;
-    if (allowed_modifier_count_ == 0)
+    if (allowed_modifiers_.empty())
         return true;
-    for (unsigned i = 0; i < allowed_modifier_count_; ++i) {
-        if (allowed_modifiers_[i] == desc.planes[0].modifier)
-            return true;
-    }
-    return false;
+    return std::ranges::contains(allowed_modifiers_, desc.planes[0].modifier);
 }
 
 #if defined(LUMEN_HAS_VULKAN)
@@ -154,28 +151,22 @@ lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import_vulkan(
     if (borrowed_fd < 0) {
         // A hardware importer with no FD means the protocol layer lost the plane FD on
         // the way here. Reporting success would fabricate an image that samples nothing.
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "dmabuf import without a plane fd");
+        return lx::make_error(lx::vulkan_err::import_failed, "dmabuf import without a plane fd");
     }
 
     const VkFormat vk_fmt = fourcc_to_vk_format(desc.format);
     if (vk_fmt == VK_FORMAT_UNDEFINED) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "unsupported dmabuf format");
+        return lx::make_error(lx::vulkan_err::import_failed, "unsupported dmabuf format");
     }
 
     const unsigned long long modifier = desc.planes[0].modifier;
     const bool implicit_layout = modifier == modifier_linear || modifier == modifier_invalid;
     if (!drm_format_modifier_ && !implicit_layout) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
+        return lx::make_error(lx::vulkan_err::import_failed,
                               "tiled dmabuf needs VK_EXT_image_drm_format_modifier");
     }
     if (!drm_format_modifier_ && desc.plane_count > 1) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
+        return lx::make_error(lx::vulkan_err::import_failed,
                               "multi-plane dmabuf needs VK_EXT_image_drm_format_modifier");
     }
 
@@ -218,9 +209,7 @@ lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import_vulkan(
 
     VkImage image = VK_NULL_HANDLE;
     if (vkCreateImage(vkdev, &ici, nullptr, &image) != VK_SUCCESS) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkCreateImage failed");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkCreateImage failed");
     }
 
     VkMemoryRequirements reqs{};
@@ -240,9 +229,7 @@ lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import_vulkan(
     }
     if (type_bits == 0) {
         vkDestroyImage(vkdev, image, nullptr);
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "no memory type accepts this dmabuf");
+        return lx::make_error(lx::vulkan_err::import_failed, "no memory type accepts this dmabuf");
     }
 
     uint32_t type_index = 0;
@@ -258,9 +245,7 @@ lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import_vulkan(
     const int owned_fd = ::dup(borrowed_fd);
     if (owned_fd < 0) {
         vkDestroyImage(vkdev, image, nullptr);
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "dup of dmabuf fd failed");
+        return lx::make_error(lx::vulkan_err::import_failed, "dup of dmabuf fd failed");
     }
 
     VkImportMemoryFdInfoKHR import_info{};
@@ -284,17 +269,13 @@ lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import_vulkan(
     if (vkAllocateMemory(vkdev, &mai, nullptr, &memory) != VK_SUCCESS) {
         ::close(owned_fd);
         vkDestroyImage(vkdev, image, nullptr);
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkAllocateMemory failed");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkAllocateMemory failed");
     }
 
     if (vkBindImageMemory(vkdev, image, memory, 0) != VK_SUCCESS) {
         vkFreeMemory(vkdev, memory, nullptr);
         vkDestroyImage(vkdev, image, nullptr);
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkBindImageMemory failed");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkBindImageMemory failed");
     }
 
     imported_image out{};
@@ -311,9 +292,7 @@ lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import_vulkan(
 
 lx::result<lx::gfx::imported_image> lx::gfx::dmabuf_importer::import(const dmabuf_desc& desc) {
     if (!can_import(desc)) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "invalid dmabuf desc");
+        return lx::make_error(lx::vulkan_err::import_failed, "invalid dmabuf desc");
     }
 
 #if defined(LUMEN_HAS_VULKAN)
@@ -347,11 +326,11 @@ void lx::gfx::dmabuf_importer::release(imported_image& img) {
 
 void lx::gfx::dmabuf_importer::set_allowed_modifiers(const unsigned long long* mods,
                                                      unsigned count) {
-    allowed_modifier_count_ = 0;
+    allowed_modifiers_.clear();
     if (!mods)
         return;
     for (unsigned i = 0; i < count && i < k_max_allowed_modifiers; ++i)
-        allowed_modifiers_[allowed_modifier_count_++] = mods[i];
+        allowed_modifiers_.push_back(mods[i]);
 }
 
 lx::gfx::dmabuf_exporter::dmabuf_exporter(void* dev, void* phys)
@@ -367,9 +346,7 @@ lx::result<lx::gfx::exported_dmabuf> lx::gfx::dmabuf_exporter::export_image(
     auto get_fd = reinterpret_cast<PFN_vkGetMemoryFdKHR>(
         vkGetDeviceProcAddr(vkdev, "vkGetMemoryFdKHR"));
     if (!get_fd) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkGetMemoryFdKHR unavailable");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkGetMemoryFdKHR unavailable");
     }
 
     VkImageSubresource subresource{};
@@ -384,9 +361,7 @@ lx::result<lx::gfx::exported_dmabuf> lx::gfx::dmabuf_exporter::export_image(
     info.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
     int fd = -1;
     if (get_fd(vkdev, &info, &fd) != VK_SUCCESS || fd < 0) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkGetMemoryFdKHR failed");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkGetMemoryFdKHR failed");
     }
 
     exported_dmabuf out{};

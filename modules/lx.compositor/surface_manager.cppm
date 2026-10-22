@@ -326,7 +326,7 @@ void lx::compositor::surface_manager::register_dmabuf(lx::buffer_id buffer,
         return;
     if (const int existing = find_buffer(buffer); existing >= 0) {
         auto& entry = buffers_[static_cast<unsigned>(existing)];
-        entry.desc = static_cast<lx::gfx::dmabuf_desc&&>(desc);
+        entry.desc = std::move(desc);
         entry.kind = buffer_kind::dmabuf;
         if (render_thread_import_ && entry.texture_id == 0)
             entry.texture_id = next_shm_texture_id_++;
@@ -337,7 +337,7 @@ void lx::compositor::surface_manager::register_dmabuf(lx::buffer_id buffer,
             continue;
         buffers_[i].used = true;
         buffers_[i].id = buffer;
-        buffers_[i].desc = static_cast<lx::gfx::dmabuf_desc&&>(desc);
+        buffers_[i].desc = std::move(desc);
         buffers_[i].kind = buffer_kind::dmabuf;
         if (render_thread_import_)
             buffers_[i].texture_id = next_shm_texture_id_++;
@@ -416,7 +416,7 @@ int lx::compositor::surface_manager::find_buffer(lx::buffer_id id) const {
 
 lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commit) {
     if (!commit.surface) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "null surface on commit");
+        return lx::invalid_argument("null surface on commit");
     }
 
     const int buffer_slot = find_buffer(commit.buffer);
@@ -425,8 +425,7 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
         // buffer — that masked missing protocol wiring as a successful import.
         if (!commit.buffer)
             return {};
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::protocol_violation),
+        return lx::make_error(lx::wayland_err::protocol_violation,
                               "surface commit with unknown buffer");
     }
 
@@ -435,8 +434,7 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
     const auto& buffer_entry_ref = buffers_[static_cast<unsigned>(buffer_slot)];
     const lx::gfx::dmabuf_desc& desc = buffer_entry_ref.desc;
     if (!desc.width || !desc.height) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::protocol_violation),
+        return lx::make_error(lx::wayland_err::protocol_violation,
                               "surface commit with zero-sized buffer");
     }
 
@@ -452,8 +450,7 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
         image.format = desc.format;
     } else if (import_cache_) {
         if (!desc.plane_count) {
-            return lx::make_error(lx::error_domain::wayland,
-                                  static_cast<int>(lx::wayland_err::protocol_violation),
+            return lx::make_error(lx::wayland_err::protocol_violation,
                                   "dmabuf buffer with no planes");
         }
         lx::gfx::import_cache_key key{};

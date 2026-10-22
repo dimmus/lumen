@@ -348,7 +348,7 @@ LUMEN_TEST(occlusion_opaque_cover_hides_what_is_below) {
                                     opaque_draw({100, 100, 50, 50}),    // partly covered
                                     opaque_draw({0, 0, 120, 120})};     // on top
     bool shown[3]{};
-    const unsigned marked = lx::scene::mark_occlusion(d, 3, {0, 0, 640, 480}, shown);
+    const unsigned marked = lx::scene::mark_occlusion(d, {0, 0, 640, 480}, shown);
     LUMEN_CHECK(marked == 1);
     LUMEN_CHECK(d[0].occluded && !shown[0]);
     LUMEN_CHECK(!d[1].occluded && shown[1]);
@@ -363,11 +363,11 @@ LUMEN_TEST(occlusion_translucent_never_occludes) {
     tinted.tint = lx::color::rgb(1.f, 1.f, 1.f, 0.9f);
     lx::scene::draw_command scaled = opaque_draw({300, 0, 100, 100});
     scaled.transform = lx::transform2d::scale(2.f, 2.f);
-    LUMEN_CHECK(lx::scene::mark_occlusion(d, 4, {0, 0, 640, 480}, nullptr) == 0);
+    LUMEN_CHECK(lx::scene::mark_occlusion(d, {0, 0, 640, 480}, nullptr) == 0);
     lx::scene::draw_command e[2] = {opaque_draw({310, 10, 10, 10}), tinted};
-    LUMEN_CHECK(lx::scene::mark_occlusion(e, 2, {0, 0, 640, 480}, nullptr) == 0);
+    LUMEN_CHECK(lx::scene::mark_occlusion(e, {0, 0, 640, 480}, nullptr) == 0);
     lx::scene::draw_command f[2] = {opaque_draw({310, 10, 10, 10}), scaled};
-    LUMEN_CHECK(lx::scene::mark_occlusion(f, 2, {0, 0, 640, 480}, nullptr) == 0);
+    LUMEN_CHECK(lx::scene::mark_occlusion(f, {0, 0, 640, 480}, nullptr) == 0);
 }
 
 LUMEN_TEST(occlusion_off_output_and_clip) {
@@ -377,16 +377,16 @@ LUMEN_TEST(occlusion_off_output_and_clip) {
     // The top draw is clipped to its left half: it covers x < 30 only.
     d[2].clip = {0, 0, 30, 200};
     bool shown[3]{};
-    LUMEN_CHECK(lx::scene::mark_occlusion(d, 3, {0, 0, 640, 480}, shown) == 1);
+    LUMEN_CHECK(lx::scene::mark_occlusion(d, {0, 0, 640, 480}, shown) == 1);
     LUMEN_CHECK(d[0].occluded && !shown[0]);
     LUMEN_CHECK(!d[1].occluded && shown[1]);
     // The part of a draw past the output does not count against covering it.
     lx::scene::draw_command e[2] = {opaque_draw({600, 400, 80, 80}), opaque_draw({590, 390, 50, 90})};
-    LUMEN_CHECK(lx::scene::mark_occlusion(e, 2, {0, 0, 640, 480}, nullptr) == 1);
+    LUMEN_CHECK(lx::scene::mark_occlusion(e, {0, 0, 640, 480}, nullptr) == 1);
     LUMEN_CHECK(e[0].occluded);
     // Unbounded (no output size): nothing is off-screen.
     lx::scene::draw_command g[1] = {opaque_draw({5000, 5000, 10, 10})};
-    LUMEN_CHECK(lx::scene::mark_occlusion(g, 1, {}, nullptr) == 0);
+    LUMEN_CHECK(lx::scene::mark_occlusion(g, {}, nullptr) == 0);
 }
 
 LUMEN_TEST(occlusion_keeps_the_eight_largest_occluders) {
@@ -398,11 +398,11 @@ LUMEN_TEST(occlusion_keeps_the_eight_largest_occluders) {
     d[1] = opaque_draw({995, 995, 20, 20});
     for (int i = 0; i < 8; ++i)
         d[2 + i] = opaque_draw({i * 110, 0, 100, 100});
-    LUMEN_CHECK(lx::scene::mark_occlusion(d, 10, {}, nullptr) == 0);
+    LUMEN_CHECK(lx::scene::mark_occlusion(d, {}, nullptr) == 0);
     LUMEN_CHECK(!d[0].occluded);
     // A cover larger than the smallest kept one replaces it, and hides the target.
     d[1] = opaque_draw({900, 900, 200, 200});
-    LUMEN_CHECK(lx::scene::mark_occlusion(d, 10, {}, nullptr) == 1);
+    LUMEN_CHECK(lx::scene::mark_occlusion(d, {}, nullptr) == 1);
     LUMEN_CHECK(d[0].occluded);
 }
 

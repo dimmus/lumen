@@ -218,14 +218,6 @@ lx::gfx::device& lx::gfx::device::operator=(device&& other) noexcept {
 #if defined(LUMEN_HAS_VULKAN)
 namespace {
 
-bool lx_gfx_has_extension(const VkExtensionProperties* props, unsigned count, const char* name) {
-    for (unsigned i = 0; i < count; ++i) {
-        if (std::strcmp(props[i].extensionName, name) == 0)
-            return true;
-    }
-    return false;
-}
-
 /// Prefer a graphics+transfer family; queue family 0 is not guaranteed to be one.
 int lx_gfx_pick_graphics_family(VkPhysicalDevice phys) {
     uint32_t count = 0;
@@ -266,18 +258,14 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
 
         VkInstance instance = VK_NULL_HANDLE;
         if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS) {
-            return lx::make_error(lx::error_domain::vulkan,
-                                  static_cast<int>(lx::vulkan_err::device_lost),
-                                  "vkCreateInstance failed");
+            return lx::make_error(lx::vulkan_err::device_lost, "vkCreateInstance failed");
         }
         d.instance_ = instance;
 
         uint32_t count = 0;
         if (vkEnumeratePhysicalDevices(instance, &count, nullptr) != VK_SUCCESS || count == 0) {
             d.destroy_vulkan();
-            return lx::make_error(lx::error_domain::vulkan,
-                                  static_cast<int>(lx::vulkan_err::device_lost),
-                                  "no Vulkan physical devices");
+            return lx::make_error(lx::vulkan_err::device_lost, "no Vulkan physical devices");
         }
 
         VkPhysicalDevice phys = VK_NULL_HANDLE;
@@ -292,9 +280,7 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         const int family = lx_gfx_pick_graphics_family(phys);
         if (family < 0) {
             d.destroy_vulkan();
-            return lx::make_error(lx::error_domain::vulkan,
-                                  static_cast<int>(lx::vulkan_err::device_lost),
-                                  "no graphics queue family");
+            return lx::make_error(lx::vulkan_err::device_lost, "no graphics queue family");
         }
         d.queue_family_ = static_cast<unsigned>(family);
 
@@ -309,26 +295,23 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         if (ext_count > 0)
             vkEnumerateDeviceExtensionProperties(phys, nullptr, &ext_count, ext_props);
 
-        const bool has_ext_mem = lx_gfx_has_extension(ext_props, ext_count,
-                                                      VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
-        const bool has_dmabuf = lx_gfx_has_extension(ext_props, ext_count,
-                                                     VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-        const bool has_modifier =
-            lx_gfx_has_extension(ext_props, ext_count,
-                                 VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) &&
-            lx_gfx_has_extension(ext_props, ext_count,
-                                 VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
-        const bool has_foreign = lx_gfx_has_extension(
-            ext_props, ext_count, VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
-        const bool has_timeline = lx_gfx_has_extension(
-            ext_props, ext_count, VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
-        const bool has_ext_sem_fd = lx_gfx_has_extension(
-            ext_props, ext_count, VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+        const std::span exts{ext_props, ext_count};
+        const auto has = [&](const char* name) {
+            return std::ranges::any_of(exts, [&](const VkExtensionProperties& p) {
+                return std::strcmp(p.extensionName, name) == 0;
+            });
+        };
+        const bool has_ext_mem = has(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+        const bool has_dmabuf = has(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+        const bool has_modifier = has(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) &&
+                                  has(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
+        const bool has_foreign = has(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+        const bool has_timeline = has(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
+        const bool has_ext_sem_fd = has(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
 
         if (!has_ext_mem || !has_dmabuf) {
             d.destroy_vulkan();
-            return lx::make_error(lx::error_domain::vulkan,
-                                  static_cast<int>(lx::vulkan_err::import_failed),
+            return lx::make_error(lx::vulkan_err::import_failed,
                                   "device lacks dma-buf external memory extensions");
         }
 
@@ -364,9 +347,7 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         VkDevice vkdev = VK_NULL_HANDLE;
         if (vkCreateDevice(phys, &dci, nullptr, &vkdev) != VK_SUCCESS) {
             d.destroy_vulkan();
-            return lx::make_error(lx::error_domain::vulkan,
-                                  static_cast<int>(lx::vulkan_err::device_lost),
-                                  "vkCreateDevice failed");
+            return lx::make_error(lx::vulkan_err::device_lost, "vkCreateDevice failed");
         }
         d.vk_device_ = vkdev;
         vkGetDeviceQueue(vkdev, d.queue_family_, 0, &d.queue_);
@@ -377,9 +358,7 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         cpci.queueFamilyIndex = d.queue_family_;
         if (vkCreateCommandPool(vkdev, &cpci, nullptr, &d.command_pool_) != VK_SUCCESS) {
             d.destroy_vulkan();
-            return lx::make_error(lx::error_domain::vulkan,
-                                  static_cast<int>(lx::vulkan_err::device_lost),
-                                  "vkCreateCommandPool failed");
+            return lx::make_error(lx::vulkan_err::device_lost, "vkCreateCommandPool failed");
         }
 
         d.info_.supports_dmabuf_import = true;
@@ -524,9 +503,7 @@ lx::result<void> lx::gfx::device_recovery::handle_device_lost() {
         needs_recovery_ = false;
         return {};
     }
-    return lx::make_error(lx::error_domain::vulkan,
-                          static_cast<int>(lx::vulkan_err::device_lost),
-                          "device recovery failed");
+    return lx::make_error(lx::vulkan_err::device_lost, "device recovery failed");
 #else
     return lx::not_implemented("lx::gfx::device_recovery::handle_device_lost");
 #endif

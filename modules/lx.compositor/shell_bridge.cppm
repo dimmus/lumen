@@ -171,9 +171,7 @@ lx::compositor::shell_bridge::shell_bridge(wayland::server& server) : server_{&s
 lx::result<void> lx::compositor::shell_bridge::install(const char* shell_binary_path) {
     shell_binary_path_ = shell_binary_path ? shell_binary_path : "lumen-shell";
     if (!server_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "shell_bridge has no server");
+        return lx::make_error(lx::wayland_err::bind_failed, "shell_bridge has no server");
     }
     server_->set_shell_binary_path(shell_binary_path_);
     return {};

@@ -1184,7 +1184,7 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
             desc.planes[i].stride = buf->dmabuf.planes[i].stride;
             desc.planes[i].modifier = buf->dmabuf.planes[i].modifier;
         }
-        s->ctx->surfaces->register_dmabuf(buf->id, static_cast<lx::gfx::dmabuf_desc&&>(desc));
+        s->ctx->surfaces->register_dmabuf(buf->id, std::move(desc));
     } else if (buf->is_shm) {
         s->ctx->surfaces->register_shm(buf->id, buf->width, buf->height, shm_format);
     }
@@ -1206,7 +1206,7 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
     s->current_buffer_id = buf->id;
     s->current_texture = s->ctx->surfaces->texture_for(buf->id);
 
-    auto result = s->ctx->surfaces->on_commit(static_cast<lx::compositor::surface_commit&&>(commit));
+    auto result = s->ctx->surfaces->on_commit(std::move(commit));
     if (!result) {
         // The buffer is unusable, so nothing will sample it. Release it immediately:
         // holding it back would starve the client of buffers and stall it forever.

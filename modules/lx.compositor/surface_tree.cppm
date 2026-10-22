@@ -278,8 +278,11 @@ private:
         lx::point2i origin{};
     };
 
-    [[nodiscard]] entry* find(lx::surface_id id);
-    [[nodiscard]] const entry* find(lx::surface_id id) const;
+    /// `entry*`, or `const entry*` on a const tree.
+    [[nodiscard]] auto find(this auto& self, lx::surface_id id) -> decltype(&self.entries_[0]) {
+        const int slot = self.index_.find(id.id());
+        return slot >= 0 ? &self.entries_[static_cast<unsigned>(slot)] : nullptr;
+    }
 
     template<class Fn>
     void preorder(lx::surface_id id, Fn& fn, unsigned depth) const {
@@ -322,8 +325,7 @@ private:
     entry entries_[k_tree_max_surfaces]{};
     id_slot_index<k_tree_max_surfaces * 2> index_{};
     /// sync_scene scratch: the root's mapped surfaces in paint order.
-    paint_item paint_[k_tree_max_surfaces]{};
-    unsigned paint_count_ = 0;
+    std::inplace_vector<paint_item, k_tree_max_surfaces> paint_{};
     bool warned_layer_full_ = false;
 };
 
@@ -366,17 +368,6 @@ constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
 } // namespace
 
 // ── lookup ─────────────────────────────────────────────────────────────────
-
-lx::compositor::surface_tree::entry* lx::compositor::surface_tree::find(lx::surface_id id) {
-    const int slot = index_.find(id.id());
-    return slot >= 0 ? &entries_[static_cast<unsigned>(slot)] : nullptr;
-}
-
-const lx::compositor::surface_tree::entry*
-lx::compositor::surface_tree::find(lx::surface_id id) const {
-    const int slot = index_.find(id.id());
-    return slot >= 0 ? &entries_[static_cast<unsigned>(slot)] : nullptr;
-}
 
 bool lx::compositor::surface_tree::debug() const {
     return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
@@ -978,8 +969,8 @@ void lx::compositor::surface_tree::paint_walk(entry& e, lx::point2i origin, unsi
         const lx::surface_id sid = e.order.ids[i];
         if (sid == e.id) {
             e.walk_mark = true;
-            if (paint_count_ < k_tree_max_surfaces)
-                paint_[paint_count_++] = {sid, origin};
+            if (paint_.size() < k_tree_max_surfaces)
+                paint_.push_back({sid, origin});
             continue;
         }
         entry* c = find(sid);
@@ -1001,7 +992,7 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
 
     // 1. Mapping: walk the current orders from the root.
     clear_marks(*r, 0);
-    paint_count_ = 0;
+    paint_.clear();
     if (r->has_buffer)
         paint_walk(*r, r->root_origin, 0);
 
@@ -1009,7 +1000,7 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
     bool changed = drop_unmarked(*r, 0, false, nullptr, nullptr);
 
     // 3. Nodes for what became mapped; global origins for all of them.
-    for (unsigned i = 0; i < paint_count_; ++i) {
+    for (unsigned i = 0; i < paint_.size(); ++i) {
         const paint_item& it = paint_[i];
         entry* e = find(it.id);
         if (!e)
@@ -1055,7 +1046,7 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
             (void)box.move_to(r->underlay, 0);
         index = 1;
     }
-    for (unsigned i = 0; i < paint_count_; ++i) {
+    for (unsigned i = 0; i < paint_.size(); ++i) {
         scene::surface_node* n = surfaces_->node(paint_[i].id);
         if (!n)
             continue;

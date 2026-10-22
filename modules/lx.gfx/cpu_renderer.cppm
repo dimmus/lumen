@@ -472,8 +472,7 @@ int lx::gfx::cpu_compositor::find(unsigned texture_id) const {
 lx::result<void> lx::gfx::cpu_compositor::register_texture(unsigned texture_id,
                                                            const pixel_surface& src) {
     if (texture_id == 0 || !src.valid()) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "cpu_compositor::register_texture: invalid surface");
+        return lx::invalid_argument("cpu_compositor::register_texture: invalid surface");
     }
     if (const int existing = find(texture_id); existing >= 0) {
         textures_[static_cast<unsigned>(existing)].surface = src;
@@ -487,8 +486,7 @@ lx::result<void> lx::gfx::cpu_compositor::register_texture(unsigned texture_id,
         textures_[i].surface = src;
         return {};
     }
-    return lx::make_error(lx::error_domain::invalid_argument, 0,
-                          "cpu_compositor: texture table full");
+    return lx::invalid_argument("cpu_compositor: texture table full");
 }
 
 void lx::gfx::cpu_compositor::forget_texture(unsigned texture_id) {
@@ -730,12 +728,10 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
     using namespace lx::gfx::detail;
 
     if (!dst.valid()) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "cpu_compositor::composite: invalid destination");
+        return lx::invalid_argument("cpu_compositor::composite: invalid destination");
     }
     if (!is_bgra_order(dst.format) && !is_rgba_order(dst.format)) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "cpu_compositor::composite: unsupported destination format");
+        return lx::invalid_argument("cpu_compositor::composite: unsupported destination format");
     }
 
     const lx::rect2i full{0, 0, static_cast<int>(dst.width), static_cast<int>(dst.height)};

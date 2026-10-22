@@ -117,7 +117,7 @@ std::string screenshot_stem(const std::tm& t) {
 
 lx::result<void> make_dirs(const std::string& dir, unsigned mode) {
     if (dir.empty() || dir.front() != '/')
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "make_dirs: not an absolute path");
+        return lx::invalid_argument("make_dirs: not an absolute path");
     for (std::size_t i = 1; i <= dir.size(); ++i) {
         if (i != dir.size() && dir[i] != '/')
             continue;
@@ -130,8 +130,7 @@ lx::result<void> make_dirs(const std::string& dir, unsigned mode) {
     }
     struct stat st{};
     if (::stat(dir.c_str(), &st) != 0 || !S_ISDIR(st.st_mode))
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
-                              "the screenshot directory is not a directory");
+        return lx::make_error(lx::io_err::not_found, "the screenshot directory is not a directory");
     return {};
 }
 
@@ -149,8 +148,7 @@ lx::result<int> create_unique(const std::string& dir, const std::string& stem, b
                                                                    : lx::io_err::not_found),
                                   "cannot create the screenshot file");
     }
-    return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
-                          "no free screenshot file name");
+    return lx::make_error(lx::io_err::not_found, "no free screenshot file name");
 }
 
 unsigned prune_older(const std::string& dir, std::string_view prefix, long max_age_s) {

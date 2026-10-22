@@ -202,7 +202,8 @@ unsigned snapshot(icon_obj* icon) {
     if (!id)
         return 0;
     unsigned picked[lx::compositor::k_icon_max_images]{};
-    const unsigned keep = lx::compositor::select_icon_images(cand, n, table->budget_left(), picked);
+    const unsigned keep =
+        lx::compositor::select_icon_images({cand, n}, table->budget_left(), picked);
     for (unsigned i = 0; i < keep; ++i) {
         wl_shm_buffer* s = shm[picked[i]];
         wl_shm_buffer_begin_access(s);

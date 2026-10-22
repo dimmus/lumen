@@ -537,18 +537,16 @@ struct compositor_impl {
     void render_test_config(const config_test& t);
     static constexpr unsigned k_max_ops = 32;
     std::mutex ops_mutex_{};
-    output_op ops_[k_max_ops]{};      // guarded by ops_mutex_
-    unsigned ops_count_ = 0;          // guarded by ops_mutex_
+    std::inplace_vector<output_op, k_max_ops> ops_{}; // guarded by ops_mutex_
     /// Render affinity: the ops taken from the queue, run outside the lock.
-    output_op ops_work_[k_max_ops]{};
+    std::inplace_vector<output_op, k_max_ops> ops_work_{};
     std::atomic<bool> ops_pending_{false};
     /// Render affinity. Ops held back until every retiring KMS pipeline has turned its CRTC
     /// off (a KMS add, and every later op of the same slot, in order): an add's CRTC
     /// allocation and TEST_ONLY then see the state its configuration was tested in — the
     /// outputs it disables already off — not one with them still lit (shared PLLs, MST
     /// bandwidth). Bounded by the queue; run by `run_deferred_output_ops`.
-    output_op ops_deferred_[k_max_ops]{};
-    unsigned ops_deferred_count_ = 0;
+    std::inplace_vector<output_op, k_max_ops> ops_deferred_{};
     std::uint32_t ops_deferred_slots_ = 0;
     lx::runtime::clock_time ops_deferred_since_ns_ = 0;
     /// A retiring pipeline's flip that never lands does not hold an add back longer.
@@ -629,8 +627,7 @@ struct compositor_impl {
         unsigned connector_id = 0;
         unsigned modes_hash = 0;
     };
-    failed_connector failed_[output_manager::k_max]{};
-    unsigned failed_count_ = 0;
+    std::inplace_vector<failed_connector, output_manager::k_max> failed_{};
     /// UI. HEADLESS-1 standing in for a display with nothing connected (-1: none): removed
     /// once a real output is added, added before the last one is removed.
     int fallback_headless_slot_ = -1;
@@ -702,10 +699,8 @@ struct compositor_impl {
     std::unique_ptr<drm::connector_scan> last_scan_{};
     /// UI. Connectors connected but disabled — by a client's configuration or the setup —
     /// and the set of connected connectors those decisions were made for.
-    unsigned disabled_connectors_[output_manager::k_max]{};
-    unsigned disabled_count_ = 0;
-    unsigned connected_set_[output_manager::k_max]{};
-    unsigned connected_count_ = 0;
+    std::inplace_vector<unsigned, output_manager::k_max> disabled_connectors_{};
+    std::inplace_vector<unsigned, output_manager::k_max> connected_set_{};
     [[nodiscard]] bool connector_disabled(unsigned connector_id) const;
     void set_connector_disabled(unsigned connector_id, bool disabled);
     /// UI. Where a disabled monitor was placed and the mode it had, when chosen explicitly:
@@ -717,8 +712,7 @@ struct compositor_impl {
         bool has_mode = false;
         drm::kms_mode mode{};
     };
-    kept_position kept_positions_[output_manager::k_max]{};
-    unsigned kept_position_count_ = 0;
+    std::inplace_vector<kept_position, output_manager::k_max> kept_positions_{};
     void keep_position(unsigned connector_id, const output_state& o);
     [[nodiscard]] const kept_position* kept_position_of(unsigned connector_id) const;
     /// UI. Virtual outputs as heads (HEADLESS-n, `--virtual-outputs`): their key, and what a
@@ -734,8 +728,7 @@ struct compositor_impl {
         lx::point2i position{};
         bool auto_position = true;
     };
-    virtual_head virtual_heads_[output_manager::k_max]{};
-    unsigned virtual_head_count_ = 0;
+    std::inplace_vector<virtual_head, output_manager::k_max> virtual_heads_{};
     unsigned next_virtual_key_ = 1;
     [[nodiscard]] unsigned virtual_key(const char* name);
     /// UI. The heads as zwlr_output_manager_v1 shows them, rebuilt and sent (only what
@@ -898,8 +891,7 @@ struct compositor_impl {
     bool latency_cursor_visible_ = false;
     /// UI affinity. Fixed sample window for the periodic summary; no allocation.
     static constexpr unsigned k_latency_window = 600;
-    unsigned long long latency_samples_[k_latency_window]{};
-    unsigned latency_sample_count_ = 0;
+    std::inplace_vector<unsigned long long, k_latency_window> latency_samples_{};
     /// Render affinity. A commit of `p` carrying this tick's cursor frame succeeded: its
     /// pipeline's `committed_input_us` gets `input_us << 1 | content` when free (0), so a
     /// commit racing the flip handler drops its sample instead of being timed against the
@@ -1445,8 +1437,8 @@ void compositor_impl::note_present_latency(output_pipeline& p, unsigned long lon
                                      "submit_us={} fence_us={} output={}",
                                      (packed & 1u) ? "content" : "cursor", input_us, present_us,
                                      latency_us, submit_us, fence_us, p.slot);
-    latency_samples_[latency_sample_count_++] = latency_us;
-    if (latency_sample_count_ == k_latency_window)
+    latency_samples_.push_back(latency_us);
+    if (latency_samples_.size() == k_latency_window)
         log_latency_summary();
 }
 
@@ -1564,12 +1556,11 @@ void compositor_impl::sync_output_views() {
 }
 
 void compositor_impl::log_latency_summary() {
-    const unsigned n = latency_sample_count_;
-    latency_sample_count_ = 0;
+    const unsigned n = static_cast<unsigned>(latency_samples_.size());
     if (n == 0)
         return;
     // Exact percentiles over the fixed window, in place: nth_element allocates nothing.
-    unsigned long long* b = latency_samples_;
+    unsigned long long* b = latency_samples_.data();
     const unsigned i50 = (n - 1) / 2;
     const unsigned i95 = (n - 1) * 95 / 100;
     std::nth_element(b, b + i95, b + n);
@@ -1577,6 +1568,7 @@ void compositor_impl::log_latency_summary() {
     std::nth_element(b, b + i50, b + i95 + 1);
     const unsigned long long p50 = b[i50];
     const unsigned long long max = *std::max_element(b + i95, b + n);
+    latency_samples_.clear();
     lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.latency",
                                      "latency summary n={} p50_us={} p95_us={} max_us={}", n, p50,
                                      p95, max);
@@ -3091,7 +3083,7 @@ lx::result<void> compositor_impl::setup_gl_present() {
     // Falling through to GL on llvmpipe would be strictly worse than compositing on the
     // CPU directly — same rasterizer, plus an upload and a driver stack.
     if (egl_.is_software_renderer()) {
-        return lx::make_error(lx::error_domain::gl, static_cast<int>(lx::gl_err::no_context),
+        return lx::make_error(lx::gl_err::no_context,
                               "GL is a software rasterizer — CPU composite is cheaper");
     }
 
@@ -3111,8 +3103,7 @@ lx::result<void> compositor_impl::create_targets(output_pipeline& p, bool scanou
     const unsigned width = static_cast<unsigned>(p.mode.width);
     const unsigned height = static_cast<unsigned>(p.mode.height);
     if (width == 0 || height == 0)
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
-                              "no usable mode for the scanout targets");
+        return lx::make_error(lx::drm_err::mode_invalid, "no usable mode for the scanout targets");
     const auto format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
     const bool kms_out = drm_present_ && scanout;
     p.scanout_rect = {0, 0, static_cast<int>(width), static_cast<int>(height)};
@@ -3356,7 +3347,7 @@ lx::result<void> compositor_impl::create_pipelines() {
                                          "tests={}) — trying without the test",
                                          n, n == 1 ? "" : "s", r.steps, r.tests);
         if (!drm::assign_crtcs(in, r, nullptr, nullptr))
-            return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::no_crtc),
+            return lx::make_error(lx::drm_err::no_crtc,
                                   "no CRTC assignment for the connected outputs");
     }
     for (unsigned i = 0; i < n; ++i) {
@@ -4355,14 +4346,14 @@ void compositor_impl::wake_render() {
 void compositor_impl::post_output_op(const output_op& op) {
     {
         std::lock_guard lock{ops_mutex_};
-        if (ops_count_ >= k_max_ops) {
+        if (ops_.size() >= k_max_ops) {
             // Bounded by the slots (one op in flight per slot and a few behind it): not
             // reachable by any sequence of uevents, which coalesce before they get here.
             lx::trace::logger::global().log(lx::trace::level::error, "compositor.hotplug",
                                             "output op queue full — op dropped");
             return;
         }
-        ops_[ops_count_++] = op;
+        ops_.push_back(op);
     }
     ops_pending_.store(true, std::memory_order_release);
     if (threads_started.load(std::memory_order_acquire))
@@ -4378,10 +4369,9 @@ void compositor_impl::run_output_ops() {
     bool test = false;
     {
         std::lock_guard lock{ops_mutex_};
-        n = ops_count_;
-        for (unsigned i = 0; i < n; ++i)
-            ops_work_[i] = ops_[i];
-        ops_count_ = 0;
+        ops_work_ = ops_;
+        ops_.clear();
+        n = static_cast<unsigned>(ops_work_.size());
         if (config_test_pending_) {
             config_test_work_ = config_test_;
             config_test_pending_ = false;
@@ -4424,38 +4414,35 @@ void compositor_impl::run_or_defer_output_op(const output_op& op) {
     if (op.slot >= output_manager::k_max)
         return;
     const std::uint32_t bit = 1u << op.slot;
-    const bool hold = (ops_deferred_slots_ & bit) ||
-                      (op.what == output_op::kind::add && op.kms && kms_retire_in_flight() &&
-                       (ops_deferred_count_ == 0 ||
-                        now_ns() - ops_deferred_since_ns_ < k_ops_defer_max_ns));
-    if (!hold || ops_deferred_count_ >= k_max_ops) {
+    const bool hold =
+        (ops_deferred_slots_ & bit) ||
+        (op.what == output_op::kind::add && op.kms && kms_retire_in_flight() &&
+         (ops_deferred_.empty() || now_ns() - ops_deferred_since_ns_ < k_ops_defer_max_ns));
+    if (!hold || ops_deferred_.size() >= k_max_ops) {
         run_output_op(op);
         return;
     }
-    if (ops_deferred_count_ == 0)
+    if (ops_deferred_.empty())
         ops_deferred_since_ns_ = now_ns();
-    ops_deferred_[ops_deferred_count_++] = op;
+    ops_deferred_.push_back(op);
     ops_deferred_slots_ |= bit;
 }
 
 void compositor_impl::run_deferred_output_ops() {
-    if (ops_deferred_count_ == 0)
+    if (ops_deferred_.empty())
         return;
     if (kms_retire_in_flight() && now_ns() - ops_deferred_since_ns_ < k_ops_defer_max_ns)
         return;
-    output_op held[k_max_ops];
-    const unsigned n = ops_deferred_count_;
-    for (unsigned i = 0; i < n; ++i)
-        held[i] = ops_deferred_[i];
-    ops_deferred_count_ = 0;
+    const std::inplace_vector<output_op, k_max_ops> held = ops_deferred_;
+    ops_deferred_.clear();
     ops_deferred_slots_ = 0;
     // Still a retire in flight: the wait timed out — they run now, in order, regardless.
     const bool timed_out = kms_retire_in_flight();
-    for (unsigned i = 0; i < n; ++i) {
+    for (const output_op& op : held) {
         if (timed_out)
-            run_output_op(held[i]);
+            run_output_op(op);
         else
-            run_or_defer_output_op(held[i]);
+            run_or_defer_output_op(op);
     }
 }
 
@@ -4581,15 +4568,14 @@ void compositor_impl::render_add_output(const output_op& op) {
         // its real first framebuffer decides — the kernel tests it against the state the
         // other CRTCs are in, so this is the full state's test.
         unsigned used_crtcs = 0;
-        unsigned used_planes[2 * output_manager::k_max]{};
-        unsigned used_plane_count = 0;
+        std::inplace_vector<unsigned, 2 * output_manager::k_max> used_planes;
         for (const auto& up : pipes_) {
             if (!up || !up->kms)
                 continue;
             used_crtcs |= 1u << up->kms->desc().crtc_index;
-            used_planes[used_plane_count++] = up->kms->desc().primary_plane_id;
+            used_planes.push_back(up->kms->desc().primary_plane_id);
             if (up->cursor.valid())
-                used_planes[used_plane_count++] = up->cursor.caps().plane_id;
+                used_planes.push_back(up->cursor.caps().plane_id);
         }
         drm::crtc_alloc_input in{};
         in.connector_count = 1;
@@ -4601,9 +4587,7 @@ void compositor_impl::render_add_output(const output_op& op) {
                                                                       : drm::k_alloc_max_planes;
         for (unsigned k = 0; k < in.plane_count; ++k) {
             const drm::kms_plane_info pl = kms.plane(k);
-            bool taken = false;
-            for (unsigned u = 0; u < used_plane_count; ++u)
-                taken = taken || used_planes[u] == pl.id;
+            const bool taken = std::ranges::contains(used_planes, pl.id);
             in.planes[k].kind = pl.kind;
             in.planes[k].possible_crtcs = pl.possible_crtcs;
             in.planes[k].bound_crtc = pl.crtc_id ? kms.crtc_index_of(pl.crtc_id) : -1;
@@ -4762,22 +4746,22 @@ struct config_test_ctx {
 bool config_crtc_test(const drm::crtc_alloc_result& r, void* user) {
     auto* t = static_cast<config_test_ctx*>(user);
     std::unique_ptr<drm::kms_pipeline> pipes[output_manager::k_max];
-    drm::modeset_entry entries[2 * output_manager::k_max]{};
-    unsigned n = 0;
+    std::inplace_vector<drm::modeset_entry, 2 * output_manager::k_max> entries;
     for (unsigned i = 0; i < t->fixed_count; ++i)
-        entries[n++] = t->fixed[i];
+        entries.push_back(t->fixed[i]);
     for (unsigned i = 0; i < t->count; ++i) {
         // Unregistered: no event can reach a candidate, and no other thread sees it.
         pipes[i] = std::make_unique<drm::kms_pipeline>(
             *t->kms, desc_for(*t->kms, r, i, t->connectors[i]), false);
         pipes[i]->set_mode(*t->modes[i]);
-        drm::modeset_entry& e = entries[n++];
+        drm::modeset_entry& e = entries.emplace_back();
         e.pipe = pipes[i].get();
         e.framebuffer_id = t->framebuffers[i];
         e.request_page_flip = false;
         e.vrr = t->vrr[i] > 0 ? 1 : 0;
     }
-    return static_cast<bool>(drm::commit_modeset(*t->kms, entries, n, true));
+    return static_cast<bool>(
+        drm::commit_modeset(*t->kms, entries.data(), static_cast<unsigned>(entries.size()), true));
 }
 } // namespace
 
@@ -4802,8 +4786,7 @@ void compositor_impl::render_test_config(const config_test& t) {
     unsigned released_crtcs = 0; // CRTCs of outputs this configuration disables
     // Staged targets: a mode change's go to its pipeline for the switch; an enabled output's
     // are dropped after the test (its add makes its own).
-    std::unique_ptr<output_pipeline> fresh[output_manager::k_max];
-    unsigned fresh_count = 0;
+    std::inplace_vector<std::unique_ptr<output_pipeline>, output_manager::k_max> fresh;
     const auto stage = [&](lx::size2i size, std::unique_ptr<output_pipeline>& out) {
         out = std::make_unique<output_pipeline>();
         out->mode = size;
@@ -4857,17 +4840,16 @@ void compositor_impl::render_test_config(const config_test& t) {
     ctx.fixed_count = nf;
     drm::crtc_alloc_input in{};
     unsigned used_crtcs = 0;
-    unsigned used_planes[2 * output_manager::k_max]{};
-    unsigned used_plane_count = 0;
+    std::inplace_vector<unsigned, 2 * output_manager::k_max> used_planes;
     for (const auto& up : pipes_) {
         if (!up || !up->kms || up->retiring)
             continue;
         if (released_crtcs & (1u << up->kms->desc().crtc_index))
             continue;
         used_crtcs |= 1u << up->kms->desc().crtc_index;
-        used_planes[used_plane_count++] = up->kms->desc().primary_plane_id;
+        used_planes.push_back(up->kms->desc().primary_plane_id);
         if (up->cursor.valid())
-            used_planes[used_plane_count++] = up->cursor.caps().plane_id;
+            used_planes.push_back(up->cursor.caps().plane_id);
     }
     // A released CRTC is not offered to another output in the same test: the disable and the
     // enable would state the same CRTC twice in one commit. Swapping a CRTC between outputs
@@ -4882,12 +4864,11 @@ void compositor_impl::render_test_config(const config_test& t) {
         const int routed = c.routed_crtc_id ? kms.crtc_index_of(c.routed_crtc_id) : -1;
         in.connectors[k].routed_crtc = routed >= 0 && !(used_crtcs & (1u << routed)) ? routed : -1;
         const lx::size2i size{static_cast<int>(c.mode.width), static_cast<int>(c.mode.height)};
-        if (!stage(size, fresh[fresh_count])) {
+        if (!stage(size, fresh.emplace_back())) {
             answer(false, 0);
             return;
         }
-        ctx.framebuffers[k] = fresh[fresh_count]->framebuffer(0, cpu_present_);
-        ++fresh_count;
+        ctx.framebuffers[k] = fresh.back()->framebuffer(0, cpu_present_);
         ctx.modes[k] = &c.mode;
         ctx.connectors[k] = c.connector_id;
         ctx.vrr[k] = c.vrr;
@@ -4904,9 +4885,7 @@ void compositor_impl::render_test_config(const config_test& t) {
                                                                       : drm::k_alloc_max_planes;
         for (unsigned k = 0; k < in.plane_count; ++k) {
             const drm::kms_plane_info pl = kms.plane(k);
-            bool taken = false;
-            for (unsigned u = 0; u < used_plane_count; ++u)
-                taken = taken || used_planes[u] == pl.id;
+            const bool taken = std::ranges::contains(used_planes, pl.id);
             in.planes[k].kind = pl.kind;
             in.planes[k].possible_crtcs = pl.possible_crtcs;
             in.planes[k].bound_crtc = pl.crtc_id ? kms.crtc_index_of(pl.crtc_id) : -1;
@@ -5118,14 +5097,15 @@ void compositor_impl::apply_connector_scan(const drm::connector_scan& scan, bool
     // A connector that failed is tried again once it changed (or was unplugged), and at every
     // resume (a failure may have been the VT switch racing the test).
     if (forced)
-        failed_count_ = 0;
-    for (unsigned i = 0; i < failed_count_;) {
+        failed_.clear();
+    for (std::size_t i = 0; i < failed_.size();) {
         const drm::connector_probe* e = scan_entry(scan, failed_[i].connector_id);
         if (e && desktop_connector(*e) && mode_list_hash(*e) == failed_[i].modes_hash) {
             ++i;
             continue;
         }
-        failed_[i] = failed_[--failed_count_];
+        failed_[i] = failed_.back();
+        failed_.pop_back();
     }
 
     output_changes ch{};
@@ -5263,8 +5243,8 @@ void compositor_impl::on_add_result(unsigned slot, unsigned gen, bool ok, unsign
         }
         if (outputs.count() == 0)
             add_fallback_headless();
-        if (failed_count_ < output_manager::k_max)
-            failed_[failed_count_++] = {pd.probe.connector_id, mode_list_hash(pd.probe)};
+        if (failed_.size() < output_manager::k_max)
+            failed_.push_back({pd.probe.connector_id, mode_list_hash(pd.probe)});
         lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.hotplug",
                                          "output {} not enabled: no CRTC, or none of its {} modes "
                                          "passed TEST_ONLY — it stays off until it changes",
@@ -5592,46 +5572,37 @@ void compositor_impl::reclamp_pointer() {
 void compositor_impl::sync_cursor_themes() {
     if (cursor_theme_count_ == 0)
         return; // before start's themes (or without a cursor at all)
-    unsigned used[output_manager::k_max];
-    unsigned n = 0;
+    std::inplace_vector<unsigned, output_manager::k_max> used;
     for (unsigned s = 0; s < output_manager::k_max; ++s) {
         if (!outputs.slot_live(s))
             continue;
         const unsigned s120 = static_cast<unsigned>(std::lround(outputs.slot_state(s).scale * 120.0));
-        bool seen = false;
-        for (unsigned i = 0; i < n; ++i)
-            seen = seen || used[i] == s120;
-        if (!seen)
-            used[n++] = s120;
+        if (!std::ranges::contains(used, s120))
+            used.push_back(s120);
     }
     bool changed = false;
-    for (unsigned u = 0; u < n; ++u) {
+    for (const unsigned s120 : used) {
         bool loaded = false;
         for (unsigned i = 0; i < cursor_theme_count_ && !loaded; ++i)
-            loaded = cursor_theme_scale120_[i] == used[u];
+            loaded = cursor_theme_scale120_[i] == s120;
         if (loaded)
             continue;
         int slot = cursor_theme_count_ < k_cursor_scales ? static_cast<int>(cursor_theme_count_) : -1;
-        for (unsigned i = 0; i < cursor_theme_count_ && slot < 0; ++i) {
-            bool in_use = false;
-            for (unsigned k = 0; k < n && !in_use; ++k)
-                in_use = used[k] == cursor_theme_scale120_[i];
-            if (!in_use)
+        for (unsigned i = 0; i < cursor_theme_count_ && slot < 0; ++i)
+            if (!std::ranges::contains(used, cursor_theme_scale120_[i]))
                 slot = static_cast<int>(i);
-        }
         if (slot < 0)
             break; // more distinct scales than themes: the nearest serves (§A.7)
         const unsigned i = static_cast<unsigned>(slot);
-        const long px = std::lround(static_cast<double>(cursor_base_px_) * used[u] / 120.0);
+        const long px = std::lround(static_cast<double>(cursor_base_px_) * s120 / 120.0);
         cursor_themes_[i].load(nullptr, px > 0 ? static_cast<unsigned>(px) : cursor_base_px_);
-        cursor_theme_scale120_[i] = used[u];
+        cursor_theme_scale120_[i] = s120;
         if (i == cursor_theme_count_)
             ++cursor_theme_count_;
         changed = true;
         lx::trace::logger::global().logf(lx::trace::level::info, "compositor.cursor",
                                          "cursor theme={} size={} scale={}/120 (new output scale)",
-                                         cursor_themes_[i].name(), cursor_themes_[i].size(),
-                                         used[u]);
+                                         cursor_themes_[i].name(), cursor_themes_[i].size(), s120);
     }
     if (!changed)
         return;
@@ -5669,10 +5640,7 @@ void compositor_impl::outputs_changed_now() {
 // ── Output configuration: wlr-output-management and persistence (ADR 008 Part C) ──────
 
 bool compositor_impl::connector_disabled(unsigned connector_id) const {
-    for (unsigned i = 0; i < disabled_count_; ++i)
-        if (disabled_connectors_[i] == connector_id)
-            return true;
-    return false;
+    return std::ranges::contains(disabled_connectors_, connector_id);
 }
 
 void compositor_impl::keep_position(unsigned connector_id, const output_state& o) {
@@ -5682,50 +5650,52 @@ void compositor_impl::keep_position(unsigned connector_id, const output_state& o
     k.position = o.position;
     k.has_mode = !o.follow_preferred && o.kms_mode.valid();
     k.mode = o.kms_mode;
-    for (unsigned i = 0; i < kept_position_count_; ++i) {
-        if (kept_positions_[i].connector_id != connector_id)
+    for (kept_position& kp : kept_positions_) {
+        if (kp.connector_id != connector_id)
             continue;
-        if (!k.has_position && !k.has_mode)
-            kept_positions_[i] = kept_positions_[--kept_position_count_];
-        else
-            kept_positions_[i] = k;
+        if (!k.has_position && !k.has_mode) {
+            kp = kept_positions_.back();
+            kept_positions_.pop_back();
+        } else {
+            kp = k;
+        }
         return;
     }
-    if ((k.has_position || k.has_mode) && kept_position_count_ < output_manager::k_max)
-        kept_positions_[kept_position_count_++] = k;
+    if ((k.has_position || k.has_mode) && kept_positions_.size() < output_manager::k_max)
+        kept_positions_.push_back(k);
 }
 
 const compositor_impl::kept_position* compositor_impl::kept_position_of(unsigned connector_id) const {
-    for (unsigned i = 0; i < kept_position_count_; ++i)
-        if (kept_positions_[i].connector_id == connector_id)
-            return &kept_positions_[i];
+    for (const kept_position& kp : kept_positions_)
+        if (kp.connector_id == connector_id)
+            return &kp;
     return nullptr;
 }
 
 void compositor_impl::set_connector_disabled(unsigned connector_id, bool disabled) {
-    for (unsigned i = 0; i < disabled_count_; ++i) {
-        if (disabled_connectors_[i] != connector_id)
+    for (unsigned& c : disabled_connectors_) {
+        if (c != connector_id)
             continue;
         if (!disabled) {
-            disabled_connectors_[i] = disabled_connectors_[--disabled_count_];
+            c = disabled_connectors_.back();
+            disabled_connectors_.pop_back();
             mark_heads_dirty();
         }
         return;
     }
-    if (disabled && disabled_count_ < output_manager::k_max) {
-        disabled_connectors_[disabled_count_++] = connector_id;
+    if (disabled && disabled_connectors_.size() < output_manager::k_max) {
+        disabled_connectors_.push_back(connector_id);
         mark_heads_dirty();
     }
 }
 
 unsigned compositor_impl::virtual_key(const char* name) {
-    for (unsigned i = 0; i < virtual_head_count_; ++i)
-        if (!std::strcmp(virtual_heads_[i].name, name))
-            return virtual_heads_[i].key;
-    if (virtual_head_count_ >= output_manager::k_max)
+    for (const virtual_head& v : virtual_heads_)
+        if (!std::strcmp(v.name, name))
+            return v.key;
+    if (virtual_heads_.size() >= output_manager::k_max)
         return mgmt::k_virtual_key; // never matched by anything
-    virtual_head& v = virtual_heads_[virtual_head_count_++];
-    v = virtual_head{};
+    virtual_head& v = virtual_heads_.emplace_back();
     v.key = mgmt::k_virtual_key | next_virtual_key_++;
     std::snprintf(v.name, sizeof(v.name), "%s", name);
     return v.key;
@@ -5741,8 +5711,8 @@ int compositor_impl::slot_of_head(unsigned key) const {
                 return static_cast<int>(s);
             continue;
         }
-        for (unsigned i = 0; i < virtual_head_count_; ++i)
-            if (virtual_heads_[i].key == key && !std::strcmp(virtual_heads_[i].name, o.name))
+        for (const virtual_head& v : virtual_heads_)
+            if (v.key == key && !std::strcmp(v.name, o.name))
                 return static_cast<int>(s);
     }
     return -1;
@@ -5831,12 +5801,12 @@ void compositor_impl::configure_outputs_at_start(const drm::connector_scan& scan
     unsigned entries[output_manager::k_max];
     const unsigned n = connected_identifiers(scan, ids, entries);
     const char* ptrs[output_manager::k_max];
+    connected_set_.clear();
     for (unsigned k = 0; k < n; ++k) {
         ptrs[k] = ids[k];
-        connected_set_[k] = scan.entries[entries[k]].connector_id;
+        connected_set_.push_back(scan.entries[entries[k]].connector_id);
     }
-    connected_count_ = n;
-    std::sort(connected_set_, connected_set_ + n);
+    std::ranges::sort(connected_set_);
     const setup_config* setup = find_setup(outcfg_.config(), ptrs, n);
     unsigned added = 0;
     for (unsigned k = 0; k < n; ++k) {
@@ -5883,7 +5853,7 @@ void compositor_impl::configure_outputs_at_start(const drm::connector_scan& scan
                                          "output configuration at start: {} monitor{}, setup {}, "
                                          "{} disabled",
                                          n, n == 1 ? "" : "s", setup ? "restored" : "new",
-                                         disabled_count_);
+                                         static_cast<unsigned>(disabled_connectors_.size()));
     }
     if (outputs.count() == 0)
         (void)outputs.add_virtual("HEADLESS-1", {0, 0, 1920, 1080}, 60000);
@@ -5901,37 +5871,32 @@ void compositor_impl::apply_connected_setup(const drm::connector_scan& scan) {
         now_set[k] = scan.entries[entries[k]].connector_id;
     }
     std::sort(now_set, now_set + n);
-    const bool set_changed =
-        n != connected_count_ || std::memcmp(now_set, connected_set_, n * sizeof(unsigned)) != 0;
-    std::memcpy(connected_set_, now_set, n * sizeof(unsigned));
-    connected_count_ = n;
+    const std::span<const unsigned> now{now_set, n};
+    const bool set_changed = !std::ranges::equal(now, connected_set_);
+    connected_set_.assign(now.begin(), now.end());
     // Disabled marks of connectors no longer connected go with them.
-    for (unsigned i = 0; i < disabled_count_;) {
-        bool still = false;
-        for (unsigned k = 0; k < n && !still; ++k)
-            still = now_set[k] == disabled_connectors_[i];
-        if (still) {
+    for (std::size_t i = 0; i < disabled_connectors_.size();) {
+        if (std::ranges::contains(now, disabled_connectors_[i])) {
             ++i;
             continue;
         }
-        disabled_connectors_[i] = disabled_connectors_[--disabled_count_];
+        disabled_connectors_[i] = disabled_connectors_.back();
+        disabled_connectors_.pop_back();
         mark_heads_dirty();
     }
-    for (unsigned i = 0; i < kept_position_count_;) {
-        bool still = false;
-        for (unsigned k = 0; k < n && !still; ++k)
-            still = now_set[k] == kept_positions_[i].connector_id;
-        if (still)
+    for (std::size_t i = 0; i < kept_positions_.size();) {
+        if (std::ranges::contains(now, kept_positions_[i].connector_id)) {
             ++i;
-        else
-            kept_positions_[i] = kept_positions_[--kept_position_count_];
+        } else {
+            kept_positions_[i] = kept_positions_.back();
+            kept_positions_.pop_back();
+        }
     }
     // When the set of connected monitors changed, its setup (if one was saved) decides which
     // are enabled and where; an unknown set enables everything and keeps what is placed
     // where it is (KWin 6). Otherwise only new connectors are brought up.
     const setup_config* setup = set_changed ? find_setup(outcfg_.config(), ptrs, n) : nullptr;
-    unsigned to_disable[output_manager::k_max];
-    unsigned disable_count = 0;
+    std::inplace_vector<unsigned, output_manager::k_max> to_disable;
     for (unsigned k = 0; k < n; ++k) {
         const drm::connector_probe& e = scan.entries[entries[k]];
         const setup_output_config* so = nullptr;
@@ -5945,7 +5910,7 @@ void compositor_impl::apply_connected_setup(const drm::connector_scan& scan) {
                 slot = static_cast<int>(s);
         if (slot >= 0) {
             if (!want) {
-                to_disable[disable_count++] = static_cast<unsigned>(slot);
+                to_disable.push_back(static_cast<unsigned>(slot));
                 keep_position(e.connector_id, outputs.slot_state(static_cast<unsigned>(slot)));
                 set_connector_disabled(e.connector_id, true);
             } else if (so && !e.hotplug_mode_update) {
@@ -5964,8 +5929,8 @@ void compositor_impl::apply_connected_setup(const drm::connector_scan& scan) {
             if (busy && mode_list_hash(e) != mode_list_hash(pending_[s].probe))
                 pending_[s].stale = true;
         }
-        for (unsigned f = 0; f < failed_count_ && !busy; ++f)
-            busy = failed_[f].connector_id == e.connector_id;
+        for (const failed_connector& f : failed_)
+            busy = busy || f.connector_id == e.connector_id;
         if (busy)
             continue;
         if (!want) {
@@ -5985,9 +5950,9 @@ void compositor_impl::apply_connected_setup(const drm::connector_scan& scan) {
     }
     // Disables last: whatever this setup enables is on its way first, so clients never see
     // the stand-in output in between.
-    for (unsigned i = 0; i < disable_count; ++i)
-        if (outputs.slot_live(to_disable[i]))
-            remove_output(to_disable[i], false, "disabled by the setup");
+    for (const unsigned slot : to_disable)
+        if (outputs.slot_live(slot))
+            remove_output(slot, false, "disabled by the setup");
     if (setup)
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.outputcfg",
                                         "connected monitors changed: their saved setup applied");
@@ -6119,8 +6084,9 @@ void compositor_impl::build_heads(mgmt::head_set& hs) {
         }
     }
     // Virtual outputs a configuration disabled.
-    for (unsigned i = 0; i < virtual_head_count_ && hs.count < mgmt::k_max_heads; ++i) {
-        const virtual_head& v = virtual_heads_[i];
+    for (const virtual_head& v : virtual_heads_) {
+        if (hs.count >= mgmt::k_max_heads)
+            break;
         if (!v.disabled)
             continue;
         mgmt::head& h = hs.heads[hs.count++];
@@ -6377,8 +6343,7 @@ void compositor_impl::switch_to_target(const mgmt::target& t, unsigned ticket,
         if (!ht.enabled || slot_of_head(ht.key) >= 0)
             continue;
         if (ht.key & mgmt::k_virtual_key) {
-            for (unsigned v = 0; v < virtual_head_count_; ++v) {
-                virtual_head& vh = virtual_heads_[v];
+            for (virtual_head& vh : virtual_heads_) {
                 if (vh.key != ht.key)
                     continue;
                 vh.disabled = false;
@@ -6510,8 +6475,7 @@ void compositor_impl::switch_to_target(const mgmt::target& t, unsigned ticket,
             keep_position(o.connector_id, o);
             set_connector_disabled(o.connector_id, true);
         } else {
-            for (unsigned v = 0; v < virtual_head_count_; ++v) {
-                virtual_head& vh = virtual_heads_[v];
+            for (virtual_head& vh : virtual_heads_) {
                 if (vh.key != ht.key)
                     continue;
                 vh.disabled = true;
@@ -6903,7 +6867,7 @@ lx::result<void> compositor::start() {
     lx::trace::timeline_start_from_env();
     lx::trace::name_thread("lx-ui");
     if (!impl_) {
-        const auto err = lx::make_error(lx::error_domain::invalid_argument, 0, "null impl");
+        const auto err = lx::invalid_argument("null impl");
         lx::trace::logger::global().log_error(err, "compositor");
         return err;
     }
@@ -6944,8 +6908,7 @@ lx::result<void> compositor::start() {
     const bool want_virtual = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
     if (!want_virtual) {
         lx::result<drm::kms_device> opened =
-            lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
-                           "kms not opened");
+            lx::make_error(lx::drm_err::open_failed, "kms not opened");
         bool inactive = false;
         if (auto taken = impl_->logind_.take_device_path("/dev/dri/card0", &inactive); taken) {
             impl_->drm_via_logind_ = impl_->logind_.has_control();
@@ -8480,10 +8443,9 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
             display_gate_.load(std::memory_order_acquire) != 0 ||
             (gate_power_mask_.load(std::memory_order_acquire) & bit) != 0;
         const auto committed =
-            paused_now ? lx::result<void>{lx::make_error(
-                             lx::error_domain::drm, static_cast<int>(lx::drm_err::page_flip_failed),
-                             "session paused")}
-                       : p.kms->commit(req);
+            paused_now
+                ? lx::result<void>{lx::make_error(lx::drm_err::page_flip_failed, "session paused")}
+                : p.kms->commit(req);
         // A commit that raced the pause is expected, not a failure of the present path:
         // logind drops master *before* it signals, so EACCES usually arrives first and the
         // pause a moment later. Master lost with no pause following is reported below.

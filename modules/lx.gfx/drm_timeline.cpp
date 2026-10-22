@@ -29,8 +29,7 @@ namespace lx::gfx {
 namespace {
 
 lx::error timeline_error(const char* message) {
-    return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::timeline_failed),
-                          message);
+    return lx::make_error(lx::drm_err::timeline_failed, message);
 }
 
 #if defined(LUMEN_HAS_DRM)

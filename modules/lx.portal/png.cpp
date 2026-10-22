@@ -47,18 +47,16 @@ void flush_fn(png_structp) {}
 
 lx::result<void> write_png(int fd, const image& img, int level) {
     if (fd < 0 || img.empty())
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "write_png: no file or no image");
+        return lx::invalid_argument("write_png: no file or no image");
     png_structp png = png_create_write_struct(PNG_LIBPNG_VER_STRING, nullptr, nullptr, nullptr);
     if (!png)
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::broken_pipe),
-                              "png_create_write_struct failed");
+        return lx::make_error(lx::io_err::broken_pipe, "png_create_write_struct failed");
     png_infop info = png_create_info_struct(png);
     fd_sink sink{fd, false};
     std::vector<png_bytep> rows;
     if (!info || setjmp(png_jmpbuf(png))) {
         png_destroy_write_struct(&png, info ? &info : nullptr);
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::broken_pipe),
-                              "PNG encoding failed");
+        return lx::make_error(lx::io_err::broken_pipe, "PNG encoding failed");
     }
     png_set_write_fn(png, &sink, write_fn, flush_fn);
     png_set_IHDR(png, info, static_cast<png_uint_32>(img.width), static_cast<png_uint_32>(img.height),
@@ -79,8 +77,7 @@ lx::result<void> write_png(int fd, const image& img, int level) {
     png_write_end(png, nullptr);
     png_destroy_write_struct(&png, &info);
     if (sink.failed)
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::broken_pipe),
-                              "writing the PNG file failed");
+        return lx::make_error(lx::io_err::broken_pipe, "writing the PNG file failed");
     return {};
 }
 
@@ -88,15 +85,13 @@ lx::result<image> read_png(const char* path) {
     png_image pi{};
     pi.version = PNG_IMAGE_VERSION;
     if (!path || !png_image_begin_read_from_file(&pi, path))
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
-                              "PNG not readable");
+        return lx::make_error(lx::io_err::not_found, "PNG not readable");
     pi.format = PNG_FORMAT_BGRA;
     image img;
     img.allocate(static_cast<int>(pi.width), static_cast<int>(pi.height));
     if (!png_image_finish_read(&pi, nullptr, img.pixels.data(), 0, nullptr)) {
         png_image_free(&pi);
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::broken_pipe),
-                              "PNG decoding failed");
+        return lx::make_error(lx::io_err::broken_pipe, "PNG decoding failed");
     }
     return img;
 }

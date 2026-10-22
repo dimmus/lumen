@@ -100,7 +100,7 @@ void params_create_common(struct wl_client* client, struct wl_resource* resource
     buf->width = p->desc.width;
     buf->height = p->desc.height;
     // Move plane FDs into buffer.
-    buf->dmabuf = static_cast<lx::gfx::dmabuf_desc&&>(p->desc);
+    buf->dmabuf = std::move(p->desc);
     p->desc = {};
 
     buf->resource = wl_resource_create(client, &wl_buffer_interface, 1, buffer_id);

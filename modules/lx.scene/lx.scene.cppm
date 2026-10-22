@@ -73,8 +73,8 @@ struct output_projection {
 /// fully inside one of them, or entirely outside `output` (when that is not empty). Every
 /// backend skips occluded draws; the pixels are identical, so damage and buffer age are
 /// untouched. `shown[i]`, when given, receives whether draw `i` reaches the screen (not
-/// occluded). Returns the number of draws marked. O(count × 8), no allocation.
-unsigned mark_occlusion(draw_command* draws, unsigned count, lx::rect2i output, bool* shown);
+/// occluded). Returns the number of draws marked. O(draws × 8), no allocation.
+unsigned mark_occlusion(std::span<draw_command> draws, lx::rect2i output, bool* shown);
 
 /// What `emit_draws` needs to place a node: the output projection, and the logical point
 /// its tree rounds edges relative to (a window's root surface origin) when it has one.
@@ -837,15 +837,14 @@ namespace {
 
 } // namespace
 
-unsigned lx::scene::mark_occlusion(draw_command* draws, unsigned count, lx::rect2i output,
-                                   bool* shown) {
+unsigned lx::scene::mark_occlusion(std::span<draw_command> draws, lx::rect2i output, bool* shown) {
     constexpr unsigned k_max_occluders = 8;
     lx::rect2i occluders[k_max_occluders]{};
     long long areas[k_max_occluders]{};
     unsigned n = 0;
     unsigned marked = 0;
     const bool bounded = output.width > 0 && output.height > 0;
-    for (unsigned i = count; i-- > 0;) {
+    for (std::size_t i = draws.size(); i-- > 0;) {
         draw_command& d = draws[i];
         lx::rect2i r = d.dst;
         if (d.clip.width > 0 && d.clip.height > 0)
@@ -938,7 +937,7 @@ bool lx::scene::scene_graph::commit_frame(unsigned slot, unsigned frame_index) {
     const unsigned n = draws.size() < k_max_draw_commands ? draws.size() : k_max_draw_commands;
     const output_projection& p = v.config.projection;
     const lx::rect2i output{0, 0, p.size.width, p.size.height};
-    v.last_culled = mark_occlusion(draws.data(), n, output, shown_);
+    v.last_culled = mark_occlusion({draws.data(), n}, output, shown_);
     for (unsigned i = 0; i < n; ++i)
         if (shown_[i] && emitters_[i])
             emitters_[i]->on_shown(frame_index, slot);

@@ -259,8 +259,9 @@ overlay::~overlay() {
 
 lx::result<void> overlay::setup_input() {
     if (!desktop_.compositor() || !desktop_.shm() || !desktop_.layer_shell() || !desktop_.seat())
-        return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::bind_failed),
-                              "the overlay needs wl_compositor, wl_shm, wl_seat and wlr-layer-shell");
+        return lx::make_error(
+            lx::wayland_err::bind_failed,
+            "the overlay needs wl_compositor, wl_shm, wl_seat and wlr-layer-shell");
     auto* seat = static_cast<wl_seat*>(desktop_.seat());
     const unsigned caps = desktop_.seat_caps();
     if (caps & WL_SEAT_CAPABILITY_POINTER) {
@@ -292,8 +293,7 @@ lx::result<void> overlay::add_view(int output_index) {
             if (!o->gone && o->name == name)
                 out = static_cast<wl_output*>(o->wl_output);
         if (!out)
-            return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::bind_failed),
-                                  "an output of the capture is gone");
+            return lx::make_error(lx::wayland_err::bind_failed, "an output of the capture is gone");
     }
     // Fractional scale before the first buffer (the canvas sizes its buffers by it).
     v->canvas.attach_scale(desktop_.viewporter(), desktop_.fractional(), surface);
@@ -343,7 +343,7 @@ lx::result<void> overlay::start_pick(std::span<const output_shot> shots) {
 
 lx::result<void> overlay::start_choose(std::vector<chooser_entry> entries, std::string heading) {
     if (entries.empty())
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "nothing to choose from");
+        return lx::invalid_argument("nothing to choose from");
     entries_ = std::move(entries);
     heading_ = std::move(heading);
     mode_ = mode::choose;

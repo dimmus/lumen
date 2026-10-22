@@ -353,10 +353,6 @@ module :private;
 
 namespace {
 
-[[nodiscard]] lx::error drm_error(lx::drm_err code, const char* message) {
-    return lx::make_error(lx::error_domain::drm, static_cast<int>(code), message);
-}
-
 [[nodiscard]] lx::runtime::clock_time steady_now_ns() {
     return static_cast<lx::runtime::clock_time>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -406,7 +402,9 @@ const char* lx::drm::connector_type_name(unsigned type) {
 
 lx::drm::kms_device::~kms_device() { release(); }
 
-lx::drm::kms_device::kms_device(kms_device&& other) noexcept { *this = static_cast<kms_device&&>(other); }
+lx::drm::kms_device::kms_device(kms_device&& other) noexcept {
+    *this = std::move(other);
+}
 
 lx::drm::kms_device& lx::drm::kms_device::operator=(kms_device&& other) noexcept {
     if (this == &other)
@@ -414,14 +412,14 @@ lx::drm::kms_device& lx::drm::kms_device::operator=(kms_device&& other) noexcept
     release();
     // Moved only before any pipeline registers (open returns it by value): the registry and
     // the cookies are empty on both sides.
-    card_fd_ = static_cast<lx::unique_fd&&>(other.card_fd_);
+    card_fd_ = std::move(other.card_fd_);
     crtc_count_ = other.crtc_count_;
     for (unsigned i = 0; i < k_max_crtcs; ++i)
         crtcs_[i] = other.crtcs_[i];
     plane_count_ = other.plane_count_;
     for (unsigned i = 0; i < k_max_planes; ++i)
         planes_[i] = other.planes_[i];
-    scan_ = static_cast<std::unique_ptr<connector_scan>&&>(other.scan_);
+    scan_ = std::move(other.scan_);
     stale_crtcs_.store(other.stale_crtcs_.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
     cursor_hotspot_cap_ = other.cursor_hotspot_cap_;
@@ -447,14 +445,14 @@ lx::result<void> lx::drm::kms_device::init_from_fd() {
 #if defined(LUMEN_HAS_DRM)
     const int fd = card_fd_.get();
     if (fd < 0)
-        return drm_error(lx::drm_err::open_failed, "invalid card fd");
+        return lx::make_error(lx::drm_err::open_failed, "invalid card fd");
     // Non-blocking so drmHandleEvent / drm_read never stalls the UI thread when
     // there is no pending page-flip event.
     const int flags = ::fcntl(fd, F_GETFL);
     if (flags >= 0)
         (void)::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     if (drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0)
-        return drm_error(lx::drm_err::open_failed, "DRM_CLIENT_CAP_ATOMIC failed");
+        return lx::make_error(lx::drm_err::open_failed, "DRM_CLIENT_CAP_ATOMIC failed");
     (void)drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
     // Declares that this client sets HOTSPOT_X/Y on cursor planes. Virtualised drivers
     // (vmwgfx, virtio-gpu, qxl, vboxvideo) only expose their cursor plane to atomic
@@ -475,7 +473,7 @@ lx::result<lx::drm::kms_device> lx::drm::kms_device::open(const char* device_pat
     const char* path = device_path ? device_path : "/dev/dri/card0";
     const int fd = ::open(path, O_RDWR | O_CLOEXEC);
     if (fd < 0)
-        return drm_error(lx::drm_err::open_failed, "failed to open DRM card");
+        return lx::make_error(lx::drm_err::open_failed, "failed to open DRM card");
     return open_fd(lx::unique_fd{fd});
 #else
     (void)device_path;
@@ -486,7 +484,7 @@ lx::result<lx::drm::kms_device> lx::drm::kms_device::open(const char* device_pat
 lx::result<lx::drm::kms_device> lx::drm::kms_device::open_fd(lx::unique_fd card_fd) {
 #if defined(LUMEN_HAS_DRM)
     kms_device dev{};
-    dev.card_fd_ = static_cast<lx::unique_fd&&>(card_fd);
+    dev.card_fd_ = std::move(card_fd);
     if (auto init = dev.init_from_fd(); !init)
         return init.get_error();
     return dev;
@@ -623,10 +621,10 @@ lx::result<void> lx::drm::kms_device::enumerate_resources() {
 #if defined(LUMEN_HAS_DRM)
     const int fd = card_fd_.get();
     if (fd < 0)
-        return drm_error(lx::drm_err::open_failed, "no card fd");
+        return lx::make_error(lx::drm_err::open_failed, "no card fd");
     drmModeRes* res = drmModeGetResources(fd);
     if (!res)
-        return drm_error(lx::drm_err::open_failed, "drmModeGetResources failed");
+        return lx::make_error(lx::drm_err::open_failed, "drmModeGetResources failed");
     crtc_count_ = 0;
     unsigned stale = 0;
     for (int i = 0; i < res->count_crtcs && crtc_count_ < k_max_crtcs; ++i) {
@@ -690,10 +688,10 @@ lx::result<void> lx::drm::kms_device::probe_connectors(unsigned hint_connector_i
 #if defined(LUMEN_HAS_DRM)
     const int fd = card_fd_.get();
     if (fd < 0)
-        return drm_error(lx::drm_err::open_failed, "no card fd");
+        return lx::make_error(lx::drm_err::open_failed, "no card fd");
     drmModeRes* res = drmModeGetResources(fd);
     if (!res)
-        return drm_error(lx::drm_err::open_failed, "drmModeGetResources failed");
+        return lx::make_error(lx::drm_err::open_failed, "drmModeGetResources failed");
     if (hint_connector_id != 0) {
         bool found = false;
         for (unsigned i = 0; i < out.count; ++i) {
@@ -755,25 +753,25 @@ lx::drm::connector_info lx::drm::kms_device::connector(unsigned index) const {
 lx::result<lx::drm::mode> lx::drm::kms_device::preferred_mode(unsigned index) const {
     const connector_scan& s = last_scan();
     if (index >= s.count)
-        return drm_error(lx::drm_err::mode_invalid, "connector index out of range");
+        return lx::make_error(lx::drm_err::mode_invalid, "connector index out of range");
     const connector_probe& e = s.entries[index];
     const kms_mode* m = e.status == connector_status::connected ? e.preferred_mode() : nullptr;
     if (!m || !m->valid())
-        return drm_error(lx::drm_err::mode_invalid, "no mode");
+        return lx::make_error(lx::drm_err::mode_invalid, "no mode");
     return mode{m->width, m->height, m->refresh_mhz, m->preferred};
 }
 
 lx::result<lx::drm::kms_pipeline_desc> lx::drm::kms_device::pipeline_desc_for(unsigned index) const {
     const connector_scan& s = last_scan();
     if (index >= s.count)
-        return drm_error(lx::drm_err::mode_invalid, "connector index out of range");
+        return lx::make_error(lx::drm_err::mode_invalid, "connector index out of range");
     const connector_probe& e = s.entries[index];
     int crtc = e.current_crtc_id ? crtc_index_of(e.current_crtc_id) : -1;
     for (unsigned i = 0; crtc < 0 && i < crtc_count_; ++i)
         if (e.possible_crtcs & (1u << crtcs_[i].index))
             crtc = static_cast<int>(crtcs_[i].index);
     if (crtc < 0)
-        return drm_error(lx::drm_err::mode_invalid, "no CRTC for connector");
+        return lx::make_error(lx::drm_err::mode_invalid, "no CRTC for connector");
     kms_pipeline_desc d{};
     d.crtc_index = static_cast<unsigned>(crtc);
     for (unsigned i = 0; i < crtc_count_; ++i)
@@ -785,7 +783,7 @@ lx::result<lx::drm::kms_pipeline_desc> lx::drm::kms_device::pipeline_desc_for(un
             (planes_[i].possible_crtcs & (1u << d.crtc_index)))
             d.primary_plane_id = planes_[i].id;
     if (!d.primary_plane_id)
-        return drm_error(lx::drm_err::mode_invalid, "no primary plane for CRTC");
+        return lx::make_error(lx::drm_err::mode_invalid, "no primary plane for CRTC");
     return d;
 }
 
@@ -823,7 +821,7 @@ lx::result<lx::unique_fd> lx::drm::kms_device::open_render_node() const {
         if (fd >= 0)
             return lx::unique_fd{fd};
     }
-    return drm_error(lx::drm_err::open_failed, "no render node");
+    return lx::make_error(lx::drm_err::open_failed, "no render node");
 #else
     return lx::not_implemented("lx::drm::kms_device::open_render_node");
 #endif
@@ -905,7 +903,7 @@ void lx::drm::kms_device::dispatch_events() {
 lx::drm::kms_framebuffer::~kms_framebuffer() { release(); }
 
 lx::drm::kms_framebuffer::kms_framebuffer(kms_framebuffer&& other) noexcept {
-    *this = static_cast<kms_framebuffer&&>(other);
+    *this = std::move(other);
 }
 
 lx::drm::kms_framebuffer& lx::drm::kms_framebuffer::operator=(kms_framebuffer&& other) noexcept {
@@ -947,14 +945,12 @@ lx::result<lx::drm::kms_framebuffer> lx::drm::kms_framebuffer::import_dmabuf(
 #if defined(LUMEN_HAS_DRM)
     const int fd = device.card_fd();
     if (fd < 0 || dmabuf_fd < 0 || width == 0 || height == 0 || stride == 0) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
-                              "invalid dmabuf framebuffer parameters");
+        return lx::make_error(lx::drm_err::open_failed, "invalid dmabuf framebuffer parameters");
     }
 
     uint32_t handle = 0;
     if (drmPrimeFDToHandle(fd, dmabuf_fd, &handle) != 0 || handle == 0) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
-                              "drmPrimeFDToHandle failed");
+        return lx::make_error(lx::drm_err::open_failed, "drmPrimeFDToHandle failed");
     }
 
     kms_framebuffer framebuffer;
@@ -976,8 +972,7 @@ lx::result<lx::drm::kms_framebuffer> lx::drm::kms_framebuffer::import_dmabuf(
     if (drmModeAddFB2WithModifiers(fd, width, height, static_cast<uint32_t>(format), handles,
                                    pitches, offsets, modifiers, &fb_id, flags) != 0 ||
         fb_id == 0) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
-                              "drmModeAddFB2WithModifiers failed");
+        return lx::make_error(lx::drm_err::mode_invalid, "drmModeAddFB2WithModifiers failed");
     }
     framebuffer.fb_id_ = fb_id;
     return framebuffer;
@@ -999,7 +994,7 @@ lx::result<lx::drm::kms_framebuffer> lx::drm::kms_framebuffer::import_dmabuf(
 lx::drm::kms_dumb_framebuffer::~kms_dumb_framebuffer() { release(); }
 
 lx::drm::kms_dumb_framebuffer::kms_dumb_framebuffer(kms_dumb_framebuffer&& other) noexcept {
-    *this = static_cast<kms_dumb_framebuffer&&>(other);
+    *this = std::move(other);
 }
 
 lx::drm::kms_dumb_framebuffer& lx::drm::kms_dumb_framebuffer::operator=(
@@ -1053,8 +1048,7 @@ lx::result<lx::drm::kms_dumb_framebuffer> lx::drm::kms_dumb_framebuffer::create(
 #if defined(LUMEN_HAS_DRM)
     const int fd = device.card_fd();
     if (fd < 0 || width == 0 || height == 0) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
-                              "invalid dumb framebuffer parameters");
+        return lx::make_error(lx::drm_err::open_failed, "invalid dumb framebuffer parameters");
     }
 
     uint32_t handle = 0;
@@ -1062,8 +1056,7 @@ lx::result<lx::drm::kms_dumb_framebuffer> lx::drm::kms_dumb_framebuffer::create(
     uint64_t size = 0;
     if (drmModeCreateDumbBuffer(fd, width, height, 32, 0, &handle, &pitch, &size) != 0 ||
         handle == 0) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
-                              "drmModeCreateDumbBuffer failed");
+        return lx::make_error(lx::drm_err::open_failed, "drmModeCreateDumbBuffer failed");
     }
 
     kms_dumb_framebuffer framebuffer;
@@ -1077,15 +1070,13 @@ lx::result<lx::drm::kms_dumb_framebuffer> lx::drm::kms_dumb_framebuffer::create(
 
     uint64_t map_offset = 0;
     if (drmModeMapDumbBuffer(fd, handle, &map_offset) != 0) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
-                              "drmModeMapDumbBuffer failed");
+        return lx::make_error(lx::drm_err::open_failed, "drmModeMapDumbBuffer failed");
     }
 
     void* mapped = mmap(nullptr, static_cast<size_t>(size), PROT_READ | PROT_WRITE, MAP_SHARED, fd,
                         static_cast<off_t>(map_offset));
     if (mapped == MAP_FAILED) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
-                              "mmap of dumb buffer failed");
+        return lx::make_error(lx::drm_err::open_failed, "mmap of dumb buffer failed");
     }
     framebuffer.pixels_ = static_cast<unsigned char*>(mapped);
 
@@ -1099,8 +1090,7 @@ lx::result<lx::drm::kms_dumb_framebuffer> lx::drm::kms_dumb_framebuffer::create(
     if (drmModeAddFB2(fd, width, height, static_cast<uint32_t>(format), handles, pitches, offsets,
                       &fb_id, 0) != 0 ||
         fb_id == 0) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
-                              "drmModeAddFB2 failed for dumb buffer");
+        return lx::make_error(lx::drm_err::mode_invalid, "drmModeAddFB2 failed for dumb buffer");
     }
     framebuffer.fb_id_ = fb_id;
     return framebuffer;
@@ -1432,12 +1422,12 @@ lx::result<void> lx::drm::kms_pipeline::ensure_props() {
     const int fd = device_->card_fd();
     const unsigned plane = desc_.primary_plane_id;
     if (fd < 0 || plane == 0)
-        return drm_error(lx::drm_err::mode_invalid, "no primary plane");
+        return lx::make_error(lx::drm_err::mode_invalid, "no primary plane");
 
     drmModeObjectProperties* props =
         drmModeObjectGetProperties(fd, plane, DRM_MODE_OBJECT_PLANE);
     if (!props)
-        return drm_error(lx::drm_err::mode_invalid, "drmModeObjectGetProperties failed");
+        return lx::make_error(lx::drm_err::mode_invalid, "drmModeObjectGetProperties failed");
     for (uint32_t i = 0; i < props->count_props; ++i) {
         drmModePropertyRes* p = drmModeGetProperty(fd, props->props[i]);
         if (!p)
@@ -1474,7 +1464,7 @@ lx::result<void> lx::drm::kms_pipeline::ensure_props() {
     drmModeFreeObjectProperties(props);
     props_ready_ = prop_crtc_id_ && prop_fb_id_;
     if (!props_ready_)
-        return drm_error(lx::drm_err::mode_invalid, "missing plane props");
+        return lx::make_error(lx::drm_err::mode_invalid, "missing plane props");
     return {};
 #else
     return lx::not_implemented("lx::drm::kms_pipeline::ensure_props");
@@ -1508,7 +1498,7 @@ bool lx::drm::kms_pipeline::ensure_modeset_props(int fd) {
 lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& request) {
 #if defined(LUMEN_HAS_DRM)
     if (!device_)
-        return drm_error(lx::drm_err::page_flip_failed, "null kms device");
+        return lx::make_error(lx::drm_err::page_flip_failed, "null kms device");
     const int fd = device_->card_fd();
     const unsigned fb = request.framebuffer_id ? request.framebuffer_id : framebuffer_id_;
     const unsigned plane = desc_.primary_plane_id;
@@ -1518,14 +1508,15 @@ lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& requ
     if (fd < 0 || !plane || !crtc || (primary && !fb)) {
         last_rejected_state_ = false;
         last_lost_master_ = false;
-        return drm_error(lx::drm_err::page_flip_failed, "atomic commit missing fb/plane/crtc");
+        return lx::make_error(lx::drm_err::page_flip_failed, "atomic commit missing fb/plane/crtc");
     }
     if (!primary && (!request.cursor || !modeset_attempted_ || !props_ready_)) {
         // Nothing to commit, or the CRTC is not ours yet — the first commit is the
         // modeset, and it carries a frame. Says nothing about the plane's state.
         last_rejected_state_ = false;
         last_lost_master_ = false;
-        return drm_error(lx::drm_err::mode_invalid, "cursor-only commit before the first modeset");
+        return lx::make_error(lx::drm_err::mode_invalid,
+                              "cursor-only commit before the first modeset");
     }
 
     if (auto props = ensure_props(); !props)
@@ -1534,7 +1525,7 @@ lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& requ
     const unsigned width = mode_.width;
     const unsigned height = mode_.height;
     if (!width || !height)
-        return drm_error(lx::drm_err::mode_invalid, "no mode for the pipeline");
+        return lx::make_error(lx::drm_err::mode_invalid, "no mode for the pipeline");
 
     // A plane-only commit inherits whatever mode the console left on the CRTC, so the very
     // first commit sets the mode our framebuffer was sized for — and so does the first one
@@ -1558,7 +1549,7 @@ lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& requ
 
     drmModeAtomicReq* req = drmModeAtomicAlloc();
     if (!req)
-        return drm_error(lx::drm_err::page_flip_failed, "drmModeAtomicAlloc failed");
+        return lx::make_error(lx::drm_err::page_flip_failed, "drmModeAtomicAlloc failed");
 
     const bool with_cursor = request.cursor && request.cursor->dirty();
     if (with_cursor)
@@ -1627,7 +1618,7 @@ lx::result<void> lx::drm::kms_pipeline::commit(const atomic_commit_request& requ
         if (raises_flip)
             flip_pending_.store(false, std::memory_order_release);
         set_failure(commit_errno);
-        return drm_error(lx::drm_err::page_flip_failed, atomic_commit_message(commit_errno));
+        return lx::make_error(lx::drm_err::page_flip_failed, atomic_commit_message(commit_errno));
     }
     last_rejected_state_ = false;
     last_lost_master_ = false;
@@ -1655,18 +1646,18 @@ lx::result<void> lx::drm::kms_pipeline::commit_power_off(kms_cursor_plane* curso
     if (fd < 0 || !crtc || !modeset_props_ready_ || !prop_crtc_active_) {
         last_rejected_state_ = false;
         last_lost_master_ = false;
-        return drm_error(lx::drm_err::mode_invalid, "power off before the first modeset");
+        return lx::make_error(lx::drm_err::mode_invalid, "power off before the first modeset");
     }
     if (flip_pending_.load(std::memory_order_acquire)) {
         last_rejected_state_ = false;
         last_lost_master_ = false;
-        return drm_error(lx::drm_err::page_flip_failed, "power off while a flip is pending");
+        return lx::make_error(lx::drm_err::page_flip_failed, "power off while a flip is pending");
     }
     drmModeAtomicReq* req = drmModeAtomicAlloc();
     if (!req) {
         last_rejected_state_ = false;
         last_lost_master_ = false;
-        return drm_error(lx::drm_err::page_flip_failed, "drmModeAtomicAlloc failed");
+        return lx::make_error(lx::drm_err::page_flip_failed, "drmModeAtomicAlloc failed");
     }
     // ACTIVE=0 alone is the atomic DPMS off: MODE_ID, the connector's CRTC and the planes'
     // state are kept, so the resources stay reserved and power-on cannot fail on them.
@@ -1689,7 +1680,7 @@ lx::result<void> lx::drm::kms_pipeline::commit_power_off(kms_cursor_plane* curso
     drmModeAtomicFree(req);
     if (r != 0) {
         set_failure(commit_errno);
-        return drm_error(lx::drm_err::page_flip_failed, atomic_commit_message(commit_errno));
+        return lx::make_error(lx::drm_err::page_flip_failed, atomic_commit_message(commit_errno));
     }
     last_rejected_state_ = false;
     last_lost_master_ = false;
@@ -1771,7 +1762,7 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
 #if defined(LUMEN_HAS_DRM)
     const int fd = device.card_fd();
     if (fd < 0 || !entries || count == 0 || count > k_max_pipelines)
-        return drm_error(lx::drm_err::mode_invalid, "modeset: nothing to commit");
+        return lx::make_error(lx::drm_err::mode_invalid, "modeset: nothing to commit");
     const auto fail_all = [&](int err, bool rejected) {
         for (unsigned i = 0; i < count; ++i) {
             if (!entries[i].pipe)
@@ -1793,22 +1784,23 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
         kms_pipeline* p = e.pipe;
         if (!p) {
             fail_all(0, true);
-            return drm_error(lx::drm_err::mode_invalid, "modeset: null pipeline");
+            return lx::make_error(lx::drm_err::mode_invalid, "modeset: null pipeline");
         }
         owned_crtcs |= 1u << p->desc_.crtc_index;
         if (auto props = p->ensure_props(); !props || !p->ensure_modeset_props(fd)) {
             fail_all(0, true);
-            return drm_error(lx::drm_err::mode_invalid, "missing crtc/connector modeset props");
+            return lx::make_error(lx::drm_err::mode_invalid,
+                                  "missing crtc/connector modeset props");
         }
         const kms_mode& want = e.mode ? *e.mode : p->mode_;
         if (e.enable && (!want.valid() || !e.framebuffer_id)) {
             fail_all(0, true);
-            return drm_error(lx::drm_err::mode_invalid, "modeset: no mode or framebuffer");
+            return lx::make_error(lx::drm_err::mode_invalid, "modeset: no mode or framebuffer");
         }
         if (!test_only && p->flip_pending_.load(std::memory_order_acquire)) {
             fail_all(0, false);
-            return drm_error(lx::drm_err::page_flip_failed,
-                             "drmModeAtomicCommit rejected: flip already pending (EBUSY)");
+            return lx::make_error(lx::drm_err::page_flip_failed,
+                                  "drmModeAtomicCommit rejected: flip already pending (EBUSY)");
         }
     }
     // Other registered pipelines' CRTCs are ours too: never touched here.
@@ -1831,7 +1823,7 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
         if (drmModeCreatePropertyBlob(fd, want.kms.bytes, sizeof(want.kms.bytes), &blobs[i]) != 0) {
             destroy_blobs();
             fail_all(0, false);
-            return drm_error(lx::drm_err::mode_invalid, "MODE_ID blob creation failed");
+            return lx::make_error(lx::drm_err::mode_invalid, "MODE_ID blob creation failed");
         }
     }
 
@@ -1839,7 +1831,7 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
     if (!req) {
         destroy_blobs();
         fail_all(0, false);
-        return drm_error(lx::drm_err::page_flip_failed, "drmModeAtomicAlloc failed");
+        return lx::make_error(lx::drm_err::page_flip_failed, "drmModeAtomicAlloc failed");
     }
 
     // Planes a previous master left on one of these CRTCs (an overlay, another cursor):
@@ -1914,7 +1906,8 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
             drmModeAtomicFree(req);
             destroy_blobs();
             fail_all(0, true);
-            return drm_error(lx::drm_err::test_rejected, "modeset: the CRTC has no VRR_ENABLED");
+            return lx::make_error(lx::drm_err::test_rejected,
+                                  "modeset: the CRTC has no VRR_ENABLED");
         }
         any_event = any_event || e.request_page_flip;
     }
@@ -1994,7 +1987,7 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
         destroy_blobs();
         if (r != 0) {
             fail_all(commit_errno, false);
-            return drm_error(lx::drm_err::test_rejected, atomic_commit_message(commit_errno));
+            return lx::make_error(lx::drm_err::test_rejected, atomic_commit_message(commit_errno));
         }
         fail_all(0, false);
         return {};
@@ -2061,7 +2054,7 @@ lx::result<void> lx::drm::commit_modeset(kms_device& device, const modeset_entry
                 entries[i].pipe->flip_pending_.store(false, std::memory_order_release);
         destroy_blobs();
         fail_all(commit_errno, false);
-        return drm_error(lx::drm_err::page_flip_failed, atomic_commit_message(commit_errno));
+        return lx::make_error(lx::drm_err::page_flip_failed, atomic_commit_message(commit_errno));
     }
 
     for (unsigned k = 0; k < device.crtc_count_; ++k)

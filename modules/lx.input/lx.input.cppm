@@ -192,11 +192,11 @@ public:
     /// Keys currently held, so a focus change can tell the newly focused surface what is
     /// already down — `wl_keyboard.enter` carries that array, and getting it wrong leaves
     /// clients with stuck modifiers.
-    [[nodiscard]] const unsigned* pressed_keys() const { return pressed_; }
-    [[nodiscard]] unsigned pressed_count() const { return pressed_count_; }
+    [[nodiscard]] const unsigned* pressed_keys() const { return pressed_.data(); }
+    [[nodiscard]] unsigned pressed_count() const { return static_cast<unsigned>(pressed_.size()); }
     void note_key(unsigned evdev_keycode, bool pressed);
     /// No key is held any more (a session pause released them all).
-    void clear_pressed() { pressed_count_ = 0; }
+    void clear_pressed() { pressed_.clear(); }
 
 private:
     static constexpr unsigned k_max_pressed = 32;
@@ -208,8 +208,7 @@ private:
     double pointer_x_ = 0.0;
     double pointer_y_ = 0.0;
     keyboard_keymap keymap_{};
-    unsigned pressed_[k_max_pressed]{};
-    unsigned pressed_count_ = 0;
+    std::inplace_vector<unsigned, k_max_pressed> pressed_;
 };
 
 /// libinput context bound to a udev seat.
@@ -291,16 +290,17 @@ private:
 module :private;
 
 void lx::input::seat::note_key(unsigned evdev_keycode, bool pressed) {
-    for (unsigned i = 0; i < pressed_count_; ++i) {
-        if (pressed_[i] != evdev_keycode)
+    for (unsigned& key : pressed_) {
+        if (key != evdev_keycode)
             continue;
         if (!pressed) {
-            pressed_[i] = pressed_[--pressed_count_];
+            key = pressed_.back();
+            pressed_.pop_back();
         }
         return; // already recorded, or just removed
     }
-    if (pressed && pressed_count_ < k_max_pressed)
-        pressed_[pressed_count_++] = evdev_keycode;
+    if (pressed)
+        pressed_.try_push_back(evdev_keycode); // dropped when full
 }
 
 #if defined(LUMEN_HAS_INPUT)

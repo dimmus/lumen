@@ -250,7 +250,7 @@ LUMEN_TEST(timeline_import_failure_is_invalid_timeline_and_closes_the_fd) {
     t.bind(fake_ops(k));
     auto bad = t.import(666);
     LUMEN_CHECK(!bad);
-    LUMEN_CHECK(bad.get_error().code == static_cast<int>(lx::drm_err::timeline_failed));
+    LUMEN_CHECK(bad.get_error().code == std::to_underlying(lx::drm_err::timeline_failed));
     const int fd = ::eventfd(0, EFD_CLOEXEC); // any fd: the table must close it
     auto ok = t.import(fd);
     LUMEN_CHECK(static_cast<bool>(ok));

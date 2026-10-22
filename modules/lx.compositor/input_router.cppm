@@ -388,8 +388,7 @@ private:
     /// Enter serials sent for the current pointer focus: one per focus change, plus one per
     /// wl_pointer the client creates while already focused.
     static constexpr unsigned k_enter_serials = 4;
-    unsigned pointer_enter_serials_[k_enter_serials]{};
-    unsigned pointer_enter_count_ = 0;
+    std::inplace_vector<unsigned, k_enter_serials> pointer_enter_serials_{};
     unsigned pointer_focus_generation_ = 0;
     /// Last key press delivered, its key and its client; the release serial of that key.
     unsigned last_key_press_serial_ = 0;
@@ -709,28 +708,21 @@ void lx::compositor::input_router::remove(void* r) {
 }
 
 void lx::compositor::input_router::note_enter_serial(unsigned serial) {
-    if (pointer_enter_count_ < k_enter_serials) {
-        pointer_enter_serials_[pointer_enter_count_++] = serial;
-        return;
-    }
-    for (unsigned i = 1; i < k_enter_serials; ++i)
-        pointer_enter_serials_[i - 1] = pointer_enter_serials_[i];
-    pointer_enter_serials_[k_enter_serials - 1] = serial;
+    if (pointer_enter_serials_.size() == k_enter_serials)
+        pointer_enter_serials_.erase(pointer_enter_serials_.begin());
+    pointer_enter_serials_.push_back(serial);
 }
 
 void lx::compositor::input_router::clear_pointer_focus_state() {
     pointer_focus_client_ = nullptr;
-    pointer_enter_count_ = 0;
+    pointer_enter_serials_.clear();
     ++pointer_focus_generation_;
 }
 
 bool lx::compositor::input_router::is_pointer_enter_serial(unsigned serial) const {
     if (serial == 0)
         return false;
-    for (unsigned i = 0; i < pointer_enter_count_; ++i)
-        if (pointer_enter_serials_[i] == serial)
-            return true;
-    return false;
+    return std::ranges::contains(pointer_enter_serials_, serial);
 }
 
 void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::seat& seat) {

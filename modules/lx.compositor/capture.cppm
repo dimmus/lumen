@@ -146,8 +146,12 @@ public:
     /// wire then makes the object and stops it at once.
     [[nodiscard]] unsigned open(unsigned client, capture_source_kind kind);
     void close(unsigned handle);
-    [[nodiscard]] capture_session* get(unsigned handle);
-    [[nodiscard]] const capture_session* get(unsigned handle) const;
+    /// `capture_session*`, or `const capture_session*` on a const table.
+    [[nodiscard]] auto get(this auto& self, unsigned handle) -> decltype(&self.sessions_[0]) {
+        if (handle == 0 || handle > k_capture_sessions || !self.sessions_[handle - 1].used)
+            return nullptr;
+        return &self.sessions_[handle - 1];
+    }
     /// The session of `handle` if it is still of `generation`.
     [[nodiscard]] capture_session* get(unsigned handle, unsigned generation);
     [[nodiscard]] unsigned count() const { return count_; }

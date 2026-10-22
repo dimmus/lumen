@@ -518,28 +518,25 @@ const zlm_policy_bridge_v1_listener k_bridge_listener = {
 
 lx::result<void> lx::shell::policy_bridge::observe(void* zlm_shell) {
     if (!zlm_shell)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "no zlm_shell_v1");
+        return lx::invalid_argument("no zlm_shell_v1");
     if (shell_ == zlm_shell)
         return {};
     if (zlm_shell_v1_add_listener(static_cast<zlm_shell_v1*>(zlm_shell), &k_shell_listener,
                                   this) != 0)
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "zlm_shell_v1 already has a listener");
+        return lx::make_error(lx::wayland_err::bind_failed, "zlm_shell_v1 already has a listener");
     shell_ = zlm_shell;
     return {};
 }
 
 lx::result<void> lx::shell::policy_bridge::attach(void* zlm_shell) {
     if (bridge_)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "bridge already attached");
+        return lx::invalid_argument("bridge already attached");
     if (auto observed = observe(zlm_shell); !observed)
         return observed;
     auto* shell = static_cast<zlm_shell_v1*>(zlm_shell);
     zlm_policy_bridge_v1* bridge = zlm_shell_v1_get_policy_bridge(shell);
     if (!bridge)
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
+        return lx::make_error(lx::wayland_err::bind_failed,
                               "zlm_shell_v1.get_policy_bridge failed");
     zlm_policy_bridge_v1_add_listener(bridge, &k_bridge_listener, this);
     bridge_ = bridge;
@@ -628,9 +625,7 @@ lx::result<unsigned> lx::shell::policy_bridge::grab_key(unsigned keysym, unsigne
         zlm_key_grab_v1* proxy =
             zlm_shell_v1_grab_key(static_cast<zlm_shell_v1*>(shell_), keysym, modifiers, flags);
         if (!proxy)
-            return lx::make_error(lx::error_domain::wayland,
-                                  static_cast<int>(lx::wayland_err::bind_failed),
-                                  "zlm_shell_v1.grab_key failed");
+            return lx::make_error(lx::wayland_err::bind_failed, "zlm_shell_v1.grab_key failed");
         g = {};
         g.proxy = proxy;
         g.owner = this;
@@ -640,7 +635,7 @@ lx::result<unsigned> lx::shell::policy_bridge::grab_key(unsigned keysym, unsigne
         zlm_key_grab_v1_add_listener(proxy, &k_key_grab_listener, &g);
         return i;
     }
-    return lx::make_error(lx::error_domain::invalid_argument, 0, "key grab table full");
+    return lx::invalid_argument("key grab table full");
 }
 
 void lx::shell::policy_bridge::ungrab_key(unsigned slot) {

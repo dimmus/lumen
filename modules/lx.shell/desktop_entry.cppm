@@ -636,9 +636,7 @@ bool lx::shell::exec_argv::push(std::string_view arg) {
 lx::result<void> lx::shell::expand_exec(const desktop_entry& e, exec_argv& out) {
     out.clear();
     const std::string_view s = e.exec;
-    auto too_long = [] {
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "Exec too long");
-    };
+    auto too_long = [] { return lx::invalid_argument("Exec too long"); };
     // One token at a time into `tok`; `drop` when a %f/%F/%u/%U was in it.
     char tok[exec_argv::k_buf];
     std::size_t tn = 0;
@@ -701,8 +699,7 @@ lx::result<void> lx::shell::expand_exec(const desktop_entry& e, exec_argv& out) 
                 ++i;
             }
             if (!closed)
-                return lx::make_error(lx::error_domain::invalid_argument, 0,
-                                      "Exec: unterminated double quote");
+                return lx::invalid_argument("Exec: unterminated double quote");
             continue;
         }
         if (c == '\'') {
@@ -711,8 +708,7 @@ lx::result<void> lx::shell::expand_exec(const desktop_entry& e, exec_argv& out) 
             explicit_empty = true;
             const std::size_t close = s.find('\'', i);
             if (close == std::string_view::npos)
-                return lx::make_error(lx::error_domain::invalid_argument, 0,
-                                      "Exec: unterminated single quote");
+                return lx::invalid_argument("Exec: unterminated single quote");
             put_sv(s.substr(i, close - i));
             i = close + 1;
             continue;
@@ -775,11 +771,10 @@ lx::result<void> lx::shell::expand_exec(const desktop_entry& e, exec_argv& out) 
     if (!end_token())
         return too_long();
     if (out.argc == 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "Exec is empty");
+        return lx::invalid_argument("Exec is empty");
     const std::string_view a0{out.argv[0]};
     if (a0.find('/') != std::string_view::npos && a0.front() != '/')
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "Exec: a program path must be absolute");
+        return lx::invalid_argument("Exec: a program path must be absolute");
     return {};
 }
 

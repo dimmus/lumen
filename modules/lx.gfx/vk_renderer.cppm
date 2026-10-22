@@ -348,8 +348,7 @@ constexpr VkFormat k_linear_format = VK_FORMAT_R16G16B16A16_SFLOAT;
 constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_UNORM;
 
 lx::error vk_error(const char* message) {
-    return lx::make_error(lx::error_domain::vulkan,
-                          static_cast<int>(lx::vulkan_err::device_lost), message);
+    return lx::make_error(lx::vulkan_err::device_lost, message);
 }
 
 int find_memory_type(VkPhysicalDevice phys, uint32_t type_bits, VkMemoryPropertyFlags want) {
@@ -1038,16 +1037,13 @@ lx::result<void> lx::gfx::vulkan_compositor::bind_imported(const imported_image&
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::bind_imported");
     if (!image.vk_image || image.image_id == 0) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
+        return lx::make_error(lx::vulkan_err::import_failed,
                               "bind_imported without a Vulkan image");
     }
 
     const int index = alloc_texture(image.image_id);
     if (index < 0) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "texture table full");
+        return lx::make_error(lx::vulkan_err::import_failed, "texture table full");
     }
     auto& slot = textures_[static_cast<unsigned>(index)];
     if (slot.image == image.vk_image && slot.view)
@@ -1096,8 +1092,7 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::upload_rgba");
     if (texture_id == 0 || width == 0 || height == 0 || !rgba) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "upload_rgba with empty source");
+        return lx::invalid_argument("upload_rgba with empty source");
     }
 
     // Present no longer blocks, so the frame this reads may still be in flight. Read-back
@@ -1110,9 +1105,7 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
 
     const int index = alloc_texture(texture_id);
     if (index < 0) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "texture table full");
+        return lx::make_error(lx::vulkan_err::import_failed, "texture table full");
     }
     auto& slot = textures_[static_cast<unsigned>(index)];
 
@@ -1197,8 +1190,7 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
         return staged.get_error();
 
     if (bytes > staging_capacity_) {
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
+        return lx::make_error(lx::vulkan_err::import_failed,
                               "upload exceeds staging ring capacity");
     }
     if (staging_offset_ + bytes > staging_capacity_) {
@@ -1806,8 +1798,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::composite");
     if (!target.valid()) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "composite into an invalid render target");
+        return lx::invalid_argument("composite into an invalid render target");
     }
     // Composite renders into a linear-light intermediate; a second pass encodes that into
     // the scanout buffer. Both are sized to the target and rebuilt only when it changes.
@@ -2079,8 +2070,7 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& targ
         return lx::not_implemented("lx::gfx::vulkan_compositor::read_back");
     const unsigned needed = target.width() * target.height() * 4u;
     if (!rgba || capacity < needed) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "read_back destination too small");
+        return lx::invalid_argument("read_back destination too small");
     }
 
     auto dev = static_cast<VkDevice>(ctx_.device);

@@ -103,7 +103,7 @@ public:
     key_grab_refusal add_grab(unsigned keysym, unsigned mods, unsigned flags, void* owner);
     /// The owner went (its resource was destroyed): the combination returns to clients.
     void remove_grab(void* owner);
-    [[nodiscard]] unsigned grab_count() const { return count_; }
+    [[nodiscard]] unsigned grab_count() const { return static_cast<unsigned>(grabs_.size()); }
 
     /// Whether some key produces `keysym` at its first level in the active layout — which
     /// decides whether a layout-0 match counts. Without one, only the active layout matches.
@@ -147,8 +147,7 @@ private:
     };
     [[nodiscard]] bool keysym_matches(unsigned grab_sym, const key_input& in) const;
 
-    grab grabs_[k_max_grabs]{};
-    unsigned count_ = 0;
+    std::inplace_vector<grab, k_max_grabs> grabs_{};
     void* tap_owner_ = nullptr;
     unsigned tap_code_ = 0;
     bool locked_ = false;
@@ -220,26 +219,25 @@ lx::compositor::key_grab_refusal lx::compositor::keybindings::add_grab(unsigned 
     if (!owner)
         return key_grab_refusal::invalid;
     const bool tap = (flags & key_grab_tap) != 0;
-    for (unsigned i = 0; i < count_; ++i) {
-        const grab& g = grabs_[i];
+    for (const grab& g : grabs_) {
         if (g.keysym == keysym && g.mods == mods && ((g.flags & key_grab_tap) != 0) == tap)
             return key_grab_refusal::taken;
     }
     // A full table is reported as taken: the protocol has no other word for "no room", and
     // 32 grabs is far past what a shell registers.
-    if (count_ == k_max_grabs)
+    if (grabs_.size() == k_max_grabs)
         return key_grab_refusal::taken;
-    grabs_[count_++] = {keysym, mods, flags, owner};
+    grabs_.push_back({keysym, mods, flags, owner});
     return key_grab_refusal::none;
 }
 
 void lx::compositor::keybindings::remove_grab(void* owner) {
     if (!owner)
         return;
-    for (unsigned i = 0; i < count_;) {
+    for (unsigned i = 0; i < grabs_.size();) {
         if (grabs_[i].owner == owner) {
-            grabs_[i] = grabs_[--count_];
-            grabs_[count_] = {};
+            grabs_[i] = grabs_.back();
+            grabs_.pop_back();
             continue;
         }
         ++i;
@@ -268,8 +266,7 @@ lx::compositor::key_decision lx::compositor::keybindings::match_grab(const key_i
     key_decision d{};
     if (!in.pressed || locked_)
         return d;
-    for (unsigned i = 0; i < count_; ++i) {
-        const grab& g = grabs_[i];
+    for (const grab& g : grabs_) {
         if ((g.flags & key_grab_tap) || g.mods != in.mods || !keysym_matches(g.keysym, in))
             continue;
         if (inhibited && !(g.flags & key_grab_not_inhibitable))
@@ -292,8 +289,7 @@ void* lx::compositor::keybindings::observe_tap(const key_input& in, bool inhibit
         tap_owner_ = nullptr;
         if (in.others_held)
             return nullptr;
-        for (unsigned i = 0; i < count_; ++i) {
-            const grab& g = grabs_[i];
+        for (const grab& g : grabs_) {
             if ((g.flags & key_grab_tap) && keysym_matches(g.keysym, in) &&
                 (!inhibited || (g.flags & key_grab_not_inhibitable))) {
                 tap_owner_ = g.owner;
