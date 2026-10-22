@@ -49,6 +49,9 @@
 #                         Super+L, loginctl lock-session, before sleep and the blank timeout
 #                         start it (lock first, then blank); none by default
 #   --blank-locked-after S  outputs off after S seconds without input while locked (60)
+#   --background SPEC     lumen-shell's desktop background: lumen (default), #RRGGBB,
+#                         gradient:#RRGGBB:#RRGGBB[:DEG], image:PATH[:fill|fit|center|
+#                         stretch|tile] (PNG, JPEG, WebP, SVG); --no-background for none
 #   --no-lock-on-blank    the blank timeout blanks without locking first
 #   --debug               LUMEN_LOG=debug for the compositor and the shell (default info)
 #   --logs DIR            log directory (default <repo>/run-desktop-logs)
@@ -89,6 +92,8 @@ while (( $# > 0 )); do
     --idle-policy=shell|--idle-policy=none) SHELL_ARGS+=("$1") ;;
     --lock-command) SHELL_ARGS+=(--lock-command "${2:?--lock-command needs a command}"); shift ;;
     --blank-locked-after) SHELL_ARGS+=(--blank-locked-after "${2:?--blank-locked-after needs seconds}"); shift ;;
+    --background) SHELL_ARGS+=(--background "${2:?--background needs a spec}"); shift ;;
+    --no-background) SHELL_ARGS+=(--no-background) ;;
     --no-lock-on-blank) SHELL_ARGS+=(--no-lock-on-blank) ;;
     --debug) LOG_LEVEL=debug ;;
     --logs) LOG_DIR="${2:?--logs needs a directory}"; shift ;;

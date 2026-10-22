@@ -28,6 +28,10 @@ if(PkgConfig_FOUND)
     # window's own pixel buffers (xdg-toplevel-icon-v1) and then to a letter tile.
     pkg_check_modules(LIBPNG QUIET libpng)
     pkg_check_modules(LIBRSVG QUIET librsvg-2.0)
+    # Desktop background images (lx.shell:background), each optional: JPEG through
+    # libjpeg-turbo (DCT-scaled decode of large photos), WebP through libwebp.
+    pkg_check_modules(LIBTURBOJPEG QUIET libturbojpeg>=3.0)
+    pkg_check_modules(LIBWEBP QUIET libwebp)
 endif()
 
 if(WAYLAND_SCANNER_FOUND)

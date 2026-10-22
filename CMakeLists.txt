@@ -109,7 +109,8 @@ if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
     target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
     target_compile_definitions(lx.shell PRIVATE LUMEN_SHELL_WAYLAND=1)
 endif()
-# Icon decoding for the panel (lx.shell:icon_theme), each optional.
+# Icon decoding for the panel (lx.shell:icon_theme) and background images
+# (lx.shell:background), each optional.
 if(LIBPNG_FOUND)
     target_compile_definitions(lx.shell PRIVATE LUMEN_HAS_PNG=1)
     target_include_directories(lx.shell PRIVATE ${LIBPNG_INCLUDE_DIRS})
@@ -119,6 +120,16 @@ if(LIBRSVG_FOUND)
     target_compile_definitions(lx.shell PRIVATE LUMEN_HAS_RSVG=1)
     target_include_directories(lx.shell PRIVATE ${LIBRSVG_INCLUDE_DIRS})
     target_link_libraries(lx.shell PUBLIC ${LIBRSVG_LINK_LIBRARIES})
+endif()
+if(LIBTURBOJPEG_FOUND)
+    target_compile_definitions(lx.shell PRIVATE LUMEN_HAS_JPEG=1)
+    target_include_directories(lx.shell PRIVATE ${LIBTURBOJPEG_INCLUDE_DIRS})
+    target_link_libraries(lx.shell PUBLIC ${LIBTURBOJPEG_LINK_LIBRARIES})
+endif()
+if(LIBWEBP_FOUND)
+    target_compile_definitions(lx.shell PRIVATE LUMEN_HAS_WEBP=1)
+    target_include_directories(lx.shell PRIVATE ${LIBWEBP_INCLUDE_DIRS})
+    target_link_libraries(lx.shell PUBLIC ${LIBWEBP_LINK_LIBRARIES})
 endif()
 
 if(LUMEN_BUILD_XWAYLAND)
@@ -722,7 +733,8 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_task_model COMMAND test_task_model)
 
     # lumen-shell's launcher: desktop entries, the catalog, launching, the launcher layout.
-    foreach(shell_test test_desktop_entry test_app_catalog test_app_launch test_launcher_layout)
+    foreach(shell_test test_desktop_entry test_app_catalog test_app_launch test_launcher_layout
+                       test_background)
         add_executable(${shell_test} tests/${shell_test}.cpp)
         target_link_libraries(${shell_test} PRIVATE lx.shell)
         lumen_apply_module_properties(${shell_test})
@@ -939,7 +951,7 @@ if(LUMEN_BUILD_TESTS)
         test_output_contract test_multi_output_contract test_hotplug_contract
         test_output_management_contract
         test_task_model test_shell_bridge
-        test_desktop_entry test_app_catalog test_app_launch test_launcher_layout
+        test_desktop_entry test_app_catalog test_app_launch test_launcher_layout test_background
         test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
         test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
         test_cvt test_output_management test_output_config_store

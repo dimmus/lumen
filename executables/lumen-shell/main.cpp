@@ -5,6 +5,7 @@ import lx.shell;
 
 // lumen-shell [--display NAME] [--idle-policy shell|none] [--blank-after S]
 //             [--blank-locked-after S] [--lock-command CMD] [--[no-]lock-on-blank]
+//             [--background SPEC | --no-background]
 //
 // The desktop shell: the top panel and its task list, the launcher, and the default idle
 // and lock policy (outputs off after --blank-after seconds without input, 600 by default; 0
@@ -16,6 +17,12 @@ import lx.shell;
 // goes away, so the unit restarts it.
 int main(int argc, char* argv[]) {
     lx::shell::shell_config cfg{};
+    if (const char* env = std::getenv("LUMEN_BACKGROUND"); env && *env) {
+        if (auto spec = lx::shell::parse_background(env))
+            cfg.background = *spec;
+        else
+            std::fprintf(stderr, "lumen-shell: ignoring LUMEN_BACKGROUND '%s' (see --help)\n", env);
+    }
     for (int i = 1; i < argc; ++i) {
         const char* a = argv[i];
         if (std::strcmp(a, "--display") == 0 && i + 1 < argc) {
@@ -40,6 +47,18 @@ int main(int argc, char* argv[]) {
             cfg.idle.lock_on_blank = true;
         } else if (std::strcmp(a, "--no-lock-on-blank") == 0) {
             cfg.idle.lock_on_blank = false;
+        } else if ((std::strcmp(a, "--background") == 0 && i + 1 < argc) ||
+                   std::strncmp(a, "--background=", 13) == 0) {
+            const char* v = a[12] == '=' ? a + 13 : argv[++i];
+            auto spec = lx::shell::parse_background(v);
+            if (!spec) {
+                std::fprintf(stderr, "lumen-shell: bad --background '%s' (see --help)\n", v);
+                return 2;
+            }
+            cfg.background = *spec;
+            cfg.background_enabled = true;
+        } else if (std::strcmp(a, "--no-background") == 0) {
+            cfg.background_enabled = false;
         } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
             std::printf(
                 "usage: lumen-shell [--display NAME] [--idle-policy shell|none] [--blank-after S]\n"
@@ -54,7 +73,15 @@ int main(int argc, char* argv[]) {
                 "  --lock-command CMD     the screen locker, an Exec line (e.g. 'swaylock -f');\n"
                 "                         started by Super+L, loginctl lock-session, before\n"
                 "                         sleep, and again if it exits while locked\n"
-                "  --no-lock-on-blank     blank without locking first (default: lock, then blank)\n");
+                "  --no-lock-on-blank     blank without locking first (default: lock, then blank)\n"
+                "  --background SPEC      the desktop background (also LUMEN_BACKGROUND):\n"
+                "                           lumen                      built-in (default)\n"
+                "                           #RRGGBB                    a colour\n"
+                "                           gradient:#RRGGBB:#RRGGBB[:DEG]  0 = left to right,\n"
+                "                                                      90 = top to bottom\n"
+                "                           image:PATH[:fill|fit|center|stretch|tile]\n"
+                "                                                      PNG, JPEG, WebP or SVG\n"
+                "  --no-background        none (leave it to another client, e.g. swaybg)\n");
             return 0;
         } else {
             std::fprintf(stderr, "lumen-shell: bad or unknown argument '%s' (see --help)\n", a);

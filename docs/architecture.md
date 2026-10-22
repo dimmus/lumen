@@ -122,7 +122,7 @@ Runs **three logical threads** (see [threading.md](subsystems/threading.md)):
 
 **Binary:** `lumen-shell`  
 **Modules:** `lx.shell` (`:bridge`, `:task_model`, `:panel`, `:shm_canvas`, `:launcher`,
-`:desktop_entry`, `:app_catalog`, `:app_launch`), `lx.shell.policy`, `lx.text`;
+`:desktop_entry`, `:app_catalog`, `:app_launch`, `:background`), `lx.shell.policy`, `lx.text`;
 libwayland-client directly (`lx.wayland.client` is still a stub), xkbcommon for the
 launcher's keyboard, sd-bus for launching
 
@@ -138,6 +138,19 @@ Acts as a **privileged Wayland client**:
 - Draws its **top panel** — a task list, one entry per window, the focused one
   highlighted — as a `wlr-layer-shell` surface (layer `top`, exclusive zone 32, so windows
   are placed and maximized below it), with CPU text from `lx::text`
+- Draws the **desktop background** (`:background`): one `wlr-layer-shell` surface per output
+  on layer `background`, opaque, taking no input. A colour is a `wp_single_pixel_buffer_v1`
+  stretched by a `wp_viewport` (no pixels; the compositor's solid draw, the cost of a clear).
+  Everything else — the procedural default `lumen`, two-stop gradients (linear light), and
+  PNG/JPEG/WebP/SVG images (fill, fit, center, stretch, tile) — is rendered at the output's
+  pixel size (fractional scale) on a worker thread, dithered (interleaved gradient noise,
+  ±½ LSB: no banding on 8-bit outputs), into one shm buffer the shell unmaps once committed
+  and destroys when released, so a background on screen holds no shell memory. JPEGs far
+  larger than the output decode DCT-scaled (libjpeg-turbo); SVGs render at the size shown.
+  Measured on vmwgfx at 1914×924: the default renders in 22 ms, a gradient in 47 ms, a
+  6000×4000 JPEG filled in 262 ms, all off the shell's thread; the shell's RSS stays at
+  23 MB with any of them. Any other client can draw the background instead
+  (`--no-background`, then swaybg, wpaperd, …).
 - Draws the **launcher** — installed applications from the XDG `.desktop` files (Desktop
   Entry Specification 1.5: ID shadowing, Hidden, NoDisplay, OnlyShowIn/NotShowIn,
   TryExec, Exec field codes), a search field, keyboard and pointer — as a separate
