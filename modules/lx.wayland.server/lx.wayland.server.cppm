@@ -4,15 +4,12 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cerrno>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
-#include <climits>
+#include <limits.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -29,6 +26,8 @@ import lx.trace;
 import lx.wayland.protocols;
 
 export module lx.wayland.server;
+
+import std;
 
 export namespace lx::wayland {
 
@@ -355,11 +354,10 @@ bool lx::wayland::client_connection::sandboxed() {
         std::snprintf(path, sizeof(path), "/proc/%u/root/.flatpak-info", cred_.pid);
         if (::access(path, F_OK) == 0) {
             sandbox_ = 2;
-            char line[128];
-            std::snprintf(line, sizeof(line),
-                          "client pid=%u is sandboxed (Flatpak): session-wide globals hidden",
-                          cred_.pid);
-            lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+            lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
+                                             "client pid={} is sandboxed (Flatpak): session-wide "
+                                             "globals hidden",
+                                             cred_.pid);
         }
     }
 #endif
@@ -812,10 +810,9 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
 #else
     const char* name = global_name ? global_name : "?";
     if (cred.uid != static_cast<unsigned>(::getuid())) {
-        char line[160];
-        std::snprintf(line, sizeof(line), "privileged global %s denied: client uid=%u pid=%u",
-                      name, cred.uid, cred.pid);
-        lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+        lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
+                                         "privileged global {} denied: client uid={} pid={}", name,
+                                         cred.uid, cred.pid);
         return false;
     }
     // The peer's pid comes from SO_PEERCRED at connect, and the connection is still open,
@@ -842,11 +839,11 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
         have_exe ? exe : nullptr, nullptr);
     if (verdict == lx::session::privilege_result::allowed)
         return true;
-    char line[2 * PATH_MAX + 160];
-    std::snprintf(line, sizeof(line),
-                  "privileged global %s denied: client pid=%u exe=%s is not the shell binary %s",
-                  name, cred.pid, have_exe ? exe : "(unknown)", shell_binary_path_);
-    lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+    lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
+                                     "privileged global {} denied: client pid={} exe={} is not "
+                                     "the shell binary {}",
+                                     name, cred.pid, have_exe ? exe : "(unknown)",
+                                     shell_binary_path_);
     return false;
 #endif
 }
@@ -876,16 +873,14 @@ void lx::wayland::server::set_shell_binary_path(const char* path) {
         // Kept as given: nothing can match it, so every privileged bind is denied (and
         // each denial names this path), rather than the check silently passing.
         std::snprintf(shell_binary_path_, sizeof(shell_binary_path_), "%s", candidate);
-        char line[PATH_MAX + 96];
-        std::snprintf(line, sizeof(line),
-                      "shell binary %s not found: zlm_shell_v1 binds will be denied",
-                      shell_binary_path_);
-        lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+        lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
+                                         "shell binary {} not found: zlm_shell_v1 binds will be "
+                                         "denied",
+                                         shell_binary_path_);
         return;
     }
-    char line[PATH_MAX + 32];
-    std::snprintf(line, sizeof(line), "shell binary %s", shell_binary_path_);
-    lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "wayland", "shell binary {}",
+                                     shell_binary_path_);
 #endif
 }
 
@@ -1004,12 +999,11 @@ int lx::wayland::server::on_listener_closed(int, uint32_t, void* data) {
     server* srv = l ? l->owner : nullptr;
     if (!srv)
         return 0;
-    char line[160];
-    std::snprintf(line, sizeof(line),
-                  "security context %s/%s: listener closed by the sandbox engine",
-                  l->context.sandbox_engine[0] ? l->context.sandbox_engine : "-",
-                  l->context.app_id[0] ? l->context.app_id : "-");
-    lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
+                                     "security context {}/{}: listener closed by the sandbox "
+                                     "engine",
+                                     l->context.sandbox_engine[0] ? l->context.sandbox_engine : "-",
+                                     l->context.app_id[0] ? l->context.app_id : "-");
     srv->drop_listener(*l);
     return 0;
 }
@@ -1049,13 +1043,12 @@ void lx::wayland::server::accept_sandboxed(security_listener& l) {
     conn->context_ = l.context;
     conn->has_context_ = true;
     conn->sandbox_ = 2;
-    char line[192];
-    std::snprintf(line, sizeof(line),
-                  "client %u connected sandboxed (security context engine=%s app_id=%s): "
-                  "session-wide globals hidden",
-                  conn->id(), l.context.sandbox_engine[0] ? l.context.sandbox_engine : "-",
-                  l.context.app_id[0] ? l.context.app_id : "-");
-    lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
+                                     "client {} connected sandboxed (security context engine={} "
+                                     "app_id={}): session-wide globals hidden",
+                                     conn->id(),
+                                     l.context.sandbox_engine[0] ? l.context.sandbox_engine : "-",
+                                     l.context.app_id[0] ? l.context.app_id : "-");
 }
 #endif
 

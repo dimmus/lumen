@@ -1,18 +1,13 @@
 module;
 
-#include <algorithm>
-#include <atomic>
-#include <cstddef>
-#include <new>
-#include <thread>
-#include <utility>
-
 import lx.foundation;
 import lx.gfx;
 import lx.runtime;
 import lx.trace;
 
 export module lx.scene:snapshot;
+
+import std;
 
 export namespace lx::scene {
 

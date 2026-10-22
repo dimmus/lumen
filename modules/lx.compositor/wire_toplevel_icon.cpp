@@ -23,11 +23,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <new>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -39,6 +35,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -237,10 +235,9 @@ void manager_set_icon(struct wl_client*, struct wl_resource*, struct wl_resource
     rec->icon_pending_set = true;
     if (surface_debug()) {
         const auto* e = g_p0_ctx->icons->get(id);
-        char line[384];
-        std::snprintf(line, sizeof(line), "icon staged toplevel=%llu name=%s buffers=%u",
-                      rec->id.id(), e ? e->name : "", e ? e->count : 0u);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.icon", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.icon",
+                                         "icon staged toplevel={} name={} buffers={}", rec->id.id(),
+                                         e ? e->name : "", e ? e->count : 0u);
     }
 }
 
@@ -298,10 +295,9 @@ void toplevel_icon_commit(surface_obj* s) {
         s->ctx->shell->emit_toplevel_icon(*rec);
     if (surface_debug()) {
         const auto* e = s->ctx->icons->get(rec->icon);
-        char line[384];
-        std::snprintf(line, sizeof(line), "icon applied toplevel=%llu name=%s buffers=%u",
-                      rec->id.id(), e ? e->name : "", e ? e->count : 0u);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.icon", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.icon",
+                                         "icon applied toplevel={} name={} buffers={}",
+                                         rec->id.id(), e ? e->name : "", e ? e->count : 0u);
     }
 }
 

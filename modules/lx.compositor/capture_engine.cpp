@@ -2,21 +2,14 @@ module;
 
 // Bodies of `:capture_engine`. See capture_engine.cppm for the model.
 
-#include <atomic>
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
-#include <thread>
-#include <cstring>
-#include <mutex>
-#include <vector>
-
 #if !defined(_WIN32)
 #include <poll.h>
 #include <unistd.h>
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.gfx;

@@ -3,15 +3,17 @@ module;
 // Bodies of `:content_update` (the queue, the readiness policy and the poller). See
 // content_update.cppm for the model.
 
-#include <cerrno>
-#include <cstdint>
+#include <errno.h>
 
 #if defined(__linux__)
 #include <sys/epoll.h>
 #include <unistd.h>
 #endif
+#include <stdio.h>
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import :content_update;

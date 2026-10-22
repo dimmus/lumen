@@ -5,11 +5,7 @@
 // and no allocation on the per-motion path. A real surface tree and scene, no Wayland.
 #include "lumen_test.hpp"
 
-#include <atomic>
-#include <cstdlib>
-#include <memory>
-#include <new>
-
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.gfx;

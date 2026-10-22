@@ -2,11 +2,9 @@ module;
 
 // Bodies of `:capture`. See capture.cppm for the model.
 
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.gfx;

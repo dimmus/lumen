@@ -1,14 +1,12 @@
 module;
 
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <unordered_map>
-#include <vector>
+#include <stdio.h>
 
 import lx.foundation;
 
 export module lx.gfx:headless;
+
+import std;
 
 export namespace lx::gfx {
 

@@ -1,17 +1,10 @@
 module;
 
-#include <cerrno>
-#include <climits>
-#include <csignal>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
+#include <time.h>
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <poll.h>
@@ -51,6 +44,8 @@ import lx.shell.policy;
 import lx.trace;
 
 export module lx.shell;
+
+import std;
 
 export import :task_model;
 export import :bridge;
@@ -300,8 +295,20 @@ constexpr const char* k_shell_category = "shell";
     lx::trace::logger::global().log(lvl, k_shell_category, line);
 }
 
+template <typename... Args>
+[[maybe_unused]] void shell_log(lx::trace::level lvl, std::format_string<Args...> fmt,
+                                Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_shell_category, fmt, std::forward<Args>(args)...);
+}
+
 [[maybe_unused]] void apps_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, k_apps_category, line);
+}
+
+template <typename... Args>
+[[maybe_unused]] void apps_log(lx::trace::level lvl, std::format_string<Args...> fmt,
+                               Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_apps_category, fmt, std::forward<Args>(args)...);
 }
 
 [[maybe_unused]] [[nodiscard]] bool shell_debug() {
@@ -817,20 +824,17 @@ void lx::shell::shell_app::events::power_mode(void* data, zwlr_output_power_v1*,
     auto& o = out(data);
     o.off = mode == ZWLR_OUTPUT_POWER_V1_MODE_OFF;
     if (shell_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "output power %s (%s)", o.off ? "off" : "on",
-                      o.connector);
-        lx::trace::logger::global().log(lx::trace::level::debug, "shell.idle", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "shell.idle",
+                                         "output power {} ({})", o.off ? "off" : "on", o.connector);
     }
 }
 
 void lx::shell::shell_app::events::power_failed(void* data, zwlr_output_power_v1* p) {
     auto& o = out(data);
-    char line[128];
-    std::snprintf(line, sizeof(line),
-                  "output power control failed (output %s went?) — not blanked any more",
-                  o.connector);
-    lx::trace::logger::global().log(lx::trace::level::warn, "shell.idle", line);
+    lx::trace::logger::global().logf(lx::trace::level::warn, "shell.idle",
+                                     "output power control failed (output {} went?) — not blanked "
+                                     "any more",
+                                     o.connector);
     zwlr_output_power_v1_destroy(p);
     if (o.power == p)
         o.power = nullptr;
@@ -885,12 +889,11 @@ void lx::shell::shell_app::setup_idle() {
     const unsigned timeout_ms = idle_.blank_timeout_ms(idle_notifier_ != nullptr,
                                                        power_manager_ != nullptr && !outputs_.empty());
     if (timeout_ms == 0) {
-        char line[160];
-        std::snprintf(line, sizeof(line), "no screen blanking:%s%s%s",
-                      config_.idle.blank_after_s == 0 ? " --blank-after 0" : "",
-                      !idle_notifier_ ? " no ext_idle_notifier_v1" : "",
-                      !power_manager_ || outputs_.empty() ? " no zwlr_output_power_manager_v1" : "");
-        lx::trace::logger::global().log(lx::trace::level::info, "shell.idle", line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::info, "shell.idle", "no screen blanking:{}{}{}",
+            config_.idle.blank_after_s == 0 ? " --blank-after 0" : "",
+            !idle_notifier_ ? " no ext_idle_notifier_v1" : "",
+            !power_manager_ || outputs_.empty() ? " no zwlr_output_power_manager_v1" : "");
         return;
     }
     // One power control per output, for outputs that come later too (M13).
@@ -904,10 +907,9 @@ void lx::shell::shell_app::setup_idle() {
         ext_idle_notification_v1_add_listener(
             static_cast<ext_idle_notification_v1*>(idle_notification_), &k_idle_listener, this);
     }
-    char line[128];
-    std::snprintf(line, sizeof(line), "blanking the outputs after %u s without input",
-                  config_.idle.blank_after_s);
-    lx::trace::logger::global().log(lx::trace::level::info, "shell.idle", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "shell.idle",
+                                     "blanking the outputs after {} s without input",
+                                     config_.idle.blank_after_s);
 #else
     lx::trace::logger::global().log(lx::trace::level::info, "shell.idle",
                                     "no screen blanking: built without ext-idle-notify / "
@@ -1028,10 +1030,8 @@ void lx::shell::shell_app::output_ready(output_record& o) {
         o.bar.reset();
         return;
     }
-    char line[128];
-    std::snprintf(line, sizeof(line), "panel requested on output %s (%dx%d+%d+%d)", o.connector,
-                  o.logical.width, o.logical.height, o.logical.x, o.logical.y);
-    shell_log(lx::trace::level::info, line);
+    shell_log(lx::trace::level::info, "panel requested on output {} ({}x{}+{}+{})", o.connector,
+              o.logical.width, o.logical.height, o.logical.x, o.logical.y);
     outputs_moved();
 }
 
@@ -1071,9 +1071,7 @@ void lx::shell::shell_app::remove_output(unsigned name) {
     for (auto it = outputs_.begin(); it != outputs_.end(); ++it) {
         if ((*it)->name != name)
             continue;
-        char line[96];
-        std::snprintf(line, sizeof(line), "output %s removed: its panel goes", (*it)->connector);
-        shell_log(lx::trace::level::info, line);
+        shell_log(lx::trace::level::info, "output {} removed: its panel goes", (*it)->connector);
         destroy_output(**it);
         outputs_.erase(it);
         outputs_moved();
@@ -1287,9 +1285,8 @@ void lx::shell::shell_app::launch_locker(const char* why) {
         return;
     }
     idle_.note_locker_started(now_ns());
-    char line[PATH_MAX + 64];
-    std::snprintf(line, sizeof(line), "lock: starting %s (%s)", p->program, why);
-    lx::trace::logger::global().log(lx::trace::level::info, "shell.lock", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "shell.lock", "lock: starting {} ({})",
+                                     p->program, why);
     // No activation token: a locker's surfaces take the keyboard as lock surfaces.
     start_launch(*p, nullptr);
 }
@@ -1388,9 +1385,7 @@ void lx::shell::shell_app::open_launcher() {
         return;
     }
     if (o && shell_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "launcher on output %s", o->connector);
-        shell_log(lx::trace::level::debug, line);
+        shell_log(lx::trace::level::debug, "launcher on output {}", o->connector);
     }
     set_apps_all(true);
     // A panel notice belongs to the closed launcher; the launcher has its own status row.
@@ -1577,10 +1572,8 @@ void lx::shell::shell_app::start_launch(const prepared_launch& p, const char* to
     if (!display || !*display)
         display = "wayland-0";
     if (shell_debug()) {
-        char line[PATH_MAX + 128];
-        std::snprintf(line, sizeof(line), "apps: starting %s (%s) token=%s", p.id, p.program,
-                      token ? "yes" : "no");
-        apps_log(lx::trace::level::debug, line);
+        apps_log(lx::trace::level::debug, "apps: starting {} ({}) token={}", p.id, p.program,
+                 token ? "yes" : "no");
     }
     apps_.start(p, token ? token : "", display);
 }
@@ -1720,22 +1713,17 @@ int lx::shell::shell_app::run() {
                                         "compositor below zlm_shell_v1 v5: no session-lock "
                                         "integration");
     } else if (idle_.can_lock()) {
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "lock command: %s (Super+L, logind Lock, before sleep%s)",
-                      idle_.config().lock_command,
-                      idle_.config().lock_on_blank && idle_.config().enabled &&
-                              idle_.config().blank_after_s
-                          ? ", before blanking"
-                          : "");
-        lx::trace::logger::global().log(lx::trace::level::info, "shell.lock", line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::info, "shell.lock",
+            "lock command: {} (Super+L, logind Lock, before sleep{})", idle_.config().lock_command,
+            idle_.config().lock_on_blank && idle_.config().enabled && idle_.config().blank_after_s
+                ? ", before blanking"
+                : "");
     }
     update_locked_notification(); // started behind a lock (a restart while locked)
     {
-        char line[160];
-        std::snprintf(line, sizeof(line), "connected to %s; panel requested",
-                      config_.display ? config_.display : "$WAYLAND_DISPLAY");
-        shell_log(lx::trace::level::info, line);
+        shell_log(lx::trace::level::info, "connected to {}; panel requested",
+                  config_.display ? config_.display : "$WAYLAND_DISPLAY");
     }
 
     int code = 0;
@@ -1767,9 +1755,7 @@ int lx::shell::shell_app::run() {
                 continue;
             // The compositor closed it (its output went), or a buffer could not be made:
             // that output goes without a panel; the others stay.
-            char line[128];
-            std::snprintf(line, sizeof(line), "panel on output %s closed", o->connector);
-            shell_log(lx::trace::level::warn, line);
+            shell_log(lx::trace::level::warn, "panel on output {} closed", o->connector);
             if (o->bar.get() == pointer_panel_) {
                 pointer_panel_ = nullptr;
                 pointer_target_ = pointer_target::none;
@@ -1824,9 +1810,7 @@ int lx::shell::shell_app::run() {
         if (n > 0 && (fds[1].revents & POLLIN)) {
             signalfd_siginfo si{};
             if (read(sfd, &si, sizeof(si)) == static_cast<ssize_t>(sizeof(si))) {
-                char line[64];
-                std::snprintf(line, sizeof(line), "signal %u: exiting", si.ssi_signo);
-                shell_log(lx::trace::level::info, line);
+                shell_log(lx::trace::level::info, "signal {}: exiting", si.ssi_signo);
                 break;
             }
         }

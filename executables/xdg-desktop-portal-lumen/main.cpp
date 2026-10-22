@@ -1,9 +1,9 @@
-#include <cstdio>
-#include <cstring>
-#include <string>
+#include <stdio.h>
 
 #include <unistd.h>
+#include <stdlib.h>
 
+import std;
 import lx.portal;
 
 // xdg-desktop-portal-lumen [-r|--replace] [-v|--verbose]

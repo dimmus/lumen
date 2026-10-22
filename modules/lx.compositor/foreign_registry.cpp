@@ -2,14 +2,14 @@ module;
 
 // Bodies of `:foreign_registry`. See foreign_registry.cppm.
 
-#include <cstdint>
-#include <cstring>
-
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
+#include <stdio.h>
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import :foreign_registry;

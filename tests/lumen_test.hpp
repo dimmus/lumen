@@ -3,12 +3,7 @@
 
 #pragma once
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <exception>
-#include <string>
-#include <vector>
+import std;
 
 namespace lumen_test {
 

@@ -1,13 +1,15 @@
 module;
 
+#include <stdio.h>
+
 // The text-input ↔ input-method relay (`:text_input`), defined here rather than in the
 // partition: the partition's interface then carries declarations only (see session_lock.cpp
 // for the Clang 23 defect that makes this the rule for partitions holding foundation value
 // types in compiled bodies). The rules are in text_input.cppm.
 
-#include <cstring>
-
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import :positioner;

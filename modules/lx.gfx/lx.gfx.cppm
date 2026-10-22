@@ -3,14 +3,15 @@ module;
 #if defined(LUMEN_HAS_VULKAN)
 #include <vulkan/vulkan.h>
 #endif
-#include <cstring>
 #include <unistd.h>
-#include <utility>
+#include <stdint.h>
 
 import lx.foundation;
 import lx.runtime;
 
 export module lx.gfx;
+
+import std;
 
 export import :damage;
 export import :dmabuf;

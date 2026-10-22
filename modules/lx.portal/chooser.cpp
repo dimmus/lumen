@@ -2,11 +2,9 @@ module;
 
 // Bodies of `:chooser` (the parsing; the list itself is the overlay's).
 
-#include <string>
-#include <string_view>
-#include <vector>
-
 module lx.portal;
+
+import std;
 
 import :chooser;
 

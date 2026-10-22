@@ -4,14 +4,13 @@
 // capacities and least-recently-used eviction, setup matching in any order, and the file:
 // a debounced atomic save, LUMEN_OUTPUT_CONFIG, and a broken file renamed to .bad by the next
 // save and never overwritten before.
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <sys/stat.h>
 #include <unistd.h>
 
+import std;
 import lx.compositor;
 
 namespace {

@@ -2,10 +2,7 @@
 // would produce, built by hand — no hardware.
 #pragma once
 
-#include <cstdio>
-#include <cstring>
-#include <initializer_list>
-
+import std;
 import lx.drm;
 
 namespace scan_builder {

@@ -8,9 +8,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -21,6 +19,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.runtime;
@@ -417,9 +417,8 @@ const struct xdg_surface_interface xdg_surface_impl = {
             }
             if (result == ack::ok &&
                 lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-                char line[96];
-                std::snprintf(line, sizeof(line), "ack id=%llu serial=%u", rec->id.id(), serial);
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.wm", line);
+                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.wm",
+                                                 "ack id={} serial={}", rec->id.id(), serial);
             }
         },
 };

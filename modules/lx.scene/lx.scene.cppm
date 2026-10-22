@@ -1,7 +1,6 @@
 module;
 
-#include <cmath>
-#include <cstdint>
+#include <stdio.h>
 
 import lx.foundation;
 import lx.gfx;
@@ -10,6 +9,8 @@ import lx.runtime;
 import lx.scheduler;
 
 export module lx.scene;
+
+import std;
 
 export import :snapshot;
 

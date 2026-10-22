@@ -7,8 +7,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -18,6 +17,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -80,10 +81,9 @@ const char* bridge_result_name(bridge_result r) {
 void bridge_log(const char* request, lx::toplevel_id id, bridge_result r) {
     if (!surface_debug())
         return;
-    char line[128];
-    std::snprintf(line, sizeof(line), "bridge request=%s id=%llu result=%s", request, id.id(),
-                  bridge_result_name(r));
-    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.shell", line);
+    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
+                                     "bridge request={} id={} result={}", request, id.id(),
+                                     bridge_result_name(r));
 }
 
 /// Decodes the handle and classifies it; `ok` means "a mapped window, go ahead".
@@ -256,10 +256,10 @@ void shell_grab_key(struct wl_client* client, struct wl_resource* resource, uint
     if (refusal != lx::compositor::key_grab_refusal::none)
         zlm_key_grab_v1_send_refused(res, static_cast<uint32_t>(refusal));
     if (surface_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "grab_key keysym=0x%x mods=0x%x flags=0x%x result=%s",
-                      keysym, modifiers, flags, refusal_name(refusal));
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.shell", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
+                                         "grab_key keysym=0x{:x} mods=0x{:x} flags=0x{:x} "
+                                         "result={}",
+                                         keysym, modifiers, flags, refusal_name(refusal));
     }
 }
 
@@ -362,9 +362,8 @@ void shell_fire_key_grab(void* grab_resource, unsigned time_ms) {
                                         lx::compositor::input_serial_kind::key_press);
     zlm_key_grab_v1_send_activated(res, serial, time_ms);
     if (surface_debug()) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "grab activated serial=%u", serial);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.shell", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
+                                         "grab activated serial={}", serial);
     }
 }
 

@@ -15,9 +15,8 @@
 //
 // A crash here is a compositor a client can kill, so treat any finding as release-blocking.
 
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
+#include <stddef.h>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <sys/socket.h>
@@ -25,6 +24,7 @@
 #include <wayland-server-core.h>
 #endif
 
+import std;
 import lx.foundation;
 import lx.wayland.server;
 import lx.compositor;

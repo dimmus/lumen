@@ -1,11 +1,7 @@
 module;
 
-#include <atomic>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <mutex>
+#include <stdio.h>
+#include <time.h>
 
 #if defined(__linux__)
 #include <pthread.h>
@@ -13,10 +9,13 @@ module;
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+#include <math.h>
 
 import lx.foundation;
 
 export module lx.trace;
+
+import std;
 
 export namespace lx::trace {
 
@@ -36,7 +35,44 @@ public:
     void log(level lvl, const char* category, const char* message) const;
     void log_error(const lx::error& err, const char* category = "error") const;
 
+    /// Formats a line with `std::format` syntax and logs it. `fmt` is checked against the
+    /// arguments at compile time. Nothing is formatted below the minimum level; the line is
+    /// built on the stack (truncated past `k_max_line` bytes), so it never allocates and is
+    /// safe on the frame path wherever `log` is. Log-line conventions: a `bool` prints as 1/0
+    /// (scripts grep `on=1`), and a null C string as "(null)".
+    template <typename... Args>
+    void logf(level lvl, const char* category, std::format_string<Args...> fmt,
+              Args&&... args) const {
+        if (lvl < min_level_)
+            return;
+        vlog(lvl, category, fmt.get(), std::make_format_args(lvalue(log_arg(args))...));
+    }
+
+    /// Type-erased half of `logf`: the formatting machinery is instantiated here once,
+    /// not at every call site.
+    void vlog(level lvl, const char* category, std::string_view fmt,
+              std::format_args args) const noexcept;
+
+    static constexpr std::size_t k_max_line = 4096;
+
 private:
+    template <typename T>
+    static decltype(auto) log_arg(const T& v) {
+        if constexpr (std::is_same_v<T, bool>)
+            return static_cast<int>(v);
+        else if constexpr (std::is_array_v<T>)
+            return static_cast<const char*>(v);
+        else if constexpr (std::is_same_v<std::decay_t<T>, const char*> ||
+                           std::is_same_v<std::decay_t<T>, char*>)
+            return static_cast<const char*>(v ? v : "(null)");
+        else
+            return v;
+    }
+    template <typename T>
+    static T& lvalue(T&& v) {
+        return static_cast<T&>(v); // a named T&& is an xvalue in a return (P2266)
+    }
+
     log_fn sink_ = nullptr;
     void* sink_user_ = nullptr;
     level min_level_ = level::info;
@@ -202,6 +238,46 @@ void lx::trace::logger::log_error(const lx::error& err, const char* category) co
 
 namespace {
 
+/// Output iterator over a fixed buffer that drops what does not fit.
+struct bounded_out {
+    struct span {
+        char* pos;
+        char* end;
+    };
+    using difference_type = std::ptrdiff_t;
+    span* s;
+    bounded_out& operator*() { return *this; }
+    bounded_out& operator=(char c) {
+        if (s->pos != s->end)
+            *s->pos++ = c;
+        return *this;
+    }
+    bounded_out& operator++() { return *this; }
+    bounded_out operator++(int) { return *this; }
+};
+
+} // namespace
+
+void lx::trace::logger::vlog(level lvl, const char* category, std::string_view fmt,
+                             std::format_args args) const noexcept {
+    if (!should_log(lvl, min_level_) || !sink_)
+        return;
+    char line[k_max_line];
+    bounded_out::span out{line, line + sizeof(line) - 1};
+    try {
+        std::vformat_to(bounded_out{&out}, fmt, args);
+    } catch (...) {
+        // Only reachable through a runtime `fmt` (logf checks its format at compile time).
+        out.pos = line;
+        for (char c : fmt)
+            bounded_out{& out} = c;
+    }
+    *out.pos = '\0';
+    sink_(lvl, category, line, sink_user_);
+}
+
+namespace {
+
 #if defined(__linux__)
 struct tl_event {
     const char* category;
@@ -305,9 +381,8 @@ void lx::trace::timeline_start_from_env() {
     s.capacity = cap;
     std::snprintf(s.path, sizeof(s.path), "%s", path);
     s.on.store(true, std::memory_order_release);
-    char line[640];
-    std::snprintf(line, sizeof(line), "timeline recording to %s (up to %llu events)", s.path, cap);
-    logger::global().log(level::info, "trace", line);
+    logger::global().logf(level::info, "trace", "timeline recording to {} (up to {} events)",
+                          s.path, cap);
 #endif
 }
 
@@ -420,10 +495,9 @@ bool lx::trace::timeline_flush() {
     }
     std::fputs("\n]}\n", f);
     const bool ok = std::fclose(f) == 0;
-    char line[700];
-    std::snprintf(line, sizeof(line), "timeline: %llu events written to %s (%llu dropped: buffer full)",
-                  n, s.path, s.dropped.load(std::memory_order_relaxed));
-    logger::global().log(ok ? level::info : level::error, "trace", line);
+    logger::global().logf(ok ? level::info : level::error, "trace",
+                          "timeline: {} events written to {} ({} dropped: buffer full)", n, s.path,
+                          s.dropped.load(std::memory_order_relaxed));
     ::munmap(s.events, s.capacity * sizeof(tl_event));
     s.events = nullptr;
     s.capacity = 0;
@@ -451,9 +525,7 @@ lx::trace::scoped_span::~scoped_span() {
     }
 #endif
     if (should_log(level::trace, logger::global().min_level())) {
-        char buf[256];
-        std::snprintf(buf, sizeof(buf), "~%s", name_);
-        logger::global().log(level::trace, category_, buf);
+        logger::global().logf(level::trace, category_, "~{}", name_);
     }
 }
 
@@ -461,9 +533,8 @@ void lx::trace::trace_event(level lvl, const char* category, const char* name,
                             const char* key, const char* value) {
     if (!should_log(lvl, logger::global().min_level())) return;
     if (key && value) {
-        char buf[512];
-        std::snprintf(buf, sizeof(buf), "%s %s=%s", name ? name : "", key, value);
-        logger::global().log(lvl, category ? category : "trace", buf);
+        logger::global().logf(lvl, category ? category : "trace", "{} {}={}", name ? name : "", key,
+                              value);
     } else {
         logger::global().log(lvl, category ? category : "trace", name ? name : "");
     }

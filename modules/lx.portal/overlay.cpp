@@ -2,15 +2,7 @@ module;
 
 // Bodies of `:overlay`. See overlay.cppm for the model.
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <memory>
-#include <span>
-#include <string>
-#include <vector>
+#include <stdint.h>
 
 #include <unistd.h>
 
@@ -27,6 +19,8 @@ module;
 #endif
 
 module lx.portal;
+
+import std;
 
 import lx.foundation;
 import lx.shell;
@@ -66,14 +60,9 @@ constexpr int k_list_rows = 10;
 
 constexpr const char* k_category = "portal.overlay";
 
-void log_line(lx::trace::level lvl, const char* fmt, auto... args) {
-    if constexpr (sizeof...(args) == 0) {
-        lx::trace::logger::global().log(lvl, k_category, fmt);
-    } else {
-        char buf[512];
-        std::snprintf(buf, sizeof buf, fmt, args...);
-        lx::trace::logger::global().log(lvl, k_category, buf);
-    }
+template <typename... Args>
+void log_line(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_category, fmt, std::forward<Args>(args)...);
 }
 
 lx::rect2i unite(lx::rect2i a, lx::rect2i b) {
@@ -370,7 +359,7 @@ void overlay::finish(overlay_result r) {
     if (done())
         return;
     result_ = r;
-    log_line(lx::trace::level::debug, "overlay result %d", static_cast<int>(r.what));
+    log_line(lx::trace::level::debug, "overlay result {}", static_cast<int>(r.what));
 }
 
 void overlay::mark_all_dirty() {

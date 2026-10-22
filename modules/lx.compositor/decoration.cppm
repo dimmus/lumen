@@ -1,10 +1,6 @@
 module;
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <vector>
+#include <math.h>
 
 import lx.foundation;
 import lx.trace;
@@ -12,6 +8,8 @@ import lx.scene;
 import lx.text;
 
 export module lx.compositor:decoration;
+
+import std;
 
 import :toplevel;
 import :surface_tree;
@@ -230,6 +228,8 @@ private:
     void damage_title(const frame_node& n) const;
     void raster_title(slot& s);
     void log(const char* line) const;
+    template <typename... Args>
+    void log(std::format_string<Args...> fmt, Args&&... args) const;
 
     surface_tree* tree_ = nullptr;
     scene::scene_graph* scene_ = nullptr;
@@ -616,6 +616,13 @@ void lx::compositor::decoration_manager::log(const char* line) const {
     lx::trace::logger::global().log(lx::trace::level::debug, k_deco_category, line);
 }
 
+template <typename... Args>
+void lx::compositor::decoration_manager::log(std::format_string<Args...> fmt,
+                                             Args&&... args) const {
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_deco_category, fmt,
+                                     std::forward<Args>(args)...);
+}
+
 lx::compositor::decoration_manager::slot*
 lx::compositor::decoration_manager::find(lx::toplevel_id id) {
     if (!id)
@@ -781,10 +788,7 @@ void lx::compositor::decoration_manager::set_active(lx::toplevel_id id) {
         damage_strips(s->node);
     }
     if ((old || s) && deco_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "decoration active id=%llu previous=%llu", id.id(),
-                      previous.id());
-        log(line);
+        log("decoration active id={} previous={}", id.id(), previous.id());
     }
 }
 
@@ -977,12 +981,8 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     s.ellipsized = fit.ellipsized;
     damage_title(n);
     if (deco_debug()) {
-        char line[320];
-        std::snprintf(line, sizeof(line),
-                      "decoration title id=%llu width=%d ellipsized=%d title=\"%.200s%s\"",
-                      s.id.id(), text_w, fit.ellipsized ? 1 : 0, s.title,
-                      s.not_responding ? k_not_responding_suffix : "");
-        log(line);
+        log("decoration title id={} width={} ellipsized={} title=\"{:.200}{}\"", s.id.id(), text_w,
+            fit.ellipsized ? 1 : 0, s.title, s.not_responding ? k_not_responding_suffix : "");
     }
 }
 

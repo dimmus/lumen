@@ -4,8 +4,7 @@
 // happened while it was held). Pure, plus a real xkb keymap for the layout cases.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-
+import std;
 import lx.compositor;
 import lx.input;
 

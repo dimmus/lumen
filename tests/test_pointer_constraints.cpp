@@ -4,8 +4,7 @@
 // nearest point inside, the activation predicate, and when a lock's cursor hint is used.
 #include "lumen_test.hpp"
 
-#include <cmath>
-
+import std;
 import lx.foundation;
 import lx.compositor;
 

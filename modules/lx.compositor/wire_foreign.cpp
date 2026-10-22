@@ -27,9 +27,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <new>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -52,6 +50,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -97,6 +97,12 @@ constexpr const char* k_category = "compositor.foreign";
 
 void foreign_log(const char* line) {
     lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+}
+
+template <typename... Args>
+void foreign_log(std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_category, fmt,
+                                     std::forward<Args>(args)...);
 }
 
 lx::compositor::foreign_registry* registry() { return g_p0_ctx ? g_p0_ctx->foreign : nullptr; }
@@ -220,10 +226,8 @@ void do_export(wl_client* client, wl_resource* manager, const wl_interface* ifac
     // A handle is sent either way: an unregistered one imports as `destroyed`.
     send_handle(res, handle);
     if (surface_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "export toplevel=%llu handle=%.8s… registered=%d",
-                      rec ? rec->id.id() : 0ull, handle, e->reg ? 1 : 0);
-        foreign_log(line);
+        foreign_log("export toplevel={} handle={:.8}… registered={}", rec ? rec->id.id() : 0ull,
+                    handle, e->reg ? 1 : 0);
     }
 }
 
@@ -248,10 +252,8 @@ void do_import(wl_client* client, wl_resource* manager, const wl_interface* ifac
     else
         send_destroyed(i); // "If the handle is invalid, the destroyed event will be sent immediately"
     if (surface_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "import handle=%.8s… result=%s", handle ? handle : "",
-                      i->exported ? "ok" : "destroyed");
-        foreign_log(line);
+        foreign_log("import handle={:.8}… result={}", handle ? handle : "",
+                    i->exported ? "ok" : "destroyed");
     }
 }
 
@@ -284,10 +286,7 @@ bool do_set_parent_of(imported_obj* i, wl_resource* surface_res) {
             i->children[k_import_children - 1] = child->id; // the newest is remembered
     }
     if (surface_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "set_parent_of child=%llu parent=%llu", child->id.id(),
-                      e->toplevel.id());
-        foreign_log(line);
+        foreign_log("set_parent_of child={} parent={}", child->id.id(), e->toplevel.id());
     }
     return true;
 }

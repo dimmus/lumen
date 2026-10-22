@@ -16,10 +16,6 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
-
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1)
@@ -29,6 +25,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -129,15 +127,13 @@ void bell_ring(struct wl_client* client, struct wl_resource*, struct wl_resource
         g_p0_ctx->shell->emit_bell(rec && rec->mapped ? rec : nullptr);
     // One line per ring at debug; a client that hits the limit is noted once at info.
     if (surface_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "bell client=%u toplevel=%llu result=%s", cid,
-                      rec ? rec->id.id() : 0ull, result);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.bell", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.bell",
+                                         "bell client={} toplevel={} result={}", cid,
+                                         rec ? rec->id.id() : 0ull, result);
     } else if (result[0] == 'r' && dropped_logged_client != cid) {
         dropped_logged_client = cid;
-        char line[96];
-        std::snprintf(line, sizeof(line), "bell client=%u rate-limited (4 per second)", cid);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.bell", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.bell",
+                                         "bell client={} rate-limited (4 per second)", cid);
     }
 }
 

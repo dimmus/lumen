@@ -5,9 +5,7 @@ module;
 // not merely materialized), and a release point set from a sync_file through a temporary
 // syncobj and drmSyncobjTransfer.
 
-#include <cerrno>
-#include <cstdint>
-#include <mutex>
+#include <errno.h>
 
 #if defined(LUMEN_HAS_DRM)
 #include <xf86drm.h>
@@ -17,8 +15,11 @@ module;
 #include <fcntl.h>
 #include <unistd.h>
 #endif
+#include <signal.h>
 
 module lx.gfx;
+
+import std;
 
 import lx.foundation;
 import :drm_timeline;

@@ -5,9 +5,7 @@
 // sway's default scale, monitor identifiers and the start-up scan.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstring>
-
+import std;
 import lx.foundation;
 import lx.drm;
 import lx.compositor;

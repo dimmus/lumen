@@ -2,10 +2,7 @@
 // layout and layout diff (what is repainted and what is damaged).
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-
+import std;
 import lx.foundation;
 import lx.shell;
 

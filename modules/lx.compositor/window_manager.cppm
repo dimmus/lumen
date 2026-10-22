@@ -1,11 +1,6 @@
 module;
 
-#include <bit>
-#include <chrono>
-#include <cstdint>
-#include <cmath>
-#include <cstdio>
-#include <cstring>
+#include <signal.h>
 
 import lx.foundation;
 import lx.runtime;
@@ -14,6 +9,8 @@ import lx.scene;
 import lx.input;
 
 export module lx.compositor:wm;
+
+import std;
 
 import :toplevel;
 import :surface;
@@ -1075,11 +1072,10 @@ void lx::compositor::window_manager::set_layers(layer_shell* layers) {
         // back.
         if (wm->layer_focus_ && !(wm->layers_ && wm->layers_->focusable(wm->layer_focus_))) {
             if (wm_debug_enabled()) {
-                char line[128];
-                std::snprintf(line, sizeof(line),
-                              "layer focus surface=0 interactivity=none cause=unmap previous=%llu",
-                              wm->layer_focus_.id());
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.layer", line);
+                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.layer",
+                                                 "layer focus surface=0 interactivity=none "
+                                                 "cause=unmap previous={}",
+                                                 wm->layer_focus_.id());
             }
             wm->layer_focus_ = {};
         }
@@ -1099,11 +1095,10 @@ void lx::compositor::window_manager::set_layers(layer_shell* layers) {
             return;
         wm->layer_focus_ = surface;
         if (wm_debug_enabled()) {
-            char line[128];
-            std::snprintf(line, sizeof(line),
-                          "layer focus surface=%llu interactivity=on_demand cause=map",
-                          surface.id());
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.layer", line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.layer",
+                                             "layer focus surface={} interactivity=on_demand "
+                                             "cause=map",
+                                             surface.id());
         }
     };
     host.surface_moved = [](void* user, lx::surface_id surface) {
@@ -1274,10 +1269,9 @@ void lx::compositor::window_manager::set_parent(lx::toplevel_id id, lx::toplevel
     rec->parent = parent;
     const bool modal = effective_modal(*toplevels_, *rec);
     if (wm_debug_enabled()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "parent id=%llu parent=%llu modal=%d", id.id(),
-                      parent.id(), modal ? 1 : 0);
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "parent id={} parent={} modal={}", id.id(), parent.id(),
+                                         modal ? 1 : 0);
     }
     if (!rec->mapped)
         return;
@@ -1301,10 +1295,9 @@ void lx::compositor::window_manager::set_modal(lx::toplevel_id id, bool modal) {
     rec->modal = modal;
     const bool now = effective_modal(*toplevels_, *rec);
     if (wm_debug_enabled()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "modal id=%llu on=%d effective=%d", id.id(),
-                      modal ? 1 : 0, now ? 1 : 0);
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "modal id={} on={} effective={}", id.id(), modal ? 1 : 0,
+                                         now ? 1 : 0);
     }
     if (was == now)
         return;
@@ -1453,10 +1446,9 @@ unsigned lx::compositor::window_manager::evacuate_output(unsigned slot, int fall
     if (moved > 0) {
         rehit_pending_ = true;
         if (wm_debug_enabled()) {
-            char line[160];
-            std::snprintf(line, sizeof(line), "evacuate output=%u to=%d windows=%u%s", slot,
-                          fallback, moved, fallback < 0 ? " (stranded until an output comes)" : "");
-            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+            lx::trace::logger::global().logf(
+                lx::trace::level::debug, k_wm_category, "evacuate output={} to={} windows={:d}{}",
+                slot, fallback, moved, fallback < 0 ? " (stranded until an output comes)" : "");
         }
     }
     return moved;
@@ -1534,10 +1526,9 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
     if (adopted > 0) {
         rehit_pending_ = true;
         if (wm_debug_enabled()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "stranded windows taken in by output=%u windows=%u",
-                          slot, adopted);
-            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                             "stranded windows taken in by output={} windows={}",
+                                             slot, adopted);
         }
     }
     if (!o.identifier[0])
@@ -1593,10 +1584,9 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
     if (back > 0) {
         rehit_pending_ = true;
         if (wm_debug_enabled()) {
-            char line[160];
-            std::snprintf(line, sizeof(line), "home output=%u identifier=\"%s\" windows=%u", slot,
-                          o.identifier, back);
-            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                             "home output={} identifier=\"{}\" windows={}", slot,
+                                             o.identifier, back);
         }
     }
     return back + adopted;
@@ -1608,10 +1598,9 @@ void lx::compositor::window_manager::on_usable_area_changed(unsigned slot, lx::r
     if (slot < output_manager::k_max && !rect_equal(usable, usable_logged_[slot])) {
         usable_logged_[slot] = usable;
         if (wm_debug_enabled()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "usable area x=%d y=%d w=%d h=%d output=%u",
-                          usable.x, usable.y, usable.width, usable.height, slot);
-            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                             "usable area x={} y={} w={} h={} output={}", usable.x,
+                                             usable.y, usable.width, usable.height, slot);
         }
     }
     if (!toplevels_)
@@ -1657,10 +1646,9 @@ void lx::compositor::window_manager::set_maximized(lx::toplevel_id id, bool on,
     if (!rec)
         return;
     if (wm_debug_enabled()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "maximize id=%llu on=%d source=%s", id.id(), on ? 1 : 0,
-                      source ? source : "-");
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "maximize id={} on={} source={}", id.id(), on ? 1 : 0,
+                                         source ? source : "-");
     }
     // Before the initial configure, that configure answers it.
     if (!rec->initial_configure_sent) {
@@ -1728,10 +1716,9 @@ void lx::compositor::window_manager::set_fullscreen(lx::toplevel_id id, bool on,
     if (output >= 0 && !(outputs_ && outputs_->slot_live(static_cast<unsigned>(output))))
         output = -1; // a wl_output whose output is gone: the window's own
     if (wm_debug_enabled()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "fullscreen id=%llu on=%d output=%d source=%s", id.id(),
-                      on ? 1 : 0, output, source ? source : "-");
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "fullscreen id={} on={} output={} source={}", id.id(),
+                                         on ? 1 : 0, output, source ? source : "-");
     }
     // Before the initial configure, that configure answers it.
     if (!rec->initial_configure_sent) {
@@ -1800,11 +1787,10 @@ void lx::compositor::window_manager::log_geometry(const toplevel_record& rec, co
                                                   unsigned serial) const {
     if (!wm_debug_enabled())
         return;
-    char line[192];
-    std::snprintf(line, sizeof(line), "geometry id=%llu x=%d y=%d w=%d h=%d cause=%s serial=%u",
-                  rec.id.id(), rec.geometry.x, rec.geometry.y, rec.geometry.width,
-                  rec.geometry.height, cause, serial);
-    lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                     "geometry id={} x={} y={} w={} h={} cause={} serial={}",
+                                     rec.id.id(), rec.geometry.x, rec.geometry.y,
+                                     rec.geometry.width, rec.geometry.height, cause, serial);
 }
 
 void lx::compositor::window_manager::send_configure(toplevel_record& rec,
@@ -1854,12 +1840,10 @@ void lx::compositor::window_manager::send_configure(toplevel_record& rec,
             const char* req = rec.deco_requested == decoration_request::client   ? "client"
                               : rec.deco_requested == decoration_request::server ? "server"
                                                                                  : "unset";
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "decoration mode id=%llu requested=%s sent=%s serial=%u", rec.id.id(),
-                          req, c.decoration == decoration_mode::server ? "server" : "client",
-                          c.serial);
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
+            lx::trace::logger::global().logf(
+                lx::trace::level::debug, "compositor.deco",
+                "decoration mode id={} requested={} sent={} serial={}", rec.id.id(), req,
+                c.decoration == decoration_mode::server ? "server" : "client", c.serial);
         }
     }
     toplevel_manager::on_sent(rec, c, now_ns);
@@ -1878,12 +1862,11 @@ void lx::compositor::window_manager::send_configure(toplevel_record& rec,
     if (wm_debug_enabled()) {
         char states[64];
         format_states(c.states, states, sizeof(states));
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "configure id=%llu serial=%u w=%d h=%d states=%s edges=%u watchdog=%d",
-                      rec.id.id(), c.serial, c.size.width, c.size.height, states, c.anchor_edges,
-                      watchdog ? 1 : 0);
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "configure id={} serial={} w={} h={} states={} edges={} "
+                                         "watchdog={}",
+                                         rec.id.id(), c.serial, c.size.width, c.size.height, states,
+                                         c.anchor_edges, watchdog ? 1 : 0);
     }
 }
 
@@ -2013,12 +1996,11 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
         if (!mode_changed || !wm_debug_enabled())
             return;
         const lx::rect2i f = frame_rect(r.geometry, extents_of(r));
-        char line[160];
-        std::snprintf(line, sizeof(line), "decoration apply id=%llu mode=%s frame=%d,%d,%dx%d",
-                      r.id.id(), r.decoration_current == decoration_mode::server ? "server"
-                                                                                 : "client",
-                      f.x, f.y, f.width, f.height);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::debug, "compositor.deco",
+            "decoration apply id={} mode={} frame={},{},{}x{}", r.id.id(),
+            r.decoration_current == decoration_mode::server ? "server" : "client", f.x, f.y,
+            f.width, f.height);
     };
 
     if (!rec->mapped) {
@@ -2120,11 +2102,10 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
     }
 
     {
-        char line[192];
-        std::snprintf(line, sizeof(line), "map id=%llu app_id=%s x=%d y=%d w=%d h=%d",
-                      rec.id.id(), rec.app_id ? rec.app_id : "", rec.geometry.x, rec.geometry.y,
-                      rec.geometry.width, rec.geometry.height);
-        lx::trace::logger::global().log(lx::trace::level::info, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::info, k_wm_category,
+                                         "map id={} app_id={} x={} y={} w={} h={}", rec.id.id(),
+                                         rec.app_id ? rec.app_id : "", rec.geometry.x,
+                                         rec.geometry.y, rec.geometry.width, rec.geometry.height);
     }
     log_geometry(rec, "map", 0);
     sync_decoration(rec);
@@ -2216,10 +2197,8 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     }
 
     {
-        char line[128];
-        std::snprintf(line, sizeof(line), "unmap id=%llu reason=%s", id.id(),
-                      reason ? reason : "-");
-        lx::trace::logger::global().log(lx::trace::level::info, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::info, k_wm_category,
+                                         "unmap id={} reason={}", id.id(), reason ? reason : "-");
     }
 
     // Focus falls to whatever is now on top — the stacking order is the only history kept.
@@ -2334,10 +2313,9 @@ void lx::compositor::window_manager::flush_configures(lx::runtime::clock_time no
             return;
         const bool watchdog = toplevel_manager::timed_out(rec, now_ns);
         if (watchdog && wm_debug_enabled()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "configure watchdog id=%llu serial=%u",
-                          rec.id.id(), rec.last_sent.serial);
-            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                             "configure watchdog id={} serial={}", rec.id.id(),
+                                             rec.last_sent.serial);
         }
         send_configure(rec, now_ns, false, watchdog);
         // A configure unanswered past the watchdog is the strongest hint of a hung client
@@ -2354,10 +2332,8 @@ void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
     // (activation, the shell's request_activate, a click, a window mapping).
     if (const lx::toplevel_id b = modal_blocker(id); b) {
         if (wm_debug_enabled()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "focus redirect id=%llu modal=%llu", id.id(),
-                          b.id());
-            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                             "focus redirect id={} modal={}", id.id(), b.id());
         }
         id = b;
     }
@@ -2389,9 +2365,8 @@ void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
     if (shell_)
         shell_->emit_focus_changed(rec);
     if (wm_debug_enabled()) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "focus keyboard id=%llu", id.id());
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "focus keyboard id={}", id.id());
     }
 }
 
@@ -2477,10 +2452,9 @@ void lx::compositor::window_manager::resolve_keyboard_focus() {
         return;
     router_->set_keyboard_focus(target, *seat_);
     if (wm_debug_enabled()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "focus keyboard-surface kind=%s surface=%llu", kind,
-                      surface.id());
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "focus keyboard-surface kind={} surface={}", kind,
+                                         surface.id());
     }
 }
 
@@ -2893,27 +2867,22 @@ void lx::compositor::window_manager::on_pointer_button(
                     layer_focus_ = pointer_root_;
                     if (wm_debug_enabled()) {
                         const layer_record* l = layers_->find(layer_focus_);
-                        char line[128];
-                        std::snprintf(line, sizeof(line),
-                                      "layer focus surface=%llu interactivity=%s cause=click",
-                                      layer_focus_.id(),
-                                      l && l->current.interactivity == 1 ? "exclusive"
-                                                                         : "on_demand");
-                        lx::trace::logger::global().log(lx::trace::level::debug,
-                                                        "compositor.layer", line);
+                        lx::trace::logger::global().logf(
+                            lx::trace::level::debug, "compositor.layer",
+                            "layer focus surface={} interactivity={} "
+                            "cause=click",
+                            layer_focus_.id(),
+                            l && l->current.interactivity == 1 ? "exclusive" : "on_demand");
                     }
                     resolve_keyboard_focus();
                 }
             } else if (pointer_owner_ != hit_owner::popup &&
                        pointer_owner_ != hit_owner::ime_popup && layer_focus_) {
                 if (wm_debug_enabled()) {
-                    char line[128];
-                    std::snprintf(line, sizeof(line),
-                                  "layer focus surface=0 interactivity=none cause=click "
-                                  "previous=%llu",
-                                  layer_focus_.id());
-                    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.layer",
-                                                    line);
+                    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.layer",
+                                                     "layer focus surface=0 interactivity=none "
+                                                     "cause=click previous={}",
+                                                     layer_focus_.id());
                 }
                 layer_focus_ = {};
                 resolve_keyboard_focus();
@@ -2930,11 +2899,9 @@ void lx::compositor::window_manager::on_pointer_button(
                 set_keyboard_focus(b);
                 (void)raise(pointer_focus_);
                 if (wm_debug_enabled()) {
-                    char line[96];
-                    std::snprintf(line, sizeof(line), "modal press id=%llu dialog=%llu",
-                                  pointer_focus_.id(), b.id());
-                    lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category,
-                                                    line);
+                    lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                                     "modal press id={} dialog={}",
+                                                     pointer_focus_.id(), b.id());
                 }
                 return;
             }
@@ -2971,10 +2938,8 @@ void lx::compositor::window_manager::on_pointer_button(
                 decorations_->set_button(id, over ? deco_button::hover : deco_button::normal);
             if (over) {
                 if (wm_debug_enabled()) {
-                    char line[64];
-                    std::snprintf(line, sizeof(line), "decoration close id=%llu", id.id());
-                    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco",
-                                                    line);
+                    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.deco",
+                                                     "decoration close id={}", id.id());
                 }
                 request_close(id);
             }
@@ -3189,10 +3154,9 @@ void lx::compositor::window_manager::drag_hit(unsigned time_ms, bool send_motion
 void lx::compositor::window_manager::decoration_press(
     lx::toplevel_id id, deco_zone zone, const lx::input::pointer_button_event& event) {
     if (wm_debug_enabled()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "decoration press id=%llu zone=%s button=%u", id.id(),
-                      deco_zone_name(zone), event.evdev_code);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.deco",
+                                         "decoration press id={} zone={} button={}", id.id(),
+                                         deco_zone_name(zone), event.evdev_code);
     }
     constexpr unsigned k_btn_middle = 0x112;
     // Middle on the title lowers (the KWin and Mutter default). Without click-to-focus: a
@@ -3220,10 +3184,9 @@ void lx::compositor::window_manager::decoration_press(
             const auto* rec = toplevels_->find(id);
             const bool maximized = rec && (rec->desired.states & tl_maximized) != 0;
             if (wm_debug_enabled()) {
-                char line[96];
-                std::snprintf(line, sizeof(line), "decoration double-click id=%llu maximize=%d",
-                              id.id(), maximized ? 0 : 1);
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
+                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.deco",
+                                                 "decoration double-click id={} maximize={}",
+                                                 id.id(), maximized ? 0 : 1);
             }
             set_maximized(id, !maximized, "decoration");
             return;
@@ -3275,10 +3238,9 @@ void lx::compositor::window_manager::log_grab_reject(lx::toplevel_id id, grab_so
                                                      const char* reason) const {
     if (!wm_debug_enabled())
         return;
-    char line[128];
-    std::snprintf(line, sizeof(line), "grab rejected id=%llu source=%s reason=%s", id.id(),
-                  grab_source_name(source), reason);
-    lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                     "grab rejected id={} source={} reason={}", id.id(),
+                                     grab_source_name(source), reason);
 }
 
 bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mode,
@@ -3338,14 +3300,12 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
     }
 
     if (wm_debug_enabled()) {
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "grab begin id=%llu mode=%s edges=%u source=%s button=%u x=%d y=%d w=%d "
-                      "h=%d",
-                      id.id(), grab_mode_name(mode), grab_.edges, grab_source_name(source),
-                      button, grab_.start.x, grab_.start.y, grab_.start.width,
-                      grab_.start.height);
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "grab begin id={} mode={} edges={} source={} button={} "
+                                         "x={} y={} w={} h={}",
+                                         id.id(), grab_mode_name(mode), grab_.edges,
+                                         grab_source_name(source), button, grab_.start.x,
+                                         grab_.start.y, grab_.start.width, grab_.start.height);
     }
     return true;
 }
@@ -3480,12 +3440,10 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
 
     if (wm_debug_enabled()) {
         const lx::rect2i r = rec ? rec->geometry : g.start;
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "grab end id=%llu mode=%s reason=%s x=%d y=%d w=%d h=%d", g.toplevel.id(),
-                      grab_mode_name(g.mode), grab_end_name(reason), r.x, r.y, r.width,
-                      r.height);
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "grab end id={} mode={} reason={} x={} y={} w={} h={}",
+                                         g.toplevel.id(), grab_mode_name(g.mode),
+                                         grab_end_name(reason), r.x, r.y, r.width, r.height);
     }
     // The pointer goes back to whatever is under it — unless a button is still held, in
     // which case nothing has it until release (no `enter` mid-press).
@@ -3523,10 +3481,9 @@ void lx::compositor::window_manager::sync_node_stacking(const toplevel_record& r
     rehit_pending_ = true;
     stacking_dirty_ = true;
     if (wm_debug_enabled()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "%s id=%llu index=%u", verb, rec.id.id(),
-                      toplevels_->stacking_index(rec.id));
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "{} id={} index={}", verb, rec.id.id(),
+                                         toplevels_->stacking_index(rec.id));
     }
 }
 
@@ -3601,12 +3558,12 @@ void log_activation(const char* token_prefix, const lx::compositor::toplevel_rec
                     const char* cause) {
     if (!wm_debug_enabled())
         return;
-    char line[192];
-    std::snprintf(line, sizeof(line), "activate token=%.8s surface=%llu id=%llu result=%s reason=%s%s",
-                  token_prefix && token_prefix[0] ? token_prefix : "-", rec.surface.id(),
-                  rec.id.id(), lx::compositor::activation_result_name(r),
-                  lx::compositor::activation_reason_name(why), cause);
-    lx::trace::logger::global().log(lx::trace::level::debug, k_activation_category, line);
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_activation_category,
+                                     "activate token={:.8} surface={} id={} result={} reason={}{}",
+                                     token_prefix && token_prefix[0] ? token_prefix : "-",
+                                     rec.surface.id(), rec.id.id(),
+                                     lx::compositor::activation_result_name(r),
+                                     lx::compositor::activation_reason_name(why), cause);
 }
 
 } // namespace
@@ -3702,9 +3659,8 @@ void lx::compositor::window_manager::set_demands_attention(toplevel_record& rec,
         return;
     rec.demands_attention = on;
     if (wm_debug_enabled()) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "urgent id=%llu on=%d", rec.id.id(), on ? 1 : 0);
-        lx::trace::logger::global().log(lx::trace::level::debug, k_activation_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_activation_category,
+                                         "urgent id={} on={}", rec.id.id(), on ? 1 : 0);
     }
     if (shell_)
         shell_->emit_toplevel_flags(rec);

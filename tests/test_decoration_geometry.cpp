@@ -2,9 +2,7 @@
 // the atlas, and frame-aware placement.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <vector>
-
+import std;
 import lx.foundation;
 import lx.gfx;
 import lx.scene;

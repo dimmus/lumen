@@ -15,9 +15,9 @@ module;
 // hold one reference each. UI affinity. The bodies are in toplevel_icon.cpp (the Clang 23
 // partition rule, see session_lock.cpp).
 
-#include <cstdint>
-
 export module lx.compositor:toplevel_icon;
+
+import std;
 
 export namespace lx::compositor {
 

@@ -5,10 +5,7 @@
 // and lumen-shell's idle policy (`lx.shell:idle_policy`). Pure: no Wayland.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <string>
-#include <vector>
-
+import std;
 import lx.foundation;
 import lx.compositor;
 import lx.shell;

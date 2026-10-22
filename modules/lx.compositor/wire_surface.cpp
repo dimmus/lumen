@@ -9,12 +9,9 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <algorithm>
-#include <cerrno>
-#include <climits>
-#include <cstdint>
-#include <cstdio>
-#include <ctime>
+#include <errno.h>
+#include <stdint.h>
+#include <time.h>
 
 #if defined(__linux__)
 #include <linux/dma-buf.h>
@@ -44,6 +41,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -634,12 +633,9 @@ bool geometry_prechecks(surface_obj* s) {
     if (s->role == surface_role::none || s->role == surface_role::cursor) {
         if (!s->invalid_size_logged && surface_debug()) {
             s->invalid_size_logged = true;
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "client bug: buffer %dx%d is not divisible by scale %d (surface=%llu, "
-                          "tolerated for this role)",
-                          in.buffer_w, in.buffer_h, in.scale, s->id.id());
-            surface_log(line);
+            surface_log("client bug: buffer {}x{} is not divisible by scale {} (surface={}, "
+                        "tolerated for this role)",
+                        in.buffer_w, in.buffer_h, in.scale, s->id.id());
         }
         return true;
     }
@@ -1155,13 +1151,10 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
         s->current_texture = 0;
         s->ctx->surfaces->set_solid(s->id, buf->solid, geo.size, content_opaque(s));
         if (surface_debug()) {
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "surface solid surface=%llu rgba=%.3f,%.3f,%.3f,%.3f size=%dx%d "
-                          "opaque=%d",
-                          s->id.id(), buf->solid.r, buf->solid.g, buf->solid.b, buf->solid.a,
-                          geo.size.width, geo.size.height, content_opaque(s) ? 1 : 0);
-            surface_log(line);
+            surface_log("surface solid surface={} rgba={:.3f},{:.3f},{:.3f},{:.3f} size={}x{} "
+                        "opaque={}",
+                        s->id.id(), buf->solid.r, buf->solid.g, buf->solid.b, buf->solid.a,
+                        geo.size.width, geo.size.height, content_opaque(s) ? 1 : 0);
         }
         wl_buffer_send_release(s->current.buffer);
         return;
@@ -1394,10 +1387,8 @@ void apply_core(surface_obj* s) {
     // frame that first shows this update.
     if (c.alpha != s->alpha_current) {
         if (surface_debug()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "surface alpha surface=%llu multiplier=%.4f",
-                          s->id.id(), static_cast<double>(c.alpha) / 4294967295.0);
-            surface_log(line);
+            surface_log("surface alpha surface={} multiplier={:.4f}", s->id.id(),
+                        static_cast<double>(c.alpha) / 4294967295.0);
         }
         s->alpha_current = c.alpha;
         s->ctx->surfaces->set_alpha(s->id,
@@ -1409,17 +1400,13 @@ void apply_core(surface_obj* s) {
                                                       c.content_type <= 3 ? c.content_type : 0));
         if (surface_debug()) {
             static const char* const k_types[] = {"none", "photo", "video", "game"};
-            char line[96];
-            std::snprintf(line, sizeof(line), "surface content type surface=%llu type=%s",
-                          s->id.id(), k_types[c.content_type <= 3 ? c.content_type : 0]);
-            surface_log(line);
+            surface_log("surface content type surface={} type={}", s->id.id(),
+                        k_types[c.content_type <= 3 ? c.content_type : 0]);
         }
     }
     if (c.tearing != s->tearing_current && surface_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "surface presentation hint surface=%llu hint=%s",
-                      s->id.id(), c.tearing == k_tearing_async ? "async" : "vsync");
-        surface_log(line);
+        surface_log("surface presentation hint surface={} hint={}", s->id.id(),
+                    c.tearing == k_tearing_async ? "async" : "vsync");
     }
     s->tearing_current = c.tearing;
     if (c.fifo_set) {
@@ -1473,15 +1460,12 @@ void apply_core(surface_obj* s) {
         // On a change only: what the client rendered against what it covers, which says
         // whether its draw is 1:1 at the output scale.
         const auto& vp = s->current.viewport;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "surface geometry surface=%llu buffer=%dx%d scale=%d transform=%d "
-                      "src=%s%.2f,%.2f,%.2fx%.2f dst=%s%dx%d size=%dx%d",
-                      s->id.id(), gin.buffer_w, gin.buffer_h, gin.scale,
-                      static_cast<int>(gin.transform), vp.has_src ? "" : "-",
-                      vp.src_x / 256.0, vp.src_y / 256.0, vp.src_w / 256.0, vp.src_h / 256.0,
-                      vp.has_dst ? "" : "-", vp.dst_w, vp.dst_h, geo.size.width, geo.size.height);
-        surface_log(line);
+        surface_log("surface geometry surface={} buffer={}x{} scale={} transform={} "
+                    "src={}{:.2f},{:.2f},{:.2f}x{:.2f} dst={}{}x{} size={}x{}",
+                    s->id.id(), gin.buffer_w, gin.buffer_h, gin.scale,
+                    static_cast<int>(gin.transform), vp.has_src ? "" : "-", vp.src_x / 256.0,
+                    vp.src_y / 256.0, vp.src_w / 256.0, vp.src_h / 256.0, vp.has_dst ? "" : "-",
+                    vp.dst_w, vp.dst_h, geo.size.width, geo.size.height);
     }
 
     if (s->role == surface_role::cursor) {
@@ -1589,12 +1573,9 @@ void apply_cached(surface_obj* s, const char* cause, unsigned depth) {
     const lx::size2i size = s->surface_size;
     tree->set_has_buffer(s->id, s->has_content && !s->surface_size.empty());
     if (s->role == surface_role::subsurface && surface_debug()) {
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "subsurface apply surface=%llu parent=%llu cause=%s buffer=%d w=%d h=%d",
-                      s->id.id(), tree->parent_of(s->id).id(), cause, s->has_content ? 1 : 0,
-                      size.width, size.height);
-        surface_log(line);
+        surface_log("subsurface apply surface={} parent={} cause={} buffer={} w={} h={}",
+                    s->id.id(), tree->parent_of(s->id).id(), cause, s->has_content ? 1 : 0,
+                    size.width, size.height);
     }
     tree->apply_child_state(s->id);
     lx::surface_id kids[lx::compositor::k_tree_max_children + 1];
@@ -1718,12 +1699,9 @@ lx::compositor::cu_conditions cu_conditions_of(const surface_obj* s) {
 void log_implicit_off(int err) {
     if (!surface_debug())
         return;
-    char line[128];
-    std::snprintf(line, sizeof(line),
-                  "dma-buf EXPORT_SYNC_FILE unavailable (errno %d): implicit fences are waited "
-                  "for by the GPU import, not before applying",
-                  err);
-    surface_log(line);
+    surface_log("dma-buf EXPORT_SYNC_FILE unavailable (errno {}): implicit fences are waited for "
+                "by the GPU import, not before applying",
+                err);
 }
 
 /// An explicit-sync acquire point that has not signalled yet: an eventfd armed with
@@ -2118,13 +2096,10 @@ bool commit_dcu(surface_obj* s, bool root_commit, const char* cause) {
                                           rec.target_ns);
             }
             if (surface_debug()) {
-                char line[192];
-                std::snprintf(line, sizeof(line),
-                              "content update queued surface=%llu cause=%s depth=%u waits=%u "
-                              "fifo=%d barrier=%d target=%llu sealed=%u",
-                              s->id.id(), cause, g_cu.depth(slot), rec.waits,
-                              rec.fifo_wait ? 1 : 0, s->fifo_barrier ? 1 : 0, rec.target_ns, nk);
-                surface_log(line);
+                surface_log("content update queued surface={} cause={} depth={} waits={} fifo={} "
+                            "barrier={} target={} sealed={}",
+                            s->id.id(), cause, g_cu.depth(slot), rec.waits, rec.fifo_wait ? 1 : 0,
+                            s->fifo_barrier ? 1 : 0, rec.target_ns, nk);
             }
             return false;
         }
@@ -2320,18 +2295,12 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
         // synchronized mode."
         s->cached.fifo_wait = false;
         if (surface_debug()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "subsurface commit surface=%llu mode=sync cached=1",
-                          s->id.id());
-            surface_log(line);
+            surface_log("subsurface commit surface={} mode=sync cached=1", s->id.id());
         }
         return;
     }
     if (is_sub && surface_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "subsurface commit surface=%llu mode=desync cached=0",
-                      s->id.id());
-        surface_log(line);
+        surface_log("subsurface commit surface={} mode=desync cached=0", s->id.id());
     }
     if (commit_dcu(s, true, is_sub ? "desync-commit" : "commit"))
         finish_commit(s, true, "commit");

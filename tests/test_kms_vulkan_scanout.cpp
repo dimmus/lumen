@@ -1,8 +1,6 @@
 // Vulkan composite → export_dmabuf → KMS framebuffer → atomic flip (vkms).
 // Opt-in: LUMEN_TEST_VKMS=1 and modprobe vkms. Soft-skips without DRM master.
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <stdio.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -13,6 +11,7 @@
 #include <xf86drmMode.h>
 #endif
 
+import std;
 import lx.foundation;
 import lx.drm;
 import lx.gfx;

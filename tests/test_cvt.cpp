@@ -2,10 +2,8 @@
 // published reference timings (`cvt` from xorg-x11-utils, VESA's CVT 2.0 spreadsheet), and
 // against libdisplay-info's `di_cvt_compute` when the build has it — the two must agree to the
 // pixel for every size a client may ask for.
-#include <cstdio>
-#include <cstring>
-#include <initializer_list>
 
+import std;
 import lx.drm;
 
 namespace {

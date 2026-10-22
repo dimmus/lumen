@@ -1,14 +1,10 @@
 module;
 
-#include <atomic>
-#include <cstdint>
-#include <cstring>
-#include <mutex>
-#include <vector>
-
 #if !defined(_WIN32)
 #include <sys/mman.h>
 #endif
+#include <signal.h>
+#include <stddef.h>
 
 import lx.foundation;
 import lx.sync;
@@ -18,6 +14,8 @@ import lx.input;
 import lx.scene;
 
 export module lx.compositor:protocols_p0;
+
+import std;
 
 import :input_router;
 import :shell_bridge;

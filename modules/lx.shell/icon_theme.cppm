@@ -15,15 +15,6 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
-#include <string>
-#include <vector>
-
 #if !defined(_WIN32)
 #include <dirent.h>
 #include <sys/stat.h>
@@ -42,6 +33,8 @@ import lx.foundation;
 import lx.trace;
 
 export module lx.shell:icon_theme;
+
+import std;
 
 export namespace lx::shell {
 
@@ -422,11 +415,10 @@ void lx::shell::icon_theme::load() {
     }
     if (const theme_index* h = index_of("hicolor"))
         chain_.push_back(h);
-    char line[256];
-    std::snprintf(line, sizeof(line), "icon theme %s (%u themes in the chain; png=%d svg=%d)",
-                  theme_.c_str(), static_cast<unsigned>(chain_.size()), can_png() ? 1 : 0,
-                  can_svg() ? 1 : 0);
-    lx::trace::logger::global().log(lx::trace::level::info, k_icon_category, line);
+    lx::trace::logger::global().logf(lx::trace::level::info, k_icon_category,
+                                     "icon theme {} ({} themes in the chain; png={} svg={})",
+                                     theme_.c_str(), static_cast<unsigned>(chain_.size()),
+                                     can_png() ? 1 : 0, can_svg() ? 1 : 0);
 }
 
 std::string lx::shell::icon_theme::find_in(const theme_index& t, const char* name, int px) const {
@@ -585,11 +577,10 @@ const std::uint32_t* lx::shell::icon_theme::lookup(const char* name, int px) {
     if (!file.empty() && !decode(file, px, entry.pixels))
         entry.pixels.clear();
     if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        char line[512];
-        std::snprintf(line, sizeof(line), "icon %s %dpx -> %s%s", name, px,
-                      file.empty() ? "(not found)" : file.c_str(),
-                      !file.empty() && entry.pixels.empty() ? " (undecodable)" : "");
-        lx::trace::logger::global().log(lx::trace::level::debug, k_icon_category, line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::debug, k_icon_category, "icon {} {}px -> {}{}", name, px,
+            file.empty() ? "(not found)" : file.c_str(),
+            !file.empty() && entry.pixels.empty() ? " (undecodable)" : "");
     }
     if (cache_.size() >= k_cache) {
         auto* oldest = &cache_[0];

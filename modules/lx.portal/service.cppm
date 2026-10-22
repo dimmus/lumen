@@ -25,10 +25,9 @@ module;
 // Single-threaded: one poll over the bus, a signalfd and — only while a request runs — its
 // Wayland connection. Idle, the process sleeps in poll with no timeout.
 
-#include <string>
-#include <string_view>
-
 export module lx.portal:service;
+
+import std;
 
 export namespace lx::portal {
 

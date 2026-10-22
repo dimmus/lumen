@@ -7,11 +7,9 @@ module;
 // expects the chosen line, verbatim, on stdout (nothing, or exit status 1, declines).
 // Parsing only decides how a line is shown; what goes back is always the line itself.
 
-#include <string>
-#include <string_view>
-#include <vector>
-
 export module lx.portal:chooser;
+
+import std;
 
 export namespace lx::portal {
 

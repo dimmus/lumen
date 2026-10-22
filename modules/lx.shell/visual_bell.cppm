@@ -16,8 +16,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
+#include <stdint.h>
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <sys/mman.h>
@@ -40,6 +39,8 @@ import lx.foundation;
 import lx.trace;
 
 export module lx.shell:visual_bell;
+
+import std;
 
 export namespace lx::shell {
 

@@ -2,13 +2,8 @@ module;
 
 // Bodies of `:files`.
 
-#include <cerrno>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <string>
-#include <string_view>
+#include <errno.h>
+#include <stdio.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -16,6 +11,8 @@ module;
 #include <unistd.h>
 
 module lx.portal;
+
+import std;
 
 import lx.foundation;
 import :files;

@@ -1,11 +1,6 @@
-module;
-
-#include <cstdlib>
-#include <new>
-#include <type_traits>
-#include <utility>
-
 export module lx.foundation:result;
+
+import std;
 
 export namespace lx {
 

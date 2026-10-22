@@ -1,8 +1,6 @@
 module;
 
-#include <cerrno>
-#include <cstddef>
-#include <cstring>
+#include <errno.h>
 
 #include <fcntl.h>
 #include <sys/random.h>
@@ -12,6 +10,8 @@ import lx.foundation;
 import lx.runtime;
 
 export module lx.compositor:activation;
+
+import std;
 
 import :input_router;
 

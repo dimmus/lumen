@@ -1,13 +1,12 @@
 module;
 
-#include <cmath>
-#include <cstdio>
-
 import lx.foundation;
 import lx.trace;
 import lx.scene;
 
 export module lx.compositor:dnd;
+
+import std;
 
 import :xcursor;
 import :cursor;
@@ -350,8 +349,7 @@ void lx::compositor::dnd_grab::finish(dnd_end_reason why) {
     if (cursor_)
         cursor_->clear_override();
     if (dnd_debug()) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "dnd end reason=%s", dnd_end_name(why));
-        lx::trace::logger::global().log(lx::trace::level::debug, k_dnd_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_dnd_category,
+                                         "dnd end reason={}", dnd_end_name(why));
     }
 }

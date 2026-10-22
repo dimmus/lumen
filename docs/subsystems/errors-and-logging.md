@@ -190,6 +190,10 @@ import lx.foundation.error;
 lx::trace::logger::global().log(
     lx::trace::level::info, "compositor", "vsync timer armed");
 
+// Formatted lines: std::format syntax, checked against the arguments at compile time.
+lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.wm",
+                                 "geometry id={} x={} y={} cause={}", id.id(), g.x, g.y, cause);
+
 if (auto r = comp.start(); !r)
     lx::trace::logger::global().log_error(r.get_error(), "compositor");
 
@@ -198,6 +202,19 @@ if (auto r = comp.start(); !r)
     // ...
 }
 ```
+
+`logf` is the way to log a formatted line; do not build one with `snprintf` into a stack
+buffer. It returns before formatting when the level is filtered out, formats into a 4 KiB
+stack buffer (longer lines are truncated) and never allocates. The formatting itself is
+type-erased into `lx.trace` (`logger::vlog`), so a call site costs a compile-time format
+check and a few hundred bytes of code rather than an instantiation of `std::format`.
+Two conventions differ from plain `std::format`, to keep lines as they were under `printf`:
+a `bool` argument prints as `1`/`0`, and a null `const char*` as `(null)`.
+
+Smoke scripts grep these lines, so a change to a format string is a change to an interface.
+
+Files with their own category keep a one-line helper (`dnd_log`, `bridge_log`, ...) with a
+`std::format_string` overload that forwards to `logf`.
 
 ### Frame-path rule
 

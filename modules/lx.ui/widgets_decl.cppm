@@ -1,12 +1,12 @@
 module;
 
-#include <cstring>
-
 import lx.foundation;
 import lx.layout;
 import lx.scene;
 
 export module lx.ui:widgets_decl;
+
+import std;
 
 import :element;
 import :node;

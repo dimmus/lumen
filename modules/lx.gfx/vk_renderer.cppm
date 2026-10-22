@@ -3,12 +3,13 @@ module;
 #if defined(LUMEN_HAS_VULKAN)
 #include <vulkan/vulkan.h>
 #endif
-#include <cstdint>
-#include <cstring>
+#include <stdint.h>
 
 import lx.foundation;
 
 export module lx.gfx:vk_renderer;
+
+import std;
 
 import :dmabuf;
 import :renderer;

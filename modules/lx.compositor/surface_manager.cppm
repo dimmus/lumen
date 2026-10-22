@@ -1,7 +1,5 @@
 module;
 
-#include <cmath>
-
 import lx.foundation;
 import lx.gfx;
 import lx.scene;
@@ -9,6 +7,8 @@ import lx.trace;
 import lx.wayland.server;
 
 export module lx.compositor:surface;
+
+import std;
 
 export namespace lx::compositor {
 

@@ -1,5 +1,7 @@
 module;
 
+#include <stdio.h>
+
 // The content-update queue of wl_surface.commit (wayland.xml since 1.24: "A commit request
 // atomically creates a Content Update ... placed at the end of a per-surface queue"), and the
 // readiness poller that clears its fence blockers. Wayland-free: it holds indices, blockers
@@ -18,9 +20,9 @@ module;
 //   tried (`cu_ready`), never stored as bits that could go stale.
 // - Only the head of a surface's queue can apply: updates apply in commit order.
 
-#include <cstdint>
-
 export module lx.compositor:content_update;
+
+import std;
 
 import lx.foundation;
 

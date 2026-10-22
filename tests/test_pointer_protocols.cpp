@@ -8,18 +8,8 @@
 // pointer-gestures-unstable-v1 v3 (swipe, pinch, hold latched to the client focused at
 // begin). A region staged after a synchronized subsurface's cached commit applies with its
 // own commit's update, not with the earlier one its parent applies.
-#include <atomic>
-#include <cerrno>
-#include <chrono>
-#include <cmath>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <functional>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
+#include <errno.h>
+#include <stdio.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -39,7 +29,9 @@
 #define LUMEN_TEST_PART_C 1
 #endif
 #endif
+#include <stdint.h>
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.input;

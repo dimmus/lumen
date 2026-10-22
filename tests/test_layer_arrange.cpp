@@ -3,8 +3,7 @@
 // tree and surface manager, with recording wire ops and host callbacks.
 #include "lumen_test.hpp"
 
-#include <memory>
-
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.gfx;

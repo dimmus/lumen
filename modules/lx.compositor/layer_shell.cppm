@@ -1,13 +1,12 @@
 module;
 
-#include <cstdio>
-#include <cstring>
-
 import lx.foundation;
 import lx.trace;
 import lx.scene;
 
 export module lx.compositor:layer_shell;
+
+import std;
 
 import :surface;
 import :surface_tree;
@@ -274,6 +273,8 @@ private:
     void mapped_add(unsigned level, unsigned slot);
     void mapped_remove(unsigned level, unsigned slot);
     void log_line(const char* line) const;
+    template <typename... Args>
+    void log_line(std::format_string<Args...> fmt, Args&&... args) const;
 
     surface_manager* surfaces_ = nullptr;
     surface_tree* tree_ = nullptr;
@@ -501,6 +502,12 @@ void lx::compositor::layer_shell::log_line(const char* line) const {
     lx::trace::logger::global().log(lx::trace::level::debug, k_layer_category, line);
 }
 
+template <typename... Args>
+void lx::compositor::layer_shell::log_line(std::format_string<Args...> fmt, Args&&... args) const {
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_layer_category, fmt,
+                                     std::forward<Args>(args)...);
+}
+
 lx::compositor::layer_record* lx::compositor::layer_shell::find(lx::surface_id surface) {
     const int slot = slot_of(surface);
     return slot >= 0 ? &records_[static_cast<unsigned>(slot)] : nullptr;
@@ -547,11 +554,8 @@ lx::compositor::layer_shell::create(lx::surface_id surface, lx::client_id client
         all_[all_count_++] = i;
         tree_->set_root_tag(surface, 0);
         if (layer_debug()) {
-            char line[192];
-            std::snprintf(line, sizeof(line),
-                          "layer create surface=%llu layer=%s namespace=%s output=%u",
-                          surface.id(), level_name(layer), r.name_space, r.output);
-            log_line(line);
+            log_line("layer create surface={} layer={} namespace={} output={}", surface.id(),
+                     level_name(layer), r.name_space, r.output);
         }
         return create_error::none;
     }
@@ -574,10 +578,7 @@ lx::compositor::layer_shell::on_ack(lx::surface_id surface, unsigned serial) {
         r->sent_count -= popped;
         r->ever_acked = true;
         if (layer_debug()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "layer ack surface=%llu serial=%u", surface.id(),
-                          serial);
-            log_line(line);
+            log_line("layer ack surface={} serial={}", surface.id(), serial);
         }
         return ack_result::ok;
     }
@@ -615,10 +616,8 @@ void lx::compositor::layer_shell::send_configure(layer_record& r, lx::size2i siz
     r.last_configure = size;
     ops_.send_configure(r.layer_res, serial, size.width, size.height);
     if (layer_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "layer configure surface=%llu serial=%u w=%d h=%d",
-                      r.surface.id(), serial, size.width, size.height);
-        log_line(line);
+        log_line("layer configure surface={} serial={} w={} h={}", r.surface.id(), serial,
+                 size.width, size.height);
     }
 }
 
@@ -728,10 +727,8 @@ void lx::compositor::layer_shell::arrange_all(unsigned output, lx::surface_id co
                 if (layer_debug() && (edge != r.logged_edge || r.current.zone != r.logged_zone)) {
                     r.logged_edge = edge;
                     r.logged_zone = r.current.zone;
-                    char line[128];
-                    std::snprintf(line, sizeof(line), "layer exclusive surface=%llu edge=%s zone=%d",
-                                  r.surface.id(), edge_name(edge), r.current.zone);
-                    log_line(line);
+                    log_line("layer exclusive surface={} edge={} zone={}", r.surface.id(),
+                             edge_name(edge), r.current.zone);
                 }
             }
         }
@@ -739,10 +736,8 @@ void lx::compositor::layer_shell::arrange_all(unsigned output, lx::surface_id co
             break;
     }
     if (layer_debug()) {
-        char line[160];
-        std::snprintf(line, sizeof(line), "layer arrange output=%u usable=%d,%d,%dx%d surfaces=%u",
-                      output, usable.x, usable.y, usable.width, usable.height, n);
-        log_line(line);
+        log_line("layer arrange output={} usable={},{},{}x{} surfaces={}", output, usable.x,
+                 usable.y, usable.width, usable.height, n);
     }
     if (!arranged_[output] || !same_rect(usable, usable_[output])) {
         arranged_[output] = true;
@@ -772,11 +767,11 @@ void lx::compositor::layer_shell::map(layer_record& r) {
     }
     mapped_add(level, static_cast<unsigned>(slot));
     {
-        char line[192];
-        std::snprintf(line, sizeof(line), "layer map surface=%llu layer=%s namespace=%s x=%d y=%d w=%d h=%d",
-                      r.surface.id(), level_name(level), r.name_space, r.box.x, r.box.y,
-                      r.box.width, r.box.height);
-        lx::trace::logger::global().log(lx::trace::level::info, k_layer_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
+                                         "layer map surface={} layer={} namespace={} x={} y={} "
+                                         "w={} h={}",
+                                         r.surface.id(), level_name(level), r.name_space, r.box.x,
+                                         r.box.y, r.box.width, r.box.height);
     }
     if (host_.surface_mapped)
         host_.surface_mapped(host_.user, r.surface);
@@ -797,10 +792,9 @@ void lx::compositor::layer_shell::unmap(layer_record& r, const char* reason) {
         mapped_remove(r.mapped_layer, static_cast<unsigned>(slot));
     r.logged_edge = ~0u;
     {
-        char line[128];
-        std::snprintf(line, sizeof(line), "layer unmap surface=%llu reason=%s", r.surface.id(),
-                      reason);
-        lx::trace::logger::global().log(lx::trace::level::info, k_layer_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
+                                         "layer unmap surface={} reason={}", r.surface.id(),
+                                         reason);
     }
     if (host_.focus_changed)
         host_.focus_changed(host_.user);
@@ -825,10 +819,7 @@ void lx::compositor::layer_shell::close(layer_record& r, const char* reason) {
         return;
     r.closed = true;
     if (layer_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "layer closed surface=%llu reason=%s", r.surface.id(),
-                      reason);
-        log_line(line);
+        log_line("layer closed surface={} reason={}", r.surface.id(), reason);
     }
     const bool alive = !ops_.client_alive || ops_.client_alive(r.client_native);
     if (alive && ops_.send_closed && r.layer_res)

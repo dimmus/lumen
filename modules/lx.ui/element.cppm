@@ -1,12 +1,12 @@
 module;
 
-#include <new>
-
 import lx.foundation;
 import lx.runtime;
 import lx.trace;
 
 export module lx.ui:element;
+
+import std;
 
 export namespace lx::ui {
 

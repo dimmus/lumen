@@ -1,11 +1,13 @@
 module;
 
-#include <cstdint>
+#include <signal.h>
 
 import lx.foundation;
 import lx.runtime;
 
 export module lx.compositor:toplevel;
+
+import std;
 
 import :activation;
 

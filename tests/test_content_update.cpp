@@ -6,12 +6,12 @@
 // lifecycle lets a dma-buf (and its explicit-sync release point) go.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <vector>
 #include <fcntl.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
+#include <signal.h>
 
+import std;
 import lx.foundation;
 import lx.gfx;
 import lx.runtime;

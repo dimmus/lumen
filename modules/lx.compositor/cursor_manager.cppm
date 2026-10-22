@@ -1,17 +1,12 @@
 module;
 
-#include <atomic>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <vector>
-
 import lx.foundation;
 import lx.scene;
 import lx.trace;
 
 export module lx.compositor:cursor;
+
+import std;
 
 import :xcursor;
 import :input_router;
@@ -844,10 +839,10 @@ void lx::compositor::cursor_manager::resolve() {
             images_->publish();
         }
         if (cursor_debug()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "cursor shape=%u source=%s hardware=%d",
-                          static_cast<unsigned>(shape), source, frame_hardware_ ? 1 : 0);
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.cursor", line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.cursor",
+                                             "cursor shape={} source={} hardware={}",
+                                             static_cast<unsigned>(shape), source,
+                                             frame_hardware_ ? 1 : 0);
         }
     }
     frame_pending_ = true;

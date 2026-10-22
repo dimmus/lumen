@@ -13,16 +13,14 @@ module;
 // paused nothing is probed (not master: the kernel would answer from its cache); the hints
 // are kept and the resume probes everything.
 
-#include <chrono>
-#include <cstdio>
-#include <memory>
-
 import lx.foundation;
 import lx.runtime;
 import lx.trace;
 import lx.drm;
 
 export module lx.compositor:hotplug;
+
+import std;
 
 import :output;
 
@@ -168,10 +166,9 @@ void lx::compositor::hotplug_controller::on_readable() {
     }
     ++batches_;
     if (debug_on()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "hotplug: uevent connectors=%s%s",
-                      b.all_connectors ? "all" : "hinted", paused_ ? " (session away: owed)" : "");
-        lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::debug, k_category, "hotplug: uevent connectors={}{}",
+            b.all_connectors ? "all" : "hinted", paused_ ? " (session away: owed)" : "");
     }
     if (paused_) {
         lx::drm::merge_hotplug(owed_, b);
@@ -240,10 +237,9 @@ void lx::compositor::hotplug_controller::finish() {
         }
     } else {
         if (debug_on()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "hotplug: probe connectors=%u hint=%u took=%u us",
-                          scan_->count, hint_, probe_us_);
-            lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
+                                             "hotplug: probe connectors={} hint={} took={} us",
+                                             scan_->count, hint_, probe_us_);
         }
         if (host_.scan_ready)
             host_.scan_ready(host_.user, *scan_, current_forced_);

@@ -22,9 +22,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <new>
+#include <stdint.h>
 
 #include <unistd.h>
 
@@ -41,6 +39,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -95,11 +95,11 @@ void deliver(dc_device* d, xfer_family f, const char* cause) {
     xfer_offer* o = src ? xfer_create_control_offer(d->client, d->resource, ops, f, src) : nullptr;
     ops.send_selection(d->resource, o ? o->resource : nullptr);
     if (surface_debug()) {
-        char line[160];
-        std::snprintf(line, sizeof(line), "data-control offer proto=%s kind=%s client=%u mimes=%u cause=%s",
-                      d->proto->name, family_name(f), wire_client_id(d->client),
-                      o ? src->mimes.count() : 0u, cause);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.selection", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.selection",
+                                         "data-control offer proto={} kind={} client={} mimes={} "
+                                         "cause={}",
+                                         d->proto->name, family_name(f), wire_client_id(d->client),
+                                         o ? src->mimes.count() : 0u, cause);
     }
 }
 

@@ -11,11 +11,9 @@ module;
 //     frontend hands to a sandboxed caller through the document portal. Files older than an
 //     hour are removed when the next one is written, so the tmpfs does not fill up.
 
-#include <ctime>
-#include <string>
-#include <string_view>
-
 export module lx.portal:files;
+
+import std;
 
 import lx.foundation;
 

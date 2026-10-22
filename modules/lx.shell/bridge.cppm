@@ -1,8 +1,6 @@
 module;
 
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
+#include <stdint.h>
 
 #if !defined(_WIN32)
 #include <sys/mman.h>
@@ -13,11 +11,14 @@ module;
 #include <wayland-client.h>
 #include "zlm_shell_v1-client-protocol.h"
 #endif
+#include <time.h>
 
 import lx.foundation;
 import lx.trace;
 
 export module lx.shell:bridge;
+
+import std;
 
 import :task_model;
 
@@ -196,6 +197,11 @@ void bridge_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, k_bridge_category, line);
 }
 
+template <typename... Args>
+void bridge_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_bridge_category, fmt, std::forward<Args>(args)...);
+}
+
 } // namespace
 
 #if defined(LUMEN_SHELL_WAYLAND)
@@ -239,9 +245,7 @@ struct lx::shell::policy_bridge::events {
         b.caps_ = flags;
         b.caps_version_ = version;
         b.has_caps_ = true;
-        char line[96];
-        std::snprintf(line, sizeof(line), "capabilities flags=0x%x version=%u", flags, version);
-        bridge_log(lx::trace::level::info, line);
+        bridge_log(lx::trace::level::info, "capabilities flags=0x{:x} version={}", flags, version);
     }
     static void session_ending(void* data, zlm_shell_v1*) {
         // Whoever started the logout, the disconnect that follows is the session ending.
@@ -255,9 +259,7 @@ struct lx::shell::policy_bridge::events {
         if (changed || bridge_debug()) {
             static constexpr const char* k_names[] = {"unlocked", "locking", "locked",
                                                       "abandoned"};
-            char line[64];
-            std::snprintf(line, sizeof(line), "session lock %s", state < 4 ? k_names[state] : "?");
-            bridge_log(lx::trace::level::info, line);
+            bridge_log(lx::trace::level::info, "session lock {}", state < 4 ? k_names[state] : "?");
         }
         if (b.lock_state_fn_)
             b.lock_state_fn_(state, b.lock_user_);
@@ -284,10 +286,8 @@ struct lx::shell::policy_bridge::events {
         auto* g = static_cast<key_grab*>(data);
         ++g->activations;
         if (bridge_debug()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "key grab activated keysym=0x%x serial=%u",
-                          g->keysym, serial);
-            bridge_log(lx::trace::level::debug, line);
+            bridge_log(lx::trace::level::debug, "key grab activated keysym=0x{:x} serial={}",
+                       g->keysym, serial);
         }
         if (g->fn)
             g->fn(serial, time, g->user);
@@ -295,10 +295,8 @@ struct lx::shell::policy_bridge::events {
     static void key_grab_refused(void* data, zlm_key_grab_v1*, uint32_t reason) {
         auto* g = static_cast<key_grab*>(data);
         g->refusal = reason;
-        char line[128];
-        std::snprintf(line, sizeof(line), "key grab keysym=0x%x refused: %s", g->keysym,
-                      refusal_name(reason));
-        bridge_log(lx::trace::level::warn, line);
+        bridge_log(lx::trace::level::warn, "key grab keysym=0x{:x} refused: {}", g->keysym,
+                   refusal_name(reason));
     }
 
     // ── zlm_policy_bridge_v1: snapshot ──
@@ -327,10 +325,9 @@ struct lx::shell::policy_bridge::events {
         }
         set_slot(t, th);
         if (bridge_debug()) {
-            char line[384];
-            std::snprintf(line, sizeof(line), "snapshot toplevel handle=%u app_id=%s title=\"%s\"",
-                          th.index, app_id ? app_id : "", title ? title : "");
-            bridge_log(lx::trace::level::debug, line);
+            bridge_log(lx::trace::level::debug,
+                       "snapshot toplevel handle={} app_id={} title=\"{}\"", th.index,
+                       app_id ? app_id : "", title ? title : "");
         }
     }
     static void snapshot_output(void*, zlm_policy_bridge_v1*, wl_output*, const char*, int32_t,
@@ -338,9 +335,7 @@ struct lx::shell::policy_bridge::events {
     static void snapshot_done(void* data, zlm_policy_bridge_v1*) {
         auto& b = self(data);
         b.model_.end_snapshot();
-        char line[64];
-        std::snprintf(line, sizeof(line), "snapshot toplevels=%u", b.model_.count());
-        bridge_log(lx::trace::level::info, line);
+        bridge_log(lx::trace::level::info, "snapshot toplevels={}", b.model_.count());
     }
 
     // ── zlm_policy_bridge_v1: deltas ──
@@ -355,10 +350,8 @@ struct lx::shell::policy_bridge::events {
         }
         set_slot(t, th);
         if (bridge_debug()) {
-            char line[64];
-            std::snprintf(line, sizeof(line), "add handle=%u count=%u", th.index,
-                          b.model_.count());
-            bridge_log(lx::trace::level::debug, line);
+            bridge_log(lx::trace::level::debug, "add handle={} count={}", th.index,
+                       b.model_.count());
         }
     }
     static void toplevel_destroyed(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
@@ -368,10 +361,8 @@ struct lx::shell::policy_bridge::events {
             unmap_icons(b.icons_[th.index]);
         const bool removed = b.model_.remove(th);
         if (bridge_debug()) {
-            char line[64];
-            std::snprintf(line, sizeof(line), "remove handle=%d count=%u",
-                          removed ? static_cast<int>(th.index) : -1, b.model_.count());
-            bridge_log(lx::trace::level::debug, line);
+            bridge_log(lx::trace::level::debug, "remove handle={} count={}",
+                       removed ? static_cast<int>(th.index) : -1, b.model_.count());
         }
         // The compositor made the handle inert; the shell releases its reference.
         if (t)
@@ -384,15 +375,11 @@ struct lx::shell::policy_bridge::events {
         const unsigned changed = b.model_.set_state(th, app_id, title, state);
         if ((changed & task_change_label) && bridge_debug()) {
             const task_entry* e = b.model_.get(th);
-            char line[448];
-            std::snprintf(line, sizeof(line), "title handle=%u app_id=%s title=\"%s\"",
-                          th.index, e ? e->app_id : "", e ? e->title : "");
-            bridge_log(lx::trace::level::debug, line);
+            bridge_log(lx::trace::level::debug, "title handle={} app_id={} title=\"{}\"", th.index,
+                       e ? e->app_id : "", e ? e->title : "");
         }
         if ((changed & task_change_state) && bridge_debug()) {
-            char line[64];
-            std::snprintf(line, sizeof(line), "state handle=%u state=%u", th.index, state);
-            bridge_log(lx::trace::level::debug, line);
+            bridge_log(lx::trace::level::debug, "state handle={} state={}", th.index, state);
         }
     }
     static void toplevel_geometry(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
@@ -425,9 +412,7 @@ struct lx::shell::policy_bridge::events {
         auto& b = self(data);
         const task_handle th = find(b, t);
         if (b.model_.set_flags(th, flags) && bridge_debug()) {
-            char line[64];
-            std::snprintf(line, sizeof(line), "flags handle=%u flags=%u", th.index, flags);
-            bridge_log(lx::trace::level::debug, line);
+            bridge_log(lx::trace::level::debug, "flags handle={} flags={}", th.index, flags);
         }
     }
     // ── zlm_policy_bridge_v1 v6 ──
@@ -469,11 +454,8 @@ struct lx::shell::policy_bridge::events {
         b.icon_pending_ = {};
         b.icon_pending_task_ = {};
         (void)b.model_.set_icon(th, b.icon_pending_name_);
-        char line[224];
-        std::snprintf(line, sizeof(line), "icon handle=%u name=%s buffers=%u", th.index,
-                      b.icon_pending_name_[0] ? b.icon_pending_name_ : "-",
-                      b.icons_[th.index].count);
-        bridge_log(lx::trace::level::info, line);
+        bridge_log(lx::trace::level::info, "icon handle={} name={} buffers={}", th.index,
+                   b.icon_pending_name_[0] ? b.icon_pending_name_ : "-", b.icons_[th.index].count);
     }
     static void toplevel_parent(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
                                 zlm_toplevel_v1* parent) {
@@ -481,19 +463,16 @@ struct lx::shell::policy_bridge::events {
         const task_handle th = find(b, t);
         const task_handle ph = find(b, parent);
         if (b.model_.set_parent(th, ph) && bridge_debug()) {
-            char line[64];
-            std::snprintf(line, sizeof(line), "parent handle=%u parent=%d", th.index,
-                          ph ? static_cast<int>(ph.index) : -1);
-            bridge_log(lx::trace::level::debug, line);
+            bridge_log(lx::trace::level::debug, "parent handle={} parent={}", th.index,
+                       ph ? static_cast<int>(ph.index) : -1);
         }
     }
     static void bell(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
         auto& b = self(data);
         const task_handle th = find(b, t);
         {
-            char line[64];
-            std::snprintf(line, sizeof(line), "bell handle=%d", th ? static_cast<int>(th.index) : -1);
-            bridge_log(lx::trace::level::info, line);
+            bridge_log(lx::trace::level::info, "bell handle={}",
+                       th ? static_cast<int>(th.index) : -1);
         }
         if (b.bell_fn_)
             b.bell_fn_(th, b.bell_user_);
@@ -636,10 +615,9 @@ lx::result<unsigned> lx::shell::policy_bridge::grab_key(unsigned keysym, unsigne
     if (!can_grab_keys()) {
         if (!told_no_grabs_) {
             told_no_grabs_ = true;
-            char line[96];
-            std::snprintf(line, sizeof(line), "compositor has no key grabs (v%u): no shell keybindings",
-                          shell_ ? wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) : 0u);
-            bridge_log(lx::trace::level::info, line);
+            bridge_log(lx::trace::level::info,
+                       "compositor has no key grabs (v{}): no shell keybindings",
+                       shell_ ? wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) : 0u);
         }
         return lx::not_implemented("lx::shell::policy_bridge::grab_key");
     }

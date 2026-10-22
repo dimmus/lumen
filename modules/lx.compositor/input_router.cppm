@@ -1,17 +1,19 @@
 module;
 
-#include <cstddef>
-#include <cstdint>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #endif
+#include <stdio.h>
 
 import lx.foundation;
 import lx.input;
 import lx.trace;
 
 export module lx.compositor:input_router;
+
+import std;
 
 export namespace lx::compositor {
 

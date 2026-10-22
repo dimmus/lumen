@@ -1,16 +1,10 @@
 module;
 
-#include <atomic>
-#include <cmath>
-#include <condition_variable>
-#include <cstdint>
-#include <cstring>
-#include <mutex>
-#include <thread>
-
 import lx.foundation;
 
 export module lx.gfx:cpu_renderer;
+
+import std;
 
 import :renderer;
 import :damage;

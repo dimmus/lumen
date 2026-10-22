@@ -1,11 +1,11 @@
 module;
 
-#include <cstring>
-
 import lx.foundation;
 import lx.runtime;
 
 export module lx.session:privilege;
+
+import std;
 
 export namespace lx::session {
 

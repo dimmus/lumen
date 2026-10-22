@@ -2,14 +2,9 @@ module;
 
 // Bodies of `:compose`. See compose.cppm for the model.
 
-#include <algorithm>
-#include <cmath>
-#include <cstdint>
-#include <cstring>
-#include <span>
-#include <vector>
-
 module lx.portal;
+
+import std;
 
 import lx.foundation;
 import :compose;

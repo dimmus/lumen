@@ -4,12 +4,8 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cerrno>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <initializer_list>
+#include <stdint.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -29,6 +25,8 @@ import lx.foundation;
 import lx.runtime;
 
 export module lx.session;
+
+import std;
 
 export import :privilege;
 

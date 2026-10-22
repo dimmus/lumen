@@ -1,5 +1,7 @@
 module;
 
+#include <stdio.h>
+
 // xdg-foreign's handle registry (design-app-compat-capture B.4, XF1): one table for v1 and
 // v2 (wlroots' `wlr_xdg_foreign_registry`), so a window exported over either version can be
 // imported over either — GTK 3 and older Firefox speak only v1, Qt 6 only v2, and a portal
@@ -10,11 +12,11 @@ module;
 // guess another app's handle could parent its windows onto it. UI affinity. The bodies are
 // in foreign_registry.cpp (the Clang 23 partition rule, see session_lock.cpp).
 
-#include <cstdint>
-
 import lx.foundation;
 
 export module lx.compositor:foreign_registry;
+
+import std;
 
 export namespace lx::compositor {
 

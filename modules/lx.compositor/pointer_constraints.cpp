@@ -2,9 +2,9 @@ module;
 
 // Bodies of `:pointer_constraints`. See pointer_constraints.cppm.
 
-#include <cmath>
-
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import :surface;

@@ -1,11 +1,12 @@
 module;
 
-#include <cstdint>
-#include <cstring>
+#include <stdio.h>
 
 import lx.foundation;
 
 export module lx.shell:task_model;
+
+import std;
 
 export namespace lx::shell {
 

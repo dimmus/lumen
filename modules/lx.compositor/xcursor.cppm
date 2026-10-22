@@ -1,18 +1,12 @@
 module;
 
-#include <cmath>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <initializer_list>
-#include <string>
-#include <vector>
+#include <stdio.h>
 
 import lx.foundation;
 
 export module lx.compositor:xcursor;
+
+import std;
 
 export namespace lx::compositor {
 

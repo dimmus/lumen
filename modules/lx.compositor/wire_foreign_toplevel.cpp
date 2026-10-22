@@ -21,11 +21,6 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <new>
-
 #if defined(__linux__)
 #include <sys/random.h>
 #endif
@@ -39,6 +34,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;

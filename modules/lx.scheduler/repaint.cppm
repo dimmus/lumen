@@ -1,11 +1,11 @@
 module;
 
-#include <cstdint>
-
 import lx.foundation;
 import lx.runtime;
 
 export module lx.scheduler:repaint;
+
+import std;
 
 export namespace lx::scheduler {
 

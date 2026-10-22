@@ -8,9 +8,9 @@ module;
 // more bytes is the better trade. Without libpng (LUMEN_PORTAL_PNG unset) both return
 // not_implemented.
 
-#include <cstdint>
-
 export module lx.portal:png;
+
+import std;
 
 import lx.foundation;
 import :compose;

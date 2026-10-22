@@ -4,14 +4,12 @@
 // reference counts, and handles — 32 hex digits, unique, withdrawn on removal.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstring>
-#include <vector>
 
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.compositor;
 

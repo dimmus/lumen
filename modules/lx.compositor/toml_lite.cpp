@@ -2,15 +2,11 @@ module;
 
 // The TOML subset reader and writer (`:toml_lite`). See the partition for what is accepted.
 
-#include <charconv>
-#include <cmath>
-#include <cstddef>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
+#include <math.h>
 
 module lx.compositor;
+
+import std;
 
 import :toml_lite;
 

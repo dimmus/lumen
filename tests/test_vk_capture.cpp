@@ -6,12 +6,9 @@
 // without hardware Vulkan); skips without one.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <thread>
 #include <unistd.h>
-#include <vector>
 
+import std;
 import lx.foundation;
 import lx.gfx;
 import lx.compositor;

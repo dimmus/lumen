@@ -36,9 +36,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <new>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -49,6 +47,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -137,11 +137,10 @@ const char* kind_of(const constraint_obj* c) { return c->lock ? "lock" : "confin
 void constraint_log(lx::trace::level lvl, const constraint_obj* c, const char* what) {
     if (lvl == lx::trace::level::debug && !surface_debug())
         return;
-    char line[160];
-    std::snprintf(line, sizeof(line), "pointer %s client=%u surface=%llu %s %s", kind_of(c),
-                  wire_client_id(c->client), c->surface ? c->surface->id.id() : 0ull,
-                  c->persistent ? "persistent" : "oneshot", what);
-    lx::trace::logger::global().log(lvl, k_category, line);
+    lx::trace::logger::global().logf(lvl, k_category, "pointer {} client={} surface={} {} {}",
+                                     kind_of(c), wire_client_id(c->client),
+                                     c->surface ? c->surface->id.id() : 0ull,
+                                     c->persistent ? "persistent" : "oneshot", what);
 }
 
 /// The surface's global origin (logical), from its scene node.

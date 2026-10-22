@@ -8,12 +8,13 @@ module;
 #include <gbm.h>
 #include <unistd.h>
 #endif
-#include <cstdint>
-#include <cstring>
+#include <stdint.h>
 
 import lx.foundation;
 
 export module lx.gfx:gl_renderer;
+
+import std;
 
 import :renderer;
 import :dmabuf;
@@ -299,7 +300,6 @@ private:
 };
 
 } // namespace lx::gfx
-
 
 
 namespace lx::gfx::detail {

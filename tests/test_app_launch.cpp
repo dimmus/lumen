@@ -3,14 +3,10 @@
 // mask, inherited fds of the launched process).
 #include "lumen_test.hpp"
 
-#include <cerrno>
-#include <climits>
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <string_view>
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -18,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.shell;
 

@@ -1,21 +1,8 @@
 module;
 
-#include <algorithm>
-#include <atomic>
-#include <cstdio>
-#include <cerrno>
-#include <chrono>
-#include <cmath>
+#include <errno.h>
 #include <fcntl.h>
-#include <condition_variable>
-#include <cstdlib>
-#include <cstring>
-#include <memory>
-#include <mutex>
-#include <thread>
 #include <unistd.h>
-#include <utility>
-#include <vector>
 
 #if defined(__GLIBC__)
 #include <malloc.h>
@@ -42,6 +29,8 @@ import lx.input;
 import lx.session;
 
 module lx.compositor;
+
+import std;
 
 namespace lx::compositor::detail {
 
@@ -1327,9 +1316,8 @@ void compositor_impl::request_vt_switch(unsigned vt) {
         lx::trace::logger::global().log_error(switched.get_error(), "compositor.session");
         return;
     }
-    char line[64];
-    std::snprintf(line, sizeof(line), "VT switch to %u requested", vt);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
+                                     "VT switch to {:d} requested", vt);
 }
 
 void compositor_impl::note_committed_input(output_pipeline& p, bool content) {
@@ -1452,13 +1440,11 @@ void compositor_impl::note_present_latency(output_pipeline& p, unsigned long lon
         submit_us = 0;
         fence_us = 0;
     }
-    char line[224];
-    std::snprintf(line, sizeof(line),
-                  "present kind=%s input_us=%llu present_us=%llu latency_us=%llu "
-                  "submit_us=%llu fence_us=%llu output=%u",
-                  (packed & 1u) ? "content" : "cursor", input_us, present_us, latency_us,
-                  submit_us, fence_us, p.slot);
-    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.latency", line);
+    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.latency",
+                                     "present kind={} input_us={} present_us={} latency_us={} "
+                                     "submit_us={} fence_us={} output={}",
+                                     (packed & 1u) ? "content" : "cursor", input_us, present_us,
+                                     latency_us, submit_us, fence_us, p.slot);
     latency_samples_[latency_sample_count_++] = latency_us;
     if (latency_sample_count_ == k_latency_window)
         log_latency_summary();
@@ -1470,13 +1456,12 @@ void compositor_impl::log_outputs() const {
             continue;
         const output_state& o = outputs.slot_state(slot);
         const lx::rect2i l = o.logical_rect();
-        char line[448];
-        std::snprintf(line, sizeof(line),
-                      "output %u name=%s mode=%dx%d refresh_mhz=%u scale=%g (%ld/120) "
-                      "logical=%dx%d+%d+%d identifier=\"%s\"",
-                      slot, o.name, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
-                      std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y, o.identifier);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
+                                         "output {} name={} mode={}x{} refresh_mhz={} scale={:g} "
+                                         "({}/120) logical={}x{}+{}+{} identifier=\"{}\"",
+                                         slot, o.name, o.mode.width, o.mode.height, o.refresh_mhz,
+                                         o.scale, std::lround(o.scale * 120.0), l.width, l.height,
+                                         l.x, l.y, o.identifier);
     }
 }
 
@@ -1592,10 +1577,9 @@ void compositor_impl::log_latency_summary() {
     std::nth_element(b, b + i50, b + i95 + 1);
     const unsigned long long p50 = b[i50];
     const unsigned long long max = *std::max_element(b + i95, b + n);
-    char line[128];
-    std::snprintf(line, sizeof(line), "latency summary n=%u p50_us=%llu p95_us=%llu max_us=%llu",
-                  n, p50, p95, max);
-    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.latency", line);
+    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.latency",
+                                     "latency summary n={} p50_us={} p95_us={} max_us={}", n, p50,
+                                     p95, max);
 }
 
 void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) {
@@ -1708,10 +1692,8 @@ void compositor_impl::prepare_cursor_plane(output_pipeline& p) {
 void compositor_impl::fail_cursor_plane(const char* why) {
     if (cursor_hw_failed_.exchange(true, std::memory_order_acq_rel))
         return;
-    char line[128];
-    std::snprintf(line, sizeof(line), "cursor plane rejected: %s — falling back to software",
-                  why);
-    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.cursor", line);
+    lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.cursor",
+                                     "cursor plane rejected: {} — falling back to software", why);
 }
 
 void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_event& event) {
@@ -1855,11 +1837,10 @@ void compositor_impl::trace_texture_op(const char* op, unsigned texture_id, bool
     if (texture_trace_count_ >= k_texture_trace_limit)
         return;
     ++texture_trace_count_;
-    char line[128];
-    std::snprintf(line, sizeof(line), "texture %s id=%u%s%s", op, texture_id,
-                  ok ? "" : " FAILED",
-                  texture_trace_count_ == k_texture_trace_limit ? " (trace ends here)" : "");
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.texture", line);
+    lx::trace::logger::global().logf(
+        lx::trace::level::info, "compositor.texture", "texture {} id={}{}{}", op, texture_id,
+        ok ? "" : " FAILED",
+        texture_trace_count_ == k_texture_trace_limit ? " (trace ends here)" : "");
 }
 
 void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
@@ -1949,11 +1930,10 @@ void compositor_impl::start_input() {
     // which protocols it can drive — gestures need a touchpad, relative pointers a mouse.
     sink.device_added = [](const char* name, bool keyboard, bool pointer, bool touch, bool gesture,
                            void*) {
-        char line[192];
-        std::snprintf(line, sizeof(line), "input device \"%s\":%s%s%s%s", name ? name : "?",
-                      keyboard ? " keyboard" : "", pointer ? " pointer" : "", touch ? " touch" : "",
-                      gesture ? " gesture" : "");
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.input", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.input",
+                                         "input device \"{}\":{}{}{}{}", name ? name : "?",
+                                         keyboard ? " keyboard" : "", pointer ? " pointer" : "",
+                                         touch ? " touch" : "", gesture ? " gesture" : "");
     };
     // Touch is not routed to clients yet; it is still the user, and wakes the display.
     sink.touch = [](const lx::input::touch_event&, void* u) {
@@ -2150,10 +2130,9 @@ void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) 
     for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i)
         std::fwrite(&rgba[i * 4u], 1, 3, f);
     std::fclose(f);
-    char line[600];
-    std::snprintf(line, sizeof(line), "screenshot %ux%u written to %s (output %u)", w, h, path,
-                  p.slot);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.render", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.render",
+                                     "screenshot {}x{} written to {} (output {})", w, h, path,
+                                     p.slot);
 }
 
 void compositor_impl::refresh_capture_host() {
@@ -2755,15 +2734,14 @@ void compositor_impl::register_p0_globals() {
         p0_.syncobj_drm_fd = kms.card_fd();
         p0_.syncobj_supported = fence_out && gfx::drm_timeline_supported(kms.card_fd());
         p0_.async_flip_capable = kms.supports_async_flip();
-        char line[200];
-        std::snprintf(line, sizeof(line),
-                      "explicit sync (linux-drm-syncobj-v1): %s; async page flips "
-                      "(tearing-control-v1): %s",
-                      p0_.syncobj_supported ? "offered"
-                      : fence_out           ? "not offered (no timeline syncobjs on this card)"
-                                            : "not offered (composite exports no fence)",
-                      p0_.async_flip_capable ? "available" : "unsupported by the card");
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx", line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::info, "compositor.gfx",
+            "explicit sync (linux-drm-syncobj-v1): {}; async page "
+            "flips (tearing-control-v1): {}",
+            p0_.syncobj_supported ? "offered"
+            : fence_out           ? "not offered (no timeline syncobjs on this card)"
+                                  : "not offered (composite exports no fence)",
+            p0_.async_flip_capable ? "available" : "unsupported by the card");
     }
     if (auto installed = install_p0_protocols(p0_); !installed) {
         lx::trace::logger::global().log_error(installed.get_error(), "compositor");
@@ -2829,10 +2807,9 @@ void compositor_impl::begin_logout(const char* source) {
         wm_.request_close(rec.id);
         ++asked;
     });
-    char line[128];
-    std::snprintf(line, sizeof(line), "logout requested by %s: closing %u window%s", source,
-                  asked, asked == 1 ? "" : "s");
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
+                                     "logout requested by {}: closing {} window{}", source, asked,
+                                     asked == 1 ? "" : "s");
 }
 
 void compositor_impl::advance_logout(lx::runtime::clock_time now_ns) {
@@ -2841,10 +2818,9 @@ void compositor_impl::advance_logout(lx::runtime::clock_time now_ns) {
     const unsigned left = toplevels.count();
     if (left > 0 && now_ns < logout_deadline_ns_)
         return;
-    char line[128];
-    std::snprintf(line, sizeof(line), "logout: stopping (%u window%s still open)", left,
-                  left == 1 ? "" : "s");
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
+                                     "logout: stopping ({} window{} still open)", left,
+                                     left == 1 ? "" : "s");
     logout_active_ = false;
     loop.quit(0);
 }
@@ -3353,12 +3329,10 @@ lx::result<void> compositor_impl::create_pipelines() {
             if (o.follow_preferred || !o.preferred_mode.valid() ||
                 o.preferred_mode.same_timings(o.kms_mode))
                 continue;
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "output %u %s: its configured mode %dx%d failed TEST_ONLY — preferred "
-                          "mode instead",
-                          slots[i], o.name, o.mode.width, o.mode.height);
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.outputcfg", line);
+            lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.outputcfg",
+                                             "output {} {}: its configured mode {}x{} failed "
+                                             "TEST_ONLY — preferred mode instead",
+                                             slots[i], o.name, o.mode.width, o.mode.height);
             outputs.set_mode(slots[i], o.preferred_mode, true, false);
             output_pipeline& p = *pipes_[slots[i]];
             release_targets(p);
@@ -3377,12 +3351,10 @@ lx::result<void> compositor_impl::create_pipelines() {
     // Without master yet (a session starting in the background) TEST_ONLY cannot run; the
     // structural assignment is taken and the first modeset decides.
     if (!assigned) {
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "CRTC allocation failed for %u output%s (steps=%u tests=%u) — trying "
-                      "without the test",
-                      n, n == 1 ? "" : "s", r.steps, r.tests);
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.drm", line);
+        lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.drm",
+                                         "CRTC allocation failed for {} output{} (steps={} "
+                                         "tests={}) — trying without the test",
+                                         n, n == 1 ? "" : "s", r.steps, r.tests);
         if (!drm::assign_crtcs(in, r, nullptr, nullptr))
             return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::no_crtc),
                                   "no CRTC assignment for the connected outputs");
@@ -3397,22 +3369,20 @@ lx::result<void> compositor_impl::create_pipelines() {
         p.kms->set_framebuffer(p.framebuffer(0, cpu_present_));
         p.presentation.bind_page_flip(*p.kms);
         p.presentation.set_handler(&compositor_impl::presentation_flip_handler, &p);
-        char line[224];
-        std::snprintf(line, sizeof(line),
-                      "output %u pipeline crtc=%u (index %u) primary=%u connector=%u mode=%ux%u@%u "
-                      "cursor_plane=%d",
-                      p.slot, d.crtc_id, d.crtc_index, d.primary_plane_id, d.connector_id,
-                      o.kms_mode.width, o.kms_mode.height, o.kms_mode.refresh_mhz,
-                      r.cursor_plane[i] >= 0
-                          ? static_cast<int>(kms.plane(static_cast<unsigned>(r.cursor_plane[i])).id)
-                          : -1);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm", line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::info, "compositor.drm",
+            "output {} pipeline crtc={} (index {}) primary={} "
+            "connector={} mode={}x{}@{} cursor_plane={}",
+            p.slot, d.crtc_id, d.crtc_index, d.primary_plane_id, d.connector_id, o.kms_mode.width,
+            o.kms_mode.height, o.kms_mode.refresh_mhz,
+            r.cursor_plane[i] >= 0
+                ? static_cast<int>(kms.plane(static_cast<unsigned>(r.cursor_plane[i])).id)
+                : -1);
     }
     {
-        char line[128];
-        std::snprintf(line, sizeof(line), "CRTC allocation: %u output%s, %u TEST_ONLY, %u steps",
-                      n, n == 1 ? "" : "s", r.tests, r.steps);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.drm",
+                                         "CRTC allocation: {} output{}, {} TEST_ONLY, {} steps", n,
+                                         n == 1 ? "" : "s", r.tests, r.steps);
     }
     return {};
 }
@@ -4129,9 +4099,8 @@ void compositor_impl::release_sleep_delay(const char* why) {
         return;
     sleep_lock_deadline_ns_ = 0;
     logind_.release_sleep_inhibitor();
-    char line[96];
-    std::snprintf(line, sizeof(line), "sleep may proceed (%s)", why);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.lock",
+                                     "sleep may proceed ({})", why);
 }
 
 bool compositor_impl::output_dark(unsigned slot) const {
@@ -4251,13 +4220,11 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
     if (lock_.state() != logged_lock_state_) {
         const lock_state from = logged_lock_state_;
         logged_lock_state_ = lock_.state();
-        char line[128];
-        std::snprintf(line, sizeof(line), "session lock: %s -> %s", lock_state_name(from),
-                      lock_state_name(logged_lock_state_));
-        lx::trace::logger::global().log(logged_lock_state_ == lock_state::abandoned
-                                            ? lx::trace::level::warn
-                                            : lx::trace::level::info,
-                                        "compositor.lock", line);
+        lx::trace::logger::global().logf(
+            logged_lock_state_ == lock_state::abandoned ? lx::trace::level::warn
+                                                        : lx::trace::level::info,
+            "compositor.lock", "session lock: {} -> {}", lock_state_name(from),
+            lock_state_name(logged_lock_state_));
         if (logged_lock_state_ == lock_state::abandoned)
             lx::trace::logger::global().log(
                 lx::trace::level::warn, "compositor.lock",
@@ -4703,15 +4670,14 @@ void compositor_impl::render_add_output(const output_op& op) {
             }
             chosen = i;
             ok = true;
-            char line[224];
-            std::snprintf(line, sizeof(line),
-                          "output %u pipeline crtc=%u (index %u) primary=%u connector=%u "
-                          "mode=%ux%u@%u cursor_plane=%d tests=%u%s%s",
-                          slot, d.crtc_id, d.crtc_index, d.primary_plane_id, d.connector_id,
-                          m.width, m.height, m.refresh_mhz, cursor_plane, tests,
-                          i > 0 ? " (fallback mode)" : "",
-                          op.vrr ? (vrr ? " vrr" : " (vrr refused: off)") : "");
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm", line);
+            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.drm",
+                                             "output {} pipeline crtc={} (index {}) primary={} "
+                                             "connector={} mode={}x{}@{} cursor_plane={:d} "
+                                             "tests={}{}{}",
+                                             slot, d.crtc_id, d.crtc_index, d.primary_plane_id,
+                                             d.connector_id, m.width, m.height, m.refresh_mhz,
+                                             cursor_plane, tests, i > 0 ? " (fallback mode)" : "",
+                                             op.vrr ? (vrr ? " vrr" : " (vrr refused: off)") : "");
         }
         if (!ok)
             release_targets(*p);
@@ -5043,10 +5009,10 @@ bool compositor_impl::apply_mode_switch(output_pipeline& p, unsigned frame) {
         p.switch_ticket = 0;
     }
     if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "output %u switched to %ux%u@%u from frame %u", p.slot,
-                      p.switch_mode.width, p.switch_mode.height, p.switch_mode.refresh_mhz, frame);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.drm", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.drm",
+                                         "output {} switched to {}x{}@{} from frame {}", p.slot,
+                                         p.switch_mode.width, p.switch_mode.height,
+                                         p.switch_mode.refresh_mhz, frame);
     }
     return true;
 }
@@ -5102,9 +5068,8 @@ void compositor_impl::on_retired(unsigned slot, unsigned gen) {
         run_next_mgmt_job(); // a job may have waited for this slot
     }
     if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "output %u pipeline retired", slot);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.hotplug", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.hotplug",
+                                         "output {} pipeline retired", slot);
     }
 }
 
@@ -5146,10 +5111,9 @@ void compositor_impl::apply_connector_scan(const drm::connector_scan& scan, bool
         op.gen = ++slot_gen_[s];
         op.connector_gone = e == nullptr;
         post_output_op(op);
-        char line[96];
-        std::snprintf(line, sizeof(line), "output %u add cancelled (%s gone again)", s,
-                      pending_[s].probe.name);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.hotplug", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.hotplug",
+                                         "output {} add cancelled ({} gone again)", s,
+                                         pending_[s].probe.name);
     }
     // A connector that failed is tried again once it changed (or was unplugged), and at every
     // resume (a failure may have been the VT switch racing the test).
@@ -5264,11 +5228,10 @@ int compositor_impl::add_output_from(const drm::connector_probe& e, const connec
     op.transform = static_cast<lx::buffer_transform>(pd.transform & 7u);
     slot_phase_[s] = slot_phase::adding;
     post_output_op(op);
-    char line[160];
-    std::snprintf(line, sizeof(line), "output %u connecting name=%s preferred=%ux%u@%u modes=%u", s,
-                  e.name, pd.modes[0].width, pd.modes[0].height, pd.modes[0].refresh_mhz,
-                  e.mode_count);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.hotplug", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.hotplug",
+                                     "output {} connecting name={} preferred={}x{}@{} modes={}", s,
+                                     e.name, pd.modes[0].width, pd.modes[0].height,
+                                     pd.modes[0].refresh_mhz, e.mode_count);
     mark_heads_dirty();
     return slot;
 }
@@ -5302,12 +5265,10 @@ void compositor_impl::on_add_result(unsigned slot, unsigned gen, bool ok, unsign
             add_fallback_headless();
         if (failed_count_ < output_manager::k_max)
             failed_[failed_count_++] = {pd.probe.connector_id, mode_list_hash(pd.probe)};
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "output %s not enabled: no CRTC, or none of its %u modes passed "
-                      "TEST_ONLY — it stays off until it changes",
-                      pd.probe.name, pd.mode_count);
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug", line);
+        lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.hotplug",
+                                         "output {} not enabled: no CRTC, or none of its {} modes "
+                                         "passed TEST_ONLY — it stays off until it changes",
+                                         pd.probe.name, pd.mode_count);
         return;
     }
     const drm::kms_mode& m = pd.modes[mode_index < pd.mode_count ? mode_index : 0];
@@ -5386,13 +5347,11 @@ void compositor_impl::on_add_result(unsigned slot, unsigned gen, bool ok, unsign
     mark_heads_dirty();
     const output_state& o = outputs.slot_state(slot);
     const lx::rect2i l = o.logical_rect();
-    char line[448];
-    std::snprintf(line, sizeof(line),
-                  "output %u added name=%s identifier=\"%s\" mode=%dx%d@%u scale=%g "
-                  "logical=%dx%d+%d+%d windows_returned=%u",
-                  slot, o.name, o.identifier, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
-                  l.width, l.height, l.x, l.y, back);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
+                                     "output {} added name={} identifier=\"{}\" mode={}x{}@{} "
+                                     "scale={:g} logical={}x{}+{}+{} windows_returned={}",
+                                     slot, o.name, o.identifier, o.mode.width, o.mode.height,
+                                     o.refresh_mhz, o.scale, l.width, l.height, l.x, l.y, back);
     request_frame(1u << slot);
     run_next_mgmt_job();
 }
@@ -5437,11 +5396,10 @@ void compositor_impl::on_mode_tested(unsigned slot, unsigned gen, bool ok, unsig
         return;
     if (!ok) {
         const output_state& o = outputs.slot_state(slot);
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "output %u %s: no mode of its new list passed TEST_ONLY — staying at %dx%d",
-                      slot, o.name, o.mode.width, o.mode.height);
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug", line);
+        lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.hotplug",
+                                         "output {} {}: no mode of its new list passed TEST_ONLY "
+                                         "— staying at {}x{}",
+                                         slot, o.name, o.mode.width, o.mode.height);
         return;
     }
     const pending_output& pd = pending_[slot];
@@ -5473,10 +5431,9 @@ void compositor_impl::switch_output_mode(unsigned slot, const drm::kms_mode& mod
     }
     outputs.set_mode(slot, mode, follow, custom);
     outputs_changed_now();
-    char line[160];
-    std::snprintf(line, sizeof(line), "output %u mode %ux%u@%u (was %dx%d) — %s", slot, mode.width,
-                  mode.height, mode.refresh_mhz, was.width, was.height, why);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
+                                     "output {} mode {}x{}@{} (was {}x{}) — {}", slot, mode.width,
+                                     mode.height, mode.refresh_mhz, was.width, was.height, why);
     request_frame(1u << slot);
 }
 
@@ -5510,9 +5467,8 @@ void compositor_impl::add_fallback_headless() {
     // Windows stranded by an output that went while another was on its way, which then
     // failed to come up: the stand-in takes them in.
     (void)wm_.on_output_added(s);
-    char line[96];
-    std::snprintf(line, sizeof(line), "output %u HEADLESS-1 stands in (no display connected)", s);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
+                                     "output {} HEADLESS-1 stands in (no display connected)", s);
 }
 
 void compositor_impl::remove_output(unsigned slot, bool connector_gone, const char* why) {
@@ -5672,10 +5628,10 @@ void compositor_impl::sync_cursor_themes() {
         if (i == cursor_theme_count_)
             ++cursor_theme_count_;
         changed = true;
-        char line[160];
-        std::snprintf(line, sizeof(line), "cursor theme=%s size=%u scale=%u/120 (new output scale)",
-                      cursor_themes_[i].name(), cursor_themes_[i].size(), used[u]);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.cursor",
+                                         "cursor theme={} size={} scale={}/120 (new output scale)",
+                                         cursor_themes_[i].name(), cursor_themes_[i].size(),
+                                         used[u]);
     }
     if (!changed)
         return;
@@ -5923,11 +5879,11 @@ void compositor_impl::configure_outputs_at_start(const drm::connector_scan& scan
                                         "the first");
     }
     if (setup || outcfg_.config().monitor_count > 0) {
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "output configuration at start: %u monitor%s, setup %s, %u disabled", n,
-                      n == 1 ? "" : "s", setup ? "restored" : "new", disabled_count_);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.outputcfg", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.outputcfg",
+                                         "output configuration at start: {} monitor{}, setup {}, "
+                                         "{} disabled",
+                                         n, n == 1 ? "" : "s", setup ? "restored" : "new",
+                                         disabled_count_);
     }
     if (outputs.count() == 0)
         (void)outputs.add_virtual("HEADLESS-1", {0, 0, 1920, 1080}, 60000);
@@ -6620,14 +6576,13 @@ void compositor_impl::finish_mgmt_job(mgmt_result result, const char* why) {
     {
         char what[1024];
         describe_target(r.target, output_mgmt_heads(p0_), what, sizeof(what));
-        char line[1200];
-        std::snprintf(line, sizeof(line), "output configuration %s %s: %s (%s)",
-                      r.job.test ? "test" : "apply",
-                      result == mgmt_result::succeeded ? "succeeded"
-                      : result == mgmt_result::failed  ? "failed"
-                                                       : "cancelled",
-                      what[0] ? what : "-", why ? why : "");
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.outputcfg", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.outputcfg",
+                                         "output configuration {} {}: {} ({})",
+                                         r.job.test ? "test" : "apply",
+                                         result == mgmt_result::succeeded ? "succeeded"
+                                         : result == mgmt_result::failed  ? "failed"
+                                                                          : "cancelled",
+                                         what[0] ? what : "-", why ? why : "");
     }
     r.active = false;
     r.waiting = 0;
@@ -7206,12 +7161,11 @@ lx::result<void> compositor::start() {
         const output_state o0 = impl_->outputs.state(impl_->outputs.nth(0));
         const lx::rect2i g = o0.mode_rect();
         const lx::rect2i l = o0.logical_rect();
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "output 0 mode=%dx%d refresh_mhz=%u scale=%g (%ld/120) logical=%dx%d",
-                      g.width, g.height, o0.refresh_mhz, o0.scale, std::lround(o0.scale * 120.0),
-                      l.width, l.height);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
+                                         "output 0 mode={}x{} refresh_mhz={} scale={:g} ({}/120) "
+                                         "logical={}x{}",
+                                         g.width, g.height, o0.refresh_mhz, o0.scale,
+                                         std::lround(o0.scale * 120.0), l.width, l.height);
     }
     impl_->log_outputs();
     impl_->output_generation_ = impl_->outputs.generation();
@@ -7255,12 +7209,12 @@ lx::result<void> compositor::start() {
             impl->cursor_themes_[i].load(nullptr, px > 0 ? static_cast<unsigned>(px) : base);
             if (impl->cursor_themes_[i].max_dimension() > need)
                 need = impl->cursor_themes_[i].max_dimension();
-            char line[192];
-            std::snprintf(line, sizeof(line),
-                          "cursor theme=%s size=%u scale=%u/120 from_theme=%u builtin=%u",
-                          impl->cursor_themes_[i].name(), impl->cursor_themes_[i].size(), scales[i],
-                          impl->cursor_themes_[i].from_theme(), impl->cursor_themes_[i].builtin());
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
+            lx::trace::logger::global().logf(
+                lx::trace::level::info, "compositor.cursor",
+                "cursor theme={} size={} scale={}/120 from_theme={} "
+                "builtin={}",
+                impl->cursor_themes_[i].name(), impl->cursor_themes_[i].size(), scales[i],
+                impl->cursor_themes_[i].from_theme(), impl->cursor_themes_[i].builtin());
         }
         impl->cursor_theme_count_ = n;
         impl->cursor_base_px_ = base;
@@ -7439,10 +7393,9 @@ lx::result<void> compositor::start() {
         const bool worker = impl_->cfg.worker_thread_count > 0;
         if (auto monitor = impl_->hotplug_.start(impl_->kms, card, impl_->loop, worker, host);
             monitor) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "hotplug: udev monitor on drm %u:%u", impl_->drm_major_,
-                          impl_->drm_minor_);
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.hotplug", line);
+            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.hotplug",
+                                             "hotplug: udev monitor on drm {}:{}",
+                                             impl_->drm_major_, impl_->drm_minor_);
         } else {
             lx::trace::logger::global().log_error(monitor.get_error(), "compositor.hotplug");
             lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug",
@@ -7534,12 +7487,12 @@ lx::result<void> compositor::start() {
     // The pause/resume machine runs only where there is a display to lose. Starting while
     // the session is in the background pauses right away (input is held until the switch).
     {
-        char line[160];
-        std::snprintf(line, sizeof(line), "session %s vt=%u can_switch_vt=%d active=%d drm=%u:%u",
-                      impl_->logind_.session_id()[0] ? impl_->logind_.session_id() : "-",
-                      impl_->logind_.vt_number(), impl_->logind_.can_switch_vt() ? 1 : 0,
-                      impl_->logind_.is_active() ? 1 : 0, impl_->drm_major_, impl_->drm_minor_);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::info, "compositor.session",
+            "session {} vt={} can_switch_vt={} active={} drm={}:{}",
+            impl_->logind_.session_id()[0] ? impl_->logind_.session_id() : "-",
+            impl_->logind_.vt_number(), impl_->logind_.can_switch_vt() ? 1 : 0,
+            impl_->logind_.is_active() ? 1 : 0, impl_->drm_major_, impl_->drm_minor_);
         impl_->apply_session_actions(impl_->session_.init(
             impl_->drm_present_, impl_->drm_major_, impl_->drm_minor_, impl_->drm_start_inactive_));
     }
@@ -7800,12 +7753,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
                                         : detail::compositor_impl::k_callback_stall_ns);
             if (!kms_output || o.present_completed || stalled) {
                 if (stalled && !o.present_completed && kms_output) {
-                    char line[96];
-                    std::snprintf(line, sizeof(line),
-                                  "no present in 250ms on output %u — pacing frame callbacks by "
-                                  "tick",
-                                  slot);
-                    lx::trace::logger::global().log(lx::trace::level::warn, "compositor", line);
+                    lx::trace::logger::global().logf(lx::trace::level::warn, "compositor",
+                                                     "no present in 250ms on output {} — pacing "
+                                                     "frame callbacks by tick",
+                                                     slot);
                 }
                 o.present_completed = false;
                 o.last_callback_ns = tick.timestamp_ns;
@@ -8032,12 +7983,11 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     }
     if (++impl->ui_budget_window_ >= detail::compositor_impl::k_budget_report_frames) {
         if (impl->ui_over_budget_ > 0) {
-            char line[96];
-            std::snprintf(line, sizeof(line),
-                          "tick_ui over budget in recent frames (%u of %u, worst %u us)",
-                          impl->ui_over_budget_, impl->ui_budget_window_,
-                          impl->ui_over_budget_max_us_);
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor", line);
+            lx::trace::logger::global().logf(lx::trace::level::warn, "compositor",
+                                             "tick_ui over budget in recent frames ({} of {}, "
+                                             "worst {} us)",
+                                             impl->ui_over_budget_, impl->ui_budget_window_,
+                                             impl->ui_over_budget_max_us_);
         }
         impl->ui_over_budget_ = 0;
         impl->ui_over_budget_max_us_ = 0;
@@ -8232,14 +8182,13 @@ void compositor::tick_render() {
             if (!composited[slot] && kind[0] == 'n')
                 continue;
             const detail::output_pipeline* p = impl->pipes_[slot].get();
-            char line[192];
-            std::snprintf(line, sizeof(line),
-                          "frame=%lld composite=%d rects=%u area=%llu commit=%s render_us=%u "
-                          "output=%u",
-                          p ? p->rendered_frame.load(std::memory_order_relaxed) : -1LL,
-                          composited[slot] ? 1 : 0, rects[slot], areas[slot], kind,
-                          p ? p->render_cost_us.load(std::memory_order_relaxed) : 0u, slot);
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.render", line);
+            lx::trace::logger::global().logf(
+                lx::trace::level::debug, "compositor.render",
+                "frame={} composite={} rects={} area={} commit={} "
+                "render_us={} output={}",
+                p ? p->rendered_frame.load(std::memory_order_relaxed) : -1LL,
+                composited[slot] ? 1 : 0, rects[slot], areas[slot], kind,
+                p ? p->render_cost_us.load(std::memory_order_relaxed) : 0u, slot);
         }
     }
 }
@@ -8727,12 +8676,10 @@ void compositor_impl::commit_pending_modesets(const char** kinds) {
             // A content commit that is also the modeset (the frame rides it).
             kinds[p.slot] = "content";
             if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-                char line[128];
-                std::snprintf(line, sizeof(line), "modeset output=%u frame=%u outputs=%u%s",
-                              p.slot, p.composited_frame, fallback ? 1u : ready,
-                              fallback ? " (alone)" : "");
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.drm",
-                                                line);
+                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.drm",
+                                                 "modeset output={} frame={} outputs={}{}", p.slot,
+                                                 p.composited_frame, fallback ? 1u : ready,
+                                                 fallback ? " (alone)" : "");
             }
         } else {
             kinds[p.slot] = lost ? "paused" : "failed";

@@ -1,7 +1,8 @@
 // DRM/KMS device enumeration smoke test. Uses the host card when accessible;
 // otherwise verifies typed errors (never silent success).
-#include <cstdio>
+#include <stdio.h>
 
+import std;
 import lx.foundation;
 import lx.drm;
 

@@ -1,8 +1,5 @@
 module;
 
-#include <cstdint>
-#include <cstdio>
-
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
@@ -15,6 +12,8 @@ import lx.trace;
 import lx.wayland.server;
 
 export module lx.compositor:shell_bridge;
+
+import std;
 
 import :toplevel;
 import :toplevel_icon;
@@ -307,10 +306,9 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
         if (server_)
             if (auto* conn = server_->find_client_by_native(wl_resource_get_client(bridge)))
                 cid = conn->id();
-        char line[128];
-        std::snprintf(line, sizeof(line), "bridge bound client=%u snapshot=%u focus=%llu", cid,
-                      index, rec && rec->shell_handle ? rec->id.id() : 0ull);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.shell", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.shell",
+                                         "bridge bound client={} snapshot={} focus={}", cid, index,
+                                         rec && rec->shell_handle ? rec->id.id() : 0ull);
     }
 #else
     (void)resource;

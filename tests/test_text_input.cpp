@@ -6,10 +6,7 @@
 // UTF-8-safe truncation. Pure: the sink records every event as text.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstring>
-#include <string>
-
+import std;
 import lx.foundation;
 import lx.compositor;
 

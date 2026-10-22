@@ -1,8 +1,6 @@
-module;
-
-#include <cstdio>
-
 export module lx.foundation:error;
+
+import std;
 
 export import :result;
 
