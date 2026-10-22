@@ -8,14 +8,10 @@
 //
 //   bench_composite [width height]
 
-#include <chrono>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <vector>
 #include <fcntl.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.gfx;
 

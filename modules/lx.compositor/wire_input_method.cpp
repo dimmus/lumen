@@ -37,11 +37,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <new>
-#include <utility>
+#include <stdint.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -56,8 +52,11 @@ module;
 #define LUMEN_HAS_VIRTUAL_KEYBOARD 1
 #endif
 #endif
+#include <time.h>
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -82,6 +81,11 @@ namespace {
 
 void ime_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, "compositor.ime", line);
+}
+
+template <typename... Args>
+void ime_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, "compositor.ime", fmt, std::forward<Args>(args)...);
 }
 
 [[nodiscard]] lx::compositor::text_input_relay* relay() {
@@ -219,10 +223,8 @@ void im_grab_keyboard(struct wl_client* client, struct wl_resource* im_res, uint
     ops.modifiers = &grab_send_modifiers;
     g_p0_ctx->input->set_im_grab(ops, *g_p0_ctx->seat);
     if (ime_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "input method grab keyboard routing=%d",
-                      g_p0_ctx->input->im_routing_active() ? 1 : 0);
-        ime_log(lx::trace::level::debug, line);
+        ime_log(lx::trace::level::debug, "input method grab keyboard routing={}",
+                g_p0_ctx->input->im_routing_active() ? 1 : 0);
     }
 }
 
@@ -305,16 +307,13 @@ const struct zwp_input_method_v2_interface im_impl = {
     .commit_string =
         [](struct wl_client*, struct wl_resource* r, const char* text) {
             if (auto* im = im_from(r); im && relay())
-                relay()->im_commit_string(im->record, text,
-                                          text ? static_cast<unsigned>(std::strlen(text)) : 0u);
+                relay()->im_commit_string(im->record, text ? text : "");
         },
     .set_preedit_string =
         [](struct wl_client*, struct wl_resource* r, const char* text, int32_t begin,
            int32_t end) {
             if (auto* im = im_from(r); im && relay())
-                relay()->im_preedit(im->record, text,
-                                    text ? static_cast<unsigned>(std::strlen(text)) : 0u, begin,
-                                    end);
+                relay()->im_preedit(im->record, text ? text : "", begin, end);
         },
     .delete_surrounding_text =
         [](struct wl_client*, struct wl_resource* r, uint32_t before, uint32_t after) {
@@ -327,11 +326,9 @@ const struct zwp_input_method_v2_interface im_impl = {
             if (!im || !relay())
                 return;
             if (ime_debug() && im->record.live && serial != im->record.dones) {
-                char line[96];
-                std::snprintf(line, sizeof(line),
-                              "input method commit serial=%u stale (dones=%u): dropped", serial,
-                              im->record.dones);
-                ime_log(lx::trace::level::debug, line);
+                ime_log(lx::trace::level::debug,
+                        "input method commit serial={} stale (dones={}): dropped", serial,
+                        im->record.dones);
             }
             relay()->im_commit(im->record, serial);
         },
@@ -447,11 +444,9 @@ void ev_popup_show(void*, void* popup, void* surface, lx::point2i origin) {
         tree->sync_scene(s->id, "ime-popup");
     }
     if (ime_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "ime popup show surface=%llu popup=%u x=%d y=%d %dx%d",
-                      s->id.id(), wl_resource_get_id(static_cast<wl_resource*>(popup)), origin.x,
-                      origin.y, s->surface_size.width, s->surface_size.height);
-        ime_log(lx::trace::level::debug, line);
+        ime_log(lx::trace::level::debug, "ime popup show surface={} popup={} x={} y={} {}x{}",
+                s->id.id(), wl_resource_get_id(static_cast<wl_resource*>(popup)), origin.x,
+                origin.y, s->surface_size.width, s->surface_size.height);
     }
 }
 
@@ -462,9 +457,7 @@ void ev_popup_hide(void*, void*, void* surface) {
         return;
     tree->unmap_root(s->id);
     if (ime_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "ime popup hide surface=%llu", s->id.id());
-        ime_log(lx::trace::level::debug, line);
+        ime_log(lx::trace::level::debug, "ime popup hide surface={}", s->id.id());
     }
 }
 
@@ -473,10 +466,8 @@ void ev_popup_rect(void*, void* popup, lx::rect2i rect) {
         zwp_input_popup_surface_v2_send_text_input_rectangle(r, rect.x, rect.y, rect.width,
                                                              rect.height);
         if (ime_debug()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "ime popup text_input_rectangle %d,%d %dx%d",
-                          rect.x, rect.y, rect.width, rect.height);
-            ime_log(lx::trace::level::debug, line);
+            ime_log(lx::trace::level::debug, "ime popup text_input_rectangle {},{} {}x{}", rect.x,
+                    rect.y, rect.width, rect.height);
         }
     }
 }
@@ -596,10 +587,8 @@ void vk_keymap(struct wl_client*, struct wl_resource* r, uint32_t format, int32_
     vk->keymap.fd = vk->fd.get();
     vk->keymap.size = out_size;
     if (ime_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "virtual keyboard keymap %u bytes differs from the seat's",
-                      out_size);
-        ime_log(lx::trace::level::debug, line);
+        ime_log(lx::trace::level::debug, "virtual keyboard keymap {} bytes differs from the seat's",
+                out_size);
     }
 }
 
@@ -710,9 +699,7 @@ void bind_virtual_keyboard_manager(wayland::client_connection& client, unsigned 
 
 // ── installation and the wl_surface hooks ────────────────────────────────────
 
-namespace {
-
-void focus_hook(void*, void* surface, void* client, void* destroyed) {
+void text_input_focus_hook(void*, void* surface, void* client, void* destroyed) {
     auto* rl = relay();
     if (!rl)
         return;
@@ -721,8 +708,6 @@ void focus_hook(void*, void* surface, void* client, void* destroyed) {
     else
         rl->keyboard_focus(surface, client);
 }
-
-} // namespace
 
 void install_text_input(p0_protocol_context& ctx) {
     if (!ctx.text_input)
@@ -744,10 +729,10 @@ void install_text_input(p0_protocol_context& ctx) {
     sink.popup_rect = &ev_popup_rect;
 #endif
     ctx.text_input->set_sink(sink);
-    if (ctx.input) {
-        ctx.input->set_focus_surface_hook(&focus_hook, &ctx);
+    // The router's focus-surface hook is wire_install.cpp's, which calls
+    // `text_input_focus_hook` (and keyboard-shortcuts-inhibit's).
+    if (ctx.input)
         ctx.input->set_seat_keymap_source(&seat_keymap);
-    }
 }
 
 void input_popup_committed(surface_obj* s) {

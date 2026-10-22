@@ -3,14 +3,10 @@
 // mask, inherited fds of the launched process).
 #include "lumen_test.hpp"
 
-#include <cerrno>
-#include <climits>
-#include <csignal>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <string_view>
+#include <errno.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -18,6 +14,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.shell;
 
@@ -63,7 +60,7 @@ bool wait_outcome(lx::shell::app_launcher& l, outcome_log& log, unsigned want) {
         int timeout = 20;
         const unsigned n = l.poll_fds(fds, lx::shell::app_launcher::k_max_poll, timeout);
         (void)poll(fds, n, timeout);
-        l.dispatch(fds, n);
+        l.dispatch({fds, n});
     }
     return log.count >= want;
 }
@@ -402,7 +399,7 @@ LUMEN_TEST(systemd_scope_holds_the_process_until_it_is_in_its_scope) {
         int timeout = 20;
         const unsigned n = l.poll_fds(fds, lx::shell::app_launcher::k_max_poll, timeout);
         (void)poll(fds, n, timeout);
-        l.dispatch(fds, n);
+        l.dispatch({fds, n});
     }
     LUMEN_CHECK(l.pending() == 0);
     (void)std::system(("rm -rf '" + g_root + "'").c_str());

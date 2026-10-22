@@ -26,9 +26,8 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <ctime>
+#include <stdint.h>
+#include <time.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -43,6 +42,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -72,6 +73,11 @@ void idle_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, "compositor.idle", line);
 }
 
+template <typename... Args>
+void idle_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, "compositor.idle", fmt, std::forward<Args>(args)...);
+}
+
 /// The tracker's next deadline may have moved, or inhibition must be looked at again.
 void changed() {
     if (g_p0_ctx && g_p0_ctx->idle_changed)
@@ -90,10 +96,7 @@ void send_idled(void*, void* resource) {
         return;
     ext_idle_notification_v1_send_idled(r);
     if (idle_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "idle notification idled id=%u",
-                      wl_resource_get_id(r));
-        idle_log(lx::trace::level::debug, line);
+        idle_log(lx::trace::level::debug, "idle notification idled id={}", wl_resource_get_id(r));
     }
 }
 
@@ -103,10 +106,7 @@ void send_resumed(void*, void* resource) {
         return;
     ext_idle_notification_v1_send_resumed(r);
     if (idle_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "idle notification resumed id=%u",
-                      wl_resource_get_id(r));
-        idle_log(lx::trace::level::debug, line);
+        idle_log(lx::trace::level::debug, "idle notification resumed id={}", wl_resource_get_id(r));
     }
 }
 
@@ -159,12 +159,10 @@ void create_notification(struct wl_client* client, struct wl_resource* notifier,
         return;
     }
     if (idle_debug()) {
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "idle notification create id=%u timeout_ms=%u obey_inhibitors=%d "
-                      "count=%u inhibited=%d",
-                      id, timeout_ms, obey ? 1 : 0, t->count(), t->inhibited() ? 1 : 0);
-        idle_log(lx::trace::level::debug, line);
+        idle_log(lx::trace::level::debug,
+                 "idle notification create id={} timeout_ms={} obey_inhibitors={} count={} "
+                 "inhibited={}",
+                 id, timeout_ms, obey ? 1 : 0, t->count(), t->inhibited() ? 1 : 0);
     }
     changed();
 }
@@ -195,10 +193,8 @@ void inhibitor_destroy_resource(wl_resource* r) {
         g_p0_ctx->inhibitors->remove(r);
         if (g_p0_ctx->inhibitors->count() != before) {
             if (idle_debug()) {
-                char line[96];
-                std::snprintf(line, sizeof(line), "idle inhibitor destroy id=%u count=%u",
-                              wl_resource_get_id(r), g_p0_ctx->inhibitors->count());
-                idle_log(lx::trace::level::debug, line);
+                idle_log(lx::trace::level::debug, "idle inhibitor destroy id={} count={}",
+                         wl_resource_get_id(r), g_p0_ctx->inhibitors->count());
             }
             changed();
         }
@@ -233,10 +229,8 @@ void create_inhibitor(struct wl_client* client, struct wl_resource* manager, uin
         return;
     }
     if (idle_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "idle inhibitor create id=%u surface=%llu count=%u",
-                      id, static_cast<unsigned long long>(s->id.id()), set->count());
-        idle_log(lx::trace::level::debug, line);
+        idle_log(lx::trace::level::debug, "idle inhibitor create id={} surface={} count={}", id,
+                 static_cast<unsigned long long>(s->id.id()), set->count());
     }
     changed();
 }

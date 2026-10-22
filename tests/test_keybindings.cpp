@@ -4,8 +4,7 @@
 // happened while it was held). Pure, plus a real xkb keymap for the layout cases.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-
+import std;
 import lx.compositor;
 import lx.input;
 
@@ -91,7 +90,9 @@ LUMEN_TEST(grab_refusals) {
                 key_grab_refusal::reserved);
     // Invalid: unknown bits, a tap that is not a bare modifier.
     LUMEN_CHECK(kb.add_grab(keysyms::return_key, 0x10, 0, A) == key_grab_refusal::invalid);
-    LUMEN_CHECK(kb.add_grab(keysyms::return_key, 0, 0x2, A) == key_grab_refusal::invalid);
+    LUMEN_CHECK(kb.add_grab(keysyms::return_key, 0, 0x4, A) == key_grab_refusal::invalid);
+    // Super+Escape: the escape hatch from a client that inhibits shortcuts.
+    LUMEN_CHECK(kb.add_grab(keysyms::escape, key_mod_super, 0, A) == key_grab_refusal::reserved);
     LUMEN_CHECK(kb.add_grab(keysyms::return_key, 0, key_grab_tap, A) == key_grab_refusal::invalid);
     LUMEN_CHECK(kb.add_grab(keysyms::super_l, key_mod_super, key_grab_tap, A) ==
                 key_grab_refusal::invalid);
@@ -123,6 +124,47 @@ LUMEN_TEST(grab_matches_exact_modifiers) {
     // Tap grabs are not taken by match_grab.
     LUMEN_CHECK(kb.add_grab(keysyms::super_l, 0, key_grab_tap, B) == key_grab_refusal::none);
     LUMEN_CHECK(!kb.match_grab(press(k_key_leftmeta, keysyms::super_l, key_mod_super)).consume);
+}
+
+LUMEN_TEST(inhibited_skips_grabs_but_not_inhibitable) {
+    keybindings kb{};
+    LUMEN_CHECK(kb.add_grab(keysyms::return_key, key_mod_super, 0, A) == key_grab_refusal::none);
+    // The lock key: v6 not_inhibitable.
+    LUMEN_CHECK(kb.add_grab('l', key_mod_super, key_grab_not_inhibitable, B) ==
+                key_grab_refusal::none);
+    LUMEN_CHECK(kb.add_grab(keysyms::super_l, 0, key_grab_tap, C) == key_grab_refusal::none);
+    // Inhibited: Super+Return goes to the client, Super+L still locks.
+    LUMEN_CHECK(!kb.match_grab(press(k_key_enter, keysyms::return_key, key_mod_super), true).consume);
+    const key_decision l = kb.match_grab(press(38, 'l', key_mod_super), true);
+    LUMEN_CHECK(l.consume && l.grab == B);
+    // The Super tap neither arms nor fires while inhibited.
+    LUMEN_CHECK(kb.observe_tap(press(k_key_leftmeta, keysyms::super_l, key_mod_super), true) ==
+                nullptr);
+    LUMEN_CHECK(!kb.tap_armed());
+    LUMEN_CHECK(kb.observe_tap(release(k_key_leftmeta, keysyms::super_l), true) == nullptr);
+    // Not inhibited: as before.
+    LUMEN_CHECK(kb.match_grab(press(k_key_enter, keysyms::return_key, key_mod_super)).consume);
+    (void)kb.observe_tap(press(k_key_leftmeta, keysyms::super_l, key_mod_super));
+    LUMEN_CHECK(kb.observe_tap(release(k_key_leftmeta, keysyms::super_l)) == C);
+    // A not_inhibitable tap arms while inhibited.
+    keybindings kb2{};
+    LUMEN_CHECK(kb2.add_grab(keysyms::super_l, 0, key_grab_tap | key_grab_not_inhibitable, A) ==
+                key_grab_refusal::none);
+    (void)kb2.observe_tap(press(k_key_leftmeta, keysyms::super_l, key_mod_super), true);
+    LUMEN_CHECK(kb2.observe_tap(release(k_key_leftmeta, keysyms::super_l), true) == A);
+}
+
+LUMEN_TEST(escape_hatch_is_exactly_super_escape) {
+    constexpr unsigned k_key_esc = 1;
+    LUMEN_CHECK(keybindings::escape_hatch(press(k_key_esc, keysyms::escape, key_mod_super)));
+    LUMEN_CHECK(!keybindings::escape_hatch(release(k_key_esc, keysyms::escape, key_mod_super)));
+    LUMEN_CHECK(!keybindings::escape_hatch(press(k_key_esc, keysyms::escape)));
+    LUMEN_CHECK(!keybindings::escape_hatch(
+        press(k_key_esc, keysyms::escape, key_mod_super | key_mod_shift)));
+    // Not an internal binding by itself: whether it acts is the compositor's (an inhibitor or
+    // a pointer constraint on the focused surface).
+    LUMEN_CHECK(!keybindings::internal(press(k_key_esc, keysyms::escape, key_mod_super), true, 1)
+                     .consume);
 }
 
 LUMEN_TEST(no_grab_or_tap_while_locked) {

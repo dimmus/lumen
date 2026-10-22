@@ -19,11 +19,8 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cmath>
-#include <cstdint>
-#include <ctime>
-#include <cstdio>
-#include <new>
+#include <stdint.h>
+#include <time.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -33,6 +30,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -104,6 +103,12 @@ template <class T> void list_unlink(T*& head, T* n) {
 
 void out_log(const char* line) {
     lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+}
+
+template <typename... Args>
+void out_log(std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_category, fmt,
+                                     std::forward<Args>(args)...);
 }
 
 lx::compositor::output_manager* outputs() {
@@ -213,11 +218,8 @@ void update_membership(surface_obj* s, std::uint32_t mask, int primary) {
             ++sent;
         }
         if (surface_debug()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "output %s surface=%llu output=%u client=%u resources=%u",
-                          enter ? "enter" : "leave", s->id.id(), slot, wire_client_id(client),
-                          sent);
-            out_log(line);
+            out_log("output {} surface={} output={} client={} resources={}",
+                    enter ? "enter" : "leave", s->id.id(), slot, wire_client_id(client), sent);
         }
     }
     // Recomputed only while the surface is on an output: one that left them all keeps
@@ -252,10 +254,8 @@ void update_membership(surface_obj* s, std::uint32_t mask, int primary) {
     (void)transform;
 #endif
     if (changed && surface_debug()) {
-        char line[112];
-        std::snprintf(line, sizeof(line), "output preferred surface=%llu scale=%d transform=%u",
-                      s->id.id(), s->pref_scale, s->pref_transform);
-        out_log(line);
+        out_log("output preferred surface={} scale={} transform={}", s->id.id(), s->pref_scale,
+                s->pref_transform);
     }
 }
 
@@ -351,13 +351,10 @@ const struct zxdg_output_manager_v1_interface xdg_output_manager_impl = {
                 send_output_done(output);
             if (surface_debug()) {
                 const lx::rect2i l = logical_rect(o);
-                char line[192];
-                std::snprintf(line, sizeof(line),
-                              "xdg-output create client=%u output=%u version=%d x=%d y=%d w=%d "
-                              "h=%d name=%s",
-                              wire_client_id(client), x->output->slot, version, l.x, l.y,
-                              l.width, l.height, o.name);
-                out_log(line);
+                out_log("xdg-output create client={} output={} version={} x={} y={} w={} h={} "
+                        "name={}",
+                        wire_client_id(client), x->output->slot, version, l.x, l.y, l.width,
+                        l.height, o.name);
             }
         },
 };
@@ -469,11 +466,8 @@ void bind_output_ex(wayland::client_connection& client, unsigned id, int version
         ++replayed;
     }
     if (surface_debug()) {
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "output bind client=%u output=%u version=%d name=%s replayed=%u",
-                      client.id(), o->slot, version, st.name, replayed);
-        out_log(line);
+        out_log("output bind client={} output={} version={} name={} replayed={}", client.id(),
+                o->slot, version, st.name, replayed);
     }
 }
 
@@ -530,9 +524,7 @@ bool sync_globals() {
             g_p0_ctx->server->remove_global(g.handle, now);
             make_inert(slot, g.id);
             if (surface_debug()) {
-                char line[96];
-                std::snprintf(line, sizeof(line), "output global remove output=%u", slot);
-                out_log(line);
+                out_log("output global remove output={}", slot);
             }
             g = {};
             changed = true;
@@ -548,10 +540,7 @@ bool sync_globals() {
                                                         .interface_desc = &wl_output_interface},
                                                        &bind_output_ex, &g);
             if (surface_debug()) {
-                char line[128];
-                std::snprintf(line, sizeof(line), "output global add output=%u name=%s", slot,
-                              om->slot_state(slot).name);
-                out_log(line);
+                out_log("output global add output={} name={}", slot, om->slot_state(slot).name);
             }
             changed = true;
         }

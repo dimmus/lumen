@@ -1,16 +1,14 @@
 // lumen-shell's desktop-entry parser and Exec expansion (Desktop Entry Specification 1.5).
 #include "lumen_test.hpp"
 
-#include <climits>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <string>
-#include <string_view>
+#include <limits.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <sys/stat.h>
 #include <unistd.h>
 
+import std;
 import lx.foundation;
 import lx.shell;
 

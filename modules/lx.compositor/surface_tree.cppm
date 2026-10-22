@@ -1,13 +1,14 @@
 module;
 
-#include <cstdio>
-#include <cstring>
+#include <stdio.h>
 
 import lx.foundation;
 import lx.trace;
 import lx.scene;
 
 export module lx.compositor:surface_tree;
+
+import std;
 
 import :surface;
 
@@ -64,6 +65,17 @@ struct tree_order {
                 return false;
         return true;
     }
+};
+
+/// A parent's cached child state (its children's cached positions and its cached order),
+/// moved out of the tree while a content update that carries it waits in the queue
+/// (`surface_tree::take_cached_child_state`), and put back when that update is applied.
+struct tree_child_state {
+    bool order_set = false;
+    tree_order order{};
+    unsigned count = 0;
+    lx::surface_id ids[k_tree_max_children]{};
+    lx::point2i pos[k_tree_max_children]{};
 };
 
 /// The surface of a tree under a point, from `surface_tree::hit`.
@@ -145,6 +157,11 @@ public:
     /// The parent's cached state is being applied: cached positions and order become
     /// current.
     void apply_child_state(lx::surface_id parent);
+    /// Moves the parent's cached child state into `out` (a queued update carries it) and
+    /// clears it; `put_cached_child_state` makes a carried state the cached one again (for
+    /// `apply_child_state`, or to restore what was stashed around a queued apply).
+    void take_cached_child_state(lx::surface_id parent, tree_child_state& out);
+    void put_cached_child_state(lx::surface_id parent, const tree_child_state& in);
     /// Effectively synchronized children (every linked child, in pending order), whose
     /// cached state is applied together with the parent's.
     [[nodiscard]] unsigned sync_children(lx::surface_id parent, lx::surface_id* out,
@@ -261,8 +278,11 @@ private:
         lx::point2i origin{};
     };
 
-    [[nodiscard]] entry* find(lx::surface_id id);
-    [[nodiscard]] const entry* find(lx::surface_id id) const;
+    /// `entry*`, or `const entry*` on a const tree.
+    [[nodiscard]] auto find(this auto& self, lx::surface_id id) -> decltype(&self.entries_[0]) {
+        const int slot = self.index_.find(id.id());
+        return slot >= 0 ? &self.entries_[static_cast<unsigned>(slot)] : nullptr;
+    }
 
     template<class Fn>
     void preorder(lx::surface_id id, Fn& fn, unsigned depth) const {
@@ -292,6 +312,8 @@ private:
     void bbox_walk(const entry& e, lx::point2i origin, unsigned depth, long long& x0,
                    long long& y0, long long& x1, long long& y1, bool& any) const;
     void log_line(const char* category, const char* line) const;
+    template <typename... Args>
+    void log_line(const char* category, std::format_string<Args...> fmt, Args&&... args) const;
     [[nodiscard]] bool debug() const;
 
     surface_manager* surfaces_ = nullptr;
@@ -303,8 +325,7 @@ private:
     entry entries_[k_tree_max_surfaces]{};
     id_slot_index<k_tree_max_surfaces * 2> index_{};
     /// sync_scene scratch: the root's mapped surfaces in paint order.
-    paint_item paint_[k_tree_max_surfaces]{};
-    unsigned paint_count_ = 0;
+    std::inplace_vector<paint_item, k_tree_max_surfaces> paint_{};
     bool warned_layer_full_ = false;
 };
 
@@ -348,23 +369,19 @@ constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
 
 // ── lookup ─────────────────────────────────────────────────────────────────
 
-lx::compositor::surface_tree::entry* lx::compositor::surface_tree::find(lx::surface_id id) {
-    const int slot = index_.find(id.id());
-    return slot >= 0 ? &entries_[static_cast<unsigned>(slot)] : nullptr;
-}
-
-const lx::compositor::surface_tree::entry*
-lx::compositor::surface_tree::find(lx::surface_id id) const {
-    const int slot = index_.find(id.id());
-    return slot >= 0 ? &entries_[static_cast<unsigned>(slot)] : nullptr;
-}
-
 bool lx::compositor::surface_tree::debug() const {
     return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
 }
 
 void lx::compositor::surface_tree::log_line(const char* category, const char* line) const {
     lx::trace::logger::global().log(lx::trace::level::debug, category, line);
+}
+
+template <typename... Args>
+void lx::compositor::surface_tree::log_line(const char* category, std::format_string<Args...> fmt,
+                                            Args&&... args) const {
+    lx::trace::logger::global().logf(lx::trace::level::debug, category, fmt,
+                                     std::forward<Args>(args)...);
 }
 
 // ── membership ─────────────────────────────────────────────────────────────
@@ -405,10 +422,7 @@ void lx::compositor::surface_tree::drop_one(entry& e, const char* reason) {
         scene_->note_damage(surfaces_->node_rect(e.id));
     surfaces_->drop_node(e.id);
     if (reason && e.parent && debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "subsurface unmap surface=%llu reason=%s", e.id.id(),
-                      reason);
-        log_line(k_surface_category, line);
+        log_line(k_surface_category, "subsurface unmap surface={} reason={}", e.id.id(), reason);
     }
     if (unmap_hook_)
         unmap_hook_(unmap_user_, e.id);
@@ -599,6 +613,64 @@ void lx::compositor::surface_tree::cache_child_state(lx::surface_id parent) {
     }
 }
 
+void lx::compositor::surface_tree::take_cached_child_state(lx::surface_id parent,
+                                                           tree_child_state& out) {
+    out.order_set = false;
+    out.count = 0;
+    entry* p = find(parent);
+    if (!p)
+        return;
+    for (unsigned i = 0; i < p->order_pending.count && out.count < k_tree_max_children; ++i) {
+        const lx::surface_id cid = p->order_pending.ids[i];
+        if (cid == parent)
+            continue;
+        entry* c = find(cid);
+        if (!c || !(c->parent == parent) || !c->pos_cached_set)
+            continue;
+        out.ids[out.count] = cid;
+        out.pos[out.count] = c->pos_cached;
+        ++out.count;
+        c->pos_cached_set = false;
+    }
+    if (p->order_cached_dirty) {
+        out.order = p->order_cached;
+        out.order_set = true;
+        p->order_cached_dirty = false;
+    }
+}
+
+void lx::compositor::surface_tree::put_cached_child_state(lx::surface_id parent,
+                                                          const tree_child_state& in) {
+    entry* p = find(parent);
+    if (!p)
+        return;
+    // Replaces whatever is cached now (the caller took it out first).
+    for (unsigned i = 0; i < p->order_pending.count; ++i) {
+        entry* c = find(p->order_pending.ids[i]);
+        if (c && c->parent == parent && !(c->id == parent))
+            c->pos_cached_set = false;
+    }
+    for (unsigned i = 0; i < in.count; ++i) {
+        entry* c = find(in.ids[i]);
+        if (!c || !(c->parent == parent))
+            continue; // unlinked or re-parented since: its old position means nothing now
+        c->pos_cached = in.pos[i];
+        c->pos_cached_set = true;
+    }
+    p->order_cached_dirty = in.order_set;
+    if (in.order_set) {
+        // Children that left since the order was cached are dropped from it.
+        tree_order o{};
+        for (unsigned i = 0; i < in.order.count; ++i) {
+            const lx::surface_id id = in.order.ids[i];
+            const entry* c = find(id);
+            if (id == parent || (c && c->parent == parent))
+                o.ids[o.count++] = id;
+        }
+        p->order_cached = o;
+    }
+}
+
 void lx::compositor::surface_tree::apply_child_state(lx::surface_id parent) {
     entry* p = find(parent);
     if (!p)
@@ -617,10 +689,8 @@ void lx::compositor::surface_tree::apply_child_state(lx::surface_id parent) {
         c->pos = c->pos_cached;
         changed = true;
         if (debug()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "subsurface position surface=%llu x=%d y=%d",
-                          cid.id(), c->pos.x, c->pos.y);
-            log_line(k_surface_category, line);
+            log_line(k_surface_category, "subsurface position surface={} x={} y={}", cid.id(),
+                     c->pos.x, c->pos.y);
         }
     }
     if (p->order_cached_dirty) {
@@ -899,8 +969,8 @@ void lx::compositor::surface_tree::paint_walk(entry& e, lx::point2i origin, unsi
         const lx::surface_id sid = e.order.ids[i];
         if (sid == e.id) {
             e.walk_mark = true;
-            if (paint_count_ < k_tree_max_surfaces)
-                paint_[paint_count_++] = {sid, origin};
+            if (paint_.size() < k_tree_max_surfaces)
+                paint_.push_back({sid, origin});
             continue;
         }
         entry* c = find(sid);
@@ -922,7 +992,7 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
 
     // 1. Mapping: walk the current orders from the root.
     clear_marks(*r, 0);
-    paint_count_ = 0;
+    paint_.clear();
     if (r->has_buffer)
         paint_walk(*r, r->root_origin, 0);
 
@@ -930,7 +1000,7 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
     bool changed = drop_unmarked(*r, 0, false, nullptr, nullptr);
 
     // 3. Nodes for what became mapped; global origins for all of them.
-    for (unsigned i = 0; i < paint_count_; ++i) {
+    for (unsigned i = 0; i < paint_.size(); ++i) {
         const paint_item& it = paint_[i];
         entry* e = find(it.id);
         if (!e)
@@ -957,12 +1027,9 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
             }
         }
         if (created && e->parent && debug()) {
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "subsurface map surface=%llu root=%llu x=%d y=%d w=%d h=%d",
-                          it.id.id(), root.id(), new_rect.x, new_rect.y, new_rect.width,
-                          new_rect.height);
-            log_line(k_surface_category, line);
+            log_line(k_surface_category, "subsurface map surface={} root={} x={} y={} w={} h={}",
+                     it.id.id(), root.id(), new_rect.x, new_rect.y, new_rect.width,
+                     new_rect.height);
         }
         const bool moved = created || !rect_same(e->last_rect, new_rect);
         if (moved)
@@ -979,7 +1046,7 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
             (void)box.move_to(r->underlay, 0);
         index = 1;
     }
-    for (unsigned i = 0; i < paint_count_; ++i) {
+    for (unsigned i = 0; i < paint_.size(); ++i) {
         scene::surface_node* n = surfaces_->node(paint_[i].id);
         if (!n)
             continue;
@@ -1077,9 +1144,7 @@ void lx::compositor::surface_tree::set_root_dim(lx::surface_id root, bool dim) {
     }
     damage_root(root);
     if (debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "tree root=%llu dim=%d", root.id(), dim ? 1 : 0);
-        log_line(k_scene_category, line);
+        log_line(k_scene_category, "tree root={} dim={}", root.id(), dim ? 1 : 0);
     }
 }
 

@@ -1,18 +1,20 @@
 module;
 
-#include <cstdint>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_DRM)
-#include <cstring>
 #include <drm_fourcc.h>
 #include <sys/mman.h>
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 #endif
+#include <stddef.h>
 
 import lx.foundation;
 
 export module lx.drm:cursor;
+
+import std;
 
 export namespace lx::drm {
 
@@ -130,7 +132,7 @@ private:
 lx::drm::kms_cursor_plane::~kms_cursor_plane() { release(); }
 
 lx::drm::kms_cursor_plane::kms_cursor_plane(kms_cursor_plane&& other) noexcept {
-    *this = static_cast<kms_cursor_plane&&>(other);
+    *this = std::move(other);
 }
 
 lx::drm::kms_cursor_plane& lx::drm::kms_cursor_plane::operator=(kms_cursor_plane&& other) noexcept {
@@ -240,12 +242,11 @@ lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, 
                                                                         unsigned want_plane) {
 #if defined(LUMEN_HAS_DRM)
     if (fd < 0 || crtc_id == 0 || crtc_index >= 32) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
-                              "cursor plane: no CRTC");
+        return lx::make_error(lx::drm_err::mode_invalid, "cursor plane: no CRTC");
     }
     drmModePlaneRes* planes = drmModeGetPlaneResources(fd);
     if (!planes) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+        return lx::make_error(lx::drm_err::mode_invalid,
                               "cursor plane: drmModeGetPlaneResources failed");
     }
 
@@ -314,7 +315,7 @@ lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, 
                               candidate.p_crtc_h_;
         if (!is_cursor || !complete)
             continue;
-        out = static_cast<kms_cursor_plane&&>(candidate);
+        out = std::move(candidate);
         out.caps_.plane_id = plane_id;
         out.caps_.hotspot = out.p_hot_x_ != 0 && out.p_hot_y_ != 0;
         size_hints_blob = hints;
@@ -322,8 +323,7 @@ lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, 
     drmModeFreePlaneResources(planes);
 
     if (out.caps_.plane_id == 0) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
-                              "no cursor plane for this CRTC");
+        return lx::make_error(lx::drm_err::mode_invalid, "no cursor plane for this CRTC");
     }
 
     // SIZE_HINTS lists the sizes the plane takes in order of preference; the first one the
@@ -366,7 +366,7 @@ lx::result<lx::drm::kms_cursor_plane> lx::drm::kms_cursor_plane::create(int fd, 
 
     for (auto& b : out.fbs_) {
         if (!create_dumb(fd, width, height, b.handle, b.fb, b.pitch, b.size, b.map)) {
-            return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::open_failed),
+            return lx::make_error(lx::drm_err::open_failed,
                                   "cursor plane: dumb buffer allocation failed");
         }
     }
@@ -388,8 +388,7 @@ lx::result<void> lx::drm::kms_cursor_plane::stage_image(const std::uint32_t* arg
 #if defined(LUMEN_HAS_DRM)
     if (!valid() || !argb || w == 0 || h == 0 || w > caps_.width || h > caps_.height ||
         stride_px < w) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "cursor image does not fit the cursor plane");
+        return lx::invalid_argument("cursor image does not fit the cursor plane");
     }
     // Never the buffer on screen. With the plane off, either is free.
     const unsigned target = hw_fb_ >= 0 ? static_cast<unsigned>(hw_fb_ ^ 1) : pending_;

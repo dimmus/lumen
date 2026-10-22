@@ -144,7 +144,7 @@ LUMEN_TEST(keyed_rows_keep_state_across_reorder) {
         lx::ui::build_scope scope{ctx};
         lx::ui::child parent = lx::ui::describe<list_node, row_props>({0});
         const lx::ui::child kids[3] = {row(10, 1), row(20, 2), row(30, 3)};
-        list = rec.apply(nullptr, lx::ui::with_children(parent, kids, 3));
+        list = rec.apply(nullptr, lx::ui::with_children(parent, kids));
     }
     LUMEN_CHECK(list != nullptr);
     LUMEN_CHECK(list->child_count() == 3);
@@ -162,7 +162,7 @@ LUMEN_TEST(keyed_rows_keep_state_across_reorder) {
         lx::ui::build_scope scope{ctx};
         lx::ui::child parent = lx::ui::describe<list_node, row_props>({0});
         const lx::ui::child kids[3] = {row(30, 3), row(20, 2), row(10, 1)};
-        list = rec.apply(list, lx::ui::with_children(parent, kids, 3));
+        list = rec.apply(list, lx::ui::with_children(parent, kids));
     }
 
     LUMEN_CHECK(list->child_count() == 3);
@@ -183,7 +183,7 @@ LUMEN_TEST(keyed_rows_keep_state_across_reorder) {
         lx::ui::build_scope scope{ctx};
         lx::ui::child parent = lx::ui::describe<list_node, row_props>({0});
         const lx::ui::child kids[1] = {row(20, 2)};
-        list = rec.apply(list, lx::ui::with_children(parent, kids, 1));
+        list = rec.apply(list, lx::ui::with_children(parent, kids));
     }
     LUMEN_CHECK(list->child_count() == 1);
     LUMEN_CHECK(list->child_at(0) == was_key2);

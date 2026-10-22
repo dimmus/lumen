@@ -15,15 +15,8 @@
 //   - a hotplugged monitor is a new head, an unplugged one is finished;
 //   - persistence: the applied state is written to outputs.toml and a new compositor comes
 //     up in it.
-#include <atomic>
-#include <chrono>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <mutex>
-#include <string>
-#include <thread>
-#include <vector>
+#include <stdio.h>
+#include <stdlib.h>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -39,9 +32,12 @@
 #endif
 #endif
 #endif
+#include <errno.h>
+#include <stdint.h>
 
 #include "scan_builder.hpp"
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.scheduler;

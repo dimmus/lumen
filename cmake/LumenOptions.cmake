@@ -1,4 +1,4 @@
-option(LUMEN_BUILD_FLATPAK_PORTAL "Build optional Flatpak portal adapter" OFF)
+option(LUMEN_BUILD_PORTAL "Build xdg-desktop-portal-lumen (needs libsystemd, wayland-client; libpng for files)" ON)
 option(LUMEN_ENABLE_TILING_PLUGIN "Build tiling WM plugin (dlopen)" ON)
 option(LUMEN_VULKAN_VALIDATION "Enable Vulkan validation layers" OFF)
 option(LUMEN_PROTOCOLS_P1 "Generate and enable P1 Wayland protocols" ON)
@@ -31,10 +31,6 @@ endif()
 
 if(LUMEN_ENABLE_TILING_PLUGIN)
     add_compile_definitions(LUMEN_ENABLE_TILING_PLUGIN=1)
-endif()
-
-if(LUMEN_BUILD_FLATPAK_PORTAL)
-    add_compile_definitions(LUMEN_BUILD_FLATPAK_PORTAL=1)
 endif()
 
 if(LUMEN_BUILD_XWAYLAND)

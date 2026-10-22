@@ -1,8 +1,6 @@
-module;
-
-#include <cmath>
-
 export module lx.foundation:types;
+
+import std;
 
 export namespace lx {
 

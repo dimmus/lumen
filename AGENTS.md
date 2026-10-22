@@ -145,8 +145,8 @@ snapshot/executor handoff patterns.
 | Situation | Return / behavior |
 |-----------|-------------------|
 | Platform API not wired yet | `lx::not_implemented("fully::qualified::name")` |
-| Invalid input | `lx::make_error(error_domain::invalid_argument, 0, "…")` |
-| Real subsystem failure | Domain enum + `make_error(domain, code, msg)` + `log_error` at boundary |
+| Invalid input | `lx::invalid_argument("…")` |
+| Real subsystem failure | `make_error(drm_err::open_failed, msg)` (domain follows from the enum) + `log_error` at boundary |
 | Offline UI demo only | `lx::ui::window::create` may succeed with empty window |
 
 **Never** return `{}` success from platform/integration `result<T>` stubs.
@@ -164,6 +164,11 @@ When replacing a stub, remove `not_implemented` and use proper domain error code
 - Partitions: `export module lx.foo:bar` in separate `.cppm` files; re-export from facade with `export import :bar`
 - Implementation: `module :private;` section at bottom of `.cppm`, or `*.cpp` with `module lx.foo;`
 - **Imports:** `import lx.foundation;` — prefer facade imports over deep partition imports
+- **Standard library:** `import std;` right after the module declaration, never `#include <vector>`
+  or `<cstdio>`. Only C and platform headers (`<wayland-server.h>`, `<unistd.h>`, `<errno.h>`)
+  go in the global module fragment — include the plain C header when a file needs a macro
+  (`errno`, `stderr`, `UINT32_MAX`) or an unqualified C name, since modules export no macros.
+  The `std` module is built from the toolchain's own source by `cmake/LumenStdModule.cmake`
 - **Exports:** public API in `export module` / `export namespace`; hide details in private sections
 - Use **`[[nodiscard]]`** on fallible and pure query functions
 - Use **typed handles** (`toplevel_id`, `surface_id`, `client_id`, `texture_id`) — not raw pointers in public API
@@ -181,10 +186,8 @@ LX_RETURN_IF_ERROR(subsystem.open());
 // Assign from result
 LX_TRY_ASSIGN(device, gfx::device_selector::select_best());
 
-// Fail with domain
-return lx::make_error(lx::error_domain::wayland,
-                      static_cast<int>(lx::wayland_err::bind_failed),
-                      "failed to bind socket");
+// Fail: the domain follows from the code's enum
+return lx::make_error(lx::wayland_err::bind_failed, "failed to bind socket");
 
 // Log once at boundary, then return
 lx::trace::logger::global().log_error(err, "wayland");
@@ -198,6 +201,9 @@ return err;
 ### 4.3 Logging
 
 - Default sink: stderr; override with `LUMEN_LOG` env (see errors-and-logging doc)
+- Formatted lines: `logger.logf(level, category, "id={} cause={}", …)` (`std::format` syntax,
+  checked at compile time, no allocation; a `bool` prints as `1`/`0`) — not `snprintf` into a
+  stack buffer. Scripts grep log lines: keep their text stable
 - Categories: stable, grep-friendly (`compositor`, `compositor.render`, `wayland`, `drm`, `gfx`, `shell`)
 - **Frame hot path** (`tick_ui`, `tick_render`): only `LX_TRACE_SCOPE` / `trace` level — no `info`+ logs, no heap alloc, no sync I/O
 - Startup / errors: `info`, `warn`, `error` as appropriate
@@ -328,7 +334,7 @@ modules/
 ├── lx.shell/          shell + bridge
 ├── lx.shell.policy/   stacking/tiling policies
 ├── lx.app/            application framework
-└── lx.portal/         optional Flatpak (LUMEN_BUILD_FLATPAK_PORTAL)
+└── lx.portal/         xdg-desktop-portal-lumen: Screenshot/PickColor backend (LUMEN_BUILD_PORTAL)
 
 executables/
 ├── lumen-compositor/

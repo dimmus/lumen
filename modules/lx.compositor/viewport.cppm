@@ -10,10 +10,9 @@ module;
 // `surface_update_damage`, `wlr_surface_get_effective_damage`), which is what every client
 // in the wild is tested against.
 
-#include <cmath>
-#include <cstdint>
-
 export module lx.compositor:viewport;
+
+import std;
 
 import lx.foundation;
 

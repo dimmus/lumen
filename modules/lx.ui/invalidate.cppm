@@ -4,6 +4,8 @@ import lx.foundation;
 
 export module lx.ui:invalidate;
 
+import std;
+
 import :node;
 
 export namespace lx::ui {
@@ -44,8 +46,7 @@ private:
     /// Merge the pair whose combined area wastes the least, freeing one slot.
     void compact();
 
-    lx::rect2i rects_[k_capacity]{};
-    unsigned count_ = 0;
+    std::inplace_vector<lx::rect2i, k_capacity> rects_;
     unsigned flags_ = 0;
 };
 
@@ -99,27 +100,28 @@ void lx::ui::damage_ledger::add(lx::rect2i region) {
 
     // Absorb into an existing rect when the union costs nothing extra — the common
     // case of a widget invalidating repeatedly within one frame.
-    for (unsigned i = 0; i < count_; ++i) {
-        const lx::rect2i merged = lx_ui_union(rects_[i], region);
-        if (lx_ui_area(merged) <= lx_ui_area(rects_[i]) + lx_ui_area(region)) {
-            rects_[i] = merged;
+    for (lx::rect2i& r : rects_) {
+        const lx::rect2i merged = lx_ui_union(r, region);
+        if (lx_ui_area(merged) <= lx_ui_area(r) + lx_ui_area(region)) {
+            r = merged;
             return;
         }
     }
 
-    if (count_ == k_capacity)
+    if (rects_.size() == k_capacity)
         compact();
-    rects_[count_++] = region;
+    rects_.push_back(region);
 }
 
 void lx::ui::damage_ledger::compact() {
-    if (count_ < 2)
+    const unsigned n = static_cast<unsigned>(rects_.size());
+    if (n < 2)
         return;
     unsigned best_a = 0;
     unsigned best_b = 1;
     long long best_waste = -1;
-    for (unsigned i = 0; i < count_; ++i) {
-        for (unsigned j = i + 1; j < count_; ++j) {
+    for (unsigned i = 0; i < n; ++i) {
+        for (unsigned j = i + 1; j < n; ++j) {
             const long long waste = lx_ui_area(lx_ui_union(rects_[i], rects_[j])) -
                                     lx_ui_area(rects_[i]) - lx_ui_area(rects_[j]);
             if (best_waste < 0 || waste < best_waste) {
@@ -130,21 +132,25 @@ void lx::ui::damage_ledger::compact() {
         }
     }
     rects_[best_a] = lx_ui_union(rects_[best_a], rects_[best_b]);
-    rects_[best_b] = rects_[count_ - 1];
-    --count_;
+    rects_[best_b] = rects_.back();
+    rects_.pop_back();
 }
 
 void lx::ui::damage_ledger::request(invalidation what) {
     flags_ |= static_cast<unsigned>(what);
 }
 
-unsigned lx::ui::damage_ledger::count() const { return count_; }
-const lx::rect2i* lx::ui::damage_ledger::rects() const { return rects_; }
+unsigned lx::ui::damage_ledger::count() const {
+    return static_cast<unsigned>(rects_.size());
+}
+const lx::rect2i* lx::ui::damage_ledger::rects() const {
+    return rects_.data();
+}
 
 lx::rect2i lx::ui::damage_ledger::union_bounds() const {
     lx::rect2i out{};
-    for (unsigned i = 0; i < count_; ++i)
-        out = lx_ui_union(out, rects_[i]);
+    for (const lx::rect2i& r : rects_)
+        out = lx_ui_union(out, r);
     return out;
 }
 
@@ -157,10 +163,12 @@ bool lx::ui::damage_ledger::needs_layout() const {
 bool lx::ui::damage_ledger::needs_animate() const {
     return (flags_ & static_cast<unsigned>(invalidation::animate)) != 0;
 }
-bool lx::ui::damage_ledger::empty() const { return count_ == 0 && flags_ == 0; }
+bool lx::ui::damage_ledger::empty() const {
+    return rects_.empty() && flags_ == 0;
+}
 
 void lx::ui::damage_ledger::clear() {
-    count_ = 0;
+    rects_.clear();
     flags_ = 0;
 }
 

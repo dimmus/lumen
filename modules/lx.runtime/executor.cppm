@@ -1,19 +1,12 @@
 module;
 
-#include <atomic>
-#include <cstddef>
-#include <cstdlib>
-#include <cstring>
-#include <new>
-#include <thread>
-#include <type_traits>
-#include <utility>
-
 import lx.foundation;
 import lx.sync;
 import lx.trace;
 
 export module lx.runtime:executor;
+
+import std;
 
 export namespace lx::runtime {
 
@@ -226,9 +219,9 @@ lx::runtime::affinity lx::runtime::strand::bound_affinity() const { return bound
 unsigned lx::runtime::strand::pending() const { return pending_.load(); }
 
 lx::runtime::executor::executor() {
-    strands_[static_cast<unsigned>(affinity::ui)] = &ui_;
-    strands_[static_cast<unsigned>(affinity::render)] = &render_;
-    strands_[static_cast<unsigned>(affinity::worker)] = &worker_;
+    strands_[std::to_underlying(affinity::ui)] = &ui_;
+    strands_[std::to_underlying(affinity::render)] = &render_;
+    strands_[std::to_underlying(affinity::worker)] = &worker_;
 }
 
 lx::runtime::executor& lx::runtime::executor::global() {

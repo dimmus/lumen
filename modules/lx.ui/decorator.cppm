@@ -1,11 +1,11 @@
 module;
 
-#include <concepts>
-
 import lx.foundation;
 import lx.layout;
 
 export module lx.ui:decorator;
+
+import std;
 
 import :element;
 import :node;
@@ -210,7 +210,7 @@ namespace {
     if (!described)
         return nullptr;
     const lx::ui::child items[1] = {content};
-    return lx::ui::with_children(described, items, 1);
+    return lx::ui::with_children(described, items);
 }
 
 [[nodiscard]] int lx_ui_align_offset(lx::layout::align how, int available, int used) {

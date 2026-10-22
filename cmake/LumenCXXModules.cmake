@@ -142,6 +142,9 @@ function(lumen_apply_module_properties target)
         CXX_STANDARD_REQUIRED ON
         CXX_EXTENSIONS OFF
     )
+    # Every Lumen unit may `import std;` (cmake/LumenStdModule.cmake). PUBLIC so importers
+    # of this target's BMIs can resolve the std BMI they reference.
+    target_link_libraries(${target} PUBLIC lumen-std)
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
         # CMake manages module output paths per object; only add the prebuilt
         # search path so dependents can find PCM artifacts.

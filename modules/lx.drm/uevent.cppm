@@ -12,10 +12,6 @@ module;
 // (`kms_device::probe_connectors`). An idle monitor costs nothing: its socket is readable
 // only when a drm uevent arrives.
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-
 #if defined(LUMEN_HAS_UDEV)
 #include <libudev.h>
 #include <sys/sysmacros.h>
@@ -25,6 +21,8 @@ module;
 import lx.foundation;
 
 export module lx.drm:uevent;
+
+import std;
 
 export namespace lx::drm {
 
@@ -163,7 +161,7 @@ void lx::drm::merge_hotplug(hotplug_batch& into, const hotplug_batch& one) {
 lx::drm::uevent_monitor::~uevent_monitor() { release(); }
 
 lx::drm::uevent_monitor::uevent_monitor(uevent_monitor&& other) noexcept {
-    *this = static_cast<uevent_monitor&&>(other);
+    *this = std::move(other);
 }
 
 lx::drm::uevent_monitor& lx::drm::uevent_monitor::operator=(uevent_monitor&& other) noexcept {
@@ -193,11 +191,10 @@ void lx::drm::uevent_monitor::release() {
 lx::result<lx::drm::uevent_monitor> lx::drm::uevent_monitor::open(unsigned long long card) {
 #if defined(LUMEN_HAS_UDEV)
     const auto fail = [](const char* why) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::monitor_failed),
-                              why);
+        return lx::make_error(lx::drm_err::monitor_failed, why);
     };
     if (card == 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "uevent monitor: no card");
+        return lx::invalid_argument("uevent monitor: no card");
     uevent_monitor m{};
     m.card_ = card;
     m.udev_ = udev_new();

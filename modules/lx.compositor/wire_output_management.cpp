@@ -32,10 +32,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <new>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -46,6 +43,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -554,10 +553,9 @@ void submit(struct wl_resource* r, bool test) {
         c->answered = true;
         zwlr_output_configuration_v1_send_cancelled(r);
         if (debug_on()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "%s cancelled: serial %u, current %u",
-                          test ? "test" : "apply", c->cfg.serial, g.serial);
-            lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
+                                             "{} cancelled: serial {}, current {}",
+                                             test ? "test" : "apply", c->cfg.serial, g.serial);
         }
         return;
     case mg::submit_verdict::ok:
@@ -717,10 +715,11 @@ void lx::compositor::output_heads_changed(p0_protocol_context& ctx, const mgmt::
         if (!client_dying(wl_resource_get_client(m->resource)))
             zwlr_output_manager_v1_send_done(m->resource, g.serial);
     if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "heads done serial=%u heads=%u added=%u removed=%u changed=%u",
-                      g.serial, heads.count, d.added_count, d.removed_count, d.changed_count);
-        lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
+                                         "heads done serial={} heads={} added={} removed={} "
+                                         "changed={}",
+                                         g.serial, heads.count, d.added_count, d.removed_count,
+                                         d.changed_count);
     }
 #else
     (void)ctx;

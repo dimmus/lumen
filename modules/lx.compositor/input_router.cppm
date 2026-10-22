@@ -1,17 +1,19 @@
 module;
 
-#include <cstddef>
-#include <cstdint>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #endif
+#include <stdio.h>
 
 import lx.foundation;
 import lx.input;
 import lx.trace;
 
 export module lx.compositor:input_router;
+
+import std;
 
 export namespace lx::compositor {
 
@@ -196,6 +198,14 @@ public:
         surface_hook_user_ = user;
     }
 
+    /// Called after the pointer-focus surface changed (its `leave` and `enter` sent), and
+    /// when the focused surface is destroyed: pointer constraints follow pointer focus.
+    using pointer_focus_hook = void (*)(void* user);
+    void set_pointer_focus_hook(pointer_focus_hook fn, void* user) {
+        pointer_hook_ = fn;
+        pointer_hook_user_ = user;
+    }
+
     /// Called after a key press or a button press reached `client` (`wl_client*`, with at
     /// least one of its resources): the liveness tracker pings on user input (Mutter).
     using user_input_hook = void (*)(void* user, void* client, unsigned serial,
@@ -284,6 +294,14 @@ public:
     /// Surface-local position; also remembered for a `wl_pointer` created later, whose
     /// `enter` must carry where the pointer is on that surface.
     void send_pointer_motion(double sx, double sy, unsigned time_ms);
+    /// A pointer lock is active (pointer-constraints-unstable-v1): `wl_pointer.motion` is
+    /// never sent — whoever asks (a re-hit after a window moved, a muted client catching up)
+    /// — while the position is still recorded for `enter`. Buttons and axes are unaffected.
+    void set_motion_locked(bool locked) { motion_locked_ = locked; }
+    [[nodiscard]] bool motion_locked() const { return motion_locked_; }
+    /// `wl_pointer.frame` to the pointer focus's pointers (v5+): ends a group of events that
+    /// carried no `motion` of their own (relative motion while locked).
+    void send_pointer_frame();
     /// Returns the serial the button event carried, or 0 when nothing has pointer focus.
     /// A press serial is what xdg_toplevel.move/resize must quote.
     unsigned send_pointer_button(const lx::input::pointer_button_event& event,
@@ -356,6 +374,9 @@ private:
     void* focus_hook_user_ = nullptr;
     user_input_hook input_hook_ = nullptr;
     void* input_hook_user_ = nullptr;
+    pointer_focus_hook pointer_hook_ = nullptr;
+    void* pointer_hook_user_ = nullptr;
+    bool motion_locked_ = false;
     void* muted_[k_max_muted]{};
     unsigned muted_count_ = 0;
     input_serial_log serials_{};
@@ -367,8 +388,7 @@ private:
     /// Enter serials sent for the current pointer focus: one per focus change, plus one per
     /// wl_pointer the client creates while already focused.
     static constexpr unsigned k_enter_serials = 4;
-    unsigned pointer_enter_serials_[k_enter_serials]{};
-    unsigned pointer_enter_count_ = 0;
+    std::inplace_vector<unsigned, k_enter_serials> pointer_enter_serials_{};
     unsigned pointer_focus_generation_ = 0;
     /// Last key press delivered, its key and its client; the release serial of that key.
     unsigned last_key_press_serial_ = 0;
@@ -682,32 +702,27 @@ void lx::compositor::input_router::remove(void* r) {
     if (pointer_focus_ == r) {
         pointer_focus_ = nullptr;
         clear_pointer_focus_state();
+        if (pointer_hook_)
+            pointer_hook_(pointer_hook_user_);
     }
 }
 
 void lx::compositor::input_router::note_enter_serial(unsigned serial) {
-    if (pointer_enter_count_ < k_enter_serials) {
-        pointer_enter_serials_[pointer_enter_count_++] = serial;
-        return;
-    }
-    for (unsigned i = 1; i < k_enter_serials; ++i)
-        pointer_enter_serials_[i - 1] = pointer_enter_serials_[i];
-    pointer_enter_serials_[k_enter_serials - 1] = serial;
+    if (pointer_enter_serials_.size() == k_enter_serials)
+        pointer_enter_serials_.erase(pointer_enter_serials_.begin());
+    pointer_enter_serials_.push_back(serial);
 }
 
 void lx::compositor::input_router::clear_pointer_focus_state() {
     pointer_focus_client_ = nullptr;
-    pointer_enter_count_ = 0;
+    pointer_enter_serials_.clear();
     ++pointer_focus_generation_;
 }
 
 bool lx::compositor::input_router::is_pointer_enter_serial(unsigned serial) const {
     if (serial == 0)
         return false;
-    for (unsigned i = 0; i < pointer_enter_count_; ++i)
-        if (pointer_enter_serials_[i] == serial)
-            return true;
-    return false;
+    return std::ranges::contains(pointer_enter_serials_, serial);
 }
 
 void lx::compositor::input_router::set_keyboard_focus(void* surface, lx::input::seat& seat) {
@@ -784,8 +799,11 @@ unsigned lx::compositor::input_router::set_pointer_focus(void* surface, double s
     clear_pointer_focus_state();
     seat.set_pointer_focus(surface ? lx::surface_id{reinterpret_cast<unsigned long long>(surface)}
                                    : lx::surface_id{});
-    if (!surface)
+    if (!surface) {
+        if (pointer_hook_)
+            pointer_hook_(pointer_hook_user_);
         return 0;
+    }
 
     pointer_focus_client_ = wl_resource_get_client(static_cast<wl_resource*>(surface));
     pointer_sx_ = sx;
@@ -802,6 +820,10 @@ unsigned lx::compositor::input_router::set_pointer_focus(void* surface, double s
         if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
             wl_pointer_send_frame(p);
     }
+    // After the `enter`: a constraint is only ever activated on a surface already told it
+    // has the pointer.
+    if (pointer_hook_)
+        pointer_hook_(pointer_hook_user_);
     return serial;
 #else
     (void)surface;
@@ -1088,6 +1110,8 @@ void lx::compositor::input_router::send_pointer_motion(double sx, double sy,
         return;
     pointer_sx_ = sx;
     pointer_sy_ = sy;
+    if (motion_locked_)
+        return;
     if (muted_count_ != 0 && motion_muted(pointer_focus_client_))
         return;
     for (unsigned i = 0; i < pointers_.count; ++i) {
@@ -1102,6 +1126,20 @@ void lx::compositor::input_router::send_pointer_motion(double sx, double sy,
     (void)sx;
     (void)sy;
     (void)time_ms;
+#endif
+}
+
+void lx::compositor::input_router::send_pointer_frame() {
+#if defined(LUMEN_HAS_WAYLAND)
+    if (!pointer_focus_)
+        return;
+    for (unsigned i = 0; i < pointers_.count; ++i) {
+        if (!resource_set::same_client(pointers_.items[i], pointer_focus_))
+            continue;
+        auto* p = static_cast<wl_resource*>(pointers_.items[i]);
+        if (wl_resource_get_version(p) >= WL_POINTER_FRAME_SINCE_VERSION)
+            wl_pointer_send_frame(p);
+    }
 #endif
 }
 

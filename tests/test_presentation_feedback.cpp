@@ -5,12 +5,7 @@
 // presentation tracker. Pure: no Wayland, no KMS.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <set>
-#include <string>
-#include <tuple>
-#include <vector>
-
+import std;
 import lx.foundation;
 import lx.drm;
 import lx.scheduler;

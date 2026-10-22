@@ -29,15 +29,15 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -84,6 +84,12 @@ drag_state drag{};
 
 void dnd_log(const char* line) {
     lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
+}
+
+template <typename... Args>
+void dnd_log(std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lx::trace::level::debug, k_category, fmt,
+                                     std::forward<Args>(args)...);
 }
 
 unsigned res_id(wl_resource* r) { return r ? wl_resource_get_id(r) : 0; }
@@ -156,12 +162,9 @@ void renegotiate(xfer_source* src, xfer_offer* o) {
             wl_data_source_send_action(src->resource, a);
         if (dnd_debug()) {
             const bool offer3 = o && v3(o->resource);
-            char line[128];
-            std::snprintf(line, sizeof(line),
-                          "dnd action action=%u source=%u offer=%u preferred=%u user=%u", a,
-                          source_actions(src), o ? (offer3 ? o->actions : 1u) : 0u,
-                          o && offer3 ? o->preferred : 0u, src->dropped ? 0u : drag.user_action);
-            dnd_log(line);
+            dnd_log("dnd action action={} source={} offer={} preferred={} user={}", a,
+                    source_actions(src), o ? (offer3 ? o->actions : 1u) : 0u,
+                    o && offer3 ? o->preferred : 0u, src->dropped ? 0u : drag.user_action);
         }
     }
     if (drag.active)
@@ -274,10 +277,7 @@ void cancel_drag(const char* cause) {
     if (src && v3(src->resource) && source_reachable(src))
         wl_data_source_send_cancelled(src->resource);
     if (src && dnd_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "dnd cancelled source=%u cause=%s",
-                      res_id(src->resource), cause);
-        dnd_log(line);
+        dnd_log("dnd cancelled source={} cause={}", res_id(src->resource), cause);
     }
     drag = {};
 }
@@ -331,11 +331,8 @@ bool op_drop(void*, lx::compositor::dnd_end_reason& why) {
         const char* mime = src && drag.accepted_mime >= 0
                                ? src->mimes.at(static_cast<unsigned>(drag.accepted_mime))
                                : nullptr;
-        char line[192];
-        std::snprintf(line, sizeof(line), "dnd drop surface=%llu client=%u action=%u mime=%.96s",
-                      drag.target_id.id(), wire_client_id(client), src ? src->action : 0u,
-                      mime ? mime : "-");
-        dnd_log(line);
+        dnd_log("dnd drop surface={} client={} action={} mime={:.96}", drag.target_id.id(),
+                wire_client_id(client), src ? src->action : 0u, mime ? mime : "-");
     }
     // Then `leave` (wlroots, Mutter, Weston); the offer stays live for receive and finish.
     send_leave(client);
@@ -394,10 +391,7 @@ void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* orig
     const char* reject = !wm || !grab ? "no-wm" : wm->validate_drag_serial(client, serial);
     if (reject) {
         if (dnd_debug()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "dnd start rejected client=%u reason=%s",
-                          wire_client_id(client), reject);
-            dnd_log(line);
+            dnd_log("dnd start rejected client={} reason={}", wire_client_id(client), reject);
         }
         // The client learns its drag will not happen (a version 2 source has no such
         // event: it was not replaced).
@@ -412,15 +406,11 @@ void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* orig
     drag.source = src;
     drag.origin_client = client;
     if (dnd_debug()) {
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "dnd start client=%u source=%u origin=%llu icon=%llu button=%u actions=%u "
-                      "mimes=%u",
-                      wire_client_id(client), res_id(src ? src->resource : nullptr),
-                      origin ? origin->id.id() : 0ull, icon ? icon->id.id() : 0ull,
-                      wm->last_press_button(), src ? source_actions(src) : 0u,
-                      src ? src->mimes.count() : 0u);
-        dnd_log(line);
+        dnd_log("dnd start client={} source={} origin={} icon={} button={} actions={} mimes={}",
+                wire_client_id(client), res_id(src ? src->resource : nullptr),
+                origin ? origin->id.id() : 0ull, icon ? icon->id.id() : 0ull,
+                wm->last_press_button(), src ? source_actions(src) : 0u,
+                src ? src->mimes.count() : 0u);
     }
     const lx::client_id origin_client =
         origin ? origin->client : lx::client_id{wire_client_id(client)};
@@ -455,10 +445,8 @@ void dnd_offer_accept(xfer_offer* o, uint32_t, const char* mime) {
         return;
     src->accepted = accepted;
     if (dnd_debug()) {
-        char line[160];
-        std::snprintf(line, sizeof(line), "dnd accept client=%u mime=%.96s",
-                      wire_client_id(o->client), accepted ? mime : "-");
-        dnd_log(line);
+        dnd_log("dnd accept client={} mime={:.96}", wire_client_id(o->client),
+                accepted ? mime : "-");
     }
 }
 
@@ -520,10 +508,7 @@ void dnd_offer_finish(xfer_offer* o) {
     if (v3(src->resource) && source_reachable(src))
         wl_data_source_send_dnd_finished(src->resource);
     if (dnd_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "dnd finish client=%u action=%u",
-                      wire_client_id(o->client), src->action);
-        dnd_log(line);
+        dnd_log("dnd finish client={} action={}", wire_client_id(o->client), src->action);
     }
     xfer_inert_offer(o);
 }
@@ -557,10 +542,8 @@ void dnd_offer_destroyed(xfer_offer* o) {
     if (v3(src->resource) && source_reachable(src))
         wl_data_source_send_cancelled(src->resource);
     if (dnd_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "dnd cancelled source=%u cause=%s",
-                      res_id(src->resource), o->in_ask ? "ask-dismissed" : "offer-destroyed");
-        dnd_log(line);
+        dnd_log("dnd cancelled source={} cause={}", res_id(src->resource),
+                o->in_ask ? "ask-dismissed" : "offer-destroyed");
     }
 }
 

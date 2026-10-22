@@ -6,17 +6,14 @@
 // software rasterizer has nothing to say about this path.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
 #include <fcntl.h>
 #include <unistd.h>
-#include <vector>
 
 #if defined(LUMEN_HAS_EGL)
 #include <GLES2/gl2.h>
 #endif
 
+import std;
 import lx.foundation;
 import lx.gfx;
 
@@ -705,6 +702,89 @@ LUMEN_TEST(gl_composite_skips_occluded_draws) {
     LUMEN_CHECK(static_cast<bool>(
         comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
     LUMEN_CHECK(at(out, W, 8, 8).g == 255 && at(out, W, 8, 8).r == 0);
+}
+
+// ── solid draws (wp_single_pixel_buffer_v1) ────────────────────────────────
+
+namespace {
+lx::gfx::blit_command solid_cmd(lx::rect2i dst, lx::color c, float opacity = 1.f) {
+    lx::gfx::blit_command cmd{};
+    cmd.solid = true;
+    cmd.solid_color = c;
+    cmd.dst = dst;
+    cmd.opacity = opacity;
+    cmd.blend = c.a >= 1.f && opacity >= 1.f ? lx::blend_mode::opaque
+                                              : lx::blend_mode::premultiplied;
+    return cmd;
+}
+} // namespace
+
+LUMEN_TEST(gl_composite_solid_draws_clear_and_shader_paths) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned W = 64, H = 32;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+
+    // Black clear; an opaque red solid on the left quarter (the glClear path); a tinted
+    // opaque red on the second quarter (the shader path, tint 1 so pixel-equal); a
+    // half-transparent white over black on the third (premultiplied: encoded 0.5).
+    lx::gfx::blit_command cmds[3] = {
+        solid_cmd({0, 0, 16, 32}, lx::color::rgb(1.f, 0.f, 0.f, 1.f)),
+        solid_cmd({16, 0, 16, 32}, lx::color::rgb(1.f, 0.f, 0.f, 1.f)),
+        solid_cmd({32, 0, 16, 32}, lx::color::rgb(0.5f, 0.5f, 0.5f, 0.5f)),
+    };
+    cmds[1].blend = lx::blend_mode::premultiplied; // forces the shader branch
+    auto stats = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f), cmds, 3, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 3);
+    LUMEN_CHECK(stats.value().draws_skipped == 0);
+    close_fence(stats);
+
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    const pixel clear_path = at(out, W, 8, 8);
+    const pixel shader_path = at(out, W, 24, 8);
+    LUMEN_CHECK(near(clear_path.r, 255) && near(clear_path.g, 0) && near(clear_path.b, 0));
+    LUMEN_CHECK(near(shader_path.r, clear_path.r, 1) && near(shader_path.g, clear_path.g, 1) &&
+                near(shader_path.b, clear_path.b, 1));
+    const pixel half = at(out, W, 40, 8);
+    LUMEN_CHECK(near(half.r, 128, 6) && near(half.g, 128, 6) && near(half.b, 128, 6));
+    const pixel untouched = at(out, W, 56, 8);
+    LUMEN_CHECK(near(untouched.r, 0) && near(untouched.g, 0));
+}
+
+LUMEN_TEST(gl_composite_skips_zero_alpha_and_applies_opacity_once) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned W = 32, H = 8;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+    const auto white = solid(4, 4, 255, 255, 255);
+    LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(1, 4, 4, white.data())));
+    const lx::gfx::blit_command cmds[2] = {
+        quad(1, {0, 0, 16, 8}, lx::blend_mode::premultiplied, 0.f),
+        quad(1, {16, 0, 16, 8}, lx::blend_mode::premultiplied, 0.5f),
+    };
+    auto stats = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f), cmds, 2, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+    LUMEN_CHECK(stats.value().draws_culled == 1);
+    close_fence(stats);
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    LUMEN_CHECK(near(at(out, W, 4, 4).r, 0));
+    // GLES 2 blends in encoded space (the backend's documented limit): white at alpha 0.5
+    // over black is encoded 0.5.
+    LUMEN_CHECK(near(at(out, W, 24, 4).r, 128, 6));
 }
 
 int main(int argc, char** argv) {

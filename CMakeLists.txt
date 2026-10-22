@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 
 include(LumenOptions)
+include(LumenStdModule)
 include(LumenCXXModules)
 include(LumenPlatform)
 
@@ -107,6 +108,17 @@ lumen_link_platform_modules(lx.shell)
 if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
     target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
     target_compile_definitions(lx.shell PRIVATE LUMEN_SHELL_WAYLAND=1)
+endif()
+# Icon decoding for the panel (lx.shell:icon_theme), each optional.
+if(LIBPNG_FOUND)
+    target_compile_definitions(lx.shell PRIVATE LUMEN_HAS_PNG=1)
+    target_include_directories(lx.shell PRIVATE ${LIBPNG_INCLUDE_DIRS})
+    target_link_libraries(lx.shell PUBLIC ${LIBPNG_LINK_LIBRARIES})
+endif()
+if(LIBRSVG_FOUND)
+    target_compile_definitions(lx.shell PRIVATE LUMEN_HAS_RSVG=1)
+    target_include_directories(lx.shell PRIVATE ${LIBRSVG_INCLUDE_DIRS})
+    target_link_libraries(lx.shell PUBLIC ${LIBRSVG_LINK_LIBRARIES})
 endif()
 
 if(LUMEN_BUILD_XWAYLAND)
@@ -233,7 +245,9 @@ if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
         # selections). Its client glue is lumen-protocol-glue's — every manifest protocol —
         # rather than private copies, which would define xdg_wm_base_interface twice.
         if(LUMEN_BUILD_TESTS AND TARGET lumen-protocol-glue)
-            add_executable(lumen-probe tests/clients/lumen-probe.cpp tests/clients/lumen-probe-output-mgmt.cpp)
+            add_executable(lumen-probe tests/clients/lumen-probe.cpp tests/clients/lumen-probe-output-mgmt.cpp
+                tests/clients/lumen-probe-compat.cpp tests/clients/lumen-probe-window.cpp
+                tests/clients/lumen-probe-pointer.cpp tests/clients/lumen-probe-capture.cpp)
             target_link_libraries(lumen-probe PRIVATE lumen-protocol-glue)
             lumen_link_platform(lumen-probe)
             target_compile_definitions(lumen-probe PRIVATE LUMEN_PROBE_HAS_LAYER_SHELL)
@@ -245,9 +259,80 @@ else()
     message(STATUS "wayland-client/scanner unavailable — skipping lumen-clouds and lumen-square")
 endif()
 
-# ── Optional Flatpak portal adapter ─────────────────────────────────────────
-if(LUMEN_BUILD_FLATPAK_PORTAL)
-    lumen_add_module_library(lx.portal modules/lx.portal DEPENDS lx.foundation lx.shell.policy)
+# ── Portal backend: xdg-desktop-portal-lumen (design-app-compat-capture Part E) ─
+# Screenshot/PickColor for xdg-desktop-portal and the ScreenCast source chooser of
+# xdg-desktop-portal-wlr. A Wayland client (the overlay draws with lx.shell's shm canvas)
+# and a D-Bus service (sd-bus); without libpng it builds but cannot write files.
+set(LUMEN_PORTAL_BUILT FALSE)
+if(LUMEN_BUILD_PORTAL)
+    if(LIBSYSTEMD_FOUND AND WAYLAND_FOUND AND TARGET lumen-protocol-glue)
+        lumen_add_module_library(lx.portal modules/lx.portal
+            DEPENDS lx.foundation lx.trace lx.text lx.shell)
+        target_link_libraries(lx.portal PRIVATE lumen-protocol-glue)
+        target_compile_definitions(lx.portal PRIVATE LUMEN_PORTAL_WAYLAND=1 LUMEN_PORTAL_DBUS=1)
+        target_include_directories(lx.portal PRIVATE ${WAYLAND_INCLUDE_DIRS} ${LIBSYSTEMD_INCLUDE_DIRS})
+        target_link_libraries(lx.portal PUBLIC ${WAYLAND_LIBRARIES} ${LIBSYSTEMD_LIBRARIES})
+        if(LIBPNG_FOUND)
+            target_compile_definitions(lx.portal PRIVATE LUMEN_PORTAL_PNG=1)
+            target_include_directories(lx.portal PRIVATE ${LIBPNG_INCLUDE_DIRS})
+            target_link_libraries(lx.portal PUBLIC ${LIBPNG_LINK_LIBRARIES})
+        else()
+            message(STATUS "libpng not found — xdg-desktop-portal-lumen cannot save screenshots")
+        endif()
+        add_executable(xdg-desktop-portal-lumen executables/xdg-desktop-portal-lumen/main.cpp)
+        target_link_libraries(xdg-desktop-portal-lumen PRIVATE lx.portal)
+        lumen_apply_module_properties(xdg-desktop-portal-lumen)
+        lumen_check_executable_layers(xdg-desktop-portal-lumen lx.portal)
+        set(LUMEN_PORTAL_BUILT TRUE)
+
+        # Deploy files: installed ones point at libexecdir; the build tree gets its own
+        # copies under share/ (pointing at the build tree) for run-desktop.sh sessions.
+        include(GNUInstallDirs)
+        set(LUMEN_PORTAL_EXEC "${CMAKE_INSTALL_FULL_LIBEXECDIR}/xdg-desktop-portal-lumen")
+        set(LUMEN_PORTAL_GEN "${CMAKE_BINARY_DIR}/generated/portal")
+        foreach(_f org.freedesktop.impl.portal.desktop.lumen.service xdg-desktop-portal-lumen.service)
+            set(_src "${CMAKE_SOURCE_DIR}/deploy/portal/${_f}.in")
+            if(_f STREQUAL "xdg-desktop-portal-lumen.service")
+                set(_src "${CMAKE_SOURCE_DIR}/deploy/systemd/${_f}.in")
+            endif()
+            configure_file("${_src}" "${LUMEN_PORTAL_GEN}/${_f}" @ONLY)
+        endforeach()
+        configure_file("${CMAKE_SOURCE_DIR}/deploy/xdg/xdg-desktop-portal-wlr/Lumen.in"
+            "${LUMEN_PORTAL_GEN}/xdpw-Lumen" @ONLY)
+        set(LUMEN_SHARE_DIR "${CMAKE_BINARY_DIR}/share")
+        file(MAKE_DIRECTORY "${LUMEN_SHARE_DIR}/xdg-desktop-portal/portals"
+            "${LUMEN_SHARE_DIR}/xdg/xdg-desktop-portal-wlr")
+        configure_file("${CMAKE_SOURCE_DIR}/deploy/portal/lumen.portal"
+            "${LUMEN_SHARE_DIR}/xdg-desktop-portal/portals/lumen.portal" COPYONLY)
+        configure_file("${CMAKE_SOURCE_DIR}/deploy/portal/lumen-portals.conf"
+            "${LUMEN_SHARE_DIR}/xdg-desktop-portal/lumen-portals.conf" COPYONLY)
+        # The chooser path is the built binary's, known only at generate time.
+        file(READ "${CMAKE_SOURCE_DIR}/deploy/xdg/xdg-desktop-portal-wlr/Lumen.in" _xdpw)
+        string(REPLACE "@LUMEN_PORTAL_EXEC@" "$<TARGET_FILE:xdg-desktop-portal-lumen>" _xdpw "${_xdpw}")
+        file(GENERATE OUTPUT "${LUMEN_SHARE_DIR}/xdg/xdg-desktop-portal-wlr/Lumen" CONTENT "${_xdpw}")
+    else()
+        message(STATUS "xdg-desktop-portal-lumen skipped: needs libsystemd, wayland-client and the protocol glue")
+    endif()
+endif()
+
+# Portal client for app-smoke group Z: the frontend's Screenshot/PickColor/ScreenCast, and a
+# PipeWire consumer of the cast (libpipewire optional: without it the stream is not read).
+if(LUMEN_BUILD_TESTS AND LIBSYSTEMD_FOUND)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(PIPEWIRE QUIET libpipewire-0.3)
+    endif()
+    add_executable(lumen-portal-probe tests/clients/lumen-portal-probe.cpp)
+    target_compile_features(lumen-portal-probe PRIVATE cxx_std_20)
+    target_include_directories(lumen-portal-probe PRIVATE ${LIBSYSTEMD_INCLUDE_DIRS})
+    target_link_libraries(lumen-portal-probe PRIVATE ${LIBSYSTEMD_LIBRARIES} m)
+    if(PIPEWIRE_FOUND)
+        target_compile_definitions(lumen-portal-probe PRIVATE LUMEN_PROBE_HAS_PIPEWIRE=1)
+        target_include_directories(lumen-portal-probe PRIVATE ${PIPEWIRE_INCLUDE_DIRS})
+        target_compile_options(lumen-portal-probe PRIVATE ${PIPEWIRE_CFLAGS_OTHER})
+        target_link_libraries(lumen-portal-probe PRIVATE ${PIPEWIRE_LIBRARIES})
+    else()
+        message(STATUS "libpipewire not found — lumen-portal-probe cannot read ScreenCast streams")
+    endif()
 endif()
 
 # ── Install ──────────────────────────────────────────────────────────────────
@@ -255,7 +340,21 @@ include(GNUInstallDirs)
 install(TARGETS lumen-compositor lumen-shell RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(DIRECTORY protocols/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/protocols
     FILES_MATCHING PATTERN "*.xml" PATTERN "*.toml")
-install(DIRECTORY deploy/systemd/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/systemd)
+install(DIRECTORY deploy/systemd/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/systemd
+    PATTERN "*.in" EXCLUDE)
+if(LUMEN_PORTAL_BUILT)
+    install(TARGETS xdg-desktop-portal-lumen RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
+    install(FILES deploy/portal/lumen.portal
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/xdg-desktop-portal/portals)
+    install(FILES deploy/portal/lumen-portals.conf
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/xdg-desktop-portal)
+    install(FILES "${LUMEN_PORTAL_GEN}/org.freedesktop.impl.portal.desktop.lumen.service"
+        DESTINATION ${CMAKE_INSTALL_DATADIR}/dbus-1/services)
+    install(FILES "${LUMEN_PORTAL_GEN}/xdg-desktop-portal-lumen.service"
+        DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/user)
+    install(FILES "${LUMEN_PORTAL_GEN}/xdpw-Lumen"
+        DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/xdg/xdg-desktop-portal-wlr RENAME Lumen)
+endif()
 
 enable_testing()
 
@@ -279,6 +378,12 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_result)
     target_include_directories(test_result PRIVATE tests)
     add_test(NAME test_result COMMAND test_result)
+
+    add_executable(test_logf tests/test_logf.cpp)
+    target_link_libraries(test_logf PRIVATE lx.trace)
+    lumen_apply_module_properties(test_logf)
+    target_include_directories(test_logf PRIVATE tests)
+    add_test(NAME test_logf COMMAND test_logf)
 
     add_executable(test_snapshot tests/test_snapshot.cpp)
     target_link_libraries(test_snapshot PRIVATE lx.scene lx.runtime)
@@ -368,6 +473,51 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_text_input PRIVATE tests)
     add_test(NAME test_text_input COMMAND test_text_input)
 
+    # Screen capture's Wayland-free parts: policy, damage ring, the CPU render side.
+    add_executable(test_capture tests/test_capture.cpp)
+    target_link_libraries(test_capture PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_capture)
+    lumen_link_platform(test_capture)
+    target_include_directories(test_capture PRIVATE tests)
+    add_test(NAME test_capture COMMAND test_capture)
+
+    # Screen capture on the GL backend against the render node (skips without hardware GL):
+    # dma-buf targets, blits and crops, pixel-pack read-backs, the engine end to end.
+    add_executable(test_gl_capture tests/test_gl_capture.cpp)
+    target_link_libraries(test_gl_capture PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_gl_capture)
+    lumen_link_platform(test_gl_capture)
+    target_include_directories(test_gl_capture PRIVATE tests)
+    add_test(NAME test_gl_capture COMMAND test_gl_capture)
+
+    # Screen capture on the Vulkan backend (lavapipe without hardware Vulkan; skips without
+    # any): the read-back into shm, a crop.
+    add_executable(test_vk_capture tests/test_vk_capture.cpp)
+    target_link_libraries(test_vk_capture PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_vk_capture)
+    lumen_link_platform(test_vk_capture)
+    target_include_directories(test_vk_capture PRIVATE tests)
+    add_test(NAME test_vk_capture COMMAND test_vk_capture)
+    set_tests_properties(test_vk_capture PROPERTIES TIMEOUT 60)
+
+    # xdg-desktop-portal-lumen's pure parts: upright transforms (against lx.gfx's map),
+    # layout composition, PNG round trip, file names, user-dirs, chooser lines.
+    if(LUMEN_PORTAL_BUILT)
+        add_executable(test_portal_compose tests/test_portal_compose.cpp)
+        target_link_libraries(test_portal_compose PRIVATE lx.portal lx.gfx)
+        lumen_apply_module_properties(test_portal_compose)
+        lumen_link_platform(test_portal_compose)
+        target_include_directories(test_portal_compose PRIVATE tests)
+        add_test(NAME test_portal_compose COMMAND test_portal_compose)
+    endif()
+
+    add_executable(test_content_update tests/test_content_update.cpp)
+    target_link_libraries(test_content_update PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_content_update)
+    lumen_link_platform(test_content_update)
+    target_include_directories(test_content_update PRIVATE tests)
+    add_test(NAME test_content_update COMMAND test_content_update)
+
     # Idle tracking and inhibitors (compositor) with lumen-shell's idle policy (shell).
     add_executable(test_idle_notify tests/test_idle_notify.cpp)
     target_link_libraries(test_idle_notify PRIVATE lx.compositor lx.shell)
@@ -382,6 +532,21 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_keybindings)
     target_include_directories(test_keybindings PRIVATE tests)
     add_test(NAME test_keybindings COMMAND test_keybindings)
+
+    add_executable(test_toplevel_icon tests/test_toplevel_icon.cpp)
+    target_link_libraries(test_toplevel_icon PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_toplevel_icon)
+    lumen_link_platform(test_toplevel_icon)
+    target_include_directories(test_toplevel_icon PRIVATE tests)
+    add_test(NAME test_toplevel_icon COMMAND test_toplevel_icon)
+
+    # pointer-constraints' policy: effective regions, confinement, activation (Part C).
+    add_executable(test_pointer_constraints tests/test_pointer_constraints.cpp)
+    target_link_libraries(test_pointer_constraints PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_pointer_constraints)
+    lumen_link_platform(test_pointer_constraints)
+    target_include_directories(test_pointer_constraints PRIVATE tests)
+    add_test(NAME test_pointer_constraints COMMAND test_pointer_constraints)
 
     add_executable(test_input_serials tests/test_input_serials.cpp)
     target_link_libraries(test_input_serials PRIVATE lx.compositor)
@@ -583,6 +748,36 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_protocol_conformance)
     target_include_directories(test_protocol_conformance PRIVATE tests "${LUMEN_GENERATED_DIR}")
     add_test(NAME test_protocol_conformance COMMAND test_protocol_conformance)
+    # design-app-compat-capture Part B: dialogs, icons, bell, xdg-foreign, shortcuts
+    # inhibition, data control, security context — in-process, as above.
+    add_executable(test_window_protocols tests/test_window_protocols.cpp)
+    target_link_libraries(test_window_protocols PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_window_protocols)
+    lumen_link_platform(test_window_protocols)
+    target_include_directories(test_window_protocols PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_window_protocols COMMAND test_window_protocols)
+    set_tests_properties(test_window_protocols PROPERTIES TIMEOUT 60)
+
+    # Part C (design-app-compat-capture): pointer constraints, relative pointer, gestures —
+    # in-process against a real compositor with injected relative motion and gestures.
+    add_executable(test_pointer_protocols tests/test_pointer_protocols.cpp)
+    target_link_libraries(test_pointer_protocols PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_pointer_protocols)
+    lumen_link_platform(test_pointer_protocols)
+    target_include_directories(test_pointer_protocols PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_pointer_protocols COMMAND test_pointer_protocols)
+    set_tests_properties(test_pointer_protocols PROPERTIES TIMEOUT 60)
+
+    # Part D (design-app-compat-capture): screen capture — the toplevel list, output and
+    # window capture, every error, the lock, wlr-screencopy — in-process on a virtual output
+    # composited on the CPU (frames go only into the capture clients' buffers).
+    add_executable(test_capture_protocols tests/test_capture_protocols.cpp)
+    target_link_libraries(test_capture_protocols PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_capture_protocols)
+    lumen_link_platform(test_capture_protocols)
+    target_include_directories(test_capture_protocols PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_capture_protocols COMMAND test_capture_protocols)
+    set_tests_properties(test_capture_protocols PROPERTIES TIMEOUT 60)
     # ~25 s of round trips and settle waits on a 2-core VM, with jitter: 30 s was marginal.
     set_tests_properties(test_protocol_conformance PROPERTIES TIMEOUT 60)
 

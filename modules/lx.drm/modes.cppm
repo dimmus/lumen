@@ -15,10 +15,6 @@ module;
 // result: a mode the connector or link cannot carry fails the TEST_ONLY commit, as it should.
 // Pure, no allocation.
 
-#include <cmath>
-#include <cstdio>
-#include <cstring>
-
 #if defined(LUMEN_HAS_DISPLAY_INFO)
 extern "C" {
 #include <libdisplay-info/cvt.h>
@@ -26,6 +22,8 @@ extern "C" {
 #endif
 
 export module lx.drm:modes;
+
+import std;
 
 import :atomic;
 

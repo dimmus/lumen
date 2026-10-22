@@ -260,6 +260,39 @@ shadows, rounded corners, CSD borders) as black. The CPU occlusion cull and `mem
 path still apply to XRGB and fully opaque ARGB windows. Opaque-region sub-rects (splitting a
 draw into an opaque and a blended part) are a follow-up.
 
+**Opacity is applied once.** The node's opacity (alpha-modifier-v1) rides
+`draw_command::opacity` only; every backend multiplies it with the tint's alpha. The scene
+used to fold it into the tint as well, so a surface at alpha 0.5 came out at 0.25 — dormant
+while every opacity was 1. A draw whose effective alpha is 0 is skipped by every backend
+(`draw_invisible`) but still counts for the visibility pass, so a surface fading in from 0
+keeps its frame callbacks.
+
+### Solid colours: no texture, no upload
+
+A `wp_single_pixel_buffer_v1` is a colour, not pixels: the surface node emits a solid draw
+(`draw_command::solid`, the premultiplied encoded colour) of its logical size, the buffer is
+released at apply, and nothing is staged, uploaded or sampled. GL draws an opaque untinted
+one as a scissored `glClear` (no shader, no blend), anything else through the composite
+shader with the colour in place of the sample (`use_solid`), so it is decoded, tinted and
+faded exactly like a texel; the CPU path fills spans (no destination read when opaque) or
+blends per pixel; Vulkan substitutes the colour in the shader (a push constant flag; a 1x1
+descriptor keeps the pipeline's sampler set bound when a frame has no other). An opaque one
+occludes for the visibility pass and the CPU clear cull like any opaque draw.
+
+### Content updates wait off the frame path
+
+An update that cannot apply yet (a fifo barrier, a commit-timing target, an unsignalled
+fence) waits in the content-update queue, not in the composite: render never waits on a
+client's GPU work, and a slow client delays only itself. Costs: an unblocked dma-buf commit
+does one `poll(…, 0)` per distinct plane (the implicit-readiness check) and nothing else; a
+blocked one takes a pool record and, per fence, one epoll add and remove; a tick with nothing
+queued checks one counter. Frame callbacks moved from an inline 64-entry array per update to
+a shared node pool, which halves what a commit copies. fifo pacing clears barriers right
+after each output's publish, so a FIFO client gets exactly one update per refresh; a
+commit-timing target arms a stopped clock for exactly the tick that presents it (an idle
+desktop with a timed update wakes once). See [architecture.md](../architecture.md) "Explicit
+sync, buffer readiness and the commit-path protocols".
+
 ### Server-side frames: no new draw type
 
 A window frame (`lx.compositor:decoration`) is drawn with the existing textured-quad path on
@@ -276,6 +309,44 @@ decorated window. Title texture ids are allocated upward and never reused, so a 
 retirement can never drop a later texture that happened to get the same id. Damage is the
 frame's four strips (title bar plus borders, old and new apart), never the client area,
 which the window's own nodes account for; a hover or press repaints the close button only.
+
+### Screen capture: copies ride the composite
+
+A capture (ext-image-copy-capture, wlr-screencopy) costs nothing while no session exists: one
+counter test per tick and per composite. An output session with a pending frame copies the
+frame the output has just composited, on the render thread, right after the composite —
+only the damage since the composite it last copied (a per-output ring of the last eight
+composites' damage, reset when the targets are made again) plus what the client damaged.
+A requested frame starts no clock: it waits for its output to composite something new, so
+an idle desktop with an idle screencast costs no wakeups (10 s idle with wf-recorder
+running: 25 context switches, the same as without it).
+
+| Copy into | GL path | Render time per frame (1914x924, SVGA3D) |
+|-----------|---------|------------------------------------------|
+| nothing (an animating window) | — | 0.34 ms median |
+| client dma-buf (LINEAR XRGB) | one `glBlitFramebuffer` per damage rect into the buffer, imported once as a framebuffer; a native fence the UI's poller waits on | 0.50 ms |
+| client shm | the same blit into the session's LINEAR GBM buffer behind a native fence; a worker waits on it, maps the buffer and copies the damaged rows into the shm | 0.50 ms (was 12.1 ms with a `glReadPixels` into a pixel-pack buffer mapped on render: SVGA3D has no asynchronous read-back, the map stalls) |
+| wf-recorder (screencopy, shm) | as shm | 0.54 ms (was 11.5 ms) |
+
+The pointer is drawn onto the copy for `paint_cursors` (a GL quad, or a CPU blend after the
+shm copy) — the hardware plane is not in the scanout. The CPU backend composites the
+frame's draws for the damaged rects straight into the client's shm; Vulkan reads its target
+back synchronously (shm only). A window session composites its own capture view (scene
+views 16–23), built only when a frame is pending and the view has damage. See
+[architecture.md](../architecture.md) "Screen capture".
+
+**Through the portals (ADR 009 Part 5).** A ScreenCast is xdg-desktop-portal-wlr's
+ext-image-copy-capture session: per delivered frame the compositor's one copy into xdpw's
+PipeWire buffer, nothing else in the compositor (measured: 54 frames/s of a moving client
+at 1914x924 into shm buffers; pw-dump shows xdpw's `Video/Source` node linked to the
+consumer). Idle, xdg-desktop-portal-lumen and xdpw do not wake (0 context switches in
+10 s); a cast delivers frames only when the output changes, so its idle cost is the
+compositor's per-frame copy machinery times the desktop's own damage rate — with
+lumen-shell's panel repainting about once a second here, 24 → 154 compositor context
+switches per 10 s (UI ≈ 6.5, render ≈ 4, worker ≈ 3 per copied shm frame). A screenshot
+is one shm capture per output (60–90 ms per request end to end at 1914x924, the PNG included) and a PNG
+written at zlib level 1 with the Sub filter: 30 ms against grim's default 114 ms for 16 %
+more bytes.
 
 ### Texture retirement is dated, not immediate
 
@@ -624,7 +695,12 @@ running clocks, and a tick serves every output due within 1 ms of it (two output
 cost one wakeup). An output's clock stops after its own two quiet ticks while the others
 run; a dark output's never starts. A served clock's next start is never sooner than one
 period after the one just served, so a repaint estimate above the period ("run flat out")
-means a tick per refresh, not one per millisecond. Measured on vmwgfx: with three outputs an
+means a tick per refresh, not one per millisecond — and that floor also holds when a flip
+re-phases the clock (`frame_clocks::on_present`). On a display whose flips complete when the
+frame lands instead of at a vblank (vmwgfx), re-phasing to each flip with a large estimate
+(one slow frame in the window) used to aim the next start less than a period after the last:
+FIFO clients were presented 8–14 ms apart for a while (app-smoke T1/T3 after long runs). On a
+vblank-locked display the floor never binds. Measured on vmwgfx: with three outputs an
 idle desktop costs 7 context switches in 5 s and no CPU tick; with two, a client
 presenting 180 frames on one output left the other at 0 composites and 0 commits.
 
@@ -834,16 +910,20 @@ Accessible via `gfx::device::semaphores()`.
 
 ## 9. Content-type hints
 
-Clients (or compositor heuristics) set `content_hint` on `surface_commit`:
+Clients set the hint with wp_content_type_v1 (double-buffered with the surface state);
+`surface_manager::content_hint_for` reports it:
 
 | Hint | Scanout priority |
 |------|------------------|
 | `game` | Highest |
 | `video` | High |
-| `normal` | Default |
+| `photo` | Default |
+| `none` | Default |
 | `subsurface_ui` | Lowest — prefer composite |
 
-Used by `scanout_manager::evaluate` when multiple fullscreen candidates exist.
+For `scanout_manager::evaluate` when multiple fullscreen candidates exist (direct scanout is
+not implemented yet), and for the connector's `content type` property of the output a window
+is fullscreen on, where the connector has one (none on vmwgfx; not programmed yet).
 
 ---
 
@@ -881,6 +961,7 @@ Compositor logs **`warn`** when a tick exceeds budget (never on every frame at `
 | KMS atomic + damage | `lx.drm.atomic` |
 | Present timing | `lx.scheduler.presentation` |
 | CPU budgets | `lx.scheduler.budget` |
+| Screen capture (policy, render side, GL objects) | `lx.compositor:capture`, `lx.compositor:capture_engine`, `lx.gfx:gl_capture` |
 
 ---
 
@@ -911,3 +992,4 @@ Compositor logs **`warn`** when a tick exceeds budget (never on every frame at `
 | [31-hybrid-scanout-overlays.mmd](../uml/31-hybrid-scanout-overlays.mmd) | Hybrid primary + overlay stack |
 | [32-kms-atomic-damage.mmd](../uml/32-kms-atomic-damage.mmd) | Atomic commit + damage blob |
 | [33-gpu-resource-pools.mmd](../uml/33-gpu-resource-pools.mmd) | Pipeline cache + semaphore pool |
+| [42-capture-sequence.mmd](../uml/42-capture-sequence.mmd) | Screen capture: session, job, copy, completion |

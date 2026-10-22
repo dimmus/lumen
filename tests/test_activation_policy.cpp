@@ -1,12 +1,10 @@
 // xdg-activation's focus-stealing-prevention policy (`decide_activation`, `decide_grantable`)
 // row by row, serial wraparound, the lifetime boundary, the token table (eviction, single
 // use, constant-time lookup by exact text) and the token text (format, uniqueness).
-#include <cstring>
-#include <set>
-#include <string>
 
 #include "lumen_test.hpp"
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.compositor;

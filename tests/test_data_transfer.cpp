@@ -3,9 +3,7 @@
 // dnd_action), including the modifier-chosen user action and version-2 sides.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstring>
-
+import std;
 import lx.compositor;
 
 using lx::compositor::dnd_ask;

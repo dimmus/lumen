@@ -1,12 +1,9 @@
 module;
 
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <stdlib.h>
 
 #if defined(LUMEN_HAS_INPUT)
-#include <cerrno>
-#include <new>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -16,6 +13,8 @@ module;
 import lx.foundation;
 
 export module lx.input:keymap;
+
+import std;
 
 export namespace lx::input {
 
@@ -256,8 +255,7 @@ lx::result<void> lx::input::keyboard_keymap::compile(keymap_config config) {
     auto* map = xkb_keymap_new_from_names(ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
     if (!map) {
         destroy();
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "xkb_keymap_new_from_names failed — check layout/variant");
+        return lx::invalid_argument("xkb_keymap_new_from_names failed — check layout/variant");
     }
     keymap_ = map;
 
@@ -514,7 +512,7 @@ lx::result<lx::unique_fd> lx::input::normalize_keymap(const char* text, unsigned
     while (text && len > 0 && text[len - 1] == '\0')
         --len;
     if (!text || len == 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "empty keymap");
+        return lx::invalid_argument("empty keymap");
     xkb_context* ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!ctx)
         return lx::make_error(lx::error_domain::io, 0, "xkb_context_new failed");
@@ -522,7 +520,7 @@ lx::result<lx::unique_fd> lx::input::normalize_keymap(const char* text, unsigned
                                                     XKB_KEYMAP_COMPILE_NO_FLAGS);
     xkb_context_unref(ctx);
     if (!keymap)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "keymap does not compile");
+        return lx::invalid_argument("keymap does not compile");
     char* out = xkb_keymap_get_as_string(keymap, XKB_KEYMAP_FORMAT_TEXT_V1);
     xkb_keymap_unref(keymap);
     if (!out)
@@ -546,7 +544,7 @@ lx::result<lx::unique_fd> lx::input::normalize_keymap_fd(int fd, unsigned long s
 #if defined(LUMEN_HAS_INPUT)
     size_out = 0;
     if (fd < 0 || size == 0 || size > k_max_client_keymap)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "keymap size");
+        return lx::invalid_argument("keymap size");
     // Once per keymap request, never per key: a heap copy is the price of not mapping a
     // file the client controls.
     char* text = new (std::nothrow) char[size];
@@ -563,8 +561,7 @@ lx::result<lx::unique_fd> lx::input::normalize_keymap_fd(int fd, unsigned long s
     }
     if (got != size) {
         delete[] text;
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "keymap file shorter than its size");
+        return lx::invalid_argument("keymap file shorter than its size");
     }
     auto out = normalize_keymap(text, size, size_out);
     delete[] text;

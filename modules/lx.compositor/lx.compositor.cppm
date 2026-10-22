@@ -44,6 +44,12 @@ export import :idle;
 export import :display_power;
 export import :session_lock;
 export import :text_input;
+export import :content_update;
+export import :toplevel_icon;
+export import :foreign_registry;
+export import :pointer_constraints;
+export import :capture;
+export import :capture_engine;
 
 export namespace lx::compositor {
 
@@ -155,6 +161,8 @@ public:
     [[nodiscard]] wayland::server& wayland();
     [[nodiscard]] surface_manager& surfaces();
     [[nodiscard]] toplevel_manager& toplevels();
+    /// xdg-toplevel-icon-v1's icon store (tests read what a set_icon snapshotted).
+    [[nodiscard]] const toplevel_icon_table& toplevel_icons() const;
     [[nodiscard]] window_manager& windows();
     [[nodiscard]] shell_bridge& shell_bridge();
     [[nodiscard]] cursor_manager& cursor();
@@ -182,7 +190,14 @@ public:
     /// the seat does; a motion puts the pointer at (`x`, `y`) in global coordinates.
     void inject_key(const lx::input::key_event& event);
     void inject_pointer_motion(const lx::input::pointer_motion_event& event);
+    /// A relative device's motion by (`dx`, `dy`) (accelerated) with its unaccelerated
+    /// deltas, as libinput reports it: what pointer locks, confinement and relative pointers
+    /// see from a mouse.
+    void inject_pointer_relative(double dx, double dy, double dx_unaccel, double dy_unaccel,
+                                 unsigned long long time_us = 0);
     void inject_pointer_button(const lx::input::pointer_button_event& event);
+    /// A touchpad gesture event (pointer-gestures), as libinput would deliver it.
+    void inject_gesture(const lx::input::gesture_event& event);
     /// logind's Session.Unlock, as the signal delivers it (`loginctl unlock-session`): for
     /// headless tests. UI affinity.
     void inject_logind_unlock();
@@ -194,6 +209,9 @@ public:
     /// Runs the work other threads posted to the UI thread (the event loop does this between
     /// dispatches; a test that drives `tick_ui` itself calls it). UI affinity.
     void run_posted_ui_tasks();
+    /// Wakes the render thread and returns once it has run a tick (what `on_vsync` does after
+    /// `tick_ui`; for tests that drive `tick_ui` themselves). False after 2 s without one.
+    bool render_and_wait();
     /// The persisted output configuration as the compositor holds it (ADR 008 §C.5), and a
     /// save written now instead of after its 2 s debounce (tests). UI affinity.
     [[nodiscard]] const output_config& persisted_outputs() const;

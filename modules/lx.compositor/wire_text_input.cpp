@@ -22,10 +22,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <new>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -36,6 +33,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -58,6 +57,12 @@ namespace {
 
 void ime_log(const char* line) {
     lx::trace::logger::global().log(lx::trace::level::debug, "compositor.ime", line);
+}
+
+template <typename... Args>
+void ime_log(std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.ime", fmt,
+                                     std::forward<Args>(args)...);
 }
 
 [[nodiscard]] lx::compositor::text_input_relay* relay() {
@@ -122,18 +127,13 @@ const struct zwp_text_input_v3_interface ti_impl = {
             auto* o = ti_from(r);
             if (!o || !relay())
                 return;
-            const std::size_t len = text ? std::strlen(text) : 0;
-            if (len > lx::compositor::k_ime_text_max && !o->truncation_logged && ime_debug()) {
+            const std::string_view s = text ? text : "";
+            if (s.size() > lx::compositor::k_ime_text_max && !o->truncation_logged && ime_debug()) {
                 o->truncation_logged = true;
-                char line[128];
-                std::snprintf(line, sizeof(line),
-                              "text input surrounding text of %zu bytes cut to the protocol's 4000",
-                              len);
-                ime_log(line);
+                ime_log("text input surrounding text of {} bytes cut to the protocol's 4000",
+                        s.size());
             }
-            relay()->set_surrounding(o->record, text,
-                                     static_cast<unsigned>(len > 0xffffu ? 0xffffu : len), cursor,
-                                     anchor);
+            relay()->set_surrounding(o->record, s, cursor, anchor);
         },
     .set_text_change_cause =
         [](struct wl_client*, struct wl_resource* r, uint32_t cause) {
@@ -208,11 +208,9 @@ void ev_enter(void*, void* ti, void* surface) {
         return;
     zwp_text_input_v3_send_enter(static_cast<wl_resource*>(ti), static_cast<wl_resource*>(surface));
     if (ime_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "text input enter ti=%u surface=%u",
-                      wl_resource_get_id(static_cast<wl_resource*>(ti)),
-                      wl_resource_get_id(static_cast<wl_resource*>(surface)));
-        ime_log(line);
+        ime_log("text input enter ti={} surface={}",
+                wl_resource_get_id(static_cast<wl_resource*>(ti)),
+                wl_resource_get_id(static_cast<wl_resource*>(surface)));
     }
 }
 
@@ -221,10 +219,7 @@ void ev_leave(void*, void* ti, void* surface) {
         return;
     zwp_text_input_v3_send_leave(static_cast<wl_resource*>(ti), static_cast<wl_resource*>(surface));
     if (ime_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "text input leave ti=%u",
-                      wl_resource_get_id(static_cast<wl_resource*>(ti)));
-        ime_log(line);
+        ime_log("text input leave ti={}", wl_resource_get_id(static_cast<wl_resource*>(ti)));
     }
 }
 

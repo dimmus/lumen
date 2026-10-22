@@ -1,12 +1,12 @@
 module;
 
-#include <cstdio>
-
 import lx.foundation;
 import lx.runtime;
 import lx.trace;
 
 export module lx.compositor:liveness;
+
+import std;
 
 export namespace lx::compositor {
 
@@ -89,8 +89,15 @@ private:
         lx::runtime::clock_time since_ns = 0;
         bool used = false;
     };
-    [[nodiscard]] entry* find(lx::client_id client);
-    [[nodiscard]] const entry* find(lx::client_id client) const;
+    /// `entry*`, or `const entry*` on a const tracker.
+    [[nodiscard]] auto find(this auto& self, lx::client_id client) -> decltype(&self.entries_[0]) {
+        if (!client)
+            return nullptr;
+        for (auto& e : self.entries_)
+            if (e.used && e.client == client)
+                return &e;
+        return nullptr;
+    }
     [[nodiscard]] entry* find_or_add(lx::client_id client, lx::runtime::clock_time now);
     void recompute_deadline();
 
@@ -127,21 +134,6 @@ const char* lx::compositor::ping_reason_name(ping_reason r) {
     case ping_reason::periodic: return "periodic";
     }
     return "-";
-}
-
-lx::compositor::liveness_tracker::entry*
-lx::compositor::liveness_tracker::find(lx::client_id client) {
-    if (!client)
-        return nullptr;
-    for (auto& e : entries_)
-        if (e.used && e.client == client)
-            return &e;
-    return nullptr;
-}
-
-const lx::compositor::liveness_tracker::entry*
-lx::compositor::liveness_tracker::find(lx::client_id client) const {
-    return const_cast<liveness_tracker*>(this)->find(client);
 }
 
 lx::compositor::liveness_tracker::entry*
@@ -196,10 +188,9 @@ void lx::compositor::liveness_tracker::request(lx::client_id client, lx::runtime
     if (now + timeout_ns_ < next_deadline_)
         next_deadline_ = now + timeout_ns_;
     if (liveness_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "ping client=%llu serial=%u reason=%s", client.id(),
-                      serial, ping_reason_name(why));
-        lx::trace::logger::global().log(lx::trace::level::debug, k_liveness_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_liveness_category,
+                                         "ping client={} serial={} reason={}", client.id(), serial,
+                                         ping_reason_name(why));
     }
 }
 
@@ -212,10 +203,9 @@ void lx::compositor::liveness_tracker::on_pong(lx::client_id client, unsigned se
     e->serial = 0;
     e->last_pong_ns = now;
     if (liveness_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "pong client=%llu serial=%u rtt_ms=%u", client.id(),
-                      serial, to_ms(rtt));
-        lx::trace::logger::global().log(lx::trace::level::debug, k_liveness_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_liveness_category,
+                                         "pong client={} serial={} rtt_ms={}", client.id(), serial,
+                                         to_ms(rtt));
     }
     if (e->not_responding) {
         e->not_responding = false;
@@ -232,10 +222,8 @@ void lx::compositor::liveness_tracker::cancel(lx::client_id client, unsigned ser
     const bool awaited = !e->not_responding;
     e->serial = 0;
     if (liveness_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "ping-cancel client=%llu serial=%u", client.id(),
-                      serial);
-        lx::trace::logger::global().log(lx::trace::level::debug, k_liveness_category, line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_liveness_category,
+                                         "ping-cancel client={} serial={}", client.id(), serial);
     }
     if (e->not_responding) {
         e->not_responding = false;

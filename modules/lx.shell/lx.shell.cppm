@@ -1,17 +1,10 @@
 module;
 
-#include <cerrno>
-#include <climits>
-#include <csignal>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <ctime>
-#include <memory>
-#include <string>
-#include <utility>
-#include <vector>
+#include <errno.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdint.h>
+#include <time.h>
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <poll.h>
@@ -52,9 +45,13 @@ import lx.trace;
 
 export module lx.shell;
 
+import std;
+
 export import :task_model;
 export import :bridge;
 export import :shm_canvas;
+export import :icon_theme;
+export import :visual_bell;
 export import :panel;
 export import :desktop_entry;
 export import :app_catalog;
@@ -116,6 +113,8 @@ private:
         t_relaunch,
         /// The blank that waits for a lock the blank timeout started: at most 5 s.
         t_lock_blank,
+        /// The visual bell's flashes end (120 ms after the bell).
+        t_bell,
         t_count
     };
     enum class pointer_target : unsigned char { none, panel, launcher };
@@ -202,6 +201,13 @@ private:
     /// Powers every output off (zwlr_output_power_v1), logging `why`.
     void blank_outputs(const char* why);
 
+    // ── zlm v6: icons and the bell ──
+    /// The panel's icon source: the icon-theme name, the window's own pixel buffers, the
+    /// app id as an icon name, its desktop entry's Icon=; null for a letter tile.
+    [[nodiscard]] const std::uint32_t* resolve_icon(task_handle h, const task_entry& e, int px);
+    /// zlm_policy_bridge_v1.bell: flash the window, or the active output's panel strip.
+    void on_bell(task_handle h);
+
     // ── Lock policy ──
     /// zlm_shell_v1 v5 events.
     void on_lock_state(unsigned state);
@@ -213,6 +219,16 @@ private:
 
     shell_config config_{};
     policy_bridge bridge_{};
+    icon_theme icons_{};
+    visual_bell bell_{};
+    /// A window's own icon pixels resampled to the size the panel draws (per task slot).
+    struct icon_cache {
+        unsigned gen = 0;
+        unsigned rev = 0;
+        int px = 0;
+        std::vector<std::uint32_t> pixels;
+    };
+    icon_cache icon_cache_[k_max_tasks]{};
     std::vector<std::unique_ptr<output_record>> outputs_{};
     /// The panels exist (after the setup): an output bound later gets its panel at its done.
     bool panels_enabled_ = false;
@@ -279,8 +295,20 @@ constexpr const char* k_shell_category = "shell";
     lx::trace::logger::global().log(lvl, k_shell_category, line);
 }
 
+template <typename... Args>
+[[maybe_unused]] void shell_log(lx::trace::level lvl, std::format_string<Args...> fmt,
+                                Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_shell_category, fmt, std::forward<Args>(args)...);
+}
+
 [[maybe_unused]] void apps_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, k_apps_category, line);
+}
+
+template <typename... Args>
+[[maybe_unused]] void apps_log(lx::trace::level lvl, std::format_string<Args...> fmt,
+                               Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_apps_category, fmt, std::forward<Args>(args)...);
 }
 
 [[maybe_unused]] [[nodiscard]] bool shell_debug() {
@@ -679,7 +707,8 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         // compositor simply never sends them.
         // v4: key grabs; v5: the session lock's state and lock requests. An older
         // compositor is bound at its own version, and the bridge reports what is absent.
-        a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface, min_version(version, 5));
+        // v6: icons, parents, the bell, capture state, non-inhibitable grabs.
+        a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface, min_version(version, 6));
         // capabilities follows the bind at once; listen before it is dispatched.
         (void)a.bridge_.observe(a.shell_);
     } else if (std::strcmp(iface, wp_cursor_shape_manager_v1_interface.name) == 0) {
@@ -795,20 +824,17 @@ void lx::shell::shell_app::events::power_mode(void* data, zwlr_output_power_v1*,
     auto& o = out(data);
     o.off = mode == ZWLR_OUTPUT_POWER_V1_MODE_OFF;
     if (shell_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "output power %s (%s)", o.off ? "off" : "on",
-                      o.connector);
-        lx::trace::logger::global().log(lx::trace::level::debug, "shell.idle", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "shell.idle",
+                                         "output power {} ({})", o.off ? "off" : "on", o.connector);
     }
 }
 
 void lx::shell::shell_app::events::power_failed(void* data, zwlr_output_power_v1* p) {
     auto& o = out(data);
-    char line[128];
-    std::snprintf(line, sizeof(line),
-                  "output power control failed (output %s went?) — not blanked any more",
-                  o.connector);
-    lx::trace::logger::global().log(lx::trace::level::warn, "shell.idle", line);
+    lx::trace::logger::global().logf(lx::trace::level::warn, "shell.idle",
+                                     "output power control failed (output {} went?) — not blanked "
+                                     "any more",
+                                     o.connector);
     zwlr_output_power_v1_destroy(p);
     if (o.power == p)
         o.power = nullptr;
@@ -863,12 +889,11 @@ void lx::shell::shell_app::setup_idle() {
     const unsigned timeout_ms = idle_.blank_timeout_ms(idle_notifier_ != nullptr,
                                                        power_manager_ != nullptr && !outputs_.empty());
     if (timeout_ms == 0) {
-        char line[160];
-        std::snprintf(line, sizeof(line), "no screen blanking:%s%s%s",
-                      config_.idle.blank_after_s == 0 ? " --blank-after 0" : "",
-                      !idle_notifier_ ? " no ext_idle_notifier_v1" : "",
-                      !power_manager_ || outputs_.empty() ? " no zwlr_output_power_manager_v1" : "");
-        lx::trace::logger::global().log(lx::trace::level::info, "shell.idle", line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::info, "shell.idle", "no screen blanking:{}{}{}",
+            config_.idle.blank_after_s == 0 ? " --blank-after 0" : "",
+            !idle_notifier_ ? " no ext_idle_notifier_v1" : "",
+            !power_manager_ || outputs_.empty() ? " no zwlr_output_power_manager_v1" : "");
         return;
     }
     // One power control per output, for outputs that come later too (M13).
@@ -882,10 +907,9 @@ void lx::shell::shell_app::setup_idle() {
         ext_idle_notification_v1_add_listener(
             static_cast<ext_idle_notification_v1*>(idle_notification_), &k_idle_listener, this);
     }
-    char line[128];
-    std::snprintf(line, sizeof(line), "blanking the outputs after %u s without input",
-                  config_.idle.blank_after_s);
-    lx::trace::logger::global().log(lx::trace::level::info, "shell.idle", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "shell.idle",
+                                     "blanking the outputs after {} s without input",
+                                     config_.idle.blank_after_s);
 #else
     lx::trace::logger::global().log(lx::trace::level::info, "shell.idle",
                                     "no screen blanking: built without ext-idle-notify / "
@@ -991,6 +1015,10 @@ void lx::shell::shell_app::output_ready(output_record& o) {
                            return at < 0 ? self == 0 : static_cast<unsigned>(at) == self;
                        },
                        &o});
+    o.bar->set_icons({[](task_handle h, const task_entry& e, int px, void* user) {
+                          return static_cast<shell_app*>(user)->resolve_icon(h, e, px);
+                      },
+                      this});
     if (auto created = o.bar->create({.compositor = compositor_,
                                       .shm = shm_,
                                       .layer_shell = layer_shell_,
@@ -1002,10 +1030,8 @@ void lx::shell::shell_app::output_ready(output_record& o) {
         o.bar.reset();
         return;
     }
-    char line[128];
-    std::snprintf(line, sizeof(line), "panel requested on output %s (%dx%d+%d+%d)", o.connector,
-                  o.logical.width, o.logical.height, o.logical.x, o.logical.y);
-    shell_log(lx::trace::level::info, line);
+    shell_log(lx::trace::level::info, "panel requested on output {} ({}x{}+{}+{})", o.connector,
+              o.logical.width, o.logical.height, o.logical.x, o.logical.y);
     outputs_moved();
 }
 
@@ -1045,9 +1071,7 @@ void lx::shell::shell_app::remove_output(unsigned name) {
     for (auto it = outputs_.begin(); it != outputs_.end(); ++it) {
         if ((*it)->name != name)
             continue;
-        char line[96];
-        std::snprintf(line, sizeof(line), "output %s removed: its panel goes", (*it)->connector);
-        shell_log(lx::trace::level::info, line);
+        shell_log(lx::trace::level::info, "output {} removed: its panel goes", (*it)->connector);
         destroy_output(**it);
         outputs_.erase(it);
         outputs_moved();
@@ -1144,6 +1168,10 @@ void lx::shell::shell_app::on_timer() {
         if (idle_.lock_state() == shell_lock::abandoned)
             launch_locker("relaunch after the locker exited");
     }
+    if (deadline_[t_bell] && deadline_[t_bell] <= now) {
+        bell_.expire(now);
+        deadline_[t_bell] = bell_.deadline();
+    }
     if (deadline_[t_lock_blank] && deadline_[t_lock_blank] <= now) {
         deadline_[t_lock_blank] = 0;
         // The lock did not come in time: dark anyway (the compositor keeps it locked if it
@@ -1152,6 +1180,90 @@ void lx::shell::shell_app::on_timer() {
             blank_outputs("idle: no lock within 5 s — powering the outputs off anyway");
     }
     arm_timer();
+}
+
+// ── zlm v6: icons and the bell ──
+
+const std::uint32_t* lx::shell::shell_app::resolve_icon(task_handle h, const task_entry& e, int px) {
+    // 1. The name the window gave (xdg-toplevel-icon-v1), in the icon theme.
+    if (e.icon_name[0])
+        if (const std::uint32_t* p = icons_.lookup(e.icon_name, px))
+            return p;
+    // 2. Its own pixel buffers: the one nearest the size, resampled once per revision.
+    policy_bridge::icon_image images[policy_bridge::k_icon_images];
+    if (const unsigned n = bridge_.icon_images(h, images, policy_bridge::k_icon_images); n > 0) {
+        icon_cache& c = icon_cache_[h.index];
+        if (c.gen != h.gen || c.rev != e.icon_rev || c.px != px || c.pixels.empty()) {
+            // The smallest buffer at least as large as asked, else the largest.
+            const policy_bridge::icon_image* best = nullptr;
+            for (unsigned i = 0; i < n; ++i) {
+                const auto& im = images[i];
+                if (!best || (im.size >= px && (best->size < px || im.size < best->size)) ||
+                    (best->size < px && im.size > best->size))
+                    best = &im;
+            }
+            c.gen = h.gen;
+            c.rev = e.icon_rev;
+            c.px = px;
+            c.pixels.assign(static_cast<std::size_t>(px) * static_cast<std::size_t>(px), 0u);
+            resample_icon(best->pixels, best->size, c.pixels.data(), px);
+        }
+        return c.pixels.data();
+    }
+    // 3. The app id as an icon name (foot, org.gtk.Demo4), then its desktop entry's Icon=.
+    if (e.app_id[0]) {
+        if (const std::uint32_t* p = icons_.lookup(e.app_id, px))
+            return p;
+        ensure_catalog();
+        if (const desktop_entry* d = catalog_.find(e.app_id); d && !d->icon.empty()) {
+            char name[256];
+            std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(d->icon.size()), d->icon.data());
+            if (const std::uint32_t* p = icons_.lookup(name, px))
+                return p;
+        }
+    }
+    return nullptr;
+}
+
+void lx::shell::shell_app::on_bell(task_handle h) {
+    if (idle_.lock_state() != shell_lock::unlocked || outputs_.empty())
+        return;
+    const long long now = now_ns();
+    lx::rect2i rects[16];
+    unsigned n = 0;
+    for (const auto& o : outputs_)
+        if (n < 16 && o->done)
+            rects[n++] = o->logical;
+    bool flashed = false;
+    if (const task_entry* e = bridge_.model().get(h); e && e->geometry.width > 0) {
+        // The window's rect on the output it overlaps most (a flash is a layer surface of
+        // one output).
+        const int at = task_output(e->geometry, rects, n);
+        unsigned i = 0;
+        for (const auto& o : outputs_) {
+            if (!o->done)
+                continue;
+            if (static_cast<int>(i++) != at)
+                continue;
+            const lx::rect2i& L = o->logical;
+            const int x0 = e->geometry.x > L.x ? e->geometry.x : L.x;
+            const int y0 = e->geometry.y > L.y ? e->geometry.y : L.y;
+            const int x1 = e->geometry.x + e->geometry.width < L.x + L.width
+                               ? e->geometry.x + e->geometry.width
+                               : L.x + L.width;
+            const int y1 = e->geometry.y + e->geometry.height < L.y + L.height
+                               ? e->geometry.y + e->geometry.height
+                               : L.y + L.height;
+            flashed = bell_.flash(o->output, {x0 - L.x, y0 - L.y, x1 - x0, y1 - y0}, now);
+        }
+    }
+    if (!flashed) {
+        // No window (or not on screen): the panel strip of the output the user works on.
+        if (output_record* o = launcher_output(); o && o->logical.width > 0)
+            flashed = bell_.flash(o->output, {0, 0, o->logical.width, k_panel_height}, now);
+    }
+    if (flashed)
+        set_timer(t_bell, bell_.deadline());
 }
 
 // ── Lock policy ──
@@ -1173,9 +1285,8 @@ void lx::shell::shell_app::launch_locker(const char* why) {
         return;
     }
     idle_.note_locker_started(now_ns());
-    char line[PATH_MAX + 64];
-    std::snprintf(line, sizeof(line), "lock: starting %s (%s)", p->program, why);
-    lx::trace::logger::global().log(lx::trace::level::info, "shell.lock", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "shell.lock", "lock: starting {} ({})",
+                                     p->program, why);
     // No activation token: a locker's surfaces take the keyboard as lock surfaces.
     start_launch(*p, nullptr);
 }
@@ -1274,9 +1385,7 @@ void lx::shell::shell_app::open_launcher() {
         return;
     }
     if (o && shell_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "launcher on output %s", o->connector);
-        shell_log(lx::trace::level::debug, line);
+        shell_log(lx::trace::level::debug, "launcher on output {}", o->connector);
     }
     set_apps_all(true);
     // A panel notice belongs to the closed launcher; the launcher has its own status row.
@@ -1463,10 +1572,8 @@ void lx::shell::shell_app::start_launch(const prepared_launch& p, const char* to
     if (!display || !*display)
         display = "wayland-0";
     if (shell_debug()) {
-        char line[PATH_MAX + 128];
-        std::snprintf(line, sizeof(line), "apps: starting %s (%s) token=%s", p.id, p.program,
-                      token ? "yes" : "no");
-        apps_log(lx::trace::level::debug, line);
+        apps_log(lx::trace::level::debug, "apps: starting {} ({}) token={}", p.id, p.program,
+                 token ? "yes" : "no");
     }
     apps_.start(p, token ? token : "", display);
 }
@@ -1564,6 +1671,13 @@ int lx::shell::shell_app::run() {
                        a.set_timer(t_repeat, 0);
                    },
                    this);
+    // The visual bell (zlm v6) flashes over windows through overlay layer surfaces.
+    bell_.init({.compositor = compositor_,
+                .shm = shm_,
+                .layer_shell = layer_shell_,
+                .viewporter = viewporter_});
+    bridge_.set_bell_handler(
+        [](task_handle h, void* user) { static_cast<shell_app*>(user)->on_bell(h); }, this);
     // Shell keybindings (zlm_shell_v1 v4). The Super tap is observed — the key still reaches
     // the focused window — and fires only when Super was pressed and released alone.
     if (bridge_.can_grab_keys()) {
@@ -1583,7 +1697,11 @@ int lx::shell::shell_app::run() {
                 if (a.idle_.on_lock_requested())
                     a.launch_locker("Super+L");
             };
-            (void)bridge_.grab_key(k_key_l, policy_bridge::k_mod_super, 0, on_lock, this);
+            // Not inhibitable (v6): a VM viewer that takes the desktop's shortcuts must not
+            // take away the user's lock key.
+            (void)bridge_.grab_key(k_key_l, policy_bridge::k_mod_super,
+                                   bridge_.has_v6() ? policy_bridge::k_grab_not_inhibitable : 0u,
+                                   on_lock, this);
         }
     } else {
         (void)bridge_.grab_key(0, 0, 0, nullptr, nullptr); // logs the absence once
@@ -1595,22 +1713,17 @@ int lx::shell::shell_app::run() {
                                         "compositor below zlm_shell_v1 v5: no session-lock "
                                         "integration");
     } else if (idle_.can_lock()) {
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "lock command: %s (Super+L, logind Lock, before sleep%s)",
-                      idle_.config().lock_command,
-                      idle_.config().lock_on_blank && idle_.config().enabled &&
-                              idle_.config().blank_after_s
-                          ? ", before blanking"
-                          : "");
-        lx::trace::logger::global().log(lx::trace::level::info, "shell.lock", line);
+        lx::trace::logger::global().logf(
+            lx::trace::level::info, "shell.lock",
+            "lock command: {} (Super+L, logind Lock, before sleep{})", idle_.config().lock_command,
+            idle_.config().lock_on_blank && idle_.config().enabled && idle_.config().blank_after_s
+                ? ", before blanking"
+                : "");
     }
     update_locked_notification(); // started behind a lock (a restart while locked)
     {
-        char line[160];
-        std::snprintf(line, sizeof(line), "connected to %s; panel requested",
-                      config_.display ? config_.display : "$WAYLAND_DISPLAY");
-        shell_log(lx::trace::level::info, line);
+        shell_log(lx::trace::level::info, "connected to {}; panel requested",
+                  config_.display ? config_.display : "$WAYLAND_DISPLAY");
     }
 
     int code = 0;
@@ -1642,9 +1755,7 @@ int lx::shell::shell_app::run() {
                 continue;
             // The compositor closed it (its output went), or a buffer could not be made:
             // that output goes without a panel; the others stay.
-            char line[128];
-            std::snprintf(line, sizeof(line), "panel on output %s closed", o->connector);
-            shell_log(lx::trace::level::warn, line);
+            shell_log(lx::trace::level::warn, "panel on output {} closed", o->connector);
             if (o->bar.get() == pointer_panel_) {
                 pointer_panel_ = nullptr;
                 pointer_target_ = pointer_target::none;
@@ -1699,9 +1810,7 @@ int lx::shell::shell_app::run() {
         if (n > 0 && (fds[1].revents & POLLIN)) {
             signalfd_siginfo si{};
             if (read(sfd, &si, sizeof(si)) == static_cast<ssize_t>(sizeof(si))) {
-                char line[64];
-                std::snprintf(line, sizeof(line), "signal %u: exiting", si.ssi_signo);
-                shell_log(lx::trace::level::info, line);
+                shell_log(lx::trace::level::info, "signal {}: exiting", si.ssi_signo);
                 break;
             }
         }
@@ -1717,7 +1826,7 @@ int lx::shell::shell_app::run() {
         // The bus is processed every time it is open (its timeouts are due without fd
         // activity); pipes only with events.
         if (na > 0)
-            apps_.dispatch(fds + k_fixed, na);
+            apps_.dispatch({fds + k_fixed, na});
     }
     close(sfd);
     teardown();
@@ -1737,6 +1846,7 @@ void lx::shell::shell_app::teardown() {
         t.launch.reset();
     }
     launcher_.close();
+    bell_.destroy_all();
     pointer_panel_ = nullptr;
     for (auto& o : outputs_)
         if (o->bar)

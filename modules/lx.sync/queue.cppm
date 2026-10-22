@@ -1,10 +1,6 @@
-module;
-
-#include <atomic>
-#include <cstddef>
-#include <utility>
-
 export module lx.sync:queue;
+
+import std;
 
 export namespace lx::sync {
 

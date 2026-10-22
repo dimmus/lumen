@@ -6,13 +6,16 @@ module;
 // unit keeps its own helpers in an anonymous namespace, so only what is declared here has
 // module linkage.
 
-#include <cstdint>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #endif
+#include <signal.h>
 
 module lx.compositor:wire;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -28,19 +31,35 @@ import :protocols_p0;
 import :data_transfer;
 import :viewport;
 import :text_input;
+import :content_update;
+import :capture;
 
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
 
 constexpr unsigned k_max_surfaces = 256;
+/// wl_surface.frame callbacks one content update may carry; beyond, the oldest is answered
+/// at once (a dropped callback stalls its client for good).
 constexpr unsigned k_max_frame_cbs = 64;
 constexpr unsigned k_max_regions = 128;
 
-struct frame_callback {
-    wl_resource* resource = nullptr;
-    bool used = false;
+/// A frame-callback list (wire_surface.cpp): nodes in a shared pool, so a content update
+/// carries three words instead of an inline array — what makes queued updates cheap.
+struct frame_cb_list {
+    unsigned head = 0; // pool index + 1; 0: empty
+    unsigned tail = 0;
+    unsigned count = 0;
 };
+
+/// linux-drm-syncobj-v1: a point on an imported timeline (`drm_timeline_table` id; 0: unset).
+struct sync_point {
+    unsigned timeline = 0;
+    unsigned long long point = 0;
+};
+
+/// wp_content_type_v1 / wp_tearing_control_v1 values as the protocols number them.
+enum : unsigned char { k_tearing_vsync = 0, k_tearing_async = 1 };
 
 /// wp_viewport state (sticky: set once, it holds until changed or the viewport goes). The
 /// source is kept as the raw 24.8 fixed values: the "unset" sentinel and the integer test
@@ -76,8 +95,22 @@ struct surface_pending {
     bool has_damage_buffer = false;
     /// wp_viewport state, merged like scale and transform.
     viewport_state viewport{};
-    frame_callback frame_cbs[k_max_frame_cbs]{};
-    unsigned frame_cb_count = 0;
+    /// wp_alpha_modifier_v1 multiplier, wp_content_type_v1 type, wp_tearing_control_v1 hint:
+    /// sticky like scale (set once, they hold until changed or their object goes).
+    std::uint32_t alpha = 0xFFFFFFFFu;
+    unsigned char content_type = 0;
+    unsigned char tearing = k_tearing_vsync;
+    /// fifo-v1 (per update): set_barrier / wait_barrier.
+    bool fifo_set = false;
+    bool fifo_wait = false;
+    /// commit-timing-v1 (per update): the target, CLOCK_MONOTONIC ns (0: none).
+    unsigned long long target_ns = 0;
+    /// linux-drm-syncobj-v1 (per update): acquire and release points of the buffer attached
+    /// with it. Each holds a timeline reference until used or dropped.
+    sync_point acquire{};
+    sync_point release{};
+    /// wl_surface.frame callbacks of this update.
+    frame_cb_list frame_cbs{};
     /// wp_presentation_feedback objects of this update: a list in the compositor's
     /// `presentation_feedback_table` (0: none). Moved with the update — merged into the
     /// cached state, queued when applied — like frame callbacks.
@@ -88,6 +121,10 @@ struct surface_pending {
     lx::compositor::input_region input{};
     bool opaque_set = false;
     lx::compositor::input_region opaque{};
+    /// The wl_surface.commit that made this update (the newest one merged into it):
+    /// double-buffered state another object stages for a commit (a pointer constraint's
+    /// region) applies with the update that carries that commit.
+    unsigned commit_seq = 0;
 };
 
 /// A wl_surface's role. Fixed for the surface's lifetime once assigned (wl_surface: a
@@ -116,6 +153,17 @@ struct fractional_obj;
 struct lock_surface_obj;
 struct input_popup_obj;
 
+/// A per-surface add-on object of the commit-path protocols (wp_fifo_v1, wp_commit_timer_v1,
+/// wp_tearing_control_v1, wp_content_type_v1, wp_alpha_modifier_surface_v1,
+/// wp_linux_drm_syncobj_surface_v1). Allocated per request, freed with its resource; inert
+/// (`surface` null) once its wl_surface is gone. At most one of each kind per surface.
+struct surface_addon {
+    wl_resource* resource = nullptr;
+    struct surface_obj* surface = nullptr;
+    /// The surface pointer this addon occupies (`&surface->fifo`, …), nulled on destroy.
+    surface_addon** slot = nullptr;
+};
+
 struct surface_obj {
     wl_resource* resource = nullptr;
     p0_protocol_context* ctx = nullptr;
@@ -127,6 +175,8 @@ struct surface_obj {
     /// synchronized subsurface when its parent's state is applied.
     surface_pending cached{};
     bool has_cached = false;
+    /// wl_surface.commit requests so far (`surface_pending::commit_seq`).
+    unsigned commit_seq = 0;
     /// `buffer` is the live wl_buffer being shown, or null once the client destroyed that
     /// object — the content stays on screen regardless (`has_content`).
     surface_pending current{};
@@ -162,6 +212,22 @@ struct surface_obj {
     lock_surface_obj* lock_surface = nullptr;
     /// The live zwp_input_popup_surface_v2 for this surface, or null (the role stays).
     input_popup_obj* input_popup = nullptr;
+    /// Commit-path add-ons (wire_fifo.cpp, wire_tearing.cpp, wire_single_pixel.cpp,
+    /// wire_syncobj.cpp): the live object of each kind, or null.
+    surface_addon* fifo = nullptr;
+    surface_addon* timer = nullptr;
+    surface_addon* tearing_ctl = nullptr;
+    surface_addon* content_type_ctl = nullptr;
+    surface_addon* alpha_ctl = nullptr;
+    surface_addon* syncobj = nullptr;
+    /// fifo-v1: the barrier, set when an update with set_barrier applied, and the frame that
+    /// first showed that update (cleared after the next latch of its pace output).
+    bool fifo_barrier = false;
+    unsigned fifo_barrier_frame = 0;
+    /// Applied add-on state (what the scene and the output policy use).
+    std::uint32_t alpha_current = 0xFFFFFFFFu;
+    unsigned char content_type_current = 0;
+    unsigned char tearing_current = k_tearing_vsync;
     /// Logical surface size of the current state (buffer / scale, transformed, or the
     /// viewport's): what roles, the tree and hit-testing use. 0x0 without content.
     lx::size2i surface_size{};
@@ -243,12 +309,23 @@ struct buffer_obj {
     wl_resource* resource = nullptr;
     bool is_shm = false;
     bool is_dmabuf = false;
+    /// wp_single_pixel_buffer_v1: 1x1, `solid` (premultiplied, encoded); never uploaded.
+    bool is_single_pixel = false;
+    lx::color solid = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+    /// linux-drm-syncobj-v1 release point of the newest commit that applied this buffer,
+    /// signalled when the buffer lifecycle retires it, after the newest composite fence. A
+    /// re-commit of the buffer signals the older point at once: the spec lets a client reuse
+    /// a buffer only once no commit holds it, so the newer one still guards it.
+    sync_point release{};
     lx::buffer_id id{};
     unsigned width = 0;
     unsigned height = 0;
     lx::gfx::dmabuf_desc dmabuf{};
     /// What has been staged for this buffer's texture (GL path, buffer-age uploads).
     buffer_upload_state upload{};
+    /// A screen capture imported it on the render thread (wire_capture.cpp): the import is
+    /// dropped when the buffer goes.
+    bool capture_imported = false;
     bool used = false;
 };
 
@@ -354,7 +431,9 @@ struct seat_obj {
 // Both families share one model (wire_selection.cpp); each family's unit only marshals.
 
 enum class xfer_family : unsigned char { clipboard, primary };
-enum class offer_use : unsigned char { selection, dnd };
+/// `control`: an offer made to a data-control device (ext/wlr data control) — it does not
+/// go inert when its client loses keyboard focus, only when the selection moves on.
+enum class offer_use : unsigned char { selection, dnd, control };
 enum class source_role : unsigned char { none, selection, dnd };
 
 constexpr unsigned k_xfer_families = 2;
@@ -365,12 +444,24 @@ constexpr unsigned k_max_offers_per_client = 32;
 
 struct xfer_offer;
 
-/// wl_data_source / zwp_primary_selection_source_v1. Allocated per request, freed with its
-/// object (wire_selection.cpp).
+/// How a source is told to write (`send`) and that it lost the selection (`cancelled`):
+/// what differs between a wl_data_source, a primary-selection source and a data-control
+/// source, any of which may own either selection.
+struct xfer_source_ops {
+    void (*send_send)(wl_resource* source, const char* mime, int32_t fd) = nullptr;
+    void (*send_cancelled)(wl_resource* source) = nullptr;
+};
+
+/// wl_data_source / zwp_primary_selection_source_v1 / ext_data_control_source_v1 /
+/// zwlr_data_control_source_v1. Allocated per request, freed with its object
+/// (wire_selection.cpp).
 struct xfer_source {
     wl_resource* resource = nullptr;
     wl_client* client = nullptr;
+    /// The selection it was set as (a data-control source: whichever set_* used it).
     xfer_family family{};
+    /// Null: the family's own source (`xfer_ops[family]`).
+    const xfer_source_ops* ops = nullptr;
     lx::compositor::mime_list mimes; // default-initialized: the arena is never zeroed
     /// wl_data_source.set_actions (v3), meaningful for drag-and-drop only.
     unsigned dnd_actions = 0;
@@ -469,6 +560,12 @@ inline void surface_log(const char* line) {
     lx::trace::logger::global().log(lx::trace::level::debug, "compositor.surface", line);
 }
 
+template <typename... Args>
+void surface_log(std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.surface", fmt,
+                                     std::forward<Args>(args)...);
+}
+
 /// Every wl_surface record (wire_surface.cpp). Scanned by buffer and frame-callback
 /// destructors, which must drop references to a dying object.
 extern surface_obj surfaces[k_max_surfaces];
@@ -505,6 +602,10 @@ void retire_image(void*, unsigned texture_id);
 
 // ── wire_surface.cpp ───────────────────────────────────────────────────────
 
+/// The surface's slot in `surfaces` + 1: its content queue key.
+[[nodiscard]] inline unsigned surface_slot(const surface_obj* s) {
+    return static_cast<unsigned>(s - surfaces) + 1u;
+}
 void apply_cached(surface_obj* s, const char* cause, unsigned depth);
 /// Geometry inputs (`:viewport`) of the state a wl_surface.commit of `s` would produce now
 /// (pending over cached over current), and of its current state.
@@ -512,6 +613,49 @@ void apply_cached(surface_obj* s, const char* cause, unsigned depth);
 [[nodiscard]] lx::compositor::surface_geometry_in current_geometry(const surface_obj* s);
 void flush_desync(surface_obj* s, const char* cause);
 void discard_cached(surface_obj* s);
+/// Answers every frame callback of `list` now and empties it (a dropped update's: "done"
+/// rather than never, which would stall the client).
+void frame_cbs_fire_now(frame_cb_list& list);
+/// Drops the update-scoped references a state holds without applying it: its frame
+/// callbacks (answered unless `dying`), presentation feedback (discarded), sync points
+/// (released points signalled at once: the buffer was never sampled) and its buffer
+/// (released unless it is what the surface shows, or `dying`).
+void drop_state(surface_obj* s, surface_pending& st, bool dying);
+
+// ── the content-update queue (wire_surface.cpp) ────────────────────────────
+
+/// UI hooks into the compositor's clocks (`p0_protocol_context::cu_*`): kept here so the
+/// queue code reads one place.
+[[nodiscard]] content_queue& cu_queue();
+/// The readiness poller's epoll fd (opened on first use; -1 when it cannot be).
+[[nodiscard]] int cu_poll_fd();
+/// Tries every surface with queued updates (a fence signalled, a barrier cleared, a tick
+/// reached a target, visibility changed). Applies what is ready, in order.
+void cu_try_all(const char* cause);
+/// The poller's fd became readable: clears the signalled waits, then tries their surfaces.
+void cu_poll();
+/// Clears the fifo barriers output `slot` latched in frame `frame` (and every barrier of a
+/// surface not on screen), then tries the queues.
+void cu_after_latch(unsigned slot, unsigned frame);
+/// Outputs whose clock must keep running for a queued update (a fifo wait of a shown
+/// surface): bit per pace output.
+[[nodiscard]] std::uint32_t cu_waiting_outputs();
+/// The earliest commit-timing target waiting per output (0: none), for `request_at`.
+[[nodiscard]] unsigned long long cu_earliest_target(unsigned slot);
+/// A surface is going: its queued updates are discarded (`dying`: its client is being torn
+/// down, nothing is sent).
+void cu_surface_destroyed(surface_obj* s, bool dying);
+/// A wl_buffer is going: queued updates attaching it keep their other state.
+void cu_buffer_gone(wl_resource* buffer);
+/// Explicit sync: the buffer lifecycle retired `buffer` — its release points are signalled
+/// after the newest composite fence.
+void syncobj_buffer_released(wl_resource* buffer);
+/// Explicit sync: a release point held without its wl_buffer (`release_sync_point`) —
+/// signalled after the newest composite fence when `signal`, else only dropped.
+void syncobj_point_settle(unsigned timeline, unsigned long long point, bool signal);
+/// Sends wl_buffer.release for a buffer that is given back unsampled (a refused import, a
+/// role that keeps no content), signalling its explicit-sync release point first.
+void buffer_release_now(wl_resource* buffer);
 void bind_compositor(wayland::client_connection& client, unsigned id, int version);
 /// `fire_frames`' output argument: every output.
 inline constexpr unsigned k_any_output = ~0u;
@@ -540,15 +684,55 @@ void fire_frames(unsigned frame_time_ms, bool throttle, unsigned slot, unsigned 
 /// calls it under the same `LUMEN_PROTOCOL_*` guard).
 void bind_presentation(wayland::client_connection& client, unsigned id, int version);
 /// The content-update hooks of wl_surface (wire_surface.cpp calls them; no-ops without a
-/// feedback table): pending → cached, cached → current, and the surface going away —
-/// destroyed (`presentation_surface_destroyed`: its pending and cached feedback too) or
-/// unmapped (`presentation_surface_unmapped`: what is in flight).
-void presentation_merge(surface_obj* s);
+/// feedback table): cached → current, and the surface going away — destroyed
+/// (`presentation_surface_destroyed`: its pending and cached feedback too) or unmapped
+/// (`presentation_surface_unmapped`: what is in flight). Merges go through
+/// `presentation_merge_lists`.
 void presentation_apply(surface_obj* s);
 void presentation_surface_destroyed(surface_obj* s);
 void presentation_surface_unmapped(lx::surface_id surface);
 /// A cached update is dropped unapplied (`discard_cached`): its feedback is discarded.
 void presentation_drop_cached(surface_obj* s);
+
+/// Discards a feedback list of a content update dropped unapplied (a queued one).
+void presentation_drop_list(unsigned& list);
+/// Merges update `from`'s feedback into `into`'s (whose own is superseded).
+void presentation_merge_lists(unsigned& from, unsigned& into);
+
+// ── commit-path protocols: wire_fifo.cpp (fifo-v1, commit-timing-v1), wire_tearing.cpp
+//    (tearing-control-v1, content-type-v1), wire_single_pixel.cpp (single-pixel-buffer-v1,
+//    alpha-modifier-v1), wire_syncobj.cpp (linux-drm-syncobj-v1) ───────────────
+
+void bind_fifo_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_commit_timing_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_tearing_control_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_content_type_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_single_pixel_buffer_manager(wayland::client_connection& client, unsigned id,
+                                      int version);
+void bind_alpha_modifier(wayland::client_connection& client, unsigned id, int version);
+void bind_syncobj_manager(wayland::client_connection& client, unsigned id, int version);
+/// A wl_surface is going: every add-on object of it goes inert.
+void surface_addons_destroyed(surface_obj* s);
+/// Creates the add-on resource for `s` and links it into `*slot` (wire_fifo.cpp). Null
+/// after posting no_memory. `destroy` must end in `addon_free`.
+surface_addon* addon_create(wl_client* client, const wl_interface* iface, int version,
+                            uint32_t id, surface_obj* s, surface_addon** slot, const void* impl,
+                            void (*destroy)(wl_resource*));
+/// The add-on of a resource created by `addon_create` (null for none).
+[[nodiscard]] surface_addon* addon_from(wl_resource* resource);
+/// Unlinks the add-on from its surface (if any) and frees it.
+void addon_free(surface_addon* a);
+/// wl_surface.commit precheck of explicit sync (wire_syncobj.cpp): unsupported_buffer,
+/// no_buffer, no_acquire_point, no_release_point, conflicting_points, in wlroots' order.
+/// False when an error was posted. True without a syncobj surface object.
+bool syncobj_precheck(surface_obj* s);
+/// The explicit-sync state: the timeline table (null when the global is not offered).
+[[nodiscard]] lx::gfx::drm_timeline_table* syncobj_timelines();
+/// Releases a sync point's timeline reference (and clears it).
+void sync_point_drop(sync_point& p);
+/// Signals a release point now (the buffer was never sampled, or the composite is done)
+/// and drops it.
+void sync_point_signal_now(sync_point& p);
 
 // ── wire_viewporter.cpp, wire_fractional_scale.cpp ──────────────────────────
 
@@ -669,6 +853,8 @@ void shell_fire_key_grab(void* grab_resource, unsigned time_ms);
 void shell_send_lock_state(unsigned state);
 /// True when one was told.
 bool shell_send_lock_requested(unsigned reason);
+/// zlm_shell_v1.capture_state (v6) to every bound shell, on change (sent on bind too).
+void shell_send_capture_state(bool active);
 void bind_output_ex(wayland::client_connection& client, unsigned id, int version, void* user);
 
 // ── wire_output.cpp: wl_output, xdg-output, output membership ───────────────
@@ -742,6 +928,26 @@ void install_data_device(p0_protocol_context& ctx);
 /// mime type. Null when no slot is left (the client holds too many live offers, or the
 /// table is full); `no_memory` has been posted when the resource could not be created.
 xfer_offer* xfer_create_offer(xfer_device* device, xfer_source* source, offer_use use);
+/// The same for a data-control device (`device_res` of `client`), with that protocol's
+/// marshalling in `ops` (offer interface, data_offer, offer). Use `offer_use::control`.
+xfer_offer* xfer_create_control_offer(wl_client* client, wl_resource* device_res,
+                                      const xfer_family_ops& ops, xfer_family family,
+                                      xfer_source* source);
+/// The source owning family `f`'s selection now (null: none, or its client is going).
+[[nodiscard]] xfer_source* xfer_selection_source(xfer_family f);
+/// ext/wlr data control set_selection / set_primary_selection: `source` (null: clear)
+/// becomes the selection of `f` with no serial check — a clipboard manager acts for the
+/// user, not on an input event. The source must be unused (the caller posts used_source).
+void xfer_set_selection_control(xfer_family f, xfer_source* source);
+/// Family `f`'s selection changed (wire_data_control.cpp): every data-control device is
+/// sent it, whatever has the keyboard.
+void data_control_selection_changed(xfer_family f);
+/// Super+Escape and the router's keyboard-focus hook for keyboard-shortcuts-inhibit
+/// (wire_shortcuts_inhibit.cpp; no-ops without its glue).
+void shortcuts_inhibit_focus(void* surface);
+void shortcuts_inhibit_surface_destroyed(surface_obj* s);
+[[nodiscard]] bool shortcuts_inhibit_effective();
+bool shortcuts_inhibit_user_toggle();
 /// The offer goes inert (unlinked from its source); its resource lives on until destroyed.
 void xfer_inert_offer(xfer_offer* offer);
 /// The live devices of `client` of family `family`, up to `cap`, in table order. The
@@ -781,6 +987,112 @@ void activation_surface_destroyed(lx::surface_id surface);
 /// Defined only when the xdg-activation glue exists (a P1 protocol); wire_install.cpp calls
 /// it under the same `LUMEN_PROTOCOL_*` guard.
 void bind_activation(wayland::client_connection& client, unsigned id, int version);
+
+// ── window and session protocols (design-app-compat-capture Part B) ─────────
+//    wire_dialog.cpp, wire_toplevel_icon.cpp, wire_bell.cpp, wire_foreign.cpp,
+//    wire_shortcuts_inhibit.cpp, wire_data_control.cpp, wire_security_context.cpp.
+//    The bind functions exist only with their glue; wire_install.cpp calls them under the
+//    same `LUMEN_PROTOCOL_*` guards.
+
+void bind_wm_dialog(wayland::client_connection& client, unsigned id, int version);
+void bind_toplevel_icon_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_system_bell(wayland::client_connection& client, unsigned id, int version);
+void bind_exporter_v2(wayland::client_connection& client, unsigned id, int version);
+void bind_importer_v2(wayland::client_connection& client, unsigned id, int version);
+void bind_exporter_v1(wayland::client_connection& client, unsigned id, int version);
+void bind_importer_v1(wayland::client_connection& client, unsigned id, int version);
+void bind_shortcuts_inhibit_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_ext_data_control_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_wlr_data_control_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_security_context_manager(wayland::client_connection& client, unsigned id,
+                                   int version);
+/// wl_surface.commit of an xdg_toplevel: an icon staged by set_icon becomes current (and
+/// the shell is told when the window is mapped).
+void toplevel_icon_commit(surface_obj* s);
+/// The toplevel record is going: its icon references are dropped.
+void toplevel_icon_released(lx::compositor::toplevel_record& rec);
+/// The toplevel is going: its xdg-foreign exports are withdrawn and every import told.
+void foreign_toplevel_destroyed(lx::toplevel_id id);
+/// The router's keyboard-focus hook of the text-input relay (wire_input_method.cpp).
+void text_input_focus_hook(void* user, void* surface, void* client, void* destroyed);
+
+// ── pointer protocols (design-app-compat-capture Part C) ───────────────────
+//    wire_pointer_constraints.cpp, wire_relative_pointer.cpp, wire_gestures.cpp. The bind
+//    functions exist only with their glue; wire_install.cpp calls them under the same
+//    `LUMEN_PROTOCOL_*` guards. The hooks are no-ops without it.
+
+void bind_pointer_constraints(wayland::client_connection& client, unsigned id, int version);
+void bind_relative_pointer_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_pointer_gestures(wayland::client_connection& client, unsigned id, int version);
+/// Which constraint holds is decided again (the router's pointer-focus hook, the
+/// keyboard-focus hook, and `pointer_constraints_update`).
+void pointer_constraints_reevaluate();
+/// `s` committed (commit `seq`): a constraint's pending region and cursor hint are staged
+/// for the content update that commit makes.
+void pointer_constraints_surface_committed(surface_obj* s, unsigned seq);
+/// A content update of `s` was applied (carrying commits up to `seq`): the regions and
+/// cursor hints staged by those commits become current, the effective region follows the
+/// new input region and size.
+void pointer_constraints_surface_applied(surface_obj* s, unsigned seq);
+/// Decides again if `pointer_constraints_surface_applied` changed anything (the end of a
+/// wl_surface.commit request: the commit is complete, a warp is safe).
+void pointer_constraints_flush();
+/// `s` is being destroyed (before input focus drops it): its constraints go inert.
+void pointer_constraints_surface_destroyed(surface_obj* s);
+/// Super+Escape: releases the active constraint (false: none).
+bool pointer_constraints_escape();
+/// What the active constraint does to a motion between global points: 0 none, 1 locked (the
+/// pointer stays), 2 confined (`to` clipped).
+int pointer_constraints_filter(double from_x, double from_y, double& to_x, double& to_y);
+/// 0 none, 1 a lock, 2 a confinement is active.
+[[nodiscard]] int pointer_constraints_active_kind();
+/// A client is gone (the server's client-destroyed hook): a gesture latched to it ends.
+void pointer_gestures_client_destroyed(wl_client* client);
+
+// ── screen capture (design-app-compat-capture Part D) ─────────────────────
+//    wire_foreign_toplevel.cpp, wire_capture.cpp, wire_capture_cursor.cpp,
+//    wire_screencopy.cpp. The bind functions exist only with their glue; wire_install.cpp
+//    calls them under the same `LUMEN_PROTOCOL_*` guards. The hooks are no-ops without it.
+
+void bind_foreign_toplevel_list(wayland::client_connection& client, unsigned id, int version);
+void bind_output_capture_source_manager(wayland::client_connection& client, unsigned id,
+                                        int version);
+void bind_toplevel_capture_source_manager(wayland::client_connection& client, unsigned id,
+                                          int version);
+void bind_image_copy_capture_manager(wayland::client_connection& client, unsigned id, int version);
+void bind_screencopy_manager(wayland::client_connection& client, unsigned id, int version);
+/// The shell bridge's observer (maps, unmaps, title / app id changes): the foreign-toplevel
+/// lists and window captures follow the windows through it.
+void install_toplevel_observer(p0_protocol_context& ctx);
+/// The window of an ext_foreign_toplevel_handle_v1 (empty: closed, or not a handle) and the
+/// identifier of that mapping.
+[[nodiscard]] lx::toplevel_id foreign_toplevel_of(wl_resource* handle, const char*& identifier);
+/// What an ext_image_capture_source_v1 names (false: not a source).
+bool capture_source_of(wl_resource* source, capture_source_kind& kind, unsigned& slot,
+                       lx::output_id& output, lx::toplevel_id& toplevel, const char*& identifier);
+/// Binds the capture shm guards to libwayland (access guards, pool unref).
+void bind_capture_guards(p0_protocol_context& ctx);
+/// A window unmapped: its captures stop.
+void capture_toplevel_unmapped(lx::toplevel_id id);
+/// A capture fence registered in the readiness poller (`cu_poll_add`) signalled.
+void capture_fence_signalled(unsigned key, unsigned serial);
+/// A wl_buffer is going: a capture import of it is dropped on the render thread.
+void capture_buffer_gone(wl_resource* buffer, buffer_obj* b);
+/// A window with a capture frame pending: its surfaces' frame callbacks are paced like a
+/// shown window's (CC2: a cast window keeps painting while covered).
+[[nodiscard]] bool capture_paces_surface(lx::surface_id surface);
+/// ext_image_copy_capture_manager_v1.create_pointer_cursor_session (wire_capture_cursor.cpp).
+void capture_cursor_session_create(wl_client* client, wl_resource* manager, uint32_t id,
+                                   wl_resource* source, wl_resource* pointer);
+/// Cursor sessions: per tick (enter / leave / position / hotspot, frames), and their window
+/// unmapping.
+void capture_cursor_tick();
+void capture_cursor_toplevel_unmapped(lx::toplevel_id id);
+/// Readiness-poller waits of other units than the content-update queue (keys above every
+/// update index): `fd` is owned in every path; false when it could not be watched.
+bool cu_poll_add(int fd, unsigned key, unsigned generation);
+/// Drops (closes) every wait of `key`.
+void cu_poll_drop(unsigned key);
 
 // ── wire_install.cpp ───────────────────────────────────────────────────────
 

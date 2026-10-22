@@ -54,7 +54,7 @@ lx::result<void> lx::ui::clipboard::bind_data_device(lx::wayland::surface* surfa
     // Client-side wl_data_device binding (offer/receive over the wire) remains a
     // follow-up once lx.wayland.client grows a real display connection.
     if (!surface)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "null surface");
+        return lx::invalid_argument("null surface");
     return lx::not_implemented("lx::ui::clipboard::bind_data_device");
 }
 

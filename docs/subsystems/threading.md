@@ -378,6 +378,49 @@ A job's serial is checked at its start and again when its test answers (a hotplu
 between makes it `cancelled`); after the switch it is answered from the commit, whatever
 moved meanwhile.
 
+### Content updates and fences (ADR 009 Part A)
+
+| Step | Thread | What |
+|------|--------|------|
+| Commit, queue, apply | UI | `wl_surface.commit` applies an update at once or queues it (`:content_update`); every apply — at commit, from the poller, at a tick — runs on UI and goes through `apply_cached`, so one snapshot shows a whole update |
+| Fence waits | UI (event loop) | One epoll fd (the readiness poller) holds every sync_file (implicit dma-buf fences) and syncobj eventfd (explicit acquire points) a queued update waits on; it is one `fd_source`, so a signalled fence wakes the UI loop, never a thread |
+| fifo / commit-timing | UI | `tick_ui` tries timed updates after its dispatch (they join the frame being built), clears fifo barriers after each served output's publish (`content_updates_latched`), and arms stopped clocks for targets (`frame_clocks::request_at`) |
+| Release points | render → UI | Render publishes a dup of each composite's out-fence into `release_fence_mailbox` (a mutex around one fd, only while a client uses explicit sync), and after a tick's capture composites that sampled client textures a fence of those; UI dups it when the buffer lifecycle retires a buffer (superseded, and past the low-water mark, which window capture views count towards and a view job not yet taken by render holds back) and attaches it to the release point — no thread waits on a fence |
+
+### Window and session protocols (ADR 009 Part B)
+
+All UI affinity, nothing per frame. Security-context listeners are fd sources on
+libwayland's own event loop (`wl_event_loop_add_fd` on the engine's listening socket and its
+close fd): the display's loop fd is what the runtime loop already watches, so a sandboxed
+connection is accepted inside `server::dispatch` on UI and costs no runtime-loop slot. Icon
+snapshots copy at most four buffers (≤ 256 KiB each) into memfds at `set_icon`, on UI, once
+per icon change. The shell (its own process, one thread) maps those memfds read-only and
+decodes theme icons on its thread when a task's icon changes, cached per (name, size).
+
+### Pointer protocols (ADR 009 Part 3)
+
+UI affinity throughout, inside the libinput dispatch: `on_input_pointer_motion` asks the
+active pointer constraint what the motion may do (a lock keeps the position, a confinement
+clips it), sends relative motion to the pointer focus's client and gestures to the client
+latched at begin — all before or instead of the window manager's hit test, with no
+allocation and nothing posted to another thread. Render only ever sees the cursor position
+the UI published, so a locked pointer is simply never republished. Constraint state
+changes (regions, cursor hints) apply with the surface's content update on UI and take
+effect at the end of the commit request or of the loop iteration (`after_dispatch`); a
+warp is a synthetic motion on UI.
+
+### Screen capture (ADR 009 Part 4)
+
+| Step | Thread | What |
+|------|--------|------|
+| Protocol, policy | UI | Sessions, frames, constraints and `capture_decide` (`wire_capture.cpp`, `:capture`) once per tick after the publish and when a frame is requested; window sessions publish their capture view (scene views 16–23) in that tick, so it is built from the same UI state as the outputs' frames |
+| Jobs | UI → render | `capture_channel`: a fixed queue under one lock (a dup'd dma-buf plane or a guarded shm mapping per job); posting wakes render. Never dropped: a job that does not fit waits for the next tick |
+| Copies | render | On the output's composite (`composite_output`) or, for a first frame or a pointer move, from its newest composited slot; window views composited from their own snapshot after the drain of the texture updates its frame may show. GL objects of capture (`gl_capture`: dma-buf framebuffers, offscreen buffers, pixel-pack buffers) are created and destroyed on render only |
+| shm read-back | worker | A shm frame is blitted on render into the session's LINEAR GBM buffer behind a native fence; one worker task waits on the fence, maps the buffer and copies the damaged rows into the client's shm under its guard, completes on the channel and posts the UI task. The session is busy until then: render skips its next job, and a session closed meanwhile is torn down by render once the worker let go. Without workers (or GBM) the read goes through a pixel-pack buffer and a second render job. Vulkan: render records a copy of the changed rects into the session's persistent mapped buffer and submits it with its own fence, no wait; the worker waits on the fence and writes the rows |
+| Client shm | render or worker, under a guard | `capture_shm_guards`: render (or the worker read) writes a client's shm only inside the entry's lock and libwayland's access guard; the wl_buffer's destruction (UI) cancels the entry under the same lock, so it waits for a copy in progress and render never touches the memory afterwards. The pool reference is dropped on UI with the job's final completion |
+| Completions | render → UI | `capture_channel` again; render posts one UI task when it has some (and `tick_ui` drains them first). A GPU copy's or read-back's native fence goes to the readiness poller (one `fd_source`, keys above every content-update index); its wake sends `ready`, or posts the read-back's copy-out job back to render |
+| Lock | UI → render | A lock request bumps an atomic epoch; render cancels a content job issued in an older epoch instead of running it (it would copy a frame from before the lock), and UI decides again a completion carrying an older epoch (a worker read that finished after the request) |
+
 ### CLI
 
 ```bash
@@ -390,6 +433,7 @@ lumen-compositor [socket-name] [-f fps] [--scale S]
 |-------|--------|
 | **Process** | Compositor / shell / apps (Wayland) — always separate |
 | **Thread** | UI + render + worker within compositor and app processes |
+| **Portal backend** | xdg-desktop-portal-lumen: one thread — a `poll` over the session bus, a signalfd and, only while a request runs, that request's Wayland connection; no timers, so an idle backend never wakes. The compositor's side of its captures is the capture engine above (UI → render → worker → UI) |
 
 ## Embedded / low-core mode
 

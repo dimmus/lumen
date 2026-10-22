@@ -1,8 +1,5 @@
 module;
 
-#include <cstdint>
-#include <cstdio>
-
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
@@ -16,7 +13,10 @@ import lx.wayland.server;
 
 export module lx.compositor:shell_bridge;
 
+import std;
+
 import :toplevel;
+import :toplevel_icon;
 
 export namespace lx::compositor {
 
@@ -27,6 +27,16 @@ enum toplevel_flag_bits : unsigned {
 };
 /// The flags the shell is told for `rec`.
 [[nodiscard]] unsigned toplevel_flags_of(const toplevel_record& rec);
+
+/// Who else follows the windows the shell is told about (ext-foreign-toplevel-list, screen
+/// capture of windows): told of every map, unmap and title/app id/state change, with or
+/// without a shell bound.
+struct toplevel_observer {
+    void (*mapped)(void* user, toplevel_record& rec) = nullptr;
+    void (*unmapped)(void* user, toplevel_record& rec) = nullptr;
+    void (*changed)(void* user, const toplevel_record& rec) = nullptr;
+    void* user = nullptr;
+};
 
 /// Server side of zlm_policy_bridge_v1: the shell's view of window state. UI affinity.
 ///
@@ -64,6 +74,15 @@ public:
     /// toplevel_flags (zlm v2): the attention flags of `rec` changed. Bridges bound at
     /// version 1 never see it.
     void emit_toplevel_flags(const toplevel_record& rec);
+    /// zlm v6: the icon of `rec` (toplevel_icon, its buffers' memfds, toplevel_icon_done),
+    /// its parent (toplevel_parent; null when it has none, or the parent is not mapped), and a
+    /// bell rung for it (null: for no window). Bridges below version 6 never see them.
+    void emit_toplevel_icon(const toplevel_record& rec);
+    void emit_toplevel_parent(const toplevel_record& rec);
+    void emit_bell(const toplevel_record* rec);
+    /// The icon store the toplevel records' `icon` ids name (null: icons are never sent).
+    void set_icons(const toplevel_icon_table* icons) { icons_ = icons; }
+    void set_observer(toplevel_observer observer) { observer_ = observer; }
 
     /// Decodes a `zlm_toplevel_v1` handle from a request. Null id for an inert handle.
     [[nodiscard]] static lx::toplevel_id toplevel_from_handle(void* zlm_toplevel_resource);
@@ -72,9 +91,16 @@ private:
     /// Creates the shell's handle for `rec` on the bridge's client.
     [[nodiscard]] void* create_handle(toplevel_record& rec);
     void detach_all_handles();
+    /// The wire toplevel_state of `rec`: `modal` for an effectively modal dialog in the
+    /// normal state.
+    [[nodiscard]] unsigned wire_state_of(const toplevel_record& rec) const;
+    /// The v6 extras after a toplevel is introduced: its icon (when not the default).
+    void send_extras(const toplevel_record& rec);
 
     wayland::server* server_ = nullptr;
     toplevel_manager* toplevels_ = nullptr;
+    const toplevel_icon_table* icons_ = nullptr;
+    toplevel_observer observer_{};
     const char* shell_binary_path_ = "lumen-shell";
     void* bridge_ = nullptr;
 };
@@ -110,6 +136,15 @@ std::uint32_t wire_state(lx::toplevel_state state) {
     default: return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_NORMAL;
     }
 }
+/// The bridge speaks zlm v6 (icons, parents, bell).
+bool bridge_v6(wl_resource* bridge) {
+#if defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
+    return bridge && wl_resource_get_version(bridge) >= ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION;
+#else
+    (void)bridge;
+    return false;
+#endif
+}
 /// toplevel_flags to a bridge that knows it (v2), when `flags` is worth sending.
 void send_flags(wl_resource* bridge, wl_resource* handle, unsigned flags) {
 #if defined(ZLM_POLICY_BRIDGE_V1_TOPLEVEL_FLAGS_SINCE_VERSION)
@@ -136,9 +171,7 @@ lx::compositor::shell_bridge::shell_bridge(wayland::server& server) : server_{&s
 lx::result<void> lx::compositor::shell_bridge::install(const char* shell_binary_path) {
     shell_binary_path_ = shell_binary_path ? shell_binary_path : "lumen-shell";
     if (!server_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "shell_bridge has no server");
+        return lx::make_error(lx::wayland_err::bind_failed, "shell_bridge has no server");
     }
     server_->set_shell_binary_path(shell_binary_path_);
     return {};
@@ -244,10 +277,19 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
         if (handle) {
             zlm_policy_bridge_v1_send_snapshot_toplevel(
                 bridge, static_cast<wl_resource*>(handle), nullptr, rec->app_id, rec->title,
-                wire_state(rec->state), rec->geometry.x, rec->geometry.y, rec->geometry.width,
+                wire_state_of(*rec), rec->geometry.x, rec->geometry.y, rec->geometry.width,
                 rec->geometry.height, toplevels_->stacking_index(rec->id));
             if (const unsigned flags = toplevel_flags_of(*rec))
                 send_flags(bridge, static_cast<wl_resource*>(handle), flags);
+        }
+    }
+    // v6: icons, then parents once every handle exists (a parent can come later in the
+    // creation order than its child — a window reparented across clients).
+    for (unsigned i = 0; i < index; ++i) {
+        if (const auto* rec = toplevels_->find(ids[i]); rec && rec->shell_handle) {
+            send_extras(*rec);
+            if (rec->parent)
+                emit_toplevel_parent(*rec);
         }
     }
     zlm_policy_bridge_v1_send_snapshot_done(bridge);
@@ -262,10 +304,9 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
         if (server_)
             if (auto* conn = server_->find_client_by_native(wl_resource_get_client(bridge)))
                 cid = conn->id();
-        char line[128];
-        std::snprintf(line, sizeof(line), "bridge bound client=%u snapshot=%u focus=%llu", cid,
-                      index, rec && rec->shell_handle ? rec->id.id() : 0ull);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.shell", line);
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.shell",
+                                         "bridge bound client={} snapshot={} focus={}", cid, index,
+                                         rec && rec->shell_handle ? rec->id.id() : 0ull);
     }
 #else
     (void)resource;
@@ -283,6 +324,8 @@ void lx::compositor::shell_bridge::on_bridge_destroyed(void* resource) {
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {
+    if (observer_.mapped)
+        observer_.mapped(observer_.user, rec);
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || rec.shell_handle)
         return;
@@ -293,11 +336,14 @@ void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {
     auto* h = static_cast<wl_resource*>(handle);
     zlm_policy_bridge_v1_send_toplevel_created(bridge, h, nullptr);
     zlm_policy_bridge_v1_send_toplevel_state(bridge, h, rec.app_id, rec.title,
-                                             wire_state(rec.state));
+                                             wire_state_of(rec));
     zlm_policy_bridge_v1_send_toplevel_geometry(bridge, h, rec.geometry.x, rec.geometry.y,
                                                 rec.geometry.width, rec.geometry.height);
     if (const unsigned flags = toplevel_flags_of(rec))
         send_flags(bridge, h, flags);
+    send_extras(rec);
+    if (rec.parent)
+        emit_toplevel_parent(rec);
 #else
     (void)rec;
 #endif
@@ -315,6 +361,8 @@ void lx::compositor::shell_bridge::emit_toplevel_flags(const toplevel_record& re
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_destroyed(toplevel_record& rec) {
+    if (observer_.unmapped)
+        observer_.unmapped(observer_.user, rec);
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!rec.shell_handle)
         return;
@@ -331,12 +379,14 @@ void lx::compositor::shell_bridge::emit_toplevel_destroyed(toplevel_record& rec)
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_state(const toplevel_record& rec) {
+    if (observer_.changed)
+        observer_.changed(observer_.user, rec);
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || !rec.shell_handle)
         return;
     zlm_policy_bridge_v1_send_toplevel_state(static_cast<wl_resource*>(bridge_),
                                              static_cast<wl_resource*>(rec.shell_handle),
-                                             rec.app_id, rec.title, wire_state(rec.state));
+                                             rec.app_id, rec.title, wire_state_of(rec));
 #else
     (void)rec;
 #endif
@@ -379,5 +429,72 @@ void lx::compositor::shell_bridge::emit_stacking_order_changed(const toplevel_re
     (void)rec;
     (void)index;
     (void)done;
+#endif
+}
+
+unsigned lx::compositor::shell_bridge::wire_state_of(const toplevel_record& rec) const {
+#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+    if (rec.state == lx::toplevel_state::normal && toplevels_ && effective_modal(*toplevels_, rec))
+        return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_MODAL;
+    return wire_state(rec.state);
+#else
+    (void)rec;
+    return 0;
+#endif
+}
+
+void lx::compositor::shell_bridge::send_extras(const toplevel_record& rec) {
+    if (rec.icon)
+        emit_toplevel_icon(rec);
+}
+
+void lx::compositor::shell_bridge::emit_toplevel_icon(const toplevel_record& rec) {
+#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) && \
+    defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
+    auto* bridge = static_cast<wl_resource*>(bridge_);
+    if (!bridge_v6(bridge) || !rec.shell_handle)
+        return;
+    auto* h = static_cast<wl_resource*>(rec.shell_handle);
+    const icon_entry* e = icons_ && rec.icon ? icons_->get(rec.icon) : nullptr;
+    zlm_policy_bridge_v1_send_toplevel_icon(bridge, h, e ? e->name : "");
+    if (e) {
+        // libwayland dups each fd into the message: the table keeps its own.
+        for (unsigned i = 0; i < e->count; ++i)
+            if (e->images[i].fd >= 0)
+                zlm_policy_bridge_v1_send_toplevel_icon_buffer(bridge, h, e->images[i].fd,
+                                                               e->images[i].size,
+                                                               e->images[i].scale);
+    }
+    zlm_policy_bridge_v1_send_toplevel_icon_done(bridge, h);
+#else
+    (void)rec;
+#endif
+}
+
+void lx::compositor::shell_bridge::emit_toplevel_parent(const toplevel_record& rec) {
+#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) && \
+    defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
+    auto* bridge = static_cast<wl_resource*>(bridge_);
+    if (!bridge_v6(bridge) || !rec.shell_handle)
+        return;
+    const toplevel_record* p = toplevels_ && rec.parent ? toplevels_->find(rec.parent) : nullptr;
+    zlm_policy_bridge_v1_send_toplevel_parent(
+        bridge, static_cast<wl_resource*>(rec.shell_handle),
+        p && p->shell_handle ? static_cast<wl_resource*>(p->shell_handle) : nullptr);
+#else
+    (void)rec;
+#endif
+}
+
+void lx::compositor::shell_bridge::emit_bell(const toplevel_record* rec) {
+#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) && \
+    defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
+    auto* bridge = static_cast<wl_resource*>(bridge_);
+    if (!bridge_v6(bridge))
+        return;
+    zlm_policy_bridge_v1_send_bell(
+        bridge, rec && rec->shell_handle ? static_cast<wl_resource*>(rec->shell_handle) : nullptr);
+#else
+    (void)rec;
 #endif
 }

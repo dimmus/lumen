@@ -1,6 +1,5 @@
 module;
 
-#include <cstddef>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -9,6 +8,8 @@ import lx.sync;
 import lx.trace;
 
 export module lx.runtime:memory;
+
+import std;
 
 export namespace lx::runtime {
 

@@ -101,27 +101,22 @@ lx::result<void*> lx::gfx::syncobj_bridge::import_timeline_semaphore(
     auto dev = static_cast<VkDevice>(device_);
     const int fd = resolve_drm_fd(timeline);
     if (!dev || fd < 0 || timeline.handle == 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "syncobj import needs a device, DRM fd and handle");
+        return lx::invalid_argument("syncobj import needs a device, DRM fd and handle");
 
     if (const int existing = find_binding(timeline.handle); existing >= 0)
         return bindings_[static_cast<unsigned>(existing)].semaphore.vk_semaphore;
 
     if (binding_count_ >= k_max_bindings)
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::sync_failed),
-                              "syncobj binding table full");
+        return lx::make_error(lx::drm_err::sync_failed, "syncobj binding table full");
 
     const auto import_fn = reinterpret_cast<PFN_vkImportSemaphoreFdKHR>(
         vkGetDeviceProcAddr(dev, "vkImportSemaphoreFdKHR"));
     if (!import_fn)
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkImportSemaphoreFdKHR unavailable");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkImportSemaphoreFdKHR unavailable");
 
     int syncobj_fd = -1;
     if (drmSyncobjHandleToFD(fd, timeline.handle, &syncobj_fd) != 0 || syncobj_fd < 0)
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::sync_failed),
-                              "drmSyncobjHandleToFD failed");
+        return lx::make_error(lx::drm_err::sync_failed, "drmSyncobjHandleToFD failed");
 
     auto acquired = pool_.acquire();
     if (!acquired) {
@@ -141,9 +136,7 @@ lx::result<void*> lx::gfx::syncobj_bridge::import_timeline_semaphore(
         // Vulkan only takes ownership of the fd on success.
         ::close(syncobj_fd);
         pool_.release(handle);
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkImportSemaphoreFdKHR failed");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkImportSemaphoreFdKHR failed");
     }
 
     bindings_[binding_count_++] = {timeline.handle, handle};
@@ -159,7 +152,7 @@ lx::result<void> lx::gfx::syncobj_bridge::wait_at_point(const syncobj_timeline& 
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_DRM)
     auto dev = static_cast<VkDevice>(device_);
     if (!dev)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "syncobj wait needs a device");
+        return lx::invalid_argument("syncobj wait needs a device");
 
     auto imported = import_timeline_semaphore(timeline);
     if (!imported)
@@ -169,9 +162,7 @@ lx::result<void> lx::gfx::syncobj_bridge::wait_at_point(const syncobj_timeline& 
     const auto wait_fn = reinterpret_cast<PFN_vkWaitSemaphores>(
         vkGetDeviceProcAddr(dev, "vkWaitSemaphores"));
     if (!wait_fn)
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkWaitSemaphores unavailable");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkWaitSemaphores unavailable");
 
     const uint64_t value = timeline.point;
     VkSemaphoreWaitInfo wait{};
@@ -181,7 +172,7 @@ lx::result<void> lx::gfx::syncobj_bridge::wait_at_point(const syncobj_timeline& 
     wait.pValues = &value;
 
     if (wait_fn(dev, &wait, timeout_ns) != VK_SUCCESS)
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::sync_failed),
+        return lx::make_error(lx::drm_err::sync_failed,
                               "timeline wait did not reach the requested point");
     return {};
 #else
@@ -196,8 +187,7 @@ lx::result<void> lx::gfx::syncobj_bridge::signal_at_point(const syncobj_timeline
     auto dev = static_cast<VkDevice>(device_);
     const int fd = resolve_drm_fd(timeline);
     if (!dev || fd < 0 || timeline.handle == 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "syncobj signal needs a device, DRM fd and handle");
+        return lx::invalid_argument("syncobj signal needs a device, DRM fd and handle");
 
     auto acquired = pool_.acquire();
     if (!acquired)
@@ -211,8 +201,7 @@ lx::result<void> lx::gfx::syncobj_bridge::signal_at_point(const syncobj_timeline
         vkGetDeviceProcAddr(dev, "vkGetSemaphoreFdKHR"));
     if (!signal_fn || !export_fn) {
         pool_.release(handle);
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
+        return lx::make_error(lx::vulkan_err::import_failed,
                               "timeline semaphore signal/export unavailable");
     }
 
@@ -222,9 +211,7 @@ lx::result<void> lx::gfx::syncobj_bridge::signal_at_point(const syncobj_timeline
     signal.value = timeline.point;
     if (signal_fn(dev, &signal) != VK_SUCCESS) {
         pool_.release(handle);
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkSignalSemaphore failed");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkSignalSemaphore failed");
     }
 
     VkSemaphoreGetFdInfoKHR export_info{};
@@ -235,9 +222,7 @@ lx::result<void> lx::gfx::syncobj_bridge::signal_at_point(const syncobj_timeline
     int opaque_fd = -1;
     if (export_fn(dev, &export_info, &opaque_fd) != VK_SUCCESS || opaque_fd < 0) {
         pool_.release(handle);
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::import_failed),
-                              "vkGetSemaphoreFdKHR failed");
+        return lx::make_error(lx::vulkan_err::import_failed, "vkGetSemaphoreFdKHR failed");
     }
 
     // Timeline-to-timeline handoff: adopt the Vulkan payload as a temporary syncobj, then
@@ -247,8 +232,7 @@ lx::result<void> lx::gfx::syncobj_bridge::signal_at_point(const syncobj_timeline
     if (drmSyncobjFDToHandle(fd, opaque_fd, &staging) != 0) {
         ::close(opaque_fd);
         pool_.release(handle);
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::sync_failed),
-                              "drmSyncobjFDToHandle failed");
+        return lx::make_error(lx::drm_err::sync_failed, "drmSyncobjFDToHandle failed");
     }
     ::close(opaque_fd);
 
@@ -258,8 +242,7 @@ lx::result<void> lx::gfx::syncobj_bridge::signal_at_point(const syncobj_timeline
     pool_.release(handle);
 
     if (transferred != 0)
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::sync_failed),
-                              "drmSyncobjTransfer failed");
+        return lx::make_error(lx::drm_err::sync_failed, "drmSyncobjTransfer failed");
     return {};
 #else
     (void)timeline;

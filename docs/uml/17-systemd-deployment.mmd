@@ -3,6 +3,10 @@ flowchart TB
         U_COMP["lumen-compositor.service"]
         U_SHELL["lumen-shell.service (session.slice)"]
         U_APP["app-lumen-ID@RANDOM.service (app.slice, transient)"]
+        U_XDP["xdg-desktop-portal.service (frontend)"]
+        U_PL["xdg-desktop-portal-lumen.service (Type=dbus)"]
+        U_PW["xdg-desktop-portal-wlr.service (Type=dbus)"]
+        ENV["manager environment:<br/>WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP=Lumen"]
         SK_WL["XDG_RUNTIME_DIR/lumen-0"]
         SK_PRIV["lumen-compositor.private"]
     end
@@ -22,3 +26,11 @@ flowchart TB
     U_SHELL --> BIN
     U_SHELL -->|"StartTransientUnit (user bus)"| U_APP
     U_APP --> SK_WL
+    U_APP -->|"D-Bus portal calls"| U_XDP
+    U_XDP -->|"lumen-portals.conf: Screenshot"| U_PL
+    U_XDP -->|"ScreenCast"| U_PW
+    U_PW -->|"--choose (dmenu chooser)"| U_PL
+    ENV -.-> U_PL
+    ENV -.-> U_PW
+    U_PL --> SK_WL
+    U_PW --> SK_WL

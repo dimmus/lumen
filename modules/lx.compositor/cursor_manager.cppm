@@ -1,17 +1,12 @@
 module;
 
-#include <atomic>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-#include <vector>
-
 import lx.foundation;
 import lx.scene;
 import lx.trace;
 
 export module lx.compositor:cursor;
+
+import std;
 
 import :xcursor;
 import :input_router;
@@ -245,6 +240,32 @@ public:
     void on_hardware_failed();
 
     [[nodiscard]] bool hardware_active() const { return hardware_ && !hw_failed_; }
+    /// The pointer as last resolved, for screen capture's cursor sessions (UI; the view stays
+    /// valid until the next tick): its image at the theme scale nearest `scale120`, and that
+    /// image's generation. False while no pointer is shown.
+    [[nodiscard]] bool image_for_scale(unsigned scale120, cursor_image_view& out,
+                                       unsigned& generation) const {
+        if (!visible_ || theme_count_ == 0)
+            return false;
+        unsigned best = 0;
+        unsigned best_d = ~0u;
+        for (unsigned k = 0; k < theme_count_; ++k) {
+            const unsigned d = theme_scale120_[k] > scale120 ? theme_scale120_[k] - scale120
+                                                             : scale120 - theme_scale120_[k];
+            if (d < best_d) {
+                best_d = d;
+                best = k;
+            }
+        }
+        if (views_[best].empty())
+            return false;
+        out = views_[best];
+        generation = image_generation_;
+        return true;
+    }
+    /// The pointer's hotspot, layout coordinates.
+    [[nodiscard]] double x() const { return x_; }
+    [[nodiscard]] double y() const { return y_; }
     [[nodiscard]] cursor_shape shape() const { return shown_shape_; }
 
 private:
@@ -818,10 +839,10 @@ void lx::compositor::cursor_manager::resolve() {
             images_->publish();
         }
         if (cursor_debug()) {
-            char line[96];
-            std::snprintf(line, sizeof(line), "cursor shape=%u source=%s hardware=%d",
-                          static_cast<unsigned>(shape), source, frame_hardware_ ? 1 : 0);
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.cursor", line);
+            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.cursor",
+                                             "cursor shape={} source={} hardware={}",
+                                             static_cast<unsigned>(shape), source,
+                                             frame_hardware_ ? 1 : 0);
         }
     }
     frame_pending_ = true;

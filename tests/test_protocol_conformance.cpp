@@ -1,21 +1,9 @@
 // Protocol conformance: requests that must end in a specific protocol error, and request
 // orders that must not. In-process compositor, one libwayland-client connection per case
 // (a protocol error is fatal to its connection), asserting wl_display_get_protocol_error.
-#include <algorithm>
-#include <atomic>
-#include <cerrno>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <ctime>
-#include <functional>
-#include <initializer_list>
-#include <mutex>
-#include <thread>
-#include <utility>
-
-#include <string>
-#include <vector>
+#include <errno.h>
+#include <stdio.h>
+#include <time.h>
 
 #include <fcntl.h>
 #include <poll.h>
@@ -65,6 +53,17 @@
 #include "wlr-output-power-management-unstable-v1-client-protocol.h"
 #define LUMEN_TEST_IDLE 1
 #endif
+#if defined(LUMEN_PROTOCOL_FIFO_V1) && defined(LUMEN_PROTOCOL_COMMIT_TIMING_V1) && \
+    defined(LUMEN_PROTOCOL_TEARING_CONTROL_V1) && defined(LUMEN_PROTOCOL_CONTENT_TYPE_V1) && \
+    defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1) && defined(LUMEN_PROTOCOL_ALPHA_MODIFIER_V1)
+#include "fifo-v1-client-protocol.h"
+#include "commit-timing-v1-client-protocol.h"
+#include "tearing-control-v1-client-protocol.h"
+#include "content-type-v1-client-protocol.h"
+#include "single-pixel-buffer-v1-client-protocol.h"
+#include "alpha-modifier-v1-client-protocol.h"
+#define LUMEN_TEST_COMMIT_PATH 1
+#endif
 #if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_TEST_SESSION_LOCK 1
@@ -79,7 +78,11 @@
 #endif
 #endif
 #endif
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
 
+import std;
 import lx.foundation;
 import lx.runtime;
 import lx.scheduler;
@@ -279,6 +282,30 @@ outcome finish(client& c) {
 
 int g_failed = 0;
 int g_ran = 0;
+
+/// Binds the global of `iface` at `version` (null when it is not advertised).
+void* bind_global(client& c, const wl_interface* iface, uint32_t version) {
+    struct found {
+        const wl_interface* iface;
+        uint32_t name = 0;
+        uint32_t version = 0;
+    } f{iface};
+    static const wl_registry_listener listener = {
+        [](void* data, wl_registry*, uint32_t name, const char* i, uint32_t v) {
+            auto* fd = static_cast<found*>(data);
+            if (std::strcmp(i, fd->iface->name) == 0) {
+                fd->name = name;
+                fd->version = v;
+            }
+        },
+        [](void*, wl_registry*, uint32_t) {}};
+    wl_registry* r = wl_display_get_registry(c.display);
+    wl_registry_add_listener(r, &listener, &f);
+    (void)wl_display_roundtrip(c.display);
+    if (!f.name)
+        return nullptr;
+    return wl_registry_bind(r, f.name, iface, version < f.version ? version : f.version);
+}
 
 /// Runs `body` on a fresh connection and checks the error it ends in.
 void expect(const char* name, const char* interface, uint32_t code,
@@ -3611,6 +3638,228 @@ int main() {
                 wl_display_disconnect(app.display);
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
+    }
+#endif
+
+#if defined(LUMEN_TEST_COMMIT_PATH)
+    // ── commit-path protocols (fifo, commit-timing, tearing, content-type, single-pixel,
+    //    alpha-modifier): every global at its version, every error ──
+    {
+        client c{};
+        bool all = connect(c);
+        const wl_interface* const ifaces[] = {
+            &wp_fifo_manager_v1_interface, &wp_commit_timing_manager_v1_interface,
+            &wp_tearing_control_manager_v1_interface, &wp_content_type_manager_v1_interface,
+            &wp_single_pixel_buffer_manager_v1_interface, &wp_alpha_modifier_v1_interface};
+        std::string missing;
+        for (const wl_interface* i : ifaces)
+            if (!all || !bind_global(c, i, 1)) {
+                all = false;
+                missing += i->name;
+                missing += ' ';
+            }
+        check("commit-path globals are advertised at version 1", all, missing);
+        if (c.display)
+            wl_display_disconnect(c.display);
+    }
+    expect("fifo: second wp_fifo_v1 for a surface", "wp_fifo_manager_v1",
+           WP_FIFO_MANAGER_V1_ERROR_ALREADY_EXISTS, [](client& c) {
+               auto* m = static_cast<wp_fifo_manager_v1*>(
+                   bind_global(c, &wp_fifo_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               (void)wp_fifo_manager_v1_get_fifo(m, s);
+               (void)wp_fifo_manager_v1_get_fifo(m, s);
+           });
+    expect("fifo: set_barrier after the surface is gone", "wp_fifo_v1",
+           WP_FIFO_V1_ERROR_SURFACE_DESTROYED, [](client& c) {
+               auto* m = static_cast<wp_fifo_manager_v1*>(
+                   bind_global(c, &wp_fifo_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_fifo_v1* f = wp_fifo_manager_v1_get_fifo(m, s);
+               wl_surface_destroy(s);
+               wp_fifo_v1_set_barrier(f);
+           });
+    expect("fifo: wait_barrier after the surface is gone", "wp_fifo_v1",
+           WP_FIFO_V1_ERROR_SURFACE_DESTROYED, [](client& c) {
+               auto* m = static_cast<wp_fifo_manager_v1*>(
+                   bind_global(c, &wp_fifo_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_fifo_v1* f = wp_fifo_manager_v1_get_fifo(m, s);
+               wl_surface_destroy(s);
+               wp_fifo_v1_wait_barrier(f);
+           });
+    expect("fifo: a FIFO stream of a mapped window never stalls (not on screen here)", "none", 0,
+           [](client& c) {
+               auto* m = static_cast<wp_fifo_manager_v1*>(
+                   bind_global(c, &wp_fifo_manager_v1_interface, 1));
+               window w{};
+               map_window(c, w);
+               wp_fifo_v1* f = wp_fifo_manager_v1_get_fifo(m, w.surface);
+               for (int i = 0; i < 20; ++i) {
+                   wp_fifo_v1_set_barrier(f);
+                   wp_fifo_v1_wait_barrier(f);
+                   wl_surface_attach(w.surface, make_buffer(c, 200, 150), 0, 0);
+                   wl_surface_damage_buffer(w.surface, 0, 0, 200, 150);
+                   wl_surface_commit(w.surface);
+               }
+               (void)wl_display_roundtrip(c.display);
+           });
+    expect("commit-timing: second timer for a surface", "wp_commit_timing_manager_v1",
+           WP_COMMIT_TIMING_MANAGER_V1_ERROR_COMMIT_TIMER_EXISTS, [](client& c) {
+               auto* m = static_cast<wp_commit_timing_manager_v1*>(
+                   bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               (void)wp_commit_timing_manager_v1_get_timer(m, s);
+               (void)wp_commit_timing_manager_v1_get_timer(m, s);
+           });
+    expect("commit-timing: tv_nsec of a whole second", "wp_commit_timer_v1",
+           WP_COMMIT_TIMER_V1_ERROR_INVALID_TIMESTAMP, [](client& c) {
+               auto* m = static_cast<wp_commit_timing_manager_v1*>(
+                   bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_commit_timer_v1* t = wp_commit_timing_manager_v1_get_timer(m, s);
+               wp_commit_timer_v1_set_timestamp(t, 0, 5, 1'000'000'000u);
+           });
+    expect("commit-timing: two timestamps for one commit", "wp_commit_timer_v1",
+           WP_COMMIT_TIMER_V1_ERROR_TIMESTAMP_EXISTS, [](client& c) {
+               auto* m = static_cast<wp_commit_timing_manager_v1*>(
+                   bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_commit_timer_v1* t = wp_commit_timing_manager_v1_get_timer(m, s);
+               wp_commit_timer_v1_set_timestamp(t, 0, 5, 0);
+               wp_commit_timer_v1_set_timestamp(t, 0, 6, 0);
+           });
+    expect("commit-timing: a timestamp per commit is fine", "none", 0, [](client& c) {
+        auto* m = static_cast<wp_commit_timing_manager_v1*>(
+            bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
+        wl_surface* s = wl_compositor_create_surface(c.compositor);
+        wp_commit_timer_v1* t = wp_commit_timing_manager_v1_get_timer(m, s);
+        wp_commit_timer_v1_set_timestamp(t, 0, 5, 0);
+        wl_surface_commit(s);
+        wp_commit_timer_v1_set_timestamp(t, 0, 6, 0);
+        wl_surface_commit(s);
+    });
+    expect("commit-timing: set_timestamp after the surface is gone", "wp_commit_timer_v1",
+           WP_COMMIT_TIMER_V1_ERROR_SURFACE_DESTROYED, [](client& c) {
+               auto* m = static_cast<wp_commit_timing_manager_v1*>(
+                   bind_global(c, &wp_commit_timing_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_commit_timer_v1* t = wp_commit_timing_manager_v1_get_timer(m, s);
+               wl_surface_destroy(s);
+               wp_commit_timer_v1_set_timestamp(t, 0, 5, 0);
+           });
+    expect("tearing-control: second object for a surface", "wp_tearing_control_manager_v1",
+           WP_TEARING_CONTROL_MANAGER_V1_ERROR_TEARING_CONTROL_EXISTS, [](client& c) {
+               auto* m = static_cast<wp_tearing_control_manager_v1*>(
+                   bind_global(c, &wp_tearing_control_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               (void)wp_tearing_control_manager_v1_get_tearing_control(m, s);
+               (void)wp_tearing_control_manager_v1_get_tearing_control(m, s);
+           });
+    expect("tearing-control: an inert object takes requests", "none", 0, [](client& c) {
+        auto* m = static_cast<wp_tearing_control_manager_v1*>(
+            bind_global(c, &wp_tearing_control_manager_v1_interface, 1));
+        wl_surface* s = wl_compositor_create_surface(c.compositor);
+        wp_tearing_control_v1* t = wp_tearing_control_manager_v1_get_tearing_control(m, s);
+        wp_tearing_control_v1_set_presentation_hint(t,
+                                                    WP_TEARING_CONTROL_V1_PRESENTATION_HINT_ASYNC);
+        wl_surface_commit(s);
+        wl_surface_destroy(s);
+        wp_tearing_control_v1_set_presentation_hint(t,
+                                                    WP_TEARING_CONTROL_V1_PRESENTATION_HINT_VSYNC);
+        wp_tearing_control_v1_destroy(t);
+    });
+    expect("content-type: second object for a surface", "wp_content_type_manager_v1",
+           WP_CONTENT_TYPE_MANAGER_V1_ERROR_ALREADY_CONSTRUCTED, [](client& c) {
+               auto* m = static_cast<wp_content_type_manager_v1*>(
+                   bind_global(c, &wp_content_type_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               (void)wp_content_type_manager_v1_get_surface_content_type(m, s);
+               (void)wp_content_type_manager_v1_get_surface_content_type(m, s);
+           });
+    expect("alpha-modifier: second object for a surface", "wp_alpha_modifier_v1",
+           WP_ALPHA_MODIFIER_V1_ERROR_ALREADY_CONSTRUCTED, [](client& c) {
+               auto* m = static_cast<wp_alpha_modifier_v1*>(
+                   bind_global(c, &wp_alpha_modifier_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               (void)wp_alpha_modifier_v1_get_surface(m, s);
+               (void)wp_alpha_modifier_v1_get_surface(m, s);
+           });
+    expect("alpha-modifier: set_multiplier after the surface is gone",
+           "wp_alpha_modifier_surface_v1", WP_ALPHA_MODIFIER_SURFACE_V1_ERROR_NO_SURFACE,
+           [](client& c) {
+               auto* m = static_cast<wp_alpha_modifier_v1*>(
+                   bind_global(c, &wp_alpha_modifier_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               wp_alpha_modifier_surface_v1* a = wp_alpha_modifier_v1_get_surface(m, s);
+               wl_surface_destroy(s);
+               wp_alpha_modifier_surface_v1_set_multiplier(a, 7);
+           });
+    {
+        // A mapped window whose content is a single-pixel buffer sized by a viewport, at
+        // half alpha, typed as video: drawn as a solid (no texture), its node's opacity one
+        // half, its content hint video.
+        client c{};
+        bool ok = connect(c);
+        std::string detail;
+#if defined(LUMEN_TEST_VIEWPORTER)
+        auto* spb = ok ? static_cast<wp_single_pixel_buffer_manager_v1*>(
+                             bind_global(c, &wp_single_pixel_buffer_manager_v1_interface, 1))
+                       : nullptr;
+        auto* am = ok ? static_cast<wp_alpha_modifier_v1*>(
+                            bind_global(c, &wp_alpha_modifier_v1_interface, 1))
+                      : nullptr;
+        auto* ct = ok ? static_cast<wp_content_type_manager_v1*>(
+                            bind_global(c, &wp_content_type_manager_v1_interface, 1))
+                      : nullptr;
+        ok = ok && spb && am && ct && c.viewporter;
+        unsigned before = drawn_surfaces();
+        if (ok) {
+            window w{};
+            map_window(c, w);
+            wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, w.surface);
+            wp_viewport_set_destination(v, 200, 150);
+            wp_alpha_modifier_surface_v1* a = wp_alpha_modifier_v1_get_surface(am, w.surface);
+            wp_alpha_modifier_surface_v1_set_multiplier(a, 0x80000000u);
+            wp_content_type_v1* t = wp_content_type_manager_v1_get_surface_content_type(ct, w.surface);
+            wp_content_type_v1_set_content_type(t, WP_CONTENT_TYPE_V1_TYPE_VIDEO);
+            wl_buffer* px = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
+                spb, 0, 0xFFFFFFFFu, 0, 0xFFFFFFFFu);
+            wl_surface_attach(w.surface, px, 0, 0);
+            wl_surface_damage_buffer(w.surface, 0, 0, 1, 1);
+            wl_surface_commit(w.surface);
+            ok = wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0 &&
+                 wl_display_get_error(c.display) == 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            std::lock_guard<std::mutex> hold(dispatch_lock);
+            bool found = false;
+            for (unsigned long long id = 1; id < 4096 && !found; ++id) {
+                const auto* n = comp.surfaces().node(lx::surface_id{id});
+                if (!n || !n->solid())
+                    continue;
+                found = true;
+                const bool green = n->solid_color().g == 1.f && n->solid_color().r == 0.f;
+                const bool sized = n->bounds().width == 200 && n->bounds().height == 150;
+                const bool half = n->opacity() > 0.49f && n->opacity() < 0.51f;
+                const bool video = comp.surfaces().content_hint_for(lx::surface_id{id}) ==
+                                   lx::compositor::content_hint::video;
+                ok = ok && green && sized && half && video;
+                detail = std::string("green ") + (green ? "1" : "0") + " 200x150 " +
+                         (sized ? "1" : "0") + " alpha/2 " + (half ? "1" : "0") + " video " +
+                         (video ? "1" : "0");
+            }
+            ok = ok && found;
+            if (!found)
+                detail = "no solid node";
+        }
+        (void)before;
+#else
+        ok = false;
+        detail = "no viewporter glue";
+#endif
+        check("single-pixel + viewport + alpha + content type reach the scene", ok, detail);
+        if (c.display)
+            wl_display_disconnect(c.display);
     }
 #endif
 

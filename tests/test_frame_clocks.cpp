@@ -132,6 +132,30 @@ LUMEN_TEST(frame_clocks_flat_out_ticks_once_a_period) {
     LUMEN_CHECK(ticks >= 5 && ticks <= 7);
 }
 
+LUMEN_TEST(frame_clocks_flips_without_vblank_never_tick_faster_than_the_refresh) {
+    // A display whose flips complete when the frame lands rather than at a vblank (vmwgfx):
+    // each flip re-phases the clock. With a large repaint estimate (one slow frame of 12 ms
+    // in the window) the start aimed back from the next "vblank" used to come ~8 ms after
+    // the previous one; ticks must stay a refresh apart.
+    frame_clocks c{};
+    c.set_live(0, true, k_60);
+    c.clock(0).observe_repaint(11'000, 1'000);
+    const long long t0 = 2'000 * k_ms;
+    c.clock(0).on_present(t0 - 10 * k_ms);
+    (void)c.request(0b1, t0);
+    long long prev = 0, min_gap = 1'000 * k_ms;
+    for (int i = 0; i < 30; ++i) {
+        const long long t = c.next_wakeup();
+        LUMEN_CHECK(c.take_due(t) == 0b1);
+        if (prev)
+            min_gap = t - prev < min_gap ? t - prev : min_gap;
+        prev = t;
+        // The flip lands 5 ms after the tick started (render + host), not on a vblank.
+        c.on_present(0, t + 5 * k_ms, t + 5 * k_ms);
+    }
+    LUMEN_CHECK(min_gap >= k_60 - frame_clocks::k_coalesce_ns);
+}
+
 LUMEN_TEST(frame_clocks_adaptive_sync_starts_on_demand) {
     // With adaptive sync (ADR 008 §C.4) there is no vblank phase: a repaint starts as soon as
     // it can land one period (the mode's highest rate) after the last flip.

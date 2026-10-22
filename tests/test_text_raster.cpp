@@ -1,10 +1,7 @@
 // lx.text single-line rasterization: shape_line / fit_line / render_line.
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <vector>
-
+import std;
 import lx.foundation;
 import lx.text;
 

@@ -283,4 +283,38 @@ LUMEN_TEST(scene_view_with_a_turned_output) {
     (void)scene.root().remove(&n);
 }
 
+LUMEN_TEST(surface_node_opacity_is_not_squared) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    lx::scene::surface_node n{lx::surface_id{9}};
+    place(n, 5, {0, 0});
+    n.set_transform({0, 0}, 1.f, 0.5f);
+    lx::scene::draw_list out;
+    n.emit_draws(out);
+    LUMEN_CHECK(out.size() == 1);
+    const auto& cmd = out.data()[0];
+    // Opacity rides `opacity` only; every backend multiplies it with the tint's alpha.
+    LUMEN_CHECK(cmd.opacity == 0.5f);
+    LUMEN_CHECK(cmd.tint.a == 1.f);
+    LUMEN_CHECK(cmd.blend == lx::blend_mode::premultiplied); // translucent: blends
+}
+
+LUMEN_TEST(surface_node_solid_emits_a_solid_draw_without_texture) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    lx::scene::surface_node n{lx::surface_id{10}};
+    n.set_bounds({0, 0, 50, 20});
+    n.set_transform({10, 10});
+    n.set_opaque(true);
+    n.set_solid(true, lx::color::rgb(0.f, 1.f, 0.f, 1.f));
+    lx::scene::draw_list out;
+    n.emit_draws(out);
+    LUMEN_CHECK(out.size() == 1);
+    const auto& cmd = out.data()[0];
+    LUMEN_CHECK(cmd.solid);
+    LUMEN_CHECK(!cmd.texture);
+    LUMEN_CHECK(cmd.solid_color.g == 1.f);
+    LUMEN_CHECK(cmd.dst.x == 10 && cmd.dst.width == 50 && cmd.dst.height == 20);
+    LUMEN_CHECK(cmd.blend == lx::blend_mode::opaque); // an occluder for the visibility pass
+    LUMEN_CHECK(!cmd.scaled);
+}
+
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

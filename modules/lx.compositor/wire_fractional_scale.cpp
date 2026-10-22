@@ -21,9 +21,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cstdint>
-#include <cstdio>
-#include <new>
+#include <stdint.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -34,6 +32,8 @@ module;
 #endif
 
 module lx.compositor;
+
+import std;
 
 import lx.foundation;
 import lx.wayland.server;
@@ -70,10 +70,9 @@ void send_preferred(surface_obj* s, std::uint32_t scale120) {
     s->pref_scale120 = scale120;
     wp_fractional_scale_v1_send_preferred_scale(s->fractional->resource, scale120);
     if (surface_debug()) {
-        char line[96];
-        std::snprintf(line, sizeof(line), "fractional preferred surface=%llu scale120=%u",
-                      s->id.id(), scale120);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.scale", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.scale",
+                                         "fractional preferred surface={} scale120={}", s->id.id(),
+                                         scale120);
     }
 }
 

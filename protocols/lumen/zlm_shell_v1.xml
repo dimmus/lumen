@@ -16,7 +16,7 @@
 
   <!-- ── Compositor-owned toplevel handle ─────────────────────────── -->
 
-  <interface name="zlm_toplevel_v1" version="5">
+  <interface name="zlm_toplevel_v1" version="6">
     <description summary="compositor-owned handle for a mapped xdg toplevel">
       Shell uses this object for all window management. The compositor maps
       zlm_toplevel_v1 to internal xdg_toplevel state. Never expose client-side
@@ -30,7 +30,7 @@
 
   <!-- ── Shell root ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_shell_v1" version="5">
+  <interface name="zlm_shell_v1" version="6">
     <description summary="Lumen desktop shell root interface"/>
 
     <enum name="capability">
@@ -96,7 +96,11 @@
         keysym must be a modifier keysym and modifiers must be 0.
 
         Grabs are not delivered during an interactive move, resize or drag, nor while the
-        session is inactive or locked (lock_state other than unlocked). A combination the compositor keeps for itself (Ctrl+Alt+
+        session is inactive or locked (lock_state other than unlocked). From version 6,
+        while the focused window inhibits shortcuts (keyboard-shortcuts-inhibit-unstable-v1:
+        a virtual machine or remote desktop viewer) its keys reach it and grabs are not
+        delivered either, except those created with the not_inhibitable flag (the shell's
+        lock key). A combination the compositor keeps for itself (Ctrl+Alt+
         BackSpace, the XF86Switch_VT_* keysyms) or one another grab already holds is
         refused: the new object receives refused and stays inert until destroyed.
       </description>
@@ -146,9 +150,21 @@
       </description>
       <arg name="reason" type="uint" enum="lock_reason"/>
     </event>
+
+    <!-- Version 6 -->
+
+    <event name="capture_state" since="6">
+      <description summary="the screen is being captured">
+        Whether some client other than this shell is capturing the screen or a window
+        (ext-image-copy-capture-v1, wlr-screencopy): active is 1 while any such capture
+        session delivered a frame in the last two seconds, else 0. Sent on bind and on
+        every change. The shell shows a privacy indicator while it is 1.
+      </description>
+      <arg name="active" type="uint"/>
+    </event>
   </interface>
 
-  <interface name="zlm_key_grab_v1" version="5">
+  <interface name="zlm_key_grab_v1" version="6">
     <description summary="a key combination held by the shell">
       Created by zlm_shell_v1.grab_key. Destroying it gives the combination back to clients.
     </description>
@@ -162,6 +178,8 @@
 
     <enum name="flag" bitfield="true">
       <entry name="tap" value="0x1" summary="a modifier pressed and released alone"/>
+      <entry name="not_inhibitable" value="0x2" since="6"
+        summary="the grab also fires while a client inhibits shortcuts"/>
     </enum>
 
     <enum name="refusal">
@@ -189,7 +207,7 @@
 
   <!-- ── Workspaces ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_workspace_manager_v1" version="5">
+  <interface name="zlm_workspace_manager_v1" version="6">
     <description summary="virtual desktop manager"/>
 
     <enum name="error">
@@ -234,7 +252,7 @@
     </event>
   </interface>
 
-  <interface name="zlm_workspace_v1" version="5">
+  <interface name="zlm_workspace_v1" version="6">
     <description summary="a single workspace"/>
 
     <request name="destroy" type="destructor"/>
@@ -258,7 +276,7 @@
 
   <!-- ── Policy bridge: shell intent → compositor execution ──────── -->
 
-  <interface name="zlm_policy_bridge_v1" version="5">
+  <interface name="zlm_policy_bridge_v1" version="6">
     <description summary="window management policy bridge">
       Shell sends placement intent; compositor executes geometry, focus, and
       stacking. Stacking is default; tiling is an optional shell plugin.
@@ -450,11 +468,63 @@
       <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
       <arg name="flags" type="uint" enum="toplevel_flag"/>
     </event>
+
+    <!-- Version 6 -->
+
+    <event name="toplevel_icon" since="6">
+      <description summary="start of a toplevel's icon">
+        The window's icon (xdg-toplevel-icon-v1) changed, or is being described in a
+        snapshot: name is an XDG icon theme name ("" for none), followed by zero or more
+        toplevel_icon_buffer events and toplevel_icon_done. An empty name and no buffers
+        means the default icon (the application's desktop entry icon). Sent after
+        snapshot_toplevel and toplevel_created when the window has an icon, and whenever
+        it changes. The shell prefers the name, resolved in its icon theme, and falls back
+        to the buffers.
+      </description>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="name" type="string"/>
+    </event>
+
+    <event name="toplevel_icon_buffer" since="6">
+      <description summary="one pixel buffer of a toplevel's icon">
+        fd is a sealed memfd (read-only mapping) of size x size pixels, premultiplied
+        ARGB8888 in native byte order, stride size * 4, for the given buffer scale.
+      </description>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="fd" type="fd"/>
+      <arg name="size" type="int" summary="edge in pixels"/>
+      <arg name="scale" type="int"/>
+    </event>
+
+    <event name="toplevel_icon_done" since="6">
+      <description summary="the icon is complete"/>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+    </event>
+
+    <event name="toplevel_parent" since="6">
+      <description summary="the window's parent changed">
+        xdg_toplevel.set_parent, or a parent across clients (xdg-foreign): parent is the
+        window this one is a dialog or child of, null for none. Sent after
+        snapshot_toplevel and toplevel_created when there is a parent, and on change. A
+        child in state modal blocks its parent; a task list can show the parent alone.
+      </description>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="parent" type="object" interface="zlm_toplevel_v1" allow-null="true"/>
+    </event>
+
+    <event name="bell" since="6">
+      <description summary="the system bell rang">
+        A client rang the bell (xdg-system-bell-v1) for this window, or for no window in
+        particular (null). The compositor limits the rate per client and drops bells while
+        the session is locked. The shell gives feedback, e.g. a visual flash.
+      </description>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1" allow-null="true"/>
+    </event>
   </interface>
 
   <!-- ── Window rules (typed, session config) ─────────────────────── -->
 
-  <interface name="zlm_window_rules_v1" version="5">
+  <interface name="zlm_window_rules_v1" version="6">
     <description summary="persistent window rules">
       Rules are stored in the session config directory
       ($XDG_CONFIG_HOME/lumen/window-rules.toml). Use reload_rules to apply.

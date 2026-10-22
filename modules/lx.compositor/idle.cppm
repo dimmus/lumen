@@ -29,6 +29,7 @@ module;
 
 export module lx.compositor:idle;
 
+import std;
 import lx.foundation;
 
 export namespace lx::compositor {
@@ -71,7 +72,7 @@ public:
 
     /// The earliest deadline of a notification that is not idle; 0 when there is none.
     [[nodiscard]] clock_ns next_deadline() const;
-    [[nodiscard]] unsigned count() const { return count_; }
+    [[nodiscard]] unsigned count() const { return static_cast<unsigned>(entries_.size()); }
     [[nodiscard]] unsigned idle_count() const { return idle_count_; }
     [[nodiscard]] bool inhibited() const { return inhibited_; }
     [[nodiscard]] clock_ns last_activity() const { return last_activity_; }
@@ -91,8 +92,7 @@ private:
     [[nodiscard]] clock_ns deadline_of(const entry& e) const;
     void set_idle(entry& e, bool idle, const idle_sink& sink);
 
-    entry entries_[k_max]{};
-    unsigned count_ = 0;
+    std::inplace_vector<entry, k_max> entries_{};
     unsigned idle_count_ = 0;
     clock_ns last_activity_ = 0;
     clock_ns uninhibited_since_ = 0;
@@ -110,7 +110,7 @@ public:
     /// False when there is no room (the caller reports no_memory).
     [[nodiscard]] bool add(void* resource, void* client, lx::surface_id surface);
     void remove(void* resource);
-    [[nodiscard]] unsigned count() const { return count_; }
+    [[nodiscard]] unsigned count() const { return static_cast<unsigned>(entries_.size()); }
     /// True when any inhibitor's surface passes `visible` — the visibility pass of the last
     /// published frame (on screen, not covered, on a powered output). O(count).
     [[nodiscard]] bool any(bool (*visible)(void* user, lx::surface_id surface), void* user) const;
@@ -121,8 +121,7 @@ private:
         void* client = nullptr;
         lx::surface_id surface{};
     };
-    entry entries_[k_max]{};
-    unsigned count_ = 0;
+    std::inplace_vector<entry, k_max> entries_{};
 };
 
 } // namespace lx::compositor
@@ -160,16 +159,15 @@ void lx::compositor::idle_tracker::set_idle(entry& e, bool idle, const idle_sink
 bool lx::compositor::idle_tracker::add(void* resource, void* client, unsigned timeout_ms,
                                        bool obey_inhibitors, clock_ns now,
                                        const idle_sink& sink) {
-    if (!resource || count_ >= k_max)
+    if (!resource || entries_.size() >= k_max)
         return false;
     unsigned mine = 0;
-    for (unsigned i = 0; i < count_; ++i)
-        if (entries_[i].client == client)
+    for (const entry& e : entries_)
+        if (e.client == client)
             ++mine;
     if (mine >= k_max_per_client)
         return false;
-    entry& e = entries_[count_++];
-    e = {};
+    entry& e = entries_.emplace_back();
     e.resource = resource;
     e.client = client;
     e.timeout_ns = static_cast<clock_ns>(timeout_ms) * 1'000'000ull;
@@ -182,13 +180,13 @@ bool lx::compositor::idle_tracker::add(void* resource, void* client, unsigned ti
 }
 
 void lx::compositor::idle_tracker::remove(void* resource) {
-    for (unsigned i = 0; i < count_; ++i) {
+    for (unsigned i = 0; i < entries_.size(); ++i) {
         if (entries_[i].resource != resource)
             continue;
         if (entries_[i].idle)
             --idle_count_;
-        entries_[i] = entries_[--count_];
-        entries_[count_] = {};
+        entries_[i] = entries_.back();
+        entries_.pop_back();
         return;
     }
 }
@@ -198,7 +196,7 @@ bool lx::compositor::idle_tracker::note_activity(clock_ns now, const idle_sink& 
     if (idle_count_ == 0)
         return false; // every deadline only moved later: the armed timer fires early, once
     bool rearm = false;
-    for (unsigned i = 0; i < count_ && idle_count_ > 0; ++i) {
+    for (unsigned i = 0; i < entries_.size() && idle_count_ > 0; ++i) {
         entry& e = entries_[i];
         if (!e.idle)
             continue;
@@ -221,7 +219,7 @@ bool lx::compositor::idle_tracker::set_inhibited(bool inhibited, clock_ns now) {
 }
 
 void lx::compositor::idle_tracker::on_timer(clock_ns now, const idle_sink& sink) {
-    for (unsigned i = 0; i < count_; ++i) {
+    for (unsigned i = 0; i < entries_.size(); ++i) {
         entry& e = entries_[i];
         const clock_ns d = deadline_of(e);
         if (d != 0 && d <= now)
@@ -231,8 +229,8 @@ void lx::compositor::idle_tracker::on_timer(clock_ns now, const idle_sink& sink)
 
 lx::compositor::idle_tracker::clock_ns lx::compositor::idle_tracker::next_deadline() const {
     clock_ns best = 0;
-    for (unsigned i = 0; i < count_; ++i) {
-        const clock_ns d = deadline_of(entries_[i]);
+    for (const entry& e : entries_) {
+        const clock_ns d = deadline_of(e);
         if (d != 0 && (best == 0 || d < best))
             best = d;
     }
@@ -240,33 +238,33 @@ lx::compositor::idle_tracker::clock_ns lx::compositor::idle_tracker::next_deadli
 }
 
 bool lx::compositor::idle_tracker::is_idle(const void* resource) const {
-    for (unsigned i = 0; i < count_; ++i)
-        if (entries_[i].resource == resource)
-            return entries_[i].idle;
+    for (const entry& e : entries_)
+        if (e.resource == resource)
+            return e.idle;
     return false;
 }
 
 // ── inhibitor_set ───────────────────────────────────────────────────────────
 
 bool lx::compositor::inhibitor_set::add(void* resource, void* client, lx::surface_id surface) {
-    if (!resource || count_ >= k_max)
+    if (!resource || entries_.size() >= k_max)
         return false;
     unsigned mine = 0;
-    for (unsigned i = 0; i < count_; ++i)
-        if (entries_[i].client == client)
+    for (const entry& e : entries_)
+        if (e.client == client)
             ++mine;
     if (mine >= k_max_per_client)
         return false;
-    entries_[count_++] = {resource, client, surface};
+    entries_.push_back({resource, client, surface});
     return true;
 }
 
 void lx::compositor::inhibitor_set::remove(void* resource) {
-    for (unsigned i = 0; i < count_; ++i) {
+    for (unsigned i = 0; i < entries_.size(); ++i) {
         if (entries_[i].resource != resource)
             continue;
-        entries_[i] = entries_[--count_];
-        entries_[count_] = {};
+        entries_[i] = entries_.back();
+        entries_.pop_back();
         return;
     }
 }
@@ -275,8 +273,8 @@ bool lx::compositor::inhibitor_set::any(bool (*visible)(void* user, lx::surface_
                                         void* user) const {
     if (!visible)
         return false;
-    for (unsigned i = 0; i < count_; ++i)
-        if (entries_[i].surface && visible(user, entries_[i].surface))
+    for (const entry& e : entries_)
+        if (e.surface && visible(user, e.surface))
             return true;
     return false;
 }

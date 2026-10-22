@@ -4,15 +4,14 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cerrno>
-#include <cstddef>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
-#include <climits>
+#include <limits.h>
+#include <fcntl.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #endif
 
@@ -28,6 +27,8 @@ import lx.wayland.protocols;
 
 export module lx.wayland.server;
 
+import std;
+
 export namespace lx::wayland {
 
 struct unix_credentials {
@@ -39,6 +40,16 @@ struct unix_credentials {
 class client_connection;
 class resource;
 class server;
+
+/// wp_security_context_v1 metadata a sandbox engine attached to a listening socket
+/// (security-context-v1); every client accepted on that socket carries it. Each string is
+/// empty when not set.
+struct security_context {
+    static constexpr unsigned k_bytes = 256;
+    char sandbox_engine[k_bytes]{};
+    char app_id[k_bytes]{};
+    char instance_id[k_bytes]{};
+};
 
 /// Opaque bind callback: client, object id, interface version.
 using global_bind_fn = void (*)(client_connection& client, unsigned id, int version);
@@ -61,9 +72,16 @@ public:
     [[nodiscard]] unsigned id() const;
     [[nodiscard]] unix_credentials credentials() const;
     [[nodiscard]] bool is_privileged_shell() const;
-    /// The client runs in a sandbox (Flatpak: `/proc/<pid>/root/.flatpak-info` exists).
-    /// Checked once, at the first global filtered for it, and cached for its life.
+    /// The client runs in a sandbox: it connected through a security-context listener
+    /// (security-context-v1, what Flatpak 1.16 and later use), or — for older Flatpak —
+    /// `/proc/<pid>/root/.flatpak-info` exists. The file check runs once, at the first
+    /// global filtered for it, and is cached for its life.
     [[nodiscard]] bool sandboxed();
+    /// The security context it connected with, or null (it connected on the display's own
+    /// socket).
+    [[nodiscard]] const security_context* context() const {
+        return has_context_ ? &context_ : nullptr;
+    }
 
     /// Native `wl_client*` (nullptr when LUMEN_HAS_WAYLAND is off).
     [[nodiscard]] void* native() const;
@@ -84,6 +102,8 @@ private:
     bool privileged_shell_ = false;
     /// 0 not checked yet, 1 not sandboxed, 2 sandboxed.
     unsigned char sandbox_ = 0;
+    bool has_context_ = false;
+    security_context context_{};
 };
 
 class resource {
@@ -196,6 +216,18 @@ public:
         client_destroyed_user_ = user;
     }
 
+    /// security-context-v1: accepts clients on `listen_fd` (a listening AF_UNIX stream
+    /// socket) with `context` attached — they are sandboxed — until `close_fd` hangs up.
+    /// Both fds are owned from here on (closed on failure too). Listening goes on after the
+    /// creating client (`creator`, its id) disconnects, as the protocol requires. At most
+    /// `k_max_security_listeners`, `k_max_security_listeners_per_client` per creator.
+    [[nodiscard]] lx::result<void> add_security_listener(int listen_fd, int close_fd,
+                                                         const security_context& context,
+                                                         unsigned creator);
+    [[nodiscard]] unsigned security_listener_count() const;
+    static constexpr unsigned k_max_security_listeners = 32;
+    static constexpr unsigned k_max_security_listeners_per_client = 8;
+
     /// Native `wl_display*` (nullptr when unavailable).
     [[nodiscard]] void* native_display() const;
     /// At least one client is connected.
@@ -233,7 +265,8 @@ private:
     [[nodiscard]] lx::result<void> bind_libwayland(const char* socket_name);
     static void global_bind_trampoline(struct wl_client* client, void* data, uint32_t version,
                                        uint32_t id);
-    /// `wl_display_set_global_filter`: hides `deny_sandboxed` globals from sandboxed clients.
+    /// `wl_display_set_global_filter`: hides `deny_sandboxed` and `privileged` globals from
+    /// sandboxed clients.
     static bool global_filter(const struct wl_client* client, const struct wl_global* global,
                               void* data);
 #endif
@@ -268,6 +301,24 @@ private:
         unsigned client_id = 0;
     };
     client_destroy_link destroy_links_[k_max_clients]{};
+
+    /// security-context listeners: sources on libwayland's own event loop (the display's
+    /// fd is what the runtime loop watches), so they cost no runtime-loop slot.
+    struct security_listener {
+        server* owner = nullptr;
+        int listen_fd = -1;
+        int close_fd = -1;
+        wl_event_source* accept_source = nullptr;
+        wl_event_source* close_source = nullptr;
+        unsigned creator = 0;
+        security_context context{};
+        bool used = false;
+    };
+    security_listener listeners_[k_max_security_listeners]{};
+    static int on_listener_readable(int fd, uint32_t mask, void* data);
+    static int on_listener_closed(int fd, uint32_t mask, void* data);
+    void drop_listener(security_listener& l);
+    void accept_sandboxed(security_listener& l);
 #endif
 };
 
@@ -289,6 +340,8 @@ void lx::wayland::client_connection::set_privileged_shell(bool privileged) {
 }
 
 bool lx::wayland::client_connection::sandboxed() {
+    if (has_context_)
+        return true;
     if (sandbox_ != 0)
         return sandbox_ == 2;
     sandbox_ = 1;
@@ -303,11 +356,10 @@ bool lx::wayland::client_connection::sandboxed() {
         std::snprintf(path, sizeof(path), "/proc/%u/root/.flatpak-info", cred_.pid);
         if (::access(path, F_OK) == 0) {
             sandbox_ = 2;
-            char line[128];
-            std::snprintf(line, sizeof(line),
-                          "client pid=%u is sandboxed (Flatpak): session-wide globals hidden",
-                          cred_.pid);
-            lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+            lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
+                                             "client pid={} is sandboxed (Flatpak): session-wide "
+                                             "globals hidden",
+                                             cred_.pid);
         }
     }
 #endif
@@ -385,6 +437,9 @@ lx::wayland::server::server() = default;
 lx::wayland::server::~server() {
     close_listen();
 #if defined(LUMEN_HAS_WAYLAND)
+    for (auto& l : listeners_)
+        if (l.used)
+            drop_listener(l);
     if (display_) {
         // Clients first: wl_display_destroy tears down globals and the event loop but not
         // connected clients, so destroying the display alone leaks every client's
@@ -421,8 +476,7 @@ void lx::wayland::server::close_listen() {
 
 lx::result<void> lx::wayland::server::bind_raw_socket(const char* socket_name) {
     (void)socket_name;
-    return lx::make_error(lx::error_domain::wayland,
-                          static_cast<int>(lx::wayland_err::bind_failed),
+    return lx::make_error(lx::wayland_err::bind_failed,
                           "libwayland-server required for protocol dispatch");
 }
 
@@ -439,10 +493,7 @@ void lx::wayland::server::advertise_pending_globals() {
         g.wl_global = wl_global_create(display_, iface, g.desc.version, &g, &global_bind_trampoline);
         if (!g.wl_global) {
             lx::trace::logger::global().log_error(
-                lx::make_error(lx::error_domain::wayland,
-                               static_cast<int>(lx::wayland_err::bind_failed),
-                               "wl_global_create failed"),
-                "wayland");
+                lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"), "wayland");
         }
     }
 }
@@ -469,18 +520,14 @@ lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
 
     display_ = wl_display_create();
     if (!display_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "wl_display_create failed");
+        return lx::make_error(lx::wayland_err::bind_failed, "wl_display_create failed");
     }
     raise_client_buffers(display_);
 
     if (wl_display_add_socket(display_, name) != 0) {
         wl_display_destroy(display_);
         display_ = nullptr;
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "wl_display_add_socket failed");
+        return lx::make_error(lx::wayland_err::bind_failed, "wl_display_add_socket failed");
     }
 
     wl_display_init_shm(display_);
@@ -536,7 +583,9 @@ bool lx::wayland::server::global_filter(const struct wl_client* client,
     if (at < lo || at >= hi)
         return true;
     const auto* entry = reinterpret_cast<const global_entry*>(at);
-    if (!entry->desc.deny_sandboxed)
+    // Privileged globals (zlm_shell_v1) too: a sandboxed client is never the shell, so its
+    // bind would only be refused — it does not see them at all.
+    if (!entry->desc.deny_sandboxed && !entry->desc.privileged)
         return true;
     client_connection* conn = srv->ensure_client(const_cast<struct wl_client*>(client));
     return !conn || !conn->sandboxed();
@@ -547,9 +596,7 @@ void lx::wayland::server::advertise_pending_globals() {}
 
 lx::result<void> lx::wayland::server::bind(const char* socket_name) {
     if (bound_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "server already bound");
+        return lx::make_error(lx::wayland_err::bind_failed, "server already bound");
     }
 
 #if defined(LUMEN_HAS_WAYLAND)
@@ -561,17 +608,13 @@ lx::result<void> lx::wayland::server::bind(const char* socket_name) {
 
 lx::result<void> lx::wayland::server::bind_socketless() {
     if (bound_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "server already bound");
+        return lx::make_error(lx::wayland_err::bind_failed, "server already bound");
     }
 
 #if defined(LUMEN_HAS_WAYLAND)
     display_ = wl_display_create();
     if (!display_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "wl_display_create failed");
+        return lx::make_error(lx::wayland_err::bind_failed, "wl_display_create failed");
     }
     raise_client_buffers(display_);
     wl_display_set_global_filter(display_, &global_filter, this);
@@ -587,7 +630,7 @@ void lx::wayland::server::remove_client_slot(unsigned index) {
         return;
     clients_[index] = {};
     if (index + 1 < client_count_)
-        clients_[index] = static_cast<client_connection&&>(clients_[client_count_ - 1]);
+        clients_[index] = std::move(clients_[client_count_ - 1]);
     clients_[client_count_ - 1] = {};
     --client_count_;
 }
@@ -640,10 +683,7 @@ void lx::wayland::server::create_wl_global(global_entry& slot) {
             wl_global_create(display_, iface, slot.desc.version, &slot, &global_bind_trampoline);
         if (!slot.wl_global) {
             lx::trace::logger::global().log_error(
-                lx::make_error(lx::error_domain::wayland,
-                               static_cast<int>(lx::wayland_err::bind_failed),
-                               "wl_global_create failed"),
-                "wayland");
+                lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"), "wayland");
         }
     }
 #else
@@ -662,8 +702,7 @@ lx::wayland::global_handle lx::wayland::server::add_global_ex(global_descriptor 
     const unsigned index = alloc_global_slot();
     if (index >= k_max_globals) {
         lx::trace::logger::global().log_error(
-            lx::make_error(lx::error_domain::wayland,
-                           static_cast<int>(lx::wayland_err::bind_failed),
+            lx::make_error(lx::wayland_err::bind_failed,
                            "global table full — interface not advertised"),
             "wayland");
         return {};
@@ -729,8 +768,7 @@ void lx::wayland::server::add_global(global_descriptor desc, global_bind_fn bind
     const unsigned index = alloc_global_slot();
     if (index >= k_max_globals) {
         lx::trace::logger::global().log_error(
-            lx::make_error(lx::error_domain::wayland,
-                           static_cast<int>(lx::wayland_err::bind_failed),
+            lx::make_error(lx::wayland_err::bind_failed,
                            "global table full — interface not advertised"),
             "wayland");
         return;
@@ -755,10 +793,9 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
 #else
     const char* name = global_name ? global_name : "?";
     if (cred.uid != static_cast<unsigned>(::getuid())) {
-        char line[160];
-        std::snprintf(line, sizeof(line), "privileged global %s denied: client uid=%u pid=%u",
-                      name, cred.uid, cred.pid);
-        lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+        lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
+                                         "privileged global {} denied: client uid={} pid={}", name,
+                                         cred.uid, cred.pid);
         return false;
     }
     // The peer's pid comes from SO_PEERCRED at connect, and the connection is still open,
@@ -785,11 +822,11 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
         have_exe ? exe : nullptr, nullptr);
     if (verdict == lx::session::privilege_result::allowed)
         return true;
-    char line[2 * PATH_MAX + 160];
-    std::snprintf(line, sizeof(line),
-                  "privileged global %s denied: client pid=%u exe=%s is not the shell binary %s",
-                  name, cred.pid, have_exe ? exe : "(unknown)", shell_binary_path_);
-    lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+    lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
+                                     "privileged global {} denied: client pid={} exe={} is not "
+                                     "the shell binary {}",
+                                     name, cred.pid, have_exe ? exe : "(unknown)",
+                                     shell_binary_path_);
     return false;
 #endif
 }
@@ -819,16 +856,14 @@ void lx::wayland::server::set_shell_binary_path(const char* path) {
         // Kept as given: nothing can match it, so every privileged bind is denied (and
         // each denial names this path), rather than the check silently passing.
         std::snprintf(shell_binary_path_, sizeof(shell_binary_path_), "%s", candidate);
-        char line[PATH_MAX + 96];
-        std::snprintf(line, sizeof(line),
-                      "shell binary %s not found: zlm_shell_v1 binds will be denied",
-                      shell_binary_path_);
-        lx::trace::logger::global().log(lx::trace::level::warn, "wayland", line);
+        lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
+                                         "shell binary {} not found: zlm_shell_v1 binds will be "
+                                         "denied",
+                                         shell_binary_path_);
         return;
     }
-    char line[PATH_MAX + 32];
-    std::snprintf(line, sizeof(line), "shell binary %s", shell_binary_path_);
-    lx::trace::logger::global().log(lx::trace::level::info, "wayland", line);
+    lx::trace::logger::global().logf(lx::trace::level::info, "wayland", "shell binary {}",
+                                     shell_binary_path_);
 #endif
 }
 
@@ -936,3 +971,137 @@ bool lx::wayland::server::has_clients() const {
 }
 
 int lx::wayland::server::event_fd() const { return listen_fd_; }
+
+#if defined(LUMEN_HAS_WAYLAND)
+void lx::wayland::server::drop_listener(security_listener& l) {
+    if (l.accept_source)
+        wl_event_source_remove(l.accept_source);
+    if (l.close_source)
+        wl_event_source_remove(l.close_source);
+    if (l.listen_fd >= 0)
+        ::close(l.listen_fd);
+    if (l.close_fd >= 0)
+        ::close(l.close_fd);
+    l = {};
+}
+
+int lx::wayland::server::on_listener_closed(int, uint32_t, void* data) {
+    auto* l = static_cast<security_listener*>(data);
+    server* srv = l ? l->owner : nullptr;
+    if (!srv)
+        return 0;
+    lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
+                                     "security context {}/{}: listener closed by the sandbox "
+                                     "engine",
+                                     l->context.sandbox_engine[0] ? l->context.sandbox_engine : "-",
+                                     l->context.app_id[0] ? l->context.app_id : "-");
+    srv->drop_listener(*l);
+    return 0;
+}
+
+int lx::wayland::server::on_listener_readable(int, uint32_t mask, void* data) {
+    auto* l = static_cast<security_listener*>(data);
+    server* srv = l ? l->owner : nullptr;
+    if (!srv)
+        return 0;
+    if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
+        srv->drop_listener(*l);
+        return 0;
+    }
+    srv->accept_sandboxed(*l);
+    return 0;
+}
+
+void lx::wayland::server::accept_sandboxed(security_listener& l) {
+    const int fd = ::accept4(l.listen_fd, nullptr, nullptr, SOCK_CLOEXEC);
+    if (fd < 0)
+        return; // EAGAIN (another accept raced it) or a transient error: the source stays
+    wl_client* client = wl_client_create(display_, fd);
+    if (!client) {
+        ::close(fd);
+        return;
+    }
+    // Registered before it can send a request: the context must be in place before the
+    // first global is filtered for it. Without a slot it cannot be marked sandboxed, so it
+    // is not let in at all.
+    client_connection* conn = ensure_client(client);
+    if (!conn) {
+        wl_client_destroy(client);
+        lx::trace::logger::global().log(lx::trace::level::warn, "wayland",
+                                        "sandboxed client refused: client table full");
+        return;
+    }
+    conn->context_ = l.context;
+    conn->has_context_ = true;
+    conn->sandbox_ = 2;
+    lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
+                                     "client {} connected sandboxed (security context engine={} "
+                                     "app_id={}): session-wide globals hidden",
+                                     conn->id(),
+                                     l.context.sandbox_engine[0] ? l.context.sandbox_engine : "-",
+                                     l.context.app_id[0] ? l.context.app_id : "-");
+}
+#endif
+
+lx::result<void> lx::wayland::server::add_security_listener(int listen_fd, int close_fd,
+                                                            const security_context& context,
+                                                            unsigned creator) {
+#if defined(LUMEN_HAS_WAYLAND)
+    security_listener* slot = nullptr;
+    unsigned of_creator = 0;
+    for (auto& l : listeners_) {
+        if (!l.used) {
+            if (!slot)
+                slot = &l;
+        } else if (l.creator == creator) {
+            ++of_creator;
+        }
+    }
+    if (!display_ || !slot || of_creator >= k_max_security_listeners_per_client) {
+        ::close(listen_fd);
+        ::close(close_fd);
+        return lx::make_error(lx::wayland_err::bind_failed, "security context listener table full");
+    }
+    // accept4 after readability must not block if another accept took the connection.
+    const int flags = ::fcntl(listen_fd, F_GETFL);
+    if (flags >= 0)
+        (void)::fcntl(listen_fd, F_SETFL, flags | O_NONBLOCK);
+    *slot = {};
+    slot->owner = this;
+    slot->listen_fd = listen_fd;
+    slot->close_fd = close_fd;
+    slot->creator = creator;
+    slot->context = context;
+    slot->used = true;
+    wl_event_loop* loop = wl_display_get_event_loop(display_);
+    slot->accept_source =
+        wl_event_loop_add_fd(loop, listen_fd, WL_EVENT_READABLE, &on_listener_readable, slot);
+    // Mask 0: only hangup and error, which epoll always reports (wlroots does the same).
+    slot->close_source = wl_event_loop_add_fd(loop, close_fd, 0, &on_listener_closed, slot);
+    if (!slot->accept_source || !slot->close_source) {
+        drop_listener(*slot);
+        return lx::make_error(lx::wayland_err::bind_failed,
+                              "security context listener: event source failed");
+    }
+    return {};
+#else
+    (void)context;
+    (void)creator;
+#if !defined(_WIN32)
+    ::close(listen_fd);
+    ::close(close_fd);
+#endif
+    return lx::not_implemented("lx::wayland::server::add_security_listener");
+#endif
+}
+
+unsigned lx::wayland::server::security_listener_count() const {
+#if defined(LUMEN_HAS_WAYLAND)
+    unsigned n = 0;
+    for (const auto& l : listeners_)
+        n += l.used ? 1u : 0u;
+    return n;
+#else
+    return 0;
+#endif
+}

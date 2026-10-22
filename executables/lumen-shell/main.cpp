@@ -1,7 +1,6 @@
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <stdio.h>
 
+import std;
 import lx.shell;
 
 // lumen-shell [--display NAME] [--idle-policy shell|none] [--blank-after S]

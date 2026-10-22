@@ -9,11 +9,16 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <algorithm>
-#include <climits>
-#include <cstdint>
-#include <cstdio>
-#include <ctime>
+#include <errno.h>
+#include <stdint.h>
+#include <time.h>
+
+#if defined(__linux__)
+#include <linux/dma-buf.h>
+#include <poll.h>
+#include <sys/eventfd.h>
+#include <sys/ioctl.h>
+#endif
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -37,6 +42,8 @@ module;
 
 module lx.compositor;
 
+import std;
+
 import lx.foundation;
 import lx.wayland.server;
 import lx.gfx;
@@ -49,6 +56,9 @@ import :toplevel;
 import :output;
 import :dnd;
 import :viewport;
+import :popup;
+import :layer_shell;
+import :content_update;
 import :wire;
 
 #if defined(LUMEN_HAS_WAYLAND)
@@ -78,6 +88,12 @@ unsigned g_throttled_frame_count = 0;
 /// FRAME_CALLBACK_THROTTLE): a window under another, off the output or hidden by the lock
 /// stops rendering at the display rate without being starved.
 constexpr unsigned long long k_frame_throttle_ns = 995'000'000ull;
+/// Readiness-poller keys from here on belong to other units (`cu_poll_add`), never to an
+/// update index (the pool has 512).
+constexpr unsigned k_poll_foreign_base = 0x10000u;
+
+/// Surfaces with a fifo barrier set: the latch scan is skipped while there are none.
+unsigned g_barriers = 0;
 
 surface_obj* alloc_surface() {
     for (auto& s : surfaces)
@@ -192,34 +208,127 @@ void queue_frame_callback(wl_resource* cb, lx::surface_id surface) {
     e.throttled = false;
 }
 
+// ── frame-callback lists (Q6) ─────────────────────────────────────────────
+// Every wl_surface.frame callback not yet applied sits in one node of a shared pool, linked
+// into the list of the content update that carries it (pending, cached, or queued). A list
+// moves between updates by splicing three words; the callback's user data is its node, so
+// its destructor unlinks it in O(1). Applied callbacks move to `g_pending_frames`.
+
+struct frame_cb_node {
+    wl_resource* resource = nullptr;
+    unsigned next = 0; // index + 1
+};
+constexpr unsigned k_frame_cb_nodes = 2048;
+frame_cb_node g_cb_nodes[k_frame_cb_nodes]{};
+unsigned g_cb_free = 0; // index + 1
+bool g_cb_ready = false;
+
+[[nodiscard]] unsigned cb_node_alloc() {
+    if (!g_cb_ready) {
+        g_cb_ready = true;
+        for (unsigned i = 0; i < k_frame_cb_nodes; ++i)
+            g_cb_nodes[i].next = i + 1 < k_frame_cb_nodes ? i + 2 : 0;
+        g_cb_free = 1;
+    }
+    const unsigned n = g_cb_free;
+    if (n)
+        g_cb_free = g_cb_nodes[n - 1].next;
+    return n;
+}
+
+void cb_node_free(unsigned n) {
+    g_cb_nodes[n - 1] = {};
+    g_cb_nodes[n - 1].next = g_cb_free;
+    g_cb_free = n;
+}
+
+/// Unlinks the list's oldest node and returns its callback (null when the client already
+/// destroyed it).
+wl_resource* cb_list_pop(frame_cb_list& l) {
+    const unsigned n = l.head;
+    if (!n)
+        return nullptr;
+    wl_resource* cb = g_cb_nodes[n - 1].resource;
+    l.head = g_cb_nodes[n - 1].next;
+    if (!l.head)
+        l.tail = 0;
+    --l.count;
+    cb_node_free(n);
+    if (cb)
+        wl_resource_set_user_data(cb, nullptr);
+    return cb;
+}
+
+void cb_list_push(frame_cb_list& l, wl_resource* cb) {
+    // Full: the oldest is answered now rather than dropped (a dropped callback stalls the
+    // client for good).
+    if (l.count >= k_max_frame_cbs)
+        fire_frame_callback_now(cb_list_pop(l));
+    const unsigned n = cb_node_alloc();
+    if (!n) {
+        fire_frame_callback_now(cb);
+        return;
+    }
+    g_cb_nodes[n - 1].resource = cb;
+    g_cb_nodes[n - 1].next = 0;
+    wl_resource_set_user_data(cb, reinterpret_cast<void*>(static_cast<std::uintptr_t>(n)));
+    if (l.tail)
+        g_cb_nodes[l.tail - 1].next = n;
+    else
+        l.head = n;
+    l.tail = n;
+    ++l.count;
+}
+
+/// Appends `from` to `into` (callbacks of an update that never applied accumulate).
+void cb_list_splice(frame_cb_list& into, frame_cb_list& from) {
+    if (!from.head)
+        return;
+    if (into.tail)
+        g_cb_nodes[into.tail - 1].next = from.head;
+    else
+        into.head = from.head;
+    into.tail = from.tail;
+    into.count += from.count;
+    from = {};
+    while (into.count > k_max_frame_cbs)
+        fire_frame_callback_now(cb_list_pop(into));
+}
+
+/// Frees the nodes without answering (a surface going away, its client torn down).
+void cb_list_forget(frame_cb_list& l) {
+    while (l.head)
+        (void)cb_list_pop(l);
+}
+
 /// libwayland destroys a client's resources on disconnect, so every table holding a
 /// wl_resource* must drop it here or the next send touches freed memory.
 void frame_callback_destroy_resource(struct wl_resource* resource) {
+    // Still in a list: its node forgets it (the list keeps the empty node until it moves).
+    const auto n = static_cast<unsigned>(
+        reinterpret_cast<std::uintptr_t>(wl_resource_get_user_data(resource)));
+    if (n >= 1 && n <= k_frame_cb_nodes && g_cb_nodes[n - 1].resource == resource) {
+        g_cb_nodes[n - 1].resource = nullptr;
+        return;
+    }
     for (unsigned i = 0; i < g_pending_frame_count; ++i) {
         if (g_pending_frames[i].resource == resource)
             g_pending_frames[i].resource = nullptr;
-    }
-    for (auto& s : surfaces) {
-        if (!s.used)
-            continue;
-        for (unsigned i = 0; i < s.pending.frame_cb_count; ++i) {
-            if (s.pending.frame_cbs[i].resource == resource)
-                s.pending.frame_cbs[i] = {};
-        }
-        for (unsigned i = 0; i < s.cached.frame_cb_count; ++i) {
-            if (s.cached.frame_cbs[i].resource == resource)
-                s.cached.frame_cbs[i] = {};
-        }
-        for (unsigned i = 0; i < s.current.frame_cb_count; ++i) {
-            if (s.current.frame_cbs[i].resource == resource)
-                s.current.frame_cbs[i] = {};
-        }
     }
 }
 
 } // namespace
 
+void frame_cbs_fire_now(frame_cb_list& list) {
+    while (list.head)
+        fire_frame_callback_now(cb_list_pop(list));
+}
+
 // ── wl_surface ─────────────────────────────────────────────────────────────
+
+namespace {
+const surface_pending* queued_tail_state(const surface_obj* s);
+} // namespace
 
 lx::compositor::surface_geometry_in pending_geometry(const surface_obj* s) {
     // The buffer the commit leaves in place: newly attached, else one a synchronized
@@ -230,6 +339,8 @@ lx::compositor::surface_geometry_in pending_geometry(const surface_obj* s) {
         (void)buffer_dims(p.buffer, w, h);
     } else if (s->has_cached && s->cached.buffer_set) {
         (void)buffer_dims(s->cached.buffer, w, h);
+    } else if (const surface_pending* tail = queued_tail_state(s); tail && tail->buffer_set) {
+        (void)buffer_dims(tail->buffer, w, h);
     } else if (s->has_content) {
         if (!buffer_dims(s->current.buffer, w, h) && s->ctx && s->ctx->surfaces) {
             // The wl_buffer object is gone; its content (and size) stays on screen.
@@ -256,6 +367,9 @@ lx::compositor::surface_geometry_in current_geometry(const surface_obj* s) {
 /// being torn down, whose buffers and callbacks libwayland is destroying anyway.
 void discard_cached(surface_obj* s) {
     presentation_drop_cached(s);
+    cb_list_forget(s->cached.frame_cbs);
+    sync_point_drop(s->cached.acquire);
+    sync_point_drop(s->cached.release);
     s->cached = {};
     s->has_cached = false;
 }
@@ -270,6 +384,32 @@ void surface_destroy_resource(struct wl_resource* resource) {
     // The unmaps below change its node rects: nothing more is sent to this object (an
     // event to a destroyed object would reach the client as one for a dead id).
     s->destroying = true;
+    // Queued content updates are discarded — buffers released, release points signalled,
+    // frame callbacks answered (a dropped one stalls the client) — and the commit-path
+    // add-ons go inert.
+    cu_surface_destroyed(s, dying);
+    surface_addons_destroyed(s);
+    // The dma-buf it shows is released once no submitted frame samples it any more.
+    if (s->ctx && s->ctx->lifecycle)
+        s->ctx->lifecycle->on_detach(s->id);
+    if (s->fifo_barrier) {
+        s->fifo_barrier = false;
+        --g_barriers;
+    }
+    cb_list_forget(s->pending.frame_cbs);
+    sync_point_drop(s->pending.acquire);
+    sync_point_drop(s->pending.release);
+    if (s->has_cached) {
+        cb_list_forget(s->cached.frame_cbs);
+        sync_point_drop(s->cached.acquire);
+        if (dying)
+            sync_point_drop(s->cached.release);
+        else
+            sync_point_signal_now(s->cached.release);
+    }
+    // Its pointer constraints go inert first (an active one is told it ended), so the focus
+    // change below re-evaluates without them.
+    pointer_constraints_surface_destroyed(s);
     // Drop input focus without a `leave`: the surface is going, and focus must not keep
     // pointing at it for the focus change the unmap below makes.
     if (s->ctx && s->ctx->input)
@@ -301,6 +441,8 @@ void surface_destroy_resource(struct wl_resource* resource) {
         s->ctx->dnd->on_surface_destroyed(s->id);
     // Activation tokens that name it as their requester (by id: nothing dangles).
     activation_surface_destroyed(s->id);
+    // Its keyboard-shortcuts inhibitor goes inert.
+    shortcuts_inhibit_surface_destroyed(s);
     // Its wp_viewport and wp_fractional_scale_v1 go inert.
     viewport_surface_destroyed(s);
     // Every wp_presentation_feedback of its updates — pending, cached or in flight — is
@@ -436,12 +578,8 @@ void surface_frame(struct wl_client* client, struct wl_resource* resource, uint3
         wl_resource_create(client, &wl_callback_interface, 1, callback_id);
     if (!cb)
         return;
-    wl_resource_set_destructor(cb, frame_callback_destroy_resource);
-    if (s->pending.frame_cb_count < k_max_frame_cbs) {
-        s->pending.frame_cbs[s->pending.frame_cb_count].resource = cb;
-        s->pending.frame_cbs[s->pending.frame_cb_count].used = true;
-        ++s->pending.frame_cb_count;
-    }
+    wl_resource_set_implementation(cb, nullptr, nullptr, frame_callback_destroy_resource);
+    cb_list_push(s->pending.frame_cbs, cb);
 }
 
 void surface_set_opaque_region(struct wl_client*, struct wl_resource* resource,
@@ -495,12 +633,9 @@ bool geometry_prechecks(surface_obj* s) {
     if (s->role == surface_role::none || s->role == surface_role::cursor) {
         if (!s->invalid_size_logged && surface_debug()) {
             s->invalid_size_logged = true;
-            char line[160];
-            std::snprintf(line, sizeof(line),
-                          "client bug: buffer %dx%d is not divisible by scale %d (surface=%llu, "
-                          "tolerated for this role)",
-                          in.buffer_w, in.buffer_h, in.scale, s->id.id());
-            surface_log(line);
+            surface_log("client bug: buffer {}x{} is not divisible by scale {} (surface={}, "
+                        "tolerated for this role)",
+                        in.buffer_w, in.buffer_h, in.scale, s->id.id());
         }
         return true;
     }
@@ -695,7 +830,6 @@ bool popup_prechecks(surface_obj* s) {
                                "buffer attached before the first configure was acked");
         return false;
     }
-    popups->apply_pending_state(s->id);
     return true;
 }
 
@@ -726,13 +860,149 @@ bool layer_prechecks(surface_obj* s) {
                                "buffer attached before a configure was acked");
         return false;
     }
-    layers->apply_pending(s->id);
     return true;
 }
 
 
+/// The toplevel's record when `s` is an xdg_toplevel with one.
+lx::compositor::toplevel_record* toplevel_rec(surface_obj* s) {
+    if (s->role == surface_role::xdg_toplevel && s->toplevel && s->ctx->toplevels)
+        return s->ctx->toplevels->find_mut(s->toplevel);
+    return nullptr;
+}
+
+/// The role state a commit carries (Q4): xdg window geometry, size limits and the acked
+/// configure of a toplevel; a popup's window geometry; a layer surface's pending props.
+/// Taken at the commit when the update is queued, applied when it is — so a queued buffer is
+/// never shown with geometry acked for a later one. (Applied at once on the fast path.)
+struct role_snapshot {
+    surface_role role = surface_role::none;
+    bool min_set = false;
+    bool max_set = false;
+    lx::size2i min{};
+    lx::size2i max{};
+    bool wg_set = false;
+    lx::rect2i wg{};
+    bool acked_unapplied = false;
+    lx::compositor::toplevel_configure acked{};
+    bool layer_set = false;
+    lx::compositor::layer_props layer{};
+};
+
+/// Moves the record's pending role state into `snap` (the update is queued).
+void take_role_snapshot(surface_obj* s, role_snapshot& snap) {
+    snap = {};
+    snap.role = s->role;
+    if (auto* tl = toplevel_rec(s)) {
+        snap.min_set = tl->min_pending_set;
+        snap.min = tl->min_pending;
+        snap.max_set = tl->max_pending_set;
+        snap.max = tl->max_pending;
+        snap.wg_set = tl->window_geometry_pending_set;
+        snap.wg = tl->window_geometry_pending;
+        tl->min_pending_set = tl->max_pending_set = tl->window_geometry_pending_set = false;
+        snap.acked_unapplied = tl->acked_unapplied;
+        snap.acked = tl->acked;
+        tl->acked_unapplied = false;
+    } else if (s->role == surface_role::popup && s->ctx->popups) {
+        if (auto* rec = s->ctx->popups->find(s->id)) {
+            snap.wg_set = rec->window_geometry_pending_set;
+            snap.wg = rec->window_geometry_pending;
+            rec->window_geometry_pending_set = false;
+        }
+    } else if (s->role == surface_role::layer && s->ctx->layers && s->layer) {
+        if (auto* rec = s->ctx->layers->find(s->id); rec && !rec->closed) {
+            snap.layer_set = true;
+            snap.layer = rec->pending;
+        }
+    }
+}
+
+/// The pending role state now, set aside while a queued update's snapshot is applied.
+struct role_stash {
+    role_snapshot pending{};
+    bool acked_unapplied = false;
+    lx::compositor::toplevel_configure acked{};
+};
+
+/// Makes `snap` the record's pending role state and applies it (as the fast path would),
+/// keeping what the client has set since in `stash`.
+void apply_role_snapshot(surface_obj* s, const role_snapshot& snap, role_stash& stash) {
+    if (auto* tl = toplevel_rec(s)) {
+        stash.pending.min_set = tl->min_pending_set;
+        stash.pending.min = tl->min_pending;
+        stash.pending.max_set = tl->max_pending_set;
+        stash.pending.max = tl->max_pending;
+        stash.pending.wg_set = tl->window_geometry_pending_set;
+        stash.pending.wg = tl->window_geometry_pending;
+        stash.acked_unapplied = tl->acked_unapplied;
+        stash.acked = tl->acked;
+        tl->min_pending_set = snap.min_set;
+        tl->min_pending = snap.min;
+        tl->max_pending_set = snap.max_set;
+        tl->max_pending = snap.max;
+        tl->window_geometry_pending_set = snap.wg_set;
+        tl->window_geometry_pending = snap.wg;
+        tl->acked_unapplied = snap.acked_unapplied;
+        if (snap.acked_unapplied)
+            tl->acked = snap.acked;
+        (void)lx::compositor::toplevel_manager::apply_pending_state(*tl); // validated at commit
+    } else if (s->role == surface_role::popup && s->ctx->popups) {
+        if (auto* rec = s->ctx->popups->find(s->id)) {
+            stash.pending.wg_set = rec->window_geometry_pending_set;
+            stash.pending.wg = rec->window_geometry_pending;
+            rec->window_geometry_pending_set = snap.wg_set;
+            rec->window_geometry_pending = snap.wg;
+            s->ctx->popups->apply_pending_state(s->id);
+        }
+    } else if (snap.layer_set && s->ctx->layers && s->layer) {
+        if (auto* rec = s->ctx->layers->find(s->id); rec && !rec->closed) {
+            stash.pending.layer_set = true;
+            stash.pending.layer = rec->pending;
+            rec->pending = snap.layer;
+            s->ctx->layers->apply_pending(s->id);
+        }
+    }
+}
+
+/// After the queued update's role finisher ran: the client's newer pending state is put
+/// back, and a configure it acked since the queued commit is still waiting to be applied.
+void restore_role_stash(surface_obj* s, const role_stash& stash) {
+    if (auto* tl = toplevel_rec(s)) {
+        tl->min_pending_set = stash.pending.min_set;
+        tl->min_pending = stash.pending.min;
+        tl->max_pending_set = stash.pending.max_set;
+        tl->max_pending = stash.pending.max;
+        tl->window_geometry_pending_set = stash.pending.wg_set;
+        tl->window_geometry_pending = stash.pending.wg;
+        if (stash.acked_unapplied) {
+            tl->acked = stash.acked;
+            tl->acked_unapplied = true;
+        }
+    } else if (s->role == surface_role::popup && s->ctx->popups) {
+        if (auto* rec = s->ctx->popups->find(s->id)) {
+            rec->window_geometry_pending_set = stash.pending.wg_set;
+            rec->window_geometry_pending = stash.pending.wg;
+        }
+    } else if (stash.pending.layer_set && s->ctx->layers && s->layer) {
+        if (auto* rec = s->ctx->layers->find(s->id); rec && !rec->closed)
+            rec->pending = stash.pending.layer;
+    }
+}
+
+/// The fast path: the commit's role state is applied now (validated by the prechecks).
+void apply_role_pending(surface_obj* s) {
+    if (auto* tl = toplevel_rec(s))
+        (void)lx::compositor::toplevel_manager::apply_pending_state(*tl);
+    else if (s->role == surface_role::popup && s->ctx->popups)
+        s->ctx->popups->apply_pending_state(s->id);
+    else if (s->role == surface_role::layer && s->ctx->layers && s->layer)
+        s->ctx->layers->apply_pending(s->id);
+}
+
 /// The xdg-shell rules that reject a whole commit, checked on the pending state before
-/// anything moves. False when an error was posted.
+/// anything moves. Validation only: the role state moves with the update (applied now on
+/// the fast path, or snapshotted with a queued update). False when an error was posted.
 bool role_prechecks(surface_obj* s) {
     if (s->role == surface_role::popup)
         return popup_prechecks(s);
@@ -752,7 +1022,14 @@ bool role_prechecks(surface_obj* s) {
                                "buffer attached before the first configure was acked");
         return false;
     }
-    if (!lx::compositor::toplevel_manager::apply_pending_state(*tl)) {
+    // min ≤ max on the limits this commit produces (pending over current). A queued
+    // update's limits are already on the record's history: they were valid when committed,
+    // and a later commit that sets only one of the two is checked against current, as the
+    // record applies them.
+    const lx::size2i min = tl->min_pending_set ? tl->min_pending : tl->min_size;
+    const lx::size2i max = tl->max_pending_set ? tl->max_pending : tl->max_size;
+    if ((min.width > 0 && max.width > 0 && min.width > max.width) ||
+        (min.height > 0 && max.height > 0 && min.height > max.height)) {
         wl_resource_post_error(static_cast<wl_resource*>(tl->xdg_toplevel_resource),
                                XDG_TOPLEVEL_ERROR_INVALID_SIZE,
                                "min_size is larger than max_size");
@@ -764,9 +1041,7 @@ bool role_prechecks(surface_obj* s) {
 /// pending → cached, the content-update queue with no constraints: later state replaces
 /// earlier, damage and frame callbacks accumulate, and a buffer superseded before it was
 /// ever used goes straight back to the client.
-void merge_pending_into_cached(surface_obj* s) {
-    surface_pending& p = s->pending;
-    surface_pending& c = s->cached;
+void merge_state(surface_obj* s, surface_pending& p, surface_pending& c) {
     if (p.buffer_set) {
         // Not when it is the buffer on screen: a dma-buf there is still being sampled and
         // the lifecycle tracker releases it. An shm buffer was copied and released at its
@@ -776,7 +1051,27 @@ void merge_pending_into_cached(surface_obj* s) {
             wl_buffer_send_release(c.buffer);
         c.buffer = p.buffer;
         c.buffer_set = true;
+        // Explicit sync: the superseded buffer was never sampled, so its release point is
+        // signalled now; its acquire point is moot. The new points travel with the update.
+        sync_point_signal_now(c.release);
+        sync_point_drop(c.acquire);
+        c.acquire = p.acquire;
+        c.release = p.release;
+        p.acquire = {};
+        p.release = {};
     }
+    if (p.commit_seq)
+        c.commit_seq = p.commit_seq;
+    c.alpha = p.alpha;
+    c.content_type = p.content_type;
+    c.tearing = p.tearing;
+    c.fifo_set = c.fifo_set || p.fifo_set;
+    c.fifo_wait = c.fifo_wait || p.fifo_wait;
+    if (p.target_ns > c.target_ns)
+        c.target_ns = p.target_ns;
+    p.fifo_set = false;
+    p.fifo_wait = false;
+    p.target_ns = 0;
     c.dx += p.dx;
     c.dy += p.dy;
     c.scale = p.scale;
@@ -796,26 +1091,9 @@ void merge_pending_into_cached(surface_obj* s) {
                               : p.damage_buffer;
         c.has_damage_buffer = true;
     }
-    for (unsigned i = 0; i < p.frame_cb_count; ++i) {
-        frame_callback cb = p.frame_cbs[i];
-        p.frame_cbs[i] = {};
-        if (!cb.used || !cb.resource)
-            continue;
-        if (c.frame_cb_count >= k_max_frame_cbs) {
-            // Full: the oldest is answered now rather than dropped (a dropped callback
-            // stalls the client for good).
-            const frame_callback oldest = c.frame_cbs[0];
-            for (unsigned j = 1; j < c.frame_cb_count; ++j)
-                c.frame_cbs[j - 1] = c.frame_cbs[j];
-            c.frame_cbs[--c.frame_cb_count] = {};
-            if (oldest.used)
-                fire_frame_callback_now(oldest.resource);
-        }
-        c.frame_cbs[c.frame_cb_count++] = cb;
-    }
-    p.frame_cb_count = 0;
+    cb_list_splice(c.frame_cbs, p.frame_cbs);
     // Presentation feedback moves with the update; a cached update it replaces is discarded.
-    presentation_merge(s);
+    presentation_merge_lists(p.feedback, c.feedback);
     if (p.input_set) {
         c.input = p.input;
         c.input_set = true;
@@ -834,6 +1112,10 @@ void merge_pending_into_cached(surface_obj* s) {
     p.has_damage_buffer = false;
     p.input_set = false;
     p.opaque_set = false;
+}
+
+void merge_pending_into_cached(surface_obj* s) {
+    merge_state(s, s->pending, s->cached);
     s->has_cached = true;
 }
 
@@ -857,6 +1139,23 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
         buf = track_shm_buffer(s->current.buffer, shm);
     if (!buf) {
         // Not a buffer kind this compositor can show; nothing will ever sample it.
+        wl_buffer_send_release(s->current.buffer);
+        return;
+    }
+    if (buf->is_single_pixel) {
+        // wp_single_pixel_buffer_v1: a colour, not pixels — the node draws it as a solid
+        // rect of its logical size (the viewport destination sizes it). Nothing is uploaded
+        // or kept, so the buffer goes straight back.
+        s->format_opaque = buf->solid.a >= 1.f;
+        s->current_buffer_id = buf->id;
+        s->current_texture = 0;
+        s->ctx->surfaces->set_solid(s->id, buf->solid, geo.size, content_opaque(s));
+        if (surface_debug()) {
+            surface_log("surface solid surface={} rgba={:.3f},{:.3f},{:.3f},{:.3f} size={}x{} "
+                        "opaque={}",
+                        s->id.id(), buf->solid.r, buf->solid.g, buf->solid.b, buf->solid.a,
+                        geo.size.width, geo.size.height, content_opaque(s) ? 1 : 0);
+        }
         wl_buffer_send_release(s->current.buffer);
         return;
     }
@@ -885,7 +1184,7 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
             desc.planes[i].stride = buf->dmabuf.planes[i].stride;
             desc.planes[i].modifier = buf->dmabuf.planes[i].modifier;
         }
-        s->ctx->surfaces->register_dmabuf(buf->id, static_cast<lx::gfx::dmabuf_desc&&>(desc));
+        s->ctx->surfaces->register_dmabuf(buf->id, std::move(desc));
     } else if (buf->is_shm) {
         s->ctx->surfaces->register_shm(buf->id, buf->width, buf->height, shm_format);
     }
@@ -907,12 +1206,12 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
     s->current_buffer_id = buf->id;
     s->current_texture = s->ctx->surfaces->texture_for(buf->id);
 
-    auto result = s->ctx->surfaces->on_commit(static_cast<lx::compositor::surface_commit&&>(commit));
+    auto result = s->ctx->surfaces->on_commit(std::move(commit));
     if (!result) {
         // The buffer is unusable, so nothing will sample it. Release it immediately:
         // holding it back would starve the client of buffers and stall it forever.
         log_commit_failure(result.get_error());
-        wl_buffer_send_release(s->current.buffer);
+        buffer_release_now(s->current.buffer);
         return;
     }
 
@@ -1059,8 +1358,13 @@ void apply_core(surface_obj* s) {
         // left it alone while it was still on screen.
         if (s->has_content && !s->current.buffer && s->current_texture)
             retire_texture(s->current_texture);
-        if (!s->current.buffer || s->current.buffer != c.buffer)
+        if (!s->current.buffer || s->current.buffer != c.buffer) {
             s->current_texture = 0;
+            // The dma-buf it showed is superseded: released once the frames that sample it
+            // have completed (a re-commit of the same buffer keeps it current).
+            if (s->ctx->lifecycle)
+                s->ctx->lifecycle->on_detach(s->id);
+        }
         s->current.buffer = c.buffer;
         s->has_content = c.buffer != nullptr;
     }
@@ -1075,13 +1379,62 @@ void apply_core(surface_obj* s) {
     const lx::rect2i surface_dmg = c.damage_surface;
     const bool had_buffer_damage = c.has_damage_buffer;
     const lx::rect2i buffer_dmg = c.damage_buffer;
-    for (unsigned i = 0; i < c.frame_cb_count; ++i) {
-        const frame_callback cb = c.frame_cbs[i];
-        c.frame_cbs[i] = {};
-        if (cb.used)
-            queue_frame_callback(cb.resource, s->id);
+    while (c.frame_cbs.head)
+        if (wl_resource* cb = cb_list_pop(c.frame_cbs))
+            queue_frame_callback(cb, s->id);
+    // The commit-path add-ons: the alpha multiplier and content type reach the scene, the
+    // tearing hint the output policy; set_barrier raises the fifo barrier, dated with the
+    // frame that first shows this update.
+    if (c.alpha != s->alpha_current) {
+        if (surface_debug()) {
+            surface_log("surface alpha surface={} multiplier={:.4f}", s->id.id(),
+                        static_cast<double>(c.alpha) / 4294967295.0);
+        }
+        s->alpha_current = c.alpha;
+        s->ctx->surfaces->set_alpha(s->id,
+                                    static_cast<float>(static_cast<double>(c.alpha) / 4294967295.0));
     }
-    c.frame_cb_count = 0;
+    if (c.content_type != s->content_type_current) {
+        s->content_type_current = c.content_type;
+        s->ctx->surfaces->set_content_hint(s->id, static_cast<lx::compositor::content_hint>(
+                                                      c.content_type <= 3 ? c.content_type : 0));
+        if (surface_debug()) {
+            static const char* const k_types[] = {"none", "photo", "video", "game"};
+            surface_log("surface content type surface={} type={}", s->id.id(),
+                        k_types[c.content_type <= 3 ? c.content_type : 0]);
+        }
+    }
+    if (c.tearing != s->tearing_current && surface_debug()) {
+        surface_log("surface presentation hint surface={} hint={}", s->id.id(),
+                    c.tearing == k_tearing_async ? "async" : "vsync");
+    }
+    s->tearing_current = c.tearing;
+    if (c.fifo_set) {
+        if (!s->fifo_barrier)
+            ++g_barriers;
+        s->fifo_barrier = true;
+        s->fifo_barrier_frame = s->ctx->building_frame;
+    }
+    // The acquire point has signalled (the update was held until it did); the release point
+    // moves to the buffer, signalled when the buffer lifecycle retires it.
+    sync_point_drop(c.acquire);
+    if (new_buffer && c.buffer && c.release.timeline) {
+        if (buffer_obj* rb = find_buffer(c.buffer); rb && rb->is_dmabuf) {
+            // A re-commit of the buffer: the newer point guards it now. On the same timeline
+            // a later point signals the older one with it (timelines only move forward), so
+            // the older is kept unsignalled until then; on another it is signalled now (one
+            // slot per buffer — the spec lets a client reuse a buffer only once no commit
+            // holds it, so the newer point still guards it).
+            if (rb->release.timeline == c.release.timeline &&
+                rb->release.point <= c.release.point)
+                sync_point_drop(rb->release);
+            else
+                sync_point_signal_now(rb->release);
+            rb->release = c.release;
+            c.release = {};
+        }
+    }
+    sync_point_signal_now(c.release);
     // Its presentation feedback is queued, dated by the snapshot that first shows it; the
     // update it replaces is discarded or superseded.
     presentation_apply(s);
@@ -1107,15 +1460,12 @@ void apply_core(surface_obj* s) {
         // On a change only: what the client rendered against what it covers, which says
         // whether its draw is 1:1 at the output scale.
         const auto& vp = s->current.viewport;
-        char line[256];
-        std::snprintf(line, sizeof(line),
-                      "surface geometry surface=%llu buffer=%dx%d scale=%d transform=%d "
-                      "src=%s%.2f,%.2f,%.2fx%.2f dst=%s%dx%d size=%dx%d",
-                      s->id.id(), gin.buffer_w, gin.buffer_h, gin.scale,
-                      static_cast<int>(gin.transform), vp.has_src ? "" : "-",
-                      vp.src_x / 256.0, vp.src_y / 256.0, vp.src_w / 256.0, vp.src_h / 256.0,
-                      vp.has_dst ? "" : "-", vp.dst_w, vp.dst_h, geo.size.width, geo.size.height);
-        surface_log(line);
+        surface_log("surface geometry surface={} buffer={}x{} scale={} transform={} "
+                    "src={}{:.2f},{:.2f},{:.2f}x{:.2f} dst={}{}x{} size={}x{}",
+                    s->id.id(), gin.buffer_w, gin.buffer_h, gin.scale,
+                    static_cast<int>(gin.transform), vp.has_src ? "" : "-", vp.src_x / 256.0,
+                    vp.src_y / 256.0, vp.src_w / 256.0, vp.src_h / 256.0, vp.has_dst ? "" : "-",
+                    vp.dst_w, vp.dst_h, geo.size.width, geo.size.height);
     }
 
     if (s->role == surface_role::cursor) {
@@ -1159,7 +1509,7 @@ void apply_core(surface_obj* s) {
     if (s->role == surface_role::none && s->ctx->cursor)
         remember_cursor_candidate(s);
     if (!keeps_content(s)) {
-        wl_buffer_send_release(s->current.buffer);
+        buffer_release_now(s->current.buffer);
         return;
     }
     import_current_buffer(s, damage, geo);
@@ -1167,11 +1517,55 @@ void apply_core(surface_obj* s) {
 
 } // namespace
 
+namespace {
+
+// ── content-update queue (design-app-compat-capture §3) ─────────────────────
+
+/// What a queued update carries besides its records: the wl_surface state, the role state
+/// (`role_snapshot`) and the tree's cached child state, parallel to `content_queue`.
+struct cu_payload {
+    surface_pending state{};
+    role_snapshot role{};
+    lx::compositor::tree_child_state tree{};
+    /// The surface's own wl_surface.commit made it (its role finisher runs when applied);
+    /// false for one a desync transition made.
+    bool root_commit = false;
+    /// A sealed record already applied with its DCU.
+    bool applied = false;
+};
+
+lx::compositor::content_queue g_cu{};
+cu_payload g_cu_payload[lx::compositor::k_cu_pool + 1]{};
+lx::compositor::readiness_poller g_poller{};
+/// The DCU being applied (0: none): sealed children are applied from it.
+unsigned g_applying_cu = 0;
+/// DMA_BUF_IOCTL_EXPORT_SYNC_FILE is missing (older kernel): implicit readiness is not
+/// waited for, the GPU waits implicitly in the import instead.
+bool g_implicit_off = false;
+bool g_overflow_warned = false;
+
+unsigned sealed_record_of(unsigned dcu, unsigned surface) {
+    for (unsigned c = g_cu.at(dcu).first_child; c; c = g_cu.at(c).next_sibling)
+        if (g_cu.at(c).surface == surface && !g_cu_payload[c].applied)
+            return c;
+    return 0;
+}
+
+const surface_pending* queued_tail_state(const surface_obj* s) {
+    const unsigned t = g_cu.tail(surface_slot(s));
+    return t ? &g_cu_payload[t].state : nullptr;
+}
+
+void apply_sealed(surface_obj* child, unsigned sealed, unsigned depth);
+
+} // namespace
+
 /// Applies `s`'s cached state, then — atomically with it, in the same UI call and so the
 /// same snapshot — its children's positions and order and the cached state of every
-/// effectively synchronized child, recursively. The only path from cached to current, so
-/// a later commit-constraint system (fences, transactions) can hold updates back here.
+/// effectively synchronized child, recursively. The only path from cached to current: a
+/// queued update is swapped into `cached` and applied through here too.
 void apply_cached(surface_obj* s, const char* cause, unsigned depth) {
+    const unsigned seq = s->cached.commit_seq;
     apply_core(s);
     auto* tree = s->ctx->tree;
     if (!tree)
@@ -1179,12 +1573,9 @@ void apply_cached(surface_obj* s, const char* cause, unsigned depth) {
     const lx::size2i size = s->surface_size;
     tree->set_has_buffer(s->id, s->has_content && !s->surface_size.empty());
     if (s->role == surface_role::subsurface && surface_debug()) {
-        char line[192];
-        std::snprintf(line, sizeof(line),
-                      "subsurface apply surface=%llu parent=%llu cause=%s buffer=%d w=%d h=%d",
-                      s->id.id(), tree->parent_of(s->id).id(), cause, s->has_content ? 1 : 0,
-                      size.width, size.height);
-        surface_log(line);
+        surface_log("subsurface apply surface={} parent={} cause={} buffer={} w={} h={}",
+                    s->id.id(), tree->parent_of(s->id).id(), cause, s->has_content ? 1 : 0,
+                    size.width, size.height);
     }
     tree->apply_child_state(s->id);
     lx::surface_id kids[lx::compositor::k_tree_max_children + 1];
@@ -1192,12 +1583,23 @@ void apply_cached(surface_obj* s, const char* cause, unsigned depth) {
         tree->sync_children(s->id, kids, lx::compositor::k_tree_max_children + 1);
     for (unsigned i = 0; i < n && depth < lx::compositor::k_tree_max_depth; ++i) {
         surface_obj* child = surface_by_id(kids[i]);
-        if (child && child->has_cached)
+        if (!child)
+            continue;
+        if (g_applying_cu) {
+            // A queued update: the child's state committed with it was sealed into it; what
+            // the child has cached now is newer and waits for the parent's next update.
+            if (const unsigned sealed = sealed_record_of(g_applying_cu, surface_slot(child)))
+                apply_sealed(child, sealed, depth + 1);
+        } else if (child->has_cached) {
             apply_cached(child, "parent-commit", depth + 1);
+        }
     }
     tree->mark_dirty(s->id);
     // text-input v2: a cursor rectangle staged for this surface applies with its content.
     text_input_surface_applied(s);
+    // pointer-constraints: a staged region or cursor hint applies with it too, and the
+    // effective region follows the new input region and size.
+    pointer_constraints_surface_applied(s, seq);
 }
 
 namespace {
@@ -1278,6 +1680,564 @@ void finish_commit(surface_obj* s, bool root_committed, const char* cause) {
         tree->sync_scene(root, cause);
 }
 
+// ── content-update queue: commit, apply, discard ─────────────────────────────
+
+/// What the compositor knows about `s` now (its visibility and pace output's prediction).
+lx::compositor::cu_conditions cu_conditions_of(const surface_obj* s) {
+    lx::compositor::cu_conditions c{};
+    const std::uint32_t shown = surface_shown_mask(s->id) & s->ctx->lit_mask;
+    c.shown = shown != 0;
+    c.barrier = s->fifo_barrier;
+    if (c.shown && s->ctx->cu_predict) {
+        const int pace = surface_pace_output(s->id);
+        if (pace >= 0)
+            c.predicted_ns = s->ctx->cu_predict(s->ctx->cu_user, static_cast<unsigned>(pace));
+    }
+    return c;
+}
+
+void log_implicit_off(int err) {
+    if (!surface_debug())
+        return;
+    surface_log("dma-buf EXPORT_SYNC_FILE unavailable (errno {}): implicit fences are waited for "
+                "by the GPU import, not before applying",
+                err);
+}
+
+/// An explicit-sync acquire point that has not signalled yet: an eventfd armed with
+/// DRM_IOCTL_SYNCOBJ_EVENTFD (-1: it has signalled, or the query failed — nothing better to
+/// wait on). `lost`: it has not signalled and no eventfd could be armed.
+int acquire_wait_fd(const sync_point& p, bool& lost) {
+#if defined(__linux__)
+    lx::gfx::drm_timeline_table* tl = syncobj_timelines();
+    if (!p.timeline || !tl)
+        return -1;
+    auto done = tl->signalled(p.timeline, p.point);
+    if (!done || done.value())
+        return -1;
+    const int efd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+    if (efd >= 0 && tl->notify(p.timeline, p.point, efd))
+        return efd;
+    if (efd >= 0)
+        ::close(efd);
+    lost = true;
+#else
+    (void)p;
+    (void)lost;
+#endif
+    return -1;
+}
+
+/// The fence waits `st`'s newly attached buffer needs before it may be sampled, as fds the
+/// poller can watch (appended to `fds`, at most `cap`; `acquire[i]` marks an explicit-sync
+/// one). Explicit sync: the acquire point — queried first, an eventfd from
+/// DRM_IOCTL_SYNCOBJ_EVENTFD only when it has not signalled; one that cannot be watched
+/// (no room left in `fds`, no eventfd) sets `lost` — the update must then not apply until
+/// it is found signalled. Otherwise, for a dma-buf: its write fences — one poll() per
+/// distinct plane (the common, already-signalled case), a sync_file snapshot
+/// (DMA_BUF_IOCTL_EXPORT_SYNC_FILE) of those still pending; one that does not fit is
+/// waited for by the GPU import instead.
+unsigned fence_waits(const surface_pending& st, int* fds, bool* acquire, unsigned cap,
+                     bool& lost) {
+    if (!st.buffer_set || !st.buffer)
+        return 0;
+    unsigned n = 0;
+#if defined(__linux__)
+    if (st.acquire.timeline) {
+        if (cap == 0) {
+            bool unused = false;
+            const int efd = acquire_wait_fd(st.acquire, unused);
+            if (efd >= 0 || unused) {
+                if (efd >= 0)
+                    ::close(efd);
+                lost = true;
+            }
+            return 0;
+        }
+        const int efd = acquire_wait_fd(st.acquire, lost);
+        if (efd < 0)
+            return 0;
+        fds[n] = efd;
+        acquire[n] = true;
+        return ++n;
+    }
+    if (g_implicit_off || cap == 0)
+        return 0;
+    const buffer_obj* buf = find_buffer(st.buffer);
+    if (!buf || !buf->is_dmabuf)
+        return 0;
+    int seen[4] = {-1, -1, -1, -1};
+    for (unsigned i = 0; i < buf->dmabuf.plane_count && i < 4 && n < cap; ++i) {
+        const int fd = buf->dmabuf.planes[i].fd.get();
+        if (fd < 0)
+            continue;
+        bool dup = false;
+        for (unsigned j = 0; j < i; ++j)
+            dup = dup || seen[j] == fd;
+        seen[i] = fd;
+        if (dup)
+            continue;
+        pollfd pfd{};
+        pfd.fd = fd;
+        pfd.events = POLLIN;
+        if (::poll(&pfd, 1, 0) == 1 && (pfd.revents & POLLIN))
+            continue; // every write fence has signalled
+        dma_buf_export_sync_file req{};
+        req.flags = DMA_BUF_SYNC_READ;
+        req.fd = -1;
+        if (::ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &req) != 0 || req.fd < 0) {
+            if (errno == ENOTTY || errno == EINVAL) {
+                g_implicit_off = true;
+                log_implicit_off(errno);
+            }
+            return n;
+        }
+        fds[n] = req.fd;
+        acquire[n] = false;
+        ++n;
+    }
+#else
+    (void)st;
+    (void)fds;
+    (void)acquire;
+    (void)cap;
+    (void)lost;
+#endif
+    return n;
+}
+
+/// Some queued update has `recheck` set (cleared by a scan that finds none).
+bool g_recheck_any = false;
+
+/// Hands `nfd` fence fds to the poller as waits of record `cu`. An explicit-sync one it
+/// cannot take, or one already `lost`, sets the record's `recheck`: the update then waits
+/// until the point is found signalled (`cu_recheck`) — never applied on an unsignalled
+/// acquire point. An implicit fence it cannot take is dropped (the GPU import waits for it).
+void arm_waits(unsigned cu, const int* fds, const bool* acquire, unsigned nfd, bool lost) {
+    lx::compositor::cu_record& rec = g_cu.at(cu);
+    for (unsigned i = 0; i < nfd; ++i) {
+        if (g_poller.add(fds[i], cu, rec.generation))
+            ++rec.waits;
+        else if (acquire[i])
+            lost = true;
+    }
+    if (lost) {
+        rec.recheck = true;
+        g_recheck_any = true;
+    }
+}
+
+/// The unsignalled explicit-sync acquire points of DCU `root` and the records sealed into
+/// it, into `out` (up to `cap`); their count. Query failures count as signalled.
+unsigned unsignalled_acquires(unsigned root, sync_point* out, unsigned cap) {
+    lx::gfx::drm_timeline_table* tl = syncobj_timelines();
+    if (!tl)
+        return 0;
+    unsigned n = 0;
+    const auto check = [&](const surface_pending& st) {
+        if (!st.buffer_set || !st.buffer || !st.acquire.timeline || n >= cap)
+            return;
+        auto done = tl->signalled(st.acquire.timeline, st.acquire.point);
+        if (done && !done.value())
+            out[n++] = st.acquire;
+    };
+    check(g_cu_payload[root].state);
+    for (unsigned c = g_cu.at(root).first_child; c; c = g_cu.at(c).next_sibling)
+        check(g_cu_payload[c].state);
+    return n;
+}
+
+/// Queued updates whose acquire points had no poller entry: each is queried again (a tick
+/// of a lit output runs this while one exists, `cu_waiting_outputs`); found signalled, the
+/// update is free of it; still pending, eventfds are armed once the poller has room for
+/// all of them.
+void cu_recheck() {
+    if (!g_recheck_any)
+        return;
+    bool still = false;
+    for (unsigned i = 1; i <= lx::compositor::k_cu_pool; ++i) {
+        lx::compositor::cu_record& rec = g_cu.at(i);
+        if (!rec.used || !rec.recheck)
+            continue;
+        sync_point points[lx::compositor::k_cu_per_surface];
+        const unsigned n = unsignalled_acquires(i, points, lx::compositor::k_cu_per_surface);
+        if (n == 0) {
+            rec.recheck = false;
+            continue;
+        }
+        bool armed = g_poller.available() >= n;
+        for (unsigned k = 0; armed && k < n; ++k) {
+            bool lost = false;
+            const int efd = acquire_wait_fd(points[k], lost);
+            if (efd < 0) {
+                armed = !lost; // signalled meanwhile
+                continue;
+            }
+            if (g_poller.add(efd, i, rec.generation))
+                ++rec.waits;
+            else
+                armed = false;
+        }
+        if (armed)
+            rec.recheck = false;
+        else
+            still = true;
+    }
+    g_recheck_any = still;
+}
+
+/// The effectively synchronized descendants of `s` with cached state, in tree preorder:
+/// what a DCU of `s` applies with it.
+unsigned sync_descendants(surface_obj* s, surface_obj** out, unsigned cap) {
+    auto* tree = s->ctx->tree;
+    if (!tree)
+        return 0;
+    unsigned count = 0;
+    tree->for_each_preorder(s->id, [&](lx::surface_id id) {
+        if (id == s->id)
+            return true;
+        if (!tree->effectively_sync(id))
+            return false; // a desynchronized subtree applies its own commits
+        surface_obj* n = surface_by_id(id);
+        if (n && n->has_cached && count < cap)
+            out[count++] = n;
+        return true;
+    });
+    return count;
+}
+
+void close_fds(const int* fds, unsigned n) {
+    for (unsigned i = 0; i < n; ++i)
+        if (fds[i] >= 0)
+            ::close(fds[i]);
+}
+
+void warn_overflow() {
+    if (g_overflow_warned)
+        return;
+    g_overflow_warned = true;
+    lx::trace::logger::global().log(
+        lx::trace::level::warn, "compositor.surface",
+        "content-update queue full (a client far ahead of the display): its newest updates are "
+        "merged, superseding frames rather than showing any early. Reported once.");
+}
+
+/// `newer`'s role state over `older`'s (two queued updates merged).
+void merge_role(role_snapshot& older, const role_snapshot& newer) {
+    if (newer.min_set) {
+        older.min_set = true;
+        older.min = newer.min;
+    }
+    if (newer.max_set) {
+        older.max_set = true;
+        older.max = newer.max;
+    }
+    if (newer.wg_set) {
+        older.wg_set = true;
+        older.wg = newer.wg;
+    }
+    if (newer.acked_unapplied) {
+        older.acked_unapplied = true;
+        older.acked = newer.acked;
+    }
+    if (newer.layer_set) {
+        older.layer_set = true;
+        older.layer = newer.layer;
+    }
+}
+
+/// `newer`'s cached child state over `older`'s.
+void merge_tree(lx::compositor::tree_child_state& older,
+                const lx::compositor::tree_child_state& newer) {
+    for (unsigned i = 0; i < newer.count; ++i) {
+        unsigned j = 0;
+        while (j < older.count && !(older.ids[j] == newer.ids[i]))
+            ++j;
+        if (j == older.count) {
+            if (older.count >= lx::compositor::k_tree_max_children)
+                continue;
+            older.ids[older.count++] = newer.ids[i];
+        }
+        older.pos[j] = newer.pos[i];
+    }
+    if (newer.order_set) {
+        older.order_set = true;
+        older.order = newer.order;
+    }
+}
+
+/// The queue of `s` is full: this commit merges into its newest queued update (Q5), which
+/// then carries the newer content and waits for both updates' blockers. Order is kept and
+/// nothing shows early; the older update's content is superseded (its feedback discarded).
+void merge_into_tail(surface_obj* s, bool root_commit, surface_obj** kids, unsigned nk,
+                     const int* fds, const bool* acquire, unsigned nfd, bool lost) {
+    const unsigned tail = g_cu.tail(surface_slot(s));
+    lx::compositor::cu_record& rec = g_cu.at(tail);
+    cu_payload& pl = g_cu_payload[tail];
+    if (s->cached.target_ns > rec.target_ns)
+        rec.target_ns = s->cached.target_ns;
+    merge_state(s, s->cached, pl.state);
+    s->cached = {};
+    s->has_cached = false;
+    if (root_commit) {
+        role_snapshot newer{};
+        take_role_snapshot(s, newer);
+        if (pl.root_commit)
+            merge_role(pl.role, newer);
+        else
+            pl.role = newer;
+        pl.root_commit = true;
+    }
+    auto* tree = s->ctx->tree;
+    if (tree) {
+        lx::compositor::tree_child_state newer{};
+        tree->take_cached_child_state(s->id, newer);
+        merge_tree(pl.tree, newer);
+    }
+    for (unsigned k = 0; k < nk; ++k) {
+        surface_obj* kid = kids[k];
+        unsigned c = sealed_record_of(tail, surface_slot(kid));
+        if (!c) {
+            c = g_cu.alloc(surface_slot(kid), s->client.id());
+            if (!c)
+                continue; // no record left: its state stays cached for the next commit
+            g_cu_payload[c] = {};
+            g_cu.seal(tail, c);
+        }
+        cu_payload& cp = g_cu_payload[c];
+        merge_state(kid, kid->cached, cp.state);
+        kid->cached = {};
+        kid->has_cached = false;
+        if (tree) {
+            lx::compositor::tree_child_state newer{};
+            tree->take_cached_child_state(kid->id, newer);
+            merge_tree(cp.tree, newer);
+        }
+    }
+    arm_waits(tail, fds, acquire, nfd, lost);
+}
+
+/// A commit of `s` (not effectively synchronized): its cached state, with its synchronized
+/// descendants' sealed in, becomes a DCU. Applied now when the surface's queue is empty and
+/// nothing blocks it (the fast path, today's cost); otherwise queued. True when applied —
+/// the caller then finishes the commit (role, scene).
+bool commit_dcu(surface_obj* s, bool root_commit, const char* cause) {
+    const unsigned slot = surface_slot(s);
+    surface_obj* kids[64];
+    const unsigned nk = sync_descendants(s, kids, 64);
+    int fds[16];
+    bool acquire[16];
+    bool lost = false;
+    unsigned nfd = fence_waits(s->cached, fds, acquire, 16, lost);
+    for (unsigned k = 0; k < nk; ++k)
+        nfd += fence_waits(kids[k]->cached, fds + nfd, acquire + nfd, 16 - nfd, lost);
+    // An unsignalled explicit-sync acquire point among them: the update cannot apply before
+    // it signals, whatever else happens.
+    bool explicit_wait = lost;
+    for (unsigned i = 0; i < nfd; ++i)
+        explicit_wait = explicit_wait || acquire[i];
+    lx::compositor::cu_record probe{};
+    probe.fifo_wait = s->cached.fifo_wait;
+    probe.target_ns = s->cached.target_ns;
+    const lx::compositor::cu_conditions cond = cu_conditions_of(s);
+    const bool blocked = g_cu.depth(slot) > 0 || nfd > 0 || lost ||
+                         !lx::compositor::cu_ready(probe, true, cond);
+    if (blocked) {
+        const unsigned need = 1 + nk;
+        const unsigned client = s->client.id();
+        const auto room = [&] {
+            return g_cu.depth(slot) < lx::compositor::k_cu_per_surface &&
+                   lx::compositor::cu_room_for(g_cu.free_count(), g_cu.client_count(client),
+                                               need);
+        };
+        if (!room() && g_cu.depth(slot) > 0) {
+            warn_overflow();
+            merge_into_tail(s, root_commit, kids, nk, fds, acquire, nfd, lost);
+            return false;
+        }
+        if (room()) {
+            const unsigned root = g_cu.alloc(slot, client);
+            lx::compositor::cu_record& rec = g_cu.at(root);
+            rec.fifo_wait = probe.fifo_wait;
+            rec.target_ns = probe.target_ns;
+            cu_payload& pl = g_cu_payload[root];
+            pl.state = s->cached;
+            s->cached = {};
+            s->has_cached = false;
+            pl.root_commit = root_commit;
+            pl.applied = false;
+            if (root_commit)
+                take_role_snapshot(s, pl.role);
+            else
+                pl.role = {};
+            if (auto* tree = s->ctx->tree)
+                tree->take_cached_child_state(s->id, pl.tree);
+            for (unsigned k = 0; k < nk; ++k) {
+                const unsigned c = g_cu.alloc(surface_slot(kids[k]), client);
+                cu_payload& cp = g_cu_payload[c];
+                cp.state = kids[k]->cached;
+                kids[k]->cached = {};
+                kids[k]->has_cached = false;
+                cp.root_commit = false;
+                cp.applied = false;
+                cp.role = {};
+                if (auto* tree = s->ctx->tree)
+                    tree->take_cached_child_state(kids[k]->id, cp.tree);
+                g_cu.seal(root, c);
+            }
+            arm_waits(root, fds, acquire, nfd, lost);
+            g_cu.push(root);
+            // A target time on a shown surface: its output's clock is armed for the tick
+            // that presents at or after it (an idle desktop wakes only for real deadlines).
+            if (rec.target_ns && cond.shown && s->ctx->cu_request_at) {
+                const int pace = surface_pace_output(s->id);
+                if (pace >= 0)
+                    s->ctx->cu_request_at(s->ctx->cu_user, static_cast<unsigned>(pace),
+                                          rec.target_ns);
+            }
+            if (surface_debug()) {
+                surface_log("content update queued surface={} cause={} depth={} waits={} fifo={} "
+                            "barrier={} target={} sealed={}",
+                            s->id.id(), cause, g_cu.depth(slot), rec.waits, rec.fifo_wait ? 1 : 0,
+                            s->fifo_barrier ? 1 : 0, rec.target_ns, nk);
+            }
+            return false;
+        }
+        // No room and nothing of this surface queued to merge into (the pool or the client cap
+        // is spent on its other surfaces).
+        close_fds(fds, nfd);
+        if (explicit_wait) {
+            // Applying it would sample a buffer the client's GPU may still be writing, and
+            // there is nowhere for it to wait: the client is past its share of the pool (the
+            // reserve keeps room for any client that queues little), so it is the one that
+            // goes — wlroots and Mutter answer an allocation failure the same way.
+            lx::trace::logger::global().log(
+                lx::trace::level::warn, "compositor.surface",
+                "content-update queue full for an update waiting on its acquire point: "
+                "client disconnected (no_memory)");
+            wl_client_post_no_memory(wl_resource_get_client(s->resource));
+            return false;
+        }
+        // Nothing waits on the client's GPU: this update applies now (fifo and commit-timing
+        // are skipped, implicit fences are waited for by the GPU import).
+        warn_overflow();
+    }
+    if (root_commit)
+        apply_role_pending(s);
+    apply_cached(s, cause, 0);
+    return true;
+}
+
+/// A sealed child's state, applied with its DCU in place of what the child caches now.
+void apply_sealed(surface_obj* child, unsigned sealed, unsigned depth) {
+    cu_payload& pl = g_cu_payload[sealed];
+    auto* tree = child->ctx->tree;
+    const surface_pending stash = child->cached;
+    const bool stash_has = child->has_cached;
+    child->cached = pl.state;
+    child->has_cached = true;
+    pl.state = {};
+    pl.applied = true;
+    lx::compositor::tree_child_state tstash{};
+    if (tree) {
+        tree->take_cached_child_state(child->id, tstash);
+        tree->put_cached_child_state(child->id, pl.tree);
+    }
+    apply_cached(child, "parent-queued", depth);
+    if (tree)
+        tree->put_cached_child_state(child->id, tstash);
+    child->cached = stash;
+    child->has_cached = stash_has;
+}
+
+/// Applies a queued DCU (already popped) and frees it: its state is swapped into the
+/// surface's `cached` (setting aside whatever the surface caches now), with its role state
+/// and the tree's child state, then applied through `apply_cached` like any commit.
+void apply_cu(unsigned root) {
+    const lx::compositor::cu_record rec = g_cu.at(root);
+    surface_obj* s = &surfaces[rec.surface - 1];
+    cu_payload& pl = g_cu_payload[root];
+    if (s->used) {
+        auto* tree = s->ctx->tree;
+        const surface_pending stash = s->cached;
+        const bool stash_has = s->has_cached;
+        s->cached = pl.state;
+        s->has_cached = true;
+        pl.state = {};
+        lx::compositor::tree_child_state tstash{};
+        if (tree) {
+            tree->take_cached_child_state(s->id, tstash);
+            tree->put_cached_child_state(s->id, pl.tree);
+        }
+        role_stash rstash{};
+        if (pl.root_commit)
+            apply_role_snapshot(s, pl.role, rstash);
+        const unsigned outer = g_applying_cu;
+        g_applying_cu = root;
+        apply_cached(s, "queued", 0);
+        g_applying_cu = outer;
+        if (tree)
+            tree->put_cached_child_state(s->id, tstash);
+        s->cached = stash;
+        s->has_cached = stash_has;
+        finish_commit(s, pl.root_commit, "queued");
+        if (pl.root_commit)
+            restore_role_stash(s, rstash);
+    }
+    for (unsigned c = rec.first_child; c;) {
+        const unsigned next = g_cu.at(c).next_sibling;
+        cu_payload& cp = g_cu_payload[c];
+        // Not applied with it (the child stopped being synchronized meanwhile): dropped
+        // like an update of a destroyed parent.
+        if (!cp.applied) {
+            surface_obj* owner = &surfaces[g_cu.at(c).surface - 1];
+            if (owner->used)
+                drop_state(owner, cp.state, false);
+        }
+        cp = {};
+        g_cu.release(c);
+        c = next;
+    }
+    (void)g_poller.drop(root);
+    pl = {};
+    g_cu.release(root);
+}
+
+/// Drops a queued DCU and its sealed records unapplied.
+void discard_cu(unsigned root, bool dying) {
+    const lx::compositor::cu_record rec = g_cu.at(root);
+    for (unsigned c = rec.first_child; c;) {
+        const unsigned next = g_cu.at(c).next_sibling;
+        surface_obj* owner = &surfaces[g_cu.at(c).surface - 1];
+        if (owner->used)
+            drop_state(owner, g_cu_payload[c].state, dying);
+        g_cu_payload[c] = {};
+        g_cu.release(c);
+        c = next;
+    }
+    surface_obj* s = &surfaces[rec.surface - 1];
+    if (s->used)
+        drop_state(s, g_cu_payload[root].state, dying);
+    (void)g_poller.drop(root);
+    g_cu_payload[root] = {};
+    g_cu.release(root);
+}
+
+/// Applies `slot`'s queued updates from the head while they are ready.
+void cu_try_surface(unsigned slot) {
+    for (unsigned guard = 0; guard <= lx::compositor::k_cu_per_surface; ++guard) {
+        const unsigned head = g_cu.head(slot);
+        if (!head)
+            return;
+        const surface_obj* s = &surfaces[slot - 1];
+        if (!lx::compositor::cu_ready(g_cu.at(head), g_cu.fences_clear(head),
+                                      cu_conditions_of(s)))
+            return;
+        (void)g_cu.pop(slot);
+        apply_cu(head);
+    }
+}
+
 } // namespace
 
 /// A surface stopped being effectively synchronized (set_desync, its wl_subsurface or its
@@ -1289,8 +2249,10 @@ void flush_desync(surface_obj* s, const char* cause) {
         return;
     tree->for_each_preorder(s->id, [&](lx::surface_id id) {
         surface_obj* n = surface_by_id(id);
+        // A cached SCU of a surface that is no longer synchronized becomes a DCU: applied
+        // now, or queued behind its fences like any other.
         if (n && n->has_cached && !tree->effectively_sync(id))
-            apply_cached(n, cause, 0);
+            (void)commit_dcu(n, false, cause);
         // Always descend: a desynchronized grandchild may hold state that was only cached
         // because this surface was synchronized.
         return true;
@@ -1308,9 +2270,19 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
     // Role rules that reject the whole commit come first, before any state moves; then
     // the geometry the commit would produce (D5: checked here, at the client's commit, as
     // wlroots does — the values are fixed by now).
-    if (!role_prechecks(s) || !geometry_prechecks(s) || !viewport_precheck(s))
+    if (!role_prechecks(s) || !geometry_prechecks(s) || !viewport_precheck(s) ||
+        !syncobj_precheck(s))
         return;
+    // xdg-toplevel-icon-v1: a staged icon is "applied on the next wl_surface.commit of the
+    // toplevel". It only reaches the shell's panel, so it goes now rather than riding a queued
+    // content update.
+    if (s->role == surface_role::xdg_toplevel)
+        toplevel_icon_commit(s);
 
+    // The commit's number travels with its content update; state other objects staged for
+    // this commit (a pointer constraint's region) is keyed by it.
+    s->pending.commit_seq = ++s->commit_seq ? s->commit_seq : ++s->commit_seq;
+    pointer_constraints_surface_committed(s, s->pending.commit_seq);
     merge_pending_into_cached(s);
     auto* tree = s->ctx->tree;
     if (tree)
@@ -1319,22 +2291,21 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
     const bool is_sub = s->role == surface_role::subsurface;
     if (tree && tree->effectively_sync(s->id)) {
         // A synchronized content update: it waits for the parent's state to be applied.
+        // fifo-v1: "The constraint must be ignored if the surface is a subsurface in
+        // synchronized mode."
+        s->cached.fifo_wait = false;
         if (surface_debug()) {
-            char line[128];
-            std::snprintf(line, sizeof(line), "subsurface commit surface=%llu mode=sync cached=1",
-                          s->id.id());
-            surface_log(line);
+            surface_log("subsurface commit surface={} mode=sync cached=1", s->id.id());
         }
         return;
     }
     if (is_sub && surface_debug()) {
-        char line[128];
-        std::snprintf(line, sizeof(line), "subsurface commit surface=%llu mode=desync cached=0",
-                      s->id.id());
-        surface_log(line);
+        surface_log("subsurface commit surface={} mode=desync cached=0", s->id.id());
     }
-    apply_cached(s, is_sub ? "desync-commit" : "commit", 0);
-    finish_commit(s, true, "commit");
+    if (commit_dcu(s, true, is_sub ? "desync-commit" : "commit"))
+        finish_commit(s, true, "commit");
+    // A constraint region or cursor hint that applied with it takes effect now.
+    pointer_constraints_flush();
 }
 
 void surface_set_buffer_transform(struct wl_client*, struct wl_resource* resource,
@@ -1568,6 +2539,10 @@ void fire_frames(unsigned frame_time_ms, bool throttle, unsigned slot, unsigned 
                 paced_elsewhere = !answer;
             }
         }
+        // A window being captured counts as shown (CC2): a screencast of a covered window
+        // keeps its frames coming at the capturing output's pace, not the throttle's.
+        if (!answer && !paced_elsewhere && capture_paces_surface(e.surface))
+            answer = true;
         // Not on screen: answered once its surface's throttle interval has passed. A
         // surface answered earlier in this same pass counts as due (`frame_done_ns == now`),
         // so all of one surface's callbacks go together.
@@ -1609,6 +2584,199 @@ std::uint32_t frames_pending_outputs() {
 }
 
 bool frames_throttled() { return g_throttled_frame_count > 0; }
+
+// ── content-update queue: entry points ───────────────────────────────────────
+
+void drop_state(surface_obj* s, surface_pending& st, bool dying) {
+    if (dying)
+        cb_list_forget(st.frame_cbs);
+    else
+        frame_cbs_fire_now(st.frame_cbs);
+    presentation_drop_list(st.feedback);
+    sync_point_drop(st.acquire);
+    if (dying)
+        sync_point_drop(st.release);
+    else
+        sync_point_signal_now(st.release);
+    // Same rule as a superseded cached buffer: not the dma-buf on screen (the lifecycle
+    // releases that one), and an shm buffer is owed a release of its own.
+    if (!dying && st.buffer_set && st.buffer &&
+        (st.buffer != s->current.buffer || wl_shm_buffer_get(st.buffer)))
+        wl_buffer_send_release(st.buffer);
+    st = {};
+}
+
+lx::compositor::content_queue& cu_queue() { return g_cu; }
+
+int cu_poll_fd() {
+    if (g_poller.fd() < 0) {
+        if (auto opened = g_poller.open(); !opened)
+            lx::trace::logger::global().log_error(opened.get_error(), "compositor.surface");
+    }
+    return g_poller.fd();
+}
+
+void cu_try_all(const char* cause) {
+    (void)cause;
+    if (g_cu.used_count() == 0)
+        return;
+    cu_recheck();
+    unsigned slots[lx::compositor::k_cu_surfaces];
+    const unsigned n = g_cu.queued_surfaces(slots, lx::compositor::k_cu_surfaces);
+    for (unsigned i = 0; i < n; ++i)
+        cu_try_surface(slots[i]);
+}
+
+void cu_poll() {
+    using wake = lx::compositor::readiness_poller::wake;
+    wake wakes[64];
+    bool any = false;
+    for (;;) {
+        const unsigned n = g_poller.drain(wakes, 64);
+        for (unsigned i = 0; i < n; ++i) {
+            if (wakes[i].cu >= k_poll_foreign_base) {
+                // Another unit's wait (a screen capture's copy fence).
+                capture_fence_signalled(wakes[i].cu, wakes[i].generation);
+                continue;
+            }
+            lx::compositor::cu_record& r = g_cu.at(wakes[i].cu);
+            if (r.used && r.generation == wakes[i].generation && r.waits > 0) {
+                --r.waits;
+                any = true;
+            }
+        }
+        if (n < 64)
+            break;
+    }
+    // Entries freed: an update whose acquire point found none may arm one now.
+    if (any || g_recheck_any)
+        cu_try_all("fence");
+}
+
+bool cu_poll_add(int fd, unsigned key, unsigned generation) {
+    if (key < k_poll_foreign_base || cu_poll_fd() < 0) {
+        if (fd >= 0)
+            ::close(fd);
+        return false;
+    }
+    // Other units' waits may use the reserve content updates cannot take.
+    return g_poller.add(fd, key, generation, true);
+}
+
+void cu_poll_drop(unsigned key) {
+    if (key >= k_poll_foreign_base)
+        (void)g_poller.drop(key);
+}
+
+void cu_after_latch(unsigned slot, unsigned frame) {
+    if (g_barriers > 0 && g_p0_ctx) {
+        for (auto& s : surfaces) {
+            if (!s.used || !s.fifo_barrier)
+                continue;
+            // "Cleared immediately after the following latching deadline": the frame that
+            // first showed the update with set_barrier has latched on the surface's pace
+            // output. A surface not on screen does not hold its barrier.
+            const bool shown = (surface_shown_mask(s.id) & g_p0_ctx->lit_mask) != 0;
+            const int pace = shown ? surface_pace_output(s.id) : -1;
+            if (pace >= 0 && (static_cast<unsigned>(pace) != slot ||
+                              static_cast<int>(frame - s.fifo_barrier_frame) < 0))
+                continue;
+            s.fifo_barrier = false;
+            --g_barriers;
+        }
+    }
+    cu_try_all("latch");
+}
+
+std::uint32_t cu_waiting_outputs() {
+    if (g_cu.used_count() == 0 || !g_p0_ctx)
+        return 0;
+    unsigned slots[lx::compositor::k_cu_surfaces];
+    const unsigned n = g_cu.queued_surfaces(slots, lx::compositor::k_cu_surfaces);
+    std::uint32_t mask = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const surface_obj& s = surfaces[slots[i] - 1];
+        const lx::compositor::cu_record& r = g_cu.at(g_cu.head(slots[i]));
+        if (g_recheck_any && !g_cu.fences_clear(g_cu.head(slots[i]))) {
+            // An acquire point only a query notices: its pace output ticks (any lit one
+            // when it is shown on none) until the point signals or an eventfd is armed.
+            bool recheck = r.recheck;
+            for (unsigned c = r.first_child; c && !recheck; c = g_cu.at(c).next_sibling)
+                recheck = g_cu.at(c).recheck;
+            if (recheck) {
+                const int pace = (surface_shown_mask(s.id) & g_p0_ctx->lit_mask) != 0
+                                     ? surface_pace_output(s.id)
+                                     : -1;
+                if (pace >= 0)
+                    mask |= 1u << static_cast<unsigned>(pace);
+                else if (g_p0_ctx->lit_mask)
+                    mask |= g_p0_ctx->lit_mask & (~g_p0_ctx->lit_mask + 1u);
+                continue;
+            }
+        }
+        if (!r.fifo_wait || !s.fifo_barrier)
+            continue;
+        const int pace = (surface_shown_mask(s.id) & g_p0_ctx->lit_mask) != 0
+                             ? surface_pace_output(s.id)
+                             : -1;
+        if (pace >= 0)
+            mask |= 1u << static_cast<unsigned>(pace);
+    }
+    return mask;
+}
+
+unsigned long long cu_earliest_target(unsigned slot) {
+    if (g_cu.used_count() == 0 || !g_p0_ctx)
+        return 0;
+    unsigned slots[lx::compositor::k_cu_surfaces];
+    const unsigned n = g_cu.queued_surfaces(slots, lx::compositor::k_cu_surfaces);
+    unsigned long long best = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const lx::compositor::cu_record& r = g_cu.at(g_cu.head(slots[i]));
+        if (!r.target_ns || (best && r.target_ns >= best))
+            continue;
+        if (surface_pace_output(surfaces[slots[i] - 1].id) == static_cast<int>(slot))
+            best = r.target_ns;
+    }
+    return best;
+}
+
+void cu_surface_destroyed(surface_obj* s, bool dying) {
+    if (g_cu.used_count() == 0)
+        return;
+    const unsigned slot = surface_slot(s);
+    while (const unsigned root = g_cu.pop(slot))
+        discard_cu(root, dying);
+    // Its state sealed into an ancestor's queued update: the record must not outlive the
+    // slot (the next surface there would receive it).
+    for (unsigned i = 1; i <= lx::compositor::k_cu_pool && g_cu.used_count() > 0; ++i) {
+        lx::compositor::cu_record& r = g_cu.at(i);
+        if (!r.used || r.surface != slot || r.parent == 0)
+            continue;
+        drop_state(s, g_cu_payload[i].state, dying);
+        g_cu_payload[i] = {};
+        g_cu.unseal(i);
+        g_cu.release(i);
+    }
+}
+
+void cu_buffer_gone(wl_resource* buffer) {
+    if (g_cu.used_count() == 0)
+        return;
+    for (unsigned i = 1; i <= lx::compositor::k_cu_pool; ++i) {
+        if (!g_cu.at(i).used)
+            continue;
+        surface_pending& st = g_cu_payload[i].state;
+        if (st.buffer != buffer)
+            continue;
+        // As for a cached attach: its contents are undefined now, the update keeps the rest
+        // of its state and shows the previous content.
+        st.buffer = nullptr;
+        st.buffer_set = false;
+        sync_point_drop(st.acquire);
+        sync_point_signal_now(st.release);
+    }
+}
 
 } // namespace lx::compositor::p0
 

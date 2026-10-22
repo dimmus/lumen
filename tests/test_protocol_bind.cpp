@@ -1,11 +1,5 @@
 // Verify advertised Wayland globals are real: present in the registry and bindable.
-#include <atomic>
-#include <chrono>
-#include <cstdio>
-#include <cstring>
-#include <string>
-#include <thread>
-#include <vector>
+#include <stdio.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-client.h>
@@ -22,7 +16,9 @@
 #pragma clang diagnostic pop
 #endif
 #endif
+#include <stdint.h>
 
+import std;
 import lx.foundation;
 import lx.compositor;
 

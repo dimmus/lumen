@@ -1,8 +1,6 @@
-module;
-
-#include <cstdio>
-
 export module lx.foundation:error;
+
+import std;
 
 export import :result;
 
@@ -59,6 +57,8 @@ enum class drm_err : int {
     test_rejected = 7,
     /// The hotplug monitor (udev netlink) could not be opened.
     monitor_failed = 8,
+    /// A DRM timeline syncobj operation (import, query, eventfd, signal, transfer) failed.
+    timeline_failed = 9,
 };
 
 enum class protocol_err : int {
@@ -88,8 +88,39 @@ enum class protocol_err : int {
     return {domain, code, message ? message : ""};
 }
 
-[[nodiscard]] inline error not_implemented(const char* what) noexcept {
+/// The domain a subsystem's error-code enum belongs to: `make_error(drm_err::open_failed, …)`
+/// needs no `error_domain` and no cast.
+template <typename E>
+struct error_domain_of;
+template <>
+struct error_domain_of<io_err> : std::integral_constant<error_domain, error_domain::io> {};
+template <>
+struct error_domain_of<wayland_err> : std::integral_constant<error_domain, error_domain::wayland> {
+};
+template <>
+struct error_domain_of<vulkan_err> : std::integral_constant<error_domain, error_domain::vulkan> {};
+template <>
+struct error_domain_of<gl_err> : std::integral_constant<error_domain, error_domain::gl> {};
+template <>
+struct error_domain_of<drm_err> : std::integral_constant<error_domain, error_domain::drm> {};
+template <>
+struct error_domain_of<protocol_err>
+    : std::integral_constant<error_domain, error_domain::protocol> {};
+
+template <typename E>
+concept domain_code = std::is_enum_v<E> && requires { error_domain_of<E>::value; };
+
+template <domain_code E>
+[[nodiscard]] constexpr error make_error(E code, const char* message) noexcept {
+    return make_error(error_domain_of<E>::value, std::to_underlying(code), message);
+}
+
+[[nodiscard]] constexpr error not_implemented(const char* what) noexcept {
     return make_error(error_domain::not_implemented, 0, what);
+}
+
+[[nodiscard]] constexpr error invalid_argument(const char* what) noexcept {
+    return make_error(error_domain::invalid_argument, 0, what);
 }
 
 /// Format `error` into a thread-local buffer (not re-entrant).

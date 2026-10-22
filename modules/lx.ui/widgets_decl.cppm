@@ -1,12 +1,12 @@
 module;
 
-#include <cstring>
-
 import lx.foundation;
 import lx.layout;
 import lx.scene;
 
 export module lx.ui:widgets_decl;
+
+import std;
 
 import :element;
 import :node;
@@ -144,7 +144,7 @@ void lx::ui::box_node::emit(draw_scope& out) const {
 }
 
 lx::ui::child lx::ui::box(lx::color fill, child content) {
-    return with_children(describe<box_node, box_props>({fill}), &content, content ? 1u : 0u);
+    return with_children(describe<box_node, box_props>({fill}), {&content, content ? 1u : 0u});
 }
 
 lx::ui::child lx::ui::box(child content) {

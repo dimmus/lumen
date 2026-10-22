@@ -22,10 +22,9 @@ module;
 // idle timeout (`--blank-locked-after`, 60 s) blanks the lock screen (GNOME and KDE do the
 // same).
 
-#include <cstdlib>
-#include <cstring>
-
 export module lx.shell:idle_policy;
+
+import std;
 
 export namespace lx::shell {
 

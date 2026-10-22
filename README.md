@@ -68,6 +68,12 @@ Key bindings:
 | Super+left drag / Super+right drag | Move / resize the window under the pointer | compositor (placeholder) |
 | Super (tap) | Open / close the launcher (also the panel's Apps button). Super pressed and released alone; the key still reaches the focused window | shell (key grab, zlm_shell_v1 v4) |
 | Super+Return | Start a terminal (`$TERMINAL`, `xdg-terminal-exec`, or the first of foot, Alacritty, kitty, … installed) | shell (key grab) |
+| Super+Escape | Turn the focused window's shortcuts inhibitor off (and on again) and release its pointer lock or confinement: a VM viewer, remote desktop or game that took the desktop's shortcuts or the pointer gives them back | compositor (only when that window inhibits or constrains the pointer; never inhibitable) |
+
+A window that inhibits shortcuts (keyboard-shortcuts-inhibit: virt-viewer, remote desktops)
+receives Super, Super+Return and the other shell keys while it has the keyboard; VT switching,
+Ctrl+Alt+Backspace and Super+Escape stay the compositor's, and the shell's lock key
+(Super+L) is never inhibited.
 
 The launcher lists the applications installed as XDG desktop entries
 (`$XDG_DATA_HOME/applications`, then each `$XDG_DATA_DIRS`'s, honouring `NoDisplay`,
@@ -126,9 +132,53 @@ Protocols served: `wl_compositor` (v6), `wl_subcompositor`, `wl_seat` (v9), `wl_
 (v2: CLOCK_MONOTONIC, the KMS flip's time and vblank counter per commit, or `discarded`),
 `ext_idle_notifier_v1` (v2), `zwp_idle_inhibit_manager_v1`, `zwlr_output_power_manager_v1`,
 `ext_session_lock_manager_v1`, `zwp_text_input_manager_v3` (v2),
-`zwp_input_method_manager_v2`, `zwp_virtual_keyboard_manager_v1`, and the private
-`zlm_shell_v1` (v5; the shell only). Windows covered by an opaque window are not
-composited, and their frame callbacks slow to one a second.
+`zwp_input_method_manager_v2`, `zwp_virtual_keyboard_manager_v1`, `wp_fifo_manager_v1`,
+`wp_commit_timing_manager_v1`, `wp_tearing_control_manager_v1`, `wp_content_type_manager_v1`,
+`wp_single_pixel_buffer_manager_v1`, `wp_alpha_modifier_v1`,
+`wp_linux_drm_syncobj_manager_v1` (only where the card has timeline syncobjs),
+`xdg_wm_dialog_v1`, `xdg_toplevel_icon_manager_v1`, `xdg_system_bell_v1`,
+`zxdg_exporter_v2`/`zxdg_importer_v2` and v1, `zwp_keyboard_shortcuts_inhibit_manager_v1`,
+`ext_data_control_manager_v1`, `zwlr_data_control_manager_v1` (v2),
+`wp_security_context_manager_v1`, `zwp_pointer_constraints_v1`, `zwp_relative_pointer_manager_v1`,
+`zwp_pointer_gestures_v1` (v3), `ext_foreign_toplevel_list_v1`,
+`ext_output_image_capture_source_manager_v1`, `ext_foreign_toplevel_image_capture_source_manager_v1`
+(GL and CPU backends), `ext_image_copy_capture_manager_v1`, `zwlr_screencopy_manager_v1` (v3), and
+the private `zlm_shell_v1` (v6; the shell only). Windows covered by an opaque window are not
+composited, and their frame callbacks slow to one a second (a window being captured keeps the
+outputs' pace).
+
+Screen capture (ADR 009 Part 4): grim (`-o` an output, `-T` a window, also a covered one),
+wf-recorder and xdg-desktop-portal-wlr work; frames carry only what changed and are copied
+right after the composite — never a capture of its own — so an idle screencast costs nothing.
+While the session is locked a capture shows black; the panel shows a red dot while anything
+but the shell captures. Sandboxed clients see none of the capture globals.
+
+Portals (ADR 009 Part 5): browsers, OBS and screenshot tools go through xdg-desktop-portal.
+ScreenCast is xdg-desktop-portal-wlr's (PipeWire over ext-image-copy-capture); Screenshot
+(interactive area/screen/window choice, `$XDG_PICTURES_DIR/Screenshots`), PickColor and the
+cast's source chooser are `xdg-desktop-portal-lumen`'s. `run-desktop.sh` exports the session
+to the systemd user manager, starts both backends from the build and WirePlumber if needed,
+restarts the frontend, and undoes it all at logout (`--no-portals` skips it); see
+docs/architecture.md § Portals. Runtime: xdg-desktop-portal, xdg-desktop-portal-wlr,
+xdg-desktop-portal-gtk, PipeWire and WirePlumber; build: libsystemd, libpng (to save files).
+`scripts/app-smoke.sh --only Z` drives it with `lumen-portal-probe`.
+
+Commits are content updates in a per-surface queue (ADR 009): an update whose buffer is not
+ready (explicit-sync acquire point, or a GL client's implicit fences), whose fifo barrier is
+set, or whose commit-timing target is ahead waits there — never in the composite — and
+applies in order when it can. Vulkan FIFO swapchains (Mesa) get one frame per refresh, and
+timed frames are never shown early. `scripts/app-smoke.sh --only T` checks this with vkcube,
+weston-simple-timing, weston-simple-egl and `lumen-probe timing|solid|tearing`.
+
+Windows and the clipboard (ADR 009 Part 2): modal dialogs (GTK 4, Qt 6) block their parent —
+it stays visible, a click on it focuses the dialog — and every dialog opens centred on its
+parent; window icons and the system bell reach the panel (the bell flashes the window), the
+icons drawn from the XDG icon theme (PNG through libpng, SVG through librsvg, both optional
+build dependencies) or the window's own pixels; clipboard tools (`wl-copy`/`wl-paste`,
+`cliphist` with `wl-paste --watch cliphist store`, clipboard managers) work through
+data control; Flatpak apps are recognised by their security context and see none of the
+session-wide globals (data control, layer shell, lock, output management, …).
+`scripts/app-smoke.sh --only U,V` checks these on the console.
 
 Screen blanking: `lumen-shell` powers the outputs off after 10 minutes without input
 (`--blank-after S`, 0 never; idle inhibitors such as a playing video hold it off while their
@@ -175,7 +225,7 @@ their own compose handling.
 | Graphics | `lx.gfx`, `lx.text`, `lx.layout`, `lx.scene` |
 | Desktop | `lx.compositor`, `lx.compositor.*`, `lx.shell`, `lx.shell.*`, `lx.ui` |
 | Apps | `lx.app`, `lx.ui.builder` |
-| Optional | `lx.portal` (Flatpak builds) |
+| Desktop (portal) | `lx.portal` (xdg-desktop-portal-lumen) |
 
 - **Multi-process:** compositor, shell, apps
 - **Stacking-first WM** with optional tiling plugin (`PolicyRegistry`)
@@ -197,11 +247,14 @@ UML index: [docs/uml/README.md](docs/uml/README.md)
 | `LUMEN_PROTOCOLS_P2` | OFF | Generate P2 upstream protocols |
 | `LUMEN_ENABLE_TILING_PLUGIN` | ON | Tiling plugin compile flag |
 | `LUMEN_VULKAN_VALIDATION` | OFF | Vulkan validation layers |
-| `LUMEN_BUILD_FLATPAK_PORTAL` | OFF | Flatpak portal adapter |
+| `LUMEN_BUILD_PORTAL` | ON | xdg-desktop-portal-lumen (needs libsystemd and wayland-client) |
 
 ## systemd (user session)
 
 Install unit files from `deploy/systemd/`. Socket: `$XDG_RUNTIME_DIR/lumen-0`.
+`cmake --install` also installs the portal backend (libexec), `lumen.portal`,
+`lumen-portals.conf`, its D-Bus service and user unit, and xdg-desktop-portal-wlr's `Lumen`
+config.
 
 ## License
 

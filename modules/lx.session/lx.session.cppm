@@ -4,12 +4,8 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cerrno>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
-#include <initializer_list>
+#include <stdint.h>
+#include <stdlib.h>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -29,6 +25,8 @@ import lx.foundation;
 import lx.runtime;
 
 export module lx.session;
+
+import std;
 
 export import :privilege;
 
@@ -198,7 +196,7 @@ module :private;
 lx::session::logind_session::~logind_session() { release(); }
 
 lx::session::logind_session::logind_session(logind_session&& other) noexcept {
-    *this = static_cast<logind_session&&>(other);
+    *this = std::move(other);
 }
 
 lx::session::logind_session& lx::session::logind_session::operator=(logind_session&& other) noexcept {
@@ -300,8 +298,7 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
     free(sid);
 
     if (sd_bus_default_system(&s.bus_) < 0 || !s.bus_) {
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
-                              "sd_bus_default_system failed");
+        return lx::make_error(lx::io_err::not_found, "sd_bus_default_system failed");
     }
 
     sd_bus_error err = SD_BUS_ERROR_NULL;
@@ -311,14 +308,12 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
                                      "s", s.session_id_);
     if (r < 0) {
         sd_bus_error_free(&err);
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
-                              "logind GetSession failed");
+        return lx::make_error(lx::io_err::not_found, "logind GetSession failed");
     }
     const char* path = nullptr;
     if (sd_bus_message_read(reply, "o", &path) < 0 || !path) {
         sd_bus_message_unref(reply);
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
-                              "logind GetSession bad reply");
+        return lx::make_error(lx::io_err::not_found, "logind GetSession bad reply");
     }
     std::snprintf(s.session_path_, sizeof(s.session_path_), "%s", path);
     sd_bus_message_unref(reply);
@@ -462,15 +457,14 @@ lx::result<lx::unique_fd> lx::session::logind_session::take_device(unsigned majo
     (void)minor;
 #endif
     (void)inactive;
-    return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::permission_denied),
-                          "TakeDevice failed");
+    return lx::make_error(lx::io_err::permission_denied, "TakeDevice failed");
 }
 
 lx::result<lx::unique_fd> lx::session::logind_session::take_device_path(const char* path,
                                                                          bool* inactive) {
 #if !defined(_WIN32)
     if (!path || path[0] == '\0') {
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "null device path");
+        return lx::invalid_argument("null device path");
     }
     struct stat st{};
     if (::stat(path, &st) == 0 && S_ISCHR(st.st_mode)) {
@@ -485,8 +479,7 @@ lx::result<lx::unique_fd> lx::session::logind_session::take_device_path(const ch
             *inactive = false;
         return lx::unique_fd{fd};
     }
-    return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::permission_denied),
-                          "failed to open device path");
+    return lx::make_error(lx::io_err::permission_denied, "failed to open device path");
 #else
     (void)path;
     (void)inactive;
@@ -549,21 +542,17 @@ void lx::session::logind_session::complete_pause(unsigned major, unsigned minor)
 
 lx::result<void> lx::session::logind_session::switch_vt(unsigned vt) {
     if (vt == 0 || vt > 63)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "VT number out of range");
+        return lx::invalid_argument("VT number out of range");
 #if defined(LUMEN_HAS_LOGIND)
     if (!bus_ || seat_path_[0] == '\0')
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
-                              "no logind seat to switch VTs on");
+        return lx::make_error(lx::io_err::not_found, "no logind seat to switch VTs on");
     if (!can_tty_)
-        return lx::make_error(lx::error_domain::io,
-                              static_cast<int>(lx::io_err::permission_denied),
-                              "seat has no virtual terminals");
+        return lx::make_error(lx::io_err::permission_denied, "seat has no virtual terminals");
     const int r = sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", seat_path_,
                                            "org.freedesktop.login1.Seat", "SwitchTo",
                                            &logind_session::on_switch_reply, this, "u", vt);
     if (r < 0)
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::broken_pipe),
-                              "Seat.SwitchTo could not be sent");
+        return lx::make_error(lx::io_err::broken_pipe, "Seat.SwitchTo could not be sent");
     (void)sd_bus_flush(bus_);
     return {};
 #else
@@ -730,8 +719,7 @@ lx::result<void> lx::session::logind_session::set_listener(session_listener list
     listener_ = listener;
 #if defined(LUMEN_HAS_LOGIND)
     if (!bus_ || session_path_[0] == '\0')
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::not_found),
-                              "no logind session to listen on");
+        return lx::make_error(lx::io_err::not_found, "no logind session to listen on");
     if (pause_slot_)
         return {}; // already installed; the listener above replaced the callbacks
     int r = sd_bus_match_signal(bus_, &pause_slot_, "org.freedesktop.login1", session_path_,
@@ -758,8 +746,7 @@ lx::result<void> lx::session::logind_session::set_listener(session_listener list
                                 "/org/freedesktop/login1", "org.freedesktop.login1.Manager",
                                 "PrepareForSleep", &logind_session::on_prepare_for_sleep, this);
     if (r < 0)
-        return lx::make_error(lx::error_domain::io, static_cast<int>(lx::io_err::broken_pipe),
-                              "logind signal match failed");
+        return lx::make_error(lx::io_err::broken_pipe, "logind signal match failed");
     return {};
 #else
     return lx::not_implemented("lx::session::logind_session::set_listener");

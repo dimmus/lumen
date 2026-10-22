@@ -1,11 +1,11 @@
 module;
 
-#include <cstdint>
-
 import lx.foundation;
 import lx.runtime;
 
 export module lx.scheduler:repaint;
+
+import std;
 
 export namespace lx::scheduler {
 
@@ -186,7 +186,19 @@ public:
     /// phase continues while stopped, so the last flip still predicts it). Running ones keep
     /// their schedule. Returns the outputs it started.
     std::uint32_t request(std::uint32_t mask, lx::runtime::clock_time now);
-    /// A flip of `slot` landed at `flip_ns`: its phase, and its next start from `now`.
+    /// commit-timing-v1: starts `slot`'s clock (when stopped) for the tick aiming at the
+    /// first vblank at or after `target − slack` — no earlier tick runs for it, so a desktop
+    /// waiting on a target wakes once. A running clock keeps its schedule (each tick checks
+    /// the target). True when it started.
+    bool request_at(unsigned slot, lx::runtime::clock_time target, lx::runtime::clock_time slack,
+                    lx::runtime::clock_time now);
+    /// A flip of `slot` landed at `flip_ns`: its phase, and its next start from `now` — never
+    /// sooner than one period after the start of the tick that produced it. A display whose
+    /// flips complete when the frame arrives rather than at a vblank (vmwgfx, virtual
+    /// outputs) re-phases the clock to each flip; with a large repaint estimate the start
+    /// aimed back from the following "vblank" would then come less than a period after the
+    /// last one, and the cadence would run above the refresh rate (FIFO clients presented
+    /// 8 ms apart after one slow frame). On a vblank-locked display the floor never binds.
     void on_present(unsigned slot, lx::runtime::clock_time flip_ns, lx::runtime::clock_time now);
     /// The earliest start among running clocks; 0 when none runs.
     [[nodiscard]] lx::runtime::clock_time next_wakeup() const;
@@ -208,6 +220,8 @@ public:
 private:
     repaint_scheduler clocks_[k_max]{};
     lx::runtime::clock_time next_start_[k_max]{};
+    /// The start of the last tick served per output (0: none since it went live).
+    lx::runtime::clock_time last_tick_[k_max]{};
     unsigned quiet_[k_max]{};
     std::uint32_t live_ = 0;
     std::uint32_t dark_ = 0;
@@ -224,6 +238,7 @@ void lx::scheduler::frame_clocks::set_live(unsigned slot, bool live,
     running_ &= ~bit;
     quiet_[slot] = 0;
     next_start_[slot] = 0;
+    last_tick_[slot] = 0;
     if (live) {
         live_ |= bit;
         clocks_[slot] = repaint_scheduler{};
@@ -258,13 +273,42 @@ std::uint32_t lx::scheduler::frame_clocks::request(std::uint32_t mask, lx::runti
     return start;
 }
 
+bool lx::scheduler::frame_clocks::request_at(unsigned slot, lx::runtime::clock_time target,
+                                             lx::runtime::clock_time slack,
+                                             lx::runtime::clock_time now) {
+    if (slot >= k_max)
+        return false;
+    const std::uint32_t bit = 1u << slot;
+    if (!(live_ & bit) || (dark_ & bit) || (running_ & bit))
+        return false;
+    const repaint_scheduler& c = clocks_[slot];
+    // `next_deadline` is the first vblank strictly after its argument.
+    const lx::runtime::clock_time from = target - slack - 1 > now ? target - slack - 1 : now;
+    const lx::runtime::clock_time deadline = c.next_deadline(from);
+    lx::runtime::clock_time start = deadline - (c.estimate_ns() + repaint_scheduler::k_margin_ns);
+    if (start < now)
+        start = now;
+    next_start_[slot] = start;
+    quiet_[slot] = 0;
+    running_ |= bit;
+    return true;
+}
+
 void lx::scheduler::frame_clocks::on_present(unsigned slot, lx::runtime::clock_time flip_ns,
                                              lx::runtime::clock_time now) {
     if (slot >= k_max || !live(slot))
         return;
     clocks_[slot].on_present(flip_ns);
-    if (running_ & (1u << slot))
-        next_start_[slot] = clocks_[slot].next_start(now);
+    if (!(running_ & (1u << slot)))
+        return;
+    lx::runtime::clock_time next = clocks_[slot].next_start(now);
+    if (last_tick_[slot] > 0) {
+        const lx::runtime::clock_time floor =
+            last_tick_[slot] + clocks_[slot].refresh_period() - k_coalesce_ns;
+        if (next < floor)
+            next = floor;
+    }
+    next_start_[slot] = next;
 }
 
 lx::runtime::clock_time lx::scheduler::frame_clocks::next_wakeup() const {
@@ -281,6 +325,7 @@ std::uint32_t lx::scheduler::frame_clocks::take_due(lx::runtime::clock_time now)
         if (!(running_ & (1u << s)) || next_start_[s] > now + k_coalesce_ns)
             continue;
         due |= 1u << s;
+        last_tick_[s] = next_start_[s];
         // The following start: past the deadline this tick aims at, and never sooner than
         // one period after this one. When the repaint estimate exceeds a period (a slow
         // frame, a screenshot read back) `next_start` runs flat out (`now`): without the

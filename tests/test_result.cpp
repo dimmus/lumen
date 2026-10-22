@@ -1,5 +1,6 @@
 #include "lumen_test.hpp"
 
+import std;
 import lx.foundation;
 
 LUMEN_TEST(result_ok_int) {
@@ -37,6 +38,32 @@ LUMEN_TEST(result_void_ok) {
 LUMEN_TEST(result_void_error) {
     lx::result<void> r{lx::not_implemented("void")};
     LUMEN_CHECK(!r.ok());
+}
+
+LUMEN_TEST(result_monadic) {
+    const lx::result<int> ok{20};
+    const lx::result<int> doubled = ok.transform([](int v) { return v * 2; });
+    LUMEN_CHECK(doubled.ok() && *doubled == 40);
+
+    const auto half = [](int v) -> std::expected<int, lx::error> {
+        if (v % 2)
+            return std::unexpected(lx::invalid_argument("odd"));
+        return v / 2;
+    };
+    const lx::result<int> chained = ok.and_then(half).and_then(half);
+    LUMEN_CHECK(chained.ok() && chained.value() == 5);
+    const lx::result<int> failed = chained.and_then(half);
+    LUMEN_CHECK(!failed.ok());
+    LUMEN_CHECK(failed.get_error().domain == lx::error_domain::invalid_argument);
+    LUMEN_CHECK(failed.value_or(-1) == -1);
+}
+
+LUMEN_TEST(result_domain_from_code) {
+    const lx::error e = lx::make_error(lx::drm_err::page_flip_failed, "flip");
+    LUMEN_CHECK(e.domain == lx::error_domain::drm);
+    LUMEN_CHECK(e.code == std::to_underlying(lx::drm_err::page_flip_failed));
+    lx::result<void> r{lx::make_error(lx::wayland_err::bind_failed, "bind")};
+    LUMEN_CHECK(r.get_error().domain == lx::error_domain::wayland);
 }
 
 int main(int argc, char** argv) {

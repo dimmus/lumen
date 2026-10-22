@@ -50,6 +50,7 @@ module;
 
 export module lx.compositor:text_input;
 
+import std;
 import lx.foundation;
 
 export namespace lx::compositor {
@@ -192,9 +193,9 @@ struct input_popup_placement {
 [[nodiscard]] input_popup_placement place_input_popup(lx::rect2i anchor, lx::size2i size,
                                                       lx::rect2i bounds);
 
-/// The longest prefix of `text` (`len` bytes) that is at most `max` bytes and does not end
-/// inside a UTF-8 sequence.
-[[nodiscard]] unsigned utf8_truncate(const char* text, unsigned len, unsigned max);
+/// The longest prefix of `text` that is at most `max` bytes and does not end inside a UTF-8
+/// sequence.
+[[nodiscard]] unsigned utf8_truncate(std::string_view text, unsigned max);
 
 /// The text-input ↔ input-method relay of the seat. UI affinity.
 class text_input_relay {
@@ -217,10 +218,9 @@ public:
     void remove(text_input_record& ti);
     void enable(text_input_record& ti);
     void disable(text_input_record& ti);
-    /// `text` (`len` bytes, truncated to k_ime_text_max at a UTF-8 boundary); `cursor` and
-    /// `anchor` are clamped into it.
-    void set_surrounding(text_input_record& ti, const char* text, unsigned len, int cursor,
-                         int anchor);
+    /// `text` (truncated to k_ime_text_max at a UTF-8 boundary); `cursor` and `anchor` are
+    /// clamped into it.
+    void set_surrounding(text_input_record& ti, std::string_view text, int cursor, int anchor);
     void set_change_cause(text_input_record& ti, unsigned cause);
     void set_content_type(text_input_record& ti, unsigned hint, unsigned purpose);
     void set_cursor_rect(text_input_record& ti, lx::rect2i rect);
@@ -240,8 +240,8 @@ public:
     [[nodiscard]] bool add_input_method(input_method_record& im);
     /// Destroyed (or its client is gone): focused text inputs get `leave`, popups go inert.
     void remove_input_method(input_method_record& im);
-    void im_commit_string(input_method_record& im, const char* text, unsigned len);
-    void im_preedit(input_method_record& im, const char* text, unsigned len, int begin, int end);
+    void im_commit_string(input_method_record& im, std::string_view text);
+    void im_preedit(input_method_record& im, std::string_view text, int begin, int end);
     void im_delete_surrounding(input_method_record& im, unsigned before, unsigned after);
     void im_commit(input_method_record& im, unsigned serial);
 

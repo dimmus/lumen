@@ -55,9 +55,7 @@ lx::gfx::timeline_semaphore_pool::acquire() {
         return timeline_semaphore_handle{semaphores_[i], i};
     }
     if (count_ >= k_capacity)
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::device_lost),
-                              "timeline semaphore pool exhausted");
+        return lx::make_error(lx::vulkan_err::device_lost, "timeline semaphore pool exhausted");
 
     VkSemaphoreTypeCreateInfo type_info{};
     type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
@@ -77,9 +75,7 @@ lx::gfx::timeline_semaphore_pool::acquire() {
 
     VkSemaphore sem = VK_NULL_HANDLE;
     if (vkCreateSemaphore(dev, &sci, nullptr, &sem) != VK_SUCCESS)
-        return lx::make_error(lx::error_domain::vulkan,
-                              static_cast<int>(lx::vulkan_err::device_lost),
-                              "vkCreateSemaphore failed");
+        return lx::make_error(lx::vulkan_err::device_lost, "vkCreateSemaphore failed");
 
     const unsigned index = count_++;
     semaphores_[index] = sem;

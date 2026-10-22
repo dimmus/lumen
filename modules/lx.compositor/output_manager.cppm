@@ -1,15 +1,12 @@
 module;
 
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
-
 import lx.foundation;
 import lx.gfx;
 import lx.drm;
 
 export module lx.compositor:output;
+
+import std;
 
 export namespace lx::compositor {
 

@@ -8,12 +8,13 @@ module;
 #include <gbm.h>
 #include <unistd.h>
 #endif
-#include <cstdint>
-#include <cstring>
+#include <stdint.h>
 
 import lx.foundation;
 
 export module lx.gfx:gl_renderer;
+
+import std;
 
 import :renderer;
 import :dmabuf;
@@ -219,6 +220,19 @@ public:
                                                                   unsigned count,
                                                                   const damage_region& damage);
 
+    /// `composite_region` into any framebuffer object (`width` x `height`, row 0 on top as
+    /// in a scanout target): a screen-capture target over a client's dma-buf, an offscreen
+    /// buffer. `clear_first` false draws over what is there (a pointer painted onto a copy);
+    /// `fence` false only flushes — the caller fences the whole capture once (and never
+    /// blocks: no glFinish either way).
+    [[nodiscard]] lx::result<gl_composite_stats> composite_into(unsigned framebuffer,
+                                                                unsigned width, unsigned height,
+                                                                lx::color clear,
+                                                                const blit_command* cmds,
+                                                                unsigned count,
+                                                                const damage_region& damage,
+                                                                bool clear_first, bool fence);
+
     /// Reads the target back as RGBA rows, top row first. For tests and screenshots — it
     /// stalls the pipeline and is not part of the frame path.
     [[nodiscard]] lx::result<void> read_back(const gl_scanout_target& target, unsigned char* rgba,
@@ -250,13 +264,19 @@ private:
     [[nodiscard]] int find(unsigned texture_id) const;
     [[nodiscard]] int alloc(unsigned texture_id);
     void destroy_slot(texture_slot& slot);
-    /// Shared body: `rect_count == 0` is the whole target.
-    [[nodiscard]] lx::result<gl_composite_stats> composite_rects(gl_scanout_target& target,
+    /// Shared body: `rect_count == 0` is the whole target. `clear_first`: each rect is
+    /// cleared before its draws; `fence`: a native fence (or glFinish without one) closes
+    /// the work, otherwise only a flush.
+    [[nodiscard]] lx::result<gl_composite_stats> composite_rects(unsigned framebuffer,
+                                                                 unsigned width_px,
+                                                                 unsigned height_px,
                                                                  lx::color clear,
                                                                  const blit_command* cmds,
                                                                  unsigned count,
                                                                  const lx::rect2i* rects,
-                                                                 unsigned rect_count);
+                                                                 unsigned rect_count,
+                                                                 bool clear_first = true,
+                                                                 bool fence = true);
 
     egl_device* device_ = nullptr;
     unsigned program_ = 0;
@@ -271,6 +291,8 @@ private:
     int uniform_src_bounds_ = -1;
     int uniform_transfer_ = -1;
     int uniform_alpha_one_ = -1;
+    int uniform_use_solid_ = -1;
+    int uniform_solid_texel_ = -1;
     bool bgra_ = false;
     bool unpack_subimage_ = false;
     int uniform_sampler_ = -1;
@@ -280,14 +302,9 @@ private:
 } // namespace lx::gfx
 
 
-
 namespace lx::gfx::detail {
 
 #if defined(LUMEN_HAS_EGL)
-
-lx::error gl_error(lx::gl_err code, const char* message) {
-    return lx::make_error(lx::error_domain::gl, static_cast<int>(code), message);
-}
 
 /// GLES 2 is the floor every driver supports, and a compositor's shader needs nothing
 /// beyond it: place a quad from a rect, sample one texture, scale by opacity.
@@ -337,6 +354,11 @@ uniform UV_PRECISION vec4 src_bounds;
 uniform int transfer;
 // 1.0 for a format without alpha (XRGB): its fourth byte is undefined, not transparency.
 uniform float alpha_one;
+// A solid draw (wp_single_pixel_buffer_v1): `solid_texel` replaces the sample — the same
+// premultiplied, encoded value a 1x1 texture would hold, so it is decoded, tinted and faded
+// exactly like one, without a texture or an upload.
+uniform float use_solid;
+uniform vec4 solid_texel;
 
 vec3 srgb_to_linear(vec3 v) {
     // GLSL ES 1.00 has no mix(genType, genType, bvec), so branch per channel arithmetically.
@@ -357,7 +379,7 @@ void main() {
     // Clamp to the source rectangle. Linear filtering samples between texel centers, so a
     // magnified crop would otherwise read texels from outside its own source rect.
     UV_PRECISION vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
-    vec4 texel = texture2D(surface, s);
+    vec4 texel = use_solid > 0.5 ? solid_texel : texture2D(surface, s);
     texel.a = max(texel.a, alpha_one);
 
     // Blending is a weighted average of light, so it has to happen in linear space.
@@ -427,7 +449,7 @@ bool renderer_is_software(const char* renderer) {
 lx::gfx::egl_device::~egl_device() { destroy(); }
 
 lx::gfx::egl_device::egl_device(egl_device&& other) noexcept {
-    *this = static_cast<egl_device&&>(other);
+    *this = std::move(other);
 }
 
 lx::gfx::egl_device& lx::gfx::egl_device::operator=(egl_device&& other) noexcept {
@@ -472,15 +494,14 @@ void lx::gfx::egl_device::destroy() {
 lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
 #if defined(LUMEN_HAS_EGL)
     if (drm_fd < 0) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "egl_device::create needs an open DRM fd");
+        return lx::invalid_argument("egl_device::create needs an open DRM fd");
     }
 
     egl_device device;
 
     device.gbm_ = gbm_create_device(drm_fd);
     if (!device.gbm_)
-        return detail::gl_error(lx::gl_err::target_failed, "gbm_create_device failed");
+        return lx::make_error(lx::gl_err::target_failed, "gbm_create_device failed");
     device.owns_gbm_ = true;
 
     // eglGetPlatformDisplayEXT rather than eglGetDisplay: the latter guesses the platform
@@ -488,16 +509,16 @@ lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
     auto get_platform_display = reinterpret_cast<PFNEGLGETPLATFORMDISPLAYEXTPROC>(
         eglGetProcAddress("eglGetPlatformDisplayEXT"));
     if (!get_platform_display)
-        return detail::gl_error(lx::gl_err::no_context, "EGL_EXT_platform_base missing");
+        return lx::make_error(lx::gl_err::no_context, "EGL_EXT_platform_base missing");
 
     EGLDisplay dpy = get_platform_display(EGL_PLATFORM_GBM_KHR, device.gbm_, nullptr);
     if (dpy == EGL_NO_DISPLAY)
-        return detail::gl_error(lx::gl_err::no_context, "eglGetPlatformDisplay(GBM) failed");
+        return lx::make_error(lx::gl_err::no_context, "eglGetPlatformDisplay(GBM) failed");
 
     EGLint major = 0;
     EGLint minor = 0;
     if (!eglInitialize(dpy, &major, &minor))
-        return detail::gl_error(lx::gl_err::no_context, "eglInitialize failed");
+        return lx::make_error(lx::gl_err::no_context, "eglInitialize failed");
     device.display_ = dpy;
 
     const char* extensions = eglQueryString(dpy, EGL_EXTENSIONS);
@@ -511,11 +532,11 @@ lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
     if (!surfaceless) {
         // Without it every context needs a window surface, which would mean binding the
         // context to one output's gbm_surface and giving up the scanout slot rotation.
-        return detail::gl_error(lx::gl_err::no_context, "EGL_KHR_surfaceless_context missing");
+        return lx::make_error(lx::gl_err::no_context, "EGL_KHR_surfaceless_context missing");
     }
 
     if (!eglBindAPI(EGL_OPENGL_ES_API))
-        return detail::gl_error(lx::gl_err::no_context, "eglBindAPI(OpenGL ES) failed");
+        return lx::make_error(lx::gl_err::no_context, "eglBindAPI(OpenGL ES) failed");
 
     EGLConfig config = EGL_NO_CONFIG_KHR;
     if (!no_config) {
@@ -532,13 +553,13 @@ lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
                                               EGL_NONE};
         EGLint config_count = 0;
         if (!eglChooseConfig(dpy, config_attrs, &config, 1, &config_count) || config_count == 0)
-            return detail::gl_error(lx::gl_err::no_context, "eglChooseConfig found no usable config");
+            return lx::make_error(lx::gl_err::no_context, "eglChooseConfig found no usable config");
     }
 
     static const EGLint context_attrs[] = {EGL_CONTEXT_MAJOR_VERSION, 2, EGL_NONE};
     EGLContext ctx = eglCreateContext(dpy, config, EGL_NO_CONTEXT, context_attrs);
     if (ctx == EGL_NO_CONTEXT)
-        return detail::gl_error(lx::gl_err::no_context, "eglCreateContext failed");
+        return lx::make_error(lx::gl_err::no_context, "eglCreateContext failed");
     device.context_ = ctx;
 
     if (auto current = device.make_current(); !current)
@@ -557,7 +578,7 @@ lx::result<void> lx::gfx::egl_device::make_current() {
         return lx::not_implemented("lx::gfx::egl_device::make_current");
     if (!eglMakeCurrent(static_cast<EGLDisplay>(display_), EGL_NO_SURFACE, EGL_NO_SURFACE,
                         static_cast<EGLContext>(context_)))
-        return detail::gl_error(lx::gl_err::no_context, "eglMakeCurrent failed");
+        return lx::make_error(lx::gl_err::no_context, "eglMakeCurrent failed");
 
     if (renderer_[0] == '\0') {
         const auto* name = reinterpret_cast<const char*>(glGetString(GL_RENDERER));
@@ -586,7 +607,7 @@ void lx::gfx::egl_device::release_current() {
 lx::gfx::gl_scanout_target::~gl_scanout_target() { destroy(); }
 
 lx::gfx::gl_scanout_target::gl_scanout_target(gl_scanout_target&& other) noexcept {
-    *this = static_cast<gl_scanout_target&&>(other);
+    *this = std::move(other);
 }
 
 lx::gfx::gl_scanout_target& lx::gfx::gl_scanout_target::operator=(
@@ -641,8 +662,7 @@ lx::result<lx::gfx::gl_scanout_target> lx::gfx::gl_scanout_target::create(const 
                                                                           lx::fourcc format) {
 #if defined(LUMEN_HAS_EGL)
     if (!device.valid() || width == 0 || height == 0) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl_scanout_target::create: invalid parameters");
+        return lx::invalid_argument("gl_scanout_target::create: invalid parameters");
     }
 
     gl_scanout_target target;
@@ -657,7 +677,7 @@ lx::result<lx::gfx::gl_scanout_target> lx::gfx::gl_scanout_target::create(const 
     target.bo_ = gbm_bo_create(gbm, width, height, static_cast<uint32_t>(format),
                                GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
     if (!target.bo_)
-        return detail::gl_error(lx::gl_err::target_failed, "gbm_bo_create(SCANOUT|RENDERING) failed");
+        return lx::make_error(lx::gl_err::target_failed, "gbm_bo_create(SCANOUT|RENDERING) failed");
 
     auto create_image =
         reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
@@ -665,12 +685,13 @@ lx::result<lx::gfx::gl_scanout_target> lx::gfx::gl_scanout_target::create(const 
         reinterpret_cast<PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC>(
             eglGetProcAddress("glEGLImageTargetRenderbufferStorageOES"));
     if (!create_image || !image_to_renderbuffer)
-        return detail::gl_error(lx::gl_err::target_failed, "EGLImage renderbuffer entrypoints missing");
+        return lx::make_error(lx::gl_err::target_failed,
+                              "EGLImage renderbuffer entrypoints missing");
 
     EGLImageKHR image = create_image(static_cast<EGLDisplay>(target.display_), EGL_NO_CONTEXT,
                                      EGL_NATIVE_PIXMAP_KHR, target.bo_, nullptr);
     if (image == EGL_NO_IMAGE_KHR)
-        return detail::gl_error(lx::gl_err::target_failed, "eglCreateImageKHR from gbm_bo failed");
+        return lx::make_error(lx::gl_err::target_failed, "eglCreateImageKHR from gbm_bo failed");
     target.image_ = image;
 
     glGenRenderbuffers(1, &target.renderbuffer_);
@@ -684,7 +705,7 @@ lx::result<lx::gfx::gl_scanout_target> lx::gfx::gl_scanout_target::create(const 
     const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (status != GL_FRAMEBUFFER_COMPLETE)
-        return detail::gl_error(lx::gl_err::target_failed, "scanout FBO incomplete");
+        return lx::make_error(lx::gl_err::target_failed, "scanout FBO incomplete");
 
     return target;
 #else
@@ -703,13 +724,13 @@ lx::result<lx::gfx::gl_scanout_dmabuf> lx::gfx::gl_scanout_target::export_dmabuf
 
     auto* bo = static_cast<struct gbm_bo*>(bo_);
     if (gbm_bo_get_plane_count(bo) != 1) {
-        return lx::make_error(lx::error_domain::drm, static_cast<int>(lx::drm_err::mode_invalid),
+        return lx::make_error(lx::drm_err::mode_invalid,
                               "multi-plane scanout buffer is not supported");
     }
 
     const int fd = gbm_bo_get_fd(bo);
     if (fd < 0)
-        return detail::gl_error(lx::gl_err::target_failed, "gbm_bo_get_fd failed");
+        return lx::make_error(lx::gl_err::target_failed, "gbm_bo_get_fd failed");
 
     gl_scanout_dmabuf out{};
     out.fd.reset(fd);
@@ -784,11 +805,13 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
 
     const GLuint vertex = detail::compile_shader(GL_VERTEX_SHADER, detail::k_vertex_shader);
     if (!vertex)
-        return detail::gl_error(lx::gl_err::program_failed, "composite vertex shader failed to compile");
+        return lx::make_error(lx::gl_err::program_failed,
+                              "composite vertex shader failed to compile");
     const GLuint fragment = detail::compile_shader(GL_FRAGMENT_SHADER, detail::k_fragment_shader);
     if (!fragment) {
         glDeleteShader(vertex);
-        return detail::gl_error(lx::gl_err::program_failed, "composite fragment shader failed to compile");
+        return lx::make_error(lx::gl_err::program_failed,
+                              "composite fragment shader failed to compile");
     }
 
     const GLuint program = glCreateProgram();
@@ -803,7 +826,7 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     glGetProgramiv(program, GL_LINK_STATUS, &linked);
     if (!linked) {
         glDeleteProgram(program);
-        return detail::gl_error(lx::gl_err::program_failed, "composite program failed to link");
+        return lx::make_error(lx::gl_err::program_failed, "composite program failed to link");
     }
     program_ = program;
 
@@ -816,6 +839,8 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     uniform_src_bounds_ = glGetUniformLocation(program, "src_bounds");
     uniform_transfer_ = glGetUniformLocation(program, "transfer");
     uniform_alpha_one_ = glGetUniformLocation(program, "alpha_one");
+    uniform_use_solid_ = glGetUniformLocation(program, "use_solid");
+    uniform_solid_texel_ = glGetUniformLocation(program, "solid_texel");
     uniform_sampler_ = glGetUniformLocation(program, "surface");
 
     const char* gl_ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
@@ -866,11 +891,10 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba_region(unsigned texture_id,
     if (!ready() || !rgba || width == 0 || height == 0 || region.x < 0 || region.y < 0 ||
         static_cast<unsigned>(region.x + region.width) > width ||
         static_cast<unsigned>(region.y + region.height) > height)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl region upload: bad arguments");
+        return lx::invalid_argument("gl region upload: bad arguments");
     const int index = alloc(texture_id);
     if (index < 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "gl texture table full");
+        return lx::invalid_argument("gl texture table full");
     auto& slot = textures_[static_cast<unsigned>(index)];
     if (slot.is_dmabuf) {
         destroy_slot(slot);
@@ -886,7 +910,7 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba_region(unsigned texture_id,
     if (!name) {
         glGenTextures(1, &name);
         if (!name)
-            return detail::gl_error(lx::gl_err::import_failed, "glGenTextures failed");
+            return lx::make_error(lx::gl_err::import_failed, "glGenTextures failed");
         glBindTexture(GL_TEXTURE_2D, name);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -926,8 +950,7 @@ lx::result<void> lx::gfx::gl_compositor::upload_client_region(unsigned texture_i
 #if defined(LUMEN_HAS_EGL)
     if (!ready() || !supports_client_upload() || !pixels || width == 0 || height == 0 ||
         stride % 4u != 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl client upload: bad arguments");
+        return lx::invalid_argument("gl client upload: bad arguments");
     const bool whole = region.width <= 0 || region.height <= 0 ||
                        (region.x == 0 && region.y == 0 &&
                         static_cast<unsigned>(region.width) == width &&
@@ -936,14 +959,12 @@ lx::result<void> lx::gfx::gl_compositor::upload_client_region(unsigned texture_i
         region = {0, 0, static_cast<int>(width), static_cast<int>(height)};
     if (region.x < 0 || region.y < 0 || static_cast<unsigned>(region.x + region.width) > width ||
         static_cast<unsigned>(region.y + region.height) > height)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl client upload: region outside the buffer");
+        return lx::invalid_argument("gl client upload: region outside the buffer");
     if (stride < static_cast<unsigned>(region.width) * 4u)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl client upload: stride shorter than a row");
+        return lx::invalid_argument("gl client upload: stride shorter than a row");
     const int index = alloc(texture_id);
     if (index < 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "gl texture table full");
+        return lx::invalid_argument("gl texture table full");
     auto& slot = textures_[static_cast<unsigned>(index)];
     if (slot.is_dmabuf) {
         destroy_slot(slot);
@@ -960,7 +981,7 @@ lx::result<void> lx::gfx::gl_compositor::upload_client_region(unsigned texture_i
     if (!name) {
         glGenTextures(1, &name);
         if (!name)
-            return detail::gl_error(lx::gl_err::import_failed, "glGenTextures failed");
+            return lx::make_error(lx::gl_err::import_failed, "glGenTextures failed");
         glBindTexture(GL_TEXTURE_2D, name);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1012,17 +1033,16 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsign
                                                      unsigned stride) {
 #if defined(LUMEN_HAS_EGL)
     if (!ready() || !rgba || width == 0 || height == 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "gl upload: bad arguments");
+        return lx::invalid_argument("gl upload: bad arguments");
     if (stride != 0 && stride != width * 4u) {
         // GLES 2 has no GL_UNPACK_ROW_LENGTH, so a padded source cannot be uploaded in one
         // call. Staged shm rows are packed; anything else is a caller bug worth naming.
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl upload: padded source stride is not supported");
+        return lx::invalid_argument("gl upload: padded source stride is not supported");
     }
 
     const int index = alloc(texture_id);
     if (index < 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "gl texture table full");
+        return lx::invalid_argument("gl texture table full");
     auto& slot = textures_[static_cast<unsigned>(index)];
     if (slot.is_dmabuf) {
         // The client switched from dma-buf to shm for this id; drop the EGLImage before
@@ -1047,7 +1067,7 @@ lx::result<void> lx::gfx::gl_compositor::upload_rgba(unsigned texture_id, unsign
     if (!name) {
         glGenTextures(1, &name);
         if (!name)
-            return detail::gl_error(lx::gl_err::import_failed, "glGenTextures failed");
+            return lx::make_error(lx::gl_err::import_failed, "glGenTextures failed");
         glBindTexture(GL_TEXTURE_2D, name);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1091,12 +1111,10 @@ lx::result<void> lx::gfx::gl_compositor::import_dmabuf(unsigned texture_id,
     if (!ready() || !device_)
         return lx::not_implemented("lx::gfx::gl_compositor::import_dmabuf");
     if (!device_->supports_dmabuf_import()) {
-        return detail::gl_error(lx::gl_err::import_failed,
-                                "EGL_EXT_image_dma_buf_import missing");
+        return lx::make_error(lx::gl_err::import_failed, "EGL_EXT_image_dma_buf_import missing");
     }
     if (desc.plane_count == 0 || desc.planes[0].fd.get() < 0) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl import: dmabuf has no planes");
+        return lx::invalid_argument("gl import: dmabuf has no planes");
     }
     // The same buffer committed again: the EGLImage already samples its memory, and the
     // client's new pixels are visible through it. A texture id names one buffer for its
@@ -1115,7 +1133,7 @@ lx::result<void> lx::gfx::gl_compositor::import_dmabuf(unsigned texture_id,
     auto image_to_texture = reinterpret_cast<PFNGLEGLIMAGETARGETTEXTURE2DOESPROC>(
         eglGetProcAddress("glEGLImageTargetTexture2DOES"));
     if (!create_image || !image_to_texture)
-        return detail::gl_error(lx::gl_err::import_failed, "EGLImage texture entrypoints missing");
+        return lx::make_error(lx::gl_err::import_failed, "EGLImage texture entrypoints missing");
 
     // Single plane only: the packed 8:8:8:8 formats clients actually use for windows.
     EGLint attrs[] = {EGL_WIDTH,
@@ -1135,14 +1153,14 @@ lx::result<void> lx::gfx::gl_compositor::import_dmabuf(unsigned texture_id,
     EGLImageKHR image = create_image(static_cast<EGLDisplay>(device_->egl_display()),
                                      EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, nullptr, attrs);
     if (image == EGL_NO_IMAGE_KHR)
-        return detail::gl_error(lx::gl_err::import_failed, "eglCreateImageKHR(dma_buf) failed");
+        return lx::make_error(lx::gl_err::import_failed, "eglCreateImageKHR(dma_buf) failed");
 
     const int index = alloc(texture_id);
     if (index < 0) {
         if (auto destroy_image = reinterpret_cast<PFNEGLDESTROYIMAGEKHRPROC>(
                 eglGetProcAddress("eglDestroyImageKHR")))
             destroy_image(static_cast<EGLDisplay>(device_->egl_display()), image);
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "gl texture table full");
+        return lx::invalid_argument("gl texture table full");
     }
 
     auto& slot = textures_[static_cast<unsigned>(index)];
@@ -1176,36 +1194,57 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite(
     gl_scanout_target& target, lx::color clear, const blit_command* cmds, unsigned count,
     lx::rect2i damage) {
     const bool has_damage = damage.width > 0 && damage.height > 0;
-    return composite_rects(target, clear, cmds, count, has_damage ? &damage : nullptr,
-                           has_damage ? 1u : 0u);
+    if (!target.valid()) {
+        return lx::invalid_argument("gl composite into an invalid target");
+    }
+    return composite_rects(target.framebuffer(), target.width(), target.height(), clear, cmds,
+                           count, has_damage ? &damage : nullptr, has_damage ? 1u : 0u);
 }
 
 lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_region(
     gl_scanout_target& target, lx::color clear, const blit_command* cmds, unsigned count,
     const damage_region& damage) {
+    if (!target.valid()) {
+        return lx::invalid_argument("gl composite into an invalid target");
+    }
     if (damage.full)
-        return composite_rects(target, clear, cmds, count, nullptr, 0);
+        return composite_rects(target.framebuffer(), target.width(), target.height(), clear,
+                               cmds, count, nullptr, 0);
     if (damage.count == 0)
         return gl_composite_stats{};
-    return composite_rects(target, clear, cmds, count, damage.rects, damage.count);
+    return composite_rects(target.framebuffer(), target.width(), target.height(), clear, cmds,
+                           count, damage.rects, damage.count);
+}
+
+lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_into(
+    unsigned framebuffer, unsigned width, unsigned height, lx::color clear,
+    const blit_command* cmds, unsigned count, const damage_region& damage, bool clear_first,
+    bool fence) {
+    if (framebuffer == 0 || width == 0 || height == 0) {
+        return lx::invalid_argument("gl composite into an invalid framebuffer");
+    }
+    if (damage.full)
+        return composite_rects(framebuffer, width, height, clear, cmds, count, nullptr, 0,
+                               clear_first, fence);
+    if (damage.count == 0)
+        return gl_composite_stats{};
+    return composite_rects(framebuffer, width, height, clear, cmds, count, damage.rects,
+                           damage.count, clear_first, fence);
 }
 
 lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
-    gl_scanout_target& target, lx::color clear, const blit_command* cmds, unsigned count,
-    const lx::rect2i* rects, unsigned rect_count) {
+    unsigned framebuffer, unsigned width_px, unsigned height_px, lx::color clear,
+    const blit_command* cmds, unsigned count, const lx::rect2i* rects, unsigned rect_count,
+    bool clear_first, bool fence) {
 #if defined(LUMEN_HAS_EGL)
     if (!ready())
         return lx::not_implemented("lx::gfx::gl_compositor::composite");
-    if (!target.valid()) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl composite into an invalid target");
-    }
 
     gl_composite_stats stats{};
-    const auto width = static_cast<GLsizei>(target.width());
-    const auto height = static_cast<GLsizei>(target.height());
+    const auto width = static_cast<GLsizei>(width_px);
+    const auto height = static_cast<GLsizei>(height_px);
 
-    glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer());
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
     glViewport(0, 0, width, height);
 
     // Pipeline state is per frame, not per rect: only the scissor changes between passes.
@@ -1218,6 +1257,12 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
         glUniform1i(uniform_sampler_, 0);
     if (uniform_target_ >= 0)
         glUniform2f(uniform_target_, static_cast<float>(width), static_cast<float>(height));
+
+    // Whether the program currently replaces the sample with `solid_texel`; set once per
+    // frame and then only when it changes.
+    bool solid_bound = false;
+    if (uniform_use_solid_ >= 0)
+        glUniform1f(uniform_use_solid_, 0.f);
 
     const unsigned passes = rect_count > 0 ? rect_count : 1u;
     for (unsigned pass = 0; pass < passes; ++pass) {
@@ -1237,25 +1282,31 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
         }
         // The clear ignores blend state, but a previous pass may have left blending on.
         glDisable(GL_BLEND);
-        glClearColor(clear.r, clear.g, clear.b, clear.a);
-        glClear(GL_COLOR_BUFFER_BIT);
+        if (clear_first) {
+            glClearColor(clear.r, clear.g, clear.b, clear.a);
+            glClear(GL_COLOR_BUFFER_BIT);
+        }
 
         for (unsigned i = 0; i < count && cmds; ++i) {
             const auto& cmd = cmds[i];
-            if (cmd.occluded) {
+            if (cmd.occluded || draw_invisible(cmd)) {
                 ++stats.draws_culled;
                 continue;
             }
-            const int index = find(cmd.texture_id);
-            if (index < 0) {
-                ++stats.draws_skipped;
-                continue;
-            }
-            const auto& slot = textures_[static_cast<unsigned>(index)];
-            const unsigned name = slot.names[slot.current];
-            if (!name) {
-                ++stats.draws_skipped;
-                continue;
+            const texture_slot* slot_ptr = nullptr;
+            unsigned name = 0;
+            if (!cmd.solid) {
+                const int index = find(cmd.texture_id);
+                if (index < 0) {
+                    ++stats.draws_skipped;
+                    continue;
+                }
+                slot_ptr = &textures_[static_cast<unsigned>(index)];
+                name = slot_ptr->names[slot_ptr->current];
+                if (!name) {
+                    ++stats.draws_skipped;
+                    continue;
+                }
             }
 
             // Effective scissor is damage ∩ clip ∩ dst, in top-left space, which is also
@@ -1286,6 +1337,20 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 if (cmd.clip.y + cmd.clip.height < sy1) sy1 = cmd.clip.y + cmd.clip.height;
                 scissored = true;
             }
+            // An opaque, untinted solid colour is a clear of its rect: no shader, no
+            // blending, no fragment work beyond the fill (wlroots draws such rects with a
+            // clear too). The clear ignores the quad, so its scissor must be dst itself.
+            const bool solid_clear = cmd.solid && cmd.blend == lx::blend_mode::opaque &&
+                                     cmd.opacity >= 1.f && cmd.tint.r >= 1.f &&
+                                     cmd.tint.g >= 1.f && cmd.tint.b >= 1.f &&
+                                     cmd.tint.a >= 1.f && cmd.solid_color.a >= 1.f;
+            if (solid_clear && !has_damage) {
+                if (cmd.dst.x > sx0) sx0 = cmd.dst.x;
+                if (cmd.dst.y > sy0) sy0 = cmd.dst.y;
+                if (cmd.dst.x + cmd.dst.width < sx1) sx1 = cmd.dst.x + cmd.dst.width;
+                if (cmd.dst.y + cmd.dst.height < sy1) sy1 = cmd.dst.y + cmd.dst.height;
+                scissored = true;
+            }
             if (scissored) {
                 if (sx0 < 0) sx0 = 0;
                 if (sy0 < 0) sy0 = 0;
@@ -1301,6 +1366,14 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 glDisable(GL_SCISSOR_TEST);
             }
 
+            if (solid_clear) {
+                glDisable(GL_BLEND);
+                glClearColor(cmd.solid_color.r, cmd.solid_color.g, cmd.solid_color.b, 1.f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                ++stats.draws_submitted;
+                continue;
+            }
+
             if (cmd.blend == lx::blend_mode::opaque) {
                 glDisable(GL_BLEND);
             } else {
@@ -1309,7 +1382,18 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
             }
 
-            glBindTexture(GL_TEXTURE_2D, name);
+            if (cmd.solid != solid_bound) {
+                solid_bound = cmd.solid;
+                if (uniform_use_solid_ >= 0)
+                    glUniform1f(uniform_use_solid_, solid_bound ? 1.f : 0.f);
+            }
+            if (cmd.solid) {
+                if (uniform_solid_texel_ >= 0)
+                    glUniform4f(uniform_solid_texel_, cmd.solid_color.r, cmd.solid_color.g,
+                                cmd.solid_color.b, cmd.solid_color.a);
+            } else {
+                glBindTexture(GL_TEXTURE_2D, name);
+            }
             if (uniform_rect_ >= 0) {
                 glUniform4f(uniform_rect_, static_cast<float>(cmd.dst.x), static_cast<float>(cmd.dst.y),
                             static_cast<float>(cmd.dst.width), static_cast<float>(cmd.dst.height));
@@ -1322,7 +1406,8 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             // draw filters linearly (wlroots, KWin).
             float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
             float u_lo = 0.f, v_lo = 0.f, u_hi = 1.f, v_hi = 1.f;
-            if (slot.width > 0 && slot.height > 0) {
+            if (slot_ptr && slot_ptr->width > 0 && slot_ptr->height > 0) {
+                const texture_slot& slot = *slot_ptr;
                 const float tw = static_cast<float>(slot.width);
                 const float th = static_cast<float>(slot.height);
                 const lx::rect2f box = effective_source(cmd.src, slot.width, slot.height);
@@ -1359,7 +1444,8 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 glUniform1i(uniform_transfer_, slot);
             }
             if (uniform_alpha_one_ >= 0)
-                glUniform1f(uniform_alpha_one_, slot.name_opaque[slot.current] ? 1.f : 0.f);
+                glUniform1f(uniform_alpha_one_,
+                            slot_ptr && slot_ptr->name_opaque[slot_ptr->current] ? 1.f : 0.f);
 
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
             ++stats.draws_submitted;
@@ -1372,6 +1458,14 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     glDisable(GL_SCISSOR_TEST);
     glDisable(GL_BLEND);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (!fence) {
+        // Part of a larger piece of work (a screen capture) that fences itself once.
+        glFlush();
+        if (const GLenum err = glGetError(); err != GL_NO_ERROR)
+            return lx::make_error(lx::gl_err::draw_failed, "GL error during composite");
+        return stats;
+    }
 
     // The KMS flip that follows reads this buffer from outside GL, and nothing synchronises
     // the two. Rather than block the render thread until the GPU is done, export the
@@ -1410,17 +1504,21 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             ::close(stats.out_fence_fd);
             stats.out_fence_fd = -1;
         }
-        return detail::gl_error(lx::gl_err::draw_failed, "GL error during composite");
+        return lx::make_error(lx::gl_err::draw_failed, "GL error during composite");
     }
 
     return stats;
 #else
-    (void)target;
+    (void)framebuffer;
+    (void)width_px;
+    (void)height_px;
     (void)clear;
     (void)cmds;
     (void)count;
     (void)rects;
     (void)rect_count;
+    (void)clear_first;
+    (void)fence;
     return lx::not_implemented("lx::gfx::gl_compositor::composite");
 #endif
 }
@@ -1432,8 +1530,7 @@ lx::result<void> lx::gfx::gl_compositor::read_back(const gl_scanout_target& targ
         return lx::not_implemented("lx::gfx::gl_compositor::read_back");
     const unsigned needed = target.width() * target.height() * 4u;
     if (capacity < needed) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "gl read_back: destination too small");
+        return lx::invalid_argument("gl read_back: destination too small");
     }
 
     glBindFramebuffer(GL_FRAMEBUFFER, target.framebuffer());
@@ -1441,7 +1538,7 @@ lx::result<void> lx::gfx::gl_compositor::read_back(const gl_scanout_target& targ
                  static_cast<GLsizei>(target.height()), GL_RGBA, GL_UNSIGNED_BYTE, rgba);
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     if (const GLenum err = glGetError(); err != GL_NO_ERROR)
-        return detail::gl_error(lx::gl_err::draw_failed, "glReadPixels failed");
+        return lx::make_error(lx::gl_err::draw_failed, "glReadPixels failed");
 
     // glReadPixels returns window y = 0 first, which for this framebuffer object is memory
     // row 0: the top line KMS scans. Rows are therefore already top-down and are returned

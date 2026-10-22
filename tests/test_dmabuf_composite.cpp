@@ -6,8 +6,6 @@
 // assertion below is on pixels that could only come from the source buffer.
 #include "lumen_test.hpp"
 
-#include <cstdio>
-#include <cstring>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -18,6 +16,7 @@
 #include <xf86drmMode.h>
 #endif
 
+import std;
 import lx.foundation;
 import lx.gfx;
 
@@ -654,6 +653,40 @@ LUMEN_TEST(composite_exports_a_sync_file_when_supported) {
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().out_fence_fd >= 0);
     ::close(stats.value().out_fence_fd);
+}
+
+// ── solid draws (wp_single_pixel_buffer_v1) ────────────────────────────────
+
+// A solid draw needs no texture of its own: with nothing else in the frame it still binds a
+// valid descriptor set (the compositor's 1x1 one) and lands its colour; translucent, it
+// blends in linear light like a texel.
+LUMEN_TEST(solid_draw_reaches_composited_output_without_a_texture) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    lx::gfx::blit_command cmds[2]{};
+    cmds[0].solid = true;
+    cmds[0].solid_color = lx::color::rgb(1.f, 0.f, 0.f, 1.f);
+    cmds[0].dst = {0, 0, static_cast<int>(k_width) / 2, static_cast<int>(k_height)};
+    cmds[0].blend = lx::blend_mode::opaque;
+    cmds[1].solid = true;
+    cmds[1].solid_color = lx::color::rgb(0.5f, 0.5f, 0.5f, 0.5f);
+    cmds[1].dst = {static_cast<int>(k_width) / 2, 0, static_cast<int>(k_width) / 2,
+                   static_cast<int>(k_height)};
+    cmds[1].blend = lx::blend_mode::premultiplied;
+    auto stats =
+        composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), cmds, 2);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 2);
+    LUMEN_CHECK(stats.value().draws_skipped == 0);
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                            sizeof(readback))));
+    const unsigned char* left = readback + ((k_height / 2u) * k_width + k_width / 4u) * 4u;
+    LUMEN_CHECK(left[0] > 240u && left[1] < 16u && left[2] < 16u);
+    // Premultiplied white at 0.5 over black: linear 0.5 encodes to ~188.
+    const unsigned char* right = readback + ((k_height / 2u) * k_width + k_width * 3u / 4u) * 4u;
+    LUMEN_CHECK(right[1] > 176u && right[1] < 200u);
 }
 
 int main(int argc, char** argv) {

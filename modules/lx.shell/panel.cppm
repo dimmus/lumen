@@ -4,10 +4,7 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#include <cerrno>
-#include <cstdint>
-#include <cstdio>
-#include <cstring>
+#include <stdint.h>
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
@@ -26,6 +23,8 @@ import lx.text;
 import lx.trace;
 
 export module lx.shell:panel;
+
+import std;
 
 import :task_model;
 import :bridge;
@@ -52,6 +51,10 @@ inline constexpr int k_panel_more_width = 44;
 inline constexpr int k_logout_width = 84;
 /// The Apps button (opens the launcher) at the left end.
 inline constexpr int k_apps_width = 64;
+/// The privacy indicator (design-app-compat-capture CI1): a red dot left of the logout
+/// button while some client captures the screen.
+inline constexpr int k_capture_width = 16;
+inline constexpr int k_capture_dot = 10;
 inline constexpr unsigned k_max_panel_cells = 128;
 
 enum panel_cell_flag : unsigned {
@@ -67,6 +70,8 @@ enum panel_cell_flag : unsigned {
 struct panel_cell {
     task_handle task{};
     unsigned label_rev = 0;
+    /// The task's icon revision (zlm v6): a new icon repaints the cell.
+    unsigned icon_rev = 0;
     int x = 0;
     int w = 0;
     unsigned flags = 0;
@@ -130,6 +135,19 @@ struct panel_layout {
     int notice_x = 0;
     int notice_w = 0;
     unsigned notice_rev = 0;
+    /// The screen-capture indicator; capture_w 0 = not shown.
+    int capture_x = 0;
+    int capture_w = 0;
+};
+
+/// The logical edge of a task entry's icon, left of its title.
+inline constexpr int k_panel_icon = 16;
+/// Resolves a task's icon at `px`² pixels (premultiplied ARGB8888; null: none — the panel
+/// draws a letter tile). The shell's: the icon-theme name, the window's own pixel buffers,
+/// the app's desktop entry icon.
+struct panel_icons {
+    const std::uint32_t* (*resolve)(task_handle h, const task_entry& e, int px, void* user) = nullptr;
+    void* user = nullptr;
 };
 
 /// Which entries a panel lists (the tasks of its output, M13); null: all of them.
@@ -141,10 +159,11 @@ struct panel_filter {
 /// Lays out `model`'s entries (those `filter` keeps) on a `width`×`height` panel. The
 /// pointer (surface coordinates; negative = not on the panel) marks the entry under it as
 /// hovered; `pressed` marks the entry a button went down on.
+/// `capturing`: some client captures the screen (zlm v6 capture_state): the indicator shows.
 void layout_panel(const task_model& model, int width, int height, double pointer_x,
                   double pointer_y, task_handle pressed, panel_layout& out,
                   panel_logout logout = {}, panel_apps apps = {}, panel_notice notice = {},
-                  panel_filter filter = {});
+                  panel_filter filter = {}, bool capturing = false);
 /// Copies the used part of `from` (the cells in use, not all k_max_panel_cells).
 ///
 /// Also a workaround: Clang 23.1 finds no viable copy assignment for this class here and
@@ -221,6 +240,11 @@ public:
     /// The output's windows may have changed (a window moved, an output moved): redraw if
     /// the list differs.
     void filter_changed() { dirty_ = true; }
+    /// Where task icons come from (none: letter tiles).
+    void set_icons(panel_icons icons) {
+        icons_ = icons;
+        dirty_ = true;
+    }
     /// The compositor closed the layer surface (its output went away) or a buffer could
     /// not be made: the shell should exit and be restarted.
     [[nodiscard]] bool closed() const { return closed_; }
@@ -265,6 +289,7 @@ private:
     void paint_logout(int bi, const panel_layout& l);
     void paint_apps(int bi, const panel_layout& l);
     void paint_notice(int bi, const panel_layout& l);
+    void paint_capture(int bi, const panel_layout& l);
     void log_layout(const panel_layout& l) const;
 
     panel_globals g_{};
@@ -298,6 +323,7 @@ private:
     action_fn action_fn_ = nullptr;
     void* action_user_ = nullptr;
     panel_filter filter_{};
+    panel_icons icons_{};
     panel_layout committed_{};
     panel_layout next_{};
 };
@@ -317,7 +343,7 @@ namespace {
 void lx::shell::layout_panel(const task_model& model, int width, int height, double px,
                              double py, task_handle pressed, panel_layout& out,
                              panel_logout logout, panel_apps apps, panel_notice notice,
-                             panel_filter filter) {
+                             panel_filter filter, bool capturing) {
     out.width = width;
     out.height = height;
     out.cell_h = height < k_entry_height ? height : k_entry_height;
@@ -334,6 +360,8 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
     out.notice_x = 0;
     out.notice_w = 0;
     out.notice_rev = 0;
+    out.capture_x = 0;
+    out.capture_w = 0;
     // The logout button takes the right end, the Apps button the left; entries share
     // what is left.
     int reserve = 0;
@@ -347,6 +375,13 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
             out.logout_flags |= logout_pressed;
         if (in_box(px, py, out.logout_x, out.logout_w, out.cell_y, out.cell_h))
             out.logout_flags |= logout_hover;
+    }
+    // The capture indicator, left of the logout button (or at the right end).
+    if (capturing && width >= 2 * k_panel_pad + reserve + k_capture_width + k_entry_min_width) {
+        out.capture_w = k_capture_width;
+        out.capture_x = (out.logout_w > 0 ? out.logout_x - k_panel_gap : width - k_panel_pad) -
+                        k_capture_width;
+        reserve += k_capture_width + k_panel_gap;
     }
     int start = k_panel_pad;
     if (apps.shown && width >= 2 * k_panel_pad + reserve + k_apps_width + k_entry_min_width) {
@@ -377,6 +412,15 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
                 order[kept++] = order[i];
         n = kept;
     }
+    // A modal dialog is not listed beside the window it blocks: clicking that window's entry
+    // activates the dialog (the compositor redirects focus), as GNOME's and KDE's task bars do.
+    {
+        unsigned kept = 0;
+        for (unsigned i = 0; i < n; ++i)
+            if (const task_entry* e = model.get(order[i]); e && !task_is_modal_child(model, *e))
+                order[kept++] = order[i];
+        n = kept;
+    }
     if (n == 0 || avail <= 0)
         return;
     const int ni = static_cast<int>(n);
@@ -398,6 +442,7 @@ void lx::shell::layout_panel(const task_model& model, int width, int height, dou
         c.task = order[i];
         const task_entry* e = model.get(order[i]);
         c.label_rev = e ? e->label_rev : 0;
+        c.icon_rev = e ? e->icon_rev : 0;
         c.x = start + static_cast<int>(i) * (w + k_panel_gap);
         c.w = w;
         c.flags = 0;
@@ -435,12 +480,15 @@ void lx::shell::copy_layout(panel_layout& to, const panel_layout& from) {
     to.notice_x = from.notice_x;
     to.notice_w = from.notice_w;
     to.notice_rev = from.notice_rev;
+    to.capture_x = from.capture_x;
+    to.capture_w = from.capture_w;
     for (unsigned i = 0; i < from.count && i < k_max_panel_cells; ++i) {
         panel_cell& d = to.cells[i];
         const panel_cell& c = from.cells[i];
         d.task.index = c.task.index;
         d.task.gen = c.task.gen;
         d.label_rev = c.label_rev;
+        d.icon_rev = c.icon_rev;
         d.x = c.x;
         d.w = c.w;
         d.flags = c.flags;
@@ -478,7 +526,8 @@ unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx:
                        a.cell_h != b.cell_h || a.logout_x != b.logout_x ||
                        a.logout_w != b.logout_w || a.apps_x != b.apps_x ||
                        a.apps_w != b.apps_w || a.notice_x != b.notice_x ||
-                       a.notice_w != b.notice_w;
+                       a.notice_w != b.notice_w || a.capture_x != b.capture_x ||
+                       a.capture_w != b.capture_w;
     for (unsigned i = 0; !arrangement && i < b.count; ++i)
         arrangement = a.cells[i].x != b.cells[i].x || a.cells[i].w != b.cells[i].w;
     if (arrangement) {
@@ -498,7 +547,8 @@ unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx:
     for (unsigned i = 0; i < b.count; ++i) {
         const panel_cell& x = a.cells[i];
         const panel_cell& y = b.cells[i];
-        if (x.task == y.task && x.label_rev == y.label_rev && x.flags == y.flags)
+        if (x.task == y.task && x.label_rev == y.label_rev && x.icon_rev == y.icon_rev &&
+            x.flags == y.flags)
             continue;
         if (!add({y.x, b.cell_y, y.w, b.cell_h}))
             return 1;
@@ -528,6 +578,8 @@ constexpr std::uint32_t k_focused = 0xFF3D6FB4u;
 constexpr std::uint32_t k_attention = 0xFFB4782Du;
 /// The armed logout button: a second click ends the session.
 constexpr std::uint32_t k_danger = 0xFFB43C3Cu;
+/// The capture indicator's dot (GNOME's and KDE's privacy indicators are red too).
+constexpr std::uint32_t k_capture_red = 0xFFE0312Bu;
 constexpr lx::text::raster_color k_text{0xE6, 0xE6, 0xE6, 0xFF};
 constexpr lx::text::raster_color k_text_focused{0xFF, 0xFF, 0xFF, 0xFF};
 constexpr lx::text::raster_color k_text_more{0xA8, 0xA8, 0xAC, 0xFF};
@@ -542,6 +594,11 @@ constexpr int k_text_pad = 8;
 
 void panel_log(lx::trace::level lvl, const char* line) {
     lx::trace::logger::global().log(lvl, k_panel_category, line);
+}
+
+template <typename... Args>
+void panel_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
+    lx::trace::logger::global().logf(lvl, k_panel_category, fmt, std::forward<Args>(args)...);
 }
 
 [[nodiscard]] bool intersects(lx::rect2i a, int x, int w) {
@@ -569,7 +626,31 @@ void lx::shell::panel::paint_cell(int bi, const panel_layout& l, unsigned i) {
     const char* label = "";
     if (e)
         label = e->title[0] ? e->title : (e->app_id[0] ? e->app_id : "untitled");
-    (void)canvas_.text(bi, {c.x + k_text_pad, l.cell_y, c.w - 2 * k_text_pad, l.cell_h}, label,
+    // The icon, 16 logical px, resolved at the pixels it lands on; else a letter tile.
+    int text_x = c.x + k_text_pad;
+    if (e && c.w >= k_entry_min_width + k_panel_icon) {
+        const lx::rect2i icon_box{c.x + k_text_pad - 2, l.cell_y + (l.cell_h - k_panel_icon) / 2,
+                                  k_panel_icon, k_panel_icon};
+        const int px = canvas_.pixel_rect(icon_box).width;
+        const std::uint32_t* pixels =
+            icons_.resolve ? icons_.resolve(c.task, *e, px, icons_.user) : nullptr;
+        if (pixels) {
+            canvas_.blit(bi, icon_box, pixels, px);
+        } else {
+            canvas_.fill_rounded(bi, icon_box, 0xFF5A5A66u, bgc, 3);
+            char letter[8] = {};
+            const char* src = e->app_id[0] ? e->app_id : label;
+            // The last dot-separated part of a reverse-DNS app id names the app.
+            if (const char* dot = std::strrchr(src, '.'); dot && dot[1])
+                src = dot + 1;
+            letter[0] = src[0] >= 'a' && src[0] <= 'z' ? static_cast<char>(src[0] - 32) : src[0];
+            (void)canvas_.text(bi, {icon_box.x + 4, icon_box.y, icon_box.width - 4, icon_box.height},
+                               letter[0] ? letter : "?", k_text_focused,
+                               {"Sans", 8.f, lx::text::weight::bold, lx::text::style::normal});
+        }
+        text_x = icon_box.x + k_panel_icon + 6;
+    }
+    (void)canvas_.text(bi, {text_x, l.cell_y, c.x + c.w - k_text_pad - text_x, l.cell_h}, label,
                        (c.flags & cell_not_responding) ? k_text_more
                        : (c.flags & cell_focused)      ? k_text_focused
                                                        : k_text,
@@ -635,6 +716,16 @@ void lx::shell::panel::paint_notice(int bi, const panel_layout& l) {
                        notice_, k_text_warning, k_panel_font);
 }
 
+void lx::shell::panel::paint_capture(int bi, const panel_layout& l) {
+    if (l.capture_w <= 0)
+        return;
+    const lx::rect2i box{l.capture_x, l.cell_y, l.capture_w, l.cell_h};
+    canvas_.fill(bi, box, k_bg);
+    const lx::rect2i dot{l.capture_x + (l.capture_w - k_capture_dot) / 2,
+                         l.cell_y + (l.cell_h - k_capture_dot) / 2, k_capture_dot, k_capture_dot};
+    canvas_.fill_rounded(bi, dot, k_capture_red, k_bg, k_capture_dot / 2);
+}
+
 void lx::shell::panel::paint(int bi, const panel_layout& l, const lx::rect2i* rects, unsigned n) {
     for (unsigned r = 0; r < n; ++r) {
         const lx::rect2i& rect = rects[r];
@@ -646,6 +737,7 @@ void lx::shell::panel::paint(int bi, const panel_layout& l, const lx::rect2i* re
                 paint_cell(bi, l, i);
             paint_more(bi, l);
             paint_notice(bi, l);
+            paint_capture(bi, l);
             paint_logout(bi, l);
             return;
         }
@@ -666,20 +758,14 @@ void lx::shell::panel::log_layout(const panel_layout& l) const {
         return;
     for (unsigned i = 0; i < l.count; ++i) {
         const task_entry* e = bridge_->model().get(l.cells[i].task);
-        char line[384];
-        std::snprintf(line, sizeof(line), "layout idx=%u x=%d w=%d handle=%u title=\"%s\"", i,
-                      l.cells[i].x, l.cells[i].w, l.cells[i].task.index, e ? e->title : "");
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug, "layout idx={} x={} w={} handle={} title=\"{}\"", i,
+                  l.cells[i].x, l.cells[i].w, l.cells[i].task.index, e ? e->title : "");
     }
     if (l.hidden) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "layout more=%u x=%d", l.hidden, l.more_x);
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug, "layout more={} x={}", l.hidden, l.more_x);
     }
     if (l.apps_w > 0) {
-        char line[64];
-        std::snprintf(line, sizeof(line), "layout apps x=%d w=%d", l.apps_x, l.apps_w);
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug, "layout apps x={} w={}", l.apps_x, l.apps_w);
     }
 }
 
@@ -807,10 +893,8 @@ void lx::shell::panel::pointer_button(unsigned button, bool down) {
         return;
     if (panel_debug()) {
         const task_entry* e = bridge_->model().get(pressed);
-        char line[384];
-        std::snprintf(line, sizeof(line), "click idx=%d handle=%u title=\"%s\"", hit,
-                      pressed.index, e ? e->title : "");
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug, "click idx={} handle={} title=\"{}\"", hit,
+                  pressed.index, e ? e->title : "");
     }
     if (action_fn_)
         action_fn_(panel_action::task, action_user_);
@@ -836,9 +920,7 @@ struct lx::shell::panel::events {
             p.width_ = nw;
             p.height_ = nh;
             p.resized_ = true;
-            char line[96];
-            std::snprintf(line, sizeof(line), "configure serial=%u w=%d h=%d", serial, nw, nh);
-            panel_log(lx::trace::level::info, line);
+            panel_log(lx::trace::level::info, "configure serial={} w={} h={}", serial, nw, nh);
         }
         p.configured_ = true;
         // The ack takes effect with the next commit: make one even if nothing changed.
@@ -862,15 +944,12 @@ const zwlr_layer_surface_v1_listener k_layer_listener = {
 lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& bridge,
                                           void* output) {
     if (!globals.compositor || !globals.shm || !globals.layer_shell)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "panel needs wl_compositor, wl_shm and zwlr_layer_shell_v1");
+        return lx::invalid_argument("panel needs wl_compositor, wl_shm and zwlr_layer_shell_v1");
     g_ = globals;
     bridge_ = &bridge;
     auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
     if (!surface)
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "wl_compositor.create_surface failed");
+        return lx::make_error(lx::wayland_err::bind_failed, "wl_compositor.create_surface failed");
     surface_ = surface;
     auto* layer = zwlr_layer_shell_v1_get_layer_surface(
         static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,
@@ -915,7 +994,8 @@ void lx::shell::panel::after_dispatch(unsigned changes) {
         return;
     // With a filter, a window moving between outputs changes which panel lists it.
     const unsigned relevant = task_change_list | task_change_label | task_change_focus |
-                              task_change_flags |
+                              task_change_flags | task_change_icon | task_change_parent |
+                              task_change_state |
                               (filter_.keep ? unsigned{task_change_geometry} : 0u);
     if (changes & relevant) {
         dirty_ = true;
@@ -926,6 +1006,9 @@ void lx::shell::panel::after_dispatch(unsigned changes) {
         if (pressed_ && !model.get(pressed_))
             pressed_ = {};
     }
+    // The privacy indicator follows the compositor's capture state.
+    if (bridge_->capture_active() != (committed_.capture_w > 0))
+        dirty_ = true;
     if (!configured_)
         return;
     // A new preferred scale: new buffers at the same logical size, everything repainted.
@@ -966,7 +1049,8 @@ void lx::shell::panel::draw(bool force) {
     layout_panel(bridge_->model(), width_, height_, pointer_x_, pointer_y_, pressed_, next_,
                  panel_logout{bridge_->can_logout(), logout_armed_, logout_pressed_},
                  panel_apps{apps_shown_, apps_open_, apps_pressed_},
-                 panel_notice{notice_[0] != '\0', notice_rev_}, filter_);
+                 panel_notice{notice_[0] != '\0', notice_rev_}, filter_,
+                 bridge_->capture_active());
     lx::rect2i damage[k_max_panel_cells];
     const unsigned nd = panel_diff(committed_, next_, damage, k_max_panel_cells);
     if (nd == 0 && !force) {
@@ -993,12 +1077,9 @@ void lx::shell::panel::draw(bool force) {
         for (unsigned i = 0; i < next_.count; ++i)
             if (next_.cells[i].flags & cell_focused)
                 focused = static_cast<int>(i);
-        char line[160];
-        std::snprintf(line, sizeof(line),
-                      "draw entries=%u hidden=%u focused=%d damage=%u%s repaint=%u buffer=%d",
-                      next_.count, next_.hidden, focused, nd, arrangement ? "(full)" : "", nr,
-                      bi);
-        panel_log(lx::trace::level::debug, line);
+        panel_log(lx::trace::level::debug,
+                  "draw entries={} hidden={} focused={} damage={}{} repaint={} buffer={}",
+                  next_.count, next_.hidden, focused, nd, arrangement ? "(full)" : "", nr, bi);
     }
 }
 

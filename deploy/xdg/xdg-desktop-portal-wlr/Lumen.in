@@ -1,0 +1,8 @@
+# xdg-desktop-portal-wlr on a Lumen session (read as $XDG_CURRENT_DESKTOP; run-desktop.sh
+# passes it with -c). The source chooser is Lumen's own list (outputs, then windows), and
+# casts are capped at 60 frames/s: a remote viewer gains nothing above it, and it halves
+# the copies on a 120 Hz output.
+[screencast]
+chooser_type=dmenu
+chooser_cmd=@LUMEN_PORTAL_EXEC@ --choose
+max_fps=60

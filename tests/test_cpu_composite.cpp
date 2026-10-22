@@ -1,9 +1,6 @@
 #include "lumen_test.hpp"
 
-#include <cstdint>
-#include <cstdio>
-#include <vector>
-
+import std;
 import lx.foundation;
 import lx.gfx;
 
@@ -541,6 +538,87 @@ LUMEN_TEST(cpu_composite_rejects_an_invalid_destination) {
     lx::gfx::pixel_surface bad{};
     auto stats = comp.composite(bad, lx::color::rgb(0.f, 0.f, 0.f), nullptr, 0, {});
     LUMEN_CHECK(!stats);
+}
+
+// ── solid draws (wp_single_pixel_buffer_v1) and alpha (alpha-modifier-v1) ─────
+
+namespace {
+lx::gfx::blit_command solid(lx::rect2i dst, lx::color c, float opacity = 1.f) {
+    lx::gfx::blit_command cmd{};
+    cmd.solid = true;
+    cmd.solid_color = c;
+    cmd.dst = dst;
+    cmd.opacity = opacity;
+    cmd.blend = c.a >= 1.f && opacity >= 1.f ? lx::blend_mode::opaque
+                                              : lx::blend_mode::premultiplied;
+    return cmd;
+}
+} // namespace
+
+LUMEN_TEST(cpu_composite_opaque_solid_fills_its_rect_without_a_texture) {
+    image dst{8, 8, k_xrgb, 0xFF000000u};
+    lx::gfx::cpu_compositor comp;
+    const auto cmd = solid({2, 2, 4, 4}, lx::color::rgb(1.f, 0.f, 0.f, 1.f));
+    auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 1.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+    LUMEN_CHECK(stats.value().draws_skipped == 0);
+    LUMEN_CHECK((dst.at(2, 2) & 0x00FFFFFFu) == 0x00FF0000u);
+    LUMEN_CHECK((dst.at(5, 5) & 0x00FFFFFFu) == 0x00FF0000u);
+    LUMEN_CHECK((dst.at(1, 1) & 0x00FFFFFFu) == 0x000000FFu); // the clear around it
+    LUMEN_CHECK((dst.at(6, 6) & 0x00FFFFFFu) == 0x000000FFu);
+}
+
+LUMEN_TEST(cpu_composite_covering_opaque_solid_skips_the_clear) {
+    image dst{4, 4, k_xrgb, 0u};
+    lx::gfx::cpu_compositor comp;
+    const auto cmd = solid({0, 0, 4, 4}, lx::color::rgb(0.f, 1.f, 0.f, 1.f));
+    auto stats = comp.composite(dst.surface(), lx::color::rgb(1.f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().cleared == false);
+    LUMEN_CHECK((dst.at(3, 3) & 0x00FFFFFFu) == 0x0000FF00u);
+}
+
+LUMEN_TEST(cpu_composite_translucent_solid_blends_premultiplied) {
+    image dst{2, 1, k_xrgb, 0xFF000000u};
+    lx::gfx::cpu_compositor comp;
+    // Premultiplied half-transparent white over black: sRGB-encoded 0.5 stays 0.5 (black
+    // contributes nothing), i.e. ~0x80.
+    const auto cmd = solid({0, 0, 2, 1}, lx::color::rgb(0.5f, 0.5f, 0.5f, 0.5f));
+    auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    const unsigned g = (dst.at(0, 0) >> 8) & 0xFFu;
+    LUMEN_CHECK(g >= 0x7E && g <= 0x82);
+}
+
+LUMEN_TEST(cpu_composite_opacity_is_applied_once) {
+    // alpha-modifier at one half on an opaque white draw over black: one half in linear
+    // light (the scene no longer folds opacity into the tint too; see test_scene_outputs).
+    image src{1, 1, k_xrgb, 0xFFFFFFFFu};
+    image dst{1, 1, k_xrgb, 0xFF000000u};
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+    auto cmd = quad(1, {0, 0, 1, 1}, lx::blend_mode::premultiplied, 0.5f);
+    auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    // Linear-light blend: 0.5 linear is ~0xBC encoded (a squared 0.25 would be ~0x89).
+    const unsigned g = (dst.at(0, 0) >> 8) & 0xFFu;
+    LUMEN_CHECK(g >= 0xB8 && g <= 0xC0);
+}
+
+LUMEN_TEST(cpu_composite_skips_draws_of_zero_alpha) {
+    image src{1, 1, k_xrgb, 0xFFFFFFFFu};
+    image dst{1, 1, k_xrgb, 0xFF000000u};
+    lx::gfx::cpu_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.register_texture(1, src.surface())));
+    const lx::gfx::blit_command cmds[2] = {
+        quad(1, {0, 0, 1, 1}, lx::blend_mode::premultiplied, 0.f),
+        solid({0, 0, 1, 1}, lx::color::rgb(1.f, 1.f, 1.f, 1.f), 0.f)};
+    auto stats = comp.composite(dst.surface(), lx::color::rgb(0.f, 0.f, 0.f), cmds, 2, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 0);
+    LUMEN_CHECK(stats.value().draws_culled == 2);
+    LUMEN_CHECK((dst.at(0, 0) & 0x00FFFFFFu) == 0u);
 }
 
 int main(int argc, char** argv) {
