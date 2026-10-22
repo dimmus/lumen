@@ -2,6 +2,7 @@ module;
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 
 #if defined(__GLIBC__)
@@ -233,6 +234,19 @@ struct output_ui {
     unsigned lock_frame = 0;
     /// The flip handler's last feedback (frame callback timestamps).
     scheduler::presentation_feedback last_feedback{};
+    /// Until when this output's first frame waits for a client's first surface (0: not
+    /// waiting yet). See `hold_first_frames`.
+    lx::runtime::clock_time first_frame_hold_until = 0;
+    /// Frame callbacks of the last flip held until just before the next repaint
+    /// (`fire_flip_callbacks`); 0 while none are held.
+    lx::runtime::clock_time callback_release_ns = 0;
+    /// How long clients take to answer this output's frame callbacks: release to the first
+    /// commit that damaged the output, over the last `k_response_window` answers.
+    static constexpr unsigned k_response_window = 8;
+    bool awaiting_response = false;
+    lx::runtime::clock_time response_ns[k_response_window]{};
+    unsigned response_count = 0;
+    unsigned response_next = 0;
 };
 
 struct compositor_impl {
@@ -861,6 +875,15 @@ struct compositor_impl {
     /// UI affinity; one theme per distinct output scale (≤ 4), loaded once in `start` at the
     /// scale's pixel size (ADR 008 §A.7).
     xcursor_theme cursor_themes_[k_cursor_scales]{};
+    /// The theme at the configured default output scale, read on a helper thread beside the
+    /// present path's set-up (`begin_cursor_theme`): the cursor set-up adopts it for that
+    /// scale instead of reading the files itself.
+    std::thread cursor_theme_thread_{};
+    xcursor_theme prefetched_theme_{};
+    unsigned prefetched_scale120_ = 0;
+    void begin_cursor_theme();
+    /// XCURSOR_SIZE, else 24: the logical cursor size.
+    [[nodiscard]] static unsigned cursor_base_px();
     unsigned cursor_theme_count_ = 0;
     /// The scale (120ths) each theme was loaded for, and XCURSOR_SIZE (logical px).
     unsigned cursor_theme_scale120_[k_cursor_scales]{};
@@ -1012,8 +1035,25 @@ struct compositor_impl {
     /// UI thread. Starts the frame clocks of `mask` (default: every live output) that are
     /// stopped and not dark, and re-arms the shared timer.
     void request_frame(std::uint32_t mask = ~0u);
-    /// UI. Output `slot` flipped a frame with client content: its frame callbacks now.
+    /// UI. Output `slot` flipped a frame with client content: its frame callbacks, now or
+    /// held until just before its next repaint.
     void fire_flip_callbacks(unsigned slot);
+    /// UI. Answers the frame callbacks output `slot` paces (the flip's, held or not).
+    void release_flip_callbacks(unsigned slot);
+    /// UI. How far ahead of output `slot`'s next repaint its clients need their frame
+    /// callbacks: the slowest recent answer plus a margin; 0 before any answer was measured.
+    [[nodiscard]] lx::runtime::clock_time client_lead_ns(unsigned slot) const;
+    /// UI. Clients committed damage to the outputs of `fresh`: their answer time.
+    void note_client_response(std::uint32_t fresh);
+    /// UI. Releases held frame callbacks that are due and re-arms `callback_timer_`.
+    void release_due_callbacks();
+    void rearm_callback_timer();
+    std::unique_ptr<runtime::timer_source> callback_timer_{};
+    static void callback_timer_callback();
+    /// Margin added to the clients' measured answer time.
+    static constexpr runtime::clock_time k_client_margin_ns = 1'500'000;
+    /// Holding callbacks for less than this is not worth a timer wake-up.
+    static constexpr runtime::clock_time k_callback_hold_min_ns = 500'000;
     /// UI thread: arms the shared timer at the earliest running clock, or the housekeeping
     /// timer when none runs.
     void rearm_frame_timer();
@@ -1024,8 +1064,24 @@ struct compositor_impl {
     /// lock's outputs) — at start and whenever the layout moved.
     void sync_output_views();
 
-    /// UI thread. Brings up libinput and routes its events to focused clients.
-    void start_input();
+    /// UI thread, in a tick: the outputs of `due` whose first frame waits for a client's
+    /// first surface; their clocks are stopped and `first_frame_timer_` ends the wait.
+    [[nodiscard]] std::uint32_t hold_first_frames(std::uint32_t due, runtime::clock_time now);
+    std::unique_ptr<runtime::timer_source> first_frame_timer_{};
+    static void first_frame_timer_callback();
+    /// UI thread, GL context current, scanout targets created: draws once through every
+    /// client texture path so the driver builds its shader and surface variants now, not
+    /// on the first client frame.
+    void warm_gl_paths();
+    /// UI thread. Brings up libinput and routes its events to focused clients:
+    /// `begin_input` opens the seat's devices on a helper thread — mostly logind
+    /// round trips, so they overlap the present path's set-up — and `finish_input` joins it
+    /// and installs the event routing. Nothing else may use `logind_` or `input_devices_`
+    /// between the two.
+    void begin_input();
+    void finish_input();
+    std::thread input_open_thread_{};
+    std::optional<lx::result<lx::input::input_manager>> input_opened_{};
     /// Render affinity. A draw whose texture was never registered means the commit path and
     /// the render path disagree, and the screen stays black. Reporting only that it
     /// happened is not actionable — this reports the ids involved, once, because it
@@ -1860,7 +1916,7 @@ void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
     lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render", detail);
 }
 
-void compositor_impl::start_input() {
+void compositor_impl::begin_input() {
     // Device nodes are opened through logind when there is a session; without one libinput
     // falls back to opening them directly, which works for root or a member of the input
     // group and fails cleanly otherwise.
@@ -1883,12 +1939,22 @@ void compositor_impl::start_input() {
         ::close(fd);
     };
 
-    // Compile a keymap regardless of whether devices open. Clients are told the layout at
-    // bind time, and a compositor that never found a keyboard still has to answer that.
-    if (auto compiled = input_devices_.default_seat().keymap().compile(); !compiled)
-        lx::trace::logger::global().log_error(compiled.get_error(), "compositor.input");
+    input_open_thread_ = std::thread([this, provider] {
+        // Compile a keymap regardless of whether devices open. Clients are told the layout
+        // at bind time, and a compositor that never found a keyboard still has to answer it.
+        if (auto compiled = input_devices_.default_seat().keymap().compile(); !compiled)
+            lx::trace::logger::global().log_error(compiled.get_error(), "compositor.input");
+        input_opened_.emplace(lx::input::input_manager::open(provider));
+    });
+}
 
-    auto opened = lx::input::input_manager::open(provider);
+void compositor_impl::finish_input() {
+    if (input_open_thread_.joinable())
+        input_open_thread_.join();
+    if (!input_opened_)
+        return;
+    auto opened = std::move(*input_opened_);
+    input_opened_.reset();
     if (!opened) {
         // Not fatal. A compositor with no seat still composites — it is useful headless and
         // in CI — but say so plainly, because "nothing happens when I type" is otherwise a
@@ -1970,14 +2036,18 @@ void compositor_impl::wayland_fd_callback() {
     if (!active)
         return;
     lx::trace::scoped_span span{"ui", "wayland.pump"};
+    const std::uint32_t damaged_before = active->scene.pending_damage_mask();
     (void)active->wayland.dispatch(0);
     // Whatever a client asked for is applied, configured and composited by a tick — of the
     // outputs it damaged when it damaged any (each on its own phase), else of every output
     // (a frame callback or a configure answer is served by whichever ticks).
     // A window capture's view damaged (its window committed while covered) ticks the
     // window's output.
-    const std::uint32_t damaged = (active->scene.pending_damage_mask() & 0xFFFFu) |
-                                  capture_wanted_outputs(active->p0_);
+    const std::uint32_t output_damage = active->scene.pending_damage_mask() & 0xFFFFu;
+    const std::uint32_t damaged = output_damage | capture_wanted_outputs(active->p0_);
+    // Output damage this dispatch added answers held frame callbacks (capture views do not).
+    if (const std::uint32_t fresh = output_damage & ~damaged_before; fresh != 0)
+        active->note_client_response(fresh);
     active->request_frame(damaged != 0 ? damaged : ~0u);
 }
 
@@ -3079,6 +3149,7 @@ lx::result<void> compositor_impl::setup_gl_present() {
     if (!device)
         return device.get_error();
     egl_ = std::move(device).value();
+    lx::trace::timeline_instant("startup", "egl ready");
 
     // Falling through to GL on llvmpipe would be strictly worse than compositing on the
     // CPU directly — same rasterizer, plus an upload and a driver stack.
@@ -3089,6 +3160,7 @@ lx::result<void> compositor_impl::setup_gl_present() {
 
     if (auto initialized = gl_compositor_.initialize(egl_); !initialized)
         return initialized.get_error();
+    lx::trace::timeline_instant("startup", "gl program ready");
 
     gl_present_ = true;
     vulkan_present_ = false;
@@ -3246,6 +3318,129 @@ bool crtc_test(const drm::crtc_alloc_result& r, void* user) {
 namespace {
 void release_targets(output_pipeline& p);
 } // namespace
+
+std::uint32_t compositor_impl::hold_first_frames(std::uint32_t due, runtime::clock_time now) {
+    // An output's first frame is a modeset, and on a virtual GPU (vmwgfx) the next flip after
+    // it lands 15–50 ms later. A client connected at start-up commits its first buffer a
+    // millisecond or two after the first tick sends its configure, so showing the empty
+    // desktop first cost that client a whole extra flip. While clients are connected and none
+    // has mapped a surface, the first frame waits — for at most one refresh period, after
+    // which the output lights as before. The tick itself still runs (it sends configures);
+    // the output is only left out of it. A map restarts the stopped clock at once.
+    if (!drm_present_ || toplevels.top() != lx::toplevel_id{} || layers_.mapped_count() > 0)
+        return 0;
+    // A client whose connection libwayland has not accepted yet counts: at the first tick
+    // the clients that connected during start-up are still in the socket's backlog, which
+    // makes the Wayland event-loop fd readable.
+    if (!wayland.has_clients()) {
+        pollfd pending{wayland.event_fd(), POLLIN, 0};
+        if (pending.fd < 0 || ::poll(&pending, 1, 0) <= 0)
+            return 0;
+    }
+    std::uint32_t held = 0;
+    runtime::clock_time until = 0;
+    for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+        output_ui& o = outs_[slot];
+        if (!(due & (1u << slot)) || o.published_once || !o.pipe || !o.pipe->kms)
+            continue;
+        if (o.first_frame_hold_until == 0)
+            o.first_frame_hold_until = now + clocks_.clock(slot).refresh_period();
+        if (now >= o.first_frame_hold_until)
+            continue;
+        held |= 1u << slot;
+        clocks_.stop(slot);
+        if (until == 0 || o.first_frame_hold_until < until)
+            until = o.first_frame_hold_until;
+    }
+    if (held != 0 && first_frame_timer_)
+        first_frame_timer_->schedule_at(until);
+    return held;
+}
+
+void compositor_impl::first_frame_timer_callback() {
+    if (active)
+        active->request_frame();
+}
+
+unsigned compositor_impl::cursor_base_px() {
+    unsigned base = 24;
+    if (const char* env = std::getenv("XCURSOR_SIZE")) {
+        const long v = std::strtol(env, nullptr, 10);
+        if (v > 0 && v <= 256)
+            base = static_cast<unsigned>(v);
+    }
+    return base;
+}
+
+void compositor_impl::begin_cursor_theme() {
+    // Reading a theme is dozens of opens across the search path and its Inherits= chain
+    // (7–9 ms on the critical path before the first client was served). The outputs' scales
+    // are settled only after the present path, so the theme for the configured default scale
+    // — what every output uses unless configured otherwise — is read now, beside it.
+    const double scale = cfg.output_scale > 0.0 ? cfg.output_scale : 1.0;
+    prefetched_scale120_ = static_cast<unsigned>(std::lround(scale * 120.0));
+    const unsigned base = cursor_base_px();
+    const long px = std::lround(static_cast<double>(base) * prefetched_scale120_ / 120.0);
+    const unsigned size = px > 0 ? static_cast<unsigned>(px) : base;
+    cursor_theme_thread_ = std::thread([this, size] { prefetched_theme_.load(nullptr, size); });
+}
+
+void compositor_impl::warm_gl_paths() {
+    // A virtual GPU (vmwgfx/SVGA3D) translates shaders for its host on first use, per texture
+    // format, sampler and target, and creates host surfaces lazily: a startup trace showed
+    // the first client frame's flip landing 14–25 ms after its commit, against about 5 ms
+    // once warm. One tiny draw per client path — shm BGRA opaque and with alpha, resampled,
+    // and the RGBA path of compositor-drawn pixels — into a scanout slot that has not been
+    // shown makes the driver do that work now, while start-up goes on: the GL work is
+    // flushed, not waited for. The slot starts with full damage, so it is repainted whole
+    // before its first scanout.
+    output_pipeline* pipe = nullptr;
+    for (auto& p : pipes_)
+        if (p && p->gl[output_pipeline::k_slots - 1].valid()) {
+            pipe = p.get();
+            break;
+        }
+    if (!pipe)
+        return;
+    constexpr unsigned k_bgra_opaque = 0xfffffff0u;
+    constexpr unsigned k_bgra_alpha = 0xfffffff1u;
+    constexpr unsigned k_rgba = 0xfffffff2u;
+    const unsigned char px[16] = {0x40, 0x40, 0x40, 0xff, 0x40, 0x40, 0x40, 0x80,
+                                  0x40, 0x40, 0x40, 0xff, 0x40, 0x40, 0x40, 0x80};
+    unsigned ids[3]{};
+    unsigned n = 0;
+    if (gl_compositor_.supports_client_upload()) {
+        if (gl_compositor_.upload_client_region(k_bgra_opaque, 2, 2, {}, px, 8, true))
+            ids[n++] = k_bgra_opaque;
+        if (gl_compositor_.upload_client_region(k_bgra_alpha, 2, 2, {}, px, 8, false))
+            ids[n++] = k_bgra_alpha;
+    }
+    if (gl_compositor_.upload_rgba(k_rgba, 2, 2, px, 8))
+        ids[n++] = k_rgba;
+    gfx::blit_command cmds[4]{};
+    unsigned count = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        cmds[count].texture_id = ids[i];
+        cmds[count].dst = {static_cast<int>(i) * 2, 0, 2, 2};
+        ++count;
+    }
+    if (n > 1) { // resampled: the linear-filter variant
+        cmds[count].texture_id = ids[1];
+        cmds[count].dst = {0, 2, 3, 3};
+        cmds[count].scaled = true;
+        ++count;
+    }
+    if (count > 0) {
+        if (auto drawn = gl_compositor_.composite(pipe->gl[output_pipeline::k_slots - 1],
+                                                  lx::color::rgb(0.f, 0.f, 0.f, 1.f), cmds,
+                                                  count, lx::rect2i{0, 0, 8, 5});
+            drawn && drawn.value().out_fence_fd >= 0)
+            ::close(drawn.value().out_fence_fd);
+    }
+    for (unsigned i = 0; i < n; ++i)
+        gl_compositor_.forget_texture(ids[i]);
+    lx::trace::timeline_instant("startup", "gl paths warmed");
+}
 
 lx::result<void> compositor_impl::create_pipelines() {
     // One pipeline per live output. Without KMS (headless, nested) the pipelines have no
@@ -3524,22 +3719,114 @@ void compositor_impl::on_output_flip(output_pipeline& p, const scheduler::presen
 }
 
 void compositor_impl::fire_flip_callbacks(unsigned slot) {
-    // The frame callbacks this output paces go out at the flip itself (after its
-    // presentation feedback): what their surfaces committed is on screen now, and a client
-    // drawing its next frame has the whole period until this output's next repaint starts
-    // (wlroots answers them from the output's frame event, at the flip). Left to the next
-    // tick they went out at the repaint start, and the reply missed that repaint: a frame
-    // every two periods.
+    // The frame callbacks this output paces are answered after its flip: what their surfaces
+    // committed is on screen now. Answered at the flip itself, a client that draws at once
+    // commits a whole period before the repaint that shows it, so commit-to-present is a
+    // full refresh (wlroots, at the output's frame event). Answered at the repaint start,
+    // the reply misses that repaint: a frame every two periods. So they are held until the
+    // repaint start minus what this output's clients have recently needed to answer, plus a
+    // margin (sway's per-view max_render_time, measured rather than configured): the commit
+    // lands just before the repaint. Until an answer was measured they go out at once; a
+    // client that answers late raises the lead for the next frame, and one slower than the
+    // whole period is answered at the flip as before.
     output_ui& o = outs_[slot];
+    if (!o.present_completed)
+        return;
+    const lx::runtime::clock_time lead = client_lead_ns(slot);
+    if (lead > 0 && (clocks_.running_mask() & (1u << slot)) != 0) {
+        const lx::runtime::clock_time release = clocks_.start_of(slot) - lead;
+        if (release > now_ns() + k_callback_hold_min_ns) {
+            o.callback_release_ns = release;
+            rearm_callback_timer();
+            return;
+        }
+    }
+    release_flip_callbacks(slot);
+}
+
+void compositor_impl::release_flip_callbacks(unsigned slot) {
+    output_ui& o = outs_[slot];
+    const bool held = o.callback_release_ns != 0;
+    o.callback_release_ns = 0;
+    if (held)
+        rearm_callback_timer();
     if (!o.present_completed)
         return;
     const auto now = now_ns();
     o.present_completed = false;
+    o.awaiting_response = true;
     o.last_callback_ns = now;
     unsigned ms = static_cast<unsigned>(static_cast<unsigned long long>(now) / 1'000'000ull);
     if (o.last_feedback.hw_clock && o.last_feedback.actual_present_ns > 0)
         ms = static_cast<unsigned>(o.last_feedback.actual_present_ns / 1'000'000ull);
     fire_output_frame_callbacks(p0_, slot, ms, static_cast<unsigned long long>(now));
+}
+
+lx::runtime::clock_time compositor_impl::client_lead_ns(unsigned slot) const {
+    const output_ui& o = outs_[slot];
+    if (o.response_count == 0)
+        return 0;
+    lx::runtime::clock_time peak = 0;
+    for (unsigned i = 0; i < o.response_count; ++i)
+        if (o.response_ns[i] > peak)
+            peak = o.response_ns[i];
+    const lx::runtime::clock_time lead = peak + k_client_margin_ns;
+    return lead < clocks_.clock(slot).refresh_period() ? lead : 0;
+}
+
+void compositor_impl::note_client_response(std::uint32_t fresh) {
+    const auto now = now_ns();
+    for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+        output_ui& o = outs_[slot];
+        if (!(fresh & (1u << slot)) || !o.awaiting_response || o.last_callback_ns == 0)
+            continue;
+        o.awaiting_response = false;
+        const lx::runtime::clock_time dt = now - o.last_callback_ns;
+        // Longer than a period is not an answer to that callback but later, unrelated work.
+        if (dt <= 0 || dt >= clocks_.clock(slot).refresh_period())
+            continue;
+        o.response_ns[o.response_next] = dt;
+        o.response_next = (o.response_next + 1) % output_ui::k_response_window;
+        if (o.response_count < output_ui::k_response_window)
+            ++o.response_count;
+    }
+}
+
+void compositor_impl::release_due_callbacks() {
+    const bool paused = display_gate_.load(std::memory_order_relaxed) != 0;
+    const std::uint32_t dark = clocks_.dark_mask();
+    const auto now = now_ns();
+    for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+        output_ui& o = outs_[slot];
+        if (o.callback_release_ns == 0)
+            continue;
+        // Paused or dark: the paused tick and the power state answer them instead.
+        if (paused || !o.live || (dark & (1u << slot))) {
+            o.callback_release_ns = 0;
+            continue;
+        }
+        if (o.callback_release_ns <= now + k_callback_hold_min_ns)
+            release_flip_callbacks(slot);
+    }
+    rearm_callback_timer();
+}
+
+void compositor_impl::rearm_callback_timer() {
+    if (!callback_timer_)
+        return;
+    lx::runtime::clock_time next = 0;
+    for (const auto& o : outs_)
+        if (o.callback_release_ns != 0 && (next == 0 || o.callback_release_ns < next))
+            next = o.callback_release_ns;
+    if (next != 0)
+        callback_timer_->schedule_at(next);
+    else
+        callback_timer_->set_enabled(false);
+}
+
+void compositor_impl::callback_timer_callback() {
+    if (active)
+        active->release_due_callbacks();
 }
 
 // ── Session pause/resume (VT switching) ────────────────────────────────────
@@ -6761,7 +7048,8 @@ void compositor_impl::on_vsync(std::uint32_t forced) {
 
     // The outputs whose start is due (two in phase share this tick, M6), plus those the
     // caller forces (the housekeeping tick).
-    const std::uint32_t due = (clocks_.take_due(tick.timestamp_ns) | forced) & outputs.live_mask();
+    std::uint32_t due = (clocks_.take_due(tick.timestamp_ns) | forced) & outputs.live_mask();
+    due &= ~hold_first_frames(due, tick.timestamp_ns);
     due_mask_ = due;
     in_vsync_ = true;
     tick_quiet_mask_ = 0;
@@ -6866,6 +7154,7 @@ lx::result<void> compositor::start() {
     // LUMEN_TRACE_FILE=path records a Perfetto-readable timeline of this run.
     lx::trace::timeline_start_from_env();
     lx::trace::name_thread("lx-ui");
+    lx::trace::timeline_instant("startup", "start entered");
     if (!impl_) {
         const auto err = lx::invalid_argument("null impl");
         lx::trace::logger::global().log_error(err, "compositor");
@@ -6874,29 +7163,17 @@ lx::result<void> compositor::start() {
 
     impl_->scheduler_.set_target_fps(impl_->cfg.target_fps);
 
-    // Graphics. A Vulkan device is not free: where the only Vulkan driver is a software
-    // rasterizer (lavapipe), creating one initialises LLVM and its JIT — about 28 MB of heap
-    // (heaptrack) for a device the GL path never composites with. So probe with an instance
-    // only, and create the device now only when Vulkan may composite; the fallbacks below
-    // create it on demand. Failure must not abort compositor start.
-    {
-        const auto want = impl_->cfg.present;
-        const bool vulkan_may_composite =
-            want == present_backend::vulkan || want == present_backend::cpu ||
-            (want == present_backend::automatic && gfx::device_selector::has_hardware_vulkan());
-        if (vulkan_may_composite) {
-            impl_->ensure_graphics_device();
-        } else {
-            impl_->headless_present_ = true;
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                            "no hardware Vulkan — Vulkan device not created");
-        }
-    }
-
-    if (impl_->headless_present_) {
-        if (auto hr = impl_->headless_.create(64, 64); !hr) {
-            lx::trace::logger::global().log_error(hr.get_error(), "compositor.gfx");
-        }
+    // The hardware-Vulkan probe runs beside the logind and KMS opening below: they mostly
+    // wait on D-Bus and the kernel, the probe is CPU work in the Vulkan loader. Only the UI
+    // thread exists yet, so the scope's environment edit has no concurrent writer.
+    bool hardware_vulkan = false;
+    std::optional<gfx::hardware_probe_scope> probe_scope;
+    std::thread probe;
+    if (impl_->cfg.present == present_backend::automatic) {
+        probe_scope.emplace();
+        probe = std::thread([&hardware_vulkan] {
+            hardware_vulkan = gfx::device_selector::has_hardware_vulkan();
+        });
     }
 
     if (auto session = session::logind_session::open(); session)
@@ -6948,6 +7225,52 @@ lx::result<void> compositor::start() {
             }
         }
     }
+
+    lx::trace::timeline_instant("startup", "kms opened");
+    if (probe.joinable())
+        probe.join();
+    probe_scope.reset();
+    lx::trace::timeline_instant("startup", "graphics probed");
+
+    // Graphics. A Vulkan device is not free: where the only Vulkan driver is a software
+    // rasterizer (lavapipe), creating one initialises LLVM and its JIT — about 28 MB of heap
+    // (heaptrack) for a device the GL path never composites with. So probe with an instance
+    // only, and create the device now only when Vulkan may composite; the fallbacks below
+    // create it on demand. Failure must not abort compositor start.
+    {
+        const auto want = impl_->cfg.present;
+        const bool vulkan_may_composite =
+            want == present_backend::vulkan || want == present_backend::cpu ||
+            (want == present_backend::automatic && hardware_vulkan);
+        if (vulkan_may_composite) {
+            impl_->ensure_graphics_device();
+        } else {
+            impl_->headless_present_ = true;
+            lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
+                                            "no hardware Vulkan — Vulkan device not created");
+        }
+    }
+
+    if (impl_->headless_present_) {
+        if (auto hr = impl_->headless_.create(64, 64); !hr) {
+            lx::trace::logger::global().log_error(hr.get_error(), "compositor.gfx");
+        }
+    }
+
+    // Input devices open, and the cursor theme is read, beside the present path's set-up
+    // (`begin_input`, `begin_cursor_theme`); joined before they are used, and on every early
+    // return below.
+    impl_->begin_input();
+    impl_->begin_cursor_theme();
+    struct helper_join {
+        detail::compositor_impl* impl;
+        ~helper_join() {
+            if (impl->input_open_thread_.joinable())
+                impl->input_open_thread_.join();
+            if (impl->cursor_theme_thread_.joinable())
+                impl->cursor_theme_thread_.join();
+        }
+    } helper_join_guard{impl_};
 
     // Present path. Requires the KMS mode, so it comes after the card is open. Failure is
     // not fatal: the compositor degrades rather than refusing to start.
@@ -7052,6 +7375,7 @@ lx::result<void> compositor::start() {
     // Outputs (ADR 008 Part A): every connected desktop connector from the device's
     // start-up probe, each in its own slot with its own pipeline. `--scale` is the default
     // for every output (0: sway's HiDPI rule), `--output-scale NAME=S` per connector.
+    lx::trace::timeline_instant("startup", "present path ready");
     impl_->outputs.set_default_scale(impl_->cfg.output_scale);
     if (const char* spec = impl_->cfg.output_scales; spec && *spec) {
         // NAME=S[,NAME=S...]
@@ -7117,8 +7441,10 @@ lx::result<void> compositor::start() {
     }
     // The GL context has to move to the render thread, which claims it in render_loop; it
     // cannot be current on two threads at once.
-    if (impl_->gl_present_)
+    if (impl_->gl_present_) {
+        impl_->warm_gl_paths();
         impl_->egl_.release_current();
+    }
     if (impl_->outputs.count() > 0) {
         // Kept for output 0 in slot order: the smokes and inject-input.py parse this line.
         const output_state o0 = impl_->outputs.state(impl_->outputs.nth(0));
@@ -7133,11 +7459,13 @@ lx::result<void> compositor::start() {
     impl_->log_outputs();
     impl_->output_generation_ = impl_->outputs.generation();
 
+    lx::trace::timeline_instant("startup", "outputs ready");
     if (auto bound = impl_->wayland.bind(impl_->cfg.socket_name); !bound) {
         lx::trace::logger::global().log_error(bound.get_error(), "compositor");
         return bound.get_error();
     }
 
+    lx::trace::timeline_instant("startup", "socket bound");
     // Cursor: themes first (they decide how large the planes' buffers must be), then one
     // plane per pipeline, then the manager that feeds them. Startup-only file I/O.
     {
@@ -7145,12 +7473,7 @@ lx::result<void> compositor::start() {
         // One theme per distinct output scale, at that scale's pixel size: XCURSOR_SIZE (or
         // 24) is a logical size, so a 1.25 output shows 30 px images — sharp, not a 24 px
         // image stretched (§A.7). At most k_cursor_scales; past that, the nearest is used.
-        unsigned base = 24;
-        if (const char* env = std::getenv("XCURSOR_SIZE")) {
-            const long v = std::strtol(env, nullptr, 10);
-            if (v > 0 && v <= 256)
-                base = static_cast<unsigned>(v);
-        }
+        const unsigned base = detail::compositor_impl::cursor_base_px();
         unsigned scales[k_cursor_scales]{};
         unsigned n = 0;
         for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
@@ -7167,9 +7490,17 @@ lx::result<void> compositor::start() {
         if (n == 0)
             scales[n++] = static_cast<unsigned>(std::lround(impl->outputs.default_scale() * 120.0));
         unsigned need = 0;
+        if (impl->cursor_theme_thread_.joinable())
+            impl->cursor_theme_thread_.join();
+        bool adopted = false;
         for (unsigned i = 0; i < n; ++i) {
-            const long px = std::lround(static_cast<double>(base) * scales[i] / 120.0);
-            impl->cursor_themes_[i].load(nullptr, px > 0 ? static_cast<unsigned>(px) : base);
+            if (!adopted && scales[i] == impl->prefetched_scale120_) {
+                impl->cursor_themes_[i] = std::move(impl->prefetched_theme_);
+                adopted = true;
+            } else {
+                const long px = std::lround(static_cast<double>(base) * scales[i] / 120.0);
+                impl->cursor_themes_[i].load(nullptr, px > 0 ? static_cast<unsigned>(px) : base);
+            }
             if (impl->cursor_themes_[i].max_dimension() > need)
                 need = impl->cursor_themes_[i].max_dimension();
             lx::trace::logger::global().logf(
@@ -7249,8 +7580,11 @@ lx::result<void> compositor::start() {
         impl->cursor_.init(setup);
     }
 
+    lx::trace::timeline_instant("startup", "cursor ready");
     impl_->register_p0_globals();
-    impl_->start_input();
+    lx::trace::timeline_instant("startup", "globals registered");
+    impl_->finish_input();
+    lx::trace::timeline_instant("startup", "input started");
 
     // The pointer starts in the middle of the first output in layout order (leftmost, then
     // topmost), where it is easy to find.
@@ -7279,6 +7613,7 @@ lx::result<void> compositor::start() {
         return installed.get_error();
     }
 
+    lx::trace::timeline_instant("startup", "shell bridge installed");
     detail::compositor_impl::active = impl_;
 
     // One frame clock per output, each following its own display's refresh (not a
@@ -7296,6 +7631,14 @@ lx::result<void> compositor::start() {
         &detail::compositor_impl::housekeeping_callback, true);
     impl_->housekeeping_timer->set_enabled(false); // only while every frame clock is stopped
     impl_->loop.add_source(impl_->housekeeping_timer.get());
+    impl_->callback_timer_ = std::make_unique<runtime::timer_source>(
+        0, &detail::compositor_impl::callback_timer_callback, false);
+    impl_->callback_timer_->set_enabled(false);
+    impl_->loop.add_source(impl_->callback_timer_.get());
+    impl_->first_frame_timer_ = std::make_unique<runtime::timer_source>(
+        0, &detail::compositor_impl::first_frame_timer_callback, false);
+    impl_->first_frame_timer_->set_enabled(false);
+    impl_->loop.add_source(impl_->first_frame_timer_.get());
     impl_->sync_output_views();
     // ext-idle-notify: one timer for every notification, armed at the next deadline only.
     impl_->idle_timer_ = std::make_unique<runtime::timer_source>(
@@ -7722,6 +8065,8 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
                                                      slot);
                 }
                 o.present_completed = false;
+                o.callback_release_ns = 0;
+                o.awaiting_response = true;
                 o.last_callback_ns = tick.timestamp_ns;
                 unsigned ms = frame_ms;
                 if (o.last_feedback.hw_clock && o.last_feedback.actual_present_ns > 0)

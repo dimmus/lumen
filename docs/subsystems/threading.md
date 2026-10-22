@@ -294,6 +294,33 @@ ticks for the deadlines only a tick notices: liveness pings, the configure watch
 unmapping idle staging. An idle desktop measured 730 wakeups/s across the three threads
 before this and 5/s after (vmwgfx, shell and one terminal).
 
+**Start-up runs three helper threads, before the render and worker threads exist.**
+`compositor::start` is on the UI thread, and its slow phases mostly wait on something else,
+so they overlap instead of queueing:
+
+| Helper | Runs beside | Joined |
+|--------|-------------|--------|
+| hardware-Vulkan probe (`device_selector::has_hardware_vulkan`) | logind session and KMS open (D-Bus, kernel) | before the present path is chosen |
+| input open (`begin_input`: keymap compile, libinput, logind `TakeDevice` per device) | EGL/GL set-up and the scanout targets | `finish_input`, after the globals |
+| cursor theme at the default output scale (`begin_cursor_theme`) | the same | the cursor set-up, which adopts it |
+
+Each owns its state until joined, and the UI thread uses neither `logind_` nor
+`input_devices_` in between; a guard joins them on every early return. The probe's
+`gfx::hardware_probe_scope` sets `VK_LOADER_DRIVERS_DISABLE` (software drivers cannot
+answer the probe and lavapipe's LLVM is most of its cost) while only the UI thread and the
+probe run, and clears it after the join, so no thread reads the environment while it is
+written. Measured on vmwgfx (2 vCPUs, `LUMEN_TRACE_FILE` start-up instants): the Vulkan
+probe 18–31 ms, input open 15–25 ms and the cursor theme 5–14 ms left the critical path;
+input in parallel against serial, 8 interleaved runs each: socket 75 vs 92 ms, first client
+frame 114 vs 126 ms.
+
+**Frame callbacks are released on a timer (UI).** After a flip, an output's callbacks are
+held until its next repaint start minus what its clients recently took to answer (peak of
+the last 8, plus 1.5 ms) and released by `callback_timer_`, a one-shot UI `timer_source`;
+the answer time is measured on the UI thread from the release to the first dispatch that
+damages the output. See rendering-performance.md (frame clocks). A tick that finds
+callbacks still held answers them itself, and pause, power-off and removal drop the hold.
+
 Client content crosses UI → render as `texture_update`s on an SPSC queue. Each carries the
 index of the snapshot that was being built when it was queued, and the render thread
 applies it no earlier than when it composites that snapshot (later ones wait, in order):
