@@ -1,0 +1,27 @@
+%% Content-update queue (ADR 009 Part A): a commit, its blockers, and the flush points.
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant W as wire_surface (UI)
+    participant Q as content_queue + poller (UI)
+    participant T as tick_ui (UI)
+    participant R as render thread
+
+    C->>W: attach, set_barrier, wait_barrier, set_timestamp, commit
+    W->>W: prechecks (role, geometry, viewport, explicit sync): validation only
+    W->>W: merge pending into cached
+    alt queue empty, fences signalled, (shown:) no barrier, target reached
+        W->>W: role state + apply_cached + finish_commit (fast path)
+    else blocked
+        W->>Q: alloc record, move state + role snapshot + tree child state, seal sync children
+        W->>Q: poll() planes / query acquire point; unsignalled: sync_file or syncobj eventfd into the epoll set
+        W-->>T: commit-timing: frame_clocks::request_at(pace output, target)
+    end
+    Q-->>W: epoll readable (fence signalled): waits-- , try the surface
+    T->>Q: after dispatch: try (targets this frame reaches, hidden surfaces)
+    T->>T: publish frame F
+    T->>Q: content_updates_latched(output, F): clear barriers latched in F, try
+    Q->>W: apply head (swap payload into cached, apply_cached, role finisher, scene)
+    T->>R: composite F (+1)
+    R-->>T: newest composite (or capture-copy) fence into release_fence_mailbox (explicit-sync clients only)
+    T->>C: wl_buffer.release, release point signalled after that fence (at retirement: superseded, last sampling frame done)

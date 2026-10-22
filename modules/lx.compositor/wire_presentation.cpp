@@ -193,11 +193,6 @@ void bind_presentation(wayland::client_connection& client, unsigned id, int vers
 
 #endif
 
-void presentation_merge(surface_obj* s) {
-    if (auto* t = table())
-        t->on_merge(s->pending.feedback, s->cached.feedback, sink());
-}
-
 void presentation_apply(surface_obj* s) {
     if (auto* t = table(); t && g_p0_ctx)
         t->on_apply(s->id, s->cached.feedback, g_p0_ctx->building_frame, sink());
@@ -221,6 +216,16 @@ void presentation_surface_unmapped(lx::surface_id surface) {
 void presentation_drop_cached(surface_obj* s) {
     if (auto* t = table())
         t->discard_list(s->cached.feedback, sink());
+}
+
+void presentation_merge_lists(unsigned& from, unsigned& into) {
+    if (auto* t = table())
+        t->on_merge(from, into, sink());
+}
+
+void presentation_drop_list(unsigned& list) {
+    if (auto* t = table())
+        t->discard_list(list, sink());
 }
 
 } // namespace lx::compositor::p0

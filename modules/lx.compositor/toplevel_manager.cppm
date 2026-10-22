@@ -158,6 +158,23 @@ struct toplevel_record {
     /// the pointer), and the one it was last on since; -1 before the initial configure.
     int output = -1;
 
+    // ── xdg-dialog-v1, xdg-toplevel-icon-v1 (design-app-compat-capture B.1, B.2) ──
+    /// A live xdg_dialog_v1 names this window: a second get_xdg_dialog is `already_used`.
+    bool dialog = false;
+    /// xdg_dialog_v1.set_modal. It blocks the parent only while the parent is mapped
+    /// (`effective_modal`).
+    bool modal = false;
+    /// The icon in effect (`toplevel_icon_table` id, a reference held; 0: the default) and
+    /// the one set_icon staged for the next commit (`icon_pending_set`; 0: reset).
+    unsigned icon = 0;
+    unsigned icon_pending = 0;
+    bool icon_pending_set = false;
+
+    // ── ext-foreign-toplevel-list-v1 (design-app-compat-capture D.1, FT1) ──
+    /// The identifier of the current mapping: 32 hex digits of 128 random bits, new at every
+    /// map (a remapped window is a new handle; the protocol forbids reuse). Empty unmapped.
+    char foreign_identifier[33]{};
+
     // ── migration (ADR 008 H5) ──
     /// The output this window was moved off when it went (its identifier, "" for none), the
     /// window geometry relative to that output's origin, and its state there. When an output
@@ -333,6 +350,15 @@ private:
     unsigned order_count_ = 0;
     unsigned long long next_id_ = 1;
 };
+
+/// xdg-dialog-v1: `rec` is modal and blocks its parent — set_modal, with a parent that is
+/// mapped (a modal dialog whose parent is gone or hidden blocks nothing; Mutter, KWin).
+[[nodiscard]] inline bool effective_modal(const toplevel_manager& m, const toplevel_record& rec) {
+    if (!rec.modal || !rec.parent || !rec.mapped)
+        return false;
+    const toplevel_record* p = m.find(rec.parent);
+    return p && p->mapped;
+}
 
 } // namespace lx::compositor
 

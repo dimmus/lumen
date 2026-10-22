@@ -37,6 +37,13 @@
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_TEST_SESSION_LOCK 1
 #endif
+#if defined(LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1) && defined(LUMEN_PROTOCOL_XDG_DIALOG_V1) && \
+    defined(LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1)
+#include "xdg-toplevel-icon-v1-client-protocol.h"
+#include "xdg-dialog-v1-client-protocol.h"
+#include "xdg-system-bell-v1-client-protocol.h"
+#define LUMEN_TEST_V6 1
+#endif
 #endif
 #endif
 
@@ -282,8 +289,8 @@ int main() {
     conn sh{};
     sh.bridge = &bridge;
     check(connect(sh) && sh.shell, "shell binds zlm_shell_v1 (exe matches the configured path)");
-    check(bridge.has_capabilities() && bridge.compositor_version() == 5,
-          "capabilities arrive right after bind (the compositor implements version 5)");
+    check(bridge.has_capabilities() && bridge.compositor_version() == 6,
+          "capabilities arrive right after bind (the compositor implements version 6)");
     check(static_cast<bool>(bridge.attach(sh.shell)), "get_policy_bridge");
     (void)wl_display_roundtrip(sh.display);
     const auto& model = bridge.model();
@@ -404,8 +411,8 @@ int main() {
     check(connect(sh3) && sh3.shell && static_cast<bool>(v4.attach(sh3.shell)),
           "a v4 shell binds");
     (void)wl_display_roundtrip(sh3.display);
-    check(v4.compositor_version() == 5 && v4.can_grab_keys() && !v4.has_lock_state(),
-          "v4: grabs, no lock state (the compositor reports 5)");
+    check(v4.compositor_version() == 6 && v4.can_grab_keys() && !v4.has_lock_state(),
+          "v4: grabs, no lock state (the compositor reports 6)");
     const auto v_one = find_title(v4.model(), "one renamed");
     const auto v_three = find_title(v4.model(), "three");
     v4.request_activate(v_one);
@@ -542,6 +549,135 @@ int main() {
         v5.detach();
         zlm_shell_v1_destroy(sh5.shell);
         wl_display_disconnect(sh5.display);
+    }
+#endif
+
+#if defined(LUMEN_TEST_V6)
+    // ── Version 6: icons (memfds), parents and modal dialogs, the bell, non-inhibitable
+    //    grabs ──
+    {
+        const auto bind = [](conn& c, const wl_interface* iface) -> void* {
+            struct found {
+                const wl_interface* iface;
+                uint32_t name = 0;
+            } f{iface};
+            static const wl_registry_listener l = {
+                [](void* d, wl_registry*, uint32_t name, const char* i, uint32_t) {
+                    auto* fd = static_cast<found*>(d);
+                    if (std::strcmp(i, fd->iface->name) == 0)
+                        fd->name = name;
+                },
+                [](void*, wl_registry*, uint32_t) {}};
+            wl_registry* r = wl_display_get_registry(c.display);
+            wl_registry_add_listener(r, &l, &f);
+            (void)wl_display_roundtrip(c.display);
+            return f.name ? wl_registry_bind(r, f.name, iface, 1) : nullptr;
+        };
+        static lx::shell::policy_bridge v6;
+        static lx::shell::task_handle bells[8];
+        static unsigned bell_count = 0;
+        v6.set_bell_handler(
+            [](lx::shell::task_handle h, void*) {
+                if (bell_count < 8)
+                    bells[bell_count++] = h;
+            },
+            nullptr);
+        conn sh6{};
+        sh6.bridge = &v6;
+        g_zlm_version = 6;
+        check(connect(sh6) && sh6.shell && v6.has_v6() && static_cast<bool>(v6.attach(sh6.shell)),
+              "v6: the shell binds version 6");
+        (void)wl_display_roundtrip(sh6.display);
+        // The lock key, not inhibitable: accepted.
+        auto lock_grab = v6.grab_key(0x6c, lx::shell::policy_bridge::k_mod_super,
+                                     lx::shell::policy_bridge::k_grab_not_inhibitable, nullptr,
+                                     nullptr);
+        (void)wl_display_roundtrip(sh6.display);
+        check(lock_grab && v6.key_grab_refusal(lock_grab.value()) == 0,
+              "v6: a not_inhibitable grab is accepted");
+        auto* icons = static_cast<xdg_toplevel_icon_manager_v1*>(
+            bind(app, &xdg_toplevel_icon_manager_v1_interface));
+        auto* dialogs = static_cast<xdg_wm_dialog_v1*>(bind(app, &xdg_wm_dialog_v1_interface));
+        auto* bell = static_cast<xdg_system_bell_v1*>(bind(app, &xdg_system_bell_v1_interface));
+        window main_w{}, dlg{};
+        map_window(app, main_w, "with-icon");
+        // A 16 px icon with a name; applied by the next commit.
+        auto* icon = xdg_toplevel_icon_manager_v1_create_icon(icons);
+        xdg_toplevel_icon_v1_set_name(icon, "utilities-terminal");
+        {
+            const int fd = memfd_create("icon", MFD_CLOEXEC);
+            (void)!ftruncate(fd, 16 * 16 * 4);
+            auto* px = static_cast<uint32_t*>(mmap(nullptr, 16 * 16 * 4, PROT_READ | PROT_WRITE,
+                                                   MAP_SHARED, fd, 0));
+            for (int i = 0; i < 256; ++i)
+                px[i] = 0xFF00FF00u;
+            munmap(px, 16 * 16 * 4);
+            wl_shm_pool* pool = wl_shm_create_pool(app.shm, fd, 16 * 16 * 4);
+            wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, 16, 16, 64, WL_SHM_FORMAT_ARGB8888);
+            wl_shm_pool_destroy(pool);
+            close(fd);
+            xdg_toplevel_icon_v1_add_buffer(icon, b, 1);
+        }
+        xdg_toplevel_icon_manager_v1_set_icon(icons, main_w.toplevel, icon);
+        xdg_toplevel_icon_v1_destroy(icon);
+        wl_surface_commit(main_w.surface);
+        (void)wl_display_roundtrip(app.display);
+        // A modal dialog of it.
+        dlg.surface = wl_compositor_create_surface(app.compositor);
+        dlg.xdg = xdg_wm_base_get_xdg_surface(app.wm_base, dlg.surface);
+        xdg_surface_add_listener(dlg.xdg, &xdg_listener, &dlg);
+        dlg.toplevel = xdg_surface_get_toplevel(dlg.xdg);
+        xdg_toplevel_set_title(dlg.toplevel, "the-dialog");
+        xdg_toplevel_set_parent(dlg.toplevel, main_w.toplevel);
+        xdg_dialog_v1_set_modal(xdg_wm_dialog_v1_get_xdg_dialog(dialogs, dlg.toplevel));
+        wl_surface_commit(dlg.surface);
+        (void)wl_display_roundtrip(app.display);
+        xdg_surface_ack_configure(dlg.xdg, dlg.serial);
+        wl_surface_attach(dlg.surface, make_buffer(app, 120, 80), 0, 0);
+        wl_surface_commit(dlg.surface);
+        (void)wl_display_roundtrip(app.display);
+        (void)wl_display_roundtrip(sh6.display);
+        const auto& m6 = v6.model();
+        const auto h_main = find_title(m6, "with-icon");
+        const auto h_dlg = find_title(m6, "the-dialog");
+        lx::shell::policy_bridge::icon_image images[4];
+        const unsigned n_images = v6.icon_images(h_main, images, 4);
+        const auto* em = m6.get(h_main);
+        check(em && std::strcmp(em->icon_name, "utilities-terminal") == 0 && n_images == 1 &&
+                  images[0].size == 16 && images[0].pixels && images[0].pixels[0] == 0xFF00FF00u,
+              "v6: the window's icon reaches the shell (name, and the pixels through a memfd)");
+        const auto* ed = m6.get(h_dlg);
+        check(ed && ed->parent == h_main && ed->state == lx::shell::k_task_state_modal &&
+                  lx::shell::task_is_modal_child(m6, *ed),
+              "v6: the dialog's parent and modal state reach the shell (the task bar hides it)");
+        // The bell, for a window and for none.
+        xdg_system_bell_v1_ring(bell, main_w.surface);
+        xdg_system_bell_v1_ring(bell, nullptr);
+        (void)wl_display_roundtrip(app.display);
+        (void)wl_display_roundtrip(sh6.display);
+        check(bell_count == 2 && bells[0] == h_main && !bells[1],
+              "v6: bells reach the shell with their window (and without one)");
+        // A snapshot carries icons and parents too.
+        static lx::shell::policy_bridge again;
+        conn sh6b{};
+        sh6b.bridge = &again;
+        check(connect(sh6b) && sh6b.shell && static_cast<bool>(again.attach(sh6b.shell)),
+              "v6: a second shell binds");
+        (void)wl_display_roundtrip(sh6b.display);
+        const auto& m6b = again.model();
+        const auto b_main = find_title(m6b, "with-icon");
+        const auto b_dlg = find_title(m6b, "the-dialog");
+        lx::shell::policy_bridge::icon_image images_b[4];
+        check(m6b.get(b_dlg) && m6b.get(b_dlg)->parent == b_main &&
+                  again.icon_images(b_main, images_b, 4) == 1 &&
+                  std::strcmp(m6b.get(b_main)->icon_name, "utilities-terminal") == 0,
+              "v6: the snapshot carries icons and parents");
+        again.detach();
+        zlm_shell_v1_destroy(sh6b.shell);
+        wl_display_disconnect(sh6b.display);
+        v6.detach();
+        zlm_shell_v1_destroy(sh6.shell);
+        wl_display_disconnect(sh6.display);
     }
 #endif
 

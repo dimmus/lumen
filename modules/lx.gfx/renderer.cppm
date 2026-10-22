@@ -46,7 +46,21 @@ struct blit_command {
     bool scaled = false;
     /// Covered by an opaque draw above it: skipped (identical pixels).
     bool occluded = false;
+    /// A solid colour instead of a texture (`wp_single_pixel_buffer_v1`): `texture_id` is 0,
+    /// `src` is ignored and every pixel of `dst` is `solid_color` — premultiplied and
+    /// encoded like a texel, then tinted, faded and blended like one. No texture exists and
+    /// nothing is uploaded; an opaque, untinted one is a scissored clear where the backend
+    /// has one.
+    bool solid = false;
+    lx::color solid_color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
 };
+
+/// A draw whose effective alpha (opacity × tint alpha) is zero changes no pixel: every
+/// backend skips it. It still counts for the visibility pass (a surface fading in from 0
+/// keeps its frame callbacks), which runs on the scene's draw list, not here.
+[[nodiscard]] inline bool draw_invisible(const blit_command& cmd) {
+    return !(cmd.opacity * cmd.tint.a > 0.f);
+}
 
 /// Where a draw's top-left, +x and +y directions land in its source box, in the box's own
 /// normalized coordinates (0..1 across the box): the source point of normalized
@@ -226,6 +240,18 @@ lx::result<void> lx::gfx::frame_renderer::draw_to_headless(const blit_command* c
         const auto& cmd = cmds[i];
         if (pipelines_) {
             (void)pipelines_->acquire(static_cast<unsigned>(cmd.blend), 0);
+        }
+        if (cmd.occluded || draw_invisible(cmd))
+            continue;
+        if (cmd.solid) {
+            const float k = cmd.opacity * cmd.tint.a;
+            const lx::color c = lx::color::rgb(cmd.solid_color.r * cmd.tint.r * k,
+                                               cmd.solid_color.g * cmd.tint.g * k,
+                                               cmd.solid_color.b * cmd.tint.b * k,
+                                               cmd.solid_color.a * k);
+            if (auto filled = target.fill_solid(cmd.dst, c); !filled)
+                outcome = filled.get_error();
+            continue;
         }
         if (auto blitted = target.blit_texture(cmd.texture_id, cmd.dst); !blitted)
             outcome = blitted.get_error();

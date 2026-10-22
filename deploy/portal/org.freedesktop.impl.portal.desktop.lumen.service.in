@@ -1,0 +1,4 @@
+[D-BUS Service]
+Name=org.freedesktop.impl.portal.desktop.lumen
+Exec=@LUMEN_PORTAL_EXEC@
+SystemdService=xdg-desktop-portal-lumen.service

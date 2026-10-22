@@ -38,8 +38,11 @@ import :keybindings;
 import :presentation_feedback;
 import :idle;
 import :session_lock;
+import :capture_engine;
 import :output_management;
 import :text_input;
+import :toplevel_icon;
+import :foreign_registry;
 
 export namespace lx::compositor {
 
@@ -571,6 +574,52 @@ struct p0_protocol_context {
     void (*output_mgmt_kick)(void* user) = nullptr;
     void* output_mgmt_user = nullptr;
 
+    // ── content-update queue (wire_surface.cpp; design-app-compat-capture §3) ──
+    /// When content applied now would first be presented on output `slot` (its frame
+    /// clock's prediction; `cu_in_tick` while a tick builds that output's frame). Null:
+    /// unknown, commit-timing targets count as reached.
+    unsigned long long (*cu_predict)(void* user, unsigned slot) = nullptr;
+    /// Arms output `slot`'s clock for the tick that presents at or after `target_ns`.
+    void (*cu_request_at)(void* user, unsigned slot, unsigned long long target_ns) = nullptr;
+    void* cu_user = nullptr;
+    /// UI: a tick is between its dispatch and its publish (what is applied now joins the
+    /// frame being built).
+    bool cu_in_tick = false;
+    /// linux-drm-syncobj-v1: the DRM fd timelines are imported on (the KMS card; -1: none)
+    /// and whether the global is offered (`gfx::drm_timeline_supported`).
+    int syncobj_drm_fd = -1;
+    bool syncobj_supported = false;
+    /// The newest composite fence render published (explicit-sync release points).
+    lx::gfx::release_fence_mailbox* release_fences = nullptr;
+    /// tearing-control-v1: whether async page flips can happen on some output at all (the
+    /// hint is stored either way).
+    bool async_flip_capable = false;
+
+    // ── window and session protocols (design-app-compat-capture Part B) ──
+    /// xdg-toplevel-icon-v1's icon store, owned by the compositor (null: the global is not
+    /// advertised). The shell bridge sends its memfds.
+    toplevel_icon_table* icons = nullptr;
+    /// xdg-foreign's handle registry (v1 and v2), owned by the compositor (null: neither
+    /// exporter nor importer is advertised).
+    foreign_registry* foreign = nullptr;
+
+    // ── screen capture (design-app-compat-capture Part D) ──
+    /// What the compositor tells capture (outputs, backend, the render channel); null: no
+    /// capture global is advertised.
+    capture_host* capture = nullptr;
+
+    // ── pointer protocols (design-app-compat-capture Part C) ──
+    /// Moves the pointer to the global point (`x`, `y`) as the compositor moves it after
+    /// motion — clamped onto the outputs, the cursor and pointer focus follow, the focus gets
+    /// `wl_pointer.motion` — but with no relative motion: a pointer lock's cursor hint on
+    /// unlock, a confined pointer brought back inside a new region. UI affinity. Null: no
+    /// warps (constraints still work; the pointer just stays where it is).
+    void (*warp_pointer)(void* user, double x, double y) = nullptr;
+    void* warp_user = nullptr;
+    /// UI. The session is paused (VT switched away), from the start of the pause's input
+    /// teardown to the end of the resume's: no pointer constraint holds meanwhile.
+    bool session_paused = false;
+
     /// Stage shm pixels in the client's own channel order instead of converting them to
     /// RGBA. The Vulkan composite path samples RGBA textures, so it needs the conversion;
     /// the CPU path writes a scanout buffer that already uses the client's order, and a
@@ -651,8 +700,94 @@ void session_lock_send(p0_protocol_context& ctx, const lock_actions& a);
                                    void*& surface_res, lx::surface_id& surface, double& sx,
                                    double& sy);
 
-/// Sends wl_buffer.release for a dmabuf buffer once the render path is done with it.
+/// Screen capture (wire_capture.cpp; design-app-compat-capture Part D), UI affinity. Once per
+/// tick after the outputs published (frame `frame`): constraints follow their sources, frames
+/// are decided and their jobs posted, window sessions publish their capture views, the
+/// privacy indicator follows. `publish` false (outside a tick: outputs changed): window
+/// sessions wait for the next tick to publish.
+void capture_tick(p0_protocol_context& ctx, unsigned frame, bool publish);
+/// The render thread's completions: frame events, fence waits, read-back copy-outs.
+void capture_complete(p0_protocol_context& ctx);
+/// The session lock may have changed state (a lock request curtains every capture at once).
+void capture_lock_check(p0_protocol_context& ctx);
+/// Outputs whose clock must run for a window capture waiting on its window (bit per slot).
+[[nodiscard]] std::uint32_t capture_wanted_outputs(const p0_protocol_context& ctx);
+/// The oldest capture-view frame a posted window job still has to be composited from (-1:
+/// none). UI releases no client buffer tagged with it or later before then: render may not
+/// have taken the job yet, so its low-water mark cannot know of it.
+[[nodiscard]] long long capture_view_floor(const p0_protocol_context& ctx);
+
+/// Sends wl_buffer.release for a dmabuf buffer once the render path is done with it (and
+/// signals its explicit-sync release point after the newest composite fence).
 void release_wl_buffer_resource(void* wl_buffer_resource, void* user_data);
+/// The buffer lifecycle settles a release point it took over from a destroyed wl_buffer:
+/// signalled after the newest composite fence, or only dropped (its client is gone).
+void release_sync_point(unsigned timeline, unsigned long long point, bool signal,
+                        void* user_data);
+
+// ── content-update queue (wire_surface.cpp) ──
+/// The readiness poller's epoll fd (-1 before install): the compositor watches it as one
+/// event-loop source and calls `content_updates_poll` when it is readable.
+[[nodiscard]] int content_updates_poll_fd(p0_protocol_context& ctx);
+void content_updates_poll(p0_protocol_context& ctx);
+/// Tries every queued update (a tick reached the outputs' deadlines). UI affinity.
+void content_updates_try(p0_protocol_context& ctx);
+/// Output `slot` published (latched) frame `frame`: fifo barriers it paces clear and queued
+/// updates waiting on them apply (they join the next frame).
+void content_updates_latched(p0_protocol_context& ctx, unsigned slot, unsigned frame);
+/// Outputs whose clock must keep ticking for a queued fifo update of a shown surface.
+[[nodiscard]] std::uint32_t content_updates_waiting_outputs(p0_protocol_context& ctx);
+/// The earliest commit-timing target queued for output `slot` (0: none).
+[[nodiscard]] unsigned long long content_updates_next_target(p0_protocol_context& ctx,
+                                                             unsigned slot);
+/// Updates queued anywhere (0 normally).
+[[nodiscard]] unsigned content_updates_queued(const p0_protocol_context& ctx);
+/// A surface with a tearing hint of `async` is the topmost content of output `slot`'s
+/// fullscreen window (tearing-control-v1, the policy's input).
+[[nodiscard]] bool surface_wants_async(p0_protocol_context& ctx, lx::surface_id surface);
+/// The wp_content_type_v1 type applied to `surface` (0 none, 1 photo, 2 video, 3 game).
+[[nodiscard]] unsigned surface_content_type(p0_protocol_context& ctx, lx::surface_id surface);
+
+// ── keyboard-shortcuts-inhibit-unstable-v1 (wire_shortcuts_inhibit.cpp) ──
+/// The surface with the keyboard has an inhibitor in effect (the user has not toggled it
+/// off; not while locked — the lock surface has the keyboard then). The shell's key grabs
+/// and taps without `not_inhibitable` are skipped while it holds. UI affinity.
+[[nodiscard]] bool shortcuts_inhibited(p0_protocol_context& ctx);
+/// Super+Escape: the focused surface's inhibitor is toggled (`inactive` / `active`). False
+/// when that surface has none — the key is then not the compositor's.
+bool shortcuts_inhibit_toggle(p0_protocol_context& ctx);
+// ── pointer-constraints, relative-pointer, pointer-gestures (wire_pointer_constraints.cpp,
+//    wire_relative_pointer.cpp, wire_gestures.cpp; design-app-compat-capture Part C) ──
+/// What an active pointer constraint did to a motion.
+enum class pointer_constraint_kind : unsigned char { none, locked, confined };
+/// A motion from the global point (`from_x`, `from_y`) to (`to_x`, `to_y`): with an active
+/// lock the pointer stays (`locked`; the caller restores the position and sends no
+/// `wl_pointer.motion`); with an active confinement `to` is clipped into the region
+/// (`confined`). UI affinity, O(rects) per motion, nothing without an active constraint.
+[[nodiscard]] pointer_constraint_kind pointer_constraint_motion(p0_protocol_context& ctx,
+                                                                double from_x, double from_y,
+                                                                double& to_x, double& to_y);
+/// Re-evaluates which constraint holds (after a motion, a button, a pause or resume, a lock
+/// change, once per tick): activations and deactivations are sent. Pointer and keyboard focus
+/// changes and region commits re-evaluate by themselves. UI affinity; nothing to do — one
+/// pointer test — while no constraint exists.
+void pointer_constraints_update(p0_protocol_context& ctx);
+/// Super+Escape: the active constraint is released (`unlocked` / `unconfined`; a oneshot is
+/// spent, a persistent one re-arms only after the pointer leaves its surface or its window
+/// loses the keyboard). False when none is active — the key is then not the compositor's.
+bool pointer_constraints_release(p0_protocol_context& ctx);
+/// The active constraint's kind (`none` without one).
+[[nodiscard]] pointer_constraint_kind pointer_constraint_active(const p0_protocol_context& ctx);
+/// zwp_relative_pointer_v1.relative_motion to the pointer focus's client (every relative
+/// pointer it made), `time_us` CLOCK_MONOTONIC: accelerated and unaccelerated deltas. True
+/// when something was sent (the caller then owes the pointers a `frame` if no motion
+/// follows). UI affinity, no allocation.
+bool relative_pointer_motion(p0_protocol_context& ctx, unsigned long long time_us, double dx,
+                             double dy, double dx_unaccel, double dy_unaccel);
+/// A touchpad gesture to the gesture objects of the client that had pointer focus when it
+/// began (latched until it ends). UI affinity.
+void pointer_gesture(p0_protocol_context& ctx, const lx::input::gesture_event& event);
+
 /// wlr-output-management (wire_output_management.cpp, ADR 008 Part C). The heads as the
 /// compositor sees them now: every bound zwlr_output_manager_v1 is sent what changed since
 /// the last call (heads introduced or finished, modes, state), then `done` with a new serial.

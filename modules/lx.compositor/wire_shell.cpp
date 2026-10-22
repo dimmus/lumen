@@ -313,6 +313,8 @@ namespace {
 /// The bound shells (normally one), told when the session is ending.
 constexpr unsigned k_max_shell_res = 4;
 wl_resource* shell_resources[k_max_shell_res]{};
+/// zlm_shell_v1.capture_state (v6) as last sent: screen capture in progress.
+bool capture_active = false;
 } // namespace
 
 void shell_send_session_ending() {
@@ -325,6 +327,15 @@ void shell_send_lock_state(unsigned state) {
     for (auto* r : shell_resources)
         if (r && wl_resource_get_version(r) >= ZLM_SHELL_V1_LOCK_STATE_SINCE_VERSION)
             zlm_shell_v1_send_lock_state(r, state);
+}
+
+void shell_send_capture_state(bool active) {
+    if (capture_active == active)
+        return;
+    capture_active = active;
+    for (auto* r : shell_resources)
+        if (r && wl_resource_get_version(r) >= ZLM_SHELL_V1_CAPTURE_STATE_SINCE_VERSION)
+            zlm_shell_v1_send_capture_state(r, active ? 1u : 0u);
 }
 
 bool shell_send_lock_requested(unsigned reason) {
@@ -388,9 +399,12 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
     // "Sent immediately after bind". No optional capability is implemented yet (tiling
     // plugin, workspace drag, explicit sync), so the flags are empty.
     // shell_protocol_version: the zlm family's version this compositor implements (2:
-    // toplevel_flags; 3: request_logout; 4: grab_key; 5: lock_state, lock_requested).
+    // toplevel_flags; 3: request_logout; 4: grab_key; 5: lock_state, lock_requested; 6:
+    // icons, parents, bell, capture_state, not_inhibitable grabs).
     auto* native = static_cast<wl_resource*>(res.native());
-    zlm_shell_v1_send_capabilities(native, 0u, 5u);
+    zlm_shell_v1_send_capabilities(native, 0u, 6u);
+    if (wl_resource_get_version(native) >= ZLM_SHELL_V1_CAPTURE_STATE_SINCE_VERSION)
+        zlm_shell_v1_send_capture_state(native, capture_active ? 1u : 0u);
     // "Sent on bind and on every change": a shell restarted behind a lock learns it at once.
     if (wl_resource_get_version(native) >= ZLM_SHELL_V1_LOCK_STATE_SINCE_VERSION)
         zlm_shell_v1_send_lock_state(

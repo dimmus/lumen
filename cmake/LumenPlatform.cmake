@@ -23,6 +23,11 @@ if(PkgConfig_FOUND)
     pkg_check_modules(LIBEGL QUIET egl glesv2 gbm)
     pkg_check_modules(HARFBUZZ QUIET harfbuzz freetype2 fontconfig)
     pkg_check_modules(LIBSYSTEMD QUIET libsystemd)
+    # lumen-shell's icon theme lookup (task-bar icons): PNG through libpng, SVG through
+    # librsvg (which brings cairo). Both optional: without them the panel falls back to the
+    # window's own pixel buffers (xdg-toplevel-icon-v1) and then to a letter tile.
+    pkg_check_modules(LIBPNG QUIET libpng)
+    pkg_check_modules(LIBRSVG QUIET librsvg-2.0)
 endif()
 
 if(WAYLAND_SCANNER_FOUND)

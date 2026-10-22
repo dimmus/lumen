@@ -80,6 +80,81 @@ module;
 #include "virtual-keyboard-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_VIRTUAL_KEYBOARD 1
 #endif
+#if defined(LUMEN_PROTOCOL_FIFO_V1)
+#include "fifo-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_COMMIT_TIMING_V1)
+#include "commit-timing-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_TEARING_CONTROL_V1)
+#include "tearing-control-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_CONTENT_TYPE_V1)
+#include "content-type-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1)
+#include "single-pixel-buffer-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_ALPHA_MODIFIER_V1)
+#include "alpha-modifier-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_LINUX_DRM_SYNCOBJ_V1)
+#include "linux-drm-syncobj-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_DIALOG_V1)
+#include "xdg-dialog-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1)
+#include "xdg-toplevel-icon-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1)
+#include "xdg-system-bell-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_FOREIGN_UNSTABLE_V2)
+#include "xdg-foreign-unstable-v2-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_FOREIGN_UNSTABLE_V1)
+// v1's exporter request is named `export`, a C++ keyword (see wire_foreign.cpp).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#define export export_
+#include "xdg-foreign-unstable-v1-server-protocol.h"
+#undef export
+#pragma clang diagnostic pop
+#endif
+#if defined(LUMEN_PROTOCOL_KEYBOARD_SHORTCUTS_INHIBIT_UNSTABLE_V1)
+#include "keyboard-shortcuts-inhibit-unstable-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1)
+#include "ext-data-control-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_WLR_DATA_CONTROL_UNSTABLE_V1)
+#include "wlr-data-control-unstable-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_SECURITY_CONTEXT_V1)
+#include "security-context-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_POINTER_CONSTRAINTS_UNSTABLE_V1)
+#include "pointer-constraints-unstable-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_RELATIVE_POINTER_UNSTABLE_V1)
+#include "relative-pointer-unstable-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_POINTER_GESTURES_UNSTABLE_V1)
+#include "pointer-gestures-unstable-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1)
+#include "ext-foreign-toplevel-list-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_EXT_IMAGE_CAPTURE_SOURCE_V1)
+#include "ext-image-capture-source-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_EXT_IMAGE_COPY_CAPTURE_V1)
+#include "ext-image-copy-capture-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1)
+#include "wlr-screencopy-unstable-v1-server-protocol.h"
+#endif
 #endif
 
 module lx.compositor;
@@ -93,6 +168,8 @@ import :surface;
 import :surface_tree;
 import :toplevel;
 import :output;
+import :content_update;
+import :capture_engine;
 import :wire;
 
 #if defined(LUMEN_HAS_WAYLAND)
@@ -100,6 +177,31 @@ import :wire;
 namespace lx::compositor::p0 {
 
 p0_protocol_context* g_p0_ctx = nullptr;
+
+namespace {
+
+/// The router's one keyboard-focus-surface hook, shared: the text-input relay follows the
+/// focus, and keyboard-shortcuts-inhibit decides which inhibitor is in effect.
+void focus_surface_changed(void* user, void* surface, void* client, void* destroyed) {
+    text_input_focus_hook(user, surface, client, destroyed);
+    shortcuts_inhibit_focus(destroyed ? nullptr : surface);
+    // A pointer constraint holds only while its window has the keyboard.
+    pointer_constraints_reevaluate();
+}
+
+/// The router's pointer-focus hook: a constraint holds only on the pointer-focus surface.
+void pointer_focus_changed(void*) { pointer_constraints_reevaluate(); }
+
+/// The window manager's hook before a toplevel record goes: what the wire keyed by it.
+void wire_toplevel_destroyed(void* user, lx::toplevel_id id) {
+    auto* ctx = static_cast<p0_protocol_context*>(user);
+    if (ctx && ctx->toplevels)
+        if (auto* rec = ctx->toplevels->find_mut(id))
+            toplevel_icon_released(*rec);
+    foreign_toplevel_destroyed(id);
+}
+
+} // namespace
 
 void install_core(p0_protocol_context& ctx) {
     g_p0_ctx = &ctx;
@@ -173,6 +275,7 @@ void install_core(p0_protocol_context& ctx) {
         ctx.notify_lock_state = &shell_send_lock_state;
         ctx.notify_lock_requested = &shell_send_lock_requested;
         ops.last_user_serial = &wm_last_user_serial;
+        ops.toplevel_destroyed = &wire_toplevel_destroyed;
         ops.user = &ctx;
         ctx.wm->set_protocol_ops(ops);
     }
@@ -199,8 +302,10 @@ void install_core(p0_protocol_context& ctx) {
                             .privileged = false,
                             .interface_desc = &xdg_wm_base_interface},
                            &bind_xdg_wm_base);
+    if (ctx.shell)
+        ctx.shell->set_icons(ctx.icons);
     ctx.server->add_global({.interface_name = "zlm_shell_v1",
-                            .version = 5,
+                            .version = 6,
                             .privileged = true,
                             .interface_desc = &zlm_shell_v1_interface},
                            bind_shell);
@@ -339,10 +444,79 @@ void install_core(p0_protocol_context& ctx) {
                                 .interface_desc = &ext_session_lock_manager_v1_interface},
                                &bind_session_lock_manager);
 #endif
+    // The commit-path protocols (design-app-compat-capture Part A): all ride the
+    // content-update queue, so they are offered together; every client, sandboxed or not,
+    // may use them.
+    if (cu_poll_fd() < 0)
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.surface",
+                                        "readiness poller unavailable: fences are not waited "
+                                        "for before applying content updates");
+#if defined(LUMEN_PROTOCOL_FIFO_V1)
+    // fifo-v1: one update per refresh for a shown surface (Mesa's Vulkan FIFO present).
+    ctx.server->add_global({.interface_name = "wp_fifo_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &wp_fifo_manager_v1_interface},
+                           &bind_fifo_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_COMMIT_TIMING_V1)
+    // commit-timing-v1: never shown a refresh before its target, the clock armed for it.
+    ctx.server->add_global({.interface_name = "wp_commit_timing_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &wp_commit_timing_manager_v1_interface},
+                           &bind_commit_timing_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_TEARING_CONTROL_V1)
+    // tearing-control-v1: the hint is kept on every host; async flips only where KMS has
+    // them (the output policy, `allow_async`).
+    ctx.server->add_global({.interface_name = "wp_tearing_control_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &wp_tearing_control_manager_v1_interface},
+                           &bind_tearing_control_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_CONTENT_TYPE_V1)
+    ctx.server->add_global({.interface_name = "wp_content_type_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &wp_content_type_manager_v1_interface},
+                           &bind_content_type_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1)
+    // Solid-colour buffers drawn without a texture.
+    ctx.server->add_global({.interface_name = "wp_single_pixel_buffer_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &wp_single_pixel_buffer_manager_v1_interface},
+                           &bind_single_pixel_buffer_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_ALPHA_MODIFIER_V1)
+    ctx.server->add_global({.interface_name = "wp_alpha_modifier_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &wp_alpha_modifier_v1_interface},
+                           &bind_alpha_modifier);
+#endif
+#if defined(LUMEN_PROTOCOL_LINUX_DRM_SYNCOBJ_V1)
+    // Explicit sync: only where a client can use it correctly (timeline syncobjs, the
+    // eventfd ioctl, a composite that exports its completion) — wlroots and Mutter hide it
+    // otherwise. Not on vmwgfx.
+    if (ctx.syncobj_supported && ctx.syncobj_drm_fd >= 0)
+        ctx.server->add_global({.interface_name = "wp_linux_drm_syncobj_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &wp_linux_drm_syncobj_manager_v1_interface},
+                               &bind_syncobj_manager);
+#endif
     // text-input-v3 v2 + input-method-v2 + virtual-keyboard-v1: the focused client's text
     // inputs relayed to the seat's one input method (fcitx5, ibus), its candidate popups at
     // the cursor, its keyboard grab and its forwarded keys.
     install_text_input(ctx);
+    if (ctx.input) {
+        ctx.input->set_focus_surface_hook(&focus_surface_changed, &ctx);
+        ctx.input->set_pointer_focus_hook(&pointer_focus_changed, &ctx);
+    }
 #if defined(LUMEN_HAS_TEXT_INPUT)
     if (ctx.text_input)
         ctx.server->add_global({.interface_name = "zwp_text_input_manager_v3",
@@ -369,6 +543,189 @@ void install_core(p0_protocol_context& ctx) {
                                 .interface_desc = &zwp_virtual_keyboard_manager_v1_interface},
                                &bind_virtual_keyboard_manager);
 #endif
+
+    // ── Window and session protocols (design-app-compat-capture Part B). Dialogs, icons,
+    //    the bell, xdg-foreign and shortcuts inhibition are for every client, sandboxed or
+    //    not (a sandboxed app exports its window for its portal dialogs); data control and
+    //    the security-context manager are session-wide and hidden from sandboxed clients.
+#if defined(LUMEN_PROTOCOL_XDG_DIALOG_V1) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+    // xdg-dialog-v1: modal dialogs block their parent (window_manager::set_modal).
+    if (ctx.wm)
+        ctx.server->add_global({.interface_name = "xdg_wm_dialog_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &xdg_wm_dialog_v1_interface},
+                               &bind_wm_dialog);
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_TOPLEVEL_ICON_V1) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+    // xdg-toplevel-icon-v1: icons snapshotted into sealed memfds for the shell's panel.
+    if (ctx.icons)
+        ctx.server->add_global({.interface_name = "xdg_toplevel_icon_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &xdg_toplevel_icon_manager_v1_interface},
+                               &bind_toplevel_icon_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_SYSTEM_BELL_V1)
+    // xdg-system-bell-v1: forwarded to the shell (a visual bell), 4 per second per client.
+    if (ctx.shell)
+        ctx.server->add_global({.interface_name = "xdg_system_bell_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &xdg_system_bell_v1_interface},
+                               &bind_system_bell);
+#endif
+#if defined(LUMEN_HAS_PROTOCOL_GLUE)
+    // xdg-foreign v2 and v1 over one registry: portals parent their dialogs onto app windows.
+#if defined(LUMEN_PROTOCOL_XDG_FOREIGN_UNSTABLE_V2)
+    if (ctx.foreign && ctx.wm) {
+        ctx.server->add_global({.interface_name = "zxdg_exporter_v2",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zxdg_exporter_v2_interface},
+                               &bind_exporter_v2);
+        ctx.server->add_global({.interface_name = "zxdg_importer_v2",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zxdg_importer_v2_interface},
+                               &bind_importer_v2);
+    }
+#endif
+#if defined(LUMEN_PROTOCOL_XDG_FOREIGN_UNSTABLE_V1)
+    if (ctx.foreign && ctx.wm) {
+        ctx.server->add_global({.interface_name = "zxdg_exporter_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zxdg_exporter_v1_interface},
+                               &bind_exporter_v1);
+        ctx.server->add_global({.interface_name = "zxdg_importer_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zxdg_importer_v1_interface},
+                               &bind_importer_v1);
+    }
+#endif
+#endif
+#if defined(LUMEN_PROTOCOL_KEYBOARD_SHORTCUTS_INHIBIT_UNSTABLE_V1)
+    // keyboard-shortcuts-inhibit: granted while the surface has the keyboard; VT switching,
+    // logout, the lock and Super+Escape are never inhibited.
+    if (ctx.input)
+        ctx.server->add_global(
+            {.interface_name = "zwp_keyboard_shortcuts_inhibit_manager_v1",
+             .version = 1,
+             .privileged = false,
+             .interface_desc = &zwp_keyboard_shortcuts_inhibit_manager_v1_interface},
+            &bind_shortcuts_inhibit_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1)
+    // ext-data-control-v1 (and wlr v2 below): clipboard managers, wl-clipboard, cliphist.
+    ctx.server->add_global({.interface_name = "ext_data_control_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .deny_sandboxed = true,
+                            .interface_desc = &ext_data_control_manager_v1_interface},
+                           &bind_ext_data_control_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_WLR_DATA_CONTROL_UNSTABLE_V1)
+    ctx.server->add_global({.interface_name = "zwlr_data_control_manager_v1",
+                            .version = 2,
+                            .privileged = false,
+                            .deny_sandboxed = true,
+                            .interface_desc = &zwlr_data_control_manager_v1_interface},
+                           &bind_wlr_data_control_manager);
+#endif
+    // ── Pointer protocols (design-app-compat-capture Part C): for every client, sandboxed
+    //    or not — a game or a VM viewer in a sandbox locks the pointer like any other.
+#if defined(LUMEN_PROTOCOL_POINTER_CONSTRAINTS_UNSTABLE_V1)
+    // pointer-constraints: lock and confine while the window has both foci; Super+Escape
+    // releases.
+    if (ctx.input && ctx.seat)
+        ctx.server->add_global({.interface_name = "zwp_pointer_constraints_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zwp_pointer_constraints_v1_interface},
+                               &bind_pointer_constraints);
+#endif
+#if defined(LUMEN_PROTOCOL_RELATIVE_POINTER_UNSTABLE_V1)
+    // relative-pointer: accelerated and unaccelerated deltas, also while locked.
+    if (ctx.input)
+        ctx.server->add_global({.interface_name = "zwp_relative_pointer_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .interface_desc = &zwp_relative_pointer_manager_v1_interface},
+                               &bind_relative_pointer_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_POINTER_GESTURES_UNSTABLE_V1)
+    // pointer-gestures v3: libinput swipe, pinch and hold to the pointer focus.
+    if (ctx.input)
+        ctx.server->add_global({.interface_name = "zwp_pointer_gestures_v1",
+                                .version = 3,
+                                .privileged = false,
+                                .interface_desc = &zwp_pointer_gestures_v1_interface},
+                               &bind_pointer_gestures);
+#endif
+    // ── Screen capture (design-app-compat-capture Part D): session-wide, hidden from
+    //    sandboxed clients (SC2) — they share their screen through the portal.
+    install_toplevel_observer(ctx);
+#if defined(LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1)
+    // ext-foreign-toplevel-list: the window list capture pickers and `grim -T` use.
+    if (ctx.toplevels && ctx.shell)
+        ctx.server->add_global({.interface_name = "ext_foreign_toplevel_list_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .deny_sandboxed = true,
+                                .interface_desc = &ext_foreign_toplevel_list_v1_interface},
+                               &bind_foreign_toplevel_list);
+#endif
+#if defined(LUMEN_PROTOCOL_EXT_IMAGE_CAPTURE_SOURCE_V1) &&                                    \
+    defined(LUMEN_PROTOCOL_EXT_IMAGE_COPY_CAPTURE_V1)
+    // ext-image-capture-source + ext-image-copy-capture: outputs and windows into client
+    // buffers, one copy from the composited frame (wire_capture.cpp).
+    if (ctx.capture && ctx.capture->backend != capture_backend::none) {
+        ctx.server->add_global(
+            {.interface_name = "ext_output_image_capture_source_manager_v1",
+             .version = 1,
+             .privileged = false,
+             .deny_sandboxed = true,
+             .interface_desc = &ext_output_image_capture_source_manager_v1_interface},
+            &bind_output_capture_source_manager);
+#if defined(LUMEN_PROTOCOL_EXT_FOREIGN_TOPLEVEL_LIST_V1)
+        if (ctx.capture->backend != capture_backend::vulkan)
+            ctx.server->add_global(
+                {.interface_name = "ext_foreign_toplevel_image_capture_source_manager_v1",
+                 .version = 1,
+                 .privileged = false,
+                 .deny_sandboxed = true,
+                 .interface_desc = &ext_foreign_toplevel_image_capture_source_manager_v1_interface},
+                &bind_toplevel_capture_source_manager);
+#endif
+        ctx.server->add_global({.interface_name = "ext_image_copy_capture_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .deny_sandboxed = true,
+                                .interface_desc = &ext_image_copy_capture_manager_v1_interface},
+                               &bind_image_copy_capture_manager);
+#if defined(LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1)
+        // wlr-screencopy v3: the same capture core for tools that predate it (wf-recorder).
+        ctx.server->add_global({.interface_name = "zwlr_screencopy_manager_v1",
+                                .version = 3,
+                                .privileged = false,
+                                .deny_sandboxed = true,
+                                .interface_desc = &zwlr_screencopy_manager_v1_interface},
+                               &bind_screencopy_manager);
+#endif
+    }
+#endif
+#if defined(LUMEN_PROTOCOL_SECURITY_CONTEXT_V1)
+    // security-context-v1: Flatpak's sockets; their clients are sandboxed (the filter above
+    // hides every deny_sandboxed global from them). Hidden from them too: no nesting.
+    ctx.server->add_global({.interface_name = "wp_security_context_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .deny_sandboxed = true,
+                            .interface_desc = &wp_security_context_manager_v1_interface},
+                           &bind_security_context_manager);
+#endif
 }
 
 } // namespace lx::compositor::p0
@@ -384,6 +741,7 @@ lx::result<void> lx::compositor::install_p0_protocols(p0_protocol_context& ctx) 
     }
     p0::install_core(ctx);
     p0::bind_shm_direct(ctx);
+    p0::bind_capture_guards(ctx);
     return {};
 #else
     (void)ctx;
@@ -430,6 +788,69 @@ void lx::compositor::fire_output_frame_callbacks(p0_protocol_context& ctx, unsig
 #endif
 }
 
+int lx::compositor::content_updates_poll_fd(p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    return p0::cu_poll_fd();
+#else
+    return -1;
+#endif
+}
+
+void lx::compositor::content_updates_poll(p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    p0::cu_poll();
+#endif
+}
+
+void lx::compositor::content_updates_try(p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    p0::cu_try_all("tick");
+#endif
+}
+
+void lx::compositor::content_updates_latched(p0_protocol_context& ctx, unsigned slot,
+                                             unsigned frame) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    p0::cu_after_latch(slot, frame);
+#else
+    (void)slot;
+    (void)frame;
+#endif
+}
+
+std::uint32_t lx::compositor::content_updates_waiting_outputs(p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    return p0::cu_waiting_outputs();
+#else
+    return 0;
+#endif
+}
+
+unsigned long long lx::compositor::content_updates_next_target(p0_protocol_context& ctx,
+                                                               unsigned slot) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    return p0::cu_earliest_target(slot);
+#else
+    (void)slot;
+    return 0;
+#endif
+}
+
+unsigned lx::compositor::content_updates_queued(const p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    return p0::cu_queue().used_count();
+#else
+    return 0;
+#endif
+}
+
 bool lx::compositor::frame_callbacks_throttled(const p0_protocol_context& ctx) {
     (void)ctx;
 #if defined(LUMEN_HAS_WAYLAND)
@@ -459,9 +880,24 @@ std::uint32_t lx::compositor::frame_callbacks_pending_outputs(const p0_protocol_
 
 void lx::compositor::release_wl_buffer_resource(void* resource, void*) {
 #if defined(LUMEN_HAS_WAYLAND)
-    if (resource)
-        wl_buffer_send_release(static_cast<wl_resource*>(resource));
+    if (!resource)
+        return;
+    // Explicit sync first: the release point carries the composite fence, so a client
+    // waiting on it rather than on the event still never reuses a buffer the GPU reads.
+    p0::syncobj_buffer_released(static_cast<wl_resource*>(resource));
+    wl_buffer_send_release(static_cast<wl_resource*>(resource));
 #else
     (void)resource;
+#endif
+}
+
+void lx::compositor::release_sync_point(unsigned timeline, unsigned long long point,
+                                        bool signal, void*) {
+#if defined(LUMEN_HAS_WAYLAND)
+    p0::syncobj_point_settle(timeline, point, signal);
+#else
+    (void)timeline;
+    (void)point;
+    (void)signal;
 #endif
 }

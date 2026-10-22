@@ -22,6 +22,12 @@ module;
 //   with a per-client cap: running out there only withholds that client's selection.
 // - receive is forwarded only for a type the source offered (Smithay); the fd is always
 //   closed here after marshalling (libwayland dups it into the message).
+// - Data control (ext-data-control-v1, zwlr-data-control v2; wire_data_control.cpp) is a
+//   third kind of device and source on the same model: any source kind may own either
+//   selection (each source carries its own send/cancelled ops), data-control devices hear
+//   of every change of both selections whatever has the keyboard, and their offers do not
+//   go inert on focus changes — a clipboard manager keeps the selection alive after its
+//   owner exits by taking it over.
 // UI affinity only. Allocation only where a client request creates an object.
 
 #ifndef _GNU_SOURCE
@@ -158,33 +164,57 @@ void warn_offer_table_full(wl_client* client) {
     lx::trace::logger::global().log(lx::trace::level::warn, k_category, line);
 }
 
-/// A new offer of `src` on `dev`, announced (data_offer + every mime type). Null when no
-/// slot is left (warned once per client) or, with `no_memory` set, when the resource could
-/// not be created (no_memory posted).
-xfer_offer* create_offer(xfer_device* dev, xfer_source* src, offer_use use, bool& no_memory) {
+/// The source's own marshalling: a data-control source owning the clipboard is sent
+/// ext_data_control_source_v1.send, not wl_data_source.send.
+const xfer_family_ops& family_ops(xfer_family f) { return xfer_ops[static_cast<unsigned>(f)]; }
+
+void source_send(xfer_source* src, const char* mime, int32_t fd) {
+    if (src->ops && src->ops->send_send)
+        src->ops->send_send(src->resource, mime, fd);
+    else if (!src->ops && family_ops(src->family).send_send)
+        family_ops(src->family).send_send(src->resource, mime, fd);
+}
+
+void source_cancel(xfer_source* src) {
+    if (src->ops && src->ops->send_cancelled)
+        src->ops->send_cancelled(src->resource);
+    else if (!src->ops && family_ops(src->family).send_cancelled)
+        family_ops(src->family).send_cancelled(src->resource);
+}
+
+/// A new offer of `src` for the device `dev_res` of `client`, announced with `ops`
+/// (data_offer + every mime type). Null when no slot is left (warned once per client) or,
+/// with `no_memory` set, when the resource could not be created (no_memory posted).
+xfer_offer* create_offer_with(wl_client* client, wl_resource* dev_res, const xfer_family_ops& ops,
+                              xfer_family family, xfer_source* src, offer_use use,
+                              bool& no_memory) {
     no_memory = false;
-    const xfer_family_ops& ops = xfer_ops[static_cast<unsigned>(dev->family)];
-    xfer_offer* o = alloc_offer(dev->client);
+    xfer_offer* o = alloc_offer(client);
     if (!o) {
-        warn_offer_table_full(dev->client);
+        warn_offer_table_full(client);
         return nullptr;
     }
-    o->resource = wl_resource_create(dev->client, ops.offer_interface,
-                                     wl_resource_get_version(dev->resource), 0);
+    o->resource = wl_resource_create(client, ops.offer_interface,
+                                     wl_resource_get_version(dev_res), 0);
     if (!o->resource) {
         *o = {};
-        wl_client_post_no_memory(dev->client);
+        wl_client_post_no_memory(client);
         no_memory = true;
         return nullptr;
     }
-    o->family = dev->family;
+    o->family = family;
     o->use = use;
     wl_resource_set_implementation(o->resource, ops.offer_impl, o, offer_destroy_resource);
     link_offer(src, o);
-    ops.send_data_offer(dev->resource, o->resource);
+    ops.send_data_offer(dev_res, o->resource);
     for (unsigned i = 0; i < src->mimes.count(); ++i)
         ops.send_offer(o->resource, src->mimes.at(i));
     return o;
+}
+
+xfer_offer* create_offer(xfer_device* dev, xfer_source* src, offer_use use, bool& no_memory) {
+    return create_offer_with(dev->client, dev->resource, family_ops(dev->family), dev->family,
+                             src, use, no_memory);
 }
 
 /// Sends the current selection of the device's family to it: a fresh offer with every mime
@@ -248,6 +278,7 @@ void source_destroy_resource(wl_resource* r) {
             sel_log(line);
         }
         deliver_to_client(s->family, focus_client, "clear");
+        data_control_selection_changed(s->family);
     }
     delete s;
 }
@@ -279,6 +310,53 @@ void log_reject(xfer_family f, wl_client* client, uint32_t serial, const char* w
 xfer_offer* xfer_create_offer(xfer_device* dev, xfer_source* src, offer_use use) {
     bool no_memory = false;
     return dev && src ? create_offer(dev, src, use, no_memory) : nullptr;
+}
+
+xfer_offer* xfer_create_control_offer(wl_client* client, wl_resource* device_res,
+                                      const xfer_family_ops& ops, xfer_family family,
+                                      xfer_source* source) {
+    bool no_memory = false;
+    return client && device_res && source
+               ? create_offer_with(client, device_res, ops, family, source, offer_use::control,
+                                   no_memory)
+               : nullptr;
+}
+
+xfer_source* xfer_selection_source(xfer_family f) {
+    xfer_source* src = selection[static_cast<unsigned>(f)].source;
+    return src && !client_dying(src->client) ? src : nullptr;
+}
+
+void xfer_set_selection_control(xfer_family f, xfer_source* src) {
+    auto& sel = selection[static_cast<unsigned>(f)];
+    if (src) {
+        src->used = true;
+        src->family = f;
+    }
+    xfer_source* old = sel.source;
+    if (old && old != src) {
+        inert_offers_of(old);
+        old->role = source_role::none;
+        if (!client_dying(old->client))
+            source_cancel(old);
+    }
+    // The serial stays: a clipboard manager re-setting the selection must not make the next
+    // Ctrl+C of an application look stale (wlroots takes a fresh display serial here, which
+    // then rejects an application's older input serial).
+    sel.source = src;
+    sel.ever_set = sel.ever_set || src != nullptr;
+    if (src)
+        src->role = source_role::selection;
+    if (surface_debug()) {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+                      "selection set kind=%s client=%u source=%u mimes=%u by=data-control",
+                      kind_name(f), src ? wire_client_id(src->client) : 0u,
+                      res_id(src ? src->resource : nullptr), src ? src->mimes.count() : 0u);
+        sel_log(line);
+    }
+    deliver_to_client(f, focus_client, "set");
+    data_control_selection_changed(f);
 }
 
 void xfer_inert_offer(xfer_offer* o) {
@@ -447,8 +525,8 @@ void xfer_set_selection(xfer_device* dev, wl_resource* source_res, uint32_t seri
     if (old && old != src) {
         inert_offers_of(old);
         old->role = source_role::none;
-        if (!client_dying(old->client) && ops.send_cancelled)
-            ops.send_cancelled(old->resource);
+        if (!client_dying(old->client))
+            source_cancel(old);
     }
     sel.source = src;
     sel.serial = serial;
@@ -468,6 +546,7 @@ void xfer_set_selection(xfer_device* dev, wl_resource* source_res, uint32_t seri
         sel_log(line);
     }
     deliver_to_client(f, focus_client, "set");
+    data_control_selection_changed(f);
 }
 
 void xfer_offer_receive(xfer_offer* o, const char* mime, int32_t fd) {
@@ -482,7 +561,7 @@ void xfer_offer_receive(xfer_offer* o, const char* mime, int32_t fd) {
     else if (client_dying(src->client))
         why = "source-gone";
     if (!why)
-        xfer_ops[static_cast<unsigned>(o->family)].send_send(src->resource, mime, fd);
+        source_send(src, mime, fd);
     // Marshalling dup'ed it (or nothing was sent): the compositor's copy is closed either way.
     ::close(fd);
     if (surface_debug()) {
@@ -536,6 +615,7 @@ void wire_client_destroyed(void*, unsigned client_id, void* client) {
     if (focus_client == client)
         focus_client = nullptr;
     dnd_client_destroyed(static_cast<wl_client*>(client));
+    pointer_gestures_client_destroyed(static_cast<wl_client*>(client));
 }
 
 } // namespace lx::compositor::p0

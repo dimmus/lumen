@@ -77,6 +77,9 @@ struct wm_protocol_ops {
     /// The newest key or button press serial delivered to the client owning `surface` (a
     /// `wl_surface` resource); 0 when none. xdg-activation's user-time rule reads it.
     unsigned (*last_user_serial)(void* user, void* surface) = nullptr;
+    /// The record of `id` is about to go (any of its three objects was destroyed): what the
+    /// wire keyed by it lets go — its icon references, its xdg-foreign exports.
+    void (*toplevel_destroyed)(void* user, lx::toplevel_id id) = nullptr;
     void* user = nullptr;
 };
 
@@ -270,8 +273,16 @@ public:
     /// over a black backdrop, frame hidden. Unset restores the geometry and the maximized
     /// state it had.
     void set_fullscreen(lx::toplevel_id id, bool on, int output, const char* source);
-    /// xdg_toplevel.set_parent: the child is placed on its parent's output.
+    /// xdg_toplevel.set_parent, and xdg-foreign's set_parent_of across clients: the child is
+    /// placed on its parent's output, centred on it at its first map, and the shell is told.
     void set_parent(lx::toplevel_id id, lx::toplevel_id parent);
+    /// xdg_dialog_v1.set_modal / unset_modal (and the dialog object going), effective at once
+    /// (Mutter). A modal child of a mapped parent stays above it, and the parent never takes
+    /// the keyboard while it has one: focus, activation and clicks go to the dialog.
+    void set_modal(lx::toplevel_id id, bool modal);
+    /// The topmost mapped window that blocks `id` — a modal child, or a modal child of one
+    /// (to any depth ≤ 8) — or a null id.
+    [[nodiscard]] lx::toplevel_id modal_blocker(lx::toplevel_id id) const;
     /// Sends every desired configure the single-in-flight rule allows.
     void flush_configures(lx::runtime::clock_time now_ns);
 
@@ -515,6 +526,12 @@ private:
     void sync_backdrops();
     /// The placement output of a window about to get its initial configure.
     [[nodiscard]] int placement_output(const toplevel_record& rec) const;
+    /// Whether `rec` is modal over `ancestor` through a chain of effectively modal links.
+    [[nodiscard]] bool blocks(const toplevel_record& rec, lx::toplevel_id ancestor) const;
+    /// After `id` was restacked: the windows modal over it go right above it, in their order.
+    void keep_modals_above(lx::toplevel_id id);
+    /// The modal state the shell sees of `id`'s children changed (its mapping, or theirs).
+    void emit_children_state(lx::toplevel_id id);
 
     toplevel_manager* toplevels_ = nullptr;
     surface_manager* surfaces_ = nullptr;
@@ -1251,9 +1268,114 @@ int lx::compositor::window_manager::placement_output(const toplevel_record& rec)
 
 void lx::compositor::window_manager::set_parent(lx::toplevel_id id, lx::toplevel_id parent) {
     auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
-    if (!rec)
+    if (!rec || rec->parent == parent)
         return;
+    const bool was_modal = effective_modal(*toplevels_, *rec);
     rec->parent = parent;
+    const bool modal = effective_modal(*toplevels_, *rec);
+    if (wm_debug_enabled()) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "parent id=%llu parent=%llu modal=%d", id.id(),
+                      parent.id(), modal ? 1 : 0);
+        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    }
+    if (!rec->mapped)
+        return;
+    if (shell_) {
+        shell_->emit_toplevel_parent(*rec);
+        if (was_modal != modal)
+            shell_->emit_toplevel_state(*rec);
+    }
+    if (modal) {
+        keep_modals_above(parent);
+        if (const lx::toplevel_id b = modal_blocker(keyboard_focus_); b)
+            set_keyboard_focus(b);
+    }
+}
+
+void lx::compositor::window_manager::set_modal(lx::toplevel_id id, bool modal) {
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec || rec->modal == modal)
+        return;
+    const bool was = effective_modal(*toplevels_, *rec);
+    rec->modal = modal;
+    const bool now = effective_modal(*toplevels_, *rec);
+    if (wm_debug_enabled()) {
+        char line[96];
+        std::snprintf(line, sizeof(line), "modal id=%llu on=%d effective=%d", id.id(),
+                      modal ? 1 : 0, now ? 1 : 0);
+        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+    }
+    if (was == now)
+        return;
+    if (shell_)
+        shell_->emit_toplevel_state(*rec);
+    if (now) {
+        // Mutter: a dialog that becomes modal over the focused window takes the keyboard.
+        keep_modals_above(rec->parent);
+        if (const lx::toplevel_id b = modal_blocker(keyboard_focus_); b)
+            set_keyboard_focus(b);
+    }
+}
+
+bool lx::compositor::window_manager::blocks(const toplevel_record& rec,
+                                            lx::toplevel_id ancestor) const {
+    const toplevel_record* at = &rec;
+    for (unsigned depth = 0; at && depth < 8; ++depth) {
+        if (!effective_modal(*toplevels_, *at))
+            return false;
+        if (at->parent == ancestor)
+            return true;
+        at = toplevels_->find(at->parent);
+    }
+    return false;
+}
+
+lx::toplevel_id lx::compositor::window_manager::modal_blocker(lx::toplevel_id id) const {
+    lx::toplevel_id found{};
+    if (!toplevels_ || !id)
+        return found;
+    toplevels_->for_each_top_down([&](const toplevel_record& r) {
+        if (r.id != id && r.modal && blocks(r, id)) {
+            found = r.id;
+            return false;
+        }
+        return true;
+    });
+    return found;
+}
+
+void lx::compositor::window_manager::keep_modals_above(lx::toplevel_id id) {
+    if (!toplevels_ || !id || toplevels_->stacking_index(id) == ~0u)
+        return;
+    // Bottom-up, so the dialogs keep their order among themselves; fixed storage.
+    lx::toplevel_id above[16];
+    unsigned n = 0;
+    toplevels_->for_each_bottom_up([&](const toplevel_record& r) {
+        if (n < 16 && r.id != id && r.modal && blocks(r, id))
+            above[n++] = r.id;
+    });
+    for (unsigned j = 0; j < n; ++j) {
+        const unsigned at = toplevels_->stacking_index(id);
+        const unsigned cur = toplevels_->stacking_index(above[j]);
+        // Taking a window from below `id` shifts `id` (and those already placed) down one.
+        const unsigned want = cur < at ? at + j : at + 1 + j;
+        if (cur != want && toplevels_->move_to(above[j], want))
+            if (const auto* r = toplevels_->find(above[j]))
+                sync_node_stacking(*r, "modal-above");
+    }
+}
+
+void lx::compositor::window_manager::emit_children_state(lx::toplevel_id id) {
+    if (!shell_ || !toplevels_ || !id)
+        return;
+    toplevels_->for_each_bottom_up([&](const toplevel_record& r) {
+        if (r.parent != id)
+            return;
+        shell_->emit_toplevel_parent(r);
+        if (r.modal)
+            shell_->emit_toplevel_state(r);
+    });
 }
 
 void lx::compositor::window_manager::on_output_changed() {
@@ -1964,7 +2086,17 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
     const frame_extents ext = extents_of(rec);
     if (!placed) {
         const lx::rect2i frame0 = frame_rect(rec.geometry, ext);
-        lx::point2i p = place_new_window(area, {frame0.width, frame0.height}, existing, n);
+        // A child (a dialog, a transient) is centred on its parent's frame, clamped into the
+        // usable area of the output it maps on (the parent's): Mutter and KWin place
+        // transients so. Anything else cascades.
+        const toplevel_record* parent = rec.parent ? toplevels_->find(rec.parent) : nullptr;
+        lx::point2i p{};
+        if (parent && parent->mapped) {
+            const lx::rect2i pf = frame_rect(parent->geometry, extents_of(*parent));
+            p = {pf.x + (pf.width - frame0.width) / 2, pf.y + (pf.height - frame0.height) / 2};
+        } else {
+            p = place_new_window(area, {frame0.width, frame0.height}, existing, n);
+        }
         p = constrain_on_output(area, {p.x, p.y, frame0.width, frame0.height});
         rec.geometry.x = p.x + ext.left;
         rec.geometry.y = p.y + ext.top;
@@ -2003,6 +2135,9 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
     const bool take_focus = decide_activation_at_map(rec);
     if (shell_)
         shell_->emit_toplevel_created(rec);
+    // Children mapped before it now have a mapped parent: the shell hears of the relation,
+    // and a modal one starts blocking.
+    emit_children_state(id);
     if (take_focus) {
         // Placeholder policy until the shell drives focus: a newly mapped window takes the
         // keyboard. The pointer is a different matter — it enters the window only if the
@@ -2014,6 +2149,12 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
         // KWin), not on top of what the user is working in.
         (void)restack(id, below);
     }
+    // A modal dialog stays above its parent and has the keyboard whenever the parent would
+    // (also when focus-stealing prevention refused it the keyboard as a new window).
+    if (const auto* now = toplevels_->find(id); now && effective_modal(*toplevels_, *now))
+        keep_modals_above(now->parent);
+    if (const lx::toplevel_id b = modal_blocker(keyboard_focus_); b)
+        set_keyboard_focus(b);
     rehit_pending_ = true;
     stacking_dirty_ = true;
 }
@@ -2054,6 +2195,25 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     }
     if (shell_)
         shell_->emit_toplevel_destroyed(*rec);
+    // xdg-shell: "If the parent is unmapped then its children are managed as though the
+    // parent of the now-unmapped parent has become the parent of this surface" (wlroots
+    // reparents for good, as here). A modal child of it blocks nothing now.
+    {
+        const lx::toplevel_id grandparent = rec->parent;
+        toplevels_->for_each_mut([&](toplevel_record& child) {
+            if (child.parent != id)
+                return;
+            child.parent = grandparent;
+            if (shell_ && child.mapped) {
+                shell_->emit_toplevel_parent(child);
+                if (child.modal)
+                    shell_->emit_toplevel_state(child);
+            }
+        });
+        rec = toplevels_->find_mut(id);
+        if (!rec)
+            return;
+    }
 
     {
         char line[128];
@@ -2110,6 +2270,8 @@ void lx::compositor::window_manager::on_destroyed(lx::toplevel_id id) {
                 cursor_->clear_hover_shape();
         }
     }
+    if (ops_.toplevel_destroyed)
+        ops_.toplevel_destroyed(ops_.user, id);
     toplevels_->destroy(id);
 }
 
@@ -2186,7 +2348,20 @@ void lx::compositor::window_manager::flush_configures(lx::runtime::clock_time no
 }
 
 void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
-    if (!toplevels_ || id == keyboard_focus_)
+    if (!toplevels_)
+        return;
+    // xdg-dialog-v1: a window with a modal dialog never takes the keyboard — the dialog does
+    // (activation, the shell's request_activate, a click, a window mapping).
+    if (const lx::toplevel_id b = modal_blocker(id); b) {
+        if (wm_debug_enabled()) {
+            char line[96];
+            std::snprintf(line, sizeof(line), "focus redirect id=%llu modal=%llu", id.id(),
+                          b.id());
+            lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
+        }
+        id = b;
+    }
+    if (id == keyboard_focus_)
         return;
     // Activating another client's window (a new window mapping, the shell's
     // request_activate) ends a popup grab: its menu must not keep the keyboard of a window
@@ -2747,6 +2922,22 @@ void lx::compositor::window_manager::on_pointer_button(
         // Placeholder policy until the shell decides: click-to-focus, raise-on-press, on
         // any button — focus before the button so the client sees keyboard `enter` first.
         if (pointer_focus_ && toplevels_->find(pointer_focus_)) {
+            // A window blocked by a modal dialog: the press is consumed (its release with it)
+            // and the dialog is focused and raised with its parent — the parent stays
+            // visible and still gets motion and scroll (Mutter, KWin).
+            if (const lx::toplevel_id b = modal_blocker(pointer_focus_); b) {
+                swallowed_mask_ |= bit;
+                set_keyboard_focus(b);
+                (void)raise(pointer_focus_);
+                if (wm_debug_enabled()) {
+                    char line[96];
+                    std::snprintf(line, sizeof(line), "modal press id=%llu dialog=%llu",
+                                  pointer_focus_.id(), b.id());
+                    lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category,
+                                                    line);
+                }
+                return;
+            }
             set_keyboard_focus(pointer_focus_);
             (void)raise(pointer_focus_);
         }
@@ -3343,29 +3534,51 @@ bool lx::compositor::window_manager::raise(lx::toplevel_id id) {
     if (!toplevels_ || !surfaces_ || !scene_)
         return false;
     const auto* rec = toplevels_->find(id);
-    if (!rec || !rec->mapped || !toplevels_->raise(id))
+    if (!rec || !rec->mapped)
         return false;
-    sync_node_stacking(*rec, "raise");
-    return true;
+    const bool moved = toplevels_->raise(id);
+    if (moved)
+        sync_node_stacking(*rec, "raise");
+    // Its modal dialogs come along, above it (also when it already was on top of them).
+    keep_modals_above(id);
+    return moved;
 }
+
+namespace {
+/// The window a modal chain hangs from: what lowering or restacking a modal dialog moves.
+lx::toplevel_id modal_root(const lx::compositor::toplevel_manager& m, lx::toplevel_id id) {
+    for (unsigned depth = 0; depth < 8; ++depth) {
+        const auto* rec = m.find(id);
+        if (!rec || !lx::compositor::effective_modal(m, *rec))
+            break;
+        id = rec->parent;
+    }
+    return id;
+}
+} // namespace
 
 bool lx::compositor::window_manager::lower(lx::toplevel_id id) {
     if (!toplevels_ || !surfaces_ || !scene_)
         return false;
+    // A modal dialog never goes below its parent: the whole family is lowered.
+    id = modal_root(*toplevels_, id);
     const auto* rec = toplevels_->find(id);
     if (!rec || !rec->mapped || !toplevels_->lower(id))
         return false;
     sync_node_stacking(*rec, "lower");
+    keep_modals_above(id);
     return true;
 }
 
 bool lx::compositor::window_manager::restack(lx::toplevel_id id, unsigned index) {
     if (!toplevels_ || !surfaces_ || !scene_)
         return false;
+    id = modal_root(*toplevels_, id);
     const auto* rec = toplevels_->find(id);
     if (!rec || !rec->mapped || !toplevels_->move_to(id, index))
         return false;
     sync_node_stacking(*rec, "restack");
+    keep_modals_above(id);
     return true;
 }
 

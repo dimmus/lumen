@@ -18,6 +18,8 @@ presents to KMS.
 | `CompositorSurfaceManager` | `lx.compositor` | Commit handling, desc extraction |
 | `DmabufImporter` | `lx.gfx` | Vulkan external memory import |
 | `SyncobjBridge` | `lx.gfx` | DRM syncobj ↔ Vulkan timeline semaphore |
+| `drm_timeline_table` | `lx.gfx.drm_timeline` | linux-drm-syncobj-v1 timelines: acquire-point queries and eventfds, release points (now, or after a sync_file) |
+| `content_queue`, `readiness_poller` | `lx.compositor.content_update` | Holds a commit until its buffer is ready (acquire point signalled, or implicit write fences done) |
 | `DmabufImportCache` | `lx.gfx.import_cache` | Reuse imports keyed by client/buffer/modifier |
 | `BufferLifecycleTracker` | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release |
 | `SurfaceNode` | `lx.scene` | Retained client surface in scene graph |
@@ -29,6 +31,37 @@ See UML:
 
 - Class: [../uml/19-dmabuf-vulkan-class.mmd](../uml/19-dmabuf-vulkan-class.mmd)
 - Sequence: [../uml/20-dmabuf-vulkan-sequence.mmd](../uml/20-dmabuf-vulkan-sequence.mmd)
+
+## Readiness before apply (ADR 009)
+
+A dma-buf content update is applied only once its buffer is ready, so the composite never
+samples (or waits on) a buffer the client's GPU is still writing:
+
+1. **Explicit sync** (`wp_linux_drm_syncobj_surface_v1`; offered only where the card has
+   timeline syncobjs and `DRM_IOCTL_SYNCOBJ_EVENTFD`, and the composite exports a fence):
+   the acquire point is queried (`drmSyncobjTimelineWait`, timeout 0, `WAIT_FOR_SUBMIT`);
+   unsignalled, an eventfd armed with `DRM_IOCTL_SYNCOBJ_EVENTFD` (flags 0: *signalled*) is
+   watched by the readiness poller. An update is never applied before its acquire point
+   signals: one the poller cannot watch (no entry, no eventfd) is queried again at each
+   tick of a lit output until it signals or an entry is armed, and an update the queue has
+   no room for disconnects its client (`no_memory`) rather than apply early — a pool
+   reserve keeps room for clients that queue little. The release point is signalled at
+   once when the buffer is never sampled (superseded, dropped, its surface gone), otherwise
+   when the buffer lifecycle retires it — only after a newer commit superseded it (every
+   composite that shows it samples it again) and the last frame that could sample it,
+   window capture views included, completed — with the newest fence of render's composites
+   and capture copies attached (a temporary syncobj and `drmSyncobjTransfer`, Mutter's
+   `set_sync_point`). A wl_buffer destroyed while on screen hands its point to the
+   lifecycle record, signalled the same way. Only dma-buf buffers: shm and single-pixel
+   buffers are `unsupported_buffer`.
+2. **Implicit sync** (every other dma-buf): one `poll(POLLIN, 0)` per distinct plane fd —
+   already signalled is the norm (always on vmwgfx) — else `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`
+   with `DMA_BUF_SYNC_READ` (a snapshot of the write fences) watched by the poller.
+
+`wl_buffer.release` is still sent in both cases, by the same rule: a dma-buf on screen is
+held until a newer commit replaces it (as in wlroots, Mutter and KWin). See
+[threading.md](threading.md) for the
+thread each step runs on.
 
 ## DmabufDesc (canonical internal form)
 
@@ -101,7 +134,8 @@ imported image — no intermediate copy, no resampling (ADR 007).
 |-----------|--------|
 | Unsupported modifier | Reject commit; send protocol error to client |
 | Import fails | Fallback: SHM buffer copy path (dev only) |
-| Sync timeout | Drop frame; log; don't stall compositor |
+| Fence not signalled | The content update waits in the queue; the previous content stays on screen; nothing stalls |
+| Timeline syncobj op fails | `drm_err::timeline_failed`, logged at most every 600th time; an `import_timeline` of a non-syncobj fd is the client's `invalid_timeline` error |
 | Client disconnect | Release all imported images for client |
 
 ## Implementation phases
@@ -111,7 +145,7 @@ imported image — no intermediate copy, no resampling (ADR 007).
 | D0 | `DmabufDesc` extraction from `zwp_linux_buffer_params_v1` |
 | D1 | Basic import (single-plane ARGB8888) |
 | D2 | Multi-plane + modifiers + feedback protocol |
-| D3 | drm-syncobj timeline integration |
+| D3 | drm-syncobj timeline integration (ADR 009 Part 1: acquire wait before apply, release points, implicit readiness) |
 | D4 | Direct scanout optimization (integrated) |
 
 ## Related docs

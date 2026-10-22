@@ -17,8 +17,13 @@ export namespace lx::scene {
 
 enum class node_kind { container, widget, surface, layer };
 
-/// Output views a scene publishes to (one per output slot, ADR 008 M3).
-inline constexpr unsigned k_max_views = 16;
+/// Views a scene publishes to: one per output slot (ADR 008 M3), then the capture views of
+/// screen capture (design-app-compat-capture CC2: one window's tree projected into a client
+/// buffer, `k_capture_view_base` onwards).
+inline constexpr unsigned k_output_views = 16;
+inline constexpr unsigned k_capture_views = 8;
+inline constexpr unsigned k_capture_view_base = k_output_views;
+inline constexpr unsigned k_max_views = k_output_views + k_capture_views;
 
 /// How layout (logical) coordinates reach one output's pixels: `origin` is the output's
 /// top-left in the layout, `scale` its scale (n/120 for a fractional one). The scene, the
@@ -86,6 +91,9 @@ struct emit_context {
 struct output_view_config {
     lx::rect2i logical{};
     output_projection projection{};
+    /// The subtree the view draws (null: the whole scene). A capture view names one window's
+    /// tree container: what is above or below the window never reaches its pixels.
+    const class scene_node* root = nullptr;
 };
 
 class scene_node {
@@ -192,6 +200,12 @@ public:
     /// must blend, never be drawn as black.
     void set_opaque(bool opaque);
     [[nodiscard]] bool opaque() const;
+    /// The content is one premultiplied, encoded colour (`wp_single_pixel_buffer_v1`)
+    /// rather than a texture: the node emits a solid draw of its bounds (no sampling, no
+    /// upload). `solid` false returns to the attached image.
+    void set_solid(bool solid, lx::color color);
+    [[nodiscard]] bool solid() const { return solid_; }
+    [[nodiscard]] lx::color solid_color() const { return solid_color_; }
     using scene_node::emit_draws;
     void emit_draws(draw_list& out, const emit_context& ctx) const override;
     void on_shown(unsigned frame, unsigned view) override {
@@ -213,18 +227,15 @@ public:
     static constexpr unsigned k_never_shown = ~0u;
 
 private:
-    unsigned visible_frame_[k_max_views] = {k_never_shown, k_never_shown, k_never_shown,
-                                            k_never_shown, k_never_shown, k_never_shown,
-                                            k_never_shown, k_never_shown, k_never_shown,
-                                            k_never_shown, k_never_shown, k_never_shown,
-                                            k_never_shown, k_never_shown, k_never_shown,
-                                            k_never_shown};
+    unsigned visible_frame_[k_max_views]{};
     lx::surface_id surface_{};
     lx::gfx::imported_image image_{};
     lx::texture_id texture_{};
     lx::rect2f src_{};
     lx::buffer_transform transform_ = lx::buffer_transform::normal;
     bool opaque_ = false;
+    bool solid_ = false;
+    lx::color solid_color_ = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
 };
 
 class scene_graph {
@@ -494,7 +505,10 @@ bool lx::scene::container_node::raise_to_top(scene_node* c) {
     return count_ > 0 && move_to(c, count_ - 1);
 }
 
-lx::scene::surface_node::surface_node(lx::surface_id s) : surface_{s} {}
+lx::scene::surface_node::surface_node(lx::surface_id s) : surface_{s} {
+    for (unsigned& f : visible_frame_)
+        f = k_never_shown;
+}
 void lx::scene::surface_node::attach(lx::gfx::imported_image img) {
     image_ = img;
     texture_ = lx::texture_id{img.image_id};
@@ -520,9 +534,14 @@ void lx::scene::surface_node::set_opaque(bool opaque) {
     }
 }
 bool lx::scene::surface_node::opaque() const { return opaque_; }
+void lx::scene::surface_node::set_solid(bool solid, lx::color color) {
+    solid_ = solid;
+    solid_color_ = color;
+    dirty_ = true;
+}
 
 void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx) const {
-    if (!texture() || !is_visible())
+    if ((!texture() && !solid_) || !is_visible())
         return;
 
     lx::rect2i b = bounds();
@@ -537,7 +556,9 @@ void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx
     }
 
     draw_command cmd{};
-    cmd.texture = texture();
+    cmd.texture = solid_ ? lx::texture_id{} : texture();
+    cmd.solid = solid_;
+    cmd.solid_color = solid_color_;
     // A root on its own rounds relative to itself; inside a window, relative to the window.
     cmd.dst = project_node(ctx.projection, ctx.anchored ? ctx.anchor : at, at, size);
     // Off this view entirely (another output's window): not emitted at all, so a view's draw
@@ -546,10 +567,11 @@ void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx
         (cmd.dst.x >= ctx.projection.size.width || cmd.dst.y >= ctx.projection.size.height ||
          cmd.dst.x + cmd.dst.width <= 0 || cmd.dst.y + cmd.dst.height <= 0))
         return;
-    cmd.src = src_;
-    cmd.buffer_xform = transform_;
+    cmd.src = solid_ ? lx::rect2f{} : src_;
+    cmd.buffer_xform = solid_ ? lx::buffer_transform::normal : transform_;
     // 1:1 or resampled: the source box, turned the way the transform turns it, against dst.
-    {
+    // A solid colour is the same at any size: never resampled.
+    if (!solid_) {
         float sw = src_.width;
         float sh = src_.height;
         if (src_.empty()) {
@@ -567,10 +589,13 @@ void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx
                      sh != static_cast<float>(cmd.dst.height);
     }
     cmd.transform = lx::transform2d::translate(cmd.dst.x, cmd.dst.y);
+    // Opacity rides `opacity` alone: every backend multiplies it with the tint's alpha, so
+    // folding it into the tint as well (as this once did) faded a translucent node twice —
+    // alpha-modifier-v1 at one half came out at one quarter.
     cmd.opacity = opacity();
-    cmd.tint = lx::color::rgb(tint_.r, tint_.g, tint_.b, tint_.a * opacity());
+    cmd.tint = tint_;
     // Blend from content, not from opacity: an ARGB buffer at opacity 1 still has to blend.
-    cmd.blend = opaque_ && opacity() >= 1.f ? lx::blend_mode::opaque
+    cmd.blend = opaque_ && opacity() >= 1.f && tint_.a >= 1.f ? lx::blend_mode::opaque
                                             : lx::blend_mode::premultiplied;
     cmd.sort_key = lx::draw_sort_key::make(0, out.size());
     out.push(cmd);
@@ -620,7 +645,7 @@ namespace {
            a.projection.scale == b.projection.scale &&
            a.projection.size.width == b.projection.size.width &&
            a.projection.size.height == b.projection.size.height &&
-           a.projection.transform == b.projection.transform;
+           a.projection.transform == b.projection.transform && a.root == b.root;
 }
 } // namespace
 
@@ -865,10 +890,13 @@ void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot)
     emit_context ctx{};
     ctx.projection = view_config(slot).projection;
     ctx.view = slot;
+    scene_node* const from = view_config(slot).root
+                                 ? const_cast<scene_node*>(view_config(slot).root)
+                                 : &root_;
     const lx::buffer_transform t = ctx.projection.transform;
     if (t == lx::buffer_transform::normal || ctx.projection.size.width <= 0 ||
         ctx.projection.size.height <= 0) {
-        emit_node(&root_, out, ctx);
+        emit_node(from, out, ctx);
         return;
     }
     // A turned output (ADR 008 §C.4): emitters draw into the untransformed content space;
@@ -878,7 +906,7 @@ void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot)
     const lx::size2i c = content_size(ctx.projection);
     ctx.projection.size = c;
     ctx.projection.transform = lx::buffer_transform::normal;
-    emit_node(&root_, out, ctx);
+    emit_node(from, out, ctx);
     draw_command* d = out.data();
     for (unsigned i = 0; i < out.size(); ++i) {
         d[i].dst = lx::gfx::transform_rect(d[i].dst, t, c.width, c.height);

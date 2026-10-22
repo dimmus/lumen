@@ -221,7 +221,20 @@ frame any live output may still sample (a view's newest consumed publish, or the
 composited-but-uncommitted slot holds). An output that is not due keeps its last snapshot,
 so a buffer it shows stays held until that output publishes again.
 
-On memory pressure, `pending_release` and (critical) `in_flight` buffers are flushed early.
+A dma-buf is sampled zero-copy by every composite that shows it, so a record stays
+**current** — never released, whatever the low-water mark — while it is its surface's
+content. A newer commit (a different buffer, a null attach) or the surface's end supersedes
+it; every published frame tags the current records with its index (an output's, and a
+window capture view's), so the superseded record is released once the frame of its last
+tag has completed. Window capture views count towards the mark (render's newest composited
+view), and a view job UI posted that render has not taken yet holds it back
+(`capture_view_floor`). A wl_buffer destroyed while still current keeps its record (the
+import stays on screen): no `wl_buffer.release` goes to the dead object, and an
+explicit-sync release point it owed moves to the record and is signalled when the record
+is released.
+
+On memory pressure, `pending_release` and (critical) `in_flight` buffers are flushed early
+— never a current one (its import stays on screen, so releasing it frees nothing).
 
 ---
 

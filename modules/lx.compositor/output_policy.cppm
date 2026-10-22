@@ -26,6 +26,30 @@ import :output;
 
 export namespace lx::compositor {
 
+/// tearing-control-v1 (design-app-compat-capture TR1): what decides whether output `slot`'s
+/// next commit may be an asynchronous (tearing) page flip.
+struct async_flip_state {
+    /// The card takes DRM_MODE_PAGE_FLIP_ASYNC in atomic commits
+    /// (DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP).
+    bool card_capable = false;
+    /// A TEST_ONLY of the async commit passed for this output's pipeline (the kernel accepts
+    /// async only for the primary plane's framebuffer change, per driver and format).
+    bool pipeline_tested = false;
+    /// The output's topmost content is a fullscreen toplevel …
+    bool fullscreen_top = false;
+    /// … whose root surface's presentation hint is `async`.
+    bool wants_async = false;
+    /// The session is locked or the display stopped: never tear the lock screen.
+    bool locked_or_paused = false;
+};
+
+/// sway/wlroots and KWin tear only a fullscreen window that asks for it; the atomic async
+/// uAPI cannot change other planes in the same commit (the cursor rides the next sync one).
+[[nodiscard]] constexpr bool allow_async(const async_flip_state& s) {
+    return s.card_capable && s.pipeline_tested && s.fullscreen_top && s.wants_async &&
+           !s.locked_or_paused;
+}
+
 struct output_change {
     enum class kind : unsigned char { added, removed, changed };
     kind what = kind::changed;

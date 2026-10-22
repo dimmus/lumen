@@ -1,0 +1,37 @@
+%% Screen capture (ADR 009 Part 4): an output session's frame on GL, dma-buf and shm.
+sequenceDiagram
+    autonumber
+    participant C as Client (grim, xdpw, wf-recorder)
+    participant W as wire_capture (UI)
+    participant T as tick_ui (UI)
+    participant R as render thread (capture_renderer)
+    participant K as worker
+    participant P as readiness poller (UI)
+
+    C->>W: create_session(source, options)
+    W-->>C: buffer_size, shm_format, dmabuf_device, dmabuf_format, done
+    C->>W: create_frame, attach_buffer, damage_buffer, capture
+    W->>T: capture_decide (lock, VT pause, power, constraints)
+    alt locked
+        T->>R: curtain job (glClear / memset)
+    else held (VT away, output off)
+        T->>T: frame waits
+    else
+        T->>R: output job {since_seq, client damage, paint_cursors, lock_epoch}
+    end
+    Note over R: waits for its output to composite something new (no clock started)
+    R->>R: composite_output → damage ring record(seq)
+    R->>R: lock_epoch moved past the job → cancelled
+    alt dma-buf
+        R->>R: glBlitFramebuffer per rect into the imported buffer (+ pointer quad), native fence
+        R-->>T: completion {fence} (channel; one UI task posted)
+        T->>P: fence fd
+        P-->>W: signalled
+    else shm
+        R->>R: blit into the session's LINEAR GBM buffer, native fence; session busy
+        R->>K: worker_read
+        K->>K: wait fence, gbm_bo_map, copy damaged rows into the shm under its guard (+ pointer blend)
+        K-->>T: completion {ready} (channel; UI task posted)
+    end
+    T->>W: capture_complete: completion from an older lock epoch → decided again
+    W-->>C: transform, damage, presentation_time, ready

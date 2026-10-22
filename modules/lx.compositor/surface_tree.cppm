@@ -66,6 +66,17 @@ struct tree_order {
     }
 };
 
+/// A parent's cached child state (its children's cached positions and its cached order),
+/// moved out of the tree while a content update that carries it waits in the queue
+/// (`surface_tree::take_cached_child_state`), and put back when that update is applied.
+struct tree_child_state {
+    bool order_set = false;
+    tree_order order{};
+    unsigned count = 0;
+    lx::surface_id ids[k_tree_max_children]{};
+    lx::point2i pos[k_tree_max_children]{};
+};
+
 /// The surface of a tree under a point, from `surface_tree::hit`.
 struct tree_hit {
     lx::surface_id surface{};
@@ -145,6 +156,11 @@ public:
     /// The parent's cached state is being applied: cached positions and order become
     /// current.
     void apply_child_state(lx::surface_id parent);
+    /// Moves the parent's cached child state into `out` (a queued update carries it) and
+    /// clears it; `put_cached_child_state` makes a carried state the cached one again (for
+    /// `apply_child_state`, or to restore what was stashed around a queued apply).
+    void take_cached_child_state(lx::surface_id parent, tree_child_state& out);
+    void put_cached_child_state(lx::surface_id parent, const tree_child_state& in);
     /// Effectively synchronized children (every linked child, in pending order), whose
     /// cached state is applied together with the parent's.
     [[nodiscard]] unsigned sync_children(lx::surface_id parent, lx::surface_id* out,
@@ -596,6 +612,64 @@ void lx::compositor::surface_tree::cache_child_state(lx::surface_id parent) {
         p->order_cached = p->order_pending;
         p->order_cached_dirty = true;
         p->order_pending_dirty = false;
+    }
+}
+
+void lx::compositor::surface_tree::take_cached_child_state(lx::surface_id parent,
+                                                           tree_child_state& out) {
+    out.order_set = false;
+    out.count = 0;
+    entry* p = find(parent);
+    if (!p)
+        return;
+    for (unsigned i = 0; i < p->order_pending.count && out.count < k_tree_max_children; ++i) {
+        const lx::surface_id cid = p->order_pending.ids[i];
+        if (cid == parent)
+            continue;
+        entry* c = find(cid);
+        if (!c || !(c->parent == parent) || !c->pos_cached_set)
+            continue;
+        out.ids[out.count] = cid;
+        out.pos[out.count] = c->pos_cached;
+        ++out.count;
+        c->pos_cached_set = false;
+    }
+    if (p->order_cached_dirty) {
+        out.order = p->order_cached;
+        out.order_set = true;
+        p->order_cached_dirty = false;
+    }
+}
+
+void lx::compositor::surface_tree::put_cached_child_state(lx::surface_id parent,
+                                                          const tree_child_state& in) {
+    entry* p = find(parent);
+    if (!p)
+        return;
+    // Replaces whatever is cached now (the caller took it out first).
+    for (unsigned i = 0; i < p->order_pending.count; ++i) {
+        entry* c = find(p->order_pending.ids[i]);
+        if (c && c->parent == parent && !(c->id == parent))
+            c->pos_cached_set = false;
+    }
+    for (unsigned i = 0; i < in.count; ++i) {
+        entry* c = find(in.ids[i]);
+        if (!c || !(c->parent == parent))
+            continue; // unlinked or re-parented since: its old position means nothing now
+        c->pos_cached = in.pos[i];
+        c->pos_cached_set = true;
+    }
+    p->order_cached_dirty = in.order_set;
+    if (in.order_set) {
+        // Children that left since the order was cached are dropped from it.
+        tree_order o{};
+        for (unsigned i = 0; i < in.order.count; ++i) {
+            const lx::surface_id id = in.order.ids[i];
+            const entry* c = find(id);
+            if (id == parent || (c && c->parent == parent))
+                o.ids[o.count++] = id;
+        }
+        p->order_cached = o;
     }
 }
 

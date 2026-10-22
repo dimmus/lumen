@@ -11,9 +11,9 @@ Implemented in `zlm_policy_bridge_v1` (`protocols/lumen/zlm_shell_v1.xml`):
 
 | Phase | Events |
 |-------|--------|
-| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 5), then (v5) `zlm_shell_v1.lock_state` |
-| Initial sync | `snapshot_begin` → `snapshot_workspace*` → (`snapshot_toplevel` [→ `toplevel_flags`])* → `snapshot_output*` → `snapshot_done` → `focus_changed` |
-| Runtime deltas | `toplevel_created` (→ `toplevel_state`, `toplevel_geometry` [, `toplevel_flags`]), `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `toplevel_flags` (v2), `focus_changed`, `stacking_order_changed` |
+| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 6), then (v5) `zlm_shell_v1.lock_state`, (v6) `capture_state` |
+| Initial sync | `snapshot_begin` → `snapshot_workspace*` → (`snapshot_toplevel` [→ `toplevel_flags`])* → (v6, per toplevel: [`toplevel_icon` → `toplevel_icon_buffer`* → `toplevel_icon_done`] [→ `toplevel_parent`])* → `snapshot_output*` → `snapshot_done` → `focus_changed` |
+| Runtime deltas | `toplevel_created` (→ `toplevel_state`, `toplevel_geometry` [, `toplevel_flags`] [, icon] [, `toplevel_parent`]), `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `toplevel_flags` (v2), `focus_changed`, `stacking_order_changed`, (v6) the icon group, `toplevel_parent`, `bell` |
 
 The snapshot carries no focus, so the compositor follows `snapshot_done` at once with a
 `focus_changed` naming the focused window (or null). It is an ordinary v1 delta: no XML
@@ -112,6 +112,46 @@ session-lock integration. Its lock policy (`lx.shell:idle_policy`, pure; `--lock
 
 The locker is an ordinary client launched like any application (`app-lumen-locker@<random>
 .service`, no activation token: lock surfaces take the keyboard as such).
+
+### Version 6: icons, parents, the bell, capture state, non-inhibitable grabs
+
+The family moves to version 6 together (design-app-compat-capture B.8). On the policy bridge:
+
+- `toplevel_icon(toplevel, name)`, `toplevel_icon_buffer(toplevel, fd, size, scale)`*,
+  `toplevel_icon_done(toplevel)` — a window's icon (xdg-toplevel-icon-v1) as applied by its
+  commit: the XDG icon-theme name ("" for none) and zero or more pixel buffers, each a
+  **sealed memfd** of `size`² premultiplied ARGB8888 the shell maps read-only (pixels never
+  travel over the wire; the compositor's copy is immutable under the mapping). An empty name
+  and no buffers means the default icon. Sent after `snapshot_toplevel` / `toplevel_created`
+  when the window has one, and on every change.
+- `toplevel_parent(toplevel, parent?)` — the window this one is a dialog or child of
+  (`xdg_toplevel.set_parent`, or xdg-foreign across clients); null for none, or when the
+  parent is not mapped. In the snapshot after every handle exists (a parent can come later
+  in creation order). A child in state `modal` (sent for an effectively modal dialog: modal,
+  with a mapped parent) blocks its parent.
+- `bell(toplevel?)` — xdg-system-bell-v1 rang for that window or for none; at most 4 a second
+  per client, none while the session is locked.
+
+On `zlm_shell_v1`: `capture_state(active)`, sent on bind and on change — 1 while a client
+other than the shell is capturing the screen: an ext-image-copy-capture session not owned by
+the shell has delivered a frame and is still open, or a wlr-screencopy frame was delivered
+within the last 2 s (ADR 009 Part 4). The indicator's own repaint is damage, so a rule of "a
+frame in the last 2 s" would make an idle cast blink it and copy a frame every ~2 s. lumen-shell draws a red dot left of its logout button while it is 1. On `zlm_key_grab_v1`: the flag `not_inhibitable` (0x2) — the grab fires also while
+the focused window inhibits shortcuts (keyboard-shortcuts-inhibit-unstable-v1); all other
+grabs and taps are skipped then and their keys reach that window.
+
+lumen-shell binds `min(advertised, 6)`. Its task model keeps each window's icon name and
+parent (the bridge keeps the mapped memfds per task slot and unmaps them with the task); the
+panel draws a 16 px icon left of the title — the name resolved in the XDG icon theme
+(`lx.shell:icon_theme`: the GTK theme setting, its Inherits chain, hicolor, then the
+unthemed directories; PNG via libpng, SVG via librsvg, each optional; cached per name and
+pixel size), else the window's own buffer nearest the size (resampled once per icon
+revision), else the app id as an icon name, else its desktop entry's `Icon=`, else a letter
+tile — and does not list a modal dialog beside the window it blocks (that window's entry
+activates the dialog, as the compositor redirects focus to it). The bell flashes the window
+(`lx.shell:visual_bell`: an overlay layer surface over its rect, a 1×1 translucent buffer
+scaled by `wp_viewport`, 120 ms, no input region) or, for a bell of no window, the panel strip
+of the active output. Super+L (with a lock command) is grabbed `not_inhibitable`.
 
 - **`not_responding`**: the client left an `xdg_wm_base.ping` unanswered past the
   compositor's timeout (`--ping-timeout`, 5 s). The compositor only shows it — "(Not
@@ -259,7 +299,7 @@ and the compositor warns `bridge replaced`).
 libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phase 3):
 
 - **Startup.** Bind `wl_compositor` (v4+), `wl_shm`, `zwlr_layer_shell_v1` (v4),
-  `zlm_shell_v1` (v5, or what the compositor advertises) and, if present, `wp_cursor_shape_manager_v1`; the bridge listens on
+  `zlm_shell_v1` (v6, or what the compositor advertises) and, if present, `wp_cursor_shape_manager_v1`; the bridge listens on
   `zlm_shell_v1` in the same dispatch as the bind, because `capabilities` follows at once
   and libwayland drops events for a proxy with no listener. A second roundtrip surfaces a
   refused bind as a protocol error: the shell logs why and exits 1. Then

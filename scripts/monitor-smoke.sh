@@ -28,6 +28,9 @@
 #   remove   Virtual-2 goes: the probe sees `wl_output removed`, its window enters Virtual-1,
 #            lumen-shell's panel there is closed, the pipeline is retired (CRTC off)
 #   return   Virtual-2 comes back: the window returns to it (home)
+#   capture  screen capture across hotplug: a session of Virtual-1 gets new constraints when
+#            its mode changes and then a full frame at the new size; a session of Virtual-2
+#            stops when it is unplugged, its pending frame failed as stopped
 #   vt       VT away, Virtual-1 back to W0xH0 while away, VT back: the resume probe switches
 #            the mode before the resume modeset (`— resume`), `session resumed`, a screenshot
 #            of output 0 is W0xH0 (a resize while away no longer leaves the display off)
@@ -75,7 +78,7 @@ SOCKET="lumen-monitor-smoke"
 LOG_DIR="${ROOT}/monitor-smoke-logs"
 JOIN_SEAT=0
 COUNTDOWN=3
-ONLY="add,pointer,place,resize,remove,return,vt,power,lock,randr,swap,mgmt-errors,kanshi,idle,persist"
+ONLY="add,pointer,place,resize,remove,return,capture,vt,power,lock,randr,swap,mgmt-errors,kanshi,idle,persist"
 while (( $# > 0 )); do
   case "$1" in
     --join-seat-session) JOIN_SEAT=1 ;;
@@ -393,6 +396,43 @@ if want return; then
   else
     record "return: the window goes back to Virtual-2 (home)" SKIP "needs the place group"
   fi
+fi
+
+# ── capture ──────────────────────────────────────────────────────────────────────────
+if want capture; then
+  # Screen capture across hotplug (design-app-compat-capture CC9): a session of Virtual-1
+  # gets new constraints when its mode changes (the frame in flight fails buffer_constraints,
+  # the next is full at the new size); a session of Virtual-2 stops when it is unplugged
+  # (its pending frame fails as stopped).
+  ensure_two
+  read -r CW CH < <(sed -E 's/^([0-9]+)x([0-9]+)\+.*/\1 \2/' <<<"${TWO[0]}")
+  NW=1280; NH=800
+  [[ "$CW" == 1280 && "$CH" == 800 ]] && { NW=1366; NH=768; }
+  start_client "$LOG_DIR/probe-capture-v1.log" "$PROBE" capture --output Virtual-1 --frames 400 --timeout 14
+  CAP1_PID=$LAST_PID
+  start_client "$LOG_DIR/probe-capture-v2.log" "$PROBE" capture --output Virtual-2 --dmabuf --frames 400 --timeout 14
+  CAP2_PID=$LAST_PID
+  wait_after "$LOG_DIR/probe-capture-v1.log" 0 "^frame 1 ready" 5
+  wait_after "$LOG_DIR/probe-capture-v2.log" 0 "^frame 1 ready" 5
+  sleep 0.3
+  layout "${NW}x${NH}+0+0" "1024x768+${NW}+0"
+  wait_after "$LOG_DIR/probe-capture-v1.log" 0 "^constraints size=${NW}x${NH} " 5
+  wait_after "$LOG_DIR/probe-capture-v1.log" 0 "ready damage=full rects=0,0,${NW}x${NH} " 5
+  layout "${NW}x${NH}+0+0"
+  wait_after "$LOG_DIR/probe-capture-v2.log" 0 "^session stopped" 5
+  sleep 0.3
+  stop_client "$CAP1_PID"; stop_client "$CAP2_PID"
+  C1=$(cat "$LOG_DIR/probe-capture-v1.log"); C2=$(cat "$LOG_DIR/probe-capture-v2.log")
+  check "capture: a session across a mode change: new constraints, then a full frame at the new size" \
+    "$(grep -q "^constraints size=${NW}x${NH} " <<<"$C1" && grep -q "ready damage=full rects=0,0,${NW}x${NH} " <<<"$C1"; echo $?)" \
+    "$(grep -E "^constraints|failed|damage=full" <<<"$C1" | head -5 | cut -c1-90 | tr '\n' ' ')"
+  check "capture: an unplugged output's session stops, its pending frame fails as stopped" \
+    "$(grep -q "^session stopped" <<<"$C2" && grep -qE "^frame [0-9]+ failed reason=2" <<<"$C2"; echo $?)" \
+    "$(grep -E "^session stopped|failed|summary" <<<"$C2" | head -3 | tr '\n' ' ')"
+  M=$(mark "$CLOG")
+  layout "${TWO[@]}"
+  wait_after "$CLOG" "$M" "output [0-9]+ added name=Virtual-2" 5
+  sleep 1
 fi
 
 # ── vt ───────────────────────────────────────────────────────────────────────────────

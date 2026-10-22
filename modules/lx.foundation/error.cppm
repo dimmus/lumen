@@ -59,6 +59,8 @@ enum class drm_err : int {
     test_rejected = 7,
     /// The hotplug monitor (udev netlink) could not be opened.
     monitor_failed = 8,
+    /// A DRM timeline syncobj operation (import, query, eventfd, signal, transfer) failed.
+    timeline_failed = 9,
 };
 
 enum class protocol_err : int {

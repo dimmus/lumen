@@ -102,6 +102,13 @@ public:
     /// A rounded rect over `under`: corners blend by analytic pixel coverage.
     void fill_rounded(int buffer, lx::rect2i r, std::uint32_t color, std::uint32_t under,
                       int radius = 4);
+    /// Draws a premultiplied ARGB8888 image of `size`² pixels over the buffer, its top-left
+    /// at the pixel corner of `logical`'s origin (sources over: src + dst × (1 − αsrc)).
+    /// `size` should be `pixel_rect(logical)`'s width — the caller resolves the icon at the
+    /// pixel size it lands on, so nothing is scaled here.
+    void blit(int buffer, lx::rect2i logical, const std::uint32_t* pixels, int size);
+    /// A logical rect on this canvas's pixel grid (the scale applied).
+    [[nodiscard]] lx::rect2i pixel_rect(lx::rect2i logical) const { return px(logical); }
     enum class align : unsigned char { left, right };
     /// One line of `text` in the box, vertically centred, ellipsized to fit. False when
     /// text cannot be shaped (warned once).
@@ -211,6 +218,40 @@ void lx::shell::shm_canvas::fill_rounded(int bi, lx::rect2i logical, std::uint32
             px[static_cast<std::ptrdiff_t>(yt) * pw_ + xr] = v;
             px[static_cast<std::ptrdiff_t>(yb) * pw_ + xl] = v;
             px[static_cast<std::ptrdiff_t>(yb) * pw_ + xr] = v;
+        }
+    }
+}
+
+void lx::shell::shm_canvas::blit(int bi, lx::rect2i logical, const std::uint32_t* src, int size) {
+    std::uint32_t* dst = buffers_[bi].pixels;
+    if (!dst || !src || size <= 0)
+        return;
+    const lx::rect2i r = this->px(logical);
+    for (int y = 0; y < size; ++y) {
+        const int ty = r.y + y;
+        if (ty < 0 || ty >= ph_)
+            continue;
+        std::uint32_t* row = dst + static_cast<std::ptrdiff_t>(ty) * pw_;
+        const std::uint32_t* in = src + static_cast<std::ptrdiff_t>(y) * size;
+        for (int x = 0; x < size; ++x) {
+            const int tx = r.x + x;
+            if (tx < 0 || tx >= pw_)
+                continue;
+            const std::uint32_t s = in[x];
+            const unsigned a = s >> 24;
+            if (a == 0)
+                continue;
+            if (a == 255) {
+                row[tx] = s;
+                continue;
+            }
+            const std::uint32_t d = row[tx];
+            const unsigned ia = 255u - a;
+            const unsigned rr = ((s >> 16) & 0xFFu) + (((d >> 16) & 0xFFu) * ia + 127u) / 255u;
+            const unsigned gg = ((s >> 8) & 0xFFu) + (((d >> 8) & 0xFFu) * ia + 127u) / 255u;
+            const unsigned bb = (s & 0xFFu) + ((d & 0xFFu) * ia + 127u) / 255u;
+            row[tx] = 0xFF000000u | ((rr > 255 ? 255 : rr) << 16) | ((gg > 255 ? 255 : gg) << 8) |
+                      (bb > 255 ? 255 : bb);
         }
     }
 }
