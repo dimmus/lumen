@@ -736,9 +736,7 @@ void install_core(p0_protocol_context& ctx) {
 lx::result<void> lx::compositor::install_p0_protocols(p0_protocol_context& ctx) {
 #if defined(LUMEN_HAS_WAYLAND)
     if (!ctx.server) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "p0 install: null server");
+        return lx::make_error(lx::wayland_err::bind_failed, "p0 install: null server");
     }
     p0::install_core(ctx);
     p0::bind_shm_direct(ctx);
@@ -746,8 +744,7 @@ lx::result<void> lx::compositor::install_p0_protocols(p0_protocol_context& ctx) 
     return {};
 #else
     (void)ctx;
-    return lx::make_error(lx::error_domain::wayland,
-                          static_cast<int>(lx::wayland_err::bind_failed),
+    return lx::make_error(lx::wayland_err::bind_failed,
                           "libwayland-server required for P0 protocols");
 #endif
 }

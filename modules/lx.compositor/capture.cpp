@@ -145,18 +145,6 @@ void capture_session_table::close(unsigned handle) {
     --count_;
 }
 
-capture_session* capture_session_table::get(unsigned handle) {
-    if (handle == 0 || handle > k_capture_sessions || !sessions_[handle - 1].used)
-        return nullptr;
-    return &sessions_[handle - 1];
-}
-
-const capture_session* capture_session_table::get(unsigned handle) const {
-    if (handle == 0 || handle > k_capture_sessions || !sessions_[handle - 1].used)
-        return nullptr;
-    return &sessions_[handle - 1];
-}
-
 capture_session* capture_session_table::get(unsigned handle, unsigned generation) {
     capture_session* s = get(handle);
     return s && s->generation == generation ? s : nullptr;

@@ -474,8 +474,7 @@ void lx::wayland::server::close_listen() {
 
 lx::result<void> lx::wayland::server::bind_raw_socket(const char* socket_name) {
     (void)socket_name;
-    return lx::make_error(lx::error_domain::wayland,
-                          static_cast<int>(lx::wayland_err::bind_failed),
+    return lx::make_error(lx::wayland_err::bind_failed,
                           "libwayland-server required for protocol dispatch");
 }
 
@@ -492,10 +491,7 @@ void lx::wayland::server::advertise_pending_globals() {
         g.wl_global = wl_global_create(display_, iface, g.desc.version, &g, &global_bind_trampoline);
         if (!g.wl_global) {
             lx::trace::logger::global().log_error(
-                lx::make_error(lx::error_domain::wayland,
-                               static_cast<int>(lx::wayland_err::bind_failed),
-                               "wl_global_create failed"),
-                "wayland");
+                lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"), "wayland");
         }
     }
 }
@@ -522,18 +518,14 @@ lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
 
     display_ = wl_display_create();
     if (!display_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "wl_display_create failed");
+        return lx::make_error(lx::wayland_err::bind_failed, "wl_display_create failed");
     }
     raise_client_buffers(display_);
 
     if (wl_display_add_socket(display_, name) != 0) {
         wl_display_destroy(display_);
         display_ = nullptr;
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "wl_display_add_socket failed");
+        return lx::make_error(lx::wayland_err::bind_failed, "wl_display_add_socket failed");
     }
 
     wl_display_init_shm(display_);
@@ -602,9 +594,7 @@ void lx::wayland::server::advertise_pending_globals() {}
 
 lx::result<void> lx::wayland::server::bind(const char* socket_name) {
     if (bound_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "server already bound");
+        return lx::make_error(lx::wayland_err::bind_failed, "server already bound");
     }
 
 #if defined(LUMEN_HAS_WAYLAND)
@@ -616,17 +606,13 @@ lx::result<void> lx::wayland::server::bind(const char* socket_name) {
 
 lx::result<void> lx::wayland::server::bind_socketless() {
     if (bound_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "server already bound");
+        return lx::make_error(lx::wayland_err::bind_failed, "server already bound");
     }
 
 #if defined(LUMEN_HAS_WAYLAND)
     display_ = wl_display_create();
     if (!display_) {
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "wl_display_create failed");
+        return lx::make_error(lx::wayland_err::bind_failed, "wl_display_create failed");
     }
     raise_client_buffers(display_);
     wl_display_set_global_filter(display_, &global_filter, this);
@@ -642,7 +628,7 @@ void lx::wayland::server::remove_client_slot(unsigned index) {
         return;
     clients_[index] = {};
     if (index + 1 < client_count_)
-        clients_[index] = static_cast<client_connection&&>(clients_[client_count_ - 1]);
+        clients_[index] = std::move(clients_[client_count_ - 1]);
     clients_[client_count_ - 1] = {};
     --client_count_;
 }
@@ -695,10 +681,7 @@ void lx::wayland::server::create_wl_global(global_entry& slot) {
             wl_global_create(display_, iface, slot.desc.version, &slot, &global_bind_trampoline);
         if (!slot.wl_global) {
             lx::trace::logger::global().log_error(
-                lx::make_error(lx::error_domain::wayland,
-                               static_cast<int>(lx::wayland_err::bind_failed),
-                               "wl_global_create failed"),
-                "wayland");
+                lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"), "wayland");
         }
     }
 #else
@@ -717,8 +700,7 @@ lx::wayland::global_handle lx::wayland::server::add_global_ex(global_descriptor 
     const unsigned index = alloc_global_slot();
     if (index >= k_max_globals) {
         lx::trace::logger::global().log_error(
-            lx::make_error(lx::error_domain::wayland,
-                           static_cast<int>(lx::wayland_err::bind_failed),
+            lx::make_error(lx::wayland_err::bind_failed,
                            "global table full — interface not advertised"),
             "wayland");
         return {};
@@ -784,8 +766,7 @@ void lx::wayland::server::add_global(global_descriptor desc, global_bind_fn bind
     const unsigned index = alloc_global_slot();
     if (index >= k_max_globals) {
         lx::trace::logger::global().log_error(
-            lx::make_error(lx::error_domain::wayland,
-                           static_cast<int>(lx::wayland_err::bind_failed),
+            lx::make_error(lx::wayland_err::bind_failed,
                            "global table full — interface not advertised"),
             "wayland");
         return;
@@ -1069,9 +1050,7 @@ lx::result<void> lx::wayland::server::add_security_listener(int listen_fd, int c
     if (!display_ || !slot || of_creator >= k_max_security_listeners_per_client) {
         ::close(listen_fd);
         ::close(close_fd);
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "security context listener table full");
+        return lx::make_error(lx::wayland_err::bind_failed, "security context listener table full");
     }
     // accept4 after readability must not block if another accept took the connection.
     const int flags = ::fcntl(listen_fd, F_GETFL);
@@ -1091,8 +1070,7 @@ lx::result<void> lx::wayland::server::add_security_listener(int listen_fd, int c
     slot->close_source = wl_event_loop_add_fd(loop, close_fd, 0, &on_listener_closed, slot);
     if (!slot->accept_source || !slot->close_source) {
         drop_listener(*slot);
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
+        return lx::make_error(lx::wayland_err::bind_failed,
                               "security context listener: event source failed");
     }
     return {};

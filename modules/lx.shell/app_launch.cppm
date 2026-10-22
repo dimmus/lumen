@@ -211,7 +211,7 @@ public:
     /// is left alone otherwise).
     [[nodiscard]] unsigned poll_fds(pollfd* out, unsigned cap, int& timeout_ms) const;
     /// After poll: processes the bus and the pipes with events.
-    void dispatch(const pollfd* fds, unsigned n);
+    void dispatch(std::span<const pollfd> fds);
     [[nodiscard]] bool systemd_available() const { return !no_systemd_; }
     /// The path systemd launches take (known once the bus has been opened).
     [[nodiscard]] systemd_launch_mode systemd_mode() const { return mode_; }
@@ -914,7 +914,7 @@ unsigned lx::shell::app_launcher::poll_fds(pollfd* out, unsigned cap, int& timeo
     return n;
 }
 
-void lx::shell::app_launcher::dispatch(const pollfd* fds, unsigned n) {
+void lx::shell::app_launcher::dispatch(std::span<const pollfd> fds) {
 #if defined(LUMEN_HAS_LOGIND)
     if (bus_) {
         // The bus is processed every time: its timeouts (a call's reply deadline) are due
@@ -956,11 +956,11 @@ void lx::shell::app_launcher::dispatch(const pollfd* fds, unsigned n) {
         }
     }
 #endif
-    for (unsigned i = 0; i < n; ++i) {
-        if (!fds[i].revents)
+    for (const pollfd& fd : fds) {
+        if (!fd.revents)
             continue;
         for (auto& pp : pipes_) {
-            if (pp.fd != fds[i].fd || pp.fd < 0)
+            if (pp.fd != fd.fd || pp.fd < 0)
                 continue;
             for (;;) {
                 const ssize_t r = read(pp.fd, pp.buf + pp.got, sizeof(pp.buf) - pp.got);

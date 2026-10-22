@@ -219,9 +219,9 @@ lx::runtime::affinity lx::runtime::strand::bound_affinity() const { return bound
 unsigned lx::runtime::strand::pending() const { return pending_.load(); }
 
 lx::runtime::executor::executor() {
-    strands_[static_cast<unsigned>(affinity::ui)] = &ui_;
-    strands_[static_cast<unsigned>(affinity::render)] = &render_;
-    strands_[static_cast<unsigned>(affinity::worker)] = &worker_;
+    strands_[std::to_underlying(affinity::ui)] = &ui_;
+    strands_[std::to_underlying(affinity::render)] = &render_;
+    strands_[std::to_underlying(affinity::worker)] = &worker_;
 }
 
 lx::runtime::executor& lx::runtime::executor::global() {

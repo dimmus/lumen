@@ -67,10 +67,9 @@ void reset_im_pending(input_method_record& im) {
     im.delete_after = 0;
 }
 
-void set_string(ime_string& out, const char* text, unsigned len) {
-    const unsigned n = text ? utf8_truncate(text, len, k_ime_text_max) : 0;
-    if (n)
-        std::memcpy(out.text, text, n);
+void set_string(ime_string& out, std::string_view text) {
+    const unsigned n = utf8_truncate(text, k_ime_text_max);
+    text.copy(out.text, n);
     out.text[n] = '\0';
     out.len = n;
     out.set = true;
@@ -105,9 +104,9 @@ void unlink(T*& head, T& item) {
 
 } // namespace
 
-unsigned utf8_truncate(const char* text, unsigned len, unsigned max) {
-    if (len <= max)
-        return len;
+unsigned utf8_truncate(std::string_view text, unsigned max) {
+    if (text.size() <= max)
+        return static_cast<unsigned>(text.size());
     unsigned n = max;
     // text[n] is the first byte left out: while it continues a sequence, the sequence it
     // belongs to started inside the prefix and is cut — drop it whole.
@@ -231,13 +230,12 @@ void text_input_relay::disable(text_input_record& ti) {
     ti.toggled = true;
 }
 
-void text_input_relay::set_surrounding(text_input_record& ti, const char* text, unsigned len,
-                                       int cursor, int anchor) {
+void text_input_relay::set_surrounding(text_input_record& ti, std::string_view text, int cursor,
+                                       int anchor) {
     if (!ti.focus)
         return;
-    const unsigned n = text ? utf8_truncate(text, len, k_ime_text_max) : 0;
-    if (n)
-        std::memcpy(ti.pending.surrounding, text, n);
+    const unsigned n = utf8_truncate(text, k_ime_text_max);
+    text.copy(ti.pending.surrounding, n);
     ti.pending.surrounding[n] = '\0';
     ti.pending.surrounding_len = n;
     const auto clamp = [n](int v) {
@@ -463,16 +461,16 @@ void text_input_relay::remove_input_method(input_method_record& im) {
     set_routing(false);
 }
 
-void text_input_relay::im_commit_string(input_method_record& im, const char* text, unsigned len) {
+void text_input_relay::im_commit_string(input_method_record& im, std::string_view text) {
     if (im.live)
-        set_string(im.commit, text, len);
+        set_string(im.commit, text);
 }
 
-void text_input_relay::im_preedit(input_method_record& im, const char* text, unsigned len,
-                                  int begin, int end) {
+void text_input_relay::im_preedit(input_method_record& im, std::string_view text, int begin,
+                                  int end) {
     if (!im.live)
         return;
-    set_string(im.preedit, text, len);
+    set_string(im.preedit, text);
     im.preedit_begin = begin;
     im.preedit_end = end;
 }

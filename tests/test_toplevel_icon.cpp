@@ -18,22 +18,22 @@ using namespace lx::compositor;
 LUMEN_TEST(selection_prefers_the_panel_size_and_caps_edges) {
     const icon_candidate in[] = {{512, 1}, {16, 1}, {48, 1}, {32, 1}, {256, 1}, {24, 1}, {0, 1}};
     unsigned out[k_icon_max_images]{};
-    const unsigned n = select_icon_images(in, 7, k_icon_pixel_budget, out);
+    const unsigned n = select_icon_images(in, k_icon_pixel_budget, out);
     // 512 and 0 dropped; ranked by distance to 32: 32, 24, 48, 16 (256 is fifth).
     LUMEN_CHECK(n == 4);
     LUMEN_CHECK(in[out[0]].size == 32 && in[out[1]].size == 24 && in[out[2]].size == 48 &&
                 in[out[3]].size == 16);
     // Equal distance: the larger edge first.
     const icon_candidate tie[] = {{24, 1}, {40, 1}};
-    LUMEN_CHECK(select_icon_images(tie, 2, k_icon_pixel_budget, out) == 2 && tie[out[0]].size == 40);
+    LUMEN_CHECK(select_icon_images(tie, k_icon_pixel_budget, out) == 2 && tie[out[0]].size == 40);
 }
 
 LUMEN_TEST(selection_under_a_spent_budget_keeps_one_or_none) {
     const icon_candidate in[] = {{256, 1}, {32, 1}, {128, 1}};
     unsigned out[k_icon_max_images]{};
     // Room for the 32 px one only.
-    LUMEN_CHECK(select_icon_images(in, 3, 32 * 32 * 4, out) == 1 && in[out[0]].size == 32);
-    LUMEN_CHECK(select_icon_images(in, 3, 100, out) == 0);
+    LUMEN_CHECK(select_icon_images(in, 32 * 32 * 4, out) == 1 && in[out[0]].size == 32);
+    LUMEN_CHECK(select_icon_images(in, 100, out) == 0);
 }
 
 LUMEN_TEST(table_copies_into_sealed_memfds_and_counts_references) {

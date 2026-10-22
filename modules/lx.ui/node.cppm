@@ -7,6 +7,8 @@ import lx.a11y;
 
 export module lx.ui:node;
 
+import std;
+
 import :element;
 import :events;
 import :style;
@@ -170,7 +172,7 @@ template<typename NodeT, typename PropsT>
 }
 
 /// Attach children to an already-described element.
-[[nodiscard]] child with_children(child parent, const child* items, unsigned count);
+[[nodiscard]] child with_children(child parent, std::span<const child> items);
 
 } // namespace lx::ui
 
@@ -432,7 +434,8 @@ void lx::ui::ui_node::mark_layout_dirty() { layout_dirty_ = true; }
 bool lx::ui::ui_node::layout_dirty() const { return layout_dirty_; }
 void lx::ui::ui_node::clear_layout_dirty() { layout_dirty_ = false; }
 
-lx::ui::child lx::ui::with_children(child parent, const child* items, unsigned count) {
+lx::ui::child lx::ui::with_children(child parent, std::span<const child> items) {
+    const auto count = static_cast<unsigned>(items.size());
     if (!parent || count == 0)
         return parent;
     build_context* ctx = build_context::current();

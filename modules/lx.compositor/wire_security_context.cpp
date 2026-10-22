@@ -169,13 +169,11 @@ const struct wp_security_context_v1_interface context_impl = {
             const int listen_fd = c->listen_fd;
             const int close_fd = c->close_fd;
             c->listen_fd = c->close_fd = -1; // the server owns them now, whatever happens
-            auto added = g_p0_ctx && g_p0_ctx->server
-                             ? g_p0_ctx->server->add_security_listener(listen_fd, close_fd,
-                                                                       c->ctx, c->creator)
-                             : lx::result<void>{lx::make_error(
-                                   lx::error_domain::wayland,
-                                   static_cast<int>(lx::wayland_err::bind_failed),
-                                   "no server")};
+            auto added =
+                g_p0_ctx && g_p0_ctx->server
+                    ? g_p0_ctx->server->add_security_listener(listen_fd, close_fd, c->ctx,
+                                                              c->creator)
+                    : lx::result<void>{lx::make_error(lx::wayland_err::bind_failed, "no server")};
             if (!added) {
                 // No protocol error exists for it: connections on that socket are never
                 // accepted, and the engine sees them fail.

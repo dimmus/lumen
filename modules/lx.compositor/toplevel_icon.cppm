@@ -35,13 +35,13 @@ struct icon_candidate {
     int scale = 1;
 };
 
-/// Which of `n` candidates an icon keeps (indices into `in`, written to `out`, at most
+/// Which of the candidates `in` an icon keeps (indices into `in`, written to `out`, at most
 /// `k_icon_max_images`; the count is returned). Edges outside 1…`k_icon_max_edge` are
 /// dropped; the rest are ranked by distance from `k_icon_preferred_edge` (ties: the larger
 /// edge, then the earlier candidate). When the ranked set does not fit `budget_bytes`
 /// (4 bytes per pixel), only the best-ranked candidate that fits is kept — none when even
 /// that one does not.
-unsigned select_icon_images(const icon_candidate* in, unsigned n, unsigned long long budget_bytes,
+unsigned select_icon_images(std::span<const icon_candidate> in, unsigned long long budget_bytes,
                             unsigned* out);
 
 struct icon_image {

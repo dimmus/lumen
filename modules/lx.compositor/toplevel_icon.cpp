@@ -28,7 +28,7 @@ namespace {
 }
 
 /// Ranks `a` before `b`: nearer the preferred edge, then larger, then earlier.
-[[nodiscard]] bool ranks_before(const icon_candidate* in, unsigned a, unsigned b) {
+[[nodiscard]] bool ranks_before(std::span<const icon_candidate> in, unsigned a, unsigned b) {
     const int da = edge_distance(in[a].size);
     const int db = edge_distance(in[b].size);
     if (da != db)
@@ -44,15 +44,15 @@ namespace {
 
 } // namespace
 
-unsigned select_icon_images(const icon_candidate* in, unsigned n, unsigned long long budget_bytes,
+unsigned select_icon_images(std::span<const icon_candidate> in, unsigned long long budget_bytes,
                             unsigned* out) {
-    if (!in || !out)
+    if (!out)
         return 0;
-    // Insertion into a ranked list of at most k_icon_max_images: n is small (≤ 8 tracked
+    // Insertion into a ranked list of at most k_icon_max_images: `in` is small (≤ 8 tracked
     // buffers per icon object), and nothing here allocates.
     unsigned ranked[k_icon_max_images]{};
     unsigned count = 0;
-    for (unsigned i = 0; i < n; ++i) {
+    for (unsigned i = 0; i < in.size(); ++i) {
         if (in[i].size <= 0 || in[i].size > k_icon_max_edge)
             continue;
         unsigned at = count;

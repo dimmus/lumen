@@ -55,8 +55,7 @@ private:
 
 lx::result<void> lx::gfx::headless_backend::create(unsigned width, unsigned height) {
     if (width == 0 || height == 0) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "headless_backend::create requires non-zero size");
+        return lx::invalid_argument("headless_backend::create requires non-zero size");
     }
     width_ = width;
     height_ = height;
@@ -68,8 +67,7 @@ lx::result<void> lx::gfx::headless_backend::create(unsigned width, unsigned heig
 
 lx::result<void> lx::gfx::headless_backend::begin_frame() {
     if (width_ == 0 || height_ == 0) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "headless_backend not created");
+        return lx::invalid_argument("headless_backend not created");
     }
     frame_start_ = std::chrono::steady_clock::now();
     in_frame_ = true;
@@ -78,8 +76,7 @@ lx::result<void> lx::gfx::headless_backend::begin_frame() {
 
 lx::result<void> lx::gfx::headless_backend::clear(lx::color c) {
     if (!in_frame_) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "clear outside begin_frame");
+        return lx::invalid_argument("clear outside begin_frame");
     }
     const auto r = static_cast<unsigned char>(c.r * 255.f);
     const auto g = static_cast<unsigned char>(c.g * 255.f);
@@ -144,15 +141,13 @@ void lx::gfx::headless_backend::blit_rgba_nearest(const headless_texture& tex, l
 
 lx::result<void> lx::gfx::headless_backend::blit_texture(unsigned tex_id, lx::rect2i dst) {
     if (!in_frame_) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "blit outside begin_frame");
+        return lx::invalid_argument("blit outside begin_frame");
     }
     const auto it = textures_.find(tex_id);
     if (it == textures_.end()) {
         // No placeholder fill: a stand-in rect makes a golden-image test pass while
         // proving nothing about the client's actual buffer contents.
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "blit of unregistered texture");
+        return lx::invalid_argument("blit of unregistered texture");
     }
     blit_rgba_nearest(it->second, dst);
     return {};
@@ -160,8 +155,7 @@ lx::result<void> lx::gfx::headless_backend::blit_texture(unsigned tex_id, lx::re
 
 lx::result<void> lx::gfx::headless_backend::fill_solid(lx::rect2i dst, lx::color c) {
     if (!in_frame_) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "fill outside begin_frame");
+        return lx::invalid_argument("fill outside begin_frame");
     }
     const int x0 = dst.x > 0 ? dst.x : 0;
     const int y0 = dst.y > 0 ? dst.y : 0;
@@ -184,8 +178,7 @@ lx::result<void> lx::gfx::headless_backend::fill_solid(lx::rect2i dst, lx::color
 
 lx::result<void> lx::gfx::headless_backend::end_frame_and_dump(const char* path) {
     if (!in_frame_) {
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "end_frame outside begin_frame");
+        return lx::invalid_argument("end_frame outside begin_frame");
     }
     in_frame_ = false;
     last_frame_ms_ = std::chrono::duration<double, std::milli>(

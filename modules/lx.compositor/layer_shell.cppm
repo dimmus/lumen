@@ -201,8 +201,12 @@ public:
                                       void* client_native, void* surface_res, void* layer_res,
                                       unsigned version, unsigned layer, const char* name_space,
                                       unsigned output = 0);
-    [[nodiscard]] layer_record* find(lx::surface_id surface);
-    [[nodiscard]] const layer_record* find(lx::surface_id surface) const;
+    /// `layer_record*`, or `const layer_record*` on a const layer shell.
+    [[nodiscard]] auto find(this auto& self, lx::surface_id surface)
+        -> decltype(&self.records_[0]) {
+        const int slot = self.slot_of(surface);
+        return slot >= 0 ? &self.records_[static_cast<unsigned>(slot)] : nullptr;
+    }
     /// Content committed to the surface is imported and drawn (until closed).
     [[nodiscard]] bool drawable(lx::surface_id surface) const;
 
@@ -284,8 +288,7 @@ private:
     layer_record records_[k_max]{};
     id_slot_index<k_max * 2> index_{};
     /// Every record's slot in creation order (the arrangement order within a layer).
-    unsigned all_[k_max]{};
-    unsigned all_count_ = 0;
+    std::inplace_vector<unsigned, k_max> all_{};
     /// Mapped records' slots per layer, bottom→top (each layer container's order).
     unsigned mapped_[k_layer_levels][k_max]{};
     unsigned mapped_count_[k_layer_levels]{};
@@ -508,17 +511,6 @@ void lx::compositor::layer_shell::log_line(std::format_string<Args...> fmt, Args
                                      std::forward<Args>(args)...);
 }
 
-lx::compositor::layer_record* lx::compositor::layer_shell::find(lx::surface_id surface) {
-    const int slot = slot_of(surface);
-    return slot >= 0 ? &records_[static_cast<unsigned>(slot)] : nullptr;
-}
-
-const lx::compositor::layer_record*
-lx::compositor::layer_shell::find(lx::surface_id surface) const {
-    const int slot = slot_of(surface);
-    return slot >= 0 ? &records_[static_cast<unsigned>(slot)] : nullptr;
-}
-
 bool lx::compositor::layer_shell::drawable(lx::surface_id surface) const {
     const layer_record* r = find(surface);
     return r && !r->closed;
@@ -529,7 +521,7 @@ lx::compositor::layer_shell::create(lx::surface_id surface, lx::client_id client
                                     void* client_native, void* surface_res, void* layer_res,
                                     unsigned version, unsigned layer, const char* name_space,
                                     unsigned output) {
-    if (find(surface) || all_count_ >= k_max)
+    if (find(surface) || all_.size() >= k_max)
         return create_error::no_memory;
     for (unsigned i = 0; i < k_max; ++i) {
         if (records_[i].used)
@@ -551,7 +543,7 @@ lx::compositor::layer_shell::create(lx::surface_id surface, lx::client_id client
         r.current.layer = layer;
         std::snprintf(r.name_space, sizeof(r.name_space), "%s", name_space ? name_space : "");
         r.created_seq = next_seq_++;
-        all_[all_count_++] = i;
+        all_.push_back(i);
         tree_->set_root_tag(surface, 0);
         if (layer_debug()) {
             log_line("layer create surface={} layer={} namespace={} output={}", surface.id(),
@@ -659,7 +651,7 @@ int lx::compositor::layer_shell::output_of(lx::surface_id surface) const {
 }
 
 void lx::compositor::layer_shell::close_output(unsigned slot) {
-    for (unsigned i = 0; i < all_count_; ++i) {
+    for (unsigned i = 0; i < all_.size(); ++i) {
         layer_record& r = records_[all_[i]];
         if (r.used && r.output == slot && !r.closed)
             close(r, "output-removed");
@@ -686,12 +678,12 @@ void lx::compositor::layer_shell::arrange_all(unsigned output, lx::surface_id co
         layer_arrange_out out[k_max];
         n = 0;
         for (unsigned lv = k_layer_levels; lv-- > 0;) {
-            for (unsigned i = 0; i < all_count_; ++i) {
-                layer_record& r = records_[all_[i]];
+            for (const unsigned slot : all_) {
+                layer_record& r = records_[slot];
                 if (!r.used || r.current.layer != lv || r.output != output)
                     continue;
                 in[n] = {&r.current, r.committed, r.mapped, r.initial_commit_seen && !r.closed};
-                slots[n++] = all_[i];
+                slots[n++] = slot;
             }
         }
         arrange_layers(full, in, out, n, usable);
@@ -894,14 +886,10 @@ void lx::compositor::layer_shell::destroy(lx::surface_id surface) {
     else if (host_.surface_unmapped)
         host_.surface_unmapped(host_.user, surface, "destroyed");
     const int slot = slot_of(surface);
-    for (unsigned i = 0; i < all_count_; ++i) {
-        if (static_cast<int>(all_[i]) != slot)
-            continue;
-        for (unsigned j = i + 1; j < all_count_; ++j)
-            all_[j - 1] = all_[j];
-        --all_count_;
-        break;
-    }
+    if (const auto it =
+            std::ranges::find_if(all_, [slot](unsigned s) { return static_cast<int>(s) == slot; });
+        it != all_.end())
+        all_.erase(it);
     index_.erase(surface.id());
     *r = {};
     // Its exclusive zone goes with it.

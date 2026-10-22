@@ -89,8 +89,15 @@ private:
         lx::runtime::clock_time since_ns = 0;
         bool used = false;
     };
-    [[nodiscard]] entry* find(lx::client_id client);
-    [[nodiscard]] const entry* find(lx::client_id client) const;
+    /// `entry*`, or `const entry*` on a const tracker.
+    [[nodiscard]] auto find(this auto& self, lx::client_id client) -> decltype(&self.entries_[0]) {
+        if (!client)
+            return nullptr;
+        for (auto& e : self.entries_)
+            if (e.used && e.client == client)
+                return &e;
+        return nullptr;
+    }
     [[nodiscard]] entry* find_or_add(lx::client_id client, lx::runtime::clock_time now);
     void recompute_deadline();
 
@@ -127,21 +134,6 @@ const char* lx::compositor::ping_reason_name(ping_reason r) {
     case ping_reason::periodic: return "periodic";
     }
     return "-";
-}
-
-lx::compositor::liveness_tracker::entry*
-lx::compositor::liveness_tracker::find(lx::client_id client) {
-    if (!client)
-        return nullptr;
-    for (auto& e : entries_)
-        if (e.used && e.client == client)
-            return &e;
-    return nullptr;
-}
-
-const lx::compositor::liveness_tracker::entry*
-lx::compositor::liveness_tracker::find(lx::client_id client) const {
-    return const_cast<liveness_tracker*>(this)->find(client);
 }
 
 lx::compositor::liveness_tracker::entry*

@@ -307,16 +307,13 @@ const struct zwp_input_method_v2_interface im_impl = {
     .commit_string =
         [](struct wl_client*, struct wl_resource* r, const char* text) {
             if (auto* im = im_from(r); im && relay())
-                relay()->im_commit_string(im->record, text,
-                                          text ? static_cast<unsigned>(std::strlen(text)) : 0u);
+                relay()->im_commit_string(im->record, text ? text : "");
         },
     .set_preedit_string =
         [](struct wl_client*, struct wl_resource* r, const char* text, int32_t begin,
            int32_t end) {
             if (auto* im = im_from(r); im && relay())
-                relay()->im_preedit(im->record, text,
-                                    text ? static_cast<unsigned>(std::strlen(text)) : 0u, begin,
-                                    end);
+                relay()->im_preedit(im->record, text ? text : "", begin, end);
         },
     .delete_surrounding_text =
         [](struct wl_client*, struct wl_resource* r, uint32_t before, uint32_t after) {

@@ -63,4 +63,11 @@ set_target_properties(lumen-std PROPERTIES
     CXX_EXTENSIONS OFF
     # The std module is system code: no project warnings, never -Werror.
     COMPILE_WARNING_AS_ERROR OFF)
-target_compile_options(lumen-std PRIVATE -w -Wno-reserved-module-identifier)
+# Source-file options, not target ones: consumers import a BMI that CMake rebuilds from this
+# source with their own flags (a synthetic target), and only source properties reach that
+# compile. The warning state is kept in the BMI, so this silences libstdc++ 16's own use of
+# is_trivial_v (deprecated in C++26) inside <inplace_vector>, which every user of
+# inplace_vector would otherwise get — without turning the warning off for Lumen's code.
+set_source_files_properties("${LUMEN_STD_MODULE_SOURCE}" PROPERTIES
+    COMPILE_OPTIONS "-Wno-reserved-module-identifier;-Wno-deprecated-declarations")
+target_compile_options(lumen-std PRIVATE -w)

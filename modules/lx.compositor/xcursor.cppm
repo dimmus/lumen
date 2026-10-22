@@ -315,15 +315,13 @@ struct poly {
 };
 
 struct vector_shape {
-    poly polys[k_max_polys];
-    unsigned count = 0;
+    std::inplace_vector<poly, k_max_polys> polys;
     pt hot{16.f, 16.f};
 
     void add(std::initializer_list<pt> points) {
-        if (count >= k_max_polys)
+        if (polys.size() >= k_max_polys)
             return;
-        poly& q = polys[count++];
-        q.n = 0;
+        poly& q = polys.emplace_back(); // value-initialized: n == 0
         for (const pt& v : points)
             if (q.n < k_max_points)
                 q.p[q.n++] = v;
@@ -336,11 +334,11 @@ struct vector_shape {
         const float r = degrees * 3.14159265358979f / 180.f;
         const float c = std::cos(r);
         const float s = std::sin(r);
-        for (unsigned i = 0; i < count; ++i) {
-            for (unsigned k = 0; k < polys[i].n; ++k) {
-                const float dx = polys[i].p[k].x - 16.f;
-                const float dy = polys[i].p[k].y - 16.f;
-                polys[i].p[k] = {16.f + dx * c - dy * s, 16.f + dx * s + dy * c};
+        for (poly& q : polys) {
+            for (unsigned k = 0; k < q.n; ++k) {
+                const float dx = q.p[k].x - 16.f;
+                const float dy = q.p[k].y - 16.f;
+                q.p[k] = {16.f + dx * c - dy * s, 16.f + dx * s + dy * c};
             }
         }
     }
@@ -463,18 +461,18 @@ void rasterize(const vector_shape& s, unsigned size, std::vector<std::uint32_t>&
                 for (unsigned sx = 0; sx < k_ss; ++sx) {
                     const float ux = (static_cast<float>(px) + (static_cast<float>(sx) + 0.5f) / k_ss) / scale;
                     const float uy = (static_cast<float>(py) + (static_cast<float>(sy) + 0.5f) / k_ss) / scale;
-                    bool in = false;
-                    for (unsigned i = 0; i < s.count && !in; ++i)
-                        in = inside_poly(s.polys[i], ux, uy);
+                    const bool in = std::ranges::any_of(
+                        s.polys, [&](const poly& q) { return inside_poly(q, ux, uy); });
                     if (in) {
                         ++fill;
                         continue;
                     }
                     bool near = false;
-                    for (unsigned i = 0; i < s.count && !near; ++i) {
-                        const poly& q = s.polys[i];
+                    for (const poly& q : s.polys) {
                         for (unsigned a = 0, b = q.n - 1; a < q.n && !near; b = a++)
                             near = dist2_to_segment(q.p[a], q.p[b], ux, uy) <= r2;
+                        if (near)
+                            break;
                     }
                     if (near)
                         ++outline;
@@ -672,7 +670,7 @@ void lx::compositor::xcursor_theme::load(const char* theme, unsigned size) {
 lx::compositor::cursor_image_view lx::compositor::xcursor_theme::image(cursor_shape shape) const {
     unsigned i = static_cast<unsigned>(shape);
     if (i == 0 || i >= k_cursor_shape_count)
-        i = static_cast<unsigned>(cursor_shape::default_);
+        i = std::to_underlying(cursor_shape::default_);
     const entry& e = entries_[i];
     cursor_image_view v{};
     v.pixels = e.pixels.empty() ? nullptr : e.pixels.data();

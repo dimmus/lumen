@@ -217,7 +217,7 @@ lx::result<void> lx::compositor::buffer_lifecycle_tracker::on_import(
 
     const int slot = alloc_record();
     if (slot < 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "lifecycle tracker full");
+        return lx::invalid_argument("lifecycle tracker full");
     buffer_lifecycle_record rec{};
     rec.client = client;
     rec.surface = surface;

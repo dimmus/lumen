@@ -116,8 +116,7 @@ struct fixture {
         c.surface = s;
         c.buffer = b;
         c.damage = {0, 0, w, h};
-        LUMEN_CHECK(static_cast<bool>(
-            surfaces.on_commit(static_cast<lx::compositor::surface_commit&&>(c))));
+        LUMEN_CHECK(static_cast<bool>(surfaces.on_commit(std::move(c))));
         tree.set_has_buffer(s, true);
         LUMEN_CHECK(tree.make_root(s, root_kind::dnd_icon));
         return s;

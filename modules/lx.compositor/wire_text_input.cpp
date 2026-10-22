@@ -127,14 +127,13 @@ const struct zwp_text_input_v3_interface ti_impl = {
             auto* o = ti_from(r);
             if (!o || !relay())
                 return;
-            const std::size_t len = text ? std::strlen(text) : 0;
-            if (len > lx::compositor::k_ime_text_max && !o->truncation_logged && ime_debug()) {
+            const std::string_view s = text ? text : "";
+            if (s.size() > lx::compositor::k_ime_text_max && !o->truncation_logged && ime_debug()) {
                 o->truncation_logged = true;
-                ime_log("text input surrounding text of {} bytes cut to the protocol's 4000", len);
+                ime_log("text input surrounding text of {} bytes cut to the protocol's 4000",
+                        s.size());
             }
-            relay()->set_surrounding(o->record, text,
-                                     static_cast<unsigned>(len > 0xffffu ? 0xffffu : len), cursor,
-                                     anchor);
+            relay()->set_surrounding(o->record, s, cursor, anchor);
         },
     .set_text_change_cause =
         [](struct wl_client*, struct wl_resource* r, uint32_t cause) {

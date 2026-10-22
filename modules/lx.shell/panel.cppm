@@ -944,15 +944,12 @@ const zwlr_layer_surface_v1_listener k_layer_listener = {
 lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& bridge,
                                           void* output) {
     if (!globals.compositor || !globals.shm || !globals.layer_shell)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "panel needs wl_compositor, wl_shm and zwlr_layer_shell_v1");
+        return lx::invalid_argument("panel needs wl_compositor, wl_shm and zwlr_layer_shell_v1");
     g_ = globals;
     bridge_ = &bridge;
     auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
     if (!surface)
-        return lx::make_error(lx::error_domain::wayland,
-                              static_cast<int>(lx::wayland_err::bind_failed),
-                              "wl_compositor.create_surface failed");
+        return lx::make_error(lx::wayland_err::bind_failed, "wl_compositor.create_surface failed");
     surface_ = surface;
     auto* layer = zwlr_layer_shell_v1_get_layer_surface(
         static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,

@@ -26,8 +26,7 @@ namespace {
 
 #if defined(LUMEN_HAS_EGL)
 lx::error capture_error(const char* message) {
-    return lx::make_error(lx::error_domain::gl, static_cast<int>(lx::gl_err::draw_failed),
-                          message);
+    return lx::make_error(lx::gl_err::draw_failed, message);
 }
 
 bool has_extension(const char* list, const char* name) {
@@ -74,7 +73,7 @@ lx::result<void> gl_capture::initialize(egl_device& device) {
     if (version && std::strncmp(version, "OpenGL ES ", 10) == 0)
         major = std::atoi(version + 10);
     if (major < 3) {
-        return lx::make_error(lx::error_domain::gl, static_cast<int>(lx::gl_err::no_context),
+        return lx::make_error(lx::gl_err::no_context,
                               "screen capture needs OpenGL ES 3.0 (blit, pixel-pack buffers)");
     }
     const char* extensions = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
@@ -164,8 +163,7 @@ lx::result<unsigned> gl_capture::dmabuf_framebuffer(unsigned key, int fd, unsign
         }
     }
     if (fd < 0)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "capture dma-buf target without a plane");
+        return lx::invalid_argument("capture dma-buf target without a plane");
     auto create_image =
         reinterpret_cast<PFNEGLCREATEIMAGEKHRPROC>(eglGetProcAddress("eglCreateImageKHR"));
     auto image_to_renderbuffer = reinterpret_cast<PFNGLEGLIMAGETARGETRENDERBUFFERSTORAGEOESPROC>(
@@ -264,8 +262,7 @@ lx::result<unsigned> gl_capture::offscreen_framebuffer(unsigned id, unsigned wid
         return lx::not_implemented("lx::gfx::gl_capture::offscreen_framebuffer");
     owner_objects* o = owner(id, true);
     if (!o)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "capture offscreen table full");
+        return lx::invalid_argument("capture offscreen table full");
     if (o->framebuffer && o->width == width && o->height == height)
         return o->framebuffer;
     // A new size: the old objects go (the pixel-pack buffer is sized on its next use).
@@ -482,7 +479,7 @@ lx::result<void> gl_capture::read_async(unsigned id, unsigned src, unsigned widt
         return lx::not_implemented("lx::gfx::gl_capture::read_async");
     owner_objects* o = owner(id, true);
     if (!o)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "capture read-back table full");
+        return lx::invalid_argument("capture read-back table full");
     const unsigned bytes = width * height * 4u;
     if (!o->pbo) {
         glGenBuffers(1, &o->pbo);
@@ -529,8 +526,7 @@ lx::result<void> gl_capture::finish_read(unsigned id, unsigned char* dst, unsign
 #if defined(LUMEN_HAS_EGL)
     owner_objects* o = owner(id, false);
     if (!ready_ || !o || !o->pbo || !dst || o->pbo_bytes != width * height * 4u)
-        return lx::make_error(lx::error_domain::invalid_argument, 0,
-                              "capture read-back finished without a read");
+        return lx::invalid_argument("capture read-back finished without a read");
     if (dst_width == 0 || dst_height == 0) {
         dst_width = width;
         dst_height = height;

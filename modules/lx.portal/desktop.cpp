@@ -448,7 +448,7 @@ lx::result<std::unique_ptr<desktop>> desktop::connect(const char* name) {
     auto d = std::make_unique<desktop>();
     auto* dpy = wl_display_connect(name);
     if (!dpy)
-        return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::bind_failed),
+        return lx::make_error(lx::wayland_err::bind_failed,
                               "cannot connect to the Wayland display");
     d->display_ = dpy;
     auto* reg = wl_display_get_registry(dpy);
@@ -456,7 +456,7 @@ lx::result<std::unique_ptr<desktop>> desktop::connect(const char* name) {
     wl_registry_add_listener(reg, &events::k_registry_listener, d.get());
     // Globals, then their first events (outputs, xdg-outputs, the toplevel list).
     if (wl_display_roundtrip(dpy) < 0 || wl_display_roundtrip(dpy) < 0)
-        return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::dispatch_failed),
+        return lx::make_error(lx::wayland_err::dispatch_failed,
                               "the Wayland display went away during setup");
     return d;
 }
@@ -525,19 +525,19 @@ lx::result<void> desktop::run_captures(std::vector<capture_job*>& jobs, int time
             break;
         const double left = deadline - now_ms();
         if (left <= 0)
-            return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::dispatch_failed),
+            return lx::make_error(lx::wayland_err::dispatch_failed,
                                   "the compositor did not deliver a captured frame in time");
         if (!pump(static_cast<int>(left) + 1))
-            return lx::make_error(lx::error_domain::wayland,
-                                  static_cast<int>(lx::wayland_err::client_disconnected),
+            return lx::make_error(lx::wayland_err::client_disconnected,
                                   "the Wayland connection broke during a capture");
     }
     for (capture_job* j : jobs) {
         if (j->stopped)
-            return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::protocol_violation),
-                                  "the compositor stopped the capture (output gone or session locked)");
+            return lx::make_error(
+                lx::wayland_err::protocol_violation,
+                "the compositor stopped the capture (output gone or session locked)");
         if (j->failed)
-            return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::protocol_violation),
+            return lx::make_error(lx::wayland_err::protocol_violation,
                                   "the compositor failed the captured frame");
     }
     return {};
@@ -545,7 +545,7 @@ lx::result<void> desktop::run_captures(std::vector<capture_job*>& jobs, int time
 
 lx::result<std::vector<output_shot>> desktop::capture_outputs(bool paint_cursor, int timeout_ms) {
     if (!can_capture_outputs())
-        return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::bind_failed),
+        return lx::make_error(lx::wayland_err::bind_failed,
                               "the compositor offers no ext-image-copy-capture output source");
     std::vector<std::unique_ptr<capture_job>> owned;
     std::vector<capture_job*> jobs;
@@ -566,8 +566,7 @@ lx::result<std::vector<output_shot>> desktop::capture_outputs(bool paint_cursor,
         owned.push_back(std::move(j));
     }
     if (jobs.empty())
-        return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::bind_failed),
-                              "no output to capture");
+        return lx::make_error(lx::wayland_err::bind_failed, "no output to capture");
     const double t0 = now_ms();
     const lx::result<void> ran = run_captures(jobs, timeout_ms);
     std::vector<output_shot> shots;
@@ -599,14 +598,14 @@ lx::result<std::vector<output_shot>> desktop::capture_outputs(bool paint_cursor,
 
 lx::result<image> desktop::capture_toplevel(std::string_view identifier, bool paint_cursor, int timeout_ms) {
     if (!can_capture_toplevels())
-        return lx::make_error(lx::error_domain::wayland, static_cast<int>(lx::wayland_err::bind_failed),
+        return lx::make_error(lx::wayland_err::bind_failed,
                               "the compositor offers no ext-image-copy-capture toplevel source");
     desktop_toplevel* target = nullptr;
     for (auto& t : toplevels_)
         if (!t->closed && t->identifier == identifier)
             target = t.get();
     if (!target)
-        return lx::make_error(lx::error_domain::invalid_argument, 0, "the chosen window is gone");
+        return lx::invalid_argument("the chosen window is gone");
     capture_job j;
     j.shm = static_cast<wl_shm*>(shm_);
     j.source = ext_foreign_toplevel_image_capture_source_manager_v1_create_source(

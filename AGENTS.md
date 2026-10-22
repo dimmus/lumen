@@ -145,8 +145,8 @@ snapshot/executor handoff patterns.
 | Situation | Return / behavior |
 |-----------|-------------------|
 | Platform API not wired yet | `lx::not_implemented("fully::qualified::name")` |
-| Invalid input | `lx::make_error(error_domain::invalid_argument, 0, "…")` |
-| Real subsystem failure | Domain enum + `make_error(domain, code, msg)` + `log_error` at boundary |
+| Invalid input | `lx::invalid_argument("…")` |
+| Real subsystem failure | `make_error(drm_err::open_failed, msg)` (domain follows from the enum) + `log_error` at boundary |
 | Offline UI demo only | `lx::ui::window::create` may succeed with empty window |
 
 **Never** return `{}` success from platform/integration `result<T>` stubs.
@@ -186,10 +186,8 @@ LX_RETURN_IF_ERROR(subsystem.open());
 // Assign from result
 LX_TRY_ASSIGN(device, gfx::device_selector::select_best());
 
-// Fail with domain
-return lx::make_error(lx::error_domain::wayland,
-                      static_cast<int>(lx::wayland_err::bind_failed),
-                      "failed to bind socket");
+// Fail: the domain follows from the code's enum
+return lx::make_error(lx::wayland_err::bind_failed, "failed to bind socket");
 
 // Log once at boundary, then return
 lx::trace::logger::global().log_error(err, "wayland");

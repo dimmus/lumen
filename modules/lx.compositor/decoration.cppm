@@ -221,8 +221,15 @@ private:
         double scale = 1.0;
     };
 
-    [[nodiscard]] slot* find(lx::toplevel_id id);
-    [[nodiscard]] const slot* find(lx::toplevel_id id) const;
+    /// `slot*`, or `const slot*` on a const manager.
+    [[nodiscard]] auto find(this auto& self, lx::toplevel_id id) -> decltype(&self.slots_[0]) {
+        if (!id)
+            return nullptr;
+        for (auto& s : self.slots_)
+            if (s.used && s.id == id)
+                return &s;
+        return nullptr;
+    }
     [[nodiscard]] slot* alloc(const toplevel_record& rec);
     void damage_strips(const frame_node& n) const;
     void damage_title(const frame_node& n) const;
@@ -621,26 +628,6 @@ void lx::compositor::decoration_manager::log(std::format_string<Args...> fmt,
                                              Args&&... args) const {
     lx::trace::logger::global().logf(lx::trace::level::debug, k_deco_category, fmt,
                                      std::forward<Args>(args)...);
-}
-
-lx::compositor::decoration_manager::slot*
-lx::compositor::decoration_manager::find(lx::toplevel_id id) {
-    if (!id)
-        return nullptr;
-    for (auto& s : slots_)
-        if (s.used && s.id == id)
-            return &s;
-    return nullptr;
-}
-
-const lx::compositor::decoration_manager::slot*
-lx::compositor::decoration_manager::find(lx::toplevel_id id) const {
-    if (!id)
-        return nullptr;
-    for (const auto& s : slots_)
-        if (s.used && s.id == id)
-            return &s;
-    return nullptr;
 }
 
 lx::compositor::decoration_manager::slot*

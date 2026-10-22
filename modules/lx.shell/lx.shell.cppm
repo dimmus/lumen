@@ -1826,7 +1826,7 @@ int lx::shell::shell_app::run() {
         // The bus is processed every time it is open (its timeouts are due without fd
         // activity); pipes only with events.
         if (na > 0)
-            apps_.dispatch(fds + k_fixed, na);
+            apps_.dispatch({fds + k_fixed, na});
     }
     close(sfd);
     teardown();

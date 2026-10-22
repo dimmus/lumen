@@ -111,7 +111,7 @@ void make_im(input_method_record& im, unsigned long long n) {
 }
 
 void surrounding(text_input_relay& r, text_input_record& ti, const char* text, int c, int a) {
-    r.set_surrounding(ti, text, static_cast<unsigned>(std::strlen(text)), c, a);
+    r.set_surrounding(ti, text, c, a);
 }
 
 /// A relay with an input method (res 50) and text input 1 (client 7) focused on surface 10.
@@ -233,7 +233,7 @@ LUMEN_TEST(requests_after_leave_are_ignored_but_commits_are_counted) {
     f.enable_and_commit();
     (void)f.rec.take();
     // The input method commits text: the text input's done carries its own commit count (3).
-    f.relay.im_commit_string(f.im, "x", 1);
+    f.relay.im_commit_string(f.im, "x");
     f.relay.im_commit(f.im, f.im.dones);
     LUMEN_CHECK(f.rec.take() == "commit ti=1 \"x\"\ndone ti=1 serial=3\n");
 }
@@ -244,7 +244,7 @@ LUMEN_TEST(input_method_commit_serial_rule) {
     (void)f.rec.take();
     LUMEN_CHECK(f.im.dones == 1);
     // A stale serial: pending is dropped, nothing reaches the text input.
-    f.relay.im_preedit(f.im, "ni", 2, 2, 2);
+    f.relay.im_preedit(f.im, "ni", 2, 2);
     f.relay.im_commit(f.im, 0);
     LUMEN_CHECK(f.rec.take().empty());
     // …and the next valid commit does not resurrect it.
@@ -252,8 +252,8 @@ LUMEN_TEST(input_method_commit_serial_rule) {
     LUMEN_CHECK(f.rec.take() == "done ti=1 serial=1\n");
     // preedit, commit string, deletion — in the spec's order — then done.
     f.relay.im_delete_surrounding(f.im, 2, 0);
-    f.relay.im_commit_string(f.im, "你好", 6);
-    f.relay.im_preedit(f.im, "a", 1, 1, 1);
+    f.relay.im_commit_string(f.im, "你好");
+    f.relay.im_preedit(f.im, "a", 1, 1);
     f.relay.im_commit(f.im, 1);
     LUMEN_CHECK(f.rec.take() ==
                 "preedit ti=1 \"a\" 1 1\ncommit ti=1 \"你好\"\ndelete ti=1 2 0\ndone ti=1 serial=1\n");
@@ -261,7 +261,7 @@ LUMEN_TEST(input_method_commit_serial_rule) {
     f.relay.disable(f.ti);
     f.relay.commit(f.ti);
     (void)f.rec.take();
-    f.relay.im_commit_string(f.im, "y", 1);
+    f.relay.im_commit_string(f.im, "y");
     f.relay.im_commit(f.im, f.im.dones);
     LUMEN_CHECK(f.rec.take().empty());
 }
@@ -273,7 +273,7 @@ LUMEN_TEST(one_input_method_per_seat) {
     LUMEN_CHECK(!f.relay.add_input_method(second));
     LUMEN_CHECK(!second.live && f.relay.input_method() == &f.im);
     // Its requests are ignored, its removal changes nothing.
-    f.relay.im_commit_string(second, "z", 1);
+    f.relay.im_commit_string(second, "z");
     f.relay.im_commit(second, 0);
     f.relay.remove_input_method(second);
     LUMEN_CHECK(f.rec.take().empty() && f.relay.input_method() == &f.im);
@@ -399,16 +399,16 @@ LUMEN_TEST(text_is_cut_at_utf8_boundaries_and_cursor_clamped) {
     using lx::compositor::utf8_truncate;
     // "é" is two bytes (0xc3 0xa9): a cut after its first byte drops it whole.
     const char text[] = "a\xc3\xa9z";
-    LUMEN_CHECK(utf8_truncate(text, 4, 2) == 1);
-    LUMEN_CHECK(utf8_truncate(text, 4, 3) == 3);
-    LUMEN_CHECK(utf8_truncate(text, 4, 10) == 4);
+    LUMEN_CHECK(utf8_truncate(text, 2) == 1);
+    LUMEN_CHECK(utf8_truncate(text, 3) == 3);
+    LUMEN_CHECK(utf8_truncate(text, 10) == 4);
     // A 4-byte character at the 4000-byte limit.
     std::string big(3998, 'x');
     big += "\xf0\x9f\x98\x80"; // U+1F600, 4 bytes: 4002 in all
-    LUMEN_CHECK(utf8_truncate(big.data(), static_cast<unsigned>(big.size()), 4000) == 3998);
+    LUMEN_CHECK(utf8_truncate(big, 4000) == 3998);
     fixture f{};
     f.relay.enable(f.ti);
-    f.relay.set_surrounding(f.ti, big.data(), static_cast<unsigned>(big.size()), 5000, -3);
+    f.relay.set_surrounding(f.ti, big, 5000, -3);
     LUMEN_CHECK(f.ti.pending.surrounding_len == 3998 && f.ti.pending.cursor == 3998 &&
                 f.ti.pending.anchor == 0 && f.ti.pending.surrounding[3998] == '\0');
 }
