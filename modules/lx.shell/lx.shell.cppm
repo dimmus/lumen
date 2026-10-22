@@ -9,6 +9,7 @@ module;
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <poll.h>
 #include <sys/signalfd.h>
+#include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 
@@ -24,6 +25,10 @@ module;
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #define LUMEN_SHELL_FRACTIONAL 1
+#if defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1)
+#include "single-pixel-buffer-v1-client-protocol.h"
+#define LUMEN_SHELL_SINGLE_PIXEL 1
+#endif
 #endif
 #if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1) && \
     defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
@@ -58,6 +63,7 @@ export import :app_catalog;
 export import :app_launch;
 export import :launcher;
 export import :idle_policy;
+export import :background;
 
 export namespace lx::shell {
 
@@ -67,6 +73,10 @@ struct shell_config {
     /// When to power the outputs off and when to lock (`--idle-policy`, `--blank-after`,
     /// `--blank-locked-after`, `--lock-command`, `--[no-]lock-on-blank`): see `:idle_policy`.
     idle_policy_config idle{};
+    /// The desktop background (`--background`, `LUMEN_BACKGROUND`; `--no-background`):
+    /// see `:background`.
+    background_spec background{};
+    bool background_enabled = true;
 };
 
 /// lumen-shell: a privileged Wayland client of lumen-compositor (architecture §2.2, §5).
@@ -135,6 +145,7 @@ private:
         /// The first wl_output.done arrived: the state above is complete.
         bool done = false;
         std::unique_ptr<panel> bar{};
+        std::unique_ptr<background> bg{};
         void* power = nullptr; // zwlr_output_power_v1*
         /// zwlr_output_power_v1.mode: off.
         bool off = false;
@@ -251,6 +262,9 @@ private:
     void* activation_ = nullptr;   // xdg_activation_v1*
     void* viewporter_ = nullptr;   // wp_viewporter*
     void* fractional_ = nullptr;   // wp_fractional_scale_manager_v1*
+    void* single_pixel_ = nullptr; // wp_single_pixel_buffer_manager_v1*
+    /// Written by a finished background render (`background::after_dispatch` then).
+    int bg_notify_fd_ = -1;
     void* idle_notifier_ = nullptr;      // ext_idle_notifier_v1*
     void* idle_notification_ = nullptr;  // ext_idle_notification_v1*
     void* power_manager_ = nullptr;      // zwlr_output_power_manager_v1*
@@ -724,6 +738,11 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         a.viewporter_ = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
     } else if (std::strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         a.fractional_ = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
+#if defined(LUMEN_SHELL_SINGLE_PIXEL)
+    } else if (std::strcmp(iface, wp_single_pixel_buffer_manager_v1_interface.name) == 0) {
+        // A colour background is one pixel the viewport stretches: nothing to render or hold.
+        a.single_pixel_ = wl_registry_bind(reg, name, &wp_single_pixel_buffer_manager_v1_interface, 1);
+#endif
 #endif
 #if defined(LUMEN_SHELL_IDLE)
     } else if (std::strcmp(iface, ext_idle_notifier_v1_interface.name) == 0) {
@@ -983,6 +1002,20 @@ void lx::shell::shell_app::set_notice_all(const char* text) {
 
 void lx::shell::shell_app::output_ready(output_record& o) {
     add_power(o);
+    if (panels_enabled_ && config_.background_enabled && !o.bg) {
+        o.bg = std::make_unique<background>();
+        if (auto made = o.bg->create({.compositor = compositor_,
+                                      .shm = shm_,
+                                      .layer_shell = layer_shell_,
+                                      .viewporter = viewporter_,
+                                      .fractional = fractional_,
+                                      .single_pixel = single_pixel_},
+                                     &config_.background, o.output, bg_notify_fd_);
+            !made) {
+            lx::trace::logger::global().log_error(made.get_error(), k_shell_category);
+            o.bg.reset();
+        }
+    }
     if (!panels_enabled_ || o.bar)
         return;
     o.bar = std::make_unique<panel>();
@@ -1050,6 +1083,7 @@ void lx::shell::shell_app::destroy_output(output_record& o) {
     if (o.bar)
         o.bar->destroy();
     o.bar.reset();
+    o.bg.reset();
 #if defined(LUMEN_SHELL_IDLE)
     if (o.power)
         zwlr_output_power_v1_destroy(static_cast<zwlr_output_power_v1*>(o.power));
@@ -1593,6 +1627,7 @@ int lx::shell::shell_app::run() {
     if (sfd < 0)
         return fail("signalfd failed");
     timer_fd_ = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
+    bg_notify_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     // zlm_shell_v1 v5: lock_state is sent right after the bind, before attach returns.
     bridge_.set_lock_handlers(
         [](unsigned state, void* user) { static_cast<shell_app*>(user)->on_lock_state(state); },
@@ -1727,7 +1762,7 @@ int lx::shell::shell_app::run() {
     }
 
     int code = 0;
-    constexpr unsigned k_fixed = 4;
+    constexpr unsigned k_fixed = 5;
     pollfd fds[k_fixed + app_launcher::k_max_poll];
     for (;;) {
         // The canonical libwayland client loop: dispatch what is queued, flush, then
@@ -1750,6 +1785,13 @@ int lx::shell::shell_app::run() {
                     o->bar->after_dispatch(changes);
         }
         launcher_.after_dispatch();
+        for (auto& o : outputs_) {
+            if (!o->bg)
+                continue;
+            o->bg->after_dispatch();
+            if (o->bg->closed())
+                o->bg.reset(); // its output went
+        }
         for (auto& o : outputs_) {
             if (!o->bar || !o->bar->closed())
                 continue;
@@ -1782,6 +1824,7 @@ int lx::shell::shell_app::run() {
         fds[1] = {sfd, POLLIN, 0};
         fds[2] = {catalog_.watch_fd(), POLLIN, 0};
         fds[3] = {timer_fd_, POLLIN, 0};
+        fds[4] = {bg_notify_fd_, POLLIN, 0};
         int timeout_ms = -1;
         const unsigned na = apps_.poll_fds(fds + k_fixed, app_launcher::k_max_poll, timeout_ms);
         timespec ts{};
@@ -1823,6 +1866,11 @@ int lx::shell::shell_app::run() {
         }
         if (n > 0 && fds[3].fd >= 0 && (fds[3].revents & POLLIN))
             on_timer();
+        if (n > 0 && fds[4].fd >= 0 && (fds[4].revents & POLLIN)) {
+            // A background render finished; it is shown at the top of the next iteration.
+            std::uint64_t count = 0;
+            (void)read(bg_notify_fd_, &count, sizeof(count));
+        }
         // The bus is processed every time it is open (its timeouts are due without fd
         // activity); pipes only with events.
         if (na > 0)
@@ -1830,6 +1878,9 @@ int lx::shell::shell_app::run() {
     }
     close(sfd);
     teardown();
+    if (bg_notify_fd_ >= 0)
+        close(bg_notify_fd_);
+    bg_notify_fd_ = -1;
     return code;
 }
 
@@ -1848,9 +1899,11 @@ void lx::shell::shell_app::teardown() {
     launcher_.close();
     bell_.destroy_all();
     pointer_panel_ = nullptr;
-    for (auto& o : outputs_)
+    for (auto& o : outputs_) {
         if (o->bar)
             o->bar->destroy();
+        o->bg.reset();
+    }
     bridge_.detach();
     teardown_idle();
     if (cursor_device_)

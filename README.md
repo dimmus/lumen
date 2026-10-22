@@ -180,6 +180,12 @@ data control; Flatpak apps are recognised by their security context and see none
 session-wide globals (data control, layer shell, lock, output management, …).
 `scripts/app-smoke.sh --only U,V` checks these on the console.
 
+Desktop background: `lumen-shell --background SPEC` (or `LUMEN_BACKGROUND`; `run-desktop.sh
+--background SPEC` passes it on). `lumen` is the built-in default; `#RRGGBB` a colour;
+`gradient:#RRGGBB:#RRGGBB[:DEG]` a two-stop gradient (90 = top to bottom);
+`image:PATH[:fill|fit|center|stretch|tile]` a PNG, JPEG, WebP or SVG. `--no-background`
+leaves it to another client (swaybg, wpaperd, …).
+
 Screen blanking: `lumen-shell` powers the outputs off after 10 minutes without input
 (`--blank-after S`, 0 never; idle inhibitors such as a playing video hold it off while their
 window is visible). Any input wakes them — the key or click that wakes the screen reaches no
