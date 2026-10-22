@@ -328,7 +328,7 @@ modules/
 ├── lx.shell/          shell + bridge
 ├── lx.shell.policy/   stacking/tiling policies
 ├── lx.app/            application framework
-└── lx.portal/         optional Flatpak (LUMEN_BUILD_FLATPAK_PORTAL)
+└── lx.portal/         xdg-desktop-portal-lumen: Screenshot/PickColor backend (LUMEN_BUILD_PORTAL)
 
 executables/
 ├── lumen-compositor/

@@ -24,6 +24,14 @@
 # Output goes to log files, because the console is not readable while the compositor
 # holds it; a summary is printed once the console is back.
 #
+# Portals: the session exports WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP=Lumen and
+# XDG_SESSION_TYPE=wayland to the systemd user manager, starts xdg-desktop-portal-wlr
+# (ScreenCast) and the build's xdg-desktop-portal-lumen (Screenshot, PickColor, the cast
+# source chooser), starts WirePlumber if no PipeWire session manager runs, and restarts
+# xdg-desktop-portal so browsers, OBS and screenshot tools find the session; all of it is
+# undone when the session ends (scripts/portal-session.sh). Their logs: xdpw.log,
+# portal-lumen.log.
+#
 # Options:
 #   -t SECONDS            time limit (default 600; 0 = none — only when you are sure you
 #                         can log out: the panel's button or Ctrl+Alt+Backspace)
@@ -33,6 +41,7 @@
 #   --scale S             output scale, fractional allowed (1.25, 1.5, 2); passed to the
 #                         compositor
 #   --no-shell            do not start lumen-shell
+#   --no-portals          leave xdg-desktop-portal and the user manager's environment alone
 #   --blank-after S       lumen-shell powers the outputs off after S seconds without input
 #                         (default 600; 0 = never); any input wakes them
 #   --idle-policy=none    lumen-shell leaves blanking to an external daemon (swayidle)
@@ -63,6 +72,7 @@ LIMIT=600
 LOG_DIR="${ROOT}/run-desktop-logs"
 LOG_LEVEL=info
 WITH_SHELL=1
+WITH_PORTALS=1
 JOIN_SEAT=0
 COMP_ARGS=()
 SHELL_ARGS=()
@@ -74,6 +84,7 @@ while (( $# > 0 )); do
     --decorations=server|--decorations=client) COMP_ARGS+=("$1") ;;
     --scale) COMP_ARGS+=(--scale "${2:?--scale needs a value}"); shift ;;
     --no-shell) WITH_SHELL=0 ;;
+    --no-portals) WITH_PORTALS=0 ;;
     --blank-after) SHELL_ARGS+=(--blank-after "${2:?--blank-after needs seconds}"); shift ;;
     --idle-policy=shell|--idle-policy=none) SHELL_ARGS+=("$1") ;;
     --lock-command) SHELL_ARGS+=(--lock-command "${2:?--lock-command needs a command}"); shift ;;
@@ -165,6 +176,8 @@ CLIENT_LOG="$LOG_DIR/client.log"
 : >"$COMP_LOG"; : >"$SHELL_LOG"; : >"$CLIENT_LOG"
 
 # ── Processes and cleanup ────────────────────────────────────────────────────
+# shellcheck source=portal-session.sh
+source "$ROOT/scripts/portal-session.sh"
 COMP_PID=""; SHELL_PID=""; CLIENT_PID=""
 COMP_RC=""; CLIENT_RC=""; ENDED_BY=""
 
@@ -179,6 +192,9 @@ stop() { # pid — SIGTERM, wait up to 5 s, then SIGKILL
 
 cleanup() {
   stop "$CLIENT_PID"; CLIENT_PID=""
+  # The portal backends are clients of the session: they go before the compositor, and the
+  # user manager's environment and xdg-desktop-portal are put back as they were.
+  portal_session_stop >>"$LOG_DIR/portals.log" 2>&1
   stop "$SHELL_PID"; SHELL_PID=""
   if [[ -n "$COMP_PID" ]]; then
     # SIGTERM, never SIGKILL first: the compositor's teardown restores text mode.
@@ -225,6 +241,7 @@ else
   # Clients go to Lumen, not to whatever else the environment points at.
   unset DISPLAY
   export GDK_BACKEND=wayland QT_QPA_PLATFORM=wayland SDL_VIDEODRIVER=wayland
+  export XDG_CURRENT_DESKTOP=Lumen XDG_SESSION_TYPE=wayland
 
   if (( WITH_SHELL )); then
     LUMEN_LOG="$LOG_LEVEL" "$SHELL_BIN" "${SHELL_ARGS[@]}" >"$SHELL_LOG" 2>&1 &
@@ -237,6 +254,9 @@ else
       kill -0 "$SHELL_PID" 2>/dev/null || break
       sleep 0.05
     done
+  fi
+  if (( WITH_PORTALS )); then
+    portal_session_start "$SOCKET" "$BUILD" "$LOG_DIR" >"$LOG_DIR/portals.log" 2>&1
   fi
   "${CLIENT[@]}" >"$CLIENT_LOG" 2>&1 &
   CLIENT_PID=$!
@@ -279,5 +299,6 @@ errors=$(grep -cE '^\[(ERROR|WARN)\]' "$COMP_LOG" 2>/dev/null || true)
 [[ "$ENDED_BY" == "compositor did not start" ]] && tail -15 "$COMP_LOG" | sed 's/^/    /'
 echo "  logs: $COMP_LOG"
 (( WITH_SHELL )) && echo "        $SHELL_LOG"
+(( WITH_PORTALS )) && echo "        $LOG_DIR/portals.log (xdpw.log, portal-lumen.log)"
 echo "        $CLIENT_LOG"
 [[ "$ENDED_BY" == "logged out" && "${COMP_RC:-1}" == "0" ]]

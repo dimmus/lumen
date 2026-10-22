@@ -211,6 +211,10 @@ public:
     /// a nested session (another compositor owns the card) can enumerate but not present.
     [[nodiscard]] bool is_master() const;
 
+    /// DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP: an atomic commit may carry DRM_MODE_PAGE_FLIP_ASYNC
+    /// (tearing-control-v1). Asked once, at startup.
+    [[nodiscard]] bool supports_async_flip() const;
+
     /// Open an owning render-node FD suitable for Vulkan / GBM (`/dev/dri/renderD128`).
     [[nodiscard]] lx::result<lx::unique_fd> open_render_node() const;
 
@@ -788,6 +792,16 @@ lx::result<lx::drm::kms_pipeline_desc> lx::drm::kms_device::pipeline_desc_for(un
 }
 
 int lx::drm::kms_device::card_fd() const { return card_fd_.get(); }
+
+bool lx::drm::kms_device::supports_async_flip() const {
+#if defined(LUMEN_HAS_DRM) && defined(DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP)
+    uint64_t cap = 0;
+    return card_fd_.get() >= 0 &&
+           drmGetCap(card_fd_.get(), DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP, &cap) == 0 && cap != 0;
+#else
+    return false;
+#endif
+}
 
 bool lx::drm::kms_device::is_master() const {
 #if defined(LUMEN_HAS_DRM)

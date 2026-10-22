@@ -710,9 +710,7 @@ void bind_virtual_keyboard_manager(wayland::client_connection& client, unsigned 
 
 // ── installation and the wl_surface hooks ────────────────────────────────────
 
-namespace {
-
-void focus_hook(void*, void* surface, void* client, void* destroyed) {
+void text_input_focus_hook(void*, void* surface, void* client, void* destroyed) {
     auto* rl = relay();
     if (!rl)
         return;
@@ -721,8 +719,6 @@ void focus_hook(void*, void* surface, void* client, void* destroyed) {
     else
         rl->keyboard_focus(surface, client);
 }
-
-} // namespace
 
 void install_text_input(p0_protocol_context& ctx) {
     if (!ctx.text_input)
@@ -744,10 +740,10 @@ void install_text_input(p0_protocol_context& ctx) {
     sink.popup_rect = &ev_popup_rect;
 #endif
     ctx.text_input->set_sink(sink);
-    if (ctx.input) {
-        ctx.input->set_focus_surface_hook(&focus_hook, &ctx);
+    // The router's focus-surface hook is wire_install.cpp's, which calls
+    // `text_input_focus_hook` (and keyboard-shortcuts-inhibit's).
+    if (ctx.input)
         ctx.input->set_seat_keymap_source(&seat_keymap);
-    }
 }
 
 void input_popup_committed(surface_obj* s) {

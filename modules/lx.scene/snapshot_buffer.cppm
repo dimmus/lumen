@@ -39,6 +39,10 @@ struct draw_command {
     /// Fully covered by an opaque draw above it, or entirely off the output: every backend
     /// skips it (identical pixels). Set by the scene's visibility pass (`mark_occlusion`).
     bool occluded = false;
+    /// A solid colour, no texture (`wp_single_pixel_buffer_v1`): `solid_color` premultiplied
+    /// and encoded; `texture` is empty. See `gfx::blit_command::solid`.
+    bool solid = false;
+    lx::color solid_color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
 };
 
 inline constexpr unsigned k_initial_draw_commands = 256;

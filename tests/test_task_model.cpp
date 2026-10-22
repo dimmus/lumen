@@ -317,6 +317,26 @@ LUMEN_TEST(arming_the_logout_button_damages_only_the_button) {
     LUMEN_CHECK(lx::shell::panel_diff(c, a, r, 8) == 1 && r[0].width == 1000);
 }
 
+// ── Screen-capture indicator (design-app-compat-capture CI1) ──
+
+LUMEN_TEST(capture_indicator_sits_left_of_logout_and_repaints_everything_when_it_comes_or_goes) {
+    static lx::shell::panel_layout a, b;
+    task_model& m = snapshot_of(3);
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, a, lx::shell::panel_logout{true});
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, b, lx::shell::panel_logout{true}, {}, {}, {},
+                            true);
+    LUMEN_CHECK(a.capture_w == 0);
+    LUMEN_CHECK(b.capture_w == lx::shell::k_capture_width);
+    LUMEN_CHECK(b.capture_x + b.capture_w + lx::shell::k_panel_gap == b.logout_x);
+    LUMEN_CHECK(b.cells[b.count - 1].x + b.cells[b.count - 1].w < b.capture_x);
+    lx::rect2i r[8];
+    LUMEN_CHECK(lx::shell::panel_diff(a, b, r, 8) == 1 && r[0].width == 1000);
+    LUMEN_CHECK(lx::shell::panel_diff(b, a, r, 8) == 1 && r[0].width == 1000);
+    // Without a logout button it takes the right end.
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, b, {}, {}, {}, {}, true);
+    LUMEN_CHECK(b.capture_x == 1000 - 4 - lx::shell::k_capture_width);
+}
+
 LUMEN_TEST(task_output_is_the_output_with_most_of_the_window) {
     const lx::rect2i outs[2] = {{0, 0, 1000, 800}, {1000, 0, 800, 600}};
     LUMEN_CHECK(lx::shell::task_output({100, 100, 300, 200}, outs, 2) == 0);
@@ -359,6 +379,77 @@ LUMEN_TEST(panel_filter_lists_only_its_outputs_windows) {
     static lx::shell::panel_layout c;
     lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, c);
     LUMEN_CHECK(c.count == 3);
+}
+
+// ── zlm v6: icons, parents, modal dialogs; the icon resampler ──
+
+LUMEN_TEST(icon_and_parent_change_bits_and_revisions) {
+    task_model& m = snapshot_of(2);
+    task_handle h[2];
+    (void)m.ordered(h, 2);
+    const unsigned rev0 = m.get(h[0])->icon_rev;
+    LUMEN_CHECK(m.set_icon(h[0], "foot"));
+    LUMEN_CHECK(std::strcmp(m.get(h[0])->icon_name, "foot") == 0 && m.get(h[0])->icon_rev == rev0 + 1);
+    // The same name again is still a new revision: the pixels may have changed with it.
+    LUMEN_CHECK(m.set_icon(h[0], "foot") && m.get(h[0])->icon_rev == rev0 + 2);
+    LUMEN_CHECK((m.take_changes() & lx::shell::task_change_icon) != 0);
+    LUMEN_CHECK(m.set_parent(h[1], h[0]) && m.get(h[1])->parent == h[0]);
+    LUMEN_CHECK((m.take_changes() & lx::shell::task_change_parent) != 0);
+    // A stale parent handle means none.
+    LUMEN_CHECK(m.set_parent(h[1], task_handle{h[0].index, h[0].gen + 100}) && !m.get(h[1])->parent);
+    LUMEN_CHECK(!m.set_icon(task_handle{}, "x"));
+}
+
+LUMEN_TEST(modal_child_is_hidden_from_the_panel) {
+    task_model& m = snapshot_of(3);
+    task_handle h[3];
+    (void)m.ordered(h, 3);
+    (void)m.set_parent(h[2], h[0]);
+    (void)m.set_state(h[2], "app", "w2", lx::shell::k_task_state_modal);
+    LUMEN_CHECK(lx::shell::task_is_modal_child(m, *m.get(h[2])));
+    lx::shell::panel_layout l{};
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, l);
+    LUMEN_CHECK(l.count == 2 && l.cells[0].task == h[0] && l.cells[1].task == h[1]);
+    // A modal state without a listed parent (its parent gone) is shown.
+    (void)m.remove(h[0]);
+    LUMEN_CHECK(!lx::shell::task_is_modal_child(m, *m.get(h[2])));
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, l);
+    LUMEN_CHECK(l.count == 2);
+}
+
+LUMEN_TEST(icon_revision_repaints_the_cell) {
+    task_model& m = snapshot_of(1);
+    task_handle h[1];
+    (void)m.ordered(h, 1);
+    lx::shell::panel_layout a{}, b{};
+    lx::shell::layout_panel(m, 600, 32, -1, -1, {}, a);
+    (void)m.set_icon(h[0], "foot");
+    lx::shell::layout_panel(m, 600, 32, -1, -1, {}, b);
+    lx::rect2i rects[4];
+    const unsigned n = lx::shell::panel_diff(a, b, rects, 4);
+    LUMEN_CHECK(n == 1 && rects[0].x == b.cells[0].x && rects[0].width == b.cells[0].w);
+}
+
+LUMEN_TEST(resample_icon_down_and_up) {
+    // 4x4 → 2x2: each output pixel averages a 2x2 block.
+    std::uint32_t src[16];
+    for (int y = 0; y < 4; ++y)
+        for (int x = 0; x < 4; ++x)
+            src[y * 4 + x] = (x < 2 && y < 2) ? 0xFFFFFFFFu : 0x00000000u;
+    src[1] = 0x00000000u; // the top-left block is 3/4 white
+    std::uint32_t dst[4];
+    lx::shell::resample_icon(src, 4, dst, 2);
+    LUMEN_CHECK((dst[0] >> 24) == 191 && (dst[0] & 0xFF) == 191 && dst[1] == 0 && dst[3] == 0);
+    // 2x2 → 4x4 bilinear keeps the corners.
+    std::uint32_t small[4] = {0xFF000000u, 0xFF0000FFu, 0xFF000000u, 0xFF0000FFu};
+    std::uint32_t big[16];
+    lx::shell::resample_icon(small, 2, big, 4);
+    LUMEN_CHECK(big[0] == 0xFF000000u && big[3] == 0xFF0000FFu && (big[1] & 0xFF) > 0 &&
+                (big[1] & 0xFF) < 0xFF);
+    // Same size: a copy.
+    std::uint32_t same[4];
+    lx::shell::resample_icon(small, 2, same, 2);
+    LUMEN_CHECK(std::memcmp(same, small, sizeof(small)) == 0);
 }
 
 int main(int argc, char** argv) {

@@ -278,16 +278,33 @@ namespace {
 
 /// A wl_buffer object is going away (either kind).
 void buffer_gone(struct wl_resource* resource, buffer_obj* b) {
-    // The tracker may still hold this buffer for an in-flight frame; it must forget the
-    // resource now rather than release it after the client freed it.
+    // The tracker may still hold this buffer — the surface's content, or read by a frame in
+    // flight: it forgets the resource now rather than release it after the client freed it,
+    // and keeps the record until nothing samples the import. An explicit-sync release point
+    // still owed goes with it (signalled after the last composite that read the buffer), so
+    // the client cannot recycle the memory while the GPU reads it.
+    bool adopted = false;
     if (g_p0_ctx && g_p0_ctx->lifecycle)
-        g_p0_ctx->lifecycle->on_buffer_destroyed(resource);
+        adopted = g_p0_ctx->lifecycle->on_buffer_destroyed(
+            resource, b ? b->release.timeline : 0u, b ? b->release.point : 0ull);
     // Likewise an upload still to read it: it keeps a copy, made now while it is readable.
     if (g_p0_ctx && g_p0_ctx->shm_direct)
         g_p0_ctx->shm_direct->on_buffer_gone(resource);
+    // Explicit sync: a release point no lifecycle record took (the buffer was never
+    // sampled, or already released) is signalled now.
+    if (b) {
+        if (adopted)
+            b->release = {}; // the record holds its timeline reference now
+        else
+            sync_point_signal_now(b->release);
+    }
+    // A screen capture's import of it on the render thread goes with it.
+    capture_buffer_gone(resource, b);
     // Before the references below are dropped: it asks whether a surface still shows it.
     if (b)
         destroy_buffer(b);
+    // Queued content updates attaching it drop the attach (their other state stays).
+    cu_buffer_gone(resource);
     // No surface may keep naming the dead object. A pending or cached attach of it is
     // dropped — its contents are undefined now, and keeping the previous content is the
     // safe reading — and content already on screen stays there without its object.
@@ -427,6 +444,14 @@ bool stage_image(void* user, unsigned texture_id, const uint32_t* argb, unsigned
 }
 
 void retire_image(void*, unsigned texture_id) { retire_texture(texture_id); }
+
+void buffer_release_now(wl_resource* buffer) {
+    if (!buffer)
+        return;
+    if (buffer_obj* b = find_buffer(buffer))
+        sync_point_signal_now(b->release);
+    wl_buffer_send_release(buffer);
+}
 
 } // namespace lx::compositor::p0
 

@@ -7,10 +7,12 @@ sequenceDiagram
     Note over Comp: privilege check: same UID and /proc/pid/exe<br/>== configured shell binary, else wl_display error
     Comp->>Shell: capabilities(flags, version)
     Comp->>Shell: lock_state(state) (v5: on bind and on every change)
+    Comp->>Shell: capture_state(active) (v6: on bind and on every change)
     Shell->>Comp: get_policy_bridge()
     Comp->>Shell: snapshot_begin
     Note over Comp: no snapshot_workspace / snapshot_output yet<br/>(no workspace objects; wl_output not per-client)
     Comp->>Shell: snapshot_toplevel (×N, new zlm_toplevel_v1, workspace=null)
+    Comp->>Shell: toplevel_icon → toplevel_icon_buffer(fd)* → toplevel_icon_done, toplevel_parent (v6, per window that has them)
     Comp->>Shell: snapshot_done
     Comp->>Shell: focus_changed (the focused handle, or null)
     Note over Shell: task model complete: the panel draws<br/>(never while a snapshot is in progress)
@@ -37,3 +39,12 @@ sequenceDiagram
     Note over Shell: launcher closed; nothing of the shell shown or reachable,<br/>no key grab delivered until lock_state(unlocked)
     Comp->>Shell: lock_state(abandoned) (the locker died)
     Note over Shell: starts the locker again (≤ once per 5 s, three times)
+
+    Note over Shell,Comp: Window protocols (v6)
+    Comp->>Shell: toplevel_icon(name) → toplevel_icon_buffer(sealed memfd, size, scale)* → toplevel_icon_done
+    Note over Shell: maps the memfds read-only; the panel resolves the name<br/>in the icon theme, else draws the pixels
+    Comp->>Shell: toplevel_parent(parent | null), toplevel_state(modal)
+    Note over Shell: a modal dialog is not listed beside the window it blocks
+    Comp->>Shell: bell(toplevel | null) (≤ 4/s per client, none while locked)
+    Note over Shell: flashes the window (overlay layer surface, 120 ms)
+    Shell->>Comp: grab_key(Super+L, not_inhibitable) (v6)

@@ -2637,16 +2637,64 @@ int usage() {
                  "         [--all-outputs] (lock: a surface on every output)\n"
                  "       lumen-probe output-mgmt [--watch S] [--apply SPEC | --test SPEC]\n"
                  "         [--stale-serial] [--error KIND]  (SPEC: NAME:mode=WxH[@mHz],custom=WxH,\n"
-                 "         pos=X,Y,scale=S,transform=T,vrr=0|1;NAME:off)\n");
+                 "         pos=X,Y,scale=S,transform=T,vrr=0|1;NAME:off)\n"
+                 "       lumen-probe timing [--frames N] [--timed N] [--step MS] [--size WxH]\n"
+                 "       lumen-probe solid [--rgba R,G,B,A] [--alpha F] [--content-type T]\n"
+                 "         [--size WxH] [--exit-after S]\n"
+                 "       lumen-probe tearing [--exit-after S]\n"
+                 "       lumen-probe dialog [--no-modal] | icon [--name N] [--sizes 16,32] |\n"
+                 "         bell [--count N] [--null] | foreign-export [--v1] |\n"
+                 "         foreign-import --handle H [--v1] [--modal] | shortcuts-inhibit |\n"
+                 "         data-control watch|set TEXT|get|errors [--primary] [--wlr] |\n"
+                 "         security-context [--app-id ID]   (each with [--exit-after S])\n"
+                 "       lumen-probe constraints [--confine] [--oneshot] [--region X,Y,W,H]\n"
+                 "         [--hint X,Y] [--size WxH] [--destroy-after S] | gestures\n"
+                 "         (each with [--exit-after S])\n"
+                 "       lumen-probe toplevels [--watch S]\n"
+                 "       lumen-probe capture (--output NAME | --toplevel ID | --app-id A)\n"
+                 "         [--dmabuf] [--frames N] [--cursor] [--expect R,G,B@X,Y]...\n"
+                 "         [--save FILE.ppm] [--timeout S] [--buffers K]\n"
+                 "       lumen-probe cursor-capture --output NAME [--frames N] [--timeout S]\n"
+                 "       lumen-probe animate [--size WxH] [--box N] [--interval MS]\n"
+                 "         [--colour R,G,B] [--exit-after S]\n");
     return 2;
 }
 
 } // namespace
 
 int output_mgmt_main(int argc, char** argv);
+int compat_main(int argc, char** argv);
+int window_main(int argc, char** argv);
+int pointer_main(int argc, char** argv);
+int capture_main(int argc, char** argv);
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
+    // The commit-path protocols (fifo, commit-timing, single-pixel, alpha, content type,
+    // tearing) have their own window and connection (lumen-probe-compat.cpp).
+    if (argc >= 2 && (std::strcmp(argv[1], "timing") == 0 || std::strcmp(argv[1], "solid") == 0 ||
+                      std::strcmp(argv[1], "tearing") == 0))
+        return compat_main(argc, argv);
+    // The window and session protocols (dialog, icon, bell, xdg-foreign, shortcuts inhibit,
+    // data control, security context): lumen-probe-window.cpp.
+    if (argc >= 2) {
+        static const char* const k_window_modes[] = {"dialog", "icon", "bell", "foreign-export",
+                                                     "foreign-import", "shortcuts-inhibit",
+                                                     "data-control", "security-context"};
+        for (const char* m : k_window_modes)
+            if (std::strcmp(argv[1], m) == 0)
+                return window_main(argc, argv);
+    }
+    // The pointer protocols (constraints, relative pointer, gestures):
+    // lumen-probe-pointer.cpp.
+    if (argc >= 2 && (std::strcmp(argv[1], "constraints") == 0 || std::strcmp(argv[1], "gestures") == 0))
+        return pointer_main(argc, argv);
+    // Screen capture (toplevel list, copy capture, cursor sessions, an animated window):
+    // lumen-probe-capture.cpp.
+    if (argc >= 2 && (std::strcmp(argv[1], "toplevels") == 0 || std::strcmp(argv[1], "capture") == 0 ||
+                      std::strcmp(argv[1], "cursor-capture") == 0 ||
+                      std::strcmp(argv[1], "animate") == 0))
+        return capture_main(argc, argv);
     // wlr-output-management has its own connection and no surfaces
     // (lumen-probe-output-mgmt.cpp).
     if (argc >= 2 && std::strcmp(argv[1], "output-mgmt") == 0)

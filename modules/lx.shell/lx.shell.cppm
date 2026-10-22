@@ -55,6 +55,8 @@ export module lx.shell;
 export import :task_model;
 export import :bridge;
 export import :shm_canvas;
+export import :icon_theme;
+export import :visual_bell;
 export import :panel;
 export import :desktop_entry;
 export import :app_catalog;
@@ -116,6 +118,8 @@ private:
         t_relaunch,
         /// The blank that waits for a lock the blank timeout started: at most 5 s.
         t_lock_blank,
+        /// The visual bell's flashes end (120 ms after the bell).
+        t_bell,
         t_count
     };
     enum class pointer_target : unsigned char { none, panel, launcher };
@@ -202,6 +206,13 @@ private:
     /// Powers every output off (zwlr_output_power_v1), logging `why`.
     void blank_outputs(const char* why);
 
+    // ── zlm v6: icons and the bell ──
+    /// The panel's icon source: the icon-theme name, the window's own pixel buffers, the
+    /// app id as an icon name, its desktop entry's Icon=; null for a letter tile.
+    [[nodiscard]] const std::uint32_t* resolve_icon(task_handle h, const task_entry& e, int px);
+    /// zlm_policy_bridge_v1.bell: flash the window, or the active output's panel strip.
+    void on_bell(task_handle h);
+
     // ── Lock policy ──
     /// zlm_shell_v1 v5 events.
     void on_lock_state(unsigned state);
@@ -213,6 +224,16 @@ private:
 
     shell_config config_{};
     policy_bridge bridge_{};
+    icon_theme icons_{};
+    visual_bell bell_{};
+    /// A window's own icon pixels resampled to the size the panel draws (per task slot).
+    struct icon_cache {
+        unsigned gen = 0;
+        unsigned rev = 0;
+        int px = 0;
+        std::vector<std::uint32_t> pixels;
+    };
+    icon_cache icon_cache_[k_max_tasks]{};
     std::vector<std::unique_ptr<output_record>> outputs_{};
     /// The panels exist (after the setup): an output bound later gets its panel at its done.
     bool panels_enabled_ = false;
@@ -679,7 +700,8 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         // compositor simply never sends them.
         // v4: key grabs; v5: the session lock's state and lock requests. An older
         // compositor is bound at its own version, and the bridge reports what is absent.
-        a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface, min_version(version, 5));
+        // v6: icons, parents, the bell, capture state, non-inhibitable grabs.
+        a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface, min_version(version, 6));
         // capabilities follows the bind at once; listen before it is dispatched.
         (void)a.bridge_.observe(a.shell_);
     } else if (std::strcmp(iface, wp_cursor_shape_manager_v1_interface.name) == 0) {
@@ -991,6 +1013,10 @@ void lx::shell::shell_app::output_ready(output_record& o) {
                            return at < 0 ? self == 0 : static_cast<unsigned>(at) == self;
                        },
                        &o});
+    o.bar->set_icons({[](task_handle h, const task_entry& e, int px, void* user) {
+                          return static_cast<shell_app*>(user)->resolve_icon(h, e, px);
+                      },
+                      this});
     if (auto created = o.bar->create({.compositor = compositor_,
                                       .shm = shm_,
                                       .layer_shell = layer_shell_,
@@ -1144,6 +1170,10 @@ void lx::shell::shell_app::on_timer() {
         if (idle_.lock_state() == shell_lock::abandoned)
             launch_locker("relaunch after the locker exited");
     }
+    if (deadline_[t_bell] && deadline_[t_bell] <= now) {
+        bell_.expire(now);
+        deadline_[t_bell] = bell_.deadline();
+    }
     if (deadline_[t_lock_blank] && deadline_[t_lock_blank] <= now) {
         deadline_[t_lock_blank] = 0;
         // The lock did not come in time: dark anyway (the compositor keeps it locked if it
@@ -1152,6 +1182,90 @@ void lx::shell::shell_app::on_timer() {
             blank_outputs("idle: no lock within 5 s — powering the outputs off anyway");
     }
     arm_timer();
+}
+
+// ── zlm v6: icons and the bell ──
+
+const std::uint32_t* lx::shell::shell_app::resolve_icon(task_handle h, const task_entry& e, int px) {
+    // 1. The name the window gave (xdg-toplevel-icon-v1), in the icon theme.
+    if (e.icon_name[0])
+        if (const std::uint32_t* p = icons_.lookup(e.icon_name, px))
+            return p;
+    // 2. Its own pixel buffers: the one nearest the size, resampled once per revision.
+    policy_bridge::icon_image images[policy_bridge::k_icon_images];
+    if (const unsigned n = bridge_.icon_images(h, images, policy_bridge::k_icon_images); n > 0) {
+        icon_cache& c = icon_cache_[h.index];
+        if (c.gen != h.gen || c.rev != e.icon_rev || c.px != px || c.pixels.empty()) {
+            // The smallest buffer at least as large as asked, else the largest.
+            const policy_bridge::icon_image* best = nullptr;
+            for (unsigned i = 0; i < n; ++i) {
+                const auto& im = images[i];
+                if (!best || (im.size >= px && (best->size < px || im.size < best->size)) ||
+                    (best->size < px && im.size > best->size))
+                    best = &im;
+            }
+            c.gen = h.gen;
+            c.rev = e.icon_rev;
+            c.px = px;
+            c.pixels.assign(static_cast<std::size_t>(px) * static_cast<std::size_t>(px), 0u);
+            resample_icon(best->pixels, best->size, c.pixels.data(), px);
+        }
+        return c.pixels.data();
+    }
+    // 3. The app id as an icon name (foot, org.gtk.Demo4), then its desktop entry's Icon=.
+    if (e.app_id[0]) {
+        if (const std::uint32_t* p = icons_.lookup(e.app_id, px))
+            return p;
+        ensure_catalog();
+        if (const desktop_entry* d = catalog_.find(e.app_id); d && !d->icon.empty()) {
+            char name[256];
+            std::snprintf(name, sizeof(name), "%.*s", static_cast<int>(d->icon.size()), d->icon.data());
+            if (const std::uint32_t* p = icons_.lookup(name, px))
+                return p;
+        }
+    }
+    return nullptr;
+}
+
+void lx::shell::shell_app::on_bell(task_handle h) {
+    if (idle_.lock_state() != shell_lock::unlocked || outputs_.empty())
+        return;
+    const long long now = now_ns();
+    lx::rect2i rects[16];
+    unsigned n = 0;
+    for (const auto& o : outputs_)
+        if (n < 16 && o->done)
+            rects[n++] = o->logical;
+    bool flashed = false;
+    if (const task_entry* e = bridge_.model().get(h); e && e->geometry.width > 0) {
+        // The window's rect on the output it overlaps most (a flash is a layer surface of
+        // one output).
+        const int at = task_output(e->geometry, rects, n);
+        unsigned i = 0;
+        for (const auto& o : outputs_) {
+            if (!o->done)
+                continue;
+            if (static_cast<int>(i++) != at)
+                continue;
+            const lx::rect2i& L = o->logical;
+            const int x0 = e->geometry.x > L.x ? e->geometry.x : L.x;
+            const int y0 = e->geometry.y > L.y ? e->geometry.y : L.y;
+            const int x1 = e->geometry.x + e->geometry.width < L.x + L.width
+                               ? e->geometry.x + e->geometry.width
+                               : L.x + L.width;
+            const int y1 = e->geometry.y + e->geometry.height < L.y + L.height
+                               ? e->geometry.y + e->geometry.height
+                               : L.y + L.height;
+            flashed = bell_.flash(o->output, {x0 - L.x, y0 - L.y, x1 - x0, y1 - y0}, now);
+        }
+    }
+    if (!flashed) {
+        // No window (or not on screen): the panel strip of the output the user works on.
+        if (output_record* o = launcher_output(); o && o->logical.width > 0)
+            flashed = bell_.flash(o->output, {0, 0, o->logical.width, k_panel_height}, now);
+    }
+    if (flashed)
+        set_timer(t_bell, bell_.deadline());
 }
 
 // ── Lock policy ──
@@ -1564,6 +1678,13 @@ int lx::shell::shell_app::run() {
                        a.set_timer(t_repeat, 0);
                    },
                    this);
+    // The visual bell (zlm v6) flashes over windows through overlay layer surfaces.
+    bell_.init({.compositor = compositor_,
+                .shm = shm_,
+                .layer_shell = layer_shell_,
+                .viewporter = viewporter_});
+    bridge_.set_bell_handler(
+        [](task_handle h, void* user) { static_cast<shell_app*>(user)->on_bell(h); }, this);
     // Shell keybindings (zlm_shell_v1 v4). The Super tap is observed — the key still reaches
     // the focused window — and fires only when Super was pressed and released alone.
     if (bridge_.can_grab_keys()) {
@@ -1583,7 +1704,11 @@ int lx::shell::shell_app::run() {
                 if (a.idle_.on_lock_requested())
                     a.launch_locker("Super+L");
             };
-            (void)bridge_.grab_key(k_key_l, policy_bridge::k_mod_super, 0, on_lock, this);
+            // Not inhibitable (v6): a VM viewer that takes the desktop's shortcuts must not
+            // take away the user's lock key.
+            (void)bridge_.grab_key(k_key_l, policy_bridge::k_mod_super,
+                                   bridge_.has_v6() ? policy_bridge::k_grab_not_inhibitable : 0u,
+                                   on_lock, this);
         }
     } else {
         (void)bridge_.grab_key(0, 0, 0, nullptr, nullptr); // logs the absence once
@@ -1737,6 +1862,7 @@ void lx::shell::shell_app::teardown() {
         t.launch.reset();
     }
     launcher_.close();
+    bell_.destroy_all();
     pointer_panel_ = nullptr;
     for (auto& o : outputs_)
         if (o->bar)

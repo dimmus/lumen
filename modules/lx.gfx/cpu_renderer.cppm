@@ -424,6 +424,43 @@ struct srgb_tables {
     return (a << 24) | (c2 << 16) | (g << 8) | c0;
 }
 
+/// A solid draw (`blit_command::solid`) over `band`: one premultiplied word built once,
+/// then a span fill when it is opaque and untinted (no destination read — the scanout
+/// mapping is write-combining), else a per-pixel source-over. Returns bytes written.
+inline unsigned long long fill_solid(const pixel_surface& dst, const blit_command& cmd,
+                                     lx::rect2i band) {
+    const lx::rect2i area = intersect(clipped_dst(cmd.dst, cmd.clip), band);
+    if (area.width <= 0 || area.height <= 0)
+        return 0;
+    const float k = cmd.opacity * cmd.tint.a;
+    const unsigned opacity_255 = k >= 1.f ? 255u : (k <= 0.f ? 0u : to_255(k));
+    if (opacity_255 == 0)
+        return 0;
+    // The tint's colour channels multiply the premultiplied colour; its alpha folds into
+    // the opacity, as for a texel.
+    const unsigned r = to_255(cmd.solid_color.r * (cmd.tint.r < 1.f ? cmd.tint.r : 1.f));
+    const unsigned g = to_255(cmd.solid_color.g * (cmd.tint.g < 1.f ? cmd.tint.g : 1.f));
+    const unsigned bl = to_255(cmd.solid_color.b * (cmd.tint.b < 1.f ? cmd.tint.b : 1.f));
+    const unsigned a = to_255(cmd.solid_color.a);
+    const std::uint32_t word = is_rgba_order(dst.format)
+                                   ? (a << 24) | (bl << 16) | (g << 8) | r
+                                   : (a << 24) | (r << 16) | (g << 8) | bl;
+    const bool fill = a == 255u && opacity_255 == 255u;
+    for (int y = 0; y < area.height; ++y) {
+        auto* row = reinterpret_cast<std::uint32_t*>(
+                        dst.pixels + static_cast<std::size_t>(area.y + y) * dst.stride) +
+                    area.x;
+        if (fill) {
+            for (int x = 0; x < area.width; ++x)
+                row[x] = word;
+        } else {
+            for (int x = 0; x < area.width; ++x)
+                row[x] = blend_over_linear(word, row[x], opacity_255);
+        }
+    }
+    return static_cast<unsigned long long>(area.height) * area.width * 4ull;
+}
+
 } // namespace lx::gfx::detail
 
 // ── cpu_compositor ───────────────────────────────────────────────────────────
@@ -511,8 +548,12 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
 
     for (unsigned i = job.first_cmd; i < job.count; ++i) {
         const auto& cmd = job.cmds[i];
-        if (cmd.occluded)
+        if (cmd.occluded || draw_invisible(cmd))
             continue;
+        if (cmd.solid) {
+            bytes += fill_solid(dst, cmd, band_rect);
+            continue;
+        }
         const int index = job.self->find(cmd.texture_id);
         if (index < 0)
             continue;
@@ -717,10 +758,19 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
     bool needs_clear = true;
     for (unsigned i = count; i-- > 0 && cmds;) {
         const auto& cmd = cmds[i];
+        if (cmd.occluded || draw_invisible(cmd))
+            continue;
+        if (cmd.solid) {
+            if (cmd.opacity >= 1.f && cmd.tint.a >= 1.f && cmd.solid_color.a >= 1.f &&
+                covers(clipped_dst(cmd.dst, cmd.clip), clip)) {
+                first_cmd = i;
+                needs_clear = false;
+                break;
+            }
+            continue;
+        }
         const int index = find(cmd.texture_id);
         if (index < 0)
-            continue;
-        if (cmd.occluded)
             continue;
         const pixel_surface& src = textures_[static_cast<unsigned>(index)].surface;
         if (!src.valid() || pick_convert(src.format, dst.format) == convert_op::unsupported)
@@ -739,12 +789,19 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
 
     for (unsigned i = 0; i < count && cmds; ++i) {
         const auto& cmd = cmds[i];
+        if (cmd.solid) {
+            if (i < first_cmd || cmd.occluded || draw_invisible(cmd))
+                ++stats.draws_culled;
+            else
+                ++stats.draws_submitted;
+            continue;
+        }
         const int index = find(cmd.texture_id);
         if (index < 0) {
             ++stats.draws_skipped;
             continue;
         }
-        if (i < first_cmd || cmd.occluded) {
+        if (i < first_cmd || cmd.occluded || draw_invisible(cmd)) {
             ++stats.draws_culled;
             continue;
         }

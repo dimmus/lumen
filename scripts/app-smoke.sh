@@ -250,6 +250,96 @@
 #        typed after it arrive through the virtual keyboard — the file holds "ααxyz"
 #     M5 GTK 4 (gtk4-demo entry_undo, WARN-level): binds text input v2, gets preedit "αα"
 #        and commit_string "αα" from the probe input method
+#   T  commit-path protocols (design-app-compat-capture Part A)
+#     T1 vkcube --present_mode 2 (Mesa's Vulkan WSI FIFO on lavapipe): binds wp_fifo and
+#        sends set_barrier + wait_barrier per present; it never commits faster than the
+#        refresh (WARN when the compositor never had to hold an update: lavapipe slower
+#        than the display)
+#     T2 weston-simple-timing: commit-timing targets queued by the compositor, no error
+#     T3 lumen-probe timing: 120 FIFO updates committed back to back are all presented, one
+#        per refresh (none discarded, no interval under half a refresh); 20 timed updates
+#        are presented no earlier than 0.5 ms before their target and at most a refresh late
+#     T4 lumen-probe solid: a single-pixel green buffer sized 320x240 by a viewport, alpha
+#        one half, type video — the compositor applies it as a solid (no texture), the
+#        alpha and the content type reach the scene, and a screenshot shows half green
+#     T5 lumen-probe tearing: a fullscreen window with the async hint — the hint is applied,
+#        and on a card without async flips the compositor says so and presents with vsync
+#     T6 weston-simple-egl (GL client, dma-buf with implicit fences): frames keep coming;
+#        reports how often an update had to wait for its buffer's fences
+#   U  window protocols (design-app-compat-capture Part B; lumen-shell runs for U and V)
+#     U1 lumen-probe dialog: a modal child (xdg-dialog-v1) maps centred on its parent; a click
+#        on the parent is consumed (the probe sees no button) and the dialog keeps the keyboard
+#     U2 GTK 4's modal message dialog (gtk4-demo Dialogs, Alt+M; WARN-level): GTK sends
+#        get_xdg_dialog + set_modal, a click on the parent is consumed
+#     U3 xdg-toplevel-icon: foot's icon name and the probe's name with 16+32 px buffers reach
+#        the shell (its bridge's `icon handle=` lines); foot does not warn about the protocol
+#     U4 xdg-system-bell: foot's \a (bell.system=yes) and six probe rings 50 ms apart reach
+#        the shell (4 per second per client pass), which flashes the window (an overlay layer
+#        surface `lumen-bell`); foot does not warn about the protocol
+#     U5 xdg-foreign: a v2 and a v1 export imported by another client (set_parent_of; the v2
+#        child modal), each import told `destroyed` when its exporter exits
+#   V  keyboard, data, sandbox
+#     V1 keyboard-shortcuts-inhibit (lumen-probe shortcuts-inhibit): Super and Super+Return
+#        reach the probe and neither the shell's tap nor a grab fires; Ctrl+Alt+F2 still
+#        switches VT (paused, chvt back, resumed); Super+Escape turns the inhibitor off
+#        (`inactive`), after which the Super tap opens the launcher (Escape closes it)
+#     V2 ext-data-control with wl-clipboard: wl-copy → wl-paste (clipboard and primary),
+#        cliphist stores every selection through `wl-paste --watch`, foot pastes a wl-copy
+#        selection into a file (Ctrl+Shift+V), a second wl-copy cancels the first
+#     V3 security-context (lumen-probe security-context): a client through the engine's
+#        listener is sandboxed and sees none of the session-wide globals (data control, layer
+#        shell, lock, output management and power, idle notifier, input method, virtual
+#        keyboard, the security-context manager itself); the socket stops when its close fd
+#        hangs up
+#   W  pointer protocols (design-app-compat-capture Part C; relative motion injected on the
+#      VMware mouse's REL_X/REL_Y node, LUMEN_INJECT_RELATIVE, default /dev/input/event3)
+#     W1 lumen-probe constraints (persistent lock): locked once the pointer is on the focused
+#        window; 20 relative motions arrive with their unaccelerated deltas (10,-5 device
+#        units) and an absolute-device move arrives as a relative delta of the same size —
+#        and no wl_pointer.motion, the pointer staying where it was (every re-entry and the
+#        first motion after the release are at the lock position). Deactivated by focus loss
+#        (lumen-square takes the keyboard), a VT switch (Ctrl+Alt+F2) and the session lock
+#        (lumen-probe lock), and holding again after each; Super+Escape releases it
+#     W2 lumen-probe constraints --confine --region 40,40,200,120: confined inside the region;
+#        absolute moves out of it and relative motion stop at its edges (one wl_fixed short
+#        of the far ones); Super+Escape unconfines
+#     W3 lumen-probe constraints --oneshot --hint 60,50: released by Super+Escape the pointer
+#        is warped to the hint (wl_pointer.motion 60,50); a spent oneshot never locks again
+#     W4 weston-constraints (WAYLAND_DEBUG=client): a click confines (motion clamped inside the
+#        surface), the next locks (relative_motion, no wl_pointer.motion), the next unlocks
+#     W5 pointer gestures: lumen-probe gestures binds v3; the compositor's device list says
+#        whether any device can make gestures (a VM has no touchpad: bind only)
+#   Y  screen capture (design-app-compat-capture Part D; grim, wf-recorder, lumen-probe)
+#     Y1 grim -o: the PNG is the output's size and, pixel for pixel, the frame the compositor
+#        reads back itself (SIGUSR1); the probe window's colour at its place
+#     Y2 grim -T of a window covered by another: its own pixels, at its own size
+#     Y3 grim -c paints the pointer, grim without it does not (the pointer is a plane)
+#     Y4 lumen-probe capture of an animating client (dma-buf and shm): the first frame full,
+#        later ones only the moving square's damage; the window's colour where nothing moves
+#     Y5 a covered window's screencast keeps its frames coming (paced like a shown window,
+#        not the 1 s throttle of covered windows)
+#     Y6 the session lock: a capture from the request on is the black curtain, no frame while
+#        locked, the desktop again after unlock
+#     Y7 wf-recorder (wlr-screencopy): a 3 s recording of the output has frames
+#     Y8 the toplevel list (ext-foreign-toplevel-list) and a pointer cursor session
+#   Z  portals (design-app-compat-capture Part E; scripts/portal-session.sh sets up
+#      xdg-desktop-portal for the run — the user manager's environment and the frontend are
+#      restored afterwards; lumen-portal-probe is the application)
+#     Z1 Screenshot (xdg-desktop-portal-lumen, non-interactive): a private PNG of the
+#        output's size, pixel for pixel the compositor's own read-back
+#     Z2 Screenshot through xdg-desktop-portal, interactive: a dragged area over a red
+#        window is a PNG of exactly the dragged size, all red, in the pictures directory
+#     Z3 interactive, the other ways out: Enter → every output, a click → that output,
+#        Escape → response 1 (cancelled)
+#     Z4 PickColor through the frontend: a click on the red window → (1, 0, 0)
+#     Z5 ScreenCast through the frontend (xdg-desktop-portal-wlr): Lumen's source chooser
+#        lists the output then the windows, Enter shares the output; the PipeWire stream (the
+#        probe offers dma-buf, then shm) has the output's size, frames at a moving client's
+#        pace, the red window's pixels
+#     Z6 ScreenCast of a window chosen in the chooser: the window's size
+#     Z7 Screenshot of a window (target Window: the list, Enter): the window's own size
+#     Z8 the session locked: a screenshot is refused (response 2), never the lock screen;
+#        after unlock it works again
 #   X  robustness: lumen-square --sub --destroy-parent-first tears the parent wl_surface
 #      down before the strip's wl_subsurface; no protocol error, compositor alive
 #
@@ -273,16 +363,18 @@ BUILD="${LUMEN_BUILD_DIR:-${ROOT}/build/release}"
 COMP="${BUILD}/lumen-compositor"
 SQUARE="${BUILD}/lumen-square"
 PROBE="${BUILD}/lumen-probe"
+PORTAL_PROBE="${BUILD}/lumen-portal-probe"
 SHELL_BIN="${BUILD}/lumen-shell"
 INJ="${ROOT}/scripts/inject-input.py"
 POINTER_DEV="${LUMEN_INJECT_POINTER:-/dev/input/event2}"
 KEYBOARD_DEV="${LUMEN_INJECT_KEYBOARD:-/dev/input/event1}"
+RELATIVE_DEV="${LUMEN_INJECT_RELATIVE:-/dev/input/event3}"
 
 SOCKET="lumen-app-smoke"
 LOG_DIR="${ROOT}/app-smoke-logs"
 JOIN_SEAT=0
 COUNTDOWN=3
-ONLY="A,B,C,D,E,F,G,H,I,J,S,P,K,L,M,X"
+ONLY="A,B,C,D,E,F,G,H,I,J,S,P,K,L,M,T,U,V,W,X,Y,Z"
 SKIP_GTK=0
 while (( $# > 0 )); do
   case "$1" in
@@ -300,7 +392,7 @@ done
 want() { [[ ",${ONLY}," == *",$1,"* ]]; }
 for g in ${ONLY//,/ }; do
   case "$g" in
-    A|B|C|D|E|F|G|H|I|J|S|P|K|L|M|X) ;;
+    A|B|C|D|E|F|G|H|I|J|S|P|K|L|M|T|U|V|W|X|Y|Z) ;;
     *) echo "unknown group '$g' (see --help)"; exit 2 ;;
   esac
 done
@@ -350,7 +442,9 @@ newest_of() {
 }
 if command -v git >/dev/null && git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
   for pair in "$COMP:modules executables/lumen-compositor" "$SQUARE:executables/lumen-square" \
-              "$PROBE:tests/clients" "$SHELL_BIN:modules/lx.shell executables/lumen-shell"; do
+              "$PROBE:tests/clients" "$SHELL_BIN:modules/lx.shell executables/lumen-shell" \
+              "$BUILD/xdg-desktop-portal-lumen:modules/lx.portal executables/xdg-desktop-portal-lumen"; do
+    [[ -e "${pair%%:*}" ]] || continue
     bin=${pair%%:*}
     # shellcheck disable=SC2086 # the path list is meant to split
     src=$(newest_of ${pair#*:})
@@ -368,6 +462,11 @@ fi
 for dev in "$POINTER_DEV" "$KEYBOARD_DEV"; do
   [[ -c "$dev" ]] || { echo "FAIL: $dev is not an input device node"; exit 2; }
 done
+if want W && [[ ! -c "$RELATIVE_DEV" ]]; then
+  echo "FAIL: $RELATIVE_DEV is not an input device node (group W injects relative motion there;"
+  echo "      set LUMEN_INJECT_RELATIVE to a node with REL_X/REL_Y)"
+  exit 2
+fi
 
 SEAT_SCOPE=""
 sid=$(loginctl show-seat seat0 -p ActiveSession --value 2>/dev/null || true)
@@ -400,6 +499,8 @@ fi
 rm -f "$SOCKET_PATH" "$LOCK_PATH"
 
 # ── Processes and cleanup ────────────────────────────────────────────────────
+# shellcheck source=portal-session.sh
+source "$ROOT/scripts/portal-session.sh"
 # Every client PID this script starts, so cleanup signals exactly those (never a pattern).
 COMP_PID=""; WATCH_PID=""; CLIENT_PIDS=()
 COMP_RC="not-stopped"
@@ -433,6 +534,7 @@ cleanup() {
   local pid
   for pid in "${CLIENT_PIDS[@]}"; do stop_client "$pid"; done
   CLIENT_PIDS=()
+  portal_session_stop >>"$LOG_DIR/portals.log" 2>&1
   stop_compositor
   stop_watch
   rm -f "$SOCKET_PATH" "$LOCK_PATH"
@@ -498,7 +600,7 @@ forget_client() { # pid: stopped, drop it from the cleanup list
 SCEN=""
 inject() {
   sudo -n python3 -I "$INJ" --pointer "$POINTER_DEV" --keyboard "$KEYBOARD_DEV" \
-    --output "${OUT_W}x${OUT_H}" --tag "$SCEN" "$@" >>"$INJ_LOG"
+    --relative "$RELATIVE_DEV" --output "${OUT_W}x${OUT_H}" --tag "$SCEN" "$@" >>"$INJ_LOG"
 }
 BEGIN_COMP=0
 begin() { SCEN=$1; BEGIN_COMP=$(lines "$COMP_LOG"); }
@@ -2217,6 +2319,712 @@ if want M; then
   stop_client "$M1IM_PID"; forget_client "$M1IM_PID"
 fi
 
+if want T; then
+  wait_gone() { # pid seconds
+    local deadline=$(( $(date +%s%N) + ${2}000000000 ))
+    while kill -0 "$1" 2>/dev/null && (( $(date +%s%N) < deadline )); do sleep 0.1; done
+    stop_client "$1"; forget_client "$1"
+  }
+  # T1 — Mesa's Vulkan FIFO present (fifo-v1, commit-timing-v1 when it uses present timing).
+  begin T1
+  if command -v vkcube >/dev/null; then
+    T1_START=$(date +%s%N)
+    WAYLAND_DEBUG=client start_client vkcube-t1 vkcube --wsi wayland --present_mode 2 --c 300
+    T1_PID=$LAST_PID
+    wait_gone "$T1_PID" 30
+    T1_MS=$(( ($(date +%s%N) - T1_START) / 1000000 ))
+    finish skipped=0 ms="$T1_MS"
+  else
+    finish skipped=1
+  fi
+
+  # T2 — weston-simple-timing: frames scheduled in the future with commit-timing.
+  begin T2
+  if command -v weston-simple-timing >/dev/null; then
+    WAYLAND_DEBUG=client start_client simple-timing-t2 weston-simple-timing
+    T2_PID=$LAST_PID
+    sleep 5
+    stop_client "$T2_PID"; forget_client "$T2_PID"
+    finish skipped=0
+  else
+    finish skipped=1
+  fi
+
+  # T3 — the probe's FIFO stream and timed commits, judged from its presentation feedback.
+  begin T3
+  start_client probe-t3 "$PROBE" timing --frames 120 --timed 20 --step 55 --size 320x240
+  T3_PID=$LAST_PID
+  wait_gone "$T3_PID" 40
+  finish
+
+  # T4 — single-pixel + viewport + alpha + content type, and its pixels.
+  begin T4
+  start_client probe-t4 "$PROBE" solid --rgba 0,255,0,255 --alpha 0.5 --content-type video \
+    --size 320x240 --exit-after 30
+  T4_PID=$LAST_PID
+  T4_ID=$(wait_map lumen-probe 5) && settle "$T4_ID"
+  SHOT=""
+  if (( T4_ID > 0 )); then
+    sleep 0.3
+    N0=$(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG")
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    for _ in $(seq 1 40); do
+      (( $(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG") > N0 )) && break
+      sleep 0.1
+    done
+    SHOT=$(grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //')
+  fi
+  stop_client "$T4_PID"; forget_client "$T4_PID"
+  finish id="${T4_ID:-0}" shot="\"${SHOT}\""
+
+  # T5 — tearing-control: a fullscreen window asking for async presentation.
+  begin T5
+  start_client probe-t5 "$PROBE" tearing --exit-after 30
+  T5_PID=$LAST_PID
+  T5_ID=$(wait_map lumen-probe 5) && settle "$T5_ID"
+  comp_since "async page flip unsupported|async flip allowed" 3
+  sleep 0.5
+  stop_client "$T5_PID"; forget_client "$T5_PID"
+  finish id="${T5_ID:-0}"
+
+  # T6 — a GL client: dma-buf buffers with implicit fences, checked before each apply.
+  begin T6
+  if command -v weston-simple-egl >/dev/null; then
+    WAYLAND_DEBUG=client start_client simple-egl-t6 weston-simple-egl
+    T6_PID=$LAST_PID
+    T6_ID=$(wait_map "\\S*" 5)
+    sleep 4
+    stop_client "$T6_PID"; forget_client "$T6_PID"
+    finish skipped=0 id="${T6_ID:-0}"
+  else
+    finish skipped=1
+  fi
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want U || want V; then
+  # lumen-shell for U and V: icons and the bell reach its panel, its Super tap is the
+  # inhibitable grab V1 checks.
+  begin UV0
+  UV_SHELL_LOG="$LOG_DIR/shell-uv.log"
+  start_client shell-uv env LUMEN_LOG=debug "$SHELL_BIN"
+  UV_SHELL_PID=$LAST_PID
+  comp_since "compositor.shell: bridge bound " 5
+  comp_since "compositor.layer: layer map surface=[0-9]+ layer=top namespace=lumen-panel " 5
+  finish
+fi
+
+if want U; then
+  # U1 — lumen-probe dialog: a modal child of a parent window (xdg-dialog-v1).
+  begin U1
+  start_client probe-u1 "$PROBE" dialog --exit-after 40
+  U1_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-u1.log" "^dialog mapped" 5
+  sleep 0.5
+  U1_PARENT=$(tail -n +"$((BEGIN_COMP + 1))" "$COMP_LOG" | grep -oE "compositor.wm: map id=[0-9]+ app_id=lumen-probe " | head -1 | sed -E 's/.*id=([0-9]+).*/\1/')
+  U1_DIALOG=$(tail -n +"$((BEGIN_COMP + 1))" "$COMP_LOG" | grep -oE "compositor.wm: map id=[0-9]+ app_id=lumen-probe " | sed -n 2p | sed -E 's/.*id=([0-9]+).*/\1/')
+  [[ -n "$U1_DIALOG" ]] && settle "$U1_DIALOG"
+  # A click on the parent's top-left corner (the centred dialog does not cover it).
+  read -r PX PY _ _ < <(geom "${U1_PARENT:-0}")
+  if [[ -n "${PX:-}" ]]; then
+    inject move $((PX + 12)) $((PY + 12)); sleep 0.2
+    inject button left click; sleep 0.5
+  fi
+  stop_client "$U1_PID"; forget_client "$U1_PID"
+  finish parent="${U1_PARENT:-0}" dialog="${U1_DIALOG:-0}"
+
+  # U2 — GTK 4's modal message dialog (gtk4-demo "Dialogs", Alt+M): the parent blocked.
+  begin U2
+  if (( ! SKIP_GTK )) && command -v gtk4-demo >/dev/null; then
+    WAYLAND_DEBUG=client GSK_RENDERER=cairo start_client gtk-u2 gtk4-demo --run=dialog
+    U2_PID=$LAST_PID
+    # gtk4-demo --run takes the app id gtk4-demo (not org.gtk.Demo4).
+    U2_PARENT=$(wait_map gtk4-demo 10)
+    sleep 1.5
+    inject key KEY_LEFTALT+KEY_M tap; sleep 1.5
+    U2_DIALOG=$(tail -n +"$((BEGIN_COMP + 1))" "$COMP_LOG" | grep -oE "compositor.wm: map id=[0-9]+ app_id=gtk4-demo " | sed -n 2p | sed -E 's/.*id=([0-9]+).*/\1/')
+    read -r PX PY _ _ < <(geom "${U2_PARENT:-0}")
+    if [[ -n "${PX:-}" && -n "${U2_DIALOG:-}" ]]; then
+      inject move $((PX + 15)) $((PY + 60)); sleep 0.2
+      inject button left click; sleep 0.6
+      inject key KEY_ESC tap; sleep 0.8
+    fi
+    stop_client "$U2_PID"; forget_client "$U2_PID"
+    finish skipped=0 parent="${U2_PARENT:-0}" dialog="${U2_DIALOG:-0}"
+  else
+    finish skipped=1
+  fi
+
+  # U3 — icons: foot names its icon (and must not warn about xdg-toplevel-icon), the probe
+  # sends a name and two pixel buffers; both reach the shell.
+  begin U3
+  start_client foot-u3 foot --app-id foot -o bell.system=yes sh -c 'sleep 1.2; printf "\a"; sleep 30'
+  U3_FOOT_PID=$LAST_PID
+  U3_FOOT=$(wait_map foot 8)
+  start_client probe-u3 "$PROBE" icon --name lumen-probe-u3-icon --sizes 16,32 --exit-after 30
+  U3_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-u3.log" "^icon set" 5
+  sleep 1.5
+  stop_client "$U3_PID"; forget_client "$U3_PID"
+  finish foot="${U3_FOOT:-0}"
+
+  # U4 — the bell: foot's `\a` (bell.system=yes) and the probe's rings reach the shell, which
+  # flashes the window (an overlay layer surface).
+  begin U4
+  start_client probe-u4 "$PROBE" bell --count 6 --interval 50 --exit-after 30
+  U4_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-u4.log" "^bell rang" 5
+  sleep 0.8
+  stop_client "$U4_PID"; forget_client "$U4_PID"
+  stop_client "$U3_FOOT_PID"; forget_client "$U3_FOOT_PID"
+  finish
+
+  # U5 — xdg-foreign: v2 and v1 exports imported by another client (modal across clients),
+  # and `destroyed` when the exporter goes.
+  begin U5
+  start_client probe-u5e "$PROBE" foreign-export --exit-after 40
+  U5E_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-u5e.log" "^handle=" 5
+  U5_HANDLE=$(grep -m1 -oE "^handle=[0-9a-f]+" "$LOG_DIR/probe-u5e.log" | cut -d= -f2)
+  start_client probe-u5i "$PROBE" foreign-import --handle "${U5_HANDLE:-none}" --modal --exit-after 40
+  U5I_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-u5i.log" "^(imported|destroyed)" 5
+  start_client probe-u5v1e "$PROBE" foreign-export --v1 --exit-after 40
+  U5V1E_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-u5v1e.log" "^handle=" 5
+  U5V1_HANDLE=$(grep -m1 -oE "^handle=[0-9a-f]+" "$LOG_DIR/probe-u5v1e.log" | cut -d= -f2)
+  start_client probe-u5v1i "$PROBE" foreign-import --v1 --handle "${U5V1_HANDLE:-none}" --exit-after 40
+  U5V1I_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-u5v1i.log" "^(imported|destroyed)" 5
+  sleep 0.5
+  stop_client "$U5E_PID"; forget_client "$U5E_PID"
+  stop_client "$U5V1E_PID"; forget_client "$U5V1E_PID"
+  wait_for "$LOG_DIR/probe-u5i.log" "^destroyed" 3
+  wait_for "$LOG_DIR/probe-u5v1i.log" "^destroyed" 3
+  stop_client "$U5I_PID"; forget_client "$U5I_PID"
+  stop_client "$U5V1I_PID"; forget_client "$U5V1I_PID"
+  finish
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want V; then
+  # V1 — keyboard-shortcuts-inhibit: while the probe inhibits, the shell's Super tap and
+  # Super+Return reach it (no launcher); Ctrl+Alt+F2 still switches VT; Super+Escape turns
+  # the inhibitor off (inactive), after which the Super tap opens the launcher again.
+  begin V1
+  start_client probe-v1 "$PROBE" shortcuts-inhibit --exit-after 60
+  V1_PID=$LAST_PID
+  V1_ID=$(wait_map lumen-probe 5) && settle "$V1_ID"
+  wait_for "$LOG_DIR/probe-v1.log" "^inhibit active" 3
+  inject key KEY_LEFTMETA tap; sleep 0.6
+  inject key KEY_LEFTMETA+KEY_ENTER tap; sleep 0.6
+  V1_MARK_VT=$(lines "$COMP_LOG")
+  START_TTY=$(cat /sys/class/tty/tty0/active 2>/dev/null || echo tty1)
+  inject key KEY_LEFTCTRL+KEY_LEFTALT+KEY_F2 tap
+  if wait_for "$COMP_LOG" "session paused" 5; then
+    sleep 0.5
+    sudo -n chvt "${START_TTY#tty}"
+    wait_for "$COMP_LOG" "session resumed" 6
+    sleep 1
+  fi
+  V1_MARK_HATCH=$(lines "$COMP_LOG")
+  inject key KEY_LEFTMETA+KEY_ESC tap; sleep 0.6
+  V1_MARK_TAP=$(lines "$COMP_LOG")
+  inject key KEY_LEFTMETA tap; sleep 1.0
+  comp_since "namespace=lumen-launcher" 3
+  inject key KEY_ESC tap; sleep 0.6
+  inject key KEY_LEFTMETA+KEY_ESC tap; sleep 0.6
+  stop_client "$V1_PID"; forget_client "$V1_PID"
+  finish id="${V1_ID:-0}" vt_mark="$V1_MARK_VT" hatch_mark="$V1_MARK_HATCH" tap_mark="$V1_MARK_TAP"
+
+  # V2 — data control with real tools: wl-copy/wl-paste (ext-data-control-v1), cliphist
+  # storing every selection through `wl-paste --watch`, and foot pasting a wl-copy selection.
+  # Every wl-copy runs in the foreground (it would fork otherwise) and is stopped by PID.
+  begin V2
+  if command -v wl-copy >/dev/null && command -v wl-paste >/dev/null; then
+    V2_CACHE="$LOG_DIR/V2-cache"; rm -rf "$V2_CACHE"; mkdir -p "$V2_CACHE"
+    V2_WATCH_PID=""
+    if command -v cliphist >/dev/null; then
+      start_client wlpaste-watch-v2 env XDG_CACHE_HOME="$V2_CACHE" wl-paste --watch cliphist store
+      V2_WATCH_PID=$LAST_PID
+    fi
+    sleep 0.5
+    WAYLAND_DEBUG=client start_client wlcopy-v2 wl-copy --foreground "lumen-v2-clipboard"
+    V2_COPY_PID=$LAST_PID
+    sleep 0.8
+    WAYLAND_DISPLAY="$SOCKET" timeout 5 wl-paste --no-newline >"$LOG_DIR/V2.paste" 2>"$LOG_DIR/wlpaste-v2.log"
+    start_client wlcopy-v2p wl-copy --foreground --primary "lumen-v2-primary"
+    V2_PCOPY_PID=$LAST_PID
+    sleep 0.8
+    WAYLAND_DISPLAY="$SOCKET" timeout 5 wl-paste --primary --no-newline >"$LOG_DIR/V2.primary" 2>>"$LOG_DIR/wlpaste-v2.log"
+    # foot pastes it: foot runs `cat` into a file, Ctrl+Shift+V, Enter, Ctrl+D.
+    rm -f "$LOG_DIR/V2.out"
+    start_client foot-v2 foot --app-id foot-v2 sh -c "cat > '$LOG_DIR/V2.out'"
+    V2_FOOT_PID=$LAST_PID
+    V2_FOOT=$(wait_map foot-v2 8) && settle "$V2_FOOT"
+    sleep 0.5
+    inject key KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_V tap; sleep 0.5
+    inject key KEY_ENTER tap; sleep 0.3
+    inject key KEY_LEFTCTRL+KEY_D tap; sleep 0.8
+    stop_client "$V2_FOOT_PID"; forget_client "$V2_FOOT_PID"
+    # A second copy: the first wl-copy is cancelled (and exits); cliphist holds both.
+    start_client wlcopy-v2b wl-copy --foreground "lumen-v2-second"
+    V2_COPY2_PID=$LAST_PID
+    sleep 1.0
+    if [[ -n "$V2_WATCH_PID" ]]; then
+      XDG_CACHE_HOME="$V2_CACHE" cliphist list >"$LOG_DIR/V2.cliphist" 2>&1
+      stop_client "$V2_WATCH_PID"; forget_client "$V2_WATCH_PID"
+    fi
+    V2_FIRST_EXITED=0; kill -0 "$V2_COPY_PID" 2>/dev/null || V2_FIRST_EXITED=1
+    for p in "$V2_COPY_PID" "$V2_PCOPY_PID" "$V2_COPY2_PID"; do stop_client "$p"; forget_client "$p"; done
+    finish skipped=0 foot="${V2_FOOT:-0}" first_exited="$V2_FIRST_EXITED" cliphist=$([[ -n "$V2_WATCH_PID" ]] && echo 1 || echo 0)
+  else
+    finish skipped=1
+  fi
+
+  # V3 — security-context: the probe plays a sandbox engine; a client on its socket sees no
+  # session-wide global, and the socket stops accepting when the engine hangs up.
+  begin V3
+  start_client probe-v3 "$PROBE" security-context --app-id org.lumen.ProbeV3
+  V3_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-v3.log" "security-context closed=" 6
+  stop_client "$V3_PID"; forget_client "$V3_PID"
+  finish
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want U || want V; then
+  stop_client "$UV_SHELL_PID"; forget_client "$UV_SHELL_PID"
+fi
+
+if want W; then
+  # W1 — a persistent pointer lock: relative motion flows, the pointer stays; focus loss, a VT
+  # switch and the session lock end it and it holds again after each; Super+Escape releases.
+  begin W1
+  W1_LOG="$LOG_DIR/probe-w1.log"
+  start_client probe-w1 "$PROBE" constraints --exit-after 120
+  W1_PID=$LAST_PID
+  W1_ID=$(wait_map lumen-probe 5) && settle "$W1_ID"
+  read -r WX WY WW WH < <(geom "${W1_ID:-0}")
+  WX=${WX:-0}; WY=${WY:-0}; WW=${WW:-480}; WH=${WH:-320}
+  inject move $((WX - 30)) $((WY - 30)); sleep 0.3
+  inject move $((WX + WW / 2)) $((WY + WH / 2))
+  wait_for "$W1_LOG" "^locked" 3
+  W1_M_LOCKED=$(lines "$W1_LOG")
+  inject rel 10 -5 --count 20 --interval-ms 8; sleep 0.4
+  # The absolute device while locked: its move is a relative delta (+150,+40), nothing more.
+  inject move $((WX + WW / 2 + 150)) $((WY + WH / 2 + 40)); sleep 0.4
+  W1_M_FOCUS=$(lines "$W1_LOG")
+  start_client square-w1 "$SQUARE"
+  W1_SQ=$LAST_PID
+  wait_map lumen-square 5 >/dev/null; sleep 0.8
+  stop_client "$W1_SQ"; forget_client "$W1_SQ"
+  sleep 1.0
+  W1_M_VT=$(lines "$W1_LOG")
+  START_TTY=$(cat /sys/class/tty/tty0/active 2>/dev/null || echo tty1)
+  inject key KEY_LEFTCTRL+KEY_LEFTALT+KEY_F2 tap
+  if wait_for "$COMP_LOG" "session paused" 5; then
+    sleep 0.5
+    sudo -n chvt "${START_TTY#tty}"
+    wait_for "$COMP_LOG" "session resumed" 6
+    sleep 1
+  fi
+  W1_M_LOCK=$(lines "$W1_LOG")
+  start_client probe-w1l "$PROBE" lock --unlock-after 1 --exit-after 10
+  W1L_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-w1l.log" "^lock unlocked" 6
+  sleep 0.8
+  stop_client "$W1L_PID"; forget_client "$W1L_PID"
+  W1_M_ESC=$(lines "$W1_LOG")
+  inject key KEY_LEFTMETA+KEY_ESC tap; sleep 0.4
+  inject rel 2 0 --count 3 --interval-ms 8; sleep 0.4
+  stop_client "$W1_PID"; forget_client "$W1_PID"
+  finish id="${W1_ID:-0}" m_locked="$W1_M_LOCKED" m_focus="$W1_M_FOCUS" m_vt="$W1_M_VT" \
+    m_lock="$W1_M_LOCK" m_esc="$W1_M_ESC" w="$WW" h="$WH"
+
+  # W2 — confinement to a region of the window.
+  begin W2
+  W2_LOG="$LOG_DIR/probe-w2.log"
+  start_client probe-w2 "$PROBE" constraints --confine --region 40,40,200,120 --exit-after 60
+  W2_PID=$LAST_PID
+  W2_ID=$(wait_map lumen-probe 5) && settle "$W2_ID"
+  read -r WX WY WW WH < <(geom "${W2_ID:-0}")
+  WX=${WX:-0}; WY=${WY:-0}
+  inject move $((WX + 100)) $((WY + 100))
+  wait_for "$W2_LOG" "^confined" 3
+  W2_M_IN=$(lines "$W2_LOG")
+  inject move $((WX + 400)) $((WY + 300)); sleep 0.3
+  W2_M_FAR=$(lines "$W2_LOG")
+  inject rel 30 0 --count 5 --interval-ms 8; sleep 0.3
+  W2_M_REL=$(lines "$W2_LOG")
+  inject move 5 5; sleep 0.3
+  W2_M_ESC=$(lines "$W2_LOG")
+  inject key KEY_LEFTMETA+KEY_ESC tap; sleep 0.4
+  inject move 6 6; sleep 0.4
+  stop_client "$W2_PID"; forget_client "$W2_PID"
+  finish id="${W2_ID:-0}" m_in="$W2_M_IN" m_far="$W2_M_FAR" m_rel="$W2_M_REL" m_esc="$W2_M_ESC"
+
+  # W3 — a oneshot lock with a cursor hint: Super+Escape warps to the hint, and it is spent.
+  begin W3
+  W3_LOG="$LOG_DIR/probe-w3.log"
+  start_client probe-w3 "$PROBE" constraints --oneshot --hint 60,50 --exit-after 60
+  W3_PID=$LAST_PID
+  W3_ID=$(wait_map lumen-probe 5) && settle "$W3_ID"
+  read -r WX WY WW WH < <(geom "${W3_ID:-0}")
+  WX=${WX:-0}; WY=${WY:-0}; WW=${WW:-480}; WH=${WH:-320}
+  inject move $((WX + WW / 2)) $((WY + WH / 2))
+  wait_for "$W3_LOG" "^locked" 3
+  W3_M_ESC=$(lines "$W3_LOG")
+  inject key KEY_LEFTMETA+KEY_ESC tap; sleep 0.4
+  inject move 8 8; sleep 0.3
+  inject move $((WX + WW / 2 + 10)) $((WY + WH / 2 + 10)); sleep 0.6
+  stop_client "$W3_PID"; forget_client "$W3_PID"
+  finish id="${W3_ID:-0}" m_esc="$W3_M_ESC"
+
+  # W4 — weston-constraints: click to confine, click to lock, click to unlock.
+  begin W4
+  if command -v weston-constraints >/dev/null; then
+    WAYLAND_DEBUG=client start_client weston-w4 weston-constraints
+    W4_PID=$LAST_PID
+    W4_ID=$(wait_map org.freedesktop.weston.simple-contrains 6) && settle "$W4_ID"
+    read -r WX WY WW WH < <(geom "${W4_ID:-0}")
+    WX=${WX:-0}; WY=${WY:-0}
+    inject move $((WX + 40)) $((WY + 40)); sleep 0.3
+    inject button left click; sleep 0.5
+    inject move $((OUT_W - 3)) $((OUT_H - 3)); sleep 0.4
+    inject button left click; sleep 0.5
+    inject rel 5 5 --count 5 --interval-ms 8; sleep 0.4
+    inject button left click; sleep 0.5
+    stop_client "$W4_PID"; forget_client "$W4_PID"
+    finish skipped=0 id="${W4_ID:-0}" w="${WW:-0}" h="${WH:-0}"
+  else
+    finish skipped=1
+  fi
+
+  # W5 — gestures: bound at v3; which devices could make them.
+  begin W5
+  start_client probe-w5 "$PROBE" gestures --exit-after 5
+  W5_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-w5.log" "^gestures bound" 4
+  sleep 0.3
+  stop_client "$W5_PID"; forget_client "$W5_PID"
+  finish
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want Y; then
+  # Screen capture (design-app-compat-capture Part D). grim speaks ext-image-copy-capture,
+  # wf-recorder wlr-screencopy; lumen-probe checks what neither tool shows.
+  OUT_NAME=$(grep -m1 -oE "output 0 name=\S+" "$COMP_LOG" | sed 's/.*name=//')
+  y_shot() { # the compositor's own read-back of the next fully repainted frame: its path
+    local n0
+    n0=$(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG")
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    for _ in $(seq 1 40); do
+      (( $(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG") > n0 )) && break
+      sleep 0.1
+    done
+    grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //'
+  }
+  y_ppm() { # png ppm — a PNG converted for the verdict (no imaging module needed there)
+    ffmpeg -loglevel error -y -i "$1" "$2" 2>/dev/null
+  }
+
+  # Y1 — grim of the output: the PNG is the output's size and, pixel for pixel, the frame the
+  # compositor reads back itself; the probe window's colour at its place.
+  begin Y1
+  start_client probe-y1-red "$PROBE" solid --rgba 255,0,0,255 --size 320x240 --exit-after 120
+  Y_RED_PID=$LAST_PID
+  Y_RED_ID=$(wait_map lumen-probe 5) && settle "$Y_RED_ID"
+  inject move 20 $((OUT_H - 20)); sleep 0.5
+  ( cd "$LOG_DIR" && WAYLAND_DISPLAY="$SOCKET" timeout 10 grim -o "$OUT_NAME" Y1.png ) \
+    >"$LOG_DIR/grim-y1.log" 2>&1
+  Y1_SHOT=$(y_shot)
+  y_ppm "$LOG_DIR/Y1.png" "$LOG_DIR/Y1.ppm"
+  finish id="${Y_RED_ID:-0}" shot="\"${Y1_SHOT}\""
+
+  # Y2 — grim -T of a window covered by another: its own pixels, at its own size.
+  begin Y2
+  start_client probe-y2-green "$PROBE" solid --rgba 0,255,0,255 --size 480x360 --exit-after 120
+  Y_GREEN_PID=$LAST_PID
+  Y_GREEN_ID=$(wait_map lumen-probe 5) && settle "$Y_GREEN_ID"
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" toplevels >"$LOG_DIR/probe-y2-list.log" 2>&1
+  Y2_TID=$(grep -m1 -oE "^toplevel identifier=[0-9a-f]+ app_id=lumen-probe " \
+           "$LOG_DIR/probe-y2-list.log" | sed -E 's/.*identifier=([0-9a-f]+).*/\1/')
+  ( cd "$LOG_DIR" && WAYLAND_DISPLAY="$SOCKET" timeout 10 grim -T "${Y2_TID:-none}" Y2.png ) \
+    >"$LOG_DIR/grim-y2.log" 2>&1
+  y_ppm "$LOG_DIR/Y2.png" "$LOG_DIR/Y2.ppm"
+  finish red="${Y_RED_ID:-0}" green="${Y_GREEN_ID:-0}"
+
+  # Y3 — grim -c paints the pointer, grim without it does not (the pointer is a plane).
+  begin Y3
+  inject move 300 200; sleep 0.5
+  ( cd "$LOG_DIR" && WAYLAND_DISPLAY="$SOCKET" timeout 10 grim -c -o "$OUT_NAME" Y3c.png &&
+    WAYLAND_DISPLAY="$SOCKET" timeout 10 grim -o "$OUT_NAME" Y3n.png ) >"$LOG_DIR/grim-y3.log" 2>&1
+  y_ppm "$LOG_DIR/Y3c.png" "$LOG_DIR/Y3c.ppm"
+  y_ppm "$LOG_DIR/Y3n.png" "$LOG_DIR/Y3n.ppm"
+  finish x=300 y=200
+  stop_client "$Y_GREEN_PID"; forget_client "$Y_GREEN_PID"
+  stop_client "$Y_RED_PID"; forget_client "$Y_RED_PID"
+  SCEN=park; inject move 20 $((OUT_H - 20))
+
+  # Y4 — a screencast of an animating client (dma-buf and shm): the first frame full, later
+  # ones only the moving square's damage; the window's colour where nothing moves.
+  begin Y4
+  start_client probe-y4-anim "$PROBE" animate --size 300x200 --exit-after 60
+  Y4_PID=$LAST_PID
+  Y4_ID=$(wait_map lumen-probe-animate 5) && settle "$Y4_ID"
+  read -r Y4X Y4Y _ _ < <(geom "$Y4_ID")
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" capture --output "$OUT_NAME" --dmabuf --frames 12 \
+    --timeout 8 --expect "0,128,255@$((Y4X + 5)),$((Y4Y + 5))" >"$LOG_DIR/probe-y4-dmabuf.log" 2>&1
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" capture --output "$OUT_NAME" --frames 8 \
+    --timeout 8 --expect "0,128,255@$((Y4X + 5)),$((Y4Y + 5))" >"$LOG_DIR/probe-y4-shm.log" 2>&1
+  stop_client "$Y4_PID"; forget_client "$Y4_PID"
+  finish id="${Y4_ID:-0}"
+
+  # Y5 — a covered window's screencast keeps its frames coming (paced like a shown window,
+  # not the 1 s throttle of covered windows).
+  begin Y5
+  start_client shm-y5 weston-simple-shm
+  Y5_SHM_PID=$LAST_PID
+  Y5_ID=$(wait_map org.freedesktop.weston.simple-shm 5)
+  start_client probe-y5-cover "$PROBE" solid --rgba 0,0,255,255 --size 1200x800 --exit-after 60
+  Y5_COVER_PID=$LAST_PID
+  Y5_COVER=$(wait_map lumen-probe 5) && settle "$Y5_COVER"
+  sleep 0.5
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" capture --app-id org.freedesktop.weston.simple-shm \
+    --frames 40 --timeout 6 >"$LOG_DIR/probe-y5.log" 2>&1
+  stop_client "$Y5_COVER_PID"; forget_client "$Y5_COVER_PID"
+  stop_client "$Y5_SHM_PID"; forget_client "$Y5_SHM_PID"
+  finish id="${Y5_ID:-0}" cover="${Y5_COVER:-0}"
+
+  # Y6 — the session lock: a capture from the request on is the black curtain, no frame
+  # while locked, the desktop again after unlock.
+  begin Y6
+  start_client probe-y6-red "$PROBE" solid --rgba 255,0,0,255 --size 320x240 --exit-after 60
+  Y6_PID=$LAST_PID
+  Y6_ID=$(wait_map lumen-probe 5) && settle "$Y6_ID"
+  read -r Y6X Y6Y _ _ < <(geom "$Y6_ID")
+  start_client probe-y6-lock "$PROBE" lock --unlock-after 3
+  Y6_LOCK_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-y6-lock.log" "^lock locked" 3
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" capture --output "$OUT_NAME" --frames 2 --timeout 1.5 \
+    --expect "0,0,0@$((Y6X + 10)),$((Y6Y + 10))" >"$LOG_DIR/probe-y6-locked.log" 2>&1
+  for _ in $(seq 1 50); do kill -0 "$Y6_LOCK_PID" 2>/dev/null || break; sleep 0.1; done
+  forget_client "$Y6_LOCK_PID"
+  sleep 0.5
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" capture --output "$OUT_NAME" --frames 1 --timeout 3 \
+    --expect "255,0,0@$((Y6X + 10)),$((Y6Y + 10))" >"$LOG_DIR/probe-y6-unlocked.log" 2>&1
+  stop_client "$Y6_PID"; forget_client "$Y6_PID"
+  finish id="${Y6_ID:-0}"
+
+  # Y7 — wf-recorder (wlr-screencopy): a 3 s recording of the output has frames.
+  begin Y7
+  if command -v wf-recorder >/dev/null && command -v ffprobe >/dev/null; then
+    start_client probe-y7-anim "$PROBE" animate --size 300x200 --exit-after 20
+    Y7_PID=$LAST_PID
+    wait_map lumen-probe-animate 5 >/dev/null
+    rm -f "$LOG_DIR/Y7.mkv"
+    ( cd "$LOG_DIR" && WAYLAND_DISPLAY="$SOCKET" timeout -s INT 3 wf-recorder -f Y7.mkv ) \
+      >"$LOG_DIR/wf-recorder-y7.log" 2>&1
+    ffprobe -v error -count_frames -select_streams v:0 \
+      -show_entries stream=width,height,nb_read_frames -of csv=p=0 "$LOG_DIR/Y7.mkv" \
+      >"$LOG_DIR/ffprobe-y7.log" 2>&1
+    stop_client "$Y7_PID"; forget_client "$Y7_PID"
+    finish skipped=0
+  else
+    finish skipped=1
+  fi
+
+  # Y8 — the toplevel list and a pointer cursor session.
+  begin Y8
+  start_client probe-y8-win "$PROBE" solid --rgba 0,0,255,255 --size 200x150 --exit-after 30
+  Y8_PID=$LAST_PID
+  Y8_ID=$(wait_map lumen-probe 5) && settle "$Y8_ID"
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" toplevels --watch 1 >"$LOG_DIR/probe-y8-list.log" 2>&1 &
+  Y8_LIST_PID=$!
+  start_client probe-y8-cursor "$PROBE" cursor-capture --output "$OUT_NAME" --frames 1 --timeout 3
+  Y8_CUR_PID=$LAST_PID
+  sleep 0.5
+  inject move 400 300; sleep 0.2; inject move 420 310
+  stop_client "$Y8_PID"; forget_client "$Y8_PID"
+  wait "$Y8_LIST_PID" 2>/dev/null
+  for _ in $(seq 1 40); do kill -0 "$Y8_CUR_PID" 2>/dev/null || break; sleep 0.1; done
+  stop_client "$Y8_CUR_PID"; forget_client "$Y8_CUR_PID"
+  finish id="${Y8_ID:-0}"
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want Z; then
+  # Portals (design-app-compat-capture Part E): xdg-desktop-portal with Lumen's backend and
+  # xdg-desktop-portal-wlr, driven by lumen-portal-probe; the chooser and the overlay are
+  # answered with injected keys and clicks.
+  : > "$LOG_DIR/portals.log"
+  rm -rf "$LOG_DIR/Z-pictures"; mkdir -p "$LOG_DIR/Z-pictures"
+  rm -f "$LOG_DIR"/Z*.png "$LOG_DIR"/Z*.ppm
+  if [[ -x "$PORTAL_PROBE" ]] &&
+     XDG_PICTURES_DIR="$LOG_DIR/Z-pictures" XDG_CONFIG_HOME="$LOG_DIR/Z-config" \
+       portal_session_start "$SOCKET" "$BUILD" "$LOG_DIR" >>"$LOG_DIR/portals.log" 2>&1; then
+    z_probe() { # log-name args... — lumen-portal-probe, its output in LOG_DIR/<log-name>.log
+      local log="$LOG_DIR/$1.log"; shift
+      "$PORTAL_PROBE" "$@" >"$log" 2>&1
+    }
+    z_bg() { # log-name args... — the same in the background; Z_BG is its PID
+      local log="$LOG_DIR/$1.log"; shift
+      "$PORTAL_PROBE" "$@" >"$log" 2>&1 &
+      Z_BG=$!
+    }
+    z_wait() { # pid seconds
+      for _ in $(seq 1 $(( $2 * 10 ))); do kill -0 "$1" 2>/dev/null || break; sleep 0.1; done
+      kill -0 "$1" 2>/dev/null && { kill -TERM "$1" 2>/dev/null; sleep 0.2; }
+      wait "$1" 2>/dev/null
+    }
+    z_overlay() { # wait until the portal's overlay (or the chooser) has mapped since $1 lines
+      local from=$1
+      for _ in $(seq 1 60); do
+        tail -n +"$((from + 1))" "$COMP_LOG" | grep -q "layer map surface=[0-9]* layer=overlay namespace=lumen-portal" && return 0
+        sleep 0.05
+      done
+      return 1
+    }
+    z_shot() { # the compositor's own read-back of the next fully repainted frame: its path
+      local n0
+      n0=$(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG")
+      kill -USR1 "$COMP_PID" 2>/dev/null
+      for _ in $(seq 1 40); do
+        (( $(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG") > n0 )) && break
+        sleep 0.1
+      done
+      grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //'
+    }
+    z_png() { # log → the PNG it names, converted to PPM at $2
+      local f
+      f=$(sed -n 's/^file \(.*\) size=.*/\1/p' "$LOG_DIR/$1.log" | tail -1)
+      [[ -n "$f" ]] && ffmpeg -loglevel error -y -i "$f" "$2" 2>/dev/null
+    }
+
+    # wait_map looks from BEGIN_COMP on: from now, not from the previous group's begin, or it
+    # can return that group's lumen-probe (already gone) before this one has mapped.
+    BEGIN_COMP=$(lines "$COMP_LOG")
+    start_client probe-z-red "$PROBE" solid --rgba 255,0,0,255 --size 320x240 --exit-after 300
+    Z_RED_PID=$LAST_PID
+    Z_RED_ID=$(wait_map lumen-probe 5) && settle "$Z_RED_ID"
+    read -r ZX ZY ZW ZH < <(geom "${Z_RED_ID:-0}")
+    SCEN=park; inject move 20 $((OUT_H - 20)); sleep 0.5
+
+    # Z1 — non-interactive, straight to the backend (no permission store involved).
+    begin Z1
+    z_probe portal-z1 screenshot --backend --timeout 10
+    Z1_SHOT=$(z_shot)
+    z_png portal-z1 "$LOG_DIR/Z1.ppm"
+    finish id="${Z_RED_ID:-0}" shot="\"${Z1_SHOT}\""
+
+    # Z2 — interactive through the frontend: drag 200x150 inside the red window.
+    begin Z2
+    n=$(lines "$COMP_LOG")
+    z_bg portal-z2 screenshot --interactive --timeout 20
+    Z2_PID=$Z_BG
+    if z_overlay "$n"; then
+      sleep 0.3
+      inject move $((ZX + 40)) $((ZY + 40)); sleep 0.2
+      inject drag $((ZX + 40)) $((ZY + 40)) $((ZX + 240)) $((ZY + 190)) --button left --steps 30
+    fi
+    z_wait "$Z2_PID" 10
+    z_png portal-z2 "$LOG_DIR/Z2.ppm"
+    finish w=200 h=150
+
+    # Z3 — Enter, a click, Escape.
+    begin Z3
+    n=$(lines "$COMP_LOG")
+    z_bg portal-z3-enter screenshot --interactive --timeout 20
+    Z3_PID=$Z_BG
+    z_overlay "$n" && { sleep 0.3; inject key KEY_ENTER tap; }
+    z_wait "$Z3_PID" 10
+    n=$(lines "$COMP_LOG")
+    z_bg portal-z3-click screenshot --interactive --timeout 20
+    Z3_PID=$Z_BG
+    z_overlay "$n" && { sleep 0.3; inject move 60 $((OUT_H - 60)); sleep 0.2; inject button left click; }
+    z_wait "$Z3_PID" 10
+    n=$(lines "$COMP_LOG")
+    z_bg portal-z3-esc screenshot --interactive --timeout 20
+    Z3_PID=$Z_BG
+    z_overlay "$n" && { sleep 0.3; inject key KEY_ESC tap; }
+    z_wait "$Z3_PID" 10
+    finish skipped=0
+    SCEN=park; inject move 20 $((OUT_H - 20))
+
+    # Z4 — PickColor: a click on the red window.
+    begin Z4
+    n=$(lines "$COMP_LOG")
+    z_bg portal-z4 pick-color --timeout 20
+    Z4_PID=$Z_BG
+    if z_overlay "$n"; then
+      sleep 0.3
+      inject move $((ZX + ZW / 2)) $((ZY + ZH / 2)); sleep 0.2
+      inject move $((ZX + ZW / 2 + 3)) $((ZY + ZH / 2 + 3)); sleep 0.2
+      inject button left click
+    fi
+    z_wait "$Z4_PID" 10
+    finish skipped=0
+    SCEN=park; inject move 20 $((OUT_H - 20))
+
+    # Z5 — ScreenCast of the output, chosen in Lumen's chooser; a moving client keeps
+    # frames coming. The probe offers dma-buf first like OBS and browsers (xdpw falls back to
+    # shm where its GBM cannot allocate with modifiers, as on vmwgfx).
+    begin Z5
+    start_client probe-z5-anim "$PROBE" animate --size 200x120 --interval 16 --exit-after 60
+    Z5_ANIM_PID=$LAST_PID
+    Z5_ANIM_ID=$(wait_map lumen-probe-animate 5) && settle "$Z5_ANIM_ID"
+    n=$(lines "$COMP_LOG")
+    z_bg portal-z5 screencast --types 3 --seconds 3 --timeout 20 --dmabuf \
+      --expect "255,0,0@$((ZX + 10)),$((ZY + 10))"
+    Z5_PID=$Z_BG
+    z_overlay "$n" && { sleep 0.5; inject key KEY_ENTER tap; }
+    z_wait "$Z5_PID" 15
+    finish anim="${Z5_ANIM_ID:-0}"
+
+    # Z6 — ScreenCast of a window: Down selects the first window line of the chooser (the
+    # verdict reads which one was chosen and expects that window's size).
+    begin Z6
+    n=$(lines "$COMP_LOG")
+    z_bg portal-z6 screencast --types 3 --seconds 2 --timeout 20
+    Z6_PID=$Z_BG
+    z_overlay "$n" && { sleep 0.5; inject key KEY_DOWN tap; sleep 0.2; inject key KEY_ENTER tap; }
+    z_wait "$Z6_PID" 15
+    stop_client "$Z5_ANIM_PID"; forget_client "$Z5_ANIM_PID"
+    finish anim_w=200 anim_h=120 red_w="${ZW:-0}" red_h="${ZH:-0}"
+
+    # Z7 — Screenshot of a window (target Window): the only window left is the red one.
+    begin Z7
+    n=$(lines "$COMP_LOG")
+    z_bg portal-z7 screenshot --backend --target 2 --timeout 20
+    Z7_PID=$Z_BG
+    z_overlay "$n" && { sleep 0.3; inject key KEY_ENTER tap; }
+    z_wait "$Z7_PID" 10
+    z_png portal-z7 "$LOG_DIR/Z7.ppm"
+    finish w="${ZW:-0}" h="${ZH:-0}"
+
+    # Z8 — locked: refused; unlocked: works again.
+    begin Z8
+    start_client probe-z8-lock "$PROBE" lock --unlock-after 3
+    Z8_LOCK_PID=$LAST_PID
+    wait_for "$LOG_DIR/probe-z8-lock.log" "^lock locked" 3
+    z_probe portal-z8-locked screenshot --backend --timeout 10
+    for _ in $(seq 1 50); do kill -0 "$Z8_LOCK_PID" 2>/dev/null || break; sleep 0.1; done
+    forget_client "$Z8_LOCK_PID"
+    sleep 0.5
+    z_probe portal-z8-unlocked screenshot --backend --timeout 10
+    finish skipped=0
+
+    stop_client "$Z_RED_PID"; forget_client "$Z_RED_PID"
+    SCEN=park; inject move 20 $((OUT_H - 20))
+  else
+    begin Z1
+    finish skipped=1
+  fi
+  portal_session_stop >>"$LOG_DIR/portals.log" 2>&1
+fi
+
 # ── Teardown ─────────────────────────────────────────────────────────────────
 for pid in "${CLIENT_PIDS[@]}"; do stop_client "$pid"; done
 CLIENT_PIDS=()
@@ -2230,7 +3038,7 @@ fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOCTTY); b=bytearray(4)
 fcntl.ioctl(fd,0x4B3B,b); print("text" if struct.unpack("i",b)[0]==0 else "graphics")' "/dev/$VT" 2>/dev/null || echo unknown)
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
-python3 -I - "$LOG_DIR" "$COMP_RC" "$CONSOLE" "$POINTER_DEV" "$KEYBOARD_DEV" "$OUT_W" "$OUT_H" <<'PY'
+python3 -I - "$LOG_DIR" "$COMP_RC" "$CONSOLE" "$POINTER_DEV" "$KEYBOARD_DEV" "$OUT_W" "$OUT_H" "$RELATIVE_DEV" <<'PY'
 import json, math, os, re, sys
 
 log_dir, comp_rc, console, pointer_dev, keyboard_dev = sys.argv[1:6]
@@ -4485,6 +5293,697 @@ if "S1" in scen:
            (f"; GTK bound fractional={gtk_frac} viewporter={gtk_vp} preferred_scale(120)={gtk_pref}"
             if dbg else "; GTK trace not run (H5 skipped)"))
 
+# ── T: commit-path protocols ────────────────────────────────────────────────
+# libwayland's trace stamp: "[HH:MM:SS.uuuuuu]" (1.23+) or "[ms.uuu]" (older).
+WLTRACE = re.compile(r"\[\s*(?:(\d+):(\d+):)?(\d+\.\d+)\].*-> (\w+)#(\d+)\.(\w+)\(")
+CUQ = re.compile(r"compositor\.surface: content update queued surface=(\d+) cause=\S+ depth=(\d+) "
+                 r"waits=(\d+) fifo=(\d) barrier=(\d) target=(\d+)")
+
+def wl_requests(name):
+    out = []
+    for l in read(name):
+        m = WLTRACE.search(l)
+        if m:
+            if m.group(1) is not None:
+                t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            else:
+                t = float(m.group(3)) / 1000.0
+            out.append((t, m.group(4), m.group(6)))
+    return out
+
+def commit_rate(reqs, request="commit"):
+    ts = [t for t, i, r in reqs if i == "wl_surface" and r == request]
+    if len(ts) < 10:
+        return len(ts), 0.0
+    # The steady part: skip the first second (setup, first frames).
+    t0 = ts[0] + 1.0
+    steady = [t for t in ts if t >= t0]
+    if len(steady) < 2:
+        return len(ts), 0.0
+    return len(ts), (len(steady) - 1) / (steady[-1] - steady[0])
+
+refresh_hz = out_mhz / 1000.0 if out_mhz else 60.0
+
+s = scen.get("T1")
+if s is not None:
+    if s.get("skipped"):
+        record("T1 vkcube FIFO present", True, "vkcube not installed", warn=True)
+    else:
+        reqs = wl_requests("vkcube-t1.log")
+        sets = sum(1 for _, i, r in reqs if i == "wp_fifo_v1" and r == "set_barrier")
+        waits = sum(1 for _, i, r in reqs if i == "wp_fifo_v1" and r == "wait_barrier")
+        timers = sum(1 for _, i, r in reqs if i == "wp_commit_timer_v1" and r == "set_timestamp")
+        # Mesa commits twice per present (the frame with set_barrier + wait_barrier, then an
+        # empty wait_barrier commit that throttles the next): frames are the attaches.
+        n, rate = commit_rate(reqs, "attach")
+        FBP = re.compile(r"wp_presentation_feedback#\d+\.presented\((\d+), (\d+), (\d+),")
+        shown = [int(m.group(2)) + int(m.group(3)) / 1e9 for l in read("vkcube-t1.log")
+                 if (m := FBP.search(l))]
+        gone = sum(1 for l in read("vkcube-t1.log") if re.search(r"wp_presentation_feedback#\d+\.discarded\(", l))
+        dts = [b - a for a, b in zip(shown, shown[1:])]
+        mean_dt = sum(dts) / len(dts) if dts else 0.0
+        queued = [m for i in rng(s) if (m := CUQ.search(comp[i])) and m.group(4) == "1"]
+        fifo_ok = sets > 0 and waits > 0
+        rate_ok = rate > 0 and rate <= refresh_hz * 1.05 + 1
+        period = 1.0 / refresh_hz
+        pace_ok = bool(dts) and abs(mean_dt - period) <= 0.15 * period and gone <= max(3, n // 20)
+        ok = fifo_ok and rate_ok and pace_ok
+        record("T1 vkcube (Mesa Vulkan WSI, FIFO): fifo-v1 barriers, one frame per refresh",
+               ok, f"frames={n} rate={rate:.1f}/s refresh={refresh_hz:.2f} Hz; presented {len(shown)} "
+               f"discarded {gone}, interval mean {mean_dt * 1e3:.2f} ms; set_barrier={sets} "
+               f"wait_barrier={waits} set_timestamp={timers}; compositor held {len(queued)} "
+               f"update(s) on the barrier", warn=ok and not queued)
+
+s = scen.get("T2")
+if s is not None:
+    if s.get("skipped"):
+        record("T2 weston-simple-timing", True, "not installed", warn=True)
+    else:
+        reqs = wl_requests("simple-timing-t2.log")
+        stamps = sum(1 for _, i, r in reqs if i == "wp_commit_timer_v1" and r == "set_timestamp")
+        timed = [m for i in rng(s) if (m := CUQ.search(comp[i])) and m.group(6) != "0"]
+        errs = [l for l in read("simple-timing-t2.log") if "error" in l.lower() and "wl_display" in l]
+        ok = stamps > 0 and not errs
+        record("T2 weston-simple-timing: commit-timing targets held until their frame", ok,
+               f"set_timestamp={stamps}; compositor held {len(timed)} timed update(s); "
+               f"protocol errors={len(errs)}", warn=ok and not timed)
+
+s = scen.get("T3")
+if s is not None:
+    TSUM = re.compile(r"timing summary fifo_frames=(\d+) fifo_presented=(\d+) fifo_discarded=(\d+) "
+                      r"dt_min_ms=([\d.]+) dt_mean_ms=([\d.]+) refresh_ms=([\d.]+) timed_frames=(\d+) "
+                      r"timed_presented=(\d+) early=(\d+) late=(\d+) delta_min_ms=(-?[\d.]+) "
+                      r"delta_max_ms=(-?[\d.]+)")
+    summ = next((m for l in probe_lines("t3") if (m := TSUM.search(l))), None)
+    queued = [m for i in rng(s) if (m := CUQ.search(comp[i]))]
+    if not summ:
+        record("T3 probe timing: FIFO one update per refresh, timed updates on target", False,
+               "no summary from the probe: " + " | ".join(probe_lines("t3")[-3:]))
+    else:
+        g = [summ.group(k) for k in range(1, 13)]
+        frames, pres, disc = int(g[0]), int(g[1]), int(g[2])
+        dt_min, dt_mean, period = float(g[3]), float(g[4]), float(g[5])
+        tframes, tpres, early, late = int(g[6]), int(g[7]), int(g[8]), int(g[9])
+        fifo_ok = pres >= frames - 1 and disc <= 1 and dt_min >= 0.5 * period and \
+            abs(dt_mean - period) <= 0.15 * period
+        timed_ok = tpres >= tframes - 1 and early == 0 and late <= 1
+        held = sum(1 for m in queued if m.group(4) == "1")
+        held_t = sum(1 for m in queued if m.group(6) != "0")
+        ok = fifo_ok and timed_ok and held > 0 and held_t > 0
+        record("T3 probe timing: FIFO one update per refresh, timed updates on target", ok,
+               f"fifo presented {pres}/{frames} discarded {disc}, dt min {dt_min:.2f} mean "
+               f"{dt_mean:.2f} ms (refresh {period:.2f}); timed presented {tpres}/{tframes}, "
+               f"early {early} late {late}, delta {g[10]}..{g[11]} ms; compositor held "
+               f"{held} fifo / {held_t} timed update(s)")
+
+s = scen.get("T4")
+if s is not None:
+    tid = s["id"]
+    rg = list(rng(s))
+    solid = [comp[i] for i in rg if "compositor.surface: surface solid " in comp[i]]
+    alpha = [comp[i] for i in rg if "compositor.surface: surface alpha " in comp[i]]
+    ctype = [comp[i] for i in rg if "surface content type" in comp[i] and "type=video" in comp[i]]
+    g = geometry_at(tid, s["comp"][1]) if tid else None
+    img = ppm(s.get("shot", "")) if s.get("shot") else None
+    detail_px, px_ok = "no screenshot", False
+    if img and g:
+        w, h, px = img
+        x, y, gw, gh = g
+        samples = [tuple(px[((v * w + u) * 3):((v * w + u) * 3 + 3)])
+                   for v in range(y + 10, y + gh - 10, 23) for u in range(x + 10, x + gw - 10, 23)
+                   if 0 <= u < w and 0 <= v < h]
+        # Half-alpha green over black: 128 (blending in encoded space, GL) to 188 (linear,
+        # CPU / Vulkan); red and blue stay black.
+        good = [c for c in samples if 118 <= c[1] <= 198 and c[0] <= 12 and c[2] <= 12]
+        px_ok = bool(samples) and len(good) == len(samples)
+        detail_px = f"{len(good)}/{len(samples)} samples half green (first {samples[0] if samples else '-'})"
+    ok = bool(solid) and "size=320x240" in solid[-1] and "opaque=1" in solid[-1] and \
+        bool(alpha) and "multiplier=0.5" in alpha[-1] and bool(ctype) and px_ok
+    record("T4 single-pixel + viewport + alpha + content type: a solid, half green, typed video", ok,
+           f"{solid[-1].split('compositor.surface: ')[-1] if solid else 'no solid line'}; "
+           f"{alpha[-1].split('compositor.surface: ')[-1] if alpha else 'no alpha line'}; "
+           f"content type video={bool(ctype)}; geometry={g}; {detail_px}")
+
+s = scen.get("T5")
+if s is not None:
+    rg = list(rng(s))
+    hint = any("surface presentation hint" in comp[i] and "hint=async" in comp[i] for i in rg)
+    unsupported = any("async page flip unsupported" in comp[i] for i in rg)
+    capable = any("async page flips (tearing-control-v1): available" in l for l in comp)
+    ok = hint and (unsupported or capable)
+    record("T5 tearing-control: the async hint applied; no async flip without the card's support",
+           ok, f"hint applied={hint}; card async flips={'yes' if capable else 'no'}; "
+           f"'async page flip unsupported' reported={unsupported}")
+
+s = scen.get("T6")
+if s is not None:
+    if s.get("skipped"):
+        record("T6 weston-simple-egl implicit sync", True, "not installed", warn=True)
+    else:
+        reqs = wl_requests("simple-egl-t6.log")
+        n, rate = commit_rate(reqs)
+        dmabuf = sum(1 for _, i, r in reqs if i == "zwp_linux_buffer_params_v1")
+        waited = [m for i in rng(s) if (m := CUQ.search(comp[i])) and int(m.group(3)) > 0]
+        ok = n > 20 and rate > 0
+        record("T6 weston-simple-egl: dma-buf frames keep coming (implicit fences checked)", ok,
+               f"commits={n} rate={rate:.1f}/s; dma-buf params requests={dmabuf}; updates that "
+               f"waited for their buffer's fences={len(waited)}")
+
+# ── U: dialogs, icons, bell, xdg-foreign (design-app-compat-capture Part B) ──
+SHUV = read("shell-uv.log")
+
+def comp_in(s, pattern):
+    rx = re.compile(pattern)
+    return [comp[i] for i in rng(s) if rx.search(comp[i])]
+
+def centre(g):
+    return (g[0] + g[2] / 2.0, g[1] + g[3] / 2.0) if g else None
+
+s = scen.get("U1")
+if s is not None:
+    pid, did = s.get("parent", 0), s.get("dialog", 0)
+    lines_u1 = probe_lines("u1")
+    gp = geometry_at(pid, s["comp"][1]) if pid else None
+    gd = geometry_at(did, s["comp"][1]) if did else None
+    cp, cd = centre(gp), centre(gd)
+    centred = bool(cp and cd) and abs(cp[0] - cd[0]) <= 1 and abs(cp[1] - cd[1]) <= 1
+    parented = bool(comp_in(s, rf"compositor\.wm: parent id={did} parent={pid} "))
+    pressed = comp_in(s, rf"compositor\.wm: modal press id={pid} dialog={did}")
+    focus = [l for l in lines_u1 if l.startswith("focus ")]
+    buttons = [l for l in lines_u1 if l.startswith("button ")]
+    ok = bool(pid and did) and centred and parented and bool(pressed) and \
+        bool(focus) and focus[-1] == "focus dialog" and "button parent" not in buttons
+    record("U1 xdg-dialog (probe): a modal child centred on its parent; a click on the parent "
+           "is consumed and the dialog keeps the keyboard", ok,
+           f"parent {pid} {gp} dialog {did} {gd} centred={centred}; parented={parented}; "
+           f"modal press lines={len(pressed)}; probe focus {focus[-3:]} buttons {buttons}")
+
+s = scen.get("U2")
+if s is not None:
+    if s.get("skipped"):
+        record("U2 GTK 4 modal dialog", True, "gtk4-demo not available", warn=True)
+    else:
+        pid, did = s.get("parent", 0), s.get("dialog", 0)
+        dbg = wl_debug("gtk-u2")
+        got_dialog = any(req and i == "xdg_wm_dialog_v1" and msg == "get_xdg_dialog" for req, i, _, msg, _a in dbg)
+        set_modal = any(req and i == "xdg_dialog_v1" and msg == "set_modal" for req, i, _, msg, _a in dbg)
+        pressed = comp_in(s, rf"compositor\.wm: modal press id={pid} dialog={did}") if pid and did else []
+        presses = wl_presses(dbg)
+        ok = bool(did) and got_dialog and set_modal and bool(pressed)
+        record("U2 GTK 4 (gtk4-demo Dialogs, Alt+M): xdg_dialog_v1 set_modal; a click on the "
+               "parent is consumed and focuses the dialog", ok,
+               f"parent {pid} dialog {did}; get_xdg_dialog={got_dialog} set_modal={set_modal}; "
+               f"modal press lines={len(pressed)}; presses GTK saw={len(presses)}", warn=not ok)
+
+s = scen.get("U3")
+if s is not None:
+    foot_log = read("foot-u3.log")
+    foot_warn = [l for l in foot_log if "does not implement the xdg-toplevel-icon" in l]
+    applied = comp_in(s, r"compositor\.icon: icon applied toplevel=\d+ name=\S+ buffers=\d+")
+    shell_icons = [l for l in SHUV if "shell.bridge: icon handle=" in l]
+    probe_ok = any("name=lumen-probe-u3-icon buffers=2" in l for l in shell_icons)
+    foot_icon = [l for l in shell_icons if "name=foot" in l]
+    pref = [l for l in probe_lines("u3") if l.startswith("icon set")]
+    ok = not foot_warn and probe_ok and bool(foot_icon) and bool(pref) and "preferred=16,32" in pref[0]
+    record("U3 xdg-toplevel-icon: foot's icon name and the probe's name + 2 buffers reach the "
+           "shell; foot does not warn", ok,
+           f"compositor applied {len(applied)}; shell icon lines {len(shell_icons)} (foot {len(foot_icon)}, "
+           f"probe with 2 buffers {probe_ok}); probe {pref[0] if pref else 'no line'}; foot warnings {len(foot_warn)}")
+
+s3, s4 = scen.get("U3"), scen.get("U4")
+if s4 is not None:
+    rg = list(range(s3["comp"][0] if s3 else s4["comp"][0], s4["comp"][1]))
+    sent = [comp[i] for i in rg if re.search(r"compositor\.bell: bell client=\d+ toplevel=\d+ result=sent", comp[i])]
+    limited = [comp[i] for i in rg if "result=rate-limited" in comp[i]]
+    flashes = [comp[i] for i in rg if "namespace=lumen-bell" in comp[i] and "layer map" in comp[i]]
+    shell_bells = [l for l in SHUV if "shell.bridge: bell handle=" in l]
+    foot_warn = [l for l in read("foot-u3.log") if "does not implement the XDG system bell" in l]
+    foot_bell = any("toplevel=" in l and f"toplevel={s3.get('foot', 0)} " in l for l in sent) if s3 else False
+    ok = len(sent) >= 4 and bool(limited) and len(shell_bells) >= 4 and bool(flashes) and not foot_warn
+    record("U4 xdg-system-bell: foot's \\a and the probe's rings reach the shell (rate-limited to "
+           "4/s per client), which flashes the window", ok,
+           f"sent {len(sent)} (foot's {foot_bell}), rate-limited {len(limited)}, shell bells "
+           f"{len(shell_bells)}, flash layer maps {len(flashes)}; foot warnings {len(foot_warn)}",
+           warn=ok and not foot_bell)
+
+s = scen.get("U5")
+if s is not None:
+    li, lv = probe_lines("u5i"), probe_lines("u5v1i")
+    he, hv = probe_lines("u5e"), probe_lines("u5v1e")
+    parented = comp_in(s, r"compositor\.foreign: set_parent_of child=\d+ parent=\d+")
+    modal = comp_in(s, r"compositor\.wm: modal id=\d+ on=1 ")
+    seq_ok = lambda l: "imported" in l and "destroyed" in l and l.index("imported") < l.index("destroyed")
+    ok = any(x.startswith("handle=") for x in he) and any(x.startswith("handle=") for x in hv) and \
+        seq_ok(li) and seq_ok(lv) and len(parented) >= 2 and bool(modal)
+    record("U5 xdg-foreign v2 and v1: imported across clients (modal over the other client's "
+           "window), `destroyed` when the exporter goes", ok,
+           f"v2 import {li}; v1 import {lv}; set_parent_of lines {len(parented)}; modal parent lines {len(modal)}")
+
+# ── V: shortcuts inhibit, data control, security context ──
+s = scen.get("V1")
+if s is not None:
+    lines_v1 = probe_lines("v1")
+    a, b = s["comp"]
+    vt_mark, hatch_mark, tap_mark = s.get("vt_mark", a), s.get("hatch_mark", a), s.get("tap_mark", a)
+    pre = range(a, vt_mark)
+    launcher_while = [comp[i] for i in pre if "namespace=lumen-launcher" in comp[i] and "layer map" in comp[i]]
+    grab_while = [comp[i] for i in pre if "compositor.shell: grab activated" in comp[i]]
+    keys = [l for l in lines_v1 if l.startswith("key code=")]
+    meta_seen = "key code=125" in keys
+    enter_seen = "key code=28" in keys
+    vt_req = any("VT switch to 2 requested" in comp[i] for i in range(vt_mark, hatch_mark))
+    paused = any("session paused" in comp[i] for i in range(vt_mark, hatch_mark))
+    resumed = any("session resumed" in comp[i] for i in range(vt_mark, hatch_mark))
+    inactive = "inhibit inactive" in lines_v1
+    launcher_after = any("namespace=lumen-launcher" in comp[i] and "layer map" in comp[i]
+                         for i in range(tap_mark, b))
+    turned_off = any("turned off by the user (Super+Escape)" in comp[i] for i in range(hatch_mark, tap_mark))
+    ok = "inhibit active" in lines_v1 and meta_seen and enter_seen and not launcher_while and \
+        not grab_while and vt_req and paused and resumed and inactive and turned_off and launcher_after
+    record("V1 keyboard-shortcuts-inhibit: Super and Super+Return reach the probe (no shell grab "
+           "or launcher); Ctrl+Alt+F2 still switches VT; Super+Escape turns it off and the Super "
+           "tap opens the launcher again", ok,
+           f"probe keys {keys[:6]}; launcher while inhibited {len(launcher_while)}, grabs {len(grab_while)}; "
+           f"VT requested={vt_req} paused={paused} resumed={resumed}; inactive={inactive} "
+           f"turned off={turned_off}; launcher after={launcher_after}")
+
+s = scen.get("V2")
+if s is not None:
+    if s.get("skipped"):
+        record("V2 data control (wl-clipboard)", True, "wl-clipboard not installed", warn=True)
+    else:
+        def text(name):
+            try:
+                with open(os.path.join(log_dir, name), encoding="utf-8", errors="replace") as f:
+                    return f.read()
+            except FileNotFoundError:
+                return None
+        paste, primary, out, hist = text("V2.paste"), text("V2.primary"), text("V2.out"), text("V2.cliphist")
+        dbg = wl_debug("wlcopy-v2")
+        ext = any(i == "ext_data_control_manager_v1" for _req, i, _, _m, _a in dbg) or \
+            any("ext_data_control_manager_v1" in l for l in read("wlcopy-v2.log"))
+        hist_ok = (not s.get("cliphist")) or (hist is not None and "lumen-v2-clipboard" in hist and
+                                               "lumen-v2-second" in hist)
+        ok = paste == "lumen-v2-clipboard" and primary == "lumen-v2-primary" and \
+            out is not None and "lumen-v2-clipboard" in out and ext and hist_ok and s.get("first_exited") == 1
+        record("V2 ext-data-control with real tools: wl-copy/wl-paste both selections, cliphist "
+               "stores through wl-paste --watch, foot pastes a wl-copy selection", ok,
+               f"paste={paste!r} primary={primary!r} foot file={out!r}; wl-copy bound ext data "
+               f"control={ext}; cliphist={hist.strip().splitlines() if hist else hist}; first wl-copy "
+               f"exited when replaced={s.get('first_exited')}")
+
+s = scen.get("V3")
+if s is not None:
+    lines_v3 = probe_lines("v3")
+    summary = [l for l in lines_v3 if l.startswith("security-context hidden=")]
+    closed = [l for l in lines_v3 if l.startswith("security-context closed=")]
+    marked = comp_in(s, r"connected sandboxed \(security context engine=org\.lumen\.probe app_id=org\.lumen\.ProbeV3\)")
+    ok = bool(summary) and summary[0] == "security-context hidden=OK visible=OK nested=OK" and \
+        bool(closed) and closed[0] == "security-context closed=OK" and bool(marked)
+    record("V3 security-context: a client on the engine's socket is sandboxed, sees no "
+           "session-wide global; the socket stops when the engine hangs up", ok,
+           f"{summary[0] if summary else 'no summary'}; {closed[0] if closed else 'no close line'}; "
+           f"compositor marked it sandboxed={bool(marked)}")
+
+# ── W: pointer constraints, relative pointer, gestures (design-app-compat-capture Part C) ──
+REL_LINE = re.compile(r"^relative (-?[\d.]+),(-?[\d.]+) unaccel (-?[\d.]+),(-?[\d.]+) t=\d+$")
+POS_LINE = re.compile(r"^(enter|motion) (-?[\d.]+),(-?[\d.]+)$")
+
+def seg(lines, a, b=None):
+    return lines[a:b] if b is not None else lines[a:]
+
+def positions(lines):
+    out = []
+    for l in lines:
+        m = POS_LINE.match(l)
+        if m:
+            out.append((m.group(1), float(m.group(2)), float(m.group(3))))
+    return out
+
+s = scen.get("W1")
+if s is not None:
+    L = probe_lines("w1")
+    ml, mf, mv, mk, me = (s.get(k, 0) for k in ("m_locked", "m_focus", "m_vt", "m_lock", "m_esc"))
+    first_locked = next((i for i, l in enumerate(L) if l == "locked"), -1)
+    enters = [p for p in positions(L[:first_locked + 1]) if p[0] == "enter"] if first_locked >= 0 else []
+    lock_pos = (enters[-1][1], enters[-1][2]) if enters else None
+    held = seg(L, ml, mf)
+    rels = [REL_LINE.match(l) for l in held]
+    rels = [tuple(float(m.group(k)) for k in (1, 2, 3, 4)) for m in rels if m]
+    unaccel_ok = sum(1 for r in rels if abs(r[2] - 10) < 0.01 and abs(r[3] + 5) < 0.01)
+    abs_rel = [r for r in rels if abs(r[2] - 150) <= 2 and abs(r[3] - 40) <= 2 and r[0] == r[2]]
+    moved_while_locked = [l for l in held if l.startswith("motion ")]
+    def phase(a, b):
+        p = seg(L, a, b)
+        return ("unlocked" in p, "locked" in p and p.index("locked") > (p.index("unlocked") if "unlocked" in p else -1))
+    focus_off, focus_back = phase(mf, mv)
+    vt_off, vt_back = phase(mv, mk)
+    lk_off, lk_back = phase(mk, me)
+    # Every time the pointer re-entered while it should have been held, and the first motion
+    # after the release: at the lock position (the pointer never moved).
+    reentries = [p for p in positions(seg(L, ml, me)) if p[0] == "enter"]
+    after = [p for p in positions(seg(L, me)) if p[0] == "motion"]
+    still = bool(lock_pos) and all(abs(p[1] - lock_pos[0]) < 1 and abs(p[2] - lock_pos[1]) < 1 for p in reentries) \
+        and bool(after) and abs(after[0][1] - lock_pos[0]) < 6 and abs(after[0][2] - lock_pos[1]) < 1
+    released = "unlocked" in seg(L, me) and any("released by the user (Super+Escape)" in comp[i] for i in rng(s))
+    reasons = [re.search(r"inactive \(([^)]*)\)", comp[i]).group(1) for i in rng(s)
+               if "compositor.constraint: pointer lock" in comp[i] and "inactive (" in comp[i]]
+    ok = first_locked >= 0 and unaccel_ok >= 20 and bool(abs_rel) and not moved_while_locked and \
+        focus_off and focus_back and vt_off and vt_back and lk_off and lk_back and still and released
+    record("W1 pointer lock (probe): relative motion flows with unaccelerated deltas, the pointer "
+           "stays; focus loss, VT switch and session lock end it and it holds again; Super+Escape "
+           "releases", ok,
+           f"locked at {lock_pos}; relative while held {len(rels)} (unaccel 10,-5: {unaccel_ok}; "
+           f"absolute device {abs_rel[0][:2] if abs_rel else 'none'}); motions while held "
+           f"{len(moved_while_locked)}; off/back focus={focus_off}/{focus_back} vt={vt_off}/{vt_back} "
+           f"lock={lk_off}/{lk_back}; re-entries {len(reentries)} first motion after release "
+           f"{after[0][1:] if after else None}; released={released}; reasons {reasons}")
+
+s = scen.get("W2")
+if s is not None:
+    L = probe_lines("w2")
+    ex, ey = 240 - 1 / 256, 160 - 1 / 256
+    far = [p for p in positions(seg(L, s.get("m_in", 0), s.get("m_far", 0))) if p[0] == "motion"]
+    rel = [p for p in positions(seg(L, s.get("m_far", 0), s.get("m_rel", 0))) if p[0] == "motion"]
+    corner = [p for p in positions(seg(L, s.get("m_rel", 0), s.get("m_esc", 0))) if p[0] == "motion"]
+    tail_ = seg(L, s.get("m_esc", 0))
+    clamp_far = bool(far) and abs(far[-1][1] - ex) < 0.01 and abs(far[-1][2] - ey) < 0.01
+    clamp_rel = bool(rel) and all(abs(p[1] - ex) < 0.01 and abs(p[2] - ey) < 0.01 for p in rel)
+    clamp_corner = bool(corner) and abs(corner[-1][1] - 40) < 0.01 and abs(corner[-1][2] - 40) < 0.01
+    ok = "confined" in L and clamp_far and clamp_rel and clamp_corner and "unconfined" in tail_ and "leave" in tail_
+    record("W2 confinement (probe, region 40,40 200x120): moves out of the region stop at its "
+           "edges; Super+Escape unconfines", ok,
+           f"far move -> {far[-1][1:] if far else None}; relative -> {[p[1:] for p in rel[-1:]]}; "
+           f"screen corner -> {corner[-1][1:] if corner else None}; after Super+Escape {tail_[:3]}")
+
+s = scen.get("W3")
+if s is not None:
+    L = probe_lines("w3")
+    tail_ = seg(L, s.get("m_esc", 0))
+    warp = [p for p in positions(tail_) if p[0] == "motion"]
+    warped = bool(warp) and abs(warp[0][1] - 60) < 0.01 and abs(warp[0][2] - 50) < 0.01
+    ok = L.count("locked") == 1 and "unlocked" in tail_ and warped and \
+        any(l.startswith("enter ") for l in tail_)
+    record("W3 oneshot lock with a cursor hint: Super+Escape warps the pointer to the hint; the "
+           "spent lock never holds again", ok,
+           f"locked {L.count('locked')}x; first motion after release {warp[0][1:] if warp else None}; "
+           f"re-entered={any(l.startswith('enter ') for l in tail_)}")
+
+s = scen.get("W4")
+if s is not None:
+    if s.get("skipped"):
+        record("W4 weston-constraints", True, "weston-constraints not installed", warn=True)
+    else:
+        dbg = wl_debug("weston-w4")
+        confined = [k for k, e in enumerate(dbg) if not e[0] and e[1] == "zwp_confined_pointer_v1" and e[3] == "confined"]
+        locked = [k for k, e in enumerate(dbg) if not e[0] and e[1] == "zwp_locked_pointer_v1" and e[3] == "locked"]
+        presses = [k for k, e in enumerate(dbg) if not e[0] and e[1] == "wl_pointer" and e[3] == "button"
+                   and e[4].replace(" ", "").endswith(",1")]
+        w, h = s.get("w", 0), s.get("h", 0)
+        clamped = False
+        if confined and locked:
+            ms = [dbg[k][4] for k in range(confined[0], locked[0]) if not dbg[k][0] and dbg[k][1] == "wl_pointer" and dbg[k][3] == "motion"]
+            if ms:
+                _t, x, y = (float(v) for v in ms[-1].split(","))
+                clamped = x < w and y < h and x > w - 1 and y > h - 1
+        held_rel, held_motion = 0, 0
+        if locked:
+            end = next((k for k in presses if k > locked[0]), len(dbg))
+            for k in range(locked[0], end):
+                e = dbg[k]
+                held_rel += (not e[0] and e[1] == "zwp_relative_pointer_v1" and e[3] == "relative_motion")
+                held_motion += (not e[0] and e[1] == "wl_pointer" and e[3] == "motion")
+        unlocked = any(e[0] and e[1] == "zwp_locked_pointer_v1" and e[3] == "destroy" for e in dbg)
+        ok = bool(confined) and bool(locked) and clamped and held_rel >= 5 and held_motion == 0 and unlocked
+        record("W4 weston-constraints: click confines (motion clamped inside the surface), click "
+               "locks (relative_motion, no wl_pointer.motion), click unlocks", ok,
+               f"confined={bool(confined)} clamped={clamped} locked={bool(locked)} relative while "
+               f"locked {held_rel} motion {held_motion}; unlocked={unlocked}")
+
+s = scen.get("W5")
+if s is not None:
+    L = probe_lines("w5")
+    devices = [comp[i].split("compositor.input: ", 1)[1] for i in range(len(comp))
+               if "compositor.input: input device " in comp[i]]
+    gesture_devices = [d for d in devices if d.endswith(" gesture") or " gesture " in d]
+    ok = "gestures bound version=3" in L
+    record("W5 pointer gestures: bound at v3" + ("" if gesture_devices else
+           " (no device makes gestures here: bind only)"), ok,
+           f"probe {L[-1:] if L else 'no output'}; devices {sorted(set(devices))}")
+
+# ── Y: screen capture (design-app-compat-capture Part D) ──
+CAPREADY = re.compile(r"^frame (\d+) ready damage=(full|partial) rects=(\S*) area=(\d+) transform=(\d+) "
+                      r"time=([\d.]+) latency_ms=([\d.]+)")
+
+def capture_frames(name):
+    return [m for l in read(name) if (m := CAPREADY.match(l))]
+
+def expects(name):
+    return [l for l in read(name) if l.startswith("expect ")]
+
+s = scen.get("Y1")
+if s is not None:
+    grim_img = ppm(os.path.join(log_dir, "Y1.ppm"))
+    shot = ppm(s.get("shot", "")) if s.get("shot") else None
+    g = geometry_at(s["id"], s["comp"][1]) if s.get("id") else None
+    same, red_ok, detail = False, False, "no image"
+    if grim_img and shot:
+        same = grim_img == shot
+        w, h, px = grim_img
+        diff = sum(1 for k in range(0, min(len(px), len(shot[2])), 3)
+                   if px[k:k + 3] != shot[2][k:k + 3]) if not same else 0
+        if g:
+            x, y, gw, gh = g
+            c = tuple(px[((y + gh // 2) * w + x + gw // 2) * 3:((y + gh // 2) * w + x + gw // 2) * 3 + 3])
+            red_ok = c == (255, 0, 0)
+        detail = (f"grim {w}x{h}, compositor read-back {shot[0]}x{shot[1]}: "
+                  f"{'identical' if same else f'{diff} pixels differ'}; window centre red={red_ok}")
+    ok = same and red_ok and grim_img is not None and grim_img[0] == out_w and grim_img[1] == out_h
+    record("Y1 grim -o: the output's size, pixel for pixel the compositor's own read-back", ok, detail)
+
+s = scen.get("Y2")
+if s is not None:
+    img = ppm(os.path.join(log_dir, "Y2.ppm"))
+    detail, ok = "no image: " + " | ".join(read("grim-y2.log")[-2:]), False
+    if img:
+        w, h, px = img
+        colours = {tuple(px[k:k + 3]) for k in range(0, len(px), 3 * 7)}
+        ok = (w, h) == (320, 240) and colours == {(255, 0, 0)}
+        detail = f"{w}x{h}, colours {sorted(colours)[:4]} (covered by a green window on screen)"
+    record("Y2 grim -T: a covered window is captured with its own pixels at its own size", ok, detail)
+
+s = scen.get("Y3")
+if s is not None:
+    a = ppm(os.path.join(log_dir, "Y3c.ppm"))
+    b = ppm(os.path.join(log_dir, "Y3n.ppm"))
+    ok, detail = False, "no images"
+    if a and b and a[0] == b[0]:
+        w = a[0]
+        diff = [k // 3 for k in range(0, min(len(a[2]), len(b[2])), 3) if a[2][k:k + 3] != b[2][k:k + 3]]
+        xs = [p % w for p in diff]
+        ys = [p // w for p in diff]
+        box = (min(xs), min(ys), max(xs), max(ys)) if diff else None
+        px, py = s["x"], s["y"]
+        ok = bool(diff) and box[0] >= px - 64 and box[1] >= py - 64 and box[2] <= px + 64 and \
+            box[3] <= py + 64
+        detail = f"{len(diff)} pixels differ, within {box} (pointer at {px},{py})"
+    record("Y3 grim -c paints the pointer, grim without it does not", ok, detail)
+
+s = scen.get("Y4")
+if s is not None:
+    for kind in ("dmabuf", "shm"):
+        f = capture_frames(f"probe-y4-{kind}.log")
+        e = expects(f"probe-y4-{kind}.log")
+        later = f[1:]
+        small = [m for m in later if m.group(2) == "partial" and int(m.group(4)) <= out_w * out_h // 50]
+        ok = len(f) >= 4 and f[0].group(2) == "full" and later and len(small) == len(later) and \
+            bool(e) and all(" OK " in l for l in e)
+        areas = sorted(int(m.group(4)) for m in later)
+        record(f"Y4 screencast into {kind}: the first frame full, then only the moving square",
+               ok, f"{len(f)} frames, later areas {areas[:3]}…{areas[-1:] if areas else ''} px; "
+               f"{e[-1] if e else 'no pixel check'}")
+
+s = scen.get("Y5")
+if s is not None:
+    f = capture_frames("probe-y5.log")
+    rate = 0.0
+    if len(f) >= 2:
+        span = float(f[-1].group(6)) - float(f[1].group(6))
+        rate = (len(f) - 2) / span if span > 0 else 0.0
+    ok = len(f) >= 20 and rate >= 10.0
+    record("Y5 a covered window being cast keeps drawing at the output's pace", ok,
+           f"{len(f)} frames of weston-simple-shm behind a covering window, {rate:.1f}/s "
+           f"(a covered window not being captured is throttled to 1/s)")
+
+s = scen.get("Y6")
+if s is not None:
+    locked = read("probe-y6-locked.log")
+    unlocked = read("probe-y6-unlocked.log")
+    lf = capture_frames("probe-y6-locked.log")
+    curtain = any(" OK " in l for l in expects("probe-y6-locked.log"))
+    held = any(l.startswith("frame 2 timeout") for l in locked) and len(lf) == 1
+    after = any(" OK " in l for l in expects("probe-y6-unlocked.log"))
+    lock_lines = [l for l in read("probe-y6-lock.log") if l.startswith("lock locked") or
+                  l.startswith("lock unlocked")]
+    ok = curtain and held and after and len(lock_lines) == 2
+    record("Y6 locked: the curtain (black), no frame while locked, the desktop after unlock", ok,
+           f"curtain black={curtain}; second frame held={held}; after unlock the window={after}; "
+           f"locker {lock_lines}")
+
+s = scen.get("Y7")
+if s is not None:
+    if s.get("skipped"):
+        record("Y7 wf-recorder (wlr-screencopy)", True, "wf-recorder or ffprobe missing", warn=True)
+    else:
+        lines = [l for l in read("ffprobe-y7.log") if l.strip()]
+        parts = lines[-1].split(",") if lines else []
+        ok = len(parts) == 3 and parts[0] == str(out_w) and parts[1] == str(out_h) and \
+            parts[2].isdigit() and int(parts[2]) >= 5
+        record("Y7 wf-recorder (wlr-screencopy v3): a recording of the output with frames", ok,
+               f"ffprobe width,height,frames = {lines[-1] if lines else 'nothing'}")
+
+s = scen.get("Y8")
+if s is not None:
+    L = read("probe-y8-list.log")
+    tops = [l for l in L if l.startswith("toplevel identifier=")]
+    ids_ok = tops and all(re.match(r"toplevel identifier=[0-9a-f]{32} ", l) for l in tops)
+    closed = any(l.startswith("closed identifier=") for l in L)
+    finished = any("finished=1" in l for l in L)
+    C = read("probe-y8-cursor.log")
+    cur_ok = "cursor enter" in C and any(l.startswith("cursor position ") for l in C) and \
+        any(l.startswith("cursor hotspot ") for l in C) and \
+        any(re.match(r"cursor frame 1 size=\d+x\d+ visible_px=[1-9]", l) for l in C)
+    active = any("compositor.capture: screen capture active" in l for l in comp)
+    record("Y8 toplevel list (32-hex identifiers, closed, finished) and a cursor session; "
+           "the capture indicator", bool(ids_ok) and closed and finished and cur_ok and active,
+           f"{len(tops)} toplevel(s), closed={closed}, finished={finished}; cursor "
+           f"{[l for l in C if not l.startswith('constraints')][:5]}; indicator on={active}")
+
+# ── Z: portals (design-app-compat-capture Part E) ──
+def portal_log(name):
+    return read(f"{name}.log")
+
+def portal_response(name):
+    return next((int(l.split()[1]) for l in portal_log(name) if l.startswith("response ")), None)
+
+def portal_file(name):
+    for l in portal_log(name):
+        m = re.match(r"file (.*) size=(\d+)x(\d+)$", l)
+        if m:
+            return m.group(1), int(m.group(2)), int(m.group(3))
+    return None
+
+s = scen.get("Z1")
+if s is not None and s.get("skipped"):
+    record("Z portals", False, "the portal session could not be set up: "
+           + " | ".join(read("portals.log")[-3:]))
+elif s is not None:
+    f = portal_file("portal-z1")
+    img = ppm(os.path.join(log_dir, "Z1.ppm"))
+    shot = ppm(s.get("shot", "")) if s.get("shot") else None
+    private = bool(f) and "/lumen-portal/" in f[0] and os.path.exists(f[0]) and \
+        (os.stat(f[0]).st_mode & 0o777) == 0o600
+    same = bool(img and shot) and img == shot
+    ok = portal_response("portal-z1") == 0 and f is not None and (f[1], f[2]) == (out_w, out_h) and \
+        private and same
+    record("Z1 Screenshot (backend): a private PNG of the output, pixel for pixel the compositor's",
+           ok, f"response {portal_response('portal-z1')}, {f}, private 0600={private}, "
+           f"identical to the read-back={same}")
+
+s = scen.get("Z2")
+if s is not None:
+    f = portal_file("portal-z2")
+    img = ppm(os.path.join(log_dir, "Z2.ppm"))
+    colours = {tuple(img[2][k:k + 3]) for k in range(0, len(img[2]), 3 * 5)} if img else set()
+    in_pics = bool(f) and "/Z-pictures/Screenshots/Screenshot from " in f[0]
+    ok = portal_response("portal-z2") == 0 and f is not None and (f[1], f[2]) == (s["w"], s["h"]) and \
+        colours == {(255, 0, 0)} and in_pics
+    record("Z2 interactive Screenshot (frontend): the dragged area, its exact size, all red", ok,
+           f"response {portal_response('portal-z2')}, {f}, colours {sorted(colours)[:3]}, "
+           f"in the pictures directory={in_pics}")
+
+s = scen.get("Z3")
+if s is not None:
+    fe, fc = portal_file("portal-z3-enter"), portal_file("portal-z3-click")
+    re_, rc, rx = portal_response("portal-z3-enter"), portal_response("portal-z3-click"), \
+        portal_response("portal-z3-esc")
+    ok = re_ == 0 and rc == 0 and rx == 1 and fe is not None and fc is not None and \
+        (fe[1], fe[2]) == (out_w, out_h) and (fc[1], fc[2]) == (out_w, out_h)
+    record("Z3 interactive: Enter → all outputs, a click → that output, Escape → cancelled (1)",
+           ok, f"enter {re_} {fe and fe[1:]}, click {rc} {fc and fc[1:]}, escape {rx}")
+
+s = scen.get("Z4")
+if s is not None:
+    col = next((l for l in portal_log("portal-z4") if l.startswith("color ")), "")
+    ok = portal_response("portal-z4") == 0 and col == "color 255,0,0"
+    record("Z4 PickColor (frontend): the clicked window's colour", ok,
+           f"response {portal_response('portal-z4')}, {col or 'no colour'}")
+
+def cast_summary(name):
+    L = portal_log(name)
+    started = next((l for l in L if l.startswith("started ")), "")
+    fmt = next((l for l in L if l.startswith("format ")), "")
+    summ = next((m for l in L if (m := re.match(r"screencast frames=(\d+) seconds=([\d.]+) fps=([\d.]+)(?: buffers=(\w+))?", l))), None)
+    exp = next((l for l in L if l.startswith("expect ")), "")
+    return started, fmt, summ, exp
+
+s = scen.get("Z5")
+if s is not None:
+    started, fmt, summ, exp = cast_summary("portal-z5")
+    xd = read("xdpw.log")
+    chooser = [l for l in xd if "chooser: chose 'Monitor: " in l]
+    frames = int(summ.group(1)) if summ else 0
+    fps = float(summ.group(3)) if summ else 0.0
+    ok = f"format {out_w}x{out_h} " in fmt and frames >= 30 and fps >= 20 and " OK " in exp and \
+        bool(chooser) and "source_type=1" in started
+    record("Z5 ScreenCast (frontend → xdg-desktop-portal-wlr → PipeWire): the output chosen in "
+           "Lumen's chooser, frames at the client's pace, the right pixels", ok,
+           f"{started}; {fmt}; {summ.group(0) if summ else 'no stream'}; {exp or 'no pixel check'}; "
+           f"chooser {chooser[-1].split('portal: ')[-1] if chooser else 'not used'}")
+
+s = scen.get("Z6")
+if s is not None:
+    started, fmt, summ, exp = cast_summary("portal-z6")
+    frames = int(summ.group(1)) if summ else 0
+    chose = [l.split("chose ")[-1] for l in read("xdpw.log") if "chooser: chose 'Window: " in l]
+    want = None
+    if chose and "animate" in chose[-1]:
+        want = (s["anim_w"], s["anim_h"])
+    elif chose and "solid" in chose[-1]:
+        want = (s["red_w"], s["red_h"])
+    ok = want is not None and f"format {want[0]}x{want[1]} " in fmt and frames >= 5 and \
+        "source_type=2" in started
+    record("Z6 ScreenCast of a window chosen in the chooser: that window's size", ok,
+           f"chose {chose[-1] if chose else 'nothing'}; {started}; {fmt}; "
+           f"{summ.group(0) if summ else 'no stream'}")
+
+s = scen.get("Z7")
+if s is not None:
+    f = portal_file("portal-z7")
+    img = ppm(os.path.join(log_dir, "Z7.ppm"))
+    colours = {tuple(img[2][k:k + 3]) for k in range(0, len(img[2]), 3 * 7)} if img else set()
+    ok = portal_response("portal-z7") == 0 and f is not None and (f[1], f[2]) == (s["w"], s["h"]) and \
+        colours == {(255, 0, 0)}
+    record("Z7 Screenshot of a window (target Window): its own pixels at its own size", ok,
+           f"response {portal_response('portal-z7')}, {f}, colours {sorted(colours)[:3]}")
+
+s = scen.get("Z8")
+if s is not None:
+    locked, unlocked = portal_response("portal-z8-locked"), portal_response("portal-z8-unlocked")
+    ok = locked == 2 and unlocked == 0 and portal_file("portal-z8-locked") is None
+    record("Z8 locked: no screenshot (response 2, no file); after unlock it works", ok,
+           f"locked {locked}, unlocked {unlocked}")
+
+# The backend's private screenshots (Z1, Z8) stay in $XDG_RUNTIME_DIR/lumen-portal until a
+# running backend expires them; judged, they go.
+for z_log in ("portal-z1", "portal-z8-unlocked"):
+    f = portal_file(z_log) if scen.get("Z1") is not None else None
+    if f and "/lumen-portal/Screenshot-" in f[0]:
+        try:
+            os.remove(f[0])
+        except OSError:
+            pass
+
 # ── Protocol errors, both sides ────────────────────────────────────────────
 # A protocol error the compositor posts ends with libwayland-server's "error in client
 # communication (pid N)"; the client side prints libwayland-client's "<iface>#<id>: error
@@ -4568,6 +6067,13 @@ if host_stalls:
 # ── Foreign input (as drag-smoke.sh) ───────────────────────────────────────
 watch = [json.loads(l) for l in read("watch.jsonl") if l.startswith("{")]
 inj_ax = {r["ax"] for r in inj if r["kind"] == "motion" and "ax" in r}
+relative_dev = sys.argv[8] if len(sys.argv) > 8 else "/dev/input/event3"
+inj_rel = {}
+for r in inj:
+    if r["kind"] == "rel":
+        k = (r["dx"], r["dy"])
+        inj_rel[k] = inj_rel.get(k, 0) + 1
+seen_rel = {}
 inj_ay = {r["ay"] for r in inj if r["kind"] == "motion" and "ay" in r}
 BTN = {"left": 0x110, "right": 0x111, "middle": 0x112}
 inj_keys = {}
@@ -4587,6 +6093,14 @@ for w in watch:
     if w.get("kind") != "seen":
         continue
     dev = w["dev"]
+    if dev == relative_dev and all(e[0] == 2 and e[1] in (0, 1) for e in w["ev"]):
+        # A relative frame (REL_X/REL_Y): the injector's when one of its writes had exactly it.
+        dx = next((e[2] for e in w["ev"] if e[1] == 0), 0)
+        dy = next((e[2] for e in w["ev"] if e[1] == 1), 0)
+        seen_rel[(dx, dy)] = seen_rel.get((dx, dy), 0) + 1
+        if seen_rel[(dx, dy)] > inj_rel.get((dx, dy), 0):
+            foreign.append((w["t_us"], f"{dev}: REL {dx},{dy}"))
+        continue
     for etype, code, value in w["ev"]:
         if dev not in (pointer_dev, keyboard_dev):
             foreign.append((w["t_us"], f"{dev}: type={etype} code={code} value={value}"))

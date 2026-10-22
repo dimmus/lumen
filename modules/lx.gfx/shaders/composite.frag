@@ -12,13 +12,14 @@ layout(push_constant) uniform quad_push {
     vec4 dst;
     vec2 target;
     float opacity;
-    float pad;
+    float use_solid; // 1: a solid draw, `solid` replaces the sample
     vec4 src_uv;
     vec4 tint;
     vec4 src_bounds;  // u_lo, v_lo, u_hi, v_hi — half-texel inset sampling bounds
     int transfer;     // 0 linear, 1 sRGB, 2 gamma 2.2, 3 PQ, 4 HLG
     float pad1;
     vec2 uv_dy;
+    vec4 solid;      // premultiplied, encoded colour of a solid draw
 } push;
 
 layout(set = 0, binding = 0) uniform sampler2D surface_texture;
@@ -64,7 +65,9 @@ void main() {
     // Clamp to the source rectangle. Linear filtering samples between texel centers, so
     // a magnified crop would otherwise read texels from outside its own source rect.
     vec2 uv = clamp(v_uv, push.src_bounds.xy, push.src_bounds.zw);
-    vec4 texel = texture(surface_texture, uv);
+    // A solid draw (wp_single_pixel_buffer_v1) takes the colour a 1x1 texture would hold
+    // and goes through the same decode, tint and opacity.
+    vec4 texel = push.use_solid > 0.5 ? push.solid : texture(surface_texture, uv);
 
     // Client buffers are premultiplied, but a transfer function is defined on the
     // unpremultiplied signal — decoding premultiplied values would bend partially

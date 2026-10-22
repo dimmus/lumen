@@ -21,9 +21,10 @@ enum key_modifier : unsigned {
 };
 inline constexpr unsigned k_key_mods_all = 0xFu;
 
-/// zlm_key_grab_v1.flag.
-enum key_grab_flag : unsigned { key_grab_tap = 0x1 };
-inline constexpr unsigned k_key_grab_flags_all = 0x1u;
+/// zlm_key_grab_v1.flag. `not_inhibitable` (v6): the grab fires also while the focused
+/// surface inhibits shortcuts (keyboard-shortcuts-inhibit-unstable-v1).
+enum key_grab_flag : unsigned { key_grab_tap = 0x1, key_grab_not_inhibitable = 0x2 };
+inline constexpr unsigned k_key_grab_flags_all = 0x3u;
 
 /// zlm_key_grab_v1.refusal (same values), `none` for an accepted grab.
 enum class key_grab_refusal : unsigned { none = 0, reserved = 1, taken = 2, invalid = 3 };
@@ -81,6 +82,12 @@ class keybindings {
 public:
     static constexpr unsigned k_max_grabs = 32;
 
+    /// Super+Escape, exactly (no other modifier): the compositor's way back from a client
+    /// that inhibits shortcuts — it toggles the focused surface's inhibitor — and, with
+    /// pointer constraints, releases the pointer. Never inhibitable; consumed only when it
+    /// acts (the caller decides), so a client without an inhibitor still gets the key.
+    [[nodiscard]] static bool escape_hatch(const key_input& in);
+
     /// Compositor-internal bindings, checked on every press before anything else (also
     /// during a window-manager grab, also with no shell): XF86Switch_VT_1…12 → switch to
     /// that VT (consumed even when switching is impossible or it is our own VT, as sway
@@ -108,13 +115,16 @@ public:
         layout_user_ = user;
     }
 
-    /// A press of a (non-tap) grabbed combination: exact modifiers. Disarms a tap.
-    [[nodiscard]] key_decision match_grab(const key_input& in);
+    /// A press of a (non-tap) grabbed combination: exact modifiers. Disarms a tap. With
+    /// `inhibited` (the focused surface inhibits shortcuts) only `not_inhibitable` grabs
+    /// match: the key goes to the client.
+    [[nodiscard]] key_decision match_grab(const key_input& in, bool inhibited = false);
 
     /// Tap observation, for every key that reaches this point. A press of a tap grab's key
     /// with nothing else held arms it; any other press disarms. The release of the armed
-    /// key returns the grab to fire (the key itself still goes to the client).
-    [[nodiscard]] void* observe_tap(const key_input& in);
+    /// key returns the grab to fire (the key itself still goes to the client). With
+    /// `inhibited`, only `not_inhibitable` taps arm.
+    [[nodiscard]] void* observe_tap(const key_input& in, bool inhibited = false);
     /// A pointer button press or a scroll while the tap key is held: not a tap.
     void note_other_input() { tap_owner_ = nullptr; }
     /// Session pause, or a consumed key: nothing is armed.
@@ -193,6 +203,9 @@ lx::compositor::key_grab_refusal lx::compositor::keybindings::check(unsigned key
         return key_grab_refusal::invalid;
     if (keysym >= keysyms::switch_vt_1 && keysym <= keysyms::switch_vt_12)
         return key_grab_refusal::reserved;
+    // The escape hatch from an inhibiting client must stay the compositor's.
+    if (keysym == keysyms::escape && mods == key_mod_super)
+        return key_grab_refusal::reserved;
     const bool chord = (mods & key_mod_ctrl) && (mods & key_mod_alt);
     if (chord && (keysym == keysyms::backspace || keysym == keysyms::terminate_server ||
                   (keysym >= keysyms::f1 && keysym <= keysyms::f12)))
@@ -247,13 +260,21 @@ bool lx::compositor::keybindings::keysym_matches(unsigned grab_sym, const key_in
            !layout_query_(grab_sym, layout_user_);
 }
 
-lx::compositor::key_decision lx::compositor::keybindings::match_grab(const key_input& in) {
+bool lx::compositor::keybindings::escape_hatch(const key_input& in) {
+    return in.pressed && in.mods == key_mod_super &&
+           (in.sym == keysyms::escape || in.raw == keysyms::escape);
+}
+
+lx::compositor::key_decision lx::compositor::keybindings::match_grab(const key_input& in,
+                                                                     bool inhibited) {
     key_decision d{};
     if (!in.pressed || locked_)
         return d;
     for (unsigned i = 0; i < count_; ++i) {
         const grab& g = grabs_[i];
         if ((g.flags & key_grab_tap) || g.mods != in.mods || !keysym_matches(g.keysym, in))
+            continue;
+        if (inhibited && !(g.flags & key_grab_not_inhibitable))
             continue;
         tap_owner_ = nullptr;
         d.consume = true;
@@ -264,7 +285,7 @@ lx::compositor::key_decision lx::compositor::keybindings::match_grab(const key_i
     return d;
 }
 
-void* lx::compositor::keybindings::observe_tap(const key_input& in) {
+void* lx::compositor::keybindings::observe_tap(const key_input& in, bool inhibited) {
     if (locked_) {
         tap_owner_ = nullptr;
         return nullptr;
@@ -275,7 +296,8 @@ void* lx::compositor::keybindings::observe_tap(const key_input& in) {
             return nullptr;
         for (unsigned i = 0; i < count_; ++i) {
             const grab& g = grabs_[i];
-            if ((g.flags & key_grab_tap) && keysym_matches(g.keysym, in)) {
+            if ((g.flags & key_grab_tap) && keysym_matches(g.keysym, in) &&
+                (!inhibited || (g.flags & key_grab_not_inhibitable))) {
                 tap_owner_ = g.owner;
                 tap_code_ = in.code;
                 break;

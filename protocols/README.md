@@ -23,11 +23,11 @@ Interfaces in `protocols/lumen/zlm_shell_v1.xml`:
 
 | Interface | Role |
 |-----------|------|
-| `zlm_shell_v1` | Root (version 5); exposes workspace manager, policy bridge, window rules; logout (v3); key grabs (v4); the session lock's `lock_state` and `lock_requested` (v5) |
-| `zlm_key_grab_v1` | A key combination held by the shell (v4): `activated(serial, time)`, `refused(reason)` |
+| `zlm_shell_v1` | Root (version 6); exposes workspace manager, policy bridge, window rules; logout (v3); key grabs (v4); the session lock's `lock_state` and `lock_requested` (v5); `capture_state` (v6) |
+| `zlm_key_grab_v1` | A key combination held by the shell (v4): `activated(serial, time)`, `refused(reason)`; the `not_inhibitable` flag (v6) |
 | `zlm_toplevel_v1` | Compositor-owned handle for mapped xdg toplevels |
 | `zlm_workspace_manager_v1` / `zlm_workspace_v1` | Virtual desktops |
-| `zlm_policy_bridge_v1` | Shell intent → compositor execution (focus, geometry, stacking) |
+| `zlm_policy_bridge_v1` | Shell intent → compositor execution (focus, geometry, stacking); v6: window icons (sealed memfds), parents, the bell |
 | `zlm_window_rules_v1` | Session window rules (config-driven) |
 
 Key design points:
@@ -62,7 +62,15 @@ Outputs per protocol:
 ```
 
 See `manifest.toml` for the P0–P2 matrix. P0/P1 codegen is enabled via CMake options
-`LUMEN_PROTOCOLS_P1`, `LUMEN_PROTOCOLS_P2`.
+`LUMEN_PROTOCOLS_P1`, `LUMEN_PROTOCOLS_P2`. The protocols of the app-compatibility and
+capture work (ADR 009) are P1: the commit-path ones (fifo, commit-timing, tearing-control,
+content-type, single-pixel-buffer, alpha-modifier — served since Part 1), the window and
+session ones (xdg-dialog, xdg-toplevel-icon, xdg-system-bell, xdg-foreign v1 and v2,
+keyboard-shortcuts-inhibit, ext-data-control and wlr-data-control v2, security-context —
+served since Part 2), the pointer ones (pointer-constraints, relative-pointer,
+pointer-gestures v3 — P1 from the start, served since Part 3), and the capture ones
+(ext-foreign-toplevel-list, ext-image-capture-source, ext-image-copy-capture and
+wlr-screencopy v3 — served since Part 4).
 
 Sources: `[upstream]` (wayland, wayland-protocols at `wayland_protocols_tag`), `[wlr]`
 (wlr-protocols), and `[wlroots]` — wlroots' own `protocol/` directory at a release tag
@@ -92,4 +100,3 @@ The compositor advertises `zlm_shell_v1` only to clients that pass:
 
 1. Same session UID (`SO_PEERCRED`)
 2. Shell binary path match (configurable)
-3. Optional Flatpak: portal capability token (`LUMEN_BUILD_FLATPAK_PORTAL`)

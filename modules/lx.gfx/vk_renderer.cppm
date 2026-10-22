@@ -127,8 +127,26 @@ public:
     [[nodiscard]] lx::transfer_function output_transfer() const { return output_transfer_; }
 
     /// Copy the target back into tightly packed RGBA8 for golden-image verification.
+    /// Synchronous (it waits for the GPU): tests and one-off reads only, never per frame.
     [[nodiscard]] lx::result<void> read_back(const render_target& target, unsigned char* rgba,
                                              unsigned capacity);
+
+    /// Screen capture's read-back slots (one per capture session). Each keeps a persistent,
+    /// mapped host-visible buffer of the target's size (B8G8R8A8 rows `width * 4` bytes
+    /// apart: wl_shm's ARGB8888/XRGB8888 byte order), a command buffer and a fence — made on
+    /// first use, kept while the size fits, so a screencast allocates nothing per frame.
+    static constexpr unsigned k_readback_slots = 64;
+    /// Render thread: records a copy of `rects` (target pixels; all of it when `count` is
+    /// 0) into `slot`'s buffer, at their own place, and submits it without waiting. The
+    /// slot's previous read must have been waited for (`read_back_wait`).
+    [[nodiscard]] lx::result<void> read_back_async(unsigned slot, const render_target& target,
+                                                   const lx::rect2i* rects, unsigned count);
+    /// Any thread (the one the caller handed the slot to): waits up to `timeout_ns` for
+    /// `slot`'s read to land; its rows, or null when it failed or timed out.
+    [[nodiscard]] const unsigned char* read_back_wait(unsigned slot,
+                                                      unsigned long long timeout_ns) const;
+    /// Render thread: frees `slot` (its capture session ended). Waits for its read first.
+    void read_back_free(unsigned slot);
 
 private:
     static constexpr unsigned k_max_textures = 256;
@@ -156,6 +174,10 @@ private:
     void destroy_encode_pipeline();
 
     [[nodiscard]] int find_texture(unsigned id) const;
+    /// The pipeline layout's sampler set must be bound for every draw, a solid one too (it
+    /// never samples it): a 1x1 texture under this reserved id provides one when the frame
+    /// has bound no other set yet. Created on the first solid draw.
+    static constexpr unsigned k_solid_texture_id = 0xFFFF'FFFEu;
     [[nodiscard]] int alloc_texture(unsigned id);
     void destroy_texture(texture_slot& slot);
     [[nodiscard]] lx::result<void> ensure_framebuffer(const render_target& target);
@@ -225,6 +247,18 @@ private:
     lx::transfer_function output_transfer_ = lx::transfer_function::srgb;
 
     texture_slot textures_[k_max_textures]{};
+
+    struct readback_slot {
+        void* buffer = nullptr;
+        void* memory = nullptr;
+        unsigned char* mapped = nullptr;
+        void* command_buffer = nullptr;
+        void* fence = nullptr;
+        unsigned capacity = 0;
+        /// A copy was submitted with `fence` and not waited for by render yet.
+        bool submitted = false;
+    };
+    readback_slot readbacks_[k_readback_slots]{};
 };
 
 } // namespace lx::gfx
@@ -235,13 +269,14 @@ namespace {
 
 /// Mirrors the `quad_push` block in composite.vert/.frag. Field order matters: each vec4
 /// sits at a 16-byte-aligned offset, which the layout below satisfies naturally (dst at 0,
-/// src_uv at 32, tint at 48, src_bounds at 64, transfer at 80, uv_dy at 88) for 96 bytes
-/// total — inside the 128 every driver guarantees for push constants.
+/// src_uv at 32, tint at 48, src_bounds at 64, transfer at 80, uv_dy at 88, solid at 96)
+/// for 112 bytes total — inside the 128 every driver guarantees for push constants.
 struct quad_push {
     float dst[4]{};
     float target[2]{};
     float opacity = 1.f;
-    float pad = 0.f;
+    /// 1: a solid draw — `solid` replaces the sample (`blit_command::solid`).
+    float use_solid = 0.f;
     /// The source box as an affine basis in normalized texture coordinates: where the
     /// destination's top-left lands (u, v) and its +x direction (du, dv); `uv_dy` is the +y
     /// direction. Crop, scale and the buffer transform in one (`source_basis_for`).
@@ -255,7 +290,10 @@ struct quad_push {
     int transfer = 1;
     float pad1 = 0.f;
     float uv_dy[2]{0.f, 1.f};
+    /// Premultiplied, encoded colour of a solid draw.
+    float solid[4]{0.f, 0.f, 0.f, 0.f};
 };
+static_assert(sizeof(quad_push) == 112, "quad_push must match composite.vert/.frag");
 
 /// Mirrors the `encode_push` block in encode.frag.
 struct encode_push {
@@ -905,6 +943,8 @@ void lx::gfx::vulkan_compositor::shutdown() {
             slot_semaphores_[i] = nullptr;
         }
         can_export_fence_ = false;
+        for (unsigned i = 0; i < k_readback_slots; ++i)
+            read_back_free(i);
 
         destroy_encode_pipeline();
         destroy_linear_target();
@@ -1777,6 +1817,18 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
     if (auto framebuffer = ensure_framebuffer(target); !framebuffer)
         return framebuffer.get_error();
 
+    // A solid draw needs some bound descriptor set (see `k_solid_texture_id`).
+    if (find_texture(k_solid_texture_id) < 0) {
+        bool any_solid = false;
+        for (unsigned i = 0; i < count && cmds && !any_solid; ++i)
+            any_solid = cmds[i].solid;
+        if (any_solid) {
+            static const unsigned char k_white[4] = {255, 255, 255, 255};
+            if (auto up = upload_rgba(k_solid_texture_id, 1, 1, k_white); !up)
+                return up.get_error();
+        }
+    }
+
     const unsigned slot = submit_slot_;
     auto fence = static_cast<VkFence>(fences_[slot]);
     if (vkWaitForFences(static_cast<VkDevice>(ctx_.device), 1, &fence, VK_TRUE,
@@ -1850,27 +1902,35 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, static_cast<VkPipeline>(pipeline_));
 
     composite_stats stats{};
+    void* bound_set = nullptr;
     for (unsigned i = 0; i < count && cmds; ++i) {
         const auto& cmd = cmds[i];
-        if (cmd.occluded) {
+        if (cmd.occluded || draw_invisible(cmd)) {
             ++stats.draws_culled;
             continue;
         }
-        const int index = find_texture(cmd.texture_id);
-        if (index < 0) {
+        // A solid draw samples nothing: any set will do, the frame's current one first.
+        const int index =
+            find_texture(cmd.solid ? (bound_set ? 0u : k_solid_texture_id) : cmd.texture_id);
+        if (index < 0 && !(cmd.solid && bound_set)) {
             ++stats.draws_skipped;
             continue;
         }
-        const auto& slot = textures_[static_cast<unsigned>(index)];
-        if (!slot.descriptor_set) {
+        const texture_slot* slot_ptr =
+            index >= 0 && !cmd.solid ? &textures_[static_cast<unsigned>(index)] : nullptr;
+        void* want_set = index >= 0 ? textures_[static_cast<unsigned>(index)].descriptor_set
+                                    : bound_set;
+        if (!want_set) {
             ++stats.draws_skipped;
             continue;
         }
-
-        auto set = static_cast<VkDescriptorSet>(slot.descriptor_set);
-        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                static_cast<VkPipelineLayout>(pipeline_layout_), 0, 1, &set, 0,
-                                nullptr);
+        if (want_set != bound_set) {
+            auto set = static_cast<VkDescriptorSet>(want_set);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    static_cast<VkPipelineLayout>(pipeline_layout_), 0, 1, &set,
+                                    0, nullptr);
+            bound_set = want_set;
+        }
 
         // Clip is a scissor, which costs nothing extra here — the pipeline already
         // declares scissor as dynamic state. An empty clip means unclipped.
@@ -1902,12 +1962,20 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
         push.target[0] = static_cast<float>(target.width());
         push.target[1] = static_cast<float>(target.height());
         push.opacity = cmd.opacity;
+        if (cmd.solid) {
+            push.use_solid = 1.f;
+            push.solid[0] = cmd.solid_color.r;
+            push.solid[1] = cmd.solid_color.g;
+            push.solid[2] = cmd.solid_color.b;
+            push.solid[3] = cmd.solid_color.a;
+        }
 
         // Source box in normalized coordinates (empty src: the whole texture), turned by
         // the buffer transform — the same basis the GL backend uses.
         {
             float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
-            if (slot.width > 0 && slot.height > 0) {
+            if (slot_ptr && slot_ptr->width > 0 && slot_ptr->height > 0) {
+                const texture_slot& slot = *slot_ptr;
                 const float tw = static_cast<float>(slot.width);
                 const float th = static_cast<float>(slot.height);
                 const lx::rect2f box = effective_source(cmd.src, slot.width, slot.height);
@@ -2127,5 +2195,250 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& targ
     (void)rgba;
     (void)capacity;
     return lx::not_implemented("lx::gfx::vulkan_compositor::read_back");
+#endif
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::read_back_async(unsigned slot,
+                                                              const render_target& target,
+                                                              const lx::rect2i* rects,
+                                                              unsigned count) {
+#if defined(LUMEN_HAS_VULKAN)
+    if (!ready() || !target.valid() || slot >= k_readback_slots)
+        return lx::not_implemented("lx::gfx::vulkan_compositor::read_back_async");
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    auto phys = static_cast<VkPhysicalDevice>(ctx_.physical_device);
+    auto queue = static_cast<VkQueue>(ctx_.queue);
+    readback_slot& rb = readbacks_[slot];
+    const unsigned w = target.width();
+    const unsigned h = target.height();
+    const unsigned needed = w * h * 4u;
+
+    if (rb.submitted) {
+        // The caller waited for it already (its read landed); this only reclaims the fence.
+        auto fence = static_cast<VkFence>(rb.fence);
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+            return vk_error("read_back_async: the slot's previous read never completed");
+        rb.submitted = false;
+    }
+    if (rb.capacity < needed) {
+        // The output grew (or the first frame): the buffer is made once per size.
+        if (rb.memory) {
+            vkUnmapMemory(dev, static_cast<VkDeviceMemory>(rb.memory));
+            vkFreeMemory(dev, static_cast<VkDeviceMemory>(rb.memory), nullptr);
+        }
+        if (rb.buffer)
+            vkDestroyBuffer(dev, static_cast<VkBuffer>(rb.buffer), nullptr);
+        rb.buffer = rb.memory = nullptr;
+        rb.mapped = nullptr;
+        rb.capacity = 0;
+
+        VkBufferCreateInfo bci{};
+        bci.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+        bci.size = needed;
+        bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        if (vkCreateBuffer(dev, &bci, nullptr, &buffer) != VK_SUCCESS)
+            return vk_error("read_back_async vkCreateBuffer failed");
+        VkMemoryRequirements reqs{};
+        vkGetBufferMemoryRequirements(dev, buffer, &reqs);
+        // Cached memory where there is some: the CPU reads every byte of it back.
+        int type = find_memory_type(phys, reqs.memoryTypeBits,
+                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        if (type < 0)
+            type = find_memory_type(phys, reqs.memoryTypeBits,
+                                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        if (type < 0) {
+            vkDestroyBuffer(dev, buffer, nullptr);
+            return vk_error("no host-visible memory type for read_back_async");
+        }
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = reqs.size;
+        mai.memoryTypeIndex = static_cast<uint32_t>(type);
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (vkAllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS) {
+            vkDestroyBuffer(dev, buffer, nullptr);
+            return vk_error("read_back_async vkAllocateMemory failed");
+        }
+        void* mapped = nullptr;
+        if (vkBindBufferMemory(dev, buffer, memory, 0) != VK_SUCCESS ||
+            vkMapMemory(dev, memory, 0, VK_WHOLE_SIZE, 0, &mapped) != VK_SUCCESS) {
+            vkFreeMemory(dev, memory, nullptr);
+            vkDestroyBuffer(dev, buffer, nullptr);
+            return vk_error("read_back_async: buffer bind or map failed");
+        }
+        rb.buffer = buffer;
+        rb.memory = memory;
+        rb.mapped = static_cast<unsigned char*>(mapped);
+        rb.capacity = needed;
+    }
+    if (!rb.command_buffer) {
+        VkCommandBufferAllocateInfo cbai{};
+        cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        cbai.commandPool = static_cast<VkCommandPool>(ctx_.command_pool);
+        cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbai.commandBufferCount = 1;
+        VkCommandBuffer cb = VK_NULL_HANDLE;
+        if (vkAllocateCommandBuffers(dev, &cbai, &cb) != VK_SUCCESS)
+            return vk_error("read_back_async vkAllocateCommandBuffers failed");
+        rb.command_buffer = cb;
+    }
+    if (!rb.fence) {
+        VkFenceCreateInfo fci{};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkFence fence = VK_NULL_HANDLE;
+        if (vkCreateFence(dev, &fci, nullptr, &fence) != VK_SUCCESS)
+            return vk_error("read_back_async vkCreateFence failed");
+        rb.fence = fence;
+    }
+    auto fence = static_cast<VkFence>(rb.fence);
+    vkResetFences(dev, 1, &fence);
+
+    auto cb = static_cast<VkCommandBuffer>(rb.command_buffer);
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &begin);
+
+    // After the composites that wrote the target (earlier submissions on this queue).
+    VkImageMemoryBarrier to_src{};
+    to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    to_src.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_src.image = static_cast<VkImage>(target.vk_image());
+    to_src.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    to_src.subresourceRange.levelCount = 1;
+    to_src.subresourceRange.layerCount = 1;
+    to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
+
+    // Only the rects asked for, each at its own place in the buffer.
+    constexpr unsigned k_max_regions = 32;
+    VkBufferImageCopy regions[k_max_regions]{};
+    unsigned nregions = 0;
+    const auto add = [&](int x, int y, int rw, int rh) {
+        const int x0 = x < 0 ? 0 : x;
+        const int y0 = y < 0 ? 0 : y;
+        const int x1 = x + rw > static_cast<int>(w) ? static_cast<int>(w) : x + rw;
+        const int y1 = y + rh > static_cast<int>(h) ? static_cast<int>(h) : y + rh;
+        if (x1 <= x0 || y1 <= y0)
+            return;
+        VkBufferImageCopy& r = regions[nregions++];
+        r.bufferOffset = (static_cast<VkDeviceSize>(y0) * w + static_cast<VkDeviceSize>(x0)) * 4u;
+        r.bufferRowLength = w;
+        r.bufferImageHeight = h;
+        r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        r.imageSubresource.layerCount = 1;
+        r.imageOffset = {x0, y0, 0};
+        r.imageExtent = {static_cast<uint32_t>(x1 - x0), static_cast<uint32_t>(y1 - y0), 1};
+    };
+    if (count == 0 || count > k_max_regions) {
+        add(0, 0, static_cast<int>(w), static_cast<int>(h));
+    } else {
+        for (unsigned i = 0; i < count; ++i)
+            add(rects[i].x, rects[i].y, rects[i].width, rects[i].height);
+    }
+    if (nregions > 0)
+        vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(target.vk_image()),
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               static_cast<VkBuffer>(rb.buffer), nregions, regions);
+
+    // Back for the next composite, which must not write the image before this read is done
+    // (no CPU wait orders them any more).
+    VkImageMemoryBarrier back = to_src;
+    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    back.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    // And the copy's writes made visible to the host that reads the mapping.
+    VkBufferMemoryBarrier to_host{};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    to_host.buffer = static_cast<VkBuffer>(rb.buffer);
+    to_host.size = VK_WHOLE_SIZE;
+    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                             VK_PIPELINE_STAGE_HOST_BIT,
+                         0, 0, nullptr, 1, &to_host, 1, &back);
+    vkEndCommandBuffer(cb);
+
+    VkSubmitInfo submit{};
+    submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit.commandBufferCount = 1;
+    submit.pCommandBuffers = &cb;
+    if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS)
+        return vk_error("read_back_async vkQueueSubmit failed");
+    rb.submitted = true;
+    return {};
+#else
+    (void)slot;
+    (void)target;
+    (void)rects;
+    (void)count;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::read_back_async");
+#endif
+}
+
+const unsigned char* lx::gfx::vulkan_compositor::read_back_wait(
+    unsigned slot, unsigned long long timeout_ns) const {
+#if defined(LUMEN_HAS_VULKAN)
+    if (slot >= k_readback_slots)
+        return nullptr;
+    const readback_slot& rb = readbacks_[slot];
+    if (!rb.submitted || !rb.fence || !rb.mapped)
+        return nullptr;
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    auto fence = static_cast<VkFence>(rb.fence);
+    if (vkWaitForFences(dev, 1, &fence, VK_TRUE, timeout_ns) != VK_SUCCESS)
+        return nullptr;
+    return rb.mapped;
+#else
+    (void)slot;
+    (void)timeout_ns;
+    return nullptr;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::read_back_free(unsigned slot) {
+#if defined(LUMEN_HAS_VULKAN)
+    if (slot >= k_readback_slots)
+        return;
+    readback_slot& rb = readbacks_[slot];
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    if (!dev) {
+        rb = {};
+        return;
+    }
+    if (rb.submitted && rb.fence) {
+        auto fence = static_cast<VkFence>(rb.fence);
+        (void)vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull);
+    }
+    if (rb.memory) {
+        vkUnmapMemory(dev, static_cast<VkDeviceMemory>(rb.memory));
+        vkFreeMemory(dev, static_cast<VkDeviceMemory>(rb.memory), nullptr);
+    }
+    if (rb.buffer)
+        vkDestroyBuffer(dev, static_cast<VkBuffer>(rb.buffer), nullptr);
+    if (rb.command_buffer) {
+        auto cb = static_cast<VkCommandBuffer>(rb.command_buffer);
+        vkFreeCommandBuffers(dev, static_cast<VkCommandPool>(ctx_.command_pool), 1, &cb);
+    }
+    if (rb.fence)
+        vkDestroyFence(dev, static_cast<VkFence>(rb.fence), nullptr);
+    rb = {};
+#else
+    (void)slot;
 #endif
 }

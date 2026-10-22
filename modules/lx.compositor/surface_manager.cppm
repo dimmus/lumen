@@ -12,8 +12,10 @@ export module lx.compositor:surface;
 
 export namespace lx::compositor {
 
-/// Content hint — reserved for future scanout / compositing priority.
-enum class content_hint { normal, video, game, subsurface_ui };
+/// What a surface shows (wp_content_type_v1, plus the compositor's own subsurface UI hint):
+/// scanout priority once direct scanout lands, and the connector's `content type` for the
+/// fullscreen window of an output whose connector has that property.
+enum class content_hint { none, photo, video, game, subsurface_ui };
 
 /// How a client buffer's storage reaches the compositor. shm is not a dmabuf and must
 /// not be pushed through the dmabuf import path.
@@ -31,8 +33,6 @@ struct surface_commit {
     /// Buffer box shown (empty: all of it) and the buffer transform (`:viewport`).
     lx::rect2f src{};
     lx::buffer_transform transform = lx::buffer_transform::normal;
-    lx::gfx::syncobj_timeline sync{};
-    content_hint hint = content_hint::normal;
     bool fullscreen = false;
     /// The content has no translucent pixel: a format without alpha, or an opaque region
     /// covering the buffer. False (blend) unless the protocol layer proves it.
@@ -186,6 +186,14 @@ public:
     void destroy(lx::surface_id surface);
     void set_override_redirect(lx::surface_id surface, bool value);
     void set_content_hint(lx::surface_id surface, content_hint hint);
+    /// The content is one colour (wp_single_pixel_buffer_v1): no texture, no upload — the
+    /// node draws `color` (premultiplied, encoded) over its logical `size`. Replaces any
+    /// image; the next `on_commit` of a real buffer replaces it. Damages the node.
+    void set_solid(lx::surface_id surface, lx::color color, lx::size2i size, bool opaque);
+    /// wp_alpha_modifier_v1: the node's opacity (1 = none). Damages the node when it changes;
+    /// kept for a node created later.
+    void set_alpha(lx::surface_id surface, float alpha);
+    [[nodiscard]] float alpha(lx::surface_id surface) const;
 
     [[nodiscard]] lx::gfx::imported_image lookup(lx::surface_id surface) const;
     [[nodiscard]] content_hint content_hint_for(lx::surface_id surface) const;
@@ -245,7 +253,11 @@ private:
         lx::size2i surface_size{};
         lx::rect2f src{};
         lx::buffer_transform transform = lx::buffer_transform::normal;
-        content_hint hint = content_hint::normal;
+        content_hint hint = content_hint::none;
+        /// Solid colour content (`set_solid`) instead of `image`.
+        bool solid = false;
+        lx::color solid_color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+        float alpha = 1.f;
         lx::scene::surface_node* node = nullptr;
         /// The container `node` was added to.
         lx::scene::container_node* node_parent = nullptr;
@@ -472,8 +484,9 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
     const lx::size2i old_size = entry.surface_size;
     const int old_margin = resample_margin(entry);
     entry.buffer = commit.buffer;
-    entry.hint = commit.hint;
     entry.image = image;
+    const bool was_solid = entry.solid;
+    entry.solid = false;
     entry.buffer_size = {static_cast<int>(desc.width), static_cast<int>(desc.height)};
     entry.surface_size = commit.surface_size.empty() ? entry.buffer_size : commit.surface_size;
     const bool source_changed = entry.src.x != commit.src.x || entry.src.y != commit.src.y ||
@@ -491,6 +504,8 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
     if (entry.node) {
         const lx::point2i o = entry.node->origin();
         entry.node->attach(image);
+        if (was_solid)
+            entry.node->set_solid(false, {});
         entry.node->set_opaque(entry.opaque);
         entry.node->set_bounds({0, 0, entry.surface_size.width, entry.surface_size.height});
         entry.node->set_content(entry.src, entry.transform);
@@ -498,7 +513,7 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
             const int margin = resample_margin(entry);
             if (old_size.width != entry.surface_size.width ||
                 old_size.height != entry.surface_size.height || opacity_changed ||
-                source_changed) {
+                source_changed || was_solid) {
                 // A size change uncovers or covers what lies outside the other extent, and a
                 // blend change repaints everything under the node: both rects, separately.
                 scene_->note_damage({o.x, o.y, old_size.width, old_size.height}, old_margin);
@@ -645,9 +660,12 @@ bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface,
         return false;
     }
     node->attach(entry.image);
+    node->set_solid(entry.solid, entry.solid_color);
     node->set_opaque(entry.opaque);
     node->set_bounds({0, 0, entry.surface_size.width, entry.surface_size.height});
     node->set_content(entry.src, entry.transform);
+    if (entry.alpha < 1.f)
+        node->set_transform(node->origin(), node->scale(), entry.alpha);
     entry.node = node;
     entry.node_parent = &parent;
     layout_changed_ = true;
@@ -720,7 +738,7 @@ lx::gfx::imported_image lx::compositor::surface_manager::lookup(lx::surface_id s
 lx::compositor::content_hint lx::compositor::surface_manager::content_hint_for(lx::surface_id surface) const {
     if (const int slot = find_surface(surface); slot >= 0)
         return surfaces_[static_cast<unsigned>(slot)].hint;
-    return content_hint::normal;
+    return content_hint::none;
 }
 
 void lx::compositor::surface_manager::set_override_redirect(lx::surface_id surface, bool value) {
@@ -732,6 +750,66 @@ void lx::compositor::surface_manager::set_content_hint(lx::surface_id surface,
                                                          content_hint hint) {
     if (const int slot = find_or_alloc_surface(surface); slot >= 0)
         surfaces_[static_cast<unsigned>(slot)].hint = hint;
+}
+
+void lx::compositor::surface_manager::set_solid(lx::surface_id surface, lx::color color,
+                                                lx::size2i size, bool opaque) {
+    const int slot = find_or_alloc_surface(surface);
+    if (slot < 0)
+        return;
+    auto& e = surfaces_[static_cast<unsigned>(slot)];
+    const lx::size2i old_size = e.surface_size;
+    const int old_margin = resample_margin(e);
+    const bool changed = !e.solid || e.solid_color.r != color.r || e.solid_color.g != color.g ||
+                         e.solid_color.b != color.b || e.solid_color.a != color.a ||
+                         e.opaque != opaque || old_size.width != size.width ||
+                         old_size.height != size.height;
+    e.solid = true;
+    e.solid_color = color;
+    e.image = {};
+    e.buffer = {};
+    e.buffer_size = {1, 1};
+    e.surface_size = size;
+    e.src = {};
+    e.transform = lx::buffer_transform::normal;
+    e.opaque = opaque;
+    if (!e.node || !changed)
+        return;
+    const lx::point2i o = e.node->origin();
+    e.node->attach({});
+    e.node->set_solid(true, color);
+    e.node->set_opaque(opaque);
+    e.node->set_bounds({0, 0, size.width, size.height});
+    e.node->set_content({}, lx::buffer_transform::normal);
+    if (scene_) {
+        scene_->note_damage({o.x, o.y, old_size.width, old_size.height}, old_margin);
+        scene_->note_damage({o.x, o.y, size.width, size.height});
+    }
+    if (old_size.width != size.width || old_size.height != size.height)
+        layout_changed_ = true;
+}
+
+void lx::compositor::surface_manager::set_alpha(lx::surface_id surface, float alpha) {
+    const int slot = find_or_alloc_surface(surface);
+    if (slot < 0)
+        return;
+    auto& e = surfaces_[static_cast<unsigned>(slot)];
+    alpha = alpha < 0.f ? 0.f : (alpha > 1.f ? 1.f : alpha);
+    if (e.alpha == alpha)
+        return;
+    e.alpha = alpha;
+    if (!e.node)
+        return;
+    e.node->set_transform(e.node->origin(), e.node->scale(), alpha);
+    // Every pixel the node covers blends differently.
+    if (scene_)
+        scene_->note_damage(node_rect(surface), resample_margin(e));
+}
+
+float lx::compositor::surface_manager::alpha(lx::surface_id surface) const {
+    if (const int slot = find_surface(surface); slot >= 0)
+        return surfaces_[static_cast<unsigned>(slot)].alpha;
+    return 1.f;
 }
 
 // ── input_region ───────────────────────────────────────────────────────────

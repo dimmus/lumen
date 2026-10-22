@@ -114,12 +114,13 @@ struct probe_state {
     unsigned pointers = 0;
 };
 
-void on_device(const char* name, bool keyboard, bool pointer, bool touch, void* user) {
+void on_device(const char* name, bool keyboard, bool pointer, bool touch, bool gesture,
+               void* user) {
     auto* st = static_cast<probe_state*>(user);
     if (keyboard) ++st->keyboards;
     if (pointer) ++st->pointers;
-    logf("device  %-40s%s%s%s\n", name ? name : "(unnamed)", keyboard ? " keyboard" : "",
-         pointer ? " pointer" : "", touch ? " touch" : "");
+    logf("device  %-40s%s%s%s%s\n", name ? name : "(unnamed)", keyboard ? " keyboard" : "",
+         pointer ? " pointer" : "", touch ? " touch" : "", gesture ? " gesture" : "");
 }
 
 void on_key(const lx::input::key_event& e, void* user) {

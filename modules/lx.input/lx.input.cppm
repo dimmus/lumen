@@ -33,15 +33,46 @@ struct pointer_motion_event {
     /// Relative movement, already accelerated by libinput.
     double dx = 0.0;
     double dy = 0.0;
+    /// The same movement without pointer acceleration, in the device's units normalised to
+    /// 1000 dpi (libinput's `get_dx_unaccelerated`): what relative-pointer-unstable-v1 hands
+    /// games and VM viewers alongside the accelerated delta.
+    double dx_unaccel = 0.0;
+    double dy_unaccel = 0.0;
     /// Pointer position. After relative motion it is the seat position in output
     /// coordinates; for an `absolute` device it is normalised to [0, 1] of the device's
     /// box, and the compositor — which alone knows the output layout — scales it.
     double x = 0.0;
     double y = 0.0;
     bool absolute = false;
+    /// An `absolute` device's previous position (normalised like `x`, `y`) when
+    /// `has_prev`: the compositor scales the difference into a relative delta (sway does the
+    /// same), because a tablet or a VM console mouse reports no motion of its own — and a
+    /// locked pointer must still yield one.
+    double prev_x = 0.0;
+    double prev_y = 0.0;
+    bool has_prev = false;
     unsigned time_ms = 0;
     /// libinput's microsecond timestamp (CLOCK_MONOTONIC). `time_ms` is what the wire
     /// carries; this is what latency is measured against.
+    unsigned long long time_us = 0;
+};
+
+/// A touchpad gesture (libinput's swipe, pinch and hold), for pointer-gestures-unstable-v1.
+/// One struct for the three kinds and their phases: begin carries the finger count, update
+/// the deltas (and for a pinch the scale since begin and the rotation since the last
+/// update, in degrees clockwise), end whether it was cancelled.
+struct gesture_event {
+    enum class kind : unsigned char { swipe, pinch, hold } type = kind::swipe;
+    enum class phase : unsigned char { begin, update, end } stage = phase::begin;
+    unsigned fingers = 0;
+    double dx = 0.0;
+    double dy = 0.0;
+    double dx_unaccel = 0.0;
+    double dy_unaccel = 0.0;
+    double scale = 1.0;
+    double rotation = 0.0;
+    bool cancelled = false;
+    unsigned time_ms = 0;
     unsigned long long time_us = 0;
 };
 
@@ -96,10 +127,13 @@ struct event_sink {
     /// sending one per keystroke is wasteful and visible.
     void (*modifiers)(const modifier_state&, void*) = nullptr;
     void (*touch)(const touch_event&, void*) = nullptr;
+    /// Touchpad gestures (every phase of every kind).
+    void (*gesture)(const gesture_event&, void*) = nullptr;
     /// A device appeared, with its libinput name and what it can do. Reported because
     /// "nothing happens when I type" is usually a keyboard that was never opened, and a
     /// device count alone cannot tell you that.
-    void (*device_added)(const char* name, bool keyboard, bool pointer, bool touch,
+    /// `gesture`: a touchpad whose swipes, pinches and holds libinput reports.
+    void (*device_added)(const char* name, bool keyboard, bool pointer, bool touch, bool gesture,
                          void*) = nullptr;
     void* user = nullptr;
 };
@@ -241,6 +275,16 @@ private:
     bool suspended_ = false;
     /// The event being handled comes from a device that is going away (see `dispatch`).
     bool removing_ = false;
+    /// The last position of each absolute pointer device (`pointer_motion_event::prev_x`),
+    /// fixed storage: a seat has one or two such devices; beyond the table a device simply
+    /// reports no previous position.
+    struct absolute_track {
+        void* device = nullptr;
+        double x = 0.0;
+        double y = 0.0;
+    };
+    static constexpr unsigned k_absolute_tracks = 8;
+    absolute_track absolute_[k_absolute_tracks]{};
 };
 
 } // namespace lx::input
@@ -446,6 +490,7 @@ void lx::input::input_manager::handle_event(void* raw) {
                 libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_KEYBOARD) != 0,
                 libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_POINTER) != 0,
                 libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_TOUCH) != 0,
+                libinput_device_has_capability(dev, LIBINPUT_DEVICE_CAP_GESTURE) != 0,
                 sink_.user);
         }
         break;
@@ -453,6 +498,10 @@ void lx::input::input_manager::handle_event(void* raw) {
     case LIBINPUT_EVENT_DEVICE_REMOVED:
         if (device_count_ > 0)
             --device_count_;
+        // A device that comes back starts without a previous position.
+        for (auto& t : absolute_)
+            if (t.device == libinput_event_get_device(ev))
+                t = {};
         break;
 
     case LIBINPUT_EVENT_POINTER_MOTION: {
@@ -460,6 +509,8 @@ void lx::input::input_manager::handle_event(void* raw) {
         pointer_motion_event out{};
         out.dx = libinput_event_pointer_get_dx(p);
         out.dy = libinput_event_pointer_get_dy(p);
+        out.dx_unaccel = libinput_event_pointer_get_dx_unaccelerated(p);
+        out.dy_unaccel = libinput_event_pointer_get_dy_unaccelerated(p);
         out.time_ms = libinput_event_pointer_get_time(p);
         out.time_us = libinput_event_pointer_get_time_usec(p);
         seat_.set_pointer_position(seat_.pointer_x() + out.dx, seat_.pointer_y() + out.dy);
@@ -480,6 +531,24 @@ void lx::input::input_manager::handle_event(void* raw) {
         out.y = libinput_event_pointer_get_absolute_y_transformed(p, 1);
         out.time_ms = libinput_event_pointer_get_time(p);
         out.time_us = libinput_event_pointer_get_time_usec(p);
+        {
+            void* dev = libinput_event_get_device(ev);
+            absolute_track* slot = nullptr;
+            for (auto& t : absolute_) {
+                if (t.device == dev) {
+                    slot = &t;
+                    break;
+                }
+                if (!slot && !t.device)
+                    slot = &t;
+            }
+            if (slot) {
+                out.has_prev = slot->device == dev;
+                out.prev_x = slot->x;
+                out.prev_y = slot->y;
+                *slot = {dev, out.x, out.y};
+            }
+        }
         if (sink_.pointer_motion)
             sink_.pointer_motion(out, sink_.user);
         break;
@@ -580,6 +649,53 @@ void lx::input::input_manager::handle_event(void* raw) {
                                                          : touch_event::phase::cancel;
         if (sink_.touch)
             sink_.touch(out, sink_.user);
+        break;
+    }
+
+    case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
+    case LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE:
+    case LIBINPUT_EVENT_GESTURE_SWIPE_END:
+    case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
+    case LIBINPUT_EVENT_GESTURE_PINCH_UPDATE:
+    case LIBINPUT_EVENT_GESTURE_PINCH_END:
+    case LIBINPUT_EVENT_GESTURE_HOLD_BEGIN:
+    case LIBINPUT_EVENT_GESTURE_HOLD_END: {
+        auto* g = libinput_event_get_gesture_event(ev);
+        gesture_event out{};
+        switch (type) {
+        case LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN:
+        case LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE:
+        case LIBINPUT_EVENT_GESTURE_SWIPE_END: out.type = gesture_event::kind::swipe; break;
+        case LIBINPUT_EVENT_GESTURE_PINCH_BEGIN:
+        case LIBINPUT_EVENT_GESTURE_PINCH_UPDATE:
+        case LIBINPUT_EVENT_GESTURE_PINCH_END: out.type = gesture_event::kind::pinch; break;
+        default: out.type = gesture_event::kind::hold; break;
+        }
+        out.stage = type == LIBINPUT_EVENT_GESTURE_SWIPE_BEGIN ||
+                            type == LIBINPUT_EVENT_GESTURE_PINCH_BEGIN ||
+                            type == LIBINPUT_EVENT_GESTURE_HOLD_BEGIN
+                        ? gesture_event::phase::begin
+                    : type == LIBINPUT_EVENT_GESTURE_SWIPE_UPDATE ||
+                            type == LIBINPUT_EVENT_GESTURE_PINCH_UPDATE
+                        ? gesture_event::phase::update
+                        : gesture_event::phase::end;
+        out.fingers = static_cast<unsigned>(libinput_event_gesture_get_finger_count(g));
+        out.time_ms = libinput_event_gesture_get_time(g);
+        out.time_us = libinput_event_gesture_get_time_usec(g);
+        if (out.stage == gesture_event::phase::update) {
+            out.dx = libinput_event_gesture_get_dx(g);
+            out.dy = libinput_event_gesture_get_dy(g);
+            out.dx_unaccel = libinput_event_gesture_get_dx_unaccelerated(g);
+            out.dy_unaccel = libinput_event_gesture_get_dy_unaccelerated(g);
+            if (out.type == gesture_event::kind::pinch) {
+                out.scale = libinput_event_gesture_get_scale(g);
+                out.rotation = libinput_event_gesture_get_angle_delta(g);
+            }
+        }
+        if (out.stage == gesture_event::phase::end)
+            out.cancelled = libinput_event_gesture_get_cancelled(g) != 0;
+        if (sink_.gesture)
+            sink_.gesture(out, sink_.user);
         break;
     }
 

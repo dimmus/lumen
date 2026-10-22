@@ -185,6 +185,18 @@ Each app:
 
 Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`.
 
+### 2.4 Portal processes
+
+**Binaries:** `xdg-desktop-portal` (the frontend), `xdg-desktop-portal-wlr` (ScreenCast),
+`xdg-desktop-portal-lumen` (Screenshot, PickColor, the cast source chooser; `lx.portal`),
+`xdg-desktop-portal-gtk` (file chooser, access dialogs and the rest)
+
+Applications — sandboxed or not — reach screen capture through D-Bus, not through the
+capture globals: the frontend checks permissions and asks the user, and routes each
+interface to a backend by `lumen-portals.conf`. The backends are ordinary Wayland clients of
+the compositor (unsandboxed, so they see the capture globals); none of them is privileged
+the way `lumen-shell` is. See [Portals](#portals) in §4.
+
 ---
 
 ## 3. Module layers
@@ -212,7 +224,7 @@ flowchart TB
         SHB["lx.shell:bridge / task_model / panel / launcher / app_catalog / app_launch"]
         SHP["lx.shell.policy"]
         UI["lx.ui"]
-        PORTAL["lx.portal (optional)"]
+        PORTAL["lx.portal (xdg-desktop-portal-lumen)"]
     end
 
     subgraph L4["Compositor layer"]
@@ -335,31 +347,39 @@ flowchart LR
 
 | Module | Responsibility |
 |--------|----------------|
-| `lx.wayland.server` | Socket, client connections, protocol dispatch, global registry |
+| `lx.wayland.server` | Socket, client connections, protocol dispatch, global registry; the global filter hiding `deny_sandboxed` globals from sandboxed clients; security-context listeners (security-context-v1: an engine's socket accepted on libwayland's own loop, each client created with its context attached and sandboxed) |
 | `lx.compositor.toplevel` | `toplevel_record` per `xdg_toplevel`, stacking order, configure state machine (one configure in flight, serials matched on ack) |
-| `lx.compositor.wm` | The executor of window state: owns `toplevel_record::geometry` (the one source of truth for where a window is), places new windows (centred, cascaded), derives node origin from geometry and node bounds from the buffer, sends configures once per tick. Input routing: hit-testing (one top→bottom pass over the stacking order, surface extents ∩ `wl_surface` input region), enter/leave pairing, the implicit grab while a button is held, click-to-focus and raise-on-press (placeholder policy until the shell drives it), stacking and the shell's activate/raise/lower/restack/close requests. Interactive move/resize grabs (xdg, shell bridge and the placeholder Super+drag binding share one executor): move is an origin change applied once per tick, resize keeps one configure in flight and anchors left/top edges on the matching commit, Escape cancels. The usable area (output minus layer-shell exclusive zones) for placement, move constraints, `configure_bounds` and maximize; keyboard-focus resolution across layer surfaces, popups and toplevels. UI affinity |
-| `lx.compositor.surface` | Commit handler: damage, dmabuf desc, syncobj timeline, `content_hint`, content opacity (blend only skipped for a format without alpha or a full opaque region); one scene node per *mapped* surface, created and placed by `surface_tree`. O(1) id → slot index; registry of each surface's `wl_resource` |
+| `lx.compositor.wm` | The executor of window state: owns `toplevel_record::geometry` (the one source of truth for where a window is), places new windows (centred, cascaded), derives node origin from geometry and node bounds from the buffer, sends configures once per tick. Input routing: hit-testing (one top→bottom pass over the stacking order, surface extents ∩ `wl_surface` input region), enter/leave pairing, the implicit grab while a button is held, click-to-focus and raise-on-press (placeholder policy until the shell drives it), stacking and the shell's activate/raise/lower/restack/close requests. Transients (xdg-dialog-v1, xdg_toplevel.set_parent, xdg-foreign): a child is centred on its parent at its first map; a modal one stays above its parent, which never takes the keyboard while it has one (focus, activation and clicks go to the dialog). Interactive move/resize grabs (xdg, shell bridge and the placeholder Super+drag binding share one executor): move is an origin change applied once per tick, resize keeps one configure in flight and anchors left/top edges on the matching commit, Escape cancels. The usable area (output minus layer-shell exclusive zones) for placement, move constraints, `configure_bounds` and maximize; keyboard-focus resolution across layer surfaces, popups and toplevels. UI affinity |
+| `lx.compositor.content_update` | The content-update queue of `wl_surface.commit` (wayland 1.24's CU model), Wayland-free: a fixed pool of queued updates (512), per-surface queues in commit order, synchronized children's state *sealed* into their parent's update, fence-wait counts, and the readiness policy (`cu_ready`: fences, the fifo barrier and the commit-timing target, all ignored but the fences for a surface not on screen); the readiness poller (one epoll fd, one event-loop source, for every sync_file and syncobj eventfd an update waits on). UI affinity |
+| `lx.compositor.surface` | Commit handler: damage, dmabuf desc, solid colour content (`wp_single_pixel_buffer_v1`), the alpha multiplier (node opacity), `content_hint` (wp_content_type_v1), content opacity (blend only skipped for a format without alpha or a full opaque region); one scene node per *mapped* surface, created and placed by `surface_tree`. O(1) id → slot index; registry of each surface's `wl_resource` |
 | `lx.compositor.surface_tree` | `wl_subsurface` trees, Wayland-free: parentage, the double-buffered child state (position, place_above/below order) pending → cached → current, effective sync, mapping (content + linked + parent mapped, recursively). Each root surface (toplevel, popup, layer surface) owns one container holding its whole tree **flattened in paint order** (an optional underlay below it); restacking a window moves that one container. Node origins stay global: relative positions live here and are pushed into the nodes when a root moves or its tree changes, damaging old and new rects per node. Hit-testing walks the container in reverse paint order (each surface clipped to its own extents and input region). UI affinity |
 | `lx.compositor.positioner` | xdg_positioner placement, pure: base rectangle from anchor, offset and gravity; constraint adjustment per axis in the spec's precedence flip → slide → resize |
 | `lx.compositor.popup` | xdg_popup state, Wayland-free: configure/ack, placement relative to the parent's window geometry, map/unmap, reposition, the popup grab and dismissal. UI affinity |
 | `lx.compositor.layer_shell` | wlr-layer-shell, Wayland-free: layer-surface records, the configure/ack flow, arrangement against the output (`arrange_layers`, pure) and the usable area its exclusive zones leave, keyboard-interactivity queries; each layer surface's tree container sits in one of the four layer-shell scene containers. UI affinity |
 | `lx.compositor.decoration` | Server-side frames (xdg-decoration), Wayland-free: frame extents and hit zones, the shared atlas, the frame scene node (underlay of the window's tree container), cached title textures rasterized with `lx.text`. UI affinity |
-| `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state, geometry, focus) on `zlm_policy_bridge_v1`; receives WM requests |
+| `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state — `modal` for an effectively modal dialog —, geometry, focus, flags; v6: icon with its memfds, parent, bell) on `zlm_policy_bridge_v1`; receives WM requests |
+| `lx.compositor.toplevel_icon` | xdg-toplevel-icon-v1's icon store, Wayland-free: a set_icon snapshot (name + up to four buffers, edge ≤ 256, nearest the panel's 32 px first) copied into sealed memfds, refcounted by the toplevel records, 128 icons and 16 MiB of pixels at most. UI affinity |
+| `lx.compositor.foreign_registry` | xdg-foreign's handle table for v1 and v2 (one registry: either imports what either exported), handles of 128 random bits as 32 hex digits, 64 exports. UI affinity |
+| `lx.compositor.pointer_constraints` | pointer-constraints' policy, Wayland-free and pure (bodies in `pointer_constraints.cpp`): the effective region (region ∩ input region ∩ the surface's box, ≤ 32 rects, overflow only confines more), `confine_motion` (the motion segment walked across the rects, sliding along the edge that stops it, one wl_fixed short of far edges), `nearest_inside`, the activation predicate `constraint_wanted` and when a lock's cursor hint is usable |
+| `lx.compositor.capture` | Screen capture's policy, Wayland-free and pure (bodies in `capture.cpp`): session constraints (buffer size, shm XRGB/ARGB, LINEAR XR24/AR24 dma-buf with the render node on GL) and whether a buffer fits them, the frame requests and their errors, the session table (64, 16 per client, a generation per open), `capture_decide` (copy, the lock curtain, held, stopped — CC7–CC9), the per-output composite damage ring (`capture_damage_ring`), the pointer's placement and premultiplied blend, wlr-screencopy's per-client damage points. UI affinity |
+| `lx.compositor.capture_engine` | Screen capture's render side, Wayland-free: jobs UI → render and completions render → UI (`capture_channel`, fixed queues under one lock), client shm under a guard render writes through (`capture_shm_guards`: the pool referenced, a buffer's destruction waits for a copy in progress), and `capture_renderer`, which runs jobs on the active backend — on a composite of their output, from an output's newest composited frame (first frames, pointer moves), or on a window's capture view — and keeps no per-session state but GL objects and a Vulkan staging buffer |
 | `lx.compositor.cursor` | Pointer image and position (grab override → frame hover → client → default). Hardware cursor plane (`lx.drm:cursor`) by default: pointer motion is a plane update on the next atomic commit — or a cursor-only commit when nothing else changed — and never a composite. Software fallback is a node in the scene's overlay layer, damaged old+new. Images from the Xcursor theme (`lx.compositor.xcursor`) with a compiled-in vector set, `wp_cursor_shape_v1` and `wl_pointer.set_cursor` |
 | `lx.compositor.output` | The outputs, in **stable slots** (an output keeps its slot while its connector stays connected): geometry, refresh, name (the kernel's connector name, "Virtual-1"), physical size, scale, transform, present mode, KMS damage flags, and a `generation` that moves only when something a client sees changed. Without a connected connector there is one virtual output, HEADLESS-1 (1920x1080 at 60 Hz). Pure membership helpers: the outputs a rect is on (one bit per slot), the primary output (largest overlap), the preferred buffer scale (ceiling of the largest) and transform. UI affinity |
 | `lx.compositor.output_management` / `.output_config_store` / `.toml_lite` | wlr-output-management's wire-free model (heads, mode identity, every configuration error, validation into a target, the job queue), the persisted `outputs.toml` model (per monitor, per setup) and its file (debounced atomic saves on the worker), and the strict TOML subset they are written in. Pure apart from the file; UI affinity |
 | `lx.compositor.liveness` | xdg_wm_base.ping/pong liveness, Wayland-free: pings on activation, delivered button and key presses, the configure watchdog and every 10 s to the focused client — one outstanding per client, at least 2 s apart; a ping unanswered past the timeout (`--ping-timeout`, 5 s) marks the client not responding until it answers. Never kills. O(1) per tick unless a deadline passed. UI affinity |
-| `lx.compositor.input_router` | Seat event delivery to the focused client's resources (enter/leave pairing, held keys, frames) and the per-client **input serial log**: the serials of input and focus events each client was sent, as compressed ranges — what `set_selection` and xdg-activation tokens quote is checked against it. The focus-client hook runs between a focus change's `leave`s and `enter`s; the user-input hook after a delivered key or button press (liveness pings on it). Pointer motion to a client that is not responding is withheld (keys, buttons and enter/leave are not). UI affinity |
+| `lx.compositor.input_router` | Seat event delivery to the focused client's resources (enter/leave pairing, held keys, frames) and the per-client **input serial log**: the serials of input and focus events each client was sent, as compressed ranges — what `set_selection` and xdg-activation tokens quote is checked against it. The focus-client hook runs between a focus change's `leave`s and `enter`s; the user-input hook after a delivered key or button press (liveness pings on it). Pointer motion to a client that is not responding is withheld (keys, buttons and enter/leave are not). UI affinity The pointer-focus hook runs after every pointer-focus change (pointer constraints follow it); the *motion lock* withholds every `wl_pointer.motion` while a pointer lock holds, and `send_pointer_frame` closes a group of relative motion that carried none. |
 | `lx.compositor.activation` | xdg-activation's focus-stealing-prevention policy, Wayland-free: `decide_grantable` (at token commit) and `decide_activation` (at `activate`, and again at map for a window that asked before mapping) — pure functions over what the wire and the window manager gather; the token table (64 fixed slots, 128-bit random text from `getrandom`, single use, 30 s lifetime, constant-time lookup, eviction of expired then oldest). UI affinity |
 | `lx.compositor.data_transfer` | Wayland-free data-transfer pieces: `mime_list` (a source's offered types, inline, never allocating) and drag-and-drop action negotiation (`negotiate_dnd_action`, the modifier-chosen user action) |
 | `lx.compositor.dnd` | The drag-and-drop grab, Wayland-free: a third pointer mode beside the implicit grab and move/resize, driven by the window manager's pointer path (hit test, button mask, Escape, modifiers) and calling the wire through `dnd_ops` (focus, motion, drop, cancel, user action). Owns the drag icon's placement (a `dnd_icon` surface-tree root in its own scene layer, moved once per tick with the pointer) and the pointer shape that shows the negotiated action. No allocation per motion. UI affinity |
-| `lx.compositor.wire` (internal) | The libwayland glue, one translation unit per protocol area: `wire_surface.cpp` (wl_compositor, wl_surface, wl_region, frame callbacks, the commit), `wire_subsurface.cpp`, `wire_buffer.cpp` (wl_buffer tracking, shm staging, texture retirement), `wire_xdg_shell.cpp` (xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, the window manager's wire ops), `wire_xdg_popup.cpp`, `wire_decoration.cpp`, `wire_layer_shell.cpp`, `wire_dmabuf.cpp`, `wire_seat.cpp`, `wire_cursor_shape.cpp`, `wire_shell.cpp` (zlm_shell_v1, policy bridge), `wire_output.cpp` (wl_output, xdg-output, wl_surface.enter/leave and the preferred buffer scale/transform), `wire_selection.cpp` (the selection model both selection families share), `wire_data_device.cpp` (wl_data_*), `wire_primary_selection.cpp` (zwp_primary_selection_*_v1), `wire_dnd.cpp` (start_drag, drag offers and action negotiation), `wire_activation.cpp` (xdg_activation_v1: token builders, the grant decision at commit, `activate`), `wire_idle.cpp` (ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1), `wire_output_power.cpp` (zwlr_output_power_manager_v1), `wire_output_management.cpp` (zwlr_output_manager_v1: heads, modes, configurations), `wire_session_lock.cpp` (ext_session_lock_manager_v1, lock objects, lock surfaces), `wire_text_input.cpp` (zwp_text_input_manager_v3, text inputs and the events the relay sends them), `wire_input_method.cpp` (zwp_input_method_manager_v2, input-method popups and keyboard grabs, zwp_virtual_keyboard_manager_v1, the relay's installation), and `wire_install.cpp` (every global, in registry order, and the `:protocols_p0` entry points). The implementation partition `:wire` (`wire.cppm`, not exported) holds the wire object records and what more than one unit uses; everything else stays in each unit's anonymous namespace. The Wayland-free state stays in the partitions above. UI affinity |
-| `lx.scene` | Scene graph (layers bottom→top: layer-shell background and bottom, windows — per-window tree containers —, layer-shell top and overlay, popups, drag icon, session-lock surfaces, cursor), a clear colour per snapshot (the lock's solid colour), multi-rect damage (`gfx::damage_region`), a per-node tint (the not-responding dim), `build_draw_list_into` |
+| `lx.compositor.wire` (internal) | The libwayland glue, one translation unit per protocol area: `wire_surface.cpp` (wl_compositor, wl_surface, wl_region, frame callbacks, the commit), `wire_subsurface.cpp`, `wire_buffer.cpp` (wl_buffer tracking, shm staging, texture retirement), `wire_xdg_shell.cpp` (xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, the window manager's wire ops), `wire_xdg_popup.cpp`, `wire_decoration.cpp`, `wire_layer_shell.cpp`, `wire_dmabuf.cpp`, `wire_seat.cpp`, `wire_cursor_shape.cpp`, `wire_shell.cpp` (zlm_shell_v1, policy bridge), `wire_output.cpp` (wl_output, xdg-output, wl_surface.enter/leave and the preferred buffer scale/transform), `wire_selection.cpp` (the selection model both selection families share), `wire_data_device.cpp` (wl_data_*), `wire_primary_selection.cpp` (zwp_primary_selection_*_v1), `wire_dnd.cpp` (start_drag, drag offers and action negotiation), `wire_activation.cpp` (xdg_activation_v1: token builders, the grant decision at commit, `activate`), `wire_idle.cpp` (ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1), `wire_output_power.cpp` (zwlr_output_power_manager_v1), `wire_output_management.cpp` (zwlr_output_manager_v1: heads, modes, configurations), `wire_session_lock.cpp` (ext_session_lock_manager_v1, lock objects, lock surfaces), `wire_text_input.cpp` (zwp_text_input_manager_v3, text inputs and the events the relay sends them), `wire_input_method.cpp` (zwp_input_method_manager_v2, input-method popups and keyboard grabs, zwp_virtual_keyboard_manager_v1, the relay's installation), the commit-path add-ons — `wire_fifo.cpp` (wp_fifo_v1, wp_commit_timer_v1, and the add-on object plumbing they all share), `wire_tearing.cpp` (wp_tearing_control_v1, wp_content_type_v1), `wire_single_pixel.cpp` (wp_single_pixel_buffer_manager_v1, wp_alpha_modifier_v1), `wire_syncobj.cpp` (wp_linux_drm_syncobj_manager_v1: timelines, acquire/release points, the commit checks) —, the window and session protocols — `wire_dialog.cpp` (xdg_wm_dialog_v1), `wire_toplevel_icon.cpp` (xdg_toplevel_icon_manager_v1), `wire_bell.cpp` (xdg_system_bell_v1), `wire_foreign.cpp` (zxdg_exporter/importer v2 and v1), `wire_shortcuts_inhibit.cpp` (zwp_keyboard_shortcuts_inhibit_manager_v1), `wire_data_control.cpp` (ext_data_control_manager_v1, zwlr_data_control_manager_v1 v2), `wire_security_context.cpp` (wp_security_context_manager_v1), `wire_pointer_constraints.cpp` (zwp_pointer_constraints_v1), `wire_relative_pointer.cpp` (zwp_relative_pointer_manager_v1), `wire_gestures.cpp` (zwp_pointer_gestures_v1 v3) —, screen capture — `wire_foreign_toplevel.cpp` (ext_foreign_toplevel_list_v1, and the shell bridge's toplevel observer), `wire_capture.cpp` (the two ext_image_capture_source managers, ext_image_copy_capture_manager_v1 sessions and frames, zwlr_screencopy_manager_v1 v3 on the same core, the capture tick and completions), `wire_capture_cursor.cpp` (ext_image_copy_capture_cursor_session_v1) — and `wire_install.cpp` (every global, in registry order, and the `:protocols_p0` entry points). The implementation partition `:wire` (`wire.cppm`, not exported) holds the wire object records and what more than one unit uses; everything else stays in each unit's anonymous namespace. The Wayland-free state stays in the partitions above. UI affinity |
+| `lx.scene` | Scene graph (layers bottom→top: layer-shell background and bottom, windows — per-window tree containers —, layer-shell top and overlay, popups, drag icon, session-lock surfaces, cursor), a clear colour per snapshot (the lock's solid colour), multi-rect damage (`gfx::damage_region`), a per-node tint (the not-responding dim), `build_draw_list_into`. Views 0–15 are the outputs; views 16–23 are *capture views* (`output_view_config::root`: one window's tree container projected into a capture client's buffer, with their own damage and snapshot buffers) |
 | `lx.scene.snapshot` | Triple-buffered handoff (v2: index swap, back-pressure policy) |
 | `lx.gfx` | Vulkan device, swapchain, dmabuf import, render pass |
-| `lx.gfx.gl_renderer` | EGL/GLES composite on GBM — the accelerated path on drivers with no Vulkan driver (vmwgfx/SVGA3D and similar) |
+| `lx.gfx.gl_renderer` | EGL/GLES composite on GBM — the accelerated path on drivers with no Vulkan driver (vmwgfx/SVGA3D and similar); `composite_into` composites into any framebuffer (a capture target), optionally without clearing and without a fence |
+| `lx.gfx.gl_capture` | Screen capture's GL objects (ES 3.0): a client's dma-buf as a framebuffer (imported once per wl_buffer, LRU of 32), `glBlitFramebuffer` of damage rects (and crops), offscreen framebuffers over LINEAR GBM buffers read off the render thread (`read_bo`), asynchronous read-backs into pixel-pack buffers behind a native fence and their copy-out where there is no GBM buffer, the curtain clear |
 | `lx.gfx.cpu_renderer` | Software composite into a CPU-writable scanout buffer; chosen when no hardware renderer is available ([rendering-performance.md](subsystems/rendering-performance.md) §1.2) |
 | `lx.gfx.import_cache` | LRU reuse of VkImage imports; per-client entry cap |
+| `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries, `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
 | `lx.runtime.memory` | Per-subsystem arenas, pressure coordinator, overflow policies |
 | `lx.input` + `seat_manager` | libinput → pointer/keyboard events (ms wire time plus µs CLOCK_MONOTONIC time for latency) → `lx.compositor.wm` decides focus |
@@ -374,26 +394,44 @@ flowchart LR
 
 ### Content updates and subsurfaces
 
-`wl_surface.commit` is four steps in `wire_surface.cpp`: role pre-checks on the pending
-state (xdg rules that reject the whole commit), **merge** pending into the surface's cached
-state (later state replaces earlier, damage and frame callbacks accumulate, a buffer
-superseded before use is released), let the tree cache the children's pending positions and
-order, and then — unless the surface is *effectively synchronized* — **apply**: cached →
-current for the surface, its children's positions and order, and recursively the cached
-state of every synchronized child, all in the same UI call and so the same snapshot. Then
-the root's role finisher (window geometry, configure acks, map) and one `sync_scene` of the
-root's container. `apply_cached` is the only path from cached to current, so commit
-constraints (fences, transactions) can later hold updates back there without touching the
-semantics. A surface that stops being effectively synchronized (`set_desync`, its
-`wl_subsurface` or parent destroyed) applies what it had cached, top-down.
+`wl_surface.commit` creates a **content update** (wayland.xml since 1.24: "placed at the end
+of a per-surface queue … applied atomically"). In `wire_surface.cpp`: role pre-checks on the
+pending state (every protocol error that rejects the whole commit — xdg rules, viewport,
+explicit sync — validation only), **merge** pending into the surface's cached state (later
+state replaces earlier, damage and frame callbacks accumulate, a buffer superseded before use
+is released and its explicit-sync release point signalled), let the tree cache the
+children's pending positions and order, and then — unless the surface is *effectively
+synchronized* — commit a DCU (`commit_dcu`):
 
-Follow-up, recorded: the double-buffered state (`surface_pending`, `merge_pending_into_cached`,
-`apply_core`) is meant to become a Wayland-free `:surface_state` partition, unit-tested on
-its own. It is not split out yet because its logic is interleaved with wire actions
-(`wl_buffer.release`, answering frame callbacks, `wl_shm_buffer` reads) and the queue has no
-logic of its own until commit constraints (explicit sync, fences, transactions) hold updates
-in the cached state; extracting it now would need an ops table on the commit hot path. The
-records already live in `:wire`, so the extraction moves one struct and two functions.
+- **Fast path** (the common case, today's cost): the surface's queue is empty and nothing
+  blocks the update — its fences (and its synchronized children's) have signalled, and for a
+  surface on screen no fifo barrier holds it and its commit-timing target is reached. It is
+  applied at once: the role state the commit carries, then cached → current for the surface,
+  its children's positions and order, and recursively the cached state of every synchronized
+  child, all in the same UI call and so the same snapshot; then the root's role finisher
+  (window geometry, configure acks, map) and one `sync_scene` of the root's container.
+- **Queued**: otherwise the update takes a record in `:content_update` and its payload — the
+  surface state, a **role snapshot** (xdg window geometry, size limits and the acked
+  configure; a popup's geometry; a layer surface's props — so a queued buffer is never shown
+  with geometry acked for a later one) and the tree's cached child state — moves out of the
+  surface. Synchronized descendants' cached state is **sealed** into it. It applies, in commit
+  order, when it heads its surface's queue and is ready: the poller saw its fences signal, a
+  tick latched the frame that clears the fifo barrier, a tick reached its target, or the
+  surface stopped being shown. Applying swaps the payload into `cached` and goes through
+  `apply_cached` like the fast path; sealed children are applied from the update, never from
+  what they cached since. A surface's queue holds up to 128 updates (weston-simple-timing
+  schedules ~110 ahead); beyond that the newest two merge (the older carries the newer
+  content and waits for both sets of blockers: a frame dropped, nothing shown early). A
+  client holds at most 128 records, and one holding more than 8 may not take the pool's
+  last 64 (`cu_room_for`), so clients far ahead of the display cannot leave one that
+  queues a frame or two without a record. The poller keeps 64 of its 384 entries for other
+  units (a capture's copy fence). A destroyed surface's queued updates are discarded —
+  buffers released, release points signalled, frame callbacks answered.
+
+A surface that stops being effectively synchronized (`set_desync`, its `wl_subsurface` or
+parent destroyed) turns what it had cached into a DCU, top-down. Frame callbacks are kept in
+a shared node pool (an update carries a three-word list), so queued updates are small and a
+commit copies no callback array.
 
 A window's geometry is clamped to the bounding box of its whole tree, so a client-side
 title bar drawn as a subsurface above the main surface is part of the window (its origin
@@ -401,6 +439,55 @@ may be negative in surface coordinates). Texture updates carry the index of the 
 being built when they were queued, and the render thread holds an update back until it
 composites that snapshot, so new pixels never show under the previous frame's geometry
 (see [rendering-performance.md](subsystems/rendering-performance.md)).
+
+### Explicit sync, buffer readiness and the commit-path protocols
+
+Design and decisions: [ADR 009](adr/009-app-compatibility-and-capture.md) Part A.
+
+- **Implicit readiness.** A dma-buf update without explicit sync is held until its writers'
+  fences have signalled: one `poll(POLLIN, 0)` per distinct plane (the already-signalled
+  case, the norm), else a `DMA_BUF_IOCTL_EXPORT_SYNC_FILE(READ)` snapshot watched by the
+  poller (Mutter's and niri's rule). A slow GL client then never costs everyone a frame. A
+  kernel without the ioctl disables the wait (the GPU import waits implicitly instead).
+- **linux-drm-syncobj-v1** is offered only where it works end to end (timeline syncobjs,
+  `DRM_IOCTL_SYNCOBJ_EVENTFD`, a composite that exports a completion fence — not on vmwgfx).
+  The acquire point is waited for *signalled* (query, then an eventfd the poller watches), so
+  the composite never waits on client GPU work. An update is never applied before its
+  acquire points signal: one the poller cannot take (or no eventfd could be armed for) marks
+  the update `recheck` — it blocks like a wait and is queried again at each tick of a lit
+  output (its pace output keeps ticking) until it signals or an entry is armed; an update
+  with nowhere to wait at all (the client past its share of the pool) disconnects its
+  client with `no_memory` rather than apply early. A release point is signalled at once for
+  a buffer that was never sampled; for a sampled one when the buffer lifecycle retires it —
+  a dma-buf is the surface's *current* content, sampled by every composite, until a newer
+  commit supersedes it, then released once the last frame that could sample it (window
+  capture views included) completed — with the newest fence attached
+  (`release_fence_mailbox`: render publishes each composite's, and one after a tick's capture
+  composites that sampled client textures, only while some client uses explicit sync). A
+  wl_buffer destroyed while on screen hands its owed point to the lifecycle record. A
+  re-commit of the buffer on the same timeline at a later point keeps the older point
+  pending (signalling the later one covers it). shm and single-pixel buffers are
+  `unsupported_buffer`.
+- **fifo-v1**: an applied update with `set_barrier` raises the surface's barrier, dated with
+  the frame that first shows it; it clears after its pace output's tick latches that frame
+  (`content_updates_latched`, right after publish), and the update waiting on it applies then,
+  joining the next frame — one update per refresh. The pace output's clock keeps ticking while
+  such an update waits.
+- **commit-timing-v1**: an update with a target T applies when the frame it would join is
+  predicted to present no earlier than 0.5 ms before T (the frame clock's deadline inside a
+  tick, the first deadline whose tick has not started outside one). A stopped clock is armed
+  for exactly that tick (`frame_clocks::request_at`), so a target costs one wake-up.
+- **Hidden surfaces** (occluded, off every output, under the lock, VT paused, display off)
+  ignore fifo and timing; only fences hold them. Frame callbacks throttle them as before.
+- **single-pixel-buffer-v1**: a colour, not pixels — a solid draw (`draw_command::solid`) of
+  the surface's logical size, released at apply; GL clears an opaque untinted one with a
+  scissored `glClear`, otherwise every backend substitutes the colour for the sample.
+  **alpha-modifier-v1** is the surface node's opacity (applied once: the scene no longer also
+  folds it into the tint). **content-type-v1** feeds `content_hint`. **tearing-control-v1**'s
+  hint reaches the output policy (`allow_async`: card capability, a TEST_ONLY-verified async
+  commit, a fullscreen window asking for it, not locked); the atomic-async commit itself is
+  not wired yet (no card here exposes the capability), so outputs present with vsync and say
+  so once.
 
 ### Popups
 
@@ -545,9 +632,21 @@ is one selection per seat and family, owned by a source.
   destroying its source (or exiting) clears the selection and tells the focused client
   `selection(NULL)` (wlroots). One client may hold 32 live offers; past that, or with the
   table full, it is sent `selection(NULL)` and one warning per client is logged.
-- **Not done (recorded).** The selection does not outlive its owner: keeping it needs
-  asynchronous reads into the compositor, whose right home is a clipboard manager on
-  `ext-data-control-v1` in the shell.
+- **Data control.** `ext-data-control-v1` and `zwlr-data-control-unstable-v1` v2 (one
+  implementation, `wire_data_control.cpp`) are a third kind of device and source on the same
+  model: every source carries its own `send`/`cancelled` marshalling, so a data-control
+  source may own the clipboard or the primary selection and a `wl_data_source` may be read by
+  a data-control offer; data-control devices are sent both selections when created and every
+  change of either after, whatever has the keyboard, and their offers go inert only when the
+  selection moves on (not on focus changes). `set_selection` there needs no serial — a
+  clipboard tool acts for the user, not on an input event — and does not move the serial an
+  application's next copy is compared with (wlroots takes a fresh display serial, which then
+  refuses that copy). Errors: `used_source`, `invalid_offer`. Hidden from sandboxed clients
+  (sway and niri restrict it the same way); wl-clipboard 2.3 and cliphist use it.
+- **Persistence.** The selection does not outlive its owner in the compositor: the owner
+  exiting clears it and tells everyone. A clipboard manager on data control
+  (`wl-clip-persist`, cliphist with `wl-paste --watch`) keeps it by reading each selection
+  and setting it again — the design every wlroots compositor relies on.
 
 ### Drag-and-drop
 
@@ -1134,16 +1233,23 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
 
 1. **Compositor-internal** — `XF86Switch_VT_1…12` (Ctrl+Alt+F*n* under the default keymap;
    keysyms, so `srvrkeys:none` disables it) → `Seat.SwitchTo`, and Ctrl+Alt+Backspace →
-   logout. Always on, also during grabs and with no shell: the keyboard ways out.
+   logout. Always on, also during grabs, with no shell and while a client inhibits
+   shortcuts: the keyboard ways out. Then **Super+Escape**, exactly, when it acts: the focused
+   surface has a keyboard-shortcuts inhibitor, which it turns off (`inactive`) or back on
+   (`active`), and an active pointer lock or confinement is released — niri's and GNOME's
+   key; with neither the key is the client's.
 2. The window manager's own (Escape during a move, resize or drag).
 3. **Shell key grabs** (zlm_shell_v1 v4 `grab_key` → `zlm_key_grab_v1.activated(serial,
    time)`): exact modifiers, Caps/Num Lock ignored, the keysym at level 1 of the active
    layout or, when that layout has no key for it, of layout 0. Not during a grab or drag,
-   not while paused, not while the session is locked (taps neither). The serial is noted as a key press delivered to the shell, so an
+   not while paused, not while the session is locked (taps neither), and — while the
+   focused surface inhibits shortcuts (keyboard-shortcuts-inhibit-unstable-v1: a VM viewer, a
+   remote desktop) — only grabs created `not_inhibitable` (zlm v6; the shell's lock key).
+   The serial is noted as a key press delivered to the shell, so an
    activation token it requests from it grants focus.
 4. **Tap grabs** (a bare modifier pressed and released alone) are observed, not taken: the
    key still reaches the client, and the grab fires on release if no other key, button or
-   scroll came between.
+   scroll came between. Inhibited like the grabs above.
 5. **The input method's keyboard grab**, while the input method is active (a focused text
    input is enabled): the key goes there and nowhere else; its release follows its press
    (see "Text input and input methods").
@@ -1187,6 +1293,250 @@ single use and outlive their issuer (a launcher may exit before what it launched
 requesting surface's destruction only clears the token's reference to it. A window that
 presents no token at all keeps the placeholder policy (a new window takes the keyboard); real
 focus-stealing prevention for those belongs in shell policy.
+
+### Dialogs, icons, the bell and xdg-foreign
+
+The window protocols of design-app-compat-capture Part B; the wire units only track objects,
+the window manager and the shell decide.
+
+- **Transients and modal dialogs.** `xdg_toplevel.set_parent` (and xdg-foreign's
+  `set_parent_of` across clients) records the parent. A child maps on its parent's output,
+  centred on the parent's frame and clamped into that output's usable area (Mutter, KWin).
+  `xdg_dialog_v1.set_modal` / `unset_modal` take effect at once (Mutter applies them in the
+  request; the protocol defines no double-buffering); a dialog is *effectively* modal while
+  its parent is mapped. Then: the parent never takes the keyboard — `set_keyboard_focus`
+  redirects focus, activation and the shell's `request_activate` to its topmost modal
+  descendant (a chain of modal dialogs, depth ≤ 8); a press on the parent is consumed (its
+  release with it) and focuses and raises the dialog, while motion and scroll still reach the
+  parent, which stays visible; raising the parent brings its modal dialogs along above it,
+  lowering or restacking a dialog moves its whole family, so a modal dialog is never below its
+  parent. When the parent unmaps its children are reparented to its parent (xdg-shell: "as
+  though the parent of the now-unmapped parent has become the parent"; wlroots does the same
+  for good). The shell sees state `modal` and the parent (zlm v6), and lists the parent alone.
+- **Icons.** `xdg_toplevel_icon_manager_v1` advertises 16 and 32 px. `set_icon` snapshots the
+  icon at once — its name and up to four of its buffers, copied into sealed memfds
+  (`:toplevel_icon`) — because the client may destroy the icon object and its buffers right
+  after; the toplevel's next commit makes it current and sends it to the shell (name, then one
+  memfd per buffer, then done; again in every snapshot). The compositor never decodes or
+  draws icons: the shell resolves the name in the XDG icon theme (PNG through libpng, SVG
+  through librsvg) and falls back to the pixels, the app id as an icon name, the desktop
+  entry's `Icon=`, a letter tile. Errors: `invalid_buffer` (not wl_shm, not square),
+  `immutable`, `no_buffer` for a buffer destroyed before the icon was set (afterwards its
+  pixels are copied; wlroots never posts it).
+- **The bell.** `xdg_system_bell_v1.ring` resolves the window (a popup's toplevel, nothing for
+  other roles) and reaches the shell as `bell(toplevel|null)`; a token bucket allows 4 rings a
+  second per client, and nothing is forwarded while the session is locked. The shell flashes
+  the window: a 1×1 translucent shm buffer scaled by `wp_viewport` over the window's rect in
+  an overlay layer surface for 120 ms (no input region, exclusive zone −1), or the panel
+  strip for a bell of no window.
+- **xdg-foreign.** v2 and v1 share one registry; handles are 128 random bits. An import of an
+  unknown handle is `destroyed` at once; an export going (or its window) sends `destroyed` to
+  every import and undoes the parent relations it made; an import going undoes its own. A
+  set_parent_of that would make a loop is ignored. Visible to sandboxed clients: a Flatpak
+  app exports its window so that its portal dialogs sit on it.
+- **Keyboard shortcuts inhibition.** Granted without asking (sway, niri, KWin; GNOME asks):
+  an inhibitor is in effect while its surface has the keyboard, the user has not turned it off
+  and the session is not locked; `active` is sent every time it comes into effect, `inactive`
+  only when the user turns it off (the spec sends nothing on focus loss). See "Key bindings".
+
+### Pointer constraints, relative pointer and gestures
+
+The pointer protocols of design-app-compat-capture Part C, on the UI thread in the motion
+path. `:pointer_constraints` is the pure policy; `wire_pointer_constraints.cpp`,
+`wire_relative_pointer.cpp` and `wire_gestures.cpp` own the objects.
+
+- **When a constraint holds.** Its surface has pointer focus (the router's `enter` was sent),
+  its window (the surface's root) has the keyboard, the pointer is inside region ∩ input
+  region ∩ the surface's box — needed to activate, not to stay — and nothing else owns the
+  pointer: no session lock (from the request on), no VT pause, no move, resize, drag or popup
+  grab (Mutter's `should_constraint_be_enabled`; niri checks focus and region only). Only the
+  pointer focus's constraint can hold, so at most one is active. Decided again on every
+  pointer- and keyboard-focus change (router hooks), after every motion and button, at the
+  end of each loop iteration (`after_dispatch`) and at the end of a `wl_surface.commit`
+  request whose update applied a new region or cursor hint (double-buffered with the
+  surface's content update). A constraint whose surface goes is told (`unlocked` /
+  `unconfined`) and goes inert; a oneshot one is spent — inert — at its first deactivation,
+  so a new one may be made for the surface. `already_constrained` is the only error.
+- **Locked.** `on_input_pointer_motion` computes where the pointer was before the event (a
+  relative device's delta is already in the seat position; an absolute device's position is
+  set there) and asks `pointer_constraint_motion`: a lock restores the position — no cursor
+  move, no hit test, no window-manager motion — and the router's *motion lock* keeps any
+  `wl_pointer.motion` from going out (a re-hit after a window moved, a muted client catching
+  up), while the position is still recorded for `enter`. Unlocking warps the pointer to the
+  cursor hint when one is set, lies inside the surface and the surface still has the pointer
+  (sway, Mutter): `wl_pointer.motion`, no relative motion.
+- **Confined.** The new position is `confine_motion(region, from, to)` in surface-local
+  coordinates (half-open rects; the farthest towards a right or bottom edge is one wl_fixed
+  step short of it, so the client never hears a position outside), then kept on the outputs.
+  A new region that leaves the pointer outside warps it to the nearest point inside.
+- **Super+Escape** releases the active constraint (see "Key bindings"); a persistent one
+  re-arms only after the pointer has left the surface or its window has lost the keyboard.
+- **Relative motion** (`zwp_relative_pointer_v1`) goes to every relative pointer of the
+  pointer focus's client before the motion, in the same `wl_pointer.frame` (sway's order);
+  while locked the router sends that frame on its own. Deltas are libinput's accelerated and
+  unaccelerated ones (`pointer_motion_event::dx_unaccel`); an absolute device (a tablet, the
+  VMware console mouse) has no motion of its own, so lx.input carries its previous position
+  and the compositor sends the position change in layout units as both. Warps make none.
+- **Gestures** (`zwp_pointer_gestures_v1` v3): libinput's swipe, pinch and hold, latched at
+  begin to the client with pointer focus — its updates and end follow even if the pointer
+  focus moves — with seat serials on begin and end. A compositor gesture policy is asked at
+  begin and consumes none today (workspace swipes plug in there). The compositor logs each
+  input device's capabilities at debug (`input device "…": pointer gesture`).
+- **Cost.** Per motion without constraints: one null test for the active constraint and a
+  short list walk for relative pointers; with a confinement, O(rects) arithmetic. No
+  allocation; objects are allocated per request with destructor hooks.
+
+### Screen capture
+
+ext-image-capture-source-v1 and ext-image-copy-capture-v1 (with ext-foreign-toplevel-list-v1
+naming windows, and wlr-screencopy v3 as a front end of the same core) — design-app-compat-
+capture Part D. `:capture` is the pure policy, `:capture_engine` the render side,
+`lx.gfx:gl_capture` the GL objects; the wire units own the protocol objects.
+
+- **Where an output's frames come from (CC1).** The frame the output just composited: the
+  render thread copies it right after `composite_output` drew it — on GL one
+  `glBlitFramebuffer` per damage rect into the client's dma-buf (imported once as a
+  framebuffer and kept while the wl_buffer lives), or for shm a blit of those rects into a
+  per-session LINEAR GBM buffer behind a native fence, which a worker thread waits on, maps
+  and copies into the client's shm before it posts the completion (the map is where a driver
+  without asynchronous read-backs spends its time — 12 ms a frame on SVGA3D, once the render
+  thread's — so render never waits; without a worker or a GBM buffer, a `glReadPixels` into
+  a pixel-pack buffer copied out by a second render job once the UI's readiness poller saw
+  its fence). A completion copied in a lock epoch the lock has since moved past is decided
+  again (a worker read can land after the lock request). The CPU path composites the frame's draws straight into the
+  client's shm; Vulkan copies the changed rects of its target into the session's
+  persistent mapped buffer (`vulkan_compositor::read_back_async`, one slot per session, made
+  once per size) without waiting, and a worker waits on its fence and writes the rows into
+  the client's shm (BGRA is wl_shm's byte order: a copy, the padding byte set opaque). A frame needed with nothing new composited — a session's first,
+  a pointer move under `paint_cursors`, the end of a hold — is copied from the newest
+  composited scanout slot, which stays intact until the output composites again. The
+  hardware pointer plane is not in the scanout: `paint_cursors` sessions get the pointer
+  drawn onto the copy (a GL quad on dma-buf, a CPU blend after the shm copy-out); with the
+  software pointer the frame is composited again without it for sessions that must not show
+  it (wlroots instead forces software cursors and shows the pointer to every session).
+- **Windows (CC2).** A window session publishes a *capture view* of the scene (views 16–23):
+  the window's tree container — its surfaces and its server-side frame, not its popups —
+  projected at the window's preferred scale into a buffer of its frame rect's size. It is
+  built only when a frame is pending and the view has damage, and composited on the render
+  thread into the client's dma-buf or, for shm, an offscreen GBM buffer read on a worker. A covered
+  window is captured whole, and while a frame is pending its surfaces' frame callbacks are
+  answered at the outputs' pace instead of the 1 s throttle of covered windows (Mutter and
+  KWin keep cast windows painting).
+- **Damage (CC3).** Per output, a ring of the last eight composites' damage
+  (`capture_damage_ring`, reset when the output's targets are made again): a session copies
+  everything since the composite it last copied, plus the client's `damage_buffer`, and
+  reports what changed. A window view has its own damage (the scene's, projected into it —
+  conservative: windows above it damage it too). The first frame of a session, a constraints
+  change, and the frame after an unlock are full.
+- **Pacing (CC10).** A requested frame waits for its source to change (the protocol allows
+  it after the first), so a capture starts no clock by itself: an idle desktop with an idle
+  screencast costs no wakeups. One frame per session; jobs and completions travel in fixed
+  queues; a job that does not fit waits for the next tick.
+- **Lock, pause, power, hotplug (CC7–CC9).** From the lock request on, content jobs already
+  with render are cancelled (a lock epoch) and every session's next frame is a black curtain;
+  then frames are held until unlock. The lock holder's own output sessions see frames built
+  with the scene locked (the lock surfaces); a window is never captured while locked. A VT
+  away or a powered-off output holds its sessions' frames (nothing new can be shown); the
+  resume's full repaint makes the next frame full. An output that goes stops its sessions
+  (`stopped`, a pending frame `failed(stopped)`); a new mode sends new constraints, and a
+  frame whose buffer no longer fits fails with `buffer_constraints`. A window that unmaps
+  stops its sessions.
+- **Cursor sessions** (`create_pointer_cursor_session`): `enter`/`leave` as the pointer image
+  meets the source's area, `position` (the hotspot in the source buffer's pixels), `hotspot`
+  before the `ready` it applies to, frames of the pointer image (shm ARGB8888, a new frame
+  when the image changes). Not while locked.
+- **wlr-screencopy v3.** Each `zwlr_screencopy_frame_v1` is a one-shot session of its output
+  (a region is a crop at the buffer's origin: the same blit and read-back with an offset);
+  `copy` takes the newest frame at once, `copy_with_damage` waits until the output changed
+  inside the region since that client's last copy and reports the damage.
+- **Presentation time (CC6)**: the frame clock's prediction of the flip that shows the copied
+  frame; a window view's, the time it was composited.
+- **Privacy indicator (CI1)**: `zlm_shell_v1.capture_state` is 1 while a session not owned by
+  the shell that has delivered a frame stays open (a wlr-screencopy frame, a one-shot session:
+  for 2 s after it); lumen-shell draws a red dot in its panel. Not "a frame in the last 2 s"
+  for every session: the dot's own repaint is damage, so an idle cast would blink it and copy
+  a frame every ~2 s.
+- **Sandboxes**: every capture global is `deny_sandboxed` (see §9).
+- **Cost.** Without sessions: nothing (one test per tick and per composite). Per copied
+  frame: one blit (dma-buf: ~0.5 ms of render time at 1914x924 on SVGA3D, against 0.34 ms
+  without capture) or one blit plus a worker's map and copy of the damaged rows (shm: the
+  same render time), one native fence, one poller or worker wake; the CPU path composites
+  only the damaged rects. Session and
+  frame objects are allocated per request, with destructor hooks on frames, sessions and the
+  attached buffers.
+
+### Portals
+
+How applications share the screen and take screenshots (design-app-compat-capture Part E,
+ADR 009 Part 5). xdg-desktop-portal is the frontend every toolkit, browser and OBS talks
+to; it routes each `org.freedesktop.impl.portal.*` interface to a backend by
+`deploy/portal/lumen-portals.conf` (read for `XDG_CURRENT_DESKTOP=Lumen`):
+
+| Interface | Backend | Why this one |
+|-----------|---------|--------------|
+| ScreenCast | xdg-desktop-portal-wlr (0.8.4) | A mature PipeWire producer, maintained by the capture protocols' authors, that speaks ext-image-copy-capture: outputs and windows, dma-buf or shm, damage, an embedded or hidden pointer. Writing a second producer would duplicate it, and an in-compositor PipeWire producer (Mutter, KWin; niri through Mutter's D-Bus API for xdg-desktop-portal-gnome) would put PipeWire in the compositor for no gain: with ext-image-copy-capture the cast costs exactly the compositor's one copy. |
+| Screenshot, PickColor | xdg-desktop-portal-lumen | xdpw's Screenshot runs `grim` into the fixed path `/tmp/out.png`, offers no area or window choice and no PickColor. |
+| the cast's source chooser | xdg-desktop-portal-lumen `--choose` | xdpw runs it as its `dmenu` chooser (`deploy/xdg/xdg-desktop-portal-wlr/Lumen`): outputs, then windows, in Lumen's own list. |
+| Inhibit | none | gtk's needs GNOME's session manager; applications fall back to idle-inhibit. |
+| everything else | xdg-desktop-portal-gtk | File chooser, access dialogs, settings. |
+
+**xdg-desktop-portal-lumen** (`lx.portal`, `executables/xdg-desktop-portal-lumen`) serves
+`org.freedesktop.impl.portal.Screenshot` version 3 on the session bus
+(`org.freedesktop.impl.portal.desktop.lumen`, sd-bus), single-threaded: one `poll` over the
+bus, a signalfd and — only while a request runs — a Wayland connection opened for that
+request (an idle backend holds no connection and never wakes; a request sees the outputs as
+they are, so hotplug needs no tracking). A request:
+
+- captures every output over ext-image-copy-capture into shm (`:desktop`), turns each frame
+  upright with the compositor's own transform map (`:compose`, checked against
+  `lx.gfx` `transform_rect` in the unit test) and composes the layout at the largest scale
+  the region touches (grim's rule; whole-pixel aligned outputs are copied, others sampled
+  bilinearly);
+- non-interactive (`Screen` or no target): every output, saved privately as
+  `$XDG_RUNTIME_DIR/lumen-portal/Screenshot-<time>.png` (0700 directory, 0600 file, O_EXCL;
+  files older than an hour go with the next request) — the frontend hands it to a
+  sandboxed caller through the document portal;
+- interactive or `Area`: overlay layer surfaces (one per output, exclusive keyboard,
+  crosshair pointer, drawn with lumen-shell's `shm_canvas` at the output's fractional scale)
+  show the frozen frame dimmed: drag an area (it shows undimmed), click an output, Enter for
+  everything, Escape or a right click to cancel (response 1). Saved as
+  `$XDG_PICTURES_DIR/Screenshots/Screenshot from <date>.png` (GNOME's naming, never
+  overwriting);
+- `Window`: a list of the windows (ext-foreign-toplevel-list); the chosen one is captured on
+  its own, covered or not, at its own scale. `Active Window` is not offered: nothing outside
+  the shell knows which window is active;
+- `PickColor`: the frozen frame with a swatch following the pointer; a click answers the
+  pixel's colour at the output's own resolution;
+- while the seat session is locked (logind's `LockedHint`, which the compositor sets with
+  ext-session-lock) nothing is captured and the request answers 2 — the compositor would
+  only deliver the black lock curtain anyway (§ Screen capture).
+
+PNG files are written with zlib level 1 and the Sub filter: 30 ms for a 1914x924 desktop
+against grim's default 114 ms, for 16 % more bytes. Permission stays the frontend's (a
+non-interactive screenshot from an app without the permission gets the gtk access dialog;
+interactive ones and PickColor need none).
+
+**ScreenCast path.** frontend `CreateSession`/`SelectSources`/`Start` → xdpw runs
+`xdg-desktop-portal-lumen --choose` (outputs, then windows; Escape declines) → xdpw creates
+an ext-image-copy-capture session of the chosen output or window and a PipeWire
+`Video/Source` node → the application's stream is linked to it by WirePlumber → each frame
+is one compositor copy into xdpw's buffer (dma-buf or shm), handed to PipeWire with its
+damage. Measured here: 54 frames/s of a moving client at 1914x924 in shm buffers (xdpw
+keeps only the dma-buf modifiers its GBM confirms; vmwgfx's GBM has none, so casts here go
+through shm even for a consumer offering dma-buf).
+
+**Session environment (E1).** The frontend and D-Bus-activated backends start with the
+systemd user manager's environment, so a session exports `WAYLAND_DISPLAY`,
+`XDG_CURRENT_DESKTOP=Lumen` and `XDG_SESSION_TYPE=wayland` to it and restarts
+`xdg-desktop-portal.service` (sway's documented setup). `scripts/portal-session.sh` does this
+reversibly for `run-desktop.sh` and `app-smoke.sh` group Z: for a build-tree run it points
+the frontend at a runtime directory holding the system's `.portal` files plus the build's
+`lumen.portal` and `lumen-portals.conf` (`XDG_DESKTOP_PORTAL_DIR`), starts xdpw and the
+build's backend as children (`-r`), starts WirePlumber if no PipeWire session manager runs
+(without one a cast is never linked), and at the end stops what it started, puts the
+manager's environment back as it was and restarts the frontend. Nothing under `~/.config` is
+written. Installed, the same files come from `share/xdg-desktop-portal/` and the backend is
+D-Bus-activated through `xdg-desktop-portal-lumen.service` (§10).
 
 ---
 
@@ -1387,7 +1737,7 @@ into `lx.wayland.protocols.*` modules.
 | Priority | Protocols | Consumer |
 |----------|-----------|----------|
 | **P0** | `wayland`, `xdg-shell`, `linux-dmabuf`, `linux-drm-syncobj`, `xdg-output`, output-management | Compositor boot |
-| **P1** | `presentation-time`, `xdg-decoration`, `viewporter`, `fractional-scale-v1`, `ext-idle-notify-v1`, `idle-inhibit-unstable-v1`, `wlr-output-power-management-unstable-v1`, `wlr-output-management-unstable-v1` (v4: wlr-randr, kanshi), `ext-session-lock-v1` and `text-input-unstable-v3` (generated with P0), `input-method-unstable-v2` and `virtual-keyboard-unstable-v1` (wlroots' `protocol/`), … | Frame timing, decorations, scaling, idle, display power, output configuration, screen locking, input methods |
+| **P1** | `presentation-time`, `xdg-decoration`, `viewporter`, `fractional-scale-v1`, `ext-idle-notify-v1`, `idle-inhibit-unstable-v1`, `wlr-output-power-management-unstable-v1`, `wlr-output-management-unstable-v1` (v4: wlr-randr, kanshi), `ext-session-lock-v1` and `text-input-unstable-v3` (generated with P0), `input-method-unstable-v2` and `virtual-keyboard-unstable-v1` (wlroots' `protocol/`), `fifo-v1`, `commit-timing-v1`, `tearing-control-v1`, `content-type-v1`, `single-pixel-buffer-v1`, `alpha-modifier-v1` (and `linux-drm-syncobj-v1` where the card supports it), `xdg-dialog-v1`, `xdg-toplevel-icon-v1`, `xdg-system-bell-v1`, `xdg-foreign` v2 and v1, `keyboard-shortcuts-inhibit-unstable-v1`, `ext-data-control-v1` and `wlr-data-control` v2, `security-context-v1`, `pointer-constraints-unstable-v1`, `relative-pointer-unstable-v1`, `pointer-gestures-unstable-v1` (v3), `ext-foreign-toplevel-list-v1`, `ext-image-capture-source-v1`, `ext-image-copy-capture-v1`, `wlr-screencopy-unstable-v1` (v3), … | Frame timing, decorations, scaling, idle, display power, output configuration, screen locking, input methods, Vulkan FIFO pacing, explicit sync, dialogs, icons, the bell, cross-client parents, shortcuts inhibition, clipboard tools, sandboxes, games and VM viewers (pointer lock, relative motion), touchpad gestures, screen capture (grim, xdg-desktop-portal-wlr, wf-recorder; browsers and OBS through the portal) |
 | **Private** | `zlm_shell_v1` (+ bridge, workspace, layer, rules) | Shell only |
 
 ```mermaid
@@ -1446,20 +1796,19 @@ is deferred indefinitely unless a concrete need appears.
 flowchart LR
     CRED["SO_PEERCRED on connect"]
     PATH["shell binary path check"]
-    PORTAL["lx.portal token (optional)"]
     CHK["lx.session.privilege_checker"]
     ALLOW["allow_privileged_global()"]
     ZLM["zlm_shell_v1 global"]
 
     CRED --> CHK
     PATH --> CHK
-    PORTAL --> CHK
     CHK --> ALLOW --> ZLM
 ```
 
-Default build: Unix session permissions — same UID, known shell binary.  
-Optional Flatpak build: `lx.portal` validates capability tokens before exposing
-privileged globals.
+Default build: Unix session permissions — same UID, known shell binary. Sandboxed
+applications capture the screen only through xdg-desktop-portal (its permission checks and
+dialogs, then xdg-desktop-portal-lumen or -wlr; § Portals); the capture globals are hidden
+from them (below).
 
 The binary check is real: `allow_privileged_global()` reads the peer's `/proc/<pid>/exe`
 (the pid `SO_PEERCRED` recorded; the connection keeps it alive) and
@@ -1480,10 +1829,31 @@ cannot take keys from other clients.
 privileged: any session-UID client may bind it (wlr-randr from a terminal, kanshi as a user
 service), as in sway and niri. Sandboxed clients do not see it: `lx.wayland.server`
 installs a global filter (`wl_display_set_global_filter`) that hides every global marked
-`deny_sandboxed` from a client whose `/proc/<pid>/root/.flatpak-info` exists (checked once
-per client, cached on its `client_connection`); a bind by name is refused by libwayland as
-an invalid global. Marked: output management, output power, idle notification, session
-lock, layer shell, input method and virtual keyboard.
+`deny_sandboxed` from a sandboxed client; a bind by name is refused by libwayland as an
+invalid global. Marked: output management, output power, idle notification, session lock,
+layer shell, input method, virtual keyboard, ext and wlr data control, the
+security-context manager itself (no nesting), and screen capture — the toplevel list, both
+image-capture-source managers, image-copy-capture and wlr-screencopy (a sandboxed app shares
+its screen through the portal, which asks the user). The filter hides privileged globals
+(`zlm_shell_v1`) from sandboxed clients as well: one can never pass the shell check, so it is
+not shown a global it could only be refused. Visible to sandboxed clients: everything an
+application window uses — dialogs, icons, the bell, xdg-foreign (a sandboxed app exports its
+window for its portal dialogs), shortcuts inhibition, the commit-path protocols, and pointer
+constraints, relative pointers and gestures (a sandboxed game locks the pointer like any
+other).
+
+**Which clients are sandboxed (security-context-v1, design-app-compat-capture SC1).** A
+sandbox engine (Flatpak 1.16 and later) binds `wp_security_context_manager_v1`, hands over a
+listening socket and a close fd and commits its metadata (engine, app id, instance id);
+`lx.wayland.server` accepts on that socket with sources on libwayland's own event loop, each
+connection becomes a client created with `wl_client_create` and registered with its context
+before it can send a request, and `client_connection::sandboxed()` is true for it — exactly,
+where the older check (`/proc/<pid>/root/.flatpak-info`, still applied to other clients for
+Flatpak before 1.16) has to guess. A client the table cannot record is refused rather than
+let in unsandboxed. Listening continues after the creating client disconnects and stops
+when the close fd hangs up; at most 32 listeners, 8 per creating client. Every error of the
+protocol is posted (`invalid_listen_fd` unless the fd is a listening AF_UNIX stream socket,
+`nested`, `already_used`, `already_set`, `invalid_metadata`).
 
 **Exposure of the everyday globals (ADR 007, X1).** `ext_idle_notifier_v1`,
 `zwp_idle_inhibit_manager_v1`, `zwlr_output_power_manager_v1` and
@@ -1493,10 +1863,9 @@ meant to be replaceable by ordinary clients (swayidle, swaylock).
 `zwp_input_method_manager_v2` and `zwp_virtual_keyboard_manager_v1` are public the same way
 (fcitx5 and ibus are ordinary clients); the input method's grab narrows what it sees to keys
 typed while a text input it serves is active (T2), and a virtual keyboard never reaches
-compositor bindings or counts as activity. When sandboxing arrives
-(`wp_security_context_v1`), sandboxed clients lose idle notification, output power, session
-lock, input method and virtual keyboard (`zwp_text_input_manager_v3` stays public); the list
-is recorded so that change is mechanical — Flatpak clients already lose them (above). The lock itself does not trust its client: a
+compositor bindings or counts as activity. Sandboxed clients — through a security context, or
+Flatpak's `.flatpak-info` — lose idle notification, output power, session lock, input method
+and virtual keyboard (`zwp_text_input_manager_v3` stays public); see above. The lock itself does not trust its client: a
 locker that dies leaves the session locked, and only another locker or logind's
 polkit-gated `Unlock` can end it.
 
@@ -1535,6 +1904,12 @@ Unit files: `deploy/systemd/`
 | `lumen-compositor.service` | Starts compositor, holds DRM lease |
 | `lumen-shell.service` | Starts after compositor; `Requires=lumen-compositor`; `Slice=session.slice` |
 | `app-lumen-<id>@<random>.service` | One per launched application (transient, `app.slice`); `journalctl --user -u 'app-lumen-*'` |
+| `xdg-desktop-portal-lumen.service` | Screenshot/PickColor portal backend, D-Bus-activated (`Type=dbus`, `PartOf=graphical-session.target`, `ConditionEnvironment=WAYLAND_DISPLAY`) |
+
+Portal files (installed from `deploy/portal/` and `deploy/xdg/`): `lumen.portal` and
+`lumen-portals.conf` in `share/xdg-desktop-portal/`, the D-Bus service file, and
+xdg-desktop-portal-wlr's `Lumen` config in `/etc/xdg/xdg-desktop-portal-wlr/`. The session
+must export its environment to the user manager before the frontend starts (§ Portals).
 
 ---
 

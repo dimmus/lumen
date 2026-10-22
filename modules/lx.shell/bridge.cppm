@@ -1,7 +1,13 @@
 module;
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
+
+#if !defined(_WIN32)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
@@ -101,6 +107,32 @@ public:
     [[nodiscard]] bool has_lock_state() const;
     [[nodiscard]] unsigned lock_state() const { return lock_state_; }
 
+    // ── zlm v6: icons, parents, bell, capture state, non-inhibitable grabs ──
+    /// zlm_key_grab_v1.flag.not_inhibitable: the grab fires also while a client inhibits
+    /// shortcuts (the lock key). Only sent to a compositor of version 6 or later.
+    static constexpr unsigned k_grab_not_inhibitable = 0x2;
+    /// Bound at version 6 or later.
+    [[nodiscard]] bool has_v6() const;
+    /// One pixel buffer of a window's icon (premultiplied ARGB8888, `size`², read-only, valid
+    /// until the task's icon changes or the task goes).
+    struct icon_image {
+        const std::uint32_t* pixels = nullptr;
+        int size = 0;
+        int scale = 1;
+    };
+    static constexpr unsigned k_icon_images = 4;
+    /// The pixel buffers of `h`'s icon (the name is in the task entry); how many were written.
+    unsigned icon_images(task_handle h, icon_image* out, unsigned cap) const;
+    /// zlm_policy_bridge_v1.bell: `h` is the window (a null handle: no window in
+    /// particular).
+    using bell_fn = void (*)(task_handle h, void* user);
+    void set_bell_handler(bell_fn fn, void* user) {
+        bell_fn_ = fn;
+        bell_user_ = user;
+    }
+    /// zlm_shell_v1.capture_state: some client is capturing the screen.
+    [[nodiscard]] bool capture_active() const { return capture_active_; }
+
     /// Wire events, one per protocol event (defined with the listeners).
     struct events;
 
@@ -118,6 +150,22 @@ private:
         unsigned activations = 0;
     };
     void destroy_key_grabs();
+
+    /// The mapped icon memfds of each task slot, and the group being received (between
+    /// toplevel_icon and toplevel_icon_done).
+    struct icon_maps {
+        icon_image images[k_icon_images]{};
+        std::size_t lengths[k_icon_images]{};
+        unsigned count = 0;
+    };
+    static void unmap_icons(icon_maps& m);
+    icon_maps icons_[k_max_tasks]{};
+    icon_maps icon_pending_{};
+    task_handle icon_pending_task_{};
+    char icon_pending_name_[k_task_icon_name_bytes]{};
+    bell_fn bell_fn_ = nullptr;
+    void* bell_user_ = nullptr;
+    bool capture_active_ = false;
 
     task_model model_{};
     key_grab grabs_[k_max_key_grabs]{};
@@ -214,6 +262,13 @@ struct lx::shell::policy_bridge::events {
         if (b.lock_state_fn_)
             b.lock_state_fn_(state, b.lock_user_);
     }
+    static void capture_state(void* data, zlm_shell_v1*, uint32_t active) {
+        auto& b = self(data);
+        if (b.capture_active_ == (active != 0))
+            return;
+        b.capture_active_ = active != 0;
+        bridge_log(lx::trace::level::info, active ? "screen capture active" : "screen capture ended");
+    }
     static void lock_requested(void* data, zlm_shell_v1*, uint32_t reason) {
         auto& b = self(data);
         bridge_log(lx::trace::level::info, reason == ZLM_SHELL_V1_LOCK_REASON_SLEEP
@@ -248,7 +303,12 @@ struct lx::shell::policy_bridge::events {
 
     // ── zlm_policy_bridge_v1: snapshot ──
     static void snapshot_begin(void* data, zlm_policy_bridge_v1*) {
-        self(data).model_.begin_snapshot(destroy_handle, nullptr);
+        auto& b = self(data);
+        b.model_.begin_snapshot(destroy_handle, nullptr);
+        for (auto& m : b.icons_)
+            unmap_icons(m);
+        unmap_icons(b.icon_pending_);
+        b.icon_pending_task_ = {};
     }
     static void snapshot_workspace(void*, zlm_policy_bridge_v1*, zlm_workspace_v1*, uint32_t,
                                    const char*, uint32_t) {}
@@ -304,6 +364,8 @@ struct lx::shell::policy_bridge::events {
     static void toplevel_destroyed(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
         auto& b = self(data);
         const task_handle th = find(b, t);
+        if (b.model_.get(th))
+            unmap_icons(b.icons_[th.index]);
         const bool removed = b.model_.remove(th);
         if (bridge_debug()) {
             char line[64];
@@ -368,6 +430,74 @@ struct lx::shell::policy_bridge::events {
             bridge_log(lx::trace::level::debug, line);
         }
     }
+    // ── zlm_policy_bridge_v1 v6 ──
+    static void toplevel_icon(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
+                              const char* name) {
+        auto& b = self(data);
+        unmap_icons(b.icon_pending_);
+        b.icon_pending_task_ = find(b, t);
+        (void)copy_utf8(b.icon_pending_name_, sizeof(b.icon_pending_name_), name);
+    }
+    static void toplevel_icon_buffer(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
+                                     int32_t fd, int32_t size, int32_t scale) {
+        auto& b = self(data);
+        icon_maps& m = b.icon_pending_;
+        // Mapped read-only for as long as the icon is shown: the compositor sealed it, so it
+        // can neither change nor shrink under the mapping.
+        const std::size_t len =
+            size > 0 && size <= 1024 ? static_cast<std::size_t>(size) * static_cast<std::size_t>(size) * 4u : 0;
+        if (len && m.count < k_icon_images && find(b, t) == b.icon_pending_task_) {
+            void* p = ::mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+            if (p != MAP_FAILED) {
+                m.images[m.count] = {static_cast<const std::uint32_t*>(p), size, scale > 0 ? scale : 1};
+                m.lengths[m.count] = len;
+                ++m.count;
+            }
+        }
+        ::close(fd);
+    }
+    static void toplevel_icon_done(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
+        auto& b = self(data);
+        const task_handle th = find(b, t);
+        if (!b.model_.get(th) || !(th == b.icon_pending_task_)) {
+            unmap_icons(b.icon_pending_);
+            b.icon_pending_task_ = {};
+            return;
+        }
+        unmap_icons(b.icons_[th.index]);
+        b.icons_[th.index] = b.icon_pending_;
+        b.icon_pending_ = {};
+        b.icon_pending_task_ = {};
+        (void)b.model_.set_icon(th, b.icon_pending_name_);
+        char line[224];
+        std::snprintf(line, sizeof(line), "icon handle=%u name=%s buffers=%u", th.index,
+                      b.icon_pending_name_[0] ? b.icon_pending_name_ : "-",
+                      b.icons_[th.index].count);
+        bridge_log(lx::trace::level::info, line);
+    }
+    static void toplevel_parent(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
+                                zlm_toplevel_v1* parent) {
+        auto& b = self(data);
+        const task_handle th = find(b, t);
+        const task_handle ph = find(b, parent);
+        if (b.model_.set_parent(th, ph) && bridge_debug()) {
+            char line[64];
+            std::snprintf(line, sizeof(line), "parent handle=%u parent=%d", th.index,
+                          ph ? static_cast<int>(ph.index) : -1);
+            bridge_log(lx::trace::level::debug, line);
+        }
+    }
+    static void bell(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
+        auto& b = self(data);
+        const task_handle th = find(b, t);
+        {
+            char line[64];
+            std::snprintf(line, sizeof(line), "bell handle=%d", th ? static_cast<int>(th.index) : -1);
+            bridge_log(lx::trace::level::info, line);
+        }
+        if (b.bell_fn_)
+            b.bell_fn_(th, b.bell_user_);
+    }
 };
 
 namespace {
@@ -382,6 +512,7 @@ const zlm_shell_v1_listener k_shell_listener = {
     .session_ending = lx::shell::policy_bridge::events::session_ending,
     .lock_state = lx::shell::policy_bridge::events::lock_state,
     .lock_requested = lx::shell::policy_bridge::events::lock_requested,
+    .capture_state = lx::shell::policy_bridge::events::capture_state,
 };
 
 const zlm_policy_bridge_v1_listener k_bridge_listener = {
@@ -397,6 +528,11 @@ const zlm_policy_bridge_v1_listener k_bridge_listener = {
     .focus_changed = lx::shell::policy_bridge::events::focus_changed,
     .stacking_order_changed = lx::shell::policy_bridge::events::stacking_order_changed,
     .toplevel_flags = lx::shell::policy_bridge::events::toplevel_flags,
+    .toplevel_icon = lx::shell::policy_bridge::events::toplevel_icon,
+    .toplevel_icon_buffer = lx::shell::policy_bridge::events::toplevel_icon_buffer,
+    .toplevel_icon_done = lx::shell::policy_bridge::events::toplevel_icon_done,
+    .toplevel_parent = lx::shell::policy_bridge::events::toplevel_parent,
+    .bell = lx::shell::policy_bridge::events::bell,
 };
 
 } // namespace
@@ -441,6 +577,9 @@ void lx::shell::policy_bridge::detach() {
         if (const task_entry* e = model_.get(all[i]); e && e->proxy)
             zlm_toplevel_v1_destroy(static_cast<zlm_toplevel_v1*>(e->proxy));
     model_.clear(); // the proxies are already gone
+    for (auto& m : icons_)
+        unmap_icons(m);
+    unmap_icons(icon_pending_);
     zlm_policy_bridge_v1_destroy(static_cast<zlm_policy_bridge_v1*>(bridge_));
     bridge_ = nullptr;
 }
@@ -479,6 +618,11 @@ void lx::shell::policy_bridge::request_logout() {
 bool lx::shell::policy_bridge::has_lock_state() const {
     return shell_ && wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) >=
                          ZLM_SHELL_V1_LOCK_STATE_SINCE_VERSION;
+}
+
+bool lx::shell::policy_bridge::has_v6() const {
+    return shell_ && wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) >=
+                         ZLM_SHELL_V1_CAPTURE_STATE_SINCE_VERSION;
 }
 
 bool lx::shell::policy_bridge::can_grab_keys() const {
@@ -546,6 +690,7 @@ lx::shell::policy_bridge::~policy_bridge() { detach(); }
 #else // !LUMEN_SHELL_WAYLAND
 
 struct lx::shell::policy_bridge::events {};
+bool lx::shell::policy_bridge::has_v6() const { return false; }
 
 lx::result<void> lx::shell::policy_bridge::observe(void*) {
     return lx::not_implemented("lx::shell::policy_bridge::observe");
@@ -577,3 +722,22 @@ void lx::shell::policy_bridge::destroy_key_grabs() {}
 lx::shell::policy_bridge::~policy_bridge() = default;
 
 #endif
+
+void lx::shell::policy_bridge::unmap_icons(icon_maps& m) {
+#if !defined(_WIN32)
+    for (unsigned i = 0; i < m.count; ++i)
+        if (m.images[i].pixels)
+            ::munmap(const_cast<std::uint32_t*>(m.images[i].pixels), m.lengths[i]);
+#endif
+    m = {};
+}
+
+unsigned lx::shell::policy_bridge::icon_images(task_handle h, icon_image* out, unsigned cap) const {
+    if (!model_.get(h) || !out)
+        return 0;
+    const icon_maps& m = icons_[h.index];
+    unsigned n = 0;
+    for (unsigned i = 0; i < m.count && n < cap; ++i)
+        out[n++] = m.images[i];
+    return n;
+}

@@ -6,9 +6,20 @@ flowchart TB
         SOCK --> CRED --> RULES
     end
 
-    subgraph OptionalFlatpak["Optional Flatpak build"]
-        PORTAL["xdg-desktop-portal adapter"]
-        PORTAL --> SNAPTOK["security context token"]
+    subgraph Portals["Capture for sandboxed apps (ADR 009 Part 5)"]
+        PORTAL["xdg-desktop-portal: permission store, access dialog"]
+        BACKENDS["xdg-desktop-portal-lumen (Screenshot, PickColor)<br/>xdg-desktop-portal-wlr (ScreenCast)<br/>unsandboxed clients of the capture globals"]
+        PORTAL --> BACKENDS
+    end
+
+    subgraph Sandboxes["Sandboxed clients (ADR 008 C5, ADR 009 SC1)"]
+        ENGINE["sandbox engine (Flatpak 1.16+)"]
+        LISTEN["wp_security_context_v1: listen fd + close fd + metadata"]
+        ACCEPT["lx.wayland.server accepts; client_connection carries the context"]
+        INFO["older Flatpak: /proc/pid/root/.flatpak-info"]
+        FILTER["global filter hides deny_sandboxed globals:<br/>data control, layer shell, lock, output mgmt/power,<br/>idle notifier, input method, virtual keyboard,<br/>security-context manager, screen capture<br/>(toplevel list, capture sources, image copy, screencopy)"]
+        ENGINE --> LISTEN --> ACCEPT --> FILTER
+        INFO --> FILTER
     end
 
     subgraph CompositorCheck["Compositor enforcement"]
@@ -17,4 +28,5 @@ flowchart TB
     end
 
     Traditional --> CompositorCheck
-    OptionalFlatpak -.-> CompositorCheck
+    Sandboxes --> CompositorCheck
+    Portals -.->|"capture globals, same UID"| CompositorCheck

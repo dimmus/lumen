@@ -217,69 +217,116 @@ path = "unstable/wlr-output-power-management-unstable-v1.xml"
 priority = "P1"
 module = "lx.wayland.protocols.output_power"
 
-# P2 — optional globals
+# Implemented by the app-compatibility and capture work (formerly P2, now enabled)
 [[upstream.protocol]]
 name = "xdg-toplevel-icon"
 path = "staging/xdg-toplevel-icon/xdg-toplevel-icon-v1.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.toplevel_icon"
 
 [[upstream.protocol]]
 name = "ext-image-copy-capture"
 path = "staging/ext-image-copy-capture/ext-image-copy-capture-v1.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.image_capture"
 
 [[upstream.protocol]]
 name = "single-pixel-buffer-v1"
 path = "staging/single-pixel-buffer/single-pixel-buffer-v1.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.single_pixel_buffer"
 
 [[upstream.protocol]]
 name = "alpha-modifier-v1"
 path = "staging/alpha-modifier/alpha-modifier-v1.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.alpha_modifier"
 
 [[upstream.protocol]]
 name = "xdg-foreign-unstable-v2"
 path = "unstable/xdg-foreign/xdg-foreign-unstable-v2.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.xdg_foreign"
 
 [[upstream.protocol]]
 name = "wp-tearing-control-v1"
 path = "staging/tearing-control/tearing-control-v1.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.tearing_control"
 
 [[upstream.protocol]]
 name = "wp-content-type-v1"
 path = "staging/content-type/content-type-v1.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.content_type"
 
 [[upstream.protocol]]
 name = "wp-fifo-v1"
 path = "staging/fifo/fifo-v1.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.fifo"
 
 [[upstream.protocol]]
 name = "wp-commit-timing-v1"
 path = "staging/commit-timing/commit-timing-v1.xml"
 source = "wayland-protocols"
-priority = "P2"
+priority = "P1"
 module = "lx.wayland.protocols.commit_timing"
+
+[[upstream.protocol]]
+name = "xdg-system-bell-v1"
+path = "staging/xdg-system-bell/xdg-system-bell-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.system_bell"
+
+[[upstream.protocol]]
+name = "keyboard-shortcuts-inhibit-unstable-v1"
+path = "unstable/keyboard-shortcuts-inhibit/keyboard-shortcuts-inhibit-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.shortcuts_inhibit"
+
+[[upstream.protocol]]
+name = "ext-data-control-v1"
+path = "staging/ext-data-control/ext-data-control-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.ext_data_control"
+
+[[upstream.protocol]]
+name = "ext-image-capture-source-v1"
+path = "staging/ext-image-capture-source/ext-image-capture-source-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.image_capture_source"
+
+[[upstream.protocol]]
+name = "xdg-foreign-unstable-v1"
+path = "unstable/xdg-foreign/xdg-foreign-unstable-v1.xml"
+source = "wayland-protocols"
+priority = "P1"
+module = "lx.wayland.protocols.xdg_foreign_v1"
+
+[[wlr.protocol]]
+name = "wlr-data-control-unstable-v1"
+path = "unstable/wlr-data-control-unstable-v1.xml"
+priority = "P1"
+module = "lx.wayland.protocols.wlr_data_control"
+
+[[wlr.protocol]]
+name = "wlr-screencopy-unstable-v1"
+path = "unstable/wlr-screencopy-unstable-v1.xml"
+priority = "P1"
+module = "lx.wayland.protocols.screencopy"
 
 # Lumen private — always from this repository
 [[lumen.protocol]]

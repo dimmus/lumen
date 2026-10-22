@@ -49,9 +49,6 @@ public:
     // pointer / latency / color (state tracked for shell + render)
     void set_pointer_locked(lx::surface_id surface, bool locked);
     void set_surface_manager(surface_manager* surfaces);
-    void set_content_type(lx::surface_id surface, content_hint hint);
-    void set_tearing_allowed(lx::surface_id surface, bool allowed);
-    void set_fifo_priority(lx::surface_id surface, bool enabled);
     [[nodiscard]] color_management_state color_state() const;
     void set_surface_image_description(lx::image_description_id desc);
 
@@ -84,17 +81,10 @@ lx::result<void> lx::compositor::protocol_managers::install(wayland::server& ser
     static constexpr global_spec k_public_globals[] = {
         {"ext_workspace_manager_v1", 1, false},
         {"zwlr_output_manager_v1", 4, false},
-        {"ext_foreign_toplevel_list_v1", 1, false},
         {"zwp_pointer_constraints_v1", 1, false},
         {"zwp_relative_pointer_manager_v1", 1, false},
         {"wp_cursor_shape_manager_v1", 1, false},
-        {"wp_single_pixel_buffer_manager_v1", 1, false},
-        {"wp_alpha_modifier_v1", 1, false},
-        {"wp_tearing_control_manager_v1", 1, false},
-        {"wp_content_type_manager_v1", 1, false},
         {"wp_security_context_manager_v1", 1, false},
-        {"wp_fifo_manager_v1", 1, false},
-        {"wp_commit_timing_manager_v1", 1, false},
         {"wp_color_manager_v1", 1, false},
         {"ext_session_management_manager_v1", 1, false},
     };
@@ -142,16 +132,6 @@ void lx::compositor::protocol_managers::set_pointer_locked(lx::surface_id surfac
 void lx::compositor::protocol_managers::set_surface_manager(surface_manager* surfaces) {
     surfaces_ = surfaces;
 }
-
-void lx::compositor::protocol_managers::set_content_type(lx::surface_id surface,
-                                                         content_hint hint) {
-    if (surfaces_)
-        surfaces_->set_content_hint(surface, hint);
-}
-
-void lx::compositor::protocol_managers::set_tearing_allowed(lx::surface_id, bool) {}
-
-void lx::compositor::protocol_managers::set_fifo_priority(lx::surface_id, bool) {}
 
 lx::compositor::color_management_state lx::compositor::protocol_managers::color_state() const {
     return color_;

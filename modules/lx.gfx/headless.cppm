@@ -25,6 +25,8 @@ public:
     [[nodiscard]] lx::result<void> begin_frame();
     [[nodiscard]] lx::result<void> clear(lx::color c);
     [[nodiscard]] lx::result<void> blit_texture(unsigned tex_id, lx::rect2i dst);
+    /// Source-over fill of `dst` with a premultiplied, encoded colour (a solid draw).
+    [[nodiscard]] lx::result<void> fill_solid(lx::rect2i dst, lx::color premultiplied);
     /// Register or replace a CPU texture for software blit (tests / headless clients).
     void register_texture(unsigned tex_id, unsigned width, unsigned height,
                           const unsigned char* rgba);
@@ -155,6 +157,30 @@ lx::result<void> lx::gfx::headless_backend::blit_texture(unsigned tex_id, lx::re
                               "blit of unregistered texture");
     }
     blit_rgba_nearest(it->second, dst);
+    return {};
+}
+
+lx::result<void> lx::gfx::headless_backend::fill_solid(lx::rect2i dst, lx::color c) {
+    if (!in_frame_) {
+        return lx::make_error(lx::error_domain::invalid_argument, 0,
+                              "fill outside begin_frame");
+    }
+    const int x0 = dst.x > 0 ? dst.x : 0;
+    const int y0 = dst.y > 0 ? dst.y : 0;
+    const int x1 = dst.x + dst.width < static_cast<int>(width_) ? dst.x + dst.width
+                                                                : static_cast<int>(width_);
+    const int y1 = dst.y + dst.height < static_cast<int>(height_) ? dst.y + dst.height
+                                                                  : static_cast<int>(height_);
+    const float inv = 1.f - (c.a < 0.f ? 0.f : (c.a > 1.f ? 1.f : c.a));
+    for (int y = y0; y < y1; ++y) {
+        for (int x = x0; x < x1; ++x) {
+            const std::size_t i =
+                (static_cast<std::size_t>(y) * width_ + static_cast<std::size_t>(x)) * 3u;
+            pixels_[i] = static_cast<unsigned char>(c.r * 255.f + pixels_[i] * inv);
+            pixels_[i + 1] = static_cast<unsigned char>(c.g * 255.f + pixels_[i + 1] * inv);
+            pixels_[i + 2] = static_cast<unsigned char>(c.b * 255.f + pixels_[i + 2] * inv);
+        }
+    }
     return {};
 }
 

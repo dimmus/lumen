@@ -21,6 +21,9 @@ inline constexpr unsigned k_max_tasks = 256;
 inline constexpr unsigned k_task_app_id_bytes = 128;
 /// Titles longer than 255 bytes are cut on a UTF-8 code point boundary.
 inline constexpr unsigned k_task_title_bytes = 256;
+inline constexpr unsigned k_task_icon_name_bytes = 128;
+/// zlm_policy_bridge_v1.toplevel_state `modal` (v6: an effectively modal dialog).
+inline constexpr unsigned k_task_state_modal = 5;
 
 struct task_handle {
     unsigned index = ~0u;
@@ -47,6 +50,12 @@ struct task_entry {
     unsigned label_rev = 0;
     /// zlm_policy_bridge_v1.toplevel_flags (v2): `task_flag_*` bits.
     unsigned flags = 0;
+    /// zlm v6 toplevel_icon: the icon-theme name ("" none). `icon_rev` changes with the
+    /// name or the pixel buffers (which the bridge keeps), so a renderer re-resolves.
+    char icon_name[k_task_icon_name_bytes]{};
+    unsigned icon_rev = 0;
+    /// zlm v6 toplevel_parent: the window this one is a dialog or child of.
+    task_handle parent{};
 };
 
 /// zlm_policy_bridge_v1.toplevel_flag values.
@@ -64,7 +73,15 @@ enum task_change : unsigned {
     task_change_focus = 1u << 4,
     task_change_stacking = 1u << 5,
     task_change_flags = 1u << 6,    ///< not responding / demands attention
+    task_change_icon = 1u << 7,     ///< icon name or pixels (v6)
+    task_change_parent = 1u << 8,   ///< the parent (v6)
 };
+
+class task_model;
+
+/// A modal dialog over a window that is in the list: a task bar shows the parent alone (its
+/// entry activates the dialog anyway — the compositor redirects focus to it).
+[[nodiscard]] bool task_is_modal_child(const task_model& model, const task_entry& e);
 
 /// The output a window of `geometry` belongs to, for the task list of each output's panel
 /// (ADR 008 M13, Plasma's "only tasks from the current screen"): the one among `outputs`
@@ -111,6 +128,11 @@ public:
     unsigned set_flags(task_handle h, unsigned flags);
     /// focus_changed. A null or stale handle means no focus.
     void set_focus(task_handle h);
+    /// toplevel_icon … toplevel_icon_done (v6): the name, and a new revision either way
+    /// (the pixels changed with it). False for a stale handle.
+    bool set_icon(task_handle h, const char* name);
+    /// toplevel_parent (v6). A null or stale `parent` means none.
+    bool set_parent(task_handle h, task_handle parent);
 
     // ── Queries ──
     [[nodiscard]] task_handle focused() const { return focused_; }
@@ -300,6 +322,32 @@ unsigned lx::shell::task_model::set_flags(task_handle h, unsigned flags) {
     e->flags = flags;
     changes_ |= task_change_flags;
     return task_change_flags;
+}
+
+bool lx::shell::task_model::set_icon(task_handle h, const char* name) {
+    task_entry* e = get_mut(h);
+    if (!e)
+        return false;
+    (void)copy_utf8(e->icon_name, sizeof(e->icon_name), name);
+    ++e->icon_rev;
+    changes_ |= task_change_icon;
+    return true;
+}
+
+bool lx::shell::task_model::set_parent(task_handle h, task_handle parent) {
+    task_entry* e = get_mut(h);
+    if (!e)
+        return false;
+    const task_handle p = get(parent) ? parent : task_handle{};
+    if (!(e->parent == p)) {
+        e->parent = p;
+        changes_ |= task_change_parent;
+    }
+    return true;
+}
+
+bool lx::shell::task_is_modal_child(const task_model& model, const task_entry& e) {
+    return e.state == k_task_state_modal && model.get(e.parent) != nullptr;
 }
 
 void lx::shell::task_model::set_focus(task_handle h) {

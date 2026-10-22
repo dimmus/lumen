@@ -89,6 +89,12 @@ struct output_pipeline {
     unsigned composited_frame = 0;
     /// sync_file of the composite in `composited_slot`, or -1; owned here.
     int composited_fence = -1;
+    /// Screen capture: the slot holding the newest composited frame (-1: none since the
+    /// targets were made), its frame index and when it was composited. It stays intact until
+    /// the next composite of this pipeline, so a capture can copy it without a new frame.
+    int capture_front = -1;
+    unsigned capture_front_frame = 0;
+    unsigned long long capture_front_ns = 0;
     /// Per scanout slot: damage the slot missed since it was last composited into (buffer
     /// age). Starts full.
     gfx::damage_region slot_age[k_slots]{};
@@ -315,6 +321,10 @@ struct compositor_impl {
     session_state session_{};
     /// UI affinity. VT and logout bindings, the shell's key grabs, tap observation.
     keybindings keys_{};
+    /// UI affinity. xdg-toplevel-icon-v1's icon memfds and xdg-foreign's handles
+    /// (design-app-compat-capture B.2, B.4); the protocol context points at them.
+    toplevel_icon_table icons_{};
+    foreign_registry foreign_{};
     /// The display gate (design §2.3). UI writes (release), render reads (acquire) at tick
     /// start and again right before every commit ioctl: while it is set, render composites
     /// nothing and commits nothing on any output, the frame clocks give way to the 1 Hz
@@ -684,6 +694,11 @@ struct compositor_impl {
     /// the pointer kept on the outputs.
     void outputs_changed_now();
     void reclamp_pointer();
+    /// UI. Moves the pointer to the global point as motion would — kept on the outputs, the
+    /// cursor and pointer focus follow, the focus gets `wl_pointer.motion` — but with no
+    /// relative motion (pointer-constraints: a lock's cursor hint on unlock, a confinement
+    /// brought inside its new region).
+    void warp_pointer(double x, double y);
     /// UI. The VT resume, after its probe (or the 250 ms wait).
     void finish_display_resume(unsigned gen);
 
@@ -941,7 +956,9 @@ struct compositor_impl {
     void release_shm_slot(unsigned texture_id);
 
     /// Render affinity. Texture retirements waiting for the snapshots that still draw them.
-    static constexpr unsigned k_max_deferred_forgets = 64;
+    /// As many as there can be live textures (the backends' tables): a client that drops
+    /// all of its buffers at once (weston-simple-timing holds ~110) retires them together.
+    static constexpr unsigned k_max_deferred_forgets = 256;
     struct deferred_forget {
         unsigned texture_id = 0;
         unsigned retire_after_frame = 0;
@@ -976,6 +993,28 @@ struct compositor_impl {
     std::unique_ptr<runtime::fd_source> wayland_fd_source{};
     std::unique_ptr<runtime::fd_source> drm_fd_source{};
     std::unique_ptr<runtime::fd_source> input_fd_source{};
+    /// The content-update queue's readiness poller (fence waits; one source for all).
+    std::unique_ptr<runtime::fd_source> content_fd_source{};
+    /// Explicit sync: the newest composite fence of a frame, for release points (render
+    /// publishes, UI dups; only while some client uses linux-drm-syncobj-v1).
+    gfx::release_fence_mailbox release_fences_{};
+    // ── Screen capture (design-app-compat-capture Part D) ──
+    /// UI ↔ render jobs and completions, the client shm render writes into, what the wire is
+    /// told about outputs and the render path, and the render thread's executor.
+    capture_channel capture_channel_{};
+    capture_shm_guards capture_guards_{};
+    capture_host capture_host_{};
+    capture_renderer capture_renderer_{};
+    /// Render → UI: a task to take the completions is queued.
+    std::atomic<bool> capture_ui_posted_{false};
+    void notify_capture_completions();
+    /// UI. What capture sees of the outputs, refreshed before every capture tick.
+    void refresh_capture_host();
+    /// Render. The pointer as output `p` shows it (paint_cursors, the software cursor test).
+    [[nodiscard]] capture_cursor capture_cursor_for(const output_pipeline& p) const;
+    /// Render, after the commits: copies that need no new composite, window captures,
+    /// curtains; completions handed to UI.
+    void run_capture_render();
     std::unique_ptr<runtime::event_source> logind_source{};
 
     /// The frame clocks run only while there is something to do. An output whose two
@@ -1025,6 +1064,7 @@ struct compositor_impl {
     void on_input_pointer_motion(const lx::input::pointer_motion_event& event);
     void on_input_pointer_button(const lx::input::pointer_button_event& event);
     void on_input_pointer_axis(const lx::input::pointer_axis_event& event);
+    void on_input_gesture(const lx::input::gesture_event& event);
     void on_input_modifiers(const lx::input::modifier_state& mods);
 
     std::thread render_thread{};
@@ -1040,6 +1080,8 @@ struct compositor_impl {
 
     std::atomic<bool> running{false};
     std::atomic<bool> threads_started{false};
+    /// Render ticks run (`compositor::render_and_wait`).
+    std::atomic<unsigned> render_ticks_{0};
     std::atomic<unsigned> frame_index{0};
 
     scheduler::frame_tick last_tick{};
@@ -1168,6 +1210,24 @@ struct compositor_impl {
     static compositor_impl* active;
     static void vsync_callback();
     static void wayland_fd_callback();
+    static void content_fd_callback();
+    /// commit-timing-v1: clocks of outputs with a queued target that stopped are armed for
+    /// the tick presenting it.
+    void arm_commit_timers();
+    /// tearing-control-v1: the output policy's verdict for the outputs just published.
+    void evaluate_tearing(std::uint32_t published);
+    /// Per output: the last `allow_async` verdict (what an async-capable commit path reads).
+    std::uint32_t async_allowed_mask_ = 0;
+    bool async_unsupported_logged_ = false;
+    /// Render: hands a dup of this composite's fence to explicit-sync release points (only
+    /// while some client uses linux-drm-syncobj-v1).
+    void publish_release_fence(int fence_fd, unsigned frame) {
+        if (fence_fd < 0 || !release_fences_.wanted())
+            return;
+        const int dup = ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
+        if (dup >= 0)
+            release_fences_.publish(dup, frame);
+    }
     static void drm_fd_callback();
     static void housekeeping_callback();
     static void after_dispatch_callback();
@@ -1216,6 +1276,19 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
             begin_logout("Ctrl+Alt+Backspace");
         return;
     }
+    // Super+Escape, when it acts: the focused surface's shortcuts inhibitor is toggled
+    // (keyboard-shortcuts-inhibit) and an active pointer lock or confinement is released
+    // (pointer-constraints) — one key gives a VM viewer's or a game's captured keyboard and
+    // pointer back. Never inhibitable, like the bindings above; a surface with neither gets
+    // the key.
+    if (keybindings::escape_hatch(in)) {
+        const bool toggled = shortcuts_inhibit_toggle(p0_);
+        const bool released = pointer_constraints_release(p0_);
+        if (toggled || released) {
+            keys_.reset();
+            return;
+        }
+    }
     // The waking press: not forwarded, so the router swallows its release too (Enter that
     // wakes the screen does not also confirm a dialog — KWin's DpmsInputEventFilter).
     if (woke && event.pressed) {
@@ -1227,10 +1300,12 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
         keys_.reset();
         return;
     }
-    // 3. The shell's grabs: never during a move, resize or drag, never while paused.
+    // 3. The shell's grabs: never during a move, resize or drag, never while paused; while
+    //    the focused surface inhibits shortcuts, only the `not_inhibitable` ones.
     const bool wm_busy = wm_.grab_active() || wm_.drag_active();
+    const bool inhibited = shortcuts_inhibited(p0_);
     if (!wm_busy && display_gate_.load(std::memory_order_relaxed) == 0) {
-        if (const key_decision d = keys_.match_grab(in); d.consume) {
+        if (const key_decision d = keys_.match_grab(in, inhibited); d.consume) {
             if (p0_.fire_key_grab)
                 p0_.fire_key_grab(d.grab, event.time_ms);
             return;
@@ -1241,7 +1316,7 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
     //    before it signals the pause; an unplug) is not the user letting go of Super.
     if (event.device_removed)
         keys_.reset();
-    void* tap = keys_.observe_tap(in);
+    void* tap = keys_.observe_tap(in, inhibited);
     input_router_.send_key(event, seat);
     if (tap && !wm_busy && p0_.fire_key_grab)
         p0_.fire_key_grab(tap, event.time_ms);
@@ -1644,6 +1719,33 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     // Activity; motion that wakes the display is delivered all the same (I5).
     (void)on_user_activity();
     auto& seat = input_devices_.default_seat();
+    // Where the pointer was before this event: lx.input has already added a relative
+    // device's delta to the seat position; an absolute device's position is set below.
+    const double from_x = event.absolute ? seat.pointer_x() : seat.pointer_x() - event.dx;
+    const double from_y = event.absolute ? seat.pointer_y() : seat.pointer_y() - event.dy;
+    // relative-pointer: the device's own motion, to the pointer focus's client, before the
+    // pointer moves (or does not: a lock still yields it). An absolute device's delta is the
+    // change of its position in layout units, accelerated and unaccelerated alike (sway).
+    double rdx = event.dx;
+    double rdy = event.dy;
+    double rdxu = event.dx_unaccel;
+    double rdyu = event.dy_unaccel;
+    if (event.absolute) {
+        rdx = rdy = 0.0;
+        if (event.has_prev && outputs.count() > 0) {
+            const lx::rect2i bounds = layout_bounds(outputs);
+            rdx = (event.x - event.prev_x) * bounds.width;
+            rdy = (event.y - event.prev_y) * bounds.height;
+        }
+        rdxu = rdx;
+        rdyu = rdy;
+    }
+    const bool relative_sent =
+        (rdx != 0.0 || rdy != 0.0 || rdxu != 0.0 || rdyu != 0.0) &&
+        relative_pointer_motion(p0_,
+                                event.time_us ? event.time_us
+                                              : static_cast<unsigned long long>(event.time_ms) * 1000ull,
+                                rdx, rdy, rdxu, rdyu);
     // Output geometry is the compositor's to know — libinput reports deltas and has no
     // idea how large the desktop is — so both halves of the mapping live here. An absolute
     // device (a tablet, or the mouse of any VM console) arrives normalised to a unit box
@@ -1655,12 +1757,28 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     // mouse spans the host window, which is the bounding box of the guest topology), and
     // the pointer stays on the union of the outputs: the nearest point of the nearest
     // output when it would leave them or fall into a gap (ADR 008 M9).
-    if (outputs.count() > 0) {
-        if (event.absolute) {
-            const lx::rect2i bounds = layout_bounds(outputs);
-            seat.set_pointer_position(bounds.x + event.x * bounds.width,
-                                      bounds.y + event.y * bounds.height);
+    if (outputs.count() > 0 && event.absolute) {
+        const lx::rect2i bounds = layout_bounds(outputs);
+        seat.set_pointer_position(bounds.x + event.x * bounds.width,
+                                  bounds.y + event.y * bounds.height);
+    }
+    // pointer-constraints: a lock keeps the pointer where it was — no cursor move, no
+    // hit-test, no `wl_pointer.motion`; the relative motion above still went out, and its
+    // frame ends here. A confinement clips the motion into its region.
+    {
+        double x = seat.pointer_x();
+        double y = seat.pointer_y();
+        const pointer_constraint_kind k = pointer_constraint_motion(p0_, from_x, from_y, x, y);
+        if (k == pointer_constraint_kind::locked) {
+            seat.set_pointer_position(from_x, from_y);
+            if (relative_sent)
+                input_router_.send_pointer_frame();
+            return;
         }
+        if (k == pointer_constraint_kind::confined)
+            seat.set_pointer_position(x, y);
+    }
+    if (outputs.count() > 0) {
         double x = seat.pointer_x();
         double y = seat.pointer_y();
         if (closest_point(outputs, x, y) && (x != seat.pointer_x() || y != seat.pointer_y()))
@@ -1677,6 +1795,25 @@ void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_ev
     // Hit-testing, enter/leave and the implicit grab are the window manager's; it sends
     // the motion in the focused surface's local coordinates.
     wm_.on_pointer_motion(event.time_ms);
+    // A constraint may hold now that the pointer is inside its region.
+    pointer_constraints_update(p0_);
+}
+
+void compositor_impl::warp_pointer(double x, double y) {
+    auto& seat = input_devices_.default_seat();
+    if (outputs.count() > 0)
+        (void)closest_point(outputs, x, y);
+    seat.set_pointer_position(x, y);
+    cursor_.on_motion(x, y, 0, wm_.grab_active() || wm_.drag_active());
+    wm_.on_pointer_motion(static_cast<unsigned>(now_ns() / 1'000'000ull));
+}
+
+void compositor_impl::on_input_gesture(const lx::input::gesture_event& event) {
+    (void)on_user_activity();
+    keys_.note_other_input();
+    // pointer-gestures: to the pointer focus at begin, latched until the end (the wire
+    // decides; a compositor gesture would claim it there).
+    pointer_gesture(p0_, event);
 }
 
 void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_event& event) {
@@ -1703,6 +1840,9 @@ void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_ev
         auto& seat = input_devices_.default_seat();
         cursor_.on_motion(seat.pointer_x(), seat.pointer_y(), event.time_us, grab_after);
     }
+    // A press may have started a grab or opened a popup grab (a constraint yields), or
+    // focused the window under the pointer (one may hold now).
+    pointer_constraints_update(p0_);
 }
 
 void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
@@ -1802,6 +1942,19 @@ void compositor_impl::start_input() {
     sink.pointer_axis = [](const lx::input::pointer_axis_event& e, void* u) {
         static_cast<compositor_impl*>(u)->on_input_pointer_axis(e);
     };
+    sink.gesture = [](const lx::input::gesture_event& e, void* u) {
+        static_cast<compositor_impl*>(u)->on_input_gesture(e);
+    };
+    // Each device once, as it appears (start, hotplug, VT resume): what it can do decides
+    // which protocols it can drive — gestures need a touchpad, relative pointers a mouse.
+    sink.device_added = [](const char* name, bool keyboard, bool pointer, bool touch, bool gesture,
+                           void*) {
+        char line[192];
+        std::snprintf(line, sizeof(line), "input device \"%s\":%s%s%s%s", name ? name : "?",
+                      keyboard ? " keyboard" : "", pointer ? " pointer" : "", touch ? " touch" : "",
+                      gesture ? " gesture" : "");
+        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.input", line);
+    };
     // Touch is not routed to clients yet; it is still the user, and wakes the display.
     sink.touch = [](const lx::input::touch_event&, void* u) {
         (void)static_cast<compositor_impl*>(u)->on_user_activity();
@@ -1849,8 +2002,78 @@ void compositor_impl::wayland_fd_callback() {
     // Whatever a client asked for is applied, configured and composited by a tick — of the
     // outputs it damaged when it damaged any (each on its own phase), else of every output
     // (a frame callback or a configure answer is served by whichever ticks).
-    const std::uint32_t damaged = active->scene.pending_damage_mask();
+    // A window capture's view damaged (its window committed while covered) ticks the
+    // window's output.
+    const std::uint32_t damaged = (active->scene.pending_damage_mask() & 0xFFFFu) |
+                                  capture_wanted_outputs(active->p0_);
     active->request_frame(damaged != 0 ? damaged : ~0u);
+}
+
+void compositor_impl::content_fd_callback() {
+    if (!active)
+        return;
+    // A fence a queued content update waited on signalled: it applies now and is composited
+    // by the next tick of the outputs it damaged.
+    content_updates_poll(active->p0_);
+    const std::uint32_t damaged = (active->scene.pending_damage_mask() & 0xFFFFu) |
+                                  capture_wanted_outputs(active->p0_);
+    if (damaged != 0)
+        active->request_frame(damaged);
+}
+
+void compositor_impl::arm_commit_timers() {
+    if (!vsync_timer || display_gate_.load(std::memory_order_relaxed) != 0 ||
+        content_updates_queued(p0_) == 0)
+        return;
+    const auto now = now_ns();
+    bool armed = false;
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        if (!clocks_.live(s) || (clocks_.running_mask() & (1u << s)))
+            continue;
+        if (const unsigned long long t = content_updates_next_target(p0_, s); t != 0)
+            armed = clocks_.request_at(s, static_cast<lx::runtime::clock_time>(t),
+                                       static_cast<lx::runtime::clock_time>(k_cu_time_slack_ns),
+                                       now) ||
+                    armed;
+    }
+    if (armed)
+        rearm_frame_timer();
+}
+
+void compositor_impl::evaluate_tearing(std::uint32_t published) {
+    const bool locked_or_paused = lock_.state() != lock_state::unlocked ||
+                                  display_gate_.load(std::memory_order_relaxed) != 0;
+    for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
+        const std::uint32_t bit = 1u << slot;
+        if (!(published & bit))
+            continue;
+        async_flip_state st{};
+        st.card_capable = p0_.async_flip_capable;
+        // No async commit has been TEST_ONLY-verified on any pipeline: the atomic-async
+        // property set is not wired yet (no hardware here exposes the cap to validate it
+        // against), so this stays false and the policy answers vsync everywhere.
+        st.pipeline_tested = false;
+        st.locked_or_paused = locked_or_paused;
+        toplevels.for_each([&](const toplevel_record& rec) {
+            if (st.fullscreen_top || !rec.mapped || rec.state != lx::toplevel_state::fullscreen ||
+                rec.fullscreen_output != static_cast<int>(slot))
+                return;
+            st.fullscreen_top = true;
+            st.wants_async = surface_wants_async(p0_, rec.surface);
+        });
+        if (allow_async(st))
+            async_allowed_mask_ |= bit;
+        else
+            async_allowed_mask_ &= ~bit;
+        if (st.wants_async && !st.card_capable && !async_unsupported_logged_ &&
+            lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+            async_unsupported_logged_ = true;
+            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.gfx",
+                                            "tearing hint async on a fullscreen window: async "
+                                            "page flip unsupported by the card, presenting "
+                                            "with vsync");
+        }
+    }
 }
 
 void compositor_impl::drm_fd_callback() {
@@ -1933,6 +2156,230 @@ void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) 
     lx::trace::logger::global().log(lx::trace::level::info, "compositor.render", line);
 }
 
+void compositor_impl::refresh_capture_host() {
+    // UI. What screen capture sees of each output (design-app-compat-capture CC7–CC9): its
+    // mode and projection, whether its display is stopped, and where the lock starts on it.
+    const bool vt = (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0;
+    const std::uint32_t dark = gate_power_mask_.load(std::memory_order_relaxed);
+    capture_host_.paused = vt;
+    const bool locked = lock_.scene_locked();
+    for (unsigned s = 0; s < output_manager::k_max && s < 16; ++s) {
+        capture_output_info& c = capture_host_.outputs[s];
+        const output_ui& o = outs_[s];
+        if (!outputs.slot_live(s) || !o.live) {
+            c = {};
+            continue;
+        }
+        const output_state& st = outputs.slot_state(s);
+        c.live = true;
+        c.id = st.id;
+        c.mode = st.mode;
+        c.scale = st.scale;
+        c.origin = {st.logical_rect().x, st.logical_rect().y};
+        c.transform = static_cast<lx::buffer_transform>(st.transform & 7u);
+        c.held = vt || (dark & (1u << s)) != 0;
+        c.lock_frame = o.lock_frame;
+        c.lock_shown = locked && o.published_once &&
+                       static_cast<int>(o.last_published_frame - o.lock_frame) >= 0;
+    }
+}
+
+capture_cursor compositor_impl::capture_cursor_for(const output_pipeline& p) const {
+    // Render. The pointer image of this output's scale, turned with it, where the plane
+    // would put it (the same math as `prepare_cursor_plane`).
+    capture_cursor c{};
+    c.visible = cursor_cur_.visible;
+    c.in_frame = cursor_cur_.visible &&
+                 (!cursor_cur_.hardware || cursor_hw_failed_.load(std::memory_order_relaxed) ||
+                  !p.cursor.valid());
+    if (!c.visible || c.in_frame)
+        return c;
+    const unsigned scale120 = static_cast<unsigned>(std::lround(p.scale * 120.0));
+    const cursor_image_set& set = cursor_images_.front();
+    const cursor_plane_image* img = set.for_scale(scale120);
+    if (!img || img->width == 0 || img->pixels.empty()) {
+        c.visible = false;
+        return c;
+    }
+    const lx::buffer_transform t = p.transform;
+    unsigned w = img->width;
+    unsigned h = img->height;
+    int hot_x = img->hot_x;
+    int hot_y = img->hot_y;
+    c.pixels = img->pixels.data();
+    c.stride_px = img->width;
+    if (t != lx::buffer_transform::normal) {
+        // The plane's turned copy, when it holds this image (it is turned once per change).
+        if ((static_cast<unsigned>(t) & 1u) != 0) {
+            w = img->height;
+            h = img->width;
+        }
+        const lx::rect2i hs = gfx::transform_rect({img->hot_x, img->hot_y, 1, 1}, t,
+                                                  static_cast<int>(img->width),
+                                                  static_cast<int>(img->height));
+        hot_x = hs.x;
+        hot_y = hs.y;
+        if (p.cursor_staged_gen == set.generation && !p.cursor_turned.empty()) {
+            c.pixels = p.cursor_turned.data();
+            c.stride_px = w;
+        } else {
+            c.visible = false; // not turned yet: painted from the next frame on
+            return c;
+        }
+    }
+    c.width = w;
+    c.height = h;
+    c.generation = set.generation;
+    c.rect = capture_cursor_rect(cursor_cur_.x, cursor_cur_.y, p.origin, p.scale, t, p.mode, w, h,
+                                 hot_x, hot_y);
+    return c;
+}
+
+void compositor_impl::run_capture_render() {
+    // Render. After the commits: output copies that need no new composite (a first frame, a
+    // pointer move for paint_cursors) from each output's newest composited frame, window
+    // captures from their capture views, curtains; then UI hears of the completions.
+    if (capture_channel_.sessions.load(std::memory_order_acquire) == 0 &&
+        !capture_renderer_.has_pending()) {
+        return;
+    }
+    const bool vt_paused = (display_gate_.load(std::memory_order_acquire) & gate_vt) != 0;
+    const std::uint32_t dark = gate_power_mask_.load(std::memory_order_acquire);
+    capture_renderer_.run_curtains(capture_channel_);
+    for (auto& up : pipes_) {
+        if (!up || up->retiring || up->capture_front < 0)
+            continue;
+        output_pipeline& p = *up;
+        // A stopped display holds its sessions (CC8): nothing new can be shown.
+        if (vt_paused || (dark & (1u << p.slot)))
+            continue;
+        const capture_cursor cursor = capture_cursor_for(p);
+        if (!capture_renderer_.wants_front(p.slot, cursor))
+            continue;
+        capture_frame_source src{};
+        src.frame = p.capture_front_frame;
+        src.time_ns = p.capture_front_ns;
+        src.size = p.mode;
+        src.cursor = cursor;
+        const scene::immutable_frame_snapshot* snap = nullptr;
+        if (cpu_present_ || (gl_present_ && cursor.in_frame)) {
+            // The frame's draws: the CPU path composites them into the client's memory, GL
+            // needs them to leave the software pointer out.
+            snap = &scene.acquire_render_snapshot(p.slot);
+            drain_texture_updates(snap->frame_index());
+            const auto& draws = snap->draws();
+            gfx::blit_command* blits = blit_storage(draws.size());
+            for (unsigned i = 0; i < draws.size(); ++i) {
+                const auto& cmd = draws.data()[i];
+                blits[i] = {};
+                blits[i].texture_id = cmd.texture.id();
+                blits[i].dst = cmd.dst;
+                blits[i].src = cmd.src;
+                blits[i].clip = cmd.clip;
+                blits[i].tint = cmd.tint;
+                blits[i].opacity = cmd.opacity;
+                blits[i].blend = cmd.blend;
+                blits[i].buffer_xform = cmd.buffer_xform;
+                blits[i].src_space = cmd.src_space;
+                blits[i].scaled = cmd.scaled;
+                blits[i].occluded = cmd.occluded;
+                blits[i].solid = cmd.solid;
+                blits[i].solid_color = cmd.solid_color;
+            }
+            src.blits = blits;
+            src.blit_count = draws.size();
+            src.clear = snap->clear_color();
+        }
+        if (gl_present_)
+            src.gl_framebuffer = p.gl[p.capture_front].framebuffer();
+        else if (vulkan_present_)
+            src.vk_target = &p.vk[p.capture_front];
+        capture_renderer_.output_front(p.slot, src, capture_channel_);
+        if (snap)
+            scene.release_render_frame(p.slot, *snap);
+    }
+    // Window captures: each job's capture view, composited into its client's buffer.
+    capture_toplevel_job jobs[capture_channel::k_jobs];
+    const unsigned n = capture_renderer_.toplevel_jobs(jobs, capture_channel::k_jobs);
+    for (unsigned i = 0; i < n; ++i) {
+        bool seen = false;
+        for (unsigned k = 0; k < i; ++k)
+            seen = seen || jobs[k].view == jobs[i].view;
+        if (seen || jobs[i].view >= scene::k_max_views)
+            continue;
+        const scene::immutable_frame_snapshot& snap = scene.acquire_render_snapshot(jobs[i].view);
+        drain_texture_updates(snap.frame_index());
+        const auto& draws = snap.draws();
+        gfx::blit_command* blits = blit_storage(draws.size());
+        for (unsigned d = 0; d < draws.size(); ++d) {
+            const auto& cmd = draws.data()[d];
+            blits[d] = {};
+            blits[d].texture_id = cmd.texture.id();
+            blits[d].dst = cmd.dst;
+            blits[d].src = cmd.src;
+            blits[d].clip = cmd.clip;
+            blits[d].tint = cmd.tint;
+            blits[d].opacity = cmd.opacity;
+            blits[d].blend = cmd.blend;
+            blits[d].buffer_xform = cmd.buffer_xform;
+            blits[d].src_space = cmd.src_space;
+            blits[d].scaled = cmd.scaled;
+            blits[d].occluded = cmd.occluded;
+            blits[d].solid = cmd.solid;
+            blits[d].solid_color = cmd.solid_color;
+        }
+        capture_frame_source src{};
+        src.frame = snap.frame_index();
+        src.time_ns = static_cast<unsigned long long>(now_ns());
+        src.blits = blits;
+        src.blit_count = draws.size();
+        src.clear = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+        // The pointer over the window, at the view's projection.
+        if (jobs[i].paint_cursors && cursor_cur_.visible) {
+            const unsigned scale120 = static_cast<unsigned>(std::lround(jobs[i].scale * 120.0));
+            if (const cursor_plane_image* img = cursor_images_.front().for_scale(scale120);
+                img && img->width > 0 && !img->pixels.empty()) {
+                src.cursor.visible = true;
+                src.cursor.pixels = img->pixels.data();
+                src.cursor.width = img->width;
+                src.cursor.height = img->height;
+                src.cursor.stride_px = img->width;
+                src.cursor.generation = cursor_images_.front().generation;
+                src.cursor.rect = capture_cursor_rect(
+                    cursor_cur_.x, cursor_cur_.y, jobs[i].origin, jobs[i].scale,
+                    lx::buffer_transform::normal, jobs[i].size, img->width, img->height,
+                    img->hot_x, img->hot_y);
+            }
+        }
+        capture_renderer_.toplevel_composited(jobs[i].view, snap.damage_rects(), src,
+                                              capture_channel_);
+        scene.release_render_frame(jobs[i].view, snap);
+    }
+    capture_renderer_.flush(capture_channel_);
+    if (capture_channel_.has_completions())
+        notify_capture_completions();
+    // Capture composites read client textures after this tick's output composites: their
+    // fence is the newest one explicit-sync release points must follow.
+    if (const int fence = capture_renderer_.take_sample_fence(release_fences_.wanted());
+        fence >= 0) {
+        const long long done = capture_renderer_.view_frame_done();
+        release_fences_.publish(fence, done >= 0 ? static_cast<unsigned>(done) : 0u);
+    }
+}
+
+void compositor_impl::notify_capture_completions() {
+    // Render or a worker read: UI answers the clients without waiting for its next tick.
+    if (capture_ui_posted_.exchange(true, std::memory_order_acq_rel))
+        return;
+    compositor_impl* self = this;
+    if (!runtime::executor::global().post(runtime::affinity::ui, [self] {
+            self->capture_ui_posted_.store(false, std::memory_order_release);
+            capture_complete(self->p0_);
+            self->wayland.flush();
+        }))
+        capture_ui_posted_.store(false, std::memory_order_release); // the tick drains
+}
+
 void compositor_impl::after_dispatch_callback() {
     if (active && active->screenshot_requested_.exchange(false, std::memory_order_acq_rel)) {
         // Every pixel of every output repainted into the slot that is read back.
@@ -1945,6 +2392,10 @@ void compositor_impl::after_dispatch_callback() {
     // round of events and one `done` for all of it.
     if (active)
         active->flush_output_heads();
+    // Pointer constraints decided after what this iteration dispatched (a region commit, a
+    // window that mapped or moved): nothing to do while no constraint exists.
+    if (active)
+        pointer_constraints_update(active->p0_);
     // Events produced anywhere in this iteration (input, protocol replies, releases) leave
     // in one flush rather than waiting for the next tick.
     if (active)
@@ -1990,6 +2441,9 @@ void compositor_impl::settle_frame_clocks(std::uint32_t served, std::uint32_t qu
         if (served & (1u << s))
             stopped_any = clocks_.settle(s, (quiet & (1u << s)) != 0) || stopped_any;
     rearm_frame_timer();
+    // A queued commit-timing target keeps no clock running: the stopped clock is armed for
+    // the one tick that presents it.
+    arm_commit_timers();
     if (stopped_any && clocks_.running_mask() == 0)
         lx::trace::timeline_instant("ui", "clock.idle");
 }
@@ -2213,7 +2667,104 @@ void compositor_impl::register_p0_globals() {
     // per commit); the UI-side Vulkan import cache is only for the Vulkan path.
     surfaces.set_render_thread_import(gl_present_);
     buffer_lifecycle_.set_release_callback(&release_wl_buffer_resource, nullptr);
+    buffer_lifecycle_.set_sync_release_callback(&release_sync_point, nullptr);
     protocols_.set_surface_manager(&surfaces);
+    // The content-update queue (fifo-v1, commit-timing-v1, fences): when content applied
+    // now is predicted to present — this tick's deadline while a tick builds the output's
+    // frame, else the first vblank whose tick has not started — and clocks armed for targets.
+    p0_.cu_user = this;
+    p0_.cu_predict = [](void* u, unsigned slot) -> unsigned long long {
+        auto* self = static_cast<compositor_impl*>(u);
+        if (slot >= output_manager::k_max || !self->clocks_.live(slot))
+            return 0;
+        const scheduler::repaint_scheduler& c = self->clocks_.clock(slot);
+        const auto now = now_ns();
+        if (self->p0_.cu_in_tick && (self->due_mask_ & (1u << slot)))
+            return static_cast<unsigned long long>(c.next_deadline(now));
+        return static_cast<unsigned long long>(
+            c.next_deadline(now + c.estimate_ns() + scheduler::repaint_scheduler::k_margin_ns));
+    };
+    p0_.cu_request_at = [](void* u, unsigned slot, unsigned long long target) {
+        auto* self = static_cast<compositor_impl*>(u);
+        if (!self->vsync_timer || self->display_gate_.load(std::memory_order_relaxed) != 0)
+            return;
+        if (self->clocks_.request_at(slot, static_cast<lx::runtime::clock_time>(target),
+                                     static_cast<lx::runtime::clock_time>(k_cu_time_slack_ns),
+                                     now_ns()))
+            self->rearm_frame_timer();
+    };
+    // linux-drm-syncobj-v1 needs timeline syncobjs and the eventfd ioctl on the card, and a
+    // composite that exports its completion as a sync_file (GL with
+    // EGL_ANDROID_native_fence_sync, Vulkan); the CPU composite has no GPU fence to attach.
+    p0_.release_fences = &release_fences_;
+    p0_.icons = &icons_;
+    p0_.foreign = &foreign_;
+    // Screen capture (design-app-compat-capture Part D): on the composite path that runs —
+    // GL copies the composited frame (one blit, or a read-back for shm) and renders windows'
+    // capture views, CPU composites into the client's memory, Vulkan reads its target back
+    // (outputs only). Without a composite path (headless) nothing is offered.
+    capture_host_.backend = gl_present_       ? capture_backend::gl
+                            : cpu_present_    ? capture_backend::cpu
+                            : vulkan_present_ ? capture_backend::vulkan
+                                              : capture_backend::none;
+    capture_host_.dmabuf = gl_present_ && egl_.supports_dmabuf_import();
+    capture_host_.dmabuf_device = p0_.dmabuf_main_device;
+    capture_host_.channel = &capture_channel_;
+    capture_host_.guards = &capture_guards_;
+    capture_host_.scene = &scene;
+    capture_host_.user = this;
+    capture_host_.wake_render = [](void* u) { static_cast<compositor_impl*>(u)->wake_render(); };
+    capture_host_.request_frame = [](void* u, std::uint32_t mask) {
+        static_cast<compositor_impl*>(u)->request_frame(mask);
+    };
+    capture_host_.predict = [](void* u, unsigned slot, unsigned long long composited) {
+        // The first vblank after the composite: the flip that shows it (CC6).
+        auto* self = static_cast<compositor_impl*>(u);
+        if (slot >= output_manager::k_max || !self->clocks_.live(slot))
+            return 0ull;
+        return static_cast<unsigned long long>(self->clocks_.clock(slot).next_deadline(
+            static_cast<lx::runtime::clock_time>(composited)));
+    };
+    capture_guards_.bind({}); // libwayland's access calls are bound by install_p0_protocols
+    if (gl_present_)
+        capture_renderer_.bind_gl(&gl_compositor_, &egl_);
+    else if (cpu_present_)
+        capture_renderer_.bind_cpu(&cpu_compositor_);
+    else if (vulkan_present_)
+        capture_renderer_.bind_vulkan(&vk_compositor_);
+    capture_renderer_.bind_guards(&capture_guards_);
+    if (cfg.worker_thread_count > 0)
+        capture_renderer_.bind_worker(
+            [](void (*fn)(void*), void* arg) {
+                compositor_impl* self = compositor_impl::active;
+                if (!self || !self->threads_started.load(std::memory_order_acquire))
+                    return false;
+                return runtime::executor::global().post(runtime::affinity::worker,
+                                                        runtime::task{fn, arg});
+            },
+            [](void* u) { static_cast<compositor_impl*>(u)->notify_capture_completions(); },
+            this);
+    p0_.capture = capture_host_.backend != capture_backend::none ? &capture_host_ : nullptr;
+    refresh_capture_host();
+    p0_.warp_user = this;
+    p0_.warp_pointer = [](void* u, double x, double y) {
+        static_cast<compositor_impl*>(u)->warp_pointer(x, y);
+    };
+    if (drm_present_) {
+        const bool fence_out = (gl_present_ && egl_.supports_native_fence()) || vulkan_present_;
+        p0_.syncobj_drm_fd = kms.card_fd();
+        p0_.syncobj_supported = fence_out && gfx::drm_timeline_supported(kms.card_fd());
+        p0_.async_flip_capable = kms.supports_async_flip();
+        char line[200];
+        std::snprintf(line, sizeof(line),
+                      "explicit sync (linux-drm-syncobj-v1): %s; async page flips "
+                      "(tearing-control-v1): %s",
+                      p0_.syncobj_supported ? "offered"
+                      : fence_out           ? "not offered (no timeline syncobjs on this card)"
+                                            : "not offered (composite exports no fence)",
+                      p0_.async_flip_capable ? "available" : "unsupported by the card");
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx", line);
+    }
     if (auto installed = install_p0_protocols(p0_); !installed) {
         lx::trace::logger::global().log_error(installed.get_error(), "compositor");
     }
@@ -2535,11 +3086,14 @@ lx::result<void> compositor_impl::setup_vulkan_present() {
 }
 
 lx::result<void> compositor_impl::setup_cpu_present() {
-    if (!drm_present_) {
-        // Without DRM master there is no scanout buffer to write into, and compositing
-        // into memory nobody reads is not a present path.
+    // Without DRM master there is no scanout buffer to write into, and compositing into
+    // memory nobody reads is not a present path — except virtual outputs asked to composite
+    // on the CPU (`--virtual-outputs` with `--present cpu`): their frames are composited on
+    // demand, into screen captures' buffers (headless capture, CI).
+    const bool virtual_cpu = cfg.present == present_backend::cpu && cfg.virtual_outputs &&
+                             *cfg.virtual_outputs;
+    if (!drm_present_ && !virtual_cpu)
         return lx::not_implemented("lx::compositor::setup_cpu_present");
-    }
     cpu_compositor_.set_worker_threads(cfg.composite_thread_count);
     cpu_present_ = true;
     vulkan_present_ = false;
@@ -2616,6 +3170,10 @@ lx::result<void> compositor_impl::create_targets(output_pipeline& p, bool scanou
             }
             p.fb[i] = std::move(framebuffer).value();
         } else if (cpu_present_) {
+            // A virtual output on the CPU path has no scanout: its frames are composited only
+            // into screen captures' buffers (`composite_output`).
+            if (!kms_out)
+                break;
             // XR24 is what the primary plane takes everywhere, and it is the byte order
             // wl_shm clients already use — so an unscaled opaque surface reaches the display
             // as a plain row copy with no conversion at all.
@@ -3194,6 +3752,7 @@ void compositor_impl::enter_display_pause(unsigned quiesce_gen) {
 
 void compositor_impl::suspend_input_for_pause() {
     auto& seat = input_devices_.default_seat();
+    p0_.session_paused = true;
     // 5. libinput closes every device (back to logind with ReleaseDevice) and emits a
     //    release for every key and button still down; those were drained through the
     //    normal path just now, so clients saw them in order.
@@ -3209,6 +3768,9 @@ void compositor_impl::suspend_input_for_pause() {
     // 6. The focused client is told it lost the keyboard; the window manager's decision is
     //    kept for the resume.
     input_router_.suspend_keyboard_focus(seat);
+    // 7. Pointer constraints end while the session is away (a persistent one holds again
+    //    after the resume).
+    pointer_constraints_update(p0_);
 }
 
 void compositor_impl::resume_input_after_pause() {
@@ -3226,7 +3788,9 @@ void compositor_impl::resume_input_after_pause() {
     // before the switch.
     wm_.resolve_keyboard_focus();
     // `enter` with an empty key array and the modifiers (only locks survive): a full resync.
+    p0_.session_paused = false;
     input_router_.resume_keyboard_focus(seat);
+    pointer_constraints_update(p0_);
 }
 
 void compositor_impl::begin_display_resume(unsigned gen) {
@@ -3613,6 +4177,9 @@ void compositor_impl::advance_lock() {
 }
 
 void compositor_impl::apply_lock_actions(const lock_actions& a) {
+    // Screen capture follows the lock from the request on (CC7): jobs already with render
+    // are cancelled, every session's next frame is the curtain.
+    capture_lock_check(p0_);
     if (a.empty())
         return;
     const lx::color black = lx::color::rgb(0.f, 0.f, 0.f);
@@ -3655,6 +4222,9 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
     }
     if (a.has(lock_actions::refocus))
         wm_.lock_focus_changed();
+    // A pointer constraint ends at the lock request and may hold again after the unlock.
+    if (a.has(lock_actions::input_lock) || a.has(lock_actions::input_unlock))
+        pointer_constraints_update(p0_);
     // The solid colour: dark red once the locker is gone (sway), so whoever sits down sees
     // why the screen is locked and empty; black otherwise.
     const lx::color clear = lock_.state() == lock_state::abandoned
@@ -4026,6 +4596,8 @@ void compositor_impl::render_add_output(const output_op& op) {
     p->slot = slot;
     p->origin = op.origin;
     p->scale = op.scale;
+    // A new output's frames have nothing to do with the slot's previous one.
+    capture_renderer_.output_reset(slot);
     // A resume or power-on asked for before this pipeline existed is not its business.
     p->resume_done_gen = resume_gen_[slot].load(std::memory_order_acquire);
     p->first_frame = op.from_frame;
@@ -4452,6 +5024,9 @@ bool compositor_impl::apply_mode_switch(output_pipeline& p, unsigned frame) {
     // Nothing composited for the old mode is committed; every slot is repainted.
     p.discard_fence();
     p.composited_slot = -1;
+    // Captures wait for the first frame of the new mode (their buffers no longer fit).
+    p.capture_front = -1;
+    capture_renderer_.output_reset(p.slot);
     p.frame_outstanding.store(false, std::memory_order_release);
     for (unsigned i = 0; i < output_pipeline::k_slots; ++i)
         p.slot_age[i].set_full();
@@ -5125,6 +5700,12 @@ void compositor_impl::outputs_changed_now() {
         log_outputs();
         lx::trace::scoped_span outputs_span{"ui", "outputs_changed"};
         notify_outputs_changed(p0_);
+    }
+    // Captures follow at once (CC9): a gone output stops its sessions, a new mode sends new
+    // constraints (window captures publish at the next tick).
+    if (p0_.capture) {
+        refresh_capture_host();
+        capture_tick(p0_, p0_.building_frame, false);
     }
     reclamp_pointer();
 }
@@ -6304,6 +6885,7 @@ void compositor_impl::render_loop() {
 
         if (owner) owner->tick_render();
         runtime::executor::global().drain(runtime::affinity::render);
+        render_ticks_.fetch_add(1, std::memory_order_release);
     }
 
     // A frame composited but never committed still holds its fence; this thread owns it.
@@ -6822,6 +7404,13 @@ lx::result<void> compositor::start() {
             wfd, &detail::compositor_impl::wayland_fd_callback);
         impl_->loop.add_source(impl_->wayland_fd_source.get());
     }
+    // Fences queued content updates wait on (sync_files, syncobj eventfds): one epoll fd,
+    // readable only while one has signalled.
+    if (const int cfd = content_updates_poll_fd(impl_->p0_); cfd >= 0) {
+        impl_->content_fd_source = std::make_unique<runtime::fd_source>(
+            cfd, &detail::compositor_impl::content_fd_callback);
+        impl_->loop.add_source(impl_->content_fd_source.get());
+    }
     // The card reports readable only while a DRM event (a flip) is queued, and
     // drmHandleEvent consumes it — so the flip handler runs the moment the flip lands.
     if (impl_->drm_present_ && impl_->kms.card_fd() >= 0) {
@@ -7004,8 +7593,39 @@ void compositor::inject_pointer_motion(const lx::input::pointer_motion_event& ev
         return;
     lx::input::pointer_motion_event e = event;
     e.absolute = false;
-    impl_->input_devices_.default_seat().set_pointer_position(event.x, event.y);
+    // A move to (x, y) is a relative motion by the difference, as a mouse would make it.
+    auto& seat = impl_->input_devices_.default_seat();
+    e.dx = event.x - seat.pointer_x();
+    e.dy = event.y - seat.pointer_y();
+    if (event.dx_unaccel == 0.0 && event.dy_unaccel == 0.0) {
+        e.dx_unaccel = e.dx;
+        e.dy_unaccel = e.dy;
+    }
+    seat.set_pointer_position(event.x, event.y);
     impl_->on_input_pointer_motion(e);
+}
+
+void compositor::inject_pointer_relative(double dx, double dy, double dx_unaccel,
+                                         double dy_unaccel, unsigned long long time_us) {
+    if (!impl_)
+        return;
+    auto& seat = impl_->input_devices_.default_seat();
+    lx::input::pointer_motion_event e{};
+    e.dx = dx;
+    e.dy = dy;
+    e.dx_unaccel = dx_unaccel;
+    e.dy_unaccel = dy_unaccel;
+    e.time_us = time_us;
+    e.time_ms = static_cast<unsigned>(time_us / 1000ull);
+    seat.set_pointer_position(seat.pointer_x() + dx, seat.pointer_y() + dy);
+    e.x = seat.pointer_x();
+    e.y = seat.pointer_y();
+    impl_->on_input_pointer_motion(e);
+}
+
+void compositor::inject_gesture(const lx::input::gesture_event& event) {
+    if (impl_)
+        impl_->on_input_gesture(event);
 }
 
 void compositor::inject_pointer_button(const lx::input::pointer_button_event& event) {
@@ -7017,6 +7637,21 @@ void compositor::simulate_connector_scan(const lx::drm::connector_scan& scan) {
     runtime::assert_affinity(runtime::affinity::ui);
     if (impl_)
         impl_->apply_connector_scan(scan, false);
+}
+
+bool compositor::render_and_wait() {
+    if (!impl_ || !impl_->threads_started.load(std::memory_order_acquire))
+        return false;
+    const unsigned before = impl_->render_ticks_.load(std::memory_order_acquire);
+    impl_->wake_render();
+    for (int i = 0; i < 2000; ++i) {
+        // A tick that was already running when woken does not count: one that started after.
+        if (impl_->render_ticks_.load(std::memory_order_acquire) - before >= 2u ||
+            (i > 5 && impl_->render_ticks_.load(std::memory_order_acquire) != before))
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return false;
 }
 
 void compositor::run_posted_ui_tasks() {
@@ -7047,6 +7682,7 @@ config compositor::configuration() const { return impl_ ? impl_->cfg : config{};
 wayland::server& compositor::wayland() { return impl_->wayland; }
 surface_manager& compositor::surfaces() { return impl_->surfaces; }
 toplevel_manager& compositor::toplevels() { return impl_->toplevels; }
+const toplevel_icon_table& compositor::toplevel_icons() const { return impl_->icons_; }
 window_manager& compositor::windows() { return impl_->wm_; }
 shell_bridge& compositor::shell_bridge() { return impl_->shell_bridge_; }
 cursor_manager& compositor::cursor() { return impl_->cursor_; }
@@ -7120,8 +7756,14 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         // moment they are readable; requests that arrived since the loop last looked are
         // taken now, so they make this frame.
         lx::trace::scoped_span dispatch_span{"ui", "dispatch"};
+        // From here to the publish, what is applied joins this tick's frame (the
+        // commit-timing prediction of the served outputs is this tick's deadline).
+        impl->p0_.cu_in_tick = true;
         (void)wayland().dispatch(0);
     }
+    // Queued content updates whose target this tick's frame reaches, or that stopped being
+    // shown, apply now and join it.
+    content_updates_try(impl->p0_);
 
     // wl_surface.frame means "the content you committed has been shown". Answering it once
     // per tick instead makes clients render frames that are composited over and never reach
@@ -7232,6 +7874,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
             o.last_damaged_frame = tick.frame_index;
     }
     impl->p0_.lit_mask = paused ? 0u : (live & ~dark);
+    impl->p0_.cu_in_tick = false;
     if (published != 0) {
         // Published: commits dispatched between now and the next tick are the next
         // snapshot's. A dropped publish keeps this frame, whose damage carries forward.
@@ -7264,6 +7907,16 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
                     impl->note_lock_shown(slot);
             }
         }
+    }
+    if (published != 0 && !paused)
+        impl->evaluate_tearing(published);
+    // fifo-v1: each served output latched this tick's frame (published, or nothing new to
+    // show): barriers it paces clear, and the updates waiting on them apply — they join the
+    // next frame, one update per refresh.
+    if (!paused) {
+        for (unsigned slot = 0; slot < output_manager::k_max; ++slot)
+            if ((served & (1u << slot)) && !(dark & (1u << slot)))
+                content_updates_latched(impl->p0_, slot, tick.frame_index);
     }
     if (dropped != 0) {
         // The render thread still holds every other slot of that view. Visible on the
@@ -7321,10 +7974,24 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     // Release client buffers no output can still sample (the render low-water mark).
     // Done here because sending wl_buffer.release requires the UI thread's ownership of
     // Wayland dispatch.
-    const long long low_water = impl->render_low_water_.load(std::memory_order_acquire);
+    long long low_water = impl->render_low_water_.load(std::memory_order_acquire);
+    if (impl->p0_.capture) {
+        // A window capture job render has yet to composite holds back what its view samples.
+        if (const long long floor = capture_view_floor(impl->p0_); floor >= 0 && floor <= low_water)
+            low_water = floor - 1;
+    }
     (void)impl->buffer_lifecycle_.retire_completed_frames(low_water);
     // Likewise shm buffers the render thread has uploaded from client memory.
     impl->shm_direct_.retire();
+
+    // Screen capture (design-app-compat-capture Part D): completions render left, then this
+    // tick's decisions — constraints, copies, curtains, window capture views published with
+    // this frame — and the privacy indicator.
+    if (impl->p0_.capture) {
+        capture_complete(impl->p0_);
+        impl->refresh_capture_host();
+        capture_tick(impl->p0_, tick.frame_index, true);
+    }
 
     // Whether the next tick has anything to do. Per output: damage to composite, a frame
     // the render thread has not reached, a flip or commit outstanding (`quiet` above);
@@ -7337,12 +8004,19 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     const std::uint32_t waiting = frame_callbacks_pending(impl->p0_)
                                       ? frame_callbacks_pending_outputs(impl->p0_)
                                       : 0u;
-    impl->tick_quiet_mask_ = global_busy ? 0u : (quiet & ~waiting);
+    // A queued fifo update of a shown surface needs its pace output's next latch.
+    const std::uint32_t fifo_waiting = content_updates_waiting_outputs(impl->p0_);
+    // A window capture waiting for its window to change needs that window's output ticking.
+    const std::uint32_t capture_waiting = capture_wanted_outputs(impl->p0_);
+    impl->tick_quiet_mask_ =
+        global_busy ? 0u : (quiet & ~waiting & ~fifo_waiting & ~capture_waiting);
     // New damage on outputs this tick did not serve (a client of another output committed):
     // their clocks start, on their own phase.
     if (const std::uint32_t pending = scene().pending_damage_mask() & ~served & live & ~dark;
         pending != 0 && !paused)
         impl->request_frame(pending);
+    if (capture_waiting != 0 && !paused)
+        impl->request_frame(capture_waiting & live & ~dark);
 
     // Configures and events produced by this tick leave now, not at the next poll.
     wayland().flush();
@@ -7403,6 +8077,8 @@ void compositor::tick_render() {
     }
     // Adds held back behind a retire whose CRTC was still lit (its flip has landed now).
     impl->run_deferred_output_ops();
+    // Screen capture jobs UI posted (a finished read-back is copied out right here).
+    impl->capture_renderer_.take(impl->capture_channel_);
     bool reread = false;
     for (auto& up : impl->pipes_) {
         if (!up || up->retiring || !impl->drm_present_ || vt_paused || (dark & (1u << up->slot)))
@@ -7538,6 +8214,10 @@ void compositor::tick_render() {
         impl->commit_pending_modesets(commit_kinds);
     }
 
+    // Screen capture that needs no new composite, window captures, curtains (before the
+    // retirements below: a capture view still draws what this tick's frames drew).
+    impl->run_capture_render();
+
     // Nothing an output can still sample is kept: client buffers (UI retires them against
     // the mark) and textures whose retirement waited for every view to move past them.
     const long long low_water = impl->compute_low_water();
@@ -7584,6 +8264,12 @@ long long compositor_impl::compute_low_water() const {
             low = rendered;
         any_pending = true;
     }
+    // Window captures composite their own views (frames the lifecycle tags too): with no
+    // output frame outstanding, the newest view composited is as far as anything has read.
+    // A view job UI posted that render has not taken yet is held back on UI's side
+    // (`capture_view_floor`).
+    if (const long long view = capture_renderer_.view_frame_done(); view > newest)
+        newest = view;
     return any_pending ? low : newest;
 }
 
@@ -7643,6 +8329,8 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             out[i].src_space = cmd.src_space;
             out[i].scaled = cmd.scaled;
             out[i].occluded = cmd.occluded;
+            out[i].solid = cmd.solid;
+            out[i].solid_color = cmd.solid_color;
         }
         return out;
     };
@@ -7670,6 +8358,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 // frame's — which is dropped rather than leaked.
                 p.discard_fence();
                 p.composited_fence = c.value().out_fence_fd;
+                publish_release_fence(p.composited_fence, idx);
                 if (c.value().draws_skipped > 0)
                     report_unregistered_draw(blits, blit_count);
                 // A requested debug screenshot of a fully repainted frame of this output.
@@ -7713,6 +8402,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 drawn = true;
                 p.discard_fence();
                 p.composited_fence = c.value().out_fence_fd;
+                publish_release_fence(p.composited_fence, idx);
                 if (c.value().draws_skipped > 0)
                     report_unregistered_draw(blits, blit_count);
             }
@@ -7730,9 +8420,50 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             p.composited_frame = idx;
             rects = region.count;
             area = region.area();
+            // Screen capture (CC1): the frame just composited is the one copied — sessions of
+            // this output waiting for new content run on it now, with the damage it brought.
+            p.capture_front = static_cast<int>(back);
+            p.capture_front_frame = idx;
+            p.capture_front_ns = static_cast<unsigned long long>(now_ns());
+            if (capture_channel_.sessions.load(std::memory_order_acquire) != 0) {
+                capture_frame_source src{};
+                src.frame = idx;
+                src.time_ns = p.capture_front_ns;
+                src.size = p.mode;
+                src.blits = blits;
+                src.blit_count = blit_count;
+                src.clear = snapshot.clear_color();
+                if (gl_present_)
+                    src.gl_framebuffer = p.gl[back].framebuffer();
+                else if (vulkan_present_)
+                    src.vk_target = &p.vk[back];
+                src.cursor = capture_cursor_for(p);
+                capture_renderer_.output_composited(slot, frame_damage, src, capture_channel_);
+            }
         } else {
             // Not drawn: try again next tick rather than lose it.
             p.missed.add_region(frame_damage);
+        }
+    } else if (!p.scanout() && cpu_present_ && !p.kms) {
+        // A virtual output on the CPU path: nothing is shown, so nothing is composited here —
+        // a screen capture composites this frame's draws into its own buffer.
+        if (!frame_damage.empty() || p.capture_front < 0) {
+            p.capture_front = 0;
+            p.capture_front_frame = idx;
+            p.capture_front_ns = static_cast<unsigned long long>(now_ns());
+            if (capture_channel_.sessions.load(std::memory_order_acquire) != 0) {
+                capture_frame_source src{};
+                src.frame = idx;
+                src.time_ns = p.capture_front_ns;
+                src.size = p.mode;
+                src.blits = build_blits();
+                src.blit_count = blit_count;
+                src.clear = snapshot.clear_color();
+                src.cursor = capture_cursor_for(p);
+                gfx::damage_region d = frame_damage;
+                d.clip({0, 0, p.mode.width, p.mode.height});
+                capture_renderer_.output_composited(slot, d, src, capture_channel_);
+            }
         }
     } else if (!p.scanout() && headless_present_ && headless_.width() > 0) {
         // Software fallback for no-GPU hosts and CI.

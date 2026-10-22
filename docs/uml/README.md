@@ -36,12 +36,12 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [13-state-machines.mmd](13-state-machines.mmd) | State | Surface, Seat, Widget, ZlmToplevel, Session pause/resume, Display power, Session lock |
 | [14-fluent-builder.mmd](14-fluent-builder.mmd) | Class | Fluent builder API |
 | [15-dual-gpu.mmd](15-dual-gpu.mmd) | Class | Discrete vs integrated render paths |
-| [16-security.mmd](16-security.mmd) | Component | Unix creds + optional Flatpak |
-| [17-systemd-deployment.mmd](17-systemd-deployment.mmd) | Deployment | systemd user session units; each launched app a transient service |
+| [16-security.mmd](16-security.mmd) | Component | Unix creds; sandboxed clients (security-context listeners, the global filter); capture for sandboxed apps only through the portals |
+| [17-systemd-deployment.mmd](17-systemd-deployment.mmd) | Deployment | systemd user session units; each launched app a transient service; the portal frontend and its Lumen and wlr backends with the exported session environment |
 | [18-focus-sequence.mmd](18-focus-sequence.mmd) | Sequence | Stacking focus change |
 | [19-dmabuf-vulkan-class.mmd](19-dmabuf-vulkan-class.mmd) | Class | dmabuf → Vulkan import |
 | [20-dmabuf-vulkan-sequence.mmd](20-dmabuf-vulkan-sequence.mmd) | Sequence | Frame commit import path |
-| [21-shell-state-sync.mmd](21-shell-state-sync.mmd) | Sequence | Compositor → shell snapshot, key grabs, session lock (v5) |
+| [21-shell-state-sync.mmd](21-shell-state-sync.mmd) | Sequence | Compositor → shell snapshot, key grabs, session lock (v5), icons, parents, bell, capture state (v6) |
 | [22-thread-model.mmd](22-thread-model.mmd) | Component | UI / render / worker threads |
 | [23-frame-handoff-sequence.mmd](23-frame-handoff-sequence.mmd) | Sequence | Immutable snapshot handoff |
 | [24-executor-class.mmd](24-executor-class.mmd) | Class | executor, strand, snapshot_buffer |
@@ -61,6 +61,8 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [38-health-evaluation.mmd](38-health-evaluation.mmd) | Activity | Health sample → report |
 | [39-hotplug-sequence.mmd](39-hotplug-sequence.mmd) | Sequence | Hotplug: uevent → worker probe → diff → output ops (add, test/switch mode, retire) → clients (ADR 008 Part B) |
 | [40-output-config-sequence.mmd](40-output-config-sequence.mmd) | Sequence | Output configuration: a wlr-output-management apply/test → protocol checks → whole-configuration TEST_ONLY → switch → combined modeset → succeeded/failed (revert) → outputs.toml on the worker |
+| [41-content-update-queue.mmd](41-content-update-queue.mmd) | Sequence | Content-update queue: a commit's blockers (fences, fifo barrier, commit-timing target), the readiness poller, the tick's flush points, release points (ADR 009 Part A) |
+| [42-capture-sequence.mmd](42-capture-sequence.mmd) | Sequence | Screen capture: a session, the job (curtain, held, output copy), the copy on render after the composite (dma-buf blit + fence to the poller, shm blit + worker read), the lock epoch, `ready` (ADR 009 Part 4) |
 
 **Narrative architecture doc:** [../architecture.md](../architecture.md)
 

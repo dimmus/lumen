@@ -15,6 +15,7 @@ export module lx.gfx;
 export import :damage;
 export import :dmabuf;
 export import :syncobj;
+export import :drm_timeline;
 export import :semaphore_pool;
 export import :import_cache;
 export import :headless;
@@ -22,6 +23,7 @@ export import :renderer;
 export import :vk_renderer;
 export import :cpu_renderer;
 export import :gl_renderer;
+export import :gl_capture;
 export import :glyph_atlas;
 
 export namespace lx::gfx {

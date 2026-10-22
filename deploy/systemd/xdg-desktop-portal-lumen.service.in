@@ -1,0 +1,16 @@
+# xdg-desktop-portal-lumen: Screenshot/PickColor portal backend of a Lumen session, started
+# by D-Bus activation when xdg-desktop-portal first needs it. The session must have
+# exported WAYLAND_DISPLAY and XDG_CURRENT_DESKTOP=Lumen to the user manager (run-desktop.sh
+# does; see docs/architecture.md "Portals").
+[Unit]
+Description=Portal service (Lumen implementation)
+PartOf=graphical-session.target
+After=graphical-session.target
+ConditionEnvironment=WAYLAND_DISPLAY
+
+[Service]
+Type=dbus
+BusName=org.freedesktop.impl.portal.desktop.lumen
+ExecStart=@LUMEN_PORTAL_EXEC@
+Restart=on-failure
+Slice=session.slice
