@@ -1,0 +1,782 @@
+> **Status:** Proposed. Nothing in this document is implemented yet; §2 records what the
+> tree contains today, §7 is the order of work, §8 the measurement that gates each step.
+
+# ADR-010: A GPU UI engine for Lumen
+
+**Date:** 2026-10-22
+**Scope:** `lx.gfx` (new `:primitives`, `:atlas`, `:ui_vk`, `:ui_gl`, `:ui_cpu`; the three
+compositors gain primitive kinds), `lx.scene` (`draw_list` carries primitives, not only
+blits), `lx.text` (rewritten: faces, itemisation, shaping cache, lines, glyph raster),
+`lx.layout` (flexbox with a cache), `lx.ui` (`style`, `theme`, `draw_scope`, concrete
+components; the legacy `:widgets` / `:widget_node` and `lx.ui.builder` deleted),
+`lx.wayland.client` (real), `lx.app` (window, swapchain, input), `lx.shell` (panel and
+launcher move onto `lx.ui`; `shm_canvas` deleted), `lx.compositor` (`:decoration` draws
+through the same primitives), `tools/lumen-theme`, `tests/bench_ui.cpp`
+(`lumen-ui-bench`), `scripts/ui-bench.sh`, `tests/bench/baseline/`.
+**Deciders:** project owner
+**Related:** [ADR-005](005-desktop-roadmap.md) Phase 3 · [ui-architecture.md](../subsystems/ui-architecture.md) ·
+[rendering-performance.md](../subsystems/rendering-performance.md) · [threading.md](../subsystems/threading.md) ·
+[memory-management.md](../subsystems/memory-management.md)
+
+---
+
+## 1. Decision
+
+Lumen gets **one primitive renderer** for every pixel it draws itself: the compositor's
+window frames, the shell's panel and launcher, and application windows built on `lx.app`.
+Its design centre is GPUI (the framework under Zed), chosen because it is the fastest
+desktop UI renderer in production use that is also simple enough to keep correct across
+three backends: a flat stream of seven instanced primitive kinds, rounded quads and
+shadows evaluated analytically in the fragment shader, glyphs and icons as atlas sprites,
+one draw call per run of equal kind. Lumen takes that design and removes the costs GPUI
+still pays:
+
+| | GPUI | Lumen |
+|--|------|-------|
+| Element tree | Rebuilt and laid out every frame | Retained, reconciled by key; only dirty subtrees relayout (`lx.ui` already does this) |
+| Repaint | Whole window every frame it draws | Damage rects ∪ buffer age, scissored per rect; damage reported to the compositor so KMS gets `FB_DAMAGE_CLIPS` end to end |
+| Per-frame allocation | `Vec` growth, `Arc` churn | Arena descriptors, fixed-capacity streams, persistently mapped instance ring; **zero heap allocations in a steady frame** is a benchmark gate |
+| Backends | Vulkan only on Linux (Blade) | Vulkan, GLES 3.1, CPU — the compositor's three, same primitive stream; runs on vmwgfx-class hardware where Zed does not start |
+| Handoff to the compositor | Vulkan WSI swapchain | dmabuf with DRM format modifiers from `zwp_linux_dmabuf_v1` feedback, explicit sync via `wp_linux_drm_syncobj_v1`, sampled in place (0.1 ms render-thread cost measured, vs 2.7 ms for shm) |
+| Colour | 8-bit sRGB, Hsla per instance | Premultiplied `f16` linear or encoded per window; the UI surface blends in the output encoding (GPUI's look, exactly), the compositor composites windows in linear light as it does today |
+| Instance size | Quad ≈ 156 B | Quad 80 B, sprite 64 B, shadow 64 B |
+
+The visual language is Zed's: the One Dark / One Light token set, its elevation and
+shadow stack, its 4 px spacing scale with three densities, 14 px UI type on a 16 px rem,
+1 px borders, small radii, ghost elements that appear on hover (§5). Themes are read in
+Zed's JSON schema, so every published Zed theme works unchanged.
+
+What is explicitly **not** decided here: a fourth backend, compute-shader path rendering
+(Vello-style), or a retained GPU display list. Each is deferred until the benchmarks in §8
+show the scenes that need it.
+
+---
+
+## 2. Where the tree stands (October 2026)
+
+Read before trusting any older description. Line references are to this checkout.
+
+**F1 — Nothing draws UI on the GPU.** `lx.gfx` composites `blit_command`s (textured or
+solid rectangles with a rectangular clip, opacity, tint; `renderer.cppm:19-56`). There is
+no rounded corner, border, gradient, shadow, glyph or path in any backend. The Vulkan
+compositor issues one `vkCmdDraw(6)` per blit with a 112-byte push constant and no vertex
+or instance buffer (`vk_renderer.cppm:275-297, 1898-2016`), rebuilds the whole target every
+frame (no damage), and creates its pipeline with no `VkPipelineCache`
+(`vk_renderer.cppm:847`). `gfx::pipeline_cache` is a 64-entry key table, not a pipeline
+cache (`renderer.cppm:186-225`). `gfx::render_pass` is an empty class
+(`lx.gfx.cppm:131-134`); `gfx::glyph_atlas` hands out a new texture id per lookup
+(`glyph_atlas.cppm:34-40`).
+
+**F2 — `lx.ui` is the right model with no output.** The declarative core
+(`element` → `reconciler` → `ui_node` → `measure/arrange` → `emit(draw_scope&)`) exists and
+is tested (`tests/test_ui_reconcile.cpp`). `draw_scope` has two primitives, `quad()` and
+`fill()` (`node.cppm:236-263`), and `fill()` never sets `draw_command::solid`, so every
+backend skips it (`vk_renderer.cppm:1906-1909`, `cpu_renderer.cppm:545-550`). `text_node`
+emits a solid bar (`widgets_decl.cppm:168-172`). `ui_root::tick` re-emits the whole tree
+and discards the damage ledger (`root.cppm:59-90`); `reducer_node::rebuild_if_dirty` has no
+caller. `style.cppm` keys properties by `const char*`; `theme::load` and
+`theme_compiler::compile` return `not_implemented`.
+
+**F3 — No consumer reaches the screen through `lx.ui`.** `lumen-hello` ticks a root into a
+local `draw_list` and throws it away. `lx.wayland.client::display::connect` is
+`not_implemented`; `lx.app` has no frame loop, buffer or renderer. `lumen-shell` does not
+import `lx.ui`: the panel and launcher paint on the CPU through `shm_canvas` (`fill`,
+`fill_rounded`, `blit`, `text`) into `wl_shm` buffers, with libwayland-client called
+directly. The compositor's title bars are rasterised by `lx.text` on the UI thread and
+uploaded as textures (`decoration.cppm:889-947`).
+
+**F4 — Text is single-line, single-face, CPU-only.** `lx.text` holds one `FT_Face` at a
+time behind a mutex and reloads on any family/size change (`lx.text.cppm:142-276`);
+`shape_line` guesses segment properties (no bidi, no script itemisation, no fallback);
+the glyph cache is a 1 MiB coverage arena cleared wholesale at 75 % load; no subpixel
+positioning, no colour glyphs.
+
+**F5 — Layout is a stub.** `flex_node::layout` stacks children and ignores alignment,
+grow and shrink; `grid_node` overlaps spanned cells; `dirty_` is never read
+(`lx.layout.cpp`).
+
+**F6 — The two-toolkit debt from ADR-005 F7 is still there.** `:widgets`, `:widget_node`
+and `lx.ui.builder` compile but do nothing.
+
+**F7 — Measurement exists for the compositor, not for UI.** Chrome-trace export
+(`LUMEN_TRACE_FILE`), spans on `tick_ui`/`tick_render`, counters, and the hand-measured
+tables in rendering-performance.md are compositor-side. `bench_frame_timing` times a CPU
+clear of a 64×64 headless buffer. No CTest labels, no stored baselines, no regression
+gate. `LX_TRACE_SCOPE` cannot be used twice in one scope (`lx.trace.cppm:125-126`, `##`
+blocks `__LINE__`), and `budget_tracker::end_tick_render` is never called.
+
+**F8 — Host for the first measurements.** VMware SVGA3D (vmwgfx): EGL 1.5, GLES 3.1 and
+GL 4.3 through Mesa, no hardware Vulkan (lavapipe only, which the compositor correctly
+refuses), 2 vCPUs. `perf`, `heaptrack`, fribidi, libunibreak, HarfBuzz, FreeType and
+fontconfig are installed; no IBM Plex or Lilex fonts.
+
+---
+
+## 3. Goals and the bar
+
+Targets are gates for §7, measured by §8 on the host in F8 unless a row says otherwise.
+They are set from what the compositor already achieves and from what GPUI, egui and GTK4
+measure on similar scenes; §8.6 says how each comparison is run.
+
+| # | Metric | Target | Why this number |
+|---|--------|--------|-----------------|
+| G1 | Idle window (no animation) | 0 wakeups/s, 0 GPU submits, 0 frame callbacks requested | The compositor idles at 0 ticks per 5 s; a client must not undo that |
+| G2 | Steady frame, shell panel (≈300 nodes, one clock cell changes) | ≤ 150 µs UI-thread CPU; damage ≤ 1 rect, ≤ 2 % of the surface | A panel repaint today is a CPU `shm_canvas` cell repaint; the GPU path must not cost more CPU than that |
+| G3 | 10 000 animated rounded quads | ≤ 1.0 ms CPU (emit + order + encode); ≤ 8 draw calls; ≤ 800 KB instance upload | 80 B per quad; GPUI batches the same scene into a handful of draws |
+| G4 | 100 000-glyph text wall, scrolling | ≤ 2.0 ms CPU per frame; 0 shaping calls per frame after warm-up; ≤ 1 draw call per atlas page | Shaping and line layout are cached in retained nodes; scrolling moves sprites |
+| G5 | Heap allocations per steady frame | 0 (`heaptrack` flat over 10 000 frames; `mallinfo2` delta 0) | memory-management.md §7; the compositor's hot path is already arena-only |
+| G6 | Input → photon, hover highlight in the shell | median ≤ 1 refresh period + 2 ms | drag-smoke gates window moves at 1.5 periods + 4 ms; UI hover has less work |
+| G7 | Cold start → first frame, `lumen-hello` | ≤ 30 ms with a warm pipeline cache, ≤ 150 ms cold | The compositor's first frame is 106 ms (rendering-performance.md §6.2) |
+| G8 | Anonymous RSS, `lumen-shell` | ≤ 25 MB | Compositor RssAnon 19.1 MB; a client with one atlas page and one swapchain has less state |
+| G9 | Instance bytes | quad 80 B, sprite 64 B, shadow 64 B, underline 48 B | §4.2; GPUI's quad is ≈156 B |
+| G10 | Pixel parity across backends | per-primitive golden images: max channel error ≤ 2/255 Vulkan vs GL, ≤ 3/255 vs CPU | Three backends must look the same or the theme is three themes |
+| G11 | Resize storm (30 resizes, window with text) | heap flat; no frame > 2× median; swapchain reallocation ≤ 1 per size | The compositor passed the same test in PR #19 |
+
+---
+
+## 4. Architecture
+
+### 4.1 One renderer, three consumers
+
+```
+                      lx.ui (describe → reconcile → layout → emit)
+                                   │ primitives
+                                   ▼
+              lx.scene::draw_list (primitive stream + order + damage)
+                 │                              │
+   in-process    │                              │  client process
+   compositor    ▼                              ▼
+   ┌─────────────────────────┐    ┌────────────────────────────────────┐
+   │ composite pass           │    │ lx.app::window                     │
+   │ surfaces (client dmabuf) │    │  swapchain: 3 × dmabuf (vk | gbm)  │
+   │ + chrome primitives      │    │  or wl_shm (cpu)                    │
+   │ → scanout image          │    │ → wl_surface.attach + damage_buffer │
+   └─────────────────────────┘    │   + syncobj acquire/release points  │
+                                  └────────────────────────────────────┘
+                 both call: lx.gfx::{ui_vk | ui_gl | ui_cpu}::draw(target, stream, damage)
+```
+
+The backend code is the same object in both processes. What differs is the target (a
+scanout image the compositor owns versus a dmabuf the client exports) and the damage
+source (scene damage versus the `lx.ui` ledger). Layering is unchanged:
+`lx.ui → lx.scene → lx.gfx`; `lx.app` and `lx.shell` sit above `lx.ui`
+(architecture.md §3). No Vulkan, EGL or GBM type crosses out of `lx.gfx`
+(AGENTS.md §1.1).
+
+### 4.2 Primitive set
+
+GPUI's seven kinds, one content mask (axis-aligned clip) on each, every one an instanced
+unit quad expanded from `gl_VertexIndex` with no vertex buffer (the trick GPUI's
+`to_device_position` uses, and `composite.vert` already does).
+
+| Kind | Draws | Fragment technique |
+|------|-------|--------------------|
+| `quad` | Rounded rectangle, per-corner radius, per-edge border width, solid or 2-stop linear gradient, solid or dashed border | Rounded-box SDF; border = inner SDF with widths subtracted; AA = `saturate(0.5 − d)`; dashes from arc length along the perimeter; gradient stops interpolated in sRGB or Oklab (GPUI's two colour spaces) |
+| `shadow` | Blurred rounded rectangle, outer or inset | Evan Wallace's closed-form Gaussian over a rounded box (`erf` along x, 4-sample integral along y) — the function GPUI's shadow shader implements |
+| `mono_sprite` | Glyphs, icons, any R8 coverage tile × colour | One atlas fetch, `color × coverage^contrast` (§4.6 on contrast) |
+| `poly_sprite` | Images, colour emoji; optional grayscale, per-corner radius, opacity | RGBA8 atlas fetch, rounded SDF mask |
+| `path` | Vector fill from a triangle list with `st` coverage | Two passes like GPUI: triangles accumulate winding into an R16F coverage tile with additive blend; the tile is drawn as a sprite |
+| `underline` | Straight or wavy line of given thickness | Analytic; wavy = sine offset before the SDF |
+| `surface` | External texture (client dmabuf, video, captured output) — today's `blit_command` | Unchanged `composite.frag` path (source basis, 8 transforms, decode per `src_transfer`) |
+
+Instance layouts (bytes). Coordinates are output pixels, `f32`; colours premultiplied
+`f16×4`, converted once at emission.
+
+```
+quad       80  bounds f32×4 │ clip f32×4 │ radii f16×4 │ border_w f16×4 │ bg0 f16×4 │
+              bg1 f16×4 │ border_rgba f16×4 │ angle f16, style u8, space u8, pad u32
+shadow     64  bounds │ clip │ radii f16×4 │ rgba f16×4 │ sigma f32 │ spread f32 │ flags u32 │ pad
+sprite     64  bounds │ clip │ uv u16×4 (atlas texels) │ page u8, flags u8, pad u16 │
+              rgba f16×4 │ radii f16×4 (poly) or rotation f16×4 (mono)
+underline  48  bounds │ clip │ rgba f16×4 │ thickness f16, wavy u16 │ pad u32
+path       64  as sprite; page = coverage atlas; rgba = fill
+surface    —   existing blit_command, unchanged
+```
+
+`bg1`, `angle` and `space` are the gradient; a solid quad leaves `bg1 = bg0`. A 64-byte
+quad with gradients in a side table was considered and rejected: the saving is 16 B per
+quad and one indirection per fragment, and G3 is already met at 80 B.
+
+Caps follow memory-management.md §3: `k_max_primitives = 16 384` per view (the
+compositor's 4 096 draw cap stays for surfaces), `overflow_action::warn_and_drop`.
+
+### 4.3 Order and batching
+
+GPUI assigns each primitive an `order` from a bounds tree (one more than the highest
+order of anything it overlaps), sorts each kind's array by `order`, and walks all kinds
+in `(order, kind)` sequence, cutting a batch whenever the kind or the sprite's atlas page
+changes. Non-overlapping primitives of one kind therefore batch together even when the
+paint order interleaves them with other kinds.
+
+Lumen keeps the rule and replaces the tree with an **overlap grid**: a fixed array of
+64 × 64 px cells per view (510 cells at 1920 × 1080, 4 KB), each holding the highest order
+drawn into it. An emitted primitive's order is `1 + max` over the cells it covers, then it
+writes its order back. No allocation, O(covered cells) per primitive, and a full-surface
+primitive costs 510 compares. A `layer` (overlay, popup, drag) pushes a base order so
+nothing below can interleave with it — GPUI's `push_layer`.
+
+Then: stable sort of the primitive index array by `(order, kind, page)` (the existing
+`batch_for_render` scratch permutation, extended), a single pass that cuts runs, one
+instanced draw per run. For the shell panel this is typically 4–6 draws; the gate for G3 is
+8.
+
+### 4.4 GPU resources per backend
+
+| | Vulkan (`:ui_vk`) | GLES 3.1 (`:ui_gl`) | CPU (`:ui_cpu`) |
+|--|--------------------|----------------------|------------------|
+| Floor | Vulkan 1.1 (the compositor's current target; move to 1.3 with ADR-005's D4) | GLES 3.1 — instancing, SSBO, `f16` attributes; the host exposes 3.1 on SVGA3D. GLES 2 hosts get the CPU renderer for UI (the compositor's GLES 2 blit path is untouched) | Row-band pool already in `cpu_renderer` |
+| Instances | One host-visible, persistently mapped ring: 3 slots × 2 MB, all kinds packed, `firstInstance` per batch; `vkCmdDraw(6, n, 0, base)` | Same ring in a `GL_SHADER_STORAGE_BUFFER` (3.1) read by `gl_InstanceID`; `glDrawArraysInstanced` | Not applicable: the stream is rasterised directly within damage rects, SDF per pixel for quads/shadows, nearest/bilinear for sprites |
+| Pipelines | 7, one layout: set 0 = globals UBO + 16-entry sampler array (atlas pages); push constant = instance base. `VkPipelineCache` persisted to `$XDG_CACHE_HOME/lumen/pipeline-cache-<pipelineCacheUUID>.bin`, replacing the key table in `renderer.cppm` | 7 programs, uniform block for globals, `GL_TEXTURE_2D_ARRAY` per atlas format; program binaries cached with `GL_OES_get_program_binary` | — |
+| Surfaces | Descriptor set per imported image as today | `EGLImage` per buffer as today | As today |
+| Atlas upload | Staging ring → one `vkCmdCopyBufferToImage` with N regions before the pass | `glTexSubImage3D` per dirty rect, coalesced | memcpy |
+| Sync | One timeline semaphore per window (`timeline_semaphore_pool`), value per frame; exported as a syncobj for the compositor | `EGL_ANDROID_native_fence_sync` → sync_file → `drmSyncobjImportSyncFile` for the acquire point; `glFinish` fallback as the GL compositor already does | `wl_shm`, no sync needed |
+| Damage | `VK_KHR_dynamic_rendering`-style load; per rect: scissor + clear + draw the batches whose bounds meet it (bounds per batch kept from the sort) | `glScissor` per rect, exactly `gl_compositor::composite_rects` | Clip to rects |
+| GPU timing | Timestamp query per batch kind (bench builds only) | `GL_EXT_disjoint_timer_query` when present; fence-wait wall time otherwise | — |
+
+The ring is sized for 25 000 primitives per frame; overflow drops with one warning per
+run, never grows. The existing Vulkan compositor's `upload_rgba` (which waits for every
+frame slot before each upload) is replaced by the staging ring on the same path.
+
+### 4.5 Colour and precision
+
+- Theme colours are stored twice at compile time: sRGB `u8×4` for tools, premultiplied
+  linear `f16×4` for the renderer. No conversion at emission.
+- A client UI window renders into an 8-bit sRGB-encoded swapchain
+  (`VK_FORMAT_B8G8R8A8_SRGB` image view; GBM `XRGB8888` + `GL_FRAMEBUFFER_SRGB` off) and
+  **blends in the encoded space**. This is what GPUI, browsers and every mainstream
+  toolkit do and what the theme's alpha values (`#74ade83d` selections, `0.12` shadows)
+  were tuned against; blending the same values in linear light visibly changes them and
+  thins text. The compositor still composites *windows* in linear light (§1.1 of
+  rendering-performance.md); the two are different layers and both stay correct.
+- When a window asks for HDR / wide gamut (`wp_color_management` later), the swapchain is
+  `R16G16B16A16_SFLOAT` scRGB, blending is linear, and `mono_sprite` applies a coverage
+  contrast exponent (theme `text.contrast`, default 1.0 dark / 1.2 light, validated
+  against the sRGB rendering in the golden tests, §8.4). The compositor's own chrome
+  renders inside its linear F16 pass and uses the same exponent.
+- 10-bit output: when `zwp_linux_dmabuf_v1` feedback offers `XRGB2101010` the client
+  swapchain uses it; the compositor already scans out A2B10G10R10.
+
+### 4.6 Text
+
+`lx.text` is rewritten as partitions; the public result is a `text_layout` retained on a
+`text_node` and invalidated only when text, width, font or scale change.
+
+| Partition | Does | Library | Cache |
+|-----------|------|---------|-------|
+| `:faces` | Family resolution, face loading, metrics | fontconfig + FreeType | LRU of 32 `(family, weight, style)` faces, each with its `hb_font_t`; `FT_Set_Char_Size` per use, not per load. Bundled fonts registered with `FcConfigAppFontAddDir` |
+| `:itemize` | Split a paragraph into runs of one (script, direction, face) | fribidi (UAX #9), HarfBuzz script, fontconfig charset for fallback | Fallback face per `(primary face, script, Unicode block)` |
+| `:shape` | Shape one run | HarfBuzz, features from the style | `shape_cache`: 4 096 entries keyed by `(face id, size × scale, features, direction, FNV-1a of the UTF-8)` → glyph ids, advances, offsets, clusters in an arena; LRU |
+| `:lines` | Line breaking, ellipsis, alignment, wrap | libunibreak (UAX #14, grapheme breaks for the caret) | Lines live in the node's `text_layout` |
+| `:raster` | Glyph → atlas tile | FreeType, unhinted outlines, grayscale AA, `FT_LOAD_COLOR` for CBDT/sbix/COLRv0 emoji | `glyph_cache` keyed by `(face, size, subpixel x variant, glyph)` → atlas tile |
+
+Rasterisation choices, each a gate in §8.4: **4 horizontal subpixel variants**
+(GPUI's `SUBPIXEL_VARIANTS = 4`), vertical position snapped to whole pixels; no hinting
+by default, light vertical autohint selectable per theme for scales below 1.5; LCD
+subpixel AA deferred (needs `wl_output.subpixel` and dual-source blending, listed in §7
+Phase 6). Emoji go to the RGBA8 page as `poly_sprite`.
+
+Atlas (`lx.gfx:atlas`, replacing `glyph_atlas.cppm`): shelf packing with bucketed
+shelves (the étagère algorithm GPUI uses), pages of 1024² growing to 2048², at most 4 R8
+and 2 RGBA8 pages; a page above 85 % occupancy with stale tiles is rebuilt from its live
+set on the worker thread and swapped at the next frame. Each tile records the last frame
+it was drawn; eviction never touches a tile used in the last 120 frames (the import
+cache's stale threshold).
+
+Shaping and rasterising happen on the **worker** affinity when a layout invalidation is
+large (a whole document) and inline on the UI thread when it is small (a label), with the
+boundary set by measurement in §8.3 S4.
+
+### 4.7 Layout
+
+`lx.layout:flex` implements the CSS flexbox subset Taffy gives GPUI: direction, wrap,
+`justify-content`, `align-items`/`align-self`, `gap`, `flex-grow`/`shrink`/`basis`,
+`min`/`max`, padding, margin, border box, `position: absolute` with insets, `overflow:
+hidden | scroll`. Grid is a later partition. The engine works on `ui_node`'s existing
+two-pass `measure(constraints, size_hint)` / `arrange(bounds)` contract and keeps the
+rule that `measure` is pure.
+
+Caching, which GPUI does not have because it rebuilds the tree: each `ui_node` keeps a
+4-entry `(constraints, size_hint) → size` cache (Yoga's shape), cleared by
+`invalidate_layout`; dirtiness propagates to the root; `arrange` of a clean subtree with
+unchanged bounds is skipped. G2 depends on this: a clock-cell change relayouts one cell.
+
+### 4.8 Style, tokens and the theme compiler
+
+`style.cppm`'s string-keyed properties are replaced by a packed `style` value (≈96 B)
+carried in element props, with a GPUI-shaped builder so a description reads like GPUI:
+
+```cpp
+box(s.children)
+  | styled(style{}.flex_row().gap(sp::b08).px(sp::b12).h(px(32))
+                  .bg(tok::surface_background).border_1(tok::border_variant)
+                  .rounded(radius::md).shadow(elevation::elevated_surface))
+```
+
+- `tok::*` are `u16` indices into the theme's colour table; `sp::*` is the spacing scale
+  (§5.3) resolved through the density; lengths are 32-bit `{unit:2, value:30}` (px, rem,
+  percent, auto).
+- `tools/lumen-theme` compiles a theme JSON in **Zed's schema**
+  (`https://zed.dev/schema/themes/v0.2.0.json`) into `.lxtheme`: a header, the colour
+  table in both encodings, the status and player tables, syntax styles, font settings.
+  `theme::load` is one read and a bounds check; `theme_compiler::compile` loses its
+  `not_implemented`. Debug builds hot-reload on inotify from the worker thread.
+- Components (§5.6) are `ui_node`s in `lx.ui:components`, above the primitives, as
+  ui-architecture.md §9 already asks.
+
+### 4.9 Frame loop and damage (client window)
+
+```
+event (wl_pointer / wl_keyboard / text-input / timer)
+  → action → reducer → invalidate_{paint,layout,animate}
+frame due (wl_callback, only requested when the ledger is non-empty or something animates)
+  → arena reset, describe, reconcile (nodes reused by key)
+  → layout dirty subtrees (§4.7)
+  → emit whole tree into the primitive stream (v1; §7 Phase 6 measures subtree caching)
+  → order (grid), sort, cut batches; write instances into the ring slot
+  → damage = ledger ∪ age(buffer)         (buffer age per swapchain image, as the compositor's scanout slots)
+  → acquire buffer (release point signalled, or wl_buffer.release)
+  → record: per damage rect scissor + batches that meet it; submit; export sync
+  → wl_surface.attach, damage_buffer × rects, set_acquire_point, commit
+  → ledger cleared only after a successful commit
+```
+
+Idle rule (G1): no ledger entries and no animation → no frame callback, no submit, no
+timer. Animations run off the frame callback, never off a free-running timer.
+`invalidate_animate` requests exactly one next frame.
+
+### 4.10 Client pixel path
+
+Selected once per window in `lx.app`, the same order and the same refusal rules as the
+compositor's `present_backend::automatic`:
+
+1. **Vulkan on the render node** (hardware device only; lavapipe refused). Formats and
+   modifiers from `zwp_linux_dmabuf_v1` feedback for the compositor's main device; images
+   created with `VK_EXT_image_drm_format_modifier`, exported with
+   `VK_EXT_external_memory_dma_buf`; acquire and release points on
+   `wp_linux_drm_syncobj_surface_v1` from the window's timeline semaphore
+   (`VK_KHR_external_semaphore_fd` as syncobj). The compositor already implements the
+   syncobj protocol (ADR-009 Part 1) and imports through `dmabuf_import_cache` by
+   `(client, buffer, modifier)`, so a re-committed swapchain image is a cache hit.
+2. **GLES 3.1 on GBM** (declines a software `GL_RENDERER`). `gbm_bo_create_with_modifiers2`
+   from the same feedback, `EGLImage` → renderbuffer → FBO; native fence → sync_file →
+   syncobj acquire point; implicit sync fallback.
+3. **`wl_shm` + CPU renderer.** Two buffers, `damage_buffer` per rect. This is also the
+   path for CI golden images.
+
+Three images per swapchain, as the compositor's three scanout slots and for the same
+reason (rendering-performance.md §6.1). Fractional scale via `wp_fractional_scale_v1` +
+`wp_viewport`; the UI lays out in logical pixels and `draw_scope` projects once at
+emission exactly as `scene::output_projection` does. `wp_presentation` feedback is
+consumed for the latency measurement in §8.3 S9.
+
+### 4.11 Compositor-side use
+
+`compositor::frame_node` (server-side decorations) emits `quad`, `shadow` and
+`mono_sprite` primitives instead of textured blits of CPU-rasterised titles; the title
+goes through `lx.text` into the compositor's atlas, 1:1 at the output scale as today
+(rendering-performance.md §Output scale). `cursor_node` and `fullscreen_backdrop` are
+untouched (`surface` and solid `quad`). `compositor_impl.cpp:8574-8593` stops converting
+`draw_command` to `blit_command`: the backends take the stream. The visibility pass keeps
+treating only radius-0, alpha-1 quads as occluders.
+
+### 4.12 Threads and allocation
+
+| Work | Affinity | Allocation |
+|------|----------|------------|
+| describe, reconcile, layout, emit, order, encode | `ui` | UI arena (descriptors, shape results), fixed streams; retained nodes `new` only on shape change (unchanged) |
+| record + submit, atlas copy | `render` in the compositor; `ui` in a client (one window, one queue; a render thread for clients is not justified until S3 shows a submit cost above 300 µs) | Ring slot, no allocation |
+| shaping, glyph raster, SVG raster, page rebuild, theme reload | `worker` | Worker arena; results posted with `executor.post(ui, …)` |
+
+`assert_affinity()` at `draw_scope` construction, `ui_vk::draw` entry and
+`atlas::rasterize` entry. Every per-frame container is fixed-capacity with an
+`overflow_action` (memory-management.md §3): primitive stream, batch list (≤ 1 024), damage
+ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
+
+### 4.13 Partition map and layer check
+
+| New / changed | Layer | Depends on |
+|---------------|-------|-----------|
+| `lx.gfx:primitives`, `:atlas`, `:ui_vk`, `:ui_gl`, `:ui_cpu` | Graphics | `lx.foundation`, `lx.runtime` |
+| `lx.text:faces`, `:itemize`, `:shape`, `:lines`, `:raster` | Graphics | `lx.gfx:atlas` (tile handles only) |
+| `lx.layout:flex` | Graphics | `lx.foundation` |
+| `lx.scene` (`draw_list` of primitives, overlap grid) | Compositor | `lx.gfx` |
+| `lx.ui:style`, `:theme`, `:draw_scope`, `:components`, `:text_node` | Desktop | `lx.scene`, `lx.text`, `lx.layout` |
+| `lx.wayland.client` (real), `lx.app:window`, `:swapchain`, `:input` | Platform / Application | `lx.gfx` (through `lx.scene`), `lx.ui` |
+| `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui` |
+| `tools/lumen-theme` | tool | `lx.ui:theme` format only |
+
+No upward edge is introduced; `cmake/LumenCXXModules.cmake` will reject one at configure
+time if it is.
+
+---
+
+## 5. Visual language: GPUI as Zed ships it
+
+Values below are Zed's current defaults (One Dark / One Light theme files,
+`crates/ui/src/styles`, `assets/settings/default.json`), captured 2026-10-22. They are the
+initial content of `assets/themes/one-dark.json` and `one-light.json` and of the
+`lx.ui:components` defaults; the theme compiler accepts any other Zed theme.
+
+### 5.1 Colour tokens
+
+| Token | One Dark | One Light | Used for |
+|-------|----------|-----------|----------|
+| `background` | `#3b414d` | `#dcdcdd` | App background, status bar, title bar |
+| `surface.background` | `#2f343e` | `#ebebec` | Panels, panes, tab bar, inactive tab |
+| `elevated_surface.background` | `#2f343e` | `#ebebec` | Popovers, menus, tooltips, modals |
+| `editor.background` | `#282c33` | — | Editable areas, active tab, toolbar |
+| `element.background` | `#2e343e` | `#ebebec` | Buttons, inputs |
+| `element.hover` | `#363c46` | `#dfdfe0` | |
+| `element.active` / `.selected` | `#454a56` | `#cacaca` | |
+| `element.disabled` | `#2e343e` | `#ebebec` | |
+| `ghost_element.background` | transparent | transparent | Toolbar buttons, list rows: invisible until hovered |
+| `ghost_element.hover` / `.active` / `.selected` | `#363c46` / `#454a56` / `#454a56` | | |
+| `border` | `#464b57` | `#c9c9ca` | Panel edges, dividers |
+| `border.variant` | `#363c46` | `#dfdfe0` | Subtle dividers, popover edges |
+| `border.focused` | `#47679e` | `#7d82e8` | Focus ring |
+| `border.selected` | `#293b5b` | `#cbcdf6` | |
+| `border.disabled` | `#414754` | `#d3d3d4` | |
+| `text` | `#dce0e5` | `#242529` | |
+| `text.muted` | `#a9afbc` | `#58585a` | Secondary labels |
+| `text.placeholder` / `.disabled` | `#878a98` | `#7e8086` | |
+| `text.accent` | `#74ade8` | `#5c78e2` | Links, active items |
+| `icon` / `.muted` / `.disabled` / `.accent` | as `text.*` | as `text.*` | |
+| `drop_target.background` | `#83899480` | | |
+| `scrollbar.thumb.background` | `#c8ccd44c` | | Thumb; `thumb.border #363c46`, track transparent, `track.border #2e333c` |
+| `search.match_background` | `#74ade866` | | |
+| `error` / `.background` / `.border` | `#d07277` / `#d072771a` / `#4c2b2c` | `#d36151` / `#fbdfd9` / `#f6c6bd` | |
+| `warning` (= `modified`, `conflict`) | `#dec184` / `#dec1841a` / `#5d4c2f` | `#a48819` / `#faf2e6` / `#f4e7d1` | |
+| `success` (= `created`) | `#a1c181` / `#a1c1811a` / `#38482f` | `#669f59` / `#dfeadb` / `#c8dcc1` | |
+| `info` (= `renamed`) | `#74ade8` / `#74ade81a` / `#293b5b` | `#5c78e2` / `#e2e2fa` / `#cbcdf6` | |
+| `hint` | `#788ca6` / `#5a6f891a` / `#293b5b` | `#7274a7` / `#e2e2fa` / `#cbcdf6` | |
+| `hidden` / `ignored` / `unreachable` | `#878a98`, `#878a98`, `#a9afbc` | | |
+| `predictive` | `#5a6a87` | `#9b9ec6` | Ghost text |
+| `players[0..7]` cursor | `#74ade8 #be5046 #bf956a #b477cf #6eb4bf #d07277 #dec184 #a1c181` | | Selection = same at alpha `3d` |
+| `terminal.ansi.*` | black `#282c34`, red `#e06c75`, green `#98c379`, yellow `#e5c07b`, blue `#61afef`, magenta `#c678dd`, cyan `#56b6c2`, white `#abb2bf` (+ bright/dim variants in the file) | | |
+
+Syntax colours (keyword `#b477cf`, string `#a1c181`, function `#73ade9`, type
+`#6eb4bf`, comment `#5d636f`, number/boolean `#bf956a`, property `#d07277`, …) ride along
+in the same table for a future editor component and the terminal.
+
+### 5.2 Elevation and shadows
+
+| Elevation | Background token | Shadows (offset, blur, black at alpha) |
+|-----------|------------------|-----------------------------------------|
+| `background` | `background` | none |
+| `surface` | `surface.background` | none |
+| `editor_surface` | `editor.background` | none |
+| `elevated_surface` (popover, menu, tooltip) | `elevated_surface.background` | (0, 2) blur 3 α 0.12; (0, 1) blur 0 α 0.06 dark / 0.03 light |
+| `modal_surface` | `elevated_surface.background` | (0, 2) blur 3 α 0.12 dark / 0.06 light; (0, 3) blur 6 α 0.08 / 0.06; (0, 6) blur 12 α 0.04; (0, 1) blur 0 α 0.12 / 0.04 |
+
+Elevated and modal surfaces carry a 1 px `border.variant` border. These map one to one
+onto `shadow` primitives (one per entry) and a `quad`.
+
+### 5.3 Spacing
+
+Zed's `DynamicSpacing`, in px at the default rem, three densities:
+
+| Step | compact | default | comfortable |
+|------|---------|---------|-------------|
+| b00 / b01 / b02 / b03 | 0 / 1 / 1 / 2 | 0 / 1 / 2 / 3 | 0 / 2 / 4 / 4 |
+| b04 / b06 / b08 | 2 / 3 / 4 | 4 / 6 / 8 | 6 / 8 / 10 |
+| b12 / b16 / b20 | 10 / 14 / 18 | 12 / 16 / 20 | 14 / 18 / 22 |
+| b24 / b32 / b40 / b48 | 20 / 28 / 36 / 44 | 24 / 32 / 40 / 48 | 28 / 36 / 44 / 52 |
+
+### 5.4 Typography
+
+| | Value |
+|--|-------|
+| rem | `ui_font_size` = 16 px; everything scales with it |
+| UI text | `TextSize::Default` 14 px (0.875 rem); `Small` 12; `XSmall` 10; `Large` 16. Line height is GPUI's `TextStyle` default, φ = 1.618 relative (`phi()`), unless a component sets its own |
+| Headlines | 0.88 / 1.0 / 1.125 (default) / 1.27 / 1.43 rem, line height 1.6 rem |
+| Buffer (editor, terminal) | 15 px, line height `comfortable` 1.618 (`standard` 1.3) |
+| Weights | 400 regular; 700 for `emphasis.strong`; italic for links and predictive text |
+| UI family | Zed ships "Zed Plex Sans" (an IBM Plex Sans fork, OFL). Lumen bundles **IBM Plex Sans** under `assets/fonts/` with fallback to the fontconfig `sans-serif` match (DejaVu Sans on this host) |
+| Mono family | Zed's `.ZedMono` aliases **Lilex** (OFL); Lumen bundles Lilex; JetBrains Mono (installed here) is the first fallback |
+
+### 5.5 Shape, borders, iconography, motion
+
+- Radii, GPUI's scale on a 16 px rem (`gpui_macros` `corner_suffixes`): `xs` 2 px
+  (badges, key hints), `sm` 4 px (buttons, list rows, inputs), `md` 6 px (popovers,
+  tooltips, menus), `lg` 8 px (modals), `xl` 12 px, `full` for pills. Tabs, panels and
+  dividers are square.
+- Borders are always 1 px: `border` between regions, `border.variant` inside a region,
+  `border.focused` as the focus ring (no glow, no offset).
+- Icons are 16 px monochrome (14 px `small`, 12 px `xsmall`), tinted with `icon.*`. Zed's
+  own set is bespoke; Lumen bundles **Lucide** (ISC) at the same sizes and rasterises each
+  `(icon, size, scale)` once on the worker into the R8 atlas (`librsvg` under
+  `LUMEN_HAS_RSVG`, as `lx.shell` already links it).
+- Motion is restrained: popovers and tooltips fade in over 100–150 ms ease-out, tooltips
+  after a 500 ms hover delay; nothing bounces; `reduced_motion` (already in `focus_style`)
+  removes all transitions.
+- Hover is a background change only (`element.hover` / `ghost_element.hover`), never a
+  colour change of the label. Selected rows use `ghost_element.selected`; the keyboard
+  focus ring and the selection are separate states.
+
+### 5.6 Component set (first release)
+
+`label`, `headline`, `icon`, `button` (filled, outlined, ghost, with icon), `icon_button`,
+`toggle`, `checkbox`, `switch`, `text_input` (caret, selection, IME through
+text-input-v3), `list` + `list_item` (keyboard navigable, virtualised past 100 rows),
+`scroll_area` with the Zed scrollbar, `tab_bar` + `tab`, `divider`, `tooltip`,
+`popover_menu`, `context_menu`, `modal`, `toast`, `progress`, `panel` (toolbar + body),
+`status_bar`, `key_binding` hint, `avatar`. The shell panel and launcher are built only
+from these.
+
+---
+
+## 6. Comparison
+
+Where Lumen matches the field and where it goes past it, per the project's bar; §8.6
+turns the claims into numbers on the same host.
+
+| Engine | Model | What Lumen takes | Where Lumen goes further |
+|--------|-------|------------------|---------------------------|
+| **GPUI** (Zed) | Immediate element tree, Taffy, 7 instanced kinds, SDF quads, erf shadows, atlas sprites, (order, kind) batching, Blade/Vulkan | All of the renderer design and the visual language | Retained tree with cached layout; damage + buffer age; allocation-free frames; GL and CPU backends; dmabuf + explicit sync; HDR-capable `f16` path; Zed themes without Zed |
+| **egui** | Immediate mode, one textured-triangle mesh, tessellated rounding | Nothing in the renderer | Analytic AA (no tessellation), text in an atlas with subpixel variants, idle at 0 frames, batches by kind rather than one mesh per frame |
+| **Flutter / Impeller** | Retained layer tree, Vulkan/Metal, stencil-cover paths, SDF text optional | Damage via layer raster cache | Lumen needs no raster cache because primitives are cheap; Impeller's per-draw uniform binding is replaced by instancing |
+| **GTK 4** (ngl / Vulkan) | Retained render-node tree, diffed per frame, rounded-rect and shadow shaders, glyph atlas | Node-diff damage is the same idea as the ledger | GTK re-uploads and rebinds per node; Lumen instances. GTK blends in sRGB too |
+| **Qt Quick** | Scene graph, batched geometry, distance-field text | Batching across the tree | Qt tessellates rounded rectangles and uses distance-field glyphs (soft at small sizes); Lumen's quads are analytic and glyphs are rasterised per subpixel variant |
+| **Slint** | Retained, FemtoVG/Skia or software | Software renderer for small devices | Same set of primitives on all three backends with golden parity |
+| **WebRender** | Retained display list, GPU cache textures, picture caching | The idea that instances stay small | Not needed: a desktop UI has 10³–10⁴ primitives, not 10⁶ |
+| **Vello** | Compute rasteriser, arbitrary paths | Nothing yet | Deferred: UI scenes are quads and glyphs; revisit if S12 (paths) matters |
+
+Honest gaps: GPUI's element library and Zed's component polish are years ahead; Lumen's
+first component set is §5.6. GPUI's subpixel (LCD) sprite kind is deferred here. Impeller
+and Skia have better arbitrary-path quality than the winding-tile approach.
+
+---
+
+## 7. Realization plan
+
+Each phase ends with its gate from §3 green on the host in F8 (GL and CPU backends) and
+the Vulkan backend green under lavapipe for correctness only. Effort is a rough size for
+one focused developer; it is an ordering aid, not a commitment.
+
+### Phase 0 — Foundations and measurement first (≈1 week)
+
+- `lx.gfx:primitives`: the structs of §4.2, `static_assert`ed sizes, packing helpers
+  (`f16`, premultiply once).
+- `lx.scene::draw_list` v3: primitive stream + index array, overlap grid, `(order, kind,
+  page)` sort reusing the `order_` scratch; `surface` kind wraps today's `draw_command`
+  unchanged so the compositor keeps working.
+- Fix `draw_scope::fill` (set `solid`), `LX_TRACE_SCOPE` (`__COUNTER__`), call
+  `budget_tracker::end_tick_render`; add spans `ui.describe`, `ui.layout`, `ui.emit`,
+  `ui.encode`, `ui.submit` and counters `ui.primitives`, `ui.batches`, `ui.instance_bytes`,
+  `ui.damage_px`, `ui.atlas_upload_bytes`.
+- `tests/bench_ui.cpp` → `lumen-ui-bench` with the JSON schema of §8.5, scenarios S1–S3
+  running against the CPU reference renderer; `scripts/ui-bench.sh`; CTest label `bench`
+  and `ctest -LE bench` as the default; `tests/bench/baseline/<host>.json` committed.
+- Gate: G9 by `static_assert`; the bench prints and stores numbers.
+
+### Phase 1 — The primitive renderer (≈3 weeks)
+
+- `lx.gfx:ui_cpu` first (the reference: SDF per pixel, exact, slow is fine), then
+  `:ui_vk` (7 pipelines, instance ring, `VkPipelineCache` on disk, timestamp queries),
+  then `:ui_gl` (GLES 3.1 SSBO + instancing, program binary cache).
+- `lx.gfx:atlas` with shelf packing, page rebuild on the worker, staged uploads.
+- Golden-image tests per primitive per backend (§8.4) with the parity thresholds of G10;
+  the sRGB-space blending of §4.5 checked against a reference PNG rendered by the CPU path.
+- The three compositors accept the stream: `quad` and `shadow` reach the screen through
+  `frame_node` for server-side decorations (title text stays CPU-rasterised until Phase 2).
+- Gate: G3 and G10 on GL and CPU here; Vulkan parity on lavapipe.
+
+### Phase 2 — Text (≈3 weeks)
+
+- `lx.text` partitions of §4.6; `text_node` emits `mono_sprite` runs from a retained
+  `text_layout`; emoji as `poly_sprite`; `underline` for links and spell marks.
+- Shape cache, face LRU, fallback itemisation, UAX #14 breaking, ellipsis; bidi correct
+  for Arabic and Hebrew test strings in `tests/test_text_lines.cpp`.
+- Title bars switch to atlas glyphs. `lx.shell`'s `shm_canvas::text` is left until Phase 5.
+- Gate: G4 (S4) on GL; `test_text_raster` and `test_text_shaping` extended, not replaced.
+
+### Phase 3 — Layout, style, theme, components (≈2 weeks)
+
+- `lx.layout:flex` with the per-node cache; `grow_node::grow_factor()` finally read.
+- `style` value + builder; `lx.ui:theme` binary format; `tools/lumen-theme` compiling
+  `assets/themes/one-dark.json` and `one-light.json` (Zed schema) at build time; bundled
+  fonts and Lucide icons under `assets/`.
+- Components of §5.6 as `ui_node`s; focus and keyboard navigation on the new tree
+  (`focus.cppm` rewritten off `widget*`); `reducer_node` wired into `ui_root`.
+- Gate: G2 on a synthetic panel tree (S2); a screenshot of the component gallery reviewed
+  against Zed side by side.
+
+### Phase 4 — The client runtime (≈3 weeks)
+
+- `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,
+  `zwp_linux_dmabuf_v1` v5 feedback, `wp_linux_drm_syncobj_v1`, `wp_viewporter`,
+  `wp_fractional_scale_v1`, `wp_presentation`, `zwp_text_input_v3`, `wl_seat`), moving the
+  shell's existing hand-written bindings where they fit.
+- `lx.app:window` with the swapchain tiers of §4.10, input routing into `ui_node::on_*`,
+  the frame loop of §4.9, damage reporting, idle rule.
+- `lumen-hello` shows a window; `lumen-ui-bench --client` runs S1, S5, S7, S9, S10 against
+  the live compositor; `scripts/ui-bench.sh --e2e` joins injector timestamps with
+  `compositor.latency: present` lines the way `drag-smoke.sh` does.
+- Gate: G1, G5, G6, G7, G11.
+
+### Phase 5 — Adoption and deletion (≈2 weeks)
+
+- `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;
+  the background keeps its single-pixel-buffer and worker-rendered image paths.
+- Delete `lx.ui:widgets`, `:widget_node`, `lx.ui.builder` and `gfx::render_pass`
+  (ADR-005 F7, step 13); `lx.app` no longer imports the builder.
+- Compositor decorations fully on primitives; `compositor_impl` passes the stream through.
+- Docs: `docs/subsystems/ui-engine.md` (this design as current), ui-architecture.md §9
+  rewritten, rendering-performance.md gains a UI section with the measured tables,
+  api/README.md and architecture.md §3 for the new partitions, UML for the client frame
+  loop and the swapchain.
+- Gate: G8; `scripts/app-smoke.sh` and `drag-smoke.sh` unchanged and green; the §8.6
+  comparison table filled in for GPUI, egui and GTK 4 on this host.
+
+### Phase 6 — Measured optimisations (ongoing, each behind a benchmark)
+
+Taken only when S-scenario numbers justify them, in this order of expected value:
+subtree emit caching (skip re-emitting clean subtrees; measure on S5 with 10 000 rows),
+LCD subpixel text via dual-source blending, 4× MSAA or analytic coverage for `path`,
+Oklab gradients, descriptor indexing for surfaces, worker-thread shaping threshold tuning,
+Vulkan 1.3 dynamic rendering (with ADR-005 D4), a render thread for clients if S3 shows a
+submit cost worth hiding.
+
+---
+
+## 8. Benchmarking plan
+
+### 8.1 Principles
+
+- **Measure the pipeline stage, not the frame.** Every number is attributed to
+  `describe | reconcile | layout | emit | order+sort | encode | submit | gpu | present`
+  through the spans and counters of Phase 0, exported as a Chrome trace
+  (`LUMEN_TRACE_FILE`) and summarised by the bench.
+- **Report distributions.** p50 / p95 / p99 / max over ≥ 600 frames after 120 warm-up
+  frames; a scenario fails on p95, not on the mean.
+- **Same host, same conditions.** Release preset, `performance` governor where it exists,
+  bench process pinned to one core and the compositor to the other on this 2-core VM,
+  display at the native mode, nothing else running. The JSON records kernel, Mesa and
+  driver versions, `GL_RENDERER` / `VkPhysicalDeviceProperties`, git SHA, and the preset.
+- **Backends are measured separately and never averaged.** The GL and CPU rows on
+  this host are the regression gate; Vulkan rows on lavapipe are parity-only and labelled
+  `software`. Hardware Vulkan numbers come from a second host and sit in their own
+  baseline file.
+- **Nothing is asserted that the bench did not print.** Tables in docs cite the JSON file
+  they came from.
+
+### 8.2 Metrics
+
+| Group | Metric | Source |
+|-------|--------|--------|
+| CPU | per-stage µs (p50/p95/p99), UI-thread µs per frame, worker µs per frame | spans |
+| GPU | per-kind batch µs (Vulkan timestamps / `GL_EXT_disjoint_timer_query`), fence-wait wall time fallback, submit→fence µs | backend |
+| Work | primitives, batches, draw calls, instance bytes, atlas uploads (count, bytes), damage px and rects, occluded primitives | counters |
+| Memory | `heaptrack` allocations in the steady window (must be 0), `mallinfo2` delta, RssAnon, atlas bytes, ring bytes, VRAM via `VK_EXT_memory_budget` when available | bench + `/proc` |
+| Power / idle | voluntary + involuntary context switches over 10 s idle (`/proc/PID/status`), wakeups/s (`perf stat -e context-switches,cpu-clock`), GPU busy where the driver exposes it (`gpu_busy_percent` on amdgpu, `intel_gpu_top` on i915; none on vmwgfx) | scripts |
+| Latency | input → present (injector timestamp → `wp_presentation` feedback and the compositor's `compositor.latency: present` line), frame callback → commit | `ui-bench --e2e` |
+| Start-up | `exec` → first commit, first commit → first present, pipeline-cache hit or miss | timeline instants |
+| Correctness | golden image diffs per backend; frames with p99 > 2 × p50 (jank count) | tests + bench |
+
+### 8.3 Scenarios (`lumen-ui-bench --scenario <id>`)
+
+Deterministic (seeded), each with a headless mode (CPU backend, no compositor) and a
+client mode (live compositor). Sizes are the defaults; `--scale` multiplies them.
+
+| Id | Scene | Exercises | Gate |
+|----|-------|-----------|------|
+| S1 | Empty window, 10 s | idle rule | G1 |
+| S2 | Shell panel replica: 24 cells, clock cell updates once per second for 60 s | retained tree, layout cache, damage locality | G2 |
+| S3 | 10 000 rounded quads with borders in a grid, each drifting | emit, order grid, encode, instancing throughput | G3 |
+| S4 | 2 000 lines × 50 glyphs of mixed Latin/Cyrillic/Arabic, scrolling 3 px per frame | shape cache, atlas, mono sprite batches, bidi correctness | G4 |
+| S5 | 1 000-row list, pointer moves one row per frame | hover damage ≤ 2 rects, no relayout outside two rows | G2, G5 |
+| S6 | Modal with the 4-shadow stack over S4 | shadow fragment cost, overlay ordering | G10 |
+| S7 | 30 resizes of a text window, 200 ms apart | relayout, swapchain reallocation, heap | G11 |
+| S8 | Launcher open / type three letters / close, 20 times | real shell path: popup, text input, list virtualisation | G2, G6 |
+| S9 | Hover a button, 125 Hz injected motion, 3 s | input → photon | G6 |
+| S10 | Cold start of `lumen-hello` ×10, with and without the pipeline cache | start-up | G7 |
+| S11 | 400 icons + 100 images in a grid, 4 scales | poly atlas, SVG raster on worker, rounded sprites | G10 |
+| S12 | 1 000 vector paths (icons as paths rather than sprites) | path coverage pass | informs Phase 6 |
+
+### 8.4 Golden images and parity
+
+`tests/test_ui_golden.cpp` renders a fixed set of primitive cases (radii 0/2/6/8/full,
+border widths 0–3, dashed, gradients at 0°/45°/90°, the five shadow entries of §5.2, a
+text block at 10/12/14/16 px and scales 1/1.25/1.5/2, emoji, underlines, a clipped
+sprite) on every available backend and compares against the CPU reference with the
+G10 thresholds. The reference PNGs are committed; a change to them is a reviewed change.
+A second case set renders the same block in sRGB-space and linear-space blending and
+asserts the `text.contrast` correction keeps the mean stem coverage within 3 %.
+
+### 8.5 Harness and regression gate
+
+- `lumen-ui-bench` prints a table and writes `bench-<scenario>-<backend>.json`:
+  `{host, driver, git, preset, scenario, backend, frames, stages:{name:{p50,p95,p99,max}},
+  counters:{…}, memory:{…}, gpu:{…}}`.
+- `scripts/ui-bench.sh [--backend gl|cpu|vulkan] [--e2e] [--compare baseline.json]`
+  builds release, runs every scenario on every available backend, stores results under
+  `tests/bench/results/<host>-<driver>/<date>-<sha>.json`, and compares against
+  `tests/bench/baseline/<host>-<driver>.json`: **fail** on p95 regressions above 10 % for
+  any stage, on any steady-frame allocation, on a draw-call count above the scenario's
+  cap, or on a golden diff; **warn** at 5 %. Updating a baseline is a deliberate commit.
+- CTest: label `bench`; the default `ctest` run excludes it; `ctest -L bench` runs the
+  headless rows in under two minutes.
+- End-to-end (`--e2e`) reuses `scripts/inject-input.py` and the `--join-seat-session`
+  machinery of `drag-smoke.sh`; both processes write Chrome traces on the same
+  `CLOCK_MONOTONIC`, merged into one Perfetto view per run.
+
+### 8.6 Comparison protocol
+
+The same scenes in other engines, on this host, observed from outside the process so no
+engine is instrumented differently: process CPU time from `/proc/PID/stat`, RssAnon,
+context switches at idle, commit rate and present latency from the compositor's own
+`compositor.latency` debug lines (it sees every client the same way), and start-up as
+the launcher's `exec` timestamp to that client's first `surface.apply` span in the
+compositor's Chrome trace (both on `CLOCK_MONOTONIC`).
+
+| Engine | Scenes | How |
+|--------|--------|-----|
+| GPUI | S1, S3, S4, S5 | `gpui` examples adapted from `crates/gpui/examples` (`hello_world`, `text`, a list); Vulkan required — runs on the hardware-Vulkan host only |
+| egui (`eframe`, glow) | S1, S3, S4, S5 | The `egui_demo_app` widget gallery plus a text-wall demo |
+| GTK 4 | S1, S4, S5 | `gtk4-widget-factory` (installed) with `GSK_RENDERER=ngl` and `vulkan` |
+| Slint | S1, S3, S5 | Gallery example, FemtoVG and software renderers |
+| Qt Quick / Flutter | if installed | `qml` text wall; Flutter desktop gallery with Impeller |
+
+Results go into `docs/subsystems/ui-engine.md` as a table with the host description, the
+file they came from, and one line per engine on what was not comparable.
+
+### 8.7 What success looks like in the docs
+
+After Phase 5, rendering-performance.md §1.2 has a "Measured: UI" block in the same
+style as the compositor's, with the G1–G11 rows filled from JSON, and a sentence per row
+on what moved it. AGENTS.md §5 "Performance invariants" gains: *primitive stream and
+instance ring are fixed-capacity; a steady UI frame allocates nothing; idle windows
+request no frame callback; themes are compiled, not parsed at runtime.*
+
+---
+
+## 9. Risks and open questions
+
+| Risk | Mitigation |
+|------|------------|
+| No hardware Vulkan on the development host | GL and CPU are the gate here; a hardware-Vulkan host is needed before Phase 1 is called done for Vulkan. Lavapipe parity catches logic errors, not performance |
+| SVGA3D may not expose `GL_EXT_disjoint_timer_query` | Fence-wait wall time is the fallback and is labelled as such in the JSON |
+| Text that looks thinner or heavier than Zed's | §4.5 blends in the encoded space by default, as GPUI does; the linear path's contrast exponent is validated by the golden set before it is used anywhere |
+| Zed theme schema changes | The compiler pins `v0.2.0` and reports unknown keys; older themes load |
+| Fonts and icons licensing | IBM Plex Sans and Lilex are OFL, Lucide is ISC; Zed's own icon set is not bundled |
+| Descriptor indexing or `f16` attributes missing on old GPUs | Sampler arrays are fixed at 16 and `f16` is only used for colours; both are Vulkan 1.1 / GLES 3.1 core |
+| Compositor regressions while the stream replaces `blit_command` | Phase 0 keeps `surface` byte-compatible; `test_dmabuf_composite`, `test_gl_composite`, `test_cpu_composite`, app-smoke and drag-smoke must stay green at every phase |
+| Scope creep into an editor | The component set is §5.6; syntax tables are compiled but no editor component is in this plan |
+
+Open: whether `lx.shell` keeps a CPU fallback for the panel on GLES 2 hosts (the CPU
+renderer already covers it, at a measured cost in S2), and whether the compositor should
+share one atlas across its outputs at different scales (one page per scale is the
+first answer).
+
+---
+
+## 10. Document maintenance
+
+| Phase | Update |
+|-------|--------|
+| 0 | `docs/api/README.md` (`lx.gfx:primitives`), rendering-performance.md §6 (batching now real) |
+| 1 | rendering-performance.md §1.2 (UI measured block), UML 33 (pools: ring, atlas, pipeline cache) |
+| 2 | ui-architecture.md §6 (text emission), a `docs/subsystems/text.md` |
+| 3 | ui-architecture.md §§4–5, 9; `docs/api/README.md` (style, theme, components) |
+| 4 | threading.md (client frame loop), memory-management.md §3 (new caps), architecture.md §2.3 and §6 |
+| 5 | This ADR → Accepted; `docs/subsystems/ui-engine.md`; architecture.md §13 status table; AGENTS.md §5 invariants |
