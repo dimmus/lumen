@@ -39,6 +39,7 @@ flowchart TB
         ASYNC["lx::async"]
         TRACE["lx::trace"]
         HEALTH["lx::health"]
+        CONFIG["lx::config"]
     end
 
     subgraph Foundation["Foundation Layer"]
@@ -59,6 +60,8 @@ flowchart TB
     COMP --> INPUT
     COMP --> DRM
     COMP --> HEALTH
+    COMP --> CONFIG
+    SHELL --> CONFIG
     SCENE --> GFX
     SCENE --> LAYOUT
     SCENE --> SCHED
@@ -73,6 +76,7 @@ flowchart TB
     RT --> TRACE
     HEALTH --> RT
     HEALTH --> TRACE
+    CONFIG --> FOUND
     ASYNC --> SYNC
     ASYNC --> EXEC
     SCENE --> SYNC

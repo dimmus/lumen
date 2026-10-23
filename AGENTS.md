@@ -117,12 +117,18 @@ Foundation → Runtime → Platform → Graphics → Compositor → Desktop → 
 
 | Owns | Process | Must NOT |
 |------|---------|----------|
-| Display socket, DRM, all protocol objects, `zlm_toplevel_v1` | `lumen-compositor` | Run shell panel logic in compositor |
-| WM **intent** (raise, tile, workspace UI) | `lumen-shell` | Mutate compositor scene graph or client surfaces directly |
+| Display socket, DRM, all protocol objects, `zlm_toplevel_v1`; workspace state, the key-binding table, config reload, the control socket | `lumen-compositor` | Run shell panel logic in compositor |
+| WM **intent** (raise, tile) and all desktop UI (panel, launcher, workspace indicator, Alt+Tab switcher, notifications, tray) | `lumen-shell` | Mutate compositor scene graph or client surfaces directly |
 | App windows | user apps | Bind `zlm_shell_v1` or reference `zlm_toplevel_v1` |
 
 **Shell decides intent → compositor executes state.** Wire format:
 `zlm_policy_bridge_v1` (see shell-state-sync doc).
+
+Refinement ([ADR 010](docs/adr/010-session-and-window-management.md)): the key → action
+mapping is user configuration the compositor interprets, so window and workspace actions keep
+working while the shell restarts; `shell.*` actions are forwarded to the shell. Workspaces are
+compositor state served as `ext-workspace-v1`; the shell's indicator is a client of it. Every UI
+decision stays in the shell.
 
 ### 3.3 Thread ownership check
 
@@ -324,7 +330,9 @@ modules/
 ├── lx.wayland.*/      server, client, protocols (generated)
 ├── lx.drm/            KMS, atomic commit, kms_damage
 ├── lx.input/          libinput seat
-├── lx.session/        logind, privilege
+├── lx.session/        logind, privilege, user session (sd_notify, environment export)
+├── lx.config/         config.toml: TOML reader, schema, actions
+├── lx.health/         health report (pulled on request; served by lumen-ctl)
 ├── lx.gfx/            Vulkan, dmabuf, syncobj, import_cache
 ├── lx.scene/          scene graph, snapshot_buffer (triple-buffer + back-pressure)
 ├── lx.layout/         flex/grid
@@ -339,6 +347,8 @@ modules/
 executables/
 ├── lumen-compositor/
 ├── lumen-shell/
+├── lumen-ctl/              control tool (Varlink io.lumen.Compositor)
+├── xdg-desktop-portal-lumen/
 └── lumen-hello/
 
 protocols/             manifest.toml, lumen/*.xml, upstream/*

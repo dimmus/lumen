@@ -26,6 +26,7 @@ import :layer_shell;
 import :dnd;
 import :liveness;
 import :activation;
+import :workspaces;
 
 export namespace lx::compositor {
 
@@ -56,6 +57,52 @@ struct wm_grab {
     bool motion_pending = false;
     /// Last size asked of the client, so an unchanged target writes nothing.
     lx::size2i last_target{};
+    /// window.move-keyboard / window.resize-keyboard (design-session-and-wm K.6): no button
+    /// holds it. The arrow keys move the pointer, Return or any button press ends it.
+    bool keyboard = false;
+    /// A keyboard resize: the axes whose edge an arrow key has picked (`edge_*` bits).
+    unsigned picked = 0;
+    /// A move of a maximized or snapped window that has not travelled 8 px yet (K.5).
+    bool restore_pending = false;
+    /// Drag-to-restore sent its configure; until the commit answering it, motion moves where
+    /// the restored window lands instead of the window.
+    bool awaiting_restore = false;
+    /// What drag-to-restore undid, put back by Escape: snap bits, or maximized.
+    unsigned restored_snap = 0;
+    bool restored_max = false;
+    /// The window's normal geometry: what a snap made at the release goes back to.
+    lx::rect2i normal{};
+    /// The edge zone under the pointer (K.4: snap bits, or `k_snap_maximize`) and the output
+    /// it is on (-1: none).
+    unsigned zone = 0;
+    int zone_output = -1;
+};
+
+/// config.toml [windows] (design-session-and-wm C.2, K.3–K.5).
+struct wm_window_config {
+    /// A move dropped at an outer edge of the layout snaps (halves, quarters, maximize).
+    bool edge_snap = true;
+    /// Logical px from an outer edge that make the zone, and along an edge that make a corner.
+    int edge_snap_distance = 8;
+    int edge_snap_corner = 64;
+    /// The translucent rect showing where the window will go.
+    bool snap_preview = true;
+    /// A move of a maximized or snapped window restores its size under the pointer.
+    bool drag_restore = true;
+};
+
+/// `next_snap`'s and `edge_snap_zone`'s "maximize", beside the `edge_*` bits of a snap.
+inline constexpr unsigned k_snap_maximize = 0x10;
+/// The Super+arrow keys of snapping.
+enum class snap_key : unsigned char { left, right, up, down };
+/// What a snap key does to a window (`next_snap`).
+enum class snap_move : unsigned char { none, snap, maximize, restore, minimize };
+struct snap_step {
+    snap_move move = snap_move::none;
+    /// snap_move::snap: the half or quarter (`edge_*` bits).
+    unsigned snap = 0;
+    /// -1 / +1: on the output to the left / right (nothing when there is none).
+    int output_dx = 0;
 };
 
 /// Wire operations the window manager needs, installed by the protocol layer so that no
@@ -112,6 +159,31 @@ struct wm_hit {
 
 struct wm_hit;
 
+/// Told after every operation that changed workspaces or a window's membership (design
+/// Part W): ext-workspace and the control socket follow the model from here.
+struct workspace_observer {
+    void (*changed)(void* user) = nullptr;
+    void* user = nullptr;
+};
+
+/// How focus follows the pointer (config.toml [focus]).
+struct wm_focus_policy {
+    /// Focus follows the pointer into a window (kept over the desktop); else click to focus.
+    bool sloppy = false;
+    bool raise_on_click = true;
+    bool raise_on_sloppy = false;
+};
+
+/// What a configured pointer-button binding asks of a press (`set_button_binding`).
+enum class wm_button_binding : unsigned char {
+    none,
+    /// window.move-interactive / window.resize-interactive on the window under the pointer.
+    move,
+    resize,
+    /// Another action, already executed by the hook: the press (and release) is consumed.
+    consumed,
+};
+
 /// The session lock's side of input (ext-session-lock-v1), installed by the compositor so
 /// the lock records stay out of this partition. Consulted only while the session is locked.
 struct wm_lock_ops {
@@ -155,8 +227,33 @@ public:
     [[nodiscard]] scene::node_kind kind() const override;
     using scene::scene_node::emit_draws;
     void emit_draws(scene::draw_list& out, const scene::emit_context& ctx) const override;
-    /// Texture id of the 1×1 opaque black image it draws scaled.
-    static constexpr unsigned k_texture_id = 0x7FFF'FE00u;
+    /// Texture id of the 1×1 opaque black image it draws scaled. Its own: the decoration
+    /// atlas is 0x7FFF'FE00 (the two shared it, so a fullscreen window's backdrop replaced the
+    /// server-side frames' atlas).
+    static constexpr unsigned k_texture_id = 0x7FFF'FD00u;
+    void show(lx::rect2i logical);
+    void hide();
+    [[nodiscard]] bool shown() const { return shown_; }
+    [[nodiscard]] lx::rect2i rect() const { return rect_; }
+
+private:
+    lx::rect2i rect_{};
+    bool shown_ = false;
+};
+
+/// The edge-snap preview (design-session-and-wm K.4): where a dragged window will go if it is
+/// dropped now — a translucent accent rect with a 1 px border, in its own layer between the
+/// windows and the top layer-shell layer (so in output captures, never in a window's). Two
+/// 1×1 premultiplied textures stretched: five draws while shown, none otherwise; damaged
+/// only when it appears, moves or goes.
+class snap_preview final : public scene::scene_node {
+public:
+    ~snap_preview() override;
+    [[nodiscard]] scene::node_kind kind() const override;
+    using scene::scene_node::emit_draws;
+    void emit_draws(scene::draw_list& out, const scene::emit_context& ctx) const override;
+    static constexpr unsigned k_fill_texture = 0x7FFF'FD01u;
+    static constexpr unsigned k_border_texture = 0x7FFF'FD02u;
     void show(lx::rect2i logical);
     void hide();
     [[nodiscard]] bool shown() const { return shown_; }
@@ -191,6 +288,104 @@ public:
     /// above (overlay, top) and below (bottom, background) the windows, and its keyboard
     /// interactivity takes part in keyboard-focus resolution.
     void set_layers(layer_shell* layers);
+    void set_focus_policy(const wm_focus_policy& p) { focus_ = p; }
+    [[nodiscard]] const wm_focus_policy& focus_policy() const { return focus_; }
+    /// The configured pointer-button bindings (config.toml, e.g. Super+BTN_LEFT): asked on
+    /// every press outside a grab, a drag, a popup grab and the lock. Null: none.
+    using button_binding_fn = wm_button_binding (*)(void* user, unsigned button, unsigned time_ms);
+    void set_button_binding(button_binding_fn fn, void* user) {
+        button_binding_ = fn;
+        button_binding_user_ = user;
+    }
+    /// window.move-to-output-{left,right,up,down}: the window goes to the nearest output in
+    /// that direction (dx, dy one of ±1, 0), keeping its place relative to the usable area
+    /// as hotplug evacuation does; maximized and fullscreen windows fill the new output.
+    /// False when there is none that way.
+    bool move_to_output(lx::toplevel_id id, int dx, int dy);
+    /// The nearest live output from `slot` in direction (dx, dy), or -1.
+    [[nodiscard]] int neighbour_output(int slot, int dx, int dy) const;
+
+    // ── Snapping, edge snapping, keyboard move/resize (design-session-and-wm Part K) ──
+
+    /// config.toml [windows]. A drag in progress keeps the values it started with only for
+    /// what it already decided (a restore, a zone shown).
+    void set_window_config(const wm_window_config& c);
+    [[nodiscard]] const wm_window_config& window_config() const { return window_cfg_; }
+    /// window.snap-left/right/up/down: Windows 11's Super+arrows (`next_snap`), applied like
+    /// maximize: one configure, the window placed by the commit answering it. False when it
+    /// changes nothing (fullscreen, no output beyond the edge, an arrow that leads nowhere).
+    bool snap_by_key(lx::toplevel_id id, snap_key key, const char* source);
+    /// Snaps `id` to `snap` (a half or a quarter, `edge_*` bits) of output `slot`'s usable
+    /// area, keeping its normal geometry (`restore`) to go back to; 0 restores that geometry.
+    /// Unmaximizes it first when it was maximized. Tiled states go with the configure.
+    void set_snap(lx::toplevel_id id, unsigned snap, int slot, const char* source);
+    /// The edge-snap preview's layer (between the windows and the top layer-shell layer).
+    void set_snap_preview_layer(scene::container_node* layer);
+    /// window.move-keyboard / window.resize-keyboard: an interactive move or resize of `id`
+    /// with no button held (K.6). The pointer is warped to the window's centre (move) or the
+    /// frame's bottom-right corner (resize) and drives it as in a button grab; the arrow keys
+    /// move the pointer by 10 logical px (Ctrl: 1), and for a resize the first arrow of an
+    /// axis picks that edge; Return or a button press applies, Escape cancels.
+    bool begin_keyboard_grab(lx::toplevel_id id, grab_mode mode);
+    /// How a keyboard grab moves the pointer (the compositor's warp: seat, cursor, then
+    /// `on_pointer_motion`). Without it there are no keyboard grabs.
+    void set_warp(void (*fn)(void* user, double x, double y), void* user) {
+        warp_ = fn;
+        warp_user_ = user;
+    }
+    /// switcher.next with no shell to run it: the topmost shown window that does not have the
+    /// keyboard is activated (a usable quick switch while the shell restarts). False when
+    /// there is none.
+    bool quick_switch();
+
+    // ── Workspaces, minimize, sticky (design-session-and-wm Part W) ──
+
+    /// config.toml [workspaces] (mode, count, names, switch-on-activate, move-follows).
+    void set_workspace_config(const workspace_config& c);
+    [[nodiscard]] const workspace_model& workspaces() const { return workspaces_; }
+    void set_workspace_observer(workspace_observer o) { ws_observer_ = o; }
+    /// Workspaces for every live output that has none (`add`: start-up, an ext-workspace
+    /// bind, a map; outputs added later get theirs in `on_output_added`) and none for an
+    /// output that went without `evacuate_output`.
+    void sync_workspace_outputs(bool add);
+    /// mapped ∧ ¬minimized ∧ (sticky ∨ its workspace is active) — or in an interactive grab.
+    [[nodiscard]] bool shown(const toplevel_record& rec) const;
+    /// The output keyboard actions act on: the focused window's, else the pointer's.
+    [[nodiscard]] int focused_output() const;
+    /// Makes `ws` its output's active workspace: windows hide and show, the keyboard goes
+    /// to the window last focused there (else its topmost window, else nowhere) unless it
+    /// is on another output. `source` is logged. False when nothing changed.
+    bool switch_workspace(lx::workspace_id ws, const char* source);
+    /// workspace.switch N on the focused output (dynamic: past the end, the empty last).
+    bool switch_to_index(unsigned index_1based);
+    /// workspace.next / workspace.previous (no wrap).
+    bool switch_relative(int dir);
+    /// Moves `id` (and its children) to workspace `ws` — of another output too, placed
+    /// there as evacuation places windows; with `follow` the workspace becomes active and
+    /// the window keeps the keyboard.
+    bool move_to_workspace(lx::toplevel_id id, lx::workspace_id ws, bool follow,
+                           const char* source);
+    /// workspace.move-window N / move-window-next / -previous (follows with move-follows).
+    bool move_to_index(lx::toplevel_id id, unsigned index_1based);
+    bool move_relative(lx::toplevel_id id, int dir);
+    /// ext-workspace assign: workspace `ws` goes to output `slot`, its windows with it.
+    bool assign_workspace(lx::workspace_id ws, unsigned slot);
+    /// xdg_toplevel.set_minimized, zlm request_minimize, window.minimize (`on`), and an
+    /// activation (`off`). The keyboard leaves a minimized window.
+    void set_minimized(lx::toplevel_id id, bool on, const char* source);
+    /// window.sticky-toggle: shown on every workspace of its output.
+    void set_sticky(lx::toplevel_id id, bool on);
+    /// Tells the observer (ext-workspace, the control socket), then the shell (zlm
+    /// toplevel_workspace), of what changed since the last flush. Every operation above
+    /// ends with it; the compositor also calls it after each dispatch.
+    void flush_workspaces();
+    /// Several operations that clients must see as one change (an ext-workspace commit):
+    /// flushes wait for the outermost `end_workspace_batch`.
+    void begin_workspace_batch() { ++ws_batch_; }
+    void end_workspace_batch() {
+        if (ws_batch_ > 0 && --ws_batch_ == 0)
+            flush_workspaces();
+    }
     void set_protocol_ops(wm_protocol_ops ops) { ops_ = ops; }
     /// Ping/pong liveness (optional): activation and the configure watchdog ping the
     /// client, and the client with the keyboard is pinged periodically from `on_tick`.
@@ -354,8 +549,11 @@ public:
     /// `button` (an evdev code) still held, and for a resize valid non-zero `edges`.
     /// Takes pointer focus away from the client (it gets `leave`), sets the cursor
     /// override and, for a resize, the `resizing` state. Rejections log at debug.
+    /// A move of a maximized or snapped window restores it once the pointer has travelled
+    /// 8 px (drag-to-restore, [windows] drag-restore); a resize of a snapped window ends its
+    /// snap. With `keyboard` no button is held (`begin_keyboard_grab`).
     bool begin_grab(lx::toplevel_id id, grab_mode mode, unsigned edges, grab_source source,
-                    unsigned button);
+                    unsigned button, bool keyboard = false);
     /// xdg_toplevel.move / .resize. `serial` must be the press serial delivered to
     /// `client` (`wl_client*`) and that button must still be held — the rule
     /// `wlr_seat_validate_pointer_grab_serial` applies. Otherwise ignored.
@@ -438,6 +636,12 @@ public:
     /// 0 = bottom; clamped to the top.
     bool restack(lx::toplevel_id id, unsigned index);
     void request_close(lx::toplevel_id id);
+    /// A mapped window in the normal state whose frame reaches outside its output's usable
+    /// area is moved (the least distance) to lie inside it, or to its top-left corner when
+    /// it is larger. For windows that mapped before the session's shell had reserved its
+    /// panel strip (the compositor's placement hold, design-session-and-wm S.2). True when
+    /// it moved.
+    bool fit_into_usable(lx::toplevel_id id);
 
     /// Output `slot`'s logical rect: what its layer surfaces are arranged against, what a
     /// fullscreen window there fills, and what layer-surface popups are constrained to. A
@@ -466,6 +670,8 @@ public:
                 (void)layer->add(&b);
     }
     void set_texture_ops(compositor_texture_ops ops) { tex_ops_ = ops; }
+    /// The edge-snap preview's rect while it is shown (none: empty).
+    [[nodiscard]] lx::rect2i snap_preview_rect() const;
     /// The frame the compositor draws around `rec` in its current state (none: client-side).
     [[nodiscard]] static frame_extents extents_of(const toplevel_record& rec);
 
@@ -529,6 +735,49 @@ private:
     void keep_modals_above(lx::toplevel_id id);
     /// The modal state the shell sees of `id`'s children changed (its mapping, or theirs).
     void emit_children_state(lx::toplevel_id id);
+    // ── workspaces ──
+    /// `rec` joins workspace `ws` (leaving its previous one): counts, the shell's dirty bit.
+    void join_workspace(toplevel_record& rec, lx::workspace_id ws);
+    void leave_workspace(toplevel_record& rec);
+    /// Every mapped window's visibility follows `shown` (O(windows)); a hidden window with
+    /// the keyboard gives it to its output's workspace focus target.
+    void update_visibility();
+    void apply_hidden(toplevel_record& rec, bool hide);
+    /// The window the keyboard goes to on output `slot`'s active workspace: the one last
+    /// focused there if still shown, else the topmost shown window there; null for none.
+    [[nodiscard]] lx::toplevel_id workspace_focus_target(int slot) const;
+    /// After `slot`'s active workspace changed: the keyboard follows unless it is on a shown
+    /// window of another output.
+    void focus_after_switch(int slot);
+    /// Brings a hidden window into view for an activation: unminimized, its workspace
+    /// active (with `switch_ok`). False when it stays hidden.
+    bool reveal(toplevel_record& rec, bool switch_ok, const char* source);
+    void recompute_urgent();
+    /// The configures of windows whose visibility changed (`suspended`), with the focus
+    /// decided since: sent at the end of the operation.
+    void send_visibility_configures();
+    [[nodiscard]] workspace_sink sink();
+    /// The topmost shown window (on `slot`, or anywhere for -1).
+    [[nodiscard]] lx::toplevel_id top_shown(int slot) const;
+    // ── snapping ──
+    /// Puts `rec`'s desired configure at `snap` of `slot`'s usable area (tiled states, the
+    /// place, the outer edges anchored); no restore bookkeeping, no send.
+    void aim_snap(toplevel_record& rec, unsigned snap, int slot);
+    /// Maximizes `rec` (desired) on `slot`; no restore bookkeeping, no send.
+    void aim_maximized(toplevel_record& rec, int slot);
+    /// Sends the configure `rec` now wants when none is in flight (else the flush does).
+    void configure_now(toplevel_record& rec);
+    /// Drag-to-restore: the move has travelled far enough — the window is asked for its
+    /// normal size, placed so the pointer keeps its spot on the title bar.
+    void drag_restore(toplevel_record& rec);
+    /// The edge zone under the pointer during a move, and the preview of it.
+    void update_edge_zone();
+    void show_snap_preview(unsigned zone, int slot);
+    void hide_snap_preview();
+    /// `edge_*` bits of `slot`'s edges at (x, y) that no other output continues.
+    [[nodiscard]] unsigned open_edges(int slot, double x, double y) const;
+    /// A keyboard grab's arrow key: the pointer moves `dx`, `dy` (logical px).
+    void keyboard_grab_step(int dx, int dy);
 
     toplevel_manager* toplevels_ = nullptr;
     surface_manager* surfaces_ = nullptr;
@@ -550,6 +799,9 @@ private:
     wm_ime_ops ime_ops_{};
     /// The session is locked: input goes to lock surfaces only.
     bool locked_ = false;
+    wm_focus_policy focus_{};
+    button_binding_fn button_binding_ = nullptr;
+    void* button_binding_user_ = nullptr;
     wm_grab grab_{};
     /// Buttons whose press never reached a client (the Super binding, presses during a
     /// grab): their release must not reach one either.
@@ -608,6 +860,23 @@ private:
     /// Stacking changed this tick: one stacking_order_changed batch goes to the shell at
     /// the tick (the protocol's "done=1 after the last index in a frame").
     bool stacking_dirty_ = false;
+    workspace_model workspaces_{};
+    workspace_observer ws_observer_{};
+    /// A window's membership changed since the last flush (its `workspace_dirty` is set).
+    bool ws_dirty_ = false;
+    unsigned ws_generation_seen_ = 0;
+    /// Bumped by every change of a window's shown/sticky/minimized state (the observer runs).
+    bool ws_windows_changed_ = false;
+    unsigned ws_batch_ = 0;
+    /// A window's visibility changed: its configure goes out at the end of the operation.
+    bool ws_configures_due_ = false;
+    // ── snapping (Part K) ──
+    wm_window_config window_cfg_{};
+    scene::container_node* snap_preview_layer_ = nullptr;
+    snap_preview preview_{};
+    bool preview_staged_ = false;
+    void (*warp_)(void* user, double x, double y) = nullptr;
+    void* warp_user_ = nullptr;
 };
 
 // ── Pure helpers (exported for tests) ──────────────────────────────────────
@@ -661,6 +930,36 @@ private:
 /// configure is finally answered.
 void shift_anchors(toplevel_record& rec, int dx, int dy);
 
+// ── Snapping (design-session-and-wm K.3–K.5), pure ──
+
+/// Windows 11's Super+arrow table, made total: from a window snapped to `snap` (0: none) or
+/// `maximized`, what `key` does. Left half + Left is the right half of the output to the
+/// left (`output_dx` -1), a top-left quarter + Down the left half, and so on (K.3).
+[[nodiscard]] snap_step next_snap(unsigned snap, bool maximized, snap_key key);
+/// The frame rect of `snap` (a half or a quarter, `edge_*` bits) in `usable`: halves split
+/// the width with the odd pixel to the left one, quarters likewise the height (to the top).
+[[nodiscard]] lx::rect2i snap_frame(lx::rect2i usable, unsigned snap);
+/// The window geometry of a window snapped to `snap`: `snap_frame` minus the frame `ext`. A
+/// window whose `min` (0: none) exceeds that keeps its minimum and is anchored at the snap's
+/// outer corner (KWin); one whose `max` is smaller, likewise.
+[[nodiscard]] lx::rect2i snap_geometry(lx::rect2i usable, unsigned snap, frame_extents ext,
+                                       lx::size2i min, lx::size2i max);
+/// The xdg tiled states of a window snapped to `snap`: each edge lies against the usable
+/// area's edge or the other half / quarter, so all four for any snap; 0 for none.
+[[nodiscard]] unsigned snap_tiled_states(unsigned snap);
+/// The edge zone (K.4) at the pointer (px, py) on output `output` (logical rect): within
+/// `distance` of an edge in `open_edges` (no output continues it there) — the left or right
+/// edge is that half, or the quarter within `corner` of its ends; the top edge maximizes
+/// (`k_snap_maximize`), or near its ends the top quarters; the bottom edge's ends the bottom
+/// quarters. 0 elsewhere.
+[[nodiscard]] unsigned edge_snap_zone(lx::rect2i output, double px, double py,
+                                      unsigned open_edges, int distance, int corner);
+/// Drag-to-restore (K.5): the origin of a frame of size `restored` replacing `frame` under
+/// the pointer (px, py) — the pointer keeps its fraction of the width and its distance from
+/// the top (the title bar it holds), at most the new height.
+[[nodiscard]] lx::point2i drag_restore_origin(lx::rect2i frame, lx::size2i restored, double px,
+                                              double py);
+
 } // namespace lx::compositor
 
 
@@ -704,6 +1003,8 @@ void format_states(unsigned states, char* out, unsigned cap) {
         put("fullscreen");
     if (states & lx::compositor::tl_suspended)
         put("suspended");
+    if ((states & lx::compositor::tl_tiled_all) == lx::compositor::tl_tiled_all)
+        put("tiled");
     if (n == 0)
         std::snprintf(out, cap, "-");
 }
@@ -841,6 +1142,173 @@ void lx::compositor::shift_anchors(toplevel_record& rec, int dx, int dy) {
     shift(rec.acked);
     for (unsigned i = 0; i < rec.sent_count; ++i)
         shift(rec.sent[i]);
+}
+
+lx::compositor::snap_step lx::compositor::next_snap(unsigned snap, bool maximized,
+                                                      snap_key key) {
+    using enum snap_key;
+    const auto to = [](unsigned s, int dx = 0) { return snap_step{snap_move::snap, s, dx}; };
+    constexpr snap_step none{};
+    constexpr snap_step restore{snap_move::restore, 0, 0};
+    const unsigned l = edge_left, r = edge_right, t = edge_top, b = edge_bottom;
+    if (maximized) {
+        switch (key) {
+        case left: return to(l);
+        case right: return to(r);
+        case up: return none;
+        case down: return restore;
+        }
+        return none;
+    }
+    switch (snap) {
+    case 0:
+        switch (key) {
+        case left: return to(l);
+        case right: return to(r);
+        case up: return {snap_move::maximize, 0, 0};
+        case down: return {snap_move::minimize, 0, 0};
+        }
+        break;
+    case edge_left:
+        switch (key) {
+        case left: return to(r, -1);
+        case right: return restore;
+        case up: return to(t | l);
+        case down: return to(b | l);
+        }
+        break;
+    case edge_right:
+        switch (key) {
+        case left: return restore;
+        case right: return to(l, 1);
+        case up: return to(t | r);
+        case down: return to(b | r);
+        }
+        break;
+    case edge_top | edge_left:
+        switch (key) {
+        case left: return to(t | r, -1);
+        case right: return to(t | r);
+        case up: return none;
+        case down: return to(l);
+        }
+        break;
+    case edge_bottom | edge_left:
+        switch (key) {
+        case left: return to(b | r, -1);
+        case right: return to(b | r);
+        case up: return to(l);
+        case down: return none;
+        }
+        break;
+    case edge_top | edge_right:
+        switch (key) {
+        case left: return to(t | l);
+        case right: return to(t | l, 1);
+        case up: return none;
+        case down: return to(r);
+        }
+        break;
+    case edge_bottom | edge_right:
+        switch (key) {
+        case left: return to(b | l);
+        case right: return to(b | l, 1);
+        case up: return to(r);
+        case down: return none;
+        }
+        break;
+    default: break;
+    }
+    return none;
+}
+
+lx::rect2i lx::compositor::snap_frame(lx::rect2i usable, unsigned snap) {
+    lx::rect2i f = usable;
+    // The odd pixel goes to the left (top) part, so the two halves always tile exactly.
+    const int left_w = (usable.width + 1) / 2;
+    const int top_h = (usable.height + 1) / 2;
+    if (snap & edge_left) {
+        f.width = left_w;
+    } else if (snap & edge_right) {
+        f.x = usable.x + left_w;
+        f.width = usable.width - left_w;
+    }
+    if (snap & edge_top) {
+        f.height = top_h;
+    } else if (snap & edge_bottom) {
+        f.y = usable.y + top_h;
+        f.height = usable.height - top_h;
+    }
+    return f;
+}
+
+lx::rect2i lx::compositor::snap_geometry(lx::rect2i usable, unsigned snap, frame_extents ext,
+                                         lx::size2i min, lx::size2i max) {
+    const lx::rect2i f = snap_frame(usable, snap);
+    lx::rect2i g{f.x + ext.left, f.y + ext.top, f.width - ext.left - ext.right,
+                 f.height - ext.top - ext.bottom};
+    if (g.width < 1)
+        g.width = 1;
+    if (g.height < 1)
+        g.height = 1;
+    // Limits the client set win: the window keeps the outer corner of its place (a right
+    // half too narrow for its minimum still touches the right edge).
+    const auto clamp_axis = [](int& pos, int& len, int lo, int hi, bool far_edge) {
+        const int want = len;
+        if (lo > 0 && len < lo)
+            len = lo;
+        if (hi > 0 && len > hi && hi >= lo)
+            len = hi;
+        if (far_edge)
+            pos += want - len;
+    };
+    clamp_axis(g.x, g.width, min.width, max.width, (snap & edge_right) != 0);
+    clamp_axis(g.y, g.height, min.height, max.height, (snap & edge_bottom) != 0);
+    return g;
+}
+
+unsigned lx::compositor::snap_tiled_states(unsigned snap) {
+    // Every edge of a half or a quarter lies against the usable area's edge or the
+    // neighbouring part: GTK then draws no shadow or rounded corner anywhere (the tiled
+    // look), foot fills the cell grid. Mutter tiles halves the same way.
+    return (snap & (edge_left | edge_right | edge_top | edge_bottom)) ? tl_tiled_all : 0u;
+}
+
+unsigned lx::compositor::edge_snap_zone(lx::rect2i o, double px, double py, unsigned open,
+                                        int distance, int corner) {
+    if (o.width <= 0 || o.height <= 0 || distance <= 0)
+        return 0;
+    const double x0 = o.x, y0 = o.y;
+    const double x1 = static_cast<double>(o.x) + o.width;
+    const double y1 = static_cast<double>(o.y) + o.height;
+    if (px < x0 || py < y0 || px >= x1 || py >= y1)
+        return 0;
+    const bool near_top = py < y0 + corner;
+    const bool near_bottom = py >= y1 - corner;
+    if ((open & edge_left) && px < x0 + distance)
+        return near_top ? edge_top | edge_left : near_bottom ? edge_bottom | edge_left : edge_left;
+    if ((open & edge_right) && px >= x1 - distance)
+        return near_top ? edge_top | edge_right
+                        : near_bottom ? edge_bottom | edge_right : edge_right;
+    const bool near_left = px < x0 + corner;
+    const bool near_right = px >= x1 - corner;
+    if ((open & edge_top) && py < y0 + distance)
+        return near_left ? edge_top | edge_left
+                         : near_right ? edge_top | edge_right : k_snap_maximize;
+    if ((open & edge_bottom) && py >= y1 - distance)
+        return near_left ? edge_bottom | edge_left : near_right ? edge_bottom | edge_right : 0u;
+    return 0;
+}
+
+lx::point2i lx::compositor::drag_restore_origin(lx::rect2i frame, lx::size2i restored, double px,
+                                                double py) {
+    double frac = frame.width > 0 ? (px - frame.x) / frame.width : 0.5;
+    frac = frac < 0.0 ? 0.0 : (frac > 1.0 ? 1.0 : frac);
+    double dy = py - frame.y;
+    const double max_dy = restored.height > 1 ? restored.height - 1.0 : 0.0;
+    dy = dy < 0.0 ? 0.0 : (dy > max_dy ? max_dy : dy);
+    return {static_cast<int>(std::lround(px - frac * restored.width)),
+            static_cast<int>(std::lround(py - dy))};
 }
 
 lx::rect2i lx::compositor::effective_window_geometry(bool set, lx::rect2i requested,
@@ -998,6 +1466,55 @@ void lx::compositor::fullscreen_backdrop::hide() {
     mark_dirty({});
 }
 
+// ── snap_preview ───────────────────────────────────────────────────────────
+
+lx::compositor::snap_preview::~snap_preview() = default;
+
+lx::scene::node_kind lx::compositor::snap_preview::kind() const {
+    return scene::node_kind::surface;
+}
+
+void lx::compositor::snap_preview::emit_draws(scene::draw_list& out,
+                                              const scene::emit_context& ctx) const {
+    if (!shown_ || rect_.width <= 2 || rect_.height <= 2)
+        return;
+    const auto push = [&](unsigned texture, lx::rect2i r) {
+        scene::draw_command cmd{};
+        cmd.texture = lx::texture_id{texture};
+        cmd.dst = scene::project_node(ctx.projection, {r.x, r.y}, {r.x, r.y}, {r.width, r.height});
+        if (cmd.dst.width <= 0 || cmd.dst.height <= 0)
+            return;
+        if (ctx.projection.size.width > 0 && ctx.projection.size.height > 0 &&
+            (cmd.dst.x >= ctx.projection.size.width || cmd.dst.y >= ctx.projection.size.height ||
+             cmd.dst.x + cmd.dst.width <= 0 || cmd.dst.y + cmd.dst.height <= 0))
+            return; // another output's
+        cmd.src = lx::rect2f{0.f, 0.f, 1.f, 1.f};
+        cmd.scaled = false; // one texel: nearest is exact
+        cmd.opacity = 1.f;
+        cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
+        cmd.blend = lx::blend_mode::premultiplied;
+        cmd.sort_key = lx::draw_sort_key::make(0, out.size());
+        out.push(cmd);
+    };
+    const lx::rect2i r = rect_;
+    push(k_fill_texture, {r.x + 1, r.y + 1, r.width - 2, r.height - 2});
+    push(k_border_texture, {r.x, r.y, r.width, 1});
+    push(k_border_texture, {r.x, r.y + r.height - 1, r.width, 1});
+    push(k_border_texture, {r.x, r.y + 1, 1, r.height - 2});
+    push(k_border_texture, {r.x + r.width - 1, r.y + 1, 1, r.height - 2});
+}
+
+void lx::compositor::snap_preview::show(lx::rect2i logical) {
+    rect_ = logical;
+    shown_ = true;
+    mark_dirty({});
+}
+
+void lx::compositor::snap_preview::hide() {
+    shown_ = false;
+    mark_dirty({});
+}
+
 // ── window_manager ─────────────────────────────────────────────────────────
 
 void lx::compositor::window_manager::bind(toplevel_manager& toplevels, surface_manager& surfaces,
@@ -1148,7 +1665,7 @@ void lx::compositor::window_manager::sync_backdrops() {
     bool want[output_manager::k_max]{};
     if (toplevels_)
         toplevels_->for_each([&](const toplevel_record& rec) {
-            if (rec.mapped && rec.state == lx::toplevel_state::fullscreen &&
+            if (rec.mapped && !rec.hidden && rec.state == lx::toplevel_state::fullscreen &&
                 rec.fullscreen_output >= 0 &&
                 static_cast<unsigned>(rec.fullscreen_output) < output_manager::k_max)
                 want[rec.fullscreen_output] = true;
@@ -1372,6 +1889,9 @@ void lx::compositor::window_manager::emit_children_state(lx::toplevel_id id) {
 }
 
 void lx::compositor::window_manager::on_output_changed() {
+    // An output that went without `evacuate_output` (a path that never had windows to
+    // move) takes its workspaces with it; outputs that came get theirs in on_output_added.
+    sync_workspace_outputs(false);
     if (layers_)
         layers_->arrange(); // reports each changed usable area through the host
     else if (outputs_)
@@ -1434,6 +1954,10 @@ unsigned lx::compositor::window_manager::evacuate_output(unsigned slot, int fall
                              rec.geometry.height};
             rec.home_maximized = (rec.desired.states & tl_maximized) != 0;
             rec.home_fullscreen = (rec.desired.states & tl_fullscreen) != 0;
+            rec.home_snap = rec.snap;
+            // Its workspace's place there, for its return (W.6).
+            const workspace_record* w = workspaces_.find(rec.workspace);
+            rec.home_workspace = w && w->output == static_cast<int>(slot) ? w->index + 1 : 0;
         }
         if (fallback < 0) {
             // Nowhere to go yet: the output on its way takes it in.
@@ -1451,6 +1975,18 @@ unsigned lx::compositor::window_manager::evacuate_output(unsigned slot, int fall
                 slot, fallback, moved, fallback < 0 ? " (stranded until an output comes)" : "");
         }
     }
+    // Its workspaces (W.6): the active one's windows join what the fallback shows, the
+    // others are appended there (static: merged by position), or all wait for an output.
+    if (fallback >= 0 && !workspaces_.has_group(static_cast<unsigned>(fallback)) &&
+        outputs_->slot_live(static_cast<unsigned>(fallback))) {
+        const output_state& f = outputs_->slot_state(static_cast<unsigned>(fallback));
+        workspaces_.output_added(static_cast<unsigned>(fallback), f.id.id(), f.identifier, f.name,
+                                 sink());
+        workspaces_.settle(static_cast<unsigned>(fallback));
+    }
+    workspaces_.output_removed(slot, fallback, sink());
+    update_visibility();
+    flush_workspaces();
     return moved;
 }
 
@@ -1483,6 +2019,13 @@ void lx::compositor::window_manager::relocate_window(toplevel_record& rec, lx::r
             rec.restore = evacuate_rect(rec.restore, from, to);
         return;
     }
+    if (rec.snap) {
+        // The same half or quarter of the new output (K.3); its normal geometry moves along.
+        aim_snap(rec, rec.snap, fallback);
+        if (rec.restore_set)
+            rec.restore = evacuate_rect(rec.restore, from, to);
+        return;
+    }
     const frame_extents ext = extents_of(rec);
     const lx::rect2i f = frame_rect(rec.geometry, ext);
     const lx::rect2i nf = evacuate_rect(f, from, to);
@@ -1498,6 +2041,70 @@ void lx::compositor::window_manager::relocate_window(toplevel_record& rec, lx::r
     rec.configure_due = true;
 }
 
+bool lx::compositor::window_manager::move_to_output(lx::toplevel_id id, int dx, int dy) {
+    toplevel_record* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec || !rec->mapped || !outputs_)
+        return false;
+    const int from_slot = window_output(*rec);
+    if (from_slot < 0)
+        return false;
+    const int best = neighbour_output(from_slot, dx, dy);
+    if (best < 0)
+        return false;
+    // The user moved it: it no longer goes back to an output it was evacuated from.
+    rec->home_identifier[0] = '\0';
+    relocate_window(*rec, usable_area(from_slot), best);
+    // It joins what that output shows (W.6); its dialogs come along.
+    if (!rec->sticky) {
+        sync_workspace_outputs(true);
+        const lx::workspace_id to = workspaces_.active(static_cast<unsigned>(best));
+        join_workspace(*rec, to);
+        toplevels_->for_each_mut([&](toplevel_record& child) {
+            if (child.parent == id && child.mapped && !child.sticky) {
+                relocate_window(child, usable_area(from_slot), best);
+                join_workspace(child, to);
+            }
+        });
+    }
+    update_visibility();
+    flush_workspaces();
+    rehit_pending_ = true;
+    if (wm_debug_enabled()) {
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "move to output id={} from={} to={}", id.id(), from_slot,
+                                         best);
+    }
+    return true;
+}
+
+int lx::compositor::window_manager::neighbour_output(int slot, int dx, int dy) const {
+    if (!outputs_ || slot < 0)
+        return -1;
+    const lx::rect2i from = output_area(slot);
+    const double cx = from.x + from.width / 2.0;
+    const double cy = from.y + from.height / 2.0;
+    // The nearest output whose centre lies that way (more along the direction than across).
+    int best = -1;
+    double best_d = 0.0;
+    for (unsigned s = 0; s < output_manager::k_max; ++s) {
+        if (static_cast<int>(s) == slot || !outputs_->slot_live(s))
+            continue;
+        const lx::rect2i o = output_area(static_cast<int>(s));
+        const double ox = o.x + o.width / 2.0 - cx;
+        const double oy = o.y + o.height / 2.0 - cy;
+        const double along = ox * dx + oy * dy;
+        const double across = std::abs(dx ? oy : ox);
+        if (along <= 0.0 || across > along)
+            continue;
+        const double d = ox * ox + oy * oy;
+        if (best < 0 || d < best_d) {
+            best = static_cast<int>(s);
+            best_d = d;
+        }
+    }
+    return best;
+}
+
 unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
     if (!toplevels_ || !outputs_ || !outputs_->slot_live(slot))
         return 0;
@@ -1505,6 +2112,11 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
     const lx::rect2i out = output_area(static_cast<int>(slot));
     const lx::rect2i usable = usable_area(static_cast<int>(slot));
     unsigned back = 0;
+    // Its workspaces (W.6): those that waited with no output left, else its own coming back
+    // from where they were appended (their windows move with them) — then, below, windows
+    // that were merged go to a workspace at their old position, and `settle` makes the
+    // workspace that was active there active again.
+    workspaces_.output_added(slot, o.id.id(), o.identifier, o.name, sink());
     // Stranded windows (their output went with none left): this one takes them in. One whose
     // home this is goes back to its place below instead.
     unsigned adopted = 0;
@@ -1531,8 +2143,12 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
                                              slot, adopted);
         }
     }
-    if (!o.identifier[0])
+    if (!o.identifier[0]) {
+        workspaces_.settle(slot);
+        update_visibility();
+        flush_workspaces();
         return adopted;
+    }
     toplevels_->for_each_mut([&](toplevel_record& rec) {
         if (!rec.home_identifier[0] || std::strcmp(rec.home_identifier, o.identifier) != 0)
             return;
@@ -1542,6 +2158,9 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
             return;
         ++back;
         rec.output = static_cast<int>(slot);
+        if (!rec.sticky)
+            join_workspace(rec, workspaces_.home_workspace(slot, rec.home_workspace));
+        rec.home_workspace = 0;
         const bool fullscreen = (rec.desired.states & tl_fullscreen) != 0;
         const bool maximized = (rec.desired.states & tl_maximized) != 0;
         if (fullscreen) {
@@ -1564,6 +2183,15 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
                                rec.restore.height};
             return;
         }
+        if (rec.snap && rec.home_snap) {
+            // Snapped there: the same half or quarter again (its normal geometry came along
+            // with every relocation).
+            aim_snap(rec, rec.home_snap, static_cast<int>(slot));
+            rec.snap = rec.home_snap;
+            rec.home_snap = 0;
+            return;
+        }
+        rec.home_snap = 0;
         // Its old place on the output, kept reachable (the output may have come back
         // smaller, or with a panel over the old title bar).
         const frame_extents ext = extents_of(rec);
@@ -1589,6 +2217,9 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
                                              o.identifier, back);
         }
     }
+    workspaces_.settle(slot);
+    update_visibility();
+    flush_workspaces();
     return back + adopted;
 }
 
@@ -1606,11 +2237,45 @@ void lx::compositor::window_manager::on_usable_area_changed(unsigned slot, lx::r
     if (!toplevels_)
         return;
     rehit_pending_ = true;
-    // Normal windows stay put (sway, KWin); maximized ones on this output fill the new area.
+    // The output a window belongs to here: where a placing configure not yet answered takes
+    // it (a window sent home by a hotplug moments ago, before the new output's panel maps),
+    // else where it is drawn.
+    const auto headed_output = [&](const toplevel_record& rec) {
+        const lx::point2i* to = rec.desired.place ? &rec.desired.place_at : nullptr;
+        for (unsigned i = rec.sent_count; !to && i-- > 0;)
+            if (rec.sent[i].place)
+                to = &rec.sent[i].place_at;
+        if (to && outputs_) {
+            const int at = output_at(*outputs_, to->x, to->y);
+            if (at >= 0)
+                return at;
+        }
+        return window_output(rec);
+    };
+    // Normal windows stay put (sway, KWin); maximized ones on this output fill the new area,
+    // and snapped ones their half or quarter of it (K.3).
     toplevels_->for_each_mut([&](toplevel_record& rec) {
+        if (rec.snap && !(rec.desired.states & (tl_maximized | tl_fullscreen))) {
+            if (headed_output(rec) != static_cast<int>(slot))
+                return;
+            const lx::rect2i g = snap_geometry(usable, rec.snap,
+                                               extents_for(rec.desired.decoration, false),
+                                               rec.min_size, rec.max_size);
+            if (g.width != rec.desired.size.width || g.height != rec.desired.size.height ||
+                rec.desired.place) {
+                aim_snap(rec, rec.snap, static_cast<int>(slot));
+                return;
+            }
+            // Same size, new place: moved without a configure, the far edges kept.
+            const int x = (rec.snap & edge_right) ? g.x + g.width - rec.geometry.width : g.x;
+            const int y = (rec.snap & edge_bottom) ? g.y + g.height - rec.geometry.height : g.y;
+            if (rec.mapped && (rec.geometry.x != x || rec.geometry.y != y))
+                move_window(rec, {x, y}, "usable");
+            return;
+        }
         if (!(rec.desired.states & tl_maximized) || (rec.desired.states & tl_fullscreen))
             return;
-        if (window_output(rec) != static_cast<int>(slot))
+        if (headed_output(rec) != static_cast<int>(slot))
             return;
         const frame_extents ext = extents_for(rec.desired.decoration, true);
         const lx::size2i size{usable.width - ext.left - ext.right,
@@ -1673,19 +2338,15 @@ void lx::compositor::window_manager::set_maximized(lx::toplevel_id id, bool on,
     const bool is_max = (rec->desired.states & tl_maximized) != 0;
     const int slot = window_output(*rec);
     if (on && !is_max) {
-        if (rec->mapped && rec->state == lx::toplevel_state::normal) {
+        // A snapped window's normal geometry is already kept (K.3): maximize keeps it.
+        if (rec->mapped && rec->state == lx::toplevel_state::normal && !rec->snap) {
             rec->restore = rec->geometry;
             rec->restore_set = true;
         }
-        const lx::rect2i area = usable_area(slot);
-        const frame_extents ext = extents_for(rec->desired.decoration, true);
-        rec->desired.states |= tl_maximized;
-        rec->desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
-        rec->desired.place = true;
-        rec->desired.place_at = {area.x + ext.left, area.y + ext.top};
-        rec->desired.anchor_edges = 0;
+        aim_maximized(*rec, slot);
     } else if (!on && is_max) {
-        rec->desired.states &= ~static_cast<unsigned>(tl_maximized);
+        rec->desired.states &= ~static_cast<unsigned>(tl_maximized | tl_tiled_all);
+        rec->snap = 0;
         if (rec->restore_set) {
             // Back where it was — kept reachable if the usable area changed meanwhile (a
             // panel appeared over the old title bar), as a move would be.
@@ -1743,12 +2404,16 @@ void lx::compositor::window_manager::set_fullscreen(lx::toplevel_id id, bool on,
             else if (rec->restore_set)
                 rec->fullscreen_restore = rec->restore; // maximized: the normal geometry
             rec->fullscreen_restore_set = rec->fullscreen_restore_set || rec->restore_set;
+            // Snapped: unset_fullscreen snaps it there again (its normal geometry stays in
+            // `restore`).
+            rec->fullscreen_snap = rec->snap;
+            rec->snap = 0;
         }
         rec->fullscreen_output = slot;
         // The whole output, no frame: xdg-shell's fullscreen size is the output's.
         const lx::rect2i area = output_area(slot);
         rec->desired.states |= tl_fullscreen;
-        rec->desired.states &= ~static_cast<unsigned>(tl_maximized);
+        rec->desired.states &= ~static_cast<unsigned>(tl_maximized | tl_tiled_all);
         rec->desired.size = {area.width, area.height};
         rec->desired.place = true;
         rec->desired.place_at = {area.x, area.y};
@@ -1763,6 +2428,9 @@ void lx::compositor::window_manager::set_fullscreen(lx::toplevel_id id, bool on,
             rec->desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
             rec->desired.place = true;
             rec->desired.place_at = {area.x + ext.left, area.y + ext.top};
+        } else if (rec->fullscreen_snap) {
+            aim_snap(*rec, rec->fullscreen_snap, slot);
+            rec->snap = rec->fullscreen_snap;
         } else if (rec->fullscreen_restore_set) {
             const frame_extents ext = extents_for(rec->desired.decoration, false);
             const lx::point2i p = constrain_on_output(usable_area(slot),
@@ -1776,6 +2444,7 @@ void lx::compositor::window_manager::set_fullscreen(lx::toplevel_id id, bool on,
             rec->desired.place = false;
         }
         rec->fullscreen_restore_set = false;
+        rec->fullscreen_snap = 0;
     }
     // xdg-shell: answered by a configure even when the state does not change.
     rec->configure_due = true;
@@ -1807,6 +2476,11 @@ void lx::compositor::window_manager::send_configure(toplevel_record& rec,
             if (rec.sent[i].place) {
                 c.place = true;
                 c.place_at = rec.sent[i].place_at;
+                // A snap's far edges with it (a right half stays against the right edge).
+                if (c.anchor_edges == 0) {
+                    c.anchor_edges = rec.sent[i].anchor_edges;
+                    c.anchor = rec.sent[i].anchor;
+                }
                 break;
             }
         }
@@ -1952,10 +2626,21 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
     const bool was_fullscreen = rec->state == lx::toplevel_state::fullscreen;
     if (toplevel_manager::consume_ack(*rec, applied)) {
         if (applied.place) {
-            // Maximize / restore: the origin the configure named, with the size the client
-            // drew — in this same snapshot as that content.
+            // Maximize / restore / snap: the origin the configure named, with the size the
+            // client drew — in this same snapshot as that content. A snap to the right or the
+            // bottom keeps that edge where it was asked to be, whatever size was drawn.
             rec->geometry = {applied.place_at.x, applied.place_at.y, eff.width, eff.height};
+            if (applied.anchor_edges & edge_left)
+                rec->geometry.x = applied.anchor.x + applied.anchor.width - eff.width;
+            if (applied.anchor_edges & edge_top)
+                rec->geometry.y = applied.anchor.y + applied.anchor.height - eff.height;
             placed = true;
+            // Drag-to-restore's configure is answered: the move goes on with the window itself.
+            if (grab_.awaiting_restore && grab_.toplevel == id &&
+                !(applied.states & (tl_maximized | tl_fullscreen | tl_tiled_all))) {
+                grab_.awaiting_restore = false;
+                grab_.motion_pending = true;
+            }
         } else {
             rec->geometry = anchored_geometry(rec->geometry, applied, {eff.width, eff.height});
         }
@@ -2061,7 +2746,8 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
     lx::rect2i existing[toplevel_manager::k_max];
     unsigned n = 0;
     toplevels_->for_each_bottom_up([&](const toplevel_record& other) {
-        if (n < toplevel_manager::k_max)
+        // What the user sees: windows of other workspaces do not push the cascade.
+        if (n < toplevel_manager::k_max && !other.hidden)
             existing[n++] = frame_rect(other.geometry, extents_of(other));
     });
 
@@ -2110,10 +2796,35 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
     log_geometry(rec, "map", 0);
     sync_decoration(rec);
 
+    // Its workspace (W.1): a child's parent's, else the active one of the output it maps
+    // on. A child of a window on another workspace maps there, hidden.
+    {
+        sync_workspace_outputs(true);
+        lx::workspace_id ws{};
+        const toplevel_record* parent = rec.parent ? toplevels_->find(rec.parent) : nullptr;
+        if (parent && parent->mapped && parent->workspace)
+            ws = parent->workspace;
+        else if (const int slot = window_output(rec); slot >= 0)
+            ws = workspaces_.active(static_cast<unsigned>(slot));
+        rec.workspace_dirty = true;
+        ws_dirty_ = true;
+        if (ws) {
+            rec.workspace = ws;
+            workspaces_.window_added(ws);
+        }
+        if (!shown(rec))
+            apply_hidden(rec, true);
+    }
+
     const lx::toplevel_id id = rec.id;
     // An activation requested before the map is decided now; a refused one marks the window
-    // (before the shell hears of it, so toplevel_created carries the flag).
-    const bool take_focus = decide_activation_at_map(rec);
+    // (before the shell hears of it, so toplevel_created carries the flag). A window that
+    // maps hidden (its parent's workspace is not shown) does not take the keyboard.
+    bool take_focus = decide_activation_at_map(rec);
+    if (take_focus && rec.hidden) {
+        take_focus = false;
+        set_demands_attention(rec, true);
+    }
     if (shell_)
         shell_->emit_toplevel_created(rec);
     // Children mapped before it now have a mapped parent: the shell hears of the relation,
@@ -2138,6 +2849,7 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
         set_keyboard_focus(b);
     rehit_pending_ = true;
     stacking_dirty_ = true;
+    flush_workspaces();
 }
 
 void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* reason) {
@@ -2164,6 +2876,16 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     // any of them that had it.
     tree_->unmap_root(rec->surface);
     toplevels_->set_mapped(id, false);
+    // Off its workspace (dynamic: an inactive workspace left empty goes); a remap joins
+    // one again.
+    leave_workspace(*rec);
+    rec->workspace_dirty = false;
+    workspaces_.forget_window(id);
+    if (rec->hidden) {
+        rec->hidden = false;
+        if (auto* box = tree_->container(rec->surface))
+            box->set_visible(true);
+    }
     if (rec->state == lx::toplevel_state::fullscreen)
         sync_backdrops();
     // The shell forgets the window (toplevel_destroyed below): its attention goes with it.
@@ -2205,9 +2927,15 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     // With nothing left that is the null id, and the change must still go through
     // set_keyboard_focus: the router sends `leave` and the shell hears focus_changed(null),
     // or keys typed at an empty desktop keep reaching the hidden surface.
-    if (keyboard_focus_ == id)
-        set_keyboard_focus(toplevels_->top());
+    // Shown windows only: the next window of the output it was on, else any.
+    if (keyboard_focus_ == id) {
+        lx::toplevel_id next = top_shown(window_output(*rec));
+        if (!next)
+            next = top_shown(-1);
+        set_keyboard_focus(next);
+    }
     stacking_dirty_ = true;
+    flush_workspaces();
     if (pointer_focus_ == id) {
         // Rebase now, not at the tick: focus must not name an unmapped window for even one
         // more event. With a button held the implicit grab's target is gone, so nothing
@@ -2339,6 +3067,10 @@ void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
     }
     if (id == keyboard_focus_)
         return;
+    // A keyboard move or resize belongs to the focused window: it ends where it is when the
+    // keyboard goes elsewhere.
+    if (grab_.mode != grab_mode::none && grab_.keyboard && !(grab_.toplevel == id))
+        end_grab(grab_end_reason::release);
     // Activating another client's window (a new window mapping, the shell's
     // request_activate) ends a popup grab: its menu must not keep the keyboard of a window
     // that is no longer active. A click there already ended it as an outside click.
@@ -2349,6 +3081,9 @@ void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
     }
     keyboard_focus_ = id;
     auto* rec = toplevels_->find_mut(id);
+    // Its workspace remembers it: switching back focuses it again (W.1).
+    if (rec && rec->workspace)
+        workspaces_.set_focus_memory(rec->workspace, id);
     // The window the user wanted is the one they now have.
     if (rec && rec->demands_attention)
         set_demands_attention(*rec, false);
@@ -2523,7 +3258,8 @@ bool lx::compositor::window_manager::hit_test(double x, double y, wm_hit& out) c
         bool covered = false;
         bool hit = false;
         toplevels_->for_each_top_down([&](const toplevel_record& rec) {
-            if (rec.state != lx::toplevel_state::fullscreen || rec.fullscreen_output < 0)
+            if (rec.hidden || rec.state != lx::toplevel_state::fullscreen ||
+                rec.fullscreen_output < 0)
                 return true;
             const lx::rect2i area = output_area(rec.fullscreen_output);
             if (x < area.x || y < area.y || x >= area.x + area.width || y >= area.y + area.height)
@@ -2555,6 +3291,9 @@ bool lx::compositor::window_manager::hit_test(double x, double y, wm_hit& out) c
     // Every surface of the tree counts, each clipped to its own extents — a subsurface is
     // not clipped to its parent.
     toplevels_->for_each_top_down([&](const toplevel_record& rec) {
+        // Another workspace's, or minimized: not there for input.
+        if (rec.hidden)
+            return true;
         tree_hit th{};
         if (!tree_->hit(rec.surface, x, y, th)) {
             // Not on a surface of this window: perhaps on its frame. The client is on top
@@ -2726,6 +3465,16 @@ void lx::compositor::window_manager::on_pointer_motion(unsigned time_ms) {
         if (!same_pointer_focus(h)) {
             // `enter` carries the position; a motion with the same one would be noise.
             set_pointer_focus(&h);
+            // Focus follows the mouse: into a window (never out of one onto the desktop,
+            // never from a popup's or a layer surface's motion), only on real motion — a
+            // window mapping or moving under a still pointer takes nothing.
+            if (focus_.sloppy && !locked_ && h.id && h.owner == hit_owner::toplevel &&
+                !(popups_ && popups_->grab_active()) && !(h.id == keyboard_focus_)) {
+                const lx::toplevel_id b = modal_blocker(h.id);
+                set_keyboard_focus(b ? b : h.id);
+                if (focus_.raise_on_sloppy)
+                    (void)raise(h.id);
+            }
             return;
         }
         if (h.target == hit_target::surface)
@@ -2791,9 +3540,12 @@ void lx::compositor::window_manager::on_pointer_button(
             return;
         const bool first = button_mask_ == 0;
         button_mask_ |= bit;
-        // Nothing reaches a client during a grab, and an extra button does not end it.
+        // Nothing reaches a client during a grab, and an extra button does not end it — but
+        // any press ends a keyboard move or resize where it is (K.6).
         if (grab_.mode != grab_mode::none) {
             swallowed_mask_ |= bit;
+            if (grab_.keyboard)
+                end_grab(grab_end_reason::release);
             return;
         }
         // Locked: no binding, frame, layer or window focus — the press goes to the lock
@@ -2826,17 +3578,24 @@ void lx::compositor::window_manager::on_pointer_button(
                 return;
             }
         }
-        // TEMPORARY placeholder binding (Super+drag) — moves to shell policy over
-        // zlm_policy_bridge_v1. Super+left moves, Super+right resizes from the edges
-        // nearest the grab point. Neither press nor release reaches the client.
-        if (bit && (event.evdev_code == k_btn_left || event.evdev_code == k_btn_right) &&
-            seat_->keymap().named().super) {
+        // Configured pointer bindings (config.toml: Super+BTN_LEFT moves, Super+BTN_RIGHT
+        // resizes from the edges nearest the grab point, by default). Neither press nor
+        // release reaches the client.
+        const wm_button_binding bound =
+            bit && button_binding_ ? button_binding_(button_binding_user_, event.evdev_code,
+                                                     event.time_ms)
+                                   : wm_button_binding::none;
+        if (bound == wm_button_binding::consumed) {
+            swallowed_mask_ |= bit;
+            return;
+        }
+        if (bound == wm_button_binding::move || bound == wm_button_binding::resize) {
             wm_hit h{};
             if (hit_test(seat_->pointer_x(), seat_->pointer_y(), h) && h.id) {
                 swallowed_mask_ |= bit;
                 set_keyboard_focus(h.id);
                 (void)raise(h.id);
-                const bool move = event.evdev_code == k_btn_left;
+                const bool move = bound == wm_button_binding::move;
                 unsigned edges = 0;
                 // The thirds of what the user sees: the frame, title bar included.
                 if (const auto* rec = toplevels_->find(h.id); rec && !move)
@@ -2906,7 +3665,8 @@ void lx::compositor::window_manager::on_pointer_button(
                 return;
             }
             set_keyboard_focus(pointer_focus_);
-            (void)raise(pointer_focus_);
+            if (focus_.raise_on_click)
+                (void)raise(pointer_focus_);
         }
         if (const unsigned serial = router_->send_pointer_button(event, *seat_); serial) {
             last_press_serial_ = serial;
@@ -2963,6 +3723,29 @@ void lx::compositor::window_manager::on_pointer_axis(const lx::input::pointer_ax
 }
 
 bool lx::compositor::window_manager::on_key(const lx::input::key_event& event) {
+    // A keyboard move or resize (K.6): every key press is the window manager's while it
+    // lasts — arrows move the pointer, Return applies, Escape cancels. Releases go on: the
+    // router passes only those of keys whose press reached a client (pressed before).
+    if (grab_.mode != grab_mode::none && grab_.keyboard) {
+        if (!event.pressed)
+            return false;
+        constexpr unsigned k_key_enter = 28, k_key_kpenter = 96, k_key_space = 57;
+        constexpr unsigned k_key_up = 103, k_key_left = 105, k_key_right = 106, k_key_down = 108;
+        const unsigned code = event.evdev_keycode;
+        const int step = seat_ && seat_->keymap().named().ctrl ? 1 : 10;
+        switch (code) {
+        case k_key_esc: end_grab(grab_end_reason::escape); break;
+        case k_key_enter:
+        case k_key_kpenter:
+        case k_key_space: end_grab(grab_end_reason::release); break;
+        case k_key_left: keyboard_grab_step(-step, 0); break;
+        case k_key_right: keyboard_grab_step(step, 0); break;
+        case k_key_up: keyboard_grab_step(0, -step); break;
+        case k_key_down: keyboard_grab_step(0, step); break;
+        default: break;
+        }
+        return true;
+    }
     if (event.evdev_keycode != k_key_esc)
         return false;
     if (event.pressed && grab_.mode != grab_mode::none) {
@@ -3077,8 +3860,9 @@ void lx::compositor::window_manager::set_suspend_reason(unsigned reason, bool on
     if ((before != 0) == (suspend_reasons_ != 0) || !toplevels_)
         return;
     on = suspend_reasons_ != 0;
+    // A hidden window stays suspended whatever the session does.
     toplevels_->for_each_mut([on](toplevel_record& rec) {
-        if (on)
+        if (on || rec.hidden)
             rec.desired.states |= tl_suspended;
         else
             rec.desired.states &= ~static_cast<unsigned>(tl_suspended);
@@ -3245,13 +4029,17 @@ void lx::compositor::window_manager::log_grab_reject(lx::toplevel_id id, grab_so
 
 bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mode,
                                                 unsigned edges, grab_source source,
-                                                unsigned button) {
+                                                unsigned button, bool keyboard) {
     if (!toplevels_ || !surfaces_ || !seat_ || mode == grab_mode::none)
         return false;
     auto* rec = toplevels_->find_mut(id);
     const unsigned offset = button - k_button_base;
     const std::uint64_t bit =
         button >= k_button_base && offset < 64 ? (std::uint64_t{1} << offset) : 0;
+    const bool maximized = rec && (rec->state == lx::toplevel_state::maximized ||
+                                   (rec->desired.states & tl_maximized));
+    const bool fullscreen = rec && (rec->state == lx::toplevel_state::fullscreen ||
+                                    (rec->desired.states & tl_fullscreen));
     const char* reject = nullptr;
     if (grab_.mode != grab_mode::none)
         reject = "grab-active";
@@ -3259,9 +4047,13 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
         reject = "dnd-active";
     else if (!rec || !rec->mapped)
         reject = "unmapped";
-    else if (!bit || !(button_mask_ & bit))
-        reject = "no-button";
-    else if (rec->state != lx::toplevel_state::normal || (rec->desired.states & tl_maximized))
+    else if (keyboard ? (button_mask_ != 0 || !warp_ || locked_) : (!bit || !(button_mask_ & bit)))
+        reject = keyboard ? "button-held" : "no-button";
+    else if (fullscreen || (rec->state != lx::toplevel_state::normal && !maximized))
+        reject = "state";
+    // A maximized window moves only by being restored under the pointer (K.5), and never
+    // resizes; a snapped one may be dragged out (restored) or resized (no longer snapped).
+    else if (maximized && (mode == grab_mode::resize || !window_cfg_.drag_restore))
         reject = "state";
     else if (mode == grab_mode::resize && (edges == edge_none || !valid_resize_edges(edges)))
         reject = "edges";
@@ -3278,11 +4070,28 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
     grab_.source = source;
     grab_.toplevel = id;
     grab_.edges = mode == grab_mode::resize ? edges : 0;
-    grab_.button = button;
+    grab_.button = keyboard ? 0u : button;
+    grab_.keyboard = keyboard;
     grab_.start_x = grab_.now_x = seat_->pointer_x();
     grab_.start_y = grab_.now_y = seat_->pointer_y();
     grab_.start = rec->geometry;
     grab_.last_target = {rec->geometry.width, rec->geometry.height};
+    grab_.normal = rec->snap || maximized ? (rec->restore_set ? rec->restore : lx::rect2i{})
+                                          : rec->geometry;
+    if (mode == grab_mode::move && (maximized || rec->snap) && window_cfg_.drag_restore) {
+        // Drag-to-restore: nothing moves until the pointer has travelled 8 px.
+        grab_.restore_pending = true;
+        grab_.restored_max = maximized;
+        grab_.restored_snap = rec->snap;
+    } else if (rec->snap) {
+        // Resized, or moved with drag-restore off: an ordinary window from now on.
+        rec->snap = 0;
+        rec->restore_set = false;
+        rec->desired.states &= ~static_cast<unsigned>(tl_tiled_all);
+        rec->configure_due = true;
+        if (shell_)
+            shell_->emit_toplevel_state(*rec);
+    }
 
     // The client's implicit grab is broken (it gets `leave`), which is what GTK and Qt
     // expect after xdg_toplevel.move/resize; no client hears the pointer until the end.
@@ -3302,10 +4111,12 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
     if (wm_debug_enabled()) {
         lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
                                          "grab begin id={} mode={} edges={} source={} button={} "
-                                         "x={} y={} w={} h={}",
+                                         "x={} y={} w={} h={}{}{}",
                                          id.id(), grab_mode_name(mode), grab_.edges,
                                          grab_source_name(source), button, grab_.start.x,
-                                         grab_.start.y, grab_.start.width, grab_.start.height);
+                                         grab_.start.y, grab_.start.width, grab_.start.height,
+                                         keyboard ? " keyboard" : "",
+                                         grab_.restore_pending ? " restore-pending" : "");
     }
     return true;
 }
@@ -3377,20 +4188,46 @@ void lx::compositor::window_manager::apply_grab() {
     auto* rec = toplevels_ ? toplevels_->find_mut(grab_.toplevel) : nullptr;
     if (!rec || !rec->mapped)
         return;
-    const int dx = round_delta(grab_.now_x - grab_.start_x);
-    const int dy = round_delta(grab_.now_y - grab_.start_y);
     if (grab_.mode == grab_mode::move) {
+        if (grab_.restore_pending) {
+            // KWin's and GNOME's threshold: a click on a maximized title bar is not a drag.
+            const double mx = grab_.now_x - grab_.start_x;
+            const double my = grab_.now_y - grab_.start_y;
+            if (mx * mx + my * my < 64.0)
+                return;
+            drag_restore(*rec);
+        }
+        const int dx = round_delta(grab_.now_x - grab_.start_x);
+        const int dy = round_delta(grab_.now_y - grab_.start_y);
         // The frame is what must stay reachable: a server-side title bar stays on the output.
-        const frame_extents ext = extents_of(*rec);
-        const lx::rect2i f = frame_rect(
-            {grab_.start.x + dx, grab_.start.y + dy, rec->geometry.width, rec->geometry.height},
-            ext);
+        // Restoring, the frame it is restored with (the commit has not changed its state yet).
+        const frame_extents ext = grab_.awaiting_restore
+                                      ? extents_for(rec->desired.decoration, false)
+                                      : extents_of(*rec);
+        const lx::rect2i f = frame_rect({grab_.start.x + dx, grab_.start.y + dy,
+                                         grab_.start.width, grab_.start.height},
+                                        ext);
         // The title bar stays reachable on *some* output: the one the pointer drags it over
         // (the nearest one in a gap between outputs, §A.9) — so a window crosses outputs.
         const lx::point2i p = constrain_on_output(usable_area(pointer_output()), f);
-        move_window(*rec, {p.x + ext.left, p.y + ext.top}, "move");
+        const lx::point2i at{p.x + ext.left, p.y + ext.top};
+        if (grab_.awaiting_restore) {
+            // The restored window lands where the pointer is when its commit comes.
+            if (rec->desired.place)
+                rec->desired.place_at = at;
+            for (unsigned i = 0; i < rec->sent_count; ++i)
+                if (rec->sent[i].place && !(rec->sent[i].states & (tl_maximized | tl_fullscreen)))
+                    rec->sent[i].place_at = at;
+            if (rec->acked_unapplied && rec->acked.place)
+                rec->acked.place_at = at;
+        } else {
+            move_window(*rec, at, "move");
+        }
+        update_edge_zone();
         return;
     }
+    const int dx = round_delta(grab_.now_x - grab_.start_x);
+    const int dy = round_delta(grab_.now_y - grab_.start_y);
     // Resize: only the request changes here. Geometry follows the client's commit of the
     // acked size (on_toplevel_commit), so no frame ever shows a stretched or cropped
     // window, and the single-in-flight rule coalesces every position in between.
@@ -3411,12 +4248,33 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
         apply_grab();
     const wm_grab g = grab_;
     grab_ = {};
+    hide_snap_preview();
     auto* rec = toplevels_ ? toplevels_->find_mut(g.toplevel) : nullptr;
     const bool live = rec && rec->mapped && (reason == grab_end_reason::release ||
                                              reason == grab_end_reason::escape);
+    // Drag-to-restore happened (the window left its maximized or snapped state).
+    const bool restored = (g.restored_max || g.restored_snap) && !g.restore_pending;
     // The user placed it: it no longer goes back to an output it was moved off (H5).
-    if (rec && reason == grab_end_reason::release)
+    if (rec && reason == grab_end_reason::release && !g.restore_pending)
         rec->home_identifier[0] = '\0';
+    // Dropped where it is now (W.1): on the output its frame overlaps most, it joins that
+    // output's active workspace — also when the workspace was switched during the drag.
+    if (rec && rec->mapped && g.mode == grab_mode::move && reason == grab_end_reason::release)
+        rec->output = window_output(*rec); // the output it was dropped on
+    if (rec && rec->mapped && !rec->sticky && g.mode == grab_mode::move &&
+        reason == grab_end_reason::release) {
+        const int slot = window_output(*rec);
+        const lx::workspace_id ws = slot >= 0 ? workspaces_.active(static_cast<unsigned>(slot))
+                                              : lx::workspace_id{};
+        if (ws && ws != rec->workspace) {
+            const lx::toplevel_id moved = rec->id;
+            join_workspace(*rec, ws);
+            toplevels_->for_each_mut([&](toplevel_record& child) {
+                if (child.parent == moved && child.mapped && !child.sticky)
+                    join_workspace(child, ws);
+            });
+        }
+    }
     if (live && g.mode == grab_mode::resize) {
         // The final configure, without `resizing`, goes out through the normal flush once
         // the one in flight is answered. Escape asks for the start size, anchored to the
@@ -3432,7 +4290,46 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
             rec->desired.anchor_edges = 0;
             rec->desired.anchor = {};
         }
-    } else if (live && g.mode == grab_mode::move && reason == grab_end_reason::escape) {
+    } else if (live && g.mode == grab_mode::move && reason == grab_end_reason::release &&
+               g.zone && g.zone_output >= 0) {
+        // Dropped in an edge zone (K.4): snapped or maximized there; its normal geometry —
+        // where it was before the drag, or the size it was restored to — is what it goes back
+        // to.
+        const int slot = g.zone_output;
+        if (!rect_empty(g.normal)) {
+            rec->restore = g.normal;
+            rec->restore_set = true;
+        }
+        if (g.zone == k_snap_maximize) {
+            aim_maximized(*rec, slot);
+        } else {
+            rec->snap = g.zone;
+            aim_snap(*rec, g.zone, slot);
+        }
+        configure_now(*rec);
+        if (shell_)
+            shell_->emit_toplevel_state(*rec);
+        lx::trace::logger::global().logf(lx::trace::level::info, k_wm_category,
+                                         "edge snap id={} zone={} output={}", g.toplevel.id(),
+                                         g.zone == k_snap_maximize ? 0x10u : g.zone, slot);
+    } else if (live && g.mode == grab_mode::move && reason == grab_end_reason::escape &&
+               restored) {
+        // Escape after drag-to-restore puts the window back as it was (maximized or snapped,
+        // its normal geometry kept).
+        const int slot = window_output(*rec);
+        if (!rect_empty(g.normal) && g.normal.width > 0) {
+            rec->restore = g.normal;
+            rec->restore_set = true;
+        }
+        if (g.restored_max) {
+            aim_maximized(*rec, slot);
+        } else {
+            rec->snap = g.restored_snap;
+            aim_snap(*rec, g.restored_snap, slot);
+        }
+        configure_now(*rec);
+    } else if (live && g.mode == grab_mode::move && reason == grab_end_reason::escape &&
+               !g.restore_pending) {
         move_window(*rec, {g.start.x, g.start.y}, "cancel");
     }
     if (cursor_)
@@ -3445,6 +4342,9 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
                                          g.toplevel.id(), grab_mode_name(g.mode),
                                          grab_end_name(reason), r.x, r.y, r.width, r.height);
     }
+    // The grab kept its window shown (`shown`); now its workspace decides again.
+    update_visibility();
+    flush_workspaces();
     // The pointer goes back to whatever is under it — unless a button is still held, in
     // which case nothing has it until release (no `enter` mid-press).
     if (button_mask_ == 0)
@@ -3540,11 +4440,15 @@ bool lx::compositor::window_manager::restack(lx::toplevel_id id, unsigned index)
 }
 
 void lx::compositor::window_manager::activate(lx::toplevel_id id) {
-    const auto* rec = toplevels_ ? toplevels_->find(id) : nullptr;
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
     if (!rec || !rec->mapped)
         return;
+    // The shell's request_activate (a task-list click, the switcher): an explicit choice,
+    // so a minimized window comes back and its workspace is switched to.
+    (void)reveal(*rec, true, "activate");
     set_keyboard_focus(id);
     (void)raise(id);
+    flush_workspaces();
 }
 
 // ── xdg-activation ─────────────────────────────────────────────────────────
@@ -3615,10 +4519,19 @@ lx::compositor::window_manager::request_activation(lx::toplevel_id id,
         }
         return r;
     }
-    if (r == activation_result::granted)
+    if (r == activation_result::granted) {
+        // A window out of view: minimized ones come back; one on an inactive workspace is
+        // switched to with switch-on-activate (GNOME, KDE), else it asks for attention.
+        if (rec->hidden && !reveal(*rec, workspaces_.config().switch_on_activate, "activation")) {
+            r = activation_result::urgent;
+            set_demands_attention(*rec, true);
+            flush_workspaces();
+            return r;
+        }
         activate(id);
-    else if (r == activation_result::urgent)
+    } else if (r == activation_result::urgent) {
         set_demands_attention(*rec, true);
+    }
     return r;
 }
 
@@ -3664,6 +4577,9 @@ void lx::compositor::window_manager::set_demands_attention(toplevel_record& rec,
     }
     if (shell_)
         shell_->emit_toplevel_flags(rec);
+    // Its workspace is urgent while a member asks for attention (ext-workspace).
+    if (rec.workspace)
+        flush_workspaces();
 }
 
 unsigned lx::compositor::window_manager::set_client_not_responding(lx::client_id client,
@@ -3686,6 +4602,30 @@ unsigned lx::compositor::window_manager::set_client_not_responding(lx::client_id
     return n;
 }
 
+bool lx::compositor::window_manager::fit_into_usable(lx::toplevel_id id) {
+    toplevel_record* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec || !rec->mapped || rec->state != lx::toplevel_state::normal || grab_active())
+        return false;
+    const lx::rect2i area = usable_area(window_output(*rec));
+    const frame_extents ext = extents_of(*rec);
+    const lx::rect2i f = frame_rect(rec->geometry, ext);
+    const auto fit = [](int pos, int len, int lo, int span) {
+        if (len >= span)
+            return lo;
+        if (pos < lo)
+            return lo;
+        if (pos + len > lo + span)
+            return lo + span - len;
+        return pos;
+    };
+    const int x = fit(f.x, f.width, area.x, area.width);
+    const int y = fit(f.y, f.height, area.y, area.height);
+    if (x == f.x && y == f.y)
+        return false;
+    move_window(*rec, {x + ext.left, y + ext.top}, "placement-hold");
+    return true;
+}
+
 void lx::compositor::window_manager::request_close(lx::toplevel_id id) {
     const auto* rec = toplevels_ ? toplevels_->find(id) : nullptr;
     if (!rec || !rec->xdg_toplevel_resource || !ops_.send_close)
@@ -3702,4 +4642,866 @@ void lx::compositor::window_manager::emit_stacking_order() {
         shell_->emit_stacking_order_changed(rec, i, i + 1 == n);
         ++i;
     });
+}
+
+// ── Workspaces, minimize, sticky (design-session-and-wm Part W) ────────────
+
+namespace {
+
+constexpr const char* k_ws_category = "compositor.workspace";
+
+} // namespace
+
+lx::compositor::workspace_sink lx::compositor::window_manager::sink() {
+    workspace_sink s{};
+    s.user = this;
+    s.windows_moved = [](void* u, lx::workspace_id from, lx::workspace_id to) {
+        auto* wm = static_cast<window_manager*>(u);
+        if (!wm->toplevels_)
+            return;
+        // The model already moved the count; only the records follow.
+        wm->toplevels_->for_each_mut([&](toplevel_record& r) {
+            if (r.workspace != from)
+                return;
+            r.workspace = to;
+            r.workspace_dirty = true;
+            wm->ws_dirty_ = true;
+        });
+    };
+    s.workspace_moved = [](void* u, lx::workspace_id ws, int from, int to) {
+        auto* wm = static_cast<window_manager*>(u);
+        if (!wm->toplevels_ || !wm->outputs_ || from < 0 || to < 0 || from == to ||
+            !wm->outputs_->slot_live(static_cast<unsigned>(to)))
+            return;
+        // Its windows go with it, placed on the new output as an evacuation places them.
+        const lx::rect2i area = wm->usable_area(from);
+        wm->toplevels_->for_each_mut([&](toplevel_record& r) {
+            if (r.mapped && r.workspace == ws && !r.sticky)
+                wm->relocate_window(r, area, to);
+        });
+        wm->rehit_pending_ = true;
+    };
+    return s;
+}
+
+void lx::compositor::window_manager::set_workspace_config(const workspace_config& c) {
+    workspaces_.configure(c, sink());
+    update_visibility();
+    flush_workspaces();
+}
+
+void lx::compositor::window_manager::sync_workspace_outputs(bool add) {
+    if (!outputs_)
+        return;
+    if (add) {
+        for (unsigned s = 0; s < output_manager::k_max && s < k_workspace_groups; ++s) {
+            if (!outputs_->slot_live(s))
+                continue;
+            const output_state& o = outputs_->slot_state(s);
+            if (workspaces_.has_group(s) && workspaces_.group(s).key == o.id.id())
+                continue;
+            workspaces_.output_added(s, o.id.id(), o.identifier, o.name, sink());
+            workspaces_.settle(s);
+        }
+    }
+    for (unsigned s = 0; s < k_workspace_groups; ++s) {
+        if (!workspaces_.has_group(s))
+            continue;
+        if (outputs_->slot_live(s) && outputs_->slot_state(s).id.id() == workspaces_.group(s).key)
+            continue;
+        int fallback = -1;
+        for (unsigned f = 0; f < k_workspace_groups && fallback < 0; ++f)
+            if (f != s && workspaces_.has_group(f) && outputs_->slot_live(f))
+                fallback = static_cast<int>(f);
+        workspaces_.output_removed(s, fallback, sink());
+    }
+    if (workspaces_.generation() != ws_generation_seen_)
+        update_visibility();
+}
+
+bool lx::compositor::window_manager::shown(const toplevel_record& rec) const {
+    if (!rec.mapped)
+        return false;
+    // The window being dragged comes along wherever the user goes.
+    if (grab_.mode != grab_mode::none && grab_.toplevel == rec.id)
+        return true;
+    if (rec.minimized)
+        return false;
+    if (rec.sticky || !rec.workspace)
+        return true;
+    return workspaces_.is_active(rec.workspace);
+}
+
+int lx::compositor::window_manager::focused_output() const {
+    if (const auto* rec = toplevels_ ? toplevels_->find(keyboard_focus_) : nullptr;
+        rec && rec->mapped && !rec->hidden)
+        return window_output(*rec);
+    return pointer_output();
+}
+
+lx::toplevel_id lx::compositor::window_manager::top_shown(int slot) const {
+    lx::toplevel_id found{};
+    if (!toplevels_)
+        return found;
+    toplevels_->for_each_top_down([&](const toplevel_record& r) {
+        if (r.hidden || (slot >= 0 && window_output(r) != slot))
+            return true;
+        found = r.id;
+        return false;
+    });
+    return found;
+}
+
+lx::toplevel_id lx::compositor::window_manager::workspace_focus_target(int slot) const {
+    if (slot < 0)
+        return {};
+    const lx::workspace_id ws = workspaces_.active(static_cast<unsigned>(slot));
+    if (const auto* rec = toplevels_->find(workspaces_.focus_memory(ws));
+        rec && rec->mapped && !rec->hidden && rec->workspace == ws)
+        return rec->id;
+    return top_shown(slot);
+}
+
+void lx::compositor::window_manager::focus_after_switch(int slot) {
+    const auto* f = toplevels_->find(keyboard_focus_);
+    // The keyboard stays on a shown window of another output (a switch there from its
+    // panel, ext-workspace).
+    if (f && f->mapped && !f->hidden && window_output(*f) != slot)
+        return;
+    set_keyboard_focus(workspace_focus_target(slot));
+}
+
+void lx::compositor::window_manager::join_workspace(toplevel_record& rec, lx::workspace_id ws) {
+    if (rec.workspace == ws)
+        return;
+    leave_workspace(rec);
+    rec.workspace = ws;
+    if (ws)
+        workspaces_.window_added(ws);
+    rec.workspace_dirty = true;
+    ws_dirty_ = true;
+}
+
+void lx::compositor::window_manager::leave_workspace(toplevel_record& rec) {
+    if (!rec.workspace)
+        return;
+    const lx::workspace_id was = rec.workspace;
+    rec.workspace = {};
+    rec.workspace_dirty = true;
+    ws_dirty_ = true;
+    workspaces_.window_removed(was);
+}
+
+void lx::compositor::window_manager::apply_hidden(toplevel_record& rec, bool hide) {
+    rec.hidden = hide;
+    ws_windows_changed_ = true;
+    ws_configures_due_ = true;
+    if (tree_) {
+        if (auto* box = tree_->container(rec.surface))
+            box->set_visible(!hide);
+        // Its rects repaint: uncovered (what is under it shows) or covered again. A hidden
+        // window's commits damage capture views only (surface_manager), so nothing of it
+        // repaints an output meanwhile; frame callbacks fall to the 995 ms throttle.
+        tree_->damage_root(rec.surface);
+    }
+    if (decorations_)
+        decorations_->damage(rec.id);
+    if (hide) {
+        // Its menus close: nothing of it stays on screen.
+        if (popups_)
+            popups_->on_parent_unmapped(rec.surface, "parent-hidden");
+        if (deco_press_.id == rec.id) {
+            deco_press_ = {};
+            if (decorations_)
+                decorations_->set_button(rec.id, deco_button::normal);
+        }
+        if (pointer_focus_ == rec.id) {
+            if (button_mask_ != 0)
+                set_pointer_focus(nullptr);
+            else
+                refresh_pointer_focus(0, false);
+        }
+    }
+    // Mutter sends `suspended` for minimized and other-workspace windows: the client may
+    // stop rendering altogether. Out with the next flush.
+    if (hide || suspend_reasons_ != 0)
+        rec.desired.states |= tl_suspended;
+    else
+        rec.desired.states &= ~static_cast<unsigned>(tl_suspended);
+    rehit_pending_ = true;
+    if (wm_debug_enabled()) {
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_ws_category,
+                                         "window id={} {} workspace={} minimized={} sticky={}",
+                                         rec.id.id(), hide ? "hidden" : "shown",
+                                         rec.workspace.id(), rec.minimized ? 1 : 0,
+                                         rec.sticky ? 1 : 0);
+    }
+}
+
+void lx::compositor::window_manager::update_visibility() {
+    if (!toplevels_)
+        return;
+    bool fullscreen = false;
+    toplevels_->for_each_mut([&](toplevel_record& rec) {
+        if (!rec.mapped)
+            return;
+        const bool hide = !shown(rec);
+        if (hide == rec.hidden)
+            return;
+        apply_hidden(rec, hide);
+        if (rec.state == lx::toplevel_state::fullscreen)
+            fullscreen = true;
+    });
+    // A fullscreen window's backdrop hides and shows with it.
+    if (fullscreen)
+        sync_backdrops();
+    // The keyboard never stays on a window that is not shown.
+    if (const auto* f = toplevels_->find(keyboard_focus_); f && f->hidden) {
+        const int slot = window_output(*f);
+        lx::toplevel_id next = workspace_focus_target(slot);
+        if (next == keyboard_focus_)
+            next = {};
+        set_keyboard_focus(next);
+    }
+}
+
+void lx::compositor::window_manager::send_visibility_configures() {
+    // Out now, each one carrying the focus decided after the switch too (`activated` and
+    // `suspended` in one configure): a switch is an event, not a frame, and a window coming
+    // back into view should draw at once. The single-in-flight rule still holds.
+    if (!ws_configures_due_ || !toplevels_)
+        return;
+    ws_configures_due_ = false;
+    flush_configures(wm_now_ns());
+}
+
+bool lx::compositor::window_manager::reveal(toplevel_record& rec, bool switch_ok,
+                                            const char* source) {
+    if (!rec.mapped)
+        return false;
+    if (rec.minimized) {
+        rec.minimized = false;
+        ws_windows_changed_ = true;
+        if (shell_)
+            shell_->emit_toplevel_state(rec);
+    }
+    if (!rec.sticky && rec.workspace && !workspaces_.is_active(rec.workspace)) {
+        if (!switch_ok) {
+            update_visibility();
+            return false;
+        }
+        (void)switch_workspace(rec.workspace, source);
+    }
+    update_visibility();
+    return !rec.hidden;
+}
+
+void lx::compositor::window_manager::recompute_urgent() {
+    if (!toplevels_)
+        return;
+    bool urgent[k_max_workspaces]{};
+    lx::workspace_id ids[k_max_workspaces]{};
+    unsigned n = 0;
+    workspaces_.for_each([&](const workspace_record& w) {
+        if (n < k_max_workspaces)
+            ids[n++] = w.id;
+    });
+    toplevels_->for_each([&](const toplevel_record& r) {
+        if (!r.mapped || !r.demands_attention || !r.workspace)
+            return;
+        for (unsigned i = 0; i < n; ++i)
+            if (ids[i] == r.workspace)
+                urgent[i] = true;
+    });
+    for (unsigned i = 0; i < n; ++i)
+        workspaces_.set_urgent(ids[i], urgent[i]);
+}
+
+void lx::compositor::window_manager::flush_workspaces() {
+    if (ws_batch_ > 0)
+        return;
+    send_visibility_configures();
+    recompute_urgent();
+    const bool model_changed = workspaces_.generation() != ws_generation_seen_;
+    if (!model_changed && !ws_dirty_ && !ws_windows_changed_)
+        return;
+    ws_generation_seen_ = workspaces_.generation();
+    ws_windows_changed_ = false;
+    // ext-workspace first: a workspace just made has its handles before the shell is told a
+    // window is on it.
+    if (ws_observer_.changed)
+        ws_observer_.changed(ws_observer_.user);
+    if (!ws_dirty_ || !toplevels_)
+        return;
+    ws_dirty_ = false;
+    toplevels_->for_each_mut([&](toplevel_record& r) {
+        if (!r.workspace_dirty)
+            return;
+        r.workspace_dirty = false;
+        if (r.mapped && shell_)
+            shell_->emit_toplevel_workspace(r);
+    });
+}
+
+bool lx::compositor::window_manager::switch_workspace(lx::workspace_id ws, const char* source) {
+    const workspace_record* w = workspaces_.find(ws);
+    if (!w || w->output < 0)
+        return false;
+    const int slot = w->output;
+    char name[k_workspace_name_bytes];
+    std::snprintf(name, sizeof(name), "%s", w->name);
+    if (!workspaces_.activate(ws)) {
+        flush_workspaces();
+        return false;
+    }
+    update_visibility();
+    focus_after_switch(slot);
+    {
+        const char* out = outputs_ && outputs_->slot_live(static_cast<unsigned>(slot))
+                              ? outputs_->slot_state(static_cast<unsigned>(slot)).name
+                              : "-";
+        lx::trace::logger::global().logf(lx::trace::level::info, k_ws_category,
+                                         "workspace activate output={} name={} id={} source={}",
+                                         out, name, ws.id(), source ? source : "-");
+    }
+    rehit_pending_ = true;
+    flush_workspaces();
+    return true;
+}
+
+bool lx::compositor::window_manager::switch_to_index(unsigned index_1based) {
+    sync_workspace_outputs(true);
+    const int slot = focused_output();
+    if (slot < 0)
+        return false;
+    const lx::workspace_id ws = workspaces_.by_index(static_cast<unsigned>(slot), index_1based);
+    return ws && switch_workspace(ws, "binding");
+}
+
+bool lx::compositor::window_manager::switch_relative(int dir) {
+    sync_workspace_outputs(true);
+    const int slot = focused_output();
+    if (slot < 0)
+        return false;
+    const lx::workspace_id ws =
+        workspaces_.neighbour(workspaces_.active(static_cast<unsigned>(slot)), dir);
+    return ws && switch_workspace(ws, "binding");
+}
+
+bool lx::compositor::window_manager::move_to_workspace(lx::toplevel_id id, lx::workspace_id ws,
+                                                       bool follow, const char* source) {
+    toplevel_record* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    const workspace_record* w = workspaces_.find(ws);
+    if (!rec || !rec->mapped || !w || w->output < 0)
+        return false;
+    // A modal dialog moves with the window it blocks (W.6): the family moves.
+    for (unsigned depth = 0; depth < 8; ++depth) {
+        const toplevel_record* r = toplevels_->find(id);
+        if (!r || !effective_modal(*toplevels_, *r))
+            break;
+        id = r->parent;
+    }
+    rec = toplevels_->find_mut(id);
+    if (!rec || !rec->mapped)
+        return false;
+    if (rec->workspace == ws && !rec->sticky)
+        return false;
+    const int to = w->output;
+    const int from = window_output(*rec);
+    // The user placed it.
+    rec->home_identifier[0] = '\0';
+    rec->home_workspace = 0;
+    const auto move_one = [&](toplevel_record& r) {
+        if (r.sticky) {
+            r.sticky = false;
+            if (shell_)
+                shell_->emit_toplevel_flags(r);
+        }
+        if (from >= 0 && from != to)
+            relocate_window(r, usable_area(from), to);
+        join_workspace(r, ws);
+    };
+    move_one(*rec);
+    // Its children (dialogs, transients) go along, to any depth.
+    lx::toplevel_id family[16]{id};
+    unsigned count = 1;
+    for (unsigned i = 0; i < count; ++i)
+        toplevels_->for_each_mut([&](toplevel_record& child) {
+            if (count < 16 && child.parent == family[i] && child.mapped) {
+                family[count++] = child.id;
+                move_one(child);
+            }
+        });
+    lx::trace::logger::global().logf(lx::trace::level::info, k_ws_category,
+                                     "workspace move window id={} to={} id={} follow={} "
+                                     "source={}",
+                                     id.id(), w->name, ws.id(), follow ? 1 : 0,
+                                     source ? source : "-");
+    if (follow) {
+        (void)switch_workspace(ws, source);
+        set_keyboard_focus(id);
+    } else {
+        update_visibility();
+    }
+    rehit_pending_ = true;
+    flush_workspaces();
+    return true;
+}
+
+bool lx::compositor::window_manager::move_to_index(lx::toplevel_id id, unsigned index_1based) {
+    sync_workspace_outputs(true);
+    const toplevel_record* rec = toplevels_ ? toplevels_->find(id) : nullptr;
+    if (!rec || !rec->mapped)
+        return false;
+    const int slot = window_output(*rec);
+    if (slot < 0)
+        return false;
+    const lx::workspace_id ws = workspaces_.by_index(static_cast<unsigned>(slot), index_1based);
+    return ws && move_to_workspace(id, ws, workspaces_.config().move_follows, "binding");
+}
+
+bool lx::compositor::window_manager::move_relative(lx::toplevel_id id, int dir) {
+    sync_workspace_outputs(true);
+    const toplevel_record* rec = toplevels_ ? toplevels_->find(id) : nullptr;
+    if (!rec || !rec->mapped)
+        return false;
+    const int slot = window_output(*rec);
+    if (slot < 0)
+        return false;
+    // From the window's own workspace (a sticky window: from the active one).
+    const lx::workspace_id here =
+        rec->workspace && !rec->sticky ? rec->workspace
+                                       : workspaces_.active(static_cast<unsigned>(slot));
+    const lx::workspace_id ws = workspaces_.neighbour(here, dir);
+    return ws && move_to_workspace(id, ws, workspaces_.config().move_follows, "binding");
+}
+
+bool lx::compositor::window_manager::assign_workspace(lx::workspace_id ws, unsigned slot) {
+    if (!workspaces_.assign(ws, slot, sink())) {
+        flush_workspaces();
+        return false;
+    }
+    lx::trace::logger::global().logf(lx::trace::level::info, k_ws_category,
+                                     "workspace assign id={} output={}", ws.id(), slot);
+    update_visibility();
+    flush_workspaces();
+    return true;
+}
+
+void lx::compositor::window_manager::set_minimized(lx::toplevel_id id, bool on,
+                                                   const char* source) {
+    toplevel_record* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    // Before the map there is nothing to minimize (xdg-shell leaves it to the compositor).
+    if (!rec || !rec->mapped || rec->minimized == on)
+        return;
+    rec->minimized = on;
+    ws_windows_changed_ = true;
+    if (wm_debug_enabled()) {
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_ws_category,
+                                         "minimize id={} on={} source={}", id.id(), on ? 1 : 0,
+                                         source ? source : "-");
+    }
+    // A move or resize of it ends (it leaves the screen under the pointer).
+    if (on && grab_.mode != grab_mode::none && grab_.toplevel == id) {
+        end_grab(grab_end_reason::escape);
+        rec = toplevels_->find_mut(id);
+        if (!rec)
+            return;
+    }
+    if (shell_)
+        shell_->emit_toplevel_state(*rec);
+    update_visibility();
+    flush_workspaces();
+}
+
+void lx::compositor::window_manager::set_sticky(lx::toplevel_id id, bool on) {
+    toplevel_record* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec || !rec->mapped || rec->sticky == on)
+        return;
+    if (on) {
+        leave_workspace(*rec);
+        rec->sticky = true;
+    } else {
+        rec->sticky = false;
+        const int slot = window_output(*rec);
+        join_workspace(*rec, slot >= 0 ? workspaces_.active(static_cast<unsigned>(slot))
+                                       : lx::workspace_id{});
+    }
+    rec->workspace_dirty = true;
+    ws_dirty_ = true;
+    ws_windows_changed_ = true;
+    if (shell_)
+        shell_->emit_toplevel_flags(*rec);
+    if (wm_debug_enabled()) {
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_ws_category,
+                                         "sticky id={} on={}", id.id(), on ? 1 : 0);
+    }
+    update_visibility();
+    flush_workspaces();
+}
+
+// ── Snapping, edge snapping, keyboard move/resize (design-session-and-wm Part K) ──
+
+namespace {
+
+constexpr const char* k_snap_category = "compositor.snap";
+
+[[nodiscard]] const char* snap_name(unsigned snap) {
+    using namespace lx::compositor;
+    switch (snap) {
+    case 0: return "none";
+    case edge_left: return "left";
+    case edge_right: return "right";
+    case edge_top | edge_left: return "top-left";
+    case edge_top | edge_right: return "top-right";
+    case edge_bottom | edge_left: return "bottom-left";
+    case edge_bottom | edge_right: return "bottom-right";
+    case k_snap_maximize: return "maximize";
+    default: return "?";
+    }
+}
+
+} // namespace
+
+void lx::compositor::window_manager::set_window_config(const wm_window_config& c) {
+    window_cfg_ = c;
+    if (!c.snap_preview || !c.edge_snap)
+        hide_snap_preview();
+}
+
+void lx::compositor::window_manager::configure_now(toplevel_record& rec) {
+    rec.configure_due = true;
+    if (!rec.inflight)
+        send_configure(rec, wm_now_ns(), false, false);
+}
+
+void lx::compositor::window_manager::aim_maximized(toplevel_record& rec, int slot) {
+    const lx::rect2i area = usable_area(slot);
+    const frame_extents ext = extents_for(rec.desired.decoration, true);
+    rec.snap = 0;
+    rec.desired.states &= ~static_cast<unsigned>(tl_tiled_all);
+    rec.desired.states |= tl_maximized;
+    rec.desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
+    rec.desired.place = true;
+    rec.desired.place_at = {area.x + ext.left, area.y + ext.top};
+    rec.desired.anchor_edges = 0;
+    rec.configure_due = true;
+}
+
+void lx::compositor::window_manager::aim_snap(toplevel_record& rec, unsigned snap, int slot) {
+    const lx::rect2i g = snap_geometry(usable_area(slot), snap,
+                                       extents_for(rec.desired.decoration, false), rec.min_size,
+                                       rec.max_size);
+    rec.desired.states &= ~static_cast<unsigned>(tl_maximized | tl_tiled_all);
+    rec.desired.states |= snap_tiled_states(snap);
+    rec.desired.size = {g.width, g.height};
+    rec.desired.place = true;
+    rec.desired.place_at = {g.x, g.y};
+    // The far edges stay where they belong whatever size the client draws (a terminal that
+    // rounds to its cell grid, a minimum the half is narrower than).
+    rec.desired.anchor_edges = ((snap & edge_right) ? unsigned{edge_left} : 0u) |
+                               ((snap & edge_bottom) ? unsigned{edge_top} : 0u);
+    rec.desired.anchor = g;
+    rec.configure_due = true;
+}
+
+void lx::compositor::window_manager::set_snap(lx::toplevel_id id, unsigned snap, int slot,
+                                              const char* source) {
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec || !rec->mapped || !rec->initial_configure_sent ||
+        (rec->desired.states & tl_fullscreen))
+        return;
+    if (grab_.mode != grab_mode::none && grab_.toplevel == id) {
+        end_grab(grab_end_reason::release);
+        rec = toplevels_->find_mut(id);
+        if (!rec)
+            return;
+    }
+    const bool was_max = (rec->desired.states & tl_maximized) != 0;
+    if (slot < 0 || !(outputs_ && outputs_->slot_live(static_cast<unsigned>(slot))))
+        slot = window_output(*rec);
+    if (snap == 0) {
+        // Back to its normal geometry, kept reachable as an unmaximize keeps it.
+        rec->snap = 0;
+        rec->desired.states &= ~static_cast<unsigned>(tl_tiled_all | tl_maximized);
+        rec->desired.anchor_edges = 0;
+        if (rec->restore_set) {
+            const frame_extents ext = extents_for(rec->desired.decoration, false);
+            const lx::point2i p =
+                constrain_on_output(usable_area(slot), frame_rect(rec->restore, ext));
+            rec->desired.size = {rec->restore.width, rec->restore.height};
+            rec->desired.place = true;
+            rec->desired.place_at = {p.x + ext.left, p.y + ext.top};
+            rec->restore_set = false;
+        } else {
+            rec->desired.size = {};
+            rec->desired.place = false;
+        }
+    } else {
+        // Its normal geometry, the first time it leaves the normal state (a snapped or
+        // maximized window keeps the one it had).
+        if (!rec->snap && !was_max && rec->state == lx::toplevel_state::normal) {
+            rec->restore = rec->geometry;
+            rec->restore_set = true;
+        }
+        rec->snap = snap;
+        aim_snap(*rec, snap, slot);
+    }
+    configure_now(*rec);
+    if (shell_)
+        shell_->emit_toplevel_state(*rec);
+    lx::trace::logger::global().logf(lx::trace::level::info, k_snap_category,
+                                     "snap id={} to={} output={} source={}", id.id(),
+                                     snap_name(snap), slot, source ? source : "-");
+}
+
+bool lx::compositor::window_manager::snap_by_key(lx::toplevel_id id, snap_key key,
+                                               const char* source) {
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec || !rec->mapped || rec->hidden || (rec->desired.states & tl_fullscreen))
+        return false;
+    const bool max = (rec->desired.states & tl_maximized) != 0;
+    const snap_step st = next_snap(rec->snap, max, key);
+    switch (st.move) {
+    case snap_move::none: return false;
+    case snap_move::minimize: set_minimized(id, true, source); return true;
+    case snap_move::maximize: set_maximized(id, true, source); return true;
+    case snap_move::restore:
+        if (max)
+            set_maximized(id, false, source);
+        else
+            set_snap(id, 0, -1, source);
+        return true;
+    case snap_move::snap: break;
+    }
+    int slot = window_output(*rec);
+    if (st.output_dx != 0) {
+        // Across to the neighbouring output (Windows 11): the window joins what it shows, as
+        // window.move-to-output does; nothing beyond the edge, nothing happens.
+        const int to = neighbour_output(slot, st.output_dx, 0);
+        if (to < 0 || !move_to_output(id, st.output_dx, 0))
+            return false;
+        slot = to;
+    }
+    set_snap(id, st.snap, slot, source);
+    return true;
+}
+
+void lx::compositor::window_manager::set_snap_preview_layer(scene::container_node* layer) {
+    snap_preview_layer_ = layer;
+    if (layer)
+        (void)layer->add(&preview_);
+}
+
+lx::rect2i lx::compositor::window_manager::snap_preview_rect() const {
+    return preview_.shown() ? preview_.rect() : lx::rect2i{};
+}
+
+unsigned lx::compositor::window_manager::open_edges(int slot, double x, double y) const {
+    if (!outputs_ || slot < 0)
+        return 0;
+    const lx::rect2i o = output_area(slot);
+    const auto covered = [&](double px, double py) { return output_at(*outputs_, px, py) >= 0; };
+    unsigned open = 0;
+    if (!covered(o.x - 0.5, y))
+        open |= edge_left;
+    if (!covered(o.x + o.width + 0.5, y))
+        open |= edge_right;
+    if (!covered(x, o.y - 0.5))
+        open |= edge_top;
+    if (!covered(x, o.y + o.height + 0.5))
+        open |= edge_bottom;
+    return open;
+}
+
+void lx::compositor::window_manager::show_snap_preview(unsigned zone, int slot) {
+    if (!snap_preview_layer_ || !scene_)
+        return;
+    if (!preview_staged_ && tex_ops_.stage) {
+        // The panel's accent (#3d6fb4): a quarter of it over what is beneath, the border
+        // at 80 % — premultiplied.
+        const std::uint32_t fill = 0x400F1C2Du;
+        const std::uint32_t border = 0xCC315990u;
+        preview_staged_ =
+            tex_ops_.stage(tex_ops_.user, snap_preview::k_fill_texture, &fill, 1, 1, 1, 1, 1) &&
+            tex_ops_.stage(tex_ops_.user, snap_preview::k_border_texture, &border, 1, 1, 1, 1, 1);
+    }
+    const lx::rect2i area = usable_area(slot);
+    const lx::rect2i r = zone == k_snap_maximize ? area : snap_frame(area, zone);
+    if (preview_.shown() && rect_equal(preview_.rect(), r))
+        return;
+    if (preview_.shown())
+        scene_->note_damage(preview_.rect());
+    preview_.show(r);
+    scene_->note_damage(r);
+    if (wm_debug_enabled()) {
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_snap_category,
+                                         "snap preview zone={} output={} x={} y={} w={} h={}",
+                                         snap_name(zone), slot, r.x, r.y, r.width, r.height);
+    }
+}
+
+void lx::compositor::window_manager::hide_snap_preview() {
+    if (!preview_.shown())
+        return;
+    if (scene_)
+        scene_->note_damage(preview_.rect());
+    preview_.hide();
+    if (wm_debug_enabled())
+        lx::trace::logger::global().log(lx::trace::level::debug, k_snap_category,
+                                        "snap preview hidden");
+}
+
+void lx::compositor::window_manager::update_edge_zone() {
+    unsigned zone = 0;
+    int slot = -1;
+    if (window_cfg_.edge_snap && grab_.mode == grab_mode::move && !grab_.restore_pending) {
+        slot = pointer_output();
+        if (slot >= 0)
+            zone = edge_snap_zone(output_area(slot), grab_.now_x, grab_.now_y,
+                                  open_edges(slot, grab_.now_x, grab_.now_y),
+                                  window_cfg_.edge_snap_distance, window_cfg_.edge_snap_corner);
+    }
+    if (zone == grab_.zone && (zone == 0 || slot == grab_.zone_output))
+        return;
+    grab_.zone = zone;
+    grab_.zone_output = zone ? slot : -1;
+    if (zone && window_cfg_.snap_preview)
+        show_snap_preview(zone, slot);
+    else
+        hide_snap_preview();
+    if (wm_debug_enabled()) {
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_snap_category,
+                                         "edge zone id={} zone={} output={}", grab_.toplevel.id(),
+                                         snap_name(zone), slot);
+    }
+}
+
+void lx::compositor::window_manager::drag_restore(toplevel_record& rec) {
+    const int slot = pointer_output();
+    const lx::rect2i area = usable_area(slot);
+    // Its normal size; a window maximized before it ever mapped has none: two thirds of the
+    // usable area (the client may still pick another size in its answer).
+    const lx::size2i size = rec.restore_set && rec.restore.width > 0 && rec.restore.height > 0
+                                ? lx::size2i{rec.restore.width, rec.restore.height}
+                                : lx::size2i{area.width * 2 / 3, area.height * 2 / 3};
+    const frame_extents ext = extents_for(rec.desired.decoration, false);
+    const lx::rect2i frame = frame_rect(rec.geometry, extents_of(rec));
+    const lx::point2i o =
+        drag_restore_origin(frame, {size.width + ext.left + ext.right,
+                                    size.height + ext.top + ext.bottom},
+                            grab_.now_x, grab_.now_y);
+    const lx::point2i at{o.x + ext.left, o.y + ext.top};
+    rec.snap = 0;
+    rec.restore_set = false;
+    rec.desired.states &= ~static_cast<unsigned>(tl_maximized | tl_tiled_all);
+    rec.desired.size = size;
+    rec.desired.place = true;
+    rec.desired.place_at = at;
+    rec.desired.anchor_edges = 0;
+    configure_now(rec);
+    // The move goes on from the restored rect, the pointer where it is now.
+    grab_.restore_pending = false;
+    grab_.awaiting_restore = true;
+    grab_.start = {at.x, at.y, size.width, size.height};
+    grab_.normal = grab_.start;
+    grab_.start_x = grab_.now_x;
+    grab_.start_y = grab_.now_y;
+    if (shell_)
+        shell_->emit_toplevel_state(rec);
+    lx::trace::logger::global().logf(lx::trace::level::info, k_snap_category,
+                                     "drag restore id={} from={} x={} y={} w={} h={}",
+                                     rec.id.id(), grab_.restored_max ? "maximized"
+                                                                     : snap_name(grab_.restored_snap),
+                                     at.x, at.y, size.width, size.height);
+}
+
+bool lx::compositor::window_manager::begin_keyboard_grab(lx::toplevel_id id, grab_mode mode) {
+    const auto* rec = toplevels_ ? toplevels_->find(id) : nullptr;
+    if (!rec || !rec->mapped || rec->hidden || !seat_ || !warp_)
+        return false;
+    const lx::rect2i f = frame_rect(rec->geometry, extents_of(*rec));
+    const unsigned edges = mode == grab_mode::resize ? unsigned{edge_bottom | edge_right} : 0u;
+    if (!begin_grab(id, mode, edges, grab_source::keybinding, 0, true))
+        return false;
+    // The pointer goes where the grab holds the window: its centre, or the corner a resize
+    // starts from; motion from there drives it as a button grab's does.
+    const double x = mode == grab_mode::move ? f.x + f.width / 2.0 : f.x + f.width - 1.0;
+    const double y = mode == grab_mode::move ? f.y + f.height / 2.0 : f.y + f.height - 1.0;
+    grab_.start_x = grab_.now_x = x;
+    grab_.start_y = grab_.now_y = y;
+    warp_(warp_user_, x, y);
+    // Where the warp actually put it (clamped to the layout): the origin of every delta.
+    grab_.start_x = grab_.now_x = seat_->pointer_x();
+    grab_.start_y = grab_.now_y = seat_->pointer_y();
+    grab_.motion_pending = false;
+    lx::trace::logger::global().logf(lx::trace::level::info, k_snap_category,
+                                     "keyboard {} id={}", grab_mode_name(mode), id.id());
+    return true;
+}
+
+void lx::compositor::window_manager::keyboard_grab_step(int dx, int dy) {
+    auto* rec = toplevels_ ? toplevels_->find_mut(grab_.toplevel) : nullptr;
+    if (!rec || !warp_ || !seat_)
+        return;
+    double x = grab_.now_x;
+    double y = grab_.now_y;
+    if (grab_.mode == grab_mode::resize) {
+        // GNOME's rule: the first arrow of an axis picks that axis' edge (Left the left
+        // edge…); the resize goes on from the window as it is now, the pointer on that edge.
+        bool repick = false;
+        if (dx != 0 && !(grab_.picked & (edge_left | edge_right))) {
+            grab_.picked |= edge_left | edge_right;
+            grab_.edges = (grab_.edges & ~unsigned{edge_left | edge_right}) |
+                          (dx < 0 ? unsigned{edge_left} : unsigned{edge_right});
+            repick = true;
+        }
+        if (dy != 0 && !(grab_.picked & (edge_top | edge_bottom))) {
+            grab_.picked |= edge_top | edge_bottom;
+            grab_.edges = (grab_.edges & ~unsigned{edge_top | edge_bottom}) |
+                          (dy < 0 ? unsigned{edge_top} : unsigned{edge_bottom});
+            repick = true;
+        }
+        if (repick) {
+            if (grab_.motion_pending)
+                apply_grab();
+            // From the size last asked for (its configure may not be answered yet), at the
+            // window's place: a resize from the right or the bottom keeps the origin.
+            const lx::rect2i now{rec->geometry.x, rec->geometry.y, grab_.last_target.width,
+                                 grab_.last_target.height};
+            const lx::rect2i f = frame_rect(now, extents_of(*rec));
+            x = (grab_.edges & edge_left) ? f.x : (grab_.edges & edge_right) ? f.x + f.width - 1.0
+                                                                             : f.x + f.width / 2.0;
+            y = (grab_.edges & edge_top) ? f.y : (grab_.edges & edge_bottom) ? f.y + f.height - 1.0
+                                                                             : f.y + f.height / 2.0;
+            grab_.start = now;
+            grab_.start_x = x;
+            grab_.start_y = y;
+            rec->desired.anchor_edges = grab_.edges;
+            rec->desired.anchor = grab_.start;
+            if (cursor_)
+                cursor_->set_override(shape_for_edges(grab_.edges));
+        }
+    }
+    warp_(warp_user_, x + dx, y + dy);
+}
+
+bool lx::compositor::window_manager::quick_switch() {
+    if (!toplevels_ || locked_)
+        return false;
+    lx::toplevel_id found{};
+    toplevels_->for_each_top_down([&](const toplevel_record& r) {
+        if (r.hidden || r.minimized || r.id == keyboard_focus_ || effective_modal(*toplevels_, r))
+            return true;
+        found = r.id;
+        return false;
+    });
+    if (!found)
+        return false;
+    activate(found);
+    if (wm_debug_enabled()) {
+        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
+                                         "quick switch id={} (no shell)", found.id());
+    }
+    return true;
 }

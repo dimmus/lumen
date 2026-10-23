@@ -9,6 +9,7 @@ module;
 #endif
 
 #include <stdint.h>
+#include <unistd.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -44,8 +45,15 @@ struct keymap_source {
     uint32_t size = 0;
 };
 
-[[nodiscard]] keymap_source& shared_keymap() {
+/// The cached keymap fd: replaced when a configuration reload compiles a new keymap
+/// (`seat_keymap_invalidate`); resources it was sent to hold their own dups.
+[[nodiscard]] keymap_source& shared_keymap_slot() {
     static keymap_source cached{};
+    return cached;
+}
+
+[[nodiscard]] keymap_source& shared_keymap() {
+    keymap_source& cached = shared_keymap_slot();
     if (cached.fd >= 0)
         return cached;
 
@@ -86,6 +94,13 @@ struct keymap_source {
 }
 
 } // namespace
+
+void seat_keymap_invalidate() {
+    keymap_source& k = shared_keymap_slot();
+    if (k.fd >= 0)
+        ::close(k.fd);
+    k = keymap_source{};
+}
 
 bool seat_keymap(int& fd, unsigned& size) {
     const keymap_source& k = shared_keymap();
@@ -174,7 +189,8 @@ const struct wl_seat_interface seat_impl = {
             wl_keyboard_send_keymap(res, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, keymap.fd,
                                    keymap.size);
             if (wl_resource_get_version(res) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
-                wl_keyboard_send_repeat_info(res, 40, 400);
+                wl_keyboard_send_repeat_info(res, g_p0_ctx ? g_p0_ctx->repeat_rate : 25,
+                                             g_p0_ctx ? g_p0_ctx->repeat_delay : 600);
 
             // Registered only after the keymap is sent: a client that receives `enter`
             // before it knows the layout cannot interpret the keys it is told are held.

@@ -449,6 +449,81 @@ LUMEN_TEST(resample_icon_down_and_up) {
     LUMEN_CHECK(std::memcmp(same, small, sizeof(small)) == 0);
 }
 
+// ── Workspaces (zlm v7 toplevel_workspace + ext-workspace; design-session-and-wm W.7) ──
+
+LUMEN_TEST(workspace_membership_and_the_current_workspace_filter) {
+    task_model& m = snapshot_of(4);
+    task_handle order[8];
+    (void)m.ordered(order, 8);
+    (void)m.take_changes();
+    void* const ws1 = proxy(100);
+    void* const ws2 = proxy(101);
+    LUMEN_CHECK(m.set_workspace(order[0], ws1) && m.set_workspace(order[1], ws2));
+    LUMEN_CHECK(m.take_changes() & lx::shell::task_change_workspace);
+    // Unchanged: no change bit.
+    (void)m.set_workspace(order[0], ws1);
+    LUMEN_CHECK(!(m.take_changes() & lx::shell::task_change_workspace));
+    // w2: sticky (no workspace); w3: never told (a compositor before v7).
+    (void)m.set_flags(order[2], lx::shell::task_flag_sticky);
+    (void)m.set_workspace(order[2], nullptr);
+    // The panel lists windows of the active workspace (ws1 here), sticky and unknown ones.
+    const auto active = [](const void* ws, void*) { return ws == proxy(100); };
+    const auto listed = [&](unsigned i) {
+        return lx::shell::task_on_shown_workspace(*m.get(order[i]), active, nullptr);
+    };
+    LUMEN_CHECK(listed(0) && !listed(1) && listed(2) && listed(3));
+    // ws2's handle is removed: nobody names it; its window counts as unknown (listed) until
+    // the compositor names its new workspace.
+    m.forget_workspace(ws2);
+    LUMEN_CHECK(!m.get(order[1])->workspace && !m.get(order[1])->workspace_known && listed(1));
+    LUMEN_CHECK(m.take_changes() & lx::shell::task_change_workspace);
+}
+
+LUMEN_TEST(minimized_tasks_are_listed_dimmed) {
+    task_model& m = snapshot_of(2);
+    task_handle order[4];
+    (void)m.ordered(order, 4);
+    (void)m.set_state(order[1], "app", "w1", lx::shell::k_task_state_minimized);
+    lx::shell::panel_layout l{};
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, l);
+    LUMEN_CHECK(l.count == 2 && !(l.cells[0].flags & lx::shell::cell_minimized) &&
+                (l.cells[1].flags & lx::shell::cell_minimized));
+}
+
+LUMEN_TEST(workspace_indicator_cells_hit_and_diff) {
+    task_model& m = snapshot_of(1);
+    lx::shell::panel_ws_input ws{};
+    ws.count = 3;
+    for (unsigned i = 0; i < 3; ++i) {
+        std::snprintf(ws.items[i].name, sizeof(ws.items[i].name), "%u", i + 1);
+        ws.items[i].id = static_cast<int>(10 + i);
+    }
+    ws.items[0].flags = lx::shell::ws_cell_active | lx::shell::ws_cell_occupied;
+    lx::shell::panel_layout a{};
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, a, {}, lx::shell::panel_apps{true, false, false},
+                            {}, {}, false, &ws);
+    LUMEN_CHECK(a.ws_count == 3 && a.ws[0].x > a.apps_x + a.apps_w - 1);
+    LUMEN_CHECK(a.cells[0].x > a.ws[2].x + a.ws[2].w - 1); // the tasks follow the indicator
+    LUMEN_CHECK(lx::shell::panel_hit_workspace(a, a.ws[1].x + 2, 16) == 1);
+    LUMEN_CHECK(lx::shell::panel_hit_workspace(a, a.cells[0].x + 2, 16) == -1);
+    // Switching to 2: only the two cells repaint.
+    ws.items[0].flags = lx::shell::ws_cell_occupied;
+    ws.items[1].flags = lx::shell::ws_cell_active;
+    ++ws.items[0].rev;
+    ++ws.items[1].rev;
+    lx::shell::panel_layout b{};
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, b, {}, lx::shell::panel_apps{true, false, false},
+                            {}, {}, false, &ws);
+    lx::rect2i rects[8];
+    const unsigned n = lx::shell::panel_diff(a, b, rects, 8);
+    LUMEN_CHECK(n == 2 && rects[0].x == a.ws[0].x && rects[1].x == a.ws[1].x);
+    // One workspace only (dynamic, nothing anywhere yet): no indicator.
+    ws.count = 1;
+    lx::shell::panel_layout c{};
+    lx::shell::layout_panel(m, 1000, 32, -1, -1, {}, c, {}, {}, {}, {}, false, &ws);
+    LUMEN_CHECK(c.ws_count == 0);
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

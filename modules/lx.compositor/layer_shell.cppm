@@ -243,6 +243,25 @@ public:
     void close_surface(lx::surface_id surface);
     static constexpr unsigned k_max_outputs = 16;
 
+    /// The zone hold (ADR 010 S6): when a mapped surface of the client given here — the
+    /// shell — is destroyed while its output still exists (the shell crashed, or was stopped
+    /// to be restarted; a logout clears the client first), the exclusive zone it reserved
+    /// stays in the usable area until `release_zone_hold`, or until a surface with an
+    /// exclusive zone maps on that output (the restarted shell's panel). Maximized windows
+    /// then do not grow into the panel's strip and shrink back a moment later. Whether the
+    /// shell destroyed its surfaces before disconnecting or the connection took them makes no
+    /// difference. Null: no hold.
+    void set_zone_hold_client(void* client_native) { hold_client_ = client_native; }
+    /// Called when a hold begins: the owner ends it after its bound (5 s) with
+    /// `release_zone_hold`.
+    void set_zone_hold_started(void (*started)(void* user), void* user) {
+        hold_started_ = started;
+        hold_started_user_ = user;
+    }
+    /// Ends the hold on every output and arranges them again.
+    void release_zone_hold();
+    [[nodiscard]] bool zone_hold_active() const;
+
     /// The surface that takes the keyboard from everything but its own popups: the topmost
     /// mapped surface with `exclusive` interactivity on the top or overlay layer (overlay
     /// first, newest first). Null when none.
@@ -296,6 +315,17 @@ private:
     lx::rect2i usable_[k_max_outputs]{};
     bool arranged_[k_max_outputs]{};
     unsigned long long next_seq_ = 1;
+    /// What a held zone keeps reserved, per output: insets from each edge.
+    struct held_zone {
+        int top = 0, bottom = 0, left = 0, right = 0;
+        bool active = false;
+    };
+    void* hold_client_ = nullptr;
+    void (*hold_started_)(void*) = nullptr;
+    void* hold_started_user_ = nullptr;
+    held_zone held_[k_max_outputs]{};
+    /// `r`'s zone becomes part of its output's hold (it is going with its client).
+    void hold_zone_of(const layer_record& r);
 };
 
 } // namespace lx::compositor
@@ -657,6 +687,9 @@ void lx::compositor::layer_shell::close_output(unsigned slot) {
             close(r, "output-removed");
     }
     arranged_[slot < k_max_outputs ? slot : 0] = false;
+    // A gone output's held zone must not apply to whatever takes its slot next.
+    if (slot < k_max_outputs)
+        held_[slot] = {};
 }
 
 void lx::compositor::layer_shell::close_surface(lx::surface_id surface) {
@@ -687,6 +720,14 @@ void lx::compositor::layer_shell::arrange_all(unsigned output, lx::surface_id co
             }
         }
         arrange_layers(full, in, out, n, usable);
+        if (const held_zone& h = held_[output]; h.active) {
+            // Whatever the remaining surfaces reserve, and at least what the gone shell did.
+            const int x0 = std::max(usable.x, full.x + h.left);
+            const int y0 = std::max(usable.y, full.y + h.top);
+            const int x1 = std::min(usable.x + usable.width, full.x + full.width - h.right);
+            const int y1 = std::min(usable.y + usable.height, full.y + full.height - h.bottom);
+            usable = {x0, y0, x1 > x0 ? x1 - x0 : 0, y1 > y0 ? y1 - y0 : 0};
+        }
         bool closed_any = false;
         for (unsigned k = 0; k < n; ++k) {
             if (!in[k].participates)
@@ -747,6 +788,12 @@ void lx::compositor::layer_shell::map(layer_record& r) {
         return;
     r.mapped = true;
     r.mapped_layer = level;
+    if (r.output < k_max_outputs && held_[r.output].active && r.current.zone > 0) {
+        held_[r.output] = {};
+        lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
+                                         "zone hold released on output {}: a new zone mapped",
+                                         r.output);
+    }
     // Placed first (the tree only records the origin while unmapped), so mapping creates
     // every node where it belongs; the arrangement also counts the zone now that it maps.
     arrange_all(r.output, r.surface);
@@ -881,6 +928,10 @@ void lx::compositor::layer_shell::destroy(lx::surface_id surface) {
         return;
     const bool participated = r->initial_commit_seen && !r->closed;
     const unsigned output = r->output;
+    // The shell's panel going away other than at a logout (a crash, a stop for a restart),
+    // and not because its output went: its zone is held (ADR 010 S6).
+    if (r->mapped && !r->closed && hold_client_ && r->client_native == hold_client_)
+        hold_zone_of(*r);
     if (r->mapped)
         unmap(*r, "destroyed");
     else if (host_.surface_unmapped)
@@ -895,6 +946,46 @@ void lx::compositor::layer_shell::destroy(lx::surface_id surface) {
     // Its exclusive zone goes with it.
     if (participated)
         arrange_all(output, lx::surface_id{});
+}
+
+void lx::compositor::layer_shell::hold_zone_of(const layer_record& r) {
+    if (r.output >= k_max_outputs || r.current.zone <= 0)
+        return;
+    held_zone& h = held_[r.output];
+    const layer_props& p = r.current;
+    switch (layer_exclusive_edge(p)) {
+    case k_layer_anchor_top: h.top = std::max(h.top, p.zone + p.margin_top); break;
+    case k_layer_anchor_bottom: h.bottom = std::max(h.bottom, p.zone + p.margin_bottom); break;
+    case k_layer_anchor_left: h.left = std::max(h.left, p.zone + p.margin_left); break;
+    case k_layer_anchor_right: h.right = std::max(h.right, p.zone + p.margin_right); break;
+    default: return;
+    }
+    const bool started = !zone_hold_active();
+    h.active = true;
+    lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
+                                     "zone hold on output {}: top={} bottom={} left={} right={} "
+                                     "(the shell went without a logout)",
+                                     r.output, h.top, h.bottom, h.left, h.right);
+    if (started && hold_started_)
+        hold_started_(hold_started_user_);
+}
+
+void lx::compositor::layer_shell::release_zone_hold() {
+    for (unsigned o = 0; o < k_max_outputs; ++o) {
+        if (!held_[o].active)
+            continue;
+        held_[o] = {};
+        lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
+                                         "zone hold released on output {}", o);
+        arrange_all(o, lx::surface_id{});
+    }
+}
+
+bool lx::compositor::layer_shell::zone_hold_active() const {
+    for (const auto& h : held_)
+        if (h.active)
+            return true;
+    return false;
 }
 
 const lx::compositor::layer_record* lx::compositor::layer_shell::exclusive_focus() const {

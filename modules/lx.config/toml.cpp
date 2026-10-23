@@ -1,16 +1,16 @@
 module;
 
-// The TOML subset reader and writer (`:toml_lite`). See the partition for what is accepted.
+// The TOML subset reader and writer (`:toml`). See the partition for what is accepted.
 
 #include <math.h>
 
-module lx.compositor;
+module lx.config;
 
 import std;
 
-import :toml_lite;
+import :toml;
 
-namespace lx::compositor::toml {
+namespace lx::config::toml {
 
 namespace {
 
@@ -292,7 +292,7 @@ bool read_scalar(reader& r, value& v) {
         return true;
     }
     if (c == '{')
-        return r.error("inline tables are not supported");
+        return r.error("an inline table is not supported here");
     if (c == '[')
         return r.error("nested arrays are not supported");
     if (r.end - r.p >= 4 && !std::strncmp(r.p, "true", 4) && !bare_char(r.peek(4))) {
@@ -346,6 +346,63 @@ bool read_value(reader& r, value& v) {
     }
     v.count = n;
     return true;
+}
+
+/// `{ k = v, … }` at `r.p` (single line), reported as begin, members, end. The key of the
+/// table is in scratch and stays valid: scratch is reset per line only.
+bool read_inline_table(reader& r, const char* key, unsigned key_line, const handler& h,
+                       parse_error& err) {
+    if (!h.inline_table)
+        return r.error("inline tables are not supported in this file");
+    ++r.p; // '{'
+    err.line = key_line;
+    if (!h.inline_table(h.user, key, true, err))
+        return false;
+    r.skip_space();
+    if (r.peek() == '}') {
+        ++r.p;
+    } else {
+        for (;;) {
+            r.skip_space();
+            if (r.at_end() || *r.p == '\n' || *r.p == '\r')
+                return r.error("an inline table must end on its line");
+            const char* member = read_key(r);
+            if (!member)
+                return false;
+            r.skip_space();
+            if (r.peek() == '.')
+                return r.error("dotted keys are not supported");
+            if (r.peek() != '=')
+                return r.error("expected '=' after a key");
+            ++r.p;
+            r.skip_space();
+            if (r.peek() == '{')
+                return r.error("nested inline tables are not supported");
+            value v{};
+            if (!read_value(r, v))
+                return false;
+            if (v.type == value::kind::array && r.line != key_line)
+                return r.error("an inline table must end on its line");
+            err.line = key_line;
+            if (h.key_value && !h.key_value(h.user, member, v, err))
+                return false;
+            r.skip_space();
+            if (r.peek() == ',') {
+                ++r.p;
+                r.skip_space();
+                if (r.peek() == '}')
+                    return r.error("trailing comma in an inline table");
+                continue;
+            }
+            if (r.peek() == '}') {
+                ++r.p;
+                break;
+            }
+            return r.error("expected ',' or '}' in an inline table");
+        }
+    }
+    err.line = key_line;
+    return h.inline_table(h.user, key, false, err);
 }
 
 } // namespace
@@ -420,6 +477,13 @@ bool parse(const char* text, std::size_t length, const handler& h, parse_error& 
             return r.error("expected '=' after a key");
         ++r.p;
         r.skip_space();
+        if (r.peek() == '{') {
+            if (!read_inline_table(r, key, key_line, h, err))
+                return false;
+            if (!r.end_line())
+                return r.error("text after a value");
+            continue;
+        }
         value v{};
         if (!read_value(r, v))
             return false;
@@ -549,4 +613,4 @@ void writer::key_ints(const char* k, const long long* items, unsigned count) {
     out_ += "]\n";
 }
 
-} // namespace lx::compositor::toml
+} // namespace lx::config::toml

@@ -1,35 +1,62 @@
 flowchart TB
-    subgraph Session["user session systemd --user"]
-        U_COMP["lumen-compositor.service"]
-        U_SHELL["lumen-shell.service (session.slice)"]
+    LOGIN["console login (bash -l) or display manager<br/>(share/wayland-sessions/lumen.desktop)"]
+    LS["lumen-session<br/>imports the login environment (recorded), restores it after"]
+
+    subgraph Session["user session systemd --user (user@UID.service)"]
+        GSP["graphical-session-pre.target"]
+        GS["graphical-session.target"]
+        XA["xdg-desktop-autostart.target"]
+        SD["lumen-shutdown.target"]
+        U_COMP["lumen-compositor.service<br/>Type=notify-reload, session.slice, WatchdogSec=30s"]
+        U_SHELL["lumen-shell.service<br/>session.slice, Restart=on-failure"]
+        U_AUTO["app-ID@autostart.service (generator, app.slice)"]
         U_APP["app-lumen-ID@RANDOM.service (app.slice, transient)"]
         U_XDP["xdg-desktop-portal.service (frontend)"]
         U_PL["xdg-desktop-portal-lumen.service (Type=dbus)"]
         U_PW["xdg-desktop-portal-wlr.service (Type=dbus)"]
-        ENV["manager environment:<br/>WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP=Lumen"]
-        SK_WL["XDG_RUNTIME_DIR/lumen-0"]
-        SK_PRIV["lumen-compositor.private"]
+        ENV["manager environment:<br/>WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP=Lumen,<br/>XDG_SESSION_TYPE=wayland, LUMEN_SOCKET (exported by the compositor before READY)"]
     end
 
-    subgraph FS["filesystem"]
-        BIN["/usr/bin/lumen-compositor"]
-        MOD["/usr/lib/lumen/modules"]
-        THEMES["/usr/share/lumen/themes"]
-        PROT["/usr/share/lumen/protocols"]
+    SK_WL["XDG_RUNTIME_DIR/lumen-0 (Wayland)"]
+    SK_CTL["XDG_RUNTIME_DIR/lumen-0.varlink<br/>(io.lumen.Compositor, 0600, this UID only)"]
+    CTL["lumen-ctl"]
+    LOGIND["logind: the login session<br/>(TakeControl, SetType wayland)"]
+
+    subgraph FS["filesystem (install prefix)"]
+        BIN["bin/lumen-compositor, lumen-shell, lumen-ctl, lumen-session"]
+        UNITS["lib/systemd/user/*.service, lumen-shutdown.target"]
+        PROT["share/lumen/protocols"]
     end
 
+    LOGIN --> LS
+    LS -->|"systemctl --user --wait start"| U_COMP
+    LS -->|"afterwards (replace-irreversibly)"| SD
+    SD -.->|Conflicts| GS
+    U_COMP -->|"BindsTo, Before"| GS
+    U_COMP -->|"Wants, After"| GSP
+    U_COMP -->|Wants| U_SHELL
+    U_COMP -->|"Wants, Before"| XA
+    XA --> U_AUTO
+    U_SHELL -.->|"PartOf, After"| GS
+    U_AUTO -.->|"PartOf, After"| GS
+    U_XDP -.->|"PartOf, After"| GS
+    U_COMP -->|"SetEnvironment, then READY=1"| ENV
+    U_COMP --> LOGIND
     U_COMP --> SK_WL
-    U_COMP --> SK_PRIV
+    U_COMP --> SK_CTL
+    CTL --> SK_CTL
     U_SHELL --> SK_WL
-    U_SHELL --> SK_PRIV
     U_COMP --> BIN
     U_SHELL --> BIN
     U_SHELL -->|"StartTransientUnit (user bus)"| U_APP
     U_APP --> SK_WL
+    U_AUTO --> SK_WL
     U_APP -->|"D-Bus portal calls"| U_XDP
     U_XDP -->|"lumen-portals.conf: Screenshot"| U_PL
     U_XDP -->|"ScreenCast"| U_PW
     U_PW -->|"--choose (dmenu chooser)"| U_PL
+    ENV -.-> U_SHELL
+    ENV -.-> U_AUTO
     ENV -.-> U_PL
     ENV -.-> U_PW
     U_PL --> SK_WL

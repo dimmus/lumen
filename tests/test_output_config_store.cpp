@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 import std;
+import lx.config;
 import lx.compositor;
 
 namespace {

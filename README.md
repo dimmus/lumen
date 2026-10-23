@@ -32,6 +32,8 @@ ctest --test-dir build -R test_protocol_bind --output-on-failure
 # "Log out" button (click, then "Confirm?") or Ctrl+Alt+Backspace; Ctrl+Alt+F<n> switches VTs
 ./scripts/run-desktop.sh                       # from a text console (tty)
 ./scripts/run-desktop.sh --join-seat-session   # over SSH; see --help for -t, --decorations, -- CMD
+./scripts/run-desktop.sh --systemd             # the real login session path (units for this run only)
+./scripts/session-smoke.sh                     # judge that path on the console (scratch prefix)
 
 # Opt-in vkms KMS test
 LUMEN_TEST_VKMS=1 ctest --test-dir build -R test_kms_vkms.
@@ -57,23 +59,71 @@ configured shell binary — by default the `lumen-shell` next to `lumen-composit
 compositor logs both paths). The shell exits 0 on SIGTERM and 1 when refused or when the
 compositor goes away; `lumen-shell.service` restarts it. `LUMEN_LOG=debug` on either
 process shows the bridge traffic (`compositor.shell`, `shell.bridge`, `shell.panel`,
-`shell.launcher`, `shell.apps`, `shell.idle`).
+`shell.launcher`, `shell.apps`, `shell.idle`, `shell.notify`, `shell.tray`, `shell.menu`,
+`shell.bus`).
 
-Key bindings:
+Key bindings (the configurable ones are `config.toml`'s `[bindings]` defaults, below; the
+compositor matches every key and runs the shell's actions through zlm_shell_v1 v7):
 
 | Keys | Action | Owner |
 |------|--------|-------|
-| Ctrl+Alt+F1…F12 | Switch virtual terminal (logind `Seat.SwitchTo`); the session pauses while another VT is in front and resumes with a full modeset when switched back | compositor (always, also with no shell) |
-| Ctrl+Alt+Backspace | Log out: every window is asked to close, then the compositor stops | compositor (always) |
-| Super+left drag / Super+right drag | Move / resize the window under the pointer | compositor (placeholder) |
-| Super (tap) | Open / close the launcher (also the panel's Apps button). Super pressed and released alone; the key still reaches the focused window | shell (key grab, zlm_shell_v1 v4) |
-| Super+Return | Start a terminal (`$TERMINAL`, `xdg-terminal-exec`, or the first of foot, Alacritty, kitty, … installed) | shell (key grab) |
+| Ctrl+Alt+F1…F12 | Switch virtual terminal (logind `Seat.SwitchTo`); the session pauses while another VT is in front and resumes with a full modeset when switched back | compositor (always, also with no shell; not configurable) |
+| Ctrl+Alt+Backspace | Log out: every window is asked to close, then the compositor stops | compositor (always; not configurable) |
+| Super+left drag / Super+right drag | Move / resize the window under the pointer (`window.move-interactive`, `window.resize-interactive`) | compositor |
+| Super (tap) | Open / close the launcher (also the panel's Apps button). Super pressed and released alone; the key still reaches the focused window (`shell.launcher`) | shell |
+| Super+Return | Start a terminal (`$TERMINAL`, `xdg-terminal-exec`, or the first of foot, Alacritty, kitty, … installed) (`shell.terminal`) | shell |
+| Super+L | Lock the screen, when `idle.lock-command` is set (`shell.lock`; also while a window inhibits shortcuts) | shell |
+| Alt+F4 | Close the focused window (`window.close`) | compositor |
+| Super+Shift+Left / Right | Move the focused window to the output on that side (`window.move-to-output-left/right`) | compositor |
+| Super+1…9 | Show workspace N of the focused output (`workspace.switch N`); past the last, the empty last one | compositor |
+| Super+Shift+1…9 | Move the focused window to workspace N, and go with it (`workspace.move-window N`; `workspaces.move-follows`) | compositor |
+| Super+Page_Down / Page_Up, Super+Ctrl+Right / Left | Next / previous workspace (`workspace.next`, `workspace.previous`) | compositor |
+| … with Shift | Move the focused window to the next / previous workspace (`workspace.move-window-next/-previous`) | compositor |
+| Super+H | Minimize the focused window (`window.minimize`); its panel entry brings it back | compositor |
+| Alt+Tab, Super+Tab (held) | Switch windows, most recently used first: a quick press switches to the previous window without showing anything; holding Alt shows the switcher after 150 ms, Tab steps, letting go of Alt switches, Escape cancels (`switcher.next`); with no shell running, the topmost other window | shell (the compositor holds the keys while Alt is down) |
+| Alt+Shift+Tab, Super+Shift+Tab | The same backwards (`switcher.previous`) | shell |
+| Alt+grave, Alt+Shift+grave | The same among the focused application's windows (`switcher.next-app`, `switcher.previous-app`) | shell |
+| Super+Left / Right | Snap the focused window to the left / right half; again: a quarter with Super+Up/Down, the half of the next monitor, or back (`window.snap-left/right`, Windows 11's rules) | compositor |
+| Super+Up / Down | Maximize / restore or minimize; from a half, its top / bottom quarter (`window.snap-up/down`) | compositor |
+| Alt+F7 / Alt+F8 | Move / resize the focused window with the arrow keys (Ctrl: 1 px steps) or the mouse; Return applies, Escape cancels (`window.move-keyboard`, `window.resize-keyboard`) | compositor |
 | Super+Escape | Turn the focused window's shortcuts inhibitor off (and on again) and release its pointer lock or confinement: a VM viewer, remote desktop or game that took the desktop's shortcuts or the pointer gives them back | compositor (only when that window inhibits or constrains the pointer; never inhibitable) |
 
 A window that inhibits shortcuts (keyboard-shortcuts-inhibit: virt-viewer, remote desktops)
 receives Super, Super+Return and the other shell keys while it has the keyboard; VT switching,
 Ctrl+Alt+Backspace and Super+Escape stay the compositor's, and the shell's lock key
 (Super+L) is never inhibited.
+
+Workspaces are per output and dynamic: there is always one empty workspace at the end of
+each output's list, and an empty one you leave goes (`[workspaces] mode = "static"` with a
+`count` and `names` instead). The panel shows the workspaces of its output right of the Apps
+button — the active one highlighted, a dot on those with windows; a click or the wheel
+switches — and lists the windows of the active workspace. Switching back focuses the window
+you left there. Any ext-workspace-v1 client (waybar's `ext/workspaces`) sees and switches the
+same workspaces. When a monitor is unplugged, the windows you were looking at stay in view on
+another one and its other workspaces are appended there; plugged back, they return.
+
+Dragging a window to the left or right edge of the screen snaps it to that half (to a corner:
+a quarter; to the top: maximized), with a preview of where it goes while you hold it there;
+dragging a maximized or snapped window away restores its size under the pointer
+(`[windows]` in `config.toml`). Snapped windows tell applications they are tiled, so GTK
+draws them without shadows and rounded corners.
+
+lumen-shell is the session's **notification server** (`org.freedesktop.Notifications`,
+specification 1.2) and its **system tray** (`StatusNotifierItem`, as KDE, waybar and
+libappindicator use it). Notifications pop up at the top right of the output you work on
+(`[notifications] position`), at most three at once, and go away after their timeout — the
+pointer over them holds it; critical ones stay until dismissed and show over fullscreen
+windows. Click a notification for its default action (or to dismiss it), its buttons for
+its actions, a link to open it in the browser; the × or a right click dismisses it. The
+panel's bell lists the earlier ones (click it); a middle click on the bell, or a binding to
+`notifications.toggle-dnd`, turns **do not disturb** on and off: only critical
+notifications pop up then, the rest wait in the list. Do not disturb is also on while an
+application records or shares the screen. Nothing shows over the lock screen; what arrives
+meanwhile pops up after you unlock. Tray icons sit left of the bell: a click activates the
+application (it may raise its window), a right click opens its menu (arrow keys work), a
+middle click is its secondary action, the wheel scrolls it; hovering shows its tooltip.
+Problems in `config.toml` are reported as a notification. Another notification daemon
+(mako, dunst) that already runs keeps the job; the shell takes over when it exits.
 
 The launcher lists the applications installed as XDG desktop entries
 (`$XDG_DATA_HOME/applications`, then each `$XDG_DATA_DIRS`'s, honouring `NoDisplay`,
@@ -255,12 +305,82 @@ UML index: [docs/uml/README.md](docs/uml/README.md)
 | `LUMEN_VULKAN_VALIDATION` | OFF | Vulkan validation layers |
 | `LUMEN_BUILD_PORTAL` | ON | xdg-desktop-portal-lumen (needs libsystemd and wayland-client) |
 
-## systemd (user session)
+## Login session (systemd)
 
-Install unit files from `deploy/systemd/`. Socket: `$XDG_RUNTIME_DIR/lumen-0`.
-`cmake --install` also installs the portal backend (libexec), `lumen.portal`,
-`lumen-portals.conf`, its D-Bus service and user unit, and xdg-desktop-portal-wlr's `Lumen`
-config.
+`cmake --install build/release [--prefix DIR]` installs a complete session: `lumen-compositor`,
+`lumen-shell`, `lumen-ctl` and the launcher `lumen-session` in `bin/`; the systemd user units
+`lumen-compositor.service`, `lumen-shell.service` and `lumen-shutdown.target` (systemd's user
+unit directory for `/usr`, else `<prefix>/lib/systemd/user`; `-DLUMEN_SYSTEMD_USER_UNIT_DIR=`
+overrides); `share/wayland-sessions/lumen.desktop` for display managers; and the portal backend
+(libexec), `lumen.portal`, `lumen-portals.conf`, its D-Bus service and user unit, and
+xdg-desktop-portal-wlr's `Lumen` config. Every path is configured at install time for the
+prefix installed to. Nothing is enabled.
+
+Start a session from a text console login with `lumen-session`, or pick "Lumen" in a display
+manager. It imports the login's environment into the systemd user manager, starts
+`lumen-compositor.service` (bound to `graphical-session.target`; it pulls in the shell and XDG
+autostart, and exports `WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP=Lumen`, `LUMEN_SOCKET` before
+it reports ready), waits for the session to end, and puts the manager's environment back as
+it was. A crashed shell is restarted by systemd; a crashed or hung compositor (watchdog, 30 s)
+ends the session back to the login. `LUMEN_DISPLAY=NAME` picks the socket name (default
+`lumen-0`). Logs: `journalctl --user -u lumen-compositor -u lumen-shell`.
+
+## Configuration
+
+One file: `~/.config/lumen/config.toml` (`$XDG_CONFIG_HOME`), read over
+`/etc/xdg/lumen/config.toml` (`$XDG_CONFIG_DIRS`) key by key. Without one every default
+applies. `lumen-ctl config defaults` prints the documented file with every key at its
+default (installed as `share/lumen/config.toml`): keyboard layouts, variants, options and
+repeat; touchpad, mouse and trackpoint settings (tap, natural scrolling, acceleration
+profile and speed, left-handed, disable-while-typing, scroll factor; per device with
+`[[input.device]]`); cursor theme and size; click or sloppy focus; the shell's idle and lock
+policy, background, window switcher and notifications (position, timeouts by urgency,
+popups shown at once, do not disturb while sharing, history size); and `[bindings]`:
+
+```toml
+[input.keyboard]
+layout = "us,ru"
+options = "grp:alt_shift_toggle"
+repeat-rate = 30
+
+[input.touchpad]
+natural-scroll = false
+
+[idle]
+lock-command = "swaylock -f"
+
+[bindings]
+"Super+T" = "shell.terminal"
+"Super+Return" = "none"                     # removes a default
+"Super+F" = { action = "window.fullscreen-toggle", allow-when-inhibited = true }
+```
+
+The compositor watches the file: a change applies as it is saved (also `lumen-ctl reload`,
+`systemctl --user reload lumen-compositor`). A syntax error keeps the configuration in use; a
+bad value keeps that key's previous value; unknown keys are warned about with a suggestion.
+Problems are logged (`config` category), shown as a notification, printed by `lumen-ctl reload`,
+and `lumen-ctl config check [FILE]` validates a file without a session. `LUMEN_CONFIG=PATH`
+uses only that file, `LUMEN_CONFIG=0` none. lumen-shell's command-line options override the
+`[idle]` and `[background]` keys. Outputs are configured in `outputs.toml` (written by
+`wlr-randr`/`kanshi` applies), not here.
+
+`lumen-ctl` controls the running session over its Varlink socket
+(`$XDG_RUNTIME_DIR/<display>.varlink`, this user only; `varlinkctl introspect` describes it):
+
+```bash
+lumen-ctl status            # health in one screen + the session's units; exit 0 ok, 1 degraded, 2 critical
+lumen-ctl health --json     # the full report
+lumen-ctl outputs | windows | workspaces   # workspaces: output, position, name, active, windows
+lumen-ctl action workspace.switch 2  # and workspace.move-window 2, window.sticky-toggle, …
+lumen-ctl action window.close        # every binding's action; lumen-ctl action --list
+lumen-ctl action notifications.toggle-dnd   # also notifications.dismiss, notifications.dismiss-all
+lumen-ctl reload            # re-read the configuration, print its problems (exit 1: rejected)
+lumen-ctl config check      # validate the configuration offline (keymap included)
+lumen-ctl config defaults   # the documented default configuration
+lumen-ctl logout
+lumen-ctl monitor           # focus, window, workspace, health and configuration events as they happen
+systemctl --user reload lumen-compositor   # SIGHUP: re-read the configuration
+```
 
 ## License
 

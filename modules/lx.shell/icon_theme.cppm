@@ -114,6 +114,26 @@ bool file_exists(const std::string& path) {
 #endif
 }
 
+/// A symbolic icon's file (icon-naming-spec: "-symbolic"; GTK's pre-rendered ".symbolic.png").
+bool is_symbolic_file(const std::string& path) {
+    const std::size_t dot = path.rfind('.');
+    if (dot == std::string::npos)
+        return false;
+    const std::string_view stem(path.data(), dot);
+    return stem.ends_with("-symbolic") || stem.ends_with(".symbolic");
+}
+
+/// Symbolic icons are monochrome shapes in a dark grey meant for light backgrounds; the
+/// shell's surfaces (panel, menus, cards, switcher) are dark, so they are drawn in its text
+/// colour instead, as GTK and Plasma recolour them to their foreground.
+void recolour_symbolic(std::vector<std::uint32_t>& px) {
+    constexpr unsigned r = 0xE6, g = 0xE6, b = 0xE6;
+    for (auto& p : px) {
+        const unsigned a = p >> 24;
+        p = (a << 24) | ((r * a / 255u) << 16) | ((g * a / 255u) << 8) | (b * a / 255u);
+    }
+}
+
 bool dir_exists(const std::string& path) {
 #if !defined(_WIN32)
     struct stat st{};
@@ -576,6 +596,8 @@ const std::uint32_t* lx::shell::icon_theme::lookup(const char* name, int px) {
     const std::string file = find_file(name, px);
     if (!file.empty() && !decode(file, px, entry.pixels))
         entry.pixels.clear();
+    else if (!entry.pixels.empty() && is_symbolic_file(file))
+        recolour_symbolic(entry.pixels);
     if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
         lx::trace::logger::global().logf(
             lx::trace::level::debug, k_icon_category, "icon {} {}px -> {}{}", name, px,

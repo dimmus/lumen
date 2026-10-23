@@ -60,6 +60,10 @@ public:
         wake_user_ = user;
     }
 
+    /// Premultiplied ARGB8888 buffers instead of XRGB (before `allocate`; sticky): rounded
+    /// corners over whatever is beneath (the window switcher). `clear` makes a buffer
+    /// transparent, and rounded fills blend their corners with the alpha channel too.
+    void set_alpha(bool on) { alpha_ = on; }
     /// (Re)allocates both buffers for a `width`×`height` (logical) surface at the current
     /// scale (`shm` is a wl_shm*).
     [[nodiscard]] bool allocate(void* shm, int width, int height, const char* name);
@@ -97,6 +101,8 @@ public:
     [[nodiscard]] bool frame_pending() const { return frame_ != nullptr; }
 
     // ── Painting into a buffer ──
+    /// Every pixel transparent (alpha buffers) or black.
+    void clear(int buffer);
     void fill(int buffer, lx::rect2i r, std::uint32_t color);
     /// A rounded rect over `under`: corners blend by analytic pixel coverage.
     void fill_rounded(int buffer, lx::rect2i r, std::uint32_t color, std::uint32_t under,
@@ -115,6 +121,20 @@ public:
               lx::text::font_desc font, align a = align::left);
     /// Width `text` would take (logical), or -1.
     [[nodiscard]] int text_width(const char* utf8, lx::text::font_desc font);
+    /// The scale (1 without fractional scale).
+    [[nodiscard]] double scale_factor() const { return scale(); }
+    /// Lays out `text` with `spans` wrapped to `logical_width`, at most `max_lines` lines,
+    /// at this canvas's scale (fonts and widths in pixels). Returns its logical height
+    /// (rounded up); 0 when it cannot be shaped.
+    int wrap(std::string_view text, std::span<const lx::text::text_span> spans,
+             lx::text::font_desc font, int logical_width, unsigned max_lines,
+             lx::text::wrapped_text& out) const;
+    /// Draws what `wrap` laid out, its top-left at `logical`'s origin, clipped to `logical`.
+    void draw_wrapped(int buffer, lx::rect2i logical, std::string_view text,
+                      std::span<const lx::text::text_span> spans, const lx::text::wrapped_text& w,
+                      lx::text::font_desc font, lx::text::span_color_fn color, void* user);
+    /// The piece of `w` under the logical point (relative to its box's origin), or -1.
+    [[nodiscard]] int wrapped_hit(const lx::text::wrapped_text& w, double x, double y) const;
 
     struct events;
 
@@ -141,6 +161,7 @@ private:
     unsigned scale120_ = 120;
     bool rescale_ = false;
     bool viewport_dirty_ = false;
+    bool alpha_ = false;
     [[nodiscard]] double scale() const { return scale120_ / 120.0; }
     /// A logical rect on the pixel grid, edge by edge (adjacent rects share edges).
     [[nodiscard]] lx::rect2i px(lx::rect2i r) const;
@@ -164,7 +185,25 @@ constexpr const char* k_canvas_category = "shell.panel";
     return 0xFF000000u | (r << 16) | (g << 8) | b;
 }
 
+/// `mix` with the alpha channel blended as well: premultiplied colours over premultiplied
+/// ones (a transparent `under` gives the coverage-scaled colour).
+[[nodiscard]] std::uint32_t mix_premultiplied(std::uint32_t over, std::uint32_t under,
+                                              unsigned a /*0..255*/) {
+    const unsigned ia = 255u - a;
+    std::uint32_t out = 0;
+    for (unsigned shift = 0; shift < 32; shift += 8) {
+        const unsigned v = (((over >> shift) & 0xFFu) * a + ((under >> shift) & 0xFFu) * ia + 127u) / 255u;
+        out |= v << shift;
+    }
+    return out;
+}
+
 } // namespace
+
+void lx::shell::shm_canvas::clear(int bi) {
+    if (std::uint32_t* p = buffers_[bi].pixels)
+        std::fill(p, p + static_cast<std::ptrdiff_t>(pw_) * ph_, alpha_ ? 0u : 0xFF000000u);
+}
 
 lx::rect2i lx::shell::shm_canvas::px(lx::rect2i r) const {
     if (scale120_ == 120)
@@ -210,7 +249,7 @@ void lx::shell::shm_canvas::fill_rounded(int bi, lx::rect2i logical, std::uint32
             float cov = static_cast<float>(rad) - std::sqrt(dx * dx + dy * dy) + 0.5f;
             cov = cov < 0.f ? 0.f : (cov > 1.f ? 1.f : cov);
             const unsigned a = static_cast<unsigned>(cov * 255.f + 0.5f);
-            const std::uint32_t v = mix(c, under, a);
+            const std::uint32_t v = alpha_ ? mix_premultiplied(c, under, a) : mix(c, under, a);
             const int xl = r.x + cx, xr = r.x + r.width - 1 - cx;
             const int yt = r.y + cy, yb = r.y + r.height - 1 - cy;
             px[static_cast<std::ptrdiff_t>(yt) * pw_ + xl] = v;
@@ -289,6 +328,44 @@ int lx::shell::shm_canvas::text_width(const char* utf8, lx::text::font_desc font
     if (!lx::text::shape_line(utf8, font, line_))
         return -1;
     return line_.width_px;
+}
+
+int lx::shell::shm_canvas::wrap(std::string_view text, std::span<const lx::text::text_span> spans,
+                                lx::text::font_desc font, int logical_width, unsigned max_lines,
+                                lx::text::wrapped_text& out) const {
+    const double s = scale();
+    font.size_pt = static_cast<float>(font.size_pt * s);
+    if (!lx::text::wrap_text(text, spans, font, static_cast<int>(logical_width * s), max_lines, out))
+        return 0;
+    if (out.line_count == 0)
+        return 0;
+    const int px_h = static_cast<int>(out.line_count) * out.line_height_px;
+    return static_cast<int>(std::ceil(px_h / s));
+}
+
+void lx::shell::shm_canvas::draw_wrapped(int bi, lx::rect2i logical, std::string_view text,
+                                         std::span<const lx::text::text_span> spans,
+                                         const lx::text::wrapped_text& w, lx::text::font_desc font,
+                                         lx::text::span_color_fn color, void* user) {
+    std::uint32_t* px = buffers_[bi].pixels;
+    const lx::rect2i box = this->px(logical);
+    if (!px || box.width <= 0 || box.height <= 0)
+        return;
+    const int x0 = box.x < 0 ? 0 : box.x, y0 = box.y < 0 ? 0 : box.y;
+    const int x1 = box.x + box.width > pw_ ? pw_ : box.x + box.width;
+    const int y1 = box.y + box.height > ph_ ? ph_ : box.y + box.height;
+    if (x1 <= x0 || y1 <= y0)
+        return;
+    font.size_pt = static_cast<float>(font.size_pt * scale());
+    lx::text::raster_target target{px + static_cast<std::ptrdiff_t>(y0) * pw_ + x0, x1 - x0,
+                                   y1 - y0, pw_};
+    (void)lx::text::render_wrapped(text, spans, w, font, color, user, target,
+                                   {box.x - x0, box.y - y0});
+}
+
+int lx::shell::shm_canvas::wrapped_hit(const lx::text::wrapped_text& w, double x, double y) const {
+    const double s = scale();
+    return lx::text::wrapped_piece_at(w, static_cast<int>(x * s), static_cast<int>(y * s));
 }
 
 int lx::shell::shm_canvas::acquire() const {
@@ -377,7 +454,8 @@ bool lx::shell::shm_canvas::allocate(void* shm, int logical_w, int logical_h, co
     for (int i = 0; i < 2; ++i) {
         buffer& b = buffers_[i];
         auto* wb = wl_shm_pool_create_buffer(pool, static_cast<int32_t>(one) * i, width, height,
-                                             static_cast<int32_t>(stride), WL_SHM_FORMAT_XRGB8888);
+                                             static_cast<int32_t>(stride),
+                                             alpha_ ? WL_SHM_FORMAT_ARGB8888 : WL_SHM_FORMAT_XRGB8888);
         wl_buffer_add_listener(wb, &k_canvas_buffer_listener, this);
         b.wl = wb;
         b.pixels = reinterpret_cast<std::uint32_t*>(static_cast<unsigned char*>(data) + one * i);

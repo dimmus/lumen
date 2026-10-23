@@ -8,6 +8,8 @@ sequenceDiagram
     Comp->>Shell: capabilities(flags, version)
     Comp->>Shell: lock_state(state) (v5: on bind and on every change)
     Comp->>Shell: capture_state(active) (v6: on bind and on every change)
+    Comp->>Shell: config(sealed memfd, size, generation) → config_diagnostic* → config_done (v7: on bind)
+    Note over Shell: parses the bytes with lx.config, applies [idle] and [background]<br/>(its command line wins)
     Shell->>Comp: get_policy_bridge()
     Comp->>Shell: snapshot_begin
     Note over Comp: no snapshot_workspace / snapshot_output yet<br/>(no workspace objects; wl_output not per-client)
@@ -16,7 +18,7 @@ sequenceDiagram
     Comp->>Shell: snapshot_done
     Comp->>Shell: focus_changed (the focused handle, or null)
     Note over Shell: task model complete: the panel draws<br/>(never while a snapshot is in progress)
-    Shell->>Comp: grab_key(keysym, modifiers, flags) (v4, ×N: Super_L/Super_R taps)
+    Shell->>Comp: grab_key(keysym, modifiers, flags) (v4–v6 compositors only, ×N: Super_L/Super_R taps)
     Comp-->>Shell: zlm_key_grab_v1.refused(reason) (reserved / taken / invalid only)
 
     Comp->>Shell: toplevel_created (new zlm_toplevel_v1, workspace=null)
@@ -48,3 +50,10 @@ sequenceDiagram
     Comp->>Shell: bell(toplevel | null) (≤ 4/s per client, none while locked)
     Note over Shell: flashes the window (overlay layer surface, 120 ms)
     Shell->>Comp: grab_key(Super+L, not_inhibitable) (v6)
+
+    Note over Shell,Comp: The configuration and actions (v7)
+    Comp->>Shell: action("shell.terminal", "", serial, time) (a [bindings] key, or lumen-ctl: serial 0)
+    Note over Shell: serial = a key press delivered to the shell
+    Note over Comp: config.toml saved → inotify → 100 ms → parse → apply<br/>(keymap and cursor on the worker)
+    Comp->>Shell: config(memfd) (only when the accepted bytes changed) → config_diagnostic* → config_done(applied)
+    Note over Shell: one panel notice per generation with problems

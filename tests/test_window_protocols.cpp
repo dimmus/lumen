@@ -1062,7 +1062,7 @@ void security_cases() {
                             "ext_session_lock_manager_v1", "zwlr_output_manager_v1",
                             "ext_idle_notifier_v1", "zwp_input_method_manager_v2",
                             "zwp_virtual_keyboard_manager_v1", "zwlr_output_power_manager_v1",
-                            "zlm_shell_v1"};
+                            "zlm_shell_v1", "ext_workspace_manager_v1"};
     const char* visible[] = {"wl_compositor", "xdg_wm_base", "zxdg_exporter_v2", "zxdg_importer_v2",
                              "xdg_wm_dialog_v1", "xdg_toplevel_icon_manager_v1", "xdg_system_bell_v1",
                              "zwp_keyboard_shortcuts_inhibit_manager_v1"};

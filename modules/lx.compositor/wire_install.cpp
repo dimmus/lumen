@@ -62,6 +62,9 @@ module;
 #include "wlr-output-management-unstable-v1-server-protocol.h"
 #define LUMEN_HAS_OUTPUT_MANAGEMENT 1
 #endif
+#if defined(LUMEN_PROTOCOL_EXT_WORKSPACE_V1)
+#include "ext-workspace-v1-server-protocol.h"
+#endif
 #if defined(LUMEN_PROTOCOL_EXT_SESSION_LOCK_V1)
 #include "ext-session-lock-v1-server-protocol.h"
 #define LUMEN_HAS_SESSION_LOCK 1
@@ -273,6 +276,13 @@ void install_core(p0_protocol_context& ctx) {
         ops.send_close = &wm_send_close;
         ctx.notify_session_ending = &shell_send_session_ending;
         ctx.fire_key_grab = &shell_fire_key_grab;
+        ctx.send_shell_config = &shell_send_config;
+        ctx.invalidate_seat_keymap = &seat_keymap_invalidate;
+        ctx.send_shell_action = &shell_send_action;
+        ctx.send_held_action = &shell_send_held_action;
+        ctx.send_hold_key = &shell_send_hold_key;
+        ctx.send_hold_released = &shell_send_hold_released;
+        ctx.send_hold_cancelled = &shell_send_hold_cancelled;
         ctx.notify_lock_state = &shell_send_lock_state;
         ctx.notify_lock_requested = &shell_send_lock_requested;
         ops.last_user_serial = &wm_last_user_serial;
@@ -306,7 +316,7 @@ void install_core(p0_protocol_context& ctx) {
     if (ctx.shell)
         ctx.shell->set_icons(ctx.icons);
     ctx.server->add_global({.interface_name = "zlm_shell_v1",
-                            .version = 6,
+                            .version = 7,
                             .privileged = true,
                             .interface_desc = &zlm_shell_v1_interface},
                            bind_shell);
@@ -677,6 +687,18 @@ void install_core(p0_protocol_context& ctx) {
                                 .deny_sandboxed = true,
                                 .interface_desc = &ext_foreign_toplevel_list_v1_interface},
                                &bind_foreign_toplevel_list);
+#endif
+#if defined(LUMEN_PROTOCOL_EXT_WORKSPACE_V1)
+    // ext-workspace (design-session-and-wm W.4): the workspaces of every output, which the
+    // shell's indicator and any bar show and switch. Session-wide: not for sandboxed
+    // clients.
+    if (ctx.wm)
+        ctx.server->add_global({.interface_name = "ext_workspace_manager_v1",
+                                .version = 1,
+                                .privileged = false,
+                                .deny_sandboxed = true,
+                                .interface_desc = &ext_workspace_manager_v1_interface},
+                               &bind_workspace_manager);
 #endif
 #if defined(LUMEN_PROTOCOL_EXT_IMAGE_CAPTURE_SOURCE_V1) &&                                    \
     defined(LUMEN_PROTOCOL_EXT_IMAGE_COPY_CAPTURE_V1)

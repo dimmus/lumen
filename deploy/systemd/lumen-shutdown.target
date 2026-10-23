@@ -1,0 +1,9 @@
+# Started by lumen-session after the compositor has gone (with
+# --job-mode=replace-irreversibly): it conflicts with both session targets, so whatever of
+# the graphical session is still up — after a crash, too — is stopped.
+[Unit]
+Description=Shut down the Lumen session
+DefaultDependencies=no
+StopWhenUnneeded=true
+Conflicts=graphical-session.target graphical-session-pre.target
+After=graphical-session.target graphical-session-pre.target

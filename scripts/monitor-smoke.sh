@@ -28,6 +28,19 @@
 #   remove   Virtual-2 goes: the probe sees `wl_output removed`, its window enters Virtual-1,
 #            lumen-shell's panel there is closed, the pipeline is retired (CRTC off)
 #   return   Virtual-2 comes back: the window returns to it (home)
+#   workspaces  two workspaces on Virtual-2 (lumen-ctl, lumen-probe window): unplugged, the
+#            active one's window stays visible on Virtual-1 and the other workspace is
+#            appended there (its window still hidden); plugged back, both return to their
+#            places, the one that was active is again, and lumen-shell's indicator on
+#            Virtual-2 shows them
+#   snap     a window on Virtual-2 snapped by Super+Left (its left half), again (Virtual-1's
+#            right half: across to the output to the left), Super+Right (Virtual-2's left
+#            half again: across to the right), Super+Right (restored); a
+#            Super+drag dropped at the edge the outputs share does not snap, one dropped at
+#            Virtual-2's outer right edge snaps to its right half; unplugged, the window is
+#            Virtual-1's right half, plugged back Virtual-2's again
+#   notify   a notification while a window on Virtual-2 has the keyboard: the popups are on
+#            Virtual-2; unplugged, they are shown on Virtual-1
 #   capture  screen capture across hotplug: a session of Virtual-1 gets new constraints when
 #            its mode changes and then a full frame at the new size; a session of Virtual-2
 #            stops when it is unplugged, its pending frame failed as stopped
@@ -78,7 +91,7 @@ SOCKET="lumen-monitor-smoke"
 LOG_DIR="${ROOT}/monitor-smoke-logs"
 JOIN_SEAT=0
 COUNTDOWN=3
-ONLY="add,pointer,place,resize,remove,return,capture,vt,power,lock,randr,swap,mgmt-errors,kanshi,idle,persist"
+ONLY="add,pointer,place,resize,remove,return,workspaces,snap,notify,capture,vt,power,lock,randr,swap,mgmt-errors,kanshi,idle,persist"
 while (( $# > 0 )); do
   case "$1" in
     --join-seat-session) JOIN_SEAT=1 ;;
@@ -250,7 +263,8 @@ fi
 for _ in $(seq 1 50); do [[ -S "$SOCKET_PATH" ]] && break; sleep 0.1; done
 check "start: udev hotplug monitor" "$(grep -q 'hotplug: udev monitor on drm' "$CLOG"; echo $?)" \
   "$(grep -m1 -oE 'hotplug: udev monitor on drm \S+' "$CLOG" || echo 'no monitor line')"
-start_client "$LOG_DIR/shell.log" env LUMEN_LOG=debug "$SHELL_BIN"
+# Its state (next notification id, do-not-disturb) in this run's directory, not the user's.
+start_client "$LOG_DIR/shell.log" env LUMEN_LOG=debug LUMEN_SHELL_STATE="$LOG_DIR/shell-state" "$SHELL_BIN"
 SH_PID=$LAST_PID
 wait_after "$LOG_DIR/shell.log" 0 "panel requested on output Virtual-1" 5
 inject move 200 $(( H0 - 100 ))
@@ -395,6 +409,175 @@ if want return; then
       "$(grep -oE "home output=.*|added name=Virtual-2 .*windows_returned=[0-9]+" <<<"$A" | tr '\n' ' ') $(grep -E "surface (enter|leave)" <<<"$P" | tr '\n' ' ')"
   else
     record "return: the window goes back to Virtual-2 (home)" SKIP "needs the place group"
+  fi
+fi
+
+# ── workspaces ───────────────────────────────────────────────────────────────────────
+if want workspaces; then
+  # Workspaces across hotplug (design-session-and-wm W.6): Virtual-2 with two workspaces —
+  # 1 (window a, and the place group's window when it ran) behind 2 (window b, active). Unplugged: b joins what Virtual-1 shows (it
+  # stays visible), a's workspace is appended to Virtual-1's list (still hidden). Plugged
+  # back: both return to their places, 2 active again, b shown on Virtual-2.
+  ensure_two
+  CTL=("$BUILD/lumen-ctl" --socket "$XDG_RUNTIME_DIR/$SOCKET.varlink")
+  V1W=$("${CTL[@]}" outputs | awk '$1 == "Virtual-1" { split($2, m, "x"); print m[1]; exit }')
+  V1W=${V1W:-$W0}
+  inject move $(( V1W + 512 )) 300; sleep 0.3
+  M=$(mark "$CLOG")
+  start_client "$LOG_DIR/probe-ws-a.log" "$PROBE" window --app-id ws-a --title ws-a --exit-after 120
+  WSA_PID=$LAST_PID
+  wait_after "$CLOG" "$M" "map id=[0-9]+ app_id=ws-a" 5; sleep 0.3
+  start_client "$LOG_DIR/probe-ws-b.log" "$PROBE" window --app-id ws-b --title ws-b --exit-after 120
+  WSB_PID=$LAST_PID
+  wait_after "$CLOG" "$M" "map id=[0-9]+ app_id=ws-b" 5; sleep 0.3
+  # b (focused) to workspace 2, and the view with it (move-follows).
+  "${CTL[@]}" action workspace.move-window 2 >"$LOG_DIR/ws-move.txt" 2>&1; sleep 0.5
+  "${CTL[@]}" workspaces >"$LOG_DIR/ws-before.txt" 2>&1
+  check "workspaces: Virtual-2 has 1 (ws-a) and 2 (ws-b, active)" \
+    "$(grep -qE '^Virtual-2 +1 +1 +[0-9]+ windows? ' "$LOG_DIR/ws-before.txt" && grep -qE '^Virtual-2 +2 +2 +active +1 window' "$LOG_DIR/ws-before.txt"; echo $?)" \
+    "$(tr '\n' ';' <"$LOG_DIR/ws-before.txt")"
+  M=$(mark "$CLOG"); MA=$(mark "$LOG_DIR/probe-ws-a.log"); MB=$(mark "$LOG_DIR/probe-ws-b.log")
+  layout "${TWO[0]}"
+  wait_after "$CLOG" "$M" "output [0-9]+ removed|retire" 5; sleep 1
+  "${CTL[@]}" workspaces >"$LOG_DIR/ws-removed.txt" 2>&1
+  "${CTL[@]}" windows >"$LOG_DIR/ws-removed-windows.txt" 2>&1
+  B_LAST=$(grep -E '^configure ' "$LOG_DIR/probe-ws-b.log" | tail -1)
+  A_LAST=$(grep -E '^configure ' "$LOG_DIR/probe-ws-a.log" | tail -1)
+  check "workspaces: unplugged, ws-b stays visible on Virtual-1, ws-a's workspace is appended there" \
+    "$(! grep -q '^Virtual-2' "$LOG_DIR/ws-removed.txt" && grep -qE 'ws-b +normal +Virtual-1' "$LOG_DIR/ws-removed-windows.txt" && [[ "$B_LAST" != *suspended* && "$A_LAST" == *suspended* ]] && grep -qE '^Virtual-1 +[0-9]+ +[0-9]+ +[1-9][0-9]* windows? ' "$LOG_DIR/ws-removed.txt"; echo $?)" \
+    "$(tr '\n' ';' <"$LOG_DIR/ws-removed.txt") b: $B_LAST a: $A_LAST"
+  M=$(mark "$CLOG")
+  layout "${TWO[@]}"
+  wait_after "$CLOG" "$M" "output [0-9]+ added name=Virtual-2" 5; sleep 1
+  "${CTL[@]}" workspaces >"$LOG_DIR/ws-back.txt" 2>&1
+  "${CTL[@]}" windows >"$LOG_DIR/ws-back-windows.txt" 2>&1
+  B_LAST=$(grep -E '^configure ' "$LOG_DIR/probe-ws-b.log" | tail -1)
+  check "workspaces: plugged back, both workspaces return to Virtual-2, 2 active, ws-b shown there" \
+    "$(grep -qE '^Virtual-2 +1 +1 +[1-9][0-9]* windows? ' "$LOG_DIR/ws-back.txt" && grep -qE '^Virtual-2 +2 +2 +active +1 window' "$LOG_DIR/ws-back.txt" && grep -qE 'ws-b +normal +Virtual-2' "$LOG_DIR/ws-back-windows.txt" && [[ "$B_LAST" != *suspended* ]]; echo $?)" \
+    "$(tr '\n' ';' <"$LOG_DIR/ws-back.txt") b: $B_LAST"
+  check "workspaces: lumen-shell's indicator on Virtual-2 follows" \
+    "$(grep -qE 'workspaces \[1\+ 2\*\+ 3\] output=Virtual-2' "$LOG_DIR/shell.log"; echo $?)" \
+    "$(grep -oE 'workspaces \[.*\] output=Virtual-2' "$LOG_DIR/shell.log" | tail -2 | tr '\n' ';')"
+  stop_client "$WSA_PID"; stop_client "$WSB_PID"
+fi
+
+# ── snap ─────────────────────────────────────────────────────────────────────────────
+if want snap; then
+  # Snapping across outputs (design-session-and-wm K.3, K.4): Windows 11's Super+Left from a
+  # left half goes to the right half of the output to the left; an edge between two outputs
+  # is no snap zone, the outer edge is; a snapped window keeps its half through unplug and
+  # replug.
+  ensure_two
+  CTL=("$BUILD/lumen-ctl" --socket "$XDG_RUNTIME_DIR/$SOCKET.varlink")
+  read -r V1W V1H < <("${CTL[@]}" outputs | awk '$1 == "Virtual-1" { for (i = 1; i < NF; ++i) if ($i == "logical") { split($(i + 1), m, "x"); print m[1], m[2]; exit } }')
+  V1W=${V1W:-$W0}; V1H=${V1H:-$H0}
+  # The usable areas under the 32 px panels.
+  V1UH=$(( V1H - 32 )); V2UH=$(( 768 - 32 ))
+  inject move $(( V1W + 512 )) 400; sleep 0.3
+  M=$(mark "$CLOG")
+  start_client "$LOG_DIR/probe-snap.log" "$PROBE" window --app-id snap --title snap --size 400x300 --exit-after 120
+  SN_PID=$LAST_PID
+  wait_after "$CLOG" "$M" "map id=[0-9]+ app_id=snap" 5; sleep 0.5
+  SN_ID=$(after "$CLOG" "$M" | grep -oE "map id=[0-9]+ app_id=snap" | head -1 | sed -E 's/map id=([0-9]+).*/\1/')
+  last_cfg() { grep -E '^configure ' "$LOG_DIR/probe-snap.log" | tail -1; }
+  win_line() { "${CTL[@]}" windows | grep -E ' snap ' | head -1; }
+  "${CTL[@]}" action window.snap-left >/dev/null 2>&1; sleep 0.6
+  C1=$(last_cfg); W1=$(win_line)
+  check "snap: Super+Left on Virtual-2 — its left half (512x${V2UH}, tiled)" \
+    "$([[ "$C1" == "configure w=512 h=${V2UH} states="*tiled_left* && "$W1" == *Virtual-2* && "$W1" == *tiled* ]]; echo $?)" \
+    "$C1 | $W1"
+  "${CTL[@]}" action window.snap-left >/dev/null 2>&1; sleep 0.6
+  C2=$(last_cfg); W2=$(win_line)
+  check "snap: Super+Left again — the right half of Virtual-1 ($(( V1W - (V1W + 1) / 2 ))x${V1UH})" \
+    "$([[ "$C2" == "configure w=$(( V1W - (V1W + 1) / 2 )) h=${V1UH} states="*tiled_left* && "$W2" == *Virtual-1* ]]; echo $?)" \
+    "$C2 | $W2"
+  "${CTL[@]}" action window.snap-right >/dev/null 2>&1; sleep 0.6
+  C3=$(last_cfg); W3=$(win_line)
+  check "snap: Super+Right from that right half — across to Virtual-2's left half" \
+    "$([[ "$C3" == "configure w=512 h=${V2UH} states="*tiled* && "$W3" == *Virtual-2* ]]; echo $?)" \
+    "$C3 | $W3"
+  "${CTL[@]}" action window.snap-right >/dev/null 2>&1; sleep 0.6
+  C3=$(last_cfg)
+  check "snap: Super+Right from a left half — restored to 400x300" \
+    "$([[ "$C3" == "configure w=400 h=300 states="* && "$C3" != *tiled* ]]; echo $?)" "$C3"
+  # Super+drag to the edge Virtual-1 shares with Virtual-2: no zone there; then on to the
+  # outer right edge of Virtual-2: its right half.
+  read -r GX GY GW GH < <(grep -E "compositor.wm: (geometry|map) id=$SN_ID " "$CLOG" | tail -1 |
+    sed -E 's/.* x=(-?[0-9]+) y=(-?[0-9]+) w=([0-9]+) h=([0-9]+).*/\1 \2 \3 \4/')
+  PX=$(( GX + GW / 2 )); PY=$(( GY + GH / 2 ))
+  M=$(mark "$CLOG")
+  inject move "$PX" "$PY"; sleep 0.2
+  inject drag "$PX" "$PY" $(( V1W - 3 )) "$PY" --button left --super --steps 30 --hold-ms 400
+  sleep 0.5
+  A=$(after "$CLOG" "$M")
+  check "snap: dropped at the edge between the outputs — no zone, not snapped" \
+    "$(! grep -qE "snap preview zone|edge snap id=$SN_ID" <<<"$A" && [[ "$(last_cfg)" != *tiled* ]]; echo $?)" \
+    "$(grep -oE "edge zone .*|snap preview zone=\S+ output=[0-9]+" <<<"$A" | tr '\n' ' ') $(last_cfg)"
+  read -r GX GY GW GH < <(grep -E "compositor.wm: (geometry|map) id=$SN_ID " "$CLOG" | tail -1 |
+    sed -E 's/.* x=(-?[0-9]+) y=(-?[0-9]+) w=([0-9]+) h=([0-9]+).*/\1 \2 \3 \4/')
+  PX=$(( GX + GW / 2 )); PY=$(( GY + GH / 2 ))
+  M=$(mark "$CLOG")
+  inject move "$PX" "$PY"; sleep 0.2
+  inject drag "$PX" "$PY" $(( V1W + 1023 )) "$PY" --button left --super --steps 40 --hold-ms 300
+  sleep 0.6
+  A=$(after "$CLOG" "$M"); C4=$(last_cfg); W4=$(win_line)
+  check "snap: dropped at Virtual-2's outer right edge — its right half (512x${V2UH})" \
+    "$(grep -qE "snap preview zone=right output=[1-9]" <<<"$A" && grep -qE "edge snap id=$SN_ID zone=8 output=[1-9]" <<<"$A" && [[ "$C4" == "configure w=512 h=${V2UH} states="*tiled* && "$W4" == *Virtual-2* ]]; echo $?)" \
+    "$(grep -oE "snap preview zone=\S+ output=[0-9]+|edge snap .*" <<<"$A" | tr '\n' ' ') | $C4 | $W4"
+  # Unplugged: the same half of Virtual-1; plugged back: Virtual-2's right half again.
+  M=$(mark "$CLOG")
+  layout "${TWO[0]}"
+  wait_after "$CLOG" "$M" "output [0-9]+ removed|retire" 5; sleep 1
+  C5=$(last_cfg); W5=$(win_line)
+  check "snap: unplugged — the right half of Virtual-1" \
+    "$([[ "$C5" == "configure w=$(( V1W - (V1W + 1) / 2 )) h=${V1UH} states="*tiled* && "$W5" == *Virtual-1* ]]; echo $?)" \
+    "$C5 | $W5"
+  M=$(mark "$CLOG")
+  layout "${TWO[@]}"
+  wait_after "$CLOG" "$M" "output [0-9]+ added name=Virtual-2" 5; sleep 1.2
+  C6=$(last_cfg); W6=$(win_line)
+  check "snap: plugged back — Virtual-2's right half again (home)" \
+    "$([[ "$C6" == "configure w=512 h=${V2UH} states="*tiled* && "$W6" == *Virtual-2* ]]; echo $?)" \
+    "$C6 | $W6"
+  stop_client "$SN_PID"
+fi
+
+# ── notify ───────────────────────────────────────────────────────────────────────────
+if want notify; then
+  # Notifications across outputs (design-session-and-wm N.3): the stack goes to the output
+  # of the focused window and stays there while it shows; that output unplugged, it is shown
+  # on the remaining one.
+  if ! command -v notify-send >/dev/null || ! command -v gdbus >/dev/null; then
+    record "notify: the popups follow the focused window's output" SKIP "notify-send (libnotify) or gdbus not installed"
+  else
+    ensure_two
+    CTL=("$BUILD/lumen-ctl" --socket "$XDG_RUNTIME_DIR/$SOCKET.varlink")
+    V1W=$("${CTL[@]}" outputs | awk '$1 == "Virtual-1" { split($2, m, "x"); print m[1]; exit }')
+    V1W=${V1W:-$W0}
+    inject move $(( V1W + 512 )) 300; sleep 0.3
+    M=$(mark "$CLOG")
+    start_client "$LOG_DIR/probe-notify.log" "$PROBE" window --app-id nt --title nt --exit-after 60
+    NT_PID=$LAST_PID
+    wait_after "$CLOG" "$M" "map id=[0-9]+ app_id=nt" 5; sleep 0.5
+    NT_ID=$(notify-send -p -a monitor-smoke -t 0 "on the focused output" "Virtual-2")
+    sleep 0.8
+    A=$(after "$CLOG" "$M")
+    X1=$(grep -oE "layer map surface=[0-9]+ layer=\w+ namespace=lumen-notifications x=-?[0-9]+" <<<"$A" | tail -1 | sed 's/.*x=//')
+    check "notify: the popups are on the focused window's output (Virtual-2)" \
+      "$([[ -n "$X1" ]] && (( X1 >= V1W )); echo $?)" "stack at x=${X1:-none} (Virtual-2 starts at $V1W)"
+    M=$(mark "$CLOG")
+    layout "${TWO[0]}"
+    wait_after "$CLOG" "$M" "output [0-9]+ removed|retire" 5; sleep 1.2
+    A=$(after "$CLOG" "$M")
+    X2=$(grep -oE "layer map surface=[0-9]+ layer=\w+ namespace=lumen-notifications x=-?[0-9]+" <<<"$A" | tail -1 | sed 's/.*x=//')
+    check "notify: Virtual-2 unplugged — the popups are shown on Virtual-1" \
+      "$([[ -n "$X2" ]] && (( X2 < V1W )); echo $?)" "stack at x=${X2:-none}"
+    gdbus call --session --dest org.freedesktop.Notifications --object-path /org/freedesktop/Notifications \
+      --method org.freedesktop.Notifications.CloseNotification "${NT_ID:-0}" >/dev/null 2>&1
+    M=$(mark "$CLOG")
+    layout "${TWO[@]}"
+    wait_after "$CLOG" "$M" "output [0-9]+ added name=Virtual-2" 5; sleep 0.8
+    stop_client "$NT_PID"
   fi
 fi
 

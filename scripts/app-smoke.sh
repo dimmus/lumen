@@ -20,6 +20,8 @@
 #   --logs DIR            log directory (default <repo>/app-smoke-logs)
 #   --only LIST           comma list of scenario groups to run (default: all available)
 #   --skip-gtk            skip the GTK scenarios
+#   --scale S             the output's scale (fractional allowed); only with --only O — the
+#                         other groups assume scale 1
 #
 # Groups (more arrive with the steps that implement them; see the design in TEST.md):
 #   A  subsurfaces
@@ -97,9 +99,10 @@
 #     E3 a new foot that retitles itself: it maps below the panel, the entry is added,
 #        renamed live, and the redraw damages that entry only
 #     E4 a window's client exits: its entry is removed
-#     E5 the shell is stopped and started again: the bridge goes, the usable area returns
-#        to the whole output, a new snapshot lists the current windows (in the order the
-#        old panel showed them), the panel comes back
+#     E5 the shell is stopped and started again: the bridge goes, the compositor holds the
+#        panel's strip (the zone hold, ADR 010: the usable area never returns to the whole
+#        output) until the new panel maps, a new snapshot lists the current windows (in the
+#        order the old panel showed them), the panel comes back
 #     E6 a copy of lumen-shell at another path is refused at bind (exit 1; the compositor's
 #        warning names both paths) and the running shell is unaffected
 #   F  clipboard and primary selection (foot and alacritty, real copy and paste; files
@@ -340,6 +343,74 @@
 #     Z7 Screenshot of a window (target Window: the list, Enter): the window's own size
 #     Z8 the session locked: a screenshot is refused (response 2), never the lock screen;
 #        after unlock it works again
+#   R  the configuration file (design-session-and-wm Part C; the compositor runs with
+#      LUMEN_CONFIG=<logs>/R-config/config.toml, absent until R writes it; lumen-shell and
+#      lumen-probe keyboard as clients)
+#     R1 the file appears (by rename): repeat 10/600 and a us,de keymap reach a new client, the
+#        mouse is set flat 0.5 with natural scrolling, the cursor 48 px; Super+Y (configured
+#        as window.close) closes the focused window
+#     R2 grp:alt_shift_toggle: y, Alt+Shift, y types y then z, as the client's own xkb sees it
+#     R3 a live edit: repeat 30 reaches the client (debounce 100 ms), one generation, no notice
+#     R4 the mouse: a wheel notch up scrolls positive (natural), doubled (scroll-factor 2),
+#        relative motion x1.5 (flat 0.5)
+#     R5 a syntax error: rejected, nothing resent, `lumen-ctl reload` exits 1 naming the line,
+#        the shell's panel shows one notice
+#     R6 a bad value keeps that key's value, an unknown action suggests the right one; the file
+#        removed: the defaults return (repeat 25/600)
+#   Q  workspaces (design-session-and-wm Part W; lumen-shell runs, lumen-probe window reports
+#      every configure's states)
+#     Q1 three windows on workspace 1, Super+2: all hidden and told `suspended`, nothing has
+#        the keyboard, lumen-probe workspaces sees 2 active; Super+1: shown again, the window
+#        focused there has the keyboard back (focus memory)
+#     Q2 Super+Shift+2 moves the focused window to 2 and follows (move-follows): it is shown,
+#        the others hidden; lumen-shell's indicator logs `1+ 2*+ 3`
+#     Q3 lumen-probe workspaces --activate 1 (ext-workspace activate + commit): 1 active
+#     Q4 a fullscreen window: on its workspace a screenshot is its colour; Super+2: neither
+#        it nor its black backdrop shows (the background does); Super+1: it again
+#     Q5 Super+H minimizes the focused window (hidden, `suspended`); a click on its panel
+#        entry brings it back with the keyboard; xdg_toplevel.set_minimized (lumen-probe
+#        window --minimize-after) minimizes too
+#     Q6 lumen-probe capture of a window on a hidden workspace: frames keep coming, the
+#        window's own pixels
+#     Q7 the session lock: Super+2 and an ext-workspace activate while locked change nothing
+#   O  switching and snapping (design-session-and-wm Part K; lumen-shell runs, three
+#      lumen-probe windows report their configures and what their keyboards are told)
+#     O1 a quick Alt+Tab (released within the 150 ms open delay): the previous window gets the
+#        keyboard and the switcher is never drawn
+#     O2 Alt held, Tab, wait, Tab, Alt up: the switcher is drawn (centred, at the output's
+#        scale: its colours in a screenshot), the third MRU window gets the keyboard
+#     O3 Alt+Tab, Escape: nothing changes; the focused window saw only Alt (no leave)
+#     O4 Alt+Shift+Tab: backwards, the least recently used window
+#     O5 Super+Left/Up/Down/Right/Up/Down: half, quarter, half (tiled states), restored;
+#        maximized, restored to the same place — each as the window's configures say
+#     O6 Super+drag to the left edge: the preview (its border and fill as composited, from a
+#        screenshot), the release snaps to the left half; dragged out: restored to its size
+#     O7 Alt+F7, arrows, Return: the window moves by the arrows' steps (10 px)
+#     O8 Alt+F8: the first arrow of an axis picks that edge; Return applies
+#     O9 the session locks during a hold: cancelled, the switcher closes, nothing activated
+#     O10 no shell: Alt+Tab is the compositor's quick switch
+#     O11 a click on a window during a hold cancels it (that window keeps the keyboard)
+#   N  notifications and the tray (design-session-and-wm Part N; lumen-shell runs with its
+#      state in this run's directory; notify-send, lumen-probe sni, dbus-monitor, gdbus,
+#      busctl)
+#     N1 notify-send -t 1500 expires (NotificationClosed reason 1); a critical one stays and
+#        lifts the popups to the overlay layer; CloseNotification closes it (3), an unknown
+#        id is an error
+#     N2 replaces_id (notify-send -r): the same id, the card replaced in place
+#     N3 a click on an action button: ActivationToken, ActionInvoked, NotificationClosed(2) in
+#        that order (dbus-monitor), notify-send prints the action; a click on a card without
+#        a default action dismisses it
+#     N4 locked (lumen-probe lock): a notification waits, pops up after the unlock, expires
+#     N5 do not disturb while the screen is captured (lumen-probe capture): normal ones to
+#        the history, critical ones still shown; a middle click on the panel's bell sets and
+#        clears it
+#     N6 lumen-probe sni in the panel (its pixmap in a screenshot), the tooltip, a left click
+#        (ProvideXdgActivationToken then Activate with that token), busctl on the watcher, a
+#        right click opens its com.canonical.dbusmenu menu (a grabbing popup), Down+Return
+#        clicks Open, the wheel scrolls it
+#     N7 the shell killed and started again: the item registers with the new watcher within
+#        a second; notification ids continue after the persisted block
+#     N8 idle with a history and a tray item: lumen-shell has no wakeups
 #   X  robustness: lumen-square --sub --destroy-parent-first tears the parent wl_surface
 #      down before the strip's wl_subsurface; no protocol error, compositor alive
 #
@@ -374,8 +445,9 @@ SOCKET="lumen-app-smoke"
 LOG_DIR="${ROOT}/app-smoke-logs"
 JOIN_SEAT=0
 COUNTDOWN=3
-ONLY="A,B,C,D,E,F,G,H,I,J,S,P,K,L,M,T,U,V,W,X,Y,Z"
+ONLY="A,B,C,D,E,F,G,H,I,J,S,P,K,L,M,T,U,V,W,X,Y,Z,R,Q,O,N"
 SKIP_GTK=0
+SCALE=1
 while (( $# > 0 )); do
   case "$1" in
     --join-seat-session) JOIN_SEAT=1 ;;
@@ -384,6 +456,7 @@ while (( $# > 0 )); do
     --logs) LOG_DIR="${2:?--logs needs a directory}"; shift ;;
     --only) ONLY="${2:?--only needs a list}"; shift ;;
     --skip-gtk) SKIP_GTK=1 ;;
+    --scale) SCALE="${2:?--scale needs a value}"; shift ;;
     -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 2 ;;
   esac
@@ -392,11 +465,19 @@ done
 want() { [[ ",${ONLY}," == *",$1,"* ]]; }
 for g in ${ONLY//,/ }; do
   case "$g" in
-    A|B|C|D|E|F|G|H|I|J|S|P|K|L|M|T|U|V|W|X|Y|Z) ;;
+    A|B|C|D|E|F|G|H|I|J|S|P|K|L|M|T|U|V|W|X|Y|Z|R|Q|O|N) ;;
     *) echo "unknown group '$g' (see --help)"; exit 2 ;;
   esac
 done
+if [[ "$SCALE" != 1 && "$ONLY" != O ]]; then
+  echo "--scale is for group O only (--only O)"; exit 2
+fi
+SCALE_ARG=""
+[[ "$SCALE" != 1 ]] && SCALE_ARG="$SCALE"
 
+# Every lumen-shell of this run keeps its state (the next notification id, do-not-disturb)
+# here, never in the user's $XDG_RUNTIME_DIR/lumen/shell-state.
+export LUMEN_SHELL_STATE="${LOG_DIR}/shell-state"
 COMP_LOG="${LOG_DIR}/compositor.log"
 INJ_LOG="${LOG_DIR}/inject.jsonl"
 SCEN_LOG="${LOG_DIR}/scenarios.jsonl"
@@ -430,6 +511,12 @@ done
 command -v foot >/dev/null || { echo "FAIL: foot is not installed (group A needs it)"; exit 2; }
 if want F && ! command -v alacritty >/dev/null; then
   echo "FAIL: alacritty is not installed (group F needs it)"; exit 2
+fi
+if want N; then
+  for tool in notify-send dbus-monitor gdbus busctl; do
+    command -v "$tool" >/dev/null ||
+      { echo "FAIL: $tool is not installed (group N needs it; notify-send is libnotify's)"; exit 2; }
+  done
 fi
 if (( ! SKIP_GTK )) && ! command -v gtk4-widget-factory >/dev/null; then
   echo "NOTE: gtk4-widget-factory not installed; GTK scenarios skipped"; SKIP_GTK=1
@@ -626,12 +713,16 @@ if ! wait_for "$WATCH_LOG" '"kind": "watch"' 3; then
   echo "FAIL: the input watcher did not start:"; cat "$WATCH_LOG"; exit 2
 fi
 
+# The configuration file of this run (group R writes it; absent: every default, and never
+# the user's own ~/.config/lumen/config.toml).
+R_CFG_PATH="$LOG_DIR/R-config/config.toml"
+rm -rf "$LOG_DIR/R-config"
 echo "1/2  compositor on $SOCKET (LUMEN_LOG=debug) ..."
 if (( ! IN_SEAT && JOIN_SEAT )); then
-  bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && exec env LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$4" "$2" "$3" --ping-timeout 1500' \
-    _ "$SEAT_SCOPE" "$COMP" "$SOCKET" "$LOG_DIR" >"$COMP_LOG" 2>&1 &
+  bash -c 'echo $$ | sudo -n tee "$1/cgroup.procs" >/dev/null && exec env LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$4" LUMEN_CONFIG="$5" "$2" "$3" --ping-timeout 1500 ${6:+--scale "$6"}' \
+    _ "$SEAT_SCOPE" "$COMP" "$SOCKET" "$LOG_DIR" "$R_CFG_PATH" "$SCALE_ARG" >"$COMP_LOG" 2>&1 &
 else
-  LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$LOG_DIR" "$COMP" "$SOCKET" --ping-timeout 1500 \
+  LUMEN_LOG=debug LUMEN_SCREENSHOT_DIR="$LOG_DIR" LUMEN_CONFIG="$R_CFG_PATH" "$COMP" "$SOCKET" --ping-timeout 1500 ${SCALE_ARG:+--scale "$SCALE_ARG"} \
     >"$COMP_LOG" 2>&1 &
 fi
 COMP_PID=$!
@@ -2841,7 +2932,9 @@ if want Y; then
   start_client probe-y8-win "$PROBE" solid --rgba 0,0,255,255 --size 200x150 --exit-after 30
   Y8_PID=$LAST_PID
   Y8_ID=$(wait_map lumen-probe 5) && settle "$Y8_ID"
-  WAYLAND_DISPLAY="$SOCKET" "$PROBE" toplevels --watch 1 >"$LOG_DIR/probe-y8-list.log" 2>&1 &
+  # 3 s: the steps below take about a second (two injections), and the window's `closed`
+  # must come before the watch ends (with 1 s it raced them).
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" toplevels --watch 3 >"$LOG_DIR/probe-y8-list.log" 2>&1 &
   Y8_LIST_PID=$!
   start_client probe-y8-cursor "$PROBE" cursor-capture --output "$OUT_NAME" --frames 1 --timeout 3
   Y8_CUR_PID=$LAST_PID
@@ -3025,6 +3118,635 @@ if want Z; then
   portal_session_stop >>"$LOG_DIR/portals.log" 2>&1
 fi
 
+if want R; then
+  # R — the configuration file (design-session-and-wm Part C). The compositor runs with
+  # LUMEN_CONFIG=$R_CFG from the start (absent: the defaults, as for every other group); the
+  # file is written here, by rename as editors do, and the inotify watch applies it.
+  R_DIR="$LOG_DIR/R-config"; R_CFG="$R_DIR/config.toml"; mkdir -p "$R_DIR"
+  r_write() { # repeat-rate [extra text] — the R configuration, written atomically
+    cat >"$R_CFG.new" <<CFG
+[input.keyboard]
+layout = "us,de"
+options = "grp:alt_shift_toggle"
+repeat-rate = $1
+
+[input.mouse]
+accel-profile = "flat"
+accel-speed = 0.5
+natural-scroll = true
+scroll-factor = 2.0
+
+[cursor]
+size = 48
+
+[bindings]
+"Super+Y" = "window.close"
+${2:-}
+CFG
+    mv "$R_CFG.new" "$R_CFG"
+  }
+  start_client shell-r env LUMEN_LOG=debug "$SHELL_BIN"
+  R_SHELL_PID=$LAST_PID
+  wait_for "$LOG_DIR/shell-r.log" "key bindings: the compositor's" 5
+
+  # R1 — the file appears: repeat 10/600 and a two-layout keymap reach a new client, the
+  # mouse gets flat acceleration and natural scrolling, the cursor 48 px; Super+Y (a
+  # configured binding) closes the focused window.
+  begin R1
+  r_write 10
+  comp_since "config: generation [0-9]+ from .* \(0 errors, 0 warnings" 5
+  comp_since "compositor.cursor: cursor theme=.* size=48 \(configuration\)" 3
+  start_client probe-r1 "$PROBE" keyboard --exit-after 60
+  R1_PID=$LAST_PID
+  R1_ID=$(wait_map lumen-probe 5) && settle "$R1_ID"
+  wait_for "$LOG_DIR/probe-r1.log" "^focus in" 3
+  inject key KEY_LEFTMETA+KEY_Y tap
+  wait_for "$LOG_DIR/probe-r1.log" "^close requested" 3
+  stop_client "$R1_PID"; forget_client "$R1_PID"
+  finish id="${R1_ID:-0}"
+
+  # R2 — the layout toggle (grp:alt_shift_toggle): y, then Alt+Shift, then y again is z
+  # under the German layout, as a client's own xkb sees it.
+  begin R2
+  start_client probe-r2 "$PROBE" keyboard --exit-after 90
+  R2_PID=$LAST_PID
+  R2_ID=$(wait_map lumen-probe 5) && settle "$R2_ID"
+  wait_for "$LOG_DIR/probe-r2.log" "^focus in" 3
+  inject type y; sleep 0.3
+  inject key KEY_LEFTALT+KEY_LEFTSHIFT tap; sleep 0.3
+  inject type y; sleep 0.3
+  inject key KEY_LEFTALT+KEY_LEFTSHIFT tap; sleep 0.3
+  finish id="${R2_ID:-0}"
+
+  # R3 — a live change (rename): repeat 30 reaches the client soon after the save, one new
+  # generation, no notice (nothing was wrong).
+  begin R3
+  T0=$(date +%s%N)
+  r_write 30
+  wait_for "$LOG_DIR/probe-r2.log" "^repeat rate=30 " 3
+  T1=$(date +%s%N)
+  sleep 0.5
+  finish ms=$(( (T1 - T0) / 1000000 )) notices="$(grep -c 'config: notice:' "$LOG_DIR/shell-r.log")"
+
+  # R4 — the mouse as configured: a wheel notch up scrolls with natural direction (positive
+  # values), relative motion is accelerated flat by 1.5 (accel-speed 0.5).
+  begin R4
+  if [[ -n "${R2_ID:-}" && "${R2_ID:-0}" != 0 ]]; then
+    read -r X Y W H < <(geom "$R2_ID")
+    inject move $((X + W / 2)) $((Y + H / 2)); sleep 0.3
+  fi
+  inject wheel 1; sleep 0.3
+  inject rel 10 0 --count 3; sleep 0.3
+  finish
+
+  # R5 — a syntax error: rejected, the configuration in use stays (repeat 30 is not
+  # resent), lumen-ctl reload exits 1 naming the line, the shell shows one notice.
+  begin R5
+  printf '[input.keyboard\nrepeat-rate = 5\n' >"$R_CFG.new"; mv "$R_CFG.new" "$R_CFG"
+  comp_since "config: generation [0-9]+ from .* rejected" 3
+  WAYLAND_DISPLAY="$SOCKET" LUMEN_SOCKET="$XDG_RUNTIME_DIR/$SOCKET.varlink" \
+    timeout 5 "$BUILD/lumen-ctl" reload >"$LOG_DIR/R5.reload" 2>&1
+  R5_RC=$?
+  wait_for "$LOG_DIR/shell-r.log" "config: notice: Lumen configuration not used" 3
+  sleep 0.3
+  finish rc="$R5_RC" notices="$(grep -c 'config: notice:' "$LOG_DIR/shell-r.log")" \
+    repeats="$(grep -c '^repeat ' "$LOG_DIR/probe-r2.log")"
+
+  # R6 — a bad value and an unknown key: that key keeps its value (30), the rest applies,
+  # one notice; then the file goes and every default returns (repeat 25).
+  begin R6
+  r_write 5000 '"Super+K" = "window.closee"'
+  comp_since "config: generation [0-9]+ from .* \(2 errors, 0 warnings" 3
+  sleep 0.3
+  R6_MARK=$(lines "$COMP_LOG")
+  rm -f "$R_CFG"
+  wait_for "$LOG_DIR/probe-r2.log" "^repeat rate=25 " 3
+  stop_client "$R2_PID"; forget_client "$R2_PID"
+  stop_client "$R_SHELL_PID"; forget_client "$R_SHELL_PID"
+  finish removed_mark="$R6_MARK"
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want Q; then
+  # Q — workspaces (design-session-and-wm Part W). Default bindings: Super+N switches,
+  # Super+Shift+N moves the focused window there (following), Super+H minimizes.
+  start_client shell-q env LUMEN_LOG=debug "$SHELL_BIN"
+  Q_SHELL_PID=$LAST_PID
+  wait_for "$LOG_DIR/shell-q.log" "key bindings: the compositor's" 5
+  sleep 0.5
+  q_ws() { # name [args...] — lumen-probe workspaces into probe-NAME.log
+    local n=$1; shift
+    WAYLAND_DISPLAY="$SOCKET" timeout 8 "$PROBE" workspaces "$@" >"$LOG_DIR/probe-$n.log" 2>&1
+  }
+  q_shot() { # → the path of a screenshot of the next frame
+    local before
+    before=$(grep -c "screenshot [0-9]*x[0-9]* written to" "$COMP_LOG")
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    local deadline=$(( $(date +%s%N) + 4000000000 ))
+    while (( $(date +%s%N) < deadline )); do
+      (( $(grep -c "screenshot [0-9]*x[0-9]* written to" "$COMP_LOG") > before )) && break
+      sleep 0.05
+    done
+    grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //'
+  }
+  inject move $((OUT_W / 2)) $((OUT_H / 2)); sleep 0.2
+
+  # Q1 — three windows, Super+2 and back.
+  begin Q1
+  for n in a b c; do
+    start_client "probe-q1$n" "$PROBE" window --app-id "q1$n" --title "q1$n" --exit-after 120
+    eval "Q1${n^^}_PID=\$LAST_PID"
+    eval "Q1${n^^}_ID=\$(wait_map q1$n 5)"
+    eval "settle \"\$Q1${n^^}_ID\""
+  done
+  # The first one gets the keyboard by a click on a corner the others leave free.
+  if [[ "${Q1A_ID:-0}" != 0 ]]; then
+    read -r X Y W H < <(geom "$Q1A_ID")
+    inject move $((X + 6)) $((Y + 6)); sleep 0.2
+    inject button left click; sleep 0.4
+    inject move 20 $((OUT_H - 20)); sleep 0.2
+  fi
+  Q1_MARK=$(lines "$COMP_LOG")
+  inject key KEY_LEFTMETA+KEY_2 tap; sleep 0.6
+  q_ws q1-on2 --watch 0.3
+  Q1_BACK=$(lines "$COMP_LOG")
+  inject key KEY_LEFTMETA+KEY_1 tap; sleep 0.6
+  finish a="${Q1A_ID:-0}" b="${Q1B_ID:-0}" c="${Q1C_ID:-0}" mark="$Q1_MARK" back="$Q1_BACK" \
+    la="$(lines "$LOG_DIR/probe-q1a.log")" lb="$(lines "$LOG_DIR/probe-q1b.log")" \
+    lc="$(lines "$LOG_DIR/probe-q1c.log")"
+
+  # Q2 — Super+Shift+2: the focused window (q1a) moves to 2, and the view follows.
+  begin Q2
+  inject key KEY_LEFTMETA+KEY_LEFTSHIFT+KEY_2 tap; sleep 0.8
+  q_ws q2 --watch 0.3
+  finish a="${Q1A_ID:-0}" b="${Q1B_ID:-0}" la="$(lines "$LOG_DIR/probe-q1a.log")" \
+    lb="$(lines "$LOG_DIR/probe-q1b.log")"
+
+  # Q3 — ext-workspace activate from a client.
+  begin Q3
+  q_ws q3 --activate 1 --watch 0.6
+  sleep 0.3
+  finish
+
+  # Q4 — a fullscreen window and its workspace.
+  begin Q4
+  start_client probe-q4 "$PROBE" window --app-id q4 --title q4 --fullscreen --exit-after 120
+  Q4_PID=$LAST_PID
+  Q4_ID=$(wait_map q4 5) && settle "$Q4_ID"
+  sleep 0.5
+  Q4_S1=$(q_shot)
+  inject key KEY_LEFTMETA+KEY_2 tap; sleep 0.8
+  Q4_S2=$(q_shot)
+  inject key KEY_LEFTMETA+KEY_1 tap; sleep 0.8
+  Q4_S3=$(q_shot)
+  stop_client "$Q4_PID"; forget_client "$Q4_PID"
+  sleep 0.5
+  finish id="${Q4_ID:-0}" s1="\"$Q4_S1\"" s2="\"$Q4_S2\"" s3="\"$Q4_S3\""
+
+  # Q5 — minimize: Super+H, the panel entry brings it back; then xdg set_minimized.
+  begin Q5
+  inject move 20 $((OUT_H - 20)); sleep 0.2
+  if [[ "${Q1C_ID:-0}" != 0 ]]; then
+    read -r X Y W H < <(geom "$Q1C_ID")
+    inject move $((X + W - 8)) $((Y + H - 8)); sleep 0.2
+    inject button left click; sleep 0.4
+  fi
+  Q5_MIN=$(lines "$COMP_LOG")
+  inject key KEY_LEFTMETA+KEY_H tap; sleep 0.8
+  Q5_CELL=$(grep -oE 'layout idx=[0-9]+ x=[0-9]+ w=[0-9]+ handle=[0-9]+ title="q1c"' "$LOG_DIR/shell-q.log" | tail -1)
+  Q5_CLICK=$(lines "$COMP_LOG")
+  if [[ -n "$Q5_CELL" ]]; then
+    CX=$(sed -E 's/.* x=([0-9]+) w=([0-9]+).*/\1/' <<<"$Q5_CELL")
+    CW=$(sed -E 's/.* x=([0-9]+) w=([0-9]+).*/\2/' <<<"$Q5_CELL")
+    inject move $((CX + CW / 2)) 16; sleep 0.3
+    inject button left click; sleep 0.8
+  fi
+  start_client probe-q5 "$PROBE" window --app-id q5 --title q5 --minimize-after 600 --exit-after 60
+  Q5_PID=$LAST_PID
+  Q5_ID=$(wait_map q5 5)
+  wait_for "$LOG_DIR/probe-q5.log" "^minimize" 4; sleep 0.6
+  stop_client "$Q5_PID"; forget_client "$Q5_PID"
+  finish c="${Q1C_ID:-0}" min="$Q5_MIN" click="$Q5_CLICK" q5="${Q5_ID:-0}" cell="$([[ -n "$Q5_CELL" ]] && echo 1 || echo 0)"
+
+  # Q6 — a window on a workspace that is not shown is still captured.
+  begin Q6
+  inject move $((OUT_W / 2)) $((OUT_H / 2)); sleep 0.2
+  start_client probe-q6-anim "$PROBE" animate --size 240x160 --exit-after 60
+  Q6_PID=$LAST_PID
+  Q6_ID=$(wait_map lumen-probe-animate 5) && settle "$Q6_ID"
+  inject key KEY_LEFTMETA+KEY_3 tap; sleep 0.6
+  WAYLAND_DISPLAY="$SOCKET" "$PROBE" capture --app-id lumen-probe-animate --frames 10 \
+    --timeout 6 >"$LOG_DIR/probe-q6.log" 2>&1
+  inject key KEY_LEFTMETA+KEY_1 tap; sleep 0.4
+  stop_client "$Q6_PID"; forget_client "$Q6_PID"
+  finish id="${Q6_ID:-0}"
+
+  # Q7 — locked: workspace keys and ext-workspace requests change nothing.
+  begin Q7
+  start_client probe-q7-lock "$PROBE" lock --unlock-after 3
+  Q7_LOCK_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-q7-lock.log" "^lock locked" 3
+  Q7_LOCKED=$(lines "$COMP_LOG")
+  inject key KEY_LEFTMETA+KEY_2 tap; sleep 0.3
+  q_ws q7 --activate 2 --watch 0.3
+  for _ in $(seq 1 50); do kill -0 "$Q7_LOCK_PID" 2>/dev/null || break; sleep 0.1; done
+  forget_client "$Q7_LOCK_PID"
+  sleep 0.5
+  q_ws q7-after --watch 0.2
+  finish locked="$Q7_LOCKED"
+
+  for v in Q1A_PID Q1B_PID Q1C_PID; do
+    [[ -n "${!v:-}" ]] && { stop_client "${!v}"; forget_client "${!v}"; }
+  done
+  stop_client "$Q_SHELL_PID"; forget_client "$Q_SHELL_PID"
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want O; then
+  # O — switching and snapping (design-session-and-wm Part K). Default bindings: Alt+Tab and
+  # Alt+Shift+Tab (held: the compositor gives lumen-shell a hold while Alt is down),
+  # Super+arrows, Alt+F7/Alt+F8; edge snapping by a Super+drag. Positions the compositor logs
+  # are logical; the injector takes output pixels (× --scale).
+  start_client shell-o env LUMEN_LOG=debug "$SHELL_BIN"
+  O_SHELL_PID=$LAST_PID
+  wait_for "$LOG_DIR/shell-o.log" "key bindings: the compositor's" 5
+  sleep 0.5
+  lpx() { awk -v v="$1" -v s="$SCALE" 'BEGIN { printf "%d", v * s + 0.5 }'; }
+  o_shot() { # → the path of a screenshot of the next frame
+    local before
+    before=$(grep -c "screenshot [0-9]*x[0-9]* written to" "$COMP_LOG")
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    local deadline=$(( $(date +%s%N) + 4000000000 ))
+    while (( $(date +%s%N) < deadline )); do
+      (( $(grep -c "screenshot [0-9]*x[0-9]* written to" "$COMP_LOG") > before )) && break
+      sleep 0.05
+    done
+    grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //'
+  }
+  shl() { lines "$LOG_DIR/shell-o.log"; }
+  inject move 20 $((OUT_H - 20)); sleep 0.2
+  for n in a b c; do
+    start_client "probe-o$n" "$PROBE" window --app-id "o$n" --title "o$n" --size 400x300 \
+      --keyboard --exit-after 240
+    eval "O${n^^}_PID=\$LAST_PID"
+    eval "O${n^^}_ID=\$(wait_map o$n 5)"
+    eval "settle \"\$O${n^^}_ID\""
+  done
+  sleep 0.3
+
+  # O1 — a quick Alt+Tab (released within the open delay): the previous window (ob) gets
+  # the keyboard, nothing is drawn.
+  begin O1
+  O1_SH=$(shl)
+  inject key KEY_LEFTALT+KEY_TAB tap; sleep 0.7
+  finish a="${OA_ID:-0}" b="${OB_ID:-0}" c="${OC_ID:-0}" sh0="$O1_SH" sh1="$(shl)"
+
+  # O2 — Alt held, Tab, wait (the switcher is drawn), Tab, Alt up: the third window of the
+  # MRU order (oa) gets the keyboard. A screenshot while it is shown.
+  begin O2
+  O2_SH=$(shl)
+  inject key KEY_LEFTALT press; sleep 0.05
+  inject key KEY_TAB tap; sleep 0.6
+  O2_SHOT=$(o_shot)
+  inject key KEY_TAB tap; sleep 0.3
+  inject key KEY_LEFTALT release; sleep 0.7
+  finish a="${OA_ID:-0}" sh0="$O2_SH" sh1="$(shl)" shot="\"$O2_SHOT\""
+
+  # O3 — Alt+Tab, then Escape: nothing changes; the focused application (oa) saw Alt only —
+  # no leave, no Tab, no Escape.
+  begin O3
+  O3_SH=$(shl)
+  O3_LA=$(lines "$LOG_DIR/probe-oa.log")
+  inject key KEY_LEFTALT press; sleep 0.05
+  inject key KEY_TAB tap; sleep 0.5
+  inject key KEY_ESC tap; sleep 0.2
+  inject key KEY_LEFTALT release; sleep 0.6
+  finish a="${OA_ID:-0}" sh0="$O3_SH" sh1="$(shl)" la0="$O3_LA" la1="$(lines "$LOG_DIR/probe-oa.log")"
+
+  # O4 — Alt+Shift+Tab: backwards, the least recent window (oc).
+  begin O4
+  O4_SH=$(shl)
+  inject key KEY_LEFTALT+KEY_LEFTSHIFT+KEY_TAB tap; sleep 0.7
+  finish c="${OC_ID:-0}" sh0="$O4_SH" sh1="$(shl)"
+
+  # O5 — Super+arrows on oc: left half, top-left quarter, left half, restore; maximize,
+  # restore. Every step's configure (size, tiled states) from the window's side.
+  begin O5
+  O5_LC=$(lines "$LOG_DIR/probe-oc.log")
+  read -r O5_X O5_Y O5_W O5_H < <(geom "${OC_ID:-0}")
+  for k in LEFT UP DOWN RIGHT UP DOWN; do
+    inject key "KEY_LEFTMETA+KEY_$k" tap; sleep 0.3
+    settle "${OC_ID:-0}" >/dev/null
+  done
+  sleep 0.3
+  finish c="${OC_ID:-0}" lc0="$O5_LC" lc1="$(lines "$LOG_DIR/probe-oc.log")" \
+    x0="${O5_X:-0}" y0="${O5_Y:-0}" w0="${O5_W:-0}" h0="${O5_H:-0}"
+
+  # O6 — Super+drag oc (on top) to the left edge: the preview shows the left half while held (a
+  # screenshot then), the release snaps it there. O6b: drag it out — restored to 400x300
+  # under the pointer.
+  begin O6
+  O6_LB=$(lines "$LOG_DIR/probe-oc.log")
+  O6_PRE=$(o_shot)
+  read -r X Y W H < <(geom "${OC_ID:-0}")
+  PX=$((X + W / 2)); PY=$((Y + H / 2))
+  inject move "$(lpx $PX)" "$(lpx $PY)"; sleep 0.2
+  inject drag "$(lpx $PX)" "$(lpx $PY)" 0 "$(lpx $PY)" --button left --super --steps 40 \
+    --interval-ms 10 --hold-ms 1500 &
+  O6_DRAG=$!
+  sleep 1.3
+  O6_SHOT=$(o_shot)
+  wait "$O6_DRAG"
+  settle "${OC_ID:-0}" >/dev/null
+  O6_MID=$(lines "$COMP_LOG")
+  O6_MIDB=$(lines "$LOG_DIR/probe-oc.log")
+  read -r X Y W H < <(geom "${OC_ID:-0}")
+  PX=$((X + W / 2)); PY=$((Y + H / 2))
+  inject move "$(lpx $PX)" "$(lpx $PY)"; sleep 0.2
+  inject drag "$(lpx $PX)" "$(lpx $PY)" "$(lpx $((PX + 300)))" "$(lpx $((PY + 40)))" \
+    --button left --super --steps 40
+  settle "${OC_ID:-0}" >/dev/null
+  sleep 0.3
+  finish b="${OC_ID:-0}" lb0="$O6_LB" lbm="$O6_MIDB" lb1="$(lines "$LOG_DIR/probe-oc.log")" \
+    mid="$O6_MID" py="$PY" pre="\"$O6_PRE\"" shot="\"$O6_SHOT\""
+
+  # O7 — Alt+F7 on oc (focused): Right ×3, Down, Return moves it by
+  # (30, 10); the arrows and Return never reach it.
+  begin O7
+  inject move 20 $((OUT_H - 20)); sleep 0.2
+  O7_LB=$(lines "$LOG_DIR/probe-oc.log")
+  read -r O7_X O7_Y O7_W O7_H < <(geom "${OC_ID:-0}")
+  inject key KEY_LEFTALT+KEY_F7 tap; sleep 0.3
+  for k in RIGHT RIGHT RIGHT DOWN; do inject key "KEY_$k" tap; sleep 0.12; done
+  inject key KEY_ENTER tap; sleep 0.4
+  finish b="${OC_ID:-0}" x0="${O7_X:-0}" y0="${O7_Y:-0}" lb0="$O7_LB" lb1="$(lines "$LOG_DIR/probe-oc.log")"
+
+  # O8 — Alt+F8: Right ×2 picks the right edge (+20), Down the bottom one (+10), Return.
+  begin O8
+  read -r O8_X O8_Y O8_W O8_H < <(geom "${OC_ID:-0}")
+  inject key KEY_LEFTALT+KEY_F8 tap; sleep 0.3
+  for k in RIGHT RIGHT DOWN; do inject key "KEY_$k" tap; sleep 0.15; done
+  inject key KEY_ENTER tap; sleep 0.3
+  settle "${OC_ID:-0}" >/dev/null
+  finish b="${OC_ID:-0}" x0="${O8_X:-0}" y0="${O8_Y:-0}" w0="${O8_W:-0}" h0="${O8_H:-0}"
+
+  # O9 — the session locks during a hold: the compositor cancels it, the switcher closes
+  # without activating anything, and nothing changes once unlocked.
+  begin O9
+  O9_SH=$(shl)
+  inject key KEY_LEFTALT press; sleep 0.05
+  inject key KEY_TAB tap; sleep 0.4
+  start_client probe-o9-lock "$PROBE" lock --unlock-after 2
+  O9_LOCK_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-o9-lock.log" "^lock locked" 3
+  inject key KEY_LEFTALT release; sleep 0.2
+  for _ in $(seq 1 40); do kill -0 "$O9_LOCK_PID" 2>/dev/null || break; sleep 0.1; done
+  forget_client "$O9_LOCK_PID"
+  sleep 0.5
+  finish c="${OC_ID:-0}" sh0="$O9_SH" sh1="$(shl)"
+
+  # O11 — a click on a window during a hold: the user went elsewhere — the hold is cancelled,
+  # the clicked window gets the keyboard, letting go of Alt activates nothing.
+  begin O11
+  O11_SH=$(shl)
+  read -r X Y W H < <(geom "${OA_ID:-0}")
+  inject key KEY_LEFTALT press; sleep 0.05
+  inject key KEY_TAB tap; sleep 0.4
+  # oa's bottom-left corner: the others (cascaded right of it, oc moved up by O6–O8) leave it.
+  inject move "$(lpx $((X + 6)))" "$(lpx $((Y + H - 6)))"; sleep 0.2
+  inject button left click; sleep 0.3
+  inject key KEY_LEFTALT release; sleep 0.5
+  inject move 20 $((OUT_H - 20)); sleep 0.2
+  finish a="${OA_ID:-0}" sh0="$O11_SH" sh1="$(shl)"
+
+  # O10 — no shell: Alt+Tab is the compositor's quick switch (the topmost other window).
+  stop_client "$O_SHELL_PID"; forget_client "$O_SHELL_PID"
+  sleep 0.5
+  begin O10
+  inject key KEY_LEFTALT+KEY_TAB tap; sleep 0.5
+  finish before="${OA_ID:-0}"
+
+  for v in OA_PID OB_PID OC_PID; do
+    [[ -n "${!v:-}" ]] && { stop_client "${!v}"; forget_client "${!v}"; }
+  done
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
+if want N; then
+  # N — notifications and the tray (design-session-and-wm Part N). lumen-shell owns
+  # org.freedesktop.Notifications and org.kde.StatusNotifierWatcher on the user bus;
+  # notify-send (libnotify) and lumen-probe sni are the applications; dbus-monitor records
+  # every Notifications signal; gdbus and busctl make the protocol-level calls. The shell's
+  # state (next id, do-not-disturb) goes to this run's directory, never the user's.
+  N_STATE="$LOG_DIR/N-shell-state"
+  rm -f "$N_STATE"
+  start_client shell-n env LUMEN_LOG=debug LUMEN_SHELL_STATE="$N_STATE" "$SHELL_BIN"
+  N_SHELL_PID=$LAST_PID
+  wait_for "$LOG_DIR/shell-n.log" "bus name org.freedesktop.Notifications: owned" 8
+  wait_for "$LOG_DIR/shell-n.log" "tray: watcher and host" 3
+  start_client n-monitor dbus-monitor --session \
+    "type='signal',interface='org.freedesktop.Notifications'"
+  N_MON_PID=$LAST_PID
+  sleep 0.5
+  nsh() { lines "$LOG_DIR/shell-n.log"; }
+  nmon() { lines "$LOG_DIR/n-monitor.log"; }
+  NGD=(gdbus call --session --dest org.freedesktop.Notifications
+       --object-path /org/freedesktop/Notifications --method)
+  n_card() { # id → "LX LY BOX CLOSE BUTTONS": the stack's origin on the output, then the
+              # card's rects in the stack (x,y,w,h; buttons separated by ';')
+    local id=$1 lx ly line
+    read -r lx ly < <(grep -oE "compositor.layer: layer map surface=[0-9]+ layer=\w+ namespace=lumen-notifications x=-?[0-9]+ y=-?[0-9]+" \
+                      "$COMP_LOG" | tail -1 | sed -E 's/.* x=(-?[0-9]+) y=(-?[0-9]+)/\1 \2/')
+    line=$(grep -oE "notifications: card id=$id box=\S+ close=\S+ buttons=\S+" "$LOG_DIR/shell-n.log" | tail -1)
+    [[ -n "$line" && -n "$lx" ]] || return 1
+    sed -E "s/.* box=(\S+) close=(\S+) buttons=(\S+)/$lx $ly \1 \2 \3/" <<<"$line"
+  }
+  n_shot() { # → the path of a screenshot of the next frame
+    local before
+    before=$(grep -c "screenshot [0-9]*x[0-9]* written to" "$COMP_LOG")
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    local deadline=$(( $(date +%s%N) + 4000000000 ))
+    while (( $(date +%s%N) < deadline )); do
+      (( $(grep -c "screenshot [0-9]*x[0-9]* written to" "$COMP_LOG") > before )) && break
+      sleep 0.05
+    done
+    grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //'
+  }
+  n_at() { # "lx ly card-line" part → global x y of the centre of box/close/button N
+    local lx=$1 ly=$2 rect=$3
+    IFS=, read -r x y w h <<<"$rect"
+    echo "$((lx + x + w / 2)) $((ly + y + h / 2))"
+  }
+
+  # N1 — a normal notification expires (reason 1); a critical one stays (critical-timeout 0)
+  # and puts the stack on the overlay layer; CloseNotification closes it (reason 3); an unknown
+  # id is an error.
+  begin N1
+  N1_SH=$(nsh); N1_MON=$(nmon)
+  N1_ID=$(notify-send -p -a smoke -t 1500 "n1 normal" "expires in 1.5 s")
+  N1C_ID=$(notify-send -p -a smoke -u critical "n1 critical" "stays until closed")
+  sleep 2.5
+  "${NGD[@]}" org.freedesktop.Notifications.CloseNotification "${N1C_ID:-0}" >"$LOG_DIR/N1-close.out" 2>&1
+  N1_RC=$?
+  "${NGD[@]}" org.freedesktop.Notifications.CloseNotification 999999 >"$LOG_DIR/N1-close2.out" 2>&1
+  N1_RC2=$?
+  sleep 0.5
+  finish id="${N1_ID:-0}" cid="${N1C_ID:-0}" rc="$N1_RC" rc2="$N1_RC2" sh0="$N1_SH" sh1="$(nsh)" \
+    mon0="$N1_MON" mon1="$(nmon)"
+
+  # N2 — replaces_id: the same id comes back, the card is replaced in place (one card).
+  begin N2
+  N2_SH=$(nsh)
+  N2_ID=$(notify-send -p -a smoke -t 0 "n2 first" "a")
+  sleep 0.4
+  N2_ID2=$(notify-send -p -r "${N2_ID:-0}" -a smoke -t 0 "n2 second" "b")
+  sleep 0.6
+  "${NGD[@]}" org.freedesktop.Notifications.CloseNotification "${N2_ID:-0}" >/dev/null 2>&1
+  sleep 0.4
+  finish id="${N2_ID:-0}" id2="${N2_ID2:-0}" sh0="$N2_SH" sh1="$(nsh)"
+
+  # N3 — an action button clicked: ActivationToken, ActionInvoked, NotificationClosed(2), in
+  # that order; notify-send prints the action. N3b: a click on the card body without a
+  # default action dismisses it (2).
+  begin N3
+  N3_SH=$(nsh); N3_MON=$(nmon)
+  start_client n3-send notify-send -p -a smoke -A ok=OK -A cancel=Cancel "n3 action" "click OK"
+  N3_PID=$LAST_PID
+  for _ in $(seq 1 40); do grep -qE "notifications: card id=[0-9]+ .* buttons=[0-9]" "$LOG_DIR/shell-n.log" && break; sleep 0.05; done
+  sleep 0.3
+  N3_ID=$(grep -oE 'notify id=[0-9]+ app="smoke" .*summary="n3 action"' "$LOG_DIR/shell-n.log" |
+          tail -1 | sed -E 's/notify id=([0-9]+).*/\1/')
+  N3_CARD=$(n_card "${N3_ID:-0}") || true
+  if [[ -n "$N3_CARD" ]]; then
+    read -r LX LY _ _ BTNS <<<"$N3_CARD"
+    read -r BX BY < <(n_at "$LX" "$LY" "${BTNS%%;*}")
+    inject move "$BX" "$BY"; sleep 0.3
+    inject button left click; sleep 0.8
+  fi
+  for _ in $(seq 1 30); do kill -0 "$N3_PID" 2>/dev/null || break; sleep 0.1; done
+  forget_client "$N3_PID"
+  N3B_ID=$(notify-send -p -a smoke -t 0 "n3b body click" "dismissed by a click")
+  sleep 0.6
+  N3B_CARD=$(n_card "${N3B_ID:-0}") || true
+  if [[ -n "$N3B_CARD" ]]; then
+    read -r LX LY BOX _ <<<"$N3B_CARD"
+    IFS=, read -r CX CY _ CH <<<"$BOX"
+    inject move $((LX + CX + 30)) $((LY + CY + CH - 6)); sleep 0.3
+    inject button left click; sleep 0.6
+  fi
+  finish id="${N3_ID:-0}" bid="${N3B_ID:-0}" sh0="$N3_SH" sh1="$(nsh)" mon0="$N3_MON" mon1="$(nmon)"
+  SCEN=park; inject move 20 $((OUT_H - 20)); sleep 0.2
+
+  # N4 — locked: a notification waits (not shown, its timer stopped) and pops up after the
+  # unlock.
+  begin N4
+  N4_SH=$(nsh)
+  start_client probe-n4-lock "$PROBE" lock --unlock-after 3 --exit-after 20
+  N4_LOCK_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-n4-lock.log" "^lock locked" 3
+  N4_ID=$(notify-send -p -a smoke -t 2000 "n4 locked" "after the unlock")
+  sleep 1
+  N4_MID=$(nsh)
+  for _ in $(seq 1 40); do kill -0 "$N4_LOCK_PID" 2>/dev/null || break; sleep 0.1; done
+  forget_client "$N4_LOCK_PID"
+  sleep 3
+  finish id="${N4_ID:-0}" sh0="$N4_SH" shm="$N4_MID" sh1="$(nsh)"
+
+  # N5 — do not disturb while the screen is captured: a normal one goes to the history, a
+  # critical one still pops up; afterwards off. N5b: a middle click on the bell sets it, a
+  # second clears it.
+  begin N5
+  N5_SH=$(nsh)
+  OUT_NAME=${OUT_NAME:-$(grep -m1 -oE "output 0 name=\S+" "$COMP_LOG" | sed 's/.*name=//')}
+  start_client probe-n5-capture "$PROBE" capture --output "$OUT_NAME" --frames 100000 --timeout 6
+  N5_CAP_PID=$LAST_PID
+  wait_for "$LOG_DIR/shell-n.log" "do not disturb on \(screen captured\)" 3
+  N5_ID=$(notify-send -p -a smoke "n5 quiet" "history only")
+  N5C_ID=$(notify-send -p -a smoke -u critical "n5 critical" "shown anyway")
+  sleep 0.6
+  stop_client "$N5_CAP_PID"; forget_client "$N5_CAP_PID"
+  wait_for "$LOG_DIR/shell-n.log" "notifications: do not disturb off" 3
+  "${NGD[@]}" org.freedesktop.Notifications.CloseNotification "${N5C_ID:-0}" >/dev/null 2>&1
+  read -r BELLX BELLW < <(grep -oE "shell.panel: layout bell x=[0-9]+ w=[0-9]+" "$LOG_DIR/shell-n.log" |
+                          tail -1 | sed -E 's/.*x=([0-9]+) w=([0-9]+)/\1 \2/')
+  if [[ -n "${BELLX:-}" ]]; then
+    inject move $((BELLX + BELLW / 2)) 16; sleep 0.3
+    inject button middle click; sleep 0.4
+    N5B_ID=$(notify-send -p -a smoke "n5b quiet" "manual do not disturb")
+    sleep 0.4
+    inject button middle click; sleep 0.4
+  fi
+  finish id="${N5_ID:-0}" cid="${N5C_ID:-0}" bid="${N5B_ID:-0}" sh0="$N5_SH" sh1="$(nsh)"
+  SCEN=park; inject move 20 $((OUT_H - 20)); sleep 0.2
+
+  # N6 — the tray: lumen-probe sni (pixmap icon, a dbusmenu menu) appears in the panel; a left
+  # click → ProvideXdgActivationToken then Activate with that token; busctl lists it on the
+  # watcher; a right click → its menu (an xdg_popup of the panel with a grab), Down, Return →
+  # Event(1, "clicked"); the wheel → Scroll.
+  begin N6
+  N6_SH=$(nsh)
+  start_client probe-n6-sni "$PROBE" sni --pixmap --title "Smoke item" --exit-after 120
+  N6_PID=$LAST_PID
+  wait_for "$LOG_DIR/probe-n6-sni.log" "^sni registered watcher=" 3
+  wait_for "$LOG_DIR/shell-n.log" "shell.panel: layout tray key=[0-9]+ x=[0-9]+" 3
+  sleep 0.4
+  busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+    org.kde.StatusNotifierWatcher RegisteredStatusNotifierItems >"$LOG_DIR/N6-busctl.out" 2>&1
+  busctl --user get-property org.kde.StatusNotifierWatcher /StatusNotifierWatcher \
+    org.kde.StatusNotifierWatcher IsStatusNotifierHostRegistered >>"$LOG_DIR/N6-busctl.out" 2>&1
+  read -r TRX TRW < <(grep -oE "shell.panel: layout tray key=[0-9]+ x=[0-9]+ w=[0-9]+" "$LOG_DIR/shell-n.log" |
+                      tail -1 | sed -E 's/.*x=([0-9]+) w=([0-9]+)/\1 \2/')
+  N6_SHOT=""
+  if [[ -n "${TRX:-}" ]]; then
+    N6_SHOT=$(n_shot)
+    inject move $((TRX + TRW / 2)) 16; sleep 0.3
+    inject move $((TRX + TRW / 2)) 17; sleep 0.8   # the tooltip after 500 ms
+    inject button left click; sleep 0.8
+    inject wheel 1; sleep 0.4
+    inject button right click; sleep 1
+    inject key KEY_DOWN tap; sleep 0.2
+    inject key KEY_ENTER tap; sleep 0.8
+  fi
+  finish tx="${TRX:-0}" tw="${TRW:-0}" sh0="$N6_SH" sh1="$(nsh)" shot="\"${N6_SHOT}\""
+  SCEN=park; inject move 20 $((OUT_H - 20)); sleep 0.2
+
+  # N7 — the shell is killed and started again: the item registers with the new watcher
+  # within a second; ids continue after the persisted block.
+  begin N7
+  N7_SN=$(lines "$LOG_DIR/probe-n6-sni.log")
+  kill -KILL "$N_SHELL_PID" 2>/dev/null; wait "$N_SHELL_PID" 2>/dev/null; forget_client "$N_SHELL_PID"
+  sleep 0.3
+  start_client shell-n2 env LUMEN_LOG=debug LUMEN_SHELL_STATE="$N_STATE" "$SHELL_BIN"
+  N_SHELL_PID=$LAST_PID
+  wait_for "$LOG_DIR/shell-n2.log" "bus name org.kde.StatusNotifierWatcher: owned" 8
+  T0=$(date +%s%N)
+  for _ in $(seq 1 40); do
+    (( $(grep -c "^sni registered watcher=" "$LOG_DIR/probe-n6-sni.log") >= 2 )) && break
+    sleep 0.05
+  done
+  N7_MS=$(( ($(date +%s%N) - T0) / 1000000 ))
+  wait_for "$LOG_DIR/shell-n2.log" "tray: item org.kde.StatusNotifierItem" 3
+  N7_ID=$(notify-send -p -a smoke -t 1000 "n7 after restart" "a new id")
+  sleep 0.3
+  finish ms="$N7_MS" id="${N7_ID:-0}" first="${N1_ID:-0}" sn0="$N7_SN" \
+    sn1="$(lines "$LOG_DIR/probe-n6-sni.log")"
+
+  # N8 — idle: a history and a tray item, nothing happening: the shell does not wake up.
+  begin N8
+  sleep 1.5
+  N8_S0=$(awk '/ctxt_switches/ {s += $2} END {print s}' "/proc/$N_SHELL_PID/status" 2>/dev/null)
+  N8_C0=$(awk '/ctxt_switches/ {s += $2} END {print s}' "/proc/$COMP_PID/task/$COMP_PID/status" 2>/dev/null)
+  sleep 10
+  N8_S1=$(awk '/ctxt_switches/ {s += $2} END {print s}' "/proc/$N_SHELL_PID/status" 2>/dev/null)
+  N8_C1=$(awk '/ctxt_switches/ {s += $2} END {print s}' "/proc/$COMP_PID/task/$COMP_PID/status" 2>/dev/null)
+  finish shell=$(( ${N8_S1:-0} - ${N8_S0:-0} )) comp=$(( ${N8_C1:-0} - ${N8_C0:-0} ))
+
+  for v in N6_PID N_SHELL_PID N_MON_PID; do
+    [[ -n "${!v:-}" ]] && { stop_client "${!v}"; forget_client "${!v}"; }
+  done
+  SCEN=park; inject move 20 $((OUT_H - 20))
+fi
+
 # ── Teardown ─────────────────────────────────────────────────────────────────
 for pid in "${CLIENT_PIDS[@]}"; do stop_client "$pid"; done
 CLIENT_PIDS=()
@@ -3038,11 +3760,12 @@ fd=os.open(sys.argv[1],os.O_RDONLY|os.O_NOCTTY); b=bytearray(4)
 fcntl.ioctl(fd,0x4B3B,b); print("text" if struct.unpack("i",b)[0]==0 else "graphics")' "/dev/$VT" 2>/dev/null || echo unknown)
 
 # ── Verdict ──────────────────────────────────────────────────────────────────
-python3 -I - "$LOG_DIR" "$COMP_RC" "$CONSOLE" "$POINTER_DEV" "$KEYBOARD_DEV" "$OUT_W" "$OUT_H" "$RELATIVE_DEV" <<'PY'
+python3 -I - "$LOG_DIR" "$COMP_RC" "$CONSOLE" "$POINTER_DEV" "$KEYBOARD_DEV" "$OUT_W" "$OUT_H" "$RELATIVE_DEV" "$SCALE" <<'PY'
 import json, math, os, re, sys
 
 log_dir, comp_rc, console, pointer_dev, keyboard_dev = sys.argv[1:6]
 out_w, out_h = int(sys.argv[6]), int(sys.argv[7])
+scale = float(sys.argv[9]) if len(sys.argv) > 9 else 1.0
 
 def read(name):
     try:
@@ -3998,11 +4721,19 @@ if s is not None:
     draws = [m for l in sh if (m := SDRAW.search(l))]
     # The snapshot is in creation order: the restarted panel lists what the old one did.
     before, after = layout_titles(SH1), layout_titles(sh)
-    ok = i_destroyed is not None and i_full is not None and bool(bound) and \
-        bound[-1].group(1) == "2" and i_back is not None and i_back > i_full and snap and \
+    # The zone hold (ADR 010 S6): the dead shell's strip stays reserved until the new panel
+    # maps, so the usable area never becomes the whole output in between (and, unchanged, is
+    # not logged again: `usable y=32 again` is informational).
+    i_hold = next((k for k, l in enumerate(lines_) if "compositor.layer: zone hold on output" in l), None)
+    i_release = next((k for k, l in enumerate(lines_)
+                      if "zone hold released on output" in l and "a new zone mapped" in l), None)
+    ok = i_destroyed is not None and i_full is None and i_hold is not None and \
+        i_release is not None and i_release > i_hold and bool(bound) and \
+        bound[-1].group(1) == "2" and snap and \
         bool(draws) and draws[-1].group(1) == "2" and before == after
-    record("E5 restart: bridge destroyed, usable area restored, fresh snapshot, panel back", ok,
-           f"destroyed={i_destroyed is not None}, usable full={i_full is not None}, rebound snapshot="
+    record("E5 restart: bridge destroyed, panel strip held, fresh snapshot, panel back", ok,
+           f"destroyed={i_destroyed is not None}, usable full meanwhile={i_full is not None}, "
+           f"zone hold={i_hold is not None}, released by the new panel={i_release is not None}, rebound snapshot="
            f"{bound[-1].group(1) if bound else '-'}, usable y=32 again={i_back is not None}, "
            f"shell snapshot of 2={snap}, draw={draws[-1].group(0) if draws else '-'}, "
            f"same entry order as before={before == after} ({list(after.values())})")
@@ -5540,6 +6271,436 @@ if s is not None:
            f"v2 import {li}; v1 import {lv}; set_parent_of lines {len(parented)}; modal parent lines {len(modal)}")
 
 # ── V: shortcuts inhibit, data control, security context ──
+# ── R: the configuration file ───────────────────────────────────────────────
+def since(s, rx):
+    a, b = s["comp"]
+    return [comp[i] for i in range(a, b) if re.search(rx, comp[i])]
+
+s = scen.get("R1")
+if s is not None:
+    p = probe_lines("r1")
+    keymap = [l for l in p if l.startswith("keymap ")]
+    rep = [l for l in p if l.startswith("repeat ")]
+    dev = since(s, r'compositor\.input: input device ".*" \(mouse\): natural-scroll=on accel-profile=flat accel-speed=0\.50')
+    cur = since(s, r"compositor\.cursor: cursor theme=\S+ size=48 \(configuration\)")
+    gen = since(s, r"config: config: generation \d+ from .* \(0 errors, 0 warnings")
+    ok = bool(keymap) and "layouts=2 names=English (US)|German" in keymap[-1] and \
+        rep[-1:] == ["repeat rate=10 delay=600"] and bool(dev) and bool(cur) and bool(gen) and \
+        "close requested" in p
+    record("R1 config.toml appears: repeat 10/600 and us,de reach a client, the mouse flat 0.5 "
+           "with natural scrolling, cursor 48 px; Super+Y (configured) closes the window", ok,
+           f"keymap {keymap[-1:]}; repeat {rep[-1:]}; mouse lines {len(dev)}; cursor {len(cur)}; "
+           f"generation {gen[-1:]}; closed={'close requested' in p}")
+
+s = scen.get("R2")
+if s is not None:
+    keys = [l for l in probe_lines("r2") if l.startswith("key code=21 state=1")]
+    ok = len(keys) >= 2 and "utf8=y layout=0" in keys[0] and "utf8=z layout=1" in keys[1]
+    record("R2 grp:alt_shift_toggle: y, Alt+Shift, y types y then z (German)", ok, f"{keys[:2]}")
+
+s = scen.get("R3")
+if s is not None:
+    p = probe_lines("r2")
+    gen = since(s, r"config: config: generation \d+ from")
+    notices = s.get("notices", -1)
+    ms = s.get("ms", 99999)
+    ok = "repeat rate=30 delay=600" in p and len(gen) == 1 and notices == 0 and ms <= 400
+    record("R3 a live edit (rename): repeat 30 reaches the client, one generation, no notice", ok,
+           f"{ms} ms from the rename to repeat_info (100 ms debounce); generations {len(gen)}; "
+           f"notices so far {notices}", warn=ok and ms > 250)
+
+s = scen.get("R4")
+if s is not None:
+    p = probe_lines("r2")
+    axis = [l for l in p if l.startswith("axis vertical ")]
+    rel = [l for l in p if l.startswith("relative ")]
+    # Natural (positive for a notch up) and doubled (scroll-factor 2: 15 → 30, one notch → 2).
+    up = axis and float(axis[-1].split()[2]) == 30.0 and axis[-1].endswith("discrete=2")
+    flat = rel and rel[-1].startswith("relative 15.00,0.00 unaccel 10.00,0.00")
+    record("R4 the mouse: natural scrolling doubled by scroll-factor 2 (a notch up: +30, 2 "
+           "notches), flat acceleration x1.5",
+           bool(up and flat), f"axis {axis[-1:]}; relative {rel[-1:]}")
+
+s = scen.get("R5")
+if s is not None:
+    rejected = since(s, r"config: config: generation \d+ from .* rejected")
+    try:
+        reload = open(os.path.join(log_dir, "R5.reload"), encoding="utf-8").read()
+    except FileNotFoundError:
+        reload = ""
+    shown = [l for l in read("shell-r.log") if "config: notice: Lumen configuration not used: 1 error" in l]
+    # Shown as a notification (Part 5) once the shell's notification server runs.
+    posted = [l for l in read("shell-r.log")
+              if re.search(r'shell\.notify: notify id=\d+ app="Lumen" \(the shell\'s own\) '
+                           r'summary="Lumen configuration not used"', l)]
+    rep = [l for l in probe_lines("r2") if l.startswith("repeat ")][:s.get("repeats", 0)]
+    notices = s.get("notices", -1)
+    ok = bool(rejected) and s.get("rc") == 1 and "expected ']'" in reload and \
+        "rejected" in reload and notices == 1 and bool(shown) and bool(posted) and \
+        rep[-1:] == ["repeat rate=30 delay=600"]
+    record("R5 a syntax error: rejected, the configuration in use stays, lumen-ctl reload exits 1 "
+           "with the line, one notice (a notification)", ok,
+           f"rejected {len(rejected)}; lumen-ctl rc={s.get('rc')} {reload.strip()[:100]!r}; "
+           f"notices {notices} (notifications {len(posted)}); last repeat then {rep[-1:]}")
+
+s = scen.get("R6")
+if s is not None:
+    mark = s.get("removed_mark", s["comp"][0])
+    kept = since(s, r"input\.keyboard\.repeat-rate: 5000 is outside 0\.\.1000; keeping 30")
+    sugg = since(s, r'unknown action "window\.closee" \(did you mean window\.close\?\)')
+    rep = [l for l in probe_lines("r2") if l.startswith("repeat ")]
+    back = any(re.search(r"config: config: generation \d+ from .* \(0 errors", comp[i])
+               for i in range(mark, s["comp"][1]))
+    notices = [l for l in read("shell-r.log") if "config: notice:" in l]
+    ok = bool(kept) and bool(sugg) and rep[-1:] == ["repeat rate=25 delay=600"] and back and \
+        len(notices) == 2
+    record("R6 a bad value keeps that key (30), an unknown action suggests one; the file removed: "
+           "the defaults return (repeat 25)", ok,
+           f"kept {len(kept)}, suggestion {len(sugg)}; last repeat {rep[-1:]}; defaults back={back}; "
+           f"notices {len(notices)}")
+
+# ── Q: workspaces ─────────────────────────────────────────────────────────────
+def configures(name, upto=None):
+    """The probe's configure lines (within its first `upto` lines: as of a scenario's end)."""
+    p = probe_lines(name)
+    return [l for l in (p[:upto] if upto is not None else p) if l.startswith("configure ")]
+
+def last_suspended(name, upto=None):
+    c = configures(name, upto)
+    return bool(c) and "suspended" in c[-1]
+
+def ws_summary(name):
+    """The last `ws output=… workspaces=…` lines of a lumen-probe workspaces log."""
+    out = {}
+    for l in probe_lines(name):
+        m = re.match(r"ws output=(\S+) workspaces=(\S+)", l)
+        if m:
+            out[m.group(1)] = m.group(2)
+    return out
+
+def focus_ids(r):
+    return [int(m.group(1)) for i in r
+            for m in [re.search(r"compositor\.wm: focus keyboard id=(\d+)$", comp[i])] if m]
+
+s = scen.get("Q1")
+if s is not None:
+    a, b, c = s.get("a", 0), s.get("b", 0), s.get("c", 0)
+    mark, back, end = s.get("mark", s["comp"][0]), s.get("back", s["comp"][0]), s["comp"][1]
+    hidden = [l for l in comp[mark:back] if re.search(r"compositor\.workspace: window id=\d+ hidden", l)]
+    shown = [l for l in comp[back:end] if re.search(r"compositor\.workspace: window id=\d+ shown", l)]
+    # Every configure after the switch carried `suspended`, the ones after the return do not.
+    upto = {"q1a": s.get("la"), "q1b": s.get("lb"), "q1c": s.get("lc")}
+    sus = [n for n in upto if any("suspended" in l for l in configures(n, upto[n]))]
+    on2 = ws_summary("q1-on2")
+    f_on2 = focus_ids(range(mark, back))
+    f_back = focus_ids(range(back, end))
+    ok = a and b and c and len(hidden) >= 3 and len(shown) >= 3 and len(sus) == 3 and \
+        not any(last_suspended(n, upto[n]) for n in upto) and \
+        any(v.endswith(",2*") or ",2*," in v for v in on2.values()) and \
+        f_on2[-1:] == [0] and f_back[-1:] == [a]
+    record("Q1 Super+2 hides the three windows (suspended, no keyboard), lumen-probe sees 2 "
+           "active; Super+1 shows them, the one focused there gets the keyboard back", bool(ok),
+           f"hidden {len(hidden)} shown {len(shown)}; told suspended {sus}; on 2: {on2}; "
+           f"focus while on 2 {f_on2[-1:]}, after {f_back[-1:]} (want {a})")
+
+s = scen.get("Q2")
+if s is not None:
+    a = s.get("a", 0)
+    moved = since(s, rf"workspace move window id={a} to=2 .* follow=1 source=binding")
+    summ = ws_summary("q2")
+    ind = [l for l in read("shell-q.log") if re.search(r"shell\.panel: workspaces \[1\+ 2\*\+ 3\]", l)]
+    la, lb = s.get("la"), s.get("lb")
+    ok = bool(moved) and not last_suspended("q1a", la) and last_suspended("q1b", lb) and \
+        any(v.startswith("1,2*,3") for v in summ.values()) and bool(ind)
+    record("Q2 Super+Shift+2 moves the focused window to 2 and follows; the others stay on 1 "
+           "(hidden); the indicator shows `1+ 2*+ 3`", ok,
+           f"moved {len(moved)}; q1a suspended={last_suspended('q1a', la)} "
+           f"q1b={last_suspended('q1b', lb)}; "
+           f"{summ}; indicator lines {len(ind)}")
+
+s = scen.get("Q3")
+if s is not None:
+    act = since(s, r"compositor\.workspace: workspace activate .* name=1 .* source=ext-workspace")
+    summ = ws_summary("q3")
+    ok = bool(act) and any(v.startswith("1*") for v in summ.values()) and \
+        any(l.startswith("request activate") for l in probe_lines("q3"))
+    record("Q3 ext-workspace activate + commit from lumen-probe shows workspace 1", ok,
+           f"activate lines {len(act)}; {summ}")
+
+s = scen.get("Q4")
+if s is not None:
+    blue = (74, 122, 176)
+    c1, f1 = shot_colour(s.get("s1"))
+    c2, f2 = shot_colour(s.get("s2"))
+    c3, f3 = shot_colour(s.get("s3"))
+    # Away from it: the screen is not the window (blue) nor its backdrop (black); q1a, also
+    # blue, may show as a small part of it.
+    gone = not (c2 == blue and f2 > 0.5) and not (c2 == (0, 0, 0) and f2 > 0.5)
+    ok = c1 == blue and f1 > 0.8 and gone and c3 == blue and f3 > 0.8
+    record("Q4 a fullscreen window: shown on its workspace; on another, neither it nor its black "
+           "backdrop; back, it again", ok,
+           f"screenshots: {c1} {f1:.2f} | {c2} {f2:.2f} | {c3} {f3:.2f}")
+
+s = scen.get("Q5")
+if s is not None:
+    c = s.get("c", 0)
+    mn, ck, end = s.get("min", s["comp"][0]), s.get("click", s["comp"][0]), s["comp"][1]
+    minim = [l for l in comp[mn:ck] if re.search(rf"compositor\.workspace: minimize id={c} on=1 source=binding", l)]
+    back = [l for l in comp[ck:end] if re.search(rf"compositor\.workspace: window id={c} shown", l)]
+    fb = focus_ids(range(ck, end))
+    q5 = s.get("q5", 0)
+    xdg = since(s, rf"compositor\.workspace: minimize id={q5} on=1 source=client")
+    q5_sus = last_suspended("q5")
+    ok = bool(minim) and bool(s.get("cell")) and bool(back) and c in fb and bool(xdg) and q5_sus
+    record("Q5 Super+H minimizes (hidden, suspended); its panel entry brings it back with the "
+           "keyboard; xdg set_minimized minimizes too", ok,
+           f"minimized {len(minim)}; panel cell found={s.get('cell')}; shown again {len(back)}; "
+           f"focus after the click {fb[-2:]}; xdg minimize {len(xdg)} (suspended={q5_sus})")
+
+s = scen.get("Q6")
+if s is not None:
+    p = probe_lines("q6")
+    summ = [l for l in p if l.startswith("capture summary")]
+    m = re.search(r"frames=(\d+) ready=(\d+)", summ[-1]) if summ else None
+    hidden = since(s, rf"compositor\.workspace: window id={s.get('id', 0)} hidden")
+    ok = bool(m) and int(m.group(2)) >= 8 and bool(hidden)
+    record("Q6 a window on a workspace that is not shown is captured: frames keep coming", ok,
+           f"{summ[-1:]}; hidden {len(hidden)}")
+
+s = scen.get("Q7")
+if s is not None:
+    locked = s.get("locked", s["comp"][0])
+    acts = [l for l in comp[locked:s["comp"][1]] if "compositor.workspace: workspace activate" in l]
+    ignored = since(s, r"ext-workspace: commit while locked; ignored")
+    after = ws_summary("q7-after")
+    ok = not acts and bool(ignored) and any(v.startswith("1*") for v in after.values())
+    record("Q7 locked: Super+2 and an ext-workspace activate change nothing", ok,
+           f"activations while locked {len(acts)}; ignored commits {len(ignored)}; after {after}")
+
+# ── O: switching and snapping (design-session-and-wm Part K) ─────────────────
+def shell_o(s):
+    """lumen-shell's lines during scenario s."""
+    return read("shell-o.log")[s.get("sh0", 0):s.get("sh1", 0)]
+
+def layer_maps(s, ns):
+    return [m for i in rng(s)
+            for m in [re.search(r"layer map surface=\d+ layer=\w+ namespace=" + ns +
+                                r" x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+)", comp[i])] if m]
+
+def usable_before(i):
+    u = None
+    for l in comp[:i]:
+        m = re.search(r"compositor\.wm: usable area x=(-?\d+) y=(-?\d+) w=(\d+) h=(\d+) output=0", l)
+        if m:
+            u = tuple(int(m.group(k)) for k in range(1, 5))
+    return u
+
+def pixel(img, x, y):
+    if not img:
+        return None
+    w, h, px = img
+    if not (0 <= x < w and 0 <= y < h):
+        return None
+    o = (y * w + x) * 3
+    return tuple(px[o:o + 3])
+
+TILED = "tiled_left,tiled_right,tiled_top,tiled_bottom"
+
+s = scen.get("O1")
+if s is not None:
+    b = s.get("b", 0)
+    f = focus_ids(rng(s))
+    sw = shell_o(s)
+    act = [l for l in sw if re.search(r'switcher: activate \(released, never shown\) "ob"', l)]
+    begun = since(s, r"held action switcher\.next begins")
+    ok = bool(begun) and f[-1:] == [b] and bool(act) and not layer_maps(s, "lumen-switcher")
+    record("O1 a quick Alt+Tab: the previous window gets the keyboard, the switcher is never "
+           "drawn (released within the open delay)", ok,
+           f"hold began {len(begun)}; focus {f[-1:]} (want {b}); shell {act[-1:] or sw[-3:]}; "
+           f"switcher maps {len(layer_maps(s, 'lumen-switcher'))}")
+
+s = scen.get("O2")
+if s is not None:
+    a = s.get("a", 0)
+    f = focus_ids(rng(s))
+    sw = shell_o(s)
+    opened = [l for l in sw if re.search(r"switcher: open \(3 windows", l)]
+    act = [l for l in sw if re.search(r'switcher: activate \(released, shown\) "oa"', l)]
+    maps = layer_maps(s, "lumen-switcher")
+    lw, lh = out_w / scale, out_h / scale
+    centred = bool(maps) and all(abs(int(m.group(1)) - (lw - int(m.group(3))) / 2) <= 1 and
+                                 abs(int(m.group(2)) - (lh - int(m.group(4))) / 2) <= 1 for m in maps)
+    keys = since(s, r"compositor\.shell: |shell\.bridge: hold key")
+    # The screenshot while shown: the switcher's background and the selection's blue inside
+    # its rect (at the output's scale).
+    img = ppm(s.get("shot", "")) if s.get("shot") else None
+    px_ok, detail_px = False, "no screenshot"
+    if img and maps:
+        x, y, w, h = (int(maps[-1].group(k)) for k in range(1, 5))
+        bg = sel = 0
+        for v in range(int(y * scale) + 2, int((y + h) * scale) - 2, 3):
+            for u in range(int(x * scale) + 2, int((x + w) * scale) - 2, 3):
+                c = pixel(img, u, v)
+                if c and max(abs(c[0] - 30), abs(c[1] - 30), abs(c[2] - 34)) <= 2:
+                    bg += 1
+                elif c and max(abs(c[0] - 61), abs(c[1] - 111), abs(c[2] - 180)) <= 2:
+                    sel += 1
+        px_ok = bg > 50 and sel > 50
+        detail_px = f"background px {bg}, selection px {sel}"
+    ok = bool(opened) and bool(act) and f[-1:] == [a] and centred and px_ok
+    record("O2 Alt held, Tab, Tab: the switcher is drawn after the open delay (centred, at the "
+           "output's scale), the third window of the MRU order gets the keyboard on release", ok,
+           f"opened {opened[-1:]}; maps {[m.group(0) for m in maps]}; centred={centred}; "
+           f"{detail_px}; focus {f[-1:]} (want {a}); {act[-1:] or sw[-4:]}")
+
+s = scen.get("O3")
+if s is not None:
+    sw = shell_o(s)
+    f = focus_ids(rng(s))
+    pa = probe_lines("oa")[s.get("la0", 0):s.get("la1", 0)]
+    leaked = [l for l in pa if re.match(r"key (15|1) ", l) or l.startswith("keyboard leave")]
+    alt = [l for l in pa if l.startswith("key 56 ")]
+    cancel = [l for l in sw if re.search(r"switcher: nothing \(escape", l)]
+    ok = bool(cancel) and not f and not leaked and len(alt) == 2
+    record("O3 Alt+Tab, Escape: nothing changes — no focus change, the application saw Alt "
+           "only (no leave, no Tab, no Escape)", ok,
+           f"{cancel[-1:] or sw[-3:]}; focus changes {f}; application lines {pa}")
+
+s = scen.get("O4")
+if s is not None:
+    c = s.get("c", 0)
+    f = focus_ids(rng(s))
+    sw = shell_o(s)
+    act = [l for l in sw if re.search(r'switcher: activate \(released, never shown\) "oc"', l)]
+    begun = since(s, r"held action switcher\.previous begins")
+    ok = bool(begun) and bool(act) and f[-1:] == [c]
+    record("O4 Alt+Shift+Tab: backwards, the least recently used window", ok,
+           f"hold {len(begun)}; {act[-1:] or sw[-3:]}; focus {f[-1:]} (want {c})")
+
+s = scen.get("O5")
+if s is not None:
+    c = s.get("c", 0)
+    u = usable_before(s["comp"][0])
+    cfgs = [l for l in probe_lines("oc")[s.get("lc0", 0):s.get("lc1", 0)] if l.startswith("configure ")]
+    seq = []
+    for l in cfgs:
+        m = re.match(r"configure w=(\d+) h=(\d+) states=(\S+)", l)
+        if m:
+            w, h, st = int(m.group(1)), int(m.group(2)), m.group(3)
+            tiled = TILED in st
+            mx = "maximized" in st
+            if not seq or seq[-1] != (w, h, tiled, mx):
+                seq.append((w, h, tiled, mx))
+    want = []
+    if u:
+        uw, uh = u[2], u[3]
+        hw, hh = (uw + 1) // 2, (uh + 1) // 2
+        w0, h0 = s.get("w0", 0), s.get("h0", 0)
+        want = [(hw, uh, True, False), (hw, hh, True, False), (hw, uh, True, False),
+                (w0, h0, False, False), (uw, uh, False, True), (w0, h0, False, False)]
+    g = geometry_at(c, s["comp"][1])
+    snaps = since(s, rf"compositor\.snap: snap id={c} to=(left|top-left|none) output=0 source=binding")
+    back = g is not None and (g[0], g[1]) == (s.get("x0"), s.get("y0"))
+    ok = bool(u) and seq == want and back and len(snaps) >= 4
+    record("O5 Super+Left, Up, Down, Right, Up, Down: left half, top-left quarter, left half "
+           "(tiled on every edge), restored; maximized, restored to the same place", ok,
+           f"usable {u}; configures {seq}; want {want}; at the end {g} (was {s.get('x0')},{s.get('y0')}); "
+           f"snap lines {len(snaps)}")
+
+s = scen.get("O6")
+if s is not None:
+    b, mid = s.get("b", 0), s.get("mid", s["comp"][0])
+    u = usable_before(s["comp"][0])
+    prev = [l for l in comp[s["comp"][0]:mid] if re.search(r"compositor\.snap: snap preview zone=left output=0", l)]
+    hidden = [l for l in comp[s["comp"][0]:mid] if "compositor.snap: snap preview hidden" in l]
+    snapped = [l for l in comp[s["comp"][0]:mid] if re.search(rf"compositor\.wm: edge snap id={b} zone=4 output=0", l)]
+    restored = [l for l in comp[mid:s["comp"][1]] if re.search(rf"compositor\.snap: drag restore id={b} from=left .* w=400 h=300", l)]
+    pb = probe_lines("oc")
+    first = [l for l in pb[s.get("lb0", 0):s.get("lbm", 0)] if l.startswith("configure ")]
+    second = [l for l in pb[s.get("lbm", 0):s.get("lb1", 0)] if l.startswith("configure ")]
+    half_ok = bool(u) and any(re.match(rf"configure w={(u[2] + 1) // 2} h={u[3]} states=\S*{TILED}", l) for l in first)
+    back_ok = bool(second) and re.match(r"configure w=400 h=300 states=", second[-1]) is not None and \
+        TILED not in second[-1]
+    # The preview in the screenshot taken while it showed: at the left edge, above the
+    # window, the border (80 % accent) and the fill (25 %) over what the earlier shot had.
+    pre, shot = ppm(s.get("pre", "")) if s.get("pre") else None, ppm(s.get("shot", "")) if s.get("shot") else None
+    px_ok, px_detail = False, "no screenshots"
+    if pre and shot and u:
+        y = int(round((s.get("py", 0) - 200) * scale))
+        border, fill = (0x31, 0x59, 0x90, 0.8), (0x0F, 0x1C, 0x2D, 0.25)
+        def blend(c, under):
+            return tuple(c[i] + under[i] * (1 - c[3]) for i in range(3))
+        under0, under2 = pixel(pre, 0, y), pixel(pre, 2, y)
+        got0, got2 = pixel(shot, 0, y), pixel(shot, 2, y)
+        if under0 and under2 and got0 and got2:
+            e0, e2 = blend(border, under0), blend(fill, under2)
+            px_ok = max(abs(got0[i] - e0[i]) for i in range(3)) <= 4 and \
+                max(abs(got2[i] - e2[i]) for i in range(3)) <= 4
+            px_detail = (f"y={y}: border px {got0} want {tuple(round(v) for v in e0)} over {under0}; "
+                         f"fill px {got2} want {tuple(round(v) for v in e2)} over {under2}")
+    ok = bool(prev) and bool(hidden) and bool(snapped) and half_ok and bool(restored) and back_ok and px_ok
+    record("O6 Super+drag to the left edge: the preview shows the left half (border and fill "
+           "as composited), the release snaps the window there (tiled); dragged out it is "
+           "restored to 400x300 under the pointer", ok,
+           f"preview {prev[-1:]}; hidden {len(hidden)}; snapped {len(snapped)}; half {half_ok} "
+           f"{first[-1:]}; restored {restored[-1:]} {second[-1:]}; {px_detail}")
+
+s = scen.get("O7")
+if s is not None:
+    b = s.get("b", 0)
+    g = geometry_at(b, s["comp"][1])
+    began = since(s, rf"compositor\.snap: keyboard move id={b}")
+    ended = since(s, rf"compositor\.wm: grab end id={b} mode=move reason=release")
+    pb = probe_lines("oc")[s.get("lb0", 0):s.get("lb1", 0)]
+    leaked = [l for l in pb if re.match(r"key (103|105|106|108|28) pressed", l)]
+    moved = g is not None and (g[0] - s.get("x0", 0), g[1] - s.get("y0", 0)) == (30, 10)
+    ok = bool(began) and bool(ended) and moved and not leaked
+    record("O7 Alt+F7, Right ×3, Down, Return: the window moved by (30, 10); the keys were the "
+           "window manager's", ok,
+           f"began {len(began)} ended {len(ended)}; geometry {g} from ({s.get('x0')},{s.get('y0')}); "
+           f"keys seen by the window {leaked}")
+
+s = scen.get("O8")
+if s is not None:
+    b = s.get("b", 0)
+    g = geometry_at(b, s["comp"][1])
+    began = since(s, rf"compositor\.snap: keyboard resize id={b}")
+    want = (s.get("x0", 0), s.get("y0", 0), s.get("w0", 0) + 20, s.get("h0", 0) + 10)
+    ok = bool(began) and g == want
+    record("O8 Alt+F8, Right ×2, Down, Return: the right edge picked (+20), then the bottom "
+           "(+10); the origin stays", ok, f"began {len(began)}; geometry {g}, want {want}")
+
+s = scen.get("O9")
+if s is not None:
+    sw = shell_o(s)
+    cancelled = since(s, r"held action cancelled \(session locked\)")
+    closed = [l for l in sw if "switcher: nothing (cancelled by the compositor" in l]
+    f = focus_ids(rng(s))
+    # Locked, nothing has the keyboard (focus 0); unlocked, the window the user left.
+    ok = bool(cancelled) and bool(closed) and f[-1:] in ([s.get("c")], [])
+    record("O9 the session locks during a hold: the hold is cancelled, the switcher closes and "
+           "activates nothing", ok,
+           f"cancelled {len(cancelled)}; {closed[-1:] or sw[-3:]}; focus {f}")
+
+s = scen.get("O11")
+if s is not None:
+    sw = shell_o(s)
+    cancelled = since(s, r"held action cancelled \(click elsewhere\)")
+    closed = [l for l in sw if "switcher: nothing (cancelled by the compositor" in l]
+    f = focus_ids(rng(s))
+    ok = bool(cancelled) and bool(closed) and f[-1:] == [s.get("a")]
+    record("O11 a click on a window during a hold cancels it; that window keeps the keyboard",
+           ok, f"cancelled {len(cancelled)}; {closed[-1:] or sw[-3:]}; focus {f} (want {s.get('a')})")
+
+s = scen.get("O10")
+if s is not None:
+    quick = since(s, r"compositor\.wm: quick switch id=(\d+) \(no shell\)")
+    f = focus_ids(rng(s))
+    # oa had the keyboard (O11's click): another window gets it.
+    ok = bool(quick) and bool(f) and f[-1] != s.get("before")
+    record("O10 with no shell Alt+Tab is the compositor's quick switch to the topmost other "
+           "window", ok, f"{quick[-1:]}; focus {f}")
+
 s = scen.get("V1")
 if s is not None:
     lines_v1 = probe_lines("v1")
@@ -5604,6 +6765,147 @@ if s is not None:
            "session-wide global; the socket stops when the engine hangs up", ok,
            f"{summary[0] if summary else 'no summary'}; {closed[0] if closed else 'no close line'}; "
            f"compositor marked it sandboxed={bool(marked)}")
+
+# ── N: notifications and the tray (design-session-and-wm Part N) ─────────────
+def shell_n(s, a="sh0", b="sh1", f="shell-n.log"):
+    """lumen-shell's lines (group N) between two marks of scenario s."""
+    return read(f)[s.get(a, 0):s.get(b, 0)]
+
+def monitor(s):
+    """org.freedesktop.Notifications signals dbus-monitor saw during s: [member, args...]."""
+    sigs, cur = [], None
+    for l in read("n-monitor.log")[s.get("mon0", 0):s.get("mon1", 0)]:
+        m = re.search(r"interface=org\.freedesktop\.Notifications; member=(\w+)", l)
+        if l.startswith("signal ") and m:
+            cur = [m.group(1)]
+            sigs.append(cur)
+            continue
+        if l.startswith("signal ") or l.startswith("method "):
+            cur = None
+            continue
+        m = re.match(r"\s+(?:uint32|string) (.*)$", l)
+        if m and cur is not None:
+            cur.append(m.group(1).strip('"'))
+    return sigs
+
+def has(lines, rx):
+    return any(re.search(rx, l) for l in lines)
+
+s = scen.get("N1")
+if s is not None:
+    i, c = s.get("id", 0), s.get("cid", 0)
+    sh = shell_n(s)
+    sig = monitor(s)
+    overlay = [l for l in sh if re.search(r"notifications: (overlay layer \(a critical one shown\)|"
+                                          r"shown \(\d+ cards?, overlay layer\))", l)]
+    ok = (i > 0 and c > 0 and has(sh, rf'notify id={i} app="smoke" urgency=normal .* popup') and
+          has(sh, rf'notify id={c} app="smoke" urgency=critical .* popup') and
+          ["NotificationClosed", str(i), "1"] in sig and ["NotificationClosed", str(c), "3"] in sig and
+          not any(x[:2] == ["NotificationClosed", str(c)] and x[2:] != ["3"] for x in sig) and
+          bool(overlay) and s.get("rc") == 0 and s.get("rc2", 0) != 0)
+    record("N1 notify-send normal (-t 1500) expires with reason 1; critical stays, on the overlay "
+           "layer, CloseNotification closes it (3); an unknown id is an error", ok,
+           f"ids {i}/{c}; closed signals {[x for x in sig if x[0] == 'NotificationClosed']}; "
+           f"overlay maps {len(overlay)}; CloseNotification rc {s.get('rc')} unknown rc {s.get('rc2')}")
+
+s = scen.get("N2")
+if s is not None:
+    i, j = s.get("id", 0), s.get("id2", 0)
+    sh = shell_n(s)
+    two = [l for l in sh if "notifications: draw cards=2" in l]
+    ok = i > 0 and i == j and has(sh, rf'notify id={i} \(replaced\) app="smoke".*summary="n2 second"') and not two
+    record("N2 replaces_id: the same id back, replaced in place (never two cards)", ok,
+           f"id {i} → {j}; replaced lines {len([l for l in sh if '(replaced)' in l])}; two-card draws {len(two)}")
+
+s = scen.get("N3")
+if s is not None:
+    i, b = s.get("id", 0), s.get("bid", 0)
+    sig = [x for x in monitor(s) if x[0] in ("ActivationToken", "ActionInvoked", "NotificationClosed")]
+    seq = [x for x in sig if len(x) > 1 and x[1] == str(i)]
+    printed = read("n3-send.log")
+    ok = (len(seq) == 3 and seq[0][0] == "ActivationToken" and len(seq[0]) == 3 and len(seq[0][2]) >= 16 and
+          seq[1] == ["ActionInvoked", str(i), "ok"] and seq[2] == ["NotificationClosed", str(i), "2"] and
+          "ok" in printed and ["NotificationClosed", str(b), "2"] in sig)
+    record("N3 an action button: ActivationToken, ActionInvoked(ok), NotificationClosed(2) in that "
+           "order, notify-send prints ok; a click on a card without a default action dismisses (2)",
+           ok, f"id {i}: {seq}; notify-send printed {printed}; body click id {b}: "
+               f"{[x for x in sig if len(x) > 1 and x[1] == str(b)]}")
+
+s = scen.get("N4")
+if s is not None:
+    i = s.get("id", 0)
+    locked = shell_n(s, "sh0", "shm")
+    after = shell_n(s, "shm", "sh1")
+    ok = (has(locked, rf'notify id={i} .*queued \(locked\)') and
+          not has(locked, r"notifications: shown") and has(after, r"notifications: shown") and
+          has(after, rf"notify id={i} closed reason=1"))
+    record("N4 while locked a notification waits (not shown, its timer stopped) and pops up after "
+           "the unlock, then expires", ok,
+           f"while locked: {[l for l in locked if 'notif' in l][-2:]}; after: "
+           f"{[l for l in after if 'notif' in l][:3]}")
+
+s = scen.get("N5")
+if s is not None:
+    i, c, b = s.get("id", 0), s.get("cid", 0), s.get("bid", 0)
+    sh = shell_n(s)
+    ok = (has(sh, r"do not disturb on \(screen captured\)") and
+          has(sh, rf'notify id={i} .*history \(do not disturb\)') and
+          has(sh, rf'notify id={c} .*urgency=critical.* popup') and has(sh, r"do not disturb off") and
+          has(sh, r"do not disturb set \(a middle click on the indicator\)") and
+          has(sh, rf'notify id={b} .*history \(do not disturb\)') and has(sh, r"do not disturb cleared"))
+    record("N5 do not disturb while the screen is captured (normal → history, critical shown), off "
+           "after; a middle click on the bell sets and clears it", ok,
+           f"{[l.split('] ', 1)[-1] for l in sh if 'disturb' in l]}")
+
+s = scen.get("N6")
+if s is not None:
+    sn = read("probe-n6-sni.log")
+    sh = shell_n(s)
+    tok = next((l.split()[2] for l in sn if l.startswith("sni token ")), "")
+    act = [l for l in sn if l.startswith("sni activate ")]
+    bus = read("N6-busctl.out")
+    r6 = rng(s)
+    grabs = [l for l in comp[r6.start:r6.stop] if POPGRAB.search(l) and "result=ok" in l]
+    maps = [l for l in comp[r6.start:r6.stop] if POPMAP.search(l)]
+    # The item's orange disc in its panel cell, in the screenshot.
+    img = ppm(s.get("shot", "")) if s.get("shot") else None
+    orange = 0
+    if img:
+        tx, tw = s.get("tx", 0), s.get("tw", 0)
+        for y in range(4, 28):
+            for x in range(tx, tx + tw):
+                c = pixel(img, x, y)
+                if c and abs(c[0] - 0xF0) <= 3 and abs(c[1] - 0x90) <= 3 and abs(c[2] - 0x20) <= 3:
+                    orange += 1
+    ok = (bool(tok) and bool(act) and act[-1].endswith(f"token={tok}") and
+          has(sh, r"tray: .* Activate x=\d+ y=\d+ token=yes") and
+          any("StatusNotifierItem" in l for l in bus) and any(l.strip() == "b true" for l in bus) and
+          bool(grabs) and bool(maps) and "sni menu event id=0 type=opened" in sn and
+          "sni menu clicked id=1 label=_Open" in sn and "sni menu event id=0 type=closed" in sn and
+          "sni scroll delta=120 orientation=vertical" in sn and has(sh, r'tray: tooltip "Smoke item"') and
+          orange >= 100)
+    record("N6 the tray: lumen-probe sni in the panel (its pixmap drawn), tooltip, left click → "
+           "ProvideXdgActivationToken then Activate with it, busctl lists it, right click → its "
+           "dbusmenu as a grabbing popup, Down+Return → Event(1, clicked), wheel → Scroll", ok,
+           f"token {tok[:8] or '-'}…; activate {act[-1:]}; busctl {bus}; popup grabs {len(grabs)} "
+           f"maps {len(maps)}; menu {[l for l in sn if 'menu' in l][-4:]}; scroll "
+           f"{[l for l in sn if 'scroll' in l]}; orange px {orange}")
+
+s = scen.get("N7")
+if s is not None:
+    sn = read("probe-n6-sni.log")[s.get("sn0", 0):s.get("sn1", 0)]
+    i = s.get("id", 0)
+    ok = (s.get("ms", 9999) <= 1000 and any(l.startswith("sni registered watcher=") for l in sn) and
+          i >= 1 + 64 and has(read("shell-n2.log"), r"tray: item org\.kde\.StatusNotifierItem-\d+-1/StatusNotifierItem id=\"lumen-probe\""))
+    record("N7 the shell killed and started again: the item registers with the new watcher within "
+           "1 s; ids continue after the persisted block", ok,
+           f"re-registered after {s.get('ms')} ms ({[l for l in sn if 'watcher' in l]}); new id {i}")
+
+s = scen.get("N8")
+if s is not None:
+    sw, cw = s.get("shell", -1), s.get("comp", -1)
+    record("N8 idle with a history and a tray item: lumen-shell sleeps (context switches in 10 s)",
+           0 <= sw <= 2, f"shell {sw}, compositor main thread {cw} in 10 s", warn=0 <= sw <= 2 and cw > 40)
 
 # ── W: pointer constraints, relative pointer, gestures (design-app-compat-capture Part C) ──
 REL_LINE = re.compile(r"^relative (-?[\d.]+),(-?[\d.]+) unaccel (-?[\d.]+),(-?[\d.]+) t=\d+$")
@@ -6039,6 +7341,10 @@ for i, l in enumerate(comp):
         pass
     elif l.startswith("[WARN]") and "L2" in scen and any(e in l for e in LOCK_WARN):
         pass
+    elif l.startswith("[WARN] config: ") and ("R5" in scen or "R6" in scen) and \
+            "R-config/config.toml" in l:
+        # R5 and R6 write a broken file on purpose: its problems are warnings by design.
+        pass
     elif l.startswith("[ERROR]") or (l.startswith("[WARN]") and not any(b in l for b in BUDGET)):
         errors.append(l)
 banned = [l for l in comp if any(t in l for t in ("unregistered texture",
@@ -6074,6 +7380,11 @@ for r in inj:
         k = (r["dx"], r["dy"])
         inj_rel[k] = inj_rel.get(k, 0) + 1
 seen_rel = {}
+inj_wheel = {}
+for r in inj:
+    if r["kind"] == "wheel":
+        inj_wheel[r["clicks"]] = inj_wheel.get(r["clicks"], 0) + 1
+seen_wheel = {}
 inj_ay = {r["ay"] for r in inj if r["kind"] == "motion" and "ay" in r}
 BTN = {"left": 0x110, "right": 0x111, "middle": 0x112}
 inj_keys = {}
@@ -6093,6 +7404,13 @@ for w in watch:
     if w.get("kind") != "seen":
         continue
     dev = w["dev"]
+    if dev == relative_dev and w["ev"] and all(e[0] == 2 and e[1] == 8 for e in w["ev"]):
+        # A wheel frame (REL_WHEEL, group R): the injector's when one of its writes had it.
+        clicks = w["ev"][0][2]
+        seen_wheel[clicks] = seen_wheel.get(clicks, 0) + 1
+        if seen_wheel[clicks] > inj_wheel.get(clicks, 0):
+            foreign.append((w["t_us"], f"{dev}: REL_WHEEL {clicks}"))
+        continue
     if dev == relative_dev and all(e[0] == 2 and e[1] in (0, 1) for e in w["ev"]):
         # A relative frame (REL_X/REL_Y): the injector's when one of its writes had exactly it.
         dx = next((e[2] for e in w["ev"] if e[1] == 0), 0)

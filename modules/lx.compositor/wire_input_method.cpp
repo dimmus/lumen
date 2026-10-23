@@ -214,13 +214,22 @@ void im_grab_keyboard(struct wl_client* client, struct wl_resource* im_res, uint
         zwp_input_method_keyboard_grab_v2_send_keymap(res, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd,
                                                       size);
     // wl_keyboard's (wire_seat.cpp): one repeat rate for the seat.
-    zwp_input_method_keyboard_grab_v2_send_repeat_info(res, 40, 400);
+    zwp_input_method_keyboard_grab_v2_send_repeat_info(res, g_p0_ctx->repeat_rate,
+                                                       g_p0_ctx->repeat_delay);
     g->im = im;
     im->grab = g;
     lx::compositor::im_grab_ops ops{};
     ops.grab = res;
     ops.key = &grab_send_key;
     ops.modifiers = &grab_send_modifiers;
+    ops.keymap = [](void* grab, int kfd, unsigned ksize) {
+        zwp_input_method_keyboard_grab_v2_send_keymap(static_cast<wl_resource*>(grab),
+                                                      WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, kfd, ksize);
+    };
+    ops.repeat_info = [](void* grab, int rate, int delay) {
+        zwp_input_method_keyboard_grab_v2_send_repeat_info(static_cast<wl_resource*>(grab), rate,
+                                                           delay);
+    };
     g_p0_ctx->input->set_im_grab(ops, *g_p0_ctx->seat);
     if (ime_debug()) {
         ime_log(lx::trace::level::debug, "input method grab keyboard routing={}",

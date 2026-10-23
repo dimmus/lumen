@@ -271,6 +271,10 @@ public:
     /// resampled draw's linear filter reaches up to half a source texel past its own pixels.
     /// Kept as separate rects, merged only where cheap — see `gfx::damage_region`.
     void note_damage(lx::rect2i region, int margin_px = 0);
+    /// The same for the views in `view_mask` only (bit per view): a window that is not shown
+    /// (another workspace, minimized) damages the capture views that may draw it, never an
+    /// output (design-session-and-wm W.3).
+    void note_damage_views(lx::rect2i region, int margin_px, std::uint32_t view_mask);
     /// Damage already in view `slot`'s output pixels.
     void note_damage_output(unsigned slot, lx::rect2i region);
     /// View 0's pixels (single-output callers and tests).
@@ -704,6 +708,11 @@ void lx::scene::scene_graph::set_snapshot_config(snapshot_config config) {
 }
 
 void lx::scene::scene_graph::note_damage(lx::rect2i region, int margin_px) {
+    note_damage_views(region, margin_px, ~0u);
+}
+
+void lx::scene::scene_graph::note_damage_views(lx::rect2i region, int margin_px,
+                                               std::uint32_t view_mask) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (region.width <= 0 || region.height <= 0)
         return;
@@ -713,7 +722,7 @@ void lx::scene::scene_graph::note_damage(lx::rect2i region, int margin_px) {
     const long long rx1 = static_cast<long long>(region.x) + region.width + 1;
     const long long ry1 = static_cast<long long>(region.y) + region.height + 1;
     for (unsigned slot = 0; slot < k_max_views; ++slot) {
-        if (!((live_views_ >> slot) & 1u))
+        if (!((live_views_ >> slot) & 1u) || !((view_mask >> slot) & 1u))
             continue;
         view& v = *views_[slot];
         const lx::rect2i l = v.config.logical;
@@ -894,9 +903,21 @@ void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot)
                                  ? const_cast<scene_node*>(view_config(slot).root)
                                  : &root_;
     const lx::buffer_transform t = ctx.projection.transform;
+    // A capture view draws its window even while the window is not shown on any output
+    // (another workspace, minimized: design-session-and-wm W.3) — the root's own visibility
+    // is not asked, everything below it is.
+    const auto emit_from = [&](emit_context& c) {
+        if (from != &root_ && from->kind() == node_kind::container) {
+            auto* box = static_cast<container_node*>(from);
+            for (unsigned i = 0; i < box->child_count(); ++i)
+                emit_node(box->child_at(i), out, c);
+            return;
+        }
+        emit_node(from, out, c);
+    };
     if (t == lx::buffer_transform::normal || ctx.projection.size.width <= 0 ||
         ctx.projection.size.height <= 0) {
-        emit_node(from, out, ctx);
+        emit_from(ctx);
         return;
     }
     // A turned output (ADR 008 §C.4): emitters draw into the untransformed content space;
@@ -906,7 +927,7 @@ void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot)
     const lx::size2i c = content_size(ctx.projection);
     ctx.projection.size = c;
     ctx.projection.transform = lx::buffer_transform::normal;
-    emit_node(from, out, ctx);
+    emit_from(ctx);
     draw_command* d = out.data();
     for (unsigned i = 0; i < out.size(); ++i) {
         d[i].dst = lx::gfx::transform_rect(d[i].dst, t, c.width, c.height);

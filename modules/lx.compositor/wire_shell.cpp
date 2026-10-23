@@ -54,7 +54,7 @@ namespace {
 // Requests name toplevels by the compositor-created zlm_toplevel_v1 handle, whose user data
 // is the toplevel_id (shell_bridge::toplevel_from_handle); an inert handle decodes to 0.
 // The bodies that are still empty are the ones whose compositor-side action does not exist
-// yet (maximize/fullscreen/minimize, workspace objects, rule
+// (the deprecated zlm workspace objects — ext-workspace-v1 serves workspaces — and rule
 // persistence) — they are declared here so the shell can bind and drive what does work,
 // rather than failing at bind. Every request has a body: libwayland calls the slot
 // unconditionally, so a missing one is a NULL call.
@@ -171,8 +171,7 @@ const struct zlm_policy_bridge_v1_interface policy_bridge_impl = {
                 return true;
             });
         },
-    // Fullscreen on the output asked for (null: the window's own). No minimize yet: logged
-    // as ignored, never an error.
+    // Fullscreen on the output asked for (null: the window's own).
     .request_fullscreen =
         [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel,
            struct wl_resource* output) {
@@ -184,7 +183,10 @@ const struct zlm_policy_bridge_v1_interface policy_bridge_impl = {
         },
     .request_minimize =
         [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {
-            bridge_request("minimize", toplevel, [](auto&, lx::toplevel_id) { return false; });
+            bridge_request("minimize", toplevel, [](auto& wm, lx::toplevel_id id) {
+                wm.set_minimized(id, true, "shell");
+                return true;
+            });
         },
     .request_close =
         [](struct wl_client*, struct wl_resource*, struct wl_resource* toplevel) {
@@ -195,6 +197,7 @@ const struct zlm_policy_bridge_v1_interface policy_bridge_impl = {
         },
 };
 
+// Deprecated in version 7 and never implemented: ext-workspace-v1 and toplevel_workspace.
 const struct zlm_workspace_manager_v1_interface workspace_manager_impl = {
     .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
     .create_workspace = [](struct wl_client*, struct wl_resource*, uint32_t, const char*) {},
@@ -349,6 +352,133 @@ bool shell_send_lock_requested(unsigned reason) {
     return told;
 }
 
+void shell_send_config(void* shell_resource, const lx::compositor::shell_config_report& r) {
+    const auto send = [&](wl_resource* res) {
+        if (!res || wl_resource_get_version(res) < ZLM_SHELL_V1_CONFIG_SINCE_VERSION)
+            return;
+        if (r.fd >= 0)
+            zlm_shell_v1_send_config(res, r.fd, r.size, r.generation);
+        for (unsigned i = 0; i < r.line_count; ++i)
+            zlm_shell_v1_send_config_diagnostic(res, r.generation, r.lines[i].severity,
+                                                r.lines[i].file ? r.lines[i].file : "",
+                                                r.lines[i].line,
+                                                r.lines[i].text ? r.lines[i].text : "");
+        zlm_shell_v1_send_config_done(res, r.generation, r.applied ? 1u : 0u, r.errors,
+                                      r.warnings);
+    };
+    if (shell_resource) {
+        send(static_cast<wl_resource*>(shell_resource));
+        return;
+    }
+    for (auto* res : shell_resources)
+        send(res);
+}
+
+bool shell_send_action(const char* action, const char* argument, unsigned time_ms, bool input) {
+    bool told = false;
+    for (auto* res : shell_resources) {
+        if (!res || wl_resource_get_version(res) < ZLM_SHELL_V1_ACTION_SINCE_VERSION)
+            continue;
+        unsigned serial = 0;
+        // As a grab's activation: an input serial noted as a key press delivered to the
+        // shell, which may quote it for the activation token of what it launches.
+        if (input && g_p0_ctx && g_p0_ctx->seat) {
+            serial = g_p0_ctx->seat->next_serial();
+            if (g_p0_ctx->input)
+                g_p0_ctx->input->serials().note(wl_resource_get_client(res), serial,
+                                                lx::compositor::input_serial_kind::key_press);
+        }
+        zlm_shell_v1_send_action(res, action ? action : "", argument ? argument : "", serial,
+                                 time_ms);
+        told = true;
+    }
+    if (surface_debug()) {
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
+                                         "action {} {} to the shell: {}", action ? action : "",
+                                         argument ? argument : "", told ? "sent" : "no v7 shell");
+    }
+    return told;
+}
+
+// ── zlm_held_action_v1 (v7, design-session-and-wm K.1) ──────────────────────
+//
+// The hold itself lives in `keybindings` (Wayland-free; the resource is its owner key). The
+// compositor diverts key presses to it while the binding's modifier is down; the resource's
+// destruction (the shell's destroy, or its connection going) ends the hold, so keys can never
+// stay diverted to a shell that is gone.
+
+namespace {
+
+const struct zlm_held_action_v1_interface held_action_impl = {
+    .destroy = [](struct wl_client*, struct wl_resource* r) { wl_resource_destroy(r); },
+};
+
+void held_action_destroyed(struct wl_resource* r) {
+    if (g_p0_ctx && g_p0_ctx->keys && g_p0_ctx->keys->hold_owner() == r) {
+        (void)g_p0_ctx->keys->end_hold();
+        if (surface_debug())
+            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.shell",
+                                            "held action ended by the shell");
+    }
+}
+
+/// A fresh input serial noted as a key press delivered to `res`'s client.
+unsigned shell_key_serial(wl_resource* res) {
+    if (!g_p0_ctx || !g_p0_ctx->seat)
+        return 0;
+    const unsigned serial = g_p0_ctx->seat->next_serial();
+    if (g_p0_ctx->input)
+        g_p0_ctx->input->serials().note(wl_resource_get_client(res), serial,
+                                        lx::compositor::input_serial_kind::key_press);
+    return serial;
+}
+
+} // namespace
+
+void* shell_send_held_action(const char* action, const char* argument, unsigned time_ms) {
+    for (auto* res : shell_resources) {
+        if (!res || wl_resource_get_version(res) < ZLM_SHELL_V1_HELD_ACTION_SINCE_VERSION)
+            continue;
+        wl_resource* hold = wl_resource_create(wl_resource_get_client(res),
+                                               &zlm_held_action_v1_interface,
+                                               wl_resource_get_version(res), 0);
+        if (!hold) {
+            wl_client_post_no_memory(wl_resource_get_client(res));
+            return nullptr;
+        }
+        wl_resource_set_implementation(hold, &held_action_impl, g_p0_ctx, &held_action_destroyed);
+        zlm_shell_v1_send_held_action(res, hold, action ? action : "", argument ? argument : "",
+                                      shell_key_serial(res), time_ms);
+        if (surface_debug()) {
+            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
+                                             "held action {} to the shell", action ? action : "");
+        }
+        return hold;
+    }
+    return nullptr;
+}
+
+void shell_send_hold_key(void* hold, unsigned keysym, unsigned mods, const char* binding,
+                         unsigned time_ms) {
+    auto* res = static_cast<wl_resource*>(hold);
+    if (!res)
+        return;
+    zlm_held_action_v1_send_key(res, keysym, mods, binding ? binding : "", shell_key_serial(res),
+                                time_ms);
+}
+
+void shell_send_hold_released(void* hold, unsigned time_ms) {
+    auto* res = static_cast<wl_resource*>(hold);
+    if (!res)
+        return;
+    zlm_held_action_v1_send_released(res, shell_key_serial(res), time_ms);
+}
+
+void shell_send_hold_cancelled(void* hold) {
+    if (auto* res = static_cast<wl_resource*>(hold))
+        zlm_held_action_v1_send_cancelled(res);
+}
+
 void shell_fire_key_grab(void* grab_resource, unsigned time_ms) {
     auto* res = static_cast<wl_resource*>(grab_resource);
     if (!res || !g_p0_ctx || !g_p0_ctx->seat)
@@ -385,9 +515,16 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
     if (!res)
         return;
     res.set_implementation(&shell_impl, g_p0_ctx, [](void* r) {
-        for (auto*& s : shell_resources)
+        bool v7 = false;
+        for (auto*& s : shell_resources) {
             if (s == r)
                 s = nullptr;
+            else if (s && wl_resource_get_version(s) >= ZLM_SHELL_V1_ACTION_SINCE_VERSION)
+                v7 = true;
+        }
+        // Shell actions are delivered only while a v7 shell is there to take them.
+        if (g_p0_ctx && g_p0_ctx->keys)
+            g_p0_ctx->keys->set_shell_actions(v7);
     });
     for (auto*& s : shell_resources) {
         if (!s) {
@@ -399,15 +536,23 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
     // plugin, workspace drag, explicit sync), so the flags are empty.
     // shell_protocol_version: the zlm family's version this compositor implements (2:
     // toplevel_flags; 3: request_logout; 4: grab_key; 5: lock_state, lock_requested; 6:
-    // icons, parents, bell, capture_state, not_inhibitable grabs).
+    // icons, parents, bell, capture_state, not_inhibitable grabs; 7: config, actions, held
+    // actions, workspaces).
     auto* native = static_cast<wl_resource*>(res.native());
-    zlm_shell_v1_send_capabilities(native, 0u, 6u);
+    zlm_shell_v1_send_capabilities(native, 0u, 7u);
     if (wl_resource_get_version(native) >= ZLM_SHELL_V1_CAPTURE_STATE_SINCE_VERSION)
         zlm_shell_v1_send_capture_state(native, capture_active ? 1u : 0u);
     // "Sent on bind and on every change": a shell restarted behind a lock learns it at once.
     if (wl_resource_get_version(native) >= ZLM_SHELL_V1_LOCK_STATE_SINCE_VERSION)
         zlm_shell_v1_send_lock_state(
             native, g_p0_ctx->lock ? lx::compositor::shell_lock_state(g_p0_ctx->lock->state()) : 0u);
+    if (wl_resource_get_version(native) >= ZLM_SHELL_V1_ACTION_SINCE_VERSION && g_p0_ctx->keys)
+        g_p0_ctx->keys->set_shell_actions(true);
+    // v7: the configuration in use, before the shell sets anything up (it applies its
+    // sections from it), so a restarted shell starts with the current file.
+    if (wl_resource_get_version(native) >= ZLM_SHELL_V1_CONFIG_SINCE_VERSION &&
+        g_p0_ctx->shell_config_on_bind)
+        g_p0_ctx->shell_config_on_bind(g_p0_ctx->shell_config_user, native);
 }
 
 } // namespace lx::compositor::p0

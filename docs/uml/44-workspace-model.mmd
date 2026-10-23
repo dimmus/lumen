@@ -1,0 +1,24 @@
+sequenceDiagram
+    %% Workspaces (ADR 010 Part 3): a binding switches, the window manager executes and tells
+    %% ext-workspace clients and the shell; the shell's indicator is one of those clients.
+    participant K as keybindings (UI)
+    participant W as window_manager (UI)
+    participant M as workspace_model (:workspaces)
+    participant X as wire_workspace (ext-workspace)
+    participant B as shell_bridge (zlm v7)
+    participant S as lumen-shell (indicator, task list)
+    participant A as application
+    K->>W: Super+2 → run_action(workspace.switch 2) on the focused output
+    W->>M: by_index(output, 2), activate(ws)
+    M-->>M: dynamic: the workspace left goes if empty (not the last); names by position
+    W->>W: update_visibility(): shown = mapped ∧ ¬minimized ∧ (sticky ∨ active)
+    W->>A: hidden: tree container invisible, out of hit test, xdg configure `suspended`
+    W->>W: focus: the workspace's remembered window, else its topmost, else none
+    W->>X: flush_workspaces() → observer → per-manager diff
+    X->>S: leave/removed, workspace/enter, name, coordinates, state … done
+    W->>B: windows whose workspace changed
+    B->>S: toplevel_workspace(toplevel, the shell's ext_workspace_handle_v1)
+    S->>S: done → indicator cells (active, occupied, urgent) and the task list follow
+    S->>X: a click: ext_workspace_handle_v1.activate + manager.commit
+    X->>W: commit: assigns, then activates, as one change (one done)
+    Note over W,M: hotplug — an output that goes: its active workspace's windows join the fallback's active one, the others are appended (homes kept); it returns: they go back, the active one active again

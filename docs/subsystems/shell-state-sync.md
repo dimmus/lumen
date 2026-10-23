@@ -11,9 +11,9 @@ Implemented in `zlm_policy_bridge_v1` (`protocols/lumen/zlm_shell_v1.xml`):
 
 | Phase | Events |
 |-------|--------|
-| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 6), then (v5) `zlm_shell_v1.lock_state`, (v6) `capture_state` |
-| Initial sync | `snapshot_begin` → `snapshot_workspace*` → (`snapshot_toplevel` [→ `toplevel_flags`])* → (v6, per toplevel: [`toplevel_icon` → `toplevel_icon_buffer`* → `toplevel_icon_done`] [→ `toplevel_parent`])* → `snapshot_output*` → `snapshot_done` → `focus_changed` |
-| Runtime deltas | `toplevel_created` (→ `toplevel_state`, `toplevel_geometry` [, `toplevel_flags`] [, icon] [, `toplevel_parent`]), `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `toplevel_flags` (v2), `focus_changed`, `stacking_order_changed`, (v6) the icon group, `toplevel_parent`, `bell` |
+| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 7), then (v5) `zlm_shell_v1.lock_state`, (v6) `capture_state`, (v7) `config` → `config_diagnostic`* → `config_done` |
+| Initial sync | `snapshot_begin` → (`snapshot_toplevel` [→ `toplevel_flags`] [→ `toplevel_workspace` (v7)])* → (v6, per toplevel: [`toplevel_icon` → `toplevel_icon_buffer`* → `toplevel_icon_done`] [→ `toplevel_parent`])* → `snapshot_done` → `focus_changed` |
+| Runtime deltas | `toplevel_created` (→ `toplevel_state`, `toplevel_geometry` [, `toplevel_flags`] [, icon] [, `toplevel_parent`]), `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `toplevel_flags` (v2), `focus_changed`, `stacking_order_changed`, (v6) the icon group, `toplevel_parent`, `bell`, (v7) `toplevel_workspace` |
 
 The snapshot carries no focus, so the compositor follows `snapshot_done` at once with a
 `focus_changed` naming the focused window (or null). It is an ordinary v1 delta: no XML
@@ -167,6 +167,100 @@ of the active output. Super+L (with a lock command) is grabbed `not_inhibitable`
   keyboard; cleared when the window gets the keyboard (a `request_activate` from the shell
   included) or unmaps.
 
+### Version 7: the configuration and actions
+
+The compositor reads, watches and validates `config.toml` (ADR 010 Part 2); the shell is
+handed what it read, and the key bindings are the compositor's:
+
+- **`config(fd, size, generation)`** — a sealed, read-only memfd of the accepted bytes: the
+  layers concatenated, each after a `# lumen-layer: PATH` line, so a line number maps back to
+  its file; size 0 means no file (every default). Sent on bind (before the shell sets
+  anything up) and after a reload that accepted different bytes. A rejected reload (a syntax
+  error) sends no `config`: the previous one stays in use. The shell parses the bytes with
+  `lx.config` — the compositor's parser — and applies `[idle]` and `[background]` live,
+  `[switcher]` at the next hold, and its focus-follows-mouse debounce from `[focus]`
+  (notifications later); its command-line options override the file. A
+  restarted shell starts from the current file.
+- **`config_diagnostic(generation, severity, file, line, text)`** then
+  **`config_done(generation, applied, errors, warnings)`** — the compositor's report of the
+  generation (parse, schema, bindings, apply-time: a keymap that does not compile, a cursor
+  theme not found). Sent on bind and after every reload. lumen-shell shows one panel notice
+  per generation with problems ("Lumen configuration: 1 error, 0 warnings — config.toml:4:
+  input.keyboard.repeat-rate: …") and not again for an identical report; notifications
+  (design Part 5) replace the notice.
+- **`action(action, argument, serial, time)`** — a configured binding (or `lumen-ctl action`,
+  serial 0) named a shell action: `shell.launcher` (the Super tap by default),
+  `shell.terminal` (Super+Return), `shell.lock` (Super+L, bound only with
+  `idle.lock-command`). The serial is an input serial noted as the shell's key press, as a
+  grab's `activated` was. The compositor matches shell bindings only while a v7 shell is
+  bound; without one (a restart, an older shell) those keys go on to legacy grabs or the
+  client (except `switcher.next`: the compositor's quick switch). Held actions (the
+  switcher) come as `held_action` instead — see below.
+
+lumen-shell binds v7 and grabs no keys from a v7 compositor — except Super+L
+(`not_inhibitable`) when its lock command comes from the command line and the configuration
+has none. Against a v4–v6 compositor it grabs as before. Every interface of the family is at
+version 7.
+
+### Version 7: workspaces (ext-workspace-v1 and membership)
+
+Workspaces are the compositor's (ADR 010 Part 3) and are served as the public
+**ext-workspace-v1**: one group per output, its workspaces with name, position and state,
+`activate` and (dynamic mode) `assign`. lumen-shell binds `ext_workspace_manager_v1` in the
+same registry round trip as `zlm_shell_v1`, so before `get_policy_bridge`, and its panel
+indicator is a client of it like any bar. zlm adds only what ext-workspace does not carry:
+
+- **`toplevel_workspace(toplevel, workspace)`** — the window's workspace as the shell's own
+  `ext_workspace_handle_v1` (looked up per client), null for a sticky window and while the
+  shell holds no handle for it. Sent after every `snapshot_toplevel`, after
+  `toplevel_created` (once the map's ext-workspace changes are out), and whenever the window
+  moves (a binding, a hotplug merge, `assign`). The compositor always sends the
+  ext-workspace `done` that introduced a workspace before a `toplevel_workspace` naming it.
+  When the shell binds ext-workspace after its bridge, every window's workspace is sent again
+  after that manager's first `done`. A handle the shell gets `removed` for is forgotten by
+  its task model (no window names it).
+- **`toplevel_flags` `sticky` (0x4)** — the window is shown on every workspace of its output.
+- **`toplevel_state` `minimized`** — now sent (it wins over the xdg state while minimized).
+
+`request_minimize` minimizes; `request_activate` brings a window back (unminimized, its
+workspace switched to). A window is shown iff it is mapped, not minimized, and sticky or on
+its output's active workspace; the shell's task list per output shows its active workspace's
+windows and sticky ones, minimized ones dimmed. A restarted shell rebuilds all of it from
+ext-workspace's bind and the snapshot.
+
+`zlm_shell_v1.get_workspace_manager`, `zlm_workspace_manager_v1`, `zlm_workspace_v1` and
+`snapshot_workspace` are deprecated: never implemented, superseded by the above. The
+`workspace` argument of `snapshot_toplevel` / `toplevel_created` stays null. Because zlm now
+names `ext_workspace_handle_v1`, ext-workspace-v1 is a P0 protocol (the zlm glue links its
+interface tables).
+
+### Version 7: held actions (the window switcher)
+
+A binding of a **held** action (`switcher.next`, `switcher.previous`, `-app`; ADR 010 K2) is
+not sent as `action` but as **`zlm_shell_v1.held_action(id, action, argument, serial,
+time)`**, which creates a `zlm_held_action_v1` — a hold on the keyboard for as long as the
+binding's primary modifier (its highest: Super, Alt, Ctrl, Shift) is down:
+
+- **`key(keysym, modifiers, binding, serial, time)`** — every key press during the hold goes
+  here instead of the focused client: the first-level keysym (Tab, not ISO_Left_Tab), the
+  `zlm_key_grab_v1.modifier` bits, and the action the user's configured binding of that key
+  names ("switcher.previous" for Alt+Shift+Tab), so the shell follows the user's keys; repeated
+  at the keyboard's rate while held. Modifier presses and the releases of keys pressed earlier
+  still reach the client: it keeps the keyboard focus (no leave, no enter) and a correct
+  modifier state.
+- **`released(serial, time)`** — the modifier is up: the switcher commits its selection
+  (`request_activate`). **`cancelled`** — the session locked, a VT switch, an interactive
+  move, resize or drag began, or a button was pressed on a window: close without activating. After either the object is inert; the
+  shell destroys it.
+- **`destroy`** (the shell) — ends the hold at once (Escape, Return, a click on the
+  switcher): key presses go to the focused client again although the modifier is still down.
+
+Diversion runs after the compositor's own keys and the window manager's (a keyboard move's)
+and before the configured bindings, so a second held binding during a hold is a `key` of the
+first. With no v7 shell bound, `switcher.next` is the compositor's own quick switch (the
+topmost other window); `lumen-ctl action switcher.next` sends a plain `action`, which the
+shell runs as an immediate switch to the window it would select.
+
 ## Compositor-owned handles
 
 Shell never references client-side `xdg_toplevel` objects. All WM operations use
@@ -180,10 +274,10 @@ Shell never references client-side `xdg_toplevel` objects. All WM operations use
   data 0): later requests naming it are ignored. The shell releases it with
   `zlm_toplevel_v1.destroy`; the compositor never destroys the shell's reference.
 - A new policy bridge replaces the previous one; the previous bridge's handles go inert.
-- `workspace` is **null** in `toplevel_created` and `snapshot_toplevel` until workspace
-  objects exist: a compositor cannot introduce a `zlm_workspace_v1` in this protocol
-  version (no event carries one as `new_id`), and an unknown object id is fatal to the
-  client. No `snapshot_workspace` is sent for the same reason, and no `snapshot_output`
+- `workspace` is **null** in `toplevel_created` and `snapshot_toplevel`: `zlm_workspace_v1`
+  is deprecated (a compositor cannot introduce one — no event carries it as `new_id`); the
+  window's workspace is v7 `toplevel_workspace` (an ext-workspace handle). No
+  `snapshot_workspace` is sent, and no `snapshot_output`
   (its `wl_output` is not nullable and the shell may not have bound one): the shell learns
   the outputs from `wl_output` and `zxdg_output_v1` (one global per output, ADR 008) and
   places each window on the output its geometry overlaps most.
@@ -299,7 +393,7 @@ and the compositor warns `bridge replaced`).
 libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phase 3):
 
 - **Startup.** Bind `wl_compositor` (v4+), `wl_shm`, `zwlr_layer_shell_v1` (v4),
-  `zlm_shell_v1` (v6, or what the compositor advertises) and, if present, `wp_cursor_shape_manager_v1`; the bridge listens on
+  `zlm_shell_v1` (v7, or what the compositor advertises) and, if present, `wp_cursor_shape_manager_v1`; the bridge listens on
   `zlm_shell_v1` in the same dispatch as the bind, because `capabilities` follows at once
   and libwayland drops events for a proxy with no listener. A second roundtrip surfaces a
   refused bind as a protocol error: the shell logs why and exits 1. Then
@@ -313,11 +407,27 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
 - **Loop.** `wl_display_prepare_read` / `dispatch_pending` / `flush` (POLLOUT on EAGAIN),
   then `ppoll` on the display fd, a `signalfd` for SIGINT/SIGTERM, the catalog's inotify
   fd, one `timerfd` (earliest of: key repeat, panel-notice expiry, catalog debounce,
-  activation-token timeout — disarmed when none is due) and, after the first launch opened
+  activation-token timeout, the switcher's open delay — disarmed when none is due) and, after the first launch opened
   it, the user bus (`sd_bus_get_events` / `sd_bus_get_timeout`) plus any fallback-launch
   pipes. An idle shell sleeps. SIGINT/SIGTERM exit 0 after destroying every object; a refused bind, a lost
-  compositor exits 1, and `lumen-shell.service` (`Restart=on-failure`)
-  starts it again. A `closed` panel (its output went away) is destroyed; the shell runs on.
+  compositor exits 1, and `lumen-shell.service` (`Restart=on-failure`, 300 ms, at most 5
+  times in 30 s; run-desktop.sh the same in its direct mode) starts it again. The new bridge
+  gets the snapshot of every window; until the new panel maps (5 s at most) the compositor
+  keeps the dead shell's exclusive zones (the zone hold, ADR 010 S6), and the bind is logged
+  `bridge bound client=… snapshot=<n> focus=… pid=… binds=<n since start>`. A `closed` panel (its output went away) is destroyed; the shell runs on.
+- **Window switcher** (`lx.shell:switcher`, ADR 010 K1). A hold begins a session over the
+  task model's **most-recently-used order** (`task_model::mru`: a snapshot seeds it from the
+  stacking order, top first; each `focus_changed` moves that window to the front; under
+  `focus.mode = "sloppy"` a focus shorter than 750 ms that moved on does not count, unless the
+  switcher chose it) filtered by `[switcher] scope` and `include-minimized` (modal dialogs
+  never: the parent stands for them; Alt+grave keeps the focused window's application). The
+  selection starts on the second entry (the last for `previous`); `key` steps (the user's
+  bindings, Tab/Shift+Tab, arrows, Home/End), Return commits, Escape cancels, `released`
+  commits. The view — an overlay layer surface (`lumen-switcher`) centred on the focused
+  window's output, no keyboard interactivity, exclusive zone -1, ARGB with rounded corners,
+  fractional scale — is created only when the hold has lasted `open-delay` (150 ms: a quick
+  Alt+Tab draws nothing) and destroyed with it; it repaints only the cells whose selection
+  changed and the title. Hover selects once the pointer has moved; a click commits.
 - **Task model** (`lx.shell:task_model`, pure). A fixed table of 256 entries — app_id, title
   (cut at 255 bytes on a UTF-8 code point boundary), state, geometry, stacking — addressed
   by a `task_handle {index, gen}` whose generation never repeats, so a handle kept across a
@@ -383,6 +493,19 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   `request_activate` (activate raises too; raise is sent so the intent stays explicit if
   focus and stacking policy ever separate). The pointer shape is `default` through
   `wp_cursor_shape_v1` on enter.
+- **Notifications and the tray** (`lx.shell:user_bus`, `:notifications`, `:notify_view`,
+  `:menu_popup`, `:tray`; ADR 010 Part 5). Not part of the zlm protocol: the shell is an
+  ordinary D-Bus service (`org.freedesktop.Notifications`, `org.kde.StatusNotifierWatcher`)
+  and an ordinary layer-shell client for its popups (`lumen-notifications`, on the output of
+  the task model's focused window), with xdg_popups of the panel for menus and tooltips (it
+  binds `xdg_wm_base` for them). What it uses from the bridge: `lock_state` (nothing pops
+  up while locked; notifications wait for the unlock), `capture_state` (do-not-disturb while
+  the screen is captured), the configuration (`[notifications]`, applied live) and the
+  diagnostics (one notification per generation with problems). A restarted shell (S6)
+  continues the notification ids after the persisted block
+  (`$XDG_RUNTIME_DIR/lumen/shell-state`, also do-not-disturb) and gets the tray back as items
+  register again when the watcher's name changes owner; notifications that were on screen
+  when it died are lost.
 - **Logs** (`LUMEN_LOG` as for the compositor): `shell` (startup, exit), `shell.bridge`
   (`capabilities`, `snapshot toplevels=<n>` at info; `snapshot toplevel`, `add`, `remove`,
   `title`, `state`, `focus handle=<slot|none>`, `flags handle=<slot> flags=<bits>` at debug), `shell.panel` (`configure` at info;

@@ -46,7 +46,7 @@ inject as VERDICT: INVALID (exit 3) instead of a list of misleading failures. Ex
 drag-smoke-logs/.
 
 # Real applications, end to end, unattended (~6 min; hands off, as drag-smoke)
-./scripts/app-smoke.sh --join-seat-session [--only A,B,C,D,E,F,G,H,I,J,X] [--skip-gtk]
+./scripts/app-smoke.sh --join-seat-session [--only A,B,C,D,E,F,G,H,I,J,X,R] [--skip-gtk]
 
 Same machinery as drag-smoke (seat session, injector, foreign-input watch, SIGTERM-only
 cleanup of the PIDs it started, exit codes 0/1/2/3, logs in app-smoke-logs/), with real
@@ -365,6 +365,223 @@ with the issuer or the target focused, a focused client with no press, nothing f
 serial wraparound, the lifetime boundary, and the token table (exact-text lookup only,
 `forget_surface`, single use, eviction of the oldest and of an expired token) and the token
 text (32 lowercase hex characters, 10 000 unique).
+
+# The login session, end to end (~1 min; ADR 010, design-session-and-wm T.3)
+./scripts/session-smoke.sh                 # from the console or SSH; --watchdog adds the watchdog run
+
+Installs the build into a scratch prefix (`--prefix`, default `<build>/session-smoke-prefix`;
+every installed file must be under it) and runs `run-desktop.sh --systemd --prefix …`: the
+prefix's units copied into `$XDG_RUNTIME_DIR/systemd/user` for this run only (drop-ins send
+the logs to the log directory), `lumen-session` started with the active seat0 session's
+`XDG_SESSION_ID`, so the compositor runs in `user@.service` exactly as after a login. Checks:
+`lumen-compositor.service` active with `StatusText=Serving …` (READY), `graphical-session.target`
+active, the exported environment in the user manager, logind's session `Type=wayland`, the
+shell's unit and panel, an `app-*@autostart.service` started after READY, `lumen-ctl status`,
+`health --json` (the `systemd` part: ready, exported, watchdog on), `outputs`, `windows`; the
+shell killed with SIGKILL comes back (`NRestarts=1`) with the same snapshot, the zone hold
+keeps a maximized window's geometry and the panel maps again; `systemctl --user reload`;
+`lumen-ctl logout` ends the session with lumen-session exit 0, the session `Type` back to `tty`,
+the console shown, and run-desktop.sh's own checks: the manager's environment and its
+enabled/linked unit files exactly as before, no session unit left (units that failed during
+the session — an autostart entry needing X11 — are reset). `--watchdog`: a second session with
+`WatchdogSec=4` survives 6 s on pings, then the compositor stopped with SIGSTOP is aborted by
+systemd and the session ends cleanly (lumen-session: `Lumen exited: watchdog`). Ends with
+`VERDICT: PASS|FAIL`. `XDG_CONFIG_HOME` is a directory under the logs. The reload check also
+wants a second configuration generation logged before `systemctl --user reload` returns
+(READY comes once the reload is applied).
+
+# The configuration file (ADR 010 Part 2, design-session-and-wm T.1, T.3)
+./scripts/app-smoke.sh --join-seat-session --countdown 0 --only R   # ~40 s
+
+app-smoke's compositor runs with `LUMEN_CONFIG=<logs>/R-config/config.toml` (absent until
+group R writes it: every other group sees the defaults, never the user's file). Group R, with
+lumen-shell and `lumen-probe keyboard` (a client printing every keymap with its layouts,
+repeat_info, key with the keysym and text its own xkb produces, modifiers, relative motion and
+scroll event): R1 the file appears by rename — repeat 10/600 and a `us,de` keymap reach a new
+client, the mouse is configured flat 0.5 with natural scrolling (the compositor's
+`input device "…" (mouse): …` line), the cursor 48 px, and the configured `Super+Y =
+window.close` closes the probe; R2 `grp:alt_shift_toggle`: y, Alt+Shift, y types y then z;
+R3 a live edit reaches the client (repeat 30, ~150 ms: 100 ms debounce), one generation, no
+notice; R4 a wheel notch up (injected `REL_WHEEL`, `inject-input.py wheel`) scrolls positive
+(natural) and doubled (scroll-factor 2: +30, two notches), and relative motion is ×1.5 (flat
+0.5); R5 a syntax error is rejected — nothing
+resent, `lumen-ctl reload` exits 1 naming the line, one panel notice; R6 a bad value keeps
+that key's value (`keeping 30`), an unknown action suggests the right one, and removing the
+file brings every default back (repeat 25/600). R's intentional `config` warnings are the
+only ones the clean-log check allows.
+
+Unit tests: `test_config` (lx.config alone: inline tables; defaults; the documented
+`deploy/lumen/config.toml` parses to exactly the defaults and names every key; every value
+kind; bad values keep the previous value; unknown keys and sections with suggestions; a
+syntax error rejects with the layer and its line; layers merge key by key, devices by name,
+bindings per combination, `none` removes; `split_layers` round trip; the bindings grammar —
+modifiers, keysyms, buttons, taps, `Super++`, reserved combinations, unknown actions,
+arguments, `allow-when-locked`, duplicates, actions not available yet; the bounded
+diagnostics; `locate_config` with XDG and `LUMEN_CONFIG`; the inotify watch through a
+directory appearing, an editor's rename, an in-place write, a removal and a symlink's target;
+the 256 KiB bound; `check_keymap` with xkbcommon's reason), `test_input_config` (pointer
+settings → libinput calls through recording ops: a touchpad taps, a mouse never does,
+"default" restores the device's default, unsupported settings skipped and reported, a
+`[[input.device]]` override reaches only that device), `test_keybindings` (the binding table:
+exact modifiers, buttons, taps, locked and inhibited filters, shell actions only with a v7
+shell and the legacy grab otherwise, `binding_table` without `shell.lock` when no lock command
+is set), `test_input_keymap` (a new keymap adopts locks, the clamped layout and held keys;
+`cycle_layout`; xkbcommon's reason on a failed compile), `test_shell_bridge` (v7: `config` on
+bind with the file's bytes behind their marker, `config_diagnostic`/`config_done`,
+Super+Return as `action shell.terminal` with the shell's key-press serial, a Super tap as
+`shell.launcher`), `test_control` (Reload answered with its diagnostics). ctest runs every
+test with `LUMEN_CONFIG=0`.
+
+# Workspaces (ADR 010 Part 3, design-session-and-wm W, T.3 group Q)
+./scripts/app-smoke.sh --join-seat-session --countdown 0 --only Q   # ~60 s
+./scripts/monitor-smoke.sh --join-seat-session --countdown 0 --only add,workspaces
+
+Group Q runs lumen-shell and `lumen-probe window` clients (a plain window printing every
+configure's states, `suspended` included) and `lumen-probe workspaces` (an ext-workspace-v1
+client printing every event and, at each `done`, `ws output=OUT workspaces=1*,2,3`): Q1 three
+windows, Super+2 hides them (each told `suspended`, the keyboard nowhere, the probe sees 2
+active), Super+1 shows them and gives the keyboard back to the window focused there; Q2
+Super+Shift+2 moves the focused window and follows (the shell's indicator logs
+`workspaces [1+ 2*+ 3]`); Q3 an ext-workspace activate + commit from the probe; Q4 a
+fullscreen window and its black backdrop are gone from a screenshot on another workspace and
+back on its own; Q5 Super+H minimizes, a click on the panel entry restores (keyboard
+included), and `xdg_toplevel.set_minimized` minimizes; Q6 a window on a workspace that is not
+shown is still captured (`lumen-probe capture`, frames keep coming); Q7 while locked, Super+2
+and an ext-workspace activate change nothing (`ext-workspace: commit while locked; ignored`).
+monitor-smoke's `workspaces` group puts two workspaces on Virtual-2 (lumen-vmw-layout),
+unplugs it — the active workspace's window stays visible on Virtual-1, the other workspace is
+appended there — and plugs it back: both return, the active one active again, and the shell's
+indicator on Virtual-2 shows `1+ 2*+ 3` (checked with `lumen-ctl workspaces` and `windows`).
+
+Unit tests of workspaces: `test_workspaces` (the model alone: dynamic invariants, a workspace
+left empty goes, static counts and names and a smaller count merging into the last, index past
+the end, neighbours, focus memory and urgency, hotplug — the active one merged into the
+fallback's, the others appended with their homes, the return with the active one restored,
+static merging by position —, stranded workspaces adopted by the next output, `assign`, ids
+never reused), `test_ext_workspace` (in-process with two virtual outputs: the bind order and
+one `done`, `output_enter` for a wl_output bound later, a window joining the active workspace
+and the empty one after it, activate + commit hiding and `suspended`, focus memory, the
+removal order `workspace_leave` → `removed` → `done`, inert handles, minimize and sticky, one
+commit of assign + activate moving a workspace with its window to the other output as one
+`done`, `stop` → `finished`), `test_shell_bridge` (v7: `toplevel_workspace` after the snapshot,
+again after a late ext-workspace bind with the shell's own handle, the sticky flag, the
+minimized state), `test_task_model` (membership, the current-workspace filter, minimized
+dimmed, the indicator's cells, hit and diff), `test_control` (`ListWorkspaces`, a window's
+workspace, the `workspace` event), `test_window_protocols` (a sandboxed client does not see
+ext_workspace_manager_v1), `test_config` (the workspace and minimize default bindings).
+
+```bash
+# Switching and snapping (ADR 010 Part 4, design-session-and-wm K, T.3)
+./scripts/app-smoke.sh --join-seat-session --countdown 0 --only O                # ~45 s
+./scripts/app-smoke.sh --join-seat-session --countdown 0 --only O --scale 1.25   # fractional
+./scripts/monitor-smoke.sh --join-seat-session --countdown 0 --only add,snap
+```
+
+Group O runs lumen-shell and three `lumen-probe window --keyboard` clients (each prints its
+configures with the tiled states and what its wl_keyboard is told): O1 a quick Alt+Tab focuses
+the previous window and the switcher is never mapped (`switcher: activate (released, never
+shown)`); O2 Alt held, Tab, wait, Tab, release: the switcher's layer surface is mapped centred
+(a screenshot shows its background and selection colours inside its rect, at the run's scale)
+and the third MRU window gets the keyboard; O3 Alt+Tab then Escape: no focus change, the
+focused window saw Alt's press and release only — no leave, no Tab, no Escape; O4
+Alt+Shift+Tab: the least recent window; O5 Super+Left, Up, Down, Right, Up, Down: the
+window's configures are the left half, the top-left quarter, the left half (all four tiled
+states), its old size, maximized, its old size — and it is back at its old place; O6 a
+Super+drag to the left edge: `snap preview zone=left`, a screenshot while held has the
+preview's border and fill composited exactly over what was there before (premultiplied, ±4),
+the release snaps it to the left half; dragged out again it is restored to 400x300
+(`drag restore`); O7 Alt+F7, Right ×3, Down, Return moves it by (30, 10) and the window saw
+none of those keys; O8 Alt+F8, Right ×2, Down, Return: 20 wider, 10 taller, the origin kept;
+O9 the session locked during a hold: `held action cancelled (session locked)`, the switcher
+closes without activating; O11 a click on a window during a hold cancels it (`held action
+cancelled (click elsewhere)`) and that window keeps the keyboard; O10 with the shell stopped,
+Alt+Tab is the compositor's quick switch. `--scale S` (group O only) runs the compositor at that output scale; the script turns
+the logged logical positions into the injector's output pixels. monitor-smoke's `snap` group
+(two outputs): Super+Left from a left half crosses to the right half of the output to the
+left and Super+Right back; a Super+drag dropped at the edge the outputs share does not snap,
+one at Virtual-2's outer edge does; unplugged, the snapped window is the same half of
+Virtual-1, plugged back Virtual-2's again.
+
+Unit tests of switching and snapping: `test_switcher` (the task model's MRU order — seeded
+from stacking, focus to the front, a new window at the back, the 750 ms focus-follows-mouse
+debounce and an explicit focus that counts —, the switcher model's scopes, minimized windows,
+modal dialogs, Alt+grave's application filter, the start selection, wrap, the user's bindings
+before Tab/Shift+Tab/arrows/Home/End, Escape and Return, the open delay and a quick release,
+a window going during the hold; the view's layout: minimum width, centred cells, rows, pages,
+hit), `test_wm_geometry` (halves and quarters of odd sizes with and without a frame, a
+minimum or maximum anchored at the outer corner, the tiled states, the whole Windows 11
+transition table and its closure, edge zones with corners and with a neighbouring output,
+drag-to-restore's point), `test_keybindings` (a hold: presses diverted, a modifier's press
+and earlier keys' releases passed on, the primary modifier ending it, Super over Alt over
+Ctrl over Shift; `peek_binding` naming a diverted key's action without disarming a tap;
+`switcher.next` matching with no shell), `test_shell_bridge` (v7 in process: Alt+Tab is
+`held_action switcher.next`, Tab and Shift+Tab arrive as `key` with their bindings, Alt's
+release is `released`, the application saw only Alt's and Shift's events and no leave; the
+shell ending the hold gives the keys back at once), `test_config` (the Part 4 default
+bindings, a held action without a modifier refused).
+
+```bash
+# Notifications and the tray (ADR 010 Part 5, design-session-and-wm N, T.3)
+sudo pacman -S --needed libnotify                                              # notify-send
+./scripts/app-smoke.sh --join-seat-session --countdown 0 --only N                # ~60 s
+./scripts/monitor-smoke.sh --join-seat-session --countdown 0 --only add,notify
+```
+
+Group N runs lumen-shell (its state — the next notification id and do-not-disturb — in the
+run's directory through `LUMEN_SHELL_STATE`, never the user's), `dbus-monitor` on every
+`org.freedesktop.Notifications` signal, `notify-send` (libnotify, the only package the tests
+need), `gdbus` and `busctl` for protocol calls, and `lumen-probe sni`
+(`tests/clients/lumen-probe-sni.cpp`: a StatusNotifierItem with a pixmap icon and a
+com.canonical.dbusmenu menu on sd-bus, logging every call it gets): N1 `notify-send -t 1500`
+expires with `NotificationClosed(id, 1)`, a critical one stays and moves the popups to the
+overlay layer, `CloseNotification` closes it with 3 and an unknown id is an error; N2
+`notify-send -r` gets the same id back and the card is replaced in place; N3 a click on an
+action button (its rect from the shell's `notifications: card` debug line) gives
+`ActivationToken`, `ActionInvoked`, `NotificationClosed(2)` in that order and notify-send
+prints the action, a click on a card without a default action dismisses it; N4 a
+notification while locked (`lumen-probe lock`) is queued, shown after the unlock, then
+expires; N5 `lumen-probe capture` turns do-not-disturb on (normal → history, critical shown)
+and off, a middle click on the bell sets and clears it; N6 the probe's item in the panel (its
+orange disc counted in a screenshot of its cell), its tooltip, a left click
+(`ProvideXdgActivationToken`, then `Activate` with that token), `busctl get-property` on the
+watcher, a right click opening its menu as a grabbing popup, Down+Return clicking Open
+(`Event(1, "clicked")`, then `"closed"`), the wheel (`Scroll(120, vertical)`); N7 the shell
+killed and started again: the item registers with the new watcher within a second, ids
+continue after the persisted block; N8 ten idle seconds with a history and a tray item: no
+context switch of the shell. monitor-smoke's `notify` group (two outputs): with a window on
+Virtual-2 focused the popups map on Virtual-2; Virtual-2 unplugged, they map on Virtual-1.
+app-smoke's and monitor-smoke's lumen-shell keep their state in the run's directory
+(`LUMEN_SHELL_STATE`).
+
+Unit tests of notifications and the tray: `test_notifications` (ids and persisted blocks,
+`replaces_id` in place and unknown, timeouts by urgency, hover and lock pauses, the lock
+queue, close reasons and CloseNotification's refusal, do-not-disturb and critical, capture,
+invoking actions and resident, senders leaving, the history bound and transient, the popup
+stack and its timers, the rate limit; the markup subset with entities, links and their
+schemes, unknown and unbalanced tags; image data: RGB, RGBA, padding, short data, formats,
+sizes; wrapped bodies: width, truncation with "…", hard breaks, long words, CJK, spans and
+hit testing; the popup layout; the D-Bus server over a socketpair: capabilities, server
+information, Notify with hints and image data, ActivationToken → ActionInvoked →
+NotificationClosed(2), CloseNotification and its error, replaces_id), `test_tray` (service
+strings by name, path and `bus/path`; the registry; IconPixmap conversion and choice; menu
+labels, mnemonics and layout; a GetLayout reply with a toggle, a separator, an invisible
+item and a submenu; the watcher over a socketpair: RegisterStatusNotifierItem and its
+signal, a duplicate, a path without a sender refused, the properties, and the host reading
+the item's properties with GetAll from the other end), `test_config` (the notification
+actions bind).
+
+Unit tests of the session: `test_session_discovery` (the logind session order —
+XDG_SESSION_ID, the process's session, then the display and active seat sessions only for a
+process in no session; UID, seat and class checks; a seatless SSH session never takes the
+console's), `test_health` (levels per part, process, memory and output, the worst-of rule, the
+miss ring), `test_control` (io.lumen.Compositor over socketpairs: every method's reply,
+GetHealth answered asynchronously and timing out to the host, the errors, IDL validation
+before a handler, Subscribe and its overflow drop, a peer of another UID refused, the socket
+file mode 0600, replaced when stale and removed at close) and `test_lumen_session`
+(`tests/test_lumen_session.sh`: lumen-session against a fake systemctl — the imported set
+and the denylist, exact restore after a clean and a crashed compositor, a value systemctl
+escaped left alone, a second session and an inactive VT refused, `--cleanup`, the fallback
+without a user manager and its autostart, the login-shell re-exec).
 
 # Sanitizers
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan

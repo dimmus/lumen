@@ -1,0 +1,33 @@
+sequenceDiagram
+    participant App as application (libnotify)
+    participant Bus as user bus (dbus-broker)
+    participant S as lumen-shell (user_bus, notifications, tray)
+    participant C as lumen-compositor
+    participant Item as tray item (StatusNotifierItem)
+    Note over S,C: design-session-and-wm N.1–N.6, ADR 010 Part 5
+    S->>Bus: (after the first panel frame) RequestName org.freedesktop.Notifications, org.kde.StatusNotifierWatcher (queued, no replace)
+    App->>Bus: Notify(app, replaces_id, icon, summary, body, actions, hints, timeout)
+    Bus->>S: Notify — answered inline with the id
+    alt locked
+        S->>S: queued, timer stopped (shown after the unlock)
+    else do not disturb and not critical
+        S->>S: history only (open, unread on the bell)
+    else
+        S->>C: one layer surface "lumen-notifications" (top; overlay while a critical one shows) — set_size, commit
+        C->>S: configure → one buffer, one commit; the timer runs while shown
+    end
+    alt the timeout passes
+        S->>Bus: NotificationClosed(id, 1) — kept in the history
+    else a click on an action button
+        S->>C: xdg_activation_v1.get_activation_token(serial of the click)
+        C->>S: done(token)
+        S->>Bus: ActivationToken(id, token), ActionInvoked(id, key), NotificationClosed(id, 2)
+        Bus->>App: the signals, in that order
+    end
+    Item->>Bus: RegisterStatusNotifierItem(name | object path)
+    Bus->>S: — StatusNotifierItemRegistered("bus/path"); GetAll(org.kde.StatusNotifierItem)
+    S->>C: the panel redraws its tray cell (icon by name, else the nearest pixmap)
+    Note over S,Item: a left click: ProvideXdgActivationToken(token) then Activate(x, y)
+    Note over S,Item: a right click: AboutToShow(0), GetLayout(0, -1) → an xdg_popup of the panel (grab on the click's serial, the panel on_demand while open); Event(id, "clicked"), Event(0, "closed")
+    Item->>Bus: NewIcon / NewStatus …
+    Bus->>S: marked; one GetAll in the same loop iteration

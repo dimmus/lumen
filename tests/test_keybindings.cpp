@@ -7,6 +7,7 @@
 import std;
 import lx.compositor;
 import lx.input;
+import lx.config;
 
 using namespace lx::compositor;
 
@@ -304,6 +305,232 @@ LUMEN_TEST(xkb_vt_keysyms_from_the_default_keymap) {
     LUMEN_CHECK(km.reset_depressed());
     LUMEN_CHECK(km.modifiers().depressed == 0);
     LUMEN_CHECK(km.keysym(k_key_f2) == keysyms::f1 + 1);
+}
+
+// ── The configured binding table (config.toml [bindings], design-session-and-wm C.3) ──
+
+namespace {
+
+binding_entry entry(const char* keys, lx::config::action_id action, unsigned char options = 0) {
+    binding_entry e{};
+    const char* error = nullptr;
+    (void)lx::config::parse_combo(keys, e.keys, error);
+    e.action = action;
+    e.options = options;
+    return e;
+}
+
+using lx::config::action_id;
+
+} // namespace
+
+LUMEN_TEST(bindings_match_exact_modifiers_and_first_level) {
+    keybindings k;
+    const binding_entry table[] = {entry("Alt+F4", action_id::window_close),
+                                   entry("Super+Shift+Left", action_id::window_move_to_output_left)};
+    k.set_bindings(table);
+    LUMEN_CHECK(k.binding_count() == 2);
+    const key_decision d = k.match_binding(press(62, 0xffc1 /* F4 */, key_mod_alt));
+    LUMEN_CHECK(d.consume && d.action == key_action::binding && d.binding &&
+                d.binding->action == action_id::window_close);
+    LUMEN_CHECK(!k.match_binding(press(62, 0xffc1, key_mod_alt | key_mod_shift)).consume);
+    LUMEN_CHECK(!k.match_binding(press(62, 0xffc1, 0)).consume);
+    LUMEN_CHECK(!k.match_binding(release(62, 0xffc1, key_mod_alt)).consume);
+    const key_decision m =
+        k.match_binding(press(105, 0xff51 /* Left */, key_mod_super | key_mod_shift));
+    LUMEN_CHECK(m.consume && m.binding->action == action_id::window_move_to_output_left);
+}
+
+LUMEN_TEST(bindings_before_grabs_and_shell_actions_need_a_v7_shell) {
+    keybindings k;
+    const binding_entry table[] = {entry("Super+Return", action_id::shell_terminal)};
+    k.set_bindings(table);
+    LUMEN_CHECK(k.add_grab(keysyms::return_key, key_mod_super, 0, A) == key_grab_refusal::none);
+    const key_input in = press(k_key_enter, keysyms::return_key, key_mod_super);
+    // No shell takes actions: the binding steps aside, the legacy grab gets the key.
+    LUMEN_CHECK(!k.match_binding(in).consume);
+    LUMEN_CHECK(k.match_grab(in).grab == A);
+    k.set_shell_actions(true);
+    const key_decision d = k.match_binding(in);
+    LUMEN_CHECK(d.consume && d.binding->action == action_id::shell_terminal);
+}
+
+LUMEN_TEST(binding_taps_and_their_owner) {
+    keybindings k;
+    k.set_shell_actions(true);
+    const binding_entry table[] = {entry("Super", action_id::shell_launcher)};
+    k.set_bindings(table);
+    (void)k.observe_tap(press(k_key_leftmeta, keysyms::super_l));
+    void* fired = k.observe_tap(release(k_key_leftmeta, keysyms::super_l));
+    const binding_entry* b = k.tap_binding(fired);
+    LUMEN_CHECK(fired && b && b->action == action_id::shell_launcher);
+    // Another key meanwhile: no tap.
+    (void)k.observe_tap(press(k_key_leftmeta, keysyms::super_l));
+    (void)k.observe_tap(press(k_key_a, 'a', key_mod_super));
+    LUMEN_CHECK(!k.observe_tap(release(k_key_leftmeta, keysyms::super_l)));
+    // A grab's tap is not a binding's.
+    keybindings g;
+    LUMEN_CHECK(g.add_grab(keysyms::super_l, 0, key_grab_tap, A) == key_grab_refusal::none);
+    (void)g.observe_tap(press(k_key_leftmeta, keysyms::super_l));
+    void* gf = g.observe_tap(release(k_key_leftmeta, keysyms::super_l));
+    LUMEN_CHECK(gf == A && !g.tap_binding(gf));
+}
+
+LUMEN_TEST(bindings_while_locked_and_inhibited) {
+    keybindings k;
+    k.set_shell_actions(true);
+    const binding_entry table[] = {
+        entry("Super+L", action_id::shell_lock, lx::config::bo_allow_when_inhibited),
+        entry("Alt+F4", action_id::window_close),
+        entry("Ctrl+Alt+Delete", action_id::session_logout, lx::config::bo_allow_when_locked),
+    };
+    k.set_bindings(table);
+    const key_input lock = press(38, 'l', key_mod_super);
+    const key_input close = press(62, 0xffc1, key_mod_alt);
+    const key_input logout = press(111, 0xffff, key_mod_ctrl | key_mod_alt);
+    // Inhibited: only allow-when-inhibited.
+    LUMEN_CHECK(k.match_binding(lock, true).consume);
+    LUMEN_CHECK(!k.match_binding(close, true).consume);
+    // Locked: only allow-when-locked.
+    k.set_locked(true);
+    LUMEN_CHECK(!k.match_binding(lock).consume);
+    LUMEN_CHECK(!k.match_binding(close).consume);
+    LUMEN_CHECK(k.match_binding(logout).consume);
+    k.set_locked(false);
+    LUMEN_CHECK(k.match_binding(close).consume);
+}
+
+// A `repeat = true` binding matched before a lock asks again before each repeat: its timer
+// used to run the action behind the lock screen until the key was let go.
+LUMEN_TEST(a_held_binding_is_asked_again_after_a_lock) {
+    keybindings k;
+    const binding_entry table[] = {
+        entry("Super+Right", action_id::workspace_next, lx::config::bo_repeat),
+        entry("Ctrl+Alt+Delete", action_id::session_logout, lx::config::bo_allow_when_locked),
+    };
+    k.set_bindings(table);
+    const key_decision d = k.match_binding(press(106, 0xff53 /* Right */, key_mod_super));
+    LUMEN_CHECK(d.consume && d.binding && k.allows(*d.binding));
+    k.set_locked(true);
+    LUMEN_CHECK(!k.allows(*d.binding));
+    LUMEN_CHECK(!k.allows(*d.binding, true));
+    const key_decision l = k.match_binding(press(111, 0xffff, key_mod_ctrl | key_mod_alt));
+    LUMEN_CHECK(l.consume && k.allows(*l.binding));
+    k.set_locked(false);
+    LUMEN_CHECK(k.allows(*d.binding) && !k.allows(*d.binding, true));
+}
+
+LUMEN_TEST(button_bindings) {
+    keybindings k;
+    const binding_entry table[] = {entry("Super+BTN_LEFT", action_id::window_move_interactive),
+                                   entry("Super+BTN_RIGHT", action_id::window_resize_interactive)};
+    k.set_bindings(table);
+    const binding_entry* b = k.match_button(0x110, key_mod_super);
+    LUMEN_CHECK(b && b->action == action_id::window_move_interactive);
+    LUMEN_CHECK(!k.match_button(0x110, 0));
+    LUMEN_CHECK(!k.match_button(0x110, key_mod_super | key_mod_shift));
+    LUMEN_CHECK(k.match_button(0x111, key_mod_super)->action == action_id::window_resize_interactive);
+    k.set_locked(true);
+    LUMEN_CHECK(!k.match_button(0x110, key_mod_super));
+}
+
+LUMEN_TEST(binding_table_from_the_configuration) {
+    // The default table: shell.lock only with a lock command (else Super+L reaches clients).
+    lx::config::config_snapshot c = lx::config::default_config();
+    std::inplace_vector<binding_entry, keybindings::k_max_bindings> t;
+    binding_table(c, t);
+    const auto has = [&](action_id a) {
+        return std::ranges::any_of(t, [&](const binding_entry& e) { return e.action == a; });
+    };
+    LUMEN_CHECK(!has(action_id::shell_lock) && has(action_id::shell_terminal) &&
+                has(action_id::window_move_interactive));
+    std::snprintf(c.idle.lock_command, sizeof(c.idle.lock_command), "swaylock -f");
+    binding_table(c, t);
+    LUMEN_CHECK(has(action_id::shell_lock));
+    // Layout 0 stands in under a non-Latin layout, as for grabs.
+    keybindings k;
+    k.set_bindings(t);
+    k.set_shell_actions(true);
+    key_input cyr = press(k_key_enter, 0, key_mod_super);
+    cyr.raw = 0x6c1; // not Return in the active layout
+    cyr.raw0 = keysyms::return_key;
+    k.set_layout_query([](unsigned, void*) { return false; }, nullptr);
+    LUMEN_CHECK(k.match_binding(cyr).consume);
+}
+
+// ── Held actions (zlm v7, design-session-and-wm K.1) ──
+
+namespace {
+constexpr unsigned k_key_tab = 15;
+constexpr unsigned k_key_leftalt = 56;
+constexpr unsigned k_key_leftshift = 42;
+constexpr unsigned k_key_esc = 1;
+constexpr unsigned k_sym_tab = 0xff09;
+} // namespace
+
+LUMEN_TEST(hold_diverts_presses_until_the_primary_modifier_goes_up) {
+    keybindings k;
+    k.set_shell_actions(true);
+    int owner = 0;
+    LUMEN_CHECK(!k.hold_active() && k.on_hold_key(press(k_key_tab, k_sym_tab, key_mod_alt)) ==
+                                        keybindings::hold_step::none);
+    // Alt+Shift+Tab: Alt is the modifier that ends it (GNOME's primaryModifier).
+    k.begin_hold(key_mod_alt | key_mod_shift, &owner);
+    LUMEN_CHECK(k.hold_active() && k.hold_owner() == &owner && k.hold_mods() == key_mod_alt);
+    // Another Tab, Escape, a letter: the hold's. A modifier's own press goes on (the client
+    // keeps its modifier state).
+    LUMEN_CHECK(k.on_hold_key(press(k_key_tab, k_sym_tab, key_mod_alt | key_mod_shift)) ==
+                keybindings::hold_step::divert);
+    LUMEN_CHECK(k.on_hold_key(press(k_key_esc, keysyms::escape, key_mod_alt)) ==
+                keybindings::hold_step::divert);
+    LUMEN_CHECK(k.on_hold_key(press(k_key_leftshift, keysyms::shift_l, key_mod_alt | key_mod_shift)) ==
+                keybindings::hold_step::none);
+    // Shift up, Alt still down: nothing ends; Tab's release goes on (the router drops it).
+    LUMEN_CHECK(k.on_hold_key(release(k_key_leftshift, keysyms::shift_l, key_mod_alt)) ==
+                keybindings::hold_step::none);
+    LUMEN_CHECK(k.on_hold_key(release(k_key_tab, k_sym_tab, key_mod_alt)) ==
+                keybindings::hold_step::none);
+    // Alt up: released (the event still goes on: the client saw Alt's press).
+    LUMEN_CHECK(k.on_hold_key(release(k_key_leftalt, keysyms::alt_l, 0)) ==
+                keybindings::hold_step::released);
+    LUMEN_CHECK(k.end_hold() == &owner && !k.hold_active() && k.end_hold() == nullptr);
+    // Super+Tab with Shift: Super is primary over Alt, Ctrl and Shift.
+    k.begin_hold(key_mod_super | key_mod_alt | key_mod_shift, &owner);
+    LUMEN_CHECK(k.hold_mods() == key_mod_super);
+    (void)k.end_hold();
+    // No modifier: no hold (a held binding always has one).
+    k.begin_hold(0, &owner);
+    LUMEN_CHECK(!k.hold_active());
+}
+
+LUMEN_TEST(hold_names_the_binding_of_a_diverted_key) {
+    keybindings k;
+    k.set_shell_actions(true);
+    const binding_entry table[] = {entry("Alt+Tab", action_id::switcher_next),
+                                   entry("Alt+Shift+Tab", action_id::switcher_previous),
+                                   entry("Super", action_id::shell_launcher)};
+    k.set_bindings(table);
+    // A peek neither consumes nor disarms an armed tap.
+    LUMEN_CHECK(k.observe_tap(press(k_key_leftmeta, keysyms::super_l)) == nullptr && k.tap_armed());
+    const binding_entry* prev = k.peek_binding(press(k_key_tab, k_sym_tab, key_mod_alt | key_mod_shift));
+    LUMEN_CHECK(prev && prev->action == action_id::switcher_previous && k.tap_armed());
+    const binding_entry* next = k.peek_binding(press(k_key_tab, k_sym_tab, key_mod_alt));
+    LUMEN_CHECK(next && next->action == action_id::switcher_next);
+    LUMEN_CHECK(!k.peek_binding(press(k_key_tab, k_sym_tab, key_mod_ctrl)));
+    LUMEN_CHECK(!k.peek_binding(release(k_key_tab, k_sym_tab, key_mod_alt)));
+}
+
+LUMEN_TEST(switcher_next_without_a_shell_is_the_compositors_quick_switch) {
+    keybindings k;
+    const binding_entry table[] = {entry("Alt+Tab", action_id::switcher_next),
+                                   entry("Alt+Shift+Tab", action_id::switcher_previous),
+                                   entry("Super+Return", action_id::shell_terminal)};
+    k.set_bindings(table);
+    // No v7 shell: switcher.next still matches (the compositor runs it), the other shell
+    // actions step aside for the client.
+    LUMEN_CHECK(k.match_binding(press(k_key_tab, k_sym_tab, key_mod_alt)).consume);
+    LUMEN_CHECK(!k.match_binding(press(k_key_tab, k_sym_tab, key_mod_alt | key_mod_shift)).consume);
+    LUMEN_CHECK(!k.match_binding(press(k_key_enter, keysyms::return_key, key_mod_super)).consume);
 }
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

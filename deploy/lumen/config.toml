@@ -1,0 +1,168 @@
+# Lumen configuration — every value below is the default.
+#
+# Copy this file to ~/.config/lumen/config.toml (or run
+# `lumen-ctl config defaults > ~/.config/lumen/config.toml`) and keep only what you
+# change: a key that is not in the file has its default. Files in $XDG_CONFIG_DIRS
+# (/etc/xdg/lumen/config.toml) are read first and the user's file over them, key by key.
+#
+# The compositor watches the file: a change applies as soon as it is saved (or with
+# `lumen-ctl reload`, `systemctl --user reload lumen-compositor`). A syntax error keeps the
+# configuration in use; a bad value keeps that key's previous value. Problems are logged,
+# shown by `lumen-ctl reload` and `lumen-ctl config check`, and reported on the panel.
+# Outputs (monitors) are configured separately, in outputs.toml.
+
+version = 1
+
+[input.keyboard]
+layout = ""             # xkb layouts, comma separated ("us,ru"); "" = the system default
+variant = ""            # per layout, comma separated ("dvorak," keeps the second plain)
+options = ""            # xkb options, e.g. "grp:alt_shift_toggle,caps:escape"
+model = ""
+rules = ""
+repeat-rate = 25        # keys per second; 0 turns key repeat off
+repeat-delay = 600      # ms before a held key starts repeating
+numlock = false         # Num Lock on when the session starts (read at start-up only)
+
+[input.touchpad]        # devices that can tap (touchpads)
+tap = true              # tap to click
+tap-button-map = "lrm"  # one, two, three fingers: lrm = left, right, middle; lmr
+drag = true             # tap and drag
+drag-lock = false
+three-finger-drag = false
+natural-scroll = true   # content follows the fingers
+scroll-method = "default"   # default | two-finger | edge | on-button-down | none
+click-method = "default"    # default | button-areas | clickfinger
+accel-profile = "default"   # default | adaptive | flat
+accel-speed = 0.0           # -1.0 (slowest) .. 1.0 (fastest)
+left-handed = false
+disable-while-typing = true
+middle-emulation = false    # left and right together are a middle click
+scroll-factor = 1.0         # multiplies scrolling (0.05 .. 20)
+
+[input.mouse]           # pointer devices that cannot tap (mice, trackballs)
+natural-scroll = false
+accel-profile = "default"
+accel-speed = 0.0
+left-handed = false
+middle-emulation = false
+scroll-factor = 1.0
+
+[input.trackpoint]
+accel-profile = "default"
+accel-speed = 0.0
+scroll-factor = 1.0
+
+# Per device, by the name libinput gives it (`libinput list-devices`); any key of the
+# sections above:
+# [[input.device]]
+# name = "Logitech USB Receiver"
+# accel-speed = -0.3
+
+[cursor]
+theme = ""              # "" = $XCURSOR_THEME, else "default"
+size = 0                # logical pixels; 0 = $XCURSOR_SIZE, else 24
+
+[focus]
+mode = "click"          # click | sloppy (focus follows the mouse; kept over the desktop)
+raise-on-click = true
+raise-on-sloppy = false # with mode = "sloppy": also raise the window the pointer enters
+
+[windows]               # snapping: Super+arrows, and dragging a window to an edge of the screen
+edge-snap = true        # a drag to a left/right edge snaps to that half, a corner to a quarter,
+                        # the top edge maximizes
+edge-snap-distance = 8  # logical pixels from an outer edge of the layout
+edge-snap-corner = 64   # logical pixels along an edge that make a corner (quarters)
+snap-preview = true     # show where the window will go while dragging
+drag-restore = true     # dragging a maximized or snapped window restores its size
+
+[workspaces]            # per output; Super+1…9 switch, Super+Shift+1…9 move the window there
+mode = "dynamic"        # dynamic (one empty workspace always last, empty ones go) | static
+count = 4               # static only: workspaces per output, 1..16
+names = []              # static only, e.g. ["web", "mail", "code"] (else 1, 2, …)
+switch-on-activate = true # a window on another workspace that is granted focus switches there
+move-follows = true     # moving the focused window to a workspace switches with it
+
+[switcher]              # Alt+Tab / Alt+Shift+Tab, held: most recently used windows first
+scope = "workspace"     # workspace (the active ones of every output) | all
+include-minimized = true
+open-delay = 150        # ms before it is drawn (a quick Alt+Tab switches without it)
+
+[idle]                  # lumen-shell; its command-line options override these
+policy = "shell"        # shell | none (leave it to swayidle or another daemon)
+blank-after = 600       # seconds without input before the outputs go off; 0 never
+blank-locked-after = 60 # the same while the session is locked
+lock-command = ""       # the screen locker, e.g. "swaylock -f"; "" = no locking
+lock-on-blank = true    # lock before blanking (with a lock-command)
+
+[background]            # lumen-shell
+spec = "lumen"          # lumen | #RRGGBB | gradient:#RRGGBB:#RRGGBB[:DEG] |
+                        # image:PATH[:fill|fit|center|stretch|tile] | none
+
+[notifications]         # lumen-shell's org.freedesktop.Notifications server
+position = "top-right"  # top-right | top-center | top-left | bottom-right | bottom-left
+timeout = 5             # seconds, when the application leaves it to the server
+timeout-low = 3         # low urgency
+critical-timeout = 0    # critical urgency; 0 = until dismissed
+max-visible = 3         # popups shown at once ("+n more" beyond)
+dnd-while-sharing = true # do not disturb while the screen is captured (critical ones still pop up)
+history = 50            # entries kept in the panel's notification list (0: none)
+# Do not disturb: a middle click on the panel's bell, its list's first entry, or a binding to
+# "notifications.toggle-dnd" (also "notifications.dismiss", "notifications.dismiss-all").
+
+[general]
+default-bindings = true # false: start from no bindings (Lumen's own keys remain:
+                        # Ctrl+Alt+F1…F12, Ctrl+Alt+BackSpace, Super+Escape)
+
+[bindings]
+# "combination" = "action [argument]", or { action = "…", argument = …,
+#   allow-when-inhibited = true, allow-when-locked = true, repeat = true }.
+# Modifiers: Super, Ctrl, Alt, Shift. Keys: xkb keysym names (Return, F4, a, Page_Down);
+# buttons: BTN_LEFT, BTN_RIGHT, BTN_MIDDLE, BTN_SIDE, BTN_EXTRA; a modifier alone is a tap.
+# "none" removes a default. `lumen-ctl action --list` lists the actions.
+"Super" = "shell.launcher"
+"Super+Return" = "shell.terminal"
+"Super+L" = { action = "shell.lock", allow-when-inhibited = true }
+"Alt+F4" = "window.close"
+"Super+H" = "window.minimize"
+"Super+Shift+Left" = "window.move-to-output-left"
+"Super+Shift+Right" = "window.move-to-output-right"
+"Super+BTN_LEFT" = "window.move-interactive"
+"Super+BTN_RIGHT" = "window.resize-interactive"
+"Super+1" = "workspace.switch 1"
+"Super+2" = "workspace.switch 2"
+"Super+3" = "workspace.switch 3"
+"Super+4" = "workspace.switch 4"
+"Super+5" = "workspace.switch 5"
+"Super+6" = "workspace.switch 6"
+"Super+7" = "workspace.switch 7"
+"Super+8" = "workspace.switch 8"
+"Super+9" = "workspace.switch 9"
+"Super+Shift+1" = "workspace.move-window 1"
+"Super+Shift+2" = "workspace.move-window 2"
+"Super+Shift+3" = "workspace.move-window 3"
+"Super+Shift+4" = "workspace.move-window 4"
+"Super+Shift+5" = "workspace.move-window 5"
+"Super+Shift+6" = "workspace.move-window 6"
+"Super+Shift+7" = "workspace.move-window 7"
+"Super+Shift+8" = "workspace.move-window 8"
+"Super+Shift+9" = "workspace.move-window 9"
+"Super+Page_Down" = "workspace.next"
+"Super+Ctrl+Right" = "workspace.next"
+"Super+Page_Up" = "workspace.previous"
+"Super+Ctrl+Left" = "workspace.previous"
+"Super+Shift+Page_Down" = "workspace.move-window-next"
+"Super+Ctrl+Shift+Right" = "workspace.move-window-next"
+"Super+Shift+Page_Up" = "workspace.move-window-previous"
+"Super+Ctrl+Shift+Left" = "workspace.move-window-previous"
+"Alt+Tab" = "switcher.next"
+"Super+Tab" = "switcher.next"
+"Alt+Shift+Tab" = "switcher.previous"
+"Super+Shift+Tab" = "switcher.previous"
+"Alt+grave" = "switcher.next-app"
+"Alt+Shift+grave" = "switcher.previous-app"
+"Super+Left" = "window.snap-left"
+"Super+Right" = "window.snap-right"
+"Super+Up" = "window.snap-up"
+"Super+Down" = "window.snap-down"
+"Alt+F7" = "window.move-keyboard"
+"Alt+F8" = "window.resize-keyboard"

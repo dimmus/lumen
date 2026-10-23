@@ -24,6 +24,8 @@ export namespace lx::compositor {
 enum toplevel_flag_bits : unsigned {
     toplevel_flag_not_responding = 0x1,
     toplevel_flag_demands_attention = 0x2,
+    /// zlm v7: shown on every workspace of its output.
+    toplevel_flag_sticky = 0x4,
 };
 /// The flags the shell is told for `rec`.
 [[nodiscard]] unsigned toplevel_flags_of(const toplevel_record& rec);
@@ -35,6 +37,8 @@ struct toplevel_observer {
     void (*mapped)(void* user, toplevel_record& rec) = nullptr;
     void (*unmapped)(void* user, toplevel_record& rec) = nullptr;
     void (*changed)(void* user, const toplevel_record& rec) = nullptr;
+    /// The keyboard focus moved to `rec` (null: no window). Optional.
+    void (*focused)(void* user, const toplevel_record* rec) = nullptr;
     void* user = nullptr;
 };
 
@@ -80,9 +84,33 @@ public:
     void emit_toplevel_icon(const toplevel_record& rec);
     void emit_toplevel_parent(const toplevel_record& rec);
     void emit_bell(const toplevel_record* rec);
+    /// zlm v7 toplevel_workspace: the shell's own ext_workspace_handle_v1 for `rec`'s
+    /// workspace (null: sticky, or the shell has no handle for it). Bridges below version 7
+    /// never see it.
+    void emit_toplevel_workspace(const toplevel_record& rec);
+    /// toplevel_workspace for every window again (the shell bound ext-workspace after the
+    /// bridge: its handles exist now).
+    void resend_toplevel_workspaces();
+    /// The ext_workspace_handle_v1 of workspace `ws` that `client` (`wl_client*`) holds, or
+    /// null (installed by the ext-workspace wire).
+    using workspace_lookup_fn = void* (*)(void* client, lx::workspace_id ws);
+    void set_workspace_lookup(workspace_lookup_fn fn) { workspace_lookup_ = fn; }
     /// The icon store the toplevel records' `icon` ids name (null: icons are never sent).
     void set_icons(const toplevel_icon_table* icons) { icons_ = icons; }
     void set_observer(toplevel_observer observer) { observer_ = observer; }
+    /// A second observer: the control socket's event stream (lumen-ctl monitor).
+    void set_control_observer(toplevel_observer observer) { control_observer_ = observer; }
+
+    /// Called at the end of every `on_bridge_bound`, with the shell's `wl_client*`.
+    void set_bound_handler(void (*bound)(void* user, void* client_native), void* user) {
+        bound_ = bound;
+        bound_user_ = user;
+    }
+
+    /// Bridges bound since start: 1 for the first shell, +1 for each restart (health).
+    [[nodiscard]] unsigned binds() const { return binds_; }
+    /// The process of the current bridge's client (0: none or unknown).
+    [[nodiscard]] int bridge_pid() const { return bridge_ ? bridge_pid_ : 0; }
 
     /// Decodes a `zlm_toplevel_v1` handle from a request. Null id for an inert handle.
     [[nodiscard]] static lx::toplevel_id toplevel_from_handle(void* zlm_toplevel_resource);
@@ -101,8 +129,14 @@ private:
     toplevel_manager* toplevels_ = nullptr;
     const toplevel_icon_table* icons_ = nullptr;
     toplevel_observer observer_{};
+    toplevel_observer control_observer_{};
     const char* shell_binary_path_ = "lumen-shell";
     void* bridge_ = nullptr;
+    unsigned binds_ = 0;
+    int bridge_pid_ = 0;
+    void (*bound_)(void*, void*) = nullptr;
+    void* bound_user_ = nullptr;
+    workspace_lookup_fn workspace_lookup_ = nullptr;
 };
 
 } // namespace lx::compositor
@@ -136,6 +170,16 @@ std::uint32_t wire_state(lx::toplevel_state state) {
     default: return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_NORMAL;
     }
 }
+/// The bridge speaks zlm v7 (toplevel_workspace, the sticky flag).
+bool bridge_v7(wl_resource* bridge) {
+#if defined(ZLM_POLICY_BRIDGE_V1_TOPLEVEL_WORKSPACE_SINCE_VERSION)
+    return bridge &&
+           wl_resource_get_version(bridge) >= ZLM_POLICY_BRIDGE_V1_TOPLEVEL_WORKSPACE_SINCE_VERSION;
+#else
+    (void)bridge;
+    return false;
+#endif
+}
 /// The bridge speaks zlm v6 (icons, parents, bell).
 bool bridge_v6(wl_resource* bridge) {
 #if defined(ZLM_POLICY_BRIDGE_V1_BELL_SINCE_VERSION)
@@ -148,6 +192,9 @@ bool bridge_v6(wl_resource* bridge) {
 /// toplevel_flags to a bridge that knows it (v2), when `flags` is worth sending.
 void send_flags(wl_resource* bridge, wl_resource* handle, unsigned flags) {
 #if defined(ZLM_POLICY_BRIDGE_V1_TOPLEVEL_FLAGS_SINCE_VERSION)
+    // `sticky` is a version 7 bit: an older shell would not know it.
+    if (!bridge_v7(bridge))
+        flags &= ~static_cast<unsigned>(lx::compositor::toplevel_flag_sticky);
     if (bridge && handle &&
         wl_resource_get_version(bridge) >= ZLM_POLICY_BRIDGE_V1_TOPLEVEL_FLAGS_SINCE_VERSION)
         zlm_policy_bridge_v1_send_toplevel_flags(bridge, handle, flags);
@@ -163,7 +210,8 @@ void send_flags(wl_resource* bridge, wl_resource* handle, unsigned flags) {
 
 unsigned lx::compositor::toplevel_flags_of(const toplevel_record& rec) {
     return (rec.not_responding ? static_cast<unsigned>(toplevel_flag_not_responding) : 0u) |
-           (rec.demands_attention ? static_cast<unsigned>(toplevel_flag_demands_attention) : 0u);
+           (rec.demands_attention ? static_cast<unsigned>(toplevel_flag_demands_attention) : 0u) |
+           (rec.sticky ? static_cast<unsigned>(toplevel_flag_sticky) : 0u);
 }
 
 lx::compositor::shell_bridge::shell_bridge(wayland::server& server) : server_{&server} {}
@@ -250,10 +298,19 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
     if (!bridge_ || !toplevels_)
         return;
     auto* bridge = static_cast<wl_resource*>(bridge_);
+    ++binds_;
+    {
+        pid_t pid = 0;
+        uid_t uid = 0;
+        gid_t gid = 0;
+        wl_client_get_credentials(wl_resource_get_client(bridge), &pid, &uid, &gid);
+        bridge_pid_ = static_cast<int>(pid);
+    }
 
-    // Workspace objects are not implemented yet; `workspace` is nullable for exactly that
-    // reason (see zlm_shell_v1.xml), so no snapshot_workspace is sent. snapshot_output is
-    // skipped too: its wl_output is not nullable and this client may not have bound one.
+    // zlm_workspace_v1 is deprecated (never implemented): `workspace` stays null and no
+    // snapshot_workspace is sent; v7 toplevel_workspace names the shell's ext-workspace
+    // handle instead. snapshot_output is skipped too: its wl_output is not nullable and this
+    // client may not have bound one.
     zlm_policy_bridge_v1_send_snapshot_begin(bridge);
     // Creation order (toplevel ids only grow), each with its stacking index: a shell lists
     // windows the way they appeared, and a restarted shell then shows the same order it
@@ -281,6 +338,9 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
                 rec->geometry.height, toplevels_->stacking_index(rec->id));
             if (const unsigned flags = toplevel_flags_of(*rec))
                 send_flags(bridge, static_cast<wl_resource*>(handle), flags);
+            // v7: its workspace (null while the shell has bound no ext-workspace manager;
+            // re-sent once it has).
+            emit_toplevel_workspace(*rec);
         }
     }
     // v6: icons, then parents once every handle exists (a parent can come later in the
@@ -305,9 +365,14 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
             if (auto* conn = server_->find_client_by_native(wl_resource_get_client(bridge)))
                 cid = conn->id();
         lx::trace::logger::global().logf(lx::trace::level::info, "compositor.shell",
-                                         "bridge bound client={} snapshot={} focus={}", cid, index,
-                                         rec && rec->shell_handle ? rec->id.id() : 0ull);
+                                         "bridge bound client={} snapshot={} focus={} pid={} "
+                                         "binds={}",
+                                         cid, index,
+                                         rec && rec->shell_handle ? rec->id.id() : 0ull,
+                                         bridge_pid_, binds_);
     }
+    if (bound_)
+        bound_(bound_user_, wl_resource_get_client(bridge));
 #else
     (void)resource;
     (void)focused;
@@ -319,6 +384,7 @@ void lx::compositor::shell_bridge::on_bridge_destroyed(void* resource) {
         return;
     detach_all_handles();
     bridge_ = nullptr;
+    bridge_pid_ = 0;
     lx::trace::logger::global().log(lx::trace::level::info, "compositor.shell",
                                     "bridge destroyed");
 }
@@ -326,6 +392,8 @@ void lx::compositor::shell_bridge::on_bridge_destroyed(void* resource) {
 void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {
     if (observer_.mapped)
         observer_.mapped(observer_.user, rec);
+    if (control_observer_.mapped)
+        control_observer_.mapped(control_observer_.user, rec);
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || rec.shell_handle)
         return;
@@ -363,6 +431,8 @@ void lx::compositor::shell_bridge::emit_toplevel_flags(const toplevel_record& re
 void lx::compositor::shell_bridge::emit_toplevel_destroyed(toplevel_record& rec) {
     if (observer_.unmapped)
         observer_.unmapped(observer_.user, rec);
+    if (control_observer_.unmapped)
+        control_observer_.unmapped(control_observer_.user, rec);
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!rec.shell_handle)
         return;
@@ -381,6 +451,8 @@ void lx::compositor::shell_bridge::emit_toplevel_destroyed(toplevel_record& rec)
 void lx::compositor::shell_bridge::emit_toplevel_state(const toplevel_record& rec) {
     if (observer_.changed)
         observer_.changed(observer_.user, rec);
+    if (control_observer_.changed)
+        control_observer_.changed(control_observer_.user, rec);
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_ || !rec.shell_handle)
         return;
@@ -406,6 +478,8 @@ void lx::compositor::shell_bridge::emit_toplevel_geometry(const toplevel_record&
 }
 
 void lx::compositor::shell_bridge::emit_focus_changed(const toplevel_record* focused) {
+    if (control_observer_.focused)
+        control_observer_.focused(control_observer_.user, focused);
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
     if (!bridge_)
         return;
@@ -434,8 +508,14 @@ void lx::compositor::shell_bridge::emit_stacking_order_changed(const toplevel_re
 
 unsigned lx::compositor::shell_bridge::wire_state_of(const toplevel_record& rec) const {
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE)
+    // Minimized wins: the window is not on screen whatever xdg state it keeps.
+    if (rec.minimized)
+        return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_MINIMIZED;
     if (rec.state == lx::toplevel_state::normal && toplevels_ && effective_modal(*toplevels_, rec))
         return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_MODAL;
+    // Snapped to a half or a quarter (design-session-and-wm K.3).
+    if (rec.state == lx::toplevel_state::normal && rec.snap)
+        return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_TILED;
     return wire_state(rec.state);
 #else
     (void)rec;
@@ -497,4 +577,30 @@ void lx::compositor::shell_bridge::emit_bell(const toplevel_record* rec) {
 #else
     (void)rec;
 #endif
+}
+
+void lx::compositor::shell_bridge::emit_toplevel_workspace(const toplevel_record& rec) {
+#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_PROTOCOL_GLUE) && \
+    defined(ZLM_POLICY_BRIDGE_V1_TOPLEVEL_WORKSPACE_SINCE_VERSION)
+    auto* bridge = static_cast<wl_resource*>(bridge_);
+    if (!bridge_v7(bridge) || !rec.shell_handle)
+        return;
+    void* ws = !rec.sticky && rec.workspace && workspace_lookup_
+                   ? workspace_lookup_(wl_resource_get_client(bridge), rec.workspace)
+                   : nullptr;
+    zlm_policy_bridge_v1_send_toplevel_workspace(bridge,
+                                                 static_cast<wl_resource*>(rec.shell_handle),
+                                                 static_cast<wl_resource*>(ws));
+#else
+    (void)rec;
+#endif
+}
+
+void lx::compositor::shell_bridge::resend_toplevel_workspaces() {
+    if (!bridge_ || !toplevels_)
+        return;
+    toplevels_->for_each([&](const toplevel_record& rec) {
+        if (rec.mapped)
+            emit_toplevel_workspace(rec);
+    });
 }

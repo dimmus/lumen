@@ -1,12 +1,14 @@
 export module lx.compositor:keybindings;
 
 import std;
+import lx.config;
 
-// The compositor's key bindings: its own (VT switching, the logout chord) and the key grabs
-// the shell registers over zlm_shell_v1 v4. Wayland-free and allocation-free, UI affinity:
-// a grab's owner is an opaque pointer (the zlm_key_grab_v1 resource), and every decision is
-// returned to the caller to execute. The compositor sees keys first, so the mechanism lives
-// here; which combination opens what is the shell's policy.
+// The compositor's key bindings: its own (VT switching, the logout chord), the configured
+// binding table (config.toml [bindings], design-session-and-wm C.3: combination → action,
+// keys, buttons and taps) and the key grabs the shell registers over zlm_shell_v1 v4 (kept
+// for compatibility, after the table). Wayland-free and allocation-free, UI affinity: a
+// grab's owner is an opaque pointer (the zlm_key_grab_v1 resource), a binding is an entry of
+// the table, and every decision is returned to the caller to execute.
 
 export namespace lx::compositor {
 
@@ -65,7 +67,15 @@ struct key_input {
     bool others_held = false;
 };
 
-enum class key_action : unsigned char { none, switch_vt, logout, grab };
+enum class key_action : unsigned char { none, switch_vt, logout, grab, binding };
+
+/// One configured binding (lx::config::binding without its origin).
+struct binding_entry {
+    lx::config::combo keys{};
+    lx::config::action_id action = lx::config::action_id::none;
+    unsigned argument = 0;
+    unsigned char options = 0;
+};
 
 struct key_decision {
     /// The key is the compositor's: neither its press nor (through the router's
@@ -74,11 +84,37 @@ struct key_decision {
     key_action action = key_action::none;
     unsigned vt = 0;      ///< switch_vt
     void* grab = nullptr; ///< grab: its owner
+    const binding_entry* binding = nullptr; ///< binding: the entry (valid until set_bindings)
 };
 
 class keybindings {
 public:
     static constexpr unsigned k_max_grabs = 32;
+    static constexpr unsigned k_max_bindings = lx::config::k_max_bindings;
+
+    /// Replaces the configured table (a reload). Disarms a tap; entries returned before are
+    /// invalid after.
+    void set_bindings(std::span<const binding_entry> table);
+    [[nodiscard]] unsigned binding_count() const { return static_cast<unsigned>(bindings_.size()); }
+    /// A press of a configured key combination: exact modifiers, the key at its first level
+    /// (as `match_grab`). Locked: only `allow-when-locked` bindings; inhibited (the focused
+    /// surface inhibits shortcuts): only `allow-when-inhibited` ones.
+    [[nodiscard]] key_decision match_binding(const key_input& in, bool inhibited = false);
+    /// A configured pointer-button binding for evdev `button` with exactly `mods` held, or
+    /// null. Never while locked (no pointer action is lock-safe).
+    [[nodiscard]] const binding_entry* match_button(unsigned button, unsigned mods,
+                                                    bool inhibited = false) const;
+    /// The tap `observe_tap` fired, when it was a configured binding's (else null: a grab's).
+    [[nodiscard]] const binding_entry* tap_binding(void* fired) const;
+    /// A shell that takes actions (zlm_shell_v1 v7) is bound. Without one, bindings to shell
+    /// actions do not match: the key goes on to a legacy shell's grabs (v4–v6) or to the
+    /// client, rather than being swallowed for nobody — except switcher.next, which the
+    /// compositor runs as a quick switch then.
+    void set_shell_actions(bool deliverable) {
+        shell_actions_ = deliverable;
+        tap_owner_ = nullptr;
+    }
+    [[nodiscard]] bool shell_actions() const { return shell_actions_; }
 
     /// Super+Escape, exactly (no other modifier): the compositor's way back from a client
     /// that inhibits shortcuts — it toggles the focused surface's inhibitor — and, with
@@ -138,6 +174,44 @@ public:
     [[nodiscard]] bool locked() const { return locked_; }
     [[nodiscard]] bool tap_armed() const { return tap_owner_ != nullptr; }
 
+    // ── Held actions (zlm_shell_v1 v7 held_action, design-session-and-wm K.1) ──
+
+    /// What a key event does during a hold (`on_hold_key`).
+    enum class hold_step : unsigned char {
+        /// Goes on as usual: a modifier's own press, a release while the hold's modifier is
+        /// still down, or no hold.
+        none,
+        /// A key press: to the hold (its `key` event), never to the focused client — so the
+        /// router never forwards it and its release reaches nobody either.
+        divert,
+        /// The hold's modifier is up: the hold ends (`released`); the event itself goes on (the
+        /// client saw that modifier's press).
+        released,
+    };
+    /// A held binding fired: from now on, while its primary modifier stays down, key presses
+    /// go to `owner` (the zlm_held_action_v1 resource) instead of the focused client. The
+    /// primary modifier is the binding's highest one (Super, then Alt, Ctrl, Shift: GNOME's
+    /// `primaryModifier`), so Alt+Shift+Tab ends when Alt is let go whatever Shift does.
+    /// Disarms a tap.
+    void begin_hold(unsigned binding_mods, void* owner);
+    [[nodiscard]] bool hold_active() const { return hold_owner_ != nullptr; }
+    [[nodiscard]] void* hold_owner() const { return hold_owner_; }
+    /// The modifier whose release ends the hold (one `key_modifier` bit).
+    [[nodiscard]] unsigned hold_mods() const { return hold_mods_; }
+    /// Ends the hold (released, destroyed, cancelled); returns the owner it had (null: none).
+    void* end_hold();
+    [[nodiscard]] hold_step on_hold_key(const key_input& in);
+    /// The configured key binding `in` would run (exact modifiers, the same filters as
+    /// `match_binding`), or null — without consuming anything or touching a tap. During a
+    /// hold the shell is told which action a diverted key is bound to.
+    [[nodiscard]] const binding_entry* peek_binding(const key_input& in, bool inhibited = false) const;
+    /// `b` may run now (the lock, shortcuts inhibition and shell filters of `match_binding`).
+    /// A repeating binding asks before every repeat: a lock that came while its key is held
+    /// stops it unless it is allowed when locked.
+    [[nodiscard]] bool allows(const binding_entry& b, bool inhibited = false) const {
+        return !filtered(b, inhibited);
+    }
+
 private:
     struct grab {
         unsigned keysym = 0;
@@ -147,9 +221,15 @@ private:
     };
     [[nodiscard]] bool keysym_matches(unsigned grab_sym, const key_input& in) const;
 
+    [[nodiscard]] bool filtered(const binding_entry& b, bool inhibited) const;
+
     std::inplace_vector<grab, k_max_grabs> grabs_{};
+    std::inplace_vector<binding_entry, k_max_bindings> bindings_{};
     void* tap_owner_ = nullptr;
+    void* hold_owner_ = nullptr;
+    unsigned hold_mods_ = 0;
     unsigned tap_code_ = 0;
+    bool shell_actions_ = false;
     bool locked_ = false;
     layout_query layout_query_ = nullptr;
     void* layout_user_ = nullptr;
@@ -256,6 +336,63 @@ bool lx::compositor::keybindings::keysym_matches(unsigned grab_sym, const key_in
            !layout_query_(grab_sym, layout_user_);
 }
 
+void lx::compositor::keybindings::set_bindings(std::span<const binding_entry> table) {
+    bindings_.clear();
+    for (const binding_entry& b : table) {
+        if (bindings_.size() == k_max_bindings)
+            break;
+        bindings_.push_back(b);
+    }
+    tap_owner_ = nullptr;
+}
+
+bool lx::compositor::keybindings::filtered(const binding_entry& b, bool inhibited) const {
+    // With no shell to take them, shell actions step aside — except switcher.next, which the
+    // compositor then runs itself as a quick switch (design C.3).
+    if (!shell_actions_ && lx::config::action(b.action).owner == lx::config::action_owner::shell &&
+        b.action != lx::config::action_id::switcher_next)
+        return true;
+    if (locked_ && !(b.options & lx::config::bo_allow_when_locked))
+        return true;
+    return inhibited && !(b.options & lx::config::bo_allow_when_inhibited);
+}
+
+lx::compositor::key_decision lx::compositor::keybindings::match_binding(const key_input& in,
+                                                                        bool inhibited) {
+    key_decision d{};
+    if (!in.pressed)
+        return d;
+    for (const binding_entry& b : bindings_) {
+        if (b.keys.kind != lx::config::combo_kind::key || b.keys.mods != in.mods ||
+            !keysym_matches(b.keys.code, in) || filtered(b, inhibited))
+            continue;
+        tap_owner_ = nullptr;
+        d.consume = true;
+        d.action = key_action::binding;
+        d.binding = &b;
+        return d;
+    }
+    return d;
+}
+
+const lx::compositor::binding_entry* lx::compositor::keybindings::match_button(
+    unsigned button, unsigned mods, bool inhibited) const {
+    if (locked_)
+        return nullptr;
+    for (const binding_entry& b : bindings_)
+        if (b.keys.kind == lx::config::combo_kind::button && b.keys.code == button &&
+            b.keys.mods == mods && !filtered(b, inhibited))
+            return &b;
+    return nullptr;
+}
+
+const lx::compositor::binding_entry* lx::compositor::keybindings::tap_binding(void* fired) const {
+    if (!fired || bindings_.empty())
+        return nullptr;
+    const auto* p = static_cast<const binding_entry*>(fired);
+    return p >= bindings_.data() && p < bindings_.data() + bindings_.size() ? p : nullptr;
+}
+
 bool lx::compositor::keybindings::escape_hatch(const key_input& in) {
     return in.pressed && in.mods == key_mod_super &&
            (in.sym == keysyms::escape || in.raw == keysyms::escape);
@@ -281,13 +418,28 @@ lx::compositor::key_decision lx::compositor::keybindings::match_grab(const key_i
 }
 
 void* lx::compositor::keybindings::observe_tap(const key_input& in, bool inhibited) {
-    if (locked_) {
-        tap_owner_ = nullptr;
-        return nullptr;
-    }
     if (in.pressed) {
         tap_owner_ = nullptr;
         if (in.others_held)
+            return nullptr;
+        // Configured taps first (a modifier key alone: Super → the launcher).
+        for (const binding_entry& b : bindings_) {
+            if (b.keys.kind != lx::config::combo_kind::tap || filtered(b, inhibited))
+                continue;
+            const unsigned bit = (in.raw == keysyms::super_l || in.raw == keysyms::super_r) ? key_mod_super
+                                 : (in.raw == keysyms::alt_l || in.raw == keysyms::alt_r) ? key_mod_alt
+                                 : (in.raw == keysyms::control_l || in.raw == keysyms::control_r)
+                                     ? key_mod_ctrl
+                                 : (in.raw == keysyms::shift_l || in.raw == keysyms::shift_r)
+                                     ? key_mod_shift
+                                     : 0u;
+            if (bit && bit == b.keys.mods) {
+                tap_owner_ = const_cast<binding_entry*>(&b);
+                tap_code_ = in.code;
+                return nullptr;
+            }
+        }
+        if (locked_)
             return nullptr;
         for (const grab& g : grabs_) {
             if ((g.flags & key_grab_tap) && keysym_matches(g.keysym, in) &&
@@ -304,4 +456,48 @@ void* lx::compositor::keybindings::observe_tap(const key_input& in, bool inhibit
     void* fire = tap_owner_;
     tap_owner_ = nullptr;
     return fire;
+}
+
+void lx::compositor::keybindings::begin_hold(unsigned binding_mods, void* owner) {
+    // The highest modifier of the binding: Super > Alt > Ctrl > Shift.
+    unsigned primary = 0;
+    for (unsigned bit : {unsigned{key_mod_super}, unsigned{key_mod_alt}, unsigned{key_mod_ctrl},
+                         unsigned{key_mod_shift}})
+        if (binding_mods & bit) {
+            primary = bit;
+            break;
+        }
+    hold_owner_ = primary ? owner : nullptr;
+    hold_mods_ = primary;
+    tap_owner_ = nullptr;
+}
+
+void* lx::compositor::keybindings::end_hold() {
+    void* owner = hold_owner_;
+    hold_owner_ = nullptr;
+    hold_mods_ = 0;
+    return owner;
+}
+
+lx::compositor::keybindings::hold_step lx::compositor::keybindings::on_hold_key(
+    const key_input& in) {
+    if (!hold_owner_)
+        return hold_step::none;
+    if (in.pressed)
+        // Shift pressed for Alt+Shift+Tab updates the client's modifiers like any modifier;
+        // every other key is the hold's.
+        return is_modifier_keysym(in.raw) || is_modifier_keysym(in.raw0) ? hold_step::none
+                                                                         : hold_step::divert;
+    return (in.mods & hold_mods_) == 0 ? hold_step::released : hold_step::none;
+}
+
+const lx::compositor::binding_entry* lx::compositor::keybindings::peek_binding(
+    const key_input& in, bool inhibited) const {
+    if (!in.pressed)
+        return nullptr;
+    for (const binding_entry& b : bindings_)
+        if (b.keys.kind == lx::config::combo_kind::key && b.keys.mods == in.mods &&
+            keysym_matches(b.keys.code, in) && !filtered(b, inhibited))
+            return &b;
+    return nullptr;
 }

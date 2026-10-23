@@ -54,6 +54,28 @@ if(LIBSYSTEMD_FOUND)
 else()
     set(LUMEN_HAS_LOGIND FALSE)
 endif()
+# The compositor's control socket and lumen-ctl use sd-varlink and sd-json, public API
+# since systemd 257. Older libsystemd (Ubuntu 24.04: 255, Debian 12: 252) still gives
+# logind, sd-bus and sd-notify; the session then runs without the control socket.
+if(LIBSYSTEMD_FOUND AND LIBSYSTEMD_VERSION VERSION_GREATER_EQUAL 257)
+    set(LUMEN_HAS_VARLINK TRUE)
+else()
+    set(LUMEN_HAS_VARLINK FALSE)
+    if(LIBSYSTEMD_FOUND)
+        message(STATUS "libsystemd ${LIBSYSTEMD_VERSION} < 257 — no sd-varlink: "
+                       "control socket and lumen-ctl unavailable")
+    endif()
+endif()
+# The compositor unit's reload protocol: Type=notify-reload (systemd 253+) sends SIGHUP and
+# waits for READY=1 itself; before that, Type=notify with an ExecReload= that sends it.
+# Both are configured into deploy/systemd/lumen-compositor.service.in.
+if(LIBSYSTEMD_FOUND AND LIBSYSTEMD_VERSION VERSION_LESS 253)
+    set(LUMEN_UNIT_SERVICE_TYPE "notify")
+    set(LUMEN_UNIT_EXEC_RELOAD "ExecReload=/bin/kill -HUP $MAINPID")
+else()
+    set(LUMEN_UNIT_SERVICE_TYPE "notify-reload")
+    set(LUMEN_UNIT_EXEC_RELOAD "# (no ExecReload=: notify-reload sends SIGHUP itself)")
+endif()
 
 find_program(LUMEN_GLSLC NAMES glslc)
 if(LUMEN_GLSLC)
@@ -128,6 +150,10 @@ function(lumen_link_platform target)
                                                      ${XKBCOMMON_INCLUDE_DIRS})
         target_link_libraries(${target} PRIVATE ${LIBINPUT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
         target_compile_definitions(${target} PRIVATE LUMEN_HAS_INPUT=1)
+        # Three-finger drag (libinput 1.28+), a touchpad setting of the configuration file.
+        if(LIBINPUT_libinput_VERSION VERSION_GREATER_EQUAL 1.28)
+            target_compile_definitions(${target} PRIVATE LUMEN_HAS_LIBINPUT_3FG_DRAG=1)
+        endif()
     elseif(LIBINPUT_FOUND)
         message(STATUS "${target}: xkbcommon missing — input stubbed")
     endif()
@@ -150,6 +176,9 @@ function(lumen_link_platform target)
         target_include_directories(${target} PRIVATE ${LIBSYSTEMD_INCLUDE_DIRS})
         target_link_libraries(${target} PRIVATE ${LIBSYSTEMD_LIBRARIES})
         target_compile_definitions(${target} PRIVATE LUMEN_HAS_LOGIND=1)
+        if(LUMEN_HAS_VARLINK)
+            target_compile_definitions(${target} PRIVATE LUMEN_HAS_VARLINK=1)
+        endif()
     endif()
 endfunction()
 

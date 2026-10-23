@@ -44,6 +44,28 @@ import :foreign_registry;
 
 export namespace lx::compositor {
 
+/// One line of a configuration report (zlm_shell_v1 v7 config_diagnostic).
+struct shell_config_line {
+    unsigned severity = 0; ///< zlm_shell_v1.config_severity
+    const char* file = "";
+    unsigned line = 0;
+    const char* text = "";
+};
+
+/// What a shell is told of the configuration (zlm_shell_v1 v7).
+struct shell_config_report {
+    /// A sealed memfd of `size` bytes (the effective bytes), or -1: no `config` event (the
+    /// bytes did not change, or the generation was rejected).
+    int fd = -1;
+    unsigned size = 0;
+    unsigned generation = 0;
+    bool applied = true;
+    unsigned errors = 0;
+    unsigned warnings = 0;
+    const shell_config_line* lines = nullptr;
+    unsigned line_count = 0;
+};
+
 /// One client buffer's worth of work for the render thread. Vulkan objects may only be
 /// recorded on the render affinity, but commits arrive on the UI thread, so the UI side
 /// only ever describes the work — it never touches Vulkan itself.
@@ -526,9 +548,39 @@ struct p0_protocol_context {
     /// The shell's key grabs (zlm_shell_v1 v4 grab_key) are recorded here; owned by the
     /// compositor, which consults it for every key.
     keybindings* keys = nullptr;
+    /// wl_keyboard.repeat_info (config.toml input.keyboard.repeat-rate/-delay), sent to every
+    /// keyboard and input-method grab at creation. UI affinity.
+    int repeat_rate = 25;
+    int repeat_delay = 600;
+    /// Set by `install_p0_protocols`: the seat's keymap was replaced; the cached memfd every
+    /// wl_keyboard is sent is serialized again from it.
+    void (*invalidate_seat_keymap)() = nullptr;
+    /// zlm_shell_v1 v7: a shell bound; the compositor sends it the configuration in use
+    /// (`send_shell_config` with that resource). Null: nothing is sent.
+    void (*shell_config_on_bind)(void* user, void* shell_resource) = nullptr;
+    void* shell_config_user = nullptr;
+    /// Set by `install_p0_protocols`: config (when `fd` ≥ 0), every diagnostic and
+    /// config_done to `shell_resource`, or to every bound v7 shell when it is null.
+    void (*send_shell_config)(void* shell_resource, const shell_config_report& report) = nullptr;
+    /// Set by `install_p0_protocols`: zlm_shell_v1.action to every bound v7 shell, with a
+    /// fresh input serial noted as a key press delivered to it when `input` (else serial 0).
+    /// False when no v7 shell is bound.
+    bool (*send_shell_action)(const char* action, const char* argument, unsigned time_ms,
+                              bool input) = nullptr;
     /// Sends zlm_key_grab_v1.activated to the grab `grab_resource` with a fresh input serial
     /// noted as a key press delivered to the shell. Set by `install_p0_protocols`.
     void (*fire_key_grab)(void* grab_resource, unsigned time_ms) = nullptr;
+    /// zlm_shell_v1.held_action (v7, design-session-and-wm K.1) to the first bound v7 shell:
+    /// returns the new zlm_held_action_v1 resource (the hold's owner in `keybindings`), null
+    /// when no v7 shell is bound. Its serial is noted as a key press delivered to the shell.
+    /// The resource's destruction ends the hold (`keybindings::end_hold`).
+    void* (*send_held_action)(const char* action, const char* argument, unsigned time_ms) = nullptr;
+    /// zlm_held_action_v1.key / released / cancelled to the hold `hold` (a resource from
+    /// `send_held_action`). Set by `install_p0_protocols`.
+    void (*send_hold_key)(void* hold, unsigned keysym, unsigned mods, const char* binding,
+                          unsigned time_ms) = nullptr;
+    void (*send_hold_released)(void* hold, unsigned time_ms) = nullptr;
+    void (*send_hold_cancelled)(void* hold) = nullptr;
     /// wp_presentation feedback in flight (owned by the compositor). Null: the global is not
     /// advertised.
     presentation_feedback_table* presentation = nullptr;
@@ -805,6 +857,9 @@ void output_mgmt_finish(p0_protocol_context& ctx, unsigned long long token, mgmt
 /// the new state (then `done`), and every surface's output membership is recomputed from
 /// its node rect. UI affinity; rare (a mode change, an output added or removed).
 void notify_outputs_changed(p0_protocol_context& ctx);
+/// The window manager's workspaces or memberships changed (its observer): every
+/// ext_workspace_manager_v1 is brought in line, one `done` each. UI affinity.
+void workspaces_changed(p0_protocol_context& ctx);
 
 } // namespace lx::compositor
 

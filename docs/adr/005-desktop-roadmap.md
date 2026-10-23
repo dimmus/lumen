@@ -263,8 +263,15 @@ someone types into it.
      Wayland server's per-client destroy listener was indexed by a slot that compaction
      moves, so out-of-order disconnects corrupted a client's destroy list and the
      compositor could spin forever in it (shell restarts hit it); fixed, with a regression
-     case in `test_protocol_conformance`. Not yet: workspaces, a clock or tray,
-     minimize (no compositor side), the shell owning focus policy.
+     case in `test_protocol_conformance`. Since: workspaces and minimize (ADR 010 Part 3:
+     per-output dynamic workspaces served as ext-workspace-v1, the panel's indicator, zlm v7
+     `toplevel_workspace`) and an Alt+Tab window switcher (ADR 010 Part 4: most recently
+     used first, the keys held through zlm v7 `held_action` while the application keeps the
+     keyboard, a view only after 150 ms), notifications and a tray (ADR 010 Part 5: an
+     org.freedesktop.Notifications server — spec 1.2, one layer surface for the popups,
+     do-not-disturb, never over the lock, a history behind the panel's bell — and a
+     StatusNotifierWatcher and host with com.canonical.dbusmenu menus as xdg_popups of the
+     panel). Not yet: a clock, the shell owning focus policy.
    - [x] **A launcher, and apps that outlive their launcher** (ADR-006 Part B). The panel's
      Apps button and the Super tap (a zlm v4 tap grab) toggle an overlay-layer launcher
      listing the XDG desktop entries (Desktop Entry Specification 1.5: ID shadowing,
@@ -296,8 +303,9 @@ someone types into it.
    `already_constructed`, `invalid_size`, `invalid_anchor`,
    `invalid_keyboard_interactivity`, `invalid_exclusive_edge`, `invalid_surface_state`)
    (`scripts/app-smoke.sh` group D). Not yet: several outputs (every layer surface is on
-   output 0 until D5, and `output_gone` is never sent), drag-to-restore a maximized window,
-   fullscreen.
+   output 0 until D5, and `output_gone` is never sent), fullscreen. Since: drag-to-restore a
+   maximized or snapped window, Windows 11's Super+arrow snapping with xdg tiled states, and
+   edge snapping with a preview (ADR 010 Part 4, app-smoke group O).
 7. **ext-session-lock.** Security-critical and easy to get subtly wrong: the lock surface
    must survive a crashing locker, and input must not leak to normal clients while locked.
    - [x] **ext_session_lock_manager_v1** (ADR 007 §2d): input leaves normal clients at the
@@ -323,7 +331,8 @@ someone types into it.
      answering its configure (frame-perfect). Text comes from `lx.text`'s new single-line
      rasterizer (HarfBuzz + FreeType into a cached texture); missing glyphs render as the
      face's .notdef until font fallback (step 14). A title double click maximizes (step 6).
-     Not yet: a window menu (right-click), drag-to-restore a maximized window, theming.
+     Not yet: a window menu (right-click), theming. Since: drag-to-restore a maximized
+     window (ADR 010 K4), keyboard move and resize (Alt+F7, Alt+F8).
    - [x] **primary-selection** (`zwp_primary_selection_device_manager_v1`) and the
      **clipboard** done properly (`wl_data_device_manager` v4): one selection per seat and
      kind, offered — every mime type — to the keyboard-focused client before its `enter` and
@@ -374,9 +383,11 @@ someone types into it.
      accent for an urgent window (the shell shows it).
 
 *Done when:* `lumen-shell` draws a panel, switches workspaces, and locks the session.
-Status: the panel — yes (task list over the bridge, step 5), with a launcher. Workspaces — not yet (no
-`zlm_workspace_v1` objects exist). Session lock — yes (step 7; the locker is an external
-client such as swaylock, started by the shell's `--lock-command`).
+Status: the panel — yes (task list over the bridge, step 5), with a launcher. Workspaces — yes
+(ADR 010 Part 3: per output, dynamic or static, owned by the compositor and served as
+ext-workspace-v1; the panel's indicator switches them, Super+1…9 and friends, minimize and
+sticky windows, hotplug keeps what is visible visible). Session lock — yes (step 7; the
+locker is an external client such as swaylock, started by the shell's `--lock-command`).
 
 ### Phase 2 — Cash in the pipeline work
 

@@ -7,6 +7,8 @@ module;
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <stdarg.h>
+#include <stdio.h>
 #include <xkbcommon/xkbcommon.h>
 #endif
 
@@ -70,8 +72,26 @@ public:
     keyboard_keymap(keyboard_keymap&& other) noexcept;
     keyboard_keymap& operator=(keyboard_keymap&& other) noexcept;
 
-    /// Compiles a keymap. Falls back to the system default when a field is null.
-    [[nodiscard]] lx::result<void> compile(keymap_config config = {});
+    /// Compiles a keymap. Falls back to the system default when a field is null. On failure
+    /// `error` (when given) receives xkbcommon's first complaint ("Couldn't find file
+    /// \"symbols/xx\" …"), which names what is wrong better than any summary.
+    [[nodiscard]] lx::result<void> compile(keymap_config config = {}, char* error = nullptr,
+                                           unsigned error_cap = 0);
+
+    /// Takes over the live state of `old` after this keymap was compiled to replace it (a
+    /// configuration reload): Caps Lock and Num Lock as they were, the locked layout clamped
+    /// to this keymap's layouts, and the keys still held (`held`, evdev codes) pressed again
+    /// so their modifiers stay down. Modifier masks are keymap-specific: the locks are carried
+    /// by name, never as raw bits.
+    void adopt_state(const keyboard_keymap& old, const unsigned* held, unsigned held_count);
+    /// Locks or unlocks Num Lock (the session's start-up setting). True when it changed.
+    [[nodiscard]] bool set_num_lock(bool on);
+    /// How many layouts (groups) the keymap has.
+    [[nodiscard]] unsigned layout_count() const;
+    /// Locks the next (`step` 1) or previous (-1) layout, wrapping. True when it changed.
+    [[nodiscard]] bool cycle_layout(int step);
+    /// The layout's name ("English (US)"), "" when unknown.
+    [[nodiscard]] const char* layout_name(unsigned layout) const;
 
     [[nodiscard]] bool valid() const { return state_ != nullptr; }
 
@@ -235,15 +255,46 @@ lx::input::keyboard_keymap& lx::input::keyboard_keymap::operator=(
     return *this;
 }
 
-lx::result<void> lx::input::keyboard_keymap::compile(keymap_config config) {
+#if defined(LUMEN_HAS_INPUT)
+namespace {
+struct xkb_error_capture {
+    char* out = nullptr;
+    unsigned cap = 0;
+};
+void capture_xkb_log(struct xkb_context* ctx, enum xkb_log_level level, const char* format,
+                     va_list args) {
+    auto* c = static_cast<xkb_error_capture*>(xkb_context_get_user_data(ctx));
+    if (level > XKB_LOG_LEVEL_ERROR)
+        return;
+    if (!c || !c->out || c->cap == 0 || c->out[0]) {
+        // Not captured (or a later one): to stderr as xkbcommon would, errors only.
+        std::vfprintf(stderr, format, args);
+        return;
+    }
+    std::vsnprintf(c->out, c->cap, format, args);
+    for (char* p = c->out; *p; ++p)
+        if (*p == '\n')
+            *p = p[1] ? ' ' : '\0';
+}
+} // namespace
+#endif
+
+lx::result<void> lx::input::keyboard_keymap::compile(keymap_config config, char* error,
+                                                     unsigned error_cap) {
 #if defined(LUMEN_HAS_INPUT)
     destroy();
+    if (error && error_cap)
+        error[0] = '\0';
 
     auto* ctx = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
     if (!ctx) {
         return lx::make_error(lx::error_domain::io, 0, "xkb_context_new failed");
     }
     context_ = ctx;
+    // The capture lives on this stack frame: the log function is detached before return.
+    xkb_error_capture capture{error, error_cap};
+    xkb_context_set_user_data(ctx, &capture);
+    xkb_context_set_log_fn(ctx, &capture_xkb_log);
 
     xkb_rule_names names{};
     names.rules = config.rules;
@@ -253,6 +304,7 @@ lx::result<void> lx::input::keyboard_keymap::compile(keymap_config config) {
     names.options = config.options;
 
     auto* map = xkb_keymap_new_from_names(ctx, &names, XKB_KEYMAP_COMPILE_NO_FLAGS);
+    xkb_context_set_user_data(ctx, nullptr);
     if (!map) {
         destroy();
         return lx::invalid_argument("xkb_keymap_new_from_names failed — check layout/variant");
@@ -269,7 +321,103 @@ lx::result<void> lx::input::keyboard_keymap::compile(keymap_config config) {
     return {};
 #else
     (void)config;
+    (void)error;
+    (void)error_cap;
     return lx::not_implemented("lx::input::keyboard_keymap::compile");
+#endif
+}
+
+void lx::input::keyboard_keymap::adopt_state(const keyboard_keymap& old, const unsigned* held,
+                                             unsigned held_count) {
+#if defined(LUMEN_HAS_INPUT)
+    if (!state_ || !keymap_)
+        return;
+    auto* st = static_cast<xkb_state*>(state_);
+    auto* map = static_cast<xkb_keymap*>(keymap_);
+    xkb_mod_mask_t locked = 0;
+    xkb_layout_index_t group = 0;
+    if (old.state_) {
+        auto* os = static_cast<xkb_state*>(old.state_);
+        for (const char* name : {XKB_MOD_NAME_CAPS, XKB_MOD_NAME_NUM}) {
+            if (xkb_state_mod_name_is_active(os, name, XKB_STATE_MODS_LOCKED) > 0) {
+                const xkb_mod_index_t i = xkb_keymap_mod_get_index(map, name);
+                if (i != XKB_MOD_INVALID)
+                    locked |= 1u << i;
+            }
+        }
+        group = xkb_state_serialize_layout(os, XKB_STATE_LAYOUT_LOCKED);
+        if (group >= xkb_keymap_num_layouts(map))
+            group = 0;
+    }
+    xkb_state_update_mask(st, 0, 0, locked, 0, 0, group);
+    for (unsigned i = 0; held && i < held_count; ++i)
+        xkb_state_update_key(st, to_xkb(held[i]), XKB_KEY_DOWN);
+    last_ = modifiers();
+#else
+    (void)old;
+    (void)held;
+    (void)held_count;
+#endif
+}
+
+bool lx::input::keyboard_keymap::set_num_lock(bool on) {
+#if defined(LUMEN_HAS_INPUT)
+    if (!state_ || !keymap_)
+        return false;
+    const xkb_mod_index_t i =
+        xkb_keymap_mod_get_index(static_cast<xkb_keymap*>(keymap_), XKB_MOD_NAME_NUM);
+    if (i == XKB_MOD_INVALID)
+        return false;
+    modifier_state m = modifiers();
+    const unsigned bit = 1u << i;
+    m.locked = on ? (m.locked | bit) : (m.locked & ~bit);
+    return update_mask(m);
+#else
+    (void)on;
+    return false;
+#endif
+}
+
+unsigned lx::input::keyboard_keymap::layout_count() const {
+#if defined(LUMEN_HAS_INPUT)
+    return keymap_ ? xkb_keymap_num_layouts(static_cast<xkb_keymap*>(keymap_)) : 0u;
+#else
+    return 0;
+#endif
+}
+
+bool lx::input::keyboard_keymap::cycle_layout(int step) {
+#if defined(LUMEN_HAS_INPUT)
+    const unsigned n = layout_count();
+    if (!state_ || n < 2)
+        return false;
+    modifier_state m = modifiers();
+    auto* st = static_cast<xkb_state*>(state_);
+    const unsigned cur = xkb_state_serialize_layout(st, XKB_STATE_LAYOUT_EFFECTIVE);
+    const unsigned next = static_cast<unsigned>((static_cast<int>(cur) + step % static_cast<int>(n) +
+                                                 static_cast<int>(n)) %
+                                                static_cast<int>(n));
+    // The locked layout is what xkb's own group switching changes too; latched and
+    // depressed group offsets (a held group key) stay off.
+    xkb_state_update_mask(st, m.depressed, m.latched, m.locked, 0, 0, next);
+    const auto now = modifiers();
+    const bool changed = !(now == last_);
+    last_ = now;
+    return changed;
+#else
+    (void)step;
+    return false;
+#endif
+}
+
+const char* lx::input::keyboard_keymap::layout_name(unsigned layout) const {
+#if defined(LUMEN_HAS_INPUT)
+    const char* n = keymap_ ? xkb_keymap_layout_get_name(static_cast<xkb_keymap*>(keymap_), layout)
+                            : nullptr;
+    return n ? n : "";
+#else
+    (void)layout;
+    return "";
 #endif
 }
 
