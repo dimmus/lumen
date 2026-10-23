@@ -74,7 +74,9 @@ public:
     [[nodiscard]] bool accepted_last() const { return accepted_last_; }
     [[nodiscard]] const lx::config::config_location& location() const { return location_; }
     [[nodiscard]] lx::config::config_watch& watch() { return watch_; }
-    /// "~/.config/lumen/config.toml" (or the explicit file; "(none)" when disabled).
+    /// What the current generation read: "~/.config/lumen/config.toml" (or the explicit file),
+    /// a system layer when the user has no file, "built-in defaults (no …)" when nothing was
+    /// read, "(none: LUMEN_CONFIG=0)" when disabled.
     [[nodiscard]] const char* describe_source() const;
 
 private:
@@ -87,7 +89,8 @@ private:
     unsigned generation_ = 0;
     bool accepted_last_ = true;
     bool loaded_ = false;
-    char source_[128]{};
+    char source_[520]{};
+    char defaults_[560]{};
 };
 
 /// The table the key matcher uses: every binding of `c`, minus `shell.lock` when no lock

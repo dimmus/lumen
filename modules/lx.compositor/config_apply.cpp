@@ -100,10 +100,23 @@ void config_state::init(cfg::env_lookup env) {
         std::snprintf(source_, sizeof(source_), "~%s", location_.user_file.path + std::strlen(home));
     else
         std::snprintf(source_, sizeof(source_), "%s", location_.user_file.path);
+    if (!location_.disabled)
+        std::snprintf(defaults_, sizeof(defaults_), "built-in defaults (no %s)", source_);
     (void)watch_.open(location_);
 }
 
-const char* config_state::describe_source() const { return source_; }
+const char* config_state::describe_source() const {
+    // What this generation actually read: the user's file, another layer (a system file
+    // with no user file), or nothing at all, which is the compiled-in defaults.
+    if (location_.disabled)
+        return source_;
+    if (read_.layers.empty())
+        return defaults_;
+    for (const auto& l : read_.layers)
+        if (std::strcmp(l.path, location_.user_file.path) == 0)
+            return source_;
+    return read_.layers.back().path;
+}
 
 const char* config_state::path_of(unsigned layer) const { return read_.path_of(layer); }
 
