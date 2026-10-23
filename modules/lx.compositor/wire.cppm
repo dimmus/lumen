@@ -843,12 +843,24 @@ bool cursor_request_allowed(wl_client* client, uint32_t serial);
 /// The seat's keymap as every wl_keyboard is sent it: a sealed memfd owned for the process
 /// lifetime. False when there is none (no keyboard is advertised then).
 bool seat_keymap(int& fd, unsigned& size);
+/// The seat's keymap was replaced: the next `seat_keymap` serializes the new one.
+void seat_keymap_invalidate();
 void bind_seat(wayland::client_connection& client, unsigned id, int version);
 void bind_shell(wayland::client_connection& client, unsigned id, int version);
 /// Sends zlm_shell_v1.session_ending (v3) to every bound shell.
 void shell_send_session_ending();
+/// zlm_shell_v1 v7: see `p0_protocol_context::send_shell_config` / `send_shell_action`.
+void shell_send_config(void* shell_resource, const lx::compositor::shell_config_report& r);
+bool shell_send_action(const char* action, const char* argument, unsigned time_ms, bool input);
 /// zlm_key_grab_v1.activated (v4): see `p0_protocol_context::fire_key_grab`.
 void shell_fire_key_grab(void* grab_resource, unsigned time_ms);
+/// zlm_shell_v1.held_action and zlm_held_action_v1 (v7): see
+/// `p0_protocol_context::send_held_action` and `send_hold_*`.
+void* shell_send_held_action(const char* action, const char* argument, unsigned time_ms);
+void shell_send_hold_key(void* hold, unsigned keysym, unsigned mods, const char* binding,
+                         unsigned time_ms);
+void shell_send_hold_released(void* hold, unsigned time_ms);
+void shell_send_hold_cancelled(void* hold);
 /// zlm_shell_v1.lock_state / lock_requested (v5) to every bound shell of version 5.
 void shell_send_lock_state(unsigned state);
 /// True when one was told.
@@ -1093,6 +1105,14 @@ void capture_cursor_toplevel_unmapped(lx::toplevel_id id);
 bool cu_poll_add(int fd, unsigned key, unsigned generation);
 /// Drops (closes) every wait of `key`.
 void cu_poll_drop(unsigned key);
+
+// ── ext-workspace-v1 (wire_workspace.cpp; design-session-and-wm W.4) ─────
+
+void bind_workspace_manager(wayland::client_connection& client, unsigned id, int version);
+/// A wl_output was bound: the client's workspace groups of that output get `output_enter`.
+void workspace_output_bound(wl_client* client, wl_resource* output, unsigned slot);
+/// Every bound manager follows the model (one `done` each that changed).
+void workspaces_sync_all();
 
 // ── wire_install.cpp ───────────────────────────────────────────────────────
 

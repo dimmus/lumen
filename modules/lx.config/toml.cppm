@@ -1,22 +1,23 @@
 module;
 
-// A strict TOML subset for Lumen's own configuration files (`outputs.toml`, ADR 008 §C.5;
-// the planned `window-rules.toml`): comments, `key = value` with basic and literal strings,
-// integers, floats, booleans and arrays of those (one line or several, trailing comma
-// allowed), `[table]` and `[[array.of.tables]]` headers with dotted names. Not supported,
-// and reported as an error with its line rather than misread: inline tables, dotted keys,
-// multi-line strings, dates. Pure: the reader streams what it finds to a callback (no
-// document tree, no allocation), the writer escapes. UI affinity in practice (start-up
-// and the save's serialisation).
+// A strict TOML subset for Lumen's own configuration files (`config.toml`, design-session-
+// and-wm Part C; `outputs.toml`, ADR 008 §C.5): comments, `key = value` with basic and
+// literal strings, integers, floats, booleans and arrays of those (one line or several,
+// trailing comma allowed), `[table]` and `[[array.of.tables]]` headers with dotted names,
+// and single-line inline tables (`k = { a = 1, b = "x" }`) for a handler that asks for them.
+// Not supported, and reported as an error with its line rather than misread: dotted keys,
+// nested inline tables, inline tables in arrays, multi-line strings, dates. Pure: the reader
+// streams what it finds to a callback (no document tree, no allocation), the writer escapes.
 //
-// Member bodies are in toml_lite.cpp (Clang 23 module-partition workaround, as
-// session_lock.cpp).
+// Moved here from lx.compositor (`:toml_lite`) so that the compositor, the shell and
+// lumen-ctl read the configuration with the same code. Member bodies are in toml.cpp
+// (Clang 23 module-partition workaround, as lx.compositor's session_lock.cpp).
 
-export module lx.compositor:toml_lite;
+export module lx.config:toml;
 
 import std;
 
-export namespace lx::compositor::toml {
+export namespace lx::config::toml {
 
 /// A scalar or an array of scalars. Strings point into the reader's scratch and are valid
 /// for the callback only.
@@ -52,8 +53,11 @@ struct handler {
     /// `[name]` (array false) or `[[name]]` (array true): later keys belong to it. `name` is
     /// the dotted path with quoting removed ("setup.output").
     bool (*table)(void* user, const char* name, bool array, parse_error& err) = nullptr;
-    /// `key = value` in the current table ("" at the top).
+    /// `key = value` in the current table ("" at the top), or in the inline table open.
     bool (*key_value)(void* user, const char* key, const value& v, parse_error& err) = nullptr;
+    /// `key = { … }`: called with `begin` true and the key, then `key_value` for each of its
+    /// members, then with `begin` false (same key). Null: an inline table is a syntax error.
+    bool (*inline_table)(void* user, const char* key, bool begin, parse_error& err) = nullptr;
 };
 
 /// Reads `text` (`length` bytes, need not be NUL-terminated). False at the first error, with
@@ -87,4 +91,4 @@ private:
     bool indent_ = false;
 };
 
-} // namespace lx::compositor::toml
+} // namespace lx::config::toml

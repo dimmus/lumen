@@ -13,6 +13,13 @@ void on_signal(int) {
         g_compositor->request_stop();
 }
 
+// SIGHUP: re-read the configuration (`systemctl --user reload lumen-compositor`, which
+// Type=notify-reload maps to SIGHUP and answers from RELOADING=1 / READY=1).
+void on_reload(int) {
+    if (g_compositor)
+        g_compositor->request_reload();
+}
+
 // Debug aid: SIGUSR1 writes the next (fully repainted) frame as a PPM (see
 // compositor::request_screenshot).
 void on_screenshot(int) {
@@ -24,6 +31,8 @@ void on_screenshot(int) {
 int main(int argc, char* argv[]) {
     lx::compositor::config cfg{};
     static char output_scales[512] = {};
+    // lumen-ctl and run-desktop.sh talk to the compositor here ($XDG_RUNTIME_DIR/<socket>.varlink).
+    cfg.control_socket = true;
 
     for (int i = 1; i < argc; ++i) {
         const char* arg = argv[i];
@@ -83,6 +92,31 @@ int main(int argc, char* argv[]) {
                 return 2;
             }
             cfg.virtual_outputs = argv[++i];
+        } else if (std::strcmp(arg, "--session") == 0) {
+            // Run as the session's display server under systemd (lumen-compositor.service,
+            // started by lumen-session): export the session environment, then READY=1.
+            cfg.session_mode = true;
+        } else if (std::strcmp(arg, "--no-control") == 0) {
+            // No control socket (lumen-ctl cannot reach this compositor).
+            cfg.control_socket = false;
+        } else if (std::strcmp(arg, "-h") == 0 || std::strcmp(arg, "--help") == 0) {
+            std::printf(
+                "usage: lumen-compositor [SOCKET] [-f FPS] [--session] [--no-control]\n"
+                "                        [--decorations=server|client] [--ping-timeout MS]\n"
+                "                        [--scale S] [--output-scale NAME=S]\n"
+                "                        [--virtual-outputs WxH[@S][,...]] [--shell PATH]\n"
+                "  SOCKET          Wayland socket name (default lumen-0)\n"
+                "  --session       the session's display server under systemd\n"
+                "                  (lumen-compositor.service): exports the session environment\n"
+                "                  to the user manager, then sends READY=1\n"
+                "  --no-control    no control socket ($XDG_RUNTIME_DIR/SOCKET.varlink, lumen-ctl)\n"
+                "Signals: SIGTERM/SIGINT stop, SIGHUP reloads the configuration, SIGUSR1 writes\n"
+                "a screenshot of the next frame.\n"
+                "Configuration: $XDG_CONFIG_HOME/lumen/config.toml over\n"
+                "$XDG_CONFIG_DIRS/lumen/config.toml, watched and applied live\n"
+                "(LUMEN_CONFIG=PATH: that file only; LUMEN_CONFIG=0: the defaults);\n"
+                "lumen-ctl config check validates it, lumen-ctl config defaults documents it.\n");
+            return 0;
         } else if (std::strcmp(arg, "--shell") == 0) {
             // The one binary zlm_shell_v1 binds are accepted from (default: lumen-shell
             // next to this executable).
@@ -108,6 +142,11 @@ int main(int argc, char* argv[]) {
     sigemptyset(&shot.sa_mask);
     shot.sa_flags = SA_RESTART;
     sigaction(SIGUSR1, &shot, nullptr);
+    struct sigaction hup {};
+    hup.sa_handler = on_reload;
+    sigemptyset(&hup.sa_mask);
+    hup.sa_flags = SA_RESTART;
+    sigaction(SIGHUP, &hup, nullptr);
 
     if (auto started = comp.start(); !started)
         return 1;

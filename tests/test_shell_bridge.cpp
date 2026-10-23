@@ -13,8 +13,11 @@
 // router's forwarded-key rule (no release without a forwarded press; `enter` lists only
 // forwarded keys).
 #include <stdio.h>
+#include <stdlib.h>
 
 #include <sys/mman.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #if defined(LUMEN_HAS_WAYLAND)
@@ -50,6 +53,7 @@ import lx.runtime;
 import lx.compositor;
 import lx.input;
 import lx.shell;
+import lx.config;
 
 // From wayland-server.h, which cannot share a translation unit with the client headers.
 extern "C" struct wl_client* wl_resource_get_client(struct wl_resource* resource);
@@ -227,6 +231,17 @@ lx::shell::task_handle find_title(const lx::shell::task_model& m, const char* ti
 } // namespace
 
 int main() {
+    // zlm v7: a configuration file the compositor hands the shell (and a key it warns about).
+    char cfg_dir[] = "/tmp/lumen-test-shell-bridge-XXXXXX";
+    std::string cfg_path;
+    if (mkdtemp(cfg_dir)) {
+        cfg_path = std::string(cfg_dir) + "/config.toml";
+        if (FILE* f = std::fopen(cfg_path.c_str(), "w")) {
+            std::fputs("[cursor]\nsiez = 30\n[bindings]\n\"Super+Y\" = \"window.close\"\n", f);
+            std::fclose(f);
+        }
+        setenv("LUMEN_CONFIG", cfg_path.c_str(), 1);
+    }
     lx::compositor::config cfg{};
     cfg.socket_name = k_socket;
     cfg.target_fps = 30.0;
@@ -287,8 +302,8 @@ int main() {
     conn sh{};
     sh.bridge = &bridge;
     check(connect(sh) && sh.shell, "shell binds zlm_shell_v1 (exe matches the configured path)");
-    check(bridge.has_capabilities() && bridge.compositor_version() == 6,
-          "capabilities arrive right after bind (the compositor implements version 6)");
+    check(bridge.has_capabilities() && bridge.compositor_version() == 7,
+          "capabilities arrive right after bind (the compositor implements version 7)");
     check(static_cast<bool>(bridge.attach(sh.shell)), "get_policy_bridge");
     (void)wl_display_roundtrip(sh.display);
     const auto& model = bridge.model();
@@ -409,8 +424,8 @@ int main() {
     check(connect(sh3) && sh3.shell && static_cast<bool>(v4.attach(sh3.shell)),
           "a v4 shell binds");
     (void)wl_display_roundtrip(sh3.display);
-    check(v4.compositor_version() == 6 && v4.can_grab_keys() && !v4.has_lock_state(),
-          "v4: grabs, no lock state (the compositor reports 6)");
+    check(v4.compositor_version() == 7 && v4.can_grab_keys() && !v4.has_lock_state(),
+          "v4: grabs, no lock state (the compositor reports 7)");
     const auto v_one = find_title(v4.model(), "one renamed");
     const auto v_three = find_title(v4.model(), "three");
     v4.request_activate(v_one);
@@ -678,6 +693,325 @@ int main() {
         wl_display_disconnect(sh6.display);
     }
 #endif
+
+    // ── Version 7: the configuration and actions ──
+    {
+        struct v7_log {
+            std::string bytes;
+            unsigned generation = 0;
+            unsigned done_generation = 0;
+            bool applied = false;
+            unsigned errors = 99, warnings = 99;
+            std::string first_line;
+            std::string all_lines;
+            std::string action;
+            unsigned action_serial = 0;
+        };
+        static v7_log log7;
+        static lx::shell::policy_bridge v7;
+        v7.set_config_handlers(
+            [](std::string_view bytes, unsigned generation, void*) {
+                log7.bytes.assign(bytes);
+                log7.generation = generation;
+            },
+            [](unsigned generation, bool applied, unsigned errors, unsigned warnings,
+               std::span<const lx::shell::policy_bridge::config_line> lines, void*) {
+                log7.done_generation = generation;
+                log7.applied = applied;
+                log7.errors = errors;
+                log7.warnings = warnings;
+                log7.all_lines.clear();
+                for (const auto& l : lines)
+                    log7.all_lines += l.text + "\n";
+                if (!lines.empty())
+                    log7.first_line = lines.front().file + ":" + std::to_string(lines.front().line) +
+                                      " " + lines.front().text;
+            },
+            [](const char* action, const char*, unsigned serial, unsigned, void*) {
+                log7.action = action;
+                log7.action_serial = serial;
+            },
+            nullptr);
+        conn sh7{};
+        sh7.bridge = &v7;
+        g_zlm_version = 7;
+        check(connect(sh7) && sh7.shell && v7.has_v7(), "v7: the shell binds version 7");
+        check(log7.generation == 1 && log7.bytes.find("# lumen-layer: " + cfg_path) == 0 &&
+                  log7.bytes.find("\"Super+Y\" = \"window.close\"") != std::string::npos,
+              "v7: config on bind: the file's bytes behind their layer marker");
+        check(log7.done_generation == 1 && log7.applied && log7.errors == 0 &&
+                  log7.warnings == 1 &&
+                  log7.first_line == cfg_path + ":2 cursor.siez: unknown key (did you mean size?); "
+                                                "ignored",
+              "v7: config_diagnostic and config_done report the compositor's diagnostics");
+        if (log7.warnings == 1 && log7.first_line.find("did you mean") == std::string::npos)
+            std::printf("      got: %s\n", log7.first_line.c_str());
+        // The parsed bytes give the shell the same configuration.
+        lx::config::config_snapshot parsed = lx::config::default_config();
+        lx::config::diagnostics d{};
+        check(lx::config::parse_config(lx::config::split_layers(log7.bytes), parsed, d, nullptr) &&
+                  d.warnings() == 1 && parsed.bindings.size() == lx::config::default_config().bindings.size() + 1,
+              "v7: the shell parses the bytes to the compositor's configuration");
+        check(static_cast<bool>(v7.attach(sh7.shell)), "v7: get_policy_bridge");
+        (void)wl_display_roundtrip(sh7.display);
+        // Super+Return: the compositor's binding sends shell.terminal to the v7 shell (not the
+        // v4 grab, not the application), with a serial noted as the shell's key press.
+        constexpr unsigned k_meta7 = 125, k_enter7 = 28;
+        const unsigned activations_before = g_activations;
+        const unsigned keys_before7 = g_kb.keys;
+        inject(k_meta7, true);
+        inject(k_enter7, true);
+        inject(k_enter7, false);
+        inject(k_meta7, false);
+        (void)wl_display_roundtrip(sh7.display);
+        (void)wl_display_roundtrip(app.display);
+        wl_client* shell7 = wl_resource_get_client(
+            static_cast<wl_resource*>(comp.shell_bridge().bridge_resource()));
+        check(log7.action == "shell.terminal" && log7.action_serial != 0 &&
+                  comp.input().serials().last_key_press(shell7) == log7.action_serial,
+              "v7: Super+Return is the action shell.terminal, its serial the shell's key press");
+        check(g_activations == activations_before, "v7: the legacy grab is not activated");
+        check(g_kb.keys == keys_before7 + 2,
+              "v7: the application saw Super's press and release only");
+        // A Super tap is shell.launcher.
+        log7.action.clear();
+        inject(k_meta7, true);
+        inject(k_meta7, false);
+        (void)wl_display_roundtrip(sh7.display);
+        check(log7.action == "shell.launcher", "v7: a Super tap is the action shell.launcher");
+
+        // ── v7: held actions (design-session-and-wm K.1): Alt+Tab holds the keyboard ──
+        {
+            struct hold_log {
+                std::string begin;
+                std::vector<std::string> keys;
+                unsigned released = 0;
+                unsigned cancelled = 0;
+            };
+            static hold_log hl;
+            v7.set_hold_handlers(
+                {.begin = [](const char* a, const char*, unsigned, unsigned, void*) { hl.begin = a; },
+                 .key = [](unsigned keysym, unsigned mods, const char* binding, unsigned, unsigned,
+                           void*) {
+                     char b[96];
+                     std::snprintf(b, sizeof(b), "%x/%x/%s", keysym, mods, binding);
+                     hl.keys.emplace_back(b);
+                 },
+                 .released = [](unsigned, unsigned, void*) { ++hl.released; },
+                 .cancelled = [](void*) { ++hl.cancelled; }});
+            constexpr unsigned k_alt = 56, k_tab = 15, k_shift = 42, k_esc = 1, k_a = 30;
+            (void)wl_display_roundtrip(app.display); // what came before is counted first
+            const unsigned keys0 = g_kb.keys;
+            const unsigned leaves0 = g_kb.leaves;
+            inject(k_alt, true);
+            inject(k_tab, true);
+            inject(k_tab, false);
+            (void)wl_display_roundtrip(sh7.display);
+            check(hl.begin == "switcher.next" && v7.holding(),
+                  "v7: Alt+Tab begins the held action switcher.next");
+            inject(k_tab, true);
+            inject(k_tab, false);
+            inject(k_shift, true);
+            inject(k_tab, true);
+            inject(k_tab, false);
+            inject(k_shift, false);
+            (void)wl_display_roundtrip(sh7.display);
+            check(hl.keys.size() == 2 && hl.keys[0] == "ff09/4/switcher.next" &&
+                      hl.keys[1] == "ff09/5/switcher.previous",
+                  "v7: Tab and Shift+Tab during the hold reach the shell as keys, with the action "
+                  "each is bound to");
+            inject(k_alt, false);
+            (void)wl_display_roundtrip(sh7.display);
+            (void)wl_display_roundtrip(app.display);
+            check(hl.released == 1 && !v7.holding(), "v7: letting go of Alt releases the hold");
+            check(g_kb.keys == keys0 + 4 && g_kb.leaves == leaves0,
+                  "v7: the application saw only Alt's and Shift's presses and releases, and kept "
+                  "the keyboard");
+            // The shell ends the hold itself (Escape dismissed the switcher): the keys reach the
+            // application again at once, though Alt is still down.
+            inject(k_alt, true);
+            inject(k_tab, true);
+            inject(k_tab, false);
+            inject(k_esc, true);
+            inject(k_esc, false);
+            (void)wl_display_roundtrip(sh7.display);
+            check(v7.holding() && hl.keys.size() == 3 && hl.keys[2] == "ff1b/4/",
+                  "v7: Escape is the hold's too");
+            v7.end_hold();
+            (void)wl_display_roundtrip(sh7.display);
+            (void)wl_display_roundtrip(app.display); // Alt's press, counted before
+            const unsigned keys1 = g_kb.keys;
+            inject(k_a, true);
+            inject(k_a, false);
+            inject(k_alt, false);
+            (void)wl_display_roundtrip(app.display);
+            (void)wl_display_roundtrip(sh7.display);
+            check(g_kb.keys == keys1 + 3 && hl.released == 1 && hl.cancelled == 0,
+                  "v7: after the shell ended the hold Alt+a and Alt's release reach the "
+                  "application, and nothing is released");
+            v7.set_hold_handlers({});
+        }
+
+        // ── v7: workspace membership (toplevel_workspace), sticky, minimized ──
+        {
+            const auto& m7 = v7.model();
+            const auto t_one = find_title(m7, "three");
+            check(t_one && m7.get(t_one)->workspace_known && !m7.get(t_one)->workspace,
+                  "v7: toplevel_workspace follows the snapshot: null without an ext-workspace "
+                  "manager");
+            // The shell binds ext-workspace after its bridge: once that manager's first done
+            // is out, every window's workspace comes again — now as the shell's handle.
+            static lx::shell::workspace_client ws7;
+            ws7.set_removed_handler(
+                [](void* proxy, void*) { v7.model().forget_workspace(proxy); }, nullptr);
+            struct found_global {
+                uint32_t name = 0;
+                uint32_t version = 0;
+            } fg{};
+            static const wl_registry_listener find_ws = {
+                [](void* d, wl_registry*, uint32_t name, const char* iface, uint32_t version) {
+                    if (std::strcmp(iface, "ext_workspace_manager_v1") == 0)
+                        *static_cast<found_global*>(d) = {name, version};
+                },
+                [](void*, wl_registry*, uint32_t) {}};
+            wl_registry* reg7 = wl_display_get_registry(sh7.display);
+            wl_registry_add_listener(reg7, &find_ws, &fg);
+            (void)wl_display_roundtrip(sh7.display);
+            check(fg.name != 0, "v7: ext_workspace_manager_v1 is advertised");
+            ws7.bind(reg7, fg.name, fg.version);
+            (void)wl_display_roundtrip(sh7.display);
+            (void)wl_display_roundtrip(sh7.display);
+            const auto* e1 = m7.get(t_one);
+            check(ws7.synced() && e1 && e1->workspace && ws7.view().is_active(e1->workspace),
+                  "v7: after a late ext-workspace bind each window names its active workspace");
+            const auto with_wm = [&](auto&& fn) {
+                std::lock_guard<std::mutex> hold(dispatch_lock);
+                lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+                lx::toplevel_id id{};
+                comp.toplevels().for_each([&](const lx::compositor::toplevel_record& r) {
+                    if (r.title && std::strcmp(r.title, "three") == 0)
+                        id = r.id;
+                });
+                fn(comp.windows(), id);
+                comp.wayland().flush();
+            };
+            with_wm([](auto& wm, lx::toplevel_id id) { wm.set_sticky(id, true); });
+            (void)wl_display_roundtrip(sh7.display);
+            e1 = m7.get(t_one);
+            check(e1 && (e1->flags & lx::shell::task_flag_sticky) && !e1->workspace &&
+                      e1->workspace_known,
+                  "v7: sticky: the flag, and no workspace");
+            with_wm([](auto& wm, lx::toplevel_id id) { wm.set_sticky(id, false); });
+            (void)wl_display_roundtrip(sh7.display);
+            e1 = m7.get(t_one);
+            check(e1 && !(e1->flags & lx::shell::task_flag_sticky) && e1->workspace &&
+                      ws7.view().is_active(e1->workspace),
+                  "v7: not sticky: back on the active workspace");
+            with_wm([](auto& wm, lx::toplevel_id id) { wm.set_minimized(id, true, "test"); });
+            (void)wl_display_roundtrip(sh7.display);
+            e1 = m7.get(t_one);
+            check(e1 && e1->state == lx::shell::k_task_state_minimized,
+                  "v7: a minimized window's state is minimized");
+            with_wm([](auto& wm, lx::toplevel_id id) { wm.activate(id); });
+            (void)wl_display_roundtrip(sh7.display);
+            e1 = m7.get(t_one);
+            check(e1 && e1->state != lx::shell::k_task_state_minimized,
+                  "v7: activating it brings it back");
+            ws7.destroy();
+            wl_registry_destroy(reg7);
+        }
+
+        // ── v7: reloads (SIGHUP's path): a keymap that does not compile stays reported in
+        // every later generation, and a reload asked for while a generation is busy (its
+        // keymap compiling on the worker) is answered by its own generation ──
+        if (!cfg_path.empty()) {
+            // What systemd would see of the reload protocol (READY=1 per SIGHUP).
+            const std::string notify_path = std::string(cfg_dir) + "/notify";
+            const int ns = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+            sockaddr_un na{};
+            na.sun_family = AF_UNIX;
+            std::snprintf(na.sun_path, sizeof(na.sun_path), "%s", notify_path.c_str());
+            check(ns >= 0 && ::bind(ns, reinterpret_cast<sockaddr*>(&na), sizeof(na)) == 0,
+                  "reload: a notify socket");
+            setenv("NOTIFY_SOCKET", notify_path.c_str(), 1);
+            std::vector<std::string> readies;
+            const auto read_notify = [&] {
+                char buf[512];
+                ssize_t n = 0;
+                while ((n = ::recv(ns, buf, sizeof(buf) - 1, 0)) > 0) {
+                    buf[n] = '\0';
+                    if (std::strstr(buf, "READY=1"))
+                        readies.emplace_back(buf);
+                }
+            };
+            const auto write_config = [&](const char* text) {
+                if (FILE* f = std::fopen(cfg_path.c_str(), "w")) {
+                    std::fputs(text, f);
+                    std::fclose(f);
+                }
+            };
+            const auto ui_tasks = [&] {
+                std::lock_guard<std::mutex> hold(dispatch_lock);
+                lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+                comp.run_posted_ui_tasks();
+                comp.wayland().flush();
+            };
+            const auto wait_generation = [&](unsigned gen) {
+                for (int i = 0; i < 400 && log7.done_generation < gen; ++i) {
+                    ui_tasks();
+                    (void)wl_display_roundtrip(sh7.display);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                }
+                return log7.done_generation == gen;
+            };
+            constexpr const char* k_base =
+                "[cursor]\nsiez = 30\n[bindings]\n\"Super+Y\" = \"window.close\"\n";
+            const std::string bad = std::string(k_base) +
+                                    "[input.keyboard]\nlayout = \"lumen-no-such-layout\"\n";
+            const unsigned g = log7.done_generation;
+            write_config(bad.c_str());
+            comp.request_reload();
+            ui_tasks(); // generation g+1 starts; its keymap compiles on the worker
+            // Saved again while that compiles, and reloaded: queued behind it.
+            const std::string bad2 = bad + "[focus]\nmood = 1\n";
+            write_config(bad2.c_str());
+            comp.request_reload();
+            ui_tasks();
+            check(wait_generation(g + 2), "reload: the queued reload runs after the busy one");
+            read_notify();
+            const std::string want1 = "generation " + std::to_string(g + 1);
+            const std::string want2 = "generation " + std::to_string(g + 2);
+            check(readies.size() == 2 && readies[0].find(want1) != std::string::npos &&
+                      readies[1].find(want2) != std::string::npos,
+                  "reload: each SIGHUP gets READY=1 from its own generation (the queued one's "
+                  "after its files were read)");
+            if (readies.size() != 2)
+                for (const auto& r : readies)
+                    std::printf("      got: %s\n", r.c_str());
+            check(log7.applied && log7.errors == 1 && log7.warnings == 2 &&
+                      log7.all_lines.find("does not compile") != std::string::npos,
+                  "reload: the keymap error is still reported by a generation that did not "
+                  "change the layout");
+            comp.request_reload();
+            check(wait_generation(g + 3) && log7.errors == 1,
+                  "reload: a forced reload without changes still reports it");
+            write_config(k_base);
+            comp.request_reload();
+            check(wait_generation(g + 4) && log7.applied && log7.errors == 0 &&
+                      log7.warnings == 1,
+                  "reload: the layout removed, the error is gone");
+            unsetenv("NOTIFY_SOCKET");
+            ::close(ns);
+            std::remove(notify_path.c_str());
+        }
+        v7.detach();
+        zlm_shell_v1_destroy(sh7.shell);
+        wl_display_disconnect(sh7.display);
+    }
+    if (!cfg_path.empty()) {
+        std::remove(cfg_path.c_str());
+        ::rmdir(cfg_dir);
+    }
 
     v4.detach();
     zlm_shell_v1_destroy(sh3.shell);

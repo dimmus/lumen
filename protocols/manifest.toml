@@ -135,11 +135,13 @@ source = "wayland-protocols"
 priority = "P1"
 module = "lx.wayland.protocols.xdg_decoration"
 
+# P0: zlm_shell_v1 (v7 toplevel_workspace) names ext_workspace_handle_v1, so its glue links
+# against this protocol's interface tables.
 [[upstream.protocol]]
 name = "ext-workspace-v1"
 path = "staging/ext-workspace/ext-workspace-v1.xml"
 source = "wayland-protocols"
-priority = "P1"
+priority = "P0"
 module = "lx.wayland.protocols.ext_workspace"
 
 [[upstream.protocol]]

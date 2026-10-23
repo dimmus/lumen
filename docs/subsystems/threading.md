@@ -421,10 +421,69 @@ warp is a synthetic motion on UI.
 | Completions | render → UI | `capture_channel` again; render posts one UI task when it has some (and `tick_ui` drains them first). A GPU copy's or read-back's native fence goes to the readiness poller (one `fd_source`, keys above every content-update index); its wake sends `ready`, or posts the read-back's copy-out job back to render |
 | Lock | UI → render | A lock request bumps an atomic epoch; render cancels a content job issued in an older epoch instead of running it (it would copy a frame from before the lock), and UI decides again a completion carrying an older epoch (a worker read that finished after the request) |
 
+### Session, control socket and health (ADR 011)
+
+| Step | Thread | What |
+|------|--------|------|
+| Control socket | UI | sd-varlink on a private sd-event loop; its epoll fd is one `event_source` of the UI loop (`control_source`), dispatched with `sd_event_run(e, 0)` until idle — never blocking. Every method handler runs on the UI thread with full access to compositor state; JSON is built per request only. A reply or stream event queued outside a dispatch "kicks" the source for one more run |
+| Session environment | UI | The user bus (sd-bus) is attached to the same sd-event loop: `SetEnvironment` / `UpdateActivationEnvironment` are asynchronous (READY from the reply callback); only the `UnsetEnvironment` at exit is synchronous (1 s), after the loop ended |
+| GetHealth | UI → render → UI | The UI thread posts a task to render, which reads its own figures (import cache, last render tick, budget counter) and posts them back; the UI thread completes the report. No answer in 500 ms (an sd-event timer): the report says `render: critical` |
+| Watchdog | UI, render heartbeat | After each loop iteration the UI thread pings when a quarter of `WatchdogSec` passed, only if `render_ticks_` moved since the last ping or the render thread is not inside a tick (`render_in_tick_`, two relaxed stores per render tick). The control source's timeout carries the next ping only if nothing else wakes the loop first |
+| Signals | any → UI | SIGHUP sets an atomic and wakes the loop (`request_reload`); RELOADING/READY are sent from the UI thread |
+
+### Configuration (ADR 011 Part 2)
+
+| Step | Thread | What |
+|------|--------|------|
+| Watch | UI | One inotify fd (`lx.config:watch`) is an `fd_source` of the UI loop; a change arms a 100 ms one-shot timer (the debounce). It sleeps while the files do not change |
+| Read and parse | UI | Each layer read with `read(2)` (≤ 256 KiB, page cache) and parsed into a heap snapshot (~0.1 ms for a few KB); at start-up before the input and cursor helper threads are started, which take the keymap names and the cursor size from it |
+| Keymap | UI → worker → UI | A changed layout is compiled on the worker into its own `keyboard_keymap` (a fresh xkb context; ~10 ms); the UI task swaps it into the seat (`adopt_state`: locks by name, the locked layout clamped, held keys pressed again) and sends it to every keyboard. Keys meanwhile use the old keymap |
+| Cursor themes | UI → worker → UI | The themes for every output scale in use are read on the worker into a job object; the UI task moves them into the theme slots the cursor manager points at and asks for a frame |
+| Report | UI | Once the generation's jobs are done: the log, the shell's zlm v7 events, the control socket's Reload replies, READY after SIGHUP. A reload asked for meanwhile runs after it, and its Reload replies and READY come from that later generation (they must see the files as they were when asked) |
+| Without a worker | UI | (`worker_thread_count` 0, or before the threads start) the jobs run inline |
+
+### Workspaces (ADR 011 Part 3)
+
+Everything is UI-affinity and event-driven: the workspace model (`:workspaces`, fixed
+tables), the window manager's visibility changes (a tree container's `set_visible`, damage,
+the configure carrying `suspended`), ext-workspace's per-manager diff and `done`, and the
+shell bridge's `toplevel_workspace` all run inside the operation that changed something (a
+binding, an ext-workspace commit, a map or unmap, a hotplug) and are flushed at its end (the
+loop's after-dispatch hook flushes anything left). Nothing runs per frame; the render thread
+only sees fewer visible nodes in the snapshots it reads. A capture view still draws a hidden
+window's tree (`build_draw_list_into`, UI), and a hidden window's commits damage only the
+capture views.
+
+### Switching and snapping (ADR 011 Part 4)
+
+UI affinity throughout. A held action is a `keybindings` field and a `zlm_held_action_v1`
+resource; diverted keys go out from `on_input_key`, their repeat rides the binding-repeat
+timer (armed only while a key repeats). Snapping, edge zones and drag-to-restore are window
+manager state changed on input: an edge zone is one rect test on the tick that applies the
+coalesced move (`apply_grab`), the preview a scene node whose two 1×1 textures are staged once
+through the compositor's texture ops (the render thread draws them from the snapshot like any
+texture). Keyboard grabs warp the pointer through the compositor's `warp_pointer` (seat,
+cursor, then the window manager's motion path). In lumen-shell the switcher is part of its one
+thread: a timerfd slot for the open delay, the view's buffers allocated when it opens.
+
+### Notifications and the tray (ADR 011 Part 5)
+
+lumen-shell's one thread again; the compositor is not involved beyond its existing
+protocols. The user bus is one `sd_bus` whose fd joins the shell's `ppoll` set (its reply
+deadline lowers the timeout) and which is processed after every wake-up; every D-Bus method
+of the notification server and the watcher is answered inline, every reply (an item's
+`GetAll`, a menu's `GetLayout`, launches' `StartTransientUnit`) handled as it arrives. An
+item's change signals only mark it; one `GetAll` per marked item follows in the same loop
+iteration. Notification expiry is one timerfd slot (the next running deadline), a tooltip's
+delay another; both are armed only while due. The popups, menus and tooltips draw after the
+dispatch like the panel (at most one commit per frame callback each). The image-data
+conversion and the body's wrap run on the thread that received them — bounded (≤ 4096²
+validated, kept ≤ 96², ≤ 4 body lines of ≤ 8 KiB markup) — never per frame.
+
 ### CLI
 
 ```bash
-lumen-compositor [socket-name] [-f fps] [--scale S]
+lumen-compositor [socket-name] [-f fps] [--scale S] [--session] [--no-control]
 ```
 
 ## Process-level vs thread-level

@@ -21,13 +21,14 @@ export import :input_router;
 export import :output;
 export import :output_policy;
 export import :output_management;
-export import :toml_lite;
 export import :output_config_store;
+export import :config_apply;
 export import :buffer_lifecycle;
 export import :protocol_managers;
 export import :hotplug;
 export import :protocols_p0;
 export import :wm;
+export import :workspaces;
 export import :positioner;
 export import :popup;
 export import :decoration;
@@ -50,6 +51,7 @@ export import :foreign_registry;
 export import :pointer_constraints;
 export import :capture;
 export import :capture_engine;
+export import :control;
 
 export namespace lx::compositor {
 
@@ -103,6 +105,15 @@ struct config {
     /// laid out left to right, each with its own frame clock. Null: the display's
     /// connectors, or one HEADLESS-1 without a display.
     const char* virtual_outputs = nullptr;
+    /// Started as the session's display server by systemd (`--session`, the
+    /// lumen-compositor.service unit): once the socket is served, the session environment
+    /// (WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP, …) is exported to the user manager and D-Bus
+    /// activation, then READY=1 is sent; it is unset again at the end. Windows mapping
+    /// before the shell's panel are placed once it has reserved its strip.
+    bool session_mode = false;
+    /// Serve the control socket ($XDG_RUNTIME_DIR/<socket>.varlink, io.lumen.Compositor:
+    /// lumen-ctl). lumen-compositor turns it on unless `--no-control`.
+    bool control_socket = false;
     /// Row-band threads for the CPU composite path, in addition to the render thread.
     ///
     /// Defaults to 0 on measurement, not principle: the fullscreen opaque case is a row
@@ -152,6 +163,9 @@ public:
     [[nodiscard]] lx::result<void> start();
     [[nodiscard]] int run();
     void request_stop();
+    /// Re-read the configuration (SIGHUP: `systemctl --user reload`), from the loop.
+    /// Async-signal-safe.
+    void request_reload();
     /// Debug aid: the next frame is repainted in full, read back and written as a PPM to
     /// $LUMEN_SCREENSHOT_DIR (else $XDG_RUNTIME_DIR) — GL path only. Async-signal-safe
     /// (lumen-compositor maps SIGUSR1 to it).
@@ -206,8 +220,9 @@ public:
     /// exactly as for a uevent. Without a KMS display the outputs it adds are virtual
     /// (composite-only), so headless tests reach every hotplug path. UI affinity.
     void simulate_connector_scan(const lx::drm::connector_scan& scan);
-    /// Runs the work other threads posted to the UI thread (the event loop does this between
-    /// dispatches; a test that drives `tick_ui` itself calls it). UI affinity.
+    /// Runs the work other threads posted to the UI thread, and a reload `request_reload`
+    /// asked for (the event loop does this between dispatches; a test that drives `tick_ui`
+    /// itself calls it). UI affinity.
     void run_posted_ui_tasks();
     /// Wakes the render thread and returns once it has run a tick (what `on_vsync` does after
     /// `tick_ui`; for tests that drive `tick_ui` themselves). False after 2 s without one.

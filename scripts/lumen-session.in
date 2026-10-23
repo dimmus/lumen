@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# lumen-session — start a Lumen session: from a text console login (run it after logging
+# in on a VT) or from a display manager (share/wayland-sessions/lumen.desktop runs it).
+#
+#   lumen-session              start the session; returns when it ends
+#   lumen-session --cleanup    undo what a session that died with this script left in the
+#                              user manager's environment
+#
+# With a systemd user manager (the normal case) the session is a set of user units
+# (design-session-and-wm S.1):
+#   lumen-compositor.service   the display server; BindsTo=graphical-session.target and
+#                              pulls in lumen-shell.service and xdg-desktop-autostart.target
+#   lumen-shell.service        the panel and launcher, restarted by systemd if it crashes
+#   lumen-shutdown.target      started afterwards: stops whatever of the session is left
+# This script imports the login's environment into the user manager (recording what it
+# changes), runs `systemctl --user --wait start lumen-compositor.service`, and when the
+# session has ended puts the manager's environment back exactly as it was.
+#
+# Without a user manager (containers, distributions without systemd) it runs the
+# compositor and the shell itself, restarts the shell when it crashes, and starts the XDG
+# autostart applications; the session ends when the compositor exits.
+#
+# Environment it reads: LUMEN_DISPLAY (the Wayland socket name, default lumen-0); the
+# session's XDG_CURRENT_DESKTOP (default Lumen) and XDG_SESSION_DESKTOP (default lumen).
+set -u
+
+LUMEN_BINDIR="@LUMEN_BINDIR@"
+PROG="${0##*/}"
+
+say() { echo "$PROG: $*" >&2; }
+
+# Never imported into the user manager: per-process, per-terminal or per-login-tool
+# variables, and the display variables the compositor owns.
+DENY_RE='^(PWD|OLDPWD|SHLVL|_|TERM|COLORTERM|TERM_PROGRAM.*|MOTD_SHOWN|SSH_.*|INVOCATION_ID|JOURNAL_STREAM|NOTIFY_SOCKET|SYSTEMD_EXEC_PID|MANAGERPID|LISTEN_.*|WATCHDOG_.*|MAIL|LS_COLORS|WAYLAND_DISPLAY|DISPLAY|HOSTTYPE|OSTYPE|MACHTYPE|LUMEN_SOCKET|BASH_.*|COLUMNS|LINES|SHELLOPTS|BASHOPTS|PS[0-9]|HISTFILE|HISTSIZE|HISTFILESIZE|HISTCONTROL|LESSOPEN|LESSCLOSE)$'
+# Owned by the compositor (it exports and unsets them): recorded, so a crash that skips the
+# compositor's own unset is still undone here.
+OWNED=(WAYLAND_DISPLAY LUMEN_SOCKET DISPLAY XDG_SESSION_TYPE XDG_CURRENT_DESKTOP
+       XDG_SESSION_DESKTOP XCURSOR_THEME XCURSOR_SIZE)
+
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STATE_DIR="$RUNTIME/lumen"
+RECORD="$STATE_DIR/session-env"
+
+# ── The manager's environment: record, import, restore ───────────────────────
+
+# Prints NAME=VALUE for every variable of the user manager whose value systemctl prints
+# unescaped. A value it had to escape ($'…') is reported as NAME with no '=': such a
+# variable is left alone (neither imported over nor restored), so nothing is ever set to a
+# misread value.
+manager_env() {
+  local line
+  while IFS= read -r line; do
+    case "$line" in
+      *=\$\'*) echo "${line%%=*}" ;;
+      *=*) echo "$line" ;;
+    esac
+  done < <(systemctl --user show-environment 2>/dev/null)
+}
+
+# record NAMES...: writes the previous value (NAME=VALUE) or absence (-NAME) of each name
+# into $RECORD; names whose value cannot be read exactly are dropped from IMPORTABLE.
+declare -a IMPORTABLE=()
+record_env() {
+  local env n line found
+  env=$(manager_env)
+  umask 077
+  mkdir -p "$STATE_DIR"
+  : >"$RECORD.new"
+  IMPORTABLE=()
+  for n in "$@"; do
+    found=""
+    while IFS= read -r line; do
+      if [[ "$line" == "$n" ]]; then found="!"; break; fi
+      if [[ "$line" == "$n="* ]]; then found="$line"; break; fi
+    done <<<"$env"
+    [[ "$found" == "!" ]] && continue
+    if [[ -n "$found" ]]; then printf '%s\n' "$found"; else printf -- '-%s\n' "$n"; fi >>"$RECORD.new"
+    IMPORTABLE+=("$n")
+  done
+  mv -f "$RECORD.new" "$RECORD"
+}
+
+restore_env() {
+  [[ -f "$RECORD" ]] || return 0
+  local line unset_names=() set_values=()
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" == -* ]]; then unset_names+=("${line#-}"); else set_values+=("$line"); fi
+  done <"$RECORD"
+  (( ${#unset_names[@]} )) && systemctl --user unset-environment "${unset_names[@]}"
+  (( ${#set_values[@]} )) && systemctl --user set-environment "${set_values[@]}"
+  rm -f "$RECORD"
+  rmdir "$STATE_DIR" 2>/dev/null
+}
+
+# The login's variables worth giving the session (valid names, not denied).
+login_names() {
+  local n
+  while IFS= read -r n; do
+    [[ "$n" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+    [[ "$n" =~ $DENY_RE ]] && continue
+    echo "$n"
+  done < <(compgen -e)
+}
+
+# ── Fallback: no systemd user manager ────────────────────────────────────────
+
+FB_COMP=""; FB_SHELL=""
+fallback_stop() {
+  [[ -n "$FB_SHELL" ]] && kill -TERM "$FB_SHELL" 2>/dev/null
+  [[ -n "$FB_COMP" ]] && kill -TERM "$FB_COMP" 2>/dev/null
+  wait 2>/dev/null
+}
+
+# True when any desktop of $XDG_CURRENT_DESKTOP (colon-separated) is in the Desktop Entry
+# list $1 (';'-separated, the last ';' optional), as OnlyShowIn/NotShowIn are matched.
+desktop_listed() {
+  local list=";$1;" d desktops=()
+  IFS=: read -r -a desktops <<<"${XDG_CURRENT_DESKTOP:-}"
+  for d in "${desktops[@]}"; do
+    [[ -n "$d" && "$list" == *";$d;"* ]] && return 0
+  done
+  return 1
+}
+
+# Starts the XDG autostart entries for this desktop (Desktop Application Autostart
+# Specification): $XDG_CONFIG_HOME/autostart over $XDG_CONFIG_DIRS/*/autostart by file name;
+# Hidden, OnlyShowIn/NotShowIn, TryExec and X-GNOME-Autostart-enabled honoured. Exec field
+# codes are dropped (nothing is opened at start-up).
+fallback_autostart() {
+  local dirs=() d f id seen=" " key val exec hidden only not tryexec enabled
+  IFS=: read -r -a dirs <<<"${XDG_CONFIG_DIRS:-/etc/xdg}"
+  dirs=("${XDG_CONFIG_HOME:-$HOME/.config}" "${dirs[@]}")
+  for d in "${dirs[@]}"; do
+    for f in "$d"/autostart/*.desktop; do
+      [[ -f "$f" ]] || continue
+      id=${f##*/}
+      [[ "$seen" == *" $id "* ]] && continue
+      seen+="$id "
+      exec=""; hidden=""; only=""; not=""; tryexec=""; enabled="true"
+      local in_main=0
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+          "[Desktop Entry]") in_main=1; continue ;;
+          "["*) in_main=0; continue ;;
+        esac
+        (( in_main )) || continue
+        key=${line%%=*}; val=${line#*=}
+        key=${key%"${key##*[![:space:]]}"}; val=${val#"${val%%[![:space:]]*}"}
+        case "$key" in
+          Exec) exec=$val ;;
+          Hidden) hidden=$val ;;
+          OnlyShowIn) only=$val ;;
+          NotShowIn) not=$val ;;
+          TryExec) tryexec=$val ;;
+          X-GNOME-Autostart-enabled) enabled=$val ;;
+        esac
+      done <"$f"
+      [[ "$hidden" == true || "$enabled" == false || -z "$exec" ]] && continue
+      if [[ -n "$only" ]] && ! desktop_listed "$only"; then continue; fi
+      if [[ -n "$not" ]] && desktop_listed "$not"; then continue; fi
+      if [[ -n "$tryexec" ]] && ! command -v "$tryexec" >/dev/null 2>&1; then continue; fi
+      exec=$(sed -e 's/%[fFuUdDnNickvm]//g' -e 's/%%/%/g' <<<"$exec")
+      say "autostart: $id"
+      setsid -f sh -c "exec $exec" </dev/null >/dev/null 2>&1
+    done
+  done
+}
+
+run_fallback() {
+  say "no systemd user manager: running the compositor and the shell directly"
+  local display="${LUMEN_DISPLAY:-lumen-0}" restarts=() now rc
+  export XDG_SESSION_TYPE=wayland
+  "$LUMEN_BINDIR/lumen-compositor" "$display" &
+  FB_COMP=$!
+  trap 'fallback_stop; exit 130' INT TERM HUP
+  # Ready once the control socket answers (built without lumen-ctl, libsystemd < 257: once
+  # the Wayland socket exists).
+  for _ in $(seq 1 100); do
+    if [[ -x "$LUMEN_BINDIR/lumen-ctl" ]]; then
+      "$LUMEN_BINDIR/lumen-ctl" --socket "$RUNTIME/$display.varlink" version >/dev/null 2>&1 && break
+    elif [[ -S "$RUNTIME/$display" ]]; then
+      break
+    fi
+    kill -0 "$FB_COMP" 2>/dev/null || break
+    sleep 0.05
+  done
+  if ! kill -0 "$FB_COMP" 2>/dev/null; then
+    wait "$FB_COMP"; rc=$?
+    say "the compositor did not start (exit $rc)"
+    return 1
+  fi
+  export WAYLAND_DISPLAY="$display" LUMEN_SOCKET="$RUNTIME/$display.varlink"
+  unset DISPLAY
+  fallback_autostart
+  # The shell, restarted when it fails (at most 5 times in 30 s, as the unit does); the
+  # session ends with the compositor.
+  local done_pid st comp_rc=""
+  while [[ -z "$comp_rc" ]]; do
+    "$LUMEN_BINDIR/lumen-shell" &
+    FB_SHELL=$!
+    while :; do
+      done_pid=""
+      wait -n -p done_pid "$FB_SHELL" "$FB_COMP"
+      st=$?
+      [[ -n "$done_pid" ]] && break # else a trapped signal interrupted the wait
+    done
+    if [[ "$done_pid" == "$FB_COMP" ]]; then
+      comp_rc=$st
+      FB_COMP=""
+      break
+    fi
+    FB_SHELL=""
+    (( st == 0 )) && break # the shell ended the session's way (a logout)
+    now=$(date +%s)
+    restarts+=("$now")
+    local recent=() t
+    for t in "${restarts[@]}"; do (( now - t < 30 )) && recent+=("$t"); done
+    restarts=("${recent[@]}")
+    if (( ${#restarts[@]} > 5 )); then
+      say "the shell keeps failing; the session continues without it"
+      break
+    fi
+    sleep 0.3
+  done
+  if [[ -z "$comp_rc" ]]; then
+    wait "$FB_COMP"
+    comp_rc=$?
+    FB_COMP=""
+  fi
+  fallback_stop
+  return "$comp_rc"
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+  --cleanup) restore_env; exit 0 ;;
+  -h|--help) sed -n '2,/^set -u/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
+esac
+
+# Through the login shell, once, so a display-manager start sees ~/.profile's exports as a
+# console login does (niri-session's rule).
+if [[ "${1:-}" != -l ]]; then
+  case "${SHELL:-}" in
+    ""|*/false|*/nologin) ;;
+    *) exec "$SHELL" -l -c 'exec "$0" -l "$@"' "$0" "$@" ;;
+  esac
+fi
+[[ "${1:-}" == -l ]] && shift
+
+# A Wayland or X display already in this environment: this is a nested start, which a
+# session launcher does not do (run lumen-compositor directly for that).
+if [[ -n "${WAYLAND_DISPLAY:-}" && -S "$RUNTIME/${WAYLAND_DISPLAY#"$RUNTIME/"}" ]]; then
+  say "a Wayland session is already running here (WAYLAND_DISPLAY=$WAYLAND_DISPLAY)"
+  exit 2
+fi
+unset WAYLAND_DISPLAY DISPLAY
+
+# On a console the session must be the one in front: logind gives the display and the
+# input devices only to the active session.
+if [[ -n "${XDG_SESSION_ID:-}" ]] && command -v loginctl >/dev/null; then
+  if [[ "$(loginctl show-session "$XDG_SESSION_ID" -p Active --value 2>/dev/null)" == no ]]; then
+    say "session $XDG_SESSION_ID is not the active one on its seat; switch to its VT first"
+    exit 2
+  fi
+fi
+
+: "${XDG_CURRENT_DESKTOP:=Lumen}"
+: "${XDG_SESSION_DESKTOP:=lumen}"
+export XDG_CURRENT_DESKTOP XDG_SESSION_DESKTOP XDG_SESSION_TYPE=wayland
+
+if ! command -v systemctl >/dev/null || ! systemctl --user show-environment >/dev/null 2>&1; then
+  run_fallback
+  exit $?
+fi
+
+if systemctl --user -q is-active graphical-session.target; then
+  say "a graphical session is already running for $(id -un) (graphical-session.target is active)"
+  exit 2
+fi
+
+# A session left behind by a crash of this script is undone first.
+restore_env
+
+systemctl --user reset-failed lumen-compositor.service lumen-shell.service 2>/dev/null
+
+# A portal frontend (or backend) still running from before would keep the old session's
+# environment: stopped, to be D-Bus activated again with this one's.
+for unit in xdg-desktop-portal.service xdg-desktop-portal-lumen.service \
+            xdg-desktop-portal-wlr.service xdg-desktop-portal-gtk.service; do
+  systemctl --user -q is-active "$unit" && systemctl --user stop "$unit"
+done
+
+mapfile -t names < <(login_names)
+declare -A listed=()
+all=()
+for n in "${names[@]}" "${OWNED[@]}"; do
+  [[ -n "${listed[$n]:-}" ]] && continue
+  listed[$n]=1
+  all+=("$n")
+done
+record_env "${all[@]}"
+# Of the owned ones only those the login itself has (XDG_CURRENT_DESKTOP, …): the
+# compositor exports the display variables.
+import=()
+for n in "${IMPORTABLE[@]}"; do
+  [[ -n "${!n+x}" ]] && import+=("$n")
+done
+if (( ${#import[@]} )); then
+  systemctl --user import-environment "${import[@]}"
+  if command -v dbus-update-activation-environment >/dev/null; then
+    dbus-update-activation-environment "${import[@]}" 2>/dev/null
+  fi
+fi
+
+# The session runs until the compositor's unit stops: a logout, the compositor exiting,
+# or a hang-up (the terminal closed) or termination of this script, which stops it.
+systemctl --user --wait start lumen-compositor.service &
+waiter=$!
+trap 'systemctl --user stop --no-block lumen-compositor.service' INT TERM HUP
+while :; do
+  wait "$waiter"
+  rc=$?
+  kill -0 "$waiter" 2>/dev/null || break
+done
+
+trap - INT TERM HUP
+systemctl --user start --job-mode=replace-irreversibly lumen-shutdown.target
+restore_env
+
+if (( rc != 0 )); then
+  result=$(systemctl --user show -p Result --value lumen-compositor.service 2>/dev/null)
+  say "Lumen exited: ${result:-error} — journalctl --user -b -u lumen-compositor"
+  exit 1
+fi
+exit 0

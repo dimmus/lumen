@@ -13,6 +13,7 @@ module;
 #include <dirent.h>
 #include <linux/sync_file.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #endif
@@ -28,6 +29,8 @@ import lx.wayland.server;
 import lx.scene;
 import lx.input;
 import lx.session;
+import lx.health;
+import lx.config;
 
 module lx.compositor;
 
@@ -247,6 +250,14 @@ struct output_ui {
     lx::runtime::clock_time response_ns[k_response_window]{};
     unsigned response_count = 0;
     unsigned response_next = 0;
+    /// Health (`lx.health`): content frames presented, those that landed a refresh period
+    /// or more after the vblank their repaint aimed at, and the last 128 of them. The aim
+    /// is noted when a tick serves the output (`aim_frame` its frame index).
+    unsigned long long presented = 0;
+    unsigned long long missed = 0;
+    lx::health::miss_ring recent{};
+    lx::runtime::clock_time aim_ns = 0;
+    unsigned aim_frame = 0;
 };
 
 struct compositor_impl {
@@ -274,6 +285,9 @@ struct compositor_impl {
     scene::container_node background_layer_{};
     scene::container_node bottom_layer_{};
     scene::container_node windows_layer_{};
+    /// The edge-snap preview while a window is dragged to an edge (design-session-and-wm
+    /// K.4): above the windows, under a panel.
+    scene::container_node snap_preview_layer_{};
     scene::container_node top_layer_{};
     /// Fullscreen windows over their outputs' black backdrops (M11): above a panel, under
     /// the overlay layer and popups (sway).
@@ -882,8 +896,12 @@ struct compositor_impl {
     xcursor_theme prefetched_theme_{};
     unsigned prefetched_scale120_ = 0;
     void begin_cursor_theme();
-    /// XCURSOR_SIZE, else 24: the logical cursor size.
-    [[nodiscard]] static unsigned cursor_base_px();
+    /// config.toml cursor.size, else XCURSOR_SIZE, else 24: the logical cursor size.
+    [[nodiscard]] unsigned cursor_base_px() const;
+    /// config.toml cursor.theme, else null ($XCURSOR_THEME, else "default").
+    [[nodiscard]] const char* cursor_theme_arg() const {
+        return cursor_theme_name_[0] ? cursor_theme_name_ : nullptr;
+    }
     unsigned cursor_theme_count_ = 0;
     /// The scale (120ths) each theme was loaded for, and XCURSOR_SIZE (logical px).
     unsigned cursor_theme_scale120_[k_cursor_scales]{};
@@ -1133,6 +1151,7 @@ struct compositor_impl {
         (void)scene.root().add(&background_layer_);
         (void)scene.root().add(&bottom_layer_);
         (void)scene.root().add(&windows_layer_);
+        (void)scene.root().add(&snap_preview_layer_);
         (void)scene.root().add(&top_layer_);
         (void)scene.root().add(&fullscreen_layer_);
         (void)scene.root().add(&overlay_shell_layer_);
@@ -1224,6 +1243,184 @@ struct compositor_impl {
     static constexpr lx::runtime::clock_time k_logout_grace_ns = 5'000'000'000ull;
     bool logout_active_ = false;
     lx::runtime::clock_time logout_deadline_ns_ = 0;
+
+    // ── the session, the control socket, health (design-session-and-wm Part 1; UI) ──
+    /// io.lumen.Compositor on <socket>.varlink, and the private sd-event loop the user bus
+    /// shares: one fd in the UI loop (`control_source_`).
+    control_server control_{};
+    std::unique_ptr<lx::runtime::event_source> control_source_{};
+    /// The environment exported to the user manager in `--session` mode.
+    session::user_environment user_env_{};
+    bool ready_sent_ = false;
+    lx::runtime::clock_time started_ns_ = 0;
+    /// The systemd watchdog (WatchdogSec=): pinged from wake-ups that happen anyway, at most
+    /// every quarter period, and only while the render thread is alive (its heartbeat moved,
+    /// or it is idle). 0: off.
+    lx::runtime::clock_time watchdog_period_ns_ = 0;
+    lx::runtime::clock_time watchdog_next_ns_ = 0;
+    unsigned watchdog_render_ticks_ = 0;
+    bool watchdog_withheld_ = false;
+    /// While `lumen-ctl monitor` subscribes: the health level is re-evaluated this often
+    /// (only then; nobody watching costs nothing).
+    static constexpr lx::runtime::clock_time k_health_poll_ns = 2'000'000'000ll;
+    lx::runtime::clock_time next_health_poll_ns_ = 0;
+    /// Render: inside `tick_render` (the heartbeat's "busy" half).
+    std::atomic<bool> render_in_tick_{false};
+    /// SIGHUP arrived (request_reload); handled after the next dispatch.
+    std::atomic<bool> reload_requested_{false};
+    // ── The configuration file (design-session-and-wm Part C) ──
+    /// The snapshot in use, its bytes, the generation's diagnostics, the inotify watch.
+    config_state config_{};
+    std::unique_ptr<runtime::fd_source> config_watch_source_{};
+    /// One timer: the 100 ms debounce after the watch saw a change.
+    std::unique_ptr<runtime::timer_source> config_timer_{};
+    static constexpr lx::runtime::clock_time k_config_debounce_ns = 100'000'000ll;
+    /// A generation is being applied (its keymap or cursor job on the worker); a reload
+    /// asked for meanwhile runs after it (`config_again_`, forced when any asker was).
+    bool config_busy_ = false;
+    bool config_again_ = false;
+    bool config_again_force_ = false;
+    unsigned config_jobs_ = 0;
+    /// SIGHUP's reload: READY=1 goes out when the generation is applied.
+    bool config_sighup_ = false;
+    /// Reload calls of the control socket waiting for the generation.
+    std::inplace_vector<unsigned, 8> config_tokens_{};
+    /// A SIGHUP and Reload calls that came while a generation was busy: they wait for the
+    /// queued reload's generation (they must see the files as they are now, not the bytes
+    /// the busy generation read).
+    bool config_sighup_next_ = false;
+    std::inplace_vector<unsigned, 8> config_tokens_next_{};
+    /// The generation the shell's notification state was last told about (zlm v7).
+    unsigned config_bytes_generation_ = 0;
+    /// A keymap compiled on the worker for a reload.
+    struct keymap_job {
+        lx::config::keyboard_settings settings{};
+        lx::input::keyboard_keymap keymap{};
+        char error[192]{};
+        bool ok = false;
+        unsigned compile_us = 0;
+    };
+    std::unique_ptr<keymap_job> keymap_job_{};
+    /// Cursor themes read on the worker for a reload (one per scale in use).
+    struct cursor_job {
+        char theme[64]{};
+        unsigned base_px = 24;
+        unsigned count = 0;
+        unsigned scale120[k_cursor_scales]{};
+        xcursor_theme themes[k_cursor_scales]{};
+    };
+    std::unique_ptr<cursor_job> cursor_job_{};
+    /// Why the configured keymap does not compile; empty while it is the one in use. Each
+    /// generation reports it (and an accepted one compiles it again: a layout installed
+    /// since then is picked up), so the problem stays visible until it is fixed.
+    char keymap_error_[192]{};
+    /// The keymap in use is the system default (the configured one failed at start).
+    bool keymap_default_ = false;
+    /// Adds the configured keymap's compile error to this generation's diagnostics.
+    void report_keymap_error();
+    /// The matcher's table (config bindings minus unavailable ones).
+    std::inplace_vector<binding_entry, keybindings::k_max_bindings> binding_table_{};
+    /// A binding with `repeat` held: it fires again at the keyboard's repeat rate.
+    std::unique_ptr<runtime::timer_source> binding_repeat_timer_{};
+    const binding_entry* repeat_binding_ = nullptr;
+    binding_entry repeat_entry_{};
+    unsigned repeat_code_ = 0;
+    /// The repeating key is a held action's (`key` again at the repeat rate) or a keyboard
+    /// move/resize's (the window manager's step again), not `repeat_binding_`.
+    enum class key_repeat : unsigned char { binding, hold, wm };
+    key_repeat repeat_kind_ = key_repeat::binding;
+    key_input repeat_in_{};
+    lx::input::key_event repeat_event_{};
+    /// Starts the repeat of `kind` for the key of `event` at the keyboard's repeat delay.
+    void start_key_repeat(key_repeat kind, const lx::input::key_event& event, const key_input& in);
+    /// A held action (design-session-and-wm K.1): `key` with the binding it would run.
+    void send_hold_key(const key_input& in, unsigned time_ms);
+    /// Ends the hold without the user letting go (lock, VT switch, a grab): `cancelled`.
+    void cancel_hold(const char* why);
+    /// Cursor theme name from the configuration ("" = $XCURSOR_THEME).
+    char cursor_theme_name_[64]{};
+
+    enum class reload_cause : unsigned char { watch, sighup, control, action, start };
+    /// Before the input and the cursor are set up: locate, read, parse (generation 1).
+    void load_initial_config();
+    /// After the protocols exist: bindings, focus, repeat, the device hook.
+    void apply_initial_config();
+    void request_config_reload(reload_cause cause, unsigned control_token);
+    void run_config_reload(bool force);
+    void start_keymap_job();
+    void finish_keymap_job();
+    void start_cursor_job();
+    void finish_cursor_job();
+    void config_job_done();
+    /// The generation is applied (or rejected): log, tell the shell, the control socket,
+    /// systemd; run a queued reload.
+    void finish_config_generation();
+    void install_bindings();
+    void apply_focus_policy();
+    /// config.toml [windows]: edge snapping, its preview, drag-to-restore (Part K).
+    void apply_window_config();
+    void apply_repeat();
+    /// zlm v7 config + diagnostics + done to `shell_resource` (null: every v7 shell).
+    void send_config_to_shell(void* shell_resource, bool with_bytes);
+    void export_cursor_environment();
+    /// Executes a binding's or lumen-ctl's action. `input`: a key or button triggered it
+    /// (the shell gets an input serial). `message` explains an invalid_argument.
+    control_action_result run_action(lx::config::action_id action, unsigned argument,
+                                     unsigned time_ms, bool input, const char* source,
+                                     const char*& message);
+    void stop_binding_repeat();
+    static void config_watch_callback();
+    static void config_timer_callback();
+    static void binding_repeat_callback();
+    [[nodiscard]] wm_button_binding on_button_binding(unsigned button, unsigned time_ms);
+    /// One timer for the session's bounded holds: the zone hold (5 s after the shell went)
+    /// and the placement hold (750 ms after READY while no shell has bound).
+    std::unique_ptr<runtime::timer_source> session_timer_{};
+    static constexpr lx::runtime::clock_time k_zone_hold_ns = 5'000'000'000ll;
+    static constexpr lx::runtime::clock_time k_placement_hold_ns = 750'000'000ll;
+    lx::runtime::clock_time zone_hold_until_ = 0;
+    lx::runtime::clock_time placement_hold_until_ = 0;
+    /// Windows that mapped during the placement hold, fitted into the usable area once the
+    /// shell's zones are known.
+    std::inplace_vector<lx::toplevel_id, 16> placement_held_{};
+    /// The health level last streamed to subscribers.
+    lx::health::level streamed_health_ = lx::health::level::unknown;
+
+    /// `start`: the control socket, the environment export and READY.
+    void start_session();
+    void on_environment_exported(bool ok);
+    void send_ready(const char* why);
+    /// `run`, after the loop: the environment unset, the control socket removed.
+    void end_session();
+    /// After each dispatch: the watchdog ping when due (cheap when not).
+    void maybe_ping_watchdog(lx::runtime::clock_time now);
+    /// Until the control source must run without its fd (the next watchdog ping); -1 none.
+    [[nodiscard]] lx::runtime::clock_time control_timeout_ns(lx::runtime::clock_time now) const;
+    void handle_reload_request();
+    /// The control host: GetHealth asks the render thread, then answers.
+    void begin_health(unsigned token);
+    void answer_health(unsigned token, bool render_answered, unsigned render_ms,
+                       unsigned cache_used, unsigned cache_capacity, unsigned render_us,
+                       unsigned long long render_over);
+    void fill_control_window(const toplevel_record& rec, control_window& out) const;
+    /// Every workspace for the control socket (ListWorkspaces); returns how many.
+    unsigned fill_control_workspaces(control_workspace* out, unsigned cap) const;
+    /// The workspaces changed (the window manager's observer): `workspace` /
+    /// `workspace-removed` events for what differs from the last ones streamed.
+    void publish_workspaces();
+    /// What the control stream last said of each workspace (while it has subscribers).
+    control_workspace published_ws_[k_max_workspaces]{};
+    unsigned published_ws_count_ = 0;
+    /// config.toml [workspaces] to the window manager.
+    void apply_workspace_config();
+    [[nodiscard]] control_action_result run_control_action(const char* action,
+                                                          const char* argument,
+                                                          const char*& message);
+    void on_shell_bound(void* client_native);
+    void rearm_session_timer();
+    static void session_timer_callback();
+    /// The placement hold ended: held windows are fitted into their usable area.
+    void end_placement_hold(const char* why);
     /// Bring up CPU-writable dumb-buffer scanout. Requires DRM master.
     [[nodiscard]] lx::result<void> setup_cpu_present();
     /// Bring up EGL/GBM for the GL composite (targets per output from `create_targets`).
@@ -1295,6 +1492,10 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
               (named.alt ? key_mod_alt : 0u) | (named.super ? key_mod_super : 0u);
     // The seat already counts this key on a press (and no longer on a release).
     in.others_held = seat.pressed_count() > (event.pressed ? 1u : 0u) || wm_.buttons_down() > 0;
+    // A repeating binding (or held-action key, or keyboard-move arrow) stops when its key
+    // goes up or another key goes down.
+    if (repeat_code_ && (event.pressed || event.evdev_keycode == repeat_code_))
+        stop_binding_repeat();
 
     // 0. Activity, before any binding or routing, so a consumed key still counts (I2). A
     //    release made by the device going away is not the user. A press that woke the
@@ -1332,16 +1533,73 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
         keys_.reset();
         return;
     }
-    // 2. Keys the window manager claims (Escape during a grab or drag).
+    // 2. Keys the window manager claims (Escape during a grab or drag; every press during a
+    //    keyboard move or resize, whose arrows repeat).
     if (wm_.on_key(event)) {
         keys_.reset();
+        if (event.pressed && wm_.grab_active() && wm_.grab().keyboard)
+            start_key_repeat(key_repeat::wm, event, in);
         return;
     }
-    // 3. The shell's grabs: never during a move, resize or drag, never while paused; while
-    //    the focused surface inhibits shortcuts, only the `not_inhibitable` ones.
+    // 2b. A held action (zlm v7, design-session-and-wm K.1): while the binding's modifier is
+    //     down every key press goes to the shell's hold instead of the focused client — which
+    //     keeps the keyboard focus and sees the modifiers as they are. Letting go of the
+    //     modifier ends it; that release still reaches the client, which saw the press.
+    if (keys_.hold_active()) {
+        switch (keys_.on_hold_key(in)) {
+        case keybindings::hold_step::divert:
+            send_hold_key(in, event.time_ms);
+            start_key_repeat(key_repeat::hold, event, in);
+            return;
+        case keybindings::hold_step::released:
+            if (void* hold = keys_.end_hold(); hold && p0_.send_hold_released)
+                p0_.send_hold_released(hold, event.time_ms);
+            if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.bindings",
+                                                "held action released");
+            break;
+        case keybindings::hold_step::none: break;
+        }
+    }
+    // 3. The configured bindings (config.toml [bindings]), then the shell's legacy grabs
+    //    (zlm v4): never during a move, resize or drag, never while paused; while locked only
+    //    `allow-when-locked` bindings; while the focused surface inhibits shortcuts, only
+    //    `allow-when-inhibited` bindings and `not_inhibitable` grabs.
     const bool wm_busy = wm_.grab_active() || wm_.drag_active();
     const bool inhibited = shortcuts_inhibited(p0_);
     if (!wm_busy && display_gate_.load(std::memory_order_relaxed) == 0) {
+        if (const key_decision d = keys_.match_binding(in, inhibited); d.consume) {
+            // A copy: the action may replace the table (session.reload-config).
+            const binding_entry b = *d.binding;
+            // A held action (Alt+Tab): the shell gets a hold for as long as the binding's
+            // modifier stays down (K.1). With no v7 shell it runs as an ordinary action.
+            if (const auto& info = lx::config::action(b.action);
+                info.held && keys_.shell_actions() && p0_.send_held_action) {
+                if (void* hold = p0_.send_held_action(info.name, "", event.time_ms)) {
+                    keys_.begin_hold(b.keys.mods, hold);
+                    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+                        lx::trace::logger::global().logf(lx::trace::level::debug,
+                                                         "compositor.bindings",
+                                                         "held action {} begins (modifier 0x{:x})",
+                                                         info.name, keys_.hold_mods());
+                    return;
+                }
+            }
+            const char* message = "";
+            (void)run_action(b.action, b.argument, event.time_ms, true, "binding", message);
+            const auto& kb = config_.current().keyboard;
+            if ((b.options & lx::config::bo_repeat) && binding_repeat_timer_ &&
+                kb.repeat_rate > 0) {
+                repeat_entry_ = b;
+                repeat_binding_ = &repeat_entry_;
+                repeat_kind_ = key_repeat::binding;
+                repeat_code_ = event.evdev_keycode;
+                binding_repeat_timer_->schedule_at(
+                    now_ns() + static_cast<runtime::clock_time>(kb.repeat_delay) * 1'000'000ll);
+                binding_repeat_timer_->set_enabled(true);
+            }
+            return;
+        }
         if (const key_decision d = keys_.match_grab(in, inhibited); d.consume) {
             if (p0_.fire_key_grab)
                 p0_.fire_key_grab(d.grab, event.time_ms);
@@ -1355,8 +1613,14 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
         keys_.reset();
     void* tap = keys_.observe_tap(in, inhibited);
     input_router_.send_key(event, seat);
-    if (tap && !wm_busy && p0_.fire_key_grab)
+    if (!tap || wm_busy)
+        return;
+    if (const binding_entry* b = keys_.tap_binding(tap)) {
+        const char* message = "";
+        (void)run_action(b->action, b->argument, event.time_ms, true, "binding", message);
+    } else if (p0_.fire_key_grab) {
         p0_.fire_key_grab(tap, event.time_ms);
+    }
 }
 
 void compositor_impl::request_vt_switch(unsigned vt) {
@@ -1420,6 +1684,34 @@ private:
     lx::session::logind_session* session_;
     void (*after_)(void*) = nullptr;
     void* user_ = nullptr;
+    bool ready_ = false;
+};
+
+/// The control socket's sd-event loop (and the user bus attached to it) as one source of
+/// the UI loop: its epoll fd, plus a deadline only when the watchdog's next ping is due and
+/// nothing else woke the loop first (on an idle desktop the 1 Hz housekeeping tick does).
+class control_source final : public lx::runtime::event_source {
+public:
+    explicit control_source(compositor_impl& impl) : impl_{&impl} {}
+    bool prepare(lx::runtime::clock_time& timeout) override {
+        if (ready_ || impl_->control_.kicked()) {
+            timeout = 0;
+            return true;
+        }
+        timeout = impl_->control_timeout_ns(compositor_impl::now_ns());
+        return timeout == 0;
+    }
+    bool check() override { return ready_ || impl_->control_.kicked(); }
+    bool dispatch() override {
+        ready_ = false;
+        impl_->control_.dispatch();
+        return true;
+    }
+    [[nodiscard]] int poll_fd() const override { return impl_->control_.fd(); }
+    void on_readable() override { ready_ = true; }
+
+private:
+    compositor_impl* impl_;
     bool ready_ = false;
 };
 
@@ -1632,6 +1924,8 @@ void compositor_impl::log_latency_summary() {
 
 void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) {
     input_router_.send_modifiers(mods, input_devices_.default_seat());
+    // Caps Lock and Num Lock light their LEDs (only when the lit set changed).
+    input_devices_.update_leds();
     // During a drag the modifiers choose the user's action.
     wm_.on_modifiers();
 }
@@ -1862,6 +2156,11 @@ void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_ev
         wm_.cancel_for_pause();
     const bool grab_before = wm_.grab_active() || wm_.drag_active();
     wm_.on_pointer_button(event);
+    // A press on a window during a held action (the switcher is up) is the user going
+    // elsewhere: the hold is cancelled, as GNOME's switcher closes on an outside click. A
+    // press on the shell's own surfaces (the switcher) is the shell's to judge.
+    if (event.pressed && keys_.hold_active() && wm_.pointer_focus())
+        cancel_hold("click elsewhere");
     // A button that starts or ends a grab (or ends a drag) changes the pointer image without
     // moving it: re-publish the same position stamped with this event, so latency is
     // measured from the button and not from the last motion.
@@ -1878,7 +2177,20 @@ void compositor_impl::on_input_pointer_button(const lx::input::pointer_button_ev
 void compositor_impl::on_input_pointer_axis(const lx::input::pointer_axis_event& event) {
     (void)on_user_activity(); // a scroll that wakes the display is delivered too
     keys_.note_other_input();
-    wm_.on_pointer_axis(event);
+    if (event.scroll_factor == 1.0) {
+        wm_.on_pointer_axis(event);
+        return;
+    }
+    // config.toml scroll-factor (per device): the values scale; a wheel's discrete steps
+    // scale and round, and a step that rounds to none is sent as continuous scrolling only
+    // (axis_discrete must be a whole number of notches).
+    lx::input::pointer_axis_event scaled = event;
+    const double f = event.scroll_factor;
+    scaled.vertical *= f;
+    scaled.horizontal *= f;
+    scaled.vertical_discrete = std::round(event.vertical_discrete * f);
+    scaled.horizontal_discrete = std::round(event.horizontal_discrete * f);
+    wm_.on_pointer_axis(scaled);
 }
 
 void compositor_impl::trace_texture_op(const char* op, unsigned texture_id, bool ok) {
@@ -1939,12 +2251,40 @@ void compositor_impl::begin_input() {
         ::close(fd);
     };
 
-    input_open_thread_ = std::thread([this, provider] {
+    // The configured layout (config.toml [input.keyboard]); the snapshot does not change
+    // before the loop runs, so the thread may read it.
+    const lx::input::keymap_config keymap = keymap_config_of(config_.current().keyboard);
+    const bool num_lock = config_.current().keyboard.numlock;
+    const bool configured = keymap.layout || keymap.variant || keymap.options || keymap.model ||
+                            keymap.rules;
+    input_open_thread_ = std::thread([this, provider, keymap, num_lock, configured] {
         // Compile a keymap regardless of whether devices open. Clients are told the layout
         // at bind time, and a compositor that never found a keyboard still has to answer it.
-        if (auto compiled = input_devices_.default_seat().keymap().compile(); !compiled)
-            lx::trace::logger::global().log_error(compiled.get_error(), "compositor.input");
-        input_opened_.emplace(lx::input::input_manager::open(provider));
+        lx::input::keyboard_keymap km;
+        if (auto compiled = km.compile(keymap, keymap_error_, sizeof(keymap_error_));
+            !compiled) {
+            if (!configured)
+                lx::trace::logger::global().log_error(compiled.get_error(), "compositor.input");
+            // A configured layout that does not compile: the system default (reported with
+            // the configuration's first generation).
+            else {
+                if (!keymap_error_[0])
+                    std::snprintf(keymap_error_, sizeof(keymap_error_),
+                                  "xkbcommon gave no reason");
+                if (auto fallback = km.compile(); !fallback)
+                    lx::trace::logger::global().log_error(fallback.get_error(),
+                                                          "compositor.input");
+            }
+        } else {
+            keymap_error_[0] = '\0';
+        }
+        if (num_lock)
+            (void)km.set_num_lock(true);
+        input_opened_.emplace(
+            lx::input::input_manager::open(provider, "seat0", keymap, num_lock, &km));
+        // Not taken (no seat): the keymap the device-less compositor still answers with.
+        if (km.valid())
+            input_devices_.default_seat().keymap() = std::move(km);
     });
 }
 
@@ -1998,6 +2338,26 @@ void compositor_impl::finish_input() {
         (void)static_cast<compositor_impl*>(u)->on_user_activity();
     };
     input_devices_.set_sink(sink);
+    // Pointer devices get the configuration's libinput settings as they appear (and again
+    // on a reload): class sections, then a [[input.device]] of that name.
+    input_devices_.set_device_config(
+        [](void* u, const char* name, lx::input::device_class kind, lx::input::pointer_config& out) {
+            out = pointer_config_of(static_cast<compositor_impl*>(u)->config_.current(), name, kind);
+            return true;
+        },
+        [](void*, const char* name, lx::input::device_class kind,
+           const lx::input::apply_report& r) {
+            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.input",
+                                             "input device \"{}\" ({}): {}", name ? name : "?",
+                                             lx::input::device_class_name(kind),
+                                             r.applied[0] ? r.applied : "nothing to set");
+            if (r.unsupported_count &&
+                lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.input",
+                                                 "input device \"{}\" does not support: {}",
+                                                 name ? name : "?", r.unsupported);
+        },
+        this);
 
     // Share the keymap the device layer compiled, so the state the compositor tracks and
     // the state clients are told about are the same one.
@@ -2008,6 +2368,11 @@ void compositor_impl::finish_input() {
         input_ready_ = true;
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.input",
                                         "libinput seat opened");
+        // The seat's devices were added while it was assigned (on the opening thread):
+        // their events wait in libinput's queue, which the fd does not signal. Taken now,
+        // not at the first key press — the keyboard LEDs and the device count (health)
+        // are right from the start.
+        (void)input_devices_.dispatch();
     }
 }
 
@@ -2437,6 +2802,34 @@ void compositor_impl::after_dispatch_callback() {
     // window that mapped or moved): nothing to do while no constraint exists.
     if (active)
         pointer_constraints_update(active->p0_);
+    // Workspace changes not flushed by the operation that made them (a flag compare).
+    if (active)
+        active->wm_.flush_workspaces();
+    // A move, resize or drag that began during a held action takes the keyboard back from it.
+    if (active && active->keys_.hold_active() &&
+        (active->wm_.grab_active() || active->wm_.drag_active()))
+        active->cancel_hold("interactive grab");
+    if (active) {
+        // SIGHUP (systemctl --user reload), the watchdog, and the placement hold's early end
+        // (the shell reserved its zones): flags and clock compares when there is nothing to do.
+        active->handle_reload_request();
+        const auto now = now_ns();
+        active->maybe_ping_watchdog(now);
+        if (active->placement_hold_until_ != 0 && active->shell_bridge_.has_bridge()) {
+            bool reserved = active->outputs.live_mask() != 0;
+            for (unsigned slot = 0; slot < output_manager::k_max && reserved; ++slot) {
+                if (!active->outputs.slot_live(slot))
+                    continue;
+                const lx::rect2i full = active->outputs.slot_state(slot).logical_rect();
+                const lx::rect2i u = active->layers_.usable(slot);
+                reserved = active->layers_.arranged(slot) &&
+                           (u.x != full.x || u.y != full.y || u.width != full.width ||
+                            u.height != full.height);
+            }
+            if (reserved)
+                active->end_placement_hold("the shell reserved its zones");
+        }
+    }
     // Events produced anywhere in this iteration (input, protocol replies, releases) leave
     // in one flush rather than waiting for the next tick.
     if (active)
@@ -2536,7 +2929,17 @@ void compositor_impl::register_p0_globals() {
     p0_.tree = &tree_;
     wm_.bind(toplevels, surfaces, tree_, scene, windows_layer_, input_router_,
              input_devices_.default_seat(), shell_bridge_, outputs);
+    // Workspaces changed (design Part W): ext-workspace follows, then the control stream.
+    wm_.set_workspace_observer({[](void* u) {
+                                    auto* self = static_cast<compositor_impl*>(u);
+                                    workspaces_changed(self->p0_);
+                                    self->publish_workspaces();
+                                },
+                                this});
     wm_.set_fullscreen_layer(&fullscreen_layer_);
+    wm_.set_snap_preview_layer(&snap_preview_layer_);
+    wm_.set_warp([](void* u, double x, double y) { static_cast<compositor_impl*>(u)->warp_pointer(x, y); },
+                 this);
     popups_.bind(toplevels, surfaces, tree_, popup_layer_);
     wm_.set_popups(&popups_);
     p0_.popups = &popups_;
@@ -2858,6 +3261,10 @@ void compositor_impl::begin_logout(const char* source) {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now().time_since_epoch()).count());
     logout_deadline_ns_ = now + k_logout_grace_ns;
+    // systemd shows the unit deactivating from here on; the shell's exit is an ending, not a
+    // crash, so its zones are not held.
+    session::service_notifier::stopping("Logging out");
+    layers_.set_zone_hold_client(nullptr);
     // The shell learns first, so it reads the disconnect that follows as a normal end.
     if (p0_.notify_session_ending)
         p0_.notify_session_ending();
@@ -2885,6 +3292,1300 @@ void compositor_impl::advance_logout(lx::runtime::clock_time now_ns) {
                                      left == 1 ? "" : "s");
     logout_active_ = false;
     loop.quit(0);
+}
+
+// ── The session, the control socket, health (design-session-and-wm Part 1) ────────
+
+namespace {
+
+const char* backend_name(bool gl, bool cpu, bool vulkan) {
+    return gl ? "gl" : cpu ? "cpu" : vulkan ? "vulkan" : "headless";
+}
+
+const char* state_name(lx::toplevel_state s) {
+    switch (s) {
+    case lx::toplevel_state::normal: return "normal";
+    case lx::toplevel_state::maximized: return "maximized";
+    case lx::toplevel_state::fullscreen: return "fullscreen";
+    case lx::toplevel_state::minimized: return "minimized";
+    case lx::toplevel_state::tiled: return "tiled";
+    case lx::toplevel_state::modal: return "modal";
+    }
+    return "normal";
+}
+
+/// `list` (a colon-separated XDG_CURRENT_DESKTOP) names Lumen.
+bool names_lumen(const char* list) {
+    if (!list)
+        return false;
+    std::string_view rest{list};
+    while (!rest.empty()) {
+        const auto colon = rest.find(':');
+        if (rest.substr(0, colon) == "Lumen")
+            return true;
+        if (colon == std::string_view::npos)
+            break;
+        rest.remove_prefix(colon + 1);
+    }
+    return false;
+}
+
+/// GetHealth requests the compositor makes itself (the health stream of `lumen-ctl
+/// monitor`): answered into the stream only.
+constexpr unsigned k_internal_health_token = 0xFFu;
+
+} // namespace
+
+void compositor_impl::start_session() {
+    started_ns_ = now_ns();
+    watchdog_period_ns_ =
+        static_cast<lx::runtime::clock_time>(session::service_notifier::watchdog_usec()) * 1000;
+    if (watchdog_period_ns_ > 0)
+        watchdog_next_ns_ = started_ns_ + watchdog_period_ns_ / 4;
+
+    if (cfg.control_socket || cfg.session_mode || watchdog_period_ns_ > 0) {
+        control_host host{};
+        host.user = this;
+        host.version = [](void* u, control_version& out) {
+            auto* self = static_cast<compositor_impl*>(u);
+            out.version = "0.3.0";
+            out.zlm_version = 7;
+            out.backend = backend_name(self->gl_present_, self->cpu_present_,
+                                       self->vulkan_present_);
+        };
+        host.health = [](void* u, unsigned token) {
+            static_cast<compositor_impl*>(u)->begin_health(token);
+        };
+        host.health_timeout = [](void* u, unsigned token) {
+            static_cast<compositor_impl*>(u)->answer_health(
+                token, false, control_server::health_timeout_ms, 0, 0, 0, 0);
+        };
+        host.outputs = [](void* u, control_output* out, unsigned cap) {
+            auto* self = static_cast<compositor_impl*>(u);
+            unsigned n = 0;
+            for (unsigned slot = 0; slot < output_manager::k_max && n < cap; ++slot) {
+                if (!self->outputs.slot_live(slot))
+                    continue;
+                const output_state& o = self->outputs.slot_state(slot);
+                control_output& c = out[n++];
+                c = {};
+                std::snprintf(c.name, sizeof(c.name), "%s", o.name);
+                std::snprintf(c.description, sizeof(c.description), "%s", o.description);
+                std::snprintf(c.identifier, sizeof(c.identifier), "%s", o.identifier);
+                const lx::rect2i l = o.logical_rect();
+                c.x = l.x;
+                c.y = l.y;
+                c.width = l.width;
+                c.height = l.height;
+                c.mode_width = o.mode.width;
+                c.mode_height = o.mode.height;
+                c.refresh_mhz = o.refresh_mhz;
+                c.scale = o.scale;
+                static constexpr const char* k_transforms[] = {
+                    "normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180",
+                    "flipped-270"};
+                c.transform = o.transform < 8 ? k_transforms[o.transform] : "normal";
+                if (const auto* w = self->wm_.workspaces().find(self->wm_.workspaces().active(slot)))
+                    std::snprintf(c.active_workspace, sizeof(c.active_workspace), "%s", w->name);
+            }
+            return n;
+        };
+        host.workspaces = [](void* u, control_workspace* out, unsigned cap) {
+            return static_cast<compositor_impl*>(u)->fill_control_workspaces(out, cap);
+        };
+        host.windows = [](void* u, control_window* out, unsigned cap) {
+            auto* self = static_cast<compositor_impl*>(u);
+            unsigned n = 0;
+            // Bottom to top: the stacking order, as a task list would read it reversed.
+            self->toplevels.for_each_bottom_up([&](const toplevel_record& rec) {
+                if (n < cap)
+                    self->fill_control_window(rec, out[n++]);
+            });
+            return n;
+        };
+        host.focused = [](void* u, control_window& out) {
+            auto* self = static_cast<compositor_impl*>(u);
+            const toplevel_record* rec = self->toplevels.find(self->wm_.keyboard_focus());
+            if (!rec || !rec->mapped)
+                return false;
+            self->fill_control_window(*rec, out);
+            return true;
+        };
+        host.reload = [](void* u, unsigned token) {
+            static_cast<compositor_impl*>(u)->request_config_reload(reload_cause::control, token);
+        };
+        host.run_action = [](void* u, const char* action, const char* argument,
+                             const char*& message) {
+            return static_cast<compositor_impl*>(u)->run_control_action(action, argument,
+                                                                         message);
+        };
+        host.logout = [](void* u, const char* source) {
+            static_cast<compositor_impl*>(u)->begin_logout(source);
+        };
+        if (auto opened = control_.open(host); !opened) {
+            lx::trace::logger::global().log_error(opened.get_error(), "compositor.session");
+        } else {
+            if (cfg.control_socket) {
+                const char* runtime = std::getenv("XDG_RUNTIME_DIR");
+                char path[256];
+                if (cfg.socket_name && cfg.socket_name[0] == '/')
+                    std::snprintf(path, sizeof(path), "%s.varlink", cfg.socket_name);
+                else
+                    std::snprintf(path, sizeof(path), "%s/%s.varlink",
+                                  runtime && *runtime ? runtime : "/tmp", cfg.socket_name);
+                if (auto listening = control_.listen(path); !listening)
+                    lx::trace::logger::global().log_error(listening.get_error(),
+                                                          "compositor.session");
+                else
+                    lx::trace::logger::global().logf(lx::trace::level::info,
+                                                     "compositor.session",
+                                                     "control socket {} ({})", path,
+                                                     k_control_interface);
+            }
+            control_source_ = std::make_unique<control_source>(*this);
+            loop.add_source(control_source_.get());
+        }
+    }
+
+    // The control socket's event stream follows windows and focus; the placement hold
+    // notes the windows that map while it lasts.
+    toplevel_observer o{};
+    o.user = this;
+    o.mapped = [](void* u, toplevel_record& rec) {
+        auto* self = static_cast<compositor_impl*>(u);
+        if (self->placement_hold_until_ != 0 && self->placement_held_.size() < 16)
+            self->placement_held_.push_back(rec.id);
+        if (self->control_.subscribers() == 0)
+            return;
+        control_window w{};
+        self->fill_control_window(rec, w);
+        self->control_.publish_window("window-opened", w);
+    };
+    o.unmapped = [](void* u, toplevel_record& rec) {
+        auto* self = static_cast<compositor_impl*>(u);
+        if (self->control_.subscribers() == 0)
+            return;
+        control_window w{};
+        self->fill_control_window(rec, w);
+        self->control_.publish_window("window-closed", w);
+    };
+    o.changed = [](void* u, const toplevel_record& rec) {
+        auto* self = static_cast<compositor_impl*>(u);
+        if (self->control_.subscribers() == 0)
+            return;
+        control_window w{};
+        self->fill_control_window(rec, w);
+        self->control_.publish_window("window-changed", w);
+    };
+    o.focused = [](void* u, const toplevel_record* rec) {
+        auto* self = static_cast<compositor_impl*>(u);
+        if (self->control_.subscribers() == 0)
+            return;
+        control_window w{};
+        if (rec)
+            self->fill_control_window(*rec, w);
+        self->control_.publish_focus(rec ? &w : nullptr);
+    };
+    shell_bridge_.set_control_observer(o);
+    shell_bridge_.set_bound_handler(
+        [](void* u, void* client) { static_cast<compositor_impl*>(u)->on_shell_bound(client); },
+        this);
+    layers_.set_zone_hold_started(
+        [](void* u) {
+            auto* self = static_cast<compositor_impl*>(u);
+            self->zone_hold_until_ = now_ns() + k_zone_hold_ns;
+            self->rearm_session_timer();
+        },
+        this);
+    session_timer_ = std::make_unique<runtime::timer_source>(
+        0, &compositor_impl::session_timer_callback, false);
+    session_timer_->set_enabled(false);
+    loop.add_source(session_timer_.get());
+
+    // A tty login's session says "tty"; the display server that took it over says what it
+    // is now. logind puts the old type back when control is released.
+    if (logind_.has_control() && std::strcmp(logind_.session_type(), "tty") == 0)
+        logind_.set_type("wayland");
+
+    if (!cfg.session_mode) {
+        send_ready(nullptr);
+        return;
+    }
+    // The session environment, before READY: units ordered after graphical-session.target
+    // (the shell, XDG autostart, portal backends) must find WAYLAND_DISPLAY in the manager.
+    // Both calls are asynchronous; READY follows their replies (or 2 s).
+    bool sent = false;
+    if (!control_.event()) {
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.session",
+                                        "no event loop for the user bus: environment not "
+                                        "exported");
+    } else if (auto opened = user_env_.open(control_.event()); !opened) {
+        lx::trace::logger::global().log_error(opened.get_error(), "compositor.session");
+    } else {
+        char display[96];
+        char socket[300];
+        char desktop[160];
+        std::snprintf(display, sizeof(display), "WAYLAND_DISPLAY=%s", cfg.socket_name);
+        std::snprintf(socket, sizeof(socket), "LUMEN_SOCKET=%s",
+                      control_.path()[0] ? control_.path() : "");
+        const char* current = std::getenv("XDG_CURRENT_DESKTOP");
+        std::snprintf(desktop, sizeof(desktop), "XDG_CURRENT_DESKTOP=%s",
+                      names_lumen(current) ? current : "Lumen");
+        std::array<std::string_view, 7> vars{
+            std::string_view{display}, std::string_view{desktop},
+            std::string_view{"XDG_SESSION_TYPE=wayland"},
+            std::string_view{"XDG_SESSION_DESKTOP=lumen"}};
+        std::size_t count = 4;
+        if (control_.path()[0])
+            vars[count++] = socket;
+        // The configured cursor (config.toml [cursor]) for applications that draw their own.
+        char xtheme[96];
+        char xsize[40];
+        const auto& cur = config_.current().cursor;
+        if (cur.theme[0]) {
+            std::snprintf(xtheme, sizeof(xtheme), "XCURSOR_THEME=%s", cur.theme);
+            vars[count++] = xtheme;
+        }
+        if (cur.size > 0) {
+            std::snprintf(xsize, sizeof(xsize), "XCURSOR_SIZE=%d", cur.size);
+            vars[count++] = xsize;
+        }
+        if (auto exported = user_env_.export_async(
+                std::span<const std::string_view>{vars.data(), count}, 2000,
+                [](void* u, bool ok) {
+                    static_cast<compositor_impl*>(u)->on_environment_exported(ok);
+                },
+                this);
+            !exported) {
+            lx::trace::logger::global().log_error(exported.get_error(), "compositor.session");
+        } else {
+            sent = true;
+            control_.dispatch(); // the calls leave now, not at the loop's first wake-up
+        }
+    }
+    if (!sent)
+        send_ready("environment not exported");
+}
+
+void compositor_impl::on_environment_exported(bool ok) {
+    lx::trace::timeline_instant("startup", "env exported");
+    if (ok)
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
+                                         "session environment exported: WAYLAND_DISPLAY={} "
+                                         "XDG_SESSION_TYPE=wayland",
+                                         cfg.socket_name);
+    else
+        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.session",
+                                        "the user manager refused the session environment "
+                                        "(or did not answer in 2 s)");
+    send_ready(ok ? nullptr : "environment export failed");
+}
+
+void compositor_impl::send_ready(const char* why) {
+    if (ready_sent_)
+        return;
+    ready_sent_ = true;
+    char status[160];
+    const unsigned n = outputs.count();
+    std::snprintf(status, sizeof(status), "Serving %s (%u output%s)%s%s", cfg.socket_name, n,
+                  n == 1 ? "" : "s", why ? "; " : "", why ? why : "");
+    session::service_notifier::ready(status);
+    lx::trace::timeline_instant("startup", "ready");
+    if (session::service_notifier::listening())
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
+                                         "ready: {}", status);
+    // Windows that map before the shell's panel has reserved its strip are fitted into the
+    // usable area once it has (or after 750 ms): only in a session, where the shell starts
+    // after READY in parallel with autostart applications.
+    if (cfg.session_mode && !shell_bridge_.has_bridge()) {
+        placement_hold_until_ = now_ns() + k_placement_hold_ns;
+        rearm_session_timer();
+    }
+}
+
+void compositor_impl::end_session() {
+    if (control_source_) {
+        loop.remove_source(control_source_.get());
+        control_source_.reset();
+    }
+    // An export still in flight (a stop during start-up) is unset too: close() would flush
+    // the SetEnvironment, and the UnsetEnvironment sent after it on the same connection is
+    // what the manager applies last.
+    if (user_env_.exported() || user_env_.export_pending()) {
+        user_env_.unset_now(1000);
+        lx::trace::logger::global().log(lx::trace::level::info, "compositor.session",
+                                        "session environment unset");
+    }
+    user_env_.close();
+    control_.close();
+    if (session_timer_) {
+        loop.remove_source(session_timer_.get());
+        session_timer_.reset();
+    }
+    for (auto* src : {static_cast<runtime::event_source*>(config_watch_source_.get()),
+                      static_cast<runtime::event_source*>(config_timer_.get()),
+                      static_cast<runtime::event_source*>(binding_repeat_timer_.get())})
+        if (src)
+            loop.remove_source(src);
+    config_watch_source_.reset();
+    config_timer_.reset();
+    binding_repeat_timer_.reset();
+    config_.watch().close();
+}
+
+void compositor_impl::maybe_ping_watchdog(lx::runtime::clock_time now) {
+    if (control_.subscribers() > 0 && now >= next_health_poll_ns_) {
+        next_health_poll_ns_ = now + k_health_poll_ns;
+        begin_health(k_internal_health_token);
+    }
+    if (watchdog_period_ns_ <= 0 || now < watchdog_next_ns_)
+        return;
+    // The render thread is alive when its heartbeat moved since the last ping, or when it
+    // waits for work. Stuck inside a tick, it withholds the ping; systemd's watchdog then
+    // ends the session instead of leaving a frozen screen.
+    const unsigned ticks = render_ticks_.load(std::memory_order_acquire);
+    const bool alive = !threads_started.load(std::memory_order_acquire) ||
+                       ticks != watchdog_render_ticks_ ||
+                       !render_in_tick_.load(std::memory_order_acquire);
+    if (!alive) {
+        if (!watchdog_withheld_) {
+            watchdog_withheld_ = true;
+            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.session",
+                                            "render thread stuck in a tick: watchdog ping "
+                                            "withheld");
+        }
+        watchdog_next_ns_ = now + 250'000'000ll;
+        return;
+    }
+    watchdog_withheld_ = false;
+    watchdog_render_ticks_ = ticks;
+    session::service_notifier::watchdog_ping();
+    watchdog_next_ns_ = now + watchdog_period_ns_ / 4;
+}
+
+lx::runtime::clock_time compositor_impl::control_timeout_ns(lx::runtime::clock_time now) const {
+    lx::runtime::clock_time due = -1;
+    if (watchdog_period_ns_ > 0)
+        due = watchdog_next_ns_;
+    if (control_.subscribers() > 0 && (due < 0 || next_health_poll_ns_ < due))
+        due = next_health_poll_ns_;
+    if (due < 0)
+        return -1;
+    return due > now ? due - now : 0;
+}
+
+void compositor_impl::handle_reload_request() {
+    if (!reload_requested_.exchange(false, std::memory_order_acq_rel))
+        return;
+    // systemd's reload protocol (Type=notify-reload): RELOADING=1 now, READY=1 once the
+    // generation is applied (finish_config_generation).
+    session::service_notifier::reloading("Reloading the configuration");
+    lx::trace::logger::global().log(lx::trace::level::info, "config",
+                                    "reload (SIGHUP): reading the configuration again");
+    request_config_reload(reload_cause::sighup, ~0u);
+}
+
+void compositor_impl::begin_health(unsigned token) {
+    if (!threads_started.load(std::memory_order_acquire)) {
+        answer_health(token, true, 0, import_cache.size(), import_cache.config().max_entries,
+                      budget_.last_tick_render_us(), budget_.render_over_total());
+        return;
+    }
+    // The render thread's own figures, read on that thread: the round trip is also the proof
+    // that it runs (an answer missing after 500 ms makes "render" critical).
+    compositor_impl* self = this;
+    const lx::runtime::clock_time t0 = now_ns();
+    const bool posted = runtime::executor::global().post(
+        runtime::affinity::render, [self, token, t0] {
+            const unsigned used = self->import_cache.size();
+            const unsigned cap = self->import_cache.config().max_entries;
+            const unsigned render_us = self->budget_.last_tick_render_us();
+            const unsigned long long over = self->budget_.render_over_total();
+            (void)runtime::executor::global().post(
+                runtime::affinity::ui, [self, token, t0, used, cap, render_us, over] {
+                    if (compositor_impl::active != self)
+                        return;
+                    const auto ms = static_cast<unsigned>((now_ns() - t0) / 1'000'000);
+                    self->answer_health(token, true, ms, used, cap, render_us, over);
+                });
+        });
+    if (!posted)
+        answer_health(token, false, 0, 0, 0, 0, 0);
+}
+
+void compositor_impl::answer_health(unsigned token, bool render_answered, unsigned render_ms,
+                                    unsigned cache_used, unsigned cache_capacity,
+                                    unsigned render_us, unsigned long long render_over) {
+    lx::health::health_inputs in{};
+    const auto now = now_ns();
+    in.uptime_ms = started_ns_ > 0 ? static_cast<unsigned long long>((now - started_ns_) / 1'000'000)
+                                   : 0;
+    in.backend = backend_name(gl_present_, cpu_present_, vulkan_present_);
+    in.compositor_pid = static_cast<int>(::getpid());
+    in.wayland_serving = true;
+    in.socket_name = cfg.socket_name;
+    const bool want_virtual = cfg.virtual_outputs && *cfg.virtual_outputs;
+    in.display = drm_present_          ? lx::health::display_path::kms
+                 : want_virtual        ? lx::health::display_path::virtual_outputs
+                 : kms.card_fd() >= 0  ? lx::health::display_path::kms_without_master
+                                       : lx::health::display_path::none;
+    in.display_paused = session_.display_stopped();
+    in.render_answered = render_answered;
+    in.render_answer_ms = render_ms;
+    in.input_open = input_devices_.fd() >= 0;
+    in.input_devices = input_devices_.device_count();
+    in.logind_control = logind_.has_control();
+    in.session_id = logind_.session_id();
+    in.shell_connected = shell_bridge_.has_bridge();
+    in.shell_pid = shell_bridge_.bridge_pid();
+    in.shell_binds = shell_bridge_.binds();
+    in.session_mode = cfg.session_mode;
+    in.environment_exported = user_env_.exported();
+    in.ready_sent = ready_sent_;
+    in.watchdog = watchdog_period_ns_ > 0;
+    switch (memory_.current_pressure()) {
+    case lx::runtime::memory_pressure::normal: in.memory_pressure = 0; break;
+    case lx::runtime::memory_pressure::moderate: in.memory_pressure = 1; break;
+    case lx::runtime::memory_pressure::critical: in.memory_pressure = 2; break;
+    }
+    in.rss_kib = lx::health::read_rss_kib();
+    in.import_cache_used = cache_used;
+    in.import_cache_capacity = cache_capacity;
+    in.render_figures = render_answered;
+    in.staging_bytes = shm_store_.bytes_held() + shm_pool_.bytes_mapped();
+    in.staging_budget = memory_.config().staging_budget_bytes;
+    in.last_tick_ui_us = budget_.last_tick_ui_us();
+    in.last_tick_render_us = render_us;
+    in.ui_over_budget = budget_.ui_over_total();
+    in.render_over_budget = render_over;
+    for (unsigned slot = 0; slot < output_manager::k_max && in.outputs.size() < in.outputs.capacity();
+         ++slot) {
+        if (!outputs.slot_live(slot))
+            continue;
+        const output_state& s = outputs.slot_state(slot);
+        const output_ui& o = outs_[slot];
+        lx::health::output_input oi{};
+        oi.name.set(s.name);
+        oi.refresh_mhz = s.refresh_mhz;
+        oi.flip_paced = o.pipe && o.pipe->kms;
+        oi.presented = o.presented;
+        oi.missed = o.missed;
+        oi.recent = o.recent;
+        in.outputs.push_back(oi);
+    }
+    in.config_generation = config_.generation();
+    in.config_errors = config_.diagnostics().errors();
+    in.config_warnings = config_.diagnostics().warnings();
+    const lx::health::health_report report = lx::health::evaluate(in);
+    if (token != k_internal_health_token)
+        control_.finish_health(token, report);
+    if (report.overall != streamed_health_) {
+        streamed_health_ = report.overall;
+        control_.publish_health(report.overall);
+    }
+}
+
+void compositor_impl::fill_control_window(const toplevel_record& rec, control_window& out) const {
+    out = {};
+    out.id = static_cast<unsigned>(rec.id.id());
+    std::snprintf(out.app_id, sizeof(out.app_id), "%s", rec.app_id ? rec.app_id : "");
+    std::snprintf(out.title, sizeof(out.title), "%s", rec.title ? rec.title : "");
+    if (auto* conn = const_cast<wayland::server&>(wayland).find_client(rec.client.id()))
+        out.pid = static_cast<int>(conn->credentials().pid);
+    if (rec.output >= 0 && outputs.slot_live(static_cast<unsigned>(rec.output)))
+        std::snprintf(out.output, sizeof(out.output), "%s",
+                      outputs.slot_state(static_cast<unsigned>(rec.output)).name);
+    // Snapped to a half or a quarter (design-session-and-wm K.3): "tiled", as the shell sees it.
+    out.state = rec.snap && rec.state == lx::toplevel_state::normal ? "tiled" : state_name(rec.state);
+    out.focused = rec.id == wm_.keyboard_focus();
+    out.minimized = rec.minimized;
+    out.sticky = rec.sticky;
+    out.workspace = static_cast<unsigned>(rec.workspace.id());
+    out.x = rec.geometry.x;
+    out.y = rec.geometry.y;
+    out.width = rec.geometry.width;
+    out.height = rec.geometry.height;
+}
+
+unsigned compositor_impl::fill_control_workspaces(control_workspace* out, unsigned cap) const {
+    unsigned n = 0;
+    wm_.workspaces().for_each([&](const workspace_record& w) {
+        if (n >= cap)
+            return;
+        control_workspace& c = out[n++];
+        c = {};
+        c.id = static_cast<unsigned>(w.id.id());
+        if (w.output >= 0 && outputs.slot_live(static_cast<unsigned>(w.output)))
+            std::snprintf(c.output, sizeof(c.output), "%s",
+                          outputs.slot_state(static_cast<unsigned>(w.output)).name);
+        c.index = w.index + 1;
+        std::snprintf(c.name, sizeof(c.name), "%s", w.name);
+        c.active = w.active;
+        c.urgent = w.urgent;
+        c.windows = w.windows;
+    });
+    return n;
+}
+
+void compositor_impl::publish_workspaces() {
+    if (control_.subscribers() == 0) {
+        published_ws_count_ = 0; // the next subscriber's stream starts from scratch
+        return;
+    }
+    control_workspace now[k_max_workspaces];
+    const unsigned n = fill_control_workspaces(now, k_max_workspaces);
+    const auto same = [](const control_workspace& a, const control_workspace& b) {
+        return a.id == b.id && a.index == b.index && a.active == b.active &&
+               a.urgent == b.urgent && a.windows == b.windows &&
+               std::strcmp(a.output, b.output) == 0 && std::strcmp(a.name, b.name) == 0;
+    };
+    for (unsigned i = 0; i < published_ws_count_; ++i) {
+        bool still = false;
+        for (unsigned j = 0; j < n && !still; ++j)
+            still = now[j].id == published_ws_[i].id;
+        if (!still)
+            control_.publish_workspace("workspace-removed", published_ws_[i]);
+    }
+    for (unsigned j = 0; j < n; ++j) {
+        bool known = false;
+        for (unsigned i = 0; i < published_ws_count_ && !known; ++i)
+            known = same(now[j], published_ws_[i]);
+        if (!known)
+            control_.publish_workspace("workspace", now[j]);
+    }
+    for (unsigned j = 0; j < n; ++j)
+        published_ws_[j] = now[j];
+    published_ws_count_ = n;
+}
+
+void compositor_impl::apply_workspace_config() {
+    const lx::config::workspace_settings& w = config_.current().workspaces;
+    workspace_config c{};
+    c.dynamic = w.mode == lx::config::workspace_mode::dynamic;
+    c.count = w.count > 0 ? static_cast<unsigned>(w.count) : 1u;
+    c.name_count = w.name_count < k_workspaces_per_output ? w.name_count : k_workspaces_per_output;
+    for (unsigned i = 0; i < c.name_count; ++i)
+        std::snprintf(c.names[i], sizeof(c.names[i]), "%s", w.names[i]);
+    c.switch_on_activate = w.switch_on_activate;
+    c.move_follows = w.move_follows;
+    wm_.set_workspace_config(c);
+}
+
+control_action_result compositor_impl::run_control_action(const char* action,
+                                                          const char* argument,
+                                                          const char*& message) {
+    namespace lxc = lx::config;
+    const lxc::action_info* a = lxc::find_action(action ? action : "");
+    if (!a || a->id == lxc::action_id::none)
+        return control_action_result::unknown_action;
+    if (!a->available) {
+        message = "this action is not available in this version of Lumen yet";
+        return control_action_result::invalid_argument;
+    }
+    if (a->pointer) {
+        message = "this action needs a pointer button (bind it to one, e.g. Super+BTN_LEFT)";
+        return control_action_result::invalid_argument;
+    }
+    unsigned arg = 0;
+    if (a->arg == lxc::action_arg::index) {
+        char* end = nullptr;
+        const long n = argument && *argument ? std::strtol(argument, &end, 10) : 0;
+        if (!end || *end || n < 1 || n > 99) {
+            message = "this action needs a number 1..99";
+            return control_action_result::invalid_argument;
+        }
+        arg = static_cast<unsigned>(n);
+    } else if (argument && *argument) {
+        message = "this action takes no argument";
+        return control_action_result::invalid_argument;
+    }
+    // Lock-safe actions only, while locked (the bindings' rule, design C.3).
+    if (!a->lock_safe && lock_.state() != lock_state::unlocked)
+        return control_action_result::session_locked;
+    return run_action(a->id, arg, 0, false, "lumen-ctl", message);
+}
+
+control_action_result compositor_impl::run_action(lx::config::action_id action, unsigned argument,
+                                                  unsigned time_ms, bool input, const char* source,
+                                                  const char*& message) {
+    namespace lxc = lx::config;
+    using enum lxc::action_id;
+    const lxc::action_info& info = lxc::action(action);
+    if (info.owner == lxc::action_owner::shell) {
+        char arg[16] = "";
+        if (argument)
+            std::snprintf(arg, sizeof(arg), "%u", argument);
+        if (!p0_.send_shell_action || !p0_.send_shell_action(info.name, arg, time_ms, input)) {
+            // switcher.next with no shell: the compositor's quick switch (design C.3), so
+            // Alt+Tab still works while the shell restarts.
+            if (action == switcher_next && lock_.state() == lock_state::unlocked) {
+                (void)wm_.quick_switch();
+                return control_action_result::ok;
+            }
+            if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.bindings",
+                                                 "{}: no shell speaks zlm v7; dropped", info.name);
+            return control_action_result::shell_not_connected;
+        }
+        return control_action_result::ok;
+    }
+    switch (action) {
+    case session_logout: begin_logout(source); return control_action_result::ok;
+    case session_reload_config:
+        request_config_reload(reload_cause::action, ~0u);
+        return control_action_result::ok;
+    case keyboard_next_layout:
+    case keyboard_previous_layout: {
+        auto& seat = input_devices_.default_seat();
+        if (seat.keymap().cycle_layout(action == keyboard_next_layout ? 1 : -1))
+            on_input_modifiers(seat.keymap().modifiers());
+        return control_action_result::ok;
+    }
+    // Workspace switches need no focused window (W.1: the focused output, else the
+    // pointer's).
+    case workspace_switch: (void)wm_.switch_to_index(argument); return control_action_result::ok;
+    case workspace_next: (void)wm_.switch_relative(1); return control_action_result::ok;
+    case workspace_previous: (void)wm_.switch_relative(-1); return control_action_result::ok;
+    default: break;
+    }
+    const lx::toplevel_id id = wm_.keyboard_focus();
+    const toplevel_record* rec = toplevels.find(id);
+    if (!rec || !rec->mapped) {
+        message = "no window has the keyboard focus";
+        return control_action_result::invalid_argument;
+    }
+    switch (action) {
+    case window_close: wm_.request_close(id); break;
+    case window_maximize_toggle:
+        wm_.set_maximized(id, rec->state != lx::toplevel_state::maximized, source);
+        break;
+    case window_fullscreen_toggle:
+        wm_.set_fullscreen(id, rec->state != lx::toplevel_state::fullscreen, -1, source);
+        break;
+    case window_move_to_output_left: (void)wm_.move_to_output(id, -1, 0); break;
+    case window_move_to_output_right: (void)wm_.move_to_output(id, 1, 0); break;
+    case window_move_to_output_up: (void)wm_.move_to_output(id, 0, -1); break;
+    case window_move_to_output_down: (void)wm_.move_to_output(id, 0, 1); break;
+    case window_minimize: wm_.set_minimized(id, true, source); break;
+    case window_sticky_toggle: wm_.set_sticky(id, !rec->sticky); break;
+    // Snapping and keyboard move/resize (design-session-and-wm Part K).
+    case window_snap_left: (void)wm_.snap_by_key(id, snap_key::left, source); break;
+    case window_snap_right: (void)wm_.snap_by_key(id, snap_key::right, source); break;
+    case window_snap_up: (void)wm_.snap_by_key(id, snap_key::up, source); break;
+    case window_snap_down: (void)wm_.snap_by_key(id, snap_key::down, source); break;
+    case window_move_keyboard:
+    case window_resize_keyboard:
+        if (keys_.hold_active())
+            cancel_hold("keyboard grab");
+        if (!wm_.begin_keyboard_grab(id, action == window_move_keyboard ? grab_mode::move
+                                                                          : grab_mode::resize)) {
+            message = "the window cannot be moved or resized now (fullscreen, maximized for a "
+                      "resize, or another grab)";
+            return control_action_result::invalid_argument;
+        }
+        break;
+    case workspace_move_window: (void)wm_.move_to_index(id, argument); break;
+    case workspace_move_window_next: (void)wm_.move_relative(id, 1); break;
+    case workspace_move_window_previous: (void)wm_.move_relative(id, -1); break;
+    default:
+        message = "this action is not available in this version of Lumen yet";
+        return control_action_result::invalid_argument;
+    }
+    return control_action_result::ok;
+}
+
+// ── The configuration file (design-session-and-wm Part C) ──────────────────────────────
+
+void compositor_impl::load_initial_config() {
+    config_.init();
+    (void)config_.reload(true);
+    std::snprintf(cursor_theme_name_, sizeof(cursor_theme_name_), "%s",
+                  config_.current().cursor.theme);
+}
+
+void compositor_impl::apply_initial_config() {
+    // A configured layout that did not compile at start: part of generation 1's report.
+    if (keymap_error_[0]) {
+        keymap_default_ = true;
+        report_keymap_error();
+    }
+    apply_repeat();
+    install_bindings();
+    apply_focus_policy();
+    apply_window_config();
+    // Workspaces of the outputs there are (later ones get theirs as they come).
+    apply_workspace_config();
+    wm_.sync_workspace_outputs(true);
+    wm_.set_button_binding(
+        [](void* u, unsigned button, unsigned time_ms) {
+            return static_cast<compositor_impl*>(u)->on_button_binding(button, time_ms);
+        },
+        this);
+    p0_.shell_config_user = this;
+    p0_.shell_config_on_bind = [](void* u, void* res) {
+        static_cast<compositor_impl*>(u)->send_config_to_shell(res, true);
+    };
+    config_timer_ = std::make_unique<runtime::timer_source>(
+        0, &compositor_impl::config_timer_callback, false);
+    config_timer_->set_enabled(false);
+    loop.add_source(config_timer_.get());
+    binding_repeat_timer_ = std::make_unique<runtime::timer_source>(
+        0, &compositor_impl::binding_repeat_callback, false);
+    binding_repeat_timer_->set_enabled(false);
+    loop.add_source(binding_repeat_timer_.get());
+    if (const int fd = config_.watch().fd(); fd >= 0) {
+        config_watch_source_ =
+            std::make_unique<runtime::fd_source>(fd, &compositor_impl::config_watch_callback);
+        loop.add_source(config_watch_source_.get());
+    }
+    config_bytes_generation_ = config_.generation();
+    // Generation 1 is reported like any other (the log; the shell asks for it on bind).
+    finish_config_generation();
+}
+
+void compositor_impl::config_watch_callback() {
+    if (!active || !active->config_.watch().drain() || !active->config_timer_)
+        return;
+    // An editor's save is several events (a temporary file, a rename): one reload after they
+    // settle.
+    active->config_timer_->schedule_at(now_ns() + k_config_debounce_ns);
+}
+
+void compositor_impl::config_timer_callback() {
+    if (!active)
+        return;
+    active->config_timer_->set_enabled(false);
+    active->request_config_reload(reload_cause::watch, ~0u);
+}
+
+void compositor_impl::request_config_reload(reload_cause cause, unsigned control_token) {
+    // Answered by the generation this request starts: the busy one's (its bytes were read
+    // before this request) is not it.
+    auto& tokens = config_busy_ ? config_tokens_next_ : config_tokens_;
+    if (control_token != ~0u && !tokens.try_push_back(control_token))
+        control_.finish_reload(control_token, config_.generation(), false, {});
+    if (cause == reload_cause::sighup)
+        (config_busy_ ? config_sighup_next_ : config_sighup_) = true;
+    const bool force = cause != reload_cause::watch;
+    if (config_busy_) {
+        config_again_ = true;
+        config_again_force_ = config_again_force_ || force;
+        return;
+    }
+    run_config_reload(force);
+}
+
+void compositor_impl::run_config_reload(bool force) {
+    lx::trace::scoped_span span{"ui", "config_reload"};
+    const config_state::result r = config_.reload(force);
+    if (r.what == config_state::outcome::unchanged)
+        return;
+    config_busy_ = true;
+    if (r.what == config_state::outcome::accepted) {
+        if (r.bytes_changed)
+            config_bytes_generation_ = config_.generation();
+        if (r.changes & cfg_repeat)
+            apply_repeat();
+        if (r.changes & cfg_pointer)
+            input_devices_.reapply_device_config();
+        if (r.changes & cfg_focus)
+            apply_focus_policy();
+        if (r.changes & cfg_windows)
+            apply_window_config();
+        if (r.changes & cfg_workspaces)
+            apply_workspace_config();
+        if (r.changes & cfg_bindings)
+            install_bindings();
+        // Unchanged but still failing: compiled again, which reports it again (or applies it
+        // when the layout became available).
+        if ((r.changes & cfg_keymap) || keymap_error_[0])
+            start_keymap_job();
+        if (r.changes & cfg_cursor) {
+            std::snprintf(cursor_theme_name_, sizeof(cursor_theme_name_), "%s",
+                          config_.current().cursor.theme);
+            start_cursor_job();
+        }
+    } else if (keymap_error_[0]) {
+        // Rejected: the configuration in use stays, and so does its keymap problem.
+        report_keymap_error();
+    }
+    if (config_jobs_ == 0)
+        finish_config_generation();
+}
+
+void compositor_impl::report_keymap_error() {
+    namespace lxc = lx::config;
+    const auto& k = config_.current().keyboard;
+    config_.diagnostics().addf(lxc::severity::error, lxc::k_no_layer, 0, "input.keyboard",
+                               "layout \"{}\" variant \"{}\" options \"{}\" does not compile ({}); "
+                               "{}",
+                               k.layout, k.variant, k.options, keymap_error_,
+                               keymap_default_ ? "using the system default"
+                                               : "keeping the previous keymap");
+}
+
+namespace {
+/// Runs `fn(arg)` on the worker; false when there is none (the caller runs it inline).
+bool config_post_worker(compositor_impl& self, void (*fn)(void*), void* arg) {
+    if (!self.threads_started.load(std::memory_order_acquire) || self.cfg.worker_thread_count == 0)
+        return false;
+    return runtime::executor::global().post(runtime::affinity::worker, runtime::task{fn, arg});
+}
+} // namespace
+
+void compositor_impl::start_keymap_job() {
+    keymap_job_ = std::make_unique<keymap_job>();
+    keymap_job_->settings = config_.current().keyboard;
+    ++config_jobs_;
+    // A keymap compile is ~10 ms of xkbcommon parsing: never on the UI thread's frame path.
+    const auto work = [](void* u) {
+        auto* self = static_cast<compositor_impl*>(u);
+        keymap_job& j = *self->keymap_job_;
+        const auto t0 = std::chrono::steady_clock::now();
+        j.ok = static_cast<bool>(
+            j.keymap.compile(keymap_config_of(j.settings), j.error, sizeof(j.error)));
+        j.compile_us = static_cast<unsigned>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                                 std::chrono::steady_clock::now() - t0)
+                                                 .count());
+        if (lx::runtime::current_affinity() == lx::runtime::affinity::worker)
+            (void)runtime::executor::global().post(runtime::affinity::ui,
+                                                   [self] { self->finish_keymap_job(); });
+        else
+            self->finish_keymap_job();
+    };
+    if (!config_post_worker(*this, work, this))
+        work(this);
+}
+
+void compositor_impl::finish_keymap_job() {
+    std::unique_ptr<keymap_job> job = std::move(keymap_job_);
+    auto& seat = input_devices_.default_seat();
+    const auto& k = job->settings;
+    if (job->ok) {
+        // The new keymap takes the old one's locks and held keys; clients get it at once
+        // (and the focus its modifiers), the IM grab too.
+        job->keymap.adopt_state(seat.keymap(), seat.pressed_keys(), seat.pressed_count());
+        seat.keymap() = std::move(job->keymap);
+        if (p0_.invalidate_seat_keymap)
+            p0_.invalidate_seat_keymap();
+        input_router_.seat_keymap_changed(seat);
+        input_devices_.update_leds();
+        stop_binding_repeat();
+        keymap_error_[0] = '\0';
+        keymap_default_ = false;
+        const auto& km = seat.keymap();
+        lx::trace::logger::global().logf(lx::trace::level::info, "config",
+                                         "keymap: layout \"{}\" variant \"{}\" options \"{}\" "
+                                         "({} layouts, active {}; compiled in {} us)",
+                                         k.layout, k.variant, k.options, km.layout_count(),
+                                         km.layout_name(km.active_layout()), job->compile_us);
+    } else {
+        std::snprintf(keymap_error_, sizeof(keymap_error_), "%s",
+                      job->error[0] ? job->error : "xkbcommon gave no reason");
+        report_keymap_error();
+    }
+    config_job_done();
+}
+
+void compositor_impl::start_cursor_job() {
+    cursor_job_ = std::make_unique<cursor_job>();
+    cursor_job& j = *cursor_job_;
+    std::snprintf(j.theme, sizeof(j.theme), "%s", cursor_theme_name_);
+    j.base_px = cursor_base_px();
+    for (unsigned s = 0; s < output_manager::k_max && j.count < k_cursor_scales; ++s) {
+        if (!outputs.slot_live(s))
+            continue;
+        const auto s120 = static_cast<unsigned>(std::lround(outputs.slot_state(s).scale * 120.0));
+        if (!std::ranges::contains(std::span{j.scale120, j.count}, s120))
+            j.scale120[j.count++] = s120;
+    }
+    if (j.count == 0)
+        j.scale120[j.count++] = static_cast<unsigned>(std::lround(outputs.default_scale() * 120.0));
+    ++config_jobs_;
+    // Dozens of file opens along the theme's Inherits= chain: on the worker.
+    const auto work = [](void* u) {
+        auto* self = static_cast<compositor_impl*>(u);
+        cursor_job& c = *self->cursor_job_;
+        for (unsigned i = 0; i < c.count; ++i) {
+            const long px = std::lround(static_cast<double>(c.base_px) * c.scale120[i] / 120.0);
+            c.themes[i].load(c.theme[0] ? c.theme : nullptr,
+                             px > 0 ? static_cast<unsigned>(px) : c.base_px);
+        }
+        if (lx::runtime::current_affinity() == lx::runtime::affinity::worker)
+            (void)runtime::executor::global().post(runtime::affinity::ui,
+                                                   [self] { self->finish_cursor_job(); });
+        else
+            self->finish_cursor_job();
+    };
+    if (!config_post_worker(*this, work, this))
+        work(this);
+}
+
+void compositor_impl::finish_cursor_job() {
+    namespace lxc = lx::config;
+    std::unique_ptr<cursor_job> job = std::move(cursor_job_);
+    if (cursor_theme_count_ > 0) {
+        for (unsigned i = 0; i < job->count; ++i) {
+            cursor_themes_[i] = std::move(job->themes[i]);
+            cursor_theme_scale120_[i] = job->scale120[i];
+        }
+        cursor_theme_count_ = job->count;
+        cursor_base_px_ = job->base_px;
+        const xcursor_theme* themes[k_cursor_scales]{};
+        for (unsigned i = 0; i < cursor_theme_count_; ++i)
+            themes[i] = &cursor_themes_[i];
+        cursor_.set_themes(themes, cursor_theme_scale120_, cursor_theme_count_);
+        request_frame();
+        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.cursor",
+                                         "cursor theme={} size={} (configuration) from_theme={}",
+                                         cursor_themes_[0].name(), cursor_themes_[0].size(),
+                                         cursor_themes_[0].from_theme());
+        if (cursor_theme_name_[0] && !cursor_themes_[0].from_theme())
+            config_.diagnostics().addf(lxc::severity::warning, lxc::k_no_layer, 0, "cursor.theme",
+                                       "cursor theme \"{}\" was not found; using {}",
+                                       cursor_theme_name_, cursor_themes_[0].name());
+    }
+    export_cursor_environment();
+    config_job_done();
+}
+
+void compositor_impl::config_job_done() {
+    if (config_jobs_ > 0 && --config_jobs_ == 0)
+        finish_config_generation();
+}
+
+void compositor_impl::export_cursor_environment() {
+    // Applications started from now on draw the same cursor (those that draw their own read
+    // XCURSOR_*); cursor-shape clients follow at once anyway.
+    if (!cfg.session_mode || !user_env_.is_open())
+        return;
+    const auto& c = config_.current().cursor;
+    char theme[96];
+    char size[40];
+    std::snprintf(theme, sizeof(theme), "XCURSOR_THEME=%s", c.theme);
+    std::snprintf(size, sizeof(size), "XCURSOR_SIZE=%u", cursor_base_px());
+    std::array<std::string_view, 2> vars{};
+    std::size_t n = 0;
+    if (c.theme[0])
+        vars[n++] = theme;
+    if (c.size > 0)
+        vars[n++] = size;
+    if (n == 0)
+        return;
+    if (auto r = user_env_.export_async(std::span<const std::string_view>{vars.data(), n}, 2000,
+                                        [](void*, bool) {}, nullptr);
+        !r)
+        lx::trace::logger::global().log_error(r.get_error(), "config");
+    else
+        control_.dispatch();
+}
+
+void compositor_impl::apply_repeat() {
+    const auto& k = config_.current().keyboard;
+    p0_.repeat_rate = k.repeat_rate;
+    p0_.repeat_delay = k.repeat_delay;
+    input_router_.send_repeat_info(k.repeat_rate, k.repeat_delay);
+}
+
+void compositor_impl::install_bindings() {
+    binding_table(config_.current(), binding_table_);
+    keys_.set_bindings(binding_table_);
+    stop_binding_repeat();
+}
+
+void compositor_impl::apply_window_config() {
+    const auto& w = config_.current().windows;
+    wm_.set_window_config({.edge_snap = w.edge_snap,
+                           .edge_snap_distance = w.edge_snap_distance,
+                           .edge_snap_corner = w.edge_snap_corner,
+                           .snap_preview = w.snap_preview,
+                           .drag_restore = w.drag_restore});
+}
+
+void compositor_impl::apply_focus_policy() {
+    const auto& f = config_.current().focus;
+    wm_.set_focus_policy({.sloppy = f.mode == lx::config::focus_mode::sloppy,
+                          .raise_on_click = f.raise_on_click,
+                          .raise_on_sloppy = f.raise_on_sloppy});
+}
+
+void compositor_impl::finish_config_generation() {
+    namespace lxc = lx::config;
+    config_busy_ = false;
+    const auto& d = config_.diagnostics();
+    // Logged once per generation: each problem, then one summary line.
+    for (const lxc::diagnostic& x : d.items()) {
+        char line[384];
+        lxc::format_diagnostic(x, config_.path_of(x.layer), true, line, sizeof(line));
+        lx::trace::logger::global().log(
+            x.sev == lxc::severity::error ? lx::trace::level::warn : lx::trace::level::info,
+            "config", line);
+    }
+    if (config_.accepted_last())
+        lx::trace::logger::global().logf(lx::trace::level::info, "config",
+                                         "config: generation {} from {} ({} errors, {} "
+                                         "warnings; {} bindings)",
+                                         config_.generation(), config_.describe_source(),
+                                         d.errors(), d.warnings(), keys_.binding_count());
+    else
+        lx::trace::logger::global().logf(lx::trace::level::warn, "config",
+                                         "config: generation {} from {} rejected ({} errors); "
+                                         "the configuration in use stays",
+                                         config_.generation(), config_.describe_source(),
+                                         d.errors());
+    // The shell: the new bytes when they changed, and the report.
+    if (p0_.send_shell_config)
+        send_config_to_shell(nullptr, config_.accepted_last() &&
+                                          config_bytes_generation_ == config_.generation());
+    if (config_sighup_) {
+        config_sighup_ = false;
+        char status[128];
+        std::snprintf(status, sizeof(status), "Serving %s (configuration generation %u)",
+                      cfg.socket_name, config_.generation());
+        session::service_notifier::ready(status);
+    }
+    if (!config_tokens_.empty()) {
+        // The Reload replies: the generation, whether it applied, and its problems.
+        std::vector<control_diagnostic> out;
+        out.reserve(d.items().size());
+        for (const lxc::diagnostic& x : d.items()) {
+            control_diagnostic c{};
+            c.severity = lxc::severity_name(x.sev);
+            const char* path = config_.path_of(x.layer);
+            c.file = path ? path : "";
+            c.line = x.line;
+            c.key = x.key;
+            c.message = x.message;
+            out.push_back(c);
+        }
+        for (const unsigned token : config_tokens_)
+            control_.finish_reload(token, config_.generation(), config_.accepted_last(), out);
+        config_tokens_.clear();
+    }
+    control_.publish_config(config_.generation());
+    if (config_again_) {
+        // A SIGHUP or a Reload call among the queued requests makes it forced, so it always
+        // produces a generation that answers them.
+        const bool force = config_again_force_;
+        config_again_ = false;
+        config_again_force_ = false;
+        for (const unsigned token : config_tokens_next_)
+            (void)config_tokens_.try_push_back(token);
+        config_tokens_next_.clear();
+        config_sighup_ = std::exchange(config_sighup_next_, false);
+        run_config_reload(force);
+    }
+}
+
+void compositor_impl::send_config_to_shell(void* shell_resource, bool with_bytes) {
+    namespace lxc = lx::config;
+    if (!p0_.send_shell_config)
+        return;
+    const auto& d = config_.diagnostics();
+    std::vector<std::array<char, 256>> texts(d.items().size());
+    std::vector<shell_config_line> lines(d.items().size());
+    for (std::size_t i = 0; i < d.items().size(); ++i) {
+        const lxc::diagnostic& x = d.items()[i];
+        if (x.key[0])
+            std::snprintf(texts[i].data(), texts[i].size(), "%s: %s", x.key, x.message);
+        else
+            std::snprintf(texts[i].data(), texts[i].size(), "%s", x.message);
+        const char* path = config_.path_of(x.layer);
+        lines[i] = {x.sev == lxc::severity::error ? 0u : 1u, path ? path : "", x.line,
+                    texts[i].data()};
+    }
+    shell_config_report r{};
+    r.generation = config_.generation();
+    r.applied = config_.accepted_last();
+    r.errors = d.errors();
+    r.warnings = d.warnings();
+    r.lines = lines.data();
+    r.line_count = static_cast<unsigned>(lines.size());
+    lx::unique_fd fd{};
+    if (with_bytes) {
+        // A sealed memfd of the accepted bytes: the shell maps it read-only and parses what
+        // the compositor parsed.
+        const std::string& bytes = config_.accepted_text().bytes;
+        const int raw = ::memfd_create("lumen-config", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        if (raw >= 0) {
+            fd = lx::unique_fd{raw};
+            std::size_t off = 0;
+            while (off < bytes.size()) {
+                const ssize_t n = ::write(raw, bytes.data() + off, bytes.size() - off);
+                if (n <= 0)
+                    break;
+                off += static_cast<std::size_t>(n);
+            }
+            (void)::fcntl(raw, F_ADD_SEALS,
+                          F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL);
+            if (off == bytes.size()) {
+                r.fd = raw;
+                r.size = static_cast<unsigned>(bytes.size());
+            }
+        }
+    }
+    p0_.send_shell_config(shell_resource, r);
+}
+
+void compositor_impl::stop_binding_repeat() {
+    repeat_binding_ = nullptr;
+    repeat_code_ = 0;
+    repeat_kind_ = key_repeat::binding;
+    if (binding_repeat_timer_)
+        binding_repeat_timer_->set_enabled(false);
+}
+
+void compositor_impl::binding_repeat_callback() {
+    if (!active || !active->repeat_code_)
+        return;
+    compositor_impl& self = *active;
+    const auto time_ms = static_cast<unsigned>(now_ns() / 1'000'000);
+    switch (self.repeat_kind_) {
+    case key_repeat::binding: {
+        if (!self.repeat_binding_) {
+            self.stop_binding_repeat();
+            return;
+        }
+        // The rules the key press was matched under, again: a lock (or a shortcuts inhibitor)
+        // that came while the key is held stops a binding not allowed under it.
+        if (!self.keys_.allows(*self.repeat_binding_, shortcuts_inhibited(self.p0_))) {
+            self.stop_binding_repeat();
+            return;
+        }
+        const binding_entry b = *self.repeat_binding_;
+        const char* message = "";
+        (void)self.run_action(b.action, b.argument, time_ms, true, "binding", message);
+        if (!self.repeat_binding_) {
+            self.stop_binding_repeat();
+            return;
+        }
+        break;
+    }
+    case key_repeat::hold:
+        // The hold may have ended meanwhile (the shell destroyed it, a lock).
+        if (!self.keys_.hold_active()) {
+            self.stop_binding_repeat();
+            return;
+        }
+        self.send_hold_key(self.repeat_in_, time_ms);
+        break;
+    case key_repeat::wm:
+        if (!self.wm_.grab_active() || !self.wm_.grab().keyboard) {
+            self.stop_binding_repeat();
+            return;
+        }
+        self.repeat_event_.time_ms = time_ms;
+        (void)self.wm_.on_key(self.repeat_event_);
+        break;
+    }
+    const int rate = self.config_.current().keyboard.repeat_rate;
+    if (rate <= 0) {
+        self.stop_binding_repeat();
+        return;
+    }
+    self.binding_repeat_timer_->schedule_at(now_ns() + 1'000'000'000ll / rate);
+}
+
+void compositor_impl::start_key_repeat(key_repeat kind, const lx::input::key_event& event,
+                                       const key_input& in) {
+    const auto& kb = config_.current().keyboard;
+    if (!binding_repeat_timer_ || kb.repeat_rate <= 0 || !event.pressed)
+        return;
+    repeat_kind_ = kind;
+    repeat_binding_ = nullptr;
+    repeat_code_ = event.evdev_keycode;
+    repeat_in_ = in;
+    repeat_event_ = event;
+    binding_repeat_timer_->schedule_at(now_ns() +
+                                       static_cast<runtime::clock_time>(kb.repeat_delay) * 1'000'000ll);
+    binding_repeat_timer_->set_enabled(true);
+}
+
+void compositor_impl::send_hold_key(const key_input& in, unsigned time_ms) {
+    if (!p0_.send_hold_key || !keys_.hold_active())
+        return;
+    const binding_entry* b = keys_.peek_binding(in, shortcuts_inhibited(p0_));
+    const char* binding = b ? lx::config::action(b->action).name : "";
+    p0_.send_hold_key(keys_.hold_owner(), in.raw ? in.raw : in.raw0, in.mods, binding, time_ms);
+}
+
+void compositor_impl::cancel_hold(const char* why) {
+    void* hold = keys_.end_hold();
+    if (!hold)
+        return;
+    if (repeat_kind_ == key_repeat::hold)
+        stop_binding_repeat();
+    if (p0_.send_hold_cancelled)
+        p0_.send_hold_cancelled(hold);
+    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.bindings",
+                                         "held action cancelled ({})", why);
+}
+
+wm_button_binding compositor_impl::on_button_binding(unsigned button, unsigned time_ms) {
+    namespace lxc = lx::config;
+    const auto named = input_devices_.default_seat().keymap().named();
+    const unsigned mods = (named.shift ? key_mod_shift : 0u) | (named.ctrl ? key_mod_ctrl : 0u) |
+                          (named.alt ? key_mod_alt : 0u) | (named.super ? key_mod_super : 0u);
+    const binding_entry* b = keys_.match_button(button, mods, shortcuts_inhibited(p0_));
+    if (!b)
+        return wm_button_binding::none;
+    if (b->action == lxc::action_id::window_move_interactive)
+        return wm_button_binding::move;
+    if (b->action == lxc::action_id::window_resize_interactive)
+        return wm_button_binding::resize;
+    const binding_entry copy = *b;
+    const char* message = "";
+    (void)run_action(copy.action, copy.argument, time_ms, true, "binding", message);
+    return wm_button_binding::consumed;
+}
+
+void compositor_impl::on_shell_bound(void* client_native) {
+    // The new shell's zones are the ones held if it goes without a logout.
+    layers_.set_zone_hold_client(logout_active_ ? nullptr : client_native);
+}
+
+void compositor_impl::rearm_session_timer() {
+    if (!session_timer_)
+        return;
+    lx::runtime::clock_time next = 0;
+    for (const auto t : {zone_hold_until_, placement_hold_until_})
+        if (t != 0 && (next == 0 || t < next))
+            next = t;
+    if (next == 0)
+        session_timer_->set_enabled(false);
+    else
+        session_timer_->schedule_at(next);
+}
+
+void compositor_impl::session_timer_callback() {
+    if (!active)
+        return;
+    const auto now = now_ns();
+    if (active->zone_hold_until_ != 0 && now >= active->zone_hold_until_) {
+        active->zone_hold_until_ = 0;
+        active->layers_.release_zone_hold();
+    }
+    if (active->placement_hold_until_ != 0 && now >= active->placement_hold_until_)
+        active->end_placement_hold("750 ms passed");
+    active->rearm_session_timer();
+}
+
+void compositor_impl::end_placement_hold(const char* why) {
+    if (placement_hold_until_ == 0)
+        return;
+    placement_hold_until_ = 0;
+    unsigned moved = 0;
+    for (const lx::toplevel_id id : placement_held_)
+        if (wm_.fit_into_usable(id))
+            ++moved;
+    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
+                                     "placement hold ended ({}): {} window{} mapped meanwhile, "
+                                     "{} moved into the usable area",
+                                     why, placement_held_.size(),
+                                     placement_held_.size() == 1 ? "" : "s", moved);
+    placement_held_.clear();
+    rearm_session_timer();
 }
 
 void compositor_impl::ensure_graphics_device() {
@@ -3362,7 +5063,9 @@ void compositor_impl::first_frame_timer_callback() {
         active->request_frame();
 }
 
-unsigned compositor_impl::cursor_base_px() {
+unsigned compositor_impl::cursor_base_px() const {
+    if (const int size = config_.current().cursor.size; size > 0)
+        return static_cast<unsigned>(size);
     unsigned base = 24;
     if (const char* env = std::getenv("XCURSOR_SIZE")) {
         const long v = std::strtol(env, nullptr, 10);
@@ -3382,7 +5085,8 @@ void compositor_impl::begin_cursor_theme() {
     const unsigned base = cursor_base_px();
     const long px = std::lround(static_cast<double>(base) * prefetched_scale120_ / 120.0);
     const unsigned size = px > 0 ? static_cast<unsigned>(px) : base;
-    cursor_theme_thread_ = std::thread([this, size] { prefetched_theme_.load(nullptr, size); });
+    cursor_theme_thread_ =
+        std::thread([this, size] { prefetched_theme_.load(cursor_theme_arg(), size); });
 }
 
 void compositor_impl::warm_gl_paths() {
@@ -3697,6 +5401,20 @@ void compositor_impl::on_output_flip(output_pipeline& p, const scheduler::presen
     // (seq 0, as the spec asks): no hw_clock. A blocking modeset's completion is timed
     // here, in software: vsync only. Only feedback this output paces is presented (M8).
     if (fb.content && fb.tag != 0) {
+        // Health: presented, and missed when it landed half a period or more past its aim
+        // (a whole vblank late). Only the frame the aim was noted for is judged.
+        ++o.presented;
+        if (o.aim_frame == fb.tag && o.aim_ns > 0) {
+            const auto period = clocks_.clock(slot).refresh_period();
+            const auto landed = fb.hw_clock && fb.actual_present_ns > 0
+                                    ? static_cast<lx::runtime::clock_time>(fb.actual_present_ns)
+                                    : now_ns();
+            const bool late = period > 0 && landed - o.aim_ns > period / 2;
+            if (late)
+                ++o.missed;
+            o.recent.record(late);
+            o.aim_ns = 0;
+        }
         present_info info{};
         info.timestamp_ns = static_cast<unsigned long long>(fb.actual_present_ns);
         info.seq = fb.vblank_clock ? fb.seq : 0;
@@ -3996,6 +5714,7 @@ void compositor_impl::enter_display_pause(unsigned quiesce_gen) {
     //    is cancelled. A half-typed tap is no tap.
     wm_.cancel_for_pause();
     keys_.reset();
+    cancel_hold("session paused");
 }
 
 void compositor_impl::suspend_input_for_pause() {
@@ -4434,13 +6153,20 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
         // L1: input leaves normal clients at the request, before anything is hidden. The
         // lock layer stays hidden until the scene locks (lock surfaces are not shown before).
         lock_layer_.set_visible(false);
+        cancel_hold("session locked");
         keys_.set_locked(true);
+        // A repeating binding stops here unless it is allowed when locked (its timer checks
+        // too; this keeps the next tick from being scheduled at all).
+        if (repeat_kind_ == key_repeat::binding && repeat_binding_ &&
+            !keys_.allows(*repeat_binding_))
+            stop_binding_repeat();
         wm_.set_session_locked(true);
     }
     if (a.has(lock_actions::scene_lock)) {
         for (scene::container_node* layer :
-             {&background_layer_, &bottom_layer_, &windows_layer_, &top_layer_,
-              &fullscreen_layer_, &overlay_shell_layer_, &popup_layer_, &dnd_icon_layer_})
+             {&background_layer_, &bottom_layer_, &windows_layer_, &snap_preview_layer_,
+              &top_layer_, &fullscreen_layer_, &overlay_shell_layer_, &popup_layer_,
+              &dnd_icon_layer_})
             layer->set_visible(false);
         lock_layer_.set_visible(true);
         // The first snapshot built from here on is a locked frame, on every output.
@@ -4455,8 +6181,9 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
     session_lock_send(p0_, a);
     if (a.has(lock_actions::scene_unlock)) {
         for (scene::container_node* layer :
-             {&background_layer_, &bottom_layer_, &windows_layer_, &top_layer_,
-              &fullscreen_layer_, &overlay_shell_layer_, &popup_layer_, &dnd_icon_layer_})
+             {&background_layer_, &bottom_layer_, &windows_layer_, &snap_preview_layer_,
+              &top_layer_, &fullscreen_layer_, &overlay_shell_layer_, &popup_layer_,
+              &dnd_icon_layer_})
             layer->set_visible(true);
         lock_layer_.set_visible(false);
         wm_.set_suspend_reason(window_manager::suspend_lock, false);
@@ -5882,7 +7609,8 @@ void compositor_impl::sync_cursor_themes() {
             break; // more distinct scales than themes: the nearest serves (§A.7)
         const unsigned i = static_cast<unsigned>(slot);
         const long px = std::lround(static_cast<double>(cursor_base_px_) * s120 / 120.0);
-        cursor_themes_[i].load(nullptr, px > 0 ? static_cast<unsigned>(px) : cursor_base_px_);
+        cursor_themes_[i].load(cursor_theme_arg(),
+                               px > 0 ? static_cast<unsigned>(px) : cursor_base_px_);
         cursor_theme_scale120_[i] = s120;
         if (i == cursor_theme_count_)
             ++cursor_theme_count_;
@@ -7051,6 +8779,12 @@ void compositor_impl::on_vsync(std::uint32_t forced) {
     std::uint32_t due = (clocks_.take_due(tick.timestamp_ns) | forced) & outputs.live_mask();
     due &= ~hold_first_frames(due, tick.timestamp_ns);
     due_mask_ = due;
+    // Health: the vblank each served output's repaint aims at (one store per output served).
+    for (std::uint32_t m = due; m != 0; m &= m - 1) {
+        const unsigned slot = static_cast<unsigned>(std::countr_zero(m));
+        outs_[slot].aim_ns = clocks_.clock(slot).next_deadline(tick.timestamp_ns);
+        outs_[slot].aim_frame = tick.frame_index;
+    }
     in_vsync_ = true;
     tick_quiet_mask_ = 0;
     if (owner) owner->tick_ui(tick);
@@ -7090,9 +8824,17 @@ void compositor_impl::render_loop() {
             render_pending = false;
         }
 
+        render_in_tick_.store(true, std::memory_order_relaxed);
+        const auto t0 = std::chrono::steady_clock::now();
         if (owner) owner->tick_render();
+        // The render half of the hot-path budget (render thread only: health reads it here).
+        budget_.end_tick_render(static_cast<unsigned>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count()));
         runtime::executor::global().drain(runtime::affinity::render);
         render_ticks_.fetch_add(1, std::memory_order_release);
+        render_in_tick_.store(false, std::memory_order_release);
     }
 
     // A frame composited but never committed still holds its fence; this thread owns it.
@@ -7260,6 +9002,9 @@ lx::result<void> compositor::start() {
     // Input devices open, and the cursor theme is read, beside the present path's set-up
     // (`begin_input`, `begin_cursor_theme`); joined before they are used, and on every early
     // return below.
+    // The configuration file first: the keymap, the cursor and the device settings come
+    // from it (a small read and parse, ~0.1 ms; design-session-and-wm C.4).
+    impl_->load_initial_config();
     impl_->begin_input();
     impl_->begin_cursor_theme();
     struct helper_join {
@@ -7473,7 +9218,7 @@ lx::result<void> compositor::start() {
         // One theme per distinct output scale, at that scale's pixel size: XCURSOR_SIZE (or
         // 24) is a logical size, so a 1.25 output shows 30 px images — sharp, not a 24 px
         // image stretched (§A.7). At most k_cursor_scales; past that, the nearest is used.
-        const unsigned base = detail::compositor_impl::cursor_base_px();
+        const unsigned base = impl->cursor_base_px();
         unsigned scales[k_cursor_scales]{};
         unsigned n = 0;
         for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
@@ -7499,7 +9244,8 @@ lx::result<void> compositor::start() {
                 adopted = true;
             } else {
                 const long px = std::lround(static_cast<double>(base) * scales[i] / 120.0);
-                impl->cursor_themes_[i].load(nullptr, px > 0 ? static_cast<unsigned>(px) : base);
+                impl->cursor_themes_[i].load(impl->cursor_theme_arg(),
+                                             px > 0 ? static_cast<unsigned>(px) : base);
             }
             if (impl->cursor_themes_[i].max_dimension() > need)
                 need = impl->cursor_themes_[i].max_dimension();
@@ -7795,10 +9541,12 @@ lx::result<void> compositor::start() {
     {
         lx::trace::logger::global().logf(
             lx::trace::level::info, "compositor.session",
-            "session {} vt={} can_switch_vt={} active={} drm={}:{}",
+            "session {} vt={} can_switch_vt={} active={} drm={}:{} found={} type={}",
             impl_->logind_.session_id()[0] ? impl_->logind_.session_id() : "-",
             impl_->logind_.vt_number(), impl_->logind_.can_switch_vt() ? 1 : 0,
-            impl_->logind_.is_active() ? 1 : 0, impl_->drm_major_, impl_->drm_minor_);
+            impl_->logind_.is_active() ? 1 : 0, impl_->drm_major_, impl_->drm_minor_,
+            session::session_found_by_name(impl_->logind_.found_by()),
+            impl_->logind_.session_type()[0] ? impl_->logind_.session_type() : "-");
         impl_->apply_session_actions(impl_->session_.init(
             impl_->drm_present_, impl_->drm_major_, impl_->drm_minor_, impl_->drm_start_inactive_));
     }
@@ -7807,6 +9555,9 @@ lx::result<void> compositor::start() {
     lx::trace::logger::global().log(lx::trace::level::info, "compositor",
                                     "threads: ui(main)+render+worker; frame clocks armed");
 
+    // After the socket is served: the control socket, the session environment, READY.
+    impl_->apply_initial_config();
+    impl_->start_session();
     return {};
 }
 
@@ -7815,6 +9566,9 @@ int compositor::run() {
 
     runtime::set_current_affinity(runtime::affinity::ui);
     const int code = impl_->loop.run();
+    // The session environment goes first (applications started from now on must not find
+    // a display that is going), then the control socket.
+    impl_->end_session();
     impl_->stop_threads();
     // Every recording thread has stopped: the timeline is complete.
     (void)lx::trace::timeline_flush();
@@ -7827,6 +9581,13 @@ int compositor::run() {
 void compositor::request_stop() {
     if (!impl_) return;
     impl_->loop.quit(0);
+}
+
+void compositor::request_reload() {
+    if (!impl_)
+        return;
+    impl_->reload_requested_.store(true, std::memory_order_release);
+    impl_->loop.wake();
 }
 
 void compositor::request_screenshot() {
@@ -7915,6 +9676,10 @@ bool compositor::render_and_wait() {
 
 void compositor::run_posted_ui_tasks() {
     runtime::assert_affinity(runtime::affinity::ui);
+    // A reload asked for with request_reload (SIGHUP), as the loop's after-dispatch step
+    // handles it; first, so a reload's worker results are drained after it.
+    if (impl_)
+        impl_->handle_reload_request();
     runtime::executor::global().drain(runtime::affinity::ui);
     if (impl_)
         impl_->flush_output_heads();

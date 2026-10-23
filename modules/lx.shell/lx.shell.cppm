@@ -15,6 +15,7 @@ module;
 
 #include <wayland-client.h>
 #include "cursor-shape-v1-client-protocol.h"
+#include "xdg-shell-client-protocol.h"
 #include "zlm_shell_v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 #if defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1)
@@ -47,6 +48,7 @@ module;
 import lx.foundation;
 import lx.shell.policy;
 import lx.trace;
+import lx.config;
 
 export module lx.shell;
 
@@ -64,12 +66,32 @@ export import :app_launch;
 export import :launcher;
 export import :idle_policy;
 export import :background;
+export import :workspaces;
+export import :switcher;
+export import :user_bus;
+export import :notifications;
+export import :notify_view;
+export import :menu_popup;
+export import :tray;
 
 export namespace lx::shell {
+
+/// Which `shell_config` settings came from the command line (or LUMEN_BACKGROUND): those
+/// override config.toml (sway's and niri's precedence: command line > file > defaults).
+enum shell_cli_setting : unsigned {
+    cli_idle_policy = 1u << 0,
+    cli_blank_after = 1u << 1,
+    cli_blank_locked_after = 1u << 2,
+    cli_lock_command = 1u << 3,
+    cli_lock_on_blank = 1u << 4,
+    cli_background = 1u << 5,
+};
 
 struct shell_config {
     /// Wayland display (socket) name; null = $WAYLAND_DISPLAY, as libwayland decides.
     const char* display = nullptr;
+    /// `shell_cli_setting` bits: what the command line set.
+    unsigned cli_set = 0;
     /// When to power the outputs off and when to lock (`--idle-policy`, `--blank-after`,
     /// `--blank-locked-after`, `--lock-command`, `--[no-]lock-on-blank`): see `:idle_policy`.
     idle_policy_config idle{};
@@ -125,9 +147,15 @@ private:
         t_lock_blank,
         /// The visual bell's flashes end (120 ms after the bell).
         t_bell,
+        /// The window switcher appears (its open delay after the hold began).
+        t_switcher,
+        /// The next notification expires (design-session-and-wm N.2).
+        t_notify,
+        /// A tray item's tooltip appears (500 ms of hovering).
+        t_tooltip,
         t_count
     };
-    enum class pointer_target : unsigned char { none, panel, launcher };
+    enum class pointer_target : unsigned char { none, panel, launcher, switcher, notify, menu };
     /// One bound wl_output: its xdg-output rect, its panel and its power control. Created on
     /// `global`, destroyed on `global_remove` (panel first) — never per frame.
     struct output_record {
@@ -152,8 +180,20 @@ private:
     };
     struct pending_token {
         void* token = nullptr; // xdg_activation_token_v1*
+        /// What the token is for: a launch, a notification's action (ActivationToken before
+        /// ActionInvoked), a tray item's activation (ProvideXdgActivationToken before
+        /// Activate).
+        enum class purpose : unsigned char { launch, notify_action, tray_activate };
+        purpose what = purpose::launch;
         std::unique_ptr<prepared_launch> launch;
         long long deadline_ns = 0;
+        /// notify_action: the notification and the action key; tray_activate: the item's
+        /// key, the point, secondary.
+        unsigned id = 0;
+        std::string key{};
+        int x = 0;
+        int y = 0;
+        bool secondary = false;
     };
     static constexpr unsigned k_max_tokens = 8;
 
@@ -168,6 +208,10 @@ private:
     void launch_entry(unsigned entry, unsigned serial);
     void launch_terminal(unsigned serial);
     void begin_launch(std::unique_ptr<prepared_launch> p, unsigned serial, void* surface);
+    /// An xdg-activation token for the input `serial` on `surface`, handed to `t`'s purpose
+    /// when done (or without one after 100 ms). False when there is no activation (the
+    /// caller goes on without a token).
+    bool request_token(pending_token&& t, unsigned serial, void* surface, const char* app_id);
     void start_launch(const prepared_launch& p, const char* token);
     void token_done(pending_token& t, const char* token);
     void expire_tokens(long long now);
@@ -198,6 +242,11 @@ private:
     [[nodiscard]] output_record* launcher_output();
     /// Every panel's task filter after the outputs' rects changed.
     void outputs_moved();
+    /// The indicator cells of `o`'s panel: its workspaces in order, active, occupied (a
+    /// window of the task model is on it), urgent.
+    void fill_workspace_cells(const output_record& o, panel_ws_input& in) const;
+    /// The wheel over `o`'s indicator: its next (`dir` 1) or previous workspace.
+    void scroll_workspaces(const output_record& o, int dir);
     [[nodiscard]] bool any_panel_drawn() const;
     void set_apps_all(bool open);
     void set_notice_all(const char* text);
@@ -228,8 +277,89 @@ private:
     /// The locked-screen idle notification exists exactly while the policy wants one.
     void update_locked_notification();
 
+    // ── Configuration (zlm_shell_v1 v7, design-session-and-wm C.2, C.5) ──
+    /// The effective bytes of a generation: parsed with lx.config, the shell's sections
+    /// applied (live once the shell runs; the command line keeps precedence).
+    void on_config(std::string_view bytes, unsigned generation);
+    /// The compositor's report: one notice per generation with problems (the panel's notice
+    /// until notifications exist).
+    void on_config_done(unsigned generation, bool applied, unsigned errors, unsigned warnings,
+                        std::span<const policy_bridge::config_line> lines);
+    /// A shell action from a binding or lumen-ctl (zlm v7 `action`).
+    void on_action(const char* action, const char* argument, unsigned serial);
+
+    // ── The window switcher (zlm v7 held actions, design-session-and-wm K.1, K.2) ──
+    /// zlm_shell_v1.held_action: a switcher.* binding was pressed; the hold lasts while its
+    /// modifier is down.
+    void on_hold_begin(const char* action);
+    /// A key press during the hold (the compositor diverted it from the focused window).
+    void on_hold_key(unsigned keysym, unsigned mods, const char* binding);
+    /// Ends the switch: the selection activated when `commit`, the hold and the view gone.
+    /// `why` is logged.
+    void finish_switch(bool commit, const char* why);
+    /// The open delay passed with the hold still on: the view appears.
+    void open_switcher();
+    /// switcher.* from lumen-ctl (no hold): straight to the window the switcher would select.
+    void quick_switch(std::string_view action);
+    /// [switcher] as the configuration says (defaults before the first `config`).
+    [[nodiscard]] switcher_options switcher_settings() const;
+    /// Applies idle and background from `c` (the command line's settings stay).
+    void apply_config(const lx::config::config_snapshot& c);
+    /// The idle and lock policy changed while running: notifications and power controls
+    /// are made again (the bound globals stay).
+    void reconfigure_idle();
+    /// Every output's background is made again (its spec changed).
+    void rebuild_backgrounds();
+
+    // ── Notifications and the tray (design-session-and-wm Part N; shell_desktop.cpp) ──
+    /// Once the first panel frame is on screen: the user bus, org.freedesktop.Notifications,
+    /// the StatusNotifierWatcher and host.
+    void start_desktop_services();
+    void stop_desktop_services();
+    /// Every loop iteration after dispatch: expiry, the popups, menus, the panels' widgets.
+    void desktop_after_dispatch();
+    /// [notifications] from the configuration.
+    void apply_notify_config(const lx::config::config_snapshot& c);
+    /// A click on the popups (`serial`: its press).
+    void on_notify_click(const notify_click& c, unsigned serial);
+    /// A tray cell or the notification indicator of `o`'s panel.
+    void on_widget(const panel_widget_event& e, output_record& o);
+    void open_history(output_record& o, const panel_widget_event& e);
+    void open_tray_menu(unsigned key, std::vector<menu_entry> items);
+    void on_menu_activate(int id);
+    void on_menu_closed();
+    void show_tooltip();
+    void toggle_dnd(const char* why);
+    /// A notification from the shell itself (configuration problems): replaces `slot`'s.
+    void post_internal(const char* summary, const char* body, notify_urgency urgency,
+                       unsigned& slot);
+    /// Where the popups go: kept while any shows; else the active window's output.
+    output_record* notify_output();
+    [[nodiscard]] output_record* output_by_name(unsigned name);
+    const std::uint32_t* notification_icon(const notification& n, int px);
+    const std::uint32_t* tray_icon(unsigned key, int px);
+    /// An icon name, an absolute path or a file:// URI at `px`² (any image format).
+    const std::uint32_t* image_icon(std::string_view what, int px);
+    void save_state();
+    /// The panel of `o` gets the tray and the indicator.
+    void attach_widgets(output_record& o);
+    [[nodiscard]] bool notifications_owned() const;
+
     shell_config config_{};
+    /// The configuration file as last applied (null before the first `config` event).
+    std::unique_ptr<lx::config::config_snapshot> file_config_{};
+    /// Storage for a lock command that came from the file (`config_.idle` points into it).
+    std::string file_lock_command_{};
+    /// The background spec text applied from the file ("" before).
+    std::string file_background_{};
+    /// The shell's own set-up ran: configuration changes apply live from now on.
+    bool started_ = false;
+    /// The last configuration report shown (generation, its lines).
+    unsigned shown_config_generation_ = 0;
+    std::string shown_config_report_{};
     policy_bridge bridge_{};
+    /// The workspace indicator's model (ext-workspace-v1, design-session-and-wm W.7).
+    workspace_client workspaces_{};
     icon_theme icons_{};
     visual_bell bell_{};
     /// A window's own icon pixels resampled to the size the panel draws (per task slot).
@@ -240,6 +370,16 @@ private:
         std::vector<std::uint32_t> pixels;
     };
     icon_cache icon_cache_[k_max_tasks]{};
+    /// The same at the switcher's size (64 px): the panel's 16 px copies stay.
+    icon_cache icon_cache_large_[k_max_tasks]{};
+    /// The window switcher: the hold's list and selection, and its view.
+    switcher_model switcher_{};
+    switcher_view switcher_view_{};
+    /// Where the pointer entered the switcher: it selects only once it has moved (a pointer
+    /// that happens to be where the view appears selects nothing).
+    double switcher_ptr_x_ = 0.0;
+    double switcher_ptr_y_ = 0.0;
+    bool switcher_ptr_moved_ = false;
     std::vector<std::unique_ptr<output_record>> outputs_{};
     /// The panels exist (after the setup): an output bound later gets its panel at its done.
     bool panels_enabled_ = false;
@@ -294,6 +434,63 @@ private:
     std::vector<std::pair<std::string, launch_failure>> warned_{};
     unsigned warned_gen_ = 0;
     bool catalog_scanned_after_frame_ = false;
+
+    // ── Notifications and the tray ──
+    void* wm_base_ = nullptr; // xdg_wm_base* (menus, tooltips)
+    /// The surface the pointer is on (menus have several) and the last press's serial.
+    void* pointer_surface_ = nullptr;
+    unsigned last_press_serial_ = 0;
+    user_bus bus_{};
+    notification_center notes_{};
+    notification_server note_server_{};
+    notification_view note_view_{};
+    tray_service tray_{};
+    menu_popup menu_{};
+    tooltip_popup tooltip_{};
+    bool desktop_started_ = false;
+    /// The output (registry name) the popups are on while any shows.
+    unsigned notify_output_ = 0;
+    unsigned notes_rev_seen_ = 0;
+    unsigned tray_rev_seen_ = 0;
+    bool dnd_seen_ = false;
+    /// The internal notification about the configuration (replaced, not stacked).
+    unsigned config_note_id_ = 0;
+    /// The tooltip waiting for its delay: the item, its output and cell.
+    unsigned tooltip_key_ = 0;
+    unsigned tooltip_output_ = 0;
+    lx::rect2i tooltip_cell_{};
+    /// What the open menu is for: a tray item's (its key), the history, a notification's
+    /// further actions (its id); and on which output's panel.
+    enum class menu_kind : unsigned char { none, tray, history, actions };
+    menu_kind menu_kind_ = menu_kind::none;
+    unsigned menu_key_ = 0;
+    unsigned menu_output_ = 0;
+    /// A tray menu asked for (its layout on the way): the item, the panel, the cell, the
+    /// press's serial.
+    unsigned pending_menu_key_ = 0;
+    unsigned pending_menu_output_ = 0;
+    lx::rect2i pending_menu_cell_{};
+    unsigned pending_menu_serial_ = 0;
+    /// History and actions menus: entry id → (notification, action index; -1 default,
+    /// -2 dismiss).
+    std::vector<std::pair<unsigned, int>> menu_actions_{};
+    std::string state_path_{};
+    shell_state state_{};
+    struct tray_icon_entry {
+        unsigned key = 0;
+        unsigned rev = 0;
+        int px = 0;
+        std::vector<std::uint32_t> pixels;
+    };
+    std::vector<tray_icon_entry> tray_icons_{};
+    struct image_entry {
+        std::string what;
+        int px = 0;
+        std::vector<std::uint32_t> pixels; // empty: could not be read
+        unsigned long long used = 0;
+    };
+    std::vector<image_entry> images_{};
+    unsigned long long image_clock_ = 0;
 };
 
 } // namespace lx::shell
@@ -443,7 +640,15 @@ struct lx::shell::shell_app::events {
                 static_cast<wp_cursor_shape_device_v1*>(a.cursor_device_), serial,
                 WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
         const double px = wl_fixed_to_double(x), py = wl_fixed_to_double(y);
-        if (output_record* o = s ? a.output_of_panel_surface(s) : nullptr) {
+        a.pointer_surface_ = s;
+        if (s && a.menu_.owns(s)) {
+            a.pointer_target_ = pointer_target::menu;
+            a.menu_.pointer_enter(s, px, py);
+        } else if (s && s == a.note_view_.surface()) {
+            a.pointer_target_ = pointer_target::notify;
+            a.note_view_.pointer_enter(px, py);
+            a.notes_.set_hover(a.note_view_.hovered(), now_ns());
+        } else if (output_record* o = s ? a.output_of_panel_surface(s) : nullptr) {
             a.pointer_target_ = pointer_target::panel;
             a.pointer_panel_ = o->bar.get();
             a.last_panel_output_ = o->name;
@@ -451,16 +656,28 @@ struct lx::shell::shell_app::events {
         } else if (s && s == a.launcher_.surface()) {
             a.pointer_target_ = pointer_target::launcher;
             a.launcher_.pointer_enter(px, py);
+        } else if (s && s == a.switcher_view_.surface()) {
+            a.pointer_target_ = pointer_target::switcher;
+            a.switcher_ptr_x_ = px;
+            a.switcher_ptr_y_ = py;
+            a.switcher_ptr_moved_ = false;
         } else {
             a.pointer_target_ = pointer_target::none;
         }
     }
-    static void ptr_leave(void* data, wl_pointer*, uint32_t, wl_surface*) {
+    static void ptr_leave(void* data, wl_pointer*, uint32_t, wl_surface* s) {
         auto& a = self(data);
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_leave();
         else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_leave();
+        else if (a.pointer_target_ == pointer_target::menu)
+            a.menu_.pointer_leave(s);
+        else if (a.pointer_target_ == pointer_target::notify) {
+            a.note_view_.pointer_leave();
+            a.notes_.set_hover(false, now_ns());
+        }
+        a.pointer_surface_ = nullptr;
         a.pointer_panel_ = nullptr;
         a.pointer_target_ = pointer_target::none;
     }
@@ -471,15 +688,42 @@ struct lx::shell::shell_app::events {
             a.pointer_panel_->pointer_motion(px, py);
         else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_motion(px, py);
+        else if (a.pointer_target_ == pointer_target::menu)
+            a.menu_.pointer_motion(a.pointer_surface_, px, py);
+        else if (a.pointer_target_ == pointer_target::notify) {
+            a.note_view_.pointer_motion(px, py);
+            a.notes_.set_hover(a.note_view_.hovered(), now_ns());
+        } else if (a.pointer_target_ == pointer_target::switcher && a.switcher_.active()) {
+            // Hovering selects (GNOME), once the pointer has really moved.
+            const double dx = px - a.switcher_ptr_x_, dy = py - a.switcher_ptr_y_;
+            a.switcher_ptr_moved_ = a.switcher_ptr_moved_ || dx * dx + dy * dy > 9.0;
+            if (const int i = a.switcher_view_.entry_at(px, py); i >= 0 && a.switcher_ptr_moved_)
+                a.switcher_.select(static_cast<unsigned>(i));
+        }
     }
     static void ptr_button(void* data, wl_pointer*, uint32_t serial, uint32_t, uint32_t button,
                            uint32_t state) {
         auto& a = self(data);
         const bool down = state == WL_POINTER_BUTTON_STATE_PRESSED;
+        if (down)
+            a.last_press_serial_ = serial;
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
-            a.pointer_panel_->pointer_button(button, down);
-        else if (a.pointer_target_ == pointer_target::launcher)
+            a.pointer_panel_->pointer_button(button, down, serial);
+        else if (a.pointer_target_ == pointer_target::menu)
+            a.menu_.pointer_button(a.pointer_surface_, button, down, serial);
+        else if (a.pointer_target_ == pointer_target::notify) {
+            const notify_click c = a.note_view_.pointer_button(button, down);
+            if (c.what != notify_click::kind::none)
+                a.on_notify_click(c, a.last_press_serial_);
+        } else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_button(serial, button, down);
+        else if (a.pointer_target_ == pointer_target::switcher && down && a.switcher_.active()) {
+            // A click picks the window under it (or the selection) and ends the switch.
+            if (const int i = a.switcher_view_.entry_at(a.switcher_ptr_x_, a.switcher_ptr_y_);
+                i >= 0 && !a.switcher_ptr_moved_)
+                a.switcher_.select(static_cast<unsigned>(i));
+            a.finish_switch(true, "click");
+        }
     }
     static void ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value) {
         auto& a = self(data);
@@ -506,6 +750,8 @@ struct lx::shell::shell_app::events {
         a.axis_discrete_seen_ = true;
         if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_scroll_steps(discrete);
+        else if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
+            a.pointer_panel_->pointer_scroll(discrete);
     }
 
     // ── wl_keyboard: only the launcher ever has keyboard focus ──
@@ -550,6 +796,8 @@ struct lx::shell::shell_app::events {
     // ── xdg_activation_token_v1 ──
     static void token_done(void* data, xdg_activation_token_v1* tok, const char* token);
 #endif
+    // ── xdg_wm_base (menus and tooltips are its popups) ──
+    static void wm_ping(void*, xdg_wm_base* base, uint32_t serial) { xdg_wm_base_pong(base, serial); }
 #if defined(LUMEN_SHELL_IDLE)
     // ── ext_idle_notification_v1, zwlr_output_power_v1 ──
     static void idled(void* data, ext_idle_notification_v1*);
@@ -597,6 +845,9 @@ const wl_pointer_listener k_pointer_listener = {
     .axis_source = lx::shell::shell_app::events::ptr_axis_source,
     .axis_stop = lx::shell::shell_app::events::ptr_axis_stop,
     .axis_discrete = lx::shell::shell_app::events::ptr_axis_discrete,
+};
+const xdg_wm_base_listener k_wm_base_listener = {
+    .ping = lx::shell::shell_app::events::wm_ping,
 };
 const wl_keyboard_listener k_keyboard_listener = {
     .keymap = lx::shell::shell_app::events::kb_keymap,
@@ -722,11 +973,19 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         // v4: key grabs; v5: the session lock's state and lock requests. An older
         // compositor is bound at its own version, and the bridge reports what is absent.
         // v6: icons, parents, the bell, capture state, non-inhibitable grabs.
-        a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface, min_version(version, 6));
+        a.shell_ = wl_registry_bind(reg, name, &zlm_shell_v1_interface, min_version(version, 7));
         // capabilities follows the bind at once; listen before it is dispatched.
         (void)a.bridge_.observe(a.shell_);
+    } else if (std::strcmp(iface, "ext_workspace_manager_v1") == 0) {
+        // Before the policy bridge (bound after these roundtrips): the compositor names
+        // each window's workspace with this client's handles (zlm v7 toplevel_workspace).
+        a.workspaces_.bind(reg, name, version);
     } else if (std::strcmp(iface, wp_cursor_shape_manager_v1_interface.name) == 0) {
         a.cursor_shape_ = wl_registry_bind(reg, name, &wp_cursor_shape_manager_v1_interface, 1);
+    } else if (std::strcmp(iface, xdg_wm_base_interface.name) == 0 && !a.wm_base_) {
+        // Menus and tooltips: xdg_popups of the panel (layer-shell get_popup).
+        a.wm_base_ = wl_registry_bind(reg, name, &xdg_wm_base_interface, min_version(version, 3));
+        xdg_wm_base_add_listener(static_cast<xdg_wm_base*>(a.wm_base_), &k_wm_base_listener, &a);
 #if defined(LUMEN_SHELL_ACTIVATION)
     } else if (std::strcmp(iface, xdg_activation_v1_interface.name) == 0) {
         a.activation_ = wl_registry_bind(reg, name, &xdg_activation_v1_interface, 1);
@@ -1021,17 +1280,38 @@ void lx::shell::shell_app::output_ready(output_record& o) {
     o.bar = std::make_unique<panel>();
     o.bar->set_apps(true, launcher_.is_open());
     o.bar->set_action_handler(
-        [](panel_action action, void* user) {
-            auto& a = *static_cast<shell_app*>(user);
+        [](panel_action action, int arg, void* user) {
+            auto& r = *static_cast<output_record*>(user);
+            auto& a = *r.app;
             if (action == panel_action::apps)
                 a.toggle_launcher();
             else if (action == panel_action::task && a.launcher_.is_open())
                 a.close_launcher();
+            else if (action == panel_action::workspace)
+                a.workspaces_.activate(arg);
+            else if (action == panel_action::workspace_scroll)
+                a.scroll_workspaces(r, arg);
         },
-        this);
-    // This output's windows only: the one each overlaps most among the outputs.
+        &o);
+    o.bar->set_output_name(o.connector);
+    // The indicator: this output's workspaces (ext-workspace), a dot on those with windows.
+    o.bar->set_workspaces({[](panel_ws_input& in, void* user) {
+                               const auto& rec = *static_cast<const output_record*>(user);
+                               rec.app->fill_workspace_cells(rec, in);
+                           },
+                           &o});
+    // This output's windows only — the one each overlaps most among the outputs — and of
+    // those, the ones on its active workspace (and sticky ones).
     o.bar->set_filter({[](const task_entry& e, void* user) {
                            const auto& rec = *static_cast<const output_record*>(user);
+                           const auto& view = rec.app->workspaces_.view();
+                           if (!task_on_shown_workspace(
+                                   e,
+                                   [](const void* ws, void* v) {
+                                       return static_cast<const workspace_view*>(v)->is_active(ws);
+                                   },
+                                   const_cast<workspace_view*>(&view)))
+                               return false;
                            const auto& all = rec.app->outputs_;
                            lx::rect2i rects[16];
                            unsigned n = 0;
@@ -1065,7 +1345,51 @@ void lx::shell::shell_app::output_ready(output_record& o) {
     }
     shell_log(lx::trace::level::info, "panel requested on output {} ({}x{}+{}+{})", o.connector,
               o.logical.width, o.logical.height, o.logical.x, o.logical.y);
+    if (desktop_started_)
+        attach_widgets(o);
     outputs_moved();
+}
+
+void lx::shell::shell_app::fill_workspace_cells(const output_record& o, panel_ws_input& in) const {
+    in.count = 0;
+    if (!o.output || !workspaces_.synced())
+        return;
+    const workspace_view& view = workspaces_.view();
+    int ids[k_max_ws_cells];
+    const unsigned n = view.of_output(o.output, ids, k_max_ws_cells);
+    task_handle tasks[k_max_tasks];
+    const unsigned nt = bridge_.model().ordered(tasks, k_max_tasks);
+    for (unsigned i = 0; i < n; ++i) {
+        const shell_workspace* w = view.get(ids[i]);
+        if (!w)
+            continue;
+        panel_ws_item& item = in.items[in.count++];
+        std::snprintf(item.name, sizeof(item.name), "%s", w->name);
+        item.id = ids[i];
+        item.rev = w->rev;
+        item.flags = ((w->state & shell_ws_active) ? ws_cell_active : 0u) |
+                     ((w->state & shell_ws_urgent) ? ws_cell_urgent : 0u);
+        for (unsigned t = 0; t < nt; ++t)
+            if (const task_entry* e = bridge_.model().get(tasks[t]); e && e->workspace == w->proxy) {
+                item.flags |= ws_cell_occupied;
+                break;
+            }
+    }
+}
+
+void lx::shell::shell_app::scroll_workspaces(const output_record& o, int dir) {
+    const workspace_view& view = workspaces_.view();
+    int ids[k_max_ws_cells];
+    const unsigned n = view.of_output(o.output, ids, k_max_ws_cells);
+    for (unsigned i = 0; i < n; ++i) {
+        const shell_workspace* w = view.get(ids[i]);
+        if (!w || !(w->state & shell_ws_active))
+            continue;
+        const long long next = static_cast<long long>(i) + (dir > 0 ? 1 : -1);
+        if (next >= 0 && next < static_cast<long long>(n))
+            workspaces_.activate(ids[next]);
+        return;
+    }
 }
 
 void lx::shell::shell_app::outputs_moved() {
@@ -1106,6 +1430,20 @@ void lx::shell::shell_app::remove_output(unsigned name) {
         if ((*it)->name != name)
             continue;
         shell_log(lx::trace::level::info, "output {} removed: its panel goes", (*it)->connector);
+        if (menu_output_ == name)
+            menu_.close();
+        if (tooltip_output_ == name) {
+            tooltip_.close();
+            set_timer(t_tooltip, 0);
+            tooltip_key_ = 0;
+        }
+        if (pending_menu_output_ == name)
+            pending_menu_key_ = 0;
+        if (notify_output_ == name) {
+            note_view_.close(); // shown again on another output after this dispatch
+            notify_output_ = 0;
+        }
+        workspaces_.view().forget_output((*it)->output);
         destroy_output(**it);
         outputs_.erase(it);
         outputs_moved();
@@ -1206,6 +1544,18 @@ void lx::shell::shell_app::on_timer() {
         bell_.expire(now);
         deadline_[t_bell] = bell_.deadline();
     }
+    if (deadline_[t_switcher] && deadline_[t_switcher] <= now) {
+        deadline_[t_switcher] = 0;
+        open_switcher();
+    }
+    if (deadline_[t_notify] && deadline_[t_notify] <= now) {
+        deadline_[t_notify] = 0;
+        (void)notes_.expire(now); // NotificationClosed(1) through the sink
+    }
+    if (deadline_[t_tooltip] && deadline_[t_tooltip] <= now) {
+        deadline_[t_tooltip] = 0;
+        show_tooltip();
+    }
     if (deadline_[t_lock_blank] && deadline_[t_lock_blank] <= now) {
         deadline_[t_lock_blank] = 0;
         // The lock did not come in time: dark anyway (the compositor keeps it locked if it
@@ -1226,7 +1576,9 @@ const std::uint32_t* lx::shell::shell_app::resolve_icon(task_handle h, const tas
     // 2. Its own pixel buffers: the one nearest the size, resampled once per revision.
     policy_bridge::icon_image images[policy_bridge::k_icon_images];
     if (const unsigned n = bridge_.icon_images(h, images, policy_bridge::k_icon_images); n > 0) {
-        icon_cache& c = icon_cache_[h.index];
+        // Two sizes are in use (the panel's and the switcher's): one cache each, so neither
+        // resamples again for the other.
+        icon_cache& c = px > 32 ? icon_cache_large_[h.index] : icon_cache_[h.index];
         if (c.gen != h.gen || c.rev != e.icon_rev || c.px != px || c.pixels.empty()) {
             // The smallest buffer at least as large as asked, else the largest.
             const policy_bridge::icon_image* best = nullptr;
@@ -1333,6 +1685,11 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
         // what it had open is dropped, so the unlocked desktop comes back as it should.
         if (launcher_.is_open())
             close_launcher();
+        if (switcher_.active())
+            finish_switch(false, "locked");
+        menu_.close();
+        tooltip_.close();
+        set_timer(t_tooltip, 0);
         pointer_target_ = pointer_target::none;
         repeat_code_ = 0;
         set_timer(t_repeat, 0);
@@ -1355,6 +1712,9 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
     }
     if (s == shell_lock::unlocked)
         set_timer(t_lock_blank, 0);
+    // Notifications arriving while locked wait (their timers too) and show after the unlock
+    // (design-session-and-wm N.4); nothing of the shell is shown over the lock anyway.
+    notes_.set_locked(s != shell_lock::unlocked, now_ns());
     if (blank)
         blank_outputs("locked: powering the outputs off");
     update_locked_notification();
@@ -1382,6 +1742,11 @@ void lx::shell::shell_app::on_key(unsigned serial, unsigned code, bool pressed) 
     }
     last_key_serial_ = serial;
     key_press k{};
+    if (menu_.is_open()) {
+        if (xkb_.press(code, k))
+            menu_.key(k.keysym, k.utf8, serial);
+        return;
+    }
     if (!launcher_.is_open() || !xkb_.press(code, k))
         return;
     launcher_.key(serial, k, xkb_.ctrl(), xkb_.shift());
@@ -1535,8 +1900,8 @@ void lx::shell::shell_app::launch_terminal(unsigned serial) {
         close_launcher();
 }
 
-void lx::shell::shell_app::begin_launch(std::unique_ptr<prepared_launch> p, unsigned serial,
-                                        void* surface) {
+bool lx::shell::shell_app::request_token(pending_token&& req, unsigned serial, void* surface,
+                                         const char* app_id) {
 #if defined(LUMEN_SHELL_ACTIVATION)
     if (activation_ && seat_) {
         for (auto& t : tokens_) {
@@ -1544,31 +1909,48 @@ void lx::shell::shell_app::begin_launch(std::unique_ptr<prepared_launch> p, unsi
                 continue;
             // The triggering input's serial: a key press, a click or a grab activation —
             // each a press delivered to this client, so the compositor finds the token
-            // grantable and the new window may take focus.
+            // grantable and the window it is handed to may take focus.
             auto* tok = xdg_activation_v1_get_activation_token(
                 static_cast<xdg_activation_v1*>(activation_));
             xdg_activation_token_v1_add_listener(tok, &k_token_listener, this);
-            xdg_activation_token_v1_set_serial(tok, serial, static_cast<wl_seat*>(seat_));
-            xdg_activation_token_v1_set_app_id(tok, p->id);
+            if (serial)
+                xdg_activation_token_v1_set_serial(tok, serial, static_cast<wl_seat*>(seat_));
+            if (app_id && *app_id)
+                xdg_activation_token_v1_set_app_id(tok, app_id);
             if (surface)
                 xdg_activation_token_v1_set_surface(tok, static_cast<wl_surface*>(surface));
             xdg_activation_token_v1_commit(tok);
+            t = std::move(req);
             t.token = tok;
-            t.launch = std::move(p);
             t.deadline_ns = now_ns() + k_token_timeout_ns;
             long long earliest = 0;
             for (const auto& o : tokens_)
                 if (o.token && (!earliest || o.deadline_ns < earliest))
                     earliest = o.deadline_ns;
             set_timer(t_token, earliest);
-            return;
+            return true;
         }
     }
 #else
+    (void)req;
     (void)serial;
     (void)surface;
+    (void)app_id;
 #endif
-    start_launch(*p, nullptr);
+    return false;
+}
+
+void lx::shell::shell_app::begin_launch(std::unique_ptr<prepared_launch> p, unsigned serial,
+                                        void* surface) {
+    pending_token t{};
+    t.what = pending_token::purpose::launch;
+    const std::string id = p->id;
+    t.launch = std::move(p);
+    if (request_token(std::move(t), serial, surface, id.c_str()))
+        return;
+    // No activation (or eight tokens in flight): at once, without one.
+    if (t.launch)
+        start_launch(*t.launch, nullptr);
 }
 
 void lx::shell::shell_app::token_done(pending_token& t, const char* token) {
@@ -1576,10 +1958,23 @@ void lx::shell::shell_app::token_done(pending_token& t, const char* token) {
     xdg_activation_token_v1_destroy(static_cast<xdg_activation_token_v1*>(t.token));
 #endif
     t.token = nullptr;
-    std::unique_ptr<prepared_launch> p = std::move(t.launch);
     t.deadline_ns = 0;
-    if (p)
-        start_launch(*p, token);
+    switch (t.what) {
+    case pending_token::purpose::launch: {
+        std::unique_ptr<prepared_launch> p = std::move(t.launch);
+        if (p)
+            start_launch(*p, token);
+        break;
+    }
+    case pending_token::purpose::notify_action:
+        note_server_.action_invoked(t.id, t.key.c_str(), token, now_ns());
+        break;
+    case pending_token::purpose::tray_activate:
+        tray_.activate(t.id, t.x, t.y, token, t.secondary);
+        break;
+    }
+    t.launch.reset();
+    t.key.clear();
 }
 
 void lx::shell::shell_app::expire_tokens(long long now) {
@@ -1590,7 +1985,7 @@ void lx::shell::shell_app::expire_tokens(long long now) {
         if (t.deadline_ns <= now) {
             if (shell_debug())
                 apps_log(lx::trace::level::debug,
-                         "apps: no activation token within 100 ms: launching without one");
+                         "apps: no activation token within 100 ms: going on without one");
             token_done(t, nullptr);
         } else if (!earliest || t.deadline_ns < earliest) {
             earliest = t.deadline_ns;
@@ -1635,7 +2030,44 @@ int lx::shell::shell_app::run() {
             static_cast<shell_app*>(user)->on_lock_requested(reason);
         },
         this);
+    // zlm_shell_v1 v7: the configuration arrives right after the bind (before the panels and
+    // the idle policy are set up, which then start from it), the actions whenever bound keys
+    // are pressed.
+    bridge_.set_config_handlers(
+        [](std::string_view bytes, unsigned generation, void* user) {
+            static_cast<shell_app*>(user)->on_config(bytes, generation);
+        },
+        [](unsigned generation, bool applied, unsigned errors, unsigned warnings,
+           std::span<const policy_bridge::config_line> lines, void* user) {
+            static_cast<shell_app*>(user)->on_config_done(generation, applied, errors, warnings,
+                                                          lines);
+        },
+        [](const char* action, const char* argument, unsigned serial, unsigned, void* user) {
+            (void)argument;
+            static_cast<shell_app*>(user)->on_action(action, argument, serial);
+        },
+        this);
 
+    // zlm_shell_v1 v7 held actions: the window switcher (Alt+Tab).
+    bridge_.set_hold_handlers(
+        {.begin = [](const char* action, const char*, unsigned, unsigned, void* user) {
+             static_cast<shell_app*>(user)->on_hold_begin(action);
+         },
+         .key = [](unsigned keysym, unsigned mods, const char* binding, unsigned, unsigned,
+                   void* user) { static_cast<shell_app*>(user)->on_hold_key(keysym, mods, binding); },
+         .released = [](unsigned, unsigned, void* user) {
+             static_cast<shell_app*>(user)->finish_switch(true, "released");
+         },
+         .cancelled = [](void* user) {
+             static_cast<shell_app*>(user)->finish_switch(false, "cancelled by the compositor");
+         },
+         .user = this});
+    // A workspace handle that goes: no window names it any more (its proxy is destroyed).
+    workspaces_.set_removed_handler(
+        [](void* proxy, void* user) {
+            static_cast<shell_app*>(user)->bridge_.model().forget_workspace(proxy);
+        },
+        this);
     auto* d = wl_display_connect(config_.display);
     if (!d) {
         close(sfd);
@@ -1713,9 +2145,35 @@ int lx::shell::shell_app::run() {
                 .viewporter = viewporter_});
     bridge_.set_bell_handler(
         [](task_handle h, void* user) { static_cast<shell_app*>(user)->on_bell(h); }, this);
-    // Shell keybindings (zlm_shell_v1 v4). The Super tap is observed — the key still reaches
-    // the focused window — and fires only when Super was pressed and released alone.
-    if (bridge_.can_grab_keys()) {
+    switcher_view_.init({.compositor = compositor_,
+                         .shm = shm_,
+                         .layer_shell = layer_shell_,
+                         .viewporter = viewporter_,
+                         .fractional = fractional_},
+                        [](task_handle h, const task_entry& e, int px, void* user) {
+                            return static_cast<shell_app*>(user)->resolve_icon(h, e, px);
+                        },
+                        this);
+    // Shell keybindings. With zlm v7 the compositor matches them (config.toml [bindings]) and
+    // sends actions; the shell grabs nothing — except Super+L for a lock command given on
+    // the command line that the configuration does not know (the compositor binds shell.lock
+    // only when idle.lock-command is set).
+    if (bridge_.has_v7()) {
+        const bool file_lock = file_config_ && file_config_->idle.lock_command[0];
+        if (idle_.can_lock() && !file_lock) {
+            const auto on_lock = [](unsigned, unsigned, void* user) {
+                auto& a = *static_cast<shell_app*>(user);
+                if (a.idle_.on_lock_requested())
+                    a.launch_locker("Super+L");
+            };
+            (void)bridge_.grab_key(k_key_l, policy_bridge::k_mod_super,
+                                   policy_bridge::k_grab_not_inhibitable, on_lock, this);
+        }
+        shell_log(lx::trace::level::info, "key bindings: the compositor's (zlm v7 actions)");
+    } else if (bridge_.can_grab_keys()) {
+        // zlm_shell_v1 v4..v6: the shell's own grabs. The Super tap is observed — the key still
+        // reaches the focused window — and fires only when Super was pressed and released
+        // alone.
         const auto on_super = [](unsigned, unsigned, void* user) {
             static_cast<shell_app*>(user)->toggle_launcher();
         };
@@ -1756,13 +2214,14 @@ int lx::shell::shell_app::run() {
                 : "");
     }
     update_locked_notification(); // started behind a lock (a restart while locked)
+    started_ = true;
     {
         shell_log(lx::trace::level::info, "connected to {}; panel requested",
                   config_.display ? config_.display : "$WAYLAND_DISPLAY");
     }
 
     int code = 0;
-    constexpr unsigned k_fixed = 5;
+    constexpr unsigned k_fixed = 6;
     pollfd fds[k_fixed + app_launcher::k_max_poll];
     for (;;) {
         // The canonical libwayland client loop: dispatch what is queued, flush, then
@@ -1775,16 +2234,32 @@ int lx::shell::shell_app::run() {
         }
         if (code)
             break;
+        // Notifications and the tray first: what they changed (the panels' widgets) is drawn
+        // by the panels below in this same iteration.
+        desktop_after_dispatch();
         {
             // The model's changes are taken once and handed to every panel. A snapshot in
             // progress keeps them until it is done.
             task_model& model = bridge_.model();
             const unsigned changes = model.in_snapshot() ? 0u : model.take_changes();
+            // An ext-workspace `done` with changes: the indicators and which windows each
+            // panel lists (the active workspace's) follow.
+            const bool ws_changed = workspaces_.view().take_changed();
+            // A window that went during a switch leaves its list (an empty list ends it).
+            if (switcher_.active() && (changes & task_change_list) && switcher_.prune(model) &&
+                switcher_.count() == 0)
+                finish_switch(false, "no windows left");
             for (auto& o : outputs_)
-                if (o->bar)
+                if (o->bar) {
+                    if (ws_changed) {
+                        o->bar->workspaces_changed();
+                        o->bar->filter_changed();
+                    }
                     o->bar->after_dispatch(changes);
+                }
         }
         launcher_.after_dispatch();
+        switcher_view_.after_dispatch(switcher_, bridge_.model());
         for (auto& o : outputs_) {
             if (!o->bg)
                 continue;
@@ -1810,6 +2285,9 @@ int lx::shell::shell_app::run() {
             catalog_scanned_after_frame_ = true;
             if (!catalog_.scanned())
                 catalog_.scan();
+            // The user bus too (notifications, the tray): never before the panel shows.
+            start_desktop_services();
+            desktop_after_dispatch();
         }
         fds[0] = {wl_display_get_fd(d), POLLIN, 0};
         if (wl_display_flush(d) < 0) {
@@ -1825,7 +2303,9 @@ int lx::shell::shell_app::run() {
         fds[2] = {catalog_.watch_fd(), POLLIN, 0};
         fds[3] = {timer_fd_, POLLIN, 0};
         fds[4] = {bg_notify_fd_, POLLIN, 0};
-        int timeout_ms = -1;
+        // The user bus (once open): asleep unless a message comes or a call's reply is due.
+        fds[5] = {bus_.fd(), bus_.events(), 0};
+        int timeout_ms = bus_.timeout_ms();
         const unsigned na = apps_.poll_fds(fds + k_fixed, app_launcher::k_max_poll, timeout_ms);
         timespec ts{};
         if (timeout_ms >= 0) {
@@ -1875,6 +2355,7 @@ int lx::shell::shell_app::run() {
         // activity); pipes only with events.
         if (na > 0)
             apps_.dispatch({fds + k_fixed, na});
+        bus_.process();
     }
     close(sfd);
     teardown();
@@ -1896,7 +2377,9 @@ void lx::shell::shell_app::teardown() {
         t.token = nullptr;
         t.launch.reset();
     }
+    stop_desktop_services();
     launcher_.close();
+    switcher_view_.close();
     bell_.destroy_all();
     pointer_panel_ = nullptr;
     for (auto& o : outputs_) {
@@ -1905,6 +2388,7 @@ void lx::shell::shell_app::teardown() {
         o->bg.reset();
     }
     bridge_.detach();
+    workspaces_.destroy();
     teardown_idle();
     if (cursor_device_)
         wp_cursor_shape_device_v1_destroy(static_cast<wp_cursor_shape_device_v1*>(cursor_device_));
@@ -1923,6 +2407,9 @@ void lx::shell::shell_app::teardown() {
 #endif
     if (cursor_shape_)
         wp_cursor_shape_manager_v1_destroy(static_cast<wp_cursor_shape_manager_v1*>(cursor_shape_));
+    if (wm_base_)
+        xdg_wm_base_destroy(static_cast<xdg_wm_base*>(wm_base_));
+    wm_base_ = nullptr;
     if (shell_)
         zlm_shell_v1_destroy(static_cast<zlm_shell_v1*>(shell_));
     if (layer_shell_)
@@ -1954,6 +2441,352 @@ void lx::shell::shell_app::teardown() {
     timer_fd_ = -1;
 }
 
+// ── Configuration (zlm_shell_v1 v7) ──
+
+namespace {
+
+/// The command's program is an absolute path that exists, or found in PATH.
+[[nodiscard]] bool command_found(const char* command) {
+    std::string_view s{command ? command : ""};
+    while (!s.empty() && s.front() == ' ')
+        s.remove_prefix(1);
+    const std::string_view prog = s.substr(0, s.find(' '));
+    if (prog.empty())
+        return false;
+    const std::string p{prog};
+    if (p.find('/') != std::string::npos)
+        return ::access(p.c_str(), X_OK) == 0;
+    const char* path = std::getenv("PATH");
+    std::string_view dirs{path ? path : "/usr/local/bin:/usr/bin:/bin"};
+    while (!dirs.empty()) {
+        const std::size_t colon = dirs.find(':');
+        const std::string dir{dirs.substr(0, colon)};
+        dirs = colon == std::string_view::npos ? std::string_view{} : dirs.substr(colon + 1);
+        if (dir.empty())
+            continue;
+        if (::access((dir + "/" + p).c_str(), X_OK) == 0)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
+void lx::shell::shell_app::on_config(std::string_view bytes, unsigned generation) {
+    // The compositor validated these bytes; the shell parses them the same way and takes its
+    // sections. Its diagnostics are the compositor's (config_diagnostic), not repeated here.
+    auto next = std::make_unique<lx::config::config_snapshot>(lx::config::default_config());
+    lx::config::diagnostics diag{};
+    if (!lx::config::parse_config(lx::config::split_layers(bytes), *next, diag,
+                                  file_config_.get())) {
+        shell_log(lx::trace::level::warn, "configuration generation {} does not parse here; "
+                                          "keeping the one in use",
+                  generation);
+        return;
+    }
+    apply_config(*next);
+    apply_notify_config(*next);
+    // Focus that follows the mouse passes over windows: those it only passed are not
+    // "recently used" (niri's 750 ms debounce); with click to focus every focus counts.
+    bridge_.model().set_focus_debounce(next->focus.mode == lx::config::focus_mode::sloppy
+                                           ? 750'000'000LL
+                                           : 0);
+    file_config_ = std::move(next);
+}
+
+void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
+    const unsigned cli = config_.cli_set;
+    // ── idle and lock ──
+    idle_policy_config want = config_.idle;
+    if (!(cli & cli_idle_policy))
+        want.enabled = c.idle.policy == lx::config::idle_policy_kind::shell;
+    if (!(cli & cli_blank_after))
+        want.blank_after_s = static_cast<unsigned>(c.idle.blank_after);
+    if (!(cli & cli_blank_locked_after))
+        want.blank_locked_after_s = static_cast<unsigned>(c.idle.blank_locked_after);
+    if (!(cli & cli_lock_on_blank))
+        want.lock_on_blank = c.idle.lock_on_blank;
+    if (!(cli & cli_lock_command)) {
+        file_lock_command_ = c.idle.lock_command;
+        want.lock_command = file_lock_command_.empty() ? nullptr : file_lock_command_.c_str();
+        if (!file_lock_command_.empty() && !command_found(file_lock_command_.c_str()))
+            lx::trace::logger::global().logf(lx::trace::level::warn, "config",
+                                             "idle.lock-command: \"{}\" is not found in PATH; "
+                                             "locking will fail",
+                                             file_lock_command_);
+    }
+    const auto same_str = [](const char* a, const char* b) {
+        return std::strcmp(a ? a : "", b ? b : "") == 0;
+    };
+    const bool idle_changed = want.enabled != config_.idle.enabled ||
+                              want.blank_after_s != config_.idle.blank_after_s ||
+                              want.blank_locked_after_s != config_.idle.blank_locked_after_s ||
+                              want.lock_on_blank != config_.idle.lock_on_blank ||
+                              !same_str(want.lock_command, config_.idle.lock_command);
+    config_.idle = want;
+    // The policy always takes the new copy (the lock command's storage may have moved).
+    if (idle_changed && started_)
+        reconfigure_idle();
+    else
+        idle_.configure(want);
+    if (idle_changed)
+        lx::trace::logger::global().logf(
+            lx::trace::level::info, "config",
+            "idle: policy {} blank-after {} s blank-locked-after {} s lock-command \"{}\"{}",
+            want.enabled ? "shell" : "none", want.blank_after_s, want.blank_locked_after_s,
+            want.lock_command ? want.lock_command : "",
+            (cli & ~cli_background) ? " (some set on the command line)" : "");
+    // ── background ──
+    if (!(cli & cli_background) && file_background_ != c.background.spec) {
+        const std::string_view spec{c.background.spec};
+        bool ok = true;
+        if (spec == "none") {
+            config_.background_enabled = false;
+        } else if (auto parsed = parse_background(spec)) {
+            config_.background = *parsed;
+            config_.background_enabled = true;
+        } else {
+            ok = false;
+            lx::trace::logger::global().logf(lx::trace::level::warn, "config",
+                                             "background.spec: \"{}\" is not a background "
+                                             "(lumen, #RRGGBB, gradient:…, image:PATH, none); "
+                                             "keeping the one shown",
+                                             spec);
+        }
+        if (ok) {
+            file_background_ = c.background.spec;
+            if (started_)
+                rebuild_backgrounds();
+        }
+    }
+}
+
+void lx::shell::shell_app::reconfigure_idle() {
+#if defined(LUMEN_SHELL_IDLE)
+    if (locked_notification_)
+        ext_idle_notification_v1_destroy(
+            static_cast<ext_idle_notification_v1*>(locked_notification_));
+    locked_notification_ = nullptr;
+    if (idle_notification_)
+        ext_idle_notification_v1_destroy(static_cast<ext_idle_notification_v1*>(idle_notification_));
+    idle_notification_ = nullptr;
+    for (auto& o : outputs_) {
+        if (o->power)
+            zwlr_output_power_v1_destroy(static_cast<zwlr_output_power_v1*>(o->power));
+        o->power = nullptr;
+    }
+#endif
+    power_enabled_ = false;
+    idle_.configure(config_.idle);
+    idle_.on_resumed();
+    setup_idle();
+    update_locked_notification();
+}
+
+void lx::shell::shell_app::rebuild_backgrounds() {
+    for (auto& o : outputs_) {
+        o->bg.reset();
+        if (o->done)
+            output_ready(*o);
+    }
+}
+
+void lx::shell::shell_app::on_config_done(unsigned generation, bool applied, unsigned errors,
+                                          unsigned warnings,
+                                          std::span<const policy_bridge::config_line> lines) {
+    if (errors == 0 && warnings == 0) {
+        shown_config_report_.clear();
+        // The file is fine again: the notification about its problems goes.
+        if (config_note_id_) {
+            (void)notes_.close(config_note_id_, close_reason::closed, now_ns());
+            config_note_id_ = 0;
+        }
+        return;
+    }
+    // One notice per generation with problems, and none again for the same report (a file
+    // saved twice unchanged, a shell restarted).
+    std::string report;
+    for (const auto& l : lines) {
+        report += l.file;
+        report += ':';
+        report += std::to_string(l.line);
+        report += l.text;
+        report += '\n';
+    }
+    if (generation == shown_config_generation_ || report == shown_config_report_)
+        return;
+    shown_config_generation_ = generation;
+    shown_config_report_ = report;
+    char text[320];
+    const char* first = lines.empty() ? "" : lines.front().text.c_str();
+    char where[96] = "";
+    if (!lines.empty()) {
+        const std::string& f = lines.front().file;
+        const std::size_t slash = f.rfind('/');
+        const std::string name = slash == std::string::npos ? f : f.substr(slash + 1);
+        if (!name.empty() && lines.front().line)
+            std::snprintf(where, sizeof(where), "%s:%u: ", name.c_str(), lines.front().line);
+        else if (!name.empty())
+            std::snprintf(where, sizeof(where), "%s: ", name.c_str());
+    }
+    std::snprintf(text, sizeof(text), "Lumen configuration%s: %u error%s, %u warning%s — %s%s",
+                  applied ? "" : " not used", errors, errors == 1 ? "" : "s", warnings,
+                  warnings == 1 ? "" : "s", where, first);
+    lx::trace::logger::global().logf(lx::trace::level::info, "config", "notice: {}", text);
+    // A notification once the server runs (replacing the previous one about the
+    // configuration); the panel's notice before that.
+    if (notifications_owned()) {
+        char summary[96];
+        std::snprintf(summary, sizeof(summary), "Lumen configuration%s",
+                      applied ? "" : " not used");
+        char body[400];
+        std::snprintf(body, sizeof(body), "%u error%s, %u warning%s \u2014 %s%s", errors,
+                      errors == 1 ? "" : "s", warnings, warnings == 1 ? "" : "s", where, first);
+        post_internal(summary, body, errors > 0 ? notify_urgency::critical : notify_urgency::normal,
+                      config_note_id_);
+        return;
+    }
+    show_notice(text);
+}
+
+void lx::shell::shell_app::on_action(const char* action, const char* argument, unsigned serial) {
+    (void)argument;
+    const std::string_view a{action ? action : ""};
+    if (a == "shell.launcher") {
+        toggle_launcher();
+    } else if (a == "shell.terminal") {
+        launch_terminal(serial);
+    } else if (a == "shell.lock") {
+        if (idle_.on_lock_requested())
+            launch_locker("shell.lock");
+    } else if (a.starts_with("switcher.")) {
+        // Not held (lumen-ctl action): the window the switcher would select, at once.
+        quick_switch(a);
+    } else if (a == "notifications.toggle-dnd") {
+        toggle_dnd("notifications.toggle-dnd");
+    } else if (a == "notifications.dismiss") {
+        (void)notes_.dismiss_newest(now_ns());
+    } else if (a == "notifications.dismiss-all") {
+        (void)notes_.dismiss_all(now_ns());
+    } else if (shell_debug()) {
+        shell_log(lx::trace::level::debug, "action {}: not a shell action this version knows", a);
+    }
+}
+
+// ── The window switcher (design-session-and-wm K.1, K.2) ──
+
+lx::shell::switcher_options lx::shell::shell_app::switcher_settings() const {
+    switcher_options o{};
+    if (file_config_) {
+        o.all = file_config_->switcher.scope == lx::config::switcher_scope::all;
+        o.include_minimized = file_config_->switcher.include_minimized;
+        o.open_delay_ns = static_cast<long long>(file_config_->switcher.open_delay) * 1'000'000LL;
+    }
+    return o;
+}
+
+namespace {
+
+/// Scope "workspace": the windows the panels list (the active workspace of their output,
+/// sticky ones, and any whose workspace is not known).
+bool switcher_shown(const lx::shell::task_entry& e, void* user) {
+    const auto* view = static_cast<const lx::shell::workspace_view*>(user);
+    return lx::shell::task_on_shown_workspace(
+        e,
+        [](const void* ws, void* v) {
+            return static_cast<const lx::shell::workspace_view*>(v)->is_active(ws);
+        },
+        const_cast<lx::shell::workspace_view*>(view));
+}
+
+} // namespace
+
+void lx::shell::shell_app::on_hold_begin(const char* action) {
+    const std::string_view a{action ? action : ""};
+    const bool forward = a == "switcher.next" || a == "switcher.next-app";
+    const bool same_app = a == "switcher.next-app" || a == "switcher.previous-app";
+    if (!forward && a != "switcher.previous" && a != "switcher.previous-app") {
+        bridge_.end_hold(); // not a hold this shell knows: the keys go back at once
+        return;
+    }
+    if (switcher_.active())
+        finish_switch(false, "a new hold");
+    if (launcher_.is_open())
+        close_launcher();
+    const unsigned n = switcher_.begin(bridge_.model(), forward, same_app, switcher_settings(),
+                                       &switcher_shown, &workspaces_.view(), now_ns());
+    if (n == 0) {
+        (void)switcher_.finish(false);
+        bridge_.end_hold();
+        lx::trace::logger::global().logf(lx::trace::level::info, "shell.switcher",
+                                         "switcher: {}: no window to switch to", a);
+        return;
+    }
+    set_timer(t_switcher, switcher_.open_at());
+    if (shell_debug()) {
+        const task_entry* e = bridge_.model().get(switcher_.selected());
+        lx::trace::logger::global().logf(lx::trace::level::debug, "shell.switcher",
+                                         "switcher: hold {} windows={} selection={} \"{}\"", a, n,
+                                         switcher_.selection(), e ? e->title : "");
+    }
+}
+
+void lx::shell::shell_app::on_hold_key(unsigned keysym, unsigned mods, const char* binding) {
+    switch (switcher_.key(keysym, mods, binding ? binding : "")) {
+    case switcher_key_result::none:
+    case switcher_key_result::changed: return;
+    case switcher_key_result::commit: finish_switch(true, "return"); return;
+    case switcher_key_result::cancel: finish_switch(false, "escape"); return;
+    }
+}
+
+void lx::shell::shell_app::open_switcher() {
+    if (!switcher_.active() || switcher_.opened())
+        return;
+    switcher_.mark_opened();
+    // On the active window's output (else the one pointed at last, else the first).
+    output_record* o = launcher_output();
+    if (!switcher_view_.open(o ? o->output : nullptr, o ? o->logical.width : 0,
+                             o ? o->logical.height : 0, switcher_))
+        return;
+    switcher_.set_columns(switcher_view_.layout().columns);
+}
+
+void lx::shell::shell_app::finish_switch(bool commit, const char* why) {
+    if (!switcher_.active())
+        return;
+    const bool shown = switcher_view_.is_open();
+    const task_handle h = switcher_.finish(commit);
+    set_timer(t_switcher, 0);
+    bridge_.end_hold(); // nothing when the compositor already ended it
+    switcher_view_.close();
+    if (pointer_target_ == pointer_target::switcher)
+        pointer_target_ = pointer_target::none;
+    const task_entry* e = bridge_.model().get(h);
+    if (e) {
+        // Chosen explicitly: it is the most recent window however briefly it stays focused.
+        bridge_.model().note_explicit_focus(h);
+        bridge_.request_activate(h);
+    }
+    lx::trace::logger::global().logf(lx::trace::level::info, "shell.switcher",
+                                     "switcher: {} ({}{}){}{}{}", e ? "activate" : "nothing",
+                                     why ? why : "-", shown ? ", shown" : ", never shown",
+                                     e ? " \"" : "", e ? e->title : "", e ? "\"" : "");
+}
+
+void lx::shell::shell_app::quick_switch(std::string_view action) {
+    const bool forward = action == "switcher.next" || action == "switcher.next-app";
+    const bool same_app = action == "switcher.next-app" || action == "switcher.previous-app";
+    if (switcher_.active())
+        return;
+    if (switcher_.begin(bridge_.model(), forward, same_app, switcher_settings(), &switcher_shown,
+                        &workspaces_.view(), now_ns()) == 0) {
+        (void)switcher_.finish(false);
+        return;
+    }
+    finish_switch(true, action.data());
+}
+
 #else // !LUMEN_SHELL_WAYLAND
 
 struct lx::shell::shell_app::events {};
@@ -1977,5 +2810,18 @@ void lx::shell::shell_app::on_lock_state(unsigned) {}
 void lx::shell::shell_app::on_lock_requested(unsigned) {}
 void lx::shell::shell_app::launch_locker(const char*) {}
 void lx::shell::shell_app::update_locked_notification() {}
+void lx::shell::shell_app::on_config(std::string_view, unsigned) {}
+void lx::shell::shell_app::on_config_done(unsigned, bool, unsigned, unsigned,
+                                          std::span<const policy_bridge::config_line>) {}
+void lx::shell::shell_app::on_action(const char*, const char*, unsigned) {}
+void lx::shell::shell_app::on_hold_begin(const char*) {}
+void lx::shell::shell_app::on_hold_key(unsigned, unsigned, const char*) {}
+void lx::shell::shell_app::finish_switch(bool, const char*) {}
+void lx::shell::shell_app::open_switcher() {}
+void lx::shell::shell_app::quick_switch(std::string_view) {}
+lx::shell::switcher_options lx::shell::shell_app::switcher_settings() const { return {}; }
+void lx::shell::shell_app::apply_config(const lx::config::config_snapshot&) {}
+void lx::shell::shell_app::reconfigure_idle() {}
+void lx::shell::shell_app::rebuild_backgrounds() {}
 
 #endif

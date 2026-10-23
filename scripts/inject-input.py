@@ -67,6 +67,7 @@ EV_SYN, EV_KEY, EV_REL, EV_ABS = 0x00, 0x01, 0x02, 0x03
 SYN_REPORT = 0
 ABS_X, ABS_Y = 0x00, 0x01
 REL_X, REL_Y = 0x00, 0x01
+REL_WHEEL = 0x08
 
 BUTTONS = {"left": 0x110, "right": 0x111, "middle": 0x112}
 KEYS = {"KEY_ESC": 1, "KEY_LEFTMETA": 125, "KEY_LEFTSHIFT": 42, "KEY_RIGHTSHIFT": 54,
@@ -218,6 +219,15 @@ class Injector:
         t = now_us()
         os.write(self.relative(), data + pack(EV_SYN, SYN_REPORT, 0))
         self.record("rel", t, dx=dx, dy=dy)
+
+    def wheel(self, clicks):
+        """One wheel frame (REL_WHEEL) on the relative node: `clicks` notches, positive away
+        from the user (scrolling up)."""
+        if not clicks:
+            return
+        t = now_us()
+        os.write(self.relative(), pack(EV_REL, REL_WHEEL, clicks) + pack(EV_SYN, SYN_REPORT, 0))
+        self.record("wheel", t, clicks=clicks)
 
     def button(self, name, pressed):
         t = now_us()
@@ -528,6 +538,12 @@ def main():
     s.add_argument("--count", type=int, default=1, help="frames of this motion")
     s.add_argument("--interval-ms", type=float, default=8.0, help="time between frames")
 
+    s = sub.add_parser("wheel", help="mouse wheel notches (REL_WHEEL) on --relative; "
+                                     "positive scrolls up")
+    s.add_argument("clicks", type=int)
+    s.add_argument("--count", type=int, default=1, help="frames of this many notches")
+    s.add_argument("--interval-ms", type=float, default=30.0, help="time between frames")
+
     sub.add_parser("watch", help="record every frame on every event node until SIGTERM")
 
     a = p.parse_args()
@@ -591,6 +607,11 @@ def main():
                     deadline += step_ns
                     sleep_until(deadline)
                 inj.rel(a.dx, a.dy)
+        elif a.cmd == "wheel":
+            for i in range(max(1, a.count)):
+                if i:
+                    time.sleep(a.interval_ms / 1000.0)
+                inj.wheel(a.clicks)
         completed = True
     except OSError as e:
         sys.exit(f"inject-input: {e}")

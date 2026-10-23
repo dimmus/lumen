@@ -1,17 +1,22 @@
 flowchart TB
-    UI[tick_ui] --> FILL[publish_health_sample]
-    FILL --> OBS[health_monitor.observe]
-    OBS --> N{frames >= N?}
-    N -->|no| WAIT[wait]
-    N -->|yes| EVAL[evaluate]
-    EVAL --> PARTS[subsystem_health x N]
-    EVAL --> PROC[process_health]
-    EVAL --> MEM[memory_health]
-    EVAL --> SPD[speed_health]
-    PARTS --> OVER[overall = worse]
+    REQ["GetHealth (control socket) / lumen-ctl status"] --> UI["UI thread: readiness, logind, shell bridge,<br/>memory pressure, staging, per-output presented/missed + miss ring"]
+    UI --> POST["executor.post(render)"]
+    POST --> RF["render thread: import cache, last render tick,<br/>render ticks over budget"]
+    RF --> BACK["executor.post(ui)"]
+    POST -. "no answer in 500 ms" .-> TO["render part: critical"]
+    BACK --> IN[health_inputs]
+    TO --> IN
+    IN --> EVAL["lx::health::evaluate (pure)"]
+    EVAL --> PARTS[parts]
+    EVAL --> PROC[processes]
+    EVAL --> MEM[memory]
+    EVAL --> SPD["speed per output"]
+    PARTS --> OVER[overall = worst]
     PROC --> OVER
     MEM --> OVER
     SPD --> OVER
     OVER --> RPT[health_report]
-    RPT --> LOG[trace warn/debug]
-    RPT --> EXP[health_exporter — P1]
+    RPT --> JSON["Varlink reply (Health)"]
+    RPT --> STREAM["Subscribe: health event on a level change"]
+    FRAME["each presented content frame"] -->|"one bit"| RING["miss_ring (128 frames)"]
+    RING -.-> UI

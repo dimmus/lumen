@@ -1,0 +1,37 @@
+# The Lumen session's display server (design-session-and-wm S.1). Started by lumen-session
+# (`systemctl --user --wait start lumen-compositor.service`), never enabled: it pulls the
+# rest of the session in with Wants=. It binds graphical-session.target (systemd.special(7)),
+# so the target — and every unit PartOf= it: the shell, XDG autostart applications, the
+# portals — ends with it. READY=1 comes once the Wayland socket is served and the session
+# environment (WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP=Lumen, …) is in the user manager, so
+# units ordered after graphical-session.target always find it.
+[Unit]
+Description=Lumen Wayland compositor
+Documentation=https://github.com/dimmus/lumen/blob/main/docs/architecture.md
+BindsTo=graphical-session.target
+Before=graphical-session.target
+Wants=graphical-session-pre.target
+After=graphical-session-pre.target
+Wants=lumen-shell.service xdg-desktop-autostart.target
+Before=xdg-desktop-autostart.target
+
+[Service]
+# READY=1 after the environment export; RELOADING=1/READY=1 around a reload (SIGHUP:
+# `systemctl --user reload lumen-compositor`); STOPPING=1 when a logout begins.
+# notify-reload needs systemd 253; built against an older one, this is Type=notify with an
+# ExecReload= sending the SIGHUP (cmake/LumenPlatform.cmake).
+Type=@LUMEN_UNIT_SERVICE_TYPE@
+@LUMEN_UNIT_EXEC_RELOAD@
+NotifyAccess=main
+# $LUMEN_DISPLAY: the Wayland socket name (lumen-session imports it when set; unset, the
+# compositor serves lumen-0).
+ExecStart=@LUMEN_BINDIR@/lumen-compositor --session $LUMEN_DISPLAY
+# Essential to the graphical session (systemd.io/DESKTOP_ENVIRONMENTS).
+Slice=session.slice
+# The session ends with the compositor: its clients cannot outlive it.
+Restart=no
+# A compositor that stops answering (its UI or render thread stuck) is aborted, and the
+# session ends, instead of leaving a frozen screen. Pings ride wake-ups that happen anyway.
+WatchdogSec=30s
+# A logout closes windows for up to 5 s; SIGTERM stops at once.
+TimeoutStopSec=10s

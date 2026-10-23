@@ -129,6 +129,9 @@ struct im_grab_ops {
     void* grab = nullptr;
     void (*key)(void* grab, unsigned serial, unsigned time_ms, unsigned key, bool pressed) = nullptr;
     void (*modifiers)(void* grab, unsigned serial, const lx::input::modifier_state& mods) = nullptr;
+    /// The seat's keymap was replaced (a configuration reload) / the repeat rate changed.
+    void (*keymap)(void* grab, int fd, unsigned size) = nullptr;
+    void (*repeat_info)(void* grab, int rate, int delay) = nullptr;
 };
 
 /// A keymap clients' `wl_keyboard`s may be switched to: a virtual keyboard's
@@ -267,6 +270,13 @@ public:
     /// the seat compiles its keymap once input starts.
     using seat_keymap_source = bool (*)(int& fd, unsigned& size);
     void set_seat_keymap_source(seat_keymap_source fn) { seat_keymap_ = fn; }
+    /// The seat's keymap was replaced (a configuration reload): every wl_keyboard — but those
+    /// of a client switched to a virtual keyboard's keymap, which get the seat's when they
+    /// switch back — and the input method's grab get the new one, and the focused client
+    /// its modifiers again (a new keymap restarts a client's xkb state).
+    void seat_keymap_changed(lx::input::seat& seat);
+    /// wl_keyboard.repeat_info (v4+) to every keyboard and the input method's grab.
+    void send_repeat_info(int rate, int delay);
     /// The input method's keyboard grab came (`ops.grab` set) or went (null).
     void set_im_grab(const im_grab_ops& ops, lx::input::seat& seat);
     /// The input method became active (keys go to its grab, when it has one) or inactive.
@@ -939,6 +949,48 @@ void lx::compositor::input_router::restore_seat_keymap(lx::input::seat& seat) {
     }
 #else
     (void)seat;
+#endif
+}
+
+void lx::compositor::input_router::seat_keymap_changed(lx::input::seat& seat) {
+#if defined(LUMEN_HAS_WAYLAND)
+    int fd = -1;
+    unsigned size = 0;
+    if (!seat_keymap_ || !seat_keymap_(fd, size))
+        return;
+    for (unsigned i = 0; i < keyboards_.count; ++i) {
+        auto* kb = static_cast<wl_resource*>(keyboards_.items[i]);
+        if (override_client_ && wl_resource_get_client(kb) == override_client_)
+            continue;
+        wl_keyboard_send_keymap(kb, WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, fd, size);
+    }
+    if (im_grab_.grab && im_grab_.keymap)
+        im_grab_.keymap(im_grab_.grab, fd, size);
+    const auto mods = seat.keymap().modifiers();
+    if (im_routing_active()) {
+        if (im_grab_.modifiers)
+            im_grab_.modifiers(im_grab_.grab, seat.next_serial(), mods);
+        return;
+    }
+    if (!override_client_)
+        deliver_modifiers(mods, seat);
+#else
+    (void)seat;
+#endif
+}
+
+void lx::compositor::input_router::send_repeat_info(int rate, int delay) {
+#if defined(LUMEN_HAS_WAYLAND)
+    for (unsigned i = 0; i < keyboards_.count; ++i) {
+        auto* kb = static_cast<wl_resource*>(keyboards_.items[i]);
+        if (wl_resource_get_version(kb) >= WL_KEYBOARD_REPEAT_INFO_SINCE_VERSION)
+            wl_keyboard_send_repeat_info(kb, rate, delay);
+    }
+    if (im_grab_.grab && im_grab_.repeat_info)
+        im_grab_.repeat_info(im_grab_.grab, rate, delay);
+#else
+    (void)rate;
+    (void)delay;
 #endif
 }
 

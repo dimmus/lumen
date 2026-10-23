@@ -35,9 +35,12 @@ export module lx.compositor:output_config_store;
 
 import std;
 
-import :toml_lite;
+import lx.config;
 
 export namespace lx::compositor {
+
+/// The TOML subset reader (lx.config, shared with the user configuration file).
+namespace toml = ::lx::config::toml;
 
 /// What is remembered of one monitor.
 struct monitor_config {

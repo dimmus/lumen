@@ -7,6 +7,9 @@ import lx.shell;
 //             [--blank-locked-after S] [--lock-command CMD] [--[no-]lock-on-blank]
 //             [--background SPEC | --no-background]
 //
+// Every option above overrides the same setting of config.toml ([idle], [background]), which
+// lumen-shell receives from the compositor (zlm_shell_v1 v7) and applies live.
+//
 // The desktop shell: the top panel and its task list, the launcher, and the default idle
 // and lock policy (outputs off after --blank-after seconds without input, 600 by default; 0
 // never; --idle-policy none leaves it to an external daemon; with --lock-command, Super+L,
@@ -18,9 +21,10 @@ import lx.shell;
 int main(int argc, char* argv[]) {
     lx::shell::shell_config cfg{};
     if (const char* env = std::getenv("LUMEN_BACKGROUND"); env && *env) {
-        if (auto spec = lx::shell::parse_background(env))
+        if (auto spec = lx::shell::parse_background(env)) {
             cfg.background = *spec;
-        else
+            cfg.cli_set |= lx::shell::cli_background;
+        } else
             std::fprintf(stderr, "lumen-shell: ignoring LUMEN_BACKGROUND '%s' (see --help)\n", env);
     }
     for (int i = 1; i < argc; ++i) {
@@ -31,22 +35,29 @@ int main(int argc, char* argv[]) {
                     lx::shell::parse_idle_policy(argv[++i], cfg.idle.enabled)) ||
                    (std::strncmp(a, "--idle-policy=", 14) == 0 &&
                     lx::shell::parse_idle_policy(a + 14, cfg.idle.enabled))) {
+            cfg.cli_set |= lx::shell::cli_idle_policy;
         } else if ((std::strcmp(a, "--blank-after") == 0 && i + 1 < argc &&
                     lx::shell::parse_idle_seconds(argv[++i], cfg.idle.blank_after_s)) ||
                    (std::strncmp(a, "--blank-after=", 14) == 0 &&
                     lx::shell::parse_idle_seconds(a + 14, cfg.idle.blank_after_s))) {
+            cfg.cli_set |= lx::shell::cli_blank_after;
         } else if ((std::strcmp(a, "--blank-locked-after") == 0 && i + 1 < argc &&
                     lx::shell::parse_idle_seconds(argv[++i], cfg.idle.blank_locked_after_s)) ||
                    (std::strncmp(a, "--blank-locked-after=", 21) == 0 &&
                     lx::shell::parse_idle_seconds(a + 21, cfg.idle.blank_locked_after_s))) {
+            cfg.cli_set |= lx::shell::cli_blank_locked_after;
         } else if (std::strcmp(a, "--lock-command") == 0 && i + 1 < argc) {
             cfg.idle.lock_command = argv[++i];
+            cfg.cli_set |= lx::shell::cli_lock_command;
         } else if (std::strncmp(a, "--lock-command=", 15) == 0) {
             cfg.idle.lock_command = a + 15;
+            cfg.cli_set |= lx::shell::cli_lock_command;
         } else if (std::strcmp(a, "--lock-on-blank") == 0) {
             cfg.idle.lock_on_blank = true;
+            cfg.cli_set |= lx::shell::cli_lock_on_blank;
         } else if (std::strcmp(a, "--no-lock-on-blank") == 0) {
             cfg.idle.lock_on_blank = false;
+            cfg.cli_set |= lx::shell::cli_lock_on_blank;
         } else if ((std::strcmp(a, "--background") == 0 && i + 1 < argc) ||
                    std::strncmp(a, "--background=", 13) == 0) {
             const char* v = a[12] == '=' ? a + 13 : argv[++i];
@@ -57,8 +68,10 @@ int main(int argc, char* argv[]) {
             }
             cfg.background = *spec;
             cfg.background_enabled = true;
+            cfg.cli_set |= lx::shell::cli_background;
         } else if (std::strcmp(a, "--no-background") == 0) {
             cfg.background_enabled = false;
+            cfg.cli_set |= lx::shell::cli_background;
         } else if (std::strcmp(a, "-h") == 0 || std::strcmp(a, "--help") == 0) {
             std::printf(
                 "usage: lumen-shell [--display NAME] [--idle-policy shell|none] [--blank-after S]\n"
@@ -81,7 +94,11 @@ int main(int argc, char* argv[]) {
                 "                                                      90 = top to bottom\n"
                 "                           image:PATH[:fill|fit|center|stretch|tile]\n"
                 "                                                      PNG, JPEG, WebP or SVG\n"
-                "  --no-background        none (leave it to another client, e.g. swaybg)\n");
+                "  --no-background        none (leave it to another client, e.g. swaybg)\n"
+                "On the user bus it is the notification server (org.freedesktop.Notifications)\n"
+                "and the tray's StatusNotifierWatcher and host; [notifications] in config.toml.\n"
+                "LUMEN_SHELL_STATE=PATH|0: where the next notification id and do-not-disturb\n"
+                "are kept (default $XDG_RUNTIME_DIR/lumen/shell-state).\n");
             return 0;
         } else {
             std::fprintf(stderr, "lumen-shell: bad or unknown argument '%s' (see --help)\n", a);

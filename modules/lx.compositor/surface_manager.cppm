@@ -281,6 +281,10 @@ private:
     /// Output pixels a content change of `e` may reach beyond its own rect: a resampled
     /// draw's linear filter extends half a source texel (in output pixels) past it.
     [[nodiscard]] int resample_margin(const surface_entry& e) const;
+    /// Damage of `e`'s content: every view, or — while its window's tree container is not
+    /// shown (another workspace, minimized) — only the capture views that may still draw it,
+    /// so a hidden window's commits repaint no output (design-session-and-wm W.3).
+    void note_content_damage(const surface_entry& e, lx::rect2i region, int margin) const;
 
     lx::gfx::dmabuf_import_cache* import_cache_ = nullptr;
     lx::scene::scene_graph* scene_ = nullptr;
@@ -513,12 +517,13 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
                 source_changed || was_solid) {
                 // A size change uncovers or covers what lies outside the other extent, and a
                 // blend change repaints everything under the node: both rects, separately.
-                scene_->note_damage({o.x, o.y, old_size.width, old_size.height}, old_margin);
-                scene_->note_damage({o.x, o.y, entry.surface_size.width, entry.surface_size.height},
-                                    margin);
+                note_content_damage(entry, {o.x, o.y, old_size.width, old_size.height}, old_margin);
+                note_content_damage(
+                    entry, {o.x, o.y, entry.surface_size.width, entry.surface_size.height}, margin);
                 layout_changed_ = true;
             } else if (commit.damage.width > 0 && commit.damage.height > 0) {
-                scene_->note_damage({commit.damage.x + o.x, commit.damage.y + o.y,
+                note_content_damage(entry,
+                                    {commit.damage.x + o.x, commit.damage.y + o.y,
                                      commit.damage.width, commit.damage.height},
                                     margin);
             }
@@ -565,7 +570,7 @@ void lx::compositor::surface_manager::destroy(lx::surface_id surface) {
         if (scene_ && entry.node->is_visible()) {
             const lx::point2i o = entry.node->origin();
             const lx::rect2i b = entry.node->bounds();
-            scene_->note_damage({o.x, o.y, b.width, b.height}, resample_margin(entry));
+            note_content_damage(entry, {o.x, o.y, b.width, b.height}, resample_margin(entry));
         }
         if (entry.node_parent)
             (void)entry.node_parent->remove(entry.node);
@@ -631,8 +636,8 @@ void lx::compositor::surface_manager::set_geometry(lx::surface_id surface, lx::s
     e.node->set_bounds({0, 0, size.width, size.height});
     e.node->set_content(src, transform);
     if (scene_) {
-        scene_->note_damage({o.x, o.y, old_size.width, old_size.height}, old_margin);
-        scene_->note_damage({o.x, o.y, size.width, size.height}, resample_margin(e));
+        note_content_damage(e, {o.x, o.y, old_size.width, old_size.height}, old_margin);
+        note_content_damage(e, {o.x, o.y, size.width, size.height}, resample_margin(e));
     }
     layout_changed_ = true;
 }
@@ -697,7 +702,7 @@ void lx::compositor::surface_manager::set_opaque(lx::surface_id surface, bool op
     entry.node->set_opaque(opaque);
     // Blending changes every pixel the node covers that is not fully opaque.
     if (scene_)
-        scene_->note_damage(node_rect(surface), resample_margin(entry));
+        note_content_damage(entry, node_rect(surface), resample_margin(entry));
 }
 
 lx::scene::surface_node* lx::compositor::surface_manager::node(lx::surface_id surface) const {
@@ -779,8 +784,8 @@ void lx::compositor::surface_manager::set_solid(lx::surface_id surface, lx::colo
     e.node->set_bounds({0, 0, size.width, size.height});
     e.node->set_content({}, lx::buffer_transform::normal);
     if (scene_) {
-        scene_->note_damage({o.x, o.y, old_size.width, old_size.height}, old_margin);
-        scene_->note_damage({o.x, o.y, size.width, size.height});
+        note_content_damage(e, {o.x, o.y, old_size.width, old_size.height}, old_margin);
+        note_content_damage(e, {o.x, o.y, size.width, size.height}, 0);
     }
     if (old_size.width != size.width || old_size.height != size.height)
         layout_changed_ = true;
@@ -800,7 +805,7 @@ void lx::compositor::surface_manager::set_alpha(lx::surface_id surface, float al
     e.node->set_transform(e.node->origin(), e.node->scale(), alpha);
     // Every pixel the node covers blends differently.
     if (scene_)
-        scene_->note_damage(node_rect(surface), resample_margin(e));
+        note_content_damage(e, node_rect(surface), resample_margin(e));
 }
 
 float lx::compositor::surface_manager::alpha(lx::surface_id surface) const {
@@ -945,4 +950,17 @@ bool lx::compositor::surface_manager::hit(lx::surface_id surface, double x, doub
     sx = lx_;
     sy = ly_;
     return true;
+}
+
+void lx::compositor::surface_manager::note_content_damage(const surface_entry& e,
+                                                          lx::rect2i region, int margin) const {
+    if (!scene_)
+        return;
+    if (e.node_parent && !e.node_parent->is_visible()) {
+        constexpr std::uint32_t k_capture_views =
+            ~((std::uint32_t{1} << lx::scene::k_capture_view_base) - 1u);
+        scene_->note_damage_views(region, margin, k_capture_views);
+        return;
+    }
+    scene_->note_damage(region, margin);
 }

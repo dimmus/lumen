@@ -17,6 +17,7 @@ export module lx.input;
 import std;
 
 export import :keymap;
+export import :device_config;
 
 export namespace lx::input {
 
@@ -95,6 +96,9 @@ struct pointer_axis_event {
     axis_source source = axis_source::unknown;
     unsigned time_ms = 0;
     unsigned long long time_us = 0;
+    /// The device's configured scroll multiplier (`pointer_config::scroll_factor`), applied
+    /// by the compositor to the values it sends.
+    double scroll_factor = 1.0;
 };
 
 struct key_event {
@@ -223,8 +227,36 @@ public:
     input_manager& operator=(input_manager&& other) noexcept;
 
     /// `seat_name` is a udev seat, almost always "seat0". The provider supplies device fds.
+    /// `keymap` is the layout the seat's keymap is compiled with (empty: the system default);
+    /// `num_lock` starts the session with Num Lock on. `compiled`, when valid, is that
+    /// keymap compiled already (moved in; not compiled twice).
     [[nodiscard]] static lx::result<input_manager> open(device_provider provider,
-                                                        const char* seat_name = "seat0");
+                                                        const char* seat_name = "seat0",
+                                                        keymap_config keymap = {},
+                                                        bool num_lock = false,
+                                                        keyboard_keymap* compiled = nullptr);
+
+    /// The configuration a pointer device should have: fills `out` for the device named
+    /// `name` of class `kind` and returns true; false leaves the device as libinput set it.
+    /// Called for every pointer device as it appears, and for all of them by
+    /// `reapply_device_config` (a configuration reload). UI affinity, like `dispatch`.
+    using device_config_fn = bool (*)(void* user, const char* name, device_class kind,
+                                      pointer_config& out);
+    /// After applying (or finding a setting unsupported): one line's worth for the log.
+    using device_report_fn = void (*)(void* user, const char* name, device_class kind,
+                                      const apply_report& report);
+    void set_device_config(device_config_fn fn, device_report_fn report, void* user) {
+        device_config_ = fn;
+        device_report_ = report;
+        device_config_user_ = user;
+    }
+    /// Applies the configuration to every device present again.
+    void reapply_device_config();
+    /// The keyboards' LEDs follow the keymap's state (Caps Lock, Num Lock): after a
+    /// modifier change or a new keymap. Only when the lit set changed.
+    void update_leds();
+    /// libinput's device configuration calls (what `apply_pointer_config` is given).
+    [[nodiscard]] static const device_ops& libinput_ops();
 
     /// Poll this in the event loop; readable means events are waiting.
     [[nodiscard]] int fd() const;
@@ -270,6 +302,21 @@ private:
     /// that caused it, and only when devices actually opened.
     std::unique_ptr<device_provider> provider_{};
     unsigned device_count_ = 0;
+    /// The devices present (a reference held on each), their class and scroll multiplier.
+    struct device_entry {
+        void* device = nullptr; // libinput_device*
+        device_class kind = device_class::other;
+        bool keyboard = false;
+        double scroll_factor = 1.0;
+    };
+    unsigned leds_ = ~0u;
+    static constexpr unsigned k_max_devices = 32;
+    std::inplace_vector<device_entry, k_max_devices> devices_{};
+    device_config_fn device_config_ = nullptr;
+    device_report_fn device_report_ = nullptr;
+    void* device_config_user_ = nullptr;
+    void configure_device(device_entry& e);
+    void release_devices();
     bool suspended_ = false;
     /// The event being handled comes from a device that is going away (see `dispatch`).
     bool removing_ = false;
@@ -348,7 +395,16 @@ const libinput_interface k_interface = {
 
 lx::input::input_manager::~input_manager() { destroy(); }
 
+void lx::input::input_manager::release_devices() {
+#if defined(LUMEN_HAS_INPUT)
+    for (const device_entry& e : devices_)
+        libinput_device_unref(static_cast<libinput_device*>(e.device));
+#endif
+    devices_.clear();
+}
+
 void lx::input::input_manager::destroy() {
+    release_devices();
 #if defined(LUMEN_HAS_INPUT)
     // Order matters: unref closes every device libinput still holds, and each close goes
     // back through the provider. Releasing the provider first would free it out from under
@@ -367,10 +423,13 @@ void lx::input::input_manager::destroy() {
 lx::input::input_manager::input_manager(input_manager&& other) noexcept
     : udev_{other.udev_}, libinput_{other.libinput_}, sink_{other.sink_},
       seat_{std::move(other.seat_)}, provider_{std::move(other.provider_)},
-      device_count_{other.device_count_}, suspended_{other.suspended_} {
+      device_count_{other.device_count_}, devices_{other.devices_},
+      device_config_{other.device_config_}, device_report_{other.device_report_},
+      device_config_user_{other.device_config_user_}, suspended_{other.suspended_} {
     other.udev_ = nullptr;
     other.libinput_ = nullptr;
     other.device_count_ = 0;
+    other.devices_.clear();
 }
 
 lx::input::input_manager& lx::input::input_manager::operator=(input_manager&& other) noexcept {
@@ -385,15 +444,23 @@ lx::input::input_manager& lx::input::input_manager::operator=(input_manager&& ot
     seat_ = std::move(other.seat_);
     provider_ = std::move(other.provider_);
     device_count_ = other.device_count_;
+    devices_ = other.devices_;
+    device_config_ = other.device_config_;
+    device_report_ = other.device_report_;
+    device_config_user_ = other.device_config_user_;
     suspended_ = other.suspended_;
     other.udev_ = nullptr;
     other.libinput_ = nullptr;
     other.device_count_ = 0;
+    other.devices_.clear();
     return *this;
 }
 
 lx::result<lx::input::input_manager> lx::input::input_manager::open(device_provider provider,
-                                                                    const char* seat_name) {
+                                                                    const char* seat_name,
+                                                                    keymap_config keymap,
+                                                                    bool num_lock,
+                                                                    keyboard_keymap* compiled) {
 #if defined(LUMEN_HAS_INPUT)
     input_manager mgr;
     mgr.provider_ = std::make_unique<device_provider>(provider);
@@ -420,13 +487,26 @@ lx::result<lx::input::input_manager> lx::input::input_manager::open(device_provi
 
     // Compile a keymap up front. Without one, keys arrive as codes with no meaning and
     // clients get no keymap at all.
-    if (auto compiled = mgr.seat_.keymap().compile(); !compiled)
-        return compiled.get_error();
+    if (compiled && compiled->valid()) {
+        mgr.seat_.keymap() = std::move(*compiled);
+    } else if (auto built = mgr.seat_.keymap().compile(keymap); !built) {
+        // A configured layout that does not compile must not leave the seat without a
+        // keymap: the system default instead (the caller reports the configuration error).
+        if (!keymap.layout && !keymap.variant && !keymap.options && !keymap.model && !keymap.rules)
+            return built.get_error();
+        if (auto fallback = mgr.seat_.keymap().compile(); !fallback)
+            return fallback.get_error();
+    }
+    if (num_lock)
+        (void)mgr.seat_.keymap().set_num_lock(true);
 
     return mgr;
 #else
     (void)provider;
     (void)seat_name;
+    (void)keymap;
+    (void)num_lock;
+    (void)compiled;
     return lx::not_implemented("lx::input::input_manager::open");
 #endif
 }
@@ -482,6 +562,28 @@ void lx::input::input_manager::handle_event(void* raw) {
         if (libinput_device_has_capability(added, LIBINPUT_DEVICE_CAP_KEYBOARD))
             libinput_device_led_update(added,
                                        static_cast<libinput_led>(seat_.keymap().led_mask()));
+        const bool pointer = libinput_device_has_capability(added, LIBINPUT_DEVICE_CAP_POINTER);
+        const bool keys = libinput_device_has_capability(added, LIBINPUT_DEVICE_CAP_KEYBOARD);
+        if ((pointer || keys) && devices_.size() < k_max_devices) {
+            device_entry e{};
+            e.device = libinput_device_ref(added);
+            e.keyboard = keys;
+            if (!pointer) {
+                e.kind = device_class::other;
+            } else if (libinput_device_config_tap_get_finger_count(added) > 0) {
+                e.kind = device_class::touchpad;
+            } else {
+                e.kind = device_class::mouse;
+                if (udev_device* ud = libinput_device_get_udev_device(added)) {
+                    const char* stick = udev_device_get_property_value(ud, "ID_INPUT_POINTINGSTICK");
+                    if (stick && std::strcmp(stick, "1") == 0)
+                        e.kind = device_class::trackpoint;
+                    udev_device_unref(ud);
+                }
+            }
+            devices_.push_back(e);
+            configure_device(devices_.back());
+        }
         if (sink_.device_added) {
             auto* dev = added;
             sink_.device_added(
@@ -497,6 +599,14 @@ void lx::input::input_manager::handle_event(void* raw) {
     case LIBINPUT_EVENT_DEVICE_REMOVED:
         if (device_count_ > 0)
             --device_count_;
+        for (unsigned i = 0; i < devices_.size(); ++i) {
+            if (devices_[i].device != libinput_event_get_device(ev))
+                continue;
+            libinput_device_unref(static_cast<libinput_device*>(devices_[i].device));
+            devices_[i] = devices_.back();
+            devices_.pop_back();
+            break;
+        }
         // A device that comes back starts without a previous position.
         for (auto& t : absolute_)
             if (t.device == libinput_event_get_device(ev))
@@ -579,6 +689,12 @@ void lx::input::input_manager::handle_event(void* raw) {
         // valid for the deprecated LIBINPUT_EVENT_POINTER_AXIS, and calling it on these
         // makes libinput print "client bug: Invalid event type ... passed to
         // libinput_event_pointer_get_axis_source()" — which it did, 18 times in one run.
+        for (const device_entry& d : devices_) {
+            if (d.device == libinput_event_get_device(ev)) {
+                out.scroll_factor = d.scroll_factor;
+                break;
+            }
+        }
         out.source = type == LIBINPUT_EVENT_POINTER_SCROLL_WHEEL    ? axis_source::wheel
                      : type == LIBINPUT_EVENT_POINTER_SCROLL_FINGER ? axis_source::finger
                                                                     : axis_source::continuous;
@@ -704,6 +820,154 @@ void lx::input::input_manager::handle_event(void* raw) {
 }
 
 #endif // LUMEN_HAS_INPUT
+
+#if defined(LUMEN_HAS_INPUT)
+namespace {
+
+libinput_device* li(void* d) { return static_cast<libinput_device*>(d); }
+
+const lx::input::device_ops k_libinput_ops = {
+    .tap_finger_count = [](void* d) { return libinput_device_config_tap_get_finger_count(li(d)); },
+    .set_tap =
+        [](void* d, bool on) {
+            (void)libinput_device_config_tap_set_enabled(
+                li(d), on ? LIBINPUT_CONFIG_TAP_ENABLED : LIBINPUT_CONFIG_TAP_DISABLED);
+        },
+    .set_tap_button_map =
+        [](void* d, unsigned map) {
+            (void)libinput_device_config_tap_set_button_map(
+                li(d), map ? LIBINPUT_CONFIG_TAP_MAP_LMR : LIBINPUT_CONFIG_TAP_MAP_LRM);
+        },
+    .set_drag =
+        [](void* d, bool on) {
+            (void)libinput_device_config_tap_set_drag_enabled(
+                li(d), on ? LIBINPUT_CONFIG_DRAG_ENABLED : LIBINPUT_CONFIG_DRAG_DISABLED);
+        },
+    .set_drag_lock =
+        [](void* d, bool on) {
+            (void)libinput_device_config_tap_set_drag_lock_enabled(
+                li(d), on ? LIBINPUT_CONFIG_DRAG_LOCK_ENABLED : LIBINPUT_CONFIG_DRAG_LOCK_DISABLED);
+        },
+#if defined(LUMEN_HAS_LIBINPUT_3FG_DRAG)
+    .three_finger_drag_fingers =
+        [](void* d) { return static_cast<int>(libinput_device_config_3fg_drag_get_finger_count(li(d))); },
+    .set_three_finger_drag =
+        [](void* d, bool on) {
+            (void)libinput_device_config_3fg_drag_set_enabled(
+                li(d), on ? LIBINPUT_CONFIG_3FG_DRAG_ENABLED_3FG : LIBINPUT_CONFIG_3FG_DRAG_DISABLED);
+        },
+#else
+    .three_finger_drag_fingers = nullptr,
+    .set_three_finger_drag = nullptr,
+#endif
+    .natural_scroll_supported =
+        [](void* d) { return libinput_device_config_scroll_has_natural_scroll(li(d)) != 0; },
+    .set_natural_scroll =
+        [](void* d, bool on) {
+            (void)libinput_device_config_scroll_set_natural_scroll_enabled(li(d), on ? 1 : 0);
+        },
+    .scroll_methods =
+        [](void* d) { return static_cast<unsigned>(libinput_device_config_scroll_get_methods(li(d))); },
+    .default_scroll_method =
+        [](void* d) {
+            return static_cast<unsigned>(libinput_device_config_scroll_get_default_method(li(d)));
+        },
+    .set_scroll_method =
+        [](void* d, unsigned m) {
+            (void)libinput_device_config_scroll_set_method(
+                li(d), static_cast<libinput_config_scroll_method>(m));
+        },
+    .click_methods =
+        [](void* d) { return static_cast<unsigned>(libinput_device_config_click_get_methods(li(d))); },
+    .default_click_method =
+        [](void* d) {
+            return static_cast<unsigned>(libinput_device_config_click_get_default_method(li(d)));
+        },
+    .set_click_method =
+        [](void* d, unsigned m) {
+            (void)libinput_device_config_click_set_method(
+                li(d), static_cast<libinput_config_click_method>(m));
+        },
+    .accel_supported = [](void* d) { return libinput_device_config_accel_is_available(li(d)) != 0; },
+    .accel_profiles =
+        [](void* d) { return static_cast<unsigned>(libinput_device_config_accel_get_profiles(li(d))); },
+    .default_accel_profile =
+        [](void* d) {
+            return static_cast<unsigned>(libinput_device_config_accel_get_default_profile(li(d)));
+        },
+    .set_accel_profile =
+        [](void* d, unsigned p) {
+            (void)libinput_device_config_accel_set_profile(
+                li(d), static_cast<libinput_config_accel_profile>(p));
+        },
+    .set_accel_speed =
+        [](void* d, double s) { (void)libinput_device_config_accel_set_speed(li(d), s); },
+    .left_handed_supported =
+        [](void* d) { return libinput_device_config_left_handed_is_available(li(d)) != 0; },
+    .set_left_handed =
+        [](void* d, bool on) { (void)libinput_device_config_left_handed_set(li(d), on ? 1 : 0); },
+    .dwt_supported = [](void* d) { return libinput_device_config_dwt_is_available(li(d)) != 0; },
+    .set_dwt =
+        [](void* d, bool on) {
+            (void)libinput_device_config_dwt_set_enabled(
+                li(d), on ? LIBINPUT_CONFIG_DWT_ENABLED : LIBINPUT_CONFIG_DWT_DISABLED);
+        },
+    .middle_emulation_supported =
+        [](void* d) { return libinput_device_config_middle_emulation_is_available(li(d)) != 0; },
+    .set_middle_emulation =
+        [](void* d, bool on) {
+            (void)libinput_device_config_middle_emulation_set_enabled(
+                li(d), on ? LIBINPUT_CONFIG_MIDDLE_EMULATION_ENABLED
+                          : LIBINPUT_CONFIG_MIDDLE_EMULATION_DISABLED);
+        },
+};
+
+} // namespace
+#endif
+
+const lx::input::device_ops& lx::input::input_manager::libinput_ops() {
+#if defined(LUMEN_HAS_INPUT)
+    return k_libinput_ops;
+#else
+    static const device_ops none{};
+    return none;
+#endif
+}
+
+void lx::input::input_manager::configure_device(device_entry& e) {
+#if defined(LUMEN_HAS_INPUT)
+    if (!device_config_ || e.kind == device_class::other)
+        return;
+    const char* name = libinput_device_get_name(li(e.device));
+    pointer_config c{};
+    if (!device_config_(device_config_user_, name, e.kind, c))
+        return;
+    apply_report report{};
+    apply_pointer_config(e.device, k_libinput_ops, e.kind, c, report);
+    e.scroll_factor = c.scroll_factor;
+    if (device_report_)
+        device_report_(device_config_user_, name, e.kind, report);
+#else
+    (void)e;
+#endif
+}
+
+void lx::input::input_manager::reapply_device_config() {
+    for (device_entry& e : devices_)
+        configure_device(e);
+}
+
+void lx::input::input_manager::update_leds() {
+#if defined(LUMEN_HAS_INPUT)
+    const unsigned leds = seat_.keymap().led_mask();
+    if (leds == leds_)
+        return;
+    leds_ = leds;
+    for (const device_entry& e : devices_)
+        if (e.keyboard)
+            libinput_device_led_update(li(e.device), static_cast<libinput_led>(leds));
+#endif
+}
 
 unsigned lx::input::input_manager::drain() {
 #if defined(LUMEN_HAS_INPUT)

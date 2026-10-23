@@ -73,13 +73,23 @@ flowchart TB
         TM["lx.shell:task_model"]
         PAN["lx.shell:panel (layer-shell)"]
         LAU["lx.shell:launcher (overlay layer)"]
+        SW["lx.shell:switcher (overlay layer, held action)"]
         CAT["lx.shell:app_catalog / desktop_entry"]
         LCH["lx.shell:app_launch"]
+        UB["lx.shell:user_bus (one sd-bus connection)"]
+        NOT["lx.shell:notifications + notify_view (top/overlay layer)"]
+        TRAY["lx.shell:tray + menu_popup (xdg_popups of the panel)"]
         SB --> TM --> PAN
+        TM --> SW
         PAN --> LAU --> CAT
         LAU --> LCH
+        PAN --> TRAY
+        LCH --> UB
+        NOT --> UB
+        TRAY --> UB
     end
-    LCH -->|"StartTransientUnit"| SYSD["systemd --user (app.slice)"]
+    UB -->|"StartTransientUnit"| SYSD["systemd --user (app.slice)"]
+    UB <-->|"org.freedesktop.Notifications, org.kde.StatusNotifierWatcher"| BUSAPPS["applications on the user bus"]
 
     subgraph Apps["user applications"]
         APP["lx.app"]
@@ -107,8 +117,16 @@ Owns:
 - Input seat and focus
 - The logind session: it pauses with it (a VT switch away) and resumes with it, and
   executes the VT switch keys itself (§4, Session pause/resume)
-- Key bindings: its own (VT switching, Ctrl+Alt+Backspace) and the key grabs the shell
-  registers (§4, Key bindings)
+- Key bindings: its own (VT switching, Ctrl+Alt+Backspace), the configured binding table
+  (`config.toml [bindings]`: window, keyboard and session actions it executes, shell actions
+  it sends over zlm v7) and the legacy key grabs a v4–v6 shell registers (§4, Key bindings)
+- The configuration file (`$XDG_CONFIG_HOME/lumen/config.toml`): it reads, watches
+  (inotify) and validates it, applies its own sections live and hands the shell the bytes
+  (§4, Configuration)
+- The control socket `$XDG_RUNTIME_DIR/<display>.varlink` (Varlink, `io.lumen.Compositor`:
+  status and health, outputs, windows, actions, logout, an event stream; `lumen-ctl` is its
+  client) and, run as the session's unit (`--session`), the session environment in the
+  user manager and the sd_notify protocol (READY, RELOADING, STOPPING, the watchdog) — §10
 
 Runs **three logical threads** (see [threading.md](subsystems/threading.md)):
 
@@ -122,9 +140,11 @@ Runs **three logical threads** (see [threading.md](subsystems/threading.md)):
 
 **Binary:** `lumen-shell`  
 **Modules:** `lx.shell` (`:bridge`, `:task_model`, `:panel`, `:shm_canvas`, `:launcher`,
-`:desktop_entry`, `:app_catalog`, `:app_launch`, `:background`), `lx.shell.policy`, `lx.text`;
+`:desktop_entry`, `:app_catalog`, `:app_launch`, `:background`, `:workspaces`, `:switcher`,
+`:user_bus`, `:notifications`, `:notify_view`, `:menu_popup`, `:tray`),
+`lx.shell.policy`, `lx.text`;
 libwayland-client directly (`lx.wayland.client` is still a stub), xkbcommon for the
-launcher's keyboard, sd-bus for launching
+launcher's keyboard, sd-bus for the user bus (launching, notifications, the tray)
 
 Acts as a **privileged Wayland client**:
 
@@ -132,9 +152,21 @@ Acts as a **privileged Wayland client**:
   `$WAYLAND_DISPLAY`)
 - Binds **`zlm_shell_v1`**, which the compositor accepts only from its configured shell
   binary (§9); a refused or disconnected shell exits 1 and `lumen-shell.service` restarts it
+  (300 ms, at most 5 times in 30 s; run-desktop.sh does the same in its direct mode). The
+  restarted shell gets the snapshot of every window again; until its panel maps (5 s at
+  most) the compositor keeps the dead shell's exclusive zones in the usable areas (the
+  **zone hold**), so maximized windows do not grow into the panel's strip and back (§10,
+  ADR 011 S6)
 - Uses **`zlm_policy_bridge_v1`** for window-management intent ↔ compositor execution: a
   task model fed by the snapshot and deltas, and requests (`request_raise` +
   `request_activate` on a panel click)
+- Shows the **workspaces** as an **ext-workspace-v1 client** (`:workspaces`, bound before the
+  policy bridge, like any bar): the panel's indicator — one cell per workspace of its output
+  right of the Apps button, the active one highlighted, a dot on occupied ones, urgent ones
+  in the attention colour; a click activates, the wheel steps; hidden while there is only
+  one. Each window's workspace arrives as zlm v7 `toplevel_workspace` (the shell's own
+  handle), so each output's task list shows the windows of its active workspace and sticky
+  ones; minimized windows are listed dimmed and a click brings them back
 - Draws its **top panel** — a task list, one entry per window, the focused one
   highlighted — as a `wlr-layer-shell` surface (layer `top`, exclusive zone 32, so windows
   are placed and maximized below it), with CPU text from `lx::text`
@@ -167,12 +199,35 @@ Acts as a **privileged Wayland client**:
   serial (`XDG_ACTIVATION_TOKEN`, `DESKTOP_STARTUP_ID`), so it takes the keyboard.
   Super+Return starts a terminal (`$TERMINAL`, `xdg-terminal-exec`, or the preferred
   TerminalEmulator entry)
+- Is the **notification server** (`:notifications`, `:notify_view`, ADR 011 N1–N4):
+  `org.freedesktop.Notifications` (spec 1.2: actions with `ActivationToken`, urgency,
+  timeouts, `replaces_id`, image data and paths, the body-markup subset with links, close
+  reasons, `persistence`) on the user bus, its popups one layer surface on the focused
+  window's output (`top`, `overlay` while a critical one shows; never over the lock: they
+  wait for the unlock), do-not-disturb (manual, and automatic while the screen is captured),
+  and the history behind the panel's bell
+- Is the **tray** (`:tray`, `:menu_popup`, ADR 011 N5–N6): the `StatusNotifierWatcher` and a
+  host, the items' icons in the panel left of the bell, tooltips, Activate (with an
+  activation token) / SecondaryActivate / Scroll, and `com.canonical.dbusmenu` menus as
+  keyboard-navigable xdg_popups of the panel
 - One thread, `ppoll` on the display fd, a signalfd, the catalog's inotify fd, one timerfd
-  (armed only while key repeat, a notice, a catalog debounce or a token wait is due) and,
-  once a launch opened it, the user bus: asleep when idle
-- Owns **key-binding policy**: which combination does what. It registers key grabs over
-  `zlm_shell_v1` v4 (`grab_key`) and the compositor reports them: the Super_L/Super_R taps
-  (launcher) and Super+Return (terminal)
+  (armed only while key repeat, a notice, a catalog debounce, a token wait, a notification's
+  expiry or a tooltip's delay is due) and the user bus (one `sd_bus`, opened once the first
+  panel frame is on screen, shared by launching, notifications and the tray): asleep when
+  idle
+- Executes **shell actions** the compositor's binding table sends (zlm_shell_v1 v7
+  `action`): `shell.launcher` (the Super tap), `shell.terminal` (Super+Return), `shell.lock`
+  (Super+L) — which key does what is the user's configuration (ADR 011 C4). Against a v4–v6
+  compositor it registers its own key grabs (`grab_key`) as before
+- Runs the **window switcher** (`:switcher`, ADR 011 K1–K2): Alt+Tab gives it a hold
+  (zlm_shell_v1 v7 `held_action`) — the keys while Alt is down, the focused window keeping the
+  keyboard — over the task model's most-recently-used order; a quick Alt+Tab switches without
+  drawing anything, a held one shows an overlay-layer view (icons, the selected window's
+  title) after 150 ms; releasing Alt activates the selection, Escape cancels
+- Applies its **sections of the configuration** (`[idle]`, `[background]`, `[switcher]`,
+  `[notifications]`) from the bytes the compositor hands it (zlm v7 `config`), live;
+  its command-line options win; one notification per generation with problems (the panel's
+  notice until the notification server runs)
 - Owns **idle and lock policy** (`:idle_policy`): blanking after `--blank-after` (600 s),
   and with a `--lock-command` (Lumen ships no locker) when to start it — Super+L, logind's
   Lock and before-sleep (zlm_shell_v1 v5 `lock_requested`), the blank timeout (lock, then
@@ -180,8 +235,8 @@ Acts as a **privileged Wayland client**:
   timeout while locked (`--blank-locked-after`, 60 s)
 
 The shell **does not** own surfaces of other apps or mutate the scene graph directly.
-It sends policy requests; the compositor executes geometry, focus, and stacking. The
-workspace switcher is not built yet (ADR-005 Phase 1). Details:
+It sends policy requests; the compositor executes geometry, focus, and stacking — and owns
+the workspaces, which the shell displays and switches through ext-workspace. Details:
 [shell-state-sync.md](subsystems/shell-state-sync.md) § The shell.
 
 ### 2.3 Application processes
@@ -234,7 +289,7 @@ flowchart TB
 
     subgraph L5["Desktop layer"]
         SH["lx.shell"]
-        SHB["lx.shell:bridge / task_model / panel / launcher / app_catalog / app_launch"]
+        SHB["lx.shell:bridge / task_model / panel / launcher / switcher / app_catalog / app_launch / user_bus / notifications / notify_view / menu_popup / tray"]
         SHP["lx.shell.policy"]
         UI["lx.ui"]
         PORTAL["lx.portal (xdg-desktop-portal-lumen)"]
@@ -270,6 +325,8 @@ flowchart TB
         RT["lx.runtime / executor"]
         SYNC["lx.sync"]
         TRACE["lx.trace"]
+        HEALTH["lx.health (health report, pure)"]
+        CONFIG["lx.config (config.toml: schema, parser, layers, watch)"]
     end
 
     subgraph L0["Foundation"]
@@ -288,6 +345,9 @@ flowchart TB
     COMP --> SCENE --> GFX
     UI --> SCENE
     WLS --> SESS
+    COMP --> HEALTH
+    COMP --> CONFIG
+    SH --> CONFIG
     RT --> SYNC
     RT --> TRACE
     L1 --> L0
@@ -370,7 +430,8 @@ flowchart LR
 | `lx.compositor.popup` | xdg_popup state, Wayland-free: configure/ack, placement relative to the parent's window geometry, map/unmap, reposition, the popup grab and dismissal. UI affinity |
 | `lx.compositor.layer_shell` | wlr-layer-shell, Wayland-free: layer-surface records, the configure/ack flow, arrangement against the output (`arrange_layers`, pure) and the usable area its exclusive zones leave, keyboard-interactivity queries; each layer surface's tree container sits in one of the four layer-shell scene containers. UI affinity |
 | `lx.compositor.decoration` | Server-side frames (xdg-decoration), Wayland-free: frame extents and hit zones, the shared atlas, the frame scene node (underlay of the window's tree container), cached title textures rasterized with `lx.text`. UI affinity |
-| `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state — `modal` for an effectively modal dialog —, geometry, focus, flags; v6: icon with its memfds, parent, bell) on `zlm_policy_bridge_v1`; receives WM requests |
+| `lx.compositor.workspaces` | The workspace model, Wayland-free and pure (bodies in `workspaces.cpp`): every output's ordered workspaces and its active one, dynamic (one empty last, empty inactive ones go) or static, focus memory, urgency, hotplug (merge, append, return, strand), `assign`; tells the window manager when windows or a workspace move (`workspace_sink`). 64 workspaces, 16 per output. UI affinity |
+| `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state — `modal` for an effectively modal dialog, `minimized` —, geometry, focus, flags — `sticky` from v7 —; v6: icon with its memfds, parent, bell; v7: `toplevel_workspace` with the shell's ext-workspace handle) on `zlm_policy_bridge_v1`; receives WM requests |
 | `lx.compositor.toplevel_icon` | xdg-toplevel-icon-v1's icon store, Wayland-free: a set_icon snapshot (name + up to four buffers, edge ≤ 256, nearest the panel's 32 px first) copied into sealed memfds, refcounted by the toplevel records, 128 icons and 16 MiB of pixels at most. UI affinity |
 | `lx.compositor.foreign_registry` | xdg-foreign's handle table for v1 and v2 (one registry: either imports what either exported), handles of 128 random bits as 32 hex digits, 64 exports. UI affinity |
 | `lx.compositor.pointer_constraints` | pointer-constraints' policy, Wayland-free and pure (bodies in `pointer_constraints.cpp`): the effective region (region ∩ input region ∩ the surface's box, ≤ 32 rects, overflow only confines more), `confine_motion` (the motion segment walked across the rects, sliding along the edge that stops it, one wl_fixed short of far edges), `nearest_inside`, the activation predicate `constraint_wanted` and when a lock's cursor hint is usable |
@@ -378,13 +439,14 @@ flowchart LR
 | `lx.compositor.capture_engine` | Screen capture's render side, Wayland-free: jobs UI → render and completions render → UI (`capture_channel`, fixed queues under one lock), client shm under a guard render writes through (`capture_shm_guards`: the pool referenced, a buffer's destruction waits for a copy in progress), and `capture_renderer`, which runs jobs on the active backend — on a composite of their output, from an output's newest composited frame (first frames, pointer moves), or on a window's capture view — and keeps no per-session state but GL objects and a Vulkan staging buffer |
 | `lx.compositor.cursor` | Pointer image and position (grab override → frame hover → client → default). Hardware cursor plane (`lx.drm:cursor`) by default: pointer motion is a plane update on the next atomic commit — or a cursor-only commit when nothing else changed — and never a composite. Software fallback is a node in the scene's overlay layer, damaged old+new. Images from the Xcursor theme (`lx.compositor.xcursor`) with a compiled-in vector set, `wp_cursor_shape_v1` and `wl_pointer.set_cursor` |
 | `lx.compositor.output` | The outputs, in **stable slots** (an output keeps its slot while its connector stays connected): geometry, refresh, name (the kernel's connector name, "Virtual-1"), physical size, scale, transform, present mode, KMS damage flags, and a `generation` that moves only when something a client sees changed. Without a connected connector there is one virtual output, HEADLESS-1 (1920x1080 at 60 Hz). Pure membership helpers: the outputs a rect is on (one bit per slot), the primary output (largest overlap), the preferred buffer scale (ceiling of the largest) and transform. UI affinity |
-| `lx.compositor.output_management` / `.output_config_store` / `.toml_lite` | wlr-output-management's wire-free model (heads, mode identity, every configuration error, validation into a target, the job queue), the persisted `outputs.toml` model (per monitor, per setup) and its file (debounced atomic saves on the worker), and the strict TOML subset they are written in. Pure apart from the file; UI affinity |
+| `lx.compositor.output_management` / `.output_config_store` | wlr-output-management's wire-free model (heads, mode identity, every configuration error, validation into a target, the job queue) and the persisted `outputs.toml` model (per monitor, per setup) and its file (debounced atomic saves on the worker), written in `lx.config`'s strict TOML subset. Pure apart from the file; UI affinity |
+| `lx.compositor.config_apply` | The configuration in use (`config_state`: the snapshot, its bytes, the generation's diagnostics, the inotify watch), what a reload changed (`diff_config`), and the file's terms in the subsystems' (the binding table, a device's libinput settings, the keymap names). Executing a change is `compositor_impl`'s. UI affinity |
 | `lx.compositor.liveness` | xdg_wm_base.ping/pong liveness, Wayland-free: pings on activation, delivered button and key presses, the configure watchdog and every 10 s to the focused client — one outstanding per client, at least 2 s apart; a ping unanswered past the timeout (`--ping-timeout`, 5 s) marks the client not responding until it answers. Never kills. O(1) per tick unless a deadline passed. UI affinity |
 | `lx.compositor.input_router` | Seat event delivery to the focused client's resources (enter/leave pairing, held keys, frames) and the per-client **input serial log**: the serials of input and focus events each client was sent, as compressed ranges — what `set_selection` and xdg-activation tokens quote is checked against it. The focus-client hook runs between a focus change's `leave`s and `enter`s; the user-input hook after a delivered key or button press (liveness pings on it). Pointer motion to a client that is not responding is withheld (keys, buttons and enter/leave are not). UI affinity The pointer-focus hook runs after every pointer-focus change (pointer constraints follow it); the *motion lock* withholds every `wl_pointer.motion` while a pointer lock holds, and `send_pointer_frame` closes a group of relative motion that carried none. |
 | `lx.compositor.activation` | xdg-activation's focus-stealing-prevention policy, Wayland-free: `decide_grantable` (at token commit) and `decide_activation` (at `activate`, and again at map for a window that asked before mapping) — pure functions over what the wire and the window manager gather; the token table (64 fixed slots, 128-bit random text from `getrandom`, single use, 30 s lifetime, constant-time lookup, eviction of expired then oldest). UI affinity |
 | `lx.compositor.data_transfer` | Wayland-free data-transfer pieces: `mime_list` (a source's offered types, inline, never allocating) and drag-and-drop action negotiation (`negotiate_dnd_action`, the modifier-chosen user action) |
 | `lx.compositor.dnd` | The drag-and-drop grab, Wayland-free: a third pointer mode beside the implicit grab and move/resize, driven by the window manager's pointer path (hit test, button mask, Escape, modifiers) and calling the wire through `dnd_ops` (focus, motion, drop, cancel, user action). Owns the drag icon's placement (a `dnd_icon` surface-tree root in its own scene layer, moved once per tick with the pointer) and the pointer shape that shows the negotiated action. No allocation per motion. UI affinity |
-| `lx.compositor.wire` (internal) | The libwayland glue, one translation unit per protocol area: `wire_surface.cpp` (wl_compositor, wl_surface, wl_region, frame callbacks, the commit), `wire_subsurface.cpp`, `wire_buffer.cpp` (wl_buffer tracking, shm staging, texture retirement), `wire_xdg_shell.cpp` (xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, the window manager's wire ops), `wire_xdg_popup.cpp`, `wire_decoration.cpp`, `wire_layer_shell.cpp`, `wire_dmabuf.cpp`, `wire_seat.cpp`, `wire_cursor_shape.cpp`, `wire_shell.cpp` (zlm_shell_v1, policy bridge), `wire_output.cpp` (wl_output, xdg-output, wl_surface.enter/leave and the preferred buffer scale/transform), `wire_selection.cpp` (the selection model both selection families share), `wire_data_device.cpp` (wl_data_*), `wire_primary_selection.cpp` (zwp_primary_selection_*_v1), `wire_dnd.cpp` (start_drag, drag offers and action negotiation), `wire_activation.cpp` (xdg_activation_v1: token builders, the grant decision at commit, `activate`), `wire_idle.cpp` (ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1), `wire_output_power.cpp` (zwlr_output_power_manager_v1), `wire_output_management.cpp` (zwlr_output_manager_v1: heads, modes, configurations), `wire_session_lock.cpp` (ext_session_lock_manager_v1, lock objects, lock surfaces), `wire_text_input.cpp` (zwp_text_input_manager_v3, text inputs and the events the relay sends them), `wire_input_method.cpp` (zwp_input_method_manager_v2, input-method popups and keyboard grabs, zwp_virtual_keyboard_manager_v1, the relay's installation), the commit-path add-ons — `wire_fifo.cpp` (wp_fifo_v1, wp_commit_timer_v1, and the add-on object plumbing they all share), `wire_tearing.cpp` (wp_tearing_control_v1, wp_content_type_v1), `wire_single_pixel.cpp` (wp_single_pixel_buffer_manager_v1, wp_alpha_modifier_v1), `wire_syncobj.cpp` (wp_linux_drm_syncobj_manager_v1: timelines, acquire/release points, the commit checks) —, the window and session protocols — `wire_dialog.cpp` (xdg_wm_dialog_v1), `wire_toplevel_icon.cpp` (xdg_toplevel_icon_manager_v1), `wire_bell.cpp` (xdg_system_bell_v1), `wire_foreign.cpp` (zxdg_exporter/importer v2 and v1), `wire_shortcuts_inhibit.cpp` (zwp_keyboard_shortcuts_inhibit_manager_v1), `wire_data_control.cpp` (ext_data_control_manager_v1, zwlr_data_control_manager_v1 v2), `wire_security_context.cpp` (wp_security_context_manager_v1), `wire_pointer_constraints.cpp` (zwp_pointer_constraints_v1), `wire_relative_pointer.cpp` (zwp_relative_pointer_manager_v1), `wire_gestures.cpp` (zwp_pointer_gestures_v1 v3) —, screen capture — `wire_foreign_toplevel.cpp` (ext_foreign_toplevel_list_v1, and the shell bridge's toplevel observer), `wire_capture.cpp` (the two ext_image_capture_source managers, ext_image_copy_capture_manager_v1 sessions and frames, zwlr_screencopy_manager_v1 v3 on the same core, the capture tick and completions), `wire_capture_cursor.cpp` (ext_image_copy_capture_cursor_session_v1) — and `wire_install.cpp` (every global, in registry order, and the `:protocols_p0` entry points). The implementation partition `:wire` (`wire.cppm`, not exported) holds the wire object records and what more than one unit uses; everything else stays in each unit's anonymous namespace. The Wayland-free state stays in the partitions above. UI affinity |
+| `lx.compositor.wire` (internal) | The libwayland glue, one translation unit per protocol area: `wire_surface.cpp` (wl_compositor, wl_surface, wl_region, frame callbacks, the commit), `wire_subsurface.cpp`, `wire_buffer.cpp` (wl_buffer tracking, shm staging, texture retirement), `wire_xdg_shell.cpp` (xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, the window manager's wire ops), `wire_xdg_popup.cpp`, `wire_decoration.cpp`, `wire_layer_shell.cpp`, `wire_dmabuf.cpp`, `wire_seat.cpp`, `wire_cursor_shape.cpp`, `wire_shell.cpp` (zlm_shell_v1, policy bridge), `wire_output.cpp` (wl_output, xdg-output, wl_surface.enter/leave and the preferred buffer scale/transform), `wire_selection.cpp` (the selection model both selection families share), `wire_data_device.cpp` (wl_data_*), `wire_primary_selection.cpp` (zwp_primary_selection_*_v1), `wire_dnd.cpp` (start_drag, drag offers and action negotiation), `wire_activation.cpp` (xdg_activation_v1: token builders, the grant decision at commit, `activate`), `wire_idle.cpp` (ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1), `wire_output_power.cpp` (zwlr_output_power_manager_v1), `wire_output_management.cpp` (zwlr_output_manager_v1: heads, modes, configurations), `wire_session_lock.cpp` (ext_session_lock_manager_v1, lock objects, lock surfaces), `wire_text_input.cpp` (zwp_text_input_manager_v3, text inputs and the events the relay sends them), `wire_input_method.cpp` (zwp_input_method_manager_v2, input-method popups and keyboard grabs, zwp_virtual_keyboard_manager_v1, the relay's installation), the commit-path add-ons — `wire_fifo.cpp` (wp_fifo_v1, wp_commit_timer_v1, and the add-on object plumbing they all share), `wire_tearing.cpp` (wp_tearing_control_v1, wp_content_type_v1), `wire_single_pixel.cpp` (wp_single_pixel_buffer_manager_v1, wp_alpha_modifier_v1), `wire_syncobj.cpp` (wp_linux_drm_syncobj_manager_v1: timelines, acquire/release points, the commit checks) —, the window and session protocols — `wire_dialog.cpp` (xdg_wm_dialog_v1), `wire_toplevel_icon.cpp` (xdg_toplevel_icon_manager_v1), `wire_bell.cpp` (xdg_system_bell_v1), `wire_foreign.cpp` (zxdg_exporter/importer v2 and v1), `wire_shortcuts_inhibit.cpp` (zwp_keyboard_shortcuts_inhibit_manager_v1), `wire_data_control.cpp` (ext_data_control_manager_v1, zwlr_data_control_manager_v1 v2), `wire_security_context.cpp` (wp_security_context_manager_v1), `wire_pointer_constraints.cpp` (zwp_pointer_constraints_v1), `wire_relative_pointer.cpp` (zwp_relative_pointer_manager_v1), `wire_gestures.cpp` (zwp_pointer_gestures_v1 v3) —, screen capture — `wire_foreign_toplevel.cpp` (ext_foreign_toplevel_list_v1, and the shell bridge's toplevel observer), `wire_capture.cpp` (the two ext_image_capture_source managers, ext_image_copy_capture_manager_v1 sessions and frames, zwlr_screencopy_manager_v1 v3 on the same core, the capture tick and completions), `wire_capture_cursor.cpp` (ext_image_copy_capture_cursor_session_v1) —, `wire_workspace.cpp` (ext_workspace_manager_v1: groups, workspace handles, the per-manager diff, commit) — and `wire_install.cpp` (every global, in registry order, and the `:protocols_p0` entry points). The implementation partition `:wire` (`wire.cppm`, not exported) holds the wire object records and what more than one unit uses; everything else stays in each unit's anonymous namespace. The Wayland-free state stays in the partitions above. UI affinity |
 | `lx.scene` | Scene graph (layers bottom→top: layer-shell background and bottom, windows — per-window tree containers —, layer-shell top and overlay, popups, drag icon, session-lock surfaces, cursor), a clear colour per snapshot (the lock's solid colour), multi-rect damage (`gfx::damage_region`), a per-node tint (the not-responding dim), `build_draw_list_into`. Views 0–15 are the outputs; views 16–23 are *capture views* (`output_view_config::root`: one window's tree container projected into a capture client's buffer, with their own damage and snapshot buffers) |
 | `lx.scene.snapshot` | Triple-buffered handoff (v2: index swap, back-pressure policy) |
 | `lx.gfx` | Vulkan device, swapchain, dmabuf import, render pass |
@@ -873,7 +935,7 @@ heads, mode identity, every protocol error, validation, the job queue — is
 - **Adaptive sync**: `VRR_ENABLED` is part of every modeset of the pipeline; a VRR output's
   frame clock starts repaints on demand, no sooner than one refresh period after the last
   flip (niri). vmwgfx has no `vrr_capable`: there it is always disabled.
-- **Persistence** (`lx.compositor:output_config_store`, `:toml_lite`):
+- **Persistence** (`lx.compositor:output_config_store`, `lx.config:toml`):
   `$XDG_CONFIG_HOME/lumen/outputs.toml` (`LUMEN_OUTPUT_CONFIG=PATH` for another file, `0` for
   none; `--virtual-outputs` reads it only when that names one). `[[output]]` per monitor
   identifier: mode (absent: preferred), scale, transform, adaptive sync — only what differs
@@ -1251,8 +1313,25 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
    surface has a keyboard-shortcuts inhibitor, which it turns off (`inactive`) or back on
    (`active`), and an active pointer lock or confinement is released — niri's and GNOME's
    key; with neither the key is the client's.
-2. The window manager's own (Escape during a move, resize or drag).
-3. **Shell key grabs** (zlm_shell_v1 v4 `grab_key` → `zlm_key_grab_v1.activated(serial,
+2. The window manager's own (Escape during a move, resize or drag; every press during a
+   keyboard move or resize, `window.move-keyboard` / `window.resize-keyboard`).
+2b. **A held action** (ADR 011 K2): while a hold exists (a `switcher.*` binding fired) and its
+   primary modifier is down, every key press goes to the shell's `zlm_held_action_v1` as
+   `key` (with the action the user's binding of that key names) instead of the focused
+   client; modifier presses and releases still reach the client. Letting go of the modifier
+   sends `released`; lock, a VT switch and a move, resize or drag cancel it.
+3. **Configured bindings** (`config.toml [bindings]`, ADR 011 C4): exact modifiers, the key
+   at its first level as for grabs below; not during a grab or drag, not while paused; while
+   locked only `allow-when-locked` ones (lock-safe actions), while inhibited only
+   `allow-when-inhibited` ones; bindings to shell actions only while a zlm v7 shell is bound
+   (otherwise the key goes on). The compositor executes `window.*`, `workspace.*`,
+   `keyboard.*`, `session.*` and sends `shell.*` to the shell (zlm v7 `action`, its serial noted as the
+   shell's key press); a held action (`switcher.*`) starts a hold instead (2b), and with no v7
+   shell `switcher.next` is the compositor's quick switch. A binding with `repeat` fires again
+   at the keyboard's repeat rate.
+   Pointer-button bindings (`Super+BTN_LEFT` → `window.move-interactive`) are matched in the
+   window manager's press path the same way.
+4. **Legacy shell key grabs** (zlm_shell_v1 v4 `grab_key` → `zlm_key_grab_v1.activated(serial,
    time)`): exact modifiers, Caps/Num Lock ignored, the keysym at level 1 of the active
    layout or, when that layout has no key for it, of layout 0. Not during a grab or drag,
    not while paused, not while the session is locked (taps neither), and — while the
@@ -1260,15 +1339,96 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
    remote desktop) — only grabs created `not_inhibitable` (zlm v6; the shell's lock key).
    The serial is noted as a key press delivered to the shell, so an
    activation token it requests from it grants focus.
-4. **Tap grabs** (a bare modifier pressed and released alone) are observed, not taken: the
-   key still reaches the client, and the grab fires on release if no other key, button or
-   scroll came between. Inhibited like the grabs above.
-5. **The input method's keyboard grab**, while the input method is active (a focused text
+5. **Taps** (a bare modifier pressed and released alone: a configured `"Super"` binding,
+   else a legacy tap grab) are observed, not taken: the key still reaches the client, and the
+   tap fires on release if no other key, button or scroll came between. Inhibited and locked
+   like the bindings and grabs above.
+6. **The input method's keyboard grab**, while the input method is active (a focused text
    input is enabled): the key goes there and nowhere else; its release follows its press
    (see "Text input and input methods").
-6. The focused client — through the router's **forwarded-key rule**: a release is sent only
+7. The focused client — through the router's **forwarded-key rule**: a release is sent only
    for a key whose press was, and `wl_keyboard.enter` lists only forwarded keys. Every
    consumed press has its release swallowed by that rule alone.
+
+### Configuration
+
+One file, `$XDG_CONFIG_HOME/lumen/config.toml`, over `$XDG_CONFIG_DIRS/lumen/config.toml`, key
+by key over the defaults (ADR 011 Part 2; `deploy/lumen/config.toml` documents every key).
+`lx.config` is the schema and the parser; the compositor alone reads and watches the files:
+
+- **Reading.** At start-up before input and the cursor are set up (generation 1), then on a
+  change the inotify watch reports (100 ms debounce), on SIGHUP (`systemctl --user reload`:
+  `RELOADING=1`, then `READY=1` once applied), `lumen-ctl reload` or the
+  `session.reload-config` action. Read and parsed on the UI thread (≤ 256 KiB per layer,
+  ~0.1 ms); a syntax error rejects the generation and the configuration in use stays; a bad
+  value keeps that key's value.
+- **Applying** only what changed (`diff_config`): repeat → `wl_keyboard.repeat_info` to every
+  keyboard and the input method's grab; the keymap compiled on the worker, then swapped on
+  the UI thread keeping locks, the locked layout (clamped) and held keys, and sent to every
+  keyboard, the input method's grab and the focus (modifiers); libinput settings re-applied
+  to every device (and to each new one as it appears); cursor themes read on the worker and
+  handed to the cursor manager; the focus policy and the binding table swapped.
+- **Reporting** once per generation: the `config` log category, zlm v7 `config_diagnostic`
+  and `config_done` to the shell (one notice), the control socket's `Reload` reply and its
+  `config` event, the health report's counts.
+- **The shell** gets the accepted bytes in a sealed memfd (zlm v7 `config`, also on bind) and
+  applies its sections live; its command-line options win.
+
+### Workspaces, minimize and sticky
+
+`:workspaces` (`workspace_model`, pure, UI affinity, fixed tables: 64 workspaces, 16 per
+output) holds every output's ordered list and its active workspace; the window manager owns
+it and is its only caller, and each window's membership is `toplevel_record::workspace`
+(ADR 011 Part 3).
+
+- **Model.** Dynamic by default — one empty workspace always last, an empty inactive one
+  goes, names are positions — or static (`count`, `names`). Index bindings act on the
+  focused output; past the end (dynamic) is the empty last one. Each workspace remembers the
+  window last focused on it. New windows join the active workspace of their output, children
+  their parent's.
+- **Visibility.** One rule for workspaces, minimize and sticky: shown iff mapped, not
+  minimized, and sticky or on the active workspace (or being dragged). Hiding sets the
+  window's tree container invisible and damages its rects; the hit test skips it, it loses
+  the keyboard to its output's focus target, its popups close, its configure carries
+  `suspended` (sent at the end of the operation with the new `activated`), its frame
+  callbacks fall to the 995 ms throttle, and its commits damage capture views only. A capture
+  view draws its window even while hidden. A fullscreen window's backdrop hides with it.
+- **ext-workspace-v1** (`wire_workspace.cpp`): groups per output, handles per workspace,
+  diffed per bound manager after every operation and closed by one `done`; requests run on
+  `commit` (assigns, then activates; one change); nothing changes while locked; not offered
+  to sandboxed clients. zlm v7 `toplevel_workspace` gives the shell each window's workspace
+  as its own handle.
+- **Hotplug.** An output that goes hands its active workspace's windows to the fallback's
+  active workspace and appends its other workspaces there (static: merged by position),
+  remembering where they were; they return with the output, and its active workspace is
+  active again. With no output, workspaces wait for the next.
+- **Control.** `lumen-ctl workspaces`, `ListWorkspaces`, workspace fields in `ListWindows` /
+  `ListOutputs`, `workspace` events in `Subscribe`.
+
+### Snapping and the window switcher
+
+(ADR 011 Part 4.) **Snapping** is window-manager state like maximize:
+`toplevel_record::snap` holds the half or quarter (`edge_*` bits) a window was asked into;
+`window_manager::snap_by_key` runs Windows 11's Super+arrow table (`next_snap`, pure; across
+to the neighbouring output at the far edge) and `set_snap` applies it — one configure with
+the size, the place and the xdg `tiled_*` states, the commit answering it placing the window
+(the far edge anchored), `restore` keeping the normal geometry. Snapped windows refit with
+the usable area, move to the same half of an evacuation's fallback and return with their
+home output. **Edge snapping**: during any move, the pointer near an outer layout edge (no
+output continues it there) picks a half, a corner a quarter, the top edge maximize
+(`edge_snap_zone`, pure); the zone's **preview** is the window manager's `snap_preview` scene
+node in `snap_preview_layer_` (between the windows and the top layer-shell layer: two 1×1
+textures, five draws while shown); the release snaps. A move of a maximized or snapped window
+restores it under the pointer once it has travelled 8 px (`drag_restore_origin`).
+**Keyboard move and resize** (`begin_keyboard_grab`) are the same grab without a button: the
+pointer is warped and the arrow keys move it.
+
+The **switcher** is lumen-shell's (`lx.shell:switcher`): a pure `switcher_model` over the task
+model's MRU order (`task_model::mru`, seeded from stacking, debounced under focus-follows-
+mouse), a pure layout, and a `switcher_view` — an overlay layer surface that exists only
+while shown, created once the hold has lasted `[switcher] open-delay`. The hold is the
+compositor's (Key bindings 2b); the shell turns its `key` events into steps, `released` into
+`request_activate`, and ends it itself on Escape, Return or a click.
 
 ### Activation: xdg-activation and focus-stealing prevention
 
@@ -1567,14 +1727,14 @@ sequenceDiagram
 
     Note over Shell,Comp: Session startup
     Shell->>Comp: connect Wayland + bind zlm_shell_v1 (exe-path privilege check)
-    Comp->>Shell: capabilities(version 5) + lock_state(unlocked)
+    Comp->>Shell: capabilities(version 7) + lock_state(unlocked)
+    Comp->>Shell: config(memfd) + config_diagnostic… + config_done
     Shell->>Comp: get_policy_bridge() + panel layer surface
     Srv->>Shell: snapshot_begin → toplevels → snapshot_done → focus_changed
-    Shell->>Comp: grab_key(Super_L, tap) + grab_key(Super_R, tap)
     Note over Shell: task model complete, panel drawn from it
 
-    Note over Shell,Comp: A grabbed key
-    Comp->>Shell: zlm_key_grab_v1.activated(serial, time)
+    Note over Shell,Comp: A bound key (config.toml [bindings])
+    Comp->>Shell: zlm_shell_v1.action("shell.terminal", "", serial, time)
     Note over Shell: the shell acts (serial usable for xdg_activation)
 
     Note over Shell,Comp: New application window
@@ -1595,7 +1755,10 @@ sequenceDiagram
 |-----------|-----------|----------|
 | Compositor → Shell | `zlm_policy_bridge_v1` events | `snapshot_*`, `toplevel_created`, `toplevel_geometry`, `focus_changed` |
 | Shell → Compositor | `zlm_policy_bridge_v1` requests | `request_activate`, `set_toplevel_stacking_index`, `request_close`, `request_move`, `request_resize` |
-| Shell → Compositor → Shell | `zlm_shell_v1.grab_key` (v4) / `zlm_key_grab_v1.activated` | which key combination the shell wants; the compositor sees keys first and reports it |
+| Compositor → Shell | `zlm_shell_v1.action` (v7) | a configured binding (or `lumen-ctl action`) named a shell action: launcher, terminal, lock |
+| Compositor → Shell ⇄ | `zlm_shell_v1.held_action` → `zlm_held_action_v1.key` / `released` / `cancelled`; the shell's `destroy` (v7) | Alt+Tab: the keys while Alt is down, for the window switcher |
+| Compositor → Shell | `zlm_shell_v1.config` / `config_diagnostic` / `config_done` (v7) | the configuration's bytes and the compositor's report of it |
+| Shell → Compositor → Shell | `zlm_shell_v1.grab_key` (v4) / `zlm_key_grab_v1.activated` | legacy: a v4–v6 shell's own key grabs |
 | Compositor → Shell | `zlm_shell_v1.lock_state` / `lock_requested` (v5) | the session lock's state (the shell closes the launcher, restarts a dead locker); logind Lock and before-sleep (the shell starts its locker) |
 
 Interactive move/resize has one executor in the compositor (`window_manager::begin_grab`)
@@ -1835,8 +1998,9 @@ shell. See [shell-state-sync.md](subsystems/shell-state-sync.md) § Privilege mo
 
 Window rules (`zlm_window_rules_v1`) load from `$XDG_CONFIG_HOME/lumen/window-rules.toml`.
 
-Key grabs (`zlm_shell_v1.grab_key`, v4) exist only on the privileged global: an application
-cannot take keys from other clients.
+Key grabs (`zlm_shell_v1.grab_key`, v4) and shell actions (v7 `action`) exist only on the
+privileged global: an application cannot take keys from other clients. The configuration
+bytes reach only the shell (its memfd is sealed read-only); the file itself is the user's.
 
 **Output configuration and sandboxes (ADR 008, C5).** `zwlr_output_manager_v1` is not
 privileged: any session-UID client may bind it (wlr-randr from a terminal, kanshi as a user
@@ -1844,8 +2008,9 @@ service), as in sway and niri. Sandboxed clients do not see it: `lx.wayland.serv
 installs a global filter (`wl_display_set_global_filter`) that hides every global marked
 `deny_sandboxed` from a sandboxed client; a bind by name is refused by libwayland as an
 invalid global. Marked: output management, output power, idle notification, session lock,
-layer shell, input method, virtual keyboard, ext and wlr data control, the
-security-context manager itself (no nesting), and screen capture — the toplevel list, both
+layer shell, input method, virtual keyboard, ext and wlr data control, ext-workspace (the
+session's workspaces and their activation), the security-context manager itself (no
+nesting), and screen capture — the toplevel list, both
 image-capture-source managers, image-copy-capture and wlr-screencopy (a sandboxed app shares
 its screen through the portal, which asks the user). The filter hides privileged globals
 (`zlm_shell_v1`) from sandboxed clients as well: one can never pass the shell check, so it is
@@ -1882,6 +2047,29 @@ and virtual keyboard (`zwp_text_input_manager_v3` stays public); see above. The 
 locker that dies leaves the session locked, and only another locker or logind's
 polkit-gated `Unlock` can end it.
 
+**The control socket (ADR 011, S7).** `$XDG_RUNTIME_DIR/<display>.varlink` is created with
+mode 0600 next to the Wayland socket, after it (the display's `.lock`, which libwayland
+holds, proves the name is this compositor's; a stale file is replaced), and served with
+`SD_VARLINK_SERVER_MYSELF_ONLY`: sd-varlink refuses a peer whose UID is not the
+compositor's before any method runs. Every call's parameters are validated against the
+interface definition first. Sandboxed applications do not see it (only the Wayland socket is
+exposed into a sandbox). It can log the session out and act on the focused window — what
+the user's own keys can do — and nothing else: it reads no pixels (screenshots stay with
+the portals and their capture indicator).
+
+**The shell on the user bus (ADR 011, N1–N6).** lumen-shell owns
+`org.freedesktop.Notifications`, `org.kde.StatusNotifierWatcher` and
+`org.kde.StatusNotifierHost-<pid>` on the session bus, without replacing an owner (a running
+mako or KDE watcher keeps its name; the shell waits in the queue). What it accepts from
+applications is bounded: strings by length, at most 16 actions, image data validated against
+its length and kept at most 96² pixels, 256 open notifications, 20 a second per sender (the
+excess merged), 32 tray items, menus of 256 items and depth 8. Notification bodies are
+parsed, never interpreted: a link opens only on a click and only for `http`, `https` and
+`mailto`, through `xdg-open` as its own unit. Activation tokens handed to applications
+(`ActivationToken`, `ProvideXdgActivationToken`) are made from the user's own click, as for
+launches. A sandboxed application reaches these names only as its bus proxy allows
+(Flatpak's `--talk-name`); the shell treats every sender the same.
+
 Applications the shell launches run as the user, each in its own transient service under
 `app.slice` of the user's systemd instance: resource-tracked, outside the shell's cgroup,
 and with nothing inherited from the shell but the environment it passes explicitly (minus
@@ -1893,36 +2081,78 @@ shell's connection, so a dead shell can neither hold keys nor lock the user in.
 
 ## 10. Session deployment (systemd)
 
-Typical user session:
+A login runs **`lumen-session`** — from the shell of a console login, or from a display
+manager through `share/wayland-sessions/lumen.desktop`. With a systemd user manager it
+imports the login's environment into the manager (recording what it changes), runs
+`systemctl --user --wait start lumen-compositor.service`, and when that returns starts
+`lumen-shutdown.target` and puts the manager's environment back exactly as it was
+(ADR 011, design-session-and-wm Part S). Nothing is enabled: the compositor's unit pulls in
+the rest.
 
 ```mermaid
-flowchart TB
-    subgraph UserSession["systemd --user"]
-        SOCK["lumen-compositor.socket"]
-        COMP["lumen-compositor.service"]
-        SHELL["lumen-shell.service"]
-    end
-
-    SOCK -->|"activates"| COMP
-    COMP -->|"After="| SHELL
-    COMP --> RUNTIME["$XDG_RUNTIME_DIR/lumen-0"]
-    SHELL --> RUNTIME
+flowchart LR
+    LS[lumen-session] -->|"--wait start"| C[lumen-compositor.service<br/>Type=notify-reload]
+    C -->|BindsTo, Before| GS[graphical-session.target]
+    C -->|Wants, After| GSP[graphical-session-pre.target]
+    C -->|Wants| SH[lumen-shell.service<br/>Restart=on-failure]
+    C -->|Wants, Before| XA[xdg-desktop-autostart.target]
+    SH -->|PartOf, After| GS
+    XA -.->|app-*@autostart.service| GS
+    P[xdg-desktop-portal*.service] -->|PartOf, After| GS
+    LS -->|"afterwards, replace-irreversibly"| SD[lumen-shutdown.target]
+    SD -->|Conflicts| GS
 ```
 
-Unit files: `deploy/systemd/`
+Unit files: `deploy/systemd/*.in`, configured at install time with the prefix's paths
+(`cmake --install build --prefix DIR` gives DIR's own tree; units go to systemd's
+`systemduserunitdir` for `/usr`, else `<prefix>/lib/systemd/user`).
 
 | Unit | Role |
 |------|------|
-| `lumen-compositor.socket` | Creates `$XDG_RUNTIME_DIR/lumen-0` |
-| `lumen-compositor.service` | Starts compositor, holds DRM lease |
-| `lumen-shell.service` | Starts after compositor; `Requires=lumen-compositor`; `Slice=session.slice` |
+| `lumen-compositor.service` | The display server: `Type=notify-reload` (built against systemd < 253: `Type=notify` with `ExecReload=` sending SIGHUP) (READY once the socket is served and the session environment is in the manager), `BindsTo=graphical-session.target`, `Slice=session.slice`, `Restart=no`, `WatchdogSec=30s`; `ExecStart=lumen-compositor --session $LUMEN_DISPLAY` |
+| `lumen-shell.service` | The shell: `PartOf=`/`After=`/`Requisite=graphical-session.target`, `Restart=on-failure` (300 ms, 5 in 30 s), `Slice=session.slice` |
+| `lumen-shutdown.target` | Started by lumen-session after the compositor: conflicts with both session targets |
 | `app-lumen-<id>@<random>.service` | One per launched application (transient, `app.slice`); `journalctl --user -u 'app-lumen-*'` |
+| `app-<id>@autostart.service` | XDG autostart entries for `Lumen` (systemd-xdg-autostart-generator), after `graphical-session.target` |
 | `xdg-desktop-portal-lumen.service` | Screenshot/PickColor portal backend, D-Bus-activated (`Type=dbus`, `PartOf=graphical-session.target`, `ConditionEnvironment=WAYLAND_DISPLAY`) |
+
+**Start-up.** The compositor (in `user@.service`, not in the login's scope) finds the login
+session by `XDG_SESSION_ID`, takes control of it and sets its type to `wayland`; opens the
+display and input, serves the Wayland socket and the control socket; exports
+`WAYLAND_DISPLAY`, `XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`, `XDG_SESSION_DESKTOP` and
+`LUMEN_SOCKET` (asynchronously); then sends `READY=1`. `graphical-session.target` becomes
+active, and with it the shell, XDG autostart and — on first use — the portals, all of which
+find the environment already there.
+
+**The shell** is supervised by systemd; a crashed shell is back in about 300 ms with the
+compositor's snapshot of every window, and the compositor holds the panel's strip meanwhile
+(§2.2, ADR 011 S6).
+
+**The end.** A logout closes every window (5 s at most) and stops the compositor
+(`STOPPING=1` first); the compositor unsets its variables and releases the session (logind
+restores the console and the session type); `BindsTo=` stops `graphical-session.target` and
+with it everything `PartOf=` it; lumen-session restores the environment. A compositor that
+crashes, or that the watchdog aborts, ends the session the same way — back to the login.
+
+**Without a user manager** lumen-session runs the compositor and the shell itself, restarts
+the shell when it fails and starts the XDG autostart entries.
+
+**Control.** `lumen-ctl status | health | outputs | windows | workspaces | reload |
+action NAME | logout | monitor` over the control socket (§9); `status` adds the session's
+units from the user manager and exits 0/1/2 for ok/degraded/critical, 3 when nothing runs.
+
+**Development.** `scripts/run-desktop.sh` runs compositor, shell (restarted when it crashes),
+portals and a client as its children; `--systemd [--prefix DIR]` instead runs the real
+session path above with the units in `$XDG_RUNTIME_DIR/systemd/user` for that run only and
+checks afterwards that the user manager is as it was. `scripts/session-smoke.sh` judges the
+whole path on the console.
 
 Portal files (installed from `deploy/portal/` and `deploy/xdg/`): `lumen.portal` and
 `lumen-portals.conf` in `share/xdg-desktop-portal/`, the D-Bus service file, and
-xdg-desktop-portal-wlr's `Lumen` config in `/etc/xdg/xdg-desktop-portal-wlr/`. The session
-must export its environment to the user manager before the frontend starts (§ Portals).
+xdg-desktop-portal-wlr's `Lumen` config in `<sysconfdir>/xdg/xdg-desktop-portal-wlr/`. The
+frontend reads `lumen-portals.conf` because `XDG_CURRENT_DESKTOP=Lumen` is in the manager's
+environment before it is D-Bus activated; lumen-session stops a frontend left running from
+an earlier session first (§ Portals).
 
 ---
 
@@ -1936,6 +2166,7 @@ All fallible APIs return **`lx::result<T>`**. Platform stubs return
 | Typed errors | `lx.foundation.error` | Domains, codes, `LX_RETURN_IF_ERROR` |
 | Logging | `lx.trace` | stderr default, `LUMEN_LOG` env, `log_error()` |
 | Spans | `LX_TRACE_SCOPE` | Frame hot-path tracing at `trace` level |
+| Health | `lx.health` | Pulled on request (`lumen-ctl status`, `GetHealth`): parts, processes, memory, per-output pacing ([health.md](subsystems/health.md)) |
 
 Orchestration boundaries (e.g. `compositor::start()`) log failures once via
 `log_error` before returning. See [errors-and-logging.md](subsystems/errors-and-logging.md).
@@ -1978,6 +2209,7 @@ returning `not_implemented` until P0 lands.
 | Shell snapshot/delta wire-up | Done — lumen-shell consumes it (panel task list) |
 | VT switching, logind pause/resume | Done — Ctrl+Alt+F*n*, `chvt`, resume modeset, paused clients at 1 Hz |
 | Key bindings, shell key grabs (zlm v4) | Done — Super tap (launcher), Super+Return (terminal) |
+| Configuration file, configurable bindings (zlm v7) | Done — config.toml with live reload, layouts/repeat/libinput/cursor/focus/idle/background, diagnostics (app-smoke R) |
 | Launcher, detached app launching | Done — XDG desktop entries, systemd transient services, activation tokens |
 | DRM page-flip vsync | P1 — timer stub today |
 | Multiple monitors, hotplug (ADR 008 Parts 1–2) | Done — per-CRTC flips, udev hotplug with worker probe, mode follow (VM resize), migration and return, resume probe (monitor-smoke) |
@@ -2006,3 +2238,4 @@ returning `not_implemented` until P0 lands.
 | dmabuf / Vulkan | [subsystems/dmabuf-vulkan-import.md](subsystems/dmabuf-vulkan-import.md) |
 | UI architecture | [subsystems/ui-architecture.md](subsystems/ui-architecture.md) |
 | Protocol registry | [../protocols/README.md](../protocols/README.md) |
+| Login session, control socket, health export | [adr/011-session-and-window-management.md](adr/011-session-and-window-management.md) |

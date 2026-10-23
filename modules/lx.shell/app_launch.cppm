@@ -203,6 +203,16 @@ public:
     void set_method(launch_method m) { method_ = m; }
     /// From LUMEN_SHELL_LAUNCH ("fork" forces the fallback, "scope" the scope path).
     void configure_from_env();
+    /// The shell's user-bus connection (`:user_bus`, sd_bus*): launches use it instead of
+    /// opening their own, and its owner polls and processes it. Ignored once a launch has
+    /// opened a connection of its own (that one stays theirs).
+    void set_shared_bus(void* bus) {
+        if (!bus_)
+            shared_bus_ = bus;
+    }
+    /// The shared connection broke: its slots go, launches waiting for systemd are reported
+    /// as failed (their outcome is unknown), the next launch connects again.
+    void bus_lost();
 
     void start(const prepared_launch& p, std::string_view token, std::string_view wayland_display);
 
@@ -273,6 +283,8 @@ private:
     void* user_ = nullptr;
     launch_method method_ = launch_method::automatic;
     void* bus_ = nullptr;       // sd_bus*
+    /// The shell's connection, when shared (then `bus_` is a reference to it).
+    void* shared_bus_ = nullptr;
     void* match_slot_ = nullptr; // sd_bus_slot*
     void* sub_slot_ = nullptr;
     bool no_systemd_ = false;
@@ -874,7 +886,7 @@ void lx::shell::app_launcher::run_deadlines() {
 unsigned lx::shell::app_launcher::poll_fds(pollfd* out, unsigned cap, int& timeout_ms) const {
     unsigned n = 0;
 #if defined(LUMEN_HAS_LOGIND)
-    if (bus_ && n < cap) {
+    if (bus_ && !shared_bus_ && n < cap) {
         auto* bus = static_cast<sd_bus*>(bus_);
         const int fd = sd_bus_get_fd(bus);
         const int ev = sd_bus_get_events(bus);
@@ -916,9 +928,9 @@ unsigned lx::shell::app_launcher::poll_fds(pollfd* out, unsigned cap, int& timeo
 
 void lx::shell::app_launcher::dispatch(std::span<const pollfd> fds) {
 #if defined(LUMEN_HAS_LOGIND)
-    if (bus_) {
+    if (bus_ && !shared_bus_) {
         // The bus is processed every time: its timeouts (a call's reply deadline) are due
-        // even without fd activity.
+        // even without fd activity. (A shared bus is its owner's to process.)
         auto* bus = static_cast<sd_bus*>(bus_);
         for (int guard = 0; guard < 64; ++guard) {
             const int r = sd_bus_process(bus, nullptr);
@@ -926,30 +938,7 @@ void lx::shell::app_launcher::dispatch(std::span<const pollfd> fds) {
                 if (r < 0) {
                     launch_log(lx::trace::level::warn, "apps: user bus failed: {}",
                                std::strerror(-r));
-                    for (auto& u : units_)
-                        if (u.used && u.slot)
-                            u.slot = sd_bus_slot_unref(static_cast<sd_bus_slot*>(u.slot));
-                    match_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(match_slot_));
-                    sub_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(sub_slot_));
-                    bus_ = sd_bus_flush_close_unref(bus);
-                    // Launches still waiting for systemd: their outcome is unknown. A held
-                    // process goes on without its scope (its pipe reports it).
-                    for (auto& u : units_)
-                        if (u.used && u.scope_for) {
-                            release_hold(*u.scope_for);
-                            u = {};
-                        }
-                    for (auto& u : units_)
-                        if (u.used) {
-                            launch_outcome o{};
-                            copy_str(o.id, sizeof(o.id), u.launch ? u.launch->id : "");
-                            copy_str(o.name, sizeof(o.name), u.launch ? u.launch->name : "");
-                            copy_str(o.unit, sizeof(o.unit), u.unit);
-                            copy_str(o.detail, sizeof(o.detail), "bus connection lost");
-                            o.failure = launch_failure::systemd_error;
-                            u = {};
-                            report(o);
-                        }
+                    bus_lost();
                 }
                 break;
             }
@@ -1123,10 +1112,15 @@ bool lx::shell::app_launcher::open_bus() {
     if (bus_)
         return true;
     sd_bus* bus = nullptr;
-    int r = sd_bus_open_user_with_description(&bus, "lumen-shell-launch");
-    if (r < 0) {
-        systemd_gone(std::strerror(-r));
-        return false;
+    int r = 0;
+    if (shared_bus_) {
+        bus = sd_bus_ref(static_cast<sd_bus*>(shared_bus_));
+    } else {
+        r = sd_bus_open_user_with_description(&bus, "lumen-shell-launch");
+        if (r < 0) {
+            systemd_gone(std::strerror(-r));
+            return false;
+        }
     }
     // Manager.Version decides service or scope (ExitType=cgroup is 250's). Once, blocking
     // for at most a second, at the first launch — as KIO does; a local round trip.
@@ -1148,7 +1142,10 @@ bool lx::shell::app_launcher::open_bus() {
         classify_start_error(err.name) == start_error_class::no_systemd) {
         systemd_gone(err.name);
         sd_bus_error_free(&err);
-        sd_bus_flush_close_unref(bus);
+        if (shared_bus_)
+            sd_bus_unref(bus);
+        else
+            sd_bus_flush_close_unref(bus);
         return false;
     }
     mode_ = version ? launch_mode_for_version(version) : systemd_launch_mode::scope;
@@ -1343,11 +1340,47 @@ lx::shell::app_launcher::~app_launcher() {
         sd_bus_slot_unref(static_cast<sd_bus_slot*>(match_slot_));
     if (sub_slot_)
         sd_bus_slot_unref(static_cast<sd_bus_slot*>(sub_slot_));
-    if (bus_)
+    if (bus_ && shared_bus_)
+        sd_bus_unref(static_cast<sd_bus*>(bus_));
+    else if (bus_)
         sd_bus_flush_close_unref(static_cast<sd_bus*>(bus_));
     for (auto& pp : pipes_)
         if (pp.fd >= 0)
             close(pp.fd);
+}
+
+void lx::shell::app_launcher::bus_lost() {
+    if (!bus_)
+        return;
+    for (auto& u : units_)
+        if (u.used && u.slot)
+            u.slot = sd_bus_slot_unref(static_cast<sd_bus_slot*>(u.slot));
+    match_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(match_slot_));
+    sub_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(sub_slot_));
+    if (shared_bus_)
+        sd_bus_unref(static_cast<sd_bus*>(bus_));
+    else
+        sd_bus_flush_close_unref(static_cast<sd_bus*>(bus_));
+    bus_ = nullptr;
+    shared_bus_ = nullptr; // the next launch opens its own connection
+    // Launches still waiting for systemd: their outcome is unknown. A held process goes on
+    // without its scope (its pipe reports it).
+    for (auto& u : units_)
+        if (u.used && u.scope_for) {
+            release_hold(*u.scope_for);
+            u = {};
+        }
+    for (auto& u : units_)
+        if (u.used) {
+            launch_outcome o{};
+            copy_str(o.id, sizeof(o.id), u.launch ? u.launch->id : "");
+            copy_str(o.name, sizeof(o.name), u.launch ? u.launch->name : "");
+            copy_str(o.unit, sizeof(o.unit), u.unit);
+            copy_str(o.detail, sizeof(o.detail), "bus connection lost");
+            o.failure = launch_failure::systemd_error;
+            u = {};
+            report(o);
+        }
 }
 
 #else // !LUMEN_HAS_LOGIND
@@ -1370,5 +1403,6 @@ lx::shell::app_launcher::~app_launcher() {
             close(pp.fd);
     }
 }
+void lx::shell::app_launcher::bus_lost() {}
 
 #endif

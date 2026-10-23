@@ -190,6 +190,22 @@ LUMEN_TEST(loop_sleeps_until_another_thread_posts) {
     LUMEN_CHECK(loop.wakeups() <= 2);
 }
 
+// A SIGTERM during compositor start-up calls quit() before run(): run() used to reset
+// running_ and serve a whole session until systemd's stop timeout killed it.
+LUMEN_TEST(quit_before_run_stops_the_next_run_once) {
+    lx::runtime::event_loop loop;
+    loop.quit(5);
+    LUMEN_CHECK(loop.run() == 5);
+    // Consumed: a later run() runs until its own quit.
+    bool ran = false;
+    (void)loop.post(lx::runtime::task{[&] {
+        ran = true;
+        loop.quit(6);
+    }});
+    LUMEN_CHECK(loop.run() == 6);
+    LUMEN_CHECK(ran);
+}
+
 LUMEN_TEST(loop_wakes_for_work_posted_to_the_ui_strand) {
     lx::runtime::event_loop loop;
     std::thread poster{[&] {

@@ -134,6 +134,54 @@ public:
     /// zlm_shell_v1.capture_state: some client is capturing the screen.
     [[nodiscard]] bool capture_active() const { return capture_active_; }
 
+    // ── zlm v7: the configuration and actions ──
+    /// Bound at version 7 or later: the compositor matches the key bindings and sends
+    /// `action`; it hands over the configuration file.
+    [[nodiscard]] bool has_v7() const;
+    /// One config_diagnostic.
+    struct config_line {
+        unsigned severity = 0; ///< 0 error, 1 warning
+        std::string file{};
+        unsigned line = 0;
+        std::string text{};
+    };
+    /// zlm_shell_v1.config: the effective bytes (read from the sealed memfd).
+    using config_fn = void (*)(std::string_view bytes, unsigned generation, void* user);
+    /// zlm_shell_v1.config_done, with the diagnostics that preceded it.
+    using config_done_fn = void (*)(unsigned generation, bool applied, unsigned errors,
+                                    unsigned warnings, std::span<const config_line> lines,
+                                    void* user);
+    /// zlm_shell_v1.action.
+    using action_fn = void (*)(const char* action, const char* argument, unsigned serial,
+                               unsigned time_ms, void* user);
+    void set_config_handlers(config_fn config, config_done_fn done, action_fn action, void* user) {
+        config_fn_ = config;
+        config_done_fn_ = done;
+        action_fn_ = action;
+        config_user_ = user;
+    }
+
+    // ── zlm v7: held actions (design-session-and-wm K.1) ──
+    /// zlm_shell_v1.held_action and zlm_held_action_v1's events. After `released` or
+    /// `cancelled` the bridge destroys the hold itself.
+    struct hold_handlers {
+        void (*begin)(const char* action, const char* argument, unsigned serial, unsigned time_ms,
+                      void* user) = nullptr;
+        /// A key press during the hold: its first-level keysym, the zlm_key_grab_v1.modifier
+        /// bits, and the action its binding names ("" none).
+        void (*key)(unsigned keysym, unsigned modifiers, const char* binding, unsigned serial,
+                    unsigned time_ms, void* user) = nullptr;
+        void (*released)(unsigned serial, unsigned time_ms, void* user) = nullptr;
+        void (*cancelled)(void* user) = nullptr;
+        void* user = nullptr;
+    };
+    /// Without handlers a hold is ended as it arrives (the keys go back to clients).
+    void set_hold_handlers(hold_handlers h) { hold_handlers_ = h; }
+    [[nodiscard]] bool holding() const { return hold_ != nullptr; }
+    /// Ends the hold now (zlm_held_action_v1.destroy): key presses go to the focused client
+    /// again — the switcher was dismissed or committed before the modifier was let go.
+    void end_hold();
+
     /// Wire events, one per protocol event (defined with the listeners).
     struct events;
 
@@ -167,6 +215,14 @@ private:
     bell_fn bell_fn_ = nullptr;
     void* bell_user_ = nullptr;
     bool capture_active_ = false;
+    config_fn config_fn_ = nullptr;
+    config_done_fn config_done_fn_ = nullptr;
+    action_fn action_fn_ = nullptr;
+    void* config_user_ = nullptr;
+    hold_handlers hold_handlers_{};
+    void* hold_ = nullptr; // zlm_held_action_v1*
+    /// The diagnostics of the generation being reported (until config_done).
+    std::vector<config_line> config_lines_{};
 
     task_model model_{};
     key_grab grabs_[k_max_key_grabs]{};
@@ -271,6 +327,94 @@ struct lx::shell::policy_bridge::events {
         b.capture_active_ = active != 0;
         bridge_log(lx::trace::level::info, active ? "screen capture active" : "screen capture ended");
     }
+    // ── zlm_shell_v1 v7 ──
+    static void config(void* data, zlm_shell_v1*, int32_t fd, uint32_t size, uint32_t generation) {
+        auto& b = self(data);
+        std::string bytes;
+        // Read, not kept mapped: the bytes are parsed once and the fd closed. A short read is
+        // a broken memfd: an empty configuration (the defaults) rather than garbage.
+        if (fd >= 0 && size > 0 && size <= 8u * 256u * 1024u + 4096u) {
+            bytes.resize(size);
+            std::size_t got = 0;
+            while (got < size) {
+                const ssize_t n = ::pread(fd, bytes.data() + got, size - got,
+                                          static_cast<off_t>(got));
+                if (n <= 0)
+                    break;
+                got += static_cast<std::size_t>(n);
+            }
+            bytes.resize(got);
+        }
+        if (fd >= 0)
+            ::close(fd);
+        b.config_lines_.clear();
+        bridge_log(lx::trace::level::info, "configuration generation {} ({} bytes)", generation,
+                   bytes.size());
+        if (b.config_fn_)
+            b.config_fn_(bytes, generation, b.config_user_);
+    }
+    static void config_diagnostic(void* data, zlm_shell_v1*, uint32_t, uint32_t severity,
+                                  const char* file, uint32_t line, const char* text) {
+        auto& b = self(data);
+        if (b.config_lines_.size() < 64)
+            b.config_lines_.push_back({severity, file ? file : "", line, text ? text : ""});
+    }
+    static void config_done(void* data, zlm_shell_v1*, uint32_t generation, uint32_t applied,
+                            uint32_t errors, uint32_t warnings) {
+        auto& b = self(data);
+        if (b.config_done_fn_)
+            b.config_done_fn_(generation, applied != 0, errors, warnings, b.config_lines_,
+                              b.config_user_);
+        b.config_lines_.clear();
+    }
+    static void action(void* data, zlm_shell_v1*, const char* name, const char* argument,
+                       uint32_t serial, uint32_t time) {
+        auto& b = self(data);
+        if (bridge_debug())
+            bridge_log(lx::trace::level::debug, "action {} serial={}", name ? name : "", serial);
+        if (b.action_fn_)
+            b.action_fn_(name ? name : "", argument ? argument : "", serial, time, b.config_user_);
+    }
+
+    static void held_action(void* data, zlm_shell_v1*, zlm_held_action_v1* hold, const char* name,
+                            const char* argument, uint32_t serial, uint32_t time);
+    static void hold_key(void* data, zlm_held_action_v1* hold, uint32_t keysym, uint32_t mods,
+                         const char* binding, uint32_t serial, uint32_t time) {
+        auto& b = self(data);
+        if (hold != b.hold_)
+            return;
+        if (bridge_debug())
+            bridge_log(lx::trace::level::debug, "hold key keysym=0x{:x} mods=0x{:x} binding={}",
+                       keysym, mods, binding ? binding : "");
+        if (b.hold_handlers_.key)
+            b.hold_handlers_.key(keysym, mods, binding ? binding : "", serial, time,
+                                 b.hold_handlers_.user);
+    }
+    static void hold_released(void* data, zlm_held_action_v1* hold, uint32_t serial,
+                              uint32_t time) {
+        auto& b = self(data);
+        if (hold != b.hold_)
+            return;
+        // Inert from now on: released before the handler, which may start nothing new on it.
+        zlm_held_action_v1_destroy(hold);
+        b.hold_ = nullptr;
+        if (bridge_debug())
+            bridge_log(lx::trace::level::debug, "hold released");
+        if (b.hold_handlers_.released)
+            b.hold_handlers_.released(serial, time, b.hold_handlers_.user);
+    }
+    static void hold_cancelled(void* data, zlm_held_action_v1* hold) {
+        auto& b = self(data);
+        if (hold != b.hold_)
+            return;
+        zlm_held_action_v1_destroy(hold);
+        b.hold_ = nullptr;
+        if (bridge_debug())
+            bridge_log(lx::trace::level::debug, "hold cancelled");
+        if (b.hold_handlers_.cancelled)
+            b.hold_handlers_.cancelled(b.hold_handlers_.user);
+    }
+
     static void lock_requested(void* data, zlm_shell_v1*, uint32_t reason) {
         auto& b = self(data);
         bridge_log(lx::trace::level::info, reason == ZLM_SHELL_V1_LOCK_REASON_SLEEP
@@ -390,7 +534,10 @@ struct lx::shell::policy_bridge::events {
     }
     static void focus_changed(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
         auto& b = self(data);
-        b.model_.set_focus(find(b, t));
+        timespec ts{};
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        b.model_.set_focus(find(b, t), static_cast<long long>(ts.tv_sec) * 1'000'000'000LL +
+                                           ts.tv_nsec);
         if (bridge_debug()) {
             const task_handle f = b.model_.focused();
             char line[64];
@@ -467,6 +614,16 @@ struct lx::shell::policy_bridge::events {
                        ph ? static_cast<int>(ph.index) : -1);
         }
     }
+    // ── zlm_policy_bridge_v1 v7 ──
+    static void toplevel_workspace(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
+                                   ext_workspace_handle_v1* ws) {
+        auto& b = self(data);
+        const task_handle th = find(b, t);
+        if (b.model_.set_workspace(th, ws) && bridge_debug()) {
+            bridge_log(lx::trace::level::debug, "workspace handle={} workspace={}", th.index,
+                       static_cast<const void*>(ws));
+        }
+    }
     static void bell(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
         auto& b = self(data);
         const task_handle th = find(b, t);
@@ -486,12 +643,23 @@ const zlm_key_grab_v1_listener k_key_grab_listener = {
     .refused = lx::shell::policy_bridge::events::key_grab_refused,
 };
 
+const zlm_held_action_v1_listener k_hold_listener = {
+    .key = lx::shell::policy_bridge::events::hold_key,
+    .released = lx::shell::policy_bridge::events::hold_released,
+    .cancelled = lx::shell::policy_bridge::events::hold_cancelled,
+};
+
 const zlm_shell_v1_listener k_shell_listener = {
     .capabilities = lx::shell::policy_bridge::events::capabilities,
     .session_ending = lx::shell::policy_bridge::events::session_ending,
     .lock_state = lx::shell::policy_bridge::events::lock_state,
     .lock_requested = lx::shell::policy_bridge::events::lock_requested,
     .capture_state = lx::shell::policy_bridge::events::capture_state,
+    .config = lx::shell::policy_bridge::events::config,
+    .config_diagnostic = lx::shell::policy_bridge::events::config_diagnostic,
+    .config_done = lx::shell::policy_bridge::events::config_done,
+    .action = lx::shell::policy_bridge::events::action,
+    .held_action = lx::shell::policy_bridge::events::held_action,
 };
 
 const zlm_policy_bridge_v1_listener k_bridge_listener = {
@@ -512,9 +680,39 @@ const zlm_policy_bridge_v1_listener k_bridge_listener = {
     .toplevel_icon_done = lx::shell::policy_bridge::events::toplevel_icon_done,
     .toplevel_parent = lx::shell::policy_bridge::events::toplevel_parent,
     .bell = lx::shell::policy_bridge::events::bell,
+    .toplevel_workspace = lx::shell::policy_bridge::events::toplevel_workspace,
 };
 
 } // namespace
+
+void lx::shell::policy_bridge::events::held_action(void* data, zlm_shell_v1*,
+                                                   zlm_held_action_v1* hold, const char* name,
+                                                   const char* argument, uint32_t serial,
+                                                   uint32_t time) {
+    auto& b = self(data);
+    if (!hold)
+        return;
+    // One hold at a time: a stale one (never the case with this compositor) goes first.
+    if (b.hold_)
+        zlm_held_action_v1_destroy(static_cast<zlm_held_action_v1*>(b.hold_));
+    b.hold_ = hold;
+    zlm_held_action_v1_add_listener(hold, &k_hold_listener, &b);
+    if (bridge_debug())
+        bridge_log(lx::trace::level::debug, "held action {} serial={}", name ? name : "", serial);
+    if (!b.hold_handlers_.begin) {
+        b.end_hold();
+        return;
+    }
+    b.hold_handlers_.begin(name ? name : "", argument ? argument : "", serial, time,
+                           b.hold_handlers_.user);
+}
+
+void lx::shell::policy_bridge::end_hold() {
+    if (!hold_)
+        return;
+    zlm_held_action_v1_destroy(static_cast<zlm_held_action_v1*>(hold_));
+    hold_ = nullptr;
+}
 
 lx::result<void> lx::shell::policy_bridge::observe(void* zlm_shell) {
     if (!zlm_shell)
@@ -545,6 +743,7 @@ lx::result<void> lx::shell::policy_bridge::attach(void* zlm_shell) {
 
 void lx::shell::policy_bridge::detach() {
     destroy_key_grabs();
+    end_hold();
     if (!bridge_)
         return;
     task_handle all[k_max_tasks];
@@ -599,6 +798,11 @@ bool lx::shell::policy_bridge::has_lock_state() const {
 bool lx::shell::policy_bridge::has_v6() const {
     return shell_ && wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) >=
                          ZLM_SHELL_V1_CAPTURE_STATE_SINCE_VERSION;
+}
+
+bool lx::shell::policy_bridge::has_v7() const {
+    return shell_ && wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) >=
+                         ZLM_SHELL_V1_ACTION_SINCE_VERSION;
 }
 
 bool lx::shell::policy_bridge::can_grab_keys() const {
@@ -664,6 +868,7 @@ lx::shell::policy_bridge::~policy_bridge() { detach(); }
 
 struct lx::shell::policy_bridge::events {};
 bool lx::shell::policy_bridge::has_v6() const { return false; }
+bool lx::shell::policy_bridge::has_v7() const { return false; }
 
 lx::result<void> lx::shell::policy_bridge::observe(void*) {
     return lx::not_implemented("lx::shell::policy_bridge::observe");
@@ -680,6 +885,7 @@ void lx::shell::policy_bridge::request_close(task_handle) {}
 void lx::shell::policy_bridge::request_maximize(task_handle) {}
 void lx::shell::policy_bridge::request_unmaximize(task_handle) {}
 void lx::shell::policy_bridge::request_minimize(task_handle) {}
+void lx::shell::policy_bridge::end_hold() {}
 bool lx::shell::policy_bridge::can_logout() const { return false; }
 void lx::shell::policy_bridge::request_logout() {}
 bool lx::shell::policy_bridge::can_grab_keys() const { return false; }

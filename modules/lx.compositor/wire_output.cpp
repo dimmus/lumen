@@ -453,6 +453,8 @@ void bind_output_ex(wayland::client_connection& client, unsigned id, int version
     const auto& st = om->slot_state(o->slot);
     send_output_state(native, st, true);
     send_output_done(native);
+    // ext-workspace: this output's workspace group names the new object too.
+    workspace_output_bound(o->client, native, o->slot);
 
     // Clients often bind outputs after mapping: the surfaces already on this output get the
     // enter they missed (wlroots does the same on bind).

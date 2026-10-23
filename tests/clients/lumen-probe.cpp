@@ -2656,7 +2656,15 @@ int usage() {
                  "         [--save FILE.ppm] [--timeout S] [--buffers K]\n"
                  "       lumen-probe cursor-capture --output NAME [--frames N] [--timeout S]\n"
                  "       lumen-probe animate [--size WxH] [--box N] [--interval MS]\n"
-                 "         [--colour R,G,B] [--exit-after S]\n");
+                 "         [--colour R,G,B] [--exit-after S]\n"
+                 "       lumen-probe keyboard [--size WxH] [--title T] [--exit-after S]\n"
+                 "       lumen-probe workspaces [--activate NAME] [--assign NAME] [--output OUT] "
+                 "[--watch S]\n"
+                 "       lumen-probe window [--title T] [--app-id A] [--size WxH] "
+                 "[--minimize-after MS] [--min-size WxH] [--keyboard] [--exit-after S]\n"
+                 "       lumen-probe sni [--id ID] [--title T] [--icon-name NAME | --pixmap] "
+                 "[--status S] [--tooltip T] [--no-menu] [--item-is-menu] [--register-path] "
+                 "[--change-after MS] [--exit-after S]\n");
     return 2;
 }
 
@@ -2667,6 +2675,9 @@ int compat_main(int argc, char** argv);
 int window_main(int argc, char** argv);
 int pointer_main(int argc, char** argv);
 int capture_main(int argc, char** argv);
+int input_main(int argc, char** argv);
+int workspace_main(int argc, char** argv);
+int sni_main(int argc, char** argv);
 
 int main(int argc, char** argv) {
     setvbuf(stdout, nullptr, _IOLBF, 0);
@@ -2695,6 +2706,18 @@ int main(int argc, char** argv) {
                       std::strcmp(argv[1], "cursor-capture") == 0 ||
                       std::strcmp(argv[1], "animate") == 0))
         return capture_main(argc, argv);
+    // The seat's keyboard and pointer as a client sees them (keymap, repeat, keys,
+    // relative motion, scrolling): lumen-probe-input.cpp.
+    if (argc >= 2 && std::strcmp(argv[1], "keyboard") == 0)
+        return input_main(argc, argv);
+    // ext-workspace-v1 and a plain window that reports its configures (suspended, minimize):
+    // lumen-probe-workspace.cpp.
+    if (argc >= 2 && (std::strcmp(argv[1], "workspaces") == 0 || std::strcmp(argv[1], "window") == 0))
+        return workspace_main(argc, argv);
+    // A StatusNotifierItem with a dbusmenu menu on the user bus (no Wayland connection):
+    // lumen-probe-sni.cpp.
+    if (argc >= 2 && std::strcmp(argv[1], "sni") == 0)
+        return sni_main(argc, argv);
     // wlr-output-management has its own connection and no surfaces
     // (lumen-probe-output-mgmt.cpp).
     if (argc >= 2 && std::strcmp(argv[1], "output-mgmt") == 0)

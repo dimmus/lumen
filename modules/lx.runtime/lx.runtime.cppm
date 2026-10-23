@@ -140,6 +140,9 @@ private:
     // Atomic so quit() stays safe from a signal handler or another thread.
     std::atomic<int> exit_code_{0};
     std::atomic<bool> running_{false};
+    // A quit() that no run() has consumed yet: one that lands before run() starts (a
+    // signal during start-up) must still stop it, and run() would otherwise reset it.
+    std::atomic<bool> quit_pending_{false};
     int epoll_fd_ = -1;
     int wake_fd_ = -1;
     int timer_fd_ = -1;
@@ -277,6 +280,10 @@ void lx::runtime::event_loop::arm_timer(clock_time deadline_ns) {
 
 int lx::runtime::event_loop::run() {
     running_ = true;
+    // After setting running_: a quit() racing with this either sees running_ already set
+    // (and clears it) or leaves quit_pending_ for this exchange to find.
+    if (quit_pending_.exchange(false))
+        running_ = false;
 #if !defined(_WIN32)
     if (epoll_fd_ >= 0 && wake_fd_ >= 0 && timer_fd_ >= 0) {
         // Blocks until a source has work: an fd is readable, a timer is due, or another
@@ -329,6 +336,7 @@ int lx::runtime::event_loop::run() {
             if (after_)
                 after_();
         }
+        quit_pending_ = false; // consumed by this run
         return exit_code_;
     }
 #endif
@@ -356,11 +364,13 @@ int lx::runtime::event_loop::run() {
         if (min_sleep_ns > 0)
             std::this_thread::sleep_for(std::chrono::nanoseconds(min_sleep_ns));
     }
+    quit_pending_ = false;
     return exit_code_;
 }
 
 void lx::runtime::event_loop::quit(int code) {
     exit_code_ = code;
+    quit_pending_ = true;
     running_ = false;
     wake(); // a blocked epoll_wait would otherwise not notice
 }

@@ -29,6 +29,7 @@ export module lx.session;
 import std;
 
 export import :privilege;
+export import :user_session;
 
 export namespace lx::session {
 
@@ -61,6 +62,75 @@ struct session_listener {
     void* user = nullptr;
 };
 
+// ── Finding the session (design-session-and-wm S.5) ─────────────────────────
+//
+// Run from a tty login (or run-desktop.sh) the compositor is inside its session's scope, and
+// sd_pid_get_session finds it. Run as a systemd user unit it is not: user@.service belongs
+// to no seat session. GNOME Shell, KWin and libseat find it the same way, in this order:
+//   1. $XDG_SESSION_ID (lumen-session imports the login's into the user manager),
+//   2. the session of this process (today's path, inside the scope),
+//   3. logind's "display" session of the user (sd_uid_get_display),
+//   4. the user's one active session on a seat.
+// A candidate counts only when it belongs to this UID, sits on a seat and has class
+// "user" (not "greeter", nor the "manager" session of user@.service). Steps 3 and 4 are
+// for a process in no session at all (a user unit): one that belongs to a session without
+// a seat — an SSH login, a test run from one — gets no session, exactly as before, and
+// never takes over the console session it does not belong to.
+
+/// What logind knows about one session, as `session_discovery` needs it.
+struct session_facts {
+    bool exists = false;
+    unsigned uid = 0;
+    bool has_seat = false;
+    /// Class "user" (or "user-early"/"user-incomplete": a login still being set up).
+    bool user_class = false;
+    /// Class "manager": the session user@.service runs in (it counts as no session).
+    bool manager_class = false;
+    bool active = false;
+};
+
+/// Where `discover_session` found the session.
+enum class session_found_by : unsigned char { none, environment, process, display, active_seat };
+
+[[nodiscard]] constexpr const char* session_found_by_name(session_found_by b) {
+    switch (b) {
+    case session_found_by::none: return "none";
+    case session_found_by::environment: return "XDG_SESSION_ID";
+    case session_found_by::process: return "process";
+    case session_found_by::display: return "display";
+    case session_found_by::active_seat: return "active-seat";
+    }
+    return "?";
+}
+
+/// The lookups `discover_session` makes, injected so the order and the checks are testable
+/// without logind. Each getter writes a NUL-terminated id into `out` and returns false when
+/// there is none.
+struct session_discovery {
+    unsigned uid = 0;
+    /// $XDG_SESSION_ID (null or empty: unset).
+    const char* env_session_id = nullptr;
+    bool (*pid_session)(void* user, char* out, std::size_t size) = nullptr;
+    bool (*uid_display)(void* user, unsigned uid, char* out, std::size_t size) = nullptr;
+    /// The user's sessions, `out[i]` each `id_size` bytes; returns how many were written.
+    unsigned (*uid_sessions)(void* user, unsigned uid, char (*out)[64], unsigned cap) = nullptr;
+    session_facts (*facts)(void* user, const char* id) = nullptr;
+    void* user = nullptr;
+};
+
+struct session_choice {
+    char id[64]{};
+    session_found_by found_by = session_found_by::none;
+    [[nodiscard]] bool found() const { return found_by != session_found_by::none; }
+};
+
+/// The session the compositor should take control of, by the order above. Pure.
+[[nodiscard]] session_choice discover_session(const session_discovery& d);
+
+/// The real lookups (sd-login), for `discover_session`. Without libsystemd every getter
+/// reports nothing.
+[[nodiscard]] session_discovery system_session_discovery();
+
 /// The logind session this process runs in: session control (TakeControl), devices
 /// (TakeDevice / ReleaseDevice / PauseDeviceComplete), the pause and resume signals, and
 /// VT switching (Seat.SwitchTo). Owned by one thread.
@@ -84,6 +154,16 @@ public:
     /// Session.Active as last seen: read at `open`, then tracked from PropertiesChanged.
     [[nodiscard]] bool is_active() const;
     [[nodiscard]] const char* session_id() const;
+    /// How `open` found the session (`session_found_by::none`: no session).
+    [[nodiscard]] session_found_by found_by() const { return found_by_; }
+    /// Session.Type as it was at `open` ("tty", "wayland", …; empty without a session).
+    [[nodiscard]] const char* session_type() const { return type_; }
+
+    /// Session.SetType(type), asynchronously, without waiting for the reply: what a display
+    /// server started on a text login does so that `loginctl` and other components see a
+    /// graphical session (only the controller may; logind restores the old type when control
+    /// is released). A failure (an older logind without the method) is not reported.
+    void set_type(const char* type);
     /// TakeControl succeeded: devices come from TakeDevice.
     [[nodiscard]] bool has_control() const { return has_control_; }
     /// Seat.CanTTY: the seat has virtual terminals (seat0 on a machine with a console).
@@ -159,6 +239,8 @@ private:
     bool has_control_ = false;
     bool can_tty_ = false;
     unsigned vt_nr_ = 0;
+    session_found_by found_by_ = session_found_by::none;
+    char type_[16]{};
     taken_device taken_[k_max_taken]{};
     session_listener listener_{};
     /// The sleep delay inhibitor's fd (-1: none held).
@@ -209,6 +291,8 @@ lx::session::logind_session& lx::session::logind_session::operator=(logind_sessi
     has_control_ = other.has_control_;
     can_tty_ = other.can_tty_;
     vt_nr_ = other.vt_nr_;
+    found_by_ = other.found_by_;
+    std::memcpy(type_, other.type_, sizeof(type_));
     std::memcpy(taken_, other.taken_, sizeof(taken_));
     listener_ = other.listener_;
     sleep_fd_ = other.sleep_fd_;
@@ -242,6 +326,8 @@ lx::session::logind_session& lx::session::logind_session::operator=(logind_sessi
     other.has_control_ = false;
     other.can_tty_ = false;
     other.vt_nr_ = 0;
+    other.found_by_ = session_found_by::none;
+    other.type_[0] = '\0';
     std::memset(other.taken_, 0, sizeof(other.taken_));
     other.listener_ = {};
     return *this;
@@ -272,6 +358,8 @@ void lx::session::logind_session::release() {
     active_ = false;
     can_tty_ = false;
     vt_nr_ = 0;
+    found_by_ = session_found_by::none;
+    type_[0] = '\0';
     std::memset(taken_, 0, sizeof(taken_));
     listener_ = {};
     session_id_buf_[0] = '\0';
@@ -283,19 +371,139 @@ void lx::session::logind_session::release() {
     sleep_fd_ = -1;
 }
 
+lx::session::session_choice lx::session::discover_session(const session_discovery& d) {
+    session_choice c{};
+    const auto acceptable = [&d](const char* id) {
+        if (!id || !*id || !d.facts)
+            return false;
+        const session_facts f = d.facts(d.user, id);
+        return f.exists && f.uid == d.uid && f.has_seat && f.user_class;
+    };
+    const auto take = [&c](const char* id, session_found_by by) {
+        std::snprintf(c.id, sizeof(c.id), "%s", id);
+        c.found_by = by;
+        return c;
+    };
+    if (d.env_session_id && *d.env_session_id && acceptable(d.env_session_id))
+        return take(d.env_session_id, session_found_by::environment);
+    char id[64]{};
+    if (d.pid_session && d.pid_session(d.user, id, sizeof(id))) {
+        if (acceptable(id))
+            return take(id, session_found_by::process);
+        // In a session that has no seat (SSH): that is where this process runs; another
+        // session's display is not its to take.
+        if (!d.facts || !d.facts(d.user, id).manager_class)
+            return c;
+    }
+    id[0] = '\0';
+    if (d.uid_display && d.uid_display(d.user, d.uid, id, sizeof(id)) && acceptable(id))
+        return take(id, session_found_by::display);
+    if (d.uid_sessions) {
+        // The one active session on a seat; two (a second seat) is ambiguous: none.
+        char ids[8][64]{};
+        const unsigned n = d.uid_sessions(d.user, d.uid, ids, 8);
+        const char* only = nullptr;
+        unsigned matches = 0;
+        for (unsigned i = 0; i < n && i < 8; ++i) {
+            if (!acceptable(ids[i]) || !d.facts(d.user, ids[i]).active)
+                continue;
+            only = ids[i];
+            ++matches;
+        }
+        if (matches == 1)
+            return take(only, session_found_by::active_seat);
+    }
+    return c;
+}
+
+lx::session::session_discovery lx::session::system_session_discovery() {
+    session_discovery d{};
+#if defined(LUMEN_HAS_LOGIND) && !defined(_WIN32)
+    d.uid = static_cast<unsigned>(::getuid());
+    d.env_session_id = std::getenv("XDG_SESSION_ID");
+    d.pid_session = [](void*, char* out, std::size_t size) {
+        char* sid = nullptr;
+        if (sd_pid_get_session(0, &sid) < 0 || !sid)
+            return false;
+        std::snprintf(out, size, "%s", sid);
+        free(sid);
+        return true;
+    };
+    d.uid_display = [](void*, unsigned uid, char* out, std::size_t size) {
+        char* sid = nullptr;
+        if (sd_uid_get_display(static_cast<uid_t>(uid), &sid) < 0 || !sid)
+            return false;
+        std::snprintf(out, size, "%s", sid);
+        free(sid);
+        return true;
+    };
+    d.uid_sessions = [](void*, unsigned uid, char (*out)[64], unsigned cap) {
+        char** list = nullptr;
+        const int n = sd_uid_get_sessions(static_cast<uid_t>(uid), 0, &list);
+        unsigned written = 0;
+        for (int i = 0; i < n && list && list[i]; ++i) {
+            if (written < cap)
+                std::snprintf(out[written++], 64, "%s", list[i]);
+            free(list[i]);
+        }
+        free(list);
+        return written;
+    };
+    d.facts = [](void*, const char* id) {
+        session_facts f{};
+        uid_t uid = 0;
+        if (sd_session_get_uid(id, &uid) < 0)
+            return f;
+        f.exists = true;
+        f.uid = static_cast<unsigned>(uid);
+        char* seat = nullptr;
+        f.has_seat = sd_session_get_seat(id, &seat) >= 0 && seat && *seat;
+        free(seat);
+        char* cls = nullptr;
+        if (sd_session_get_class(id, &cls) >= 0 && cls) {
+            f.user_class = std::strncmp(cls, "user", 4) == 0;
+            f.manager_class = std::strncmp(cls, "manager", 7) == 0;
+        }
+        free(cls);
+        f.active = sd_session_is_active(id) > 0;
+        return f;
+    };
+#endif
+    return d;
+}
+
+void lx::session::logind_session::set_type(const char* type) {
+#if defined(LUMEN_HAS_LOGIND)
+    if (!bus_ || !has_control_ || session_path_[0] == '\0' || !type)
+        return;
+    (void)sd_bus_call_method_async(bus_, nullptr, "org.freedesktop.login1", session_path_,
+                                   "org.freedesktop.login1.Session", "SetType", nullptr, nullptr,
+                                   "s", type);
+    (void)sd_bus_flush(bus_);
+#else
+    (void)type;
+#endif
+}
+
 lx::result<lx::session::logind_session> lx::session::logind_session::open() {
 #if defined(LUMEN_HAS_LOGIND)
     logind_session s{};
-    char* sid = nullptr;
-    if (sd_pid_get_session(0, &sid) < 0 || !sid) {
+    const session_choice choice = discover_session(system_session_discovery());
+    if (!choice.found()) {
         // Not in a logind session (e.g. some CI) — return a soft inactive session.
         s.active_ = false;
         s.session_id_ = "";
         return s;
     }
-    std::snprintf(s.session_id_buf_, sizeof(s.session_id_buf_), "%s", sid);
+    std::snprintf(s.session_id_buf_, sizeof(s.session_id_buf_), "%s", choice.id);
     s.session_id_ = s.session_id_buf_;
-    free(sid);
+    s.found_by_ = choice.found_by;
+    {
+        char* type = nullptr;
+        if (sd_session_get_type(s.session_id_, &type) >= 0 && type)
+            std::snprintf(s.type_, sizeof(s.type_), "%s", type);
+        free(type);
+    }
 
     if (sd_bus_default_system(&s.bus_) < 0 || !s.bus_) {
         return lx::make_error(lx::io_err::not_found, "sd_bus_default_system failed");

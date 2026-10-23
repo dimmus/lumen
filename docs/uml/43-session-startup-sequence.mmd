@@ -1,0 +1,32 @@
+sequenceDiagram
+    participant L as lumen-session
+    participant M as systemd --user
+    participant C as lumen-compositor
+    participant G as logind
+    participant S as lumen-shell
+    participant A as app-*@autostart
+    L->>L: re-exec via $SHELL -l; guards (nested, a running session, inactive VT)
+    L->>M: reset-failed; stop stale portals
+    L->>M: import-environment (login env minus denylist; previous values recorded)
+    L->>M: start --wait lumen-compositor.service
+    M->>C: exec (session.slice), NOTIFY_SOCKET, WATCHDOG_USEC
+    C->>G: XDG_SESSION_ID → GetSession, TakeControl, SetType("wayland")
+    C->>C: DRM, outputs, input, globals, Wayland socket, control socket (<display>.varlink)
+    C-)M: SetEnvironment(WAYLAND_DISPLAY, XDG_CURRENT_DESKTOP, XDG_SESSION_TYPE, ..., LUMEN_SOCKET)
+    C-)M: UpdateActivationEnvironment(...)
+    M--)C: replies (2 s bound)
+    C->>M: READY=1, STATUS=Serving lumen-0 (1 output)
+    M->>M: graphical-session.target active
+    par shell
+        M->>S: start lumen-shell.service
+        S->>C: bind zlm_shell_v1, get_policy_bridge
+        C->>S: snapshot ... snapshot_done, focus_changed
+    and autostart
+        M->>A: xdg-desktop-autostart.target, ExecCondition "Lumen"
+    end
+    Note over C: placement hold: windows mapped before the panel are fitted once it reserved its zone
+    Note over S,M: shell crash: Restart=on-failure (300 ms); zone hold until the new panel maps
+    Note over C: logout: STOPPING=1, close windows, unset environment, ReleaseControl
+    C-->>M: exit 0 → BindsTo stops graphical-session.target (PartOf units stop)
+    M-->>L: --wait returns
+    L->>M: start lumen-shutdown.target (replace-irreversibly); restore environment

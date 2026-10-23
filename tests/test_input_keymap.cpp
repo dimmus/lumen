@@ -387,6 +387,53 @@ LUMEN_TEST(reset_depressed_keeps_locks) {
     LUMEN_CHECK(km.level1_keysym(k_key_a, km.active_layout()) == 'a');
 }
 
+// A configuration reload compiles a new keymap: it takes the old one's locks (by name — the
+// masks are keymap-specific) and the locked layout clamped to its own layouts, and the keys
+// still held press again.
+LUMEN_TEST(new_keymap_adopts_locks_layout_and_held_keys) {
+    lx::input::keyboard_keymap old_km;
+    LUMEN_CHECK(old_km.compile({.layout = "us,ru"}).ok());
+    LUMEN_CHECK(old_km.layout_count() == 2);
+    LUMEN_CHECK(old_km.set_num_lock(true));
+    LUMEN_CHECK(old_km.cycle_layout(1)); // to ru
+    LUMEN_CHECK(old_km.active_layout() == 1);
+    (void)old_km.update_key(58, true); // Caps Lock
+    (void)old_km.update_key(58, false);
+    LUMEN_CHECK(old_km.named().caps_lock && old_km.named().num_lock);
+    (void)old_km.update_key(42, true); // Shift held across the reload
+
+    // Same layouts: the group stays.
+    lx::input::keyboard_keymap two;
+    LUMEN_CHECK(two.compile({.layout = "us,de"}).ok());
+    const unsigned held[] = {42};
+    two.adopt_state(old_km, held, 1);
+    LUMEN_CHECK(two.active_layout() == 1);
+    LUMEN_CHECK(two.named().caps_lock && two.named().num_lock && two.named().shift);
+    // One layout now: the group is clamped to 0.
+    lx::input::keyboard_keymap one;
+    LUMEN_CHECK(one.compile({.layout = "fr"}).ok());
+    one.adopt_state(old_km, nullptr, 0);
+    LUMEN_CHECK(one.active_layout() == 0 && one.named().num_lock && !one.named().shift);
+}
+
+LUMEN_TEST(cycle_layout_wraps_both_ways) {
+    lx::input::keyboard_keymap km;
+    LUMEN_CHECK(km.compile({.layout = "us,ru,de"}).ok());
+    LUMEN_CHECK(km.cycle_layout(-1) && km.active_layout() == 2);
+    LUMEN_CHECK(km.cycle_layout(1) && km.active_layout() == 0);
+    lx::input::keyboard_keymap single;
+    LUMEN_CHECK(single.compile({.layout = "us"}).ok());
+    LUMEN_CHECK(!single.cycle_layout(1));
+}
+
+LUMEN_TEST(compile_reports_xkbcommons_reason) {
+    lx::input::keyboard_keymap km;
+    char why[192] = "unchanged";
+    LUMEN_CHECK(!km.compile({.layout = "xx-no-such-layout"}, why, sizeof(why)));
+    LUMEN_CHECK(std::strstr(why, "xx-no-such-layout") != nullptr);
+    LUMEN_CHECK(km.compile({.layout = "us"}, why, sizeof(why)).ok() && why[0] == '\0');
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

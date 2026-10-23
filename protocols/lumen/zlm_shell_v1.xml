@@ -16,7 +16,7 @@
 
   <!-- ── Compositor-owned toplevel handle ─────────────────────────── -->
 
-  <interface name="zlm_toplevel_v1" version="6">
+  <interface name="zlm_toplevel_v1" version="7">
     <description summary="compositor-owned handle for a mapped xdg toplevel">
       Shell uses this object for all window management. The compositor maps
       zlm_toplevel_v1 to internal xdg_toplevel state. Never expose client-side
@@ -30,7 +30,7 @@
 
   <!-- ── Shell root ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_shell_v1" version="6">
+  <interface name="zlm_shell_v1" version="7">
     <description summary="Lumen desktop shell root interface"/>
 
     <enum name="capability">
@@ -43,6 +43,10 @@
     <request name="destroy" type="destructor"/>
 
     <request name="get_workspace_manager">
+      <description summary="deprecated, never implemented">
+        Deprecated since version 7 (see zlm_workspace_manager_v1): the object is created and
+        stays inert. Use ext-workspace-v1.
+      </description>
       <arg name="id" type="new_id" interface="zlm_workspace_manager_v1"/>
     </request>
 
@@ -162,9 +166,153 @@
       </description>
       <arg name="active" type="uint"/>
     </event>
+
+    <!-- Version 7 -->
+
+    <event name="config" since="7">
+      <description summary="the session's configuration">
+        The configuration in use (the user's config.toml over the system's, as the
+        compositor read, watches and validated it): fd is a sealed, read-only memfd of
+        size bytes, the layers concatenated, each preceded by a line
+        "# lumen-layer: PATH" so line numbers map back to the files; size 0 means no file
+        (every default). The shell parses the same bytes with the same rules and applies
+        the sections it owns (idle, background, switcher, notifications); its command-line
+        options override them. generation increases with every reload that read the files.
+
+        Sent on bind and whenever a reload accepted different bytes. A reload the
+        compositor rejected (a syntax error) sends no config: the previous one stays in use,
+        and config_diagnostic and config_done say why.
+      </description>
+      <arg name="fd" type="fd"/>
+      <arg name="size" type="uint"/>
+      <arg name="generation" type="uint"/>
+    </event>
+
+    <enum name="config_severity" since="7">
+      <entry name="error" value="0" summary="a key (or the whole file) was not used"/>
+      <entry name="warning" value="1" summary="something was ignored"/>
+    </enum>
+
+    <event name="config_diagnostic" since="7">
+      <description summary="a problem the compositor found in the configuration">
+        One problem of generation: in file (empty when it concerns no file, e.g. a keymap
+        that does not compile), at line (0: the file as a whole), text a one-line message
+        naming the key ("input.touchpad.tapp: unknown key (did you mean tap?)"). Followed
+        by config_done.
+      </description>
+      <arg name="generation" type="uint"/>
+      <arg name="severity" type="uint" enum="config_severity"/>
+      <arg name="file" type="string"/>
+      <arg name="line" type="uint"/>
+      <arg name="text" type="string"/>
+    </event>
+
+    <event name="config_done" since="7">
+      <description summary="the end of a generation's report">
+        Every config_diagnostic of generation was sent; errors and warnings count them
+        (also those past the ones sent). applied is 1 when generation is in use, 0 when it
+        was rejected and the previous configuration stays. Sent on bind (for the
+        generation in use) and after every reload. A shell tells the user once per
+        generation that has errors or warnings, and not again for an unchanged report.
+      </description>
+      <arg name="generation" type="uint"/>
+      <arg name="applied" type="uint"/>
+      <arg name="errors" type="uint"/>
+      <arg name="warnings" type="uint"/>
+    </event>
+
+    <event name="action" since="7">
+      <description summary="run a shell action">
+        A key binding (config.toml [bindings]) or lumen-ctl named an action the shell
+        executes: action is its name ("shell.launcher", "shell.terminal", "shell.lock"),
+        argument its argument or empty. The compositor matched the keys, so the shell need
+        not grab any. serial is an input serial delivered to this client (a key press: it
+        may be used with xdg_activation_token_v1.set_serial), 0 when no input event
+        triggered it (lumen-ctl); time is the event's timestamp in milliseconds, or 0.
+      </description>
+      <arg name="action" type="string"/>
+      <arg name="argument" type="string"/>
+      <arg name="serial" type="uint"/>
+      <arg name="time" type="uint"/>
+    </event>
+
+    <event name="held_action" since="7">
+      <description summary="a held shell action begins">
+        A binding of a held action was pressed (the switcher.* actions, which are bound
+        with at least one modifier: Alt+Tab). action, argument, serial and time are as in
+        action; id is the hold.
+
+        While the binding's primary modifier stays down, the compositor sends every key
+        press to id (zlm_held_action_v1.key) instead of the focused client. The primary
+        modifier is the binding's highest of Super, Alt, Ctrl and Shift, in that order:
+        Alt for Alt+Shift+Tab, which ends when Alt is let go whether or not Shift is still
+        held. The modifier keys' own events and the releases of keys pressed before go on
+        to the focused client as usual, so it keeps the keyboard focus and a correct
+        modifier state: keyboard focus never changes during a hold. When the primary
+        modifier is up, released ends the hold. The shell may end it earlier by destroying id, and the compositor
+        cancels it (cancelled) when the session locks, at a VT switch, when an
+        interactive move or resize or a drag begins, and when a button is pressed on a
+        window; the hold also ends when the shell goes. A second
+        held binding pressed during a hold is a key of the first.
+      </description>
+      <arg name="id" type="new_id" interface="zlm_held_action_v1"/>
+      <arg name="action" type="string"/>
+      <arg name="argument" type="string"/>
+      <arg name="serial" type="uint"/>
+      <arg name="time" type="uint"/>
+    </event>
   </interface>
 
-  <interface name="zlm_key_grab_v1" version="6">
+  <interface name="zlm_held_action_v1" version="7">
+    <description summary="the keyboard while a held binding's primary modifier is down">
+      Created by zlm_shell_v1.held_action. After released or cancelled the object is inert:
+      the shell destroys it.
+    </description>
+
+    <request name="destroy" type="destructor">
+      <description summary="end the hold">
+        Key presses go to the focused client again at once (the shell's switcher was
+        dismissed with Escape, or committed with Return or a click).
+      </description>
+    </request>
+
+    <event name="key">
+      <description summary="a key was pressed during the hold">
+        keysym is the key's keysym at its first shift level in the active layout, as key
+        bindings match keys (Tab, not ISO_Left_Tab, with shift among the modifiers);
+        modifiers are the zlm_key_grab_v1.modifier bits held with it. binding names the
+        action of the configured binding that this key with these modifiers would run
+        ("switcher.previous" for Alt+Shift+Tab under the default bindings), or is empty:
+        a shell follows the user's bindings inside the hold too. Presses only, repeated
+        while the key is held at the keyboard's repeat rate; their releases reach nobody.
+        serial is an input serial delivered to this client, time the key's timestamp in
+        milliseconds.
+      </description>
+      <arg name="keysym" type="uint"/>
+      <arg name="modifiers" type="uint"/>
+      <arg name="binding" type="string"/>
+      <arg name="serial" type="uint"/>
+      <arg name="time" type="uint"/>
+    </event>
+
+    <event name="released">
+      <description summary="the binding's primary modifier is up">
+        The hold ended as the user let go: a switcher commits its selection. serial is an
+        input serial delivered to this client, time the release's timestamp.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="time" type="uint"/>
+    </event>
+
+    <event name="cancelled">
+      <description summary="the hold ended without the user letting go">
+        The session locked, a VT switch, an interactive grab, or another reason the
+        compositor took the keyboard back: a switcher closes without activating anything.
+      </description>
+    </event>
+  </interface>
+
+  <interface name="zlm_key_grab_v1" version="7">
     <description summary="a key combination held by the shell">
       Created by zlm_shell_v1.grab_key. Destroying it gives the combination back to clients.
     </description>
@@ -207,8 +355,12 @@
 
   <!-- ── Workspaces ───────────────────────────────────────────────── -->
 
-  <interface name="zlm_workspace_manager_v1" version="6">
-    <description summary="virtual desktop manager"/>
+  <interface name="zlm_workspace_manager_v1" version="7">
+    <description summary="virtual desktop manager (deprecated, never implemented)">
+      Deprecated since version 7 and never implemented: requests are ignored and no event
+      is sent. Workspaces are served as ext-workspace-v1 (ext_workspace_manager_v1), and a
+      window's workspace is zlm_policy_bridge_v1.toplevel_workspace.
+    </description>
 
     <enum name="error">
       <entry name="workspace_not_empty" value="1"/>
@@ -252,8 +404,11 @@
     </event>
   </interface>
 
-  <interface name="zlm_workspace_v1" version="6">
-    <description summary="a single workspace"/>
+  <interface name="zlm_workspace_v1" version="7">
+    <description summary="a single workspace (deprecated, never implemented)">
+      Deprecated since version 7 and never implemented (see zlm_workspace_manager_v1):
+      ext_workspace_handle_v1 replaces it.
+    </description>
 
     <request name="destroy" type="destructor"/>
 
@@ -276,7 +431,7 @@
 
   <!-- ── Policy bridge: shell intent → compositor execution ──────── -->
 
-  <interface name="zlm_policy_bridge_v1" version="6">
+  <interface name="zlm_policy_bridge_v1" version="7">
     <description summary="window management policy bridge">
       Shell sends placement intent; compositor executes geometry, focus, and
       stacking. Stacking is default; tiling is an optional shell plugin.
@@ -368,6 +523,10 @@
     </event>
 
     <event name="snapshot_workspace">
+      <description summary="deprecated, never sent">
+        Deprecated since version 7 and never sent: workspaces are ext-workspace-v1's, a
+        window's workspace is toplevel_workspace.
+      </description>
       <arg name="workspace" type="object" interface="zlm_workspace_v1"/>
       <arg name="index" type="uint"/>
       <arg name="name" type="string"/>
@@ -377,8 +536,8 @@
     <event name="snapshot_toplevel">
       <description summary="one mapped toplevel, introducing its handle">
         Introduces the compositor-created handle for an already-mapped toplevel, so it is
-        a new_id: the shell has never seen this object before. workspace is null while
-        the compositor has no workspace objects.
+        a new_id: the shell has never seen this object before. workspace is always null
+        (zlm_workspace_v1 is deprecated); from version 7 toplevel_workspace follows.
       </description>
       <arg name="toplevel" type="new_id" interface="zlm_toplevel_v1"/>
       <arg name="workspace" type="object" interface="zlm_workspace_v1" allow-null="true"/>
@@ -409,8 +568,8 @@
     <event name="toplevel_created">
       <description summary="a toplevel was mapped">
         Followed by toplevel_state and toplevel_geometry for the same handle. workspace
-        is null while the compositor has no workspace objects (a workspace object cannot
-        be introduced by the compositor in this version).
+        is always null (zlm_workspace_v1 is deprecated); from version 7
+        toplevel_workspace follows.
       </description>
       <arg name="toplevel" type="new_id" interface="zlm_toplevel_v1"/>
       <arg name="workspace" type="object" interface="zlm_workspace_v1" allow-null="true"/>
@@ -457,6 +616,8 @@
     <enum name="toplevel_flag" bitfield="true" since="2">
       <entry name="not_responding" value="0x1" summary="the client did not answer a ping in time"/>
       <entry name="demands_attention" value="0x2" summary="an activation request was not granted focus"/>
+      <entry name="sticky" value="0x4" since="7"
+             summary="shown on every workspace of its output (toplevel_workspace is null)"/>
     </enum>
 
     <event name="toplevel_flags" since="2">
@@ -520,11 +681,33 @@
       </description>
       <arg name="toplevel" type="object" interface="zlm_toplevel_v1" allow-null="true"/>
     </event>
+
+    <!-- Version 7 -->
+
+    <event name="toplevel_workspace" since="7">
+      <description summary="the workspace a toplevel belongs to">
+        The workspace this window belongs to, as the shell's own ext_workspace_handle_v1
+        (ext-workspace-v1, on an ext_workspace_manager_v1 the shell bound); null for a
+        sticky window (toplevel_flag sticky: shown on every workspace of its output) and
+        while the shell has no handle for that workspace. Sent after snapshot_toplevel and
+        toplevel_created, after every change of workspace (always after the
+        ext_workspace_manager_v1 done that introduced a new workspace), and for every
+        toplevel again after the first done of an ext_workspace_manager_v1 bound after the
+        policy bridge. A window is shown when it is mapped, not minimized (toplevel_state
+        minimized) and sticky or on its output's active workspace.
+
+        Workspaces themselves (groups per output, names, the active one, activate and
+        assign) are ext-workspace-v1's: the compositor owns them, and the shell's
+        workspace indicator is a client of that protocol like any bar.
+      </description>
+      <arg name="toplevel" type="object" interface="zlm_toplevel_v1"/>
+      <arg name="workspace" type="object" interface="ext_workspace_handle_v1" allow-null="true"/>
+    </event>
   </interface>
 
   <!-- ── Window rules (typed, session config) ─────────────────────── -->
 
-  <interface name="zlm_window_rules_v1" version="6">
+  <interface name="zlm_window_rules_v1" version="7">
     <description summary="persistent window rules">
       Rules are stored in the session config directory
       ($XDG_CONFIG_HOME/lumen/window-rules.toml). Use reload_rules to apply.

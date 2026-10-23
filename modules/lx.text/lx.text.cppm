@@ -131,16 +131,105 @@ struct raster_color {
                                            raster_color color, raster_target target,
                                            lx::point2i baseline);
 
+// ── Wrapped paragraphs (a notification's body, a tooltip) ─────────────────────
+//
+// Greedy line breaking over styled spans: break opportunities after spaces, after a hyphen
+// or a slash, around CJK characters, and at '\n' (a hard break); a word wider than the line
+// is broken between clusters. Each piece (one word, or its part in one span) is shaped on
+// its own with the span's font; the widths add up per line. Lines beyond `max_lines` are
+// dropped and the last kept line ends in "…" (cut at a cluster boundary). Left-to-right line
+// order (a right-to-left run is shaped in its own visual order within its piece). Fixed
+// storage, no heap; one thread at a time per process, as the single-line calls.
+
+/// A styled stretch [begin, end) of the paragraph's UTF-8 bytes. Bytes no span covers use
+/// the base font.
+struct text_span {
+    std::uint32_t begin = 0;
+    std::uint32_t end = 0;
+    weight weight = weight::normal;
+    style style = style::normal;
+    bool underline = false;
+    /// The caller's tag (a colour, a link number), handed back when drawing.
+    std::uint16_t tag = 0;
+};
+
+inline constexpr unsigned k_max_wrap_lines = 24;
+inline constexpr unsigned k_max_wrap_pieces = 320;
+/// The longest piece shaped at once (bytes); longer words are broken.
+inline constexpr unsigned k_max_wrap_piece_bytes = 480;
+
+/// A part of one span on one line.
+struct wrap_piece {
+    std::uint32_t begin = 0;
+    std::uint32_t end = 0;
+    /// Index into the spans, or 0xFFFF: the base font.
+    std::uint16_t span = 0xFFFF;
+    /// "…" is drawn after this piece (the last piece of a cut paragraph).
+    bool ellipsis = false;
+    /// From the line's start; the width includes the ellipsis.
+    int x_px = 0;
+    int width_px = 0;
+};
+
+struct wrap_line {
+    unsigned first = 0;
+    unsigned count = 0;
+    /// Without trailing spaces.
+    int width_px = 0;
+};
+
+struct wrapped_text {
+    unsigned line_count = 0;
+    wrap_line lines[k_max_wrap_lines]{};
+    unsigned piece_count = 0;
+    wrap_piece pieces[k_max_wrap_pieces]{};
+    /// The base font's metrics; a line advances `line_height_px`.
+    int ascent_px = 0;
+    int descent_px = 0;
+    int line_height_px = 0;
+    /// The widest line.
+    int width_px = 0;
+    /// Not everything fitted (`max_lines`, or the piece storage): the last line ends in "…".
+    bool truncated = false;
+};
+
+/// Lays out `utf8` with `spans` over `base` in lines at most `max_width_px` wide, at most
+/// `max_lines` (≤ k_max_wrap_lines) of them. `not_implemented` without HarfBuzz/FreeType; an
+/// `io` error when no face resolves.
+[[nodiscard]] lx::result<void> wrap_text(std::string_view utf8, std::span<const text_span> spans,
+                                         font_desc base, int max_width_px, unsigned max_lines,
+                                         wrapped_text& out);
+/// Each span's colour (by its tag; `span` < 0: the base font's text).
+using span_color_fn = raster_color (*)(int span, std::uint16_t tag, void* user);
+/// Draws `w` into `target`: line i's baseline at origin.y + ascent + i × line height; its
+/// pieces at origin.x + their x. Underlined spans get a line under their ink.
+[[nodiscard]] lx::result<void> render_wrapped(std::string_view utf8,
+                                              std::span<const text_span> spans,
+                                              const wrapped_text& w, font_desc base,
+                                              span_color_fn color, void* user,
+                                              raster_target target, lx::point2i origin);
+/// The piece of `w` under (x, y) (relative to the origin `render_wrapped` was given), or -1.
+[[nodiscard]] int wrapped_piece_at(const wrapped_text& w, int x, int y);
+
 } // namespace lx::text
 
 
 #if defined(LUMEN_HAS_TEXT)
 namespace lx::text::detail {
 
-/// Owns FreeType + the resolved hb_font_t. Shaping without a face is never attempted:
-/// hb_shape() dereferences its font argument, so a null face must fall back to metrics.
+/// Owns FreeType and a few resolved faces (hb_font_t over FT_Face), least recently used
+/// first out. Shaping without a face is never attempted: hb_shape() dereferences its font
+/// argument, so a null face must fall back to metrics.
+///
+/// Several faces stay loaded because text mixes them: a bold title over a regular body, an
+/// italic span, the panel's letter tiles. With one face every switch was a fontconfig match
+/// plus FT_New_Face (milliseconds), and the glyph cache, keyed by face, lost its entries.
+/// Each entry has its own generation (never reused), so cached glyphs of one face stay valid
+/// while another is in use.
 class face_cache {
 public:
+    static constexpr unsigned k_faces = 8;
+
     static face_cache& instance() {
         static face_cache c{};
         return c;
@@ -150,7 +239,8 @@ public:
     /// fontconfig global config are released rather than reported as leaks.
     ~face_cache() {
         std::lock_guard lock{mutex_};
-        release_locked();
+        for (auto& e : faces_)
+            release_locked(e);
         if (library_) {
             FT_Done_FreeType(library_);
             library_ = nullptr;
@@ -168,12 +258,18 @@ public:
     }
 
     /// Callers that use the face beyond one call (shaping, glyph rendering) hold this for
-    /// the whole operation: FreeType faces are not thread-safe, and the single cached face
-    /// may otherwise be replaced underneath them.
+    /// the whole operation: FreeType faces are not thread-safe, and the face in use may
+    /// otherwise be evicted underneath them.
     [[nodiscard]] std::unique_lock<std::mutex> lock() { return std::unique_lock{mutex_}; }
-    [[nodiscard]] FT_Face face_locked() const { return ft_face_; }
-    /// Changes whenever a different face is loaded; glyph caches key on it.
-    [[nodiscard]] unsigned generation_locked() const { return generation_; }
+    /// The face the last `acquire_locked` returned.
+    [[nodiscard]] FT_Face face_locked() const {
+        return current_ < k_faces ? faces_[current_].ft : nullptr;
+    }
+    /// Identifies the face the last `acquire_locked` returned (unique per loaded face);
+    /// glyph caches key on it.
+    [[nodiscard]] unsigned generation_locked() const {
+        return current_ < k_faces ? faces_[current_].generation : 0u;
+    }
 
     hb_font_t* acquire_locked(const font_desc& desc) {
         if (!init_attempted_) {
@@ -183,6 +279,7 @@ public:
             if (!FcInit())
                 fontconfig_ready_ = false;
         }
+        current_ = k_faces;
         if (!library_ || !fontconfig_ready_)
             return nullptr;
 
@@ -190,43 +287,65 @@ public:
         const char* family = desc.family && desc.family[0] ? desc.family : "Sans";
         // By value, not by pointer: two equal family strings at different addresses are the
         // same face, and a caller's buffer may not outlive the cache entry.
-        if (hb_font_ && cached_px_ == px && std::strcmp(cached_family_, family) == 0 &&
-            cached_weight_ == desc.weight && cached_style_ == desc.style)
-            return hb_font_;
-
-        release_locked();
-
-        FcPattern* pattern = FcNameParse(reinterpret_cast<const FcChar8*>(
-            desc.family && desc.family[0] ? desc.family : "Sans"));
-        if (!pattern)
-            return nullptr;
-        FcPatternAddInteger(pattern, FC_WEIGHT,
-                            desc.weight == weight::bold ? FC_WEIGHT_BOLD : FC_WEIGHT_REGULAR);
-        FcPatternAddInteger(pattern, FC_SLANT,
-                            desc.style == style::italic ? FC_SLANT_ITALIC : FC_SLANT_ROMAN);
-        FcConfigSubstitute(nullptr, pattern, FcMatchPattern);
-        FcDefaultSubstitute(pattern);
-
-        FcResult match_result{};
-        FcPattern* matched = FcFontMatch(nullptr, pattern, &match_result);
-        FcPatternDestroy(pattern);
-        if (!matched || match_result != FcResultMatch) {
-            if (matched) FcPatternDestroy(matched);
-            return nullptr;
-        }
-
-        FcChar8* file = nullptr;
+        const char* file = nullptr;
         int face_index = 0;
-        if (FcPatternGetString(matched, FC_FILE, 0, &file) != FcResultMatch || !file) {
-            FcPatternDestroy(matched);
-            return nullptr;
+        unsigned victim = 0;
+        for (unsigned i = 0; i < k_faces; ++i) {
+            entry& e = faces_[i];
+            if (!e.hb) {
+                victim = i;
+                continue;
+            }
+            const bool same_face = std::strcmp(e.family, family) == 0 &&
+                                   e.weight == desc.weight && e.style == desc.style;
+            if (same_face && e.px == px) {
+                e.used = ++clock_;
+                current_ = i;
+                return e.hb;
+            }
+            // The same face at another size (a fractional scale): its file is known.
+            if (same_face && e.file[0]) {
+                file = e.file;
+                face_index = e.face_index;
+            }
+            if (faces_[victim].hb && e.used < faces_[victim].used)
+                victim = i;
         }
-        FcPatternGetInteger(matched, FC_INDEX, 0, &face_index);
+
+        char resolved[sizeof(entry::file)];
+        if (file) {
+            std::snprintf(resolved, sizeof(resolved), "%s", file);
+        } else {
+            FcPattern* pattern = FcNameParse(reinterpret_cast<const FcChar8*>(family));
+            if (!pattern)
+                return nullptr;
+            FcPatternAddInteger(pattern, FC_WEIGHT,
+                                desc.weight == weight::bold ? FC_WEIGHT_BOLD : FC_WEIGHT_REGULAR);
+            FcPatternAddInteger(pattern, FC_SLANT,
+                                desc.style == style::italic ? FC_SLANT_ITALIC : FC_SLANT_ROMAN);
+            FcConfigSubstitute(nullptr, pattern, FcMatchPattern);
+            FcDefaultSubstitute(pattern);
+
+            FcResult match_result{};
+            FcPattern* matched = FcFontMatch(nullptr, pattern, &match_result);
+            FcPatternDestroy(pattern);
+            if (!matched || match_result != FcResultMatch) {
+                if (matched) FcPatternDestroy(matched);
+                return nullptr;
+            }
+            FcChar8* match_file = nullptr;
+            if (FcPatternGetString(matched, FC_FILE, 0, &match_file) != FcResultMatch ||
+                !match_file) {
+                FcPatternDestroy(matched);
+                return nullptr;
+            }
+            FcPatternGetInteger(matched, FC_INDEX, 0, &face_index);
+            std::snprintf(resolved, sizeof(resolved), "%s", reinterpret_cast<const char*>(match_file));
+            FcPatternDestroy(matched);
+        }
 
         FT_Face face = nullptr;
-        const FT_Error err =
-            FT_New_Face(library_, reinterpret_cast<const char*>(file), face_index, &face);
-        FcPatternDestroy(matched);
+        const FT_Error err = FT_New_Face(library_, resolved, face_index, &face);
         if (err != 0 || !face)
             return nullptr;
 
@@ -237,40 +356,53 @@ public:
             return nullptr;
         }
 
-        ft_face_ = face;
-        hb_font_ = font;
-        cached_px_ = px;
-        std::strncpy(cached_family_, family, sizeof(cached_family_) - 1);
-        cached_family_[sizeof(cached_family_) - 1] = '\0';
-        ++generation_;
-        cached_weight_ = desc.weight;
-        cached_style_ = desc.style;
-        return hb_font_;
+        entry& e = faces_[victim];
+        release_locked(e);
+        e.ft = face;
+        e.hb = font;
+        e.px = px;
+        std::snprintf(e.family, sizeof(e.family), "%s", family);
+        std::snprintf(e.file, sizeof(e.file), "%s", resolved);
+        e.face_index = face_index;
+        e.weight = desc.weight;
+        e.style = desc.style;
+        e.generation = ++generation_;
+        e.used = ++clock_;
+        current_ = victim;
+        return e.hb;
     }
 
 private:
+    struct entry {
+        FT_Face ft = nullptr;
+        hb_font_t* hb = nullptr;
+        int px = 0;
+        char family[128]{};
+        /// The file fontconfig resolved (reused for the same face at another size).
+        char file[512]{};
+        int face_index = 0;
+        weight weight = weight::normal;
+        style style = style::normal;
+        unsigned generation = 0;
+        unsigned long long used = 0;
+    };
+
     face_cache() = default;
 
-    void release_locked() {
-        if (hb_font_) {
-            hb_font_destroy(hb_font_);
-            hb_font_ = nullptr;
-        }
-        if (ft_face_) {
-            FT_Done_Face(ft_face_);
-            ft_face_ = nullptr;
-        }
+    static void release_locked(entry& e) {
+        if (e.hb)
+            hb_font_destroy(e.hb);
+        if (e.ft)
+            FT_Done_Face(e.ft);
+        e = entry{};
     }
 
     std::mutex mutex_{};
     FT_Library library_ = nullptr;
-    FT_Face ft_face_ = nullptr;
-    hb_font_t* hb_font_ = nullptr;
-    int cached_px_ = 0;
-    char cached_family_[128]{};
+    entry faces_[k_faces]{};
+    unsigned current_ = k_faces;
     unsigned generation_ = 0;
-    weight cached_weight_ = weight::normal;
-    style cached_style_ = style::normal;
+    unsigned long long clock_ = 0;
     bool init_attempted_ = false;
     bool fontconfig_ready_ = true;
 };
@@ -702,4 +834,462 @@ lx::result<void> lx::text::render_line(const shaped_line& line, line_fit fit, ra
     (void)baseline;
     return lx::not_implemented("lx::text::render_line");
 #endif
+}
+
+// ── Wrapped paragraphs ────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr std::uint16_t k_base_span = 0xFFFF;
+
+/// The code point at `i` (advanced past it); U+FFFD for a malformed sequence.
+std::uint32_t next_code_point(std::string_view s, std::size_t& i) {
+    const auto b = static_cast<unsigned char>(s[i++]);
+    if (b < 0x80)
+        return b;
+    int extra = b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC0 ? 1 : 0;
+    std::uint32_t cp = extra == 3 ? b & 0x07u : extra == 2 ? b & 0x0Fu : b & 0x1Fu;
+    if (extra == 0)
+        return 0xFFFD;
+    while (extra-- > 0) {
+        if (i >= s.size() || (static_cast<unsigned char>(s[i]) & 0xC0u) != 0x80u)
+            return 0xFFFD;
+        cp = (cp << 6) | (static_cast<unsigned char>(s[i++]) & 0x3Fu);
+    }
+    return cp;
+}
+
+/// Ideographs, kana, Hangul and full-width forms: a line may break before and after each.
+bool breaks_around(std::uint32_t c) {
+    return (c >= 0x2E80 && c <= 0x9FFF) || (c >= 0xAC00 && c <= 0xD7AF) ||
+           (c >= 0xF900 && c <= 0xFAFF) || (c >= 0xFF00 && c <= 0xFFEF) ||
+           (c >= 0x20000 && c <= 0x2FFFF);
+}
+
+bool is_space(std::uint32_t c) { return c == ' ' || c == '\t'; }
+
+[[maybe_unused]] lx::text::font_desc span_font(lx::text::font_desc base,
+                                               std::span<const lx::text::text_span> spans,
+                                               std::uint16_t span) {
+    if (span < spans.size()) {
+        base.weight = spans[span].weight;
+        base.style = spans[span].style;
+    }
+    return base;
+}
+
+/// The span covering byte `at` and where its style ends (`limit` at most).
+[[maybe_unused]] std::uint16_t span_at(std::span<const lx::text::text_span> spans, std::uint32_t at,
+                                       std::uint32_t limit, std::uint32_t& run_end) {
+    std::uint32_t next = limit;
+    for (std::size_t i = 0; i < spans.size() && i < k_base_span; ++i) {
+        const auto& s = spans[i];
+        if (at >= s.begin && at < s.end) {
+            run_end = s.end < limit ? s.end : limit;
+            return static_cast<std::uint16_t>(i);
+        }
+        if (s.begin > at && s.begin < next)
+            next = s.begin;
+    }
+    run_end = next;
+    return k_base_span;
+}
+
+/// A NUL-terminated copy of [b, e) (cut to the buffer at a code point boundary).
+[[maybe_unused]] const char* piece_text(std::string_view s, std::uint32_t b, std::uint32_t e,
+                                        char (&buf)[lx::text::k_max_wrap_piece_bytes + 1]) {
+    std::size_t n = e > b ? e - b : 0;
+    if (n > lx::text::k_max_wrap_piece_bytes) {
+        n = lx::text::k_max_wrap_piece_bytes;
+        while (n > 0 && (static_cast<unsigned char>(s[b + n]) & 0xC0u) == 0x80u)
+            --n;
+    }
+    std::memcpy(buf, s.data() + b, n);
+    buf[n] = '\0';
+    return buf;
+}
+
+} // namespace
+
+#if defined(LUMEN_HAS_TEXT)
+namespace {
+
+/// The layout in progress: lines and pieces into `out`.
+struct wrap_state {
+    std::string_view text;
+    std::span<const lx::text::text_span> spans;
+    lx::text::font_desc base;
+    int max_w = 0;
+    unsigned max_lines = 1;
+    lx::text::wrapped_text* out = nullptr;
+    /// The current line's pen (trailing spaces included) and its inked width.
+    int pen = 0;
+    int ink = 0;
+    bool full = false;
+    lx::text::shaped_line scratch{};
+
+    lx::text::wrap_line& line() { return out->lines[out->line_count - 1]; }
+
+    /// Width of [b, e) in `span`'s font; -1 when it cannot be shaped.
+    int measure(std::uint32_t b, std::uint32_t e, std::uint16_t span) {
+        char buf[lx::text::k_max_wrap_piece_bytes + 1];
+        if (!lx::text::shape_line(piece_text(text, b, e, buf), span_font(base, spans, span), scratch))
+            return -1;
+        return scratch.width_px;
+    }
+
+    bool new_line() {
+        if (out->line_count >= max_lines || out->line_count >= lx::text::k_max_wrap_lines) {
+            full = true;
+            return false;
+        }
+        lx::text::wrap_line& l = out->lines[out->line_count++];
+        l = {};
+        l.first = out->piece_count;
+        pen = ink = 0;
+        return true;
+    }
+
+    bool add_piece(std::uint32_t b, std::uint32_t e, std::uint16_t span, int w) {
+        if (out->piece_count >= lx::text::k_max_wrap_pieces) {
+            full = true;
+            return false;
+        }
+        lx::text::wrap_piece& p = out->pieces[out->piece_count++];
+        p = {};
+        p.begin = b;
+        p.end = e;
+        p.span = span;
+        p.x_px = pen;
+        p.width_px = w;
+        ++line().count;
+        pen += w;
+        ink = pen;
+        line().width_px = ink;
+        return true;
+    }
+
+    /// Places the word [b, e) and its trailing spaces up to `next`.
+    void place_word(std::uint32_t b, std::uint32_t e, std::uint32_t next) {
+        // Segments by span, each measured once.
+        struct seg {
+            std::uint32_t b, e;
+            std::uint16_t span;
+            int w;
+        };
+        seg segs[24];
+        unsigned n = 0;
+        int word_w = 0;
+        for (std::uint32_t at = b; at < e && n < 24;) {
+            std::uint32_t run_end = e;
+            const std::uint16_t span = span_at(spans, at, e, run_end);
+            if (run_end - at > lx::text::k_max_wrap_piece_bytes) {
+                run_end = at + lx::text::k_max_wrap_piece_bytes;
+                while (run_end > at + 1 &&
+                       (static_cast<unsigned char>(text[run_end]) & 0xC0u) == 0x80u)
+                    --run_end;
+            }
+            const int w = measure(at, run_end, span);
+            if (w < 0)
+                return;
+            segs[n++] = {at, run_end, span, w};
+            word_w += w;
+            at = run_end;
+        }
+        int space_w = 0;
+        if (next > e) {
+            std::uint32_t run_end = next;
+            const int w = measure(e, next, span_at(spans, e, next, run_end));
+            space_w = w > 0 ? w : 0;
+        }
+        if (line().count > 0 && pen + word_w > max_w && !new_line())
+            return;
+        for (unsigned i = 0; i < n && !full; ++i) {
+            const seg& s = segs[i];
+            if (pen + s.w <= max_w || (line().count == 0 && pen == 0 && s.w <= max_w)) {
+                add_piece(s.b, s.e, s.span, s.w);
+                continue;
+            }
+            // Wider than what is left: broken between clusters (an over-long word).
+            split_segment(s.b, s.e, s.span);
+        }
+        pen += space_w;
+    }
+
+    /// A segment that does not fit: as much as fits on each line, at cluster boundaries.
+    void split_segment(std::uint32_t b, std::uint32_t e, std::uint16_t span) {
+        while (b < e && !full) {
+            char buf[lx::text::k_max_wrap_piece_bytes + 1];
+            const char* t = piece_text(text, b, e, buf);
+            if (!lx::text::shape_line(t, span_font(base, spans, span), scratch))
+                return;
+            const int room = max_w - pen;
+            if (scratch.width_px <= room) {
+                add_piece(b, b + static_cast<std::uint32_t>(std::strlen(t)), span, scratch.width_px);
+                b += static_cast<std::uint32_t>(std::strlen(t));
+                continue;
+            }
+            // The longest cluster prefix that fits.
+            long acc = 0;
+            unsigned cut = 0;
+            int cut_w = 0;
+            for (unsigned g = 0; g < scratch.count; ++g) {
+                if (g > 0 && scratch.cluster[g] != scratch.cluster[g - 1]) {
+                    const int w = static_cast<int>((acc + 63) / 64);
+                    if (w > room)
+                        break;
+                    cut = scratch.cluster[g];
+                    cut_w = w;
+                }
+                acc += scratch.x_adv[g];
+            }
+            if (cut == 0) {
+                if (line().count > 0) {
+                    if (!new_line())
+                        return;
+                    continue;
+                }
+                // Not even one cluster fits an empty line: it goes anyway (clipped).
+                std::size_t i = 0;
+                (void)next_code_point(std::string_view{t}, i);
+                cut = static_cast<unsigned>(i);
+                cut_w = room;
+            }
+            add_piece(b, b + cut, span, cut_w);
+            b += cut;
+            if (b < e && !new_line())
+                return;
+        }
+    }
+
+    /// The last line ends in "…": its last pieces are cut until it fits.
+    void ellipsize() {
+        out->truncated = true;
+        if (out->line_count == 0 && !new_line_forced())
+            return;
+        lx::text::wrap_line& l = line();
+        while (true) {
+            if (l.count == 0) {
+                // Nothing left on the line: the ellipsis alone.
+                if (out->piece_count >= lx::text::k_max_wrap_pieces)
+                    return;
+                const std::uint16_t span = k_base_span;
+                if (!lx::text::shape_line("\xE2\x80\xA6", span_font(base, spans, span), scratch))
+                    return;
+                lx::text::wrap_piece& p = out->pieces[out->piece_count++];
+                p = {};
+                p.span = span;
+                p.ellipsis = true;
+                p.width_px = scratch.width_px;
+                l.count = 1;
+                l.width_px = p.width_px;
+                return;
+            }
+            lx::text::wrap_piece& p = out->pieces[l.first + l.count - 1];
+            const lx::text::font_desc f = span_font(base, spans, p.span);
+            if (!lx::text::shape_line("\xE2\x80\xA6", f, scratch))
+                return;
+            const int ell = scratch.width_px;
+            if (p.x_px + p.width_px + ell <= max_w) {
+                p.width_px += ell;
+                p.ellipsis = true;
+                l.width_px = p.x_px + p.width_px;
+                return;
+            }
+            char buf[lx::text::k_max_wrap_piece_bytes + 1];
+            if (!lx::text::shape_line(piece_text(text, p.begin, p.end, buf), f, scratch))
+                return;
+            const lx::text::line_fit fit = lx::text::fit_line(scratch, max_w - p.x_px);
+            if (fit.ellipsized && fit.glyph_end > 0) {
+                p.end = p.begin + scratch.cluster[fit.glyph_end];
+                p.width_px = fit.width_px;
+                p.ellipsis = true;
+                l.width_px = p.x_px + p.width_px;
+                return;
+            }
+            // Nothing of this piece fits with the ellipsis: drop it.
+            --l.count;
+            --out->piece_count;
+            l.width_px = l.count ? out->pieces[l.first + l.count - 1].x_px +
+                                       out->pieces[l.first + l.count - 1].width_px
+                                 : 0;
+        }
+    }
+
+    bool new_line_forced() {
+        full = false;
+        return new_line();
+    }
+};
+
+} // namespace
+#endif
+
+lx::result<void> lx::text::wrap_text(std::string_view text, std::span<const text_span> spans,
+                                     font_desc base, int max_width_px, unsigned max_lines,
+                                     wrapped_text& out) {
+    out.line_count = 0;
+    out.piece_count = 0;
+    out.truncated = false;
+    out.width_px = 0;
+#if defined(LUMEN_HAS_TEXT)
+    // Per thread, reused: the shaping scratch is 10 KiB, never allocated per call.
+    static thread_local wrap_state s{};
+    if (!lx::text::shape_line("", base, s.scratch))
+        return lx::make_error(lx::error_domain::io, 0, "no font face resolved");
+    out.ascent_px = s.scratch.ascent_px;
+    out.descent_px = s.scratch.descent_px;
+    const int h = out.ascent_px + out.descent_px;
+    out.line_height_px = h + (h / 6 > 1 ? h / 6 : 1);
+    s.text = text;
+    s.spans = spans;
+    s.base = base;
+    s.max_w = max_width_px > 1 ? max_width_px : 1;
+    s.max_lines = max_lines == 0 ? 1 : (max_lines > k_max_wrap_lines ? k_max_wrap_lines : max_lines);
+    s.out = &out;
+    s.pen = s.ink = 0;
+    s.full = false;
+    if (text.empty())
+        return {};
+    (void)s.new_line();
+    // Units: a word and the spaces after it; a hard break at '\n'; soft breaks after a
+    // hyphen or a slash and around CJK characters.
+    std::size_t i = 0;
+    std::uint32_t word_begin = 0;
+    while (i < text.size() && !s.full) {
+        const std::size_t at = i;
+        const std::uint32_t c = next_code_point(text, i);
+        if (c == '\n') {
+            if (at > word_begin)
+                s.place_word(word_begin, static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at));
+            word_begin = static_cast<std::uint32_t>(i);
+            if (i < text.size())
+                (void)s.new_line();
+            continue;
+        }
+        if (is_space(c)) {
+            // The word ends here; its spaces run to the next non-space.
+            std::size_t j = i;
+            while (j < text.size()) {
+                std::size_t k = j;
+                const std::uint32_t d = next_code_point(text, k);
+                if (!is_space(d))
+                    break;
+                j = k;
+            }
+            s.place_word(word_begin, static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(j));
+            word_begin = static_cast<std::uint32_t>(j);
+            i = j;
+            continue;
+        }
+        const bool around = breaks_around(c);
+        if (around && at > word_begin) {
+            s.place_word(word_begin, static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at));
+            word_begin = static_cast<std::uint32_t>(at);
+        }
+        if (around || ((c == '-' || c == '/') && i < text.size() &&
+                       !is_space(static_cast<unsigned char>(text[i])) && text[i] != '\n')) {
+            s.place_word(word_begin, static_cast<std::uint32_t>(i), static_cast<std::uint32_t>(i));
+            word_begin = static_cast<std::uint32_t>(i);
+        }
+    }
+    if (!s.full && word_begin < text.size())
+        s.place_word(word_begin, static_cast<std::uint32_t>(text.size()),
+                     static_cast<std::uint32_t>(text.size()));
+    // A line left empty at the end (text ending in '\n') is not a line.
+    while (out.line_count > 1 && out.lines[out.line_count - 1].count == 0 && !s.full)
+        --out.line_count;
+    if (s.full)
+        s.ellipsize();
+    for (unsigned l = 0; l < out.line_count; ++l)
+        if (out.lines[l].width_px > out.width_px)
+            out.width_px = out.lines[l].width_px;
+    return {};
+#else
+    (void)text;
+    (void)spans;
+    (void)base;
+    (void)max_width_px;
+    (void)max_lines;
+    return lx::not_implemented("lx::text::wrap_text");
+#endif
+}
+
+lx::result<void> lx::text::render_wrapped(std::string_view text, std::span<const text_span> spans,
+                                          const wrapped_text& w, font_desc base,
+                                          span_color_fn color, void* user, raster_target target,
+                                          lx::point2i origin) {
+    if (!target.pixels || target.width <= 0 || target.height <= 0 ||
+        target.stride_px < target.width)
+        return lx::invalid_argument("render_wrapped: bad target");
+#if defined(LUMEN_HAS_TEXT)
+    static thread_local shaped_line line_storage{};
+    shaped_line* line = &line_storage;
+    char buf[k_max_wrap_piece_bytes + 1];
+    for (unsigned l = 0; l < w.line_count; ++l) {
+        const int baseline = origin.y + w.ascent_px + static_cast<int>(l) * w.line_height_px;
+        const wrap_line& ln = w.lines[l];
+        for (unsigned k = 0; k < ln.count && ln.first + k < w.piece_count; ++k) {
+            const wrap_piece& p = w.pieces[ln.first + k];
+            const font_desc f = span_font(base, spans, p.span);
+            if (!shape_line(piece_text(text, p.begin, p.end, buf), f, *line))
+                continue;
+            const std::uint16_t tag = p.span < spans.size() ? spans[p.span].tag : 0;
+            const raster_color c =
+                color ? color(p.span < spans.size() ? static_cast<int>(p.span) : -1, tag, user)
+                      : raster_color{0xE6, 0xE6, 0xE6, 0xFF};
+            const line_fit fit{line->count, line->width_px, p.ellipsis};
+            const int x = origin.x + p.x_px;
+            (void)render_line(*line, fit, c, target, {x, baseline});
+            if (p.span < spans.size() && spans[p.span].underline) {
+                // Under the ink: a third of the descent below the baseline, ≥ 1 px thick.
+                const int thick = line->ascent_px >= 16 ? 2 : 1;
+                const int uy = baseline + (line->descent_px + 2) / 3;
+                const unsigned a = c.a;
+                for (int y = uy; y < uy + thick; ++y) {
+                    if (y < 0 || y >= target.height)
+                        continue;
+                    std::uint32_t* row = target.pixels + static_cast<long>(y) * target.stride_px;
+                    for (int xx = x; xx < x + p.width_px; ++xx) {
+                        if (xx < 0 || xx >= target.width)
+                            continue;
+                        const std::uint32_t d = row[xx];
+                        const unsigned inv = 255u - a;
+                        const auto ch = [&](unsigned shift, unsigned s) {
+                            return s + (((d >> shift) & 0xFFu) * inv + 127u) / 255u;
+                        };
+                        row[xx] = (ch(24, a) << 24) | (ch(16, (c.r * a + 127u) / 255u) << 16) |
+                                  (ch(8, (c.g * a + 127u) / 255u) << 8) |
+                                  ch(0, (c.b * a + 127u) / 255u);
+                    }
+                }
+            }
+        }
+    }
+    return {};
+#else
+    (void)text;
+    (void)spans;
+    (void)w;
+    (void)base;
+    (void)color;
+    (void)user;
+    (void)origin;
+    return lx::not_implemented("lx::text::render_wrapped");
+#endif
+}
+
+int lx::text::wrapped_piece_at(const wrapped_text& w, int x, int y) {
+    if (y < 0 || w.line_height_px <= 0)
+        return -1;
+    const unsigned l = static_cast<unsigned>(y / w.line_height_px);
+    if (l >= w.line_count)
+        return -1;
+    const wrap_line& ln = w.lines[l];
+    for (unsigned k = 0; k < ln.count && ln.first + k < w.piece_count; ++k) {
+        const wrap_piece& p = w.pieces[ln.first + k];
+        if (x >= p.x_px && x < p.x_px + p.width_px)
+            return static_cast<int>(ln.first + k);
+    }
+    return -1;
 }

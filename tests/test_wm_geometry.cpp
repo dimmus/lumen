@@ -473,6 +473,161 @@ LUMEN_TEST(wm_moved_window_keeps_outstanding_resize_anchor) {
     LUMEN_CHECK(got.x == 250 && got.y == 150);
 }
 
+// ── snapping (design-session-and-wm K.3–K.5) ───────────────────────────────
+
+LUMEN_TEST(wm_snap_halves_and_quarters_tile_exactly_with_odd_sizes) {
+    using namespace lx::compositor;
+    // An odd usable area (a 1919x1047 output under a 33 px panel): the odd pixel goes to the
+    // left half and the top quarter, and the parts meet without gap or overlap.
+    const lx::rect2i u{0, 33, 1919, 1047};
+    const lx::rect2i l = snap_frame(u, edge_left);
+    const lx::rect2i r = snap_frame(u, edge_right);
+    LUMEN_CHECK(same(l, {0, 33, 960, 1047}) && same(r, {960, 33, 959, 1047}));
+    const lx::rect2i tl = snap_frame(u, edge_top | edge_left);
+    const lx::rect2i bl = snap_frame(u, edge_bottom | edge_left);
+    const lx::rect2i tr = snap_frame(u, edge_top | edge_right);
+    const lx::rect2i br = snap_frame(u, edge_bottom | edge_right);
+    LUMEN_CHECK(same(tl, {0, 33, 960, 524}) && same(bl, {0, 557, 960, 523}));
+    LUMEN_CHECK(same(tr, {960, 33, 959, 524}) && same(br, {960, 557, 959, 523}));
+    LUMEN_CHECK(tl.height + bl.height == u.height && l.width + r.width == u.width);
+    // A server-side frame comes off the window geometry: the frame fills the half.
+    const frame_extents ext{4, 28, 4, 4};
+    const lx::rect2i g = snap_geometry(u, edge_right, ext, {}, {});
+    LUMEN_CHECK(same(g, {964, 61, 951, 1015}));
+    LUMEN_CHECK(same(frame_rect(g, ext), r));
+}
+
+LUMEN_TEST(wm_snap_minimum_keeps_the_outer_corner) {
+    using namespace lx::compositor;
+    const lx::rect2i u{0, 0, 1000, 800};
+    // Too narrow for a 600 px minimum: the right half keeps touching the right edge.
+    const lx::rect2i r = snap_geometry(u, edge_right, {}, {600, 0}, {});
+    LUMEN_CHECK(same(r, {400, 0, 600, 800}));
+    const lx::rect2i l = snap_geometry(u, edge_left, {}, {600, 0}, {});
+    LUMEN_CHECK(same(l, {0, 0, 600, 800}));
+    // A bottom quarter too short for its minimum keeps touching the bottom.
+    const lx::rect2i br = snap_geometry(u, edge_bottom | edge_right, {}, {0, 500}, {});
+    LUMEN_CHECK(same(br, {500, 300, 500, 500}));
+    // A maximum smaller than the half: anchored at the outer edge too.
+    const lx::rect2i m = snap_geometry(u, edge_right, {}, {}, {300, 0});
+    LUMEN_CHECK(same(m, {700, 0, 300, 800}));
+    LUMEN_CHECK(snap_tiled_states(edge_left) == tl_tiled_all &&
+                snap_tiled_states(edge_bottom | edge_right) == tl_tiled_all &&
+                snap_tiled_states(0) == 0);
+}
+
+LUMEN_TEST(wm_snap_windows_11_transition_table) {
+    using namespace lx::compositor;
+    using enum snap_key;
+    const unsigned L = edge_left, R = edge_right, T = edge_top, B = edge_bottom;
+    struct row {
+        unsigned from;
+        bool maximized;
+        snap_key key;
+        snap_move move;
+        unsigned to;
+        int dx;
+    };
+    const row table[] = {
+        // normal
+        {0, false, left, snap_move::snap, L, 0},
+        {0, false, right, snap_move::snap, R, 0},
+        {0, false, up, snap_move::maximize, 0, 0},
+        {0, false, down, snap_move::minimize, 0, 0},
+        // maximized
+        {0, true, left, snap_move::snap, L, 0},
+        {0, true, right, snap_move::snap, R, 0},
+        {0, true, up, snap_move::none, 0, 0},
+        {0, true, down, snap_move::restore, 0, 0},
+        // left half
+        {L, false, left, snap_move::snap, R, -1},
+        {L, false, right, snap_move::restore, 0, 0},
+        {L, false, up, snap_move::snap, T | L, 0},
+        {L, false, down, snap_move::snap, B | L, 0},
+        // right half
+        {R, false, left, snap_move::restore, 0, 0},
+        {R, false, right, snap_move::snap, L, 1},
+        {R, false, up, snap_move::snap, T | R, 0},
+        {R, false, down, snap_move::snap, B | R, 0},
+        // quarters
+        {T | L, false, left, snap_move::snap, T | R, -1},
+        {T | L, false, right, snap_move::snap, T | R, 0},
+        {T | L, false, up, snap_move::none, 0, 0},
+        {T | L, false, down, snap_move::snap, L, 0},
+        {B | L, false, left, snap_move::snap, B | R, -1},
+        {B | L, false, right, snap_move::snap, B | R, 0},
+        {B | L, false, up, snap_move::snap, L, 0},
+        {B | L, false, down, snap_move::none, 0, 0},
+        {T | R, false, left, snap_move::snap, T | L, 0},
+        {T | R, false, right, snap_move::snap, T | L, 1},
+        {T | R, false, up, snap_move::none, 0, 0},
+        {T | R, false, down, snap_move::snap, R, 0},
+        {B | R, false, left, snap_move::snap, B | L, 0},
+        {B | R, false, right, snap_move::snap, B | L, 1},
+        {B | R, false, up, snap_move::snap, R, 0},
+        {B | R, false, down, snap_move::none, 0, 0},
+    };
+    for (const row& r : table) {
+        const snap_step s = next_snap(r.from, r.maximized, r.key);
+        LUMEN_CHECK(s.move == r.move);
+        if (s.move == snap_move::snap)
+            LUMEN_CHECK(s.snap == r.to && s.output_dx == r.dx);
+        else
+            LUMEN_CHECK(s.output_dx == 0);
+    }
+    // Every reachable state is closed under the four keys (the table is total).
+    for (unsigned from : {0u, L, R, T | L, B | L, T | R, B | R})
+        for (snap_key k : {left, right, up, down}) {
+            const snap_step s = next_snap(from, false, k);
+            if (s.move == snap_move::snap)
+                LUMEN_CHECK(s.snap == L || s.snap == R || s.snap == (T | L) || s.snap == (B | L) ||
+                            s.snap == (T | R) || s.snap == (B | R));
+        }
+}
+
+LUMEN_TEST(wm_edge_snap_zones_respect_neighbouring_outputs) {
+    using namespace lx::compositor;
+    const lx::rect2i o{0, 0, 1920, 1080};
+    const unsigned all = edge_left | edge_right | edge_top | edge_bottom;
+    // Edges: halves; ends of the side edges and of the top/bottom edges: quarters; the top
+    // edge: maximize; the bottom edge's middle: nothing; the inside: nothing.
+    LUMEN_CHECK(edge_snap_zone(o, 0, 540, all, 8, 64) == edge_left);
+    LUMEN_CHECK(edge_snap_zone(o, 7.9, 540, all, 8, 64) == edge_left);
+    LUMEN_CHECK(edge_snap_zone(o, 8, 540, all, 8, 64) == 0);
+    LUMEN_CHECK(edge_snap_zone(o, 1919, 540, all, 8, 64) == edge_right);
+    LUMEN_CHECK(edge_snap_zone(o, 0, 10, all, 8, 64) == (edge_top | edge_left));
+    LUMEN_CHECK(edge_snap_zone(o, 1919, 1079, all, 8, 64) == (edge_bottom | edge_right));
+    LUMEN_CHECK(edge_snap_zone(o, 960, 0, all, 8, 64) == k_snap_maximize);
+    LUMEN_CHECK(edge_snap_zone(o, 30, 0, all, 8, 64) == (edge_top | edge_left));
+    LUMEN_CHECK(edge_snap_zone(o, 1900, 2, all, 8, 64) == (edge_top | edge_right));
+    LUMEN_CHECK(edge_snap_zone(o, 960, 1079, all, 8, 64) == 0);
+    LUMEN_CHECK(edge_snap_zone(o, 10, 1079, all, 8, 64) == (edge_bottom | edge_left));
+    LUMEN_CHECK(edge_snap_zone(o, 960, 540, all, 8, 64) == 0);
+    // Another output continues the right edge: dragging across it is no snap there, but
+    // its top edge still maximizes.
+    LUMEN_CHECK(edge_snap_zone(o, 1919, 540, all & ~edge_right, 8, 64) == 0);
+    LUMEN_CHECK(edge_snap_zone(o, 1000, 0, all & ~edge_right, 8, 64) == k_snap_maximize);
+    // A second output to the right of the first: its left edge is inner, its right outer.
+    const lx::rect2i o2{1920, 0, 1280, 1024};
+    LUMEN_CHECK(edge_snap_zone(o2, 1920, 500, all & ~edge_left, 8, 64) == 0);
+    LUMEN_CHECK(edge_snap_zone(o2, 3199, 500, all & ~edge_left, 8, 64) == edge_right);
+    // Corners 0 wide: only halves and maximize.
+    LUMEN_CHECK(edge_snap_zone(o, 0, 0, all, 8, 0) == edge_left);
+    LUMEN_CHECK(edge_snap_zone(o, 20, 0, all, 8, 0) == k_snap_maximize);
+}
+
+LUMEN_TEST(wm_drag_restore_keeps_the_pointer_on_the_title_bar) {
+    using namespace lx::compositor;
+    // A maximized frame 1920 wide grabbed at 3/4 of its width, 10 px into its title bar:
+    // restored to 800x600, the pointer is at 3/4 of the new width, 10 px below its top.
+    const lx::rect2i frame{0, 33, 1920, 1047};
+    const lx::point2i p = drag_restore_origin(frame, {800, 600}, 1440, 43);
+    LUMEN_CHECK(p.x == 1440 - 600 && p.y == 33);
+    // Grabbed below what the restored frame is tall: clamped into it.
+    const lx::point2i q = drag_restore_origin(frame, {800, 300}, 100, 833);
+    LUMEN_CHECK(q.y == 833 - 299 && q.x == 100 - static_cast<int>(std::lround(100.0 / 1920 * 800)));
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

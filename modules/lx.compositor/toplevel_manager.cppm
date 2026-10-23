@@ -19,10 +19,19 @@ enum toplevel_state_bit : unsigned {
     tl_resizing = 1u << 1,
     tl_maximized = 1u << 2,
     tl_fullscreen = 1u << 3,
-    /// The session is paused (VT switched away): nothing is repainted. Sent as
+    /// Nothing of the window is repainted: the session is paused, locked or powered off, or
+    /// the window is not shown (another workspace, minimized; Mutter does the same). Sent as
     /// XDG_TOPLEVEL_STATE_SUSPENDED to xdg_wm_base v6 clients.
     tl_suspended = 1u << 4,
+    /// xdg_toplevel v2 `tiled_*`: the edge lies against the usable area's edge or another
+    /// snapped window (a half or a quarter, design-session-and-wm K.3): the client draws no
+    /// shadow and no rounded corner there (GTK) and does not round its size (foot).
+    tl_tiled_left = 1u << 5,
+    tl_tiled_right = 1u << 6,
+    tl_tiled_top = 1u << 7,
+    tl_tiled_bottom = 1u << 8,
 };
+inline constexpr unsigned tl_tiled_all = tl_tiled_left | tl_tiled_right | tl_tiled_top | tl_tiled_bottom;
 
 /// Same values as `xdg_toplevel.resize_edge` and `zlm_policy_bridge_v1.resize_edge`.
 enum resize_edge_bits : unsigned {
@@ -213,6 +222,17 @@ struct toplevel_record {
     bool restore_set = false;
     /// xdg_toplevel.set_maximized before the initial configure: that configure maximizes.
     bool want_maximized = false;
+
+    // ── snapping (design-session-and-wm K.3–K.5) ──
+    /// Where it is snapped: `resize_edge_bits` of a half (edge_left, edge_right) or a quarter
+    /// (edge_top | edge_left, …) of its output's usable area; 0 when not snapped. Never
+    /// together with maximized. The window manager's decision, set when the configure asking
+    /// for it is made (`restore` then holds the normal geometry it goes back to).
+    unsigned snap = 0;
+    /// Fullscreen from a snapped state: unset_fullscreen snaps it there again.
+    unsigned fullscreen_snap = 0;
+    /// With `home_identifier`: snapped there, for its return.
+    unsigned home_snap = 0;
     /// The next configure must go out even if it asks for nothing new: set_maximized /
     /// unset_maximized are always answered by a configure (xdg-shell), maximized already or
     /// not.
@@ -237,7 +257,22 @@ struct toplevel_record {
     activation_grant pending_grant{};
     lx::runtime::clock_time activation_requested_ns = 0;
 
+    // ── workspaces, minimize, sticky (design-session-and-wm Part W) ──
+    /// The workspace it belongs to (`:workspaces`); none while unmapped, while it is sticky,
+    /// and before its output has workspaces.
     lx::workspace_id workspace{};
+    /// xdg_toplevel.set_minimized, the shell's request_minimize, window.minimize: not shown,
+    /// still on its workspace. Activation brings it back.
+    bool minimized = false;
+    /// Shown on every workspace of its output (window.sticky-toggle).
+    bool sticky = false;
+    /// Not shown (its workspace is inactive, or it is minimized): its tree container is
+    /// invisible, it takes no input and its configures carry `suspended`.
+    bool hidden = false;
+    /// The shell has yet to be told its workspace (zlm v7 toplevel_workspace).
+    bool workspace_dirty = false;
+    /// With `home_identifier`: the 1-based position its workspace had on that output.
+    unsigned home_workspace = 0;
     unsigned wire_id = 0;           ///< zlm_toplevel_v1 Wayland object id (P0)
     bool override_redirect = false; ///< XWayland / OR windows — no decorations, fixed stacking
     unsigned net_wm_type = 0;       ///< _NET_WM_WINDOW_TYPE atom value (XWayland bridge)
@@ -636,4 +671,11 @@ void lx::compositor::toplevel_manager::reset_for_remap(toplevel_record& rec) {
     rec.output = -1;
     rec.fullscreen_output = -1;
     rec.fullscreen_restore_set = false;
+    rec.snap = 0;
+    rec.fullscreen_snap = 0;
+    // A remap is a new window (W.1): it joins a workspace again when it maps.
+    rec.minimized = false;
+    rec.hidden = false;
+    rec.workspace = {};
+    rec.workspace_dirty = false;
 }

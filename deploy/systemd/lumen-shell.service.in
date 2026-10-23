@@ -1,0 +1,22 @@
+# lumen-shell: the panel, the launcher, the idle and lock policy (design-session-and-wm S.7).
+# Pulled in by lumen-compositor.service and supervised here, as Plasma supervises
+# plasmashell: a crash restarts it (the compositor replays its state over the policy bridge
+# and holds the panel's strip meanwhile); a clean exit (the session ending) does not.
+[Unit]
+Description=Lumen desktop shell
+Documentation=https://github.com/dimmus/lumen/blob/main/docs/architecture.md
+PartOf=graphical-session.target
+After=graphical-session.target lumen-compositor.service
+# Only inside a running session: `systemctl --user start lumen-shell` alone does nothing.
+Requisite=graphical-session.target
+StartLimitIntervalSec=30s
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=@LUMEN_BINDIR@/lumen-shell
+# Essential to the graphical session. The applications it launches are not its children:
+# each runs as app-lumen-<id>@<random>.service in app.slice.
+Slice=session.slice
+Restart=on-failure
+RestartSec=300ms

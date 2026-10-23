@@ -32,6 +32,16 @@ lumen_add_module_library(lx.foundation modules/lx.foundation)
 lumen_add_module_library(lx.sync modules/lx.sync DEPENDS lx.foundation)
 lumen_add_module_library(lx.trace modules/lx.trace DEPENDS lx.foundation)
 lumen_add_module_library(lx.runtime modules/lx.runtime DEPENDS lx.foundation lx.trace lx.sync)
+# The session's health report (docs/subsystems/health.md): pure, filled on request.
+lumen_add_module_library(lx.health modules/lx.health DEPENDS lx.foundation)
+# The configuration file (design-session-and-wm Part C): schema, parser, layers, watch. Pure
+# apart from reading files; keysym names from xkbcommon when it is there.
+lumen_add_module_library(lx.config modules/lx.config DEPENDS lx.foundation)
+if(XKBCOMMON_FOUND)
+    target_include_directories(lx.config PRIVATE ${XKBCOMMON_INCLUDE_DIRS})
+    target_link_libraries(lx.config PUBLIC ${XKBCOMMON_LIBRARIES})
+    target_compile_definitions(lx.config PRIVATE LUMEN_HAS_XKBCOMMON=1)
+endif()
 
 # ── Platform ─────────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.input modules/lx.input DEPENDS lx.runtime)
@@ -99,11 +109,11 @@ lumen_add_module_library(lx.ui.builder modules/lx.ui.builder DEPENDS lx.ui)
 lumen_add_module_library(lx.shell.policy modules/lx.shell.policy
     DEPENDS lx.wayland.client lx.wayland.protocols)
 lumen_add_module_library(lx.compositor modules/lx.compositor
-    DEPENDS lx.wayland.server lx.gfx lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session)
+    DEPENDS lx.wayland.server lx.gfx lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session lx.health lx.config)
 # lumen-shell talks libwayland-client directly (lx.wayland.client is still a stub): the
 # zlm_shell_v1, wlr-layer-shell and cursor-shape client glue comes from lumen-protocol-glue.
 lumen_add_module_library(lx.shell modules/lx.shell
-    DEPENDS lx.shell.policy lx.text lx.trace)
+    DEPENDS lx.shell.policy lx.text lx.trace lx.config)
 lumen_link_platform_modules(lx.shell)
 if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
     target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
@@ -161,6 +171,44 @@ target_link_libraries(lumen-shell PRIVATE lx.shell)
 lumen_apply_module_properties(lumen-shell)
 lumen_check_executable_layers(lumen-shell lx.shell)
 lumen_link_platform(lumen-shell)
+
+# lumen-ctl: the running session's control tool, a Varlink client of the compositor's
+# control socket (design-session-and-wm S.8). Plain C++ on libsystemd (sd-varlink, sd-json,
+# sd-bus for the units): no Lumen module, so it starts in a millisecond. sd-varlink is public
+# since systemd 257 (LUMEN_HAS_VARLINK, cmake/LumenPlatform.cmake).
+if(LUMEN_HAS_VARLINK)
+    # `config check` / `config defaults` / `action --list` use lx.config (config.cpp); the
+    # documented default file is compiled in.
+    file(READ "${CMAKE_SOURCE_DIR}/deploy/lumen/config.toml" LUMEN_DEFAULT_CONFIG_TEXT)
+    configure_file("${CMAKE_SOURCE_DIR}/executables/lumen-ctl/default_config.inc.in"
+        "${CMAKE_BINARY_DIR}/generated/lumen-ctl/lumen_default_config.inc" @ONLY)
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+        "${CMAKE_SOURCE_DIR}/deploy/lumen/config.toml")
+    add_executable(lumen-ctl executables/lumen-ctl/main.cpp executables/lumen-ctl/config.cpp)
+    target_include_directories(lumen-ctl PRIVATE ${LIBSYSTEMD_INCLUDE_DIRS}
+        "${CMAKE_BINARY_DIR}/generated/lumen-ctl")
+    target_link_libraries(lumen-ctl PRIVATE ${LIBSYSTEMD_LIBRARIES} lx.config)
+    lumen_apply_module_properties(lumen-ctl)
+else()
+    message(STATUS "no libsystemd >= 257 — lumen-ctl and the control socket unavailable")
+endif()
+
+# The session's files for runs from the build tree (run-desktop.sh --systemd): the units
+# and lumen-session pointing at this build directory. Installed copies are configured at
+# install time instead (cmake/LumenInstallSession.cmake).
+set(LUMEN_BINDIR "${CMAKE_BINARY_DIR}")
+foreach(_unit lumen-compositor.service lumen-shell.service)
+    configure_file("${CMAKE_SOURCE_DIR}/deploy/systemd/${_unit}.in"
+        "${CMAKE_BINARY_DIR}/share/systemd/user/${_unit}" @ONLY)
+endforeach()
+configure_file("${CMAKE_SOURCE_DIR}/deploy/systemd/lumen-shutdown.target"
+    "${CMAKE_BINARY_DIR}/share/systemd/user/lumen-shutdown.target" COPYONLY)
+configure_file("${CMAKE_SOURCE_DIR}/scripts/lumen-session.in"
+    "${CMAKE_BINARY_DIR}/lumen-session" @ONLY
+    FILE_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ GROUP_EXECUTE
+                     WORLD_READ WORLD_EXECUTE)
+configure_file("${CMAKE_SOURCE_DIR}/deploy/wayland-sessions/lumen.desktop.in"
+    "${CMAKE_BINARY_DIR}/share/wayland-sessions/lumen.desktop" @ONLY)
 
 # Diagnostic: exercises lx.input alone, so "typing does nothing" can be narrowed to
 # permissions, devices, translation or routing instead of testing all four at once.
@@ -258,7 +306,9 @@ if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
         if(LUMEN_BUILD_TESTS AND TARGET lumen-protocol-glue)
             add_executable(lumen-probe tests/clients/lumen-probe.cpp tests/clients/lumen-probe-output-mgmt.cpp
                 tests/clients/lumen-probe-compat.cpp tests/clients/lumen-probe-window.cpp
-                tests/clients/lumen-probe-pointer.cpp tests/clients/lumen-probe-capture.cpp)
+                tests/clients/lumen-probe-pointer.cpp tests/clients/lumen-probe-capture.cpp
+                tests/clients/lumen-probe-input.cpp tests/clients/lumen-probe-workspace.cpp
+                tests/clients/lumen-probe-sni.cpp)
             target_link_libraries(lumen-probe PRIVATE lumen-protocol-glue)
             lumen_link_platform(lumen-probe)
             target_compile_definitions(lumen-probe PRIVATE LUMEN_PROBE_HAS_LAYER_SHELL)
@@ -296,21 +346,24 @@ if(LUMEN_BUILD_PORTAL)
         lumen_check_executable_layers(xdg-desktop-portal-lumen lx.portal)
         set(LUMEN_PORTAL_BUILT TRUE)
 
-        # Deploy files: installed ones point at libexecdir; the build tree gets its own
-        # copies under share/ (pointing at the build tree) for run-desktop.sh sessions.
-        include(GNUInstallDirs)
-        set(LUMEN_PORTAL_EXEC "${CMAKE_INSTALL_FULL_LIBEXECDIR}/xdg-desktop-portal-lumen")
-        set(LUMEN_PORTAL_GEN "${CMAKE_BINARY_DIR}/generated/portal")
+        # Deploy files: installed ones are configured at install time against the prefix
+        # (cmake/LumenInstallSession.cmake); the build tree gets its own copies under share/
+        # (pointing at the build tree) for run-desktop.sh sessions.
+        set(LUMEN_PORTAL_EXEC "$<TARGET_FILE:xdg-desktop-portal-lumen>")
+        set(LUMEN_SHARE_DIR "${CMAKE_BINARY_DIR}/share")
+        # The D-Bus service and its unit for a build-tree systemd session (run-desktop.sh
+        # --systemd links them into $XDG_RUNTIME_DIR for that run only).
         foreach(_f org.freedesktop.impl.portal.desktop.lumen.service xdg-desktop-portal-lumen.service)
             set(_src "${CMAKE_SOURCE_DIR}/deploy/portal/${_f}.in")
+            set(_dst "${LUMEN_SHARE_DIR}/dbus-1/services/${_f}")
             if(_f STREQUAL "xdg-desktop-portal-lumen.service")
                 set(_src "${CMAKE_SOURCE_DIR}/deploy/systemd/${_f}.in")
+                set(_dst "${LUMEN_SHARE_DIR}/systemd/user/${_f}")
             endif()
-            configure_file("${_src}" "${LUMEN_PORTAL_GEN}/${_f}" @ONLY)
+            file(READ "${_src}" _content)
+            string(REPLACE "@LUMEN_PORTAL_EXEC@" "${LUMEN_PORTAL_EXEC}" _content "${_content}")
+            file(GENERATE OUTPUT "${_dst}" CONTENT "${_content}")
         endforeach()
-        configure_file("${CMAKE_SOURCE_DIR}/deploy/xdg/xdg-desktop-portal-wlr/Lumen.in"
-            "${LUMEN_PORTAL_GEN}/xdpw-Lumen" @ONLY)
-        set(LUMEN_SHARE_DIR "${CMAKE_BINARY_DIR}/share")
         file(MAKE_DIRECTORY "${LUMEN_SHARE_DIR}/xdg-desktop-portal/portals"
             "${LUMEN_SHARE_DIR}/xdg/xdg-desktop-portal-wlr")
         configure_file("${CMAKE_SOURCE_DIR}/deploy/portal/lumen.portal"
@@ -347,25 +400,48 @@ if(LUMEN_BUILD_TESTS AND LIBSYSTEMD_FOUND)
 endif()
 
 # ── Install ──────────────────────────────────────────────────────────────────
+# Every destination is relative to the prefix, so `cmake --install build --prefix DIR`
+# installs a complete, self-consistent tree into DIR (the session files name DIR's paths).
 include(GNUInstallDirs)
 install(TARGETS lumen-compositor lumen-shell RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+if(TARGET lumen-ctl)
+    install(TARGETS lumen-ctl RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+endif()
 install(DIRECTORY protocols/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/protocols
     FILES_MATCHING PATTERN "*.xml" PATTERN "*.toml")
-install(DIRECTORY deploy/systemd/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/systemd
-    PATTERN "*.in" EXCLUDE)
+# The documented configuration (every key at its default): a template to copy to
+# ~/.config/lumen/config.toml, not a layer itself (lumen-ctl config defaults prints it too).
+install(FILES deploy/lumen/config.toml DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen)
 if(LUMEN_PORTAL_BUILT)
     install(TARGETS xdg-desktop-portal-lumen RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
     install(FILES deploy/portal/lumen.portal
         DESTINATION ${CMAKE_INSTALL_DATADIR}/xdg-desktop-portal/portals)
     install(FILES deploy/portal/lumen-portals.conf
         DESTINATION ${CMAKE_INSTALL_DATADIR}/xdg-desktop-portal)
-    install(FILES "${LUMEN_PORTAL_GEN}/org.freedesktop.impl.portal.desktop.lumen.service"
-        DESTINATION ${CMAKE_INSTALL_DATADIR}/dbus-1/services)
-    install(FILES "${LUMEN_PORTAL_GEN}/xdg-desktop-portal-lumen.service"
-        DESTINATION ${CMAKE_INSTALL_PREFIX}/lib/systemd/user)
-    install(FILES "${LUMEN_PORTAL_GEN}/xdpw-Lumen"
-        DESTINATION ${CMAKE_INSTALL_FULL_SYSCONFDIR}/xdg/xdg-desktop-portal-wlr RENAME Lumen)
 endif()
+# The session: systemd user units, share/wayland-sessions/lumen.desktop, bin/lumen-session
+# and the portal service files, configured with the install prefix's paths. The unit
+# directory: LUMEN_SYSTEMD_USER_UNIT_DIR if set; systemd's own (pkg-config) for /usr;
+# else <prefix>/lib/systemd/user. Nothing is enabled: lumen-session starts the session.
+set(LUMEN_SYSTEMD_USER_UNIT_DIR "" CACHE STRING
+    "systemd user unit directory (empty: systemd's for /usr, else <prefix>/lib/systemd/user)")
+set(_lumen_unit_dir_usr "")
+if(PkgConfig_FOUND)
+    pkg_get_variable(_lumen_unit_dir_usr systemd systemduserunitdir)
+endif()
+install(CODE "
+    set(LUMEN_SOURCE_DIR \"${CMAKE_SOURCE_DIR}\")
+    set(LUMEN_STAGE_DIR \"${CMAKE_BINARY_DIR}/install-stage\")
+    set(LUMEN_UNIT_DIR_OVERRIDE \"${LUMEN_SYSTEMD_USER_UNIT_DIR}\")
+    set(LUMEN_SYSTEMD_UNIT_DIR_USR \"${_lumen_unit_dir_usr}\")
+    set(LUMEN_PORTAL_BUILT ${LUMEN_PORTAL_BUILT})
+    set(LUMEN_BINDIR_REL \"${CMAKE_INSTALL_BINDIR}\")
+    set(LUMEN_LIBEXECDIR_REL \"${CMAKE_INSTALL_LIBEXECDIR}\")
+    set(LUMEN_DATADIR_REL \"${CMAKE_INSTALL_DATADIR}\")
+    set(LUMEN_UNIT_SERVICE_TYPE \"${LUMEN_UNIT_SERVICE_TYPE}\")
+    set(LUMEN_UNIT_EXEC_RELOAD \"${LUMEN_UNIT_EXEC_RELOAD}\")
+")
+install(SCRIPT cmake/LumenInstallSession.cmake)
 
 enable_testing()
 
@@ -389,6 +465,53 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_result)
     target_include_directories(test_result PRIVATE tests)
     add_test(NAME test_result COMMAND test_result)
+
+    # The configuration file (design-session-and-wm Part 2): lx.config alone, and the
+    # documented default file it must parse to the defaults.
+    add_executable(test_config tests/test_config.cpp)
+    target_link_libraries(test_config PRIVATE lx.config)
+    lumen_apply_module_properties(test_config)
+    target_compile_definitions(test_config PRIVATE LUMEN_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_include_directories(test_config PRIVATE tests)
+    add_test(NAME test_config COMMAND test_config)
+
+    # Pointer device settings: the configuration → libinput setter calls (recording ops).
+    add_executable(test_input_config tests/test_input_config.cpp)
+    target_link_libraries(test_input_config PRIVATE lx.compositor lx.input lx.config)
+    lumen_apply_module_properties(test_input_config)
+    lumen_link_platform(test_input_config)
+    target_include_directories(test_input_config PRIVATE tests)
+    add_test(NAME test_input_config COMMAND test_input_config)
+
+    # The session (design-session-and-wm Part 1): health levels, logind session discovery,
+    # the control socket, lumen-session against a fake systemctl.
+    add_executable(test_health tests/test_health.cpp)
+    target_link_libraries(test_health PRIVATE lx.health)
+    lumen_apply_module_properties(test_health)
+    target_include_directories(test_health PRIVATE tests)
+    add_test(NAME test_health COMMAND test_health)
+
+    add_executable(test_session_discovery tests/test_session_discovery.cpp)
+    target_link_libraries(test_session_discovery PRIVATE lx.session)
+    lumen_apply_module_properties(test_session_discovery)
+    lumen_link_platform(test_session_discovery)
+    target_include_directories(test_session_discovery PRIVATE tests)
+    add_test(NAME test_session_discovery COMMAND test_session_discovery)
+
+    if(LUMEN_HAS_VARLINK)
+        add_executable(test_control tests/test_control.cpp)
+        target_link_libraries(test_control PRIVATE lx.compositor)
+        lumen_apply_module_properties(test_control)
+        lumen_link_platform(test_control)
+        target_include_directories(test_control PRIVATE tests)
+        add_test(NAME test_control COMMAND test_control)
+        set_tests_properties(test_control PROPERTIES TIMEOUT 60)
+    endif()
+
+    add_test(NAME test_lumen_session
+        COMMAND bash "${CMAKE_SOURCE_DIR}/tests/test_lumen_session.sh" "${CMAKE_SOURCE_DIR}"
+                "${CMAKE_BINARY_DIR}/test_lumen_session")
+    set_tests_properties(test_lumen_session PROPERTIES TIMEOUT 60)
 
     add_executable(test_logf tests/test_logf.cpp)
     target_link_libraries(test_logf PRIVATE lx.trace)
@@ -538,11 +661,18 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_idle_notify COMMAND test_idle_notify)
 
     add_executable(test_keybindings tests/test_keybindings.cpp)
-    target_link_libraries(test_keybindings PRIVATE lx.compositor lx.input)
+    target_link_libraries(test_keybindings PRIVATE lx.compositor lx.input lx.config)
     lumen_apply_module_properties(test_keybindings)
     lumen_link_platform(test_keybindings)
     target_include_directories(test_keybindings PRIVATE tests)
     add_test(NAME test_keybindings COMMAND test_keybindings)
+
+    add_executable(test_workspaces tests/test_workspaces.cpp)
+    target_link_libraries(test_workspaces PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_workspaces)
+    lumen_link_platform(test_workspaces)
+    target_include_directories(test_workspaces PRIVATE tests)
+    add_test(NAME test_workspaces COMMAND test_workspaces)
 
     add_executable(test_toplevel_icon tests/test_toplevel_icon.cpp)
     target_link_libraries(test_toplevel_icon PRIVATE lx.compositor)
@@ -734,7 +864,7 @@ if(LUMEN_BUILD_TESTS)
 
     # lumen-shell's launcher: desktop entries, the catalog, launching, the launcher layout.
     foreach(shell_test test_desktop_entry test_app_catalog test_app_launch test_launcher_layout
-                       test_background)
+                       test_background test_switcher test_notifications test_tray)
         add_executable(${shell_test} tests/${shell_test}.cpp)
         target_link_libraries(${shell_test} PRIVATE lx.shell)
         lumen_apply_module_properties(${shell_test})
@@ -762,6 +892,14 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_protocol_conformance COMMAND test_protocol_conformance)
     # design-app-compat-capture Part B: dialogs, icons, bell, xdg-foreign, shortcuts
     # inhibition, data control, security context — in-process, as above.
+    add_executable(test_ext_workspace tests/test_ext_workspace.cpp)
+    target_link_libraries(test_ext_workspace PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_ext_workspace)
+    lumen_link_platform(test_ext_workspace)
+    target_include_directories(test_ext_workspace PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_ext_workspace COMMAND test_ext_workspace)
+    set_tests_properties(test_ext_workspace PROPERTIES TIMEOUT 60)
+
     add_executable(test_window_protocols tests/test_window_protocols.cpp)
     target_link_libraries(test_window_protocols PRIVATE lx.compositor)
     lumen_apply_module_properties(test_window_protocols)
@@ -939,9 +1077,14 @@ if(LUMEN_BUILD_TESTS)
         "LSAN_OPTIONS=detect_leaks=0"
         "UBSAN_OPTIONS=${LUMEN_UBSAN_OPTS}")
 
+    if(TARGET test_control)
+        set_tests_properties(test_control PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+    endif()
+    set_tests_properties(test_health test_session_discovery
+        PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
     set_tests_properties(test_result test_snapshot test_scene_outputs test_damage_region test_wm_geometry
         test_surface_tree test_positioner test_layer_arrange test_xcursor
-        test_data_transfer test_input_serials test_session_pause test_keybindings
+        test_data_transfer test_input_serials test_session_pause test_keybindings test_workspaces
         test_viewport_geometry test_presentation_feedback
         test_dnd_grab test_output_membership test_liveness
         test_activation_policy
@@ -952,6 +1095,7 @@ if(LUMEN_BUILD_TESTS)
         test_output_management_contract
         test_task_model test_shell_bridge
         test_desktop_entry test_app_catalog test_app_launch test_launcher_layout test_background
+        test_switcher test_notifications test_tray
         test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
         test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
         test_cvt test_output_management test_output_config_store
@@ -990,6 +1134,13 @@ if(LUMEN_BUILD_FUZZERS)
                 -max_total_time=10 -rss_limit_mb=2048)
     set_tests_properties(fuzz_wayland_dispatch_smoke PROPERTIES TIMEOUT 120
         ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+endif()
+
+# No test reads the user's configuration file (~/.config/lumen/config.toml): every test
+# starts from the defaults unless it points LUMEN_CONFIG at a file of its own.
+get_property(_lumen_tests DIRECTORY PROPERTY TESTS)
+if(_lumen_tests)
+    set_property(TEST ${_lumen_tests} APPEND PROPERTY ENVIRONMENT "LUMEN_CONFIG=0")
 endif()
 
 message(STATUS "Lumen ${PROJECT_VERSION} — C++${CMAKE_CXX_STANDARD} — ${CMAKE_CXX_COMPILER_ID}")

@@ -23,15 +23,21 @@ Interfaces in `protocols/lumen/zlm_shell_v1.xml`:
 
 | Interface | Role |
 |-----------|------|
-| `zlm_shell_v1` | Root (version 6); exposes workspace manager, policy bridge, window rules; logout (v3); key grabs (v4); the session lock's `lock_state` and `lock_requested` (v5); `capture_state` (v6) |
+| `zlm_shell_v1` | Root (version 7); exposes workspace manager, policy bridge, window rules; logout (v3); key grabs (v4); the session lock's `lock_state` and `lock_requested` (v5); `capture_state` (v6); the configuration (`config` memfd, `config_diagnostic`, `config_done`) and shell actions from the compositor's bindings (`action`), held actions (`held_action`) (v7) |
+| `zlm_held_action_v1` | A hold on the keyboard while a held binding's modifier is down (v7, the window switcher): `key(keysym, modifiers, binding, serial, time)`, `released`, `cancelled`; `destroy` ends it |
 | `zlm_key_grab_v1` | A key combination held by the shell (v4): `activated(serial, time)`, `refused(reason)`; the `not_inhibitable` flag (v6) |
 | `zlm_toplevel_v1` | Compositor-owned handle for mapped xdg toplevels |
-| `zlm_workspace_manager_v1` / `zlm_workspace_v1` | Virtual desktops |
-| `zlm_policy_bridge_v1` | Shell intent → compositor execution (focus, geometry, stacking); v6: window icons (sealed memfds), parents, the bell |
+| `zlm_workspace_manager_v1` / `zlm_workspace_v1` | Deprecated (v7), never implemented: workspaces are ext-workspace-v1's |
+| `zlm_policy_bridge_v1` | Shell intent → compositor execution (focus, geometry, stacking); v6: window icons (sealed memfds), parents, the bell; v7: `toplevel_workspace` (the window's workspace as the shell's `ext_workspace_handle_v1`), the `sticky` flag, `minimized` state |
 | `zlm_window_rules_v1` | Session window rules (config-driven) |
 
 Key design points:
 
+- **ext-workspace-v1 is required by zlm** — v7's `toplevel_workspace` names an
+  `ext_workspace_handle_v1`, so the zlm glue links ext-workspace's interface tables and
+  ext-workspace-v1 is a P0 protocol in `manifest.toml` (fetched by `fetch-protocols.sh` like
+  the other staging protocols). The compositor serves it to every unsandboxed client; the
+  shell's workspace indicator is one of them.
 - **`zlm_toplevel_v1`** — compositor-owned handle (shell never uses client `xdg_toplevel`)
 - **State sync** — `snapshot_*` batch on bind, then delta events
 - **Stacking** — `set_toplevel_stacking_index` (valid Wayland IDL)

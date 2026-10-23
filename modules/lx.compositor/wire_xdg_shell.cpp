@@ -255,7 +255,13 @@ const struct xdg_toplevel_interface xdg_toplevel_impl = {
             if (auto* t = toplevel_of(resource); t && t->id && t->ctx && t->ctx->wm)
                 t->ctx->wm->set_fullscreen(t->id, false, -1, "client");
         },
-    .set_minimized = [](struct wl_client*, struct wl_resource*) {},
+    // Hidden until activated (the panel, the switcher, xdg-activation); it keeps its
+    // workspace (design-session-and-wm W.3).
+    .set_minimized =
+        [](struct wl_client*, struct wl_resource* resource) {
+            if (auto* t = toplevel_of(resource); t && t->id && t->ctx && t->ctx->wm)
+                t->ctx->wm->set_minimized(t->id, true, "client");
+        },
 };
 
 } // namespace
@@ -643,18 +649,19 @@ void wm_send_configure(void* toplevel_res, void* xdg_surface_res,
 
     // A wl_array over stack storage, never released: wl_array_add would reallocate per
     // configure, and a resize sends one per frame.
-    uint32_t storage[8];
+    uint32_t storage[12];
     wl_array array{};
     array.data = storage;
     array.alloc = sizeof(storage);
     array.size = 0;
 
-    // Maximize and fullscreen: Lumen has no window menu or minimize yet, and a CSD client
+    // Maximize, fullscreen and minimize: Lumen has no window menu yet, and a CSD client
     // hides the buttons it is told the compositor does not honour.
     if (initial && version >= XDG_TOPLEVEL_WM_CAPABILITIES_SINCE_VERSION) {
         storage[0] = XDG_TOPLEVEL_WM_CAPABILITIES_MAXIMIZE;
         storage[1] = XDG_TOPLEVEL_WM_CAPABILITIES_FULLSCREEN;
-        array.size = 2 * sizeof(uint32_t);
+        storage[2] = XDG_TOPLEVEL_WM_CAPABILITIES_MINIMIZE;
+        array.size = 3 * sizeof(uint32_t);
         xdg_toplevel_send_wm_capabilities(tl, &array);
         array.size = 0;
     }
@@ -674,6 +681,18 @@ void wm_send_configure(void* toplevel_res, void* xdg_surface_res,
     if ((c.states & lx::compositor::tl_suspended) &&
         version >= XDG_TOPLEVEL_STATE_SUSPENDED_SINCE_VERSION)
         storage[n++] = XDG_TOPLEVEL_STATE_SUSPENDED;
+    // A snapped window (design-session-and-wm K.3): the tiled edges, xdg_wm_base v2+.
+    if ((c.states & lx::compositor::tl_tiled_all) &&
+        version >= XDG_TOPLEVEL_STATE_TILED_LEFT_SINCE_VERSION) {
+        if (c.states & lx::compositor::tl_tiled_left)
+            storage[n++] = XDG_TOPLEVEL_STATE_TILED_LEFT;
+        if (c.states & lx::compositor::tl_tiled_right)
+            storage[n++] = XDG_TOPLEVEL_STATE_TILED_RIGHT;
+        if (c.states & lx::compositor::tl_tiled_top)
+            storage[n++] = XDG_TOPLEVEL_STATE_TILED_TOP;
+        if (c.states & lx::compositor::tl_tiled_bottom)
+            storage[n++] = XDG_TOPLEVEL_STATE_TILED_BOTTOM;
+    }
     array.size = n * sizeof(uint32_t);
     xdg_toplevel_send_configure(tl, c.size.width, c.size.height, &array);
     if (decoration_res)

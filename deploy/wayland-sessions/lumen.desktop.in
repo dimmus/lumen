@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Lumen
+Comment=The Lumen desktop: a Wayland compositor and its shell
+# lumen-session sets XDG_CURRENT_DESKTOP=Lumen and XDG_SESSION_DESKTOP=lumen when the display
+# manager has not (DesktopNames= is not a Desktop Entry key: desktop-file-validate rejects it).
+Exec=@LUMEN_BINDIR@/lumen-session
+TryExec=@LUMEN_BINDIR@/lumen-session
+Type=Application

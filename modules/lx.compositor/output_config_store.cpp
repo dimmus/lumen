@@ -16,7 +16,7 @@ import std;
 
 import lx.foundation;
 import lx.trace;
-import :toml_lite;
+import lx.config;
 import :output_config_store;
 
 namespace lx::compositor {
