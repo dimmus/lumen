@@ -243,7 +243,7 @@ public:
     void close_surface(lx::surface_id surface);
     static constexpr unsigned k_max_outputs = 16;
 
-    /// The zone hold (ADR 010 S6): when a mapped surface of the client given here — the
+    /// The zone hold (ADR 011 S6): when a mapped surface of the client given here — the
     /// shell — is destroyed while its output still exists (the shell crashed, or was stopped
     /// to be restarted; a logout clears the client first), the exclusive zone it reserved
     /// stays in the usable area until `release_zone_hold`, or until a surface with an
@@ -929,7 +929,7 @@ void lx::compositor::layer_shell::destroy(lx::surface_id surface) {
     const bool participated = r->initial_commit_seen && !r->closed;
     const unsigned output = r->output;
     // The shell's panel going away other than at a logout (a crash, a stop for a restart),
-    // and not because its output went: its zone is held (ADR 010 S6).
+    // and not because its output went: its zone is held (ADR 011 S6).
     if (r->mapped && !r->closed && hold_client_ && r->client_native == hold_client_)
         hold_zone_of(*r);
     if (r->mapped)

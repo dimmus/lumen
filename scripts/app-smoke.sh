@@ -100,7 +100,7 @@
 #        renamed live, and the redraw damages that entry only
 #     E4 a window's client exits: its entry is removed
 #     E5 the shell is stopped and started again: the bridge goes, the compositor holds the
-#        panel's strip (the zone hold, ADR 010: the usable area never returns to the whole
+#        panel's strip (the zone hold, ADR 011: the usable area never returns to the whole
 #        output) until the new panel maps, a new snapshot lists the current windows (in the
 #        order the old panel showed them), the panel comes back
 #     E6 a copy of lumen-shell at another path is refused at bind (exit 1; the compositor's
@@ -4721,7 +4721,7 @@ if s is not None:
     draws = [m for l in sh if (m := SDRAW.search(l))]
     # The snapshot is in creation order: the restarted panel lists what the old one did.
     before, after = layout_titles(SH1), layout_titles(sh)
-    # The zone hold (ADR 010 S6): the dead shell's strip stays reserved until the new panel
+    # The zone hold (ADR 011 S6): the dead shell's strip stays reserved until the new panel
     # maps, so the usable area never becomes the whole output in between (and, unchanged, is
     # not logged again: `usable y=32 again` is informational).
     i_hold = next((k for k, l in enumerate(lines_) if "compositor.layer: zone hold on output" in l), None)

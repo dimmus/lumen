@@ -3,7 +3,7 @@ sequenceDiagram
     participant C as lumen-compositor (keybindings, router)
     participant A as focused application
     participant S as lumen-shell (switcher)
-    Note over C,S: design-session-and-wm K.1–K.2, ADR 010 K2
+    Note over C,S: design-session-and-wm K.1–K.2, ADR 011 K2
     U->>C: Alt press
     C->>A: wl_keyboard.key(Alt) + modifiers (forwarded)
     U->>C: Tab press (Alt held)

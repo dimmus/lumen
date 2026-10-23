@@ -15,7 +15,7 @@ module;
 // view (an overlay layer surface, centred on the focused window's output) appears only once
 // the hold has lasted `open-delay` (150 ms, GNOME's and niri's). No thumbnails: a capture
 // readback per window costs ~12 ms each on this hardware class; a compositor-drawn mirror is
-// the designed follow-up (ADR 010).
+// the designed follow-up (ADR 011).
 //
 // The model and the layout are pure (tests/test_switcher.cpp); the view is the only part
 // with Wayland in it. Shell thread only; nothing allocates while the hold lasts beyond the

@@ -5,11 +5,11 @@
 The session's health report: which parts of the compositor work, the processes of the
 session, memory, and how well each output keeps its frame pace — aggregated into one
 `health_report` with one level. `lumen-ctl status` shows it; the control socket's
-`GetHealth` returns it (ADR 010 S8).
+`GetHealth` returns it (ADR 011 S8).
 
 **Related:** [architecture.md](../architecture.md) §10 · [memory-management.md](memory-management.md) ·
 [rendering-performance.md](rendering-performance.md) · [errors-and-logging.md](errors-and-logging.md) ·
-[ADR 010](../adr/010-session-and-window-management.md)
+[ADR 011](../adr/011-session-and-window-management.md)
 
 ---
 

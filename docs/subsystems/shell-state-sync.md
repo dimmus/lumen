@@ -169,7 +169,7 @@ of the active output. Super+L (with a lock command) is grabbed `not_inhibitable`
 
 ### Version 7: the configuration and actions
 
-The compositor reads, watches and validates `config.toml` (ADR 010 Part 2); the shell is
+The compositor reads, watches and validates `config.toml` (ADR 011 Part 2); the shell is
 handed what it read, and the key bindings are the compositor's:
 
 - **`config(fd, size, generation)`** — a sealed, read-only memfd of the accepted bytes: the
@@ -204,7 +204,7 @@ version 7.
 
 ### Version 7: workspaces (ext-workspace-v1 and membership)
 
-Workspaces are the compositor's (ADR 010 Part 3) and are served as the public
+Workspaces are the compositor's (ADR 011 Part 3) and are served as the public
 **ext-workspace-v1**: one group per output, its workspaces with name, position and state,
 `activate` and (dynamic mode) `assign`. lumen-shell binds `ext_workspace_manager_v1` in the
 same registry round trip as `zlm_shell_v1`, so before `get_policy_bridge`, and its panel
@@ -236,7 +236,7 @@ interface tables).
 
 ### Version 7: held actions (the window switcher)
 
-A binding of a **held** action (`switcher.next`, `switcher.previous`, `-app`; ADR 010 K2) is
+A binding of a **held** action (`switcher.next`, `switcher.previous`, `-app`; ADR 011 K2) is
 not sent as `action` but as **`zlm_shell_v1.held_action(id, action, argument, serial,
 time)`**, which creates a `zlm_held_action_v1` — a hold on the keyboard for as long as the
 binding's primary modifier (its highest: Super, Alt, Ctrl, Shift) is down:
@@ -413,9 +413,9 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   compositor exits 1, and `lumen-shell.service` (`Restart=on-failure`, 300 ms, at most 5
   times in 30 s; run-desktop.sh the same in its direct mode) starts it again. The new bridge
   gets the snapshot of every window; until the new panel maps (5 s at most) the compositor
-  keeps the dead shell's exclusive zones (the zone hold, ADR 010 S6), and the bind is logged
+  keeps the dead shell's exclusive zones (the zone hold, ADR 011 S6), and the bind is logged
   `bridge bound client=… snapshot=<n> focus=… pid=… binds=<n since start>`. A `closed` panel (its output went away) is destroyed; the shell runs on.
-- **Window switcher** (`lx.shell:switcher`, ADR 010 K1). A hold begins a session over the
+- **Window switcher** (`lx.shell:switcher`, ADR 011 K1). A hold begins a session over the
   task model's **most-recently-used order** (`task_model::mru`: a snapshot seeds it from the
   stacking order, top first; each `focus_changed` moves that window to the front; under
   `focus.mode = "sloppy"` a focus shorter than 750 ms that moved on does not count, unless the
@@ -494,7 +494,7 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   focus and stacking policy ever separate). The pointer shape is `default` through
   `wp_cursor_shape_v1` on enter.
 - **Notifications and the tray** (`lx.shell:user_bus`, `:notifications`, `:notify_view`,
-  `:menu_popup`, `:tray`; ADR 010 Part 5). Not part of the zlm protocol: the shell is an
+  `:menu_popup`, `:tray`; ADR 011 Part 5). Not part of the zlm protocol: the shell is an
   ordinary D-Bus service (`org.freedesktop.Notifications`, `org.kde.StatusNotifierWatcher`)
   and an ordinary layer-shell client for its popups (`lumen-notifications`, on the output of
   the task model's focused window), with xdg_popups of the panel for menus and tooltips (it

@@ -124,7 +124,7 @@ Foundation → Runtime → Platform → Graphics → Compositor → Desktop → 
 **Shell decides intent → compositor executes state.** Wire format:
 `zlm_policy_bridge_v1` (see shell-state-sync doc).
 
-Refinement ([ADR 010](docs/adr/010-session-and-window-management.md)): the key → action
+Refinement ([ADR 011](docs/adr/011-session-and-window-management.md)): the key → action
 mapping is user configuration the compositor interprets, so window and workspace actions keep
 working while the shell restarts; `shell.*` actions are forwarded to the shell. Workspaces are
 compositor state served as `ext-workspace-v1`; the shell's indicator is a client of it. Every UI

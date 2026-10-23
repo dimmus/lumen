@@ -421,7 +421,7 @@ warp is a synthetic motion on UI.
 | Completions | render → UI | `capture_channel` again; render posts one UI task when it has some (and `tick_ui` drains them first). A GPU copy's or read-back's native fence goes to the readiness poller (one `fd_source`, keys above every content-update index); its wake sends `ready`, or posts the read-back's copy-out job back to render |
 | Lock | UI → render | A lock request bumps an atomic epoch; render cancels a content job issued in an older epoch instead of running it (it would copy a frame from before the lock), and UI decides again a completion carrying an older epoch (a worker read that finished after the request) |
 
-### Session, control socket and health (ADR 010)
+### Session, control socket and health (ADR 011)
 
 | Step | Thread | What |
 |------|--------|------|
@@ -431,7 +431,7 @@ warp is a synthetic motion on UI.
 | Watchdog | UI, render heartbeat | After each loop iteration the UI thread pings when a quarter of `WatchdogSec` passed, only if `render_ticks_` moved since the last ping or the render thread is not inside a tick (`render_in_tick_`, two relaxed stores per render tick). The control source's timeout carries the next ping only if nothing else wakes the loop first |
 | Signals | any → UI | SIGHUP sets an atomic and wakes the loop (`request_reload`); RELOADING/READY are sent from the UI thread |
 
-### Configuration (ADR 010 Part 2)
+### Configuration (ADR 011 Part 2)
 
 | Step | Thread | What |
 |------|--------|------|
@@ -442,7 +442,7 @@ warp is a synthetic motion on UI.
 | Report | UI | Once the generation's jobs are done: the log, the shell's zlm v7 events, the control socket's Reload replies, READY after SIGHUP. A reload asked for meanwhile runs after it, and its Reload replies and READY come from that later generation (they must see the files as they were when asked) |
 | Without a worker | UI | (`worker_thread_count` 0, or before the threads start) the jobs run inline |
 
-### Workspaces (ADR 010 Part 3)
+### Workspaces (ADR 011 Part 3)
 
 Everything is UI-affinity and event-driven: the workspace model (`:workspaces`, fixed
 tables), the window manager's visibility changes (a tree container's `set_visible`, damage,
@@ -454,7 +454,7 @@ only sees fewer visible nodes in the snapshots it reads. A capture view still dr
 window's tree (`build_draw_list_into`, UI), and a hidden window's commits damage only the
 capture views.
 
-### Switching and snapping (ADR 010 Part 4)
+### Switching and snapping (ADR 011 Part 4)
 
 UI affinity throughout. A held action is a `keybindings` field and a `zlm_held_action_v1`
 resource; diverted keys go out from `on_input_key`, their repeat rides the binding-repeat
@@ -466,7 +466,7 @@ texture). Keyboard grabs warp the pointer through the compositor's `warp_pointer
 cursor, then the window manager's motion path). In lumen-shell the switcher is part of its one
 thread: a timerfd slot for the open delay, the view's buffers allocated when it opens.
 
-### Notifications and the tray (ADR 010 Part 5)
+### Notifications and the tray (ADR 011 Part 5)
 
 lumen-shell's one thread again; the compositor is not involved beyond its existing
 protocols. The user bus is one `sd_bus` whose fd joins the shell's `ppoll` set (its reply

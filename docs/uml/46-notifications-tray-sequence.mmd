@@ -4,7 +4,7 @@ sequenceDiagram
     participant S as lumen-shell (user_bus, notifications, tray)
     participant C as lumen-compositor
     participant Item as tray item (StatusNotifierItem)
-    Note over S,C: design-session-and-wm N.1–N.6, ADR 010 Part 5
+    Note over S,C: design-session-and-wm N.1–N.6, ADR 011 Part 5
     S->>Bus: (after the first panel frame) RequestName org.freedesktop.Notifications, org.kde.StatusNotifierWatcher (queued, no replace)
     App->>Bus: Notify(app, replaces_id, icon, summary, body, actions, hints, timeout)
     Bus->>S: Notify — answered inline with the id

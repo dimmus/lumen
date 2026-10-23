@@ -1,4 +1,4 @@
-# ADR 010 — The login session and everyday window management
+# ADR 011 — The login session and everyday window management
 
 **Status:** Accepted — implemented: Part 1 (the session), Part 2 (the configuration file
 and key bindings), Part 3 (workspaces, minimize, sticky), Part 4 (switching and snapping)

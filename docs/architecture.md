@@ -156,7 +156,7 @@ Acts as a **privileged Wayland client**:
   restarted shell gets the snapshot of every window again; until its panel maps (5 s at
   most) the compositor keeps the dead shell's exclusive zones in the usable areas (the
   **zone hold**), so maximized windows do not grow into the panel's strip and back (§10,
-  ADR 010 S6)
+  ADR 011 S6)
 - Uses **`zlm_policy_bridge_v1`** for window-management intent ↔ compositor execution: a
   task model fed by the snapshot and deltas, and requests (`request_raise` +
   `request_activate` on a panel click)
@@ -199,14 +199,14 @@ Acts as a **privileged Wayland client**:
   serial (`XDG_ACTIVATION_TOKEN`, `DESKTOP_STARTUP_ID`), so it takes the keyboard.
   Super+Return starts a terminal (`$TERMINAL`, `xdg-terminal-exec`, or the preferred
   TerminalEmulator entry)
-- Is the **notification server** (`:notifications`, `:notify_view`, ADR 010 N1–N4):
+- Is the **notification server** (`:notifications`, `:notify_view`, ADR 011 N1–N4):
   `org.freedesktop.Notifications` (spec 1.2: actions with `ActivationToken`, urgency,
   timeouts, `replaces_id`, image data and paths, the body-markup subset with links, close
   reasons, `persistence`) on the user bus, its popups one layer surface on the focused
   window's output (`top`, `overlay` while a critical one shows; never over the lock: they
   wait for the unlock), do-not-disturb (manual, and automatic while the screen is captured),
   and the history behind the panel's bell
-- Is the **tray** (`:tray`, `:menu_popup`, ADR 010 N5–N6): the `StatusNotifierWatcher` and a
+- Is the **tray** (`:tray`, `:menu_popup`, ADR 011 N5–N6): the `StatusNotifierWatcher` and a
   host, the items' icons in the panel left of the bell, tooltips, Activate (with an
   activation token) / SecondaryActivate / Scroll, and `com.canonical.dbusmenu` menus as
   keyboard-navigable xdg_popups of the panel
@@ -217,9 +217,9 @@ Acts as a **privileged Wayland client**:
   idle
 - Executes **shell actions** the compositor's binding table sends (zlm_shell_v1 v7
   `action`): `shell.launcher` (the Super tap), `shell.terminal` (Super+Return), `shell.lock`
-  (Super+L) — which key does what is the user's configuration (ADR 010 C4). Against a v4–v6
+  (Super+L) — which key does what is the user's configuration (ADR 011 C4). Against a v4–v6
   compositor it registers its own key grabs (`grab_key`) as before
-- Runs the **window switcher** (`:switcher`, ADR 010 K1–K2): Alt+Tab gives it a hold
+- Runs the **window switcher** (`:switcher`, ADR 011 K1–K2): Alt+Tab gives it a hold
   (zlm_shell_v1 v7 `held_action`) — the keys while Alt is down, the focused window keeping the
   keyboard — over the task model's most-recently-used order; a quick Alt+Tab switches without
   drawing anything, a held one shows an overlay-layer view (icons, the selected window's
@@ -1315,12 +1315,12 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
    key; with neither the key is the client's.
 2. The window manager's own (Escape during a move, resize or drag; every press during a
    keyboard move or resize, `window.move-keyboard` / `window.resize-keyboard`).
-2b. **A held action** (ADR 010 K2): while a hold exists (a `switcher.*` binding fired) and its
+2b. **A held action** (ADR 011 K2): while a hold exists (a `switcher.*` binding fired) and its
    primary modifier is down, every key press goes to the shell's `zlm_held_action_v1` as
    `key` (with the action the user's binding of that key names) instead of the focused
    client; modifier presses and releases still reach the client. Letting go of the modifier
    sends `released`; lock, a VT switch and a move, resize or drag cancel it.
-3. **Configured bindings** (`config.toml [bindings]`, ADR 010 C4): exact modifiers, the key
+3. **Configured bindings** (`config.toml [bindings]`, ADR 011 C4): exact modifiers, the key
    at its first level as for grabs below; not during a grab or drag, not while paused; while
    locked only `allow-when-locked` ones (lock-safe actions), while inhibited only
    `allow-when-inhibited` ones; bindings to shell actions only while a zlm v7 shell is bound
@@ -1353,7 +1353,7 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
 ### Configuration
 
 One file, `$XDG_CONFIG_HOME/lumen/config.toml`, over `$XDG_CONFIG_DIRS/lumen/config.toml`, key
-by key over the defaults (ADR 010 Part 2; `deploy/lumen/config.toml` documents every key).
+by key over the defaults (ADR 011 Part 2; `deploy/lumen/config.toml` documents every key).
 `lx.config` is the schema and the parser; the compositor alone reads and watches the files:
 
 - **Reading.** At start-up before input and the cursor are set up (generation 1), then on a
@@ -1379,7 +1379,7 @@ by key over the defaults (ADR 010 Part 2; `deploy/lumen/config.toml` documents e
 `:workspaces` (`workspace_model`, pure, UI affinity, fixed tables: 64 workspaces, 16 per
 output) holds every output's ordered list and its active workspace; the window manager owns
 it and is its only caller, and each window's membership is `toplevel_record::workspace`
-(ADR 010 Part 3).
+(ADR 011 Part 3).
 
 - **Model.** Dynamic by default — one empty workspace always last, an empty inactive one
   goes, names are positions — or static (`count`, `names`). Index bindings act on the
@@ -1407,7 +1407,7 @@ it and is its only caller, and each window's membership is `toplevel_record::wor
 
 ### Snapping and the window switcher
 
-(ADR 010 Part 4.) **Snapping** is window-manager state like maximize:
+(ADR 011 Part 4.) **Snapping** is window-manager state like maximize:
 `toplevel_record::snap` holds the half or quarter (`edge_*` bits) a window was asked into;
 `window_manager::snap_by_key` runs Windows 11's Super+arrow table (`next_snap`, pure; across
 to the neighbouring output at the far edge) and `set_snap` applies it — one configure with
@@ -2047,7 +2047,7 @@ and virtual keyboard (`zwp_text_input_manager_v3` stays public); see above. The 
 locker that dies leaves the session locked, and only another locker or logind's
 polkit-gated `Unlock` can end it.
 
-**The control socket (ADR 010, S7).** `$XDG_RUNTIME_DIR/<display>.varlink` is created with
+**The control socket (ADR 011, S7).** `$XDG_RUNTIME_DIR/<display>.varlink` is created with
 mode 0600 next to the Wayland socket, after it (the display's `.lock`, which libwayland
 holds, proves the name is this compositor's; a stale file is replaced), and served with
 `SD_VARLINK_SERVER_MYSELF_ONLY`: sd-varlink refuses a peer whose UID is not the
@@ -2057,7 +2057,7 @@ exposed into a sandbox). It can log the session out and act on the focused windo
 the user's own keys can do — and nothing else: it reads no pixels (screenshots stay with
 the portals and their capture indicator).
 
-**The shell on the user bus (ADR 010, N1–N6).** lumen-shell owns
+**The shell on the user bus (ADR 011, N1–N6).** lumen-shell owns
 `org.freedesktop.Notifications`, `org.kde.StatusNotifierWatcher` and
 `org.kde.StatusNotifierHost-<pid>` on the session bus, without replacing an owner (a running
 mako or KDE watcher keeps its name; the shell waits in the queue). What it accepts from
@@ -2086,7 +2086,7 @@ manager through `share/wayland-sessions/lumen.desktop`. With a systemd user mana
 imports the login's environment into the manager (recording what it changes), runs
 `systemctl --user --wait start lumen-compositor.service`, and when that returns starts
 `lumen-shutdown.target` and puts the manager's environment back exactly as it was
-(ADR 010, design-session-and-wm Part S). Nothing is enabled: the compositor's unit pulls in
+(ADR 011, design-session-and-wm Part S). Nothing is enabled: the compositor's unit pulls in
 the rest.
 
 ```mermaid
@@ -2126,7 +2126,7 @@ find the environment already there.
 
 **The shell** is supervised by systemd; a crashed shell is back in about 300 ms with the
 compositor's snapshot of every window, and the compositor holds the panel's strip meanwhile
-(§2.2, ADR 010 S6).
+(§2.2, ADR 011 S6).
 
 **The end.** A logout closes every window (5 s at most) and stops the compositor
 (`STOPPING=1` first); the compositor unsets its variables and releases the session (logind
@@ -2238,4 +2238,4 @@ returning `not_implemented` until P0 lands.
 | dmabuf / Vulkan | [subsystems/dmabuf-vulkan-import.md](subsystems/dmabuf-vulkan-import.md) |
 | UI architecture | [subsystems/ui-architecture.md](subsystems/ui-architecture.md) |
 | Protocol registry | [../protocols/README.md](../protocols/README.md) |
-| Login session, control socket, health export | [adr/010-session-and-window-management.md](adr/010-session-and-window-management.md) |
+| Login session, control socket, health export | [adr/011-session-and-window-management.md](adr/011-session-and-window-management.md) |

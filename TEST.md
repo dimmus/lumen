@@ -366,7 +366,7 @@ serial wraparound, the lifetime boundary, and the token table (exact-text lookup
 `forget_surface`, single use, eviction of the oldest and of an expired token) and the token
 text (32 lowercase hex characters, 10 000 unique).
 
-# The login session, end to end (~1 min; ADR 010, design-session-and-wm T.3)
+# The login session, end to end (~1 min; ADR 011, design-session-and-wm T.3)
 ./scripts/session-smoke.sh                 # from the console or SSH; --watchdog adds the watchdog run
 
 Installs the build into a scratch prefix (`--prefix`, default `<build>/session-smoke-prefix`;
@@ -390,7 +390,7 @@ systemd and the session ends cleanly (lumen-session: `Lumen exited: watchdog`). 
 wants a second configuration generation logged before `systemctl --user reload` returns
 (READY comes once the reload is applied).
 
-# The configuration file (ADR 010 Part 2, design-session-and-wm T.1, T.3)
+# The configuration file (ADR 011 Part 2, design-session-and-wm T.1, T.3)
 ./scripts/app-smoke.sh --join-seat-session --countdown 0 --only R   # ~40 s
 
 app-smoke's compositor runs with `LUMEN_CONFIG=<logs>/R-config/config.toml` (absent until
@@ -432,7 +432,7 @@ Super+Return as `action shell.terminal` with the shell's key-press serial, a Sup
 `shell.launcher`), `test_control` (Reload answered with its diagnostics). ctest runs every
 test with `LUMEN_CONFIG=0`.
 
-# Workspaces (ADR 010 Part 3, design-session-and-wm W, T.3 group Q)
+# Workspaces (ADR 011 Part 3, design-session-and-wm W, T.3 group Q)
 ./scripts/app-smoke.sh --join-seat-session --countdown 0 --only Q   # ~60 s
 ./scripts/monitor-smoke.sh --join-seat-session --countdown 0 --only add,workspaces
 
@@ -471,7 +471,7 @@ workspace, the `workspace` event), `test_window_protocols` (a sandboxed client d
 ext_workspace_manager_v1), `test_config` (the workspace and minimize default bindings).
 
 ```bash
-# Switching and snapping (ADR 010 Part 4, design-session-and-wm K, T.3)
+# Switching and snapping (ADR 011 Part 4, design-session-and-wm K, T.3)
 ./scripts/app-smoke.sh --join-seat-session --countdown 0 --only O                # ~45 s
 ./scripts/app-smoke.sh --join-seat-session --countdown 0 --only O --scale 1.25   # fractional
 ./scripts/monitor-smoke.sh --join-seat-session --countdown 0 --only add,snap
@@ -521,7 +521,7 @@ shell ending the hold gives the keys back at once), `test_config` (the Part 4 de
 bindings, a held action without a modifier refused).
 
 ```bash
-# Notifications and the tray (ADR 010 Part 5, design-session-and-wm N, T.3)
+# Notifications and the tray (ADR 011 Part 5, design-session-and-wm N, T.3)
 sudo pacman -S --needed libnotify                                              # notify-send
 ./scripts/app-smoke.sh --join-seat-session --countdown 0 --only N                # ~60 s
 ./scripts/monitor-smoke.sh --join-seat-session --countdown 0 --only add,notify
