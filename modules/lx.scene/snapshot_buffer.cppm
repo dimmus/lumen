@@ -84,8 +84,37 @@ public:
     // takes from `orders().assign(bounds)`. `bounds` is the clipped output-pixel rect, what
     // the batch bounds are the union of. Overflow: past `gfx::k_max_primitives` the
     // primitive is dropped (`drop_oldest` is not offered for instances; it drops too).
-    void push_quad(const lx::gfx::quad_instance& q, lx::rect2i bounds, std::uint32_t order,
-                   lx::runtime::overflow_action overflow = lx::runtime::overflow_action::warn_and_drop);
+    inline void push_quad(const lx::gfx::quad_instance& q, lx::rect2i bounds,
+                          std::uint32_t order,
+                          lx::runtime::overflow_action overflow =
+                              lx::runtime::overflow_action::warn_and_drop) {
+        if (lx::gfx::quad_instance* slot = append_quad(bounds, order, overflow))
+            *slot = q;
+    }
+    /// `push_quad` without the copy: the instance slot to fill (every byte of it — its old
+    /// contents are undefined), or null when the cap dropped it. Inline while the arrays
+    /// have room, which is every steady frame: a UI emits thousands a frame from another
+    /// module, and a call and a staged 80-byte copy each are a measurable share of G3.
+    [[nodiscard]] inline lx::gfx::quad_instance*
+    append_quad(lx::rect2i bounds, std::uint32_t order,
+                lx::runtime::overflow_action overflow = lx::runtime::overflow_action::warn_and_drop) {
+        // Locals, not members, between the stores: the arrays are `uint32_t` too, so the
+        // compiler must otherwise reload every count after every store.
+        const unsigned n = primitive_count_;
+        const unsigned index = quads_.count;
+        if (n < ref_capacity_ && n < lx::gfx::k_max_primitives && index < quads_.capacity)
+            [[likely]] {
+            refs_[n] = {order, lx::gfx::primitive_kind::quad, 0, 0, index};
+            ref_bounds_[n] = bounds;
+            ref_draw_pos_[n] = count_;
+            quads_.count = index + 1;
+            primitive_count_ = n + 1;
+            ref_count_ = n + 1;
+            stream_live_ = true;
+            return quads_.items + index;
+        }
+        return append_quad_growing(bounds, order, overflow);
+    }
     void push_shadow(const lx::gfx::shadow_instance& s, lx::rect2i bounds, std::uint32_t order,
                      lx::runtime::overflow_action overflow = lx::runtime::overflow_action::warn_and_drop);
     /// `kind` is `mono_sprite`, `poly_sprite` or `path`; anything else is dropped.
@@ -100,8 +129,13 @@ public:
     /// Taking it starts the frame's primitive stream: the surfaces pushed so far without an
     /// order take theirs now, back to front by sort key, so they sort under whatever is
     /// emitted next, and every later `push(cmd)` takes its order at push.
-    [[nodiscard]] lx::gfx::order_grid& orders();
-    [[nodiscard]] const lx::gfx::order_grid& orders() const { return orders_; }
+    [[nodiscard]] inline lx::gfx::order_grid& orders() {
+        stream_live_ = true;
+        if (orders_pending_) [[unlikely]]
+            assign_pending_orders();
+        return orders_;
+    }
+    [[nodiscard]] inline const lx::gfx::order_grid& orders() const { return orders_; }
 
     /// Sorts the surface draws (sort key, then texture: paint order), appends a `surface`
     /// ref per draw, sorts the ref stream by `(order, kind, page)` — stable: equal keys keep
@@ -123,7 +157,7 @@ public:
     /// After `batch_for_render`: the sorted stream, surfaces included (empty before it, and
     /// for a list with no primitive stream).
     [[nodiscard]] std::span<const lx::gfx::primitive_ref> refs() const {
-        return {sorted_, sorted_count_};
+        return {stream_, sorted_count_};
     }
     [[nodiscard]] std::span<const lx::gfx::batch> batches() const { return {batches_, batch_count_}; }
     /// After `batch_for_render`: what a backend uploads (ADR-010 §4.4) — every primitive
@@ -188,6 +222,12 @@ private:
         unsigned count = 0;
     };
 
+    /// `append_quad` past its inline fast path: grows the arrays, or drops at the cap.
+    [[nodiscard]] lx::gfx::quad_instance* append_quad_growing(lx::rect2i bounds,
+                                                              std::uint32_t order,
+                                                              lx::runtime::overflow_action overflow);
+    /// `orders()` starting the stream: the surfaces pushed before it take their orders.
+    void assign_pending_orders();
     void ensure_capacity(unsigned need);
     void ensure_ref_capacity(unsigned need);
     void ensure_batch_capacity(unsigned need);
@@ -236,6 +276,9 @@ private:
     std::uint64_t* ref_keys_ = nullptr;
     std::uint64_t* ref_keys_swap_ = nullptr;
     lx::gfx::primitive_ref* sorted_ = nullptr;
+    /// The sorted stream `refs()` and `encode_instances` read: `sorted_`, or `refs_` itself
+    /// when the stream is its push order (a one-kind stream: nothing to copy).
+    const lx::gfx::primitive_ref* stream_ = nullptr;
     lx::rect2i* sorted_bounds_ = nullptr;
     unsigned ref_capacity_ = 0;
     unsigned ref_count_ = 0;
@@ -586,6 +629,7 @@ void lx::scene::draw_list::ensure_ref_capacity(unsigned need) {
     ref_keys_swap_ = new std::uint64_t[new_cap];
     sorted_ = new lx::gfx::primitive_ref[new_cap];
     sorted_bounds_ = new lx::rect2i[new_cap];
+    stream_ = sorted_;
     sorted_count_ = 0;
     ref_capacity_ = new_cap;
 }
@@ -640,19 +684,15 @@ void lx::scene::draw_list::begin(lx::size2i view_px) {
     orders_.reset(view_px);
 }
 
-lx::gfx::order_grid& lx::scene::draw_list::orders() {
-    stream_live_ = true;
-    if (orders_pending_) {
-        // The surfaces pushed before the stream started, back to front.
-        orders_pending_ = false;
-        sort_commands();
-        for (unsigned i = 0; i < count_; ++i) {
-            const draw_command& cmd = commands_[i];
-            if (cmd_orders_[i] == k_order_unassigned)
-                cmd_orders_[i] = orders_.assign(lx_scene_clipped(cmd.dst, cmd.clip));
-        }
+void lx::scene::draw_list::assign_pending_orders() {
+    // The surfaces pushed before the stream started, back to front.
+    orders_pending_ = false;
+    sort_commands();
+    for (unsigned i = 0; i < count_; ++i) {
+        const draw_command& cmd = commands_[i];
+        if (cmd_orders_[i] == k_order_unassigned)
+            cmd_orders_[i] = orders_.assign(lx_scene_clipped(cmd.dst, cmd.clip));
     }
-    return orders_;
 }
 
 void lx::scene::draw_list::push(draw_command cmd, lx::runtime::overflow_action overflow) {
@@ -740,11 +780,13 @@ void lx::scene::draw_list::push_ref(lx::gfx::primitive_kind kind, std::uint8_t p
     ref_count_ = primitive_count_;
 }
 
-void lx::scene::draw_list::push_quad(const lx::gfx::quad_instance& q, lx::rect2i bounds,
-                                     std::uint32_t order, lx::runtime::overflow_action overflow) {
-    if (!admit_primitive(overflow) || !quads_.push(q, lx::gfx::k_max_primitives))
-        return;
+lx::gfx::quad_instance*
+lx::scene::draw_list::append_quad_growing(lx::rect2i bounds, std::uint32_t order,
+                                          lx::runtime::overflow_action overflow) {
+    if (!admit_primitive(overflow) || !quads_.push({}, lx::gfx::k_max_primitives))
+        return nullptr;
     push_ref(lx::gfx::primitive_kind::quad, 0, quads_.count - 1, bounds, order);
+    return quads_.items + (quads_.count - 1);
 }
 
 void lx::scene::draw_list::push_shadow(const lx::gfx::shadow_instance& s, lx::rect2i bounds,
@@ -882,6 +924,42 @@ void lx::scene::draw_list::batch_for_render() {
         ++ref_count_;
     }
 
+    // One kind on one page and no surface — only quads, only shadows or only underlines
+    // (their page is always 0): the stream is one batch whatever the orders, and the push
+    // order, the painter's order every order the grid hands out respects, is already a
+    // valid order inside it. The sort exists to batch, so it has nothing to do: the stream
+    // is the push order, the batch the union of every bound.
+    const unsigned typed_kinds = (quads_.count != 0 ? 1u : 0u) + (shadows_.count != 0 ? 1u : 0u) +
+                                 (underlines_.count != 0 ? 1u : 0u);
+    if (count_ == 0 && sprites_.count == 0 && typed_kinds == 1) {
+        // Pushes after this write past `sorted_count_`, so the span stays as sorted here.
+        stream_ = refs_;
+        sorted_count_ = ref_count_;
+        int x0 = std::numeric_limits<int>::max();
+        int y0 = std::numeric_limits<int>::max();
+        int x1 = std::numeric_limits<int>::min();
+        int y1 = std::numeric_limits<int>::min();
+        for (unsigned i = 0; i < ref_count_; ++i) {
+            const lx::rect2i b = ref_bounds_[i];
+            if (b.width <= 0 || b.height <= 0)
+                continue;
+            x0 = b.x < x0 ? b.x : x0;
+            y0 = b.y < y0 ? b.y : y0;
+            x1 = b.x + b.width > x1 ? b.x + b.width : x1;
+            y1 = b.y + b.height > y1 ? b.y + b.height : y1;
+        }
+        ensure_batch_capacity(1);
+        batches_[0] = {refs_[0].kind, 0, 0, ref_count_,
+                       x1 > x0 ? lx::rect2i{x0, y0, x1 - x0, y1 - y0} : lx::rect2i{}};
+        batch_count_ = 1;
+        if (lx::trace::timeline_enabled()) {
+            lx::trace::timeline_counter("scene.primitives", primitive_count_);
+            lx::trace::timeline_counter("scene.refs", sorted_count_);
+            lx::trace::timeline_counter("scene.batches", batch_count_);
+        }
+        return;
+    }
+
     // Stable sort by (order, kind, page) as one 64-bit key per ref, the push position in
     // the low bits: keys are unique, so the sorted keys name the source ref of every output
     // slot and the order is the stable one; `refs_` itself stays in push order. Building
@@ -907,15 +985,23 @@ void lx::scene::draw_list::batch_for_render() {
         ref_keys_[i] = key;
     }
     static_assert(k_max_refs <= 0xFFFFu, "the ref position must fit the key's low 16 bits");
-    // The bounds of `sorted_[i]`, for the batch union below.
+    // The bounds of `stream_[i]`, for the batch union below.
     const lx::rect2i* sorted_bounds = ref_bounds_;
     if (ascending) {
-        // Already in (order, kind, page) order: the sorted stream is the push order.
-        std::memcpy(sorted_, refs_, sizeof(lx::gfx::primitive_ref) * ref_count_);
+        // Already in (order, kind, page) order: the sorted stream is the push order. With
+        // no surface refs appended it is `refs_` itself — a later push writes past it —
+        // otherwise a copy, since a push overwrites the surface refs.
+        if (count_ == 0) {
+            stream_ = refs_;
+        } else {
+            std::memcpy(sorted_, refs_, sizeof(lx::gfx::primitive_ref) * ref_count_);
+            stream_ = sorted_;
+        }
     } else {
         // Not ascending means some byte above the position bits varies: at least one pass.
         lx_scene_radix_sort(ref_keys_, ref_keys_swap_, ref_count_, varying, refs_, ref_bounds_,
                             sorted_, sorted_bounds_);
+        stream_ = sorted_;
         sorted_bounds = sorted_bounds_;
     }
     sorted_count_ = ref_count_;
@@ -924,7 +1010,7 @@ void lx::scene::draw_list::batch_for_render() {
     batch_count_ = 0;
     lx::gfx::batch* current = nullptr;
     for (unsigned i = 0; i < sorted_count_; ++i) {
-        const lx::gfx::primitive_ref& r = sorted_[i];
+        const lx::gfx::primitive_ref& r = stream_[i];
         if (!current || current->kind != r.kind || current->page != r.page) {
             if (batch_count_ >= lx::gfx::k_max_batches) {
                 if (!batch_cap_warned_) {
@@ -985,7 +1071,7 @@ std::size_t lx::scene::draw_list::encode_instances(std::span<std::byte> ring,
         const std::size_t bytes = stride * run.count;
         if (off + bytes <= ring.size()) {
             std::byte* dst = ring.data() + off;
-            const lx::gfx::primitive_ref* refs = sorted_ + run.first;
+            const lx::gfx::primitive_ref* refs = stream_ + run.first;
             switch (run.kind) {
             case lx::gfx::primitive_kind::quad:
                 lx_scene_gather(dst, quads_.items, refs, run.count);

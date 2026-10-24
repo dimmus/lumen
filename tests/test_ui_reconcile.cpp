@@ -192,6 +192,66 @@ LUMEN_TEST(keyed_rows_keep_state_across_reorder) {
     delete list;
 }
 
+LUMEN_TEST(children_outgrow_their_span_and_keep_identity) {
+    // Child pointers live out of line in pooled spans of 1, 2, 4 … 64 slots: growing a list
+    // through several span sizes moves the pointers, never the rows, and the fan-out still
+    // stops at k_max_children.
+    lx::runtime::memory_arena arena{64 * 1024};
+    lx::ui::build_context ctx{arena};
+    lx::ui::reconciler rec{};
+    constexpr unsigned k_max = lx::ui::ui_node::k_max_children;
+
+    const auto rebuild = [&](lx::ui::ui_node* list, unsigned count) {
+        arena.reset();
+        rec.reset_stats();
+        lx::ui::build_scope scope{ctx};
+        lx::ui::child kids[k_max + 8]{};
+        for (unsigned i = 0; i < count; ++i)
+            kids[i] = row(static_cast<int>(i), i + 1);
+        return rec.apply(list, lx::ui::with_children(lx::ui::describe<list_node, row_props>({0}),
+                                                     {kids, count}));
+    };
+
+    lx::ui::ui_node* list = rebuild(nullptr, 3);
+    LUMEN_CHECK(list != nullptr && list->child_count() == 3);
+    lx::ui::ui_node* first = list->child_at(0);
+    static_cast<row_node*>(first)->scroll = 7;
+
+    list = rebuild(list, 40); // 4 slots → 64
+    LUMEN_CHECK(list->child_count() == 40);
+    LUMEN_CHECK(rec.stats().reused == 4 && rec.stats().constructed == 37); // list + 3 rows kept
+    LUMEN_CHECK(list->child_at(0) == first && static_cast<row_node*>(first)->scroll == 7);
+    bool keyed = true;
+    for (unsigned i = 0; i < 40; ++i)
+        keyed = keyed && list->child_at(i)->key() == i + 1 && list->child_at(i)->parent() == list;
+    LUMEN_CHECK(keyed);
+
+    list = rebuild(list, k_max + 8); // past the cap: the first k_max only
+    LUMEN_CHECK(list->child_count() == k_max);
+    LUMEN_CHECK(list->child_at(k_max - 1)->key() == k_max && list->child_at(k_max) == nullptr);
+
+    list = rebuild(list, 2); // shrinking keeps the span; the rest are destroyed
+    LUMEN_CHECK(list->child_count() == 2 && rec.stats().destroyed == k_max - 2);
+    LUMEN_CHECK(list->child_at(0) == first);
+
+    // Spans go back to the pool and come out again: a tree built, dropped and rebuilt.
+    delete list;
+    list = rebuild(nullptr, 17);
+    LUMEN_CHECK(list->child_count() == 17 && list->child_at(16)->key() == 17);
+
+    // The direct API grows the same way: adopt through every span size, then replace a slot.
+    lx::ui::ui_node* bare = rebuild(nullptr, 0);
+    for (unsigned i = 0; i < k_max; ++i)
+        bare->adopt(new row_node{});
+    row_node refused{};
+    bare->adopt(&refused); // past the cap: not taken
+    LUMEN_CHECK(bare->child_count() == k_max && refused.parent() == nullptr);
+    bare->set_child_at(k_max - 1, new row_node{}); // replaces (and deletes) the last
+    LUMEN_CHECK(bare->child_count() == k_max && bare->child_at(k_max - 1)->parent() == bare);
+    delete list;
+    delete bare;
+}
+
 LUMEN_TEST(decorators_compose_without_shared_state) {
     lx::runtime::memory_arena arena{64 * 1024};
     lx::ui::build_context ctx{arena};

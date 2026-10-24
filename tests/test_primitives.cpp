@@ -430,6 +430,46 @@ LUMEN_TEST(draw_list_ascending_stream_keeps_push_order) {
     LUMEN_CHECK(list.batches().size() == 200); // shadow, quad quad, shadow, …
 }
 
+LUMEN_TEST(draw_list_one_kind_stream_is_one_batch_in_push_order) {
+    // Only quads, orders not ascending: one batch whatever the orders, so the stream stays
+    // in push order (overlapping quads keep their paint order) and nothing is sorted.
+    lx::scene::draw_list list{};
+    list.begin({640, 480});
+    list.push_quad(quad_at(0, 0), {0, 0, 50, 50}, 1);
+    list.push_quad(quad_at(10, 10), {10, 10, 10, 10}, 2); // over the first
+    list.push_quad(quad_at(300, 200), {300, 200, 20, 30}, 1);
+    list.push_quad(quad_at(0, 0), {0, 0, 0, 0}, 1); // empty bounds: no part of the union
+    list.batch_for_render();
+    const auto refs = list.refs();
+    LUMEN_CHECK(refs.size() == 4);
+    bool in_push_order = true;
+    for (unsigned i = 0; i < refs.size(); ++i)
+        in_push_order = in_push_order && refs[i].index == i && refs[i].kind == primitive_kind::quad;
+    LUMEN_CHECK(in_push_order);
+    const auto batches = list.batches();
+    LUMEN_CHECK(batches.size() == 1);
+    LUMEN_CHECK(batches[0].kind == primitive_kind::quad && batches[0].first == 0 &&
+                batches[0].count == 4);
+    LUMEN_CHECK(batches[0].bounds.x == 0 && batches[0].bounds.y == 0 &&
+                batches[0].bounds.width == 320 && batches[0].bounds.height == 230);
+
+    // A shadow joins: two kinds, the full sort again (the order-1 quads before the order-2).
+    lx::gfx::shadow_instance shadow{};
+    list.push_shadow(shadow, {500, 0, 10, 10}, 3);
+    list.batch_for_render();
+    LUMEN_CHECK(list.refs().size() == 5 && list.refs()[2].order == 1 &&
+                list.refs()[3].order == 2 && list.batches().size() == 2);
+
+    // Only shadows: the same rule for another kind.
+    list.begin({640, 480});
+    list.push_shadow(shadow, {0, 0, 10, 10}, 2);
+    list.push_shadow(shadow, {20, 0, 10, 10}, 1);
+    list.batch_for_render();
+    LUMEN_CHECK(list.refs().size() == 2 && list.refs()[0].order == 2 &&
+                list.batches().size() == 1 && list.batches()[0].kind == primitive_kind::shadow &&
+                list.batches()[0].bounds.width == 30);
+}
+
 LUMEN_TEST(draw_list_radix_sort_matches_a_stable_comparison_sort) {
     // Orders spanning three bytes, every kind, several pages, pushed in random order: the
     // radix sort must give exactly what a stable comparison sort of the push-order refs by

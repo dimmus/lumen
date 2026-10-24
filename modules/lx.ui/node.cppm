@@ -1,5 +1,7 @@
 module;
 
+#include <stddef.h>
+
 import lx.foundation;
 import lx.gfx;
 import lx.layout;
@@ -147,6 +149,9 @@ private:
         lx::rect2i clip{};
         float opacity = 1.f;
         lx::point2i origin{};
+        /// `clip` as an instance writes it (x, y, w, h floats): converted once per push,
+        /// not once per primitive.
+        float clip_f[4]{};
     };
 
     void push_frame(frame f);
@@ -174,9 +179,22 @@ private:
 /// Retained UI node. Lives across frames and owns its children; descriptors are
 /// reconciled onto it rather than replacing it, so scroll offsets, carets, and
 /// animation state survive a rebuild.
+///
+/// The child pointers live out of line, in a span from the UI thread's retained-tree pool
+/// (power-of-two sizes up to `k_max_children` slots, recycled through free lists), so a
+/// node is its own fields and nothing more: S3's 10 651 nodes fit in cache, where a
+/// 64-slot inline array made each one 640 B and the tree 7 MB. The span is taken or grown
+/// only when the child count does — a shape change — and returned when the node dies.
 class ui_node {
 public:
     virtual ~ui_node();
+
+    /// Nodes come from the UI thread's retained-tree pool, with their child spans: dense
+    /// and in construction order, the order layout and emit walk them. Sized delete — the
+    /// virtual destructor passes the dynamic type's size. A node type must not be
+    /// over-aligned (more than 16 bytes).
+    [[nodiscard]] static void* operator new(std::size_t bytes);
+    static void operator delete(void* node, std::size_t bytes);
 
     ui_node(const ui_node&) = delete;
     ui_node& operator=(const ui_node&) = delete;
@@ -211,6 +229,9 @@ public:
 
     /// Move every child into `out` and leave this node childless. Returns how many.
     [[nodiscard]] unsigned detach_children(ui_node** out, unsigned capacity);
+    /// Make room for `count` children (at most `k_max_children`) without changing the
+    /// count, so the slots a reconcile is about to fill exist before it fills them.
+    void reserve_children(unsigned count);
     /// Assign a slot without deleting the previous occupant.
     void place_child(unsigned index, ui_node* node);
     void set_child_count(unsigned count);
@@ -240,8 +261,11 @@ protected:
     ui_node() = default;
 
     ui_node* parent_ = nullptr;
-    ui_node* children_[k_max_children]{};
+    /// `child_capacity_` slots from the retained-tree pool; null while it is zero. Slots at
+    /// and past `child_count_` hold null or a pointer the reconciler has yet to count.
+    ui_node** children_ = nullptr;
     unsigned child_count_ = 0;
+    unsigned child_capacity_ = 0;
     element_key key_ = 0;
     lx::rect2i bounds_{};
     style_ref style_{};
@@ -347,7 +371,8 @@ lx::ui::packed_quad_style lx::ui::pack_quad_style(const quad_style& style, float
 lx::ui::draw_scope::draw_scope(lx::scene::draw_list& out, lx::rect2i clip) : out_{&out} {
     // Every emitter writes the list's overlap grid, which is UI affinity (ADR-010 §4.12).
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    stack_[0] = {clip, 1.f, {}};
+    stack_[0] = {clip, 1.f, {}, {}};
+    lx_ui_write_rect(stack_[0].clip_f, clip);
 }
 
 void lx::ui::draw_scope::push_frame(frame f) {
@@ -366,6 +391,7 @@ const lx::ui::draw_scope::frame& lx::ui::draw_scope::top() const { return stack_
 void lx::ui::draw_scope::push_clip(lx::rect2i clip) {
     frame next = top();
     next.clip = lx_ui_intersect(next.clip, clip);
+    lx_ui_write_rect(next.clip_f, next.clip);
     push_frame(next);
 }
 
@@ -466,25 +492,39 @@ void lx::ui::draw_scope::quad(lx::rect2i bounds, const packed_quad_style& style)
 void lx::ui::draw_scope::emit_quad(lx::rect2i placed, lx::rect2i visible,
                                    const packed_quad_style& style, float colour_scale) {
     const frame& f = top();
-    lx::gfx::quad_instance q{};
-    lx_ui_write_rect(q.bounds, placed);
-    lx_ui_write_rect(q.clip, f.clip);
-    lx_ui_copy_half4(q.radii, style.radii);
-    lx_ui_copy_half4(q.border_widths, style.border_widths);
-    if (colour_scale == 1.f) {
-        lx_ui_copy_half4(q.background, style.background);
-        lx_ui_copy_half4(q.background_end, style.background_end);
-        lx_ui_copy_half4(q.border_color, style.border_color);
-    } else {
-        lx_ui_scale_half4(q.background, style.background, colour_scale);
-        lx_ui_scale_half4(q.background_end, style.background_end, colour_scale);
-        lx_ui_scale_half4(q.border_color, style.border_color, colour_scale);
-    }
-    q.gradient_angle = style.gradient_angle;
-    q.border_style = style.border_style;
-    q.gradient_space = style.gradient_space;
-    out_->push_quad(q, visible, out_->orders().assign(visible));
+    const std::uint32_t order = out_->orders().assign(visible);
     ++emitted_;
+    // Written in place in the list's instance array: no staged instance, no copy.
+    lx::gfx::quad_instance* q = out_->append_quad(visible, order);
+    if (!q)
+        return;
+    lx_ui_write_rect(q->bounds, placed);
+    for (unsigned i = 0; i < 4; ++i)
+        q->clip[i] = f.clip_f[i];
+    if (colour_scale == 1.f) {
+        // The packed style is the instance from `radii` up to `pad`, field for field.
+        using inst = lx::gfx::quad_instance;
+        constexpr std::size_t base = offsetof(inst, radii);
+        static_assert(sizeof(packed_quad_style) == offsetof(inst, pad) - base);
+        static_assert(offsetof(packed_quad_style, border_widths) == offsetof(inst, border_widths) - base &&
+                      offsetof(packed_quad_style, background) == offsetof(inst, background) - base &&
+                      offsetof(packed_quad_style, background_end) == offsetof(inst, background_end) - base &&
+                      offsetof(packed_quad_style, border_color) == offsetof(inst, border_color) - base &&
+                      offsetof(packed_quad_style, gradient_angle) == offsetof(inst, gradient_angle) - base &&
+                      offsetof(packed_quad_style, border_style) == offsetof(inst, border_style) - base &&
+                      offsetof(packed_quad_style, gradient_space) == offsetof(inst, gradient_space) - base);
+        std::memcpy(q->radii, &style, sizeof(packed_quad_style));
+    } else {
+        lx_ui_copy_half4(q->radii, style.radii);
+        lx_ui_copy_half4(q->border_widths, style.border_widths);
+        lx_ui_scale_half4(q->background, style.background, colour_scale);
+        lx_ui_scale_half4(q->background_end, style.background_end, colour_scale);
+        lx_ui_scale_half4(q->border_color, style.border_color, colour_scale);
+        q->gradient_angle = style.gradient_angle;
+        q->border_style = style.border_style;
+        q->gradient_space = style.gradient_space;
+    }
+    q->pad = 0;
 }
 
 void lx::ui::draw_scope::shadow(lx::rect2i bounds, const shadow_style& style) {
@@ -641,9 +681,115 @@ lx::rect2i lx::ui::draw_scope::clip() const { return top().clip; }
 float lx::ui::draw_scope::opacity() const { return top().opacity; }
 unsigned lx::ui::draw_scope::emitted() const { return emitted_; }
 
+// ── retained-tree pool ──────────────────────────────────────────────────────────
+
+namespace {
+
+/// The storage of every retained node on the UI thread and of their child-pointer spans,
+/// in 16-byte size classes up to 512 bytes (larger blocks go to the global heap). A
+/// released block goes on its class's free list and the next block of that class is that
+/// one, so a tree whose shape changes recycles storage and one that keeps its shape
+/// touches none (ADR-010 G5). Fresh blocks are carved from 64 KB chunks in the order the
+/// reconciler takes them — a node, its span, its first child … — which is the order
+/// layout and emit walk the tree: one dense run with no allocator headers between nodes.
+///
+/// UI affinity owns retained trees (ui-architecture.md §8), so there is one pool and no
+/// lock. It is never destroyed: a retained tree may outlive any static it could be torn
+/// down with, and the chunks stay reachable from it.
+class lx_ui_tree_pool {
+public:
+    static constexpr std::size_t k_grain = 16;
+    static constexpr std::size_t k_max_block = 512;
+
+    [[nodiscard]] void* take(std::size_t bytes) {
+        if (bytes > k_max_block)
+            return ::operator new(bytes);
+        const std::size_t cls = class_of(bytes);
+        if (void* block = free_[cls]) {
+            free_[cls] = *static_cast<void**>(block);
+            return block;
+        }
+        const std::size_t size = (cls + 1) * k_grain;
+        if (static_cast<std::size_t>(end_ - next_) < size) {
+            // A new chunk: its first word links it to the previous one, so the pool keeps
+            // every chunk reachable. The rest of the old chunk is left unused.
+            auto* chunk = static_cast<std::byte*>(::operator new(k_chunk_bytes));
+            *reinterpret_cast<void**>(chunk) = chunks_;
+            chunks_ = chunk;
+            next_ = chunk + k_grain;
+            end_ = chunk + k_chunk_bytes;
+        }
+        void* block = next_;
+        next_ += size;
+        return block;
+    }
+
+    void give_back(void* block, std::size_t bytes) {
+        if (!block)
+            return;
+        if (bytes > k_max_block) {
+            ::operator delete(block);
+            return;
+        }
+        const std::size_t cls = class_of(bytes);
+        *static_cast<void**>(block) = free_[cls];
+        free_[cls] = block;
+    }
+
+private:
+    static constexpr std::size_t k_chunk_bytes = 64 * 1024;
+    static constexpr std::size_t k_classes = k_max_block / k_grain;
+    static_assert(alignof(std::max_align_t) <= k_grain);
+
+    [[nodiscard]] static std::size_t class_of(std::size_t bytes) {
+        return bytes == 0 ? 0 : (bytes - 1) / k_grain;
+    }
+
+    void* free_[k_classes]{};
+    void* chunks_ = nullptr;
+    std::byte* next_ = nullptr;
+    std::byte* end_ = nullptr;
+};
+
+[[nodiscard]] lx_ui_tree_pool& lx_ui_tree_storage() {
+    static lx_ui_tree_pool* const pool = new lx_ui_tree_pool{};
+    return *pool;
+}
+
+/// A child span of `capacity` slots (a power of two, ≤ `ui_node::k_max_children`), in bytes.
+[[nodiscard]] std::size_t lx_ui_span_bytes(unsigned capacity) {
+    return std::size_t{capacity} * sizeof(lx::ui::ui_node*);
+}
+
+} // namespace
+
 // ── ui_node ─────────────────────────────────────────────────────────────────────
 
-lx::ui::ui_node::~ui_node() { release_children(); }
+void* lx::ui::ui_node::operator new(std::size_t bytes) { return lx_ui_tree_storage().take(bytes); }
+
+void lx::ui::ui_node::operator delete(void* node, std::size_t bytes) {
+    lx_ui_tree_storage().give_back(node, bytes);
+}
+
+lx::ui::ui_node::~ui_node() {
+    release_children();
+    lx_ui_tree_storage().give_back(children_, lx_ui_span_bytes(child_capacity_));
+}
+
+void lx::ui::ui_node::reserve_children(unsigned count) {
+    if (count <= child_capacity_)
+        return;
+    if (count > k_max_children)
+        count = k_max_children;
+    const unsigned capacity = std::bit_ceil(count);
+    lx_ui_tree_pool& pool = lx_ui_tree_storage();
+    auto** grown = static_cast<ui_node**>(pool.take(lx_ui_span_bytes(capacity)));
+    for (unsigned i = 0; i < capacity; ++i)
+        grown[i] = i < child_capacity_ ? children_[i] : nullptr;
+    pool.give_back(children_, lx_ui_span_bytes(child_capacity_));
+    children_ = grown;
+    child_capacity_ = capacity;
+}
 
 const char* lx::ui::ui_node::type_name() const { return "ui_node"; }
 
@@ -722,6 +868,7 @@ lx::a11y::node lx::ui::ui_node::accessibility_node() const {
 void lx::ui::ui_node::adopt(ui_node* node) {
     if (!node || child_count_ >= k_max_children)
         return;
+    reserve_children(child_count_ + 1);
     node->parent_ = this;
     children_[child_count_++] = node;
     layout_dirty_ = true;
@@ -730,6 +877,7 @@ void lx::ui::ui_node::adopt(ui_node* node) {
 void lx::ui::ui_node::set_child_at(unsigned index, ui_node* node) {
     if (index >= k_max_children)
         return;
+    reserve_children(index + 1);
     if (children_[index] && children_[index] != node)
         delete children_[index];
     children_[index] = node;
@@ -779,12 +927,14 @@ unsigned lx::ui::ui_node::detach_children(ui_node** out, unsigned capacity) {
 void lx::ui::ui_node::place_child(unsigned index, ui_node* node) {
     if (index >= k_max_children)
         return;
+    reserve_children(index + 1);
     children_[index] = node;
     if (node)
         node->parent_ = this;
 }
 
 void lx::ui::ui_node::set_child_count(unsigned count) {
+    reserve_children(count);
     child_count_ = count < k_max_children ? count : k_max_children;
     layout_dirty_ = true;
 }
