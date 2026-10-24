@@ -43,8 +43,13 @@ inline constexpr unsigned k_max_order_layers = 32;
 // same on every host and in `constexpr`. A finite input never produces an infinity: past
 // 65504 it clamps to the largest finite half, which is what a colour or a radius wants.
 // NaN stays NaN (quiet), ±inf stays ±inf, subnormals round like everything else.
+//
+// `to_half_reference` is the conversion written out case by case; `to_half` is the one
+// emitters call, bit-identical to it for every float (test_primitives checks the two
+// against each other) but branch-light where colours, radii and widths live.
 
-[[nodiscard]] constexpr std::uint16_t to_half(float value) {
+/// Every float, case by case: what `to_half` must equal bit for bit.
+[[nodiscard]] constexpr std::uint16_t to_half_reference(float value) {
     const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
     const std::uint16_t sign = static_cast<std::uint16_t>((bits >> 16u) & 0x8000u);
     const std::uint32_t exp = (bits >> 23u) & 0xFFu;
@@ -75,6 +80,29 @@ inline constexpr unsigned k_max_order_layers = 32;
     if (half >= 0x7C00u)
         half = 0x7BFFu; // rounding carried into infinity: clamp
     return static_cast<std::uint16_t>(sign | half);
+}
+
+/// `to_half_reference` with one branch for the common case: a magnitude in the normal
+/// half range or above it (finite) rebiases and rounds in integer arithmetic, clamping past
+/// 65504 to the largest finite half; zero and anything below half the smallest subnormal
+/// is a signed zero; subnormals, infinities and NaN take the reference path.
+[[nodiscard]] constexpr std::uint16_t to_half(float value) {
+    const std::uint32_t bits = std::bit_cast<std::uint32_t>(value);
+    const auto sign = static_cast<std::uint16_t>((bits >> 16u) & 0x8000u);
+    std::uint32_t mag = bits & 0x7FFFFFFFu;
+    // [2^-14, +inf): unsigned wrap puts everything below 2^-14 past the range.
+    if (mag - 0x38800000u < 0x7F800000u - 0x38800000u) [[likely]] {
+        // 65504 is the largest finite half; everything from it up (65520 would round to
+        // infinity) clamps to it.
+        mag = mag < 0x477FE000u ? mag : 0x477FE000u;
+        // Rebias 127 → 15 (subtract 112 << 23), round to nearest even on the 13 dropped
+        // bits; a carry out of the mantissa lands in the exponent, which is correct.
+        const std::uint32_t odd = (mag >> 13u) & 1u;
+        return static_cast<std::uint16_t>(sign | ((mag - 0x38000000u + 0x0FFFu + odd) >> 13u));
+    }
+    if (mag < 0x33000000u) // below 2^-25 (zero included): rounds to zero
+        return sign;
+    return to_half_reference(value);
 }
 
 [[nodiscard]] constexpr float from_half(std::uint16_t h) {
@@ -332,6 +360,15 @@ std::uint32_t lx::gfx::order_grid::assign(lx::rect2i bounds) {
     const unsigned cy0 = static_cast<unsigned>(y0) >> shift_;
     const unsigned cx1 = static_cast<unsigned>(x1 - 1) >> shift_;
     const unsigned cy1 = static_cast<unsigned>(y1 - 1) >> shift_;
+    if (cx0 == cx1 && cy0 == cy1) {
+        // One cell — most primitives of a UI (a glyph, an icon, a small quad): read, bump,
+        // write back, without the row loops.
+        std::uint32_t& cell = cells_[cy0 * cells_x_ + cx0];
+        const std::uint32_t order = cell + 1 > base_ ? cell + 1 : base_;
+        cell = order;
+        max_ = order > max_ ? order : max_;
+        return order;
+    }
     std::uint32_t highest = 0;
     for (unsigned cy = cy0; cy <= cy1; ++cy) {
         const std::uint32_t* row = cells_ + cy * cells_x_;

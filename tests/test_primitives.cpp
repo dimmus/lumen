@@ -36,6 +36,26 @@ using lx::gfx::primitive_kind;
     return cmd;
 }
 
+/// A deterministic sequence for the randomised cases (xorshift64).
+struct test_rng {
+    std::uint64_t state = 0x9E3779B97F4A7C15ull;
+    [[nodiscard]] std::uint64_t next() {
+        state ^= state << 13u;
+        state ^= state >> 7u;
+        state ^= state << 17u;
+        return state;
+    }
+    [[nodiscard]] unsigned below(unsigned n) { return static_cast<unsigned>(next() % n); }
+};
+
+[[nodiscard]] bool same_ref(const lx::gfx::primitive_ref& a, const lx::gfx::primitive_ref& b) {
+    return a.order == b.order && a.kind == b.kind && a.page == b.page && a.index == b.index;
+}
+
+[[nodiscard]] bool same_quad(const lx::gfx::quad_instance& a, const lx::gfx::quad_instance& b) {
+    return std::memcmp(&a, &b, sizeof a) == 0;
+}
+
 } // namespace
 
 // ── lx.gfx:primitives ───────────────────────────────────────────────────────────
@@ -106,6 +126,52 @@ LUMEN_TEST(half_handles_zero_denormals_overflow_and_nan) {
     LUMEN_CHECK(lx::gfx::to_half(std::numeric_limits<float>::infinity()) == 0x7C00);
     LUMEN_CHECK(std::isinf(lx::gfx::from_half(0x7C00)));
     LUMEN_CHECK(std::isnan(half_round_trip(std::numeric_limits<float>::quiet_NaN())));
+}
+
+LUMEN_TEST(half_fast_path_matches_the_reference_bit_for_bit) {
+    // `to_half` takes integer shortcuts for normal and overflowing magnitudes and for
+    // zero; `to_half_reference` is the case-by-case conversion. Every sign and exponent,
+    // with every half mantissa against each rounding edge of the 13 dropped bits (just
+    // below, at and just past the tie, the tie's neighbours) plus pseudo-random low bits:
+    // 2 × 256 × 8192 floats, well under a second. (An exhaustive 2^32 sweep agreed when the
+    // fast path was written; it takes ~15 s, too long for every test run.)
+    static_assert(lx::gfx::to_half(0.5f) == lx::gfx::to_half_reference(0.5f));
+    static_assert(lx::gfx::to_half(65519.f) == lx::gfx::to_half_reference(65519.f));
+    constexpr std::uint32_t k_edges[8] = {0x0000u, 0x0001u, 0x0FFFu, 0x1000u,
+                                          0x1001u, 0x1FFFu, 0x0800u, 0x17FFu};
+    test_rng rng{};
+    unsigned mismatches = 0;
+    std::uint32_t first_bad = 0;
+    const auto check = [&](std::uint32_t bits) {
+        const float f = std::bit_cast<float>(bits);
+        if (lx::gfx::to_half(f) != lx::gfx::to_half_reference(f)) {
+            if (mismatches++ == 0)
+                first_bad = bits;
+        }
+    };
+    for (std::uint32_t sign = 0; sign < 2; ++sign) {
+        for (std::uint32_t exp = 0; exp < 256; ++exp) {
+            const std::uint32_t high = (sign << 31u) | (exp << 23u);
+            for (std::uint32_t m10 = 0; m10 < 1024; ++m10) {
+                for (const std::uint32_t low : k_edges)
+                    check(high | (m10 << 13u) | low);
+                check(high | (m10 << 13u) | static_cast<std::uint32_t>(rng.next() & 0x1FFFu));
+            }
+            for (unsigned i = 0; i < 1024; ++i)
+                check(high | static_cast<std::uint32_t>(rng.next() & 0x7FFFFFu));
+        }
+    }
+    // The fast path's own boundaries: the smallest normal half and its predecessor, half
+    // the smallest subnormal, the clamp at 65504 and the first float that would round to
+    // infinity, the largest finite float, infinity and NaN payloads.
+    for (const std::uint32_t bits :
+         {0x38800000u, 0x387FFFFFu, 0x33000000u, 0x32FFFFFFu, 0x33000001u, 0x477FE000u,
+          0x477FDFFFu, 0x477FEFFFu, 0x477FF000u, 0x47800000u, 0x7F7FFFFFu, 0x7F800000u,
+          0x7F800001u, 0x7FC00000u, 0xFFFFFFFFu, 0x80000000u, 0x00000001u})
+        check(bits);
+    if (mismatches != 0)
+        std::printf("to_half mismatch: %u floats, first 0x%08x\n", mismatches, first_bad);
+    LUMEN_CHECK(mismatches == 0);
 }
 
 LUMEN_TEST(premultiplied_half_premultiplies_once_and_ignores_space) {
@@ -206,6 +272,60 @@ LUMEN_TEST(order_grid_doubles_its_cell_past_the_cell_cap) {
     LUMEN_CHECK(g.assign({8000, 8000, 10, 10}) == 1);
 }
 
+LUMEN_TEST(order_grid_one_cell_fast_path_matches_the_cell_loop) {
+    // A model of the grid's rule over the same cells: `1 + max` under the rect (at least
+    // the layer base), written back. Rects inside one cell take the fast path, the rest the
+    // loops; both must agree with the model through layers and off-view rects.
+    lx::gfx::order_grid g{};
+    g.reset({640, 480}); // 10 × 8 cells of 64 px
+    std::uint32_t model[80]{};
+    std::uint32_t base = 0;
+    std::uint32_t bases[8]{};
+    unsigned depth = 0;
+    std::uint32_t max_order = 0;
+    test_rng rng{};
+    bool agree = true;
+    unsigned one_cell = 0;
+    for (unsigned i = 0; i < 4000; ++i) {
+        if (i % 500 == 250 && depth < 8) {
+            g.push_layer();
+            bases[depth++] = base;
+            base = max_order + 1;
+        } else if (i % 500 == 499 && depth > 0) {
+            g.pop_layer();
+            base = bases[--depth];
+        }
+        // Mostly small rects (one cell or straddling two), some large, some off-view.
+        const bool big = rng.below(10) == 0;
+        const int w = big ? 1 + static_cast<int>(rng.below(400)) : 1 + static_cast<int>(rng.below(20));
+        const int h = big ? 1 + static_cast<int>(rng.below(300)) : 1 + static_cast<int>(rng.below(20));
+        const int x = static_cast<int>(rng.below(700)) - 30;
+        const int y = static_cast<int>(rng.below(540)) - 30;
+        const std::uint32_t got = g.assign({x, y, w, h});
+        const int x0 = x < 0 ? 0 : x;
+        const int y0 = y < 0 ? 0 : y;
+        const int x1 = x + w > 640 ? 640 : x + w;
+        const int y1 = y + h > 480 ? 480 : y + h;
+        std::uint32_t want = base;
+        if (x1 > x0 && y1 > y0) {
+            std::uint32_t highest = 0;
+            for (int cy = y0 / 64; cy <= (y1 - 1) / 64; ++cy)
+                for (int cx = x0 / 64; cx <= (x1 - 1) / 64; ++cx)
+                    highest = model[cy * 10 + cx] > highest ? model[cy * 10 + cx] : highest;
+            want = highest + 1 > base ? highest + 1 : base;
+            for (int cy = y0 / 64; cy <= (y1 - 1) / 64; ++cy)
+                for (int cx = x0 / 64; cx <= (x1 - 1) / 64; ++cx)
+                    model[cy * 10 + cx] = want;
+            max_order = want > max_order ? want : max_order;
+            one_cell += (x0 / 64 == (x1 - 1) / 64 && y0 / 64 == (y1 - 1) / 64) ? 1u : 0u;
+        }
+        agree = agree && got == want;
+    }
+    LUMEN_CHECK(agree);
+    LUMEN_CHECK(g.max_order() == max_order);
+    LUMEN_CHECK(one_cell > 1000); // the fast path was exercised
+}
+
 // ── lx.scene::draw_list v3 ──────────────────────────────────────────────────────
 
 LUMEN_TEST(draw_list_cuts_batches_on_kind_and_page) {
@@ -284,6 +404,111 @@ LUMEN_TEST(draw_list_sorts_by_order_then_stably) {
     list.batch_for_render();
     LUMEN_CHECK(list.refs().size() == 6);
     LUMEN_CHECK(list.refs()[5].index == 0 && list.batches().size() == 3);
+}
+
+LUMEN_TEST(draw_list_ascending_stream_keeps_push_order) {
+    // Keys already ascending (each primitive above the last): the sort is skipped and the
+    // stream is the push order.
+    lx::scene::draw_list list{};
+    list.begin({640, 480});
+    const lx::rect2i r{0, 0, 10, 10};
+    lx::gfx::shadow_instance shadow{};
+    for (unsigned i = 0; i < 300; ++i) {
+        if (i % 3 == 0)
+            list.push_shadow(shadow, r, list.orders().assign(r));
+        else
+            list.push_quad(quad_at(0, 0), r, list.orders().assign(r));
+    }
+    list.batch_for_render();
+    const auto refs = list.refs();
+    LUMEN_CHECK(refs.size() == 300);
+    bool in_push_order = true;
+    for (unsigned i = 0; i < refs.size(); ++i)
+        in_push_order = in_push_order && refs[i].order == i + 1 &&
+                        refs[i].kind == (i % 3 == 0 ? primitive_kind::shadow : primitive_kind::quad);
+    LUMEN_CHECK(in_push_order);
+    LUMEN_CHECK(list.batches().size() == 200); // shadow, quad quad, shadow, …
+}
+
+LUMEN_TEST(draw_list_radix_sort_matches_a_stable_comparison_sort) {
+    // Orders spanning three bytes, every kind, several pages, pushed in random order: the
+    // radix sort must give exactly what a stable comparison sort of the push-order refs by
+    // (order, kind, page) gives.
+    lx::scene::draw_list list{};
+    list.begin({640, 480});
+    test_rng rng{};
+    lx::gfx::shadow_instance shadow{};
+    lx::gfx::sprite_instance sprite{};
+    lx::gfx::underline_instance underline{};
+    std::vector<lx::gfx::primitive_ref> pushed{};
+    unsigned quads = 0, shadows = 0, sprites = 0, underlines = 0;
+    constexpr unsigned k_count = 3000;
+    for (unsigned i = 0; i < k_count; ++i) {
+        // Few distinct small orders, so equal keys (where stability shows) are common, and
+        // a quarter past 2^16 so the order's third byte varies too.
+        const std::uint32_t order = rng.below(4) == 0 ? 65536u + rng.below(70000) : rng.below(40);
+        const lx::rect2i r{static_cast<int>(rng.below(600)), static_cast<int>(rng.below(440)), 8, 8};
+        switch (rng.below(5)) {
+        case 0:
+            list.push_quad(quad_at(r.x, r.y), r, order);
+            pushed.push_back({order, primitive_kind::quad, 0, 0, quads++});
+            break;
+        case 1:
+            list.push_shadow(shadow, r, order);
+            pushed.push_back({order, primitive_kind::shadow, 0, 0, shadows++});
+            break;
+        case 2: {
+            const auto page = static_cast<std::uint8_t>(rng.below(3));
+            list.push_sprite(primitive_kind::mono_sprite, page, sprite, r, order);
+            pushed.push_back({order, primitive_kind::mono_sprite, page, 0, sprites++});
+            break;
+        }
+        case 3: {
+            const auto page = static_cast<std::uint8_t>(rng.below(2));
+            list.push_sprite(primitive_kind::poly_sprite, page, sprite, r, order);
+            pushed.push_back({order, primitive_kind::poly_sprite, page, 0, sprites++});
+            break;
+        }
+        default:
+            list.push_underline(underline, r, order);
+            pushed.push_back({order, primitive_kind::underline, 0, 0, underlines++});
+            break;
+        }
+    }
+    // Surfaces in paint order (ascending sort key), so their refs follow in push order.
+    for (unsigned i = 0; i < 20; ++i) {
+        const std::uint32_t order = rng.below(40);
+        list.push(surface_at(i + 1, static_cast<int>(i) * 20, i), order);
+        pushed.push_back({order, primitive_kind::surface, 0, 0, i});
+    }
+    std::stable_sort(pushed.begin(), pushed.end(),
+                     [](const lx::gfx::primitive_ref& a, const lx::gfx::primitive_ref& b) {
+                         if (a.order != b.order)
+                             return a.order < b.order;
+                         if (a.kind != b.kind)
+                             return static_cast<int>(a.kind) < static_cast<int>(b.kind);
+                         return a.page < b.page;
+                     });
+
+    for (unsigned pass = 0; pass < 2; ++pass) {
+        // The second pass sorts again from the untouched push order: the same stream.
+        list.batch_for_render();
+        const auto refs = list.refs();
+        bool same = refs.size() == pushed.size();
+        for (unsigned i = 0; same && i < refs.size(); ++i)
+            same = same_ref(refs[i], pushed[i]);
+        LUMEN_CHECK(same);
+        // Batches partition the stream at every (kind, page) change.
+        unsigned covered = 0;
+        bool cut_right = true;
+        for (const lx::gfx::batch& b : list.batches()) {
+            cut_right = cut_right && b.first == covered && b.count > 0;
+            for (unsigned i = b.first; i < b.first + b.count; ++i)
+                cut_right = cut_right && refs[i].kind == b.kind && refs[i].page == b.page;
+            covered += b.count;
+        }
+        LUMEN_CHECK(cut_right && covered == refs.size());
+    }
 }
 
 LUMEN_TEST(draw_list_surfaces_take_orders_in_paint_order) {
@@ -439,6 +664,55 @@ LUMEN_TEST(snapshot_exposes_the_sorted_stream) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
 }
 
+LUMEN_TEST(encode_instances_copies_runs_and_gathers_permuted_batches) {
+    lx::scene::draw_list list{};
+    list.begin({640, 480});
+    // Batch 0: quads 0..3 in push order (one block copy). Batch 1: a shadow. Batch 2: quads
+    // 4 and 5, which the sort swaps (5 has the lower order): a gather. Batch 3: a surface.
+    for (int i = 0; i < 4; ++i)
+        list.push_quad(quad_at(i * 10, 0), {i * 10, 0, 10, 10}, 1);
+    lx::gfx::shadow_instance shadow{};
+    shadow.sigma = 7.f;
+    list.push_shadow(shadow, {0, 20, 10, 10}, 2);
+    list.push_quad(quad_at(100, 0), {100, 0, 10, 10}, 4);
+    list.push_quad(quad_at(110, 0), {110, 0, 10, 10}, 3);
+    list.push(surface_at(1, 200, 0), 5u);
+    list.batch_for_render();
+    const auto batches = list.batches();
+    LUMEN_CHECK(batches.size() == 4);
+    LUMEN_CHECK(batches[2].kind == primitive_kind::quad && batches[2].count == 2);
+
+    const auto quads = list.quad_instances();
+    std::vector<std::byte> ring(4096);
+    std::uint32_t offsets[4] = {~0u, ~0u, ~0u, ~0u};
+    const std::size_t bytes = list.encode_instances(ring, offsets);
+    constexpr std::size_t q = sizeof(lx::gfx::quad_instance);
+    constexpr std::size_t sh = sizeof(lx::gfx::shadow_instance);
+    LUMEN_CHECK(bytes == 6 * q + sh);
+    LUMEN_CHECK(offsets[0] == 0 && offsets[1] == 4 * q && offsets[2] == 4 * q + sh &&
+                offsets[3] == bytes); // the surface batch copies nothing
+    LUMEN_CHECK(std::memcmp(ring.data(), quads.data(), 4 * q) == 0);
+    LUMEN_CHECK(std::memcmp(ring.data() + 4 * q, &shadow, sh) == 0);
+    LUMEN_CHECK(std::memcmp(ring.data() + 4 * q + sh, &quads[5], q) == 0);
+    LUMEN_CHECK(std::memcmp(ring.data() + 5 * q + sh, &quads[4], q) == 0);
+
+    // Batch starts aligned to 256 bytes: 0, 512 (after 320), 768 (after 576).
+    std::uint32_t aligned[4]{};
+    const std::size_t padded = list.encode_instances(ring, aligned, 256);
+    LUMEN_CHECK(aligned[0] == 0 && aligned[1] == 512 && aligned[2] == 768);
+    LUMEN_CHECK(padded == 768 + 2 * q);
+    LUMEN_CHECK(std::memcmp(ring.data() + 512, &shadow, sh) == 0);
+    LUMEN_CHECK(std::memcmp(ring.data() + 768, &quads[5], q) == 0);
+
+    // A ring too small: the batches that fit whole are written (quads, shadow: 384 of 400
+    // bytes), the last is not, and the result says how much was needed.
+    std::vector<std::byte> small(5 * q, std::byte{0xAB});
+    LUMEN_CHECK(list.encode_instances(small) == bytes);
+    LUMEN_CHECK(std::memcmp(small.data(), quads.data(), 4 * q) == 0);
+    LUMEN_CHECK(std::memcmp(small.data() + 4 * q, &shadow, sh) == 0);
+    LUMEN_CHECK(small[4 * q + sh] == std::byte{0xAB} && small[5 * q - 1] == std::byte{0xAB});
+}
+
 // ── lx.ui::draw_scope ───────────────────────────────────────────────────────────
 
 LUMEN_TEST(draw_scope_fill_emits_a_solid_draw) {
@@ -528,6 +802,58 @@ LUMEN_TEST(draw_scope_opacity_multiplies_colours) {
     out.pop();
     out.fill({0, 60, 10, 10}, lx::color::rgb(1.f, 1.f, 1.f, 1.f));
     LUMEN_CHECK(list.data()[1].solid_color.a == 1.f);
+}
+
+LUMEN_TEST(draw_scope_packed_quad_style_matches_the_unpacked_one) {
+    lx::scene::draw_list list{};
+    list.begin({200, 100});
+    lx::ui::draw_scope out{list, {0, 0, 200, 100}};
+    lx::ui::quad_style style{};
+    style.background = lx::color::rgb(0.3f, 0.6f, 0.9f, 0.7f);
+    style.background_end = lx::color::rgb(0.1f, 0.2f, 0.3f, 1.f);
+    style.gradient_angle_deg = 45.f;
+    style.border_color = lx::color::rgb(1.f, 0.5f, 0.25f, 0.5f);
+    style.corner_radii[0] = 2.f;
+    style.corner_radii[2] = 6.5f;
+    style.border_widths[1] = 1.5f;
+    style.border = lx::ui::border_style::dashed;
+    const lx::ui::packed_quad_style packed = lx::ui::pack_quad_style(style);
+
+    // Opacity 1: the packed form is copied, bit for bit what the float style writes.
+    out.quad({0, 0, 10, 10}, style);
+    out.quad({0, 0, 10, 10}, packed);
+    LUMEN_CHECK(list.quad_instances().size() == 2);
+    lx::gfx::quad_instance a = list.quad_instances()[0];
+    lx::gfx::quad_instance b = list.quad_instances()[1];
+    LUMEN_CHECK(same_quad(a, b));
+    LUMEN_CHECK(a.background[3] == lx::gfx::to_half(0.7f) && a.border_style == 1);
+
+    // Below 1 the packed colours are rescaled from their halves: within one half-float ulp
+    // of folding the opacity in before the premultiply. Geometry and shape are unchanged.
+    out.push_opacity(0.37f);
+    out.quad({20, 0, 10, 10}, style);
+    out.quad({20, 0, 10, 10}, packed);
+    a = list.quad_instances()[2];
+    b = list.quad_instances()[3];
+    const auto near = [](std::uint16_t x, std::uint16_t y) {
+        return (x > y ? x - y : y - x) <= 1;
+    };
+    bool close = true;
+    for (unsigned i = 0; i < 4; ++i) {
+        close = close && near(a.background[i], b.background[i]) &&
+                near(a.background_end[i], b.background_end[i]) &&
+                near(a.border_color[i], b.border_color[i]);
+    }
+    LUMEN_CHECK(close);
+    LUMEN_CHECK(std::memcmp(a.radii, b.radii, sizeof a.radii) == 0);
+    LUMEN_CHECK(std::memcmp(a.border_widths, b.border_widths, sizeof a.border_widths) == 0);
+    LUMEN_CHECK(std::memcmp(a.bounds, b.bounds, sizeof a.bounds) == 0);
+    LUMEN_CHECK(a.gradient_angle == b.gradient_angle && b.border_style == 1);
+    out.pop();
+
+    // A clipped-away packed quad is dropped like any other.
+    out.quad({500, 0, 10, 10}, packed);
+    LUMEN_CHECK(list.quad_instances().size() == 4);
 }
 
 LUMEN_TEST(draw_scope_nested_origins_offset_and_clips_intersect) {

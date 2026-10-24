@@ -435,9 +435,12 @@ public:
     [[nodiscard]] const char* type_name() const override { return "drift_quad"; }
 
     void apply(const drift_props& props) {
+        // Packed once here, when the props change, never per frame (ADR-010 §4.5): the
+        // emit copies halves.
         index_ = props.index;
-        style_ = g_s3.style;
-        style_.background = props.fill;
+        lx::ui::quad_style style = g_s3.style;
+        style.background = props.fill;
+        style_ = lx::ui::pack_quad_style(style);
     }
 
     [[nodiscard]] lx::size2i measure(lx::layout::constraints, lx::ui::size_hint) const override {
@@ -461,7 +464,7 @@ public:
 
 private:
     unsigned index_ = 0;
-    lx::ui::quad_style style_{};
+    lx::ui::packed_quad_style style_{};
 };
 
 // ── Scenario descriptions ───────────────────────────────────────────────────────
@@ -819,41 +822,13 @@ struct scenario_result {
     return n;
 }
 
-/// What a backend does with the sorted stream: gather each batch's instances, in order,
-/// into the ring it uploads. Surface refs stay in the draw-command path and copy nothing.
+/// What a backend does with the sorted stream: `draw_list::encode_instances`, each batch's
+/// instances in order into the ring it uploads. Surface refs stay in the draw-command path
+/// and copy nothing.
 [[nodiscard]] std::uint64_t encode(const lx::scene::draw_list& draws, std::byte* ring,
                                    std::size_t capacity) {
-    const auto quads = draws.quad_instances();
-    const auto shadows = draws.shadow_instances();
-    const auto sprites = draws.sprite_instances();
-    const auto underlines = draws.underline_instances();
-    std::size_t off = 0;
-    const auto put = [&](const void* src, std::size_t n) {
-        if (off + n <= capacity)
-            std::memcpy(ring + off, src, n);
-        off += n;
-    };
-    for (const lx::gfx::primitive_ref& r : draws.refs()) {
-        switch (r.kind) {
-        case lx::gfx::primitive_kind::quad:
-            put(&quads[r.index], sizeof(lx::gfx::quad_instance));
-            break;
-        case lx::gfx::primitive_kind::shadow:
-            put(&shadows[r.index], sizeof(lx::gfx::shadow_instance));
-            break;
-        case lx::gfx::primitive_kind::path:
-        case lx::gfx::primitive_kind::mono_sprite:
-        case lx::gfx::primitive_kind::poly_sprite:
-            put(&sprites[r.index], sizeof(lx::gfx::sprite_instance));
-            break;
-        case lx::gfx::primitive_kind::underline:
-            put(&underlines[r.index], sizeof(lx::gfx::underline_instance));
-            break;
-        case lx::gfx::primitive_kind::surface:
-            break;
-        }
-    }
-    if (off >= sizeof(std::uint32_t)) {
+    const std::size_t off = draws.encode_instances({ring, capacity});
+    if (off >= sizeof(std::uint32_t) && off <= capacity) {
         std::uint32_t word = 0;
         std::memcpy(&word, ring, sizeof word);
         g_sink = g_sink ^ word;

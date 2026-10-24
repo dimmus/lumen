@@ -126,6 +126,18 @@ public:
         return {sorted_, sorted_count_};
     }
     [[nodiscard]] std::span<const lx::gfx::batch> batches() const { return {batches_, batch_count_}; }
+    /// After `batch_for_render`: what a backend uploads (ADR-010 §4.4) — every primitive
+    /// batch's instances, batch after batch, each batch's in its sorted order, packed into
+    /// `ring`. A batch starts at a multiple of `align` bytes (a power of two; 0 and 1 pack
+    /// tight). Refs naming consecutive instances are copied as one block, so a stream the
+    /// sort did not permute is one copy per batch. `batch_offsets`, when given (one entry per
+    /// `batches()`; extra entries untouched, missing ones skipped), receives each batch's
+    /// byte offset; a `surface` batch copies nothing and gets the offset reached. Returns the
+    /// bytes the stream needs: a batch that does not fit `ring` entirely is not written, and
+    /// a result above `ring.size()` tells the caller the ring overflowed.
+    [[nodiscard]] std::size_t encode_instances(std::span<std::byte> ring,
+                                               std::span<std::uint32_t> batch_offsets = {},
+                                               std::size_t align = 1) const;
     [[nodiscard]] std::span<const lx::gfx::quad_instance> quad_instances() const {
         return {quads_.items, quads_.count};
     }
@@ -196,12 +208,15 @@ private:
 
     /// The ref stream and its sort scratch, grown together: the refs in push order (the
     /// primitives first, then the surfaces `batch_for_render` appends), the clipped bounds
-    /// per ref, one packed 64-bit key per ref, and the sorted stream the sort writes into.
-    /// Push order is never disturbed, so `batch_for_render` can run again on the same list.
+    /// per ref, one packed 64-bit key per ref and the radix sort's second key buffer, and
+    /// the sorted stream (refs and their bounds) the sort writes into. Push order is never
+    /// disturbed, so `batch_for_render` can run again on the same list.
     lx::gfx::primitive_ref* refs_ = nullptr;
     lx::rect2i* ref_bounds_ = nullptr;
     std::uint64_t* ref_keys_ = nullptr;
+    std::uint64_t* ref_keys_swap_ = nullptr;
     lx::gfx::primitive_ref* sorted_ = nullptr;
+    lx::rect2i* sorted_bounds_ = nullptr;
     unsigned ref_capacity_ = 0;
     unsigned ref_count_ = 0;
     unsigned sorted_count_ = 0;
@@ -365,7 +380,9 @@ lx::scene::draw_list::~draw_list() {
     delete[] refs_;
     delete[] ref_bounds_;
     delete[] ref_keys_;
+    delete[] ref_keys_swap_;
     delete[] sorted_;
+    delete[] sorted_bounds_;
     delete[] batches_;
 }
 
@@ -400,6 +417,77 @@ namespace {
     if (x1 <= x0 || y1 <= y0)
         return {};
     return {x0, y0, x1 - x0, y1 - y0};
+}
+
+/// Sorts `n` keys whose low 16 bits are their own position (unique, ascending in input
+/// order) by an LSD radix sort over the bytes above those 16 bits, ping-ponging between
+/// `keys` and `swap`, and writes the refs and bounds at those positions in sorted order to
+/// `out_refs` / `out_bounds`. Each pass is stable and the input is in position order, so
+/// the position bits never need a pass: the result is the full 64-bit ascending order. A
+/// byte equal in every key (`varying` has its bits clear: the kind and page of a one-kind
+/// stream, the order's high bytes) is skipped; at least one byte must vary. The last pass
+/// places refs and bounds rather than keys — with a single pass, the usual case, it reads
+/// them in push order instead of gathering them by position afterwards.
+void lx_scene_radix_sort(std::uint64_t* keys, std::uint64_t* swap, unsigned n,
+                         std::uint64_t varying, const lx::gfx::primitive_ref* refs,
+                         const lx::rect2i* bounds, lx::gfx::primitive_ref* out_refs,
+                         lx::rect2i* out_bounds) {
+    unsigned shifts[6]{};
+    unsigned passes = 0;
+    for (unsigned shift = 16; shift < 64; shift += 8)
+        if (((varying >> shift) & 0xFFu) != 0)
+            shifts[passes++] = shift;
+    std::uint64_t* src = keys;
+    std::uint64_t* dst = swap;
+    for (unsigned p = 0; p < passes; ++p) {
+        const unsigned shift = shifts[p];
+        std::uint32_t offsets[256]{};
+        for (unsigned i = 0; i < n; ++i)
+            ++offsets[(src[i] >> shift) & 0xFFu];
+        std::uint32_t sum = 0;
+        for (std::uint32_t& c : offsets) {
+            const std::uint32_t count = c;
+            c = sum;
+            sum += count;
+        }
+        if (p + 1 == passes) {
+            for (unsigned i = 0; i < n; ++i) {
+                const std::uint64_t k = src[i];
+                const std::uint32_t slot = offsets[(k >> shift) & 0xFFu]++;
+                const auto pos = static_cast<unsigned>(k & 0xFFFFu);
+                out_refs[slot] = refs[pos];
+                out_bounds[slot] = bounds[pos];
+            }
+            return;
+        }
+        for (unsigned i = 0; i < n; ++i) {
+            const std::uint64_t k = src[i];
+            dst[offsets[(k >> shift) & 0xFFu]++] = k;
+        }
+        std::uint64_t* t = src;
+        src = dst;
+        dst = t;
+    }
+}
+
+/// The instances `refs[0, count)` name, in that order, into `dst`: a run of consecutive
+/// indices is one block copy, a lone instance a fixed-size one.
+template <typename T>
+void lx_scene_gather(std::byte* dst, const T* src, const lx::gfx::primitive_ref* refs,
+                     unsigned count) {
+    unsigned j = 0;
+    while (j < count) {
+        const std::uint32_t start = refs[j].index;
+        unsigned run = 1;
+        while (j + run < count && refs[j + run].index == start + run)
+            ++run;
+        if (run == 1)
+            std::memcpy(dst, src + start, sizeof(T));
+        else
+            std::memcpy(dst, src + start, sizeof(T) * run);
+        dst += sizeof(T) * run;
+        j += run;
+    }
 }
 
 [[nodiscard]] lx::rect2i lx_scene_union(lx::rect2i a, lx::rect2i b) {
@@ -465,9 +553,13 @@ void lx::scene::draw_list::ensure_ref_capacity(unsigned need) {
     ref_bounds_ = bounds;
     // Sort scratch and output hold nothing between calls.
     delete[] ref_keys_;
+    delete[] ref_keys_swap_;
     delete[] sorted_;
+    delete[] sorted_bounds_;
     ref_keys_ = new std::uint64_t[new_cap];
+    ref_keys_swap_ = new std::uint64_t[new_cap];
     sorted_ = new lx::gfx::primitive_ref[new_cap];
+    sorted_bounds_ = new lx::rect2i[new_cap];
     sorted_count_ = 0;
     ref_capacity_ = new_cap;
 }
@@ -746,20 +838,41 @@ void lx::scene::draw_list::batch_for_render() {
     }
 
     // Stable sort by (order, kind, page) as one 64-bit key per ref, the push position in
-    // the low bits: keys are unique, so an unstable in-place sort of a fixed array (no
-    // allocation, unlike `std::stable_sort`) gives the stable order. The sorted keys then
-    // name the source ref of every output slot; `refs_` itself stays in push order.
+    // the low bits: keys are unique, so the sorted keys name the source ref of every output
+    // slot and the order is the stable one; `refs_` itself stays in push order. Building
+    // the keys also tells whether they already ascend (a stream emitted in order: nothing
+    // to sort) and which key bytes vary at all, so the radix sort (no comparison, no
+    // allocation: two fixed key buffers) runs a pass only for those — typically one, the
+    // order's low byte. Same result as a comparison sort of the full keys.
+    std::uint64_t first_key = 0;
+    std::uint64_t varying = 0;
+    bool ascending = true;
+    std::uint64_t previous = 0;
     for (unsigned i = 0; i < ref_count_; ++i) {
         const lx::gfx::primitive_ref& r = refs_[i];
-        ref_keys_[i] = (static_cast<std::uint64_t>(r.order) << 32u) |
-                       (static_cast<std::uint64_t>(static_cast<std::uint8_t>(r.kind)) << 24u) |
-                       (static_cast<std::uint64_t>(r.page) << 16u) | i;
+        const std::uint64_t key =
+            (static_cast<std::uint64_t>(r.order) << 32u) |
+            (static_cast<std::uint64_t>(static_cast<std::uint8_t>(r.kind)) << 24u) |
+            (static_cast<std::uint64_t>(r.page) << 16u) | i;
+        if (i == 0)
+            first_key = key;
+        ascending = ascending && key >= previous;
+        varying |= key ^ first_key;
+        previous = key;
+        ref_keys_[i] = key;
     }
     static_assert(k_max_refs <= 0xFFFFu, "the ref position must fit the key's low 16 bits");
-    if (ref_count_ > 1)
-        std::sort(ref_keys_, ref_keys_ + ref_count_);
-    for (unsigned i = 0; i < ref_count_; ++i)
-        sorted_[i] = refs_[static_cast<unsigned>(ref_keys_[i] & 0xFFFFu)];
+    // The bounds of `sorted_[i]`, for the batch union below.
+    const lx::rect2i* sorted_bounds = ref_bounds_;
+    if (ascending) {
+        // Already in (order, kind, page) order: the sorted stream is the push order.
+        std::memcpy(sorted_, refs_, sizeof(lx::gfx::primitive_ref) * ref_count_);
+    } else {
+        // Not ascending means some byte above the position bits varies: at least one pass.
+        lx_scene_radix_sort(ref_keys_, ref_keys_swap_, ref_count_, varying, refs_, ref_bounds_,
+                            sorted_, sorted_bounds_);
+        sorted_bounds = sorted_bounds_;
+    }
     sorted_count_ = ref_count_;
 
     // Cut runs: a new batch whenever the kind or the atlas page changes.
@@ -782,8 +895,7 @@ void lx::scene::draw_list::batch_for_render() {
             *current = {r.kind, r.page, i, 0, {}};
         }
         ++current->count;
-        current->bounds = lx_scene_union(
-            current->bounds, ref_bounds_[static_cast<unsigned>(ref_keys_[i] & 0xFFFFu)]);
+        current->bounds = lx_scene_union(current->bounds, sorted_bounds[i]);
     }
 
     if (lx::trace::timeline_enabled()) {
@@ -791,6 +903,62 @@ void lx::scene::draw_list::batch_for_render() {
         lx::trace::timeline_counter("scene.refs", sorted_count_);
         lx::trace::timeline_counter("scene.batches", batch_count_);
     }
+}
+
+std::size_t lx::scene::draw_list::encode_instances(std::span<std::byte> ring,
+                                                   std::span<std::uint32_t> batch_offsets,
+                                                   std::size_t align) const {
+    const std::size_t mask = align > 1 ? align - 1 : 0;
+    std::size_t off = 0;
+    for (unsigned b = 0; b < batch_count_; ++b) {
+        const lx::gfx::batch& run = batches_[b];
+        std::size_t stride = 0;
+        switch (run.kind) {
+        case lx::gfx::primitive_kind::quad:
+            stride = sizeof(lx::gfx::quad_instance);
+            break;
+        case lx::gfx::primitive_kind::shadow:
+            stride = sizeof(lx::gfx::shadow_instance);
+            break;
+        case lx::gfx::primitive_kind::path:
+        case lx::gfx::primitive_kind::mono_sprite:
+        case lx::gfx::primitive_kind::poly_sprite:
+            stride = sizeof(lx::gfx::sprite_instance);
+            break;
+        case lx::gfx::primitive_kind::underline:
+            stride = sizeof(lx::gfx::underline_instance);
+            break;
+        case lx::gfx::primitive_kind::surface:
+            break;
+        }
+        if (stride != 0)
+            off = (off + mask) & ~mask;
+        if (b < batch_offsets.size())
+            batch_offsets[b] = static_cast<std::uint32_t>(off);
+        if (stride == 0)
+            continue;
+        const std::size_t bytes = stride * run.count;
+        if (off + bytes <= ring.size()) {
+            std::byte* dst = ring.data() + off;
+            const lx::gfx::primitive_ref* refs = sorted_ + run.first;
+            switch (run.kind) {
+            case lx::gfx::primitive_kind::quad:
+                lx_scene_gather(dst, quads_.items, refs, run.count);
+                break;
+            case lx::gfx::primitive_kind::shadow:
+                lx_scene_gather(dst, shadows_.items, refs, run.count);
+                break;
+            case lx::gfx::primitive_kind::underline:
+                lx_scene_gather(dst, underlines_.items, refs, run.count);
+                break;
+            default:
+                lx_scene_gather(dst, sprites_.items, refs, run.count);
+                break;
+            }
+        }
+        off += bytes;
+    }
+    return off;
 }
 
 unsigned lx::scene::draw_list::size() const { return count_; }

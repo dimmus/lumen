@@ -51,6 +51,26 @@ struct quad_style {
     border_style border = border_style::solid;
 };
 
+/// A `quad_style` converted once to the instance encoding (ADR-010 §4.5): f16 radii and
+/// border widths, premultiplied f16 colours — the fields of `gfx::quad_instance` after its
+/// bounds and clip. A retained node whose style rarely changes packs it when it does (in
+/// `apply`) and emits the packed form every frame: `draw_scope::quad` then copies it with
+/// no conversion at scope opacity 1, and below 1 only rescales the three colours.
+struct packed_quad_style {
+    std::uint16_t radii[4]{};          ///< f16, as `quad_style::corner_radii`
+    std::uint16_t border_widths[4]{};  ///< f16, as `quad_style::border_widths`
+    std::uint16_t background[4]{};     ///< premultiplied f16 rgba
+    std::uint16_t background_end[4]{}; ///< premultiplied f16 rgba (= `background` when solid)
+    std::uint16_t border_color[4]{};   ///< premultiplied f16 rgba
+    std::uint16_t gradient_angle{};    ///< f16 degrees
+    std::uint8_t border_style = 0;     ///< `gfx::quad_instance::border_style`
+    std::uint8_t gradient_space = 0;   ///< `gfx::quad_instance::gradient_space`
+};
+
+/// `style` packed with `opacity` folded into each colour's alpha before premultiplying —
+/// bit for bit what `draw_scope::quad(bounds, style)` writes in a scope of that opacity.
+[[nodiscard]] packed_quad_style pack_quad_style(const quad_style& style, float opacity = 1.f);
+
 /// A blurred rounded rectangle cast by a box, outside it or inset (ADR-010 §4.2 `shadow`).
 struct shadow_style {
     lx::color color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
@@ -81,6 +101,10 @@ public:
 
     /// Append a rounded, bordered, solid or gradient rectangle over `bounds`.
     void quad(lx::rect2i bounds, const quad_style& style);
+    /// The same from a style packed once (`pack_quad_style` at opacity 1): no half
+    /// conversion at scope opacity 1; below it the colours are scaled from their halves,
+    /// within one half-float ulp of what the unpacked overload writes.
+    void quad(lx::rect2i bounds, const packed_quad_style& style);
     /// Append a shadow cast by `bounds` (what its blur reaches decides visibility).
     void shadow(lx::rect2i bounds, const shadow_style& style);
     /// Append an atlas sprite over `bounds`: `kind` is `mono_sprite`, `poly_sprite` or
@@ -105,6 +129,12 @@ private:
     };
 
     void push_frame(frame f);
+    /// Offsets `bounds` by the origin into `placed` and clips it into `visible`; false when
+    /// nothing of it is visible.
+    [[nodiscard]] bool place(lx::rect2i bounds, lx::rect2i& placed, lx::rect2i& visible) const;
+    /// `quad`'s common tail: `colour_scale` multiplies the packed colours (1: as they are).
+    void emit_quad(lx::rect2i placed, lx::rect2i visible, const packed_quad_style& style,
+                   float colour_scale);
     [[nodiscard]] frame& top();
     [[nodiscard]] const frame& top() const;
 
@@ -263,7 +293,31 @@ void lx_ui_write_half4(std::uint16_t (&out)[4], const float (&v)[4]) {
         out[i] = lx::gfx::to_half(v[i]);
 }
 
+void lx_ui_copy_half4(std::uint16_t (&out)[4], const std::uint16_t (&in)[4]) {
+    for (unsigned i = 0; i < 4; ++i)
+        out[i] = in[i];
+}
+
+/// A premultiplied half colour at `scale` × its coverage: every channel scales alike.
+void lx_ui_scale_half4(std::uint16_t (&out)[4], const std::uint16_t (&in)[4], float scale) {
+    for (unsigned i = 0; i < 4; ++i)
+        out[i] = lx::gfx::to_half(lx::gfx::from_half(in[i]) * scale);
+}
+
 } // namespace
+
+lx::ui::packed_quad_style lx::ui::pack_quad_style(const quad_style& style, float opacity) {
+    packed_quad_style p{};
+    lx_ui_write_half4(p.radii, style.corner_radii);
+    lx_ui_write_half4(p.border_widths, style.border_widths);
+    lx_ui_write_rgba(p.background, style.background, opacity);
+    lx_ui_write_rgba(p.background_end,
+                     style.background_end ? *style.background_end : style.background, opacity);
+    lx_ui_write_rgba(p.border_color, style.border_color, opacity);
+    p.gradient_angle = lx::gfx::to_half(style.gradient_angle_deg);
+    p.border_style = style.border == border_style::dashed ? 1 : 0;
+    return p;
+}
 
 lx::ui::draw_scope::draw_scope(lx::scene::draw_list& out, lx::rect2i clip) : out_{&out} {
     // Every emitter writes the list's overlap grid, which is UI affinity (ADR-010 §4.12).
@@ -357,28 +411,53 @@ void lx::ui::draw_scope::fill(lx::rect2i dst, lx::color color) {
     ++emitted_;
 }
 
-void lx::ui::draw_scope::quad(lx::rect2i bounds, const quad_style& style) {
-    if (!out_)
-        return;
+bool lx::ui::draw_scope::place(lx::rect2i bounds, lx::rect2i& placed,
+                               lx::rect2i& visible) const {
     const frame& f = top();
-    lx::rect2i placed = bounds;
+    placed = bounds;
     placed.x += f.origin.x;
     placed.y += f.origin.y;
-    const lx::rect2i visible = lx_ui_intersect(placed, f.clip);
-    if (visible.width <= 0 || visible.height <= 0)
-        return;
+    visible = lx_ui_intersect(placed, f.clip);
+    return visible.width > 0 && visible.height > 0;
+}
 
+void lx::ui::draw_scope::quad(lx::rect2i bounds, const quad_style& style) {
+    lx::rect2i placed{};
+    lx::rect2i visible{};
+    if (!out_ || !place(bounds, placed, visible))
+        return;
+    // The scope opacity is folded in at packing, before the premultiply: no rescale after.
+    emit_quad(placed, visible, pack_quad_style(style, top().opacity), 1.f);
+}
+
+void lx::ui::draw_scope::quad(lx::rect2i bounds, const packed_quad_style& style) {
+    lx::rect2i placed{};
+    lx::rect2i visible{};
+    if (!out_ || !place(bounds, placed, visible))
+        return;
+    emit_quad(placed, visible, style, top().opacity);
+}
+
+void lx::ui::draw_scope::emit_quad(lx::rect2i placed, lx::rect2i visible,
+                                   const packed_quad_style& style, float colour_scale) {
+    const frame& f = top();
     lx::gfx::quad_instance q{};
     lx_ui_write_rect(q.bounds, placed);
     lx_ui_write_rect(q.clip, f.clip);
-    lx_ui_write_half4(q.radii, style.corner_radii);
-    lx_ui_write_half4(q.border_widths, style.border_widths);
-    lx_ui_write_rgba(q.background, style.background, f.opacity);
-    lx_ui_write_rgba(q.background_end,
-                     style.background_end ? *style.background_end : style.background, f.opacity);
-    lx_ui_write_rgba(q.border_color, style.border_color, f.opacity);
-    q.gradient_angle = lx::gfx::to_half(style.gradient_angle_deg);
-    q.border_style = style.border == border_style::dashed ? 1 : 0;
+    lx_ui_copy_half4(q.radii, style.radii);
+    lx_ui_copy_half4(q.border_widths, style.border_widths);
+    if (colour_scale == 1.f) {
+        lx_ui_copy_half4(q.background, style.background);
+        lx_ui_copy_half4(q.background_end, style.background_end);
+        lx_ui_copy_half4(q.border_color, style.border_color);
+    } else {
+        lx_ui_scale_half4(q.background, style.background, colour_scale);
+        lx_ui_scale_half4(q.background_end, style.background_end, colour_scale);
+        lx_ui_scale_half4(q.border_color, style.border_color, colour_scale);
+    }
+    q.gradient_angle = style.gradient_angle;
+    q.border_style = style.border_style;
+    q.gradient_space = style.gradient_space;
     out_->push_quad(q, visible, out_->orders().assign(visible));
     ++emitted_;
 }
