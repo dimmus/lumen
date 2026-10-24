@@ -895,7 +895,9 @@ unsigned lx::scene::mark_occlusion(std::span<draw_command> draws, lx::rect2i out
 
 void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    out.clear();
+    // The order grid covers the view's pixels (empty: unbounded), the space draws land in
+    // after projection and any output transform.
+    out.begin(view_config(slot).projection.size);
     emit_context ctx{};
     ctx.projection = view_config(slot).projection;
     ctx.view = slot;

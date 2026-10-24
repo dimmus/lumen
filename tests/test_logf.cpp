@@ -3,6 +3,8 @@
 import std;
 import lx.trace;
 
+#include "lx.trace/scope.hpp"
+
 namespace {
 
 struct capture {
@@ -73,6 +75,23 @@ LUMEN_TEST(logf_truncates_long_lines) {
     LUMEN_CHECK(c.lines.size() == 1);
     LUMEN_CHECK(c.lines[0].size() == lx::trace::logger::k_max_line - 1);
     LUMEN_CHECK(c.lines[0].find_first_not_of('x') == std::string::npos);
+}
+
+// `##__LINE__` used to paste the token `__LINE__` itself, so a second scope in one block
+// redeclared the first's variable.
+LUMEN_TEST(trace_scope_twice_in_one_block) {
+    capture c;
+    sink_guard g{c, lx::trace::level::trace};
+    {
+        LX_TRACE_SCOPE("t", "outer");
+        LX_TRACE_SCOPE("t", "inner");
+        LUMEN_CHECK(c.lines.size() == 2);
+    }
+    LUMEN_CHECK(c.lines.size() == 4);
+    LUMEN_CHECK(c.lines[0] == "outer");
+    LUMEN_CHECK(c.lines[1] == "inner");
+    LUMEN_CHECK(c.lines[2] == "~inner");
+    LUMEN_CHECK(c.lines[3] == "~outer");
 }
 
 int main(int argc, char** argv) {

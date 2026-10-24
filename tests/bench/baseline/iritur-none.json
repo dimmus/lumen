@@ -1,0 +1,395 @@
+[
+  {
+    "host": {
+      "kernel": "7.2.10-fastvm",
+      "cpus": 2,
+      "cpu": "Intel(R) Pentium(R) Gold G6405 CPU @ 4.10GHz",
+      "arch": "x86_64",
+      "hostname": "iritur"
+    },
+    "driver": "none",
+    "git": "c4260ae-dirty",
+    "preset": "release",
+    "scenario": "S1",
+    "title": "idle window",
+    "backend": "none",
+    "frames": 600,
+    "warmup": 120,
+    "period_us": 1000,
+    "scale": 1.0,
+    "view": {
+      "width": 640,
+      "height": 480
+    },
+    "stages": {
+      "update": {
+        "p50": 0.02,
+        "p95": 0.05,
+        "p99": 0.079,
+        "max": 0.434,
+        "samples": 600
+      },
+      "tick_idle": {
+        "p50": 0.217,
+        "p95": 1.315,
+        "p99": 2.169,
+        "max": 52.604,
+        "samples": 600
+      },
+      "tick": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "describe": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "reconcile": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "emit": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "order": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "encode": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "emit_order_encode": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "frame": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      }
+    },
+    "counters": {
+      "frames_produced": 0,
+      "frames_idle": 600,
+      "frames_described": 0,
+      "nodes": 11,
+      "primitives": 0,
+      "primitives_built": 2,
+      "primitives_total": 0,
+      "surfaces": 0,
+      "refs": 0,
+      "batches": 0,
+      "instance_bytes": 0,
+      "damage_rects": 0,
+      "damage_px": 0,
+      "damage_fraction": 0.0,
+      "overflow_drops": 0
+    },
+    "memory": {
+      "allocations": 0,
+      "allocated_bytes": 0,
+      "allocations_per_steady_frame": 0.0,
+      "mallinfo2_uordblks_delta": 0,
+      "rss_anon_kb": 1168
+    },
+    "gpu": {},
+    "gates": {
+      "G1": "pass",
+      "G5": "pass"
+    }
+  },
+  {
+    "host": {
+      "kernel": "7.2.10-fastvm",
+      "cpus": 2,
+      "cpu": "Intel(R) Pentium(R) Gold G6405 CPU @ 4.10GHz",
+      "arch": "x86_64",
+      "hostname": "iritur"
+    },
+    "driver": "none",
+    "git": "c4260ae-dirty",
+    "preset": "release",
+    "scenario": "S2",
+    "title": "shell panel replica",
+    "backend": "none",
+    "frames": 36000,
+    "warmup": 120,
+    "period_us": 1000,
+    "scale": 1.0,
+    "view": {
+      "width": 1920,
+      "height": 36
+    },
+    "stages": {
+      "update": {
+        "p50": 0.099,
+        "p95": 0.544,
+        "p99": 1.016,
+        "max": 564.346,
+        "samples": 36000
+      },
+      "tick_idle": {
+        "p50": 0.258,
+        "p95": 1.419,
+        "p99": 2.983,
+        "max": 703.886,
+        "samples": 35400
+      },
+      "tick": {
+        "p50": 19.333,
+        "p95": 119.586,
+        "p99": 250.191,
+        "max": 1487.151,
+        "samples": 600
+      },
+      "describe": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "reconcile": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout": {
+        "p50": 4.952,
+        "p95": 56.762,
+        "p99": 62.255,
+        "max": 1192.821,
+        "samples": 600
+      },
+      "emit": {
+        "p50": 11.324,
+        "p95": 61.106,
+        "p99": 129.943,
+        "max": 678.215,
+        "samples": 600
+      },
+      "order": {
+        "p50": 2.719,
+        "p95": 6.789,
+        "p99": 57.774,
+        "max": 152.059,
+        "samples": 600
+      },
+      "encode": {
+        "p50": 0.777,
+        "p95": 1.267,
+        "p99": 11.577,
+        "max": 56.031,
+        "samples": 600
+      },
+      "emit_order_encode": {
+        "p50": 15.89,
+        "p95": 113.845,
+        "p99": 187.264,
+        "max": 733.532,
+        "samples": 600
+      },
+      "frame": {
+        "p50": 23.012,
+        "p95": 123.788,
+        "p99": 253.728,
+        "max": 1542.493,
+        "samples": 600
+      }
+    },
+    "counters": {
+      "frames_produced": 600,
+      "frames_idle": 35400,
+      "frames_described": 0,
+      "nodes": 49,
+      "primitives": 49,
+      "primitives_built": 49,
+      "primitives_total": 29400,
+      "surfaces": 0,
+      "refs": 49,
+      "batches": 1,
+      "instance_bytes": 3920,
+      "damage_rects": 1,
+      "damage_px": 784,
+      "damage_fraction": 0.01134,
+      "overflow_drops": 0
+    },
+    "memory": {
+      "allocations": 0,
+      "allocated_bytes": 0,
+      "allocations_per_steady_frame": 0.0,
+      "mallinfo2_uordblks_delta": 0,
+      "rss_anon_kb": 5248
+    },
+    "gpu": {},
+    "gates": {
+      "G2": "pass",
+      "G5": "pass"
+    }
+  },
+  {
+    "host": {
+      "kernel": "7.2.10-fastvm",
+      "cpus": 2,
+      "cpu": "Intel(R) Pentium(R) Gold G6405 CPU @ 4.10GHz",
+      "arch": "x86_64",
+      "hostname": "iritur"
+    },
+    "driver": "none",
+    "git": "c4260ae-dirty",
+    "preset": "release",
+    "scenario": "S3",
+    "title": "drifting rounded quads",
+    "backend": "none",
+    "frames": 1800,
+    "warmup": 120,
+    "period_us": 1000,
+    "scale": 1.0,
+    "view": {
+      "width": 1919,
+      "height": 1080
+    },
+    "stages": {
+      "update": {
+        "p50": 70.314,
+        "p95": 188.926,
+        "p99": 766.518,
+        "max": 2146.918,
+        "samples": 1800
+      },
+      "tick_idle": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "tick": {
+        "p50": 2280.863,
+        "p95": 5220.72,
+        "p99": 9968.251,
+        "max": 31906.033,
+        "samples": 1800
+      },
+      "describe": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "reconcile": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout": {
+        "p50": 484.249,
+        "p95": 1176.397,
+        "p99": 3761.367,
+        "max": 8083.694,
+        "samples": 1800
+      },
+      "emit": {
+        "p50": 1752.345,
+        "p95": 3851.987,
+        "p99": 8325.923,
+        "max": 23817.023,
+        "samples": 1800
+      },
+      "order": {
+        "p50": 492.427,
+        "p95": 984.124,
+        "p99": 2896.473,
+        "max": 10227.131,
+        "samples": 1800
+      },
+      "encode": {
+        "p50": 164.463,
+        "p95": 417.647,
+        "p99": 1563.635,
+        "max": 5728.067,
+        "samples": 1800
+      },
+      "emit_order_encode": {
+        "p50": 2436.226,
+        "p95": 5451.855,
+        "p99": 10901.609,
+        "max": 24800.844,
+        "samples": 1800
+      },
+      "frame": {
+        "p50": 3003.156,
+        "p95": 6623.065,
+        "p99": 12239.15,
+        "max": 32889.884,
+        "samples": 1800
+      }
+    },
+    "counters": {
+      "frames_produced": 1800,
+      "frames_idle": 0,
+      "frames_described": 0,
+      "nodes": 10651,
+      "primitives": 10001,
+      "primitives_built": 10001,
+      "primitives_total": 18001800,
+      "surfaces": 0,
+      "refs": 10001,
+      "batches": 1,
+      "instance_bytes": 800080,
+      "damage_rects": 0,
+      "damage_px": 0,
+      "damage_fraction": 0.0,
+      "overflow_drops": 0
+    },
+    "memory": {
+      "allocations": 0,
+      "allocated_bytes": 0,
+      "allocations_per_steady_frame": 0.0,
+      "mallinfo2_uordblks_delta": 0,
+      "rss_anon_kb": 13468
+    },
+    "gpu": {},
+    "gates": {
+      "G3": "fail",
+      "G5": "pass"
+    }
+  }
+]

@@ -15,6 +15,7 @@ export module lx.gfx;
 import std;
 
 export import :damage;
+export import :primitives;
 export import :dmabuf;
 export import :syncobj;
 export import :drm_timeline;

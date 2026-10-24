@@ -639,9 +639,21 @@ See [../uml/28-import-cache-sequence.mmd](../uml/28-import-cache-sequence.mmd).
 
 ## 6. Draw batching + pipeline cache
 
-Before `try_publish()`, `draw_list::batch_for_render()` partitions opaque and
-translucent draws, preserves paint order for alpha blending, and uses texture ID
-only as a tiebreaker within a batch.
+Before publishing, `draw_list::batch_for_render()` sorts the surface draws into strict
+painter's order (sort key, then texture id as a tie-break; no opaque-first partition —
+there is no depth buffer), then builds the primitive stream of ADR-010 §4.3 over the
+surfaces and the UI primitives (`lx.gfx:primitives`) emitted into the same list: every
+primitive took an `order` from the list's overlap grid at emission (one more than the
+highest order under its bounds, so non-overlapping primitives share an order), a surface
+draw takes one at push once the list has a primitive stream (those pushed before it starts
+take theirs back to front when it does), and the stream is stable-sorted by `(order, kind,
+page)` on packed 64-bit keys in a preallocated scratch and cut into batches wherever the
+kind or atlas page changes, with the union of each run's clipped bounds kept for damage
+skipping. One instanced draw per batch is the target for the UI backends (≤ 8 for the
+10 000-quad scene, ADR-010 G3); the compositor's backends still take the sorted
+`draw_command` array as before. A list without primitives — the compositor's scene — has
+no stream: it is only sorted, never touches the grid, and its `refs()` / `batches()` are
+empty.
 
 `pipeline_cache::acquire(pipeline_key)` returns cached pipeline handle (stub until P0 Vulkan).
 

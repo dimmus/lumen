@@ -122,8 +122,8 @@ void timeline_instant(const char* category, const char* name);
 /// stopped. False when nothing was recording or the file could not be written.
 bool timeline_flush();
 
-#define LX_TRACE_SCOPE(cat, name) \
-    ::lx::trace::scoped_span _lx_span_##__LINE__{cat, name}
+// `LX_TRACE_SCOPE(cat, name)`, a `scoped_span` for the rest of the block, is a macro and so
+// lives in `lx.trace/scope.hpp`: a named module exports no macros.
 
 void trace_event(level lvl, const char* category, const char* name,
                  const char* key = nullptr, const char* value = nullptr);

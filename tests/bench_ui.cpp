@@ -1,0 +1,1440 @@
+// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phase 0.
+//
+// The scenarios S1–S3 of §8.3 run against lx.ui's declarative core the way an application
+// uses it: descriptors reconciled onto retained nodes by `ui_root::tick`, nodes emitting
+// ADR-010 primitives through `draw_scope`, the overlap grid and the `(order, kind, page)`
+// sort of `draw_list::batch_for_render`. Every number is attributed to a stage (§8.1) with
+// CLOCK_MONOTONIC read around the call; the lx.trace spans on the same stages feed Perfetto
+// and are not what the table is made of.
+//
+// Phase 0 has no primitive renderer, so the only backend is `none`: the stages through
+// `encode` (the sorted instances gathered into a ring — the bytes a backend uploads) are
+// measured and nothing is submitted. Phase 1 adds `cpu`, `gl` and `vulkan` behind the same
+// `--backend` flag; nothing is renamed.
+//
+//   lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none] [--frames N] [--warmup N]
+//                  [--period-us US] [--json PATH] [--pin CPU|none] [--scale F] [--git SHA]
+//                  [--preset NAME]
+//
+// Frames come from a frame clock (`--period-us`): a scenario whose work is a few
+// microseconds per frame is otherwise over in a millisecond, one sample of whatever the
+// host was doing at that instant rather than a distribution. The default is 1 ms — the
+// samples spread over seconds and the core stays warm, which on a shared 2-vCPU host is
+// what makes p95 repeat run after run; 16667 is a display's 60 Hz cadence and gives the
+// cold number (every frame after a 16 ms sleep), 0 runs frames back to back. Deterministic:
+// the scenes are seeded (xorshift64) and read no clock. The exit status is 0 whatever the
+// numbers say — CTest checks that it ran; the `gates` block of the JSON and
+// scripts/ui-bench.sh carry the verdicts.
+
+#include <errno.h>
+#include <malloc.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <sys/utsname.h>
+#include <time.h>
+#include <unistd.h>
+
+import std;
+import lx.foundation;
+import lx.runtime;
+import lx.layout;
+import lx.gfx;
+import lx.scene;
+import lx.ui;
+import lx.trace;
+
+// ── Heap accounting (G5) ────────────────────────────────────────────────────────
+//
+// Every `new` in the process goes through these — a global replacement, one relaxed atomic
+// each — so a steady frame's allocation count is exact, not sampled. `mallinfo2` is read
+// beside it: it also sees `malloc` calls that never went through `new`.
+
+namespace {
+
+std::atomic<std::uint64_t> g_new_calls{0};
+std::atomic<std::uint64_t> g_new_bytes{0};
+
+void* counted_alloc(std::size_t n) noexcept {
+    g_new_calls.fetch_add(1, std::memory_order_relaxed);
+    g_new_bytes.fetch_add(n, std::memory_order_relaxed);
+    return std::malloc(n > 0 ? n : 1);
+}
+
+void* counted_aligned_alloc(std::size_t n, std::align_val_t align) noexcept {
+    g_new_calls.fetch_add(1, std::memory_order_relaxed);
+    g_new_bytes.fetch_add(n, std::memory_order_relaxed);
+    const auto a = static_cast<std::size_t>(align);
+    const std::size_t rounded = (n + a - 1) / a * a;
+    return std::aligned_alloc(a, rounded > 0 ? rounded : a);
+}
+
+} // namespace
+
+void* operator new(std::size_t n) {
+    if (void* p = counted_alloc(n))
+        return p;
+    throw std::bad_alloc{};
+}
+void* operator new[](std::size_t n) {
+    if (void* p = counted_alloc(n))
+        return p;
+    throw std::bad_alloc{};
+}
+void* operator new(std::size_t n, const std::nothrow_t&) noexcept { return counted_alloc(n); }
+void* operator new[](std::size_t n, const std::nothrow_t&) noexcept { return counted_alloc(n); }
+void* operator new(std::size_t n, std::align_val_t a) {
+    if (void* p = counted_aligned_alloc(n, a))
+        return p;
+    throw std::bad_alloc{};
+}
+void* operator new[](std::size_t n, std::align_val_t a) {
+    if (void* p = counted_aligned_alloc(n, a))
+        return p;
+    throw std::bad_alloc{};
+}
+void* operator new(std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
+    return counted_aligned_alloc(n, a);
+}
+void* operator new[](std::size_t n, std::align_val_t a, const std::nothrow_t&) noexcept {
+    return counted_aligned_alloc(n, a);
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept { std::free(p); }
+
+namespace {
+
+using lx::ui::child;
+
+// ── Clock, randomness, options ──────────────────────────────────────────────────
+
+[[nodiscard]] std::uint64_t now_ns() {
+    timespec ts{};
+    ::clock_gettime(CLOCK_MONOTONIC, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ull +
+           static_cast<std::uint64_t>(ts.tv_nsec);
+}
+
+struct xorshift64 {
+    std::uint64_t state = 0x9E3779B97F4A7C15ull;
+    [[nodiscard]] std::uint64_t next() {
+        state ^= state << 13u;
+        state ^= state >> 7u;
+        state ^= state << 17u;
+        return state;
+    }
+};
+
+struct options {
+    bool scenarios[3]{true, true, true};
+    const char* backend = "none";
+    unsigned frames = 600;
+    unsigned warmup = 120;
+    unsigned period_us = 1000; ///< the frame clock; 0: no pacing
+    const char* json = nullptr;
+    int pin = -2; ///< -2: the last CPU; -1: none
+    float scale = 1.f;
+    const char* git = "";
+    const char* preset = "release";
+};
+
+/// Keeps the optimiser from deleting the encode copy.
+volatile std::uint32_t g_sink = 0;
+
+// ── Stages and distributions ────────────────────────────────────────────────────
+
+enum stage : unsigned {
+    st_update,            ///< the scenario's per-frame mutation and invalidation (bench side)
+    st_tick_idle,         ///< `ui_root::tick` when it produced nothing
+    st_tick,              ///< `ui_root::tick` when it produced a frame
+    st_describe,          ///< the describer (from `ui_root::last_stage_times`)
+    st_reconcile,         ///< the reconciler
+    st_layout,            ///< measure + arrange
+    st_emit,              ///< emit into the draw list (grid orders assigned here)
+    st_order,             ///< `batch_for_render`: surface refs, sort, batches
+    st_encode,            ///< gather the sorted instances into the ring
+    st_emit_order_encode, ///< G3's sum
+    st_frame,             ///< tick + order + encode: the UI thread's cost of a produced frame
+    st_count,
+};
+
+constexpr const char* k_stage_names[st_count] = {
+    "update", "tick_idle", "tick",   "describe",          "reconcile", "layout",
+    "emit",   "order",     "encode", "emit_order_encode", "frame",
+};
+
+struct summary {
+    double p50 = 0.0;
+    double p95 = 0.0;
+    double p99 = 0.0;
+    double max = 0.0;
+    unsigned samples = 0;
+};
+
+/// Nearest-rank percentiles, in microseconds. Sorts `ns` in place.
+[[nodiscard]] summary summarize(std::vector<std::uint64_t>& ns) {
+    summary s{};
+    s.samples = static_cast<unsigned>(ns.size());
+    if (ns.empty())
+        return s;
+    std::sort(ns.begin(), ns.end());
+    const auto at = [&](double p) {
+        auto rank = static_cast<std::size_t>(std::ceil(p * static_cast<double>(ns.size())));
+        if (rank == 0)
+            rank = 1;
+        if (rank > ns.size())
+            rank = ns.size();
+        return static_cast<double>(ns[rank - 1]) / 1000.0;
+    };
+    s.p50 = at(0.50);
+    s.p95 = at(0.95);
+    s.p99 = at(0.99);
+    s.max = static_cast<double>(ns.back()) / 1000.0;
+    return s;
+}
+
+// ── Colours: GPUI / Zed "One Dark" tokens as literals (ADR-010 §5.1) ────────────
+
+[[nodiscard]] constexpr lx::color tok(int r, int g, int b, float a = 1.f) {
+    return lx::color::rgb(static_cast<float>(r) / 255.f, static_cast<float>(g) / 255.f,
+                          static_cast<float>(b) / 255.f, a);
+}
+
+constexpr lx::color k_background = tok(0x28, 0x2c, 0x33);         // background
+constexpr lx::color k_surface = tok(0x2f, 0x34, 0x3e);            // elevated_surface.background
+constexpr lx::color k_border = tok(0x36, 0x3c, 0x46);             // border
+constexpr lx::color k_element = tok(0x2f, 0x34, 0x3e);            // element.background
+constexpr lx::color k_title_bar = tok(0x3b, 0x41, 0x4d);          // title_bar.background
+constexpr lx::color k_text = tok(0xc8, 0xcc, 0xd4);               // text
+constexpr lx::color k_text_muted = tok(0x87, 0x8a, 0x98);         // text.muted
+constexpr lx::color k_accent = tok(0x74, 0xad, 0xe8);             // text.accent
+constexpr lx::color k_shadow = tok(0x00, 0x00, 0x00, 0.40f);      // §5.2 elevation
+constexpr lx::color k_none = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+
+// ── Scene nodes ─────────────────────────────────────────────────────────────────
+//
+// Built with the declarative API the way an application builds a window: a descriptor per
+// node, reconciled onto a retained node by `ui_root`, each retained node emitting ADR-010
+// primitives through `draw_scope`. Nothing here pushes an instance by hand.
+
+/// A rounded, bordered quad with an optional shadow; its children fill the bounds inside
+/// `pad`. A window frame, a panel cell, the grid's background.
+struct card_props {
+    lx::ui::quad_style style{};
+    lx::ui::shadow_style shadow{}; ///< `blur_sigma` 0: none
+    lx::size2i size{};             ///< preferred; 0 fills the constraint
+    lx::inset pad{};
+};
+
+class card_node final : public lx::ui::ui_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
+    }
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "card"; }
+
+    void apply(const card_props& props) { props_ = props; }
+
+    [[nodiscard]] lx::size2i measure(lx::layout::constraints c, lx::ui::size_hint) const override {
+        lx::size2i out = props_.size;
+        if (out.width <= 0)
+            out.width = c.max.width;
+        if (out.height <= 0)
+            out.height = c.max.height;
+        if (out.width < c.min.width) out.width = c.min.width;
+        if (out.height < c.min.height) out.height = c.min.height;
+        if (out.width > c.max.width) out.width = c.max.width;
+        if (out.height > c.max.height) out.height = c.max.height;
+        return out;
+    }
+
+    void arrange(lx::rect2i bounds) override {
+        bounds_ = bounds;
+        layout_dirty_ = false;
+        const lx::rect2i inner{bounds.x + props_.pad.left, bounds.y + props_.pad.top,
+                               bounds.width - props_.pad.left - props_.pad.right,
+                               bounds.height - props_.pad.top - props_.pad.bottom};
+        for (unsigned i = 0; i < child_count_; ++i) {
+            if (children_[i])
+                children_[i]->arrange(inner);
+        }
+    }
+
+    void emit(lx::ui::draw_scope& out) const override {
+        if (!visible_)
+            return;
+        if (props_.shadow.blur_sigma > 0.f)
+            out.shadow(bounds_, props_.shadow);
+        out.quad(bounds_, props_.style);
+        ui_node::emit(out);
+    }
+
+private:
+    card_props props_{};
+};
+
+/// The panel: a full-width bar that lays its cells out left to right at `pitch`.
+struct panel_props {
+    lx::ui::quad_style style{};
+    int pitch = 0;
+    int inset = 0;
+};
+
+class panel_node final : public lx::ui::ui_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
+    }
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "panel"; }
+
+    void apply(const panel_props& props) { props_ = props; }
+
+    [[nodiscard]] lx::size2i measure(lx::layout::constraints c, lx::ui::size_hint) const override {
+        return c.max;
+    }
+
+    void arrange(lx::rect2i bounds) override {
+        bounds_ = bounds;
+        layout_dirty_ = false;
+        for (unsigned i = 0; i < child_count_; ++i) {
+            if (!children_[i])
+                continue;
+            children_[i]->arrange({bounds.x + static_cast<int>(i) * props_.pitch + props_.inset,
+                                   bounds.y + props_.inset, props_.pitch - 2 * props_.inset,
+                                   bounds.height - 2 * props_.inset});
+        }
+    }
+
+    void emit(lx::ui::draw_scope& out) const override {
+        if (!visible_)
+            return;
+        out.quad(bounds_, props_.style);
+        ui_node::emit(out);
+    }
+
+private:
+    panel_props props_{};
+};
+
+/// A text placeholder: a quad the size the text would shape to (Phase 2 replaces it with
+/// glyph sprites). `text` is read at measure and may change in place between frames.
+struct label_props {
+    const char* text = "";
+    lx::color color{};
+    int glyph_w = 7;
+    int line_h = 14;
+};
+
+class label_node final : public lx::ui::ui_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
+    }
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "label"; }
+
+    void apply(const label_props& props) { props_ = props; }
+
+    [[nodiscard]] lx::size2i measure(lx::layout::constraints c, lx::ui::size_hint) const override {
+        lx::size2i out{static_cast<int>(std::strlen(props_.text)) * props_.glyph_w,
+                       props_.line_h};
+        if (out.width > c.max.width) out.width = c.max.width;
+        if (out.height > c.max.height) out.height = c.max.height;
+        return out;
+    }
+
+    /// Left-aligned, vertically centred in what the parent offers.
+    void arrange(lx::rect2i bounds) override {
+        const lx::size2i wanted = measure({{0, 0}, {bounds.width, bounds.height}},
+                                          lx::ui::size_hint::preferred);
+        bounds_ = {bounds.x, bounds.y + (bounds.height - wanted.height) / 2, wanted.width,
+                   wanted.height};
+        layout_dirty_ = false;
+    }
+
+    void emit(lx::ui::draw_scope& out) const override {
+        if (!visible_)
+            return;
+        lx::ui::quad_style style{};
+        style.background = props_.color;
+        style.corner_radii[0] = style.corner_radii[1] = style.corner_radii[2] =
+            style.corner_radii[3] = 2.f;
+        out.quad(bounds_, style);
+    }
+
+private:
+    label_props props_{};
+};
+
+/// An interior node of the S3 tree: `ui_node::k_max_children` bounds the fan-out, so
+/// 10 000 leaves hang under two levels of these.
+struct group_props {};
+
+class group_node final : public lx::ui::ui_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
+    }
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "group"; }
+    void apply(const group_props&) {}
+};
+
+// ── S3 state: the grid every leaf places itself in ──────────────────────────────
+
+struct s3_scene {
+    unsigned count = 10000;
+    unsigned cols = 125;
+    unsigned rows = 80;
+    int pitch_x = 15;
+    int pitch_y = 13;
+    int quad_w = 10;
+    int quad_h = 8;
+    int origin_x = 22;
+    int origin_y = 20;
+    lx::ui::quad_style style{};
+    std::vector<std::int8_t> drift_x{};
+    std::vector<std::int8_t> drift_y{};
+    xorshift64 rng{};
+    lx::ui::ui_node* root = nullptr;
+};
+
+s3_scene g_s3{};
+
+/// One grid item: a rounded, bordered quad whose position is its grid cell plus the frame's
+/// drift. Drift stays within ±2 px of a 15 × 13 px pitch around a 10 × 8 px quad, so no two
+/// quads ever overlap and every one of them batches with the rest (§4.3).
+struct drift_props {
+    unsigned index = 0;
+    lx::color fill{};
+};
+
+class drift_quad_node final : public lx::ui::ui_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
+    }
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "drift_quad"; }
+
+    void apply(const drift_props& props) {
+        index_ = props.index;
+        style_ = g_s3.style;
+        style_.background = props.fill;
+    }
+
+    [[nodiscard]] lx::size2i measure(lx::layout::constraints, lx::ui::size_hint) const override {
+        return {g_s3.quad_w, g_s3.quad_h};
+    }
+
+    void arrange(lx::rect2i) override {
+        const auto col = static_cast<int>(index_ % g_s3.cols);
+        const auto row = static_cast<int>(index_ / g_s3.cols);
+        bounds_ = {g_s3.origin_x + col * g_s3.pitch_x + g_s3.drift_x[index_],
+                   g_s3.origin_y + row * g_s3.pitch_y + g_s3.drift_y[index_], g_s3.quad_w,
+                   g_s3.quad_h};
+        layout_dirty_ = false;
+    }
+
+    void emit(lx::ui::draw_scope& out) const override {
+        if (!visible_)
+            return;
+        out.quad(bounds_, style_);
+    }
+
+private:
+    unsigned index_ = 0;
+    lx::ui::quad_style style_{};
+};
+
+// ── Scenario descriptions ───────────────────────────────────────────────────────
+
+struct scenario_spec {
+    const char* id = "";
+    const char* title = "";
+    lx::rect2i view{};
+    unsigned arena_bytes = 0;
+    lx::ui::describe_fn describe = nullptr;
+    void (*before_frame)(unsigned frame) = nullptr;      ///< scene mutation + invalidation
+    void (*on_built)(lx::ui::ui_node& root) = nullptr;   ///< once, after the first frame
+    unsigned batch_cap = 0;                              ///< 0: no cap for this scenario
+};
+
+[[nodiscard]] int scaled(int px, float scale) {
+    return static_cast<int>(std::lround(static_cast<float>(px) * scale));
+}
+
+// S1 — an idle window: a frame with a shadow, a title row and a body of stock widgets
+// (`box`, `text`, `button` emit solid surface draws; the frame emits a shadow and a quad).
+// Built once; nothing invalidates afterwards, so `ui_root::tick` must do nothing.
+
+struct s1_scene {
+    float scale = 1.f;
+};
+
+s1_scene g_s1{};
+
+[[nodiscard]] child describe_s1(lx::ui::build_context&) {
+    using namespace lx::ui;
+    const float sc = g_s1.scale;
+
+    child title_items[4] = {
+        text("lumen-hello", k_text),
+        button("min", nullptr, k_element),
+        button("max", nullptr, k_element),
+        button("close", nullptr, k_element),
+    };
+    child title = with_children(describe<box_node, box_props>({k_title_bar, true, scaled(8, sc)}),
+                                title_items);
+
+    child body_items[3] = {
+        text("Hello from the declarative tree", k_text),
+        text("nothing changes after the first frame", k_text_muted),
+        button("OK", nullptr, k_accent),
+    };
+    child body = with_children(describe<box_node, box_props>({k_none, false, scaled(8, sc)}),
+                               body_items);
+
+    child column_items[2] = {title, body};
+    child column = with_children(describe<box_node, box_props>({k_none, false, 0}), column_items);
+
+    card_props frame{};
+    frame.style.background = k_background;
+    frame.style.border_color = k_border;
+    for (float& r : frame.style.corner_radii)
+        r = 8.f * sc;
+    for (float& w : frame.style.border_widths)
+        w = 1.f;
+    frame.shadow.color = k_shadow;
+    frame.shadow.blur_sigma = 12.f * sc;
+    for (float& r : frame.shadow.corner_radii)
+        r = 8.f * sc;
+    frame.pad = {1, 1, 1, 1};
+    return with_children(describe<card_node, card_props>(frame), {&column, 1u});
+}
+
+[[nodiscard]] scenario_spec make_s1(const options& opt) {
+    g_s1.scale = opt.scale;
+    scenario_spec s{};
+    s.id = "S1";
+    s.title = "idle window";
+    s.view = {0, 0, scaled(640, opt.scale), scaled(480, opt.scale)};
+    s.arena_bytes = 64 * 1024;
+    s.describe = describe_s1;
+    return s;
+}
+
+// S2 — the shell panel replica: 24 cells, each a bordered rounded quad with a text
+// placeholder, GPUI's tokens as literal colours. Every 60th frame the clock cell's label
+// changes in place and that label is paint-invalidated: the retained tree is reused with no
+// describe, and the damage is that one label.
+
+constexpr unsigned k_s2_cells = 24;
+constexpr unsigned k_s2_clock = k_s2_cells - 1;
+constexpr lx::ui::element_key k_s2_cell_key = 100;
+constexpr lx::ui::element_key k_s2_label_key = 200;
+
+constexpr const char* k_s2_texts[k_s2_cells] = {
+    "activities", "ws 1",  "ws 2",  "ws 3",    "firefox",  "terminal", "editor", "files",
+    "music",      "chat",  "mail",  "calendar", "notes",   "build",    "logs",   "cpu 12%",
+    "mem 3.1G",   "net",   "bt",    "wifi",     "vol 60%", "bat 87%",  "en",     "00:00:00",
+};
+
+struct s2_scene {
+    int height = 36;
+    int pitch = 80;
+    int inset = 4;
+    int label_pad_x = 8;
+    int glyph_w = 7;
+    int line_h = 14;
+    lx::ui::quad_style panel_style{};
+    lx::ui::quad_style cell_style{};
+    char clock_text[9] = "00:00:00";
+    lx::ui::ui_node* clock_label = nullptr;
+};
+
+s2_scene g_s2{};
+
+[[nodiscard]] child describe_s2(lx::ui::build_context&) {
+    using namespace lx::ui;
+    child cells[k_s2_cells]{};
+    for (unsigned i = 0; i < k_s2_cells; ++i) {
+        label_props lp{};
+        lp.text = i == k_s2_clock ? g_s2.clock_text : k_s2_texts[i];
+        lp.color = i == k_s2_clock ? k_text : k_text_muted;
+        lp.glyph_w = g_s2.glyph_w;
+        lp.line_h = g_s2.line_h;
+        child label = describe<label_node, label_props>(lp, k_s2_label_key + i);
+
+        card_props cp{};
+        cp.style = g_s2.cell_style;
+        cp.pad = {0, g_s2.label_pad_x, 0, g_s2.label_pad_x};
+        cells[i] = with_children(describe<card_node, card_props>(cp, k_s2_cell_key + i),
+                                 {&label, 1u});
+    }
+    panel_props pp{};
+    pp.style = g_s2.panel_style;
+    pp.pitch = g_s2.pitch;
+    pp.inset = g_s2.inset;
+    return with_children(describe<panel_node, panel_props>(pp), cells);
+}
+
+[[nodiscard]] lx::ui::ui_node* find_key(lx::ui::ui_node& node, lx::ui::element_key key) {
+    if (node.key() == key)
+        return &node;
+    for (unsigned i = 0; i < node.child_count(); ++i) {
+        if (lx::ui::ui_node* c = node.child_at(i)) {
+            if (lx::ui::ui_node* hit = find_key(*c, key))
+                return hit;
+        }
+    }
+    return nullptr;
+}
+
+void s2_on_built(lx::ui::ui_node& root) {
+    g_s2.clock_label = find_key(root, k_s2_label_key + k_s2_clock);
+}
+
+void s2_before_frame(unsigned frame) {
+    if (frame % 60 != 0 || !g_s2.clock_label)
+        return;
+    // The clock advances a second per 60 frames; same length every time, so this is a
+    // paint change, not a layout one.
+    const unsigned seconds = frame / 60;
+    const unsigned h = (seconds / 3600) % 24;
+    const unsigned m = (seconds / 60) % 60;
+    const unsigned s = seconds % 60;
+    char* t = g_s2.clock_text;
+    t[0] = static_cast<char>('0' + h / 10);
+    t[1] = static_cast<char>('0' + h % 10);
+    t[3] = static_cast<char>('0' + m / 10);
+    t[4] = static_cast<char>('0' + m % 10);
+    t[6] = static_cast<char>('0' + s / 10);
+    t[7] = static_cast<char>('0' + s % 10);
+    lx::ui::invalidate_paint(*g_s2.clock_label);
+}
+
+[[nodiscard]] scenario_spec make_s2(const options& opt) {
+    const float sc = opt.scale;
+    g_s2 = {};
+    g_s2.height = scaled(36, sc);
+    g_s2.pitch = scaled(80, sc);
+    g_s2.inset = scaled(4, sc);
+    g_s2.label_pad_x = scaled(8, sc);
+    g_s2.glyph_w = scaled(7, sc);
+    g_s2.line_h = scaled(14, sc);
+    g_s2.panel_style.background = k_background;
+    g_s2.panel_style.border_color = k_border;
+    g_s2.panel_style.border_widths[2] = 1.f; // bottom
+    g_s2.cell_style.background = k_surface;
+    g_s2.cell_style.border_color = k_border;
+    for (float& r : g_s2.cell_style.corner_radii)
+        r = 4.f * sc;
+    for (float& w : g_s2.cell_style.border_widths)
+        w = 1.f;
+
+    scenario_spec s{};
+    s.id = "S2";
+    s.title = "shell panel replica";
+    s.view = {0, 0, g_s2.pitch * static_cast<int>(k_s2_cells), g_s2.height};
+    s.arena_bytes = 64 * 1024;
+    s.describe = describe_s2;
+    s.before_frame = s2_before_frame;
+    s.on_built = s2_on_built;
+    s.batch_cap = 8;
+    return s;
+}
+
+// S3 — 10 000 rounded, bordered quads in a grid, each drifting by a seeded delta every
+// frame. Every frame the whole tree is dirty: the drift of every leaf changes and the root
+// is animate-invalidated (ADR-010 §4.9's animation path), so every node is laid out and
+// emitted again. The three-level tree is what `ui_node::k_max_children` makes of 10 000
+// leaves: 25 groups × 25 groups × 16 leaves.
+
+constexpr unsigned k_s3_leaves_per_group = 16;
+constexpr unsigned k_s3_groups_per_band = 25;
+constexpr unsigned k_s3_band = k_s3_leaves_per_group * k_s3_groups_per_band;
+
+[[nodiscard]] lx::color s3_fill(unsigned index) {
+    // A fixed hash per quad, so colours are deterministic and vary across the grid.
+    std::uint32_t h = index * 2654435761u;
+    h ^= h >> 15u;
+    h *= 2246822519u;
+    h ^= h >> 13u;
+    const float r = 0.25f + 0.55f * static_cast<float>(h & 0xFFu) / 255.f;
+    const float g = 0.25f + 0.55f * static_cast<float>((h >> 8u) & 0xFFu) / 255.f;
+    const float b = 0.30f + 0.55f * static_cast<float>((h >> 16u) & 0xFFu) / 255.f;
+    return lx::color::rgb(r, g, b);
+}
+
+[[nodiscard]] child describe_s3(lx::ui::build_context&) {
+    using namespace lx::ui;
+    child bands[ui_node::k_max_children]{};
+    unsigned band_count = 0;
+    for (unsigned first = 0; first < g_s3.count && band_count < ui_node::k_max_children;
+         first += k_s3_band) {
+        child groups[k_s3_groups_per_band]{};
+        unsigned group_count = 0;
+        const unsigned band_end = first + k_s3_band < g_s3.count ? first + k_s3_band : g_s3.count;
+        for (unsigned g = first; g < band_end; g += k_s3_leaves_per_group) {
+            child leaves[k_s3_leaves_per_group]{};
+            unsigned leaf_count = 0;
+            const unsigned group_end =
+                g + k_s3_leaves_per_group < band_end ? g + k_s3_leaves_per_group : band_end;
+            for (unsigned i = g; i < group_end; ++i)
+                leaves[leaf_count++] = describe<drift_quad_node, drift_props>({i, s3_fill(i)});
+            groups[group_count++] = with_children(describe<group_node, group_props>({}),
+                                                  {leaves, leaf_count});
+        }
+        bands[band_count++] =
+            with_children(describe<group_node, group_props>({}), {groups, group_count});
+    }
+    card_props bg{};
+    bg.style.background = k_background;
+    return with_children(describe<card_node, card_props>(bg), {bands, band_count});
+}
+
+void s3_on_built(lx::ui::ui_node& root) { g_s3.root = &root; }
+
+void s3_before_frame(unsigned) {
+    for (unsigned i = 0; i < g_s3.count; ++i) {
+        const std::uint64_t r = g_s3.rng.next();
+        int dx = g_s3.drift_x[i] + static_cast<int>(r % 3u) - 1;
+        int dy = g_s3.drift_y[i] + static_cast<int>((r >> 8u) % 3u) - 1;
+        dx = dx < -2 ? -2 : (dx > 2 ? 2 : dx);
+        dy = dy < -2 ? -2 : (dy > 2 ? 2 : dy);
+        g_s3.drift_x[i] = static_cast<std::int8_t>(dx);
+        g_s3.drift_y[i] = static_cast<std::int8_t>(dy);
+    }
+    if (g_s3.root)
+        lx::ui::invalidate_animate(*g_s3.root);
+}
+
+[[nodiscard]] scenario_spec make_s3(const options& opt) {
+    g_s3 = {};
+    // `--scale` multiplies the quad count; the background quad takes one slot of the cap.
+    auto count = static_cast<long>(std::lround(10000.0 * static_cast<double>(opt.scale)));
+    const long cap = static_cast<long>(lx::gfx::k_max_primitives) - 1;
+    if (count < 1)
+        count = 1;
+    if (count > cap)
+        count = cap;
+    g_s3.count = static_cast<unsigned>(count);
+    g_s3.rows = (g_s3.count + g_s3.cols - 1) / g_s3.cols;
+    g_s3.style.background = k_surface;
+    g_s3.style.border_color = k_border;
+    for (float& r : g_s3.style.corner_radii)
+        r = 3.f;
+    for (float& w : g_s3.style.border_widths)
+        w = 1.f;
+    g_s3.drift_x.assign(g_s3.count, 0);
+    g_s3.drift_y.assign(g_s3.count, 0);
+
+    scenario_spec s{};
+    s.id = "S3";
+    s.title = "drifting rounded quads";
+    s.view = {0, 0, static_cast<int>(g_s3.cols) * g_s3.pitch_x + 2 * g_s3.origin_x,
+              static_cast<int>(g_s3.rows) * g_s3.pitch_y + 2 * g_s3.origin_y};
+    s.arena_bytes = 8 * 1024 * 1024;
+    s.describe = describe_s3;
+    s.before_frame = s3_before_frame;
+    s.on_built = s3_on_built;
+    s.batch_cap = 8;
+    return s;
+}
+
+// ── The measured loop ───────────────────────────────────────────────────────────
+
+struct counters {
+    unsigned frames_produced = 0;
+    unsigned frames_idle = 0;
+    unsigned frames_described = 0;
+    unsigned nodes = 0;
+    unsigned primitives_built = 0; ///< what the first frame emitted (the tree as built)
+    unsigned primitives = 0;       ///< per produced frame, max over the window
+    std::uint64_t primitives_total = 0;
+    unsigned surfaces = 0;
+    unsigned refs = 0;
+    unsigned batches = 0;
+    std::uint64_t instance_bytes = 0;
+    unsigned damage_rects = 0;
+    std::uint64_t damage_px = 0;
+    double damage_fraction = 0.0;
+    unsigned overflow_drops = 0;
+};
+
+struct memory_stats {
+    std::uint64_t allocations = 0;
+    std::uint64_t allocated_bytes = 0;
+    double per_frame = 0.0;
+    long long mallinfo_delta = 0;
+    long rss_anon_kb = 0;
+};
+
+/// ADR-010 §8.1: a p95 is judged over at least this many frames.
+constexpr unsigned k_min_gate_samples = 600;
+
+struct gate {
+    const char* id = "";
+    /// "pass", "fail", or "insufficient": a p95 gate with fewer than `k_min_gate_samples`
+    /// samples, which no verdict can be drawn from.
+    const char* verdict = "fail";
+    char detail[200]{};
+};
+
+struct scenario_result {
+    scenario_spec spec{};
+    unsigned frames = 0;
+    unsigned warmup = 0;
+    summary stages[st_count]{};
+    counters cnt{};
+    memory_stats mem{};
+    gate gates[3]{};
+    unsigned gate_count = 0;
+};
+
+[[nodiscard]] unsigned count_nodes(const lx::ui::ui_node& node) {
+    unsigned n = 1;
+    for (unsigned i = 0; i < node.child_count(); ++i) {
+        if (const lx::ui::ui_node* c = node.child_at(i))
+            n += count_nodes(*c);
+    }
+    return n;
+}
+
+/// What a backend does with the sorted stream: gather each batch's instances, in order,
+/// into the ring it uploads. Surface refs stay in the draw-command path and copy nothing.
+[[nodiscard]] std::uint64_t encode(const lx::scene::draw_list& draws, std::byte* ring,
+                                   std::size_t capacity) {
+    const auto quads = draws.quad_instances();
+    const auto shadows = draws.shadow_instances();
+    const auto sprites = draws.sprite_instances();
+    const auto underlines = draws.underline_instances();
+    std::size_t off = 0;
+    const auto put = [&](const void* src, std::size_t n) {
+        if (off + n <= capacity)
+            std::memcpy(ring + off, src, n);
+        off += n;
+    };
+    for (const lx::gfx::primitive_ref& r : draws.refs()) {
+        switch (r.kind) {
+        case lx::gfx::primitive_kind::quad:
+            put(&quads[r.index], sizeof(lx::gfx::quad_instance));
+            break;
+        case lx::gfx::primitive_kind::shadow:
+            put(&shadows[r.index], sizeof(lx::gfx::shadow_instance));
+            break;
+        case lx::gfx::primitive_kind::path:
+        case lx::gfx::primitive_kind::mono_sprite:
+        case lx::gfx::primitive_kind::poly_sprite:
+            put(&sprites[r.index], sizeof(lx::gfx::sprite_instance));
+            break;
+        case lx::gfx::primitive_kind::underline:
+            put(&underlines[r.index], sizeof(lx::gfx::underline_instance));
+            break;
+        case lx::gfx::primitive_kind::surface:
+            break;
+        }
+    }
+    if (off >= sizeof(std::uint32_t)) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, ring, sizeof word);
+        g_sink = g_sink ^ word;
+    }
+    return off;
+}
+
+[[nodiscard]] long read_rss_anon_kb() {
+    std::FILE* f = std::fopen("/proc/self/status", "r");
+    if (!f)
+        return -1;
+    char line[256];
+    long kb = -1;
+    while (std::fgets(line, sizeof line, f)) {
+        if (std::strncmp(line, "RssAnon:", 8) == 0) {
+            kb = std::strtol(line + 8, nullptr, 10);
+            break;
+        }
+    }
+    std::fclose(f);
+    return kb;
+}
+
+/// Sleeps until `deadline_ns` on CLOCK_MONOTONIC: the frame clock.
+void sleep_until_ns(std::uint64_t deadline_ns) {
+    timespec ts{};
+    ts.tv_sec = static_cast<time_t>(deadline_ns / 1'000'000'000ull);
+    ts.tv_nsec = static_cast<long>(deadline_ns % 1'000'000'000ull);
+    while (::clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &ts, nullptr) == EINTR) {
+    }
+}
+
+[[nodiscard]] scenario_result run_scenario(const scenario_spec& spec, const options& opt) {
+    scenario_result out{};
+    out.spec = spec;
+    out.frames = opt.frames;
+    out.warmup = opt.warmup;
+
+    lx::ui::ui_damage().clear();
+    lx::runtime::memory_arena arena{spec.arena_bytes};
+    lx::ui::ui_root root{arena};
+    root.set_describer(spec.describe);
+    root.set_bounds(spec.view);
+    lx::scene::draw_list draws{};
+
+    // Everything the window touches is sized now, so the window itself allocates nothing.
+    const std::size_t ring_bytes =
+        static_cast<std::size_t>(lx::gfx::k_max_primitives) * sizeof(lx::gfx::quad_instance);
+    std::vector<std::byte> ring(ring_bytes);
+    std::vector<std::uint64_t> samples[st_count];
+    for (auto& s : samples)
+        s.reserve(opt.frames);
+
+    const double view_px =
+        static_cast<double>(spec.view.width) * static_cast<double>(spec.view.height);
+    counters& cnt = out.cnt;
+    bool built = false;
+    std::uint64_t allocs_start = 0;
+    std::uint64_t bytes_start = 0;
+    std::size_t uordblks_start = 0;
+
+    const std::uint64_t period_ns = static_cast<std::uint64_t>(opt.period_us) * 1000ull;
+    std::uint64_t deadline = now_ns();
+
+    const unsigned total = opt.warmup + opt.frames;
+    for (unsigned frame = 0; frame < total; ++frame) {
+        if (period_ns) {
+            // An absolute schedule, so a late frame does not shift every later one; a
+            // frame that overran a whole period restarts the schedule instead of bursting.
+            deadline += period_ns;
+            const std::uint64_t now = now_ns();
+            if (deadline + period_ns < now)
+                deadline = now;
+            else if (deadline > now)
+                sleep_until_ns(deadline);
+        }
+        const bool measuring = frame >= opt.warmup;
+        if (frame == opt.warmup) {
+            uordblks_start = ::mallinfo2().uordblks;
+            allocs_start = g_new_calls.load(std::memory_order_relaxed);
+            bytes_start = g_new_bytes.load(std::memory_order_relaxed);
+        }
+
+        const std::uint64_t t_update0 = now_ns();
+        if (spec.before_frame)
+            spec.before_frame(frame);
+        const std::uint64_t t_update1 = now_ns();
+
+        // The ledger is consumed by the tick: read what this frame asks for before it.
+        const lx::ui::damage_ledger& ledger = lx::ui::ui_damage();
+        const unsigned damage_rects = ledger.count();
+        std::uint64_t damage_px = 0;
+        for (unsigned i = 0; i < damage_rects; ++i) {
+            const lx::rect2i r = ledger.rects()[i];
+            if (r.width > 0 && r.height > 0)
+                damage_px += static_cast<std::uint64_t>(r.width) * static_cast<std::uint64_t>(r.height);
+        }
+
+        const std::uint64_t t0 = now_ns();
+        const bool produced = root.tick(draws);
+        const std::uint64_t t1 = now_ns();
+
+        if (!produced) {
+            if (measuring) {
+                samples[st_update].push_back(t_update1 - t_update0);
+                samples[st_tick_idle].push_back(t1 - t0);
+                ++cnt.frames_idle;
+            }
+            continue;
+        }
+
+        const std::uint64_t t2 = now_ns();
+        draws.batch_for_render();
+        const std::uint64_t t3 = now_ns();
+        if (lx::trace::timeline_enabled())
+            lx::trace::timeline_counter("ui.batches", static_cast<long long>(draws.batches().size()));
+        const std::uint64_t bytes = encode(draws, ring.data(), ring.size());
+        const std::uint64_t t4 = now_ns();
+
+        if (!built) {
+            built = true;
+            if (root.tree()) {
+                cnt.nodes = count_nodes(*root.tree());
+                if (spec.on_built)
+                    spec.on_built(*root.tree());
+            }
+            cnt.primitives_built = draws.primitive_count();
+        }
+
+        if (!measuring)
+            continue;
+
+        const lx::ui::ui_root::stage_times st = root.last_stage_times();
+        samples[st_update].push_back(t_update1 - t_update0);
+        samples[st_tick].push_back(t1 - t0);
+        if (st.described) {
+            samples[st_describe].push_back(st.describe);
+            samples[st_reconcile].push_back(st.reconcile);
+            ++cnt.frames_described;
+        }
+        samples[st_layout].push_back(st.layout);
+        samples[st_emit].push_back(st.emit);
+        samples[st_order].push_back(t3 - t2);
+        samples[st_encode].push_back(t4 - t3);
+        samples[st_emit_order_encode].push_back(st.emit + (t3 - t2) + (t4 - t3));
+        samples[st_frame].push_back(t4 - t0);
+        ++cnt.frames_produced;
+
+        const unsigned primitives = draws.primitive_count();
+        cnt.primitives_total += primitives;
+        if (primitives > cnt.primitives) cnt.primitives = primitives;
+        if (draws.size() > cnt.surfaces) cnt.surfaces = draws.size();
+        const auto refs = static_cast<unsigned>(draws.refs().size());
+        if (refs > cnt.refs) cnt.refs = refs;
+        const auto batches = static_cast<unsigned>(draws.batches().size());
+        if (batches > cnt.batches) cnt.batches = batches;
+        if (bytes > cnt.instance_bytes) cnt.instance_bytes = bytes;
+        if (damage_rects > cnt.damage_rects) cnt.damage_rects = damage_rects;
+        if (damage_px > cnt.damage_px) cnt.damage_px = damage_px;
+        cnt.overflow_drops += draws.overflow_drops();
+    }
+
+    const std::size_t uordblks_end = ::mallinfo2().uordblks;
+    memory_stats& mem = out.mem;
+    mem.allocations = g_new_calls.load(std::memory_order_relaxed) - allocs_start;
+    mem.allocated_bytes = g_new_bytes.load(std::memory_order_relaxed) - bytes_start;
+    mem.per_frame = opt.frames > 0 ? static_cast<double>(mem.allocations) / opt.frames : 0.0;
+    mem.mallinfo_delta = static_cast<long long>(uordblks_end) - static_cast<long long>(uordblks_start);
+    mem.rss_anon_kb = read_rss_anon_kb();
+
+    if (view_px > 0.0)
+        cnt.damage_fraction = static_cast<double>(cnt.damage_px) / view_px;
+
+    for (unsigned i = 0; i < st_count; ++i)
+        out.stages[i] = summarize(samples[i]);
+
+    // ── Gates (ADR-010 §3), what Phase 0 can already check ──
+    const auto add_gate = [&](const char* id, const char* verdict, const char* fmt,
+                              auto... args) {
+        if (out.gate_count >= 3)
+            return;
+        gate& g = out.gates[out.gate_count++];
+        g.id = id;
+        g.verdict = verdict;
+        std::snprintf(g.detail, sizeof g.detail, fmt, args...);
+    };
+    const auto verdict = [](bool pass) { return pass ? "pass" : "fail"; };
+    // A p95 bound is judged only over enough frames (§8.1); the gate's other bounds are
+    // judged whatever the sample count.
+    const auto p95_verdict = [&](const summary& st, bool p95_ok, bool rest_ok) {
+        if (!rest_ok)
+            return "fail";
+        return st.samples < k_min_gate_samples ? "insufficient" : verdict(p95_ok);
+    };
+    // G5: no operator new and no net malloc growth over the steady window.
+    const bool no_allocs = mem.allocations == 0 && mem.mallinfo_delta == 0;
+    if (std::strcmp(spec.id, "S1") == 0) {
+        const bool idle = cnt.frames_produced == 0 && cnt.primitives_total == 0;
+        add_gate("G1", verdict(idle), "%u frames produced, %llu primitives emitted over %u idle ticks",
+                 cnt.frames_produced, static_cast<unsigned long long>(cnt.primitives_total),
+                 opt.frames);
+    } else if (std::strcmp(spec.id, "S2") == 0) {
+        const summary& st = out.stages[st_frame];
+        const bool damage_ok = cnt.damage_rects <= 1 && cnt.damage_fraction <= 0.02;
+        add_gate("G2", p95_verdict(st, st.p95 <= 150.0, damage_ok),
+                 "frame p95 %.1f us (<= 150) over %u frames (>= %u), damage %u rect(s), %.2f%% "
+                 "of the surface (<= 2%%)",
+                 st.p95, st.samples, k_min_gate_samples, cnt.damage_rects,
+                 cnt.damage_fraction * 100.0);
+    } else if (std::strcmp(spec.id, "S3") == 0) {
+        const summary& st = out.stages[st_emit_order_encode];
+        const bool size_ok = cnt.batches <= 8 && cnt.instance_bytes <= 800u * 1024u;
+        add_gate("G3", p95_verdict(st, st.p95 <= 1000.0, size_ok),
+                 "emit+order+encode p95 %.1f us (<= 1000) over %u frames, %u batch(es) (<= 8), "
+                 "%llu instance bytes (<= 819200)",
+                 st.p95, st.samples, cnt.batches, static_cast<unsigned long long>(cnt.instance_bytes));
+    }
+    add_gate("G5", verdict(no_allocs), "%llu heap allocations in %u steady frames, mallinfo2 delta %lld B",
+             static_cast<unsigned long long>(mem.allocations), opt.frames, mem.mallinfo_delta);
+    return out;
+}
+
+// ── Output ──────────────────────────────────────────────────────────────────────
+
+struct host_info {
+    char kernel[128] = "unknown";
+    char nodename[128] = "unknown";
+    char machine[64] = "unknown";
+    char cpu[160] = "unknown";
+    unsigned cpus = 1;
+};
+
+[[nodiscard]] host_info read_host() {
+    host_info h{};
+    utsname u{};
+    if (::uname(&u) == 0) {
+        std::snprintf(h.kernel, sizeof h.kernel, "%s", u.release);
+        std::snprintf(h.nodename, sizeof h.nodename, "%s", u.nodename);
+        std::snprintf(h.machine, sizeof h.machine, "%s", u.machine);
+    }
+    const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
+    h.cpus = n > 0 ? static_cast<unsigned>(n) : 1u;
+    if (std::FILE* f = std::fopen("/proc/cpuinfo", "r")) {
+        char line[256];
+        while (std::fgets(line, sizeof line, f)) {
+            if (std::strncmp(line, "model name", 10) == 0) {
+                const char* colon = std::strchr(line, ':');
+                if (colon) {
+                    ++colon;
+                    while (*colon == ' ' || *colon == '\t')
+                        ++colon;
+                    std::snprintf(h.cpu, sizeof h.cpu, "%s", colon);
+                    if (char* nl = std::strchr(h.cpu, '\n'))
+                        *nl = '\0';
+                }
+                break;
+            }
+        }
+        std::fclose(f);
+    }
+    return h;
+}
+
+void print_table(const scenario_result& r) {
+    std::printf("\n%s  %s  (%u nodes, %dx%d, %u frames after %u warm-up)\n", r.spec.id,
+                r.spec.title, r.cnt.nodes, r.spec.view.width, r.spec.view.height, r.frames,
+                r.warmup);
+    std::printf("  %-20s %8s %10s %10s %10s %10s\n", "stage", "samples", "p50 us", "p95 us",
+                "p99 us", "max us");
+    for (unsigned i = 0; i < st_count; ++i) {
+        const summary& s = r.stages[i];
+        if (s.samples == 0)
+            continue;
+        std::printf("  %-20s %8u %10.3f %10.3f %10.3f %10.3f\n", k_stage_names[i], s.samples,
+                    s.p50, s.p95, s.p99, s.max);
+    }
+    const counters& c = r.cnt;
+    std::printf("  counters   frames_produced=%u frames_idle=%u frames_described=%u "
+                "primitives=%u (built %u) surfaces=%u refs=%u batches=%u instance_bytes=%llu "
+                "damage_rects=%u damage_px=%llu (%.2f%%) overflow_drops=%u\n",
+                c.frames_produced, c.frames_idle, c.frames_described, c.primitives,
+                c.primitives_built, c.surfaces, c.refs, c.batches,
+                static_cast<unsigned long long>(c.instance_bytes), c.damage_rects,
+                static_cast<unsigned long long>(c.damage_px), c.damage_fraction * 100.0,
+                c.overflow_drops);
+    const memory_stats& m = r.mem;
+    std::printf("  memory     allocations=%llu (%.3f/frame, %llu B)  mallinfo2.uordblks delta=%lld B  "
+                "RssAnon=%ld kB\n",
+                static_cast<unsigned long long>(m.allocations), m.per_frame,
+                static_cast<unsigned long long>(m.allocated_bytes), m.mallinfo_delta,
+                m.rss_anon_kb);
+    std::printf("  gates     ");
+    for (unsigned i = 0; i < r.gate_count; ++i)
+        std::printf(" %s %s (%s)", r.gates[i].id,
+                    std::strcmp(r.gates[i].verdict, "fail") == 0 ? "FAIL" : r.gates[i].verdict,
+                    r.gates[i].detail);
+    std::printf("\n");
+}
+
+void json_string(std::FILE* f, const char* s) {
+    std::fputc('"', f);
+    for (; *s; ++s) {
+        if (*s == '"' || *s == '\\')
+            std::fputc('\\', f);
+        if (static_cast<unsigned char>(*s) < 0x20)
+            continue;
+        std::fputc(*s, f);
+    }
+    std::fputc('"', f);
+}
+
+void write_json(const options& opt, const host_info& host, const scenario_result* results,
+                unsigned count) {
+    std::FILE* f = std::fopen(opt.json, "w");
+    if (!f) {
+        std::fprintf(stderr, "lumen-ui-bench: cannot write %s\n", opt.json);
+        return;
+    }
+    std::fputs("[\n", f);
+    for (unsigned n = 0; n < count; ++n) {
+        const scenario_result& r = results[n];
+        std::fputs("  {\n    \"host\": {\"kernel\": ", f);
+        json_string(f, host.kernel);
+        std::fprintf(f, ", \"cpus\": %u, \"cpu\": ", host.cpus);
+        json_string(f, host.cpu);
+        std::fputs(", \"arch\": ", f);
+        json_string(f, host.machine);
+        std::fputs(", \"hostname\": ", f);
+        json_string(f, host.nodename);
+        std::fputs("},\n    \"driver\": \"none\",\n    \"git\": ", f);
+        json_string(f, opt.git);
+        std::fputs(",\n    \"preset\": ", f);
+        json_string(f, opt.preset);
+        std::fprintf(f, ",\n    \"scenario\": \"%s\",\n    \"title\": ", r.spec.id);
+        json_string(f, r.spec.title);
+        std::fprintf(f, ",\n    \"backend\": ");
+        json_string(f, opt.backend);
+        std::fprintf(f, ",\n    \"frames\": %u,\n    \"warmup\": %u,\n    \"period_us\": %u,\n"
+                        "    \"scale\": %.3f,\n",
+                     r.frames, r.warmup, opt.period_us, static_cast<double>(opt.scale));
+        std::fprintf(f, "    \"view\": {\"width\": %d, \"height\": %d},\n", r.spec.view.width,
+                     r.spec.view.height);
+        std::fputs("    \"stages\": {\n", f);
+        for (unsigned i = 0; i < st_count; ++i) {
+            const summary& s = r.stages[i];
+            std::fprintf(f,
+                         "      \"%s\": {\"p50\": %.3f, \"p95\": %.3f, \"p99\": %.3f, \"max\": %.3f, "
+                         "\"samples\": %u}%s\n",
+                         k_stage_names[i], s.p50, s.p95, s.p99, s.max, s.samples,
+                         i + 1 < st_count ? "," : "");
+        }
+        std::fputs("    },\n", f);
+        const counters& c = r.cnt;
+        std::fprintf(f,
+                     "    \"counters\": {\"frames_produced\": %u, \"frames_idle\": %u, "
+                     "\"frames_described\": %u, \"nodes\": %u, \"primitives\": %u, "
+                     "\"primitives_built\": %u, \"primitives_total\": %llu, \"surfaces\": %u, "
+                     "\"refs\": %u, \"batches\": %u, \"instance_bytes\": %llu, "
+                     "\"damage_rects\": %u, \"damage_px\": %llu, \"damage_fraction\": %.5f, "
+                     "\"overflow_drops\": %u},\n",
+                     c.frames_produced, c.frames_idle, c.frames_described, c.nodes, c.primitives,
+                     c.primitives_built, static_cast<unsigned long long>(c.primitives_total),
+                     c.surfaces, c.refs, c.batches,
+                     static_cast<unsigned long long>(c.instance_bytes), c.damage_rects,
+                     static_cast<unsigned long long>(c.damage_px), c.damage_fraction,
+                     c.overflow_drops);
+        const memory_stats& m = r.mem;
+        std::fprintf(f,
+                     "    \"memory\": {\"allocations\": %llu, \"allocated_bytes\": %llu, "
+                     "\"allocations_per_steady_frame\": %.6f, \"mallinfo2_uordblks_delta\": %lld, "
+                     "\"rss_anon_kb\": %ld},\n",
+                     static_cast<unsigned long long>(m.allocations),
+                     static_cast<unsigned long long>(m.allocated_bytes), m.per_frame,
+                     m.mallinfo_delta, m.rss_anon_kb);
+        std::fputs("    \"gpu\": {},\n    \"gates\": {", f);
+        for (unsigned i = 0; i < r.gate_count; ++i)
+            std::fprintf(f, "%s\"%s\": \"%s\"", i ? ", " : "", r.gates[i].id,
+                         r.gates[i].verdict);
+        std::fprintf(f, "}\n  }%s\n", n + 1 < count ? "," : "");
+    }
+    std::fputs("]\n", f);
+    std::fclose(f);
+}
+
+// ── CLI ─────────────────────────────────────────────────────────────────────────
+
+void usage() {
+    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none] [--frames N]\n"
+               "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
+               "                      [--scale F] [--git SHA] [--preset NAME]\n",
+               stderr);
+}
+
+[[nodiscard]] bool parse(int argc, char** argv, options& opt) {
+    for (int i = 1; i < argc; ++i) {
+        const char* a = argv[i];
+        const char* v = i + 1 < argc ? argv[i + 1] : nullptr;
+        const auto take = [&]() -> const char* {
+            if (!v) {
+                std::fprintf(stderr, "lumen-ui-bench: %s needs a value\n", a);
+                return nullptr;
+            }
+            ++i;
+            return v;
+        };
+        if (std::strcmp(a, "--scenario") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            if (std::strcmp(s, "all") == 0) {
+                opt.scenarios[0] = opt.scenarios[1] = opt.scenarios[2] = true;
+            } else if (std::strlen(s) == 2 && s[0] == 'S' && s[1] >= '1' && s[1] <= '3') {
+                opt.scenarios[0] = opt.scenarios[1] = opt.scenarios[2] = false;
+                opt.scenarios[s[1] - '1'] = true;
+            } else {
+                std::fprintf(stderr, "lumen-ui-bench: unknown scenario %s\n", s);
+                return false;
+            }
+        } else if (std::strcmp(a, "--backend") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            if (std::strcmp(s, "none") != 0) {
+                std::fprintf(stderr,
+                             "lumen-ui-bench: backend %s is not available in Phase 0 (only none)\n", s);
+                return false;
+            }
+            opt.backend = s;
+        } else if (std::strcmp(a, "--frames") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.frames = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
+        } else if (std::strcmp(a, "--warmup") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.warmup = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
+        } else if (std::strcmp(a, "--period-us") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.period_us = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
+        } else if (std::strcmp(a, "--json") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.json = s;
+        } else if (std::strcmp(a, "--pin") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.pin = std::strcmp(s, "none") == 0 ? -1 : static_cast<int>(std::strtol(s, nullptr, 10));
+        } else if (std::strcmp(a, "--scale") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.scale = std::strtof(s, nullptr);
+            if (!(opt.scale > 0.f)) {
+                std::fprintf(stderr, "lumen-ui-bench: --scale must be positive\n");
+                return false;
+            }
+        } else if (std::strcmp(a, "--git") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.git = s;
+        } else if (std::strcmp(a, "--preset") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.preset = s;
+        } else if (std::strcmp(a, "--help") == 0 || std::strcmp(a, "-h") == 0) {
+            usage();
+            return false;
+        } else {
+            std::fprintf(stderr, "lumen-ui-bench: unknown option %s\n", a);
+            usage();
+            return false;
+        }
+    }
+    if (opt.frames == 0) {
+        std::fprintf(stderr, "lumen-ui-bench: --frames must be at least 1\n");
+        return false;
+    }
+    return true;
+}
+
+[[nodiscard]] int pin_cpu(int wanted) {
+    if (wanted == -1)
+        return -1;
+    int cpu = wanted;
+    if (cpu == -2) {
+        const long n = ::sysconf(_SC_NPROCESSORS_ONLN);
+        cpu = n > 0 ? static_cast<int>(n - 1) : 0;
+    }
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    if (::sched_setaffinity(0, sizeof set, &set) != 0) {
+        std::fprintf(stderr, "lumen-ui-bench: cannot pin to CPU %d (%s); running unpinned\n", cpu,
+                     std::strerror(errno));
+        return -1;
+    }
+    return cpu;
+}
+
+// ── The bench thread ────────────────────────────────────────────────────────────
+//
+// The scenarios run on a thread whose stack is a fresh page-aligned mapping, not the main
+// thread's: argv and the environment sit above the main stack and shift every frame of it,
+// and `draw_scope`'s per-primitive temporaries then alias (4 KiB) against the draw list
+// differently from one shell to the next — S2's emit moved 1.7× with 256 bytes more
+// environment. On its own stack every address has the same low bits run after run;
+// scripts/ui-bench.sh fixes the heap the same way (`setarch -R`).
+
+struct bench_job {
+    const options* opt = nullptr;
+    const host_info* host = nullptr;
+    scenario_result* results = nullptr;
+    unsigned count = 0;
+};
+
+void* bench_thread(void* raw) {
+    bench_job& job = *static_cast<bench_job*>(raw);
+    const options& opt = *job.opt;
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    for (unsigned i = 0; i < 3; ++i) {
+        if (!opt.scenarios[i])
+            continue;
+        const scenario_spec spec = i == 0 ? make_s1(opt) : i == 1 ? make_s2(opt) : make_s3(opt);
+        job.results[job.count] = run_scenario(spec, opt);
+        print_table(job.results[job.count]);
+        std::fflush(stdout);
+        ++job.count;
+    }
+    return nullptr;
+}
+
+[[nodiscard]] bool run_on_own_stack(bench_job& job) {
+    constexpr std::size_t k_stack_bytes = 16u << 20u;
+    void* stack = ::mmap(nullptr, k_stack_bytes, PROT_READ | PROT_WRITE,
+                         MAP_PRIVATE | MAP_ANONYMOUS | MAP_STACK, -1, 0);
+    if (stack == MAP_FAILED)
+        return false;
+    pthread_attr_t attr;
+    pthread_t thread;
+    bool ok = ::pthread_attr_init(&attr) == 0 &&
+              ::pthread_attr_setstack(&attr, stack, k_stack_bytes) == 0 &&
+              ::pthread_create(&thread, &attr, bench_thread, &job) == 0;
+    ::pthread_attr_destroy(&attr);
+    if (ok)
+        ok = ::pthread_join(thread, nullptr) == 0;
+    ::munmap(stack, k_stack_bytes);
+    return ok;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    options opt{};
+    if (!parse(argc, argv, opt))
+        return 2;
+
+    // The bench thread inherits the mask.
+    const int cpu = pin_cpu(opt.pin);
+    // The cap warnings are the only thing the frame path logs; keep them, drop the rest.
+    lx::trace::logger::global().set_min_level(lx::trace::level::warn);
+
+    const host_info host = read_host();
+    std::printf("lumen-ui-bench  backend=%s  frames=%u  warmup=%u  period-us=%u  scale=%.2f  pin=",
+                opt.backend, opt.frames, opt.warmup, opt.period_us, static_cast<double>(opt.scale));
+    if (cpu >= 0)
+        std::printf("%d", cpu);
+    else
+        std::printf("none");
+    std::printf("  git=%s  preset=%s\n", *opt.git ? opt.git : "-", opt.preset);
+    std::printf("host: %s %s, %u cpus, %s\n", host.kernel, host.machine, host.cpus, host.cpu);
+    std::fflush(stdout);
+
+    scenario_result results[3]{};
+    bench_job job{&opt, &host, results, 0};
+    if (!run_on_own_stack(job)) {
+        std::fprintf(stderr, "lumen-ui-bench: cannot start the bench thread (%s)\n",
+                     std::strerror(errno));
+        return 1;
+    }
+
+    if (opt.json)
+        write_json(opt, host, results, job.count);
+
+    // Never fail on a number — CTest only checks the exit status.
+    return 0;
+}

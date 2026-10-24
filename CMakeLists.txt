@@ -525,6 +525,13 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_snapshot PRIVATE tests)
     add_test(NAME test_snapshot COMMAND test_snapshot)
 
+    add_executable(test_primitives tests/test_primitives.cpp)
+    target_link_libraries(test_primitives PRIVATE lx.ui lx.scene lx.gfx lx.runtime)
+    lumen_apply_module_properties(test_primitives)
+    lumen_link_platform(test_primitives)
+    target_include_directories(test_primitives PRIVATE tests)
+    add_test(NAME test_primitives COMMAND test_primitives)
+
     add_executable(test_scene_outputs tests/test_scene_outputs.cpp)
     target_link_libraries(test_scene_outputs PRIVATE lx.scene lx.runtime)
     lumen_apply_module_properties(test_scene_outputs)
@@ -820,12 +827,26 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(bench_frame PRIVATE tests)
     # Timing benchmark — always passes; prints avg ms for CI logs.
     add_test(NAME bench_frame COMMAND bench_frame)
+    set_tests_properties(bench_frame PROPERTIES LABELS bench)
 
     add_executable(bench_composite tests/bench_composite.cpp)
     target_link_libraries(bench_composite PRIVATE lx.gfx)
     lumen_apply_module_properties(bench_composite)
     target_include_directories(bench_composite PRIVATE tests)
     add_test(NAME bench_composite COMMAND bench_composite)
+    set_tests_properties(bench_composite PROPERTIES LABELS bench)
+
+    # ADR-010 §8: the UI engine's scenarios S1–S3 through lx.ui, a table and the JSON of
+    # §8.5. scripts/ui-bench.sh drives it and keeps the baseline; here it only has to run.
+    # Benches carry the `bench` label: the test presets exclude it, `ctest --preset bench` runs
+    # them (a plain `-L bench` on top of another preset still meets its exclude).
+    add_executable(lumen-ui-bench tests/bench_ui.cpp)
+    target_link_libraries(lumen-ui-bench PRIVATE lx.ui lx.scene lx.gfx lx.runtime lx.trace)
+    lumen_apply_module_properties(lumen-ui-bench)
+    lumen_link_platform(lumen-ui-bench)
+    target_include_directories(lumen-ui-bench PRIVATE tests)
+    add_test(NAME bench_ui COMMAND lumen-ui-bench --scenario all --frames 120 --warmup 30)
+    set_tests_properties(bench_ui PROPERTIES LABELS bench TIMEOUT 300)
 
     add_executable(test_headless_golden tests/test_headless_golden.cpp)
     target_link_libraries(test_headless_golden PRIVATE lx.gfx)
@@ -1082,7 +1103,7 @@ if(LUMEN_BUILD_TESTS)
     endif()
     set_tests_properties(test_health test_session_discovery
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
-    set_tests_properties(test_result test_snapshot test_scene_outputs test_damage_region test_wm_geometry
+    set_tests_properties(test_result test_snapshot test_primitives test_scene_outputs test_damage_region test_wm_geometry
         test_surface_tree test_positioner test_layer_arrange test_xcursor
         test_data_transfer test_input_serials test_session_pause test_keybindings test_workspaces
         test_viewport_geometry test_presentation_feedback
@@ -1099,7 +1120,7 @@ if(LUMEN_BUILD_TESTS)
         test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
         test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
         test_cvt test_output_management test_output_config_store
-        test_ui_reconcile test_gl_composite bench_composite
+        test_ui_reconcile test_gl_composite bench_composite bench_ui
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout

@@ -396,14 +396,18 @@ ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
 
 | New / changed | Layer | Depends on |
 |---------------|-------|-----------|
-| `lx.gfx:primitives`, `:atlas`, `:ui_vk`, `:ui_gl`, `:ui_cpu` | Graphics | `lx.foundation`, `lx.runtime` |
+| `lx.gfx:primitives` (instance structs, packing helpers, `order_grid`), `:atlas`, `:ui_vk`, `:ui_gl`, `:ui_cpu` | Graphics | `lx.foundation`, `lx.runtime` |
 | `lx.text:faces`, `:itemize`, `:shape`, `:lines`, `:raster` | Graphics | `lx.gfx:atlas` (tile handles only) |
 | `lx.layout:flex` | Graphics | `lx.foundation` |
-| `lx.scene` (`draw_list` of primitives, overlap grid) | Compositor | `lx.gfx` |
+| `lx.scene` (`draw_list` of primitives, one overlap grid per list) | Compositor | `lx.gfx` |
 | `lx.ui:style`, `:theme`, `:draw_scope`, `:components`, `:text_node` | Desktop | `lx.scene`, `lx.text`, `lx.layout` |
 | `lx.wayland.client` (real), `lx.app:window`, `:swapchain`, `:input` | Platform / Application | `lx.gfx` (through `lx.scene`), `lx.ui` |
 | `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui` |
 | `tools/lumen-theme` | tool | `lx.ui:theme` format only |
+
+The overlap grid (`order_grid`) is a geometry utility with no scene dependency, so it lives
+in `lx.gfx:primitives` beside the structs whose `order` it assigns; `lx.scene::draw_list`
+owns one instance per list and is what emitters take orders from.
 
 No upward edge is introduced; `cmake/LumenCXXModules.cmake` will reject one at configure
 time if it is.
@@ -556,17 +560,17 @@ one focused developer; it is an ordering aid, not a commitment.
 ### Phase 0 — Foundations and measurement first (≈1 week)
 
 - `lx.gfx:primitives`: the structs of §4.2, `static_assert`ed sizes, packing helpers
-  (`f16`, premultiply once).
-- `lx.scene::draw_list` v3: primitive stream + index array, overlap grid, `(order, kind,
-  page)` sort reusing the `order_` scratch; `surface` kind wraps today's `draw_command`
-  unchanged so the compositor keeps working.
+  (`f16`, premultiply once), and the overlap grid `order_grid` (§4.13).
+- `lx.scene::draw_list` v3: primitive stream + index array, its own overlap grid,
+  `(order, kind, page)` sort reusing the `order_` scratch; `surface` kind wraps today's
+  `draw_command` unchanged so the compositor keeps working.
 - Fix `draw_scope::fill` (set `solid`), `LX_TRACE_SCOPE` (`__COUNTER__`), call
   `budget_tracker::end_tick_render`; add spans `ui.describe`, `ui.layout`, `ui.emit`,
   `ui.encode`, `ui.submit` and counters `ui.primitives`, `ui.batches`, `ui.instance_bytes`,
   `ui.damage_px`, `ui.atlas_upload_bytes`.
 - `tests/bench_ui.cpp` → `lumen-ui-bench` with the JSON schema of §8.5, scenarios S1–S3
   running against the CPU reference renderer; `scripts/ui-bench.sh`; CTest label `bench`
-  and `ctest -LE bench` as the default; `tests/bench/baseline/<host>.json` committed.
+  excluded by the default test presets, `ctest --preset bench` runs it; `tests/bench/baseline/<host>.json` committed.
 - Gate: G9 by `static_assert`; the bench prints and stores numbers.
 
 ### Phase 1 — The primitive renderer (≈3 weeks)
@@ -714,8 +718,9 @@ asserts the `text.contrast` correction keeps the mean stem coverage within 3 %.
   `tests/bench/baseline/<host>-<driver>.json`: **fail** on p95 regressions above 10 % for
   any stage, on any steady-frame allocation, on a draw-call count above the scenario's
   cap, or on a golden diff; **warn** at 5 %. Updating a baseline is a deliberate commit.
-- CTest: label `bench`; the default `ctest` run excludes it; `ctest -L bench` runs the
-  headless rows in under two minutes.
+- CTest: label `bench`; the default test presets exclude it; `ctest --preset bench` runs
+  the headless rows in under two minutes (a `-L bench` on top of another preset still
+  meets that preset's exclude).
 - End-to-end (`--e2e`) reuses `scripts/inject-input.py` and the `--join-seat-session`
   machinery of `drag-smoke.sh`; both processes write Chrome traces on the same
   `CLOCK_MONOTONIC`, merged into one Perfetto view per run.
