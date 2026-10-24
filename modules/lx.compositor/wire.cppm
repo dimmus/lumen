@@ -85,14 +85,12 @@ struct surface_pending {
     int dy = 0;
     int scale = 1;
     int32_t transform = 0;
-    /// Union of every wl_surface.damage since the last commit (surface-local, logical) and,
-    /// separately, of every damage_buffer (buffer pixels). The two spaces differ as soon as
+    /// Every wl_surface.damage since the last commit (surface-local, logical) and,
+    /// separately, every damage_buffer (buffer pixels), as a few rects each. The two spaces differ as soon as
     /// a buffer scale, transform or viewport applies; each is converted into the other
     /// when the update is applied (`:viewport`).
-    lx::rect2i damage_surface{};
-    bool has_damage_surface = false;
-    lx::rect2i damage_buffer{};
-    bool has_damage_buffer = false;
+    client_damage damage_surface{};
+    client_damage damage_buffer{};
     /// wp_viewport state, merged like scale and transform.
     viewport_state viewport{};
     /// wp_alpha_modifier_v1 multiplier, wp_content_type_v1 type, wp_tearing_control_v1 hint:
@@ -585,10 +583,14 @@ lx::fourcc staged_shm_format(wl_shm_buffer* shm);
                                          unsigned& stride);
 /// Binds `ctx.shm_direct` to libwayland (access guards, release, pool unref).
 void bind_shm_direct(p0_protocol_context& ctx);
+/// Copies the commit's shm pixels into compositor-owned staging (see the definition).
+/// `history`/`surface`: the committing surface's damage, with which the CPU path's
+/// per-texture store rewrites only what changed in the slot it reuses.
 const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsigned texture_id,
-                                      lx::rect2i region, unsigned long long& seq_out,
-                                      unsigned long long& token_out,
-                                      unsigned long long& pool_token_out);
+                                      lx::rect2i region, unsigned long long& token_out,
+                                      unsigned long long& pool_token_out,
+                                      const surface_damage_history* history = nullptr,
+                                      lx::surface_id surface = {});
 lx::buffer_id next_buffer_id();
 void buffer_destroy_resource(struct wl_resource* resource);
 /// The dma-buf wl_buffer implementation. One definition: `find_buffer` tells the buffers

@@ -3,7 +3,8 @@ module;
 #if defined(LUMEN_HAS_EGL)
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+// GLES 3 headers (a superset of 2): `copy_region` blits when the context is ES 3.0.
+#include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 #include <gbm.h>
 #include <unistd.h>
@@ -178,7 +179,7 @@ public:
     /// Requires `device.make_current()` on this thread first.
     [[nodiscard]] lx::result<void> initialize(egl_device& device);
     void shutdown();
-    [[nodiscard]] bool ready() const { return program_ != 0; }
+    [[nodiscard]] bool ready() const { return programs_[0].id != 0 && programs_[1].id != 0; }
 
     /// Uploads CPU pixels in RGBA order. `stride` is bytes per row; 0 means packed.
     [[nodiscard]] lx::result<void> upload_rgba(unsigned texture_id, unsigned width,
@@ -204,6 +205,15 @@ public:
                                                         unsigned height, lx::rect2i region,
                                                         const unsigned char* pixels,
                                                         unsigned stride, bool opaque);
+    /// The same for several rects of one update, in one alternation of the texture's
+    /// names: `pixels` is `region`'s first pixel and every rect of `parts` lies inside
+    /// `region` (its bounds). A terminal that changed its cursor line and its status line
+    /// uploads two strips, not the window between them.
+    [[nodiscard]] lx::result<void> upload_client_regions(unsigned texture_id, unsigned width,
+                                                         unsigned height, lx::rect2i region,
+                                                         std::span<const lx::rect2i> parts,
+                                                         const unsigned char* pixels,
+                                                         unsigned stride, bool opaque);
     /// GL_EXT_texture_format_BGRA8888 and GL_EXT_unpack_subimage: client rows can be
     /// uploaded as they are, at their own stride.
     [[nodiscard]] bool supports_client_upload() const { return bgra_ && unpack_subimage_; }
@@ -252,6 +262,16 @@ public:
     /// native fence support, blocks until it is done and returns -1.
     [[nodiscard]] lx::result<int> fence_frame();
 
+    /// Copies `region` (full: everything) of `src` into the same place of `dst`, a target of
+    /// the same size: a scanout slot brought up to date from the one on screen while the
+    /// output is idle, so its next composite draws only that frame's damage. Needs
+    /// `supports_target_copy` (OpenGL ES 3.0, glBlitFramebuffer). Flushed, not fenced: a
+    /// later composite into `dst` is ordered after it in this context, and its fence covers it.
+    [[nodiscard]] lx::result<void> copy_region(const gl_scanout_target& src,
+                                               gl_scanout_target& dst,
+                                               const damage_region& region);
+    [[nodiscard]] bool supports_target_copy() const { return target_copy_; }
+
     /// Reads the target back as RGBA rows, top row first. For tests and screenshots — it
     /// stalls the pipeline and is not part of the frame path.
     [[nodiscard]] lx::result<void> read_back(const gl_scanout_target& target, unsigned char* rgba,
@@ -298,24 +318,34 @@ private:
                                                                  bool fence = true,
                                                                  bool flush = true);
 
+    /// One composite program and its uniform locations (-1: optimised out).
+    struct composite_program {
+        unsigned id = 0;
+        int rect = -1;
+        int target = -1;
+        int opacity = -1;
+        int uv_origin_dx = -1;
+        int uv_dy = -1;
+        int tint = -1;
+        int src_bounds = -1;
+        int transfer = -1;
+        int alpha_one = -1;
+        int use_solid = -1;
+        int solid_texel = -1;
+        int sampler = -1;
+    };
+    /// [0] decodes to linear light, tints and re-encodes; [1] is the identity variant for
+    /// an sRGB source without a colour tint, the common case (LUMEN_IDENTITY in the shader).
+    static constexpr unsigned k_program_linear = 0;
+    static constexpr unsigned k_program_identity = 1;
+
     egl_device* device_ = nullptr;
-    unsigned program_ = 0;
+    composite_program programs_[2]{};
     unsigned partial_into_fresh_ = 0;
     unsigned vertex_buffer_ = 0;
-    int uniform_rect_ = -1;
-    int uniform_target_ = -1;
-    int uniform_opacity_ = -1;
-    int uniform_uv_origin_dx_ = -1;
-    int uniform_uv_dy_ = -1;
-    int uniform_tint_ = -1;
-    int uniform_src_bounds_ = -1;
-    int uniform_transfer_ = -1;
-    int uniform_alpha_one_ = -1;
-    int uniform_use_solid_ = -1;
-    int uniform_solid_texel_ = -1;
     bool bgra_ = false;
     bool unpack_subimage_ = false;
-    int uniform_sampler_ = -1;
+    bool target_copy_ = false;
     texture_slot textures_[k_max_textures]{};
 };
 
@@ -361,7 +391,8 @@ void main() {
 }
 )";
 
-constexpr const char* k_fragment_shader = R"(#version 100
+// Compiled twice: as is, and with LUMEN_IDENTITY defined (see gl_compositor::initialize).
+constexpr const char* k_fragment_shader = R"(
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 #define UV_PRECISION highp
 #else
@@ -405,6 +436,14 @@ void main() {
     UV_PRECISION vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
     vec4 texel = use_solid > 0.5 ? solid_texel : texture2D(surface, s);
     texel.a = max(texel.a, alpha_one);
+#ifdef LUMEN_IDENTITY
+    // An sRGB source without a colour tint: decoding and re-encoding is the identity, so
+    // opacity and tint alpha only scale the premultiplied texel. This skips the six pow()
+    // below, most of the shader's cost: a fullscreen draw on SVGA3D went from 5.5 to 3 ms.
+    // A separate program rather than a branch on a uniform, which Mesa specialises the
+    // shader on per draw (it cost 16 µs of submission per draw).
+    gl_FragColor = texel * (opacity * tint.a);
+#else
 
     // Blending is a weighted average of light, so it has to happen in linear space.
     // GLES 2 has no sRGB framebuffer to do this in the blend unit and no float attachment
@@ -420,14 +459,21 @@ void main() {
     float alpha = texel.a * opacity * tint.a;
     vec3 shaded = linear_to_srgb(lin * tint.rgb);
     gl_FragColor = vec4(shaded * alpha, alpha);
+#endif
 }
 )";
 
-unsigned compile_shader(unsigned kind, const char* source) {
+/// `prefix` goes before `source` (after the #version line, which must come first).
+unsigned compile_shader(unsigned kind, const char* source, const char* prefix = nullptr) {
     const GLuint shader = glCreateShader(kind);
     if (!shader)
         return 0;
-    glShaderSource(shader, 1, &source, nullptr);
+    if (prefix) {
+        const char* parts[3] = {"#version 100\n", prefix, source};
+        glShaderSource(shader, 3, parts, nullptr);
+    } else {
+        glShaderSource(shader, 1, &source, nullptr);
+    }
     glCompileShader(shader);
     GLint ok = GL_FALSE;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
@@ -853,45 +899,56 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     if (!vertex)
         return lx::make_error(lx::gl_err::program_failed,
                               "composite vertex shader failed to compile");
-    const GLuint fragment = detail::compile_shader(GL_FRAGMENT_SHADER, detail::k_fragment_shader);
-    if (!fragment) {
-        glDeleteShader(vertex);
-        return lx::make_error(lx::gl_err::program_failed,
-                              "composite fragment shader failed to compile");
-    }
+    for (unsigned v = 0; v < 2; ++v) {
+        const GLuint fragment = detail::compile_shader(
+            GL_FRAGMENT_SHADER, detail::k_fragment_shader,
+            v == k_program_identity ? "#define LUMEN_IDENTITY 1\n" : "\n");
+        if (!fragment) {
+            glDeleteShader(vertex);
+            shutdown();
+            return lx::make_error(lx::gl_err::program_failed,
+                                  "composite fragment shader failed to compile");
+        }
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glBindAttribLocation(program, 0, "corner");
+        glLinkProgram(program);
+        glDeleteShader(fragment);
 
-    const GLuint program = glCreateProgram();
-    glAttachShader(program, vertex);
-    glAttachShader(program, fragment);
-    glBindAttribLocation(program, 0, "corner");
-    glLinkProgram(program);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            glDeleteProgram(program);
+            glDeleteShader(vertex);
+            shutdown();
+            return lx::make_error(lx::gl_err::program_failed, "composite program failed to link");
+        }
+        composite_program& p = programs_[v];
+        p.id = program;
+        p.rect = glGetUniformLocation(program, "rect");
+        p.target = glGetUniformLocation(program, "target");
+        p.opacity = glGetUniformLocation(program, "opacity");
+        p.uv_origin_dx = glGetUniformLocation(program, "uv_origin_dx");
+        p.uv_dy = glGetUniformLocation(program, "uv_dy");
+        p.tint = glGetUniformLocation(program, "tint");
+        p.src_bounds = glGetUniformLocation(program, "src_bounds");
+        p.transfer = glGetUniformLocation(program, "transfer");
+        p.alpha_one = glGetUniformLocation(program, "alpha_one");
+        p.use_solid = glGetUniformLocation(program, "use_solid");
+        p.solid_texel = glGetUniformLocation(program, "solid_texel");
+        p.sampler = glGetUniformLocation(program, "surface");
+    }
     glDeleteShader(vertex);
-    glDeleteShader(fragment);
-
-    GLint linked = GL_FALSE;
-    glGetProgramiv(program, GL_LINK_STATUS, &linked);
-    if (!linked) {
-        glDeleteProgram(program);
-        return lx::make_error(lx::gl_err::program_failed, "composite program failed to link");
-    }
-    program_ = program;
-
-    uniform_rect_ = glGetUniformLocation(program, "rect");
-    uniform_target_ = glGetUniformLocation(program, "target");
-    uniform_opacity_ = glGetUniformLocation(program, "opacity");
-    uniform_uv_origin_dx_ = glGetUniformLocation(program, "uv_origin_dx");
-    uniform_uv_dy_ = glGetUniformLocation(program, "uv_dy");
-    uniform_tint_ = glGetUniformLocation(program, "tint");
-    uniform_src_bounds_ = glGetUniformLocation(program, "src_bounds");
-    uniform_transfer_ = glGetUniformLocation(program, "transfer");
-    uniform_alpha_one_ = glGetUniformLocation(program, "alpha_one");
-    uniform_use_solid_ = glGetUniformLocation(program, "use_solid");
-    uniform_solid_texel_ = glGetUniformLocation(program, "solid_texel");
-    uniform_sampler_ = glGetUniformLocation(program, "surface");
 
     const char* gl_ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
     bgra_ = detail::egl_has_extension(gl_ext, "GL_EXT_texture_format_BGRA8888");
     unpack_subimage_ = detail::egl_has_extension(gl_ext, "GL_EXT_unpack_subimage");
+    // "OpenGL ES 3.1 Mesa …": the context is created as ES 2, and drivers hand out the
+    // newest compatible version, so ES 3's glBlitFramebuffer is there when it says 3.
+    const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+    target_copy_ = version && std::strncmp(version, "OpenGL ES ", 10) == 0 &&
+                   std::atoi(version + 10) >= 3;
 
     // Unit quad; the vertex shader maps it onto each draw's destination rect.
     static const float corners[] = {0.f, 0.f, 1.f, 0.f, 0.f, 1.f, 1.f, 1.f};
@@ -915,11 +972,13 @@ void lx::gfx::gl_compositor::shutdown() {
     }
     if (vertex_buffer_)
         glDeleteBuffers(1, &vertex_buffer_);
-    if (program_)
-        glDeleteProgram(program_);
+    for (composite_program& p : programs_)
+        if (p.id)
+            glDeleteProgram(p.id);
 #endif
     vertex_buffer_ = 0;
-    program_ = 0;
+    for (composite_program& p : programs_)
+        p = {};
     device_ = nullptr;
 }
 
@@ -993,6 +1052,13 @@ lx::result<void> lx::gfx::gl_compositor::upload_client_region(unsigned texture_i
                                                               lx::rect2i region,
                                                               const unsigned char* pixels,
                                                               unsigned stride, bool opaque) {
+    return upload_client_regions(texture_id, width, height, region, {}, pixels, stride, opaque);
+}
+
+lx::result<void> lx::gfx::gl_compositor::upload_client_regions(
+    unsigned texture_id, unsigned width, unsigned height, lx::rect2i region,
+    std::span<const lx::rect2i> parts, const unsigned char* pixels, unsigned stride,
+    bool opaque) {
 #if defined(LUMEN_HAS_EGL)
     if (!ready() || !supports_client_upload() || !pixels || width == 0 || height == 0 ||
         stride % 4u != 0)
@@ -1049,8 +1115,25 @@ lx::result<void> lx::gfx::gl_compositor::upload_client_region(unsigned texture_i
                          nullptr);
             ++partial_into_fresh_; // reported by the caller: the rest is undefined
         }
-        glTexSubImage2D(GL_TEXTURE_2D, 0, region.x, region.y, region.width, region.height,
-                        GL_BGRA_EXT, GL_UNSIGNED_BYTE, first);
+        if (parts.empty() || whole) {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, region.x, region.y, region.width, region.height,
+                            GL_BGRA_EXT, GL_UNSIGNED_BYTE, first);
+        } else {
+            for (const lx::rect2i& r : parts) {
+                // Clipped to the region, which the pointer arithmetic is relative to.
+                const int x0 = std::max(r.x, region.x);
+                const int y0 = std::max(r.y, region.y);
+                const int x1 = std::min(r.x + r.width, region.x + region.width);
+                const int y1 = std::min(r.y + r.height, region.y + region.height);
+                if (x1 <= x0 || y1 <= y0)
+                    continue;
+                const unsigned char* at =
+                    first + static_cast<std::size_t>(y0 - region.y) * stride +
+                    static_cast<std::size_t>(x0 - region.x) * 4u;
+                glTexSubImage2D(GL_TEXTURE_2D, 0, x0, y0, x1 - x0, y1 - y0, GL_BGRA_EXT,
+                                GL_UNSIGNED_BYTE, at);
+            }
+        }
     }
     glPixelStorei(GL_UNPACK_ROW_LENGTH_EXT, 0);
     glBindTexture(GL_TEXTURE_2D, 0);
@@ -1067,10 +1150,11 @@ lx::result<void> lx::gfx::gl_compositor::upload_client_region(unsigned texture_i
     (void)width;
     (void)height;
     (void)region;
+    (void)parts;
     (void)pixels;
     (void)stride;
     (void)opaque;
-    return lx::not_implemented("lx::gfx::gl_compositor::upload_client_region");
+    return lx::not_implemented("lx::gfx::gl_compositor::upload_client_regions");
 #endif
 }
 
@@ -1294,21 +1378,57 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     glViewport(0, 0, width, height);
 
     // Pipeline state is per frame, not per rect: only the scissor changes between passes.
-    glUseProgram(program_);
     glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer_);
     glEnableVertexAttribArray(0);
     glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
     glActiveTexture(GL_TEXTURE0);
-    if (uniform_sampler_ >= 0)
-        glUniform1i(uniform_sampler_, 0);
-    if (uniform_target_ >= 0)
-        glUniform2f(uniform_target_, static_cast<float>(width), static_cast<float>(height));
+    // Uniforms belong to a program: the per-frame ones are set in both. Whether a program
+    // replaces the sample with `solid_texel` is then changed only when it changes.
+    bool solid_bound[2] = {false, false};
+    for (const composite_program& p : programs_) {
+        glUseProgram(p.id);
+        if (p.sampler >= 0)
+            glUniform1i(p.sampler, 0);
+        if (p.target >= 0)
+            glUniform2f(p.target, static_cast<float>(width), static_cast<float>(height));
+        if (p.use_solid >= 0)
+            glUniform1f(p.use_solid, 0.f);
+    }
+    unsigned bound = k_program_identity;
 
-    // Whether the program currently replaces the sample with `solid_texel`; set once per
-    // frame and then only when it changes.
-    bool solid_bound = false;
-    if (uniform_use_solid_ >= 0)
-        glUniform1f(uniform_use_solid_, 0.f);
+    // Scissor and blend state, set only when it changes. Mesa does not drop a redundant
+    // call: on SVGA3D a repeated glScissor measured 1.7 µs per draw, a changed one 4 µs, a
+    // scissor-test toggle 7 µs and a blend toggle 2.6 µs.
+    bool scissor_on = false;
+    lx::rect2i scissor_rect{0, 0, -1, -1};
+    bool blend_on = false;
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    // Sources are premultiplied, so the source factor is one.
+    glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    const auto set_scissor = [&](bool on, lx::rect2i r) {
+        if (on != scissor_on) {
+            if (on)
+                glEnable(GL_SCISSOR_TEST);
+            else
+                glDisable(GL_SCISSOR_TEST);
+            scissor_on = on;
+        }
+        if (on && (r.x != scissor_rect.x || r.y != scissor_rect.y || r.width != scissor_rect.width ||
+                   r.height != scissor_rect.height)) {
+            glScissor(r.x, r.y, r.width, r.height);
+            scissor_rect = r;
+        }
+    };
+    const auto set_blend = [&](bool on) {
+        if (on == blend_on)
+            return;
+        if (on)
+            glEnable(GL_BLEND);
+        else
+            glDisable(GL_BLEND);
+        blend_on = on;
+    };
 
     const unsigned passes = rect_count > 0 ? rect_count : 1u;
     for (unsigned pass = 0; pass < passes; ++pass) {
@@ -1320,14 +1440,10 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
         // Scissor to the damage rect so the clear and every draw stay inside it. Window
         // y = 0 is memory row 0, the top (see the vertex shader), so the top-left rect is
         // used as is.
-        if (has_damage) {
-            glEnable(GL_SCISSOR_TEST);
-            glScissor(damage.x, damage.y < 0 ? 0 : damage.y, damage.width, damage.height);
-        } else {
-            glDisable(GL_SCISSOR_TEST);
-        }
-        // The clear ignores blend state, but a previous pass may have left blending on.
-        glDisable(GL_BLEND);
+        if (has_damage)
+            set_scissor(true, {damage.x, damage.y < 0 ? 0 : damage.y, damage.width, damage.height});
+        else
+            set_scissor(false, {});
         if (clear_first) {
             glClearColor(clear.r, clear.g, clear.b, clear.a);
             glClear(GL_COLOR_BUFFER_BIT);
@@ -1355,11 +1471,11 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 }
             }
 
-            // Effective scissor is damage ∩ clip ∩ dst, in top-left space, which is also
-            // window space here (row 0 is the top). Set explicitly on every draw rather than only when a
-            // clip is present: leaving the previous draw's scissor in place would silently
-            // clip the next one. Intersecting with dst culls draws that miss this rect,
-            // which is most of them once damage is split into several small rects.
+            // The scissor is damage ∩ clip, in top-left space, which is also window space
+            // here (row 0 is the top). The quad covers exactly dst, so dst needs no scissor:
+            // it only culls draws that miss this rect, which is most of them once damage is
+            // split into several small rects. Leaving dst out keeps the scissor the same for
+            // every unclipped draw of a pass, so it is set once instead of once per draw.
             int sx0 = 0;
             int sy0 = 0;
             int sx1 = static_cast<int>(width);
@@ -1371,10 +1487,6 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 sx1 = damage.x + damage.width;
                 sy1 = damage.y + damage.height;
                 scissored = true;
-                if (cmd.dst.x > sx0) sx0 = cmd.dst.x;
-                if (cmd.dst.y > sy0) sy0 = cmd.dst.y;
-                if (cmd.dst.x + cmd.dst.width < sx1) sx1 = cmd.dst.x + cmd.dst.width;
-                if (cmd.dst.y + cmd.dst.height < sy1) sy1 = cmd.dst.y + cmd.dst.height;
             }
             if (cmd.clip.width > 0 && cmd.clip.height > 0) {
                 if (cmd.clip.x > sx0) sx0 = cmd.clip.x;
@@ -1383,6 +1495,11 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 if (cmd.clip.y + cmd.clip.height < sy1) sy1 = cmd.clip.y + cmd.clip.height;
                 scissored = true;
             }
+            if (std::max(sx0, cmd.dst.x) >= std::min(sx1, cmd.dst.x + cmd.dst.width) ||
+                std::max(sy0, cmd.dst.y) >= std::min(sy1, cmd.dst.y + cmd.dst.height)) {
+                ++stats.draws_culled;
+                continue;
+            }
             // An opaque, untinted solid colour is a clear of its rect: no shader, no
             // blending, no fragment work beyond the fill (wlroots draws such rects with a
             // clear too). The clear ignores the quad, so its scissor must be dst itself.
@@ -1390,7 +1507,7 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                                      cmd.opacity >= 1.f && cmd.tint.r >= 1.f &&
                                      cmd.tint.g >= 1.f && cmd.tint.b >= 1.f &&
                                      cmd.tint.a >= 1.f && cmd.solid_color.a >= 1.f;
-            if (solid_clear && !has_damage) {
+            if (solid_clear) {
                 if (cmd.dst.x > sx0) sx0 = cmd.dst.x;
                 if (cmd.dst.y > sy0) sy0 = cmd.dst.y;
                 if (cmd.dst.x + cmd.dst.width < sx1) sx1 = cmd.dst.x + cmd.dst.width;
@@ -1406,46 +1523,50 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                     ++stats.draws_culled;
                     continue;
                 }
-                glEnable(GL_SCISSOR_TEST);
-                glScissor(sx0, sy0, sx1 - sx0, sy1 - sy0);
+                set_scissor(true, {sx0, sy0, sx1 - sx0, sy1 - sy0});
             } else {
-                glDisable(GL_SCISSOR_TEST);
+                set_scissor(false, {});
             }
 
             if (solid_clear) {
-                glDisable(GL_BLEND);
                 glClearColor(cmd.solid_color.r, cmd.solid_color.g, cmd.solid_color.b, 1.f);
                 glClear(GL_COLOR_BUFFER_BIT);
                 ++stats.draws_submitted;
                 continue;
             }
 
-            if (cmd.blend == lx::blend_mode::opaque) {
-                glDisable(GL_BLEND);
-            } else {
-                glEnable(GL_BLEND);
-                // Sources are premultiplied, so the source factor is one.
-                glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
-            }
+            set_blend(cmd.blend != lx::blend_mode::opaque);
 
-            if (cmd.solid != solid_bound) {
-                solid_bound = cmd.solid;
-                if (uniform_use_solid_ >= 0)
-                    glUniform1f(uniform_use_solid_, solid_bound ? 1.f : 0.f);
+            const int transfer = cmd.src_transfer == lx::transfer_function::linear    ? 0
+                                 : cmd.src_transfer == lx::transfer_function::gamma22 ? 2
+                                                                                      : 1;
+            const unsigned want = transfer == 1 && cmd.tint.r == 1.f && cmd.tint.g == 1.f &&
+                                          cmd.tint.b == 1.f
+                                      ? k_program_identity
+                                      : k_program_linear;
+            if (want != bound) {
+                glUseProgram(programs_[want].id);
+                bound = want;
+            }
+            const composite_program& prog = programs_[bound];
+            if (cmd.solid != solid_bound[bound]) {
+                solid_bound[bound] = cmd.solid;
+                if (prog.use_solid >= 0)
+                    glUniform1f(prog.use_solid, cmd.solid ? 1.f : 0.f);
             }
             if (cmd.solid) {
-                if (uniform_solid_texel_ >= 0)
-                    glUniform4f(uniform_solid_texel_, cmd.solid_color.r, cmd.solid_color.g,
+                if (prog.solid_texel >= 0)
+                    glUniform4f(prog.solid_texel, cmd.solid_color.r, cmd.solid_color.g,
                                 cmd.solid_color.b, cmd.solid_color.a);
             } else {
                 glBindTexture(GL_TEXTURE_2D, name);
             }
-            if (uniform_rect_ >= 0) {
-                glUniform4f(uniform_rect_, static_cast<float>(cmd.dst.x), static_cast<float>(cmd.dst.y),
+            if (prog.rect >= 0) {
+                glUniform4f(prog.rect, static_cast<float>(cmd.dst.x), static_cast<float>(cmd.dst.y),
                             static_cast<float>(cmd.dst.width), static_cast<float>(cmd.dst.height));
             }
-            if (uniform_opacity_ >= 0)
-                glUniform1f(uniform_opacity_, cmd.opacity);
+            if (prog.opacity >= 0)
+                glUniform1f(prog.opacity, cmd.opacity);
             // The source box (empty: the whole texture) in normalized texture coordinates,
             // turned by the buffer transform. On a 1:1 draw at whole pixels every fragment
             // centre lands on a texel centre, so linear filtering is exact; a resampled
@@ -1473,24 +1594,20 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             }
             {
                 const source_basis b = source_basis_for(cmd.buffer_xform);
-                if (uniform_uv_origin_dx_ >= 0)
-                    glUniform4f(uniform_uv_origin_dx_, u0 + b.origin[0] * du,
+                if (prog.uv_origin_dx >= 0)
+                    glUniform4f(prog.uv_origin_dx, u0 + b.origin[0] * du,
                                 v0 + b.origin[1] * dv, b.dx[0] * du, b.dx[1] * dv);
-                if (uniform_uv_dy_ >= 0)
-                    glUniform2f(uniform_uv_dy_, b.dy[0] * du, b.dy[1] * dv);
+                if (prog.uv_dy >= 0)
+                    glUniform2f(prog.uv_dy, b.dy[0] * du, b.dy[1] * dv);
             }
-            if (uniform_src_bounds_ >= 0)
-                glUniform4f(uniform_src_bounds_, u_lo, v_lo, u_hi, v_hi);
-            if (uniform_tint_ >= 0)
-                glUniform4f(uniform_tint_, cmd.tint.r, cmd.tint.g, cmd.tint.b, cmd.tint.a);
-            if (uniform_transfer_ >= 0) {
-                const int slot = cmd.src_transfer == lx::transfer_function::linear    ? 0
-                                 : cmd.src_transfer == lx::transfer_function::gamma22 ? 2
-                                                                                      : 1;
-                glUniform1i(uniform_transfer_, slot);
-            }
-            if (uniform_alpha_one_ >= 0)
-                glUniform1f(uniform_alpha_one_,
+            if (prog.src_bounds >= 0)
+                glUniform4f(prog.src_bounds, u_lo, v_lo, u_hi, v_hi);
+            if (prog.tint >= 0)
+                glUniform4f(prog.tint, cmd.tint.r, cmd.tint.g, cmd.tint.b, cmd.tint.a);
+            if (prog.transfer >= 0)
+                glUniform1i(prog.transfer, transfer);
+            if (prog.alpha_one >= 0)
+                glUniform1f(prog.alpha_one,
                             slot_ptr && slot_ptr->name_opaque[slot_ptr->current] ? 1.f : 0.f);
 
             glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
@@ -1594,6 +1711,45 @@ int lx::gfx::detail::gl_frame_fence(egl_device* device) {
     return out_fence_fd;
 }
 #endif
+
+lx::result<void> lx::gfx::gl_compositor::copy_region(const gl_scanout_target& src,
+                                                     gl_scanout_target& dst,
+                                                     const damage_region& region) {
+#if defined(LUMEN_HAS_EGL)
+    if (!target_copy_ || !src.valid() || !dst.valid())
+        return lx::not_implemented("lx::gfx::gl_compositor::copy_region");
+    if (src.width() != dst.width() || src.height() != dst.height())
+        return lx::invalid_argument("gl copy_region between targets of different sizes");
+    const lx::rect2i whole{0, 0, static_cast<int>(src.width()), static_cast<int>(src.height())};
+    damage_region r = region;
+    if (r.full) {
+        r.clear();
+        r.add(whole);
+    }
+    r.clip(whole);
+    if (r.count == 0)
+        return {};
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src.framebuffer());
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.framebuffer());
+    // Both have row 0 on top: a rect lands where it was.
+    for (unsigned i = 0; i < r.count; ++i) {
+        const lx::rect2i& q = r.rects[i];
+        glBlitFramebuffer(q.x, q.y, q.x + q.width, q.y + q.height, q.x, q.y, q.x + q.width,
+                          q.y + q.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFlush();
+    if (glGetError() != GL_NO_ERROR)
+        return lx::make_error(lx::gl_err::draw_failed, "glBlitFramebuffer between scanout targets failed");
+    return {};
+#else
+    (void)src;
+    (void)dst;
+    (void)region;
+    return lx::not_implemented("lx::gfx::gl_compositor::copy_region");
+#endif
+}
 
 lx::result<void> lx::gfx::gl_compositor::read_back(const gl_scanout_target& target,
                                                    unsigned char* rgba, unsigned capacity) {

@@ -6,7 +6,9 @@ module;
 // directories; PNG decoded with libpng (LUMEN_HAS_PNG), SVG rendered with librsvg
 // (LUMEN_HAS_RSVG) straight at the size asked for. Results are premultiplied ARGB8888 at
 // exactly the requested pixel size, cached by (name, size) — a panel repaint never touches
-// the file system, and a name is resolved once per size.
+// the file system, and a name is resolved once per size. Resolving one reads no directory
+// either: a theme's GTK `icon-theme.cache` is mapped where it is current, and otherwise each
+// directory is listed once, on first use.
 //
 // Shell process only, its one thread. Allocates when a theme index is read and when an
 // icon is loaded (rare, event driven), never per frame.
@@ -17,6 +19,8 @@ module;
 
 #if !defined(_WIN32)
 #include <dirent.h>
+#include <fcntl.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif
@@ -24,17 +28,13 @@ module;
 #if defined(LUMEN_HAS_PNG)
 #include <png.h>
 #endif
-#if defined(LUMEN_HAS_RSVG)
-#include <cairo.h>
-#include <librsvg/rsvg.h>
-#endif
-
 import lx.foundation;
 import lx.trace;
 
 export module lx.shell:icon_theme;
 
 import std;
+import :svg;
 
 export namespace lx::shell {
 
@@ -68,10 +68,32 @@ private:
         int threshold = 2;
         dir_type type = dir_type::threshold;
     };
+    /// What one base directory of a theme holds, so a lookup reads memory, not the file
+    /// system: GTK's `icon-theme.cache` mapped when it is at least as new as the directory
+    /// (the check GTK makes; GTK and Qt read the same file), else each directory's file
+    /// names, read once on first use.
+    struct theme_root {
+        std::string path;
+        const unsigned char* cache = nullptr;
+        std::size_t cache_size = 0;
+        /// Per entry of `theme_index::dirs`: its index in the cache's directory list, -1 none.
+        std::vector<int> cache_dir;
+        /// Per entry of `theme_index::dirs`, without a cache: its file names, sorted.
+        std::vector<std::vector<std::string>> listing;
+        std::vector<bool> listed;
+
+        theme_root() = default;
+        theme_root(const theme_root&) = delete;
+        theme_root& operator=(const theme_root&) = delete;
+        ~theme_root();
+        /// Whether `name` + `ext` is in the theme's directory `dir` (`rel`, its path) here.
+        [[nodiscard]] bool has(std::size_t dir, const std::string& rel, std::string_view name,
+                               std::string_view ext);
+    };
     struct theme_index {
         std::string name;
         /// Base directories the theme exists in (…/icons/<name>).
-        std::vector<std::string> roots;
+        std::vector<std::unique_ptr<theme_root>> roots;
         /// Its directories that exist in at least one root.
         std::vector<theme_dir> dirs;
         std::vector<std::string> inherits;
@@ -85,15 +107,15 @@ private:
     static constexpr unsigned k_cache = 96;
 
     void load();
-    [[nodiscard]] const theme_index* index_of(const std::string& name);
-    [[nodiscard]] std::string find_in(const theme_index& t, const char* name, int px) const;
+    [[nodiscard]] theme_index* index_of(const std::string& name);
+    [[nodiscard]] static std::string find_in(theme_index& t, const char* name, int px);
     [[nodiscard]] static bool decode(const std::string& path, int px, std::vector<std::uint32_t>& out);
 
     std::string theme_;
     bool loaded_ = false;
     std::vector<std::string> bases_;
     std::vector<std::unique_ptr<theme_index>> themes_;
-    std::vector<const theme_index*> chain_;
+    std::vector<theme_index*> chain_;
     std::vector<cached> cache_;
     unsigned long long clock_ = 0;
 };
@@ -142,6 +164,101 @@ bool dir_exists(const std::string& path) {
     (void)path;
     return false;
 #endif
+}
+
+// GTK's icon-theme.cache (gtk/gtkiconcache.c, written by gtk-update-icon-cache). Big-endian;
+// a header {u16 major = 1, u16 minor = 0, u32 hash, u32 directory list}; the directory list
+// {u32 n, u32 name[n]}; the hash {u32 buckets, u32 icon[buckets]}, each icon {u32 next,
+// u32 name, u32 images} and the images {u32 n, then n × {u16 directory, u16 flags, u32 data}}.
+// Offsets are bounds-checked: the file is read as it is on disk.
+constexpr std::uint32_t k_cache_none = 0xFFFFFFFFu;
+constexpr std::uint16_t k_cache_svg = 2;
+constexpr std::uint16_t k_cache_png = 4;
+
+std::uint32_t cache_u32(const unsigned char* c, std::size_t n, std::uint32_t at) {
+    if (at > n || n - at < 4)
+        return k_cache_none;
+    return (std::uint32_t{c[at]} << 24) | (std::uint32_t{c[at + 1]} << 16) |
+           (std::uint32_t{c[at + 2]} << 8) | std::uint32_t{c[at + 3]};
+}
+
+std::uint16_t cache_u16(const unsigned char* c, std::size_t n, std::uint32_t at) {
+    if (at > n || n - at < 2)
+        return 0xFFFFu;
+    return static_cast<std::uint16_t>((c[at] << 8) | c[at + 1]);
+}
+
+std::string_view cache_str(const unsigned char* c, std::size_t n, std::uint32_t at) {
+    if (at >= n)
+        return {};
+    const void* end = std::memchr(c + at, 0, n - at);
+    if (!end)
+        return {};
+    return {reinterpret_cast<const char*>(c + at),
+            static_cast<std::size_t>(static_cast<const unsigned char*>(end) - (c + at))};
+}
+
+/// Maps `root`/icon-theme.cache when it is a version 1.0 cache no older than `root` itself.
+void map_icon_cache(const std::string& root, const unsigned char*& data, std::size_t& size) {
+#if !defined(_WIN32)
+    struct stat dir{};
+    if (::stat(root.c_str(), &dir) != 0)
+        return;
+    const int fd = ::open((root + "/icon-theme.cache").c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return;
+    struct stat st{};
+    if (::fstat(fd, &st) == 0 && st.st_mtime >= dir.st_mtime && st.st_size >= 12) {
+        void* m = ::mmap(nullptr, static_cast<std::size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+        if (m != MAP_FAILED) {
+            const auto* c = static_cast<const unsigned char*>(m);
+            const auto n = static_cast<std::size_t>(st.st_size);
+            if (cache_u16(c, n, 0) == 1 && cache_u16(c, n, 2) == 0) {
+                data = c;
+                size = n;
+            } else
+                ::munmap(m, n);
+        }
+    }
+    ::close(fd);
+#else
+    (void)root, (void)data, (void)size;
+#endif
+}
+
+/// `dir`'s index in the cache's directory list, -1 when the cache has no such directory.
+int cache_dir_index(const unsigned char* c, std::size_t n, std::string_view dir) {
+    const std::uint32_t list = cache_u32(c, n, 8);
+    const std::uint32_t count = cache_u32(c, n, list);
+    for (std::uint32_t i = 0; count != k_cache_none && i < count && i < 0xFFFFu; ++i) {
+        const std::uint32_t at = cache_u32(c, n, list + 4 + 4 * i);
+        if (at == k_cache_none)
+            return -1;
+        if (cache_str(c, n, at) == dir)
+            return static_cast<int>(i);
+    }
+    return -1;
+}
+
+/// The offset of `name`'s image list in the cache, or k_cache_none.
+std::uint32_t cache_images(const unsigned char* c, std::size_t n, std::string_view name) {
+    if (name.empty())
+        return k_cache_none;
+    // gtkiconcache.c icon_name_hash, over signed chars.
+    std::uint32_t h = static_cast<std::uint32_t>(static_cast<signed char>(name[0]));
+    for (std::size_t i = 1; i < name.size(); ++i)
+        h = (h << 5) - h + static_cast<std::uint32_t>(static_cast<signed char>(name[i]));
+    const std::uint32_t hash = cache_u32(c, n, 4);
+    const std::uint32_t buckets = cache_u32(c, n, hash);
+    if (buckets == 0 || buckets == k_cache_none)
+        return k_cache_none;
+    std::uint32_t icon = cache_u32(c, n, hash + 4 + 4 * (h % buckets));
+    for (int guard = 0; icon != k_cache_none && guard < 4096; ++guard) {
+        if (cache_str(c, n, cache_u32(c, n, icon + 4)) == name)
+            return cache_u32(c, n, icon + 8);
+        icon = cache_u32(c, n, icon);
+    }
+    return k_cache_none;
 }
 
 std::string trim(std::string s) {
@@ -282,6 +399,47 @@ bool lx::shell::icon_theme::can_svg() {
 #endif
 }
 
+lx::shell::icon_theme::theme_root::~theme_root() {
+#if !defined(_WIN32)
+    if (cache)
+        ::munmap(const_cast<unsigned char*>(cache), cache_size);
+#endif
+}
+
+bool lx::shell::icon_theme::theme_root::has(std::size_t dir, const std::string& rel,
+                                            std::string_view name, std::string_view ext) {
+    if (cache) {
+        const int want = cache_dir[dir];
+        const std::uint16_t flag = ext == ".png" ? k_cache_png : ext == ".svg" ? k_cache_svg : 0;
+        const std::uint32_t images = cache_images(cache, cache_size, name);
+        const std::uint32_t count = cache_u32(cache, cache_size, images);
+        if (want < 0 || flag == 0 || count == k_cache_none)
+            return false;
+        for (std::uint32_t i = 0; i < count && i < 0xFFFFu; ++i) {
+            const std::uint32_t at = images + 4 + 8 * i;
+            if (cache_u16(cache, cache_size, at) == static_cast<std::uint32_t>(want))
+                return (cache_u16(cache, cache_size, at + 2) & flag) != 0;
+        }
+        return false;
+    }
+    if (!listed[dir]) {
+        listed[dir] = true;
+#if !defined(_WIN32)
+        if (DIR* d = ::opendir((path + "/" + rel).c_str())) {
+            while (const dirent* e = ::readdir(d))
+                if (e->d_name[0] != '.' && e->d_type != DT_DIR)
+                    listing[dir].emplace_back(e->d_name);
+            ::closedir(d);
+        }
+#endif
+        std::ranges::sort(listing[dir]);
+    }
+    std::string file;
+    file.reserve(name.size() + ext.size());
+    file.append(name).append(ext);
+    return std::ranges::binary_search(listing[dir], file);
+}
+
 void lx::shell::icon_theme::set_theme(const char* name) {
     theme_ = name ? name : "";
     loaded_ = false;
@@ -290,7 +448,7 @@ void lx::shell::icon_theme::set_theme(const char* name) {
     cache_.clear();
 }
 
-const lx::shell::icon_theme::theme_index* lx::shell::icon_theme::index_of(const std::string& name) {
+lx::shell::icon_theme::theme_index* lx::shell::icon_theme::index_of(const std::string& name) {
     for (const auto& t : themes_)
         if (t->name == name)
             return t->roots.empty() ? nullptr : t.get();
@@ -301,7 +459,10 @@ const lx::shell::icon_theme::theme_index* lx::shell::icon_theme::index_of(const 
         const std::string root = b + "/" + name;
         if (!dir_exists(root))
             continue;
-        t->roots.push_back(root);
+        auto r = std::make_unique<theme_root>();
+        r->path = root;
+        map_icon_cache(root, r->cache, r->cache_size);
+        t->roots.push_back(std::move(r));
         if (index_path.empty() && file_exists(root + "/index.theme"))
             index_path = root + "/index.theme";
     }
@@ -368,7 +529,8 @@ const lx::shell::icon_theme::theme_index* lx::shell::icon_theme::index_of(const 
                 continue;
             bool present = false;
             for (const auto& r : t->roots)
-                present = present || dir_exists(r + "/" + s.path);
+                present = present || (r->cache ? cache_dir_index(r->cache, r->cache_size, s.path) >= 0
+                                               : dir_exists(r->path + "/" + s.path));
             if (!present)
                 continue;
             if (s.min_size <= 0)
@@ -376,6 +538,15 @@ const lx::shell::icon_theme::theme_index* lx::shell::icon_theme::index_of(const 
             if (s.max_size <= 0)
                 s.max_size = s.size;
             t->dirs.push_back(s);
+        }
+    }
+    for (auto& r : t->roots) {
+        if (r->cache)
+            for (const auto& d : t->dirs)
+                r->cache_dir.push_back(cache_dir_index(r->cache, r->cache_size, d.path));
+        else {
+            r->listing.resize(t->dirs.size());
+            r->listed.assign(t->dirs.size(), false);
         }
     }
     themes_.push_back(std::move(t));
@@ -421,7 +592,7 @@ void lx::shell::icon_theme::load() {
     for (std::size_t i = 0; i < pending.size() && i < 16; ++i) {
         if (pending[i] == "hicolor")
             continue;
-        const theme_index* t = index_of(pending[i]);
+        theme_index* t = index_of(pending[i]);
         if (!t)
             continue;
         chain_.push_back(t);
@@ -433,7 +604,7 @@ void lx::shell::icon_theme::load() {
                 pending.push_back(p);
         }
     }
-    if (const theme_index* h = index_of("hicolor"))
+    if (theme_index* h = index_of("hicolor"))
         chain_.push_back(h);
     lx::trace::logger::global().logf(lx::trace::level::info, k_icon_category,
                                      "icon theme {} ({} themes in the chain; png={} svg={})",
@@ -441,13 +612,14 @@ void lx::shell::icon_theme::load() {
                                      can_png() ? 1 : 0, can_svg() ? 1 : 0);
 }
 
-std::string lx::shell::icon_theme::find_in(const theme_index& t, const char* name, int px) const {
+std::string lx::shell::icon_theme::find_in(theme_index& t, const char* name, int px) {
     // icon-theme-spec LookupIcon, in pixels (Size × Scale): an exact match first, else the
     // directory with the smallest size distance.
     const char* exts[] = {can_png() ? ".png" : nullptr, can_svg() ? ".svg" : nullptr};
     std::string best;
     int best_distance = 1 << 30;
-    for (const auto& d : t.dirs) {
+    for (std::size_t di = 0; di < t.dirs.size(); ++di) {
+        const theme_dir& d = t.dirs[di];
         const int sc = d.scale;
         bool match = false;
         int distance = 0;
@@ -471,16 +643,14 @@ std::string lx::shell::icon_theme::find_in(const theme_index& t, const char* nam
         }
         if (!match && distance >= best_distance)
             continue;
-        for (const auto& r : t.roots) {
+        for (auto& r : t.roots) {
             for (const char* ext : exts) {
-                if (!ext)
+                if (!ext || !r->has(di, d.path, name, ext))
                     continue;
-                std::string path = r + "/" + d.path + "/" + name + ext;
-                if (!file_exists(path))
-                    continue;
+                std::string path = r->path + "/" + d.path + "/" + name + ext;
                 if (match)
                     return path;
-                best = path;
+                best = std::move(path);
                 best_distance = distance;
             }
         }
@@ -494,7 +664,7 @@ std::string lx::shell::icon_theme::find_file(const char* name, int px) {
     if (name[0] == '/')
         return file_exists(name) ? std::string(name) : std::string();
     load();
-    for (const theme_index* t : chain_)
+    for (theme_index* t : chain_)
         if (std::string f = find_in(*t, name, px); !f.empty())
             return f;
     // Unthemed: the base directories themselves, then /usr/share/pixmaps.
@@ -511,38 +681,109 @@ std::string lx::shell::icon_theme::find_file(const char* name, int px) {
     return {};
 }
 
+namespace {
+#if !defined(_WIN32)
+/// Rasterised SVG icons, kept across sessions in `$XDG_CACHE_HOME/lumen/icons`: one file per
+/// (source file, its modification time and size, pixel size), raw premultiplied ARGB words
+/// behind a 16-byte header. The panel's icons come from SVG for most applications, and
+/// rendering one needs librsvg, which is loaded only on a cache miss (`svg_document`).
+struct icon_cache_header {
+    char magic[4] = {'L', 'X', 'I', '1'};
+    std::uint32_t px = 0;
+    std::uint64_t key = 0;
+};
+
+std::string icon_cache_dir() {
+    if (const char* x = std::getenv("XDG_CACHE_HOME"); x && *x == '/')
+        return std::string{x} + "/lumen/icons";
+    if (const char* h = std::getenv("HOME"); h && *h == '/')
+        return std::string{h} + "/.cache/lumen/icons";
+    return {};
+}
+
+/// FNV-1a over what makes a rasterisation stale: the path, its mtime and size, the pixels.
+std::uint64_t icon_cache_key(const std::string& path, const struct stat& st, int px) {
+    std::uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](const void* data, std::size_t n) {
+        const auto* b = static_cast<const unsigned char*>(data);
+        for (std::size_t i = 0; i < n; ++i)
+            h = (h ^ b[i]) * 1099511628211ull;
+    };
+    mix(path.data(), path.size());
+    const long long mtime_ns =
+        static_cast<long long>(st.st_mtim.tv_sec) * 1'000'000'000ll + st.st_mtim.tv_nsec;
+    const long long size = static_cast<long long>(st.st_size);
+    mix(&mtime_ns, sizeof mtime_ns);
+    mix(&size, sizeof size);
+    mix(&px, sizeof px);
+    return h;
+}
+
+bool icon_cache_read(const std::string& file, std::uint64_t key, int px,
+                     std::vector<std::uint32_t>& out) {
+    const int fd = ::open(file.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    icon_cache_header h{};
+    const std::size_t bytes = static_cast<std::size_t>(px) * px * 4u;
+    bool ok = ::pread(fd, &h, sizeof h, 0) == static_cast<ssize_t>(sizeof h) &&
+              std::memcmp(h.magic, "LXI1", 4) == 0 && h.px == static_cast<std::uint32_t>(px) &&
+              h.key == key &&
+              ::pread(fd, out.data(), bytes, sizeof h) == static_cast<ssize_t>(bytes);
+    ::close(fd);
+    return ok;
+}
+
+void icon_cache_write(const std::string& dir, const std::string& file, std::uint64_t key, int px,
+                      const std::vector<std::uint32_t>& pixels) {
+    // mkdir -p of the two levels under the cache root; failures leave the icon uncached.
+    const std::size_t lumen = dir.rfind('/');
+    if (lumen != std::string::npos)
+        (void)::mkdir(dir.substr(0, lumen).c_str(), 0700);
+    (void)::mkdir(dir.c_str(), 0700);
+    const std::string tmp = file + ".tmp" + std::to_string(::getpid());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return;
+    icon_cache_header h{};
+    h.px = static_cast<std::uint32_t>(px);
+    h.key = key;
+    const std::size_t bytes = static_cast<std::size_t>(px) * px * 4u;
+    const bool ok = ::write(fd, &h, sizeof h) == static_cast<ssize_t>(sizeof h) &&
+                    ::write(fd, pixels.data(), bytes) == static_cast<ssize_t>(bytes);
+    ::close(fd);
+    // Atomic: a reader sees the old file, no file, or the whole new one.
+    if (!ok || ::rename(tmp.c_str(), file.c_str()) != 0)
+        (void)::unlink(tmp.c_str());
+}
+#endif
+} // namespace
+
 bool lx::shell::icon_theme::decode(const std::string& path, int px, std::vector<std::uint32_t>& out) {
     const bool svg = path.size() > 4 && path.compare(path.size() - 4, 4, ".svg") == 0;
     out.assign(static_cast<std::size_t>(px) * px, 0u);
     if (svg) {
-#if defined(LUMEN_HAS_RSVG)
-        GError* err = nullptr;
-        RsvgHandle* h = rsvg_handle_new_from_file(path.c_str(), &err);
-        if (!h) {
-            if (err)
-                g_error_free(err);
-            return false;
-        }
-        cairo_surface_t* surf = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, px, px);
-        cairo_t* cr = cairo_create(surf);
-        const RsvgRectangle viewport{0.0, 0.0, static_cast<double>(px), static_cast<double>(px)};
-        const bool ok = rsvg_handle_render_document(h, cr, &viewport, &err) != 0;
-        if (err)
-            g_error_free(err);
-        cairo_destroy(cr);
-        cairo_surface_flush(surf);
-        // CAIRO_FORMAT_ARGB32 is premultiplied, native-endian 0xAARRGGBB: what the panel draws.
-        const unsigned char* data = cairo_image_surface_get_data(surf);
-        const int stride = cairo_image_surface_get_stride(surf);
-        for (int y = 0; ok && data && y < px; ++y)
-            std::memcpy(out.data() + static_cast<std::size_t>(y) * px, data + static_cast<std::size_t>(y) * stride,
-                        static_cast<std::size_t>(px) * 4u);
-        cairo_surface_destroy(surf);
-        g_object_unref(h);
-        return ok;
-#else
-        return false;
+#if !defined(_WIN32)
+        struct stat st{};
+        const std::string dir = icon_cache_dir();
+        const bool cacheable = !dir.empty() && ::stat(path.c_str(), &st) == 0;
+        const std::uint64_t key = cacheable ? icon_cache_key(path, st, px) : 0;
+        char name[32];
+        std::snprintf(name, sizeof name, "/%016llx.argb", static_cast<unsigned long long>(key));
+        const std::string file = dir + name;
+        if (cacheable && icon_cache_read(file, key, px, out))
+            return true;
 #endif
+        // Premultiplied, native-endian 0xAARRGGBB (cairo's ARGB32): what the panel draws.
+        svg_document doc;
+        const bool ok = doc.open(path.c_str()) &&
+                        doc.render(reinterpret_cast<unsigned char*>(out.data()), px, px, px * 4,
+                                   {0.f, 0.f, static_cast<float>(px), static_cast<float>(px)});
+#if !defined(_WIN32)
+        if (ok && cacheable)
+            icon_cache_write(dir, file, key, px, out);
+#endif
+        return ok;
     }
 #if defined(LUMEN_HAS_PNG)
     png_image img{};

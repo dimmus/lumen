@@ -95,6 +95,8 @@ struct output_pipeline {
     gfx::damage_region kms_pending{};
     /// Damage a failed composite could not draw, retried on the next tick.
     gfx::damage_region missed{};
+    /// Render clock: when this output last composited (slot catch-up waits for idle).
+    lx::runtime::clock_time last_composite_ns = 0;
     /// Frame index of the snapshot whose damage was last consumed.
     unsigned last_seen_frame = ~0u;
     /// Newest snapshot of this view acquired and composited (or skipped): -1 before any.
@@ -835,6 +837,15 @@ struct compositor_impl {
     scheduler::frame_clocks clocks_{};
     /// UI → render: bit per output whose view published since render last looked.
     std::atomic<std::uint32_t> render_mask_{0};
+    /// UI → render: bumped after each resume UI posts (`resume_gen_`), work only a render
+    /// tick notices.
+    std::atomic<unsigned long long> render_posts_{1};
+    /// Render → UI, at the end of each render tick: the `render_posts_` it started from when
+    /// nothing of render's own is left for a later tick (no flip or frame waiting, no
+    /// leftover damage, no targets kept around, no deferred op, texture retirement, capture
+    /// job or resume), else 0. Equal to `render_posts_`: the idle housekeeping tick leaves the
+    /// render thread asleep. A post after the tick began no longer matches, so is not missed.
+    std::atomic<unsigned long long> render_quiet_at_{0};
     /// UI affinity. The outputs `on_vsync` is serving (`tick_ui`); 0 outside a vsync tick
     /// (a test driving `tick_ui` directly serves every live output).
     std::uint32_t due_mask_ = 0;
@@ -879,9 +890,9 @@ struct compositor_impl {
     unsigned deferred_head_ = 0;
     unsigned deferred_count_ = 0;
     bool warned_deferred_full_ = false;
-    shm_staging_ring shm_staging_{};
     shm_pixel_store shm_store_{};
-    /// GL path: transient staging, a block per in-flight update (see shm_upload_pool).
+    /// GL and Vulkan paths: transient staging, a block per in-flight update (see
+    /// shm_upload_pool).
     shm_upload_pool shm_pool_{};
     /// Staging blocks unused this long are unmapped; long enough to ride out a pause in
     /// an animation, short enough that an idle desktop holds none.
@@ -1205,7 +1216,14 @@ struct compositor_impl {
     void stop_threads();
     /// One tick of the frame clocks: the outputs due now (`frame_clocks::take_due`) plus
     /// `forced` (the housekeeping and paused ticks serve outputs whose clock is stopped).
-    void on_vsync(std::uint32_t forced = 0);
+    /// `housekeeping`: the idle once-a-second tick, which wakes render only for work.
+    void on_vsync(std::uint32_t forced = 0, bool housekeeping = false);
+    /// UI affinity. Whether the render thread has anything to do: it said at the end of its
+    /// last tick that nothing of its own was left (`render_quiet_at_`), and nothing new has
+    /// been handed to it since.
+    [[nodiscard]] bool render_has_work() const;
+    /// Render affinity, end of `tick_render`: see `render_quiet_at_`.
+    [[nodiscard]] bool render_is_quiet() const;
     void render_loop();
     void worker_loop();
     void register_p0_globals();
@@ -1429,6 +1447,20 @@ struct compositor_impl {
                           unsigned long long& area);
     /// Render. Commits `p`'s composited frame (and its cursor), or a cursor-only commit.
     const char* commit_output(output_pipeline& p, unsigned slot, bool composited);
+    /// Render, once `p` has composited nothing for `k_catch_up_idle_ns` with nothing in
+    /// flight (GL): every slot off screen whose age covers at least a quarter of the output
+    /// is brought up to date from the one on screen by a copy, so the busy frame that next
+    /// draws into it — the third slot is first drawn into by a frame composited while a flip
+    /// is pending — repaints only its own damage rather than the whole output. Not between
+    /// the frames of an animation: those repaint the same region anyway.
+    void catch_up_slots(output_pipeline& p);
+    /// Render. `p` is in a state a catch-up may run in, and some slot's age is large enough;
+    /// `front` receives the slot on screen. Owed catch-ups keep render from reporting quiet,
+    /// so the idle housekeeping tick runs it.
+    [[nodiscard]] bool catch_up_owed(const output_pipeline& p, unsigned& front) const;
+    static constexpr lx::runtime::clock_time k_catch_up_idle_ns = 200'000'000;
+    /// Render. A copy failed once: no more catch-ups (the frames repaint by buffer age).
+    bool catch_up_failed_ = false;
     /// Render. Every pipeline that needs a modeset and has a frame: one combined commit (M5).
     /// `kinds[slot]` receives what each pipeline committed.
     void commit_pending_modesets(const char** kinds);
@@ -2394,7 +2426,8 @@ void compositor_impl::wayland_fd_callback() {
         return;
     lx::trace::scoped_span span{"ui", "wayland.pump"};
     const std::uint32_t damaged_before = active->scene.pending_damage_mask();
-    (void)active->wayland.dispatch(0);
+    // Unflushed: the loop's after-dispatch hook flushes once the iteration is done.
+    (void)active->wayland.dispatch(0, false);
     // Whatever a client asked for is applied, configured and composited by a tick — of the
     // outputs it damaged when it damaged any (each on its own phase), else of every output
     // (a frame callback or a configure answer is served by whichever ticks).
@@ -2499,7 +2532,7 @@ void compositor_impl::housekeeping_callback() {
             const bool master = session_active && active->kms.is_master();
             active->apply_session_actions(active->session_.on_paused_tick(session_active, master));
         }
-        active->on_vsync();
+        active->on_vsync(0, true);
         if (active->clocks_.running_mask() == 0 && active->housekeeping_timer)
             active->housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
         return;
@@ -2513,7 +2546,7 @@ void compositor_impl::housekeeping_callback() {
     }
     // One tick of every lit output for the deadlines only a tick notices; nothing woke the
     // clocks but the calendar, so one quiet tick is enough to stop them again.
-    active->on_vsync();
+    active->on_vsync(0, true);
     if (active->clocks_.running_mask() == 0 && active->housekeeping_timer)
         active->housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
 }
@@ -3032,14 +3065,14 @@ void compositor_impl::register_p0_globals() {
     p0_.lifecycle = &buffer_lifecycle_;
     // Exactly one staging strategy: the CPU path samples staged rows in place during the
     // composite, which a shared FIFO cannot keep alive that long (see shm_pixel_store).
-    // GL copies the pixels out during the drain, but still stages per texture: a global
-    // 8-slot ring starves as soon as one client commits more surfaces than that in a frame
-    // (a CSD client's subsurfaces alone do), and the dropped update never shows. GL uploads
-    // RGBA, so it wants the conversion. Vulkan keeps the ring.
+    // GL and Vulkan copy the pixels out during the drain, so their staging is a transient
+    // block per update (`shm_upload_pool`), mapped for it and unmapped after a second idle.
+    // A global ring of window-sized vectors that never shrank held seven 1080p frames
+    // (57 MiB) after the only client had gone.
     p0_.shm_pool = nullptr;
+    p0_.shm_regions = false;
     if (cpu_present_) {
         p0_.shm_store = &shm_store_;
-        p0_.shm_staging = nullptr;
         // Scanout is XR24, so keeping the client's channel order means an unscaled opaque
         // surface reaches the display with no conversion pass at all.
         p0_.shm_native_format = true;
@@ -3048,8 +3081,8 @@ void compositor_impl::register_p0_globals() {
         // the trip to the render thread: transient blocks sized by the damage they carry,
         // not a persistent window-sized copy per texture.
         p0_.shm_pool = &shm_pool_;
+        p0_.shm_regions = true;
         p0_.shm_store = nullptr;
-        p0_.shm_staging = nullptr;
         p0_.shm_native_format = false;
         // Where the driver takes BGRA rows at any stride, the client's buffer is uploaded
         // as it is: no staging copy and no swizzle on the UI thread. What is still staged
@@ -3062,7 +3095,8 @@ void compositor_impl::register_p0_globals() {
                                             "shm: uploaded from client memory (no staging)");
         }
     } else {
-        p0_.shm_staging = &shm_staging_;
+        // Vulkan uploads whole RGBA images.
+        p0_.shm_pool = &shm_pool_;
         p0_.shm_store = nullptr;
         p0_.shm_native_format = false;
     }
@@ -4274,7 +4308,7 @@ void compositor_impl::finish_config_generation() {
     const auto& d = config_.diagnostics();
     // Logged once per generation: each problem, then one summary line.
     for (const lxc::diagnostic& x : d.items()) {
-        char line[384];
+        char line[1024]; // a path (up to 512) and the message
         lxc::format_diagnostic(x, config_.path_of(x.layer), true, line, sizeof(line));
         lx::trace::logger::global().log(
             x.sev == lxc::severity::error ? lx::trace::level::warn : lx::trace::level::info,
@@ -4712,19 +4746,21 @@ void compositor_impl::apply_texture_update(texture_update& update) {
                 update.format == static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
             const bool opaque =
                 update.format == static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+            // The rects of the region, when it has several (empty: the region as one).
+            const std::span<const lx::rect2i> parts{update.rects.rects, update.rects.count};
             if (update.shm_direct) {
                 // The client's own rows, read under its buffer's access guard.
                 shm_direct_.upload(update.shm_direct,
                                    [&](const unsigned char* pixels, unsigned stride) {
-                                       applied = pixels ? gl_compositor_.upload_client_region(
+                                       applied = pixels ? gl_compositor_.upload_client_regions(
                                                               update.texture_id, update.width,
                                                               update.height, update.region,
-                                                              pixels, stride, opaque)
+                                                              parts, pixels, stride, opaque)
                                                         : lx::result<void>{};
                                    });
             } else if (bgra) {
-                applied = gl_compositor_.upload_client_region(
-                    update.texture_id, update.width, update.height, update.region,
+                applied = gl_compositor_.upload_client_regions(
+                    update.texture_id, update.width, update.height, update.region, parts,
                     update.pixels, update.stride, opaque);
             } else {
                 applied = gl_compositor_.upload_rgba_region(update.texture_id, update.width,
@@ -4744,10 +4780,9 @@ void compositor_impl::apply_texture_update(texture_update& update) {
         } else if (vulkan_present_) {
             applied = vk_compositor_.upload_rgba(update.texture_id, update.width,
                                                  update.height, update.pixels);
-            // The ring slot is free the moment the upload has been recorded.
-            shm_staging_.publish_consumed(update.shm_seq);
+            // The upload copied the pixels into the renderer's own staging.
+            shm_pool_.release(update.shm_pool_token);
         } else {
-            shm_staging_.publish_consumed(update.shm_seq);
             shm_store_.release(update.shm_token);
             shm_pool_.release(update.shm_pool_token);
         }
@@ -5801,6 +5836,7 @@ void compositor_impl::finish_display_resume(unsigned gen) {
         if (!outs_[s].live)
             continue;
         resume_gen_[s].store(render_gen, std::memory_order_release);
+        render_posts_.fetch_add(1, std::memory_order_acq_rel);
         if (outs_[s].pipe && outs_[s].pipe->kms)
             vt_resume_pending_ |= 1u << s;
     }
@@ -5911,6 +5947,7 @@ void compositor_impl::apply_power_actions(unsigned slot, const power_actions& a)
             const unsigned render_gen = ++render_gen_counter_;
             o.power_resume_render_gen = render_gen;
             resume_gen_[slot].store(render_gen, std::memory_order_release);
+            render_posts_.fetch_add(1, std::memory_order_acq_rel);
         }
         gate_power_mask_.fetch_and(~bit, std::memory_order_release);
         clocks_.set_dark(slot, false);
@@ -8761,7 +8798,39 @@ void compositor_impl::stop_threads() {
     runtime::executor::global().worker_strand().set_waker(nullptr, nullptr);
 }
 
-void compositor_impl::on_vsync(std::uint32_t forced) {
+bool compositor_impl::render_is_quiet() const {
+    if (!ops_deferred_.empty() || capture_renderer_.has_pending() ||
+        device_recovery_.needs_recovery())
+        return false;
+    for (const deferred_forget& f : deferred_forgets_)
+        if (f.used)
+            return false;
+    for (const auto& up : pipes_) {
+        if (!up)
+            continue;
+        const output_pipeline& p = *up;
+        // A composited slot only waits for something with a CRTC to hand it to.
+        if (p.retiring || p.graveyard || p.staged || !p.missed.empty() ||
+            p.frame_outstanding.load(std::memory_order_relaxed) ||
+            (p.kms && (p.composited_slot >= 0 || p.kms->flip_pending())) ||
+            resume_gen_[p.slot].load(std::memory_order_acquire) != p.resume_done_gen)
+            return false;
+        if (unsigned front = 0; catch_up_owed(p, front))
+            return false;
+    }
+    return true;
+}
+
+bool compositor_impl::render_has_work() const {
+    return render_quiet_at_.load(std::memory_order_acquire) !=
+               render_posts_.load(std::memory_order_acquire) ||
+           render_mask_.load(std::memory_order_acquire) != 0 || !texture_updates_.empty() ||
+           ops_pending_.load(std::memory_order_acquire) || cursor_frames_.fresh() ||
+           cursor_images_.fresh() || screenshot_pending_.load(std::memory_order_acquire) != 0 ||
+           capture_ui_posted_.load(std::memory_order_acquire);
+}
+
+void compositor_impl::on_vsync(std::uint32_t forced, bool housekeeping) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
 
     const auto now = std::chrono::steady_clock::now();
@@ -8793,11 +8862,15 @@ void compositor_impl::on_vsync(std::uint32_t forced) {
 
     // Render runs after every tick: composites of the views just published, a frame still
     // waiting for its flip, and cursor-only commits (the pointer moved, nothing else did).
-    {
-        std::lock_guard lock{render_mutex};
-        render_pending = true;
+    // The idle housekeeping tick wakes it only for work: otherwise it found nothing, once a
+    // second — half of an idle desktop's wakeups.
+    if (!housekeeping || render_has_work()) {
+        {
+            std::lock_guard lock{render_mutex};
+            render_pending = true;
+        }
+        render_cv.notify_one();
     }
-    render_cv.notify_one();
     settle_frame_clocks(due, tick_quiet_mask_);
 }
 
@@ -9784,7 +9857,9 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         // From here to the publish, what is applied joins this tick's frame (the
         // commit-timing prediction of the served outputs is this tick's deadline).
         impl->p0_.cu_in_tick = true;
-        (void)wayland().dispatch(0);
+        // Unflushed: the tick flushes once at its end, so what these requests produce (a
+        // buffer release) leaves together with the frame's events in one send.
+        (void)wayland().dispatch(0, false);
     }
     // Queued content updates whose target this tick's frame reaches, or that stopped being
     // shown, apply now and join it.
@@ -10073,6 +10148,8 @@ void compositor::tick_render() {
     runtime::assert_affinity(runtime::affinity::render);
     lx::trace::scoped_span span{"render", "tick_render"};
     auto* impl = impl_;
+    // Before anything this tick reads: work UI posts from here on wakes render again.
+    const unsigned long long posts_seen = impl->render_posts_.load(std::memory_order_acquire);
 
     // The pause gate, in this order (see `resume_gen_`). A resume runs its procedure before
     // anything else this tick: the KMS state, the cursor plane and every slot's history are
@@ -10236,6 +10313,9 @@ void compositor::tick_render() {
             commit_kinds[up->slot] = impl->commit_output(*up, up->slot, composited[up->slot]);
         }
         impl->commit_pending_modesets(commit_kinds);
+        for (auto& up : impl->pipes_)
+            if (up && !composited[up->slot])
+                impl->catch_up_slots(*up);
     }
 
     // Screen capture that needs no new composite, window captures, curtains (before the
@@ -10247,6 +10327,8 @@ void compositor::tick_render() {
     const long long low_water = impl->compute_low_water();
     impl->render_low_water_.store(low_water, std::memory_order_release);
     impl->apply_due_forgets(low_water);
+    impl->render_quiet_at_.store(impl->render_is_quiet() ? posts_seen : 0,
+                                 std::memory_order_release);
 
     // One line per output that did something; an idle tick is silent. Checked before
     // formatting so the frame path pays nothing when debug is off.
@@ -10420,6 +10502,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 if (i != back)
                     p.slot_age[i].add_region(frame_damage);
             p.slot_age[back].clear();
+            p.last_composite_ns = now_ns();
             p.kms_pending.add_region(frame_damage);
             p.frame_outstanding.store(p.kms != nullptr, std::memory_order_release);
             // Newest wins: a frame that could not be shown yet is superseded by this one
@@ -10492,6 +10575,63 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
     p.rendered_frame.store(static_cast<long long>(idx), std::memory_order_release);
     scene.release_render_frame(slot, snapshot);
     return drawn;
+}
+
+bool compositor_impl::catch_up_owed(const output_pipeline& p, unsigned& front) const {
+    if (!gl_present_ || catch_up_failed_ || !gl_compositor_.supports_target_copy() ||
+        p.slot_count < 2 || !p.kms || p.retiring || p.graveyard || p.staged ||
+        p.switch_pending || p.composited_slot >= 0 || !p.missed.empty() ||
+        !p.content_committed_once || p.kms->flip_pending() || p.kms->needs_modeset())
+        return false;
+    if (display_gate_.load(std::memory_order_acquire) != 0 ||
+        (gate_power_mask_.load(std::memory_order_acquire) & (1u << p.slot)) != 0)
+        return false;
+    // Nothing is waiting or queued, so the slot on screen holds the newest composite — the
+    // frame every other slot's age is measured against. Its own age is then empty; anything
+    // else means it is not that frame (its flip is drained but not noted yet).
+    front = p.front.load(std::memory_order_acquire);
+    if (front >= p.slot_count || !p.slot_age[front].empty())
+        return false;
+    const unsigned long long output_area =
+        static_cast<unsigned long long>(p.scanout_rect.width) * p.scanout_rect.height;
+    for (unsigned i = 0; i < p.slot_count; ++i) {
+        if (i == front || p.slot_age[i].empty())
+            continue;
+        gfx::damage_region region = p.slot_age[i];
+        region.clip(p.scanout_rect);
+        // A small age is cheaper to repaint with the frame that next uses the slot.
+        if ((region.full ? output_area : region.area()) * 4 >= output_area)
+            return true;
+    }
+    return false;
+}
+
+void compositor_impl::catch_up_slots(output_pipeline& p) {
+    unsigned front = 0;
+    if (!catch_up_owed(p, front) || now_ns() - p.last_composite_ns < k_catch_up_idle_ns)
+        return;
+    const unsigned long long output_area =
+        static_cast<unsigned long long>(p.scanout_rect.width) * p.scanout_rect.height;
+    for (unsigned i = 0; i < p.slot_count; ++i) {
+        if (i == front || p.slot_age[i].empty())
+            continue;
+        gfx::damage_region region = p.slot_age[i];
+        region.clip(p.scanout_rect);
+        const unsigned long long area = region.full ? output_area : region.area();
+        if (area * 4 < output_area)
+            continue;
+        lx::trace::scoped_span span{"render", "catch_up_slot"};
+        if (auto ok = gl_compositor_.copy_region(p.gl[front], p.gl[i], region); !ok) {
+            lx::trace::logger::global().log_error(ok.get_error(), "compositor.render");
+            catch_up_failed_ = true;
+            return;
+        }
+        p.slot_age[i].clear();
+        if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.render",
+                                             "slot catch-up output={} slot={} from={} area={}",
+                                             p.slot, i, front, area);
+    }
 }
 
 const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bool composited) {

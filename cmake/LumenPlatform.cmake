@@ -5,6 +5,8 @@ find_package(PkgConfig QUIET)
 
 if(PkgConfig_FOUND)
     pkg_check_modules(WAYLAND QUIET wayland-server wayland-client)
+    # A Wayland client alone (lumen-shell): libwayland-client without the server.
+    pkg_check_modules(WAYLAND_CLIENT QUIET wayland-client)
     pkg_check_modules(WAYLAND_SCANNER QUIET wayland-scanner)
     pkg_check_modules(LIBDRM QUIET libdrm)
     # libdisplay-info parses EDID into the make/model/serial a monitor is identified by
@@ -211,6 +213,45 @@ function(lumen_link_platform target)
             target_compile_definitions(${target} PRIVATE LUMEN_HAS_VARLINK=1)
         endif()
     endif()
+endfunction()
+
+# Only the named platform parts, for a target that is not the compositor (lumen-shell and the
+# modules it is built from): `lumen_link_platform` brings Vulkan, DRM, libinput, udev and
+# EGL/GBM as well, which a client loads and relocates at every start for nothing.
+#   wayland_client  libwayland-client          LUMEN_HAS_WAYLAND
+#   xkb             xkbcommon                  LUMEN_HAS_XKBCOMMON
+#   text            HarfBuzz, FreeType, fontconfig  LUMEN_HAS_TEXT
+#   systemd         libsystemd (sd-bus)        LUMEN_HAS_LOGIND
+function(lumen_link_platform_parts target)
+    foreach(part IN LISTS ARGN)
+        if(part STREQUAL "wayland_client")
+            if(WAYLAND_CLIENT_FOUND)
+                target_include_directories(${target} PRIVATE ${WAYLAND_CLIENT_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${WAYLAND_CLIENT_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_WAYLAND=1)
+            endif()
+        elseif(part STREQUAL "xkb")
+            if(XKBCOMMON_FOUND)
+                target_include_directories(${target} PRIVATE ${XKBCOMMON_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${XKBCOMMON_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_XKBCOMMON=1)
+            endif()
+        elseif(part STREQUAL "text")
+            if(HARFBUZZ_FOUND)
+                target_include_directories(${target} PRIVATE ${HARFBUZZ_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${HARFBUZZ_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_TEXT=1)
+            endif()
+        elseif(part STREQUAL "systemd")
+            if(LIBSYSTEMD_FOUND)
+                target_include_directories(${target} PRIVATE ${LIBSYSTEMD_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${LIBSYSTEMD_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_LOGIND=1)
+            endif()
+        else()
+            message(FATAL_ERROR "lumen_link_platform_parts: unknown part '${part}'")
+        endif()
+    endforeach()
 endfunction()
 
 # Link platform deps into module libraries that call platform APIs directly.

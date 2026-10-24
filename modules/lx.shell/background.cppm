@@ -62,17 +62,13 @@ module;
 #if defined(LUMEN_HAS_WEBP)
 #include <webp/decode.h>
 #endif
-#if defined(LUMEN_HAS_RSVG)
-#include <cairo.h>
-#include <librsvg/rsvg.h>
-#endif
-
 import lx.foundation;
 import lx.trace;
 
 export module lx.shell:background;
 
 import std;
+import :svg;
 
 export namespace lx::shell {
 
@@ -215,19 +211,23 @@ float linear_to_srgb(float v) {
     return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
 }
 
+/// Fractional part of a non-negative `v`. Truncation is floor there, and it vectorizes on
+/// baseline x86-64 (cvttps2dq) where floor needs SSE4.1 and is a libm call per pixel.
+inline float frac_nonneg(float v) { return v - static_cast<float>(static_cast<int>(v)); }
+
 /// Interleaved gradient noise (Jimenez 2014) in [-0.5, 0.5): a dither with no visible
-/// pattern, cheaper than blue noise and free of a texture.
+/// pattern, cheaper than blue noise and free of a texture. `x`, `y` ≥ 0.
 inline float dither_ign(int x, int y) {
     const float f = 0.06711056f * static_cast<float>(x) + 0.00583715f * static_cast<float>(y);
-    const float g = 52.9829189f * (f - std::floor(f));
-    return (g - std::floor(g)) - 0.5f;
+    return frac_nonneg(52.9829189f * frac_nonneg(f)) - 0.5f;
 }
 
-/// sRGB channel values in 0..1, dithered by `n` (in LSBs), to XRGB8888.
+/// sRGB channel values in 0..1, dithered by `n` (in LSBs), to XRGB8888. Converted through
+/// int: float → unsigned is a branch per value on x86-64, float → int one instruction.
 inline std::uint32_t pack_xrgb(float r, float g, float b, float n) {
     const auto q = [n](float v) {
         const float s = v * 255.f + 0.5f + n;
-        return static_cast<std::uint32_t>(s < 0.f ? 0.f : (s > 255.f ? 255.f : s));
+        return static_cast<std::uint32_t>(static_cast<int>(s < 0.f ? 0.f : (s > 255.f ? 255.f : s)));
     };
     return 0xFF000000u | (q(r) << 16) | (q(g) << 8) | q(b);
 }
@@ -255,84 +255,99 @@ bool parse_hex(std::string_view s, std::uint32_t& out) {
 
 // ── resampling ────────────────────────────────────────────────────────────────
 
+/// The source samples one axis of a resample reads for each output sample: output `o`
+/// takes taps [begin[o], begin[o + 1]), each a source index and its weight.
+struct axis_taps {
+    std::vector<unsigned> begin;
+    std::vector<int> index;
+    std::vector<float> weight;
+};
+
+/// Area averaging when the axis shrinks (`src` > `dst`), bilinear when it grows.
+axis_taps make_taps(int src, int dst) {
+    axis_taps t;
+    t.begin.reserve(static_cast<std::size_t>(dst) + 1);
+    const double s = static_cast<double>(src) / dst;
+    for (int o = 0; o < dst; ++o) {
+        t.begin.push_back(static_cast<unsigned>(t.index.size()));
+        if (s > 1.0) {
+            const double x0 = o * s, x1 = x0 + s;
+            for (int i = static_cast<int>(x0); i < src && i < x1; ++i) {
+                t.index.push_back(i);
+                t.weight.push_back(static_cast<float>((std::min<double>(i + 1, x1) - std::max<double>(i, x0)) / s));
+            }
+        } else {
+            double f = (o + 0.5) * s - 0.5;
+            f = f < 0 ? 0 : f;
+            const int i0 = std::min(static_cast<int>(f), src - 1);
+            const int i1 = std::min(i0 + 1, src - 1);
+            const double w = f - i0;
+            t.index.push_back(i0);
+            t.weight.push_back(static_cast<float>(1 - w));
+            t.index.push_back(i1);
+            t.weight.push_back(static_cast<float>(w));
+        }
+    }
+    t.begin.push_back(static_cast<unsigned>(t.index.size()));
+    return t;
+}
+
 /// `src` (`sw`×`sh`, premultiplied ARGB) to `dw`×`dh`: area averaging on each axis that
-/// shrinks, bilinear on each that grows. Separable: a horizontal pass into a float row
-/// buffer, then a vertical one.
+/// shrinks, bilinear on each that grows. Separable, a row at a time: each source row is
+/// resampled horizontally once, into one of two cached float rows (consecutive output rows
+/// share at most their boundary rows), and the output row accumulates its source rows'
+/// weights — memory is a few rows, not an intermediate image.
 void resample_area_bilinear(const std::uint32_t* src, int sw, int sh, std::uint32_t* dst, int dw, int dh) {
     if (sw <= 0 || sh <= 0 || dw <= 0 || dh <= 0)
         return;
-    // Horizontal pass, row by row: sh rows of dw pixels, 4 floats each.
-    std::vector<float> mid(static_cast<std::size_t>(dw) * sh * 4);
-    const double sx = static_cast<double>(sw) / dw;
-    for (int y = 0; y < sh; ++y) {
-        const std::uint32_t* row = src + static_cast<std::size_t>(y) * sw;
-        float* out = mid.data() + static_cast<std::size_t>(y) * dw * 4;
+    const axis_taps hx = make_taps(sw, dw);
+    const axis_taps vy = make_taps(sh, dh);
+    const std::size_t row_floats = static_cast<std::size_t>(dw) * 4;
+    std::vector<float> rows(row_floats * 3);
+    float* const acc = rows.data() + row_floats * 2;
+    int cached[2] = {-1, -1};
+    unsigned oldest = 0;
+    const auto horizontal = [&](int j) -> const float* {
+        for (unsigned k = 0; k < 2; ++k)
+            if (cached[k] == j)
+                return rows.data() + row_floats * k;
+        const unsigned k = oldest;
+        oldest ^= 1u;
+        cached[k] = j;
+        float* out = rows.data() + row_floats * k;
+        const std::uint32_t* row = src + static_cast<std::size_t>(j) * sw;
         for (int x = 0; x < dw; ++x) {
-            double a = 0, r = 0, g = 0, b = 0;
-            if (sx > 1.0) {
-                const double x0 = x * sx, x1 = x0 + sx;
-                for (int i = static_cast<int>(x0); i < sw && i < x1; ++i) {
-                    const double w = std::min<double>(i + 1, x1) - std::max<double>(i, x0);
-                    const std::uint32_t p = row[i];
-                    a += w * (p >> 24);
-                    r += w * ((p >> 16) & 0xFFu);
-                    g += w * ((p >> 8) & 0xFFu);
-                    b += w * (p & 0xFFu);
-                }
-                a /= sx;
-                r /= sx;
-                g /= sx;
-                b /= sx;
-            } else {
-                double fx = (x + 0.5) * sx - 0.5;
-                fx = fx < 0 ? 0 : fx;
-                const int i0 = std::min(static_cast<int>(fx), sw - 1);
-                const int i1 = std::min(i0 + 1, sw - 1);
-                const double t = fx - i0;
-                const std::uint32_t p0 = row[i0], p1 = row[i1];
-                a = (1 - t) * (p0 >> 24) + t * (p1 >> 24);
-                r = (1 - t) * ((p0 >> 16) & 0xFFu) + t * ((p1 >> 16) & 0xFFu);
-                g = (1 - t) * ((p0 >> 8) & 0xFFu) + t * ((p1 >> 8) & 0xFFu);
-                b = (1 - t) * (p0 & 0xFFu) + t * (p1 & 0xFFu);
+            float a = 0, r = 0, g = 0, b = 0;
+            for (unsigned t = hx.begin[x]; t < hx.begin[x + 1]; ++t) {
+                const std::uint32_t p = row[hx.index[t]];
+                const float w = hx.weight[t];
+                a += w * static_cast<float>(p >> 24);
+                r += w * static_cast<float>((p >> 16) & 0xFFu);
+                g += w * static_cast<float>((p >> 8) & 0xFFu);
+                b += w * static_cast<float>(p & 0xFFu);
             }
-            out[x * 4 + 0] = static_cast<float>(a);
-            out[x * 4 + 1] = static_cast<float>(r);
-            out[x * 4 + 2] = static_cast<float>(g);
-            out[x * 4 + 3] = static_cast<float>(b);
+            out[x * 4 + 0] = a;
+            out[x * 4 + 1] = r;
+            out[x * 4 + 2] = g;
+            out[x * 4 + 3] = b;
         }
-    }
-    // Vertical pass.
-    const double sy = static_cast<double>(sh) / dh;
+        return out;
+    };
     for (int y = 0; y < dh; ++y) {
-        for (int x = 0; x < dw; ++x) {
-            float acc[4] = {0, 0, 0, 0};
-            if (sy > 1.0) {
-                const double y0 = y * sy, y1 = y0 + sy;
-                for (int j = static_cast<int>(y0); j < sh && j < y1; ++j) {
-                    const float w = static_cast<float>(std::min<double>(j + 1, y1) - std::max<double>(j, y0));
-                    const float* m = mid.data() + (static_cast<std::size_t>(j) * dw + x) * 4;
-                    for (int c = 0; c < 4; ++c)
-                        acc[c] += w * m[c];
-                }
-                for (float& v : acc)
-                    v /= static_cast<float>(sy);
-            } else {
-                double fy = (y + 0.5) * sy - 0.5;
-                fy = fy < 0 ? 0 : fy;
-                const int j0 = std::min(static_cast<int>(fy), sh - 1);
-                const int j1 = std::min(j0 + 1, sh - 1);
-                const float t = static_cast<float>(fy - j0);
-                const float* m0 = mid.data() + (static_cast<std::size_t>(j0) * dw + x) * 4;
-                const float* m1 = mid.data() + (static_cast<std::size_t>(j1) * dw + x) * 4;
-                for (int c = 0; c < 4; ++c)
-                    acc[c] = (1 - t) * m0[c] + t * m1[c];
-            }
-            const auto q = [](float v) {
-                return static_cast<std::uint32_t>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f));
-            };
-            dst[static_cast<std::size_t>(y) * dw + x] =
-                (q(acc[0]) << 24) | (q(acc[1]) << 16) | (q(acc[2]) << 8) | q(acc[3]);
+        std::fill_n(acc, row_floats, 0.f);
+        for (unsigned t = vy.begin[y]; t < vy.begin[y + 1]; ++t) {
+            const float* m = horizontal(vy.index[t]);
+            const float w = vy.weight[t];
+            for (std::size_t i = 0; i < row_floats; ++i)
+                acc[i] += w * m[i];
         }
+        std::uint32_t* out = dst + static_cast<std::size_t>(y) * dw;
+        const auto q = [](float v) {
+            return static_cast<std::uint32_t>(static_cast<int>(v < 0.f ? 0.f : (v > 255.f ? 255.f : v + 0.5f)));
+        };
+        for (int x = 0; x < dw; ++x)
+            out[x] = (q(acc[x * 4]) << 24) | (q(acc[x * 4 + 1]) << 16) | (q(acc[x * 4 + 2]) << 8) |
+                     q(acc[x * 4 + 3]);
     }
 }
 
@@ -480,35 +495,21 @@ bool decode_webp(const std::vector<unsigned char>& file, std::vector<std::uint32
 #if defined(LUMEN_HAS_RSVG)
 bool render_svg(const std::string& path, int w, int h, lx::shell::background_fit fit,
                 std::vector<std::uint32_t>& out, int& ow, int& oh) {
-    GError* err = nullptr;
-    RsvgHandle* svg = rsvg_handle_new_from_file(path.c_str(), &err);
-    if (!svg) {
-        if (err)
-            g_error_free(err);
+    lx::shell::svg_document svg;
+    if (!svg.open(path.c_str()))
         return false;
-    }
     double iw = 0, ih = 0;
-    if (!rsvg_handle_get_intrinsic_size_in_pixels(svg, &iw, &ih) || iw <= 0 || ih <= 0) {
+    if (!svg.intrinsic_size(iw, ih)) {
         iw = w; // no intrinsic size (a viewBox only): it scales to whatever it is given
         ih = h;
     }
     fit_size(static_cast<int>(std::lround(iw)), static_cast<int>(std::lround(ih)), w, h, fit, ow, oh);
-    if (static_cast<std::size_t>(ow) * oh > k_max_pixels) {
-        g_object_unref(svg);
+    if (static_cast<std::size_t>(ow) * oh > k_max_pixels)
         return false;
-    }
     out.assign(static_cast<std::size_t>(ow) * oh, 0u);
-    cairo_surface_t* surf = cairo_image_surface_create_for_data(
-        reinterpret_cast<unsigned char*>(out.data()), CAIRO_FORMAT_ARGB32, ow, oh, ow * 4);
-    cairo_t* cr = cairo_create(surf);
-    const RsvgRectangle viewport{0.0, 0.0, static_cast<double>(ow), static_cast<double>(oh)};
-    const bool ok = rsvg_handle_render_document(svg, cr, &viewport, &err) != 0;
-    if (err)
-        g_error_free(err);
-    cairo_destroy(cr);
-    cairo_surface_destroy(surf);
-    g_object_unref(svg);
-    return ok; // cairo's ARGB32 is premultiplied 0xAARRGGBB already
+    // cairo's ARGB32 is premultiplied 0xAARRGGBB already.
+    return svg.render(reinterpret_cast<unsigned char*>(out.data()), ow, oh, ow * 4,
+                      {0.f, 0.f, static_cast<float>(ow), static_cast<float>(oh)});
 }
 #endif
 
@@ -608,7 +609,7 @@ void lx::shell::render_gradient(std::uint32_t* px, int w, int h, int stride, std
         for (int x = 0; x < w; ++x) {
             float t = ((static_cast<float>(x) + 0.5f - cx) * dx + base) * inv + 0.5f;
             t = t < 0.f ? 0.f : (t > 1.f ? 1.f : t);
-            const rgbf& c = lut[static_cast<std::size_t>(t * (k_lut - 1) + 0.5f)];
+            const rgbf& c = lut[static_cast<unsigned>(static_cast<int>(t * (k_lut - 1) + 0.5f))];
             row[x] = pack_xrgb(c.r, c.g, c.b, dither_ign(x, y));
         }
     }
@@ -979,6 +980,11 @@ void lx::shell::background::start_render() {
     const int notify = notify_fd_;
     j->thread = std::thread([j, spec, notify] {
         const auto t0 = std::chrono::steady_clock::now();
+        // Every page is written: fault them in with one call (Linux 5.14) rather than one
+        // trap per 4 KiB page as the render reaches it. Older kernels: EINVAL, the same as before.
+#if defined(MADV_POPULATE_WRITE)
+        (void)::madvise(j->data, j->size, MADV_POPULATE_WRITE);
+#endif
         j->ok = render_background(spec, static_cast<std::uint32_t*>(j->data), j->pw, j->ph, j->pw);
         j->ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         j->done.store(true, std::memory_order_release);

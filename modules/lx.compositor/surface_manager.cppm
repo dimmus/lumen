@@ -21,6 +21,12 @@ enum class content_hint { none, photo, video, game, subsurface_ui };
 /// not be pushed through the dmabuf import path.
 enum class buffer_kind { none, dmabuf, shm };
 
+/// A client's damage: a few rects, merged by the output region's rule (25 % waste). A
+/// single bounding box turns a terminal's cursor line and status line into the whole window
+/// between them — uploaded and repainted on every keystroke. Four rects hold the shapes
+/// clients send; more merge into the cheapest pair.
+using client_damage = lx::gfx::basic_damage_region<4>;
+
 struct surface_commit {
     lx::surface_id surface{};
     lx::buffer_id buffer{};
@@ -28,6 +34,9 @@ struct surface_commit {
     /// Surface-local (logical) damage of this update, already merged from wl_surface.damage
     /// and the converted damage_buffer. Empty = no content damage.
     lx::rect2i damage{};
+    /// The same damage as separate rects inside `damage` (its bounds), when the client sent
+    /// more than one; empty: `damage` alone.
+    client_damage damage_rects{};
     /// Logical surface size (buffer scale, transform and viewport applied).
     lx::size2i surface_size{};
     /// Buffer box shown (empty: all of it) and the buffer transform (`:viewport`).
@@ -288,12 +297,13 @@ private:
 
     lx::gfx::dmabuf_import_cache* import_cache_ = nullptr;
     lx::scene::scene_graph* scene_ = nullptr;
-    surface_entry surfaces_[k_max_surfaces]{};
+    /// Allocated 16 entries at a time as surfaces appear (`lx::sparse_slots`).
+    lx::sparse_slots<surface_entry, k_max_surfaces> surfaces_{};
     id_slot_index<k_max_surfaces * 2> index_{};
     bool layout_changed_ = false;
     bool warned_container_full_ = false;
     bool render_thread_import_ = false;
-    buffer_entry buffers_[k_max_buffers]{};
+    lx::sparse_slots<buffer_entry, k_max_buffers> buffers_{};
     /// Compositor-assigned texture ids (shm, render-thread dma-buf) live in a space disjoint
     /// from import-cache ids.
     unsigned next_shm_texture_id_ = 0x4000'0000u;
@@ -521,6 +531,11 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
                 note_content_damage(
                     entry, {o.x, o.y, entry.surface_size.width, entry.surface_size.height}, margin);
                 layout_changed_ = true;
+            } else if (!commit.damage_rects.empty()) {
+                for (unsigned i = 0; i < commit.damage_rects.count; ++i) {
+                    const lx::rect2i& d = commit.damage_rects.rects[i];
+                    note_content_damage(entry, {d.x + o.x, d.y + o.y, d.width, d.height}, margin);
+                }
             } else if (commit.damage.width > 0 && commit.damage.height > 0) {
                 note_content_damage(entry,
                                     {commit.damage.x + o.x, commit.damage.y + o.y,

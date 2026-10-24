@@ -322,7 +322,8 @@ private:
     void* unmap_user_ = nullptr;
     rect_hook rect_hook_ = nullptr;
     void* rect_user_ = nullptr;
-    entry entries_[k_tree_max_surfaces]{};
+    /// Allocated 16 entries at a time (`lx::sparse_slots`): an entry is nearly a kilobyte.
+    lx::sparse_slots<entry, k_tree_max_surfaces> entries_{};
     id_slot_index<k_tree_max_surfaces * 2> index_{};
     /// sync_scene scratch: the root's mapped surfaces in paint order.
     std::inplace_vector<paint_item, k_tree_max_surfaces> paint_{};

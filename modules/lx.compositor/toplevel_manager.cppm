@@ -10,6 +10,7 @@ export module lx.compositor:toplevel;
 import std;
 
 import :activation;
+import :surface;
 
 export namespace lx::compositor {
 
@@ -379,7 +380,13 @@ private:
     [[nodiscard]] int slot_of(lx::toplevel_id id) const;
     [[nodiscard]] int order_of(unsigned slot) const;
 
-    toplevel_record records_[k_max]{};
+    /// Allocated 16 records at a time as windows appear (`lx::sparse_slots`): a record is
+    /// a kilobyte, and the whole table was resident from start-up.
+    lx::sparse_slots<toplevel_record, k_max> records_{};
+    /// Slot by toplevel id and by root surface id: every wire request, commit and tick
+    /// looks a window up, and a scan touched a kilobyte record per slot it passed.
+    id_slot_index<k_max * 2> by_id_{};
+    id_slot_index<k_max * 2> by_surface_{};
     bool used_[k_max]{};
     unsigned used_count_ = 0;
     /// Slot indices of mapped toplevels, bottom→top.
@@ -402,11 +409,8 @@ private:
 int lx::compositor::toplevel_manager::slot_of(lx::toplevel_id id) const {
     if (!id)
         return -1;
-    for (unsigned i = 0; i < k_max; ++i) {
-        if (used_[i] && records_[i].id == id)
-            return static_cast<int>(i);
-    }
-    return -1;
+    const int slot = by_id_.find(id.id());
+    return slot >= 0 && used_[static_cast<unsigned>(slot)] ? slot : -1;
 }
 
 int lx::compositor::toplevel_manager::order_of(unsigned slot) const {
@@ -432,6 +436,8 @@ lx::compositor::toplevel_manager::create(lx::client_id client, lx::surface_id su
         rec.xdg_surface_resource = xdg_surface_resource;
         rec.xdg_toplevel_resource = xdg_toplevel_resource;
         rec.wire_id = static_cast<unsigned>(rec.id.id());
+        (void)by_id_.insert(rec.id.id(), static_cast<int>(i));
+        (void)by_surface_.insert(surface.id(), static_cast<int>(i));
         return rec.id;
     }
     return lx::invalid_argument("toplevel table full");
@@ -442,6 +448,8 @@ void lx::compositor::toplevel_manager::destroy(lx::toplevel_id id) {
     if (slot < 0)
         return;
     set_mapped(id, false);
+    by_id_.erase(id.id());
+    by_surface_.erase(records_[static_cast<unsigned>(slot)].surface.id());
     records_[static_cast<unsigned>(slot)] = {};
     used_[static_cast<unsigned>(slot)] = false;
     --used_count_;
@@ -462,11 +470,9 @@ const lx::compositor::toplevel_record*
 lx::compositor::toplevel_manager::find_by_surface(lx::surface_id surface) const {
     if (!surface)
         return nullptr;
-    for (unsigned i = 0; i < k_max; ++i) {
-        if (used_[i] && records_[i].surface == surface)
-            return &records_[i];
-    }
-    return nullptr;
+    const int slot = by_surface_.find(surface.id());
+    return slot >= 0 && used_[static_cast<unsigned>(slot)] ? &records_[static_cast<unsigned>(slot)]
+                                                           : nullptr;
 }
 
 void lx::compositor::toplevel_manager::set_mapped(lx::toplevel_id id, bool mapped) {

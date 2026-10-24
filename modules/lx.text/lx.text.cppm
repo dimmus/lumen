@@ -9,7 +9,6 @@ module;
 #endif
 
 import lx.foundation;
-import lx.gfx;
 
 export module lx.text;
 
@@ -53,7 +52,6 @@ public:
     void set_font(font_desc desc);
     void set_max_width(float width);
     [[nodiscard]] lx::size2i bounding_size() const;
-    void paint(lx::gfx::render_pass& pass, lx::point2i origin, lx::color color) const;
 
 private:
     void reshape();
@@ -500,13 +498,6 @@ lx::size2i lx::text::text_layout::bounding_size() const {
     if (max_width_ > 0.f && width > max_width_)
         width = max_width_;
     return {static_cast<int>(width), static_cast<int>(height)};
-}
-
-void lx::text::text_layout::paint(lx::gfx::render_pass& pass, lx::point2i origin,
-                                  lx::color color) const {
-    (void)pass;
-    (void)origin;
-    (void)color;
 }
 
 // ── Single-line rasterization ─────────────────────────────────────────────────

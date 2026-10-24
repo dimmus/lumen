@@ -18,8 +18,12 @@ inline constexpr unsigned k_damage_rects = 16;
 ///
 /// Rects may overlap. Every consumer (composite clear+draw, KMS clips) is idempotent over
 /// an overlap, so overlap costs a little overdraw and never correctness.
-struct damage_region {
-    lx::rect2i rects[k_damage_rects]{};
+template <unsigned Capacity>
+struct basic_damage_region {
+    static constexpr unsigned k_capacity = Capacity;
+    static_assert(Capacity >= 2, "merging needs room for a pair");
+
+    lx::rect2i rects[Capacity]{};
     unsigned count = 0;
     /// The whole target is damaged; `rects` is ignored.
     bool full = false;
@@ -39,7 +43,8 @@ struct damage_region {
     /// Adds every rect of `other`; a full `other` makes this full. A distinct name, not an
     /// `add` overload: `add({x, y, w, h})` would otherwise be ambiguous, since a braced
     /// list can aggregate-initialise either parameter.
-    void add_region(const damage_region& other);
+    template <unsigned Other>
+    void add_region(const basic_damage_region<Other>& other);
     /// Intersects each rect with `bounds` and drops the empty ones. Full becomes `{bounds}`.
     void clip(lx::rect2i bounds);
     /// Bounding box of all rects. Empty for an empty region and for a full one — the
@@ -48,6 +53,9 @@ struct damage_region {
     /// Sum of rect areas (overlaps counted twice).
     [[nodiscard]] unsigned long long area() const;
 };
+
+/// The compositor's region: output damage, buffer age, KMS clips.
+using damage_region = basic_damage_region<k_damage_rects>;
 
 } // namespace lx::gfx
 
@@ -102,7 +110,8 @@ namespace lx::gfx::detail {
 
 } // namespace lx::gfx::detail
 
-void lx::gfx::damage_region::add(lx::rect2i r) {
+template <unsigned Capacity>
+void lx::gfx::basic_damage_region<Capacity>::add(lx::rect2i r) {
     using namespace lx::gfx::detail;
     if (full || damage_rect_empty(r))
         return;
@@ -136,13 +145,13 @@ void lx::gfx::damage_region::add(lx::rect2i r) {
             break;
     }
 
-    if (count < k_damage_rects) {
+    if (count < Capacity) {
         rects[count++] = r;
         return;
     }
 
     // Full: merge the pair, among the stored rects and `r`, whose bbox wastes the least.
-    // 17 candidates, 136 pairs — negligible, and it only runs on overflow.
+    // Capacity + 1 candidates (136 pairs at 16) — negligible, and only on overflow.
     const auto at = [&](unsigned i) { return i < count ? rects[i] : r; };
     unsigned best_a = 0;
     unsigned best_b = 1;
@@ -167,11 +176,13 @@ void lx::gfx::damage_region::add(lx::rect2i r) {
         rects[best_b] = rects[--count];
     rects[best_a] = rects[--count];
     if (!r_in_pair)
-        add(r); // still needs a place; at most 15 stored, so it fits
+        add(r); // still needs a place; at most Capacity - 1 stored, so it fits
     add(merged);
 }
 
-void lx::gfx::damage_region::add_region(const damage_region& other) {
+template <unsigned Capacity>
+template <unsigned Other>
+void lx::gfx::basic_damage_region<Capacity>::add_region(const basic_damage_region<Other>& other) {
     if (full)
         return;
     if (other.full) {
@@ -182,7 +193,8 @@ void lx::gfx::damage_region::add_region(const damage_region& other) {
         add(other.rects[i]);
 }
 
-void lx::gfx::damage_region::clip(lx::rect2i bounds) {
+template <unsigned Capacity>
+void lx::gfx::basic_damage_region<Capacity>::clip(lx::rect2i bounds) {
     using namespace lx::gfx::detail;
     if (full) {
         full = false;
@@ -200,7 +212,8 @@ void lx::gfx::damage_region::clip(lx::rect2i bounds) {
     count = kept;
 }
 
-lx::rect2i lx::gfx::damage_region::bounds() const {
+template <unsigned Capacity>
+lx::rect2i lx::gfx::basic_damage_region<Capacity>::bounds() const {
     if (full || count == 0)
         return {};
     lx::rect2i b = rects[0];
@@ -209,7 +222,8 @@ lx::rect2i lx::gfx::damage_region::bounds() const {
     return b;
 }
 
-unsigned long long lx::gfx::damage_region::area() const {
+template <unsigned Capacity>
+unsigned long long lx::gfx::basic_damage_region<Capacity>::area() const {
     unsigned long long total = 0;
     for (unsigned i = 0; i < count; ++i)
         total += static_cast<unsigned long long>(detail::damage_area(rects[i]));

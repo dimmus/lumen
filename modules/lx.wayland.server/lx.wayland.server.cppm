@@ -166,7 +166,10 @@ public:
     /// want: no name to collide on, nothing left in `$XDG_RUNTIME_DIR`, and no dependency
     /// on the filesystem at all.
     [[nodiscard]] lx::result<void> bind_socketless();
-    [[nodiscard]] int dispatch(int timeout_ms);
+    /// Dispatches client requests. `flush` sends what they produced at once; a caller that
+    /// flushes anyway once its whole iteration is done (the compositor's event loop) passes
+    /// false, so a client gets one send per iteration instead of one per dispatch.
+    [[nodiscard]] int dispatch(int timeout_ms, bool flush = true);
     void flush();
     /// Disconnects every client now (their objects' destructors run here), so an owner can
     /// tear down while what those destructors touch is still alive. Idempotent; the
@@ -635,7 +638,7 @@ void lx::wayland::server::remove_client_slot(unsigned index) {
     --client_count_;
 }
 
-int lx::wayland::server::dispatch(int timeout_ms) {
+int lx::wayland::server::dispatch(int timeout_ms, bool flush) {
     if (!bound_)
         return 0;
 
@@ -645,11 +648,13 @@ int lx::wayland::server::dispatch(int timeout_ms) {
         const int n = wl_event_loop_dispatch(loop, timeout_ms);
         if (n < 0)
             return 0;
-        wl_display_flush_clients(display_);
+        if (flush)
+            wl_display_flush_clients(display_);
         return n;
     }
 #else
     (void)timeout_ms;
+    (void)flush;
 #endif
     return 0;
 }

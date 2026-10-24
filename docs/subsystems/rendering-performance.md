@@ -96,10 +96,20 @@ GL    composite, shm client (full upload)      2.7 ms
 
 The GL figures are **submission** cost, not GPU wall time. The composite exports a fence
 instead of blocking (see below), so the GPU work overlaps the rest of the tick and the flip
-waits on the fence rather than the compositor waiting on the GPU. The GPU still needs
-roughly 1.7 ms for a fullscreen quad; it just has a whole refresh period to do it in. Before
-the fence, the same two lines measured 5.3 ms and 11.4 ms, all of it the render thread
-sitting in `glFinish`.
+waits on the fence rather than the compositor waiting on the GPU. The GPU still has a
+fullscreen quad to draw; it just has a whole refresh period to do it in. Before the fence,
+the same two lines measured 5.3 ms and 11.4 ms, all of it the render thread sitting in
+`glFinish`.
+
+**The linear-light shader is the GPU's main cost, and usually the identity.** Decoding and
+re-encoding sRGB is six `pow()` per fragment, and for an sRGB source with no colour tint —
+nearly every draw — it gives back the texel it started from. The GL backend therefore links
+the composite shader twice: as is, and with `LUMEN_IDENTITY`, which only scales the
+premultiplied texel by opacity and tint alpha. Measured on SVGA3D, submit plus GPU completion
+per frame: one fullscreen draw 5.4 → 3.0 ms, 50 blended 240×180 draws 6.2 → 3.2–4.3 ms.
+Two programs rather than a branch on a uniform: the branch measured the same GPU time but
+cost about 16 µs of submission per draw, which Mesa spends re-checking the shader against
+the uniform's value.
 
 Two things follow, and neither is intuitive:
 
@@ -153,7 +163,8 @@ not optional.
 | dma-buf clients | `EGL_EXT_image_dma_buf_import` → sampled in place, no copy. Imported **on the render thread** (where the context lives) against a compositor texture id per `wl_buffer` (`surface_manager::set_render_thread_import`); the UI-side Vulkan import cache is not used, since on hosts that pick GL its only Vulkan device is usually a software rasterizer that cannot import at all. The `EGLImage` is made once per buffer and reused while the client re-commits it |
 | shm clients | `glTexSubImage2D` in RGBA (BGRA measured slower on SVGA3D) of only the **buffer-age region**: the union of surface damage since that buffer's texture was last written, plus the previous upload's damage (the other GL name missed it). Staged through `shm_upload_pool` — a transient block per update, sized by the region, returned right after the upload |
 | Upload hazard | Each texture keeps **two** GL names and alternates. Uploading into the texture the previous frame is still sampling stalls the driver — measured 48 ms vs 22 ms per frame on SVGA3D. Each name tracks its own storage size: a client resizing every frame (interactive resize) alternates sizes across the names, and a sub-image upload into storage of another size is a GL error that leaves stale pixels on screen |
-| Damage | `glScissor` over the damage rect, unflipped: the target is a framebuffer object over the scanout buffer, where window y = 0 is memory row 0, the top line KMS scans (GL's bottom-left origin applies only to window-system framebuffers) |
+| Damage | `glScissor` over the damage rect, unflipped: the target is a framebuffer object over the scanout buffer, where window y = 0 is memory row 0, the top line KMS scans (GL's bottom-left origin applies only to window-system framebuffers). The scissor is damage ∩ clip — not ∩ dst, which the quad already is — so every unclipped draw of a pass shares it |
+| State changes | Scissor, scissor test and blend are set only when they change, and the program only when consecutive draws differ (linear-light or identity). Mesa does not drop a redundant call: on SVGA3D a repeated `glScissor` cost 1.7 µs per draw, a changed one 4 µs, a scissor-test toggle 7 µs and a blend toggle 2.6 µs; 50 draws against 16 damage strips went from 0.77 to 0.62 ms of submission |
 | Blending | `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` — sources are premultiplied |
 | Sampling | The source box (float, wp_viewport) and the buffer transform as an affine basis in three uniforms (`gfx::source_basis_for`, shared with Vulkan and CPU); UVs `highp` where the fragment stage has it (mediump cannot address texels past ~2048); `GL_LINEAR` throughout — a 1:1 draw on whole pixels samples texel centres exactly; a half-texel clamp keeps crops from bleeding |
 | GPU sync | `EGL_ANDROID_native_fence_sync` → sync_file → `atomic_commit_request::in_fence_fd`; `glFinish` only as fallback |
@@ -169,6 +180,7 @@ actually failed.
 |----------|----------|
 | Occlusion cull | Topmost opaque draw covering the damage rect skips the clear **and** every draw beneath it |
 | Fast path | Identity (whole-texel source the size of dst, normal transform) + opaque + compatible format → row `memcpy` |
+| Translucent formats | An ARGB window at full opacity is mostly opaque pixels: each run of them is copied, only the rest blended, and a fully opaque pixel never decodes (the 8-bit round trip is exact). A fullscreen such window: 15 → 4 ms |
 | Conversion | Fused into the blit (`copy` / `swap_rb`); no separate pass |
 | Scaling, crop, transform | Every non-identity draw inverse-maps pixel centres through the shared source basis, 16.16 fixed point, two adds per pixel: nearest for an integer magnification of whole texels (exact), bilinear otherwise, taps clamped to the source box |
 | Damage | Composite is clipped to `snapshot.damage()` |
@@ -188,9 +200,21 @@ Two strategies, because the consumers differ:
 
 | Consumer | Staging | Lifetime |
 |----------|---------|----------|
-| Vulkan upload (copies pixels out during drain) | `shm_staging_ring` — one FIFO for all surfaces | Slot free once the upload is recorded |
+| Vulkan upload (copies pixels out during drain) | `shm_upload_pool` — a block per in-flight update, the whole image | Block returned once the upload is recorded |
 | GL upload, driver takes BGRA at any stride (`GL_EXT_texture_format_BGRA8888` + `GL_EXT_unpack_subimage`) | None: `shm_direct_uploads` — the render thread uploads the damaged region straight from the client's buffer | The `wl_buffer` is held, with an external `wl_shm_pool` reference, until the upload; released from `tick_ui` after it |
 | GL upload, otherwise (and compositor images) | `shm_upload_pool` — a block per in-flight update, sized by the damaged region | Block returned right after `glTexSubImage2D`; blocks idle 1 s are unmapped |
+
+`shm_upload_pool` caps what is staged and not yet uploaded at 64 MiB
+(`k_max_in_flight_bytes`). Past that, a commit gets no block, and its update is dropped the
+way a full ring dropped it: the buffer is released and the texture keeps its previous
+content until the next commit. The cap only bounds a render thread that has stopped
+draining. Without it the pool would grow with every commit. The first block is always
+granted, so one update larger than the cap still goes through.
+
+Vulkan used a shared `shm_staging_ring` until the pool took its place. The ring's slots
+grew to the largest buffer they had carried and were never returned, so 57 MB stayed
+resident after a 1080p client disconnected (anon memory 97.9 MB, against 43–44 MB with the
+pool). With the pool the blocks are unmapped once idle.
 | CPU composite (samples staged rows in place) | `shm_pixel_store` — two slots per texture | Slot held until a later commit supersedes it; a retired texture's storage is freed once neither slot is in flight |
 
 **GL uploads from client memory.** Staging copied every damaged pixel on the UI thread
@@ -234,8 +258,19 @@ content, whichever buffer held it, while a texture belongs to one buffer. A clie
 three buffers would otherwise leave each texture missing what changed while the others were
 shown. `shm_upload_region` keeps an 8-commit damage history per surface; a buffer moved to
 another surface, or one not shown for longer than the history, is staged whole, as are a
-texture's first two uploads (both GL names). The CPU and Vulkan paths still stage whole
-buffers: the CPU store *is* the texture, and the Vulkan upload takes whole images.
+texture's first two uploads (both GL names). The CPU store *is* the texture, so each of its
+two slots is stamped with the surface commit its content came from, and a commit rewrites
+only the damage since that commit (`shm_store_region`): exact buffer age per slot, which
+stays right when one slot is written twice in a row because the other was still being read.
+The Vulkan upload still takes whole images.
+
+Damage stays **several rects**, not one box (`client_damage`, four rects merged by the
+output region's 25 % rule): a terminal that changes its cursor line and its status line
+sends two strips, and their bounding box is the window between them. The rects carry
+through the surface's damage history, the buffer-age region and the upload — the GL backend
+writes each with its own `glTexSubImage2D` from the client's memory
+(`gl_compositor::upload_client_regions`) — and into the scene's damage, so the repaint is
+two strips as well.
 
 ### Texture updates wait for their snapshot
 
@@ -875,6 +910,35 @@ screen nor queued, so the composite always has somewhere to go.
 A frame composited while a flip is queued waits in `composited_slot_` and is committed as
 soon as the CRTC is free. If another frame lands first it simply takes its place — mailbox
 semantics, so what reaches the display is always the newest content.
+
+**Idle slot catch-up (GL).** The third slot is drawn into only when a frame is composited
+while a flip is queued, which is the first busy moment. Until then it keeps the age it
+started with: the whole output, or everything damaged since. So that busy frame repainted
+the whole output. The drag smoke (G9) caught one of these in the middle of a drag.
+
+Now, once an output has composited nothing for 200 ms and nothing is queued, each slot off
+screen with an age of at least a quarter of the output is brought up to date. It is copied
+from the slot on screen, which then holds the newest frame, with `glBlitFramebuffer` over
+just that age (`gl_compositor::copy_region`, OpenGL ES 3.0). Its age is then empty, and the
+next frame drawn into it repaints only its own damage.
+
+The rules:
+
+- **Not between frames.** It never runs between the frames of an animation. Those frames
+  repaint the same region anyway, and catching up between them copied about 1.3 Mpx twice
+  per frame.
+- **Small ages are left alone.** Copying them twice per cursor blink would cost more than
+  the repaint they save.
+- **An owed catch-up keeps render from reporting quiet.** The idle housekeeping tick then
+  runs it, so it happens at most a second later.
+
+Measured on vmwgfx:
+
+- In the drag scenarios, the only full-output frames left are the first one or two after
+  start-up.
+- Over a whole app-smoke run, the mean repaint area per frame fell from 467k px to 385k px
+  (−18 %). The full-output frames left (267 → 248) are frames whose own damage is the whole
+  output: a workspace switch, a maximise.
 
 **The tick is phase-locked to the display.** A timer free-running at `target_fps` drifts
 against the real vblank cadence: ticks land while a flip is still queued and their work is

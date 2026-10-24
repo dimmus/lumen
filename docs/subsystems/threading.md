@@ -225,8 +225,8 @@ drained after it is ignored by the paused branch of the handler.
 **The paused tick.** While paused the frame clock is stopped and `request_frame()` is a
 no-op; the housekeeping timer runs at 1 s and calls `on_vsync()` itself: one `tick_ui`
 (dispatch, configures, scene publish, buffer retirement, frame callbacks answered
-unconditionally) and one `tick_render` that only drains texture updates and publishes the
-frame index — no composite, no commit. Hot-path cost of the gate: one acquire load per tick
+unconditionally) and, when it has work (see the housekeeping tick above), one `tick_render`
+that only drains texture updates and publishes the frame index — no composite, no commit. Hot-path cost of the gate: one acquire load per tick
 and one per commit; no lock, allocation or log. The paused tick also discards queued
 presentation feedback, so clients pacing by it are not left waiting on a display that is off.
 
@@ -275,10 +275,17 @@ per key the cost is one branch while no input method is active.
 | **Render** | `render` | `render_loop()` waits on `condition_variable` → `tick_render()` |
 | **Worker** | `worker` | `worker_loop()` drains `executor` worker strand |
 
-No thread polls. The UI loop blocks in `epoll_wait` on every fd it serves (Wayland display,
-DRM card, libinput, the logind bus), one `timerfd` armed at the earliest timer deadline
-(absolute, CLOCK_MONOTONIC) and one `eventfd` that `event_loop::post`, `quit` and posts to
-the UI strand write. A flip wakes it the moment the card turns readable. The render thread
+No thread polls. The UI loop blocks in `epoll_pwait2` on every fd it serves (Wayland display,
+DRM card, libinput, the logind bus) and one `eventfd` that `event_loop::post`, `quit` and
+posts to the UI strand write, with the time to the earliest timer deadline as its nanosecond
+timeout. A timer wake is then that one syscall; an absolute `timerfd`, which kernels before
+5.11 still use, cost a `timerfd_settime` before each wait and a `read` after each fire. The
+loop sets the UI thread's timer slack to 1 µs so the timeout keeps a timerfd's precision,
+and reads the clock once before the sources prepare and once after the wait, not once per
+timer source. With an animating client on a virtual output the main thread went from 11.3
+to 8.5 syscalls per frame. The Wayland dispatch inside a tick and in the display fd's
+callback do not flush: the tick flushes at its end and the loop once per iteration, so a
+buffer release leaves with the frame's events. A flip wakes it the moment the card turns readable. The render thread
 waits for a tick's snapshot or a post to its strand; the worker only for a post (each
 strand's `set_waker`). An `fd_source` with a nonzero `poll_interval_ns` still dispatches on
 a period, for an fd whose readiness cannot be trusted; nothing uses one.
@@ -292,7 +299,13 @@ deferred. A client request, an input event or a flip restarts it at the display'
 deadline (`repaint_scheduler::next_start`). While it is stopped a 1 s housekeeping timer
 ticks for the deadlines only a tick notices: liveness pings, the configure watchdog,
 unmapping idle staging. An idle desktop measured 730 wakeups/s across the three threads
-before this and 5/s after (vmwgfx, shell and one terminal).
+before this and 5/s after (vmwgfx, shell and one terminal). The housekeeping tick wakes the
+render thread only for work: at the end of each tick render reports whether anything of its
+own is left (a flip or frame waiting, leftover damage, targets kept around, a deferred op,
+texture retirement, capture job or resume) together with the count of UI posts it started
+from, and the tick also checks what UI handed over since (a publish, texture updates, output
+ops, a cursor, a capture, a screenshot). An idle compositor went from 2.1 to 1.0 wakeups/s;
+frame ticks always wake render, as before.
 
 **Start-up runs three helper threads, before the render and worker threads exist.**
 `compositor::start` is on the UI thread, and its slow phases mostly wait on something else,
