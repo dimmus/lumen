@@ -278,8 +278,41 @@ public:
 
     /// The order for a primitive covering `bounds` (clamped to the view), written back into
     /// the covered cells: `max(layer base, 1 + max over the cells)`. An empty or off-view
-    /// rect returns the current layer base and writes nothing.
-    [[nodiscard]] std::uint32_t assign(lx::rect2i bounds);
+    /// rect returns the current layer base and writes nothing. Inline for the case that
+    /// dominates — a rect inside the view spanning at most 2 × 2 cells (a glyph, an icon, a
+    /// small quad, wherever it falls on the cell lines) — so an emitter in another module
+    /// pays no call and no loop for it.
+    [[nodiscard]] inline std::uint32_t assign(lx::rect2i bounds) {
+        // Unsigned: a negative origin wraps past every view and takes the general path.
+        const auto x0 = static_cast<unsigned>(bounds.x);
+        const auto y0 = static_cast<unsigned>(bounds.y);
+        const auto x1 = x0 + static_cast<unsigned>(bounds.width) - 1u;
+        const auto y1 = y0 + static_cast<unsigned>(bounds.height) - 1u;
+        if (bounds.width > 0 && bounds.height > 0 && x0 <= x1 && y0 <= y1 &&
+            x1 < static_cast<unsigned>(view_.width) && y1 < static_cast<unsigned>(view_.height)) {
+            const unsigned cx0 = x0 >> shift_;
+            const unsigned cy0 = y0 >> shift_;
+            const unsigned cx1 = x1 >> shift_;
+            const unsigned cy1 = y1 >> shift_;
+            if (cx1 - cx0 <= 1u && cy1 - cy0 <= 1u) {
+                // The four corner cells: one, two or four distinct ones, read and written
+                // without branching on which (a repeated cell is read and written twice).
+                std::uint32_t* const top = cells_ + cy0 * cells_x_;
+                std::uint32_t* const bottom = cells_ + cy1 * cells_x_;
+                std::uint32_t highest = top[cx0] > top[cx1] ? top[cx0] : top[cx1];
+                highest = bottom[cx0] > highest ? bottom[cx0] : highest;
+                highest = bottom[cx1] > highest ? bottom[cx1] : highest;
+                const std::uint32_t order = highest + 1 > base_ ? highest + 1 : base_;
+                top[cx0] = order;
+                top[cx1] = order;
+                bottom[cx0] = order;
+                bottom[cx1] = order;
+                max_ = order > max_ ? order : max_;
+                return order;
+            }
+        }
+        return assign_cells(bounds);
+    }
 
     /// Lifts the base order above everything assigned so far: an overlay, popup or drag
     /// cannot interleave with what is under it (GPUI's `push_layer`). At most
@@ -298,6 +331,9 @@ public:
 
 private:
     static constexpr int k_unbounded_px = 8192;
+
+    /// `assign` for every other rect: clamped to the view, any number of cells.
+    [[nodiscard]] std::uint32_t assign_cells(lx::rect2i bounds);
 
     std::uint32_t cells_[k_max_order_cells]{};
     std::uint32_t layer_bases_[k_max_order_layers]{};
@@ -345,7 +381,7 @@ void lx::gfx::order_grid::reset(lx::size2i view_px) {
     depth_ = 0;
 }
 
-std::uint32_t lx::gfx::order_grid::assign(lx::rect2i bounds) {
+std::uint32_t lx::gfx::order_grid::assign_cells(lx::rect2i bounds) {
     if (bounds.width <= 0 || bounds.height <= 0)
         return base_;
     const long long x0 = bounds.x > 0 ? bounds.x : 0;
