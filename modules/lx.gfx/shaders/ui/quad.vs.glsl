@@ -43,9 +43,11 @@ void main() {
     uint style = inst_word(18u); // angle f16 | border_style << 16 | gradient_space << 24
     if (border && ((style >> 16u) & 0xFFu) == 1u)
         flags |= 2u;
-    v_bg0 = inst_half4(12u);
-    v_bg1 = inst_half4(14u);
-    v_border = inst_half4(16u);
+    vec4 bg0 = inst_half4(12u);
+    vec4 bg1 = inst_half4(14u);
+    v_bg0 = lx_instance_color(bg0);
+    v_bg1 = lx_instance_color(bg1);
+    v_border = lx_instance_color(inst_half4(16u));
     v_grad = vec4(1.0, 0.0, 0.0, 0.0);
     v_lab0 = vec4(0.0);
     v_lab1 = vec4(0.0);
@@ -58,8 +60,8 @@ void main() {
         v_grad = vec4(dx, dy, len > 0.0 ? 1.0 / len : 0.0, 0.0);
         if (((style >> 24u) & 0xFFu) == 1u) {
             flags |= 8u;
-            v_lab0 = lx_to_oklab(v_bg0);
-            v_lab1 = lx_to_oklab(v_bg1);
+            v_lab0 = lx_to_oklab(bg0);
+            v_lab1 = lx_to_oklab(bg1);
         }
     }
     v_bounds = bounds;

@@ -125,7 +125,8 @@ public:
 
     /// A `w` × `h` tile of `format`, stamped used this frame. Fails (invalid_argument) for
     /// an empty tile, one larger than a page, or when every page of the format is full of
-    /// tiles used within the last 120 frames, or the tile table is full.
+    /// tiles used within the last 120 frames, or the tile table is full of them (a full
+    /// table frees its stale tiles first).
     [[nodiscard]] lx::result<atlas_tile_id> allocate(atlas_format format, unsigned w, unsigned h);
     /// Copies the tile's pixels from `pixels` (`stride` bytes per row, `w` × bytes-per-texel
     /// used of each) into its page and adds the tile's rect to the page's dirty list.
@@ -139,6 +140,14 @@ public:
     [[nodiscard]] bool lookup(atlas_tile_id id, atlas_tile& out) const;
     /// Stamps the tile used this frame (what the emitter does for every sprite it draws).
     void touch(atlas_tile_id id);
+    /// `lookup` and `touch` in one: what an emitter calls for each sprite it draws.
+    [[nodiscard]] bool use(atlas_tile_id id, atlas_tile& out);
+    /// The frame the tile was last stamped used in (`touch`, `use`, `allocate`); empty for an
+    /// id released, evicted or never issued.
+    [[nodiscard]] std::optional<std::uint64_t> last_used(atlas_tile_id id) const;
+    /// True when the tile is stale by the eviction rule (unused `k_atlas_stale_frames` frames
+    /// or more): nothing a published frame names can still be drawing it.
+    [[nodiscard]] bool is_stale(atlas_tile_id id) const;
     /// Frees the tile now; its id goes stale.
     void release(atlas_tile_id id);
 
@@ -448,7 +457,9 @@ lx::result<lx::gfx::atlas_tile_id> lx::gfx::atlas::allocate(atlas_format format,
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (w == 0 || h == 0 || w > k_atlas_page_max || h > k_atlas_page_max)
         return lx::invalid_argument("atlas::allocate: empty tile or larger than a page");
-    if (free_top_ == 0)
+    // A full tile table frees its stale tiles in place first (no tile moves): ids dropped by
+    // their owner without a release (a glyph cache replacing a way) age out this way.
+    if (free_top_ == 0 && evict_stale() == 0)
         return lx::invalid_argument("atlas::allocate: tile table full");
 
     const unsigned first = format == atlas_format::r8 ? 0u : k_atlas_first_rgba8_page;
@@ -538,9 +549,29 @@ bool lx::gfx::atlas::lookup(atlas_tile_id id, atlas_tile& out) const {
     return true;
 }
 
+std::optional<std::uint64_t> lx::gfx::atlas::last_used(atlas_tile_id id) const {
+    if (const tile_entry* t = entry(id))
+        return t->last_used;
+    return std::nullopt;
+}
+
+bool lx::gfx::atlas::is_stale(atlas_tile_id id) const {
+    const tile_entry* t = entry(id);
+    return t && stale(*t);
+}
+
 void lx::gfx::atlas::touch(atlas_tile_id id) {
     if (tile_entry* t = entry(id))
         t->last_used = frame_;
+}
+
+bool lx::gfx::atlas::use(atlas_tile_id id, atlas_tile& out) {
+    tile_entry* t = entry(id);
+    if (!t)
+        return false;
+    t->last_used = frame_;
+    out = {t->page, t->x, t->y, t->w, t->h};
+    return true;
 }
 
 void lx::gfx::atlas::release(atlas_tile_id id) {

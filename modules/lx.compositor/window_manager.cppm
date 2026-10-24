@@ -1648,15 +1648,16 @@ void lx::compositor::window_manager::sync_decoration(const toplevel_record& rec)
     if (!decorations_)
         return;
     decorations_->sync(rec);
-    // The title at the largest scale among the outputs the frame is on (sharp on each).
+    // The title at the scale of every output the frame is on: 1:1 on each (ADR-010 §4.11).
     if (rec.mapped && outputs_ && rec.decoration_current == decoration_mode::server) {
         const std::uint32_t mask = outputs_for_rect(*outputs_, frame_rect(rec.geometry, extents_of(rec)));
-        double best = 0.0;
+        double scales[output_manager::k_max]{};
+        unsigned n = 0;
         for (unsigned s = 0; s < output_manager::k_max; ++s)
-            if ((mask & (1u << s)) && outputs_->slot_state(s).scale > best)
-                best = outputs_->slot_state(s).scale;
-        if (best > 0.0)
-            decorations_->set_window_scale(rec.id, best);
+            if ((mask & (1u << s)) && outputs_->slot_state(s).scale > 0.0)
+                scales[n++] = outputs_->slot_state(s).scale;
+        if (n > 0)
+            decorations_->set_window_scales(rec.id, {scales, n});
     }
 }
 

@@ -144,18 +144,74 @@ public:
     /// values, as `gl_compositor` and `cpu_compositor::blend` do. Leaves its pipeline and
     /// descriptor set bound: the caller binds its own again.
     ///
-    /// Lifetime: the textures' images, views and descriptor sets are recorded into the
-    /// caller's command buffer, which this compositor's frame fences do not cover —
-    /// `forget_texture` and `upload_rgba` over an existing id wait only for this
-    /// compositor's own frames, and `bind_imported` of another image under an existing id
-    /// replaces the view without waiting. Until it tracks external users (a fence or timeline
-    /// value per `record_blits`), the caller must wait for its submitted frames before any of
-    /// those calls touches a texture it recorded (`ui_vk_renderer::wait_idle`).
+    /// Lifetime: on a command buffer that is not this compositor's own frame (a UI renderer's),
+    /// the textures' images, views and descriptor sets outlive what this compositor's fences
+    /// cover, so each texture recorded there is marked as externally used, and
+    /// `forget_texture`, `upload_rgba` over it and `bind_imported` of another image under its
+    /// id first call every registered external user's `wait` (`add_external_user`). On this
+    /// compositor's own frame (`begin_linear_frame`) its fences cover them, as for
+    /// `composite`. A pass of this compositor's own (`render_pass` its linear pass) draws with
+    /// its own composite pipeline.
     [[nodiscard]] lx::result<composite_stats> record_blits(void* command_buffer, void* render_pass,
                                                            unsigned vk_format, void* pipeline_cache,
                                                            unsigned width, unsigned height,
                                                            const blit_command* cmds, unsigned count,
                                                            lx::rect2i scissor, bool encoded);
+
+    // ── External users and the UI pass (ADR-010 §4.4, §4.11) ──────────────────────
+
+    /// Someone that records this compositor's textures into command buffers of its own (a
+    /// `ui_vk_renderer` drawing a stream's `surface` refs through `record_blits`). `wait(user)`
+    /// returns once every frame the user submitted is complete — called before a texture such
+    /// a frame recorded is destroyed, re-uploaded or re-pointed. `detach(user)`: this
+    /// compositor is shutting down (the device is idle; drop the pointer to it).
+    struct external_user {
+        void* user = nullptr;
+        void (*wait)(void* user) = nullptr;
+        void (*detach)(void* user) = nullptr;
+    };
+    static constexpr unsigned k_external_users = 4;
+    /// False when `k_external_users` are registered already (the user must then not record
+    /// this compositor's textures) or `u` has no `wait`. Registering a user twice is a no-op.
+    [[nodiscard]] bool add_external_user(external_user u);
+    void remove_external_user(void* user);
+
+    /// The acquires of freshly imported images that the last `prepare_blits` (or
+    /// `begin_linear_frame`) recorded did not run: the command buffer holding them was never
+    /// submitted (its vkEndCommandBuffer or vkQueueSubmit failed). Marks those images
+    /// unacquired again, so the next frame records their acquire.
+    void abandon_prepared_blits();
+
+    /// A frame whose UI stream `:ui_vk` records inside this compositor's linear F16 pass
+    /// (`ui_vk_renderer::composite`): what `composite` does, split where the UI renderer
+    /// records its own work.
+    struct linear_frame {
+        void* command_buffer = nullptr;
+        /// The linear pass `begin_linear_pass` begins: one R16G16B16A16_SFLOAT attachment,
+        /// linear light. Pipelines made for it are compatible with every frame's.
+        void* render_pass = nullptr;
+        unsigned vk_format = 0;
+        unsigned width = 0;
+        unsigned height = 0;
+    };
+    /// `composite`'s set-up for `target` — the linear intermediate, the encode pipeline, the
+    /// framebuffer, the solid texture when `cmds` has a solid draw — then waits for the frame
+    /// slot, begins its command buffer and records the acquires of fresh imports. The caller
+    /// records its work outside the pass (atlas copies), then `begin_linear_pass`, its draws
+    /// (`record_blits` with `render_pass` for surfaces), then `end_linear_frame`; on an
+    /// error in between, `abandon_linear_frame`.
+    [[nodiscard]] lx::result<linear_frame> begin_linear_frame(render_target& target,
+                                                              const blit_command* cmds,
+                                                              unsigned count);
+    /// Begins the linear pass, cleared to `clear` (encoded, decoded here as `composite`
+    /// does), with the full-target viewport and scissor set.
+    void begin_linear_pass(lx::color clear);
+    /// Ends the pass, records the encode pass into the target, ends and submits the command
+    /// buffer as `composite` does (the out fence exported when the device can). On failure
+    /// the frame is abandoned (its acquires un-marked) and nothing was submitted.
+    [[nodiscard]] lx::result<composite_stats> end_linear_frame();
+    /// Ends the command buffer unsubmitted and un-marks its acquires.
+    void abandon_linear_frame();
 
     /// Copy the target back into tightly packed RGBA8 for golden-image verification.
     /// Synchronous (it waits for the GPU): tests and one-off reads only, never per frame.
@@ -193,6 +249,8 @@ private:
         bool owns_image = false;
         bool layout_ready = false;
         bool used = false;
+        /// Recorded by an external user since the last wait for them (`record_blits`).
+        bool external_use = false;
     };
 
     /// Creates or resizes the linear-light intermediate the composite pass renders into.
@@ -237,6 +295,19 @@ private:
     void record_acquires(void* command_buffer);
     /// Shared by `composite` and `prepare_blits`: the 1×1 texture solid draws bind.
     [[nodiscard]] lx::result<void> ensure_solid_texture(const blit_command* cmds, unsigned count);
+    /// Before destroying or rewriting texture `slot`: when an external user recorded it, waits
+    /// for every external user (and clears every slot's mark — they are all done).
+    void wait_external(const texture_slot& slot);
+
+    external_user external_[k_external_users]{};
+    /// Texture slots `record_acquires` marked acquired in the command buffer being recorded.
+    std::uint16_t acquired_[k_max_textures]{};
+    unsigned acquired_count_ = 0;
+    /// The command buffer of a `begin_linear_frame` not yet ended (null: none), its target
+    /// and whether its pass is open.
+    void* linear_cb_ = nullptr;
+    render_target* linear_target_ = nullptr;
+    bool linear_pass_open_ = false;
 
     static constexpr unsigned k_frame_slots = 2;
     static constexpr unsigned k_staging_ring_bytes = 16u * 1024u * 1024u;
@@ -805,6 +876,8 @@ void lx::gfx::vulkan_compositor::destroy_texture(texture_slot& slot) {
     if (dev) {
         // Uploads are submitted without waiting, so a queued command buffer may still
         // reference this image. Destroying it first is a use-after-free inside the driver.
+        // A UI renderer's frames that recorded it are not covered by those fences.
+        wait_external(slot);
         wait_all_slots_idle();
         if (slot.view)
             vkDestroyImageView(dev, static_cast<VkImageView>(slot.view), nullptr);
@@ -835,6 +908,49 @@ void lx::gfx::vulkan_compositor::wait_all_slots_idle() {
     if (count > 0)
         (void)vkWaitForFences(dev, count, fences, VK_TRUE, 1'000'000'000ull);
 #endif
+}
+
+void lx::gfx::vulkan_compositor::wait_external(const texture_slot& slot) {
+    if (!slot.external_use)
+        return;
+    for (const external_user& u : external_)
+        if (u.wait)
+            u.wait(u.user);
+    for (texture_slot& t : textures_)
+        t.external_use = false;
+}
+
+bool lx::gfx::vulkan_compositor::add_external_user(external_user u) {
+    if (!u.user || !u.wait)
+        return false;
+    for (const external_user& e : external_)
+        if (e.user == u.user)
+            return true;
+    for (external_user& e : external_)
+        if (!e.user) {
+            e = u;
+            return true;
+        }
+    return false;
+}
+
+void lx::gfx::vulkan_compositor::remove_external_user(void* user) {
+    for (external_user& e : external_)
+        if (e.user == user && user) {
+            // Whatever it recorded is waited for before it goes: it can no longer be asked.
+            if (e.wait)
+                e.wait(e.user);
+            e = {};
+        }
+}
+
+void lx::gfx::vulkan_compositor::abandon_prepared_blits() {
+    for (unsigned i = 0; i < acquired_count_; ++i) {
+        texture_slot& t = textures_[acquired_[i]];
+        if (t.used && !t.owns_image)
+            t.layout_ready = false;
+    }
+    acquired_count_ = 0;
 }
 
 void lx::gfx::vulkan_compositor::forget_texture(unsigned id) {
@@ -1032,6 +1148,17 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
 }
 
 void lx::gfx::vulkan_compositor::shutdown() {
+    // External users drop their pointer to this compositor (whatever they submitted is waited
+    // for below, with the device).
+    for (external_user& e : external_) {
+        if (e.detach)
+            e.detach(e.user);
+        e = {};
+    }
+    acquired_count_ = 0;
+    linear_cb_ = nullptr;
+    linear_target_ = nullptr;
+    linear_pass_open_ = false;
 #if defined(LUMEN_HAS_VULKAN)
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (dev) {
@@ -1179,6 +1306,9 @@ lx::result<void> lx::gfx::vulkan_compositor::bind_imported(const imported_image&
 
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (slot.view) {
+        // The view and the descriptor set are re-pointed: a UI renderer's frame that recorded
+        // them must be done first.
+        wait_external(slot);
         vkDestroyImageView(dev, static_cast<VkImageView>(slot.view), nullptr);
         slot.view = nullptr;
     }
@@ -1236,6 +1366,8 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
         return lx::make_error(lx::vulkan_err::import_failed, "texture table full");
     }
     auto& slot = textures_[static_cast<unsigned>(index)];
+    // The copy below rewrites an image a UI renderer's frame may still sample.
+    wait_external(slot);
 
     // Reallocate only on a size change; a resizing client is rare, a redrawing one is not.
     if (slot.image && (slot.width != width || slot.height != height)) {
@@ -2101,6 +2233,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
 void lx::gfx::vulkan_compositor::record_acquires(void* command_buffer) {
 #if defined(LUMEN_HAS_VULKAN)
     auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    acquired_count_ = 0;
     // Acquire freshly imported client images. A dma-buf written by another device has no
     // Vulkan release to pair with, so the acquire comes from the foreign queue family and
     // the modifier — not a Vulkan layout — is what guarantees the contents survive.
@@ -2128,6 +2261,9 @@ void lx::gfx::vulkan_compositor::record_acquires(void* command_buffer) {
                              VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
                              &acquire);
         slot.layout_ready = true;
+        // Undone by `abandon_prepared_blits` when this command buffer is never submitted.
+        if (acquired_count_ < k_max_textures)
+            acquired_[acquired_count_++] = static_cast<std::uint16_t>(i);
     }
 #else
     (void)command_buffer;
@@ -2176,11 +2312,15 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
         return lx::invalid_argument("record_blits into an empty attachment");
     auto dev = static_cast<VkDevice>(ctx_.device);
 
-    // The pipeline for this attachment format, made once.
-    void* pipeline = nullptr;
+    // The pipeline for this attachment format, made once; this compositor's own linear pass
+    // draws with its composite pipeline.
+    void* pipeline = render_pass == render_pass_ ? pipeline_ : nullptr;
     for (const pass_pipeline& p : pass_pipelines_)
-        if (p.pipeline && p.format == vk_format)
+        if (!pipeline && p.pipeline && p.format == vk_format)
             pipeline = p.pipeline;
+    // Another command buffer than this compositor's frame: its textures are marked as an
+    // external user's until the users are waited for.
+    const bool external = command_buffer != linear_cb_;
     if (!pipeline) {
         VkPipeline made = create_composite_pipeline(
             dev, static_cast<VkPipelineLayout>(pipeline_layout_),
@@ -2255,6 +2395,8 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
                                     0, nullptr);
             bound_set = want_set;
         }
+        if (external && index >= 0)
+            textures_[static_cast<unsigned>(index)].external_use = true;
         VkRect2D rect{};
         rect.offset = {clip.x, clip.y};
         rect.extent = {static_cast<unsigned>(clip.width), static_cast<unsigned>(clip.height)};
@@ -2284,6 +2426,174 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
     (void)encoded;
     return lx::not_implemented("lx::gfx::vulkan_compositor::record_blits");
 #endif
+}
+
+lx::result<lx::gfx::vulkan_compositor::linear_frame>
+lx::gfx::vulkan_compositor::begin_linear_frame(render_target& target, const blit_command* cmds,
+                                               unsigned count) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    if (!ready())
+        return lx::not_implemented("lx::gfx::vulkan_compositor::begin_linear_frame");
+    if (!target.valid())
+        return lx::invalid_argument("begin_linear_frame on an invalid render target");
+    if (linear_cb_)
+        abandon_linear_frame(); // a frame begun and never ended: dropped
+    // As `composite`: the intermediate, the encode pipeline and the framebuffer, rebuilt only
+    // when the target changes; the solid texture before the slot is taken (it is an upload of
+    // its own).
+    if (auto linear = ensure_linear_target(target.width(), target.height()); !linear)
+        return linear.get_error();
+    if (auto encode = ensure_encode_pipeline(target.format()); !encode)
+        return encode.get_error();
+    if (auto framebuffer = ensure_framebuffer(target); !framebuffer)
+        return framebuffer.get_error();
+    if (auto solid = ensure_solid_texture(cmds, count); !solid)
+        return solid.get_error();
+
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    const unsigned slot = submit_slot_;
+    auto fence = static_cast<VkFence>(fences_[slot]);
+    // The fence is reset just before the submit: a frame abandoned on the way leaves it
+    // signalled, and the next wait does not hang on work never submitted.
+    if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+        return vk_error("vkWaitForFences timed out reclaiming composite slot");
+    auto cb = static_cast<VkCommandBuffer>(command_buffers_[slot]);
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS)
+        return vk_error("vkBeginCommandBuffer failed");
+    linear_cb_ = cb;
+    linear_target_ = &target;
+    linear_pass_open_ = false;
+    record_acquires(cb);
+    linear_frame f{};
+    f.command_buffer = cb;
+    f.render_pass = render_pass_;
+    f.vk_format = static_cast<unsigned>(k_linear_format);
+    f.width = target.width();
+    f.height = target.height();
+    return f;
+#else
+    (void)target;
+    (void)cmds;
+    (void)count;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::begin_linear_frame");
+#endif
+}
+
+void lx::gfx::vulkan_compositor::begin_linear_pass(lx::color clear) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    if (!linear_cb_ || !linear_target_ || linear_pass_open_)
+        return;
+    auto cb = static_cast<VkCommandBuffer>(linear_cb_);
+    const unsigned w = linear_target_->width();
+    const unsigned h = linear_target_->height();
+    // As `composite`: the attachment holds linear light, so the clear is decoded.
+    VkClearValue clear_value{};
+    clear_value.color = {{lx::to_linear(clear.r, clear.encoding),
+                          lx::to_linear(clear.g, clear.encoding),
+                          lx::to_linear(clear.b, clear.encoding), clear.a}};
+    VkRenderPassBeginInfo rpbi{};
+    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpbi.renderPass = static_cast<VkRenderPass>(render_pass_);
+    rpbi.framebuffer = static_cast<VkFramebuffer>(linear_framebuffer_);
+    rpbi.renderArea.extent = {w, h};
+    rpbi.clearValueCount = 1;
+    rpbi.pClearValues = &clear_value;
+    vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(w);
+    viewport.height = static_cast<float>(h);
+    viewport.maxDepth = 1.f;
+    vkCmdSetViewport(cb, 0, 1, &viewport);
+    VkRect2D scissor{};
+    scissor.extent = {w, h};
+    vkCmdSetScissor(cb, 0, 1, &scissor);
+    linear_pass_open_ = true;
+#else
+    (void)clear;
+#endif
+}
+
+lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_frame() {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    if (!linear_cb_ || !linear_target_)
+        return lx::invalid_argument("end_linear_frame without begin_linear_frame");
+    auto cb = static_cast<VkCommandBuffer>(linear_cb_);
+    const render_target& target = *linear_target_;
+    if (!linear_pass_open_)
+        begin_linear_pass(lx::color::rgb(0.f, 0.f, 0.f));
+    vkCmdEndRenderPass(cb);
+    linear_pass_open_ = false;
+
+    // The encode pass, as `composite` records it: the intermediate (left in
+    // SHADER_READ_ONLY_OPTIMAL by the pass) into the scanout target's transfer function.
+    VkRenderPassBeginInfo encode_rpbi{};
+    encode_rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    encode_rpbi.renderPass = static_cast<VkRenderPass>(encode_render_pass_);
+    encode_rpbi.framebuffer = static_cast<VkFramebuffer>(framebuffer_);
+    encode_rpbi.renderArea.extent = {target.width(), target.height()};
+    vkCmdBeginRenderPass(cb, &encode_rpbi, VK_SUBPASS_CONTENTS_INLINE);
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(target.width());
+    viewport.height = static_cast<float>(target.height());
+    viewport.maxDepth = 1.f;
+    vkCmdSetViewport(cb, 0, 1, &viewport);
+    VkRect2D scissor{};
+    scissor.extent = {target.width(), target.height()};
+    vkCmdSetScissor(cb, 0, 1, &scissor);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      static_cast<VkPipeline>(encode_pipeline_));
+    auto encode_set = static_cast<VkDescriptorSet>(encode_set_);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            static_cast<VkPipelineLayout>(encode_pipeline_layout_), 0, 1,
+                            &encode_set, 0, nullptr);
+    encode_push epush{};
+    epush.transfer = transfer_slot(output_transfer_);
+    vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(encode_pipeline_layout_),
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(epush), &epush);
+    vkCmdDraw(cb, 3, 1, 0, 0);
+    vkCmdEndRenderPass(cb);
+
+    linear_cb_ = nullptr;
+    linear_target_ = nullptr;
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) {
+        abandon_prepared_blits();
+        return vk_error("vkEndCommandBuffer failed");
+    }
+    auto fence = static_cast<VkFence>(fences_[submit_slot_]);
+    vkResetFences(static_cast<VkDevice>(ctx_.device), 1, &fence);
+    composite_stats stats{};
+    if (auto submitted = submit_current_slot(true, &stats.out_fence_fd); !submitted) {
+        // Nothing ran: the acquires go again, and the fence must not stay unsignalled.
+        abandon_prepared_blits();
+        VkSubmitInfo none{};
+        none.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        (void)vkQueueSubmit(static_cast<VkQueue>(ctx_.queue), 0, &none, fence);
+        return submitted.get_error();
+    }
+    acquired_count_ = 0;
+    return stats;
+#else
+    return lx::not_implemented("lx::gfx::vulkan_compositor::end_linear_frame");
+#endif
+}
+
+void lx::gfx::vulkan_compositor::abandon_linear_frame() {
+#if defined(LUMEN_HAS_VULKAN)
+    if (linear_cb_) {
+        auto cb = static_cast<VkCommandBuffer>(linear_cb_);
+        if (linear_pass_open_)
+            vkCmdEndRenderPass(cb);
+        (void)vkEndCommandBuffer(cb);
+    }
+#endif
+    linear_cb_ = nullptr;
+    linear_target_ = nullptr;
+    linear_pass_open_ = false;
+    abandon_prepared_blits();
 }
 
 lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& target,

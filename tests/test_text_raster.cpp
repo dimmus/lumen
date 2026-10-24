@@ -1,9 +1,17 @@
-// lx.text single-line rasterization: shape_line / fit_line / render_line.
+// lx.text single-line rasterization: shape_line / fit_line / render_line; and the glyph
+// atlas raster (`lx.text:raster`, ADR-010 §4.6): subpixel variants, cache hits, eviction and
+// rebuild, colour glyphs on an RGBA8 page.
 #include "lumen_test.hpp"
 
 import std;
 import lx.foundation;
+import lx.gfx;
+import lx.runtime;
 import lx.text;
+
+#ifndef LUMEN_TEST_FONT_DIR
+#define LUMEN_TEST_FONT_DIR "tests/fonts"
+#endif
 
 namespace {
 
@@ -152,6 +160,391 @@ LUMEN_TEST(failure_is_reported_not_faked) {
     LUMEN_CHECK(line.count == 0);
 }
 
+// ── Glyph atlas raster (lx.text:raster) ──
+
+namespace {
+
+/// A face cache over the bundled fonts plus tests/fonts, its shape cache and an atlas with a
+/// glyph cache on it. Heap-allocated: the atlas and the caches are large.
+struct raster_fixture {
+    std::unique_ptr<lx::text::face_cache> faces = std::make_unique<lx::text::face_cache>();
+    std::unique_ptr<lx::text::shape_cache> shapes = std::make_unique<lx::text::shape_cache>();
+    std::unique_ptr<lx::gfx::atlas> atlas = std::make_unique<lx::gfx::atlas>();
+    std::unique_ptr<lx::text::glyph_cache> glyphs;
+    explicit raster_fixture(lx::text::glyph_cache_config config = {})
+        : glyphs{std::make_unique<lx::text::glyph_cache>(*atlas, config)} {
+        (void)faces->add_font_dir(LUMEN_TEST_FONT_DIR);
+    }
+
+    /// The glyph ids of `utf8` in `face` at `size` (26.6), visual order; empty without fonts.
+    std::vector<std::uint32_t> glyph_ids(lx::text::face_id face, std::int32_t size,
+                                         std::string_view utf8) {
+        lx::text::shape_request req{};
+        req.face = face;
+        req.size_26_6 = size;
+        req.utf8 = utf8;
+        std::vector<std::uint32_t> out;
+        if (auto run = shapes->shape(*faces, req))
+            for (const lx::text::shaped_glyph& g : run->glyphs)
+                out.push_back(g.glyph);
+        return out;
+    }
+
+    /// The tile's texels, row by row (bytes per texel of its page).
+    std::vector<std::uint8_t> texels(const lx::gfx::atlas_tile& t) const {
+        const lx::gfx::atlas_page_view v = atlas->page(t.page);
+        const unsigned bpt = v.format == lx::gfx::atlas_format::r8 ? 1u : 4u;
+        std::vector<std::uint8_t> out;
+        for (unsigned y = 0; y < t.h; ++y) {
+            const std::uint8_t* row = v.pixels + static_cast<std::size_t>(t.y + y) * v.stride +
+                                      static_cast<std::size_t>(t.x) * bpt;
+            out.insert(out.end(), row, row + static_cast<std::size_t>(t.w) * bpt);
+        }
+        return out;
+    }
+};
+
+constexpr std::int32_t k_14px = 14 * 64;
+
+} // namespace
+
+LUMEN_TEST(glyph_pen_rounds_to_quarters_and_whole_rows) {
+    using lx::text::glyph_pen;
+    static_assert(glyph_pen(0, 0).x == 0 && glyph_pen(0, 0).variant == 0);
+    // 26.6: 16 units are a quarter pixel; the nearest quarter wins.
+    static_assert(glyph_pen(7, 0).variant == 0 && glyph_pen(8, 0).variant == 1);
+    static_assert(glyph_pen(32, 0).variant == 2 && glyph_pen(48, 0).variant == 3);
+    static_assert(glyph_pen(56, 0).x == 1 && glyph_pen(56, 0).variant == 0);
+    static_assert(glyph_pen(64 * 5 + 36, 0).x == 5 && glyph_pen(64 * 5 + 36, 0).variant == 2);
+    // Negative pens floor: −¼ px is pixel −1, variant 3.
+    static_assert(glyph_pen(-16, 0).x == -1 && glyph_pen(-16, 0).variant == 3);
+    // y snaps to the nearest whole pixel.
+    static_assert(glyph_pen(0, 31).y == 0 && glyph_pen(0, 32).y == 1 && glyph_pen(0, -33).y == -1);
+    static_assert(lx::text::effective_hinting(lx::text::glyph_hinting::light, 1.25f) ==
+                  lx::text::glyph_hinting::light);
+    static_assert(lx::text::effective_hinting(lx::text::glyph_hinting::light, 1.5f) ==
+                  lx::text::glyph_hinting::none);
+    static_assert(lx::text::effective_hinting(lx::text::glyph_hinting::none, 1.f) ==
+                  lx::text::glyph_hinting::none);
+}
+
+LUMEN_TEST(subpixel_variants_differ_and_are_cached_separately) {
+    raster_fixture fx{};
+    const lx::text::face_id face = fx.faces->resolve(lx::text::font_desc{});
+    if (!face.valid())
+        return; // no faces on this host
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, k_14px, "l");
+    LUMEN_CHECK(ids.size() == 1);
+    lx::gfx::atlas_tile tiles[lx::text::k_subpixel_variants]{};
+    lx::gfx::atlas_tile_id tile_ids[lx::text::k_subpixel_variants]{};
+    std::vector<std::uint8_t> px[lx::text::k_subpixel_variants];
+    int lefts[lx::text::k_subpixel_variants]{};
+    for (std::uint8_t v = 0; v < lx::text::k_subpixel_variants; ++v) {
+        auto e = fx.glyphs->get(*fx.faces, {face, k_14px, ids[0], v});
+        LUMEN_CHECK(static_cast<bool>(e));
+        LUMEN_CHECK(!(*e)->empty() && !(*e)->color);
+        LUMEN_CHECK(fx.glyphs->place(**e, tiles[v]));
+        LUMEN_CHECK(tiles[v].page < lx::gfx::k_atlas_first_rgba8_page);
+        tile_ids[v] = (*e)->tile;
+        lefts[v] = (*e)->left;
+        px[v] = fx.texels(tiles[v]);
+    }
+    for (unsigned a = 0; a < lx::text::k_subpixel_variants; ++a)
+        for (unsigned b = a + 1; b < lx::text::k_subpixel_variants; ++b) {
+            LUMEN_CHECK(tile_ids[a] != tile_ids[b]);
+            // Moved by a quarter pixel: different coverage (the stem straddles columns).
+            LUMEN_CHECK(px[a] != px[b] || lefts[a] != lefts[b]);
+        }
+    const lx::text::glyph_cache_counters c = fx.glyphs->counters();
+    std::printf("    'l' 14 px: variants left %d %d %d %d, widths %u %u %u %u\n", lefts[0], lefts[1],
+                lefts[2], lefts[3], tiles[0].w, tiles[1].w, tiles[2].w, tiles[3].w);
+    LUMEN_CHECK(c.rasterized == 4 && c.live == 4);
+    // The ink moves right with the variant: its coverage-weighted centre grows.
+    float centre[lx::text::k_subpixel_variants]{};
+    for (unsigned v = 0; v < lx::text::k_subpixel_variants; ++v) {
+        double sum = 0.0, weighted = 0.0;
+        for (unsigned y = 0; y < tiles[v].h; ++y)
+            for (unsigned x = 0; x < tiles[v].w; ++x) {
+                const double cov = px[v][y * tiles[v].w + x];
+                sum += cov;
+                weighted += cov * (lefts[v] + static_cast<int>(x) + 0.5);
+            }
+        centre[v] = static_cast<float>(weighted / sum);
+    }
+    for (unsigned v = 1; v < lx::text::k_subpixel_variants; ++v) {
+        const float step = centre[v] - centre[v - 1];
+        LUMEN_CHECK(step > 0.15f && step < 0.35f);
+    }
+}
+
+LUMEN_TEST(glyph_cache_hit_returns_the_same_tile) {
+    raster_fixture fx{};
+    const lx::text::face_id face = fx.faces->resolve(lx::text::font_desc{});
+    if (!face.valid())
+        return;
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, k_14px, "Lumen");
+    LUMEN_CHECK(ids.size() == 5);
+    std::vector<lx::gfx::atlas_tile_id> first;
+    for (std::uint32_t id : ids) {
+        auto e = fx.glyphs->get(*fx.faces, {face, k_14px, id, 1});
+        LUMEN_CHECK(static_cast<bool>(e));
+        first.push_back((*e)->tile);
+    }
+    const lx::text::glyph_cache_counters before = fx.glyphs->counters();
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        const lx::text::glyph_entry* hit = fx.glyphs->find({face, k_14px, ids[i], 1});
+        LUMEN_CHECK(hit && hit->tile == first[i]);
+    }
+    const lx::text::glyph_cache_counters after = fx.glyphs->counters();
+    LUMEN_CHECK(after.rasterized == before.rasterized);
+    LUMEN_CHECK(after.hits == before.hits + ids.size());
+    // Another size, hinting or face is another glyph.
+    LUMEN_CHECK(fx.glyphs->find({face, k_14px + 64, ids[0], 1}) == nullptr);
+    LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[0], 1, lx::text::glyph_hinting::light}) ==
+                nullptr);
+    auto hinted = fx.glyphs->get(*fx.faces, {face, k_14px, ids[0], 1, lx::text::glyph_hinting::light});
+    LUMEN_CHECK(static_cast<bool>(hinted) && (*hinted)->tile != first[0]);
+    // A space has no ink: cached, but no tile and nothing to place.
+    const std::vector<std::uint32_t> space = fx.glyph_ids(face, k_14px, " ");
+    LUMEN_CHECK(space.size() == 1);
+    auto blank = fx.glyphs->get(*fx.faces, {face, k_14px, space[0], 0});
+    LUMEN_CHECK(static_cast<bool>(blank) && (*blank)->empty());
+    lx::gfx::atlas_tile none{};
+    LUMEN_CHECK(!fx.glyphs->place(**blank, none));
+    LUMEN_CHECK(fx.glyphs->find({face, k_14px, space[0], 0}) != nullptr);
+    // A stale face is an io error, never a crash.
+    auto stale = fx.glyphs->get(*fx.faces, {lx::text::face_id{0xFFFFFFu}, k_14px, ids[0], 0});
+    LUMEN_CHECK(!stale && stale.get_error().domain == lx::error_domain::io);
+}
+
+LUMEN_TEST(eviction_and_rebuild_keep_glyphs_drawable) {
+    raster_fixture fx{};
+    const lx::text::face_id face = fx.faces->resolve(lx::text::font_desc{});
+    if (!face.valid())
+        return;
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, k_14px, "abcdefgh");
+    LUMEN_CHECK(ids.size() == 8);
+    fx.atlas->begin_frame(1);
+    std::vector<std::vector<std::uint8_t>> original;
+    for (std::uint32_t id : ids) {
+        auto e = fx.glyphs->get(*fx.faces, {face, k_14px, id, 0});
+        LUMEN_CHECK(static_cast<bool>(e));
+        lx::gfx::atlas_tile t{};
+        LUMEN_CHECK(fx.glyphs->place(**e, t));
+        original.push_back(fx.texels(t));
+    }
+    // Keep "abcd" in use, let "efgh" go stale, then rebuild their page: the stale tiles are
+    // dropped, the live ones move — their ids stay, `place` finds the new texels.
+    const unsigned page = [&] {
+        lx::gfx::atlas_tile t{};
+        (void)fx.glyphs->place(*fx.glyphs->find({face, k_14px, ids[0], 0}), t);
+        return static_cast<unsigned>(t.page);
+    }();
+    for (std::uint64_t frame = 2; frame <= 200; ++frame) {
+        fx.atlas->begin_frame(frame);
+        for (unsigned i = 0; i < 4; ++i) {
+            const lx::text::glyph_entry* e = fx.glyphs->find({face, k_14px, ids[i], 0});
+            lx::gfx::atlas_tile t{};
+            LUMEN_CHECK(e && fx.glyphs->place(*e, t));
+        }
+    }
+    auto rebuilt = fx.atlas->rebuild(page);
+    LUMEN_CHECK(static_cast<bool>(rebuilt));
+    std::printf("    rebuild: %u evicted, %u moved\n", rebuilt->evicted, rebuilt->moved);
+    LUMEN_CHECK(rebuilt->evicted == 4 && rebuilt->lost == 0);
+    const lx::text::glyph_cache_counters before = fx.glyphs->counters();
+    for (unsigned i = 0; i < 8; ++i) {
+        const lx::text::glyph_key key{face, k_14px, ids[i], 0};
+        const lx::text::glyph_entry* e = fx.glyphs->find(key);
+        if (i < 4) {
+            // Live: found where the rebuild put it, with the same pixels.
+            lx::gfx::atlas_tile t{};
+            LUMEN_CHECK(e && fx.glyphs->place(*e, t));
+            LUMEN_CHECK(fx.texels(t) == original[i]);
+        } else {
+            // Evicted: a miss, rasterised again on demand, identical.
+            LUMEN_CHECK(e == nullptr);
+            auto again = fx.glyphs->get(*fx.faces, key);
+            LUMEN_CHECK(static_cast<bool>(again));
+            lx::gfx::atlas_tile t{};
+            LUMEN_CHECK(fx.glyphs->place(**again, t));
+            LUMEN_CHECK(fx.texels(t) == original[i]);
+        }
+    }
+    const lx::text::glyph_cache_counters after = fx.glyphs->counters();
+    LUMEN_CHECK(after.rerasterized == before.rerasterized + 4);
+    LUMEN_CHECK(after.rasterized == before.rasterized + 4);
+    LUMEN_CHECK(after.live == before.live);
+
+    // In-place eviction (no rebuild) behaves the same way.
+    for (std::uint64_t frame = 201; frame <= 330; ++frame)
+        fx.atlas->begin_frame(frame);
+    LUMEN_CHECK(fx.atlas->evict_stale() == 8);
+    for (std::uint32_t id : ids) {
+        LUMEN_CHECK(fx.glyphs->find({face, k_14px, id, 0}) == nullptr);
+        auto e = fx.glyphs->get(*fx.faces, {face, k_14px, id, 0});
+        lx::gfx::atlas_tile t{};
+        LUMEN_CHECK(e && fx.glyphs->place(**e, t));
+    }
+}
+
+LUMEN_TEST(full_sets_replace_their_least_recently_used_way) {
+    // One set of 8 ways: the ninth glyph replaces the oldest; the frame's tiles stay.
+    lx::text::glyph_cache_config one_set{};
+    one_set.entries = lx::text::k_glyph_cache_ways;
+    raster_fixture fx{one_set};
+    const lx::text::face_id face = fx.faces->resolve(lx::text::font_desc{});
+    if (!face.valid())
+        return;
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, k_14px, "abcdefghij");
+    LUMEN_CHECK(ids.size() == 10);
+    fx.atlas->begin_frame(1);
+    for (unsigned i = 0; i < 8; ++i)
+        LUMEN_CHECK(static_cast<bool>(fx.glyphs->get(*fx.faces, {face, k_14px, ids[i], 0})));
+    // The atlas's stale age later: "a" has not been drawn since frame 1.
+    fx.atlas->begin_frame(1 + lx::gfx::k_atlas_stale_frames);
+    // Touch "b" … "h": "a" is the least recently used.
+    for (unsigned i = 1; i < 8; ++i)
+        LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[i], 0}) != nullptr);
+    const unsigned tiles_before = fx.atlas->stats().live_tiles;
+    LUMEN_CHECK(static_cast<bool>(fx.glyphs->get(*fx.faces, {face, k_14px, ids[8], 0})));
+    LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[0], 0}) == nullptr);
+    const lx::text::glyph_cache_counters c = fx.glyphs->counters();
+    LUMEN_CHECK(c.evictions == 1 && c.tiles_released == 1 && c.live == 8 && c.capacity == 8);
+    LUMEN_CHECK(c.tiles_aging == 0);
+    // "a" was stale by the atlas's rule, so its tile went back to the atlas.
+    LUMEN_CHECK(fx.atlas->stats().live_tiles == tiles_before);
+    // `reject` keeps the set and fails the glyph.
+    lx::text::glyph_cache_config strict = one_set;
+    strict.overflow = lx::runtime::overflow_action::reject;
+    lx::text::glyph_cache rejecting{*fx.atlas, strict};
+    for (unsigned i = 0; i < 8; ++i)
+        LUMEN_CHECK(static_cast<bool>(rejecting.get(*fx.faces, {face, k_14px, ids[i], 0})));
+    auto refused = rejecting.get(*fx.faces, {face, k_14px, ids[9], 0});
+    LUMEN_CHECK(!refused && rejecting.counters().overflows == 1);
+}
+
+LUMEN_TEST(replacing_a_way_never_frees_a_tile_still_drawn) {
+    // Retained emitters (a text node's placements, the compositor's title runs) draw through
+    // `atlas::use` and never touch the table: the victim is chosen by the atlas's clock, and
+    // a tile drawn within the stale age is left to age out, never handed to another glyph.
+    lx::text::glyph_cache_config one_set{};
+    one_set.entries = lx::text::k_glyph_cache_ways;
+    raster_fixture fx{one_set};
+    const lx::text::face_id face = fx.faces->resolve(lx::text::font_desc{});
+    if (!face.valid())
+        return;
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, k_14px, "abcdefghi");
+    LUMEN_CHECK(ids.size() == 9);
+    fx.atlas->begin_frame(1);
+    lx::gfx::atlas_tile_id tiles[8]{};
+    std::vector<std::uint8_t> pixels[8];
+    for (unsigned i = 0; i < 8; ++i) {
+        auto e = fx.glyphs->get(*fx.faces, {face, k_14px, ids[i], 0});
+        LUMEN_CHECK(e && !(*e)->empty());
+        tiles[i] = (*e)->tile;
+        lx::gfx::atlas_tile t{};
+        LUMEN_CHECK(fx.atlas->lookup(tiles[i], t));
+        pixels[i] = fx.texels(t);
+    }
+    // Frame 2 draws every glyph but "c" through the atlas only. The table's own clock still
+    // says "a" is the oldest (it was filled first).
+    fx.atlas->begin_frame(2);
+    for (unsigned i = 0; i < 8; ++i) {
+        lx::gfx::atlas_tile t{};
+        if (i != 2)
+            LUMEN_CHECK(fx.atlas->use(tiles[i], t));
+    }
+    auto added = fx.glyphs->get(*fx.faces, {face, k_14px, ids[8], 0});
+    LUMEN_CHECK(static_cast<bool>(added));
+    const lx::text::glyph_cache_counters c = fx.glyphs->counters();
+    LUMEN_CHECK(c.evictions == 1 && c.tiles_released == 0 && c.tiles_aging == 1);
+    // "c" went (drawn longest ago), "a" stayed.
+    LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[2], 0}) == nullptr);
+    LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[0], 0}) != nullptr);
+    // Every tile drawn in frames 1–2 is still where it was, with its pixels, and the new
+    // glyph's tile overlaps none of them.
+    lx::gfx::atlas_tile fresh{};
+    LUMEN_CHECK(fx.atlas->lookup((*added)->tile, fresh));
+    for (unsigned i = 0; i < 8; ++i) {
+        lx::gfx::atlas_tile t{};
+        LUMEN_CHECK(fx.atlas->lookup(tiles[i], t));
+        LUMEN_CHECK(fx.texels(t) == pixels[i]);
+        const bool overlap = t.page == fresh.page && t.x < fresh.x + fresh.w &&
+                             fresh.x < t.x + t.w && t.y < fresh.y + fresh.h &&
+                             fresh.y < t.y + t.h;
+        LUMEN_CHECK(!overlap);
+    }
+    // The dropped tile ages out of the atlas like any unused one.
+    LUMEN_CHECK(!fx.atlas->is_stale(tiles[2]));
+    fx.atlas->begin_frame(1 + lx::gfx::k_atlas_stale_frames);
+    LUMEN_CHECK(fx.atlas->is_stale(tiles[2]));
+    LUMEN_CHECK(fx.atlas->evict_stale() >= 1);
+    lx::gfx::atlas_tile gone{};
+    LUMEN_CHECK(!fx.atlas->lookup(tiles[2], gone));
+}
+
+LUMEN_TEST(oversize_glyphs_fail_before_rendering) {
+    lx::text::glyph_cache_config small{};
+    small.max_glyph_px = 8;
+    raster_fixture fx{small};
+    const lx::text::face_id face = fx.faces->resolve(lx::text::font_desc{});
+    if (!face.valid())
+        return;
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, 40 * 64, "M");
+    LUMEN_CHECK(ids.size() == 1);
+    fx.atlas->begin_frame(1);
+    LUMEN_CHECK(!fx.glyphs->get(*fx.faces, {face, 40 * 64, ids[0], 0}));
+    const lx::text::glyph_cache_counters c = fx.glyphs->counters();
+    LUMEN_CHECK(c.oversize == 1 && c.failures == 1 && c.rasterized == 0);
+    LUMEN_CHECK(fx.atlas->stats().live_tiles == 0);
+}
+
+LUMEN_TEST(colour_glyph_lands_on_an_rgba8_page) {
+    raster_fixture fx{};
+    const lx::text::face_id face = fx.faces->resolve("Lumen Test Emoji", lx::text::weight::normal,
+                                                     lx::text::style::normal);
+    lx::text::face_info info{};
+    if (!face.valid() || !fx.faces->describe(face, info) ||
+        std::strstr(info.file, "LumenTestEmoji") == nullptr) {
+        std::printf("    (skip: tests/fonts not registered)\n");
+        return;
+    }
+    // 😀 U+1F600: COLRv0 layers.
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, 24 * 64, "\xF0\x9F\x98\x80");
+    LUMEN_CHECK(ids.size() == 1 && ids[0] != 0);
+    auto e = fx.glyphs->get(*fx.faces, {face, 24 * 64, ids[0], 0});
+    LUMEN_CHECK(static_cast<bool>(e));
+    LUMEN_CHECK((*e)->color && !(*e)->empty());
+    lx::gfx::atlas_tile t{};
+    LUMEN_CHECK(fx.glyphs->place(**e, t));
+    LUMEN_CHECK(t.page >= lx::gfx::k_atlas_first_rgba8_page);
+    LUMEN_CHECK(lx::gfx::atlas::page_format(t.page) == lx::gfx::atlas_format::rgba8);
+    std::printf("    U+1F600 at 24 px: %u x %u, bearing (%d, %d), page %u\n", t.w, t.h, (*e)->left,
+                (*e)->top, t.page);
+    LUMEN_CHECK(t.w >= 18 && t.w <= 30 && t.h >= 18 && t.h <= 30);
+    // Premultiplied and coloured: no channel above alpha, and the face is yellow (R, G > B).
+    const std::vector<std::uint8_t> px = fx.texels(t);
+    unsigned long long r = 0, g = 0, b = 0, opaque = 0;
+    for (std::size_t i = 0; i < px.size(); i += 4) {
+        LUMEN_CHECK(px[i] <= px[i + 3] && px[i + 1] <= px[i + 3] && px[i + 2] <= px[i + 3]);
+        r += px[i];
+        g += px[i + 1];
+        b += px[i + 2];
+        opaque += px[i + 3] == 255 ? 1u : 0u;
+    }
+    LUMEN_CHECK(opaque > px.size() / 4 / 3);
+    LUMEN_CHECK(r > 2 * b && g > 2 * b);
+    // Colour glyphs have no subpixel variants: every variant answers with the same tile.
+    for (std::uint8_t v = 1; v < lx::text::k_subpixel_variants; ++v) {
+        auto ev = fx.glyphs->get(*fx.faces, {face, 24 * 64, ids[0], v});
+        LUMEN_CHECK(static_cast<bool>(ev) && (*ev)->tile == (*e)->tile);
+    }
+    LUMEN_CHECK(fx.glyphs->counters().color == 1 && fx.glyphs->counters().rasterized == 1);
+}
+
 int main(int argc, char** argv) {
+    // The atlas the glyph cache writes is UI affinity.
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     return lumen_test::run_all(argc, argv);
 }

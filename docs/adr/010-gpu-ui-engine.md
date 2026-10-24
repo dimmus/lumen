@@ -254,10 +254,16 @@ the compositor's shm uploads yet. The atlas's dirty lists (and a new page image'
 state) are committed only when the frame is submitted; a frame whose surface draw fails to
 record inside the pass is still submitted, so the copies and acquires recorded before it run.
 `surface` draws record `vulkan_compositor`'s images and descriptor sets into `:ui_vk`'s
-command buffers, which the compositor's fences do not cover: until `vulkan_compositor`
-tracks external users, whoever forgets or replaces such a texture must first wait for
-`:ui_vk`'s frames (`wait_idle`; stated on `record_blits`). The compositor's Vulkan path does
-not use `:ui_vk` yet, so nothing in production depends on this.
+command buffers, which the compositor's fences do not cover. As built in Phase 2 both Phase 1
+open items are closed: `vulkan_compositor` tracks external users (`add_external_user`: a
+`ui_vk_renderer` given a surface compositor registers its `wait_idle`; `record_blits` on a
+command buffer other than the compositor's own frame marks the texture, and
+`forget_texture`, `upload_rgba` over it and `bind_imported` of another image under its id
+wait for every external user first), and a `vkEndCommandBuffer` / `vkQueueSubmit` that fails
+after `prepare_blits` un-marks the acquires it recorded (`abandon_prepared_blits`), so the
+next frame records them again. The compositor's own Vulkan frames with primitives record
+`:ui_vk` inside its linear pass (`ui_vk_renderer::composite`, §4.11), where its fences cover
+everything.
 
 ### 4.5 Colour and precision
 
@@ -275,6 +281,15 @@ not use `:ui_vk` yet, so nothing in production depends on this.
   contrast exponent (theme `text.contrast`, default 1.0 dark / 1.2 light, validated
   against the sRGB rendering in the golden tests, §8.4). The compositor's own chrome
   renders inside its linear F16 pass and uses the same exponent.
+  Measured in Phase 2 (`test_ui_golden` `text_contrast_keeps_stem_coverage`: IBM Plex Sans at
+  10–16 px, coverage from the CPU reference, the linear blend composed from it): the starting
+  values do not hold the 3 % bound — linear blending thickens One Dark's text by 26 % at
+  exponent 1.0 and thins One Light's by 31 % at 1.2. The exponent has to rise for
+  light-on-dark and fall below 1 for dark-on-light: 1.58–1.77 (1.67 used) dark and 0.54–0.61
+  (0.57 used) light keep the mean stem coverage within 3 % (`gfx::k_text_contrast_dark`,
+  `k_text_contrast_light`). The first linear target is the Vulkan compositor's F16 pass
+  (§4.11): its light-on-dark title text at 1.67 has a mean stem weight +1.5 % of the CPU
+  compositor's encoded blend, +14.7 % at 1.0 (`test_deco_titles`, lavapipe).
 - 10-bit output: when `zwp_linux_dmabuf_v1` feedback offers `XRGB2101010` the client
   swapchain uses it; the compositor already scans out A2B10G10R10.
 
@@ -311,9 +326,46 @@ naming its pixels — and marks a page above 85 % for the rebuild at the next fr
 measured, rendering-performance.md §6). The worker rebuild into a shadow page swapped at
 `begin_frame` is left for when S4 shows the synchronous one on a frame.
 
+As built in Phase 2 (`:itemize`, `:lines`): libunibreak is called from `:itemize`, which decodes
+each paragraph once and computes its bidi levels, scripts, UAX #29 grapheme and UAX #14 break
+flags in one pass; `:lines` consumes the flags. fribidi is skipped for a paragraph with nothing
+right-to-left in it. The fallback key's "Unicode block" is a fixed slice of 128 code points,
+negative answers included; a cluster of Common / Inherited characters stays in the face of the
+run before it. A line cuts a run's glyphs at a cluster boundary instead of reshaping the two
+halves (the shape cache does not keep HarfBuzz's unsafe-to-break flags), so a re-wrap at any
+width shapes nothing; a forced break inside a word or an ellipsis cut keeps the glyph forms the
+whole word was shaped with. With `max_lines` the ellipsis cut stays within the last line's
+wrapped extent (as CSS `line-clamp`); an unwrapped line is cut at any grapheme. The retained
+`text_layout` replaces the old one-line class of that name (same setters, `bounding_size` now
+counts every line); `wrap_text` / `render_wrapped` keep their own path for the shell until
+Phase 5. Measured on an S4-like wall (2 000 paragraphs of Latin / Cyrillic / Arabic, 142 KB,
+97 k glyphs; `test_text_lines`, load 0.7, five runs): cold layout 28–54 ms, a fresh layout over
+a warm shape cache 15–21 ms p50 (itemization 7–9 ms of it, no shaping calls), re-wrap at a new
+width 0.49–0.67 ms p50 / 0.8–4 ms p95 with no shaping; 6.9 MB of layout storage (vector
+growth slack included). A whole-document relayout is therefore worker work (below); scrolling
+does not relayout.
+
+As built in Phase 2 (`:raster`, `lx.ui:text_node`): `lx.text` depends on `lx.gfx` for the atlas
+(tile ids and `atlas::insert` / `lookup` / `touch` only). `glyph_cache` is a set-associative
+table (16 384 entries, 8 ways; a full set replaces the way the atlas saw drawn longest ago and
+releases its tile only when the atlas already counts it stale, else leaves it to the 120-frame
+aging, since retained emitters touch the atlas, not the table) keyed by (face, size × scale, variant, glyph, hinting); the
+pen rounds to the nearest quarter pixel (`glyph_pen`), the variant moves the outline before
+FreeType renders it; colour glyphs are rasterised once at variant 0 and answer every variant;
+a tile the atlas evicted is rasterised again on the frame that needs it. The text node is
+`text_block_node` (the placeholder `text_node` of `:widgets_decl` keeps its name until Phase 3):
+it binary-searches the lines the clip reaches (widened by an em) before touching a glyph, takes
+the face lock once per emit and only on a miss, and emits through `draw_scope::glyph` with
+colours packed once per run. The golden text cases use only bundled fonts plus two subsets in
+`tests/fonts` (IBM Plex Sans Arabic and Twemoji Mozilla COLRv0, renamed): CPU, GL and Vulkan
+(lavapipe) agree within 2/255.
+
 Shaping and rasterising happen on the **worker** affinity when a layout invalidation is
 large (a whole document) and inline on the UI thread when it is small (a label), with the
-boundary set by measurement in §8.3 S4.
+boundary set by measurement in §8.3 S4. As built: the boundary is 4 KiB of text (a cold
+reshape costs ~0.21 µs a byte here; S4's whole document 31–38 ms); shaping and wrapping move to
+the worker, glyph rasterising stays on the UI thread where the atlas lives (§7 Phase 2, as
+built).
 
 ### 4.7 Layout
 
@@ -421,6 +473,32 @@ square quads become solid blits, other primitives are dropped, counted and warne
 linear instance colours, is the remaining step for primitives that do not lower. Occluders
 are quads that lower (radius 0, borderless, one colour, integral rects) at alpha 1;
 primitives are never culled.
+
+As built in Phase 2 (`lx.compositor:decoration`, `:ui_composite`; rendering-performance.md §1.2
+"Server-side frames", §6): the title text and the close glyph are `mono_sprite`s in the
+compositor's own atlas (`chrome_atlas`: one `gfx::atlas` for every output, written by UI under
+its mutex, read by the render thread's renderer under it). `chrome_text` shapes and fits a
+title with the single-line `lx.text` API — the CPU titles' font, ellipsis and not-responding
+rules, placement unchanged — and rasterises its glyphs through a `text::glyph_cache` (4
+subpixel variants, light hinting below 1.5) once per title change and per output scale the
+frame is on (`decoration_manager::set_window_scales`, up to 4 runs): each output draws its own
+scale 1:1, a view of another scale resamples the largest run. The close glyph is the analytic
+"×" rasterised per scale (not a font glyph: no font on every host has the same one); the
+hover / pressed circle stays a blit. The per-window CPU title textures, their upload and their
+texture ids are gone. The Vulkan compositor no longer lowers: `ui_vk_renderer::composite`
+records the stream inside `vulkan_compositor`'s linear F16 pass (`begin_linear_frame`,
+`begin_linear_pass`, `end_linear_frame`), with instance colours decoded to premultiplied linear
+light and glyph coverage raised to `k_text_contrast_dark` by the shaders under a push-constant
+flag; frames without primitives are `composite` byte for byte. Screen capture's
+re-composites (`paint_cpu_capture`, `paint_gl_capture`: the crop moves the primitives too) and
+the headless dump (`paint_headless`) draw the stream; only GLES 2 still lowers, dropping the
+glyphs. On a turned output the view marks each sprite with its transform and the renderers
+sample the tile back through `source_basis_for`. Dimmed frames' fills and glyphs carry one
+byte rule on every backend — the Phase 1 disagreement between dimmed fills and dimmed title
+blits on GL and Vulkan is gone. Measured (`test_deco_titles`): GL within 1/255 of the CPU
+compositor, Vulkan (lavapipe) within 1/255 outside the text and 9/255 on glyph edges with the
+stem weight +1.5 %; render-thread cost on CPU +3–5 % for a full repaint, GL unchanged within
+noise; no frame allocates.
 
 ### 4.12 Threads and allocation
 
@@ -673,6 +751,62 @@ numbers, so `scripts/ui-bench.sh` still warns while the gate fails in both.
 - Title bars switch to atlas glyphs. `lx.shell`'s `shm_canvas::text` is left until Phase 5.
 - Gate: G4 (S4) on GL; `test_text_raster` and `test_text_shaping` extended, not replaced.
 
+As built (S4 and G4; `lumen-ui-bench --scenario S4`, tests/bench/baseline/iritur-none.json):
+S4 is one `text_block_node` holding 2 000 seeded lines of 50 glyphs (Latin / Cyrillic / Arabic
+words, IBM Plex Sans 14 px, line height φ, Arabic from the host's DejaVu Sans fallback; 139 375
+B, 99 771 glyphs, 7.9 MB of layout) under a scroll node that moves its origin 3 px a frame at
+1920 × 1080. The first frame lays the document out inline (57–75 ms, 3 673 shaping calls, 402
+glyphs rasterised, 40 KB uploaded); a steady frame lays nothing out and emits the ~50 lines its
+clip reaches: 2 096 mono sprites, **0 shaping calls**, 45 glyphs rasterised over 1 800 frames
+(new subpixel variants as lines scroll in; 3 740 atlas bytes in all, at most 318 in a frame),
+two batches — the background quad and **one sprite batch on the one R8 page (one draw call on
+GL)**, 128 912 instance bytes — and no heap allocation. G4's sum (layout + emit + order +
+encode) with `--backend none`, load 0.4–0.7, three runs: p50 153–156 µs, p95 1.08–1.20 ms;
+beside the GL backend (two runs, the gate): p50 169 µs, p95 0.46–0.52 ms (`submit` p50 0.45 ms,
+`gpu` fence-wall p50 4.7 ms); frames back to back (`--period-us 0`): p50 81 µs, p95 0.18 ms.
+**G4 passes on GL and on `none`**, but the `none` p95 is 7× its p50 and that tail is the host:
+at the 1 ms frame clock the bench idles ~0.85 ms a frame and the vCPU then runs in bursts about
+8× slower (a fixed spin loop run before the tick takes up to 10× its usual time in some frames,
+and with it warming the core first the emit's slow frames mostly go; S3, whose frames outlast
+the period, never idles and shows 2.2×). What brought it
+there from p50 249 µs / p95 1.98 ms at first: `glyph_cache` hashes the key with one 64-bit mix
+and compares a 32-bit tag per way before the key, and `find_placed` probes and looks up and
+touches the tile once (`atlas::use`) — emit −25 %; a line's sprites share one order from the
+grid (`draw_scope::group_order`, a floor of the previous group's + 1 so a block's groups
+ascend), which removes the per-glyph grid lookup and leaves `batch_for_render` an ascending
+stream to copy instead of sort — order −50 %; and the text node keeps each glyph's placement
+(box and tile) until the layout runs a pass, so a scrolling frame costs one `atlas::use` per
+glyph — emit 104 → 64 µs back to back. Shaping by invalidation size (§4.6, the same run, cold
+= shape cache empty, warm = a new layout over a warm cache): a 14-byte label 3.3 µs cold; one
+76-byte line 15–36 µs (0.7–0.8 ms the first time a script needs a fontconfig fallback search);
+a 669-byte paragraph 0.13 ms cold, 53 µs warm; a 6.9 KB page 1.4–1.5 ms cold, 0.7–1.1 ms warm;
+the whole document 31–38 ms cold, 20–22 ms warm, a re-wrap 0.8 ms. The whole-document reshape
+exceeds a 60 Hz frame, so it moved off the UI thread: text of 4 KiB or more
+(`lx.ui::k_text_async_min_bytes`, an inline cold reshape under ~1 ms) is shaped and wrapped on
+the worker affinity when the block has a `text_async_shaping` (the worker's own shape cache and
+itemizer over the block's face cache) into a staging layout, handed back with
+`executor.post(ui, …)` and swapped in at the next UI frame, the old layout shown meanwhile
+(`test_text_node`). The worker's shape pass gives the face lock to a waiter between paragraphs
+(`face_cache::contended`): the UI thread waited at most 1.3 ms while a 150 KB document shaped.
+GL baseline rows: none committed — the two GL runs differ by more than 5 % at p95.
+
+As built (title bars, §4.11): server-side titles and the close glyph are atlas glyphs on all
+three compositors — CPU and GL through `:ui_cpu` / `:ui_gl` with the compositor's
+`chrome_atlas`, Vulkan through `:ui_vk` recording inside its linear F16 pass — and the
+per-window CPU title textures are deleted. `test_deco_titles`: the CPU compositor against
+committed references (tests/golden/compositor, scale 1 and 1.25, every title rule and button
+state), on turned outputs pixel-exact against the content turned, GL within 1/255 of it
+(G10's 3/255 is the bound; both blend UI in the encoded space; the circle blit's edge, blended
+per compositor as every blit always was, is masked), Vulkan within 2/255 outside the text and
+16/255 on glyph edges (measured 1 and 9/255; the bound leaves room for a hardware driver's
+pow and rounding) with the mean stem weight within 3 % (measured +1.5 %), zero validation
+messages; capture re-composites and the headless dump show the titles; a steady frame
+allocates nothing. Render-thread cost per decorated frame, `bench_ui_composite` (six titled
+480×320 windows at 1920×1080): CPU full repaint 1.81–1.85 → 1.87–2.08 ms p50 (1.89–1.91 ms
+at load 0.1), one window 32 → 36–45 µs; GL render thread 719–831 → 698–802 µs, GPU completion
+5.99–6.04 → 5.91–6.05 ms; UI-thread `commit_frame` 16 → 23–26 µs. A title change costs
+≈80 µs on the UI thread when its glyphs are new, 1–3 µs when they are cached.
+
 ### Phase 3 — Layout, style, theme, components (≈2 weeks)
 
 - `lx.layout:flex` with the per-node cache; `grow_node::grow_factor()` finally read.
@@ -848,9 +982,12 @@ request no frame callback; themes are compiled, not parsed at runtime.*
 | Scope creep into an editor | The component set is §5.6; syntax tables are compiled but no editor component is in this plan |
 
 Open: whether `lx.shell` keeps a CPU fallback for the panel on GLES 2 hosts (the CPU
-renderer already covers it, at a measured cost in S2), and whether the compositor should
-share one atlas across its outputs at different scales (one page per scale is the
-first answer).
+renderer already covers it, at a measured cost in S2). Answered in Phase 2: the compositor
+shares one atlas across its outputs — a glyph's key carries its size × scale, so the runs a
+title keeps per output scale are different tiles of the same pages, and a page set per scale
+would only split a few hundred tiles (§4.11). A GLES 2 compositor has no primitive renderer
+and draws its frames without titles (the lowered path drops glyphs); a lowering of mono
+sprites to blits of a coverage texture is the fix if such hosts matter.
 
 ---
 

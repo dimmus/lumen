@@ -333,6 +333,206 @@ LUMEN_TEST(surfaces_draw_in_stream_order) {
     LUMEN_CHECK(px[10 * 32 + 10] == 0xFF008080u);
 }
 
+// ── Text through the node: culling, and the contrast set (ADR-010 §8.4) ──────────
+
+namespace {
+
+/// The text block of the contrast set: the four UI sizes and a Cyrillic line, `fg` on `bg`,
+/// rendered by the CPU reference (encoded-sRGB blending, §4.5).
+[[nodiscard]] std::vector<std::uint32_t> contrast_block(const ui_golden::tiles& t,
+                                                        const lx::gfx::atlas& a, lx::color fg,
+                                                        lx::color bg, int w, int h) {
+    auto list = std::make_unique<lx::scene::draw_list>();
+    list->begin({w, h});
+    {
+        lx::ui::draw_scope s{*list, {0, 0, w, h}};
+        const float sizes[4] = {10.f, 12.f, 14.f, 16.f};
+        int y = 4;
+        for (float px : sizes) {
+            ui_golden::text_line(s, t, {6, y}, "Lumen 0123 quick brown fox jumps",
+                                 lx::text::k_ui_family, px, fg);
+            y += static_cast<int>(px * 1.5f);
+        }
+        ui_golden::text_line(s, t, {6, y},
+                             "\xD0\xA1\xD1\x8A\xD0\xB5\xD1\x88\xD1\x8C \xD0\xB5\xD1\x89\xD1\x91 "
+                             "\xD1\x8D\xD1\x82\xD0\xB8\xD1\x85 \xD0\xB1\xD1\x83\xD0\xBB\xD0\xBE"
+                             "\xD0\xBA",
+                             lx::text::k_ui_family, 14.f, fg);
+    }
+    list->batch_for_render();
+    std::vector<std::uint32_t> px(static_cast<std::size_t>(w) * h, 0u);
+    lx::gfx::ui_cpu_renderer r{};
+    lx::gfx::damage_region full{};
+    full.set_full();
+    std::vector<std::uint32_t>& out = px;
+    lx::gfx::pixel_surface surf = surface_of(out, w, h, lx::pixel_format::xrgb8888);
+    LUMEN_CHECK(static_cast<bool>(r.draw(surf, ui_golden::stream_of(*list), &a, full,
+                                         ui_golden::premultiplied(bg))));
+    return px;
+}
+
+[[nodiscard]] float srgb_decode(float v) {
+    return v <= 0.04045f ? v / 12.92f : std::pow((v + 0.055f) / 1.055f, 2.4f);
+}
+[[nodiscard]] float srgb_encode(float v) {
+    return v <= 0.0031308f ? v * 12.92f : 1.055f * std::pow(v, 1.f / 2.4f) - 0.055f;
+}
+
+/// Mean over the block's ink pixels of the perceived coverage, (L − L_bg) / (L_fg − L_bg)
+/// with L the mean of the encoded channels: in the sRGB rendering as drawn (`srgb`), and in
+/// linear-light blending with coverage^γ (`linear(γ)`), composed per pixel from the same
+/// coverage. The renderers have no linear-blending target yet (the HDR / scRGB swapchain of
+/// §4.5 comes with the client runtime), so the linear rendering is the blend equation applied
+/// to the coverage the CPU reference rasterised — the quantity the exponent corrects.
+struct stem_coverage {
+    std::vector<float> coverage; ///< per ink pixel, from white-on-black
+    float srgb = 0.f;
+    float fg_enc[3]{};
+    float bg_enc[3]{};
+
+    [[nodiscard]] float linear(float gamma) const {
+        double sum = 0.0;
+        const float lfg = (fg_enc[0] + fg_enc[1] + fg_enc[2]) / 3.f;
+        const float lbg = (bg_enc[0] + bg_enc[1] + bg_enc[2]) / 3.f;
+        for (float a : coverage) {
+            const float k = std::pow(a, gamma);
+            float l = 0.f;
+            for (int ch = 0; ch < 3; ++ch) {
+                const float lin = srgb_decode(fg_enc[ch]) * k + srgb_decode(bg_enc[ch]) * (1.f - k);
+                l += srgb_encode(lin);
+            }
+            sum += (l / 3.f - lbg) / (lfg - lbg);
+        }
+        return static_cast<float>(sum / static_cast<double>(coverage.size()));
+    }
+};
+
+[[nodiscard]] stem_coverage measure_stems(const ui_golden::tiles& t, const lx::gfx::atlas& a,
+                                          lx::color fg, lx::color bg) {
+    constexpr int w = 280;
+    constexpr int h = 112;
+    const std::vector<std::uint32_t> cov =
+        contrast_block(t, a, lx::color::rgb(1.f, 1.f, 1.f), lx::color::rgb(0.f, 0.f, 0.f), w, h);
+    const std::vector<std::uint32_t> srgb = contrast_block(t, a, fg, bg, w, h);
+    stem_coverage m{};
+    m.fg_enc[0] = fg.r;
+    m.fg_enc[1] = fg.g;
+    m.fg_enc[2] = fg.b;
+    m.bg_enc[0] = bg.r;
+    m.bg_enc[1] = bg.g;
+    m.bg_enc[2] = bg.b;
+    const float lfg = (fg.r + fg.g + fg.b) / 3.f;
+    const float lbg = (bg.r + bg.g + bg.b) / 3.f;
+    double sum = 0.0;
+    for (std::size_t i = 0; i < cov.size(); ++i) {
+        const float c = static_cast<float>(cov[i] & 0xFFu) / 255.f;
+        if (c <= 0.f)
+            continue;
+        m.coverage.push_back(c);
+        const std::uint32_t p = srgb[i];
+        const float l = (static_cast<float>((p >> 16) & 0xFFu) + static_cast<float>((p >> 8) & 0xFFu) +
+                         static_cast<float>(p & 0xFFu)) / (3.f * 255.f);
+        sum += (l - lbg) / (lfg - lbg);
+    }
+    m.srgb = static_cast<float>(sum / static_cast<double>(m.coverage.size()));
+    return m;
+}
+
+// The `text.contrast` exponent each theme blends linear-light text with (§4.5). The ADR's
+// starting values, 1.0 dark / 1.2 light, do not hold the 3 % bound: linear blending thickens
+// light-on-dark text (+26 % at 1.0) and thins dark-on-light text (−31 % at 1.2), so the
+// exponent has to go up for the dark theme and below 1 for the light one. These are the
+// centres of the ranges the set measured (dark 1.58–1.77, light 0.54–0.61 within 3 %): the
+// values `lx.gfx` exports and the compositor's linear pass uses (`ui_vk_renderer::composite`).
+constexpr float k_text_contrast_dark = lx::gfx::k_text_contrast_dark;
+constexpr float k_text_contrast_light = lx::gfx::k_text_contrast_light;
+static_assert(k_text_contrast_dark == 1.67f && k_text_contrast_light == 0.57f);
+constexpr float k_stem_tolerance = 0.03f;
+
+} // namespace
+
+// A wrapped paragraph under a clip: the node looks only at the lines the clip reaches.
+LUMEN_TEST(text_block_skips_lines_outside_the_clip) {
+    fixture fx{};
+    lx::ui::text_block_props p{};
+    std::string text;
+    for (int i = 0; i < 200; ++i)
+        text += "Line of text that wraps at the block's width. ";
+    p.text = text.c_str();
+    p.font = {lx::text::k_ui_family, 9.f};
+    p.context = {ui_golden::text_fonts().engine(), fx.tiles.glyphs.get()};
+    auto node = std::make_unique<lx::ui::text_block_node>();
+    node->apply(p);
+    node->arrange({0, 0, 200, 99999});
+    auto list = std::make_unique<lx::scene::draw_list>();
+    list->begin({200, 600});
+    lx::ui::draw_scope s{*list, {0, 300, 200, 40}};
+    node->emit(s);
+    const lx::ui::text_emit_stats st = node->last_emit();
+    std::printf("    %u lines, %u looked at, %u glyphs, %u sprites, %u rasterised\n", st.lines,
+                st.lines_drawn, st.glyphs, st.sprites, st.rasterized);
+    LUMEN_CHECK(st.lines > 100);
+    // 40 px of clip at a 16 px line pitch is three lines; one em either side adds one each.
+    LUMEN_CHECK(st.lines_drawn >= 3 && st.lines_drawn <= 6);
+    LUMEN_CHECK(st.failures == 0 && st.sprites > 0);
+    // The second frame rasterises nothing and emits the same.
+    list->begin({200, 600});
+    lx::ui::draw_scope s2{*list, {0, 300, 200, 40}};
+    node->emit(s2);
+    LUMEN_CHECK(node->last_emit().rasterized == 0 && node->last_emit().sprites == st.sprites);
+    // Re-applying the same props keeps the layout: no shape or wrap pass.
+    const lx::text::text_layout_counters before = node->layout().counters();
+    node->apply(p);
+    node->arrange({0, 0, 200, 99999});
+    (void)node->layout().lines();
+    const lx::text::text_layout_counters after = node->layout().counters();
+    LUMEN_CHECK(after.shape_passes == before.shape_passes && after.wrap_passes == before.wrap_passes);
+}
+
+// §8.4's second set: the same block blended in encoded sRGB and in linear light with the
+// `text.contrast` exponent keeps its mean stem coverage within 3 %, dark and light.
+LUMEN_TEST(text_contrast_keeps_stem_coverage) {
+    fixture fx{};
+    struct theme {
+        const char* name;
+        lx::color fg;
+        lx::color bg;
+        float contrast;
+    };
+    // One Dark text on the editor background; One Light's (#383a41 on #fafafa).
+    const theme themes[2] = {
+        {"dark", ui_golden::k_text, ui_golden::k_editor, k_text_contrast_dark},
+        {"light", ui_golden::tok(0x38, 0x3a, 0x41), ui_golden::tok(0xfa, 0xfa, 0xfa),
+         k_text_contrast_light},
+    };
+    bool held[2]{};
+    for (unsigned t = 0; t < 2; ++t) {
+        const theme& th = themes[t];
+        const stem_coverage m = measure_stems(fx.tiles, *fx.atlas, th.fg, th.bg);
+        LUMEN_CHECK(m.coverage.size() > 1000);
+        const auto deviation = [&](float g) { return (m.linear(g) - m.srgb) / m.srgb; };
+        float lo = 0.f;
+        float hi = 0.f;
+        float best = 0.f;
+        for (int i = 25; i <= 400; ++i) {
+            const float g = static_cast<float>(i) / 100.f;
+            if (std::fabs(deviation(g)) <= k_stem_tolerance) {
+                lo = lo == 0.f ? g : lo;
+                hi = g;
+            }
+            if (best == 0.f || std::fabs(deviation(g)) < std::fabs(deviation(best)))
+                best = g;
+        }
+        std::printf("    %-5s %zu ink px, sRGB mean %.4f; linear γ=1.0 %+.1f %%, γ=1.2 %+.1f %%, "
+                    "γ=%.2f %+.1f %%; within 3 %%: γ %.2f – %.2f, best %.2f\n",
+                    th.name, m.coverage.size(), m.srgb, 100.f * deviation(1.f),
+                    100.f * deviation(1.2f), th.contrast, 100.f * deviation(th.contrast), lo, hi,
+                    best);
+        held[t] = std::fabs(deviation(th.contrast)) <= k_stem_tolerance;
+    }
+    LUMEN_CHECK(held[0] && held[1]);
+}
+
 // ── GLES 3.1: lx.gfx:ui_gl against the same references (G10) ───────────────────
 
 namespace {
@@ -496,14 +696,18 @@ LUMEN_TEST(gl_fallback_ring_matches) {
     options.program_cache = false;
     LUMEN_CHECK(static_cast<bool>(fallback.initialize(options)));
     LUMEN_CHECK(!fallback.caps().persistent_ring && !fallback.caps().timer_query);
-    fixture fx{};
+    // An atlas per renderer: its dirty rects have one consumer, and the text cases add glyph
+    // tiles while the frames are built — one renderer's upload would clear what the other
+    // still has to copy.
+    fixture fa{};
+    fixture fb{};
     // Twice round the ring of each, so every slot of both is written and reused.
     for (unsigned pass = 0; pass < 2; ++pass)
         for (const ui_golden::golden_case& c : ui_golden::cases()) {
             std::vector<std::uint32_t> a;
             std::vector<std::uint32_t> b;
-            LUMEN_CHECK(render_gl(gl->renderer, c, fx.tiles, *fx.atlas, a, full_region()));
-            LUMEN_CHECK(render_gl(fallback, c, fx.tiles, *fx.atlas, b, full_region()));
+            LUMEN_CHECK(render_gl(gl->renderer, c, fa.tiles, *fa.atlas, a, full_region()));
+            LUMEN_CHECK(render_gl(fallback, c, fb.tiles, *fb.atlas, b, full_region()));
             LUMEN_CHECK(a == b);
         }
 }

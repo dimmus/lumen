@@ -24,6 +24,12 @@ if(PkgConfig_FOUND)
     # together: GBM allocates the scanout buffer, EGL binds it, GLES draws into it.
     pkg_check_modules(LIBEGL QUIET egl glesv2 gbm)
     pkg_check_modules(HARFBUZZ QUIET harfbuzz freetype2 fontconfig)
+    # lx.text:itemize, each optional: fribidi for UAX #9 embedding levels (without it every
+    # paragraph is one direction) and libunibreak for UAX #14 line breaks and UAX #29
+    # grapheme clusters (without it lines break after spaces, clusters are a code point and
+    # its marks).
+    pkg_check_modules(FRIBIDI QUIET fribidi)
+    pkg_check_modules(LIBUNIBREAK QUIET libunibreak)
     pkg_check_modules(LIBSYSTEMD QUIET libsystemd)
     # lumen-shell's icon theme lookup (task-bar icons): PNG through libpng, SVG through
     # librsvg (which brings cairo). Both optional: without them the panel falls back to the
@@ -146,6 +152,21 @@ function(lumen_embed_glsl target subdir)
 endfunction()
 
 # Link platform libs and define LUMEN_HAS_* on a target (executables + modules).
+# fribidi and libunibreak, linked with the text part (lx.text:itemize). Each is optional and
+# has its own macro; lx.text builds without either.
+function(lumen_link_text_segmentation target)
+    if(FRIBIDI_FOUND)
+        target_include_directories(${target} PRIVATE ${FRIBIDI_INCLUDE_DIRS})
+        target_link_libraries(${target} PRIVATE ${FRIBIDI_LIBRARIES})
+        target_compile_definitions(${target} PRIVATE LUMEN_HAS_FRIBIDI=1)
+    endif()
+    if(LIBUNIBREAK_FOUND)
+        target_include_directories(${target} PRIVATE ${LIBUNIBREAK_INCLUDE_DIRS})
+        target_link_libraries(${target} PRIVATE ${LIBUNIBREAK_LIBRARIES})
+        target_compile_definitions(${target} PRIVATE LUMEN_HAS_UNIBREAK=1)
+    endif()
+endfunction()
+
 function(lumen_link_platform target)
     if(Vulkan_FOUND)
         target_link_libraries(${target} PRIVATE Vulkan::Vulkan)
@@ -204,6 +225,7 @@ function(lumen_link_platform target)
         target_link_libraries(${target} PRIVATE ${HARFBUZZ_LIBRARIES})
         target_compile_definitions(${target} PRIVATE LUMEN_HAS_TEXT=1)
     endif()
+    lumen_link_text_segmentation(${target})
 
     if(LIBSYSTEMD_FOUND)
         target_include_directories(${target} PRIVATE ${LIBSYSTEMD_INCLUDE_DIRS})
@@ -221,6 +243,8 @@ endfunction()
 #   wayland_client  libwayland-client          LUMEN_HAS_WAYLAND
 #   xkb             xkbcommon                  LUMEN_HAS_XKBCOMMON
 #   text            HarfBuzz, FreeType, fontconfig  LUMEN_HAS_TEXT
+#                   fribidi                         LUMEN_HAS_FRIBIDI
+#                   libunibreak                     LUMEN_HAS_UNIBREAK
 #   systemd         libsystemd (sd-bus)        LUMEN_HAS_LOGIND
 function(lumen_link_platform_parts target)
     foreach(part IN LISTS ARGN)
@@ -242,6 +266,7 @@ function(lumen_link_platform_parts target)
                 target_link_libraries(${target} PRIVATE ${HARFBUZZ_LIBRARIES})
                 target_compile_definitions(${target} PRIVATE LUMEN_HAS_TEXT=1)
             endif()
+            lumen_link_text_segmentation(${target})
         elseif(part STREQUAL "systemd")
             if(LIBSYSTEMD_FOUND)
                 target_include_directories(${target} PRIVATE ${LIBSYSTEMD_INCLUDE_DIRS})

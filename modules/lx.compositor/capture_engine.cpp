@@ -496,6 +496,27 @@ bool capture_renderer::paint_cursor_gl(unsigned framebuffer, lx::size2i size,
     return static_cast<bool>(drawn);
 }
 
+bool capture_renderer::recomposite_cpu(const capture_frame_source& src,
+                                       const lx::gfx::pixel_surface& dst, lx::color clear,
+                                       const lx::gfx::blit_command* blits, lx::point2i offset,
+                                       const lx::gfx::damage_region& region) {
+    if (src.paint.cpu)
+        return src.paint.cpu(src.paint.user, dst, clear, blits, src.blit_count, offset, region);
+    return static_cast<bool>(cpu_->composite_region(dst, clear, blits, src.blit_count, region));
+}
+
+bool capture_renderer::recomposite_gl(const capture_frame_source& src, unsigned framebuffer,
+                                      unsigned width, unsigned height, lx::color clear,
+                                      const lx::gfx::blit_command* blits, lx::point2i offset,
+                                      const lx::gfx::damage_region& region) {
+    if (src.paint.gl)
+        return src.paint.gl(src.paint.user, framebuffer, width, height, clear, blits,
+                            src.blit_count, offset, region);
+    return static_cast<bool>(
+        gl_->composite_into(framebuffer, width, height, clear, blits, src.blit_count, region, true,
+                            false));
+}
+
 bool capture_renderer::run_output(capture_job& job, const capture_frame_source& src,
                                   bool composited_now, capture_channel& out) {
     (void)composited_now;
@@ -619,9 +640,8 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
             bool ok = true;
             if (hide_pointer) {
                 sampled_textures_ = true;
-                ok = static_cast<bool>(gl_->composite_into(dst.value(), w, h, src.clear, draws(),
-                                                           src.blit_count, out_region, true,
-                                                           false));
+                ok = recomposite_gl(src, dst.value(), w, h, src.clear, draws(), {crop.x, crop.y},
+                                    out_region);
             } else if (!region.empty()) {
                 ok = static_cast<bool>(gl_capture_.blit(src.gl_framebuffer, dst.value(), sw, sh,
                                                         region, crop.x, crop.y));
@@ -647,9 +667,8 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
                     sampled_textures_ = sampled_textures_ || hide_pointer;
                     const bool drew =
                         hide_pointer
-                            ? static_cast<bool>(gl_->composite_into(off.value(), w, h, src.clear,
-                                                                    draws(), src.blit_count,
-                                                                    out_region, true, false))
+                            ? recomposite_gl(src, off.value(), w, h, src.clear, draws(),
+                                             {crop.x, crop.y}, out_region)
                             : region.empty() || static_cast<bool>(gl_capture_.blit(
                                                     src.gl_framebuffer, off.value(), sw, sh,
                                                     region, crop.x, crop.y));
@@ -674,8 +693,8 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
                 // Composited at the buffer's size: read with no crop.
                 auto off = gl_capture_.offscreen_framebuffer(job.session, w, h);
                 sampled_textures_ = true;
-                if (!off || !gl_->composite_into(off.value(), w, h, src.clear, draws(),
-                                                 src.blit_count, out_region, true, false)) {
+                if (!off || !recomposite_gl(src, off.value(), w, h, src.clear, draws(),
+                                            {crop.x, crop.y}, out_region)) {
                     fail(out, job, capture_failure::unknown);
                     return true;
                 }
@@ -734,8 +753,8 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
                 dst.format = static_cast<lx::fourcc>(opaque ? lx::pixel_format::xrgb8888
                                                             : lx::pixel_format::argb8888);
                 if (src.blits && !out_region.empty())
-                    (void)cpu_->composite_region(dst, src.clear, draws(), src.blit_count,
-                                                 out_region);
+                    (void)recomposite_cpu(src, dst, src.clear, draws(), {crop.x, crop.y},
+                                          out_region);
                 if (hw_cursor)
                     capture_blend_argb(pixels, tw, th, stride, src.cursor.pixels, src.cursor.width,
                                        src.cursor.height, src.cursor.stride_px, cursor_at.x,
@@ -1058,8 +1077,7 @@ void capture_renderer::toplevel_composited(unsigned view, const lx::gfx::damage_
                                                           job.target.offset, job.target.stride, w,
                                                           h, job.target.format, job.target.modifier);
                 ok = dst && (region.empty() ||
-                             gl_->composite_into(dst.value(), w, h, clear, src.blits,
-                                                 src.blit_count, region, true, false));
+                             recomposite_gl(src, dst.value(), w, h, clear, src.blits, {}, region));
                 if (ok && hw_cursor)
                     (void)paint_cursor_gl(dst.value(), size, src.cursor);
                 if (ok) {
@@ -1069,8 +1087,7 @@ void capture_renderer::toplevel_composited(unsigned view, const lx::gfx::damage_
             } else {
                 auto off = gl_capture_.offscreen_framebuffer(job.session, w, h);
                 ok = off && (region.empty() ||
-                             gl_->composite_into(off.value(), w, h, clear, src.blits,
-                                                 src.blit_count, region, true, false));
+                             recomposite_gl(src, off.value(), w, h, clear, src.blits, {}, region));
                 if (ok && post_ && gl_capture_.offscreen_bo(job.session)) {
                     // Read off render (see run_output).
                     c.cursor = {true, hw_cursor, hw_cursor ? src.cursor.rect : lx::rect2i{},
@@ -1120,8 +1137,7 @@ void capture_renderer::toplevel_composited(unsigned view, const lx::gfx::damage_
                     dst.format = static_cast<lx::fourcc>(opaque ? lx::pixel_format::xrgb8888
                                                                 : lx::pixel_format::argb8888);
                     if (!region.empty())
-                        (void)cpu_->composite_region(dst, clear, src.blits, src.blit_count,
-                                                     region);
+                        (void)recomposite_cpu(src, dst, clear, src.blits, {}, region);
                     if (hw_cursor)
                         capture_blend_argb(pixels, tw, th, stride, src.cursor.pixels,
                                            src.cursor.width, src.cursor.height,

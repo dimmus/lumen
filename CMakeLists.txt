@@ -120,8 +120,16 @@ lumen_embed_glsl(lx.gfx ui
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/sprite.fs.glsl"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.vs.glsl"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.fs.glsl")
-lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.foundation)
+# lx.text:raster writes glyphs into the lx.gfx:atlas (ADR-010 §4.13: tile handles only).
+lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.foundation lx.runtime lx.trace lx.gfx)
 lumen_link_platform_parts(lx.text text)
+# Bundled fonts (assets/fonts, ADR-010 §5.4), registered with fontconfig by lx.text:faces: the
+# source tree's copy, the install relative to the executable, the configured install.
+include(GNUInstallDirs)
+target_compile_definitions(lx.text PRIVATE
+    LUMEN_FONT_DIR_BUILD="${CMAKE_SOURCE_DIR}/assets/fonts"
+    LUMEN_FONT_DIR_INSTALL_RELATIVE="${CMAKE_INSTALL_DATADIR}/lumen/fonts"
+    LUMEN_FONT_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/fonts")
 lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.runtime)
 lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
@@ -438,6 +446,8 @@ install(DIRECTORY protocols/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/protocol
 # The documented configuration (every key at its default): a template to copy to
 # ~/.config/lumen/config.toml, not a layer itself (lumen-ctl config defaults prints it too).
 install(FILES deploy/lumen/config.toml DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen)
+# The bundled UI and mono fonts with their licenses (lx.text:faces finds them here).
+install(DIRECTORY assets/fonts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/fonts)
 if(LUMEN_PORTAL_BUILT)
     install(TARGETS xdg-desktop-portal-lumen RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
     install(FILES deploy/portal/lumen.portal
@@ -575,7 +585,8 @@ if(LUMEN_BUILD_TESTS)
         lumen_link_platform(test_ui_golden)
         target_include_directories(test_ui_golden PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
         target_compile_definitions(test_ui_golden PRIVATE
-            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui")
+            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui"
+            LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
         add_test(NAME test_ui_golden COMMAND test_ui_golden)
         # The Vulkan cases again under VK_LAYER_KHRONOS_validation, which must log no error.
         find_file(LUMEN_VK_VALIDATION_LAYER VkLayer_khronos_validation.json
@@ -810,6 +821,22 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_ui_composite PRIVATE tests)
     add_test(NAME test_ui_composite COMMAND test_ui_composite)
 
+    # ADR-010 §4.11, Phase 2: title bars as atlas glyphs on the CPU, GL and Vulkan compositors
+    # (references in tests/golden/compositor), and the Vulkan cases under validation.
+    if(LIBPNG_FOUND)
+        add_executable(test_deco_titles tests/test_deco_titles.cpp)
+        target_link_libraries(test_deco_titles PRIVATE lx.compositor ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_deco_titles)
+        lumen_link_platform(test_deco_titles)
+        target_include_directories(test_deco_titles PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_deco_titles PRIVATE
+            LUMEN_DECO_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/compositor")
+        add_test(NAME test_deco_titles COMMAND test_deco_titles)
+        if(LUMEN_VK_VALIDATION_LAYER)
+            add_test(NAME test_deco_titles_vk_validation COMMAND test_deco_titles --filter=vk_)
+        endif()
+    endif()
+
     add_executable(test_layer_arrange tests/test_layer_arrange.cpp)
     target_link_libraries(test_layer_arrange PRIVATE lx.compositor)
     lumen_apply_module_properties(test_layer_arrange)
@@ -940,7 +967,24 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_text_raster)
     lumen_link_platform(test_text_raster)
     target_include_directories(test_text_raster PRIVATE tests)
+    target_compile_definitions(test_text_raster PRIVATE
+        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
     add_test(NAME test_text_raster COMMAND test_text_raster)
+
+    add_executable(test_text_lines tests/test_text_lines.cpp)
+    target_link_libraries(test_text_lines PRIVATE lx.text)
+    lumen_apply_module_properties(test_text_lines)
+    lumen_link_platform(test_text_lines)
+    target_include_directories(test_text_lines PRIVATE tests)
+    add_test(NAME test_text_lines COMMAND test_text_lines)
+
+    # lx.ui:text_node shaping large text on the worker affinity (ADR-010 §4.6).
+    add_executable(test_text_node tests/test_text_node.cpp)
+    target_link_libraries(test_text_node PRIVATE lx.ui lx.scene lx.gfx lx.runtime)
+    lumen_apply_module_properties(test_text_node)
+    lumen_link_platform(test_text_node)
+    target_include_directories(test_text_node PRIVATE tests)
+    add_test(NAME test_text_node COMMAND test_text_node)
 
     add_executable(test_protocol_bind tests/test_protocol_bind.cpp)
     target_link_libraries(test_protocol_bind PRIVATE lx.compositor)
@@ -1208,6 +1252,13 @@ if(LUMEN_BUILD_TESTS)
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    if(TARGET test_deco_titles)
+        set_tests_properties(test_deco_titles PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+        if(TEST test_deco_titles_vk_validation)
+            set_tests_properties(test_deco_titles_vk_validation PROPERTIES ENVIRONMENT
+                "${LUMEN_SANITIZER_ENV_VULKAN_ICD};LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
+        endif()
+    endif()
 endif()
 
 # ── Fuzzers ──────────────────────────────────────────────────────────────────

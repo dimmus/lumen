@@ -16,6 +16,7 @@ import :toplevel;
 import :surface_tree;
 import :xcursor;
 import :cursor;
+import :ui_composite;
 
 export namespace lx::compositor {
 
@@ -37,9 +38,9 @@ inline constexpr int k_deco_title_padding = 10;
 /// (0x4000'0000 upward) and apart from the cursor's id.
 inline constexpr unsigned k_deco_atlas_texture_id = 0x7FFF'FE00u;
 inline constexpr unsigned k_deco_atlas_size = 64;
-/// Per-window title textures are allocated upward from here, never reused: a dated
-/// retirement of an id must not land on a later texture with the same id.
-inline constexpr unsigned k_deco_title_texture_base = 0x7F00'0000u;
+/// The close glyph's edge at scale 1 (its swatch in the decoration atlas, the tile in the
+/// compositor's text atlas).
+inline constexpr int k_deco_close_glyph = 10;
 
 /// Visible frame around the client's window geometry.
 struct frame_extents {
@@ -116,6 +117,125 @@ inline constexpr lx::rect2i circle_pressed{24, 24, 20, 20};
 /// close glyph (analytic anti-aliasing, 1.5 px strokes) and the button circles.
 void build_deco_atlas(std::uint32_t* out);
 
+/// The close glyph's coverage at `scale` (`size` = round(10 × scale) texels square, R8, `size`
+/// bytes per row): the "×" of `build_deco_atlas` — two diagonals, 1.5 px strokes, analytic
+/// anti-aliasing — drawn for that scale rather than resampled. At scale 1 its bytes are the
+/// alpha of the atlas swatch.
+void build_close_coverage(double scale, int size, std::uint8_t* out);
+
+// ── Title text (ADR-010 §4.11) ─────────────────────────────────────────────
+
+/// Distinct output scales a window's title is kept rasterised for at once; on an output of
+/// another scale the largest is resampled.
+inline constexpr unsigned k_title_scales = 4;
+/// Distinct scales the close glyph is kept for.
+inline constexpr unsigned k_close_glyph_scales = 8;
+
+/// One glyph of a rasterised title: its tile and its box relative to the text's origin (the
+/// pen's start on the baseline), device pixels at the run's scale.
+struct title_glyph {
+    gfx::atlas_tile_id tile{};
+    std::int32_t x = 0;
+    /// The box's top from the baseline, down positive (above the baseline: negative).
+    std::int32_t y = 0;
+    std::uint16_t width = 0;
+    std::uint16_t height = 0;
+    /// An RGBA8 tile (a colour glyph): drawn as a `poly_sprite`.
+    bool color = false;
+};
+
+/// A title laid out and rasterised at one scale, drawn 1:1 on outputs of that scale.
+struct title_run {
+    /// 0: unused.
+    double scale = 0.0;
+    /// What is drawn — the title's fit (ellipsis included) and the not-responding suffix —
+    /// in device pixels; 0: nothing.
+    int width = 0;
+    int ascent = 0;
+    int descent = 0;
+    /// The title's fit, so a resize that cuts where it did lays nothing out.
+    unsigned glyph_end = 0;
+    bool ellipsized = false;
+    bool not_responding = false;
+    /// Grown to the longest title seen at this scale, then reused: a title change allocates
+    /// at most once; a frame never does.
+    std::vector<title_glyph> glyphs{};
+};
+
+/// A window's title at the scales of the outputs it is on.
+struct title_text {
+    title_run runs[k_title_scales]{};
+    /// The run drawn on an output of `scale`: the one rasterised for it, else the largest
+    /// (resampled); null when there is none.
+    [[nodiscard]] const title_run* for_scale(double scale) const;
+};
+
+/// The close button's "×" at one scale: a tile of `build_close_coverage`.
+struct close_glyph {
+    double scale = 0.0;
+    gfx::atlas_tile_id tile{};
+    int size = 0;
+};
+
+/// Server-side frames' text in the compositor's atlas (`chrome_atlas`): titles shaped and
+/// fitted by `lx.text` (the single-line API: one face, the ellipsis and the not-responding
+/// rule of the CPU-rasterised titles it replaces), their glyphs rasterised by an
+/// `lx.text::glyph_cache` over the chrome atlas — 4 subpixel variants, light hinting below
+/// scale 1.5 — and the close glyph. UI affinity. Rasterising takes the atlas's mutex, and only
+/// on a miss; a frame's emission looks tiles up without it.
+class chrome_text {
+public:
+    explicit chrome_text(chrome_atlas& atlas);
+    ~chrome_text();
+    chrome_text(const chrome_text&) = delete;
+    chrome_text& operator=(const chrome_text&) = delete;
+
+    [[nodiscard]] chrome_atlas& atlas() { return *atlas_; }
+    [[nodiscard]] text::glyph_cache& glyphs() { return *glyphs_; }
+    /// The title font at scale 1 (default: "Sans", bold, 10 pt — the CPU titles' font).
+    void set_font(text::font_desc font) { font_ = font; }
+    [[nodiscard]] text::font_desc font() const { return font_; }
+
+    /// Lays `title` out in `room_logical` logical pixels at `scale` into `run`: shaped at the
+    /// font's size × scale, ellipsized to the room (with `not_responding`, " (Not Responding)"
+    /// always shown and the title fitted to what it leaves, as KWin does), every glyph placed
+    /// on a quarter pixel and rasterised into the atlas if it is not there. `changed`: the text
+    /// is new — otherwise a run whose fit is unchanged is left as it is. True when the run's
+    /// pixels changed. Errors: lx.text cannot shape (no face, no HarfBuzz).
+    [[nodiscard]] lx::result<bool> layout_title(title_run& run, const char* title,
+                                                bool not_responding, int room_logical,
+                                                double scale, bool changed);
+    /// The close glyph at `scale`, rasterised on first use; null when the atlas refuses it.
+    const close_glyph* close(double scale);
+    /// The close glyph at `scale` if it is rasterised (emission: no raster).
+    [[nodiscard]] const close_glyph* find_close(double scale) const;
+
+    /// An emitter found a tile gone (the atlas evicted it): the manager lays the titles out
+    /// again at its next tick.
+    void note_stale() { stale_ = true; }
+    [[nodiscard]] bool take_stale() {
+        const bool s = stale_;
+        stale_ = false;
+        return s;
+    }
+
+private:
+    [[nodiscard]] bool add_glyph(title_run& run, text::face_id face, std::int32_t size,
+                                 text::glyph_hinting hinting, std::uint32_t glyph,
+                                 std::int32_t pen_x, std::int32_t x_off, std::int32_t y_off);
+
+    chrome_atlas* atlas_ = nullptr;
+    std::unique_ptr<text::glyph_cache> glyphs_{};
+    text::font_desc font_{"Sans", 10.f, text::weight::bold, text::style::normal};
+    /// Scratch, allocated once: the shaped title, the suffix, the ellipsis.
+    std::unique_ptr<text::shaped_line> line_{};
+    std::unique_ptr<text::shaped_line> suffix_{};
+    std::unique_ptr<text::shaped_line> ellipsis_{};
+    close_glyph close_[k_close_glyph_scales]{};
+    unsigned next_close_ = 0;
+    bool stale_ = false;
+};
+
 // ── Scene node ─────────────────────────────────────────────────────────────
 
 enum class deco_button : unsigned char { normal, hover, pressed };
@@ -123,10 +243,15 @@ enum class deco_button : unsigned char { normal, hover, pressed };
 /// The frame of one window: the underlay of its tree container, so it restacks with the
 /// window and paints below its surfaces. The four border fills and the title fill are UI
 /// primitives (ADR-010 §4.11: radius-0 solid quads, the palette's colours, the projected
-/// rects the swatch blits had); the title text and the close button (circle when hovered or
-/// pressed, glyph) stay atlas blits until Phase 2 text. A dimmed frame's fills carry the dim
-/// already applied, the way `cpu_compositor` tints an encoded byte (`(c · 166) >> 8` for
-/// 0.65) — the pixels the tinted swatch blit had on the CPU backend.
+/// rects the swatch blits had); the title text and the close glyph are `mono_sprite`s from the
+/// compositor's text atlas (`text`), drawn 1:1 on an output whose scale the title was
+/// rasterised for (the manager keeps one run per output scale the frame is on) and resampled
+/// from the largest run elsewhere; the button's hover / pressed circle stays a blit of the
+/// decoration atlas. A dimmed frame's fills and glyphs carry the dim already applied, the way
+/// `cpu_compositor` tints an encoded byte (`(c · 166) >> 8` for 0.65) — the pixels the tinted
+/// swatch blit had on the CPU backend, and one colour rule on every backend. Without `text`
+/// (a node built by hand) the close glyph is the decoration atlas's blit and no title is
+/// drawn.
 class frame_node final : public scene::scene_node {
 public:
     ~frame_node() override;
@@ -141,16 +266,11 @@ public:
     bool shown = false;
     bool active = false;
     deco_button button = deco_button::normal;
-    /// Title textures (active text colour, inactive), padded by `title_pad` on each side.
-    /// Rasterized at the output scale (`title_scale`): size, pad and text width are output
-    /// pixels, drawn 1:1 — text is never resampled.
-    unsigned title_texture[2]{};
-    lx::size2i title_size{};
-    int title_pad = 0;
-    /// Width of the drawn text (the fit, ellipsis included), for centring.
-    int title_text_width = 0;
-    double title_scale = 1.0;
-    bool title_ready = false;
+    /// The window's title, laid out per output scale (the manager's); null: no title.
+    const title_text* title = nullptr;
+    /// The compositor's text atlas the title and close glyphs are tiles of; null: no glyph
+    /// sprites (the close glyph falls back to the decoration atlas's blit).
+    chrome_text* text = nullptr;
     /// The client stopped answering pings: the frame is drawn through the same grey tint
     /// as the window's surfaces.
     bool dimmed = false;
@@ -160,17 +280,22 @@ public:
 
 // ── Manager ────────────────────────────────────────────────────────────────
 
-/// Server-side frames. UI affinity. One slot per decorated toplevel: the frame node, its
-/// title textures and the title's fit, re-rasterized only when the title changes or the
-/// ellipsis cut moves with the width (a focus change swaps texture ids; a move costs no
-/// texture work at all). Damage is the frame's strips (title bar, borders), never the
-/// client area, which the window's own nodes already account for.
+/// Server-side frames. UI affinity. One slot per decorated toplevel: the frame node and its
+/// title laid out per output scale, re-laid out only when the title changes, the ellipsis cut
+/// moves with the width or the window's scales change (a focus change only recolours the
+/// sprites; a move costs no text work at all). Glyphs go to the compositor's atlas through
+/// `chrome_text` (`bind_chrome`). Damage is the frame's strips (title bar, borders), never
+/// the client area, which the window's own nodes already account for.
 class decoration_manager {
 public:
     static constexpr unsigned k_max = toplevel_manager::k_max;
 
     void bind(surface_tree& tree, scene::scene_graph& scene);
     void set_texture_ops(compositor_texture_ops ops) { ops_ = ops; }
+    /// The compositor's text atlas the titles and close glyphs are rasterised into (the render
+    /// thread's UI renderer draws from it). Without one no title is drawn.
+    void bind_chrome(chrome_atlas* atlas);
+    [[nodiscard]] chrome_text* text() { return text_.get(); }
 
     /// Brings the frame of `rec` in line with it: shown iff mapped with the server-side mode
     /// applied, at its geometry, with the maximized extents when maximized. Damages old and
@@ -194,13 +319,14 @@ public:
     /// frame is shown, rasterizes changed titles.
     void on_tick();
     /// The scale titles of new frames are rasterized at (text at 10 pt × scale, in output
-    /// pixels). A change re-rasterizes every title at the next `on_tick`.
+    /// pixels) until their outputs are known.
     void set_scale(double scale);
-    /// The scale window `id`'s title is rasterized at: the largest scale among the outputs
-    /// its frame is on (`preferred_buffer_scale`'s rule), so it is sharp on every one of
-    /// them and resampled down on the others. A change re-rasterizes it at the next
-    /// `on_tick` (at most once a tick however often it moves across outputs).
+    /// Window `id`'s title at one scale (an output of another is resampled from it).
     void set_window_scale(lx::toplevel_id id, double scale);
+    /// The scales of the outputs window `id`'s frame is on: its title is laid out at each
+    /// (the first `k_title_scales` distinct ones), drawn 1:1 on every one of them. A change
+    /// lays it out again at the next `on_tick` (at most once a tick however often it moves).
+    void set_window_scales(lx::toplevel_id id, std::span<const double> scales);
 
     [[nodiscard]] bool shown(lx::toplevel_id id) const;
     [[nodiscard]] const frame_node* node(lx::toplevel_id id) const;
@@ -218,12 +344,11 @@ private:
         bool title_changed = true;
         /// The width changed: rasterize only if the ellipsis cut moved.
         bool refit = true;
-        unsigned glyph_end = 0;
-        bool ellipsized = false;
-        bool textures_staged = false;
         bool not_responding = false;
-        /// The scale its title is rasterized at.
-        double scale = 1.0;
+        /// The scales its title is laid out at (`scale_count` of them).
+        double scales[k_title_scales]{1.0};
+        unsigned scale_count = 1;
+        title_text text{};
     };
 
     /// `slot*`, or `const slot*` on a const manager.
@@ -250,20 +375,11 @@ private:
     /// 256-byte title, and the whole table was resident from start-up.
     lx::sparse_slots<slot, k_max> slots_{};
     lx::toplevel_id active_{};
-    unsigned next_texture_id_ = k_deco_title_texture_base;
     bool atlas_ready_ = false;
     bool any_dirty_ = false;
     bool warned_no_text_ = false;
-    /// Scratch, reused: the shaped title and the raster buffer (grown, never shrunk).
-    lx::text::shaped_line line_{};
-    /// " (Not Responding)", shaped once on first use.
-    lx::text::shaped_line suffix_line_{};
-    bool suffix_shaped_ = false;
-    /// The scale `suffix_line_` was shaped at.
-    double suffix_scale_ = 0.0;
-    std::vector<std::uint32_t> raster_{};
+    std::unique_ptr<chrome_text> text_{};
     double scale_ = 1.0;
-    [[nodiscard]] lx::text::font_desc title_font(double scale) const;
 };
 
 } // namespace lx::compositor
@@ -309,6 +425,18 @@ constexpr const char* k_deco_category = "compositor.deco";
     return std::sqrt(cx * cx + cy * cy);
 }
 
+/// The close glyph's coverage at pixel (x, y) of its box at `scale`: two diagonals from
+/// (1.5, 1.5) to (8.5, 8.5) of a 10 px box, a 1.5 px stroke, all scaled; a 1 px linear ramp at
+/// the edge (half stroke + half pixel − distance). Unclamped.
+[[nodiscard]] double close_coverage(double scale, int x, int y) {
+    const double px = x + 0.5, py = y + 0.5;
+    const double lo = 1.5 * scale, hi = 8.5 * scale;
+    const double d1 = segment_distance(px, py, lo, lo, hi, hi);
+    const double d2 = segment_distance(px, py, hi, lo, lo, hi);
+    const double d = d1 < d2 ? d1 : d2;
+    return 0.75 * scale + 0.5 - d;
+}
+
 // Palette (sRGB).
 constexpr std::uint32_t k_title_active = 0x303033u;
 constexpr std::uint32_t k_title_inactive = 0x48484Cu;
@@ -316,13 +444,9 @@ constexpr std::uint32_t k_border_active = 0x1B1B1Du;
 constexpr std::uint32_t k_border_inactive = 0x2C2C30u;
 constexpr std::uint32_t k_button_hover = 0xE0443Eu;
 constexpr std::uint32_t k_button_pressed = 0xB8322Du;
+/// The close glyph's colours, and the title text's (active, inactive).
 constexpr std::uint32_t k_glyph_light = 0xF2F2F2u;
 constexpr std::uint32_t k_glyph_dim = 0xA8A8ACu;
-constexpr lx::text::raster_color k_text_active{0xF2, 0xF2, 0xF2, 0xFF};
-constexpr lx::text::raster_color k_text_inactive{0xA8, 0xA8, 0xAC, 0xFF};
-/// One font per process: lx.text caches a single face (R12).
-constexpr lx::text::font_desc k_title_font{"Sans", 10.f, lx::text::weight::bold,
-                                           lx::text::style::normal};
 
 /// Appended to the title of a window whose client does not answer pings (KWin's wording).
 constexpr const char* k_not_responding_suffix = " (Not Responding)";
@@ -517,15 +641,9 @@ void lx::compositor::build_deco_atlas(std::uint32_t* out) {
     // the stroke's centre line (a 1 px linear ramp at the edge).
     const auto glyph = [&](lx::rect2i r, std::uint32_t rgb) {
         for (int y = 0; y < r.height; ++y)
-            for (int x = 0; x < r.width; ++x) {
-                const double px = x + 0.5, py = y + 0.5;
-                const double d1 = segment_distance(px, py, 1.5, 1.5, 8.5, 8.5);
-                const double d2 = segment_distance(px, py, 8.5, 1.5, 1.5, 8.5);
-                const double d = d1 < d2 ? d1 : d2;
-                const double cov = 0.75 + 0.5 - d; // half stroke + half pixel - distance
+            for (int x = 0; x < r.width; ++x)
                 out[static_cast<unsigned>(r.y + y) * n + static_cast<unsigned>(r.x + x)] =
-                    premul(rgb, cov);
-            }
+                    premul(rgb, close_coverage(1.0, x, y));
     };
     glyph(deco_atlas::close_light, k_glyph_light);
     glyph(deco_atlas::close_dim, k_glyph_dim);
@@ -542,6 +660,213 @@ void lx::compositor::build_deco_atlas(std::uint32_t* out) {
     };
     circle(deco_atlas::circle_hover, k_button_hover);
     circle(deco_atlas::circle_pressed, k_button_pressed);
+}
+
+void lx::compositor::build_close_coverage(double scale, int size, std::uint8_t* out) {
+    for (int y = 0; y < size; ++y)
+        for (int x = 0; x < size; ++x) {
+            double cov = close_coverage(scale, x, y);
+            cov = cov < 0.0 ? 0.0 : (cov > 1.0 ? 1.0 : cov);
+            // The atlas swatch's alpha byte (`premul`'s rounding).
+            out[static_cast<std::size_t>(y) * static_cast<std::size_t>(size) +
+                static_cast<std::size_t>(x)] = static_cast<std::uint8_t>(255.0 * cov + 0.5);
+        }
+}
+
+// ── Title text ─────────────────────────────────────────────────────────────
+
+const lx::compositor::title_run* lx::compositor::title_text::for_scale(double scale) const {
+    const title_run* largest = nullptr;
+    for (const title_run& r : runs) {
+        if (!(r.scale > 0.0))
+            continue;
+        if (r.scale == scale)
+            return &r;
+        if (!largest || r.scale > largest->scale)
+            largest = &r;
+    }
+    return largest;
+}
+
+lx::compositor::chrome_text::chrome_text(chrome_atlas& atlas) : atlas_{&atlas} {
+    text::glyph_cache_config config{};
+    // Titles touch a few hundred glyphs per scale; the tile ids the runs keep must not be
+    // replaced under them, so the table is far from full.
+    config.entries = 4096;
+    config.max_glyph_px = 128;
+    glyphs_ = std::make_unique<text::glyph_cache>(atlas.atlas(), config);
+    line_ = std::make_unique<text::shaped_line>();
+    suffix_ = std::make_unique<text::shaped_line>();
+    ellipsis_ = std::make_unique<text::shaped_line>();
+}
+
+lx::compositor::chrome_text::~chrome_text() = default;
+
+const lx::compositor::close_glyph* lx::compositor::chrome_text::find_close(double scale) const {
+    for (const close_glyph& c : close_)
+        if (c.scale == scale && c.tile.valid())
+            return &c;
+    return nullptr;
+}
+
+const lx::compositor::close_glyph* lx::compositor::chrome_text::close(double scale) {
+    if (!(scale > 0.0))
+        return nullptr;
+    gfx::atlas_tile tile{};
+    for (close_glyph& c : close_)
+        if (c.scale == scale && c.tile.valid()) {
+            if (atlas_->atlas().lookup(c.tile, tile))
+                return &c;
+            c = {}; // evicted: rasterised again below
+        }
+    const int size = std::max(1, static_cast<int>(std::lround(k_deco_close_glyph * scale)));
+    if (size > static_cast<int>(text::k_glyph_max_px))
+        return nullptr;
+    std::uint8_t coverage[text::k_glyph_max_px * text::k_glyph_max_px];
+    build_close_coverage(scale, size, coverage);
+    lx::result<gfx::atlas_tile_id> id = lx::invalid_argument("chrome_text: no tile");
+    {
+        const std::lock_guard<std::mutex> lock{atlas_->mutex()};
+        id = atlas_->atlas().insert(gfx::atlas_format::r8, static_cast<unsigned>(size),
+                                    static_cast<unsigned>(size),
+                                    {coverage, static_cast<std::size_t>(size) * size},
+                                    static_cast<unsigned>(size));
+    }
+    if (!id)
+        return nullptr;
+    // A free entry, else round robin (the replaced tile ages out of the atlas on its own).
+    close_glyph* slot = nullptr;
+    for (close_glyph& c : close_)
+        if (!c.tile.valid() && !slot)
+            slot = &c;
+    if (!slot) {
+        slot = &close_[next_close_];
+        next_close_ = (next_close_ + 1u) % k_close_glyph_scales;
+    }
+    *slot = {scale, id.value(), size};
+    return slot;
+}
+
+bool lx::compositor::chrome_text::add_glyph(title_run& run, text::face_id face, std::int32_t size,
+                                            text::glyph_hinting hinting, std::uint32_t glyph,
+                                            std::int32_t pen_x, std::int32_t x_off,
+                                            std::int32_t y_off) {
+    // The pen on a quarter pixel (its variant rasterised), the baseline on a whole one.
+    const text::glyph_pen_pos pos = text::glyph_pen(pen_x + x_off, y_off);
+    const text::glyph_key key{face, size, glyph, pos.variant, hinting};
+    const text::glyph_entry* e = glyphs_->find(key);
+    if (!e) {
+        // A miss rasterises into the atlas's pages: the render thread is not reading them.
+        const std::lock_guard<std::mutex> lock{atlas_->mutex()};
+        auto got = glyphs_->get(text::face_cache::shared(), key);
+        if (!got)
+            return false;
+        e = got.value();
+    }
+    if (!e || e->empty())
+        return true;
+    title_glyph g{};
+    g.tile = e->tile;
+    g.x = pos.x + e->left;
+    g.y = -pos.y - e->top;
+    g.width = e->width;
+    g.height = e->height;
+    g.color = e->color;
+    run.glyphs.push_back(g); // capacity kept: allocates only for a title longer than any before
+    return true;
+}
+
+lx::result<bool> lx::compositor::chrome_text::layout_title(title_run& run, const char* title,
+                                                          bool not_responding, int room_logical,
+                                                          double scale, bool changed) {
+    static constexpr const char* k_suffix = " (Not Responding)";
+    static constexpr const char* k_ellipsis = "\xE2\x80\xA6";
+    const auto clear = [&] {
+        const bool had = run.width > 0;
+        run.scale = scale;
+        run.width = 0;
+        run.glyph_end = 0;
+        run.ellipsized = false;
+        run.not_responding = not_responding;
+        run.glyphs.clear();
+        return had;
+    };
+    text::font_desc f = font_;
+    f.size_pt = static_cast<float>(f.size_pt * scale);
+    const int room = static_cast<int>(std::lround(room_logical * scale));
+    const bool has_title = title && title[0] != '\0';
+    // A not-responding window shows the suffix whatever the title's length: the title part
+    // gets what room the suffix leaves (KWin).
+    int suffix_w = 0;
+    if (not_responding) {
+        if (auto r = text::shape_line(k_suffix, f, *suffix_); !r)
+            return r.get_error();
+        suffix_w = suffix_->width_px;
+    }
+    if (room <= 0 || (!has_title && !not_responding))
+        return clear();
+    text::line_fit fit{};
+    if (has_title) {
+        if (auto r = text::shape_line(title, f, *line_); !r)
+            return r.get_error();
+        fit = text::fit_line(*line_, room - suffix_w);
+    }
+    // The suffix alone when the title gets no room; then it may be ellipsized itself.
+    text::line_fit suffix_fit{};
+    if (not_responding)
+        suffix_fit = text::fit_line(*suffix_, fit.width_px > 0 ? suffix_w : room);
+    const int text_w = fit.width_px + suffix_fit.width_px;
+    if (text_w <= 0)
+        return clear();
+    // A resize that leaves the cut where it was costs nothing: same glyphs, same places.
+    if (!changed && run.scale == scale && run.width > 0 && run.not_responding == not_responding &&
+        fit.glyph_end == run.glyph_end && fit.ellipsized == run.ellipsized && !not_responding)
+        return false;
+
+    const text::face_id face = text::face_cache::shared().resolve(f);
+    if (!face.valid())
+        return lx::make_error(lx::io_err::not_found, "no title font face resolved");
+    const std::int32_t size = text::size_26_6_from_pt(f.size_pt);
+    const text::glyph_hinting hinting =
+        text::effective_hinting(text::glyph_hinting::light, static_cast<float>(scale));
+    if (fit.ellipsized || suffix_fit.ellipsized)
+        if (auto r = text::shape_line(k_ellipsis, f, *ellipsis_); !r)
+            return r.get_error();
+    run.glyphs.clear();
+    bool ok = true;
+    // `render_line`'s placement: the kept prefix glyph by glyph, then "…" at the prefix's end
+    // rounded up to a pixel (where `fit_line` measured it).
+    const auto line = [&](const text::shaped_line& l, const text::line_fit& lf, std::int32_t pen) {
+        const unsigned end = lf.glyph_end < l.count ? lf.glyph_end : l.count;
+        for (unsigned i = 0; i < end; ++i) {
+            ok = add_glyph(run, face, size, hinting, l.glyph[i], pen, l.x_off[i], l.y_off[i]) && ok;
+            pen += l.x_adv[i];
+        }
+        if (lf.ellipsized) {
+            pen = ((pen + 63) / 64) * 64;
+            for (unsigned i = 0; i < ellipsis_->count; ++i) {
+                ok = add_glyph(run, face, size, hinting, ellipsis_->glyph[i], pen,
+                               ellipsis_->x_off[i], ellipsis_->y_off[i]) &&
+                     ok;
+                pen += ellipsis_->x_adv[i];
+            }
+        }
+    };
+    if (fit.width_px > 0)
+        line(*line_, fit, 0);
+    if (suffix_fit.width_px > 0)
+        line(*suffix_, suffix_fit, fit.width_px * 64);
+    const text::shaped_line& metrics = fit.width_px > 0 ? *line_ : *suffix_;
+    run.scale = scale;
+    run.width = text_w;
+    run.ascent = metrics.ascent_px;
+    run.descent = metrics.descent_px;
+    run.glyph_end = fit.glyph_end;
+    run.ellipsized = fit.ellipsized;
+    run.not_responding = not_responding;
+    if (!ok)
+        return lx::invalid_argument("chrome_text: a title glyph could not be rasterised");
+    return true;
 }
 
 // ── frame_node ─────────────────────────────────────────────────────────────
@@ -605,28 +930,97 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
 
     const lx::rect2i title = title_rect(g);
     push_fill(title, active ? k_title_active : k_title_inactive);
+    const double vs = ctx.projection.scale > 0.0 ? ctx.projection.scale : 1.0;
+    const lx::rect2i bar = project(title);
 
-    if (title_ready && title_size.width > 0 && title_size.height > 0) {
-        // Placed in output pixels: the texture is rasterized at the window's scale (the
-        // largest among its outputs) and drawn 1:1 on an output of that scale, resampled
-        // down on the others. Centred in the room left of the close button, within the
-        // projected bar.
-        const double ts = title_scale > 0.0 ? title_scale : 1.0;
-        const double vs = ctx.projection.scale > 0.0 ? ctx.projection.scale : 1.0;
-        const double k = vs / ts;
-        const lx::rect2i bar = project(title);
+    // A glyph sprite over `box` (output pixels, fractional when resampled) from tile `id`,
+    // clipped to `clip`, at `order`. False when the tile is gone (the atlas evicted it).
+    const auto push_glyph = [&](gfx::atlas_tile_id id, bool color, const float box[4],
+                                lx::rect2i clip, gfx::packed_rgba rgba, std::uint32_t order) {
+        gfx::atlas_tile tile{};
+        if (!text->atlas().atlas().use(id, tile))
+            return false;
+        const int x0 = static_cast<int>(std::floor(box[0]));
+        const int y0 = static_cast<int>(std::floor(box[1]));
+        const int x1 = static_cast<int>(std::ceil(box[0] + box[2]));
+        const int y1 = static_cast<int>(std::ceil(box[1] + box[3]));
+        const int vx0 = std::max(x0, clip.x);
+        const int vy0 = std::max(y0, clip.y);
+        const int vx1 = std::min(x1, clip.x + clip.width);
+        const int vy1 = std::min(y1, clip.y + clip.height);
+        if (vx1 <= vx0 || vy1 <= vy0)
+            return true;
+        gfx::sprite_instance sp{};
+        for (unsigned i = 0; i < 4; ++i)
+            sp.bounds[i] = box[i];
+        sp.clip[0] = static_cast<float>(clip.x);
+        sp.clip[1] = static_cast<float>(clip.y);
+        sp.clip[2] = static_cast<float>(clip.width);
+        sp.clip[3] = static_cast<float>(clip.height);
+        const gfx::sprite_uv uv = tile.uv();
+        sp.uv[0] = uv.u0;
+        sp.uv[1] = uv.v0;
+        sp.uv[2] = uv.u1;
+        sp.uv[3] = uv.v1;
+        sp.page = tile.page;
+        sp.color[0] = rgba.r;
+        sp.color[1] = rgba.g;
+        sp.color[2] = rgba.b;
+        sp.color[3] = rgba.a;
+        if (!color) {
+            sp.params[0] = 0x3C00u; // f16 1: the identity rotation (cos, sin, −sin, cos)
+            sp.params[3] = 0x3C00u;
+        }
+        out.push_sprite(color ? gfx::primitive_kind::poly_sprite : gfx::primitive_kind::mono_sprite,
+                        tile.page, sp, {vx0, vy0, vx1 - vx0, vy1 - vy0}, order);
+        return true;
+    };
+
+    const title_run* run = this->title && text ? this->title->for_scale(vs) : nullptr;
+    if (run && run->width > 0) {
+        // Placed in output pixels: the run rasterised for this output's scale is drawn 1:1
+        // (k = 1); a run of another scale is resampled. Centred in the room left of the close
+        // button, within the projected bar, the line box centred vertically — where the CPU
+        // title textures were.
+        const double k = vs / run->scale;
         const int room = static_cast<int>(std::lround(title_text_room(g.width) * vs));
-        const int text_w = static_cast<int>(std::lround(title_text_width * k));
-        const int w = static_cast<int>(std::lround(title_size.width * k));
-        const int h = static_cast<int>(std::lround(title_size.height * k));
-        const int pad = static_cast<int>(std::lround(title_pad * k));
+        const int text_w = static_cast<int>(std::lround(run->width * k));
+        const int h = static_cast<int>(std::lround((run->ascent + run->descent) * k));
         const int x0 = bar.x + static_cast<int>(std::lround(k_deco_title_padding * vs));
         const int x = x0 + (room > text_w ? (room - text_w) / 2 : 0);
         const int y = bar.y + (bar.height - h) / 2;
-        ::push_draw(out, title_texture[active ? 0 : 1], {0, 0, title_size.width, title_size.height},
-                    {x - pad, y, w, h},
-                    project({title.x, title.y, g.width - k_deco_title_height, k_deco_title_height}),
-                    lx::blend_mode::premultiplied, tint, k != 1.0);
+        const int baseline = y + static_cast<int>(std::lround(run->ascent * k));
+        const lx::rect2i clip =
+            project({title.x, title.y, g.width - k_deco_title_height, k_deco_title_height});
+        const lx::rect2i span{std::max(x, clip.x), y, std::min(text_w, clip.width), h};
+        if (clip.width > 0 && span.width > 0 && span.height > 0) {
+            // One order for the run: its glyphs do not overlap anything of the frame's above
+            // them, and the batch stays one draw per page.
+            const std::uint32_t order = out.orders().assign(span);
+            const gfx::packed_rgba fg = gfx::premultiplied_half(
+                deco_fill_color(active ? k_glyph_light : k_glyph_dim, dimmed));
+            const gfx::packed_rgba white = gfx::premultiplied_half(
+                deco_fill_color(0xFFFFFFu, dimmed));
+            bool stale = false;
+            for (const title_glyph& gl : run->glyphs) {
+                float box[4];
+                if (k == 1.0) {
+                    box[0] = static_cast<float>(x + gl.x);
+                    box[1] = static_cast<float>(baseline + gl.y);
+                    box[2] = static_cast<float>(gl.width);
+                    box[3] = static_cast<float>(gl.height);
+                } else {
+                    box[0] = static_cast<float>(x + gl.x * k);
+                    box[1] = static_cast<float>(baseline + gl.y * k);
+                    box[2] = static_cast<float>(gl.width * k);
+                    box[3] = static_cast<float>(gl.height * k);
+                }
+                if (!push_glyph(gl.tile, gl.color, box, clip, gl.color ? white : fg, order))
+                    stale = true;
+            }
+            if (stale)
+                text->note_stale();
+        }
     }
 
     const lx::rect2i close = close_rect(g);
@@ -638,8 +1032,24 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
                    c.width, c.height},
                   title, lx::blend_mode::premultiplied, tint);
     }
-    const lx::rect2i glyph = button != deco_button::normal || active ? deco_atlas::close_light
-                                                                     : deco_atlas::close_dim;
+    const bool light = button != deco_button::normal || active;
+    if (const close_glyph* cg = text ? text->find_close(vs) : nullptr) {
+        // The glyph rasterised for this scale, centred in the projected button.
+        const lx::rect2i cr = project(close);
+        const float box[4] = {static_cast<float>(cr.x + (cr.width - cg->size) / 2),
+                              static_cast<float>(cr.y + (cr.height - cg->size) / 2),
+                              static_cast<float>(cg->size), static_cast<float>(cg->size)};
+        const lx::rect2i at{static_cast<int>(box[0]), static_cast<int>(box[1]), cg->size, cg->size};
+        if (!push_glyph(cg->tile, false, box, bar,
+                        gfx::premultiplied_half(
+                            deco_fill_color(light ? k_glyph_light : k_glyph_dim, dimmed)),
+                        out.orders().assign(at)))
+            text->note_stale();
+        return;
+    }
+    // Not rasterised for this scale (yet: the manager does at its next tick), or no text
+    // atlas: the decoration atlas's glyph.
+    const lx::rect2i glyph = light ? deco_atlas::close_light : deco_atlas::close_dim;
     push_draw(out, atlas, glyph,
               {close.x + (close.width - glyph.width) / 2,
                close.y + (close.height - glyph.height) / 2, glyph.width, glyph.height},
@@ -679,27 +1089,23 @@ lx::compositor::decoration_manager::alloc(const toplevel_record& rec) {
         s.title[0] = '\0';
         s.title_changed = true;
         s.refit = true;
-        s.glyph_end = 0;
-        s.ellipsized = false;
-        s.textures_staged = false;
         s.not_responding = false;
-        s.scale = scale_;
+        s.scales[0] = scale_;
+        s.scale_count = 1;
+        for (title_run& r : s.text.runs) {
+            r.scale = 0.0;
+            r.width = 0;
+            r.glyphs.clear();
+        }
         s.node.dimmed = false;
         s.node.geometry = {};
         s.node.extents = {};
         s.node.shown = false;
         s.node.active = rec.id == active_;
         s.node.button = deco_button::normal;
-        s.node.title_size = {};
-        s.node.title_pad = 0;
-        s.node.title_text_width = 0;
-        s.node.title_ready = false;
+        s.node.title = &s.text;
+        s.node.text = text_.get();
         s.node.atlas_ready = &atlas_ready_;
-        // Fresh ids per window, two at a time; wrapping takes 16M windows.
-        if (next_texture_id_ + 2 >= k_deco_atlas_texture_id)
-            next_texture_id_ = k_deco_title_texture_base;
-        s.node.title_texture[0] = next_texture_id_++;
-        s.node.title_texture[1] = next_texture_id_++;
         return &s;
     }
     return nullptr;
@@ -849,10 +1255,7 @@ void lx::compositor::decoration_manager::on_destroyed(lx::toplevel_id id, lx::su
     // The surface (and its container) may already be gone; set_underlay ignores that.
     if (s->installed && tree_)
         tree_->set_underlay(root, nullptr);
-    if (s->textures_staged && ops_.retire) {
-        ops_.retire(ops_.user, s->node.title_texture[0]);
-        ops_.retire(ops_.user, s->node.title_texture[1]);
-    }
+    // Its glyphs stay in the atlas, shared with every title that uses them, until they age out.
     s->used = false;
     s->installed = false;
     s->id = {};
@@ -872,10 +1275,13 @@ lx::compositor::decoration_manager::node(lx::toplevel_id id) const {
     return s ? &s->node : nullptr;
 }
 
-lx::text::font_desc lx::compositor::decoration_manager::title_font(double scale) const {
-    lx::text::font_desc f = k_title_font;
-    f.size_pt = static_cast<float>(f.size_pt * scale);
-    return f;
+void lx::compositor::decoration_manager::bind_chrome(chrome_atlas* atlas) {
+    text_ = atlas ? std::make_unique<chrome_text>(*atlas) : nullptr;
+    for (auto& s : slots_) {
+        s.node.text = text_.get();
+        s.title_changed = true;
+    }
+    any_dirty_ = true;
 }
 
 void lx::compositor::decoration_manager::set_scale(double scale) {
@@ -885,11 +1291,42 @@ void lx::compositor::decoration_manager::set_scale(double scale) {
 }
 
 void lx::compositor::decoration_manager::set_window_scale(lx::toplevel_id id, double scale) {
+    const double one[1] = {scale};
+    set_window_scales(id, one);
+}
+
+void lx::compositor::decoration_manager::set_window_scales(lx::toplevel_id id,
+                                                           std::span<const double> scales) {
     slot* s = find(id);
-    if (!s || !(scale > 0.0) || s->scale == scale)
+    if (!s)
         return;
-    s->scale = scale;
-    s->title_changed = true;
+    double want[k_title_scales]{};
+    unsigned n = 0;
+    for (const double v : scales) {
+        if (!(v > 0.0) || n == k_title_scales)
+            continue;
+        bool seen = false;
+        for (unsigned i = 0; i < n; ++i)
+            seen = seen || want[i] == v;
+        if (!seen)
+            want[n++] = v;
+    }
+    if (n == 0)
+        return;
+    bool same = n == s->scale_count;
+    for (unsigned i = 0; i < n && same; ++i) {
+        bool found = false;
+        for (unsigned k = 0; k < s->scale_count; ++k)
+            found = found || s->scales[k] == want[i];
+        same = found;
+    }
+    if (same)
+        return;
+    for (unsigned i = 0; i < k_title_scales; ++i)
+        s->scales[i] = i < n ? want[i] : 0.0;
+    s->scale_count = n;
+    // Runs of the scales kept stay as they are; the new ones are laid out at the next tick.
+    s->refit = true;
     any_dirty_ = true;
 }
 
@@ -898,17 +1335,6 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     s.title_changed = false;
     s.refit = false;
     frame_node& n = s.node;
-    // Output pixels: the text is shaped at 10 pt × the window's scale.
-    const double scale = s.scale > 0.0 ? s.scale : 1.0;
-    const int room = static_cast<int>(std::lround(title_text_room(n.geometry.width) * scale));
-
-    const auto drop = [&] {
-        if (n.title_ready)
-            damage_title(n);
-        n.title_ready = false;
-        s.glyph_end = 0;
-        s.ellipsized = false;
-    };
     const auto warn_no_text = [&] {
         if (!warned_no_text_) {
             warned_no_text_ = true;
@@ -917,99 +1343,85 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
                                             "face, or built without HarfBuzz). Reported once.");
         }
     };
-    // A not-responding window shows the suffix whatever the title's length: the title part
-    // gets what room the suffix leaves (KWin).
-    int suffix_w = 0;
-    if (s.not_responding) {
-        if (!suffix_shaped_ || suffix_scale_ != scale) {
-            if (auto shaped = lx::text::shape_line(k_not_responding_suffix, title_font(scale),
-                                                   suffix_line_);
-                !shaped) {
-                warn_no_text();
-                drop();
-                return;
+    if (!text_) {
+        warn_no_text();
+        return;
+    }
+    // Runs of scales the window left are dropped (their storage kept for the next).
+    bool damaged = false;
+    for (title_run& r : s.text.runs) {
+        bool wanted = false;
+        for (unsigned i = 0; i < s.scale_count; ++i)
+            wanted = wanted || r.scale == s.scales[i];
+        if (r.scale > 0.0 && !wanted) {
+            damaged = damaged || r.width > 0;
+            r.scale = 0.0;
+            r.width = 0;
+            r.glyphs.clear();
+        }
+    }
+    const int room = title_text_room(n.geometry.width);
+    for (unsigned i = 0; i < s.scale_count; ++i) {
+        const double scale = s.scales[i];
+        // The close glyph at this scale (shared by every frame; rasterised once per scale).
+        if (!text_->find_close(scale) || changed) {
+            if (text_->close(scale) && scene_ && n.shown)
+                scene_->note_damage(close_rect(n.geometry));
+        }
+        title_run* run = nullptr;
+        for (title_run& r : s.text.runs)
+            if (r.scale == scale)
+                run = &r;
+        bool fresh = false;
+        if (!run) {
+            for (title_run& r : s.text.runs)
+                if (!run && !(r.scale > 0.0))
+                    run = &r;
+            fresh = true;
+        }
+        if (!run)
+            break;
+        auto laid = text_->layout_title(*run, s.title, s.not_responding, room, scale,
+                                        changed || fresh);
+        if (!laid) {
+            // What could be laid out is drawn; the rest is tried again at the next change.
+            if (!warned_no_text_) {
+                warned_no_text_ = true;
+                lx::trace::logger::global().log_error(laid.get_error(), k_deco_category);
             }
-            suffix_shaped_ = true;
-            suffix_scale_ = scale;
+            damaged = true;
+            continue;
         }
-        suffix_w = suffix_line_.width_px;
-    }
-    if (room <= 0 || (s.title[0] == '\0' && !s.not_responding)) {
-        drop();
-        return;
-    }
-    lx::text::line_fit fit{};
-    if (s.title[0] != '\0') {
-        if (auto shaped = lx::text::shape_line(s.title, title_font(scale), line_); !shaped) {
-            warn_no_text();
-            drop();
-            return;
-        }
-        fit = lx::text::fit_line(line_, room - suffix_w);
-    }
-    // The suffix alone when the title gets no room; then it may be ellipsized itself.
-    lx::text::line_fit suffix_fit{};
-    if (s.not_responding)
-        suffix_fit = lx::text::fit_line(suffix_line_, fit.width_px > 0 ? suffix_w : room);
-    const int text_w = fit.width_px + suffix_fit.width_px;
-    if (text_w <= 0) {
-        drop();
-        return;
-    }
-    // A resize that leaves the cut where it was costs nothing: same pixels, same texture.
-    if (!changed && n.title_ready && fit.glyph_end == s.glyph_end &&
-        fit.ellipsized == s.ellipsized && !s.not_responding)
-        return;
-
-    // Glyph ink may overhang the advance box.
-    const int k_pad = static_cast<int>(std::ceil(2.0 * scale));
-    const int w = text_w + 2 * k_pad;
-    const lx::text::shaped_line& metrics = fit.width_px > 0 ? line_ : suffix_line_;
-    const int h = metrics.ascent_px + metrics.descent_px;
-    if (w <= 0 || h <= 0 || !ops_.stage) {
-        drop();
-        return;
-    }
-    const std::size_t px = static_cast<std::size_t>(w) * static_cast<std::size_t>(h);
-    if (raster_.size() < px)
-        raster_.resize(px); // grows to the widest title seen, then stays
-    const lx::text::raster_color colours[2] = {k_text_active, k_text_inactive};
-    for (unsigned i = 0; i < 2; ++i) {
-        std::memset(raster_.data(), 0, px * sizeof(std::uint32_t));
-        if (fit.width_px > 0)
-            (void)lx::text::render_line(line_, fit, colours[i], {raster_.data(), w, h, w},
-                                        {k_pad, metrics.ascent_px});
-        if (suffix_fit.width_px > 0)
-            (void)lx::text::render_line(suffix_line_, suffix_fit, colours[i],
-                                        {raster_.data(), w, h, w},
-                                        {k_pad + fit.width_px, metrics.ascent_px});
-        if (!ops_.stage(ops_.user, n.title_texture[i], raster_.data(), static_cast<unsigned>(w),
-                        static_cast<unsigned>(h), static_cast<unsigned>(w),
-                        static_cast<unsigned>(w), static_cast<unsigned>(h))) {
-            // Staging full this frame: try again next tick, with the old title meanwhile.
-            s.title_changed = changed;
-            s.refit = true;
-            any_dirty_ = true;
-            return;
+        damaged = damaged || laid.value();
+        if (laid.value() && deco_debug()) {
+            log("decoration title id={} scale={} width={} ellipsized={} title=\"{:.200}{}\"",
+                s.id.id(), scale, run->width, run->ellipsized ? 1 : 0, s.title,
+                s.not_responding ? " (Not Responding)" : "");
         }
     }
-    s.textures_staged = true;
-    damage_title(n); // old extent
-    n.title_size = {w, h};
-    n.title_pad = k_pad;
-    n.title_text_width = text_w;
-    n.title_scale = scale;
-    n.title_ready = true;
-    s.glyph_end = fit.glyph_end;
-    s.ellipsized = fit.ellipsized;
-    damage_title(n);
-    if (deco_debug()) {
-        log("decoration title id={} width={} ellipsized={} title=\"{:.200}{}\"", s.id.id(), text_w,
-            fit.ellipsized ? 1 : 0, s.title, s.not_responding ? k_not_responding_suffix : "");
-    }
+    if (damaged)
+        damage_title(n);
 }
 
 void lx::compositor::decoration_manager::on_tick() {
+    if (text_) {
+        // The atlas's frame; tiles that moved (a page rebuild) are drawn where they now are by
+        // the next emission, which a full damage of the frames makes happen.
+        if (text_->atlas().begin_frame()) {
+            for (const auto& s : slots_)
+                if (s.used)
+                    damage_strips(s.node);
+        }
+        // A tile an emission found evicted: every title is laid out (and rasterised) again.
+        if (text_->take_stale()) {
+            for (auto& s : slots_)
+                if (s.used) {
+                    s.title_changed = true;
+                    damage_title(s.node);
+                }
+            any_dirty_ = true;
+        }
+    }
     if (!atlas_ready_) {
         bool any_shown = false;
         for (const auto& s : slots_)

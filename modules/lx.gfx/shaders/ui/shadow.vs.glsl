@@ -43,6 +43,6 @@ void main() {
     v_r = r;
     v_elem = elem;
     v_er = er;
-    v_color = inst_half4(10u);
+    v_color = lx_instance_color(inst_half4(10u));
     v_flags = flags;
 }

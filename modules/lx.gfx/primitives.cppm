@@ -145,6 +145,14 @@ struct packed_rgba {
     return {to_half(c.r * c.a), to_half(c.g * c.a), to_half(c.b * c.a), to_half(c.a)};
 }
 
+/// The `text.contrast` exponent (ADR-010 §4.5): a `mono_sprite` blended in linear light (the
+/// compositor's F16 pass, an scRGB swapchain) draws `colour × coverage^contrast`, so text keeps
+/// the stem weight it has blended in the encoded space. Measured by `test_ui_golden`
+/// `text_contrast_keeps_stem_coverage` (mean stem coverage within 3 %): light text on a dark
+/// background needs 1.58–1.77, dark text on a light one 0.54–0.61; these are the centres.
+inline constexpr float k_text_contrast_dark = 1.67f;
+inline constexpr float k_text_contrast_light = 0.57f;
+
 // ── GPU instances (ADR-010 §4.2) ────────────────────────────────────────────────
 //
 // Uploaded as they are into an SSBO (Vulkan and GLES 3.1) or walked by the CPU renderer,
@@ -200,7 +208,7 @@ struct sprite_instance {
     float clip[4]{};
     std::uint16_t uv[4]{};  ///< atlas texels: u0, v0, u1, v1
     std::uint8_t page = 0;  ///< atlas page (sampler array index)
-    std::uint8_t flags = 0; ///< bit 0: grayscale (poly)
+    std::uint8_t flags = 0; ///< bit 0: grayscale (poly); bits 1–3: output transform (set by the view)
     std::uint16_t pad0 = 0;
     std::uint16_t color[4]{};  ///< premultiplied f16 rgba (mono: tint; poly: multiplier; path: fill)
     std::uint16_t params[4]{}; ///< f16: radii (poly) or rotation (mono)
@@ -313,6 +321,11 @@ public:
         }
         return assign_cells(bounds);
     }
+    /// `assign` with a floor: the order is at least `at_least` (written back like any other).
+    /// An emitter whose consecutive groups need no order between them but should come out
+    /// ascending — successive lines of one text block — chains them with it, so the stream
+    /// stays sorted and `draw_list::batch_for_render` skips its sort.
+    [[nodiscard]] std::uint32_t assign(lx::rect2i bounds, std::uint32_t at_least);
 
     /// Lifts the base order above everything assigned so far: an overlay, popup or drag
     /// cannot interleave with what is under it (GPUI's `push_layer`). At most
@@ -413,6 +426,38 @@ std::uint32_t lx::gfx::order_grid::assign_cells(lx::rect2i bounds) {
                 highest = row[cx];
     }
     const std::uint32_t order = highest + 1 > base_ ? highest + 1 : base_;
+    for (unsigned cy = cy0; cy <= cy1; ++cy) {
+        std::uint32_t* row = cells_ + cy * cells_x_;
+        for (unsigned cx = cx0; cx <= cx1; ++cx)
+            row[cx] = order;
+    }
+    if (order > max_)
+        max_ = order;
+    return order;
+}
+
+std::uint32_t lx::gfx::order_grid::assign(lx::rect2i bounds, std::uint32_t at_least) {
+    if (bounds.width <= 0 || bounds.height <= 0)
+        return base_;
+    const long long x0 = bounds.x > 0 ? bounds.x : 0;
+    const long long y0 = bounds.y > 0 ? bounds.y : 0;
+    const long long bx1 = static_cast<long long>(bounds.x) + bounds.width;
+    const long long by1 = static_cast<long long>(bounds.y) + bounds.height;
+    const long long x1 = bx1 < view_.width ? bx1 : view_.width;
+    const long long y1 = by1 < view_.height ? by1 : view_.height;
+    if (x1 <= x0 || y1 <= y0)
+        return base_;
+    const unsigned cx0 = static_cast<unsigned>(x0) >> shift_;
+    const unsigned cy0 = static_cast<unsigned>(y0) >> shift_;
+    const unsigned cx1 = static_cast<unsigned>(x1 - 1) >> shift_;
+    const unsigned cy1 = static_cast<unsigned>(y1 - 1) >> shift_;
+    std::uint32_t order = at_least > base_ ? at_least : base_;
+    for (unsigned cy = cy0; cy <= cy1; ++cy) {
+        const std::uint32_t* row = cells_ + cy * cells_x_;
+        for (unsigned cx = cx0; cx <= cx1; ++cx)
+            if (row[cx] + 1 > order)
+                order = row[cx] + 1;
+    }
     for (unsigned cy = cy0; cy <= cy1; ++cy) {
         std::uint32_t* row = cells_ + cy * cells_x_;
         for (unsigned cx = cx0; cx <= cx1; ++cx)

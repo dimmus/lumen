@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # UI engine benchmark and regression gate (ADR-010 §8.5).
 #
-# Builds lumen-ui-bench in the release build, runs every scenario (S1–S3) on the backend
+# Builds lumen-ui-bench in the release build, runs every scenario (S1–S4) on the backend
 # (`none`: nothing renders, the stages through encode are measured; `cpu`: the reference
 # renderer rasterises each frame's damage too, the `raster` stage; `gl`: the GLES 3.1
 # renderer draws it on /dev/dri/renderD128, the `submit` and `gpu` stages — refused on a
@@ -14,8 +14,8 @@
 #   FAIL           a stage's p95 more than 10 % above the baseline's — and at least
 #                  ABS_FLOOR_US slower: a sub-microsecond stage jitters by more than 10 %
 #                  on its own; any heap allocation or non-zero mallinfo2 delta in a steady
-#                  frame of any scenario (G5); more batches than the scenario's cap (S2, S3:
-#                  8); a gate the bench judged `fail` that the baseline passed (or has no
+#                  frame of any scenario (G5); more batches than the scenario's cap (S2, S3,
+#                  S4: 8); a gate the bench judged `fail` that the baseline passed (or has no
 #                  verdict for); a stage whose sample count went from zero to non-zero or
 #                  back (S1 producing frames, say); a scenario, stage or gate of the
 #                  baseline missing from the run
@@ -33,9 +33,9 @@
 # Options:
 #   --backend B         the backend to measure: none (default), cpu, gl or vulkan; each has its own
 #                       baseline, tests/bench/baseline/<hostname>-<backend>.json
-#   --frames N          measured frames for every scenario (default: S1 600, S2 36000, S3 1800
-#                       at the bench's 1 ms frame clock; S2 changes its clock every 60th
-#                       frame, so 36000 is the 600 produced frames §8.1 takes a p95 over)
+#   --frames N          measured frames for every scenario (default: S1 600, S2 36000, S3 1800,
+#                       S4 1800 at the bench's 1 ms frame clock; S2 changes its clock every
+#                       60th frame, so 36000 is the 600 produced frames §8.1 takes a p95 over)
 #   --warmup N          warm-up frames (default 120)
 #   --pin CPU           CPU the bench is pinned to (default: the last one — 1 on a 2-core host)
 #   --no-build          skip the build step
@@ -140,12 +140,13 @@ frames_for() {
     S1) echo 600 ;;
     S2) echo 36000 ;;
     S3) echo 1800 ;;
+    S4) echo 1800 ;;
   esac
 }
 
 echo "== lumen-ui-bench: backend=${backend} warmup=${warmup} pin=${pin} -> ${out#"$ROOT"/}"
 parts=()
-for scenario in S1 S2 S3; do
+for scenario in S1 S2 S3 S4; do
   n="${frames:-$(frames_for "$scenario")}"
   part="${out%.json}-${scenario}.json"
   "${runner[@]}" "$BENCH" --scenario "$scenario" --backend "$backend" --frames "$n" \
@@ -192,7 +193,7 @@ import sys
 
 new_path, ref_path, floor = sys.argv[1], sys.argv[2], float(sys.argv[3])
 FAIL_PCT, WARN_PCT = 10.0, 5.0
-BATCH_CAPS = {"S2": 8, "S3": 8}
+BATCH_CAPS = {"S2": 8, "S3": 8, "S4": 8}
 
 with open(new_path) as f:
     new = json.load(f)

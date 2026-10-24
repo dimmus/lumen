@@ -12,16 +12,31 @@ flat in vec4 v_mr;
 flat in uint v_flags;
 
 void main() {
-    vec2 p = gl_FragCoord.xy;
+    vec2 pf = gl_FragCoord.xy;
+    // The pixel in the sprite's own (unturned) box: the output transform's basis maps the
+    // turned box back (a signed permutation: whole pixels stay whole), `ui_cpu`'s rule.
+    vec2 p = pf;
+    vec4 box = v_bounds;
+    uint xf = (v_flags >> 3u) & 7u;
+    if (xf != 0u) {
+        vec2 o;
+        vec2 bdx;
+        vec2 bdy;
+        lx_basis(xf, o, bdx, bdy);
+        vec2 csize = bdx.x == 0.0 ? v_bounds.wz : v_bounds.zw;
+        vec2 d = pf - v_bounds.xy;
+        p = o * csize + vec2(bdx.x * d.x + bdy.x * d.y, bdx.y * d.x + bdy.y * d.y);
+        box = vec4(0.0, 0.0, csize);
+    }
     vec4 texel;
     if ((v_flags & 1u) != 0u) {
-        texel = lx_page_texel(ivec2(v_tile.xy) + (ivec2(floor(p)) - ivec2(v_bounds.xy)));
+        texel = lx_page_texel(ivec2(v_tile.xy) + (ivec2(floor(p)) - ivec2(box.xy)));
     } else {
         // `ui_raster::sample`: bilinear at (u - 1/2, v - 1/2), clamped to the tile's texel centres.
-        float ku = (v_tile.z - v_tile.x) / v_bounds.z;
-        float kv = (v_tile.w - v_tile.y) / v_bounds.w;
-        float su = clamp(v_tile.x + (p.x - v_bounds.x) * ku - 0.5, v_tile.x, v_tile.z - 1.0);
-        float sv = clamp(v_tile.y + (p.y - v_bounds.y) * kv - 0.5, v_tile.y, v_tile.w - 1.0);
+        float ku = (v_tile.z - v_tile.x) / box.z;
+        float kv = (v_tile.w - v_tile.y) / box.w;
+        float su = clamp(v_tile.x + (p.x - box.x) * ku - 0.5, v_tile.x, v_tile.z - 1.0);
+        float sv = clamp(v_tile.y + (p.y - box.y) * kv - 0.5, v_tile.y, v_tile.w - 1.0);
         float fu = floor(su);
         float fv = floor(sv);
         float wx = su - fu;
@@ -44,11 +59,11 @@ void main() {
         float l = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
         c.rgb = vec3(l);
     }
-    vec4 src = c * v_color;
+    vec4 src = lx_fragment_color(c) * v_color;
     if ((v_flags & 4u) != 0u)
-        src = src * lx_coverage(v_mbox, v_mr, p);
+        src = src * lx_coverage(v_mbox, v_mr, pf);
     o_color = src;
 #else
-    o_color = v_color * texel.r;
+    o_color = v_color * lx_text_coverage(texel.r);
 #endif
 }

@@ -22,7 +22,7 @@ vec4 lx_background(vec2 p, vec4 box) {
     float t = lx_saturate(0.5 + ((p.x - box.x) * v_grad.x + (p.y - box.y) * v_grad.y) * v_grad.z);
     if ((v_flags & 8u) == 0u)
         return v_bg0 + (v_bg1 + v_bg0 * -1.0) * t;
-    return lx_from_oklab(v_lab0 + (v_lab1 - v_lab0) * t);
+    return lx_fragment_color(lx_from_oklab(v_lab0 + (v_lab1 - v_lab0) * t));
 }
 
 float lx_dash(vec2 p) {

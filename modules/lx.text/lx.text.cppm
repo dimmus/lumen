@@ -1,11 +1,8 @@
 module;
 
 #if defined(LUMEN_HAS_TEXT)
-#include <fontconfig/fontconfig.h>
 #include <ft2build.h>
 #include FT_FREETYPE_H
-#include <hb-ft.h>
-#include <hb.h>
 #endif
 
 import lx.foundation;
@@ -14,17 +11,17 @@ export module lx.text;
 
 import std;
 
+// ADR-010 §4.6: faces (fontconfig, FreeType, the face LRU), itemization (fribidi, script,
+// fallback faces, UAX #14 / #29 boundaries), shaping (HarfBuzz, the shape cache) and lines
+// (the retained `text_layout`: wrapping, ellipsis, bidi reordering, hit testing) and raster
+// (glyphs into the `lx.gfx:atlas`) are partitions; the single-line and paragraph API below shapes through them.
+export import :faces;
+export import :shape;
+export import :itemize;
+export import :lines;
+export import :raster;
+
 export namespace lx::text {
-
-enum class weight { normal, bold };
-enum class style { normal, italic };
-
-struct font_desc {
-    const char* family = "Sans";
-    float size_pt = 11.f;
-    weight weight = weight::normal;
-    style style = style::normal;
-};
 
 struct glyph_run {
     const char* utf8 = "";
@@ -32,6 +29,7 @@ struct glyph_run {
     float height = 0.f;
 };
 
+/// Width measurement over `face_cache::shared()` and `shape_cache::shared()`.
 class font_stack {
 public:
     /// Process-wide shaping cache — face loading is expensive, share it.
@@ -44,22 +42,6 @@ public:
 
     /// True when a real font face backs shaping; false means metric estimation.
     [[nodiscard]] bool has_face() const;
-};
-
-class text_layout {
-public:
-    void set_text(const char* utf8);
-    void set_font(font_desc desc);
-    void set_max_width(float width);
-    [[nodiscard]] lx::size2i bounding_size() const;
-
-private:
-    void reshape();
-
-    const char* text_ = "";
-    font_desc font_{};
-    float max_width_ = 0.f;
-    glyph_run shaped_{};
 };
 
 // ── Single-line CPU rasterization ─────────────────────────────────────────────
@@ -212,195 +194,17 @@ using span_color_fn = raster_color (*)(int span, std::uint16_t tag, void* user);
 #if defined(LUMEN_HAS_TEXT)
 namespace lx::text::detail {
 
-/// Owns FreeType and a few resolved faces (hb_font_t over FT_Face), least recently used
-/// first out. Shaping without a face is never attempted: hb_shape() dereferences its font
-/// argument, so a null face must fall back to metrics.
-///
-/// Several faces stay loaded because text mixes them: a bold title over a regular body, an
-/// italic span, the panel's letter tiles. With one face every switch was a fontconfig match
-/// plus FT_New_Face (milliseconds), and the glyph cache, keyed by face, lost its entries.
-/// Each entry has its own generation (never reused), so cached glyphs of one face stay valid
-/// while another is in use.
-class face_cache {
-public:
-    static constexpr unsigned k_faces = 8;
-
-    static face_cache& instance() {
-        static face_cache c{};
-        return c;
-    }
-
-    /// Function-local static: runs at exit, so FreeType/HarfBuzz handles and the
-    /// fontconfig global config are released rather than reported as leaks.
-    ~face_cache() {
-        std::lock_guard lock{mutex_};
-        for (auto& e : faces_)
-            release_locked(e);
-        if (library_) {
-            FT_Done_FreeType(library_);
-            library_ = nullptr;
-        }
-        if (init_attempted_ && fontconfig_ready_)
-            FcFini();
-    }
-
-    face_cache(const face_cache&) = delete;
-    face_cache& operator=(const face_cache&) = delete;
-
-    hb_font_t* acquire(const font_desc& desc) {
-        std::lock_guard lock{mutex_};
-        return acquire_locked(desc);
-    }
-
-    /// Callers that use the face beyond one call (shaping, glyph rendering) hold this for
-    /// the whole operation: FreeType faces are not thread-safe, and the face in use may
-    /// otherwise be evicted underneath them.
-    [[nodiscard]] std::unique_lock<std::mutex> lock() { return std::unique_lock{mutex_}; }
-    /// The face the last `acquire_locked` returned.
-    [[nodiscard]] FT_Face face_locked() const {
-        return current_ < k_faces ? faces_[current_].ft : nullptr;
-    }
-    /// Identifies the face the last `acquire_locked` returned (unique per loaded face);
-    /// glyph caches key on it.
-    [[nodiscard]] unsigned generation_locked() const {
-        return current_ < k_faces ? faces_[current_].generation : 0u;
-    }
-
-    hb_font_t* acquire_locked(const font_desc& desc) {
-        if (!init_attempted_) {
-            init_attempted_ = true;
-            if (FT_Init_FreeType(&library_) != 0)
-                library_ = nullptr;
-            if (!FcInit())
-                fontconfig_ready_ = false;
-        }
-        current_ = k_faces;
-        if (!library_ || !fontconfig_ready_)
-            return nullptr;
-
-        const int px = static_cast<int>(desc.size_pt * 64.f);
-        const char* family = desc.family && desc.family[0] ? desc.family : "Sans";
-        // By value, not by pointer: two equal family strings at different addresses are the
-        // same face, and a caller's buffer may not outlive the cache entry.
-        const char* file = nullptr;
-        int face_index = 0;
-        unsigned victim = 0;
-        for (unsigned i = 0; i < k_faces; ++i) {
-            entry& e = faces_[i];
-            if (!e.hb) {
-                victim = i;
-                continue;
-            }
-            const bool same_face = std::strcmp(e.family, family) == 0 &&
-                                   e.weight == desc.weight && e.style == desc.style;
-            if (same_face && e.px == px) {
-                e.used = ++clock_;
-                current_ = i;
-                return e.hb;
-            }
-            // The same face at another size (a fractional scale): its file is known.
-            if (same_face && e.file[0]) {
-                file = e.file;
-                face_index = e.face_index;
-            }
-            if (faces_[victim].hb && e.used < faces_[victim].used)
-                victim = i;
-        }
-
-        char resolved[sizeof(entry::file)];
-        if (file) {
-            std::snprintf(resolved, sizeof(resolved), "%s", file);
-        } else {
-            FcPattern* pattern = FcNameParse(reinterpret_cast<const FcChar8*>(family));
-            if (!pattern)
-                return nullptr;
-            FcPatternAddInteger(pattern, FC_WEIGHT,
-                                desc.weight == weight::bold ? FC_WEIGHT_BOLD : FC_WEIGHT_REGULAR);
-            FcPatternAddInteger(pattern, FC_SLANT,
-                                desc.style == style::italic ? FC_SLANT_ITALIC : FC_SLANT_ROMAN);
-            FcConfigSubstitute(nullptr, pattern, FcMatchPattern);
-            FcDefaultSubstitute(pattern);
-
-            FcResult match_result{};
-            FcPattern* matched = FcFontMatch(nullptr, pattern, &match_result);
-            FcPatternDestroy(pattern);
-            if (!matched || match_result != FcResultMatch) {
-                if (matched) FcPatternDestroy(matched);
-                return nullptr;
-            }
-            FcChar8* match_file = nullptr;
-            if (FcPatternGetString(matched, FC_FILE, 0, &match_file) != FcResultMatch ||
-                !match_file) {
-                FcPatternDestroy(matched);
-                return nullptr;
-            }
-            FcPatternGetInteger(matched, FC_INDEX, 0, &face_index);
-            std::snprintf(resolved, sizeof(resolved), "%s", reinterpret_cast<const char*>(match_file));
-            FcPatternDestroy(matched);
-        }
-
-        FT_Face face = nullptr;
-        const FT_Error err = FT_New_Face(library_, resolved, face_index, &face);
-        if (err != 0 || !face)
-            return nullptr;
-
-        FT_Set_Char_Size(face, 0, px, 0, 96);
-        hb_font_t* font = hb_ft_font_create_referenced(face);
-        if (!font) {
-            FT_Done_Face(face);
-            return nullptr;
-        }
-
-        entry& e = faces_[victim];
-        release_locked(e);
-        e.ft = face;
-        e.hb = font;
-        e.px = px;
-        std::snprintf(e.family, sizeof(e.family), "%s", family);
-        std::snprintf(e.file, sizeof(e.file), "%s", resolved);
-        e.face_index = face_index;
-        e.weight = desc.weight;
-        e.style = desc.style;
-        e.generation = ++generation_;
-        e.used = ++clock_;
-        current_ = victim;
-        return e.hb;
-    }
-
-private:
-    struct entry {
-        FT_Face ft = nullptr;
-        hb_font_t* hb = nullptr;
-        int px = 0;
-        char family[128]{};
-        /// The file fontconfig resolved (reused for the same face at another size).
-        char file[512]{};
-        int face_index = 0;
-        weight weight = weight::normal;
-        style style = style::normal;
-        unsigned generation = 0;
-        unsigned long long used = 0;
-    };
-
-    face_cache() = default;
-
-    static void release_locked(entry& e) {
-        if (e.hb)
-            hb_font_destroy(e.hb);
-        if (e.ft)
-            FT_Done_Face(e.ft);
-        e = entry{};
-    }
-
-    std::mutex mutex_{};
-    FT_Library library_ = nullptr;
-    entry faces_[k_faces]{};
-    unsigned current_ = k_faces;
-    unsigned generation_ = 0;
-    unsigned long long clock_ = 0;
-    bool init_attempted_ = false;
-    bool fontconfig_ready_ = true;
-};
+/// Shapes `utf8` with face `id` at `size` (26.6 px) through the shared shape cache. The
+/// caller holds `face_cache::shared().lock()`, which guards the shared shape cache too; the
+/// run's glyphs are valid until the next shaping call.
+[[nodiscard]] inline lx::result<shaped_run> shape_shared_locked(face_id id, std::int32_t size,
+                                                                std::string_view utf8) {
+    shape_request req{};
+    req.face = id;
+    req.size_26_6 = size;
+    req.utf8 = utf8;
+    return shape_cache::shared().shape_locked(face_cache::shared(), req);
+}
 
 } // namespace lx::text::detail
 #endif
@@ -430,7 +234,7 @@ void lx::text::font_stack::load_default() { load({}); }
 
 void lx::text::font_stack::load(font_desc desc) {
 #if defined(LUMEN_HAS_TEXT)
-    (void)detail::face_cache::instance().acquire(desc);
+    (void)face_cache::shared().resolve(desc);
 #else
     (void)desc;
 #endif
@@ -438,7 +242,7 @@ void lx::text::font_stack::load(font_desc desc) {
 
 bool lx::text::font_stack::has_face() const {
 #if defined(LUMEN_HAS_TEXT)
-    return detail::face_cache::instance().acquire(font_desc{}) != nullptr;
+    return face_cache::shared().resolve(font_desc{}).valid();
 #else
     return false;
 #endif
@@ -448,24 +252,17 @@ lx::text::glyph_run lx::text::font_stack::shape(const char* utf8, font_desc desc
     if (!utf8 || utf8[0] == '\0')
         return {};
 #if defined(LUMEN_HAS_TEXT)
-    hb_font_t* font = detail::face_cache::instance().acquire(desc);
-    if (!font)
+    auto& faces = face_cache::shared();
+    auto lock = faces.lock();
+    const face_id id = faces.resolve_locked(desc.family, desc.weight, desc.style);
+    if (!id.valid())
         return detail::estimate(utf8, desc);
-
-    hb_buffer_t* buf = hb_buffer_create();
-    if (!buf)
+    const auto run = detail::shape_shared_locked(id, size_26_6_from_pt(desc.size_pt), utf8);
+    if (!run)
         return detail::estimate(utf8, desc);
-    hb_buffer_add_utf8(buf, utf8, -1, 0, -1);
-    hb_buffer_guess_segment_properties(buf);
-    hb_shape(font, buf, nullptr, 0);
-
-    unsigned count = 0;
-    const hb_glyph_position_t* pos = hb_buffer_get_glyph_positions(buf, &count);
     float width = 0.f;
-    for (unsigned i = 0; i < count && pos; ++i)
-        width += static_cast<float>(pos[i].x_advance) / 64.f;
-    hb_buffer_destroy(buf);
-
+    for (const shaped_glyph& g : run->glyphs)
+        width += static_cast<float>(g.x_advance) / 64.f;
     return {utf8, width, desc.size_pt * 1.2f};
 #else
     return detail::estimate(utf8, desc);
@@ -476,42 +273,19 @@ float lx::text::font_stack::measure_width(const char* utf8, font_desc desc) cons
     return shape(utf8, desc).width;
 }
 
-void lx::text::text_layout::reshape() {
-    shaped_ = font_stack::shared().shape(text_, font_);
-}
-
-void lx::text::text_layout::set_text(const char* t) {
-    text_ = t ? t : "";
-    reshape();
-}
-
-void lx::text::text_layout::set_font(font_desc d) {
-    font_ = d;
-    reshape();
-}
-
-void lx::text::text_layout::set_max_width(float w) { max_width_ = w; }
-
-lx::size2i lx::text::text_layout::bounding_size() const {
-    const float height = shaped_.height > 0.f ? shaped_.height : font_.size_pt * 1.2f;
-    float width = shaped_.width;
-    if (max_width_ > 0.f && width > max_width_)
-        width = max_width_;
-    return {static_cast<int>(width), static_cast<int>(height)};
-}
-
 // ── Single-line rasterization ─────────────────────────────────────────────────
 
 #if defined(LUMEN_HAS_TEXT)
 namespace lx::text::detail {
 
-/// Grayscale glyph coverage, keyed by (face generation, glyph index). A fixed table and a
+/// Grayscale glyph coverage, keyed by (face id, size, glyph index). A fixed table and a
 /// fixed arena, both allocated on first use and cleared wholesale when either fills: a
 /// title bar or a panel touches a few hundred glyphs, so the steady state never clears.
 class glyph_cache {
 public:
     struct entry {
-        unsigned generation = 0;
+        std::uint32_t face = 0;
+        std::int32_t size = 0;
         unsigned glyph = 0;
         int left = 0;   ///< bitmap_left: pen → first column
         int top = 0;    ///< bitmap_top: baseline → first row (up is positive)
@@ -526,8 +300,9 @@ public:
         return c;
     }
 
-    /// Caller holds the face cache lock. Null when FreeType cannot render the glyph.
-    const entry* get(FT_Face face, unsigned generation, unsigned glyph) {
+    /// Caller holds the face cache lock and has put `face` to use at `size`. Null when
+    /// FreeType cannot render the glyph.
+    const entry* get(FT_Face face, std::uint32_t face_id, std::int32_t size, unsigned glyph) {
         if (!face)
             return nullptr;
         if (!arena_) {
@@ -535,12 +310,12 @@ public:
             if (!arena_)
                 return nullptr;
         }
-        unsigned h = (generation * 2654435761u) ^ (glyph * 40503u);
+        unsigned h = hash(face_id, size, glyph);
         for (unsigned probe = 0; probe < k_slots; ++probe) {
             entry& e = slots_[(h + probe) & (k_slots - 1)];
             if (!e.used)
                 break;
-            if (e.generation == generation && e.glyph == glyph)
+            if (e.face == face_id && e.size == size && e.glyph == glyph)
                 return &e;
         }
         if (FT_Load_Glyph(face, glyph, FT_LOAD_TARGET_LIGHT | FT_LOAD_RENDER) != 0)
@@ -554,7 +329,7 @@ public:
         if (bytes > k_arena_bytes)
             return nullptr;
         entry* slot = nullptr;
-        h = (generation * 2654435761u) ^ (glyph * 40503u);
+        h = hash(face_id, size, glyph);
         for (unsigned probe = 0; probe < k_slots; ++probe) {
             entry& e = slots_[(h + probe) & (k_slots - 1)];
             if (!e.used) {
@@ -577,7 +352,8 @@ public:
                         : ((src[c >> 3] >> (7 - (c & 7))) & 1u) ? 255u : 0u;
             }
         }
-        slot->generation = generation;
+        slot->face = face_id;
+        slot->size = size;
         slot->glyph = glyph;
         slot->left = face->glyph->bitmap_left;
         slot->top = face->glyph->bitmap_top;
@@ -596,6 +372,11 @@ private:
     static constexpr unsigned k_slots = 1024;
     static constexpr unsigned k_arena_bytes = 1u << 20;
 
+    static unsigned hash(std::uint32_t face_id, std::int32_t size, unsigned glyph) {
+        return (face_id * 2654435761u) ^ (glyph * 40503u) ^
+               (static_cast<unsigned>(size) * 2246822519u);
+    }
+
     void clear() {
         for (auto& e : slots_)
             e = {};
@@ -609,51 +390,12 @@ private:
     unsigned used_count_ = 0;
 };
 
-/// Reused for every shaping call (reset, never recreated). Guarded by the face cache lock.
-inline hb_buffer_t* shared_buffer() {
-    static hb_buffer_t* buf = hb_buffer_create();
-    return buf;
+/// "…" in face `id` at `size`, from the shared shape cache (caller holds the face lock).
+[[nodiscard]] inline lx::result<shaped_run> ellipsis_locked(face_id id, std::int32_t size) {
+    return shape_shared_locked(id, size, "\xE2\x80\xA6");
 }
 
-/// "…" shaped once per face.
-struct ellipsis_run {
-    unsigned generation = ~0u;
-    unsigned count = 0;
-    std::uint32_t glyph[4]{};
-    std::int32_t x_adv[4]{};
-    std::int32_t x_off[4]{};
-    std::int32_t y_off[4]{};
-    int width_px = 0;
-};
-
-inline const ellipsis_run* ellipsis_locked(hb_font_t* font, unsigned generation) {
-    static ellipsis_run run{};
-    if (run.generation == generation)
-        return &run;
-    hb_buffer_t* buf = shared_buffer();
-    if (!buf)
-        return nullptr;
-    hb_buffer_reset(buf);
-    hb_buffer_add_utf8(buf, "\xE2\x80\xA6", -1, 0, -1);
-    hb_buffer_guess_segment_properties(buf);
-    hb_shape(font, buf, nullptr, 0);
-    unsigned n = 0;
-    const hb_glyph_info_t* info = hb_buffer_get_glyph_infos(buf, &n);
-    const hb_glyph_position_t* pos = hb_buffer_get_glyph_positions(buf, &n);
-    run = {};
-    run.generation = generation;
-    long pen = 0;
-    for (unsigned i = 0; i < n && i < 4 && info && pos; ++i) {
-        run.glyph[i] = info[i].codepoint;
-        run.x_adv[i] = pos[i].x_advance;
-        run.x_off[i] = pos[i].x_offset;
-        run.y_off[i] = pos[i].y_offset;
-        pen += pos[i].x_advance;
-        ++run.count;
-    }
-    run.width_px = static_cast<int>((pen + 63) / 64);
-    return &run;
-}
+[[nodiscard]] inline int width_px(const shaped_run& run) { return (run.x_advance + 63) / 64; }
 
 [[nodiscard]] inline int round_26_6(long v) {
     return static_cast<int>(v >= 0 ? (v + 32) / 64 : -((-v + 32) / 64));
@@ -698,42 +440,35 @@ lx::result<void> lx::text::shape_line(const char* utf8, font_desc font, shaped_l
     out.descent_px = 0;
     out.font = font;
 #if defined(LUMEN_HAS_TEXT)
-    auto& cache = detail::face_cache::instance();
-    auto lock = cache.lock();
-    hb_font_t* hb = cache.acquire_locked(font);
-    FT_Face face = cache.face_locked();
-    if (!hb || !face)
-        return lx::make_error(lx::error_domain::io, 0, "no font face resolved");
-    const FT_Size_Metrics& m = face->size->metrics;
-    out.ascent_px = static_cast<int>((m.ascender + 63) / 64);
-    out.descent_px = static_cast<int>((-m.descender + 63) / 64);
+    auto& faces = face_cache::shared();
+    auto lock = faces.lock();
+    const face_id id = faces.resolve_locked(font.family, font.weight, font.style);
+    const std::int32_t size = size_26_6_from_pt(font.size_pt);
+    const auto metrics = faces.metrics_locked(id, size);
+    if (!id.valid() || !metrics)
+        return lx::make_error(lx::io_err::not_found, "no font face resolved");
+    out.ascent_px = static_cast<int>((metrics->ascent + 63) / 64);
+    out.descent_px = static_cast<int>((metrics->descent + 63) / 64);
     if (!utf8 || utf8[0] == '\0')
         return {};
-    hb_buffer_t* buf = detail::shared_buffer();
-    if (!buf)
-        return lx::make_error(lx::error_domain::io, 0, "harfbuzz buffer allocation failed");
-    hb_buffer_reset(buf);
-    hb_buffer_add_utf8(buf, utf8, -1, 0, -1);
-    hb_buffer_guess_segment_properties(buf);
-    hb_shape(hb, buf, nullptr, 0);
-    unsigned n = 0;
-    const hb_glyph_info_t* info = hb_buffer_get_glyph_infos(buf, &n);
-    const hb_glyph_position_t* pos = hb_buffer_get_glyph_positions(buf, &n);
-    if (!info || !pos)
-        return {};
+    const auto run = detail::shape_shared_locked(id, size, utf8);
+    if (!run)
+        return run.get_error();
+    const std::span<const shaped_glyph> glyphs = run->glyphs;
+    const auto n = static_cast<unsigned>(glyphs.size());
     unsigned count = n < k_max_line_glyphs ? n : k_max_line_glyphs;
     // Over capacity: drop the partial cluster at the cut too.
     if (count < n)
-        while (count > 0 && info[count].cluster == info[count - 1].cluster)
+        while (count > 0 && glyphs[count].cluster == glyphs[count - 1].cluster)
             --count;
     long pen = 0;
     for (unsigned i = 0; i < count; ++i) {
-        out.glyph[i] = info[i].codepoint;
-        out.cluster[i] = info[i].cluster;
-        out.x_adv[i] = pos[i].x_advance;
-        out.x_off[i] = pos[i].x_offset;
-        out.y_off[i] = pos[i].y_offset;
-        pen += pos[i].x_advance;
+        out.glyph[i] = glyphs[i].glyph;
+        out.cluster[i] = glyphs[i].cluster;
+        out.x_adv[i] = glyphs[i].x_advance;
+        out.x_off[i] = glyphs[i].x_offset;
+        out.y_off[i] = glyphs[i].y_offset;
+        pen += glyphs[i].x_advance;
     }
     out.count = count;
     out.width_px = static_cast<int>((pen + 63) / 64);
@@ -750,15 +485,18 @@ lx::text::line_fit lx::text::fit_line(const shaped_line& line, int max_width_px)
     if (line.width_px <= max_width_px)
         return {line.count, line.width_px, false};
 #if defined(LUMEN_HAS_TEXT)
-    auto& cache = detail::face_cache::instance();
-    auto lock = cache.lock();
-    hb_font_t* hb = cache.acquire_locked(line.font);
-    if (!hb)
+    auto& faces = face_cache::shared();
+    auto lock = faces.lock();
+    const face_id id = faces.resolve_locked(line.font.family, line.font.weight, line.font.style);
+    if (!id.valid())
         return {};
-    const detail::ellipsis_run* ell = detail::ellipsis_locked(hb, cache.generation_locked());
-    if (!ell || ell->width_px > max_width_px)
+    const auto ell = detail::ellipsis_locked(id, size_26_6_from_pt(line.font.size_pt));
+    if (!ell)
         return {};
-    const int avail = max_width_px - ell->width_px;
+    const int ell_w = detail::width_px(*ell);
+    if (ell_w > max_width_px)
+        return {};
+    const int avail = max_width_px - ell_w;
     unsigned best = 0;
     int best_w = 0;
     long pen = 0;
@@ -774,7 +512,7 @@ lx::text::line_fit lx::text::fit_line(const shaped_line& line, int max_width_px)
         }
         pen += line.x_adv[i];
     }
-    return {best, best_w + ell->width_px, true};
+    return {best, best_w + ell_w, true};
 #else
     return {};
 #endif
@@ -786,18 +524,18 @@ lx::result<void> lx::text::render_line(const shaped_line& line, line_fit fit, ra
         target.stride_px < target.width)
         return lx::invalid_argument("render_line: bad target");
 #if defined(LUMEN_HAS_TEXT)
-    auto& cache = detail::face_cache::instance();
-    auto lock = cache.lock();
-    hb_font_t* hb = cache.acquire_locked(line.font);
-    FT_Face face = cache.face_locked();
-    if (!hb || !face)
-        return lx::make_error(lx::error_domain::io, 0, "no font face resolved");
-    const unsigned generation = cache.generation_locked();
+    auto& faces = face_cache::shared();
+    auto lock = faces.lock();
+    const face_id id = faces.resolve_locked(line.font.family, line.font.weight, line.font.style);
+    const std::int32_t size = size_26_6_from_pt(line.font.size_pt);
+    auto* face = static_cast<FT_Face>(faces.use_locked(id, size).ft_face);
+    if (!face)
+        return lx::make_error(lx::io_err::not_found, "no font face resolved");
     auto& glyphs = detail::glyph_cache::instance();
     long pen = 0;
     const auto draw = [&](std::uint32_t glyph, std::int32_t adv, std::int32_t xo,
                           std::int32_t yo) {
-        if (const auto* g = glyphs.get(face, generation, glyph)) {
+        if (const auto* g = glyphs.get(face, id.value, size, glyph)) {
             const int x = baseline.x + detail::round_26_6(pen + xo) + g->left;
             const int y = baseline.y - detail::round_26_6(yo) - g->top;
             detail::blend_glyph(*g, glyphs.coverage(*g), color, target, x, y);
@@ -810,9 +548,9 @@ lx::result<void> lx::text::render_line(const shaped_line& line, line_fit fit, ra
     if (fit.ellipsized) {
         // Placed where the kept prefix ends, rounded as `fit_line` measured it.
         pen = static_cast<long>((pen + 63) / 64) * 64;
-        if (const detail::ellipsis_run* ell = detail::ellipsis_locked(hb, generation))
-            for (unsigned i = 0; i < ell->count; ++i)
-                draw(ell->glyph[i], ell->x_adv[i], ell->x_off[i], ell->y_off[i]);
+        if (const auto ell = detail::ellipsis_locked(id, size))
+            for (const shaped_glyph& g : ell->glyphs)
+                draw(g.glyph, g.x_advance, g.x_offset, g.y_offset);
     }
     return {};
 #else

@@ -34,6 +34,12 @@ vec4 lx_window(vec4 r, vec4 clip) {
     }
     return vec4(max(w.xy, vec2(0.0)), min(w.zw, u_target));
 }
+// The instance colour as the stage hands it to the fragment: the premultiplied encoded colour
+// as emitted. A prologue that blends in linear light (ui_vk inside the compositor's F16 pass)
+// defines LX_COLOR_HOOKS and its own `lx_instance_color` before this file.
+#ifndef LX_COLOR_HOOKS
+vec4 lx_instance_color(vec4 c) { return c; }
+#endif
 void lx_cull() { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); }
 // Places this vertex of the window's two triangles; false (and culled) when it is empty.
 bool lx_place(vec4 w) {
