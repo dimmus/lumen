@@ -1,5 +1,8 @@
 #include "lumen_test.hpp"
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 import std;
 import lx.foundation;
 import lx.runtime;
@@ -395,6 +398,70 @@ LUMEN_TEST(caps_are_fixed) {
     // The slot was reused under a new generation: the old id stays dead.
     atlas_tile t{};
     LUMEN_CHECK(!b->lookup(ids[5], t) && b->lookup(*again, t));
+}
+
+namespace {
+
+/// Pages of [p, p + bytes) resident in this process, by mincore.
+[[nodiscard]] std::size_t resident_pages(const void* p, std::size_t bytes) {
+    const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    std::vector<unsigned char> v((bytes + page - 1) / page);
+    if (::mincore(const_cast<void*>(p), bytes, v.data()) != 0)
+        return ~std::size_t{0};
+    std::size_t n = 0;
+    for (unsigned char c : v)
+        n += c & 1u;
+    return n;
+}
+
+} // namespace
+
+// A page is a 4 MiB mapping (R8 at its 2048² maximum) but costs memory only where tiles
+// are written: the compositor's title glyphs touch a few hundred KB of it. A rebuild hands
+// back the rows it empties, and its scratch is gone when it returns.
+LUMEN_TEST(page_memory_is_resident_only_where_written) {
+    const std::size_t page_bytes = std::size_t{lx::gfx::k_atlas_page_max} * lx::gfx::k_atlas_page_max;
+    auto a = std::make_unique<atlas>();
+    a->begin_frame(1);
+    auto first = a->allocate(atlas_format::r8, 16, 16);
+    LUMEN_CHECK(static_cast<bool>(first));
+    write_pattern(*a, *first, 7);
+    const auto view = a->page(0);
+    LUMEN_CHECK(view.valid());
+    const std::size_t one_tile = resident_pages(view.pixels, page_bytes);
+    std::printf("    one 16x16 tile: %zu resident pages of the 4 MiB page\n", one_tile);
+    LUMEN_CHECK(one_tile >= 1 && one_tile <= 16);
+
+    // Fill most of the page with glyphs, then let all but a few go stale and rebuild.
+    test_rng rng{};
+    std::vector<atlas_tile_id> ids;
+    for (unsigned i = 0; i < 6000; ++i) {
+        unsigned w = 0;
+        unsigned h = 0;
+        glyph_box(rng, w, h);
+        auto id = a->allocate(atlas_format::r8, w, h);
+        if (!id || a->page(0).pixels != view.pixels)
+            break;
+        atlas_tile t{};
+        if (!a->lookup(*id, t) || t.page != 0)
+            break;
+        write_pattern(*a, *id, i);
+        ids.push_back(*id);
+    }
+    const std::size_t filled = resident_pages(view.pixels, page_bytes);
+    for (std::uint64_t f = 2; f <= 200; ++f) {
+        a->begin_frame(f);
+        for (unsigned i = 0; i < ids.size(); i += 50)
+            a->touch(ids[i]);
+    }
+    auto r = a->rebuild(0);
+    LUMEN_CHECK(static_cast<bool>(r));
+    const std::size_t after = resident_pages(view.pixels, page_bytes);
+    std::printf("    %zu tiles: %zu resident pages; after a rebuild keeping %u: %zu\n",
+                ids.size(), filled, r ? r->moved : 0u, after);
+    LUMEN_CHECK(after * 4 < filled);
+    for (unsigned i = 0; i < ids.size(); i += 50)
+        LUMEN_CHECK(pattern_intact(*a, ids[i], i));
 }
 
 int main(int argc, char** argv) {

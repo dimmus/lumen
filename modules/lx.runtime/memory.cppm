@@ -81,6 +81,42 @@ private:
     unsigned offset_ = 0;
 };
 
+/// Zero-filled anonymous pages straight from the kernel, outside the malloc heap, in small
+/// pages (no transparent huge pages): a page becomes resident when first written and stops
+/// being resident at `release` or `discard`.
+/// For large buffers that fill sparsely or are rarely needed (atlas pages and their rebuild
+/// scratch, cache arenas). A heap block of the same size is not lazy in practice: glibc
+/// raises its mmap threshold (up to 32 MiB) once a mapped block is freed — Mesa does that
+/// during start-up — after which a large calloc is carved from dirty brk memory and
+/// zero-filled whole.
+class page_mapping {
+public:
+    page_mapping() = default;
+    ~page_mapping();
+
+    page_mapping(const page_mapping&) = delete;
+    page_mapping& operator=(const page_mapping&) = delete;
+    page_mapping(page_mapping&& other) noexcept;
+    page_mapping& operator=(page_mapping&& other) noexcept;
+
+    /// Maps `bytes` (rounded up to whole pages), releasing any previous mapping first.
+    /// False, and nothing mapped, when `bytes` is 0 or the kernel refuses.
+    [[nodiscard]] bool map(std::size_t bytes);
+    void release();
+    /// The whole pages inside [offset, offset + bytes) go back to the kernel: they read as
+    /// zero again and are not resident until written. Partial pages at either end are kept.
+    void discard(std::size_t offset, std::size_t bytes);
+
+    [[nodiscard]] std::byte* data() const { return data_; }
+    /// Bytes mapped (whole pages), 0 when nothing is.
+    [[nodiscard]] std::size_t size() const { return size_; }
+    [[nodiscard]] bool valid() const { return data_ != nullptr; }
+
+private:
+    std::byte* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
 /// Global memory budget coordinator — pressure callbacks fan out to subscribers.
 class memory_budget_coordinator {
 public:
@@ -157,6 +193,68 @@ void lx::runtime::memory_arena::release() {
     capacity_ = 0;
     mapped_bytes_ = 0;
     offset_ = 0;
+}
+
+namespace {
+
+std::size_t lx_runtime_page_size() {
+    const long page = ::sysconf(_SC_PAGESIZE);
+    return page > 0 ? static_cast<std::size_t>(page) : std::size_t{4096};
+}
+
+} // namespace
+
+lx::runtime::page_mapping::~page_mapping() {
+    release();
+}
+
+lx::runtime::page_mapping::page_mapping(page_mapping&& other) noexcept
+    : data_{std::exchange(other.data_, nullptr)}, size_{std::exchange(other.size_, 0)} {}
+
+lx::runtime::page_mapping& lx::runtime::page_mapping::operator=(page_mapping&& other) noexcept {
+    if (this != &other) {
+        release();
+        data_ = std::exchange(other.data_, nullptr);
+        size_ = std::exchange(other.size_, 0);
+    }
+    return *this;
+}
+
+bool lx::runtime::page_mapping::map(std::size_t bytes) {
+    release();
+    const std::size_t page = lx_runtime_page_size();
+    if (bytes == 0 || bytes > std::numeric_limits<std::size_t>::max() - (page - 1))
+        return false;
+    const std::size_t mapped = (bytes + page - 1) / page * page;
+    void* base = ::mmap(nullptr, mapped, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (base == MAP_FAILED)
+        return false;
+    // With transparent huge pages set to `always`, the first write into a 2 MiB-aligned
+    // stretch faults in a whole huge page: one glyph would make 2 MiB of an atlas page
+    // resident. These buffers are sparse by design, so they take small pages.
+    (void)::madvise(base, mapped, MADV_NOHUGEPAGE);
+    data_ = static_cast<std::byte*>(base);
+    size_ = mapped;
+    return true;
+}
+
+void lx::runtime::page_mapping::release() {
+    if (data_)
+        ::munmap(data_, size_);
+    data_ = nullptr;
+    size_ = 0;
+}
+
+void lx::runtime::page_mapping::discard(std::size_t offset, std::size_t bytes) {
+    if (!data_ || offset >= size_ || bytes == 0)
+        return;
+    const std::size_t page = lx_runtime_page_size();
+    const std::size_t end = bytes > size_ - offset ? size_ : offset + bytes;
+    const std::size_t first = (offset + page - 1) / page * page;
+    const std::size_t last = end / page * page;
+    if (last > first)
+        (void)::madvise(data_ + first, last - first, MADV_DONTNEED);
 }
 
 lx::runtime::memory_arena::~memory_arena() { release(); }

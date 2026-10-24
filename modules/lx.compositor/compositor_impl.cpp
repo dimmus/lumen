@@ -4915,12 +4915,18 @@ lx::result<void> compositor_impl::setup_gl_present() {
         return initialized.get_error();
     lx::trace::timeline_instant("startup", "gl program ready");
 
-    // UI primitives (ADR-010 §4.11) on GLES 3.1; programs built (or loaded from the binary
-    // cache) now, not on the first frame with a decoration. On GLES 2 the frames that carry
-    // primitives are lowered to blits.
+    // UI primitives (ADR-010 §4.11) on GLES 3.1. The programs decorations draw every frame —
+    // border and title fills (quad), title and close glyphs (mono_sprite) — are built (or
+    // loaded from the binary cache) now, not on the first decorated frame; the rest
+    // (shadow, underline, colour glyphs) only if a frame ever carries them, since each linked
+    // program holds driver memory. On GLES 2 the frames that carry primitives are lowered
+    // to blits.
     if (egl_.gles_at_least(3, 1)) {
         auto ui = std::make_unique<gfx::ui_gl_renderer>();
-        if (auto ready = ui->initialize(); ready) {
+        gfx::ui_gl_options ui_options{};
+        ui_options.prebuild_kinds = gfx::ui_gl_kind_bit(gfx::primitive_kind::quad) |
+                                    gfx::ui_gl_kind_bit(gfx::primitive_kind::mono_sprite);
+        if (auto ready = ui->initialize(ui_options); ready) {
             ui->set_surface_compositor(&gl_compositor_);
             ui_gl_ = std::move(ui);
             lx::trace::timeline_instant("startup", "ui_gl ready");
