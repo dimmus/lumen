@@ -186,6 +186,11 @@ public:
     /// The directory registered with fontconfig ("" when none was, or none exists).
     /// Initializes the cache (fontconfig, FreeType) on first use, as a resolution would.
     [[nodiscard]] const char* font_dir();
+    /// Registers one more directory of fonts with this cache's fontconfig configuration,
+    /// beside the bundled one (tests register tests/fonts this way). Families resolved
+    /// afterwards may come from it; faces already loaded stay. False when the directory does
+    /// not exist or fontconfig refuses it. Takes the lock.
+    [[nodiscard]] bool add_font_dir(const char* dir);
 
 private:
     face_cache(const char* font_dir, bool is_shared);
@@ -764,6 +769,19 @@ lx::text::face_cache_stats lx::text::face_cache::stats() {
     for (const auto& s : slots_)
         out.live += s.hb ? 1u : 0u;
     return out;
+}
+
+bool lx::text::face_cache::add_font_dir(const char* dir) {
+    std::lock_guard lock{mutex_};
+#if defined(LUMEN_HAS_TEXT)
+    if (!is_dir(dir) || !init_locked())
+        return false;
+    return FcConfigAppFontAddDir(static_cast<FcConfig*>(config_),
+                                 reinterpret_cast<const FcChar8*>(dir)) != 0;
+#else
+    (void)dir;
+    return false;
+#endif
 }
 
 const char* lx::text::face_cache::font_dir() {

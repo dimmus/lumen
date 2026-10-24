@@ -275,6 +275,12 @@ not use `:ui_vk` yet, so nothing in production depends on this.
   contrast exponent (theme `text.contrast`, default 1.0 dark / 1.2 light, validated
   against the sRGB rendering in the golden tests, §8.4). The compositor's own chrome
   renders inside its linear F16 pass and uses the same exponent.
+  Measured in Phase 2 (`test_ui_golden` `text_contrast_keeps_stem_coverage`: IBM Plex Sans at
+  10–16 px, coverage from the CPU reference, the linear blend composed from it since no
+  renderer has a linear target yet): the starting values do not hold the 3 % bound — linear
+  blending thickens One Dark's text by 26 % at exponent 1.0 and thins One Light's by 31 % at
+  1.2. The exponent has to rise for light-on-dark and fall below 1 for dark-on-light: 1.58–1.77
+  (1.67 used) dark and 0.54–0.61 (0.57 used) light keep the mean stem coverage within 3 %.
 - 10-bit output: when `zwp_linux_dmabuf_v1` feedback offers `XRGB2101010` the client
   swapchain uses it; the compositor already scans out A2B10G10R10.
 
@@ -329,6 +335,20 @@ a warm shape cache 15–21 ms p50 (itemization 7–9 ms of it, no shaping calls)
 width 0.49–0.67 ms p50 / 0.8–4 ms p95 with no shaping; 6.9 MB of layout storage (vector
 growth slack included). A whole-document relayout is therefore worker work (below); scrolling
 does not relayout.
+
+As built in Phase 2 (`:raster`, `lx.ui:text_node`): `lx.text` depends on `lx.gfx` for the atlas
+(tile ids and `atlas::insert` / `lookup` / `touch` only). `glyph_cache` is a set-associative
+table (16 384 entries, 8 ways, LRU replacement that releases a replaced way's tile unless it was
+drawn in the atlas's current frame) keyed by (face, size × scale, variant, glyph, hinting); the
+pen rounds to the nearest quarter pixel (`glyph_pen`), the variant moves the outline before
+FreeType renders it; colour glyphs are rasterised once at variant 0 and answer every variant;
+a tile the atlas evicted is rasterised again on the frame that needs it. The text node is
+`text_block_node` (the placeholder `text_node` of `:widgets_decl` keeps its name until Phase 3):
+it binary-searches the lines the clip reaches (widened by an em) before touching a glyph, takes
+the face lock once per emit and only on a miss, and emits through `draw_scope::glyph` with
+colours packed once per run. The golden text cases use only bundled fonts plus two subsets in
+`tests/fonts` (IBM Plex Sans Arabic and Twemoji Mozilla COLRv0, renamed): CPU, GL and Vulkan
+(lavapipe) agree within 2/255.
 
 Shaping and rasterising happen on the **worker** affinity when a layout invalidation is
 large (a whole document) and inline on the UI thread when it is small (a label), with the

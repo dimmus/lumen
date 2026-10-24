@@ -120,7 +120,8 @@ lumen_embed_glsl(lx.gfx ui
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/sprite.fs.glsl"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.vs.glsl"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.fs.glsl")
-lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.foundation lx.runtime lx.trace)
+# lx.text:raster writes glyphs into the lx.gfx:atlas (ADR-010 §4.13: tile handles only).
+lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.foundation lx.runtime lx.trace lx.gfx)
 lumen_link_platform_parts(lx.text text)
 # Bundled fonts (assets/fonts, ADR-010 §5.4), registered with fontconfig by lx.text:faces: the
 # source tree's copy, the install relative to the executable, the configured install.
@@ -584,7 +585,8 @@ if(LUMEN_BUILD_TESTS)
         lumen_link_platform(test_ui_golden)
         target_include_directories(test_ui_golden PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
         target_compile_definitions(test_ui_golden PRIVATE
-            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui")
+            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui"
+            LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
         add_test(NAME test_ui_golden COMMAND test_ui_golden)
         # The Vulkan cases again under VK_LAYER_KHRONOS_validation, which must log no error.
         find_file(LUMEN_VK_VALIDATION_LAYER VkLayer_khronos_validation.json
@@ -949,6 +951,8 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_text_raster)
     lumen_link_platform(test_text_raster)
     target_include_directories(test_text_raster PRIVATE tests)
+    target_compile_definitions(test_text_raster PRIVATE
+        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
     add_test(NAME test_text_raster COMMAND test_text_raster)
 
     add_executable(test_text_lines tests/test_text_lines.cpp)

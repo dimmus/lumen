@@ -13,12 +13,13 @@ import std;
 
 // ADR-010 §4.6: faces (fontconfig, FreeType, the face LRU), itemization (fribidi, script,
 // fallback faces, UAX #14 / #29 boundaries), shaping (HarfBuzz, the shape cache) and lines
-// (the retained `text_layout`: wrapping, ellipsis, bidi reordering, hit testing) are
-// partitions; the single-line and paragraph API below shapes through them.
+// (the retained `text_layout`: wrapping, ellipsis, bidi reordering, hit testing) and raster
+// (glyphs into the `lx.gfx:atlas`) are partitions; the single-line and paragraph API below shapes through them.
 export import :faces;
 export import :shape;
 export import :itemize;
 export import :lines;
+export import :raster;
 
 export namespace lx::text {
 

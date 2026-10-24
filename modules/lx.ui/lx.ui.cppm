@@ -25,6 +25,8 @@ export import :decorator;
 export import :reducer;
 export import :widgets_decl;
 export import :root;
+// ADR-010 Phase 2: a retained text layout drawn as atlas glyph sprites.
+export import :text_node;
 
 // Legacy retained-widget API, superseded by :node. Kept until callers migrate.
 export import :widgets;

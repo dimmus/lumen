@@ -20,10 +20,14 @@ import std;
 import lx.foundation;
 import lx.gfx;
 import lx.scene;
+import lx.text;
 import lx.ui;
 
 #ifndef LUMEN_UI_GOLDEN_DIR
 #define LUMEN_UI_GOLDEN_DIR "tests/golden/ui"
+#endif
+#ifndef LUMEN_TEST_FONT_DIR
+#define LUMEN_TEST_FONT_DIR "tests/fonts"
 #endif
 
 namespace ui_golden {
@@ -56,12 +60,31 @@ inline constexpr lx::color k_warning = tok(0xde, 0xc1, 0x84);
     return c;
 }
 
-/// The synthetic atlas tiles the sprite cases sample (text is Phase 2).
+/// The text caches of the text cases: the bundled fonts plus tests/fonts (Lumen Test Arabic,
+/// Lumen Test Emoji), so no glyph comes from a host font. One per process.
+struct text_env {
+    lx::text::face_cache faces{};
+    lx::text::shape_cache shapes{};
+    lx::text::itemizer items{};
+    bool test_fonts = false;
+    text_env() { test_fonts = faces.add_font_dir(LUMEN_TEST_FONT_DIR); }
+    [[nodiscard]] lx::text::text_engine engine() { return {&faces, &shapes, &items}; }
+};
+
+[[nodiscard]] inline text_env& text_fonts() {
+    static const std::unique_ptr<text_env> env = std::make_unique<text_env>();
+    return *env;
+}
+
+/// The synthetic atlas tiles the sprite cases sample, and the glyph cache the text cases
+/// rasterise into the same atlas.
 struct tiles {
     lx::gfx::atlas_tile disc{};  ///< R8 16 × 16: an antialiased disc of radius 7
     lx::gfx::atlas_tile ring{};  ///< R8 12 × 12: a 2 px ring
     lx::gfx::atlas_tile ramp{};  ///< R8 32 × 8: coverage 0 → 255 left to right
     lx::gfx::atlas_tile image{}; ///< RGBA8 24 × 24: four premultiplied quadrants, one translucent
+    /// Over the atlas `make_tiles` filled (which must outlive it).
+    std::shared_ptr<lx::text::glyph_cache> glyphs{};
 };
 
 /// Fills `a` with the tiles. Deterministic: the same atlas state every call.
@@ -105,6 +128,7 @@ struct tiles {
         auto id = a.insert(f, w, h, {px, static_cast<std::size_t>(stride) * h}, stride);
         return id && a.lookup(*id, tile);
     };
+    out.glyphs = std::make_shared<lx::text::glyph_cache>(a);
     return put(atlas_format::r8, 16, 16, disc, 16, out.disc) &&
            put(atlas_format::r8, 12, 12, ring, 12, out.ring) &&
            put(atlas_format::r8, 32, 8, ramp, 32, out.ramp) &&
@@ -299,6 +323,122 @@ inline void build_mixed_order(lx::ui::draw_scope& s, const tiles& t) {
     s.quad({140, 6, 12, 12}, solid(k_text, 3.f));
 }
 
+// ── Text (ADR-010 §8.4): `text_block_node` → mono / poly sprites and underlines ──
+
+/// One unwrapped block of `utf8` at `px` (CSS pixels at scale 1) with its top-left at `at`.
+inline void text_line(lx::ui::draw_scope& s, const tiles& t, lx::point2i at, const char* utf8,
+                      const char* family, float px, lx::color color, float scale = 1.f,
+                      std::span<const lx::text::text_attr> attrs = {},
+                      lx::text::glyph_hinting hinting = lx::text::glyph_hinting::none) {
+    lx::ui::text_block_props p{};
+    p.text = utf8;
+    p.font = {family, px * 0.75f}; // points at 96 dpi
+    p.color = color;
+    p.scale = scale;
+    p.wrap = lx::text::text_wrap::none;
+    p.attrs = attrs;
+    p.hinting = hinting;
+    p.context = {text_fonts().engine(), t.glyphs.get()};
+    auto node = std::make_unique<lx::ui::text_block_node>();
+    node->apply(p);
+    const lx::size2i size = node->measure({}, lx::ui::size_hint::preferred);
+    node->arrange({at.x, at.y, size.width, size.height});
+    node->emit(s);
+}
+
+inline constexpr const char* k_arabic_family = "Lumen Test Arabic";
+inline constexpr const char* k_emoji_family = "Lumen Test Emoji";
+
+/// 10, 12, 14 and 16 px at scale 1 (the UI sizes of §5.4), then 12 px with the light
+/// autohinter a theme may select below scale 1.5.
+inline void build_text_sizes(lx::ui::draw_scope& s, const tiles& t) {
+    const float sizes[4] = {10.f, 12.f, 14.f, 16.f};
+    int y = 4;
+    for (float px : sizes) {
+        text_line(s, t, {6, y}, "Lumen 0123 quick brown fox", lx::text::k_ui_family, px, k_text);
+        y += static_cast<int>(px * 1.5f);
+    }
+    text_line(s, t, {6, y}, "Lumen 0123 quick brown fox", lx::text::k_ui_family, 12.f, k_text,
+              1.f, {}, lx::text::glyph_hinting::light);
+}
+
+/// One 14 px block at scales 1, 1.25, 1.5 and 2: glyphs rasterised at size × scale.
+inline void build_text_scales(lx::ui::draw_scope& s, const tiles& t) {
+    const float scales[4] = {1.f, 1.25f, 1.5f, 2.f};
+    int y = 4;
+    for (float sc : scales) {
+        text_line(s, t, {6, y}, "Hamburgefonstiv 0.125", lx::text::k_ui_family, 14.f, k_accent, sc);
+        y += static_cast<int>(14.f * 1.5f * sc);
+    }
+}
+
+/// Latin and Cyrillic in IBM Plex Sans; Arabic with Latin and digits in Lumen Test Arabic (a
+/// right-to-left paragraph: joining forms, bidi reordering).
+inline void build_text_scripts(lx::ui::draw_scope& s, const tiles& t) {
+    text_line(s, t, {6, 4}, "Latin, \xD0\x9A\xD0\xB8\xD1\x80\xD0\xB8\xD0\xBB\xD0\xBB\xD0\xB8\xD1\x86"
+                            "\xD0\xB0: \xD1\x81\xD1\x8A\xD0\xB5\xD1\x88\xD1\x8C \xD0\xB5\xD1\x89"
+                            "\xD1\x91",
+              lx::text::k_ui_family, 14.f, k_text);
+    text_line(s, t, {6, 28},
+              "\xD8\xA7\xD9\x84\xD8\xB9\xD8\xB1\xD8\xA8\xD9\x8A\xD8\xA9: \xD9\x85\xD8\xB1\xD8\xAD"
+              "\xD8\xA8\xD8\xA7 \xD8\xA8\xD8\xA7\xD9\x84\xD8\xB9\xD8\xA7\xD9\x84\xD9\x85 42 Lumen",
+              k_arabic_family, 14.f, k_text);
+    text_line(s, t, {6, 56}, "Lumen \xD0\x9B\xD1\x8E\xD0\xBC\xD0\xB5\xD0\xBD", lx::text::k_ui_family,
+              16.f, k_success);
+}
+
+/// Span colours and underlines: a link (accent, straight), a spelling mark (wavy, error), a
+/// wavy underline in the span's colour, a straight one in the node's.
+inline void build_text_underlines(lx::ui::draw_scope& s, const tiles& t) {
+    // "plain link spelling wavy under"
+    //  0     6    11       20   25
+    static const lx::text::text_attr attrs[] = {
+        {6, 10, lx::text::weight::normal, lx::text::style::normal, 0x74ade8ffu,
+         lx::text::text_underline::single, lx::text::span_role::link, 1},
+        {11, 19, lx::text::weight::normal, lx::text::style::normal, 0,
+         lx::text::text_underline::none, lx::text::span_role::spell, 0},
+        {20, 24, lx::text::weight::normal, lx::text::style::normal, 0xdec184ffu,
+         lx::text::text_underline::wavy, lx::text::span_role::none, 0},
+        {25, 30, lx::text::weight::bold, lx::text::style::normal, 0,
+         lx::text::text_underline::single, lx::text::span_role::none, 0},
+    };
+    text_line(s, t, {6, 6}, "plain link spelling wavy under", lx::text::k_ui_family, 14.f, k_text,
+              1.f, attrs);
+    text_line(s, t, {6, 32}, "plain link spelling wavy under", lx::text::k_ui_family, 14.f, k_text,
+              1.5f, attrs);
+}
+
+/// Colour glyphs (COLRv0, `poly_sprite`) beside mono text, and faded by the scope opacity.
+inline void build_text_emoji(lx::ui::draw_scope& s, const tiles& t) {
+    const char* emoji = "\xF0\x9F\x98\x80\xE2\x9D\xA4\xF0\x9F\x91\x8D\xF0\x9F\x9A\x80\xE2\xAD\x90";
+    text_line(s, t, {6, 4}, "Lumen", lx::text::k_ui_family, 16.f, k_text);
+    text_line(s, t, {60, 4}, emoji, k_emoji_family, 16.f, k_text);
+    text_line(s, t, {6, 30}, emoji, k_emoji_family, 24.f, k_text);
+    s.push_opacity(0.5f);
+    text_line(s, t, {150, 30}, emoji, k_emoji_family, 12.f, k_text, 1.5f);
+    s.pop();
+}
+
+/// A wrapped paragraph under a content mask that hides its first and last lines: the node
+/// skips lines outside the clip, the mask cuts the rest.
+inline void build_text_clip(lx::ui::draw_scope& s, const tiles& t) {
+    lx::ui::text_block_props p{};
+    p.text = "The quick brown fox jumps over the lazy dog. Pack my box with five dozen "
+             "liquor jugs. Sphinx of black quartz, judge my vow.";
+    p.font = {lx::text::k_ui_family, 12.f * 0.75f};
+    p.color = k_text;
+    p.context = {text_fonts().engine(), t.glyphs.get()};
+    auto node = std::make_unique<lx::ui::text_block_node>();
+    node->apply(p);
+    const lx::size2i size = node->measure({{0, 0}, {150, 99999}}, lx::ui::size_hint::preferred);
+    node->arrange({6, 4, 150, size.height});
+    s.push_clip({0, 22, 200, 37});
+    node->emit(s);
+    s.pop();
+    lx::ui::quad_style outline = bordered(with_alpha(k_text, 0.f), with_alpha(k_accent, 0.5f), 1.f, 0.f);
+    s.quad({2, 21, 160, 39}, outline);
+}
+
 [[nodiscard]] inline std::span<const golden_case> cases() {
     static const golden_case k_cases[] = {
         {"quad_radii", 232, 48, k_editor, build_quad_radii},
@@ -312,6 +452,12 @@ inline void build_mixed_order(lx::ui::draw_scope& s, const tiles& t) {
         {"underlines", 200, 56, k_editor, build_underlines},
         {"content_mask", 112, 64, k_editor, build_content_mask},
         {"mixed_order", 160, 72, k_editor, build_mixed_order},
+        {"text_sizes", 232, 104, k_editor, build_text_sizes},
+        {"text_scales", 320, 136, k_editor, build_text_scales},
+        {"text_scripts", 232, 84, k_editor, build_text_scripts},
+        {"text_underlines", 312, 64, k_editor, build_text_underlines},
+        {"text_emoji", 264, 72, k_surface, build_text_emoji},
+        {"text_clip", 168, 80, k_editor, build_text_clip},
     };
     return k_cases;
 }

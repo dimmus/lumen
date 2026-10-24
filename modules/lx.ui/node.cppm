@@ -118,10 +118,19 @@ public:
                 lx::gfx::sprite_uv uv, lx::color color, std::array<float, 4> params = {});
     /// Append a straight or wavy line of `thickness` px across `bounds`.
     void underline(lx::rect2i bounds, lx::color color, float thickness, bool wavy = false);
+    /// A glyph of a text run (`text_block_node`): `sprite` with the colour already packed —
+    /// premultiplied halves with the scope opacity folded in by the caller, once per run
+    /// (`gfx::premultiplied_half` of the colour at `opacity()` × its alpha) — and no params:
+    /// the identity rotation for a `mono_sprite`, square corners for a `poly_sprite`. No half
+    /// conversion per glyph.
+    void glyph(lx::gfx::primitive_kind kind, std::uint8_t page, lx::rect2i bounds,
+               lx::gfx::sprite_uv uv, lx::gfx::packed_rgba color);
 
     [[nodiscard]] lx::rect2i clip() const;
     [[nodiscard]] float opacity() const;
     [[nodiscard]] unsigned emitted() const;
+    /// The offset every emitter adds to its bounds (the sum of `push_origin`s).
+    [[nodiscard]] lx::point2i origin() const;
 
 private:
     struct frame {
@@ -552,6 +561,41 @@ void lx::ui::draw_scope::underline(lx::rect2i bounds, lx::color color, float thi
     ++emitted_;
 }
 
+void lx::ui::draw_scope::glyph(lx::gfx::primitive_kind kind, std::uint8_t page,
+                               lx::rect2i bounds, lx::gfx::sprite_uv uv,
+                               lx::gfx::packed_rgba color) {
+    if (!out_ || (kind != lx::gfx::primitive_kind::mono_sprite &&
+                  kind != lx::gfx::primitive_kind::poly_sprite))
+        return;
+    const frame& f = top();
+    lx::rect2i placed = bounds;
+    placed.x += f.origin.x;
+    placed.y += f.origin.y;
+    const lx::rect2i visible = lx_ui_intersect(placed, f.clip);
+    if (visible.width <= 0 || visible.height <= 0)
+        return;
+
+    lx::gfx::sprite_instance s{};
+    lx_ui_write_rect(s.bounds, placed);
+    lx_ui_write_rect(s.clip, f.clip);
+    s.uv[0] = uv.u0;
+    s.uv[1] = uv.v0;
+    s.uv[2] = uv.u1;
+    s.uv[3] = uv.v1;
+    s.page = page;
+    s.color[0] = color.r;
+    s.color[1] = color.g;
+    s.color[2] = color.b;
+    s.color[3] = color.a;
+    if (kind == lx::gfx::primitive_kind::mono_sprite) {
+        s.params[0] = 0x3C00u; // f16 1: the identity rotation (cos, sin, −sin, cos)
+        s.params[3] = 0x3C00u;
+    }
+    out_->push_sprite(kind, page, s, visible, out_->orders().assign(visible));
+    ++emitted_;
+}
+
+lx::point2i lx::ui::draw_scope::origin() const { return top().origin; }
 lx::rect2i lx::ui::draw_scope::clip() const { return top().clip; }
 float lx::ui::draw_scope::opacity() const { return top().opacity; }
 unsigned lx::ui::draw_scope::emitted() const { return emitted_; }
