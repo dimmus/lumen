@@ -307,6 +307,21 @@ struct capture_cursor {
     unsigned generation = 0;
 };
 
+/// Draws a frame's UI stream (ADR-010 §4.11: server-side frames' fills and title glyphs) in a
+/// re-composite, in place of compositing its blits. Set by the render thread for a frame with
+/// primitives on a path with a primitive renderer; `blits` are then the frame's draws in draw
+/// order — what the stream's `surface` refs index — as the capture adjusted them (the pointer
+/// hidden, moved by `-offset`, the crop, which the stream's primitives move by too).
+struct capture_paint {
+    void* user = nullptr;
+    bool (*cpu)(void* user, const lx::gfx::pixel_surface& dst, lx::color clear,
+                const lx::gfx::blit_command* blits, unsigned count, lx::point2i offset,
+                const lx::gfx::damage_region& region) = nullptr;
+    bool (*gl)(void* user, unsigned framebuffer, unsigned width, unsigned height,
+               lx::color clear, const lx::gfx::blit_command* blits, unsigned count,
+               lx::point2i offset, const lx::gfx::damage_region& region) = nullptr;
+};
+
 /// One composited frame of an output, as the render thread hands it to capture.
 struct capture_frame_source {
     unsigned frame = 0;
@@ -322,6 +337,8 @@ struct capture_frame_source {
     /// Vulkan: the target holding the frame.
     lx::gfx::render_target* vk_target = nullptr;
     capture_cursor cursor{};
+    /// The frame's stream, when it has primitives: what re-composites draw instead of `blits`.
+    capture_paint paint{};
 };
 
 /// A window capture waiting for its view (`capture_renderer::toplevel_jobs`).
@@ -457,6 +474,14 @@ private:
     void run_finish(const capture_job& job, capture_channel& out);
     /// The pointer (if any) for job `job` onto a GL framebuffer / client rows.
     bool paint_cursor_gl(unsigned framebuffer, lx::size2i size, const capture_cursor& cursor);
+    /// A re-composite of `src` (its draws as `blits`, moved by `-offset`): through its stream
+    /// when it has one (`capture_paint`), else the draws composited as blits.
+    bool recomposite_cpu(const capture_frame_source& src, const lx::gfx::pixel_surface& dst,
+                         lx::color clear, const lx::gfx::blit_command* blits, lx::point2i offset,
+                         const lx::gfx::damage_region& region);
+    bool recomposite_gl(const capture_frame_source& src, unsigned framebuffer, unsigned width,
+                        unsigned height, lx::color clear, const lx::gfx::blit_command* blits,
+                        lx::point2i offset, const lx::gfx::damage_region& region);
     void remove_pending(unsigned index);
     /// Removes a job that will not run, telling UI (its guard is let go).
     void drop_pending(unsigned index, capture_channel& out);

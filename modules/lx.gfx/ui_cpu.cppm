@@ -90,6 +90,11 @@ export namespace lx::gfx {
 // size) samples the nearest texel exactly; anything else is bilinear at (u − ½, v − ½)
 // with the sample point clamped to the tile's texel centres, so nothing outside the tile
 // is ever read. `params` (the rotation) is not applied in Phase 1. path has no `params`.
+// Flags bits 1–3: an output transform (`lx::buffer_transform`, 0 normal) the view turned the
+// sprite by (`draw_list::transform_primitives`): `bounds` is then the turned box and the
+// pixel's centre is mapped back into the unturned one through `source_basis_for` — the map
+// a blit's buffer transform samples through — before the rules above (whole pixels at 1:1
+// compare the unturned size with the tile).
 //
 // poly_sprite. An RGBA8 page (premultiplied, R, G, B, A bytes), sampled as above, × the
 // instance colour component-wise (a premultiplied multiplier: white at alpha o fades to
@@ -1097,10 +1102,15 @@ void ui_cpu_sprite(const ui_cpu_frame& f, lx::gfx::primitive_kind kind,
     const float th = static_cast<float>(t.v1 - t.v0);
     const float bx = sp.bounds[0];
     const float by = sp.bounds[1];
-    const float ku = tw / sp.bounds[2];
-    const float kv = th / sp.bounds[3];
-    const bool nearest = bx == std::floor(bx) && by == std::floor(by) && sp.bounds[2] == tw &&
-                         sp.bounds[3] == th;
+    // A turned sprite: its unturned size, and the basis mapping its pixels back into it.
+    const unsigned xf = (sp.flags >> 1u) & 7u;
+    const lx::gfx::source_basis basis = lx::gfx::source_basis_for(static_cast<lx::buffer_transform>(xf));
+    const bool turned = xf != 0 && basis.dx[0] == 0.f;
+    const float cw = turned ? sp.bounds[3] : sp.bounds[2];
+    const float ch = turned ? sp.bounds[2] : sp.bounds[3];
+    const float ku = tw / cw;
+    const float kv = th / ch;
+    const bool nearest = bx == std::floor(bx) && by == std::floor(by) && cw == tw && ch == th;
     const rgba color = half4(sp.color);
     const bool grayscale = poly && (sp.flags & 1u) != 0;
     rbox mask{};
@@ -1121,7 +1131,20 @@ void ui_cpu_sprite(const ui_cpu_frame& f, lx::gfx::primitive_kind kind,
         for (int x = win.x0; x < win.x1; ++x) {
             const float px = static_cast<float>(x) + 0.5f;
             float texel[4]{};
-            if (nearest)
+            if (xf != 0) {
+                // The pixel's centre in the unturned box: the basis is a signed permutation,
+                // so whole-pixel offsets stay exact.
+                const float dx = px - bx;
+                const float dy = py - by;
+                const float cx = basis.origin[0] * cw + basis.dx[0] * dx + basis.dy[0] * dy;
+                const float cy = basis.origin[1] * ch + basis.dx[1] * dx + basis.dy[1] * dy;
+                if (nearest)
+                    fetch(t, t.u0 + static_cast<int>(std::floor(cx)),
+                          t.v0 + static_cast<int>(std::floor(cy)), texel);
+                else
+                    sample(t, static_cast<float>(t.u0) + cx * ku, static_cast<float>(t.v0) + cy * kv,
+                           texel);
+            } else if (nearest)
                 fetch(t, t.u0 + (x - ox), t.v0 + (y - oy), texel);
             else
                 sample(t, static_cast<float>(t.u0) + (px - bx) * ku, v, texel);

@@ -24,6 +24,29 @@ float lx_sin(float x) {
 float lx_cos(float x) { return lx_sin(x + LX_PI * 0.5); }
 float lx_srgb_decode(float v) { return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); }
 float lx_srgb_encode(float v) { return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
+// A premultiplied sRGB-encoded colour as premultiplied linear light (the compositor's F16
+// pass, ADR-010 4.5): the colour decoded, its alpha kept.
+vec4 lx_premul_to_linear(vec4 c) {
+    if (!(c.a > 0.0))
+        return c;
+    float inv = 1.0 / c.a;
+    return vec4(lx_srgb_decode(lx_saturate(c.r * inv)) * c.a, lx_srgb_decode(lx_saturate(c.g * inv)) * c.a,
+                lx_srgb_decode(lx_saturate(c.b * inv)) * c.a, c.a);
+}
+// `source_basis_for` of lx.gfx:renderer: where an output transform's turned box maps back
+// into the unturned one (origin, +x, +y, normalised). Indexed by lx::buffer_transform.
+void lx_basis(uint t, out vec2 o, out vec2 dx, out vec2 dy) {
+    o = vec2(0.0);
+    dx = vec2(1.0, 0.0);
+    dy = vec2(0.0, 1.0);
+    if (t == 1u) { o = vec2(0.0, 1.0); dx = vec2(0.0, -1.0); dy = vec2(1.0, 0.0); }
+    else if (t == 2u) { o = vec2(1.0, 1.0); dx = vec2(-1.0, 0.0); dy = vec2(0.0, -1.0); }
+    else if (t == 3u) { o = vec2(1.0, 0.0); dx = vec2(0.0, 1.0); dy = vec2(-1.0, 0.0); }
+    else if (t == 4u) { o = vec2(1.0, 0.0); dx = vec2(-1.0, 0.0); dy = vec2(0.0, 1.0); }
+    else if (t == 5u) { o = vec2(0.0, 0.0); dx = vec2(0.0, 1.0); dy = vec2(1.0, 0.0); }
+    else if (t == 6u) { o = vec2(0.0, 1.0); dx = vec2(1.0, 0.0); dy = vec2(0.0, -1.0); }
+    else if (t == 7u) { o = vec2(1.0, 1.0); dx = vec2(0.0, -1.0); dy = vec2(-1.0, 0.0); }
+}
 float lx_cbrt(float x) { return x == 0.0 ? 0.0 : (x < 0.0 ? -pow(-x, 1.0 / 3.0) : pow(x, 1.0 / 3.0)); }
 vec4 lx_to_oklab(vec4 c) {
     float inv = c.a > 0.0 ? 1.0 / c.a : 0.0;

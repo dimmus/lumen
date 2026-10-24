@@ -442,9 +442,11 @@ struct stem_coverage {
 // starting values, 1.0 dark / 1.2 light, do not hold the 3 % bound: linear blending thickens
 // light-on-dark text (+26 % at 1.0) and thins dark-on-light text (−31 % at 1.2), so the
 // exponent has to go up for the dark theme and below 1 for the light one. These are the
-// centres of the ranges the set measured (dark 1.58–1.77, light 0.54–0.61 within 3 %).
-constexpr float k_text_contrast_dark = 1.67f;
-constexpr float k_text_contrast_light = 0.57f;
+// centres of the ranges the set measured (dark 1.58–1.77, light 0.54–0.61 within 3 %): the
+// values `lx.gfx` exports and the compositor's linear pass uses (`ui_vk_renderer::composite`).
+constexpr float k_text_contrast_dark = lx::gfx::k_text_contrast_dark;
+constexpr float k_text_contrast_light = lx::gfx::k_text_contrast_light;
+static_assert(k_text_contrast_dark == 1.67f && k_text_contrast_light == 0.57f);
 constexpr float k_stem_tolerance = 0.03f;
 
 } // namespace

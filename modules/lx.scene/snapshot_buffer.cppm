@@ -1104,9 +1104,14 @@ void lx::scene::draw_list::transform_primitives(lx::buffer_transform t, lx::size
         lx_scene_transform_rectf(sh.clip, t, w, h);
         permute(sh.radii, corner);
     }
+    // A sprite's tile is drawn turned with its box: the renderers sample it through the
+    // transform a blit of a normal buffer would take on this output (flags bits 1-3).
+    const auto sprite_xf = static_cast<std::uint8_t>(
+        static_cast<unsigned>(lx::gfx::compose_output_transform(lx::buffer_transform::normal, t)) << 1u);
     for (unsigned i = 0; i < sprites_.count; ++i) {
         lx_scene_transform_rectf(sprites_.items[i].bounds, t, w, h);
         lx_scene_transform_rectf(sprites_.items[i].clip, t, w, h);
+        sprites_.items[i].flags = static_cast<std::uint8_t>((sprites_.items[i].flags & 1u) | sprite_xf);
     }
     for (unsigned i = 0; i < underlines_.count; ++i) {
         lx_scene_transform_rectf(underlines_.items[i].bounds, t, w, h);

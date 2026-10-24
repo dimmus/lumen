@@ -145,6 +145,14 @@ struct packed_rgba {
     return {to_half(c.r * c.a), to_half(c.g * c.a), to_half(c.b * c.a), to_half(c.a)};
 }
 
+/// The `text.contrast` exponent (ADR-010 §4.5): a `mono_sprite` blended in linear light (the
+/// compositor's F16 pass, an scRGB swapchain) draws `colour × coverage^contrast`, so text keeps
+/// the stem weight it has blended in the encoded space. Measured by `test_ui_golden`
+/// `text_contrast_keeps_stem_coverage` (mean stem coverage within 3 %): light text on a dark
+/// background needs 1.58–1.77, dark text on a light one 0.54–0.61; these are the centres.
+inline constexpr float k_text_contrast_dark = 1.67f;
+inline constexpr float k_text_contrast_light = 0.57f;
+
 // ── GPU instances (ADR-010 §4.2) ────────────────────────────────────────────────
 //
 // Uploaded as they are into an SSBO (Vulkan and GLES 3.1) or walked by the CPU renderer,
@@ -200,7 +208,7 @@ struct sprite_instance {
     float clip[4]{};
     std::uint16_t uv[4]{};  ///< atlas texels: u0, v0, u1, v1
     std::uint8_t page = 0;  ///< atlas page (sampler array index)
-    std::uint8_t flags = 0; ///< bit 0: grayscale (poly)
+    std::uint8_t flags = 0; ///< bit 0: grayscale (poly); bits 1–3: output transform (set by the view)
     std::uint16_t pad0 = 0;
     std::uint16_t color[4]{};  ///< premultiplied f16 rgba (mono: tint; poly: multiplier; path: fill)
     std::uint16_t params[4]{}; ///< f16: radii (poly) or rotation (mono)

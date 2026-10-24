@@ -173,6 +173,22 @@ struct ui_vk_draw_stats {
     std::uint64_t slot_wait_ns = 0;   ///< waiting for the slot's previous fence
 };
 
+/// What `ui_vk_renderer::composite` takes beyond the frame (ADR-010 §4.5, §4.11).
+struct ui_vk_composite_options {
+    /// The `mono_sprite` coverage exponent in the linear pass (theme `text.contrast`):
+    /// `k_text_contrast_dark` for light text on dark chrome, `k_text_contrast_light` for dark on
+    /// light.
+    float text_contrast = k_text_contrast_dark;
+};
+
+/// One compositor frame drawn by `ui_vk_renderer::composite`: the UI renderer's side (instances,
+/// atlas uploads, draws) and the compositor's (surfaces, the out fence — owned by the caller,
+/// as `vulkan_compositor::composite`'s).
+struct ui_vk_composite_stats {
+    ui_vk_draw_stats ui{};
+    composite_stats composite{};
+};
+
 /// How `wait_gpu_time` measured.
 enum class ui_vk_timing : std::uint8_t {
     none,       ///< no frame was timed
@@ -264,11 +280,12 @@ public:
     /// Where `surface` refs' textures are registered (same device). Borrowed; null skips
     /// surfaces (counted in `primitives_skipped`). Lifetime: the compositor's descriptor sets
     /// and images are recorded into this renderer's command buffers, which the compositor's
-    /// own fences do not cover — `vulkan_compositor::forget_texture` (or a texture
-    /// re-upload) of a texture a submitted `draw` used must wait for this renderer's frames
-    /// first (`wait_idle`). Nothing enforces that yet: the compositor's Vulkan path does not
-    /// use this renderer (ADR-010 §4.11 as built).
-    void set_surface_compositor(vulkan_compositor* compositor) { compositor_ = compositor; }
+    /// own fences do not cover, so the renderer registers itself as the compositor's external
+    /// user (`vulkan_compositor::add_external_user`): before the compositor destroys,
+    /// re-uploads or re-points a texture a `draw` recorded, it waits for this renderer's
+    /// frames (`wait_idle`). A compositor shutting down detaches the renderer (the pointer is
+    /// cleared). Not used by `composite`, which records into the compositor's own frame.
+    void set_surface_compositor(vulkan_compositor* compositor);
 
     /// The affinity `draw` and `wait_gpu_time` must run on (ADR-010 §4.12): `render` in the
     /// compositor, `ui` in a client. `any` (the default) checks nothing — the tests and the
@@ -295,6 +312,22 @@ public:
         return draw(target.attachment(), stream, atlas, damage, clear);
     }
 
+    /// ADR-010 §4.11: the compositor's frame for `target` with `stream` recorded inside
+    /// `compositor`'s linear F16 pass, then its encode pass, in one command buffer of the
+    /// compositor's (`vulkan_compositor::begin_linear_frame` … `end_linear_frame`): the atlas
+    /// copies before the pass, `surface` refs through `record_blits` (decoded as `composite`
+    /// decodes them), primitive batches through this renderer's pipelines made for that pass,
+    /// with instance colours converted to premultiplied linear light and `mono_sprite`
+    /// coverage raised to `options.text_contrast` (the push constant's linear flag; shaders/ui
+    /// `lx_instance_color`, `lx_text_coverage`). The whole target is drawn (Vulkan repaints
+    /// every frame) and cleared to `clear` first. The ring slot is fenced by an empty submit
+    /// after the compositor's; the atlas's dirty lists are cleared once that submit is made.
+    /// On an error nothing is submitted, the compositor's acquires are un-marked and the atlas
+    /// stays dirty. Render affinity in the compositor (`set_owner_affinity`).
+    [[nodiscard]] lx::result<ui_vk_composite_stats>
+    composite(vulkan_compositor& compositor, render_target& target, lx::color clear,
+              const ui_stream& stream, atlas* atlas, const ui_vk_composite_options& options = {});
+
     /// The GPU time of the last timed frame; waits for it. `none` when timing is off or no
     /// frame was drawn since the last call.
     [[nodiscard]] lx::result<ui_vk_gpu_time> wait_gpu_time();
@@ -309,6 +342,9 @@ private:
         std::uint32_t format = 0;
         void* render_pass = nullptr;
         void* pipelines[p_count]{};
+        /// Made for a pass the caller owns (the compositor's linear pass): not destroyed here,
+        /// no framebuffer of ours uses it.
+        bool external = false;
     };
     struct framebuffer_entry {
         std::uint64_t serial = 0;
@@ -329,7 +365,10 @@ private:
         void* memory = nullptr;
     };
 
-    [[nodiscard]] lx::result<unsigned> ensure_pipelines(std::uint32_t format);
+    /// The pipeline set for `format`, made for our own LOAD pass, or, with `external_pass`, for
+    /// that pass (any format the blend supports: the compositor's R16G16B16A16_SFLOAT).
+    [[nodiscard]] lx::result<unsigned> ensure_pipelines(std::uint32_t format,
+                                                        void* external_pass = nullptr);
     [[nodiscard]] lx::result<void*> ensure_framebuffer(const ui_vk_attachment& target,
                                                        void* render_pass);
     [[nodiscard]] lx::result<void> upload_atlas(atlas& a, void* command_buffer, unsigned slot,
@@ -340,6 +379,8 @@ private:
     void write_page_descriptors(unsigned slot);
     void save_pipeline_cache();
     void wait_slots();
+    static void wait_external_thunk(void* self);
+    static void detach_external_thunk(void* self);
 
     vk_context ctx_{};
     ui_vk_caps caps_{};
@@ -463,12 +504,17 @@ constexpr std::size_t k_globals_offset =
 constexpr std::size_t k_ring_bytes = k_globals_offset + k_ui_vk_ring_slots * k_globals_stride;
 constexpr std::uint64_t k_fence_timeout_ns = 2'000'000'000ull;
 
-/// The push constants of every UI pipeline (both stages): the batch's first word in the slot
-/// and its atlas page.
+/// The push constants of every UI pipeline (both stages): the batch's first word in the slot,
+/// its atlas page, and the target's blending space — `linear` 1 inside the compositor's F16
+/// pass, where colours are decoded and glyph coverage goes through `contrast` (shaders/ui
+/// vk_vertex.glsl, vk_fragment.glsl).
 struct push_block {
     std::uint32_t base = 0;
     std::uint32_t page = 0;
+    std::uint32_t linear = 0;
+    float contrast = 1.f;
 };
+static_assert(sizeof(push_block) == 16);
 
 [[nodiscard]] inline lx::error vk_fail(const char* message) {
     return lx::make_error(lx::vulkan_err::device_lost, message);
@@ -936,7 +982,31 @@ lx::result<void> lx::gfx::ui_vk_target::read_back(std::span<std::uint32_t> out, 
 
 // ── ui_vk_renderer: set-up ──────────────────────────────────────────────────────
 
-lx::gfx::ui_vk_renderer::~ui_vk_renderer() { shutdown(); }
+lx::gfx::ui_vk_renderer::~ui_vk_renderer() {
+    shutdown();
+    set_surface_compositor(nullptr);
+}
+
+void lx::gfx::ui_vk_renderer::set_surface_compositor(vulkan_compositor* compositor) {
+    if (compositor == compositor_)
+        return;
+    if (compositor_)
+        compositor_->remove_external_user(this);
+    compositor_ = compositor;
+    // A full table (four users) leaves this renderer unregistered: its surface draws would be
+    // unprotected, so it draws none.
+    if (compositor_ &&
+        !compositor_->add_external_user({this, &wait_external_thunk, &detach_external_thunk}))
+        compositor_ = nullptr;
+}
+
+void lx::gfx::ui_vk_renderer::wait_external_thunk(void* self) {
+    static_cast<ui_vk_renderer*>(self)->wait_slots();
+}
+
+void lx::gfx::ui_vk_renderer::detach_external_thunk(void* self) {
+    static_cast<ui_vk_renderer*>(self)->compositor_ = nullptr;
+}
 
 lx::result<void> lx::gfx::ui_vk_renderer::initialize(const vk_context& ctx,
                                                      const ui_vk_options& options) {
@@ -1291,7 +1361,7 @@ void lx::gfx::ui_vk_renderer::shutdown() {
             for (void* p : set.pipelines)
                 if (p)
                     vkDestroyPipeline(dev, static_cast<VkPipeline>(p), nullptr);
-            if (set.render_pass)
+            if (set.render_pass && !set.external)
                 vkDestroyRenderPass(dev, static_cast<VkRenderPass>(set.render_pass), nullptr);
         }
         for (page_image& p : pages_)
@@ -1418,13 +1488,17 @@ void lx::gfx::ui_vk_renderer::save_pipeline_cache() {
 #endif
 }
 
-lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t format) {
+lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t format,
+                                                               void* external_pass) {
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
     using namespace ui_vk_detail;
-    for (unsigned i = 0; i < k_ui_vk_pipeline_sets; ++i)
-        if (pipeline_sets_[i].render_pass && pipeline_sets_[i].format == format)
+    for (unsigned i = 0; i < k_ui_vk_pipeline_sets; ++i) {
+        const pipeline_set& p = pipeline_sets_[i];
+        if (p.render_pass && p.format == format && p.external == (external_pass != nullptr) &&
+            (!external_pass || p.render_pass == external_pass))
             return i;
-    if (!supported_format(format))
+    }
+    if (!external_pass && !supported_format(format))
         return lx::invalid_argument("ui_vk_renderer: unsupported attachment format");
     auto dev = static_cast<VkDevice>(ctx_.device);
     const unsigned index = next_pipeline_set_;
@@ -1441,12 +1515,14 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
         for (void* p : set.pipelines)
             if (p)
                 vkDestroyPipeline(dev, static_cast<VkPipeline>(p), nullptr);
-        vkDestroyRenderPass(dev, static_cast<VkRenderPass>(set.render_pass), nullptr);
+        if (!set.external)
+            vkDestroyRenderPass(dev, static_cast<VkRenderPass>(set.render_pass), nullptr);
         set = {};
     }
 
     const std::uint64_t t0 = now_ns();
-    VkRenderPass pass = make_render_pass(dev, static_cast<VkFormat>(format));
+    VkRenderPass pass = external_pass ? static_cast<VkRenderPass>(external_pass)
+                                      : make_render_pass(dev, static_cast<VkFormat>(format));
     if (!pass)
         return vk_fail("ui_vk: vkCreateRenderPass failed");
 
@@ -1520,7 +1596,8 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
         for (VkPipeline p : made)
             if (p)
                 vkDestroyPipeline(dev, p, nullptr);
-        vkDestroyRenderPass(dev, pass, nullptr);
+        if (!external_pass)
+            vkDestroyRenderPass(dev, pass, nullptr);
         return vk_fail("ui_vk: vkCreateGraphicsPipelines failed");
     }
     setup_.pipeline_ns += now_ns() - t0;
@@ -1528,6 +1605,7 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
     setup_.pipelines += p_count;
     set.format = format;
     set.render_pass = pass;
+    set.external = external_pass != nullptr;
     for (unsigned i = 0; i < p_count; ++i)
         set.pipelines[i] = made[i];
     // New pipelines grew the cache: keep them for the next start.
@@ -1535,6 +1613,7 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
     return index;
 #else
     (void)format;
+    (void)external_pass;
     return lx::not_implemented("lx::gfx::ui_vk_renderer::ensure_pipelines");
 #endif
 }
@@ -1888,6 +1967,7 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     bool any_surface = false;
     for (std::size_t b = 0; b < batch_total && !any_surface; ++b)
         any_surface = stream.batches[b].kind == primitive_kind::surface;
+    bool prepared_blits = false;
     if (any_surface && compositor_) {
         if (auto prepared = compositor_->prepare_blits(cb, stream.surfaces.data(),
                                                        static_cast<unsigned>(stream.surfaces.size()));
@@ -1895,6 +1975,7 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
             (void)vkEndCommandBuffer(cb);
             return prepared.get_error();
         }
+        prepared_blits = true;
     }
     if (set_generation_[slot] != page_generation_)
         write_page_descriptors(slot);
@@ -1991,7 +2072,7 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
                                         &descriptor_set, 0, nullptr);
                 set_bound = true;
             }
-            const push_block push{batch_word_[b], bt.page};
+            const push_block push{batch_word_[b], bt.page, 0u, 1.f};
             vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
                                0, sizeof push, &push);
             vkCmdDraw(cb, 6, count, 0, 0);
@@ -2001,8 +2082,13 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     vkCmdEndRenderPass(cb);
     if (timed)
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * slot + 1);
-    if (vkEndCommandBuffer(cb) != VK_SUCCESS)
+    // Never submitted: the compositor's acquires recorded above did not happen, so the next
+    // frame records them again (`abandon_prepared_blits`); the atlas stays dirty.
+    if (vkEndCommandBuffer(cb) != VK_SUCCESS) {
+        if (prepared_blits && compositor_)
+            compositor_->abandon_prepared_blits();
         return vk_fail("ui_vk: vkEndCommandBuffer failed");
+    }
     // Submitted even when a surface draw failed to record (`failed`): the atlas copies and
     // the compositor's acquires recorded before the pass are already counted as done on the
     // CPU side, so they must run. The error is returned after the submit.
@@ -2011,8 +2097,12 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit.commandBufferCount = 1;
     submit.pCommandBuffers = &cb;
-    if (vkQueueSubmit(static_cast<VkQueue>(ctx_.queue), 1, &submit, fence) != VK_SUCCESS)
+    if (vkQueueSubmit(static_cast<VkQueue>(ctx_.queue), 1, &submit, fence) != VK_SUCCESS) {
+        if (prepared_blits && compositor_)
+            compositor_->abandon_prepared_blits();
+        // The fence was reset and nothing will signal it: the slot is not in flight.
         return vk_fail("ui_vk: vkQueueSubmit failed");
+    }
     submitted_[slot] = true;
     ++frame_;
     if (atlas) {
@@ -2038,6 +2128,181 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     (void)damage;
     (void)clear;
     return lx::not_implemented("lx::gfx::ui_vk_renderer::draw");
+#endif
+}
+
+lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
+    vulkan_compositor& compositor, render_target& target, lx::color clear, const ui_stream& stream,
+    atlas* atlas, const ui_vk_composite_options& options) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    using namespace ui_vk_detail;
+    lx::runtime::assert_affinity(owner_);
+    if (!ready_ || !compositor.ready())
+        return lx::not_implemented("lx::gfx::ui_vk_renderer::composite");
+    if (!target.valid())
+        return lx::invalid_argument("ui_vk_renderer::composite: invalid target");
+    ui_vk_composite_stats out{};
+    ui_vk_draw_stats& stats = out.ui;
+    auto dev = static_cast<VkDevice>(ctx_.device);
+
+    // The ring slot, as `draw` takes it: fenced by the empty submit after the compositor's.
+    const unsigned slot = frame_ % k_ui_vk_ring_slots;
+    stats.slot = slot;
+    auto fence = static_cast<VkFence>(fences_[slot]);
+    if (submitted_[slot]) {
+        const std::uint64_t w0 = now_ns();
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, k_fence_timeout_ns) != VK_SUCCESS)
+            return vk_fail("ui_vk: ring slot fence never signalled");
+        stats.slot_wait_ns = now_ns() - w0;
+        submitted_[slot] = false;
+        if (timed_slot_ == static_cast<int>(slot))
+            timed_slot_ = -1;
+    }
+    free_transient(slot);
+    std::byte* slot_bytes = ring_mapped_ + static_cast<std::size_t>(slot) * k_ui_vk_slot_bytes;
+    ui_encode::encode_counts counts{};
+    stats.instance_bytes = ui_encode::encode(stream, atlas, slot_bytes, k_ui_vk_slot_bytes,
+                                             batch_word_, batch_count_, counts);
+    stats.primitives_encoded = counts.encoded;
+    stats.primitives_skipped = counts.skipped;
+    stats.overflow_drops = counts.overflow_drops;
+    const float globals[4] = {static_cast<float>(target.width()),
+                              static_cast<float>(target.height()), 0.f, 0.f};
+    std::memcpy(ring_mapped_ + k_globals_offset + slot * k_globals_stride, globals, sizeof globals);
+
+    auto frame = compositor.begin_linear_frame(target, stream.surfaces.data(),
+                                               static_cast<unsigned>(stream.surfaces.size()));
+    if (!frame)
+        return frame.get_error();
+    auto cb = static_cast<VkCommandBuffer>(frame->command_buffer);
+    // Before the pass: the atlas copies; then this slot's page descriptors and the pipelines
+    // made for the compositor's pass.
+    if (atlas) {
+        if (auto up = upload_atlas(*atlas, cb, slot, stats); !up) {
+            compositor.abandon_linear_frame();
+            return up.get_error();
+        }
+    }
+    if (set_generation_[slot] != page_generation_)
+        write_page_descriptors(slot);
+    auto pipelines = ensure_pipelines(frame->vk_format, frame->render_pass);
+    if (!pipelines) {
+        compositor.abandon_linear_frame();
+        return pipelines.get_error();
+    }
+    const pipeline_set& set = pipeline_sets_[*pipelines];
+
+    compositor.begin_linear_pass(clear);
+    const lx::rect2i full{0, 0, static_cast<int>(frame->width), static_cast<int>(frame->height)};
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(frame->width);
+    viewport.height = static_cast<float>(frame->height);
+    viewport.maxDepth = 1.f;
+    VkRect2D scissor{};
+    scissor.extent = {frame->width, frame->height};
+    auto layout = static_cast<VkPipelineLayout>(pipeline_layout_);
+    auto descriptor_set = static_cast<VkDescriptorSet>(sets_[slot]);
+    int bound_pipeline = -1;
+    bool set_bound = false;
+    stats.rects = 1;
+    const std::size_t batch_total =
+        stream.batches.size() < k_max_batches ? stream.batches.size() : k_max_batches;
+    for (std::size_t b = 0; b < batch_total; ++b) {
+        const batch& bt = stream.batches[b];
+        if (!ui_encode::meets(bt.bounds, full)) {
+            ++stats.batches_skipped;
+            continue;
+        }
+        ++stats.batches_drawn;
+        if (bt.kind == primitive_kind::surface) {
+            const std::size_t end = static_cast<std::size_t>(bt.first) + bt.count;
+            for (std::size_t i = bt.first; i < end && i < stream.refs.size(); ++i) {
+                const std::uint32_t index = stream.refs[i].index;
+                if (index >= stream.surfaces.size()) {
+                    ++stats.primitives_skipped;
+                    continue;
+                }
+                // Decoded into linear light (`encoded` false), as `composite` draws them.
+                auto drawn = compositor.record_blits(cb, frame->render_pass, frame->vk_format,
+                                                     pipeline_cache_, frame->width, frame->height,
+                                                     &stream.surfaces[index], 1, full, false);
+                bound_pipeline = -1;
+                set_bound = false;
+                vkCmdSetViewport(cb, 0, 1, &viewport);
+                vkCmdSetScissor(cb, 0, 1, &scissor);
+                if (!drawn) {
+                    compositor.abandon_linear_frame();
+                    return drawn.get_error();
+                }
+                stats.draw_calls += drawn->draws_submitted;
+                out.composite.draws_submitted += drawn->draws_submitted;
+                out.composite.draws_skipped += drawn->draws_skipped;
+                out.composite.draws_culled += drawn->draws_culled;
+            }
+            continue;
+        }
+        const std::uint32_t count = batch_count_[b];
+        if (count == 0)
+            continue;
+        unsigned index = p_quad;
+        switch (bt.kind) {
+        case primitive_kind::shadow: index = p_shadow; break;
+        case primitive_kind::quad: index = p_quad; break;
+        case primitive_kind::mono_sprite:
+        case primitive_kind::path: index = p_mono; break;
+        case primitive_kind::poly_sprite: index = p_poly; break;
+        case primitive_kind::underline: index = p_underline; break;
+        case primitive_kind::surface: break;
+        }
+        if (bound_pipeline != static_cast<int>(index)) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              static_cast<VkPipeline>(set.pipelines[index]));
+            bound_pipeline = static_cast<int>(index);
+        }
+        if (!set_bound) {
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
+                                    &descriptor_set, 0, nullptr);
+            set_bound = true;
+        }
+        const push_block push{batch_word_[b], bt.page, 1u, options.text_contrast};
+        vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof push, &push);
+        vkCmdDraw(cb, 6, count, 0, 0);
+        ++stats.draw_calls;
+    }
+
+    auto ended = compositor.end_linear_frame();
+    if (!ended)
+        return ended.get_error(); // abandoned there: nothing submitted, the atlas stays dirty
+    out.composite.out_fence_fd = ended->out_fence_fd;
+    // This slot's instances, staging range and page descriptors are free once the compositor's
+    // frame is: an empty submit signals the slot's fence after it.
+    vkResetFences(dev, 1, &fence);
+    if (vkQueueSubmit(static_cast<VkQueue>(ctx_.queue), 0, nullptr, fence) == VK_SUCCESS) {
+        submitted_[slot] = true;
+    } else {
+        // No fence for the slot: wait for the queue instead (an error path, never steady).
+        (void)vkQueueWaitIdle(static_cast<VkQueue>(ctx_.queue));
+    }
+    ++frame_;
+    if (atlas) {
+        for (unsigned i = 0; i < k_atlas_pages; ++i)
+            if (page_uploaded_[i]) {
+                atlas->clear_dirty(i);
+                page_whole_pending_[i] = false;
+                page_uploaded_[i] = false;
+            }
+        atlas_seen_ = atlas;
+    }
+    return out;
+#else
+    (void)compositor;
+    (void)target;
+    (void)clear;
+    (void)stream;
+    (void)atlas;
+    (void)options;
+    return lx::not_implemented("lx::gfx::ui_vk_renderer::composite");
 #endif
 }
 

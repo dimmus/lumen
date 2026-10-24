@@ -18,7 +18,7 @@ void main() {
     if (!lx_place(lx_window(bounds, inst_vec4(4u))))
         return;
     v_bounds = bounds;
-    v_color = inst_half4(8u);
+    v_color = lx_instance_color(inst_half4(8u));
     v_line = vec4(t, t * 0.5, 2.0 * LX_PI / (4.0 * t), bounds.y + bounds.w * 0.5);
     v_wavy = tw >> 16u;
 }

@@ -307,6 +307,10 @@ struct compositor_impl {
     /// UI affinity. wlr-layer-shell surfaces, arrangement, exclusive zones — see
     /// `:layer_shell`.
     layer_shell layers_{};
+    /// The compositor's glyph atlas (ADR-010 §4.11): server-side frames' title and close
+    /// glyphs. UI writes it (`decorations_`), render reads it under its mutex
+    /// (`frame_painter`). Before `decorations_`, which holds the text built on it.
+    chrome_atlas chrome_atlas_{};
     /// UI affinity. Server-side frames (xdg-decoration) — see `:decoration`.
     decoration_manager decorations_{};
     /// UI affinity. Window geometry, configure flow and focus — see `:wm`.
@@ -502,6 +506,27 @@ struct compositor_impl {
     /// The GL path's primitive renderer, made with the backend when the context is GLES 3.1
     /// (`setup_gl_present`); null on GLES 2, where primitives are lowered to blits.
     std::unique_ptr<gfx::ui_gl_renderer> ui_gl_{};
+    /// The Vulkan path's primitive renderer (`setup_vulkan_present`): records frames with
+    /// primitives inside `vk_compositor_`'s linear pass. After `vk_compositor_`, so it goes
+    /// first.
+    std::unique_ptr<gfx::ui_vk_renderer> ui_vk_{};
+    /// Screen capture's re-composites of a frame with primitives: its stream through the
+    /// backend's UI renderer (`capture_paint`).
+    struct capture_paint_ctx {
+        compositor_impl* impl = nullptr;
+        const scene::immutable_frame_snapshot* snap = nullptr;
+    };
+    /// Sets `src.paint` (and `src.blits` to the frame's draws in draw order, what its stream
+    /// indexes) when `snap` has primitives and this backend has a UI renderer; `ctx` must
+    /// outlive the capture call.
+    void capture_paint_for(capture_frame_source& src, capture_paint_ctx& ctx,
+                           const scene::immutable_frame_snapshot& snap);
+    static bool capture_paint_cpu(void* user, const gfx::pixel_surface& dst, lx::color clear,
+                                  const gfx::blit_command* blits, unsigned count,
+                                  lx::point2i offset, const gfx::damage_region& region);
+    static bool capture_paint_gl(void* user, unsigned framebuffer, unsigned width, unsigned height,
+                                 lx::color clear, const gfx::blit_command* blits, unsigned count,
+                                 lx::point2i offset, const gfx::damage_region& region);
     /// Render affinity (created at start, before the render thread; at runtime by output
     /// ops). One per output slot with a pipeline; null for a free slot. UI reaches a
     /// pipeline only through `outs_[slot].pipe`.
@@ -2693,16 +2718,18 @@ void compositor_impl::run_capture_render() {
         src.size = p.mode;
         src.cursor = cursor;
         const scene::immutable_frame_snapshot* snap = nullptr;
+        capture_paint_ctx paint_ctx{};
         if (cpu_present_ || (gl_present_ && cursor.in_frame)) {
             // The frame's draws: the CPU path composites them into the client's memory, GL
             // needs them to leave the software pointer out.
             snap = &scene.acquire_render_snapshot(p.slot);
             drain_texture_updates(snap->frame_index());
-            // A re-composite has no primitive renderer: the stream lowered to blits.
             const auto blits = painter_.flattened(*snap);
             src.blits = blits.data();
             src.blit_count = static_cast<unsigned>(blits.size());
             src.clear = snap->clear_color();
+            // Its UI stream (title glyphs) through the backend's primitive renderer.
+            capture_paint_for(src, paint_ctx, *snap);
         }
         if (gl_present_)
             src.gl_framebuffer = p.gl[p.capture_front].framebuffer();
@@ -2723,8 +2750,8 @@ void compositor_impl::run_capture_render() {
             continue;
         const scene::immutable_frame_snapshot& snap = scene.acquire_render_snapshot(jobs[i].view);
         drain_texture_updates(snap.frame_index());
-        // The window's frame included: the stream lowered to blits (no primitive renderer
-        // composites into a capture buffer).
+        // The window's frame included: its stream (title glyphs) through the backend's
+        // primitive renderer, or lowered to blits where there is none.
         const auto blits = painter_.flattened(snap);
         capture_frame_source src{};
         src.frame = snap.frame_index();
@@ -2732,6 +2759,8 @@ void compositor_impl::run_capture_render() {
         src.blits = blits.data();
         src.blit_count = static_cast<unsigned>(blits.size());
         src.clear = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+        capture_paint_ctx paint_ctx{};
+        capture_paint_for(src, paint_ctx, snap);
         // The pointer over the window, at the view's projection.
         if (jobs[i].paint_cursors && cursor_cur_.visible) {
             const unsigned scale120 = static_cast<unsigned>(std::lround(jobs[i].scale * 120.0));
@@ -2943,6 +2972,7 @@ void compositor_impl::register_p0_globals() {
     wm_.set_layers(&layers_);
     p0_.layers = &layers_;
     decorations_.bind(tree_, scene);
+    decorations_.bind_chrome(&chrome_atlas_);
     wm_.set_decorations(&decorations_);
     p0_.decorations = &decorations_;
     p0_.server_side_decorations = cfg.server_side_decorations;
@@ -4813,6 +4843,20 @@ lx::result<void> compositor_impl::setup_vulkan_present() {
         return lx::not_implemented("lx::compositor::setup_vulkan_present");
     if (auto initialized = vk_compositor_.initialize(graphics.context()); !initialized)
         return initialized.get_error();
+    // UI primitives (ADR-010 §4.11) recorded inside the composite's linear pass; pipelines
+    // for that pass are made on the first frame that has primitives. Without it frames with
+    // primitives are lowered to blits.
+    {
+        auto ui = std::make_unique<gfx::ui_vk_renderer>();
+        if (auto ready = ui->initialize(graphics.context()); ready) {
+            // From here on only the render thread draws with it (ADR-010 §4.12).
+            ui->set_owner_affinity(runtime::affinity::render);
+            ui_vk_ = std::move(ui);
+            lx::trace::timeline_instant("startup", "ui_vk ready");
+        } else {
+            lx::trace::logger::global().log_error(ready.get_error(), "compositor.gfx");
+        }
+    }
     vulkan_present_ = true;
     headless_present_ = false;
     return {};
@@ -10434,7 +10478,8 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
         lx::trace::scoped_span composite_span{"render", "composite"};
         if (gl_present_) {
             auto c = painter_.paint_gl(gl_compositor_, ui_gl_.get(), p.gl[back].framebuffer(),
-                                       p.gl[back].width(), p.gl[back].height(), snapshot, region);
+                                       p.gl[back].width(), p.gl[back].height(), snapshot, region,
+                                       &chrome_atlas_);
             if (!c) {
                 lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
@@ -10465,7 +10510,8 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             target.stride = fb.stride();
             target.format = fb.format();
             target.write_combining = true;
-            auto c = painter_.paint_cpu(cpu_compositor_, ui_cpu_.get(), target, snapshot, region);
+            auto c = painter_.paint_cpu(cpu_compositor_, ui_cpu_.get(), target, snapshot, region,
+                                        &chrome_atlas_);
             if (!c) {
                 lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
@@ -10480,21 +10526,22 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                                                     "scanout format — surface not shown");
             }
         } else if (vulkan_present_) {
-            // Vulkan repaints the whole target, which is correct for any buffer age. Its
-            // chrome is drawn inside the linear pass as solid blits (the stream lowered:
-            // `:ui_vk` does not record into this compositor's pass yet).
-            const auto blits = painter_.flattened(snapshot);
-            auto c = vk_compositor_.composite(p.vk[back], snapshot.clear_color(), blits.data(),
-                                              static_cast<unsigned>(blits.size()));
+            // Vulkan repaints the whole target, which is correct for any buffer age. A frame
+            // with primitives (the chrome) records them inside the linear pass through
+            // `:ui_vk`; one without is the blit composite it always was.
+            auto c = painter_.paint_vk(vk_compositor_, ui_vk_.get(), p.vk[back], snapshot,
+                                       &chrome_atlas_);
             if (!c) {
                 lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
                 drawn = true;
                 p.discard_fence();
-                p.composited_fence = c.value().out_fence_fd;
+                p.composited_fence = c.value().composite.out_fence_fd;
                 publish_release_fence(p.composited_fence, idx);
-                if (c.value().draws_skipped > 0)
+                if (c.value().composite.draws_skipped > 0) {
+                    const auto blits = painter_.surfaces(snapshot);
                     report_unregistered_draw(blits.data(), static_cast<unsigned>(blits.size()));
+                }
             }
         }
         if (drawn) {
@@ -10530,6 +10577,8 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 else if (vulkan_present_)
                     src.vk_target = &p.vk[back];
                 src.cursor = capture_cursor_for(p);
+                capture_paint_ctx paint_ctx{};
+                capture_paint_for(src, paint_ctx, snapshot);
                 capture_renderer_.output_composited(slot, frame_damage, src, capture_channel_);
             }
         } else {
@@ -10553,6 +10602,8 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 src.blit_count = static_cast<unsigned>(blits.size());
                 src.clear = snapshot.clear_color();
                 src.cursor = capture_cursor_for(p);
+                capture_paint_ctx paint_ctx{};
+                capture_paint_for(src, paint_ctx, snapshot);
                 gfx::damage_region d = frame_damage;
                 d.clip({0, 0, p.mode.width, p.mode.height});
                 capture_renderer_.output_composited(slot, d, src, capture_channel_);
@@ -10562,11 +10613,8 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
         // Software fallback for no-GPU hosts and CI.
         (void)headless_.begin_frame();
         (void)headless_.clear(lx::color::rgb(0.f, 0.f, 0.f));
-        if (draws.size() > 0) {
-            const auto blits = painter_.flattened(snapshot);
-            (void)frame_renderer_.draw_to_headless(blits.data(), static_cast<unsigned>(blits.size()),
-                                                   headless_);
-        }
+        if (draws.size() > 0 || frame_painter::has_primitives(snapshot))
+            painter_.paint_headless(frame_renderer_, headless_, snapshot, &chrome_atlas_);
         (void)headless_.end_frame_and_dump(nullptr);
     }
 
@@ -10575,6 +10623,52 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
     p.rendered_frame.store(static_cast<long long>(idx), std::memory_order_release);
     scene.release_render_frame(slot, snapshot);
     return drawn;
+}
+
+void compositor_impl::capture_paint_for(capture_frame_source& src, capture_paint_ctx& ctx,
+                                        const scene::immutable_frame_snapshot& snap) {
+    if (!frame_painter::has_primitives(snap))
+        return;
+    const bool cpu = cpu_present_ && ui_cpu_;
+    const bool gl = gl_present_ && ui_gl_ && ui_gl_->ready();
+    if (!cpu && !gl)
+        return; // GLES 2: the lowered blits already in `src`
+    ctx.impl = this;
+    ctx.snap = &snap;
+    // The draws in draw order: what the stream's surface refs index.
+    const auto plain = painter_.surfaces(snap);
+    src.blits = plain.data();
+    src.blit_count = static_cast<unsigned>(plain.size());
+    src.paint.user = &ctx;
+    src.paint.cpu = cpu ? &compositor_impl::capture_paint_cpu : nullptr;
+    src.paint.gl = gl ? &compositor_impl::capture_paint_gl : nullptr;
+}
+
+bool compositor_impl::capture_paint_cpu(void* user, const gfx::pixel_surface& dst, lx::color clear,
+                                        const gfx::blit_command* blits, unsigned count,
+                                        lx::point2i offset, const gfx::damage_region& region) {
+    auto* ctx = static_cast<capture_paint_ctx*>(user);
+    compositor_impl& c = *ctx->impl;
+    auto painted = c.painter_.paint_cpu_capture(c.cpu_compositor_, *c.ui_cpu_, dst, *ctx->snap,
+                                                {blits, count}, offset, clear, region,
+                                                &c.chrome_atlas_);
+    if (!painted)
+        lx::trace::logger::global().log_error(painted.get_error(), "compositor.capture");
+    return static_cast<bool>(painted);
+}
+
+bool compositor_impl::capture_paint_gl(void* user, unsigned framebuffer, unsigned width,
+                                       unsigned height, lx::color clear,
+                                       const gfx::blit_command* blits, unsigned count,
+                                       lx::point2i offset, const gfx::damage_region& region) {
+    auto* ctx = static_cast<capture_paint_ctx*>(user);
+    compositor_impl& c = *ctx->impl;
+    auto painted = c.painter_.paint_gl_capture(c.gl_compositor_, *c.ui_gl_, framebuffer, width,
+                                               height, *ctx->snap, {blits, count}, offset, clear,
+                                               region, &c.chrome_atlas_);
+    if (!painted)
+        lx::trace::logger::global().log_error(painted.get_error(), "compositor.capture");
+    return static_cast<bool>(painted);
 }
 
 bool compositor_impl::catch_up_owed(const output_pipeline& p, unsigned& front) const {

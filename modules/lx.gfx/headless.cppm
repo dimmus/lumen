@@ -25,6 +25,14 @@ public:
     [[nodiscard]] lx::result<void> blit_texture(unsigned tex_id, lx::rect2i dst);
     /// Source-over fill of `dst` with a premultiplied, encoded colour (a solid draw).
     [[nodiscard]] lx::result<void> fill_solid(lx::rect2i dst, lx::color premultiplied);
+    /// Source-over of `premultiplied` × coverage over `dst`, the coverage an R8 tile of
+    /// `src_w` × `src_h` texels (`stride` bytes per row) sampled nearest — a `mono_sprite`
+    /// (ADR-010 §4.11: server-side titles in the headless dump), clipped to `clip` when it is
+    /// not empty.
+    [[nodiscard]] lx::result<void> blend_coverage(lx::rect2i dst, lx::rect2i clip,
+                                                  const std::uint8_t* coverage, unsigned stride,
+                                                  unsigned src_w, unsigned src_h,
+                                                  lx::color premultiplied);
     /// Register or replace a CPU texture for software blit (tests / headless clients).
     void register_texture(unsigned tex_id, unsigned width, unsigned height,
                           const unsigned char* rgba);
@@ -171,6 +179,45 @@ lx::result<void> lx::gfx::headless_backend::fill_solid(lx::rect2i dst, lx::color
             pixels_[i] = static_cast<unsigned char>(c.r * 255.f + pixels_[i] * inv);
             pixels_[i + 1] = static_cast<unsigned char>(c.g * 255.f + pixels_[i + 1] * inv);
             pixels_[i + 2] = static_cast<unsigned char>(c.b * 255.f + pixels_[i + 2] * inv);
+        }
+    }
+    return {};
+}
+
+lx::result<void> lx::gfx::headless_backend::blend_coverage(lx::rect2i dst, lx::rect2i clip,
+                                                          const std::uint8_t* coverage,
+                                                          unsigned stride, unsigned src_w,
+                                                          unsigned src_h, lx::color c) {
+    if (!in_frame_)
+        return lx::invalid_argument("blend outside begin_frame");
+    if (!coverage || dst.width <= 0 || dst.height <= 0 || src_w == 0 || src_h == 0)
+        return {};
+    int x0 = dst.x > 0 ? dst.x : 0;
+    int y0 = dst.y > 0 ? dst.y : 0;
+    int x1 = dst.x + dst.width < static_cast<int>(width_) ? dst.x + dst.width
+                                                          : static_cast<int>(width_);
+    int y1 = dst.y + dst.height < static_cast<int>(height_) ? dst.y + dst.height
+                                                            : static_cast<int>(height_);
+    if (clip.width > 0 && clip.height > 0) {
+        x0 = x0 > clip.x ? x0 : clip.x;
+        y0 = y0 > clip.y ? y0 : clip.y;
+        x1 = x1 < clip.x + clip.width ? x1 : clip.x + clip.width;
+        y1 = y1 < clip.y + clip.height ? y1 : clip.y + clip.height;
+    }
+    for (int y = y0; y < y1; ++y) {
+        const unsigned sy = static_cast<unsigned>(((y - dst.y) * static_cast<int>(src_h)) / dst.height);
+        for (int x = x0; x < x1; ++x) {
+            const unsigned sx =
+                static_cast<unsigned>(((x - dst.x) * static_cast<int>(src_w)) / dst.width);
+            const float k = static_cast<float>(coverage[sy * stride + sx]) / 255.f;
+            if (k <= 0.f)
+                continue;
+            const float inv = 1.f - c.a * k;
+            const std::size_t i =
+                (static_cast<std::size_t>(y) * width_ + static_cast<std::size_t>(x)) * 3u;
+            pixels_[i] = static_cast<unsigned char>(c.r * k * 255.f + pixels_[i] * inv);
+            pixels_[i + 1] = static_cast<unsigned char>(c.g * k * 255.f + pixels_[i + 1] * inv);
+            pixels_[i + 2] = static_cast<unsigned char>(c.b * k * 255.f + pixels_[i + 2] * inv);
         }
     }
     return {};

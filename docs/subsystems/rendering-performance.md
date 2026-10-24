@@ -328,7 +328,7 @@ commit-timing target arms a stopped clock for exactly the tick that presents it 
 desktop with a timed update wakes once). See [architecture.md](../architecture.md) "Explicit
 sync, buffer readiness and the commit-path protocols".
 
-### Server-side frames: quad primitives and atlas blits
+### Server-side frames: quad primitives and atlas glyphs
 
 A window frame (`lx.compositor:decoration`) emits its four border fills and its title fill
 as UI **quad primitives** (ADR-010 §4.11): radius 0, no border, one colour, on the projected
@@ -336,24 +336,23 @@ whole-pixel rects the swatch blits used to cover — so the pixels are those of 
 CPU compositor at scale 1 and 1.25 is pixel-identical in every frame state,
 `test_decoration_geometry`). Colours are the palette's sRGB bytes as encoded values; a
 dimmed (not-responding) frame carries the dim already applied with `cpu_compositor`'s byte
-rule (`(c · 166) >> 8`), so no `tint` is involved. The title text and the close button
-(glyph, circle on hover) stay blits of the 64x64 atlas and of one premultiplied texture per
-window and focus colour, rasterized on the UI thread by `lx.text` when the title changes or
-its ellipsis cut moves (≈0.1–0.3 ms, not per frame). Title texture ids are allocated upward
-and never reused, so a dated retirement can never drop a later texture that happened to get
-the same id. Damage is unchanged: the frame's four strips (title bar plus borders, old and
-new apart), never the client area; a hover or press repaints the close button only. No
-shadow and no rounded corner yet — a visual change, left for after Phase 2 text.
+rule (`(c · 166) >> 8`), so no `tint` is involved. The title text and the close glyph are
+**`mono_sprite`s** (ADR-010 Phase 2) from the compositor's own glyph atlas (`chrome_atlas`):
+the title is shaped and fitted by `lx.text` and its glyphs rasterised into the atlas on the
+UI thread when the title, its ellipsis cut or the window's output scales change (≈80 µs for
+a 26-glyph title in a size not seen yet, ≈1–3 µs when its glyphs are cached — not a frame
+cost), one run per output scale the frame is on so it is drawn 1:1 on each; the close glyph
+is the analytic "×" rasterised per scale. Only the hover / pressed circle stays a blit of
+the 64x64 atlas. There are no per-window title textures any more (no upload, no texture id,
+no retirement per title change). Damage is unchanged: the frame's four strips (title bar plus
+borders, old and new apart), never the client area; a hover or press repaints the close
+button only. No shadow and no rounded corner yet — a visual change, left for Phase 3.
 
-Dimming on the GPU backends. The old swatch blits applied the 0.65 dim tint in linear light
-on GL and Vulkan (`linear_to_srgb(lin · tint)`; `composite.frag` likewise), the CPU
-compositor as the byte rule. The fills now carry the byte rule on every backend — a
-deliberate change, which makes a dimmed frame's fill a few levels darker on GL and Vulkan
-than before (0x3b: about 47 then, 38 now) and identical to the CPU's. The title text and
-close-glyph blits of the same bar still carry `k_dim_tint`, which GL and Vulkan apply in
-linear light: on those backends a dimmed bar's fill and its text follow different dim rules
-until Phase 2 draws the text as primitives (or the dim is baked into the title textures).
-`test_decoration_geometry` checks the fills on `cpu_compositor` only.
+Dimming. The fills and the glyph colours carry the byte rule on every backend, so a dimmed
+bar's fill and text follow one rule everywhere (Phase 1 left the title blits tinted in linear
+light on GL and Vulkan, apart from their fills): on GL the dimmed fill and the full-coverage
+glyph pixels equal the CPU's bytes, on Vulkan within 1/255 (`test_deco_titles`). The circle
+blit still carries `k_dim_tint`.
 
 ### Screen capture: copies ride the composite
 
@@ -836,14 +835,33 @@ frame:
   no flush — one submit at the end, fenced by `gl_compositor::fence_frame`), primitive
   batches through the UI renderer, in stream order. Both renderers are made when the backend
   starts (`ui_gl` programs from the binary cache, warmed with one quad on SVGA3D).
+- **Vulkan** records the stream inside `vulkan_compositor`'s linear F16 pass
+  (`ui_vk_renderer::composite`, Phase 2): the compositor begins its frame and records its
+  acquires, `:ui_vk` its atlas copies, the pass is begun, `surface` refs go through
+  `record_blits` with the compositor's own composite pipeline (decoded as `composite` decodes
+  them), primitive batches through `:ui_vk` pipelines made for that pass, then the encode
+  pass and one submit; an empty submit after it fences `:ui_vk`'s ring slot. In the pass a
+  push-constant flag makes the shaders decode instance colours to premultiplied linear light
+  and raise glyph coverage to the `text.contrast` exponent (`k_text_contrast_dark`, 1.67:
+  the compositor's text is light on dark). Against the CPU compositor on lavapipe: fills,
+  borders and window content within 1/255, glyph edges within 9/255 (6/255 at scale 1.25),
+  mean stem weight +1.5 % (+14.7 % without the exponent); zero validation messages. A frame
+  without primitives is `composite` as before, byte for byte.
+- **Screen capture and the headless dump** draw the stream too: a capture's re-composite
+  (CPU always, GL when the software pointer is left out, window captures) goes through
+  `paint_cpu_capture` / `paint_gl_capture`, the frame's draws as the capture adjusted them
+  standing in for the surface refs and every primitive moved by the crop; the headless dump
+  walks the stream in order (`paint_headless`: blits, solid quads, glyphs blended from the
+  atlas).
 - **Without a primitive renderer** — a GLES 2 context (`egl_device` asks for 3.1 and falls
-  back to 2.0), the Vulkan composite, screen capture's re-composites and the headless dump —
-  the stream is lowered (`gfx::lower_to_blits`): a solid square quad on whole pixels becomes
-  a solid blit, anything else is dropped and counted, with one warning per run of frames that
-  drop. Decorations need nothing else, so every backend draws them. On Vulkan the solid blits
-  are decoded and drawn inside the linear F16 pass like any solid draw; `:ui_vk` recording
-  into that pass (with linear instance colours) is the follow-up for primitives that do not
-  lower.
+  back to 2.0) — the stream is lowered (`gfx::lower_to_blits`): a solid square quad on whole
+  pixels becomes a solid blit, anything else (the title glyphs among it) is dropped and
+  counted, with one warning per run of frames that drop. A GLES 2 host shows frames without
+  titles.
+- **The glyph atlas across threads.** `chrome_atlas` is written by the UI thread (a title
+  change rasterises under its mutex) and read by the render thread: every paint whose stream
+  has sprites holds the mutex while the renderer samples (CPU) or uploads (GL, Vulkan) the
+  pages. The UI thread takes it only on a glyph miss, so a steady frame never waits.
 - **Colour space.** Primitive colours are premultiplied and sRGB-encoded (ADR-010 §4.5);
   `:ui_cpu` and `:ui_gl` blend them in that space, as a client window does, while the CPU
   compositor blends *surfaces* in linear light through its tables and the GL one in encoded
@@ -866,7 +884,10 @@ frame:
   on every path. Primitives are never culled: they draw wherever damage reaches them.
 - **Turned outputs.** The order grid covers the content space emitters draw in; after
   emission `draw_list::transform_primitives` turns bounds, clips, per-corner radii and
-  per-edge borders (and a gradient's angle) with the draws.
+  per-edge borders (and a gradient's angle) with the draws, and marks each sprite with the
+  transform (flags bits 1–3): the renderers map a pixel of the turned box back into the
+  sprite's own through `source_basis_for`, so a title on a turned output is the content's
+  title turned, pixel for pixel (`test_deco_titles`).
 
 Render-thread cost per frame, `bench_ui_composite` (1920×1080, solid background, six
 overlapping 480×320 windows, each with its frame when decorated; `paint_cpu` / `paint_gl`
@@ -897,6 +918,31 @@ fill. On the UI thread, `commit_frame` of the decorated scene (30 quads, 7 surfa
 draw takes an order from the overlap grid, the refs are sorted and cut into batches) is
 12 µs p50 for a full repaint and 5 µs for a window update, against 6 µs and under 1 µs
 without decorations (load 0.3).
+
+Title bars as glyphs (Phase 2). The same bench with a title on every frame ("Window N - Lumen
+Terminal: ~/src/lumen", the compositor's font, 26–30 glyphs): before, each title one
+premultiplied texture blitted as a surface; after, its glyphs as mono sprites from
+`chrome_atlas` and the close glyph a sprite. 400 frames, p50 / p95; before three runs at load
+0.17–0.35, after five at load 0.1–0.85:
+
+| Backend | Damage | Titles as textures | Titles as glyphs |
+|---------|--------|--------------------|------------------|
+| CPU | whole frame | 1.81–1.85 ms / 3.7–4.1 ms | 1.87–2.08 ms / 3.6–4.4 ms (1.89–1.91 ms at load 0.1) |
+| CPU | one window | 32 µs / 58–105 µs | 36–45 µs / 150–250 µs |
+| GL, render thread | whole frame | 719–831 µs / 5.3–6.7 ms | 698–802 µs / 4.5–6.7 ms |
+| GL, render thread | one window | 568–620 µs / 4.8–5.4 ms | 543–639 µs / 5.2–5.8 ms |
+| GL, until the fence signals | whole frame | 5.99–6.04 ms | 5.91–6.05 ms |
+| GL, until the fence signals | one window | 2.57–2.70 ms | 2.54–2.74 ms |
+
+On GL the change is within the noise: ≈180 more instances in the ring and one more batch per
+title run, against six texture binds fewer. On the CPU a full repaint costs 3–5 % more —
+`:ui_cpu` shades each glyph pixel (colour × coverage, one blend) where the texture blit
+copied premultiplied pixels — and a window update a few µs where a title crosses its damage.
+On the UI thread `commit_frame` of the decorated scene goes from 16 µs to 23–26 µs p50 for a
+full repaint (each glyph one `atlas::use` and one sprite; a title's glyphs share one order)
+and from 6 µs to 13 µs for a window update. No frame allocates (`test_deco_titles`
+`steady_titled_frame_allocates_nothing`, 32 frames). Vulkan has no hardware here: lavapipe
+correctness only, no numbers.
 
 ---
 

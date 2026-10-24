@@ -821,6 +821,22 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_ui_composite PRIVATE tests)
     add_test(NAME test_ui_composite COMMAND test_ui_composite)
 
+    # ADR-010 §4.11, Phase 2: title bars as atlas glyphs on the CPU, GL and Vulkan compositors
+    # (references in tests/golden/compositor), and the Vulkan cases under validation.
+    if(LIBPNG_FOUND)
+        add_executable(test_deco_titles tests/test_deco_titles.cpp)
+        target_link_libraries(test_deco_titles PRIVATE lx.compositor ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_deco_titles)
+        lumen_link_platform(test_deco_titles)
+        target_include_directories(test_deco_titles PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_deco_titles PRIVATE
+            LUMEN_DECO_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/compositor")
+        add_test(NAME test_deco_titles COMMAND test_deco_titles)
+        if(LUMEN_VK_VALIDATION_LAYER)
+            add_test(NAME test_deco_titles_vk_validation COMMAND test_deco_titles --filter=vk_)
+        endif()
+    endif()
+
     add_executable(test_layer_arrange tests/test_layer_arrange.cpp)
     target_link_libraries(test_layer_arrange PRIVATE lx.compositor)
     lumen_apply_module_properties(test_layer_arrange)
@@ -1236,6 +1252,13 @@ if(LUMEN_BUILD_TESTS)
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    if(TARGET test_deco_titles)
+        set_tests_properties(test_deco_titles PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+        if(TEST test_deco_titles_vk_validation)
+            set_tests_properties(test_deco_titles_vk_validation PROPERTIES ENVIRONMENT
+                "${LUMEN_SANITIZER_ENV_VULKAN_ICD};LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
+        endif()
+    endif()
 endif()
 
 # ── Fuzzers ──────────────────────────────────────────────────────────────────

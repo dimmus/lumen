@@ -464,6 +464,15 @@ warp is a synthetic motion on UI.
 | Face lock | worker ↔ UI | The worker's shape pass holds `face_cache::lock()` but hands it to a waiter between paragraphs (`face_cache::contended`): the UI thread rasterising a glyph waits at most one paragraph (1.3 ms worst seen against a 150 KB pass, `test_text_node`) |
 | Node destroyed meanwhile | UI | The job outlives the node and is freed by its UI task |
 
+### Compositor title glyphs (ADR-010 §4.11)
+
+| Step | Thread | What |
+|------|--------|------|
+| Title change | UI | `decoration_manager` lays the title out (`chrome_text`) and rasterises its new glyphs into `chrome_atlas` under the atlas's mutex — only on a glyph-cache miss |
+| Frame emission | UI | `frame_node` looks each glyph's tile up (`atlas::use`: the tile table is UI-only, no lock) and emits a sprite into the snapshot |
+| Paint | render | A frame whose stream has sprites holds the mutex while `:ui_cpu` samples the pages in place or `:ui_gl` / `:ui_vk` upload their dirty rects (and clear the lists); captures and the headless dump likewise |
+| Tile reuse | UI | A tile a published frame names is reused only after the atlas ages it out (120 frames unused); a page rebuild moves tiles under the mutex and damages every frame |
+
 ### Workspaces (ADR 011 Part 3)
 
 Everything is UI-affinity and event-driven: the workspace model (`:workspaces`, fixed

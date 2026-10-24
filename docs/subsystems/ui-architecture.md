@@ -146,6 +146,41 @@ than growing, so a pathological tree cannot allocate mid-frame.
 > was an empty placeholder class, so nothing painted through it could ever reach the
 > screen. See §9.
 
+### Text emission (ADR-010 §4.6, Phase 2)
+
+Text is emitted, never rasterized into a buffer by the node: `text_block_node` (`lx.ui:text_node`)
+holds a retained `text::text_layout` and appends one sprite per glyph — `mono_sprite` (R8
+coverage × the span's colour) or, for a colour glyph, `poly_sprite` (RGBA8) — plus an
+`underline` per underlined or spell-marked run. See [text.md](text.md) for the layout, the
+caches and the threading contract.
+
+- **Invalidation.** `apply` hands every prop to the layout's setters, which ignore an equal
+  value: the shape pass runs only when text, font, scale, attributes, direction or language
+  change, the wrap pass only when width, wrap, max lines or alignment change. Width comes
+  from `arrange` (bounds width over the scale). Text of 4 KiB or more is shaped on the
+  worker (`text_async_shaping`); the old layout is drawn until the new one lands.
+- **Placement.** Bounds are device pixels; the layout is laid out at `scale`. Each glyph is
+  placed by `text::glyph_pen` (x on a quarter pixel — the subpixel variant —, y on a whole
+  pixel), so its sprite is its tile 1:1 on whole pixels. A glyph is looked up once
+  (`glyph_cache::find_placed`: one probe, one `atlas::use`) and its box and tile kept until
+  the layout runs a pass; a frame that only moves the text costs one `atlas::use` per glyph.
+  A miss rasterizes on that frame, under the face lock taken once per emit.
+- **Culling.** Lines are stacked, so the lines the clip reaches are found by a binary search
+  over their tops (widened by an em) before any glyph is touched.
+- **Order.** A line's sprites share one order from the overlap grid
+  (`draw_scope::group_order`, at most 128 sprites a group; an underline closes the group),
+  each group's order above the previous one's, so a block's sprites batch in push order —
+  one draw per atlas page — and the sort has nothing to move.
+- **Colour.** Packed once per run (premultiplied f16, opacity folded in), in the space the
+  target blends in (encoded sRGB, §4.5 of the ADR). A linear-light target raises glyph
+  coverage to the theme's `text.contrast` exponent in the renderer.
+- **Allocation.** None per frame: the layout's storage, the placements, the glyph cache and
+  the atlas are retained.
+
+The compositor's server-side title bars use the same primitives without `lx.ui`:
+`compositor::frame_node` emits its title and close glyph as `mono_sprite`s from the
+compositor's own atlas, laid out per output scale by `decoration_manager` (text.md §6).
+
 ---
 
 ## 7. Damage

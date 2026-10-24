@@ -254,10 +254,16 @@ the compositor's shm uploads yet. The atlas's dirty lists (and a new page image'
 state) are committed only when the frame is submitted; a frame whose surface draw fails to
 record inside the pass is still submitted, so the copies and acquires recorded before it run.
 `surface` draws record `vulkan_compositor`'s images and descriptor sets into `:ui_vk`'s
-command buffers, which the compositor's fences do not cover: until `vulkan_compositor`
-tracks external users, whoever forgets or replaces such a texture must first wait for
-`:ui_vk`'s frames (`wait_idle`; stated on `record_blits`). The compositor's Vulkan path does
-not use `:ui_vk` yet, so nothing in production depends on this.
+command buffers, which the compositor's fences do not cover. As built in Phase 2 both Phase 1
+open items are closed: `vulkan_compositor` tracks external users (`add_external_user`: a
+`ui_vk_renderer` given a surface compositor registers its `wait_idle`; `record_blits` on a
+command buffer other than the compositor's own frame marks the texture, and
+`forget_texture`, `upload_rgba` over it and `bind_imported` of another image under its id
+wait for every external user first), and a `vkEndCommandBuffer` / `vkQueueSubmit` that fails
+after `prepare_blits` un-marks the acquires it recorded (`abandon_prepared_blits`), so the
+next frame records them again. The compositor's own Vulkan frames with primitives record
+`:ui_vk` inside its linear pass (`ui_vk_renderer::composite`, §4.11), where its fences cover
+everything.
 
 ### 4.5 Colour and precision
 
@@ -276,11 +282,14 @@ not use `:ui_vk` yet, so nothing in production depends on this.
   against the sRGB rendering in the golden tests, §8.4). The compositor's own chrome
   renders inside its linear F16 pass and uses the same exponent.
   Measured in Phase 2 (`test_ui_golden` `text_contrast_keeps_stem_coverage`: IBM Plex Sans at
-  10–16 px, coverage from the CPU reference, the linear blend composed from it since no
-  renderer has a linear target yet): the starting values do not hold the 3 % bound — linear
-  blending thickens One Dark's text by 26 % at exponent 1.0 and thins One Light's by 31 % at
-  1.2. The exponent has to rise for light-on-dark and fall below 1 for dark-on-light: 1.58–1.77
-  (1.67 used) dark and 0.54–0.61 (0.57 used) light keep the mean stem coverage within 3 %.
+  10–16 px, coverage from the CPU reference, the linear blend composed from it): the starting
+  values do not hold the 3 % bound — linear blending thickens One Dark's text by 26 % at
+  exponent 1.0 and thins One Light's by 31 % at 1.2. The exponent has to rise for
+  light-on-dark and fall below 1 for dark-on-light: 1.58–1.77 (1.67 used) dark and 0.54–0.61
+  (0.57 used) light keep the mean stem coverage within 3 % (`gfx::k_text_contrast_dark`,
+  `k_text_contrast_light`). The first linear target is the Vulkan compositor's F16 pass
+  (§4.11): its light-on-dark title text at 1.67 has a mean stem weight +1.5 % of the CPU
+  compositor's encoded blend, +14.7 % at 1.0 (`test_deco_titles`, lavapipe).
 - 10-bit output: when `zwp_linux_dmabuf_v1` feedback offers `XRGB2101010` the client
   swapchain uses it; the compositor already scans out A2B10G10R10.
 
@@ -463,6 +472,32 @@ square quads become solid blits, other primitives are dropped, counted and warne
 linear instance colours, is the remaining step for primitives that do not lower. Occluders
 are quads that lower (radius 0, borderless, one colour, integral rects) at alpha 1;
 primitives are never culled.
+
+As built in Phase 2 (`lx.compositor:decoration`, `:ui_composite`; rendering-performance.md §1.2
+"Server-side frames", §6): the title text and the close glyph are `mono_sprite`s in the
+compositor's own atlas (`chrome_atlas`: one `gfx::atlas` for every output, written by UI under
+its mutex, read by the render thread's renderer under it). `chrome_text` shapes and fits a
+title with the single-line `lx.text` API — the CPU titles' font, ellipsis and not-responding
+rules, placement unchanged — and rasterises its glyphs through a `text::glyph_cache` (4
+subpixel variants, light hinting below 1.5) once per title change and per output scale the
+frame is on (`decoration_manager::set_window_scales`, up to 4 runs): each output draws its own
+scale 1:1, a view of another scale resamples the largest run. The close glyph is the analytic
+"×" rasterised per scale (not a font glyph: no font on every host has the same one); the
+hover / pressed circle stays a blit. The per-window CPU title textures, their upload and their
+texture ids are gone. The Vulkan compositor no longer lowers: `ui_vk_renderer::composite`
+records the stream inside `vulkan_compositor`'s linear F16 pass (`begin_linear_frame`,
+`begin_linear_pass`, `end_linear_frame`), with instance colours decoded to premultiplied linear
+light and glyph coverage raised to `k_text_contrast_dark` by the shaders under a push-constant
+flag; frames without primitives are `composite` byte for byte. Screen capture's
+re-composites (`paint_cpu_capture`, `paint_gl_capture`: the crop moves the primitives too) and
+the headless dump (`paint_headless`) draw the stream; only GLES 2 still lowers, dropping the
+glyphs. On a turned output the view marks each sprite with its transform and the renderers
+sample the tile back through `source_basis_for`. Dimmed frames' fills and glyphs carry one
+byte rule on every backend — the Phase 1 disagreement between dimmed fills and dimmed title
+blits on GL and Vulkan is gone. Measured (`test_deco_titles`): GL within 1/255 of the CPU
+compositor, Vulkan (lavapipe) within 1/255 outside the text and 9/255 on glyph edges with the
+stem weight +1.5 %; render-thread cost on CPU +3–5 % for a full repaint, GL unchanged within
+noise; no frame allocates.
 
 ### 4.12 Threads and allocation
 
@@ -733,6 +768,23 @@ itemizer over the block's face cache) into a staging layout, handed back with
 (`face_cache::contended`): the UI thread waited at most 1.3 ms while a 150 KB document shaped.
 GL baseline rows: none committed — the two GL runs differ by more than 5 % at p95.
 
+As built (title bars, §4.11): server-side titles and the close glyph are atlas glyphs on all
+three compositors — CPU and GL through `:ui_cpu` / `:ui_gl` with the compositor's
+`chrome_atlas`, Vulkan through `:ui_vk` recording inside its linear F16 pass — and the
+per-window CPU title textures are deleted. `test_deco_titles`: the CPU compositor against
+committed references (tests/golden/compositor, scale 1 and 1.25, every title rule and button
+state), on turned outputs pixel-exact against the content turned, GL within 1/255 of it
+(G10's 3/255 is the bound; both blend UI in the encoded space; the circle blit's edge, blended
+per compositor as every blit always was, is masked), Vulkan within 2/255 outside the text and
+16/255 on glyph edges (measured 1 and 9/255; the bound leaves room for a hardware driver's
+pow and rounding) with the mean stem weight within 3 % (measured +1.5 %), zero validation
+messages; capture re-composites and the headless dump show the titles; a steady frame
+allocates nothing. Render-thread cost per decorated frame, `bench_ui_composite` (six titled
+480×320 windows at 1920×1080): CPU full repaint 1.81–1.85 → 1.87–2.08 ms p50 (1.89–1.91 ms
+at load 0.1), one window 32 → 36–45 µs; GL render thread 719–831 → 698–802 µs, GPU completion
+5.99–6.04 → 5.91–6.05 ms; UI-thread `commit_frame` 16 → 23–26 µs. A title change costs
+≈80 µs on the UI thread when its glyphs are new, 1–3 µs when they are cached.
+
 ### Phase 3 — Layout, style, theme, components (≈2 weeks)
 
 - `lx.layout:flex` with the per-node cache; `grow_node::grow_factor()` finally read.
@@ -908,9 +960,12 @@ request no frame callback; themes are compiled, not parsed at runtime.*
 | Scope creep into an editor | The component set is §5.6; syntax tables are compiled but no editor component is in this plan |
 
 Open: whether `lx.shell` keeps a CPU fallback for the panel on GLES 2 hosts (the CPU
-renderer already covers it, at a measured cost in S2), and whether the compositor should
-share one atlas across its outputs at different scales (one page per scale is the
-first answer).
+renderer already covers it, at a measured cost in S2). Answered in Phase 2: the compositor
+shares one atlas across its outputs — a glyph's key carries its size × scale, so the runs a
+title keeps per output scale are different tiles of the same pages, and a page set per scale
+would only split a few hundred tiles (§4.11). A GLES 2 compositor has no primitive renderer
+and draws its frames without titles (the lowered path drops glyphs); a lowering of mono
+sprites to blits of a coverage texture is the fix if such hosts matter.
 
 ---
 

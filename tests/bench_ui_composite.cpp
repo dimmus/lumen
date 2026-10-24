@@ -2,8 +2,10 @@
 // (ADR-010 §4.11): a 1920x1080 view with a solid background and six overlapping 480x320
 // windows, composited by the CPU and GL backends exactly as `composite_output` calls them
 // (`frame_painter::paint_cpu` / `paint_gl` on a published snapshot). Decorated, each window's
-// fills are quad primitives and the frame goes through `:ui_cpu` / `:ui_gl`; undecorated,
-// it is the blit path.
+// fills are quad primitives and its title ("Window N - Lumen Terminal: ~/src/lumen", the
+// compositor's title font) and close glyph are mono sprites from the compositor's text atlas
+// (`chrome_atlas`, laid out once before the run), and the frame goes through `:ui_cpu` /
+// `:ui_gl`; undecorated, it is the blit path.
 //
 // Two damage cases: the whole frame (a repaint) and one window's content (a client
 // committing every frame — the steady case). GL reports the render thread's time to submit
@@ -23,6 +25,7 @@ import lx.gfx;
 import lx.runtime;
 import lx.scene;
 import lx.compositor;
+import lx.text;
 
 namespace {
 
@@ -33,8 +36,21 @@ constexpr int k_win_h = 320;
 constexpr unsigned k_windows = 6;
 constexpr unsigned k_texture_base = 0x100u;
 
+/// The compositor's text atlas and the titles' text, shared by every scene (the atlas is UI
+/// state that outlives frames, as in the compositor).
+struct titles {
+    lx::compositor::chrome_atlas atlas{};
+    lx::compositor::chrome_text text{atlas};
+};
+
+titles& chrome() {
+    static titles t{};
+    return t;
+}
+
 struct scene_setup {
     lx::scene::scene_graph scene{};
+    std::vector<std::unique_ptr<lx::compositor::title_text>> titles;
     lx::scene::surface_node background{lx::surface_id{1}};
     std::vector<std::unique_ptr<lx::scene::surface_node>> windows;
     std::vector<std::unique_ptr<lx::compositor::frame_node>> frames;
@@ -60,6 +76,15 @@ struct scene_setup {
                 f->shown = true;
                 f->active = i + 1 == k_windows;
                 f->atlas_ready = &atlas_ready;
+                auto t = std::make_unique<lx::compositor::title_text>();
+                char title[64];
+                std::snprintf(title, sizeof title, "Window %u - Lumen Terminal: ~/src/lumen", i);
+                (void)chrome().text.layout_title(t->runs[0], title, false,
+                                                 lx::compositor::title_text_room(k_win_w), 1.0, true);
+                (void)chrome().text.close(1.0);
+                f->title = t.get();
+                f->text = &chrome().text;
+                titles.push_back(std::move(t));
                 (void)scene.root().add(f.get());
                 frames.push_back(std::move(f));
             }
@@ -194,7 +219,7 @@ int main(int argc, char** argv) {
                     const auto& snap = s.publish(full);
                     const double build = us_since(tb);
                     const auto t0 = std::chrono::steady_clock::now();
-                    (void)painter.paint_cpu(comp, &ui, t, snap, snap.damage_rects());
+                    (void)painter.paint_cpu(comp, &ui, t, snap, snap.damage_rects(), &chrome().atlas);
                     const double us = us_since(t0);
                     if (f >= warmup) {
                         times.push_back(us);
@@ -263,7 +288,7 @@ int main(int argc, char** argv) {
                         const auto& snap = s.publish(full);
                         const auto t0 = std::chrono::steady_clock::now();
                         auto p = painter.paint_gl(comp, ui_ready ? &ui : nullptr, target->framebuffer(),
-                                                  k_w, k_h, snap, snap.damage_rects());
+                                                  k_w, k_h, snap, snap.damage_rects(), &chrome().atlas);
                         const double us = us_since(t0);
                         if (p && p->composite.out_fence_fd >= 0) {
                             pollfd pfd{p->composite.out_fence_fd, POLLIN, 0};
