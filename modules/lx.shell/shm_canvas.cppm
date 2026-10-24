@@ -67,6 +67,11 @@ public:
     /// (Re)allocates both buffers for a `width`×`height` (logical) surface at the current
     /// scale (`shm` is a wl_shm*).
     [[nodiscard]] bool allocate(void* shm, int width, int height, const char* name);
+    /// One buffer (index 0) in private memory at `scale120`, with no Wayland objects: what is
+    /// painted into it is never shown. For painting a surface's first frame ahead of time,
+    /// so that its text is shaped and its glyphs rasterised into the process's caches before
+    /// the real first frame needs them. `free` releases it and restores the scale.
+    [[nodiscard]] bool allocate_offscreen(int width, int height, unsigned scale120);
     /// Frees the buffers (not the scale objects: the surface keeps them).
     void free();
     [[nodiscard]] bool allocated() const { return pool_ != nullptr; }
@@ -162,6 +167,8 @@ private:
     unsigned scale120_ = 120;
     bool rescale_ = false;
     bool viewport_dirty_ = false;
+    /// `allocate_offscreen`: the scale to restore on `free` (0: not offscreen).
+    unsigned offscreen_restore_ = 0;
     bool alpha_ = false;
     [[nodiscard]] double scale() const { return scale120_ / 120.0; }
     /// A logical rect on the pixel grid, edge by edge (adjacent rects share edges).
@@ -494,7 +501,37 @@ bool lx::shell::shm_canvas::allocate(void* shm, int logical_w, int logical_h, co
     return true;
 }
 
+bool lx::shell::shm_canvas::allocate_offscreen(int logical_w, int logical_h, unsigned scale120) {
+    free();
+    if (logical_w <= 0 || logical_h <= 0 || scale120 == 0)
+        return false;
+    offscreen_restore_ = scale120_;
+    scale120_ = scale120;
+    const int width = static_cast<int>(std::lround(logical_w * scale()));
+    const int height = static_cast<int>(std::lround(logical_h * scale()));
+    const std::size_t size = static_cast<std::size_t>(width) * 4u * static_cast<std::size_t>(height);
+    // Anonymous pages: only the rows painted become memory, and only until `free`.
+    void* data = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (data == MAP_FAILED) {
+        scale120_ = offscreen_restore_;
+        offscreen_restore_ = 0;
+        return false;
+    }
+    pool_data_ = data;
+    pool_size_ = size;
+    width_ = logical_w;
+    height_ = logical_h;
+    pw_ = width;
+    ph_ = height;
+    buffers_[0].pixels = static_cast<std::uint32_t*>(data);
+    return true;
+}
+
 void lx::shell::shm_canvas::free() {
+    if (offscreen_restore_) {
+        scale120_ = offscreen_restore_;
+        offscreen_restore_ = 0;
+    }
     for (auto& b : buffers_) {
         if (b.wl)
             wl_buffer_destroy(static_cast<wl_buffer*>(b.wl));
@@ -597,6 +634,7 @@ void lx::shell::shm_canvas::release_scale() {
 
 struct lx::shell::shm_canvas::events {};
 bool lx::shell::shm_canvas::allocate(void*, int, int, const char*) { return false; }
+bool lx::shell::shm_canvas::allocate_offscreen(int, int, unsigned) { return false; }
 void lx::shell::shm_canvas::free() {}
 void lx::shell::shm_canvas::commit(void*, int, const lx::rect2i*, unsigned) {}
 void lx::shell::shm_canvas::attach_scale(void*, void*, void*) {}

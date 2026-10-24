@@ -154,6 +154,8 @@ private:
         t_notify,
         /// A tray item's tooltip appears (500 ms of hovering).
         t_tooltip,
+        /// The launcher's first frame is painted ahead, once start-up has settled.
+        t_prepare,
         t_count
     };
     enum class pointer_target : unsigned char { none, panel, launcher, switcher, notify, menu };
@@ -561,6 +563,9 @@ constexpr long long k_token_timeout_ns = 100'000'000LL;
 constexpr long long k_notice_ns = 6'000'000'000LL;
 /// inotify bursts (a package install) settle into one rescan.
 constexpr long long k_debounce_ns = 250'000'000LL;
+/// After the panel first shows: when the launcher's first frame is painted ahead
+/// (`t_prepare`), clear of the background render, the tray and the notifications starting.
+constexpr long long k_prepare_ns = 1'000'000'000LL;
 
 } // namespace
 
@@ -1553,6 +1558,19 @@ void lx::shell::shell_app::on_timer() {
         deadline_[t_notify] = 0;
         (void)notes_.expire(now); // NotificationClosed(1) through the sink
     }
+    if (deadline_[t_prepare] && deadline_[t_prepare] <= now) {
+        deadline_[t_prepare] = 0;
+        // What the first Super press would otherwise do between the key and its frame:
+        // shape the entries' names and rasterise their glyphs (the panel's font at another
+        // size, the search field's), at the scale of the output it would open on.
+        if (!launcher_.is_open()) {
+            ensure_catalog();
+            output_record* o = launcher_output();
+            const int w = o && o->logical.width > 0 ? o->logical.width : 1024;
+            const int h = o && o->logical.height > 0 ? o->logical.height : 768;
+            launcher_.prepare(w, h, k_panel_height, o && o->bar ? o->bar->scale120() : 120u);
+        }
+    }
     if (deadline_[t_tooltip] && deadline_[t_tooltip] <= now) {
         deadline_[t_tooltip] = 0;
         show_tooltip();
@@ -2289,6 +2307,7 @@ int lx::shell::shell_app::run() {
             // The user bus too (notifications, the tray): never before the panel shows.
             start_desktop_services();
             desktop_after_dispatch();
+            set_timer(t_prepare, now_ns() + k_prepare_ns);
         }
         fds[0] = {wl_display_get_fd(d), POLLIN, 0};
         if (wl_display_flush(d) < 0) {

@@ -231,6 +231,11 @@ public:
     /// logical; false when it cannot.
     bool open(int output_w, int output_h, int panel_h, void* output = nullptr);
     void close();
+    /// While closed: paints the frame `open` would show first (same size, `scale120`) into
+    /// memory that is never shown, then frees it. The first open's frame then finds its text
+    /// shaped and its glyphs rasterised, as every later open does, rather than doing that
+    /// work between the key press and the frame.
+    void prepare(int output_w, int output_h, int panel_h, unsigned scale120);
     [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
     [[nodiscard]] void* surface() const { return surface_; }
     [[nodiscard]] launcher_model& model() { return model_; }
@@ -1011,6 +1016,27 @@ bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, void* ou
     return true;
 }
 
+void lx::shell::launcher::prepare(int output_w, int output_h, int panel_h, unsigned scale120) {
+    if (is_open() || !catalog_ || output_w <= 0)
+        return;
+    const launcher_geometry geo = launcher_size(output_w, output_h > 0 ? output_h : 600, panel_h);
+    if (!canvas_.allocate_offscreen(geo.width, geo.height, scale120))
+        return;
+    width_ = geo.width;
+    height_ = geo.height;
+    rows_ = geo.rows;
+    model_.reset();
+    model_.set_rows(rows_);
+    launcher_view v;
+    make_view(v);
+    launcher_layout first{};
+    layout_launcher(v, width_, height_, rows_, first);
+    const lx::rect2i whole{0, 0, first.width, first.height};
+    paint(0, first, &whole, 1);
+    canvas_.free();
+    model_.reset();
+}
+
 void lx::shell::launcher::close() {
     if (!is_open())
         return;
@@ -1095,6 +1121,7 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
 }
 bool lx::shell::launcher::open(int, int, int, void*) { return false; }
 void lx::shell::launcher::close() {}
+void lx::shell::launcher::prepare(int, int, int, unsigned) {}
 void lx::shell::launcher::after_dispatch() {}
 void lx::shell::launcher::draw(bool) {}
 

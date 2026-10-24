@@ -474,7 +474,11 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   Tab/Shift+Tab, Page Up/Down, Home/End move, Return launches, BackSpace / Ctrl+BackSpace /
   Ctrl+W / Ctrl+U edit; keys repeat per `repeat_info`. A press and release on a row
   launches it; the wheel scrolls three rows a notch. Layout, diff and model are pure, as the
-  panel's.
+  panel's. A second after the panel first shows, the launcher's first frame is painted once
+  into memory that is never shown (`launcher::prepare`, `shm_canvas::allocate_offscreen`), at
+  the size and scale it would open with: the entries' names are shaped and their glyphs
+  rasterised then, not between the first Super press and its frame (first paint 0.8–7.6 ms
+  → 0.5–0.6 ms on SVGA3D, the same as every later open).
 - **Catalog and launching** (`lx.shell:desktop_entry`, `:app_catalog`, `:app_launch`). The
   catalog is read once after the panel's first commit, then inotify only marks it stale;
   it is rescanned when the launcher opens (or, while open, 250 ms after a burst of
