@@ -712,6 +712,35 @@ LUMEN_TEST(gl_fallback_ring_matches) {
         }
 }
 
+// A renderer told to prebuild only the quad program (the compositor names quad and
+// mono_sprite) builds every other program the first time a stream needs it, once, and
+// draws what the fully prebuilt renderer draws.
+LUMEN_TEST(gl_lazy_programs_match) {
+    gl_context* gl = shared_gl();
+    if (!gl)
+        return;
+    lx::gfx::ui_gl_renderer lazy{};
+    lx::gfx::ui_gl_options options{};
+    options.prebuild_kinds = lx::gfx::ui_gl_kind_bit(lx::gfx::primitive_kind::quad);
+    LUMEN_CHECK(static_cast<bool>(lazy.initialize(options)));
+    LUMEN_CHECK(lazy.setup_stats().programs == 1 && lazy.setup_stats().lazy == 0);
+    fixture fa{};
+    fixture fb{};
+    for (unsigned pass = 0; pass < 2; ++pass)
+        for (const ui_golden::golden_case& c : ui_golden::cases()) {
+            std::vector<std::uint32_t> a;
+            std::vector<std::uint32_t> b;
+            LUMEN_CHECK(render_gl(gl->renderer, c, fa.tiles, *fa.atlas, a, full_region()));
+            LUMEN_CHECK(render_gl(lazy, c, fb.tiles, *fb.atlas, b, full_region()));
+            LUMEN_CHECK(a == b);
+        }
+    // shadow, mono, poly and underline: each built once, on the first case that drew it.
+    LUMEN_CHECK(lazy.setup_stats().lazy == 4);
+    LUMEN_CHECK(lazy.setup_stats().programs == 5);
+    std::printf("    4 programs built on first use: %.2f ms in all\n",
+                static_cast<double>(lazy.setup_stats().lazy_ns) / 1e6);
+}
+
 // A tile written after the page went up reaches the GPU through the page's dirty rects
 // alone, and draws what the CPU reference draws.
 LUMEN_TEST(gl_atlas_dirty_rects_upload) {

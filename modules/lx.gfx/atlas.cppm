@@ -33,7 +33,12 @@ export namespace lx::gfx {
 //
 // Fixed caps everywhere: the tile table, the shelves of a page and the dirty list are
 // fixed arrays sized at construction; after a page exists nothing allocates except the
-// creation of another page (and, with the first page of a format, the rebuild scratch).
+// creation of another page and a rebuild's scratch.
+//
+// Pixel memory is anonymous mappings (`lx::runtime::page_mapping`), not heap: a page's
+// texels are resident only where tiles have been written, the rebuild scratch is mapped for
+// the rebuild alone and sized to the live tiles, and the rows a rebuild empties are handed
+// back. Title-bar glyphs touch a few hundred KB of a 4 MiB R8 page.
 
 enum class atlas_format : std::uint8_t {
     r8,    ///< one byte of coverage per texel
@@ -214,7 +219,7 @@ private:
         std::uint16_t live = 0; ///< live tiles on it
     };
     struct page_state {
-        std::uint8_t* pixels = nullptr; ///< `k_atlas_page_max`² texels, calloc'd
+        std::uint8_t* pixels = nullptr; ///< `k_atlas_page_max`² texels, in `page_memory_`
         unsigned stride = 0;
         unsigned size = 0; ///< 0: not created
         unsigned next_y = 0;
@@ -248,8 +253,7 @@ private:
 
     storage* store_ = nullptr;
     page_state pages_[k_atlas_pages]{};
-    std::uint8_t* scratch_ = nullptr; ///< rebuild scratch, one page of the largest format
-    std::size_t scratch_bytes_ = 0;
+    lx::runtime::page_mapping page_memory_[k_atlas_pages]{};
     std::uint64_t frame_ = 0;
     unsigned free_top_ = 0;
     atlas_stats stats_{};
@@ -301,9 +305,6 @@ lx::gfx::atlas::atlas() {
 }
 
 lx::gfx::atlas::~atlas() {
-    for (auto& p : pages_)
-        std::free(p.pixels);
-    std::free(scratch_);
     delete store_;
 }
 
@@ -339,16 +340,11 @@ bool lx::gfx::atlas::create_page(unsigned page) {
         return true;
     const unsigned bpt = bytes_per_texel(page_format(page));
     const std::size_t bytes = static_cast<std::size_t>(k_atlas_page_max) * k_atlas_page_max * bpt;
-    // calloc: zero texels, and a large calloc maps lazily — the untouched 3/4 of a page
-    // that has not grown costs address space, not memory.
-    p.pixels = static_cast<std::uint8_t*>(std::calloc(bytes, 1));
-    if (!p.pixels)
+    // Zero texels, resident only once written: the untouched 3/4 of a page that has not
+    // grown, and the rows below the last shelf, cost address space, not memory.
+    if (!page_memory_[page].map(bytes))
         return false;
-    if (scratch_bytes_ < bytes) {
-        std::free(scratch_);
-        scratch_ = static_cast<std::uint8_t*>(std::calloc(bytes, 1));
-        scratch_bytes_ = scratch_ ? bytes : 0;
-    }
+    p.pixels = reinterpret_cast<std::uint8_t*>(page_memory_[page].data());
     p.stride = k_atlas_page_max * bpt;
     p.size = k_atlas_page_initial;
     p.next_y = 0;
@@ -621,8 +617,6 @@ lx::result<lx::gfx::atlas_rebuild_stats> lx::gfx::atlas::rebuild(unsigned page) 
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (page >= k_atlas_pages || pages_[page].size == 0)
         return lx::invalid_argument("atlas::rebuild: page not created");
-    if (!scratch_)
-        return lx::invalid_argument("atlas::rebuild: no scratch (allocation failed)");
     const std::uint64_t t0 = lx_gfx_atlas_now_ns();
     page_state& p = pages_[page];
     p.rebuild_pending = false;
@@ -658,15 +652,25 @@ lx::result<lx::gfx::atlas_rebuild_stats> lx::gfx::atlas::rebuild(unsigned page) 
         return a < b;
     });
 
-    // 3. Pixels out to the scratch, in repack order.
+    // 3. Pixels out to the scratch, in repack order. The scratch holds just the live tiles
+    //    and is unmapped when the rebuild returns.
     const unsigned bpt = bytes_per_texel(page_format(page));
+    std::size_t live_bytes = 0;
+    for (unsigned n = 0; n < count; ++n) {
+        const tile_entry& t = tiles[store_->order[n]];
+        live_bytes += static_cast<std::size_t>(t.w) * t.h * bpt;
+    }
+    lx::runtime::page_mapping scratch_memory;
+    if (live_bytes > 0 && !scratch_memory.map(live_bytes))
+        return lx::invalid_argument("atlas::rebuild: scratch mapping failed");
+    auto* const scratch = reinterpret_cast<std::uint8_t*>(scratch_memory.data());
     std::size_t offset = 0;
     for (unsigned n = 0; n < count; ++n) {
         const tile_entry& t = tiles[store_->order[n]];
         const std::size_t row_bytes = static_cast<std::size_t>(t.w) * bpt;
         store_->scratch_offset[n] = static_cast<std::uint32_t>(offset);
         for (unsigned row = 0; row < t.h; ++row) {
-            std::memcpy(scratch_ + offset,
+            std::memcpy(scratch + offset,
                         p.pixels + static_cast<std::size_t>(t.y + row) * p.stride +
                             static_cast<std::size_t>(t.x) * bpt,
                         row_bytes);
@@ -700,7 +704,7 @@ lx::result<lx::gfx::atlas_rebuild_stats> lx::gfx::atlas::rebuild(unsigned page) 
         t.x = static_cast<std::uint16_t>(x);
         t.y = static_cast<std::uint16_t>(y);
         const std::size_t row_bytes = static_cast<std::size_t>(t.w) * bpt;
-        const std::uint8_t* src = scratch_ + store_->scratch_offset[n];
+        const std::uint8_t* src = scratch + store_->scratch_offset[n];
         for (unsigned row = 0; row < t.h; ++row)
             std::memcpy(p.pixels + static_cast<std::size_t>(t.y + row) * p.stride +
                             static_cast<std::size_t>(t.x) * bpt,
@@ -709,6 +713,9 @@ lx::result<lx::gfx::atlas_rebuild_stats> lx::gfx::atlas::rebuild(unsigned page) 
     }
     p.dirty_full = true;
     p.dirty_count = 0;
+    // The rows below the last shelf held tiles that are gone or moved up: back to the kernel.
+    page_memory_[page].discard(static_cast<std::size_t>(p.next_y) * p.stride,
+                               page_memory_[page].size());
 
     out.occupancy_after = occupancy(page);
     out.ns = lx_gfx_atlas_now_ns() - t0;

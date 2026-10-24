@@ -28,8 +28,9 @@ export namespace lx::text {
 // share glyphs. The ellipsis runs `text_layout` shapes per face go through the same check.
 //
 // Glyphs live in one arena of `glyph_capacity` records and the runs' UTF-8 in another of
-// `text_capacity` bytes, both allocated at construction; nothing allocates after
-// construction except HarfBuzz itself while warming up (a shape plan per face and feature
+// `text_capacity` bytes, both mapped at construction (anonymous pages, resident as runs
+// fill them, handed back by `clear`); nothing allocates after construction except
+// HarfBuzz itself while warming up (a shape plan per face and feature
 // set, a buffer that grows past its preallocation for a run longer than `max_run_glyphs`
 // code points). A full table or arena applies the cache's `overflow_action`: `drop_oldest`
 // (the default) evicts least recently used entries — down to 1/16 of each arena free, so the
@@ -226,6 +227,10 @@ private:
     shaped_glyph* arena_ = nullptr;
     shaped_glyph* scratch_ = nullptr;
     char* text_arena_ = nullptr;
+    /// Backing for the three above: anonymous mappings, resident only as runs fill them.
+    lx::runtime::page_mapping arena_memory_{};
+    lx::runtime::page_mapping scratch_memory_{};
+    lx::runtime::page_mapping text_memory_{};
     std::uint32_t text_top_ = 0;
     std::uint32_t live_text_ = 0;
     void* buffer_ = nullptr; ///< hb_buffer_t*
@@ -303,20 +308,22 @@ lx::text::shape_cache::shape_cache(shape_cache_config config) : config_{config} 
     entries_ = new (std::nothrow) entry[config_.entries];
     index_ = new (std::nothrow) std::uint32_t[slots]{};
     index_mask_ = slots - 1;
-    // Raw storage, no constructor run (shaped_glyph is an implicit-lifetime aggregate): the
-    // arena's pages become resident only as runs fill them.
-    arena_ = static_cast<shaped_glyph*>(
-        ::operator new(std::size_t{config_.glyph_capacity} * sizeof(shaped_glyph), std::nothrow));
-    scratch_ = static_cast<shaped_glyph*>(
-        ::operator new(std::size_t{config_.max_run_glyphs} * sizeof(shaped_glyph), std::nothrow));
-    text_arena_ = static_cast<char*>(::operator new(std::size_t{config_.text_capacity}, std::nothrow));
+    // Anonymous mappings, no constructor run (shaped_glyph is an implicit-lifetime
+    // aggregate): an arena's pages become resident only as runs fill them. Heap blocks would
+    // not stay lazy — see lx::runtime::page_mapping.
+    if (arena_memory_.map(std::size_t{config_.glyph_capacity} * sizeof(shaped_glyph)))
+        arena_ = reinterpret_cast<shaped_glyph*>(arena_memory_.data());
+    if (scratch_memory_.map(std::size_t{config_.max_run_glyphs} * sizeof(shaped_glyph)))
+        scratch_ = reinterpret_cast<shaped_glyph*>(scratch_memory_.data());
+    if (text_memory_.map(std::size_t{config_.text_capacity}))
+        text_arena_ = reinterpret_cast<char*>(text_memory_.data());
     if (!entries_ || !index_ || !arena_ || !scratch_ || !text_arena_) {
         // Out of memory at construction: every shape call reports it.
         delete[] entries_;
         delete[] index_;
-        ::operator delete(arena_);
-        ::operator delete(scratch_);
-        ::operator delete(text_arena_);
+        arena_memory_.release();
+        scratch_memory_.release();
+        text_memory_.release();
         entries_ = nullptr;
         index_ = nullptr;
         arena_ = scratch_ = nullptr;
@@ -351,9 +358,6 @@ lx::text::shape_cache::~shape_cache() {
 #endif
     delete[] entries_;
     delete[] index_;
-    ::operator delete(arena_);
-    ::operator delete(scratch_);
-    ::operator delete(text_arena_);
 }
 
 lx::text::shape_cache_counters lx::text::shape_cache::counters() const {
@@ -371,6 +375,9 @@ void lx::text::shape_cache::clear() {
     }
     top_ = 0;
     text_top_ = 0;
+    // Nothing is stored: the arenas' pages go back to the kernel.
+    arena_memory_.discard(0, arena_memory_.size());
+    text_memory_.discard(0, text_memory_.size());
 }
 
 lx::result<lx::text::shape_cache::key> lx::text::shape_cache::make_key(const shape_request& r) const {

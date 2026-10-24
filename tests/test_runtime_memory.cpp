@@ -1,5 +1,8 @@
 #include "lumen_test.hpp"
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 import std;
 import lx.runtime;
 
@@ -129,6 +132,59 @@ LUMEN_TEST(staging_is_not_an_arena) {
     const unsigned used = ui.used_bytes();
     coord.reset_frame_arenas(lx::runtime::memory_pool::staging);
     LUMEN_CHECK(ui.used_bytes() == used); // resetting "staging" must not reset the UI arena
+}
+
+namespace {
+
+/// Pages of [p, p + bytes) resident in this process, by mincore.
+[[nodiscard]] std::size_t resident_pages(const void* p, std::size_t bytes) {
+    const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    std::vector<unsigned char> v((bytes + page - 1) / page);
+    if (::mincore(const_cast<void*>(p), bytes, v.data()) != 0)
+        return ~std::size_t{0};
+    std::size_t n = 0;
+    for (unsigned char c : v)
+        n += c & 1u;
+    return n;
+}
+
+} // namespace
+
+// Atlas pages and cache arenas rely on this: nothing resident until written, and discard
+// hands whole pages back (reading zero after), keeping partial pages at the ends.
+LUMEN_TEST(page_mapping_is_lazy_and_discard_returns_pages) {
+    const std::size_t page = static_cast<std::size_t>(::sysconf(_SC_PAGESIZE));
+    lx::runtime::page_mapping m;
+    LUMEN_CHECK(!m.valid() && m.size() == 0);
+    LUMEN_CHECK(!m.map(0));
+    LUMEN_CHECK(m.map(4 * 1024 * 1024 + 1));
+    LUMEN_CHECK(m.valid() && m.size() == 4 * 1024 * 1024 + page);
+    LUMEN_CHECK(resident_pages(m.data(), m.size()) == 0);
+
+    // Residency is checked before each read: mincore counts a page that was only read,
+    // because reading maps the shared zero page (which costs no RSS).
+    m.data()[0] = std::byte{1};
+    m.data()[3 * page + 5] = std::byte{2};
+    m.data()[7 * page] = std::byte{3};
+    LUMEN_CHECK(resident_pages(m.data(), m.size()) == 3);
+
+    // [1 byte into page 0, end of page 7): only pages 1–6 are whole, so page 0 stays.
+    m.discard(1, 7 * page - 1);
+    LUMEN_CHECK(resident_pages(m.data(), m.size()) == 2);
+    LUMEN_CHECK(m.data()[0] == std::byte{1});
+    LUMEN_CHECK(m.data()[3 * page + 5] == std::byte{0});
+    LUMEN_CHECK(m.data()[7 * page] == std::byte{3});
+    m.discard(0, m.size() * 2); // clamped to the mapping
+    LUMEN_CHECK(resident_pages(m.data(), m.size()) == 0);
+    bool zero = true;
+    for (std::size_t i = 0; i < m.size(); ++i)
+        zero = zero && m.data()[i] == std::byte{0};
+    LUMEN_CHECK(zero);
+
+    lx::runtime::page_mapping moved{std::move(m)};
+    LUMEN_CHECK(!m.valid() && moved.valid() && moved.size() == 4 * 1024 * 1024 + page);
+    moved.release();
+    LUMEN_CHECK(!moved.valid() && moved.size() == 0);
 }
 
 int main(int argc, char** argv) {

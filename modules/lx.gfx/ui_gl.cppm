@@ -120,7 +120,16 @@ struct ui_gl_options {
     bool persistent_ring = true; ///< use GL_EXT_buffer_storage when present
     bool timer_query = true;     ///< use GL_EXT_disjoint_timer_query when present
     bool program_cache = true;   ///< cache program binaries when the driver has a format
+    /// Kinds whose programs `initialize` builds, as bits `1u << primitive_kind`; every other
+    /// program is built by the first `draw` whose stream needs it. Each linked program holds
+    /// driver memory (about 1.8 MiB on SVGA3D, binary cache or not), so a caller that only
+    /// ever draws a few kinds — the compositor's decorations — names those. All by default.
+    std::uint32_t prebuild_kinds = 0xFFFFFFFFu;
 };
+
+[[nodiscard]] constexpr std::uint32_t ui_gl_kind_bit(primitive_kind kind) {
+    return 1u << static_cast<unsigned>(kind);
+}
 
 /// What the context offers and what `initialize` chose.
 struct ui_gl_caps {
@@ -148,6 +157,8 @@ struct ui_gl_setup_stats {
     unsigned programs = 0;
     unsigned from_cache = 0;      ///< programs loaded from a cached binary
     unsigned written = 0;         ///< binaries written to the cache
+    unsigned lazy = 0;            ///< programs built by `draw`, outside `prebuild_kinds`
+    std::uint64_t lazy_ns = 0;    ///< what those took, summed
 };
 
 struct ui_gl_draw_stats {
@@ -274,6 +285,8 @@ private:
     };
 
     [[nodiscard]] lx::result<void> build_program(program_index index);
+    /// The program drawing `kind`; `p_count` for surface.
+    [[nodiscard]] static program_index program_for(primitive_kind kind);
     [[nodiscard]] lx::result<void> upload_atlas(atlas& a, ui_gl_draw_stats& stats);
     [[nodiscard]] std::size_t encode(const ui_stream& stream, const atlas* a, std::byte* slot,
                                      ui_gl_draw_stats& stats);
@@ -634,6 +647,19 @@ lx::result<void> lx::gfx::ui_gl_target::read_back(std::span<std::uint32_t> out, 
 
 lx::gfx::ui_gl_renderer::~ui_gl_renderer() { shutdown(); }
 
+lx::gfx::ui_gl_renderer::program_index lx::gfx::ui_gl_renderer::program_for(primitive_kind kind) {
+    switch (kind) {
+    case primitive_kind::shadow: return p_shadow;
+    case primitive_kind::quad: return p_quad;
+    case primitive_kind::mono_sprite:
+    case primitive_kind::path: return p_mono;
+    case primitive_kind::poly_sprite: return p_poly;
+    case primitive_kind::underline: return p_underline;
+    case primitive_kind::surface: break;
+    }
+    return p_count;
+}
+
 lx::result<void> lx::gfx::ui_gl_renderer::build_program(program_index index) {
 #if defined(LUMEN_HAS_EGL)
     using namespace ui_gl_detail;
@@ -799,7 +825,15 @@ lx::result<void> lx::gfx::ui_gl_renderer::initialize(const ui_gl_options& option
     caps_.program_cache = options.program_cache && caps_.program_binary_formats > 0;
 
     const std::uint64_t t0 = now_ns();
+    std::uint32_t wanted = 0; // programs, by bit
+    for (unsigned k = 0; k < k_primitive_kinds; ++k) {
+        const auto kind = static_cast<primitive_kind>(k);
+        if ((options.prebuild_kinds & ui_gl_kind_bit(kind)) != 0 && program_for(kind) != p_count)
+            wanted |= 1u << program_for(kind);
+    }
     for (unsigned i = 0; i < p_count; ++i) {
+        if ((wanted & (1u << i)) == 0)
+            continue;
         if (auto built = build_program(static_cast<program_index>(i)); !built) {
             shutdown();
             return built.get_error();
@@ -1057,6 +1091,24 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
             return up.get_error();
     }
 
+    // Programs `initialize` left out (`ui_gl_options::prebuild_kinds`), built the first time
+    // a stream draws their kind: one compile, or one binary load, per program per renderer.
+    bool all_built = true;
+    for (const program& p : programs_)
+        all_built = all_built && p.id != 0;
+    if (!all_built) {
+        for (const batch& b : stream.batches) {
+            const program_index index = program_for(b.kind);
+            if (index == p_count || programs_[index].id != 0)
+                continue;
+            const std::uint64_t t0 = ui_gl_detail::now_ns();
+            if (auto built = build_program(index); !built)
+                return built.get_error();
+            ++setup_.lazy;
+            setup_.lazy_ns += ui_gl_detail::now_ns() - t0;
+        }
+    }
+
     // The slot: wait (rarely) for the frame three back that used it.
     const unsigned slot = frame_ % k_ui_gl_ring_slots;
     ++frame_;
@@ -1209,16 +1261,7 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
             const std::uint32_t count = batch_count_[b];
             if (count == 0)
                 continue;
-            unsigned index = p_quad;
-            switch (bt.kind) {
-            case primitive_kind::shadow: index = p_shadow; break;
-            case primitive_kind::quad: index = p_quad; break;
-            case primitive_kind::mono_sprite:
-            case primitive_kind::path: index = p_mono; break;
-            case primitive_kind::poly_sprite: index = p_poly; break;
-            case primitive_kind::underline: index = p_underline; break;
-            case primitive_kind::surface: break;
-            }
+            const unsigned index = program_for(bt.kind);
             use(index);
             if (index == p_mono || index == p_poly) {
                 if (bound_page != bt.page) {
