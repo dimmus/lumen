@@ -15,6 +15,7 @@ export module lx.gfx;
 import std;
 
 export import :damage;
+export import :primitives;
 export import :dmabuf;
 export import :syncobj;
 export import :drm_timeline;
@@ -26,7 +27,10 @@ export import :vk_renderer;
 export import :cpu_renderer;
 export import :gl_renderer;
 export import :gl_capture;
-export import :glyph_atlas;
+export import :atlas;
+export import :ui_cpu;
+export import :ui_gl;
+export import :ui_vk;
 
 export namespace lx::gfx {
 

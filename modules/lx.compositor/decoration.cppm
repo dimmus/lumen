@@ -3,6 +3,7 @@ module;
 #include <math.h>
 
 import lx.foundation;
+import lx.gfx;
 import lx.trace;
 import lx.scene;
 import lx.text;
@@ -120,8 +121,12 @@ void build_deco_atlas(std::uint32_t* out);
 enum class deco_button : unsigned char { normal, hover, pressed };
 
 /// The frame of one window: the underlay of its tree container, so it restacks with the
-/// window and paints below its surfaces. 7–8 draws: four border fills, the title fill, the
-/// title text, the close button (circle when hovered or pressed, glyph).
+/// window and paints below its surfaces. The four border fills and the title fill are UI
+/// primitives (ADR-010 §4.11: radius-0 solid quads, the palette's colours, the projected
+/// rects the swatch blits had); the title text and the close button (circle when hovered or
+/// pressed, glyph) stay atlas blits until Phase 2 text. A dimmed frame's fills carry the dim
+/// already applied, the way `cpu_compositor` tints an encoded byte (`(c · 166) >> 8` for
+/// 0.65) — the pixels the tinted swatch blit had on the CPU backend.
 class frame_node final : public scene::scene_node {
 public:
     ~frame_node() override;
@@ -325,6 +330,21 @@ constexpr const char* k_not_responding_suffix = " (Not Responding)";
 /// surfaces.
 constexpr lx::color k_dim_tint = lx::color::rgb(0.65f, 0.65f, 0.65f, 1.f);
 constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
+
+/// A fill colour of the palette as a frame's quad carries it: the sRGB bytes as encoded
+/// values (the compositor's primitives blend in the backend's encoded space, ADR-010 §4.5),
+/// dimmed with `cpu_compositor`'s byte rule for the dim tint.
+[[nodiscard]] lx::color deco_fill_color(std::uint32_t rgb, bool dimmed) {
+    // `cpu_compositor`'s `to_255(0.65)`: the tint as the byte multiplier it applies.
+    const auto tint_255 = static_cast<std::uint32_t>(k_dim_tint.r * 255.f + 0.5f);
+    const auto channel = [&](unsigned shift) {
+        std::uint32_t v = (rgb >> shift) & 0xFFu;
+        if (dimmed)
+            v = (v * tint_255) >> 8u;
+        return static_cast<float>(v) / 255.f;
+    };
+    return lx::color::rgb(channel(16), channel(8), channel(0), 1.f);
+}
 
 void push_draw(lx::scene::draw_list& out, unsigned texture, lx::rect2i src, lx::rect2i dst,
                lx::rect2i clip, lx::blend_mode blend, lx::color tint = k_no_tint,
@@ -552,27 +572,39 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
     const lx::rect2i f = frame_rect(g, extents);
     const lx::color tint = dimmed ? k_dim_tint : k_no_tint;
     const unsigned atlas = k_deco_atlas_texture_id;
-    const lx::rect2i border =
-        swatch_centre(active ? deco_atlas::border_active : deco_atlas::border_inactive);
+    // The solid fills: one opaque quad per rect, ordered in the frame's paint order (the
+    // first starts the list's primitive stream; the surfaces after it take their orders at
+    // push, above it).
+    const auto push_fill = [&](lx::rect2i logical, std::uint32_t rgb) {
+        const lx::rect2i r = project(logical);
+        if (r.width <= 0 || r.height <= 0)
+            return;
+        lx::gfx::quad_instance q{};
+        q.bounds[0] = static_cast<float>(r.x);
+        q.bounds[1] = static_cast<float>(r.y);
+        q.bounds[2] = static_cast<float>(r.width);
+        q.bounds[3] = static_cast<float>(r.height);
+        const lx::color c = deco_fill_color(rgb, dimmed);
+        const lx::gfx::packed_rgba bg = lx::gfx::premultiplied_half(c);
+        q.background[0] = q.background_end[0] = bg.r;
+        q.background[1] = q.background_end[1] = bg.g;
+        q.background[2] = q.background_end[2] = bg.b;
+        q.background[3] = q.background_end[3] = bg.a;
+        out.push_quad(q, r, out.orders().assign(r));
+    };
+    const std::uint32_t border = active ? k_border_active : k_border_inactive;
     // Borders: left and right full height, top and bottom between them.
     if (extents.left > 0)
-        push_draw(out, atlas, border, {f.x, f.y, extents.left, f.height}, {},
-                  lx::blend_mode::opaque, tint);
+        push_fill({f.x, f.y, extents.left, f.height}, border);
     if (extents.right > 0)
-        push_draw(out, atlas, border, {g.x + g.width, f.y, extents.right, f.height}, {},
-                  lx::blend_mode::opaque, tint);
+        push_fill({g.x + g.width, f.y, extents.right, f.height}, border);
     if (extents.top > k_deco_title_height)
-        push_draw(out, atlas, border,
-                  {g.x, f.y, g.width, extents.top - k_deco_title_height}, {},
-                  lx::blend_mode::opaque, tint);
+        push_fill({g.x, f.y, g.width, extents.top - k_deco_title_height}, border);
     if (extents.bottom > 0)
-        push_draw(out, atlas, border, {g.x, g.y + g.height, g.width, extents.bottom}, {},
-                  lx::blend_mode::opaque, tint);
+        push_fill({g.x, g.y + g.height, g.width, extents.bottom}, border);
 
     const lx::rect2i title = title_rect(g);
-    push_draw(out, atlas,
-              swatch_centre(active ? deco_atlas::title_active : deco_atlas::title_inactive),
-              title, {}, lx::blend_mode::opaque, tint);
+    push_fill(title, active ? k_title_active : k_title_inactive);
 
     if (title_ready && title_size.width > 0 && title_size.height > 0) {
         // Placed in output pixels: the texture is rasterized at the window's scale (the

@@ -328,22 +328,32 @@ commit-timing target arms a stopped clock for exactly the tick that presents it 
 desktop with a timed update wakes once). See [architecture.md](../architecture.md) "Explicit
 sync, buffer readiness and the commit-path protocols".
 
-### Server-side frames: no new draw type
+### Server-side frames: quad primitives and atlas blits
 
-A window frame (`lx.compositor:decoration`) is drawn with the existing textured-quad path on
-every backend: there is no solid-fill draw, and none was added. Border and title fills
-stretch the centre 2x2 of a 4x4 colour swatch in one 64x64 atlas texture (the GL path's
-half-texel inset keeps linear filtering inside the swatch; CPU nearest sampling is exact),
-with `blend_mode::opaque`, so the CPU occlusion cull and the GL blend-off path still apply.
-Colours are baked into the swatches rather than produced by `tint`, whose encoding semantics
-would have to be proven identical on GL, CPU and Vulkan. The title is one premultiplied
-texture per window and focus colour, rasterized on the UI thread by `lx.text` when the title
-changes or its ellipsis cut moves (≈0.1–0.3 ms, not per frame); a focus change swaps the
-texture id, a move or a resize that keeps the cut costs no texture work. 7–8 draws per
-decorated window. Title texture ids are allocated upward and never reused, so a dated
-retirement can never drop a later texture that happened to get the same id. Damage is the
-frame's four strips (title bar plus borders, old and new apart), never the client area,
-which the window's own nodes account for; a hover or press repaints the close button only.
+A window frame (`lx.compositor:decoration`) emits its four border fills and its title fill
+as UI **quad primitives** (ADR-010 §4.11): radius 0, no border, one colour, on the projected
+whole-pixel rects the swatch blits used to cover — so the pixels are those of the blits (the
+CPU compositor at scale 1 and 1.25 is pixel-identical in every frame state,
+`test_decoration_geometry`). Colours are the palette's sRGB bytes as encoded values; a
+dimmed (not-responding) frame carries the dim already applied with `cpu_compositor`'s byte
+rule (`(c · 166) >> 8`), so no `tint` is involved. The title text and the close button
+(glyph, circle on hover) stay blits of the 64x64 atlas and of one premultiplied texture per
+window and focus colour, rasterized on the UI thread by `lx.text` when the title changes or
+its ellipsis cut moves (≈0.1–0.3 ms, not per frame). Title texture ids are allocated upward
+and never reused, so a dated retirement can never drop a later texture that happened to get
+the same id. Damage is unchanged: the frame's four strips (title bar plus borders, old and
+new apart), never the client area; a hover or press repaints the close button only. No
+shadow and no rounded corner yet — a visual change, left for after Phase 2 text.
+
+Dimming on the GPU backends. The old swatch blits applied the 0.65 dim tint in linear light
+on GL and Vulkan (`linear_to_srgb(lin · tint)`; `composite.frag` likewise), the CPU
+compositor as the byte rule. The fills now carry the byte rule on every backend — a
+deliberate change, which makes a dimmed frame's fill a few levels darker on GL and Vulkan
+than before (0x3b: about 47 then, 38 now) and identical to the CPU's. The title text and
+close-glyph blits of the same bar still carry `k_dim_tint`, which GL and Vulkan apply in
+linear light: on those backends a dimmed bar's fill and its text follow different dim rules
+until Phase 2 draws the text as primitives (or the dim is baked into the title textures).
+`test_decoration_geometry` checks the fills on `cpu_compositor` only.
 
 ### Screen capture: copies ride the composite
 
@@ -584,9 +594,11 @@ multiplies per draw in `project_node`, none per pixel; nothing allocates.
 
 - Up to **eight opaque rects** are kept, seeded from draws that cover their destination with
   full alpha: `blend_mode::opaque` (a format without alpha or an opaque region over the whole
-  buffer), opacity and tint alpha 1, translation only. When more are found the eight largest
-  stay. A draw inside one of them, or outside the output, is marked `occluded`; GL, Vulkan
-  and CPU skip it (`draws_culled`). The pixels are identical, so damage and buffer age are
+  buffer), opacity and tint alpha 1, translation only. A UI quad that is a solid square on
+  whole pixels at alpha 1 (a decoration fill) seeds one too, at its place in paint order; no
+  primitive is ever marked (§6, UI primitives in the compositor). When more are found the
+  eight largest stay. A draw inside one of them, or outside the output, is marked
+  `occluded`; GL, Vulkan and CPU skip it (`draws_culled`). The pixels are identical, so damage and buffer age are
   untouched — what is saved is the GPU fill of windows under a maximized one.
 - Cost: O(draws × 8) compares per published frame, a parallel `scene_node*`/`bool` scratch
   array of `k_max_draw_commands` in the scene graph (no allocation), one virtual call per
@@ -674,9 +686,23 @@ See [../uml/28-import-cache-sequence.mmd](../uml/28-import-cache-sequence.mmd).
 
 ## 6. Draw batching + pipeline cache
 
-Before `try_publish()`, `draw_list::batch_for_render()` partitions opaque and
-translucent draws, preserves paint order for alpha blending, and uses texture ID
-only as a tiebreaker within a batch.
+Before publishing, `draw_list::batch_for_render()` sorts the surface draws into strict
+painter's order (sort key, then texture id as a tie-break; no opaque-first partition —
+there is no depth buffer), then builds the primitive stream of ADR-010 §4.3 over the
+surfaces and the UI primitives (`lx.gfx:primitives`) emitted into the same list: every
+primitive took an `order` from the list's overlap grid at emission (one more than the
+highest order under its bounds, so non-overlapping primitives share an order), a surface
+draw takes one at push once the list has a primitive stream (those pushed before it starts
+take theirs back to front when it does), and the stream is stable-sorted by `(order, kind,
+page)` on packed 64-bit keys in a preallocated scratch and cut into batches wherever the
+kind or atlas page changes, with the union of each run's clipped bounds kept for damage
+skipping. One instanced draw per batch is the target for the UI backends (≤ 8 for the
+10 000-quad scene, ADR-010 G3). A list without primitives has no stream: it is only sorted,
+never touches the grid, its `refs()` / `batches()` are empty, and it reaches the
+compositor's backends as the sorted `draw_command` array converted to blits, as before. With
+primitives (server-side decorations), CPU and GLES 3.1 draw the stream through `:ui_cpu` /
+`:ui_gl` and the other paths draw it lowered to blits — see "UI primitives in the
+compositor" below.
 
 `pipeline_cache::acquire(pipeline_key)` returns cached pipeline handle (stub until P0 Vulkan).
 
@@ -685,6 +711,192 @@ only as a tiebreaker within a batch.
 **Module:** `lx.gfx.pipeline` — `pipeline_cache`, `merged_render_pass`, `textured_quad`
 
 See [../uml/33-gpu-resource-pools.mmd](../uml/33-gpu-resource-pools.mmd).
+
+### UI primitives: the atlas and the CPU reference renderer (ADR-010 Phase 1)
+
+`lx.gfx:ui_cpu` rasterises the sorted primitive stream into an XRGB8888/ARGB8888 buffer,
+inside the damage rects only, in row bands of about 128 KiB of target so every primitive
+crossing a band is drawn while the band is in L2 (drawing a 1919×1080 frame rect by rect,
+the destination load was the hottest instruction in `perf`). The partition states the pixel
+rules the GL and Vulkan backends copy; its own output is deterministic (no FMA, no libm
+transcendental) and is pinned by `tests/golden/ui/*.png` (`test_ui_golden`, bit-exact).
+A quad's fully covered interior is written without the SDF, and the clear under an opaque
+square quad covering a band is skipped — both proven bit-identical by the tests.
+
+`lx.gfx:atlas` packs tiles on bucketed shelves into CPU-owned pages; GPU backends upload
+each page's dirty-rect list. When an allocation finds no room, tiles unused for 120 frames
+are freed in place; a page that was above 85 % occupancy is marked and repacked
+synchronously at the next `atlas::begin_frame` — never inside the allocation, since a
+repack moves live tiles and a uv already emitted in the frame being built would then name
+another tile's pixels.
+
+Measured on the F8 host (VMware SVGA3D VM, 2 vCPUs, release preset; load 0.6–0.9;
+`./scripts/ui-bench.sh --backend cpu`, `test_atlas`):
+
+| | Value |
+|--|--|
+| Glyph packing (10–20 px UI glyph boxes) | 89.0 % of a 1024² page live when it first has to grow |
+| Page rebuild, 2 000 live glyphs repacked | 0.62 ms |
+| Page rebuild, 1 024 tiles of 64² on a 2048² page | 1.3 ms |
+| S2 raster (one 784 px clock cell) | p50 13 µs, p95 63–113 µs |
+| S3 raster (10 000 bordered rounded quads, full 1919×1080 repaint) | p50 25.6–27.5 ms, p95 36–69 ms |
+
+The two `cpu` runs differ by more than 5 % at p95, so no `iritur-cpu` baseline is committed
+yet; `none` stays the regression gate.
+
+### UI primitives on GLES 3.1 (`lx.gfx:ui_gl`, ADR-010 Phase 1)
+
+`lx.gfx:ui_gl` draws the same stream into a framebuffer object of any current GLES 3.1
+context. The vertex stage turns each instance into its whole-pixel raster window (`ui_cpu`'s
+pixel-centre rule), so the content mask costs no fragment work and the scissor is left to
+the damage rects; the fragment programs transcribe `ui_cpu`'s functions. Against the CPU
+references every golden case is within 1/255 on SVGA3D (and within 2/255 on llvmpipe), G10
+asking for 3.
+
+Instances go into a 3 × 2 MiB ring — one persistent coherent mapping with
+`GL_EXT_buffer_storage`, mapped ranges otherwise, a fence per slot — and the vertex stage
+reads them as a std430 storage buffer at a per-batch uniform offset. The ring is bound whole,
+once per frame, with the slot in the offset: rebinding per slot with `glBindBufferRange`
+made SVGA3D keep reading the previous slot's offset (stale quads on screen). Per-instance
+attributes (`ui_gl_fetch::attributes`, for contexts without vertex-stage storage blocks)
+measure the same here.
+
+What the host offers and does not: SVGA3D exposes `GL_EXT_disjoint_timer_query` but answers
+every query with 0, so `initialize` calibrates once and falls back to "fence-wall" (flush to
+fence signalled); `GL_OES_get_program_binary` is listed with zero binary formats, so the
+program cache (`$XDG_CACHE_HOME/lumen/gl-program-<hash>.bin`) is inactive and every start
+compiles the five programs, 95–155 ms. llvmpipe has a format: 22.5 ms cold, 11.1 ms from the
+cache (correctness host only; not a performance number).
+
+Measured on the F8 host (`./scripts/ui-bench.sh --backend gl`):
+
+| | S2 (one 784 px clock cell) | S3 (10 000 bordered rounded quads, full 1919×1080) |
+|--|--|--|
+| Draw calls, instance bytes | 1, 3 920 B | 1, 800 080 B |
+| `submit` (CPU, `ui_gl_renderer::draw`) p50 / p95 | 373–385 µs / 2.4–3.5 ms | 0.70–0.83 ms / 1.7–5.9 ms |
+| `gpu` (fence-wall) p50 / p95 | 1.6–1.9 ms / 3.4–5.4 ms | 8.75–9.26 ms / 10.5–13.6 ms |
+| CPU reference (`raster`, above) p50 | 13 µs | 25.6–27.5 ms |
+
+Three runs, load 1.0–1.8 (another worktree was benchmarking); they differ by more than 5 % at
+p95, so no `iritur-gl` baseline is committed. Where the time goes on this host:
+
+- `submit` is mostly the driver: a frame is about six vmwgfx ioctls, and `glFenceSync` (the
+  ring slot's fence) is where Mesa's svga driver flushes its command buffer. For S3 the
+  gather of 800 KB into the coherent mapping is ~0.5 ms against 0.2 ms into host memory (the
+  bench's own `encode`); the mapped-range ring (`--gl-ring mapped`) measured a lower p50
+  (0.51 ms) and a higher p95 (2.4 ms) in one 300-frame pair, not enough to change the default.
+- `gpu`: with trivial shaders S3 still costs 4.3–4.6 ms (2.3 ms without any instance fetch),
+  so a third of the frame is per-instance fixed cost on SVGA3D; the shading itself is the
+  other half. Six-vertex triangles and four-vertex instanced strips measure the same.
+- The UI-thread stages run 40–50 % slower beside the GPU work than with `--backend none` in
+  the same minutes (S3 emit+order+encode p50 1.44–1.55 ms against 1.02 ms): the host's 3D
+  work shares the vCPUs.
+- **G3 is open** (ADR-010 §7 Phase 1, as built): its ≤ 1.0 ms for S3's emit + order +
+  encode is missed on every backend — 1.13 ms p50 / 2.42 ms p95 with `none` (the committed
+  baseline says `"G3": "fail"`), 1.44–1.55 ms p50 here. Emit is two thirds of it; closing
+  it is carried into Phase 2, and `scripts/ui-bench.sh` warns while it stays open.
+- G5 for `gl` rows: no `operator new` in any steady frame; `mallinfo2` moves by 592 B (S3)
+  and 0.9–7 KB (S2) inside Mesa (sync objects, command buffers), which the script counts as
+  a G5 failure — the driver's heap, not the frame path's.
+
+### UI primitives on Vulkan (`lx.gfx:ui_vk`, ADR-010 Phase 1)
+
+`lx.gfx:ui_vk` draws the same stream with the same GLSL: `shaders/ui/*.glsl` is one set of
+files that `ui_gl` embeds as strings and compiles at run time and `ui_vk` compiles to SPIR-V
+at build time (`ui_<kind>.vert/.frag` add the Vulkan prologue — the ring as a std430 buffer
+at a push-constant offset, the globals block, the eight page samplers). Against the CPU
+references every golden case is within 2/255, and within 2/255 of `ui_gl` on SVGA3D (G10:
+3 and 2); `test_ui_golden_vk_validation` runs the Vulkan cases under
+VK_LAYER_KHRONOS_validation and requires an empty error log (a run with synchronization
+validation on, `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`, logged nothing either).
+
+The only Vulkan on the F8 host is lavapipe, a CPU device: these are **lavapipe numbers,
+correctness only**. Pipeline creation for the five pipelines is 42–65 ms cold and the same
+warm: lavapipe keeps nothing in a `VkPipelineCache` (its data is a truncated 20-byte header,
+which `ui_vk` does not write to disk), so the warm start is untested on a caching driver.
+`lumen-ui-bench --backend vulkan` runs every scenario (S3: one draw, 800 080 instance bytes,
+`submit` p50 ≈ 0.17 ms, `gpu` ≈ 60 ms of llvmpipe shading per full 1919×1080 frame); its rows
+are labelled `vulkan-software` and scripts/ui-bench.sh neither compares them nor makes them a
+baseline. No `operator new` in a steady frame; lavapipe's own threads move `mallinfo2` by
+0.2–1.2 KB per run.
+
+### UI primitives in the compositor (ADR-010 §4.11)
+
+`lx.compositor:ui_composite` (`frame_painter`) is what `composite_output` calls per output
+frame:
+
+- **No primitive in the snapshot** (no decorated window on the output): the draw commands
+  become blits in draw order and go to `cpu_compositor::composite_region`,
+  `gl_compositor::composite_into` (the call `composite_region` makes) or
+  `vulkan_compositor::composite` — the path as it was, and no primitive renderer, grid or
+  stream is touched (`test_ui_composite` compares the bytes and counts the renderer's frames).
+- **With primitives**, CPU and GL draw the snapshot's sorted stream with `:ui_cpu` /
+  `:ui_gl` into the same scanout target and damage rects: runs of `surface` refs through the
+  compositor's own blit code (`cpu_compositor::blend`, `gl_compositor::composite_into` with
+  no flush — one submit at the end, fenced by `gl_compositor::fence_frame`), primitive
+  batches through the UI renderer, in stream order. Both renderers are made when the backend
+  starts (`ui_gl` programs from the binary cache, warmed with one quad on SVGA3D).
+- **Without a primitive renderer** — a GLES 2 context (`egl_device` asks for 3.1 and falls
+  back to 2.0), the Vulkan composite, screen capture's re-composites and the headless dump —
+  the stream is lowered (`gfx::lower_to_blits`): a solid square quad on whole pixels becomes
+  a solid blit, anything else is dropped and counted, with one warning per run of frames that
+  drop. Decorations need nothing else, so every backend draws them. On Vulkan the solid blits
+  are decoded and drawn inside the linear F16 pass like any solid draw; `:ui_vk` recording
+  into that pass (with linear instance colours) is the follow-up for primitives that do not
+  lower.
+- **Colour space.** Primitive colours are premultiplied and sRGB-encoded (ADR-010 §4.5);
+  `:ui_cpu` and `:ui_gl` blend them in that space, as a client window does, while the CPU
+  compositor blends *surfaces* in linear light through its tables and the GL one in encoded
+  space. Opaque square chrome never blends, so it is the same colour on all three.
+- **Diagnostics.** `ui_draw_stats` / `ui_gl_draw_stats` carry what the compositor's blit
+  code reported for the surface runs (`surface_draws_skipped`, `_unsupported` on CPU,
+  `_culled`), and `paint_cpu` / `paint_gl` fold them into `composite.draws_skipped` /
+  `draws_unsupported`, so the unregistered-texture and unsupported-format warnings (and
+  `report_unregistered_draw`) fire on decorated frames as on plain ones.
+- **Threads (CPU).** `:ui_cpu`'s row bands run on the render thread, and its surface runs go
+  through `cpu_compositor::blend`, which draws one band: on a frame with primitives the
+  `row_band_pool` workers (`composite_thread_count` > 0) stay idle, while a frame without
+  primitives still uses them. The default is 0 threads and the 2-vCPU F8 host cannot show the
+  loss; running `:ui_cpu`'s disjoint bands on the compositor's pool is the follow-up, to be
+  measured on a host with more cores. Opaque pixels (source alpha 1) are written without
+  reading the target, which matters for a write-combining dumb buffer: a 1-px border quad
+  has no interior span, so every one of its pixels goes through the per-pixel blend.
+- **Visibility.** Only a quad that lowers to a blit (radius 0, borderless, one colour,
+  integral bounds and clip) at alpha 1 occludes the draws under it — it is drawn identically
+  on every path. Primitives are never culled: they draw wherever damage reaches them.
+- **Turned outputs.** The order grid covers the content space emitters draw in; after
+  emission `draw_list::transform_primitives` turns bounds, clips, per-corner radii and
+  per-edge borders (and a gradient's angle) with the draws.
+
+Render-thread cost per frame, `bench_ui_composite` (1920×1080, solid background, six
+overlapping 480×320 windows, each with its frame when decorated; `paint_cpu` / `paint_gl`
+on published snapshots as `composite_output` calls them — the compositor's virtual outputs
+composite only into capture buffers on CPU and cannot run GL, so the bench drives the same
+calls in-process; render node `renderD128`, SVGA3D; median and p95 of 300 frames):
+
+| Backend | Damage | Undecorated p50 / p95 | Decorated p50 / p95 |
+|---------|--------|-----------------------|---------------------|
+| CPU | whole frame | 1.84–2.43 ms / 3.2–6.3 ms | 1.71–1.75 ms / 2.8–3.6 ms (stream) |
+| CPU | one window (480×320) | 27 µs / 38–117 µs | 32 µs / 44–100 µs (stream) |
+| GL, render thread | whole frame | 380–387 µs / 3.2 ms | 748 µs / 5.7–6.1 ms (stream) |
+| GL, render thread | one window | 360–375 µs / 3.0–3.5 ms | 627–633 µs / 3.6–5.2 ms (stream) |
+| GL, until the fence signals | whole frame | 9.3–10.7 ms / 14–15 ms | 10.4–12.1 ms / 15–21 ms |
+| GL, until the fence signals | one window | 2.6–2.9 ms / 4.5–4.6 ms | 3.2–3.4 ms / 6.6–7.6 ms |
+
+Two runs, load average 0.6–0.8 (2 vCPUs, the VM's own display session running beside them;
+p95 on this host is mostly scheduling noise). On the CPU the stream path costs what the blit
+path costs: `:ui_cpu` starts each band at the topmost ref that covers it opaquely (the same
+cull as `cpu_compositor::composite`), and its L2-sized bands repaint a full frame no slower
+than the composite's whole-rect passes; a window update over decorated windows is +5 µs. On
+GL the stream path adds ≈ 0.25–0.37 ms of render-thread time per frame (the ring slot and
+encode, then one `composite_into` setup per run of surfaces between the frames' quads —
+unflushed, one submit at the end; flushing each run, as at first, cost twice that) and
+0.5–1.5 ms to the frame's GPU completion on SVGA3D. A frame with no decorated window on the
+output pays none of it. The lowered path (GLES 2) is the blit path plus one solid blit per
+fill. On the UI thread, `commit_frame` of the decorated scene (30 quads, 7 surfaces: every
+draw takes an order from the overlap grid, the refs are sorted and cut into batches) is
+12 µs p50 for a full repaint and 5 µs for a window update, against 6 µs and under 1 µs
+without decorations (load 0.3).
 
 ---
 

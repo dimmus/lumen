@@ -237,6 +237,28 @@ The ring is sized for 25 000 primitives per frame; overflow drops with one warni
 run, never grows. The existing Vulkan compositor's `upload_rgba` (which waits for every
 frame slot before each upload) is replaced by the staging ring on the same path.
 
+As built in Phase 1, `:ui_vk` differs from the Vulkan column in these details: the batch's
+offset is a push constant (its first word in the ring slot, with its atlas page), not
+`firstInstance` — the kinds have different strides, so a batch's offset is not a multiple
+of its own; the pipelines are five (`path` shares mono's, as in `:ui_gl`) plus the
+compositor's composite pipeline for `surface`, made for the UI pass by
+`vulkan_compositor::record_blits`; the sampler array has 8 entries (`k_atlas_pages` = 6 used,
+the rest a 1×1 dummy), indexed through a switch because the compositor's device does not
+enable `shaderSampledImageArrayDynamicIndexing`; at Vulkan 1.1 the "dynamic rendering-style
+load" is a render pass with loadOp LOAD and a `vkCmdClearAttachments` per damage rect; the
+timestamps bracket the frame, not each kind. The GLSL is one set of files (shaders/ui/*.glsl)
+that `:ui_gl` compiles at run time and `:ui_vk` at build time. `renderer.cppm`'s key table
+stays: the compositor's `frame_renderer` still uses it. The compositor's `upload_rgba` still
+waits on its frame slots — the staging ring belongs to `:ui_vk` and has not been moved under
+the compositor's shm uploads yet. The atlas's dirty lists (and a new page image's "uploaded"
+state) are committed only when the frame is submitted; a frame whose surface draw fails to
+record inside the pass is still submitted, so the copies and acquires recorded before it run.
+`surface` draws record `vulkan_compositor`'s images and descriptor sets into `:ui_vk`'s
+command buffers, which the compositor's fences do not cover: until `vulkan_compositor`
+tracks external users, whoever forgets or replaces such a texture must first wait for
+`:ui_vk`'s frames (`wait_idle`; stated on `record_blits`). The compositor's Vulkan path does
+not use `:ui_vk` yet, so nothing in production depends on this.
+
 ### 4.5 Colour and precision
 
 - Theme colours are stored twice at compile time: sRGB `u8×4` for tools, premultiplied
@@ -281,6 +303,13 @@ and 2 RGBA8 pages; a page above 85 % occupancy with stale tiles is rebuilt from 
 set on the worker thread and swapped at the next frame. Each tile records the last frame
 it was drawn; eviction never touches a tile used in the last 120 frames (the import
 cache's stale threshold).
+
+As built in Phase 1: the rebuild is synchronous on the UI thread, not on the worker, and
+runs at `atlas::begin_frame`. An `allocate` that finds no room frees stale tiles in place
+only — a rebuild moves live tiles, and a uv looked up earlier in the same frame must keep
+naming its pixels — and marks a page above 85 % for the rebuild at the next frame (0.6–1.3 ms
+measured, rendering-performance.md §6). The worker rebuild into a shadow page swapped at
+`begin_frame` is left for when S4 shows the synchronous one on a frame.
 
 Shaping and rasterising happen on the **worker** affinity when a layout invalidation is
 large (a whole document) and inline on the UI thread when it is small (a label), with the
@@ -379,6 +408,20 @@ untouched (`surface` and solid `quad`). `compositor_impl.cpp:8574-8593` stops co
 `draw_command` to `blit_command`: the backends take the stream. The visibility pass keeps
 treating only radius-0, alpha-1 quads as occluders.
 
+As built in Phase 1 (`lx.compositor:ui_composite`, rendering-performance.md §6 "UI primitives
+in the compositor"): `frame_node`'s border and title fills are quads (the same rects and
+colours as the swatch blits, pixel-identical on the CPU compositor); the title and close
+button are still blits, and no shadow or rounding was added (a visual change, after Phase 2).
+A snapshot without primitives keeps the blit conversion and the backends' old calls
+unchanged; with primitives, CPU and GLES 3.1 draw the stream through `:ui_cpu` / `:ui_gl` in
+the compositor's target and damage. The Vulkan composite, GLES 2 contexts and screen
+capture's re-composites take the stream *lowered* to blits (`gfx::lower_to_blits`: solid
+square quads become solid blits, other primitives are dropped, counted and warned about):
+`:ui_vk` does not yet record into `vulkan_compositor`'s linear F16 pass — that, with
+linear instance colours, is the remaining step for primitives that do not lower. Occluders
+are quads that lower (radius 0, borderless, one colour, integral rects) at alpha 1;
+primitives are never culled.
+
 ### 4.12 Threads and allocation
 
 | Work | Affinity | Allocation |
@@ -388,7 +431,12 @@ treating only radius-0, alpha-1 quads as occluders.
 | shaping, glyph raster, SVG raster, page rebuild, theme reload | `worker` | Worker arena; results posted with `executor.post(ui, …)` |
 
 `assert_affinity()` at `draw_scope` construction, `ui_vk::draw` entry and
-`atlas::rasterize` entry. Every per-frame container is fixed-capacity with an
+`atlas::rasterize` entry. As built in Phase 1: the renderers' affinity depends on the
+consumer, so `ui_vk_renderer` and `ui_gl_renderer` assert at `draw` and `wait_gpu_time`
+entry against an owner the consumer binds with `set_owner_affinity` (the compositor binds
+`ui_gl` to `render` after its start-up warm draw; `any`, the default, checks nothing — tests
+and the bench); the atlas asserts `ui` at `allocate`, `write`, `release`, `rebuild` and
+`begin_frame` (there is no `rasterize` before Phase 2). Every per-frame container is fixed-capacity with an
 `overflow_action` (memory-management.md §3): primitive stream, batch list (≤ 1 024), damage
 ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
 
@@ -396,14 +444,18 @@ ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
 
 | New / changed | Layer | Depends on |
 |---------------|-------|-----------|
-| `lx.gfx:primitives`, `:atlas`, `:ui_vk`, `:ui_gl`, `:ui_cpu` | Graphics | `lx.foundation`, `lx.runtime` |
+| `lx.gfx:primitives` (instance structs, packing helpers, `order_grid`), `:atlas`, `:ui_vk`, `:ui_gl`, `:ui_cpu` | Graphics | `lx.foundation`, `lx.runtime` |
 | `lx.text:faces`, `:itemize`, `:shape`, `:lines`, `:raster` | Graphics | `lx.gfx:atlas` (tile handles only) |
 | `lx.layout:flex` | Graphics | `lx.foundation` |
-| `lx.scene` (`draw_list` of primitives, overlap grid) | Compositor | `lx.gfx` |
+| `lx.scene` (`draw_list` of primitives, one overlap grid per list) | Compositor | `lx.gfx` |
 | `lx.ui:style`, `:theme`, `:draw_scope`, `:components`, `:text_node` | Desktop | `lx.scene`, `lx.text`, `lx.layout` |
 | `lx.wayland.client` (real), `lx.app:window`, `:swapchain`, `:input` | Platform / Application | `lx.gfx` (through `lx.scene`), `lx.ui` |
 | `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui` |
 | `tools/lumen-theme` | tool | `lx.ui:theme` format only |
+
+The overlap grid (`order_grid`) is a geometry utility with no scene dependency, so it lives
+in `lx.gfx:primitives` beside the structs whose `order` it assigns; `lx.scene::draw_list`
+owns one instance per list and is what emitters take orders from.
 
 No upward edge is introduced; `cmake/LumenCXXModules.cmake` will reject one at configure
 time if it is.
@@ -556,17 +608,17 @@ one focused developer; it is an ordering aid, not a commitment.
 ### Phase 0 — Foundations and measurement first (≈1 week)
 
 - `lx.gfx:primitives`: the structs of §4.2, `static_assert`ed sizes, packing helpers
-  (`f16`, premultiply once).
-- `lx.scene::draw_list` v3: primitive stream + index array, overlap grid, `(order, kind,
-  page)` sort reusing the `order_` scratch; `surface` kind wraps today's `draw_command`
-  unchanged so the compositor keeps working.
+  (`f16`, premultiply once), and the overlap grid `order_grid` (§4.13).
+- `lx.scene::draw_list` v3: primitive stream + index array, its own overlap grid,
+  `(order, kind, page)` sort reusing the `order_` scratch; `surface` kind wraps today's
+  `draw_command` unchanged so the compositor keeps working.
 - Fix `draw_scope::fill` (set `solid`), `LX_TRACE_SCOPE` (`__COUNTER__`), call
   `budget_tracker::end_tick_render`; add spans `ui.describe`, `ui.layout`, `ui.emit`,
   `ui.encode`, `ui.submit` and counters `ui.primitives`, `ui.batches`, `ui.instance_bytes`,
   `ui.damage_px`, `ui.atlas_upload_bytes`.
 - `tests/bench_ui.cpp` → `lumen-ui-bench` with the JSON schema of §8.5, scenarios S1–S3
   running against the CPU reference renderer; `scripts/ui-bench.sh`; CTest label `bench`
-  and `ctest -LE bench` as the default; `tests/bench/baseline/<host>.json` committed.
+  excluded by the default test presets, `ctest --preset bench` runs it; `tests/bench/baseline/<host>.json` committed.
 - Gate: G9 by `static_assert`; the bench prints and stores numbers.
 
 ### Phase 1 — The primitive renderer (≈3 weeks)
@@ -580,6 +632,16 @@ one focused developer; it is an ordering aid, not a commitment.
 - The three compositors accept the stream: `quad` and `shadow` reach the screen through
   `frame_node` for server-side decorations (title text stays CPU-rasterised until Phase 2).
 - Gate: G3 and G10 on GL and CPU here; Vulkan parity on lavapipe.
+
+As built: G10 is met on CPU, GL and Vulkan (lavapipe), and G3's ≤ 8 draws and ≤ 800 KB
+hold (one draw, 800 080 B). **G3's CPU time is open**: S3's emit + order + encode is
+1.13 ms p50 / 2.42 ms p95 with `--backend none` (the committed baseline,
+tests/bench/baseline/iritur-none.json, records `"G3": "fail"`) and 1.44–1.55 ms p50 beside
+the GL backend, against ≤ 1.0 ms. Emit is two thirds of it (0.83 ms p50). Phase 1 closed
+with the gate open; closing it — the per-quad cost of the emit path, `draw_scope` →
+`draw_list::push_quad`, since every S3 quad moves every frame and caching does not apply —
+is carried into Phase 2, whose gate does not count as green until G3 is.
+`scripts/ui-bench.sh` warns on every run while the gate fails in the baseline too.
 
 ### Phase 2 — Text (≈3 weeks)
 
@@ -714,8 +776,9 @@ asserts the `text.contrast` correction keeps the mean stem coverage within 3 %.
   `tests/bench/baseline/<host>-<driver>.json`: **fail** on p95 regressions above 10 % for
   any stage, on any steady-frame allocation, on a draw-call count above the scenario's
   cap, or on a golden diff; **warn** at 5 %. Updating a baseline is a deliberate commit.
-- CTest: label `bench`; the default `ctest` run excludes it; `ctest -L bench` runs the
-  headless rows in under two minutes.
+- CTest: label `bench`; the default test presets exclude it; `ctest --preset bench` runs
+  the headless rows in under two minutes (a `-L bench` on top of another preset still
+  meets that preset's exclude).
 - End-to-end (`--e2e`) reuses `scripts/inject-input.py` and the `--join-seat-session`
   machinery of `drag-smoke.sh`; both processes write Chrome traces on the same
   `CLOCK_MONOTONIC`, merged into one Perfetto view per run.

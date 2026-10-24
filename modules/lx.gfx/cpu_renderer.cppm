@@ -128,6 +128,22 @@ public:
                                                                    unsigned count,
                                                                    const damage_region& damage);
 
+    /// Draws `cmds` (back to front) over what `dst` already holds, inside `clip` (clipped to
+    /// the surface; empty means the whole surface): `composite`'s per-draw path with no
+    /// clear and no occlusion cull. For a caller that interleaves surface draws with its own
+    /// pixels — the UI renderer's `surface` refs (`ui_cpu_renderer`).
+    [[nodiscard]] lx::result<cpu_composite_stats> blend(const pixel_surface& dst,
+                                                        const blit_command* cmds, unsigned count,
+                                                        lx::rect2i clip);
+
+    /// `cmd` repaints every pixel of `area` with full alpha in a `dst_format` target — the
+    /// test `composite`'s occlusion cull applies from the top down: drawn (not occluded, not
+    /// invisible), a solid colour or a registered texture with a conversion, at full opacity
+    /// and alpha (opaque blending or a format without alpha), its clipped destination
+    /// containing `area`. What lies under such a draw is never seen.
+    [[nodiscard]] bool covers_opaquely(const blit_command& cmd, lx::fourcc dst_format,
+                                       lx::rect2i area) const;
+
 private:
     struct texture_slot {
         unsigned id = 0;
@@ -774,30 +790,7 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
     unsigned first_cmd = 0;
     bool needs_clear = true;
     for (unsigned i = count; i-- > 0 && cmds;) {
-        const auto& cmd = cmds[i];
-        if (cmd.occluded || draw_invisible(cmd))
-            continue;
-        if (cmd.solid) {
-            if (cmd.opacity >= 1.f && cmd.tint.a >= 1.f && cmd.solid_color.a >= 1.f &&
-                covers(clipped_dst(cmd.dst, cmd.clip), clip)) {
-                first_cmd = i;
-                needs_clear = false;
-                break;
-            }
-            continue;
-        }
-        const int index = find(cmd.texture_id);
-        if (index < 0)
-            continue;
-        const pixel_surface& src = textures_[static_cast<unsigned>(index)].surface;
-        if (!src.valid() || pick_convert(src.format, dst.format) == convert_op::unsupported)
-            continue;
-        // A tint that darkens or fades still covers, but only if it is fully opaque and
-        // the draw is actually drawn — otherwise what is underneath shows through.
-        const bool opaque = cmd.opacity >= 1.f && cmd.tint.a >= 1.f &&
-                            (cmd.blend == lx::blend_mode::opaque || !has_alpha_channel(src.format));
-        // The clip, not just dst, bounds what this draw actually covers.
-        if (opaque && covers(clipped_dst(cmd.dst, cmd.clip), clip)) {
+        if (covers_opaquely(cmds[i], dst.format, clip)) {
             first_cmd = i;
             needs_clear = false;
             break;
@@ -893,4 +886,69 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite_regi
         total.cleared = total.cleared || s.cleared;
     }
     return total;
+}
+
+bool lx::gfx::cpu_compositor::covers_opaquely(const blit_command& cmd, lx::fourcc dst_format,
+                                              lx::rect2i area) const {
+    using namespace lx::gfx::detail;
+    if (cmd.occluded || draw_invisible(cmd))
+        return false;
+    if (cmd.solid)
+        return cmd.opacity >= 1.f && cmd.tint.a >= 1.f && cmd.solid_color.a >= 1.f &&
+               covers(clipped_dst(cmd.dst, cmd.clip), area);
+    const int index = find(cmd.texture_id);
+    if (index < 0)
+        return false;
+    const pixel_surface& src = textures_[static_cast<unsigned>(index)].surface;
+    if (!src.valid() || pick_convert(src.format, dst_format) == convert_op::unsupported)
+        return false;
+    // A tint that darkens or fades still covers, but only if it is fully opaque and the draw
+    // is actually drawn — otherwise what is underneath shows through.
+    const bool opaque = cmd.opacity >= 1.f && cmd.tint.a >= 1.f &&
+                        (cmd.blend == lx::blend_mode::opaque || !has_alpha_channel(src.format));
+    // The clip, not just dst, bounds what this draw actually covers.
+    return opaque && covers(clipped_dst(cmd.dst, cmd.clip), area);
+}
+
+lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::blend(const pixel_surface& dst,
+                                                                      const blit_command* cmds,
+                                                                      unsigned count,
+                                                                      lx::rect2i clip) {
+    using namespace lx::gfx::detail;
+    if (!dst.valid())
+        return lx::invalid_argument("cpu_compositor::blend: invalid destination");
+    if (!is_bgra_order(dst.format) && !is_rgba_order(dst.format))
+        return lx::invalid_argument("cpu_compositor::blend: unsupported destination format");
+    const lx::rect2i full{0, 0, static_cast<int>(dst.width), static_cast<int>(dst.height)};
+    const lx::rect2i area = (clip.width > 0 && clip.height > 0) ? intersect(clip, full) : full;
+    cpu_composite_stats stats{};
+    if (area.width <= 0 || area.height <= 0 || !cmds || count == 0)
+        return stats;
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& cmd = cmds[i];
+        if (cmd.occluded || draw_invisible(cmd)) {
+            ++stats.draws_culled;
+        } else if (cmd.solid) {
+            ++stats.draws_submitted;
+        } else if (const int index = find(cmd.texture_id); index < 0) {
+            ++stats.draws_skipped;
+        } else if (pick_convert(textures_[static_cast<unsigned>(index)].surface.format,
+                                dst.format) == convert_op::unsupported) {
+            ++stats.draws_unsupported;
+        } else {
+            ++stats.draws_submitted;
+        }
+    }
+    band_job job{};
+    job.self = this;
+    job.dst = &dst;
+    job.cmds = cmds;
+    job.first_cmd = 0;
+    job.count = count;
+    job.clip = area;
+    job.do_clear = false;
+    // One band: the UI renderer calls this per surface ref and per damage rect.
+    run_band(&job, 0, 1);
+    stats.bytes_written = job.bytes.load(std::memory_order_relaxed);
+    return stats;
 }

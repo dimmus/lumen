@@ -95,7 +95,31 @@ lumen_compile_shaders(lx.gfx
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.vert"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.frag"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.vert"
-    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.frag")
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.frag"
+    # ADR-010 UI primitives (lx.gfx:ui_vk); their code is shaders/ui/*.glsl, shared with ui_gl.
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_quad.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_quad.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_shadow.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_shadow.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_mono.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_mono.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_poly.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_poly.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_underline.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_underline.frag")
+# The same UI GLSL as strings for lx.gfx:ui_gl, which compiles it at run time (GLES 3.1).
+lumen_embed_glsl(lx.gfx ui
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/math.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/vertex.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/fragment.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/quad.vs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/quad.fs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/shadow.vs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/shadow.fs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/sprite.vs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/sprite.fs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.vs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.fs.glsl")
 lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.foundation)
 lumen_link_platform_parts(lx.text text)
 lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.runtime)
@@ -527,6 +551,44 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_snapshot PRIVATE tests)
     add_test(NAME test_snapshot COMMAND test_snapshot)
 
+    add_executable(test_primitives tests/test_primitives.cpp)
+    target_link_libraries(test_primitives PRIVATE lx.ui lx.scene lx.gfx lx.runtime)
+    lumen_apply_module_properties(test_primitives)
+    lumen_link_platform(test_primitives)
+    target_include_directories(test_primitives PRIVATE tests)
+    add_test(NAME test_primitives COMMAND test_primitives)
+
+    add_executable(test_atlas tests/test_atlas.cpp)
+    target_link_libraries(test_atlas PRIVATE lx.gfx lx.runtime)
+    lumen_apply_module_properties(test_atlas)
+    lumen_link_platform(test_atlas)
+    target_include_directories(test_atlas PRIVATE tests)
+    add_test(NAME test_atlas COMMAND test_atlas)
+
+    # The UI primitive golden images (ADR-010 §8.4): references in tests/golden/ui/*.png,
+    # read and written through libpng. LUMEN_UI_GOLDEN_UPDATE=1 rewrites them.
+    if(LIBPNG_FOUND)
+        add_executable(test_ui_golden tests/test_ui_golden.cpp)
+        target_link_libraries(test_ui_golden PRIVATE lx.ui lx.scene lx.gfx lx.runtime
+            ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_ui_golden)
+        lumen_link_platform(test_ui_golden)
+        target_include_directories(test_ui_golden PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_ui_golden PRIVATE
+            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui")
+        add_test(NAME test_ui_golden COMMAND test_ui_golden)
+        # The Vulkan cases again under VK_LAYER_KHRONOS_validation, which must log no error.
+        find_file(LUMEN_VK_VALIDATION_LAYER VkLayer_khronos_validation.json
+            PATHS /usr/share/vulkan/explicit_layer.d /usr/local/share/vulkan/explicit_layer.d
+                  /etc/vulkan/explicit_layer.d
+            NO_DEFAULT_PATH)
+        if(LUMEN_VK_VALIDATION_LAYER)
+            add_test(NAME test_ui_golden_vk_validation COMMAND test_ui_golden --filter=vk_)
+        endif()
+    else()
+        message(STATUS "libpng not found — test_ui_golden (UI golden images) not built")
+    endif()
+
     add_executable(test_scene_outputs tests/test_scene_outputs.cpp)
     target_link_libraries(test_scene_outputs PRIVATE lx.scene lx.runtime)
     lumen_apply_module_properties(test_scene_outputs)
@@ -740,6 +802,14 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_decoration_geometry PRIVATE tests)
     add_test(NAME test_decoration_geometry COMMAND test_decoration_geometry)
 
+    # ADR-010 §4.11: the compositor's backends draw the UI primitive stream (CPU, GL).
+    add_executable(test_ui_composite tests/test_ui_composite.cpp)
+    target_link_libraries(test_ui_composite PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_ui_composite)
+    lumen_link_platform(test_ui_composite)
+    target_include_directories(test_ui_composite PRIVATE tests)
+    add_test(NAME test_ui_composite COMMAND test_ui_composite)
+
     add_executable(test_layer_arrange tests/test_layer_arrange.cpp)
     target_link_libraries(test_layer_arrange PRIVATE lx.compositor)
     lumen_apply_module_properties(test_layer_arrange)
@@ -822,12 +892,35 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(bench_frame PRIVATE tests)
     # Timing benchmark — always passes; prints avg ms for CI logs.
     add_test(NAME bench_frame COMMAND bench_frame)
+    set_tests_properties(bench_frame PROPERTIES LABELS bench)
 
     add_executable(bench_composite tests/bench_composite.cpp)
     target_link_libraries(bench_composite PRIVATE lx.gfx)
     lumen_apply_module_properties(bench_composite)
     target_include_directories(bench_composite PRIVATE tests)
     add_test(NAME bench_composite COMMAND bench_composite)
+    set_tests_properties(bench_composite PROPERTIES LABELS bench)
+
+    # ADR-010 §4.11: render-thread cost of a frame with and without decorations (CPU, GL).
+    add_executable(bench_ui_composite tests/bench_ui_composite.cpp)
+    target_link_libraries(bench_ui_composite PRIVATE lx.compositor)
+    lumen_apply_module_properties(bench_ui_composite)
+    lumen_link_platform(bench_ui_composite)
+    target_include_directories(bench_ui_composite PRIVATE tests)
+    add_test(NAME bench_ui_composite COMMAND bench_ui_composite --frames 60 --warmup 10)
+    set_tests_properties(bench_ui_composite PROPERTIES LABELS bench)
+
+    # ADR-010 §8: the UI engine's scenarios S1–S3 through lx.ui, a table and the JSON of
+    # §8.5. scripts/ui-bench.sh drives it and keeps the baseline; here it only has to run.
+    # Benches carry the `bench` label: the test presets exclude it, `ctest --preset bench` runs
+    # them (a plain `-L bench` on top of another preset still meets its exclude).
+    add_executable(lumen-ui-bench tests/bench_ui.cpp)
+    target_link_libraries(lumen-ui-bench PRIVATE lx.ui lx.scene lx.gfx lx.runtime lx.trace)
+    lumen_apply_module_properties(lumen-ui-bench)
+    lumen_link_platform(lumen-ui-bench)
+    target_include_directories(lumen-ui-bench PRIVATE tests)
+    add_test(NAME bench_ui COMMAND lumen-ui-bench --scenario all --frames 120 --warmup 30)
+    set_tests_properties(bench_ui PROPERTIES LABELS bench TIMEOUT 300)
 
     add_executable(test_headless_golden tests/test_headless_golden.cpp)
     target_link_libraries(test_headless_golden PRIVATE lx.gfx)
@@ -1084,7 +1177,16 @@ if(LUMEN_BUILD_TESTS)
     endif()
     set_tests_properties(test_health test_session_discovery
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
-    set_tests_properties(test_result test_snapshot test_scene_outputs test_damage_region test_wm_geometry
+    if(TARGET test_ui_golden)
+        # It brings up a Vulkan device (ui_vk): the ICD's threads and dlclose need the same
+        # sanitizer settings as the other Vulkan tests.
+        set_tests_properties(test_ui_golden PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+        if(TEST test_ui_golden_vk_validation)
+            set_tests_properties(test_ui_golden_vk_validation PROPERTIES ENVIRONMENT
+                "${LUMEN_SANITIZER_ENV_VULKAN_ICD};LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
+        endif()
+    endif()
+    set_tests_properties(test_result test_snapshot test_primitives test_atlas test_scene_outputs test_damage_region test_wm_geometry
         test_surface_tree test_positioner test_layer_arrange test_xcursor
         test_data_transfer test_input_serials test_session_pause test_keybindings test_workspaces
         test_viewport_geometry test_presentation_feedback
@@ -1101,7 +1203,7 @@ if(LUMEN_BUILD_TESTS)
         test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
         test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
         test_cvt test_output_management test_output_config_store
-        test_ui_reconcile test_gl_composite bench_composite
+        test_ui_reconcile test_gl_composite bench_composite bench_ui
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout

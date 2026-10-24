@@ -79,6 +79,14 @@ public:
     /// sync_file the atomic commit waits on, instead of the render thread blocking on it.
     [[nodiscard]] bool supports_native_fence() const { return has_native_fence_; }
 
+    /// The context's GLES version (`GL_VERSION`), 0.0 until `make_current`. `create` asks
+    /// for 3.1 and falls back to 2.0; `at_least(3, 1)` is what `:ui_gl` needs.
+    [[nodiscard]] int gles_major() const { return gles_major_; }
+    [[nodiscard]] int gles_minor() const { return gles_minor_; }
+    [[nodiscard]] bool gles_at_least(int major, int minor) const {
+        return gles_major_ > major || (gles_major_ == major && gles_minor_ >= minor);
+    }
+
     [[nodiscard]] void* egl_display() const { return display_; }
     [[nodiscard]] void* gbm_device_handle() const { return gbm_; }
 
@@ -89,6 +97,8 @@ private:
     void* display_ = nullptr;
     void* context_ = nullptr;
     char renderer_[128]{};
+    int gles_major_ = 0;
+    int gles_minor_ = 0;
     bool software_ = false;
     bool has_dmabuf_import_ = false;
     bool has_native_fence_ = false;
@@ -234,14 +244,23 @@ public:
     /// in a scanout target): a screen-capture target over a client's dma-buf, an offscreen
     /// buffer. `clear_first` false draws over what is there (a pointer painted onto a copy);
     /// `fence` false only flushes — the caller fences the whole capture once (and never
-    /// blocks: no glFinish either way).
+    /// blocks: no glFinish either way). `flush` false (with `fence` false) does not even
+    /// flush: a caller drawing more into the same frame (the UI renderer's surface runs)
+    /// submits it once at its end.
     [[nodiscard]] lx::result<gl_composite_stats> composite_into(unsigned framebuffer,
                                                                 unsigned width, unsigned height,
                                                                 lx::color clear,
                                                                 const blit_command* cmds,
                                                                 unsigned count,
                                                                 const damage_region& damage,
-                                                                bool clear_first, bool fence);
+                                                                bool clear_first, bool fence,
+                                                                bool flush = true);
+
+    /// Closes a frame other code drew into a scanout target on this context (the UI
+    /// primitive renderer, `:ui_gl`, drawing a frame's stream): exports its completion as a
+    /// sync_file — the `out_fence_fd` `composite` returns, owned by the caller — or, with no
+    /// native fence support, blocks until it is done and returns -1.
+    [[nodiscard]] lx::result<int> fence_frame();
 
     /// Copies `region` (full: everything) of `src` into the same place of `dst`, a target of
     /// the same size: a scanout slot brought up to date from the one on screen while the
@@ -296,7 +315,8 @@ private:
                                                                  const lx::rect2i* rects,
                                                                  unsigned rect_count,
                                                                  bool clear_first = true,
-                                                                 bool fence = true);
+                                                                 bool fence = true,
+                                                                 bool flush = true);
 
     /// One composite program and its uniform locations (-1: optimised out).
     struct composite_program {
@@ -335,6 +355,10 @@ private:
 namespace lx::gfx::detail {
 
 #if defined(LUMEN_HAS_EGL)
+
+/// Ends a frame's GL work: a native fence's sync_file when the device exports one (the
+/// caller owns it), else `glFinish` and -1.
+[[nodiscard]] int gl_frame_fence(egl_device* device);
 
 /// GLES 2 is the floor every driver supports, and a compositor's shader needs nothing
 /// beyond it: place a quad from a rect, sample one texture, scale by opacity.
@@ -510,6 +534,8 @@ lx::gfx::egl_device& lx::gfx::egl_device::operator=(egl_device&& other) noexcept
     has_native_fence_ = other.has_native_fence_;
     owns_gbm_ = other.owns_gbm_;
     std::memcpy(renderer_, other.renderer_, sizeof(renderer_));
+    gles_major_ = other.gles_major_;
+    gles_minor_ = other.gles_minor_;
     other.gbm_ = nullptr;
     other.display_ = nullptr;
     other.context_ = nullptr;
@@ -535,6 +561,8 @@ void lx::gfx::egl_device::destroy() {
     context_ = nullptr;
     owns_gbm_ = false;
     renderer_[0] = '\0';
+    gles_major_ = 0;
+    gles_minor_ = 0;
 }
 
 lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
@@ -584,26 +612,35 @@ lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
     if (!eglBindAPI(EGL_OPENGL_ES_API))
         return lx::make_error(lx::gl_err::no_context, "eglBindAPI(OpenGL ES) failed");
 
-    EGLConfig config = EGL_NO_CONFIG_KHR;
-    if (!no_config) {
-        static const EGLint config_attrs[] = {EGL_SURFACE_TYPE,
-                                              EGL_WINDOW_BIT,
-                                              EGL_RENDERABLE_TYPE,
-                                              EGL_OPENGL_ES2_BIT,
-                                              EGL_RED_SIZE,
-                                              8,
-                                              EGL_GREEN_SIZE,
-                                              8,
-                                              EGL_BLUE_SIZE,
-                                              8,
-                                              EGL_NONE};
+    // GLES 3.1 when the driver has it — what the UI primitive renderer (`:ui_gl`) needs —
+    // else the GLES 2 context the compositor's blit path has always run on (its shaders are
+    // `#version 100`, valid in both). A config without ES3 in its renderable types cannot
+    // hold a 3.x context, so the ES3 config is asked for first.
+    const auto choose = [&](EGLint renderable, EGLConfig& out) {
+        const EGLint config_attrs[] = {EGL_SURFACE_TYPE, EGL_WINDOW_BIT, EGL_RENDERABLE_TYPE,
+                                       renderable,       EGL_RED_SIZE,   8,
+                                       EGL_GREEN_SIZE,   8,              EGL_BLUE_SIZE,
+                                       8,                EGL_NONE};
         EGLint config_count = 0;
-        if (!eglChooseConfig(dpy, config_attrs, &config, 1, &config_count) || config_count == 0)
-            return lx::make_error(lx::gl_err::no_context, "eglChooseConfig found no usable config");
+        return eglChooseConfig(dpy, config_attrs, &out, 1, &config_count) && config_count > 0;
+    };
+    static constexpr EGLint k_es3_bit = 0x0040; // EGL_OPENGL_ES3_BIT(_KHR)
+    EGLContext ctx = EGL_NO_CONTEXT;
+    {
+        EGLConfig config = EGL_NO_CONFIG_KHR;
+        if (no_config || choose(k_es3_bit, config)) {
+            static const EGLint es31_attrs[] = {EGL_CONTEXT_MAJOR_VERSION, 3,
+                                                EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE};
+            ctx = eglCreateContext(dpy, config, EGL_NO_CONTEXT, es31_attrs);
+        }
     }
-
-    static const EGLint context_attrs[] = {EGL_CONTEXT_MAJOR_VERSION, 2, EGL_NONE};
-    EGLContext ctx = eglCreateContext(dpy, config, EGL_NO_CONTEXT, context_attrs);
+    if (ctx == EGL_NO_CONTEXT) {
+        EGLConfig config = EGL_NO_CONFIG_KHR;
+        if (!no_config && !choose(EGL_OPENGL_ES2_BIT, config))
+            return lx::make_error(lx::gl_err::no_context, "eglChooseConfig found no usable config");
+        static const EGLint es2_attrs[] = {EGL_CONTEXT_MAJOR_VERSION, 2, EGL_NONE};
+        ctx = eglCreateContext(dpy, config, EGL_NO_CONTEXT, es2_attrs);
+    }
     if (ctx == EGL_NO_CONTEXT)
         return lx::make_error(lx::gl_err::no_context, "eglCreateContext failed");
     device.context_ = ctx;
@@ -633,6 +670,15 @@ lx::result<void> lx::gfx::egl_device::make_current() {
             renderer_[sizeof(renderer_) - 1] = '\0';
         }
         software_ = detail::renderer_is_software(renderer_);
+        // "OpenGL ES 3.2 Mesa …": what the context really is (a driver may give more than
+        // was asked for, never less than a successful request).
+        if (const auto* version = reinterpret_cast<const char*>(glGetString(GL_VERSION))) {
+            int maj = 0, min = 0;
+            if (std::sscanf(version, "OpenGL ES %d.%d", &maj, &min) == 2) {
+                gles_major_ = maj;
+                gles_minor_ = min;
+            }
+        }
     }
     return {};
 #else
@@ -1303,23 +1349,23 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_region
 lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_into(
     unsigned framebuffer, unsigned width, unsigned height, lx::color clear,
     const blit_command* cmds, unsigned count, const damage_region& damage, bool clear_first,
-    bool fence) {
+    bool fence, bool flush) {
     if (framebuffer == 0 || width == 0 || height == 0) {
         return lx::invalid_argument("gl composite into an invalid framebuffer");
     }
     if (damage.full)
         return composite_rects(framebuffer, width, height, clear, cmds, count, nullptr, 0,
-                               clear_first, fence);
+                               clear_first, fence, flush);
     if (damage.count == 0)
         return gl_composite_stats{};
     return composite_rects(framebuffer, width, height, clear, cmds, count, damage.rects,
-                           damage.count, clear_first, fence);
+                           damage.count, clear_first, fence, flush);
 }
 
 lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     unsigned framebuffer, unsigned width_px, unsigned height_px, lx::color clear,
     const blit_command* cmds, unsigned count, const lx::rect2i* rects, unsigned rect_count,
-    bool clear_first, bool fence) {
+    bool clear_first, bool fence, bool flush) {
 #if defined(LUMEN_HAS_EGL)
     if (!ready())
         return lx::not_implemented("lx::gfx::gl_compositor::composite");
@@ -1577,45 +1623,16 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
     if (!fence) {
-        // Part of a larger piece of work (a screen capture) that fences itself once.
-        glFlush();
+        // Part of a larger piece of work (a screen capture, a UI stream) that fences itself
+        // once.
+        if (flush)
+            glFlush();
         if (const GLenum err = glGetError(); err != GL_NO_ERROR)
             return lx::make_error(lx::gl_err::draw_failed, "GL error during composite");
         return stats;
     }
 
-    // The KMS flip that follows reads this buffer from outside GL, and nothing synchronises
-    // the two. Rather than block the render thread until the GPU is done, export the
-    // frame's completion as a sync_file and let the atomic commit wait on it — the display
-    // controller holds the flip back instead of the compositor holding the frame back.
-    if (device_ && device_->supports_native_fence()) {
-        auto dpy = static_cast<EGLDisplay>(device_->egl_display());
-        auto create_sync =
-            reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(eglGetProcAddress("eglCreateSyncKHR"));
-        auto destroy_sync =
-            reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(eglGetProcAddress("eglDestroySyncKHR"));
-        auto dup_fence = reinterpret_cast<PFNEGLDUPNATIVEFENCEFDANDROIDPROC>(
-            eglGetProcAddress("eglDupNativeFenceFDANDROID"));
-
-        if (create_sync && destroy_sync && dup_fence) {
-            EGLSyncKHR sync = create_sync(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
-            if (sync != EGL_NO_SYNC_KHR) {
-                // The fence is only real once the commands behind it have been submitted;
-                // the extension requires a flush between creating it and dup'ing the FD.
-                glFlush();
-                const EGLint fd = dup_fence(dpy, sync);
-                destroy_sync(dpy, sync);
-                if (fd != EGL_NO_NATIVE_FENCE_FD_ANDROID)
-                    stats.out_fence_fd = fd;
-            }
-        }
-    }
-
-    // No usable fence — fall back to blocking rather than committing a buffer the GPU may
-    // still be drawing into, which would show a partly-drawn frame.
-    if (stats.out_fence_fd < 0)
-        glFinish();
-
+    stats.out_fence_fd = detail::gl_frame_fence(device_);
     if (const GLenum err = glGetError(); err != GL_NO_ERROR) {
         if (stats.out_fence_fd >= 0) {
             ::close(stats.out_fence_fd);
@@ -1636,9 +1653,64 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     (void)rect_count;
     (void)clear_first;
     (void)fence;
+    (void)flush;
     return lx::not_implemented("lx::gfx::gl_compositor::composite");
 #endif
 }
+
+lx::result<int> lx::gfx::gl_compositor::fence_frame() {
+#if defined(LUMEN_HAS_EGL)
+    if (!ready())
+        return lx::not_implemented("lx::gfx::gl_compositor::fence_frame");
+    const int fd = detail::gl_frame_fence(device_);
+    if (glGetError() != GL_NO_ERROR) {
+        if (fd >= 0)
+            ::close(fd);
+        return lx::make_error(lx::gl_err::draw_failed, "GL error before the frame fence");
+    }
+    return fd;
+#else
+    return lx::not_implemented("lx::gfx::gl_compositor::fence_frame");
+#endif
+}
+
+#if defined(LUMEN_HAS_EGL)
+int lx::gfx::detail::gl_frame_fence(egl_device* device) {
+    int out_fence_fd = -1;
+    // The KMS flip that follows reads this buffer from outside GL, and nothing synchronises
+    // the two. Rather than block the render thread until the GPU is done, export the
+    // frame's completion as a sync_file and let the atomic commit wait on it — the display
+    // controller holds the flip back instead of the compositor holding the frame back.
+    if (device && device->supports_native_fence()) {
+        auto dpy = static_cast<EGLDisplay>(device->egl_display());
+        auto create_sync =
+            reinterpret_cast<PFNEGLCREATESYNCKHRPROC>(eglGetProcAddress("eglCreateSyncKHR"));
+        auto destroy_sync =
+            reinterpret_cast<PFNEGLDESTROYSYNCKHRPROC>(eglGetProcAddress("eglDestroySyncKHR"));
+        auto dup_fence = reinterpret_cast<PFNEGLDUPNATIVEFENCEFDANDROIDPROC>(
+            eglGetProcAddress("eglDupNativeFenceFDANDROID"));
+
+        if (create_sync && destroy_sync && dup_fence) {
+            EGLSyncKHR sync = create_sync(dpy, EGL_SYNC_NATIVE_FENCE_ANDROID, nullptr);
+            if (sync != EGL_NO_SYNC_KHR) {
+                // The fence is only real once the commands behind it have been submitted;
+                // the extension requires a flush between creating it and dup'ing the FD.
+                glFlush();
+                const EGLint fd = dup_fence(dpy, sync);
+                destroy_sync(dpy, sync);
+                if (fd != EGL_NO_NATIVE_FENCE_FD_ANDROID)
+                    out_fence_fd = fd;
+            }
+        }
+    }
+
+    // No usable fence — fall back to blocking rather than committing a buffer the GPU may
+    // still be drawing into, which would show a partly-drawn frame.
+    if (out_fence_fd < 0)
+        glFinish();
+    return out_fence_fd;
+}
+#endif
 
 lx::result<void> lx::gfx::gl_compositor::copy_region(const gl_scanout_target& src,
                                                      gl_scanout_target& dst,

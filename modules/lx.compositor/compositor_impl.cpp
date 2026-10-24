@@ -487,16 +487,21 @@ struct compositor_impl {
     gfx::headless_backend headless_{};
     gfx::frame_renderer frame_renderer_{};
     gfx::pipeline_cache pipeline_cache_{};
-    /// Render affinity. Scene draw commands translated for the present backend, reused
-    /// every frame. A member and not a local: sized by the cap rather than by occupancy it
-    /// was a six-figure stack allocation touched once per frame, which evicts the working
-    /// set for no benefit.
-    gfx::blit_command* blits_ = nullptr;
-    unsigned blit_capacity_ = 0;
+    /// Render affinity. A snapshot's draw commands translated for the present backend, and
+    /// its UI primitive stream drawn or lowered (ADR-010 §4.11), with storage reused every
+    /// frame. A member and not a local: sized by the cap rather than by occupancy it was a
+    /// six-figure stack allocation touched once per frame, which evicts the working set for
+    /// no benefit.
+    frame_painter painter_{};
     gfx::vulkan_compositor vk_compositor_{};
     gfx::cpu_compositor cpu_compositor_{};
+    /// The CPU path's primitive renderer, made with the backend (`setup_cpu_present`).
+    std::unique_ptr<gfx::ui_cpu_renderer> ui_cpu_{};
     gfx::egl_device egl_{};
     gfx::gl_compositor gl_compositor_{};
+    /// The GL path's primitive renderer, made with the backend when the context is GLES 3.1
+    /// (`setup_gl_present`); null on GLES 2, where primitives are lowered to blits.
+    std::unique_ptr<gfx::ui_gl_renderer> ui_gl_{};
     /// Render affinity (created at start, before the render thread; at runtime by output
     /// ops). One per output slot with a pipeline; null for a free slot. UI reaches a
     /// pipeline only through `outs_[slot].pipe`.
@@ -1187,7 +1192,6 @@ struct compositor_impl {
         // libinput closes its devices through the provider, which hands them back to
         // logind: that has to happen while the session object is still alive.
         input_devices_ = lx::input::input_manager{};
-        delete[] blits_;
         // A deferred dma-buf update still owns the fd the UI thread duplicated for it.
         for (unsigned i = 0; i < deferred_count_; ++i) {
             texture_update& u = deferred_updates_[(deferred_head_ + i) % k_deferred_updates];
@@ -1204,18 +1208,6 @@ struct compositor_impl {
 
     compositor_impl(const compositor_impl&) = delete;
     compositor_impl& operator=(const compositor_impl&) = delete;
-
-    /// Render affinity. Grows to fit and never shrinks; returns null if `need` is 0.
-    [[nodiscard]] gfx::blit_command* blit_storage(unsigned need) {
-        if (need == 0)
-            return nullptr;
-        if (need > blit_capacity_) {
-            delete[] blits_;
-            blits_ = new gfx::blit_command[need];
-            blit_capacity_ = need;
-        }
-        return blits_;
-    }
 
     static void on_memory_pressure(lx::runtime::memory_pressure level, void* self);
     void handle_memory_pressure(lx::runtime::memory_pressure level);
@@ -2706,27 +2698,10 @@ void compositor_impl::run_capture_render() {
             // needs them to leave the software pointer out.
             snap = &scene.acquire_render_snapshot(p.slot);
             drain_texture_updates(snap->frame_index());
-            const auto& draws = snap->draws();
-            gfx::blit_command* blits = blit_storage(draws.size());
-            for (unsigned i = 0; i < draws.size(); ++i) {
-                const auto& cmd = draws.data()[i];
-                blits[i] = {};
-                blits[i].texture_id = cmd.texture.id();
-                blits[i].dst = cmd.dst;
-                blits[i].src = cmd.src;
-                blits[i].clip = cmd.clip;
-                blits[i].tint = cmd.tint;
-                blits[i].opacity = cmd.opacity;
-                blits[i].blend = cmd.blend;
-                blits[i].buffer_xform = cmd.buffer_xform;
-                blits[i].src_space = cmd.src_space;
-                blits[i].scaled = cmd.scaled;
-                blits[i].occluded = cmd.occluded;
-                blits[i].solid = cmd.solid;
-                blits[i].solid_color = cmd.solid_color;
-            }
-            src.blits = blits;
-            src.blit_count = draws.size();
+            // A re-composite has no primitive renderer: the stream lowered to blits.
+            const auto blits = painter_.flattened(*snap);
+            src.blits = blits.data();
+            src.blit_count = static_cast<unsigned>(blits.size());
             src.clear = snap->clear_color();
         }
         if (gl_present_)
@@ -2748,30 +2723,14 @@ void compositor_impl::run_capture_render() {
             continue;
         const scene::immutable_frame_snapshot& snap = scene.acquire_render_snapshot(jobs[i].view);
         drain_texture_updates(snap.frame_index());
-        const auto& draws = snap.draws();
-        gfx::blit_command* blits = blit_storage(draws.size());
-        for (unsigned d = 0; d < draws.size(); ++d) {
-            const auto& cmd = draws.data()[d];
-            blits[d] = {};
-            blits[d].texture_id = cmd.texture.id();
-            blits[d].dst = cmd.dst;
-            blits[d].src = cmd.src;
-            blits[d].clip = cmd.clip;
-            blits[d].tint = cmd.tint;
-            blits[d].opacity = cmd.opacity;
-            blits[d].blend = cmd.blend;
-            blits[d].buffer_xform = cmd.buffer_xform;
-            blits[d].src_space = cmd.src_space;
-            blits[d].scaled = cmd.scaled;
-            blits[d].occluded = cmd.occluded;
-            blits[d].solid = cmd.solid;
-            blits[d].solid_color = cmd.solid_color;
-        }
+        // The window's frame included: the stream lowered to blits (no primitive renderer
+        // composites into a capture buffer).
+        const auto blits = painter_.flattened(snap);
         capture_frame_source src{};
         src.frame = snap.frame_index();
         src.time_ns = static_cast<unsigned long long>(now_ns());
-        src.blits = blits;
-        src.blit_count = draws.size();
+        src.blits = blits.data();
+        src.blit_count = static_cast<unsigned>(blits.size());
         src.clear = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
         // The pointer over the window, at the view's projection.
         if (jobs[i].paint_cursors && cursor_cur_.visible) {
@@ -4869,6 +4828,10 @@ lx::result<void> compositor_impl::setup_cpu_present() {
     if (!drm_present_ && !virtual_cpu)
         return lx::not_implemented("lx::compositor::setup_cpu_present");
     cpu_compositor_.set_worker_threads(cfg.composite_thread_count);
+    // The primitive renderer is made here, once (its row table is the one allocation), not
+    // on the first frame that carries a primitive.
+    ui_cpu_ = std::make_unique<gfx::ui_cpu_renderer>();
+    ui_cpu_->set_surface_compositor(&cpu_compositor_);
     cpu_present_ = true;
     vulkan_present_ = false;
     headless_present_ = false;
@@ -4897,6 +4860,25 @@ lx::result<void> compositor_impl::setup_gl_present() {
     if (auto initialized = gl_compositor_.initialize(egl_); !initialized)
         return initialized.get_error();
     lx::trace::timeline_instant("startup", "gl program ready");
+
+    // UI primitives (ADR-010 §4.11) on GLES 3.1; programs built (or loaded from the binary
+    // cache) now, not on the first frame with a decoration. On GLES 2 the frames that carry
+    // primitives are lowered to blits.
+    if (egl_.gles_at_least(3, 1)) {
+        auto ui = std::make_unique<gfx::ui_gl_renderer>();
+        if (auto ready = ui->initialize(); ready) {
+            ui->set_surface_compositor(&gl_compositor_);
+            ui_gl_ = std::move(ui);
+            lx::trace::timeline_instant("startup", "ui_gl ready");
+        } else {
+            lx::trace::logger::global().log_error(ready.get_error(), "compositor.gfx");
+        }
+    }
+    if (!ui_gl_)
+        lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.gfx",
+                                         "GLES {}.{}: no UI primitive renderer — solid square "
+                                         "quads drawn as blits, other primitives dropped",
+                                         egl_.gles_major(), egl_.gles_minor());
 
     gl_present_ = true;
     vulkan_present_ = false;
@@ -5178,6 +5160,25 @@ void compositor_impl::warm_gl_paths() {
     }
     for (unsigned i = 0; i < n; ++i)
         gl_compositor_.forget_texture(ids[i]);
+    // The primitive renderer's quad program (decorations) the same way: one quad.
+    if (ui_gl_) {
+        gfx::quad_instance quad{};
+        quad.bounds[2] = 8.f;
+        quad.bounds[3] = 5.f;
+        quad.background[3] = quad.background_end[3] = gfx::to_half(1.f);
+        const gfx::primitive_ref ref{1, gfx::primitive_kind::quad, 0, 0, 0};
+        const gfx::batch run{gfx::primitive_kind::quad, 0, 0, 1, {0, 0, 8, 5}};
+        gfx::ui_stream stream{};
+        stream.refs = {&ref, 1};
+        stream.batches = {&run, 1};
+        stream.quads = {&quad, 1};
+        gfx::damage_region warm{};
+        warm.add({0, 0, 8, 5});
+        const gfx::gl_scanout_target& t = pipe->gl[output_pipeline::k_slots - 1];
+        (void)ui_gl_->draw(t.framebuffer(), t.width(), t.height(), stream, nullptr, warm);
+        // From here on only the render thread draws with it (ADR-010 §4.12).
+        ui_gl_->set_owner_affinity(runtime::affinity::render);
+    }
     lx::trace::timeline_instant("startup", "gl paths warmed");
 }
 
@@ -10416,28 +10417,9 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
         return false;
     }
 
-    // Translated only when something is drawn: an idle tick touches no draw data at all.
-    const unsigned blit_count = draws.size();
-    const auto build_blits = [&]() -> lx::gfx::blit_command* {
-        lx::gfx::blit_command* out = blit_storage(blit_count);
-        for (unsigned i = 0; i < blit_count; ++i) {
-            const auto& cmd = draws.data()[i];
-            out[i].texture_id = cmd.texture.id();
-            out[i].dst = cmd.dst;
-            out[i].src = cmd.src;
-            out[i].clip = cmd.clip;
-            out[i].tint = cmd.tint;
-            out[i].opacity = cmd.opacity;
-            out[i].blend = cmd.blend;
-            out[i].buffer_xform = cmd.buffer_xform;
-            out[i].src_space = cmd.src_space;
-            out[i].scaled = cmd.scaled;
-            out[i].occluded = cmd.occluded;
-            out[i].solid = cmd.solid;
-            out[i].solid_color = cmd.solid_color;
-        }
-        return out;
-    };
+    // Translated only when something is drawn: an idle tick touches no draw data at all. A
+    // snapshot with no UI primitive is the draw commands as blits, exactly as always; one
+    // with primitives is drawn as a stream (CPU, GL 3.1) or lowered to blits (`painter_`).
 
     bool drawn = false;
     if (p.scanout())
@@ -10449,11 +10431,10 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
         gfx::damage_region region = frame_damage;
         region.add_region(p.slot_age[back]);
         region.clip(p.scanout_rect);
-        lx::gfx::blit_command* blits = build_blits();
         lx::trace::scoped_span composite_span{"render", "composite"};
         if (gl_present_) {
-            auto c = gl_compositor_.composite_region(p.gl[back], snapshot.clear_color(), blits,
-                                                     blit_count, region);
+            auto c = painter_.paint_gl(gl_compositor_, ui_gl_.get(), p.gl[back].framebuffer(),
+                                       p.gl[back].width(), p.gl[back].height(), snapshot, region);
             if (!c) {
                 lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
@@ -10461,10 +10442,12 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 // This frame supersedes any uncommitted one, so its fence replaces that
                 // frame's — which is dropped rather than leaked.
                 p.discard_fence();
-                p.composited_fence = c.value().out_fence_fd;
+                p.composited_fence = c.value().composite.out_fence_fd;
                 publish_release_fence(p.composited_fence, idx);
-                if (c.value().draws_skipped > 0)
-                    report_unregistered_draw(blits, blit_count);
+                if (c.value().composite.draws_skipped > 0) {
+                    const auto blits = painter_.surfaces(snapshot);
+                    report_unregistered_draw(blits.data(), static_cast<unsigned>(blits.size()));
+                }
                 // A requested debug screenshot of a fully repainted frame of this output.
                 const std::uint32_t bit = 1u << slot;
                 if ((screenshot_pending_.load(std::memory_order_relaxed) & bit) &&
@@ -10482,14 +10465,13 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             target.stride = fb.stride();
             target.format = fb.format();
             target.write_combining = true;
-            auto c = cpu_compositor_.composite_region(target, snapshot.clear_color(), blits,
-                                                      blit_count, region);
+            auto c = painter_.paint_cpu(cpu_compositor_, ui_cpu_.get(), target, snapshot, region);
             if (!c) {
                 lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
                 drawn = true;
-                const auto stats = c.value();
-                if (stats.draws_skipped > 0)
+                const auto stats = c.value().composite;
+                if (stats.draws_skipped > 0 || c.value().ui.primitives_skipped > 0)
                     lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
                                                     "draw referenced an unregistered texture");
                 if (stats.draws_unsupported > 0)
@@ -10498,8 +10480,12 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                                                     "scanout format — surface not shown");
             }
         } else if (vulkan_present_) {
-            // Vulkan repaints the whole target, which is correct for any buffer age.
-            auto c = vk_compositor_.composite(p.vk[back], snapshot.clear_color(), blits, blit_count);
+            // Vulkan repaints the whole target, which is correct for any buffer age. Its
+            // chrome is drawn inside the linear pass as solid blits (the stream lowered:
+            // `:ui_vk` does not record into this compositor's pass yet).
+            const auto blits = painter_.flattened(snapshot);
+            auto c = vk_compositor_.composite(p.vk[back], snapshot.clear_color(), blits.data(),
+                                              static_cast<unsigned>(blits.size()));
             if (!c) {
                 lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
             } else {
@@ -10508,7 +10494,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 p.composited_fence = c.value().out_fence_fd;
                 publish_release_fence(p.composited_fence, idx);
                 if (c.value().draws_skipped > 0)
-                    report_unregistered_draw(blits, blit_count);
+                    report_unregistered_draw(blits.data(), static_cast<unsigned>(blits.size()));
             }
         }
         if (drawn) {
@@ -10535,8 +10521,9 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 src.frame = idx;
                 src.time_ns = p.capture_front_ns;
                 src.size = p.mode;
-                src.blits = blits;
-                src.blit_count = blit_count;
+                const auto blits = painter_.flattened(snapshot);
+                src.blits = blits.data();
+                src.blit_count = static_cast<unsigned>(blits.size());
                 src.clear = snapshot.clear_color();
                 if (gl_present_)
                     src.gl_framebuffer = p.gl[back].framebuffer();
@@ -10561,8 +10548,9 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 src.frame = idx;
                 src.time_ns = p.capture_front_ns;
                 src.size = p.mode;
-                src.blits = build_blits();
-                src.blit_count = blit_count;
+                const auto blits = painter_.flattened(snapshot);
+                src.blits = blits.data();
+                src.blit_count = static_cast<unsigned>(blits.size());
                 src.clear = snapshot.clear_color();
                 src.cursor = capture_cursor_for(p);
                 gfx::damage_region d = frame_damage;
@@ -10574,8 +10562,11 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
         // Software fallback for no-GPU hosts and CI.
         (void)headless_.begin_frame();
         (void)headless_.clear(lx::color::rgb(0.f, 0.f, 0.f));
-        if (blit_count > 0)
-            (void)frame_renderer_.draw_to_headless(build_blits(), blit_count, headless_);
+        if (draws.size() > 0) {
+            const auto blits = painter_.flattened(snapshot);
+            (void)frame_renderer_.draw_to_headless(blits.data(), static_cast<unsigned>(blits.size()),
+                                                   headless_);
+        }
         (void)headless_.end_frame_and_dump(nullptr);
     }
 

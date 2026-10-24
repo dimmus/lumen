@@ -62,17 +62,26 @@
     {
       "name": "release",
       "configurePreset": "release",
-      "output": { "outputOnFailure": true }
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "bench" } }
     },
     {
       "name": "asan",
       "configurePreset": "asan",
-      "output": { "outputOnFailure": true }
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "bench" } }
     },
     {
       "name": "tsan",
       "configurePreset": "tsan",
-      "output": { "outputOnFailure": true }
+      "output": { "outputOnFailure": true },
+      "filter": { "exclude": { "label": "bench" } }
+    },
+    {
+      "name": "bench",
+      "configurePreset": "release",
+      "output": { "outputOnFailure": true },
+      "filter": { "include": { "label": "bench" } }
     }
   ]
 }
