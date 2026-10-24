@@ -11,10 +11,14 @@ export module lx.text;
 
 import std;
 
-// ADR-010 §4.6: faces (fontconfig, FreeType, the face LRU) and shaping (HarfBuzz, the shape
-// cache) are partitions; the single-line and paragraph API below shapes through them.
+// ADR-010 §4.6: faces (fontconfig, FreeType, the face LRU), itemization (fribidi, script,
+// fallback faces, UAX #14 / #29 boundaries), shaping (HarfBuzz, the shape cache) and lines
+// (the retained `text_layout`: wrapping, ellipsis, bidi reordering, hit testing) are
+// partitions; the single-line and paragraph API below shapes through them.
 export import :faces;
 export import :shape;
+export import :itemize;
+export import :lines;
 
 export namespace lx::text {
 
@@ -37,22 +41,6 @@ public:
 
     /// True when a real font face backs shaping; false means metric estimation.
     [[nodiscard]] bool has_face() const;
-};
-
-class text_layout {
-public:
-    void set_text(const char* utf8);
-    void set_font(font_desc desc);
-    void set_max_width(float width);
-    [[nodiscard]] lx::size2i bounding_size() const;
-
-private:
-    void reshape();
-
-    const char* text_ = "";
-    font_desc font_{};
-    float max_width_ = 0.f;
-    glyph_run shaped_{};
 };
 
 // ── Single-line CPU rasterization ─────────────────────────────────────────────
@@ -282,30 +270,6 @@ lx::text::glyph_run lx::text::font_stack::shape(const char* utf8, font_desc desc
 
 float lx::text::font_stack::measure_width(const char* utf8, font_desc desc) const {
     return shape(utf8, desc).width;
-}
-
-void lx::text::text_layout::reshape() {
-    shaped_ = font_stack::shared().shape(text_, font_);
-}
-
-void lx::text::text_layout::set_text(const char* t) {
-    text_ = t ? t : "";
-    reshape();
-}
-
-void lx::text::text_layout::set_font(font_desc d) {
-    font_ = d;
-    reshape();
-}
-
-void lx::text::text_layout::set_max_width(float w) { max_width_ = w; }
-
-lx::size2i lx::text::text_layout::bounding_size() const {
-    const float height = shaped_.height > 0.f ? shaped_.height : font_.size_pt * 1.2f;
-    float width = shaped_.width;
-    if (max_width_ > 0.f && width > max_width_)
-        width = max_width_;
-    return {static_cast<int>(width), static_cast<int>(height)};
 }
 
 // ── Single-line rasterization ─────────────────────────────────────────────────

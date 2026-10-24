@@ -99,6 +99,10 @@ struct face_metrics {
     std::int32_t line_gap = 0;
     /// OS/2 sxHeight, or the height of "x" when the table has none; 0 when neither exists.
     std::int32_t x_height = 0;
+    /// The face's underline: top edge's offset below the baseline (positive is down) and
+    /// thickness (at least 1 px). From the `post` table; 1/14 and 1/20 em when it has none.
+    std::int32_t underline_offset = 0;
+    std::int32_t underline_thickness = 0;
 };
 
 /// What a face id resolved to.
@@ -123,6 +127,10 @@ struct face_cache_stats {
     std::uint64_t failures = 0;
     /// FT_Set_Char_Size calls (a use at a size other than the face's current one).
     std::uint64_t size_changes = 0;
+    /// `fallback_locked` searches (each a fontconfig match over the charset).
+    std::uint64_t fallback_searches = 0;
+    /// Searches that found no scalable face with the character.
+    std::uint64_t fallback_failures = 0;
     unsigned live = 0;
 };
 
@@ -158,6 +166,17 @@ public:
     /// handles; valid until the next `resolve_locked`.
     [[nodiscard]] handles use_locked(face_id id, std::int32_t size_26_6);
     [[nodiscard]] lx::result<face_metrics> metrics_locked(face_id id, std::int32_t size_26_6);
+    /// The face maps `codepoint` to a glyph (its cmap; FT_Get_Char_Index). False for a stale id.
+    [[nodiscard]] bool has_char_locked(face_id id, char32_t codepoint);
+    /// `alive` with the lock held.
+    [[nodiscard]] bool alive_locked(face_id id) { return find_locked(id) != nullptr; }
+    /// A face for `codepoint` when `primary` lacks it (ADR §4.6 `:itemize`): fontconfig's best
+    /// scalable match for the primary's requested family, weight and style whose charset has
+    /// the character, loaded into the LRU like any face (keyed by its file, so it never answers
+    /// a family resolution). Invalid when no installed scalable face has it, or `primary` is
+    /// stale. One fontconfig match per call — callers cache the answer (`itemizer` does, per
+    /// primary face, script and block).
+    [[nodiscard]] face_id fallback_locked(face_id primary, char32_t codepoint);
 
     [[nodiscard]] lx::result<face_metrics> metrics(face_id id, std::int32_t size_26_6);
     /// False when `id` is not loaded (evicted, or never was).
@@ -180,6 +199,10 @@ private:
         std::int32_t size_26_6 = 0;
         std::uint16_t units_per_em = 0;
         std::int16_t x_height_units = 0;
+        std::int16_t underline_position_units = 0;
+        std::int16_t underline_thickness_units = 0;
+        /// Loaded by `fallback_locked`: keyed by its file, not answering family resolutions.
+        bool fallback = false;
         weight weight = weight::normal;
         style style = style::normal;
         int index = 0;
@@ -190,6 +213,12 @@ private:
 
     bool init_locked();
     void release_locked(slot& s);
+    /// The least recently used slot (or a free one).
+    [[nodiscard]] unsigned victim_locked() const;
+    /// Opens `file` into slot `victim` (evicting what is there). Null on failure.
+    [[nodiscard]] slot* load_locked(unsigned victim, std::uint64_t key, const char* requested,
+                                    const char* file, int index, const char* matched_family,
+                                    weight w, style s, bool fallback);
     [[nodiscard]] slot* find_locked(face_id id);
 
     std::mutex mutex_{};
@@ -382,24 +411,29 @@ lx::text::face_id lx::text::face_cache::resolve(const char* family, weight w, st
     return resolve_locked(family, w, s);
 }
 
+unsigned lx::text::face_cache::victim_locked() const {
+    unsigned victim = 0;
+    for (unsigned i = 0; i < k_face_cache_size; ++i) {
+        const slot& e = slots_[i];
+        if (!e.hb)
+            return i;
+        if (e.used < slots_[victim].used)
+            victim = i;
+    }
+    return victim;
+}
+
 lx::text::face_id lx::text::face_cache::resolve_locked(const char* family_in, weight w, style st) {
     const char* family = family_or_default(family_in);
     const std::uint64_t key = face_key_hash(family, w, st);
-    unsigned victim = 0;
     for (unsigned i = 0; i < k_face_cache_size; ++i) {
         slot& e = slots_[i];
-        if (!e.hb) {
-            if (slots_[victim].hb)
-                victim = i;
-            continue;
-        }
-        if (e.key_hash == key && e.weight == w && e.style == st && same_family(e.requested, family)) {
+        if (e.hb && !e.fallback && e.key_hash == key && e.weight == w && e.style == st &&
+            same_family(e.requested, family)) {
             e.used = ++clock_;
             ++stats_.hits;
             return {e.id};
         }
-        if (slots_[victim].hb && e.used < slots_[victim].used)
-            victim = i;
     }
 #if defined(LUMEN_HAS_TEXT)
     if (!init_locked()) {
@@ -440,19 +474,35 @@ lx::text::face_id lx::text::face_cache::resolve_locked(const char* family_in, we
              match_family ? reinterpret_cast<const char*>(match_family) : "");
     FcPatternDestroy(matched);
 
-    FT_Face face = nullptr;
-    if (FT_New_Face(static_cast<FT_Library>(library_), file, face_index, &face) != 0 || !face) {
+    const slot* e = load_locked(victim_locked(), key, family, file, face_index, matched_family, w,
+                                st, false);
+    if (!e) {
         ++stats_.failures;
         return {};
     }
+    return {e->id};
+#else
+    ++stats_.failures;
+    return {};
+#endif
+}
+
+lx::text::face_cache::slot* lx::text::face_cache::load_locked(unsigned victim, std::uint64_t key,
+                                                              const char* requested,
+                                                              const char* file, int face_index,
+                                                              const char* matched_family, weight w,
+                                                              style st, bool fallback) {
+#if defined(LUMEN_HAS_TEXT)
+    FT_Face face = nullptr;
+    if (FT_New_Face(static_cast<FT_Library>(library_), file, face_index, &face) != 0 || !face)
+        return nullptr;
     // Sized at load only so hb_font_t starts from a valid scale; every use sets its own.
     const std::int32_t initial = size_26_6_from_pt(11.f);
     FT_Set_Char_Size(face, 0, initial, 72, 72);
     hb_font_t* font = hb_ft_font_create_referenced(face);
     if (!font) {
         FT_Done_Face(face);
-        ++stats_.failures;
-        return {};
+        return nullptr;
     }
     // x-height in font units: OS/2 sxHeight (version 2+), else the outline of "x".
     std::int16_t x_height = 0;
@@ -481,17 +531,144 @@ lx::text::face_id lx::text::face_cache::resolve_locked(const char* family_in, we
     e.size_26_6 = initial;
     e.units_per_em = face->units_per_EM;
     e.x_height_units = x_height;
+    // FreeType's underline_position is the centre of the line, negative below the baseline.
+    e.underline_position_units = face->underline_position;
+    e.underline_thickness_units = face->underline_thickness;
+    e.fallback = fallback;
     e.weight = w;
     e.style = st;
     e.index = face_index;
-    copy_cut(e.requested, sizeof(e.requested), family);
+    copy_cut(e.requested, sizeof(e.requested), requested);
     copy_cut(e.family, sizeof(e.family), matched_family);
     copy_cut(e.file, sizeof(e.file), file);
     ++stats_.loads;
-    return {e.id};
+    return &e;
 #else
     (void)victim;
-    ++stats_.failures;
+    (void)key;
+    (void)requested;
+    (void)file;
+    (void)face_index;
+    (void)matched_family;
+    (void)w;
+    (void)st;
+    (void)fallback;
+    return nullptr;
+#endif
+}
+
+bool lx::text::face_cache::has_char_locked(face_id id, char32_t codepoint) {
+    slot* s = find_locked(id);
+    if (!s)
+        return false;
+    s->used = ++clock_;
+#if defined(LUMEN_HAS_TEXT)
+    return FT_Get_Char_Index(static_cast<FT_Face>(s->ft), static_cast<FT_ULong>(codepoint)) != 0;
+#else
+    (void)codepoint;
+    return false;
+#endif
+}
+
+lx::text::face_id lx::text::face_cache::fallback_locked(face_id primary, char32_t codepoint) {
+    const slot* p = find_locked(primary);
+    if (!p)
+        return {};
+#if defined(LUMEN_HAS_TEXT)
+    if (!init_locked())
+        return {};
+    ++stats_.fallback_searches;
+    // Copies: loading below may evict the primary's slot.
+    char requested[k_face_family_bytes];
+    copy_cut(requested, sizeof(requested), p->requested);
+    char primary_file[k_face_path_bytes];
+    copy_cut(primary_file, sizeof(primary_file), p->file);
+    const int primary_index = p->index;
+    const weight w = p->weight;
+    const style st = p->style;
+
+    auto* config = static_cast<FcConfig*>(config_);
+    FcPattern* pattern = FcNameParse(reinterpret_cast<const FcChar8*>(requested));
+    FcCharSet* chars = FcCharSetCreate();
+    if (!pattern || !chars) {
+        if (pattern)
+            FcPatternDestroy(pattern);
+        if (chars)
+            FcCharSetDestroy(chars);
+        ++stats_.fallback_failures;
+        return {};
+    }
+    for (const char* f : fallback_families(requested))
+        FcPatternAddString(pattern, FC_FAMILY, reinterpret_cast<const FcChar8*>(f));
+    FcCharSetAddChar(chars, static_cast<FcChar32>(codepoint));
+    // The charset outranks the family in fontconfig's match order, so the match has the
+    // character whenever any installed face does; the family breaks ties between those.
+    FcPatternAddCharSet(pattern, FC_CHARSET, chars);
+    FcCharSetDestroy(chars);
+    FcPatternAddBool(pattern, FC_SCALABLE, FcTrue);
+    FcPatternAddInteger(pattern, FC_WEIGHT, w == weight::bold ? FC_WEIGHT_BOLD : FC_WEIGHT_REGULAR);
+    FcPatternAddInteger(pattern, FC_SLANT, st == style::italic ? FC_SLANT_ITALIC : FC_SLANT_ROMAN);
+    FcConfigSubstitute(config, pattern, FcMatchPattern);
+    FcDefaultSubstitute(pattern);
+    FcResult match_result{};
+    FcPattern* matched = FcFontMatch(config, pattern, &match_result);
+    FcPatternDestroy(pattern);
+    FcChar8* match_file = nullptr;
+    FcCharSet* match_chars = nullptr;
+    FcBool scalable = FcFalse;
+    const bool usable =
+        matched && match_result == FcResultMatch &&
+        FcPatternGetString(matched, FC_FILE, 0, &match_file) == FcResultMatch && match_file &&
+        FcPatternGetCharSet(matched, FC_CHARSET, 0, &match_chars) == FcResultMatch &&
+        FcCharSetHasChar(match_chars, static_cast<FcChar32>(codepoint)) &&
+        FcPatternGetBool(matched, FC_SCALABLE, 0, &scalable) == FcResultMatch && scalable;
+    if (!usable) {
+        if (matched)
+            FcPatternDestroy(matched);
+        ++stats_.fallback_failures;
+        return {};
+    }
+    int face_index = 0;
+    FcPatternGetInteger(matched, FC_INDEX, 0, &face_index);
+    FcChar8* match_family = nullptr;
+    FcPatternGetString(matched, FC_FAMILY, 0, &match_family);
+    char file[k_face_path_bytes];
+    char matched_family[k_face_family_bytes];
+    copy_cut(file, sizeof(file), reinterpret_cast<const char*>(match_file));
+    copy_cut(matched_family, sizeof(matched_family),
+             match_family ? reinterpret_cast<const char*>(match_family) : "");
+    FcPatternDestroy(matched);
+    if (std::strcmp(file, primary_file) == 0 && face_index == primary_index) {
+        // fontconfig's charset says the primary has it, its cmap does not: nothing better.
+        ++stats_.fallback_failures;
+        return {};
+    }
+
+    // Keyed by the file: a fallback slot is found by what it is, not by a family name.
+    std::uint64_t key = k_fnv_offset ^ 0xFA11BACCull;
+    for (const char* c = file; *c; ++c)
+        key = (key ^ static_cast<unsigned char>(*c)) * k_fnv_prime;
+    key = (key ^ (0x300u + static_cast<unsigned>(face_index))) * k_fnv_prime;
+    key = (key ^ (0x100u + static_cast<unsigned>(w))) * k_fnv_prime;
+    key = (key ^ (0x200u + static_cast<unsigned>(st))) * k_fnv_prime;
+    for (unsigned i = 0; i < k_face_cache_size; ++i) {
+        slot& e = slots_[i];
+        if (e.hb && e.fallback && e.key_hash == key && e.index == face_index && e.weight == w &&
+            e.style == st && std::strcmp(e.file, file) == 0) {
+            e.used = ++clock_;
+            ++stats_.hits;
+            return {e.id};
+        }
+    }
+    const slot* e = load_locked(victim_locked(), key, matched_family, file, face_index,
+                                matched_family, w, st, true);
+    if (!e) {
+        ++stats_.fallback_failures;
+        return {};
+    }
+    return {e->id};
+#else
+    (void)codepoint;
     return {};
 #endif
 }
@@ -529,6 +706,23 @@ lx::result<lx::text::face_metrics> lx::text::face_cache::metrics_locked(face_id 
     const auto gap = static_cast<std::int32_t>(m.height) - out.ascent - out.descent;
     out.line_gap = gap > 0 ? gap : 0;
     out.x_height = static_cast<std::int32_t>(FT_MulFix(s->x_height_units, m.y_scale));
+    // 26.6 em = size_26_6; a value in font units scales by size / units_per_em.
+    const auto units = [&](std::int32_t v) {
+        return s->units_per_em
+                   ? static_cast<std::int32_t>(static_cast<std::int64_t>(v) * size_26_6 /
+                                               s->units_per_em)
+                   : 0;
+    };
+    std::int32_t thickness = units(s->underline_thickness_units);
+    std::int32_t centre = -units(s->underline_position_units);
+    if (s->underline_thickness_units <= 0) {
+        thickness = size_26_6 / 20;
+        centre = size_26_6 / 14;
+    }
+    if (thickness < 64)
+        thickness = 64;
+    out.underline_thickness = thickness;
+    out.underline_offset = centre - thickness / 2;
     return out;
 #else
     (void)id;

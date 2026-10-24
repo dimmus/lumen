@@ -311,6 +311,25 @@ naming its pixels — and marks a page above 85 % for the rebuild at the next fr
 measured, rendering-performance.md §6). The worker rebuild into a shadow page swapped at
 `begin_frame` is left for when S4 shows the synchronous one on a frame.
 
+As built in Phase 2 (`:itemize`, `:lines`): libunibreak is called from `:itemize`, which decodes
+each paragraph once and computes its bidi levels, scripts, UAX #29 grapheme and UAX #14 break
+flags in one pass; `:lines` consumes the flags. fribidi is skipped for a paragraph with nothing
+right-to-left in it. The fallback key's "Unicode block" is a fixed slice of 128 code points,
+negative answers included; a cluster of Common / Inherited characters stays in the face of the
+run before it. A line cuts a run's glyphs at a cluster boundary instead of reshaping the two
+halves (the shape cache does not keep HarfBuzz's unsafe-to-break flags), so a re-wrap at any
+width shapes nothing; a forced break inside a word or an ellipsis cut keeps the glyph forms the
+whole word was shaped with. With `max_lines` the ellipsis cut stays within the last line's
+wrapped extent (as CSS `line-clamp`); an unwrapped line is cut at any grapheme. The retained
+`text_layout` replaces the old one-line class of that name (same setters, `bounding_size` now
+counts every line); `wrap_text` / `render_wrapped` keep their own path for the shell until
+Phase 5. Measured on an S4-like wall (2 000 paragraphs of Latin / Cyrillic / Arabic, 142 KB,
+97 k glyphs; `test_text_lines`, load 0.7, five runs): cold layout 28–54 ms, a fresh layout over
+a warm shape cache 15–21 ms p50 (itemization 7–9 ms of it, no shaping calls), re-wrap at a new
+width 0.49–0.67 ms p50 / 0.8–4 ms p95 with no shaping; 6.9 MB of layout storage (vector
+growth slack included). A whole-document relayout is therefore worker work (below); scrolling
+does not relayout.
+
 Shaping and rasterising happen on the **worker** affinity when a layout invalidation is
 large (a whole document) and inline on the UI thread when it is small (a label), with the
 boundary set by measurement in §8.3 S4.

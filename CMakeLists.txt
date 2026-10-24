@@ -951,6 +951,13 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_text_raster PRIVATE tests)
     add_test(NAME test_text_raster COMMAND test_text_raster)
 
+    add_executable(test_text_lines tests/test_text_lines.cpp)
+    target_link_libraries(test_text_lines PRIVATE lx.text)
+    lumen_apply_module_properties(test_text_lines)
+    lumen_link_platform(test_text_lines)
+    target_include_directories(test_text_lines PRIVATE tests)
+    add_test(NAME test_text_lines COMMAND test_text_lines)
+
     add_executable(test_protocol_bind tests/test_protocol_bind.cpp)
     target_link_libraries(test_protocol_bind PRIVATE lx.compositor)
     lumen_apply_module_properties(test_protocol_bind)

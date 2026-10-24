@@ -562,6 +562,48 @@ LUMEN_TEST(shaping_cost_report) {
                 std::chrono::duration<double, std::nano>(clock::now() - l0).count() / reps);
 }
 
+LUMEN_TEST(face_fallback_finds_a_face_with_the_character) {
+    // ADR §4.6 :itemize: a character the face lacks resolves, through fontconfig's charset, to
+    // an installed scalable face that has it — loaded into the LRU by file, apart from family
+    // resolutions. IBM Plex Sans (the bundled UI face) has no Hebrew; DejaVu Sans does here.
+    lx::text::face_cache faces{};
+    const lx::text::face_id ui = faces.resolve(lx::text::font_desc{});
+    if (!ui.valid())
+        return;
+    lx::text::face_id fb{};
+    {
+        auto lock = faces.lock();
+        LUMEN_CHECK(faces.has_char_locked(ui, U'a'));
+        if (faces.has_char_locked(ui, U'\u05D0')) {
+            std::printf("    SKIP: the UI face has Hebrew\n");
+            return;
+        }
+        fb = faces.fallback_locked(ui, U'\u05D0');
+        LUMEN_CHECK(fb.valid() && fb != ui);
+        LUMEN_CHECK(faces.has_char_locked(fb, U'\u05D0'));
+    }
+    const auto s1 = faces.stats(); // stats() takes the lock itself
+    LUMEN_CHECK(s1.fallback_searches == 1 && s1.fallback_failures == 0);
+    {
+        // The same search again finds the loaded face (one more fontconfig match, no load).
+        auto lock = faces.lock();
+        LUMEN_CHECK(faces.fallback_locked(ui, U'\u05D1') == fb);
+        // A family resolution never answers with a fallback slot.
+        LUMEN_CHECK(faces.resolve_locked(lx::text::k_ui_family, lx::text::weight::normal,
+                                         lx::text::style::normal) == ui);
+        // A code point no face has: no fallback (U+10FFFD, plane 16 private use).
+        LUMEN_CHECK(!faces.fallback_locked(ui, U'\U0010FFFD').valid());
+    }
+    const auto s2 = faces.stats();
+    LUMEN_CHECK(s2.loads == s1.loads);
+    LUMEN_CHECK(s2.fallback_searches == 3 && s2.fallback_failures == 1);
+    // Underline metrics for decorations: below the baseline, at least a pixel thick.
+    const auto m = faces.metrics(ui, lx::text::size_26_6_from_pt(11.f));
+    LUMEN_CHECK(m.ok() && m->underline_offset > 0 && m->underline_thickness >= 64);
+    std::printf("    underline offset %d, thickness %d (26.6)\n", m->underline_offset,
+                m->underline_thickness);
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }
