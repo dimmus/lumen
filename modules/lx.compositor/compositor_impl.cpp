@@ -830,6 +830,15 @@ struct compositor_impl {
     scheduler::frame_clocks clocks_{};
     /// UI → render: bit per output whose view published since render last looked.
     std::atomic<std::uint32_t> render_mask_{0};
+    /// UI → render: bumped after each resume UI posts (`resume_gen_`), work only a render
+    /// tick notices.
+    std::atomic<unsigned long long> render_posts_{1};
+    /// Render → UI, at the end of each render tick: the `render_posts_` it started from when
+    /// nothing of render's own is left for a later tick (no flip or frame waiting, no
+    /// leftover damage, no targets kept around, no deferred op, texture retirement, capture
+    /// job or resume), else 0. Equal to `render_posts_`: the idle housekeeping tick leaves the
+    /// render thread asleep. A post after the tick began no longer matches, so is not missed.
+    std::atomic<unsigned long long> render_quiet_at_{0};
     /// UI affinity. The outputs `on_vsync` is serving (`tick_ui`); 0 outside a vsync tick
     /// (a test driving `tick_ui` directly serves every live output).
     std::uint32_t due_mask_ = 0;
@@ -1213,7 +1222,14 @@ struct compositor_impl {
     void stop_threads();
     /// One tick of the frame clocks: the outputs due now (`frame_clocks::take_due`) plus
     /// `forced` (the housekeeping and paused ticks serve outputs whose clock is stopped).
-    void on_vsync(std::uint32_t forced = 0);
+    /// `housekeeping`: the idle once-a-second tick, which wakes render only for work.
+    void on_vsync(std::uint32_t forced = 0, bool housekeeping = false);
+    /// UI affinity. Whether the render thread has anything to do: it said at the end of its
+    /// last tick that nothing of its own was left (`render_quiet_at_`), and nothing new has
+    /// been handed to it since.
+    [[nodiscard]] bool render_has_work() const;
+    /// Render affinity, end of `tick_render`: see `render_quiet_at_`.
+    [[nodiscard]] bool render_is_quiet() const;
     void render_loop();
     void worker_loop();
     void register_p0_globals();
@@ -2402,7 +2418,8 @@ void compositor_impl::wayland_fd_callback() {
         return;
     lx::trace::scoped_span span{"ui", "wayland.pump"};
     const std::uint32_t damaged_before = active->scene.pending_damage_mask();
-    (void)active->wayland.dispatch(0);
+    // Unflushed: the loop's after-dispatch hook flushes once the iteration is done.
+    (void)active->wayland.dispatch(0, false);
     // Whatever a client asked for is applied, configured and composited by a tick — of the
     // outputs it damaged when it damaged any (each on its own phase), else of every output
     // (a frame callback or a configure answer is served by whichever ticks).
@@ -2507,7 +2524,7 @@ void compositor_impl::housekeeping_callback() {
             const bool master = session_active && active->kms.is_master();
             active->apply_session_actions(active->session_.on_paused_tick(session_active, master));
         }
-        active->on_vsync();
+        active->on_vsync(0, true);
         if (active->clocks_.running_mask() == 0 && active->housekeeping_timer)
             active->housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
         return;
@@ -2521,7 +2538,7 @@ void compositor_impl::housekeeping_callback() {
     }
     // One tick of every lit output for the deadlines only a tick notices; nothing woke the
     // clocks but the calendar, so one quiet tick is enough to stop them again.
-    active->on_vsync();
+    active->on_vsync(0, true);
     if (active->clocks_.running_mask() == 0 && active->housekeeping_timer)
         active->housekeeping_timer->schedule_at(now_ns() + k_housekeeping_ns);
 }
@@ -4315,7 +4332,7 @@ void compositor_impl::finish_config_generation() {
     const auto& d = config_.diagnostics();
     // Logged once per generation: each problem, then one summary line.
     for (const lxc::diagnostic& x : d.items()) {
-        char line[384];
+        char line[1024]; // a path (up to 512) and the message
         lxc::format_diagnostic(x, config_.path_of(x.layer), true, line, sizeof(line));
         lx::trace::logger::global().log(
             x.sev == lxc::severity::error ? lx::trace::level::warn : lx::trace::level::info,
@@ -4753,19 +4770,21 @@ void compositor_impl::apply_texture_update(texture_update& update) {
                 update.format == static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
             const bool opaque =
                 update.format == static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+            // The rects of the region, when it has several (empty: the region as one).
+            const std::span<const lx::rect2i> parts{update.rects.rects, update.rects.count};
             if (update.shm_direct) {
                 // The client's own rows, read under its buffer's access guard.
                 shm_direct_.upload(update.shm_direct,
                                    [&](const unsigned char* pixels, unsigned stride) {
-                                       applied = pixels ? gl_compositor_.upload_client_region(
+                                       applied = pixels ? gl_compositor_.upload_client_regions(
                                                               update.texture_id, update.width,
                                                               update.height, update.region,
-                                                              pixels, stride, opaque)
+                                                              parts, pixels, stride, opaque)
                                                         : lx::result<void>{};
                                    });
             } else if (bgra) {
-                applied = gl_compositor_.upload_client_region(
-                    update.texture_id, update.width, update.height, update.region,
+                applied = gl_compositor_.upload_client_regions(
+                    update.texture_id, update.width, update.height, update.region, parts,
                     update.pixels, update.stride, opaque);
             } else {
                 applied = gl_compositor_.upload_rgba_region(update.texture_id, update.width,
@@ -5800,6 +5819,7 @@ void compositor_impl::finish_display_resume(unsigned gen) {
         if (!outs_[s].live)
             continue;
         resume_gen_[s].store(render_gen, std::memory_order_release);
+        render_posts_.fetch_add(1, std::memory_order_acq_rel);
         if (outs_[s].pipe && outs_[s].pipe->kms)
             vt_resume_pending_ |= 1u << s;
     }
@@ -5910,6 +5930,7 @@ void compositor_impl::apply_power_actions(unsigned slot, const power_actions& a)
             const unsigned render_gen = ++render_gen_counter_;
             o.power_resume_render_gen = render_gen;
             resume_gen_[slot].store(render_gen, std::memory_order_release);
+            render_posts_.fetch_add(1, std::memory_order_acq_rel);
         }
         gate_power_mask_.fetch_and(~bit, std::memory_order_release);
         clocks_.set_dark(slot, false);
@@ -8760,7 +8781,37 @@ void compositor_impl::stop_threads() {
     runtime::executor::global().worker_strand().set_waker(nullptr, nullptr);
 }
 
-void compositor_impl::on_vsync(std::uint32_t forced) {
+bool compositor_impl::render_is_quiet() const {
+    if (!ops_deferred_.empty() || capture_renderer_.has_pending() ||
+        device_recovery_.needs_recovery())
+        return false;
+    for (const deferred_forget& f : deferred_forgets_)
+        if (f.used)
+            return false;
+    for (const auto& up : pipes_) {
+        if (!up)
+            continue;
+        const output_pipeline& p = *up;
+        // A composited slot only waits for something with a CRTC to hand it to.
+        if (p.retiring || p.graveyard || p.staged || !p.missed.empty() ||
+            p.frame_outstanding.load(std::memory_order_relaxed) ||
+            (p.kms && (p.composited_slot >= 0 || p.kms->flip_pending())) ||
+            resume_gen_[p.slot].load(std::memory_order_acquire) != p.resume_done_gen)
+            return false;
+    }
+    return true;
+}
+
+bool compositor_impl::render_has_work() const {
+    return render_quiet_at_.load(std::memory_order_acquire) !=
+               render_posts_.load(std::memory_order_acquire) ||
+           render_mask_.load(std::memory_order_acquire) != 0 || !texture_updates_.empty() ||
+           ops_pending_.load(std::memory_order_acquire) || cursor_frames_.fresh() ||
+           cursor_images_.fresh() || screenshot_pending_.load(std::memory_order_acquire) != 0 ||
+           capture_ui_posted_.load(std::memory_order_acquire);
+}
+
+void compositor_impl::on_vsync(std::uint32_t forced, bool housekeeping) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
 
     const auto now = std::chrono::steady_clock::now();
@@ -8792,11 +8843,15 @@ void compositor_impl::on_vsync(std::uint32_t forced) {
 
     // Render runs after every tick: composites of the views just published, a frame still
     // waiting for its flip, and cursor-only commits (the pointer moved, nothing else did).
-    {
-        std::lock_guard lock{render_mutex};
-        render_pending = true;
+    // The idle housekeeping tick wakes it only for work: otherwise it found nothing, once a
+    // second — half of an idle desktop's wakeups.
+    if (!housekeeping || render_has_work()) {
+        {
+            std::lock_guard lock{render_mutex};
+            render_pending = true;
+        }
+        render_cv.notify_one();
     }
-    render_cv.notify_one();
     settle_frame_clocks(due, tick_quiet_mask_);
 }
 
@@ -9783,7 +9838,9 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         // From here to the publish, what is applied joins this tick's frame (the
         // commit-timing prediction of the served outputs is this tick's deadline).
         impl->p0_.cu_in_tick = true;
-        (void)wayland().dispatch(0);
+        // Unflushed: the tick flushes once at its end, so what these requests produce (a
+        // buffer release) leaves together with the frame's events in one send.
+        (void)wayland().dispatch(0, false);
     }
     // Queued content updates whose target this tick's frame reaches, or that stopped being
     // shown, apply now and join it.
@@ -10072,6 +10129,8 @@ void compositor::tick_render() {
     runtime::assert_affinity(runtime::affinity::render);
     lx::trace::scoped_span span{"render", "tick_render"};
     auto* impl = impl_;
+    // Before anything this tick reads: work UI posts from here on wakes render again.
+    const unsigned long long posts_seen = impl->render_posts_.load(std::memory_order_acquire);
 
     // The pause gate, in this order (see `resume_gen_`). A resume runs its procedure before
     // anything else this tick: the KMS state, the cursor plane and every slot's history are
@@ -10246,6 +10305,8 @@ void compositor::tick_render() {
     const long long low_water = impl->compute_low_water();
     impl->render_low_water_.store(low_water, std::memory_order_release);
     impl->apply_due_forgets(low_water);
+    impl->render_quiet_at_.store(impl->render_is_quiet() ? posts_seen : 0,
+                                 std::memory_order_release);
 
     // One line per output that did something; an idle tick is silent. Checked before
     // formatting so the frame path pays nothing when debug is off.

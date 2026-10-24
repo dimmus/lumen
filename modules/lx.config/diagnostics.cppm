@@ -139,17 +139,19 @@ void lx::config::format_diagnostic(const diagnostic& d, const char* file, bool f
         if (const char* slash = std::strrchr(file, '/'))
             name = slash + 1;
     }
-    char where[96];
+    // Straight into `out`: an intermediate buffer for "file:line" cut paths longer than it
+    // (a configuration under a long $XDG_CONFIG_HOME).
+    const bool at_line = *name && d.line;
     if (!*name)
-        std::snprintf(where, sizeof(where), "lumen");
-    else if (d.line)
-        std::snprintf(where, sizeof(where), "%s:%u", name, d.line);
+        name = "lumen";
+    if (at_line && d.key[0])
+        std::snprintf(out, cap, "%s:%u: %s: %s", name, d.line, d.key, d.message);
+    else if (at_line)
+        std::snprintf(out, cap, "%s:%u: %s", name, d.line, d.message);
+    else if (d.key[0])
+        std::snprintf(out, cap, "%s: %s: %s", name, d.key, d.message);
     else
-        std::snprintf(where, sizeof(where), "%s", name);
-    if (d.key[0])
-        std::snprintf(out, cap, "%s: %s: %s", where, d.key, d.message);
-    else
-        std::snprintf(out, cap, "%s: %s", where, d.message);
+        std::snprintf(out, cap, "%s: %s", name, d.message);
 }
 
 unsigned lx::config::edit_distance(std::string_view a, std::string_view b, unsigned limit) {

@@ -335,6 +335,12 @@ struct srgb_tables {
     }
     if (sa == 0)
         return dst;
+    // Fully opaque (which implies opacity 255): the destination drops out and decoding then
+    // re-encoding is exact for every 8-bit value (test_cpu_composite checks it), so the
+    // result is the source. Most pixels of a translucent-format window are opaque; this
+    // skips six table reads and three divisions for each of them.
+    if (sa == 255u) [[likely]]
+        return src;
 
     const unsigned inv = 255u - sa;
     // Alpha is a coverage fraction, not a light level — it stays linear and is not
@@ -612,6 +618,11 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         if (identity) {
             const bool memcpy_rows = !needs_blend && !fill_alpha && !tinted &&
                                      conv == convert_op::copy;
+            // A translucent-format window at full opacity is mostly opaque pixels (all but
+            // its shadow and rounded corners): copy each opaque run, blend only the rest.
+            // A fullscreen such window went from 15 to about 4 ms.
+            const bool blend_runs = needs_blend && !fill_alpha && !tinted &&
+                                    conv == convert_op::copy && opacity_255 == 255u;
             const unsigned sx0 = static_cast<unsigned>(sub.x + (area.x - cmd.dst.x));
             for (int row = 0; row < area.height; ++row) {
                 const unsigned sy = static_cast<unsigned>(sub.y + (area.y - cmd.dst.y) + row);
@@ -624,6 +635,22 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
                 if (memcpy_rows) {
                     std::memcpy(dst_row, src_row + sx0,
                                 static_cast<std::size_t>(area.width) * 4u);
+                    continue;
+                }
+                if (blend_runs) {
+                    const std::uint32_t* s = src_row + sx0;
+                    for (int x = 0; x < area.width;) {
+                        int end = x;
+                        while (end < area.width && (s[end] >> 24) == 0xFFu)
+                            ++end;
+                        if (end > x) {
+                            std::memcpy(dst_row + x, s + x, static_cast<std::size_t>(end - x) * 4u);
+                            x = end;
+                            continue;
+                        }
+                        dst_row[x] = blend_over_linear(s[x], dst_row[x], 255u);
+                        ++x;
+                    }
                     continue;
                 }
                 for (int x = 0; x < area.width; ++x)

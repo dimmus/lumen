@@ -546,28 +546,25 @@ lx::rect2i clip_damage_to_buffer(lx::rect2i damage, int width, int height) {
             static_cast<int>(y1 - y0)};
 }
 
-/// Adds `x, y, width, height` to an accumulated damage bbox. A client may send several
-/// damage requests per commit, and keeping only the last one under-reports what changed. A
-/// bbox union is enough here — the client's rects all land inside one window, and the
-/// window's damage is split from the others' in the scene's region. Formed in 64 bits:
-/// INT32_MAX extents are common ("everything", wev, GTK, SDL).
-void accumulate_damage(lx::rect2i& acc, bool& has, int32_t x, int32_t y, int32_t width,
-                       int32_t height) {
+/// Adds `x, y, width, height` to a commit's accumulated damage. A client may send several
+/// damage requests per commit, and keeping only the last one under-reports what changed;
+/// they are kept as separate rects (`client_damage`), so two lines far apart upload and
+/// repaint as two strips. Formed in 64 bits: INT32_MAX extents are common ("everything",
+/// wev, GTK, SDL).
+void accumulate_damage(client_damage& acc, int32_t x, int32_t y, int32_t width, int32_t height) {
     if (width <= 0 || height <= 0)
         return;
     const lx::rect2i incoming = clip_damage_to_buffer({x, y, width, height}, INT32_MAX, INT32_MAX);
     if (incoming.width <= 0 || incoming.height <= 0)
         return;
-    acc = has ? lx::compositor::union_rect(acc, incoming) : incoming;
-    has = true;
+    acc.add(incoming);
 }
 
 /// wl_surface.damage: surface-local (logical) coordinates.
 void surface_damage(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y,
                     int32_t width, int32_t height) {
     if (auto* s = surface_from(resource))
-        accumulate_damage(s->pending.damage_surface, s->pending.has_damage_surface, x, y, width,
-                          height);
+        accumulate_damage(s->pending.damage_surface, x, y, width, height);
 }
 
 void surface_frame(struct wl_client* client, struct wl_resource* resource, uint32_t callback_id) {
@@ -1079,18 +1076,8 @@ void merge_state(surface_obj* s, surface_pending& p, surface_pending& c) {
     c.viewport = p.viewport;
     // Damage of updates that were never applied accumulates, each kind in its own space:
     // converting at apply time uses the geometry of the state that is finally applied.
-    if (p.has_damage_surface) {
-        c.damage_surface = c.has_damage_surface
-                               ? lx::compositor::union_rect(c.damage_surface, p.damage_surface)
-                               : p.damage_surface;
-        c.has_damage_surface = true;
-    }
-    if (p.has_damage_buffer) {
-        c.damage_buffer = c.has_damage_buffer
-                              ? lx::compositor::union_rect(c.damage_buffer, p.damage_buffer)
-                              : p.damage_buffer;
-        c.has_damage_buffer = true;
-    }
+    c.damage_surface.add_region(p.damage_surface);
+    c.damage_buffer.add_region(p.damage_buffer);
     cb_list_splice(c.frame_cbs, p.frame_cbs);
     // Presentation feedback moves with the update; a cached update it replaces is discarded.
     presentation_merge_lists(p.feedback, c.feedback);
@@ -1106,10 +1093,8 @@ void merge_state(surface_obj* s, surface_pending& p, surface_pending& c) {
     p.buffer_set = false;
     p.dx = 0;
     p.dy = 0;
-    p.damage_surface = {};
-    p.has_damage_surface = false;
-    p.damage_buffer = {};
-    p.has_damage_buffer = false;
+    p.damage_surface.clear();
+    p.damage_buffer.clear();
     p.input_set = false;
     p.opaque_set = false;
 }
@@ -1123,9 +1108,9 @@ void merge_pending_into_cached(surface_obj* s) {
 struct update_damage {
     bool any = false;
     /// Surface-local (logical): what the scene repaints.
-    lx::rect2i surface{};
+    client_damage surface{};
     /// Buffer pixels: what the texture upload copies.
-    lx::rect2i buffer{};
+    client_damage buffer{};
 };
 
 /// The import path: hands a newly applied buffer to the surface manager, stages its pixels
@@ -1200,8 +1185,15 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
     // A new buffer with no damage request is treated as fully damaged: strictly the
     // client said nothing changed, but every real client that does this means "all of it".
     const lx::rect2i whole{0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
-    commit.damage = damage.any ? damage.surface : lx::rect2i{0, 0, geo.size.width, geo.size.height};
-    const lx::rect2i buffer_damage = damage.any ? damage.buffer : whole;
+    commit.damage = damage.any ? damage.surface.bounds()
+                               : lx::rect2i{0, 0, geo.size.width, geo.size.height};
+    if (damage.any && damage.surface.count > 1)
+        commit.damage_rects = damage.surface;
+    client_damage buffer_damage = damage.buffer;
+    if (!damage.any) {
+        buffer_damage.clear();
+        buffer_damage.add(whole);
+    }
 
     s->current_buffer_id = buf->id;
     s->current_texture = s->ctx->surfaces->texture_for(buf->id);
@@ -1224,14 +1216,17 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
     unsigned shm_direct = 0;
     unsigned shm_stride = 0;
     lx::rect2i shm_region{};
+    client_damage shm_rects{};
     if (buf->is_shm && img.image_id) {
         // Buffer age: only what changed since this buffer's texture was last written (plus
         // what its other GL name missed) is copied and uploaded — in buffer pixels, so a
         // scaled, transformed or cropped client keeps partial uploads too.
-        s->damage_history.record(buffer_damage);
-        if (s->ctx->shm_pool)
-            shm_region = shm_upload_region(s->damage_history, buf->upload, s->id, buf->width,
-                                           buf->height);
+        s->damage_history.record_rects(buffer_damage);
+        if (s->ctx->shm_pool) {
+            shm_rects = shm_upload_damage(s->damage_history, buf->upload, s->id, buf->width,
+                                          buf->height);
+            shm_region = shm_rects.bounds();
+        }
         // Read straight from the client's buffer by the render thread when the backend can
         // take its rows as they are; staged (a copy here) otherwise, or when the table is
         // full.
@@ -1239,8 +1234,11 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
                                        shm_stride);
         if (!shm_direct)
             shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_region, shm_seq,
-                                          shm_token, shm_pool_token);
+                                          shm_token, shm_pool_token, &s->damage_history, s->id);
         if (!shm_pixels) {
+            // Nothing reached the texture, so the next upload of this buffer cannot assume
+            // this one did (the store's slots carry their own stamps; the GL path counts).
+            buf->upload = {};
             // The one silent path to a black screen: without staged pixels no texture
             // update is queued, so the texture is never registered, and the draw that
             // references it is skipped every frame with nothing explaining why. Staging
@@ -1302,6 +1300,9 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
                                  (static_cast<unsigned>(shm_region.width) != buf->width ||
                                   static_cast<unsigned>(shm_region.height) != buf->height);
             update.region = partial ? shm_region : lx::rect2i{};
+            // Several rects in the region: the upload copies only them.
+            if (partial && shm_rects.count > 1)
+                update.rects = shm_rects;
             update.stride = (partial ? static_cast<unsigned>(shm_region.width) : buf->width) * 4u;
             if (shm_direct) {
                 update.shm_direct = shm_direct;
@@ -1375,10 +1376,10 @@ void apply_core(surface_obj* s) {
     s->current.transform = c.transform;
     s->current.viewport = c.viewport;
     // Damage is per update: it describes this change and nothing after it.
-    const bool had_surface_damage = c.has_damage_surface;
-    const lx::rect2i surface_dmg = c.damage_surface;
-    const bool had_buffer_damage = c.has_damage_buffer;
-    const lx::rect2i buffer_dmg = c.damage_buffer;
+    const client_damage surface_dmg = c.damage_surface;
+    const client_damage buffer_dmg = c.damage_buffer;
+    const bool had_surface_damage = !surface_dmg.empty();
+    const bool had_buffer_damage = !buffer_dmg.empty();
     while (c.frame_cbs.head)
         if (wl_resource* cb = cb_list_pop(c.frame_cbs))
             queue_frame_callback(cb, s->id);
@@ -1492,15 +1493,15 @@ void apply_core(surface_obj* s) {
     // the scene repaints surface-local damage, the upload copies buffer damage.
     update_damage damage{};
     damage.any = had_surface_damage || had_buffer_damage;
-    if (had_surface_damage) {
-        damage.surface = lx::compositor::clip_to(surface_dmg, geo.size.width, geo.size.height);
-        damage.buffer = lx::compositor::surface_to_buffer_damage(surface_dmg, gin);
+    for (unsigned i = 0; i < surface_dmg.count; ++i) {
+        const lx::rect2i& r = surface_dmg.rects[i];
+        damage.surface.add(lx::compositor::clip_to(r, geo.size.width, geo.size.height));
+        damage.buffer.add(lx::compositor::surface_to_buffer_damage(r, gin));
     }
-    if (had_buffer_damage) {
-        damage.surface = lx::compositor::union_rect(
-            damage.surface, lx::compositor::buffer_to_surface_damage(buffer_dmg, gin));
-        damage.buffer = lx::compositor::union_rect(
-            damage.buffer, lx::compositor::clip_to(buffer_dmg, gin.buffer_w, gin.buffer_h));
+    for (unsigned i = 0; i < buffer_dmg.count; ++i) {
+        const lx::rect2i& r = buffer_dmg.rects[i];
+        damage.surface.add(lx::compositor::buffer_to_surface_damage(r, gin));
+        damage.buffer.add(lx::compositor::clip_to(r, gin.buffer_w, gin.buffer_h));
     }
 
     // A role-less surface may still become the cursor: wl_pointer.set_cursor may name it
@@ -2333,8 +2334,7 @@ void surface_set_buffer_scale(struct wl_client*, struct wl_resource* resource, i
 void surface_damage_buffer(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y,
                            int32_t width, int32_t height) {
     if (auto* s = surface_from(resource))
-        accumulate_damage(s->pending.damage_buffer, s->pending.has_damage_buffer, x, y, width,
-                          height);
+        accumulate_damage(s->pending.damage_buffer, x, y, width, height);
 }
 
 void surface_offset(struct wl_client*, struct wl_resource* resource, int32_t x, int32_t y) {

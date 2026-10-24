@@ -38,6 +38,10 @@ public:
         return true;
     }
     [[nodiscard]] const T& front() const { return slots_[front_]; }
+    /// Either side. A value is published that the consumer has not taken yet.
+    [[nodiscard]] bool fresh() const {
+        return (middle_.load(std::memory_order_acquire) & k_fresh) != 0;
+    }
     /// Either side, before the other thread runs (one-time sizing).
     [[nodiscard]] T& slot(unsigned i) { return slots_[i]; }
 
