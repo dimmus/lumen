@@ -96,8 +96,8 @@ lumen_compile_shaders(lx.gfx
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.frag"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.vert"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.frag")
-lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.gfx)
-lumen_link_platform_modules(lx.text)
+lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.foundation)
+lumen_link_platform_parts(lx.text text)
 lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.runtime)
 lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
@@ -114,7 +114,7 @@ lumen_add_module_library(lx.compositor modules/lx.compositor
 # zlm_shell_v1, wlr-layer-shell and cursor-shape client glue comes from lumen-protocol-glue.
 lumen_add_module_library(lx.shell modules/lx.shell
     DEPENDS lx.shell.policy lx.text lx.trace lx.config)
-lumen_link_platform_modules(lx.shell)
+lumen_link_platform_parts(lx.shell wayland_client xkb text systemd)
 if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
     target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
     target_compile_definitions(lx.shell PRIVATE LUMEN_SHELL_WAYLAND=1)
@@ -127,9 +127,11 @@ if(LIBPNG_FOUND)
     target_link_libraries(lx.shell PUBLIC ${LIBPNG_LINK_LIBRARIES})
 endif()
 if(LIBRSVG_FOUND)
+    # Headers only: librsvg (and the GLib/cairo stack under it) is dlopen'd on the first SVG
+    # (lx.shell:svg), not linked.
     target_compile_definitions(lx.shell PRIVATE LUMEN_HAS_RSVG=1)
     target_include_directories(lx.shell PRIVATE ${LIBRSVG_INCLUDE_DIRS})
-    target_link_libraries(lx.shell PUBLIC ${LIBRSVG_LINK_LIBRARIES})
+    target_link_libraries(lx.shell PUBLIC ${CMAKE_DL_LIBS})
 endif()
 if(LIBTURBOJPEG_FOUND)
     target_compile_definitions(lx.shell PRIVATE LUMEN_HAS_JPEG=1)
@@ -170,7 +172,7 @@ add_executable(lumen-shell executables/lumen-shell/main.cpp)
 target_link_libraries(lumen-shell PRIVATE lx.shell)
 lumen_apply_module_properties(lumen-shell)
 lumen_check_executable_layers(lumen-shell lx.shell)
-lumen_link_platform(lumen-shell)
+lumen_link_platform_parts(lumen-shell wayland_client xkb text systemd)
 
 # lumen-ctl: the running session's control tool, a Varlink client of the compositor's
 # control socket (design-session-and-wm S.8). Plain C++ on libsystemd (sd-varlink, sd-json,
@@ -864,7 +866,7 @@ if(LUMEN_BUILD_TESTS)
 
     # lumen-shell's launcher: desktop entries, the catalog, launching, the launcher layout.
     foreach(shell_test test_desktop_entry test_app_catalog test_app_launch test_launcher_layout
-                       test_background test_switcher test_notifications test_tray)
+                       test_background test_switcher test_notifications test_tray test_icon_theme)
         add_executable(${shell_test} tests/${shell_test}.cpp)
         target_link_libraries(${shell_test} PRIVATE lx.shell)
         lumen_apply_module_properties(${shell_test})

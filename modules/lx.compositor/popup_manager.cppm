@@ -232,7 +232,8 @@ private:
     const layer_shell* layers_ = nullptr;
     popup_ops ops_{};
     popup_host host_{};
-    popup_record records_[k_max]{};
+    /// Allocated 16 records at a time (`lx::sparse_slots`).
+    lx::sparse_slots<popup_record, k_max> records_{};
     id_slot_index<k_max * 2> index_{};
     /// Mapped popups' slots, bottom→top (the popup layer's order).
     std::inplace_vector<unsigned, k_max> order_{};

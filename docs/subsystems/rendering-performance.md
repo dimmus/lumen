@@ -200,9 +200,21 @@ Two strategies, because the consumers differ:
 
 | Consumer | Staging | Lifetime |
 |----------|---------|----------|
-| Vulkan upload (copies pixels out during drain) | `shm_staging_ring` — one FIFO for all surfaces | Slot free once the upload is recorded |
+| Vulkan upload (copies pixels out during drain) | `shm_upload_pool` — a block per in-flight update, the whole image | Block returned once the upload is recorded |
 | GL upload, driver takes BGRA at any stride (`GL_EXT_texture_format_BGRA8888` + `GL_EXT_unpack_subimage`) | None: `shm_direct_uploads` — the render thread uploads the damaged region straight from the client's buffer | The `wl_buffer` is held, with an external `wl_shm_pool` reference, until the upload; released from `tick_ui` after it |
 | GL upload, otherwise (and compositor images) | `shm_upload_pool` — a block per in-flight update, sized by the damaged region | Block returned right after `glTexSubImage2D`; blocks idle 1 s are unmapped |
+
+`shm_upload_pool` caps what is staged and not yet uploaded at 64 MiB
+(`k_max_in_flight_bytes`). Past that, a commit gets no block, and its update is dropped the
+way a full ring dropped it: the buffer is released and the texture keeps its previous
+content until the next commit. The cap only bounds a render thread that has stopped
+draining. Without it the pool would grow with every commit. The first block is always
+granted, so one update larger than the cap still goes through.
+
+Vulkan used a shared `shm_staging_ring` until the pool took its place. The ring's slots
+grew to the largest buffer they had carried and were never returned, so 57 MB stayed
+resident after a 1080p client disconnected (anon memory 97.9 MB, against 43–44 MB with the
+pool). With the pool the blocks are unmapped once idle.
 | CPU composite (samples staged rows in place) | `shm_pixel_store` — two slots per texture | Slot held until a later commit supersedes it; a retired texture's storage is freed once neither slot is in flight |
 
 **GL uploads from client memory.** Staging copied every damaged pixel on the UI thread

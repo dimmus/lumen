@@ -57,6 +57,7 @@ import std;
 export import :task_model;
 export import :bridge;
 export import :shm_canvas;
+export import :svg;
 export import :icon_theme;
 export import :visual_bell;
 export import :panel;

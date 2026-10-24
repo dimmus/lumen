@@ -47,8 +47,8 @@ export namespace lx::shell {
 //
 // A service needs ExitType=cgroup (systemd 250): without it the unit ends — and its
 // cgroup is killed — when the first process exits, which an app that forks and exits does.
-// Against an older manager (Manager.Version, read once when the bus is opened) each launch
-// is instead the double fork below, held before execve until the process has been moved
+// Against an older manager — its Manager.Version, read without waiting when the bus is
+// opened, or a start refused with PropertyReadOnly — each launch is instead the double fork below, held before execve until the process has been moved
 // into its own transient scope, app-lumen-<escaped id>-<random>.scope (as KIO does below
 // 250, and GNOME Shell always — but without their window in which the app runs, and can
 // fork, outside its scope; the hold ends after at most `k_scope_hold_us` regardless).
@@ -287,6 +287,7 @@ private:
     void* shared_bus_ = nullptr;
     void* match_slot_ = nullptr; // sd_bus_slot*
     void* sub_slot_ = nullptr;
+    void* version_slot_ = nullptr;
     bool no_systemd_ = false;
     bool told_fallback_ = false;
     systemd_launch_mode mode_ = systemd_launch_mode::service;
@@ -1098,6 +1099,32 @@ struct lx::shell::app_launcher::events {
         return 0;
     }
 
+    /// Manager.Version, asked for when the bus was opened: launches already started as
+    /// services meanwhile fall back on their own if the manager is older (PropertyReadOnly).
+    static int version_read(sd_bus_message* m, void* user, sd_bus_error*) {
+        auto* l = static_cast<app_launcher*>(user);
+        l->version_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(l->version_slot_));
+        const char* version = nullptr;
+        const sd_bus_error* err = sd_bus_message_get_error(m);
+        if (err) {
+            if (err->name && classify_start_error(err->name) == start_error_class::no_systemd)
+                l->systemd_gone(err->name);
+        } else if (sd_bus_message_read(m, "v", "s", &version) < 0) {
+            version = nullptr;
+        }
+        if (version && l->mode_ == systemd_launch_mode::service)
+            l->mode_ = launch_mode_for_version(version);
+        if (!l->no_systemd_)
+            launch_log(l->mode_ == systemd_launch_mode::service ? lx::trace::level::debug
+                                                                : lx::trace::level::info,
+                       "apps: systemd --user {}: {}",
+                       version ? version : (err && err->name ? err->name : "version unknown"),
+                       l->mode_ == systemd_launch_mode::service
+                           ? "one transient service per launch"
+                           : "one transient scope per launch (no ExitType=cgroup before 250)");
+        return 0;
+    }
+
     static int subscribed(sd_bus_message* m, void*, sd_bus_error*) {
         if (sd_bus_message_is_method_error(m, nullptr)) {
             const sd_bus_error* err = sd_bus_message_get_error(m);
@@ -1122,44 +1149,16 @@ bool lx::shell::app_launcher::open_bus() {
             return false;
         }
     }
-    // Manager.Version decides service or scope (ExitType=cgroup is 250's). Once, blocking
-    // for at most a second, at the first launch — as KIO does; a local round trip.
-    sd_bus_error err = SD_BUS_ERROR_NULL;
-    sd_bus_message* call = nullptr;
-    sd_bus_message* reply = nullptr;
-    r = sd_bus_message_new_method_call(bus, &call, "org.freedesktop.systemd1",
-                                       "/org/freedesktop/systemd1",
-                                       "org.freedesktop.DBus.Properties", "Get");
-    if (r >= 0)
-        r = sd_bus_message_append(call, "ss", "org.freedesktop.systemd1.Manager", "Version");
-    if (r >= 0)
-        r = sd_bus_call(bus, call, 1'000'000, &err, &reply);
-    sd_bus_message_unref(call);
-    const char* version = nullptr;
-    if (r >= 0 && sd_bus_message_read(reply, "v", "s", &version) < 0)
-        version = nullptr;
-    if (r < 0 && err.name &&
-        classify_start_error(err.name) == start_error_class::no_systemd) {
-        systemd_gone(err.name);
-        sd_bus_error_free(&err);
-        if (shared_bus_)
-            sd_bus_unref(bus);
-        else
-            sd_bus_flush_close_unref(bus);
-        return false;
-    }
-    mode_ = version ? launch_mode_for_version(version) : systemd_launch_mode::scope;
-    {
-        launch_log(mode_ == systemd_launch_mode::service ? lx::trace::level::debug
-                                                         : lx::trace::level::info,
-                   "apps: systemd --user {}: {}",
-                   version ? version : (err.name ? err.name : "version unknown"),
-                   mode_ == systemd_launch_mode::service
-                       ? "one transient service per launch"
-                       : "one transient scope per launch (no ExitType=cgroup before 250)");
-    }
-    sd_bus_message_unref(reply);
-    sd_bus_error_free(&err);
+    // Manager.Version decides service or scope (ExitType=cgroup is 250's), asked for without
+    // waiting: until it answers launches are services, and a manager too old for one refuses
+    // the start with PropertyReadOnly, which retries it as a scope (`events::started`).
+    // No systemd --user at all shows the same way, as the first start's error.
+    sd_bus_slot* version = nullptr;
+    if (sd_bus_call_method_async(bus, &version, "org.freedesktop.systemd1",
+                                 "/org/freedesktop/systemd1", "org.freedesktop.DBus.Properties",
+                                 "Get", events::version_read, this, "ss",
+                                 "org.freedesktop.systemd1.Manager", "Version") >= 0)
+        version_slot_ = version;
     bus_ = bus;
     sd_bus_slot* match = nullptr;
     if (sd_bus_match_signal_async(bus, &match, "org.freedesktop.systemd1",
@@ -1340,6 +1339,8 @@ lx::shell::app_launcher::~app_launcher() {
         sd_bus_slot_unref(static_cast<sd_bus_slot*>(match_slot_));
     if (sub_slot_)
         sd_bus_slot_unref(static_cast<sd_bus_slot*>(sub_slot_));
+    if (version_slot_)
+        sd_bus_slot_unref(static_cast<sd_bus_slot*>(version_slot_));
     if (bus_ && shared_bus_)
         sd_bus_unref(static_cast<sd_bus*>(bus_));
     else if (bus_)
@@ -1357,6 +1358,7 @@ void lx::shell::app_launcher::bus_lost() {
             u.slot = sd_bus_slot_unref(static_cast<sd_bus_slot*>(u.slot));
     match_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(match_slot_));
     sub_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(sub_slot_));
+    version_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(version_slot_));
     if (shared_bus_)
         sd_bus_unref(static_cast<sd_bus*>(bus_));
     else

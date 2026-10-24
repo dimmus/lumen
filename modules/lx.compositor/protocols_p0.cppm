@@ -99,9 +99,6 @@ struct texture_update {
     unsigned dmabuf_stride = 0;
     unsigned long long dmabuf_modifier = 0;
     const unsigned char* pixels = nullptr;
-    /// Staging-ring sequence backing `pixels`; the render thread publishes it as consumed.
-    /// Set only when `pixels` came from `shm_staging_ring`.
-    unsigned long long shm_seq = 0;
     /// `shm_pixel_store` slot backing `pixels`, released once the composite has read it.
     /// Set only when `pixels` came from `shm_pixel_store`.
     unsigned long long shm_token = 0;
@@ -131,30 +128,6 @@ struct texture_update {
 
 using texture_update_queue = lx::sync::spsc_queue<texture_update, 256>;
 
-/// Staging for converted SHM pixels, owned by the compositor rather than by the client's
-/// wl_buffer.
-///
-/// Tying this storage to the buffer would be a use-after-free: the client can destroy a
-/// buffer (or disconnect) while a `texture_update` referencing it is still queued, and
-/// FIFO ordering does not keep freed memory alive. Slots are recycled only once the render
-/// thread reports them consumed, so a queued pointer always addresses live memory.
-class shm_staging_ring {
-public:
-    static constexpr unsigned k_slots = 8;
-
-    /// UI affinity. Returns writable storage for `bytes`, or nullptr when every slot is
-    /// still in flight (the caller should skip the update rather than overwrite one).
-    [[nodiscard]] unsigned char* acquire(unsigned bytes, unsigned long long& seq_out);
-
-    /// Render affinity. Marks everything up to and including `seq` reusable.
-    void publish_consumed(unsigned long long seq);
-
-private:
-    std::vector<unsigned char> slots_[k_slots]{};
-    unsigned long long produced_ = 0;
-    std::atomic<unsigned long long> consumed_{0};
-};
-
 /// Transient staging for the GL upload path.
 ///
 /// GL copies staged pixels into a texture during the drain and never reads them again, so
@@ -173,6 +146,11 @@ public:
     /// Size classes are powers of two from 64 KiB.
     static constexpr unsigned k_min_shift = 16;
     static constexpr unsigned k_max_blocks = 64;
+    /// Bytes staged and not yet uploaded, beyond which `acquire` declines (one update is
+    /// always allowed). Seven 1080p frames: a backend that falls behind (software Vulkan
+    /// takes ~165 ms a frame) makes the client wait instead of the pool mapping a block for
+    /// every frame the client gets ahead.
+    static constexpr unsigned long long k_max_in_flight_bytes = 64ull << 20;
 
     shm_upload_pool() = default;
     shm_upload_pool(const shm_upload_pool&) = delete;
@@ -199,11 +177,14 @@ private:
         unsigned char* data = nullptr; // UI-owned
         unsigned long long size = 0;   // UI-owned
         unsigned long long last_used_ns = 0;
+        unsigned long long staged = 0; // bytes of the update in it; UI-owned
         std::atomic<bool> in_flight{false}; // set by UI on acquire, cleared by render
     };
     void unmap(block& b);
     block blocks_[k_max_blocks]{};
     unsigned long long mapped_bytes_ = 0;
+    /// Sum of `staged` over blocks in flight: added by UI, taken back by render.
+    std::atomic<unsigned long long> in_flight_bytes_{0};
 };
 
 /// GL path: client shm buffers uploaded by the render thread straight from the client's
@@ -441,11 +422,10 @@ struct shm_pixel_store_stamp {
 
 /// Per-texture staging for shm pixels, used by the CPU composite path.
 ///
-/// `shm_staging_ring` is a single FIFO shared by every surface, which is right when the
-/// consumer copies the pixels out during the drain (the Vulkan upload does). The CPU
-/// compositor instead *samples the staged rows in place* during the composite, so a slot
-/// stays live well past the drain and a shared FIFO would let another surface's commits
-/// recycle it underneath — the texture would silently start showing someone else's pixels.
+/// `shm_upload_pool` hands out a block per update, which is right when the consumer copies
+/// the pixels out during the drain (the GL and Vulkan uploads do). The CPU compositor
+/// instead *samples the staged rows in place* during the composite, so its staging has to
+/// stay live well past the drain, as the texture itself.
 ///
 /// Two slots per texture: the UI thread stages the next commit into one while the render
 /// thread still reads the other. A client that runs more than one commit ahead of the
@@ -547,12 +527,14 @@ struct p0_protocol_context {
     gfx::dmabuf_importer* dmabuf = nullptr;
     texture_update_queue* textures = nullptr;
     buffer_lifecycle_tracker* lifecycle = nullptr;
-    shm_staging_ring* shm_staging = nullptr;
-    /// Set instead of `shm_staging` when the CPU or GL composite path is active.
+    /// CPU path: per-texture staging the composite samples in place.
     shm_pixel_store* shm_store = nullptr;
-    /// GL path: transient per-update staging. Exactly one of shm_store / shm_pool /
-    /// shm_staging is set.
+    /// GL and Vulkan paths: transient per-update staging. Exactly one of shm_store /
+    /// shm_pool is set.
     shm_upload_pool* shm_pool = nullptr;
+    /// The backend uploads part of an image (GL): staging carries the buffer-age region.
+    /// Otherwise (Vulkan) every staged update is the whole image.
+    bool shm_regions = false;
     /// GL path with client-memory uploads (`gl_compositor::supports_client_upload`): shm
     /// commits skip staging and are uploaded from the client's buffer. Requires shm_pool.
     shm_direct_uploads* shm_direct = nullptr;
@@ -906,26 +888,6 @@ void workspaces_changed(p0_protocol_context& ctx);
 } // namespace lx::compositor
 
 
-unsigned char* lx::compositor::shm_staging_ring::acquire(unsigned bytes,
-                                                        unsigned long long& seq_out) {
-    if (bytes == 0)
-        return nullptr;
-    if (produced_ - consumed_.load(std::memory_order_acquire) >= k_slots)
-        return nullptr;
-
-    // The slot is provably not in flight, so growing it cannot invalidate a pointer the
-    // render thread still holds. Never shrink: steady state stops allocating.
-    auto& slot = slots_[produced_ % k_slots];
-    if (slot.size() < bytes)
-        slot.resize(bytes);
-    seq_out = produced_++;
-    return slot.data();
-}
-
-void lx::compositor::shm_staging_ring::publish_consumed(unsigned long long seq) {
-    consumed_.store(seq + 1, std::memory_order_release);
-}
-
 unsigned char* lx::compositor::shm_pixel_store::acquire(unsigned texture_id, unsigned bytes,
                                                         unsigned long long& token_out,
                                                         stamp next, stamp* previous) {
@@ -1093,6 +1055,9 @@ unsigned char* lx::compositor::shm_upload_pool::acquire(unsigned bytes,
     token_out = 0;
     if (bytes == 0)
         return nullptr;
+    const unsigned long long staged = in_flight_bytes_.load(std::memory_order_acquire);
+    if (staged != 0 && staged + bytes > k_max_in_flight_bytes)
+        return nullptr; // the backend is behind: this update is dropped, the buffer still released
     unsigned long long size = 1ull << k_min_shift;
     while (size < bytes)
         size <<= 1;
@@ -1129,6 +1094,8 @@ unsigned char* lx::compositor::shm_upload_pool::acquire(unsigned bytes,
         best = empty;
     }
     best->last_used_ns = now_ns;
+    best->staged = bytes;
+    in_flight_bytes_.fetch_add(bytes, std::memory_order_acq_rel);
     best->in_flight.store(true, std::memory_order_release);
     token_out = static_cast<unsigned long long>(best - blocks_) + 1;
     return best->data;
@@ -1137,7 +1104,12 @@ unsigned char* lx::compositor::shm_upload_pool::acquire(unsigned bytes,
 void lx::compositor::shm_upload_pool::release(unsigned long long token) {
     if (token == 0 || token > k_max_blocks)
         return;
-    blocks_[token - 1].in_flight.store(false, std::memory_order_release);
+    block& b = blocks_[token - 1];
+    // `staged` was written before the acquire's release store this load pairs with.
+    if (b.in_flight.load(std::memory_order_acquire)) {
+        in_flight_bytes_.fetch_sub(b.staged, std::memory_order_acq_rel);
+        b.in_flight.store(false, std::memory_order_release);
+    }
 }
 
 void lx::compositor::shm_upload_pool::collect(unsigned long long now_ns,

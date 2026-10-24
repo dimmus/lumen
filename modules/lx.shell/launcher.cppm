@@ -16,7 +16,7 @@ module;
 #pragma clang diagnostic pop
 #endif
 
-#if defined(LUMEN_HAS_INPUT)
+#if defined(LUMEN_HAS_XKBCOMMON)
 #include <sys/mman.h>
 #include <unistd.h>
 #include <xkbcommon/xkbcommon.h>
@@ -171,7 +171,7 @@ struct key_press {
 };
 
 /// The shell's wl_keyboard state: the compositor's keymap and modifier state. Without
-/// LUMEN_HAS_INPUT every key is ignored (the launcher is then pointer-only).
+/// LUMEN_HAS_XKBCOMMON every key is ignored (the launcher is then pointer-only).
 class xkb_keyboard {
 public:
     xkb_keyboard() = default;
@@ -572,7 +572,7 @@ lx::shell::launcher_key_result lx::shell::launcher_model::key(unsigned sym, cons
 
 // ── Keyboard ─────────────────────────────────────────────────────────────────
 
-#if defined(LUMEN_HAS_INPUT)
+#if defined(LUMEN_HAS_XKBCOMMON)
 
 bool lx::shell::xkb_keyboard::set_keymap(int fd, std::uint32_t size) {
     void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -742,19 +742,23 @@ void lx::shell::launcher::paint_row(int bi, const launcher_layout& l, unsigned i
     const int inner_x = cell.x + 8;
     const int inner_w = cell.width - 16;
     int name_w = inner_w;
+    int gw = 0;
     if (!e->generic_name.empty() && e->generic_name != e->name) {
-        const int gw = canvas_.text_width(e->generic_name.data(), k_lfont);
+        gw = canvas_.text_width(e->generic_name.data(), k_lfont);
         const int nw = canvas_.text_width(e->name.data(), k_lfont);
         // GenericName right-aligned and dimmed, only when both fit whole.
-        if (gw > 0 && nw > 0 && nw + 24 + gw <= inner_w) {
-            (void)canvas_.text(bi, {inner_x + inner_w - gw, cell.y, gw, cell.height},
-                               e->generic_name.data(), sel ? k_ltext_dim_selected : k_ltext_dim,
-                               k_lfont, shm_canvas::align::right);
+        if (gw > 0 && nw > 0 && nw + 24 + gw <= inner_w)
             name_w = inner_w - gw - 24;
-        }
+        else
+            gw = 0;
     }
+    // The name first: it is what the canvas shaped last.
     (void)canvas_.text(bi, {inner_x, cell.y, name_w, cell.height}, e->name.data(),
                        sel ? k_ltext_selected : k_ltext, k_lfont);
+    if (gw > 0)
+        (void)canvas_.text(bi, {inner_x + inner_w - gw, cell.y, gw, cell.height},
+                           e->generic_name.data(), sel ? k_ltext_dim_selected : k_ltext_dim,
+                           k_lfont, shm_canvas::align::right);
 }
 
 void lx::shell::launcher::paint_status(int bi, const launcher_layout& l) {

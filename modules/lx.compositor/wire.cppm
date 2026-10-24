@@ -587,8 +587,7 @@ void bind_shm_direct(p0_protocol_context& ctx);
 /// `history`/`surface`: the committing surface's damage, with which the CPU path's
 /// per-texture store rewrites only what changed in the slot it reuses.
 const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsigned texture_id,
-                                      lx::rect2i region, unsigned long long& seq_out,
-                                      unsigned long long& token_out,
+                                      lx::rect2i region, unsigned long long& token_out,
                                       unsigned long long& pool_token_out,
                                       const surface_damage_history* history = nullptr,
                                       lx::surface_id surface = {});

@@ -4,6 +4,84 @@ import std;
 
 export namespace lx {
 
+/// A fixed-capacity table whose storage is allocated `Block` slots at a time, the first time
+/// a slot of the block is written. Fixed arrays of a few hundred records sized for the worst
+/// case were resident from start-up, because constructing the owner writes every slot (the
+/// records have non-zero defaults): a desktop with a few windows paid for 256. Here an
+/// untouched block reads as default records and costs a pointer.
+///
+/// - `operator[]` (non-const) allocates the slot's block; `operator[] const` does not and
+///   reads a default `T` for a block never touched.
+/// - Iteration visits the allocated blocks only. Every slot of an untouched block is a
+///   default `T`, which a table's loops skip as unused anyway; a search for a free slot
+///   must index (`operator[]`), or it would never reach an untouched block.
+/// - Blocks are kept once allocated (a high-water mark, like the array's pages were).
+///
+/// Single-threaded, like the tables it holds.
+template <class T, unsigned N, unsigned Block = 16>
+class sparse_slots {
+    static_assert(N % Block == 0, "whole blocks");
+    using block_type = std::array<T, Block>;
+
+public:
+    static constexpr unsigned k_blocks = N / Block;
+
+    [[nodiscard]] T& operator[](unsigned i) { return block(i / Block)[i % Block]; }
+    [[nodiscard]] const T& operator[](unsigned i) const {
+        const auto& b = blocks_[i / Block];
+        return b ? (*b)[i % Block] : empty();
+    }
+    [[nodiscard]] static constexpr unsigned size() { return N; }
+
+    template <bool Const>
+    class basic_iterator {
+    public:
+        using owner = std::conditional_t<Const, const sparse_slots, sparse_slots>;
+        using reference = std::conditional_t<Const, const T&, T&>;
+        basic_iterator(owner* o, unsigned i) : o_{o}, i_{i} { skip(); }
+        reference operator*() const { return (*o_->blocks_[i_ / Block])[i_ % Block]; }
+        basic_iterator& operator++() {
+            ++i_;
+            skip();
+            return *this;
+        }
+        bool operator==(const basic_iterator& other) const { return i_ == other.i_; }
+
+    private:
+        void skip() {
+            while (i_ < N && !o_->blocks_[i_ / Block])
+                i_ = (i_ / Block + 1) * Block;
+        }
+        owner* o_;
+        unsigned i_;
+    };
+    [[nodiscard]] basic_iterator<false> begin() { return {this, 0}; }
+    [[nodiscard]] basic_iterator<false> end() { return {this, N}; }
+    [[nodiscard]] basic_iterator<true> begin() const { return {this, 0}; }
+    [[nodiscard]] basic_iterator<true> end() const { return {this, N}; }
+
+    /// Blocks allocated (diagnostics, tests).
+    [[nodiscard]] unsigned blocks_allocated() const {
+        unsigned n = 0;
+        for (const auto& b : blocks_)
+            n += b ? 1u : 0u;
+        return n;
+    }
+
+private:
+    block_type& block(unsigned b) {
+        auto& p = blocks_[b];
+        if (!p)
+            p = std::make_unique<block_type>();
+        return *p;
+    }
+    static const T& empty() {
+        static const T e{};
+        return e;
+    }
+    std::unique_ptr<block_type> blocks_[k_blocks]{};
+};
+
 struct point2i {
     int x = 0;
     int y = 0;

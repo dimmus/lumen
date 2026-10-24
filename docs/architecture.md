@@ -141,10 +141,13 @@ Runs **three logical threads** (see [threading.md](subsystems/threading.md)):
 **Binary:** `lumen-shell`  
 **Modules:** `lx.shell` (`:bridge`, `:task_model`, `:panel`, `:shm_canvas`, `:launcher`,
 `:desktop_entry`, `:app_catalog`, `:app_launch`, `:background`, `:workspaces`, `:switcher`,
-`:user_bus`, `:notifications`, `:notify_view`, `:menu_popup`, `:tray`),
-`lx.shell.policy`, `lx.text`;
+`:user_bus`, `:notifications`, `:notify_view`, `:menu_popup`, `:tray`, `:icon_theme`,
+`:svg`), `lx.shell.policy`, `lx.text`;
 libwayland-client directly (`lx.wayland.client` is still a stub), xkbcommon for the
-launcher's keyboard, sd-bus for the user bus (launching, notifications, the tray)
+launcher's keyboard, sd-bus for the user bus (launching, notifications, the tray), librsvg
+by `dlopen` on the first SVG not in the icon cache. It links only the platform parts it
+uses (`lumen_link_platform_parts`), not the compositor's DRM, GBM, EGL, Vulkan and input
+stack. That is 25 shared objects mapped instead of 69, and about 15 MB RSS instead of 24.
 
 Acts as a **privileged Wayland client**:
 

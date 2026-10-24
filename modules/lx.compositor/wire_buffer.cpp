@@ -141,11 +141,6 @@ lx::fourcc staged_shm_format(wl_shm_buffer* shm) {
     return static_cast<lx::fourcc>(lx::pixel_format::rgba8888);
 }
 
-/// Copies the client's shm pixels into compositor-owned staging. Must run on every commit:
-/// a client is free to redraw into the same wl_buffer.
-///
-/// Which staging is used depends on how the render thread consumes it — see
-/// `shm_pixel_store`. Exactly one of `seq_out` / `token_out` is set.
 namespace {
 /// Copies rect `r` of the client's buffer (`data` at `stride`) to `dst` (where the rect's
 /// first pixel goes, rows `dst_stride` apart), converting to the staged channel order.
@@ -188,15 +183,14 @@ void copy_shm_rect(const unsigned char* data, unsigned stride, uint32_t fmt, boo
 /// a client is free to redraw into the same wl_buffer.
 ///
 /// Which staging is used depends on how the render thread consumes it — see
-/// `shm_pixel_store`. Exactly one of `seq_out` / `token_out` is set.
+/// `shm_pixel_store` and `shm_upload_pool`. Exactly one of `token_out` / `pool_token_out` is
+/// set.
 const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsigned texture_id,
-                                      lx::rect2i region, unsigned long long& seq_out,
-                                      unsigned long long& token_out,
+                                      lx::rect2i region, unsigned long long& token_out,
                                       unsigned long long& pool_token_out,
                                       const surface_damage_history* history,
                                       lx::surface_id surface) {
     lx::trace::scoped_span span{"wayland", "shm.stage"};
-    seq_out = 0;
     token_out = 0;
     pool_token_out = 0;
     if (!buf || !shm || !g_p0_ctx)
@@ -238,9 +232,9 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
         return image;
     }
 
-    // The transient GL pool carries just the region, packed at its own width; the Vulkan
-    // upload takes whole images.
-    const bool whole = region.width <= 0 || region.height <= 0 || !g_p0_ctx->shm_pool ||
+    // The transient pool carries just the region, packed at its own width, where the
+    // backend uploads regions (GL); the Vulkan upload takes whole images.
+    const bool whole = region.width <= 0 || region.height <= 0 || !g_p0_ctx->shm_regions ||
                        (region.x == 0 && region.y == 0 &&
                         static_cast<unsigned>(region.width) == buf->width &&
                         static_cast<unsigned>(region.height) == buf->height);
@@ -251,8 +245,6 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
     unsigned char* out = nullptr;
     if (g_p0_ctx->shm_pool)
         out = g_p0_ctx->shm_pool->acquire(bytes, pool_token_out, g_p0_ctx->now_ns);
-    else if (g_p0_ctx->shm_staging)
-        out = g_p0_ctx->shm_staging->acquire(bytes, seq_out);
     if (!out)
         return nullptr;
     wl_shm_buffer_begin_access(shm);
@@ -431,7 +423,6 @@ bool stage_image(void* user, unsigned texture_id, const uint32_t* argb, unsigned
     if (!ctx || !ctx->textures || !argb || canvas_w == 0 || canvas_h == 0)
         return false;
     const unsigned bytes = canvas_w * canvas_h * 4u;
-    unsigned long long seq = 0;
     unsigned long long token = 0;
     unsigned long long pool_token = 0;
     unsigned char* out = nullptr;
@@ -439,8 +430,6 @@ bool stage_image(void* user, unsigned texture_id, const uint32_t* argb, unsigned
         out = ctx->shm_pool->acquire(bytes, pool_token, ctx->now_ns);
     else if (ctx->shm_store)
         out = ctx->shm_store->acquire(texture_id, bytes, token);
-    else if (ctx->shm_staging)
-        out = ctx->shm_staging->acquire(bytes, seq);
     if (!out)
         return false;
     const bool native = ctx->shm_native_format;
@@ -464,7 +453,6 @@ bool stage_image(void* user, unsigned texture_id, const uint32_t* argb, unsigned
     update.format = native ? static_cast<lx::fourcc>(lx::pixel_format::argb8888)
                            : static_cast<lx::fourcc>(lx::pixel_format::rgba8888);
     update.pixels = out;
-    update.shm_seq = seq;
     update.shm_token = token;
     update.shm_pool_token = pool_token;
     if (!ctx->textures->try_push(update)) {
