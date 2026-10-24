@@ -27,7 +27,8 @@ export import :vk_renderer;
 export import :cpu_renderer;
 export import :gl_renderer;
 export import :gl_capture;
-export import :glyph_atlas;
+export import :atlas;
+export import :ui_cpu;
 
 export namespace lx::gfx {
 

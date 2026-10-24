@@ -1,4 +1,4 @@
-// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phase 0.
+// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phases 0–1.
 //
 // The scenarios S1–S3 of §8.3 run against lx.ui's declarative core the way an application
 // uses it: descriptors reconciled onto retained nodes by `ui_root::tick`, nodes emitting
@@ -7,12 +7,15 @@
 // CLOCK_MONOTONIC read around the call; the lx.trace spans on the same stages feed Perfetto
 // and are not what the table is made of.
 //
-// Phase 0 has no primitive renderer, so the only backend is `none`: the stages through
-// `encode` (the sorted instances gathered into a ring — the bytes a backend uploads) are
-// measured and nothing is submitted. Phase 1 adds `cpu`, `gl` and `vulkan` behind the same
-// `--backend` flag; nothing is renamed.
+// Backends: `none` measures the stages through `encode` (the sorted instances gathered into
+// a ring — the bytes a backend uploads) and submits nothing; `cpu` then rasterises each
+// produced frame with the reference renderer (`gfx::ui_cpu_renderer`) into an XRGB8888
+// buffer of the scenario's size, inside the frame's damage — the ledger's rects, or the
+// whole view when the frame carries none (an animation tick, the first frame) — and times
+// that as the `raster` stage. `gl` and `vulkan` come with their Phase 1 stages, behind the
+// same flag; nothing is renamed.
 //
-//   lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none] [--frames N] [--warmup N]
+//   lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu] [--frames N] [--warmup N]
 //                  [--period-us US] [--json PATH] [--pin CPU|none] [--scale F] [--git SHA]
 //                  [--preset NAME]
 //
@@ -165,12 +168,13 @@ enum stage : unsigned {
     st_encode,            ///< gather the sorted instances into the ring
     st_emit_order_encode, ///< G3's sum
     st_frame,             ///< tick + order + encode: the UI thread's cost of a produced frame
+    st_raster,            ///< the backend drawing the frame (`cpu`: ui_cpu_renderer::draw)
     st_count,
 };
 
 constexpr const char* k_stage_names[st_count] = {
     "update", "tick_idle", "tick",   "describe",          "reconcile", "layout",
-    "emit",   "order",     "encode", "emit_order_encode", "frame",
+    "emit",   "order",     "encode", "emit_order_encode", "frame",     "raster",
 };
 
 struct summary {
@@ -781,6 +785,7 @@ struct counters {
     std::uint64_t damage_px = 0;
     double damage_fraction = 0.0;
     unsigned overflow_drops = 0;
+    std::uint64_t raster_px = 0; ///< pixels the backend shaded, max per frame
 };
 
 struct memory_stats {
@@ -882,6 +887,27 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
     for (auto& s : samples)
         s.reserve(opt.frames);
 
+    // The `cpu` backend's target: XRGB8888 at the view's size, written inside the damage.
+    const bool raster = std::strcmp(opt.backend, "cpu") == 0;
+    std::vector<std::uint32_t> target_px;
+    lx::gfx::pixel_surface target{};
+    if (raster) {
+        target_px.assign(static_cast<std::size_t>(spec.view.width) *
+                             static_cast<std::size_t>(spec.view.height),
+                         0u);
+        target.pixels = reinterpret_cast<unsigned char*>(target_px.data());
+        target.width = static_cast<unsigned>(spec.view.width);
+        target.height = static_cast<unsigned>(spec.view.height);
+        target.stride = target.width * 4u;
+        target.format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+    }
+    // Only built for `cpu`: `none` keeps the heap and mappings of Phase 0, so its baseline
+    // stays comparable.
+    std::optional<lx::gfx::ui_cpu_renderer> rasteriser{};
+    if (raster)
+        rasteriser.emplace();
+    const lx::color clear = k_background;
+
     const double view_px =
         static_cast<double>(spec.view.width) * static_cast<double>(spec.view.height);
     counters& cnt = out.cnt;
@@ -921,11 +947,16 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         const lx::ui::damage_ledger& ledger = lx::ui::ui_damage();
         const unsigned damage_rects = ledger.count();
         std::uint64_t damage_px = 0;
+        lx::gfx::damage_region damage{};
         for (unsigned i = 0; i < damage_rects; ++i) {
             const lx::rect2i r = ledger.rects()[i];
             if (r.width > 0 && r.height > 0)
                 damage_px += static_cast<std::uint64_t>(r.width) * static_cast<std::uint64_t>(r.height);
+            damage.add(r);
         }
+        // A frame with no rects (an animation tick, the first build) repaints the view.
+        if (damage.empty())
+            damage.set_full();
 
         const std::uint64_t t0 = now_ns();
         const bool produced = root.tick(draws);
@@ -947,6 +978,20 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
             lx::trace::timeline_counter("ui.batches", static_cast<long long>(draws.batches().size()));
         const std::uint64_t bytes = encode(draws, ring.data(), ring.size());
         const std::uint64_t t4 = now_ns();
+        std::uint64_t raster_px = 0;
+        if (raster) {
+            lx::gfx::ui_stream stream{};
+            stream.refs = draws.refs();
+            stream.batches = draws.batches();
+            stream.quads = draws.quad_instances();
+            stream.shadows = draws.shadow_instances();
+            stream.sprites = draws.sprite_instances();
+            stream.underlines = draws.underline_instances();
+            auto drawn = rasteriser->draw(target, stream, nullptr, damage, clear);
+            if (drawn)
+                raster_px = drawn->pixels_shaded;
+        }
+        const std::uint64_t t5 = now_ns();
 
         if (!built) {
             built = true;
@@ -975,6 +1020,10 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         samples[st_encode].push_back(t4 - t3);
         samples[st_emit_order_encode].push_back(st.emit + (t3 - t2) + (t4 - t3));
         samples[st_frame].push_back(t4 - t0);
+        if (raster)
+            samples[st_raster].push_back(t5 - t4);
+        if (raster_px > cnt.raster_px)
+            cnt.raster_px = raster_px;
         ++cnt.frames_produced;
 
         const unsigned primitives = draws.primitive_count();
@@ -1108,12 +1157,12 @@ void print_table(const scenario_result& r) {
     const counters& c = r.cnt;
     std::printf("  counters   frames_produced=%u frames_idle=%u frames_described=%u "
                 "primitives=%u (built %u) surfaces=%u refs=%u batches=%u instance_bytes=%llu "
-                "damage_rects=%u damage_px=%llu (%.2f%%) overflow_drops=%u\n",
+                "damage_rects=%u damage_px=%llu (%.2f%%) overflow_drops=%u raster_px=%llu\n",
                 c.frames_produced, c.frames_idle, c.frames_described, c.primitives,
                 c.primitives_built, c.surfaces, c.refs, c.batches,
                 static_cast<unsigned long long>(c.instance_bytes), c.damage_rects,
                 static_cast<unsigned long long>(c.damage_px), c.damage_fraction * 100.0,
-                c.overflow_drops);
+                c.overflow_drops, static_cast<unsigned long long>(c.raster_px));
     const memory_stats& m = r.mem;
     std::printf("  memory     allocations=%llu (%.3f/frame, %llu B)  mallinfo2.uordblks delta=%lld B  "
                 "RssAnon=%ld kB\n",
@@ -1158,7 +1207,9 @@ void write_json(const options& opt, const host_info& host, const scenario_result
         json_string(f, host.machine);
         std::fputs(", \"hostname\": ", f);
         json_string(f, host.nodename);
-        std::fputs("},\n    \"driver\": \"none\",\n    \"git\": ", f);
+        std::fputs("},\n    \"driver\": ", f);
+        json_string(f, opt.backend);
+        std::fputs(",\n    \"git\": ", f);
         json_string(f, opt.git);
         std::fputs(",\n    \"preset\": ", f);
         json_string(f, opt.preset);
@@ -1188,13 +1239,13 @@ void write_json(const options& opt, const host_info& host, const scenario_result
                      "\"primitives_built\": %u, \"primitives_total\": %llu, \"surfaces\": %u, "
                      "\"refs\": %u, \"batches\": %u, \"instance_bytes\": %llu, "
                      "\"damage_rects\": %u, \"damage_px\": %llu, \"damage_fraction\": %.5f, "
-                     "\"overflow_drops\": %u},\n",
+                     "\"overflow_drops\": %u, \"raster_px\": %llu},\n",
                      c.frames_produced, c.frames_idle, c.frames_described, c.nodes, c.primitives,
                      c.primitives_built, static_cast<unsigned long long>(c.primitives_total),
                      c.surfaces, c.refs, c.batches,
                      static_cast<unsigned long long>(c.instance_bytes), c.damage_rects,
                      static_cast<unsigned long long>(c.damage_px), c.damage_fraction,
-                     c.overflow_drops);
+                     c.overflow_drops, static_cast<unsigned long long>(c.raster_px));
         const memory_stats& m = r.mem;
         std::fprintf(f,
                      "    \"memory\": {\"allocations\": %llu, \"allocated_bytes\": %llu, "
@@ -1216,7 +1267,7 @@ void write_json(const options& opt, const host_info& host, const scenario_result
 // ── CLI ─────────────────────────────────────────────────────────────────────────
 
 void usage() {
-    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none] [--frames N]\n"
+    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu] [--frames N]\n"
                "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
                "                      [--scale F] [--git SHA] [--preset NAME]\n",
                stderr);
@@ -1249,9 +1300,9 @@ void usage() {
         } else if (std::strcmp(a, "--backend") == 0) {
             const char* s = take();
             if (!s) return false;
-            if (std::strcmp(s, "none") != 0) {
+            if (std::strcmp(s, "none") != 0 && std::strcmp(s, "cpu") != 0) {
                 std::fprintf(stderr,
-                             "lumen-ui-bench: backend %s is not available in Phase 0 (only none)\n", s);
+                             "lumen-ui-bench: backend %s is not available (none, cpu)\n", s);
                 return false;
             }
             opt.backend = s;

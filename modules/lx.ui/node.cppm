@@ -43,7 +43,9 @@ struct quad_style {
     lx::color background = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
     /// Second stop of a two-stop linear gradient; none is a solid quad (`bg1 = bg0`).
     std::optional<lx::color> background_end{};
-    /// Gradient direction, degrees clockwise from "to top" (CSS `linear-gradient`).
+    /// Gradient direction in degrees, clockwise with y down: 0 runs left → right, 90 top →
+    /// bottom (`gfx::ui_cpu_renderer` states the rule every backend follows). CSS's
+    /// `linear-gradient(α)` is this angle + 90.
     float gradient_angle_deg = 0.f;
     lx::color border_color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
     float corner_radii[4]{};  ///< top-left, top-right, bottom-right, bottom-left, px

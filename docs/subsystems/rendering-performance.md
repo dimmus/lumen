@@ -663,6 +663,35 @@ empty.
 
 See [../uml/33-gpu-resource-pools.mmd](../uml/33-gpu-resource-pools.mmd).
 
+### UI primitives: the atlas and the CPU reference renderer (ADR-010 Phase 1)
+
+`lx.gfx:ui_cpu` rasterises the sorted primitive stream into an XRGB8888/ARGB8888 buffer,
+inside the damage rects only, in row bands of about 128 KiB of target so every primitive
+crossing a band is drawn while the band is in L2 (drawing a 1919×1080 frame rect by rect,
+the destination load was the hottest instruction in `perf`). The partition states the pixel
+rules the GL and Vulkan backends copy; its own output is deterministic (no FMA, no libm
+transcendental) and is pinned by `tests/golden/ui/*.png` (`test_ui_golden`, bit-exact).
+A quad's fully covered interior is written without the SDF, and the clear under an opaque
+square quad covering a band is skipped — both proven bit-identical by the tests.
+
+`lx.gfx:atlas` packs tiles on bucketed shelves into CPU-owned pages; GPU backends upload
+each page's dirty-rect list. A page above 85 % occupancy with tiles unused for 120 frames
+is repacked synchronously when an allocation finds no room.
+
+Measured on the F8 host (VMware SVGA3D VM, 2 vCPUs, release preset; load 0.6–0.9;
+`./scripts/ui-bench.sh --backend cpu`, `test_atlas`):
+
+| | Value |
+|--|--|
+| Glyph packing (10–20 px UI glyph boxes) | 89.0 % of a 1024² page live when it first has to grow |
+| Page rebuild, 2 000 live glyphs repacked | 0.62 ms |
+| Page rebuild, 1 024 tiles of 64² on a 2048² page | 1.3 ms |
+| S2 raster (one 784 px clock cell) | p50 13 µs, p95 63–113 µs |
+| S3 raster (10 000 bordered rounded quads, full 1919×1080 repaint) | p50 25.6–27.5 ms, p95 36–69 ms |
+
+The two `cpu` runs differ by more than 5 % at p95, so no `iritur-cpu` baseline is committed
+yet; `none` stays the regression gate.
+
 ---
 
 ## 6.1 Frame clock and scanout rotation

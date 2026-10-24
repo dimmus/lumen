@@ -2,7 +2,8 @@
 # UI engine benchmark and regression gate (ADR-010 §8.5).
 #
 # Builds lumen-ui-bench in the release build, runs every scenario (S1–S3) on the backend
-# (Phase 0 has only `none`: nothing renders, the stages through encode are measured), stores
+# (`none`: nothing renders, the stages through encode are measured; `cpu`: the reference
+# renderer rasterises each frame's damage too, the `raster` stage), stores
 # the JSON under tests/bench/results/<hostname>-<driver>/<YYYYMMDD>-<sha>.json and compares
 # it with tests/bench/baseline/<hostname>-<driver>.json:
 #
@@ -25,7 +26,8 @@
 #   ./scripts/ui-bench.sh --compare FILE      # compare against FILE instead of the baseline
 #
 # Options:
-#   --backend none      the backend to measure (Phase 0: none)
+#   --backend B         the backend to measure: none (default) or cpu; each has its own
+#                       baseline, tests/bench/baseline/<hostname>-<backend>.json
 #   --frames N          measured frames for every scenario (default: S1 600, S2 36000, S3 1800
 #                       at the bench's 1 ms frame clock; S2 changes its clock every 60th
 #                       frame, so 36000 is the 600 produced frames §8.1 takes a p95 over)
@@ -64,7 +66,7 @@ while [[ $# -gt 0 ]]; do
     --update-baseline) update_baseline=1; shift ;;
     --compare) compare="$2"; shift 2 ;;
     --e2e) echo "FAIL: --e2e needs the client runtime (ADR-010 Phase 4)"; exit 2 ;;
-    -h|--help) sed -n '2,41p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 2 ;;
   esac
 done

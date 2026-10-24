@@ -532,6 +532,29 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_primitives PRIVATE tests)
     add_test(NAME test_primitives COMMAND test_primitives)
 
+    add_executable(test_atlas tests/test_atlas.cpp)
+    target_link_libraries(test_atlas PRIVATE lx.gfx lx.runtime)
+    lumen_apply_module_properties(test_atlas)
+    lumen_link_platform(test_atlas)
+    target_include_directories(test_atlas PRIVATE tests)
+    add_test(NAME test_atlas COMMAND test_atlas)
+
+    # The UI primitive golden images (ADR-010 §8.4): references in tests/golden/ui/*.png,
+    # read and written through libpng. LUMEN_UI_GOLDEN_UPDATE=1 rewrites them.
+    if(LIBPNG_FOUND)
+        add_executable(test_ui_golden tests/test_ui_golden.cpp)
+        target_link_libraries(test_ui_golden PRIVATE lx.ui lx.scene lx.gfx lx.runtime
+            ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_ui_golden)
+        lumen_link_platform(test_ui_golden)
+        target_include_directories(test_ui_golden PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_ui_golden PRIVATE
+            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui")
+        add_test(NAME test_ui_golden COMMAND test_ui_golden)
+    else()
+        message(STATUS "libpng not found — test_ui_golden (UI golden images) not built")
+    endif()
+
     add_executable(test_scene_outputs tests/test_scene_outputs.cpp)
     target_link_libraries(test_scene_outputs PRIVATE lx.scene lx.runtime)
     lumen_apply_module_properties(test_scene_outputs)
@@ -1103,7 +1126,10 @@ if(LUMEN_BUILD_TESTS)
     endif()
     set_tests_properties(test_health test_session_discovery
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
-    set_tests_properties(test_result test_snapshot test_primitives test_scene_outputs test_damage_region test_wm_geometry
+    if(TARGET test_ui_golden)
+        set_tests_properties(test_ui_golden PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+    endif()
+    set_tests_properties(test_result test_snapshot test_primitives test_atlas test_scene_outputs test_damage_region test_wm_geometry
         test_surface_tree test_positioner test_layer_arrange test_xcursor
         test_data_transfer test_input_serials test_session_pause test_keybindings test_workspaces
         test_viewport_geometry test_presentation_feedback

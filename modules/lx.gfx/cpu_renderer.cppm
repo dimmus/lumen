@@ -128,6 +128,14 @@ public:
                                                                    unsigned count,
                                                                    const damage_region& damage);
 
+    /// Draws `cmds` (back to front) over what `dst` already holds, inside `clip` (clipped to
+    /// the surface; empty means the whole surface): `composite`'s per-draw path with no
+    /// clear and no occlusion cull. For a caller that interleaves surface draws with its own
+    /// pixels — the UI renderer's `surface` refs (`ui_cpu_renderer`).
+    [[nodiscard]] lx::result<cpu_composite_stats> blend(const pixel_surface& dst,
+                                                        const blit_command* cmds, unsigned count,
+                                                        lx::rect2i clip);
+
 private:
     struct texture_slot {
         unsigned id = 0;
@@ -866,4 +874,47 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite_regi
         total.cleared = total.cleared || s.cleared;
     }
     return total;
+}
+
+lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::blend(const pixel_surface& dst,
+                                                                      const blit_command* cmds,
+                                                                      unsigned count,
+                                                                      lx::rect2i clip) {
+    using namespace lx::gfx::detail;
+    if (!dst.valid())
+        return lx::invalid_argument("cpu_compositor::blend: invalid destination");
+    if (!is_bgra_order(dst.format) && !is_rgba_order(dst.format))
+        return lx::invalid_argument("cpu_compositor::blend: unsupported destination format");
+    const lx::rect2i full{0, 0, static_cast<int>(dst.width), static_cast<int>(dst.height)};
+    const lx::rect2i area = (clip.width > 0 && clip.height > 0) ? intersect(clip, full) : full;
+    cpu_composite_stats stats{};
+    if (area.width <= 0 || area.height <= 0 || !cmds || count == 0)
+        return stats;
+    for (unsigned i = 0; i < count; ++i) {
+        const auto& cmd = cmds[i];
+        if (cmd.occluded || draw_invisible(cmd)) {
+            ++stats.draws_culled;
+        } else if (cmd.solid) {
+            ++stats.draws_submitted;
+        } else if (const int index = find(cmd.texture_id); index < 0) {
+            ++stats.draws_skipped;
+        } else if (pick_convert(textures_[static_cast<unsigned>(index)].surface.format,
+                                dst.format) == convert_op::unsupported) {
+            ++stats.draws_unsupported;
+        } else {
+            ++stats.draws_submitted;
+        }
+    }
+    band_job job{};
+    job.self = this;
+    job.dst = &dst;
+    job.cmds = cmds;
+    job.first_cmd = 0;
+    job.count = count;
+    job.clip = area;
+    job.do_clear = false;
+    // One band: the UI renderer calls this per surface ref and per damage rect.
+    run_band(&job, 0, 1);
+    stats.bytes_written = job.bytes.load(std::memory_order_relaxed);
+    return stats;
 }

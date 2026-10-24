@@ -45,9 +45,6 @@ public:
 
     /// True when a real font face backs shaping; false means metric estimation.
     [[nodiscard]] bool has_face() const;
-
-private:
-    gfx::glyph_atlas atlas_{};
 };
 
 class text_layout {

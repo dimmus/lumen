@@ -164,7 +164,7 @@ struct quad_instance {
     std::uint16_t background[4]{};     ///< premultiplied f16 rgba, gradient stop 0
     std::uint16_t background_end[4]{}; ///< premultiplied f16 rgba, gradient stop 1 (= stop 0 when solid)
     std::uint16_t border_color[4]{};   ///< premultiplied f16 rgba
-    std::uint16_t gradient_angle{};    ///< f16 degrees, clockwise from "to top"
+    std::uint16_t gradient_angle{};    ///< f16 degrees: 0 left → right, 90 top → bottom (`:ui_cpu`)
     std::uint8_t border_style = 0;     ///< 0 solid, 1 dashed
     std::uint8_t gradient_space = 0;   ///< 0 sRGB, 1 Oklab
     std::uint32_t pad = 0;
