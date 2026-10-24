@@ -251,6 +251,58 @@ LUMEN_TEST(gl_region_upload_updates_only_its_region) {
     LUMEN_CHECK(near(outside.r, 0) && near(outside.b, 255));
 }
 
+LUMEN_TEST(gl_client_upload_of_several_rects_leaves_the_rows_between) {
+    // A terminal's cursor line and status line: two strips of one update, uploaded as two,
+    // so the rows between keep what they had even though the client's buffer changed there.
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned W = 32, H = 32;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+    if (!comp.supports_client_upload())
+        return;
+    const auto bgra = [](unsigned char r, unsigned char g, unsigned char b) {
+        std::vector<unsigned char> v(static_cast<std::size_t>(W) * H * 4);
+        for (std::size_t i = 0; i < v.size(); i += 4) {
+            v[i] = b;
+            v[i + 1] = g;
+            v[i + 2] = r;
+            v[i + 3] = 255;
+        }
+        return v;
+    };
+    const auto blue = bgra(0, 0, 255);
+    LUMEN_CHECK(static_cast<bool>(comp.upload_client_region(6, W, H, {}, blue.data(), W * 4, true)));
+    LUMEN_CHECK(static_cast<bool>(comp.upload_client_region(6, W, H, {}, blue.data(), W * 4, true)));
+    const auto red = bgra(255, 0, 0); // the client redrew everything; only two strips are damage
+    const lx::rect2i region{0, 2, 8, 28};
+    const lx::rect2i parts[2] = {{0, 2, 8, 2}, {0, 28, 8, 2}};
+    const unsigned char* first = red.data() + static_cast<std::size_t>(region.y) * W * 4 +
+                                 static_cast<std::size_t>(region.x) * 4;
+    LUMEN_CHECK(static_cast<bool>(
+        comp.upload_client_regions(6, W, H, region, parts, first, W * 4, true)));
+    LUMEN_CHECK(comp.partial_into_fresh() == 0);
+
+    const auto cmd = quad(6, {0, 0, static_cast<int>(W), static_cast<int>(H)});
+    auto stats = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+    LUMEN_CHECK(static_cast<bool>(stats));
+    close_fence(stats);
+    std::vector<unsigned char> out(static_cast<std::size_t>(W) * H * 4);
+    LUMEN_CHECK(static_cast<bool>(
+        comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+    const pixel top = at(out, W, 4, 3);
+    const pixel between = at(out, W, 4, 15);
+    const pixel bottom = at(out, W, 4, 29);
+    const pixel beside = at(out, W, 20, 3);
+    LUMEN_CHECK(near(top.r, 255) && near(top.b, 0));
+    LUMEN_CHECK(near(bottom.r, 255) && near(bottom.b, 0));
+    LUMEN_CHECK(near(between.r, 0) && near(between.b, 255));
+    LUMEN_CHECK(near(beside.r, 0) && near(beside.b, 255));
+}
+
 LUMEN_TEST(gl_region_upload_into_a_fresh_texture_is_counted) {
     auto* device = shared_device();
     if (!device)

@@ -146,10 +146,55 @@ lx::fourcc staged_shm_format(wl_shm_buffer* shm) {
 ///
 /// Which staging is used depends on how the render thread consumes it — see
 /// `shm_pixel_store`. Exactly one of `seq_out` / `token_out` is set.
+namespace {
+/// Copies rect `r` of the client's buffer (`data` at `stride`) to `dst` (where the rect's
+/// first pixel goes, rows `dst_stride` apart), converting to the staged channel order.
+void copy_shm_rect(const unsigned char* data, unsigned stride, uint32_t fmt, bool native,
+                   lx::rect2i r, unsigned char* dst, unsigned dst_stride) {
+    const unsigned rw = static_cast<unsigned>(r.width);
+    const unsigned rh = static_cast<unsigned>(r.height);
+    const unsigned row_bytes = rw * 4u;
+    const auto* src = data + static_cast<size_t>(r.y) * stride + static_cast<size_t>(r.x) * 4u;
+    if (native) {
+        // Nothing to reorder — a contiguous client buffer staged whole is one memcpy for
+        // the frame, and anything else is a memcpy per row.
+        if (stride == dst_stride && row_bytes == dst_stride) {
+            std::memcpy(dst, src, static_cast<size_t>(row_bytes) * rh);
+            return;
+        }
+        for (unsigned y = 0; y < rh; ++y)
+            std::memcpy(dst + static_cast<size_t>(y) * dst_stride,
+                        src + static_cast<size_t>(y) * stride, row_bytes);
+        return;
+    }
+    const bool swap_rb = fmt == WL_SHM_FORMAT_ARGB8888 || fmt == WL_SHM_FORMAT_XRGB8888;
+    const uint32_t alpha_fill = fmt == WL_SHM_FORMAT_XRGB8888 ? 0xFF000000u : 0u;
+    for (unsigned y = 0; y < rh; ++y) {
+        const auto* src_row = reinterpret_cast<const uint32_t*>(src + static_cast<size_t>(y) * stride);
+        auto* dst_row = reinterpret_cast<uint32_t*>(dst + static_cast<size_t>(y) * dst_stride);
+        for (unsigned x = 0; x < rw; ++x) {
+            // Word-at-a-time so the loop vectorises; the byte-wise form did not.
+            const uint32_t p = src_row[x];
+            dst_row[x] = swap_rb ? (((p & 0xFF00FF00u) | ((p & 0x00FF0000u) >> 16) |
+                                     ((p & 0x000000FFu) << 16)) |
+                                    alpha_fill)
+                                 : p;
+        }
+    }
+}
+} // namespace
+
+/// Copies the client's shm pixels into compositor-owned staging. Must run on every commit:
+/// a client is free to redraw into the same wl_buffer.
+///
+/// Which staging is used depends on how the render thread consumes it — see
+/// `shm_pixel_store`. Exactly one of `seq_out` / `token_out` is set.
 const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsigned texture_id,
                                       lx::rect2i region, unsigned long long& seq_out,
                                       unsigned long long& token_out,
-                                      unsigned long long& pool_token_out) {
+                                      unsigned long long& pool_token_out,
+                                      const surface_damage_history* history,
+                                      lx::surface_id surface) {
     lx::trace::scoped_span span{"wayland", "shm.stage"};
     seq_out = 0;
     token_out = 0;
@@ -161,70 +206,58 @@ const unsigned char* stage_shm_pixels(buffer_obj* buf, wl_shm_buffer* shm, unsig
     const uint32_t fmt = wl_shm_buffer_get_format(shm);
     if (buf->width == 0 || buf->height == 0 || stride <= 0)
         return nullptr;
+    const bool native = g_p0_ctx->shm_native_format;
+    const lx::rect2i full{0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
 
-    // Only the transient GL pool can carry part of an image: the CPU store is the texture
-    // itself, and the Vulkan upload takes whole images.
+    if (g_p0_ctx->shm_store) {
+        // The CPU compositor samples the store's slot as the texture itself, so the slot
+        // always holds a whole image; only the rects that changed since the content it
+        // already has are rewritten. A typing terminal rewrites a line, not the window.
+        const unsigned dst_stride = buf->width * 4u;
+        shm_pixel_store::stamp held{};
+        const shm_pixel_store::stamp now{surface, history ? history->seq : 0};
+        unsigned char* image = g_p0_ctx->shm_store->acquire(texture_id, dst_stride * buf->height,
+                                                            token_out, now, &held);
+        if (!image)
+            return nullptr;
+        client_damage rects{};
+        if (history)
+            rects = shm_store_damage(*history, held, surface, buf->width, buf->height);
+        else
+            rects.add(full);
+        wl_shm_buffer_begin_access(shm);
+        const auto* data = static_cast<const unsigned char*>(wl_shm_buffer_get_data(shm));
+        for (unsigned i = 0; i < rects.count; ++i) {
+            const lx::rect2i& r = rects.rects[i];
+            copy_shm_rect(data, static_cast<unsigned>(stride), fmt, native, r,
+                          image + static_cast<size_t>(r.y) * dst_stride +
+                              static_cast<size_t>(r.x) * 4u,
+                          dst_stride);
+        }
+        wl_shm_buffer_end_access(shm);
+        return image;
+    }
+
+    // The transient GL pool carries just the region, packed at its own width; the Vulkan
+    // upload takes whole images.
     const bool whole = region.width <= 0 || region.height <= 0 || !g_p0_ctx->shm_pool ||
                        (region.x == 0 && region.y == 0 &&
                         static_cast<unsigned>(region.width) == buf->width &&
                         static_cast<unsigned>(region.height) == buf->height);
     if (whole)
-        region = {0, 0, static_cast<int>(buf->width), static_cast<int>(buf->height)};
-    const unsigned rx = static_cast<unsigned>(region.x);
-    const unsigned ry = static_cast<unsigned>(region.y);
-    const unsigned rw = static_cast<unsigned>(region.width);
-    const unsigned rh = static_cast<unsigned>(region.height);
-    const unsigned dst_stride = rw * 4u;
-    const unsigned bytes = dst_stride * rh;
-
+        region = full;
+    const unsigned dst_stride = static_cast<unsigned>(region.width) * 4u;
+    const unsigned bytes = dst_stride * static_cast<unsigned>(region.height);
     unsigned char* out = nullptr;
     if (g_p0_ctx->shm_pool)
         out = g_p0_ctx->shm_pool->acquire(bytes, pool_token_out, g_p0_ctx->now_ns);
-    else if (g_p0_ctx->shm_store)
-        out = g_p0_ctx->shm_store->acquire(texture_id, bytes, token_out);
     else if (g_p0_ctx->shm_staging)
         out = g_p0_ctx->shm_staging->acquire(bytes, seq_out);
     if (!out)
         return nullptr;
-
-    const bool native = g_p0_ctx->shm_native_format;
-
     wl_shm_buffer_begin_access(shm);
-    const auto* data = static_cast<const unsigned char*>(wl_shm_buffer_get_data(shm)) +
-                       static_cast<size_t>(ry) * static_cast<unsigned>(stride) +
-                       static_cast<size_t>(rx) * 4u;
-
-    if (native) {
-        // Nothing to reorder — a contiguous client buffer staged whole is one memcpy for
-        // the frame, and anything else is a memcpy per row.
-        if (static_cast<unsigned>(stride) == dst_stride) {
-            std::memcpy(out, data, bytes);
-        } else {
-            for (unsigned y = 0; y < rh; ++y) {
-                std::memcpy(out + static_cast<size_t>(y) * dst_stride,
-                            data + static_cast<size_t>(y) * static_cast<unsigned>(stride),
-                            dst_stride);
-            }
-        }
-        wl_shm_buffer_end_access(shm);
-        return out;
-    }
-
-    const bool swap_rb = fmt == WL_SHM_FORMAT_ARGB8888 || fmt == WL_SHM_FORMAT_XRGB8888;
-    const uint32_t alpha_fill = fmt == WL_SHM_FORMAT_XRGB8888 ? 0xFF000000u : 0u;
-    for (unsigned y = 0; y < rh; ++y) {
-        const auto* src_row = reinterpret_cast<const uint32_t*>(
-            data + static_cast<size_t>(y) * static_cast<unsigned>(stride));
-        auto* dst_row = reinterpret_cast<uint32_t*>(out + static_cast<size_t>(y) * dst_stride);
-        for (unsigned x = 0; x < rw; ++x) {
-            // Word-at-a-time so the loop vectorises; the byte-wise form did not.
-            const uint32_t p = src_row[x];
-            dst_row[x] = swap_rb ? (((p & 0xFF00FF00u) | ((p & 0x00FF0000u) >> 16) |
-                                     ((p & 0x000000FFu) << 16)) |
-                                    alpha_fill)
-                                 : p;
-        }
-    }
+    copy_shm_rect(static_cast<const unsigned char*>(wl_shm_buffer_get_data(shm)),
+                  static_cast<unsigned>(stride), fmt, native, region, out, dst_stride);
     wl_shm_buffer_end_access(shm);
     return out;
 }

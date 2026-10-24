@@ -18,7 +18,7 @@ constexpr const char k_defaults[] =
 
 void print_diagnostics(const lx::config::diagnostics& d, const lx::config::config_text& t) {
     for (const auto& x : d.items()) {
-        char line[512];
+        char line[1024]; // a path (up to 512) and the message
         lx::config::format_diagnostic(x, t.path_of(x.layer), true, line, sizeof(line));
         std::printf("%s: %s\n", lx::config::severity_name(x.sev), line);
     }

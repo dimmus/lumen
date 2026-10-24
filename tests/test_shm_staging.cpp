@@ -11,6 +11,10 @@ import lx.compositor;
 using lx::compositor::buffer_upload_state;
 using lx::compositor::shm_direct_uploads;
 using lx::compositor::shm_pixel_store;
+using lx::compositor::shm_store_region;
+using lx::compositor::shm_store_damage;
+using lx::compositor::shm_upload_damage;
+using lx::compositor::client_damage;
 using lx::compositor::shm_upload_pool;
 using lx::compositor::shm_upload_region;
 using lx::compositor::surface_damage_history;
@@ -309,6 +313,111 @@ LUMEN_TEST(direct_upload_table_full_falls_back) {
     for (unsigned i = 0; i < shm_direct_uploads::k_max; ++i)
         LUMEN_CHECK(t.add(&g_buffer_a, &g_shm_a, &g_pool, pixels, 4, {0, 0, 1, 1}) != 0);
     LUMEN_CHECK(t.add(&g_buffer_a, &g_shm_a, &g_pool, pixels, 4, {0, 0, 1, 1}) == 0);
+}
+
+LUMEN_TEST(store_slot_new_to_a_texture_is_written_whole) {
+    shm_pixel_store store;
+    surface_damage_history h;
+    const lx::surface_id s{1};
+    h.record({5, 5, 10, 10});
+    unsigned long long token = 0;
+    shm_pixel_store::stamp held{};
+    LUMEN_CHECK(store.acquire(3, 100 * 50 * 4, token, {s, h.seq}, &held) != nullptr);
+    LUMEN_CHECK(held.seq == 0);
+    LUMEN_CHECK(same(shm_store_region(h, held, s, 100, 50), {0, 0, 100, 50}));
+}
+
+LUMEN_TEST(store_slot_rewrites_only_the_damage_since_its_own_content) {
+    shm_pixel_store store;
+    surface_damage_history h;
+    const lx::surface_id s{1};
+    unsigned long long ta = 0, tb = 0, tc = 0;
+    shm_pixel_store::stamp held{};
+    h.record({0, 0, 100, 50}); // commit 1 → slot 0, whole
+    (void)store.acquire(3, 100 * 50 * 4, ta, {s, h.seq}, &held);
+    h.record({10, 10, 5, 5}); // commit 2 → slot 1, whole (new to the texture)
+    (void)store.acquire(3, 100 * 50 * 4, tb, {s, h.seq}, &held);
+    LUMEN_CHECK(held.seq == 0);
+    store.release(ta);
+    h.record({40, 20, 2, 2}); // commit 3 → slot 0, which holds commit 1
+    (void)store.acquire(3, 100 * 50 * 4, tc, {s, h.seq}, &held);
+    LUMEN_CHECK(held.seq == 1);
+    LUMEN_CHECK(same(shm_store_region(h, held, s, 100, 50), {10, 10, 32, 12}));
+}
+
+LUMEN_TEST(store_slot_written_twice_in_a_row_still_catches_up) {
+    // Slot 1 stays in flight (the composite still reads it), so slot 0 takes two commits
+    // in a row; then slot 1 comes back and must catch up on all three commits since its own
+    // content. Strict alternation would have missed the middle one.
+    shm_pixel_store store;
+    surface_damage_history h;
+    const lx::surface_id s{1};
+    unsigned long long t0 = 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0;
+    shm_pixel_store::stamp held{};
+    h.record({0, 0, 100, 50});
+    (void)store.acquire(3, 100 * 50 * 4, t0, {s, h.seq}, &held); // commit 1 → slot 0
+    h.record({0, 0, 100, 50});
+    (void)store.acquire(3, 100 * 50 * 4, t1, {s, h.seq}, &held); // commit 2 → slot 1
+    store.release(t0);
+    h.record({1, 1, 1, 1});
+    (void)store.acquire(3, 100 * 50 * 4, t2, {s, h.seq}, &held); // commit 3 → slot 0
+    store.release(t2);
+    h.record({50, 40, 1, 1});
+    (void)store.acquire(3, 100 * 50 * 4, t3, {s, h.seq}, &held); // commit 4 → slot 0 again
+    LUMEN_CHECK(held.seq == 3);
+    LUMEN_CHECK(same(shm_store_region(h, held, s, 100, 50), {50, 40, 1, 1}));
+    store.release(t1);
+    store.release(t3);
+    h.record({90, 2, 1, 1});
+    (void)store.acquire(3, 100 * 50 * 4, t4, {s, h.seq}, &held); // commit 5 → slot 1
+    LUMEN_CHECK(held.seq == 2);
+    LUMEN_CHECK(same(shm_store_region(h, held, s, 100, 50), {1, 1, 90, 40}));
+}
+
+LUMEN_TEST(store_slot_of_another_surface_or_lost_history_is_whole) {
+    surface_damage_history h;
+    const lx::surface_id s{1};
+    for (unsigned i = 0; i < 3; ++i)
+        h.record({0, 0, 1, 1});
+    LUMEN_CHECK(same(shm_store_region(h, {lx::surface_id{2}, 2}, s, 100, 50), {0, 0, 100, 50}));
+    for (unsigned i = 0; i < surface_damage_history::k_depth + 1; ++i)
+        h.record({0, 0, 1, 1});
+    LUMEN_CHECK(same(shm_store_region(h, {s, 2}, s, 100, 50), {0, 0, 100, 50}));
+}
+
+LUMEN_TEST(upload_damage_keeps_disjoint_rects_apart) {
+    // Two strips far apart (a cursor line and a status line) stay two rects through the
+    // buffer-age union, instead of the window between them.
+    surface_damage_history h;
+    buffer_upload_state st;
+    const lx::surface_id s{1};
+    h.record({0, 0, 100, 50});
+    (void)shm_upload_damage(h, st, s, 100, 50); // first upload: whole
+    h.record({0, 0, 100, 50});
+    (void)shm_upload_damage(h, st, s, 100, 50); // second: whole
+    client_damage d{};
+    d.add({0, 2, 100, 2});
+    d.add({0, 46, 100, 2});
+    h.record_rects(d);
+    const client_damage up = shm_upload_damage(h, st, s, 100, 50);
+    // This commit's two strips plus what the other name missed (the whole previous upload).
+    LUMEN_CHECK(up.count >= 1);
+    h.record_rects(d);
+    const client_damage up2 = shm_upload_damage(h, st, s, 100, 50);
+    LUMEN_CHECK(up2.count == 2);
+    LUMEN_CHECK(up2.area() == 2u * 100u * 2u);
+    LUMEN_CHECK(same(up2.bounds(), {0, 2, 100, 46}));
+}
+
+LUMEN_TEST(store_damage_is_the_rects_since_the_slot_content) {
+    surface_damage_history h;
+    const lx::surface_id s{1};
+    h.record({0, 0, 100, 50});            // commit 1: the slot's content
+    h.record({0, 2, 100, 2});             // commit 2
+    h.record({0, 46, 100, 2});            // commit 3
+    const client_damage d = shm_store_damage(h, {s, 1}, s, 100, 50);
+    LUMEN_CHECK(d.count == 2);
+    LUMEN_CHECK(d.area() == 400u);
 }
 
 int main(int argc, char** argv) {

@@ -4,6 +4,7 @@ module;
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/prctl.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
 #endif
@@ -145,7 +146,9 @@ private:
     std::atomic<bool> quit_pending_{false};
     int epoll_fd_ = -1;
     int wake_fd_ = -1;
+    // Only without epoll_pwait2 (Linux < 5.11), which takes the timeout itself.
     int timer_fd_ = -1;
+    bool pwait2_ = false;
     clock_time armed_ns_ = -1;
     callback after_{};
     unsigned long long wakeups_ = 0;
@@ -195,6 +198,15 @@ static long long lx_runtime_now_ns() {
         .count();
 }
 
+// The loop's clock for the phase of an iteration under way — read once before the sources
+// prepare and once after the wait, rather than by every timer source in turn (a dozen
+// vDSO reads per phase). 0 outside the loop: a source then reads the clock itself.
+static thread_local long long g_phase_now = 0;
+
+static long long lx_runtime_phase_now() {
+    return g_phase_now != 0 ? g_phase_now : lx_runtime_now_ns();
+}
+
 static constexpr unsigned k_max_event_sources = 32;
 
 struct lx_runtime_loop_state {
@@ -220,7 +232,15 @@ lx::runtime::event_loop::event_loop() {
 #if !defined(_WIN32)
     epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
     wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    timer_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (epoll_fd_ >= 0) {
+        // epoll_pwait2 takes a nanosecond timeout: the next deadline needs no timerfd to
+        // arm before each wait and read after each fire — two syscalls per timer wake.
+        epoll_event probe{};
+        const timespec zero{};
+        pwait2_ = ::epoll_pwait2(epoll_fd_, &probe, 1, &zero, nullptr) >= 0; // ENOSYS < 5.11
+    }
+    if (!pwait2_)
+        timer_fd_ = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (epoll_fd_ >= 0) {
         epoll_event ev{};
         ev.events = EPOLLIN;
@@ -285,7 +305,11 @@ int lx::runtime::event_loop::run() {
     if (quit_pending_.exchange(false))
         running_ = false;
 #if !defined(_WIN32)
-    if (epoll_fd_ >= 0 && wake_fd_ >= 0 && timer_fd_ >= 0) {
+    if (epoll_fd_ >= 0 && wake_fd_ >= 0 && (pwait2_ || timer_fd_ >= 0)) {
+        // A timeout's expiry is subject to the thread's timer slack (50 µs by default; an
+        // absolute timerfd had none). The frame clock is a deadline, so keep it tight.
+        if (pwait2_)
+            (void)::prctl(PR_SET_TIMERSLACK, 1000UL, 0UL, 0UL, 0UL);
         // Blocks until a source has work: an fd is readable, a timer is due, or another
         // thread posted. Nothing runs on a schedule of its own — an idle desktop sleeps.
         while (running_) {
@@ -294,6 +318,7 @@ int lx::runtime::event_loop::run() {
 
             clock_time timeout = -1; // relative, ns; -1 = until something happens
             const clock_time now = lx_runtime_now_ns();
+            g_phase_now = now;
             for (unsigned i = 0; i < loop_state().source_count; ++i) {
                 auto* source = loop_state().sources[i];
                 if (!source)
@@ -303,14 +328,31 @@ int lx::runtime::event_loop::run() {
                 if (t >= 0 && (timeout < 0 || t < timeout))
                     timeout = t;
             }
+            g_phase_now = 0;
             if (!running_)
                 break;
-            if (timeout > 0)
-                arm_timer(now + timeout);
-            else if (timeout < 0 && armed_ns_ > 0)
-                arm_timer(0); // a deadline that went away (a stopped timer) must not wake us
             epoll_event events[16];
-            const int n = ::epoll_wait(epoll_fd_, events, 16, timeout == 0 ? 0 : -1);
+            int n = 0;
+            if (pwait2_) {
+                timespec ts{};
+                const timespec* wait = nullptr;
+                if (timeout >= 0) {
+                    // Relative to now, not to the read before the sources prepared.
+                    clock_time left = now + timeout - lx_runtime_now_ns();
+                    if (left < 0)
+                        left = 0;
+                    ts.tv_sec = static_cast<time_t>(left / 1'000'000'000);
+                    ts.tv_nsec = static_cast<long>(left % 1'000'000'000);
+                    wait = &ts;
+                }
+                n = ::epoll_pwait2(epoll_fd_, events, 16, wait, nullptr);
+            } else {
+                if (timeout > 0)
+                    arm_timer(now + timeout);
+                else if (timeout < 0 && armed_ns_ > 0)
+                    arm_timer(0); // a deadline that went away must not wake us
+                n = ::epoll_wait(epoll_fd_, events, 16, timeout == 0 ? 0 : -1);
+            }
             ++wakeups_;
             for (int i = 0; i < n; ++i) {
                 void* tag = events[i].data.ptr;
@@ -328,11 +370,15 @@ int lx::runtime::event_loop::run() {
                 break;
             drain_inbound();
             ui_strand_.drain();
+            // One read for every check. A timer that comes due while another source is
+            // dispatching is seen by the next iteration, which then does not wait.
+            g_phase_now = lx_runtime_now_ns();
             for (unsigned i = 0; i < loop_state().source_count; ++i) {
                 auto* source = loop_state().sources[i];
                 if (source && source->check())
                     (void)source->dispatch();
             }
+            g_phase_now = 0;
             if (after_)
                 after_();
         }
@@ -452,7 +498,7 @@ bool lx::runtime::timer_source::prepare(clock_time& timeout) {
         timeout = -1;
         return false;
     }
-    const auto now = lx_runtime_now_ns();
+    const auto now = lx_runtime_phase_now();
     const auto remaining = next_fire_ns_ - now;
     timeout = remaining > 0 ? remaining : 0;
     return true;
@@ -460,7 +506,7 @@ bool lx::runtime::timer_source::prepare(clock_time& timeout) {
 
 bool lx::runtime::timer_source::check() {
     if (!enabled_) return false;
-    return lx_runtime_now_ns() >= next_fire_ns_;
+    return lx_runtime_phase_now() >= next_fire_ns_;
 }
 
 bool lx::runtime::timer_source::dispatch() {

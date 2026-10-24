@@ -114,6 +114,9 @@ struct texture_update {
     /// `region.width * 4`). Empty means the whole image. A partial region updates texture
     /// storage that already holds the rest — see `shm_upload_region`.
     lx::rect2i region{};
+    /// The region as separate rects (inside `region`, its bounds) when there are several:
+    /// a backend that uploads rect by rect copies only these. Empty: `region` as one.
+    client_damage rects{};
     /// `forget` only: the first frame index whose snapshot is guaranteed not to reference
     /// this texture. Applying the forget before that frame has been composited drops a
     /// texture an in-flight snapshot still draws. See `drain_texture_updates`.
@@ -368,18 +371,25 @@ private:
 };
 
 /// Damage history of one surface, for buffer-age uploads: commit `seq` (1-based) has its
-/// damage in `rects[seq % k_depth]`.
+/// damage (buffer pixels) in `rects[seq % k_depth]`.
 struct surface_damage_history {
     static constexpr unsigned k_depth = 8;
     unsigned long long seq = 0;
-    lx::rect2i rects[k_depth]{};
+    client_damage rects[k_depth]{};
 
-    void record(lx::rect2i damage) {
+    void record_rects(const client_damage& damage) {
         ++seq;
         rects[seq % k_depth] = damage;
     }
-    /// Union of the damage of commits (`after`, `seq`]. False when that range is older than
-    /// the history keeps, or empty.
+    void record(lx::rect2i damage) {
+        client_damage d{};
+        d.add(damage);
+        record_rects(d);
+    }
+    /// The damage of commits (`after`, `seq`]. False when that range is older than the
+    /// history keeps, or empty.
+    [[nodiscard]] bool since_rects(unsigned long long after, client_damage& out) const;
+    /// Its bounding box.
     [[nodiscard]] bool since(unsigned long long after, lx::rect2i& out) const;
 };
 
@@ -388,7 +398,7 @@ struct buffer_upload_state {
     lx::surface_id surface{};
     unsigned long long seq = 0; // surface commit last uploaded
     unsigned uploads = 0;
-    lx::rect2i last{};          // damage that upload carried
+    client_damage last{};       // damage that upload carried
 };
 
 /// The region of a `width` x `height` shm buffer that must be staged for this upload.
@@ -403,6 +413,31 @@ struct buffer_upload_state {
 [[nodiscard]] lx::rect2i shm_upload_region(const surface_damage_history& history,
                                            buffer_upload_state& state, lx::surface_id surface,
                                            unsigned width, unsigned height);
+/// The same as rects (`shm_upload_region` is their bounds): what the upload copies.
+[[nodiscard]] client_damage shm_upload_damage(const surface_damage_history& history,
+                                              buffer_upload_state& state, lx::surface_id surface,
+                                              unsigned width, unsigned height);
+
+/// What a `shm_pixel_store` slot holds: the content of `surface` as of its commit `seq`
+/// (the `surface_damage_history` numbering). `seq == 0`: nothing usable for this texture.
+struct shm_pixel_store_stamp {
+    lx::surface_id surface{};
+    unsigned long long seq = 0;
+};
+
+/// The region of a `width` x `height` image to rewrite into a `shm_pixel_store` slot that
+/// holds `held` (see `shm_pixel_store::acquire`) to bring it to the content `history`
+/// ends with: the damage since the slot's commit, or the whole image when the slot holds
+/// nothing of this surface or the history no longer reaches back that far. Exact buffer
+/// age per slot, so a slot written twice in a row (its sibling was still being read) never
+/// misses a commit. `history` must already hold this commit.
+[[nodiscard]] lx::rect2i shm_store_region(const surface_damage_history& history,
+                                          shm_pixel_store_stamp held, lx::surface_id surface,
+                                          unsigned width, unsigned height);
+/// The same as rects (`shm_store_region` is their bounds): what the staging rewrites.
+[[nodiscard]] client_damage shm_store_damage(const surface_damage_history& history,
+                                             shm_pixel_store_stamp held, lx::surface_id surface,
+                                             unsigned width, unsigned height);
 
 /// Per-texture staging for shm pixels, used by the CPU composite path.
 ///
@@ -427,10 +462,16 @@ public:
     static constexpr unsigned k_max_textures = 256;
     static constexpr unsigned k_slots = 2;
 
+    using stamp = shm_pixel_store_stamp;
+
     /// UI affinity. Writable storage of `bytes` for `texture_id`, or nullptr when both
-    /// slots are still being sampled. `token_out` is nonzero on success.
+    /// slots are still being sampled. `token_out` is nonzero on success. The slot is
+    /// stamped `next` (the caller writes that content now); `previous` receives what it
+    /// held, so the caller can rewrite only the damage since (`shm_store_region`) instead
+    /// of the whole image.
     [[nodiscard]] unsigned char* acquire(unsigned texture_id, unsigned bytes,
-                                         unsigned long long& token_out);
+                                         unsigned long long& token_out, stamp next = {},
+                                         stamp* previous = nullptr);
 
     /// Render affinity. Marks the slot behind `token` reusable. Ignores a zero token.
     void release(unsigned long long token);
@@ -449,6 +490,7 @@ private:
         std::vector<unsigned char> slots[k_slots]{};
         std::atomic<bool> in_flight[k_slots]{};
         unsigned next = 0;
+        stamp stamps[k_slots]{};
         bool used = false;
         bool retiring = false;
     };
@@ -885,8 +927,11 @@ void lx::compositor::shm_staging_ring::publish_consumed(unsigned long long seq) 
 }
 
 unsigned char* lx::compositor::shm_pixel_store::acquire(unsigned texture_id, unsigned bytes,
-                                                        unsigned long long& token_out) {
+                                                        unsigned long long& token_out,
+                                                        stamp next, stamp* previous) {
     token_out = 0;
+    if (previous)
+        *previous = {};
     if (texture_id == 0 || bytes == 0)
         return nullptr;
 
@@ -906,6 +951,8 @@ unsigned char* lx::compositor::shm_pixel_store::acquire(unsigned texture_id, uns
             entries_[i].used = true;
             entries_[i].texture_id = texture_id;
             entries_[i].next = 0;
+            for (stamp& s : entries_[i].stamps)
+                s = {};
             slot_entry = &entries_[i];
             index = i;
             break;
@@ -929,6 +976,8 @@ unsigned char* lx::compositor::shm_pixel_store::acquire(unsigned texture_id, uns
             entries_[i].used = true;
             entries_[i].texture_id = texture_id;
             entries_[i].next = 0;
+            for (stamp& s : entries_[i].stamps)
+                s = {};
             slot_entry = &entries_[i];
             index = i;
             break;
@@ -956,7 +1005,11 @@ unsigned char* lx::compositor::shm_pixel_store::acquire(unsigned texture_id, uns
     if (storage.size() < bytes) {
         held_bytes_ += bytes - storage.size();
         storage.resize(bytes);
+        slot_entry->stamps[chosen] = {};
     }
+    if (previous)
+        *previous = slot_entry->stamps[chosen];
+    slot_entry->stamps[chosen] = next;
 
     slot_entry->next = (chosen + 1) % k_slots;
     slot_entry->in_flight[chosen].store(true, std::memory_order_release);
@@ -985,6 +1038,8 @@ void lx::compositor::shm_pixel_store::free_entry(entry& e) {
     e.retiring = false;
     e.texture_id = 0;
     e.next = 0;
+    for (stamp& s : e.stamps)
+        s = {};
 }
 
 void lx::compositor::shm_pixel_store::retire(unsigned texture_id) {
@@ -1110,56 +1165,85 @@ unsigned lx::compositor::shm_upload_pool::blocks_mapped() const {
     return n;
 }
 
-namespace {
-lx::rect2i union_rect(lx::rect2i a, lx::rect2i b) {
-    if (a.width <= 0 || a.height <= 0)
-        return b;
-    if (b.width <= 0 || b.height <= 0)
-        return a;
-    const int x0 = a.x < b.x ? a.x : b.x;
-    const int y0 = a.y < b.y ? a.y : b.y;
-    const int x1 = (a.x + a.width) > (b.x + b.width) ? a.x + a.width : b.x + b.width;
-    const int y1 = (a.y + a.height) > (b.y + b.height) ? a.y + a.height : b.y + b.height;
-    return {x0, y0, x1 - x0, y1 - y0};
-}
-} // namespace
-
-bool lx::compositor::surface_damage_history::since(unsigned long long after,
-                                                   lx::rect2i& out) const {
+bool lx::compositor::surface_damage_history::since_rects(unsigned long long after,
+                                                         client_damage& out) const {
     if (after >= seq || seq - after > k_depth)
         return false;
-    lx::rect2i u{};
+    client_damage u{};
     for (unsigned long long s = after + 1; s <= seq; ++s)
-        u = union_rect(u, rects[s % k_depth]);
+        u.add_region(rects[s % k_depth]);
     out = u;
     return true;
 }
 
-lx::rect2i lx::compositor::shm_upload_region(const surface_damage_history& history,
-                                             buffer_upload_state& state, lx::surface_id surface,
-                                             unsigned width, unsigned height) {
+bool lx::compositor::surface_damage_history::since(unsigned long long after,
+                                                   lx::rect2i& out) const {
+    client_damage u{};
+    if (!since_rects(after, u))
+        return false;
+    out = u.bounds();
+    return true;
+}
+
+lx::compositor::client_damage lx::compositor::shm_store_damage(
+    const surface_damage_history& history, shm_pixel_store_stamp held, lx::surface_id surface,
+    unsigned width, unsigned height) {
     const lx::rect2i full{0, 0, static_cast<int>(width), static_cast<int>(height)};
-    lx::rect2i damage = full;
-    if (state.uploads > 0 && state.surface == surface) {
-        lx::rect2i since{};
-        if (history.since(state.seq, since))
-            damage = since;
+    client_damage out{};
+    client_damage damage{};
+    if (held.seq == 0 || held.surface != surface || !history.since_rects(held.seq, damage)) {
+        out.add(full);
+        return out;
+    }
+    damage.clip(full);
+    // Empty damage since: the content did not change, but the slot is written anyway;
+    // an empty region would read as "whole" downstream, so keep one pixel.
+    if (damage.empty())
+        damage.add({0, 0, full.width > 0 ? 1 : 0, full.height > 0 ? 1 : 0});
+    return damage;
+}
+
+lx::rect2i lx::compositor::shm_store_region(const surface_damage_history& history,
+                                            shm_pixel_store_stamp held, lx::surface_id surface,
+                                            unsigned width, unsigned height) {
+    return shm_store_damage(history, held, surface, width, height).bounds();
+}
+
+lx::compositor::client_damage lx::compositor::shm_upload_damage(
+    const surface_damage_history& history, buffer_upload_state& state, lx::surface_id surface,
+    unsigned width, unsigned height) {
+    const lx::rect2i full{0, 0, static_cast<int>(width), static_cast<int>(height)};
+    client_damage damage{};
+    bool known = false;
+    if (state.uploads > 0 && state.surface == surface)
+        known = history.since_rects(state.seq, damage);
+    if (!known) {
+        damage.clear();
+        damage.add(full);
     }
     // The name being written missed the previous upload of this texture; before two
     // uploads, one name has never been written at all.
-    lx::rect2i region = state.uploads >= 2 ? union_rect(damage, state.last) : full;
+    client_damage region{};
+    if (state.uploads >= 2) {
+        region = damage;
+        region.add_region(state.last);
+    } else {
+        region.add(full);
+    }
     // Clip to the buffer: damage is clipped where it is recorded, but stay safe.
-    const int x0 = region.x < 0 ? 0 : region.x;
-    const int y0 = region.y < 0 ? 0 : region.y;
-    int x1 = region.x + region.width;
-    int y1 = region.y + region.height;
-    if (x1 > full.width) x1 = full.width;
-    if (y1 > full.height) y1 = full.height;
-    region = (x1 > x0 && y1 > y0) ? lx::rect2i{x0, y0, x1 - x0, y1 - y0} : full;
+    region.clip(full);
+    if (region.empty())
+        region.add(full);
 
     state.surface = surface;
     state.seq = history.seq;
     ++state.uploads;
     state.last = damage;
     return region;
+}
+
+lx::rect2i lx::compositor::shm_upload_region(const surface_damage_history& history,
+                                             buffer_upload_state& state, lx::surface_id surface,
+                                             unsigned width, unsigned height) {
+    return shm_upload_damage(history, state, surface, width, height).bounds();
 }
