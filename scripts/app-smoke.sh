@@ -1752,7 +1752,9 @@ if want G; then
   # G11 — GTK → foot: widget-factory's text view (F4's) filled with numbered lines through
   # the clipboard (a probe owns it), all of it selected and dragged onto foot running `cat`.
   # widget-factory is moved left first: a press raises it, and at its size it would
-  # otherwise cover foot.
+  # otherwise cover foot. It is taken near its right edge, so the pointer stays well inside
+  # the output — at the left edge the move would end in an edge snap (half the output),
+  # which resizes the window and moves the text view away from (1376, 529).
   if (( ! SKIP_GTK )); then
     begin G11
     rm -f "$LOG_DIR/G11.out"
@@ -1766,8 +1768,9 @@ if want G; then
       settle "$G11_GTK_ID"
       sleep 1
       read -r GX GY GW GH < <(geom "$G11_GTK_ID")
-      inject move $((GX + 800)) $((GY + 400)); sleep 0.2
-      inject drag $((GX + 800)) $((GY + 400)) $((GX - 300)) $((GY + 400)) --super --steps 30
+      G11_GRAB=$((GX + GW - 150))
+      inject move "$G11_GRAB" $((GY + 400)); sleep 0.2
+      inject drag "$G11_GRAB" $((GY + 400)) $((G11_GRAB - 1100)) $((GY + 400)) --super --steps 30
       settle "$G11_GTK_ID"
       read -r GX GY GW GH < <(geom "$G11_GTK_ID")
       TX=$((GX + 1376)); TY=$((GY + 529))

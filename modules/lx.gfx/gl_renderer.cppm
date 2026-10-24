@@ -3,7 +3,8 @@ module;
 #if defined(LUMEN_HAS_EGL)
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
-#include <GLES2/gl2.h>
+// GLES 3 headers (a superset of 2): `copy_region` blits when the context is ES 3.0.
+#include <GLES3/gl3.h>
 #include <GLES2/gl2ext.h>
 #include <gbm.h>
 #include <unistd.h>
@@ -242,6 +243,16 @@ public:
                                                                 const damage_region& damage,
                                                                 bool clear_first, bool fence);
 
+    /// Copies `region` (full: everything) of `src` into the same place of `dst`, a target of
+    /// the same size: a scanout slot brought up to date from the one on screen while the
+    /// output is idle, so its next composite draws only that frame's damage. Needs
+    /// `supports_target_copy` (OpenGL ES 3.0, glBlitFramebuffer). Flushed, not fenced: a
+    /// later composite into `dst` is ordered after it in this context, and its fence covers it.
+    [[nodiscard]] lx::result<void> copy_region(const gl_scanout_target& src,
+                                               gl_scanout_target& dst,
+                                               const damage_region& region);
+    [[nodiscard]] bool supports_target_copy() const { return target_copy_; }
+
     /// Reads the target back as RGBA rows, top row first. For tests and screenshots — it
     /// stalls the pipeline and is not part of the frame path.
     [[nodiscard]] lx::result<void> read_back(const gl_scanout_target& target, unsigned char* rgba,
@@ -314,6 +325,7 @@ private:
     unsigned vertex_buffer_ = 0;
     bool bgra_ = false;
     bool unpack_subimage_ = false;
+    bool target_copy_ = false;
     texture_slot textures_[k_max_textures]{};
 };
 
@@ -886,6 +898,11 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     const char* gl_ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
     bgra_ = detail::egl_has_extension(gl_ext, "GL_EXT_texture_format_BGRA8888");
     unpack_subimage_ = detail::egl_has_extension(gl_ext, "GL_EXT_unpack_subimage");
+    // "OpenGL ES 3.1 Mesa …": the context is created as ES 2, and drivers hand out the
+    // newest compatible version, so ES 3's glBlitFramebuffer is there when it says 3.
+    const char* version = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+    target_copy_ = version && std::strncmp(version, "OpenGL ES ", 10) == 0 &&
+                   std::atoi(version + 10) >= 3;
 
     // Unit quad; the vertex shader maps it onto each draw's destination rect.
     static const float corners[] = {0.f, 0.f, 1.f, 0.f, 0.f, 1.f, 1.f, 1.f};
@@ -1620,6 +1637,45 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     (void)clear_first;
     (void)fence;
     return lx::not_implemented("lx::gfx::gl_compositor::composite");
+#endif
+}
+
+lx::result<void> lx::gfx::gl_compositor::copy_region(const gl_scanout_target& src,
+                                                     gl_scanout_target& dst,
+                                                     const damage_region& region) {
+#if defined(LUMEN_HAS_EGL)
+    if (!target_copy_ || !src.valid() || !dst.valid())
+        return lx::not_implemented("lx::gfx::gl_compositor::copy_region");
+    if (src.width() != dst.width() || src.height() != dst.height())
+        return lx::invalid_argument("gl copy_region between targets of different sizes");
+    const lx::rect2i whole{0, 0, static_cast<int>(src.width()), static_cast<int>(src.height())};
+    damage_region r = region;
+    if (r.full) {
+        r.clear();
+        r.add(whole);
+    }
+    r.clip(whole);
+    if (r.count == 0)
+        return {};
+    glDisable(GL_SCISSOR_TEST);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, src.framebuffer());
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dst.framebuffer());
+    // Both have row 0 on top: a rect lands where it was.
+    for (unsigned i = 0; i < r.count; ++i) {
+        const lx::rect2i& q = r.rects[i];
+        glBlitFramebuffer(q.x, q.y, q.x + q.width, q.y + q.height, q.x, q.y, q.x + q.width,
+                          q.y + q.height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    glFlush();
+    if (glGetError() != GL_NO_ERROR)
+        return lx::make_error(lx::gl_err::draw_failed, "glBlitFramebuffer between scanout targets failed");
+    return {};
+#else
+    (void)src;
+    (void)dst;
+    (void)region;
+    return lx::not_implemented("lx::gfx::gl_compositor::copy_region");
 #endif
 }
 

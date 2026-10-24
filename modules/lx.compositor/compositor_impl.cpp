@@ -95,6 +95,8 @@ struct output_pipeline {
     gfx::damage_region kms_pending{};
     /// Damage a failed composite could not draw, retried on the next tick.
     gfx::damage_region missed{};
+    /// Render clock: when this output last composited (slot catch-up waits for idle).
+    lx::runtime::clock_time last_composite_ns = 0;
     /// Frame index of the snapshot whose damage was last consumed.
     unsigned last_seen_frame = ~0u;
     /// Newest snapshot of this view acquired and composited (or skipped): -1 before any.
@@ -1453,6 +1455,20 @@ struct compositor_impl {
                           unsigned long long& area);
     /// Render. Commits `p`'s composited frame (and its cursor), or a cursor-only commit.
     const char* commit_output(output_pipeline& p, unsigned slot, bool composited);
+    /// Render, once `p` has composited nothing for `k_catch_up_idle_ns` with nothing in
+    /// flight (GL): every slot off screen whose age covers at least a quarter of the output
+    /// is brought up to date from the one on screen by a copy, so the busy frame that next
+    /// draws into it — the third slot is first drawn into by a frame composited while a flip
+    /// is pending — repaints only its own damage rather than the whole output. Not between
+    /// the frames of an animation: those repaint the same region anyway.
+    void catch_up_slots(output_pipeline& p);
+    /// Render. `p` is in a state a catch-up may run in, and some slot's age is large enough;
+    /// `front` receives the slot on screen. Owed catch-ups keep render from reporting quiet,
+    /// so the idle housekeeping tick runs it.
+    [[nodiscard]] bool catch_up_owed(const output_pipeline& p, unsigned& front) const;
+    static constexpr lx::runtime::clock_time k_catch_up_idle_ns = 200'000'000;
+    /// Render. A copy failed once: no more catch-ups (the frames repaint by buffer age).
+    bool catch_up_failed_ = false;
     /// Render. Every pipeline that needs a modeset and has a frame: one combined commit (M5).
     /// `kinds[slot]` receives what each pipeline committed.
     void commit_pending_modesets(const char** kinds);
@@ -8798,6 +8814,8 @@ bool compositor_impl::render_is_quiet() const {
             (p.kms && (p.composited_slot >= 0 || p.kms->flip_pending())) ||
             resume_gen_[p.slot].load(std::memory_order_acquire) != p.resume_done_gen)
             return false;
+        if (unsigned front = 0; catch_up_owed(p, front))
+            return false;
     }
     return true;
 }
@@ -10294,6 +10312,9 @@ void compositor::tick_render() {
             commit_kinds[up->slot] = impl->commit_output(*up, up->slot, composited[up->slot]);
         }
         impl->commit_pending_modesets(commit_kinds);
+        for (auto& up : impl->pipes_)
+            if (up && !composited[up->slot])
+                impl->catch_up_slots(*up);
     }
 
     // Screen capture that needs no new composite, window captures, curtains (before the
@@ -10495,6 +10516,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 if (i != back)
                     p.slot_age[i].add_region(frame_damage);
             p.slot_age[back].clear();
+            p.last_composite_ns = now_ns();
             p.kms_pending.add_region(frame_damage);
             p.frame_outstanding.store(p.kms != nullptr, std::memory_order_release);
             // Newest wins: a frame that could not be shown yet is superseded by this one
@@ -10562,6 +10584,63 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
     p.rendered_frame.store(static_cast<long long>(idx), std::memory_order_release);
     scene.release_render_frame(slot, snapshot);
     return drawn;
+}
+
+bool compositor_impl::catch_up_owed(const output_pipeline& p, unsigned& front) const {
+    if (!gl_present_ || catch_up_failed_ || !gl_compositor_.supports_target_copy() ||
+        p.slot_count < 2 || !p.kms || p.retiring || p.graveyard || p.staged ||
+        p.switch_pending || p.composited_slot >= 0 || !p.missed.empty() ||
+        !p.content_committed_once || p.kms->flip_pending() || p.kms->needs_modeset())
+        return false;
+    if (display_gate_.load(std::memory_order_acquire) != 0 ||
+        (gate_power_mask_.load(std::memory_order_acquire) & (1u << p.slot)) != 0)
+        return false;
+    // Nothing is waiting or queued, so the slot on screen holds the newest composite — the
+    // frame every other slot's age is measured against. Its own age is then empty; anything
+    // else means it is not that frame (its flip is drained but not noted yet).
+    front = p.front.load(std::memory_order_acquire);
+    if (front >= p.slot_count || !p.slot_age[front].empty())
+        return false;
+    const unsigned long long output_area =
+        static_cast<unsigned long long>(p.scanout_rect.width) * p.scanout_rect.height;
+    for (unsigned i = 0; i < p.slot_count; ++i) {
+        if (i == front || p.slot_age[i].empty())
+            continue;
+        gfx::damage_region region = p.slot_age[i];
+        region.clip(p.scanout_rect);
+        // A small age is cheaper to repaint with the frame that next uses the slot.
+        if ((region.full ? output_area : region.area()) * 4 >= output_area)
+            return true;
+    }
+    return false;
+}
+
+void compositor_impl::catch_up_slots(output_pipeline& p) {
+    unsigned front = 0;
+    if (!catch_up_owed(p, front) || now_ns() - p.last_composite_ns < k_catch_up_idle_ns)
+        return;
+    const unsigned long long output_area =
+        static_cast<unsigned long long>(p.scanout_rect.width) * p.scanout_rect.height;
+    for (unsigned i = 0; i < p.slot_count; ++i) {
+        if (i == front || p.slot_age[i].empty())
+            continue;
+        gfx::damage_region region = p.slot_age[i];
+        region.clip(p.scanout_rect);
+        const unsigned long long area = region.full ? output_area : region.area();
+        if (area * 4 < output_area)
+            continue;
+        lx::trace::scoped_span span{"render", "catch_up_slot"};
+        if (auto ok = gl_compositor_.copy_region(p.gl[front], p.gl[i], region); !ok) {
+            lx::trace::logger::global().log_error(ok.get_error(), "compositor.render");
+            catch_up_failed_ = true;
+            return;
+        }
+        p.slot_age[i].clear();
+        if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
+            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.render",
+                                             "slot catch-up output={} slot={} from={} area={}",
+                                             p.slot, i, front, area);
+    }
 }
 
 const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bool composited) {

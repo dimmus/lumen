@@ -699,6 +699,35 @@ A frame composited while a flip is queued waits in `composited_slot_` and is com
 soon as the CRTC is free. If another frame lands first it simply takes its place — mailbox
 semantics, so what reaches the display is always the newest content.
 
+**Idle slot catch-up (GL).** The third slot is drawn into only when a frame is composited
+while a flip is queued, which is the first busy moment. Until then it keeps the age it
+started with: the whole output, or everything damaged since. So that busy frame repainted
+the whole output. The drag smoke (G9) caught one of these in the middle of a drag.
+
+Now, once an output has composited nothing for 200 ms and nothing is queued, each slot off
+screen with an age of at least a quarter of the output is brought up to date. It is copied
+from the slot on screen, which then holds the newest frame, with `glBlitFramebuffer` over
+just that age (`gl_compositor::copy_region`, OpenGL ES 3.0). Its age is then empty, and the
+next frame drawn into it repaints only its own damage.
+
+The rules:
+
+- **Not between frames.** It never runs between the frames of an animation. Those frames
+  repaint the same region anyway, and catching up between them copied about 1.3 Mpx twice
+  per frame.
+- **Small ages are left alone.** Copying them twice per cursor blink would cost more than
+  the repaint they save.
+- **An owed catch-up keeps render from reporting quiet.** The idle housekeeping tick then
+  runs it, so it happens at most a second later.
+
+Measured on vmwgfx:
+
+- In the drag scenarios, the only full-output frames left are the first one or two after
+  start-up.
+- Over a whole app-smoke run, the mean repaint area per frame fell from 467k px to 385k px
+  (−18 %). The full-output frames left (267 → 248) are frames whose own damage is the whole
+  output: a workspace switch, a maximise.
+
 **The tick is phase-locked to the display.** A timer free-running at `target_fps` drifts
 against the real vblank cadence: ticks land while a flip is still queued and their work is
 wasted, and the visible rate settles well below the refresh rate for reasons that look like
