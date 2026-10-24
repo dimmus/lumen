@@ -127,6 +127,28 @@ public:
     void set_output_transfer(lx::transfer_function tf) { output_transfer_ = tf; }
     [[nodiscard]] lx::transfer_function output_transfer() const { return output_transfer_; }
 
+    /// ADR-010 §4.4: `surface` primitives in a UI stream (`:ui_vk`) are this compositor's
+    /// draws, recorded into the UI renderer's own render pass. `prepare_blits` records, on
+    /// `command_buffer` and outside any render pass, what `composite` records before its own:
+    /// the acquire of freshly imported client images; and it makes the 1×1 texture a solid
+    /// draw binds when `cmds` has one (an upload submitted on its own, once). Call it before
+    /// beginning the pass `record_blits` draws in.
+    [[nodiscard]] lx::result<void> prepare_blits(void* command_buffer, const blit_command* cmds,
+                                                 unsigned count);
+    /// Records `cmds` into the render pass the caller has begun on `command_buffer` — one
+    /// colour attachment of `vk_format` (a VkFormat), `width` × `height` — with the composite
+    /// shaders in a pipeline made for a pass compatible with `render_pass` (one per format,
+    /// cached; `pipeline_cache` is a VkPipelineCache or null), scissored to `scissor` and each
+    /// draw's clip. `encoded`: the attachment holds encoded values (a UI target, ADR-010
+    /// §4.5), so texels are not decoded to linear light — tint and opacity scale the encoded
+    /// values, as `gl_compositor` and `cpu_compositor::blend` do. Leaves its pipeline and
+    /// descriptor set bound: the caller binds its own again.
+    [[nodiscard]] lx::result<composite_stats> record_blits(void* command_buffer, void* render_pass,
+                                                           unsigned vk_format, void* pipeline_cache,
+                                                           unsigned width, unsigned height,
+                                                           const blit_command* cmds, unsigned count,
+                                                           lx::rect2i scissor, bool encoded);
+
     /// Copy the target back into tightly packed RGBA8 for golden-image verification.
     /// Synchronous (it waits for the GPU): tests and one-off reads only, never per frame.
     [[nodiscard]] lx::result<void> read_back(const render_target& target, unsigned char* rgba,
@@ -193,6 +215,20 @@ private:
     /// Blocks until every submitted frame slot has completed. Required before destroying
     /// any resource a queued command buffer might reference.
     void wait_all_slots_idle();
+
+    /// `record_blits`' pipelines, one per attachment format (a pipeline is compatible with
+    /// every render pass compatible with the one it was made for: one colour attachment of
+    /// the format). Fixed: a fifth format evicts the first.
+    static constexpr unsigned k_pass_pipelines = 4;
+    struct pass_pipeline {
+        unsigned format = 0;
+        void* pipeline = nullptr;
+    };
+    pass_pipeline pass_pipelines_[k_pass_pipelines]{};
+    /// Records the acquire of every imported image not yet acquired (outside a render pass).
+    void record_acquires(void* command_buffer);
+    /// Shared by `composite` and `prepare_blits`: the 1×1 texture solid draws bind.
+    [[nodiscard]] lx::result<void> ensure_solid_texture(const blit_command* cmds, unsigned count);
 
     static constexpr unsigned k_frame_slots = 2;
     static constexpr unsigned k_staging_ring_bytes = 16u * 1024u * 1024u;
@@ -347,6 +383,74 @@ constexpr VkFormat k_linear_format = VK_FORMAT_R16G16B16A16_SFLOAT;
 
 constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_UNORM;
 
+/// One blit's push constants: destination, the source box as a basis with its half-texel
+/// sampling bounds (`tex_w` × `tex_h`: the sampled texture; 0 for a solid draw), tint,
+/// opacity and the transfer slot to decode with.
+[[nodiscard]] quad_push make_quad_push(const lx::gfx::blit_command& cmd, unsigned tex_w,
+                                       unsigned tex_h, unsigned target_w, unsigned target_h,
+                                       int transfer) {
+    quad_push push{};
+    push.dst[0] = static_cast<float>(cmd.dst.x);
+    push.dst[1] = static_cast<float>(cmd.dst.y);
+    push.dst[2] = static_cast<float>(cmd.dst.width);
+    push.dst[3] = static_cast<float>(cmd.dst.height);
+    push.target[0] = static_cast<float>(target_w);
+    push.target[1] = static_cast<float>(target_h);
+    push.opacity = cmd.opacity;
+    if (cmd.solid) {
+        push.use_solid = 1.f;
+        push.solid[0] = cmd.solid_color.r;
+        push.solid[1] = cmd.solid_color.g;
+        push.solid[2] = cmd.solid_color.b;
+        push.solid[3] = cmd.solid_color.a;
+    }
+
+    // Source box in normalized coordinates (empty src: the whole texture), turned by
+    // the buffer transform — the same basis the GL backend uses.
+    {
+        float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
+        if (tex_w > 0 && tex_h > 0) {
+            const float tw = static_cast<float>(tex_w);
+            const float th = static_cast<float>(tex_h);
+            const lx::rect2f box = lx::gfx::effective_source(cmd.src, tex_w, tex_h);
+            u0 = box.x / tw;
+            v0 = box.y / th;
+            du = box.width / tw;
+            dv = box.height / th;
+            // Inset by half a texel on each side: linear filtering samples between
+            // texel centers, so without this a magnified crop reads its neighbours
+            // across the crop edge. Degenerate rects collapse to the center rather than
+            // inverting.
+            const float half_u = 0.5f / tw;
+            const float half_v = 0.5f / th;
+            float u_lo = u0 + half_u;
+            float v_lo = v0 + half_v;
+            float u_hi = u0 + du - half_u;
+            float v_hi = v0 + dv - half_v;
+            if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
+            if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
+            push.src_bounds[0] = u_lo;
+            push.src_bounds[1] = v_lo;
+            push.src_bounds[2] = u_hi;
+            push.src_bounds[3] = v_hi;
+        }
+        const lx::gfx::source_basis b = lx::gfx::source_basis_for(cmd.buffer_xform);
+        push.src_uv[0] = u0 + b.origin[0] * du;
+        push.src_uv[1] = v0 + b.origin[1] * dv;
+        push.src_uv[2] = b.dx[0] * du;
+        push.src_uv[3] = b.dx[1] * dv;
+        push.uv_dy[0] = b.dy[0] * du;
+        push.uv_dy[1] = b.dy[1] * dv;
+    }
+
+    push.tint[0] = cmd.tint.r;
+    push.tint[1] = cmd.tint.g;
+    push.tint[2] = cmd.tint.b;
+    push.tint[3] = cmd.tint.a;
+    push.transfer = transfer;
+        return push;
+}
+
 lx::error vk_error(const char* message) {
     return lx::make_error(lx::vulkan_err::device_lost, message);
 }
@@ -394,6 +498,102 @@ VkShaderModule create_shader(VkDevice dev, const uint32_t* code, std::size_t byt
     if (vkCreateShaderModule(dev, &info, nullptr, &module_handle) != VK_SUCCESS)
         return VK_NULL_HANDLE;
     return module_handle;
+}
+
+/// The composite pipeline (composite.vert/.frag, premultiplied source-over, viewport and
+/// scissor dynamic) for `render_pass`'s one colour attachment. Null on failure.
+VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_layout,
+                                     VkRenderPass render_pass, VkPipelineCache cache) {
+    VkShaderModule vert = create_shader(dev, k_composite_vert_spv, sizeof(k_composite_vert_spv));
+    VkShaderModule frag = create_shader(dev, k_composite_frag_spv, sizeof(k_composite_frag_spv));
+    if (!vert || !frag) {
+        if (vert)
+            vkDestroyShaderModule(dev, vert, nullptr);
+        if (frag)
+            vkDestroyShaderModule(dev, frag, nullptr);
+        return VK_NULL_HANDLE;
+    }
+
+    VkPipelineShaderStageCreateInfo stages[2]{};
+    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vert;
+    stages[0].pName = "main";
+    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = frag;
+    stages[1].pName = "main";
+
+    // Quad corners come from gl_VertexIndex, so there is no vertex input state.
+    VkPipelineVertexInputStateCreateInfo vertex_input{};
+    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
+
+    VkPipelineInputAssemblyStateCreateInfo input_assembly{};
+    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo viewport_state{};
+    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+
+    VkPipelineRasterizationStateCreateInfo raster{};
+    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
+    raster.polygonMode = VK_POLYGON_MODE_FILL;
+    raster.cullMode = VK_CULL_MODE_NONE;
+    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    raster.lineWidth = 1.f;
+
+    VkPipelineMultisampleStateCreateInfo multisample{};
+    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
+    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineColorBlendAttachmentState blend{};
+    blend.blendEnable = VK_TRUE;
+    blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend.colorBlendOp = VK_BLEND_OP_ADD;
+    blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+
+    VkPipelineColorBlendStateCreateInfo blend_state{};
+    blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
+    blend_state.attachmentCount = 1;
+    blend_state.pAttachments = &blend;
+
+    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
+                                              VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic{};
+    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
+    dynamic.dynamicStateCount = 2;
+    dynamic.pDynamicStates = dynamic_states;
+
+    VkGraphicsPipelineCreateInfo gpci{};
+    gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpci.stageCount = 2;
+    gpci.pStages = stages;
+    gpci.pVertexInputState = &vertex_input;
+    gpci.pInputAssemblyState = &input_assembly;
+    gpci.pViewportState = &viewport_state;
+    gpci.pRasterizationState = &raster;
+    gpci.pMultisampleState = &multisample;
+    gpci.pColorBlendState = &blend_state;
+    gpci.pDynamicState = &dynamic;
+    gpci.layout = pipeline_layout;
+    gpci.renderPass = render_pass;
+    gpci.subpass = 0;
+
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    const VkResult pipeline_result =
+        vkCreateGraphicsPipelines(dev, cache, 1, &gpci, nullptr, &pipeline);
+    vkDestroyShaderModule(dev, vert, nullptr);
+    vkDestroyShaderModule(dev, frag, nullptr);
+    if (pipeline_result != VK_SUCCESS)
+        return VK_NULL_HANDLE;
+    return pipeline;
 }
 
 } // namespace
@@ -760,95 +960,10 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
         return vk_error("vkCreatePipelineLayout failed");
     pipeline_layout_ = pipeline_layout;
 
-    VkShaderModule vert = create_shader(dev, k_composite_vert_spv, sizeof(k_composite_vert_spv));
-    VkShaderModule frag = create_shader(dev, k_composite_frag_spv, sizeof(k_composite_frag_spv));
-    if (!vert || !frag) {
-        if (vert)
-            vkDestroyShaderModule(dev, vert, nullptr);
-        if (frag)
-            vkDestroyShaderModule(dev, frag, nullptr);
-        return vk_error("composite shader module creation failed");
-    }
-
-    VkPipelineShaderStageCreateInfo stages[2]{};
-    stages[0].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[0].stage = VK_SHADER_STAGE_VERTEX_BIT;
-    stages[0].module = vert;
-    stages[0].pName = "main";
-    stages[1].sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
-    stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
-    stages[1].module = frag;
-    stages[1].pName = "main";
-
-    // Quad corners come from gl_VertexIndex, so there is no vertex input state.
-    VkPipelineVertexInputStateCreateInfo vertex_input{};
-    vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
-
-    VkPipelineInputAssemblyStateCreateInfo input_assembly{};
-    input_assembly.sType = VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO;
-    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-
-    VkPipelineViewportStateCreateInfo viewport_state{};
-    viewport_state.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO;
-    viewport_state.viewportCount = 1;
-    viewport_state.scissorCount = 1;
-
-    VkPipelineRasterizationStateCreateInfo raster{};
-    raster.sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO;
-    raster.polygonMode = VK_POLYGON_MODE_FILL;
-    raster.cullMode = VK_CULL_MODE_NONE;
-    raster.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    raster.lineWidth = 1.f;
-
-    VkPipelineMultisampleStateCreateInfo multisample{};
-    multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
-    multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
-
-    VkPipelineColorBlendAttachmentState blend{};
-    blend.blendEnable = VK_TRUE;
-    blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-    blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend.colorBlendOp = VK_BLEND_OP_ADD;
-    blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend.alphaBlendOp = VK_BLEND_OP_ADD;
-    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
-
-    VkPipelineColorBlendStateCreateInfo blend_state{};
-    blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
-    blend_state.attachmentCount = 1;
-    blend_state.pAttachments = &blend;
-
-    const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
-                                              VK_DYNAMIC_STATE_SCISSOR};
-    VkPipelineDynamicStateCreateInfo dynamic{};
-    dynamic.sType = VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO;
-    dynamic.dynamicStateCount = 2;
-    dynamic.pDynamicStates = dynamic_states;
-
-    VkGraphicsPipelineCreateInfo gpci{};
-    gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
-    gpci.stageCount = 2;
-    gpci.pStages = stages;
-    gpci.pVertexInputState = &vertex_input;
-    gpci.pInputAssemblyState = &input_assembly;
-    gpci.pViewportState = &viewport_state;
-    gpci.pRasterizationState = &raster;
-    gpci.pMultisampleState = &multisample;
-    gpci.pColorBlendState = &blend_state;
-    gpci.pDynamicState = &dynamic;
-    gpci.layout = pipeline_layout;
-    gpci.renderPass = render_pass;
-    gpci.subpass = 0;
-
-    VkPipeline pipeline = VK_NULL_HANDLE;
-    const VkResult pipeline_result =
-        vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipeline);
-    vkDestroyShaderModule(dev, vert, nullptr);
-    vkDestroyShaderModule(dev, frag, nullptr);
-    if (pipeline_result != VK_SUCCESS)
-        return vk_error("vkCreateGraphicsPipelines failed");
+    VkPipeline pipeline =
+        create_composite_pipeline(dev, pipeline_layout, render_pass, VK_NULL_HANDLE);
+    if (!pipeline)
+        return vk_error("composite pipeline creation failed");
     pipeline_ = pipeline;
 
     VkCommandBufferAllocateInfo cbai{};
@@ -954,6 +1069,9 @@ void lx::gfx::vulkan_compositor::shutdown() {
         encode_set_layout_ = nullptr;
         encode_set_ = nullptr; // freed with the pool below
 
+        for (pass_pipeline& p : pass_pipelines_)
+            if (p.pipeline)
+                vkDestroyPipeline(dev, static_cast<VkPipeline>(p.pipeline), nullptr);
         if (pipeline_)
             vkDestroyPipeline(dev, static_cast<VkPipeline>(pipeline_), nullptr);
         if (pipeline_layout_)
@@ -985,6 +1103,8 @@ void lx::gfx::vulkan_compositor::shutdown() {
     staging_offset_ = 0;
     submit_slot_ = 0;
     pipeline_ = nullptr;
+    for (pass_pipeline& p : pass_pipelines_)
+        p = {};
     pipeline_layout_ = nullptr;
     descriptor_pool_ = nullptr;
     descriptor_layout_ = nullptr;
@@ -1810,16 +1930,8 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
         return framebuffer.get_error();
 
     // A solid draw needs some bound descriptor set (see `k_solid_texture_id`).
-    if (find_texture(k_solid_texture_id) < 0) {
-        bool any_solid = false;
-        for (unsigned i = 0; i < count && cmds && !any_solid; ++i)
-            any_solid = cmds[i].solid;
-        if (any_solid) {
-            static const unsigned char k_white[4] = {255, 255, 255, 255};
-            if (auto up = upload_rgba(k_solid_texture_id, 1, 1, k_white); !up)
-                return up.get_error();
-        }
-    }
+    if (auto solid = ensure_solid_texture(cmds, count); !solid)
+        return solid.get_error();
 
     const unsigned slot = submit_slot_;
     auto fence = static_cast<VkFence>(fences_[slot]);
@@ -1836,34 +1948,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cb, &begin);
 
-    // Acquire freshly imported client images. A dma-buf written by another device has no
-    // Vulkan release to pair with, so the acquire comes from the foreign queue family and
-    // the modifier — not a Vulkan layout — is what guarantees the contents survive.
-    for (unsigned i = 0; i < k_max_textures; ++i) {
-        auto& slot = textures_[i];
-        if (!slot.used || slot.layout_ready || !slot.image || slot.owns_image)
-            continue;
-
-        VkImageMemoryBarrier acquire{};
-        acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        acquire.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        acquire.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        acquire.srcQueueFamilyIndex = ctx_.supports_queue_family_foreign
-                                          ? VK_QUEUE_FAMILY_FOREIGN_EXT
-                                          : VK_QUEUE_FAMILY_IGNORED;
-        acquire.dstQueueFamilyIndex = ctx_.supports_queue_family_foreign
-                                          ? ctx_.queue_family
-                                          : VK_QUEUE_FAMILY_IGNORED;
-        acquire.image = static_cast<VkImage>(slot.image);
-        acquire.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        acquire.subresourceRange.levelCount = 1;
-        acquire.subresourceRange.layerCount = 1;
-        acquire.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                             &acquire);
-        slot.layout_ready = true;
-    }
+    record_acquires(cb);
 
     // The attachment holds linear light, so the clear colour has to be decoded too —
     // clearing with the encoded value would make the background the wrong brightness.
@@ -1946,66 +2031,9 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
         }
         vkCmdSetScissor(cb, 0, 1, &draw_scissor);
 
-        quad_push push{};
-        push.dst[0] = static_cast<float>(cmd.dst.x);
-        push.dst[1] = static_cast<float>(cmd.dst.y);
-        push.dst[2] = static_cast<float>(cmd.dst.width);
-        push.dst[3] = static_cast<float>(cmd.dst.height);
-        push.target[0] = static_cast<float>(target.width());
-        push.target[1] = static_cast<float>(target.height());
-        push.opacity = cmd.opacity;
-        if (cmd.solid) {
-            push.use_solid = 1.f;
-            push.solid[0] = cmd.solid_color.r;
-            push.solid[1] = cmd.solid_color.g;
-            push.solid[2] = cmd.solid_color.b;
-            push.solid[3] = cmd.solid_color.a;
-        }
-
-        // Source box in normalized coordinates (empty src: the whole texture), turned by
-        // the buffer transform — the same basis the GL backend uses.
-        {
-            float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
-            if (slot_ptr && slot_ptr->width > 0 && slot_ptr->height > 0) {
-                const texture_slot& slot = *slot_ptr;
-                const float tw = static_cast<float>(slot.width);
-                const float th = static_cast<float>(slot.height);
-                const lx::rect2f box = effective_source(cmd.src, slot.width, slot.height);
-                u0 = box.x / tw;
-                v0 = box.y / th;
-                du = box.width / tw;
-                dv = box.height / th;
-                // Inset by half a texel on each side: linear filtering samples between
-                // texel centers, so without this a magnified crop reads its neighbours
-                // across the crop edge. Degenerate rects collapse to the center rather than
-                // inverting.
-                const float half_u = 0.5f / tw;
-                const float half_v = 0.5f / th;
-                float u_lo = u0 + half_u;
-                float v_lo = v0 + half_v;
-                float u_hi = u0 + du - half_u;
-                float v_hi = v0 + dv - half_v;
-                if (u_lo > u_hi) u_lo = u_hi = 0.5f * (u_lo + u_hi);
-                if (v_lo > v_hi) v_lo = v_hi = 0.5f * (v_lo + v_hi);
-                push.src_bounds[0] = u_lo;
-                push.src_bounds[1] = v_lo;
-                push.src_bounds[2] = u_hi;
-                push.src_bounds[3] = v_hi;
-            }
-            const source_basis b = source_basis_for(cmd.buffer_xform);
-            push.src_uv[0] = u0 + b.origin[0] * du;
-            push.src_uv[1] = v0 + b.origin[1] * dv;
-            push.src_uv[2] = b.dx[0] * du;
-            push.src_uv[3] = b.dx[1] * dv;
-            push.uv_dy[0] = b.dy[0] * du;
-            push.uv_dy[1] = b.dy[1] * dv;
-        }
-
-        push.tint[0] = cmd.tint.r;
-        push.tint[1] = cmd.tint.g;
-        push.tint[2] = cmd.tint.b;
-        push.tint[3] = cmd.tint.a;
-        push.transfer = transfer_slot(cmd.src_transfer);
+        const quad_push push =
+            make_quad_push(cmd, slot_ptr ? slot_ptr->width : 0u, slot_ptr ? slot_ptr->height : 0u,
+                           target.width(), target.height(), transfer_slot(cmd.src_transfer));
 
         vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
@@ -2059,6 +2087,194 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
     (void)cmds;
     (void)count;
     return lx::not_implemented("lx::gfx::vulkan_compositor::composite");
+#endif
+}
+
+void lx::gfx::vulkan_compositor::record_acquires(void* command_buffer) {
+#if defined(LUMEN_HAS_VULKAN)
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    // Acquire freshly imported client images. A dma-buf written by another device has no
+    // Vulkan release to pair with, so the acquire comes from the foreign queue family and
+    // the modifier — not a Vulkan layout — is what guarantees the contents survive.
+    for (unsigned i = 0; i < k_max_textures; ++i) {
+        auto& slot = textures_[i];
+        if (!slot.used || slot.layout_ready || !slot.image || slot.owns_image)
+            continue;
+
+        VkImageMemoryBarrier acquire{};
+        acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        acquire.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        acquire.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        acquire.srcQueueFamilyIndex = ctx_.supports_queue_family_foreign
+                                          ? VK_QUEUE_FAMILY_FOREIGN_EXT
+                                          : VK_QUEUE_FAMILY_IGNORED;
+        acquire.dstQueueFamilyIndex = ctx_.supports_queue_family_foreign
+                                          ? ctx_.queue_family
+                                          : VK_QUEUE_FAMILY_IGNORED;
+        acquire.image = static_cast<VkImage>(slot.image);
+        acquire.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        acquire.subresourceRange.levelCount = 1;
+        acquire.subresourceRange.layerCount = 1;
+        acquire.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
+                             &acquire);
+        slot.layout_ready = true;
+    }
+#else
+    (void)command_buffer;
+#endif
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::ensure_solid_texture(const blit_command* cmds,
+                                                                  unsigned count) {
+    if (find_texture(k_solid_texture_id) >= 0)
+        return {};
+    bool any_solid = false;
+    for (unsigned i = 0; i < count && cmds && !any_solid; ++i)
+        any_solid = cmds[i].solid;
+    if (!any_solid)
+        return {};
+    static const unsigned char k_white[4] = {255, 255, 255, 255};
+    return upload_rgba(k_solid_texture_id, 1, 1, k_white);
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::prepare_blits(void* command_buffer,
+                                                           const blit_command* cmds,
+                                                           unsigned count) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    if (!ready() || !command_buffer)
+        return lx::not_implemented("lx::gfx::vulkan_compositor::prepare_blits");
+    if (auto solid = ensure_solid_texture(cmds, count); !solid)
+        return solid.get_error();
+    record_acquires(command_buffer);
+    return {};
+#else
+    (void)command_buffer;
+    (void)cmds;
+    (void)count;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::prepare_blits");
+#endif
+}
+
+lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
+    void* command_buffer, void* render_pass, unsigned vk_format, void* pipeline_cache,
+    unsigned width, unsigned height, const blit_command* cmds, unsigned count,
+    lx::rect2i scissor, bool encoded) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    if (!ready() || !command_buffer || !render_pass)
+        return lx::not_implemented("lx::gfx::vulkan_compositor::record_blits");
+    if (width == 0 || height == 0)
+        return lx::invalid_argument("record_blits into an empty attachment");
+    auto dev = static_cast<VkDevice>(ctx_.device);
+
+    // The pipeline for this attachment format, made once.
+    void* pipeline = nullptr;
+    for (const pass_pipeline& p : pass_pipelines_)
+        if (p.pipeline && p.format == vk_format)
+            pipeline = p.pipeline;
+    if (!pipeline) {
+        VkPipeline made = create_composite_pipeline(
+            dev, static_cast<VkPipelineLayout>(pipeline_layout_),
+            static_cast<VkRenderPass>(render_pass), static_cast<VkPipelineCache>(pipeline_cache));
+        if (!made)
+            return vk_error("record_blits pipeline creation failed");
+        unsigned slot = 0;
+        while (slot < k_pass_pipelines && pass_pipelines_[slot].pipeline)
+            ++slot;
+        if (slot == k_pass_pipelines) {
+            // Evicted: whatever recorded it may still be in flight.
+            (void)vkDeviceWaitIdle(dev);
+            vkDestroyPipeline(dev, static_cast<VkPipeline>(pass_pipelines_[0].pipeline), nullptr);
+            slot = 0;
+        }
+        pass_pipelines_[slot] = {vk_format, made};
+        pipeline = made;
+    }
+
+    composite_stats stats{};
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, static_cast<VkPipeline>(pipeline));
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(width);
+    viewport.height = static_cast<float>(height);
+    viewport.maxDepth = 1.f;
+    vkCmdSetViewport(cb, 0, 1, &viewport);
+
+    void* bound_set = nullptr;
+    for (unsigned i = 0; i < count && cmds; ++i) {
+        const blit_command& cmd = cmds[i];
+        if (cmd.occluded || draw_invisible(cmd)) {
+            ++stats.draws_culled;
+            continue;
+        }
+        // As `composite`: a solid draw samples nothing, any set will do.
+        const int index =
+            find_texture(cmd.solid ? (bound_set ? 0u : k_solid_texture_id) : cmd.texture_id);
+        if (index < 0 && !(cmd.solid && bound_set)) {
+            ++stats.draws_skipped;
+            continue;
+        }
+        const texture_slot* slot_ptr =
+            index >= 0 && !cmd.solid ? &textures_[static_cast<unsigned>(index)] : nullptr;
+        void* want_set = index >= 0 ? textures_[static_cast<unsigned>(index)].descriptor_set
+                                    : bound_set;
+        if (!want_set) {
+            ++stats.draws_skipped;
+            continue;
+        }
+        lx::rect2i clip = scissor;
+        if (cmd.clip.width > 0 && cmd.clip.height > 0) {
+            const long long x0 = clip.x > cmd.clip.x ? clip.x : cmd.clip.x;
+            const long long y0 = clip.y > cmd.clip.y ? clip.y : cmd.clip.y;
+            const long long x1 = std::min(static_cast<long long>(clip.x) + clip.width,
+                                          static_cast<long long>(cmd.clip.x) + cmd.clip.width);
+            const long long y1 = std::min(static_cast<long long>(clip.y) + clip.height,
+                                          static_cast<long long>(cmd.clip.y) + cmd.clip.height);
+            clip = x1 > x0 && y1 > y0 ? lx::rect2i{static_cast<int>(x0), static_cast<int>(y0),
+                                                   static_cast<int>(x1 - x0),
+                                                   static_cast<int>(y1 - y0)}
+                                      : lx::rect2i{};
+        }
+        if (clip.width <= 0 || clip.height <= 0 || clip.x < 0 || clip.y < 0) {
+            ++stats.draws_culled;
+            continue;
+        }
+        if (want_set != bound_set) {
+            auto set = static_cast<VkDescriptorSet>(want_set);
+            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    static_cast<VkPipelineLayout>(pipeline_layout_), 0, 1, &set,
+                                    0, nullptr);
+            bound_set = want_set;
+        }
+        VkRect2D rect{};
+        rect.offset = {clip.x, clip.y};
+        rect.extent = {static_cast<unsigned>(clip.width), static_cast<unsigned>(clip.height)};
+        vkCmdSetScissor(cb, 0, 1, &rect);
+        // Encoded target: transfer slot 0 ("linear") is the identity — the texel's encoded
+        // values blend as they are.
+        const quad_push push =
+            make_quad_push(cmd, slot_ptr ? slot_ptr->width : 0u, slot_ptr ? slot_ptr->height : 0u,
+                           width, height, encoded ? 0 : transfer_slot(cmd.src_transfer));
+        vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
+                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                           sizeof(push), &push);
+        vkCmdDraw(cb, 6, 1, 0, 0);
+        ++stats.draws_submitted;
+    }
+    return stats;
+#else
+    (void)command_buffer;
+    (void)render_pass;
+    (void)vk_format;
+    (void)pipeline_cache;
+    (void)width;
+    (void)height;
+    (void)cmds;
+    (void)count;
+    (void)scissor;
+    (void)encoded;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::record_blits");
 #endif
 }
 

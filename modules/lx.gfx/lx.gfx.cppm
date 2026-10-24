@@ -30,6 +30,7 @@ export import :gl_capture;
 export import :atlas;
 export import :ui_cpu;
 export import :ui_gl;
+export import :ui_vk;
 
 export namespace lx::gfx {
 

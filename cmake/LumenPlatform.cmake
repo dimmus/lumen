@@ -87,7 +87,11 @@ else()
 endif()
 
 # Compile GLSL sources to SPIR-V as C initializer lists so shaders are embedded in the
-# binary; a compositor must not depend on shader files at runtime.
+# binary; a compositor must not depend on shader files at runtime. A source may #include
+# (GL_GOOGLE_include_directive, relative to itself): glslc's depfile rebuilds it when an
+# included file changes. Varyings without a location get one by declaration order
+# (-fauto-map-locations), which is how the GLSL shared with GLES (ADR-010's ui/*.glsl) is
+# written; a stage pair must then declare its varyings in the same order.
 function(lumen_compile_shaders target)
     if(NOT LUMEN_HAS_GLSLC)
         return()
@@ -100,8 +104,10 @@ function(lumen_compile_shaders target)
         set(out "${out_dir}/${name}.spv.h")
         add_custom_command(
             OUTPUT "${out}"
-            COMMAND ${LUMEN_GLSLC} --target-env=vulkan1.1 -O -mfmt=c -o "${out}" "${src}"
+            COMMAND ${LUMEN_GLSLC} --target-env=vulkan1.1 -O -fauto-map-locations -mfmt=c
+                    -MD -MF "${out}.d" -o "${out}" "${src}"
             DEPENDS "${src}"
+            DEPFILE "${out}.d"
             COMMENT "glslc ${name}"
             VERBATIM
         )
@@ -110,6 +116,31 @@ function(lumen_compile_shaders target)
     add_custom_target(${target}-shaders DEPENDS ${outputs})
     add_dependencies(${target} ${target}-shaders)
     target_compile_definitions(${target} PRIVATE LUMEN_HAS_SHADERS=1)
+endfunction()
+
+# Embed GLSL sources as C++ raw string literals — `${out_dir}/<subdir>/<name>.h`, one
+# `R"lxglsl(...)lxglsl"` each — for a backend that compiles them at run time (ui_gl, GLES)
+# from the same files another compiles to SPIR-V (ui_vk). Independent of glslc. Usage:
+#   lumen_embed_glsl(target subdir file...)  →  #include "shaders/<subdir>/<file>.h"
+function(lumen_embed_glsl target subdir)
+    set(out_dir "${CMAKE_BINARY_DIR}/generated/shaders/${subdir}")
+    file(MAKE_DIRECTORY "${out_dir}")
+    set(outputs "")
+    foreach(src IN LISTS ARGN)
+        get_filename_component(name "${src}" NAME)
+        set(out "${out_dir}/${name}.h")
+        add_custom_command(
+            OUTPUT "${out}"
+            COMMAND ${CMAKE_COMMAND} -DIN=${src} -DOUT=${out}
+                    -P "${CMAKE_SOURCE_DIR}/cmake/LumenEmbedText.cmake"
+            DEPENDS "${src}" "${CMAKE_SOURCE_DIR}/cmake/LumenEmbedText.cmake"
+            COMMENT "embed ${subdir}/${name}"
+            VERBATIM
+        )
+        list(APPEND outputs "${out}")
+    endforeach()
+    add_custom_target(${target}-glsl-${subdir} DEPENDS ${outputs})
+    add_dependencies(${target} ${target}-glsl-${subdir})
 endfunction()
 
 # Link platform libs and define LUMEN_HAS_* on a target (executables + modules).

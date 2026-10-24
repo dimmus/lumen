@@ -237,6 +237,21 @@ The ring is sized for 25 000 primitives per frame; overflow drops with one warni
 run, never grows. The existing Vulkan compositor's `upload_rgba` (which waits for every
 frame slot before each upload) is replaced by the staging ring on the same path.
 
+As built in Phase 1, `:ui_vk` differs from the Vulkan column in these details: the batch's
+offset is a push constant (its first word in the ring slot, with its atlas page), not
+`firstInstance` — the kinds have different strides, so a batch's offset is not a multiple
+of its own; the pipelines are five (`path` shares mono's, as in `:ui_gl`) plus the
+compositor's composite pipeline for `surface`, made for the UI pass by
+`vulkan_compositor::record_blits`; the sampler array has 8 entries (`k_atlas_pages` = 6 used,
+the rest a 1×1 dummy), indexed through a switch because the compositor's device does not
+enable `shaderSampledImageArrayDynamicIndexing`; at Vulkan 1.1 the "dynamic rendering-style
+load" is a render pass with loadOp LOAD and a `vkCmdClearAttachments` per damage rect; the
+timestamps bracket the frame, not each kind. The GLSL is one set of files (shaders/ui/*.glsl)
+that `:ui_gl` compiles at run time and `:ui_vk` at build time. `renderer.cppm`'s key table
+stays: the compositor's `frame_renderer` still uses it. The compositor's `upload_rgba` still
+waits on its frame slots — the staging ring belongs to `:ui_vk` and has not been moved under
+the compositor's shm uploads yet.
+
 ### 4.5 Colour and precision
 
 - Theme colours are stored twice at compile time: sRGB `u8×4` for tools, premultiplied

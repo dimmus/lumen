@@ -743,6 +743,27 @@ p95, so no `iritur-gl` baseline is committed. Where the time goes on this host:
   and 0.9–7 KB (S2) inside Mesa (sync objects, command buffers), which the script counts as
   a G5 failure — the driver's heap, not the frame path's.
 
+### UI primitives on Vulkan (`lx.gfx:ui_vk`, ADR-010 Phase 1)
+
+`lx.gfx:ui_vk` draws the same stream with the same GLSL: `shaders/ui/*.glsl` is one set of
+files that `ui_gl` embeds as strings and compiles at run time and `ui_vk` compiles to SPIR-V
+at build time (`ui_<kind>.vert/.frag` add the Vulkan prologue — the ring as a std430 buffer
+at a push-constant offset, the globals block, the eight page samplers). Against the CPU
+references every golden case is within 2/255, and within 2/255 of `ui_gl` on SVGA3D (G10:
+3 and 2); `test_ui_golden_vk_validation` runs the Vulkan cases under
+VK_LAYER_KHRONOS_validation and requires an empty error log (a run with synchronization
+validation on, `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`, logged nothing either).
+
+The only Vulkan on the F8 host is lavapipe, a CPU device: these are **lavapipe numbers,
+correctness only**. Pipeline creation for the five pipelines is 42–65 ms cold and the same
+warm: lavapipe keeps nothing in a `VkPipelineCache` (its data is a truncated 20-byte header,
+which `ui_vk` does not write to disk), so the warm start is untested on a caching driver.
+`lumen-ui-bench --backend vulkan` runs every scenario (S3: one draw, 800 080 instance bytes,
+`submit` p50 ≈ 0.17 ms, `gpu` ≈ 60 ms of llvmpipe shading per full 1919×1080 frame); its rows
+are labelled `vulkan-software` and scripts/ui-bench.sh neither compares them nor makes them a
+baseline. No `operator new` in a steady frame; lavapipe's own threads move `mallinfo2` by
+0.2–1.2 KB per run.
+
 ---
 
 ## 6.1 Frame clock and scanout rotation

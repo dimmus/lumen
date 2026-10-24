@@ -781,6 +781,166 @@ inline void fetch(const tile_sampler& t, int i, int j, float (&out)[4]) {
 
 } // namespace lx::gfx::ui_raster
 
+// ── What the GPU backends share (`:ui_gl`, `:ui_vk`) ────────────────────────────────
+//
+// Not exported: module-internal, visible to the partitions that import this one. The stream
+// is encoded into a ring slot the same way by both, so the batches, their instance counts
+// and every skip rule agree — and with them the pixels.
+
+namespace lx::gfx::ui_encode {
+
+/// Bytes per instance of a batch's kind in a ring slot; 0 for surfaces (they stay blit
+/// commands).
+[[nodiscard]] inline unsigned stride(primitive_kind kind) {
+    switch (kind) {
+    case primitive_kind::quad: return sizeof(quad_instance);
+    case primitive_kind::shadow: return sizeof(shadow_instance);
+    case primitive_kind::mono_sprite:
+    case primitive_kind::poly_sprite:
+    case primitive_kind::path: return sizeof(sprite_instance);
+    case primitive_kind::underline: return sizeof(underline_instance);
+    case primitive_kind::surface: return 0;
+    }
+    return 0;
+}
+
+[[nodiscard]] inline bool meets(lx::rect2i a, lx::rect2i b) {
+    return a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0 && a.x < b.x + b.width &&
+           b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+}
+
+[[nodiscard]] inline lx::rect2i intersect(lx::rect2i a, lx::rect2i b) {
+    const long long x0 = a.x > b.x ? a.x : b.x;
+    const long long y0 = a.y > b.y ? a.y : b.y;
+    const long long ax1 = static_cast<long long>(a.x) + a.width;
+    const long long bx1 = static_cast<long long>(b.x) + b.width;
+    const long long ay1 = static_cast<long long>(a.y) + a.height;
+    const long long by1 = static_cast<long long>(b.y) + b.height;
+    const long long x1 = ax1 < bx1 ? ax1 : bx1;
+    const long long y1 = ay1 < by1 ? ay1 : by1;
+    if (x1 <= x0 || y1 <= y0)
+        return {};
+    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
+            static_cast<int>(y1 - y0)};
+}
+
+/// Copies the batch's instances (refs `first`, `count`) of one kind into `out`, in sorted
+/// order, a run of consecutive indices with one memcpy. `valid(index)` rejects an instance
+/// (skipped and counted). Returns the instances written.
+template <typename Instance, typename Valid>
+unsigned gather(std::span<const primitive_ref> refs, std::uint32_t first, std::uint32_t count,
+                std::span<const Instance> instances, std::byte* out, unsigned& skipped,
+                Valid&& valid) {
+    unsigned written = 0;
+    std::size_t run_start = 0;
+    std::size_t run_len = 0;
+    const auto flush = [&]() {
+        if (run_len == 0)
+            return;
+        std::memcpy(out + static_cast<std::size_t>(written) * sizeof(Instance),
+                    instances.data() + run_start, run_len * sizeof(Instance));
+        written += static_cast<unsigned>(run_len);
+        run_len = 0;
+    };
+    const std::size_t end = static_cast<std::size_t>(first) + count;
+    for (std::size_t i = first; i < end && i < refs.size(); ++i) {
+        const std::uint32_t index = refs[i].index;
+        if (index >= instances.size() || !valid(instances[index])) {
+            ++skipped;
+            continue;
+        }
+        if (run_len > 0 && index == run_start + run_len) {
+            ++run_len;
+            continue;
+        }
+        flush();
+        run_start = index;
+        run_len = 1;
+    }
+    flush();
+    return written;
+}
+
+struct encode_counts {
+    unsigned encoded = 0;        ///< instances written
+    unsigned skipped = 0;        ///< bad index, missing or mismatched page, bad uv
+    unsigned overflow_drops = 0; ///< primitives of batches that did not fit the slot
+};
+
+/// Encodes `stream` into one ring slot of `capacity` bytes: every batch's valid instances,
+/// contiguous and in sorted order, the batches one after another. `batch_word[b]` gets the
+/// batch's first word in the slot and `batch_count[b]` its instances (0: nothing to draw),
+/// for the first `k_max_batches` batches; a batch that does not fit is dropped whole
+/// (warn_and_drop: the caller sees the count). Sprite batches keep `:ui_cpu`'s rule: the page
+/// must exist with the kind's format, each instance on the batch's page with its tile inside
+/// it. Returns the bytes written.
+[[nodiscard]] inline std::size_t encode(const ui_stream& stream, const atlas* a, std::byte* slot,
+                                        std::size_t capacity, std::uint32_t* batch_word,
+                                        std::uint32_t* batch_count, encode_counts& counts) {
+    std::size_t cursor = 0;
+    const std::size_t batches = stream.batches.size();
+    for (std::size_t b = 0; b < batches && b < k_max_batches; ++b) {
+        const batch& bt = stream.batches[b];
+        batch_word[b] = 0;
+        batch_count[b] = 0;
+        const unsigned size = stride(bt.kind);
+        if (size == 0)
+            continue;
+        const std::size_t need = static_cast<std::size_t>(bt.count) * size;
+        if (cursor + need > capacity) {
+            counts.overflow_drops += bt.count;
+            continue;
+        }
+        std::byte* out = slot + cursor;
+        unsigned& skipped = counts.skipped;
+        unsigned n = 0;
+        switch (bt.kind) {
+        case primitive_kind::quad:
+            n = gather(stream.refs, bt.first, bt.count, stream.quads, out, skipped,
+                       [](const quad_instance&) { return true; });
+            break;
+        case primitive_kind::shadow:
+            n = gather(stream.refs, bt.first, bt.count, stream.shadows, out, skipped,
+                       [](const shadow_instance&) { return true; });
+            break;
+        case primitive_kind::underline:
+            n = gather(stream.refs, bt.first, bt.count, stream.underlines, out, skipped,
+                       [](const underline_instance&) { return true; });
+            break;
+        case primitive_kind::mono_sprite:
+        case primitive_kind::poly_sprite:
+        case primitive_kind::path: {
+            const atlas_page_view page = a ? a->page(bt.page) : atlas_page_view{};
+            const atlas_format want =
+                bt.kind == primitive_kind::poly_sprite ? atlas_format::rgba8 : atlas_format::r8;
+            if (!page.valid() || page.format != want || bt.page >= k_atlas_pages) {
+                skipped += bt.count;
+                break;
+            }
+            const unsigned page_size = page.size;
+            const std::uint8_t pg = bt.page;
+            n = gather(stream.refs, bt.first, bt.count, stream.sprites, out, skipped,
+                       [page_size, pg](const sprite_instance& sp) {
+                           return sp.page == pg && sp.uv[2] > sp.uv[0] && sp.uv[3] > sp.uv[1] &&
+                                  sp.uv[2] <= page_size && sp.uv[3] <= page_size;
+                       });
+            break;
+        }
+        case primitive_kind::surface:
+            break;
+        }
+        batch_word[b] = static_cast<std::uint32_t>(cursor / 4u);
+        batch_count[b] = n;
+        cursor += static_cast<std::size_t>(n) * size;
+        counts.encoded += n;
+    }
+    for (std::size_t b = k_max_batches; b < batches; ++b)
+        counts.overflow_drops += stream.batches[b].count;
+    return cursor;
+}
+
+} // namespace lx::gfx::ui_encode
+
 // ── ui_cpu_renderer ─────────────────────────────────────────────────────────────
 
 namespace {

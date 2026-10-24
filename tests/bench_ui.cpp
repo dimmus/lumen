@@ -21,9 +21,15 @@
 // G3 stays comparable across backends), and `gpu`, the frame's GPU time from
 // GL_EXT_disjoint_timer_query, or, without one, the wall time from the flush to the frame's
 // fence ("fence-wall"; the JSON's `gpu.timing` says which). A software GL_RENDERER
-// (llvmpipe) is refused: its numbers are not GPU numbers.
+// (llvmpipe) is refused: its numbers are not GPU numbers. `vulkan` draws it with
+// `gfx::ui_vk_renderer` into an R8G8B8A8_UNORM image on the device `device_selector` picks,
+// with the same `submit` (CPU: upload, gather, record, vkQueueSubmit) and `gpu` (timestamps,
+// or fence-wall) stages. A CPU device (lavapipe) is not refused — it is the only Vulkan some
+// hosts have, and the path is worth exercising — but its rows say so: the JSON's `driver` is
+// "vulkan-software" and `gpu.software` true, and scripts/ui-bench.sh never compares them nor
+// makes them a baseline.
 //
-//   lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu|gl] [--frames N] [--warmup N]
+//   lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu|gl|vulkan] [--frames N] [--warmup N]
 //                  [--period-us US] [--json PATH] [--pin CPU|none] [--scale F] [--git SHA]
 //                  [--preset NAME] [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]
 //
@@ -257,6 +263,69 @@ gl_info g_gl_info{};
     return true;
 }
 
+// ── The `vulkan` backend ────────────────────────────────────────────────────────
+//
+// One device and one renderer for the run, on the bench thread (the queue is submitted to
+// from one thread).
+
+struct vk_backend {
+    lx::gfx::device device{};
+    lx::gfx::ui_vk_renderer renderer{};
+    std::uint64_t setup_cold_ns = 0; ///< the first `initialize`: pipelines from the disk cache, if any
+    std::uint64_t setup_warm_ns = 0; ///< a second one (shutdown, initialize again)
+
+    vk_backend() = default;
+    vk_backend(const vk_backend&) = delete;
+    vk_backend& operator=(const vk_backend&) = delete;
+    ~vk_backend() { renderer.shutdown(); } // before the device
+};
+
+vk_backend* g_vk = nullptr;
+
+struct vk_info {
+    bool valid = false;
+    lx::gfx::ui_vk_caps caps{};
+    std::uint64_t setup_cold_ns = 0;
+    std::uint64_t setup_warm_ns = 0;
+    std::uint64_t cache_bytes_loaded = 0;
+};
+
+vk_info g_vk_info{};
+
+[[nodiscard]] bool start_vk(vk_backend& vk) {
+    auto selected = lx::gfx::device_selector::select_best();
+    if (!selected || !selected->context().valid()) {
+        std::fprintf(stderr, "lumen-ui-bench: vulkan: no Vulkan device\n");
+        return false;
+    }
+    vk.device = std::move(selected).value();
+    if (auto ok = vk.renderer.initialize(vk.device.context()); !ok) {
+        std::fprintf(stderr, "lumen-ui-bench: vulkan: %s\n", ok.get_error().message);
+        return false;
+    }
+    vk.setup_cold_ns = vk.renderer.setup_stats().pipeline_ns;
+    vk.renderer.shutdown();
+    if (auto ok = vk.renderer.initialize(vk.device.context()); !ok) {
+        std::fprintf(stderr, "lumen-ui-bench: vulkan: %s\n", ok.get_error().message);
+        return false;
+    }
+    vk.setup_warm_ns = vk.renderer.setup_stats().pipeline_ns;
+    vk.renderer.set_gpu_timing(true);
+    const lx::gfx::ui_vk_caps& caps = vk.renderer.caps();
+    g_vk_info = {true, caps, vk.setup_cold_ns, vk.setup_warm_ns,
+                 vk.renderer.setup_stats().cache_bytes_loaded};
+    std::printf("vulkan: %s%s | api %u.%u | gpu timing %s | pipeline setup %.1f us, again %.1f us "
+                "(%llu cache bytes read)\n",
+                caps.device_name,
+                caps.software ? " (software: a CPU device — correctness only, no GPU numbers)" : "",
+                caps.api_version >> 22u, (caps.api_version >> 12u) & 0x3FFu,
+                caps.timestamps ? "timestamps" : "fence-wall",
+                static_cast<double>(vk.setup_cold_ns) / 1000.0,
+                static_cast<double>(vk.setup_warm_ns) / 1000.0,
+                static_cast<unsigned long long>(g_vk_info.cache_bytes_loaded));
+    return true;
+}
+
 // ── Stages and distributions ────────────────────────────────────────────────────
 
 enum stage : unsigned {
@@ -272,8 +341,8 @@ enum stage : unsigned {
     st_emit_order_encode, ///< G3's sum
     st_frame,             ///< tick + order + encode: the UI thread's cost of a produced frame
     st_raster,            ///< the backend drawing the frame (`cpu`: ui_cpu_renderer::draw)
-    st_submit,            ///< `gl`: ui_gl_renderer::draw on the CPU (upload, gather, record, flush)
-    st_gpu,               ///< `gl`: the frame's GPU time (timer query, or fence-wall)
+    st_submit,            ///< `gl`/`vulkan`: the renderer's draw on the CPU (upload, gather, record, submit)
+    st_gpu,               ///< `gl`/`vulkan`: the frame's GPU time (timer query / timestamps, or fence-wall)
     st_count,
 };
 
@@ -1025,6 +1094,18 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         else
             std::fprintf(stderr, "lumen-ui-bench: gl target: %s\n", t.get_error().message);
     }
+    // `vulkan`: an R8G8B8A8_UNORM image of the view's size on the run's device.
+    const bool vk = std::strcmp(opt.backend, "vulkan") == 0 && g_vk;
+    std::optional<lx::gfx::ui_vk_target> vk_target{};
+    if (vk) {
+        auto t = lx::gfx::ui_vk_target::create(g_vk->device.context(),
+                                               static_cast<unsigned>(spec.view.width),
+                                               static_cast<unsigned>(spec.view.height));
+        if (t)
+            vk_target.emplace(std::move(t).value());
+        else
+            std::fprintf(stderr, "lumen-ui-bench: vulkan target: %s\n", t.get_error().message);
+    }
     const lx::color clear = k_background;
 
     const double view_px =
@@ -1116,6 +1197,11 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
             if (drawn)
                 draw_calls = drawn->draw_calls;
         }
+        if (vk && vk_target) {
+            auto drawn = g_vk->renderer.draw(*vk_target, stream, nullptr, damage, clear);
+            if (drawn)
+                draw_calls = drawn->draw_calls;
+        }
         const std::uint64_t t5 = now_ns();
         // The GPU stage: waiting for it here is outside every CPU stage above.
         std::uint64_t gpu_ns = 0;
@@ -1127,6 +1213,13 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
                 gpu_ns = timed->ns;
                 if (timed->disjoint && measuring)
                     ++cnt.gpu_disjoint;
+            }
+        }
+        if (vk && vk_target) {
+            auto timed = g_vk->renderer.wait_gpu_time();
+            if (timed && timed->source != lx::gfx::ui_vk_timing::none) {
+                gpu_ok = true;
+                gpu_ns = timed->ns;
             }
         }
 
@@ -1159,7 +1252,7 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         samples[st_frame].push_back(t4 - t0);
         if (raster)
             samples[st_raster].push_back(t5 - t4);
-        if (gl && gl_target) {
+        if ((gl && gl_target) || (vk && vk_target)) {
             samples[st_submit].push_back(t5 - t4);
             if (gpu_ok)
                 samples[st_gpu].push_back(gpu_ns);
@@ -1241,6 +1334,8 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
     }
     add_gate("G5", verdict(no_allocs), "%llu heap allocations in %u steady frames, mallinfo2 delta %lld B",
              static_cast<unsigned long long>(mem.allocations), opt.frames, mem.mallinfo_delta);
+    if (vk && vk_target)
+        g_vk->renderer.wait_idle(); // the target goes with this frame
     return out;
 }
 
@@ -1354,7 +1449,10 @@ void write_json(const options& opt, const host_info& host, const scenario_result
         std::fputs(", \"hostname\": ", f);
         json_string(f, host.nodename);
         std::fputs("},\n    \"driver\": ", f);
-        json_string(f, opt.backend);
+        // A CPU Vulkan device is its own driver: never compared with, nor taken for, a GPU.
+        const bool vk_software = g_vk_info.valid && g_vk_info.caps.software &&
+                                 std::strcmp(opt.backend, "vulkan") == 0;
+        json_string(f, vk_software ? "vulkan-software" : opt.backend);
         std::fputs(",\n    \"git\": ", f);
         json_string(f, opt.git);
         std::fputs(",\n    \"preset\": ", f);
@@ -1420,6 +1518,21 @@ void write_json(const options& opt, const host_info& host, const scenario_result
                          caps.program_binary_formats, caps.program_cache ? "true" : "false",
                          static_cast<double>(g_gl_info.setup_cold_ns) / 1000.0,
                          static_cast<double>(g_gl_info.setup_warm_ns) / 1000.0, g_gl_info.from_cache);
+        } else if (g_vk_info.valid && std::strcmp(opt.backend, "vulkan") == 0) {
+            const lx::gfx::ui_vk_caps& caps = g_vk_info.caps;
+            std::fputs("    \"gpu\": {\"device\": ", f);
+            json_string(f, caps.device_name);
+            std::fprintf(f,
+                         ", \"api\": \"%u.%u\", \"software\": %s, \"timing\": \"%s\", "
+                         "\"pipeline_cache\": %s, \"pipeline_cache_bytes_loaded\": %llu, "
+                         "\"pipeline_setup_cold_us\": %.1f, \"pipeline_setup_again_us\": %.1f},\n",
+                         caps.api_version >> 22u, (caps.api_version >> 12u) & 0x3FFu,
+                         caps.software ? "true" : "false",
+                         caps.timestamps ? "timestamp" : "fence-wall",
+                         caps.pipeline_cache ? "true" : "false",
+                         static_cast<unsigned long long>(g_vk_info.cache_bytes_loaded),
+                         static_cast<double>(g_vk_info.setup_cold_ns) / 1000.0,
+                         static_cast<double>(g_vk_info.setup_warm_ns) / 1000.0);
         } else {
             std::fputs("    \"gpu\": {},\n", f);
         }
@@ -1436,7 +1549,7 @@ void write_json(const options& opt, const host_info& host, const scenario_result
 // ── CLI ─────────────────────────────────────────────────────────────────────────
 
 void usage() {
-    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu|gl] [--frames N]\n"
+    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu|gl|vulkan] [--frames N]\n"
                "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
                "                      [--scale F] [--git SHA] [--preset NAME]\n"
                "                      [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]\n",
@@ -1471,9 +1584,9 @@ void usage() {
             const char* s = take();
             if (!s) return false;
             if (std::strcmp(s, "none") != 0 && std::strcmp(s, "cpu") != 0 &&
-                std::strcmp(s, "gl") != 0) {
+                std::strcmp(s, "gl") != 0 && std::strcmp(s, "vulkan") != 0) {
                 std::fprintf(stderr,
-                             "lumen-ui-bench: backend %s is not available (none, cpu, gl)\n", s);
+                             "lumen-ui-bench: backend %s is not available (none, cpu, gl, vulkan)\n", s);
                 return false;
             }
             opt.backend = s;
@@ -1596,6 +1709,16 @@ void* bench_thread(void* raw) {
         g_gl = &*gl;
         std::fflush(stdout);
     }
+    std::optional<vk_backend> vk{};
+    if (std::strcmp(opt.backend, "vulkan") == 0) {
+        vk.emplace();
+        if (!start_vk(*vk)) {
+            job.backend_failed = true;
+            return nullptr;
+        }
+        g_vk = &*vk;
+        std::fflush(stdout);
+    }
     for (unsigned i = 0; i < 3; ++i) {
         if (!opt.scenarios[i])
             continue;
@@ -1606,6 +1729,7 @@ void* bench_thread(void* raw) {
         ++job.count;
     }
     g_gl = nullptr;
+    g_vk = nullptr;
     return nullptr;
 }
 

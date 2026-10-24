@@ -95,7 +95,31 @@ lumen_compile_shaders(lx.gfx
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.vert"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.frag"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.vert"
-    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.frag")
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.frag"
+    # ADR-010 UI primitives (lx.gfx:ui_vk); their code is shaders/ui/*.glsl, shared with ui_gl.
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_quad.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_quad.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_shadow.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_shadow.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_mono.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_mono.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_poly.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_poly.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_underline.vert"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_underline.frag")
+# The same UI GLSL as strings for lx.gfx:ui_gl, which compiles it at run time (GLES 3.1).
+lumen_embed_glsl(lx.gfx ui
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/math.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/vertex.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/fragment.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/quad.vs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/quad.fs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/shadow.vs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/shadow.fs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/sprite.vs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/sprite.fs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.vs.glsl"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.fs.glsl")
 lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.gfx)
 lumen_link_platform_modules(lx.text)
 lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.runtime)
@@ -551,6 +575,14 @@ if(LUMEN_BUILD_TESTS)
         target_compile_definitions(test_ui_golden PRIVATE
             LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui")
         add_test(NAME test_ui_golden COMMAND test_ui_golden)
+        # The Vulkan cases again under VK_LAYER_KHRONOS_validation, which must log no error.
+        find_file(LUMEN_VK_VALIDATION_LAYER VkLayer_khronos_validation.json
+            PATHS /usr/share/vulkan/explicit_layer.d /usr/local/share/vulkan/explicit_layer.d
+                  /etc/vulkan/explicit_layer.d
+            NO_DEFAULT_PATH)
+        if(LUMEN_VK_VALIDATION_LAYER)
+            add_test(NAME test_ui_golden_vk_validation COMMAND test_ui_golden --filter=vk_)
+        endif()
     else()
         message(STATUS "libpng not found — test_ui_golden (UI golden images) not built")
     endif()
@@ -1127,7 +1159,13 @@ if(LUMEN_BUILD_TESTS)
     set_tests_properties(test_health test_session_discovery
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
     if(TARGET test_ui_golden)
-        set_tests_properties(test_ui_golden PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+        # It brings up a Vulkan device (ui_vk): the ICD's threads and dlclose need the same
+        # sanitizer settings as the other Vulkan tests.
+        set_tests_properties(test_ui_golden PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+        if(TEST test_ui_golden_vk_validation)
+            set_tests_properties(test_ui_golden_vk_validation PROPERTIES ENVIRONMENT
+                "${LUMEN_SANITIZER_ENV_VULKAN_ICD};LUMEN_VULKAN_VALIDATION=1")
+        endif()
     endif()
     set_tests_properties(test_result test_snapshot test_primitives test_atlas test_scene_outputs test_damage_region test_wm_geometry
         test_surface_tree test_positioner test_layer_arrange test_xcursor

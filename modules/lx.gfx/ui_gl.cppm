@@ -31,8 +31,9 @@ export namespace lx::gfx {
 // takes) into a framebuffer object of the current GLES 3.1 context, inside the damage rects,
 // at pixel parity with the CPU reference (G10: within 3/255 per channel). The pixel rules
 // are `:ui_cpu`'s, word for word — its header comment is the specification; the shaders
-// below transcribe its functions (the same SDF, border, dash, gradient, the same four-sample
-// erf shadow, the same Taylor sine for wavy underlines and gradient directions).
+// (shaders/ui/*.glsl, the same files `:ui_vk` compiles to SPIR-V) transcribe its functions
+// (the same SDF, border, dash, gradient, the same four-sample erf shadow, the same Taylor
+// sine for wavy underlines and gradient directions).
 //
 // Context. Any current GLES 3.1 context with at least one vertex-stage shader storage block:
 // `egl_device` on a render node (Mesa answers its ES 2 request with the highest ES version
@@ -309,75 +310,22 @@ precision highp float;
 precision highp int;
 )";
 
+// The GLSL is shaders/ui/*.glsl, shared with lx.gfx:ui_vk (which compiles the same files to
+// SPIR-V at build time); lumen_embed_glsl turns each into a raw string literal. What differs
+// between the backends is the prologue below: how an instance word is fetched, where the
+// target size comes from, the vertex index, the fragment output and the atlas page sampler.
+//
 // Deterministic helpers shared by both stages: `ui_math::sin` (the CPU's Taylor series after
 // the same range reduction), the sRGB curves and Oklab of `ui_raster::to_oklab`/`from_oklab`.
-constexpr const char* k_math = R"(
-const float LX_PI = 3.14159265358979323846;
-float lx_saturate(float v) { return v < 0.0 ? 0.0 : (v > 1.0 ? 1.0 : v); }
-float lx_sin(float x) {
-    float turns = floor(x / (2.0 * LX_PI) + 0.5);
-    x = x - turns * (2.0 * LX_PI);
-    if (x > LX_PI * 0.5)
-        x = LX_PI - x;
-    else if (x < -LX_PI * 0.5)
-        x = -LX_PI - x;
-    float x2 = x * x;
-    float term = x;
-    float sum = x;
-    for (int k = 2; k <= 12; k += 2) {
-        term = -term * x2 / float(k * (k + 1));
-        sum = sum + term;
-    }
-    return sum;
-}
-float lx_cos(float x) { return lx_sin(x + LX_PI * 0.5); }
-float lx_srgb_decode(float v) { return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4); }
-float lx_srgb_encode(float v) { return v <= 0.0031308 ? v * 12.92 : 1.055 * pow(v, 1.0 / 2.4) - 0.055; }
-float lx_cbrt(float x) { return x == 0.0 ? 0.0 : (x < 0.0 ? -pow(-x, 1.0 / 3.0) : pow(x, 1.0 / 3.0)); }
-vec4 lx_to_oklab(vec4 c) {
-    float inv = c.a > 0.0 ? 1.0 / c.a : 0.0;
-    float r = lx_srgb_decode(lx_saturate(c.r * inv));
-    float g = lx_srgb_decode(lx_saturate(c.g * inv));
-    float b = lx_srgb_decode(lx_saturate(c.b * inv));
-    float l = lx_cbrt(0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b);
-    float m = lx_cbrt(0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b);
-    float s = lx_cbrt(0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b);
-    return vec4(0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
-                1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
-                0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s, c.a);
-}
-vec4 lx_from_oklab(vec4 lab) {
-    float l_ = lab.x + 0.3963377774 * lab.y + 0.2158037573 * lab.z;
-    float m_ = lab.x - 0.1055613458 * lab.y - 0.0638541728 * lab.z;
-    float s_ = lab.x - 0.0894841775 * lab.y - 1.2914855480 * lab.z;
-    float l = l_ * l_ * l_;
-    float m = m_ * m_ * m_;
-    float s = s_ * s_ * s_;
-    float r = lx_saturate(4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s);
-    float g = lx_saturate(-1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s);
-    float b = lx_saturate(-0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s);
-    float a = lx_saturate(lab.w);
-    return vec4(lx_srgb_encode(r) * a, lx_srgb_encode(g) * a, lx_srgb_encode(b) * a, a);
-}
-// A rounded box as (centre x, centre y, half w, half h), half w < 0 when empty; radii
-// top-left, top-right, bottom-right, bottom-left, clamped to [0, min(half size)].
-vec4 lx_make_box(vec4 rect, vec4 radii, out vec4 r) {
-    r = vec4(0.0);
-    if (!(rect.z > 0.0) || !(rect.w > 0.0))
-        return vec4(0.0, 0.0, -1.0, -1.0);
-    float hw = rect.z * 0.5;
-    float hh = rect.w * 0.5;
-    float limit = min(hw, hh);
-    r = min(max(radii, vec4(0.0)), vec4(limit));
-    return vec4(rect.x + hw, rect.y + hh, hw, hh);
-}
-)";
+constexpr const char* k_math =
+#include "shaders/ui/math.glsl.h"
+    ;
 
-// The vertex stage: instance fetch, the raster window and the whole-pixel quad. Words come
-// from per-instance integer attributes (four per attribute, the batch's offset in the
-// attribute pointers) or from the ring as a storage buffer (`u_base` + instance · stride).
-// `i` is a constant at every call site, so the attribute selection folds away.
-constexpr const char* k_vertex_common = R"(
+// The vertex prologue: instance fetch. Words come from per-instance integer attributes (four
+// per attribute, the batch's offset in the attribute pointers) or from the ring as a storage
+// buffer (`u_base` + instance · stride). `i` is a constant at every call site, so the
+// attribute selection folds away.
+constexpr const char* k_vertex_gl = R"(
 uniform uint u_base;
 uniform vec2 u_target;
 #ifdef LX_ATTRIBUTES
@@ -406,499 +354,82 @@ uint inst_word(uint i) {
 layout(std430, binding = 0) readonly buffer lx_instances { uint lx_words[]; };
 uint inst_word(uint i) { return lx_words[u_base + uint(gl_InstanceID) * LX_STRIDE + i]; }
 #endif
-float inst_float(uint i) { return uintBitsToFloat(inst_word(i)); }
-vec4 inst_vec4(uint i) {
-    return vec4(inst_float(i), inst_float(i + 1u), inst_float(i + 2u), inst_float(i + 3u));
-}
-vec4 inst_half4(uint i) { return vec4(unpackHalf2x16(inst_word(i)), unpackHalf2x16(inst_word(i + 1u))); }
-
-float lx_clamp_px(float v) {
-    if (!(v >= -1.0e6))
-        return -1.0e6;
-    if (!(v <= 1.0e6))
-        return 1.0e6;
-    return v;
-}
-// The pixels whose centre lies in [lo, hi): [ceil(lo - 1/2), ceil(hi - 1/2)).
-vec2 lx_centres(float lo, float hi) {
-    return vec2(lx_clamp_px(ceil(lo - 0.5)), lx_clamp_px(ceil(hi - 0.5)));
-}
-// x0, y0, x1, y1 of the pixels whose centre is in `r` and in `clip` (no mask when empty),
-// within the target.
-vec4 lx_window(vec4 r, vec4 clip) {
-    vec2 xs = lx_centres(r.x, r.x + r.z);
-    vec2 ys = lx_centres(r.y, r.y + r.w);
-    vec4 w = vec4(xs.x, ys.x, xs.y, ys.y);
-    if (clip.z > 0.0 && clip.w > 0.0) {
-        vec2 cx = lx_centres(clip.x, clip.x + clip.z);
-        vec2 cy = lx_centres(clip.y, clip.y + clip.w);
-        w = vec4(max(w.x, cx.x), max(w.y, cy.x), min(w.z, cx.y), min(w.w, cy.y));
-    }
-    return vec4(max(w.xy, vec2(0.0)), min(w.zw, u_target));
-}
-void lx_cull() { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); }
-// Places this vertex of the window's two triangles; false (and culled) when it is empty.
-bool lx_place(vec4 w) {
-    if (!(w.z > w.x) || !(w.w > w.y)) {
-        lx_cull();
-        return false;
-    }
-    int v = gl_VertexID;
-    vec2 corner = vec2((v == 1 || v == 4 || v == 5) ? 1.0 : 0.0, (v == 2 || v == 3 || v == 5) ? 1.0 : 0.0);
-    vec2 p = mix(w.xy, w.zw, corner);
-    gl_Position = vec4(p / u_target * 2.0 - 1.0, 0.0, 1.0);
-    return true;
-}
+#define LX_VERTEX_ID gl_VertexID
 )";
 
-constexpr const char* k_fragment_common = R"(
+// The vertex stage proper: the raster window and the whole-pixel quad.
+constexpr const char* k_vertex_common =
+#include "shaders/ui/vertex.glsl.h"
+    ;
+
+constexpr const char* k_fragment_gl = R"(
 layout(location = 0) out vec4 o_color;
-
-float lx_pick(vec4 r, vec2 d) { return d.x < 0.0 ? (d.y < 0.0 ? r.x : r.w) : (d.y < 0.0 ? r.y : r.z); }
-// GPUI's rounded-box signed distance (negative inside), as `ui_raster::sdf`.
-float lx_sdf(vec4 box, vec4 r, vec2 p) {
-    vec2 d = p - box.xy;
-    float rr = lx_pick(r, d);
-    float qx = abs(d.x) - box.z + rr;
-    float qy = abs(d.y) - box.w + rr;
-    if (rr == 0.0)
-        return max(qx, qy);
-    float mx = max(qx, 0.0);
-    float my = max(qy, 0.0);
-    float len = mx == 0.0 ? my : (my == 0.0 ? mx : sqrt(mx * mx + my * my));
-    return len + min(max(qx, qy), 0.0) - rr;
-}
-float lx_coverage(vec4 box, vec4 r, vec2 p) {
-    return box.z < 0.0 ? 0.0 : lx_saturate(0.5 - lx_sdf(box, r, p));
-}
 )";
+
+constexpr const char* k_fragment_common =
+#include "shaders/ui/fragment.glsl.h"
+    ;
 
 // ── quad ──
 
-constexpr const char* k_quad_vs = R"(
-flat out vec4 v_bounds;
-flat out vec4 v_r;
-flat out vec4 v_ibox;
-flat out vec4 v_ir;
-flat out vec4 v_widths;
-flat out vec4 v_bg0;
-flat out vec4 v_bg1;
-flat out vec4 v_border;
-flat out vec4 v_grad;
-flat out vec4 v_lab0;
-flat out vec4 v_lab1;
-flat out uint v_flags;
-void main() {
-    vec4 bounds = inst_vec4(0u);
-    vec4 r;
-    vec4 box = lx_make_box(bounds, inst_half4(8u), r);
-    if (box.z < 0.0) {
-        lx_cull();
-        return;
-    }
-    if (!lx_place(lx_window(bounds, inst_vec4(4u))))
-        return;
-    vec4 widths = max(inst_half4(10u), vec4(0.0)); // top, right, bottom, left
-    uint flags = 0u;
-    vec4 ir = vec4(0.0);
-    vec4 ibox = vec4(0.0, 0.0, -1.0, -1.0);
-    bool border = widths.x > 0.0 || widths.y > 0.0 || widths.z > 0.0 || widths.w > 0.0;
-    if (border) {
-        flags |= 1u;
-        vec4 inner_radii = vec4(max(r.x - max(widths.x, widths.w), 0.0),
-                                max(r.y - max(widths.x, widths.y), 0.0),
-                                max(r.z - max(widths.z, widths.y), 0.0),
-                                max(r.w - max(widths.z, widths.w), 0.0));
-        ibox = lx_make_box(vec4(bounds.x + widths.w, bounds.y + widths.x,
-                                bounds.z - widths.w - widths.y, bounds.w - widths.x - widths.z),
-                           inner_radii, ir);
-    }
-    uint style = inst_word(18u); // angle f16 | border_style << 16 | gradient_space << 24
-    if (border && ((style >> 16u) & 0xFFu) == 1u)
-        flags |= 2u;
-    v_bg0 = inst_half4(12u);
-    v_bg1 = inst_half4(14u);
-    v_border = inst_half4(16u);
-    v_grad = vec4(1.0, 0.0, 0.0, 0.0);
-    v_lab0 = vec4(0.0);
-    v_lab1 = vec4(0.0);
-    if (inst_word(12u) != inst_word(14u) || inst_word(13u) != inst_word(15u)) {
-        flags |= 4u;
-        float theta = unpackHalf2x16(style & 0xFFFFu).x * (LX_PI / 180.0);
-        float dx = lx_cos(theta);
-        float dy = lx_sin(theta);
-        float len = abs(bounds.z * dx) + abs(bounds.w * dy);
-        v_grad = vec4(dx, dy, len > 0.0 ? 1.0 / len : 0.0, 0.0);
-        if (((style >> 24u) & 0xFFu) == 1u) {
-            flags |= 8u;
-            v_lab0 = lx_to_oklab(v_bg0);
-            v_lab1 = lx_to_oklab(v_bg1);
-        }
-    }
-    v_bounds = bounds;
-    v_r = r;
-    v_ibox = ibox;
-    v_ir = ir;
-    v_widths = widths;
-    v_flags = flags;
-}
-)";
-
-constexpr const char* k_quad_fs = R"(
-flat in vec4 v_bounds;
-flat in vec4 v_r;
-flat in vec4 v_ibox;
-flat in vec4 v_ir;
-flat in vec4 v_widths;
-flat in vec4 v_bg0;
-flat in vec4 v_bg1;
-flat in vec4 v_border;
-flat in vec4 v_grad;
-flat in vec4 v_lab0;
-flat in vec4 v_lab1;
-flat in uint v_flags;
-
-vec4 lx_background(vec2 p, vec4 box) {
-    if ((v_flags & 4u) == 0u)
-        return v_bg0;
-    float t = lx_saturate(0.5 + ((p.x - box.x) * v_grad.x + (p.y - box.y) * v_grad.y) * v_grad.z);
-    if ((v_flags & 8u) == 0u)
-        return v_bg0 + (v_bg1 + v_bg0 * -1.0) * t;
-    return lx_from_oklab(v_lab0 + (v_lab1 - v_lab0) * t);
-}
-
-float lx_dash(vec2 p) {
-    vec4 r = v_r;
-    vec4 w = v_widths;
-    float x0 = v_bounds.x;
-    float y0 = v_bounds.y;
-    float x1 = v_bounds.x + v_bounds.z;
-    float y1 = v_bounds.y + v_bounds.w;
-    float tl_x = max(r.x, w.w), tl_y = max(r.x, w.x);
-    float tr_x = max(r.y, w.y), tr_y = max(r.y, w.x);
-    float br_x = max(r.z, w.y), br_y = max(r.z, w.z);
-    float bl_x = max(r.w, w.w), bl_y = max(r.w, w.z);
-    if ((p.x < x0 + tl_x && p.y < y0 + tl_y) || (p.x >= x1 - tr_x && p.y < y0 + tr_y) ||
-        (p.x >= x1 - br_x && p.y >= y1 - br_y) || (p.x < x0 + bl_x && p.y >= y1 - bl_y))
-        return 1.0;
-    float excess[4] = float[4]((p.y - y0) - w.x, (x1 - p.x) - w.y, (y1 - p.y) - w.z, (p.x - x0) - w.w);
-    float widths[4] = float[4](w.x, w.y, w.z, w.w);
-    int edge = -1;
-    float best = 0.0;
-    for (int e = 0; e < 4; ++e) {
-        if (!(widths[e] > 0.0))
-            continue;
-        if (edge < 0 || excess[e] < best) {
-            best = excess[e];
-            edge = e;
-        }
-    }
-    if (edge < 0)
-        return 1.0;
-    float t;
-    if (edge == 0)
-        t = p.x - (x0 + tl_x);
-    else if (edge == 1)
-        t = p.y - (y0 + tr_y);
-    else if (edge == 2)
-        t = (x1 - br_x) - p.x;
-    else
-        t = (y1 - bl_y) - p.y;
-    float ww = widths[edge];
-    float period = 4.0 * ww;
-    float m = t - period * floor(t / period);
-    float on = m < 2.0 * ww ? min(m, 2.0 * ww - m) : -min(m - 2.0 * ww, period - m);
-    return lx_saturate(0.5 + on);
-}
-
-void main() {
-    vec2 p = gl_FragCoord.xy;
-    float hw = v_bounds.z * 0.5;
-    float hh = v_bounds.w * 0.5;
-    vec4 box = vec4(v_bounds.x + hw, v_bounds.y + hh, hw, hh);
-    float a_o = lx_coverage(box, v_r, p);
-    if (!(a_o > 0.0)) {
-        o_color = vec4(0.0);
-        return;
-    }
-    vec4 bg = lx_background(p, box);
-    if ((v_flags & 1u) == 0u) {
-        o_color = bg * a_o;
-        return;
-    }
-    float a_i = lx_coverage(v_ibox, v_ir, p);
-    float w_i = min(a_i, a_o);
-    float w_b = a_o - w_i;
-    vec4 o = bg * w_i;
-    if (w_b > 0.0) {
-        vec4 border = (v_flags & 2u) != 0u ? v_border * lx_dash(p) : v_border;
-        o = o + (border + bg * (1.0 - border.a)) * w_b;
-    }
-    o_color = o;
-}
-)";
+constexpr const char* k_quad_vs =
+#include "shaders/ui/quad.vs.glsl.h"
+    ;
+constexpr const char* k_quad_fs =
+#include "shaders/ui/quad.fs.glsl.h"
+    ;
 
 // ── shadow ──
 
-constexpr const char* k_shadow_vs = R"(
-flat out vec4 v_box;
-flat out vec4 v_r;
-flat out vec4 v_elem;
-flat out vec4 v_er;
-flat out vec4 v_color;
-flat out vec4 v_sigma; // sigma, sqrt(1/2) / sigma, 1 / (sqrt(2 pi) sigma), -1 / (2 sigma^2)
-flat out uint v_flags; // 1 inset, 2 hard
-void main() {
-    vec4 bounds = inst_vec4(0u);
-    vec4 radii = inst_half4(8u);
-    float sigma = max(inst_float(12u), 0.0);
-    float sp = inst_float(13u);
-    bool inset = (inst_word(14u) & 1u) != 0u;
-    float reach = inset ? 0.0 : 3.0 * sigma + sp;
-    vec4 raster = vec4(bounds.x - reach, bounds.y - reach, bounds.z + 2.0 * reach, bounds.w + 2.0 * reach);
-    if (!lx_place(lx_window(raster, inst_vec4(4u))))
-        return;
-    uint flags = inset ? 1u : 0u;
-    bool hard = sigma < 1.0e-4;
-    if (hard)
-        flags |= 2u;
-    vec4 r;
-    vec4 er = vec4(0.0);
-    vec4 box;
-    vec4 elem = vec4(0.0, 0.0, -1.0, -1.0);
-    if (inset) {
-        elem = lx_make_box(bounds, radii, er);
-        box = lx_make_box(vec4(bounds.x + sp, bounds.y + sp, bounds.z - 2.0 * sp, bounds.w - 2.0 * sp),
-                          max(radii - sp, vec4(0.0)), r);
-    } else {
-        box = lx_make_box(vec4(bounds.x - sp, bounds.y - sp, bounds.z + 2.0 * sp, bounds.w + 2.0 * sp),
-                          max(radii + sp, vec4(0.0)), r);
-    }
-    v_sigma = hard ? vec4(sigma, 0.0, 0.0, 0.0)
-                   : vec4(sigma, 0.70710678118 / sigma, 1.0 / (2.50662827463 * sigma),
-                          -1.0 / (2.0 * sigma * sigma));
-    v_box = box;
-    v_r = r;
-    v_elem = elem;
-    v_er = er;
-    v_color = inst_half4(10u);
-    v_flags = flags;
-}
-)";
-
-constexpr const char* k_shadow_fs = R"(
-flat in vec4 v_box;
-flat in vec4 v_r;
-flat in vec4 v_elem;
-flat in vec4 v_er;
-flat in vec4 v_color;
-flat in vec4 v_sigma;
-flat in uint v_flags;
-
-// Abramowitz-Stegun 7.1.27, as `ui_math::erf`.
-float lx_erf(float x) {
-    float s = x < 0.0 ? -1.0 : (x > 0.0 ? 1.0 : 0.0);
-    float a = abs(x);
-    float t = 1.0 + (0.278393 + (0.230389 + 0.078108 * (a * a)) * a) * a;
-    t = t * t;
-    return s - s / (t * t);
-}
-
-// Evan Wallace's blurred rounded box, four samples along y.
-float lx_shadow_mask(vec2 p) {
-    if (v_box.z < 0.0)
-        return 0.0;
-    if ((v_flags & 2u) != 0u)
-        return lx_coverage(v_box, v_r, p);
-    vec2 d = p - v_box.xy;
-    float corner = lx_pick(v_r, d);
-    float three = 3.0 * v_sigma.x;
-    float low = d.y - v_box.w;
-    float high = d.y + v_box.w;
-    float start = min(max(-three, low), high);
-    float end = min(max(three, low), high);
-    float stride = (end - start) * 0.25;
-    float y = start + stride * 0.5;
-    float value = 0.0;
-    for (int i = 0; i < 4; ++i) {
-        float yy = d.y - y;
-        float delta = min(v_box.w - corner - abs(yy), 0.0);
-        float curved = v_box.z - corner + sqrt(max(0.0, corner * corner - delta * delta));
-        float lo = 0.5 + 0.5 * lx_erf((d.x - curved) * v_sigma.y);
-        float hi = 0.5 + 0.5 * lx_erf((d.x + curved) * v_sigma.y);
-        float gauss = exp(y * y * v_sigma.w) * v_sigma.z;
-        value = value + (hi - lo) * gauss * stride;
-        y = y + stride;
-    }
-    return value;
-}
-
-void main() {
-    vec2 p = gl_FragCoord.xy;
-    float mask;
-    if ((v_flags & 1u) == 0u) {
-        mask = lx_shadow_mask(p);
-    } else {
-        float element = lx_coverage(v_elem, v_er, p);
-        mask = element > 0.0 ? element * (1.0 - lx_shadow_mask(p)) : 0.0;
-    }
-    o_color = mask > 0.0 ? v_color * mask : vec4(0.0);
-}
-)";
+constexpr const char* k_shadow_vs =
+#include "shaders/ui/shadow.vs.glsl.h"
+    ;
+constexpr const char* k_shadow_fs =
+#include "shaders/ui/shadow.fs.glsl.h"
+    ;
 
 // ── sprites (mono and path: R8; poly with LX_POLY: RGBA8) ──
 
-constexpr const char* k_sprite_vs = R"(
-flat out vec4 v_bounds;
-flat out vec4 v_tile;  // u0, v0, u1, v1 (texels)
-flat out vec4 v_color;
-flat out vec4 v_mbox;  // poly: the rounded mask
-flat out vec4 v_mr;
-flat out uint v_flags; // 1 nearest, 2 grayscale, 4 rounded
-void main() {
-    vec4 bounds = inst_vec4(0u);
-    if (!lx_place(lx_window(bounds, inst_vec4(4u))))
-        return;
-    uint a = inst_word(8u);
-    uint b = inst_word(9u);
-    vec4 tile = vec4(float(a & 0xFFFFu), float(a >> 16u), float(b & 0xFFFFu), float(b >> 16u));
-    uint flags = 0u;
-    if (bounds.x == floor(bounds.x) && bounds.y == floor(bounds.y) && bounds.z == tile.z - tile.x &&
-        bounds.w == tile.w - tile.y)
-        flags |= 1u;
-    vec4 mr = vec4(0.0);
-    vec4 mbox = vec4(0.0, 0.0, -1.0, -1.0);
-#ifdef LX_POLY
-    if (((inst_word(10u) >> 8u) & 1u) != 0u)
-        flags |= 2u;
-    vec4 radii = inst_half4(13u);
-    if (radii.x > 0.0 || radii.y > 0.0 || radii.z > 0.0 || radii.w > 0.0) {
-        flags |= 4u;
-        mbox = lx_make_box(bounds, radii, mr);
-    }
-#endif
-    v_bounds = bounds;
-    v_tile = tile;
-    v_color = inst_half4(11u);
-    v_mbox = mbox;
-    v_mr = mr;
-    v_flags = flags;
-}
-)";
-
-constexpr const char* k_sprite_fs = R"(
-flat in vec4 v_bounds;
-flat in vec4 v_tile;
-flat in vec4 v_color;
-flat in vec4 v_mbox;
-flat in vec4 v_mr;
-flat in uint v_flags;
+constexpr const char* k_sprite_vs =
+#include "shaders/ui/sprite.vs.glsl.h"
+    ;
+// The page is bound to texture unit 0 per batch.
+constexpr const char* k_sprite_fs_gl = R"(
 uniform highp sampler2D u_page;
-
-void main() {
-    vec2 p = gl_FragCoord.xy;
-    vec4 texel;
-    if ((v_flags & 1u) != 0u) {
-        texel = texelFetch(u_page, ivec2(v_tile.xy) + (ivec2(floor(p)) - ivec2(v_bounds.xy)), 0);
-    } else {
-        // `ui_raster::sample`: bilinear at (u - 1/2, v - 1/2), clamped to the tile's texel centres.
-        float ku = (v_tile.z - v_tile.x) / v_bounds.z;
-        float kv = (v_tile.w - v_tile.y) / v_bounds.w;
-        float su = clamp(v_tile.x + (p.x - v_bounds.x) * ku - 0.5, v_tile.x, v_tile.z - 1.0);
-        float sv = clamp(v_tile.y + (p.y - v_bounds.y) * kv - 0.5, v_tile.y, v_tile.w - 1.0);
-        float fu = floor(su);
-        float fv = floor(sv);
-        float wx = su - fu;
-        float wy = sv - fv;
-        int i0 = int(fu);
-        int j0 = int(fv);
-        int i1 = i0 + 1 < int(v_tile.z) ? i0 + 1 : i0;
-        int j1 = j0 + 1 < int(v_tile.w) ? j0 + 1 : j0;
-        vec4 p00 = texelFetch(u_page, ivec2(i0, j0), 0);
-        vec4 p10 = texelFetch(u_page, ivec2(i1, j0), 0);
-        vec4 p01 = texelFetch(u_page, ivec2(i0, j1), 0);
-        vec4 p11 = texelFetch(u_page, ivec2(i1, j1), 0);
-        vec4 top = p00 + (p10 - p00) * wx;
-        vec4 bottom = p01 + (p11 - p01) * wx;
-        texel = top + (bottom - top) * wy;
-    }
-#ifdef LX_POLY
-    vec4 c = texel;
-    if ((v_flags & 2u) != 0u) {
-        float l = 0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b;
-        c.rgb = vec3(l);
-    }
-    vec4 src = c * v_color;
-    if ((v_flags & 4u) != 0u)
-        src = src * lx_coverage(v_mbox, v_mr, p);
-    o_color = src;
-#else
-    o_color = v_color * texel.r;
-#endif
-}
+vec4 lx_page_texel(ivec2 p) { return texelFetch(u_page, p, 0); }
 )";
+constexpr const char* k_sprite_fs =
+#include "shaders/ui/sprite.fs.glsl.h"
+    ;
 
 // ── underline ──
 
-constexpr const char* k_underline_vs = R"(
-flat out vec4 v_bounds;
-flat out vec4 v_color;
-flat out vec4 v_line; // thickness, thickness / 2, omega, centre y
-flat out uint v_wavy;
-void main() {
-    vec4 bounds = inst_vec4(0u);
-    uint tw = inst_word(10u); // thickness f16 | wavy << 16
-    float t = max(unpackHalf2x16(tw & 0xFFFFu).x, 0.0);
-    if (!(t > 0.0)) {
-        lx_cull();
-        return;
-    }
-    if (!lx_place(lx_window(bounds, inst_vec4(4u))))
-        return;
-    v_bounds = bounds;
-    v_color = inst_half4(8u);
-    v_line = vec4(t, t * 0.5, 2.0 * LX_PI / (4.0 * t), bounds.y + bounds.w * 0.5);
-    v_wavy = tw >> 16u;
-}
-)";
-
-constexpr const char* k_underline_fs = R"(
-flat in vec4 v_bounds;
-flat in vec4 v_color;
-flat in vec4 v_line;
-flat in uint v_wavy;
-void main() {
-    vec2 p = gl_FragCoord.xy;
-    float dist;
-    if (v_wavy != 0u) {
-        float phase = (p.x - v_bounds.x) * v_line.z;
-        float fy = v_line.w + v_line.x * lx_sin(phase);
-        float slope = v_line.x * v_line.z * lx_cos(phase);
-        dist = abs(p.y - fy) / sqrt(1.0 + slope * slope);
-    } else {
-        dist = abs(p.y - v_line.w);
-    }
-    float cov = lx_saturate(v_line.y - dist + 0.5);
-    o_color = cov > 0.0 ? v_color * cov : vec4(0.0);
-}
-)";
+constexpr const char* k_underline_vs =
+#include "shaders/ui/underline.vs.glsl.h"
+    ;
+constexpr const char* k_underline_fs =
+#include "shaders/ui/underline.fs.glsl.h"
+    ;
 
 struct program_source {
     const char* name;
     const char* defines; ///< after the header, both stages
     const char* vs;
+    const char* fs_prologue; ///< GLES-only fragment declarations before `fs`
     const char* fs;
     unsigned vec4s; ///< instance size in 16-byte attributes
 };
 
 /// By `program_index`.
 constexpr program_source k_programs[] = {
-    {"shadow", "#define LX_STRIDE 16u\n#define LX_VEC4S 4\n", k_shadow_vs, k_shadow_fs, 4},
-    {"quad", "#define LX_STRIDE 20u\n#define LX_VEC4S 5\n", k_quad_vs, k_quad_fs, 5},
-    {"mono_sprite", "#define LX_STRIDE 16u\n#define LX_VEC4S 4\n", k_sprite_vs, k_sprite_fs, 4},
-    {"poly_sprite", "#define LX_STRIDE 16u\n#define LX_VEC4S 4\n#define LX_POLY 1\n", k_sprite_vs,
+    {"shadow", "#define LX_STRIDE 16u\n#define LX_VEC4S 4\n", k_shadow_vs, "\n", k_shadow_fs, 4},
+    {"quad", "#define LX_STRIDE 20u\n#define LX_VEC4S 5\n", k_quad_vs, "\n", k_quad_fs, 5},
+    {"mono_sprite", "#define LX_STRIDE 16u\n#define LX_VEC4S 4\n", k_sprite_vs, k_sprite_fs_gl,
      k_sprite_fs, 4},
-    {"underline", "#define LX_STRIDE 12u\n#define LX_VEC4S 3\n", k_underline_vs, k_underline_fs, 3},
+    {"poly_sprite", "#define LX_STRIDE 16u\n#define LX_VEC4S 4\n#define LX_POLY 1\n", k_sprite_vs,
+     k_sprite_fs_gl, k_sprite_fs, 4},
+    {"underline", "#define LX_STRIDE 12u\n#define LX_VEC4S 3\n", k_underline_vs, "\n",
+     k_underline_fs, 3},
 };
 
 constexpr const char* k_fetch_attributes = "#define LX_ATTRIBUTES 1\n";
@@ -1097,8 +628,9 @@ lx::result<void> lx::gfx::ui_gl_renderer::build_program(program_index index) {
     using namespace ui_gl_detail;
     const program_source& src = k_programs[index];
     const char* fetch = caps_.fetch == ui_gl_fetch::attributes ? k_fetch_attributes : k_fetch_storage;
-    const char* vs[] = {k_header, fetch, src.defines, k_math, k_vertex_common, src.vs};
-    const char* fs[] = {k_header, fetch, src.defines, k_math, k_fragment_common, src.fs};
+    const char* vs[] = {k_header, fetch, src.defines, k_math, k_vertex_gl, k_vertex_common, src.vs};
+    const char* fs[] = {k_header,      fetch,             src.defines,     k_math,
+                        k_fragment_gl, k_fragment_common, src.fs_prologue, src.fs};
 
     char path[640]{};
     bool cacheable = false;
@@ -1144,10 +676,10 @@ lx::result<void> lx::gfx::ui_gl_renderer::build_program(program_index index) {
     }
 
     if (!prog) {
-        const GLuint v = compile(GL_VERTEX_SHADER, vs, 6);
+        const GLuint v = compile(GL_VERTEX_SHADER, vs, static_cast<GLsizei>(std::size(vs)));
         if (!v)
             return lx::make_error(lx::gl_err::program_failed, "ui_gl vertex shader failed to compile");
-        const GLuint f = compile(GL_FRAGMENT_SHADER, fs, 6);
+        const GLuint f = compile(GL_FRAGMENT_SHADER, fs, static_cast<GLsizei>(std::size(fs)));
         if (!f) {
             glDeleteShader(v);
             return lx::make_error(lx::gl_err::program_failed, "ui_gl fragment shader failed to compile");
@@ -1472,146 +1004,15 @@ lx::result<void> lx::gfx::ui_gl_renderer::upload_atlas(atlas& a, ui_gl_draw_stat
 #endif
 }
 
-namespace {
-
-/// Copies the batch's instances (refs `first`, `count`) of one kind into `out`, in sorted
-/// order, a run of consecutive indices with one memcpy. `valid(index)` rejects an instance
-/// (skipped and counted). Returns the instances written.
-template <typename Instance, typename Valid>
-unsigned lx_gfx_ui_gl_gather(std::span<const lx::gfx::primitive_ref> refs, std::uint32_t first,
-                             std::uint32_t count, std::span<const Instance> instances,
-                             std::byte* out, unsigned& skipped, Valid&& valid) {
-    unsigned written = 0;
-    std::size_t run_start = 0;
-    std::size_t run_len = 0;
-    const auto flush = [&]() {
-        if (run_len == 0)
-            return;
-        std::memcpy(out + static_cast<std::size_t>(written) * sizeof(Instance),
-                    instances.data() + run_start, run_len * sizeof(Instance));
-        written += static_cast<unsigned>(run_len);
-        run_len = 0;
-    };
-    const std::size_t end = static_cast<std::size_t>(first) + count;
-    for (std::size_t i = first; i < end && i < refs.size(); ++i) {
-        const std::uint32_t index = refs[i].index;
-        if (index >= instances.size() || !valid(instances[index])) {
-            ++skipped;
-            continue;
-        }
-        if (run_len > 0 && index == run_start + run_len) {
-            ++run_len;
-            continue;
-        }
-        flush();
-        run_start = index;
-        run_len = 1;
-    }
-    flush();
-    return written;
-}
-
-[[nodiscard]] unsigned lx_gfx_ui_gl_stride(lx::gfx::primitive_kind kind) {
-    using lx::gfx::primitive_kind;
-    switch (kind) {
-    case primitive_kind::quad: return sizeof(lx::gfx::quad_instance);
-    case primitive_kind::shadow: return sizeof(lx::gfx::shadow_instance);
-    case primitive_kind::mono_sprite:
-    case primitive_kind::poly_sprite:
-    case primitive_kind::path: return sizeof(lx::gfx::sprite_instance);
-    case primitive_kind::underline: return sizeof(lx::gfx::underline_instance);
-    case primitive_kind::surface: return 0;
-    }
-    return 0;
-}
-
-[[nodiscard]] bool lx_gfx_ui_gl_meets(lx::rect2i a, lx::rect2i b) {
-    return a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0 && a.x < b.x + b.width &&
-           b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
-}
-
-[[nodiscard]] lx::rect2i lx_gfx_ui_gl_intersect(lx::rect2i a, lx::rect2i b) {
-    const long long x0 = a.x > b.x ? a.x : b.x;
-    const long long y0 = a.y > b.y ? a.y : b.y;
-    const long long ax1 = static_cast<long long>(a.x) + a.width;
-    const long long bx1 = static_cast<long long>(b.x) + b.width;
-    const long long ay1 = static_cast<long long>(a.y) + a.height;
-    const long long by1 = static_cast<long long>(b.y) + b.height;
-    const long long x1 = ax1 < bx1 ? ax1 : bx1;
-    const long long y1 = ay1 < by1 ? ay1 : by1;
-    if (x1 <= x0 || y1 <= y0)
-        return {};
-    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
-            static_cast<int>(y1 - y0)};
-}
-
-} // namespace
-
 std::size_t lx::gfx::ui_gl_renderer::encode(const ui_stream& stream, const atlas* a,
                                             std::byte* slot, ui_gl_draw_stats& stats) {
-    std::size_t cursor = 0;
-    const std::size_t batches = stream.batches.size();
-    for (std::size_t b = 0; b < batches && b < k_max_batches; ++b) {
-        const batch& bt = stream.batches[b];
-        batch_word_[b] = 0;
-        batch_count_[b] = 0;
-        const unsigned stride = lx_gfx_ui_gl_stride(bt.kind);
-        if (stride == 0)
-            continue; // surfaces stay blit commands
-        const std::size_t need = static_cast<std::size_t>(bt.count) * stride;
-        if (cursor + need > k_ui_gl_slot_bytes) {
-            // warn_and_drop: the caller sees the count and warns.
-            stats.overflow_drops += bt.count;
-            continue;
-        }
-        std::byte* out = slot + cursor;
-        unsigned& skipped = stats.primitives_skipped;
-        unsigned n = 0;
-        switch (bt.kind) {
-        case primitive_kind::quad:
-            n = lx_gfx_ui_gl_gather(stream.refs, bt.first, bt.count, stream.quads, out, skipped,
-                                    [](const quad_instance&) { return true; });
-            break;
-        case primitive_kind::shadow:
-            n = lx_gfx_ui_gl_gather(stream.refs, bt.first, bt.count, stream.shadows, out, skipped,
-                                    [](const shadow_instance&) { return true; });
-            break;
-        case primitive_kind::underline:
-            n = lx_gfx_ui_gl_gather(stream.refs, bt.first, bt.count, stream.underlines, out,
-                                    skipped, [](const underline_instance&) { return true; });
-            break;
-        case primitive_kind::mono_sprite:
-        case primitive_kind::poly_sprite:
-        case primitive_kind::path: {
-            // `ui_cpu`'s rule: the page must exist with the kind's format, the tile inside it.
-            const atlas_page_view page = a ? a->page(bt.page) : atlas_page_view{};
-            const atlas_format want =
-                bt.kind == primitive_kind::poly_sprite ? atlas_format::rgba8 : atlas_format::r8;
-            if (!page.valid() || page.format != want || bt.page >= k_atlas_pages) {
-                skipped += bt.count;
-                break;
-            }
-            const unsigned size = page.size;
-            const std::uint8_t pg = bt.page;
-            n = lx_gfx_ui_gl_gather(stream.refs, bt.first, bt.count, stream.sprites, out, skipped,
-                                    [size, pg](const sprite_instance& sp) {
-                                        return sp.page == pg && sp.uv[2] > sp.uv[0] &&
-                                               sp.uv[3] > sp.uv[1] && sp.uv[2] <= size &&
-                                               sp.uv[3] <= size;
-                                    });
-            break;
-        }
-        case primitive_kind::surface:
-            break;
-        }
-        batch_word_[b] = static_cast<std::uint32_t>(cursor / 4u);
-        batch_count_[b] = n;
-        cursor += static_cast<std::size_t>(n) * stride;
-        stats.primitives_encoded += n;
-    }
-    for (std::size_t b = k_max_batches; b < batches; ++b)
-        stats.overflow_drops += stream.batches[b].count;
-    return cursor;
+    ui_encode::encode_counts counts{};
+    const std::size_t bytes = ui_encode::encode(stream, a, slot, k_ui_gl_slot_bytes, batch_word_,
+                                                batch_count_, counts);
+    stats.primitives_encoded += counts.encoded;
+    stats.primitives_skipped += counts.skipped;
+    stats.overflow_drops += counts.overflow_drops;
+    return bytes;
 }
 
 lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
@@ -1631,7 +1032,7 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
         rects[rect_count++] = full;
     } else {
         for (unsigned i = 0; i < damage.count && i < k_damage_rects; ++i) {
-            const lx::rect2i r = lx_gfx_ui_gl_intersect(damage.rects[i], full);
+            const lx::rect2i r = ui_encode::intersect(damage.rects[i], full);
             if (r.width > 0 && r.height > 0)
                 rects[rect_count++] = r;
         }
@@ -1667,7 +1068,7 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
     } else {
         std::size_t upper = 0;
         for (const batch& b : stream.batches)
-            upper += static_cast<std::size_t>(b.count) * lx_gfx_ui_gl_stride(b.kind);
+            upper += static_cast<std::size_t>(b.count) * ui_encode::stride(b.kind);
         upper = upper < k_ui_gl_slot_bytes ? upper : k_ui_gl_slot_bytes;
         if (upper > 0) {
             glBindBuffer(GL_SHADER_STORAGE_BUFFER, buffer_);
@@ -1746,7 +1147,7 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
         glEnable(GL_BLEND);
         for (std::size_t b = 0; b < batch_total; ++b) {
             const batch& bt = stream.batches[b];
-            if (!lx_gfx_ui_gl_meets(bt.bounds, rect)) {
+            if (!ui_encode::meets(bt.bounds, rect)) {
                 ++stats.batches_skipped;
                 continue;
             }

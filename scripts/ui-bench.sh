@@ -5,7 +5,9 @@
 # (`none`: nothing renders, the stages through encode are measured; `cpu`: the reference
 # renderer rasterises each frame's damage too, the `raster` stage; `gl`: the GLES 3.1
 # renderer draws it on /dev/dri/renderD128, the `submit` and `gpu` stages — refused on a
-# software GL_RENDERER), stores
+# software GL_RENDERER; `vulkan`: the Vulkan renderer, the same two stages — on a CPU device
+# such as lavapipe it runs, but the rows say "vulkan-software" and are stored only: never
+# compared, never a baseline), stores
 # the JSON under tests/bench/results/<hostname>-<driver>/<YYYYMMDD>-<sha>.json and compares
 # it with tests/bench/baseline/<hostname>-<driver>.json:
 #
@@ -28,7 +30,7 @@
 #   ./scripts/ui-bench.sh --compare FILE      # compare against FILE instead of the baseline
 #
 # Options:
-#   --backend B         the backend to measure: none (default), cpu or gl; each has its own
+#   --backend B         the backend to measure: none (default), cpu, gl or vulkan; each has its own
 #                       baseline, tests/bench/baseline/<hostname>-<backend>.json
 #   --frames N          measured frames for every scenario (default: S1 600, S2 36000, S3 1800
 #                       at the bench's 1 ms frame clock; S2 changes its clock every 60th
@@ -163,6 +165,16 @@ with open(sys.argv[1], "w") as f:
     f.write("\n")
 PY
 rm -f "${parts[@]}"
+
+# A CPU Vulkan device measures the CPU through a graphics API, not a GPU: its rows are kept
+# for the record and nothing more.
+software="$(python3 -I -c 'import json, sys
+print(int(any(r.get("driver") == "vulkan-software" for r in json.load(open(sys.argv[1])))))' "$out")"
+if [[ "$software" -eq 1 ]]; then
+  echo
+  echo "== ${backend}: a software device (driver vulkan-software) — correctness only: not compared, never a baseline"
+  exit 0
+fi
 
 ref="$baseline"
 if [[ -n "$compare" ]]; then
