@@ -742,8 +742,11 @@ LUMEN_TEST(gl_gpu_timing) {
 // The same cases through the Vulkan renderer on the device `device_selector` picks — on this
 // host lavapipe, a CPU device: correctness only. Held to G10 against the CPU references (3/255)
 // and against `ui_gl` (2/255) when both run. Skips (passes) without a Vulkan device.
-// LUMEN_VULKAN_VALIDATION=1 loads VK_LAYER_KHRONOS_validation (when installed) with its log in
-// a temporary file, and `vk_validation_clean` (last) requires that log to hold no error.
+// LUMEN_VULKAN_VALIDATION=1 loads VK_LAYER_KHRONOS_validation (the manifest CMake found, passed
+// as LUMEN_VK_VALIDATION_LAYER) with its log in a temporary file, and `vk_validation_clean`
+// (last) requires the layer to have loaded (the log file exists: the layer creates it) and
+// the log to hold no error; it fails when validation was asked for and the layer is missing,
+// and says SKIP when there is no Vulkan device to validate.
 // LUMEN_UI_VK_DUMP=<dir> writes each case as <case>-vk.png.
 
 namespace {
@@ -754,6 +757,8 @@ struct vk_context_fixture {
 };
 
 std::string g_vk_validation_log{};
+/// LUMEN_VULKAN_VALIDATION=1 was set: `vk_validation_clean` must see the layer's log.
+bool g_vk_validation_requested = false;
 
 /// Torn down by `main` before it returns, not by a static destructor: the loader and the
 /// validation layer are libraries opened at run time, and their own state is gone by the
@@ -1094,6 +1099,72 @@ LUMEN_TEST(vk_surfaces_draw_in_stream_order) {
     LUMEN_CHECK(near(px[10 * 32 + 10], 0xFF008080u));
 }
 
+// A frame that fails before its submit (here: the surface compositor cannot prepare, after
+// the atlas copies were recorded) uploads nothing as far as the atlas is concerned: its dirty
+// lists stay, and the next frame uploads the pages — whole, the images being new — and draws
+// what the CPU reference draws.
+LUMEN_TEST(vk_failed_frame_keeps_the_atlas_dirty) {
+    vk_context_fixture* vk = shared_vk();
+    if (!vk)
+        return;
+    const lx::gfx::vk_context ctx = vk->device.context();
+    fixture fx{};
+    lx::gfx::ui_vk_renderer r{};
+    LUMEN_CHECK(static_cast<bool>(r.initialize(ctx)));
+    auto list = std::make_unique<lx::scene::draw_list>();
+    list->begin({40, 24});
+    {
+        lx::ui::draw_scope s{*list, {0, 0, 40, 24}};
+        s.sprite(lx::gfx::primitive_kind::mono_sprite, fx.tiles.disc.page, {2, 2, 16, 16},
+                 fx.tiles.disc.uv(), ui_golden::k_accent);
+        s.fill({20, 4, 8, 8}, lx::color::rgb(0.f, 0.f, 1.f));
+    }
+    list->batch_for_render();
+    std::vector<lx::gfx::blit_command> blits;
+    for (unsigned i = 0; i < list->size(); ++i) {
+        const lx::scene::draw_command& d = list->data()[i];
+        lx::gfx::blit_command b{};
+        b.dst = d.dst;
+        b.clip = d.clip;
+        b.opacity = d.opacity;
+        b.solid = d.solid;
+        b.solid_color = d.solid_color;
+        blits.push_back(b);
+    }
+    lx::gfx::ui_stream stream = ui_golden::stream_of(*list);
+    stream.surfaces = blits;
+    const unsigned page = fx.tiles.disc.page;
+    LUMEN_CHECK(fx.atlas->dirty_full(page) || !fx.atlas->dirty_rects(page).empty());
+    auto target = lx::gfx::ui_vk_target::create(ctx, 40, 24);
+    LUMEN_CHECK(static_cast<bool>(target));
+    // Not initialised: `prepare_blits` refuses, after `upload_atlas` recorded its copies.
+    lx::gfx::vulkan_compositor broken{};
+    r.set_surface_compositor(&broken);
+    auto failed = r.draw(*target, stream, fx.atlas.get(), full_region(), lx::color::rgb(0, 0, 0));
+    LUMEN_CHECK(!failed);
+    LUMEN_CHECK(fx.atlas->dirty_full(page) || !fx.atlas->dirty_rects(page).empty());
+    // The next frame (no compositor: the surface is skipped) uploads and draws the sprite.
+    r.set_surface_compositor(nullptr);
+    auto drawn = r.draw(*target, stream, fx.atlas.get(), full_region(), lx::color::rgb(0, 0, 0));
+    LUMEN_CHECK(static_cast<bool>(drawn));
+    LUMEN_CHECK(drawn && drawn->atlas_copies >= 1 && drawn->primitives_skipped == 1);
+    LUMEN_CHECK(fx.atlas->dirty_rects(page).empty() && !fx.atlas->dirty_full(page));
+    std::vector<std::uint32_t> px(40 * 24, 0u);
+    LUMEN_CHECK(static_cast<bool>(target->read_back(px)));
+    r.wait_idle();
+    std::vector<std::uint32_t> cpu(40 * 24, 0u);
+    lx::gfx::ui_cpu_renderer reference{};
+    LUMEN_CHECK(static_cast<bool>(reference.draw(surface_of(cpu, 40, 24, lx::pixel_format::xrgb8888),
+                                                 stream, fx.atlas.get(), full_region(),
+                                                 lx::color::rgb(0, 0, 0))));
+    const int worst = max_channel_error(px, cpu);
+    std::printf("    after a failed frame: %u copies, max channel error %d/255 vs CPU\n",
+                drawn ? drawn->atlas_copies : 0u, worst);
+    LUMEN_CHECK(worst <= ui_golden::k_tolerance_vs_cpu);
+    LUMEN_CHECK(px[10 * 40 + 10] != 0xFF000000u); // the disc's centre is drawn
+    r.shutdown();
+}
+
 // The pipeline cache on disk. A cold renderer writes it when the driver has data worth
 // keeping, a warm one reads it (and writes nothing), both draw the same pixels; a file whose
 // header names another device is not handed to the driver, and one naming this device is.
@@ -1214,11 +1285,21 @@ LUMEN_TEST(vk_gpu_timing) {
 
 // Last: with LUMEN_VULKAN_VALIDATION=1, the validation layer's log holds no error.
 LUMEN_TEST(vk_validation_clean) {
+    if (!g_vk_validation_requested)
+        return;
+    // Asked for, and the layer's manifest is not there: nothing was validated.
+    LUMEN_CHECK(!g_vk_validation_log.empty());
     if (g_vk_validation_log.empty())
         return;
-    if (vk_context_fixture* vk = shared_vk())
-        vk->renderer.wait_idle();
+    vk_context_fixture* vk = shared_vk();
+    if (!vk) {
+        std::printf("    SKIP: no Vulkan device, nothing validated\n");
+        return;
+    }
+    vk->renderer.wait_idle();
     std::FILE* f = std::fopen(g_vk_validation_log.c_str(), "r");
+    // The layer opens its log when an instance loads it: no file, no layer.
+    LUMEN_CHECK(f != nullptr);
     unsigned errors = 0;
     unsigned lines = 0;
     if (f) {
@@ -1245,15 +1326,24 @@ int main(int argc, char** argv) {
     // LUMEN_VULKAN_VALIDATION=1: the Khronos validation layer for every Vulkan instance this
     // process makes, logging to a file `vk_validation_clean` reads.
     if (const char* v = std::getenv("LUMEN_VULKAN_VALIDATION"); v && *v == '1') {
-        if (::access("/usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json", R_OK) == 0) {
+        g_vk_validation_requested = true;
+        // The manifest CMake found (any of the loader's explicit layer directories), or the
+        // usual one when run by hand.
+        const char* found = std::getenv("LUMEN_VK_VALIDATION_LAYER");
+        const std::string manifest =
+            found && *found ? found
+                            : "/usr/share/vulkan/explicit_layer.d/VkLayer_khronos_validation.json";
+        if (::access(manifest.c_str(), R_OK) == 0) {
             g_vk_validation_log = "/tmp/lumen-vk-validation-" + std::to_string(::getpid()) + ".log";
+            // Its directory, in case the loader would not search it on its own.
+            ::setenv("VK_ADD_LAYER_PATH", manifest.substr(0, manifest.find_last_of('/')).c_str(), 1);
             ::setenv("VK_INSTANCE_LAYERS", "VK_LAYER_KHRONOS_validation", 1);
             ::setenv("VK_KHRONOS_VALIDATION_DEBUG_ACTION", "VK_DBG_LAYER_ACTION_LOG_MSG", 1);
             ::setenv("VK_KHRONOS_VALIDATION_LOG_FILENAME", g_vk_validation_log.c_str(), 1);
             ::setenv("VK_KHRONOS_VALIDATION_REPORT_FLAGS", "error,warn", 1);
             std::remove(g_vk_validation_log.c_str());
         } else {
-            std::printf("LUMEN_VULKAN_VALIDATION: VK_LAYER_KHRONOS_validation not installed\n");
+            std::printf("LUMEN_VULKAN_VALIDATION: %s not readable\n", manifest.c_str());
         }
     }
     const int status = lumen_test::run_all(argc, argv);

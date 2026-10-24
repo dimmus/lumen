@@ -1181,7 +1181,7 @@ if(LUMEN_BUILD_TESTS)
         set_tests_properties(test_ui_golden PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
         if(TEST test_ui_golden_vk_validation)
             set_tests_properties(test_ui_golden_vk_validation PROPERTIES ENVIRONMENT
-                "${LUMEN_SANITIZER_ENV_VULKAN_ICD};LUMEN_VULKAN_VALIDATION=1")
+                "${LUMEN_SANITIZER_ENV_VULKAN_ICD};LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
         endif()
     endif()
     set_tests_properties(test_result test_snapshot test_primitives test_atlas test_scene_outputs test_damage_region test_wm_geometry

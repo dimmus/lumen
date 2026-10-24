@@ -11,6 +11,7 @@ module;
 #endif
 
 import lx.foundation;
+import lx.runtime;
 
 export module lx.gfx:ui_gl;
 
@@ -156,6 +157,10 @@ struct ui_gl_draw_stats {
     unsigned draw_calls = 0;          ///< instanced draws plus surface draws
     unsigned primitives_encoded = 0;  ///< instances written to the ring
     unsigned primitives_skipped = 0;  ///< bad index, missing or mismatched page, bad uv, no compositor
+    /// What `gl_compositor::composite_into` reported for the surface runs, summed over
+    /// (run, damage rect) pairs: draws of an unregistered texture, draws clipped away.
+    unsigned surface_draws_skipped = 0;
+    unsigned surface_draws_culled = 0;
     unsigned overflow_drops = 0;      ///< primitives of batches that did not fit the slot (dropped)
     std::uint64_t instance_bytes = 0; ///< bytes written to the slot
     unsigned atlas_uploads = 0;       ///< glTexSubImage2D calls
@@ -226,6 +231,11 @@ public:
     /// surfaces.
     void set_surface_compositor(gl_compositor* compositor) { compositor_ = compositor; }
 
+    /// The affinity `draw` and `wait_gpu_time` must run on (ADR-010 §4.12): `render` in the
+    /// compositor, `ui` in a client. `any` (the default) checks nothing — the tests, the bench
+    /// and the compositor's start-up warm draw, before the context moves to the render thread.
+    void set_owner_affinity(lx::runtime::affinity owner) { owner_ = owner; }
+
     /// Times each frame's GPU work (a timer query, or the fence when there is none), read
     /// with `wait_gpu_time`. Off by default.
     void set_gpu_timing(bool on) { timing_ = on; }
@@ -286,6 +296,7 @@ private:
     std::uint32_t batch_word_[k_max_batches]{};
     std::uint32_t batch_count_[k_max_batches]{};
     gl_compositor* compositor_ = nullptr;
+    lx::runtime::affinity owner_ = lx::runtime::affinity::any;
     // GL_EXT_buffer_storage / GL_EXT_disjoint_timer_query entry points.
     void* buffer_storage_ = nullptr;
     void* gen_queries_ = nullptr;
@@ -1019,6 +1030,7 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
     unsigned framebuffer, unsigned width, unsigned height, const ui_stream& stream, atlas* atlas,
     const damage_region& damage, std::optional<lx::color> clear) {
 #if defined(LUMEN_HAS_EGL)
+    lx::runtime::assert_affinity(owner_);
     if (!ready_)
         return lx::not_implemented("lx::gfx::ui_gl_renderer::draw");
     if (framebuffer == 0 || width == 0 || height == 0)
@@ -1189,6 +1201,8 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
                     if (!drawn)
                         return drawn.get_error();
                     ++stats.draw_calls;
+                    stats.surface_draws_skipped += drawn->draws_skipped;
+                    stats.surface_draws_culled += drawn->draws_culled;
                 }
                 continue;
             }
@@ -1273,6 +1287,7 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
 
 lx::result<lx::gfx::ui_gl_gpu_time> lx::gfx::ui_gl_renderer::wait_gpu_time() {
 #if defined(LUMEN_HAS_EGL)
+    lx::runtime::assert_affinity(owner_);
     ui_gl_gpu_time out{};
     if (!ready_ || timed_slot_ < 0)
         return out;

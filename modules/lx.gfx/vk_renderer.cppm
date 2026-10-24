@@ -143,6 +143,14 @@ public:
     /// §4.5), so texels are not decoded to linear light — tint and opacity scale the encoded
     /// values, as `gl_compositor` and `cpu_compositor::blend` do. Leaves its pipeline and
     /// descriptor set bound: the caller binds its own again.
+    ///
+    /// Lifetime: the textures' images, views and descriptor sets are recorded into the
+    /// caller's command buffer, which this compositor's frame fences do not cover —
+    /// `forget_texture` and `upload_rgba` over an existing id wait only for this
+    /// compositor's own frames, and `bind_imported` of another image under an existing id
+    /// replaces the view without waiting. Until it tracks external users (a fence or timeline
+    /// value per `record_blits`), the caller must wait for its submitted frames before any of
+    /// those calls touches a texture it recorded (`ui_vk_renderer::wait_idle`).
     [[nodiscard]] lx::result<composite_stats> record_blits(void* command_buffer, void* render_pass,
                                                            unsigned vk_format, void* pipeline_cache,
                                                            unsigned width, unsigned height,

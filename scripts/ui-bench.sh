@@ -20,7 +20,8 @@
 #                  back (S1 producing frames, say); a scenario, stage or gate of the
 #                  baseline missing from the run
 #   WARN           a stage's p95 more than 5 % above the baseline's; a gate with too few
-#                  samples to judge (`insufficient`); a scenario the baseline lacks
+#                  samples to judge (`insufficient`); a gate that fails in the run and in
+#                  the baseline (an open gate: never silent); a scenario the baseline lacks
 #
 # Exit status: 0 PASS (possibly with warnings), 1 FAIL, 2 could not run (a bad option, no
 # python3, no configured build, no bench binary).
@@ -222,6 +223,8 @@ for r in new:
         was = base_gates.get(gid)
         if verdict == "fail" and was != "fail":
             fails.append(f"{sid}: gate {gid} fail (baseline: {was or 'none'})")
+        elif verdict == "fail":
+            warns.append(f"{sid}: gate {gid} still fails (open in the baseline too)")
         elif verdict == "insufficient":
             warns.append(f"{sid}: gate {gid} has too few samples to judge")
     for gid in base_gates:

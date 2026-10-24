@@ -227,6 +227,26 @@ LUMEN_TEST(decorated_frame_goes_through_the_cpu_primitive_renderer) {
     d.release(snap);
 }
 
+// A decorated frame whose window texture was never registered: the stream path reports the
+// skipped surface in `composite.draws_skipped`, as the blit path does, so the compositor's
+// unregistered-texture warning fires on stream frames too.
+LUMEN_TEST(stream_frames_report_unregistered_surfaces) {
+    lx::gfx::cpu_compositor comp; // nothing registered
+    lx::gfx::ui_cpu_renderer ui;
+    lx::compositor::frame_painter painter;
+    desktop d{true};
+    const auto& snap = d.publish();
+    LUMEN_CHECK(lx::compositor::frame_painter::has_primitives(snap));
+    image streamed{};
+    auto s = painter.paint_cpu(comp, &ui, streamed.surface(), snap, full_region());
+    LUMEN_CHECK(static_cast<bool>(s) && s->paint.stream);
+    LUMEN_CHECK(s && s->ui.surface_draws_skipped > 0 && s->composite.draws_skipped > 0);
+    image lowered{};
+    auto l = painter.paint_cpu(comp, nullptr, lowered.surface(), snap, full_region());
+    LUMEN_CHECK(static_cast<bool>(l) && l->composite.draws_skipped > 0);
+    d.release(snap);
+}
+
 LUMEN_TEST(only_opaque_square_quads_occlude_and_primitives_are_never_culled) {
     lx::scene::draw_list list;
     list.begin({200, 200});

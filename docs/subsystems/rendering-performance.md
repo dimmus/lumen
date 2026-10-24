@@ -310,6 +310,16 @@ the same id. Damage is unchanged: the frame's four strips (title bar plus border
 new apart), never the client area; a hover or press repaints the close button only. No
 shadow and no rounded corner yet — a visual change, left for after Phase 2 text.
 
+Dimming on the GPU backends. The old swatch blits applied the 0.65 dim tint in linear light
+on GL and Vulkan (`linear_to_srgb(lin · tint)`; `composite.frag` likewise), the CPU
+compositor as the byte rule. The fills now carry the byte rule on every backend — a
+deliberate change, which makes a dimmed frame's fill a few levels darker on GL and Vulkan
+than before (0x3b: about 47 then, 38 now) and identical to the CPU's. The title text and
+close-glyph blits of the same bar still carry `k_dim_tint`, which GL and Vulkan apply in
+linear light: on those backends a dimmed bar's fill and its text follow different dim rules
+until Phase 2 draws the text as primitives (or the dim is baked into the title textures).
+`test_decoration_geometry` checks the fills on `cpu_compositor` only.
+
 ### Screen capture: copies ride the composite
 
 A capture (ext-image-copy-capture, wlr-screencopy) costs nothing while no session exists: one
@@ -652,10 +662,12 @@ take theirs back to front when it does), and the stream is stable-sorted by `(or
 page)` on packed 64-bit keys in a preallocated scratch and cut into batches wherever the
 kind or atlas page changes, with the union of each run's clipped bounds kept for damage
 skipping. One instanced draw per batch is the target for the UI backends (≤ 8 for the
-10 000-quad scene, ADR-010 G3); the compositor's backends still take the sorted
-`draw_command` array as before. A list without primitives — the compositor's scene — has
-no stream: it is only sorted, never touches the grid, and its `refs()` / `batches()` are
-empty.
+10 000-quad scene, ADR-010 G3). A list without primitives has no stream: it is only sorted,
+never touches the grid, its `refs()` / `batches()` are empty, and it reaches the
+compositor's backends as the sorted `draw_command` array converted to blits, as before. With
+primitives (server-side decorations), CPU and GLES 3.1 draw the stream through `:ui_cpu` /
+`:ui_gl` and the other paths draw it lowered to blits — see "UI primitives in the
+compositor" below.
 
 `pipeline_cache::acquire(pipeline_key)` returns cached pipeline handle (stub until P0 Vulkan).
 
@@ -677,8 +689,11 @@ A quad's fully covered interior is written without the SDF, and the clear under 
 square quad covering a band is skipped — both proven bit-identical by the tests.
 
 `lx.gfx:atlas` packs tiles on bucketed shelves into CPU-owned pages; GPU backends upload
-each page's dirty-rect list. A page above 85 % occupancy with tiles unused for 120 frames
-is repacked synchronously when an allocation finds no room.
+each page's dirty-rect list. When an allocation finds no room, tiles unused for 120 frames
+are freed in place; a page that was above 85 % occupancy is marked and repacked
+synchronously at the next `atlas::begin_frame` — never inside the allocation, since a
+repack moves live tiles and a uv already emitted in the frame being built would then name
+another tile's pixels.
 
 Measured on the F8 host (VMware SVGA3D VM, 2 vCPUs, release preset; load 0.6–0.9;
 `./scripts/ui-bench.sh --backend cpu`, `test_atlas`):
@@ -741,6 +756,10 @@ p95, so no `iritur-gl` baseline is committed. Where the time goes on this host:
 - The UI-thread stages run 40–50 % slower beside the GPU work than with `--backend none` in
   the same minutes (S3 emit+order+encode p50 1.44–1.55 ms against 1.02 ms): the host's 3D
   work shares the vCPUs.
+- **G3 is open** (ADR-010 §7 Phase 1, as built): its ≤ 1.0 ms for S3's emit + order +
+  encode is missed on every backend — 1.13 ms p50 / 2.42 ms p95 with `none` (the committed
+  baseline says `"G3": "fail"`), 1.44–1.55 ms p50 here. Emit is two thirds of it; closing
+  it is carried into Phase 2, and `scripts/ui-bench.sh` warns while it stays open.
 - G5 for `gl` rows: no `operator new` in any steady frame; `mallinfo2` moves by 592 B (S3)
   and 0.9–7 KB (S2) inside Mesa (sync objects, command buffers), which the script counts as
   a G5 failure — the driver's heap, not the frame path's.
@@ -794,6 +813,19 @@ frame:
   `:ui_cpu` and `:ui_gl` blend them in that space, as a client window does, while the CPU
   compositor blends *surfaces* in linear light through its tables and the GL one in encoded
   space. Opaque square chrome never blends, so it is the same colour on all three.
+- **Diagnostics.** `ui_draw_stats` / `ui_gl_draw_stats` carry what the compositor's blit
+  code reported for the surface runs (`surface_draws_skipped`, `_unsupported` on CPU,
+  `_culled`), and `paint_cpu` / `paint_gl` fold them into `composite.draws_skipped` /
+  `draws_unsupported`, so the unregistered-texture and unsupported-format warnings (and
+  `report_unregistered_draw`) fire on decorated frames as on plain ones.
+- **Threads (CPU).** `:ui_cpu`'s row bands run on the render thread, and its surface runs go
+  through `cpu_compositor::blend`, which draws one band: on a frame with primitives the
+  `row_band_pool` workers (`composite_thread_count` > 0) stay idle, while a frame without
+  primitives still uses them. The default is 0 threads and the 2-vCPU F8 host cannot show the
+  loss; running `:ui_cpu`'s disjoint bands on the compositor's pool is the follow-up, to be
+  measured on a host with more cores. Opaque pixels (source alpha 1) are written without
+  reading the target, which matters for a write-combining dumb buffer: a 1-px border quad
+  has no interior span, so every one of its pixels goes through the per-pixel blend.
 - **Visibility.** Only a quad that lowers to a blit (radius 0, borderless, one colour,
   integral bounds and clip) at alpha 1 occludes the draws under it — it is drawn identically
   on every path. Primitives are never culled: they draw wherever damage reaches them.

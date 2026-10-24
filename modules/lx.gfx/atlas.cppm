@@ -23,10 +23,13 @@ export namespace lx::gfx {
 // rounds up to its bucket, a shelf holds tiles of one bucket left to right across the page,
 // shelves stack top to bottom. A page starts at 1024² and grows once to 2048² (every shelf
 // gains the new width, new shelves go below); pages are created on demand up to 4 R8 and 2
-// RGBA8. When nothing fits, tiles unused for `k_atlas_stale_frames` frames are reclaimed:
-// a page above `k_atlas_rebuild_occupancy` with stale tiles is rebuilt (its live tiles
-// repacked, the page then whole-page dirty), any other page with stale tiles has them freed
-// in place. A tile used in the last 120 frames is never evicted.
+// RGBA8. When nothing fits, tiles unused for `k_atlas_stale_frames` frames are freed in
+// place, and a page that was above `k_atlas_rebuild_occupancy` with stale tiles is marked
+// for a rebuild (its live tiles repacked, the page then whole-page dirty), which runs at the
+// next `begin_frame` — never inside `allocate`: a rebuild moves live tiles, and a uv already
+// looked up for the current frame (a sprite emitted before the allocation) must stay where
+// its pixels are until the frame is built. A tile used in the last 120 frames is never
+// evicted.
 //
 // Fixed caps everywhere: the tile table, the shelves of a page and the dirty list are
 // fixed arrays sized at construction; after a page exists nothing allocates except the
@@ -114,7 +117,9 @@ public:
     atlas(const atlas&) = delete;
     atlas& operator=(const atlas&) = delete;
 
-    /// The frame number tiles are stamped with (`touch`, `allocate`); monotonic.
+    /// The frame number tiles are stamped with (`touch`, `allocate`); monotonic. Runs the
+    /// rebuilds `allocate` marked since the last call, before any emitter of the new frame
+    /// looks up a uv (call it before building the frame).
     void begin_frame(std::uint64_t frame);
     [[nodiscard]] std::uint64_t frame() const { return frame_; }
 
@@ -141,7 +146,9 @@ public:
     /// Returns how many.
     unsigned evict_stale();
     /// Drops the page's stale tiles and repacks the live ones from the top (tallest bucket
-    /// first), synchronously; the whole page becomes dirty. Fails for a page not created.
+    /// first), synchronously; the whole page becomes dirty. Moves live tiles: call it between
+    /// frames (as `begin_frame` does), never after a uv of the frame being built was looked
+    /// up. Fails for a page not created.
     [[nodiscard]] lx::result<atlas_rebuild_stats> rebuild(unsigned page);
 
     [[nodiscard]] static constexpr atlas_format page_format(unsigned page) {
@@ -155,6 +162,11 @@ public:
     [[nodiscard]] float density(unsigned page) const;
     [[nodiscard]] unsigned live_tiles(unsigned page) const;
     [[nodiscard]] unsigned stale_tiles(unsigned page) const;
+    /// `allocate` reclaimed stale tiles of this page in place while it was above
+    /// `k_atlas_rebuild_occupancy`: the next `begin_frame` rebuilds it.
+    [[nodiscard]] bool rebuild_pending(unsigned page) const {
+        return page < k_atlas_pages && pages_[page].rebuild_pending;
+    }
 
     /// What changed since `clear_dirty`: coalesced texel rects (empty when `dirty_full`).
     [[nodiscard]] std::span<const lx::rect2i> dirty_rects(unsigned page) const;
@@ -202,6 +214,7 @@ private:
         lx::rect2i dirty[k_atlas_dirty_rects]{};
         unsigned dirty_count = 0;
         bool dirty_full = false;
+        bool rebuild_pending = false; ///< rebuilt at the next `begin_frame`
         unsigned live = 0;
         unsigned long long live_area = 0;
     };
@@ -289,6 +302,12 @@ void lx::gfx::atlas::begin_frame(std::uint64_t frame) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (frame > frame_)
         frame_ = frame;
+    // Rebuilds `allocate` asked for: between frames, before any uv of this one is looked up.
+    for (unsigned p = 0; p < k_atlas_pages; ++p)
+        if (pages_[p].rebuild_pending) {
+            pages_[p].rebuild_pending = false;
+            (void)rebuild(p);
+        }
 }
 
 lx::gfx::atlas::tile_entry* lx::gfx::atlas::entry(atlas_tile_id id) {
@@ -551,11 +570,10 @@ bool lx::gfx::atlas::reclaim(atlas_format format) {
     for (unsigned p = first; p < last; ++p) {
         if (pages_[p].size == 0 || stale_tiles(p) == 0)
             continue;
-        if (occupancy(p) > k_atlas_rebuild_occupancy) {
-            if (auto r = rebuild(p); r && r->evicted > 0)
-                freed = true;
-            continue;
-        }
+        // In place only: live tiles never move inside `allocate` (uvs of this frame may
+        // already be in the stream). A crowded page is repacked at the next `begin_frame`.
+        if (occupancy(p) > k_atlas_rebuild_occupancy)
+            pages_[p].rebuild_pending = true;
         for (unsigned i = 0; i < k_atlas_max_tiles; ++i) {
             const tile_entry& t = store_->tiles[i];
             if (t.live && t.page == p && stale(t)) {
@@ -576,6 +594,7 @@ lx::result<lx::gfx::atlas_rebuild_stats> lx::gfx::atlas::rebuild(unsigned page) 
         return lx::invalid_argument("atlas::rebuild: no scratch (allocation failed)");
     const std::uint64_t t0 = lx_gfx_atlas_now_ns();
     page_state& p = pages_[page];
+    p.rebuild_pending = false;
     atlas_rebuild_stats out{};
     out.page = page;
     out.occupancy_before = occupancy(page);

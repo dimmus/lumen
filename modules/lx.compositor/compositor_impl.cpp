@@ -5141,6 +5141,8 @@ void compositor_impl::warm_gl_paths() {
         warm.add({0, 0, 8, 5});
         const gfx::gl_scanout_target& t = pipe->gl[output_pipeline::k_slots - 1];
         (void)ui_gl_->draw(t.framebuffer(), t.width(), t.height(), stream, nullptr, warm);
+        // From here on only the render thread draws with it (ADR-010 §4.12).
+        ui_gl_->set_owner_affinity(runtime::affinity::render);
     }
     lx::trace::timeline_instant("startup", "gl paths warmed");
 }

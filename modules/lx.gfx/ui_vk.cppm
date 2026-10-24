@@ -10,6 +10,7 @@ module;
 #include <stdint.h>
 
 import lx.foundation;
+import lx.runtime;
 
 export module lx.gfx:ui_vk;
 
@@ -81,7 +82,12 @@ export namespace lx::gfx {
 // frame path). An upload larger than the slot's staging range — whole pages, after growth or
 // for an atlas the renderer has not seen — goes through a buffer made for that frame and
 // freed when its slot comes round again (`draw_stats::atlas_transient`). Nothing waits for
-// the queue to go idle.
+// the queue to go idle. The atlas's dirty lists are cleared, and a new page image counted as
+// holding its contents, only once the frame that uploads them is submitted: a frame that
+// fails before its submit records copies that never run, so the next draw uploads the same
+// rects again (a new page whole, from UNDEFINED). A frame whose surface draw fails to record
+// inside the pass is still ended and submitted, so its copies and the compositor's acquires
+// (`prepare_blits`) execute as their CPU-side state says they did.
 //
 // Damage. One render pass over the whole attachment; per damage rect: the scissor, a
 // vkCmdClearAttachments of the rect (when a clear colour is given), then every batch whose
@@ -256,17 +262,28 @@ public:
     [[nodiscard]] const ui_vk_setup_stats& setup_stats() const { return setup_; }
 
     /// Where `surface` refs' textures are registered (same device). Borrowed; null skips
-    /// surfaces (counted in `primitives_skipped`).
+    /// surfaces (counted in `primitives_skipped`). Lifetime: the compositor's descriptor sets
+    /// and images are recorded into this renderer's command buffers, which the compositor's
+    /// own fences do not cover — `vulkan_compositor::forget_texture` (or a texture
+    /// re-upload) of a texture a submitted `draw` used must wait for this renderer's frames
+    /// first (`wait_idle`). Nothing enforces that yet: the compositor's Vulkan path does not
+    /// use this renderer (ADR-010 §4.11 as built).
     void set_surface_compositor(vulkan_compositor* compositor) { compositor_ = compositor; }
+
+    /// The affinity `draw` and `wait_gpu_time` must run on (ADR-010 §4.12): `render` in the
+    /// compositor, `ui` in a client. `any` (the default) checks nothing — the tests and the
+    /// bench, which drive the renderer from one thread.
+    void set_owner_affinity(lx::runtime::affinity owner) { owner_ = owner; }
 
     /// Times each frame's GPU work, read with `wait_gpu_time`. Off by default.
     void set_gpu_timing(bool on) { timing_ = on; }
 
     /// Draws `stream` into `target` inside `damage`, clearing each damage rect to `clear`
-    /// (premultiplied, encoded) first when given. Uploads the atlas's dirty pages first and
-    /// clears its dirty lists (`atlas` may be null when the stream has no sprites). An empty
-    /// region draws nothing and submits nothing. Submits; never waits for the GPU except for
-    /// a ring slot still in flight three frames on.
+    /// (premultiplied, encoded) first when given. Uploads the atlas's dirty pages first and,
+    /// once the frame is submitted, clears its dirty lists (`atlas` may be null when the
+    /// stream has no sprites; a frame that fails before its submit leaves them for the next
+    /// draw). An empty region draws nothing and submits nothing. Submits; never waits for the
+    /// GPU except for a ring slot still in flight three frames on.
     [[nodiscard]] lx::result<ui_vk_draw_stats> draw(const ui_vk_attachment& target,
                                                     const ui_stream& stream, atlas* atlas,
                                                     const damage_region& damage,
@@ -361,6 +378,12 @@ private:
     unsigned next_framebuffer_ = 0;
     page_image pages_[k_atlas_pages]{};
     const atlas* atlas_seen_ = nullptr;
+    /// A page image made and not yet uploaded by a submitted frame: its next upload is whole,
+    /// from UNDEFINED.
+    bool page_whole_pending_[k_atlas_pages]{};
+    /// Pages this frame's `upload_atlas` recorded: their dirty lists are cleared at submit.
+    bool page_uploaded_[k_atlas_pages]{};
+    lx::runtime::affinity owner_ = lx::runtime::affinity::any;
     unsigned frame_ = 0;
     int timed_slot_ = -1; ///< slot of the last timed frame, until `wait_gpu_time`
     std::uint64_t timed_submit_ns_ = 0;
@@ -1641,9 +1664,11 @@ lx::result<void> lx::gfx::ui_vk_renderer::upload_atlas(atlas& a, void* command_b
 #if defined(LUMEN_HAS_VULKAN)
     using namespace ui_vk_detail;
     auto cb = static_cast<VkCommandBuffer>(command_buffer);
-    // An atlas this renderer has not drawn from: every page it has goes up whole.
+    // An atlas this renderer has not drawn from (in a submitted frame): every page it has
+    // goes up whole. `atlas_seen_`, like the dirty lists, is committed at submit.
     const bool fresh_atlas = atlas_seen_ != &a;
-    atlas_seen_ = &a;
+    for (bool& u : page_uploaded_)
+        u = false;
 
     // Plan: which pages go up, whole or by rects, and how many bytes that is.
     bool whole[k_atlas_pages]{};
@@ -1657,10 +1682,11 @@ lx::result<void> lx::gfx::ui_vk_renderer::upload_atlas(atlas& a, void* command_b
         if (pages_[i].size != view.size) {
             if (auto made = create_page(i, view.size, view.format == atlas_format::r8); !made)
                 return made.get_error();
-            whole[i] = true;
+            page_whole_pending_[i] = true;
         }
         const std::span<const lx::rect2i> dirty = a.dirty_rects(i);
-        whole[i] = whole[i] || fresh_atlas || a.dirty_full(i) || dirty.size() > k_ui_vk_upload_regions;
+        whole[i] = page_whole_pending_[i] || fresh_atlas || a.dirty_full(i) ||
+                   dirty.size() > k_ui_vk_upload_regions;
         upload[i] = whole[i] || !dirty.empty();
         if (whole[i]) {
             need += static_cast<std::size_t>(view.stride) * view.size;
@@ -1758,7 +1784,7 @@ lx::result<void> lx::gfx::ui_vk_renderer::upload_atlas(atlas& a, void* command_b
             ++stats.atlas_copies;
             stats.atlas_uploads += count;
         }
-        a.clear_dirty(i);
+        page_uploaded_[i] = true; // dirty list cleared once the frame is submitted
     }
     return {};
 #else
@@ -1777,6 +1803,7 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     const damage_region& damage, std::optional<lx::color> clear) {
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
     using namespace ui_vk_detail;
+    lx::runtime::assert_affinity(owner_);
     if (!ready_)
         return lx::not_implemented("lx::gfx::ui_vk_renderer::draw");
     if (!target.image || !target.view || target.width == 0 || target.height == 0 ||
@@ -1976,9 +2003,9 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * slot + 1);
     if (vkEndCommandBuffer(cb) != VK_SUCCESS)
         return vk_fail("ui_vk: vkEndCommandBuffer failed");
-    if (!failed)
-        return failed.get_error(); // recorded, never submitted: the slot stays free
-
+    // Submitted even when a surface draw failed to record (`failed`): the atlas copies and
+    // the compositor's acquires recorded before the pass are already counted as done on the
+    // CPU side, so they must run. The error is returned after the submit.
     vkResetFences(dev, 1, &fence);
     VkSubmitInfo submit{};
     submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1988,10 +2015,21 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
         return vk_fail("ui_vk: vkQueueSubmit failed");
     submitted_[slot] = true;
     ++frame_;
+    if (atlas) {
+        for (unsigned i = 0; i < k_atlas_pages; ++i)
+            if (page_uploaded_[i]) {
+                atlas->clear_dirty(i);
+                page_whole_pending_[i] = false;
+                page_uploaded_[i] = false;
+            }
+        atlas_seen_ = atlas;
+    }
     if (timing_) {
         timed_slot_ = static_cast<int>(slot);
         timed_submit_ns_ = now_ns();
     }
+    if (!failed)
+        return failed.get_error();
     return stats;
 #else
     (void)target;
@@ -2006,6 +2044,7 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
 lx::result<lx::gfx::ui_vk_gpu_time> lx::gfx::ui_vk_renderer::wait_gpu_time() {
 #if defined(LUMEN_HAS_VULKAN)
     using namespace ui_vk_detail;
+    lx::runtime::assert_affinity(owner_);
     ui_vk_gpu_time out{};
     if (!ready_ || timed_slot_ < 0)
         return out;

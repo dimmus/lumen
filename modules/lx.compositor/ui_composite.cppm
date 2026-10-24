@@ -245,6 +245,11 @@ lx::result<lx::compositor::cpu_paint_result> lx::compositor::frame_painter::pain
     if (!d)
         return d.get_error();
     out.ui = d.value();
+    // The surfaces' own diagnostics, as `composite_region` reports them on the blit path:
+    // the caller's unregistered-texture and unsupported-format warnings fire on stream frames.
+    out.composite.draws_skipped = out.ui.surface_draws_skipped;
+    out.composite.draws_unsupported = out.ui.surface_draws_unsupported;
+    out.composite.draws_culled = out.ui.surface_draws_culled;
     out.paint.stream = true;
     out.paint.primitives = snap.draws().primitive_count();
     ++stream_frames_;
@@ -282,7 +287,10 @@ lx::result<lx::compositor::gl_paint_result> lx::compositor::frame_painter::paint
         return fence.get_error();
     out.composite.out_fence_fd = fence.value();
     out.composite.draws_submitted = out.ui.draw_calls;
-    out.composite.draws_skipped = out.ui.primitives_skipped;
+    // Primitives the renderer could not draw and surfaces of an unregistered texture: what
+    // the caller's `report_unregistered_draw` looks for.
+    out.composite.draws_skipped = out.ui.primitives_skipped + out.ui.surface_draws_skipped;
+    out.composite.draws_culled = out.ui.surface_draws_culled;
     out.paint.stream = true;
     out.paint.primitives = snap.draws().primitive_count();
     ++stream_frames_;

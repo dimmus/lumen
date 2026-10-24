@@ -250,7 +250,14 @@ timestamps bracket the frame, not each kind. The GLSL is one set of files (shade
 that `:ui_gl` compiles at run time and `:ui_vk` at build time. `renderer.cppm`'s key table
 stays: the compositor's `frame_renderer` still uses it. The compositor's `upload_rgba` still
 waits on its frame slots — the staging ring belongs to `:ui_vk` and has not been moved under
-the compositor's shm uploads yet.
+the compositor's shm uploads yet. The atlas's dirty lists (and a new page image's "uploaded"
+state) are committed only when the frame is submitted; a frame whose surface draw fails to
+record inside the pass is still submitted, so the copies and acquires recorded before it run.
+`surface` draws record `vulkan_compositor`'s images and descriptor sets into `:ui_vk`'s
+command buffers, which the compositor's fences do not cover: until `vulkan_compositor`
+tracks external users, whoever forgets or replaces such a texture must first wait for
+`:ui_vk`'s frames (`wait_idle`; stated on `record_blits`). The compositor's Vulkan path does
+not use `:ui_vk` yet, so nothing in production depends on this.
 
 ### 4.5 Colour and precision
 
@@ -296,6 +303,13 @@ and 2 RGBA8 pages; a page above 85 % occupancy with stale tiles is rebuilt from 
 set on the worker thread and swapped at the next frame. Each tile records the last frame
 it was drawn; eviction never touches a tile used in the last 120 frames (the import
 cache's stale threshold).
+
+As built in Phase 1: the rebuild is synchronous on the UI thread, not on the worker, and
+runs at `atlas::begin_frame`. An `allocate` that finds no room frees stale tiles in place
+only — a rebuild moves live tiles, and a uv looked up earlier in the same frame must keep
+naming its pixels — and marks a page above 85 % for the rebuild at the next frame (0.6–1.3 ms
+measured, rendering-performance.md §6). The worker rebuild into a shadow page swapped at
+`begin_frame` is left for when S4 shows the synchronous one on a frame.
 
 Shaping and rasterising happen on the **worker** affinity when a layout invalidation is
 large (a whole document) and inline on the UI thread when it is small (a label), with the
@@ -417,7 +431,12 @@ primitives are never culled.
 | shaping, glyph raster, SVG raster, page rebuild, theme reload | `worker` | Worker arena; results posted with `executor.post(ui, …)` |
 
 `assert_affinity()` at `draw_scope` construction, `ui_vk::draw` entry and
-`atlas::rasterize` entry. Every per-frame container is fixed-capacity with an
+`atlas::rasterize` entry. As built in Phase 1: the renderers' affinity depends on the
+consumer, so `ui_vk_renderer` and `ui_gl_renderer` assert at `draw` and `wait_gpu_time`
+entry against an owner the consumer binds with `set_owner_affinity` (the compositor binds
+`ui_gl` to `render` after its start-up warm draw; `any`, the default, checks nothing — tests
+and the bench); the atlas asserts `ui` at `allocate`, `write`, `release`, `rebuild` and
+`begin_frame` (there is no `rasterize` before Phase 2). Every per-frame container is fixed-capacity with an
 `overflow_action` (memory-management.md §3): primitive stream, batch list (≤ 1 024), damage
 ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
 
@@ -613,6 +632,16 @@ one focused developer; it is an ordering aid, not a commitment.
 - The three compositors accept the stream: `quad` and `shadow` reach the screen through
   `frame_node` for server-side decorations (title text stays CPU-rasterised until Phase 2).
 - Gate: G3 and G10 on GL and CPU here; Vulkan parity on lavapipe.
+
+As built: G10 is met on CPU, GL and Vulkan (lavapipe), and G3's ≤ 8 draws and ≤ 800 KB
+hold (one draw, 800 080 B). **G3's CPU time is open**: S3's emit + order + encode is
+1.13 ms p50 / 2.42 ms p95 with `--backend none` (the committed baseline,
+tests/bench/baseline/iritur-none.json, records `"G3": "fail"`) and 1.44–1.55 ms p50 beside
+the GL backend, against ≤ 1.0 ms. Emit is two thirds of it (0.83 ms p50). Phase 1 closed
+with the gate open; closing it — the per-quad cost of the emit path, `draw_scope` →
+`draw_list::push_quad`, since every S3 quad moves every frame and caching does not apply —
+is carried into Phase 2, whose gate does not count as green until G3 is.
+`scripts/ui-bench.sh` warns on every run while the gate fails in the baseline too.
 
 ### Phase 2 — Text (≈3 weeks)
 

@@ -138,6 +138,12 @@ struct ui_draw_stats {
     unsigned batches_skipped = 0;   ///< (batch, band) pairs whose bounds missed
     unsigned primitives_drawn = 0;  ///< (primitive, band) pairs rasterised
     unsigned primitives_skipped = 0; ///< bad index, missing or mismatched atlas page, no compositor
+    /// What `cpu_compositor::blend` reported for the surface runs, summed over (run, band)
+    /// pairs: draws of an unregistered texture, of a format with no conversion to the
+    /// target's, and draws culled (occluded or invisible).
+    unsigned surface_draws_skipped = 0;
+    unsigned surface_draws_unsupported = 0;
+    unsigned surface_draws_culled = 0;
     unsigned long long pixels_shaded = 0;
 };
 
@@ -369,6 +375,12 @@ struct unorm_table {
 inline void blend(std::uint32_t& px, rgba s, bool has_alpha) {
     if (!(s.a > 0.f) && !(s.r > 0.f) && !(s.g > 0.f) && !(s.b > 0.f))
         return; // adds nothing: d · 1 rounds back to d
+    if (s.a == 1.f) {
+        // Opaque: d · 0 adds nothing, so the result is the source's bytes — written without
+        // reading the target (a scanout dumb buffer is write-combining: a read is uncached).
+        px = pack(s, has_alpha);
+        return;
+    }
     const float* u = unorm().v;
     const float k = 1.f - s.a;
     const std::uint32_t r = to_byte(s.r + u[(px >> 16u) & 0xFFu] * k);
@@ -1422,6 +1434,9 @@ lx::result<void> lx::gfx::ui_cpu_renderer::draw_band(const void* frame, const ui
                     if (!drawn)
                         return drawn.get_error();
                     stats.primitives_drawn += static_cast<unsigned>(n);
+                    stats.surface_draws_skipped += drawn->draws_skipped;
+                    stats.surface_draws_unsupported += drawn->draws_unsupported;
+                    stats.surface_draws_culled += drawn->draws_culled;
                     i += n - 1;
                 } else {
                     ++stats.primitives_skipped;

@@ -242,7 +242,9 @@ LUMEN_TEST(rebuild_preserves_live_tile_contents) {
 }
 
 // Every R8 page full of 64 × 64 tiles (shelves claim 100 %): the next allocation reclaims —
-// pages above 85 % with stale tiles are rebuilt — and succeeds; recent tiles survive.
+// stale tiles freed in place, pages above 85 % marked for a rebuild — and succeeds; no live
+// tile moves inside `allocate` (a uv looked up earlier in the frame still names its pixels);
+// the rebuild runs at the next `begin_frame`; recent tiles survive both.
 LUMEN_TEST(full_atlas_rebuilds_pages_with_stale_tiles) {
     auto a = std::make_unique<atlas>();
     a->begin_frame(10);
@@ -263,8 +265,26 @@ LUMEN_TEST(full_atlas_rebuilds_pages_with_stale_tiles) {
     for (std::size_t i = 0; i < ids.size(); ++i)
         if (i % 2u == 0)
             a->touch(ids[i]);
+    // The frame's sprites looked their uvs up before the allocation.
+    std::vector<atlas_tile> before(ids.size());
+    for (std::size_t i = 0; i < ids.size(); i += 2)
+        LUMEN_CHECK(a->lookup(ids[i], before[i]));
     auto fresh = a->allocate(atlas_format::r8, 64, 64);
     LUMEN_CHECK(static_cast<bool>(fresh));
+    LUMEN_CHECK(a->stats().rebuilds == 0 && a->stats().evicted > 0);
+    bool pending = false;
+    for (unsigned p = 0; p < lx::gfx::k_atlas_r8_pages; ++p)
+        pending = pending || a->rebuild_pending(p);
+    LUMEN_CHECK(pending);
+    for (std::size_t i = 0; i < ids.size(); i += 2) {
+        atlas_tile now{};
+        LUMEN_CHECK(a->lookup(ids[i], now));
+        LUMEN_CHECK(now.page == before[i].page && now.x == before[i].x && now.y == before[i].y);
+        LUMEN_CHECK(pattern_intact(*a, ids[i], static_cast<unsigned>(i)));
+    }
+    a->begin_frame(201);
+    for (unsigned p = 0; p < lx::gfx::k_atlas_r8_pages; ++p)
+        LUMEN_CHECK(!a->rebuild_pending(p));
     const lx::gfx::atlas_stats st = a->stats();
     std::printf("    reclaim: %llu rebuilds, %llu evicted, last rebuild %.1f us, max %.1f us\n",
                 st.rebuilds, st.evicted, static_cast<double>(st.last_rebuild_ns) / 1000.0,
