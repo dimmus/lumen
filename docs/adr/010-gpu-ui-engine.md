@@ -352,7 +352,10 @@ colours packed once per run. The golden text cases use only bundled fonts plus t
 
 Shaping and rasterising happen on the **worker** affinity when a layout invalidation is
 large (a whole document) and inline on the UI thread when it is small (a label), with the
-boundary set by measurement in §8.3 S4.
+boundary set by measurement in §8.3 S4. As built: the boundary is 4 KiB of text (a cold
+reshape costs ~0.21 µs a byte here; S4's whole document 31–38 ms); shaping and wrapping move to
+the worker, glyph rasterising stays on the UI thread where the atlas lives (§7 Phase 2, as
+built).
 
 ### 4.7 Layout
 
@@ -690,6 +693,45 @@ is carried into Phase 2, whose gate does not count as green until G3 is.
   for Arabic and Hebrew test strings in `tests/test_text_lines.cpp`.
 - Title bars switch to atlas glyphs. `lx.shell`'s `shm_canvas::text` is left until Phase 5.
 - Gate: G4 (S4) on GL; `test_text_raster` and `test_text_shaping` extended, not replaced.
+
+As built (S4 and G4; `lumen-ui-bench --scenario S4`, tests/bench/baseline/iritur-none.json):
+S4 is one `text_block_node` holding 2 000 seeded lines of 50 glyphs (Latin / Cyrillic / Arabic
+words, IBM Plex Sans 14 px, line height φ, Arabic from the host's DejaVu Sans fallback; 139 375
+B, 99 771 glyphs, 7.9 MB of layout) under a scroll node that moves its origin 3 px a frame at
+1920 × 1080. The first frame lays the document out inline (57–75 ms, 3 673 shaping calls, 402
+glyphs rasterised, 40 KB uploaded); a steady frame lays nothing out and emits the ~50 lines its
+clip reaches: 2 096 mono sprites, **0 shaping calls**, 45 glyphs rasterised over 1 800 frames
+(new subpixel variants as lines scroll in; 3 740 atlas bytes in all, at most 318 in a frame),
+two batches — the background quad and **one sprite batch on the one R8 page (one draw call on
+GL)**, 128 912 instance bytes — and no heap allocation. G4's sum (layout + emit + order +
+encode) with `--backend none`, load 0.4–0.7, three runs: p50 153–156 µs, p95 1.08–1.20 ms;
+beside the GL backend (two runs, the gate): p50 169 µs, p95 0.46–0.52 ms (`submit` p50 0.45 ms,
+`gpu` fence-wall p50 4.7 ms); frames back to back (`--period-us 0`): p50 81 µs, p95 0.18 ms.
+**G4 passes on GL and on `none`**, but the `none` p95 is 7× its p50 and that tail is the host:
+at the 1 ms frame clock the bench idles ~0.85 ms a frame and the vCPU then runs in bursts about
+8× slower (a fixed spin loop run before the tick takes up to 10× its usual time in some frames,
+and with it warming the core first the emit's slow frames mostly go; S3, whose frames outlast
+the period, never idles and shows 2.2×). What brought it
+there from p50 249 µs / p95 1.98 ms at first: `glyph_cache` hashes the key with one 64-bit mix
+and compares a 32-bit tag per way before the key, and `find_placed` probes and looks up and
+touches the tile once (`atlas::use`) — emit −25 %; a line's sprites share one order from the
+grid (`draw_scope::group_order`, a floor of the previous group's + 1 so a block's groups
+ascend), which removes the per-glyph grid lookup and leaves `batch_for_render` an ascending
+stream to copy instead of sort — order −50 %; and the text node keeps each glyph's placement
+(box and tile) until the layout runs a pass, so a scrolling frame costs one `atlas::use` per
+glyph — emit 104 → 64 µs back to back. Shaping by invalidation size (§4.6, the same run, cold
+= shape cache empty, warm = a new layout over a warm cache): a 14-byte label 3.3 µs cold; one
+76-byte line 15–36 µs (0.7–0.8 ms the first time a script needs a fontconfig fallback search);
+a 669-byte paragraph 0.13 ms cold, 53 µs warm; a 6.9 KB page 1.4–1.5 ms cold, 0.7–1.1 ms warm;
+the whole document 31–38 ms cold, 20–22 ms warm, a re-wrap 0.8 ms. The whole-document reshape
+exceeds a 60 Hz frame, so it moved off the UI thread: text of 4 KiB or more
+(`lx.ui::k_text_async_min_bytes`, an inline cold reshape under ~1 ms) is shaped and wrapped on
+the worker affinity when the block has a `text_async_shaping` (the worker's own shape cache and
+itemizer over the block's face cache) into a staging layout, handed back with
+`executor.post(ui, …)` and swapped in at the next UI frame, the old layout shown meanwhile
+(`test_text_node`). The worker's shape pass gives the face lock to a waiter between paragraphs
+(`face_cache::contended`): the UI thread waited at most 1.3 ms while a 150 KB document shaped.
+GL baseline rows: none committed — the two GL runs differ by more than 5 % at p95.
 
 ### Phase 3 — Layout, style, theme, components (≈2 weeks)
 

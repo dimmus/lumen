@@ -1,6 +1,6 @@
-// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phases 0–1.
+// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phases 0–2.
 //
-// The scenarios S1–S3 of §8.3 run against lx.ui's declarative core the way an application
+// The scenarios S1–S4 of §8.3 run against lx.ui's declarative core the way an application
 // uses it: descriptors reconciled onto retained nodes by `ui_root::tick`, nodes emitting
 // ADR-010 primitives through `draw_scope`, the overlap grid and the `(order, kind, page)`
 // sort of `draw_list::batch_for_render`. Every number is attributed to a stage (§8.1) with
@@ -29,9 +29,9 @@
 // "vulkan-software" and `gpu.software` true, and scripts/ui-bench.sh never compares them nor
 // makes them a baseline.
 //
-//   lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu|gl|vulkan] [--frames N] [--warmup N]
+//   lumen-ui-bench [--scenario S1|S2|S3|S4|all] [--backend none|cpu|gl|vulkan] [--frames N] [--warmup N]
 //                  [--period-us US] [--json PATH] [--pin CPU|none] [--scale F] [--git SHA]
-//                  [--preset NAME] [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]
+//                  [--preset NAME] [--gl-ring persistent|mapped] [--gl-fetch storage|attributes] [--no-reshape]
 //
 // Frames come from a frame clock (`--period-us`): a scenario whose work is a few
 // microseconds per frame is otherwise over in a millisecond, one sample of whatever the
@@ -42,6 +42,12 @@
 // the scenes are seeded (xorshift64) and read no clock. The exit status is 0 whatever the
 // numbers say — CTest checks that it ran; the `gates` block of the JSON and
 // scripts/ui-bench.sh carry the verdicts.
+//
+// S4 (the text wall, gate G4) adds per-frame text counters — shaping calls, glyphs rasterised,
+// atlas bytes a backend uploads, sprites, sprite batches per atlas page — under "text" in the
+// JSON, the stage `layout_emit_order_encode` (G4's sum), and after its frames the reshape cost
+// of a label, a line, a paragraph, a page and the whole document under "reshape"
+// (`--no-reshape` skips it).
 
 #include <errno.h>
 #include <fcntl.h>
@@ -59,6 +65,7 @@ import lx.runtime;
 import lx.layout;
 import lx.gfx;
 import lx.scene;
+import lx.text;
 import lx.ui;
 import lx.trace;
 
@@ -154,7 +161,7 @@ struct xorshift64 {
 };
 
 struct options {
-    bool scenarios[3]{true, true, true};
+    bool scenarios[4]{true, true, true, true};
     const char* backend = "none";
     unsigned frames = 600;
     unsigned warmup = 120;
@@ -166,6 +173,7 @@ struct options {
     const char* preset = "release";
     bool gl_mapped_ring = false; ///< `gl`: the mapped-range ring instead of the persistent one
     bool gl_attribute_fetch = false; ///< `gl`: instances as vertex attributes, not a storage buffer
+    bool reshape = true; ///< S4: measure the reshape cost by invalidation size after the frames
 };
 
 /// Keeps the optimiser from deleting the encode copy.
@@ -343,13 +351,14 @@ enum stage : unsigned {
     st_raster,            ///< the backend drawing the frame (`cpu`: ui_cpu_renderer::draw)
     st_submit,            ///< `gl`/`vulkan`: the renderer's draw on the CPU (upload, gather, record, submit)
     st_gpu,               ///< `gl`/`vulkan`: the frame's GPU time (timer query / timestamps, or fence-wall)
+    st_layout_emit_order_encode, ///< G4's sum: the UI thread's work on a produced frame
     st_count,
 };
 
 constexpr const char* k_stage_names[st_count] = {
     "update", "tick_idle", "tick",   "describe",          "reconcile", "layout",
     "emit",   "order",     "encode", "emit_order_encode", "frame",     "raster",
-    "submit", "gpu",
+    "submit", "gpu",    "layout_emit_order_encode",
 };
 
 struct summary {
@@ -648,6 +657,23 @@ private:
 
 // ── Scenario descriptions ───────────────────────────────────────────────────────
 
+struct text_counters;
+
+/// What a text scenario (S4) reports of one produced frame, read after `encode` and before
+/// the backend draws (a GPU backend commits the atlas's dirty lists as it uploads them).
+struct text_frame_sample {
+    unsigned shaping_calls = 0;       ///< the engine's shape cache: HarfBuzz calls this frame
+    unsigned rasterized = 0;          ///< glyph cache misses rasterised this frame
+    std::uint64_t upload_bytes = 0;   ///< atlas texels dirtied this frame × bytes per texel
+    unsigned upload_rects = 0;        ///< dirty rects (a whole page counts one)
+    unsigned sprites = 0;             ///< glyph sprites the text node emitted
+    unsigned glyphs = 0;              ///< glyphs it looked at
+    unsigned lines_drawn = 0;         ///< lines inside the clip
+    unsigned sprite_batches = 0;      ///< batches of atlas kinds (one instanced draw each)
+    unsigned sprite_batches_per_page = 0; ///< the most on one atlas page
+    unsigned pages = 0;               ///< atlas pages the frame's sprites sample
+};
+
 struct scenario_spec {
     const char* id = "";
     const char* title = "";
@@ -657,6 +683,15 @@ struct scenario_spec {
     void (*before_frame)(unsigned frame) = nullptr;      ///< scene mutation + invalidation
     void (*on_built)(lx::ui::ui_node& root) = nullptr;   ///< once, after the first frame
     unsigned batch_cap = 0;                              ///< 0: no cap for this scenario
+    /// The atlas the frame's sprites sample (a GPU backend uploads it and clears its dirty
+    /// lists); null: none.
+    lx::gfx::atlas* atlas = nullptr;
+    /// A text scenario's per-frame counters; `clear_dirty`: no backend uploads the atlas, so
+    /// the sample commits its dirty lists itself.
+    void (*text_frame)(const lx::scene::draw_list& draws, bool clear_dirty,
+                       text_frame_sample& out) = nullptr;
+    /// Fills the document fields of the scenario's `text_counters` after the run.
+    void (*text_doc)(text_counters& out) = nullptr;
 };
 
 [[nodiscard]] int scaled(int px, float scale) {
@@ -942,6 +977,278 @@ void s3_before_frame(unsigned) {
     return s;
 }
 
+// S4 — the text wall of ADR-010 §8.3 (gate G4): 2 000 lines of 50 glyphs, words drawn
+// (seeded) from Latin, Cyrillic and Arabic pools — most lines carry right-to-left runs inside
+// a left-to-right paragraph — in one `text_block_node` (lx.ui:text_node) under a scroll
+// container that moves 3 px per frame, 1920 × 1080. UI text of §5.4: IBM Plex Sans 14 px,
+// line height φ; Arabic falls back through fontconfig (DejaVu Sans on this host). The layout
+// is itemized, shaped and wrapped once, on the first frame (warm-up). A steady frame lays
+// nothing out: the root is animate-invalidated, the scroll node moves the origin, and the
+// text node emits the lines its clip reaches — one atlas sprite per glyph, rasterised only
+// when the glyph cache misses (a glyph at a subpixel variant not seen yet).
+//
+// The text engine and the atlas are the scenario's own: a face cache over the bundled fonts,
+// a shape cache sized for the document (16 384 runs, 1 Mi glyphs — the shared cache's 4 096
+// would hold a quarter of it), the itemizer, an atlas and its glyph cache.
+
+constexpr unsigned k_s4_lines = 2000;
+constexpr unsigned k_s4_line_glyphs = 50;
+constexpr int k_s4_scroll_px = 3;
+constexpr int k_s4_pad = 16;
+constexpr lx::ui::element_key k_s4_block_key = 400;
+
+struct s4_scene {
+    float scale = 1.f;
+    std::string text{};
+    unsigned bytes = 0;
+    int scroll = 0;
+    int content_h = 0;
+    lx::ui::ui_node* root = nullptr;
+    lx::ui::text_block_node* block = nullptr;
+    // Declared in dependency order: the glyph cache goes before the atlas it writes.
+    std::unique_ptr<lx::text::face_cache> faces{};
+    std::unique_ptr<lx::text::shape_cache> shapes{};
+    std::unique_ptr<lx::text::itemizer> items{};
+    std::unique_ptr<lx::gfx::atlas> atlas{};
+    std::unique_ptr<lx::text::glyph_cache> glyphs{};
+    std::uint64_t shaping_seen = 0;
+    std::uint64_t rasterized_seen = 0;
+    std::uint64_t frame = 0;
+
+    [[nodiscard]] lx::text::text_engine engine() const {
+        return {faces.get(), shapes.get(), items.get()};
+    }
+};
+
+s4_scene g_s4{};
+
+/// The S4 document: `lines` lines of `glyphs` code points (words and their spaces), each its
+/// own paragraph. Deterministic (xorshift64, fixed seed).
+[[nodiscard]] std::string s4_document(unsigned lines, unsigned glyphs) {
+    static constexpr const char* k_latin[] = {
+        "the",    "quick",  "brown",   "fox",    "jumps",  "over",    "lazy",   "dog",
+        "render", "glyph",  "atlas",   "shelf",  "layout", "window",  "frame",  "scroll",
+        "pixel",  "buffer", "surface", "Lumen",  "text",   "kernel",  "output", "theme",
+    };
+    static constexpr const char* k_cyrillic[] = {
+        "съешь",  "же",      "ещё",     "этих",   "мягких", "французских", "булок", "да",
+        "выпей",  "чаю",     "быстрая", "лиса",   "окно",   "текст",       "кадр",  "шрифт",
+    };
+    static constexpr const char* k_arabic[] = {
+        "العدد", "هنا", "والنص", "العربي", "مع", "الأرقام", "كتاب", "مدرسة",
+        "جميل",  "نافذة", "خط",   "صورة",   "سطر", "لون",
+    };
+    const auto code_points = [](const char* s) {
+        unsigned n = 0;
+        for (; *s; ++s)
+            if ((static_cast<unsigned char>(*s) & 0xC0u) != 0x80u)
+                ++n;
+        return n;
+    };
+    xorshift64 rng{0x5EED5EED5EED5EEDull};
+    std::string out;
+    out.reserve(static_cast<std::size_t>(lines) * glyphs * 2u);
+    for (unsigned line = 0; line < lines; ++line) {
+        unsigned n = 0;
+        while (n < glyphs) {
+            const std::uint64_t r = rng.next();
+            const unsigned pool = static_cast<unsigned>(r % 10u); // 5 Latin : 3 Cyrillic : 2 Arabic
+            const char* word = pool < 5 ? k_latin[(r >> 8u) % std::size(k_latin)]
+                               : pool < 8 ? k_cyrillic[(r >> 8u) % std::size(k_cyrillic)]
+                                          : k_arabic[(r >> 8u) % std::size(k_arabic)];
+            const unsigned w = code_points(word);
+            if (n > 0 && n + 1 + w > glyphs) {
+                // Pad the line to exactly `glyphs` with a run of digits.
+                if (n + 1 < glyphs) {
+                    out += ' ';
+                    ++n;
+                }
+                while (n < glyphs) {
+                    out += static_cast<char>('0' + (rng.next() % 10u));
+                    ++n;
+                }
+                break;
+            }
+            if (n > 0) {
+                out += ' ';
+                ++n;
+            }
+            out += word;
+            n += w;
+        }
+        if (line + 1 < lines)
+            out += '\n';
+    }
+    return out;
+}
+
+/// The scroll container: a background, and its one child laid out at the full content
+/// height and drawn through a clip at the bounds and an origin moved up by the offset.
+struct scroll_props {
+    lx::color background{};
+};
+
+class scroll_node final : public lx::ui::ui_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
+    }
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "scroll"; }
+
+    void apply(const scroll_props& props) {
+        lx::ui::quad_style style{};
+        style.background = props.background;
+        style_ = lx::ui::pack_quad_style(style);
+    }
+
+    [[nodiscard]] lx::size2i measure(lx::layout::constraints c, lx::ui::size_hint) const override {
+        return c.max;
+    }
+
+    void arrange(lx::rect2i bounds) override {
+        bounds_ = bounds;
+        layout_dirty_ = false;
+        const int w = bounds.width - 2 * k_s4_pad;
+        for (unsigned i = 0; i < child_count(); ++i) {
+            lx::ui::ui_node* c = child_at(i);
+            if (!c)
+                continue;
+            const lx::size2i s =
+                c->measure({{0, 0}, {w, 1 << 28}}, lx::ui::size_hint::preferred);
+            c->arrange({bounds.x + k_s4_pad, bounds.y + k_s4_pad, w, s.height});
+            g_s4.content_h = s.height + 2 * k_s4_pad;
+        }
+    }
+
+    void emit(lx::ui::draw_scope& out) const override {
+        if (!visible_)
+            return;
+        out.quad(bounds_, style_);
+        out.push_clip(bounds_);
+        out.push_origin({0, -g_s4.scroll});
+        ui_node::emit(out);
+        out.pop();
+        out.pop();
+    }
+
+private:
+    lx::ui::packed_quad_style style_{};
+};
+
+[[nodiscard]] child describe_s4(lx::ui::build_context&) {
+    using namespace lx::ui;
+    text_block_props p{};
+    p.text = g_s4.text.c_str();
+    p.font = {lx::text::k_ui_family, 14.f * 0.75f}; // §5.4 UI text: 14 px (points at 96 dpi)
+    p.color = k_text;
+    p.scale = g_s4.scale;
+    p.wrap = lx::text::text_wrap::word;
+    p.line_height = 1.618f;
+    p.context = {g_s4.engine(), g_s4.glyphs.get()};
+    child block = text_block(p, k_s4_block_key);
+    return with_children(describe<scroll_node, scroll_props>({k_background}), {&block, 1u});
+}
+
+void s4_on_built(lx::ui::ui_node& root) {
+    g_s4.root = &root;
+    g_s4.block = static_cast<lx::ui::text_block_node*>(find_key(root, k_s4_block_key));
+}
+
+void s4_before_frame(unsigned frame) {
+    // Stamps for the atlas's 120-frame eviction rule; before anything of the frame looks up a uv.
+    g_s4.atlas->begin_frame(++g_s4.frame);
+    if (!g_s4.root)
+        return;
+    const int view_h = 1080;
+    const int range = g_s4.content_h - view_h;
+    g_s4.scroll += k_s4_scroll_px;
+    if (range <= 0 || g_s4.scroll > range)
+        g_s4.scroll = 0;
+    (void)frame;
+    lx::ui::invalidate_animate(*g_s4.root);
+}
+
+void s4_text_frame(const lx::scene::draw_list& draws, bool clear_dirty, text_frame_sample& out) {
+    out = {};
+    const std::uint64_t shaping = g_s4.shapes->counters().shaping_calls;
+    out.shaping_calls = static_cast<unsigned>(shaping - g_s4.shaping_seen);
+    g_s4.shaping_seen = shaping;
+    const std::uint64_t rasterized = g_s4.glyphs->counters().rasterized;
+    out.rasterized = static_cast<unsigned>(rasterized - g_s4.rasterized_seen);
+    g_s4.rasterized_seen = rasterized;
+    if (g_s4.block) {
+        const lx::ui::text_emit_stats e = g_s4.block->last_emit();
+        out.sprites = e.sprites;
+        out.glyphs = e.glyphs;
+        out.lines_drawn = e.lines_drawn;
+    }
+    // What a backend uploads: each page's dirty rects, or the whole page.
+    lx::gfx::atlas& a = *g_s4.atlas;
+    for (unsigned page = 0; page < lx::gfx::k_atlas_pages; ++page) {
+        const lx::gfx::atlas_page_view v = a.page(page);
+        if (!v.valid())
+            continue;
+        const std::uint64_t bpt = v.format == lx::gfx::atlas_format::r8 ? 1u : 4u;
+        if (a.dirty_full(page)) {
+            out.upload_bytes += static_cast<std::uint64_t>(v.size) * v.size * bpt;
+            ++out.upload_rects;
+        } else {
+            for (const lx::rect2i& r : a.dirty_rects(page)) {
+                out.upload_bytes += static_cast<std::uint64_t>(r.width) *
+                                    static_cast<std::uint64_t>(r.height) * bpt;
+                ++out.upload_rects;
+            }
+        }
+        if (clear_dirty)
+            a.clear_dirty(page);
+    }
+    unsigned per_page[lx::gfx::k_atlas_pages]{};
+    for (const lx::gfx::batch& b : draws.batches()) {
+        if (b.kind != lx::gfx::primitive_kind::mono_sprite &&
+            b.kind != lx::gfx::primitive_kind::poly_sprite &&
+            b.kind != lx::gfx::primitive_kind::path)
+            continue;
+        ++out.sprite_batches;
+        if (b.page < lx::gfx::k_atlas_pages && per_page[b.page]++ == 0)
+            ++out.pages;
+    }
+    for (unsigned n : per_page)
+        if (n > out.sprite_batches_per_page)
+            out.sprite_batches_per_page = n;
+}
+
+void s4_text_doc(text_counters& out);
+
+[[nodiscard]] scenario_spec make_s4(const options& opt) {
+    g_s4.glyphs.reset(); // before the atlas it writes
+    g_s4 = {};
+    g_s4.scale = opt.scale;
+    g_s4.text = s4_document(k_s4_lines, k_s4_line_glyphs);
+    g_s4.bytes = static_cast<unsigned>(g_s4.text.size());
+    g_s4.faces = std::make_unique<lx::text::face_cache>();
+    g_s4.shapes = std::make_unique<lx::text::shape_cache>(
+        lx::text::shape_cache_config{.entries = 16384, .glyph_capacity = 1u << 20});
+    g_s4.items = std::make_unique<lx::text::itemizer>();
+    g_s4.atlas = std::make_unique<lx::gfx::atlas>();
+    g_s4.glyphs = std::make_unique<lx::text::glyph_cache>(*g_s4.atlas);
+
+    scenario_spec s{};
+    s.id = "S4";
+    s.title = "scrolling text wall";
+    s.view = {0, 0, 1920, 1080};
+    s.arena_bytes = 64 * 1024;
+    s.describe = describe_s4;
+    s.before_frame = s4_before_frame;
+    s.on_built = s4_on_built;
+    s.batch_cap = 8;
+    s.atlas = g_s4.atlas.get();
+    s.text_frame = s4_text_frame;
+    s.text_doc = s4_text_doc;
+    return s;
+}
+
 // ── The measured loop ───────────────────────────────────────────────────────────
 
 struct counters {
@@ -963,6 +1270,41 @@ struct counters {
     std::uint64_t raster_px = 0; ///< pixels the backend shaded, max per frame
     unsigned draw_calls = 0;     ///< `gl`: instanced and surface draws per frame, max
     unsigned gpu_disjoint = 0;   ///< `gl`: frames whose timer query was disjoint (not sampled)
+};
+
+/// A text scenario's counters over the steady window (`text_frame_sample` folded), plus the
+/// document and its first frame.
+struct text_counters {
+    bool valid = false;
+    std::uint64_t shaping_calls = 0;
+    unsigned shaping_calls_max = 0;
+    std::uint64_t rasterized = 0;
+    unsigned rasterized_max = 0;
+    unsigned raster_frames = 0;          ///< steady frames that rasterised anything
+    std::uint64_t upload_bytes = 0;
+    std::uint64_t upload_bytes_max = 0;
+    unsigned upload_rects_max = 0;
+    unsigned upload_frames = 0;          ///< steady frames that dirtied the atlas
+    unsigned sprites_max = 0;
+    std::uint64_t sprites_total = 0;
+    unsigned glyphs_max = 0;
+    unsigned lines_drawn_max = 0;
+    unsigned sprite_batches_max = 0;
+    unsigned sprite_batches_per_page_max = 0;
+    unsigned pages_max = 0;
+    /// `gl`/`vulkan`: draw calls of atlas kinds in a frame (the renderer's draws less the
+    /// frame's other batches; one damage rect), the most per page.
+    unsigned sprite_draws_per_page_max = 0;
+    // The document, and the first frame (itemize + shape + wrap of all of it, inline).
+    unsigned doc_bytes = 0;
+    unsigned doc_lines = 0;
+    unsigned doc_glyphs = 0;
+    unsigned doc_shaping_calls = 0;      ///< what the first frame shaped
+    unsigned doc_rasterized = 0;         ///< what the first frame rasterised
+    std::uint64_t first_frame_ns = 0;    ///< `ui_root::tick` of the first frame
+    std::uint64_t first_layout_ns = 0;   ///< its measure + arrange (the layout passes)
+    std::uint64_t first_upload_bytes = 0;
+    std::uint64_t layout_storage_bytes = 0;
 };
 
 struct memory_stats {
@@ -993,7 +1335,21 @@ struct scenario_result {
     memory_stats mem{};
     gate gates[3]{};
     unsigned gate_count = 0;
+    text_counters text{};
 };
+
+void s4_text_doc(text_counters& out) {
+    out.doc_bytes = g_s4.bytes;
+    if (!g_s4.block)
+        return;
+    const lx::text::text_layout& l = g_s4.block->layout();
+    out.doc_lines = static_cast<unsigned>(l.lines().size());
+    std::uint64_t glyphs = 0;
+    for (const lx::text::layout_run& r : l.runs())
+        glyphs += r.glyph_count;
+    out.doc_glyphs = static_cast<unsigned>(glyphs);
+    out.layout_storage_bytes = l.storage_bytes();
+}
 
 [[nodiscard]] unsigned count_nodes(const lx::ui::ui_node& node) {
     unsigned n = 1;
@@ -1178,6 +1534,11 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
             lx::trace::timeline_counter("ui.batches", static_cast<long long>(draws.batches().size()));
         const std::uint64_t bytes = encode(draws, ring.data(), ring.size());
         const std::uint64_t t4 = now_ns();
+        // Outside every timed stage: the scenario's counters of this frame.
+        text_frame_sample text_sample{};
+        if (spec.text_frame)
+            spec.text_frame(draws, !gl && !vk, text_sample);
+        const std::uint64_t t_draw = now_ns();
         std::uint64_t raster_px = 0;
         lx::gfx::ui_stream stream{};
         stream.refs = draws.refs();
@@ -1187,18 +1548,18 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         stream.sprites = draws.sprite_instances();
         stream.underlines = draws.underline_instances();
         if (raster) {
-            auto drawn = rasteriser->draw(target, stream, nullptr, damage, clear);
+            auto drawn = rasteriser->draw(target, stream, spec.atlas, damage, clear);
             if (drawn)
                 raster_px = drawn->pixels_shaded;
         }
         unsigned draw_calls = 0;
         if (gl && gl_target) {
-            auto drawn = g_gl->renderer.draw(*gl_target, stream, nullptr, damage, clear);
+            auto drawn = g_gl->renderer.draw(*gl_target, stream, spec.atlas, damage, clear);
             if (drawn)
                 draw_calls = drawn->draw_calls;
         }
         if (vk && vk_target) {
-            auto drawn = g_vk->renderer.draw(*vk_target, stream, nullptr, damage, clear);
+            auto drawn = g_vk->renderer.draw(*vk_target, stream, spec.atlas, damage, clear);
             if (drawn)
                 draw_calls = drawn->draw_calls;
         }
@@ -1231,10 +1592,51 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
                     spec.on_built(*root.tree());
             }
             cnt.primitives_built = draws.primitive_count();
+            if (spec.text_frame) {
+                text_counters& tc = out.text;
+                tc.valid = true;
+                tc.doc_shaping_calls = text_sample.shaping_calls;
+                tc.doc_rasterized = text_sample.rasterized;
+                tc.first_frame_ns = t1 - t0;
+                tc.first_layout_ns = root.last_stage_times().layout;
+                tc.first_upload_bytes = text_sample.upload_bytes;
+            }
         }
 
         if (!measuring)
             continue;
+
+        if (spec.text_frame) {
+            text_counters& tc = out.text;
+            const text_frame_sample& ts = text_sample;
+            tc.shaping_calls += ts.shaping_calls;
+            tc.shaping_calls_max = std::max(tc.shaping_calls_max, ts.shaping_calls);
+            tc.rasterized += ts.rasterized;
+            tc.rasterized_max = std::max(tc.rasterized_max, ts.rasterized);
+            if (ts.rasterized)
+                ++tc.raster_frames;
+            tc.upload_bytes += ts.upload_bytes;
+            tc.upload_bytes_max = std::max(tc.upload_bytes_max, ts.upload_bytes);
+            tc.upload_rects_max = std::max(tc.upload_rects_max, ts.upload_rects);
+            if (ts.upload_bytes)
+                ++tc.upload_frames;
+            tc.sprites_max = std::max(tc.sprites_max, ts.sprites);
+            tc.sprites_total += ts.sprites;
+            tc.glyphs_max = std::max(tc.glyphs_max, ts.glyphs);
+            tc.lines_drawn_max = std::max(tc.lines_drawn_max, ts.lines_drawn);
+            tc.sprite_batches_max = std::max(tc.sprite_batches_max, ts.sprite_batches);
+            tc.sprite_batches_per_page_max =
+                std::max(tc.sprite_batches_per_page_max, ts.sprite_batches_per_page);
+            tc.pages_max = std::max(tc.pages_max, ts.pages);
+            if (((gl && gl_target) || (vk && vk_target)) && ts.pages > 0) {
+                // One damage rect (the view): each batch is one draw call.
+                const auto frame_batches = static_cast<unsigned>(draws.batches().size());
+                const unsigned other = frame_batches - ts.sprite_batches;
+                const unsigned sprite_draws = draw_calls > other ? draw_calls - other : 0u;
+                const unsigned per_page = (sprite_draws + ts.pages - 1) / ts.pages;
+                tc.sprite_draws_per_page_max = std::max(tc.sprite_draws_per_page_max, per_page);
+            }
+        }
 
         const lx::ui::ui_root::stage_times st = root.last_stage_times();
         samples[st_update].push_back(t_update1 - t_update0);
@@ -1250,10 +1652,12 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         samples[st_encode].push_back(t4 - t3);
         samples[st_emit_order_encode].push_back(st.emit + (t3 - t2) + (t4 - t3));
         samples[st_frame].push_back(t4 - t0);
+        samples[st_layout_emit_order_encode].push_back(st.layout + st.emit + (t3 - t2) +
+                                                       (t4 - t3));
         if (raster)
-            samples[st_raster].push_back(t5 - t4);
+            samples[st_raster].push_back(t5 - t_draw);
         if ((gl && gl_target) || (vk && vk_target)) {
-            samples[st_submit].push_back(t5 - t4);
+            samples[st_submit].push_back(t5 - t_draw);
             if (gpu_ok)
                 samples[st_gpu].push_back(gpu_ns);
         }
@@ -1278,6 +1682,8 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
     }
 
     const std::size_t uordblks_end = ::mallinfo2().uordblks;
+    if (spec.text_doc && out.text.valid)
+        spec.text_doc(out.text);
     memory_stats& mem = out.mem;
     mem.allocations = g_new_calls.load(std::memory_order_relaxed) - allocs_start;
     mem.allocated_bytes = g_new_bytes.load(std::memory_order_relaxed) - bytes_start;
@@ -1332,11 +1738,180 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
                  "%llu instance bytes (<= 819200)",
                  st.p95, st.samples, cnt.batches, static_cast<unsigned long long>(cnt.instance_bytes));
     }
+    if (std::strcmp(spec.id, "S4") == 0) {
+        const summary& st = out.stages[st_layout_emit_order_encode];
+        const text_counters& tc = out.text;
+        const bool gpu = (gl && gl_target) || (vk && vk_target);
+        const bool rest_ok = tc.valid && tc.shaping_calls == 0 &&
+                             tc.sprite_batches_per_page_max <= 1 &&
+                             (!gpu || tc.sprite_draws_per_page_max <= 1);
+        add_gate("G4", p95_verdict(st, st.p95 <= 2000.0, rest_ok),
+                 "layout+emit+order+encode p50 %.1f p95 %.1f us (<= 2000) over %u frames, "
+                 "%llu shaping calls (0), %u sprite batch(es) per page (<= 1)%s",
+                 st.p50, st.p95, st.samples, static_cast<unsigned long long>(tc.shaping_calls),
+                 tc.sprite_batches_per_page_max,
+                 gpu ? (tc.sprite_draws_per_page_max <= 1 ? ", 1 draw per page"
+                                                          : ", more than 1 draw per page")
+                     : "");
+    }
     add_gate("G5", verdict(no_allocs), "%llu heap allocations in %u steady frames, mallinfo2 delta %lld B",
              static_cast<unsigned long long>(mem.allocations), opt.frames, mem.mallinfo_delta);
     if (vk && vk_target)
         g_vk->renderer.wait_idle(); // the target goes with this frame
     return out;
+}
+
+// ── S4's reshape cost by invalidation size (ADR-010 §4.6, last paragraph) ────────
+//
+// What a text change costs on the thread that lays it out, by how much text it invalidates:
+// a label, one S4 line, a paragraph of ten lines, a page of 100 lines and the whole document,
+// each wrapped at S4's width. `cold`: the shape cache emptied first, so every run is shaped
+// (faces stay loaded — they are per family, not per text — and the itemizer keeps its
+// fallback memo); `first`: the fallback memo emptied too, so the first Arabic run of the text
+// runs a fontconfig search, what text in a script new to the process pays once; `warm`: a
+// fresh `text_layout` over a shape cache that already holds the text (itemize + cache hits +
+// wrap; the layout's vectors are allocated, as a new node's are); `rewrap`: the same layout at
+// another width (the wrap pass alone). Measured after the S4 frames, on the bench thread.
+
+struct reshape_row {
+    const char* name = "";
+    unsigned bytes = 0;
+    unsigned lines = 0;
+    unsigned glyphs = 0;
+    unsigned shaping_calls = 0; ///< one cold pass
+    summary cold{};
+    summary first{};
+    summary warm{};
+    summary rewrap{};
+};
+
+struct reshape_result {
+    bool valid = false;
+    reshape_row rows[5]{};
+    unsigned count = 0;
+};
+
+reshape_result g_reshape{};
+
+void measure_reshape() {
+    g_reshape = {};
+    if (!g_s4.faces || g_s4.text.empty())
+        return;
+    // The texts: prefixes of the S4 document (its lines joined by spaces below the
+    // document, so a paragraph wraps instead of breaking at every line).
+    const std::string& doc = g_s4.text;
+    const auto nth_newline = [&](unsigned n) {
+        std::size_t at = 0;
+        for (unsigned i = 0; i < n; ++i) {
+            at = doc.find('\n', at);
+            if (at == std::string::npos)
+                return doc.size();
+            ++at;
+        }
+        return at - 1;
+    };
+    const auto joined = [&](unsigned lines) {
+        std::string t = doc.substr(0, nth_newline(lines));
+        for (char& c : t)
+            if (c == '\n')
+                c = ' ';
+        return t;
+    };
+    std::string line = doc.substr(0, nth_newline(1));
+    std::string label = line.substr(0, line.find(' ', line.find(' ') + 1));
+    struct sample {
+        const char* name;
+        std::string text;
+        unsigned reps;
+    };
+    sample samples[5] = {
+        {"label", label, 300},
+        {"line", line, 300},
+        {"paragraph", joined(10), 100},
+        {"page", doc.substr(0, nth_newline(100)), 30},
+        {"document", doc, 7},
+    };
+    lx::text::shape_cache shapes{
+        lx::text::shape_cache_config{.entries = 16384, .glyph_capacity = 1u << 20}};
+    lx::text::itemizer items{};
+    const lx::text::text_engine engine{g_s4.faces.get(), &shapes, &items};
+    const float width = static_cast<float>(1920 - 2 * k_s4_pad) / g_s4.scale;
+    const auto setup = [&](lx::text::text_layout& l, const std::string& text) {
+        l.set_text(text);
+        l.set_font({lx::text::k_ui_family, 14.f * 0.75f});
+        l.set_scale(g_s4.scale);
+        l.set_line_height(1.618f);
+        l.set_max_width(width);
+    };
+    for (const sample& s : samples) {
+        reshape_row& row = g_reshape.rows[g_reshape.count++];
+        row.name = s.name;
+        row.bytes = static_cast<unsigned>(s.text.size());
+        std::vector<std::uint64_t> cold, first, warm, rewrap;
+        cold.reserve(s.reps);
+        first.reserve(s.reps);
+        warm.reserve(s.reps);
+        rewrap.reserve(s.reps * 2u);
+        for (unsigned rep = 0; rep < s.reps; ++rep) {
+            shapes.clear();
+            items.clear_fallbacks();
+            lx::text::text_layout l{engine};
+            setup(l, s.text);
+            const std::uint64_t t0 = now_ns();
+            (void)l.update();
+            first.push_back(now_ns() - t0);
+        }
+        for (unsigned rep = 0; rep < s.reps; ++rep) {
+            shapes.clear();
+            lx::text::text_layout l{engine};
+            setup(l, s.text);
+            const std::uint64_t calls = shapes.counters().shaping_calls;
+            const std::uint64_t t0 = now_ns();
+            (void)l.update();
+            cold.push_back(now_ns() - t0);
+            row.shaping_calls = static_cast<unsigned>(shapes.counters().shaping_calls - calls);
+            if (rep == 0) {
+                row.lines = static_cast<unsigned>(l.lines().size());
+                std::uint64_t g = 0;
+                for (const lx::text::layout_run& r : l.runs())
+                    g += r.glyph_count;
+                row.glyphs = static_cast<unsigned>(g);
+            }
+        }
+        for (unsigned rep = 0; rep < s.reps; ++rep) {
+            lx::text::text_layout l{engine};
+            setup(l, s.text);
+            std::uint64_t t0 = now_ns();
+            (void)l.update();
+            warm.push_back(now_ns() - t0);
+            for (int k = 0; k < 2; ++k) {
+                l.set_max_width(k == 0 ? width * 0.75f : width);
+                t0 = now_ns();
+                (void)l.update();
+                rewrap.push_back(now_ns() - t0);
+            }
+        }
+        row.cold = summarize(cold);
+        row.first = summarize(first);
+        row.warm = summarize(warm);
+        row.rewrap = summarize(rewrap);
+    }
+    g_reshape.valid = true;
+}
+
+void print_reshape() {
+    if (!g_reshape.valid)
+        return;
+    std::printf("\nS4 reshape cost by invalidation size (inline on this thread; us)\n");
+    std::printf("  %-10s %8s %6s %7s %7s %10s %10s %10s %10s %10s %10s %10s\n", "size",
+                "bytes", "lines", "glyphs", "shapes", "first p50", "cold p50", "cold p95",
+                "warm p50", "warm p95", "rewrap p50", "rewrap p95");
+    for (unsigned i = 0; i < g_reshape.count; ++i) {
+        const reshape_row& r = g_reshape.rows[i];
+        std::printf("  %-10s %8u %6u %7u %7u %10.1f %10.1f %10.1f %10.1f %10.1f %10.1f %10.1f\n",
+                    r.name, r.bytes, r.lines, r.glyphs, r.shaping_calls, r.first.p50, r.cold.p50,
+                    r.cold.p95, r.warm.p50, r.warm.p95, r.rewrap.p50, r.rewrap.p95);
+    }
 }
 
 // ── Output ──────────────────────────────────────────────────────────────────────
@@ -1410,6 +1985,28 @@ void print_table(const scenario_result& r) {
                 static_cast<unsigned long long>(m.allocations), m.per_frame,
                 static_cast<unsigned long long>(m.allocated_bytes), m.mallinfo_delta,
                 m.rss_anon_kb);
+    if (r.text.valid) {
+        const text_counters& t = r.text;
+        std::printf("  text       document %u B, %u lines, %u glyphs, layout storage %llu KiB; first "
+                    "frame %.1f us (layout %.1f us, %u shaping calls, %u glyphs rasterised, "
+                    "%llu B uploaded)\n",
+                    t.doc_bytes, t.doc_lines, t.doc_glyphs,
+                    static_cast<unsigned long long>(t.layout_storage_bytes / 1024),
+                    static_cast<double>(t.first_frame_ns) / 1000.0,
+                    static_cast<double>(t.first_layout_ns) / 1000.0, t.doc_shaping_calls,
+                    t.doc_rasterized, static_cast<unsigned long long>(t.first_upload_bytes));
+        std::printf("  text       steady: shaping_calls=%llu (max %u/frame) rasterized=%llu (max "
+                    "%u/frame, %u frames) upload_bytes=%llu (max %llu/frame, %u rects, %u frames) "
+                    "sprites=%u/frame (max) glyphs=%u lines_drawn=%u sprite_batches=%u "
+                    "per_page=%u pages=%u sprite_draws_per_page=%u\n",
+                    static_cast<unsigned long long>(t.shaping_calls), t.shaping_calls_max,
+                    static_cast<unsigned long long>(t.rasterized), t.rasterized_max,
+                    t.raster_frames, static_cast<unsigned long long>(t.upload_bytes),
+                    static_cast<unsigned long long>(t.upload_bytes_max), t.upload_rects_max,
+                    t.upload_frames, t.sprites_max, t.glyphs_max, t.lines_drawn_max,
+                    t.sprite_batches_max, t.sprite_batches_per_page_max, t.pages_max,
+                    t.sprite_draws_per_page_max);
+    }
     std::printf("  gates     ");
     for (unsigned i = 0; i < r.gate_count; ++i)
         std::printf(" %s %s (%s)", r.gates[i].id,
@@ -1536,6 +2133,50 @@ void write_json(const options& opt, const host_info& host, const scenario_result
         } else {
             std::fputs("    \"gpu\": {},\n", f);
         }
+        if (r.text.valid) {
+            const text_counters& t = r.text;
+            std::fprintf(
+                f,
+                "    \"text\": {\"doc_bytes\": %u, \"doc_lines\": %u, \"doc_glyphs\": %u, "
+                "\"layout_storage_bytes\": %llu, \"first_frame_us\": %.1f, \"first_layout_us\": %.1f, "
+                "\"first_shaping_calls\": %u, \"first_rasterized\": %u, \"first_upload_bytes\": %llu, "
+                "\"shaping_calls\": %llu, \"shaping_calls_max\": %u, \"rasterized\": %llu, "
+                "\"rasterized_max\": %u, \"raster_frames\": %u, \"upload_bytes\": %llu, "
+                "\"upload_bytes_max\": %llu, \"upload_rects_max\": %u, \"upload_frames\": %u, "
+                "\"sprites_max\": %u, \"sprites_total\": %llu, \"glyphs_max\": %u, "
+                "\"lines_drawn_max\": %u, \"sprite_batches_max\": %u, "
+                "\"sprite_batches_per_page_max\": %u, \"pages_max\": %u, "
+                "\"sprite_draws_per_page_max\": %u},\n",
+                t.doc_bytes, t.doc_lines, t.doc_glyphs,
+                static_cast<unsigned long long>(t.layout_storage_bytes),
+                static_cast<double>(t.first_frame_ns) / 1000.0,
+                static_cast<double>(t.first_layout_ns) / 1000.0, t.doc_shaping_calls,
+                t.doc_rasterized, static_cast<unsigned long long>(t.first_upload_bytes),
+                static_cast<unsigned long long>(t.shaping_calls), t.shaping_calls_max,
+                static_cast<unsigned long long>(t.rasterized), t.rasterized_max, t.raster_frames,
+                static_cast<unsigned long long>(t.upload_bytes),
+                static_cast<unsigned long long>(t.upload_bytes_max), t.upload_rects_max,
+                t.upload_frames, t.sprites_max, static_cast<unsigned long long>(t.sprites_total),
+                t.glyphs_max, t.lines_drawn_max, t.sprite_batches_max,
+                t.sprite_batches_per_page_max, t.pages_max, t.sprite_draws_per_page_max);
+        }
+        if (std::strcmp(r.spec.id, "S4") == 0 && g_reshape.valid) {
+            std::fputs("    \"reshape\": [", f);
+            for (unsigned i = 0; i < g_reshape.count; ++i) {
+                const reshape_row& w = g_reshape.rows[i];
+                std::fprintf(f,
+                             "%s\n      {\"size\": \"%s\", \"bytes\": %u, \"lines\": %u, "
+                             "\"glyphs\": %u, \"shaping_calls\": %u, \"first\": {\"p50\": %.1f, "
+                             "\"p95\": %.1f}, \"cold\": {\"p50\": %.1f, "
+                             "\"p95\": %.1f, \"samples\": %u}, \"warm\": {\"p50\": %.1f, "
+                             "\"p95\": %.1f, \"samples\": %u}, \"rewrap\": {\"p50\": %.1f, "
+                             "\"p95\": %.1f, \"samples\": %u}}",
+                             i ? "," : "", w.name, w.bytes, w.lines, w.glyphs, w.shaping_calls,
+                             w.first.p50, w.first.p95, w.cold.p50, w.cold.p95, w.cold.samples, w.warm.p50, w.warm.p95,
+                             w.warm.samples, w.rewrap.p50, w.rewrap.p95, w.rewrap.samples);
+            }
+            std::fputs("\n    ],\n", f);
+        }
         std::fputs("    \"gates\": {", f);
         for (unsigned i = 0; i < r.gate_count; ++i)
             std::fprintf(f, "%s\"%s\": \"%s\"", i ? ", " : "", r.gates[i].id,
@@ -1549,10 +2190,11 @@ void write_json(const options& opt, const host_info& host, const scenario_result
 // ── CLI ─────────────────────────────────────────────────────────────────────────
 
 void usage() {
-    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu|gl|vulkan] [--frames N]\n"
+    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|S4|all] [--backend none|cpu|gl|vulkan] [--frames N]\n"
                "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
                "                      [--scale F] [--git SHA] [--preset NAME]\n"
-               "                      [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]\n",
+               "                      [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]\n"
+               "                      [--no-reshape]\n",
                stderr);
 }
 
@@ -1572,9 +2214,11 @@ void usage() {
             const char* s = take();
             if (!s) return false;
             if (std::strcmp(s, "all") == 0) {
-                opt.scenarios[0] = opt.scenarios[1] = opt.scenarios[2] = true;
-            } else if (std::strlen(s) == 2 && s[0] == 'S' && s[1] >= '1' && s[1] <= '3') {
-                opt.scenarios[0] = opt.scenarios[1] = opt.scenarios[2] = false;
+                for (bool& on : opt.scenarios)
+                    on = true;
+            } else if (std::strlen(s) == 2 && s[0] == 'S' && s[1] >= '1' && s[1] <= '4') {
+                for (bool& on : opt.scenarios)
+                    on = false;
                 opt.scenarios[s[1] - '1'] = true;
             } else {
                 std::fprintf(stderr, "lumen-ui-bench: unknown scenario %s\n", s);
@@ -1606,6 +2250,8 @@ void usage() {
                 return false;
             }
             opt.gl_attribute_fetch = std::strcmp(s, "attributes") == 0;
+        } else if (std::strcmp(a, "--no-reshape") == 0) {
+            opt.reshape = false;
         } else if (std::strcmp(a, "--frames") == 0) {
             const char* s = take();
             if (!s) return false;
@@ -1719,12 +2365,19 @@ void* bench_thread(void* raw) {
         g_vk = &*vk;
         std::fflush(stdout);
     }
-    for (unsigned i = 0; i < 3; ++i) {
+    for (unsigned i = 0; i < 4; ++i) {
         if (!opt.scenarios[i])
             continue;
-        const scenario_spec spec = i == 0 ? make_s1(opt) : i == 1 ? make_s2(opt) : make_s3(opt);
+        const scenario_spec spec = i == 0   ? make_s1(opt)
+                                   : i == 1 ? make_s2(opt)
+                                   : i == 2 ? make_s3(opt)
+                                            : make_s4(opt);
         job.results[job.count] = run_scenario(spec, opt);
         print_table(job.results[job.count]);
+        if (i == 3 && opt.reshape) {
+            measure_reshape();
+            print_reshape();
+        }
         std::fflush(stdout);
         ++job.count;
     }
@@ -1774,7 +2427,7 @@ int main(int argc, char** argv) {
     std::printf("host: %s %s, %u cpus, %s\n", host.kernel, host.machine, host.cpus, host.cpu);
     std::fflush(stdout);
 
-    scenario_result results[3]{};
+    scenario_result results[4]{};
     bench_job job{&opt, &host, results, 0};
     if (!run_on_own_stack(job)) {
         std::fprintf(stderr, "lumen-ui-bench: cannot start the bench thread (%s)\n",

@@ -60,7 +60,11 @@ export namespace lx::text {
 // Threading contract. A layout has one owner (the node holding it). Its queries are const
 // and lay out lazily: the first query after a change runs the passes, under the engine's
 // `faces.lock()` (which guards the shared shape cache and itemizer of `text_engine::shared()`),
-// so it must not be called with that lock held.
+// so it must not be called with that lock held. The shape pass hands the lock to a waiter
+// between paragraphs (`face_cache::contended`; `counters().lock_yields`). A layout may be
+// laid out on another thread (a worker, with its own shape cache and itemizer over the same
+// face cache) and handed over whole: `assign_inputs` copies a layout's inputs into another,
+// `rebind_engine` points the result at the receiving thread's caches without reshaping.
 
 enum class text_align : std::uint8_t { start, center, end };
 enum class text_wrap : std::uint8_t { word, none };
@@ -216,6 +220,9 @@ struct text_layout_counters {
     std::uint64_t shape_misses = 0;
     /// Ellipses shaped (one per face per shape pass, through the cache).
     std::uint64_t ellipsis_shapes = 0;
+    /// Times a shape pass let another thread waiting for the face lock in (`face_cache::
+    /// contended`), between paragraphs.
+    std::uint64_t lock_yields = 0;
 };
 
 /// The caches a layout works with. Null members are the shared ones.
@@ -268,6 +275,23 @@ public:
     /// Text and attributes already set beyond the new caps are cut now.
     void set_limits(text_layout_limits limits);
     void set_engine(text_engine engine);
+    /// Changes the engine later passes use without dropping the shape pass's results, when
+    /// the new engine names the same face cache (the results' face ids are its): a layout
+    /// shaped on a worker's caches is handed to the UI thread's. Another face cache is
+    /// `set_engine`.
+    void rebind_engine(text_engine engine);
+    /// Takes `from`'s inputs through the setters (so an equal one changes nothing): all but the
+    /// engine and the max width, or with `shape_inputs` false only those of the wrap pass
+    /// (align, wrap, max lines, ellipsis, line height).
+    void assign_inputs(const text_layout& from, bool shape_inputs = true);
+    /// Counts the input changes that invalidated the shape pass (text, font, scale,
+    /// attributes, direction, language, limits, engine): two equal values mean the shape
+    /// inputs did not change in between.
+    [[nodiscard]] std::uint64_t shape_generation() const { return shape_generation_; }
+    /// The shape pass must run before the next query.
+    [[nodiscard]] bool shape_dirty() const { return shape_dirty_; }
+    /// Logical pixels; 0 is unbounded.
+    [[nodiscard]] float max_width() const { return max_width_; }
 
     /// Runs the passes whose inputs changed. Queries call it themselves; this reports errors
     /// (`io` when no face resolves is not one: the layout then estimates widths, as
@@ -385,6 +409,7 @@ private:
     text_layout_limits limits_{};
     text_engine engine_{};
     bool input_cut_ = false; ///< set_text / set_attrs dropped input over a cap
+    std::uint64_t shape_generation_ = 0;
 
     // Results (lazily computed by const queries).
     mutable bool shape_dirty_ = true;
@@ -487,6 +512,7 @@ void lx::text::text_layout::set_text(std::string_view utf8) {
     text_.assign(utf8.data(), utf8.data() + n);
     input_cut_ = cut;
     shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
 }
 
 void lx::text::text_layout::set_font(font_desc desc) {
@@ -506,6 +532,7 @@ void lx::text::text_layout::set_font(font_desc desc) {
     weight_ = desc.weight;
     style_ = desc.style;
     shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
 }
 
 void lx::text::text_layout::set_max_width(float px) {
@@ -526,6 +553,7 @@ void lx::text::text_layout::set_scale(float scale) {
         return;
     scale_ = scale;
     shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
 }
 
 void lx::text::text_layout::set_attrs(std::span<const text_attr> attrs) {
@@ -556,6 +584,7 @@ void lx::text::text_layout::set_attrs(std::span<const text_attr> attrs) {
     attrs_ = std::move(sorted);
     input_cut_ = input_cut_ || cut;
     shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
 }
 
 void lx::text::text_layout::set_direction(text_direction direction) {
@@ -565,6 +594,7 @@ void lx::text::text_layout::set_direction(text_direction direction) {
         return;
     direction_ = direction;
     shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
 }
 
 void lx::text::text_layout::set_language(const char* bcp47) {
@@ -575,6 +605,7 @@ void lx::text::text_layout::set_language(const char* bcp47) {
         return;
     std::memcpy(language_, next, sizeof(next));
     shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
 }
 
 void lx::text::text_layout::set_align(text_align align) {
@@ -630,6 +661,7 @@ void lx::text::text_layout::set_limits(text_layout_limits limits) {
         input_cut_ = true;
     }
     shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
 }
 
 void lx::text::text_layout::set_engine(text_engine engine) {
@@ -637,6 +669,39 @@ void lx::text::text_layout::set_engine(text_engine engine) {
         return;
     engine_ = engine;
     shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
+}
+
+void lx::text::text_layout::rebind_engine(text_engine engine) {
+    if (engine == engine_)
+        return;
+    const auto faces_of = [](const text_engine& e) {
+        return e.faces ? e.faces : &face_cache::shared();
+    };
+    if (faces_of(engine) != faces_of(engine_)) {
+        set_engine(engine);
+        return;
+    }
+    engine_ = engine;
+}
+
+void lx::text::text_layout::assign_inputs(const text_layout& from, bool shape_inputs) {
+    if (&from == this)
+        return;
+    if (shape_inputs) {
+        set_limits(from.limits_);
+        set_text(std::string_view{from.text_.data(), from.text_.size()});
+        set_font(from.font());
+        set_scale(from.scale_);
+        set_attrs(from.attrs_);
+        set_direction(from.direction_);
+        set_language(from.language_);
+    }
+    set_align(from.align_);
+    set_wrap(from.wrap_);
+    set_max_lines(from.max_lines_);
+    set_ellipsize(from.ellipsize_);
+    set_line_height(from.line_height_);
 }
 
 // ── Passes ──
@@ -865,6 +930,16 @@ lx::result<void> lx::text::text_layout::shape_pass() const {
             paragraphs_.push_back({pb, pe, cl, cl, level});
         }
         for (std::uint32_t cb = pb; !estimate_ && cb < pe;) {
+            // Between paragraphs (and itemizer chunks) nothing of the itemizer or the shape
+            // cache is held: a thread blocked on the face lock — the UI thread rasterising a
+            // glyph while this pass runs on a worker — gets it now rather than after the pass.
+            if (faces.contended()) {
+                ++counters_.lock_yields;
+                lock.unlock();
+                while (faces.contended())
+                    std::this_thread::yield();
+                lock.lock();
+            }
             ranges_.clear();
             for (std::size_t a = 0; a < attrs_.size(); ++a) {
                 const text_attr& at = attrs_[a];

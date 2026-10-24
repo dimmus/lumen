@@ -139,6 +139,8 @@ public:
     [[nodiscard]] bool lookup(atlas_tile_id id, atlas_tile& out) const;
     /// Stamps the tile used this frame (what the emitter does for every sprite it draws).
     void touch(atlas_tile_id id);
+    /// `lookup` and `touch` in one: what an emitter calls for each sprite it draws.
+    [[nodiscard]] bool use(atlas_tile_id id, atlas_tile& out);
     /// Frees the tile now; its id goes stale.
     void release(atlas_tile_id id);
 
@@ -541,6 +543,15 @@ bool lx::gfx::atlas::lookup(atlas_tile_id id, atlas_tile& out) const {
 void lx::gfx::atlas::touch(atlas_tile_id id) {
     if (tile_entry* t = entry(id))
         t->last_used = frame_;
+}
+
+bool lx::gfx::atlas::use(atlas_tile_id id, atlas_tile& out) {
+    tile_entry* t = entry(id);
+    if (!t)
+        return false;
+    t->last_used = frame_;
+    out = {t->page, t->x, t->y, t->w, t->h};
+    return true;
 }
 
 void lx::gfx::atlas::release(atlas_tile_id id) {

@@ -455,6 +455,15 @@ warp is a synthetic motion on UI.
 | Report | UI | Once the generation's jobs are done: the log, the shell's zlm v7 events, the control socket's Reload replies, READY after SIGHUP. A reload asked for meanwhile runs after it, and its Reload replies and READY come from that later generation (they must see the files as they were when asked) |
 | Without a worker | UI | (`worker_thread_count` 0, or before the threads start) the jobs run inline |
 
+### UI text shaping (ADR-010 §4.6)
+
+| Step | Thread | What |
+|------|--------|------|
+| Small text (< 4 KiB, `lx.ui::k_text_async_min_bytes`) | UI | `text_block_node::apply` sets the layout's inputs; the shape and wrap passes run lazily on the UI thread at the next measure |
+| Large text | UI → worker → UI | `apply` copies the inputs into the node's job; the worker runs the shape + wrap passes into a staging `text_layout` with its own shape cache and itemizer over the block's face cache (`text_async_shaping`); the UI task swaps it in (`rebind_engine`: no reshape) and invalidates the node's layout. The previous layout stays on show until then; a change meanwhile posts one more job when this one lands; text that drops below the boundary is laid out inline and the running job's result is dropped |
+| Face lock | worker ↔ UI | The worker's shape pass holds `face_cache::lock()` but hands it to a waiter between paragraphs (`face_cache::contended`): the UI thread rasterising a glyph waits at most one paragraph (1.3 ms worst seen against a 150 KB pass, `test_text_node`) |
+| Node destroyed meanwhile | UI | The job outlives the node and is freed by its UI task |
+
 ### Workspaces (ADR 011 Part 3)
 
 Everything is UI-affinity and event-driven: the workspace model (`:workspaces`, fixed

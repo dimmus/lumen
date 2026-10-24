@@ -44,8 +44,10 @@ export namespace lx::text {
 // operation: FreeType faces are not thread-safe, the size set by `use_locked` is state of the
 // face, and a face may be evicted by the next resolution. Under the lock, the handles
 // `use_locked` returns stay valid until the next `resolve_locked` on the same cache. The lock
-// is uncontended in practice (UI thread; the worker affinity once large layouts are shaped
-// there, ADR §4.6) and costs one atomic exchange; a hit in a shape cache never takes it. The
+// is uncontended in practice and costs one atomic exchange plus the waiter count; a hit in a
+// shape cache never takes it. When large layouts are shaped on the worker affinity (ADR §4.6,
+// `lx.ui:text_node`), the worker's shape pass holds it for tens of milliseconds: it checks
+// `contended()` between paragraphs and lets a waiter (the UI thread rasterising a glyph) in. The
 // process-wide `shared()` cache also guards `shape_cache::shared()` (see `:shape`).
 
 enum class weight { normal, bold };
@@ -159,8 +161,17 @@ public:
     [[nodiscard]] face_id resolve(const font_desc& desc);
     [[nodiscard]] face_id resolve(const char* family, weight w, style s);
 
-    /// Everything below with `_locked` expects `lock()` held by the caller.
-    [[nodiscard]] std::unique_lock<std::mutex> lock() { return std::unique_lock{mutex_}; }
+    /// Everything below with `_locked` expects `lock()` held by the caller. A caller waiting
+    /// here is counted (`contended`) until it holds the lock.
+    [[nodiscard]] std::unique_lock<std::mutex> lock() {
+        waiting_.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock held{mutex_};
+        waiting_.fetch_sub(1, std::memory_order_relaxed);
+        return held;
+    }
+    /// Someone is blocked in `lock()`: what a long holder (a worker's shape pass) checks
+    /// between paragraphs to hand the lock over.
+    [[nodiscard]] bool contended() const { return waiting_.load(std::memory_order_relaxed) != 0; }
     [[nodiscard]] face_id resolve_locked(const char* family, weight w, style s);
     /// Sets the face to `size_26_6` (only when it is not already at it) and hands out its
     /// handles; valid until the next `resolve_locked`.
@@ -227,6 +238,7 @@ private:
     [[nodiscard]] slot* find_locked(face_id id);
 
     std::mutex mutex_{};
+    std::atomic<unsigned> waiting_{0};
     void* library_ = nullptr; ///< FT_Library
     void* config_ = nullptr;  ///< FcConfig*
     bool init_attempted_ = false;

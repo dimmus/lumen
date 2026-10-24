@@ -41,7 +41,8 @@ export namespace lx::text {
 //   to any size.
 //
 // Storage: a set-associative table of `k_glyph_cache_ways` ways per set, fixed at
-// construction, each way a key, the tile id and the bitmap's placement. A full set replaces
+// construction, each way a key, the tile id and the bitmap's placement, beside a 32-bit tag
+// per way (the key's hash) that a probe compares first: one cache line of tags per set. A full set replaces
 // its least recently used way (`overflow_action::drop_oldest`, the default) and releases that
 // way's tile when it was not used in the atlas's current frame (a tile drawn this frame stays
 // until the atlas ages it out); `reject` / `warn_and_drop` keep the set and fail the new glyph
@@ -168,6 +169,10 @@ public:
                                                             const glyph_key& key);
     /// `get_locked`, taking `faces.lock()` only on a miss.
     [[nodiscard]] lx::result<const glyph_entry*> get(face_cache& faces, const glyph_key& key);
+    /// `find` and `place` in one probe and one atlas lookup — the emitter's per-glyph call.
+    /// Null on a miss or an evicted tile (call `get*`); an empty glyph is returned with `out`
+    /// untouched.
+    [[nodiscard]] const glyph_entry* find_placed(const glyph_key& key, lx::gfx::atlas_tile& out);
     /// Where the entry's tile is now, stamped used this atlas frame. False for an empty glyph
     /// or a tile the atlas evicted (call `get*` again).
     [[nodiscard]] bool place(const glyph_entry& entry, lx::gfx::atlas_tile& out) const;
@@ -187,9 +192,19 @@ private:
     };
 
     [[nodiscard]] static std::uint64_t hash(const glyph_key& k);
-    [[nodiscard]] way* set_of(const glyph_key& k);
+    /// A way's tag: the hash's high half, never 0 (0 marks a free way).
+    [[nodiscard]] static constexpr std::uint32_t tag_of(std::uint64_t h) {
+        return static_cast<std::uint32_t>(h >> 32u) | 1u;
+    }
     /// The way holding `k`, or null.
     [[nodiscard]] way* probe(const glyph_key& k);
+    /// The way holding `k` (tags compared first, one cache line a set), or null.
+    [[nodiscard]] way* probe_hashed(const glyph_key& k, std::uint64_t h);
+    /// The way answering `key` (its own, or a colour glyph's at variant 0), or null; its
+    /// tile is not checked.
+    [[nodiscard]] way* hit(const glyph_key& key);
+    /// A hit: the way is stamped used (LRU clock, atlas frame) and counted.
+    void stamp(way& w);
     [[nodiscard]] bool alive(const way& w) const;
     void release_tile(way& w);
     /// Rasterises `key` into `out` (tile allocated and written). Caller holds the lock.
@@ -199,6 +214,9 @@ private:
     lx::gfx::atlas* atlas_ = nullptr;
     glyph_cache_config config_{};
     std::unique_ptr<way[]> ways_{};
+    /// `tag_of` per way (0: free), `k_glyph_cache_ways` per set: a probe reads one line of
+    /// tags before it touches a way.
+    std::unique_ptr<std::uint32_t[]> tags_{};
     std::unique_ptr<std::uint8_t[]> scratch_{};
     unsigned sets_ = 0;
     std::uint64_t clock_ = 0;
@@ -221,6 +239,7 @@ lx::text::glyph_cache::glyph_cache(lx::gfx::atlas& atlas, glyph_cache_config con
     if (config_.max_glyph_px == 0)
         config_.max_glyph_px = 1;
     ways_ = std::make_unique<way[]>(config_.entries);
+    tags_ = std::make_unique<std::uint32_t[]>(config_.entries);
     scratch_ = std::make_unique<std::uint8_t[]>(static_cast<std::size_t>(config_.max_glyph_px) *
                                                 config_.max_glyph_px * 4u);
     counters_.capacity = config_.entries;
@@ -229,34 +248,55 @@ lx::text::glyph_cache::glyph_cache(lx::gfx::atlas& atlas, glyph_cache_config con
 lx::text::glyph_cache::~glyph_cache() { clear(); }
 
 std::uint64_t lx::text::glyph_cache::hash(const glyph_key& k) {
-    // FNV-1a over the key's fields, then a final mix so the low bits (the set) spread.
-    std::uint64_t h = 14695981039346656037ull;
-    const auto mix = [&h](std::uint64_t v) {
-        for (unsigned i = 0; i < 8; ++i) {
-            h = (h ^ (v & 0xFFu)) * 1099511628211ull;
-            v >>= 8u;
-        }
-    };
-    mix(k.face.value);
-    mix(static_cast<std::uint32_t>(k.size_26_6));
-    mix(k.glyph);
-    mix((static_cast<std::uint64_t>(k.variant) << 8u) | static_cast<std::uint64_t>(k.hinting));
-    h ^= h >> 29u;
+    // The key's fields packed into two words and mixed (splitmix64's finaliser): a few
+    // multiplies per glyph — it runs for every glyph drawn — and the low bits (the set) and
+    // the high half (the tag) both spread.
+    const std::uint64_t a = (static_cast<std::uint64_t>(k.face.value) << 32u) |
+                            static_cast<std::uint32_t>(k.size_26_6);
+    const std::uint64_t b = (static_cast<std::uint64_t>(k.glyph) << 16u) |
+                            (static_cast<std::uint64_t>(k.variant) << 8u) |
+                            static_cast<std::uint64_t>(k.hinting);
+    std::uint64_t h = a ^ (b * 0x9E3779B97F4A7C15ull);
+    h ^= h >> 30u;
     h *= 0xBF58476D1CE4E5B9ull;
-    h ^= h >> 32u;
+    h ^= h >> 27u;
+    h *= 0x94D049BB133111EBull;
+    h ^= h >> 31u;
     return h;
 }
 
-lx::text::glyph_cache::way* lx::text::glyph_cache::set_of(const glyph_key& k) {
-    return ways_.get() + (hash(k) & (sets_ - 1u)) * k_glyph_cache_ways;
+lx::text::glyph_cache::way* lx::text::glyph_cache::probe_hashed(const glyph_key& k,
+                                                                std::uint64_t h) {
+    const std::size_t first = (h & (sets_ - 1u)) * k_glyph_cache_ways;
+    const std::uint32_t tag = tag_of(h);
+    const std::uint32_t* tags = tags_.get() + first;
+    for (unsigned i = 0; i < k_glyph_cache_ways; ++i)
+        if (tags[i] == tag && ways_[first + i].key == k)
+            return &ways_[first + i];
+    return nullptr;
 }
 
 lx::text::glyph_cache::way* lx::text::glyph_cache::probe(const glyph_key& k) {
-    way* set = set_of(k);
-    for (unsigned i = 0; i < k_glyph_cache_ways; ++i)
-        if (set[i].live && set[i].key == k)
-            return &set[i];
-    return nullptr;
+    return probe_hashed(k, hash(k));
+}
+
+lx::text::glyph_cache::way* lx::text::glyph_cache::hit(const glyph_key& key) {
+    way* w = probe(key);
+    if (!w && key.variant != 0) {
+        // A colour glyph is cached once, at variant 0, for every variant.
+        glyph_key base = key;
+        base.variant = 0;
+        way* b = probe(base);
+        if (b && b->entry.color)
+            w = b;
+    }
+    return w;
+}
+
+void lx::text::glyph_cache::stamp(way& w) {
+    w.used = ++clock_;
+    w.frame = atlas_->frame();
+    ++counters_.hits;
 }
 
 bool lx::text::glyph_cache::alive(const way& w) const {
@@ -281,22 +321,24 @@ void lx::text::glyph_cache::release_tile(way& w) {
 
 const lx::text::glyph_entry* lx::text::glyph_cache::find(const glyph_key& key) {
     lx::runtime::assert_affinity(owner_);
-    way* w = probe(key);
-    if (!w && key.variant != 0) {
-        // A colour glyph is cached once, at variant 0, for every variant.
-        glyph_key base = key;
-        base.variant = 0;
-        way* b = probe(base);
-        if (b && b->entry.color)
-            w = b;
-    }
+    way* w = hit(key);
     if (!w || !alive(*w)) {
         ++counters_.misses;
         return nullptr;
     }
-    w->used = ++clock_;
-    w->frame = atlas_->frame();
-    ++counters_.hits;
+    stamp(*w);
+    return &w->entry;
+}
+
+const lx::text::glyph_entry* lx::text::glyph_cache::find_placed(const glyph_key& key,
+                                                                lx::gfx::atlas_tile& out) {
+    lx::runtime::assert_affinity(owner_);
+    way* w = hit(key);
+    if (!w || (!w->entry.empty() && !atlas_->use(w->entry.tile, out))) {
+        ++counters_.misses;
+        return nullptr;
+    }
+    stamp(*w);
     return &w->entry;
 }
 
@@ -329,12 +371,13 @@ lx::text::glyph_cache::get_locked(face_cache& faces, const glyph_key& key) {
 
     // The way to fill: the key's own (its tile was evicted), else a free one, else the set's
     // least recently used.
-    way* target = probe(stored);
+    const std::uint64_t h = hash(stored);
+    way* target = probe_hashed(stored, h);
     if (target) {
         ++counters_.rerasterized;
         release_tile(*target);
     } else {
-        way* set = set_of(stored);
+        way* set = ways_.get() + (h & (sets_ - 1u)) * k_glyph_cache_ways;
         for (unsigned i = 0; i < k_glyph_cache_ways && !target; ++i)
             if (!set[i].live)
                 target = &set[i];
@@ -362,6 +405,7 @@ lx::text::glyph_cache::get_locked(face_cache& faces, const glyph_key& key) {
         }
     }
     target->live = true;
+    tags_[static_cast<std::size_t>(target - ways_.get())] = tag_of(h);
     target->key = stored;
     target->entry = e;
     target->used = ++clock_;
@@ -387,6 +431,7 @@ void lx::text::glyph_cache::clear() {
                 atlas_->release(w.entry.tile);
         }
         w = way{};
+        tags_[i] = 0;
     }
     counters_.live = 0;
 }

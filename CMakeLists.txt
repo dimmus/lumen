@@ -962,6 +962,14 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_text_lines PRIVATE tests)
     add_test(NAME test_text_lines COMMAND test_text_lines)
 
+    # lx.ui:text_node shaping large text on the worker affinity (ADR-010 §4.6).
+    add_executable(test_text_node tests/test_text_node.cpp)
+    target_link_libraries(test_text_node PRIVATE lx.ui lx.scene lx.gfx lx.runtime)
+    lumen_apply_module_properties(test_text_node)
+    lumen_link_platform(test_text_node)
+    target_include_directories(test_text_node PRIVATE tests)
+    add_test(NAME test_text_node COMMAND test_text_node)
+
     add_executable(test_protocol_bind tests/test_protocol_bind.cpp)
     target_link_libraries(test_protocol_bind PRIVATE lx.compositor)
     lumen_apply_module_properties(test_protocol_bind)

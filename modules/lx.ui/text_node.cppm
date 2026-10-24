@@ -5,12 +5,14 @@ import lx.gfx;
 import lx.layout;
 import lx.runtime;
 import lx.text;
+import lx.trace;
 
 export module lx.ui:text_node;
 
 import std;
 
 import :element;
+import :invalidate;
 import :node;
 
 export namespace lx::ui {
@@ -36,21 +38,64 @@ export namespace lx::ui {
 //
 // Emission does no per-glyph work for a line outside the scope's clip: lines are stacked
 // top to bottom, so the visible ones are found by a binary search over their tops (widened
-// by one em for ink above or below the line box) before any glyph is looked at. Per drawn
-// glyph: one glyph-cache probe, one atlas lookup + touch, one sprite. A glyph not in the
-// cache is rasterised on that frame (counted in `last_emit().rasterized`) under the text
-// engine's face lock, taken once per emit and only when something missed. No allocation per
-// frame: the layout's storage and the glyph cache are retained.
+// by one em for ink above or below the line box) before any glyph is looked at. A glyph is
+// placed once — one glyph-cache probe and one atlas lookup + touch
+// (`glyph_cache::find_placed`) — and its box and tile kept per layout glyph (`placed_`) until
+// the layout runs a pass again, so a frame that only moves the text (a scroll) costs one
+// `atlas::use` per glyph (which also tells an evicted tile, placed again through the glyph
+// cache) and one sprite. A glyph not in the glyph cache is rasterised on that frame (counted
+// in `last_emit().rasterized`) under the text engine's face lock, taken once per emit and
+// only when something missed. Order: a line's sprites share one order from the overlap grid
+// (`draw_scope::group_order` over their union, at most 128 sprites a group; a run's underline
+// closes the group so it draws above the run), so they cost no grid lookup each and batch in
+// push order; each group's order is at least the previous one's + 1, so a block's groups
+// ascend and the sort has nothing to do. No allocation per frame: the layout's storage, the
+// placements and the glyph cache are retained.
+//
+// Large text (`k_text_async_min_bytes` or more, with a `text_async_shaping`) is shaped and
+// wrapped on the worker affinity; the layout on show stays until the result lands (below,
+// "Off-thread shaping").
 //
 // UI affinity (the glyph cache writes the atlas): `emit` runs inside the frame build. The
 // layout's queries lock the engine's face cache lazily, so the layout is brought up to date
 // before the face lock is taken.
 
+/// Text of at least this many UTF-8 bytes is shaped off the UI thread when the block has a
+/// `text_async_shaping` (ADR-010 §4.6, the boundary §8.3 S4 measured). On the F8 host a cold
+/// reshape (shape cache empty for the text) costs about 0.21 µs a byte — 0.13 ms for a
+/// 669-byte paragraph, 1.4 ms for a 6.9 KB page, 31–38 ms for S4's 139 KB document — so 4 KiB
+/// keeps an inline reshape under about 1 ms, half of G4's 2 ms frame; a whole document goes
+/// to the worker.
+inline constexpr std::uint32_t k_text_async_min_bytes = 4096;
+
+/// Off-thread shaping for large text. `engine` is the worker's: its own shape cache and
+/// itemizer (a shape cache is single-threaded — a hit takes no lock), over the same face
+/// cache as the block's engine (face ids, and so the glyph cache's keys, belong to it). The
+/// worker affinity's strand of `executor` (null: `executor::global()`) runs the shape and
+/// wrap passes; the result comes back through the UI strand. Several blocks may share one.
+struct text_async_shaping {
+    lx::text::text_engine engine{};
+    lx::runtime::executor* executor = nullptr;
+    std::uint32_t min_bytes = k_text_async_min_bytes;
+};
+
 /// What a text block lays out with and rasterises into. Null `engine` members are the
-/// shared caches; without `glyphs` the block lays out and measures but draws nothing.
+/// shared caches; without `glyphs` the block lays out and measures but draws nothing; with
+/// `async`, text of `async->min_bytes` or more is shaped on the worker affinity.
 struct text_raster_context {
     lx::text::text_engine engine{};
     lx::text::glyph_cache* glyphs = nullptr;
+    text_async_shaping* async = nullptr;
+};
+
+/// The off-thread shaping of one block.
+struct text_async_stats {
+    std::uint64_t posted = 0;     ///< shape jobs sent to the worker
+    std::uint64_t landed = 0;     ///< results swapped in
+    std::uint64_t discarded = 0;  ///< results dropped (the block went back to inline text)
+    std::uint64_t inline_fallbacks = 0; ///< the worker strand was full: shaped inline instead
+    bool pending = false;         ///< a job is on the worker or its result not yet landed
+    bool active = false;          ///< the block's text is shaped off-thread
 };
 
 struct text_block_props {
@@ -84,6 +129,7 @@ struct text_emit_stats {
     unsigned underlines = 0;
     unsigned rasterized = 0;   ///< glyph cache misses rasterised on this frame
     unsigned failures = 0;     ///< glyphs that could not be rasterised or placed
+    unsigned cached = 0;       ///< glyphs placed from the node's placement cache
 };
 
 class text_block_node final : public ui_node {
@@ -95,6 +141,9 @@ public:
     [[nodiscard]] element_type_id type() const override { return static_type(); }
     [[nodiscard]] const char* type_name() const override { return "text_block"; }
 
+    text_block_node() = default;
+    ~text_block_node() override;
+
     void apply(const text_block_props& props);
 
     [[nodiscard]] lx::size2i measure(lx::layout::constraints c, size_hint hint) const override;
@@ -103,8 +152,21 @@ public:
 
     [[nodiscard]] const lx::text::text_layout& layout() const { return layout_; }
     [[nodiscard]] text_emit_stats last_emit() const { return stats_; }
+    [[nodiscard]] text_async_stats async_stats() const;
 
 private:
+    struct shape_job;
+
+    /// `apply` for text below the async boundary (or without `async`): the layout's setters.
+    void apply_inline(const text_block_props& p);
+    /// `apply` for large text: the inputs go to the job, a shape on the worker if they changed.
+    void apply_async(const text_block_props& p, text_async_shaping& async);
+    /// Posts the job's inputs to the worker; inline when the strand is full.
+    void start_job();
+    /// UI affinity: the worker's result arrived (the job's `generation`).
+    void land();
+    static void run_job(void* job);
+    static void land_job(void* job);
     /// The layout's max width (logical px) for a device-pixel width; 0 is unbounded.
     [[nodiscard]] float logical_width(int device_px) const;
 
@@ -117,6 +179,36 @@ private:
     /// The engine's face cache (null: the shared one): its lock guards rasterising.
     lx::text::face_cache* faces_ = nullptr;
     mutable text_emit_stats stats_{};
+
+    /// A layout glyph as last drawn: its box from the block's top left, its atlas tile.
+    struct placed_glyph {
+        std::int32_t x = 0;
+        std::int32_t y = 0;
+        std::uint32_t tile = 0; ///< `gfx::atlas_tile_id::value`
+        std::uint16_t width = 0;
+        std::uint16_t height = 0;
+        std::uint8_t state = 0; ///< 0: not placed yet, 1: empty (a space), 2: a sprite
+        bool color = false;
+    };
+    /// One entry per layout glyph (`layout_run::glyph_begin` + i; ellipsis runs are not
+    /// cached), valid while the layout's passes, the glyph cache and the hinting are those it
+    /// was filled under. Sized when the layout changes, never per frame.
+    mutable std::vector<placed_glyph> placed_{};
+    mutable std::uint64_t placed_passes_ = ~0ull;
+    mutable const lx::text::glyph_cache* placed_glyphs_ = nullptr;
+    mutable lx::text::glyph_hinting placed_hinting_ = lx::text::glyph_hinting::none;
+    mutable bool placed_valid_ = false;
+
+    // Off-thread shaping: `job_` is allocated on the first large text and kept (its layouts'
+    // storage with it); the node's generation counts shape-input changes of large text,
+    // `shown_` the one `layout_` holds.
+    shape_job* job_ = nullptr;
+    text_async_shaping* async_ = nullptr;
+    lx::text::text_engine engine_{};
+    std::uint64_t async_generation_ = 0;
+    std::uint64_t shown_generation_ = 0;
+    bool async_active_ = false;
+    text_async_stats async_stats_{};
 };
 
 /// Describes a `text_block_node` with `props`.
@@ -141,17 +233,102 @@ namespace {
     return lx::gfx::premultiplied_half(c);
 }
 
+/// Glyphs buffered by `text_block_node::emit` until their group's order is known.
+constexpr unsigned k_text_glyph_group = 128;
+
+struct lx_ui_pending_glyph {
+    lx::rect2i box{};
+    lx::gfx::sprite_uv uv{};
+    lx::gfx::packed_rgba color{};
+    lx::gfx::primitive_kind kind = lx::gfx::primitive_kind::mono_sprite;
+    std::uint8_t page = 0;
+};
+
+[[nodiscard]] lx::rect2i lx_ui_text_union(lx::rect2i a, lx::rect2i b) {
+    const int x0 = a.x < b.x ? a.x : b.x;
+    const int y0 = a.y < b.y ? a.y : b.y;
+    const int x1 = a.x + a.width > b.x + b.width ? a.x + a.width : b.x + b.width;
+    const int y1 = a.y + a.height > b.y + b.height ? a.y + a.height : b.y + b.height;
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
 /// 26.6 → whole pixels, rounded to nearest (floor of x + ½).
 [[nodiscard]] constexpr std::int32_t lx_ui_round_26_6(std::int32_t v) { return (v + 32) >> 6; }
 
 } // namespace
 
+// ── Off-thread shaping (ADR-010 §4.6) ──
+//
+// Text of `async->min_bytes` or more is not laid out by `apply`: its inputs go to the job's
+// `next` layout (an input record, never laid out), and when its shape inputs changed the job
+// copies them into `staging` and posts `run_job` to the worker strand. The worker runs
+// `staging.update()` (shape + wrap, with the async engine: its own shape cache and itemizer,
+// the block's face cache) and posts `land_job` to the UI strand. Landing swaps `staging` into
+// `layout_`, points it at the block's engine (`rebind_engine`: same face cache, no reshape),
+// applies the current wrap inputs (a re-wrap at most) and invalidates the node's layout; the
+// layout shown until then is the previous one. A change that arrives while a job runs only
+// bumps the generation: the landing job's result is shown and another job is posted with the
+// newest inputs. Text that drops below the boundary is laid out inline at once and a job
+// still running is discarded when it lands. The node's destructor leaves a running job to
+// `land_job`, which frees it. Allocation: the job (two layouts) once per node, the layouts'
+// vectors as they grow — never per frame.
+
+struct lx::ui::text_block_node::shape_job {
+    lx::text::text_layout staging{};
+    lx::text::text_layout next{};
+    lx::result<void> outcome{};
+    /// Null once the node is gone (UI affinity).
+    text_block_node* node = nullptr;
+    lx::runtime::executor* executor = nullptr;
+    std::uint64_t generation = 0;
+    bool running = false;
+};
+
+lx::ui::text_block_node::~text_block_node() {
+    if (!job_)
+        return;
+    if (job_->running)
+        job_->node = nullptr; // `land_job` frees it
+    else
+        delete job_;
+}
+
 void lx::ui::text_block_node::apply(const text_block_props& p) {
+    color_ = p.color;
+    scale_ = p.scale > 0.f ? p.scale : 1.f;
+    wraps_ = p.wrap == lx::text::text_wrap::word;
+    hinting_ = p.hinting;
+    glyphs_ = p.context.glyphs;
+    faces_ = p.context.engine.faces;
+    engine_ = p.context.engine;
+    text_async_shaping* async = p.context.async;
+    const auto faces_of = [](lx::text::face_cache* f) {
+        return f ? f : &lx::text::face_cache::shared();
+    };
+    // The worker needs caches of its own over the block's face cache.
+    if (async && (!async->engine.shapes || !async->engine.items ||
+                  faces_of(async->engine.faces) != faces_of(p.context.engine.faces) ||
+                  async->engine.shapes == p.context.engine.shapes ||
+                  async->engine.items == p.context.engine.items))
+        async = nullptr;
+    const std::size_t bytes = p.text ? std::strlen(p.text) : 0;
+    if (async && bytes >= async->min_bytes)
+        apply_async(p, *async);
+    else
+        apply_inline(p);
+}
+
+void lx::ui::text_block_node::apply_inline(const text_block_props& p) {
+    if (async_active_) {
+        // Back to inline text: a job still running is discarded when it lands.
+        async_active_ = false;
+        ++async_generation_;
+    }
     lx::text::text_layout& l = layout_;
     l.set_engine(p.context.engine);
     l.set_text(p.text ? p.text : "");
     l.set_font(p.font);
-    l.set_scale(p.scale > 0.f ? p.scale : 1.f);
+    l.set_scale(scale_);
     l.set_align(p.align);
     l.set_wrap(p.wrap);
     l.set_max_lines(p.max_lines);
@@ -159,14 +336,123 @@ void lx::ui::text_block_node::apply(const text_block_props& p) {
     l.set_line_height(p.line_height);
     l.set_direction(p.direction);
     l.set_attrs(p.attrs);
-    color_ = p.color;
-    scale_ = p.scale > 0.f ? p.scale : 1.f;
-    wraps_ = p.wrap == lx::text::text_wrap::word;
-    hinting_ = p.hinting;
-    glyphs_ = p.context.glyphs;
-    faces_ = p.context.engine.faces;
     if (l.dirty())
         mark_layout_dirty();
+}
+
+void lx::ui::text_block_node::apply_async(const text_block_props& p, text_async_shaping& async) {
+    if (!job_) {
+        job_ = new shape_job{};
+        job_->node = this;
+    }
+    async_ = &async;
+    lx::text::text_layout& next = job_->next;
+    const std::uint64_t before = next.shape_generation();
+    next.set_text(p.text);
+    next.set_font(p.font);
+    next.set_scale(scale_);
+    next.set_attrs(p.attrs);
+    next.set_direction(p.direction);
+    next.set_align(p.align);
+    next.set_wrap(p.wrap);
+    next.set_max_lines(p.max_lines);
+    next.set_ellipsize(p.ellipsize);
+    next.set_line_height(p.line_height);
+    if (!async_active_ || next.shape_generation() != before) {
+        async_active_ = true;
+        ++async_generation_;
+    }
+    // The layout on show keeps its shaping; a new face cache makes it meaningless.
+    layout_.rebind_engine(p.context.engine);
+    if (layout_.shape_dirty()) {
+        layout_ = lx::text::text_layout{p.context.engine};
+        shown_generation_ = 0;
+        placed_valid_ = false;
+    }
+    // Its wrap inputs follow at once: a re-wrap is cheap.
+    layout_.assign_inputs(next, false);
+    if (async_generation_ != shown_generation_ && !job_->running)
+        start_job();
+    if (layout_.dirty())
+        mark_layout_dirty();
+}
+
+void lx::ui::text_block_node::start_job() {
+    shape_job& j = *job_;
+    lx::runtime::executor& ex = async_->executor ? *async_->executor
+                                                 : lx::runtime::executor::global();
+    j.staging.set_engine(async_->engine);
+    j.staging.assign_inputs(j.next);
+    // The width the block was last laid out at; arrange re-wraps if it moved meanwhile.
+    j.staging.set_max_width(layout_.max_width());
+    j.generation = async_generation_;
+    j.executor = &ex;
+    j.running = true;
+    if (ex.post(lx::runtime::affinity::worker, lx::runtime::task{&text_block_node::run_job, &j})) {
+        ++async_stats_.posted;
+        return;
+    }
+    // The worker strand is full: shape here rather than show stale text indefinitely.
+    j.running = false;
+    ++async_stats_.inline_fallbacks;
+    lx::trace::logger::global().log(lx::trace::level::warn, "ui.text",
+                                    "text_block: worker strand full, shaping inline");
+    layout_.assign_inputs(j.next);
+    shown_generation_ = async_generation_;
+    placed_valid_ = false;
+    mark_layout_dirty();
+}
+
+void lx::ui::text_block_node::run_job(void* raw) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::worker);
+    auto* j = static_cast<shape_job*>(raw);
+    j->outcome = j->staging.update();
+    // Back to the UI strand. It drains every frame, so a full queue clears: retry, yielding.
+    const lx::runtime::task back{&text_block_node::land_job, j};
+    for (unsigned attempt = 0; !j->executor->post(lx::runtime::affinity::ui, back); ++attempt) {
+        if (attempt == 100000) {
+            lx::trace::logger::global().log(lx::trace::level::error, "ui.text",
+                                            "text_block: UI strand full, shape result lost");
+            return;
+        }
+        std::this_thread::yield();
+    }
+}
+
+void lx::ui::text_block_node::land_job(void* raw) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    auto* j = static_cast<shape_job*>(raw);
+    j->running = false;
+    if (!j->node) {
+        delete j;
+        return;
+    }
+    j->node->land();
+}
+
+void lx::ui::text_block_node::land() {
+    shape_job& j = *job_;
+    if (!async_active_) {
+        ++async_stats_.discarded;
+        return;
+    }
+    // Newer than what is on show even when the inputs moved on: show it, then go again.
+    std::swap(layout_, j.staging);
+    layout_.rebind_engine(engine_);
+    layout_.assign_inputs(j.next, false);
+    shown_generation_ = j.generation;
+    placed_valid_ = false;
+    ++async_stats_.landed;
+    invalidate_layout(*this);
+    if (async_generation_ != shown_generation_)
+        start_job();
+}
+
+lx::ui::text_async_stats lx::ui::text_block_node::async_stats() const {
+    text_async_stats s = async_stats_;
+    s.pending = job_ && job_->running;
+    s.active = async_active_;
+    return s;
 }
 
 float lx::ui::text_block_node::logical_width(int device_px) const {
@@ -237,6 +523,43 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     const lx::text::glyph_hinting hinting = lx::text::effective_hinting(hinting_, scale_);
     const std::span<const lx::text::text_attr> attrs = layout_.attrs();
     const lx::point2i at{bounds_.x, bounds_.y};
+    lx::gfx::atlas& atlas = glyphs_->atlas();
+
+    // The placement cache: dropped when the layout ran a pass since it was filled.
+    const lx::text::text_layout_counters lc = layout_.counters();
+    const std::uint64_t passes = lc.shape_passes + lc.wrap_passes;
+    if (!placed_valid_ || placed_passes_ != passes || placed_glyphs_ != glyphs_ ||
+        placed_hinting_ != hinting) {
+        std::size_t total = 0;
+        for (const lx::text::layout_run& r : layout_.runs())
+            if (!r.ellipsis && std::size_t{r.glyph_begin} + r.glyph_count > total)
+                total = std::size_t{r.glyph_begin} + r.glyph_count;
+        placed_.assign(total, placed_glyph{});
+        placed_passes_ = passes;
+        placed_glyphs_ = glyphs_;
+        placed_hinting_ = hinting;
+        placed_valid_ = true;
+    }
+
+    // A line's sprites are emitted in groups sharing one order (`draw_scope::group_order`
+    // over the group's union): a group closes at the line's end, before an underline (drawn
+    // above its run) and when the buffer is full.
+    lx_ui_pending_glyph pending[k_text_glyph_group];
+    unsigned pending_count = 0;
+    lx::rect2i pending_union{};
+    std::uint32_t next_order = 0;
+    const auto flush = [&] {
+        if (pending_count == 0)
+            return;
+        const std::uint32_t order = out.group_order(pending_union, next_order);
+        next_order = order + 1;
+        for (unsigned i = 0; i < pending_count; ++i) {
+            const lx_ui_pending_glyph& g = pending[i];
+            out.glyph(g.kind, g.page, g.box, g.uv, g.color, order);
+        }
+        pending_count = 0;
+        pending_union = {};
+    };
 
     for (std::size_t li = lo; li < lines.size(); ++li) {
         const lx::text::layout_line& line = lines[li];
@@ -250,14 +573,53 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
             const lx::gfx::packed_rgba run_color =
                 span_color ? lx_ui_text_pack(lx_ui_text_rgba(attr->color), opacity) : node_color;
             std::int32_t pen = run.x;
-            for (const lx::text::layout_glyph& g : layout_.glyphs(run)) {
+            const std::span<const lx::text::layout_glyph> run_glyphs = layout_.glyphs(run);
+            placed_glyph* cache = !run.ellipsis && std::size_t{run.glyph_begin} +
+                                                           run_glyphs.size() <= placed_.size()
+                                      ? placed_.data() + run.glyph_begin
+                                      : nullptr;
+            for (std::size_t gi = 0; gi < run_glyphs.size(); ++gi) {
+                const lx::text::layout_glyph& g = run_glyphs[gi];
                 ++stats_.glyphs;
+                if (cache && cache[gi].state != 0) {
+                    const placed_glyph& c = cache[gi];
+                    lx::gfx::atlas_tile tile{};
+                    if (c.state == 1) {
+                        pen += g.x_advance;
+                        ++stats_.cached;
+                        continue;
+                    }
+                    if (atlas.use({c.tile}, tile)) {
+                        pen += g.x_advance;
+                        if (pending_count == k_text_glyph_group)
+                            flush();
+                        lx_ui_pending_glyph& pg = pending[pending_count++];
+                        pg.box = {at.x + c.x, at.y + c.y, c.width, c.height};
+                        pg.uv = tile.uv();
+                        pg.page = tile.page;
+                        if (c.color) {
+                            pg.kind = lx::gfx::primitive_kind::poly_sprite;
+                            pg.color = white;
+                            ++stats_.color_sprites;
+                        } else {
+                            pg.kind = lx::gfx::primitive_kind::mono_sprite;
+                            pg.color = run_color;
+                        }
+                        pending_union = pending_count == 1 ? pg.box
+                                                           : lx_ui_text_union(pending_union, pg.box);
+                        ++stats_.sprites;
+                        ++stats_.cached;
+                        continue;
+                    }
+                    // The atlas evicted the tile: placed again below.
+                }
                 const lx::text::glyph_pen_pos p =
                     lx::text::glyph_pen(pen + g.x_offset, line.baseline - g.y_offset);
                 pen += g.x_advance;
                 const lx::text::glyph_key key{run.face, run.size_26_6, g.glyph, p.variant,
                                               hinting};
-                const lx::text::glyph_entry* found = glyphs_->find(key);
+                lx::gfx::atlas_tile tile{};
+                const lx::text::glyph_entry* found = glyphs_->find_placed(key, tile);
                 if (!found) {
                     if (!lock.owns_lock())
                         lock = faces.lock();
@@ -268,24 +630,39 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
                     }
                     found = *got;
                     ++stats_.rasterized;
+                    if (!found->empty() && !glyphs_->place(*found, tile)) {
+                        ++stats_.failures;
+                        continue;
+                    }
                 }
                 const lx::text::glyph_entry e = *found;
+                if (cache) {
+                    placed_glyph& c = cache[gi];
+                    c.x = p.x + e.left;
+                    c.y = p.y - e.top;
+                    c.tile = e.tile.value;
+                    c.width = e.width;
+                    c.height = e.height;
+                    c.state = e.empty() ? 1 : 2;
+                    c.color = e.color;
+                }
                 if (e.empty())
                     continue;
-                lx::gfx::atlas_tile tile{};
-                if (!glyphs_->place(e, tile)) {
-                    ++stats_.failures;
-                    continue;
-                }
-                const lx::rect2i box{at.x + p.x + e.left, at.y + p.y - e.top, e.width, e.height};
+                if (pending_count == k_text_glyph_group)
+                    flush();
+                lx_ui_pending_glyph& pg = pending[pending_count++];
+                pg.box = {at.x + p.x + e.left, at.y + p.y - e.top, e.width, e.height};
+                pg.uv = tile.uv();
+                pg.page = tile.page;
                 if (e.color) {
-                    out.glyph(lx::gfx::primitive_kind::poly_sprite, tile.page, box, tile.uv(),
-                              white);
+                    pg.kind = lx::gfx::primitive_kind::poly_sprite;
+                    pg.color = white;
                     ++stats_.color_sprites;
                 } else {
-                    out.glyph(lx::gfx::primitive_kind::mono_sprite, tile.page, box, tile.uv(),
-                              run_color);
+                    pg.kind = lx::gfx::primitive_kind::mono_sprite;
+                    pg.color = run_color;
                 }
+                pending_union = pending_count == 1 ? pg.box : lx_ui_text_union(pending_union, pg.box);
                 ++stats_.sprites;
             }
 
@@ -296,6 +673,8 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
                               attr->role == lx::text::span_role::spell;
             if (!wavy && attr->underline != lx::text::text_underline::single)
                 continue;
+            // Above the run's glyphs: they take their order first.
+            flush();
             const lx::text::face_metrics* m = layout_.metrics(run.face);
             const std::int32_t offset = m ? m->underline_offset : run.size_26_6 / 14;
             const std::int32_t thick_26_6 = m ? m->underline_thickness : 64;
@@ -316,6 +695,7 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
             }
             ++stats_.underlines;
         }
+        flush();
     }
 }
 

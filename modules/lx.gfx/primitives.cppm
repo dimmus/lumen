@@ -280,6 +280,11 @@ public:
     /// the covered cells: `max(layer base, 1 + max over the cells)`. An empty or off-view
     /// rect returns the current layer base and writes nothing.
     [[nodiscard]] std::uint32_t assign(lx::rect2i bounds);
+    /// `assign` with a floor: the order is at least `at_least` (written back like any other).
+    /// An emitter whose consecutive groups need no order between them but should come out
+    /// ascending — successive lines of one text block — chains them with it, so the stream
+    /// stays sorted and `draw_list::batch_for_render` skips its sort.
+    [[nodiscard]] std::uint32_t assign(lx::rect2i bounds, std::uint32_t at_least);
 
     /// Lifts the base order above everything assigned so far: an overlay, popup or drag
     /// cannot interleave with what is under it (GPUI's `push_layer`). At most
@@ -377,6 +382,38 @@ std::uint32_t lx::gfx::order_grid::assign(lx::rect2i bounds) {
                 highest = row[cx];
     }
     const std::uint32_t order = highest + 1 > base_ ? highest + 1 : base_;
+    for (unsigned cy = cy0; cy <= cy1; ++cy) {
+        std::uint32_t* row = cells_ + cy * cells_x_;
+        for (unsigned cx = cx0; cx <= cx1; ++cx)
+            row[cx] = order;
+    }
+    if (order > max_)
+        max_ = order;
+    return order;
+}
+
+std::uint32_t lx::gfx::order_grid::assign(lx::rect2i bounds, std::uint32_t at_least) {
+    if (bounds.width <= 0 || bounds.height <= 0)
+        return base_;
+    const long long x0 = bounds.x > 0 ? bounds.x : 0;
+    const long long y0 = bounds.y > 0 ? bounds.y : 0;
+    const long long bx1 = static_cast<long long>(bounds.x) + bounds.width;
+    const long long by1 = static_cast<long long>(bounds.y) + bounds.height;
+    const long long x1 = bx1 < view_.width ? bx1 : view_.width;
+    const long long y1 = by1 < view_.height ? by1 : view_.height;
+    if (x1 <= x0 || y1 <= y0)
+        return base_;
+    const unsigned cx0 = static_cast<unsigned>(x0) >> shift_;
+    const unsigned cy0 = static_cast<unsigned>(y0) >> shift_;
+    const unsigned cx1 = static_cast<unsigned>(x1 - 1) >> shift_;
+    const unsigned cy1 = static_cast<unsigned>(y1 - 1) >> shift_;
+    std::uint32_t order = at_least > base_ ? at_least : base_;
+    for (unsigned cy = cy0; cy <= cy1; ++cy) {
+        const std::uint32_t* row = cells_ + cy * cells_x_;
+        for (unsigned cx = cx0; cx <= cx1; ++cx)
+            if (row[cx] + 1 > order)
+                order = row[cx] + 1;
+    }
     for (unsigned cy = cy0; cy <= cy1; ++cy) {
         std::uint32_t* row = cells_ + cy * cells_x_;
         for (unsigned cx = cx0; cx <= cx1; ++cx)

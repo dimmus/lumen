@@ -125,6 +125,16 @@ public:
     /// conversion per glyph.
     void glyph(lx::gfx::primitive_kind kind, std::uint8_t page, lx::rect2i bounds,
                lx::gfx::sprite_uv uv, lx::gfx::packed_rgba color);
+    /// The order a group of glyphs will share: the overlap grid's `assign` over `bounds`
+    /// (offset by the origin, clipped), which must cover every glyph of the group, and at
+    /// least `at_least`. Glyphs of one group (a text line's sprites) need no order among
+    /// themselves — they batch in push order — so one grid lookup serves the group; chaining
+    /// a block's groups (`at_least` = the previous group's order + 1) keeps them ascending,
+    /// which leaves `batch_for_render` nothing to sort.
+    [[nodiscard]] std::uint32_t group_order(lx::rect2i bounds, std::uint32_t at_least = 0);
+    /// `glyph` with an order from `group_order` instead of one from the grid.
+    void glyph(lx::gfx::primitive_kind kind, std::uint8_t page, lx::rect2i bounds,
+               lx::gfx::sprite_uv uv, lx::gfx::packed_rgba color, std::uint32_t order);
 
     [[nodiscard]] lx::rect2i clip() const;
     [[nodiscard]] float opacity() const;
@@ -143,6 +153,10 @@ private:
     /// Offsets `bounds` by the origin into `placed` and clips it into `visible`; false when
     /// nothing of it is visible.
     [[nodiscard]] bool place(lx::rect2i bounds, lx::rect2i& placed, lx::rect2i& visible) const;
+    /// `glyph`'s common tail, `placed` and `visible` from `place`.
+    void emit_glyph(lx::gfx::primitive_kind kind, std::uint8_t page, lx::rect2i placed,
+                    lx::rect2i visible, lx::gfx::sprite_uv uv, lx::gfx::packed_rgba color,
+                    std::uint32_t order);
     /// `quad`'s common tail: `colour_scale` multiplies the packed colours (1: as they are).
     void emit_quad(lx::rect2i placed, lx::rect2i visible, const packed_quad_style& style,
                    float colour_scale);
@@ -567,14 +581,41 @@ void lx::ui::draw_scope::glyph(lx::gfx::primitive_kind kind, std::uint8_t page,
     if (!out_ || (kind != lx::gfx::primitive_kind::mono_sprite &&
                   kind != lx::gfx::primitive_kind::poly_sprite))
         return;
-    const frame& f = top();
-    lx::rect2i placed = bounds;
-    placed.x += f.origin.x;
-    placed.y += f.origin.y;
-    const lx::rect2i visible = lx_ui_intersect(placed, f.clip);
-    if (visible.width <= 0 || visible.height <= 0)
+    lx::rect2i placed{};
+    lx::rect2i visible{};
+    if (!place(bounds, placed, visible))
         return;
+    emit_glyph(kind, page, placed, visible, uv, color, out_->orders().assign(visible));
+}
 
+std::uint32_t lx::ui::draw_scope::group_order(lx::rect2i bounds, std::uint32_t at_least) {
+    if (!out_)
+        return 0;
+    lx::rect2i placed{};
+    lx::rect2i visible{};
+    if (!place(bounds, placed, visible))
+        return out_->orders().layer_base();
+    return out_->orders().assign(visible, at_least);
+}
+
+void lx::ui::draw_scope::glyph(lx::gfx::primitive_kind kind, std::uint8_t page,
+                               lx::rect2i bounds, lx::gfx::sprite_uv uv,
+                               lx::gfx::packed_rgba color, std::uint32_t order) {
+    if (!out_ || (kind != lx::gfx::primitive_kind::mono_sprite &&
+                  kind != lx::gfx::primitive_kind::poly_sprite))
+        return;
+    lx::rect2i placed{};
+    lx::rect2i visible{};
+    if (!place(bounds, placed, visible))
+        return;
+    emit_glyph(kind, page, placed, visible, uv, color, order);
+}
+
+void lx::ui::draw_scope::emit_glyph(lx::gfx::primitive_kind kind, std::uint8_t page,
+                                    lx::rect2i placed, lx::rect2i visible,
+                                    lx::gfx::sprite_uv uv, lx::gfx::packed_rgba color,
+                                    std::uint32_t order) {
+    const frame& f = top();
     lx::gfx::sprite_instance s{};
     lx_ui_write_rect(s.bounds, placed);
     lx_ui_write_rect(s.clip, f.clip);
@@ -591,7 +632,7 @@ void lx::ui::draw_scope::glyph(lx::gfx::primitive_kind kind, std::uint8_t page,
         s.params[0] = 0x3C00u; // f16 1: the identity rotation (cos, sin, −sin, cos)
         s.params[3] = 0x3C00u;
     }
-    out_->push_sprite(kind, page, s, visible, out_->orders().assign(visible));
+    out_->push_sprite(kind, page, s, visible, order);
     ++emitted_;
 }
 
