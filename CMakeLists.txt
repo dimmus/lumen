@@ -120,8 +120,15 @@ lumen_embed_glsl(lx.gfx ui
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/sprite.fs.glsl"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.vs.glsl"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui/underline.fs.glsl")
-lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.foundation)
+lumen_add_module_library(lx.text modules/lx.text DEPENDS lx.foundation lx.runtime lx.trace)
 lumen_link_platform_parts(lx.text text)
+# Bundled fonts (assets/fonts, ADR-010 §5.4), registered with fontconfig by lx.text:faces: the
+# source tree's copy, the install relative to the executable, the configured install.
+include(GNUInstallDirs)
+target_compile_definitions(lx.text PRIVATE
+    LUMEN_FONT_DIR_BUILD="${CMAKE_SOURCE_DIR}/assets/fonts"
+    LUMEN_FONT_DIR_INSTALL_RELATIVE="${CMAKE_INSTALL_DATADIR}/lumen/fonts"
+    LUMEN_FONT_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/fonts")
 lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.runtime)
 lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
@@ -438,6 +445,8 @@ install(DIRECTORY protocols/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/protocol
 # The documented configuration (every key at its default): a template to copy to
 # ~/.config/lumen/config.toml, not a layer itself (lumen-ctl config defaults prints it too).
 install(FILES deploy/lumen/config.toml DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen)
+# The bundled UI and mono fonts with their licenses (lx.text:faces finds them here).
+install(DIRECTORY assets/fonts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/fonts)
 if(LUMEN_PORTAL_BUILT)
     install(TARGETS xdg-desktop-portal-lumen RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
     install(FILES deploy/portal/lumen.portal
