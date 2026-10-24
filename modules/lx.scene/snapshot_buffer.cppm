@@ -290,6 +290,23 @@ void lx::scene::draw_list::batch_for_render() {
     if (!order_)
         return;
 
+    const auto before = [this](unsigned a, unsigned b) {
+        const auto& ca = commands_[a];
+        const auto& cb = commands_[b];
+        if (ca.sort_key.value != cb.sort_key.value)
+            return ca.sort_key.value < cb.sort_key.value;
+        return ca.texture.id() < cb.texture.id();
+    };
+    // Every emitter pushes in paint order (`draw_sort_key::make(layer, out.size())`), so the
+    // list nearly always is sorted already: one pass and nothing else. The sort used to run
+    // anyway, and `stable_sort` allocates its buffer on each call — the publish path's one
+    // heap allocation per view per frame.
+    bool sorted = true;
+    for (unsigned i = 1; i < count_ && sorted; ++i)
+        sorted = !before(i, i - 1);
+    if (sorted) [[likely]]
+        return;
+
     unsigned* indices = order_;
     for (unsigned i = 0; i < count_; ++i)
         indices[i] = i;
@@ -310,12 +327,13 @@ void lx::scene::draw_list::batch_for_render() {
     // the list really is in paint order.
     //
     // Restore the partition only alongside a depth buffer.
-    std::stable_sort(indices, indices + count_, [this](unsigned a, unsigned b) {
-        const auto& ca = commands_[a];
-        const auto& cb = commands_[b];
-        if (ca.sort_key.value != cb.sort_key.value)
-            return ca.sort_key.value < cb.sort_key.value;
-        return ca.texture.id() < cb.texture.id();
+    // Ties keep their push order, as a stable sort would, without its allocation.
+    std::sort(indices, indices + count_, [&](unsigned a, unsigned b) {
+        if (before(a, b))
+            return true;
+        if (before(b, a))
+            return false;
+        return a < b;
     });
 
     // Apply the permutation in place, one cycle at a time: `indices[i]` names the command

@@ -119,7 +119,8 @@ public:
     /// text cannot be shaped (warned once).
     bool text(int buffer, lx::rect2i box, const char* utf8, lx::text::raster_color color,
               lx::text::font_desc font, align a = align::left);
-    /// Width `text` would take (logical), or -1.
+    /// Width `text` would take (logical: its width at the output's density, rounded up), or
+    /// -1. Measuring a label and then drawing it shapes it once.
     [[nodiscard]] int text_width(const char* utf8, lx::text::font_desc font);
     /// The scale (1 without fractional scale).
     [[nodiscard]] double scale_factor() const { return scale(); }
@@ -168,7 +169,15 @@ private:
     bool font_warned_ = false;
     wake_fn wake_ = nullptr;
     void* wake_user_ = nullptr;
+    /// Shapes `utf8` in `font` (its size already at pixel density) into `line_`, unless that
+    /// is what `line_` holds — a label is measured, then drawn.
+    [[nodiscard]] bool shape(const char* utf8, lx::text::font_desc font);
     lx::text::shaped_line line_{};
+    /// What `line_` holds: its text, family and the rest of its font (`line_valid_` false: nothing).
+    std::string line_text_;
+    std::string line_family_;
+    lx::text::font_desc line_font_{};
+    bool line_valid_ = false;
 };
 
 } // namespace lx::shell
@@ -305,15 +314,8 @@ bool lx::shell::shm_canvas::text(int bi, lx::rect2i logical_box, const char* utf
     // Shaped at the output's pixel density: the glyphs are rasterized for the pixels they
     // land on, never scaled afterwards.
     font.size_pt = static_cast<float>(font.size_pt * scale());
-    if (auto shaped = lx::text::shape_line(utf8, font, line_); !shaped) {
-        if (!font_warned_) {
-            font_warned_ = true;
-            lx::trace::logger::global().log_error(shaped.get_error(), k_canvas_category);
-            lx::trace::logger::global().log(lx::trace::level::warn, k_canvas_category,
-                                            "no text rendering: labels are not drawn");
-        }
+    if (!shape(utf8, font))
         return false;
-    }
     const lx::text::line_fit fit = lx::text::fit_line(line_, box.width);
     const int x = a == align::right ? box.width - fit.width_px : 0;
     // The target is the label's own box, so nothing can spill into a neighbour.
@@ -325,9 +327,36 @@ bool lx::shell::shm_canvas::text(int bi, lx::rect2i logical_box, const char* utf
 }
 
 int lx::shell::shm_canvas::text_width(const char* utf8, lx::text::font_desc font) {
-    if (!lx::text::shape_line(utf8, font, line_))
+    const double s = scale();
+    font.size_pt = static_cast<float>(font.size_pt * s);
+    if (!shape(utf8, font))
         return -1;
-    return line_.width_px;
+    return static_cast<int>(std::ceil(line_.width_px / s));
+}
+
+bool lx::shell::shm_canvas::shape(const char* utf8, lx::text::font_desc font) {
+    if (!utf8)
+        utf8 = "";
+    const char* family = font.family ? font.family : "";
+    if (line_valid_ && line_text_ == utf8 && line_family_ == family &&
+        line_font_.size_pt == font.size_pt && line_font_.weight == font.weight &&
+        line_font_.style == font.style)
+        return true;
+    line_valid_ = false;
+    if (auto shaped = lx::text::shape_line(utf8, font, line_); !shaped) {
+        if (!font_warned_) {
+            font_warned_ = true;
+            lx::trace::logger::global().log_error(shaped.get_error(), k_canvas_category);
+            lx::trace::logger::global().log(lx::trace::level::warn, k_canvas_category,
+                                            "no text rendering: labels are not drawn");
+        }
+        return false;
+    }
+    line_text_ = utf8;
+    line_family_ = family;
+    line_font_ = font;
+    line_valid_ = true;
+    return true;
 }
 
 int lx::shell::shm_canvas::wrap(std::string_view text, std::span<const lx::text::text_span> spans,

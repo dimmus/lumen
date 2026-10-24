@@ -485,7 +485,8 @@ libwayland-client program (`lx.wayland.client` is still a stub; see ADR-005 Phas
   on `done` (or after 100 ms without one) the app starts as its own systemd user service
   (`StartTransientUnit`, `app-lumen-<id>@<random>.service`, `Type=exec`, `ExitType=cgroup`,
   `Slice=app.slice`, `CollectMode=inactive-or-failed`, the launch environment, the absolute
-  program path); below systemd 250 (`Manager.Version`, read once) as a double fork held
+  program path); below systemd 250 (`Manager.Version`, asked for without waiting when the bus opens;
+  a start refused with `PropertyReadOnly` before it answers is retried) as a double fork held
   before `execve` until it is in its transient scope `app-lumen-<id>-<random>.scope`; or,
   without systemd --user, by double fork + `setsid`. A `NoReply` is never retried by fork
   (systemd may still start the unit).

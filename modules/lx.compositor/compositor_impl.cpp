@@ -883,9 +883,9 @@ struct compositor_impl {
     unsigned deferred_head_ = 0;
     unsigned deferred_count_ = 0;
     bool warned_deferred_full_ = false;
-    shm_staging_ring shm_staging_{};
     shm_pixel_store shm_store_{};
-    /// GL path: transient staging, a block per in-flight update (see shm_upload_pool).
+    /// GL and Vulkan paths: transient staging, a block per in-flight update (see
+    /// shm_upload_pool).
     shm_upload_pool shm_pool_{};
     /// Staging blocks unused this long are unmapped; long enough to ride out a pause in
     /// an animation, short enough that an idle desktop holds none.
@@ -3090,14 +3090,14 @@ void compositor_impl::register_p0_globals() {
     p0_.lifecycle = &buffer_lifecycle_;
     // Exactly one staging strategy: the CPU path samples staged rows in place during the
     // composite, which a shared FIFO cannot keep alive that long (see shm_pixel_store).
-    // GL copies the pixels out during the drain, but still stages per texture: a global
-    // 8-slot ring starves as soon as one client commits more surfaces than that in a frame
-    // (a CSD client's subsurfaces alone do), and the dropped update never shows. GL uploads
-    // RGBA, so it wants the conversion. Vulkan keeps the ring.
+    // GL and Vulkan copy the pixels out during the drain, so their staging is a transient
+    // block per update (`shm_upload_pool`), mapped for it and unmapped after a second idle.
+    // A global ring of window-sized vectors that never shrank held seven 1080p frames
+    // (57 MiB) after the only client had gone.
     p0_.shm_pool = nullptr;
+    p0_.shm_regions = false;
     if (cpu_present_) {
         p0_.shm_store = &shm_store_;
-        p0_.shm_staging = nullptr;
         // Scanout is XR24, so keeping the client's channel order means an unscaled opaque
         // surface reaches the display with no conversion pass at all.
         p0_.shm_native_format = true;
@@ -3106,8 +3106,8 @@ void compositor_impl::register_p0_globals() {
         // the trip to the render thread: transient blocks sized by the damage they carry,
         // not a persistent window-sized copy per texture.
         p0_.shm_pool = &shm_pool_;
+        p0_.shm_regions = true;
         p0_.shm_store = nullptr;
-        p0_.shm_staging = nullptr;
         p0_.shm_native_format = false;
         // Where the driver takes BGRA rows at any stride, the client's buffer is uploaded
         // as it is: no staging copy and no swizzle on the UI thread. What is still staged
@@ -3120,7 +3120,8 @@ void compositor_impl::register_p0_globals() {
                                             "shm: uploaded from client memory (no staging)");
         }
     } else {
-        p0_.shm_staging = &shm_staging_;
+        // Vulkan uploads whole RGBA images.
+        p0_.shm_pool = &shm_pool_;
         p0_.shm_store = nullptr;
         p0_.shm_native_format = false;
     }
@@ -4804,10 +4805,9 @@ void compositor_impl::apply_texture_update(texture_update& update) {
         } else if (vulkan_present_) {
             applied = vk_compositor_.upload_rgba(update.texture_id, update.width,
                                                  update.height, update.pixels);
-            // The ring slot is free the moment the upload has been recorded.
-            shm_staging_.publish_consumed(update.shm_seq);
+            // The upload copied the pixels into the renderer's own staging.
+            shm_pool_.release(update.shm_pool_token);
         } else {
-            shm_staging_.publish_consumed(update.shm_seq);
             shm_store_.release(update.shm_token);
             shm_pool_.release(update.shm_pool_token);
         }

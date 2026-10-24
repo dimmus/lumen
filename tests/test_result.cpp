@@ -66,6 +66,46 @@ LUMEN_TEST(result_domain_from_code) {
     LUMEN_CHECK(r.get_error().domain == lx::error_domain::wayland);
 }
 
+// ── lx::sparse_slots ──────────────────────────────────────────────────────────
+
+namespace {
+struct rec {
+    int id = -1; // a non-zero default, like the tables it holds
+    bool used = false;
+};
+} // namespace
+
+LUMEN_TEST(sparse_slots_allocates_a_block_on_first_write_only) {
+    lx::sparse_slots<rec, 64> t;
+    LUMEN_CHECK(t.blocks_allocated() == 0);
+    const auto& c = t;
+    LUMEN_CHECK(c[40].id == -1 && !c[40].used); // an untouched block reads as defaults
+    LUMEN_CHECK(t.blocks_allocated() == 0);
+    t[40].used = true; // block 2 (slots 32..47)
+    t[40].id = 7;
+    LUMEN_CHECK(t.blocks_allocated() == 1);
+    LUMEN_CHECK(c[40].id == 7 && c[41].id == -1);
+}
+
+LUMEN_TEST(sparse_slots_iterates_the_allocated_blocks) {
+    lx::sparse_slots<rec, 64> t;
+    t[3].used = true;
+    t[50].used = true;
+    unsigned seen = 0;
+    unsigned used = 0;
+    for (auto& r : t) {
+        ++seen;
+        used += r.used ? 1u : 0u;
+    }
+    LUMEN_CHECK(seen == 32); // two blocks of 16
+    LUMEN_CHECK(used == 2);
+    unsigned none = 0;
+    const lx::sparse_slots<rec, 64> empty;
+    for (const auto& r : empty)
+        none += r.used ? 1u : 1u;
+    LUMEN_CHECK(none == 0);
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

@@ -241,7 +241,9 @@ private:
     surface_tree* tree_ = nullptr;
     scene::scene_graph* scene_ = nullptr;
     compositor_texture_ops ops_{};
-    slot slots_[k_max]{};
+    /// Allocated 16 slots at a time (`lx::sparse_slots`): a slot holds its frame node and a
+    /// 256-byte title, and the whole table was resident from start-up.
+    lx::sparse_slots<slot, k_max> slots_{};
     lx::toplevel_id active_{};
     unsigned next_texture_id_ = k_deco_title_texture_base;
     bool atlas_ready_ = false;
@@ -632,7 +634,9 @@ void lx::compositor::decoration_manager::log(std::format_string<Args...> fmt,
 
 lx::compositor::decoration_manager::slot*
 lx::compositor::decoration_manager::alloc(const toplevel_record& rec) {
-    for (auto& s : slots_) {
+    // By index: iteration skips blocks never allocated, where the free slots may be.
+    for (unsigned i = 0; i < slots_.size(); ++i) {
+        slot& s = slots_[i];
         if (s.used)
             continue;
         // The node stays where it is (it is not in any container now); only its state resets.

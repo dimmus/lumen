@@ -1210,7 +1210,6 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
     const auto img = s->ctx->surfaces->lookup(s->id);
 
     const unsigned char* shm_pixels = nullptr;
-    unsigned long long shm_seq = 0;
     unsigned long long shm_token = 0;
     unsigned long long shm_pool_token = 0;
     unsigned shm_direct = 0;
@@ -1222,7 +1221,7 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
         // what its other GL name missed) is copied and uploaded — in buffer pixels, so a
         // scaled, transformed or cropped client keeps partial uploads too.
         s->damage_history.record_rects(buffer_damage);
-        if (s->ctx->shm_pool) {
+        if (s->ctx->shm_pool && s->ctx->shm_regions) {
             shm_rects = shm_upload_damage(s->damage_history, buf->upload, s->id, buf->width,
                                           buf->height);
             shm_region = shm_rects.bounds();
@@ -1233,8 +1232,8 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
         shm_direct = direct_shm_upload(s->current.buffer, shm, buf, shm_region, shm_pixels,
                                        shm_stride);
         if (!shm_direct)
-            shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_region, shm_seq,
-                                          shm_token, shm_pool_token, &s->damage_history, s->id);
+            shm_pixels = stage_shm_pixels(buf, shm, img.image_id, shm_region, shm_token,
+                                          shm_pool_token, &s->damage_history, s->id);
         if (!shm_pixels) {
             // Nothing reached the texture, so the next upload of this buffer cannot assume
             // this one did (the store's slots carry their own stamps; the GL path counts).
@@ -1291,7 +1290,6 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
         } else if (buf->is_shm && shm_pixels) {
             update.kind = texture_update::op::shm;
             update.pixels = shm_pixels;
-            update.shm_seq = shm_seq;
             update.shm_token = shm_token;
             update.shm_pool_token = shm_pool_token;
             update.format = shm_format;

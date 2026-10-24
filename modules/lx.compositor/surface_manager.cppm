@@ -297,12 +297,13 @@ private:
 
     lx::gfx::dmabuf_import_cache* import_cache_ = nullptr;
     lx::scene::scene_graph* scene_ = nullptr;
-    surface_entry surfaces_[k_max_surfaces]{};
+    /// Allocated 16 entries at a time as surfaces appear (`lx::sparse_slots`).
+    lx::sparse_slots<surface_entry, k_max_surfaces> surfaces_{};
     id_slot_index<k_max_surfaces * 2> index_{};
     bool layout_changed_ = false;
     bool warned_container_full_ = false;
     bool render_thread_import_ = false;
-    buffer_entry buffers_[k_max_buffers]{};
+    lx::sparse_slots<buffer_entry, k_max_buffers> buffers_{};
     /// Compositor-assigned texture ids (shm, render-thread dma-buf) live in a space disjoint
     /// from import-cache ids.
     unsigned next_shm_texture_id_ = 0x4000'0000u;

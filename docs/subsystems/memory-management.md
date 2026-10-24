@@ -53,9 +53,10 @@ pool that was actually full (a 64 MiB staging budget would hide a 100 % used fra
 shm pixels are copied at commit (the client may reuse its buffer at once) and consumed on
 the render thread — except on GL with client-memory uploads (`shm_direct_uploads`), where
 nothing is staged and the client's buffer is held until the render thread has read it.
-GL otherwise: `shm_upload_pool` — transient mmap'd blocks sized by the buffer-age
-region, returned right after the upload, unmapped after 1 s idle; an idle desktop holds
-none. CPU: `shm_pixel_store` — the staged rows are the texture, freed by `collect` once a
+GL otherwise, and Vulkan: `shm_upload_pool` — transient mmap'd blocks (sized by the
+buffer-age region on GL, the whole image on Vulkan), returned right after the upload,
+unmapped after 1 s idle; an idle desktop holds none, and no more than 64 MiB is staged and
+not yet uploaded. CPU: `shm_pixel_store` — the staged rows are the texture, freed by `collect` once a
 retired texture's slots are no longer sampled. Both are reported as `memory_pool::staging`.
 See rendering-performance.md, SHM staging, for why per-texture staging used to grow
 without bound.
@@ -72,6 +73,25 @@ The other heap leak found with heaptrack: on GPU paths the commit path still cop
 shm buffer into the headless software backend, whose table was keyed by never-repeating
 texture ids and never pruned — 60 MB over a 30-resize run. The headless backend is now
 handed to the protocols only when it is the present path, and retired textures are erased.
+
+### Fixed tables
+
+The compositor's per-object tables keep fixed capacities, so their indices stay stable and
+nothing reallocates on the frame path. They are `lx::sparse_slots<T, N>` (`lx.foundation`):
+storage comes in blocks of 16 slots, allocated on first write. A desktop with a dozen windows
+touches a block or two. Before this, every table was fully resident from start-up, about
+1 MB together. The tables converted are:
+
+- toplevels and popups;
+- the surface tree;
+- decorations;
+- surfaces and buffers.
+
+Iteration visits allocated blocks only. Toplevel lookups by id and by surface go through an
+`id_slot_index`, not a scan.
+
+`lx::spsc_queue` leaves its slots unconstructed until pushed. Its storage is written lazily,
+so an idle queue's pages are never touched.
 
 Register handler via `memory_budget_coordinator::set_pressure_handler`.
 
