@@ -100,6 +100,8 @@ void lx::ui::reconciler::reconcile_children(ui_node& parent, const element& desi
     // freeing a node that a keyed descriptor is about to claim.
     ui_node* pool[ui_node::k_max_children]{};
     const unsigned pooled = parent.detach_children(pool, ui_node::k_max_children);
+    // The span grows here, once, when the count does; a steady rebuild reuses it.
+    parent.reserve_children(wanted);
 
     for (unsigned i = 0; i < wanted; ++i) {
         child want = desired.children ? desired.children[i] : nullptr;

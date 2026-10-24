@@ -634,14 +634,35 @@ one focused developer; it is an ordering aid, not a commitment.
 - Gate: G3 and G10 on GL and CPU here; Vulkan parity on lavapipe.
 
 As built: G10 is met on CPU, GL and Vulkan (lavapipe), and G3's ≤ 8 draws and ≤ 800 KB
-hold (one draw, 800 080 B). **G3's CPU time is open**: S3's emit + order + encode is
-1.13 ms p50 / 2.42 ms p95 with `--backend none` (the committed baseline,
-tests/bench/baseline/iritur-none.json, records `"G3": "fail"`) and 1.44–1.55 ms p50 beside
-the GL backend, against ≤ 1.0 ms. Emit is two thirds of it (0.83 ms p50). Phase 1 closed
-with the gate open; closing it — the per-quad cost of the emit path, `draw_scope` →
-`draw_list::push_quad`, since every S3 quad moves every frame and caching does not apply —
-is carried into Phase 2, whose gate does not count as green until G3 is.
-`scripts/ui-bench.sh` warns on every run while the gate fails in the baseline too.
+hold (one draw, 800 080 B). G3's CPU time closed at 1.13 ms p50 / 2.42 ms p95 with
+`--backend none`. Emit was two thirds of that (0.83 ms p50), and was carried into Phase 2.
+
+The Phase 2 pass on emit, order and encode measured each change A/B, interleaved, on this
+host (2 vCPU, bench pinned to CPU 1, `setarch -R`, the 1 ms frame clock), with load
+checked before each run. S3, µs, median over the rounds:
+
+| Change | emit+order+encode p50 / p95 | emit | order | encode | layout |
+|--------|----------------------------|------|-------|--------|--------|
+| Phase 1 (inline 64-slot child array, 640 B nodes) | 1220–1437 / 2372–3327 | 870 | 115 | 150 | 420 |
+| Child pointers out of line (pooled spans) | 800 / 1600 | 470 | 123 | 125 | 160 |
+| Inline `orders()`, one-cell `order_grid::assign`, `push_quad` | 700 / 1400 | 375 | 123 | 140 | 170 |
+| One kind on one page, no surface: one batch in push order, no sort | 524 / 1289 | 381 | 31 | 102 | 168 |
+| Instance written in place (`append_quad`), clip floats cached per scope | 482 / 1097 | 346 | 31 | 97 | 168 |
+| Inline 2 × 2-cell grid path; stream aliases the push order, no copy | 459 / 1091 | 330 | 18 | 98 | 162 |
+| Nodes and spans from one retained-tree pool | 451 / 1161 | 324 | 18 | 95 | 146 |
+
+Two things tried and dropped, for no gain: an inline `draw_scope::quad`, and
+non-temporal stores in `encode_instances`. The second saved 14 µs, but only on the bench's
+own copy (the backends gather through `ui_encode`).
+
+**G3 p95 still fails on this host under the frame clock**: p50 is about 0.45 ms, p95 1.05–1.16 ms.
+p95 runs about 2.4× p50 on every stage, including the bench's compute-only `update`, so
+the gap is host jitter: the vCPU sleeps between frames and wakes with cold caches. It is
+not one slow path. Without the clock (`--period-us 0`) S3 is 0.40 ms p50 / 0.82 ms p95,
+which passes. Warm, the emit costs 18 ns per quad at 1 000–3 000 quads and 26 ns at
+10 000, once the working set (≈ 1.4 MB of nodes, 800 KB of instances, 800 KB of ring)
+outgrows what the host leaves of the L3. The baseline was not refreshed with these
+numbers, so `scripts/ui-bench.sh` still warns while the gate fails in both.
 
 ### Phase 2 — Text (≈3 weeks)
 

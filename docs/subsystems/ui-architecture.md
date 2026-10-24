@@ -40,7 +40,7 @@ the whole point.
 | | Descriptor (`element`) | Retained node (`ui_node`) |
 |--|------------------------|---------------------------|
 | Lifetime | One rebuild | Until the tree shape changes |
-| Storage | UI frame arena | Heap, via `construct` |
+| Storage | UI frame arena | Retained-tree pool, via `construct` |
 | Contents | Props by value, child pointers | Geometry, scroll offset, caret, animation phase |
 | Identity | `type` + `key` | Same `type` + `key`, matched against descriptors |
 | Destructor | None — trivially discarded | Virtual; owns its children |
@@ -52,6 +52,22 @@ allocation per node and the arena reset at the end of the frame reclaims everyth
 node calls `new` and happens **only when the tree shape changes** — a node appears,
 disappears, or changes type. Steady-state animation and state updates reuse every node
 and allocate nothing but arena bytes.
+
+**Node storage.** A node holds its own fields and a pointer to its children, nothing
+more. The child pointers live out of line in a span of 1, 2, 4 … `k_max_children` (64)
+slots, taken when the child count first needs it and grown only when the count outgrows
+it (the reconciler reserves the count it is about to fill, once). Nodes and spans both come
+from one UI-affinity pool (`ui_node::operator new`, 16-byte size classes up to 512 B, 64 KB
+chunks, a free list per class). A freed block is the next one of its size, so a reshaped
+tree recycles storage. Fresh blocks are carved in the order the reconciler takes them —
+node, span, first child … — which is the order layout and emit walk the tree: one dense
+run with no allocator headers between nodes. The pool never returns chunks; it holds the
+peak tree. A node type must not be over-aligned (more than 16 bytes).
+
+The inline 64-slot array this replaced made every node 640 B whatever its fan-out: S3's
+10 651 nodes came to about 7 MB against this host's 4 MB L3, and 82 % of the emit samples
+stalled on a node's first field. Out of line, S3's drifting quad is 128 B and the tree
+about 1.4 MB; emit fell 45 % and layout 62 % (p50, ADR-010 §7).
 
 ---
 
