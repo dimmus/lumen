@@ -394,6 +394,20 @@ untouched (`surface` and solid `quad`). `compositor_impl.cpp:8574-8593` stops co
 `draw_command` to `blit_command`: the backends take the stream. The visibility pass keeps
 treating only radius-0, alpha-1 quads as occluders.
 
+As built in Phase 1 (`lx.compositor:ui_composite`, rendering-performance.md §6 "UI primitives
+in the compositor"): `frame_node`'s border and title fills are quads (the same rects and
+colours as the swatch blits, pixel-identical on the CPU compositor); the title and close
+button are still blits, and no shadow or rounding was added (a visual change, after Phase 2).
+A snapshot without primitives keeps the blit conversion and the backends' old calls
+unchanged; with primitives, CPU and GLES 3.1 draw the stream through `:ui_cpu` / `:ui_gl` in
+the compositor's target and damage. The Vulkan composite, GLES 2 contexts and screen
+capture's re-composites take the stream *lowered* to blits (`gfx::lower_to_blits`: solid
+square quads become solid blits, other primitives are dropped, counted and warned about):
+`:ui_vk` does not yet record into `vulkan_compositor`'s linear F16 pass — that, with
+linear instance colours, is the remaining step for primitives that do not lower. Occluders
+are quads that lower (radius 0, borderless, one colour, integral rects) at alpha 1;
+primitives are never culled.
+
 ### 4.12 Threads and allocation
 
 | Work | Affinity | Allocation |

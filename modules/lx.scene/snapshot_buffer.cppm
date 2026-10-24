@@ -151,6 +151,24 @@ public:
     [[nodiscard]] std::span<const lx::gfx::underline_instance> underline_instances() const {
         return {underlines_.items, underlines_.count};
     }
+    /// The primitives in push order (their kind and index into the typed arrays; the sorted
+    /// stream is `refs()`), and per primitive how many draw commands had been pushed before
+    /// it: where it sits in paint order among the surfaces, for the visibility pass
+    /// (`scene::mark_occlusion`).
+    [[nodiscard]] std::span<const lx::gfx::primitive_ref> pushed_primitives() const {
+        return {refs_, primitive_count_};
+    }
+    [[nodiscard]] std::span<const std::uint32_t> primitive_draw_positions() const {
+        return {ref_draw_pos_, primitive_count_};
+    }
+    /// Turns every primitive emitted into a `content` sized space into the pixels of an
+    /// output of transform `t` (`scene_graph::build_draw_list_into` for a turned output, ADR
+    /// 008 §C.4, as it turns the draw commands): bounds and clip of every kind and the
+    /// stream's bounds, and for quads and shadows the per-corner radii and per-edge border
+    /// widths, permuted to the corners and edges they land on, and a gradient's angle. A
+    /// sprite's tile and an underline's direction are not turned (Phase 2 text). UI affinity,
+    /// before `batch_for_render`; no allocation.
+    void transform_primitives(lx::buffer_transform t, lx::size2i content);
 
 private:
     friend class snapshot_buffer;
@@ -213,6 +231,8 @@ private:
     /// disturbed, so `batch_for_render` can run again on the same list.
     lx::gfx::primitive_ref* refs_ = nullptr;
     lx::rect2i* ref_bounds_ = nullptr;
+    /// Per primitive (`refs_[0, primitive_count_)`): `count_` when it was pushed.
+    std::uint32_t* ref_draw_pos_ = nullptr;
     std::uint64_t* ref_keys_ = nullptr;
     std::uint64_t* ref_keys_swap_ = nullptr;
     lx::gfx::primitive_ref* sorted_ = nullptr;
@@ -379,6 +399,7 @@ lx::scene::draw_list::~draw_list() {
     delete[] cmd_orders_;
     delete[] refs_;
     delete[] ref_bounds_;
+    delete[] ref_draw_pos_;
     delete[] ref_keys_;
     delete[] ref_keys_swap_;
     delete[] sorted_;
@@ -543,14 +564,19 @@ void lx::scene::draw_list::ensure_ref_capacity(unsigned need) {
         return;
     auto* refs = new lx::gfx::primitive_ref[new_cap];
     auto* bounds = new lx::rect2i[new_cap];
+    auto* positions = new std::uint32_t[new_cap];
     for (unsigned i = 0; i < ref_count_; ++i) {
         refs[i] = refs_[i];
         bounds[i] = ref_bounds_[i];
     }
+    for (unsigned i = 0; i < primitive_count_; ++i)
+        positions[i] = ref_draw_pos_[i];
     delete[] refs_;
     delete[] ref_bounds_;
+    delete[] ref_draw_pos_;
     refs_ = refs;
     ref_bounds_ = bounds;
+    ref_draw_pos_ = positions;
     // Sort scratch and output hold nothing between calls.
     delete[] ref_keys_;
     delete[] ref_keys_swap_;
@@ -709,6 +735,7 @@ void lx::scene::draw_list::push_ref(lx::gfx::primitive_kind kind, std::uint8_t p
     ensure_ref_capacity(primitive_count_ + 1);
     refs_[primitive_count_] = {order, kind, page, 0, index};
     ref_bounds_[primitive_count_] = bounds;
+    ref_draw_pos_[primitive_count_] = count_;
     ++primitive_count_;
     ref_count_ = primitive_count_;
 }
@@ -959,6 +986,116 @@ std::size_t lx::scene::draw_list::encode_instances(std::span<std::byte> ring,
         off += bytes;
     }
     return off;
+}
+
+namespace {
+
+/// `gfx::transform_rect` for an x, y, w, h float rect (an empty one stays as it is: a clip
+/// of zero size is no mask).
+void lx_scene_transform_rectf(float* r, lx::buffer_transform t, int width, int height) {
+    if (!(r[2] > 0.f) || !(r[3] > 0.f))
+        return;
+    const lx::gfx::source_basis b = lx::gfx::source_basis_for(t);
+    const bool turned = b.dx[0] == 0.f;
+    const double fw = turned ? height : width;
+    const double fh = turned ? width : height;
+    const auto map = [&](double x, double y, double& ox, double& oy) {
+        ox = b.origin[0] * fw + b.dx[0] * x + b.dy[0] * y;
+        oy = b.origin[1] * fh + b.dx[1] * x + b.dy[1] * y;
+    };
+    double ax = 0, ay = 0, bx = 0, by = 0;
+    map(r[0], r[1], ax, ay);
+    map(static_cast<double>(r[0]) + r[2], static_cast<double>(r[1]) + r[3], bx, by);
+    r[0] = static_cast<float>(ax < bx ? ax : bx);
+    r[1] = static_cast<float>(ay < by ? ay : by);
+    r[2] = static_cast<float>(ax < bx ? bx - ax : ax - bx);
+    r[3] = static_cast<float>(ay < by ? by - ay : ay - by);
+}
+
+/// Where each content-space corner (top-left, top-right, bottom-right, bottom-left) of a
+/// box lands under `t`, as an output corner index in the same order.
+void lx_scene_corner_map(lx::buffer_transform t, unsigned* to) {
+    const lx::gfx::source_basis b = lx::gfx::source_basis_for(t);
+    // The unit square's corners through the linear part; which output corner each is follows
+    // from its signs relative to the square's mapped centre.
+    static constexpr float cx[4] = {0.f, 1.f, 1.f, 0.f};
+    static constexpr float cy[4] = {0.f, 0.f, 1.f, 1.f};
+    for (unsigned k = 0; k < 4; ++k) {
+        const float ox = b.dx[0] * (cx[k] - 0.5f) + b.dy[0] * (cy[k] - 0.5f);
+        const float oy = b.dx[1] * (cx[k] - 0.5f) + b.dy[1] * (cy[k] - 0.5f);
+        const bool right = ox > 0.f;
+        const bool bottom = oy > 0.f;
+        to[k] = !bottom ? (right ? 1u : 0u) : (right ? 2u : 3u);
+    }
+}
+
+/// Edge `e` (top, right, bottom, left) runs from corner `e` to corner `e + 1`: the output
+/// edge between the corners those land on.
+[[nodiscard]] unsigned lx_scene_edge_of(unsigned a, unsigned b) {
+    const unsigned lo = a < b ? a : b;
+    const unsigned hi = a < b ? b : a;
+    if (lo == 0 && hi == 3)
+        return 3u; // bottom-left → top-left: the left edge
+    return lo;     // {0,1} top, {1,2} right, {2,3} bottom
+}
+
+} // namespace
+
+void lx::scene::draw_list::transform_primitives(lx::buffer_transform t, lx::size2i content) {
+    if (t == lx::buffer_transform::normal || primitive_count_ == 0 || content.width <= 0 ||
+        content.height <= 0)
+        return;
+    const int w = content.width;
+    const int h = content.height;
+    unsigned corner[4]{};
+    lx_scene_corner_map(t, corner);
+    unsigned edge[4]{};
+    for (unsigned e = 0; e < 4; ++e)
+        edge[e] = lx_scene_edge_of(corner[e], corner[(e + 1) % 4]);
+    const lx::gfx::source_basis b = lx::gfx::source_basis_for(t);
+    const auto permute = [](std::uint16_t* v, const unsigned* to) {
+        std::uint16_t in[4] = {v[0], v[1], v[2], v[3]};
+        for (unsigned k = 0; k < 4; ++k)
+            v[to[k]] = in[k];
+    };
+    for (unsigned i = 0; i < quads_.count; ++i) {
+        lx::gfx::quad_instance& q = quads_.items[i];
+        lx_scene_transform_rectf(q.bounds, t, w, h);
+        lx_scene_transform_rectf(q.clip, t, w, h);
+        permute(q.radii, corner);
+        permute(q.border_widths, edge);
+        bool gradient = false;
+        for (unsigned k = 0; k < 4; ++k)
+            gradient = gradient || q.background[k] != q.background_end[k];
+        if (gradient) {
+            // The direction (cos θ, sin θ) through the linear part of the map.
+            const float rad = lx::gfx::from_half(q.gradient_angle) * 3.14159265358979323846f / 180.f;
+            const float vx = std::cos(rad);
+            const float vy = std::sin(rad);
+            const float ox = b.dx[0] * vx + b.dy[0] * vy;
+            const float oy = b.dx[1] * vx + b.dy[1] * vy;
+            float deg = std::atan2(oy, ox) * 180.f / 3.14159265358979323846f;
+            if (deg < 0.f)
+                deg += 360.f;
+            q.gradient_angle = lx::gfx::to_half(deg);
+        }
+    }
+    for (unsigned i = 0; i < shadows_.count; ++i) {
+        lx::gfx::shadow_instance& sh = shadows_.items[i];
+        lx_scene_transform_rectf(sh.bounds, t, w, h);
+        lx_scene_transform_rectf(sh.clip, t, w, h);
+        permute(sh.radii, corner);
+    }
+    for (unsigned i = 0; i < sprites_.count; ++i) {
+        lx_scene_transform_rectf(sprites_.items[i].bounds, t, w, h);
+        lx_scene_transform_rectf(sprites_.items[i].clip, t, w, h);
+    }
+    for (unsigned i = 0; i < underlines_.count; ++i) {
+        lx_scene_transform_rectf(underlines_.items[i].bounds, t, w, h);
+        lx_scene_transform_rectf(underlines_.items[i].clip, t, w, h);
+    }
+    for (unsigned i = 0; i < primitive_count_; ++i)
+        ref_bounds_[i] = lx::gfx::transform_rect(ref_bounds_[i], t, w, h);
 }
 
 unsigned lx::scene::draw_list::size() const { return count_; }

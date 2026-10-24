@@ -75,6 +75,15 @@ struct output_projection {
 /// untouched. `shown[i]`, when given, receives whether draw `i` reaches the screen (not
 /// occluded). Returns the number of draws marked. O(draws × 8), no allocation.
 unsigned mark_occlusion(std::span<draw_command> draws, lx::rect2i output, bool* shown);
+/// The same pass over a draw list that carries UI primitives (ADR-010 §4.11; the first
+/// `k_max_draw_commands` draws). A quad that is a solid rectangle on whole pixels
+/// (`gfx::quad_lowers_to_blit`: radius 0, borderless, one colour, integral bounds and clip)
+/// at alpha 1 hides the draws pushed before it, exactly like an opaque draw — the only
+/// primitive that may: it is drawn identically by every backend, the lowered paths too.
+/// Primitives themselves are never marked: they are drawn wherever the damage reaches them,
+/// so no surface hides one in a way that could change a pixel. A list without primitives
+/// takes the span overload's path unchanged.
+unsigned mark_occlusion(draw_list& list, lx::rect2i output, bool* shown);
 
 /// What `emit_draws` needs to place a node: the output projection, and the logical point
 /// its tree rounds edges relative to (a window's root surface origin) when it has one.
@@ -844,16 +853,63 @@ namespace {
            d.transform.m3 == 1.f;
 }
 
-} // namespace
+/// The pixels a quad covers at full coverage, if it may occlude (see `mark_occlusion`).
+[[nodiscard]] bool lx_scene_quad_occluder(const lx::gfx::quad_instance& q, lx::rect2i& out) {
+    if (!lx::gfx::quad_lowers_to_blit(q) || q.background[3] != lx::gfx::to_half(1.f))
+        return false;
+    lx::rect2i r{static_cast<int>(q.bounds[0]), static_cast<int>(q.bounds[1]),
+                 static_cast<int>(q.bounds[2]), static_cast<int>(q.bounds[3])};
+    if (q.clip[2] > 0.f && q.clip[3] > 0.f)
+        r = intersect(r, {static_cast<int>(q.clip[0]), static_cast<int>(q.clip[1]),
+                          static_cast<int>(q.clip[2]), static_cast<int>(q.clip[3])});
+    out = r;
+    return r.width > 0 && r.height > 0;
+}
 
-unsigned lx::scene::mark_occlusion(std::span<draw_command> draws, lx::rect2i output, bool* shown) {
+unsigned lx_scene_mark_occlusion(std::span<lx::scene::draw_command> draws,
+                                 std::span<const lx::gfx::primitive_ref> prims,
+                                 std::span<const std::uint32_t> prim_pos,
+                                 std::span<const lx::gfx::quad_instance> quads, lx::rect2i output,
+                                 bool* shown) {
+    using lx::scene::draw_command;
     constexpr unsigned k_max_occluders = 8;
     lx::rect2i occluders[k_max_occluders]{};
     long long areas[k_max_occluders]{};
     unsigned n = 0;
     unsigned marked = 0;
     const bool bounded = output.width > 0 && output.height > 0;
+    const auto add_occluder = [&](lx::rect2i r) {
+        const long long area = static_cast<long long>(r.width) * r.height;
+        if (n < k_max_occluders) {
+            occluders[n] = r;
+            areas[n] = area;
+            ++n;
+            return;
+        }
+        // Full: the eight largest are kept — they hide the most.
+        unsigned smallest = 0;
+        for (unsigned k = 1; k < n; ++k)
+            if (areas[k] < areas[smallest])
+                smallest = k;
+        if (area > areas[smallest]) {
+            occluders[smallest] = r;
+            areas[smallest] = area;
+        }
+    };
+    // Primitives above draw `i` are those pushed after it: walked top-down beside the draws.
+    std::size_t prim = prims.size() < prim_pos.size() ? prims.size() : prim_pos.size();
     for (std::size_t i = draws.size(); i-- > 0;) {
+        for (; prim > 0 && prim_pos[prim - 1] > i; --prim) {
+            const lx::gfx::primitive_ref& ref = prims[prim - 1];
+            lx::rect2i q{};
+            if (ref.kind != lx::gfx::primitive_kind::quad || ref.index >= quads.size() ||
+                !lx_scene_quad_occluder(quads[ref.index], q))
+                continue;
+            if (bounded)
+                q = intersect(q, output);
+            if (q.width > 0 && q.height > 0)
+                add_occluder(q);
+        }
         draw_command& d = draws[i];
         lx::rect2i r = d.dst;
         if (d.clip.width > 0 && d.clip.height > 0)
@@ -873,31 +929,30 @@ unsigned lx::scene::mark_occlusion(std::span<draw_command> draws, lx::rect2i out
         }
         if (!covers_opaquely(d))
             continue;
-        const long long area = static_cast<long long>(r.width) * r.height;
-        if (n < k_max_occluders) {
-            occluders[n] = r;
-            areas[n] = area;
-            ++n;
-            continue;
-        }
-        // Full: the eight largest are kept — they hide the most.
-        unsigned smallest = 0;
-        for (unsigned k = 1; k < n; ++k)
-            if (areas[k] < areas[smallest])
-                smallest = k;
-        if (area > areas[smallest]) {
-            occluders[smallest] = r;
-            areas[smallest] = area;
-        }
+        add_occluder(r);
     }
     return marked;
 }
 
+} // namespace
+
+unsigned lx::scene::mark_occlusion(std::span<draw_command> draws, lx::rect2i output, bool* shown) {
+    return lx_scene_mark_occlusion(draws, {}, {}, {}, output, shown);
+}
+
+unsigned lx::scene::mark_occlusion(draw_list& list, lx::rect2i output, bool* shown) {
+    const unsigned n = list.size() < k_max_draw_commands ? list.size() : k_max_draw_commands;
+    return lx_scene_mark_occlusion({list.data(), n}, list.pushed_primitives(),
+                                   list.primitive_draw_positions(), list.quad_instances(), output,
+                                   shown);
+}
+
 void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    // The order grid covers the view's pixels (empty: unbounded), the space draws land in
-    // after projection and any output transform.
-    out.begin(view_config(slot).projection.size);
+    // The order grid covers the space emitters draw in (empty: unbounded): the view's
+    // pixels, or a turned output's content space (sizes swapped) — orders compare what
+    // overlaps there, the same overlaps once turned.
+    out.begin(content_size(view_config(slot).projection));
     emit_context ctx{};
     ctx.projection = view_config(slot).projection;
     ctx.view = slot;
@@ -937,6 +992,7 @@ void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot)
             d[i].clip = lx::gfx::transform_rect(d[i].clip, t, c.width, c.height);
         d[i].buffer_xform = lx::gfx::compose_output_transform(d[i].buffer_xform, t);
     }
+    out.transform_primitives(t, c);
 }
 
 bool lx::scene::scene_graph::commit_frame(unsigned slot, unsigned frame_index) {
@@ -960,7 +1016,7 @@ bool lx::scene::scene_graph::commit_frame(unsigned slot, unsigned frame_index) {
     const unsigned n = draws.size() < k_max_draw_commands ? draws.size() : k_max_draw_commands;
     const output_projection& p = v.config.projection;
     const lx::rect2i output{0, 0, p.size.width, p.size.height};
-    v.last_culled = mark_occlusion({draws.data(), n}, output, shown_);
+    v.last_culled = mark_occlusion(draws, output, shown_);
     for (unsigned i = 0; i < n; ++i)
         if (shown_[i] && emitters_[i])
             emitters_[i]->on_shown(frame_index, slot);

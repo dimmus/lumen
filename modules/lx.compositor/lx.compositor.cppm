@@ -51,6 +51,7 @@ export import :foreign_registry;
 export import :pointer_constraints;
 export import :capture;
 export import :capture_engine;
+export import :ui_composite;
 export import :control;
 
 export namespace lx::compositor {

@@ -1160,6 +1160,14 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
                         ++stats.primitives_skipped;
                         continue;
                     }
+                    // Refs naming consecutive draws (the compositor's windows, in paint
+                    // order) go through one call: the same pixels, one state setup and one
+                    // flush for the run.
+                    unsigned run = 1;
+                    while (i + run < end && i + run < stream.refs.size() &&
+                           stream.refs[i + run].index == index + run &&
+                           index + run < stream.surfaces.size())
+                        ++run;
                     damage_region one{};
                     one.rects[0] = rect;
                     one.count = 1;
@@ -1170,8 +1178,9 @@ lx::result<lx::gfx::ui_gl_draw_stats> lx::gfx::ui_gl_renderer::draw(
                         glBindBuffer(GL_ARRAY_BUFFER, 0);
                     }
                     auto drawn = compositor_->composite_into(framebuffer, width, height, {},
-                                                             &stream.surfaces[index], 1, one,
-                                                             false, false);
+                                                             &stream.surfaces[index], run, one,
+                                                             false, false, false);
+                    i += run - 1;
                     bind_state();
                     glScissor(rect.x, rect.y, rect.width, rect.height);
                     glEnable(GL_BLEND);

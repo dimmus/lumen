@@ -293,22 +293,22 @@ commit-timing target arms a stopped clock for exactly the tick that presents it 
 desktop with a timed update wakes once). See [architecture.md](../architecture.md) "Explicit
 sync, buffer readiness and the commit-path protocols".
 
-### Server-side frames: no new draw type
+### Server-side frames: quad primitives and atlas blits
 
-A window frame (`lx.compositor:decoration`) is drawn with the existing textured-quad path on
-every backend: there is no solid-fill draw, and none was added. Border and title fills
-stretch the centre 2x2 of a 4x4 colour swatch in one 64x64 atlas texture (the GL path's
-half-texel inset keeps linear filtering inside the swatch; CPU nearest sampling is exact),
-with `blend_mode::opaque`, so the CPU occlusion cull and the GL blend-off path still apply.
-Colours are baked into the swatches rather than produced by `tint`, whose encoding semantics
-would have to be proven identical on GL, CPU and Vulkan. The title is one premultiplied
-texture per window and focus colour, rasterized on the UI thread by `lx.text` when the title
-changes or its ellipsis cut moves (≈0.1–0.3 ms, not per frame); a focus change swaps the
-texture id, a move or a resize that keeps the cut costs no texture work. 7–8 draws per
-decorated window. Title texture ids are allocated upward and never reused, so a dated
-retirement can never drop a later texture that happened to get the same id. Damage is the
-frame's four strips (title bar plus borders, old and new apart), never the client area,
-which the window's own nodes account for; a hover or press repaints the close button only.
+A window frame (`lx.compositor:decoration`) emits its four border fills and its title fill
+as UI **quad primitives** (ADR-010 §4.11): radius 0, no border, one colour, on the projected
+whole-pixel rects the swatch blits used to cover — so the pixels are those of the blits (the
+CPU compositor at scale 1 and 1.25 is pixel-identical in every frame state,
+`test_decoration_geometry`). Colours are the palette's sRGB bytes as encoded values; a
+dimmed (not-responding) frame carries the dim already applied with `cpu_compositor`'s byte
+rule (`(c · 166) >> 8`), so no `tint` is involved. The title text and the close button
+(glyph, circle on hover) stay blits of the 64x64 atlas and of one premultiplied texture per
+window and focus colour, rasterized on the UI thread by `lx.text` when the title changes or
+its ellipsis cut moves (≈0.1–0.3 ms, not per frame). Title texture ids are allocated upward
+and never reused, so a dated retirement can never drop a later texture that happened to get
+the same id. Damage is unchanged: the frame's four strips (title bar plus borders, old and
+new apart), never the client area; a hover or press repaints the close button only. No
+shadow and no rounded corner yet — a visual change, left for after Phase 2 text.
 
 ### Screen capture: copies ride the composite
 
@@ -549,9 +549,11 @@ multiplies per draw in `project_node`, none per pixel; nothing allocates.
 
 - Up to **eight opaque rects** are kept, seeded from draws that cover their destination with
   full alpha: `blend_mode::opaque` (a format without alpha or an opaque region over the whole
-  buffer), opacity and tint alpha 1, translation only. When more are found the eight largest
-  stay. A draw inside one of them, or outside the output, is marked `occluded`; GL, Vulkan
-  and CPU skip it (`draws_culled`). The pixels are identical, so damage and buffer age are
+  buffer), opacity and tint alpha 1, translation only. A UI quad that is a solid square on
+  whole pixels at alpha 1 (a decoration fill) seeds one too, at its place in paint order; no
+  primitive is ever marked (§6, UI primitives in the compositor). When more are found the
+  eight largest stay. A draw inside one of them, or outside the output, is marked
+  `occluded`; GL, Vulkan and CPU skip it (`draws_culled`). The pixels are identical, so damage and buffer age are
   untouched — what is saved is the GPU fill of windows under a maximized one.
 - Cost: O(draws × 8) compares per published frame, a parallel `scene_node*`/`bool` scratch
   array of `k_max_draw_commands` in the scene graph (no allocation), one virtual call per
@@ -763,6 +765,71 @@ which `ui_vk` does not write to disk), so the warm start is untested on a cachin
 are labelled `vulkan-software` and scripts/ui-bench.sh neither compares them nor makes them a
 baseline. No `operator new` in a steady frame; lavapipe's own threads move `mallinfo2` by
 0.2–1.2 KB per run.
+
+### UI primitives in the compositor (ADR-010 §4.11)
+
+`lx.compositor:ui_composite` (`frame_painter`) is what `composite_output` calls per output
+frame:
+
+- **No primitive in the snapshot** (no decorated window on the output): the draw commands
+  become blits in draw order and go to `cpu_compositor::composite_region`,
+  `gl_compositor::composite_into` (the call `composite_region` makes) or
+  `vulkan_compositor::composite` — the path as it was, and no primitive renderer, grid or
+  stream is touched (`test_ui_composite` compares the bytes and counts the renderer's frames).
+- **With primitives**, CPU and GL draw the snapshot's sorted stream with `:ui_cpu` /
+  `:ui_gl` into the same scanout target and damage rects: runs of `surface` refs through the
+  compositor's own blit code (`cpu_compositor::blend`, `gl_compositor::composite_into` with
+  no flush — one submit at the end, fenced by `gl_compositor::fence_frame`), primitive
+  batches through the UI renderer, in stream order. Both renderers are made when the backend
+  starts (`ui_gl` programs from the binary cache, warmed with one quad on SVGA3D).
+- **Without a primitive renderer** — a GLES 2 context (`egl_device` asks for 3.1 and falls
+  back to 2.0), the Vulkan composite, screen capture's re-composites and the headless dump —
+  the stream is lowered (`gfx::lower_to_blits`): a solid square quad on whole pixels becomes
+  a solid blit, anything else is dropped and counted, with one warning per run of frames that
+  drop. Decorations need nothing else, so every backend draws them. On Vulkan the solid blits
+  are decoded and drawn inside the linear F16 pass like any solid draw; `:ui_vk` recording
+  into that pass (with linear instance colours) is the follow-up for primitives that do not
+  lower.
+- **Colour space.** Primitive colours are premultiplied and sRGB-encoded (ADR-010 §4.5);
+  `:ui_cpu` and `:ui_gl` blend them in that space, as a client window does, while the CPU
+  compositor blends *surfaces* in linear light through its tables and the GL one in encoded
+  space. Opaque square chrome never blends, so it is the same colour on all three.
+- **Visibility.** Only a quad that lowers to a blit (radius 0, borderless, one colour,
+  integral bounds and clip) at alpha 1 occludes the draws under it — it is drawn identically
+  on every path. Primitives are never culled: they draw wherever damage reaches them.
+- **Turned outputs.** The order grid covers the content space emitters draw in; after
+  emission `draw_list::transform_primitives` turns bounds, clips, per-corner radii and
+  per-edge borders (and a gradient's angle) with the draws.
+
+Render-thread cost per frame, `bench_ui_composite` (1920×1080, solid background, six
+overlapping 480×320 windows, each with its frame when decorated; `paint_cpu` / `paint_gl`
+on published snapshots as `composite_output` calls them — the compositor's virtual outputs
+composite only into capture buffers on CPU and cannot run GL, so the bench drives the same
+calls in-process; render node `renderD128`, SVGA3D; median and p95 of 300 frames):
+
+| Backend | Damage | Undecorated p50 / p95 | Decorated p50 / p95 |
+|---------|--------|-----------------------|---------------------|
+| CPU | whole frame | 1.84–2.43 ms / 3.2–6.3 ms | 1.71–1.75 ms / 2.8–3.6 ms (stream) |
+| CPU | one window (480×320) | 27 µs / 38–117 µs | 32 µs / 44–100 µs (stream) |
+| GL, render thread | whole frame | 380–387 µs / 3.2 ms | 748 µs / 5.7–6.1 ms (stream) |
+| GL, render thread | one window | 360–375 µs / 3.0–3.5 ms | 627–633 µs / 3.6–5.2 ms (stream) |
+| GL, until the fence signals | whole frame | 9.3–10.7 ms / 14–15 ms | 10.4–12.1 ms / 15–21 ms |
+| GL, until the fence signals | one window | 2.6–2.9 ms / 4.5–4.6 ms | 3.2–3.4 ms / 6.6–7.6 ms |
+
+Two runs, load average 0.6–0.8 (2 vCPUs, the VM's own display session running beside them;
+p95 on this host is mostly scheduling noise). On the CPU the stream path costs what the blit
+path costs: `:ui_cpu` starts each band at the topmost ref that covers it opaquely (the same
+cull as `cpu_compositor::composite`), and its L2-sized bands repaint a full frame no slower
+than the composite's whole-rect passes; a window update over decorated windows is +5 µs. On
+GL the stream path adds ≈ 0.25–0.37 ms of render-thread time per frame (the ring slot and
+encode, then one `composite_into` setup per run of surfaces between the frames' quads —
+unflushed, one submit at the end; flushing each run, as at first, cost twice that) and
+0.5–1.5 ms to the frame's GPU completion on SVGA3D. A frame with no decorated window on the
+output pays none of it. The lowered path (GLES 2) is the blit path plus one solid blit per
+fill. On the UI thread, `commit_frame` of the decorated scene (30 quads, 7 surfaces: every
+draw takes an order from the overlap grid, the refs are sorted and cut into batches) is
+12 µs p50 for a full repaint and 5 µs for a window update, against 6 µs and under 1 µs
+without decorations (load 0.3).
 
 ---
 

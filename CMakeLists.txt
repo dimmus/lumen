@@ -800,6 +800,14 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_decoration_geometry PRIVATE tests)
     add_test(NAME test_decoration_geometry COMMAND test_decoration_geometry)
 
+    # ADR-010 §4.11: the compositor's backends draw the UI primitive stream (CPU, GL).
+    add_executable(test_ui_composite tests/test_ui_composite.cpp)
+    target_link_libraries(test_ui_composite PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_ui_composite)
+    lumen_link_platform(test_ui_composite)
+    target_include_directories(test_ui_composite PRIVATE tests)
+    add_test(NAME test_ui_composite COMMAND test_ui_composite)
+
     add_executable(test_layer_arrange tests/test_layer_arrange.cpp)
     target_link_libraries(test_layer_arrange PRIVATE lx.compositor)
     lumen_apply_module_properties(test_layer_arrange)
@@ -890,6 +898,15 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(bench_composite PRIVATE tests)
     add_test(NAME bench_composite COMMAND bench_composite)
     set_tests_properties(bench_composite PROPERTIES LABELS bench)
+
+    # ADR-010 §4.11: render-thread cost of a frame with and without decorations (CPU, GL).
+    add_executable(bench_ui_composite tests/bench_ui_composite.cpp)
+    target_link_libraries(bench_ui_composite PRIVATE lx.compositor)
+    lumen_apply_module_properties(bench_ui_composite)
+    lumen_link_platform(bench_ui_composite)
+    target_include_directories(bench_ui_composite PRIVATE tests)
+    add_test(NAME bench_ui_composite COMMAND bench_ui_composite --frames 60 --warmup 10)
+    set_tests_properties(bench_ui_composite PROPERTIES LABELS bench)
 
     # ADR-010 §8: the UI engine's scenarios S1–S3 through lx.ui, a table and the JSON of
     # §8.5. scripts/ui-bench.sh drives it and keeps the baseline; here it only has to run.

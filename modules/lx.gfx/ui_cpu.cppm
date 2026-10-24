@@ -114,8 +114,9 @@ export namespace lx::gfx {
 // clipped to the target: clear it to the clear colour (when given), then every batch whose
 // bounds meet the rect, in order, each batch's refs in order. Overlapping rects repaint
 // their overlap; the result is the same. Pixels outside every rect are never read or
-// written. (The clear is skipped when the rect's first primitive is an opaque square quad
-// covering it on whole pixels — the same pixels either way.)
+// written. (Drawing starts at the topmost ref that repaints the band opaquely — an opaque
+// square quad on whole pixels, or a surface `cpu_compositor::covers_opaquely` — with no
+// clear: the same pixels either way.)
 
 /// One view's sorted stream as the scene publishes it (`scene::draw_list`): the refs and
 /// batches of `batch_for_render`, the typed instance arrays the refs index, and the surface
@@ -177,6 +178,31 @@ private:
     /// Per sorted ref: the first and one-past-last row it can write (2 per ref).
     std::unique_ptr<std::int32_t[]> rows_;
 };
+
+/// What `lower_to_blits` did with a stream.
+struct ui_lower_stats {
+    unsigned surfaces = 0; ///< `surface` refs copied
+    unsigned lowered = 0;  ///< quads turned into solid blits
+    unsigned dropped = 0;  ///< primitives with no blit equivalent: counted, not drawn
+    unsigned overflow = 0; ///< refs past `capacity`
+};
+
+/// True when `q` is a solid rectangle on whole pixels — every radius 0, no visible border
+/// (every width 0, or a fully transparent border colour), `background_end` equal to
+/// `background` bit for bit, `bounds` and `clip` integral — which `:ui_cpu` fills with one
+/// colour at full coverage: a `blit_command::solid` draws the same pixels.
+[[nodiscard]] bool quad_lowers_to_blit(const quad_instance& q);
+
+/// The stream as `blit_command`s in its sorted order, for a path with no primitive renderer
+/// (the compositor's GLES 2 and Vulkan composites, screen capture's re-composites, the
+/// headless dump): a `surface` ref is copied from `stream.surfaces`; a quad that
+/// `quad_lowers_to_blit` becomes a solid blit of its premultiplied encoded colour
+/// (`blend_mode::opaque` at alpha 1, else premultiplied source-over in the backend's own
+/// blend space); every other primitive is dropped and counted in `stats.dropped`. Writes at
+/// most `capacity` commands (the rest counted in `stats.overflow`) and returns how many. No
+/// allocation; any affinity (it reads the stream only).
+[[nodiscard]] unsigned lower_to_blits(const ui_stream& stream, blit_command* out,
+                                      unsigned capacity, ui_lower_stats& stats);
 
 } // namespace lx::gfx
 
@@ -1307,25 +1333,33 @@ lx::result<void> lx::gfx::ui_cpu_renderer::draw_band(const void* frame, const ui
     const auto in_band = [&](std::size_t i) {
         return !banded || (rows_[2 * i] < band.y + band.height && rows_[2 * i + 1] > band.y);
     };
-    // The first primitive drawn here may repaint the whole band opaquely (a window's
-    // background): then the clear under it is skipped — the same pixels, half the writes.
+    // The topmost ref that repaints the whole band opaquely (a window over it, a window's
+    // background) hides everything under it, the clear included: drawing starts there —
+    // the same pixels, the writes of what shows only (`cpu_compositor::composite`'s cull).
+    std::size_t start = 0;
     bool covered = false;
-    bool found = false;
-    for (const batch& b : stream.batches) {
-        if (!lx_gfx_ui_meets(b.bounds, band))
+    for (std::size_t b = stream.batches.size(); b-- > 0 && !covered;) {
+        const batch& bt = stream.batches[b];
+        if (!lx_gfx_ui_meets(bt.bounds, band))
             continue;
-        const std::size_t end = static_cast<std::size_t>(b.first) + b.count;
-        for (std::size_t i = b.first; i < end && i < stream.refs.size(); ++i) {
+        if (bt.kind != primitive_kind::quad && bt.kind != primitive_kind::surface)
+            continue;
+        const std::size_t end = static_cast<std::size_t>(bt.first) + bt.count;
+        for (std::size_t i = end < stream.refs.size() ? end : stream.refs.size(); i-- > bt.first;) {
             if (!in_band(i))
                 continue;
-            const primitive_ref& first = stream.refs[i];
-            covered = first.kind == primitive_kind::quad && first.index < stream.quads.size() &&
-                      lx_gfx_ui_covers(stream.quads[first.index], band);
-            found = true;
-            break;
+            const primitive_ref& r = stream.refs[i];
+            const bool cover =
+                r.kind == primitive_kind::quad
+                    ? r.index < stream.quads.size() && lx_gfx_ui_covers(stream.quads[r.index], band)
+                    : compositor_ && r.index < stream.surfaces.size() &&
+                          compositor_->covers_opaquely(stream.surfaces[r.index], f.target->format, band);
+            if (cover) {
+                start = i;
+                covered = true;
+                break;
+            }
         }
-        if (found)
-            break;
     }
     if (clear_word && !covered) {
         for (int y = band.y; y < band.y + band.height; ++y) {
@@ -1335,13 +1369,14 @@ lx::result<void> lx::gfx::ui_cpu_renderer::draw_band(const void* frame, const ui
         }
     }
     for (const batch& b : stream.batches) {
-        if (!lx_gfx_ui_meets(b.bounds, band)) {
+        const std::size_t end = static_cast<std::size_t>(b.first) + b.count;
+        // Missing the band, or entirely under the covering ref.
+        if (!lx_gfx_ui_meets(b.bounds, band) || end <= start) {
             ++stats.batches_skipped;
             continue;
         }
         ++stats.batches_drawn;
-        const std::size_t end = static_cast<std::size_t>(b.first) + b.count;
-        for (std::size_t i = b.first; i < end && i < stream.refs.size(); ++i) {
+        for (std::size_t i = b.first > start ? b.first : start; i < end && i < stream.refs.size(); ++i) {
             if (!in_band(i))
                 continue;
             const primitive_ref& ref = stream.refs[i];
@@ -1374,10 +1409,20 @@ lx::result<void> lx::gfx::ui_cpu_renderer::draw_band(const void* frame, const ui
                 break;
             case primitive_kind::surface:
                 if (compositor_ && ref.index < stream.surfaces.size()) {
-                    auto drawn = compositor_->blend(*f.target, &stream.surfaces[ref.index], 1, band);
+                    // A run of refs naming consecutive draws (the compositor's windows, in
+                    // paint order) is one blend call: the same pixels, one setup.
+                    std::size_t n = 1;
+                    while (i + n < end && i + n < stream.refs.size() && in_band(i + n) &&
+                           stream.refs[i + n].kind == primitive_kind::surface &&
+                           stream.refs[i + n].index == ref.index + n &&
+                           ref.index + n < stream.surfaces.size())
+                        ++n;
+                    auto drawn = compositor_->blend(*f.target, &stream.surfaces[ref.index],
+                                                    static_cast<unsigned>(n), band);
                     if (!drawn)
                         return drawn.get_error();
-                    ++stats.primitives_drawn;
+                    stats.primitives_drawn += static_cast<unsigned>(n);
+                    i += n - 1;
                 } else {
                     ++stats.primitives_skipped;
                 }
@@ -1386,4 +1431,75 @@ lx::result<void> lx::gfx::ui_cpu_renderer::draw_band(const void* frame, const ui
         }
     }
     return {};
+}
+
+// ── Lowering to blits ───────────────────────────────────────────────────────────
+
+bool lx::gfx::quad_lowers_to_blit(const quad_instance& q) {
+    for (unsigned k = 0; k < 4; ++k)
+        if ((q.radii[k] & 0x7FFFu) != 0)
+            return false;
+    bool borderless = true;
+    for (unsigned k = 0; k < 4; ++k)
+        borderless = borderless && (q.border_widths[k] & 0x7FFFu) == 0;
+    if (!borderless) {
+        bool clear = true;
+        for (unsigned k = 0; k < 4; ++k)
+            clear = clear && (q.border_color[k] & 0x7FFFu) == 0;
+        if (!clear)
+            return false;
+    }
+    for (unsigned k = 0; k < 4; ++k)
+        if (q.background[k] != q.background_end[k])
+            return false;
+    const auto whole = [](float v) { return v == std::floor(v) && v > -1e9f && v < 1e9f; };
+    for (unsigned k = 0; k < 4; ++k)
+        if (!whole(q.bounds[k]) || !whole(q.clip[k]))
+            return false;
+    return q.bounds[2] > 0.f && q.bounds[3] > 0.f;
+}
+
+unsigned lx::gfx::lower_to_blits(const ui_stream& stream, blit_command* out, unsigned capacity,
+                                 ui_lower_stats& stats) {
+    unsigned n = 0;
+    const auto put = [&](const blit_command& c) {
+        if (n < capacity && out) {
+            out[n++] = c;
+            return true;
+        }
+        ++stats.overflow;
+        return false;
+    };
+    for (const primitive_ref& ref : stream.refs) {
+        switch (ref.kind) {
+        case primitive_kind::surface:
+            if (ref.index < stream.surfaces.size() && put(stream.surfaces[ref.index]))
+                ++stats.surfaces;
+            break;
+        case primitive_kind::quad: {
+            if (ref.index >= stream.quads.size() || !quad_lowers_to_blit(stream.quads[ref.index])) {
+                ++stats.dropped;
+                break;
+            }
+            const quad_instance& q = stream.quads[ref.index];
+            blit_command c{};
+            c.solid = true;
+            c.solid_color = lx::color::rgb(from_half(q.background[0]), from_half(q.background[1]),
+                                           from_half(q.background[2]), from_half(q.background[3]));
+            c.blend = c.solid_color.a >= 1.f ? lx::blend_mode::opaque : lx::blend_mode::premultiplied;
+            c.dst = {static_cast<int>(q.bounds[0]), static_cast<int>(q.bounds[1]),
+                     static_cast<int>(q.bounds[2]), static_cast<int>(q.bounds[3])};
+            if (q.clip[2] > 0.f && q.clip[3] > 0.f)
+                c.clip = {static_cast<int>(q.clip[0]), static_cast<int>(q.clip[1]),
+                          static_cast<int>(q.clip[2]), static_cast<int>(q.clip[3])};
+            if (put(c))
+                ++stats.lowered;
+            break;
+        }
+        default:
+            ++stats.dropped;
+            break;
+        }
+    }
+    return n;
 }

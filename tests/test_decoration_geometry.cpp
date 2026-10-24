@@ -182,8 +182,10 @@ LUMEN_TEST(placement_with_extents_keeps_the_title_bar_on_the_output) {
 
 namespace {
 
-/// Composites a frame node's draws on the CPU backend (the atlas registered as it is staged
-/// there: native ARGB) into a black XRGB target, the way the render thread does.
+/// Composites a frame node's emission on the CPU backend (the atlas registered as it is
+/// staged there: native ARGB) into a black XRGB target, the way the render thread does: its
+/// fills are quad primitives, so the sorted stream goes through `ui_cpu_renderer` with the
+/// compositor drawing the `surface` refs (`frame_painter::paint_cpu`).
 struct composited {
     std::vector<std::uint32_t> px;
     int w = 0, h = 0;
@@ -192,38 +194,120 @@ struct composited {
     }
 };
 
-composited composite_frame(const frame_node& node, int w, int h) {
+lx::gfx::cpu_compositor& deco_compositor() {
     static std::vector<std::uint32_t> atlas(k_deco_atlas_size * k_deco_atlas_size);
-    build_deco_atlas(atlas.data());
-    lx::gfx::pixel_surface tex{};
-    tex.pixels = reinterpret_cast<unsigned char*>(atlas.data());
-    tex.width = tex.height = k_deco_atlas_size;
-    tex.stride = k_deco_atlas_size * 4u;
-    tex.format = static_cast<lx::fourcc>(lx::pixel_format::argb8888);
-    lx::gfx::cpu_compositor comp;
-    (void)comp.register_texture(k_deco_atlas_texture_id, tex);
-
-    lx::scene::draw_list list;
-    node.emit_draws(list);
-    std::vector<lx::gfx::blit_command> blits(list.size());
-    for (unsigned i = 0; i < list.size(); ++i) {
-        const auto& d = list.data()[i];
-        blits[i].texture_id = d.texture.id();
-        blits[i].dst = d.dst;
-        blits[i].src = d.src;
-        blits[i].clip = d.clip;
-        blits[i].tint = d.tint;
-        blits[i].opacity = d.opacity;
-        blits[i].blend = d.blend;
+    static lx::gfx::cpu_compositor comp;
+    static bool registered = false;
+    if (!registered) {
+        registered = true;
+        build_deco_atlas(atlas.data());
+        lx::gfx::pixel_surface tex{};
+        tex.pixels = reinterpret_cast<unsigned char*>(atlas.data());
+        tex.width = tex.height = k_deco_atlas_size;
+        tex.stride = k_deco_atlas_size * 4u;
+        tex.format = static_cast<lx::fourcc>(lx::pixel_format::argb8888);
+        (void)comp.register_texture(k_deco_atlas_texture_id, tex);
     }
-    composited out{std::vector<std::uint32_t>(static_cast<std::size_t>(w * h), 0u), w, h};
+    return comp;
+}
+
+lx::gfx::blit_command blit_of(const lx::scene::draw_command& d) {
+    lx::gfx::blit_command b{};
+    b.texture_id = d.texture.id();
+    b.dst = d.dst;
+    b.src = d.src;
+    b.clip = d.clip;
+    b.tint = d.tint;
+    b.opacity = d.opacity;
+    b.blend = d.blend;
+    b.scaled = d.scaled;
+    b.solid = d.solid;
+    b.solid_color = d.solid_color;
+    return b;
+}
+
+composited blank(int w, int h) {
+    return {std::vector<std::uint32_t>(static_cast<std::size_t>(w * h), 0u), w, h};
+}
+
+lx::gfx::pixel_surface surface_of(composited& c) {
     lx::gfx::pixel_surface dst{};
-    dst.pixels = reinterpret_cast<unsigned char*>(out.px.data());
-    dst.width = static_cast<unsigned>(w);
-    dst.height = static_cast<unsigned>(h);
-    dst.stride = static_cast<unsigned>(w) * 4u;
+    dst.pixels = reinterpret_cast<unsigned char*>(c.px.data());
+    dst.width = static_cast<unsigned>(c.w);
+    dst.height = static_cast<unsigned>(c.h);
+    dst.stride = static_cast<unsigned>(c.w) * 4u;
     dst.format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
-    (void)comp.composite(dst, lx::color::rgb(0.f, 0.f, 0.f), blits.data(),
+    return dst;
+}
+
+composited composite_frame(const frame_node& node, int w, int h,
+                           const lx::scene::emit_context& ctx = {}) {
+    lx::gfx::cpu_compositor& comp = deco_compositor();
+    lx::scene::draw_list list;
+    node.emit_draws(list, ctx);
+    list.batch_for_render();
+    std::vector<lx::gfx::blit_command> blits(list.size());
+    for (unsigned i = 0; i < list.size(); ++i)
+        blits[i] = blit_of(list.data()[i]);
+    composited out = blank(w, h);
+    static lx::gfx::ui_cpu_renderer ui;
+    ui.set_surface_compositor(&comp);
+    lx::gfx::ui_stream st{};
+    st.refs = list.refs();
+    st.batches = list.batches();
+    st.quads = list.quad_instances();
+    st.surfaces = blits;
+    lx::gfx::damage_region full{};
+    full.full = true;
+    (void)ui.draw(surface_of(out), st, nullptr, full, lx::color::rgb(0.f, 0.f, 0.f));
+    return out;
+}
+
+/// What the frame drew before its fills became quads: each fill a blit of the atlas
+/// swatch's centre (opaque, tinted by the dim), then the node's remaining draws (title text,
+/// close button), through `cpu_compositor::composite` — the old render path, rebuilt here.
+composited composite_frame_before(const frame_node& node, int w, int h,
+                                  const lx::scene::emit_context& ctx = {}) {
+    lx::gfx::cpu_compositor& comp = deco_compositor();
+    const lx::rect2i g = node.geometry;
+    const lx::point2i anchor = ctx.anchored ? ctx.anchor : lx::point2i{g.x, g.y};
+    const auto project = [&](lx::rect2i r) {
+        return lx::scene::project_node(ctx.projection, anchor, {r.x, r.y}, {r.width, r.height});
+    };
+    const lx::color tint = node.dimmed ? lx::color::rgb(0.65f, 0.65f, 0.65f, 1.f)
+                                       : lx::color::rgb(1.f, 1.f, 1.f, 1.f);
+    std::vector<lx::gfx::blit_command> blits;
+    const auto fill = [&](lx::rect2i logical, lx::rect2i swatch) {
+        if (logical.width <= 0 || logical.height <= 0)
+            return;
+        lx::gfx::blit_command b{};
+        b.texture_id = k_deco_atlas_texture_id;
+        const lx::rect2i c = swatch_centre(swatch);
+        b.src = {static_cast<float>(c.x), static_cast<float>(c.y), static_cast<float>(c.width),
+                 static_cast<float>(c.height)};
+        b.dst = project(logical);
+        b.tint = tint;
+        b.blend = lx::blend_mode::opaque;
+        blits.push_back(b);
+    };
+    const frame_extents e = node.extents;
+    const lx::rect2i f = frame_rect(g, e);
+    const lx::rect2i border = node.active ? deco_atlas::border_active : deco_atlas::border_inactive;
+    if (e.left > 0)
+        fill({f.x, f.y, e.left, f.height}, border);
+    if (e.right > 0)
+        fill({g.x + g.width, f.y, e.right, f.height}, border);
+    if (e.top > T)
+        fill({g.x, f.y, g.width, e.top - T}, border);
+    if (e.bottom > 0)
+        fill({g.x, g.y + g.height, g.width, e.bottom}, border);
+    fill(title_rect(g), node.active ? deco_atlas::title_active : deco_atlas::title_inactive);
+    lx::scene::draw_list list;
+    node.emit_draws(list, ctx);
+    for (unsigned i = 0; i < list.size(); ++i)
+        blits.push_back(blit_of(list.data()[i]));
+    composited out = blank(w, h);
+    (void)comp.composite(surface_of(out), lx::color::rgb(0.f, 0.f, 0.f), blits.data(),
                          static_cast<unsigned>(blits.size()), {});
     return out;
 }
@@ -240,8 +324,10 @@ LUMEN_TEST(frame_draws_baked_colours_where_the_zones_are) {
     node.atlas_ready = &atlas_ready;
     lx::scene::draw_list list;
     node.emit_draws(list);
-    // Four borders, the title fill, the close glyph (no title text staged, no hover).
-    LUMEN_CHECK(list.size() == 6);
+    // Four borders and the title fill as quads, the close glyph a draw (no title text
+    // staged, no hover).
+    LUMEN_CHECK(list.primitive_count() == 5 && list.quad_instances().size() == 5);
+    LUMEN_CHECK(list.size() == 1);
 
     const composited a = composite_frame(node, 160, 120);
     const lx::rect2i g = node.geometry;
@@ -281,6 +367,54 @@ LUMEN_TEST(frame_draws_baked_colours_where_the_zones_are) {
     LUMEN_CHECK(m.at(g.x + 30, g.y - T - 1) == 0u);
 }
 
+LUMEN_TEST(frame_quads_draw_the_pixels_the_swatch_blits_drew) {
+    // ADR-010 §4.11: the fills moved from atlas swatch blits to quad primitives with the
+    // same rects and colours; on the CPU compositor at scale 1 the frame is pixel-identical
+    // in every state (and at a fractional scale, where the rects round the same way).
+    static bool atlas_ready = true;
+    frame_node node{};
+    node.geometry = {20, 40, 100, 50};
+    node.shown = true;
+    node.atlas_ready = &atlas_ready;
+    lx::scene::emit_context scaled{};
+    scaled.projection.scale = 1.25;
+    const lx::scene::emit_context* const contexts[2] = {nullptr, &scaled};
+    unsigned compared = 0;
+    for (const bool maximized : {false, true})
+        for (const bool active : {true, false})
+            for (const bool dimmed : {false, true})
+                for (const deco_button b :
+                     {deco_button::normal, deco_button::hover, deco_button::pressed})
+                    for (const lx::scene::emit_context* ctx : contexts) {
+                        node.extents = extents_for(decoration_mode::server, maximized);
+                        node.active = active;
+                        node.dimmed = dimmed;
+                        node.button = b;
+                        const lx::scene::emit_context c = ctx ? *ctx : lx::scene::emit_context{};
+                        const composited before = composite_frame_before(node, 200, 150, c);
+                        const composited after = composite_frame(node, 200, 150, c);
+                        unsigned diffs = 0;
+                        for (int y = 0; y < 150; ++y)
+                            for (int x = 0; x < 200; ++x)
+                                diffs += before.at(x, y) != after.at(x, y) ? 1u : 0u;
+                        if (diffs != 0)
+                            std::printf("    max=%d active=%d dimmed=%d button=%d scaled=%d: %u "
+                                        "pixel(s) differ\n",
+                                        maximized, active, dimmed, static_cast<int>(b),
+                                        ctx != nullptr, diffs);
+                        LUMEN_CHECK(diffs == 0);
+                        ++compared;
+                    }
+    LUMEN_CHECK(compared == 48);
+    // The dimmed fill is the CPU compositor's tinted byte: (0x30 · 166) >> 8 = 0x1F.
+    node.extents = extents_for(decoration_mode::server, false);
+    node.active = true;
+    node.dimmed = true;
+    node.button = deco_button::normal;
+    const composited d = composite_frame(node, 200, 150);
+    LUMEN_CHECK(d.at(node.geometry.x + 30, node.geometry.y - 14) == 0x1F1F21u);
+}
+
 LUMEN_TEST(frame_draws_nothing_before_the_atlas_or_when_hidden) {
     static bool atlas_ready = false;
     frame_node node{};
@@ -290,11 +424,11 @@ LUMEN_TEST(frame_draws_nothing_before_the_atlas_or_when_hidden) {
     node.atlas_ready = &atlas_ready;
     lx::scene::draw_list list;
     node.emit_draws(list);
-    LUMEN_CHECK(list.size() == 0);
+    LUMEN_CHECK(list.size() == 0 && list.primitive_count() == 0);
     atlas_ready = true;
     node.shown = false;
     node.emit_draws(list);
-    LUMEN_CHECK(list.size() == 0);
+    LUMEN_CHECK(list.size() == 0 && list.primitive_count() == 0);
 }
 
 int main(int argc, char** argv) {

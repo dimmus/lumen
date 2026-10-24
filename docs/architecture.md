@@ -429,7 +429,8 @@ flowchart LR
 | `lx.compositor.positioner` | xdg_positioner placement, pure: base rectangle from anchor, offset and gravity; constraint adjustment per axis in the spec's precedence flip → slide → resize |
 | `lx.compositor.popup` | xdg_popup state, Wayland-free: configure/ack, placement relative to the parent's window geometry, map/unmap, reposition, the popup grab and dismissal. UI affinity |
 | `lx.compositor.layer_shell` | wlr-layer-shell, Wayland-free: layer-surface records, the configure/ack flow, arrangement against the output (`arrange_layers`, pure) and the usable area its exclusive zones leave, keyboard-interactivity queries; each layer surface's tree container sits in one of the four layer-shell scene containers. UI affinity |
-| `lx.compositor.decoration` | Server-side frames (xdg-decoration), Wayland-free: frame extents and hit zones, the shared atlas, the frame scene node (underlay of the window's tree container), cached title textures rasterized with `lx.text`. UI affinity |
+| `lx.compositor.decoration` | Server-side frames (xdg-decoration), Wayland-free: frame extents and hit zones, the shared atlas, the frame scene node (underlay of the window's tree container; its fills are UI quad primitives), cached title textures rasterized with `lx.text`. UI affinity |
+| `lx.compositor.ui_composite` | How a backend draws a snapshot (ADR-010 §4.11): the draws as blits when it carries no UI primitive (the path unchanged), its sorted stream through `lx.gfx:ui_cpu` / `:ui_gl` when it does, the stream lowered to blits where there is no primitive renderer (GLES 2, Vulkan, capture). Render affinity |
 | `lx.compositor.workspaces` | The workspace model, Wayland-free and pure (bodies in `workspaces.cpp`): every output's ordered workspaces and its active one, dynamic (one empty last, empty inactive ones go) or static, focus memory, urgency, hotplug (merge, append, return, strand), `assign`; tells the window manager when windows or a workspace move (`workspace_sink`). 64 workspaces, 16 per output. UI affinity |
 | `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state — `modal` for an effectively modal dialog, `minimized` —, geometry, focus, flags — `sticky` from v7 —; v6: icon with its memfds, parent, bell; v7: `toplevel_workspace` with the shell's ext-workspace handle) on `zlm_policy_bridge_v1`; receives WM requests |
 | `lx.compositor.toplevel_icon` | xdg-toplevel-icon-v1's icon store, Wayland-free: a set_icon snapshot (name + up to four buffers, edge ≤ 256, nearest the panel's 32 px first) copied into sealed memfds, refcounted by the toplevel records, 128 icons and 16 MiB of pixels at most. UI affinity |
@@ -610,11 +611,13 @@ and everything that is *placement* uses the frame around it: new windows are pla
 moves constrained by the frame rect (the title bar stays on the output), and
 `configure_bounds` leaves room for it. The frame is a scene node (`frame_node`), the
 underlay of the window's tree container, so it restacks with the window and paints below its
-surfaces: four border fills and the title fill sample the centre of colour swatches baked
-into one 64x64 atlas texture (identical colours on GL, CPU and Vulkan — no tint), the title
-is a cached texture per window and focus state, re-rasterized by `lx.text` only when the
-title changes or its ellipsis cut moves, and the close button is a glyph (with a circle on
-hover). No backend code was added; damage is the frame's strips, never the client area.
+surfaces: four border fills and the title fill are UI quad primitives (ADR-010 §4.11: radius
+0, one palette colour, the dim pre-applied — pixel-identical to the atlas swatch blits they
+replaced), drawn by the primitive renderer of the CPU and GLES 3.1 backends and as solid blits
+elsewhere (`lx.compositor.ui_composite`); the title is a cached texture per window and focus
+state, re-rasterized by `lx.text` only when the title changes or its ellipsis cut moves, and
+the close button is an atlas glyph (with a circle on hover). Damage is the frame's strips,
+never the client area.
 
 The hit test checks a window's surfaces first, then its frame's zones (close button, title,
 then resize bands that extend 8 px outside the visible border, corners within 20 px).
