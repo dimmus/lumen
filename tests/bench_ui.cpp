@@ -13,11 +13,19 @@
 // buffer of the scenario's size, inside the frame's damage — the ledger's rects, or the
 // whole view when the frame carries none (an animation tick, the first frame) — and times
 // that as the `raster` stage. `gl` and `vulkan` come with their Phase 1 stages, behind the
-// same flag; nothing is renamed.
+// same flag; nothing is renamed. `gl` draws each produced frame with `gfx::ui_gl_renderer`
+// (GLES 3.1 on the render node, /dev/dri/renderD128) into an RGBA8 framebuffer object of the
+// scenario's size, inside the same damage, and times two stages: `submit`, the CPU cost of
+// `ui_gl_renderer::draw` (atlas upload, the gather of every batch's instances into the mapped
+// ring slot, recording, glFlush — the bench's own `encode` into a host ring still runs, so
+// G3 stays comparable across backends), and `gpu`, the frame's GPU time from
+// GL_EXT_disjoint_timer_query, or, without one, the wall time from the flush to the frame's
+// fence ("fence-wall"; the JSON's `gpu.timing` says which). A software GL_RENDERER
+// (llvmpipe) is refused: its numbers are not GPU numbers.
 //
-//   lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu] [--frames N] [--warmup N]
+//   lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu|gl] [--frames N] [--warmup N]
 //                  [--period-us US] [--json PATH] [--pin CPU|none] [--scale F] [--git SHA]
-//                  [--preset NAME]
+//                  [--preset NAME] [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]
 //
 // Frames come from a frame clock (`--period-us`): a scenario whose work is a few
 // microseconds per frame is otherwise over in a millisecond, one sample of whatever the
@@ -30,6 +38,7 @@
 // scripts/ui-bench.sh carry the verdicts.
 
 #include <errno.h>
+#include <fcntl.h>
 #include <malloc.h>
 #include <pthread.h>
 #include <sched.h>
@@ -149,10 +158,104 @@ struct options {
     float scale = 1.f;
     const char* git = "";
     const char* preset = "release";
+    bool gl_mapped_ring = false; ///< `gl`: the mapped-range ring instead of the persistent one
+    bool gl_attribute_fetch = false; ///< `gl`: instances as vertex attributes, not a storage buffer
 };
 
 /// Keeps the optimiser from deleting the encode copy.
 volatile std::uint32_t g_sink = 0;
+
+// ── The `gl` backend ────────────────────────────────────────────────────────────
+//
+// One EGL context on the render node for the whole run, created on the bench thread (a
+// context is current on one thread) before the first scenario.
+
+struct gl_backend {
+    int fd = -1;
+    lx::gfx::egl_device device{};
+    lx::gfx::ui_gl_renderer renderer{};
+    std::uint64_t setup_cold_ns = 0; ///< the first `initialize` of the process
+    std::uint64_t setup_warm_ns = 0; ///< a second one (shutdown, initialize again)
+    unsigned from_cache = 0;         ///< programs the second one loaded from the binary cache
+
+    gl_backend() = default;
+    gl_backend(const gl_backend&) = delete;
+    gl_backend& operator=(const gl_backend&) = delete;
+    ~gl_backend() {
+        // The renderer needs the context, the context the node.
+        renderer.shutdown();
+        device = lx::gfx::egl_device{};
+        if (fd >= 0)
+            ::close(fd);
+    }
+};
+
+gl_backend* g_gl = nullptr;
+
+/// What the JSON reports of the `gl` backend; outlives the context (the JSON is written after
+/// the bench thread is gone).
+struct gl_info {
+    bool valid = false;
+    lx::gfx::ui_gl_caps caps{};
+    std::uint64_t setup_cold_ns = 0;
+    std::uint64_t setup_warm_ns = 0;
+    unsigned from_cache = 0;
+};
+
+gl_info g_gl_info{};
+
+/// Brings the `gl` backend up; false (with the reason printed) when it cannot run here.
+[[nodiscard]] bool start_gl(gl_backend& gl, const options& opt) {
+    lx::gfx::ui_gl_options gl_options{};
+    gl_options.persistent_ring = !opt.gl_mapped_ring;
+    gl_options.fetch = opt.gl_attribute_fetch ? lx::gfx::ui_gl_fetch::attributes
+                                              : lx::gfx::ui_gl_fetch::storage_buffer;
+    gl.fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (gl.fd < 0) {
+        std::fprintf(stderr, "lumen-ui-bench: gl: no render node (/dev/dri/renderD128)\n");
+        return false;
+    }
+    auto device = lx::gfx::egl_device::create(gl.fd);
+    if (!device) {
+        std::fprintf(stderr, "lumen-ui-bench: gl: %s\n", device.get_error().message);
+        return false;
+    }
+    gl.device = std::move(device).value();
+    if (auto ok = gl.renderer.initialize(gl_options); !ok) {
+        std::fprintf(stderr, "lumen-ui-bench: gl: %s\n", ok.get_error().message);
+        return false;
+    }
+    gl.setup_cold_ns = gl.renderer.setup_stats().program_ns;
+    if (gl.renderer.caps().software) {
+        std::fprintf(stderr,
+                     "lumen-ui-bench: gl: GL_RENDERER is a software rasteriser (%s) — refusing to "
+                     "report its numbers as GPU numbers\n",
+                     gl.renderer.caps().renderer);
+        return false;
+    }
+    gl.renderer.shutdown();
+    if (auto ok = gl.renderer.initialize(gl_options); !ok) {
+        std::fprintf(stderr, "lumen-ui-bench: gl: %s\n", ok.get_error().message);
+        return false;
+    }
+    gl.setup_warm_ns = gl.renderer.setup_stats().program_ns;
+    gl.from_cache = gl.renderer.setup_stats().from_cache;
+    gl.renderer.set_gpu_timing(true);
+    const lx::gfx::ui_gl_caps& caps = gl.renderer.caps();
+    g_gl_info = {true, caps, gl.setup_cold_ns, gl.setup_warm_ns, gl.from_cache};
+    std::printf("gl: %s | %s | fetch %s | ring %s | gpu timing %s | program binary formats %d | "
+                "program setup cold %.1f us, again %.1f us (%u from cache)\n",
+                caps.renderer, caps.version,
+                caps.fetch == lx::gfx::ui_gl_fetch::attributes ? "attributes" : "storage",
+                caps.persistent_ring ? "persistent" : "mapped-range",
+                caps.timer_query            ? "timer query"
+                : caps.timer_query_reads_zero ? "fence-wall (timer query reads 0)"
+                                              : "fence-wall",
+                caps.program_binary_formats,
+                static_cast<double>(gl.setup_cold_ns) / 1000.0,
+                static_cast<double>(gl.setup_warm_ns) / 1000.0, gl.from_cache);
+    return true;
+}
 
 // ── Stages and distributions ────────────────────────────────────────────────────
 
@@ -169,12 +272,15 @@ enum stage : unsigned {
     st_emit_order_encode, ///< G3's sum
     st_frame,             ///< tick + order + encode: the UI thread's cost of a produced frame
     st_raster,            ///< the backend drawing the frame (`cpu`: ui_cpu_renderer::draw)
+    st_submit,            ///< `gl`: ui_gl_renderer::draw on the CPU (upload, gather, record, flush)
+    st_gpu,               ///< `gl`: the frame's GPU time (timer query, or fence-wall)
     st_count,
 };
 
 constexpr const char* k_stage_names[st_count] = {
     "update", "tick_idle", "tick",   "describe",          "reconcile", "layout",
     "emit",   "order",     "encode", "emit_order_encode", "frame",     "raster",
+    "submit", "gpu",
 };
 
 struct summary {
@@ -786,6 +892,8 @@ struct counters {
     double damage_fraction = 0.0;
     unsigned overflow_drops = 0;
     std::uint64_t raster_px = 0; ///< pixels the backend shaded, max per frame
+    unsigned draw_calls = 0;     ///< `gl`: instanced and surface draws per frame, max
+    unsigned gpu_disjoint = 0;   ///< `gl`: frames whose timer query was disjoint (not sampled)
 };
 
 struct memory_stats {
@@ -906,6 +1014,17 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
     std::optional<lx::gfx::ui_cpu_renderer> rasteriser{};
     if (raster)
         rasteriser.emplace();
+    // `gl`: an RGBA8 framebuffer object of the view's size in the run's context.
+    const bool gl = std::strcmp(opt.backend, "gl") == 0 && g_gl;
+    std::optional<lx::gfx::ui_gl_target> gl_target{};
+    if (gl) {
+        auto t = lx::gfx::ui_gl_target::create(static_cast<unsigned>(spec.view.width),
+                                               static_cast<unsigned>(spec.view.height));
+        if (t)
+            gl_target.emplace(std::move(t).value());
+        else
+            std::fprintf(stderr, "lumen-ui-bench: gl target: %s\n", t.get_error().message);
+    }
     const lx::color clear = k_background;
 
     const double view_px =
@@ -979,19 +1098,37 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         const std::uint64_t bytes = encode(draws, ring.data(), ring.size());
         const std::uint64_t t4 = now_ns();
         std::uint64_t raster_px = 0;
+        lx::gfx::ui_stream stream{};
+        stream.refs = draws.refs();
+        stream.batches = draws.batches();
+        stream.quads = draws.quad_instances();
+        stream.shadows = draws.shadow_instances();
+        stream.sprites = draws.sprite_instances();
+        stream.underlines = draws.underline_instances();
         if (raster) {
-            lx::gfx::ui_stream stream{};
-            stream.refs = draws.refs();
-            stream.batches = draws.batches();
-            stream.quads = draws.quad_instances();
-            stream.shadows = draws.shadow_instances();
-            stream.sprites = draws.sprite_instances();
-            stream.underlines = draws.underline_instances();
             auto drawn = rasteriser->draw(target, stream, nullptr, damage, clear);
             if (drawn)
                 raster_px = drawn->pixels_shaded;
         }
+        unsigned draw_calls = 0;
+        if (gl && gl_target) {
+            auto drawn = g_gl->renderer.draw(*gl_target, stream, nullptr, damage, clear);
+            if (drawn)
+                draw_calls = drawn->draw_calls;
+        }
         const std::uint64_t t5 = now_ns();
+        // The GPU stage: waiting for it here is outside every CPU stage above.
+        std::uint64_t gpu_ns = 0;
+        bool gpu_ok = false;
+        if (gl && gl_target) {
+            auto timed = g_gl->renderer.wait_gpu_time();
+            if (timed && timed->source != lx::gfx::ui_gl_timing::none) {
+                gpu_ok = !timed->disjoint;
+                gpu_ns = timed->ns;
+                if (timed->disjoint && measuring)
+                    ++cnt.gpu_disjoint;
+            }
+        }
 
         if (!built) {
             built = true;
@@ -1022,8 +1159,15 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         samples[st_frame].push_back(t4 - t0);
         if (raster)
             samples[st_raster].push_back(t5 - t4);
+        if (gl && gl_target) {
+            samples[st_submit].push_back(t5 - t4);
+            if (gpu_ok)
+                samples[st_gpu].push_back(gpu_ns);
+        }
         if (raster_px > cnt.raster_px)
             cnt.raster_px = raster_px;
+        if (draw_calls > cnt.draw_calls)
+            cnt.draw_calls = draw_calls;
         ++cnt.frames_produced;
 
         const unsigned primitives = draws.primitive_count();
@@ -1157,12 +1301,14 @@ void print_table(const scenario_result& r) {
     const counters& c = r.cnt;
     std::printf("  counters   frames_produced=%u frames_idle=%u frames_described=%u "
                 "primitives=%u (built %u) surfaces=%u refs=%u batches=%u instance_bytes=%llu "
-                "damage_rects=%u damage_px=%llu (%.2f%%) overflow_drops=%u raster_px=%llu\n",
+                "damage_rects=%u damage_px=%llu (%.2f%%) overflow_drops=%u raster_px=%llu "
+                "draw_calls=%u gpu_disjoint=%u\n",
                 c.frames_produced, c.frames_idle, c.frames_described, c.primitives,
                 c.primitives_built, c.surfaces, c.refs, c.batches,
                 static_cast<unsigned long long>(c.instance_bytes), c.damage_rects,
                 static_cast<unsigned long long>(c.damage_px), c.damage_fraction * 100.0,
-                c.overflow_drops, static_cast<unsigned long long>(c.raster_px));
+                c.overflow_drops, static_cast<unsigned long long>(c.raster_px), c.draw_calls,
+                c.gpu_disjoint);
     const memory_stats& m = r.mem;
     std::printf("  memory     allocations=%llu (%.3f/frame, %llu B)  mallinfo2.uordblks delta=%lld B  "
                 "RssAnon=%ld kB\n",
@@ -1239,13 +1385,15 @@ void write_json(const options& opt, const host_info& host, const scenario_result
                      "\"primitives_built\": %u, \"primitives_total\": %llu, \"surfaces\": %u, "
                      "\"refs\": %u, \"batches\": %u, \"instance_bytes\": %llu, "
                      "\"damage_rects\": %u, \"damage_px\": %llu, \"damage_fraction\": %.5f, "
-                     "\"overflow_drops\": %u, \"raster_px\": %llu},\n",
+                     "\"overflow_drops\": %u, \"raster_px\": %llu, \"draw_calls\": %u, "
+                     "\"gpu_disjoint\": %u},\n",
                      c.frames_produced, c.frames_idle, c.frames_described, c.nodes, c.primitives,
                      c.primitives_built, static_cast<unsigned long long>(c.primitives_total),
                      c.surfaces, c.refs, c.batches,
                      static_cast<unsigned long long>(c.instance_bytes), c.damage_rects,
                      static_cast<unsigned long long>(c.damage_px), c.damage_fraction,
-                     c.overflow_drops, static_cast<unsigned long long>(c.raster_px));
+                     c.overflow_drops, static_cast<unsigned long long>(c.raster_px),
+                     c.draw_calls, c.gpu_disjoint);
         const memory_stats& m = r.mem;
         std::fprintf(f,
                      "    \"memory\": {\"allocations\": %llu, \"allocated_bytes\": %llu, "
@@ -1254,7 +1402,28 @@ void write_json(const options& opt, const host_info& host, const scenario_result
                      static_cast<unsigned long long>(m.allocations),
                      static_cast<unsigned long long>(m.allocated_bytes), m.per_frame,
                      m.mallinfo_delta, m.rss_anon_kb);
-        std::fputs("    \"gpu\": {},\n    \"gates\": {", f);
+        if (g_gl_info.valid && std::strcmp(opt.backend, "gl") == 0) {
+            const lx::gfx::ui_gl_caps& caps = g_gl_info.caps;
+            std::fputs("    \"gpu\": {\"renderer\": ", f);
+            json_string(f, caps.renderer);
+            std::fputs(", \"version\": ", f);
+            json_string(f, caps.version);
+            std::fprintf(f,
+                         ", \"fetch\": \"%s\", \"timing\": \"%s\", \"timer_query_reads_zero\": %s, "
+                         "\"ring\": \"%s\", "
+                         "\"program_binary_formats\": %d, "
+                         "\"program_cache\": %s, \"program_setup_cold_us\": %.1f, "
+                         "\"program_setup_again_us\": %.1f, \"programs_from_cache\": %u},\n",
+                         caps.fetch == lx::gfx::ui_gl_fetch::attributes ? "attributes" : "storage",
+                         caps.timer_query ? "timer_query" : "fence-wall",
+                         caps.timer_query_reads_zero ? "true" : "false", caps.persistent_ring ? "persistent" : "mapped-range",
+                         caps.program_binary_formats, caps.program_cache ? "true" : "false",
+                         static_cast<double>(g_gl_info.setup_cold_ns) / 1000.0,
+                         static_cast<double>(g_gl_info.setup_warm_ns) / 1000.0, g_gl_info.from_cache);
+        } else {
+            std::fputs("    \"gpu\": {},\n", f);
+        }
+        std::fputs("    \"gates\": {", f);
         for (unsigned i = 0; i < r.gate_count; ++i)
             std::fprintf(f, "%s\"%s\": \"%s\"", i ? ", " : "", r.gates[i].id,
                          r.gates[i].verdict);
@@ -1267,9 +1436,10 @@ void write_json(const options& opt, const host_info& host, const scenario_result
 // ── CLI ─────────────────────────────────────────────────────────────────────────
 
 void usage() {
-    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu] [--frames N]\n"
+    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|all] [--backend none|cpu|gl] [--frames N]\n"
                "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
-               "                      [--scale F] [--git SHA] [--preset NAME]\n",
+               "                      [--scale F] [--git SHA] [--preset NAME]\n"
+               "                      [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]\n",
                stderr);
 }
 
@@ -1300,12 +1470,29 @@ void usage() {
         } else if (std::strcmp(a, "--backend") == 0) {
             const char* s = take();
             if (!s) return false;
-            if (std::strcmp(s, "none") != 0 && std::strcmp(s, "cpu") != 0) {
+            if (std::strcmp(s, "none") != 0 && std::strcmp(s, "cpu") != 0 &&
+                std::strcmp(s, "gl") != 0) {
                 std::fprintf(stderr,
-                             "lumen-ui-bench: backend %s is not available (none, cpu)\n", s);
+                             "lumen-ui-bench: backend %s is not available (none, cpu, gl)\n", s);
                 return false;
             }
             opt.backend = s;
+        } else if (std::strcmp(a, "--gl-ring") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            if (std::strcmp(s, "mapped") != 0 && std::strcmp(s, "persistent") != 0) {
+                std::fprintf(stderr, "lumen-ui-bench: --gl-ring is persistent or mapped\n");
+                return false;
+            }
+            opt.gl_mapped_ring = std::strcmp(s, "mapped") == 0;
+        } else if (std::strcmp(a, "--gl-fetch") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            if (std::strcmp(s, "attributes") != 0 && std::strcmp(s, "storage") != 0) {
+                std::fprintf(stderr, "lumen-ui-bench: --gl-fetch is attributes or storage\n");
+                return false;
+            }
+            opt.gl_attribute_fetch = std::strcmp(s, "attributes") == 0;
         } else if (std::strcmp(a, "--frames") == 0) {
             const char* s = take();
             if (!s) return false;
@@ -1391,12 +1578,24 @@ struct bench_job {
     const host_info* host = nullptr;
     scenario_result* results = nullptr;
     unsigned count = 0;
+    bool backend_failed = false;
 };
 
 void* bench_thread(void* raw) {
     bench_job& job = *static_cast<bench_job*>(raw);
     const options& opt = *job.opt;
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    // The `gl` context belongs to this thread; it is torn down here too, before the stack goes.
+    std::optional<gl_backend> gl{};
+    if (std::strcmp(opt.backend, "gl") == 0) {
+        gl.emplace();
+        if (!start_gl(*gl, opt)) {
+            job.backend_failed = true;
+            return nullptr;
+        }
+        g_gl = &*gl;
+        std::fflush(stdout);
+    }
     for (unsigned i = 0; i < 3; ++i) {
         if (!opt.scenarios[i])
             continue;
@@ -1406,6 +1605,7 @@ void* bench_thread(void* raw) {
         std::fflush(stdout);
         ++job.count;
     }
+    g_gl = nullptr;
     return nullptr;
 }
 
@@ -1457,6 +1657,8 @@ int main(int argc, char** argv) {
                      std::strerror(errno));
         return 1;
     }
+    if (job.backend_failed)
+        return 2;
 
     if (opt.json)
         write_json(opt, host, results, job.count);

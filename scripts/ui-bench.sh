@@ -3,7 +3,9 @@
 #
 # Builds lumen-ui-bench in the release build, runs every scenario (S1–S3) on the backend
 # (`none`: nothing renders, the stages through encode are measured; `cpu`: the reference
-# renderer rasterises each frame's damage too, the `raster` stage), stores
+# renderer rasterises each frame's damage too, the `raster` stage; `gl`: the GLES 3.1
+# renderer draws it on /dev/dri/renderD128, the `submit` and `gpu` stages — refused on a
+# software GL_RENDERER), stores
 # the JSON under tests/bench/results/<hostname>-<driver>/<YYYYMMDD>-<sha>.json and compares
 # it with tests/bench/baseline/<hostname>-<driver>.json:
 #
@@ -26,7 +28,7 @@
 #   ./scripts/ui-bench.sh --compare FILE      # compare against FILE instead of the baseline
 #
 # Options:
-#   --backend B         the backend to measure: none (default) or cpu; each has its own
+#   --backend B         the backend to measure: none (default), cpu or gl; each has its own
 #                       baseline, tests/bench/baseline/<hostname>-<backend>.json
 #   --frames N          measured frames for every scenario (default: S1 600, S2 36000, S3 1800
 #                       at the bench's 1 ms frame clock; S2 changes its clock every 60th
@@ -66,7 +68,7 @@ while [[ $# -gt 0 ]]; do
     --update-baseline) update_baseline=1; shift ;;
     --compare) compare="$2"; shift 2 ;;
     --e2e) echo "FAIL: --e2e needs the client runtime (ADR-010 Phase 4)"; exit 2 ;;
-    -h|--help) sed -n '2,43p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 2 ;;
   esac
 done

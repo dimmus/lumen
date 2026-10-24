@@ -692,6 +692,57 @@ Measured on the F8 host (VMware SVGA3D VM, 2 vCPUs, release preset; load 0.6–0
 The two `cpu` runs differ by more than 5 % at p95, so no `iritur-cpu` baseline is committed
 yet; `none` stays the regression gate.
 
+### UI primitives on GLES 3.1 (`lx.gfx:ui_gl`, ADR-010 Phase 1)
+
+`lx.gfx:ui_gl` draws the same stream into a framebuffer object of any current GLES 3.1
+context. The vertex stage turns each instance into its whole-pixel raster window (`ui_cpu`'s
+pixel-centre rule), so the content mask costs no fragment work and the scissor is left to
+the damage rects; the fragment programs transcribe `ui_cpu`'s functions. Against the CPU
+references every golden case is within 1/255 on SVGA3D (and within 2/255 on llvmpipe), G10
+asking for 3.
+
+Instances go into a 3 × 2 MiB ring — one persistent coherent mapping with
+`GL_EXT_buffer_storage`, mapped ranges otherwise, a fence per slot — and the vertex stage
+reads them as a std430 storage buffer at a per-batch uniform offset. The ring is bound whole,
+once per frame, with the slot in the offset: rebinding per slot with `glBindBufferRange`
+made SVGA3D keep reading the previous slot's offset (stale quads on screen). Per-instance
+attributes (`ui_gl_fetch::attributes`, for contexts without vertex-stage storage blocks)
+measure the same here.
+
+What the host offers and does not: SVGA3D exposes `GL_EXT_disjoint_timer_query` but answers
+every query with 0, so `initialize` calibrates once and falls back to "fence-wall" (flush to
+fence signalled); `GL_OES_get_program_binary` is listed with zero binary formats, so the
+program cache (`$XDG_CACHE_HOME/lumen/gl-program-<hash>.bin`) is inactive and every start
+compiles the five programs, 95–155 ms. llvmpipe has a format: 22.5 ms cold, 11.1 ms from the
+cache (correctness host only; not a performance number).
+
+Measured on the F8 host (`./scripts/ui-bench.sh --backend gl`):
+
+| | S2 (one 784 px clock cell) | S3 (10 000 bordered rounded quads, full 1919×1080) |
+|--|--|--|
+| Draw calls, instance bytes | 1, 3 920 B | 1, 800 080 B |
+| `submit` (CPU, `ui_gl_renderer::draw`) p50 / p95 | 373–385 µs / 2.4–3.5 ms | 0.70–0.83 ms / 1.7–5.9 ms |
+| `gpu` (fence-wall) p50 / p95 | 1.6–1.9 ms / 3.4–5.4 ms | 8.75–9.26 ms / 10.5–13.6 ms |
+| CPU reference (`raster`, above) p50 | 13 µs | 25.6–27.5 ms |
+
+Three runs, load 1.0–1.8 (another worktree was benchmarking); they differ by more than 5 % at
+p95, so no `iritur-gl` baseline is committed. Where the time goes on this host:
+
+- `submit` is mostly the driver: a frame is about six vmwgfx ioctls, and `glFenceSync` (the
+  ring slot's fence) is where Mesa's svga driver flushes its command buffer. For S3 the
+  gather of 800 KB into the coherent mapping is ~0.5 ms against 0.2 ms into host memory (the
+  bench's own `encode`); the mapped-range ring (`--gl-ring mapped`) measured a lower p50
+  (0.51 ms) and a higher p95 (2.4 ms) in one 300-frame pair, not enough to change the default.
+- `gpu`: with trivial shaders S3 still costs 4.3–4.6 ms (2.3 ms without any instance fetch),
+  so a third of the frame is per-instance fixed cost on SVGA3D; the shading itself is the
+  other half. Six-vertex triangles and four-vertex instanced strips measure the same.
+- The UI-thread stages run 40–50 % slower beside the GPU work than with `--backend none` in
+  the same minutes (S3 emit+order+encode p50 1.44–1.55 ms against 1.02 ms): the host's 3D
+  work shares the vCPUs.
+- G5 for `gl` rows: no `operator new` in any steady frame; `mallinfo2` moves by 592 B (S3)
+  and 0.9–7 KB (S2) inside Mesa (sync objects, command buffers), which the script counts as
+  a G5 failure — the driver's heap, not the frame path's.
+
 ---
 
 ## 6.1 Frame clock and scanout rotation
