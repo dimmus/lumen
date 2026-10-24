@@ -459,6 +459,26 @@ LUMEN_TEST(alignment_follows_the_paragraph_direction) {
     LUMEN_CHECK(l.lines()[0].x == box - wr);
     l.set_align(lt::text_align::end);
     LUMEN_CHECK(l.lines()[0].x == 0);
+    // Wider than the box: the start edge stays put and the line overflows toward its end —
+    // an RTL line keeps its right edge on the box's and runs out past the left one, for
+    // every alignment; an LTR line starts at 0.
+    l.set_wrap(lt::text_wrap::none);
+    l.set_max_width(5.f);
+    const std::int32_t small = px(5);
+    for (const lt::text_align a :
+         {lt::text_align::start, lt::text_align::end, lt::text_align::center}) {
+        l.set_align(a);
+        const lt::layout_line& line = l.lines()[0];
+        LUMEN_CHECK(line.width > small);
+        LUMEN_CHECK(line.x == small - line.width && line.x < 0);
+        LUMEN_CHECK(l.runs()[0].x + l.runs()[0].width <= small);
+    }
+    l.set_text("abc");
+    for (const lt::text_align a :
+         {lt::text_align::start, lt::text_align::end, lt::text_align::center}) {
+        l.set_align(a);
+        LUMEN_CHECK(l.lines()[0].width > small && l.lines()[0].x == 0);
+    }
 }
 
 // ── Hit testing ────────────────────────────────────────────────────────────────────
@@ -654,6 +674,17 @@ LUMEN_TEST(attributes_split_runs_and_reach_them) {
          .tag = 7},
     };
     l.set_attrs(attrs);
+    LUMEN_CHECK(l.update().ok());
+    // The same spans again (the normalised form, or the input as given) are no change.
+    const std::uint64_t generation = l.shape_generation();
+    l.set_attrs(attrs);
+    const std::vector<lt::text_attr> normalised(l.attrs().begin(), l.attrs().end());
+    l.set_attrs(normalised);
+    LUMEN_CHECK(l.shape_generation() == generation && !l.dirty());
+    // Out of order is sorted first: still equal, still no change.
+    const lt::text_attr reversed[] = {attrs[1], attrs[0]};
+    l.set_attrs(reversed);
+    LUMEN_CHECK(l.shape_generation() == generation && !l.dirty());
     bool saw_bold = false;
     bool saw_link = false;
     for (const lt::layout_run& r : l.runs()) {

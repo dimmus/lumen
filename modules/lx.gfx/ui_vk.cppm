@@ -179,6 +179,12 @@ struct ui_vk_composite_options {
     /// `k_text_contrast_dark` for light text on dark chrome, `k_text_contrast_light` for dark on
     /// light.
     float text_contrast = k_text_contrast_dark;
+    /// The lock guarding the atlas's pages and dirty lists against their writer (the
+    /// compositor's `chrome_atlas` mutex), or null when the caller serialises them itself.
+    /// Taken only while the stream is encoded and the dirty rects are copied into staging —
+    /// after the ring-slot and composite-slot fence waits, never across them — so a writer
+    /// on another thread never waits for the GPU.
+    std::mutex* atlas_mutex = nullptr;
 };
 
 /// One compositor frame drawn by `ui_vk_renderer::composite`: the UI renderer's side (instances,
@@ -321,9 +327,10 @@ public:
     /// coverage raised to `options.text_contrast` (the push constant's linear flag; shaders/ui
     /// `lx_instance_color`, `lx_text_coverage`). The whole target is drawn (Vulkan repaints
     /// every frame) and cleared to `clear` first. The ring slot is fenced by an empty submit
-    /// after the compositor's; the atlas's dirty lists are cleared once that submit is made.
-    /// On an error nothing is submitted, the compositor's acquires are un-marked and the atlas
-    /// stays dirty. Render affinity in the compositor (`set_owner_affinity`).
+    /// after the compositor's. The atlas's dirty lists are cleared as their rects are copied
+    /// into staging (under `options.atlas_mutex` when given, which is held for nothing else);
+    /// on an error nothing is submitted, the compositor's acquires are un-marked and the pages
+    /// copied go up whole next time. Render affinity in the compositor (`set_owner_affinity`).
     [[nodiscard]] lx::result<ui_vk_composite_stats>
     composite(vulkan_compositor& compositor, render_target& target, lx::color clear,
               const ui_stream& stream, atlas* atlas, const ui_vk_composite_options& options = {});
@@ -2159,35 +2166,58 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
             timed_slot_ = -1;
     }
     free_transient(slot);
-    std::byte* slot_bytes = ring_mapped_ + static_cast<std::size_t>(slot) * k_ui_vk_slot_bytes;
-    ui_encode::encode_counts counts{};
-    stats.instance_bytes = ui_encode::encode(stream, atlas, slot_bytes, k_ui_vk_slot_bytes,
-                                             batch_word_, batch_count_, counts);
-    stats.primitives_encoded = counts.encoded;
-    stats.primitives_skipped = counts.skipped;
-    stats.overflow_drops = counts.overflow_drops;
-    const float globals[4] = {static_cast<float>(target.width()),
-                              static_cast<float>(target.height()), 0.f, 0.f};
-    std::memcpy(ring_mapped_ + k_globals_offset + slot * k_globals_stride, globals, sizeof globals);
-
+    // The compositor's frame (it waits for its own slot's fence) before the atlas is locked.
     auto frame = compositor.begin_linear_frame(target, stream.surfaces.data(),
                                                static_cast<unsigned>(stream.surfaces.size()));
     if (!frame)
         return frame.get_error();
     auto cb = static_cast<VkCommandBuffer>(frame->command_buffer);
-    // Before the pass: the atlas copies; then this slot's page descriptors and the pipelines
-    // made for the compositor's pass.
-    if (atlas) {
-        if (auto up = upload_atlas(*atlas, cb, slot, stats); !up) {
-            compositor.abandon_linear_frame();
-            return up.get_error();
+    // Pages whose dirty rects this frame copied: if the frame is not submitted, they go up
+    // whole next time (their dirty lists are already cleared).
+    const auto abandon = [&] {
+        compositor.abandon_linear_frame();
+        for (unsigned i = 0; i < k_atlas_pages; ++i)
+            if (page_uploaded_[i]) {
+                page_whole_pending_[i] = true;
+                page_uploaded_[i] = false;
+            }
+    };
+
+    std::byte* slot_bytes = ring_mapped_ + static_cast<std::size_t>(slot) * k_ui_vk_slot_bytes;
+    {
+        // The atlas's pages and dirty lists, under the writer's lock: encode's page checks
+        // and the dirty rects copied into staging, cleared while the lock is still held so
+        // a rect added after the copy stays for the next frame.
+        std::unique_lock<std::mutex> atlas_lock{};
+        if (atlas && options.atlas_mutex)
+            atlas_lock = std::unique_lock<std::mutex>{*options.atlas_mutex};
+        ui_encode::encode_counts counts{};
+        stats.instance_bytes = ui_encode::encode(stream, atlas, slot_bytes, k_ui_vk_slot_bytes,
+                                                 batch_word_, batch_count_, counts);
+        stats.primitives_encoded = counts.encoded;
+        stats.primitives_skipped = counts.skipped;
+        stats.overflow_drops = counts.overflow_drops;
+        // Before the pass: the atlas copies.
+        if (atlas) {
+            if (auto up = upload_atlas(*atlas, cb, slot, stats); !up) {
+                abandon();
+                return up.get_error();
+            }
+            for (unsigned i = 0; i < k_atlas_pages; ++i)
+                if (page_uploaded_[i])
+                    atlas->clear_dirty(i);
         }
     }
+    const float globals[4] = {static_cast<float>(target.width()),
+                              static_cast<float>(target.height()), 0.f, 0.f};
+    std::memcpy(ring_mapped_ + k_globals_offset + slot * k_globals_stride, globals, sizeof globals);
+
+    // This slot's page descriptors and the pipelines made for the compositor's pass.
     if (set_generation_[slot] != page_generation_)
         write_page_descriptors(slot);
     auto pipelines = ensure_pipelines(frame->vk_format, frame->render_pass);
     if (!pipelines) {
-        compositor.abandon_linear_frame();
+        abandon();
         return pipelines.get_error();
     }
     const pipeline_set& set = pipeline_sets_[*pipelines];
@@ -2231,7 +2261,7 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
                 vkCmdSetViewport(cb, 0, 1, &viewport);
                 vkCmdSetScissor(cb, 0, 1, &scissor);
                 if (!drawn) {
-                    compositor.abandon_linear_frame();
+                    abandon();
                     return drawn.get_error();
                 }
                 stats.draw_calls += drawn->draws_submitted;
@@ -2272,8 +2302,15 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
     }
 
     auto ended = compositor.end_linear_frame();
-    if (!ended)
-        return ended.get_error(); // abandoned there: nothing submitted, the atlas stays dirty
+    if (!ended) {
+        // Abandoned there: nothing submitted; the pages copied go up whole next time.
+        for (unsigned i = 0; i < k_atlas_pages; ++i)
+            if (page_uploaded_[i]) {
+                page_whole_pending_[i] = true;
+                page_uploaded_[i] = false;
+            }
+        return ended.get_error();
+    }
     out.composite.out_fence_fd = ended->out_fence_fd;
     // This slot's instances, staging range and page descriptors are free once the compositor's
     // frame is: an empty submit signals the slot's fence after it.
@@ -2286,9 +2323,9 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
     }
     ++frame_;
     if (atlas) {
+        // The dirty lists were cleared when their rects were copied (above, under the lock).
         for (unsigned i = 0; i < k_atlas_pages; ++i)
             if (page_uploaded_[i]) {
-                atlas->clear_dirty(i);
                 page_whole_pending_[i] = false;
                 page_uploaded_[i] = false;
             }

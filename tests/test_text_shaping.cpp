@@ -420,6 +420,44 @@ LUMEN_TEST(shape_cache_arena_overflow_evicts_least_recently_used) {
     LUMEN_CHECK(!small.shape(faces, req)->hit);
 }
 
+LUMEN_TEST(shape_cache_keeps_and_compares_the_run_bytes) {
+    auto& faces = lx::text::face_cache::shared();
+    const lx::text::face_id id = dejavu();
+    if (!id.valid())
+        return;
+    // Room for the glyphs of many runs but the bytes of two 19-byte runs: the text arena
+    // decides what stays.
+    lx::text::shape_cache_config cfg{};
+    cfg.entries = 64;
+    cfg.glyph_capacity = 1024;
+    cfg.text_capacity = 40;
+    lx::text::shape_cache cache{cfg};
+    char text[3][24];
+    for (int i = 0; i < 3; ++i)
+        std::snprintf(text[i], sizeof(text[i]), "%c123456789012345678", 'a' + i);
+    const auto shape = [&](int i) {
+        lx::text::shape_request req{};
+        req.face = id;
+        req.size_26_6 = 12 * 64;
+        req.utf8 = text[i];
+        return cache.shape(faces, req);
+    };
+    LUMEN_CHECK(shape(0)->stored && shape(1)->stored);
+    auto c = cache.counters();
+    LUMEN_CHECK(c.text_bytes_in_use == 38 && c.text_bytes_capacity == 40 && c.evictions == 0);
+    LUMEN_CHECK(shape(1)->hit);
+    LUMEN_CHECK(shape(2)->stored); // run 0's bytes go: it is the least recently used
+    c = cache.counters();
+    LUMEN_CHECK(c.evictions == 1 && c.entries == 2 && c.text_bytes_in_use == 38);
+    LUMEN_CHECK(c.compactions == 1);
+    // The survivors' bytes moved with the compaction and still answer: a hit compares them.
+    LUMEN_CHECK(shape(1)->hit && shape(2)->hit);
+    LUMEN_CHECK(!shape(0)->hit);
+    // The default text arena is four bytes a glyph.
+    LUMEN_CHECK(lx::text::shape_cache{}.counters().text_bytes_capacity ==
+                4ull * lx::text::k_shape_cache_glyphs);
+}
+
 LUMEN_TEST(shape_cache_drop_newest_keeps_the_cache_and_still_shapes) {
     auto& faces = lx::text::face_cache::shared();
     const lx::text::face_id id = dejavu();

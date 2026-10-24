@@ -401,7 +401,8 @@ LUMEN_TEST(full_sets_replace_their_least_recently_used_way) {
     fx.atlas->begin_frame(1);
     for (unsigned i = 0; i < 8; ++i)
         LUMEN_CHECK(static_cast<bool>(fx.glyphs->get(*fx.faces, {face, k_14px, ids[i], 0})));
-    fx.atlas->begin_frame(2);
+    // The atlas's stale age later: "a" has not been drawn since frame 1.
+    fx.atlas->begin_frame(1 + lx::gfx::k_atlas_stale_frames);
     // Touch "b" … "h": "a" is the least recently used.
     for (unsigned i = 1; i < 8; ++i)
         LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[i], 0}) != nullptr);
@@ -410,7 +411,8 @@ LUMEN_TEST(full_sets_replace_their_least_recently_used_way) {
     LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[0], 0}) == nullptr);
     const lx::text::glyph_cache_counters c = fx.glyphs->counters();
     LUMEN_CHECK(c.evictions == 1 && c.tiles_released == 1 && c.live == 8 && c.capacity == 8);
-    // "a" was last used in frame 1, so its tile went back to the atlas.
+    LUMEN_CHECK(c.tiles_aging == 0);
+    // "a" was stale by the atlas's rule, so its tile went back to the atlas.
     LUMEN_CHECK(fx.atlas->stats().live_tiles == tiles_before);
     // `reject` keeps the set and fails the glyph.
     lx::text::glyph_cache_config strict = one_set;
@@ -420,6 +422,82 @@ LUMEN_TEST(full_sets_replace_their_least_recently_used_way) {
         LUMEN_CHECK(static_cast<bool>(rejecting.get(*fx.faces, {face, k_14px, ids[i], 0})));
     auto refused = rejecting.get(*fx.faces, {face, k_14px, ids[9], 0});
     LUMEN_CHECK(!refused && rejecting.counters().overflows == 1);
+}
+
+LUMEN_TEST(replacing_a_way_never_frees_a_tile_still_drawn) {
+    // Retained emitters (a text node's placements, the compositor's title runs) draw through
+    // `atlas::use` and never touch the table: the victim is chosen by the atlas's clock, and
+    // a tile drawn within the stale age is left to age out, never handed to another glyph.
+    lx::text::glyph_cache_config one_set{};
+    one_set.entries = lx::text::k_glyph_cache_ways;
+    raster_fixture fx{one_set};
+    const lx::text::face_id face = fx.faces->resolve(lx::text::font_desc{});
+    if (!face.valid())
+        return;
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, k_14px, "abcdefghi");
+    LUMEN_CHECK(ids.size() == 9);
+    fx.atlas->begin_frame(1);
+    lx::gfx::atlas_tile_id tiles[8]{};
+    std::vector<std::uint8_t> pixels[8];
+    for (unsigned i = 0; i < 8; ++i) {
+        auto e = fx.glyphs->get(*fx.faces, {face, k_14px, ids[i], 0});
+        LUMEN_CHECK(e && !(*e)->empty());
+        tiles[i] = (*e)->tile;
+        lx::gfx::atlas_tile t{};
+        LUMEN_CHECK(fx.atlas->lookup(tiles[i], t));
+        pixels[i] = fx.texels(t);
+    }
+    // Frame 2 draws every glyph but "c" through the atlas only. The table's own clock still
+    // says "a" is the oldest (it was filled first).
+    fx.atlas->begin_frame(2);
+    for (unsigned i = 0; i < 8; ++i) {
+        lx::gfx::atlas_tile t{};
+        if (i != 2)
+            LUMEN_CHECK(fx.atlas->use(tiles[i], t));
+    }
+    auto added = fx.glyphs->get(*fx.faces, {face, k_14px, ids[8], 0});
+    LUMEN_CHECK(static_cast<bool>(added));
+    const lx::text::glyph_cache_counters c = fx.glyphs->counters();
+    LUMEN_CHECK(c.evictions == 1 && c.tiles_released == 0 && c.tiles_aging == 1);
+    // "c" went (drawn longest ago), "a" stayed.
+    LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[2], 0}) == nullptr);
+    LUMEN_CHECK(fx.glyphs->find({face, k_14px, ids[0], 0}) != nullptr);
+    // Every tile drawn in frames 1–2 is still where it was, with its pixels, and the new
+    // glyph's tile overlaps none of them.
+    lx::gfx::atlas_tile fresh{};
+    LUMEN_CHECK(fx.atlas->lookup((*added)->tile, fresh));
+    for (unsigned i = 0; i < 8; ++i) {
+        lx::gfx::atlas_tile t{};
+        LUMEN_CHECK(fx.atlas->lookup(tiles[i], t));
+        LUMEN_CHECK(fx.texels(t) == pixels[i]);
+        const bool overlap = t.page == fresh.page && t.x < fresh.x + fresh.w &&
+                             fresh.x < t.x + t.w && t.y < fresh.y + fresh.h &&
+                             fresh.y < t.y + t.h;
+        LUMEN_CHECK(!overlap);
+    }
+    // The dropped tile ages out of the atlas like any unused one.
+    LUMEN_CHECK(!fx.atlas->is_stale(tiles[2]));
+    fx.atlas->begin_frame(1 + lx::gfx::k_atlas_stale_frames);
+    LUMEN_CHECK(fx.atlas->is_stale(tiles[2]));
+    LUMEN_CHECK(fx.atlas->evict_stale() >= 1);
+    lx::gfx::atlas_tile gone{};
+    LUMEN_CHECK(!fx.atlas->lookup(tiles[2], gone));
+}
+
+LUMEN_TEST(oversize_glyphs_fail_before_rendering) {
+    lx::text::glyph_cache_config small{};
+    small.max_glyph_px = 8;
+    raster_fixture fx{small};
+    const lx::text::face_id face = fx.faces->resolve(lx::text::font_desc{});
+    if (!face.valid())
+        return;
+    const std::vector<std::uint32_t> ids = fx.glyph_ids(face, 40 * 64, "M");
+    LUMEN_CHECK(ids.size() == 1);
+    fx.atlas->begin_frame(1);
+    LUMEN_CHECK(!fx.glyphs->get(*fx.faces, {face, 40 * 64, ids[0], 0}));
+    const lx::text::glyph_cache_counters c = fx.glyphs->counters();
+    LUMEN_CHECK(c.oversize == 1 && c.failures == 1 && c.rasterized == 0);
+    LUMEN_CHECK(fx.atlas->stats().live_tiles == 0);
 }
 
 LUMEN_TEST(colour_glyph_lands_on_an_rgba8_page) {

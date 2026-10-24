@@ -22,17 +22,19 @@ export namespace lx::text {
 // set over a stretch of UTF-8 — through HarfBuzz into glyph ids, advances, offsets and
 // clusters, and keeps the result: `k_shape_cache_entries` entries keyed by (face id, size
 // in 26.6, features + language hash, direction, script, FNV-1a 64 of the UTF-8, its byte
-// length), least recently used out. The key is a hash of the text, not the text: two
-// different runs with equal key fields and an equal 64-bit FNV-1a would share an entry
-// (with 4 096 entries, odds of about 1 in 2⁴⁰ over the cache's whole content).
+// length), least recently used out. The hash only finds the entry: a hit also compares the
+// run's UTF-8 with the bytes the entry keeps, so two runs whose hashes collide (FNV-1a is
+// easily inverted: a client could craft a window title that collides with another's) never
+// share glyphs. The ellipsis runs `text_layout` shapes per face go through the same check.
 //
-// Glyphs live in one arena of `glyph_capacity` records allocated at construction; nothing
-// allocates after construction except HarfBuzz itself while warming up (a shape plan per
-// face and feature set, a buffer that grows past its preallocation for a run longer than
-// `max_run_glyphs` code points). A full table or arena applies the cache's
-// `overflow_action`: `drop_oldest` (the default) evicts least recently used entries — down to
-// 1/16 of the arena free, so the arena is compacted (live runs slid down, in arena order)
-// once per that many glyphs rather than on every miss; `drop_newest`, `reject` and
+// Glyphs live in one arena of `glyph_capacity` records and the runs' UTF-8 in another of
+// `text_capacity` bytes, both allocated at construction; nothing allocates after
+// construction except HarfBuzz itself while warming up (a shape plan per face and feature
+// set, a buffer that grows past its preallocation for a run longer than `max_run_glyphs`
+// code points). A full table or arena applies the cache's `overflow_action`: `drop_oldest`
+// (the default) evicts least recently used entries — down to 1/16 of each arena free, so the
+// arenas are compacted (live runs slid down, in arena order) once per that many glyphs or
+// bytes rather than on every miss; `drop_newest`, `reject` and
 // `warn_and_drop` (one warning per cache) keep the cache as it is and return the new run
 // from a scratch run that is not stored. A run over `max_run_glyphs` glyphs is cut at the
 // last whole cluster that fits and flagged `truncated`.
@@ -130,6 +132,8 @@ struct shape_cache_config {
     /// Longer runs are cut; at most `glyph_capacity`.
     unsigned max_run_glyphs = k_shape_max_run_glyphs;
     lx::runtime::overflow_action overflow = lx::runtime::overflow_action::drop_oldest;
+    /// UTF-8 bytes of the stored runs (compared on every hit); 0 is 4 × `glyph_capacity`.
+    unsigned text_capacity = 0;
 };
 
 struct shape_cache_counters {
@@ -147,6 +151,9 @@ struct shape_cache_counters {
     std::uint64_t bytes_in_use = 0;
     /// The glyph arena.
     std::uint64_t bytes_capacity = 0;
+    /// The stored runs' UTF-8, and its arena.
+    std::uint64_t text_bytes_in_use = 0;
+    std::uint64_t text_bytes_capacity = 0;
 };
 
 [[nodiscard]] constexpr std::uint64_t fnv1a_64(std::string_view bytes) {
@@ -197,7 +204,8 @@ private:
     };
 
     [[nodiscard]] lx::result<key> make_key(const shape_request& r) const;
-    [[nodiscard]] std::uint32_t find(const key& k) const;
+    /// The entry for `k` whose kept bytes equal `utf8`, or `k_none`.
+    [[nodiscard]] std::uint32_t find(const key& k, std::string_view utf8) const;
     [[nodiscard]] shaped_run hit(std::uint32_t index);
     [[nodiscard]] lx::result<shaped_run> miss_locked(face_cache& faces, const shape_request& r,
                                                      const key& k);
@@ -206,7 +214,9 @@ private:
     void index_insert(std::uint32_t index);
     void index_remove(std::uint32_t index);
     [[nodiscard]] bool take_entry(std::uint32_t& index);
-    [[nodiscard]] bool reserve_glyphs(std::uint32_t n, std::uint32_t& offset);
+    /// Room for `n` glyphs and `bytes` of UTF-8 (evicting, compacting); false: none.
+    [[nodiscard]] bool reserve(std::uint32_t n, std::uint32_t bytes, std::uint32_t& offset,
+                               std::uint32_t& text_offset);
     void compact();
 
     shape_cache_config config_{};
@@ -215,6 +225,9 @@ private:
     std::uint32_t index_mask_ = 0;
     shaped_glyph* arena_ = nullptr;
     shaped_glyph* scratch_ = nullptr;
+    char* text_arena_ = nullptr;
+    std::uint32_t text_top_ = 0;
+    std::uint32_t live_text_ = 0;
     void* buffer_ = nullptr; ///< hb_buffer_t*
     std::uint32_t free_head_ = 0;
     std::uint32_t lru_head_ = 0; ///< most recently used
@@ -255,6 +268,8 @@ struct lx::text::shape_cache::entry {
     std::uint32_t script_out = 0;
     std::uint32_t offset = 0;
     std::uint32_t count = 0;
+    /// The run's UTF-8 (`k.bytes` of it) in the text arena.
+    std::uint32_t text_offset = 0;
     std::int32_t x_advance = 0;
     std::int32_t y_advance = 0;
     std::uint32_t lru_prev = k_none;
@@ -278,6 +293,10 @@ lx::text::shape_cache::shape_cache(shape_cache_config config) : config_{config} 
         config_.glyph_capacity = 1;
     if (config_.max_run_glyphs == 0 || config_.max_run_glyphs > config_.glyph_capacity)
         config_.max_run_glyphs = config_.glyph_capacity;
+    if (config_.text_capacity == 0)
+        config_.text_capacity = config_.glyph_capacity <= 0x3FFFFFFFu
+                                    ? config_.glyph_capacity * 4u
+                                    : 0xFFFFFFFFu;
     unsigned slots = 1;
     while (slots < config_.entries * 2)
         slots <<= 1;
@@ -290,18 +309,22 @@ lx::text::shape_cache::shape_cache(shape_cache_config config) : config_{config} 
         ::operator new(std::size_t{config_.glyph_capacity} * sizeof(shaped_glyph), std::nothrow));
     scratch_ = static_cast<shaped_glyph*>(
         ::operator new(std::size_t{config_.max_run_glyphs} * sizeof(shaped_glyph), std::nothrow));
-    if (!entries_ || !index_ || !arena_ || !scratch_) {
+    text_arena_ = static_cast<char*>(::operator new(std::size_t{config_.text_capacity}, std::nothrow));
+    if (!entries_ || !index_ || !arena_ || !scratch_ || !text_arena_) {
         // Out of memory at construction: every shape call reports it.
         delete[] entries_;
         delete[] index_;
         ::operator delete(arena_);
         ::operator delete(scratch_);
+        ::operator delete(text_arena_);
         entries_ = nullptr;
         index_ = nullptr;
         arena_ = scratch_ = nullptr;
+        text_arena_ = nullptr;
         config_.entries = 0;
         config_.glyph_capacity = 0;
         config_.max_run_glyphs = 0;
+        config_.text_capacity = 0;
     }
     for (std::uint32_t i = 0; i < config_.entries; ++i)
         entries_[i].lru_next = i + 1 < config_.entries ? i + 1 : k_none;
@@ -309,6 +332,7 @@ lx::text::shape_cache::shape_cache(shape_cache_config config) : config_{config} 
     lru_head_ = lru_tail_ = arena_head_ = arena_tail_ = k_none;
     counters_.entry_capacity = config_.entries;
     counters_.bytes_capacity = static_cast<std::uint64_t>(config_.glyph_capacity) * sizeof(shaped_glyph);
+    counters_.text_bytes_capacity = config_.text_capacity;
 #if defined(LUMEN_HAS_TEXT)
     hb_buffer_t* buf = hb_buffer_create();
     if (buf && hb_buffer_allocation_successful(buf)) {
@@ -329,12 +353,14 @@ lx::text::shape_cache::~shape_cache() {
     delete[] index_;
     ::operator delete(arena_);
     ::operator delete(scratch_);
+    ::operator delete(text_arena_);
 }
 
 lx::text::shape_cache_counters lx::text::shape_cache::counters() const {
     shape_cache_counters c = counters_;
     c.entries = live_entries_;
     c.bytes_in_use = static_cast<std::uint64_t>(live_glyphs_) * sizeof(shaped_glyph);
+    c.text_bytes_in_use = live_text_;
     return c;
 }
 
@@ -344,6 +370,7 @@ void lx::text::shape_cache::clear() {
         --counters_.evictions; // a clear is not pressure
     }
     top_ = 0;
+    text_top_ = 0;
 }
 
 lx::result<lx::text::shape_cache::key> lx::text::shape_cache::make_key(const shape_request& r) const {
@@ -386,15 +413,18 @@ lx::result<lx::text::shape_cache::key> lx::text::shape_cache::make_key(const sha
     return k;
 }
 
-std::uint32_t lx::text::shape_cache::find(const key& k) const {
+std::uint32_t lx::text::shape_cache::find(const key& k, std::string_view utf8) const {
     for (std::uint32_t i = static_cast<std::uint32_t>(k.hash) & index_mask_;; i = (i + 1) & index_mask_) {
         const std::uint32_t slot = index_[i];
         if (slot == 0)
             return k_none;
-        const key& e = entries_[slot - 1].k;
+        const entry& en = entries_[slot - 1];
+        const key& e = en.k;
+        // The hash finds the entry; the bytes decide it (a colliding run is a miss).
         if (e.hash == k.hash && e.text_hash == k.text_hash && e.features_hash == k.features_hash &&
             e.face == k.face && e.size == k.size && e.bytes == k.bytes && e.script == k.script &&
-            e.direction == k.direction)
+            e.direction == k.direction &&
+            std::memcmp(text_arena_ + en.text_offset, utf8.data(), k.bytes) == 0)
             return slot - 1;
     }
 }
@@ -472,13 +502,14 @@ void lx::text::shape_cache::evict(std::uint32_t i) {
     else
         arena_tail_ = e.arena_prev;
     live_glyphs_ -= e.count;
+    live_text_ -= e.k.bytes;
     --live_entries_;
     e = entry{};
     e.lru_next = free_head_;
     free_head_ = i;
     ++counters_.evictions;
     if (arena_tail_ == k_none)
-        top_ = 0;
+        top_ = text_top_ = 0;
 }
 
 bool lx::text::shape_cache::take_entry(std::uint32_t& index) {
@@ -493,37 +524,55 @@ bool lx::text::shape_cache::take_entry(std::uint32_t& index) {
 }
 
 void lx::text::shape_cache::compact() {
+    // Both arenas fill in arena order (an entry's glyphs and bytes are reserved together).
     std::uint32_t dst = 0;
+    std::uint32_t text_dst = 0;
     for (std::uint32_t i = arena_head_; i != k_none; i = entries_[i].arena_next) {
         entry& e = entries_[i];
         if (e.offset != dst && e.count > 0)
             std::memmove(arena_ + dst, arena_ + e.offset, e.count * sizeof(shaped_glyph));
         e.offset = dst;
         dst += e.count;
+        if (e.text_offset != text_dst && e.k.bytes > 0)
+            std::memmove(text_arena_ + text_dst, text_arena_ + e.text_offset, e.k.bytes);
+        e.text_offset = text_dst;
+        text_dst += e.k.bytes;
     }
     top_ = dst;
+    text_top_ = text_dst;
     ++counters_.compactions;
 }
 
-bool lx::text::shape_cache::reserve_glyphs(std::uint32_t n, std::uint32_t& offset) {
+bool lx::text::shape_cache::reserve(std::uint32_t n, std::uint32_t bytes, std::uint32_t& offset,
+                                    std::uint32_t& text_offset) {
     const std::uint32_t cap = config_.glyph_capacity;
-    if (n > cap)
+    const std::uint32_t text_cap = config_.text_capacity;
+    if (n > cap || bytes > text_cap)
         return false;
-    if (top_ + n > cap) {
+    if (top_ + n > cap || text_top_ + bytes > text_cap) {
         if (config_.overflow == lx::runtime::overflow_action::drop_oldest) {
-            // Free the room asked for plus 1/16 of the arena, so the compaction below runs
-            // once per that many glyphs, not on every miss once the arena is full.
-            const std::uint64_t slack = cap / 16;
-            const std::uint64_t want = n + slack < cap ? n + slack : cap;
-            while (lru_tail_ != k_none && static_cast<std::uint64_t>(cap - live_glyphs_) < want)
+            // Free the room asked for plus 1/16 of each arena, so the compaction below runs
+            // once per that many glyphs or bytes, not on every miss once an arena is full.
+            const auto want = [](std::uint64_t asked, std::uint32_t capacity) {
+                const std::uint64_t slack = capacity / 16;
+                return asked + slack < capacity ? asked + slack : std::uint64_t{capacity};
+            };
+            const std::uint64_t want_glyphs = top_ + n > cap ? want(n, cap) : n;
+            const std::uint64_t want_text = text_top_ + bytes > text_cap ? want(bytes, text_cap)
+                                                                          : bytes;
+            while (lru_tail_ != k_none &&
+                   (static_cast<std::uint64_t>(cap - live_glyphs_) < want_glyphs ||
+                    static_cast<std::uint64_t>(text_cap - live_text_) < want_text))
                 evict(lru_tail_);
         }
-        if (live_glyphs_ + n > cap)
+        if (live_glyphs_ + n > cap || live_text_ + bytes > text_cap)
             return false;
         compact();
     }
     offset = top_;
     top_ += n;
+    text_offset = text_top_;
+    text_top_ += bytes;
     return true;
 }
 
@@ -553,7 +602,7 @@ lx::result<lx::text::shaped_run> lx::text::shape_cache::shape(face_cache& faces,
     const lx::result<key> k = make_key(request);
     if (!k)
         return k.get_error();
-    if (const std::uint32_t i = find(*k); i != k_none)
+    if (const std::uint32_t i = find(*k, request.utf8); i != k_none)
         return hit(i);
     auto lock = faces.lock();
     return miss_locked(faces, request, *k);
@@ -569,7 +618,7 @@ lx::result<lx::text::shaped_run> lx::text::shape_cache::shape_locked(face_cache&
     const lx::result<key> k = make_key(request);
     if (!k)
         return k.get_error();
-    if (const std::uint32_t i = find(*k); i != k_none)
+    if (const std::uint32_t i = find(*k, request.utf8); i != k_none)
         return hit(i);
     return miss_locked(faces, request, *k);
 }
@@ -622,9 +671,10 @@ lx::result<lx::text::shaped_run> lx::text::shape_cache::miss_locked(face_cache& 
 
     std::uint32_t index = k_none;
     std::uint32_t offset = 0;
+    std::uint32_t text_offset = 0;
     bool stored = false;
     if (take_entry(index)) {
-        if (reserve_glyphs(count, offset)) {
+        if (reserve(count, k.bytes, offset, text_offset)) {
             stored = true;
         } else {
             // Give the entry back: no room for its glyphs.
@@ -669,6 +719,9 @@ lx::result<lx::text::shaped_run> lx::text::shape_cache::miss_locked(face_cache& 
     e.script_out = run.script;
     e.offset = offset;
     e.count = count;
+    e.text_offset = text_offset;
+    if (k.bytes > 0)
+        std::memcpy(text_arena_ + text_offset, r.utf8.data(), k.bytes);
     e.x_advance = run.x_advance;
     e.y_advance = run.y_advance;
     e.direction_out = static_cast<std::uint8_t>(run.direction);
@@ -689,6 +742,7 @@ lx::result<lx::text::shaped_run> lx::text::shape_cache::miss_locked(face_cache& 
         lru_tail_ = index;
     index_insert(index);
     live_glyphs_ += count;
+    live_text_ += k.bytes;
     ++live_entries_;
     return run;
 #else

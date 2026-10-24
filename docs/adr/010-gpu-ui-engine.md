@@ -347,8 +347,9 @@ does not relayout.
 
 As built in Phase 2 (`:raster`, `lx.ui:text_node`): `lx.text` depends on `lx.gfx` for the atlas
 (tile ids and `atlas::insert` / `lookup` / `touch` only). `glyph_cache` is a set-associative
-table (16 384 entries, 8 ways, LRU replacement that releases a replaced way's tile unless it was
-drawn in the atlas's current frame) keyed by (face, size × scale, variant, glyph, hinting); the
+table (16 384 entries, 8 ways; a full set replaces the way the atlas saw drawn longest ago and
+releases its tile only when the atlas already counts it stale, else leaves it to the 120-frame
+aging, since retained emitters touch the atlas, not the table) keyed by (face, size × scale, variant, glyph, hinting); the
 pen rounds to the nearest quarter pixel (`glyph_pen`), the variant moves the outline before
 FreeType renders it; colour glyphs are rasterised once at variant 0 and answer every variant;
 a tile the atlas evicted is rasterised again on the frame that needs it. The text node is

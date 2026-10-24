@@ -43,13 +43,18 @@ export namespace lx::text {
 // Storage: a set-associative table of `k_glyph_cache_ways` ways per set, fixed at
 // construction, each way a key, the tile id and the bitmap's placement, beside a 32-bit tag
 // per way (the key's hash) that a probe compares first: one cache line of tags per set. A full set replaces
-// its least recently used way (`overflow_action::drop_oldest`, the default) and releases that
-// way's tile when it was not used in the atlas's current frame (a tile drawn this frame stays
-// until the atlas ages it out); `reject` / `warn_and_drop` keep the set and fail the new glyph
-// (`warn_and_drop` warns once). Rasterising writes into a scratch bitmap of
-// `max_glyph_px`² RGBA texels allocated at construction, so a miss allocates nothing beyond
-// FreeType's own glyph-slot work; a glyph larger than that fails (counted). Nothing is
-// allocated on a hit.
+// its least recently drawn way (`overflow_action::drop_oldest`, the default) — recency is the
+// atlas's (`atlas::last_used`), which every emitter keeps current through `atlas::use` even
+// when it skips this table (a retained text node's placements, the compositor's title runs),
+// so a glyph on screen is the last to go. The replaced way's tile is released only when the
+// atlas already counts it stale (unused for `k_atlas_stale_frames`); otherwise the way just
+// drops its reference and the atlas ages the tile out, so a tile a frame in flight (or one
+// emitted earlier in the frame being built) samples is never handed to another glyph.
+// `reject` / `warn_and_drop` keep the set and fail the new glyph (`warn_and_drop` warns once).
+// Rasterising writes into a scratch bitmap of `max_glyph_px`² RGBA texels allocated at
+// construction, so a miss allocates nothing beyond FreeType's own glyph-slot work; a glyph
+// larger than that fails (counted) before it is rendered — its outline's box is checked
+// first. Nothing is allocated on a hit.
 //
 // Atlas tiles are looked up every frame: `place` returns where the tile is now (a rebuild at
 // `atlas::begin_frame` moves tiles; the id stays) and touches it for the 120-frame eviction
@@ -136,9 +141,11 @@ struct glyph_cache_counters {
     std::uint64_t empty = 0;
     /// Misses on an entry whose tile the atlas had evicted (rasterised again).
     std::uint64_t rerasterized = 0;
-    /// Ways replaced in a full set, and the tiles released with them.
+    /// Ways replaced in a full set, and the tiles released with them (stale ones only).
     std::uint64_t evictions = 0;
     std::uint64_t tiles_released = 0;
+    /// Replaced ways whose tile was drawn too recently to free: left for the atlas to age out.
+    std::uint64_t tiles_aging = 0;
     /// Glyphs that could not be cached: a full set without `drop_oldest`.
     std::uint64_t overflows = 0;
     /// FreeType could not load or render, the atlas had no room, or the bitmap was too large.
@@ -206,6 +213,11 @@ private:
     /// A hit: the way is stamped used (LRU clock, atlas frame) and counted.
     void stamp(way& w);
     [[nodiscard]] bool alive(const way& w) const;
+    /// The atlas frame the way's glyph was last drawn in: its tile's `last_used` (kept current
+    /// by emitters that bypass this table), the way's own stamp for an empty glyph, 0 for a
+    /// tile the atlas no longer has.
+    [[nodiscard]] std::uint64_t drawn(const way& w) const;
+    /// Drops the way's tile: released when the atlas counts it stale, else left to age out.
     void release_tile(way& w);
     /// Rasterises `key` into `out` (tile allocated and written). Caller holds the lock.
     [[nodiscard]] lx::result<void> rasterize_locked(face_cache& faces, const glyph_key& key,
@@ -306,15 +318,26 @@ bool lx::text::glyph_cache::alive(const way& w) const {
     return atlas_->lookup(w.entry.tile, t);
 }
 
+std::uint64_t lx::text::glyph_cache::drawn(const way& w) const {
+    if (w.entry.empty())
+        return w.frame;
+    const std::optional<std::uint64_t> last = atlas_->last_used(w.entry.tile);
+    return last ? *last : 0;
+}
+
 void lx::text::glyph_cache::release_tile(way& w) {
     if (!w.entry.tile.valid())
         return;
     lx::gfx::atlas_tile t{};
-    // Released only when nothing of the atlas's current frame can be drawing it: a sprite
-    // emitted this frame names its texels until the frame is built.
-    if (atlas_->lookup(w.entry.tile, t) && w.frame < atlas_->frame()) {
+    // The way's stamps do not say whether the tile is on screen: emitters that keep their own
+    // placements touch the atlas only. A sprite of a frame in flight (or of the frame being
+    // built) samples the tile until the atlas's 120-frame rule lets it go, so only a tile the
+    // atlas already counts stale is freed now; any other ages out there.
+    if (atlas_->is_stale(w.entry.tile)) {
         atlas_->release(w.entry.tile);
         ++counters_.tiles_released;
+    } else if (atlas_->lookup(w.entry.tile, t)) {
+        ++counters_.tiles_aging;
     }
     w.entry.tile = {};
 }
@@ -394,10 +417,16 @@ lx::text::glyph_cache::get_locked(face_cache& faces, const glyph_key& key) {
                     atlas_->release(e.tile);
                 return lx::invalid_argument("glyph_cache: set full");
             }
+            // The way drawn longest ago by the atlas's clock (ties: this table's LRU clock).
             target = &set[0];
-            for (unsigned i = 1; i < k_glyph_cache_ways; ++i)
-                if (set[i].used < target->used)
+            std::uint64_t oldest = drawn(set[0]);
+            for (unsigned i = 1; i < k_glyph_cache_ways; ++i) {
+                const std::uint64_t d = drawn(set[i]);
+                if (d < oldest || (d == oldest && set[i].used < target->used)) {
                     target = &set[i];
+                    oldest = d;
+                }
+            }
             release_tile(*target);
             ++counters_.evictions;
         } else {
@@ -464,6 +493,17 @@ lx::result<void> lx::text::glyph_cache::rasterize_locked(face_cache& faces, cons
             // The subpixel variant: the outline moved right by variant / 4 px (26.6).
             if (key.variant != 0)
                 FT_Outline_Translate(&slot->outline, static_cast<FT_Pos>(key.variant) * 16, 0);
+            // Too large for the scratch: refused before FreeType renders it (the bitmap
+            // FT_RENDER_MODE_NORMAL makes covers the control box rounded out to pixels).
+            FT_BBox box{};
+            FT_Outline_Get_CBox(&slot->outline, &box);
+            const FT_Pos bw = ((box.xMax + 63) & ~FT_Pos{63}) - (box.xMin & ~FT_Pos{63});
+            const FT_Pos bh = ((box.yMax + 63) & ~FT_Pos{63}) - (box.yMin & ~FT_Pos{63});
+            if (bw > static_cast<FT_Pos>(config_.max_glyph_px) * 64 ||
+                bh > static_cast<FT_Pos>(config_.max_glyph_px) * 64) {
+                ++counters_.oversize;
+                return lx::invalid_argument("glyph_cache: glyph bitmap larger than max_glyph_px");
+            }
             if (FT_Render_Glyph(slot, FT_RENDER_MODE_NORMAL) != 0)
                 return lx::invalid_argument("glyph_cache: FreeType could not render the glyph");
         } else if (slot->format != FT_GLYPH_FORMAT_BITMAP) {

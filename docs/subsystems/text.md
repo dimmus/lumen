@@ -47,9 +47,9 @@ Every structure is sized at construction; growth past a cap applies its `overflo
 | Face cache | 32 faces | least recently used face dropped (ids are never reused, so nothing keyed by an old id can hit) |
 | Itemizer | 65 536 code points per call, 4 096 runs | the rest of a long paragraph is a further chunk; extra runs merge into the last (`runs_overflowed`) or the call fails (`reject`) |
 | Fallback table (per itemizer) | 256 (primary, script, block) entries, direct-mapped; a 4 096-entry (face, code point) coverage memo | a colliding key replaces the entry |
-| Shape cache | 4 096 entries, 131 072 glyphs, 4 096 glyphs per run | `drop_oldest` (LRU, the arena compacted 1/16 at a time); a longer run is cut at a cluster (`truncated`) |
+| Shape cache | 4 096 entries, 131 072 glyphs, 4 096 glyphs per run, 4 × the glyphs in UTF-8 bytes (compared on every hit) | `drop_oldest` (LRU, the arenas compacted 1/16 at a time); a longer run is cut at a cluster (`truncated`) |
 | `text_layout` | 4 MiB of UTF-8, 1 M glyphs, 65 536 runs, 65 536 lines, 4 096 attribute spans, 16 faces | `truncated()`, or the pass fails with `reject` |
-| Glyph cache | 16 384 ways (the compositor's: 4 096), bitmaps up to 256 px (128) | the set's least recently used way replaced, its tile released unless drawn this atlas frame |
+| Glyph cache | 16 384 ways (the compositor's: 4 096), bitmaps up to 256 px (128) | the set's way drawn longest ago (by the atlas's clock) replaced; its tile released only if already stale, else left to the atlas's 120-frame aging |
 | Atlas (`lx.gfx:atlas`) | 4 R8 + 2 RGBA8 pages, 1024² growing once to 2048²; 16 384 tiles; 256 dirty rects per page | stale tiles (unused 120 frames) freed in place; a page above 85 % with stale tiles rebuilt at the next `begin_frame`; more dirty rects make the page whole-dirty |
 
 Per glyph a layout keeps about 20 B, per cluster 28 B, per line and per run 64 B, plus a

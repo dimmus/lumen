@@ -5,6 +5,7 @@
 // the test thread is the UI thread and drains the UI strand.
 #include "lumen_test.hpp"
 
+#include <stdlib.h>
 #include <unistd.h>
 
 import std;
@@ -14,6 +15,29 @@ import lx.runtime;
 import lx.scene;
 import lx.text;
 import lx.ui;
+
+namespace {
+/// Every allocation through the replaced operator new (G5: a reconcile of unchanged props
+/// allocates nothing).
+std::atomic<unsigned long long> g_allocations{0};
+} // namespace
+
+void* operator new(std::size_t n) {
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+    if (void* p = std::malloc(n ? n : 1))
+        return p;
+    throw std::bad_alloc{};
+}
+void* operator new[](std::size_t n) {
+    g_allocations.fetch_add(1, std::memory_order_relaxed);
+    if (void* p = std::malloc(n ? n : 1))
+        return p;
+    throw std::bad_alloc{};
+}
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
 
 namespace {
 
@@ -284,6 +308,94 @@ LUMEN_TEST(ui_thread_gets_the_face_lock_while_the_worker_shapes) {
                 static_cast<unsigned long long>(c.lock_yields));
     // The pass handed the lock over rather than holding it to the end.
     LUMEN_CHECK(attempts < 3 || c.lock_yields > 0);
+}
+
+LUMEN_TEST(reapplying_identical_props_allocates_nothing) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    auto e = std::make_unique<env>();
+    if (skip(*e, "reapplying_identical_props_allocates_nothing"))
+        return;
+    const lt::text_attr attrs[] = {
+        {.begin = 6, .end = 10, .weight = lt::weight::bold},
+        {.begin = 11, .end = 15, .color = 0x3366FFFFu, .underline = lt::text_underline::single},
+    };
+    lx::ui::text_block_props p = e->props("plain bold link");
+    p.context.async = nullptr;
+    p.attrs = attrs;
+    lx::ui::text_block_node node{};
+    node.apply(p);
+    LUMEN_CHECK(draw(node, *e, 400) > 0);
+    const std::uint64_t generation = node.layout().shape_generation();
+    const unsigned long long before = g_allocations.load(std::memory_order_relaxed);
+    for (int i = 0; i < 100; ++i)
+        node.apply(p);
+    const unsigned long long allocated = g_allocations.load(std::memory_order_relaxed) - before;
+    LUMEN_CHECK(allocated == 0);
+    LUMEN_CHECK(node.layout().shape_generation() == generation && !node.layout().dirty());
+}
+
+LUMEN_TEST(a_glyph_that_fails_is_not_retried_every_frame) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    auto e = std::make_unique<env>();
+    if (skip(*e, "a_glyph_that_fails_is_not_retried_every_frame"))
+        return;
+    // Every glyph is larger than this cache's bitmaps: rasterising fails.
+    lt::glyph_cache_config tiny_config{};
+    tiny_config.max_glyph_px = 2;
+    lt::glyph_cache tiny{e->atlas, tiny_config};
+    lx::ui::text_block_props p = e->props("Lumen");
+    p.context.async = nullptr;
+    p.context.glyphs = &tiny;
+    lx::ui::text_block_node node{};
+    node.apply(p);
+    LUMEN_CHECK(draw(node, *e, 400) == 0);
+    const unsigned failed = node.last_emit().failures;
+    const std::uint64_t tried = tiny.counters().oversize;
+    LUMEN_CHECK(failed == 5 && tried == 5);
+    // The next frames draw nothing and ask FreeType nothing.
+    for (int i = 0; i < 10; ++i) {
+        (void)draw(node, *e, 400);
+        LUMEN_CHECK(node.last_emit().failures == failed && node.last_emit().rasterized == 0);
+    }
+    LUMEN_CHECK(tiny.counters().oversize == tried);
+    // A stale age later they are tried once more.
+    e->atlas.begin_frame(e->atlas.frame() + lx::gfx::k_atlas_stale_frames);
+    (void)draw(node, *e, 400);
+    LUMEN_CHECK(tiny.counters().oversize == tried + 5);
+}
+
+LUMEN_TEST(a_block_whose_face_was_evicted_reshapes) {
+    lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    auto e = std::make_unique<env>();
+    if (skip(*e, "a_block_whose_face_was_evicted_reshapes"))
+        return;
+    lx::ui::text_block_props p = e->props("Retained text");
+    p.context.async = nullptr;
+    lx::ui::text_block_node node{};
+    node.apply(p);
+    const unsigned sprites = draw(node, *e, 400);
+    LUMEN_CHECK(sprites > 0 && node.last_emit().failures == 0);
+    const std::uint64_t passes = node.layout().counters().shape_passes;
+    // Fill the face cache's LRU with other faces: the block's face is evicted (its slot
+    // reused under a new id), and its glyphs leave the glyph cache.
+    const std::uint64_t evicted = e->faces.stats().evictions;
+    for (unsigned i = 0; i < lt::k_face_cache_size; ++i) {
+        char family[32];
+        std::snprintf(family, sizeof family, "Lumen Evict %u", i);
+        (void)e->faces.resolve(family, lt::weight::normal, lt::style::normal);
+    }
+    LUMEN_CHECK(e->faces.stats().evictions >= evicted + 1);
+    e->glyphs.clear();
+    // This frame finds the face gone (and asks for a relayout); the next one reshapes and
+    // draws everything again.
+    lx::ui::ui_damage().clear();
+    (void)draw(node, *e, 400);
+    LUMEN_CHECK(node.last_emit().failures > 0);
+    LUMEN_CHECK(lx::ui::ui_damage().needs_layout());
+    lx::ui::ui_damage().clear();
+    LUMEN_CHECK(draw(node, *e, 400) == sprites);
+    LUMEN_CHECK(node.last_emit().failures == 0);
+    LUMEN_CHECK(node.layout().counters().shape_passes == passes + 1);
 }
 
 int main(int argc, char** argv) {

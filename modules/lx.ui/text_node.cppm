@@ -45,7 +45,12 @@ export namespace lx::ui {
 // `atlas::use` per glyph (which also tells an evicted tile, placed again through the glyph
 // cache) and one sprite. A glyph not in the glyph cache is rasterised on that frame (counted
 // in `last_emit().rasterized`) under the text engine's face lock, taken once per emit and
-// only when something missed. Order: a line's sprites share one order from the overlap grid
+// only when something missed. A glyph that cannot be rasterised is remembered as failed and
+// not tried again for `gfx::k_atlas_stale_frames` frames (or until the layout runs a pass),
+// so a glyph that never succeeds costs no FreeType work per frame. When the failure is a
+// face the face cache evicted since the shape pass (its 32-face LRU reuses the slot under a
+// new id), the block reshapes: inline text on the next frame (the layout's shape pass
+// invalidated, the node's layout too), off-thread text through another worker job. Order: a line's sprites share one order from the overlap grid
 // (`draw_scope::group_order` over their union, at most 128 sprites a group; a run's underline
 // closes the group so it draws above the run), so they cost no grid lookup each and batch in
 // push order; each group's order is at least the previous one's + 1, so a block's groups
@@ -169,6 +174,9 @@ private:
     static void land_job(void* job);
     /// The layout's max width (logical px) for a device-pixel width; 0 is unbounded.
     [[nodiscard]] float logical_width(int device_px) const;
+    /// UI affinity: a face the layout's runs name is gone from the face cache. Reshapes —
+    /// inline on the next frame, or through another worker job for off-thread text.
+    void faces_evicted();
 
     mutable lx::text::text_layout layout_{};
     lx::color color_ = lx::color::rgb(1.f, 1.f, 1.f);
@@ -184,10 +192,13 @@ private:
     struct placed_glyph {
         std::int32_t x = 0;
         std::int32_t y = 0;
-        std::uint32_t tile = 0; ///< `gfx::atlas_tile_id::value`
+        /// `gfx::atlas_tile_id::value`; state 3: the atlas frame of the failure (low bits).
+        std::uint32_t tile = 0;
         std::uint16_t width = 0;
         std::uint16_t height = 0;
-        std::uint8_t state = 0; ///< 0: not placed yet, 1: empty (a space), 2: a sprite
+        /// 0: not placed yet, 1: empty (a space), 2: a sprite, 3: failed (retried
+        /// `gfx::k_atlas_stale_frames` frames on)
+        std::uint8_t state = 0;
         bool color = false;
     };
     /// One entry per layout glyph (`layout_run::glyph_begin` + i; ellipsis runs are not
@@ -461,6 +472,19 @@ float lx::ui::text_block_node::logical_width(int device_px) const {
     return static_cast<float>(device_px) / scale_;
 }
 
+void lx::ui::text_block_node::faces_evicted() {
+    if (async_active_) {
+        // The worker shapes again from the current inputs; the layout on show stays until
+        // the result lands (its missing glyphs are remembered as failed meanwhile).
+        ++async_generation_;
+        if (job_ && !job_->running)
+            start_job();
+        return;
+    }
+    layout_.invalidate_shape();
+    invalidate_layout(*this);
+}
+
 lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint) const {
     layout_.set_max_width(logical_width(c.max.width));
     lx::size2i out = layout_.bounding_size();
@@ -524,6 +548,9 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     const std::span<const lx::text::text_attr> attrs = layout_.attrs();
     const lx::point2i at{bounds_.x, bounds_.y};
     lx::gfx::atlas& atlas = glyphs_->atlas();
+    const std::uint32_t atlas_frame = static_cast<std::uint32_t>(atlas.frame());
+    // A run's face was evicted from the face cache since the shape pass.
+    bool face_gone = false;
 
     // The placement cache: dropped when the layout ran a pass since it was filled.
     const lx::text::text_layout_counters lc = layout_.counters();
@@ -589,7 +616,13 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
                         ++stats_.cached;
                         continue;
                     }
-                    if (atlas.use({c.tile}, tile)) {
+                    if (c.state == 3 && atlas_frame - c.tile < lx::gfx::k_atlas_stale_frames) {
+                        // Failed recently: not tried again yet.
+                        pen += g.x_advance;
+                        ++stats_.failures;
+                        continue;
+                    }
+                    if (c.state == 2 && atlas.use({c.tile}, tile)) {
                         pen += g.x_advance;
                         if (pending_count == k_text_glyph_group)
                             flush();
@@ -611,7 +644,8 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
                         ++stats_.cached;
                         continue;
                     }
-                    // The atlas evicted the tile: placed again below.
+                    // The atlas evicted the tile, or a failure is old enough to retry:
+                    // placed again below.
                 }
                 const lx::text::glyph_pen_pos p =
                     lx::text::glyph_pen(pen + g.x_offset, line.baseline - g.y_offset);
@@ -624,16 +658,18 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
                     if (!lock.owns_lock())
                         lock = faces.lock();
                     auto got = glyphs_->get_locked(faces, key);
-                    if (!got) {
+                    if (!got || (!(*got)->empty() && !glyphs_->place(**got, tile))) {
                         ++stats_.failures;
+                        if (!got && !faces.alive_locked(run.face))
+                            face_gone = true;
+                        if (cache) {
+                            cache[gi].state = 3;
+                            cache[gi].tile = atlas_frame;
+                        }
                         continue;
                     }
                     found = *got;
                     ++stats_.rasterized;
-                    if (!found->empty() && !glyphs_->place(*found, tile)) {
-                        ++stats_.failures;
-                        continue;
-                    }
                 }
                 const lx::text::glyph_entry e = *found;
                 if (cache) {
@@ -696,6 +732,12 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
             ++stats_.underlines;
         }
         flush();
+    }
+    if (face_gone) {
+        if (lock.owns_lock())
+            lock.unlock();
+        // Nodes are never const objects; emit is const only to the draw walk.
+        const_cast<text_block_node*>(this)->faces_evicted();
     }
 }
 

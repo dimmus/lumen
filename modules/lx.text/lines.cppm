@@ -284,6 +284,10 @@ public:
     /// engine and the max width, or with `shape_inputs` false only those of the wrap pass
     /// (align, wrap, max lines, ellipsis, line height).
     void assign_inputs(const text_layout& from, bool shape_inputs = true);
+    /// Forces the shape pass to run again with the same inputs: what a holder does when a face
+    /// its runs name was evicted from the face cache (`face_cache::alive_locked` false), so
+    /// the faces are resolved again. Counts as a shape-input change (`shape_generation`).
+    void invalidate_shape();
     /// Counts the input changes that invalidated the shape pass (text, font, scale,
     /// attributes, direction, language, limits, engine): two equal values mean the shape
     /// inputs did not change in between.
@@ -392,6 +396,8 @@ private:
     // Inputs.
     std::vector<char> text_{};
     std::vector<text_attr> attrs_{};
+    /// `set_attrs`' normalisation buffer, swapped with `attrs_` on a change (capacity kept).
+    std::vector<text_attr> attrs_scratch_{};
     char family_[k_face_family_bytes]{};
     bool family_default_ = true;
     float size_pt_ = 11.f;
@@ -557,14 +563,22 @@ void lx::text::text_layout::set_scale(float scale) {
 }
 
 void lx::text::text_layout::set_attrs(std::span<const text_attr> attrs) {
-    // Normalize into a scratch copy first: equal input after sorting is no change.
     std::size_t n = attrs.size();
     bool cut = false;
     if (n > limits_.max_attrs) {
         n = limits_.max_attrs;
         cut = true;
     }
-    std::vector<text_attr> sorted(attrs.begin(), attrs.begin() + static_cast<std::ptrdiff_t>(n));
+    // The current spans are normalised (sorted, disjoint, none empty), so input equal to them
+    // element by element normalises to itself: no change, nothing copied (a reconcile that
+    // re-applies the same props).
+    if (!cut && !input_cut_ && n == attrs_.size() &&
+        std::equal(attrs.begin(), attrs.end(), attrs_.begin()))
+        return;
+    // Normalise into the scratch buffer (its capacity kept): equal input after sorting is
+    // no change either.
+    std::vector<text_attr>& sorted = attrs_scratch_;
+    sorted.assign(attrs.begin(), attrs.begin() + static_cast<std::ptrdiff_t>(n));
     std::stable_sort(sorted.begin(), sorted.end(),
                      [](const text_attr& a, const text_attr& b) { return a.begin < b.begin; });
     std::uint32_t prev_end = 0;
@@ -581,7 +595,7 @@ void lx::text::text_layout::set_attrs(std::span<const text_attr> attrs) {
     sorted.resize(out);
     if (!cut && !input_cut_ && sorted == attrs_)
         return;
-    attrs_ = std::move(sorted);
+    attrs_.swap(sorted);
     input_cut_ = input_cut_ || cut;
     shape_dirty_ = wrap_dirty_ = true;
     ++shape_generation_;
@@ -660,6 +674,11 @@ void lx::text::text_layout::set_limits(text_layout_limits limits) {
         attrs_.resize(limits_.max_attrs);
         input_cut_ = true;
     }
+    shape_dirty_ = wrap_dirty_ = true;
+    ++shape_generation_;
+}
+
+void lx::text::text_layout::invalidate_shape() {
     shape_dirty_ = wrap_dirty_ = true;
     ++shape_generation_;
 }
@@ -1333,8 +1352,11 @@ lx::result<void> lx::text::text_layout::wrap_pass() const {
         case text_align::end: x = rtl ? 0 : box - l.width; break;
         case text_align::center: x = (box - l.width) / 2; break;
         }
-        if (x < 0)
-            x = 0;
+        // A line wider than the box keeps its start edge in place and overflows toward its
+        // end (CSS, Pango): an LTR line starts at 0, an RTL line ends at the box's right edge
+        // and runs past the left one (x negative).
+        if (l.width > box)
+            x = rtl ? box - l.width : 0;
         l.x = x;
         for (std::uint32_t i = 0; i < l.run_count; ++i)
             line_runs_[l.run_begin + i].x += x;

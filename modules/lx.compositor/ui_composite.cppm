@@ -16,10 +16,11 @@ module;
 //   - Screen capture's re-composites (CPU, and GL when the software pointer is left out)
 //     draw the same stream into the capture buffer (`paint_cpu_capture`, `paint_gl_capture`),
 //     the headless dump walks it in order (`paint_headless`).
-//   - A path with no primitive renderer (GLES 2) takes the stream lowered to blits
-//     (`gfx::lower_to_blits`): solid square quads become solid blits, everything else —
-//     the title glyphs among it — is dropped, counted and warned about once per run of
-//     frames that drop.
+//   - A path with no primitive renderer (GLES 2, or Vulkan whose `ui_vk` did not come up)
+//     takes the stream lowered to blits (`gfx::lower_to_blits`): solid square quads become
+//     solid blits, everything else is dropped, counted and warned about once per run of
+//     frames that drop. The compositor binds no chrome atlas on such a path, so frames
+//     carry no title glyphs there and keep the decoration atlas's close-button blit.
 //
 // Colour. A primitive's colour is premultiplied and sRGB-encoded (ADR-010 §4.5), and the CPU
 // and GL compositors' UI renderers blend it in that encoded space, as in a client window;
@@ -27,7 +28,8 @@ module;
 // two by what the blending space and the contrast exponent make of them.
 //
 // Glyphs. Sprites sample `chrome_atlas`, which the UI thread writes; every paint that reads it
-// holds its mutex while the renderer reads or uploads the pages.
+// holds its mutex while the renderer reads or uploads the pages (Vulkan: only around the
+// encode and the staging copy, after its fence waits — `ui_vk_composite_options::atlas_mutex`).
 //
 // Render affinity; the storage grows to the largest frame seen and is reused, so a steady
 // frame allocates nothing.
@@ -448,10 +450,11 @@ lx::result<lx::compositor::vk_paint_result> lx::compositor::frame_painter::paint
     (void)surfaces(snap);
     gfx::ui_vk_composite_options options{};
     options.text_contrast = text_contrast;
-    std::unique_lock<std::mutex> lock{};
     gfx::atlas* pages = nullptr;
     if (atlas && uses_atlas(snap)) {
-        lock = std::unique_lock<std::mutex>{atlas->mutex()};
+        // Locked by the renderer around its atlas reads only, never across its fence waits:
+        // the UI thread rasterising a title takes the same mutex.
+        options.atlas_mutex = &atlas->mutex();
         pages = &atlas->atlas();
     }
     auto d = ui->composite(compositor, target, snap.clear_color(), stream(snap), pages, options);

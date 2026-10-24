@@ -2972,7 +2972,17 @@ void compositor_impl::register_p0_globals() {
     wm_.set_layers(&layers_);
     p0_.layers = &layers_;
     decorations_.bind(tree_, scene);
-    decorations_.bind_chrome(&chrome_atlas_);
+    {
+        // Titles and the close glyph are atlas sprites only where the present path has a
+        // primitive renderer to draw them (CPU, GLES 3.1, a ready ui_vk; the headless dump
+        // walks mono sprites itself). GLES 2, or Vulkan whose ui_vk did not come up, lowers
+        // the stream to blits and would drop them: there the frames keep the decoration
+        // atlas's close-button blit and draw no title.
+        const bool sprites = cpu_present_ || headless_present_ ||
+                             (gl_present_ && ui_gl_ && ui_gl_->ready()) ||
+                             (vulkan_present_ && ui_vk_ && ui_vk_->ready());
+        decorations_.bind_chrome(sprites ? &chrome_atlas_ : nullptr);
+    }
     wm_.set_decorations(&decorations_);
     p0_.decorations = &decorations_;
     p0_.server_side_decorations = cfg.server_side_decorations;
