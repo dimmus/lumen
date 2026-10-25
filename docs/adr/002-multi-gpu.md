@@ -13,8 +13,13 @@ and migrate dmabufs when scanout and client GPUs differ.
 
 ## Decision
 
-- `lx::gfx::device_selector::probe_tier()` detects dual render nodes (`renderD128` + `renderD129`
-  or `card1`) and selects **discrete** tier when a secondary GPU is present.
+- The Vulkan device is the one behind the KMS card: `device_selector::select_best(drm_node)`
+  matches the card's dev_t against each physical device's VK_EXT_physical_device_drm primary
+  (or render) node; without a match, the first hardware device.
+- `lx::gfx::device_selector::probe_tier(devices, card)` is that device's
+  `VkPhysicalDeviceType` (discrete GPU → **discrete**, else integrated). It used to count
+  `/dev/dri` nodes (`renderD129` or `card1` meant discrete), which misreads the common single
+  GPU on card1 after simpledrm.
 - `output_manager` maps each `lx::output_id` to a render node; hotplug refresh rebuilds the map.
 - Cross-device presentation uses **dmabuf re-export + Vulkan re-import** via `import_cache` eviction
   and re-acquire — no silent SHM fallback in production paths.

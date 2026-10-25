@@ -24,6 +24,7 @@ export module lx.drm;
 import std;
 
 export import :atomic;
+export import :card;
 export import :cursor;
 export import :crtc_alloc;
 export import :edid;

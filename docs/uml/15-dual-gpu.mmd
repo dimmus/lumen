@@ -10,7 +10,7 @@ flowchart TB
     end
 
     subgraph compositor [lumen-compositor]
-        probe["device_selector::probe_tier()"]
+        probe["device_selector::select_best(card dev_t)<br/>VK_EXT_physical_device_drm match; tier from device type"]
         assign["output_manager — output-to-GPU map"]
         migrate["Cross-device buffer migration<br/>dma-buf re-export + re-import"]
         present["KMS atomic present per output GPU"]

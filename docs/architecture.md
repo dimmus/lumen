@@ -794,6 +794,19 @@ and remembered across sessions (Part 3, below). One
 `output_manager` (UI affinity) holds up to 16 outputs in stable **slots** (a surface's
 output set is a bit mask by slot); an `output_id` is never reused, a slot is.
 
+- **The card.** `drm::find_cards` lists the display devices from `/sys/class/drm` without
+  opening one, best first: a card with a connected display, then the firmware's boot VGA
+  device, then the lowest index (wlroots and Mutter rank the same way). card0 is not "the
+  GPU": simpledrm takes it at boot and the driver replacing it (nouveau, amdgpu, i915) gets
+  card1, and a render-only GPU has a card node without connectors. Each is tried (logind
+  TakeDevice, then a direct open) until one opens; a card that does not is logged with why
+  and released. `LUMEN_DRM_DEVICE=/dev/dri/cardN` names the card instead. None usable: the
+  error is logged and the compositor runs on HEADLESS-1.
+- **The GPU follows the card.** The Vulkan device is the physical device whose
+  VK_EXT_physical_device_drm primary (or render) node is the opened card's dev_t
+  (`gfx::device_selector::select_best(drm_node)`; the compositor passes major/minor, no DRM
+  or Vulkan type crosses). Without a match the first hardware device is used and a warning
+  says so (rendering-performance.md §1.2).
 - **Discovery.** `kms_device::probe_connectors` reads every connected desktop
   connector into a plain `connector_scan` (modes with their 68-byte mode blobs, physical
   size, subpixel, `possible_crtcs`, the CRTC routed to it now, `hotplug_mode_update` and
