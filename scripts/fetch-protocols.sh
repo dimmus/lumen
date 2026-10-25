@@ -31,20 +31,20 @@ while IFS='|' read -r source relpath; do
 done < "$LIST"
 
 echo "==> Cloning wayland-protocols (${TAG})..."
-git clone --depth 1 --branch "$TAG" "$WP_REPO" "$TMP/wayland-protocols"
+git -c advice.detachedHead=false clone --depth 1 --branch "$TAG" "$WP_REPO" "$TMP/wayland-protocols"
 
 echo "==> Cloning wayland (wayland.xml)..."
-git clone --depth 1 "$WAYLAND_REPO" "$TMP/wayland"
+git -c advice.detachedHead=false clone --depth 1 "$WAYLAND_REPO" "$TMP/wayland"
 
 if [[ "$NEED_WLR" -eq 1 ]]; then
     echo "==> Cloning wlr-protocols..."
-    git clone --depth 1 "$WLR_REPO" "$TMP/wlr-protocols"
+    git -c advice.detachedHead=false clone --depth 1 "$WLR_REPO" "$TMP/wlr-protocols"
 fi
 
 if [[ "$NEED_WLROOTS" -eq 1 ]]; then
     # Only protocol/ is needed: a blobless sparse checkout keeps this a few hundred KiB.
     echo "==> Cloning wlroots (${WLROOTS_TAG}, protocol/ only)..."
-    git clone --depth 1 --branch "$WLROOTS_TAG" --filter=blob:none --sparse \
+    git -c advice.detachedHead=false clone --depth 1 --branch "$WLROOTS_TAG" --filter=blob:none --sparse \
         "$WLROOTS_REPO" "$TMP/wlroots"
     git -C "$TMP/wlroots" sparse-checkout set protocol
 fi
