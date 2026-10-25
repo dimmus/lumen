@@ -184,12 +184,18 @@ public:
     button_builder& tab_index(int i) { tab_index_ = static_cast<std::int16_t>(i); return *this; }
     button_builder& name(const char* a11y) { name_ = a11y; return *this; }
     button_builder& key(element_key k) { key_ = k; return *this; }
-    /// A tooltip after the 500 ms hover delay (`Tooltip::text`).
-    button_builder& tooltip(const char* text) { tooltip_ = text; return *this; }
+    /// A tooltip after the 500 ms hover delay (`Tooltip::text`); with `meta`, a second, muted
+    /// line under it (`Tooltip::with_meta`).
+    button_builder& tooltip(const char* text, const char* meta = nullptr) {
+        tooltip_ = text;
+        tooltip_meta_ = meta;
+        return *this;
+    }
     operator child() const; // NOLINT(google-explicit-constructor)
 
 private:
     const char* tooltip_ = nullptr;
+    const char* tooltip_meta_ = nullptr;
     kind kind_ = kind::text;
     const char* label_ = nullptr;
     lx::ui::icon icon_ = lx::ui::icon::circle;
@@ -219,8 +225,8 @@ private:
 /// hover delay runs out (the control needs `control_props::hover_intent`; a button's
 /// `.tooltip(text)` sets both) and closes when the hover or a press ends. Zed's
 /// `tooltip_container`: 8 px right of and 10 px below the pointer (`pl_2().pt_2p5()`), an
-/// elevated surface (`elevation_2`: the §5.2 shadows, 1 px `border.variant`; rounded `md`
-/// per §5.5 where Zed rounds `lg`) with `py_1().px_2()`, the title in `text` at
+/// elevated surface (`elevation_2`: the §5.2 shadows, 1 px `border.variant`, rounded `lg`)
+/// with `py_1().px_2()`, the title in `text` at
 /// `TextSize::Default` up to `max_w_72` (288 px) wide, the meta line `Small` and muted. It
 /// fades in over 100 ms; the pointer passes through it.
 [[nodiscard]] child tooltip(const char* text, const char* meta = nullptr);
@@ -786,7 +792,7 @@ lx::ui::button_builder::operator child() const {
     if (icon_child && icon_at_ == icon_position::end)
         kids[n++] = icon_child;
     if (tooltip_)
-        kids[n++] = lx::ui::tooltip(tooltip_);
+        kids[n++] = lx::ui::tooltip(tooltip_, tooltip_meta_);
     if (toggle) {
         // The entry's content: `h_flex().w_full().px_2().gap_1p5().justify_center()`.
         const child inner = lx_ui_box(lx_ui_h_flex().flex_grow(1.f).px(rems_from_px(8.f))
@@ -823,7 +829,7 @@ lx::ui::child lx::ui::tooltip(const char* text, const char* meta) {
     }
     const child box = div(style{}.flex_col().py(rems_from_px(4.f)).px(rems_from_px(8.f))
                               .bg(tok::elevated_surface_background).border_1(tok::border_variant)
-                              .rounded(radius::md).shadow(elevation::elevated_surface),
+                              .rounded(radius::lg).shadow(elevation::elevated_surface),
                           {rows, n});
     return overlay(o, box);
 }

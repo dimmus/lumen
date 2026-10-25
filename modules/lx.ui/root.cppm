@@ -26,6 +26,20 @@ export namespace lx::ui {
 
 using describe_fn = child (*)(build_context& ctx);
 
+/// What a produced frame's draw list holds (`ui_root::set_emit_scope`).
+enum class emit_scope : std::uint8_t {
+    /// Every primitive of the tree: for a consumer that draws the whole surface each frame.
+    full,
+    /// The primitives that touch the frame's damage (`ui_root::frame_damage`, its union),
+    /// clipped to it: for a consumer that keeps the last frame's pixels (a buffer of known
+    /// age, a retained target) and repaints inside the damage. A frame without damage rects
+    /// (the first, an animation tick) emits everything. Every emitter drops what the clip
+    /// hides, a clipping container whose clip misses the damage walks none of its children,
+    /// and text and icons beside the clip look nothing up: a steady frame walks, writes,
+    /// orders and encodes little more than what it repaints.
+    damage,
+};
+
 /// Owns the retained tree and drives one UI frame: rebuild, reconcile, layout, emit.
 class ui_root {
 public:
@@ -37,6 +51,9 @@ public:
 
     void set_describer(describe_fn fn);
     void set_bounds(lx::rect2i bounds);
+    /// `emit_scope::full` by default.
+    void set_emit_scope(emit_scope scope) { emit_scope_ = scope; }
+    [[nodiscard]] emit_scope emit_scope_mode() const { return emit_scope_; }
 
     /// Rebuild when dirty, then measure/arrange/emit into `draws`. True when a frame was
     /// produced. False — with `draws` untouched, no describe, no layout — when nothing asked
@@ -113,6 +130,7 @@ private:
     /// The `theme_generation` the tree was last resolved under.
     std::uint64_t theme_generation_ = 0;
     bool dirty_ = true;
+    emit_scope emit_scope_ = emit_scope::full;
 };
 
 } // namespace lx::ui
@@ -184,6 +202,17 @@ struct lx_ui_frame_scope {
     lx_ui_frame_scope(const lx_ui_frame_scope&) = delete;
     lx_ui_frame_scope& operator=(const lx_ui_frame_scope&) = delete;
 };
+
+/// `a` ∩ `b` (empty: zero size at `a`'s origin).
+[[nodiscard]] lx::rect2i lx_ui_clip_to(lx::rect2i a, lx::rect2i b) {
+    const int x0 = std::max(a.x, b.x);
+    const int y0 = std::max(a.y, b.y);
+    const int x1 = std::min(a.x + a.width, b.x + b.width);
+    const int y1 = std::min(a.y + a.height, b.y + b.height);
+    if (x1 <= x0 || y1 <= y0)
+        return {a.x, a.y, 0, 0};
+    return {x0, y0, x1 - x0, y1 - y0};
+}
 
 /// Every node's layout dirty and its measure cache cleared.
 void lx_ui_mark_tree_dirty(lx::ui::ui_node& node) {
@@ -306,7 +335,10 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
         // The list is rebuilt from scratch each tick; appending would grow it without
         // bound. The overlap grid covers the pixels the tree can reach.
         draws.begin({bounds_.x + bounds_.width, bounds_.y + bounds_.height});
-        draw_scope scope_out{draws, bounds_};
+        lx::rect2i clip = bounds_;
+        if (emit_scope_ == emit_scope::damage && frame_damage_.count() > 0)
+            clip = lx_ui_clip_to(bounds_, frame_damage_.union_bounds());
+        draw_scope scope_out{draws, clip};
         root_->emit(scope_out);
         // GPUI's deferred draw: the overlays over everything, in the order they opened.
         overlays.emit(scope_out);

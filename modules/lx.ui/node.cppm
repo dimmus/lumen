@@ -171,6 +171,11 @@ public:
                lx::gfx::sprite_uv uv, lx::gfx::packed_rgba color, std::uint32_t order);
 
     [[nodiscard]] lx::rect2i clip() const;
+    /// The clip is empty: no emitter can draw anything.
+    [[nodiscard]] bool clip_empty() const;
+    /// `local` (a rect in the node's layout space, offset by the origin) misses the clip:
+    /// what an emitter checks before work it would draw nothing with.
+    [[nodiscard]] bool culled(lx::rect2i local) const;
     [[nodiscard]] float opacity() const;
     [[nodiscard]] unsigned emitted() const;
     /// The offset every emitter adds to its bounds (the sum of `push_origin`s).
@@ -920,6 +925,18 @@ void lx::ui::draw_scope::emit_glyph(lx::gfx::primitive_kind kind, std::uint8_t p
 
 lx::point2i lx::ui::draw_scope::origin() const { return top().origin; }
 lx::rect2i lx::ui::draw_scope::clip() const { return top().clip; }
+bool lx::ui::draw_scope::clip_empty() const {
+    const lx::rect2i& c = top().clip;
+    return c.width <= 0 || c.height <= 0;
+}
+bool lx::ui::draw_scope::culled(lx::rect2i local) const {
+    const frame& f = top();
+    const int x = local.x + f.origin.x;
+    const int y = local.y + f.origin.y;
+    return local.width <= 0 || local.height <= 0 || f.clip.width <= 0 || f.clip.height <= 0 ||
+           x + local.width <= f.clip.x || y + local.height <= f.clip.y ||
+           x >= f.clip.x + f.clip.width || y >= f.clip.y + f.clip.height;
+}
 float lx::ui::draw_scope::opacity() const { return top().opacity; }
 unsigned lx::ui::draw_scope::emitted() const { return emitted_; }
 
@@ -1348,6 +1365,10 @@ void lx::ui::ui_node::arrange(lx::rect2i bounds) {
 
 void lx::ui::ui_node::emit(draw_scope& out) const {
     if (!visible_)
+        return;
+    // Nothing reaches the surface through an empty clip: a clipping container outside a
+    // frame's damage (`emit_scope::damage`) walks none of its children.
+    if (out.clip_empty())
         return;
     for (unsigned i = 0; i < child_count_; ++i) {
         if (children_[i])

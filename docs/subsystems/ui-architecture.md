@@ -158,7 +158,7 @@ props, written the way GPUI writes it:
 const child kids[] = {icon_view(icon::bell, &icons), label};
 div(style{}.flex_row().gap(sp::b08).px(sp::b12).h(px(32))
         .bg(tok::surface_background).border_1(tok::border_variant)
-        .rounded(radius::md).shadow(elevation::elevated_surface),
+        .rounded(radius::lg).shadow(elevation::elevated_surface),
     kids);
 // or, on a container already described: flex(...) | styled(style{}...)
 ```
@@ -180,14 +180,22 @@ token, size step, weight, line height) are inherited by the box's text
 A **theme** (`lx.ui:theme`) is a compiled `.lxtheme` file: `tools/lumen-theme` compiles a
 theme family in Zed's JSON schema at build time (`theme_compiler`, with Zed's own fallback
 rules for missing keys), and `theme::load` reads it with one read and a bounds check —
-nothing is parsed at run time. Each colour is stored sRGB-encoded (what UI surfaces blend in)
+nothing is parsed at run time. The file is a 128-byte header (magic `LXTH`, version, the
+table sizes and offsets, an FNV-1a checksum of the rest), the colour table twice (sRGB
+`u8×4` and premultiplied linear `f16×4`, one entry per `tok`), the 14 status and 8 player
+token triples, 46 syntax styles (colour token, weight, italic, background), the font
+settings of ADR-010 §5.4 and the default density: 3 816 B for One Dark. A missing key is
+refined as Zed refines it (its derived rules, then the base value of its appearance), and the
+compiler reports each fallback and ignored key. Each colour is stored sRGB-encoded (what UI surfaces blend in)
 and as premultiplied linear-light halves (the compositor's linear pass); a token's colour is
 an array index. The bundled One Dark and One Light are also compiled into the binary
 (`theme::builtin`), so an app without the files renders One Dark. The UI thread has one
 **active theme** and a **density**; changing either bumps `theme_generation`, and
-`ui_root::tick` then describes again, relayouts and repaints the whole tree. `theme_watcher`
-reloads a theme file on change (inotify; read and checked on the worker affinity, swapped in
-on UI).
+`ui_root::tick` then describes again, relayouts and repaints the whole tree. Density is
+Zed's `UiDensity`: every `sp` step resolves through it (`spacing_px(step, density, rem)`,
+compact / standard / comfortable, ADR-010 §5.3), so a density change moves every padding and
+gap and nothing else. `theme_watcher` reloads a theme file on change (inotify; read and
+checked on the worker affinity, swapped in on UI).
 
 ### Components (ADR-010 §5.6)
 
@@ -334,6 +342,31 @@ solid colour needing no binding.
 The stack depth is capped at 32 frames; exceeding it keeps the innermost frame rather
 than growing, so a pathological tree cannot allocate mid-frame.
 
+### Emission scoped to the damage
+
+`ui_root` emits the whole tree into each produced frame by default (`emit_scope::full`, for
+a consumer that redraws the whole surface). A consumer that keeps its last frame — a buffer
+of known age, a retained target — sets `emit_scope::damage`: the root's clip is then the
+frame's damage (`frame_damage`, the union of its rects; the first frame and animation ticks,
+which carry no rects, emit everything), and the draw list holds only what touches it. Every
+emitter already drops what the clip hides; on top of that a node skips the work it would draw
+nothing with:
+
+- `ui_node::emit` walks no children through an empty clip, so a clipping container
+  (`overflow: hidden`) outside the damage costs one call;
+- a text block whose lines lie wholly beside the clip — its bounds, widened by its overflow
+  and an em — looks at no glyph (`text_block_node`; lines above and below the clip were
+  already skipped by the binary search);
+- an icon outside the clip makes no cache lookup and stamps no tile (`draw_scope::culled`).
+
+The ordering of a client frame becomes: buffer age known → its damage added to the ledger →
+`tick` (which emits inside it) → record per damage rect. On S2 (ADR-010 §8.3: a 301-node panel
+whose clock changes) a clock frame walks 7 nodes and emits 10 primitives in 2 batches
+instead of the tree's 141, and its emit, woken from idle, takes 8 µs p50 where the whole
+tree's took 55 µs (`lumen-ui-bench --scenario S2`). `test_ui_components`'
+`damage_scoped_emit_repaints_the_damage_exactly` checks that the kept pixels with the damage
+repainted from the scoped list equal a full redraw.
+
 > The previous `widget::paint(lx::gfx::render_pass&)` signature is superseded. `render_pass`
 > was an empty placeholder class, so nothing painted through it could ever reach the
 > screen. See §9.
@@ -405,6 +438,11 @@ Inside a scrolled viewport a node's bounds are where it is laid out, not where i
 damage call maps the region through the viewports above the node (`surface_rect`), clipped
 to them. A tree without a viewport maps nothing.
 
+What a produced frame repaints is `ui_root::frame_damage()`: the ledger as the tick found
+it plus what the describe, a reducer's rebuild and the layout raised on the way (a moved
+node, a label whose text changed). What the emit raises — an animation asking for its next
+frame — stays in the ledger for the next tick.
+
 Merged regions are what should feed `kms_damage_region` on the atomic commit path.
 
 ---
@@ -438,7 +476,9 @@ text input and the menus, modals, toasts and tooltips (`:overlay`, `:scroll`, `:
 is covered by `tests/test_layout_flex.cpp`; styles, themes, styled boxes and icons
 (`:style`, `:theme`, `:theme.compile`, `:styled`, `:icon`) by `tests/test_ui_theme.cpp` and
 the `styled_surfaces` / `icons` golden images. The old string-keyed `style_ref` survives only
-for `:widgets` and `lx.ui.builder`, and reads nothing.
+for `:widgets` and `lx.ui.builder`, and reads nothing. Every §5.6 component in its states is
+drawn by `lumen-ui-gallery` (§10); `lumen-ui-bench --scenario S2` is a shell panel built from
+them (ADR-010 §8.3, gate G2).
 
 The legacy retained-widget API (`:widgets`, `:widget_node`) is still exported so existing
 callers compile. It is superseded and should not gain new widgets:
@@ -459,3 +499,56 @@ Still to build:
 - Feeding merged damage into `kms_damage_region`
 - A design-system layer (shell chrome: scaffold, rows, toolbars) as a separate module
   above `lx.ui`, keeping primitives and opinionated components apart
+
+---
+
+## 10. Components against Zed
+
+`lumen-ui-gallery` (tests/ui_gallery.cpp) draws every ADR-010 §5.6 component in its states —
+normal, hovered, focused, disabled and selected controls, the text styles, a tab bar, a panel
+and a status bar, a list, a scroll area and text inputs (one with a selection), an open popover
+menu, a tooltip, a toast stack and a modal — at 1× under the compiled theme, on the CPU or GL
+renderer (`--theme one-dark|one-light --backend cpu|gl --out PATH`). The two CPU renderings
+are committed; the `ui_gallery` test (`lumen-ui-gallery --check`) redraws them bit for bit and,
+where a hardware GLES 3.1 context exists, on GL within G10's 3/255 (1/255 on this host);
+`LUMEN_UI_GOLDEN_UPDATE=1` rewrites them.
+
+![Component gallery, One Dark](../images/ui-gallery-one-dark.png)
+
+![Component gallery, One Light](../images/ui-gallery-one-light.png)
+
+The values below are Zed's at zed-industries/zed a5c4ca8 (crates/ui/src/components, styles,
+crates/workspace, crates/notifications), at the default density and the 16 px rem; "Lumen"
+is what `lx.ui:components` / `:popups` build, checked by `test_ui_components` where a size is
+given.
+
+| Component | Zed | Lumen | Match |
+|-----------|-----|-------|-------|
+| Button height | `ButtonSize` Large 32, Medium 28, Default 22, Compact 18, None 16 px (button_like.rs `rems`) | 32 / 28 / 22 / 18 / 16 | yes |
+| Button padding, gap | `px(Base08)` large and medium, `px(Base04)` default and compact, `px_px` none; `gap(Base04)` | same | yes |
+| Button radius | `rounded_sm` (4 px) on every corner | `radius::sm` | yes |
+| Button colours | Filled: `element.background`, hover the same at 50 %, active `element.active`; Outlined: + 1 px `border.variant`, hover `ghost_element.hover` + `border`; Subtle (ghost): `ghost_element.*`; Tinted: the status background and border, hover darkened (`theme.darken` 0.05 / 0.2) | same tokens and rules | yes |
+| Transparent button, hovered | label and icon turn `Color::Muted` (button_like.rs `hovered`) | label keeps its colour | no — ADR-010 §5.5's rule kept; listed in §7 Phase 3 |
+| Icon button | `Wide`: the 16 px icon + `Base04` each side by the size's height (24 × 22); `Square`: icon + `Base02` each side (20 × 20) | 24 × 22, 20 × 20 | yes |
+| Toggle button, selected | `Tinted(Accent)`: `info.background`, `info.border`, accent label; entries `XSmall` icons | same | yes |
+| Checkbox | 20 px container, 16 px box `m_1` `rounded_xs` `border_1` `border`, check `IconSize::Small` in the accent | same | yes (Lumen's is also a tab stop) |
+| Switch | `p(1px)` + `border_2` around a `Base32` × `Base20` track (`rounded_full`, 1 px border), 12 px thumb; on: `info` at 40 %, border `text.accent` at 20 % | 38 × 26 outer, 32 × 20 track, 12 px thumb 3 px from the end, same tokens | yes |
+| Divider | 1 px `border.variant`; vertical `h_4` (16 px) | same | yes |
+| Progress bar | `h_2` (8) with `p_0p5` (2), `rounded_full`, track `background`, fill `info` (`error` past the max) | 8 px, 4 px fill | yes |
+| Avatar | `rems(1.)` (16 px), round, optional border | same | yes (Lumen also draws initials) |
+| Key binding | a key `h(TextSize::Default)` (14) in `py_0p5` | 14 px in 18 px | yes |
+| Key binding hint | keys at `Small` − 2 (10 px), `py_0p5`, a 1 px cap border | same, 16 px cap | yes |
+| Tab, tab bar | `Tab::container_height` = `Base32` (32), content `Base32` − 1; start slot 12 px, end slot 14 px; bar groups `gap(Base04)` `px(Base06)` | 32 / 31, same slots and groups | yes |
+| Label | `TextSize` Large 16, Default 14, Small 12, XSmall 10; line height φ (`TextLabel`) or 1 (`UiLabel`) | same | yes |
+| Headline | 0.88 / 1 / 1.125 / 1.27 / 1.43 rem, line height 1.6 rem | same | yes |
+| Icon | `IconSize` 10 / 12 / 14 / 16 / 48 px, Zed's own glyphs | Lucide 1.61.0 at the same sizes | sizes yes; glyphs differ (Zed's set is not bundled, ADR-010 §9) |
+| Tooltip | `elevation_2` — `elevated_surface.background`, 1 px `border.variant`, `rounded_lg` (8 px), §5.2 shadows — `py_1` `px_2`, title `max_w_72` (288), meta `Small` muted, 8 / 10 px from the pointer | same (`rounded_lg` since Phase 3's gate; was `md`) | yes |
+| Context / popover menu | `elevation_2` (`rounded_lg`), `min_w(200)`, list `py(Base04)`, inset items (`px(Base04)` outside, `px(Base06)` box, `rounded_sm`), separator 1 px `my(Base06)`; submenus open on hover | same (`rounded_lg` since the gate); submenus open on a click, space, enter or → | radius and sizes yes; submenu trigger no |
+| Modal | `elevation_3` (four §5.2 shadows, `rounded_lg`), `top_20` (5 rem) below the window's top, scrim `elevated_surface.background` faded 0.2 (80 %) | same | yes |
+| Status toast | `elevation_3`, then `surface.background` and `shadow_lg`; `gap_2` `py_1p5` `pl_2p5`, `pr_1p5` with an action else `pr_2p5`; 10 s, resumed with ≥ 800 ms | same | yes |
+| List item | dense: a 14 px label on the φ line (23 px); extra dense − 2 (21); sparse `py_1` (31); `px(Base06)`, `gap_1`; hover `ghost_element.hover`, selected `ghost_element.selected` | 23 / 21 / 31, same tokens | yes |
+| Scrollbar | `Regular`: 6 px thumb, 4 px padding, 14 px strip, 25 px minimum thumb, `scrollbar.thumb.*`; hidden 1 s after scrolling stops (`ShowScrollbar::Auto` → autohide, 400 ms fade) | same sizes; shown whenever the content overflows; the thumb carries `scrollbar.thumb.border` | sizes yes; autohide no |
+| Input field | `px_2` `py_1p5` `rounded_md`, 1 px `border.variant`, `border.focused` while focused | same | yes |
+| Status bar | `p(Base04)` around default buttons (30 px), `status_bar.background` | 30 px | yes |
+| Panel toolbar | `py(Base06)` around a `min_h_8` (32 px) row, 1 px rule below: 45 px, `toolbar.background` | 45 px | yes |
+| Focus ring | per component (some draw `border.focused`, many draw nothing) | a 1 px `border.focused` ring on every focusable control (focus-visible only) | no — deliberate (keyboard use is visible everywhere) |

@@ -623,6 +623,18 @@ if(LUMEN_BUILD_TESTS)
             LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui"
             LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
         add_test(NAME test_ui_golden COMMAND test_ui_golden)
+        # The component gallery (ADR-010 Phase 3): docs/images/ui-gallery-one-{dark,light}.png
+        # are its CPU renderings; --check redraws them (bit for bit) and on GL (G10).
+        add_executable(lumen-ui-gallery tests/ui_gallery.cpp)
+        target_link_libraries(lumen-ui-gallery PRIVATE lx.ui lx.scene lx.gfx lx.runtime lx.a11y lx.trace
+            ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(lumen-ui-gallery)
+        lumen_link_platform(lumen-ui-gallery)
+        target_include_directories(lumen-ui-gallery PRIVATE tests ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(lumen-ui-gallery PRIVATE
+            LUMEN_GALLERY_DIR="${CMAKE_SOURCE_DIR}/docs/images"
+            LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
+        add_test(NAME ui_gallery COMMAND lumen-ui-gallery --check)
         # The Vulkan cases again under VK_LAYER_KHRONOS_validation, which must log no error.
         find_file(LUMEN_VK_VALIDATION_LAYER VkLayer_khronos_validation.json
             PATHS /usr/share/vulkan/explicit_layer.d /usr/local/share/vulkan/explicit_layer.d

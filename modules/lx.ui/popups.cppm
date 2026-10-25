@@ -26,8 +26,8 @@ import :theme;
 // ── Menus, popovers, modals and toasts (ADR-010 §5.6, on lx.ui:overlay) ──────────────────
 //
 // Menus (`menu`, crates/ui/src/components/context_menu.rs at zed a5c4ca8): an elevated
-// surface (`elevation_2`: §5.2's elevated shadows, a 1 px `border.variant` border; rounded
-// `md` as §5.5 asks, where Zed rounds `lg`), `min_w(px(200.))`, the entries in a `List`
+// surface (`elevation_2`: §5.2's elevated shadows, a 1 px `border.variant` border, rounded
+// `lg` — styled_ext.rs `elevated`), `min_w(px(200.))`, the entries in a `List`
 // (`py(Base04)`). An entry is an inset `ListItem` (outer `px(Base04)`, the box `px(Base06)`
 // rounded `sm`, hover `ghost_element.hover`), a dense row on the menu's comfortable φ line
 // (23 px): an optional `IconSize::Small` icon and the label (`gap_1p5`), the key binding
@@ -374,7 +374,7 @@ child lx_ui_pp_entries(std::span<const menu_entry> entries, const char* name) {
     const child body = control(list, {items, n});
     // `elevation_2`, `min_w(px(200.))`.
     return div(style{}.flex_col().min_w(rems_from_px(200.f)).bg(tok::elevated_surface_background)
-                   .border_1(tok::border_variant).rounded(radius::md)
+                   .border_1(tok::border_variant).rounded(radius::lg)
                    .shadow(elevation::elevated_surface),
                {&body, 1u});
 }

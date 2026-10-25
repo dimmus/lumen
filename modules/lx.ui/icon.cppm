@@ -596,11 +596,14 @@ lx::size2i lx::ui::icon_node::measure(lx::layout::constraints c, size_hint) cons
 void lx::ui::icon_node::emit(draw_scope& out) const {
     if (!visible_ || !cache_ || color_.a <= 0.f)
         return;
+    const int s = static_cast<int>(device_px_);
+    const lx::rect2i at{bounds_.x + (bounds_.width - s) / 2, bounds_.y + (bounds_.height - s) / 2, s, s};
+    // Outside the clip (a frame's damage): no cache lookup, no atlas stamp.
+    if (out.culled(at))
+        return;
     lx::gfx::atlas_tile tile{};
     if (!cache_->place(id_, device_px_, tile, surface_rect(*this, bounds_)))
         return;
-    const int s = static_cast<int>(device_px_);
-    const lx::rect2i at{bounds_.x + (bounds_.width - s) / 2, bounds_.y + (bounds_.height - s) / 2, s, s};
     out.sprite(lx::gfx::primitive_kind::mono_sprite, tile.page, at, tile.uv(), color_);
 }
 

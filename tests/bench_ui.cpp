@@ -1,4 +1,4 @@
-// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phases 0–2.
+// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phases 0–3.
 //
 // The scenarios S1–S4 of §8.3 run against lx.ui's declarative core the way an application
 // uses it: descriptors reconciled onto retained nodes by `ui_root::tick`, nodes emitting
@@ -32,7 +32,7 @@
 //   lumen-ui-bench [--scenario S1|S2|S3|S4|all] [--backend none|cpu|gl|vulkan] [--frames N] [--warmup N]
 //                  [--period-us US] [--json PATH] [--pin CPU|none] [--scale F] [--git SHA]
 //                  [--preset NAME] [--gl-ring persistent|mapped] [--gl-fetch storage|attributes] [--no-reshape]
-//                  [--no-layout-solve]
+//                  [--no-layout-solve] [--clock-every N]
 //
 // Frames come from a frame clock (`--period-us`): a scenario whose work is a few
 // microseconds per frame is otherwise over in a millisecond, one sample of whatever the
@@ -50,10 +50,20 @@
 // of a label, a line, a paragraph, a page and the whole document under "reshape"
 // (`--no-reshape` skips it).
 //
+// S2 (the shell panel, gate G2) is a real panel tree built from lx.ui:components on the
+// compiled One Dark theme with real text and icons (Phase 3); its clock changes every 60th
+// frame (`--clock-every` changes that) and, without `--frames`, it runs 3600 frames — 60 s
+// at 60 Hz. Its draw list is scoped to each frame's damage (`ui::emit_scope::damage`, a
+// client that keeps its last frame). Every scenario reports, per produced frame, the measure
+// and arrange calls, the nodes the emit walk visits and the damage (rects, px, % of the
+// surface); `update_frame` is G2's sum (update + tick + order + encode) on a produced frame,
+// `update_idle` the same on a frame that produced nothing. The damage a frame repaints is
+// `ui_root::frame_damage`, read after the tick (what the describe and layout raised too).
+//
 // S2 adds, after its frames, the flex layout's solve cost on a 301-node panel-shaped tree
-// (ADR-010 §4.7: a column of 10 flex rows of 29 labels) — every node dirty (cold), the root
-// alone dirty over warm caches, one label dirty (a clock cell) — under "layout_solve"
-// (`--no-layout-solve` skips it).
+// (ADR-010 §4.7: a column of 10 flex rows of 29 labels, the shape of the panel replica S2
+// was before Phase 3) — every node dirty (cold), the root alone dirty over warm caches, one
+// label dirty (a clock cell) — under "layout_solve" (`--no-layout-solve` skips it).
 
 #include <errno.h>
 #include <fcntl.h>
@@ -61,6 +71,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
@@ -170,6 +181,7 @@ struct options {
     bool scenarios[4]{true, true, true, true};
     const char* backend = "none";
     unsigned frames = 600;
+    bool frames_given = false; ///< `--frames` on the command line (else S2 runs 60 s: 3600)
     unsigned warmup = 120;
     unsigned period_us = 1000; ///< the frame clock; 0: no pacing
     const char* json = nullptr;
@@ -181,6 +193,7 @@ struct options {
     bool gl_attribute_fetch = false; ///< `gl`: instances as vertex attributes, not a storage buffer
     bool reshape = true; ///< S4: measure the reshape cost by invalidation size after the frames
     bool layout_solve = true; ///< S2: measure the flex solve cost after the frames
+    unsigned clock_every = 60; ///< S2: frames per clock change (60: once a second at 60 Hz)
 };
 
 /// Keeps the optimiser from deleting the encode copy.
@@ -359,13 +372,15 @@ enum stage : unsigned {
     st_submit,            ///< `gl`/`vulkan`: the renderer's draw on the CPU (upload, gather, record, submit)
     st_gpu,               ///< `gl`/`vulkan`: the frame's GPU time (timer query / timestamps, or fence-wall)
     st_layout_emit_order_encode, ///< G4's sum: the UI thread's work on a produced frame
+    st_update_frame,      ///< G2's sum on a produced frame: update + tick + order + encode
+    st_update_idle,       ///< G2's sum on a frame that produced nothing: update + idle tick
     st_count,
 };
 
 constexpr const char* k_stage_names[st_count] = {
     "update", "tick_idle", "tick",   "describe",          "reconcile", "layout",
     "emit",   "order",     "encode", "emit_order_encode", "frame",     "raster",
-    "submit", "gpu",    "layout_emit_order_encode",
+    "submit", "gpu",    "layout_emit_order_encode", "update_frame", "update_idle",
 };
 
 struct summary {
@@ -478,102 +493,6 @@ public:
 
 private:
     card_props props_{};
-};
-
-/// The panel: a full-width bar that lays its cells out left to right at `pitch`.
-struct panel_props {
-    lx::ui::quad_style style{};
-    int pitch = 0;
-    int inset = 0;
-};
-
-class panel_node final : public lx::ui::ui_node {
-public:
-    [[nodiscard]] static lx::ui::element_type_id static_type() {
-        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
-        return id;
-    }
-    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
-    [[nodiscard]] const char* type_name() const override { return "panel"; }
-
-    void apply(const panel_props& props) { props_ = props; }
-
-    [[nodiscard]] lx::size2i measure(lx::layout::constraints c, lx::ui::size_hint) const override {
-        return c.max;
-    }
-
-    void arrange(lx::rect2i bounds) override {
-        bounds_ = bounds;
-        layout_dirty_ = false;
-        for (unsigned i = 0; i < child_count_; ++i) {
-            if (!children_[i])
-                continue;
-            children_[i]->arrange({bounds.x + static_cast<int>(i) * props_.pitch + props_.inset,
-                                   bounds.y + props_.inset, props_.pitch - 2 * props_.inset,
-                                   bounds.height - 2 * props_.inset});
-        }
-    }
-
-    void emit(lx::ui::draw_scope& out) const override {
-        if (!visible_)
-            return;
-        out.quad(bounds_, props_.style);
-        ui_node::emit(out);
-    }
-
-private:
-    panel_props props_{};
-};
-
-/// A text placeholder: a quad the size the text would shape to (Phase 2 replaces it with
-/// glyph sprites). `text` is read at measure and may change in place between frames.
-struct label_props {
-    const char* text = "";
-    lx::color color{};
-    int glyph_w = 7;
-    int line_h = 14;
-};
-
-class label_node final : public lx::ui::ui_node {
-public:
-    [[nodiscard]] static lx::ui::element_type_id static_type() {
-        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
-        return id;
-    }
-    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
-    [[nodiscard]] const char* type_name() const override { return "label"; }
-
-    void apply(const label_props& props) { props_ = props; }
-
-    [[nodiscard]] lx::size2i measure(lx::layout::constraints c, lx::ui::size_hint) const override {
-        lx::size2i out{static_cast<int>(std::strlen(props_.text)) * props_.glyph_w,
-                       props_.line_h};
-        if (out.width > c.max.width) out.width = c.max.width;
-        if (out.height > c.max.height) out.height = c.max.height;
-        return out;
-    }
-
-    /// Left-aligned, vertically centred in what the parent offers.
-    void arrange(lx::rect2i bounds) override {
-        const lx::size2i wanted = measure({{0, 0}, {bounds.width, bounds.height}},
-                                          lx::ui::size_hint::preferred);
-        bounds_ = {bounds.x, bounds.y + (bounds.height - wanted.height) / 2, wanted.width,
-                   wanted.height};
-        layout_dirty_ = false;
-    }
-
-    void emit(lx::ui::draw_scope& out) const override {
-        if (!visible_)
-            return;
-        lx::ui::quad_style style{};
-        style.background = props_.color;
-        style.corner_radii[0] = style.corner_radii[1] = style.corner_radii[2] =
-            style.corner_radii[3] = 2.f;
-        out.quad(bounds_, style);
-    }
-
-private:
-    label_props props_{};
 };
 
 /// An interior node of the S3 tree: `ui_node::k_max_children` bounds the fan-out, so
@@ -698,6 +617,9 @@ struct scenario_spec {
     lx::ui::describe_fn describe = nullptr;
     void (*before_frame)(unsigned frame) = nullptr;      ///< scene mutation + invalidation
     void (*on_built)(lx::ui::ui_node& root) = nullptr;   ///< once, after the first frame
+    /// What a produced frame emits: everything, or what its damage repaints (a client that
+    /// keeps its last frame, as S2's panel does).
+    lx::ui::emit_scope emit = lx::ui::emit_scope::full;
     unsigned batch_cap = 0;                              ///< 0: no cap for this scenario
     /// The atlas the frame's sprites sample (a GPU backend uploads it and clears its dirty
     /// lists); null: none.
@@ -774,59 +696,207 @@ s1_scene g_s1{};
     return s;
 }
 
-// S2 — the shell panel replica: 24 cells, each a bordered rounded quad with a text
-// placeholder, GPUI's tokens as literal colours. Every 60th frame the clock cell's label
-// changes in place and that label is paint-invalidated: the retained tree is reused with no
-// describe, and the damage is that one label.
+// S2 — a shell panel (ADR-010 §8.3, gate G2) built the way lumen-shell will build it in
+// Phase 5: only the §5.6 components (`lx.ui:components`), flex layout (`lx.ui:styled`'s
+// `div`), the compiled One Dark theme (`one-dark.lxtheme`, else the built-in copy compiled
+// from the same file) and real text in the bundled IBM Plex Sans, icons from the bundled
+// Lucide set. A 1920 × 36 bar at the top of a 1920 × 1080 surface: an Activities button,
+// ten workspace buttons, six pinned launchers, six window buttons, a clock in the middle,
+// status texts with two meters, an input-source and a notification button, tray icon
+// buttons and the user's avatar — 301 nodes, 117 of them drawn. The buttons carry tooltips
+// (closed: an overlay node and its content in the tree, never laid out or drawn: the other
+// 184 nodes). Each side clips what does not fit. The clock is a reducer (`reducer_node`): once a second — every 60th frame of the
+// frame count, the 60 Hz cadence; `--period-us` paces the frames — the bench dispatches the
+// new time to it, the next tick describes that reducer's subtree alone, the label reshapes
+// and the layout re-measures the path to the root over every other node's cache. Nothing
+// changes on the frames in between, which the root answers without producing a frame.
+// Sizes come from the theme's rem (16 px), not `--scale`.
 
-constexpr unsigned k_s2_cells = 24;
-constexpr unsigned k_s2_clock = k_s2_cells - 1;
-constexpr lx::ui::element_key k_s2_cell_key = 100;
-constexpr lx::ui::element_key k_s2_label_key = 200;
+constexpr lx::ui::element_key k_s2_clock_key = 900;
+/// 60 s at 60 Hz: the clock changes 60 times.
+constexpr unsigned k_s2_default_frames = 3600;
+constexpr unsigned k_s2_workspaces = 10;
+constexpr unsigned k_s2_active_workspace = 1;
+/// Workspaces with windows on them: their tooltips say how many.
+constexpr unsigned k_s2_occupied = 6;
+constexpr unsigned k_s2_focused_task = 2;
+/// The clock starts at 09:41:00 and advances a second per 60 frames.
+constexpr unsigned k_s2_clock_start = 9 * 3600 + 41 * 60;
 
-constexpr const char* k_s2_texts[k_s2_cells] = {
-    "activities", "ws 1",  "ws 2",  "ws 3",    "firefox",  "terminal", "editor", "files",
-    "music",      "chat",  "mail",  "calendar", "notes",   "build",    "logs",   "cpu 12%",
-    "mem 3.1G",   "net",   "bt",    "wifi",     "vol 60%", "bat 87%",  "en",     "00:00:00",
+/// A launcher, a window or a tray item: an icon, a short title, a tooltip and its meta line.
+struct s2_item {
+    lx::ui::icon glyph;
+    const char* title;
+    const char* tooltip;
+    const char* meta;
 };
 
+/// Pinned launchers (icon buttons).
+constexpr s2_item k_s2_pinned[] = {
+    {lx::ui::icon::search, nullptr, "Search", "Super"},
+    {lx::ui::icon::terminal, nullptr, "Terminal", "Ctrl-Alt-T"},
+    {lx::ui::icon::folder, nullptr, "Files", "Super-E"},
+    {lx::ui::icon::pencil, nullptr, "Zed", "Code editor"},
+    {lx::ui::icon::calendar, nullptr, "Calendar", "3 events today"},
+    {lx::ui::icon::settings, nullptr, "Settings", "Super-I"},
+};
+
+/// Open windows (buttons with the app's icon and title).
+constexpr s2_item k_s2_tasks[] = {
+    {lx::ui::icon::terminal, "Terminal", "Terminal", "~/lumen"},
+    {lx::ui::icon::folder, "Files", "Files", "Documents"},
+    {lx::ui::icon::pencil, "Zed", "Zed", "lumen — modules/lx.ui"},
+    {lx::ui::icon::external_link, "Web", "Browser", "ADR-010"},
+    {lx::ui::icon::file, "Notes", "Notes", "Phase 3"},
+    {lx::ui::icon::monitor, "Top", "System monitor", "12 % CPU"},
+};
+
+/// Status texts; the first `k_s2_meter_count` carry a meter.
+constexpr s2_item k_s2_status[] = {
+    {lx::ui::icon::monitor, "CPU 12%", nullptr, nullptr},
+    {lx::ui::icon::circle, "MEM 3.1G", nullptr, nullptr},
+    {lx::ui::icon::folder, "DISK 41%", nullptr, nullptr},
+    {lx::ui::icon::sun, "48 °C", nullptr, nullptr},
+    {lx::ui::icon::arrow_right, "1.2 MB/s", nullptr, nullptr},
+    {lx::ui::icon::calendar, "Sat 25 Oct", nullptr, nullptr},
+};
+constexpr float k_s2_meters[] = {12.f, 39.f};
+
+/// Tray icon buttons.
+constexpr s2_item k_s2_tray[] = {
+    {lx::ui::icon::bluetooth, nullptr, "Bluetooth", "2 devices connected"},
+    {lx::ui::icon::wifi, nullptr, "Wi-Fi", "lumen-lab, 5 GHz"},
+    {lx::ui::icon::volume_2, nullptr, "Volume", "60 %"},
+    {lx::ui::icon::moon, nullptr, "Night light", "Off until 20:00"},
+    {lx::ui::icon::battery, nullptr, "Battery", "87 %, 4 h 10 min left"},
+    {lx::ui::icon::refresh_cw, nullptr, "Updates", "3 available"},
+    {lx::ui::icon::lock, nullptr, "Lock", "Super-L"},
+    {lx::ui::icon::log_out, nullptr, "Log out", nullptr},
+    {lx::ui::icon::power, nullptr, "Power off", nullptr},
+};
+
+constexpr unsigned k_s2_pinned_count = static_cast<unsigned>(std::size(k_s2_pinned));
+constexpr unsigned k_s2_task_count = static_cast<unsigned>(std::size(k_s2_tasks));
+constexpr unsigned k_s2_status_count = static_cast<unsigned>(std::size(k_s2_status));
+constexpr unsigned k_s2_meter_count = static_cast<unsigned>(std::size(k_s2_meters));
+constexpr unsigned k_s2_tray_count = static_cast<unsigned>(std::size(k_s2_tray));
+
+struct s2_clock_state {
+    unsigned seconds = 0;
+};
+struct s2_clock_action {
+    unsigned seconds = 0;
+};
+using s2_clock_host = lx::ui::reducer_node<s2_clock_state, s2_clock_action>;
+
 struct s2_scene {
-    int height = 36;
-    int pitch = 80;
-    int inset = 4;
-    int label_pad_x = 8;
-    int glyph_w = 7;
-    int line_h = 14;
-    lx::ui::quad_style panel_style{};
-    lx::ui::quad_style cell_style{};
-    char clock_text[9] = "00:00:00";
-    lx::ui::ui_node* clock_label = nullptr;
+    // Declared in dependency order: the glyph and icon caches go before the atlas they write.
+    std::unique_ptr<lx::text::face_cache> faces{};
+    std::unique_ptr<lx::text::shape_cache> shapes{};
+    std::unique_ptr<lx::text::itemizer> items{};
+    std::unique_ptr<lx::gfx::atlas> atlas{};
+    std::unique_ptr<lx::text::glyph_cache> glyphs{};
+    std::unique_ptr<lx::ui::icon_cache> icons{};
+    const char* theme_source = "built-in";
+    s2_clock_host* clock = nullptr;
+    std::uint64_t shaping_seen = 0;
+    std::uint64_t rasterized_seen = 0;
+    std::uint64_t frame = 0;
+    unsigned clock_every = 60;
+
+    [[nodiscard]] lx::text::text_engine engine() const {
+        return {faces.get(), shapes.get(), items.get()};
+    }
 };
 
 s2_scene g_s2{};
 
+void s2_clock_reduce(s2_clock_state& s, const s2_clock_action& a) { s.seconds = a.seconds; }
+
+[[nodiscard]] child s2_clock_build(const s2_clock_state& s, s2_clock_host&) {
+    using namespace lx::ui;
+    const unsigned t = k_s2_clock_start + s.seconds;
+    return label(frame_format("{:02}:{:02}:{:02}", (t / 3600u) % 24u, (t / 60u) % 60u, t % 60u))
+        .single_line();
+}
+
 [[nodiscard]] child describe_s2(lx::ui::build_context&) {
     using namespace lx::ui;
-    child cells[k_s2_cells]{};
-    for (unsigned i = 0; i < k_s2_cells; ++i) {
-        label_props lp{};
-        lp.text = i == k_s2_clock ? g_s2.clock_text : k_s2_texts[i];
-        lp.color = i == k_s2_clock ? k_text : k_text_muted;
-        lp.glyph_w = g_s2.glyph_w;
-        lp.line_h = g_s2.line_h;
-        child label = describe<label_node, label_props>(lp, k_s2_label_key + i);
+    const style row = style{}.flex_row().items_center();
 
-        card_props cp{};
-        cp.style = g_s2.cell_style;
-        cp.pad = {0, g_s2.label_pad_x, 0, g_s2.label_pad_x};
-        cells[i] = with_children(describe<card_node, card_props>(cp, k_s2_cell_key + i),
-                                 {&label, 1u});
+    // Left: Activities, the workspaces, pinned launchers, the open windows.
+    child workspaces[k_s2_workspaces]{};
+    for (unsigned i = 0; i < k_s2_workspaces; ++i)
+        workspaces[i] = button(frame_format("{}", i + 1))
+                            .selected(i == k_s2_active_workspace)
+                            .tooltip(frame_format("Workspace {}", i + 1),
+                                     i < k_s2_occupied ? frame_format("{} windows", i % 3 + 1)
+                                                       : nullptr)
+                            .key(100 + i);
+    child pinned[k_s2_pinned_count]{};
+    for (unsigned i = 0; i < k_s2_pinned_count; ++i)
+        pinned[i] = icon_button(k_s2_pinned[i].glyph)
+                        .tooltip(k_s2_pinned[i].tooltip, k_s2_pinned[i].meta)
+                        .key(150 + i);
+    child tasks[k_s2_task_count]{};
+    for (unsigned i = 0; i < k_s2_task_count; ++i)
+        tasks[i] = button(k_s2_tasks[i].title)
+                       .icon(k_s2_tasks[i].glyph)
+                       .icon_size(icon_size::small)
+                       .selected(i == k_s2_focused_task)
+                       .tooltip(k_s2_tasks[i].tooltip, k_s2_tasks[i].meta)
+                       .key(200 + i);
+    const child left[] = {
+        button("Activities").icon(icon::menu).key(1),
+        vertical_divider().inset().key(2),
+        div(style{row}.gap(sp::b02), workspaces),
+        vertical_divider().inset().key(3),
+        div(style{row}.gap(sp::b02), pinned),
+        div(style{row}.gap(sp::b04).min_w(px(0.f)).flex_shrink(1.f).overflow_hidden(), tasks),
+    };
+
+    // Middle: the clock, in a fixed-width cell so its width never moves its neighbours.
+    const child clock = reducer<s2_clock_state, s2_clock_action>({}, s2_clock_reduce,
+                                                                 s2_clock_build, k_s2_clock_key);
+
+    // Right: status texts and meters, the input source, notifications, the tray, the avatar.
+    child status[k_s2_status_count + k_s2_meter_count]{};
+    unsigned n = 0;
+    for (unsigned i = 0; i < k_s2_status_count; ++i) {
+        const child parts[2] = {icon_view(k_s2_status[i].glyph, 14.f, tok::icon_muted),
+                                label(k_s2_status[i].title).size(label_size::small)
+                                    .color(tok::text_muted).single_line()};
+        status[n++] = div(style{row}.gap(sp::b04), parts);
+        if (i < k_s2_meter_count) {
+            const child meter = progress_bar(k_s2_meters[i], 100.f).key(300 + i);
+            status[n++] = div(style{}.w(px(32.f)), {&meter, 1u});
+        }
     }
-    panel_props pp{};
-    pp.style = g_s2.panel_style;
-    pp.pitch = g_s2.pitch;
-    pp.inset = g_s2.inset;
-    return with_children(describe<panel_node, panel_props>(pp), cells);
+    child tray[k_s2_tray_count]{};
+    for (unsigned i = 0; i < k_s2_tray_count; ++i)
+        tray[i] = icon_button(k_s2_tray[i].glyph)
+                      .tooltip(k_s2_tray[i].tooltip, k_s2_tray[i].meta)
+                      .key(400 + i);
+    const child right[] = {
+        div(style{row}.gap(sp::b08), status),
+        vertical_divider().inset().key(4),
+        button("EN").label_size(label_size::small).tooltip("Input source", "English (US)").key(7),
+        button("3").icon(icon::bell).icon_size(icon_size::small).tooltip("Notifications").key(8),
+        div(style{row}.gap(sp::b02), tray),
+        avatar("DC").size(20.f).border(tok::border).key(5),
+    };
+
+    // Each side clips what does not fit: a clipping container outside a frame's damage
+    // walks none of its children (`emit_scope::damage`).
+    const child sections[3] = {
+        div(style{row}.flex_1().min_w(px(0.f)).gap(sp::b04).overflow_hidden(), left),
+        div(style{row}.flex_none().w(px(120.f)).justify_center(), {&clock, 1u}),
+        div(style{row}.flex_1().min_w(px(0.f)).gap(sp::b08).justify_end().overflow_hidden(), right),
+    };
+    const child bar = div(style{row}.w_full().h(px(36.f)).flex_none().px(sp::b08)
+                              .bg(tok::title_bar_background).border_b_1(tok::border),
+                          sections);
+    return div(style{}.flex_col().size_full().bg(tok::background), {&bar, 1u});
 }
 
 [[nodiscard]] lx::ui::ui_node* find_key(lx::ui::ui_node& node, lx::ui::element_key key) {
@@ -842,56 +912,102 @@ s2_scene g_s2{};
 }
 
 void s2_on_built(lx::ui::ui_node& root) {
-    g_s2.clock_label = find_key(root, k_s2_label_key + k_s2_clock);
+    lx::ui::ui_node* host = find_key(root, k_s2_clock_key);
+    g_s2.clock = host && host->type() == s2_clock_host::static_type()
+                     ? static_cast<s2_clock_host*>(host)
+                     : nullptr;
 }
 
 void s2_before_frame(unsigned frame) {
-    if (frame % 60 != 0 || !g_s2.clock_label)
+    // A client stamps the atlas once a frame (its eviction clock) before anything looks up a uv.
+    g_s2.atlas->begin_frame(++g_s2.frame);
+    if (frame % g_s2.clock_every != 0 || !g_s2.clock)
         return;
-    // The clock advances a second per 60 frames; same length every time, so this is a
-    // paint change, not a layout one.
-    const unsigned seconds = frame / 60;
-    const unsigned h = (seconds / 3600) % 24;
-    const unsigned m = (seconds / 60) % 60;
-    const unsigned s = seconds % 60;
-    char* t = g_s2.clock_text;
-    t[0] = static_cast<char>('0' + h / 10);
-    t[1] = static_cast<char>('0' + h % 10);
-    t[3] = static_cast<char>('0' + m / 10);
-    t[4] = static_cast<char>('0' + m % 10);
-    t[6] = static_cast<char>('0' + s / 10);
-    t[7] = static_cast<char>('0' + s % 10);
-    lx::ui::invalidate_paint(*g_s2.clock_label);
+    g_s2.clock->dispatch({frame / g_s2.clock_every});
+}
+
+/// The text work of a produced frame, and the atlas upload a GPU backend would see.
+void s2_text_frame(const lx::scene::draw_list& draws, bool clear_dirty, text_frame_sample& out) {
+    out = {};
+    const std::uint64_t shaping = g_s2.shapes->counters().shaping_calls;
+    out.shaping_calls = static_cast<unsigned>(shaping - g_s2.shaping_seen);
+    g_s2.shaping_seen = shaping;
+    const std::uint64_t rasterized = g_s2.glyphs->counters().rasterized;
+    out.rasterized = static_cast<unsigned>(rasterized - g_s2.rasterized_seen);
+    g_s2.rasterized_seen = rasterized;
+    lx::gfx::atlas& a = *g_s2.atlas;
+    for (unsigned page = 0; page < lx::gfx::k_atlas_pages; ++page) {
+        const lx::gfx::atlas_page_view v = a.page(page);
+        if (!v.valid())
+            continue;
+        const std::uint64_t bpt = v.format == lx::gfx::atlas_format::r8 ? 1u : 4u;
+        if (a.dirty_full(page)) {
+            out.upload_bytes += static_cast<std::uint64_t>(v.size) * v.size * bpt;
+            ++out.upload_rects;
+        } else {
+            for (const lx::rect2i& r : a.dirty_rects(page)) {
+                out.upload_bytes += static_cast<std::uint64_t>(r.width) *
+                                    static_cast<std::uint64_t>(r.height) * bpt;
+                ++out.upload_rects;
+            }
+        }
+        if (clear_dirty)
+            a.clear_dirty(page);
+    }
+    unsigned per_page[lx::gfx::k_atlas_pages]{};
+    for (const lx::gfx::batch& b : draws.batches()) {
+        if (b.kind != lx::gfx::primitive_kind::mono_sprite &&
+            b.kind != lx::gfx::primitive_kind::poly_sprite)
+            continue;
+        ++out.sprite_batches;
+        out.sprites += b.count;
+        if (b.page < lx::gfx::k_atlas_pages && per_page[b.page]++ == 0)
+            ++out.pages;
+    }
+    for (unsigned c : per_page)
+        if (c > out.sprite_batches_per_page)
+            out.sprite_batches_per_page = c;
 }
 
 [[nodiscard]] scenario_spec make_s2(const options& opt) {
-    const float sc = opt.scale;
+    g_s2.icons.reset(); // before the atlas they write
+    g_s2.glyphs.reset();
     g_s2 = {};
-    g_s2.height = scaled(36, sc);
-    g_s2.pitch = scaled(80, sc);
-    g_s2.inset = scaled(4, sc);
-    g_s2.label_pad_x = scaled(8, sc);
-    g_s2.glyph_w = scaled(7, sc);
-    g_s2.line_h = scaled(14, sc);
-    g_s2.panel_style.background = k_background;
-    g_s2.panel_style.border_color = k_border;
-    g_s2.panel_style.border_widths[2] = 1.f; // bottom
-    g_s2.cell_style.background = k_surface;
-    g_s2.cell_style.border_color = k_border;
-    for (float& r : g_s2.cell_style.corner_radii)
-        r = 4.f * sc;
-    for (float& w : g_s2.cell_style.border_widths)
-        w = 1.f;
+    g_s2.clock_every = opt.clock_every;
+    g_s2.faces = std::make_unique<lx::text::face_cache>();
+    g_s2.shapes = std::make_unique<lx::text::shape_cache>();
+    g_s2.items = std::make_unique<lx::text::itemizer>();
+    g_s2.atlas = std::make_unique<lx::gfx::atlas>();
+    g_s2.glyphs = std::make_unique<lx::text::glyph_cache>(*g_s2.atlas);
+    g_s2.icons = std::make_unique<lx::ui::icon_cache>(*g_s2.atlas);
+
+    // The compiled theme the build writes (tools/lumen-theme), else the copy compiled in.
+    if (auto t = lx::ui::load_theme_file("one-dark")) {
+        lx::ui::set_active_theme(std::move(t).value());
+        g_s2.theme_source = "one-dark.lxtheme";
+    } else {
+        lx::ui::set_active_builtin_theme(lx::ui::appearance::dark);
+        g_s2.theme_source = "built-in (one-dark.lxtheme not found)";
+    }
+    lx::ui::ui_resources r{};
+    r.text = {g_s2.engine(), g_s2.glyphs.get(), nullptr};
+    r.icons = g_s2.icons.get();
+    lx::ui::set_ui_resources(r);
+    std::printf("S2: theme %s, icons %s\n", g_s2.theme_source,
+                lx::ui::icons_available() ? "Lucide (librsvg)" : "not available (drawn as nothing)");
 
     scenario_spec s{};
     s.id = "S2";
-    s.title = "shell panel replica";
-    s.view = {0, 0, g_s2.pitch * static_cast<int>(k_s2_cells), g_s2.height};
-    s.arena_bytes = 64 * 1024;
+    s.title = "shell panel on components";
+    s.view = {0, 0, 1920, 1080};
+    s.arena_bytes = 256 * 1024;
     s.describe = describe_s2;
     s.before_frame = s2_before_frame;
     s.on_built = s2_on_built;
     s.batch_cap = 8;
+    s.atlas = g_s2.atlas.get();
+    s.text_frame = s2_text_frame;
+    s.emit = lx::ui::emit_scope::damage;
     return s;
 }
 
@@ -1290,6 +1406,14 @@ struct counters {
     std::uint64_t raster_px = 0; ///< pixels the backend shaded, max per frame
     unsigned draw_calls = 0;     ///< `gl`: instanced and surface draws per frame, max
     unsigned gpu_disjoint = 0;   ///< `gl`: frames whose timer query was disjoint (not sampled)
+    // Per produced frame (ADR-010 §4.7: a clock change measures one path), max and total.
+    unsigned measures_max = 0;   ///< calls into a node's measure (cache misses)
+    std::uint64_t measures_total = 0;
+    unsigned measure_hits_max = 0;
+    unsigned arranges_max = 0;   ///< arranges `place` did not skip
+    std::uint64_t arranges_total = 0;
+    unsigned nodes_emitted = 0;  ///< nodes the emit walk visits (closed overlays' content not)
+    unsigned damage_rects_min = 0; ///< the fewest rects a produced frame carried
 };
 
 /// A text scenario's counters over the steady window (`text_frame_sample` folded), plus the
@@ -1333,6 +1457,9 @@ struct memory_stats {
     double per_frame = 0.0;
     long long mallinfo_delta = 0;
     long rss_anon_kb = 0;
+    long minor_faults = 0; ///< page faults in the steady window (`getrusage`)
+    long major_faults = 0;
+    long ctx_involuntary = 0; ///< the bench thread preempted in the steady window
 };
 
 /// ADR-010 §8.1: a p95 is judged over at least this many frames.
@@ -1343,7 +1470,7 @@ struct gate {
     /// "pass", "fail", or "insufficient": a p95 gate with fewer than `k_min_gate_samples`
     /// samples, which no verdict can be drawn from.
     const char* verdict = "fail";
-    char detail[200]{};
+    char detail[256]{};
 };
 
 struct scenario_result {
@@ -1376,6 +1503,36 @@ void s4_text_doc(text_counters& out) {
     for (unsigned i = 0; i < node.child_count(); ++i) {
         if (const lx::ui::ui_node* c = node.child_at(i))
             n += count_nodes(*c);
+    }
+    return n;
+}
+
+/// The nodes the emit walk visits under `clip` (surface coordinates; the root's clip is the
+/// frame's damage under `emit_scope::damage`): every visible node, a closed overlay's content
+/// not, and a clipping container's children not when its clip is empty — what `ui_node::emit`
+/// and the containers' emits do.
+[[nodiscard]] unsigned count_emitted(const lx::ui::ui_node& node, lx::rect2i clip) {
+    if (!node.visible())
+        return 0;
+    unsigned n = 1;
+    if (node.type() == lx::ui::overlay_node::static_type() &&
+        !static_cast<const lx::ui::overlay_node&>(node).is_open())
+        return n;
+    if (const lx::layout::flex_style* fs = node.flex_item_style();
+        fs && (fs->overflow_x != lx::layout::overflow::visible ||
+               fs->overflow_y != lx::layout::overflow::visible)) {
+        const lx::rect2i b = lx::ui::surface_bounds(node);
+        const int x0 = std::max(clip.x, b.x);
+        const int y0 = std::max(clip.y, b.y);
+        const int x1 = std::min(clip.x + clip.width, b.x + b.width);
+        const int y1 = std::min(clip.y + clip.height, b.y + b.height);
+        clip = {x0, y0, std::max(x1 - x0, 0), std::max(y1 - y0, 0)};
+    }
+    if (clip.width <= 0 || clip.height <= 0)
+        return n;
+    for (unsigned i = 0; i < node.child_count(); ++i) {
+        if (const lx::ui::ui_node* c = node.child_at(i))
+            n += count_emitted(*c, clip);
     }
     return n;
 }
@@ -1429,6 +1586,7 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
     lx::runtime::memory_arena arena{spec.arena_bytes};
     lx::ui::ui_root root{arena};
     root.set_describer(spec.describe);
+    root.set_emit_scope(spec.emit);
     root.set_bounds(spec.view);
     lx::scene::draw_list draws{};
 
@@ -1491,6 +1649,7 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
     std::uint64_t allocs_start = 0;
     std::uint64_t bytes_start = 0;
     std::size_t uordblks_start = 0;
+    rusage usage_start{};
 
     const std::uint64_t period_ns = static_cast<std::uint64_t>(opt.period_us) * 1000ull;
     std::uint64_t deadline = now_ns();
@@ -1510,6 +1669,7 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         const bool measuring = frame >= opt.warmup;
         if (frame == opt.warmup) {
             uordblks_start = ::mallinfo2().uordblks;
+            ::getrusage(RUSAGE_THREAD, &usage_start);
             allocs_start = g_new_calls.load(std::memory_order_relaxed);
             bytes_start = g_new_bytes.load(std::memory_order_relaxed);
         }
@@ -1519,8 +1679,29 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
             spec.before_frame(frame);
         const std::uint64_t t_update1 = now_ns();
 
-        // The ledger is consumed by the tick: read what this frame asks for before it.
-        const lx::ui::damage_ledger& ledger = lx::ui::ui_damage();
+        const lx::ui::layout_counters layout_before = lx::ui::ui_layout_counters();
+        const std::uint64_t t0 = now_ns();
+        const bool produced = root.tick(draws);
+        const std::uint64_t t1 = now_ns();
+
+        if (!produced) {
+            if (measuring) {
+                samples[st_update].push_back(t_update1 - t_update0);
+                samples[st_tick_idle].push_back(t1 - t0);
+                samples[st_update_idle].push_back((t_update1 - t_update0) + (t1 - t0));
+                ++cnt.frames_idle;
+            }
+            continue;
+        }
+        const lx::ui::layout_counters& layout_after = lx::ui::ui_layout_counters();
+        const auto frame_measures = static_cast<unsigned>(layout_after.measures - layout_before.measures);
+        const auto frame_hits =
+            static_cast<unsigned>(layout_after.measure_hits - layout_before.measure_hits);
+        const auto frame_arranges = static_cast<unsigned>(layout_after.arranges - layout_before.arranges);
+
+        // What the frame repaints: the ledger as the tick took it plus what its describe and
+        // layout raised (`ui_root::frame_damage`).
+        const lx::ui::damage_ledger& ledger = root.frame_damage();
         const unsigned damage_rects = ledger.count();
         std::uint64_t damage_px = 0;
         lx::gfx::damage_region damage{};
@@ -1533,19 +1714,6 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         // A frame with no rects (an animation tick, the first build) repaints the view.
         if (damage.empty())
             damage.set_full();
-
-        const std::uint64_t t0 = now_ns();
-        const bool produced = root.tick(draws);
-        const std::uint64_t t1 = now_ns();
-
-        if (!produced) {
-            if (measuring) {
-                samples[st_update].push_back(t_update1 - t_update0);
-                samples[st_tick_idle].push_back(t1 - t0);
-                ++cnt.frames_idle;
-            }
-            continue;
-        }
 
         const std::uint64_t t2 = now_ns();
         draws.batch_for_render();
@@ -1665,6 +1833,10 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
             samples[st_describe].push_back(st.describe);
             samples[st_reconcile].push_back(st.reconcile);
             ++cnt.frames_described;
+        } else if (st.reducers_rebuilt > 0) {
+            // Only reducers described their subtrees again (S2's clock): their describe and
+            // reconcile are the `reconcile` stage.
+            samples[st_reconcile].push_back(st.reconcile);
         }
         samples[st_layout].push_back(st.layout);
         samples[st_emit].push_back(st.emit);
@@ -1674,6 +1846,7 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         samples[st_frame].push_back(t4 - t0);
         samples[st_layout_emit_order_encode].push_back(st.layout + st.emit + (t3 - t2) +
                                                        (t4 - t3));
+        samples[st_update_frame].push_back((t_update1 - t_update0) + (t4 - t0));
         if (raster)
             samples[st_raster].push_back(t5 - t_draw);
         if ((gl && gl_target) || (vk && vk_target)) {
@@ -1697,11 +1870,26 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
         if (batches > cnt.batches) cnt.batches = batches;
         if (bytes > cnt.instance_bytes) cnt.instance_bytes = bytes;
         if (damage_rects > cnt.damage_rects) cnt.damage_rects = damage_rects;
+        if (cnt.frames_produced == 1 || damage_rects < cnt.damage_rects_min)
+            cnt.damage_rects_min = damage_rects;
+        cnt.measures_total += frame_measures;
+        cnt.arranges_total += frame_arranges;
+        cnt.measures_max = std::max(cnt.measures_max, frame_measures);
+        cnt.measure_hits_max = std::max(cnt.measure_hits_max, frame_hits);
+        cnt.arranges_max = std::max(cnt.arranges_max, frame_arranges);
+        if (root.tree()) {
+            lx::rect2i clip = spec.view;
+            if (spec.emit == lx::ui::emit_scope::damage && damage_rects > 0)
+                clip = ledger.union_bounds();
+            cnt.nodes_emitted = std::max(cnt.nodes_emitted, count_emitted(*root.tree(), clip));
+        }
         if (damage_px > cnt.damage_px) cnt.damage_px = damage_px;
         cnt.overflow_drops += draws.overflow_drops();
     }
 
     const std::size_t uordblks_end = ::mallinfo2().uordblks;
+    rusage usage_end{};
+    ::getrusage(RUSAGE_THREAD, &usage_end);
     if (spec.text_doc && out.text.valid)
         spec.text_doc(out.text);
     memory_stats& mem = out.mem;
@@ -1710,6 +1898,9 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
     mem.per_frame = opt.frames > 0 ? static_cast<double>(mem.allocations) / opt.frames : 0.0;
     mem.mallinfo_delta = static_cast<long long>(uordblks_end) - static_cast<long long>(uordblks_start);
     mem.rss_anon_kb = read_rss_anon_kb();
+    mem.minor_faults = usage_end.ru_minflt - usage_start.ru_minflt;
+    mem.major_faults = usage_end.ru_majflt - usage_start.ru_majflt;
+    mem.ctx_involuntary = usage_end.ru_nivcsw - usage_start.ru_nivcsw;
 
     if (view_px > 0.0)
         cnt.damage_fraction = static_cast<double>(cnt.damage_px) / view_px;
@@ -1743,12 +1934,16 @@ void sleep_until_ns(std::uint64_t deadline_ns) {
                  cnt.frames_produced, static_cast<unsigned long long>(cnt.primitives_total),
                  opt.frames);
     } else if (std::strcmp(spec.id, "S2") == 0) {
-        const summary& st = out.stages[st_frame];
+        // The clock-change frames (update + tick + order + encode) and the frames between
+        // them (update + idle tick), each against the bound.
+        const summary& st = out.stages[st_update_frame];
+        const summary& idle = out.stages[st_update_idle];
         const bool damage_ok = cnt.damage_rects <= 1 && cnt.damage_fraction <= 0.02;
-        add_gate("G2", p95_verdict(st, st.p95 <= 150.0, damage_ok),
-                 "frame p95 %.1f us (<= 150) over %u frames (>= %u), damage %u rect(s), %.2f%% "
-                 "of the surface (<= 2%%)",
-                 st.p95, st.samples, k_min_gate_samples, cnt.damage_rects,
+        const bool idle_ok = idle.samples == 0 || idle.p95 <= 150.0;
+        add_gate("G2", p95_verdict(st, st.p95 <= 150.0 && idle_ok, damage_ok),
+                 "change frame p50 %.1f p95 %.1f us (<= 150) over %u frames (>= %u); between "
+                 "p95 %.2f us; damage %u rect(s), %.2f%% of the surface (<= 2%%)",
+                 st.p50, st.p95, st.samples, k_min_gate_samples, idle.p95, cnt.damage_rects,
                  cnt.damage_fraction * 100.0);
     } else if (std::strcmp(spec.id, "S3") == 0) {
         const summary& st = out.stages[st_emit_order_encode];
@@ -1970,8 +2165,16 @@ layout_solve_result g_layout_solve{};
 constexpr unsigned k_ls_rows = 10;
 constexpr unsigned k_ls_cells = 29;
 
-/// A label of S2's size (7 px a glyph, 14 px high) that a flex row places: it keeps the
-/// bounds it is given (S2's `label_node` centres itself, which `place` would take for a move).
+/// The texts of the panel replica S2 drew before it moved onto the components (24 cells).
+constexpr const char* k_ls_texts[] = {
+    "activities", "ws 1",  "ws 2",  "ws 3",    "firefox",  "terminal", "editor", "files",
+    "music",      "chat",  "mail",  "calendar", "notes",   "build",    "logs",   "cpu 12%",
+    "mem 3.1G",   "net",   "bt",    "wifi",     "vol 60%", "bat 87%",  "en",     "00:00:00",
+};
+constexpr unsigned k_ls_text_count = static_cast<unsigned>(std::size(k_ls_texts));
+
+/// A label of the old S2 replica's size (7 px a glyph, 14 px high) that a flex row places: it
+/// keeps the bounds it is given.
 struct solve_label_props {
     const char* text = "";
 };
@@ -2017,7 +2220,7 @@ private:
         child cells[k_ls_cells]{};
         for (unsigned c = 0; c < k_ls_cells; ++c)
             cells[c] = describe<solve_label_node, solve_label_props>(
-                {k_s2_texts[(r * k_ls_cells + c) % k_s2_cells]});
+                {k_ls_texts[(r * k_ls_cells + c) % k_ls_text_count]});
         rows[r] = flex(row_style, cells);
     }
     return flex(column_style, rows);
@@ -2160,12 +2363,21 @@ void print_table(const scenario_result& r) {
                 static_cast<unsigned long long>(c.damage_px), c.damage_fraction * 100.0,
                 c.overflow_drops, static_cast<unsigned long long>(c.raster_px), c.draw_calls,
                 c.gpu_disjoint);
+    if (c.frames_produced > 0)
+        std::printf("  layout     per produced frame: measures max %u (%.1f avg), measure hits max %u, "
+                    "arranges max %u (%.1f avg); nodes emitted %u; damage %u-%u rect(s), max %llu px "
+                    "(%.3f%% of the surface)\n",
+                    c.measures_max,
+                    static_cast<double>(c.measures_total) / c.frames_produced, c.measure_hits_max,
+                    c.arranges_max, static_cast<double>(c.arranges_total) / c.frames_produced,
+                    c.nodes_emitted, c.damage_rects_min, c.damage_rects,
+                    static_cast<unsigned long long>(c.damage_px), c.damage_fraction * 100.0);
     const memory_stats& m = r.mem;
     std::printf("  memory     allocations=%llu (%.3f/frame, %llu B)  mallinfo2.uordblks delta=%lld B  "
-                "RssAnon=%ld kB\n",
+                "RssAnon=%ld kB  steady: page faults %ld minor %ld major, %ld preemptions\n",
                 static_cast<unsigned long long>(m.allocations), m.per_frame,
                 static_cast<unsigned long long>(m.allocated_bytes), m.mallinfo_delta,
-                m.rss_anon_kb);
+                m.rss_anon_kb, m.minor_faults, m.major_faults, m.ctx_involuntary);
     if (r.text.valid) {
         const text_counters& t = r.text;
         std::printf("  text       document %u B, %u lines, %u glyphs, layout storage %llu KiB; first "
@@ -2262,22 +2474,29 @@ void write_json(const options& opt, const host_info& host, const scenario_result
                      "\"refs\": %u, \"batches\": %u, \"instance_bytes\": %llu, "
                      "\"damage_rects\": %u, \"damage_px\": %llu, \"damage_fraction\": %.5f, "
                      "\"overflow_drops\": %u, \"raster_px\": %llu, \"draw_calls\": %u, "
-                     "\"gpu_disjoint\": %u},\n",
+                     "\"gpu_disjoint\": %u, \"measures_max\": %u, \"measures_total\": %llu, "
+                     "\"measure_hits_max\": %u, \"arranges_max\": %u, \"arranges_total\": %llu, "
+                     "\"nodes_emitted\": %u, \"damage_rects_min\": %u},\n",
                      c.frames_produced, c.frames_idle, c.frames_described, c.nodes, c.primitives,
                      c.primitives_built, static_cast<unsigned long long>(c.primitives_total),
                      c.surfaces, c.refs, c.batches,
                      static_cast<unsigned long long>(c.instance_bytes), c.damage_rects,
                      static_cast<unsigned long long>(c.damage_px), c.damage_fraction,
                      c.overflow_drops, static_cast<unsigned long long>(c.raster_px),
-                     c.draw_calls, c.gpu_disjoint);
+                     c.draw_calls, c.gpu_disjoint, c.measures_max,
+                     static_cast<unsigned long long>(c.measures_total), c.measure_hits_max,
+                     c.arranges_max, static_cast<unsigned long long>(c.arranges_total),
+                     c.nodes_emitted, c.damage_rects_min);
         const memory_stats& m = r.mem;
         std::fprintf(f,
                      "    \"memory\": {\"allocations\": %llu, \"allocated_bytes\": %llu, "
                      "\"allocations_per_steady_frame\": %.6f, \"mallinfo2_uordblks_delta\": %lld, "
-                     "\"rss_anon_kb\": %ld},\n",
+                     "\"rss_anon_kb\": %ld, \"minor_faults\": %ld, \"major_faults\": %ld, "
+                     "\"involuntary_switches\": %ld},\n",
                      static_cast<unsigned long long>(m.allocations),
                      static_cast<unsigned long long>(m.allocated_bytes), m.per_frame,
-                     m.mallinfo_delta, m.rss_anon_kb);
+                     m.mallinfo_delta, m.rss_anon_kb, m.minor_faults, m.major_faults,
+                     m.ctx_involuntary);
         if (g_gl_info.valid && std::strcmp(opt.backend, "gl") == 0) {
             const lx::gfx::ui_gl_caps& caps = g_gl_info.caps;
             std::fputs("    \"gpu\": {\"renderer\": ", f);
@@ -2395,7 +2614,7 @@ void usage() {
         "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
         "                      [--scale F] [--git SHA] [--preset NAME]\n"
         "                      [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]\n"
-        "                      [--no-reshape] [--no-layout-solve]\n",
+        "                      [--no-reshape] [--no-layout-solve] [--clock-every N]\n",
         stderr);
 }
 
@@ -2455,10 +2674,19 @@ void usage() {
             opt.reshape = false;
         } else if (std::strcmp(a, "--no-layout-solve") == 0) {
             opt.layout_solve = false;
+        } else if (std::strcmp(a, "--clock-every") == 0) {
+            const char* s = take();
+            if (!s) return false;
+            opt.clock_every = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
+            if (opt.clock_every == 0) {
+                std::fprintf(stderr, "lumen-ui-bench: --clock-every must be at least 1\n");
+                return false;
+            }
         } else if (std::strcmp(a, "--frames") == 0) {
             const char* s = take();
             if (!s) return false;
             opt.frames = static_cast<unsigned>(std::strtoul(s, nullptr, 10));
+            opt.frames_given = true;
         } else if (std::strcmp(a, "--warmup") == 0) {
             const char* s = take();
             if (!s) return false;
@@ -2575,7 +2803,11 @@ void* bench_thread(void* raw) {
                                    : i == 1 ? make_s2(opt)
                                    : i == 2 ? make_s3(opt)
                                             : make_s4(opt);
-        job.results[job.count] = run_scenario(spec, opt);
+        // S2 runs 60 s of 60 Hz frames (60 clock changes) unless `--frames` says otherwise.
+        options run = opt;
+        if (i == 1 && !opt.frames_given)
+            run.frames = k_s2_default_frames;
+        job.results[job.count] = run_scenario(spec, run);
         print_table(job.results[job.count]);
         if (i == 3 && opt.reshape) {
             measure_reshape();

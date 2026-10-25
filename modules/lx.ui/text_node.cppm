@@ -549,6 +549,19 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     const std::int64_t top_px = static_cast<std::int64_t>(clip.y) - origin.y - bounds_.y;
     const std::int64_t clip_top = top_px * 64 - em;
     const std::int64_t clip_bottom = (top_px + clip.height) * 64 + em;
+    // Across: the lines start at most the overflow left of the bounds (end-aligned text wider
+    // than them) and end at most the overflow right of them; an em more each side for ink. A
+    // block wholly beside the clip — a label outside a frame's damage — looks at no glyph.
+    {
+        const std::int64_t text_w = (static_cast<std::int64_t>(layout_.width()) + 63) / 64;
+        const std::int64_t over = std::max<std::int64_t>(text_w - bounds_.width, 0);
+        const std::int64_t em_px = (static_cast<std::int64_t>(em) + 63) / 64;
+        const std::int64_t left = static_cast<std::int64_t>(origin.x) + bounds_.x - over - em_px;
+        const std::int64_t right =
+            static_cast<std::int64_t>(origin.x) + bounds_.x + bounds_.width + over + em_px;
+        if (right <= clip.x || left >= static_cast<std::int64_t>(clip.x) + clip.width)
+            return;
+    }
     // First line whose box reaches below the clip's top.
     std::size_t lo = 0;
     std::size_t hi = lines.size();

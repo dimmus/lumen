@@ -93,6 +93,33 @@ private:
     bool overflowed_ = false;
 };
 
+namespace detail {
+
+/// An output iterator writing into `[at, end)` and counting every character it is given.
+struct bounded_chars {
+    using iterator_category = std::output_iterator_tag;
+    using value_type = void;
+    using difference_type = std::ptrdiff_t;
+    using pointer = void;
+    using reference = void;
+
+    char* at = nullptr;
+    char* end = nullptr;
+    std::size_t* count = nullptr;
+
+    bounded_chars& operator*() { return *this; }
+    bounded_chars& operator++() { return *this; }
+    bounded_chars operator++(int) { return *this; }
+    bounded_chars& operator=(char c) {
+        if (at < end)
+            *at++ = c;
+        ++*count;
+        return *this;
+    }
+};
+
+} // namespace detail
+
 /// `fmt` formatted into the current build's frame arena, NUL-terminated: text that lives
 /// as long as the description (a label copies it when applied). "" outside a build or once
 /// the arena is exhausted. No heap allocation.
@@ -101,11 +128,21 @@ template<typename... Args>
     build_context* ctx = build_context::current();
     if (!ctx)
         return "";
-    const std::size_t n = std::formatted_size(fmt, std::forward<Args>(args)...);
+    // One formatting pass into the stack for the usual short label; a second one only for
+    // text longer than that.
+    char local[128];
+    std::size_t n = 0;
+    const auto format_args = std::make_format_args(args...);
+    (void)std::vformat_to(detail::bounded_chars{local, local + sizeof local, &n}, fmt.get(),
+                          format_args);
     char* out = ctx->alloc_chars(static_cast<unsigned>(n + 1));
     if (!out)
         return "";
-    *std::format_to_n(out, static_cast<std::ptrdiff_t>(n), fmt, std::forward<Args>(args)...).out = '\0';
+    if (n <= sizeof local)
+        std::memcpy(out, local, n);
+    else
+        (void)std::vformat_to(out, fmt.get(), format_args);
+    out[n] = '\0';
     return out;
 }
 

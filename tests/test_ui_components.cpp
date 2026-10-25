@@ -1,7 +1,7 @@
 // ADR-010 §7 Phase 3, stages 3 and 4: focus over the retained tree, the reducer wired into
 // the root, pointer state and motion, and §5.6's components — the first half, then overlays
 // (menus, popovers, tooltips, modals, toasts), scroll areas, virtualised lists and the text
-// input with its IME interface.
+// input with its IME interface; and stage 5's emission scoped to a frame's damage.
 //
 // Sizes are checked against Zed's numbers at the default density and the 16 px rem, from
 // zed-industries/zed a5c4ca8 crates/ui/src (and crates/workspace for the status bar and the
@@ -2179,6 +2179,140 @@ LUMEN_TEST(steady_frames_with_overlays_allocate_nothing) {
     const unsigned long long typing = g_allocations.load() - before;
     std::printf("    typing + backspace, 200 frames: %llu allocations\n", typing);
     LUMEN_CHECK(typing == 0);
+}
+
+// ── Damage-scoped emission (`emit_scope::damage`, ADR-010 §8.3 S2) ──
+
+struct ticker_state {
+    unsigned n = 0;
+};
+struct ticker_action {
+    unsigned n = 0;
+};
+using ticker_host = reducer_node<ticker_state, ticker_action>;
+void ticker_reduce(ticker_state& s, const ticker_action& a) { s.n = a.n; }
+child ticker_build(const ticker_state& s, ticker_host&) {
+    return label(frame_format("{:02}:{:02}", s.n / 60, s.n % 60)).single_line();
+}
+constexpr element_key k_ticker_key = 77;
+
+/// A panel-like row: clipping sections of buttons, icons and labels either side of a
+/// reducer's label, all three over a background.
+child describe_damage_scope(build_context&) {
+    const style row = style{}.flex_row().items_center();
+    const child left[3] = {button("Files").icon(icon::folder), icon_button(icon::settings).tooltip("Settings"),
+                           label("left").color(tok::text_muted)};
+    const child ticker = reducer<ticker_state, ticker_action>({}, ticker_reduce, ticker_build, k_ticker_key);
+    const child right[3] = {progress_bar(30.f, 100.f), label("right"), icon_button(icon::bell)};
+    const child kids[3] = {
+        div(style{row}.flex_1().gap(sp::b04).overflow_hidden(), left),
+        div(style{row}.w(px(64.f)).justify_center(), {&ticker, 1u}),
+        div(style{row}.flex_1().gap(sp::b04).justify_end().overflow_hidden(), right),
+    };
+    return div(style{row}.size_full().px(sp::b08).bg(tok::title_bar_background).border_b_1(tok::border), kids);
+}
+
+/// XRGB8888 pixels of a `w` × `h` target.
+struct pixels {
+    int w = 0;
+    int h = 0;
+    std::vector<std::uint32_t> px;
+    pixels(int width, int height) : w{width}, h{height}, px(static_cast<std::size_t>(width) * height, 0u) {}
+    [[nodiscard]] lx::gfx::pixel_surface surface() {
+        lx::gfx::pixel_surface s{};
+        s.pixels = reinterpret_cast<unsigned char*>(px.data());
+        s.width = static_cast<unsigned>(w);
+        s.height = static_cast<unsigned>(h);
+        s.stride = static_cast<unsigned>(w) * 4u;
+        s.format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+        return s;
+    }
+};
+
+[[nodiscard]] ticker_host* find_ticker(ui_node* n) {
+    if (!n)
+        return nullptr;
+    if (n->key() == k_ticker_key && n->type() == ticker_host::static_type())
+        return static_cast<ticker_host*>(n);
+    for (unsigned i = 0; i < n->child_count(); ++i)
+        if (ticker_host* hit = find_ticker(n->child_at(i)))
+            return hit;
+    return nullptr;
+}
+
+void raster(const lx::scene::draw_list& list, pixels& into, const lx::gfx::damage_region& damage) {
+    lx::gfx::ui_stream st{};
+    st.refs = list.refs();
+    st.batches = list.batches();
+    st.quads = list.quad_instances();
+    st.shadows = list.shadow_instances();
+    st.sprites = list.sprite_instances();
+    st.underlines = list.underline_instances();
+    lx::gfx::ui_cpu_renderer r{};
+    LUMEN_CHECK(r.draw(into.surface(), st, &env().atlas, damage, lx::color::rgb(0.f, 0.f, 0.f)).ok());
+}
+
+LUMEN_TEST(damage_scoped_emit_repaints_the_damage_exactly) {
+    set_active_builtin_theme(appearance::dark);
+    const lx::rect2i bounds{0, 0, 360, 36};
+    harness h{describe_damage_scope, bounds};
+    h.root.set_emit_scope(emit_scope::damage);
+    // The first frame carried no damage rects: everything was emitted.
+    h.list->batch_for_render();
+    const unsigned full = h.list->primitive_count();
+    LUMEN_CHECK(full > 10);
+    lx::gfx::damage_region all{};
+    all.set_full();
+    pixels kept{bounds.width, bounds.height};
+    raster(*h.list, kept, all);
+
+    ticker_host* host = find_ticker(h.root.tree());
+    LUMEN_CHECK(host != nullptr);
+    if (!host)
+        return;
+    for (unsigned step = 1; step <= 3; ++step) {
+        host->dispatch({step * 61});
+        LUMEN_CHECK(h.tick());
+        const damage_ledger& d = h.root.frame_damage();
+        LUMEN_CHECK(d.count() == 1);
+        const lx::rect2i u = d.union_bounds();
+        LUMEN_CHECK(u.width > 0 && u.width < 64 && u.height <= bounds.height);
+        h.list->batch_for_render();
+        // Only what touches the damage: the background, the bar's border and the label.
+        LUMEN_CHECK(h.list->primitive_count() < full / 2);
+        for (const lx::gfx::quad_instance& q : h.list->quad_instances()) {
+            LUMEN_CHECK(q.bounds[0] < u.x + u.width && q.bounds[0] + q.bounds[2] > u.x);
+        }
+        // The kept pixels with the damage repainted from the scoped list are the pixels of
+        // the whole tree drawn again.
+        lx::gfx::damage_region region{};
+        region.add(u);
+        raster(*h.list, kept, region);
+        harness fresh{describe_damage_scope, bounds};
+        ticker_host* fh = find_ticker(fresh.root.tree());
+        LUMEN_CHECK(fh != nullptr);
+        if (fh) {
+            fh->dispatch({step * 61});
+            (void)fresh.tick();
+            ui_damage().add(bounds); // a full frame
+            LUMEN_CHECK(fresh.tick());
+        }
+        fresh.list->batch_for_render();
+        pixels whole{bounds.width, bounds.height};
+        raster(*fresh.list, whole, all);
+        LUMEN_CHECK(whole.px == kept.px);
+    }
+}
+
+LUMEN_TEST(frame_format_formats_long_text_into_the_arena) {
+    lx::runtime::memory_arena arena{4096};
+    build_context ctx{arena};
+    build_scope scope{ctx};
+    const std::string long_text(300, 'x');
+    const char* s = frame_format("[{}] {}", 42, long_text);
+    LUMEN_CHECK(std::strlen(s) == 5 + 300);
+    LUMEN_CHECK(std::strncmp(s, "[42] xxx", 8) == 0);
+    LUMEN_CHECK(std::strcmp(frame_format("{:02}:{:02}", 9, 41), "09:41") == 0);
 }
 
 int main(int argc, char** argv) {
