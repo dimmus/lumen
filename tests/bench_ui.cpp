@@ -32,6 +32,7 @@
 //   lumen-ui-bench [--scenario S1|S2|S3|S4|all] [--backend none|cpu|gl|vulkan] [--frames N] [--warmup N]
 //                  [--period-us US] [--json PATH] [--pin CPU|none] [--scale F] [--git SHA]
 //                  [--preset NAME] [--gl-ring persistent|mapped] [--gl-fetch storage|attributes] [--no-reshape]
+//                  [--no-layout-solve]
 //
 // Frames come from a frame clock (`--period-us`): a scenario whose work is a few
 // microseconds per frame is otherwise over in a millisecond, one sample of whatever the
@@ -48,6 +49,11 @@
 // JSON, the stage `layout_emit_order_encode` (G4's sum), and after its frames the reshape cost
 // of a label, a line, a paragraph, a page and the whole document under "reshape"
 // (`--no-reshape` skips it).
+//
+// S2 adds, after its frames, the flex layout's solve cost on a 301-node panel-shaped tree
+// (ADR-010 §4.7: a column of 10 flex rows of 29 labels) — every node dirty (cold), the root
+// alone dirty over warm caches, one label dirty (a clock cell) — under "layout_solve"
+// (`--no-layout-solve` skips it).
 
 #include <errno.h>
 #include <fcntl.h>
@@ -174,6 +180,7 @@ struct options {
     bool gl_mapped_ring = false; ///< `gl`: the mapped-range ring instead of the persistent one
     bool gl_attribute_fetch = false; ///< `gl`: instances as vertex attributes, not a storage buffer
     bool reshape = true; ///< S4: measure the reshape cost by invalidation size after the frames
+    bool layout_solve = true; ///< S2: measure the flex solve cost after the frames
 };
 
 /// Keeps the optimiser from deleting the encode copy.
@@ -570,7 +577,8 @@ private:
 };
 
 /// An interior node of the S3 tree: `ui_node::k_max_children` bounds the fan-out, so
-/// 10 000 leaves hang under two levels of these.
+/// 10 000 leaves hang under two levels of these. It arranges every child every time (S3
+/// moves every leaf every frame), not through `place`.
 struct group_props {};
 
 class group_node final : public lx::ui::ui_node {
@@ -582,6 +590,14 @@ public:
     [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
     [[nodiscard]] const char* type_name() const override { return "group"; }
     void apply(const group_props&) {}
+
+    void arrange(lx::rect2i bounds) override {
+        bounds_ = bounds;
+        layout_dirty_ = false;
+        for (unsigned i = 0; i < child_count_; ++i)
+            if (children_[i])
+                children_[i]->arrange(bounds);
+    }
 };
 
 // ── S3 state: the grid every leaf places itself in ──────────────────────────────
@@ -880,10 +896,12 @@ void s2_before_frame(unsigned frame) {
 }
 
 // S3 — 10 000 rounded, bordered quads in a grid, each drifting by a seeded delta every
-// frame. Every frame the whole tree is dirty: the drift of every leaf changes and the root
-// is animate-invalidated (ADR-010 §4.9's animation path), so every node is laid out and
-// emitted again. The three-level tree is what `ui_node::k_max_children` makes of 10 000
-// leaves: 25 groups × 25 groups × 16 leaves.
+// frame. Every frame the whole tree is dirty: the drift of every leaf changes, the root is
+// layout-dirtied and its interior nodes arrange every child (a scene where every leaf moves:
+// `place`'s skip of a clean child, ADR-010 §4.7, has nothing to skip, and marking 10 000
+// leaves would only add a walk), and the root is animate-invalidated (§4.9's animation path),
+// so every node is laid out and emitted again. The three-level tree is what
+// `ui_node::k_max_children` makes of 10 000 leaves: 25 groups × 25 groups × 16 leaves.
 
 constexpr unsigned k_s3_leaves_per_group = 16;
 constexpr unsigned k_s3_groups_per_band = 25;
@@ -940,8 +958,10 @@ void s3_before_frame(unsigned) {
         g_s3.drift_x[i] = static_cast<std::int8_t>(dx);
         g_s3.drift_y[i] = static_cast<std::int8_t>(dy);
     }
-    if (g_s3.root)
+    if (g_s3.root) {
+        g_s3.root->mark_layout_dirty();
         lx::ui::invalidate_animate(*g_s3.root);
+    }
 }
 
 [[nodiscard]] scenario_spec make_s3(const options& opt) {
@@ -1914,6 +1934,167 @@ void print_reshape() {
     }
 }
 
+// ── S2's flex solve cost (ADR-010 §4.7) ─────────────────────────────────────────
+//
+// A panel-shaped tree of 301 nodes through lx.ui's flex containers: a column (4 px padding,
+// 2 px row gap) of 10 rows (`align-items: center`, 4 px column gap, 5 px vertical padding:
+// 24 px high from their content) of 29 labels with S2's texts and glyph widths. Each sample
+// times `place` of the root at the panel's bounds — the whole layout pass — after setting
+// up what is dirty:
+//   cold   every label layout-dirty, so every node's measure cache is empty and every node
+//          is measured and arranged;
+//   warm   the root alone dirty: its solve asks each row its height, which the row's cache
+//          answers; no row moves, so none is arranged;
+//   leaf   one label dirty with the same width (a clock cell): its row and the root solve,
+//          the other rows and labels answer from their caches and are not arranged.
+
+struct layout_solve_row {
+    const char* name = "";
+    summary time{};
+    std::uint64_t measures = 0; ///< per solve
+    std::uint64_t hits = 0;
+    std::uint64_t arranges = 0;
+    std::uint64_t skips = 0;
+};
+
+struct layout_solve_result {
+    bool valid = false;
+    unsigned nodes = 0;
+    unsigned node_bytes = 0;
+    std::uint64_t allocations = 0; ///< over every timed solve
+    layout_solve_row rows[3]{};
+};
+
+layout_solve_result g_layout_solve{};
+
+constexpr unsigned k_ls_rows = 10;
+constexpr unsigned k_ls_cells = 29;
+
+/// A label of S2's size (7 px a glyph, 14 px high) that a flex row places: it keeps the
+/// bounds it is given (S2's `label_node` centres itself, which `place` would take for a move).
+struct solve_label_props {
+    const char* text = "";
+};
+
+class solve_label_node final : public lx::ui::ui_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
+    }
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "solve_label"; }
+
+    bool apply(const solve_label_props& props) {
+        const bool changed = props.text != text_;
+        text_ = props.text;
+        return changed;
+    }
+
+    [[nodiscard]] lx::size2i measure(lx::layout::constraints c, lx::ui::size_hint) const override {
+        lx::size2i out{static_cast<int>(std::strlen(text_)) * 7, 14};
+        out.width = std::clamp(out.width, c.min.width, std::max(c.min.width, c.max.width));
+        out.height = std::clamp(out.height, c.min.height, std::max(c.min.height, c.max.height));
+        return out;
+    }
+
+private:
+    const char* text_ = "";
+};
+
+[[nodiscard]] child describe_layout_solve(lx::ui::build_context&) {
+    using namespace lx::ui;
+    lx::layout::flex_style row_style{};
+    row_style.align_items = lx::layout::item_align::center;
+    row_style.column_gap = lx::layout::px(4.f);
+    row_style.padding.top = row_style.padding.bottom = lx::layout::px(5.f);
+    lx::layout::flex_style column_style{};
+    column_style.direction = lx::layout::flex_direction::column;
+    column_style.row_gap = lx::layout::px(2.f);
+    column_style.padding = lx::layout::uniform(lx::layout::px(4.f));
+    child rows[k_ls_rows]{};
+    for (unsigned r = 0; r < k_ls_rows; ++r) {
+        child cells[k_ls_cells]{};
+        for (unsigned c = 0; c < k_ls_cells; ++c)
+            cells[c] = describe<solve_label_node, solve_label_props>(
+                {k_s2_texts[(r * k_ls_cells + c) % k_s2_cells]});
+        rows[r] = flex(row_style, cells);
+    }
+    return flex(column_style, rows);
+}
+
+void measure_layout_solve() {
+    g_layout_solve = {};
+    lx::runtime::memory_arena arena{256 * 1024};
+    lx::ui::ui_root root{arena};
+    lx::scene::draw_list draws{};
+    const lx::rect2i bounds{0, 0, 2048, 300};
+    lx::ui::ui_damage().clear();
+    root.set_describer(describe_layout_solve);
+    root.set_bounds(bounds);
+    (void)root.tick(draws);
+    lx::ui::ui_node* tree = root.tree();
+    if (!tree)
+        return;
+    lx::ui::ui_node* leaves[k_ls_rows * k_ls_cells]{};
+    unsigned leaf_count = 0;
+    for (unsigned r = 0; r < tree->child_count(); ++r)
+        for (unsigned c = 0; c < tree->child_at(r)->child_count(); ++c)
+            leaves[leaf_count++] = tree->child_at(r)->child_at(c);
+    g_layout_solve.nodes = 1 + tree->child_count() + leaf_count;
+    g_layout_solve.node_bytes = static_cast<unsigned>(sizeof(lx::ui::ui_node));
+    lx::ui::ui_node* clock = leaves[leaf_count - 1];
+
+    constexpr unsigned k_reps = 3000;
+    std::vector<std::uint64_t> ns;
+    ns.reserve(k_reps);
+    const std::uint64_t allocs0 = g_new_calls.load(std::memory_order_relaxed);
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        layout_solve_row& row = g_layout_solve.rows[mode];
+        row.name = mode == 0 ? "cold" : mode == 1 ? "warm" : "leaf";
+        ns.clear();
+        lx::ui::layout_counters& k = lx::ui::ui_layout_counters();
+        const lx::ui::layout_counters before = k;
+        for (unsigned rep = 0; rep < k_reps; ++rep) {
+            if (mode == 0) {
+                for (unsigned i = 0; i < leaf_count; ++i)
+                    leaves[i]->mark_layout_dirty();
+            } else if (mode == 1) {
+                tree->mark_layout_dirty();
+            } else {
+                clock->mark_layout_dirty();
+            }
+            const std::uint64_t t0 = now_ns();
+            tree->place(bounds);
+            ns.push_back(now_ns() - t0);
+        }
+        row.measures = (k.measures - before.measures) / k_reps;
+        row.hits = (k.measure_hits - before.measure_hits) / k_reps;
+        row.arranges = (k.arranges - before.arranges) / k_reps;
+        row.skips = (k.arrange_skips - before.arrange_skips) / k_reps;
+        row.time = summarize(ns);
+    }
+    g_layout_solve.allocations = g_new_calls.load(std::memory_order_relaxed) - allocs0;
+    g_layout_solve.valid = true;
+}
+
+void print_layout_solve() {
+    if (!g_layout_solve.valid)
+        return;
+    std::printf(
+        "\nS2 flex solve cost, %u-node panel tree (sizeof(ui_node) %u B; %llu allocations; us)\n",
+        g_layout_solve.nodes, g_layout_solve.node_bytes,
+        static_cast<unsigned long long>(g_layout_solve.allocations));
+    std::printf("  %-6s %10s %10s %10s %10s %10s %10s %10s\n", "dirty", "p50", "p95", "p99",
+                "measures", "hits", "arranges", "skipped");
+    for (const layout_solve_row& r : g_layout_solve.rows)
+        std::printf("  %-6s %10.2f %10.2f %10.2f %10llu %10llu %10llu %10llu\n", r.name, r.time.p50,
+                    r.time.p95, r.time.p99, static_cast<unsigned long long>(r.measures),
+                    static_cast<unsigned long long>(r.hits),
+                    static_cast<unsigned long long>(r.arranges),
+                    static_cast<unsigned long long>(r.skips));
+}
+
 // ── Output ──────────────────────────────────────────────────────────────────────
 
 struct host_info {
@@ -2160,6 +2341,24 @@ void write_json(const options& opt, const host_info& host, const scenario_result
                 t.glyphs_max, t.lines_drawn_max, t.sprite_batches_max,
                 t.sprite_batches_per_page_max, t.pages_max, t.sprite_draws_per_page_max);
         }
+        if (std::strcmp(r.spec.id, "S2") == 0 && g_layout_solve.valid) {
+            std::fprintf(
+                f,
+                "    \"layout_solve\": {\"nodes\": %u, \"node_bytes\": %u, \"allocations\": %llu",
+                g_layout_solve.nodes, g_layout_solve.node_bytes,
+                static_cast<unsigned long long>(g_layout_solve.allocations));
+            for (const layout_solve_row& w : g_layout_solve.rows)
+                std::fprintf(
+                    f,
+                    ", \"%s\": {\"p50\": %.2f, \"p95\": %.2f, \"p99\": %.2f, \"samples\": %u, "
+                    "\"measures\": %llu, \"hits\": %llu, \"arranges\": %llu, \"skipped\": %llu}",
+                    w.name, w.time.p50, w.time.p95, w.time.p99, w.time.samples,
+                    static_cast<unsigned long long>(w.measures),
+                    static_cast<unsigned long long>(w.hits),
+                    static_cast<unsigned long long>(w.arranges),
+                    static_cast<unsigned long long>(w.skips));
+            std::fputs("},\n", f);
+        }
         if (std::strcmp(r.spec.id, "S4") == 0 && g_reshape.valid) {
             std::fputs("    \"reshape\": [", f);
             for (unsigned i = 0; i < g_reshape.count; ++i) {
@@ -2190,12 +2389,14 @@ void write_json(const options& opt, const host_info& host, const scenario_result
 // ── CLI ─────────────────────────────────────────────────────────────────────────
 
 void usage() {
-    std::fputs("usage: lumen-ui-bench [--scenario S1|S2|S3|S4|all] [--backend none|cpu|gl|vulkan] [--frames N]\n"
-               "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
-               "                      [--scale F] [--git SHA] [--preset NAME]\n"
-               "                      [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]\n"
-               "                      [--no-reshape]\n",
-               stderr);
+    std::fputs(
+        "usage: lumen-ui-bench [--scenario S1|S2|S3|S4|all] [--backend none|cpu|gl|vulkan] "
+        "[--frames N]\n"
+        "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
+        "                      [--scale F] [--git SHA] [--preset NAME]\n"
+        "                      [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]\n"
+        "                      [--no-reshape] [--no-layout-solve]\n",
+        stderr);
 }
 
 [[nodiscard]] bool parse(int argc, char** argv, options& opt) {
@@ -2252,6 +2453,8 @@ void usage() {
             opt.gl_attribute_fetch = std::strcmp(s, "attributes") == 0;
         } else if (std::strcmp(a, "--no-reshape") == 0) {
             opt.reshape = false;
+        } else if (std::strcmp(a, "--no-layout-solve") == 0) {
+            opt.layout_solve = false;
         } else if (std::strcmp(a, "--frames") == 0) {
             const char* s = take();
             if (!s) return false;
@@ -2377,6 +2580,10 @@ void* bench_thread(void* raw) {
         if (i == 3 && opt.reshape) {
             measure_reshape();
             print_reshape();
+        }
+        if (i == 1 && opt.layout_solve) {
+            measure_layout_solve();
+            print_layout_solve();
         }
         std::fflush(stdout);
         ++job.count;

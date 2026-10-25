@@ -22,6 +22,8 @@ export import :node;
 export import :invalidate;
 export import :reconcile;
 export import :decorator;
+// ADR-010 §4.7: flex containers over lx.layout:flex.
+export import :flex;
 export import :reducer;
 export import :widgets_decl;
 export import :root;

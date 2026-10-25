@@ -11,11 +11,15 @@ import std;
 import :element;
 import :node;
 import :events;
+import :flex;
 
 export namespace lx::ui {
 
 // ── box ───────────────────────────────────────────────────────────────────────
 
+/// A flex container of the old shape (ADR-010 §4.7): a column, or a row with `row`, its
+/// children at their content size from the start edge, `gap` px apart. `flex()` is the
+/// full container.
 struct box_props {
     lx::color fill{};
     bool row = false;
@@ -31,7 +35,8 @@ public:
     [[nodiscard]] element_type_id type() const override { return static_type(); }
     [[nodiscard]] const char* type_name() const override { return "box"; }
 
-    void apply(const box_props& props) { props_ = props; }
+    /// True when the direction or the gap changed.
+    bool apply(const box_props& props);
 
     [[nodiscard]] lx::size2i measure(lx::layout::constraints c, size_hint hint) const override;
     void arrange(lx::rect2i bounds) override;
@@ -39,6 +44,7 @@ public:
 
 private:
     box_props props_{};
+    lx::layout::flex_style style_{};
 };
 
 [[nodiscard]] child box(lx::color fill, child content);
@@ -104,35 +110,24 @@ private:
 } // namespace lx::ui
 
 
+bool lx::ui::box_node::apply(const box_props& props) {
+    const bool changed = props.row != props_.row || props.gap != props_.gap;
+    props_ = props;
+    style_.direction =
+        props.row ? lx::layout::flex_direction::row : lx::layout::flex_direction::column;
+    style_.align_items = lx::layout::item_align::flex_start;
+    style_.row_gap = style_.column_gap = lx::layout::px(static_cast<float>(props.gap));
+    return changed;
+}
+
 lx::size2i lx::ui::box_node::measure(lx::layout::constraints c, size_hint hint) const {
-    return ui_node::measure(c, hint);
+    return flex_container_measure(*this, style_, c, hint, false);
 }
 
 void lx::ui::box_node::arrange(lx::rect2i bounds) {
     bounds_ = bounds;
     layout_dirty_ = false;
-
-    int cursor_x = bounds.x;
-    int cursor_y = bounds.y;
-    int max_cross = 0;
-    for (unsigned i = 0; i < child_count_; ++i) {
-        if (!children_[i])
-            continue;
-        const auto child_size = children_[i]->measure({{0, 0}, {bounds.width, bounds.height}},
-                                                      size_hint::preferred);
-        if (props_.row) {
-            children_[i]->arrange({cursor_x, bounds.y, child_size.width, child_size.height});
-            cursor_x += child_size.width + props_.gap;
-            if (child_size.height > max_cross)
-                max_cross = child_size.height;
-        } else {
-            children_[i]->arrange({bounds.x, cursor_y, child_size.width, child_size.height});
-            cursor_y += child_size.height + props_.gap;
-            if (child_size.width > max_cross)
-                max_cross = child_size.width;
-        }
-    }
-    (void)max_cross;
+    (void)flex_container_arrange(*this, style_, bounds);
 }
 
 void lx::ui::box_node::emit(draw_scope& out) const {

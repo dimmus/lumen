@@ -306,6 +306,38 @@ LUMEN_TEST(latin_and_cyrillic_wrap_at_spaces_for_several_widths) {
     LUMEN_CHECK(l.lines().size() == 1);
 }
 
+LUMEN_TEST(min_content_width_is_the_widest_word) {
+    // CSS min-content: the narrowest the text wraps without breaking a word — the widest
+    // word, its trailing space hanging (what a flex container asks for an item's automatic
+    // minimum size, lx.layout:flex). The words' widths come from the shaped line.
+    if (skip_without(false, true, "min_content_width_is_the_widest_word"))
+        return;
+    const std::string_view text = "ab cdefghij kl mnopq";
+    lt::shaped_line whole{};
+    if (!lt::shape_line(std::string{text}.c_str(), lt::font_desc{}, whole)) {
+        std::printf("    SKIP: no font face on this host\n");
+        return;
+    }
+    // "cdefghij" spans bytes [3, 11); the widest of the four words.
+    const double widest = width_before(whole, 11) - width_before(whole, 3);
+    LUMEN_CHECK(widest > width_before(whole, 2) &&
+                widest > width_before(whole, 20) - width_before(whole, 15));
+    lt::text_layout l{};
+    l.set_text(text);
+    l.set_wrap(lt::text_wrap::word);
+    const int min_content = l.min_content_width();
+    std::printf("    min-content %d px, widest word %.2f px\n", min_content, widest);
+    LUMEN_CHECK(min_content == static_cast<int>(std::ceil(widest)));
+    // Wrapped there, no word is broken: four lines, one word each.
+    l.set_max_width(static_cast<float>(min_content));
+    LUMEN_CHECK(l.lines().size() == 4);
+    LUMEN_CHECK(l.bounding_size().width == min_content);
+    // A mandatory break separates words as a break opportunity does.
+    lt::text_layout two{};
+    two.set_text("cdefghij\nab");
+    LUMEN_CHECK(two.min_content_width() == min_content);
+}
+
 LUMEN_TEST(cjk_breaks_between_ideographs) {
     if (skip_without(false, true, "cjk_breaks_between_ideographs"))
         return;

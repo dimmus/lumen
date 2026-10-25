@@ -1193,6 +1193,15 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_ui_reconcile PRIVATE tests)
     add_test(NAME test_ui_reconcile COMMAND test_ui_reconcile)
 
+    # lx.layout:flex against Chrome's layout of Taffy's fixtures, and lx.ui's flex container
+    # with the per-node measure cache (ADR-010 §4.7).
+    add_executable(test_layout_flex tests/test_layout_flex.cpp)
+    target_link_libraries(test_layout_flex PRIVATE lx.ui lx.layout lx.scene lx.text lx.runtime)
+    lumen_apply_module_properties(test_layout_flex)
+    lumen_link_platform(test_layout_flex)
+    target_include_directories(test_layout_flex PRIVATE tests)
+    add_test(NAME test_layout_flex COMMAND test_layout_flex)
+
     add_executable(test_kms_vkms tests/test_kms_vkms.cpp)
     target_link_libraries(test_kms_vkms PRIVATE lx.drm)
     lumen_apply_module_properties(test_kms_vkms)
@@ -1268,7 +1277,7 @@ if(LUMEN_BUILD_TESTS)
         test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
         test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
         test_cvt test_output_management test_output_config_store
-        test_ui_reconcile test_gl_composite bench_composite bench_ui
+        test_ui_reconcile test_layout_flex test_gl_composite bench_composite bench_ui
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout

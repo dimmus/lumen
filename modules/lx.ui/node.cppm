@@ -21,7 +21,35 @@ export namespace lx::ui {
 
 /// Which end of the constraint range a measure pass is asking about. Measuring for
 /// `min` and `max` separately is what lets flex distribute slack without guessing.
+/// `min` is the min-content width (the narrowest the content wraps to); a flex container
+/// asks it for an item's automatic minimum size.
 enum class size_hint : unsigned char { min, preferred, max };
+
+/// Whether a measurement applies the node's own size styles (`inherent`, what any parent
+/// asks) or measures the content alone (`content`: what a flex container asks of an item
+/// whose width, height, min or max it applies itself — Taffy's `SizingMode::ContentSize`).
+/// A node without size styles answers both the same (`ui_node::measure_content`).
+enum class sizing_mode : unsigned char { inherent, content };
+
+class ui_node;
+
+/// What the layout passes did, summed since the counters were last cleared: UI affinity,
+/// for tests and `lumen-ui-bench` (G2: a clock-cell change measures one cell's ancestors).
+/// `measures` counts calls into a node's `measure` / `measure_content` (cache misses and
+/// uncacheable keys); `arranges` calls into `arrange` that `place` did not skip. The hooks,
+/// when set, see each such call.
+struct layout_counters {
+    std::uint64_t measures = 0;
+    std::uint64_t measure_hits = 0;
+    /// Keys the cache cannot hold (a min neither 0 nor the max), or a full cache pool.
+    std::uint64_t measure_uncached = 0;
+    std::uint64_t arranges = 0;
+    std::uint64_t arrange_skips = 0;
+    void (*on_measure)(const ui_node& node) = nullptr;
+    void (*on_arrange)(const ui_node& node) = nullptr;
+};
+
+[[nodiscard]] layout_counters& ui_layout_counters();
 
 /// Result of routing a point through the tree — window chrome needs to distinguish
 /// "content" from "drag me" and "resize me" before the event reaches a widget.
@@ -202,10 +230,35 @@ public:
     [[nodiscard]] virtual element_type_id type() const = 0;
     [[nodiscard]] virtual const char* type_name() const;
 
-    /// Pass 1. Must not mutate observable state — it is called repeatedly per pass.
+    /// Pass 1. Must not mutate observable state — it is called repeatedly per pass. A node
+    /// measures its children through `measure_cached`.
     [[nodiscard]] virtual lx::size2i measure(layout::constraints c, size_hint hint) const;
-    /// Pass 2. Assigns final geometry and recurses.
+    /// Pass 1 for a flex container's item (`sizing_mode::content`): the content's size, the
+    /// node's own width, height, min and max not applied. Defaults to `measure`; a node
+    /// with size styles (`flex_item_style`) overrides it.
+    [[nodiscard]] virtual lx::size2i measure_content(layout::constraints c, size_hint hint) const;
+    /// Pass 2. Assigns final geometry and recurses. A node places its children through
+    /// `place`.
     virtual void arrange(lx::rect2i bounds);
+
+    /// `measure` (or `measure_content`) through this node's measure cache (ADR-010 §4.7,
+    /// Yoga's shape): four `(constraints, hint, mode) → size` entries, replaced round-robin,
+    /// cleared by `mark_layout_dirty`. A key whose min is neither 0 nor its max on an axis is
+    /// measured without the cache (counted in `layout_counters::measure_uncached`); every
+    /// query the layout passes make has one or the other. The entries live out of the node,
+    /// in a 72-byte block of the UI thread's measure-cache pool that the node takes the first
+    /// time it is measured and gives back when it dies: a node never measured (a leaf its
+    /// parent places without asking) costs nothing, and the node stays the 80 bytes the emit
+    /// walk reads (G3).
+    [[nodiscard]] lx::size2i measure_cached(layout::constraints c, size_hint hint,
+                                            sizing_mode mode = sizing_mode::inherent) const;
+    /// `arrange` unless the node is clean and `bounds` are its bounds already: a clean
+    /// subtree whose place did not move is not walked.
+    void place(lx::rect2i bounds);
+
+    /// The node's style as a flex item, read by its parent flex container: null for CSS's
+    /// initial values (`flex: 0 1 auto`, auto sizes and margins).
+    [[nodiscard]] virtual const layout::flex_style* flex_item_style() const;
     /// Pass 3. Appends draw commands for this node and its children.
     virtual void emit(draw_scope& out) const;
 
@@ -225,7 +278,9 @@ public:
 
     // ── Reconciler primitives ────────────────────────────────────────────────
     // These move children without destroying them so a keyed rearrangement cannot
-    // free a node it is about to reuse. Ownership passes to the caller and back.
+    // free a node it is about to reuse. Ownership passes to the caller and back. They do
+    // not mark the layout dirty: the caller does, when the children it settles on differ
+    // from the ones it took.
 
     /// Move every child into `out` and leave this node childless. Returns how many.
     [[nodiscard]] unsigned detach_children(ui_node** out, unsigned capacity);
@@ -252,7 +307,11 @@ public:
 
     [[nodiscard]] lx::rect2i bounds() const;
 
-    /// Set by the reconciler when layout must run again before the next emit.
+    /// Layout must run again before the next emit: clears this node's measure cache and
+    /// marks it and its ancestors dirty (their measurements depended on it; the walk stops
+    /// below an ancestor already dirty), so the layout passes walk exactly the path down to
+    /// it. Called by `invalidate_layout`, by the reconciler when props or children change,
+    /// and by a node whose measure inputs did.
     void mark_layout_dirty();
     [[nodiscard]] bool layout_dirty() const;
     void clear_layout_dirty();
@@ -271,10 +330,19 @@ protected:
     style_ref style_{};
     bool visible_ = true;
     bool layout_dirty_ = true;
+
+private:
+    /// The node's block in the measure-cache pool, 1-based; 0: none yet. It fills what was
+    /// padding after the flags.
+    mutable std::uint32_t measure_slot_ = 0;
 };
 
 /// Describe a retained node of type `NodeT` carrying `PropsT`. Props are copied into
 /// the frame arena; `apply` writes them onto the retained node during reconciliation.
+///
+/// An `apply` that returns `bool` says whether the props changed anything layout reads
+/// (true: the reconciler marks the node's layout dirty; false: nothing did, or the node
+/// marked itself); one that returns nothing is taken to have changed it every time.
 template<typename NodeT, typename PropsT>
 [[nodiscard]] child describe(const PropsT& props, element_key key = 0) {
     build_context* ctx = build_context::current();
@@ -290,7 +358,15 @@ template<typename NodeT, typename PropsT>
     node->props = stored;
     node->construct = []() -> ui_node* { return new NodeT{}; };
     node->apply = [](ui_node& target, const void* raw) {
-        static_cast<NodeT&>(target).apply(*static_cast<const PropsT*>(raw));
+        auto& n = static_cast<NodeT&>(target);
+        const PropsT& p = *static_cast<const PropsT*>(raw);
+        if constexpr (std::is_same_v<decltype(n.apply(p)), bool>) {
+            if (n.apply(p))
+                n.mark_layout_dirty();
+        } else {
+            n.apply(p);
+            n.mark_layout_dirty();
+        }
     };
     return node;
 }
@@ -763,6 +839,81 @@ private:
 
 } // namespace
 
+namespace {
+
+/// UI affinity, like the trees it counts.
+lx::ui::layout_counters g_layout_counters{};
+
+/// One node's measure cache. A tag is 0 when its entry is empty, else bit 0 set, the hint
+/// in bits 1–2, bit 3 / 4 set when the key's min width / height equals its max (else that
+/// min is 0), bit 5 for `sizing_mode::content`.
+struct lx_ui_measure_block {
+    static constexpr unsigned k_entries = 4;
+    struct entry {
+        int max_width;
+        int max_height;
+        int width;
+        int height;
+    };
+    std::uint8_t tags[k_entries];
+    std::uint8_t next;
+    entry entries[k_entries];
+};
+static_assert(sizeof(lx_ui_measure_block) == 72);
+
+/// The UI thread's measure caches: blocks in 1 024-block chunks, recycled through a free
+/// list (linked through the first entry), so a tree that keeps its shape takes none. At
+/// most 4 096 chunks (4 Mi measured nodes alive at once); past that a node goes uncached
+/// (`layout_counters::measure_uncached`), the overflow rule of memory-management.md §3.
+/// Never destroyed, like the tree pool: a retained tree may outlive any static.
+class lx_ui_measure_pool {
+public:
+    static constexpr std::uint32_t k_per_chunk = 1024;
+    static constexpr std::uint32_t k_max_chunks = 4096;
+
+    /// A cleared block, 1-based; 0 when the pool is full.
+    [[nodiscard]] std::uint32_t take() {
+        std::uint32_t slot = free_;
+        if (slot != 0) {
+            free_ = static_cast<std::uint32_t>(at(slot).entries[0].max_width);
+        } else {
+            if (used_ % k_per_chunk == 0) {
+                const std::uint32_t chunk = used_ / k_per_chunk;
+                if (chunk >= k_max_chunks)
+                    return 0;
+                chunks_[chunk] = static_cast<lx_ui_measure_block*>(
+                    ::operator new(sizeof(lx_ui_measure_block) * k_per_chunk));
+            }
+            slot = ++used_;
+        }
+        lx_ui_measure_block& b = at(slot);
+        b.tags[0] = b.tags[1] = b.tags[2] = b.tags[3] = 0;
+        b.next = 0;
+        return slot;
+    }
+
+    void give_back(std::uint32_t slot) {
+        at(slot).entries[0].max_width = static_cast<int>(free_);
+        free_ = slot;
+    }
+
+    [[nodiscard]] lx_ui_measure_block& at(std::uint32_t slot) {
+        return chunks_[(slot - 1) / k_per_chunk][(slot - 1) % k_per_chunk];
+    }
+
+private:
+    lx_ui_measure_block* chunks_[k_max_chunks]{};
+    std::uint32_t used_ = 0;
+    std::uint32_t free_ = 0;
+};
+
+[[nodiscard]] lx_ui_measure_pool& lx_ui_measure_storage() {
+    static lx_ui_measure_pool* const pool = new lx_ui_measure_pool{};
+    return *pool;
+}
+
+} // namespace
+
 // ── ui_node ─────────────────────────────────────────────────────────────────────
 
 void* lx::ui::ui_node::operator new(std::size_t bytes) { return lx_ui_tree_storage().take(bytes); }
@@ -774,6 +925,8 @@ void lx::ui::ui_node::operator delete(void* node, std::size_t bytes) {
 lx::ui::ui_node::~ui_node() {
     release_children();
     lx_ui_tree_storage().give_back(children_, lx_ui_span_bytes(child_capacity_));
+    if (measure_slot_ != 0)
+        lx_ui_measure_storage().give_back(measure_slot_);
 }
 
 void lx::ui::ui_node::reserve_children(unsigned count) {
@@ -793,13 +946,84 @@ void lx::ui::ui_node::reserve_children(unsigned count) {
 
 const char* lx::ui::ui_node::type_name() const { return "ui_node"; }
 
+lx::ui::layout_counters& lx::ui::ui_layout_counters() {
+    return g_layout_counters;
+}
+
+lx::size2i lx::ui::ui_node::measure_cached(layout::constraints c, size_hint hint,
+                                           sizing_mode mode) const {
+    layout_counters& k = g_layout_counters;
+    auto tag = static_cast<std::uint8_t>(1u | (static_cast<unsigned>(hint) << 1) |
+                                         (mode == sizing_mode::content ? 0x20u : 0u));
+    bool cacheable = true;
+    if (c.min.width == c.max.width)
+        tag = static_cast<std::uint8_t>(tag | 0x08u);
+    else if (c.min.width != 0)
+        cacheable = false;
+    if (c.min.height == c.max.height)
+        tag = static_cast<std::uint8_t>(tag | 0x10u);
+    else if (c.min.height != 0)
+        cacheable = false;
+    lx_ui_measure_pool& pool = lx_ui_measure_storage();
+    if (cacheable && measure_slot_ == 0)
+        measure_slot_ = pool.take(); // the first measurement of this node: a layout change
+    if (cacheable && measure_slot_ != 0) {
+        const lx_ui_measure_block& b = pool.at(measure_slot_);
+        for (unsigned e = 0; e < lx_ui_measure_block::k_entries; ++e) {
+            const lx_ui_measure_block::entry& m = b.entries[e];
+            if (b.tags[e] == tag && m.max_width == c.max.width && m.max_height == c.max.height) {
+                ++k.measure_hits;
+                return {m.width, m.height};
+            }
+        }
+    } else {
+        ++k.measure_uncached;
+    }
+    ++k.measures;
+    if (k.on_measure)
+        k.on_measure(*this);
+    const lx::size2i size =
+        mode == sizing_mode::content ? measure_content(c, hint) : measure(c, hint);
+    if (cacheable && measure_slot_ != 0) {
+        // Measuring children never takes this node's block, so `b` is still this node's.
+        lx_ui_measure_block& b = pool.at(measure_slot_);
+        const unsigned e = b.next;
+        b.next = static_cast<std::uint8_t>((e + 1u) % lx_ui_measure_block::k_entries);
+        b.entries[e] = {c.max.width, c.max.height, size.width, size.height};
+        b.tags[e] = tag;
+    }
+    return size;
+}
+
+void lx::ui::ui_node::place(lx::rect2i bounds) {
+    layout_counters& k = g_layout_counters;
+    if (!layout_dirty_ && bounds.x == bounds_.x && bounds.y == bounds_.y &&
+        bounds.width == bounds_.width && bounds.height == bounds_.height) {
+        ++k.arrange_skips;
+        return;
+    }
+    ++k.arranges;
+    if (k.on_arrange)
+        k.on_arrange(*this);
+    arrange(bounds);
+    layout_dirty_ = false;
+}
+
+lx::size2i lx::ui::ui_node::measure_content(layout::constraints c, size_hint hint) const {
+    return measure(c, hint);
+}
+
+const lx::layout::flex_style* lx::ui::ui_node::flex_item_style() const {
+    return nullptr;
+}
+
 lx::size2i lx::ui::ui_node::measure(layout::constraints c, size_hint hint) const {
     // Default: wrap the largest child measurement, clamped to the constraint range.
     lx::size2i out{};
     for (unsigned i = 0; i < child_count_; ++i) {
         if (!children_[i])
             continue;
-        const auto child_size = children_[i]->measure(c, hint);
+        const auto child_size = children_[i]->measure_cached(c, hint);
         if (child_size.width > out.width)
             out.width = child_size.width;
         if (child_size.height > out.height)
@@ -817,7 +1041,7 @@ void lx::ui::ui_node::arrange(lx::rect2i bounds) {
     layout_dirty_ = false;
     for (unsigned i = 0; i < child_count_; ++i) {
         if (children_[i])
-            children_[i]->arrange(bounds);
+            children_[i]->place(bounds);
     }
 }
 
@@ -871,7 +1095,7 @@ void lx::ui::ui_node::adopt(ui_node* node) {
     reserve_children(child_count_ + 1);
     node->parent_ = this;
     children_[child_count_++] = node;
-    layout_dirty_ = true;
+    mark_layout_dirty();
 }
 
 void lx::ui::ui_node::set_child_at(unsigned index, ui_node* node) {
@@ -885,7 +1109,7 @@ void lx::ui::ui_node::set_child_at(unsigned index, ui_node* node) {
         node->parent_ = this;
     if (index >= child_count_)
         child_count_ = index + 1;
-    layout_dirty_ = true;
+    mark_layout_dirty();
 }
 
 void lx::ui::ui_node::truncate_children(unsigned count) {
@@ -895,7 +1119,7 @@ void lx::ui::ui_node::truncate_children(unsigned count) {
     }
     if (count < child_count_) {
         child_count_ = count;
-        layout_dirty_ = true;
+        mark_layout_dirty();
     }
 }
 
@@ -936,7 +1160,6 @@ void lx::ui::ui_node::place_child(unsigned index, ui_node* node) {
 void lx::ui::ui_node::set_child_count(unsigned count) {
     reserve_children(count);
     child_count_ = count < k_max_children ? count : k_max_children;
-    layout_dirty_ = true;
 }
 
 unsigned lx::ui::ui_node::child_count() const { return child_count_; }
@@ -955,7 +1178,24 @@ void lx::ui::ui_node::set_style(style_ref style) { style_ = style; }
 lx::ui::style_ref lx::ui::ui_node::style() const { return style_; }
 lx::rect2i lx::ui::ui_node::bounds() const { return bounds_; }
 
-void lx::ui::ui_node::mark_layout_dirty() { layout_dirty_ = true; }
+void lx::ui::ui_node::mark_layout_dirty() {
+    // Every ancestor's measurement depended on this one. The walk stops below an ancestor
+    // already dirty (Yoga's rule): the passes keep "dirty ⇒ parent dirty" — a node is
+    // cleaned only by its own arrange, its parent's arrange places every child, and the
+    // reconciler marks a parent whose children changed — so that ancestor's own ancestors
+    // are dirty and their caches empty already. 10 000 leaves of one parent cost one walk.
+    ui_node* n = this;
+    for (;;) {
+        n->layout_dirty_ = true;
+        if (n->measure_slot_ != 0) {
+            lx_ui_measure_block& b = lx_ui_measure_storage().at(n->measure_slot_);
+            b.tags[0] = b.tags[1] = b.tags[2] = b.tags[3] = 0;
+        }
+        if (n->parent_ == nullptr || n->parent_->layout_dirty_)
+            break;
+        n = n->parent_;
+    }
+}
 bool lx::ui::ui_node::layout_dirty() const { return layout_dirty_; }
 void lx::ui::ui_node::clear_layout_dirty() { layout_dirty_ = false; }
 

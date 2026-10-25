@@ -124,7 +124,10 @@ fresh descriptor, two subtrees can be decorated independently — which is exact
 an anti-pattern in `AGENTS.md`.
 
 Built-in proxies: `insets`, `align` / `center`, `sizing` / `pin_size` / `min_size`,
-`grow`, `opacity`, `clip`, and `keyed`.
+`grow`, `opacity`, `clip`, and `keyed`. In a flex container (§5) `grow` is the item's
+`flex-grow` and `sizing` its min and max size; both pass the rest of their child's item
+style through, as `opacity` and `clip` pass all of it, so `label | min_size(..) | grow(1)`
+is one item with both.
 
 Deferred subtrees use a `slot` thunk so overlays and collapsed panels are not described
 until they are shown.
@@ -136,12 +139,39 @@ until they are shown.
 Two passes, mirroring the constraint model already in `lx.layout`:
 
 1. **`measure(constraints, size_hint)`** — must not mutate observable state; it is called
-   more than once per pass. `size_hint` selects `min`, `preferred`, or `max`, which is
-   what lets a flex container distribute slack without guessing.
+   more than once per pass. `size_hint` selects `min` (the min-content width), `preferred`,
+   or `max`, which is what lets a flex container distribute slack without guessing.
+   `measure_content` is the same without the node's own size styles (what a flex container
+   asks of an item whose width, min and max it applies itself).
 2. **`arrange(bounds)`** — assigns final geometry and recurses.
 
-Layout invalidation is scoped to a subtree via `mark_layout_dirty()`. It deliberately does
-**not** imply a full-surface repaint.
+A node asks its children through **`measure_cached`** and **`place`**, never the virtuals
+directly (ADR-010 §4.7):
+
+- Each node has a 4-entry `(constraints, hint, mode) → size` cache (Yoga's shape) in a
+  72-byte block of the UI thread's measure-cache pool, taken the first time the node is
+  measured; `ui_node` itself stays 80 bytes. A key whose min is neither 0 nor its max goes
+  uncached; the flex container never makes one.
+- `mark_layout_dirty()` (`invalidate_layout`, the reconciler when props or children change)
+  clears the node's cache and marks it and its ancestors dirty, stopping below one already
+  dirty: the passes keep "dirty ⇒ parent dirty" because an `arrange` places every child.
+- `place(bounds)` skips a clean node whose bounds did not change, so a pass walks the dirty
+  path only; `ui_root` places the root and no longer measures it. An `arrange` must store
+  the bounds it is given (a node that positions itself inside them is re-arranged whenever
+  its parent is).
+- Props that change nothing layout reads leave the layout alone: an `apply` returning
+  `bool` says whether they did (`describe` marks the node when it returns true, and on every
+  apply when it returns nothing).
+
+The flex container is **`flex_node`** (`lx.ui:flex`, `flex(style, children)`), a
+`layout::flex_style` over `lx.layout:flex`: the CSS flexbox subset Taffy gives GPUI
+(direction, wrap, justify / align content, items and self, gaps, grow / shrink / basis,
+min / max, margin with `auto`, padding, border, `position: absolute` with insets, overflow;
+lengths px, rem, percent, auto). `box()` is a flex column or row with a gap. Text wraps at
+the width the container gives it and shrinks to its longest word. Counts of what a pass did
+are in `ui_layout_counters()`.
+
+Layout invalidation does **not** imply a full-surface repaint.
 
 ---
 
@@ -263,7 +293,7 @@ Still to build:
 
 - Concrete widgets (`label`, `button`, `entry`, `checkbox`, `scroll_area`) as `ui_node`s
 - A root host that owns the reducer rebuild → layout → emit → damage sequence per tick
-- Flex and grid containers reading `grow_node::grow_factor()` off their children
+- Grid containers (flex is `lx.ui:flex`, which reads `grow_node::grow_factor()`)
 - Overlay layers (dialog, popover) that defer show/close to the next frame
 - Feeding merged damage into `kms_damage_region`
 - A design-system layer (shell chrome: scaffold, rows, toolbars) as a separate module

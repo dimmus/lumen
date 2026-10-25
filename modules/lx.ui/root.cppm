@@ -156,9 +156,9 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
 
     {
         lx::trace::scoped_span span{"ui", "ui.layout"};
-        const lx::layout::constraints constraints{{0, 0}, {bounds_.width, bounds_.height}};
-        (void)root_->measure(constraints, size_hint::preferred);
-        root_->arrange(bounds_);
+        // The root is placed at the bounds: only the dirty path is measured and arranged
+        // again (ADR-010 §4.7); a clean root at the same bounds is not walked at all.
+        root_->place(bounds_);
     }
     {
         const auto now = clock::now();

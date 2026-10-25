@@ -149,8 +149,13 @@ public:
     text_block_node() = default;
     ~text_block_node() override;
 
-    void apply(const text_block_props& props);
+    /// Marks the layout dirty itself when an input the layout reads changed, so it tells
+    /// the reconciler there is nothing more to do (false).
+    bool apply(const text_block_props& props);
 
+    /// The text's size wrapped at the constraint's width; for `size_hint::min` when it wraps,
+    /// its min-content width (`text_layout::min_content_width`, the longest word) and the
+    /// height wrapped there.
     [[nodiscard]] lx::size2i measure(lx::layout::constraints c, size_hint hint) const override;
     void arrange(lx::rect2i bounds) override;
     void emit(draw_scope& out) const override;
@@ -304,7 +309,7 @@ lx::ui::text_block_node::~text_block_node() {
         delete job_;
 }
 
-void lx::ui::text_block_node::apply(const text_block_props& p) {
+bool lx::ui::text_block_node::apply(const text_block_props& p) {
     color_ = p.color;
     scale_ = p.scale > 0.f ? p.scale : 1.f;
     wraps_ = p.wrap == lx::text::text_wrap::word;
@@ -327,6 +332,7 @@ void lx::ui::text_block_node::apply(const text_block_props& p) {
         apply_async(p, *async);
     else
         apply_inline(p);
+    return false;
 }
 
 void lx::ui::text_block_node::apply_inline(const text_block_props& p) {
@@ -485,8 +491,13 @@ void lx::ui::text_block_node::faces_evicted() {
     invalidate_layout(*this);
 }
 
-lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint) const {
-    layout_.set_max_width(logical_width(c.max.width));
+lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint hint) const {
+    // A measure wraps the layout at the width it asks about; `emit` puts the bounds' width
+    // back, since a parent may measure after it arranged (a cached arrange is not re-run).
+    int width = c.max.width;
+    if (hint == size_hint::min && wraps_)
+        width = std::min(width, std::max(layout_.min_content_width(), 1));
+    layout_.set_max_width(logical_width(width));
     lx::size2i out = layout_.bounding_size();
     if (out.width < c.min.width)
         out.width = c.min.width;
@@ -509,6 +520,7 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     stats_ = {};
     if (!visible_ || !glyphs_)
         return;
+    layout_.set_max_width(logical_width(bounds_.width));
     // Lay out now, before the face lock below: the queries lock the engine lazily.
     if (!layout_.update())
         return;

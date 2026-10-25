@@ -818,6 +818,30 @@ at load 0.1), one window 32 → 36–45 µs; GL render thread 719–831 → 698�
 - Gate: G2 on a synthetic panel tree (S2); a screenshot of the component gallery reviewed
   against Zed side by side.
 
+As built (layout, §4.7): `lx.layout:flex` (`solve_flex` over a `flex_style`, on
+`lx.foundation` only) follows CSS Flexbox §9 in the shape of Taffy's `flexbox.rs` and lays out
+463 of Taffy's 685 Chrome-generated flexbox fixtures exactly as Chrome does
+(`test_layout_flex`, transcribed by `scripts/flex-fixtures.py`; the rest use text measurement,
+RTL, baseline, aspect ratio, sizing keywords, scrollbar gutters or non-flex display, and two
+need `position: static` or Taffy's known-but-indefinite sizes). Not offered: `baseline` (no
+baseline query on `ui_node`), `aspect-ratio` beyond filling a missing side. Per-item and
+per-line state is caller-provided (`ui_node::k_max_children` of each on the stack in lx.ui):
+a solve allocates nothing. `lx.ui:flex`'s `flex_node` runs it through `measure` / `arrange`;
+`box()` became a flex column or row; `grow` and `sizing` are read as `flex-grow` and min /
+max; text answers `size_hint::min` with its longest word (`text_layout::min_content_width`).
+The 4-entry measure cache lives in a 72-byte side-pool block a node takes when first
+measured, behind a 32-bit slot in what was padding: `sizeof(ui_node)` stays 80 B, and S3
+measured A/B interleaved against main is unchanged (emit + order + encode p50 447–457 µs vs
+447–466 µs, load 0.7). Dirtiness propagates to the root (stopping below a dirty ancestor),
+`place` skips a clean node at unchanged bounds, `ui_root` places the root without measuring
+it, and props that change nothing layout reads mark nothing (`apply` returning `bool`). On a
+301-node panel tree (10 rows × 29 labels; `lumen-ui-bench --scenario S2`, "layout_solve",
+load 0.5–0.8, six runs): every node dirty 66 µs p50 / 153–200 µs p95 (1 170 measure calls,
+301 arranges), the root alone dirty over warm caches 1.1–1.4 µs / 1.1–5.3 µs (10 cache hits,
+one arrange), one label dirty 6.9 µs / 7.5–13.8 µs (5 measure calls — the label and its row —
+3 arranges, 37 skipped); 0 allocations. A paint-only S2 frame's layout stage fell from
+p95 56.6 µs to 1.7 µs (the clean root is not walked).
+
 ### Phase 4 — The client runtime (≈3 weeks)
 
 - `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,

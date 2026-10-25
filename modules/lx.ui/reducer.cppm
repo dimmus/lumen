@@ -72,9 +72,14 @@ public:
         child described = build_(state_, *this);
         if (ctx.overflowed())
             return; // keep the previous tree rather than reconcile a truncated one
-        ui_node* settled = rec.apply(child_at(0), described);
+        ui_node* const previous = child_at(0);
+        const bool reused = previous && described && previous->type() == described->type &&
+                            previous->key() == described->key;
+        ui_node* settled = rec.apply(previous, described);
         place_child(0, settled);
         set_child_count(settled ? 1u : 0u);
+        if (!reused && (previous || settled))
+            mark_layout_dirty();
         dirty_ = false;
     }
 
