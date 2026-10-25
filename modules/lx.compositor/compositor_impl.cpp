@@ -9055,21 +9055,58 @@ lx::result<void> compositor::start() {
     if (auto session = session::logind_session::open(); session)
         impl_->logind_ = std::move(session).value();
 
-    // Prefer logind TakeDevice for the card node; fall back to direct open. `--virtual-outputs`
-    // asks for virtual outputs instead of the display: no card is opened (headless and
-    // multi-output protocol tests on a host whose display is free to take).
+    // The card: LUMEN_DRM_DEVICE when set, else the display devices sysfs lists, best first
+    // (`drm::find_cards`: a connected display, boot VGA, lowest index — card0 is often
+    // simpledrm's or a render-only GPU's), each tried until one opens. Prefer logind
+    // TakeDevice for the node; fall back to direct open. `--virtual-outputs` asks for virtual
+    // outputs instead of the display: no card is opened (headless and multi-output protocol
+    // tests on a host whose display is free to take).
     const bool want_virtual = impl_->cfg.virtual_outputs && *impl_->cfg.virtual_outputs;
     if (!want_virtual) {
         lx::result<drm::kms_device> opened =
-            lx::make_error(lx::drm_err::open_failed, "kms not opened");
-        bool inactive = false;
-        if (auto taken = impl_->logind_.take_device_path("/dev/dri/card0", &inactive); taken) {
-            impl_->drm_via_logind_ = impl_->logind_.has_control();
-            impl_->drm_start_inactive_ = impl_->drm_via_logind_ && inactive;
-            opened = drm::kms_device::open_fd(std::move(taken).value());
+            lx::make_error(lx::drm_err::open_failed, "no display device (/sys/class/drm)");
+        drm::card_list cards{};
+        if (const char* env = std::getenv("LUMEN_DRM_DEVICE"); env && *env) {
+            cards.count = 1;
+            std::snprintf(cards.cards[0].path, sizeof(cards.cards[0].path), "%s", env);
+            std::snprintf(cards.cards[0].driver, sizeof(cards.cards[0].driver), "LUMEN_DRM_DEVICE");
         } else {
-            opened = drm::kms_device::open("/dev/dri/card0");
+            cards = drm::find_cards();
         }
+        for (unsigned i = 0; i < cards.count && !opened; ++i) {
+            const drm::card_candidate& c = cards.cards[i];
+            bool inactive = false;
+            bool via_logind = false;
+            dev_t taken_dev = 0;
+            if (auto taken = impl_->logind_.take_device_path(c.path, &inactive); taken) {
+                via_logind = impl_->logind_.has_control();
+                struct stat st {};
+                if (::fstat(taken.value().get(), &st) == 0)
+                    taken_dev = st.st_rdev;
+                opened = drm::kms_device::open_fd(std::move(taken).value());
+            } else {
+                opened = drm::kms_device::open(c.path);
+            }
+            if (opened) {
+                impl_->drm_via_logind_ = via_logind;
+                impl_->drm_start_inactive_ = via_logind && inactive;
+                lx::trace::logger::global().logf(
+                    lx::trace::level::info, "compositor.drm",
+                    "card {} ({}): {} connected of {} connectors{}", c.path,
+                    c.driver[0] ? c.driver : "?", c.connected, c.connectors,
+                    c.boot_vga ? ", boot VGA" : "");
+            } else {
+                // A card logind gave us and we cannot use goes back, or it stays paused-ours.
+                if (via_logind && taken_dev != 0)
+                    impl_->logind_.release_device(major(taken_dev), minor(taken_dev));
+                lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.drm",
+                                                 "card {} ({}) not usable: {}", c.path,
+                                                 c.driver[0] ? c.driver : "?",
+                                                 opened.get_error().message);
+            }
+        }
+        if (!opened)
+            lx::trace::logger::global().log_error(opened.get_error(), "compositor.drm");
         if (opened) {
             impl_->kms = std::move(opened).value();
             impl_->graphics.syncobj().set_drm_fd(impl_->kms.card_fd());

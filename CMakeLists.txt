@@ -1147,6 +1147,12 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_uevent_parse PRIVATE tests)
     add_test(NAME test_uevent_parse COMMAND test_uevent_parse)
 
+    add_executable(test_card_select tests/test_card_select.cpp)
+    target_link_libraries(test_card_select PRIVATE lx.drm)
+    lumen_apply_module_properties(test_card_select)
+    target_include_directories(test_card_select PRIVATE tests)
+    add_test(NAME test_card_select COMMAND test_card_select)
+
     foreach(t test_output_scan_diff test_output_policy test_window_migration
               test_output_management test_output_config_store)
         add_executable(${t} tests/${t}.cpp)
