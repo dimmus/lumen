@@ -420,6 +420,21 @@ if [[ -n "${WAYLAND_DISPLAY:-}" || -n "${DISPLAY:-}" ]]; then
   echo "      --join-seat-session)."
 fi
 
+# The compositor needs atomic modesetting, which Linux before 7.4 leaves off on nouveau: the
+# card would be refused and the session would run with nothing on screen.
+# shellcheck source=nouveau-atomic.sh
+source "$ROOT/scripts/nouveau-atomic.sh"
+if [[ -n "$(nouveau_cards)" ]]; then
+  case "$(nouveau_atomic_state)" in
+    off)
+      echo "NOTE: nouveau has atomic modesetting off (Linux before 7.4): the compositor will"
+      echo "      refuse $(nouveau_cards | paste -sd' ') and nothing reaches the screen."
+      echo "      TODO: ./scripts/install-deps.sh --nouveau-atomic, then reboot." ;;
+    pending)
+      echo "NOTE: nouveau atomic modesetting is configured but needs a reboot to take effect." ;;
+  esac
+fi
+
 # libinput opens devices through logind TakeDevice, which only the active seat session
 # may do. Find that session's cgroup and compare it with ours.
 SEAT_SCOPE=""

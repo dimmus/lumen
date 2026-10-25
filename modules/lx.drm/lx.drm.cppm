@@ -167,7 +167,8 @@ public:
     /// `open_fd` after `logind_session::take_device_path`.
     [[nodiscard]] static lx::result<kms_device> open(const char* device_path = nullptr);
     /// Sets the atomic, universal-planes and cursor-hotspot caps, enumerates the resources
-    /// and probes every connector once (`last_scan`).
+    /// and probes every connector once (`last_scan`). A driver that refuses atomic is
+    /// `drm_err::no_atomic` (see `no_atomic_hint`).
     [[nodiscard]] static lx::result<kms_device> open_fd(lx::unique_fd card_fd);
 
     /// CRTCs and planes, with what is bound to them now. At open; again at resume.
@@ -452,8 +453,11 @@ lx::result<void> lx::drm::kms_device::init_from_fd() {
     const int flags = ::fcntl(fd, F_GETFL);
     if (flags >= 0)
         (void)::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    // Atomic only: a driver without it (nouveau before Linux 7.4 unless nouveau.atomic=1,
+    // radeon, nouveau before NV50) is refused with its own code, so the caller can say why.
     if (drmSetClientCap(fd, DRM_CLIENT_CAP_ATOMIC, 1) != 0)
-        return lx::make_error(lx::drm_err::open_failed, "DRM_CLIENT_CAP_ATOMIC failed");
+        return lx::make_error(lx::drm_err::no_atomic,
+                              "DRM_CLIENT_CAP_ATOMIC refused: the driver has no atomic modesetting");
     (void)drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
     // Declares that this client sets HOTSPOT_X/Y on cursor planes. Virtualised drivers
     // (vmwgfx, virtio-gpu, qxl, vboxvideo) only expose their cursor plane to atomic

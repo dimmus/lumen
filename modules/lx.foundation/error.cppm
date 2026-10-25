@@ -59,6 +59,9 @@ enum class drm_err : int {
     monitor_failed = 8,
     /// A DRM timeline syncobj operation (import, query, eventfd, signal, transfer) failed.
     timeline_failed = 9,
+    /// The driver offers no atomic modesetting (DRM_CLIENT_CAP_ATOMIC refused), which the
+    /// KMS path requires (`lx::drm::no_atomic_hint` says what to do about it).
+    no_atomic = 10,
 };
 
 enum class protocol_err : int {

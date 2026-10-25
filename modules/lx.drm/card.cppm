@@ -51,6 +51,13 @@ void rank_cards(card_list& list);
 /// ranked (`rank_cards`). Empty when there is no display device.
 [[nodiscard]] card_list find_cards(const char* sys_drm = "/sys/class/drm");
 
+/// What to do about a card whose `driver` refused atomic modesetting (`drm_err::no_atomic`):
+/// one static line for the log. nouveau leaves atomic off before Linux 7.4 unless
+/// `nouveau.atomic=1`; when `sys_module`'s `nouveau/parameters/atomic` shows it on already
+/// (the file is root-only, so usually it cannot be read), the GPU predates NV50 and has
+/// none. radeon has none at all; amdgpu drives its GCN 1.0/1.1 cards with atomic.
+[[nodiscard]] const char* no_atomic_hint(const char* driver, const char* sys_module = "/sys/module");
+
 } // namespace lx::drm
 
 
@@ -96,6 +103,26 @@ void lx::drm::rank_cards(card_list& list) {
             return a.boot_vga;
         return a.index < b.index;
     });
+}
+
+const char* lx::drm::no_atomic_hint(const char* driver, const char* sys_module) {
+    if (driver && std::strcmp(driver, "nouveau") == 0) {
+        char path[512];
+        char value[16];
+        std::snprintf(path, sizeof(path), "%s/nouveau/parameters/atomic",
+                      sys_module ? sys_module : "/sys/module");
+        // 1, or -1 ("auto", Linux 7.4+): asked for and still refused.
+        if (read_attr(path, value, sizeof(value)) && std::strcmp(value, "0") != 0)
+            return "nouveau has no atomic modesetting on GPUs before NV50 (GeForce 8); Lumen "
+                   "cannot scan out on this card";
+        return "TODO: nouveau leaves atomic modesetting off before Linux 7.4 — add `options "
+               "nouveau atomic=1` to /etc/modprobe.d (./scripts/install-deps.sh "
+               "--nouveau-atomic does it) and reboot";
+    }
+    if (driver && std::strcmp(driver, "radeon") == 0)
+        return "radeon has no atomic modesetting; a GCN 1.0/1.1 card can run on amdgpu instead "
+               "(radeon.si_support=0 amdgpu.si_support=1, or the cik_support pair)";
+    return "the driver has no atomic modesetting, which Lumen's KMS path requires";
 }
 
 lx::drm::card_list lx::drm::find_cards(const char* sys_drm) {
