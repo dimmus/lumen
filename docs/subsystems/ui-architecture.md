@@ -102,7 +102,24 @@ ids through `next_element_type_id()` from a function-local static:
 ```
 
 **Never store a `ui_node*` in application state.** State holds plain data; the tree is
-derived from it. A stored node pointer dangles the moment its type changes.
+derived from it. A stored node pointer dangles the moment its type changes. The toolkit's
+own holders of node pointers — the focused, hovered and pressed node, a timer's target, a
+trap's scope — are `node_observer`s: a node they refer to carries `node_flag::referenced` and
+tells them when it dies.
+
+**Reducers.** A `reducer_node` hosts a piece of state and a build function for its subtree.
+`dispatch` reduces the state and queues the reducer (an intrusive list, no allocation); the
+next `ui_root::tick` describes **that reducer's subtree only** and reconciles it, reusing every
+unchanged node, so the damage is the nodes whose props changed. The reconciler never walks
+into a reducer's children (`node_flag::opaque_children`): when the tree around it is described
+again the reducer is re-applied and its subtree and state are left as they are.
+
+```cpp
+child build_counter(const counter& s, reducer_node<counter, action>& host) {
+    const child kids[2] = {button("+").on_press(bind(host, action::increment)), label(s.text)};
+    return div(style{}.flex_row().gap(sp::b04), kids);
+}
+```
 
 ---
 
@@ -171,6 +188,53 @@ an array index. The bundled One Dark and One Light are also compiled into the bi
 `ui_root::tick` then describes again, relayouts and repaints the whole tree. `theme_watcher`
 reloads a theme file on change (inotify; read and checked on the worker affinity, swapped in
 on UI).
+
+### Components (ADR-010 §5.6)
+
+`lx.ui:components` builds the component set from three node types: **`control_node`**
+(`lx.ui:control`) — a flex container that paints one rounded, bordered box whose background
+and border follow the pointer (`control_paint`: a rest, hover and pressed `box_paint`, each a
+token, a faded token, a token blended with another, or a darkened one), takes hover, press,
+focus and activation, and draws the focus ring — `text_block_node` and `icon_node`. Each
+component is a **builder**, a value converted to a `child` inside a describe, with one shape
+across the set:
+
+```cpp
+button("Save").style(button_style::filled).icon(icon::check).on_press(save)
+icon_button(icon::x).shape(icon_button_shape::square).on_press(close)
+checkbox(toggle_state::selected).label("Wrap lines").on_toggle(set_wrap)  // gets the next state
+toggle_switch(wifi).label("Wi-Fi").on_toggle(set_wifi)
+tab("main.rs").position(i, n, selected).on_select(show)                   // gets the index
+```
+
+Sizes, spacing, radii and tokens are Zed's (crates/ui, cited at each builder): a default
+button is 22 px with `b04` padding and `rounded_sm`, an icon button 24 × 22 (square 20 × 20),
+a checkbox's box 16 px in a 20 px holder, a switch 38 × 26 around a `b32` × `b20` track, a
+tab 32 px. Disabled and selected are props, so the label colours they change are described;
+hover and press change a background or a border only (§5.5). `ui_resources` gives labels and
+icons the app's text engine, glyph cache and icon cache. `handler`s (function pointers,
+reducer bindings, small trivially copyable lambdas) ride in props inline.
+
+### Interaction
+
+- **Focus** (`lx.ui:focus`): `focus_manager` over the `ui_node` tree. Tab and shift-tab walk
+  focusable, enabled, visible nodes in tree order, positive `focus_order()` first, negative
+  ones skipped; a trap (`trap(scope)`) confines the sequence to a modal's subtree and gives
+  the focus back on `release`. Focus-visible follows GPUI: the ring shows after keyboard input
+  and hides after a pointer press; programmatic focus keeps the last input's modality. The
+  ring is a 1 px `border.focused` border on the node's own rounded box, drawn by the node,
+  separate from selection. Groups (tab bars, status bars, lists) move the focus with the
+  arrow keys, home and end (`move_within`, `move_to_edge`; one tab stop per group).
+- **Pointer** (`lx.ui:interact`): `pointer_state` keeps the hovered and pressed node — the
+  topmost interactive, enabled node under the pointer — in their flags; a release over the
+  pressed node activates it; a press moves the focus there without a ring. Each state change
+  calls the node's `on_interaction_changed`, which damages that control's bounds and nothing
+  else. `ui_root` routes `pointer_move`, `pointer_button`, `pointer_leave` and `key`.
+- **Time and motion**: `ui_now_ns()` is the frame clock (latched per tick). A `transition`
+  (100–150 ms ease-out, §5.5) sampled through `animate` in `emit` asks for the next frame only
+  while it runs; `reduced_motion` makes it jump to its end. Delays are timers (`ui_timers`, 32
+  entries): hover intent fires 500 ms after a hover begins, and `ui_root::next_deadline_ns`
+  tells the event loop when to wake — a delay requests no frames, an idle tree nothing (G1).
 
 **Icons** (`lx.ui:icon`) are the bundled Lucide SVGs, rasterised per (icon, device size)
 once by librsvg into the atlas's R8 pages and drawn as `mono_sprite`s tinted with an
@@ -297,9 +361,11 @@ Two deliberate differences from the model this was adapted from:
 
 - **Rects are merged.** Karm accumulates them unbounded and never coalesces.
 - **Relayout does not damage the whole surface.** Karm marks the entire window dirty on
-  any layout change, which would make the damage useless to KMS. Here relayout damages
-  the affected subtree's bounds before arrange, and the root adds the new bounds after,
-  so a resize repaints both the vacated and the newly covered area.
+  any layout change, which would make the damage useless to KMS. Here `ui_node::place`
+  damages a node the layout moved — its old and its new bounds — and a node whose look changed
+  with its layout (`mark_repaint`: a label's text), but not an ancestor re-arranged in place,
+  whose own pixels did not change. A paint-only change (a hover, a colour) damages the node's
+  bounds from `apply` or `on_interaction_changed`.
 
 Merged regions are what should feed `kms_damage_region` on the atomic commit path.
 
@@ -324,7 +390,10 @@ description.
 ## 9. Migration status
 
 The declarative core (`:element`, `:node`, `:invalidate`, `:reconcile`, `:decorator`,
-`:reducer`) is in place and covered by `tests/test_ui_reconcile.cpp`. Flex layout (`:flex`)
+`:reducer`) is in place and covered by `tests/test_ui_reconcile.cpp`. Focus, pointer state,
+motion, reducers wired into the root and the first components (`:focus`, `:interact`,
+`:control`, `:components`) are covered by `tests/test_ui_components.cpp` and the
+`components_states` / `components_gallery` golden images. Flex layout (`:flex`)
 is covered by `tests/test_layout_flex.cpp`; styles, themes, styled boxes and icons
 (`:style`, `:theme`, `:theme.compile`, `:styled`, `:icon`) by `tests/test_ui_theme.cpp` and
 the `styled_surfaces` / `icons` golden images. The old string-keyed `style_ref` survives only
@@ -343,10 +412,9 @@ callers compile. It is superseded and should not gain new widgets:
 
 Still to build:
 
-- Concrete widgets — ADR-010 §5.6's components (`label`, `button`, `toggle`, `text_input`,
-  `list`, `scroll_area`, `tab_bar`, `tooltip`, `popover_menu`, `modal`, …) as `ui_node`s on
-  styled boxes, text blocks and icons
-- A root host that owns the reducer rebuild → layout → emit → damage sequence per tick
+- The rest of ADR-010 §5.6 (`text_input`, `list` + `list_item`, `scroll_area`, `tooltip`,
+  `popover_menu`, `context_menu`, `modal`, `toast`) on `control_node`, the focus traps and
+  the timers above
 - Grid containers (flex is `lx.ui:flex`, which reads `grow_node::grow_factor()`)
 - Overlay layers (dialog, popover) that defer show/close to the next frame
 - Feeding merged damage into `kms_damage_region`

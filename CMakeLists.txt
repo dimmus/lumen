@@ -1241,6 +1241,15 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_ui_reconcile PRIVATE tests)
     add_test(NAME test_ui_reconcile COMMAND test_ui_reconcile)
 
+    # ADR-010 §7 Phase 3: focus over the retained tree, reducers wired into the root, pointer
+    # state and motion, and §5.6's basic components against Zed's sizes and tokens.
+    add_executable(test_ui_components tests/test_ui_components.cpp)
+    target_link_libraries(test_ui_components PRIVATE lx.ui lx.scene lx.gfx lx.text lx.runtime lx.a11y)
+    lumen_apply_module_properties(test_ui_components)
+    lumen_link_platform(test_ui_components)
+    target_include_directories(test_ui_components PRIVATE tests)
+    add_test(NAME test_ui_components COMMAND test_ui_components)
+
     # lx.layout:flex against Chrome's layout of Taffy's fixtures, and lx.ui's flex container
     # with the per-node measure cache (ADR-010 §4.7).
     add_executable(test_layout_flex tests/test_layout_flex.cpp)

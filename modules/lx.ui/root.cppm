@@ -11,8 +11,12 @@ export module lx.ui:root;
 import std;
 
 import :element;
+import :events;
+import :focus;
+import :interact;
 import :node;
 import :reconcile;
+import :reducer;
 import :invalidate;
 import :theme;
 
@@ -42,6 +46,28 @@ public:
 
     [[nodiscard]] ui_node* tree() const;
     [[nodiscard]] damage_ledger& damage();
+
+    // ── Input (ADR-010 §4.9; Phase 4's window routes wl_pointer / wl_keyboard here) ──
+
+    /// The tree's keyboard focus (tab order, traps, focus-visible).
+    [[nodiscard]] focus_manager& focus() { return focus_; }
+    /// The hovered and pressed nodes.
+    [[nodiscard]] pointer_state& pointer() { return pointer_; }
+    /// The pointer moved to `at` (surface coordinates): hover follows. True when the
+    /// hovered node changed (it damaged itself).
+    bool pointer_move(lx::point2i at);
+    /// A button changed at the pointer's position: press, focus, activation on release.
+    /// Falls back to the tree's `on_mouse` when no interactive node is there.
+    bool pointer_button(mouse_button b, bool pressed);
+    void pointer_leave();
+    /// A key: tab moves the focus, others go to the focused node and its ancestors, then
+    /// to the tree's `on_key`.
+    bool key(key_event event);
+
+    /// When the event loop must wake the UI next without input, CLOCK_MONOTONIC ns (a timer
+    /// such as a tooltip's hover delay); 0: nothing pending. An animation asks for frames
+    /// through the ledger instead.
+    [[nodiscard]] std::uint64_t next_deadline_ns() const;
     /// The damage the last frame `tick` produced repaints (see `tick`).
     [[nodiscard]] const damage_ledger& frame_damage() const { return frame_damage_; }
 
@@ -55,6 +81,9 @@ public:
         std::uint64_t layout = 0;
         std::uint64_t emit = 0;
         bool described = false;
+        /// Reducers whose subtree this frame described again (only theirs, when the tree
+        /// itself was not).
+        unsigned reducers_rebuilt = 0;
     };
     [[nodiscard]] stage_times last_stage_times() const;
 
@@ -66,6 +95,8 @@ private:
     lx::rect2i bounds_{};
     stage_times stage_times_{};
     damage_ledger frame_damage_{};
+    focus_manager focus_{};
+    pointer_state pointer_{};
     /// The `theme_generation` the tree was last resolved under.
     std::uint64_t theme_generation_ = 0;
     bool dirty_ = true;
@@ -102,7 +133,17 @@ void lx_ui_fold(lx::ui::damage_ledger& into, const lx::ui::damage_ledger& from) 
         into.request(lx::ui::invalidation::layout);
     if (from.needs_animate())
         into.request(lx::ui::invalidation::animate);
+    if (from.needs_rebuild())
+        into.request(lx::ui::invalidation::rebuild);
 }
+
+/// Latches the frame clock for one tick (`ui_now_ns`), released on every return path.
+struct lx_ui_frame_scope {
+    lx_ui_frame_scope() { lx::ui::begin_ui_frame(); }
+    ~lx_ui_frame_scope() { lx::ui::end_ui_frame(); }
+    lx_ui_frame_scope(const lx_ui_frame_scope&) = delete;
+    lx_ui_frame_scope& operator=(const lx_ui_frame_scope&) = delete;
+};
 
 /// Every node's layout dirty and its measure cache cleared.
 void lx_ui_mark_tree_dirty(lx::ui::ui_node& node) {
@@ -124,6 +165,10 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (!arena_ || !describe_)
         return false;
+
+    const lx_ui_frame_scope frame_clock{};
+    // Timers due by this frame's time run first: what they invalidate is this frame's.
+    (void)ui_timers().fire_due(ui_now_ns());
 
     damage_ledger& ledger = ui_damage();
     // A new theme or density changes what every styled node resolves to: describe again
@@ -169,6 +214,18 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
             stage_times_.reconcile = lx_ui_ns_between(described_at, stage_start);
         }
     }
+    if (reducers_pending()) {
+        // Reducers that dispatched (or that this describe constructed) describe their own
+        // subtree again — only theirs, the reconcile reusing every unchanged node.
+        lx::trace::scoped_span span{"ui", "ui.reducers"};
+        const auto rebuild_start = clock::now();
+        stage_times_.reducers_rebuilt = rebuild_pending_reducers(ctx, reconciler_);
+        if (reducers_pending())
+            ledger.request(invalidation::rebuild); // past the per-frame cap: next frame
+        stage_start = clock::now();
+        stage_times_.reconcile += lx_ui_ns_between(rebuild_start, stage_start);
+    }
+    focus_.set_root(root_);
 
     if (!root_) {
         // No frame: whatever was asked is still owed.
@@ -210,3 +267,30 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
 }
 
 lx::ui::ui_node* lx::ui::ui_root::tree() const { return root_; }
+
+bool lx::ui::ui_root::pointer_move(lx::point2i at) {
+    return pointer_.move(root_, at);
+}
+
+bool lx::ui::ui_root::pointer_button(mouse_button b, bool pressed) {
+    if (pointer_.button(root_, b, pressed, &focus_))
+        return true;
+    if (!root_)
+        return false;
+    mouse_event e{};
+    e.position = pointer_.position();
+    e.button = b;
+    e.pressed = pressed;
+    return root_->on_mouse(e);
+}
+
+void lx::ui::ui_root::pointer_leave() { pointer_.leave(); }
+
+bool lx::ui::ui_root::key(key_event event) {
+    focus_.set_root(root_);
+    if (focus_.handle_key(event))
+        return true;
+    return root_ && root_->on_key(event);
+}
+
+std::uint64_t lx::ui::ui_root::next_deadline_ns() const { return ui_timers().next_deadline(); }

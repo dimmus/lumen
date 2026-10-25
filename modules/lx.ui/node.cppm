@@ -204,6 +204,55 @@ private:
     unsigned emitted_ = 0;
 };
 
+class focus_manager;
+
+/// What a node is, interaction-wise, and bookkeeping the passes keep on it: 16 bits in what
+/// was padding (`sizeof(ui_node)` stays 80). The interaction bits are written by the focus
+/// manager and the pointer state (`lx.ui:focus`, `:interact`) — a test may set them directly
+/// to draw a state — and read by the node's `emit`.
+enum class node_flag : std::uint16_t {
+    none = 0,
+    focusable = 1u << 0,       ///< takes keyboard focus (tab order, a pointer press)
+    focus_scope = 1u << 1,     ///< the root of an active focus trap (a modal, a popover)
+    focused = 1u << 2,         ///< has the focus
+    focus_ring = 1u << 3,      ///< has it and shows the ring: it came by keyboard (focus-visible)
+    hovered = 1u << 4,         ///< the interactive node under the pointer
+    pressed = 1u << 5,         ///< pressed by the pointer, not yet released
+    interactive = 1u << 6,     ///< takes hover, press and activation
+    disabled = 1u << 7,        ///< interactive but inert: no hover, press, focus or activation
+    opaque_children = 1u << 8, ///< the reconciler leaves its children alone (a reducer's subtree)
+    repaint = 1u << 9,         ///< damage the bounds again when the next arrange lays it out
+    referenced = 1u << 10,     ///< a `node_observer` may hold a pointer to it
+    hover_intent = 1u << 11,   ///< wants `on_timer(k_timer_hover_intent)` after a 500 ms hover
+};
+
+[[nodiscard]] constexpr node_flag operator|(node_flag a, node_flag b) {
+    return static_cast<node_flag>(static_cast<std::uint16_t>(a) | static_cast<std::uint16_t>(b));
+}
+
+/// Something that keeps `ui_node` pointers across frames — the focused node, the hovered and
+/// pressed ones, a timer's target, a trap's scope — and must forget one when it dies. A node
+/// is told to report its death by `ui_node::mark_referenced` (a flag bit; nodes nobody refers
+/// to cost nothing). Observers form an intrusive list: registering allocates nothing. UI
+/// affinity.
+class node_observer {
+public:
+    node_observer(const node_observer&) = delete;
+    node_observer& operator=(const node_observer&) = delete;
+
+    /// `node` is being destroyed (its derived parts already are): drop every pointer to it.
+    virtual void node_destroyed(ui_node& node) = 0;
+
+protected:
+    node_observer();
+    virtual ~node_observer();
+
+private:
+    friend class ui_node;
+    node_observer* prev_ = nullptr;
+    node_observer* next_ = nullptr;
+};
+
 /// Retained UI node. Lives across frames and owns its children; descriptors are
 /// reconciled onto it rather than replacing it, so scroll offsets, carets, and
 /// animation state survive a rebuild.
@@ -268,6 +317,45 @@ public:
 
     [[nodiscard]] virtual a11y::node accessibility_node() const;
 
+    // ── Interaction (lx.ui:focus, :interact) ─────────────────────────────────
+
+    [[nodiscard]] bool has_flag(node_flag f) const {
+        return (flags_ & static_cast<std::uint16_t>(f)) != 0;
+    }
+    /// Sets or clears flag bits without side effects: the focus manager's and the pointer
+    /// state's (which then call `on_interaction_changed`), a node's own in `apply`
+    /// (`focusable`, `interactive`, `disabled`), a test's to draw a state.
+    void set_flag(node_flag f, bool on) {
+        if (on)
+            flags_ = static_cast<std::uint16_t>(flags_ | static_cast<std::uint16_t>(f));
+        else
+            flags_ = static_cast<std::uint16_t>(flags_ & ~static_cast<std::uint16_t>(f));
+    }
+    [[nodiscard]] std::uint16_t flags() const { return flags_; }
+    /// A `node_observer` is about to keep this node's address: the node reports its death.
+    void mark_referenced() { set_flag(node_flag::referenced, true); }
+
+    /// Its place in the tab sequence: 0 in tree order, a positive index before every 0 in
+    /// ascending order (HTML's `tabindex`), negative: focusable by pointer, program or arrow
+    /// keys but skipped by tab.
+    [[nodiscard]] virtual int focus_order() const;
+    /// Focus, the ring, hover or press changed on this node (or, for a node painted from an
+    /// ancestor's state, on that ancestor). The default damages the bounds.
+    virtual void on_interaction_changed();
+    /// A key the focus manager routes to the focused node, then to each ancestor until one
+    /// takes it (true): activation keys, arrow navigation in a group.
+    virtual bool on_focus_key(key_event event, focus_manager& focus);
+    /// A click released over the node, or space / enter while it has the focus. False when
+    /// it does nothing (no handler, disabled).
+    virtual bool activate();
+    /// A timer scheduled for this node (`ui_timers::schedule`) came due, on the UI thread at
+    /// the start of a frame tick.
+    virtual void on_timer(std::uint32_t tag);
+
+    /// The node's look changed with its layout (a label's text): damages its bounds now and
+    /// again where the next arrange puts it.
+    void mark_repaint();
+
     static constexpr unsigned k_max_children = 64;
 
     // ── Tree structure (owned children) ──────────────────────────────────────
@@ -330,6 +418,8 @@ protected:
     style_ref style_{};
     bool visible_ = true;
     bool layout_dirty_ = true;
+    /// `node_flag` bits, in what was padding.
+    std::uint16_t flags_ = 0;
 
 private:
     /// The node's block in the measure-cache pool, 1-based; 0: none yet. It fills what was
@@ -360,12 +450,17 @@ template<typename NodeT, typename PropsT>
     node->apply = [](ui_node& target, const void* raw) {
         auto& n = static_cast<NodeT&>(target);
         const PropsT& p = *static_cast<const PropsT*>(raw);
+        // A layout change is taken to change the look too: the node is damaged where it was
+        // and where the arrange puts it. A paint-only change damages itself in `apply`.
         if constexpr (std::is_same_v<decltype(n.apply(p)), bool>) {
-            if (n.apply(p))
+            if (n.apply(p)) {
                 n.mark_layout_dirty();
+                n.mark_repaint();
+            }
         } else {
             n.apply(p);
             n.mark_layout_dirty();
+            n.mark_repaint();
         }
     };
     return node;
@@ -375,6 +470,12 @@ template<typename NodeT, typename PropsT>
 [[nodiscard]] child with_children(child parent, std::span<const child> items);
 
 } // namespace lx::ui
+
+namespace lx::ui::detail {
+/// Adds `region` to the UI thread's damage ledger (`ui_damage`, defined in :invalidate,
+/// which this partition cannot import).
+void damage_rect(lx::rect2i region);
+} // namespace lx::ui::detail
 
 
 // ── draw_scope ──────────────────────────────────────────────────────────────────
@@ -922,7 +1023,37 @@ void lx::ui::ui_node::operator delete(void* node, std::size_t bytes) {
     lx_ui_tree_storage().give_back(node, bytes);
 }
 
+namespace {
+/// The UI thread's node observers, an intrusive list (no allocation to register).
+lx::ui::node_observer* g_node_observers = nullptr;
+} // namespace
+
+lx::ui::node_observer::node_observer() {
+    next_ = g_node_observers;
+    if (next_)
+        next_->prev_ = this;
+    g_node_observers = this;
+}
+
+lx::ui::node_observer::~node_observer() {
+    if (prev_)
+        prev_->next_ = next_;
+    else if (g_node_observers == this)
+        g_node_observers = next_;
+    if (next_)
+        next_->prev_ = prev_;
+    prev_ = next_ = nullptr;
+}
+
 lx::ui::ui_node::~ui_node() {
+    if (has_flag(node_flag::referenced)) {
+        // Each observer drops its pointers; one may unregister another, so walk carefully.
+        for (node_observer* o = g_node_observers; o;) {
+            node_observer* next = o->next_;
+            o->node_destroyed(*this);
+            o = next;
+        }
+    }
     release_children();
     lx_ui_tree_storage().give_back(children_, lx_ui_span_bytes(child_capacity_));
     if (measure_slot_ != 0)
@@ -1005,9 +1136,36 @@ void lx::ui::ui_node::place(lx::rect2i bounds) {
     ++k.arranges;
     if (k.on_arrange)
         k.on_arrange(*this);
+    const lx::rect2i before = bounds_;
     arrange(bounds);
     layout_dirty_ = false;
+    // A node the layout moved repaints where it was and where it is; one whose look changed
+    // with its layout (`mark_repaint`) where it is. An ancestor re-arranged in place is not
+    // damaged: its own pixels did not change.
+    const bool moved = before.x != bounds.x || before.y != bounds.y ||
+                       before.width != bounds.width || before.height != bounds.height;
+    if (moved || has_flag(node_flag::repaint)) {
+        if (moved)
+            detail::damage_rect(before);
+        detail::damage_rect(bounds);
+        set_flag(node_flag::repaint, false);
+    }
 }
+
+void lx::ui::ui_node::mark_repaint() {
+    detail::damage_rect(bounds_);
+    set_flag(node_flag::repaint, true);
+}
+
+int lx::ui::ui_node::focus_order() const { return 0; }
+
+void lx::ui::ui_node::on_interaction_changed() { detail::damage_rect(bounds_); }
+
+bool lx::ui::ui_node::on_focus_key(key_event, focus_manager&) { return false; }
+
+bool lx::ui::ui_node::activate() { return false; }
+
+void lx::ui::ui_node::on_timer(std::uint32_t) {}
 
 lx::size2i lx::ui::ui_node::measure_content(layout::constraints c, size_hint hint) const {
     return measure(c, hint);

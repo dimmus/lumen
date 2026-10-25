@@ -900,6 +900,57 @@ the atlas on the UI strand, damaging the bounds that asked. Golden images `style
 reference, Vulkan (lavapipe) within 2/255 of CPU and 2/255 of GL. Without librsvg the build
 succeeds, icons draw nothing and those cases print SKIP.
 
+As built (focus, reducers, motion, the basic components, §5.5–§5.6): `ui_node` carries 16
+interaction and bookkeeping bits (`node_flag`: focusable, focused, focus ring, hovered,
+pressed, interactive, disabled, a trap's scope, a reducer's opaque children, repaint,
+referenced, hover intent) in what was padding — `sizeof(ui_node)` stays 80 — and holders of
+node pointers across frames (focus, hover, press, timers, traps) are `node_observer`s a dying
+node tells. `lx.ui:focus` is rewritten on that tree (the old `widget*` manager had no callers
+and is gone): tab / shift-tab in tree order with positive `focus_order` first and negative
+skipped, traps for stage 4's modals (8 deep, rejected past that), programmatic focus,
+focus-visible as GPUI decides it (the ring after keyboard input only), arrow / home / end
+within groups, the magnifier hook kept. `lx.ui:interact` adds the pointer state (hover and
+press per interactive node, a release over the pressed node activates it, a press focuses
+without a ring), `handler` (a 32-byte trivially copyable callable: function pointers, reducer
+bindings, small lambdas), the frame clock, `transition` + `animate` (100–150 ms ease-out,
+frames only while running, `reduced_motion` jumps to the end) and a 32-entry timer table
+(hover intent at 500 ms; `ui_root::next_deadline_ns` for the event loop, no frames while a
+delay waits). Reducers are wired into `ui_root`: a dispatch queues its reducer (intrusive
+list) and the next tick describes that subtree alone; the reconciler never enters a reducer's
+children, so a describe of the tree around it keeps its state and nodes. Damage became exact
+for relayout: `place` damages a node the layout moved (old and new bounds) and one whose look
+changed with its layout (`mark_repaint`: a label's text), never an ancestor arranged in
+place; a text block's colour change repaints it. A text block's height is no longer cut to
+an unfixed available height, so a 23 px φ line overflows a 22 px button centred, as in GPUI.
+
+The components (`lx.ui:control`, `:components`) are builders over one node, `control_node` —
+a flex container painting a rounded, bordered box whose background and border follow the
+pointer (rest / hover / pressed, each a token, faded, blended with a second token or darkened,
+Zed's `Hsla::blend` and `Theme::darken`) — plus `text_block_node` and `icon_node`: `label`,
+`headline`, `button` (Zed's six `ButtonStyle`s, `subtle` being the ghost; five
+`ButtonSize`s; with icon), `icon_button` (wide, square), `toggle_button`, `checkbox`,
+`toggle_switch`, `divider`, `progress_bar`, `avatar`, `key_binding`, `key_binding_hint`,
+`tab`, `tab_bar`, `panel` (Zed's workspace toolbar + body), `status_bar`. Every size, padding,
+token and state rule is taken from crates/ui at zed a5c4ca8 and cited in the source;
+`test_ui_components` checks them at the default density — button 22 / 18 / 28 / 32 px with
+`b04` / `b08` padding, icon button 24 × 22 and 20 × 20, checkbox box 16 px offset 2 in its
+20 px holder, switch 38 × 26 around a 32 × 20 track with the 12 px thumb 3 px from the end,
+divider 1 px, progress 8 px with a 4 px fill, avatar 16 px, key 14 px in an 18 px stroke, a
+key hint's cap 16 px, tab and tab bar 32 px with 31 px content, status bar 30 px, toolbar
+45 px. Departures from Zed: every focusable control draws the §5.5 ring (Zed varies it), the
+transparent button keeps its label colour on hover (§5.5), the checkbox and switch are tab
+stops (keyboard-operable), a lone toggle button sizes to its content, avatars may show
+initials. The golden images `components_states` (each control at rest, hovered, focused and
+disabled) and `components_gallery` are within 1/255 of the CPU reference on GL and 2/255 of
+CPU and GL on Vulkan (lavapipe). Measured (`test_ui_components`, load 0.8–1.4, frames back to
+back): the gallery tree of every component (94 nodes, 184 primitives) ticks a full repaint in
+11.4–13.9 µs p50 (15–22 µs p95), a hover move 11.4–18.5 µs, a focus move 11.4–20 µs, a
+describe of the whole unchanged tree 24–40 µs, with 0 allocations and a flat `mallinfo2` over
+300 frames of each; a hover repaints exactly that control's bounds; a fade is 9 frames over
+150 ms and then none, an idle tree asks for no frame and sets no deadline. S2–S4 A/B against
+the stage before, interleaved (load 0.8–1.6): S2 tick p50 12.9–14.3 vs 13.2–14.1 µs, S3
+layout p50 134–145 vs 143–150 µs, S4 within the host's bimodal noise both ways.
+
 ### Phase 4 — The client runtime (≈3 weeks)
 
 - `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,

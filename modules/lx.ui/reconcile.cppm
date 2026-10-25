@@ -61,7 +61,9 @@ lx::ui::ui_node* lx::ui::reconciler::apply(ui_node* retained, child desired) {
     if (retained && matches(*retained, *desired)) {
         if (desired->apply)
             desired->apply(*retained, desired->props);
-        reconcile_children(*retained, *desired);
+        // A reducer's subtree is its own: it describes and reconciles it itself.
+        if (!retained->has_flag(node_flag::opaque_children))
+            reconcile_children(*retained, *desired);
         ++stats_.reused;
         return retained;
     }
@@ -85,7 +87,8 @@ lx::ui::ui_node* lx::ui::reconciler::apply(ui_node* retained, child desired) {
     fresh->set_key(desired->key);
     if (desired->apply)
         desired->apply(*fresh, desired->props);
-    reconcile_children(*fresh, *desired);
+    if (!fresh->has_flag(node_flag::opaque_children))
+        reconcile_children(*fresh, *desired);
     fresh->mark_layout_dirty();
     ++stats_.constructed;
     return fresh;

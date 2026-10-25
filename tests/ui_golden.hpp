@@ -19,6 +19,7 @@
 import std;
 import lx.foundation;
 import lx.gfx;
+import lx.runtime;
 import lx.scene;
 import lx.text;
 import lx.ui;
@@ -501,6 +502,136 @@ inline void build_icons(lx::ui::draw_scope& s, const tiles& t) {
     big->emit(s);
 }
 
+// ── Components (ADR-010 §5.6, Phase 3 stage 3): the controls in each state, and the rest of
+// the set, as `lx.ui:components` describes them under the built-in One Dark ──
+
+/// A described, laid-out component tree (its own arena and reconciler).
+struct component_tree {
+    lx::runtime::memory_arena arena{256 * 1024};
+    lx::ui::reconciler rec{};
+    lx::ui::ui_node* root = nullptr;
+    component_tree() = default;
+    component_tree(const component_tree&) = delete;
+    component_tree& operator=(const component_tree&) = delete;
+    ~component_tree() { delete root; }
+};
+
+/// `describe()` with the case's text and icon caches, placed at `bounds`.
+[[nodiscard]] inline std::unique_ptr<component_tree> component_layout(const tiles& t,
+                                                                     lx::ui::child (*describe)(),
+                                                                     lx::rect2i bounds) {
+    lx::ui::set_active_builtin_theme(lx::ui::appearance::dark);
+    lx::ui::ui_resources r{};
+    r.text = {text_fonts().engine(), t.glyphs.get(), nullptr};
+    r.icons = t.icons.get();
+    lx::ui::set_ui_resources(r);
+    auto tree = std::make_unique<component_tree>();
+    {
+        lx::ui::build_context ctx{tree->arena};
+        lx::ui::build_scope scope{ctx};
+        tree->root = tree->rec.apply(nullptr, describe());
+        (void)lx::ui::rebuild_pending_reducers(ctx, tree->rec);
+    }
+    if (tree->root)
+        tree->root->place(bounds);
+    lx::ui::ui_damage().clear();
+    return tree;
+}
+
+/// Sets `flag` (and `also`) on every node of the tree that is `want` and enabled.
+inline void set_state(lx::ui::ui_node& n, lx::ui::node_flag want, lx::ui::node_flag flag,
+                      lx::ui::node_flag also = lx::ui::node_flag::none) {
+    if (n.has_flag(want) && !n.has_flag(lx::ui::node_flag::disabled)) {
+        n.set_flag(flag, true);
+        if (also != lx::ui::node_flag::none)
+            n.set_flag(also, true);
+    }
+    for (unsigned i = 0; i < n.child_count(); ++i)
+        if (lx::ui::ui_node* c = n.child_at(i))
+            set_state(*c, want, flag, also);
+}
+
+inline bool g_state_row_disabled = false;
+
+/// One of each control: filled, outlined and ghost (with icon) buttons, an icon button, a
+/// selected toggle button, a checked checkbox, an on switch, an unselected tab.
+[[nodiscard]] inline lx::ui::child describe_state_row() {
+    using namespace lx::ui;
+    const bool d = g_state_row_disabled;
+    const child kids[] = {
+        button("Save").style(button_style::filled).disabled(d),
+        button("Open").style(button_style::outlined).disabled(d),
+        button("Ghost").icon(icon::check).disabled(d),
+        icon_button(icon::settings).disabled(d),
+        toggle_button("Grid").selected(true).icon(icon::menu).disabled(d),
+        checkbox(true).label("Wrap").disabled(d),
+        toggle_switch(true).label("Wi-Fi").disabled(d),
+        tab("main.rs").disabled(d),
+    };
+    return div(style{}.flex_row().items_center().gap(sp::b08), kids);
+}
+
+/// Rows top to bottom: normal, hovered, focused (the ring), disabled.
+inline void build_components_states(lx::ui::draw_scope& s, const tiles& t) {
+    using lx::ui::node_flag;
+    for (int row = 0; row < 4; ++row) {
+        g_state_row_disabled = row == 3;
+        auto tree = component_layout(t, describe_state_row, {8, 8 + 40 * row, 544, 32});
+        g_state_row_disabled = false;
+        if (!tree->root)
+            continue;
+        if (row == 1)
+            set_state(*tree->root, node_flag::interactive, node_flag::hovered);
+        if (row == 2)
+            set_state(*tree->root, node_flag::focusable, node_flag::focused, node_flag::focus_ring);
+        tree->root->emit(s);
+    }
+}
+
+/// The rest: a headline and muted label, avatars, key bindings and a key hint, a divider, a
+/// progress bar, a tab bar, a panel with its toolbar and a status bar.
+[[nodiscard]] inline lx::ui::child describe_gallery() {
+    using namespace lx::ui;
+    static const char* const keys[2] = {"Ctrl-S", "Ctrl-Shift-P"};
+    child tabs[3];
+    const char* names[3] = {"main.rs", "lib.rs", "theme.rs"};
+    for (unsigned i = 0; i < 3; ++i)
+        tabs[i] = tab(names[i]).position(i, 3, 1);
+    const child heading[2] = {headline("Components"), label("ADR-010 §5.6").color(tok::text_muted).size(label_size::small)};
+    const child misc[] = {
+        avatar("LM"),
+        avatar(nullptr),
+        vertical_divider(),
+        key_binding(keys),
+        key_binding_hint(std::span<const char* const>{keys, 1}, tok::surface_background).prefix("Save").suffix("to keep it"),
+    };
+    const child tool_left[1] = {label("Project")};
+    const child tool_right[2] = {icon_button(icon::plus).shape(icon_button_shape::square),
+                                 icon_button(icon::ellipsis).shape(icon_button_shape::square)};
+    const child body = label("Panels sit on panel.background under a toolbar.").color(tok::text_muted);
+    const child dock[1] = {panel(body).toolbar_start(tool_left).toolbar_end(tool_right)};
+    const child status_left[2] = {button("main").icon(icon::folder).size(button_size::compact),
+                                  label("Ln 12, Col 4").color(tok::text_muted).size(label_size::small)};
+    const child status_right[2] = {icon_button(icon::bell).size(button_size::compact),
+                                   icon_button(icon::settings).size(button_size::compact)};
+    const child kids[] = {
+        div(style{}.flex_row().items_end().gap(sp::b08), heading),
+        div(style{}.flex_row().items_center().gap(sp::b08), misc),
+        divider(),
+        progress_bar(62.f, 100.f),
+        tab_bar(tabs),
+        div(style{}.w_full().h(px(96.f)), dock),
+        status_bar(status_left, status_right),
+    };
+    return div(style{}.flex_col().gap(sp::b08), kids);
+}
+
+inline void build_components_gallery(lx::ui::draw_scope& s, const tiles& t) {
+    auto tree = component_layout(t, describe_gallery, {8, 8, 404, 300});
+    if (tree->root)
+        tree->root->emit(s);
+}
+
 [[nodiscard]] inline std::span<const golden_case> cases() {
     static const std::vector<golden_case> k_cases = [] {
     std::vector<golden_case> v = {
@@ -523,10 +654,13 @@ inline void build_icons(lx::ui::draw_scope& s, const tiles& t) {
         {"text_clip", 168, 80, k_editor, build_text_clip},
         {"styled_surfaces", 300, 112, k_surface, build_styled_surfaces},
     };
-    if (lx::ui::icons_available())
+    if (lx::ui::icons_available()) {
         v.push_back({"icons", 148, 66, k_editor, build_icons});
-    else
-        std::printf("    SKIP icons: librsvg or the bundled icons are not available\n");
+        v.push_back({"components_states", 560, 168, k_surface, build_components_states});
+        v.push_back({"components_gallery", 420, 316, k_surface, build_components_gallery});
+    } else {
+        std::printf("    SKIP icons, components_*: librsvg or the bundled icons are not available\n");
+    }
     return v;
     }();
     return k_cases;

@@ -20,7 +20,16 @@ enum class key {
     up,
     down,
     space,
+    home,
+    end,
 };
+
+/// `key_event::modifiers` bits: xkb's real modifier masks (what `wl_keyboard.modifiers`
+/// carries as `mods_depressed | mods_latched | mods_locked`).
+inline constexpr unsigned k_mod_shift = 1u << 0;
+inline constexpr unsigned k_mod_ctrl = 1u << 2;
+inline constexpr unsigned k_mod_alt = 1u << 3;
+inline constexpr unsigned k_mod_super = 1u << 6;
 
 struct mouse_event {
     lx::point2i position{};

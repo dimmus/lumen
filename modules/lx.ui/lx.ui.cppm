@@ -41,7 +41,12 @@ export import :icon;
 export import :widgets;
 export import :widget_node;
 
+// ADR-010 §7 Phase 3: focus over the retained tree, pointer state, handlers, timers and
+// motion; controls and the first half of §5.6's components.
 export import :focus;
+export import :interact;
+export import :control;
+export import :components;
 export import :clipboard;
 
 export namespace lx::ui {

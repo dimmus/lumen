@@ -17,6 +17,8 @@ enum class invalidation : unsigned char {
     paint = 1 << 0,
     layout = 1 << 1,
     animate = 1 << 2,
+    /// A reducer dispatched: its subtree is described again on the next frame (only it).
+    rebuild = 1 << 3,
 };
 
 /// Bounded damage accumulator. Rects are merged so the compositor receives a fixed
@@ -38,6 +40,7 @@ public:
     [[nodiscard]] bool needs_paint() const;
     [[nodiscard]] bool needs_layout() const;
     [[nodiscard]] bool needs_animate() const;
+    [[nodiscard]] bool needs_rebuild() const;
     [[nodiscard]] bool empty() const;
 
     void clear();
@@ -163,6 +166,9 @@ bool lx::ui::damage_ledger::needs_layout() const {
 bool lx::ui::damage_ledger::needs_animate() const {
     return (flags_ & static_cast<unsigned>(invalidation::animate)) != 0;
 }
+bool lx::ui::damage_ledger::needs_rebuild() const {
+    return (flags_ & static_cast<unsigned>(invalidation::rebuild)) != 0;
+}
 bool lx::ui::damage_ledger::empty() const {
     return rects_.empty() && flags_ == 0;
 }
@@ -173,6 +179,8 @@ void lx::ui::damage_ledger::clear() {
 }
 
 lx::ui::damage_ledger& lx::ui::ui_damage() { return g_ui_damage; }
+
+void lx::ui::detail::damage_rect(lx::rect2i region) { g_ui_damage.add(region); }
 
 lx::ui::ui_node* lx::ui::root_of(ui_node& node) {
     ui_node* cursor = &node;

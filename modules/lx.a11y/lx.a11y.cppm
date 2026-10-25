@@ -13,6 +13,20 @@ enum class role {
     text_field,
     window,
     group,
+    // ADR-010 §5.6's components (lx.ui:components).
+    heading,
+    image,
+    checkbox,
+    switch_control,
+    toggle_button,
+    tab,
+    tab_list,
+    progress_bar,
+    separator,
+    toolbar,
+    status_bar,
+    panel,
+    key_shortcut,
 };
 
 enum class state_flag : unsigned {
@@ -20,6 +34,10 @@ enum class state_flag : unsigned {
     focused = 1u << 0,
     disabled = 1u << 1,
     expanded = 1u << 2,
+    checked = 1u << 3,
+    mixed = 1u << 4,
+    selected = 1u << 5,
+    pressed = 1u << 6,
 };
 
 struct node {

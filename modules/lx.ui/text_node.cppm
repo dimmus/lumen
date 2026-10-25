@@ -310,6 +310,11 @@ lx::ui::text_block_node::~text_block_node() {
 }
 
 bool lx::ui::text_block_node::apply(const text_block_props& p) {
+    // A colour change repaints the block where it is; a layout change repaints it where it
+    // was and where the arrange puts it (`mark_repaint`, below).
+    if (p.color.r != color_.r || p.color.g != color_.g || p.color.b != color_.b ||
+        p.color.a != color_.a)
+        invalidate_paint(*this);
     color_ = p.color;
     scale_ = p.scale > 0.f ? p.scale : 1.f;
     wraps_ = p.wrap == lx::text::text_wrap::word;
@@ -353,8 +358,10 @@ void lx::ui::text_block_node::apply_inline(const text_block_props& p) {
     l.set_line_height(p.line_height);
     l.set_direction(p.direction);
     l.set_attrs(p.attrs);
-    if (l.dirty())
+    if (l.dirty()) {
         mark_layout_dirty();
+        mark_repaint();
+    }
 }
 
 void lx::ui::text_block_node::apply_async(const text_block_props& p, text_async_shaping& async) {
@@ -390,8 +397,10 @@ void lx::ui::text_block_node::apply_async(const text_block_props& p, text_async_
     layout_.assign_inputs(next, false);
     if (async_generation_ != shown_generation_ && !job_->running)
         start_job();
-    if (layout_.dirty())
+    if (layout_.dirty()) {
         mark_layout_dirty();
+        mark_repaint();
+    }
 }
 
 void lx::ui::text_block_node::start_job() {
@@ -505,7 +514,10 @@ lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint
         out.height = c.min.height;
     if (out.width > c.max.width)
         out.width = c.max.width;
-    if (out.height > c.max.height)
+    // A height the parent does not fix is the text's own, even past the space offered: a
+    // line taller than its row overflows it centred (a 14 px label on GPUI's φ line, 23 px,
+    // in a 22 px button), as CSS and GPUI lay it out, rather than being cut to the row.
+    if (out.height > c.max.height && c.min.height == c.max.height)
         out.height = c.max.height;
     return out;
 }
