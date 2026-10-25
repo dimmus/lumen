@@ -14,6 +14,7 @@
 #include <stdio.h>
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -264,10 +265,18 @@ int main() {
     std::mutex dispatch_lock;
     std::thread pump_thread([&] {
         lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        const int loop_fd = comp.wayland().event_fd();
         while (pump.load(std::memory_order_acquire)) {
-            std::lock_guard<std::mutex> hold(dispatch_lock);
-            (void)comp.wayland().dispatch(10);
-            comp.wayland().flush();
+            {
+                std::lock_guard<std::mutex> hold(dispatch_lock);
+                (void)comp.wayland().dispatch(0);
+                comp.wayland().flush();
+            }
+            // Wait for client traffic without the lock: std::mutex is not fair, and a
+            // dispatch sleeping in epoll while holding it, then re-locking at once, left the
+            // test thread waiting seconds for it.
+            pollfd pf{loop_fd, POLLIN, 0};
+            (void)poll(&pf, 1, 10);
         }
     });
     // One frame tick on this thread (UI affinity while the pump is held off): what notices an
