@@ -122,6 +122,10 @@ public:
     draw_scope(lx::scene::draw_list& out, lx::rect2i clip);
 
     void push_clip(lx::rect2i clip);
+    /// `push_clip` of a rect in the node's layout space: offset by the origin first. A node
+    /// clipping to its own bounds uses this, so it clips where it is drawn inside a scrolled
+    /// viewport (whose content is drawn under a `push_origin`).
+    void push_clip_local(lx::rect2i clip);
     void push_opacity(float opacity);
     void push_origin(lx::point2i delta);
     void pop();
@@ -224,6 +228,10 @@ enum class node_flag : std::uint16_t {
     repaint = 1u << 9,         ///< damage the bounds again when the next arrange lays it out
     referenced = 1u << 10,     ///< a `node_observer` may hold a pointer to it
     hover_intent = 1u << 11,   ///< wants `on_timer(k_timer_hover_intent)` after a 500 ms hover
+    /// Its children are laid out, drawn and hit-tested by the overlay layer against the
+    /// window (`lx.ui:overlay`), not by it: their bounds are surface coordinates, whatever
+    /// viewport the node itself sits in.
+    layer = 1u << 12,
 };
 
 [[nodiscard]] constexpr node_flag operator|(node_flag a, node_flag b) {
@@ -262,6 +270,26 @@ private:
 /// node is its own fields and nothing more: S3's 10 651 nodes fit in cache, where a
 /// 64-slot inline array made each one 640 B and the tree 7 MB. The span is taken or grown
 /// only when the child count does — a shape change — and returned when the node dies.
+/// A node that scrolls its content (`lx.ui:scroll`'s scroll area, `lx.ui:list`): what a
+/// scrollbar node reads and drives. Offsets and sizes are px along the axis.
+struct scroll_metrics {
+    float offset = 0.f;   ///< how far the content is scrolled
+    float viewport = 0.f; ///< the visible length
+    float content = 0.f;  ///< the content's length (≥ the viewport when it overflows)
+    [[nodiscard]] float max_offset() const { return content > viewport ? content - viewport : 0.f; }
+};
+
+class scroll_target {
+public:
+    /// Axis 0 is horizontal, 1 vertical.
+    [[nodiscard]] virtual scroll_metrics scroll_metrics_along(unsigned axis) const = 0;
+    /// Scroll to `offset` along `axis` (clamped); repaints the viewport, relays nothing out.
+    virtual void scroll_to(unsigned axis, float offset) = 0;
+
+protected:
+    ~scroll_target() = default;
+};
+
 class ui_node {
 public:
     virtual ~ui_node();
@@ -313,6 +341,18 @@ public:
 
     virtual bool on_mouse(mouse_event event);
     virtual bool on_key(key_event event);
+    /// A pointer event routed to this node (`pointer_kind`): press, drag and release go to
+    /// the pressed interactive node, wheel and secondary presses to the node under the
+    /// pointer and then up its ancestors until one returns true. Default: not taken.
+    virtual bool on_pointer(const pointer_event& event);
+    /// Whether this node draws `child` translated and clipped (a scrolled viewport): `offset`
+    /// is added to the child's layout coordinates to get this node's, and `clip` (in this
+    /// node's coordinates) is what of it shows. Hit testing, damage and `surface_rect` follow
+    /// it. Default: no (children are drawn where they are laid out).
+    [[nodiscard]] virtual bool child_viewport(const ui_node& child, lx::point2i& offset,
+                                              lx::rect2i& clip) const;
+    /// The node as a scroll container, for its scrollbars; null when it is not one.
+    [[nodiscard]] virtual scroll_target* as_scroll_target();
     [[nodiscard]] virtual hit_result hit_test(lx::point2i p) const;
 
     [[nodiscard]] virtual a11y::node accessibility_node() const;
@@ -475,7 +515,27 @@ namespace lx::ui::detail {
 /// Adds `region` to the UI thread's damage ledger (`ui_damage`, defined in :invalidate,
 /// which this partition cannot import).
 void damage_rect(lx::rect2i region);
+/// Adds `region` of `node`'s layout space, mapped to the surface (`surface_rect`).
+void damage_node(const ui_node& node, lx::rect2i region);
+/// Live nodes that override `child_viewport` with an offset (scroll containers) register
+/// here, so that a tree without one maps nothing (UI affinity).
+void viewport_created();
+void viewport_destroyed();
 } // namespace lx::ui::detail
+
+export namespace lx::ui {
+
+/// `r` in `node`'s layout space as the surface shows it: translated and clipped by every
+/// ancestor viewport (`ui_node::child_viewport`) up to the root or a `node_flag::layer`
+/// node (whose children are laid out in surface coordinates). Empty when a viewport hides
+/// it all. Without viewports in the tree it is `r`.
+[[nodiscard]] lx::rect2i surface_rect(const ui_node& node, lx::rect2i r);
+/// `node`'s bounds as the surface shows them, not clipped by viewports: an overlay's anchor.
+[[nodiscard]] lx::rect2i surface_bounds(const ui_node& node);
+/// A surface point in `node`'s layout space (the inverse of the viewports' offsets).
+[[nodiscard]] lx::point2i local_point(const ui_node& node, lx::point2i surface);
+
+} // namespace lx::ui
 
 
 // ── draw_scope ──────────────────────────────────────────────────────────────────
@@ -570,6 +630,11 @@ void lx::ui::draw_scope::push_clip(lx::rect2i clip) {
     next.clip = lx_ui_intersect(next.clip, clip);
     lx_ui_write_rect(next.clip_f, next.clip);
     push_frame(next);
+}
+
+void lx::ui::draw_scope::push_clip_local(lx::rect2i clip) {
+    const frame& f = top();
+    push_clip({clip.x + f.origin.x, clip.y + f.origin.y, clip.width, clip.height});
 }
 
 void lx::ui::draw_scope::push_opacity(float opacity) {
@@ -1146,20 +1211,98 @@ void lx::ui::ui_node::place(lx::rect2i bounds) {
                        before.width != bounds.width || before.height != bounds.height;
     if (moved || has_flag(node_flag::repaint)) {
         if (moved)
-            detail::damage_rect(before);
-        detail::damage_rect(bounds);
+            detail::damage_node(*this, before);
+        detail::damage_node(*this, bounds);
         set_flag(node_flag::repaint, false);
     }
 }
 
 void lx::ui::ui_node::mark_repaint() {
-    detail::damage_rect(bounds_);
+    detail::damage_node(*this, bounds_);
     set_flag(node_flag::repaint, true);
+}
+
+bool lx::ui::ui_node::on_pointer(const pointer_event&) { return false; }
+
+bool lx::ui::ui_node::child_viewport(const ui_node&, lx::point2i&, lx::rect2i&) const {
+    return false;
+}
+
+lx::ui::scroll_target* lx::ui::ui_node::as_scroll_target() { return nullptr; }
+
+namespace {
+/// Live viewport nodes (UI affinity): none, and nothing is mapped.
+unsigned g_viewport_nodes = 0;
+} // namespace
+
+void lx::ui::detail::viewport_created() { ++g_viewport_nodes; }
+void lx::ui::detail::viewport_destroyed() {
+    if (g_viewport_nodes)
+        --g_viewport_nodes;
+}
+
+lx::rect2i lx::ui::surface_rect(const ui_node& node, lx::rect2i r) {
+    if (g_viewport_nodes == 0)
+        return r;
+    const ui_node* child = &node;
+    for (const ui_node* p = node.parent(); p; child = p, p = p->parent()) {
+        if (p->has_flag(node_flag::layer))
+            break; // the layer's children are placed in surface coordinates
+        lx::point2i offset{};
+        lx::rect2i clip{};
+        if (!p->child_viewport(*child, offset, clip))
+            continue;
+        r.x += offset.x;
+        r.y += offset.y;
+        r = lx_ui_intersect(r, clip);
+        if (r.width <= 0 || r.height <= 0)
+            return {};
+    }
+    return r;
+}
+
+lx::rect2i lx::ui::surface_bounds(const ui_node& node) {
+    lx::rect2i r = node.bounds();
+    if (g_viewport_nodes == 0)
+        return r;
+    const ui_node* child = &node;
+    for (const ui_node* p = node.parent(); p; child = p, p = p->parent()) {
+        if (p->has_flag(node_flag::layer))
+            break;
+        lx::point2i offset{};
+        lx::rect2i clip{};
+        if (p->child_viewport(*child, offset, clip)) {
+            r.x += offset.x;
+            r.y += offset.y;
+        }
+    }
+    return r;
+}
+
+lx::point2i lx::ui::local_point(const ui_node& node, lx::point2i surface) {
+    if (g_viewport_nodes == 0)
+        return surface;
+    const ui_node* child = &node;
+    for (const ui_node* p = node.parent(); p; child = p, p = p->parent()) {
+        if (p->has_flag(node_flag::layer))
+            break;
+        lx::point2i offset{};
+        lx::rect2i clip{};
+        if (p->child_viewport(*child, offset, clip)) {
+            surface.x -= offset.x;
+            surface.y -= offset.y;
+        }
+    }
+    return surface;
+}
+
+void lx::ui::detail::damage_node(const ui_node& node, lx::rect2i region) {
+    damage_rect(surface_rect(node, region));
 }
 
 int lx::ui::ui_node::focus_order() const { return 0; }
 
-void lx::ui::ui_node::on_interaction_changed() { detail::damage_rect(bounds_); }
+void lx::ui::ui_node::on_interaction_changed() { detail::damage_node(*this, bounds_); }
 
 bool lx::ui::ui_node::on_focus_key(key_event, focus_manager&) { return false; }
 

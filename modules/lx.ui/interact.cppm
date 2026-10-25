@@ -178,13 +178,38 @@ private:
 // ── Pointer ──
 
 /// The topmost visible, interactive, enabled node under `at` in `root`'s tree (later
-/// siblings paint over earlier ones, so they win), or null.
+/// siblings paint over earlier ones, so they win), or null. `at` is in `root`'s layout space;
+/// a viewport (`ui_node::child_viewport`) translates it for its children and hides what it
+/// clips. Overlay subtrees (`node_flag::layer`) are skipped: the overlay layer tests them.
 [[nodiscard]] ui_node* hit_interactive(ui_node& root, lx::point2i at);
+/// The deepest visible node under `at` (any node, interactive or not), by the same rules:
+/// where a wheel or a secondary press starts its walk up the ancestors.
+[[nodiscard]] ui_node* hit_node(ui_node& root, lx::point2i at);
+
+/// What the pointer is over: `interactive` false asks for `hit_node`'s answer. `ui_root`
+/// installs one that tests the overlay layer first.
+using pointer_resolver = ui_node* (*)(void* context, ui_node* root, lx::point2i at,
+                                      bool interactive);
 
 class pointer_state final : public node_observer {
 public:
+    /// Presses this close in time and space count as one double (triple) click.
+    static constexpr std::uint64_t k_multi_click_ns = 400'000'000ull;
+    static constexpr int k_multi_click_px = 4;
+
     pointer_state() = default;
     ~pointer_state() override = default;
+
+    /// Replaces the hit test (null: `hit_interactive` / `hit_node` on the root).
+    void set_resolver(pointer_resolver resolver, void* context) {
+        resolver_ = resolver;
+        resolver_context_ = context;
+    }
+    /// The keyboard modifiers pointer events report (`ui_root` keeps them current).
+    void set_modifiers(unsigned modifiers) { modifiers_ = modifiers; }
+    [[nodiscard]] unsigned modifiers() const { return modifiers_; }
+    /// What `resolver` (or the plain hit test) finds at `at`.
+    [[nodiscard]] ui_node* resolve(ui_node* root, lx::point2i at, bool interactive) const;
 
     /// The pointer is at `at` over `root`'s tree: the hover moves to what is there. True
     /// when the hovered node changed.
@@ -211,6 +236,14 @@ private:
     ui_node* pressed_ = nullptr;
     lx::point2i position_{};
     bool inside_ = false;
+    pointer_resolver resolver_ = nullptr;
+    void* resolver_context_ = nullptr;
+    unsigned modifiers_ = 0;
+    // Multi-click counting: the last press's time, place and node, and its count.
+    std::uint64_t last_press_ns_ = 0;
+    lx::point2i last_press_at_{};
+    const ui_node* last_press_node_ = nullptr;
+    unsigned clicks_ = 0;
 };
 
 // ── Focus ring ──
@@ -323,7 +356,7 @@ float lx::ui::animate(const ui_node& node, const transition& t) {
     const std::uint64_t now = ui_now_ns();
     if (t.running(now)) {
         damage_ledger& ledger = ui_damage();
-        ledger.add(node.bounds());
+        ledger.add(surface_rect(node, node.bounds()));
         ledger.request(invalidation::animate);
     }
     return t.value(now);
@@ -405,16 +438,53 @@ lx::ui::timer_queue& lx::ui::ui_timers() {
 
 // ── pointer ──
 
-lx::ui::ui_node* lx::ui::hit_interactive(ui_node& root, lx::point2i at) {
+namespace {
+
+/// `hit_interactive` / `hit_node`: children topmost first, each in its own space.
+[[nodiscard]] lx::ui::ui_node* lx_ui_hit(lx::ui::ui_node& root, lx::point2i at,
+                                         bool interactive) {
+    using lx::ui::node_flag;
     if (!root.visible() || !root.bounds().contains(at))
         return nullptr;
-    for (unsigned i = root.child_count(); i > 0; --i)
-        if (ui_node* c = root.child_at(i - 1))
-            if (ui_node* hit = hit_interactive(*c, at))
-                return hit;
+    for (unsigned i = root.child_count(); i > 0; --i) {
+        lx::ui::ui_node* c = root.child_at(i - 1);
+        if (!c || c->has_flag(node_flag::layer))
+            continue;
+        lx::point2i p = at;
+        lx::point2i offset{};
+        lx::rect2i clip{};
+        if (root.child_viewport(*c, offset, clip)) {
+            if (!clip.contains(at))
+                continue;
+            p = {at.x - offset.x, at.y - offset.y};
+        }
+        if (lx::ui::ui_node* hit = lx_ui_hit(*c, p, interactive))
+            return hit;
+    }
+    if (!interactive)
+        return &root;
     if (root.has_flag(node_flag::interactive) && !root.has_flag(node_flag::disabled))
         return &root;
     return nullptr;
+}
+
+} // namespace
+
+lx::ui::ui_node* lx::ui::hit_interactive(ui_node& root, lx::point2i at) {
+    return lx_ui_hit(root, at, true);
+}
+
+lx::ui::ui_node* lx::ui::hit_node(ui_node& root, lx::point2i at) {
+    return lx_ui_hit(root, at, false);
+}
+
+lx::ui::ui_node* lx::ui::pointer_state::resolve(ui_node* root, lx::point2i at,
+                                                bool interactive) const {
+    if (resolver_)
+        return resolver_(resolver_context_, root, at, interactive);
+    if (!root)
+        return nullptr;
+    return interactive ? hit_interactive(*root, at) : hit_node(*root, at);
 }
 
 void lx::ui::pointer_state::set_hovered(ui_node* node) {
@@ -439,10 +509,21 @@ void lx::ui::pointer_state::set_hovered(ui_node* node) {
 
 bool lx::ui::pointer_state::move(ui_node* root, lx::point2i at) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    const bool moved = at.x != position_.x || at.y != position_.y;
     position_ = at;
     inside_ = true;
     ui_node* const before = hovered_;
-    set_hovered(root ? hit_interactive(*root, at) : nullptr);
+    set_hovered(resolve(root, at, true));
+    if (pressed_ && moved) {
+        // A drag: the pressed node follows the pointer wherever it goes (a scrollbar's thumb,
+        // a text selection).
+        pointer_event e{};
+        e.kind = pointer_kind::drag;
+        e.at = at;
+        e.modifiers = modifiers_;
+        e.clicks = clicks_ ? clicks_ : 1;
+        (void)pressed_->on_pointer(e);
+    }
     return hovered_ != before;
 }
 
@@ -458,7 +539,7 @@ bool lx::ui::pointer_state::button(ui_node* root, mouse_button b, bool down,
         return false;
     if (down) {
         if (inside_)
-            set_hovered(root ? hit_interactive(*root, position_) : nullptr);
+            set_hovered(resolve(root, position_, true));
         ui_node* target = hovered_;
         if (focus)
             focus->pointer_down(target);
@@ -468,10 +549,29 @@ bool lx::ui::pointer_state::button(ui_node* root, mouse_button b, bool down,
             pressed_->set_flag(node_flag::pressed, false);
             pressed_->on_interaction_changed();
         }
+        // Double and triple clicks: presses on the same node, close in time and space.
+        const std::uint64_t now = ui_now_ns();
+        const int dx = position_.x - last_press_at_.x;
+        const int dy = position_.y - last_press_at_.y;
+        if (clicks_ > 0 && target == last_press_node_ && now - last_press_ns_ <= k_multi_click_ns &&
+            dx * dx + dy * dy <= k_multi_click_px * k_multi_click_px)
+            clicks_ = clicks_ >= 3 ? 1 : clicks_ + 1;
+        else
+            clicks_ = 1;
+        last_press_ns_ = now;
+        last_press_at_ = position_;
+        last_press_node_ = target;
         pressed_ = target;
         target->mark_referenced();
         target->set_flag(node_flag::pressed, true);
         target->on_interaction_changed();
+        pointer_event e{};
+        e.kind = pointer_kind::press;
+        e.at = position_;
+        e.modifiers = modifiers_;
+        e.clicks = clicks_;
+        if (pressed_ == target)
+            (void)target->on_pointer(e);
         return true;
     }
     ui_node* target = pressed_;
@@ -480,6 +580,14 @@ bool lx::ui::pointer_state::button(ui_node* root, mouse_button b, bool down,
     pressed_ = nullptr;
     target->set_flag(node_flag::pressed, false);
     target->on_interaction_changed();
+    {
+        pointer_event e{};
+        e.kind = pointer_kind::release;
+        e.at = position_;
+        e.modifiers = modifiers_;
+        e.clicks = clicks_ ? clicks_ : 1;
+        (void)target->on_pointer(e);
+    }
     // A click: released over the node it pressed (moving off and back still counts).
     if (hovered_ == target && !target->has_flag(node_flag::disabled))
         (void)target->activate();
@@ -491,6 +599,8 @@ void lx::ui::pointer_state::node_destroyed(ui_node& node) {
         hovered_ = nullptr;
     if (pressed_ == &node)
         pressed_ = nullptr;
+    if (last_press_node_ == &node)
+        last_press_node_ = nullptr;
 }
 
 // ── focus ring ──

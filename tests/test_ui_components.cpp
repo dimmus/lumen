@@ -1,5 +1,7 @@
-// ADR-010 §7 Phase 3, stage 3: focus over the retained tree, the reducer wired into the
-// root, pointer state and motion, and the first half of §5.6's components.
+// ADR-010 §7 Phase 3, stages 3 and 4: focus over the retained tree, the reducer wired into
+// the root, pointer state and motion, and §5.6's components — the first half, then overlays
+// (menus, popovers, tooltips, modals, toasts), scroll areas, virtualised lists and the text
+// input with its IME interface.
 //
 // Sizes are checked against Zed's numbers at the default density and the 16 px rem, from
 // zed-industries/zed a5c4ca8 crates/ui/src (and crates/workspace for the status bar and the
@@ -58,6 +60,10 @@ struct resources {
     icon_cache icons{atlas};
 
     resources() {
+#ifdef LUMEN_TEST_FONT_DIR
+        // Lumen Test Arabic and Emoji: the text input's right-to-left and emoji cases.
+        (void)faces.add_font_dir(LUMEN_TEST_FONT_DIR);
+#endif
         ui_resources r{};
         r.text = {{&faces, &shapes, &items}, &glyphs, nullptr};
         r.icons = &icons;
@@ -1050,6 +1056,1129 @@ LUMEN_TEST(steady_frames_of_every_component_allocate_nothing) {
     run("press", [&](int i) { (void)r.pointer_button(mouse_button::left, i % 2 == 0); });
     // Everything described again over an unchanged tree: allocation-free too (arena only).
     run("describe", [&](int) { invalidate_layout(*r.tree()); });
+}
+
+// ════════════════════════════════════════════════════════════════════════════════════════
+// Stage 4: overlays, scrolling, virtual lists, the text input and the remaining components.
+// ════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+[[nodiscard]] ui_node* find_type(ui_node* n, element_type_id t) {
+    if (!n)
+        return nullptr;
+    if (n->type() == t)
+        return n;
+    for (unsigned i = 0; i < n->child_count(); ++i)
+        if (ui_node* hit = find_type(n->child_at(i), t))
+            return hit;
+    return nullptr;
+}
+
+[[nodiscard]] unsigned count_nodes(const ui_node* n) {
+    unsigned c = 1;
+    for (unsigned i = 0; i < n->child_count(); ++i)
+        if (const ui_node* k = n->child_at(i))
+            c += count_nodes(k);
+    return c;
+}
+
+[[nodiscard]] key_event text_key(char32_t c, unsigned mods = 0) {
+    key_event e{};
+    e.key = c == ' ' ? key::space : key::unknown;
+    e.pressed = true;
+    e.modifiers = mods;
+    e.codepoint = c;
+    return e;
+}
+
+void type_text(ui_root& r, const char* ascii) {
+    for (const char* p = ascii; *p; ++p)
+        LUMEN_CHECK(r.key(text_key(static_cast<char32_t>(*p))));
+}
+
+void click(ui_root& r, lx::point2i at) {
+    (void)r.pointer_move(at);
+    (void)r.pointer_button(mouse_button::left, true);
+    (void)r.pointer_button(mouse_button::left, false);
+}
+
+[[nodiscard]] bool same(lx::rect2i a, lx::rect2i b) { return same_rect(a, b); }
+
+[[nodiscard]] lx::point2i centre_of(lx::rect2i b) { return {b.x + b.width / 2, b.y + b.height / 2}; }
+
+} // namespace
+
+// ── Overlay placement ──
+
+LUMEN_TEST(overlay_placement_flips_and_shifts_at_window_edges) {
+    const lx::rect2i win{0, 0, 400, 300};
+    const overlay_placement p{}; // below, start, 8 px margin
+    // Room below: it hangs from the anchor's bottom-left corner.
+    LUMEN_CHECK(same(place_overlay({20, 20, 60, 22}, {200, 100}, win, p), {20, 42, 200, 100}));
+    // At the bottom: above the anchor.
+    LUMEN_CHECK(same(place_overlay({20, 250, 60, 22}, {200, 100}, win, p), {20, 150, 200, 100}));
+    // At the right edge: from the anchor's end instead (GPUI's `SwitchAnchor`).
+    LUMEN_CHECK(same(place_overlay({300, 20, 60, 22}, {200, 100}, win, p), {160, 42, 200, 100}));
+    // Fits on neither side: the side that overflows less, then shifted inside the margin.
+    LUMEN_CHECK(same(place_overlay({20, 120, 60, 22}, {200, 250}, win, p), {20, 42, 200, 250}));
+    // Wider than the window: its start edge at the margin.
+    LUMEN_CHECK(place_overlay({20, 20, 60, 22}, {500, 100}, win, p).x == 8);
+    // A point (a context menu) in the bottom-right corner: up and to the left of it.
+    LUMEN_CHECK(same(place_overlay({390, 290, 0, 0}, {120, 80}, win, p), {270, 210, 120, 80}));
+    // A submenu at the right edge opens to the left.
+    overlay_placement sub{};
+    sub.side = overlay_side::right;
+    sub.gap = 5;
+    LUMEN_CHECK(same(place_overlay({250, 40, 120, 23}, {150, 100}, win, sub), {95, 40, 150, 100}));
+    // Shifted, not flipped, when flipping is off; nothing moves when shifting is off too.
+    overlay_placement rigid{};
+    rigid.flip = false;
+    LUMEN_CHECK(place_overlay({20, 250, 60, 22}, {200, 100}, win, rigid).y == 192);
+    rigid.shift = false;
+    LUMEN_CHECK(place_overlay({20, 250, 60, 22}, {200, 100}, win, rigid).y == 272);
+    // A modal 5 rem from the top, centred; toasts at the bottom.
+    overlay_placement top{};
+    top.side = overlay_side::window_top;
+    LUMEN_CHECK(same(place_overlay({}, {200, 100}, win, top), {100, 80, 200, 100}));
+    overlay_placement bottom{};
+    bottom.side = overlay_side::window_bottom;
+    LUMEN_CHECK(same(place_overlay({}, {200, 100}, win, bottom), {100, 192, 200, 100}));
+}
+
+// ── Popover menus: open, keyboard, activation, dismissal ──
+
+namespace {
+
+bool g_menu_open = false;
+int g_menu_dismissed = 0;
+int g_menu_action = -1;
+lx::point2i g_trigger_at{20, 20};
+const char* const k_copy_keys[1] = {"Ctrl-C"};
+const char* const k_paste_keys[1] = {"Ctrl-V"};
+
+void on_menu_dismiss(int) {
+    g_menu_open = false;
+    ++g_menu_dismissed;
+}
+void on_menu_action(int v) { g_menu_action = v; }
+void toggle_menu() { g_menu_open = !g_menu_open; }
+
+child describe_menu(build_context&) {
+    static menu_entry sub[2];
+    static menu_entry entries[7];
+    sub[0] = menu_item("Zoom in", on_menu_action).with_value(20);
+    sub[1] = menu_item("Zoom out", on_menu_action).with_value(21);
+    entries[0] = menu_header("Edit");
+    entries[1] = menu_item("Copy", on_menu_action).with_value(1).icon(icon::copy).keys(k_copy_keys);
+    entries[2] = menu_item("Paste", on_menu_action).with_value(2).keys(k_paste_keys);
+    entries[3] = menu_item("Delete", on_menu_action).with_value(3).disabled();
+    entries[4] = menu_separator();
+    entries[5] = menu_submenu("View", sub);
+    entries[6] = menu_item("Wrap", on_menu_action).with_value(6).toggle(true);
+    const child trigger = button("Menu").name("trigger").on_press(toggle_menu);
+    const child menu_kids[1] = {popover_menu(trigger, entries).open(g_menu_open).on_dismiss(on_menu_dismiss)};
+    const child kids[2] = {
+        div(style{}.absolute().left(px(static_cast<float>(g_trigger_at.x)))
+                .top(px(static_cast<float>(g_trigger_at.y))),
+            menu_kids),
+        div(style{}.absolute().left(px(200.f)).top(px(20.f)), {}),
+    };
+    return div(style{}.relative().size_full(), kids);
+}
+
+void redescribe(harness& h) {
+    invalidate_layout(*h.root.tree());
+    (void)h.tick();
+}
+
+[[nodiscard]] ui_node* menu_item_node(ui_root& r, const char* name) {
+    if (overlay_node* top = ui_overlays().top())
+        return find(top->content(), lx::a11y::role::menu_item, name);
+    return find(r.tree(), lx::a11y::role::menu_item, name);
+}
+
+} // namespace
+
+LUMEN_TEST(popover_menu_opens_navigates_and_dismisses) {
+    set_active_builtin_theme(appearance::dark);
+    set_reduced_motion(true);
+    g_menu_open = false;
+    g_menu_dismissed = 0;
+    g_trigger_at = {20, 20};
+    harness h{describe_menu, {0, 0, 800, 300}};
+    ui_root& r = h.root;
+    ui_node* trigger = find(r.tree(), lx::a11y::role::button, "trigger");
+    LUMEN_CHECK(trigger && ui_overlays().open_count() == 0);
+    const lx::rect2i tb = trigger->bounds();
+
+    // Opened by the app: below the trigger, 5 px out for the menu's padding and border.
+    g_menu_open = true;
+    redescribe(h);
+    LUMEN_CHECK(ui_overlays().open_count() == 1);
+    overlay_node* ov = ui_overlays().top();
+    LUMEN_CHECK(ov && ov->kind() == overlay_kind::menu && ov->is_open());
+    const lx::rect2i mb = ov->content()->bounds();
+    print_rect("menu", mb);
+    LUMEN_CHECK(mb.y == tb.y + tb.height && mb.x == tb.x - 5);
+    LUMEN_CHECK(mb.width >= 200); // `min_w(px(200.))`
+    // Entries: 23 px rows inset 4 px, the separator 1 px between 6 px margins.
+    ui_node* copy = menu_item_node(r, "Copy");
+    ui_node* paste = menu_item_node(r, "Paste");
+    LUMEN_CHECK(copy && paste && copy->bounds().height == 23);
+    LUMEN_CHECK(copy->bounds().x == mb.x + 1 + 4);
+    LUMEN_CHECK(paste->bounds().y == copy->bounds().y + 23);
+    // Drawn after the tree: the frame's last primitives are the menu's.
+    LUMEN_CHECK(r.frame_damage().count() >= 1 && overlaps(r.frame_damage().union_bounds(), mb));
+    // The focus is trapped in it: the first entry, arrows and tab move inside.
+    LUMEN_CHECK(r.focus().active_trap() == ov->content());
+    LUMEN_CHECK(std::strcmp(focused_name(r), "Copy") == 0);
+    LUMEN_CHECK(r.key(key_press(key::down)) && std::strcmp(focused_name(r), "Paste") == 0);
+    // The disabled entry is skipped.
+    LUMEN_CHECK(r.key(key_press(key::down)) && std::strcmp(focused_name(r), "View") == 0);
+    LUMEN_CHECK(r.key(key_press(key::tab)) && std::strcmp(focused_name(r), "Wrap") == 0);
+    // The pointer: hovering an entry, nothing beneath.
+    LUMEN_CHECK(r.pointer_move(centre(*paste)) && r.pointer().hovered() == paste);
+
+    // Escape dismisses it: the app is told, the focus goes back.
+    LUMEN_CHECK(r.key(key_press(key::escape)));
+    LUMEN_CHECK(!g_menu_open && g_menu_dismissed == 1 && ui_overlays().open_count() == 0);
+    LUMEN_CHECK(r.focus().active_trap() == nullptr);
+    redescribe(h);
+
+    // A press outside dismisses it; a press on the trigger is the trigger's (it toggles).
+    g_menu_open = true;
+    redescribe(h);
+    LUMEN_CHECK(ui_overlays().open_count() == 1);
+    click(r, centre(*trigger));
+    LUMEN_CHECK(!g_menu_open && g_menu_dismissed == 1); // toggled by the trigger, not dismissed
+    redescribe(h);
+    LUMEN_CHECK(ui_overlays().open_count() == 0);
+    g_menu_open = true;
+    redescribe(h);
+    (void)r.pointer_move({790, 290});
+    (void)r.pointer_button(mouse_button::left, true);
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(!g_menu_open && g_menu_dismissed == 2 && ui_overlays().open_count() == 0);
+    redescribe(h);
+
+    // Activating an entry runs it and closes the menu: a click, then enter.
+    g_menu_open = true;
+    redescribe(h);
+    g_menu_action = -1;
+    click(r, centre(*menu_item_node(r, "Paste")));
+    LUMEN_CHECK(g_menu_action == 2 && !g_menu_open && g_menu_dismissed == 3);
+    redescribe(h);
+    g_menu_open = true;
+    redescribe(h);
+    LUMEN_CHECK(r.key(key_press(key::down)) && r.key(key_press(key::enter)));
+    LUMEN_CHECK(g_menu_action == 2 && !g_menu_open && g_menu_dismissed == 4);
+    redescribe(h);
+    // A disabled entry does nothing; the menu stays.
+    g_menu_open = true;
+    redescribe(h);
+    g_menu_action = -1;
+    click(r, centre(*menu_item_node(r, "Delete")));
+    LUMEN_CHECK(g_menu_action == -1 && g_menu_open && ui_overlays().open_count() == 1);
+
+    // A submenu: the right arrow opens it (the focus goes in), left closes it.
+    (void)r.focus().focus(*menu_item_node(r, "View"), focus_cause::keyboard);
+    LUMEN_CHECK(r.key(key_press(key::right)));
+    (void)h.tick();
+    LUMEN_CHECK(ui_overlays().open_count() == 2);
+    overlay_node* sub = ui_overlays().top();
+    ui_node* view = find(ov->content(), lx::a11y::role::menu_item, "View");
+    LUMEN_CHECK(sub && sub->nested() && std::strcmp(focused_name(r), "Zoom in") == 0);
+    // Right of its item, its first entry level with it.
+    LUMEN_CHECK(sub->content()->bounds().x == view->bounds().x + view->bounds().width + 5);
+    LUMEN_CHECK(find(sub->content(), lx::a11y::role::menu_item, "Zoom in")->bounds().y == view->bounds().y);
+    LUMEN_CHECK(r.key(key_press(key::left)) && ui_overlays().open_count() == 1);
+    LUMEN_CHECK(std::strcmp(focused_name(r), "View") == 0);
+    // Clicking the item opens it too; an entry in it closes the whole chain.
+    click(r, centre(*view));
+    (void)h.tick();
+    LUMEN_CHECK(ui_overlays().open_count() == 2);
+    click(r, centre(*find(ui_overlays().top()->content(), lx::a11y::role::menu_item, "Zoom out")));
+    LUMEN_CHECK(g_menu_action == 21 && !g_menu_open && ui_overlays().open_count() == 0);
+    redescribe(h);
+
+    // At the window's bottom-right corner it opens above and leftwards.
+    g_trigger_at = {730, 262};
+    redescribe(h);
+    g_menu_open = true;
+    redescribe(h);
+    ov = ui_overlays().top();
+    trigger = find(r.tree(), lx::a11y::role::button, "trigger");
+    const lx::rect2i flipped = ov->content()->bounds();
+    print_rect("menu at the corner", flipped);
+    LUMEN_CHECK(flipped.y + flipped.height <= trigger->bounds().y);
+    LUMEN_CHECK(flipped.x + flipped.width <= 800 - 8 && flipped.x >= 8);
+    g_menu_open = false;
+    redescribe(h);
+    LUMEN_CHECK(ui_overlays().open_count() == 0);
+    set_reduced_motion(false);
+}
+
+// ── Context menus ──
+
+namespace {
+
+int g_ctx_action = -1;
+void on_ctx_action(int v) { g_ctx_action = v; }
+
+child describe_context(build_context&) {
+    static menu_entry entries[3];
+    entries[0] = menu_item("Open", on_ctx_action).with_value(1);
+    entries[1] = menu_item("Rename", on_ctx_action).with_value(2);
+    entries[2] = menu_item("Delete", on_ctx_action).with_value(3);
+    const child area = div(style{}.size_full().bg(tok::editor_background), {});
+    const child kids[1] = {context_menu(area, entries)};
+    return div(style{}.size_full(), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(context_menu_opens_at_the_pointer) {
+    set_reduced_motion(true);
+    harness h{describe_context, {0, 0, 400, 300}};
+    ui_root& r = h.root;
+    (void)r.pointer_move({50, 60});
+    LUMEN_CHECK(r.pointer_button(mouse_button::right, true));
+    (void)r.pointer_button(mouse_button::right, false);
+    (void)h.tick();
+    LUMEN_CHECK(ui_overlays().open_count() == 1);
+    const lx::rect2i mb = ui_overlays().top()->content()->bounds();
+    LUMEN_CHECK(mb.x == 50 && mb.y == 60);
+    // A second secondary press moves it; near the corner it opens up and to the left.
+    (void)r.pointer_move({380, 280});
+    LUMEN_CHECK(r.pointer_button(mouse_button::right, true));
+    (void)h.tick();
+    LUMEN_CHECK(ui_overlays().open_count() == 1);
+    const lx::rect2i moved = ui_overlays().top()->content()->bounds();
+    LUMEN_CHECK(moved.x + moved.width <= 380 && moved.y + moved.height <= 280);
+    // An entry runs and closes it.
+    g_ctx_action = -1;
+    click(r, centre(*menu_item_node(r, "Rename")));
+    LUMEN_CHECK(g_ctx_action == 2 && ui_overlays().open_count() == 0);
+    (void)h.tick();
+    set_reduced_motion(false);
+}
+
+// ── Modals ──
+
+namespace {
+
+bool g_modal_open = false;
+int g_modal_dismissed = 0;
+void on_modal_dismiss(int) {
+    g_modal_open = false;
+    ++g_modal_dismissed;
+}
+
+child describe_modal(build_context&) {
+    const child body_kids[2] = {button("OK").name("ok"), button("Cancel").name("cancel")};
+    const child body = div(style{}.flex_row().gap(sp::b08), body_kids);
+    const child kids[3] = {
+        button("Behind").name("behind"),
+        button("Also behind").name("behind2"),
+        modal(body).title("Confirm").open(g_modal_open).on_dismiss(on_modal_dismiss).width(320.f),
+    };
+    return div(style{}.flex_col().items_start().gap(sp::b08).p(sp::b08).size_full(), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(modal_traps_focus_scrims_the_tree_and_dismisses) {
+    set_reduced_motion(true);
+    g_modal_open = false;
+    g_modal_dismissed = 0;
+    harness h{describe_modal, {0, 0, 640, 400}};
+    ui_root& r = h.root;
+    ui_node* behind = find(r.tree(), lx::a11y::role::button, "behind");
+    LUMEN_CHECK(r.key(key_press(key::tab)) && std::strcmp(focused_name(r), "behind") == 0);
+
+    g_modal_open = true;
+    redescribe(h);
+    overlay_node* ov = ui_overlays().top();
+    LUMEN_CHECK(ov && ov->kind() == overlay_kind::modal);
+    const lx::rect2i box = ov->content()->bounds();
+    print_rect("modal", box);
+    // Centred, 5 rem from the top, 320 px wide.
+    LUMEN_CHECK(box.y == 80 && box.width == 320 && box.x == (640 - 320) / 2);
+    // The scrim: a quad over the whole window, `elevated_surface.background` at 80 %.
+    bool scrim = false;
+    const lx::color sc = token(tok::elevated_surface_background, 0.8f);
+    const lx::gfx::packed_rgba want = lx::gfx::premultiplied_half(sc);
+    for (const lx::gfx::quad_instance& q : h.list->quad_instances())
+        scrim = scrim || (q.bounds[0] == 0.f && q.bounds[1] == 0.f && q.bounds[2] == 640.f &&
+                          q.bounds[3] == 400.f && q.background[3] == want.a);
+    LUMEN_CHECK(scrim);
+    // Focus trapped: the header's close button, then OK, Cancel, and round again.
+    LUMEN_CHECK(r.focus().active_trap() == ov->content());
+    LUMEN_CHECK(std::strcmp(focused_name(r), "Close") == 0);
+    LUMEN_CHECK(r.key(key_press(key::tab)) && std::strcmp(focused_name(r), "ok") == 0);
+    LUMEN_CHECK(r.key(key_press(key::tab)) && std::strcmp(focused_name(r), "cancel") == 0);
+    LUMEN_CHECK(r.key(key_press(key::tab)) && std::strcmp(focused_name(r), "Close") == 0);
+    LUMEN_CHECK(r.key(key_press(key::tab, k_mod_shift)) && std::strcmp(focused_name(r), "cancel") == 0);
+    // The tree beneath takes no pointer: no hover, a press on the scrim dismisses (consumed).
+    (void)r.pointer_move(centre(*behind));
+    LUMEN_CHECK(r.pointer().hovered() == nullptr);
+    LUMEN_CHECK(r.pointer_button(mouse_button::left, true));
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(!g_modal_open && g_modal_dismissed == 1 && ui_overlays().open_count() == 0);
+    // The focus is back where it was.
+    LUMEN_CHECK(std::strcmp(focused_name(r), "behind") == 0 && r.focus().active_trap() == nullptr);
+    redescribe(h);
+    // Escape, and the close button, dismiss it too.
+    g_modal_open = true;
+    redescribe(h);
+    LUMEN_CHECK(r.key(key_press(key::escape)) && g_modal_dismissed == 2);
+    redescribe(h);
+    g_modal_open = true;
+    redescribe(h);
+    LUMEN_CHECK(r.key(key_press(key::enter)) && g_modal_dismissed == 3); // Close has the focus
+    redescribe(h);
+    LUMEN_CHECK(ui_overlays().open_count() == 0);
+    set_reduced_motion(false);
+}
+
+// ── The overlay layer's cap ──
+
+namespace {
+
+unsigned g_cap_count = 0;
+
+child describe_many_popovers(build_context&) {
+    child kids[ui_node::k_max_children]{};
+    const unsigned n = std::min(g_cap_count, ui_node::k_max_children);
+    for (unsigned i = 0; i < n; ++i) {
+        overlay_props o{};
+        o.open = true;
+        o.dismiss_outside = false;
+        kids[i] = overlay(o, div(style{}.size(px(10.f)).bg(tok::element_background), {}));
+    }
+    return div(style{}.size_full(), {kids, n});
+}
+
+} // namespace
+
+LUMEN_TEST(overlay_layer_is_bounded) {
+    g_cap_count = overlay_layer::k_capacity + 3;
+    const std::uint64_t before = ui_overlays().rejected();
+    harness h{describe_many_popovers, {0, 0, 200, 200}};
+    LUMEN_CHECK(ui_overlays().open_count() == overlay_layer::k_capacity);
+    LUMEN_CHECK(ui_overlays().rejected() - before == 3); // overflow_action::reject
+    g_cap_count = 0;
+    redescribe(h);
+    LUMEN_CHECK(ui_overlays().open_count() == 0);
+}
+
+// ── Scroll areas ──
+
+namespace {
+
+char g_scroll_names[30][8];
+
+child describe_scroll(build_context&) {
+    child rows[30];
+    for (unsigned i = 0; i < 30; ++i) {
+        std::snprintf(g_scroll_names[i], sizeof(g_scroll_names[i]), "r%u", i);
+        rows[i] = button(g_scroll_names[i]).name(g_scroll_names[i]).full_width();
+    }
+    const child kids[1] = {scroll_area(style{}.w(px(200.f)).h(px(200.f)), rows)};
+    return div(style{}.flex_col().p(px(10.f)), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(scroll_area_scrolls_without_relayout_and_damages_the_viewport) {
+    set_active_builtin_theme(appearance::dark);
+    harness h{describe_scroll, {0, 0, 320, 260}};
+    ui_root& r = h.root;
+    auto* sn = static_cast<scroll_node*>(find_type(r.tree(), scroll_node::static_type()));
+    LUMEN_CHECK(sn != nullptr);
+    const lx::rect2i vp = sn->bounds();
+    LUMEN_CHECK(same(vp, {10, 10, 200, 200}));
+    // 30 buttons of 22 px: 660 px of content.
+    LUMEN_CHECK(sn->content_size().height == 660);
+    // Zed's scrollbar: a 14 px strip, the thumb 6 px inside 4 px of padding, its length the
+    // viewport's share (200 / 660 of the 192 px track: 58 px), at the top.
+    auto* bar = static_cast<scrollbar_node*>(find_type(r.tree(), scrollbar_node::static_type()));
+    LUMEN_CHECK(bar && bar->visible());
+    const scrollbar_geometry g = bar->geometry();
+    LUMEN_CHECK(same(g.strip, {10 + 200 - 14, 10, 14, 200}));
+    LUMEN_CHECK(g.thumb.width == 6 && g.thumb.x == 10 + 200 - 10 && g.thumb.y == 14);
+    LUMEN_CHECK(g.thumb.height == 58);
+    // A long content keeps Zed's 25 px minimum thumb.
+    const scrollbar_geometry tiny = scrollbar_layout({0, 0, 100, 100}, 1, {0.f, 100.f, 100000.f});
+    LUMEN_CHECK(tiny.visible && tiny.thumb.height == 23); // 25 / 100 of the 92 px track
+
+    // The wheel: the offset moves, nothing is measured or arranged, the viewport repaints.
+    ui_node* r3 = find(r.tree(), lx::a11y::role::button, "r3");
+    (void)r.pointer_move(centre(*r3));
+    LUMEN_CHECK(r.pointer().hovered() == r3);
+    LUMEN_CHECK(h.tick());
+    ui_layout_counters() = {};
+    LUMEN_CHECK(r.pointer_axis(0.f, 44.f));
+    LUMEN_CHECK(sn->offset().y == 44);
+    LUMEN_CHECK(h.tick());
+    LUMEN_CHECK(ui_layout_counters().measures == 0 && ui_layout_counters().arranges == 0);
+    const damage_ledger& d = r.frame_damage();
+    for (unsigned i = 0; i < d.count(); ++i)
+        LUMEN_CHECK(inside(d.rects()[i], vp));
+    LUMEN_CHECK(same(d.union_bounds(), vp));
+    // What is under the still pointer is the row two buttons on (44 px = two rows).
+    ui_node* r5 = find(r.tree(), lx::a11y::role::button, "r5");
+    LUMEN_CHECK(r.pointer().hovered() == r5);
+    // The hover repaint of a scrolled row lands where it is drawn.
+    (void)r.pointer_move(centre(*r3)); // layout coordinates of r3, now showing r5 + 0
+    ui_damage().clear();
+    (void)r.pointer_move({vp.x + 20, vp.y + 1});
+    const lx::rect2i drawn = surface_rect(*r.pointer().hovered(), r.pointer().hovered()->bounds());
+    LUMEN_CHECK(inside(drawn, vp) || drawn.y == vp.y);
+    LUMEN_CHECK(overlaps(ui_damage().union_bounds(), drawn));
+    (void)h.tick();
+
+    // To the end and no further (the ancestors may take what it cannot).
+    LUMEN_CHECK(r.pointer_axis(0.f, 10000.f) && sn->offset().y == 460);
+    LUMEN_CHECK(!r.pointer_axis(0.f, 10.f));
+    (void)h.tick();
+    LUMEN_CHECK(bar->geometry().thumb.y + bar->geometry().thumb.height == 10 + 200 - 4);
+
+    // Dragging the thumb: the offset follows, the grab point kept.
+    sn->scroll_to(1, 0.f);
+    (void)h.tick();
+    const lx::rect2i thumb = bar->geometry().thumb;
+    (void)r.pointer_move(centre_of(thumb));
+    LUMEN_CHECK(r.pointer().hovered() == bar);
+    LUMEN_CHECK(r.pointer_button(mouse_button::left, true) && bar->dragging());
+    ui_layout_counters() = {};
+    (void)r.pointer_move({centre_of(thumb).x, centre_of(thumb).y + 67});
+    // 67 px of a 134 px travel (192 − 58): half the 460 px range.
+    LUMEN_CHECK(sn->offset().y == 230);
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(!bar->dragging());
+    LUMEN_CHECK(h.tick());
+    LUMEN_CHECK(ui_layout_counters().measures == 0 && ui_layout_counters().arranges == 0);
+    // A press on the track centres the thumb there.
+    (void)r.pointer_move({thumb.x + 3, 10 + 200 - 10});
+    (void)r.pointer_button(mouse_button::left, true);
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(sn->offset().y == 460);
+    (void)h.tick();
+}
+
+// ── Lists ──
+
+namespace {
+
+int g_list_selected = -2;
+int g_list_activated = -1;
+void on_list_select(int i) { g_list_selected = i; }
+void on_list_activate(int i) { g_list_activated = i; }
+unsigned g_list_count = 10000;
+
+child list_row_fn(void*, const list_row& row) {
+    return list_item(frame_format("Row {}", row.index)).row(row).name(frame_format("row{}", row.index));
+}
+
+child describe_list(build_context&) {
+    const child kids[2] = {
+        button("before").name("before"),
+        list(g_list_count, list_row_fn).layout(style{}.w(px(300.f)).h(px(400.f)))
+            .on_select(on_list_select).on_activate(on_list_activate).name("rows"),
+    };
+    return div(style{}.flex_col().items_start().p(px(10.f)).gap(px(10.f)), kids);
+}
+
+[[nodiscard]] list_node& the_list(ui_root& r) {
+    ui_node* n = find_type(r.tree(), list_node::static_type());
+    LUMEN_CHECK(n != nullptr);
+    return *static_cast<list_node*>(n);
+}
+
+} // namespace
+
+LUMEN_TEST(list_virtualises_past_100_rows_and_navigates_by_keyboard) {
+    set_active_builtin_theme(appearance::dark);
+    // 80 rows: every row exists.
+    g_list_count = 80;
+    {
+        harness small{describe_list, {0, 0, 400, 500}};
+        list_node& l = the_list(small.root);
+        LUMEN_CHECK(!l.virtualised() && l.live_rows() == 80);
+        LUMEN_CHECK(l.row_node(79) != nullptr);
+    }
+    g_list_count = 10000;
+    g_list_selected = -2;
+    harness h{describe_list, {0, 0, 400, 500}};
+    ui_root& r = h.root;
+    list_node& l = the_list(r);
+    // Zed's dense `ListItem`: a 14 px label on the φ line, 23 px.
+    LUMEN_CHECK(l.row_height() == 23 && l.virtualised());
+    // 400 / 23 visible rows ± 8, in 16-row chunks: at most 4 chunks.
+    const unsigned visible = (400 + 22) / 23;
+    std::printf("    10 000 rows: %u live (visible %u), %u nodes in the tree\n", l.live_rows(),
+                visible, count_nodes(r.tree()));
+    LUMEN_CHECK(l.live_rows() >= visible && l.live_rows() <= 64);
+    ui_node* row0 = l.row_node(0);
+    LUMEN_CHECK(row0 && row0->bounds().height == 23 && row0->bounds().width == 300);
+
+    // One tab stop; the arrows move the selection, not the focus.
+    LUMEN_CHECK(r.key(key_press(key::tab)) && r.key(key_press(key::tab)));
+    LUMEN_CHECK(r.focus().focused() == &l && l.has_flag(node_flag::focus_ring));
+    LUMEN_CHECK(r.key(key_press(key::down)) && l.selected() == 0 && g_list_selected == 0);
+    LUMEN_CHECK(r.key(key_press(key::down)) && l.selected() == 1 && g_list_selected == 1);
+    (void)h.tick();
+    // The selection is the row's `ghost_element.selected` background; the ring stays the list's.
+    LUMEN_CHECK(ctl(l.row_node(1)).selected() && !ctl(l.row_node(0)).selected());
+    LUMEN_CHECK(same_colour(ctl(l.row_node(1)).background(), token(tok::ghost_element_selected)));
+    LUMEN_CHECK(!l.row_node(1)->has_flag(node_flag::focus_ring));
+    // End: the last row, scrolled into view and in the pool.
+    LUMEN_CHECK(r.key(key_press(key::end)) && l.selected() == 9999);
+    (void)h.tick();
+    LUMEN_CHECK(l.offset() == 10000 * 23 - 400);
+    LUMEN_CHECK(l.row_node(9999) != nullptr && l.row_node(0) == nullptr);
+    LUMEN_CHECK(l.live_rows() <= 64);
+    // Home, page down (17 rows fit), up.
+    LUMEN_CHECK(r.key(key_press(key::home)) && l.selected() == 0);
+    (void)h.tick();
+    LUMEN_CHECK(l.offset() == 0);
+    LUMEN_CHECK(r.key(key_press(key::page_down)) && l.selected() == 17);
+    LUMEN_CHECK(r.key(key_press(key::up)) && l.selected() == 16);
+    // Enter activates the selection.
+    g_list_activated = -1;
+    LUMEN_CHECK(r.key(key_press(key::enter)) && g_list_activated == 16);
+    (void)h.tick();
+    // A click selects the row under the pointer and focuses the list without a ring.
+    ui_node* row3 = l.row_node(3);
+    click(r, centre_of(surface_rect(*row3, row3->bounds())));
+    LUMEN_CHECK(l.selected() == 3 && r.focus().focused() == &l && !l.has_flag(node_flag::focus_ring));
+    (void)h.tick();
+}
+
+LUMEN_TEST(list_hover_damages_two_rows_and_relays_out_nothing) {
+    // ADR-010 §8.3 S5: a 1 000-row list, the pointer moving one row per frame.
+    g_list_count = 1000;
+    harness h{describe_list, {0, 0, 400, 500}};
+    ui_root& r = h.root;
+    list_node& l = the_list(r);
+    (void)r.pointer_move(centre(*l.row_node(0)));
+    (void)h.tick();
+    std::vector<double> us;
+    us.reserve(16);
+    unsigned max_rects = 0;
+    for (unsigned i = 1; i <= 15; ++i) {
+        ui_node* prev = l.row_node(i - 1);
+        ui_node* row = l.row_node(i);
+        ui_layout_counters() = {};
+        LUMEN_CHECK(r.pointer_move(centre(*row)) && r.pointer().hovered() == row);
+        const auto t0 = std::chrono::steady_clock::now();
+        LUMEN_CHECK(h.tick());
+        us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        const damage_ledger& d = r.frame_damage();
+        max_rects = std::max(max_rects, d.count());
+        LUMEN_CHECK(d.count() <= 2);
+        for (unsigned k = 0; k < d.count(); ++k)
+            LUMEN_CHECK(same(d.rects()[k], surface_rect(*prev, prev->bounds())) ||
+                        same(d.rects()[k], surface_rect(*row, row->bounds())) ||
+                        inside(d.rects()[k], {prev->bounds().x, surface_rect(*prev, prev->bounds()).y,
+                                              prev->bounds().width, 46}));
+        LUMEN_CHECK(ui_layout_counters().measures == 0 && ui_layout_counters().arranges == 0);
+    }
+    std::sort(us.begin(), us.end());
+    std::printf("    S5 hover: damage <= %u rects, 0 measures, 0 arranges; tick p50 %.1f us p95 %.1f us\n",
+                max_rects, us[us.size() / 2], us[us.size() * 95 / 100]);
+    // Scrolled, the same holds: the rows are found where they are drawn.
+    LUMEN_CHECK(r.pointer_axis(0.f, 230.f));
+    (void)h.tick();
+    ui_node* under = r.pointer().hovered();
+    LUMEN_CHECK(under != nullptr);
+    const lx::rect2i drawn = surface_rect(*under, under->bounds());
+    LUMEN_CHECK(drawn.contains(r.pointer().position()));
+}
+
+LUMEN_TEST(list_scroll_recycles_a_fixed_pool) {
+    g_list_count = 10000;
+    harness h{describe_list, {0, 0, 400, 500}};
+    ui_root& r = h.root;
+    list_node& l = the_list(r);
+    (void)r.pointer_move(centre(*l.row_node(0)));
+    (void)h.tick();
+    const unsigned nodes = count_nodes(r.tree());
+    // Warm-up: down 600 rows and back, 2 rows a step (the rows' text shaped, the pool full).
+    for (int i = 0; i < 300; ++i) {
+        (void)r.pointer_axis(0.f, 46.f);
+        (void)h.tick();
+    }
+    for (int i = 0; i < 300; ++i) {
+        (void)r.pointer_axis(0.f, -46.f);
+        (void)h.tick();
+    }
+    LUMEN_CHECK(l.offset() == 0);
+    LUMEN_CHECK(count_nodes(r.tree()) == nodes);
+    const std::uint64_t rebuilds = l.rebuilds();
+    const unsigned long long allocs = g_allocations.load();
+    const std::size_t heap = mallinfo2().uordblks;
+    std::vector<double> us;
+    us.reserve(300);
+    const unsigned long long allocs_reserved = g_allocations.load();
+    unsigned max_live = 0;
+    for (int i = 0; i < 300; ++i) {
+        LUMEN_CHECK(r.pointer_axis(0.f, 46.f));
+        const auto t0 = std::chrono::steady_clock::now();
+        LUMEN_CHECK(h.tick());
+        us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        max_live = std::max(max_live, l.live_rows());
+        LUMEN_CHECK(l.row_node(static_cast<unsigned>(l.offset() / 23)) != nullptr);
+    }
+    const unsigned long long during = g_allocations.load() - allocs_reserved;
+    (void)allocs;
+    // The same nodes throughout: chunks re-described in place, nothing constructed.
+    LUMEN_CHECK(count_nodes(r.tree()) == nodes);
+    LUMEN_CHECK(l.rebuilds() > rebuilds);
+    LUMEN_CHECK(max_live <= 64);
+    std::sort(us.begin(), us.end());
+    std::printf("    list scroll (2 rows/frame, %llu rebuilds): tick p50 %.1f us p95 %.1f us, %llu allocations, %u live rows max\n",
+                static_cast<unsigned long long>(l.rebuilds() - rebuilds), us[us.size() / 2],
+                us[us.size() * 95 / 100], during, max_live);
+    LUMEN_CHECK(during == 0);
+    LUMEN_CHECK(mallinfo2().uordblks <= heap + 300 * sizeof(double) + 64);
+}
+
+// ── Text input ──
+
+namespace {
+
+char g_text_storage[64];
+text_buffer g_text{g_text_storage};
+int g_text_changes = 0;
+int g_text_submitted = -1;
+void on_text_change(int) { ++g_text_changes; }
+void on_text_submit(int n) { g_text_submitted = n; }
+std::uint32_t g_text_max = 63;
+lx::runtime::overflow_action g_text_overflow = lx::runtime::overflow_action::reject;
+
+child describe_input(build_context&) {
+    const child kids[2] = {
+        text_input().buffer(g_text).placeholder("Search").name("search")
+            .layout(style{}.w(px(240.f))).max_bytes(g_text_max).overflow(g_text_overflow)
+            .on_change(on_text_change).on_submit(on_text_submit),
+        button("after").name("after"),
+    };
+    return div(style{}.flex_col().items_start().p(px(10.f)).gap(px(8.f)), kids);
+}
+
+[[nodiscard]] text_input_node& the_input(ui_root& r) {
+    ui_node* n = find_type(r.tree(), text_input_node::static_type());
+    LUMEN_CHECK(n != nullptr);
+    return *static_cast<text_input_node*>(n);
+}
+
+[[nodiscard]] bool text_is(const text_input_node& t, std::string_view s) { return t.text() == s; }
+
+} // namespace
+
+LUMEN_TEST(text_input_edits_by_grapheme_and_word) {
+    set_active_builtin_theme(appearance::dark);
+    (void)g_text.assign("");
+    g_text_max = 63;
+    g_text_overflow = lx::runtime::overflow_action::reject;
+    harness h{describe_input, {0, 0, 400, 200}};
+    ui_root& r = h.root;
+    text_input_node& t = the_input(r);
+    // Zed's `InputField`: 33 px (the 19 px standard line, 6 px padding, 1 px border).
+    LUMEN_CHECK(t.bounds().height == 33 && t.bounds().width == 240);
+    LUMEN_CHECK(t.text_node().layout().text() == "Search"); // the placeholder, muted
+    LUMEN_CHECK(r.key(key_press(key::tab)) && r.focus().focused() == &t);
+    LUMEN_CHECK(r.ime() == static_cast<ime_target*>(&t));
+    type_text(r, "hello");
+    LUMEN_CHECK(text_is(t, "hello") && t.caret() == 5 && g_text.size == 5);
+    LUMEN_CHECK(g_text_changes >= 5);
+    (void)h.tick();
+    LUMEN_CHECK(t.text_node().layout().text() == "hello");
+    // Arrows, shift-selection, backspace over the selection.
+    LUMEN_CHECK(r.key(key_press(key::left)) && r.key(key_press(key::left)) && t.caret() == 3);
+    LUMEN_CHECK(r.key(key_press(key::left, k_mod_shift)) && t.anchor() == 3 && t.caret() == 2);
+    LUMEN_CHECK(r.key(key_press(key::backspace)) && text_is(t, "helo") && t.caret() == 2);
+    LUMEN_CHECK(r.key(key_press(key::delete_forward)) && text_is(t, "heo"));
+    LUMEN_CHECK(r.key(key_press(key::end)) && t.caret() == 3);
+    type_text(r, " big world");
+    // Word jumps: back over "world", then "big"; forward to the end of "big".
+    LUMEN_CHECK(r.key(key_press(key::left, k_mod_ctrl)) && t.caret() == 8);
+    LUMEN_CHECK(r.key(key_press(key::left, k_mod_ctrl)) && t.caret() == 4);
+    LUMEN_CHECK(r.key(key_press(key::right, k_mod_ctrl)) && t.caret() == 7);
+    LUMEN_CHECK(r.key(key_press(key::backspace, k_mod_ctrl)) && text_is(t, "heo  world") && t.caret() == 4);
+    LUMEN_CHECK(r.key(key_press(key::home, k_mod_shift)) && t.selection_begin() == 0 && t.selection_end() == 4);
+    LUMEN_CHECK(r.key(key_press(key::right)) && t.caret() == 4 && !t.has_selection());
+    // Clipboard: ctrl+a, ctrl+c, ctrl+x, ctrl+v.
+    LUMEN_CHECK(r.key(text_key('a', k_mod_ctrl)) && t.selection_end() == 10 && t.selection_begin() == 0);
+    LUMEN_CHECK(r.key(text_key('c', k_mod_ctrl)) && std::strcmp(clipboard::global().text(), "heo  world") == 0);
+    LUMEN_CHECK(r.key(text_key('x', k_mod_ctrl)) && text_is(t, "") && t.caret() == 0);
+    LUMEN_CHECK(r.key(text_key('v', k_mod_ctrl)) && r.key(text_key('v', k_mod_ctrl)));
+    LUMEN_CHECK(text_is(t, "heo  worldheo  world"));
+    // Enter submits.
+    LUMEN_CHECK(r.key(key_press(key::enter)) && g_text_submitted == 20);
+    (void)h.tick();
+
+    // The capacity: reject refuses an insertion whole; drop_newest keeps what fits.
+    (void)g_text.assign("");
+    g_text_max = 8;
+    redescribe(h);
+    type_text(r, "12345678");
+    const std::uint64_t refused = t.rejected();
+    LUMEN_CHECK(r.key(text_key('9')) && text_is(t, "12345678") && t.rejected() == refused + 1);
+    (void)g_text.assign("1234567");
+    g_text_overflow = lx::runtime::overflow_action::drop_newest;
+    redescribe(h);
+    clipboard::global().set_text("abc");
+    LUMEN_CHECK(r.key(text_key('v', k_mod_ctrl)) && text_is(t, "1234567a"));
+    g_text_max = 63;
+    g_text_overflow = lx::runtime::overflow_action::reject;
+
+    // A ZWJ emoji sequence is one grapheme: one step, one backspace.
+    const char* family = "a\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA9\xE2\x80\x8D\xF0\x9F\x91\xA7" "b";
+    LUMEN_CHECK(g_text.assign(family));
+    redescribe(h);
+    LUMEN_CHECK(t.caret() == 20); // the app replaced the text: the caret at its end
+    LUMEN_CHECK(r.key(key_press(key::home)) && r.key(key_press(key::right)) && t.caret() == 1);
+    LUMEN_CHECK(r.key(key_press(key::right)) && t.caret() == 19);
+    LUMEN_CHECK(r.key(key_press(key::right)) && t.caret() == 20);
+    LUMEN_CHECK(r.key(key_press(key::left)) && r.key(key_press(key::backspace)) && text_is(t, "ab"));
+    LUMEN_CHECK(t.caret() == 1);
+    (void)h.tick();
+
+    // Right to left: the caret starts at the right edge; left moves forward (leftwards).
+    const char* arabic = "\xD9\x85\xD8\xB1\xD8\xAD\xD8\xA8\xD8\xA7"; // مرحبا
+    LUMEN_CHECK(g_text.assign(arabic));
+    redescribe(h);
+    LUMEN_CHECK(t.text_node().layout().direction() == lx::text::text_direction::rtl);
+    LUMEN_CHECK(r.key(key_press(key::home)) && t.caret() == 0);
+    (void)h.tick();
+    const int x0 = t.caret_rect().x;
+    LUMEN_CHECK(x0 > t.text_area().x + t.text_area().width / 2); // the start of an RTL line
+    LUMEN_CHECK(r.key(key_press(key::left)) && t.caret() == 2);
+    const int x1 = t.caret_rect().x;
+    LUMEN_CHECK(r.key(key_press(key::left)) && t.caret() == 4);
+    const int x2 = t.caret_rect().x;
+    std::printf("    rtl caret x: %d -> %d -> %d\n", x0, x1, x2);
+    LUMEN_CHECK(x1 < x0 && x2 < x1);
+    LUMEN_CHECK(r.key(key_press(key::right)) && t.caret() == 2 && t.caret_rect().x == x1);
+    (void)h.tick();
+
+    // The pointer: a press places the caret (hit testing), a drag selects, a double press
+    // selects a word.
+    LUMEN_CHECK(g_text.assign("hello world"));
+    redescribe(h);
+    const lx::rect2i area = t.text_area();
+    const int mid = area.y + area.height / 2;
+    (void)r.pointer_move({area.x + 1, mid});
+    (void)r.pointer_button(mouse_button::left, true);
+    LUMEN_CHECK(t.caret() == 0);
+    (void)r.pointer_move({area.x + area.width - 2, mid});
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(t.anchor() == 0 && t.caret() == 11);
+    (void)h.tick();
+    // A double click on "world".
+    const lx::text::caret_pos w = t.text_node().layout().caret(8);
+    const lx::point2i on_world{t.text_node().bounds().x + ((w.x + 32) >> 6), mid};
+    click(r, on_world);
+    click(r, on_world);
+    LUMEN_CHECK(t.selection_begin() == 6 && t.selection_end() == 11);
+    (void)h.tick();
+}
+
+LUMEN_TEST(text_input_ime_preedit_and_commit) {
+    (void)g_text.assign("ab");
+    g_text_max = 63;
+    harness h{describe_input, {0, 0, 400, 200}};
+    ui_root& r = h.root;
+    text_input_node& t = the_input(r);
+    LUMEN_CHECK(r.key(key_press(key::tab)));
+    LUMEN_CHECK(r.key(key_press(key::home)) && r.key(key_press(key::right)) && t.caret() == 1);
+    ime_target* ime = r.ime();
+    LUMEN_CHECK(ime == static_cast<ime_target*>(&t));
+    // A preedit: shown at the caret, underlined, not part of the text.
+    ime_update u{};
+    u.preedit = "\xE3\x81\xAB\xE3\x81\xBB"; // にほ
+    u.preedit_cursor_begin = u.preedit_cursor_end = 6;
+    ime->ime_apply(u);
+    LUMEN_CHECK(text_is(t, "ab") && t.preedit() == u.preedit && t.caret() == 1);
+    (void)h.tick();
+    const lx::text::text_layout& l = t.text_node().layout();
+    LUMEN_CHECK(l.text() == "a\xE3\x81\xAB\xE3\x81\xBB" "b");
+    LUMEN_CHECK(l.attrs().size() == 1 && l.attrs()[0].begin == 1 && l.attrs()[0].end == 7 &&
+                l.attrs()[0].underline == lx::text::text_underline::single);
+    // The caret is drawn at the preedit's cursor (after it), and the state reports the text.
+    LUMEN_CHECK(t.caret_visible());
+    const ime_state s = ime->ime_query();
+    LUMEN_CHECK(s.enabled && s.surrounding == "ab" && s.cursor == 1 && s.cursor_rect.width == 2);
+    LUMEN_CHECK(s.cursor_rect.x > t.text_area().x + 8);
+    // Keys belong to the input method while it composes.
+    LUMEN_CHECK(!r.key(key_press(key::left)) && t.caret() == 1);
+    // Commit: the preedit goes, the commit is inserted.
+    ime_update c{};
+    c.commit = "\xE6\x97\xA5\xE6\x9C\xAC"; // 日本
+    ime->ime_apply(c);
+    LUMEN_CHECK(text_is(t, "a\xE6\x97\xA5\xE6\x9C\xAC" "b") && t.caret() == 7 && t.preedit().empty());
+    // delete_surrounding_text then commit, in the protocol's order.
+    ime_update d{};
+    d.delete_before = 3;
+    d.commit = "x";
+    ime->ime_apply(d);
+    LUMEN_CHECK(text_is(t, "a\xE6\x97\xA5" "xb") && t.caret() == 5);
+    (void)h.tick();
+    // A reset drops the preedit; so does losing the focus.
+    u.preedit_cursor_begin = u.preedit_cursor_end = -1;
+    ime->ime_apply(u);
+    LUMEN_CHECK(!t.preedit().empty() && !t.caret_visible());
+    ime->ime_reset();
+    LUMEN_CHECK(t.preedit().empty() && text_is(t, "a\xE6\x97\xA5" "xb"));
+    ime->ime_apply(u);
+    LUMEN_CHECK(r.key(key_press(key::tab)) && t.preedit().empty());
+    LUMEN_CHECK(r.ime() == nullptr);
+    // An over-long preedit is cut to its capacity at a character boundary.
+    LUMEN_CHECK(r.key(key_press(key::tab, k_mod_shift)) && r.ime() != nullptr);
+    std::string long_preedit;
+    for (int i = 0; i < 120; ++i)
+        long_preedit += "\xE3\x81\xAB";
+    ime_update big{};
+    big.preedit = long_preedit;
+    ime->ime_apply(big);
+    LUMEN_CHECK(t.preedit().size() == 255 && t.preedit().size() % 3 == 0);
+    ime->ime_reset();
+    (void)h.tick();
+}
+
+// ── Timers: the caret blink, the tooltip, toasts ──
+
+namespace {
+
+int g_tip_press = 0;
+void on_tip_press() { ++g_tip_press; }
+
+child describe_tip(build_context&) {
+    const child kids[2] = {
+        button("Save").name("save").tooltip("Save the file").on_press(on_tip_press),
+        text_input().placeholder("Name").name("field").initial("abc"),
+    };
+    return div(style{}.flex_row().items_center().gap(px(20.f)).p(px(20.f)), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(caret_blink_and_tooltip_request_frames_only_while_needed) {
+    set_ui_clock(test_clock);
+    set_reduced_motion(false);
+    harness h{describe_tip, {0, 0, 500, 200}};
+    ui_root& r = h.root;
+    LUMEN_CHECK(!h.tick() && r.next_deadline_ns() == 0);
+    ui_node* save = find(r.tree(), lx::a11y::role::button, "save");
+    text_input_node& field = the_input(r);
+
+    // Focused: the caret shows and a blink is due in 500 ms; no frames until then.
+    LUMEN_CHECK(r.key(key_press(key::tab)) && r.key(key_press(key::tab)));
+    LUMEN_CHECK(r.focus().focused() == &field && field.caret_visible());
+    LUMEN_CHECK(r.next_deadline_ns() == g_now_ns + 500'000'000ull);
+    LUMEN_CHECK(h.tick());
+    for (int i = 0; i < 4; ++i) {
+        g_now_ns += 100'000'000ull;
+        LUMEN_CHECK(!h.tick());
+    }
+    g_now_ns += 100'000'000ull;
+    LUMEN_CHECK(h.tick() && !field.caret_visible());
+    // The blink repaints the caret alone.
+    LUMEN_CHECK(r.frame_damage().union_bounds().width <= 4);
+    g_now_ns += 500'000'000ull;
+    LUMEN_CHECK(h.tick() && field.caret_visible());
+    // Typing shows the caret solid and restarts the delay.
+    LUMEN_CHECK(r.key(text_key('d')) && field.caret_visible());
+    LUMEN_CHECK(r.next_deadline_ns() == g_now_ns + 500'000'000ull);
+    LUMEN_CHECK(h.tick());
+    // Unfocused: the blink stops — no deadline, no frames.
+    LUMEN_CHECK(r.key(key_press(key::tab)) && r.focus().focused() != &field);
+    LUMEN_CHECK(r.next_deadline_ns() == 0);
+    LUMEN_CHECK(h.tick());
+    g_now_ns += 2'000'000'000ull;
+    LUMEN_CHECK(!h.tick());
+
+    // A tooltip: 500 ms after the hover, at the pointer, fading in over 100 ms.
+    r.focus().blur();
+    (void)h.tick();
+    const lx::point2i at = centre(*save);
+    LUMEN_CHECK(r.pointer_move(at));
+    LUMEN_CHECK(r.next_deadline_ns() == g_now_ns + 500'000'000ull);
+    LUMEN_CHECK(h.tick());
+    g_now_ns += 250'000'000ull;
+    LUMEN_CHECK(!h.tick() && ui_overlays().open_count() == 0);
+    g_now_ns += 250'000'000ull;
+    LUMEN_CHECK(h.tick());
+    LUMEN_CHECK(ui_overlays().open_count() == 1 && ui_overlays().top()->kind() == overlay_kind::tooltip);
+    const lx::rect2i tip = ui_overlays().top()->content()->bounds();
+    LUMEN_CHECK(tip.x == at.x + 8 && tip.y == at.y + 10);
+    unsigned frames = 0;
+    while (ui_damage().needs_animate() && frames < 100) {
+        g_now_ns += 16'666'667ull;
+        LUMEN_CHECK(h.tick());
+        ++frames;
+    }
+    std::printf("    tooltip fade: %u frames\n", frames);
+    LUMEN_CHECK(frames >= 5 && frames <= 7);
+    LUMEN_CHECK(!h.tick() && r.next_deadline_ns() == 0);
+    // The pointer passes through it; a press closes it (and presses the button).
+    LUMEN_CHECK(r.pointer().hovered() == save);
+    (void)r.pointer_button(mouse_button::left, true);
+    LUMEN_CHECK(ui_overlays().open_count() == 0);
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(g_tip_press == 1);
+    (void)h.tick();
+    // Leaving before the delay: no tooltip, no deadline.
+    r.pointer_leave();
+    (void)h.tick();
+    LUMEN_CHECK(r.pointer_move(at) && r.next_deadline_ns() != 0);
+    r.pointer_leave();
+    LUMEN_CHECK(r.next_deadline_ns() == 0);
+    (void)h.tick();
+    g_now_ns += 1'000'000'000ull;
+    LUMEN_CHECK(!h.tick() && ui_overlays().open_count() == 0);
+    set_ui_clock(nullptr);
+}
+
+namespace {
+
+bool g_toast_alive[2] = {true, true};
+int g_toast_dismissed[2] = {};
+void on_toast_dismiss(int i) {
+    g_toast_alive[i] = false;
+    ++g_toast_dismissed[i];
+}
+
+child describe_toasts(build_context&) {
+    child toasts[2]{};
+    unsigned n = 0;
+    if (g_toast_alive[0])
+        toasts[n++] = toast("Saved 3 files").status(status_kind::success).icon(icon::check)
+                          .value(0).on_dismiss(on_toast_dismiss).key(1);
+    if (g_toast_alive[1])
+        toasts[n++] = toast("Push failed").status(status_kind::error).icon(icon::x)
+                          .duration_ms(4000).value(1).on_dismiss(on_toast_dismiss).key(2);
+    const child kids[2] = {label("content"), toast_stack({toasts, n})};
+    return div(style{}.size_full().p(px(10.f)), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(toasts_stack_and_dismiss_themselves) {
+    set_ui_clock(test_clock);
+    set_reduced_motion(true);
+    g_toast_alive[0] = g_toast_alive[1] = true;
+    g_toast_dismissed[0] = g_toast_dismissed[1] = 0;
+    harness h{describe_toasts, {0, 0, 500, 300}};
+    ui_root& r = h.root;
+    LUMEN_CHECK(ui_overlays().open_count() == 1);
+    overlay_node* layer = ui_overlays().top();
+    auto* first = static_cast<toast_node*>(find_type(layer->content(), toast_node::static_type()));
+    ui_node* second = layer->content()->child_at(1);
+    LUMEN_CHECK(first && second);
+    // Stacked at the bottom centre, 8 px apart, 8 px above the window's edge.
+    const lx::rect2i a = first->bounds();
+    const lx::rect2i b = second->bounds();
+    print_rect("toast 1", a);
+    print_rect("toast 2", b);
+    LUMEN_CHECK(b.y == a.y + a.height + 8 && b.y + b.height == 300 - 8);
+    LUMEN_CHECK(std::abs((a.x + a.width / 2) - 250) <= 1 && std::abs((b.x + b.width / 2) - 250) <= 1);
+    // The earliest timer is the 4 s toast; the stack lays out again when it goes.
+    LUMEN_CHECK(r.next_deadline_ns() == g_now_ns + 4'000'000'000ull);
+    g_now_ns += 4'000'000'000ull;
+    LUMEN_CHECK(h.tick() && g_toast_dismissed[1] == 1 && !g_toast_alive[1]);
+    redescribe(h);
+    LUMEN_CHECK(ui_overlays().open_count() == 1);
+    // Hovering pauses the other: past its 10 s it stays while the pointer is on it.
+    first = static_cast<toast_node*>(find_type(ui_overlays().top()->content(), toast_node::static_type()));
+    LUMEN_CHECK(r.pointer_move(centre(*first)) && r.pointer().hovered() == first);
+    g_now_ns += 20'000'000'000ull;
+    (void)h.tick();
+    LUMEN_CHECK(g_toast_alive[0]);
+    // Left, it resumes with what was left (6 s).
+    r.pointer_leave();
+    LUMEN_CHECK(r.next_deadline_ns() == g_now_ns + 6'000'000'000ull);
+    g_now_ns += 6'000'000'000ull;
+    (void)h.tick();
+    LUMEN_CHECK(!g_toast_alive[0] && g_toast_dismissed[0] == 1);
+    redescribe(h);
+    // Nothing left: the layer closes, no timer, no frames.
+    LUMEN_CHECK(ui_overlays().open_count() == 0 && r.next_deadline_ns() == 0);
+    g_now_ns += 1'000'000'000ull;
+    LUMEN_CHECK(!h.tick());
+    set_reduced_motion(false);
+    set_ui_clock(nullptr);
+}
+
+// ── G5: steady frames with overlays, lists and inputs allocate nothing ──
+
+LUMEN_TEST(steady_frames_with_overlays_allocate_nothing) {
+    set_active_builtin_theme(appearance::dark);
+    set_reduced_motion(true);
+    g_menu_open = true;
+    g_trigger_at = {20, 20};
+    harness h{describe_menu, {0, 0, 400, 300}};
+    ui_root& r = h.root;
+    LUMEN_CHECK(ui_overlays().open_count() == 1);
+    ui_node* copy = menu_item_node(r, "Copy");
+    ui_node* paste = menu_item_node(r, "Paste");
+    for (int i = 0; i < 4; ++i) {
+        ui_damage().add({0, 0, 400, 300});
+        (void)r.pointer_move(centre(i % 2 ? *copy : *paste));
+        (void)r.key(key_press(key::down));
+        LUMEN_CHECK(h.tick());
+    }
+    // Idle with the menu open: no frame at all.
+    LUMEN_CHECK(!h.tick());
+    const auto run = [&](const char* what, auto&& step) {
+        const std::size_t heap = mallinfo2().uordblks;
+        std::vector<double> us;
+        us.reserve(300);
+        const unsigned long long before = g_allocations.load();
+        for (int i = 0; i < 300; ++i) {
+            step(i);
+            const auto t0 = std::chrono::steady_clock::now();
+            (void)h.tick();
+            us.push_back(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count());
+        }
+        const unsigned long long during = g_allocations.load() - before;
+        LUMEN_CHECK(during == 0);
+        LUMEN_CHECK(mallinfo2().uordblks <= heap + 300 * sizeof(double) + 64);
+        std::sort(us.begin(), us.end());
+        std::printf("    %-30s tick p50 %7.1f us  p95 %7.1f us  allocations %llu\n", what,
+                    us[us.size() / 2], us[us.size() * 95 / 100], during);
+    };
+    run("menu open, full repaint", [&](int) { ui_damage().add({0, 0, 400, 300}); });
+    run("menu open, hover", [&](int i) { (void)r.pointer_move(centre(i % 2 ? *copy : *paste)); });
+    run("menu open, arrow keys", [&](int) { (void)r.key(key_press(key::down)); });
+    g_menu_open = false;
+    redescribe(h);
+    set_reduced_motion(false);
+
+    // Typing into a field and deleting it again.
+    (void)g_text.assign("");
+    harness hi{describe_input, {0, 0, 400, 200}};
+    LUMEN_CHECK(hi.root.key(key_press(key::tab)));
+    for (int i = 0; i < 4; ++i) {
+        type_text(hi.root, "lumen ");
+        for (int k = 0; k < 6; ++k)
+            (void)hi.root.key(key_press(key::backspace));
+        (void)hi.tick();
+    }
+    const unsigned long long before = g_allocations.load();
+    for (int i = 0; i < 100; ++i) {
+        (void)hi.root.key(text_key(static_cast<char32_t>('a' + i % 6)));
+        (void)hi.tick();
+        (void)hi.root.key(key_press(key::backspace));
+        (void)hi.tick();
+    }
+    const unsigned long long typing = g_allocations.load() - before;
+    std::printf("    typing + backspace, 200 frames: %llu allocations\n", typing);
+    LUMEN_CHECK(typing == 0);
 }
 
 int main(int argc, char** argv) {

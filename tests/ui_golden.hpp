@@ -18,6 +18,7 @@
 
 import std;
 import lx.foundation;
+import lx.a11y;
 import lx.gfx;
 import lx.runtime;
 import lx.scene;
@@ -632,6 +633,178 @@ inline void build_components_gallery(lx::ui::draw_scope& s, const tiles& t) {
         tree->root->emit(s);
 }
 
+// ── Overlays, scrolling and editing (ADR-010 §5.6, Phase 3 stage 4): a menu open below its
+// trigger, a tooltip, a modal over content, a toast stack, a scrolled area with its
+// scrollbar, text inputs with a selection and the caret ──
+
+/// `describe()` laid out as `component_layout` does, its open overlays laid out against the
+/// case's window (fades at their end: reduced motion while it builds) and the whole drawn —
+/// the tree, then the overlays over it. `prepare` runs between the layout and the draw.
+inline void build_with_overlays(lx::ui::draw_scope& s, const tiles& t, lx::ui::child (*describe)(),
+                                lx::rect2i bounds, lx::rect2i window,
+                                void (*prepare)(lx::ui::ui_node& root) = nullptr) {
+    lx::ui::set_reduced_motion(true);
+    auto tree = component_layout(t, describe, bounds);
+    lx::ui::overlay_layer& layer = lx::ui::ui_overlays();
+    if (tree->root) {
+        layer.set_root(tree->root);
+        layer.set_focus(nullptr);
+        layer.layout(window);
+        if (prepare) {
+            prepare(*tree->root);
+            layer.layout(window);
+        }
+        lx::ui::ui_damage().clear();
+        tree->root->emit(s);
+        layer.emit(s);
+    }
+    lx::ui::set_reduced_motion(false);
+    layer.set_root(nullptr);
+}
+
+[[nodiscard]] inline lx::ui::ui_node* find_named(lx::ui::ui_node* n, const char* name) {
+    if (!n)
+        return nullptr;
+    const lx::a11y::node a = n->accessibility_node();
+    if (a.name && std::strcmp(a.name, name) == 0)
+        return n;
+    for (unsigned i = 0; i < n->child_count(); ++i)
+        if (lx::ui::ui_node* hit = find_named(n->child_at(i), name))
+            return hit;
+    return nullptr;
+}
+
+inline const char* const k_golden_copy[1] = {"Ctrl-C"};
+inline const char* const k_golden_rename[1] = {"F2"};
+
+/// A popover menu open below its trigger: a header, entries with an icon and key bindings,
+/// a disabled entry, a separator, a submenu and a checked toggle; "Rename" hovered.
+[[nodiscard]] inline lx::ui::child describe_menu_open() {
+    using namespace lx::ui;
+    static menu_entry sub[1];
+    static menu_entry entries[7];
+    sub[0] = menu_item("Zoom in");
+    entries[0] = menu_header("Edit");
+    entries[1] = menu_item("Copy").icon(icon::copy).keys(k_golden_copy);
+    entries[2] = menu_item("Rename").icon(icon::pencil).keys(k_golden_rename);
+    entries[3] = menu_item("Delete").icon(icon::trash).disabled();
+    entries[4] = menu_separator();
+    entries[5] = menu_submenu("View", sub);
+    entries[6] = menu_item("Word wrap").toggle(true);
+    const child trigger = button("Edit").style(button_style::filled).icon(icon::chevron_down, icon_position::end);
+    const child kids[1] = {popover_menu(trigger, entries).open(true)};
+    return div(style{}.flex_row().items_start(), kids);
+}
+
+inline void build_menu_open(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_menu_open, {12, 8, 276, 24}, {0, 0, 300, 232},
+                        [](lx::ui::ui_node& root) {
+                            lx::ui::overlay_node* o = lx::ui::ui_overlays().top();
+                            if (lx::ui::ui_node* rename = o ? find_named(o->content(), "Rename") : nullptr)
+                                rename->set_flag(lx::ui::node_flag::hovered, true);
+                            (void)root;
+                        });
+}
+
+/// A button with a tooltip, shown at a pointer over it (its hover delay run out).
+[[nodiscard]] inline lx::ui::child describe_tooltip() {
+    using namespace lx::ui;
+    const child kids[2] = {button("Save").style(button_style::filled).icon(icon::check).tooltip("Save the file").name("save"),
+                           icon_button(icon::settings)};
+    return div(style{}.flex_row().items_center().gap(sp::b08), kids);
+}
+
+inline void build_tooltip(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_tooltip, {10, 10, 200, 24}, {0, 0, 236, 96},
+                        [](lx::ui::ui_node& root) {
+                            lx::ui::ui_node* save = find_named(&root, "save");
+                            if (!save)
+                                return;
+                            save->set_flag(lx::ui::node_flag::hovered, true);
+                            if (lx::ui::overlay_node* tip = lx::ui::child_overlay(*save, lx::ui::overlay_kind::tooltip))
+                                (void)tip->open_at({save->bounds().x + 20, save->bounds().y + 14});
+                        });
+}
+
+/// A modal over a panel of content: its scrim, the modal surface, header, body and footer.
+[[nodiscard]] inline lx::ui::child describe_modal_over_content() {
+    using namespace lx::ui;
+    const child behind[] = {
+        headline("Settings"),
+        label("Content behind the modal, under its scrim.").color(tok::text_muted),
+        button("Behind").style(button_style::outlined),
+    };
+    const child body = label("Discard the changes to three files?");
+    const child footer_end = button("Discard").style(button_style::filled);
+    const child footer_start = button("Cancel");
+    const child kids[2] = {div(style{}.flex_col().gap(sp::b08).p(sp::b12).size_full().bg(tok::surface_background), behind),
+                           modal(body).title("Unsaved changes").open(true).width(300.f).footer(footer_start, footer_end)};
+    return div(style{}.size_full(), kids);
+}
+
+inline void build_modal(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_modal_over_content, {0, 0, 380, 260}, {0, 0, 380, 260});
+}
+
+/// Two toasts stacked at the bottom centre: a success with its icon, an error with a close
+/// button.
+[[nodiscard]] inline lx::ui::child describe_toasts() {
+    using namespace lx::ui;
+    const child toasts[2] = {toast("Pushed 4 changes").status(status_kind::success).icon(icon::check).key(1),
+                             toast("Build failed").status(status_kind::error).icon(icon::x).dismiss_button().key(2)};
+    const child kids[2] = {label("Editor").color(tok::text_muted), toast_stack(toasts)};
+    return div(style{}.size_full().p(sp::b08), kids);
+}
+
+inline void build_toast_stack(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_toasts, {0, 0, 300, 140}, {0, 0, 300, 140});
+}
+
+/// A scroll area over twelve list items, scrolled 30 px, its scrollbar showing.
+[[nodiscard]] inline lx::ui::child describe_scroll_area() {
+    using namespace lx::ui;
+    static const char* const names[12] = {"main.rs", "lib.rs", "theme.rs", "overlay.rs", "scroll.rs",
+                                          "list.rs", "input.rs", "popups.rs", "focus.rs", "root.rs",
+                                          "node.rs", "style.rs"};
+    child rows[12];
+    for (unsigned i = 0; i < 12; ++i)
+        rows[i] = list_item(names[i]).start_slot(icon_view(icon::file, 14.f, tok::icon_muted)).selected(i == 3);
+    const child kids[1] = {scroll_area(style{}.w(px(196.f)).h(px(136.f)), rows)};
+    return div(style{}.flex_col().bg(tok::panel_background), kids);
+}
+
+inline void build_scroll_area(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_scroll_area, {8, 8, 196, 136}, {0, 0, 212, 152},
+                        [](lx::ui::ui_node& root) {
+                            lx::ui::ui_node* n = &root;
+                            while (n && n->type() != lx::ui::scroll_node::static_type())
+                                n = n->child_count() ? n->child_at(0) : nullptr;
+                            if (n)
+                                static_cast<lx::ui::scroll_node*>(n)->scroll_to(1, 30.f);
+                        });
+}
+
+/// Two text inputs: one focused with "Lumen text input", "text" selected and the caret after
+/// it; one empty showing its placeholder.
+[[nodiscard]] inline lx::ui::child describe_text_inputs() {
+    using namespace lx::ui;
+    const child kids[2] = {text_input().initial("Lumen text input").name("focused").layout(style{}.w(px(240.f))),
+                           text_input().placeholder("Search files").name("empty").layout(style{}.w(px(240.f)))};
+    return div(style{}.flex_col().gap(sp::b08), kids);
+}
+
+inline void build_text_input(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_text_inputs, {10, 8, 240, 80}, {0, 0, 260, 96},
+                        [](lx::ui::ui_node& root) {
+                            lx::ui::ui_node* n = find_named(&root, "focused");
+                            if (!n || n->type() != lx::ui::text_input_node::static_type())
+                                return;
+                            auto* in = static_cast<lx::ui::text_input_node*>(n);
+                            in->set_flag(lx::ui::node_flag::focused, true);
+                            in->set_selection(6, 10);
+                        });
+}
+
 [[nodiscard]] inline std::span<const golden_case> cases() {
     static const std::vector<golden_case> k_cases = [] {
     std::vector<golden_case> v = {
@@ -658,8 +831,14 @@ inline void build_components_gallery(lx::ui::draw_scope& s, const tiles& t) {
         v.push_back({"icons", 148, 66, k_editor, build_icons});
         v.push_back({"components_states", 560, 168, k_surface, build_components_states});
         v.push_back({"components_gallery", 420, 316, k_surface, build_components_gallery});
+        v.push_back({"menu_open", 300, 232, k_surface, build_menu_open});
+        v.push_back({"tooltip", 236, 96, k_editor, build_tooltip});
+        v.push_back({"modal", 380, 260, k_surface, build_modal});
+        v.push_back({"toast_stack", 300, 140, k_editor, build_toast_stack});
+        v.push_back({"scroll_area", 212, 152, k_surface, build_scroll_area});
+        v.push_back({"text_input", 260, 96, k_surface, build_text_input});
     } else {
-        std::printf("    SKIP icons, components_*: librsvg or the bundled icons are not available\n");
+        std::printf("    SKIP icons, components_*, menu_open, tooltip, modal, toast_stack, scroll_area, text_input: librsvg or the bundled icons are not available\n");
     }
     return v;
     }();

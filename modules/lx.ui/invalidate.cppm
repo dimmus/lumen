@@ -189,21 +189,21 @@ lx::ui::ui_node* lx::ui::root_of(ui_node& node) {
     return cursor;
 }
 
-void lx::ui::invalidate_paint(ui_node& node) { ui_damage().add(node.bounds()); }
+void lx::ui::invalidate_paint(ui_node& node) { ui_damage().add(surface_rect(node, node.bounds())); }
 
 void lx::ui::invalidate_paint(ui_node& node, lx::rect2i region) {
     lx::rect2i placed = region;
     const lx::rect2i b = node.bounds();
     placed.x += b.x;
     placed.y += b.y;
-    ui_damage().add(placed);
+    ui_damage().add(surface_rect(node, placed));
 }
 
 void lx::ui::invalidate_layout(ui_node& node) {
     node.mark_layout_dirty();
     // Damage the pre-layout bounds now; the post-layout bounds are added by the root
     // after arrange, so a resize repaints both the vacated and the newly covered area.
-    ui_damage().add(node.bounds());
+    ui_damage().add(surface_rect(node, node.bounds()));
     ui_damage().request(invalidation::layout);
 }
 

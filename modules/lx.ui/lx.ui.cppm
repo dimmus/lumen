@@ -48,6 +48,14 @@ export import :interact;
 export import :control;
 export import :components;
 export import :clipboard;
+// ADR-010 §5.6, the rest: overlays laid out against the window and drawn after the tree,
+// scroll areas with Zed's scrollbar, virtualised lists, the text input and its IME interface,
+// menus, popovers, modals and toasts.
+export import :overlay;
+export import :scroll;
+export import :list;
+export import :text_input;
+export import :popups;
 
 export namespace lx::ui {
 // Widget types exported via :widgets partition.

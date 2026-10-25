@@ -478,7 +478,7 @@ void lx::ui::clip_node::emit(draw_scope& out) const {
         ui_node::emit(out);
         return;
     }
-    out.push_clip(bounds());
+    out.push_clip_local(bounds());
     ui_node::emit(out);
     out.pop();
 }

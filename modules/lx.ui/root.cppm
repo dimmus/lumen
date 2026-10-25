@@ -15,9 +15,11 @@ import :events;
 import :focus;
 import :interact;
 import :node;
+import :overlay;
 import :reconcile;
 import :reducer;
 import :invalidate;
+import :text_input;
 import :theme;
 
 export namespace lx::ui {
@@ -28,6 +30,10 @@ using describe_fn = child (*)(build_context& ctx);
 class ui_root {
 public:
     explicit ui_root(lx::runtime::memory_arena& arena);
+    /// Destroys the retained tree: its timers, overlays, focus and hover go with it.
+    ~ui_root();
+    ui_root(const ui_root&) = delete;
+    ui_root& operator=(const ui_root&) = delete;
 
     void set_describer(describe_fn fn);
     void set_bounds(lx::rect2i bounds);
@@ -60,9 +66,16 @@ public:
     /// Falls back to the tree's `on_mouse` when no interactive node is there.
     bool pointer_button(mouse_button b, bool pressed);
     void pointer_leave();
-    /// A key: tab moves the focus, others go to the focused node and its ancestors, then
-    /// to the tree's `on_key`.
+    /// A key: Escape dismisses the topmost overlay that takes it; tab moves the focus, others
+    /// go to the focused node and its ancestors, then to the tree's `on_key`.
     bool key(key_event event);
+    /// A scroll wheel or touchpad axis at the pointer (surface px, positive down / right):
+    /// offered to the node under the pointer and up its ancestors (the scroll areas and
+    /// lists there) until one moves. True when one did.
+    bool pointer_axis(float dx, float dy);
+    /// The focused text field as the input method's target (Phase 4 routes
+    /// `zwp_text_input_v3` here), or null.
+    [[nodiscard]] ime_target* ime() const { return focused_ime_target(focus_); }
 
     /// When the event loop must wake the UI next without input, CLOCK_MONOTONIC ns (a timer
     /// such as a tooltip's hover delay); 0: nothing pending. An animation asks for frames
@@ -105,7 +118,34 @@ private:
 } // namespace lx::ui
 
 
-lx::ui::ui_root::ui_root(lx::runtime::memory_arena& arena) : arena_{&arena} {}
+namespace {
+
+/// The pointer's hit test: the overlays first (topmost down; a modal's scrim blocks the
+/// tree), then the tree.
+lx::ui::ui_node* lx_ui_root_resolve(void*, lx::ui::ui_node* root, lx::point2i at,
+                                    bool interactive) {
+    bool blocked = false;
+    lx::ui::ui_node* hit = lx::ui::ui_overlays().hit(at, interactive, blocked);
+    if (hit || blocked || !root)
+        return hit;
+    return interactive ? lx::ui::hit_interactive(*root, at) : lx::ui::hit_node(*root, at);
+}
+
+} // namespace
+
+lx::ui::ui_root::ui_root(lx::runtime::memory_arena& arena) : arena_{&arena} {
+    pointer_.set_resolver(lx_ui_root_resolve, this);
+}
+
+lx::ui::ui_root::~ui_root() {
+    overlay_layer& overlays = ui_overlays();
+    if (root_) {
+        overlays.set_focus(nullptr);
+        delete root_;
+        root_ = nullptr;
+    }
+    overlays.set_root(nullptr);
+}
 
 void lx::ui::ui_root::set_describer(describe_fn fn) {
     describe_ = fn;
@@ -226,6 +266,9 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
         stage_times_.reconcile += lx_ui_ns_between(rebuild_start, stage_start);
     }
     focus_.set_root(root_);
+    overlay_layer& overlays = ui_overlays();
+    overlays.set_root(root_);
+    overlays.set_focus(&focus_);
 
     if (!root_) {
         // No frame: whatever was asked is still owed.
@@ -238,6 +281,15 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
         // The root is placed at the bounds: only the dirty path is measured and arranged
         // again (ADR-010 §4.7); a clean root at the same bounds is not walked at all.
         root_->place(bounds_);
+        // Then the open overlays, against the window (lx.ui:overlay).
+        overlays.layout(bounds_);
+        if (reducers_pending()) {
+            // The layout moved what a list shows (its viewport, its scroll): its rows are
+            // described now and laid out on this frame, not the next.
+            stage_times_.reducers_rebuilt += rebuild_pending_reducers(ctx, reconciler_);
+            root_->place(bounds_);
+            overlays.layout(bounds_);
+        }
     }
     {
         const auto now = clock::now();
@@ -256,6 +308,8 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
         draws.begin({bounds_.x + bounds_.width, bounds_.y + bounds_.height});
         draw_scope scope_out{draws, bounds_};
         root_->emit(scope_out);
+        // GPUI's deferred draw: the overlays over everything, in the order they opened.
+        overlays.emit(scope_out);
     }
     stage_times_.emit = lx_ui_ns_between(stage_start, clock::now());
     if (lx::trace::timeline_enabled())
@@ -269,16 +323,40 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
 lx::ui::ui_node* lx::ui::ui_root::tree() const { return root_; }
 
 bool lx::ui::ui_root::pointer_move(lx::point2i at) {
+    ui_overlays().set_pointer(at);
     return pointer_.move(root_, at);
 }
 
 bool lx::ui::ui_root::pointer_button(mouse_button b, bool pressed) {
-    if (pointer_.button(root_, b, pressed, &focus_))
+    overlay_layer& overlays = ui_overlays();
+    const lx::point2i at = pointer_.position();
+    // A press outside an overlay dismisses it before anything else sees the press; a
+    // modal's scrim takes it.
+    if (pressed && overlays.press(at))
+        return true;
+    if (pressed && b == mouse_button::right) {
+        // A secondary press: the node under the pointer, then its ancestors (a context
+        // menu's area opens its menu there).
+        pointer_event e{};
+        e.kind = pointer_kind::secondary;
+        e.at = at;
+        e.button = b;
+        e.modifiers = pointer_.modifiers();
+        for (ui_node* n = pointer_.resolve(root_, at, false); n; n = n->parent()) {
+            if (n->on_pointer(e))
+                return true;
+            if (n->has_flag(node_flag::layer))
+                break;
+        }
+    }
+    const bool taken = pointer_.button(root_, b, pressed, &focus_);
+    overlays.after_input();
+    if (taken)
         return true;
     if (!root_)
         return false;
     mouse_event e{};
-    e.position = pointer_.position();
+    e.position = at;
     e.button = b;
     e.pressed = pressed;
     return root_->on_mouse(e);
@@ -286,9 +364,38 @@ bool lx::ui::ui_root::pointer_button(mouse_button b, bool pressed) {
 
 void lx::ui::ui_root::pointer_leave() { pointer_.leave(); }
 
+bool lx::ui::ui_root::pointer_axis(float dx, float dy) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    pointer_event e{};
+    e.kind = pointer_kind::wheel;
+    e.at = pointer_.position();
+    e.dx = dx;
+    e.dy = dy;
+    e.modifiers = pointer_.modifiers();
+    bool moved = false;
+    for (ui_node* n = pointer_.resolve(root_, e.at, false); n; n = n->parent()) {
+        if (n->on_pointer(e)) {
+            moved = true;
+            break;
+        }
+        if (n->has_flag(node_flag::layer))
+            break;
+    }
+    // What is under a still pointer changed: the hover follows.
+    if (moved)
+        (void)pointer_.refresh(root_);
+    return moved;
+}
+
 bool lx::ui::ui_root::key(key_event event) {
     focus_.set_root(root_);
-    if (focus_.handle_key(event))
+    pointer_.set_modifiers(event.modifiers);
+    overlay_layer& overlays = ui_overlays();
+    if (event.pressed && event.key == key::escape && overlays.escape())
+        return true;
+    const bool taken = focus_.handle_key(event);
+    overlays.after_input();
+    if (taken)
         return true;
     return root_ && root_->on_key(event);
 }

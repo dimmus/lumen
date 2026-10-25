@@ -15,7 +15,9 @@ import :focus;
 import :icon;
 import :interact;
 import :node;
+import :overlay;
 import :style;
+import :styled;
 import :text_node;
 import :theme;
 
@@ -182,9 +184,12 @@ public:
     button_builder& tab_index(int i) { tab_index_ = static_cast<std::int16_t>(i); return *this; }
     button_builder& name(const char* a11y) { name_ = a11y; return *this; }
     button_builder& key(element_key k) { key_ = k; return *this; }
+    /// A tooltip after the 500 ms hover delay (`Tooltip::text`).
+    button_builder& tooltip(const char* text) { tooltip_ = text; return *this; }
     operator child() const; // NOLINT(google-explicit-constructor)
 
 private:
+    const char* tooltip_ = nullptr;
     kind kind_ = kind::text;
     const char* label_ = nullptr;
     lx::ui::icon icon_ = lx::ui::icon::circle;
@@ -209,6 +214,16 @@ private:
 
 [[nodiscard]] button_builder button(const char* label);
 [[nodiscard]] button_builder icon_button(icon id);
+
+/// A tooltip (tooltip.rs): an overlay child a control opens at the pointer when its 500 ms
+/// hover delay runs out (the control needs `control_props::hover_intent`; a button's
+/// `.tooltip(text)` sets both) and closes when the hover or a press ends. Zed's
+/// `tooltip_container`: 8 px right of and 10 px below the pointer (`pl_2().pt_2p5()`), an
+/// elevated surface (`elevation_2`: the §5.2 shadows, 1 px `border.variant`; rounded `md`
+/// per §5.5 where Zed rounds `lg`) with `py_1().px_2()`, the title in `text` at
+/// `TextSize::Default` up to `max_w_72` (288 px) wide, the meta line `Small` and muted. It
+/// fades in over 100 ms; the pointer passes through it.
+[[nodiscard]] child tooltip(const char* text, const char* meta = nullptr);
 /// Zed's toggle button (a `ToggleButtonGroup` entry): selected, it takes the tinted accent
 /// style and an accent label; `on_toggle` gets the next state.
 [[nodiscard]] button_builder toggle_button(const char* label);
@@ -753,7 +768,8 @@ lx::ui::button_builder::operator child() const {
         icon_tok = tok::icon_muted; // toggle_button.rs: an unselected entry's icon is muted
     }
 
-    child kids[3]{};
+    c.hover_intent = tooltip_ != nullptr;
+    child kids[4]{};
     unsigned n = 0;
     // toggle_button.rs entries show an `XSmall` icon; a button's icon is its `IconSize`.
     const float icon_px = icon_size_px(toggle ? lx::ui::icon_size::xsmall : icon_size_);
@@ -769,6 +785,8 @@ lx::ui::button_builder::operator child() const {
         kids[n++] = text_child;
     if (icon_child && icon_at_ == icon_position::end)
         kids[n++] = icon_child;
+    if (tooltip_)
+        kids[n++] = lx::ui::tooltip(tooltip_);
     if (toggle) {
         // The entry's content: `h_flex().w_full().px_2().gap_1p5().justify_center()`.
         const child inner = lx_ui_box(lx_ui_h_flex().flex_grow(1.f).px(rems_from_px(8.f))
@@ -781,6 +799,33 @@ lx::ui::button_builder::operator child() const {
 
 lx::ui::button_builder lx::ui::button(const char* label) {
     return button_builder{button_builder::kind::text, label, icon::circle};
+}
+
+lx::ui::child lx::ui::tooltip(const char* text, const char* meta) {
+    overlay_props o{};
+    o.kind = overlay_kind::tooltip;
+    o.hit_through = true;
+    o.dismiss_outside = true;
+    o.dismiss_escape = true;
+    o.fade_ms = static_cast<std::uint16_t>(k_motion_fast_ms);
+    // `div().pl_2().pt_2p5()` around the box, from the pointer.
+    const float rem = lx_ui_rem();
+    o.placement.offset = {static_cast<int>(std::lround(8.f * rem / 16.f)),
+                          static_cast<int>(std::lround(10.f * rem / 16.f))};
+    const style cap = style{}.max_w(rems_from_px(288.f));
+    child rows[2]{};
+    unsigned n = 0;
+    const child title = label(text);
+    rows[n++] = div(cap, {&title, 1u});
+    if (meta) {
+        const child m = label(meta).size(label_size::small).color(tok::text_muted);
+        rows[n++] = div(cap, {&m, 1u});
+    }
+    const child box = div(style{}.flex_col().py(rems_from_px(4.f)).px(rems_from_px(8.f))
+                              .bg(tok::elevated_surface_background).border_1(tok::border_variant)
+                              .rounded(radius::md).shadow(elevation::elevated_surface),
+                          {rows, n});
+    return overlay(o, box);
 }
 
 lx::ui::button_builder lx::ui::icon_button(icon id) {

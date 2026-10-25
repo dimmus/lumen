@@ -27,6 +27,16 @@ enum class role {
     status_bar,
     panel,
     key_shortcut,
+    // ADR-010 §5.6's overlay, scrolling and editing components.
+    menu,
+    menu_item,
+    tooltip,
+    dialog,
+    alert,
+    list,
+    list_item,
+    scroll_area,
+    scrollbar,
 };
 
 enum class state_flag : unsigned {

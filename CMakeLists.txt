@@ -614,7 +614,7 @@ if(LUMEN_BUILD_TESTS)
     # read and written through libpng. LUMEN_UI_GOLDEN_UPDATE=1 rewrites them.
     if(LIBPNG_FOUND)
         add_executable(test_ui_golden tests/test_ui_golden.cpp)
-        target_link_libraries(test_ui_golden PRIVATE lx.ui lx.scene lx.gfx lx.runtime
+        target_link_libraries(test_ui_golden PRIVATE lx.ui lx.scene lx.gfx lx.runtime lx.a11y
             ${LIBPNG_LINK_LIBRARIES})
         lumen_apply_module_properties(test_ui_golden)
         lumen_link_platform(test_ui_golden)
@@ -1248,6 +1248,8 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_ui_components)
     lumen_link_platform(test_ui_components)
     target_include_directories(test_ui_components PRIVATE tests)
+    target_compile_definitions(test_ui_components PRIVATE
+        LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
     add_test(NAME test_ui_components COMMAND test_ui_components)
 
     # lx.layout:flex against Chrome's layout of Taffy's fixtures, and lx.ui's flex container

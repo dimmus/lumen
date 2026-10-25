@@ -951,6 +951,72 @@ describe of the whole unchanged tree 24–40 µs, with 0 allocations and a flat 
 the stage before, interleaved (load 0.8–1.6): S2 tick p50 12.9–14.3 vs 13.2–14.1 µs, S3
 layout p50 134–145 vs 143–150 µs, S4 within the host's bimodal noise both ways.
 
+As built (overlays, scrolling, lists, text input and the rest of §5.6): `lx.ui:overlay` is
+GPUI's deferred draw on the retained tree. An `overlay_node` sits anywhere in the tree,
+zero-size and absolute in the flow; while open it is registered with the UI thread's
+`overlay_layer` (16 slots, `overflow_action::reject`), which after the tree's layout measures
+its content against the window less an 8 px margin, places it beside its anchor — the overlay
+node's parent, a surface point or the window — with GPUI's anchored rules (flip to the other
+side, hang from the anchor's other end, then shift inside the margin: `place_overlay`), and
+emits it after the tree so the overlap grid orders it above what it covers. The pointer tests
+overlays first, topmost first (`pointer_state`'s resolver), a modal's scrim blocking the
+tree; a press outside an overlay dismisses it top down (a press on a popover's trigger is the
+trigger's), Escape the topmost, an activated menu item its menu chain; modals and menus trap
+the focus (stage 3's traps) and give it back. Opening is a prop edge (`open`, with
+`on_dismiss` telling the app) or the node's own (`open_at`: a tooltip, a context menu, a
+submenu). `node_flag::layer` makes the content's bounds surface coordinates.
+
+Viewports: `ui_node::child_viewport` (offset and clip per child), with `surface_rect` /
+`local_point` mapping a node's rect or a surface point through every viewport above it —
+damage, hover and hit tests, the IME's cursor rectangle and the magnifier all go through it,
+and a tree without a viewport maps nothing (a live-viewport count; `sizeof(ui_node)` stays
+80, S2's solve and tick unchanged: cold 66 µs, warm 1.1 µs, leaf 6.9 µs p50). A node clipping
+to its bounds pushes `draw_scope::push_clip_local` (offset by the origin; `push_clip` stays
+absolute). `lx.ui:scroll`'s `scroll_area` lays its content out once at full size and draws
+it under the offset: a wheel or a thumb drag measures and arranges nothing and damages the
+viewport (`test_ui_components`: 0 measures, 0 arranges, damage = the viewport). Its
+scrollbar is Zed's `ScrollbarStyle::Regular` (scrollbar.rs at a5c4ca8: 6 px thumb, 4 px
+padding, 14 px strip, 25 px minimum thumb, `thumb_ranges`' placement, track click centring
+the thumb), in the §5.1 tokens; it shows whenever the content overflows (no autohide).
+`lx.ui:list` holds rows of one fixed height — Zed's `ListItem` spacing: dense 23 px (a 14 px
+label on the φ line), extra dense 21, sparse 31 — in chunks of 16 under a reducer host:
+up to 100 rows all exist; past that only the chunks covering the visible rows ± 8 do, in a
+fixed pool where chunk k is slot k mod the pool size, so a scroll re-describes a chunk in
+place and never creates a node (10 000 rows in a 400 px viewport: 48 rows live, 152 nodes in
+the tree; scrolling 2 rows a frame after a warm-up pass, tick p50 15 µs / p95 88 µs with a
+chunk re-described every ~8 frames, 0 allocations, the node count constant). `ui_root`
+rebuilds what its own layout asked for (a list whose viewport moved) and lays out again on
+the same frame. Selection (`ghost_element.selected`) and the list's focus ring are separate;
+up / down / home / end / page keys move the selection into view, enter activates. S5's
+property holds: the pointer moving one row per frame over a 1 000-row list damages one or
+two rects (the two rows, merged when adjacent), measures and arranges nothing (tick p50
+13.6 µs).
+
+`lx.ui:text_input` edits a fixed buffer (the app's `text_buffer`, or 1 KiB of its own) with
+`overflow_action` at the capacity, through a `text_block_node` it owns: carets on lx.text's
+grapheme boundaries (a ZWJ family is one step and one backspace), left / right following the
+paragraph direction with the caret where `text_layout::caret` puts it (an Arabic field's
+caret starts at the right and moves left), word jumps, home / end, shift and pointer
+selection (double and triple clicks), backspace / delete, `clipboard::global()` for ctrl+c / x
+/ v, a 500 ms blink on a UI timer that stops with the focus, horizontal scrolling by origin.
+`ime_target` is the interface text-input-v3 will drive: one `ime_update` per `done` applied in
+the protocol's order (delete surrounding, commit, preedit), the preedit shown underlined at
+the caret with its own cursor, `ime_query` for the surrounding text and the cursor rectangle;
+`ui_root::ime()` is the focused field. Typing and deleting allocate nothing.
+`lx.ui:popups` builds menus (Zed's `ContextMenu`: inset dense items with an icon, label and
+key binding, separators, headers, disabled items, toggles, one-level submenus opened by
+click or right arrow), `popover_menu`, `context_menu`, `modal` (the modal-surface box rounded
+`lg`, 5 rem from the top over a scrim of `elevated_surface.background` at 80 %, Zed's modal
+layer) and toasts (Zed's status toast with GPUI's `shadow_lg`, stacked at the bottom,
+dismissing themselves after 10 s, paused on hover); `button(…).tooltip(text)` is Zed's
+tooltip (500 ms, at the pointer + (8, 10), 100 ms fade). Departures: overlay radii follow §5.5
+(`md`) where Zed's `elevation_2` rounds `lg`; the scrollbar thumb carries the theme's border
+token; submenus open on a click or key, not on hover. Measured (`test_ui_components`, load
+0.3–0.6): a frame with a menu open ticks in 4.5 µs p50 (repaint, hover, arrow keys) with 0
+allocations, an idle one is no frame; a tooltip's fade is 6 frames; the six new golden images
+(`menu_open`, `tooltip`, `modal`, `toast_stack`, `scroll_area`, `text_input`) are within
+1/255 of the CPU reference on GL and 2/255 of CPU and GL on Vulkan (lavapipe).
+
 ### Phase 4 — The client runtime (≈3 weeks)
 
 - `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,

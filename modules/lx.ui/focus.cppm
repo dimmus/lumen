@@ -308,7 +308,8 @@ void lx::ui::focus_manager::set_focus(ui_node* node, bool ring) {
         node->set_flag(node_flag::focused, true);
         node->set_flag(node_flag::focus_ring, ring_);
         node->on_interaction_changed();
-        notify_compositor_magnifier(node->bounds());
+        // Where the node shows (inside a scrolled viewport that is not its layout place).
+        notify_compositor_magnifier(surface_rect(*node, node->bounds()));
     }
 }
 

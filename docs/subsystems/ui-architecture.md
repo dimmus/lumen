@@ -241,6 +241,40 @@ once by librsvg into the atlas's R8 pages and drawn as `mono_sprite`s tinted wit
 `icon.*` token (`icon_view`, `icon_cache`). A miss rasterises at once on the UI thread, or on
 the worker with `icon_cache::set_async`, the icon then appearing on the frame after it lands.
 
+### Overlays, scrolling, lists and text (ADR-010 §5.6)
+
+- **Overlays** (`lx.ui:overlay`): GPUI's deferred draw. An `overlay_node` is a zero-size,
+  absolute item anywhere in the tree; while open, the UI thread's `overlay_layer` (16 slots,
+  `overflow_action::reject`) lays its one child out against the window after the tree's
+  layout, beside an anchor (the overlay node's parent, a surface point, the window) with
+  GPUI's anchored rules (`place_overlay`: flip, hang from the anchor's other end, shift 8 px
+  inside the window), and emits it after the tree. Overlays are hit-tested first (a modal's
+  scrim blocks the tree); a press outside dismisses one, Escape the topmost, an activated
+  menu item its menu chain; modals and menus trap the focus while open. `open` in the props
+  opens and closes on its edges (`on_dismiss` tells the app a user closed it); `open_at`
+  opens one from the node itself (a tooltip, a context menu, a submenu). The content's bounds
+  are surface coordinates (`node_flag::layer`).
+- **Viewports**: a node may draw a child translated and clipped (`child_viewport`: a scroll
+  offset). `surface_rect`, `surface_bounds` and `local_point` map through every viewport above
+  a node; damage, hit tests, pointer events and the IME's cursor rectangle use them. A scroll
+  (`scroll_area`, `list`) changes the offset only: no measure, no arrange, the viewport
+  repainted. Nodes that clip to their bounds use `draw_scope::push_clip_local`.
+- **Pointer events** (`ui_node::on_pointer`): press, drag and release go to the pressed
+  interactive node (a scrollbar thumb, a text selection; double and triple presses counted),
+  wheel and secondary presses to the node under the pointer and up its ancestors
+  (`ui_root::pointer_axis`, a context menu's area).
+- **Lists** (`lx.ui:list`): rows of one height (Zed's `ListItem` spacing), described by the
+  app's row function, in 16-row chunks under a reducer host; past 100 rows only the chunks
+  near the viewport exist, in a fixed pool recycled in place as it scrolls (no node created
+  or destroyed). The list has one tab stop and moves its selection (`ghost_element.selected`)
+  with the arrow, page, home and end keys; the selection and the focus ring are separate.
+- **Text input** (`lx.ui:text_input`): single-line editing on `lx.text`'s grapheme
+  boundaries and bidi-correct carets in a fixed buffer, with `ime_target` — the
+  preedit / commit / delete-surrounding interface text-input-v3 drives — and a caret blink on
+  a timer that stops with the focus.
+- **Menus, modals, toasts, tooltips** (`lx.ui:popups`, `button(…).tooltip(…)`): Zed's
+  `ContextMenu`, `PopoverMenu`, modal layer, status toast and tooltip on overlays.
+
 ---
 
 ## 5. Layout
@@ -367,6 +401,10 @@ Two deliberate differences from the model this was adapted from:
   whose own pixels did not change. A paint-only change (a hover, a colour) damages the node's
   bounds from `apply` or `on_interaction_changed`.
 
+Inside a scrolled viewport a node's bounds are where it is laid out, not where it shows: every
+damage call maps the region through the viewports above the node (`surface_rect`), clipped
+to them. A tree without a viewport maps nothing.
+
 Merged regions are what should feed `kms_damage_region` on the atomic commit path.
 
 ---
@@ -393,7 +431,10 @@ The declarative core (`:element`, `:node`, `:invalidate`, `:reconcile`, `:decora
 `:reducer`) is in place and covered by `tests/test_ui_reconcile.cpp`. Focus, pointer state,
 motion, reducers wired into the root and the first components (`:focus`, `:interact`,
 `:control`, `:components`) are covered by `tests/test_ui_components.cpp` and the
-`components_states` / `components_gallery` golden images. Flex layout (`:flex`)
+`components_states` / `components_gallery` golden images; overlays, scroll areas, lists, the
+text input and the menus, modals, toasts and tooltips (`:overlay`, `:scroll`, `:list`,
+`:text_input`, `:popups`) by the same test and the `menu_open`, `tooltip`, `modal`,
+`toast_stack`, `scroll_area` and `text_input` golden images. Flex layout (`:flex`)
 is covered by `tests/test_layout_flex.cpp`; styles, themes, styled boxes and icons
 (`:style`, `:theme`, `:theme.compile`, `:styled`, `:icon`) by `tests/test_ui_theme.cpp` and
 the `styled_surfaces` / `icons` golden images. The old string-keyed `style_ref` survives only
@@ -412,11 +453,9 @@ callers compile. It is superseded and should not gain new widgets:
 
 Still to build:
 
-- The rest of ADR-010 §5.6 (`text_input`, `list` + `list_item`, `scroll_area`, `tooltip`,
-  `popover_menu`, `context_menu`, `modal`, `toast`) on `control_node`, the focus traps and
-  the timers above
+- Driving `ime_target` from `zwp_text_input_v3` and the clipboard from `wl_data_device`
+  (ADR-010 Phase 4)
 - Grid containers (flex is `lx.ui:flex`, which reads `grow_node::grow_factor()`)
-- Overlay layers (dialog, popover) that defer show/close to the next frame
 - Feeding merged damage into `kms_damage_region`
 - A design-system layer (shell chrome: scaffold, rows, toolbars) as a separate module
   above `lx.ui`, keeping primitives and opinionated components apart

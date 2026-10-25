@@ -597,7 +597,7 @@ void lx::ui::icon_node::emit(draw_scope& out) const {
     if (!visible_ || !cache_ || color_.a <= 0.f)
         return;
     lx::gfx::atlas_tile tile{};
-    if (!cache_->place(id_, device_px_, tile, bounds_))
+    if (!cache_->place(id_, device_px_, tile, surface_rect(*this, bounds_)))
         return;
     const int s = static_cast<int>(device_px_);
     const lx::rect2i at{bounds_.x + (bounds_.width - s) / 2, bounds_.y + (bounds_.height - s) / 2, s, s};

@@ -71,6 +71,9 @@ public:
     }
 
     [[nodiscard]] const element** alloc_children(unsigned count);
+    /// `count` bytes of the frame arena (text a description formats: a list row's label).
+    /// Null once the arena is exhausted.
+    [[nodiscard]] char* alloc_chars(unsigned count);
 
     /// True when any allocation failed this frame; the caller should keep the previous
     /// retained tree instead of reconciling against a truncated description.
@@ -89,6 +92,22 @@ private:
     lx::runtime::memory_arena* arena_ = nullptr;
     bool overflowed_ = false;
 };
+
+/// `fmt` formatted into the current build's frame arena, NUL-terminated: text that lives
+/// as long as the description (a label copies it when applied). "" outside a build or once
+/// the arena is exhausted. No heap allocation.
+template<typename... Args>
+[[nodiscard]] const char* frame_format(std::format_string<Args...> fmt, Args&&... args) {
+    build_context* ctx = build_context::current();
+    if (!ctx)
+        return "";
+    const std::size_t n = std::formatted_size(fmt, std::forward<Args>(args)...);
+    char* out = ctx->alloc_chars(static_cast<unsigned>(n + 1));
+    if (!out)
+        return "";
+    *std::format_to_n(out, static_cast<std::ptrdiff_t>(n), fmt, std::forward<Args>(args)...).out = '\0';
+    return out;
+}
 
 /// Sets the current build context for one rebuild and restores the previous one.
 class build_scope {
@@ -133,6 +152,15 @@ const lx::ui::element** lx::ui::build_context::alloc_children(unsigned count) {
     for (unsigned i = 0; i < count; ++i)
         slots[i] = nullptr;
     return slots;
+}
+
+char* lx::ui::build_context::alloc_chars(unsigned count) {
+    void* raw = arena_ && count ? arena_->allocate(count, 1) : nullptr;
+    if (!raw) {
+        note_overflow();
+        return nullptr;
+    }
+    return static_cast<char*>(raw);
 }
 
 bool lx::ui::build_context::overflowed() const { return overflowed_; }

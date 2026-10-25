@@ -17,6 +17,7 @@ import :icon;
 import :interact;
 import :invalidate;
 import :node;
+import :overlay;
 import :style;
 import :text_node;
 import :theme;
@@ -43,6 +44,12 @@ import :theme;
 // Resolution happens in `apply`, against the active theme (a new theme or density describes
 // again): the three boxes are packed once (`pack_quad_style`), `emit` copies one. A state
 // change repaints the node's bounds and nothing else; it allocates nothing.
+//
+// Overlays a control owns (lx.ui:overlay): a tooltip child opens at the pointer when the
+// hover-intent timer fires and closes when the hover or a press ends; a menu child is a
+// submenu — activating the control (a click, space, enter) or the right arrow opens it
+// instead of calling `on_activate`. Every activation is reported to the overlay layer, which
+// closes the menu chain an activated item is in.
 
 export namespace lx::ui {
 
@@ -154,6 +161,10 @@ public:
     [[nodiscard]] int focus_order() const override { return tab_index_; }
     bool on_focus_key(key_event event, focus_manager& focus) override;
     bool activate() override;
+    /// The hover-intent delay ran out: a tooltip child opens.
+    void on_timer(std::uint32_t tag) override;
+    /// Damages the bounds; a hover or press ending closes a tooltip child.
+    void on_interaction_changed() override;
     [[nodiscard]] a11y::node accessibility_node() const override;
 
     /// Which box `emit` paints now: 0 rest, 1 hover, 2 pressed.
@@ -471,7 +482,7 @@ void lx::ui::control_node::emit(draw_scope& out) const {
     const bool clip = flex_.overflow_x != lx::layout::overflow::visible ||
                       flex_.overflow_y != lx::layout::overflow::visible;
     if (clip)
-        out.push_clip(bounds_);
+        out.push_clip_local(bounds_);
     ui_node::emit(out);
     if (clip)
         out.pop();
@@ -487,6 +498,11 @@ bool lx::ui::control_node::on_focus_key(key_event event, focus_manager& focus) {
     if (has_flag(node_flag::interactive) && has_flag(node_flag::focused) &&
         (event.key == key::space || event.key == key::enter))
         return activate();
+    // A submenu's item: the right arrow opens it (the layer traps the focus in it).
+    if (event.key == key::right && has_flag(node_flag::focused) &&
+        !has_flag(node_flag::disabled))
+        if (overlay_node* sub = child_overlay(*this, overlay_kind::menu))
+            return sub->open();
     if (nav_ == nav_axis::none)
         return false;
     const bool h = nav_ == nav_axis::horizontal || nav_ == nav_axis::both;
@@ -513,9 +529,28 @@ bool lx::ui::control_node::activate() {
     if (!has_flag(node_flag::interactive) || has_flag(node_flag::disabled))
         return false;
     ++activations_;
+    ui_overlays().note_activation(*this);
+    if (overlay_node* sub = child_overlay(*this, overlay_kind::menu)) {
+        (void)sub->open();
+        return true;
+    }
     if (on_activate_)
         on_activate_(value_);
     return true;
+}
+
+void lx::ui::control_node::on_timer(std::uint32_t tag) {
+    if (tag != k_timer_hover_intent || !has_flag(node_flag::hovered))
+        return;
+    if (overlay_node* tip = child_overlay(*this, overlay_kind::tooltip))
+        (void)tip->open_at(ui_overlays().pointer());
+}
+
+void lx::ui::control_node::on_interaction_changed() {
+    if (!has_flag(node_flag::hovered) || has_flag(node_flag::pressed))
+        if (overlay_node* tip = child_overlay(*this, overlay_kind::tooltip))
+            tip->close();
+    ui_node::on_interaction_changed();
 }
 
 lx::a11y::node lx::ui::control_node::accessibility_node() const {

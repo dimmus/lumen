@@ -284,7 +284,7 @@ void lx::ui::styled_node::emit(draw_scope& out) const {
     const bool clip = flex_.overflow_x != lx::layout::overflow::visible ||
                       flex_.overflow_y != lx::layout::overflow::visible;
     if (clip)
-        out.push_clip(bounds_);
+        out.push_clip_local(bounds_);
     ui_node::emit(out);
     if (clip)
         out.pop();
