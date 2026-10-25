@@ -8,6 +8,8 @@ module;
 #include <hb-ft.h>
 #include <hb.h>
 #endif
+#include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -49,6 +51,19 @@ export namespace lx::text {
 // `lx.ui:text_node`), the worker's shape pass holds it for tens of milliseconds: it checks
 // `contended()` between paragraphs and lets a waiter (the UI thread rasterising a glyph) in. The
 // process-wide `shared()` cache also guards `shape_cache::shared()` (see `:shape`).
+//
+// Persisted matches (`persist_matches`). fontconfig parses its configuration and loads its
+// caches before its first answer — 15–40 ms, paid by the first title bar or panel paint of a
+// run. A cache that persists keeps every (family, weight, style) → file answer in a file, and
+// a later run loads a face it finds there with FreeType alone: fontconfig is started only for
+// an answer the file does not have, or a fallback search (a character the face lacks). The
+// file is trusted only while everything an answer depends on is as it was when it was written:
+// fontconfig's version, the program, the environment fontconfig reads, the bundled directory
+// and the fallback families (a hash in the header), and — by inode, size, mtime and ctime —
+// fontconfig's configuration files and their directories, its font directories, the user's
+// configuration paths (absent ones too: creating one changes answers), the bundled font tree
+// and the faces' files. Anything else and every stored answer is dropped (fontconfig is
+// asked, and the file rewritten).
 
 enum class weight { normal, bold };
 enum class style { normal, italic };
@@ -129,12 +144,40 @@ struct face_cache_stats {
     std::uint64_t failures = 0;
     /// FT_Set_Char_Size calls (a use at a size other than the face's current one).
     std::uint64_t size_changes = 0;
+    /// Faces loaded from persisted matches (`persist_matches`): no fontconfig match.
+    std::uint64_t stored_hits = 0;
+    /// fontconfig was started (its configuration loaded) by this cache.
+    bool fontconfig_started = false;
     /// `fallback_locked` searches (each a fontconfig match over the charset).
     std::uint64_t fallback_searches = 0;
     /// Searches that found no scalable face with the character.
     std::uint64_t fallback_failures = 0;
     unsigned live = 0;
 };
+
+/// One persisted answer (`persist_matches`): what was asked and the face fontconfig chose.
+struct font_match {
+    std::string family;
+    weight weight = weight::normal;
+    style style = style::normal;
+    std::string file;
+    int index = 0;
+    /// FC_FAMILY of the match (`face_info::family`).
+    std::string matched_family;
+};
+
+/// The matches stored in `path` by `write_font_matches` with the same `inputs`, provided
+/// every path it watched is as it was then: the same inode, size, modification and change
+/// time, or still absent. False, and nothing, otherwise: no such file, another `inputs`, a
+/// watched path that changed, or not a match file.
+[[nodiscard]] bool read_font_matches(const char* path, std::uint64_t inputs,
+                                     std::vector<font_match>& out);
+/// Stores `matches` in `path` (replaced atomically; missing directories made, 0700), with
+/// `inputs` and what each of `watched` is now. False when it cannot be written, or a path or
+/// a family holds a tab or a newline.
+[[nodiscard]] bool write_font_matches(const char* path, std::uint64_t inputs,
+                                      std::span<const std::string> watched,
+                                      std::span<const font_match> matches);
 
 class face_cache {
 public:
@@ -200,8 +243,15 @@ public:
     /// Registers one more directory of fonts with this cache's fontconfig configuration,
     /// beside the bundled one (tests register tests/fonts this way). Families resolved
     /// afterwards may come from it; faces already loaded stay. False when the directory does
-    /// not exist or fontconfig refuses it. Takes the lock.
+    /// not exist or fontconfig refuses it. Takes the lock. Stops persisting matches: they
+    /// would no longer be fontconfig's answers without it.
     [[nodiscard]] bool add_font_dir(const char* dir);
+
+    /// Keeps fontconfig's answers in `path` and answers from there what it answered before
+    /// (see "Persisted matches" above). Null or empty: `$XDG_CACHE_HOME/lumen/fonts-<program>`
+    /// (`~/.cache` when unset; nothing when neither is known). Call before the first
+    /// resolution; takes the lock.
+    void persist_matches(const char* path = nullptr);
 
 private:
     face_cache(const char* font_dir, bool is_shared);
@@ -227,7 +277,17 @@ private:
         char file[k_face_path_bytes]{};
     };
 
+    /// FreeType and the bundled directory's path: all a persisted answer needs.
+    bool init_ft_locked();
+    /// fontconfig too (its configuration, the bundled directory registered).
     bool init_locked();
+    /// The persisted answer for (family, weight, style); the file is read on first use.
+    [[nodiscard]] const font_match* stored_locked(const char* family, weight w, style s);
+    /// Adds fontconfig's answer to the persisted ones and rewrites the file.
+    void remember_locked(const char* family, weight w, style s, const char* file, int index,
+                         const char* matched_family);
+    /// What the persisted answers depend on besides the watched paths.
+    [[nodiscard]] std::uint64_t store_inputs_locked() const;
     void release_locked(slot& s);
     /// The least recently used slot (or a free one).
     [[nodiscard]] unsigned victim_locked() const;
@@ -241,7 +301,15 @@ private:
     std::atomic<unsigned> waiting_{0};
     void* library_ = nullptr; ///< FT_Library
     void* config_ = nullptr;  ///< FcConfig*
+    bool ft_attempted_ = false;
     bool init_attempted_ = false;
+    /// `persist_matches`: the file (empty: none), whether it was read, what it held (and
+    /// what fontconfig answered since).
+    std::string store_path_{};
+    bool store_read_ = false;
+    std::vector<font_match> stored_{};
+    /// The bundled directory chosen (`init_ft_locked`), registered or not.
+    char candidate_dir_[k_face_path_bytes]{};
     bool is_shared_ = false;
     std::uint32_t serial_ = 0;
     std::uint64_t clock_ = 0;
@@ -344,31 +412,27 @@ lx::text::face_cache::~face_cache() {
 #endif
 }
 
-bool lx::text::face_cache::init_locked() {
-    if (init_attempted_)
-        return library_ && config_;
-    init_attempted_ = true;
+bool lx::text::face_cache::init_ft_locked() {
+    if (ft_attempted_)
+        return library_ != nullptr;
+    ft_attempted_ = true;
 #if defined(LUMEN_HAS_TEXT)
     FT_Library lib = nullptr;
     if (FT_Init_FreeType(&lib) != 0)
         return false;
     library_ = lib;
-    FcConfig* config = FcInitLoadConfigAndFonts();
-    if (!config)
-        return false;
-    config_ = config;
 
     // The bundled fonts' directory: the override, else the first of the build tree, a
     // relocated install (next to the executable) and the configured install that exists.
-    char candidate[k_face_path_bytes]{};
+    char* const candidate = candidate_dir_;
     if (dir_given_) {
-        copy_cut(candidate, sizeof(candidate), requested_dir_);
+        copy_cut(candidate, k_face_path_bytes, requested_dir_);
     } else if (const char* env = ::getenv("LUMEN_FONT_DIR"); env && env[0]) {
-        copy_cut(candidate, sizeof(candidate), env);
+        copy_cut(candidate, k_face_path_bytes, env);
     } else {
 #if defined(LUMEN_FONT_DIR_BUILD)
         if (is_dir(LUMEN_FONT_DIR_BUILD))
-            copy_cut(candidate, sizeof(candidate), LUMEN_FONT_DIR_BUILD);
+            copy_cut(candidate, k_face_path_bytes, LUMEN_FONT_DIR_BUILD);
 #endif
 #if defined(LUMEN_FONT_DIR_INSTALL_RELATIVE)
         if (!candidate[0]) {
@@ -384,18 +448,36 @@ bool lx::text::face_cache::init_locked() {
                 const int w = std::snprintf(rel, sizeof(rel), "%s/%s", exe,
                                             LUMEN_FONT_DIR_INSTALL_RELATIVE);
                 if (w > 0 && static_cast<std::size_t>(w) < sizeof(rel) && is_dir(rel))
-                    copy_cut(candidate, sizeof(candidate), rel);
+                    copy_cut(candidate, k_face_path_bytes, rel);
             }
         }
 #endif
 #if defined(LUMEN_FONT_DIR_INSTALL)
         if (!candidate[0] && is_dir(LUMEN_FONT_DIR_INSTALL))
-            copy_cut(candidate, sizeof(candidate), LUMEN_FONT_DIR_INSTALL);
+            copy_cut(candidate, k_face_path_bytes, LUMEN_FONT_DIR_INSTALL);
 #endif
     }
-    if (is_dir(candidate) &&
-        FcConfigAppFontAddDir(config, reinterpret_cast<const FcChar8*>(candidate)))
-        copy_cut(font_dir_, sizeof(font_dir_), candidate);
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool lx::text::face_cache::init_locked() {
+    if (init_attempted_)
+        return library_ && config_;
+    if (!init_ft_locked())
+        return false;
+    init_attempted_ = true;
+#if defined(LUMEN_HAS_TEXT)
+    FcConfig* config = FcInitLoadConfigAndFonts();
+    if (!config)
+        return false;
+    config_ = config;
+    stats_.fontconfig_started = true;
+    if (is_dir(candidate_dir_) &&
+        FcConfigAppFontAddDir(config, reinterpret_cast<const FcChar8*>(candidate_dir_)))
+        copy_cut(font_dir_, sizeof(font_dir_), candidate_dir_);
     return true;
 #else
     return false;
@@ -453,6 +535,19 @@ lx::text::face_id lx::text::face_cache::resolve_locked(const char* family_in, we
         }
     }
 #if defined(LUMEN_HAS_TEXT)
+    // A persisted answer needs FreeType only; one whose file no longer loads (it went between
+    // the check and now) is asked of fontconfig after all.
+    if (!init_ft_locked()) {
+        ++stats_.failures;
+        return {};
+    }
+    if (const font_match* m = stored_locked(family, w, st)) {
+        if (const slot* e = load_locked(victim_locked(), key, family, m->file.c_str(), m->index,
+                                        m->matched_family.c_str(), w, st, false)) {
+            ++stats_.stored_hits;
+            return {e->id};
+        }
+    }
     if (!init_locked()) {
         ++stats_.failures;
         return {};
@@ -497,6 +592,8 @@ lx::text::face_id lx::text::face_cache::resolve_locked(const char* family_in, we
         ++stats_.failures;
         return {};
     }
+    if (!store_path_.empty())
+        remember_locked(family, w, st, file, face_index, matched_family);
     return {e->id};
 #else
     ++stats_.failures;
@@ -788,6 +885,10 @@ bool lx::text::face_cache::add_font_dir(const char* dir) {
 #if defined(LUMEN_HAS_TEXT)
     if (!is_dir(dir) || !init_locked())
         return false;
+    // fontconfig answers with the directory from here on; the persisted answers were
+    // without it.
+    store_path_.clear();
+    stored_.clear();
     return FcConfigAppFontAddDir(static_cast<FcConfig*>(config_),
                                  reinterpret_cast<const FcChar8*>(dir)) != 0;
 #else
@@ -800,4 +901,267 @@ const char* lx::text::face_cache::font_dir() {
     std::lock_guard lock{mutex_};
     (void)init_locked();
     return font_dir_;
+}
+
+// ── Persisted matches ─────────────────────────────────────────────────────────
+
+namespace {
+
+/// "ino size mtime ctime" of `path` now (nanoseconds), or "-" when it is not there.
+std::string path_identity(const std::string& path) {
+    struct stat st{};
+    if (::stat(path.c_str(), &st) != 0)
+        return "-";
+    char line[96];
+    std::snprintf(line, sizeof line, "%llu %lld %lld %lld",
+                  static_cast<unsigned long long>(st.st_ino), static_cast<long long>(st.st_size),
+                  static_cast<long long>(st.st_mtim.tv_sec) * 1'000'000'000ll + st.st_mtim.tv_nsec,
+                  static_cast<long long>(st.st_ctim.tv_sec) * 1'000'000'000ll + st.st_ctim.tv_nsec);
+    return line;
+}
+
+/// Bumped when what an answer means changes (the match pattern built in `resolve_locked`).
+constexpr std::string_view k_match_magic = "lumen-font-matches 2 ";
+
+std::string match_header(std::uint64_t inputs) {
+    char header[64];
+    std::snprintf(header, sizeof header, "%.*s%016llx\n", static_cast<int>(k_match_magic.size()),
+                  k_match_magic.data(), static_cast<unsigned long long>(inputs));
+    return header;
+}
+
+} // namespace
+
+bool lx::text::read_font_matches(const char* path, std::uint64_t inputs,
+                                 std::vector<font_match>& out) {
+    out.clear();
+    if (!path || !path[0])
+        return false;
+    const int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return false;
+    std::string text;
+    char chunk[4096];
+    for (ssize_t n; (n = ::read(fd, chunk, sizeof chunk)) > 0 && text.size() < (1u << 20);)
+        text.append(chunk, static_cast<std::size_t>(n));
+    ::close(fd);
+    const std::string header = match_header(inputs);
+    if (!text.starts_with(header))
+        return false;
+    std::string_view rest{text};
+    rest.remove_prefix(header.size());
+    const auto fail = [&out] {
+        out.clear();
+        return false;
+    };
+    while (!rest.empty()) {
+        const std::size_t end = rest.find('\n');
+        if (end == std::string_view::npos)
+            return fail(); // cut short
+        const std::string_view line = rest.substr(0, end);
+        rest.remove_prefix(end + 1);
+        if (line.starts_with("w ")) {
+            // "w <identity>\t<path>": the identity is "-" or four numbers.
+            const std::string_view body = line.substr(2);
+            const std::size_t tab = body.find('\t');
+            if (tab == std::string_view::npos)
+                return fail();
+            if (path_identity(std::string{body.substr(tab + 1)}) != body.substr(0, tab))
+                return fail(); // changed since: fontconfig could answer differently
+        } else if (line.starts_with("m ")) {
+            // "m <weight> <style> <index> <family>\t<file>\t<matched family>"
+            std::string_view body = line.substr(2);
+            int nums[3]{};
+            for (int& v : nums) {
+                const auto r = std::from_chars(body.data(), body.data() + body.size(), v);
+                if (r.ec != std::errc{} || r.ptr == body.data() + body.size() || *r.ptr != ' ')
+                    return fail();
+                body.remove_prefix(static_cast<std::size_t>(r.ptr - body.data()) + 1);
+            }
+            const std::size_t t1 = body.find('\t');
+            const std::size_t t2 = t1 == std::string_view::npos ? t1 : body.find('\t', t1 + 1);
+            if (t2 == std::string_view::npos || nums[0] < 0 || nums[0] > 1 || nums[1] < 0 ||
+                nums[1] > 1 || nums[2] < 0 || t1 == 0 || t2 == t1 + 1)
+                return fail();
+            out.push_back({std::string{body.substr(0, t1)},
+                           nums[0] ? weight::bold : weight::normal,
+                           nums[1] ? style::italic : style::normal,
+                           std::string{body.substr(t1 + 1, t2 - t1 - 1)}, nums[2],
+                           std::string{body.substr(t2 + 1)}});
+        } else {
+            return fail();
+        }
+    }
+    return true;
+}
+
+bool lx::text::write_font_matches(const char* path, std::uint64_t inputs,
+                                  std::span<const std::string> watched,
+                                  std::span<const font_match> matches) {
+    if (!path || path[0] != '/')
+        return false;
+    const auto clean = [](std::string_view s) { return s.find_first_of("\t\n") == s.npos; };
+    std::string text = match_header(inputs);
+    for (const std::string& w : watched) {
+        if (w.empty() || !clean(w))
+            return false;
+        text += "w " + path_identity(w) + '\t' + w + '\n';
+    }
+    for (const font_match& m : matches) {
+        if (m.family.empty() || m.file.empty() || !clean(m.family) || !clean(m.file) ||
+            !clean(m.matched_family))
+            return false;
+        char nums[48];
+        std::snprintf(nums, sizeof nums, "m %d %d %d ", m.weight == weight::bold ? 1 : 0,
+                      m.style == style::italic ? 1 : 0, m.index);
+        text += nums + m.family + '\t' + m.file + '\t' + m.matched_family + '\n';
+    }
+    // mkdir -p of the directories above the file; one that fails fails the open below.
+    const std::string p{path};
+    for (std::size_t slash = p.find('/', 1); slash != std::string::npos;
+         slash = p.find('/', slash + 1))
+        (void)::mkdir(p.substr(0, slash).c_str(), 0700);
+    const std::string tmp = p + ".tmp" + std::to_string(::getpid());
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return false;
+    const bool ok = ::write(fd, text.data(), text.size()) == static_cast<ssize_t>(text.size());
+    ::close(fd);
+    // Atomic: a reader sees the old file, no file, or the whole new one.
+    if (!ok || ::rename(tmp.c_str(), path) != 0) {
+        (void)::unlink(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
+void lx::text::face_cache::persist_matches(const char* path) {
+    std::lock_guard lock{mutex_};
+    store_read_ = false;
+    stored_.clear();
+    if (path && path[0]) {
+        store_path_ = path;
+        return;
+    }
+    store_path_.clear();
+#if defined(__GLIBC__)
+    const char* program = program_invocation_short_name;
+#else
+    const char* program = "lumen";
+#endif
+    if (const char* x = ::getenv("XDG_CACHE_HOME"); x && x[0] == '/')
+        store_path_ = std::string{x} + "/lumen/fonts-" + program;
+    else if (const char* h = ::getenv("HOME"); h && h[0] == '/')
+        store_path_ = std::string{h} + "/.cache/lumen/fonts-" + program;
+}
+
+std::uint64_t lx::text::face_cache::store_inputs_locked() const {
+    std::uint64_t h = k_fnv_offset;
+    const auto mix = [&h](std::string_view s) {
+        for (const char c : s)
+            h = (h ^ static_cast<unsigned char>(c)) * k_fnv_prime;
+        h = (h ^ 0xFFu) * k_fnv_prime; // separator: ("ab","c") is not ("a","bc")
+    };
+#if defined(LUMEN_HAS_TEXT)
+    char version[16];
+    std::snprintf(version, sizeof version, "%d", FcGetVersion());
+    mix(version);
+    // What each request is matched with besides its family.
+    for (const char* family : {lx::text::k_ui_family, lx::text::k_mono_family})
+        for (const char* f : fallback_families(family))
+            mix(f);
+#endif
+#if defined(__GLIBC__)
+    mix(program_invocation_short_name); // configurations may match on the program
+#endif
+    mix(candidate_dir_);
+    for (const char* name : {"FONTCONFIG_FILE", "FONTCONFIG_PATH", "FONTCONFIG_SYSROOT", "FC_LANG",
+                             "LC_ALL", "LC_CTYPE", "LANG", "HOME", "XDG_CONFIG_HOME",
+                             "XDG_DATA_HOME", "XDG_DATA_DIRS"}) {
+        const char* v = ::getenv(name);
+        mix(v ? v : "\x01"); // unset is not empty
+    }
+    return h;
+}
+
+const lx::text::font_match* lx::text::face_cache::stored_locked(const char* family, weight w,
+                                                                style s) {
+    if (store_path_.empty())
+        return nullptr;
+    if (!store_read_) {
+        store_read_ = true;
+        if (!read_font_matches(store_path_.c_str(), store_inputs_locked(), stored_))
+            stored_.clear();
+    }
+    for (const font_match& m : stored_)
+        if (m.weight == w && m.style == s && same_family(m.family.c_str(), family))
+            return &m;
+    return nullptr;
+}
+
+void lx::text::face_cache::remember_locked(const char* family, weight w, style s, const char* file,
+                                           int index, const char* matched_family) {
+#if defined(LUMEN_HAS_TEXT)
+    if (!store_read_) {
+        // Answers of earlier runs that are still valid are kept beside this one.
+        store_read_ = true;
+        if (!read_font_matches(store_path_.c_str(), store_inputs_locked(), stored_))
+            stored_.clear();
+    }
+    std::erase_if(stored_, [&](const font_match& m) {
+        return m.weight == w && m.style == s && same_family(m.family.c_str(), family);
+    });
+    stored_.push_back({family, w, s, file, index, matched_family});
+
+    // What fontconfig read to answer: its configuration files and their directories (a new
+    // conf.d link), its font directories (a font installed or removed), the user's
+    // configuration paths, present or not, the bundled tree, and the faces themselves.
+    std::vector<std::string> watched;
+    const auto take = [&watched](FcStrList* list, bool parents) {
+        if (!list)
+            return;
+        while (FcChar8* str = FcStrListNext(list)) {
+            std::string path{reinterpret_cast<const char*>(str)};
+            if (parents)
+                if (const auto slash = path.rfind('/'); slash != std::string::npos && slash > 0)
+                    watched.push_back(path.substr(0, slash));
+            watched.push_back(std::move(path));
+        }
+        FcStrListDone(list);
+    };
+    auto* config = static_cast<FcConfig*>(config_);
+    take(FcConfigGetConfigFiles(config), true);
+    take(FcConfigGetFontDirs(config), false);
+    const char* home = ::getenv("HOME");
+    const char* xdg = ::getenv("XDG_CONFIG_HOME");
+    if (xdg && xdg[0] == '/')
+        watched.push_back(std::string{xdg} + "/fontconfig");
+    if (home && home[0] == '/') {
+        watched.push_back(std::string{home} + "/.config/fontconfig");
+        watched.push_back(std::string{home} + "/.fonts.conf");
+        watched.push_back(std::string{home} + "/.fonts.conf.d");
+        watched.push_back(std::string{home} + "/.fonts");
+        watched.push_back(std::string{home} + "/.local/share/fonts");
+    }
+    if (candidate_dir_[0]) {
+        watched.emplace_back(candidate_dir_);
+        std::error_code ec;
+        for (auto it = std::filesystem::recursive_directory_iterator{candidate_dir_, ec};
+             !ec && it != std::filesystem::recursive_directory_iterator{}; it.increment(ec))
+            if (it->is_directory(ec))
+                watched.push_back(it->path().string());
+    }
+    for (const font_match& m : stored_)
+        watched.push_back(m.file);
+    std::ranges::sort(watched);
+    watched.erase(std::unique(watched.begin(), watched.end()), watched.end());
+    (void)write_font_matches(store_path_.c_str(), store_inputs_locked(), watched, stored_);
+#else
+    (void)family;
+    (void)w;
+    (void)s;
+    (void)file;
+    (void)index;
+    (void)matched_family;
+#endif
 }

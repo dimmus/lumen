@@ -89,6 +89,22 @@ rasterisation stays on the UI thread, where the atlas lives.
   split at every space.
 - The single-line API (`shape_line`) resolves one face and does not fall back: titles in a
   script the title font lacks show its `.notdef`, as the CPU titles did.
+- **Persisted matches** (`face_cache::persist_matches`; the compositor and the shell opt
+  in for `shared()`). fontconfig loads its configuration and caches before its first
+  answer, which cost the first title bar 18–25 ms on vmwgfx and 25–40 ms on a GTX 1060 host,
+  on the UI thread (`tick_ui` over budget once per session). A persisting cache stores each
+  (family, weight, style) → (file, index, matched family) answer in
+  `$XDG_CACHE_HOME/lumen/fonts-<program>` and loads a face it finds there with FreeType
+  alone; fontconfig starts only for a request the file lacks or a fallback search. The
+  file's header hashes fontconfig's version, the program, the environment fontconfig reads
+  (`FONTCONFIG_*`, `FC_LANG`, the locale, `HOME`, `XDG_*`), the bundled directory and the
+  fallback family lists; each watched path is stored with its inode, size, mtime and ctime
+  (or as absent): fontconfig's configuration files and their directories, its font
+  directories, the user's configuration and font paths, the bundled tree and the faces'
+  files. Any difference drops every stored answer, and the file is rewritten (atomically)
+  from fontconfig's new ones. `add_font_dir` stops persisting. Measured on vmwgfx, first
+  decorated tick: 24.6 ms without the file, 1.7–2.8 ms with it; strace shows neither
+  process opening `/etc/fonts` once the file exists.
 
 ---
 

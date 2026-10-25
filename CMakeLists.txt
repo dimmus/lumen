@@ -977,6 +977,15 @@ if(LUMEN_BUILD_TESTS)
         LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
     add_test(NAME test_text_raster COMMAND test_text_raster)
 
+    add_executable(test_font_matches tests/test_font_matches.cpp)
+    target_link_libraries(test_font_matches PRIVATE lx.text)
+    lumen_apply_module_properties(test_font_matches)
+    lumen_link_platform(test_font_matches)
+    target_include_directories(test_font_matches PRIVATE tests)
+    target_compile_definitions(test_font_matches PRIVATE
+        LUMEN_ASSET_FONT_DIR="${CMAKE_SOURCE_DIR}/assets/fonts")
+    add_test(NAME test_font_matches COMMAND test_font_matches)
+
     add_executable(test_text_lines tests/test_text_lines.cpp)
     target_link_libraries(test_text_lines PRIVATE lx.text)
     lumen_apply_module_properties(test_text_lines)

@@ -1132,6 +1132,10 @@ installed`. What keeps it short:
   waited for: a virtual GPU builds its shader and surface variants during start-up instead
   of on the first client frame.
 - **First frame**: starts at once and carries a starting client's window (§6.1).
+- **No fontconfig.** The first title bar (and the shell's first panel paint) used to start
+  fontconfig on the UI thread, 18–40 ms. Both processes load their faces from the last
+  run's persisted matches instead (text.md §4): the first decorated `tick_ui` 24.6 ms →
+  1.7–2.8 ms on vmwgfx.
 
 What remains is Mesa: `egl ready` takes 50–65 ms on vmwgfx (loading the driver and its LLVM,
 creating the screen), which every GL compositor pays.

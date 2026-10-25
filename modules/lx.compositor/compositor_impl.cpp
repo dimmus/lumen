@@ -31,6 +31,7 @@ import lx.input;
 import lx.session;
 import lx.health;
 import lx.config;
+import lx.text;
 
 module lx.compositor;
 
@@ -9067,6 +9068,9 @@ lx::result<void> compositor::start() {
     }
 
     impl_->scheduler_.set_target_fps(impl_->cfg.target_fps);
+    // Title bars' faces from the last run's fontconfig answers: the first decorated window
+    // does not wait 15–40 ms on the UI thread for fontconfig to start.
+    lx::text::face_cache::shared().persist_matches();
 
     // The hardware-Vulkan probe runs beside the logind and KMS opening below: they mostly
     // wait on D-Bus and the kernel, the probe is CPU work in the Vulkan loader. Only the UI
