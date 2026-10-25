@@ -71,6 +71,19 @@ enum class protocol_err : int {
     unsupported = 3,
 };
 
+enum class ui_err : int {
+    none = 0,
+    /// A compiled theme (.lxtheme) that is truncated, has the wrong magic, sizes, offsets or
+    /// checksum.
+    theme_format = 1,
+    /// A compiled theme of another format version.
+    theme_version = 2,
+    /// A theme source (Zed theme JSON) that is not valid JSON or not a theme family.
+    theme_source = 3,
+    /// An icon that could not be rasterised (no librsvg, an unreadable SVG, a full atlas).
+    icon_raster = 4,
+};
+
 [[nodiscard]] constexpr const char* domain_name(error_domain domain) noexcept {
     switch (domain) {
     case error_domain::none: return "none";
@@ -82,6 +95,7 @@ enum class protocol_err : int {
     case error_domain::protocol: return "protocol";
     case error_domain::invalid_argument: return "invalid_argument";
     case error_domain::not_implemented: return "not_implemented";
+    case error_domain::ui: return "ui";
     }
     return "unknown";
 }
@@ -109,6 +123,8 @@ struct error_domain_of<drm_err> : std::integral_constant<error_domain, error_dom
 template <>
 struct error_domain_of<protocol_err>
     : std::integral_constant<error_domain, error_domain::protocol> {};
+template <>
+struct error_domain_of<ui_err> : std::integral_constant<error_domain, error_domain::ui> {};
 
 template <typename E>
 concept domain_code = std::is_enum_v<E> && requires { error_domain_of<E>::value; };

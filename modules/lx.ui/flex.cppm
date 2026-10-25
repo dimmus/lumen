@@ -10,6 +10,7 @@ import std;
 
 import :element;
 import :node;
+import :theme;
 
 // ── Flex containers on ui_node (ADR-010 §4.7) ────────────────────────────────────────
 //
@@ -31,8 +32,8 @@ import :node;
 
 export namespace lx::ui {
 
-/// The rem a flex style's `rem` lengths resolve against, in the node's pixels. Phase 3's
-/// theme binds it to the density.
+/// The default rem a flex style's `rem` lengths resolve against, in the node's pixels. A
+/// solve takes the active theme's (`ui_rem_px`: its UI font size, 16 px in the bundled ones).
 inline constexpr float k_layout_rem_px = 16.f;
 
 struct flex_props {
@@ -169,7 +170,7 @@ lx::size2i lx::ui::flex_container_measure(const ui_node& self, const lx::layout:
     in.available_height = c.max.height >= k_unbounded ? inf : static_cast<float>(c.max.height);
     in.min_content_width = hint == size_hint::min;
     in.content_size = content;
-    in.rem_px = k_layout_rem_px;
+    in.rem_px = ui_rem_px();
     lx_ui_flex_solve solve;
     const lx::layout::flex_output o = solve.run(self, style, in);
     lx::size2i out{lx_ui_round(o.width), lx_ui_round(o.height)};
@@ -185,7 +186,7 @@ lx::size2i lx::ui::flex_container_arrange(ui_node& self, const lx::layout::flex_
     in.known_height = static_cast<float>(bounds.height);
     in.available_width = in.known_width;
     in.available_height = in.known_height;
-    in.rem_px = k_layout_rem_px;
+    in.rem_px = ui_rem_px();
     lx_ui_flex_solve solve;
     const lx::layout::flex_output o = solve.run(self, style, in);
     const unsigned n = std::min(self.child_count(), ui_node::k_max_children);

@@ -2222,7 +2222,7 @@ wl-scanner-cpp  →  lx.wayland.protocols.* (C++26 modules)
 CMake lumen_add_module_library  →  liblx.* + executables
 ```
 
-Tools: `wl-scanner-cpp` (protocol codegen), `lumen-theme` (theme compiler stub).
+Tools: `wl-scanner-cpp` (protocol codegen), `lumen-theme` (Zed theme JSON → `.lxtheme`, ADR-010 §4.8; the build compiles the bundled One Dark and One Light).
 
 ---
 

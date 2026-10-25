@@ -132,6 +132,51 @@ is one item with both.
 Deferred subtrees use a `slot` thunk so overlays and collapsed panels are not described
 until they are shown.
 
+### Styles, tokens and themes (ADR-010 §4.8, §5)
+
+A box's look is one packed **`style`** value (`lx.ui:style`, 112 bytes) carried in its
+props, written the way GPUI writes it:
+
+```cpp
+const child kids[] = {icon_view(icon::bell, &icons), label};
+div(style{}.flex_row().gap(sp::b08).px(sp::b12).h(px(32))
+        .bg(tok::surface_background).border_1(tok::border_variant)
+        .rounded(radius::md).shadow(elevation::elevated_surface),
+    kids);
+// or, on a container already described: flex(...) | styled(style{}...)
+```
+
+Nothing in a style is a resolved colour or a resolved spacing: colours are **tokens**
+(`tok::*`, u16 indices into the theme's colour table — every colour key of Zed's theme
+schema, the status triples, eight players, the syntax colours), spacing is a length or a
+**step** of Zed's density-dependent scale (`sp::b00`…`b48`), radii are GPUI's scale
+(`radius::xs`…`full`), shadows an **elevation** (`elevation::elevated_surface`,
+`modal_surface`: §5.2's shadow stacks plus the 1 px `border.variant` border). The
+**`styled_node`** (`lx.ui:styled`) resolves the style against the active theme in `apply`:
+the layout half becomes the flex container's `layout::flex_style`, the paint half one packed
+quad (background, border, radii) and the elevation's shadows, emitted under the style's
+opacity before the children. Re-applying an equal style under the same theme costs one
+comparison; a paint-only change damages the bounds without a relayout. Text fields (colour
+token, size step, weight, line height) are inherited by the box's text
+(`inherited_text(node)`).
+
+A **theme** (`lx.ui:theme`) is a compiled `.lxtheme` file: `tools/lumen-theme` compiles a
+theme family in Zed's JSON schema at build time (`theme_compiler`, with Zed's own fallback
+rules for missing keys), and `theme::load` reads it with one read and a bounds check —
+nothing is parsed at run time. Each colour is stored sRGB-encoded (what UI surfaces blend in)
+and as premultiplied linear-light halves (the compositor's linear pass); a token's colour is
+an array index. The bundled One Dark and One Light are also compiled into the binary
+(`theme::builtin`), so an app without the files renders One Dark. The UI thread has one
+**active theme** and a **density**; changing either bumps `theme_generation`, and
+`ui_root::tick` then describes again, relayouts and repaints the whole tree. `theme_watcher`
+reloads a theme file on change (inotify; read and checked on the worker affinity, swapped in
+on UI).
+
+**Icons** (`lx.ui:icon`) are the bundled Lucide SVGs, rasterised per (icon, device size)
+once by librsvg into the atlas's R8 pages and drawn as `mono_sprite`s tinted with an
+`icon.*` token (`icon_view`, `icon_cache`). A miss rasterises at once on the UI thread, or on
+the worker with `icon_cache::set_async`, the icon then appearing on the frame after it lands.
+
 ---
 
 ## 5. Layout
@@ -162,6 +207,9 @@ directly (ADR-010 §4.7):
 - Props that change nothing layout reads leave the layout alone: an `apply` returning
   `bool` says whether they did (`describe` marks the node when it returns true, and on every
   apply when it returns nothing).
+
+A styled box (§4, `div` / `styled`) is the same container with its `flex_style` resolved
+from a `style`; rem lengths resolve against the active theme's UI font size (`ui_rem_px`).
 
 The flex container is **`flex_node`** (`lx.ui:flex`, `flex(style, children)`), a
 `layout::flex_style` over `lx.layout:flex`: the CSS flexbox subset Taffy gives GPUI
@@ -276,7 +324,11 @@ description.
 ## 9. Migration status
 
 The declarative core (`:element`, `:node`, `:invalidate`, `:reconcile`, `:decorator`,
-`:reducer`) is in place and covered by `tests/test_ui_reconcile.cpp`.
+`:reducer`) is in place and covered by `tests/test_ui_reconcile.cpp`. Flex layout (`:flex`)
+is covered by `tests/test_layout_flex.cpp`; styles, themes, styled boxes and icons
+(`:style`, `:theme`, `:theme.compile`, `:styled`, `:icon`) by `tests/test_ui_theme.cpp` and
+the `styled_surfaces` / `icons` golden images. The old string-keyed `style_ref` survives only
+for `:widgets` and `lx.ui.builder`, and reads nothing.
 
 The legacy retained-widget API (`:widgets`, `:widget_node`) is still exported so existing
 callers compile. It is superseded and should not gain new widgets:
@@ -291,7 +343,9 @@ callers compile. It is superseded and should not gain new widgets:
 
 Still to build:
 
-- Concrete widgets (`label`, `button`, `entry`, `checkbox`, `scroll_area`) as `ui_node`s
+- Concrete widgets — ADR-010 §5.6's components (`label`, `button`, `toggle`, `text_input`,
+  `list`, `scroll_area`, `tab_bar`, `tooltip`, `popover_menu`, `modal`, …) as `ui_node`s on
+  styled boxes, text blocks and icons
 - A root host that owns the reducer rebuild → layout → emit → damage sequence per tick
 - Grid containers (flex is `lx.ui:flex`, which reads `grow_node::grow_factor()`)
 - Overlay layers (dialog, popover) that defer show/close to the next frame

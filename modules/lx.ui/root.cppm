@@ -14,6 +14,7 @@ import :element;
 import :node;
 import :reconcile;
 import :invalidate;
+import :theme;
 
 export namespace lx::ui {
 
@@ -65,6 +66,8 @@ private:
     lx::rect2i bounds_{};
     stage_times stage_times_{};
     damage_ledger frame_damage_{};
+    /// The `theme_generation` the tree was last resolved under.
+    std::uint64_t theme_generation_ = 0;
     bool dirty_ = true;
 };
 
@@ -101,6 +104,14 @@ void lx_ui_fold(lx::ui::damage_ledger& into, const lx::ui::damage_ledger& from) 
         into.request(lx::ui::invalidation::animate);
 }
 
+/// Every node's layout dirty and its measure cache cleared.
+void lx_ui_mark_tree_dirty(lx::ui::ui_node& node) {
+    node.mark_layout_dirty();
+    for (unsigned i = 0; i < node.child_count(); ++i)
+        if (lx::ui::ui_node* c = node.child_at(i))
+            lx_ui_mark_tree_dirty(*c);
+}
+
 [[nodiscard]] std::uint64_t lx_ui_ns_between(std::chrono::steady_clock::time_point from,
                                              std::chrono::steady_clock::time_point to) {
     return static_cast<std::uint64_t>(
@@ -115,6 +126,17 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
         return false;
 
     damage_ledger& ledger = ui_damage();
+    // A new theme or density changes what every styled node resolves to: describe again
+    // (each node re-resolves in `apply`), and lay out and repaint everything.
+    if (const std::uint64_t generation = theme_generation(); generation != theme_generation_) {
+        theme_generation_ = generation;
+        dirty_ = true;
+        if (root_) {
+            lx_ui_mark_tree_dirty(*root_);
+            ledger.add(bounds_);
+            ledger.request(invalidation::paint);
+        }
+    }
     if (!dirty_ && root_ && ledger.empty() && !root_->layout_dirty())
         return false;
 

@@ -20,11 +20,6 @@ add_executable(wl-scanner-cpp
 target_include_directories(wl-scanner-cpp PRIVATE tools/wl-scanner-cpp)
 target_compile_features(wl-scanner-cpp PRIVATE cxx_std_20)
 
-add_executable(lumen-theme
-    tools/lumen-theme/main.cpp
-)
-target_compile_features(lumen-theme PRIVATE cxx_std_20)
-
 include(LumenProtocols)
 
 # ── Foundation ──────────────────────────────────────────────────────────────
@@ -135,6 +130,43 @@ lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
     DEPENDS lx.gfx lx.layout lx.scheduler lx.runtime lx.sync)
 lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.wayland.client lx.layout lx.a11y)
+# Compiled themes (ADR-010 §4.8) and bundled Lucide icons (§5.5): found in the build tree, an
+# install relative to the executable, or the configured install (LUMEN_THEME_DIR /
+# LUMEN_ICON_DIR override both). Icons are rasterised by librsvg, dlopen'd on first use as
+# lx.shell does: headers only, no link edge.
+target_compile_definitions(lx.ui PRIVATE
+    LUMEN_THEME_DIR_BUILD="${CMAKE_BINARY_DIR}/themes"
+    LUMEN_THEME_DIR_INSTALL_RELATIVE="${CMAKE_INSTALL_DATADIR}/lumen/themes"
+    LUMEN_THEME_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/themes"
+    LUMEN_ICON_DIR_BUILD="${CMAKE_SOURCE_DIR}/assets/icons/lucide"
+    LUMEN_ICON_DIR_INSTALL_RELATIVE="${CMAKE_INSTALL_DATADIR}/lumen/icons/lucide"
+    LUMEN_ICON_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/icons/lucide")
+if(LIBRSVG_FOUND)
+    target_compile_definitions(lx.ui PRIVATE LUMEN_HAS_RSVG=1)
+    target_include_directories(lx.ui PRIVATE ${LIBRSVG_INCLUDE_DIRS})
+    target_link_libraries(lx.ui PUBLIC ${CMAKE_DL_LIBS})
+endif()
+# The theme compiler: Zed theme JSON → .lxtheme through lx.ui:theme.compile. It compiles the
+# bundled One Dark and One Light into the build tree as part of `all`.
+add_executable(lumen-theme tools/lumen-theme/main.cpp)
+target_link_libraries(lumen-theme PRIVATE lx.ui)
+lumen_apply_module_properties(lumen-theme)
+lumen_link_platform(lumen-theme)
+set(LUMEN_THEME_SOURCE "${CMAKE_SOURCE_DIR}/assets/themes/one/one.json")
+set(LUMEN_THEME_OUTPUTS
+    "${CMAKE_BINARY_DIR}/themes/one-dark.lxtheme"
+    "${CMAKE_BINARY_DIR}/themes/one-light.lxtheme")
+add_custom_command(
+    OUTPUT ${LUMEN_THEME_OUTPUTS}
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_BINARY_DIR}/themes"
+    COMMAND lumen-theme "${LUMEN_THEME_SOURCE}" "${CMAKE_BINARY_DIR}/themes/one-dark.lxtheme"
+            --theme "One Dark" --quiet
+    COMMAND lumen-theme "${LUMEN_THEME_SOURCE}" "${CMAKE_BINARY_DIR}/themes/one-light.lxtheme"
+            --theme "One Light" --quiet
+    DEPENDS lumen-theme "${LUMEN_THEME_SOURCE}"
+    COMMENT "Compiling the bundled themes (One Dark, One Light)"
+    VERBATIM)
+add_custom_target(lumen-themes ALL DEPENDS ${LUMEN_THEME_OUTPUTS})
 lumen_add_module_library(lx.ui.builder modules/lx.ui.builder DEPENDS lx.ui)
 
 # ── Desktop ──────────────────────────────────────────────────────────────────
@@ -448,6 +480,9 @@ install(DIRECTORY protocols/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/protocol
 install(FILES deploy/lumen/config.toml DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen)
 # The bundled UI and mono fonts with their licenses (lx.text:faces finds them here).
 install(DIRECTORY assets/fonts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/fonts)
+# The compiled bundled themes and the Lucide icons with their licenses (lx.ui finds them here).
+install(FILES ${LUMEN_THEME_OUTPUTS} DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/themes)
+install(DIRECTORY assets/icons/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/icons)
 if(LUMEN_PORTAL_BUILT)
     install(TARGETS xdg-desktop-portal-lumen RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
     install(FILES deploy/portal/lumen.portal
@@ -1186,6 +1221,19 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_dmabuf_composite COMMAND test_dmabuf_composite)
     set_tests_properties(test_dmabuf_composite PROPERTIES TIMEOUT 60)
 
+    # ADR-010 §4.8, §5: the theme compiler over the bundled Zed themes, the .lxtheme format,
+    # styles, styled boxes, the theme watcher and Lucide icons (SKIP without librsvg).
+    add_executable(test_ui_theme tests/test_ui_theme.cpp)
+    target_link_libraries(test_ui_theme PRIVATE lx.ui lx.scene lx.gfx lx.runtime)
+    lumen_apply_module_properties(test_ui_theme)
+    lumen_link_platform(test_ui_theme)
+    target_include_directories(test_ui_theme PRIVATE tests)
+    target_compile_definitions(test_ui_theme PRIVATE
+        LUMEN_THEME_SOURCE_JSON="${LUMEN_THEME_SOURCE}"
+        LUMEN_TEST_THEME_DIR="${CMAKE_BINARY_DIR}/themes")
+    add_dependencies(test_ui_theme lumen-themes)
+    add_test(NAME test_ui_theme COMMAND test_ui_theme)
+
     add_executable(test_ui_reconcile tests/test_ui_reconcile.cpp)
     target_link_libraries(test_ui_reconcile PRIVATE lx.ui)
     lumen_apply_module_properties(test_ui_reconcile)
@@ -1277,7 +1325,7 @@ if(LUMEN_BUILD_TESTS)
         test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
         test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
         test_cvt test_output_management test_output_config_store
-        test_ui_reconcile test_layout_flex test_gl_composite bench_composite bench_ui
+        test_ui_reconcile test_ui_theme test_layout_flex test_gl_composite bench_composite bench_ui
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout

@@ -842,6 +842,64 @@ one arrange), one label dirty 6.9 µs / 7.5–13.8 µs (5 measure calls — the 
 3 arranges, 37 skipped); 0 allocations. A paint-only S2 frame's layout stage fell from
 p95 56.6 µs to 1.7 µs (the clean root is not walked).
 
+As built (style, theme, icons, §4.8, §5): `lx.ui:theme` defines the tokens — every colour key
+of Zed's theme schema except the vim mode colours (167, with the 14 status triples), 8
+players × 3 and the 46 syntax colours of the One themes: 237 `tok`s, each an index into the
+`.lxtheme` colour table — and the format: a 128-byte header (magic, version, sizes, offsets,
+FNV-1a checksum of the rest), the sRGB `u8×4` and premultiplied linear `f16×4` tables, the
+status and player tables (token triples), 46 syntax styles (colour token, weight, italic,
+background), the fonts of §5.4 and the density. A theme is 3 816 B; `theme::load` is one
+`read` and a bounds, version and checksum check (11.9 µs from the page cache), immutable
+afterwards, failing with `io_err` or the new `ui_err` domain (`theme_format`,
+`theme_version`). `tools/lumen-theme` compiles Zed's own `assets/themes/one/one.json`,
+vendored unmodified with its MIT licence (one family file, not the `one-dark.json` /
+`one-light.json` pair this section names), through `theme_compiler` (a strict RFC 8259
+reader; build-time code with std containers) into `themes/one-dark.lxtheme` and
+`one-light.lxtheme` in the build tree (≈11 ms a run), installed to
+`share/lumen/themes` and found through `LUMEN_THEME_DIR`, the build tree or the install. A
+missing key is refined as Zed refines it (`refine_theme`): Zed's derived rules — a status
+background from its colour at 25 %, the selection from player 0, version-control and
+diff-hunk colours from the status colours, the active scrollbar thumb, minimap and panel
+overlay colours from their neighbours — then the base value of its appearance, transcribed
+from Zed's `ThemeColors` / `StatusColors` / `PlayerColors` `::dark()` / `::light()` by
+`scripts/zed-theme-defaults.py` into `lx.ui:theme_defaults`; every fallback and ignored key
+is reported. One Dark: 207 tokens from the file, 19 derived, 11 from Zed's base; One Light
+205 / 19 / 13; every value the file gives, and every §5.1 value above, comes out as written
+(`test_ui_theme`). The fallback theme compiled into the binary is generated constants
+(`theme_builtin.cpp`, `lumen-theme --emit-cpp`, committed): compiling it during the build
+would make lx.ui depend on a tool that links lx.ui; `test_ui_theme` fails when it differs from
+what the build compiles. The UI thread has one active theme and density; changing either
+bumps `theme_generation`, on which `ui_root::tick` describes again, clears every measure cache
+and repaints everything; flex solves take the rem from the active theme (`ui_rem_px`, S2's
+solve costs unchanged). `theme_watcher` (inotify on the file's directory) reloads on the
+worker and applies on UI in every build type; hooking it to a client's event loop is Phase 4.
+
+`lx.ui:style` is the packed `style` with the builder above — 112 B, not ≈96: its 21 lengths
+(sizes, basis, gaps, padding, margin, insets) at 32 bits are 84 B alone; the flex enums pack
+into one word, grow and shrink are halves, the paint and text fields u16 tokens and bytes. A
+spacing step rides in a length of unit `auto` with value step + 1, so a style stays bitwise
+comparable and density-independent. `lx.ui:styled` resolves it in `apply` (layout through the
+density into the flex engine; one packed quad and the elevation's shadows, emitted under the
+style's opacity; an elevation with no `bg` takes §5.2's background token, an elevated or modal
+one without a border the 1 px `border.variant`); a paint-only change damages the bounds without
+a relayout; `styled_node` is 504 B; repainting a styled tree allocates nothing. Text fields are
+resolved and inherited (`inherited_text`) but not yet read by `text_block_node`, whose props
+carry their own colour and font — the components (§5.6) bridge the two.
+
+Icons: 53 Lucide 1.61.0 SVGs (26 KB with the licence and a README of SHA-256s;
+`trash` is the old `trash-2`) in `lx.ui:icon` — in lx.ui rather than lx.gfx because the set,
+its files and its tint tokens are the UI's, and librsvg is dlopen'd as lx.shell does, so no
+module gains a library edge (the GLib and cairo headers stay in an implementation unit). An
+`icon_cache` rasterises (icon, device px) once into an R8 atlas tile, the alpha of librsvg's
+rendering as coverage (63 µs for a 16 px icon), tinted per draw. A miss rasterises
+synchronously on the UI thread by default (counted; a steady frame only hits); with `set_async`
+it is rasterised on the worker (four jobs, buffers allocated with the cache) and written into
+the atlas on the UI strand, damaging the bounds that asked. Golden images `styled_surfaces`
+(elevated and modal stacks over `surface.background`, borders, radii xs…full, opacity) and
+`icons` (16 / 14 / 12 px and a 20 px raster at scale 1.25): GL within 1/255 of the CPU
+reference, Vulkan (lavapipe) within 2/255 of CPU and 2/255 of GL. Without librsvg the build
+succeeds, icons draw nothing and those cases print SKIP.
+
 ### Phase 4 — The client runtime (≈3 weeks)
 
 - `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,

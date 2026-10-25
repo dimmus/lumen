@@ -85,6 +85,8 @@ struct tiles {
     lx::gfx::atlas_tile image{}; ///< RGBA8 24 × 24: four premultiplied quadrants, one translucent
     /// Over the atlas `make_tiles` filled (which must outlive it).
     std::shared_ptr<lx::text::glyph_cache> glyphs{};
+    /// Lucide icons rasterised into the same atlas (nothing drawn without librsvg).
+    std::shared_ptr<lx::ui::icon_cache> icons{};
 };
 
 /// Fills `a` with the tiles. Deterministic: the same atlas state every call.
@@ -129,6 +131,7 @@ struct tiles {
         return id && a.lookup(*id, tile);
     };
     out.glyphs = std::make_shared<lx::text::glyph_cache>(a);
+    out.icons = std::make_shared<lx::ui::icon_cache>(a);
     return put(atlas_format::r8, 16, 16, disc, 16, out.disc) &&
            put(atlas_format::r8, 12, 12, ring, 12, out.ring) &&
            put(atlas_format::r8, 32, 8, ramp, 32, out.ramp) &&
@@ -439,8 +442,68 @@ inline void build_text_clip(lx::ui::draw_scope& s, const tiles& t) {
     s.quad({2, 21, 160, 39}, outline);
 }
 
+// ── Styled boxes and icons (ADR-010 §4.8, §5.2, §5.5): `styled_node` and `icon_node` under
+// the built-in One Dark ──
+
+/// A styled box at `bounds`, laid out and emitted (its children none).
+inline void styled_box(lx::ui::draw_scope& s, lx::rect2i bounds, const lx::ui::style& st) {
+    auto node = std::make_unique<lx::ui::styled_node>();
+    node->apply({st});
+    node->arrange(bounds);
+    node->emit(s);
+}
+
+/// Elevated (popover) and modal surfaces over `surface.background` with their shadow stacks
+/// and `border.variant` borders; a translucent box; radii xs, sm, md, lg and full on bordered
+/// elements; a focus ring.
+inline void build_styled_surfaces(lx::ui::draw_scope& s, const tiles&) {
+    using namespace lx::ui;
+    lx::ui::set_active_builtin_theme(appearance::dark);
+    styled_box(s, {16, 16, 72, 48},
+               style{}.bg(lx::ui::tok::elevated_surface_background).rounded(radius::md)
+                   .shadow(elevation::elevated_surface));
+    styled_box(s, {112, 16, 88, 56},
+               style{}.bg(lx::ui::tok::elevated_surface_background).rounded(radius::lg)
+                   .shadow(elevation::modal_surface));
+    styled_box(s, {224, 16, 60, 40},
+               style{}.bg(lx::ui::tok::text_accent).border_1(lx::ui::tok::border_focused).rounded(radius::sm)
+                   .opacity(0.5f));
+    const radius radii[5] = {radius::xs, radius::sm, radius::md, radius::lg, radius::full};
+    for (int i = 0; i < 5; ++i)
+        styled_box(s, {16 + 36 * i, 84, 28, 18},
+                   style{}.bg(lx::ui::tok::element_background).border_1(lx::ui::tok::border).rounded(radii[i]));
+    styled_box(s, {200, 84, 36, 18},
+               style{}.bg(lx::ui::tok::ghost_element_hover).border_1(lx::ui::tok::border_focused).rounded(radius::sm));
+    styled_box(s, {248, 84, 36, 18}, style{}.bg(lx::ui::tok::element_active).border_b_1(lx::ui::tok::border_variant));
+}
+
+/// Lucide icons at Zed's 16, 14 and 12 px in `icon.*` and status tokens, and 16 px at scale
+/// 1.25 (a 20 px raster).
+inline void build_icons(lx::ui::draw_scope& s, const tiles& t) {
+    using namespace lx::ui;
+    const icon set[5] = {icon::x, icon::check, icon::settings, icon::bell, icon::chevron_down};
+    const lx::ui::tok colors[5] = {lx::ui::tok::icon, lx::ui::tok::icon_muted, lx::ui::tok::icon_accent, lx::ui::tok::error, lx::ui::tok::success};
+    const float sizes[3] = {16.f, 14.f, 12.f};
+    int y = 6;
+    for (float px : sizes) {
+        for (int i = 0; i < 5; ++i) {
+            auto node = std::make_unique<icon_node>();
+            node->apply({set[i], px, 1.f, colors[i], t.icons.get()});
+            const lx::size2i sz = node->measure({}, size_hint::preferred);
+            node->arrange({6 + 22 * i, y, sz.width, sz.height});
+            node->emit(s);
+        }
+        y += static_cast<int>(px) + 6;
+    }
+    auto big = std::make_unique<icon_node>();
+    big->apply({icon::wifi, 16.f, 1.25f, lx::ui::tok::text, t.icons.get()});
+    big->arrange({120, 6, 20, 20});
+    big->emit(s);
+}
+
 [[nodiscard]] inline std::span<const golden_case> cases() {
-    static const golden_case k_cases[] = {
+    static const std::vector<golden_case> k_cases = [] {
+    std::vector<golden_case> v = {
         {"quad_radii", 232, 48, k_editor, build_quad_radii},
         {"quad_borders", 232, 48, k_editor, build_quad_borders},
         {"quad_dashed", 232, 48, k_surface, build_quad_dashed},
@@ -458,7 +521,14 @@ inline void build_text_clip(lx::ui::draw_scope& s, const tiles& t) {
         {"text_underlines", 312, 64, k_editor, build_text_underlines},
         {"text_emoji", 264, 72, k_surface, build_text_emoji},
         {"text_clip", 168, 80, k_editor, build_text_clip},
+        {"styled_surfaces", 300, 112, k_surface, build_styled_surfaces},
     };
+    if (lx::ui::icons_available())
+        v.push_back({"icons", 148, 66, k_editor, build_icons});
+    else
+        std::printf("    SKIP icons: librsvg or the bundled icons are not available\n");
+    return v;
+    }();
     return k_cases;
 }
 
