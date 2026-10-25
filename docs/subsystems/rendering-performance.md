@@ -1135,7 +1135,9 @@ installed`. What keeps it short:
 - **No fontconfig.** The first title bar (and the shell's first panel paint) used to start
   fontconfig on the UI thread, 18–40 ms. Both processes load their faces from the last
   run's persisted matches instead (text.md §4): the first decorated `tick_ui` 24.6 ms →
-  1.7–2.8 ms on vmwgfx.
+  1.7–2.8 ms on vmwgfx. Without them (a first run, a font change) the compositor shapes its
+  title font on a start-up helper (`begin_title_font`), so fontconfig starts beside the
+  present path and not in that tick: 35.0 ms → 1.3–2.1 ms from an empty cache.
 
 What remains is Mesa: `egl ready` takes 50–65 ms on vmwgfx (loading the driver and its LLVM,
 creating the screen), which every GL compositor pays.

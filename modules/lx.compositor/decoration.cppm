@@ -177,6 +177,9 @@ struct close_glyph {
     int size = 0;
 };
 
+/// The title font at scale 1: "Sans", bold, 10 pt — the CPU titles' font.
+inline constexpr text::font_desc k_title_font{"Sans", 10.f, text::weight::bold, text::style::normal};
+
 /// Server-side frames' text in the compositor's atlas (`chrome_atlas`): titles shaped and
 /// fitted by `lx.text` (the single-line API: one face, the ellipsis and the not-responding
 /// rule of the CPU-rasterised titles it replaces), their glyphs rasterised by an
@@ -192,7 +195,7 @@ public:
 
     [[nodiscard]] chrome_atlas& atlas() { return *atlas_; }
     [[nodiscard]] text::glyph_cache& glyphs() { return *glyphs_; }
-    /// The title font at scale 1 (default: "Sans", bold, 10 pt — the CPU titles' font).
+    /// The title font at scale 1 (default `k_title_font`).
     void set_font(text::font_desc font) { font_ = font; }
     [[nodiscard]] text::font_desc font() const { return font_; }
 
@@ -226,7 +229,7 @@ private:
 
     chrome_atlas* atlas_ = nullptr;
     std::unique_ptr<text::glyph_cache> glyphs_{};
-    text::font_desc font_{"Sans", 10.f, text::weight::bold, text::style::normal};
+    text::font_desc font_ = k_title_font;
     /// Scratch, allocated once: the shaped title, the suffix, the ellipsis.
     std::unique_ptr<text::shaped_line> line_{};
     std::unique_ptr<text::shaped_line> suffix_{};

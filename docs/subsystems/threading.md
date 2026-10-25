@@ -307,7 +307,7 @@ from, and the tick also checks what UI handed over since (a publish, texture upd
 ops, a cursor, a capture, a screenshot). An idle compositor went from 2.1 to 1.0 wakeups/s;
 frame ticks always wake render, as before.
 
-**Start-up runs three helper threads, before the render and worker threads exist.**
+**Start-up runs four helper threads, before the render and worker threads exist.**
 `compositor::start` is on the UI thread, and its slow phases mostly wait on something else,
 so they overlap instead of queueing:
 
@@ -316,8 +316,10 @@ so they overlap instead of queueing:
 | hardware-Vulkan probe (`device_selector::probe_devices`: the devices and their DRM nodes; which one counts is chosen from the card after the join) | logind session and KMS open (D-Bus, kernel) | before the present path is chosen |
 | input open (`begin_input`: keymap compile, libinput, logind `TakeDevice` per device) | EGL/GL set-up and the scanout targets | `finish_input`, after the globals |
 | cursor theme at the default output scale (`begin_cursor_theme`) | the same | the cursor set-up, which adopts it |
+| title font (`begin_title_font`: resolves and shapes the title bars' font, so fontconfig starts here on a persisted-match miss) | the same | the end of `start`; the face cache's mutex orders it with any title shaped earlier |
 
-Each owns its state until joined, and the UI thread uses neither `logind_` nor
+Each owns its state until joined (the title font writes only the process-wide face cache,
+under its mutex), and the UI thread uses neither `logind_` nor
 `input_devices_` in between; a guard joins them on every early return. The probe's
 `gfx::hardware_probe_scope` sets `VK_LOADER_DRIVERS_DISABLE` (software drivers cannot
 answer the probe and lavapipe's LLVM is most of its cost) while only the UI thread and the
