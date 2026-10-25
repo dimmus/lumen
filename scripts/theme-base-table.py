@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+"""Generate modules/lx.ui/theme_defaults.cppm: the base theme the compiler falls back to.
+
+A token a theme file leaves out, with no derived rule of its own (theme_compile.cppm),
+takes the value of its appearance from this table. The values are Lumen's base theme:
+
+  * every token One Dark / One Light set in assets/themes/one/one.json (MIT, see
+    assets/themes/one/LICENSE) takes that file's value, so a partial Zed theme falls back
+    to Lumen's default look;
+  * the tokens one.json leaves unset take Lumen's own choice below, written as another
+    token of the same theme, optionally at a fixed alpha.
+
+The token keys are read from modules/lx.ui/theme.cppm (`k_token_keys`).
+
+Usage:
+    scripts/theme-base-table.py > modules/lx.ui/theme_defaults.cppm
+"""
+
+import json
+import pathlib
+import re
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+# Lumen's choices for the tokens one.json does not set: (source token, alpha or None).
+# Guides and focus edges reuse the border scale; overlays, minimap and the active scrollbar
+# thumb reuse their panel and scrollbar counterparts; diff hunks and conflict markers are
+# their status colour faded; the selection is player 0's at 25 %.
+PICKS = {
+    "element.selection_background": ("players[0].selection", 0x40),
+    "drop_target.border": ("border.focused", None),
+    "debugger.accent": ("error", None),
+    "panel.focused_border": ("border.focused", None),
+    "panel.indent_guide": ("border.variant", None),
+    "panel.indent_guide_hover": ("border", None),
+    "panel.indent_guide_active": ("border.selected", None),
+    "panel.overlay_background": ("panel.background", None),
+    "panel.overlay_hover": ("element.hover", None),
+    "pane.focused_border": ("border.focused", None),
+    "pane_group.border": ("border", None),
+    "scrollbar.thumb.active_background": ("scrollbar.thumb.hover_background", None),
+    "minimap.thumb.background": ("scrollbar.thumb.background", None),
+    "minimap.thumb.hover_background": ("scrollbar.thumb.hover_background", None),
+    "minimap.thumb.active_background": ("scrollbar.thumb.hover_background", None),
+    "minimap.thumb.border": ("scrollbar.thumb.border", None),
+    "editor.debugger_active_line.background": ("warning.background", None),
+    "editor.indent_guide": ("editor.wrap_guide", None),
+    "editor.indent_guide_active": ("editor.active_wrap_guide", None),
+    "editor.document_highlight.bracket_background": ("editor.document_highlight.read_background", None),
+    "editor.diff_hunk.added.background": ("created", 0x1F),
+    "editor.diff_hunk.added.hollow_background": ("created", 0x0F),
+    "editor.diff_hunk.added.hollow_border": ("created", 0x5C),
+    "editor.diff_hunk.deleted.background": ("deleted", 0x1F),
+    "editor.diff_hunk.deleted.hollow_background": ("deleted", 0x0F),
+    "editor.diff_hunk.deleted.hollow_border": ("deleted", 0x5C),
+    "terminal.ansi.background": ("terminal.background", None),
+    "version_control.renamed": ("renamed", None),
+    "version_control.conflict": ("conflict", None),
+    "version_control.ignored": ("ignored", None),
+    "version_control.conflict_marker.ours": ("created", 0x33),
+    "version_control.conflict_marker.theirs": ("info", 0x33),
+}
+
+
+def token_keys():
+    src = (ROOT / "modules/lx.ui/theme.cppm").read_text()
+    block = src[src.index("k_token_keys[] = {"):]
+    return re.findall(r'"([^"]+)"', block[: block.index("};")])
+
+
+def rgba(text):
+    """#rgb, #rgba, #rrggbb or #rrggbbaa as eight lowercase hex digits."""
+    h = text.lstrip("#").lower()
+    if len(h) in (3, 4):
+        h = "".join(c * 2 for c in h)
+    if len(h) == 6:
+        h += "ff"
+    if len(h) != 8 or any(c not in "0123456789abcdef" for c in h):
+        raise ValueError(f"not a colour: {text}")
+    return "#" + h
+
+
+def lookup(style, key):
+    m = re.fullmatch(r"players\[(\d)\]\.(cursor|background|selection)", key)
+    if m:
+        return style["players"][int(m.group(1))][m.group(2)]
+    value = style.get(key)
+    return value if isinstance(value, str) else None
+
+
+def resolve(style, key, theme):
+    value = lookup(style, key)
+    if value is not None:
+        return rgba(value)
+    if key not in PICKS:
+        sys.exit(f"{theme}: {key} is unset in one.json and has no pick in {__file__}")
+    source, alpha = PICKS[key]
+    value = lookup(style, source)
+    if value is None:
+        sys.exit(f"{theme}: the pick for {key}, {source}, is unset in one.json")
+    value = rgba(value)
+    return value if alpha is None else value[:7] + f"{alpha:02x}"
+
+
+def main():
+    family = json.loads((ROOT / "assets/themes/one/one.json").read_text())
+    themes = {t["appearance"]: t for t in family["themes"]}
+    dark, light = themes["dark"], themes["light"]
+    keys = [k for k in token_keys() if not k.startswith("syntax.") and not k.startswith("players[")]
+
+    out = []
+    out.append("// Generated by scripts/theme-base-table.py. Do not edit by hand.")
+    out.append("//")
+    out.append("// Lumen's base theme: a token a theme file leaves out, with no derived rule of its own")
+    out.append("// (theme_compile.cppm), takes the value of its appearance here. Values are One Dark's and")
+    out.append("// One Light's from assets/themes/one/one.json (MIT, assets/themes/one/LICENSE); the tokens")
+    out.append("// that file leaves unset take Lumen's own choice, listed in the script.")
+    out.append("")
+    out.append("export module lx.ui:theme_defaults;")
+    out.append("")
+    out.append("export namespace lx::ui::base_theme {")
+    out.append("")
+    out.append("struct base_entry {")
+    out.append("    const char* key;")
+    out.append("    const char* dark;")
+    out.append("    const char* light;")
+    out.append("};")
+    out.append("")
+    out.append("inline constexpr base_entry k_colors[] = {")
+    for key in keys:
+        d = resolve(dark["style"], key, dark["name"])
+        l = resolve(light["style"], key, light["name"])
+        out.append(f'    {{"{key}", "{d}", "{l}"}},')
+    out.append("};")
+    out.append("")
+    out.append("/// cursor, background, selection per player.")
+    out.append("inline constexpr const char* k_players[2][8][3] = {")
+    for theme in (dark, light):
+        out.append("    {")
+        for p in theme["style"]["players"][:8]:
+            out.append("        {" + ", ".join(f'"{rgba(p[f])}"' for f in ("cursor", "background", "selection")) + "},")
+        out.append("    },")
+    out.append("};")
+    out.append("")
+    out.append("} // namespace lx::ui::base_theme")
+    print("\n".join(out))
+
+
+if __name__ == "__main__":
+    main()

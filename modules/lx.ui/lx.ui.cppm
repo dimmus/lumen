@@ -13,7 +13,7 @@ export module lx.ui;
 
 export import :events;
 // ADR-010 §4.8: compiled themes (tokens, the .lxtheme format, the active theme), the packed
-// style value and its builder, the theme compiler and Zed's base values it refines off.
+// style value and its builder, the theme compiler and the base theme it refines off.
 export import :theme;
 export import :theme_defaults;
 export import :style;

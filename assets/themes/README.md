@@ -22,23 +22,20 @@ Any other Zed theme family compiles the same way (`lumen-theme <family.json> <ou
 --theme "<name>"`); keys the compiler does not keep are counted, missing ones fall back by
 Zed's own rules (`--verbose` lists both).
 
-## Zed's base colours (`modules/lx.ui/theme_defaults.cppm`)
+## The base theme (`modules/lx.ui/theme_defaults.cppm`)
 
-A key a theme file leaves out falls back as Zed falls back: through Zed's derived rules, then
-to the value of Zed's base theme of the same appearance. `scripts/zed-theme-defaults.py`
-evaluates those base values — `ThemeColors::dark()` / `light()`
-(`crates/theme/src/default_colors.rs`), `StatusColors` and `PlayerColors`
-(`crates/theme/src/styles/`), over the Radix colour scales they are written in — to hex
-colours, keyed by the JSON key names of Zed's theme schema (`crates/settings_content/src/theme.rs`),
-and writes them as a table. Unlike `one/one.json` (MIT), those crates are licensed
-**GPL-3.0-or-later**.
+A key a theme file leaves out resolves as it does in Zed: through the compiler's derived
+rules (a status background from its colour, the selection from player 0, …), then to the
+value of its appearance in Lumen's base theme. `scripts/theme-base-table.py` generates that
+table from two sources only:
 
-What the table takes from them is data, not code: for each schema key, a dark and a light
-colour value, plus the key names a Zed theme file uses (needed to read such files at all). No
-Rust source, expression or structure of Zed's is copied; the evaluation is the script's own.
-The working position (recorded for the maintainer to confirm; it is not legal advice) is that
-these colour values and key names are factual interoperability data rather than a copy of
-Zed's code, so `theme_defaults.cppm` is distributed under Lumen's licence. Only 11 (One Dark) and 13 (One Light) of the compiled
-tokens come from the table — the rest are `one.json`'s own or derived from it — so, should
-that position ever change, the table can be replaced by values chosen from `one.json` and
-first-party ones without touching the compiler or the format.
+- One Dark's and One Light's own values in `one/one.json` (MIT, above);
+- for the 32 tokens that file leaves unset, Lumen's own choices, listed in the script: each
+  is another One token, sometimes at a fixed alpha (focus edges and indent guides from the
+  border scale, diff hunks from the status colours faded, the debugger accent from `error`).
+
+Nothing in it comes from Zed's GPL-licensed crates. The token key names are the keys of
+Zed's theme schema, which a reader of Zed theme files needs; `one/one.json` uses them too.
+Regenerate after changing `one/one.json` or the token list:
+
+    scripts/theme-base-table.py > modules/lx.ui/theme_defaults.cppm

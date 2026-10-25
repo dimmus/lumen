@@ -306,7 +306,7 @@ LUMEN_TEST(compiles_both_bundled_themes) {
         LUMEN_CHECK(report.invalid_colors == 0 && report.ignored_keys == 0);
         LUMEN_CHECK(report.themes.size() == 2);
         LUMEN_CHECK(report.fallbacks.size() == report.tokens_derived + report.tokens_from_base);
-        std::printf("    %s: %zu bytes, %u tokens from the file, %u derived, %u from Zed's base\n",
+        std::printf("    %s: %zu bytes, %u tokens from the file, %u derived, %u from the base theme\n",
                     name, bytes.size(), report.tokens_from_source, report.tokens_derived,
                     report.tokens_from_base);
         // The linear table is the sRGB table decoded and premultiplied.
@@ -486,17 +486,17 @@ LUMEN_TEST(compiler_falls_back_by_zeds_rules) {
     // panel + hover at alpha 0.5, opaque.
     LUMEN_CHECK(t.rgba8(tok::panel_overlay_hover) == hex("#909090"));
     // Player 0's selection is opaque: 25 % for the selection background; player 0's cursor
-    // from Zed's base players.
+    // from the base theme's players (One Dark's).
     LUMEN_CHECK(t.rgba8(tok::element_selection_background) == hex("#00ff0040"));
-    LUMEN_CHECK(t.rgba8(tok::player0_cursor) == hex("#0090ff"));
-    // Version control from the status colours; with no status colour, Zed's base.
+    LUMEN_CHECK(t.rgba8(tok::player0_cursor) == hex("#74ade8"));
+    // Version control from the status colours; with no status colour, the base theme's.
     LUMEN_CHECK(t.rgba8(tok::version_control_added) == hex("#00aa00"));
     LUMEN_CHECK(t.rgba8(tok::created_background) == hex("#00aa0040"));
     LUMEN_CHECK(t.rgba8(tok::editor_diff_hunk_added_background) == hex("#00aa001f")); // 12 %
-    LUMEN_CHECK(t.rgba8(tok::version_control_deleted) == hex("#78081a"));
-    // Zed's base for the rest; an invalid colour counts and falls back.
-    LUMEN_CHECK(t.rgba8(tok::background) == hex("#111110"));
-    LUMEN_CHECK(t.rgba8(tok::text) == hex("#eeeeecff"));
+    LUMEN_CHECK(t.rgba8(tok::version_control_deleted) == hex("#e06c76"));
+    // The base theme (One Dark) for the rest; an invalid colour counts and falls back.
+    LUMEN_CHECK(t.rgba8(tok::background) == hex("#3b414d"));
+    LUMEN_CHECK(t.rgba8(tok::text) == hex("#dce0e5ff"));
     LUMEN_CHECK(r->invalid_colors == 1);
     // Ignored: the theme's "extra", vim, an unknown key, an unknown syntax key.
     LUMEN_CHECK(r->ignored_keys == 4);

@@ -152,7 +152,7 @@ int main(int argc, char** argv) {
     }
     if (!quiet) {
         std::printf("lumen-theme: %s -> %s: \"%s\" (%s), %zu bytes; %u tokens from the file, "
-                    "%u derived, %u from Zed's base; %u keys ignored, %u invalid colours\n",
+                    "%u derived, %u from the base theme; %u keys ignored, %u invalid colours\n",
                     source.input_path, source.output_path, r->name.c_str(),
                     r->mode == lx::ui::appearance::light ? "light" : "dark", r->bytes,
                     r->tokens_from_source, r->tokens_derived, r->tokens_from_base, r->ignored_keys,

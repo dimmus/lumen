@@ -24,12 +24,13 @@ import :theme_defaults;
 // The JSON reader is strict RFC 8259 (no comments, no trailing commas, no duplicate keys in
 // an object, nesting at most 64 deep, input at most 16 MiB). A theme is refined the way Zed
 // refines it (crates/theme_settings/src/theme_settings.rs `refine_theme`): a colour key the
-// file leaves out, sets to null or to a string that is not a colour takes Zed's derived rule
-// where one exists (crates/theme_settings/src/schema.rs: a status background from its
+// file leaves out, sets to null or to a string that is not a colour takes a derived rule
+// where one exists, so a Zed theme resolves as it does in Zed (a status background from its
 // colour at 25 % opacity, the active scrollbar thumb from the thumb, version-control colours
-// from the status colours, the selection from player 0, …) and otherwise the base value of
-// its appearance (`zed_defaults`, transcribed from Zed's `ThemeColors::dark()` /
-// `light()`). Players merge over Zed's eight base players. Every fallback is reported, and
+// from the status colours, the selection from player 0, …) and otherwise the value of its
+// appearance in Lumen's base theme (`base_theme`, theme_defaults.cppm: One Dark / One Light
+// from assets/themes/one/one.json plus Lumen's own picks). Players merge over the base
+// theme's eight. Every fallback is reported, and
 // keys the compiler does not keep (vim mode colours, accents, window background appearance,
 // keys it does not know) are counted as ignored.
 
@@ -66,7 +67,7 @@ struct compile_report {
     std::vector<std::string> themes{};
     unsigned tokens_from_source = 0;
     unsigned tokens_derived = 0;   ///< from a Zed derived rule
-    unsigned tokens_from_base = 0; ///< from Zed's base theme of the appearance
+    unsigned tokens_from_base = 0; ///< from Lumen's base theme of the appearance
     unsigned invalid_colors = 0;   ///< strings that are not colours (treated as missing)
     unsigned ignored_keys = 0;
     /// One line per token that fell back: "key: <rule>".
@@ -451,12 +452,12 @@ struct lx_ui_theme_build {
     [[nodiscard]] rgba base(lx::ui::tok t) const {
         const std::string_view key = lx::ui::token_key(t);
         const bool light = mode == lx::ui::appearance::light;
-        for (const auto& e : lx::ui::zed_defaults::k_colors)
+        for (const auto& e : lx::ui::base_theme::k_colors)
             if (key == e.key)
                 return *lx::ui::parse_theme_color(light ? e.light : e.dark);
         if (t >= lx::ui::tok::player0_cursor && t < lx::ui::tok::syntax_attribute) {
             const unsigned i = idx(t) - idx(lx::ui::tok::player0_cursor);
-            return *lx::ui::parse_theme_color(lx::ui::zed_defaults::k_players[light ? 1 : 0][i / 3][i % 3]);
+            return *lx::ui::parse_theme_color(lx::ui::base_theme::k_players[light ? 1 : 0][i / 3][i % 3]);
         }
         return {0.f, 0.f, 0.f, 0.f};
     }
@@ -468,7 +469,7 @@ struct lx_ui_theme_build {
             report->fallbacks.push_back(std::string{lx::ui::token_key(t)} + ": " + std::string{rule});
     }
 
-    /// The source value, else `derived` (with its rule), else Zed's base.
+    /// The source value, else `derived` (with its rule), else the base theme's.
     void resolve(lx::ui::tok t, std::optional<rgba> derived = std::nullopt,
                  std::string_view rule = {}) {
         if (s(t))
@@ -476,7 +477,7 @@ struct lx_ui_theme_build {
         else if (derived)
             set(t, *derived, 1, rule);
         else
-            set(t, base(t), 2, "Zed base");
+            set(t, base(t), 2, "base theme");
     }
 };
 
