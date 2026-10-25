@@ -49,6 +49,7 @@ import lx.foundation;
 import lx.shell.policy;
 import lx.trace;
 import lx.config;
+import lx.text;
 
 export module lx.shell;
 
@@ -2029,6 +2030,9 @@ void lx::shell::shell_app::start_launch(const prepared_launch& p, const char* to
 // ── Main loop ──
 
 int lx::shell::shell_app::run() {
+    // The panel's faces from the last run's fontconfig answers: its first paint does not wait
+    // for fontconfig to start.
+    lx::text::face_cache::shared().persist_matches();
     // Signals arrive as readable data on an fd the loop already polls: the handler cannot
     // interrupt a libwayland call halfway, and shutdown is an ordinary loop exit.
     sigset_t mask;
