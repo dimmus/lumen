@@ -105,6 +105,11 @@ rasterisation stays on the UI thread, where the atlas lives.
   from fontconfig's new ones. `add_font_dir` stops persisting. Measured on vmwgfx, first
   decorated tick: 24.6 ms without the file, 1.7–2.8 ms with it; strace shows neither
   process opening `/etc/fonts` once the file exists.
+- **Title font at start-up** (`compositor_impl::begin_title_font`). A miss — the first run,
+  or any change the header or a watched path catches — would still start fontconfig in the
+  first decorated `tick_ui`. The compositor therefore resolves and shapes the title font on
+  a start-up helper thread beside the present path's set-up, so fontconfig starts there.
+  Measured on vmwgfx from an empty cache: first decorated tick 35.0 ms → 1.3–2.1 ms.
 
 ---
 

@@ -940,6 +940,11 @@ struct compositor_impl {
     xcursor_theme prefetched_theme_{};
     unsigned prefetched_scale120_ = 0;
     void begin_cursor_theme();
+    /// Resolves and shapes the title bars' font on a helper thread beside the present path's
+    /// set-up (`begin_title_font`), so the first decorated window does not start fontconfig on
+    /// the UI thread when the persisted matches are missing or stale.
+    std::thread title_font_thread_{};
+    void begin_title_font();
     /// config.toml cursor.size, else XCURSOR_SIZE, else 24: the logical cursor size.
     [[nodiscard]] unsigned cursor_base_px() const;
     /// config.toml cursor.theme, else null ($XCURSOR_THEME, else "default").
@@ -5196,6 +5201,20 @@ void compositor_impl::begin_cursor_theme() {
         std::thread([this, size] { prefetched_theme_.load(cursor_theme_arg(), size); });
 }
 
+void compositor_impl::begin_title_font() {
+    // The first decorated window shapes its title in `tick_ui`. Without the last run's
+    // persisted matches (a first run; fonts or fontconfig's configuration changed) that is
+    // where fontconfig loads its configuration and caches: 35 ms on vmwgfx, 25 ms on a GTX
+    // 1060 host (text.md §4). Shaping a title now, beside the present path, leaves that tick
+    // a cache hit. The face cache's mutex orders it with the UI thread: a title shaped before
+    // this finishes waits for it, no longer than it would have taken itself.
+    const text::font_desc font = decorations_.text() ? decorations_.text()->font() : k_title_font;
+    title_font_thread_ = std::thread([font] {
+        auto line = std::make_unique<text::shaped_line>();
+        (void)text::shape_line("Lumen", font, *line);
+    });
+}
+
 void compositor_impl::warm_gl_paths() {
     // A virtual GPU (vmwgfx/SVGA3D) translates shaders for its host on first use, per texture
     // format, sampler and target, and creates host surfaces lazily: a startup trace showed
@@ -9235,14 +9254,15 @@ lx::result<void> compositor::start() {
         }
     }
 
-    // Input devices open, and the cursor theme is read, beside the present path's set-up
-    // (`begin_input`, `begin_cursor_theme`); joined before they are used, and on every early
-    // return below.
+    // Input devices open, the cursor theme is read and the title font resolved beside the
+    // present path's set-up (`begin_input`, `begin_cursor_theme`, `begin_title_font`); joined
+    // before they are used, and on every early return below.
     // The configuration file first: the keymap, the cursor and the device settings come
     // from it (a small read and parse, ~0.1 ms; design-session-and-wm C.4).
     impl_->load_initial_config();
     impl_->begin_input();
     impl_->begin_cursor_theme();
+    impl_->begin_title_font();
     struct helper_join {
         detail::compositor_impl* impl;
         ~helper_join() {
@@ -9250,6 +9270,8 @@ lx::result<void> compositor::start() {
                 impl->input_open_thread_.join();
             if (impl->cursor_theme_thread_.joinable())
                 impl->cursor_theme_thread_.join();
+            if (impl->title_font_thread_.joinable())
+                impl->title_font_thread_.join();
         }
     } helper_join_guard{impl_};
 
