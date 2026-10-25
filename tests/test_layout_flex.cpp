@@ -696,6 +696,43 @@ LUMEN_TEST(box_is_a_flex_column_and_sizing_is_read) {
 
 namespace {
 
+lx::ui::child describe_percent_padding(lx::ui::build_context&) {
+    // A 400 px row; its item pads itself by 10 % / 5 % — CSS resolves both against the
+    // containing block's width (400): 40 px left, 20 px top.
+    lx::ui::child inner[1] = {label("abc")};
+    lx::ui::child items[1] = {lx::ui::flex(style("padding-left:10%;padding-top:5%"), inner)};
+    return lx::ui::flex(style("align-items:flex-start"), items);
+}
+
+lx::ui::child describe_percent_under_align(lx::ui::build_context&) {
+    // A 50 %-wide box under an align decorator (no flex parent): its percent base is the
+    // decorator's box, 400 px wide.
+    lx::ui::child inner[1] = {label("abc")};
+    return lx::ui::flex(style("width:50%"), inner) |
+           lx::ui::align(lx::layout::align::start, lx::layout::align::start);
+}
+
+} // namespace
+
+LUMEN_TEST(percent_padding_and_size_resolve_against_the_parent_box) {
+    // §9.2 with the item's own padding: content 21 × 14 (3 × 7 px) plus 40 / 20 px.
+    ui_harness h{describe_percent_padding, {0, 0, 400, 100}};
+    LUMEN_CHECK(same(h.node({0}).bounds(), {0, 0, 61, 34}));
+    LUMEN_CHECK(same(h.node({0, 0}).bounds(), {40, 20, 21, 14}));
+    // A relayout at another width moves the padding with it though the row's own place
+    // and the item's size are recomputed from the new base (500: 50 / 25 px).
+    h.root.set_bounds({0, 0, 500, 100});
+    (void)h.root.tick(h.draws);
+    LUMEN_CHECK(same(h.node({0}).bounds(), {0, 0, 71, 39}));
+    LUMEN_CHECK(same(h.node({0, 0}).bounds(), {50, 25, 21, 14}));
+
+    // Under a decorator: 50 % of the decorator's 400 px box.
+    ui_harness a{describe_percent_under_align, {0, 0, 400, 100}};
+    LUMEN_CHECK(same(a.node({0}).bounds(), {0, 0, 200, 14}));
+}
+
+namespace {
+
 /// The process's shared face cache (the UI's), with a shape cache and itemizer of the test's.
 struct text_env {
     lx::text::face_cache& faces = lx::text::face_cache::shared();
@@ -732,7 +769,7 @@ lx::ui::child describe_text_row(lx::ui::build_context&) {
 LUMEN_TEST(text_block_wraps_at_the_width_flex_gives_it) {
     text_env env{};
     if (!env.has_fonts()) {
-        std::printf("    skipped: no font\n");
+        std::printf("    SKIP: no font face on this host (text_block_wraps_at_the_width_flex_gives_it)\n");
         return;
     }
     g_text = &env;

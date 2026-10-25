@@ -112,6 +112,11 @@ private:
 
 bool lx::ui::box_node::apply(const box_props& props) {
     const bool changed = props.row != props_.row || props.gap != props_.gap;
+    const lx::color& a = props.fill;
+    const lx::color& b = props_.fill;
+    // A new fill alone repaints the box; a layout change is damaged by the reconciler.
+    if (!changed && (a.r != b.r || a.g != b.g || a.b != b.b || a.a != b.a))
+        detail::damage_node(*this, ink_bounds(*this));
     props_ = props;
     style_.direction =
         props.row ? lx::layout::flex_direction::row : lx::layout::flex_direction::column;

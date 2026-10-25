@@ -133,8 +133,11 @@ struct control_props {
     bool selected = false;
     /// Paint from the nearest interactive ancestor's hover / press / ring.
     bool group_paint = false;
-    /// Draw the focus ring when the state source shows it.
+    /// Draw the focus ring when the ring's source (itself, or with `group_paint` the nearest
+    /// focusable ancestor) shows it.
     bool focus_ring = false;
+    /// The ring's width, px (§5.5: 1; a switch's is its 2 px border, as Zed's).
+    std::uint8_t focus_ring_px = 1;
     /// Wants `on_timer(k_timer_hover_intent)` after a 500 ms hover (a tooltip).
     bool hover_intent = false;
     /// Arrow keys move the focus among the focusable descendants along this axis.
@@ -157,6 +160,8 @@ public:
     void arrange(lx::rect2i bounds) override;
     void emit(draw_scope& out) const override;
     [[nodiscard]] const lx::layout::flex_style* flex_item_style() const override;
+    /// The drop shadow's reach.
+    [[nodiscard]] int ink_outset() const override;
 
     [[nodiscard]] int focus_order() const override { return tab_index_; }
     bool on_focus_key(key_event event, focus_manager& focus) override;
@@ -175,9 +180,12 @@ public:
     [[nodiscard]] int value() const { return value_; }
     /// Activations since construction (tests).
     [[nodiscard]] std::uint64_t activations() const { return activations_; }
-    /// The node whose hover / press / ring this one paints (itself, or the nearest
-    /// interactive ancestor with `group_paint`).
+    /// The node whose hover / press this one paints (itself, or the nearest interactive
+    /// ancestor with `group_paint`).
     [[nodiscard]] const ui_node& state_source() const;
+    /// The node whose focus ring this one draws (itself, or the nearest focusable ancestor
+    /// with `group_paint`).
+    [[nodiscard]] const ui_node& ring_source() const;
 
 private:
     void resolve();
@@ -203,6 +211,7 @@ private:
     bool selected_ = false;
     bool group_paint_ = false;
     bool ring_ = false;
+    std::uint8_t ring_px_ = 1;
     bool applied_ = false;
     char name_[48]{};
 };
@@ -378,7 +387,8 @@ bool lx::ui::control_node::apply(const control_props& p) {
     const bool new_theme = generation != generation_ || !applied_;
     bool repaint = new_theme || !(p.paint == paint_) || p.selected != selected_ ||
                    p.disabled != has_flag(node_flag::disabled) ||
-                   p.group_paint != group_paint_ || p.focus_ring != ring_;
+                   p.group_paint != group_paint_ || p.focus_ring != ring_ ||
+                   p.focus_ring_px != ring_px_;
     // Layout: resolved through the density, compared as the engine reads it.
     bool layout_changed = false;
     const bool borders_changed = std::memcmp(p.paint.border_widths, paint_.border_widths,
@@ -400,6 +410,7 @@ bool lx::ui::control_node::apply(const control_props& p) {
     selected_ = p.selected;
     group_paint_ = p.group_paint;
     ring_ = p.focus_ring;
+    ring_px_ = p.focus_ring_px;
     on_activate_ = p.on_activate;
     value_ = p.value;
     tab_index_ = p.tab_index;
@@ -446,6 +457,21 @@ void lx::ui::control_node::arrange(lx::rect2i bounds) {
 
 const lx::layout::flex_style* lx::ui::control_node::flex_item_style() const { return &flex_; }
 
+int lx::ui::control_node::ink_outset() const {
+    if (!has_shadow_)
+        return 0;
+    return 3 * paint_.shadow_blur + std::abs(static_cast<int>(paint_.shadow_y));
+}
+
+const lx::ui::ui_node& lx::ui::control_node::ring_source() const {
+    if (!group_paint_)
+        return *this;
+    for (const ui_node* n = parent(); n; n = n->parent())
+        if (n->has_flag(node_flag::focusable))
+            return *n;
+    return *this;
+}
+
 const lx::ui::ui_node& lx::ui::control_node::state_source() const {
     if (!group_paint_)
         return *this;
@@ -486,8 +512,8 @@ void lx::ui::control_node::emit(draw_scope& out) const {
     ui_node::emit(out);
     if (clip)
         out.pop();
-    if (ring_ && state_source().has_flag(node_flag::focus_ring))
-        draw_focus_ring(out, bounds_, radii_);
+    if (ring_ && ring_source().has_flag(node_flag::focus_ring))
+        draw_focus_ring(out, bounds_, radii_, static_cast<float>(ring_px_));
     if (fade)
         out.pop();
 }

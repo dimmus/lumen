@@ -85,6 +85,8 @@ public:
     void arrange(lx::rect2i bounds) override;
     void emit(draw_scope& out) const override;
     [[nodiscard]] const lx::layout::flex_style* flex_item_style() const override;
+    /// The elevation's shadows' reach.
+    [[nodiscard]] int ink_outset() const override;
 
     [[nodiscard]] const lx::ui::style& value() const { return style_; }
     [[nodiscard]] const resolved_paint& paint() const { return paint_; }
@@ -294,6 +296,15 @@ void lx::ui::styled_node::emit(draw_scope& out) const {
 
 const lx::layout::flex_style* lx::ui::styled_node::flex_item_style() const {
     return &flex_;
+}
+
+int lx::ui::styled_node::ink_outset() const {
+    float reach = 0.f;
+    for (unsigned i = 0; i < paint_.shadow_count; ++i) {
+        const elevation_shadow& e = paint_.shadows[i];
+        reach = std::max(reach, 3.f * e.blur + std::max(std::fabs(e.offset_x), std::fabs(e.offset_y)));
+    }
+    return static_cast<int>(std::ceil(reach));
 }
 
 lx::ui::child lx::ui::div(const style& s, std::span<const child> children) {

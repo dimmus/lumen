@@ -238,11 +238,21 @@ unsigned lx::ui::rebuild_pending_reducers(build_context& ctx, reconciler& rec) {
     // ones (they unlink): take the head each time. A build that dispatches into its own
     // reducer would never drain; past the cap the rest wait for the next frame.
     constexpr unsigned k_max_rebuilds_per_frame = 4096;
+    // A rebuild that runs out of the frame arena keeps its previous subtree and did not
+    // happen: it is queued again and the loop stops (the arena stays exhausted this frame),
+    // the rest waiting with it for the next frame's fresh arena. One that overflowed an arena
+    // nothing else had used yet never fits: it is dropped (`note_overflow` logged it).
     while (reducer_host* h = g_pending_head) {
-        if (rebuilt == k_max_rebuilds_per_frame)
+        if (rebuilt == k_max_rebuilds_per_frame || ctx.overflowed())
             break;
+        const unsigned used = ctx.used_bytes();
         h->unlink();
         h->rebuild(ctx, rec);
+        if (ctx.overflowed()) {
+            if (used > 0)
+                h->request_rebuild();
+            break;
+        }
         ++rebuilt;
     }
     return rebuilt;

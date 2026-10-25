@@ -423,15 +423,21 @@ LUMEN_TEST(pointer_states_change_background_tokens_and_damage_only_that_control)
     LUMEN_CHECK(g_presses == 0 && off.activations() == 0);
     LUMEN_CHECK(h.tick());
 
-    // A checkbox: the row is what is hovered, the box paints from it (`group_hover`): its
-    // border at 70 %; the damage is the row.
+    // A checkbox: toggle.rs's hover group is the 20 px container (`.group(group_id)`): over
+    // the box it is what is hovered and the box paints from it (`group_hover`): its border at
+    // 70 %; the damage is the container. The ring is the row's (it has the focus). Over the
+    // label the row is hovered and the box stays at rest.
     control_node& row = ctl(find(root, lx::a11y::role::checkbox, "Box"));
-    control_node& box = ctl(row.child_at(0)->child_at(0));
+    control_node& holder = ctl(row.child_at(0));
+    control_node& box = ctl(holder.child_at(0));
     ui_damage().clear();
     LUMEN_CHECK(h.root.pointer_move(centre(box)));
-    LUMEN_CHECK(row.has_flag(node_flag::hovered) && !box.has_flag(node_flag::hovered));
-    LUMEN_CHECK(box.paint_state() == 1 && &box.state_source() == &row);
-    LUMEN_CHECK(ui_damage().count() == 1 && same_rect(ui_damage().union_bounds(), row.bounds()));
+    LUMEN_CHECK(holder.has_flag(node_flag::hovered) && !row.has_flag(node_flag::hovered) &&
+                !box.has_flag(node_flag::hovered));
+    LUMEN_CHECK(box.paint_state() == 1 && &box.state_source() == &holder && &box.ring_source() == &row);
+    LUMEN_CHECK(ui_damage().count() == 1 && same_rect(ui_damage().union_bounds(), holder.bounds()));
+    LUMEN_CHECK(h.root.pointer_move(centre(*row.child_at(1))));
+    LUMEN_CHECK(row.has_flag(node_flag::hovered) && box.paint_state() == 0);
     // The switch track: `element.disabled` with `text` at 5 % on top.
     control_node& sw_row = ctl(find(root, lx::a11y::role::switch_control, "Sw"));
     control_node& track = ctl(sw_row.child_at(0)->child_at(0));
@@ -1369,6 +1375,7 @@ LUMEN_TEST(context_menu_opens_at_the_pointer) {
 namespace {
 
 bool g_modal_open = false;
+bool g_modal_scrim = true;
 int g_modal_dismissed = 0;
 void on_modal_dismiss(int) {
     g_modal_open = false;
@@ -1381,7 +1388,7 @@ child describe_modal(build_context&) {
     const child kids[3] = {
         button("Behind").name("behind"),
         button("Also behind").name("behind2"),
-        modal(body).title("Confirm").open(g_modal_open).on_dismiss(on_modal_dismiss).width(320.f),
+        modal(body).title("Confirm").open(g_modal_open).scrim(g_modal_scrim).on_dismiss(on_modal_dismiss).width(320.f),
     };
     return div(style{}.flex_col().items_start().gap(sp::b08).p(sp::b08).size_full(), kids);
 }
@@ -1439,6 +1446,23 @@ LUMEN_TEST(modal_traps_focus_scrims_the_tree_and_dismisses) {
     LUMEN_CHECK(r.key(key_press(key::enter)) && g_modal_dismissed == 3); // Close has the focus
     redescribe(h);
     LUMEN_CHECK(ui_overlays().open_count() == 0);
+
+    // Zed's default: no scrim (`fade_out_background` false), the window below still occluded.
+    g_modal_scrim = false;
+    g_modal_open = true;
+    redescribe(h);
+    bool any_scrim = false;
+    for (const lx::gfx::quad_instance& q : h.list->quad_instances())
+        any_scrim = any_scrim || (q.bounds[0] == 0.f && q.bounds[1] == 0.f && q.bounds[2] == 640.f &&
+                                  q.bounds[3] == 400.f);
+    LUMEN_CHECK(!any_scrim);
+    (void)r.pointer_move(centre(*behind));
+    LUMEN_CHECK(r.pointer().hovered() == nullptr);
+    LUMEN_CHECK(r.pointer_button(mouse_button::left, true));
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(!g_modal_open && g_modal_dismissed == 4);
+    redescribe(h);
+    g_modal_scrim = true;
     set_reduced_motion(false);
 }
 
@@ -1787,8 +1811,9 @@ LUMEN_TEST(text_input_edits_by_grapheme_and_word) {
     harness h{describe_input, {0, 0, 400, 200}};
     ui_root& r = h.root;
     text_input_node& t = the_input(r);
-    // Zed's `InputField`: 33 px (the 19 px standard line, 6 px padding, 1 px border).
-    LUMEN_CHECK(t.bounds().height == 33 && t.bounds().width == 240);
+    // Zed's `InputField`: `min_h_8`, 32 px (the 17 px line of 14 px × 1.2, 6 px padding and a
+    // 1 px border make 31).
+    LUMEN_CHECK(t.bounds().height == 32 && t.bounds().width == 240);
     LUMEN_CHECK(t.text_node().layout().text() == "Search"); // the placeholder, muted
     LUMEN_CHECK(r.key(key_press(key::tab)) && r.focus().focused() == &t);
     LUMEN_CHECK(r.ime() == static_cast<ime_target*>(&t));
@@ -2313,6 +2338,262 @@ LUMEN_TEST(frame_format_formats_long_text_into_the_arena) {
     LUMEN_CHECK(std::strlen(s) == 5 + 300);
     LUMEN_CHECK(std::strncmp(s, "[42] xxx", 8) == 0);
     LUMEN_CHECK(std::strcmp(frame_format("{:02}:{:02}", 9, 41), "09:41") == 0);
+}
+
+// ── Review fixes: capacity, paint-only damage, ink, rebuild retries ──
+
+namespace {
+
+char g_big_storage[4096];
+text_buffer g_big{g_big_storage};
+std::uint32_t g_big_max = 4000;
+
+child describe_big_input(build_context&) {
+    const child kids[1] = {text_input().buffer(g_big).name("big").max_bytes(g_big_max)
+                               .layout(style{}.w(px(240.f)))};
+    return div(style{}.flex_col().items_start().p(px(10.f)), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(text_input_keeps_the_text_within_what_it_holds) {
+    // An app buffer larger than the field: the field holds `k_text_input_capacity` bytes.
+    const std::string many(2000, 'x');
+    LUMEN_CHECK(g_big.assign(many));
+    g_big_max = 4000;
+    harness h{describe_big_input, {0, 0, 400, 100}};
+    ui_root& r = h.root;
+    text_input_node& t = the_input(r);
+    LUMEN_CHECK(t.capacity() == k_text_input_capacity);
+    LUMEN_CHECK(t.text().size() == k_text_input_capacity && g_big.size == k_text_input_capacity);
+    LUMEN_CHECK(t.caret() == k_text_input_capacity);
+    LUMEN_CHECK(t.text_node().layout().text().size() == k_text_input_capacity);
+    // Typing at the capacity is refused (reject), and nothing is written past it.
+    LUMEN_CHECK(r.key(key_press(key::tab)) && r.focus().focused() == &t);
+    const std::uint64_t refused = t.rejected();
+    type_text(r, "ab");
+    LUMEN_CHECK(t.text().size() == k_text_input_capacity && t.rejected() == refused + 2);
+    LUMEN_CHECK(g_big_storage[k_text_input_capacity] == '\0');
+    // A smaller `max_bytes` over longer text cuts it (at a character boundary) and keeps
+    // the caret inside it; inserting then works within the new room.
+    g_big_max = 100;
+    redescribe(h);
+    LUMEN_CHECK(t.text().size() == 100 && g_big.size == 100 && t.caret() <= 100);
+    type_text(r, "c");
+    LUMEN_CHECK(t.text().size() == 100);
+    LUMEN_CHECK(r.key(key_press(key::backspace)) && t.text().size() == 99);
+    type_text(r, "d");
+    LUMEN_CHECK(t.text().size() == 100 && t.text().back() == 'd');
+    // Two-byte characters: the cut never splits one.
+    std::string accents;
+    for (int i = 0; i < 300; ++i)
+        accents += "\xC3\xA9"; // é
+    g_big_max = 101;
+    LUMEN_CHECK(g_big.assign(accents));
+    redescribe(h);
+    LUMEN_CHECK(t.text().size() == 100 && (t.text()[98] & 0xC0) == 0xC0);
+    (void)g_big.assign("");
+    g_big_max = 4000;
+    redescribe(h);
+}
+
+namespace {
+
+lx::color g_box_fill = lx::color::rgb(0.2f, 0.3f, 0.4f, 1.f);
+float g_box_opacity = 1.f;
+const char* g_side_text = "one";
+
+child describe_paint_only(build_context&) {
+    const child inner[1] = {label("filled")};
+    const child faded[1] = {div(style{}.size(px(30.f)).bg(tok::element_background), {})};
+    const child kids[3] = {
+        flex(lx::layout::flex_style{}, inner, g_box_fill),
+        opacity(g_box_opacity, div(style{}.flex_row(), faded)),
+        label(g_side_text),
+    };
+    return div(style{}.flex_col().items_start().gap(px(8.f)).p(px(8.f)), kids);
+}
+
+/// Describes the tree again without damaging it (what an app's state change does).
+void relayout(harness& h) {
+    ui_damage().request(invalidation::layout);
+    (void)h.tick();
+}
+
+[[nodiscard]] bool covered(const damage_ledger& d, lx::rect2i box) {
+    for (unsigned i = 0; i < d.count(); ++i)
+        if (inside(box, d.rects()[i]))
+            return true;
+    return false;
+}
+
+} // namespace
+
+LUMEN_TEST(paint_only_prop_changes_damage_their_node) {
+    g_box_fill = lx::color::rgb(0.2f, 0.3f, 0.4f, 1.f);
+    g_box_opacity = 1.f;
+    g_side_text = "one";
+    harness h{describe_paint_only, {0, 0, 300, 200}};
+    ui_root& r = h.root;
+    const lx::rect2i box = r.tree()->child_at(0)->bounds();
+    const lx::rect2i faded = r.tree()->child_at(1)->bounds();
+    LUMEN_CHECK(box.width > 0 && faded.width > 0);
+    // The fill alone changes, beside a label whose text changes: the box is damaged too.
+    g_box_fill = lx::color::rgb(0.6f, 0.1f, 0.1f, 1.f);
+    g_side_text = "two";
+    relayout(h);
+    LUMEN_CHECK(covered(r.frame_damage(), box));
+    // The opacity alone.
+    g_box_opacity = 0.5f;
+    g_side_text = "three";
+    relayout(h);
+    LUMEN_CHECK(covered(r.frame_damage(), faded));
+    // Nothing paint-related changes: neither is damaged.
+    g_side_text = "four";
+    relayout(h);
+    LUMEN_CHECK(!covered(r.frame_damage(), box) && !covered(r.frame_damage(), faded));
+}
+
+namespace {
+
+bool g_ink_menu_open = false;
+bool g_ink_modal_open = false;
+
+child describe_ink(build_context&) {
+    static menu_entry entries[2];
+    entries[0] = menu_item("Copy");
+    entries[1] = menu_item("Paste");
+    const child body = label("Body");
+    const child kids[3] = {
+        div(style{}.size(px(60.f)).bg(tok::elevated_surface_background).shadow(elevation::modal_surface), {}),
+        popover_menu(button("Menu").name("ink-trigger"), entries).open(g_ink_menu_open),
+        modal(body).title("Fade").open(g_ink_modal_open).scrim().width(200.f),
+    };
+    return div(style{}.flex_col().items_start().gap(px(8.f)).p(px(40.f)).size_full(), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(overlay_and_shadow_damage_covers_what_they_paint) {
+    set_ui_clock(test_clock);
+    set_reduced_motion(false);
+    g_ink_menu_open = g_ink_modal_open = false;
+    harness h{describe_ink, {0, 0, 480, 360}};
+    ui_root& r = h.root;
+    // A styled box with the modal elevation paints its shadows past its bounds.
+    ui_node* shadowed = r.tree()->child_at(0);
+    LUMEN_CHECK(shadowed->ink_outset() > 0);
+    const lx::rect2i ink = ink_bounds(*shadowed);
+    LUMEN_CHECK(ink.width > shadowed->bounds().width && inside(shadowed->bounds(), ink));
+
+    // A menu open, then closed: the close damages its shadows' reach, not just its box.
+    g_ink_menu_open = true;
+    relayout(h);
+    for (int i = 0; i < 20 && ui_damage().needs_animate(); ++i) {
+        g_now_ns += 16'666'667ull;
+        (void)h.tick();
+    }
+    overlay_node* menu = ui_overlays().top();
+    LUMEN_CHECK(menu && menu->kind() == overlay_kind::menu);
+    const ui_node* content = menu->content();
+    lx::rect2i painted = ink_bounds(*content);
+    for (unsigned i = 0; i < content->child_count(); ++i)
+        if (const ui_node* c = content->child_at(i)) {
+            const lx::rect2i k = ink_bounds(*c);
+            const int x0 = std::min(painted.x, k.x), y0 = std::min(painted.y, k.y);
+            const int x1 = std::max(painted.x + painted.width, k.x + k.width);
+            const int y1 = std::max(painted.y + painted.height, k.y + k.height);
+            painted = {x0, y0, x1 - x0, y1 - y0};
+        }
+    LUMEN_CHECK(painted.width > content->bounds().width);
+    g_ink_menu_open = false;
+    relayout(h);
+    LUMEN_CHECK(ui_overlays().open_count() == 0);
+    LUMEN_CHECK(covered(r.frame_damage(), painted));
+
+    // A modal fading in over its scrim: every frame of the fade repaints the whole window,
+    // not just the dialog.
+    g_ink_modal_open = true;
+    relayout(h);
+    unsigned frames = 0;
+    while (ui_damage().needs_animate() && frames < 30) {
+        g_now_ns += 16'666'667ull;
+        LUMEN_CHECK(h.tick());
+        LUMEN_CHECK(covered(r.frame_damage(), {0, 0, 480, 360}));
+        ++frames;
+    }
+    LUMEN_CHECK(frames >= 5);
+    g_ink_modal_open = false;
+    relayout(h);
+    set_reduced_motion(true);
+    set_ui_clock(nullptr);
+}
+
+namespace {
+
+struct rows_state {
+    unsigned rows = 1;
+};
+struct rows_action {
+    unsigned rows = 1;
+};
+using rows_host = reducer_node<rows_state, rows_action>;
+void reduce_rows(rows_state& s, const rows_action& a) { s.rows = a.rows; }
+
+[[nodiscard]] child many_rows(unsigned n) {
+    child rows[60]{};
+    n = std::min(n, 60u);
+    for (unsigned i = 0; i < n; ++i)
+        rows[i] = label("row");
+    return div(style{}.flex_col(), {rows, n});
+}
+
+child build_rows(const rows_state& s, rows_host&) { return many_rows(s.rows); }
+
+child describe_rows(build_context&) {
+    const child kids[2] = {reducer<rows_state, rows_action>({}, reduce_rows, build_rows, 5), many_rows(60)};
+    return div(style{}.flex_col(), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(a_rebuild_the_frame_arena_cannot_hold_is_retried) {
+    // What 60 rows take of an arena: the frame's describe takes about that and the
+    // reducer's rebuild as much again, so an arena of 1.5 × fits either but not both.
+    unsigned rows_bytes = 0;
+    {
+        lx::runtime::memory_arena probe{1u << 20};
+        build_context ctx{probe};
+        build_scope scope{ctx};
+        (void)many_rows(60);
+        rows_bytes = probe.used_bytes();
+    }
+    LUMEN_CHECK(rows_bytes > 0);
+    lx::runtime::memory_arena arena{rows_bytes + rows_bytes / 2};
+    ui_root root{arena};
+    auto list = std::make_unique<lx::scene::draw_list>();
+    (void)env();
+    ui_damage().clear();
+    root.set_describer(describe_rows);
+    root.set_bounds({0, 0, 200, 2000});
+    LUMEN_CHECK(root.tick(*list));
+    ui_node* n = root.tree()->child_at(0);
+    LUMEN_CHECK(n && n->type() == rows_host::static_type());
+    auto* host = static_cast<rows_host*>(n);
+    const std::uint64_t built = host->rebuilds();
+    LUMEN_CHECK(host->child_at(0)->child_count() == 1);
+    // The dispatch lands in a frame that also describes the whole tree: the rebuild runs
+    // out of arena, keeps its subtree and stays queued.
+    host->dispatch({60});
+    invalidate_layout(*root.tree());
+    LUMEN_CHECK(root.tick(*list));
+    LUMEN_CHECK(host->rebuilds() == built && host->rebuild_pending());
+    LUMEN_CHECK(host->child_at(0)->child_count() == 1);
+    LUMEN_CHECK(ui_damage().needs_rebuild());
+    // The next frame describes the reducer alone: it fits.
+    LUMEN_CHECK(root.tick(*list));
+    LUMEN_CHECK(host->rebuilds() == built + 1 && !host->rebuild_pending());
+    LUMEN_CHECK(host->child_at(0)->child_count() == 60);
 }
 
 int main(int argc, char** argv) {

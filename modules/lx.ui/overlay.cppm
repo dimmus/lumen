@@ -26,9 +26,9 @@ import :theme;
 // does not fit, then shift to stay `margin` px inside the window (Zed's
 // `snap_to_window_with_margin(px(8.))`), and emits it after the main tree, so the overlap
 // grid orders it above everything it covers. Overlays are hit-tested before the tree,
-// topmost (last opened) first; a modal's scrim blocks everything below it. A press outside
-// an overlay dismisses it (`dismiss_outside`), as does Escape (`dismiss_escape`): the topmost
-// one, a modal's scrim taking the press. A modal or menu traps the focus in its content
+// topmost (last opened) first; an occluding one (a modal) blocks everything below it, scrim
+// or not. A press outside an overlay dismisses it (`dismiss_outside`), as does Escape
+// (`dismiss_escape`): the topmost one, an occluding overlay taking the press. A modal or menu traps the focus in its content
 // while it is open (`focus_manager::trap`) and gives it back when it closes. Activating an
 // item inside a menu closes the menu chain it is in. Every content node's bounds are surface
 // coordinates (`node_flag::layer` on the overlay node stops `surface_rect` there), so their
@@ -97,8 +97,11 @@ struct overlay_props {
     bool dismiss_escape = true;
     /// The focus stays in the content while it is open (a modal, a menu).
     bool trap_focus = false;
-    /// A modal's scrim: `elevated_surface.background` faded out by 0.2 over the window
-    /// (Zed's modal layer), blocking the pointer below.
+    /// Blocks the pointer below it over the whole window, taking a press outside its content
+    /// (and dismissing on it, with `dismiss_outside`): Zed's modal layer, scrim or not.
+    bool occlude = false;
+    /// Paints `elevated_surface.background` faded out by 0.2 over the window under it (Zed's
+    /// modal layer when a modal asks for `fade_out_background`). Paint only.
     bool scrim = false;
     /// The pointer passes through it (a tooltip).
     bool hit_through = false;
@@ -272,6 +275,31 @@ namespace {
 }
 
 lx::ui::overlay_layer* g_overlay_layer = nullptr;
+
+[[nodiscard]] lx::rect2i lx_ui_ov_union(lx::rect2i a, lx::rect2i b) {
+    if (a.width <= 0 || a.height <= 0)
+        return b;
+    if (b.width <= 0 || b.height <= 0)
+        return a;
+    const int x0 = std::min(a.x, b.x);
+    const int y0 = std::min(a.y, b.y);
+    const int x1 = std::max(a.x + a.width, b.x + b.width);
+    const int y1 = std::max(a.y + a.height, b.y + b.height);
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
+/// What an overlay's content paints (surface coordinates): every visible node's bounds with
+/// its shadows' reach (`ink_bounds`), not descending into overlays of its own (a submenu is
+/// its own layer entry).
+[[nodiscard]] lx::rect2i lx_ui_ov_painted(const lx::ui::ui_node& n) {
+    if (!n.visible() || n.has_flag(lx::ui::node_flag::layer))
+        return {};
+    lx::rect2i r = lx::ui::ink_bounds(n);
+    for (unsigned i = 0; i < n.child_count(); ++i)
+        if (const lx::ui::ui_node* c = n.child_at(i))
+            r = lx_ui_ov_union(r, lx_ui_ov_painted(*c));
+    return r;
+}
 
 } // namespace
 
@@ -478,7 +506,7 @@ void lx::ui::overlay_node::close() {
     layer.close_inside(*this);
     open_ = false;
     if (ui_node* c = content())
-        detail::damage_rect(c->bounds());
+        detail::damage_rect(lx_ui_ov_painted(*c));
     if (props_.scrim)
         detail::damage_rect(layer.window());
     layer.remove(*this);
@@ -616,6 +644,8 @@ void lx::ui::overlay_layer::node_destroyed(ui_node& node) {
 void lx::ui::overlay_layer::layout(lx::rect2i window) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     window_ = window;
+    // Overlay content resolves its percentages against the window.
+    const percent_base_scope base{static_cast<float>(window.width), static_cast<float>(window.height)};
     for (unsigned i = 0; i < count_; ++i) {
         entry& e = entries_[i];
         overlay_node& n = *e.node;
@@ -631,7 +661,7 @@ void lx::ui::overlay_layer::layout(lx::rect2i window) {
         if (e.fresh) {
             // Shown now: it paints even where it was laid out before (closed, then opened).
             e.fresh = false;
-            detail::damage_rect(r);
+            detail::damage_rect(lx_ui_ov_union(r, lx_ui_ov_painted(*content)));
             if (n.props_.scrim)
                 detail::damage_rect(window);
             if (n.props_.trap_focus && focus_ && !e.trapped)
@@ -647,6 +677,12 @@ void lx::ui::overlay_layer::emit(draw_scope& out) const {
         if (!content || !live(n) || entries_[i].fresh)
             continue;
         const float a = n.props_.fade_ms ? animate(*content, n.fade_) : 1.f;
+        if (n.props_.fade_ms && n.fade_.running(ui_now_ns())) {
+            // The fade repaints what the content paints next frame — its shadows past its
+            // bounds, and the scrim over the whole window.
+            damage_ledger& ledger = ui_damage();
+            ledger.add(n.props_.scrim ? window_ : lx_ui_ov_painted(*content));
+        }
         if (n.props_.scrim) {
             // Zed's modal layer: `elevated_surface_background.fade_out(0.2)` over the window.
             quad_style q{};
@@ -675,7 +711,7 @@ lx::ui::ui_node* lx::ui::overlay_layer::hit(lx::point2i at, bool interactive,
             blocked = true;
             return interactive ? hit_interactive(*content, at) : hit_node(*content, at);
         }
-        if (n.props_.scrim) {
+        if (n.props_.occlude) {
             blocked = true;
             return nullptr;
         }
@@ -699,7 +735,7 @@ bool lx::ui::overlay_layer::press(lx::point2i at) {
             n.props_.kind != overlay_kind::tooltip && n.parent() &&
             surface_bounds(*n.parent()).contains(at))
             return false;
-        if (n.props_.scrim) {
+        if (n.props_.occlude) {
             if (n.props_.dismiss_outside)
                 n.dismiss();
             return true;

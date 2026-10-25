@@ -240,12 +240,15 @@ struct flex_input {
 /// The container's border-box size, and its content size: the extent of its children's
 /// margin boxes plus its end padding, measured from its padding box's origin and never
 /// smaller than the padding box (CSS Overflow 3 §2.2's scrollable overflow for a flex
-/// container). A scroll owner's range is `content - padding box` on each axis.
+/// container). A scroll owner's range is `content - padding box` on each axis. `inner_*` is
+/// the container's content-box size (NaN where indefinite): its children's percent base.
 struct flex_output {
     float width = 0.f;
     float height = 0.f;
     float content_width = 0.f;
     float content_height = 0.f;
+    float inner_width = std::numeric_limits<float>::quiet_NaN();
+    float inner_height = std::numeric_limits<float>::quiet_NaN();
 };
 
 /// Per-item state of one solve; engine-private, caller-owned storage.
@@ -1278,5 +1281,7 @@ lx::layout::solve_flex(const flex_style& cs, const flex_input& in, const flex_ch
     result.height = s.outer[1];
     result.content_width = fmax(extent[0] + (count > 0 ? s.padding[1] : 0.f), cb[0]);
     result.content_height = fmax(extent[1] + (count > 0 ? s.padding[2] : 0.f), cb[1]);
+    result.inner_width = s.inner[0];
+    result.inner_height = s.inner[1];
     return result;
 }

@@ -482,6 +482,9 @@ install(FILES deploy/lumen/config.toml DESTINATION ${CMAKE_INSTALL_DATADIR}/lume
 install(DIRECTORY assets/fonts/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/fonts)
 # The compiled bundled themes and the Lucide icons with their licenses (lx.ui finds them here).
 install(FILES ${LUMEN_THEME_OUTPUTS} DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/themes)
+# They are compiled from Zed's MIT-licensed one.json: its notice goes with them.
+install(FILES assets/themes/one/LICENSE DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/themes
+    RENAME LICENSE-one)
 install(DIRECTORY assets/icons/ DESTINATION ${CMAKE_INSTALL_DATADIR}/lumen/icons)
 if(LUMEN_PORTAL_BUILT)
     install(TARGETS xdg-desktop-portal-lumen RUNTIME DESTINATION ${CMAKE_INSTALL_LIBEXECDIR})
@@ -1350,6 +1353,12 @@ if(LUMEN_BUILD_TESTS)
         test_cvt test_output_management test_output_config_store
         test_ui_reconcile test_ui_theme test_layout_flex test_gl_composite bench_composite bench_ui
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+    if(TEST test_ui_components)
+        set_tests_properties(test_ui_components PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+    endif()
+    if(TEST ui_gallery)
+        set_tests_properties(ui_gallery PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+    endif()
 
     set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")

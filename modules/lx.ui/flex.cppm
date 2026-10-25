@@ -22,6 +22,12 @@ import :theme;
 // node's own style. A child whose style sets a width, height, min or max is measured for
 // its content (`sizing_mode::content`): the engine applies those itself.
 //
+// Percentages: the engine resolves an item's against this container's content box, and the
+// container's own (padding, border, and size, min and max when it is not a flex item)
+// against `current_percent_base` — what its parent set (`percent_base_scope`): the engine's
+// `child_query::parent_*` while the parent measures it, the parent's arranged content box
+// while the parent places it.
+//
 // Sizes are whole pixels at the ui_node boundary: a known size is rounded before it is
 // passed down as a constraint, and each child's rect is rounded edge by edge (Taffy's
 // rule) so neighbours neither gap nor overlap. A constraint's max at
@@ -134,6 +140,8 @@ lx::layout::flex_size lx_ui_child_measure(void* ctx, unsigned i, const lx::layou
     const lx::ui::sizing_mode mode = q.content_size && lx_ui_sizes_itself(child->flex_item_style())
                                          ? lx::ui::sizing_mode::content
                                          : lx::ui::sizing_mode::inherent;
+    // The child's own percentages resolve against this container's content box.
+    const lx::ui::percent_base_scope base{q.parent_width, q.parent_height};
     const lx::size2i s = child->measure_cached(c, hint, mode);
     return {static_cast<float>(s.width), static_cast<float>(s.height)};
 }
@@ -171,6 +179,11 @@ lx::size2i lx::ui::flex_container_measure(const ui_node& self, const lx::layout:
     in.min_content_width = hint == size_hint::min;
     in.content_size = content;
     in.rem_px = ui_rem_px();
+    const percent_base base = current_percent_base();
+    in.parent_width = base.width;
+    in.parent_height = base.height;
+    if (style_reads_percent_base(style, content))
+        note_percent_base_read();
     lx_ui_flex_solve solve;
     const lx::layout::flex_output o = solve.run(self, style, in);
     lx::size2i out{lx_ui_round(o.width), lx_ui_round(o.height)};
@@ -187,8 +200,13 @@ lx::size2i lx::ui::flex_container_arrange(ui_node& self, const lx::layout::flex_
     in.available_width = in.known_width;
     in.available_height = in.known_height;
     in.rem_px = ui_rem_px();
+    const percent_base base = current_percent_base();
+    in.parent_width = base.width;
+    in.parent_height = base.height;
     lx_ui_flex_solve solve;
     const lx::layout::flex_output o = solve.run(self, style, in);
+    // The children's percent base while they arrange: this container's content box.
+    const percent_base_scope inner{o.inner_width, o.inner_height};
     const unsigned n = std::min(self.child_count(), ui_node::k_max_children);
     for (unsigned i = 0; i < n; ++i) {
         ui_node* child = self.child_at(i);
@@ -218,7 +236,13 @@ const char* lx::ui::flex_node::type_name() const {
 
 bool lx::ui::flex_node::apply(const flex_props& props) {
     const bool layout_changed = !(props.style == props_.style);
+    const lx::color& a = props.fill;
+    const lx::color& b = props_.fill;
+    const bool repaint = a.r != b.r || a.g != b.g || a.b != b.b || a.a != b.a;
     props_ = props;
+    // A new fill alone repaints the box; a layout change is damaged by the reconciler.
+    if (repaint && !layout_changed)
+        detail::damage_node(*this, ink_bounds(*this));
     return layout_changed;
 }
 

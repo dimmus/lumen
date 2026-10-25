@@ -79,6 +79,8 @@ public:
     /// retained tree instead of reconciling against a truncated description.
     [[nodiscard]] bool overflowed() const;
     void reset_overflow();
+    /// Bytes of the frame arena in use (0: nothing has described into it this frame).
+    [[nodiscard]] unsigned used_bytes() const;
 
     /// UI-thread current context, valid only for the duration of one rebuild. Lets
     /// `operator|` allocate wrapper descriptors without threading a parameter through
@@ -201,6 +203,7 @@ char* lx::ui::build_context::alloc_chars(unsigned count) {
 }
 
 bool lx::ui::build_context::overflowed() const { return overflowed_; }
+unsigned lx::ui::build_context::used_bytes() const { return arena_ ? arena_->used_bytes() : 0u; }
 void lx::ui::build_context::reset_overflow() { overflowed_ = false; }
 
 void lx::ui::build_context::note_overflow() {

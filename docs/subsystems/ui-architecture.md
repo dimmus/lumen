@@ -300,9 +300,19 @@ A node asks its children through **`measure_cached`** and **`place`**, never the
 directly (ADR-010 §4.7):
 
 - Each node has a 4-entry `(constraints, hint, mode) → size` cache (Yoga's shape) in a
-  72-byte block of the UI thread's measure-cache pool, taken the first time the node is
+  104-byte block of the UI thread's measure-cache pool, taken the first time the node is
   measured; `ui_node` itself stays 80 bytes. A key whose min is neither 0 nor its max goes
-  uncached; the flex container never makes one.
+  uncached; the flex container never makes one. An entry whose measurement read the percent
+  base (below) is keyed by it too.
+- Percentages resolve against the **percent base**, the parent's content box (NaN where it
+  is indefinite), which a parent sets for its children with a `percent_base_scope`: a flex
+  container its content box (the engine's `child_query::parent_*` while it measures, its
+  arranged inner size while it places), a decorator, scroll area, list or the overlay layer
+  the box it lays its children out in, `ui_root` the window; a wrapper that is its child's box
+  (opacity, clip, grow, sizing, a reducer) leaves it. A container resolves its own padding
+  and border (and, when no flex parent applies them, its size, min and max) against it, so
+  the parent's and the child's passes agree; a node with percentage padding or border is
+  re-arranged even at unchanged bounds.
 - `mark_layout_dirty()` (`invalidate_layout`, the reconciler when props or children change)
   clears the node's cache and marks it and its ancestors dirty, stopping below one already
   dirty: the passes keep "dirty ⇒ parent dirty" because an `arrange` places every child.
@@ -531,24 +541,24 @@ given.
 | Transparent button, hovered | label and icon turn `Color::Muted` (button_like.rs `hovered`) | label keeps its colour | no — ADR-010 §5.5's rule kept; listed in §7 Phase 3 |
 | Icon button | `Wide`: the 16 px icon + `Base04` each side by the size's height (24 × 22); `Square`: icon + `Base02` each side (20 × 20) | 24 × 22, 20 × 20 | yes |
 | Toggle button, selected | `Tinted(Accent)`: `info.background`, `info.border`, accent label; entries `XSmall` icons | same | yes |
-| Checkbox | 20 px container, 16 px box `m_1` `rounded_xs` `border_1` `border`, check `IconSize::Small` in the accent | same | yes (Lumen's is also a tab stop) |
-| Switch | `p(1px)` + `border_2` around a `Base32` × `Base20` track (`rounded_full`, 1 px border), 12 px thumb; on: `info` at 40 %, border `text.accent` at 20 % | 38 × 26 outer, 32 × 20 track, 12 px thumb 3 px from the end, same tokens | yes |
+| Checkbox | 20 px container (the hover group: the box's border at 70 % while it is hovered), 16 px box `m_1` `rounded_xs` `border_1` `border`, check `IconSize::Small` in the accent; the label keeps its colour when disabled | same | yes (Lumen's is also a tab stop) |
+| Switch | `p(1px)` + `border_2` around a `Base32` × `Base20` track (`rounded_full`, 1 px border), 12 px thumb; on: `info` at 40 %, border `text.accent` at 20 %; focus: the 2 px border `border.focused`; label `text`, not dimmed when disabled | 38 × 26 outer, 32 × 20 track, 12 px thumb 3 px from the end, same tokens; the ring 2 px | yes |
 | Divider | 1 px `border.variant`; vertical `h_4` (16 px) | same | yes |
 | Progress bar | `h_2` (8) with `p_0p5` (2), `rounded_full`, track `background`, fill `info` (`error` past the max) | 8 px, 4 px fill | yes |
 | Avatar | `rems(1.)` (16 px), round, optional border | same | yes (Lumen also draws initials) |
 | Key binding | a key `h(TextSize::Default)` (14) in `py_0p5` | 14 px in 18 px | yes |
-| Key binding hint | keys at `Small` − 2 (10 px), `py_0p5`, a 1 px cap border | same, 16 px cap | yes |
-| Tab, tab bar | `Tab::container_height` = `Base32` (32), content `Base32` − 1; start slot 12 px, end slot 14 px; bar groups `gap(Base04)` `px(Base06)` | 32 / 31, same slots and groups | yes |
+| Key binding hint | keys at `Small` − 2 (10 px), `py_0p5`, a 1 px cap border; the whole hint in the buffer font, italic | same, 16 px cap, the theme's buffer family | yes |
+| Tab, tab bar | `Tab::container_height` = `Base32` (32), content `Base32` − 1; start slot 12 px, end slot 14 px; bar groups `gap(Base04)` `px(Base06)`; the close button (pane.rs) shows on the hovered tab only | 32 / 31, same slots and groups (the gallery, a still image, shows no close buttons) | yes |
 | Label | `TextSize` Large 16, Default 14, Small 12, XSmall 10; line height φ (`TextLabel`) or 1 (`UiLabel`) | same | yes |
 | Headline | 0.88 / 1 / 1.125 / 1.27 / 1.43 rem, line height 1.6 rem | same | yes |
-| Icon | `IconSize` 10 / 12 / 14 / 16 / 48 px, Zed's own glyphs | Lucide 1.61.0 at the same sizes | sizes yes; glyphs differ (Zed's set is not bundled, ADR-010 §9) |
+| Icon | `IconSize` 10 / 12 / 14 / 16 / 48 px, Zed's own glyphs, 16-unit grid with a 1.2-unit stroke (1.2 px at 16 px) | Lucide 1.61.0 at the same sizes, its 24-unit stroke set to 1.8 units at raster time (1.2 px at 16 px) | sizes and weight yes; glyphs differ (Zed's set is not bundled, ADR-010 §9) |
 | Tooltip | `elevation_2` — `elevated_surface.background`, 1 px `border.variant`, `rounded_lg` (8 px), §5.2 shadows — `py_1` `px_2`, title `max_w_72` (288), meta `Small` muted, 8 / 10 px from the pointer | same (`rounded_lg` since Phase 3's gate; was `md`) | yes |
-| Context / popover menu | `elevation_2` (`rounded_lg`), `min_w(200)`, list `py(Base04)`, inset items (`px(Base04)` outside, `px(Base06)` box, `rounded_sm`), separator 1 px `my(Base06)`; submenus open on hover | same (`rounded_lg` since the gate); submenus open on a click, space, enter or → | radius and sizes yes; submenu trigger no |
-| Modal | `elevation_3` (four §5.2 shadows, `rounded_lg`), `top_20` (5 rem) below the window's top, scrim `elevated_surface.background` faded 0.2 (80 %) | same | yes |
-| Status toast | `elevation_3`, then `surface.background` and `shadow_lg`; `gap_2` `py_1p5` `pl_2p5`, `pr_1p5` with an action else `pr_2p5`; 10 s, resumed with ≥ 800 ms | same | yes |
+| Context / popover menu | `elevation_2` (`rounded_lg`), `min_w(200)`, list `py(Base04)`, inset items (`px(Base04)` outside, `px(Base06)` box, `rounded_sm`), separator 1 px `my(Base06)`; entry icons `Default` (`Muted` disabled, a toggle's check `Accent`), the submenu chevron `Muted`; submenus open on hover | same (`rounded_lg` since the gate); submenus open on a click, space, enter or → | radius, sizes and colours yes; submenu trigger no |
+| Modal | `elevation_3` (four §5.2 shadows, `rounded_lg`), `top_20` (5 rem) below the window's top; the layer occludes the window below and a press outside dismisses; a scrim `elevated_surface.background` faded 0.2 (80 %) only when the modal asks (`fade_out_background`, default false); the header's `Headline` in `text` | same: occluding always, the scrim with `modal(…).scrim()` | yes |
+| Status toast | `elevation_3` (1 px `border.variant`), then `surface.background` and `shadow_lg`; `gap_2` `py_1p5` `pl_2p5`, `pr_1p5` with an action else `pr_2p5`; the status in the icon's colour only; close: a square `Small` `Muted` icon button; 10 s, resumed with ≥ 800 ms | same | yes |
 | List item | dense: a 14 px label on the φ line (23 px); extra dense − 2 (21); sparse `py_1` (31); `px(Base06)`, `gap_1`; hover `ghost_element.hover`, selected `ghost_element.selected` | 23 / 21 / 31, same tokens | yes |
-| Scrollbar | `Regular`: 6 px thumb, 4 px padding, 14 px strip, 25 px minimum thumb, `scrollbar.thumb.*`; hidden 1 s after scrolling stops (`ShowScrollbar::Auto` → autohide, 400 ms fade) | same sizes; shown whenever the content overflows; the thumb carries `scrollbar.thumb.border` | sizes yes; autohide no |
-| Input field | `px_2` `py_1p5` `rounded_md`, 1 px `border.variant`, `border.focused` while focused | same | yes |
+| Scrollbar | `Regular`: 6 px thumb, 4 px padding, 14 px strip, 25 px minimum thumb; no track unless given colours; the thumb borderless, `surface.background` (alpha ≤ 0.7 unless hovered) blended with `scrollbar.thumb.*`; hidden 1 s after scrolling stops (`ShowScrollbar::Auto` → autohide, 400 ms fade) | same sizes and paint; shown whenever the content overflows | sizes and paint yes; autohide no |
+| Input field | `px_2` `py_1p5` `rounded_md`, 1 px `border.variant`, `border.focused` while focused; the editor's 1.2 line (17 px at 14 px), so `min_h_8` makes it 32 px | same, 32 px | yes |
 | Status bar | `p(Base04)` around default buttons (30 px), `status_bar.background` | 30 px | yes |
 | Panel toolbar | `py(Base06)` around a `min_h_8` (32 px) row, 1 px rule below: 45 px, `toolbar.background` | 45 px | yes |
 | Focus ring | per component (some draw `border.focused`, many draw nothing) | a 1 px `border.focused` ring on every focusable control (focus-visible only) | no — deliberate (keyboard use is visible everywhere) |

@@ -138,8 +138,8 @@ private:
 
 namespace {
 
-/// The pointer's hit test: the overlays first (topmost down; a modal's scrim blocks the
-/// tree), then the tree.
+/// The pointer's hit test: the overlays first (topmost down; an occluding one, a modal,
+/// blocks the tree), then the tree.
 lx::ui::ui_node* lx_ui_root_resolve(void*, lx::ui::ui_node* root, lx::point2i at,
                                     bool interactive) {
     bool blocked = false;
@@ -307,6 +307,8 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
 
     {
         lx::trace::scoped_span span{"ui", "ui.layout"};
+        // The tree's percentages resolve against the window.
+        const percent_base_scope base{static_cast<float>(bounds_.width), static_cast<float>(bounds_.height)};
         // The root is placed at the bounds: only the dirty path is measured and arranged
         // again (ADR-010 §4.7); a clean root at the same bounds is not walked at all.
         root_->place(bounds_);
@@ -329,6 +331,10 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
     // Raised before the emit (a removed node's bounds): this frame paints it.
     lx_ui_fold(frame_damage_, ledger);
     ledger.clear();
+    // A rebuild the layout pass queued and could not run (past the cap, or out of the frame
+    // arena) is the next frame's.
+    if (reducers_pending())
+        ledger.request(invalidation::rebuild);
 
     {
         lx::trace::scoped_span span{"ui", "ui.emit"};
@@ -362,8 +368,8 @@ bool lx::ui::ui_root::pointer_move(lx::point2i at) {
 bool lx::ui::ui_root::pointer_button(mouse_button b, bool pressed) {
     overlay_layer& overlays = ui_overlays();
     const lx::point2i at = pointer_.position();
-    // A press outside an overlay dismisses it before anything else sees the press; a
-    // modal's scrim takes it.
+    // A press outside an overlay dismisses it before anything else sees the press; an
+    // occluding overlay (a modal) takes it.
     if (pressed && overlays.press(at))
         return true;
     if (pressed && b == mouse_button::right) {

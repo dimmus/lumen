@@ -540,14 +540,20 @@ using namespace lx::ui;
     return f && f[0] ? f : lx::text::k_ui_family;
 }
 
-/// A text block's props for one run of UI text.
+/// The buffer (monospace) family of the active theme (§5.4), else lx.text's.
+[[nodiscard]] const char* lx_ui_buffer_family() {
+    const char* f = active_theme().fonts().buffer_family;
+    return f && f[0] ? f : lx::text::k_mono_family;
+}
+
+/// A text block's props for one run of UI text (`family` null: the UI family).
 [[nodiscard]] text_block_props lx_ui_text(const char* text, float size_px, tok color,
                                           float line_height, bool bold = false,
                                           bool italic = false, bool wrap = false,
-                                          bool ellipsize = false) {
+                                          bool ellipsize = false, const char* family = nullptr) {
     text_block_props p{};
     p.text = text ? text : "";
-    p.font = {lx_ui_ui_family(), size_px * 0.75f,
+    p.font = {family ? family : lx_ui_ui_family(), size_px * 0.75f,
               bold ? lx::text::weight::bold : lx::text::weight::normal,
               italic ? lx::text::style::italic : lx::text::style::normal};
     p.color = active_theme().color(color);
@@ -739,9 +745,10 @@ lx::ui::button_builder::operator child() const {
     if (full_width_)
         c.layout.w_full().justify_center();
     if (kind_ == kind::icon_only && shape_ == icon_button_shape::square) {
-        // `IconSize::square`: the icon plus `Base02` on each side, both ways.
-        const float side = icon_size_px(icon_size_) +
-                           2.f * spacing_px(sp::b02, ui_density(), lx_ui_rem());
+        // `IconSize::square`: the icon plus `Base02` on each side (`Base00` for an
+        // `Indicator`), both ways.
+        const sp pad = icon_size_ == lx::ui::icon_size::indicator ? sp::b00 : sp::b02;
+        const float side = icon_size_px(icon_size_) + 2.f * spacing_px(pad, ui_density(), lx_ui_rem());
         c.layout.w(rems_from_px(side * 16.f / lx_ui_rem())).h(rems_from_px(side * 16.f / lx_ui_rem()))
             .justify_center();
     }
@@ -762,6 +769,8 @@ lx::ui::button_builder::operator child() const {
     c.focus_ring = true;
 
     // Label and icon colours: disabled, selected (`Color::Selected`, the accent), or as set.
+    // button.rs recolours only a selected button's label; its start / end icon keeps its
+    // colour. An icon button's icon and a toggle group's entry icon are the accent.
     tok label_tok = label_color_;
     tok icon_tok = icon_color_;
     if (disabled_) {
@@ -769,7 +778,8 @@ lx::ui::button_builder::operator child() const {
         icon_tok = tok::icon_disabled;
     } else if (selected_) {
         label_tok = tok::text_accent;
-        icon_tok = tok::icon_accent;
+        if (kind_ == kind::icon_only || toggle)
+            icon_tok = tok::icon_accent;
     } else if (toggle) {
         icon_tok = tok::icon_muted; // toggle_button.rs: an unselected entry's icon is muted
     }
@@ -865,7 +875,7 @@ lx::ui::checkbox_builder::operator child() const {
 
     // The box: `m_1().size_4().rounded_xs().border_1()`, ghost or element background, border
     // `border` (disabled: `border.variant` over `element.disabled` at 60 %), the border at
-    // 70 % while the row is hovered (`group_hover`).
+    // 70 % while its 20 px container is hovered (`group_hover`).
     const tok border_tok = disabled_ ? tok::border_variant : tok::border;
     box_paint rest{filled_ ? paint(tok::element_background) : paint(tok::ghost_element_background),
                    paint(border_tok)};
@@ -888,15 +898,22 @@ lx::ui::checkbox_builder::operator child() const {
     else if (state_ == toggle_state::indeterminate)
         mark = icon_view(icon::minus, 14.f * lx_ui_rem() / 16.f, mark_tok); // `IconName::Dash`
     const child box_child = control(box, {&mark, mark ? 1u : 0u});
-    // `h_flex().size(Checkbox::container_size() = 20px).justify_center()`.
-    const child holder = lx_ui_box(lx_ui_h_flex().size(rems_from_px(20.f)).justify_center(),
-                                   control_paint{}, {&box_child, 1u});
+    // `h_flex().size(Checkbox::container_size() = 20px).justify_center()`, the hover group
+    // (`.group(group_id)`): the box's border follows the pointer over these 20 px, not over the
+    // label. Interactive so it tracks its own hover; a press on it toggles like the row.
+    control_props hp{};
+    hp.layout = lx_ui_h_flex().size(rems_from_px(20.f)).justify_center();
+    hp.on_activate = on_toggle_;
+    hp.value = row.value;
+    hp.interactive = true;
+    hp.disabled = disabled_;
+    const child holder = control(hp, {&box_child, 1u});
     child kids[2] = {holder, nullptr};
     unsigned n = 1;
+    // toggle.rs keeps the label's colour when disabled (only the box and mark dim).
     if (label_)
         kids[n++] = text_block(lx_ui_text(label_, label_size_px(label_size_, lx_ui_rem()),
-                                          disabled_ ? tok::text_disabled : label_color_,
-                                          lx_ui_phi_line()));
+                                          label_color_, lx_ui_phi_line()));
     return control(row, {kids, n}, key_);
 }
 
@@ -933,6 +950,7 @@ lx::ui::switch_builder::operator child() const {
                               2);
     sw.group_paint = true;
     sw.focus_ring = true;
+    sw.focus_ring_px = 2; // the ring is the 2 px border turning `border.focused`
 
     // The track: `w(Base32).h(Base20).rounded_full().px(Base02).border_1()`; off:
     // `element.disabled` and `border`; on: `info` at 40 % and `text.accent` at 20 %. Hovered,
@@ -966,8 +984,8 @@ lx::ui::switch_builder::operator child() const {
     child kids[2]{};
     unsigned n = 0;
     const child text_child =
-        label_ ? text_block(lx_ui_text(label_, label_size_px(label_size_, lx_ui_rem()),
-                                       disabled_ ? tok::text_disabled : tok::text, lx_ui_phi_line()))
+        label_ ? text_block(lx_ui_text(label_, label_size_px(label_size_, lx_ui_rem()), tok::text,
+                                       lx_ui_phi_line())) // toggle.rs: not dimmed when disabled
                : nullptr;
     if (text_child && label_at_ == switch_label_position::start)
         kids[n++] = text_child;
@@ -1089,8 +1107,10 @@ lx::ui::avatar_builder lx::ui::avatar(lx::gfx::atlas& atlas, lx::gfx::atlas_tile
 namespace {
 
 /// One `Key`: `h(size).text_size(size).line_height(1)`, a single character `w(size)`
-/// centred, longer text `px_0p5()`.
-[[nodiscard]] child lx_ui_key(const char* text, float size_px, tok color) {
+/// centred, longer text `px_0p5()`; in `family` (null: the UI family), italic if asked (it
+/// inherits a hint's font).
+[[nodiscard]] child lx_ui_key(const char* text, float size_px, tok color,
+                              const char* family = nullptr, bool italic = false) {
     const bool single = text && text[0] && !text[1];
     const float rem = lx_ui_rem();
     style s = lx_ui_h_flex().flex_none().h(rems_from_px(size_px * 16.f / rem));
@@ -1098,20 +1118,21 @@ namespace {
         s.w(rems_from_px(size_px * 16.f / rem)).justify_center();
     else
         s.px(rems_from_px(2.f));
-    const child t = text_block(lx_ui_text(text, size_px, color, 1.f));
+    const child t = text_block(lx_ui_text(text, size_px, color, 1.f, false, italic, false, false, family));
     return lx_ui_box(s, control_paint{}, {&t, 1u});
 }
 
 /// `KeyBinding`: each keystroke `h_flex().flex_none().py_0p5().rounded_xs()`, `Base04` apart.
 [[nodiscard]] child lx_ui_keys(std::span<const char* const> keys, float size_px, tok color,
-                               element_key key) {
+                               element_key key, const char* family = nullptr,
+                               bool italic = false) {
     constexpr unsigned k_max = 8;
     child strokes[k_max]{};
     unsigned n = 0;
     for (const char* k : keys) {
         if (n == k_max)
             break;
-        const child one = lx_ui_key(k, size_px, color);
+        const child one = lx_ui_key(k, size_px, color, family, italic);
         strokes[n++] = lx_ui_box(lx_ui_h_flex().flex_none().py(rems_from_px(2.f)), control_paint{},
                                  {&one, 1u});
     }
@@ -1146,7 +1167,10 @@ lx::ui::key_binding_hint_builder::operator child() const {
     cap = lx_ui_bordered(lx_ui_rounded(cap, radius::sm), 1);
     cap.shadow_y = 1;
     cap.shadow = paint(tok::text, light ? 0.04f : 0.08f);
-    const child keys = lx_ui_keys(keys_, px - 2.f * rem / 16.f, tok::text_muted, 0);
+    // keybinding_hint.rs sets `font_buffer` and italic on the whole hint: the prefix, the
+    // keys and the suffix are all in the buffer font.
+    const char* mono = lx_ui_buffer_family();
+    const child keys = lx_ui_keys(keys_, px - 2.f * rem / 16.f, tok::text_muted, 0, mono, true);
     const child cap_child = lx_ui_box(lx_ui_h_flex().flex_none().px(rems_from_px(2.f))
                                           .mr(rems_from_px(2.f)),
                                       cap, {&keys, 1u});
@@ -1154,10 +1178,12 @@ lx::ui::key_binding_hint_builder::operator child() const {
     unsigned n = 0;
     // `h_flex().gap_1()`, italic, `text.disabled`, `TextSize::Small`.
     if (prefix_)
-        kids[n++] = text_block(lx_ui_text(prefix_, px, tok::text_disabled, lx_ui_phi_line(), false, true));
+        kids[n++] = text_block(lx_ui_text(prefix_, px, tok::text_disabled, lx_ui_phi_line(), false, true,
+                                          false, false, mono));
     kids[n++] = cap_child;
     if (suffix_)
-        kids[n++] = text_block(lx_ui_text(suffix_, px, tok::text_disabled, lx_ui_phi_line(), false, true));
+        kids[n++] = text_block(lx_ui_text(suffix_, px, tok::text_disabled, lx_ui_phi_line(), false, true,
+                                          false, false, mono));
     return lx_ui_box(lx_ui_h_flex().flex_none().gap(rems_from_px(4.f)), control_paint{}, {kids, n}, key_);
 }
 

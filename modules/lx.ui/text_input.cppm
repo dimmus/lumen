@@ -48,14 +48,17 @@ import :theme;
 // `min_h_8()` (32 px), `px_2()` / `py_1p5()` (8 / 6 px), `rounded_md()`, a 1 px border
 // `border.variant` turning `border.focused` while focused, background `editor.background`;
 // text in `text`, the placeholder in `text.placeholder`, both `TextSize::Default` (14 px) on the
-// buffer's standard 1.3 line (§5.4: 19 px, so the field is 33 px). The caret is Zed's bar
+// 1.2 line Zed's single-line editor sets (editor.rs `ErasedEditorImpl::render`, the UI font:
+// 17 px, so `min_h_8` governs and the field is 32 px). The caret is Zed's bar
 // cursor, 2 px in `players[0].cursor`; the selection `players[0].selection`. The caret blinks
 // at Zed's 500 ms (`BlinkManager`) on a UI timer — no frames while it waits — restarting solid
 // after each edit or move, and stops when the focus leaves. Text wider than the field scrolls
 // horizontally to keep the caret in view (by origin, no relayout).
 //
-// Capacity: `text_input_props::max_bytes` (at most the buffer's capacity, the node's own
-// being `k_text_input_capacity`); an insertion that does not fit follows `overflow`: `reject`
+// Capacity: `text_input_props::max_bytes`, at most the buffer's capacity and at most
+// `k_text_input_capacity` (what the display holds); text longer than that — an app buffer
+// assigned more, a smaller `max_bytes` — is cut to it at a character boundary when the props
+// are applied. An insertion that does not fit follows `overflow`: `reject`
 // refuses it whole, `drop_newest` / `warn_and_drop` keep what fits (cut at a character
 // boundary); `rejected()` counts both. The preedit has `k_preedit_capacity`. Nothing
 // allocates per keystroke: the text, display and preedit buffers are fixed, the layout keeps
@@ -201,6 +204,8 @@ private:
     [[nodiscard]] const char* data() const;
     [[nodiscard]] std::uint32_t size() const;
     void set_size(std::uint32_t n);
+    /// Cuts the text to `capacity()` at a character boundary; true when it did.
+    bool clamp_to_capacity();
     void erase(std::uint32_t begin, std::uint32_t end);
     void changed();
     void sync_text();
@@ -288,7 +293,7 @@ constexpr int k_ti_pad_x = 8;  // px_2
 constexpr int k_ti_pad_y = 6;  // py_1p5
 constexpr int k_ti_min_h = 32; // min_h_8
 constexpr int k_ti_min_w = 192;
-constexpr float k_ti_line = 1.3f;
+constexpr float k_ti_line = 1.2f; // editor.rs: `line_height: relative(1.2)`
 constexpr int k_ti_caret_w = 2; // CursorShape::Bar
 
 /// The copied text clipboard::set_text points at (it keeps the pointer). UI affinity.
@@ -402,6 +407,8 @@ void lx::ui::text_input_node::set_size(std::uint32_t n) {
         buffer_->size = n;
         ++buffer_->revision;
         seen_revision_ = buffer_->revision;
+        if (buffer_->storage.empty())
+            return;
     } else {
         own_size_ = n;
     }
@@ -410,7 +417,21 @@ void lx::ui::text_input_node::set_size(std::uint32_t n) {
 
 std::uint32_t lx::ui::text_input_node::capacity() const {
     const std::uint32_t storage = buffer_ ? buffer_->capacity() : k_text_input_capacity;
-    return std::min(storage, max_bytes_);
+    // The display buffer holds `k_text_input_capacity` bytes of text (and the preedit).
+    return std::min({storage, max_bytes_, k_text_input_capacity});
+}
+
+bool lx::ui::text_input_node::clamp_to_capacity() {
+    // What the storage holds, then what the field may: cut at a character boundary.
+    std::uint32_t n = size();
+    if (buffer_)
+        n = std::min(n, buffer_->capacity());
+    const std::uint32_t cap = capacity();
+    if (n <= cap && n == size())
+        return false;
+    const std::size_t cut = lx_ui_ti_cut({data(), n}, cap);
+    set_size(static_cast<std::uint32_t>(cut));
+    return true;
 }
 
 std::string_view lx::ui::text_input_node::text() const { return {data(), size()}; }
@@ -482,11 +503,13 @@ bool lx::ui::text_input_node::apply(const text_input_props& p) {
     if (buffer_ && buffer_->revision != seen_revision_) {
         // The app changed the text: the caret goes to its end.
         seen_revision_ = buffer_->revision;
-        if (buffer_->size > buffer_->capacity())
-            buffer_->size = buffer_->capacity();
-        caret_ = anchor_ = buffer_->size;
+        caret_ = anchor_ = std::min(buffer_->size, capacity());
         reread = true;
     }
+    // Never more text than the field holds (an app buffer assigned more, a smaller
+    // `max_bytes`): cut at a character boundary, the buffer's revision bumped.
+    if (clamp_to_capacity())
+        reread = true;
     caret_ = std::min(caret_, size());
     anchor_ = std::min(anchor_, size());
     if (!applied_ || reread || new_placeholder || repaint || disabled_changed)
@@ -498,17 +521,19 @@ bool lx::ui::text_input_node::apply(const text_input_props& p) {
 }
 
 void lx::ui::text_input_node::sync_text() {
-    const std::uint32_t n = size();
+    // `apply` keeps the text within `capacity()`; the display is bounded here regardless.
+    const std::uint32_t n = std::min(size(), k_text_input_capacity);
+    const std::uint32_t at = std::min(caret_, n);
     const bool show_placeholder = n == 0 && preedit_size_ == 0;
     // The display: the text with the preedit at the caret.
     std::uint32_t d = 0;
     if (!show_placeholder) {
-        std::memcpy(display_, data(), caret_);
-        d = caret_;
+        std::memcpy(display_, data(), at);
+        d = at;
         std::memcpy(display_ + d, preedit_, preedit_size_);
         d += preedit_size_;
-        std::memcpy(display_ + d, data() + caret_, n - caret_);
-        d += n - caret_;
+        std::memcpy(display_ + d, data() + at, n - at);
+        d += n - at;
     }
     display_[d] = '\0';
     text_block_props p{};
@@ -522,8 +547,8 @@ void lx::ui::text_input_node::sync_text() {
     p.context = active_ui_resources().text;
     if (preedit_size_ && !show_placeholder) {
         preedit_attr_ = {};
-        preedit_attr_.begin = caret_;
-        preedit_attr_.end = caret_ + preedit_size_;
+        preedit_attr_.begin = at;
+        preedit_attr_.end = at + preedit_size_;
         preedit_attr_.underline = lx::text::text_underline::single;
         p.attrs = {&preedit_attr_, 1};
     }
@@ -792,7 +817,10 @@ bool lx::ui::text_input_node::insert(std::string_view s) {
     const std::uint32_t a = selection_begin();
     const std::uint32_t b = selection_end();
     const std::uint32_t n = size();
-    const std::uint32_t room = capacity() - (n - (b - a));
+    // Saturating: the text never outgrows the capacity (`apply` cuts it), but a room must
+    // not wrap if it did.
+    const std::uint32_t used = n - (b - a);
+    const std::uint32_t room = used < capacity() ? capacity() - used : 0u;
     std::size_t take = s.size();
     if (take > room) {
         ++rejected_;

@@ -51,6 +51,41 @@ struct layout_counters {
 
 [[nodiscard]] layout_counters& ui_layout_counters();
 
+/// The percent base of the node being measured or arranged: its parent's content box, NaN
+/// where it is indefinite — what CSS resolves the node's own percentage padding, border,
+/// size, min and max against (`layout::flex_input::parent_*`). A parent sets it for its
+/// children with a `percent_base_scope`: a flex container its content box (from the
+/// engine's `child_query::parent_*` while it measures, its arranged inner size while it
+/// places), a decorator, scroll area, list or overlay layer the box it lays its children
+/// out in; a wrapper that is its child's box (opacity, clip, grow, sizing, a reducer)
+/// leaves it as it is. Outside any scope (`ui_root` sets the window's) it is NaN. A
+/// measurement that read it (`note_percent_base_read`, a container with such a percentage)
+/// is cached under it. UI affinity.
+struct percent_base {
+    float width = std::numeric_limits<float>::quiet_NaN();
+    float height = std::numeric_limits<float>::quiet_NaN();
+};
+
+[[nodiscard]] percent_base current_percent_base();
+/// The measurement in progress resolved a percentage against `current_percent_base`.
+void note_percent_base_read();
+/// Whether `s` resolves a percentage against its own percent base: its padding or border,
+/// and (unless `content`, the sizing a flex parent applies itself) its size, min or max.
+[[nodiscard]] bool style_reads_percent_base(const layout::flex_style& s, bool content);
+
+/// Sets the percent base for the measurements and placements made while it lives.
+class percent_base_scope {
+public:
+    percent_base_scope(float width, float height);
+    ~percent_base_scope();
+    percent_base_scope(const percent_base_scope&) = delete;
+    percent_base_scope& operator=(const percent_base_scope&) = delete;
+
+private:
+    percent_base saved_{};
+    bool saved_read_ = false;
+};
+
 /// Result of routing a point through the tree — window chrome needs to distinguish
 /// "content" from "drag me" and "resize me" before the event reaches a widget.
 enum class hit_result : unsigned char {
@@ -325,17 +360,19 @@ public:
 
     /// `measure` (or `measure_content`) through this node's measure cache (ADR-010 §4.7,
     /// Yoga's shape): four `(constraints, hint, mode) → size` entries, replaced round-robin,
-    /// cleared by `mark_layout_dirty`. A key whose min is neither 0 nor its max on an axis is
-    /// measured without the cache (counted in `layout_counters::measure_uncached`); every
+    /// cleared by `mark_layout_dirty`; an entry whose measurement read the percent base
+    /// (`current_percent_base`) is keyed by it too. A key whose min is neither 0 nor its max
+    /// on an axis is measured without the cache (`layout_counters::measure_uncached`); every
     /// query the layout passes make has one or the other. The entries live out of the node,
-    /// in a 72-byte block of the UI thread's measure-cache pool that the node takes the first
+    /// in a 104-byte block of the UI thread's measure-cache pool that the node takes the first
     /// time it is measured and gives back when it dies: a node never measured (a leaf its
     /// parent places without asking) costs nothing, and the node stays the 80 bytes the emit
     /// walk reads (G3).
     [[nodiscard]] lx::size2i measure_cached(layout::constraints c, size_hint hint,
                                             sizing_mode mode = sizing_mode::inherent) const;
     /// `arrange` unless the node is clean and `bounds` are its bounds already: a clean
-    /// subtree whose place did not move is not walked.
+    /// subtree whose place did not move is not walked. A node with percentage padding or
+    /// border (`flex_item_style`) is arranged anyway: its percent base may have moved.
     void place(lx::rect2i bounds);
 
     /// The node's style as a flex item, read by its parent flex container: null for CSS's
@@ -359,6 +396,9 @@ public:
     /// The node as a scroll container, for its scrollbars; null when it is not one.
     [[nodiscard]] virtual scroll_target* as_scroll_target();
     [[nodiscard]] virtual hit_result hit_test(lx::point2i p) const;
+    /// How far the node paints outside its bounds, px on every side: a drop shadow's reach
+    /// (3σ + spread + offset). Damage covers it (`ink_bounds`). Default 0.
+    [[nodiscard]] virtual int ink_outset() const;
 
     [[nodiscard]] virtual a11y::node accessibility_node() const;
 
@@ -539,6 +579,10 @@ export namespace lx::ui {
 [[nodiscard]] lx::rect2i surface_bounds(const ui_node& node);
 /// A surface point in `node`'s layout space (the inverse of the viewports' offsets).
 [[nodiscard]] lx::point2i local_point(const ui_node& node, lx::point2i surface);
+/// `node`'s bounds grown by its `ink_outset` (an empty box stays empty): what it paints.
+[[nodiscard]] lx::rect2i ink_bounds(const ui_node& node);
+/// The same grown by `node`'s ink outset (`r` in its layout space).
+[[nodiscard]] lx::rect2i ink_rect(const ui_node& node, lx::rect2i r);
 
 } // namespace lx::ui
 
@@ -1029,20 +1073,28 @@ lx::ui::layout_counters g_layout_counters{};
 
 /// One node's measure cache. A tag is 0 when its entry is empty, else bit 0 set, the hint
 /// in bits 1–2, bit 3 / 4 set when the key's min width / height equals its max (else that
-/// min is 0), bit 5 for `sizing_mode::content`.
+/// min is 0), bit 5 for `sizing_mode::content`, bit 6 when the entry is keyed by the
+/// percent base (`base_*`, compared bit for bit: NaN matches NaN).
 struct lx_ui_measure_block {
     static constexpr unsigned k_entries = 4;
+    static constexpr std::uint8_t k_by_base = 0x40;
     struct entry {
         int max_width;
         int max_height;
         int width;
         int height;
+        std::uint32_t base_width;
+        std::uint32_t base_height;
     };
     std::uint8_t tags[k_entries];
     std::uint8_t next;
     entry entries[k_entries];
 };
-static_assert(sizeof(lx_ui_measure_block) == 72);
+static_assert(sizeof(lx_ui_measure_block) == 104);
+
+/// The percent base in force and whether the measurement in progress read it (UI affinity).
+lx::ui::percent_base g_percent_base{};
+bool g_percent_read = false;
 
 /// The UI thread's measure caches: blocks in 1 024-block chunks, recycled through a free
 /// list (linked through the first entry), so a tree that keeps its shape takes none. At
@@ -1163,9 +1215,39 @@ lx::ui::layout_counters& lx::ui::ui_layout_counters() {
     return g_layout_counters;
 }
 
+lx::ui::percent_base lx::ui::current_percent_base() { return g_percent_base; }
+
+void lx::ui::note_percent_base_read() { g_percent_read = true; }
+
+bool lx::ui::style_reads_percent_base(const layout::flex_style& s, bool content) {
+    const auto pct = [](layout::length l) { return l.kind() == layout::unit::percent; };
+    const auto edges = [&](const layout::edges& e) {
+        return pct(e.top) || pct(e.right) || pct(e.bottom) || pct(e.left);
+    };
+    if (edges(s.padding) || edges(s.border))
+        return true;
+    return !content && (pct(s.width) || pct(s.height) || pct(s.min_width) || pct(s.min_height) ||
+                        pct(s.max_width) || pct(s.max_height));
+}
+
+lx::ui::percent_base_scope::percent_base_scope(float width, float height)
+    : saved_{g_percent_base}, saved_read_{g_percent_read} {
+    g_percent_base = {width, height};
+    // What is measured under this base depends on it, not on the one outside: the reads
+    // made here stay here.
+    g_percent_read = false;
+}
+
+lx::ui::percent_base_scope::~percent_base_scope() {
+    g_percent_base = saved_;
+    g_percent_read = saved_read_;
+}
+
 lx::size2i lx::ui::ui_node::measure_cached(layout::constraints c, size_hint hint,
                                            sizing_mode mode) const {
     layout_counters& k = g_layout_counters;
+    const std::uint32_t base_w = std::bit_cast<std::uint32_t>(g_percent_base.width);
+    const std::uint32_t base_h = std::bit_cast<std::uint32_t>(g_percent_base.height);
     auto tag = static_cast<std::uint8_t>(1u | (static_cast<unsigned>(hint) << 1) |
                                          (mode == sizing_mode::content ? 0x20u : 0u));
     bool cacheable = true;
@@ -1184,10 +1266,17 @@ lx::size2i lx::ui::ui_node::measure_cached(layout::constraints c, size_hint hint
         const lx_ui_measure_block& b = pool.at(measure_slot_);
         for (unsigned e = 0; e < lx_ui_measure_block::k_entries; ++e) {
             const lx_ui_measure_block::entry& m = b.entries[e];
-            if (b.tags[e] == tag && m.max_width == c.max.width && m.max_height == c.max.height) {
-                ++k.measure_hits;
-                return {m.width, m.height};
+            const std::uint8_t t = b.tags[e];
+            if ((t & ~lx_ui_measure_block::k_by_base) != tag || m.max_width != c.max.width ||
+                m.max_height != c.max.height)
+                continue;
+            if ((t & lx_ui_measure_block::k_by_base) != 0) {
+                if (m.base_width != base_w || m.base_height != base_h)
+                    continue;
+                g_percent_read = true; // the caller's answer depends on the base too
             }
+            ++k.measure_hits;
+            return {m.width, m.height};
         }
     } else {
         ++k.measure_uncached;
@@ -1195,15 +1284,21 @@ lx::size2i lx::ui::ui_node::measure_cached(layout::constraints c, size_hint hint
     ++k.measures;
     if (k.on_measure)
         k.on_measure(*this);
+    // Whether this measurement reads the percent base: the caller's flag is kept aside and
+    // gets this one's on the way out (the parent depends on what its pass-through child read).
+    const bool outer_read = g_percent_read;
+    g_percent_read = false;
     const lx::size2i size =
         mode == sizing_mode::content ? measure_content(c, hint) : measure(c, hint);
+    const bool read = g_percent_read;
+    g_percent_read = outer_read || read;
     if (cacheable && measure_slot_ != 0) {
         // Measuring children never takes this node's block, so `b` is still this node's.
         lx_ui_measure_block& b = pool.at(measure_slot_);
         const unsigned e = b.next;
         b.next = static_cast<std::uint8_t>((e + 1u) % lx_ui_measure_block::k_entries);
-        b.entries[e] = {c.max.width, c.max.height, size.width, size.height};
-        b.tags[e] = tag;
+        b.entries[e] = {c.max.width, c.max.height, size.width, size.height, base_w, base_h};
+        b.tags[e] = static_cast<std::uint8_t>(tag | (read ? lx_ui_measure_block::k_by_base : 0u));
     }
     return size;
 }
@@ -1212,8 +1307,13 @@ void lx::ui::ui_node::place(lx::rect2i bounds) {
     layout_counters& k = g_layout_counters;
     if (!layout_dirty_ && bounds.x == bounds_.x && bounds.y == bounds_.y &&
         bounds.width == bounds_.width && bounds.height == bounds_.height) {
-        ++k.arrange_skips;
-        return;
+        // Percentage padding or border resolves against the parent's box, which may have
+        // changed though this node's did not: arrange it again.
+        const layout::flex_style* s = flex_item_style();
+        if (!s || !style_reads_percent_base(*s, true)) {
+            ++k.arrange_skips;
+            return;
+        }
     }
     ++k.arranges;
     if (k.on_arrange)
@@ -1227,15 +1327,16 @@ void lx::ui::ui_node::place(lx::rect2i bounds) {
     const bool moved = before.x != bounds.x || before.y != bounds.y ||
                        before.width != bounds.width || before.height != bounds.height;
     if (moved || has_flag(node_flag::repaint)) {
+        // What it paints: its shadows reach past the bounds.
         if (moved)
-            detail::damage_node(*this, before);
-        detail::damage_node(*this, bounds);
+            detail::damage_node(*this, ink_rect(*this, before));
+        detail::damage_node(*this, ink_rect(*this, bounds));
         set_flag(node_flag::repaint, false);
     }
 }
 
 void lx::ui::ui_node::mark_repaint() {
-    detail::damage_node(*this, bounds_);
+    detail::damage_node(*this, ink_bounds(*this));
     set_flag(node_flag::repaint, true);
 }
 
@@ -1317,9 +1418,20 @@ void lx::ui::detail::damage_node(const ui_node& node, lx::rect2i region) {
     damage_rect(surface_rect(node, region));
 }
 
+int lx::ui::ui_node::ink_outset() const { return 0; }
+
+lx::rect2i lx::ui::ink_rect(const ui_node& node, lx::rect2i r) {
+    const int o = node.ink_outset();
+    if (o <= 0 || r.width <= 0 || r.height <= 0)
+        return r;
+    return {r.x - o, r.y - o, r.width + 2 * o, r.height + 2 * o};
+}
+
+lx::rect2i lx::ui::ink_bounds(const ui_node& node) { return ink_rect(node, node.bounds()); }
+
 int lx::ui::ui_node::focus_order() const { return 0; }
 
-void lx::ui::ui_node::on_interaction_changed() { detail::damage_node(*this, bounds_); }
+void lx::ui::ui_node::on_interaction_changed() { detail::damage_node(*this, ink_bounds(*this)); }
 
 bool lx::ui::ui_node::on_focus_key(key_event, focus_manager&) { return false; }
 

@@ -536,7 +536,7 @@ ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
 | `lx.ui:style`, `:theme`, `:draw_scope`, `:components`, `:text_node` | Desktop | `lx.scene`, `lx.text`, `lx.layout` |
 | `lx.wayland.client` (real), `lx.app:window`, `:swapchain`, `:input` | Platform / Application | `lx.gfx` (through `lx.scene`), `lx.ui` |
 | `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui` |
-| `tools/lumen-theme` | tool | `lx.ui:theme` format only |
+| `tools/lumen-theme` | tool | the `lx.ui` facade (its `:theme`, `:theme_compile` and `:theme_defaults` partitions; see Phase 3's deviations) |
 
 The overlap grid (`order_grid`) is a geometry utility with no scene dependency, so it lives
 in `lx.gfx:primitives` beside the structs whose `order` it assigns; `lx.scene::draw_list`
@@ -1098,12 +1098,42 @@ licence) instead of a `one-dark.json` / `one-light.json` pair; icons live in `lx
 `widget*` focus manager was deleted, not ported (no callers); `text_block_node` does not read
 a style's text fields (the components pass colour and font); `ui_root` gained
 `emit_scope::damage`, which §4.9 did not plan; S2 ignores `--scale` (its sizes come from the
-theme's rem). Components that depart from Zed, on purpose: every focusable control draws the
+theme's rem); `tools/lumen-theme` links and imports the `lx.ui` facade, not a format-only
+library (§4.13 planned "`lx.ui:theme` format only"): the format, the compiler and Zed's
+defaults are lx.ui partitions built on lx.ui's `style` and token types, and moving them into a
+library below lx.ui would move those types with them for one build tool that no process
+links. Components that depart from Zed, on purpose: every focusable control draws the
 §5.5 focus ring (Zed varies it); a transparent button keeps its label colour on hover (§5.5;
 Zed mutes it); the checkbox and switch are tab stops; a lone toggle button sizes to its
 content; avatars may show initials; submenus open on a click, space, enter or → rather than
-on hover; the scrollbar thumb carries the theme's border token and the scrollbar does not
-autohide. G2's p95 is open, as above.
+on hover; the scrollbar does not autohide. G2's p95 is open, as above.
+
+Review fixes (after the gate). Bounds: a text input's text is cut, at a character boundary,
+to `min(storage, max_bytes, k_text_input_capacity)` whenever the props are applied (an app
+buffer assigned more, a smaller `max_bytes`), and an insertion's room saturates, so nothing
+writes past the node's fixed buffers. Layout: percentages now have a base across the
+`ui_node` boundary (`percent_base_scope`: the engine's `child_query::parent_*` while a flex
+container measures, its arranged content box while it places, a decorator's, scroll area's,
+list's or the overlay layer's box, the window at the root), the measure cache keys an entry by
+it only when the measurement read it (the block grew from 72 to 104 B; S2's clock frame still
+measures 9 nodes with 2 hits and arranges 5), and a node with percentage padding or border is
+re-arranged at unchanged bounds. Damage: `ui_node::ink_outset` (a shadow's 3σ + spread +
+offset) widens what `place`, `invalidate_paint`, `invalidate_layout` and `animate` damage; an
+overlay damages its content's painted extent when it opens and closes, and the whole window
+on every frame of a scrim's fade; paint-only prop changes on opacity, clip, flex and box nodes
+damage the node. A reducer or list rebuild that runs out of the frame arena is queued again
+for the next frame's (dropped, as logged, only when it overflowed an arena nothing else used).
+Fidelity against Zed's sources: the modal layer occludes without a scrim unless a modal asks
+(`modal(…).scrim()`), its title in `text`; status toasts keep `border.variant` with a square
+muted close button; menu icons `Default` (chevron `Muted`); the scrollbar draws no track and a
+borderless thumb blended over the surface; the switch's ring is its 2 px border; the input
+field is 32 px (the editor's 1.2 line); the key binding hint is in the buffer font; a selected
+text button keeps its icon colour; disabled checkbox and switch labels keep their colour and
+the checkbox's hover group is its 20 px box; an `Indicator` square icon button has no padding;
+Lucide strokes are drawn 1.8 units wide (Zed's 1.2 px at 16 px). The gallery is now 1 492
+primitives (no close glyph on unhovered tabs, as Zed shows none); the `icons`,
+`components_states`, `components_gallery`, `menu_open`, `tooltip`, `modal`, `toast_stack`,
+`scroll_area` and `text_input` references were rewritten.
 
 ### Phase 4 — The client runtime (≈3 weeks)
 

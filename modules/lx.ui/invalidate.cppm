@@ -56,7 +56,7 @@ private:
 /// Walk to the root of a retained tree.
 [[nodiscard]] ui_node* root_of(ui_node& node);
 
-/// Repaint just this node's bounds.
+/// Repaint just this node's bounds, and what it paints past them (`ink_bounds`).
 void invalidate_paint(ui_node& node);
 /// Repaint an explicit sub-region (text caret, hover ring) without the whole node.
 void invalidate_paint(ui_node& node, lx::rect2i region);
@@ -189,7 +189,7 @@ lx::ui::ui_node* lx::ui::root_of(ui_node& node) {
     return cursor;
 }
 
-void lx::ui::invalidate_paint(ui_node& node) { ui_damage().add(surface_rect(node, node.bounds())); }
+void lx::ui::invalidate_paint(ui_node& node) { ui_damage().add(surface_rect(node, ink_bounds(node))); }
 
 void lx::ui::invalidate_paint(ui_node& node, lx::rect2i region) {
     lx::rect2i placed = region;
@@ -203,7 +203,7 @@ void lx::ui::invalidate_layout(ui_node& node) {
     node.mark_layout_dirty();
     // Damage the pre-layout bounds now; the post-layout bounds are added by the root
     // after arrange, so a resize repaints both the vacated and the newly covered area.
-    ui_damage().add(surface_rect(node, node.bounds()));
+    ui_damage().add(surface_rect(node, ink_bounds(node)));
     ui_damage().request(invalidation::layout);
 }
 

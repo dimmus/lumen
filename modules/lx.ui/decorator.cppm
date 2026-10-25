@@ -246,6 +246,12 @@ namespace {
     return s ? *s : lx::layout::k_default_flex_style;
 }
 
+/// A side of a box being measured under `lo`..`hi`: definite (a percent base) only when the
+/// constraint fixes it.
+[[nodiscard]] float lx_ui_definite(int lo, int hi, int less = 0) {
+    return lo == hi ? static_cast<float>(std::max(hi - less, 0)) : std::numeric_limits<float>::quiet_NaN();
+}
+
 [[nodiscard]] int lx_ui_align_offset(lx::layout::align how, int available, int used) {
     const int slack = available - used;
     if (slack <= 0)
@@ -294,6 +300,9 @@ lx::size2i lx::ui::insets_node::measure(layout::constraints c, size_hint hint) c
     inner.min.height = c.min.height > extra_h ? c.min.height - extra_h : 0;
 
     const ui_node* content = child_at(0);
+    // The content's percent base: the box inside the insets, where the constraint fixes it.
+    const percent_base_scope base{lx_ui_definite(c.min.width, c.max.width, extra_w),
+                                  lx_ui_definite(c.min.height, c.max.height, extra_h)};
     const lx::size2i inner_size = content ? content->measure_cached(inner, hint) : lx::size2i{};
     return {inner_size.width + extra_w, inner_size.height + extra_h};
 }
@@ -302,9 +311,12 @@ void lx::ui::insets_node::arrange(lx::rect2i bounds) {
     bounds_ = bounds;
     clear_layout_dirty();
     if (ui_node* content = child_at(0)) {
-        content->place({bounds.x + props_.padding.left, bounds.y + props_.padding.top,
-                        bounds.width - props_.padding.left - props_.padding.right,
-                        bounds.height - props_.padding.top - props_.padding.bottom});
+        const lx::rect2i inner{bounds.x + props_.padding.left, bounds.y + props_.padding.top,
+                               bounds.width - props_.padding.left - props_.padding.right,
+                               bounds.height - props_.padding.top - props_.padding.bottom};
+        const percent_base_scope base{static_cast<float>(std::max(inner.width, 0)),
+                                      static_cast<float>(std::max(inner.height, 0))};
+        content->place(inner);
     }
 }
 
@@ -326,6 +338,8 @@ lx::size2i lx::ui::align_node::measure(layout::constraints c, size_hint hint) co
     // Alignment consumes whatever it is given; the child keeps its own preference. An
     // unbounded axis (a flex container asking for the content size) gets the child's.
     const ui_node* content = child_at(0);
+    const percent_base_scope base{lx_ui_definite(c.min.width, c.max.width),
+                                  lx_ui_definite(c.min.height, c.max.height)};
     if (hint == size_hint::min)
         return content ? content->measure_cached(c, hint) : c.min;
     const int unbounded = layout::constraints{}.max.width;
@@ -342,6 +356,7 @@ void lx::ui::align_node::arrange(lx::rect2i bounds) {
     ui_node* content = child_at(0);
     if (!content)
         return;
+    const percent_base_scope base{static_cast<float>(bounds.width), static_cast<float>(bounds.height)};
 
     layout::constraints c{};
     c.max = bounds.size();
@@ -432,7 +447,11 @@ lx::ui::element_type_id lx::ui::opacity_node::static_type() {
 lx::ui::element_type_id lx::ui::opacity_node::type() const { return static_type(); }
 const char* lx::ui::opacity_node::type_name() const { return "opacity"; }
 bool lx::ui::opacity_node::apply(const opacity_props& props) {
+    // Paint only: the subtree repaints where it is (the layout is untouched).
+    const bool repaint = props.value != props_.value;
     props_ = props;
+    if (repaint)
+        detail::damage_node(*this, ink_bounds(*this));
     return false;
 }
 const lx::layout::flex_style* lx::ui::opacity_node::flex_item_style() const {
@@ -460,7 +479,11 @@ lx::ui::element_type_id lx::ui::clip_node::static_type() {
 lx::ui::element_type_id lx::ui::clip_node::type() const { return static_type(); }
 const char* lx::ui::clip_node::type_name() const { return "clip"; }
 bool lx::ui::clip_node::apply(const clip_props& props) {
+    // Paint only: what the children draw past the bounds shows or goes.
+    const bool repaint = props.enabled != props_.enabled;
     props_ = props;
+    if (repaint)
+        detail::damage_node(*this, ink_bounds(*this));
     return false;
 }
 const lx::layout::flex_style* lx::ui::clip_node::flex_item_style() const {

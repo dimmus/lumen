@@ -248,9 +248,10 @@ private:
 
 // ── Focus ring ──
 
-/// The focus ring of §5.5 over `bounds` (corner radii px, top-left clockwise): a 1 px
-/// `border.focused` border on the box itself, no glow, no offset.
-void draw_focus_ring(draw_scope& out, lx::rect2i bounds, const float (&radii)[4]);
+/// The focus ring of §5.5 over `bounds` (corner radii px, top-left clockwise): a `width` px
+/// (1 by default) `border.focused` border on the box itself, no glow, no offset.
+void draw_focus_ring(draw_scope& out, lx::rect2i bounds, const float (&radii)[4],
+                     float width = 1.f);
 
 } // namespace lx::ui
 
@@ -356,7 +357,7 @@ float lx::ui::animate(const ui_node& node, const transition& t) {
     const std::uint64_t now = ui_now_ns();
     if (t.running(now)) {
         damage_ledger& ledger = ui_damage();
-        ledger.add(surface_rect(node, node.bounds()));
+        ledger.add(surface_rect(node, ink_bounds(node)));
         ledger.request(invalidation::animate);
     }
     return t.value(now);
@@ -605,12 +606,13 @@ void lx::ui::pointer_state::node_destroyed(ui_node& node) {
 
 // ── focus ring ──
 
-void lx::ui::draw_focus_ring(draw_scope& out, lx::rect2i bounds, const float (&radii)[4]) {
+void lx::ui::draw_focus_ring(draw_scope& out, lx::rect2i bounds, const float (&radii)[4],
+                             float width) {
     quad_style q{};
     q.border_color = active_theme().color(tok::border_focused);
     for (unsigned i = 0; i < 4; ++i) {
         q.corner_radii[i] = radii[i];
-        q.border_widths[i] = 1.f;
+        q.border_widths[i] = width;
     }
     out.quad(bounds, q);
 }

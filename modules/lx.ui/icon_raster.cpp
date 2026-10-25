@@ -23,6 +23,7 @@ namespace {
 /// it is not linked).
 struct lx_ui_rsvg_api {
     decltype(&rsvg_handle_new_from_file) new_from_file = nullptr;
+    decltype(&rsvg_handle_set_stylesheet) set_stylesheet = nullptr;
     decltype(&rsvg_handle_render_document) render_document = nullptr;
     decltype(&g_object_unref) object_unref = nullptr;
     decltype(&g_error_free) error_free = nullptr;
@@ -49,6 +50,7 @@ const lx_ui_rsvg_api& lx_ui_rsvg() {
             return slot != nullptr;
         };
         a.ok = sym(a.new_from_file, "rsvg_handle_new_from_file") &&
+               sym(a.set_stylesheet, "rsvg_handle_set_stylesheet") &&
                sym(a.render_document, "rsvg_handle_render_document") &&
                sym(a.object_unref, "g_object_unref") && sym(a.error_free, "g_error_free") &&
                sym(a.surface_for_data, "cairo_image_surface_create_for_data") &&
@@ -92,6 +94,18 @@ lx::result<void> lx::ui::rasterize_icon(const char* path, unsigned size_px,
         a.error_free(err);
     if (!h)
         return lx::make_error(lx::ui_err::icon_raster, "rasterize_icon: not an SVG librsvg reads");
+    // Zed's icons are drawn on a 16-unit grid with a 1.2-unit stroke (1.2 px at 16 px); the
+    // bundled Lucide set's 24-unit grid has a 2-unit one (1.33 px at 16 px). The same weight:
+    // 1.2 × 24 / 16 = 1.8 units, scaling with the icon as Zed's does. Lucide sets the width on
+    // the root only; a user-origin `!important` rule wins over that presentation attribute.
+    static constexpr char k_stroke_css[] = "* { stroke-width: 1.8px !important; }";
+    err = nullptr;
+    if (!a.set_stylesheet(h, reinterpret_cast<const guint8*>(k_stroke_css), sizeof(k_stroke_css) - 1, &err)) {
+        if (err)
+            a.error_free(err);
+        a.object_unref(h);
+        return lx::make_error(lx::ui_err::icon_raster, "rasterize_icon: librsvg refused the stroke style");
+    }
     // 128² ARGB32 at most: 64 KiB on the stack, no heap of our own (librsvg's is its own).
     alignas(16) std::uint32_t argb[icon_cache::k_max_px * icon_cache::k_max_px];
     const int n = static_cast<int>(size_px);

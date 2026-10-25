@@ -726,7 +726,8 @@ inline void build_tooltip(lx::ui::draw_scope& s, const tiles& t) {
                         });
 }
 
-/// A modal over a panel of content: its scrim, the modal surface, header, body and footer.
+/// A modal over a panel of content: the scrim it asks for (`scrim()`, Zed's
+/// `fade_out_background`; off by default), the modal surface, header, body and footer.
 [[nodiscard]] inline lx::ui::child describe_modal_over_content() {
     using namespace lx::ui;
     const child behind[] = {
@@ -738,7 +739,7 @@ inline void build_tooltip(lx::ui::draw_scope& s, const tiles& t) {
     const child footer_end = button("Discard").style(button_style::filled);
     const child footer_start = button("Cancel");
     const child kids[2] = {div(style{}.flex_col().gap(sp::b08).p(sp::b12).size_full().bg(tok::surface_background), behind),
-                           modal(body).title("Unsaved changes").open(true).width(300.f).footer(footer_start, footer_end)};
+                           modal(body).title("Unsaved changes").open(true).scrim().width(300.f).footer(footer_start, footer_end)};
     return div(style{}.size_full(), kids);
 }
 

@@ -43,13 +43,15 @@ import :theme;
 // flipping above or leftwards at the window's edges; `context_menu(target, entries)` opens at
 // the pointer on a secondary press inside `target`. A modal (`modal`, modal.rs and the
 // workspace's modal layer) is a `modal_surface` box (§5.2's four shadows, rounded `lg`) 5 rem
-// below the window's top, centred, over a scrim of `elevated_surface.background` at 80 %; it
-// traps the focus and Escape or a press on the scrim dismisses it. Toasts (`toast`,
+// below the window's top, centred; it occludes the window below (nothing under it takes the
+// pointer), traps the focus, and Escape or a press outside it dismisses it. As in Zed it draws
+// no scrim unless asked (`modal_builder::scrim`, Zed's `fade_out_background`):
+// `elevated_surface.background` at 80 % over the window. Toasts (`toast`,
 // crates/notifications/src/status_toast.rs, the workspace's toast layer) stack at the bottom
 // centre and dismiss themselves after `duration_ms` (Zed's 10 s), the timer paused while the
 // pointer is over one (resumed with at least Zed's 800 ms); each is Zed's status toast — the
-// surface background, rounded `lg`, GPUI's `shadow_lg`, the icon in its status colour and its
-// border the status border.
+// surface background, rounded `lg`, the elevation's 1 px `border.variant`, GPUI's `shadow_lg`,
+// the icon in its status colour, a square muted close button.
 //
 // All of them fade in (§5.5: 100 ms for menus and tooltips, 150 ms for modals and toasts).
 
@@ -157,6 +159,8 @@ public:
     modal_builder& footer(child start, child end) { footer_start_ = start; footer_end_ = end; return *this; }
     /// The header's close button (default on).
     modal_builder& dismiss_button(bool on) { dismiss_button_ = on; return *this; }
+    /// Fade the window out under it (Zed's `ModalView::fade_out_background`, default off).
+    modal_builder& scrim(bool on = true) { scrim_ = on; return *this; }
     modal_builder& name(const char* a11y) { name_ = a11y; return *this; }
     modal_builder& key(element_key k) { key_ = k; return *this; }
     operator child() const; // NOLINT(google-explicit-constructor)
@@ -166,6 +170,7 @@ private:
     const char* title_ = nullptr;
     bool open_ = false;
     bool dismiss_button_ = true;
+    bool scrim_ = false;
     handler on_dismiss_{};
     float width_ = 448.f;
     child footer_start_ = nullptr;
@@ -203,6 +208,8 @@ public:
     void arrange(lx::rect2i bounds) override;
     void emit(draw_scope& out) const override;
     [[nodiscard]] const lx::layout::flex_style* flex_item_style() const override;
+    /// `shadow_lg`'s reach.
+    [[nodiscard]] int ink_outset() const override;
     void on_timer(std::uint32_t tag) override;
     void on_interaction_changed() override;
     [[nodiscard]] a11y::node accessibility_node() const override;
@@ -297,13 +304,15 @@ child lx_ui_pp_entries(std::span<const menu_entry> entries, const char* name);
     }
     const bool disabled = e.is_disabled;
     const tok text_tok = disabled ? tok::text_disabled : tok::text;
-    const tok icon_tok = disabled ? tok::icon_disabled : tok::icon_muted;
+    // context_menu.rs: an entry's icon `Default` (a toggle's check `Accent`), `Muted` when
+    // disabled; a submenu entry's icon and chevron `Muted`.
+    const tok icon_tok = disabled || e.kind == menu_entry_kind::submenu ? tok::icon_muted : tok::icon;
     const float small = 14.f * lx_ui_pp_rem() / 16.f; // IconSize::Small
     // The label: `h_flex().gap_1p5()` over the icon (or a toggle's check slot) and the label.
     child head[2]{};
     unsigned hn = 0;
     if (e.toggled >= 0) {
-        const child check = icon_view(icon::check, small, disabled ? tok::icon_disabled : tok::icon_accent);
+        const child check = icon_view(icon::check, small, disabled ? tok::icon_muted : tok::icon_accent);
         control_props slot{};
         slot.layout = style{}.flex_none().size(lx::layout::px(small));
         slot.paint.opacity = e.toggled ? 255 : 0; // `.when(!toggled, invisible)`
@@ -326,7 +335,7 @@ child lx_ui_pp_entries(std::span<const menu_entry> entries, const char* name);
         parts[pn++] = control(wrap, {&kb, 1u});
     }
     if (e.kind == menu_entry_kind::submenu) {
-        parts[pn++] = icon_view(icon::chevron_right, small, icon_tok);
+        parts[pn++] = icon_view(icon::chevron_right, small, tok::icon_muted);
         // The submenu: right of the item, its first entry beside it (the menu's 4 px list
         // padding and 1 px border above it, the item's 4 px inset and the border beside it).
         overlay_props o{};
@@ -514,10 +523,11 @@ lx::ui::modal_builder::operator child() const {
     unsigned n = 0;
     if (title_ || dismiss_button_) {
         // `ModalHeader`: `h_flex().justify_between().w_full().px(Base12).pt(Base08)
-        // .pb(Base04).gap(Base08)`, the headline `Small` and muted, the close button small.
+        // .pb(Base04).gap(Base08)`, the headline `Small` (in `text`: Zed's `Headline` ignores
+        // the `Muted` ModalHeader gives it), the close button small.
         child head[2]{};
         unsigned hn = 0;
-        head[hn++] = headline(title_ ? title_ : "").size(headline_size::small).color(tok::text_muted);
+        head[hn++] = headline(title_ ? title_ : "").size(headline_size::small);
         if (dismiss_button_) {
             const handler close = on_dismiss_;
             head[hn++] = icon_button(icon::x).icon_size(icon_size::small).on_press(close).name("Close");
@@ -551,7 +561,8 @@ lx::ui::modal_builder::operator child() const {
     o.open = open_;
     o.placement.side = overlay_side::window_top;
     o.placement.window_top = static_cast<int>(std::lround(5.f * rem)); // `top_20()`
-    o.scrim = true;
+    o.occlude = true;
+    o.scrim = scrim_;
     o.trap_focus = true;
     o.fade_ms = static_cast<std::uint16_t>(k_motion_ms);
     o.on_dismiss = on_dismiss_;
@@ -604,20 +615,31 @@ void lx::ui::toast_node::arrange(lx::rect2i bounds) {
         box->place(bounds);
 }
 
+namespace {
+/// GPUI's `shadow_lg` (Tailwind's `0 10px 15px -3px`, `0 4px 6px -4px`, black at 10 %).
+constexpr struct {
+    int dy;
+    float blur;
+    float spread;
+} k_lx_ui_shadow_lg[2] = {{10, 15.f, -3.f}, {4, 6.f, -4.f}};
+} // namespace
+
+int lx::ui::toast_node::ink_outset() const {
+    float reach = 0.f;
+    for (const auto& s : k_lx_ui_shadow_lg)
+        reach = std::max(reach, 3.f * s.blur + s.spread + static_cast<float>(std::abs(s.dy)));
+    return static_cast<int>(std::ceil(reach));
+}
+
 void lx::ui::toast_node::emit(draw_scope& out) const {
     if (!visible_ || dismissed_)
         return;
-    // status_toast.rs: `.elevation_3(cx)…shadow_lg()` — GPUI's `shadow_lg` (Tailwind's
-    // `0 10px 15px -3px`, `0 4px 6px -4px`, black at 10 %) replaces the modal shadows.
+    // status_toast.rs: `.elevation_3(cx)…shadow_lg()` — `shadow_lg` replaces the modal
+    // shadows.
     if (const ui_node* box = child_at(0)) {
         const lx::rect2i b = box->bounds();
         const float r = radius_px(radius::lg, ui_rem_px());
-        static constexpr struct {
-            int dy;
-            float blur;
-            float spread;
-        } k_lg[2] = {{10, 15.f, -3.f}, {4, 6.f, -4.f}};
-        for (const auto& s : k_lg) {
+        for (const auto& s : k_lx_ui_shadow_lg) {
             shadow_style sh{};
             sh.color = lx::color::rgb(0.f, 0.f, 0.f, 0.1f);
             for (float& c : sh.corner_radii)
@@ -681,16 +703,19 @@ lx::ui::toast_builder::operator child() const {
     if (dismiss_button_) {
         // The close button calls back like the timer would.
         const handler h = props_.on_dismiss;
-        kids[n++] = icon_button(icon::x).icon_size(icon_size::small).on_press(h).name("Dismiss");
+        // status_toast.rs: `IconButton::new(.., IconName::Close).shape(Square)
+        // .icon_size(Small).icon_color(Muted)`.
+        kids[n++] = icon_button(icon::x).shape(icon_button_shape::square).icon_size(icon_size::small)
+                        .icon_color(tok::icon_muted).on_press(h).name("Dismiss");
     }
     // status_toast.rs: `h_flex().elevation_3().gap_2().py_1p5().pl_2p5()` and `pr_2p5()` (`pr_1p5()`
     // with a button), `bg(surface_background)`, `shadow_lg()` (drawn by the toast node); the
-    // elevation's 1 px border, which a status toast takes from its status (§5.1).
+    // elevation's 1 px `border.variant` (the status shows in the icon's colour only).
     style s = style{}.flex_row().items_center().flex_none().gap(rems_from_px(8.f))
                   .py(rems_from_px(6.f)).pl(rems_from_px(10.f))
                   .pr(rems_from_px(dismiss_button_ ? 6.f : 10.f))
                   .bg(tok::surface_background).rounded(radius::lg)
-                  .border_1(has_status_ ? sc.border : tok::border_variant);
+                  .border_1(tok::border_variant);
     const child box = div(s, {kids, n});
     return with_children(describe<toast_node, toast_props>(props_, key_), {&box, 1u});
 }

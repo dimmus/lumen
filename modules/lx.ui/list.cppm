@@ -311,6 +311,8 @@ void lx::ui::list_chunk_node::arrange(lx::rect2i bounds) {
     bounds_ = bounds;
     layout_dirty_ = false;
     const int h = props_.row_height;
+    // A row's percentages resolve against the list's width and the row's height.
+    const percent_base_scope base{static_cast<float>(bounds.width), static_cast<float>(h)};
     for (unsigned i = 0; i < child_count(); ++i)
         if (ui_node* r = child_at(i))
             r->place({bounds.x, bounds.y + static_cast<int>(i) * h, bounds.width, h});
@@ -475,9 +477,10 @@ void lx::ui::list_node::arrange(lx::rect2i bounds) {
             bar->place(bar->geometry().strip);
         }
     }
-    // The viewport changed which rows show: describe them (ui_root lays out again).
+    // The viewport changed which rows show, or the rows were never described (a first build
+    // the frame arena could not hold): describe them (ui_root lays out again).
     const window w = wanted_window();
-    if (built_ && (w.first != built_first_ || w.slots != built_slots_))
+    if (!built_ || w.first != built_first_ || w.slots != built_slots_)
         request_rebuild();
 }
 

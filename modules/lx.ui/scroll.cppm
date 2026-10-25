@@ -35,13 +35,12 @@ import :theme;
 // `thumb_ranges` (start = offset / max offset × (viewport − thumb), as a fraction of the
 // viewport, times the inset track). A press on the thumb drags it (the grab point kept); a
 // press on the track centres the thumb there and drags on (`ScrollbarMouseEvent::TrackClick`,
-// `thumb_size / 2`). Colours are the theme's scrollbar tokens as ADR-010 §5.1 lists them:
-// the thumb `scrollbar.thumb.background` (hovered `.hover_background`, dragged
-// `.active_background`) with a 1 px `scrollbar.thumb.border`, the track transparent with a
-// 1 px `scrollbar.track.border` on its inner edge. Departures from Zed: the bar shows whenever
-// the content overflows (Zed's `ShowScrollbar::Always`; its autohide fade is not done), and
-// the thumb carries the border token the theme defines (Zed paints it borderless and blends
-// it over the surface).
+// `thumb_size / 2`). Paint is Zed's (scrollbar.rs, the regular style with no track): no track
+// strip is drawn; the thumb is borderless, its colour `surface.background` — its alpha capped
+// at 0.7 unless the bar is hovered (`MAXIMUM_OPACITY`) — blended with the state's
+// `scrollbar.thumb.background` (hovered `.hover_background`, dragged `.active_background`) by
+// GPUI's `Hsla::blend`. Departure from Zed: the bar shows whenever the content overflows
+// (Zed's `ShowScrollbar::Always`; its autohide fade is not done).
 
 export namespace lx::ui {
 
@@ -292,26 +291,32 @@ void lx::ui::scrollbar_node::emit(draw_scope& out) const {
     if (!g.visible)
         return;
     const theme& th = active_theme();
-    // The track: transparent, a 1 px `scrollbar.track.border` along its inner edge.
-    quad_style track{};
-    track.border_color = th.color(tok::scrollbar_track_border);
-    if (axis_)
-        track.border_widths[3] = 1.f;
-    else
-        track.border_widths[0] = 1.f;
-    out.quad(g.strip, track);
-    // The thumb: rounded fully, its background by state, a 1 px `scrollbar.thumb.border`.
-    quad_style thumb{};
-    const tok bg = dragging_                           ? tok::scrollbar_thumb_active_background
-                   : has_flag(node_flag::hovered)      ? tok::scrollbar_thumb_hover_background
-                                                       : tok::scrollbar_thumb_background;
-    thumb.background = th.color(bg);
-    thumb.border_color = th.color(tok::scrollbar_thumb_border);
-    const float r = static_cast<float>(std::min(g.thumb.width, g.thumb.height)) * 0.5f;
-    for (unsigned i = 0; i < 4; ++i) {
-        thumb.corner_radii[i] = r;
-        thumb.border_widths[i] = 1.f;
+    // The thumb, rounded fully and borderless: scrollbar.rs blends the state's thumb colour
+    // over `surface.background` (its alpha capped at `MAXIMUM_OPACITY` = 0.7 unless hovered;
+    // a dragged thumb is not "hovered" there) with `Hsla::blend`: an opaque thumb colour is
+    // itself, a transparent one the surface, else the RGB mixed by the thumb's alpha under the
+    // surface's alpha. No track: the regular style paints one only when it is given colours.
+    const bool hovered = has_flag(node_flag::hovered) && !dragging_;
+    const tok bg = dragging_  ? tok::scrollbar_thumb_active_background
+                   : hovered  ? tok::scrollbar_thumb_hover_background
+                              : tok::scrollbar_thumb_background;
+    lx::color under = th.color(tok::surface_background);
+    if (!hovered)
+        under.a = std::min(under.a, 0.7f);
+    const lx::color over = th.color(bg);
+    lx::color c = under;
+    if (over.a >= 1.f) {
+        c = over;
+    } else if (over.a > 0.f) {
+        c.r = under.r * (1.f - over.a) + over.r * over.a;
+        c.g = under.g * (1.f - over.a) + over.g * over.a;
+        c.b = under.b * (1.f - over.a) + over.b * over.a;
     }
+    quad_style thumb{};
+    thumb.background = c;
+    const float r = static_cast<float>(std::min(g.thumb.width, g.thumb.height)) * 0.5f;
+    for (unsigned i = 0; i < 4; ++i)
+        thumb.corner_radii[i] = r;
     out.quad(g.thumb, thumb);
 }
 
@@ -434,6 +439,10 @@ lx::size2i lx::ui::scroll_node::measure(lx::layout::constraints c, size_hint hin
         cc.min.width = scrolls(0) ? 0 : (c.min.width == c.max.width ? c.min.width : 0);
         cc.max.height = scrolls(1) ? k_scroll_unbounded : c.max.height;
         cc.min.height = scrolls(1) ? 0 : (c.min.height == c.max.height ? c.min.height : 0);
+        // The content's percent base: the viewport, where the constraint fixes it.
+        const float nan = std::numeric_limits<float>::quiet_NaN();
+        const percent_base_scope base{c.min.width == c.max.width ? static_cast<float>(c.max.width) : nan,
+                                      c.min.height == c.max.height ? static_cast<float>(c.max.height) : nan};
         s = content->measure_cached(cc, hint);
     }
     s.width = std::clamp(s.width, c.min.width, std::max(c.min.width, c.max.width));
@@ -455,6 +464,7 @@ void lx::ui::scroll_node::arrange(lx::rect2i bounds) {
     layout_dirty_ = false;
     ui_node* content = child_at(0);
     if (content) {
+        const percent_base_scope base{static_cast<float>(bounds.width), static_cast<float>(bounds.height)};
         // Known across the scroll: the viewport's size; along it, the content's own.
         lx::layout::constraints cc = content_constraints(bounds.width, bounds.height);
         if (scrolls(1) && !scrolls(0))

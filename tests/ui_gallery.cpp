@@ -15,8 +15,8 @@
 // reviewed change, as the golden references are).
 //
 // The gallery is panes of component trees, each laid out by lx.ui's flex engine at its rect
-// and its open overlays laid out against that rect (a menu, a tooltip, toasts, a modal and
-// its scrim), all drawn into one draw list. Hover, focus and pressed states are the node flags
+// and its open overlays laid out against that rect (a menu, a tooltip, toasts, a modal), all
+// drawn into one draw list. Hover, focus and pressed states are the node flags
 // the pointer and focus manager set, set directly here; fades are at their end (reduced
 // motion while it builds).
 
@@ -238,8 +238,11 @@ const char* const k_keys[2] = {"Ctrl-S", "Ctrl-Shift-P"};
 [[nodiscard]] child describe_chrome() {
     static const char* const names[4] = {"main.rs", "lib.rs", "theme.rs", "ui_gallery.cpp"};
     child tabs[4];
+    // No close buttons: Zed's tab shows its close button (a 14 px muted square icon button,
+    // pane.rs) only on the hovered tab (`show_close_button: "hover"`), and nothing is hovered
+    // in this still image.
     for (unsigned i = 0; i < 4; ++i)
-        tabs[i] = tab(names[i]).position(i, 4, 1).end_slot(icon_view(icon::x, 12.f, tok::icon_muted));
+        tabs[i] = tab(names[i]).position(i, 4, 1);
     const child bar_end[2] = {icon_button(icon::plus).size(button_size::compact),
                               icon_button(icon::ellipsis).size(button_size::compact)};
     const child bar_start[1] = {icon_button(icon::arrow_left).size(button_size::compact)};
@@ -369,7 +372,7 @@ void prepare_tooltip(ui_node& root) {
 }
 
 [[nodiscard]] child describe_modal() {
-    const child behind[2] = {label("Content behind the modal, under its scrim.").color(tok::text_muted),
+    const child behind[2] = {label("Content behind the modal (Zed draws no scrim).").color(tok::text_muted),
                              button("Behind").style(button_style::outlined)};
     const child body = label("Discard the changes to three files?");
     const child kids[2] = {div(style{}.flex_col().gap(sp::b08), behind),
@@ -520,6 +523,12 @@ struct gl_context {
 }
 
 int check(const char* dir) {
+    // The committed images carry Lucide icons: without librsvg (or the icon directory) the
+    // gallery cannot match them, so there is nothing to check (ADR-010 §7 Phase 3).
+    if (!lx::ui::icons_available()) {
+        std::printf("SKIP ui_gallery: librsvg or the bundled icons are not available\n");
+        return 0;
+    }
     const bool update = ui_golden::update_requested();
     auto gl = update ? nullptr : open_gl();
     if (gl && gl->renderer.caps().software)
