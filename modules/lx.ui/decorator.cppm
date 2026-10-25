@@ -41,7 +41,7 @@ public:
     [[nodiscard]] element_type_id type() const override;
     [[nodiscard]] const char* type_name() const override;
 
-    void apply(const insets_props& props);
+    bool apply(const insets_props& props);
 
     [[nodiscard]] lx::size2i measure(layout::constraints c, size_hint hint) const override;
     void arrange(lx::rect2i bounds) override;
@@ -61,7 +61,7 @@ public:
     [[nodiscard]] element_type_id type() const override;
     [[nodiscard]] const char* type_name() const override;
 
-    void apply(const align_props& props);
+    bool apply(const align_props& props);
 
     [[nodiscard]] lx::size2i measure(layout::constraints c, size_hint hint) const override;
     void arrange(lx::rect2i bounds) override;
@@ -81,12 +81,18 @@ public:
     [[nodiscard]] element_type_id type() const override;
     [[nodiscard]] const char* type_name() const override;
 
-    void apply(const sizing_props& props);
+    bool apply(const sizing_props& props);
 
     [[nodiscard]] lx::size2i measure(layout::constraints c, size_hint hint) const override;
+    /// The child's content size, unclamped: a flex container applies the min and max itself.
+    [[nodiscard]] lx::size2i measure_content(layout::constraints c, size_hint hint) const override;
+    /// The child's item style with `min` and `max` as its min and max size, so a flex
+    /// container honours them.
+    [[nodiscard]] const layout::flex_style* flex_item_style() const override;
 
 private:
     sizing_props props_{};
+    mutable layout::flex_style item_{};
 };
 
 struct grow_props {
@@ -94,18 +100,23 @@ struct grow_props {
 };
 
 /// Marks a child as consuming leftover main-axis space. Flex containers read
-/// `grow_factor()` off their children rather than tracking it themselves.
+/// `grow_factor()` off their children rather than tracking it themselves: it is the
+/// `flex-grow` of the item style this node gives its parent.
 class grow_node final : public ui_node {
 public:
     [[nodiscard]] static element_type_id static_type();
     [[nodiscard]] element_type_id type() const override;
     [[nodiscard]] const char* type_name() const override;
 
-    void apply(const grow_props& props);
+    bool apply(const grow_props& props);
     [[nodiscard]] unsigned grow_factor() const;
+    /// The child's item style with `flex-grow` set to the factor.
+    [[nodiscard]] const layout::flex_style* flex_item_style() const override;
+    [[nodiscard]] lx::size2i measure_content(layout::constraints c, size_hint hint) const override;
 
 private:
     grow_props props_{};
+    mutable layout::flex_style item_{};
 };
 
 struct opacity_props {
@@ -118,8 +129,12 @@ public:
     [[nodiscard]] element_type_id type() const override;
     [[nodiscard]] const char* type_name() const override;
 
-    void apply(const opacity_props& props);
+    /// Paint only: never a layout change.
+    bool apply(const opacity_props& props);
     void emit(draw_scope& out) const override;
+    /// The child's: paint-only decorators are transparent to layout.
+    [[nodiscard]] const layout::flex_style* flex_item_style() const override;
+    [[nodiscard]] lx::size2i measure_content(layout::constraints c, size_hint hint) const override;
 
 private:
     opacity_props props_{};
@@ -135,8 +150,12 @@ public:
     [[nodiscard]] element_type_id type() const override;
     [[nodiscard]] const char* type_name() const override;
 
-    void apply(const clip_props& props);
+    /// Paint only: never a layout change.
+    bool apply(const clip_props& props);
     void emit(draw_scope& out) const override;
+    /// The child's: paint-only decorators are transparent to layout.
+    [[nodiscard]] const layout::flex_style* flex_item_style() const override;
+    [[nodiscard]] lx::size2i measure_content(layout::constraints c, size_hint hint) const override;
 
 private:
     clip_props props_{};
@@ -213,6 +232,26 @@ namespace {
     return lx::ui::with_children(described, items);
 }
 
+/// A one-child proxy's content measurement: its child's, in content mode.
+[[nodiscard]] lx::size2i lx_ui_child_content(const lx::ui::ui_node& self, lx::layout::constraints c,
+                                             lx::ui::size_hint hint) {
+    const lx::ui::ui_node* content = self.child_at(0);
+    return content ? content->measure_cached(c, hint, lx::ui::sizing_mode::content) : c.min;
+}
+
+/// A one-child proxy's base item style: its child's, or CSS's initial values.
+[[nodiscard]] const lx::layout::flex_style& lx_ui_child_style(const lx::ui::ui_node& self) {
+    const lx::ui::ui_node* content = self.child_at(0);
+    const lx::layout::flex_style* s = content ? content->flex_item_style() : nullptr;
+    return s ? *s : lx::layout::k_default_flex_style;
+}
+
+/// A side of a box being measured under `lo`..`hi`: definite (a percent base) only when the
+/// constraint fixes it.
+[[nodiscard]] float lx_ui_definite(int lo, int hi, int less = 0) {
+    return lo == hi ? static_cast<float>(std::max(hi - less, 0)) : std::numeric_limits<float>::quiet_NaN();
+}
+
 [[nodiscard]] int lx_ui_align_offset(lx::layout::align how, int available, int used) {
     const int slack = available - used;
     if (slack <= 0)
@@ -241,7 +280,14 @@ lx::ui::element_type_id lx::ui::insets_node::static_type() {
 }
 lx::ui::element_type_id lx::ui::insets_node::type() const { return static_type(); }
 const char* lx::ui::insets_node::type_name() const { return "insets"; }
-void lx::ui::insets_node::apply(const insets_props& props) { props_ = props; }
+bool lx::ui::insets_node::apply(const insets_props& props) {
+    const lx::inset& a = props_.padding;
+    const lx::inset& b = props.padding;
+    const bool changed =
+        a.top != b.top || a.right != b.right || a.bottom != b.bottom || a.left != b.left;
+    props_ = props;
+    return changed;
+}
 
 lx::size2i lx::ui::insets_node::measure(layout::constraints c, size_hint hint) const {
     const int extra_w = props_.padding.left + props_.padding.right;
@@ -254,7 +300,10 @@ lx::size2i lx::ui::insets_node::measure(layout::constraints c, size_hint hint) c
     inner.min.height = c.min.height > extra_h ? c.min.height - extra_h : 0;
 
     const ui_node* content = child_at(0);
-    const lx::size2i inner_size = content ? content->measure(inner, hint) : lx::size2i{};
+    // The content's percent base: the box inside the insets, where the constraint fixes it.
+    const percent_base_scope base{lx_ui_definite(c.min.width, c.max.width, extra_w),
+                                  lx_ui_definite(c.min.height, c.max.height, extra_h)};
+    const lx::size2i inner_size = content ? content->measure_cached(inner, hint) : lx::size2i{};
     return {inner_size.width + extra_w, inner_size.height + extra_h};
 }
 
@@ -262,9 +311,12 @@ void lx::ui::insets_node::arrange(lx::rect2i bounds) {
     bounds_ = bounds;
     clear_layout_dirty();
     if (ui_node* content = child_at(0)) {
-        content->arrange({bounds.x + props_.padding.left, bounds.y + props_.padding.top,
-                          bounds.width - props_.padding.left - props_.padding.right,
-                          bounds.height - props_.padding.top - props_.padding.bottom});
+        const lx::rect2i inner{bounds.x + props_.padding.left, bounds.y + props_.padding.top,
+                               bounds.width - props_.padding.left - props_.padding.right,
+                               bounds.height - props_.padding.top - props_.padding.bottom};
+        const percent_base_scope base{static_cast<float>(std::max(inner.width, 0)),
+                                      static_cast<float>(std::max(inner.height, 0))};
+        content->place(inner);
     }
 }
 
@@ -276,15 +328,26 @@ lx::ui::element_type_id lx::ui::align_node::static_type() {
 }
 lx::ui::element_type_id lx::ui::align_node::type() const { return static_type(); }
 const char* lx::ui::align_node::type_name() const { return "align"; }
-void lx::ui::align_node::apply(const align_props& props) { props_ = props; }
+bool lx::ui::align_node::apply(const align_props& props) {
+    const bool changed = props.horizontal != props_.horizontal || props.vertical != props_.vertical;
+    props_ = props;
+    return changed;
+}
 
 lx::size2i lx::ui::align_node::measure(layout::constraints c, size_hint hint) const {
-    // Alignment consumes whatever it is given; the child keeps its own preference.
-    if (hint == size_hint::min) {
-        const ui_node* content = child_at(0);
-        return content ? content->measure(c, hint) : c.min;
-    }
-    return c.max;
+    // Alignment consumes whatever it is given; the child keeps its own preference. An
+    // unbounded axis (a flex container asking for the content size) gets the child's.
+    const ui_node* content = child_at(0);
+    const percent_base_scope base{lx_ui_definite(c.min.width, c.max.width),
+                                  lx_ui_definite(c.min.height, c.max.height)};
+    if (hint == size_hint::min)
+        return content ? content->measure_cached(c, hint) : c.min;
+    const int unbounded = layout::constraints{}.max.width;
+    if (c.max.width < unbounded && c.max.height < unbounded)
+        return c.max;
+    const lx::size2i wanted = content ? content->measure_cached(c, hint) : c.min;
+    return {c.max.width < unbounded ? c.max.width : wanted.width,
+            c.max.height < unbounded ? c.max.height : wanted.height};
 }
 
 void lx::ui::align_node::arrange(lx::rect2i bounds) {
@@ -293,17 +356,18 @@ void lx::ui::align_node::arrange(lx::rect2i bounds) {
     ui_node* content = child_at(0);
     if (!content)
         return;
+    const percent_base_scope base{static_cast<float>(bounds.width), static_cast<float>(bounds.height)};
 
     layout::constraints c{};
     c.max = bounds.size();
-    const lx::size2i wanted = content->measure(c, size_hint::preferred);
+    const lx::size2i wanted = content->measure_cached(c, size_hint::preferred);
 
     const int width = props_.horizontal == layout::align::stretch ? bounds.width : wanted.width;
     const int height = props_.vertical == layout::align::stretch ? bounds.height : wanted.height;
 
-    content->arrange({bounds.x + lx_ui_align_offset(props_.horizontal, bounds.width, width),
-                      bounds.y + lx_ui_align_offset(props_.vertical, bounds.height, height),
-                      width, height});
+    content->place({bounds.x + lx_ui_align_offset(props_.horizontal, bounds.width, width),
+                    bounds.y + lx_ui_align_offset(props_.vertical, bounds.height, height), width,
+                    height});
 }
 
 // ── sizing ──────────────────────────────────────────────────────────────────────
@@ -314,7 +378,31 @@ lx::ui::element_type_id lx::ui::sizing_node::static_type() {
 }
 lx::ui::element_type_id lx::ui::sizing_node::type() const { return static_type(); }
 const char* lx::ui::sizing_node::type_name() const { return "sizing"; }
-void lx::ui::sizing_node::apply(const sizing_props& props) { props_ = props; }
+bool lx::ui::sizing_node::apply(const sizing_props& props) {
+    const bool changed =
+        props.min.width != props_.min.width || props.min.height != props_.min.height ||
+        props.max.width != props_.max.width || props.max.height != props_.max.height;
+    props_ = props;
+    return changed;
+}
+
+lx::size2i lx::ui::sizing_node::measure_content(layout::constraints c, size_hint hint) const {
+    return lx_ui_child_content(*this, c, hint);
+}
+
+const lx::layout::flex_style* lx::ui::sizing_node::flex_item_style() const {
+    item_ = lx_ui_child_style(*this);
+    const int unbounded = layout::constraints{}.max.width;
+    if (props_.min.width > 0)
+        item_.min_width = layout::px(static_cast<float>(props_.min.width));
+    if (props_.min.height > 0)
+        item_.min_height = layout::px(static_cast<float>(props_.min.height));
+    if (props_.max.width < unbounded)
+        item_.max_width = layout::px(static_cast<float>(props_.max.width));
+    if (props_.max.height < unbounded)
+        item_.max_height = layout::px(static_cast<float>(props_.max.height));
+    return &item_;
+}
 
 lx::size2i lx::ui::sizing_node::measure(layout::constraints c, size_hint hint) const {
     layout::constraints clamped = c;
@@ -335,8 +423,20 @@ lx::ui::element_type_id lx::ui::grow_node::static_type() {
 }
 lx::ui::element_type_id lx::ui::grow_node::type() const { return static_type(); }
 const char* lx::ui::grow_node::type_name() const { return "grow"; }
-void lx::ui::grow_node::apply(const grow_props& props) { props_ = props; }
+bool lx::ui::grow_node::apply(const grow_props& props) {
+    const bool changed = props.factor != props_.factor;
+    props_ = props;
+    return changed;
+}
 unsigned lx::ui::grow_node::grow_factor() const { return props_.factor; }
+const lx::layout::flex_style* lx::ui::grow_node::flex_item_style() const {
+    item_ = lx_ui_child_style(*this);
+    item_.flex_grow = static_cast<float>(props_.factor);
+    return &item_;
+}
+lx::size2i lx::ui::grow_node::measure_content(layout::constraints c, size_hint hint) const {
+    return lx_ui_child_content(*this, c, hint);
+}
 
 // ── opacity ─────────────────────────────────────────────────────────────────────
 
@@ -346,7 +446,21 @@ lx::ui::element_type_id lx::ui::opacity_node::static_type() {
 }
 lx::ui::element_type_id lx::ui::opacity_node::type() const { return static_type(); }
 const char* lx::ui::opacity_node::type_name() const { return "opacity"; }
-void lx::ui::opacity_node::apply(const opacity_props& props) { props_ = props; }
+bool lx::ui::opacity_node::apply(const opacity_props& props) {
+    // Paint only: the subtree repaints where it is (the layout is untouched).
+    const bool repaint = props.value != props_.value;
+    props_ = props;
+    if (repaint)
+        detail::damage_node(*this, ink_bounds(*this));
+    return false;
+}
+const lx::layout::flex_style* lx::ui::opacity_node::flex_item_style() const {
+    const ui_node* content = child_at(0);
+    return content ? content->flex_item_style() : nullptr;
+}
+lx::size2i lx::ui::opacity_node::measure_content(layout::constraints c, size_hint hint) const {
+    return lx_ui_child_content(*this, c, hint);
+}
 
 void lx::ui::opacity_node::emit(draw_scope& out) const {
     if (!visible())
@@ -364,7 +478,21 @@ lx::ui::element_type_id lx::ui::clip_node::static_type() {
 }
 lx::ui::element_type_id lx::ui::clip_node::type() const { return static_type(); }
 const char* lx::ui::clip_node::type_name() const { return "clip"; }
-void lx::ui::clip_node::apply(const clip_props& props) { props_ = props; }
+bool lx::ui::clip_node::apply(const clip_props& props) {
+    // Paint only: what the children draw past the bounds shows or goes.
+    const bool repaint = props.enabled != props_.enabled;
+    props_ = props;
+    if (repaint)
+        detail::damage_node(*this, ink_bounds(*this));
+    return false;
+}
+const lx::layout::flex_style* lx::ui::clip_node::flex_item_style() const {
+    const ui_node* content = child_at(0);
+    return content ? content->flex_item_style() : nullptr;
+}
+lx::size2i lx::ui::clip_node::measure_content(layout::constraints c, size_hint hint) const {
+    return lx_ui_child_content(*this, c, hint);
+}
 
 void lx::ui::clip_node::emit(draw_scope& out) const {
     if (!visible())
@@ -373,7 +501,7 @@ void lx::ui::clip_node::emit(draw_scope& out) const {
         ui_node::emit(out);
         return;
     }
-    out.push_clip(bounds());
+    out.push_clip_local(bounds());
     ui_node::emit(out);
     out.pop();
 }

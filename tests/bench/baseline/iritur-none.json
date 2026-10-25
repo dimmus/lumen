@@ -139,10 +139,10 @@
       "hostname": "iritur"
     },
     "driver": "none",
-    "git": "de393b8-dirty",
+    "git": "f2f1719-dirty",
     "preset": "release",
     "scenario": "S2",
-    "title": "shell panel replica",
+    "title": "shell panel on components",
     "backend": "none",
     "frames": 36000,
     "warmup": 120,
@@ -150,28 +150,28 @@
     "scale": 1.0,
     "view": {
       "width": 1920,
-      "height": 36
+      "height": 1080
     },
     "stages": {
       "update": {
-        "p50": 0.108,
-        "p95": 0.685,
-        "p99": 2.157,
-        "max": 558.206,
+        "p50": 0.843,
+        "p95": 2.221,
+        "p99": 17.256,
+        "max": 1389.747,
         "samples": 36000
       },
       "tick_idle": {
-        "p50": 0.241,
-        "p95": 1.31,
-        "p99": 3.528,
-        "max": 998.88,
+        "p50": 1.798,
+        "p95": 5.584,
+        "p99": 52.392,
+        "max": 1931.457,
         "samples": 35400
       },
       "tick": {
-        "p50": 18.528,
-        "p95": 118.563,
-        "p99": 177.123,
-        "max": 490.93,
+        "p50": 91.382,
+        "p95": 479.735,
+        "p99": 1143.683,
+        "max": 1848.911,
         "samples": 600
       },
       "describe": {
@@ -182,82 +182,200 @@
         "samples": 0
       },
       "reconcile": {
+        "p50": 12.518,
+        "p95": 62.812,
+        "p99": 119.215,
+        "max": 321.831,
+        "samples": 600
+      },
+      "layout": {
+        "p50": 62.336,
+        "p95": 351.807,
+        "p99": 1021.775,
+        "max": 1773.888,
+        "samples": 600
+      },
+      "emit": {
+        "p50": 9.392,
+        "p95": 59.372,
+        "p99": 166.757,
+        "max": 906.607,
+        "samples": 600
+      },
+      "order": {
+        "p50": 1.059,
+        "p95": 2.283,
+        "p99": 10.782,
+        "max": 72.7,
+        "samples": 600
+      },
+      "encode": {
+        "p50": 0.724,
+        "p95": 1.681,
+        "p99": 10.565,
+        "max": 269.691,
+        "samples": 600
+      },
+      "emit_order_encode": {
+        "p50": 11.478,
+        "p95": 61.257,
+        "p99": 228.482,
+        "max": 928.136,
+        "samples": 600
+      },
+      "frame": {
+        "p50": 94.332,
+        "p95": 486.848,
+        "p99": 1149.772,
+        "max": 1850.479,
+        "samples": 600
+      },
+      "raster": {
         "p50": 0.0,
         "p95": 0.0,
         "p99": 0.0,
         "max": 0.0,
         "samples": 0
       },
-      "layout": {
-        "p50": 5.244,
-        "p95": 56.625,
-        "p99": 60.321,
-        "max": 167.146,
+      "submit": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "gpu": {
+        "p50": 0.0,
+        "p95": 0.0,
+        "p99": 0.0,
+        "max": 0.0,
+        "samples": 0
+      },
+      "layout_emit_order_encode": {
+        "p50": 74.796,
+        "p95": 414.86,
+        "p99": 1072.31,
+        "max": 1783.658,
         "samples": 600
       },
-      "emit": {
-        "p50": 9.271,
-        "p95": 59.785,
-        "p99": 121.25,
-        "max": 432.121,
+      "update_frame": {
+        "p50": 95.69,
+        "p95": 497.956,
+        "p99": 1218.715,
+        "max": 1904.582,
         "samples": 600
       },
-      "order": {
-        "p50": 1.589,
-        "p95": 5.517,
-        "p99": 53.279,
-        "max": 131.769,
-        "samples": 600
-      },
-      "encode": {
-        "p50": 0.709,
-        "p95": 1.317,
-        "p99": 4.664,
-        "max": 57.353,
-        "samples": 600
-      },
-      "emit_order_encode": {
-        "p50": 12.552,
-        "p95": 62.01,
-        "p99": 128.284,
-        "max": 515.847,
-        "samples": 600
-      },
-      "frame": {
-        "p50": 21.052,
-        "p95": 120.699,
-        "p99": 184.281,
-        "max": 580.183,
-        "samples": 600
+      "update_idle": {
+        "p50": 2.722,
+        "p95": 8.843,
+        "p99": 57.888,
+        "max": 1932.946,
+        "samples": 35400
       }
     },
     "counters": {
       "frames_produced": 600,
       "frames_idle": 35400,
       "frames_described": 0,
-      "nodes": 49,
-      "primitives": 49,
-      "primitives_built": 49,
-      "primitives_total": 29400,
+      "nodes": 301,
+      "primitives": 10,
+      "primitives_built": 141,
+      "primitives_total": 6000,
       "surfaces": 0,
-      "refs": 49,
-      "batches": 1,
-      "instance_bytes": 3920,
+      "refs": 10,
+      "batches": 2,
+      "instance_bytes": 672,
       "damage_rects": 1,
-      "damage_px": 784,
-      "damage_fraction": 0.01134,
-      "overflow_drops": 0
+      "damage_px": 1357,
+      "damage_fraction": 0.00065,
+      "overflow_drops": 0,
+      "raster_px": 0,
+      "draw_calls": 0,
+      "gpu_disjoint": 0,
+      "measures_max": 9,
+      "measures_total": 5400,
+      "measure_hits_max": 2,
+      "arranges_max": 5,
+      "arranges_total": 3000,
+      "nodes_emitted": 7,
+      "damage_rects_min": 1
     },
     "memory": {
       "allocations": 0,
       "allocated_bytes": 0,
       "allocations_per_steady_frame": 0.0,
       "mallinfo2_uordblks_delta": 0,
-      "rss_anon_kb": 5252
+      "rss_anon_kb": 9164,
+      "minor_faults": 248,
+      "major_faults": 0,
+      "involuntary_switches": 3
     },
     "gpu": {},
+    "text": {
+      "doc_bytes": 0,
+      "doc_lines": 0,
+      "doc_glyphs": 0,
+      "layout_storage_bytes": 0,
+      "first_frame_us": 28062.8,
+      "first_layout_us": 22317.4,
+      "first_shaping_calls": 26,
+      "first_rasterized": 86,
+      "first_upload_bytes": 28152,
+      "shaping_calls": 600,
+      "shaping_calls_max": 1,
+      "rasterized": 13,
+      "rasterized_max": 1,
+      "raster_frames": 13,
+      "upload_bytes": 1024,
+      "upload_bytes_max": 90,
+      "upload_rects_max": 1,
+      "upload_frames": 13,
+      "sprites_max": 8,
+      "sprites_total": 4800,
+      "glyphs_max": 0,
+      "lines_drawn_max": 0,
+      "sprite_batches_max": 1,
+      "sprite_batches_per_page_max": 1,
+      "pages_max": 1,
+      "sprite_draws_per_page_max": 0
+    },
+    "layout_solve": {
+      "nodes": 301,
+      "node_bytes": 80,
+      "allocations": 0,
+      "cold": {
+        "p50": 103.08,
+        "p95": 793.05,
+        "p99": 3552.66,
+        "samples": 3000,
+        "measures": 1170,
+        "hits": 0,
+        "arranges": 301,
+        "skipped": 0
+      },
+      "warm": {
+        "p50": 1.08,
+        "p95": 1.96,
+        "p99": 2.63,
+        "samples": 3000,
+        "measures": 0,
+        "hits": 10,
+        "arranges": 1,
+        "skipped": 10
+      },
+      "leaf": {
+        "p50": 9.5,
+        "p95": 40.57,
+        "p99": 174.77,
+        "samples": 3000,
+        "measures": 5,
+        "hits": 121,
+        "arranges": 3,
+        "skipped": 37
+      }
+    },
     "gates": {
-      "G2": "pass",
+      "G2": "fail",
       "G5": "pass"
     }
   },

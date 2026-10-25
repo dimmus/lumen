@@ -170,6 +170,9 @@ emits each glyph with one `atlas::use` — no shaping, no rasterising, no alloca
   reordered visually (L2); start / end alignment follow the paragraph's direction.
 - `max_lines` puts "…" at the logical end of the last line, within its wrapped extent (CSS
   `line-clamp`); an unwrapped line too wide is cut at any grapheme.
+- `min_content_width()` is the widest run of clusters between break opportunities, trailing
+  whitespace hanging (CSS `min-content`, from the shape pass alone): what `text_block_node`
+  answers for `size_hint::min`, so a flex container shrinks wrapped text to its longest word.
 - Hit testing maps a point to a logical position with caret affinity (`upstream` at a
   direction boundary and a soft break); inside a ligature carets are spaced evenly.
 - Correct for Arabic and Hebrew test strings (`test_text_lines`).

@@ -1209,6 +1209,15 @@ LUMEN_TEST(vk_atlas_dirty_rects_upload) {
     }
     r.shutdown();
 
+    // The shared renderer draws the tile below: make this atlas the one it has seen first (it
+    // goes up whole, as above), so the tile is its only upload whatever the renderer drew
+    // before. It tells atlases apart by address, and a freed atlas of an earlier test may or
+    // may not share this one's — which made the check below pass or fail with heap layout.
+    {
+        std::vector<std::uint32_t> primed;
+        LUMEN_CHECK(render_vk(vk->renderer, ctx, c, fx.tiles, *fx.atlas, primed, full_region()));
+    }
+
     std::uint8_t checker[10 * 6];
     for (int y = 0; y < 6; ++y)
         for (int x = 0; x < 10; ++x)

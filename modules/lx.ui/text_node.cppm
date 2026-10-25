@@ -149,8 +149,13 @@ public:
     text_block_node() = default;
     ~text_block_node() override;
 
-    void apply(const text_block_props& props);
+    /// Marks the layout dirty itself when an input the layout reads changed, so it tells
+    /// the reconciler there is nothing more to do (false).
+    bool apply(const text_block_props& props);
 
+    /// The text's size wrapped at the constraint's width; for `size_hint::min` when it wraps,
+    /// its min-content width (`text_layout::min_content_width`, the longest word) and the
+    /// height wrapped there.
     [[nodiscard]] lx::size2i measure(lx::layout::constraints c, size_hint hint) const override;
     void arrange(lx::rect2i bounds) override;
     void emit(draw_scope& out) const override;
@@ -304,7 +309,12 @@ lx::ui::text_block_node::~text_block_node() {
         delete job_;
 }
 
-void lx::ui::text_block_node::apply(const text_block_props& p) {
+bool lx::ui::text_block_node::apply(const text_block_props& p) {
+    // A colour change repaints the block where it is; a layout change repaints it where it
+    // was and where the arrange puts it (`mark_repaint`, below).
+    if (p.color.r != color_.r || p.color.g != color_.g || p.color.b != color_.b ||
+        p.color.a != color_.a)
+        invalidate_paint(*this);
     color_ = p.color;
     scale_ = p.scale > 0.f ? p.scale : 1.f;
     wraps_ = p.wrap == lx::text::text_wrap::word;
@@ -327,6 +337,7 @@ void lx::ui::text_block_node::apply(const text_block_props& p) {
         apply_async(p, *async);
     else
         apply_inline(p);
+    return false;
 }
 
 void lx::ui::text_block_node::apply_inline(const text_block_props& p) {
@@ -347,8 +358,10 @@ void lx::ui::text_block_node::apply_inline(const text_block_props& p) {
     l.set_line_height(p.line_height);
     l.set_direction(p.direction);
     l.set_attrs(p.attrs);
-    if (l.dirty())
+    if (l.dirty()) {
         mark_layout_dirty();
+        mark_repaint();
+    }
 }
 
 void lx::ui::text_block_node::apply_async(const text_block_props& p, text_async_shaping& async) {
@@ -384,8 +397,10 @@ void lx::ui::text_block_node::apply_async(const text_block_props& p, text_async_
     layout_.assign_inputs(next, false);
     if (async_generation_ != shown_generation_ && !job_->running)
         start_job();
-    if (layout_.dirty())
+    if (layout_.dirty()) {
         mark_layout_dirty();
+        mark_repaint();
+    }
 }
 
 void lx::ui::text_block_node::start_job() {
@@ -485,8 +500,13 @@ void lx::ui::text_block_node::faces_evicted() {
     invalidate_layout(*this);
 }
 
-lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint) const {
-    layout_.set_max_width(logical_width(c.max.width));
+lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint hint) const {
+    // A measure wraps the layout at the width it asks about; `emit` puts the bounds' width
+    // back, since a parent may measure after it arranged (a cached arrange is not re-run).
+    int width = c.max.width;
+    if (hint == size_hint::min && wraps_)
+        width = std::min(width, std::max(layout_.min_content_width(), 1));
+    layout_.set_max_width(logical_width(width));
     lx::size2i out = layout_.bounding_size();
     if (out.width < c.min.width)
         out.width = c.min.width;
@@ -494,7 +514,10 @@ lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint
         out.height = c.min.height;
     if (out.width > c.max.width)
         out.width = c.max.width;
-    if (out.height > c.max.height)
+    // A height the parent does not fix is the text's own, even past the space offered: a
+    // line taller than its row overflows it centred (a 14 px label on GPUI's φ line, 23 px,
+    // in a 22 px button), as CSS and GPUI lay it out, rather than being cut to the row.
+    if (out.height > c.max.height && c.min.height == c.max.height)
         out.height = c.max.height;
     return out;
 }
@@ -509,6 +532,7 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     stats_ = {};
     if (!visible_ || !glyphs_)
         return;
+    layout_.set_max_width(logical_width(bounds_.width));
     // Lay out now, before the face lock below: the queries lock the engine lazily.
     if (!layout_.update())
         return;
@@ -525,6 +549,19 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     const std::int64_t top_px = static_cast<std::int64_t>(clip.y) - origin.y - bounds_.y;
     const std::int64_t clip_top = top_px * 64 - em;
     const std::int64_t clip_bottom = (top_px + clip.height) * 64 + em;
+    // Across: the lines start at most the overflow left of the bounds (end-aligned text wider
+    // than them) and end at most the overflow right of them; an em more each side for ink. A
+    // block wholly beside the clip — a label outside a frame's damage — looks at no glyph.
+    {
+        const std::int64_t text_w = (static_cast<std::int64_t>(layout_.width()) + 63) / 64;
+        const std::int64_t over = std::max<std::int64_t>(text_w - bounds_.width, 0);
+        const std::int64_t em_px = (static_cast<std::int64_t>(em) + 63) / 64;
+        const std::int64_t left = static_cast<std::int64_t>(origin.x) + bounds_.x - over - em_px;
+        const std::int64_t right =
+            static_cast<std::int64_t>(origin.x) + bounds_.x + bounds_.width + over + em_px;
+        if (right <= clip.x || left >= static_cast<std::int64_t>(clip.x) + clip.width)
+            return;
+    }
     // First line whose box reaches below the clip's top.
     std::size_t lo = 0;
     std::size_t hi = lines.size();

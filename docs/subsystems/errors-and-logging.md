@@ -18,8 +18,8 @@ Lumen separates **typed recoverable failures** (`lx::result<T>`) from **observab
 ### Structure
 
 ```cpp
-enum class error_domain { io, wayland, vulkan, drm, protocol,
-                          invalid_argument, not_implemented, ... };
+enum class error_domain { io, wayland, vulkan, gl, drm, protocol,
+                          invalid_argument, not_implemented, ui };
 
 struct error {
     error_domain domain;
@@ -39,6 +39,7 @@ Each subsystem defines an `*_err` enum in `lx.foundation.error`:
 | `vulkan_err` | `lx.gfx` |
 | `drm_err` | `lx.drm` — `open_failed`, `mode_invalid`, `page_flip_failed`, `sync_failed`, `probe_failed` (a connector probe ioctl failed), `no_crtc` (no CRTC or primary plane left for an output), `test_rejected` (the kernel refused a TEST_ONLY of a configuration), `monitor_failed` (the udev hotplug monitor could not be opened), `no_atomic` (the driver refused DRM_CLIENT_CAP_ATOMIC; `no_atomic_hint` says what to do) |
 | `protocol_err` | Wire protocol violations, `zlm_*` |
+| `ui_err` | `lx.ui` — `theme_format` (a compiled theme that is truncated, has the wrong magic, a table out of bounds or a bad checksum), `theme_version` (another format version or token set: recompile it), `theme_source` (theme JSON that is not JSON or not a Zed theme family; the compiler keeps the byte offset), `icon_raster` (an icon librsvg could not render, or no librsvg) |
 
 Each enum maps to its domain through `error_domain_of`, so `make_error` takes the code alone:
 

@@ -369,7 +369,7 @@ flowchart TB
 | **Foundation** | Types, errors, handles, WM vocabulary | `result<T>`, `toplevel_id`, `toplevel_state`, `placement` |
 | **Runtime** | Event loop, thread routing, logging | `executor`, `event_loop`, `logger` |
 | **Platform** | OS / kernel / Wayland wire | `server::bind`, `kms_device::open`, protocols |
-| **Graphics** | Vulkan RHI, text, layout (`lx.text` rasterises glyphs into `lx.gfx:atlas`, so it depends on `lx.gfx`) | `dmabuf_importer`, `layout_engine`, `scene_graph` |
+| **Graphics** | Vulkan RHI, text, layout (`lx.text` rasterises glyphs into `lx.gfx:atlas`, so it depends on `lx.gfx`; `lx.layout:flex` is the UI's flexbox, on `lx.foundation` only) | `dmabuf_importer`, `solve_flex`, `scene_graph` |
 | **Compositor** | Display server integration | `tick_ui` / `tick_render`, `shell_bridge` |
 | **Desktop** | WM policy, shell UI, shared widget toolkit | `policy_bridge`, `stacking_policy`, `lx.ui` |
 | **Application** | End-user programs + fluent builders | `lx::application`, `make_window()` |
@@ -2222,7 +2222,7 @@ wl-scanner-cpp  →  lx.wayland.protocols.* (C++26 modules)
 CMake lumen_add_module_library  →  liblx.* + executables
 ```
 
-Tools: `wl-scanner-cpp` (protocol codegen), `lumen-theme` (theme compiler stub).
+Tools: `wl-scanner-cpp` (protocol codegen), `lumen-theme` (Zed theme JSON → `.lxtheme`, ADR-010 §4.8; the build compiles the bundled One Dark and One Light).
 
 ---
 

@@ -425,6 +425,13 @@ Idle rule (G1): no ledger entries and no animation → no frame callback, no sub
 timer. Animations run off the frame callback, never off a free-running timer.
 `invalidate_animate` requests exactly one next frame.
 
+As built (Phase 3): the emit need not be the whole tree. `ui_root::set_emit_scope(
+emit_scope::damage)` clips the root to the frame's damage, so a consumer that keeps its last
+frame emits, orders and encodes only what it repaints (S2's clock frame: 7 nodes walked, 10
+primitives, instead of 141). With it the buffer's age is known before the tick, not after:
+acquire → age → `ui_damage().add(age damage)` → tick → record per rect. `emit_scope::full`
+remains the default.
+
 ### 4.10 Client pixel path
 
 Selected once per window in `lx.app`, the same order and the same refusal rules as the
@@ -529,7 +536,7 @@ ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
 | `lx.ui:style`, `:theme`, `:draw_scope`, `:components`, `:text_node` | Desktop | `lx.scene`, `lx.text`, `lx.layout` |
 | `lx.wayland.client` (real), `lx.app:window`, `:swapchain`, `:input` | Platform / Application | `lx.gfx` (through `lx.scene`), `lx.ui` |
 | `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui` |
-| `tools/lumen-theme` | tool | `lx.ui:theme` format only |
+| `tools/lumen-theme` | tool | the `lx.ui` facade (its `:theme`, `:theme_compile` and `:theme_defaults` partitions; see Phase 3's deviations) |
 
 The overlap grid (`order_grid`) is a geometry utility with no scene dependency, so it lives
 in `lx.gfx:primitives` beside the structs whose `order` it assigns; `lx.scene::draw_list`
@@ -554,7 +561,7 @@ initial content of `assets/themes/one-dark.json` and `one-light.json` and of the
 | `background` | `#3b414d` | `#dcdcdd` | App background, status bar, title bar |
 | `surface.background` | `#2f343e` | `#ebebec` | Panels, panes, tab bar, inactive tab |
 | `elevated_surface.background` | `#2f343e` | `#ebebec` | Popovers, menus, tooltips, modals |
-| `editor.background` | `#282c33` | — | Editable areas, active tab, toolbar |
+| `editor.background` | `#282c33` | `#fafafa` | Editable areas, active tab, toolbar |
 | `element.background` | `#2e343e` | `#ebebec` | Buttons, inputs |
 | `element.hover` | `#363c46` | `#dfdfe0` | |
 | `element.active` / `.selected` | `#454a56` | `#cacaca` | |
@@ -627,12 +634,17 @@ Zed's `DynamicSpacing`, in px at the default rem, three densities:
 ### 5.5 Shape, borders, iconography, motion
 
 - Radii, GPUI's scale on a 16 px rem (`gpui_macros` `corner_suffixes`): `xs` 2 px
-  (badges, key hints), `sm` 4 px (buttons, list rows, inputs), `md` 6 px (popovers,
-  tooltips, menus), `lg` 8 px (modals), `xl` 12 px, `full` for pills. Tabs, panels and
-  dividers are square.
-- Borders are always 1 px: `border` between regions, `border.variant` inside a region,
-  `border.focused` as the focus ring (no glow, no offset).
-- Icons are 16 px monochrome (14 px `small`, 12 px `xsmall`), tinted with `icon.*`. Zed's
+  (badges, key hints, the checkbox), `sm` 4 px (buttons, list rows), `md` 6 px (text inputs:
+  input_field.rs `rounded_md`), `lg` 8 px (every elevated surface — popovers, menus,
+  tooltips, notifications, modals: styled_ext.rs `elevated` rounds `lg` for `elevation_1`,
+  `_2` and `_3`), `xl` 12 px, `full` for pills. Tabs, panels and dividers are square.
+  *Corrected at Phase 3's gate:* this list first gave popovers, tooltips and menus `md` and
+  inputs `sm`; Zed rounds the first three `lg` and inputs `md` (zed a5c4ca8).
+- Borders are 1 px: `border` between regions, `border.variant` inside a region,
+  `border.focused` as the focus ring (no glow, no offset). The switch is the exception: a
+  2 px border, transparent until focused (toggle.rs `border_2`).
+- Icons are 16 px monochrome (`IconSize`: 10 px `indicator`, 12 px `xsmall`, 14 px `small`,
+  16 px `medium`, 48 px `xlarge`), tinted with `icon.*`. Zed's
   own set is bespoke; Lumen bundles **Lucide** (ISC) at the same sizes and rasterises each
   `(icon, size, scale)` once on the worker into the R8 atlas (`librsvg` under
   `LUMEN_HAS_RSVG`, as `lx.shell` already links it).
@@ -640,8 +652,12 @@ Zed's `DynamicSpacing`, in px at the default rem, three densities:
   after a 500 ms hover delay; nothing bounces; `reduced_motion` (already in `focus_style`)
   removes all transitions.
 - Hover is a background change only (`element.hover` / `ghost_element.hover`), never a
-  colour change of the label. Selected rows use `ghost_element.selected`; the keyboard
-  focus ring and the selection are separate states.
+  colour change of the label — Lumen's rule. Zed departs from it in one place: a
+  `ButtonStyle::Transparent` button turns its label and icon `Color::Muted` while hovered
+  (button_like.rs `hovered`); Lumen keeps the label. Selected rows use
+  `ghost_element.selected`; the keyboard focus ring and the selection are separate states.
+- Scrollbars: Zed hides them 1 s after scrolling stops (`ShowScrollbar::Auto`, a 400 ms fade);
+  Lumen's show whenever the content overflows (Phase 3; autohide is open).
 
 ### 5.6 Component set (first release)
 
@@ -818,6 +834,309 @@ at load 0.1), one window 32 → 36–45 µs; GL render thread 719–831 → 698�
 - Gate: G2 on a synthetic panel tree (S2); a screenshot of the component gallery reviewed
   against Zed side by side.
 
+As built (layout, §4.7): `lx.layout:flex` (`solve_flex` over a `flex_style`, on
+`lx.foundation` only) follows CSS Flexbox §9 in the shape of Taffy's `flexbox.rs` and lays out
+463 of Taffy's 685 Chrome-generated flexbox fixtures exactly as Chrome does
+(`test_layout_flex`, transcribed by `scripts/flex-fixtures.py`; the rest use text measurement,
+RTL, baseline, aspect ratio, sizing keywords, scrollbar gutters or non-flex display, and two
+need `position: static` or Taffy's known-but-indefinite sizes). Not offered: `baseline` (no
+baseline query on `ui_node`), `aspect-ratio` beyond filling a missing side. Per-item and
+per-line state is caller-provided (`ui_node::k_max_children` of each on the stack in lx.ui):
+a solve allocates nothing. `lx.ui:flex`'s `flex_node` runs it through `measure` / `arrange`;
+`box()` became a flex column or row; `grow` and `sizing` are read as `flex-grow` and min /
+max; text answers `size_hint::min` with its longest word (`text_layout::min_content_width`).
+The 4-entry measure cache lives in a 72-byte side-pool block a node takes when first
+measured, behind a 32-bit slot in what was padding: `sizeof(ui_node)` stays 80 B, and S3
+measured A/B interleaved against main is unchanged (emit + order + encode p50 447–457 µs vs
+447–466 µs, load 0.7). Dirtiness propagates to the root (stopping below a dirty ancestor),
+`place` skips a clean node at unchanged bounds, `ui_root` places the root without measuring
+it, and props that change nothing layout reads mark nothing (`apply` returning `bool`). On a
+301-node panel tree (10 rows × 29 labels; `lumen-ui-bench --scenario S2`, "layout_solve",
+load 0.5–0.8, six runs): every node dirty 66 µs p50 / 153–200 µs p95 (1 170 measure calls,
+301 arranges), the root alone dirty over warm caches 1.1–1.4 µs / 1.1–5.3 µs (10 cache hits,
+one arrange), one label dirty 6.9 µs / 7.5–13.8 µs (5 measure calls — the label and its row —
+3 arranges, 37 skipped); 0 allocations. A paint-only S2 frame's layout stage fell from
+p95 56.6 µs to 1.7 µs (the clean root is not walked).
+
+As built (style, theme, icons, §4.8, §5): `lx.ui:theme` defines the tokens — every colour key
+of Zed's theme schema except the vim mode colours (167, with the 14 status triples), 8
+players × 3 and the 46 syntax colours of the One themes: 237 `tok`s, each an index into the
+`.lxtheme` colour table — and the format: a 128-byte header (magic, version, sizes, offsets,
+FNV-1a checksum of the rest), the sRGB `u8×4` and premultiplied linear `f16×4` tables, the
+status and player tables (token triples), 46 syntax styles (colour token, weight, italic,
+background), the fonts of §5.4 and the density. A theme is 3 816 B; `theme::load` is one
+`read` and a bounds, version and checksum check (11.9 µs from the page cache), immutable
+afterwards, failing with `io_err` or the new `ui_err` domain (`theme_format`,
+`theme_version`). `tools/lumen-theme` compiles Zed's own `assets/themes/one/one.json`,
+vendored unmodified with its MIT licence (one family file, not the `one-dark.json` /
+`one-light.json` pair this section names), through `theme_compiler` (a strict RFC 8259
+reader; build-time code with std containers) into `themes/one-dark.lxtheme` and
+`one-light.lxtheme` in the build tree (≈11 ms a run), installed to
+`share/lumen/themes` and found through `LUMEN_THEME_DIR`, the build tree or the install. A
+missing key resolves as it does in Zed: derived rules — a status background from its
+colour at 25 %, the selection from player 0, version-control and diff-hunk colours from the
+status colours, the active scrollbar thumb, minimap and panel overlay colours from their
+neighbours — then the value of its appearance in Lumen's base theme (`lx.ui:theme_defaults`,
+generated by `scripts/theme-base-table.py`): One Dark's and One Light's values from the MIT
+`one.json`, and for the 32 tokens that file leaves unset Lumen's own picks, each another One
+token at a fixed alpha. No value is taken from Zed's GPL-licensed crates. Every fallback and
+ignored key is reported. One Dark: 207 tokens from the file, 19 derived, 11 from the base
+theme; One Light
+205 / 19 / 13; every value the file gives, and every §5.1 value above, comes out as written
+(`test_ui_theme`). The fallback theme compiled into the binary is generated constants
+(`theme_builtin.cpp`, `lumen-theme --emit-cpp`, committed): compiling it during the build
+would make lx.ui depend on a tool that links lx.ui; `test_ui_theme` fails when it differs from
+what the build compiles. The UI thread has one active theme and density; changing either
+bumps `theme_generation`, on which `ui_root::tick` describes again, clears every measure cache
+and repaints everything; flex solves take the rem from the active theme (`ui_rem_px`, S2's
+solve costs unchanged). `theme_watcher` (inotify on the file's directory) reloads on the
+worker and applies on UI in every build type; hooking it to a client's event loop is Phase 4.
+
+`lx.ui:style` is the packed `style` with the builder above — 112 B, not ≈96: its 21 lengths
+(sizes, basis, gaps, padding, margin, insets) at 32 bits are 84 B alone; the flex enums pack
+into one word, grow and shrink are halves, the paint and text fields u16 tokens and bytes. A
+spacing step rides in a length of unit `auto` with value step + 1, so a style stays bitwise
+comparable and density-independent. `lx.ui:styled` resolves it in `apply` (layout through the
+density into the flex engine; one packed quad and the elevation's shadows, emitted under the
+style's opacity; an elevation with no `bg` takes §5.2's background token, an elevated or modal
+one without a border the 1 px `border.variant`); a paint-only change damages the bounds without
+a relayout; `styled_node` is 504 B; repainting a styled tree allocates nothing. Text fields are
+resolved and inherited (`inherited_text`) but not yet read by `text_block_node`, whose props
+carry their own colour and font — the components (§5.6) bridge the two.
+
+Icons: 53 Lucide 1.61.0 SVGs (26 KB with the licence and a README of SHA-256s;
+`trash` is the old `trash-2`) in `lx.ui:icon` — in lx.ui rather than lx.gfx because the set,
+its files and its tint tokens are the UI's, and librsvg is dlopen'd as lx.shell does, so no
+module gains a library edge (the GLib and cairo headers stay in an implementation unit). An
+`icon_cache` rasterises (icon, device px) once into an R8 atlas tile, the alpha of librsvg's
+rendering as coverage (63 µs for a 16 px icon), tinted per draw. A miss rasterises
+synchronously on the UI thread by default (counted; a steady frame only hits); with `set_async`
+it is rasterised on the worker (four jobs, buffers allocated with the cache) and written into
+the atlas on the UI strand, damaging the bounds that asked. Golden images `styled_surfaces`
+(elevated and modal stacks over `surface.background`, borders, radii xs…full, opacity) and
+`icons` (16 / 14 / 12 px and a 20 px raster at scale 1.25): GL within 1/255 of the CPU
+reference, Vulkan (lavapipe) within 2/255 of CPU and 2/255 of GL. Without librsvg the build
+succeeds, icons draw nothing and those cases print SKIP.
+
+As built (focus, reducers, motion, the basic components, §5.5–§5.6): `ui_node` carries 16
+interaction and bookkeeping bits (`node_flag`: focusable, focused, focus ring, hovered,
+pressed, interactive, disabled, a trap's scope, a reducer's opaque children, repaint,
+referenced, hover intent) in what was padding — `sizeof(ui_node)` stays 80 — and holders of
+node pointers across frames (focus, hover, press, timers, traps) are `node_observer`s a dying
+node tells. `lx.ui:focus` is rewritten on that tree (the old `widget*` manager had no callers
+and is gone): tab / shift-tab in tree order with positive `focus_order` first and negative
+skipped, traps for stage 4's modals (8 deep, rejected past that), programmatic focus,
+focus-visible as GPUI decides it (the ring after keyboard input only), arrow / home / end
+within groups, the magnifier hook kept. `lx.ui:interact` adds the pointer state (hover and
+press per interactive node, a release over the pressed node activates it, a press focuses
+without a ring), `handler` (a 32-byte trivially copyable callable: function pointers, reducer
+bindings, small lambdas), the frame clock, `transition` + `animate` (100–150 ms ease-out,
+frames only while running, `reduced_motion` jumps to the end) and a 32-entry timer table
+(hover intent at 500 ms; `ui_root::next_deadline_ns` for the event loop, no frames while a
+delay waits). Reducers are wired into `ui_root`: a dispatch queues its reducer (intrusive
+list) and the next tick describes that subtree alone; the reconciler never enters a reducer's
+children, so a describe of the tree around it keeps its state and nodes. Damage became exact
+for relayout: `place` damages a node the layout moved (old and new bounds) and one whose look
+changed with its layout (`mark_repaint`: a label's text), never an ancestor arranged in
+place; a text block's colour change repaints it. A text block's height is no longer cut to
+an unfixed available height, so a 23 px φ line overflows a 22 px button centred, as in GPUI.
+
+The components (`lx.ui:control`, `:components`) are builders over one node, `control_node` —
+a flex container painting a rounded, bordered box whose background and border follow the
+pointer (rest / hover / pressed, each a token, faded, blended with a second token or darkened,
+Zed's `Hsla::blend` and `Theme::darken`) — plus `text_block_node` and `icon_node`: `label`,
+`headline`, `button` (Zed's six `ButtonStyle`s, `subtle` being the ghost; five
+`ButtonSize`s; with icon), `icon_button` (wide, square), `toggle_button`, `checkbox`,
+`toggle_switch`, `divider`, `progress_bar`, `avatar`, `key_binding`, `key_binding_hint`,
+`tab`, `tab_bar`, `panel` (Zed's workspace toolbar + body), `status_bar`. Every size, padding,
+token and state rule is taken from crates/ui at zed a5c4ca8 and cited in the source;
+`test_ui_components` checks them at the default density — button 22 / 18 / 28 / 32 px with
+`b04` / `b08` padding, icon button 24 × 22 and 20 × 20, checkbox box 16 px offset 2 in its
+20 px holder, switch 38 × 26 around a 32 × 20 track with the 12 px thumb 3 px from the end,
+divider 1 px, progress 8 px with a 4 px fill, avatar 16 px, key 14 px in an 18 px stroke, a
+key hint's cap 16 px, tab and tab bar 32 px with 31 px content, status bar 30 px, toolbar
+45 px. Departures from Zed: every focusable control draws the §5.5 ring (Zed varies it), the
+transparent button keeps its label colour on hover (§5.5), the checkbox and switch are tab
+stops (keyboard-operable), a lone toggle button sizes to its content, avatars may show
+initials. The golden images `components_states` (each control at rest, hovered, focused and
+disabled) and `components_gallery` are within 1/255 of the CPU reference on GL and 2/255 of
+CPU and GL on Vulkan (lavapipe). Measured (`test_ui_components`, load 0.8–1.4, frames back to
+back): the gallery tree of every component (94 nodes, 184 primitives) ticks a full repaint in
+11.4–13.9 µs p50 (15–22 µs p95), a hover move 11.4–18.5 µs, a focus move 11.4–20 µs, a
+describe of the whole unchanged tree 24–40 µs, with 0 allocations and a flat `mallinfo2` over
+300 frames of each; a hover repaints exactly that control's bounds; a fade is 9 frames over
+150 ms and then none, an idle tree asks for no frame and sets no deadline. S2–S4 A/B against
+the stage before, interleaved (load 0.8–1.6): S2 tick p50 12.9–14.3 vs 13.2–14.1 µs, S3
+layout p50 134–145 vs 143–150 µs, S4 within the host's bimodal noise both ways.
+
+As built (overlays, scrolling, lists, text input and the rest of §5.6): `lx.ui:overlay` is
+GPUI's deferred draw on the retained tree. An `overlay_node` sits anywhere in the tree,
+zero-size and absolute in the flow; while open it is registered with the UI thread's
+`overlay_layer` (16 slots, `overflow_action::reject`), which after the tree's layout measures
+its content against the window less an 8 px margin, places it beside its anchor — the overlay
+node's parent, a surface point or the window — with GPUI's anchored rules (flip to the other
+side, hang from the anchor's other end, then shift inside the margin: `place_overlay`), and
+emits it after the tree so the overlap grid orders it above what it covers. The pointer tests
+overlays first, topmost first (`pointer_state`'s resolver), a modal's scrim blocking the
+tree; a press outside an overlay dismisses it top down (a press on a popover's trigger is the
+trigger's), Escape the topmost, an activated menu item its menu chain; modals and menus trap
+the focus (stage 3's traps) and give it back. Opening is a prop edge (`open`, with
+`on_dismiss` telling the app) or the node's own (`open_at`: a tooltip, a context menu, a
+submenu). `node_flag::layer` makes the content's bounds surface coordinates.
+
+Viewports: `ui_node::child_viewport` (offset and clip per child), with `surface_rect` /
+`local_point` mapping a node's rect or a surface point through every viewport above it —
+damage, hover and hit tests, the IME's cursor rectangle and the magnifier all go through it,
+and a tree without a viewport maps nothing (a live-viewport count; `sizeof(ui_node)` stays
+80, S2's solve and tick unchanged: cold 66 µs, warm 1.1 µs, leaf 6.9 µs p50). A node clipping
+to its bounds pushes `draw_scope::push_clip_local` (offset by the origin; `push_clip` stays
+absolute). `lx.ui:scroll`'s `scroll_area` lays its content out once at full size and draws
+it under the offset: a wheel or a thumb drag measures and arranges nothing and damages the
+viewport (`test_ui_components`: 0 measures, 0 arranges, damage = the viewport). Its
+scrollbar is Zed's `ScrollbarStyle::Regular` (scrollbar.rs at a5c4ca8: 6 px thumb, 4 px
+padding, 14 px strip, 25 px minimum thumb, `thumb_ranges`' placement, track click centring
+the thumb), in the §5.1 tokens; it shows whenever the content overflows (no autohide).
+`lx.ui:list` holds rows of one fixed height — Zed's `ListItem` spacing: dense 23 px (a 14 px
+label on the φ line), extra dense 21, sparse 31 — in chunks of 16 under a reducer host:
+up to 100 rows all exist; past that only the chunks covering the visible rows ± 8 do, in a
+fixed pool where chunk k is slot k mod the pool size, so a scroll re-describes a chunk in
+place and never creates a node (10 000 rows in a 400 px viewport: 48 rows live, 152 nodes in
+the tree; scrolling 2 rows a frame after a warm-up pass, tick p50 15 µs / p95 88 µs with a
+chunk re-described every ~8 frames, 0 allocations, the node count constant). `ui_root`
+rebuilds what its own layout asked for (a list whose viewport moved) and lays out again on
+the same frame. Selection (`ghost_element.selected`) and the list's focus ring are separate;
+up / down / home / end / page keys move the selection into view, enter activates. S5's
+property holds: the pointer moving one row per frame over a 1 000-row list damages one or
+two rects (the two rows, merged when adjacent), measures and arranges nothing (tick p50
+13.6 µs).
+
+`lx.ui:text_input` edits a fixed buffer (the app's `text_buffer`, or 1 KiB of its own) with
+`overflow_action` at the capacity, through a `text_block_node` it owns: carets on lx.text's
+grapheme boundaries (a ZWJ family is one step and one backspace), left / right following the
+paragraph direction with the caret where `text_layout::caret` puts it (an Arabic field's
+caret starts at the right and moves left), word jumps, home / end, shift and pointer
+selection (double and triple clicks), backspace / delete, `clipboard::global()` for ctrl+c / x
+/ v, a 500 ms blink on a UI timer that stops with the focus, horizontal scrolling by origin.
+`ime_target` is the interface text-input-v3 will drive: one `ime_update` per `done` applied in
+the protocol's order (delete surrounding, commit, preedit), the preedit shown underlined at
+the caret with its own cursor, `ime_query` for the surrounding text and the cursor rectangle;
+`ui_root::ime()` is the focused field. Typing and deleting allocate nothing.
+`lx.ui:popups` builds menus (Zed's `ContextMenu`: inset dense items with an icon, label and
+key binding, separators, headers, disabled items, toggles, one-level submenus opened by
+click or right arrow), `popover_menu`, `context_menu`, `modal` (the modal-surface box rounded
+`lg`, 5 rem from the top over a scrim of `elevated_surface.background` at 80 %, Zed's modal
+layer) and toasts (Zed's status toast with GPUI's `shadow_lg`, stacked at the bottom,
+dismissing themselves after 10 s, paused on hover); `button(…).tooltip(text)` is Zed's
+tooltip (500 ms, at the pointer + (8, 10), 100 ms fade). Departures: overlay radii follow §5.5
+(`md`) where Zed's `elevation_2` rounds `lg`; the scrollbar thumb carries the theme's border
+token; submenus open on a click or key, not on hover. Measured (`test_ui_components`, load
+0.3–0.6): a frame with a menu open ticks in 4.5 µs p50 (repaint, hover, arrow keys) with 0
+allocations, an idle one is no frame; a tooltip's fade is 6 frames; the six new golden images
+(`menu_open`, `tooltip`, `modal`, `toast_stack`, `scroll_area`, `text_input`) are within
+1/255 of the CPU reference on GL and 2/255 of CPU and GL on Vulkan (lavapipe).
+
+As built (the gate: S2 on the components, G2, the gallery). `lumen-ui-bench --scenario S2` is
+no longer a replica of 24 quads: it is a shell panel described only with §5.6 components,
+`div` flex boxes, the compiled One Dark theme (`one-dark.lxtheme`) and real text and icons —
+Activities, ten workspace buttons, six pinned launchers, six window buttons with icon and
+title, six status texts (two with meters), an input-source button, a notification button,
+nine tray icon buttons, an avatar and, in a fixed 120 px cell in the middle, a clock — at
+1920 × 36 in a 1920 × 1080 surface. It is **301 `ui_node`s**: 117 drawn, 184 in the 34
+tooltips its buttons carry (closed: an overlay node and its content, never laid out or
+drawn). The clock is a reducer; once a second (every 60th frame; 3600 frames = 60 s by
+default, `--clock-every` changes it) the bench dispatches the new time, and the tick describes
+that reducer's subtree alone, reshapes the label (one shaping call), re-measures the path to
+the root over every other node's cache — 9 measure calls, 2 cache hits, 5 arranges per clock
+frame — and damages **1 rect of 1 357 px, 0.065 % of the surface**. Between clock frames the
+root produces nothing. With `emit_scope::damage` (§4.9) a clock frame walks 7 nodes and emits
+10 primitives in 2 batches. Measured (`lumen-ui-bench --scenario S2 --frames 36000`, 600 clock
+frames per run at the bench's 1 ms frame clock, `setarch -R`, pinned to CPU 1; load 0.04–0.45;
+`tests/bench/baseline/iritur-none.json`, rebaselined at load 0.31, holds one of them):
+
+| G2 sum (update + tick + order + encode) | p50 | p95 | Stages, p50 |
+|---|---|---|---|
+| clock frame, `none` (3 runs) | 90.0–91.1 µs | 480.7–484.2 µs | reconcile 12–14, layout 59–60, emit 8.0–8.5, order 0.9, encode 0.4 µs |
+| clock frame, `gl` (2 runs) | 93.1–95.9 µs | 538.7–543.6 µs | the same; `submit` 392–395 µs, GPU 1.55–1.60 ms (fence-wall) |
+| frames between (`update_idle`), `none` | 0.9 µs | 5.6–6.3 µs | — |
+| clock frame back to back (`--period-us 0`) | 7.0–7.5 µs | 24.7–26.4 µs | reconcile 0.7, layout 4.8–5.0, emit 1.1 µs |
+
+**G2 is not met on this host**: damage passes (1 rect, 0.065 % ≤ 2 %), p50 is under the
+bound, p95 is 3.2× over it. The frame is cheap warm (7 µs) and expensive woken from idle,
+which is how S2 runs and how a panel runs: 91 µs p50, of which the clock label's reshape is
+most of the layout stage (≈45 µs — itemisation, a HarfBuzz call on cold code and font tables,
+the wrap), std::format and the label's describe most of the reconcile. The p95 is the host's:
+a fixed 13 µs arithmetic loop timed on the same cadence (1 ms frame clock, one frame in 60)
+has p50 13.3 µs and p95 115–116 µs, against p95 16.9 µs back to back — on this VM a frame
+woken from a sleep stalls for ~100–450 µs one time in twenty or more, the more often the
+longer it runs. A pass is not claimed. What Phase 3 did to the frame: the scene's first version (241
+nodes, the whole tree emitted) measured 146 µs p50 / 1 140 µs p95 with the emit at 55 µs p50
+(147 primitives in 15 batches, over S2's cap of 8); emitting inside the damage, skipping a clipping container's
+children through an empty clip, culling text blocks beside the clip before any glyph and icons
+before the cache, and one formatting pass in `frame_format` brought it to the numbers above
+(solving small flex containers with 8-entry rather than 64-entry stack scratch was tried and
+measured nothing, and was left out). G5 holds on `none` (0
+`operator new`, `mallinfo2` delta 0 over 36 000 frames); on `gl` there is no `operator new`
+either, and `mallinfo2` grows 288–480 B over a run from Mesa's own allocations (the previous
+S2 grew 960 B on `gl` the same way). The flex solve cost table (`layout_solve`, the synthetic
+301-node tree) read cold 103–122 µs / leaf 9.5–12.6 µs on this day where it read 66 / 6.9 µs
+before; the same table built from the previous stage's bench, and from this stage with its
+lx.ui changes reverted, reads the same 117–121 µs — the host moved, not the code.
+`sizeof(ui_node)` is 80 B, `sizeof(style)` 112 B, `styled_node` 504 B.
+
+The gallery (`lumen-ui-gallery`, ui-architecture.md §10) draws every component in its states
+under One Dark and One Light; `docs/images/ui-gallery-one-{dark,light}.png` are its CPU
+renderings (1040 × 1008, 1 496 primitives, ≈180 KB each), the `ui_gallery` test redraws them
+bit for bit and on GL within 1/255. Compared with Zed's sources value by value
+(ui-architecture.md §10): menus and tooltips now round `lg` as Zed's `elevation_2` does (they
+were `md`, and §5.5 said `md` — corrected above; the `menu_open` and `tooltip` references were
+rewritten for it, nothing else moved).
+
+Deviations from this phase's plan, across its stages: the `style` is 112 B, not ≈96 B;
+`tools/lumen-theme` compiles Zed's single `one.json` family file (vendored with its MIT
+licence) instead of a `one-dark.json` / `one-light.json` pair; icons live in `lx.ui:icon`, not
+`lx.gfx`, with librsvg dlopen'd; the flex engine has no `baseline` alignment and uses
+`aspect-ratio` only to fill a missing side, and grid is later; theme hot reload
+(`theme_watcher`) exists in every build type, its event-loop hook is Phase 4; the old
+`widget*` focus manager was deleted, not ported (no callers); `text_block_node` does not read
+a style's text fields (the components pass colour and font); `ui_root` gained
+`emit_scope::damage`, which §4.9 did not plan; S2 ignores `--scale` (its sizes come from the
+theme's rem); `tools/lumen-theme` links and imports the `lx.ui` facade, not a format-only
+library (§4.13 planned "`lx.ui:theme` format only"): the format, the compiler and Zed's
+defaults are lx.ui partitions built on lx.ui's `style` and token types, and moving them into a
+library below lx.ui would move those types with them for one build tool that no process
+links. Components that depart from Zed, on purpose: every focusable control draws the
+§5.5 focus ring (Zed varies it); a transparent button keeps its label colour on hover (§5.5;
+Zed mutes it); the checkbox and switch are tab stops; a lone toggle button sizes to its
+content; avatars may show initials; submenus open on a click, space, enter or → rather than
+on hover; the scrollbar does not autohide. G2's p95 is open, as above.
+
+Review fixes (after the gate). Bounds: a text input's text is cut, at a character boundary,
+to `min(storage, max_bytes, k_text_input_capacity)` whenever the props are applied (an app
+buffer assigned more, a smaller `max_bytes`), and an insertion's room saturates, so nothing
+writes past the node's fixed buffers. Layout: percentages now have a base across the
+`ui_node` boundary (`percent_base_scope`: the engine's `child_query::parent_*` while a flex
+container measures, its arranged content box while it places, a decorator's, scroll area's,
+list's or the overlay layer's box, the window at the root), the measure cache keys an entry by
+it only when the measurement read it (the block grew from 72 to 104 B; S2's clock frame still
+measures 9 nodes with 2 hits and arranges 5), and a node with percentage padding or border is
+re-arranged at unchanged bounds. Damage: `ui_node::ink_outset` (a shadow's 3σ + spread +
+offset) widens what `place`, `invalidate_paint`, `invalidate_layout` and `animate` damage; an
+overlay damages its content's painted extent when it opens and closes, and the whole window
+on every frame of a scrim's fade; paint-only prop changes on opacity, clip, flex and box nodes
+damage the node. A reducer or list rebuild that runs out of the frame arena is queued again
+for the next frame's (dropped, as logged, only when it overflowed an arena nothing else used).
+Fidelity against Zed's sources: the modal layer occludes without a scrim unless a modal asks
+(`modal(…).scrim()`), its title in `text`; status toasts keep `border.variant` with a square
+muted close button; menu icons `Default` (chevron `Muted`); the scrollbar draws no track and a
+borderless thumb blended over the surface; the switch's ring is its 2 px border; the input
+field is 32 px (the editor's 1.2 line); the key binding hint is in the buffer font; a selected
+text button keeps its icon colour; disabled checkbox and switch labels keep their colour and
+the checkbox's hover group is its 20 px box; an `Indicator` square icon button has no padding;
+Lucide strokes are drawn 1.8 units wide (Zed's 1.2 px at 16 px). The gallery is now 1 492
+primitives (no close glyph on unhovered tabs, as Zed shows none); the `icons`,
+`components_states`, `components_gallery`, `menu_open`, `tooltip`, `modal`, `toast_stack`,
+`scroll_area` and `text_input` references were rewritten.
+
 ### Phase 4 — The client runtime (≈3 weeks)
 
 - `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,
@@ -898,7 +1217,7 @@ client mode (live compositor). Sizes are the defaults; `--scale` multiplies them
 | Id | Scene | Exercises | Gate |
 |----|-------|-----------|------|
 | S1 | Empty window, 10 s | idle rule | G1 |
-| S2 | Shell panel replica: 24 cells, clock cell updates once per second for 60 s | retained tree, layout cache, damage locality | G2 |
+| S2 | Shell panel built from the §5.6 components (301 nodes: workspaces, launchers, a task list, status texts and meters, tray icon buttons with tooltips, a clock) at 1920 × 36 in a 1920 × 1080 surface; the clock changes once per second for 60 s | retained tree, layout cache, damage locality, damage-scoped emission | G2 |
 | S3 | 10 000 rounded quads with borders in a grid, each drifting | emit, order grid, encode, instancing throughput | G3 |
 | S4 | 2 000 lines × 50 glyphs of mixed Latin/Cyrillic/Arabic, scrolling 3 px per frame | shape cache, atlas, mono sprite batches, bidi correctness | G4 |
 | S5 | 1 000-row list, pointer moves one row per frame | hover damage ≤ 2 rects, no relayout outside two rows | G2, G5 |

@@ -71,11 +71,16 @@ public:
     }
 
     [[nodiscard]] const element** alloc_children(unsigned count);
+    /// `count` bytes of the frame arena (text a description formats: a list row's label).
+    /// Null once the arena is exhausted.
+    [[nodiscard]] char* alloc_chars(unsigned count);
 
     /// True when any allocation failed this frame; the caller should keep the previous
     /// retained tree instead of reconciling against a truncated description.
     [[nodiscard]] bool overflowed() const;
     void reset_overflow();
+    /// Bytes of the frame arena in use (0: nothing has described into it this frame).
+    [[nodiscard]] unsigned used_bytes() const;
 
     /// UI-thread current context, valid only for the duration of one rebuild. Lets
     /// `operator|` allocate wrapper descriptors without threading a parameter through
@@ -89,6 +94,59 @@ private:
     lx::runtime::memory_arena* arena_ = nullptr;
     bool overflowed_ = false;
 };
+
+namespace detail {
+
+/// An output iterator writing into `[at, end)` and counting every character it is given.
+struct bounded_chars {
+    using iterator_category = std::output_iterator_tag;
+    using value_type = void;
+    using difference_type = std::ptrdiff_t;
+    using pointer = void;
+    using reference = void;
+
+    char* at = nullptr;
+    char* end = nullptr;
+    std::size_t* count = nullptr;
+
+    bounded_chars& operator*() { return *this; }
+    bounded_chars& operator++() { return *this; }
+    bounded_chars operator++(int) { return *this; }
+    bounded_chars& operator=(char c) {
+        if (at < end)
+            *at++ = c;
+        ++*count;
+        return *this;
+    }
+};
+
+} // namespace detail
+
+/// `fmt` formatted into the current build's frame arena, NUL-terminated: text that lives
+/// as long as the description (a label copies it when applied). "" outside a build or once
+/// the arena is exhausted. No heap allocation.
+template<typename... Args>
+[[nodiscard]] const char* frame_format(std::format_string<Args...> fmt, Args&&... args) {
+    build_context* ctx = build_context::current();
+    if (!ctx)
+        return "";
+    // One formatting pass into the stack for the usual short label; a second one only for
+    // text longer than that.
+    char local[128];
+    std::size_t n = 0;
+    const auto format_args = std::make_format_args(args...);
+    (void)std::vformat_to(detail::bounded_chars{local, local + sizeof local, &n}, fmt.get(),
+                          format_args);
+    char* out = ctx->alloc_chars(static_cast<unsigned>(n + 1));
+    if (!out)
+        return "";
+    if (n <= sizeof local)
+        std::memcpy(out, local, n);
+    else
+        (void)std::vformat_to(out, fmt.get(), format_args);
+    out[n] = '\0';
+    return out;
+}
 
 /// Sets the current build context for one rebuild and restores the previous one.
 class build_scope {
@@ -135,7 +193,17 @@ const lx::ui::element** lx::ui::build_context::alloc_children(unsigned count) {
     return slots;
 }
 
+char* lx::ui::build_context::alloc_chars(unsigned count) {
+    void* raw = arena_ && count ? arena_->allocate(count, 1) : nullptr;
+    if (!raw) {
+        note_overflow();
+        return nullptr;
+    }
+    return static_cast<char*>(raw);
+}
+
 bool lx::ui::build_context::overflowed() const { return overflowed_; }
+unsigned lx::ui::build_context::used_bytes() const { return arena_ ? arena_->used_bytes() : 0u; }
 void lx::ui::build_context::reset_overflow() { overflowed_ = false; }
 
 void lx::ui::build_context::note_overflow() {

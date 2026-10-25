@@ -18,7 +18,9 @@
 
 import std;
 import lx.foundation;
+import lx.a11y;
 import lx.gfx;
+import lx.runtime;
 import lx.scene;
 import lx.text;
 import lx.ui;
@@ -85,6 +87,8 @@ struct tiles {
     lx::gfx::atlas_tile image{}; ///< RGBA8 24 × 24: four premultiplied quadrants, one translucent
     /// Over the atlas `make_tiles` filled (which must outlive it).
     std::shared_ptr<lx::text::glyph_cache> glyphs{};
+    /// Lucide icons rasterised into the same atlas (nothing drawn without librsvg).
+    std::shared_ptr<lx::ui::icon_cache> icons{};
 };
 
 /// Fills `a` with the tiles. Deterministic: the same atlas state every call.
@@ -129,6 +133,7 @@ struct tiles {
         return id && a.lookup(*id, tile);
     };
     out.glyphs = std::make_shared<lx::text::glyph_cache>(a);
+    out.icons = std::make_shared<lx::ui::icon_cache>(a);
     return put(atlas_format::r8, 16, 16, disc, 16, out.disc) &&
            put(atlas_format::r8, 12, 12, ring, 12, out.ring) &&
            put(atlas_format::r8, 32, 8, ramp, 32, out.ramp) &&
@@ -439,8 +444,371 @@ inline void build_text_clip(lx::ui::draw_scope& s, const tiles& t) {
     s.quad({2, 21, 160, 39}, outline);
 }
 
+// ── Styled boxes and icons (ADR-010 §4.8, §5.2, §5.5): `styled_node` and `icon_node` under
+// the built-in One Dark ──
+
+/// A styled box at `bounds`, laid out and emitted (its children none).
+inline void styled_box(lx::ui::draw_scope& s, lx::rect2i bounds, const lx::ui::style& st) {
+    auto node = std::make_unique<lx::ui::styled_node>();
+    node->apply({st});
+    node->arrange(bounds);
+    node->emit(s);
+}
+
+/// Elevated (popover) and modal surfaces over `surface.background` with their shadow stacks
+/// and `border.variant` borders; a translucent box; radii xs, sm, md, lg and full on bordered
+/// elements; a focus ring.
+inline void build_styled_surfaces(lx::ui::draw_scope& s, const tiles&) {
+    using namespace lx::ui;
+    lx::ui::set_active_builtin_theme(appearance::dark);
+    styled_box(s, {16, 16, 72, 48},
+               style{}.bg(lx::ui::tok::elevated_surface_background).rounded(radius::md)
+                   .shadow(elevation::elevated_surface));
+    styled_box(s, {112, 16, 88, 56},
+               style{}.bg(lx::ui::tok::elevated_surface_background).rounded(radius::lg)
+                   .shadow(elevation::modal_surface));
+    styled_box(s, {224, 16, 60, 40},
+               style{}.bg(lx::ui::tok::text_accent).border_1(lx::ui::tok::border_focused).rounded(radius::sm)
+                   .opacity(0.5f));
+    const radius radii[5] = {radius::xs, radius::sm, radius::md, radius::lg, radius::full};
+    for (int i = 0; i < 5; ++i)
+        styled_box(s, {16 + 36 * i, 84, 28, 18},
+                   style{}.bg(lx::ui::tok::element_background).border_1(lx::ui::tok::border).rounded(radii[i]));
+    styled_box(s, {200, 84, 36, 18},
+               style{}.bg(lx::ui::tok::ghost_element_hover).border_1(lx::ui::tok::border_focused).rounded(radius::sm));
+    styled_box(s, {248, 84, 36, 18}, style{}.bg(lx::ui::tok::element_active).border_b_1(lx::ui::tok::border_variant));
+}
+
+/// Lucide icons at Zed's 16, 14 and 12 px in `icon.*` and status tokens, and 16 px at scale
+/// 1.25 (a 20 px raster).
+inline void build_icons(lx::ui::draw_scope& s, const tiles& t) {
+    using namespace lx::ui;
+    const icon set[5] = {icon::x, icon::check, icon::settings, icon::bell, icon::chevron_down};
+    const lx::ui::tok colors[5] = {lx::ui::tok::icon, lx::ui::tok::icon_muted, lx::ui::tok::icon_accent, lx::ui::tok::error, lx::ui::tok::success};
+    const float sizes[3] = {16.f, 14.f, 12.f};
+    int y = 6;
+    for (float px : sizes) {
+        for (int i = 0; i < 5; ++i) {
+            auto node = std::make_unique<icon_node>();
+            node->apply({set[i], px, 1.f, colors[i], t.icons.get()});
+            const lx::size2i sz = node->measure({}, size_hint::preferred);
+            node->arrange({6 + 22 * i, y, sz.width, sz.height});
+            node->emit(s);
+        }
+        y += static_cast<int>(px) + 6;
+    }
+    auto big = std::make_unique<icon_node>();
+    big->apply({icon::wifi, 16.f, 1.25f, lx::ui::tok::text, t.icons.get()});
+    big->arrange({120, 6, 20, 20});
+    big->emit(s);
+}
+
+// ── Components (ADR-010 §5.6, Phase 3 stage 3): the controls in each state, and the rest of
+// the set, as `lx.ui:components` describes them under the built-in One Dark ──
+
+/// A described, laid-out component tree (its own arena and reconciler).
+struct component_tree {
+    lx::runtime::memory_arena arena{256 * 1024};
+    lx::ui::reconciler rec{};
+    lx::ui::ui_node* root = nullptr;
+    component_tree() = default;
+    component_tree(const component_tree&) = delete;
+    component_tree& operator=(const component_tree&) = delete;
+    ~component_tree() { delete root; }
+};
+
+/// `describe()` with the case's text and icon caches, placed at `bounds`.
+[[nodiscard]] inline std::unique_ptr<component_tree> component_layout(const tiles& t,
+                                                                     lx::ui::child (*describe)(),
+                                                                     lx::rect2i bounds) {
+    lx::ui::set_active_builtin_theme(lx::ui::appearance::dark);
+    lx::ui::ui_resources r{};
+    r.text = {text_fonts().engine(), t.glyphs.get(), nullptr};
+    r.icons = t.icons.get();
+    lx::ui::set_ui_resources(r);
+    auto tree = std::make_unique<component_tree>();
+    {
+        lx::ui::build_context ctx{tree->arena};
+        lx::ui::build_scope scope{ctx};
+        tree->root = tree->rec.apply(nullptr, describe());
+        (void)lx::ui::rebuild_pending_reducers(ctx, tree->rec);
+    }
+    if (tree->root)
+        tree->root->place(bounds);
+    lx::ui::ui_damage().clear();
+    return tree;
+}
+
+/// Sets `flag` (and `also`) on every node of the tree that is `want` and enabled.
+inline void set_state(lx::ui::ui_node& n, lx::ui::node_flag want, lx::ui::node_flag flag,
+                      lx::ui::node_flag also = lx::ui::node_flag::none) {
+    if (n.has_flag(want) && !n.has_flag(lx::ui::node_flag::disabled)) {
+        n.set_flag(flag, true);
+        if (also != lx::ui::node_flag::none)
+            n.set_flag(also, true);
+    }
+    for (unsigned i = 0; i < n.child_count(); ++i)
+        if (lx::ui::ui_node* c = n.child_at(i))
+            set_state(*c, want, flag, also);
+}
+
+inline bool g_state_row_disabled = false;
+
+/// One of each control: filled, outlined and ghost (with icon) buttons, an icon button, a
+/// selected toggle button, a checked checkbox, an on switch, an unselected tab.
+[[nodiscard]] inline lx::ui::child describe_state_row() {
+    using namespace lx::ui;
+    const bool d = g_state_row_disabled;
+    const child kids[] = {
+        button("Save").style(button_style::filled).disabled(d),
+        button("Open").style(button_style::outlined).disabled(d),
+        button("Ghost").icon(icon::check).disabled(d),
+        icon_button(icon::settings).disabled(d),
+        toggle_button("Grid").selected(true).icon(icon::menu).disabled(d),
+        checkbox(true).label("Wrap").disabled(d),
+        toggle_switch(true).label("Wi-Fi").disabled(d),
+        tab("main.rs").disabled(d),
+    };
+    return div(style{}.flex_row().items_center().gap(sp::b08), kids);
+}
+
+/// Rows top to bottom: normal, hovered, focused (the ring), disabled.
+inline void build_components_states(lx::ui::draw_scope& s, const tiles& t) {
+    using lx::ui::node_flag;
+    for (int row = 0; row < 4; ++row) {
+        g_state_row_disabled = row == 3;
+        auto tree = component_layout(t, describe_state_row, {8, 8 + 40 * row, 544, 32});
+        g_state_row_disabled = false;
+        if (!tree->root)
+            continue;
+        if (row == 1)
+            set_state(*tree->root, node_flag::interactive, node_flag::hovered);
+        if (row == 2)
+            set_state(*tree->root, node_flag::focusable, node_flag::focused, node_flag::focus_ring);
+        tree->root->emit(s);
+    }
+}
+
+/// The rest: a headline and muted label, avatars, key bindings and a key hint, a divider, a
+/// progress bar, a tab bar, a panel with its toolbar and a status bar.
+[[nodiscard]] inline lx::ui::child describe_gallery() {
+    using namespace lx::ui;
+    static const char* const keys[2] = {"Ctrl-S", "Ctrl-Shift-P"};
+    child tabs[3];
+    const char* names[3] = {"main.rs", "lib.rs", "theme.rs"};
+    for (unsigned i = 0; i < 3; ++i)
+        tabs[i] = tab(names[i]).position(i, 3, 1);
+    const child heading[2] = {headline("Components"), label("ADR-010 §5.6").color(tok::text_muted).size(label_size::small)};
+    const child misc[] = {
+        avatar("LM"),
+        avatar(nullptr),
+        vertical_divider(),
+        key_binding(keys),
+        key_binding_hint(std::span<const char* const>{keys, 1}, tok::surface_background).prefix("Save").suffix("to keep it"),
+    };
+    const child tool_left[1] = {label("Project")};
+    const child tool_right[2] = {icon_button(icon::plus).shape(icon_button_shape::square),
+                                 icon_button(icon::ellipsis).shape(icon_button_shape::square)};
+    const child body = label("Panels sit on panel.background under a toolbar.").color(tok::text_muted);
+    const child dock[1] = {panel(body).toolbar_start(tool_left).toolbar_end(tool_right)};
+    const child status_left[2] = {button("main").icon(icon::folder).size(button_size::compact),
+                                  label("Ln 12, Col 4").color(tok::text_muted).size(label_size::small)};
+    const child status_right[2] = {icon_button(icon::bell).size(button_size::compact),
+                                   icon_button(icon::settings).size(button_size::compact)};
+    const child kids[] = {
+        div(style{}.flex_row().items_end().gap(sp::b08), heading),
+        div(style{}.flex_row().items_center().gap(sp::b08), misc),
+        divider(),
+        progress_bar(62.f, 100.f),
+        tab_bar(tabs),
+        div(style{}.w_full().h(px(96.f)), dock),
+        status_bar(status_left, status_right),
+    };
+    return div(style{}.flex_col().gap(sp::b08), kids);
+}
+
+inline void build_components_gallery(lx::ui::draw_scope& s, const tiles& t) {
+    auto tree = component_layout(t, describe_gallery, {8, 8, 404, 300});
+    if (tree->root)
+        tree->root->emit(s);
+}
+
+// ── Overlays, scrolling and editing (ADR-010 §5.6, Phase 3 stage 4): a menu open below its
+// trigger, a tooltip, a modal over content, a toast stack, a scrolled area with its
+// scrollbar, text inputs with a selection and the caret ──
+
+/// `describe()` laid out as `component_layout` does, its open overlays laid out against the
+/// case's window (fades at their end: reduced motion while it builds) and the whole drawn —
+/// the tree, then the overlays over it. `prepare` runs between the layout and the draw.
+inline void build_with_overlays(lx::ui::draw_scope& s, const tiles& t, lx::ui::child (*describe)(),
+                                lx::rect2i bounds, lx::rect2i window,
+                                void (*prepare)(lx::ui::ui_node& root) = nullptr) {
+    lx::ui::set_reduced_motion(true);
+    auto tree = component_layout(t, describe, bounds);
+    lx::ui::overlay_layer& layer = lx::ui::ui_overlays();
+    if (tree->root) {
+        layer.set_root(tree->root);
+        layer.set_focus(nullptr);
+        layer.layout(window);
+        if (prepare) {
+            prepare(*tree->root);
+            layer.layout(window);
+        }
+        lx::ui::ui_damage().clear();
+        tree->root->emit(s);
+        layer.emit(s);
+    }
+    lx::ui::set_reduced_motion(false);
+    layer.set_root(nullptr);
+}
+
+[[nodiscard]] inline lx::ui::ui_node* find_named(lx::ui::ui_node* n, const char* name) {
+    if (!n)
+        return nullptr;
+    const lx::a11y::node a = n->accessibility_node();
+    if (a.name && std::strcmp(a.name, name) == 0)
+        return n;
+    for (unsigned i = 0; i < n->child_count(); ++i)
+        if (lx::ui::ui_node* hit = find_named(n->child_at(i), name))
+            return hit;
+    return nullptr;
+}
+
+inline const char* const k_golden_copy[1] = {"Ctrl-C"};
+inline const char* const k_golden_rename[1] = {"F2"};
+
+/// A popover menu open below its trigger: a header, entries with an icon and key bindings,
+/// a disabled entry, a separator, a submenu and a checked toggle; "Rename" hovered.
+[[nodiscard]] inline lx::ui::child describe_menu_open() {
+    using namespace lx::ui;
+    static menu_entry sub[1];
+    static menu_entry entries[7];
+    sub[0] = menu_item("Zoom in");
+    entries[0] = menu_header("Edit");
+    entries[1] = menu_item("Copy").icon(icon::copy).keys(k_golden_copy);
+    entries[2] = menu_item("Rename").icon(icon::pencil).keys(k_golden_rename);
+    entries[3] = menu_item("Delete").icon(icon::trash).disabled();
+    entries[4] = menu_separator();
+    entries[5] = menu_submenu("View", sub);
+    entries[6] = menu_item("Word wrap").toggle(true);
+    const child trigger = button("Edit").style(button_style::filled).icon(icon::chevron_down, icon_position::end);
+    const child kids[1] = {popover_menu(trigger, entries).open(true)};
+    return div(style{}.flex_row().items_start(), kids);
+}
+
+inline void build_menu_open(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_menu_open, {12, 8, 276, 24}, {0, 0, 300, 232},
+                        [](lx::ui::ui_node& root) {
+                            lx::ui::overlay_node* o = lx::ui::ui_overlays().top();
+                            if (lx::ui::ui_node* rename = o ? find_named(o->content(), "Rename") : nullptr)
+                                rename->set_flag(lx::ui::node_flag::hovered, true);
+                            (void)root;
+                        });
+}
+
+/// A button with a tooltip, shown at a pointer over it (its hover delay run out).
+[[nodiscard]] inline lx::ui::child describe_tooltip() {
+    using namespace lx::ui;
+    const child kids[2] = {button("Save").style(button_style::filled).icon(icon::check).tooltip("Save the file").name("save"),
+                           icon_button(icon::settings)};
+    return div(style{}.flex_row().items_center().gap(sp::b08), kids);
+}
+
+inline void build_tooltip(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_tooltip, {10, 10, 200, 24}, {0, 0, 236, 96},
+                        [](lx::ui::ui_node& root) {
+                            lx::ui::ui_node* save = find_named(&root, "save");
+                            if (!save)
+                                return;
+                            save->set_flag(lx::ui::node_flag::hovered, true);
+                            if (lx::ui::overlay_node* tip = lx::ui::child_overlay(*save, lx::ui::overlay_kind::tooltip))
+                                (void)tip->open_at({save->bounds().x + 20, save->bounds().y + 14});
+                        });
+}
+
+/// A modal over a panel of content: the scrim it asks for (`scrim()`, Zed's
+/// `fade_out_background`; off by default), the modal surface, header, body and footer.
+[[nodiscard]] inline lx::ui::child describe_modal_over_content() {
+    using namespace lx::ui;
+    const child behind[] = {
+        headline("Settings"),
+        label("Content behind the modal, under its scrim.").color(tok::text_muted),
+        button("Behind").style(button_style::outlined),
+    };
+    const child body = label("Discard the changes to three files?");
+    const child footer_end = button("Discard").style(button_style::filled);
+    const child footer_start = button("Cancel");
+    const child kids[2] = {div(style{}.flex_col().gap(sp::b08).p(sp::b12).size_full().bg(tok::surface_background), behind),
+                           modal(body).title("Unsaved changes").open(true).scrim().width(300.f).footer(footer_start, footer_end)};
+    return div(style{}.size_full(), kids);
+}
+
+inline void build_modal(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_modal_over_content, {0, 0, 380, 260}, {0, 0, 380, 260});
+}
+
+/// Two toasts stacked at the bottom centre: a success with its icon, an error with a close
+/// button.
+[[nodiscard]] inline lx::ui::child describe_toasts() {
+    using namespace lx::ui;
+    const child toasts[2] = {toast("Pushed 4 changes").status(status_kind::success).icon(icon::check).key(1),
+                             toast("Build failed").status(status_kind::error).icon(icon::x).dismiss_button().key(2)};
+    const child kids[2] = {label("Editor").color(tok::text_muted), toast_stack(toasts)};
+    return div(style{}.size_full().p(sp::b08), kids);
+}
+
+inline void build_toast_stack(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_toasts, {0, 0, 300, 140}, {0, 0, 300, 140});
+}
+
+/// A scroll area over twelve list items, scrolled 30 px, its scrollbar showing.
+[[nodiscard]] inline lx::ui::child describe_scroll_area() {
+    using namespace lx::ui;
+    static const char* const names[12] = {"main.rs", "lib.rs", "theme.rs", "overlay.rs", "scroll.rs",
+                                          "list.rs", "input.rs", "popups.rs", "focus.rs", "root.rs",
+                                          "node.rs", "style.rs"};
+    child rows[12];
+    for (unsigned i = 0; i < 12; ++i)
+        rows[i] = list_item(names[i]).start_slot(icon_view(icon::file, 14.f, tok::icon_muted)).selected(i == 3);
+    const child kids[1] = {scroll_area(style{}.w(px(196.f)).h(px(136.f)), rows)};
+    return div(style{}.flex_col().bg(tok::panel_background), kids);
+}
+
+inline void build_scroll_area(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_scroll_area, {8, 8, 196, 136}, {0, 0, 212, 152},
+                        [](lx::ui::ui_node& root) {
+                            lx::ui::ui_node* n = &root;
+                            while (n && n->type() != lx::ui::scroll_node::static_type())
+                                n = n->child_count() ? n->child_at(0) : nullptr;
+                            if (n)
+                                static_cast<lx::ui::scroll_node*>(n)->scroll_to(1, 30.f);
+                        });
+}
+
+/// Two text inputs: one focused with "Lumen text input", "text" selected and the caret after
+/// it; one empty showing its placeholder.
+[[nodiscard]] inline lx::ui::child describe_text_inputs() {
+    using namespace lx::ui;
+    const child kids[2] = {text_input().initial("Lumen text input").name("focused").layout(style{}.w(px(240.f))),
+                           text_input().placeholder("Search files").name("empty").layout(style{}.w(px(240.f)))};
+    return div(style{}.flex_col().gap(sp::b08), kids);
+}
+
+inline void build_text_input(lx::ui::draw_scope& s, const tiles& t) {
+    build_with_overlays(s, t, describe_text_inputs, {10, 8, 240, 80}, {0, 0, 260, 96},
+                        [](lx::ui::ui_node& root) {
+                            lx::ui::ui_node* n = find_named(&root, "focused");
+                            if (!n || n->type() != lx::ui::text_input_node::static_type())
+                                return;
+                            auto* in = static_cast<lx::ui::text_input_node*>(n);
+                            in->set_flag(lx::ui::node_flag::focused, true);
+                            in->set_selection(6, 10);
+                        });
+}
+
 [[nodiscard]] inline std::span<const golden_case> cases() {
-    static const golden_case k_cases[] = {
+    static const std::vector<golden_case> k_cases = [] {
+    std::vector<golden_case> v = {
         {"quad_radii", 232, 48, k_editor, build_quad_radii},
         {"quad_borders", 232, 48, k_editor, build_quad_borders},
         {"quad_dashed", 232, 48, k_surface, build_quad_dashed},
@@ -458,7 +826,23 @@ inline void build_text_clip(lx::ui::draw_scope& s, const tiles& t) {
         {"text_underlines", 312, 64, k_editor, build_text_underlines},
         {"text_emoji", 264, 72, k_surface, build_text_emoji},
         {"text_clip", 168, 80, k_editor, build_text_clip},
+        {"styled_surfaces", 300, 112, k_surface, build_styled_surfaces},
     };
+    if (lx::ui::icons_available()) {
+        v.push_back({"icons", 148, 66, k_editor, build_icons});
+        v.push_back({"components_states", 560, 168, k_surface, build_components_states});
+        v.push_back({"components_gallery", 420, 316, k_surface, build_components_gallery});
+        v.push_back({"menu_open", 300, 232, k_surface, build_menu_open});
+        v.push_back({"tooltip", 236, 96, k_editor, build_tooltip});
+        v.push_back({"modal", 380, 260, k_surface, build_modal});
+        v.push_back({"toast_stack", 300, 140, k_editor, build_toast_stack});
+        v.push_back({"scroll_area", 212, 152, k_surface, build_scroll_area});
+        v.push_back({"text_input", 260, 96, k_surface, build_text_input});
+    } else {
+        std::printf("    SKIP icons, components_*, menu_open, tooltip, modal, toast_stack, scroll_area, text_input: librsvg or the bundled icons are not available\n");
+    }
+    return v;
+    }();
     return k_cases;
 }
 

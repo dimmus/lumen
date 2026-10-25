@@ -61,7 +61,9 @@ lx::ui::ui_node* lx::ui::reconciler::apply(ui_node* retained, child desired) {
     if (retained && matches(*retained, *desired)) {
         if (desired->apply)
             desired->apply(*retained, desired->props);
-        reconcile_children(*retained, *desired);
+        // A reducer's subtree is its own: it describes and reconciles it itself.
+        if (!retained->has_flag(node_flag::opaque_children))
+            reconcile_children(*retained, *desired);
         ++stats_.reused;
         return retained;
     }
@@ -85,7 +87,8 @@ lx::ui::ui_node* lx::ui::reconciler::apply(ui_node* retained, child desired) {
     fresh->set_key(desired->key);
     if (desired->apply)
         desired->apply(*fresh, desired->props);
-    reconcile_children(*fresh, *desired);
+    if (!fresh->has_flag(node_flag::opaque_children))
+        reconcile_children(*fresh, *desired);
     fresh->mark_layout_dirty();
     ++stats_.constructed;
     return fresh;
@@ -100,12 +103,17 @@ void lx::ui::reconciler::reconcile_children(ui_node& parent, const element& desi
     // freeing a node that a keyed descriptor is about to claim.
     ui_node* pool[ui_node::k_max_children]{};
     const unsigned pooled = parent.detach_children(pool, ui_node::k_max_children);
+    // A rebuild that settles on the same children in the same slots leaves the parent's
+    // layout (and its measure cache) alone. "The same" is a reuse, never a pointer compare:
+    // the pool hands a freed node's block to the next node of its size.
+    bool changed = wanted != pooled;
     // The span grows here, once, when the count does; a steady rebuild reuses it.
     parent.reserve_children(wanted);
 
     for (unsigned i = 0; i < wanted; ++i) {
         child want = desired.children ? desired.children[i] : nullptr;
         ui_node* claimed = nullptr;
+        unsigned claimed_from = i;
 
         if (want && want->key != 0) {
             // Keyed: find this identity anywhere, so a reordered or filtered list
@@ -113,6 +121,7 @@ void lx::ui::reconciler::reconcile_children(ui_node& parent, const element& desi
             for (unsigned j = 0; j < pooled; ++j) {
                 if (pool[j] && pool[j]->key() == want->key && pool[j]->type() == want->type) {
                     claimed = pool[j];
+                    claimed_from = j;
                     pool[j] = nullptr;
                     break;
                 }
@@ -123,10 +132,18 @@ void lx::ui::reconciler::reconcile_children(ui_node& parent, const element& desi
             pool[i] = nullptr;
         }
 
+        if (!want) {
+            if (i < pooled && pool[i])
+                changed = true; // the slot empties (its node is destroyed below)
+        } else if (!claimed || !matches(*claimed, *want) || claimed_from != i) {
+            changed = true; // a new node, or one moved from another slot
+        }
         parent.place_child(i, apply(claimed, want));
     }
 
     parent.set_child_count(wanted);
+    if (changed)
+        parent.mark_layout_dirty();
 
     // Whatever no descriptor claimed has left the tree.
     for (unsigned j = 0; j < pooled; ++j) {

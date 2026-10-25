@@ -4,6 +4,10 @@ import lx.foundation;
 
 export module lx.layout;
 
+// ADR-010 §4.7: the flexbox engine lx.ui's containers use. The classes below are the
+// old engine, kept for lx.scene's container_node and lx.ui.builder until Phase 5.
+export import :flex;
+
 export namespace lx::layout {
 
 enum class axis { horizontal, vertical };

@@ -16,6 +16,8 @@ enum class error_domain {
     protocol,
     invalid_argument,
     not_implemented,
+    /// lx.ui: compiled themes, icon rasterisation.
+    ui,
 };
 
 struct error {

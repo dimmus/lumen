@@ -306,6 +306,12 @@ public:
     /// The layout's size in whole device pixels (rounded up); the width is at most the max
     /// width (an unbreakable word may overflow it).
     [[nodiscard]] lx::size2i bounding_size() const;
+    /// The min-content width in whole device pixels (rounded up): the widest run of clusters
+    /// between two break opportunities, its trailing whitespace hanging — the narrowest the
+    /// text wraps without breaking a word (CSS `min-content`; a word wider than the max
+    /// width is still broken by the wrap pass, `overflow-wrap: break-word`). The widest
+    /// paragraph when no face resolved (`has_faces()` false).
+    [[nodiscard]] int min_content_width() const;
     [[nodiscard]] std::string_view text() const { return {text_.data(), text_.size()}; }
     [[nodiscard]] std::span<const text_attr> attrs() const { return attrs_; }
     [[nodiscard]] std::span<const layout_line> lines() const;
@@ -1391,6 +1397,27 @@ lx::size2i lx::text::text_layout::bounding_size() const {
     if (max > 0 && w > (max + 63) / 64)
         w = (max + 63) / 64;
     return {w, h};
+}
+
+int lx::text::text_layout::min_content_width() const {
+    (void)refresh();
+    if (estimate_)
+        return (width_ + 63) / 64;
+    std::int32_t widest = 0;
+    for (const paragraph& p : paragraphs_) {
+        std::int32_t width = 0;
+        std::int32_t content = 0;
+        for (std::uint32_t k = p.cluster_begin; k < p.cluster_end; ++k) {
+            const layout_cluster& cl = clusters_[k];
+            width += cl.advance;
+            if (!cl.space)
+                content = width;
+            widest = std::max(widest, content);
+            if (k + 1 < p.cluster_end && (pos_[cl.end] & (k_pos_break | k_pos_mandatory)) != 0)
+                width = content = 0;
+        }
+    }
+    return (widest + 63) / 64;
 }
 
 std::span<const lx::text::layout_line> lx::text::text_layout::lines() const {
