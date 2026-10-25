@@ -131,4 +131,28 @@ LUMEN_TEST(card_rank_is_pure) {
     LUMEN_CHECK(l.cards[0].index == 2 && l.cards[1].index == 0);
 }
 
+LUMEN_TEST(card_no_atomic_hint) {
+    // nouveau before Linux 7.4: atomic=0, or the parameter unreadable (it is root-only).
+    fake_sysfs s;
+    const std::string mod = (s.root / "module").string();
+    const std::string_view off = lx::drm::no_atomic_hint("nouveau", mod.c_str());
+    LUMEN_CHECK(off.starts_with("TODO:"));
+    LUMEN_CHECK(off.find("options nouveau atomic=1") != std::string_view::npos);
+    LUMEN_CHECK(off.find("--nouveau-atomic") != std::string_view::npos);
+    fake_sysfs::write(s.root / "module/nouveau/parameters/atomic", "0");
+    LUMEN_CHECK(std::string_view(lx::drm::no_atomic_hint("nouveau", mod.c_str())) == off);
+    // Asked for (1, or -1 = auto on 7.4+) and still refused: a GPU before NV50.
+    for (const char* on : {"1", "-1"}) {
+        fake_sysfs::write(s.root / "module/nouveau/parameters/atomic", on);
+        const std::string_view old = lx::drm::no_atomic_hint("nouveau", mod.c_str());
+        LUMEN_CHECK(old.find("NV50") != std::string_view::npos);
+        LUMEN_CHECK(old.find("TODO") == std::string_view::npos);
+    }
+    LUMEN_CHECK(std::string_view(lx::drm::no_atomic_hint("radeon")).find("amdgpu") !=
+                std::string_view::npos);
+    LUMEN_CHECK(std::string_view(lx::drm::no_atomic_hint("udl")).find("no atomic") !=
+                std::string_view::npos);
+    LUMEN_CHECK(lx::drm::no_atomic_hint(nullptr) != nullptr);
+}
+
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

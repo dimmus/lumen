@@ -802,6 +802,12 @@ output set is a bit mask by slot); an `output_id` is never reused, a slot is.
   TakeDevice, then a direct open) until one opens; a card that does not is logged with why
   and released. `LUMEN_DRM_DEVICE=/dev/dri/cardN` names the card instead. None usable: the
   error is logged and the compositor runs on HEADLESS-1.
+- **Atomic modesetting only.** There is no legacy (SetCrtc/PageFlip) KMS path: a driver
+  that refuses DRM_CLIENT_CAP_ATOMIC fails the open with `drm_err::no_atomic`, and
+  `drm::no_atomic_hint` adds what to do to the log. The case that matters is nouveau, which
+  leaves atomic off before Linux 7.4 unless `nouveau.atomic=1`
+  (`scripts/install-deps.sh --nouveau-atomic` sets it; its check and `run-desktop.sh` say
+  when it is needed). radeon and nouveau before NV50 have none.
 - **The GPU follows the card.** The Vulkan device is the physical device whose
   VK_EXT_physical_device_drm primary (or render) node is the opened card's dev_t
   (`gfx::device_selector::select_best(drm_node)`; the compositor passes major/minor, no DRM

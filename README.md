@@ -12,7 +12,9 @@ cmake --build --preset release
 
 `install-deps.sh` supports Arch, Debian testing, Ubuntu 26.04+, Fedora 44+ and openSUSE
 Tumbleweed (`--help`; `-n` prints the packages without installing them). Lumen needs Clang with
-libstdc++ 16, CMake 3.28+ and Python 3.11+. Without the script:
+libstdc++ 16, CMake 3.28+ and Python 3.11+. On an NVIDIA GPU with nouveau and Linux before 7.4,
+`./scripts/install-deps.sh --nouveau-atomic` (then reboot) turns on the atomic modesetting the
+compositor needs. Without the script:
 
 ```bash
 ./scripts/fetch-protocols.sh

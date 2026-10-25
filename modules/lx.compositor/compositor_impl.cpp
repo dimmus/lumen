@@ -9095,9 +9095,17 @@ lx::result<void> compositor::start() {
             lx::make_error(lx::drm_err::open_failed, "no display device (/sys/class/drm)");
         drm::card_list cards{};
         if (const char* env = std::getenv("LUMEN_DRM_DEVICE"); env && *env) {
+            // The named card, with what sysfs says about it when it lists it (the driver
+            // decides what a failure to open it means).
+            drm::card_candidate named{};
+            std::snprintf(named.path, sizeof(named.path), "%s", env);
+            std::snprintf(named.driver, sizeof(named.driver), "LUMEN_DRM_DEVICE");
+            const drm::card_list listed = drm::find_cards();
+            for (unsigned i = 0; i < listed.count; ++i)
+                if (std::strcmp(listed.cards[i].path, env) == 0)
+                    named = listed.cards[i];
             cards.count = 1;
-            std::snprintf(cards.cards[0].path, sizeof(cards.cards[0].path), "%s", env);
-            std::snprintf(cards.cards[0].driver, sizeof(cards.cards[0].driver), "LUMEN_DRM_DEVICE");
+            cards.cards[0] = named;
         } else {
             cards = drm::find_cards();
         }
@@ -9127,14 +9135,29 @@ lx::result<void> compositor::start() {
                 // A card logind gave us and we cannot use goes back, or it stays paused-ours.
                 if (via_logind && taken_dev != 0)
                     impl_->logind_.release_device(major(taken_dev), minor(taken_dev));
+                const lx::error err = opened.get_error();
                 lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.drm",
                                                  "card {} ({}) not usable: {}", c.path,
-                                                 c.driver[0] ? c.driver : "?",
-                                                 opened.get_error().message);
+                                                 c.driver[0] ? c.driver : "?", err.message);
+                // No atomic modesetting is usually a module option away (nouveau before
+                // Linux 7.4): say what to do, not only what failed.
+                if (err.domain == lx::error_domain::drm &&
+                    err.code == static_cast<int>(lx::drm_err::no_atomic))
+                    lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.drm",
+                                                     "card {} ({}): {}", c.path,
+                                                     c.driver[0] ? c.driver : "?",
+                                                     drm::no_atomic_hint(c.driver));
             }
         }
-        if (!opened)
-            lx::trace::logger::global().log_error(opened.get_error(), "compositor.drm");
+        if (!opened) {
+            // Each card's reason is logged above; this is the outcome.
+            lx::trace::logger::global().log_error(
+                cards.count == 0 ? opened.get_error()
+                                 : lx::make_error(lx::drm_err::open_failed,
+                                                  "no display device usable: running on a "
+                                                  "virtual output (HEADLESS-1), nothing on screen"),
+                "compositor.drm");
+        }
         if (opened) {
             impl_->kms = std::move(opened).value();
             impl_->graphics.syncobj().set_drm_fd(impl_->kms.card_fd());

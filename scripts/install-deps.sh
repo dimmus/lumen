@@ -6,6 +6,7 @@
 #   ./scripts/install-deps.sh dev         # also develop and test
 #   ./scripts/install-deps.sh dev -n      # print what it would install, change nothing
 #   ./scripts/install-deps.sh --check     # only check the toolchain and libraries
+#   ./scripts/install-deps.sh --nouveau-atomic   # turn on nouveau's atomic modesetting
 #
 # Default set — what building and running a session needs: Clang with libstdc++ 16
 # (std::inplace_vector; `import std;` is built from its bits/std.cc) and clang-scan-deps,
@@ -36,6 +37,13 @@
 #   --no-fetch        do not run scripts/fetch-protocols.sh
 #   --check           only the toolchain and library check (no install, no fetch)
 #   --distro ID       skip /etc/os-release detection: arch, debian, ubuntu, fedora, opensuse
+#   --nouveau-atomic  only this: write `options nouveau atomic=1` to
+#                     /etc/modprobe.d/nouveau-atomic.conf and rebuild the initramfs (mkinitcpio,
+#                     dracut or update-initramfs: nouveau usually loads from it), then reboot.
+#                     The compositor needs atomic modesetting, which Linux before 7.4 leaves off
+#                     on nouveau; without it the card is refused and nothing reaches the screen.
+#                     `nouveau.atomic=1` on the kernel command line does the same. The check
+#                     (every run) says when it is needed.
 #
 # Supported: Arch and derivatives (pacman), Debian testing/unstable, Ubuntu and derivatives (apt),
 # Fedora (dnf), openSUSE Tumbleweed (zypper). libstdc++ 16 decides how old a release can be:
@@ -49,6 +57,7 @@ DRY=0
 YES=0
 FETCH=1
 CHECK_ONLY=0
+NOUVEAU_ATOMIC=0
 DISTRO=""
 
 while (( $# > 0 )); do
@@ -58,6 +67,7 @@ while (( $# > 0 )); do
     -y|--yes) YES=1 ;;
     --no-fetch) FETCH=0 ;;
     --check) CHECK_ONLY=1 ;;
+    --nouveau-atomic) NOUVEAU_ATOMIC=1 ;;
     --distro) DISTRO="${2:?--distro needs an ID}"; shift ;;
     -h|--help) sed -n '2,/^set -uo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1 (see --help)"; exit 2 ;;
@@ -330,6 +340,39 @@ run_user() {
   if [[ $EUID -eq 0 && -n "${SUDO_USER:-}" ]]; then sudo -u "$SUDO_USER" -- "$@"; else "$@"; fi
 }
 version_ge() { [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" == "$2" ]]; }
+# shellcheck source=nouveau-atomic.sh
+source "$ROOT/scripts/nouveau-atomic.sh"
+
+# ── nouveau atomic modesetting (--nouveau-atomic) ────────────────────────────
+NOUVEAU_CONF=/etc/modprobe.d/nouveau-atomic.conf
+nouveau_atomic_enable() {
+  case "$(nouveau_atomic_state)" in
+    on) say "nouveau atomic modesetting is on already"; return 0 ;;
+    pending) say "nouveau atomic modesetting is configured; reboot for it to take effect"; return 0 ;;
+  esac
+  [[ -n "$(nouveau_cards)" ]] || warn "nouveau drives no card here; writing the option anyway"
+  say "Turning on nouveau atomic modesetting: $NOUVEAU_CONF"
+  if (( DRY )); then
+    printf "  printf 'options nouveau atomic=1\\\\n' | %stee %q\n" "$([[ $EUID -eq 0 ]] || echo 'sudo ')" "$NOUVEAU_CONF"
+  else
+    printf '# Lumen: the compositor needs atomic modesetting (on by default from Linux 7.4).\noptions nouveau atomic=1\n' \
+      | run_root tee "$NOUVEAU_CONF" >/dev/null || { echo "FAIL: could not write $NOUVEAU_CONF" >&2; return 1; }
+  fi
+  # The options reach a nouveau loaded from the initramfs only through a rebuilt one.
+  if command -v mkinitcpio >/dev/null; then
+    say "Rebuilding the initramfs (mkinitcpio -P)"
+    run_root mkinitcpio -P || { echo "FAIL: mkinitcpio -P" >&2; return 1; }
+  elif command -v dracut >/dev/null; then
+    say "Rebuilding the initramfs (dracut)"
+    run_root dracut -f --regenerate-all || { echo "FAIL: dracut" >&2; return 1; }
+  elif command -v update-initramfs >/dev/null; then
+    say "Rebuilding the initramfs (update-initramfs)"
+    run_root update-initramfs -u -k all || { echo "FAIL: update-initramfs" >&2; return 1; }
+  else
+    warn "no mkinitcpio, dracut or update-initramfs: if nouveau loads from an initramfs, rebuild it"
+  fi
+  say "Reboot, then check: sudo cat /sys/module/nouveau/parameters/atomic (1)"
+}
 
 # ── Toolchain and library check ──────────────────────────────────────────────
 newest_versioned_clang() {
@@ -405,6 +448,17 @@ check() {
   fi
   command -v glslc >/dev/null || warn "glslc not found: the Vulkan composite pass is not built"
 
+  if [[ -n "$(nouveau_cards)" ]]; then
+    say "Checking the display (nouveau)"
+    case "$(nouveau_atomic_state)" in
+      off)
+        warn "nouveau has atomic modesetting off (Linux before 7.4): the compositor refuses the" \
+             "card and shows nothing. TODO: $0 --nouveau-atomic, then reboot" ;;
+      pending)
+        warn "nouveau atomic modesetting is configured but not booted with yet: reboot" ;;
+    esac
+  fi
+
   say "Checking libraries (pkg-config)"
   if ! command -v pkg-config >/dev/null; then
     fail "pkg-config not found"
@@ -439,6 +493,11 @@ check() {
 }
 
 # ── Main ─────────────────────────────────────────────────────────────────────
+if (( NOUVEAU_ATOMIC )); then
+  nouveau_atomic_enable
+  exit $?
+fi
+
 if (( ! CHECK_ONLY )); then
   case "$FAMILY" in
     arch) plan_arch ;;
