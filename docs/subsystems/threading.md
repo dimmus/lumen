@@ -313,7 +313,7 @@ so they overlap instead of queueing:
 
 | Helper | Runs beside | Joined |
 |--------|-------------|--------|
-| hardware-Vulkan probe (`device_selector::has_hardware_vulkan`) | logind session and KMS open (D-Bus, kernel) | before the present path is chosen |
+| hardware-Vulkan probe (`device_selector::probe_devices`: the devices and their DRM nodes; which one counts is chosen from the card after the join) | logind session and KMS open (D-Bus, kernel) | before the present path is chosen |
 | input open (`begin_input`: keymap compile, libinput, logind `TakeDevice` per device) | EGL/GL set-up and the scanout targets | `finish_input`, after the globals |
 | cursor theme at the default output scale (`begin_cursor_theme`) | the same | the cursor set-up, which adopts it |
 

@@ -54,6 +54,31 @@ Chosen **once at startup**, in `compositor::start`, from `config::present`:
 `egl_device::is_software_renderer()` (`GL_RENDERER` naming llvmpipe/softpipe/swrast). Each
 backend declines itself rather than accepting a downgrade.
 
+**Which GPU.** The Vulkan device is the one behind the KMS card, not the first one the
+loader lists. `compositor::start` opens the card (`drm::find_cards`), passes its dev_t to
+`gfx::device_selector::select_best(drm_node)` as plain major/minor numbers, and
+`gfx::choose_physical_device` picks the physical device whose
+`VkPhysicalDeviceDrmPropertiesEXT` primary node (VK_EXT_physical_device_drm), else render
+node, is that card. On a hybrid laptop the loader commonly lists the discrete GPU first
+while the panel hangs off the integrated one; compositing there sends every frame across
+PCIe, and client dma-bufs and the scanout target belong to different devices, which defeats
+zero-copy import and direct scanout. Without a match — no device has the extension, or the
+card has no Vulkan device behind it (simpledrm, evdi, vkms, a GPU without a Vulkan driver)
+— the first hardware device is used, as before matching existed, and the
+`compositor.gfx` line saying which device and how is a warning. A hybrid laptop, then the
+same laptop driving a DisplayLink dock (evdi, card2):
+
+```
+Vulkan device Intel(R) Graphics (integrated) for card 226:1: matched by primary node
+Vulkan device Intel(R) Graphics (integrated) for card 226:2: no device owns the card, first hardware device composites
+```
+
+The start-up probe (instance only, beside the KMS open) lists the devices with their nodes
+(`device_selector::probe_devices`); the choice is made from that list once the card is open,
+so `automatic` asks whether *the card's* device is hardware, and the logical device is
+created only after the card is known. The GL path needs none of this: its EGL display is
+created on the card's own GBM device.
+
 **Why GL exists alongside Vulkan.** Mesa ships hardware drivers for devices it has no
 Vulkan driver for — vmwgfx/SVGA3D under VMware being the case this was built for, but also
 older radeon/nouveau and many SoCs. On those, EGL/GLES is the only accelerated path, and
@@ -651,6 +676,12 @@ clients, `render_us` from the `compositor.render` debug line:
 | `fifo_relaxed` | Integrated | Adaptive vsync — **balanced** |
 | `fifo` | Integrated | Strict vsync — **no tear** |
 | `auto_select` | Any | discrete→mailbox, integrated→fifo_relaxed |
+
+The tier is the compositing device's `VkPhysicalDeviceType` (`gfx::tier_of`: discrete GPU →
+discrete, anything else → integrated), of the device matched to the card (§1.2), handed to
+`output_manager::set_gpu_tier`. It used to be guessed from which `/dev/dri` nodes existed
+(`card1` or `renderD129` meant "discrete"), which is wrong whenever simpledrm took card0 and
+the only GPU is card1.
 
 **Module:** `lx.compositor.output` — `output_manager`, `present_mode`, `output_state`
 

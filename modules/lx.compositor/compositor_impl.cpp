@@ -377,6 +377,8 @@ struct compositor_impl {
     /// The card's device number (what logind's signals name) and how it was opened.
     unsigned drm_major_ = 0;
     unsigned drm_minor_ = 0;
+    /// The same numbers for lx.gfx, which picks the Vulkan device behind the card from them.
+    gfx::drm_node drm_node_{};
     bool drm_via_logind_ = false;
     bool drm_start_inactive_ = false;
     /// UI affinity. logind signals recorded inside sd_bus_process, handled right after it
@@ -4625,11 +4627,38 @@ void compositor_impl::ensure_graphics_device() {
     if (graphics_created_)
         return;
     graphics_created_ = true;
-    if (auto dev = gfx::device_selector::select_best(); dev) {
+    if (auto dev = gfx::device_selector::select_best(drm_node_); dev) {
         graphics = std::move(dev).value();
-        headless_present_ = !graphics.info().supports_dmabuf_import;
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                        graphics.info().device_name);
+        const gfx::device_info info = graphics.info();
+        headless_present_ = !info.supports_dmabuf_import;
+        if (!graphics.vk_device()) {
+            lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
+                                            info.device_name);
+        } else {
+            // Which GPU composites, and whether it is the one that scans out: on a hybrid
+            // or two-GPU machine anything but a node match means frames cross devices. A
+            // software rasterizer owns no card; that is no cross-device warning.
+            outputs.set_gpu_tier(info.tier);
+            const bool matched = info.match == gfx::device_match::primary_node ||
+                                 info.match == gfx::device_match::render_node;
+            const char* tier = info.tier == gfx::gpu_tier::discrete ? "discrete" : "integrated";
+            if (!drm_node_.present) {
+                lx::trace::logger::global().logf(lx::trace::level::info, "compositor.gfx",
+                                                 "Vulkan device {} ({}): no card to match",
+                                                 info.device_name, tier);
+            } else {
+                const bool software = info.is_software_rasterizer;
+                lx::trace::logger::global().logf(
+                    matched || software ? lx::trace::level::info : lx::trace::level::warn,
+                    "compositor.gfx", "Vulkan device {} ({}) for card {}:{}: {}{}{}",
+                    info.device_name, software ? "software" : tier, drm_node_.major,
+                    drm_node_.minor, matched ? "matched by " : "",
+                    gfx::device_match_name(info.match),
+                    matched    ? ""
+                    : software ? ", software rasterizer"
+                               : ", first hardware device composites");
+            }
+        }
         if (kms.card_fd() >= 0) {
             graphics.syncobj().set_drm_fd(kms.card_fd());
             graphics.syncobj().set_device(graphics.vk_device());
@@ -9041,15 +9070,14 @@ lx::result<void> compositor::start() {
 
     // The hardware-Vulkan probe runs beside the logind and KMS opening below: they mostly
     // wait on D-Bus and the kernel, the probe is CPU work in the Vulkan loader. Only the UI
-    // thread exists yet, so the scope's environment edit has no concurrent writer.
-    bool hardware_vulkan = false;
+    // thread exists yet, so the scope's environment edit has no concurrent writer. It lists
+    // the devices; which one counts is known only once the card is open (below).
+    gfx::physical_device_list probed{};
     std::optional<gfx::hardware_probe_scope> probe_scope;
     std::thread probe;
     if (impl_->cfg.present == present_backend::automatic) {
         probe_scope.emplace();
-        probe = std::thread([&hardware_vulkan] {
-            hardware_vulkan = gfx::device_selector::has_hardware_vulkan();
-        });
+        probe = std::thread([&probed] { probed = gfx::device_selector::probe_devices(); });
     }
 
     if (auto session = session::logind_session::open(); session)
@@ -9122,6 +9150,7 @@ lx::result<void> compositor::start() {
                 if (::fstat(impl_->kms.card_fd(), &st) == 0 && S_ISCHR(st.st_mode)) {
                     impl_->drm_major_ = major(st.st_rdev);
                     impl_->drm_minor_ = minor(st.st_rdev);
+                    impl_->drm_node_ = {true, impl_->drm_major_, impl_->drm_minor_};
                 }
             }
             if (impl_->drm_present_ && impl_->drm_start_inactive_) {
@@ -9144,6 +9173,15 @@ lx::result<void> compositor::start() {
         probe.join();
     probe_scope.reset();
     lx::trace::timeline_instant("startup", "graphics probed");
+    // Hardware Vulkan means the device that would composite is hardware: the one behind the
+    // card, the same choice `ensure_graphics_device` makes (software drivers were not
+    // loaded for the probe, so none is listed).
+    const gfx::device_choice probed_choice =
+        gfx::choose_physical_device(probed, impl_->drm_node_);
+    const bool hardware_vulkan =
+        probed.count > 0 &&
+        probed.devices[probed_choice.index].kind != gfx::physical_device_kind::cpu;
+    impl_->outputs.set_gpu_tier(gfx::device_selector::probe_tier(probed, impl_->drm_node_));
 
     // Graphics. A Vulkan device is not free: where the only Vulkan driver is a software
     // rasterizer (lavapipe), creating one initialises LLVM and its JIT — about 28 MB of heap

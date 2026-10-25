@@ -188,6 +188,9 @@ public:
     [[nodiscard]] present_mode present_mode_for(lx::output_id output) const;
 
     void set_present_mode(lx::output_id output, present_mode mode);
+    /// The compositing GPU's tier (`gfx::device_info::tier` of the device behind the card),
+    /// which `present_mode::auto_select` resolves against. Integrated until set.
+    void set_gpu_tier(lx::gfx::gpu_tier tier) { gpu_tier_ = tier; }
     /// Rounded through `representable_scale`. Moves `generation` on a change, and re-runs
     /// the automatic layout (a logical width changed).
     void set_scale(lx::output_id output, double scale);
@@ -291,6 +294,7 @@ private:
     };
     scale_override overrides_[k_max]{};
     unsigned override_count_ = 0;
+    lx::gfx::gpu_tier gpu_tier_ = lx::gfx::gpu_tier::integrated;
 };
 
 [[nodiscard]] present_mode resolve_present_mode(present_mode requested,
@@ -460,8 +464,7 @@ lx::compositor::present_mode
 lx::compositor::output_manager::present_mode_for(lx::output_id output) const {
     const auto st = state(output);
     if (st.present != present_mode::auto_select) return st.present;
-    return lx::compositor::resolve_present_mode(present_mode::auto_select,
-                                                lx::gfx::device_selector::probe_tier());
+    return lx::compositor::resolve_present_mode(present_mode::auto_select, gpu_tier_);
 }
 
 void lx::compositor::output_manager::set_present_mode(lx::output_id output, present_mode mode) {

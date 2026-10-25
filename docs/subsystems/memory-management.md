@@ -61,8 +61,8 @@ retired texture's slots are no longer sampled. Both are reported as `memory_pool
 See rendering-performance.md, SHM staging, for why per-texture staging used to grow
 without bound.
 
-Start-up probes Vulkan with an instance only (`device_selector::has_hardware_vulkan`) and
-creates a Vulkan device only when Vulkan may composite: hardware Vulkan, or an explicit
+Start-up probes Vulkan with an instance only (`device_selector::probe_devices`) and
+creates a Vulkan device only when Vulkan may composite: hardware Vulkan behind the card, or an explicit
 `vulkan`/`cpu` request. A software ICD (lavapipe) costs about 28 MB of heap to create a
 device on (LLVM and its JIT, measured with heaptrack) — paid before for a device the GL
 path never used. The CPU and nested fallbacks create it on demand; on the GL path any

@@ -4,7 +4,6 @@ module;
 #include <vulkan/vulkan.h>
 #endif
 #include <stdlib.h>
-#include <unistd.h>
 #include <stdint.h>
 
 import lx.foundation;
@@ -36,6 +35,92 @@ export namespace lx::gfx {
 
 enum class gpu_tier { discrete, integrated, embedded };
 
+/// A DRM device node as the numbers of its dev_t: the card the compositor scans out on
+/// (`major`/`minor` of its `st_rdev`). It is how the Vulkan device behind the card is found
+/// without a DRM or Vulkan type crossing into lx.gfx. `present` false: no card (headless,
+/// nested, virtual outputs).
+struct drm_node {
+    bool present = false;
+    unsigned major = 0;
+    unsigned minor = 0;
+};
+
+/// `VkPhysicalDeviceType`, numbered the same, as a plain value.
+enum class physical_device_kind : unsigned char {
+    other = 0,
+    integrated_gpu = 1,
+    discrete_gpu = 2,
+    virtual_gpu = 3,
+    cpu = 4,
+};
+
+/// Discrete for a discrete GPU; integrated otherwise (an integrated GPU, a guest's virtual
+/// GPU, a software rasterizer). What the present mode follows.
+[[nodiscard]] constexpr gpu_tier tier_of(physical_device_kind kind) {
+    return kind == physical_device_kind::discrete_gpu ? gpu_tier::discrete
+                                                      : gpu_tier::integrated;
+}
+
+/// How `choose_physical_device` found its device.
+enum class device_match : unsigned char {
+    /// The device's primary node (VK_EXT_physical_device_drm) is the card.
+    primary_node,
+    /// The device's render node is the node given (a render node named as the card).
+    render_node,
+    /// No card to match: the first hardware device.
+    no_card,
+    /// No device reports its DRM nodes (VK_EXT_physical_device_drm missing everywhere):
+    /// the first hardware device, as before matching existed.
+    no_extension,
+    /// Devices report their nodes and none is the card — a display-only card (simpledrm,
+    /// evdi, vkms) or a GPU without a Vulkan driver: the first hardware device, which then
+    /// composites for another GPU's scanout.
+    no_match,
+};
+
+[[nodiscard]] constexpr const char* device_match_name(device_match m) {
+    switch (m) {
+    case device_match::primary_node: return "primary node";
+    case device_match::render_node: return "render node";
+    case device_match::no_card: return "no card";
+    case device_match::no_extension: return "VK_EXT_physical_device_drm missing";
+    case device_match::no_match: return "no device owns the card";
+    }
+    return "?";
+}
+
+/// One Vulkan physical device as the selector sees it, in plain values.
+struct physical_device_desc {
+    physical_device_kind kind = physical_device_kind::other;
+    /// VK_EXT_physical_device_drm is supported: the node fields below are meaningful.
+    bool has_drm = false;
+    /// `VkPhysicalDeviceDrmPropertiesEXT` — `present` mirrors `hasPrimary` / `hasRender`.
+    drm_node primary{};
+    drm_node render{};
+};
+
+inline constexpr unsigned k_max_physical_devices = 8;
+
+/// Physical devices in enumeration order (at most `k_max_physical_devices`).
+struct physical_device_list {
+    physical_device_desc devices[k_max_physical_devices]{};
+    unsigned count = 0;
+};
+
+struct device_choice {
+    /// Into the list; 0 for an empty list (check `count`).
+    unsigned index = 0;
+    device_match match = device_match::no_card;
+};
+
+/// Pure: the device behind `card` — the one whose primary node is the card, else whose
+/// render node is. Without a match, the first device that is not a software rasterizer
+/// (the first device when every one is). A hybrid laptop's panel is on the integrated GPU
+/// while the loader often lists the discrete one first; compositing there would put every
+/// frame across PCIe and make client dma-bufs foreign to the scanout device.
+[[nodiscard]] device_choice choose_physical_device(const physical_device_list& list,
+                                                   drm_node card);
+
 struct device_info {
     gpu_tier tier = gpu_tier::integrated;
     const char* device_name = "";
@@ -55,6 +140,14 @@ struct device_info {
     /// SwiftShader). Vulkan still works, but every composite is CPU work reached through
     /// an upload and a tiling pass, so the present path should prefer `cpu_compositor`.
     bool is_software_rasterizer = false;
+    /// Input to `device::create`: the card to match the physical device to (`select_best`).
+    /// Kept, so device recovery re-selects for the same card.
+    drm_node card{};
+    /// How the physical device was matched to `card`, and that device's own nodes
+    /// (`present` false without VK_EXT_physical_device_drm).
+    device_match match = device_match::no_card;
+    drm_node primary_node{};
+    drm_node render_node{};
 };
 
 class device {
@@ -105,18 +198,25 @@ private:
 
 class device_selector {
 public:
-    [[nodiscard]] static lx::result<device> select_best();
-    [[nodiscard]] static gpu_tier probe_tier();
-    /// True when Vulkan exposes a device that is not a software rasterizer
-    /// (`VK_PHYSICAL_DEVICE_TYPE_CPU`). Creates and destroys an instance only — no logical
-    /// device, so a software ICD never builds its JIT or worker threads just to be asked.
-    /// `select_best` (the same first device) creates a lavapipe device for about 28 MB of
-    /// heap; a caller that would not composite with it should not pay that to find out.
-    [[nodiscard]] static bool has_hardware_vulkan();
+    /// A Vulkan device on the physical device behind `card` (`choose_physical_device`),
+    /// else the headless bookkeeping device.
+    [[nodiscard]] static lx::result<device> select_best(drm_node card = {});
+    /// The tier of the device `choose_physical_device` picks from `devices` for `card`;
+    /// integrated when there is none. From the device's type, not from which /dev/dri
+    /// nodes exist: card1 is commonly the only GPU (simpledrm took card0).
+    [[nodiscard]] static gpu_tier probe_tier(const physical_device_list& devices,
+                                             drm_node card);
+    /// The physical devices Vulkan exposes, described for `choose_physical_device`.
+    /// Creates and destroys an instance only — no logical device, so a software ICD never
+    /// builds its JIT or worker threads just to be asked. `select_best` creates a lavapipe
+    /// device for about 28 MB of heap; a caller that would not composite with it should
+    /// not pay that to find out. Empty without Vulkan.
+    [[nodiscard]] static physical_device_list probe_devices();
 };
 
 /// While alive, the Vulkan loader skips software drivers (`VK_LOADER_DRIVERS_DISABLE`), for
-/// `device_selector::has_hardware_vulkan`: a software rasterizer cannot be its answer, and
+/// `device_selector::probe_devices` asked whether hardware Vulkan exists: a software
+/// rasterizer cannot be its answer, and
 /// loading one is most of the probe's cost (lavapipe initialises LLVM: about 15 of 20 ms on
 /// a VM). Left alone when the environment already chooses drivers. It edits the process
 /// environment: create and destroy it while no other thread can write the environment, and
@@ -257,8 +357,96 @@ int lx_gfx_pick_graphics_family(VkPhysicalDevice phys) {
     return -1;
 }
 
+/// The device's type and, with VK_EXT_physical_device_drm, its DRM nodes. The extension's
+/// properties are read through `vkGetPhysicalDeviceProperties2`, core in Vulkan 1.1: the
+/// instances here ask for 1.1, and a 1.0 device is described without nodes.
+lx::gfx::physical_device_desc lx_gfx_describe(VkPhysicalDevice phys) {
+    static_assert(static_cast<int>(lx::gfx::physical_device_kind::other) ==
+                  VK_PHYSICAL_DEVICE_TYPE_OTHER);
+    static_assert(static_cast<int>(lx::gfx::physical_device_kind::integrated_gpu) ==
+                  VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU);
+    static_assert(static_cast<int>(lx::gfx::physical_device_kind::discrete_gpu) ==
+                  VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU);
+    static_assert(static_cast<int>(lx::gfx::physical_device_kind::virtual_gpu) ==
+                  VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU);
+    static_assert(static_cast<int>(lx::gfx::physical_device_kind::cpu) ==
+                  VK_PHYSICAL_DEVICE_TYPE_CPU);
+    lx::gfx::physical_device_desc d{};
+    VkPhysicalDeviceProperties props{};
+    vkGetPhysicalDeviceProperties(phys, &props);
+    if (props.deviceType <= VK_PHYSICAL_DEVICE_TYPE_CPU)
+        d.kind = static_cast<lx::gfx::physical_device_kind>(props.deviceType);
+    if (props.apiVersion < VK_API_VERSION_1_1)
+        return d;
+
+    uint32_t ext_count = 0;
+    if (vkEnumerateDeviceExtensionProperties(phys, nullptr, &ext_count, nullptr) != VK_SUCCESS)
+        return d;
+    std::vector<VkExtensionProperties> exts(ext_count);
+    if (ext_count > 0 &&
+        vkEnumerateDeviceExtensionProperties(phys, nullptr, &ext_count, exts.data()) < 0)
+        return d;
+    exts.resize(ext_count);
+    if (!std::ranges::any_of(exts, [](const VkExtensionProperties& p) {
+            return std::strcmp(p.extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME) == 0;
+        }))
+        return d;
+
+    VkPhysicalDeviceDrmPropertiesEXT drm{};
+    drm.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT;
+    VkPhysicalDeviceProperties2 props2{};
+    props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    props2.pNext = &drm;
+    vkGetPhysicalDeviceProperties2(phys, &props2);
+    d.has_drm = true;
+    d.primary = {drm.hasPrimary == VK_TRUE, static_cast<unsigned>(drm.primaryMajor),
+                 static_cast<unsigned>(drm.primaryMinor)};
+    d.render = {drm.hasRender == VK_TRUE, static_cast<unsigned>(drm.renderMajor),
+                static_cast<unsigned>(drm.renderMinor)};
+    return d;
+}
+
+/// The instance's physical devices in enumeration order, at most `k_max_physical_devices`,
+/// with `list` describing each.
+void lx_gfx_enumerate(VkInstance instance,
+                      VkPhysicalDevice (&devices)[lx::gfx::k_max_physical_devices],
+                      lx::gfx::physical_device_list& list) {
+    uint32_t n = lx::gfx::k_max_physical_devices;
+    const VkResult r = vkEnumeratePhysicalDevices(instance, &n, devices);
+    list.count = (r == VK_SUCCESS || r == VK_INCOMPLETE) ? n : 0;
+    for (unsigned i = 0; i < list.count; ++i)
+        list.devices[i] = lx_gfx_describe(devices[i]);
+}
+
 } // namespace
 #endif
+
+lx::gfx::device_choice lx::gfx::choose_physical_device(const physical_device_list& list,
+                                                       drm_node card) {
+    const std::span devices{list.devices, std::min(list.count, k_max_physical_devices)};
+    const auto is = [&card](const drm_node& n) {
+        return n.present && n.major == card.major && n.minor == card.minor;
+    };
+    device_choice choice{};
+    if (card.present) {
+        for (unsigned i = 0; i < devices.size(); ++i)
+            if (devices[i].has_drm && is(devices[i].primary))
+                return {i, device_match::primary_node};
+        for (unsigned i = 0; i < devices.size(); ++i)
+            if (devices[i].has_drm && is(devices[i].render))
+                return {i, device_match::render_node};
+        const bool any_drm =
+            std::ranges::any_of(devices, [](const physical_device_desc& d) { return d.has_drm; });
+        choice.match = any_drm ? device_match::no_match : device_match::no_extension;
+    }
+    for (unsigned i = 0; i < devices.size(); ++i) {
+        if (devices[i].kind != physical_device_kind::cpu) {
+            choice.index = i;
+            break;
+        }
+    }
+    return choice;
+}
 
 lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
     device d;
@@ -284,20 +472,23 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         }
         d.instance_ = instance;
 
-        uint32_t count = 0;
-        if (vkEnumeratePhysicalDevices(instance, &count, nullptr) != VK_SUCCESS || count == 0) {
+        // The physical device behind the scanout card: composite where the frame is
+        // shown, and import client dma-bufs on the device that will scan them out.
+        VkPhysicalDevice devices[k_max_physical_devices]{};
+        physical_device_list described{};
+        lx_gfx_enumerate(instance, devices, described);
+        if (described.count == 0) {
             d.destroy_vulkan();
             return lx::make_error(lx::vulkan_err::device_lost, "no Vulkan physical devices");
         }
-
-        VkPhysicalDevice phys = VK_NULL_HANDLE;
-        {
-            VkPhysicalDevice devices[8]{};
-            uint32_t n = count < 8 ? count : 8;
-            vkEnumeratePhysicalDevices(instance, &n, devices);
-            phys = devices[0];
-        }
+        const device_choice choice = choose_physical_device(described, info.card);
+        const physical_device_desc& chosen = described.devices[choice.index];
+        VkPhysicalDevice phys = devices[choice.index];
         d.physical_ = phys;
+        d.info_.match = choice.match;
+        d.info_.primary_node = chosen.primary;
+        d.info_.render_node = chosen.render;
+        d.info_.tier = tier_of(chosen.kind);
 
         const int family = lx_gfx_pick_graphics_family(phys);
         if (family < 0) {
@@ -402,8 +593,6 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
             d.device_name_[sizeof(d.device_name_) - 1] = '\0';
             if (d.device_name_[0] != '\0')
                 d.info_.device_name = d.device_name_;
-            if (props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU)
-                d.info_.tier = gpu_tier::discrete;
         }
 
         if (!d.info_.device_name || d.info_.device_name[0] == '\0')
@@ -462,9 +651,9 @@ lx::gfx::vk_context lx::gfx::device::context() const {
     return ctx;
 }
 
-lx::result<lx::gfx::device> lx::gfx::device_selector::select_best() {
+lx::result<lx::gfx::device> lx::gfx::device_selector::select_best(drm_node card) {
     device_info info{};
-    info.tier = probe_tier();
+    info.card = card;
 #if defined(LUMEN_HAS_VULKAN)
     info.device_name = "vulkan";
     info.supports_dmabuf_import = true;
@@ -491,7 +680,8 @@ lx::gfx::hardware_probe_scope::~hardware_probe_scope() {
         ::unsetenv("VK_LOADER_DRIVERS_DISABLE");
 }
 
-bool lx::gfx::device_selector::has_hardware_vulkan() {
+lx::gfx::physical_device_list lx::gfx::device_selector::probe_devices() {
+    physical_device_list list{};
 #if defined(LUMEN_HAS_VULKAN)
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -502,31 +692,19 @@ bool lx::gfx::device_selector::has_hardware_vulkan() {
     ici.pApplicationInfo = &app;
     VkInstance instance = VK_NULL_HANDLE;
     if (vkCreateInstance(&ici, nullptr, &instance) != VK_SUCCESS)
-        return false;
-    // `device::create` uses the first physical device, so that is the one that matters.
-    VkPhysicalDevice first = VK_NULL_HANDLE;
-    uint32_t n = 1;
-    const VkResult r = vkEnumeratePhysicalDevices(instance, &n, &first);
-    bool hardware = false;
-    if ((r == VK_SUCCESS || r == VK_INCOMPLETE) && n > 0 && first != VK_NULL_HANDLE) {
-        VkPhysicalDeviceProperties props{};
-        vkGetPhysicalDeviceProperties(first, &props);
-        hardware = props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU;
-    }
+        return list;
+    VkPhysicalDevice devices[k_max_physical_devices]{};
+    lx_gfx_enumerate(instance, devices, list);
     vkDestroyInstance(instance, nullptr);
-    return hardware;
-#else
-    return false;
 #endif
+    return list;
 }
 
-lx::gfx::gpu_tier lx::gfx::device_selector::probe_tier() {
-    // Dual-GPU heuristic: secondary render node implies discrete + integrated PRIME setup.
-    if (access("/dev/dri/renderD128", F_OK) == 0 && access("/dev/dri/renderD129", F_OK) == 0)
-        return lx::gfx::gpu_tier::discrete;
-    if (access("/dev/dri/card1", F_OK) == 0)
-        return lx::gfx::gpu_tier::discrete;
-    return lx::gfx::gpu_tier::integrated;
+lx::gfx::gpu_tier lx::gfx::device_selector::probe_tier(const physical_device_list& devices,
+                                                       drm_node card) {
+    if (devices.count == 0)
+        return gpu_tier::integrated;
+    return tier_of(devices.devices[choose_physical_device(devices, card).index].kind);
 }
 
 lx::gfx::device_recovery::device_recovery(device& dev) : device_{&dev} {}
@@ -534,7 +712,7 @@ lx::gfx::device_recovery::device_recovery(device& dev) : device_{&dev} {}
 lx::result<void> lx::gfx::device_recovery::handle_device_lost() {
 #if defined(LUMEN_HAS_VULKAN)
     needs_recovery_ = true;
-    if (auto next = device_selector::select_best(); next) {
+    if (auto next = device_selector::select_best(device_->info().card); next) {
         *device_ = std::move(next).value();
         needs_recovery_ = false;
         return {};
