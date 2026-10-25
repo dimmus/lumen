@@ -5,6 +5,16 @@ Linux windowing system, desktop environment, and UI library — greenfield C++26
 ## Quick start (Linux)
 
 ```bash
+./scripts/install-deps.sh       # packages to build and run (`dev`: tests and tooling too), then fetch-protocols.sh
+cmake --preset release
+cmake --build --preset release
+```
+
+`install-deps.sh` supports Arch, Debian testing, Ubuntu 26.04+, Fedora 44+ and openSUSE
+Tumbleweed (`--help`; `-n` prints the packages without installing them). Lumen needs Clang with
+libstdc++ 16, CMake 3.28+ and Python 3.11+. Without the script:
+
+```bash
 ./scripts/fetch-protocols.sh
 cmake -B build -G Ninja -DCMAKE_CXX_COMPILER=clang++
 cmake --build build
