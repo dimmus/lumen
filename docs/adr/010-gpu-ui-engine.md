@@ -1,5 +1,13 @@
-> **Status:** Proposed. Nothing in this document is implemented yet; §2 records what the
-> tree contains today, §7 is the order of work, §8 the measurement that gates each step.
+> **Status:** Accepted. Phases 0–3 implemented: the primitive stream and `lumen-ui-bench`
+> (Phase 0), the CPU, GL and Vulkan primitive renderers and the atlas (Phase 1), the
+> `lx.text` rewrite with title bars on atlas glyphs (Phase 2), and flex layout, style, the
+> theme compiler, One Dark / One Light, Lucide icons and the §5.6 components with
+> `lumen-ui-gallery` (Phase 3). Gates G3, G4 and G10 pass; G2 is not met on the
+> development host (§7 Phase 3). Next is Phase 4, the client runtime: `lx.wayland.client`
+> and `lx.app` are still stubs, so no client draws with the engine yet, and `lx.shell`
+> still draws through `shm_canvas` until Phase 5. §2 is the tree as it stood before the
+> work began, §7 the order of work with an "As built" note per finished phase, §8 the
+> measurement that gates each step.
 
 # ADR-010: A GPU UI engine for Lumen
 
@@ -52,9 +60,10 @@ show the scenes that need it.
 
 ---
 
-## 2. Where the tree stands (October 2026)
+## 2. Where the tree stood (October 2026, before Phase 0)
 
-Read before trusting any older description. Line references are to this checkout.
+The starting point, kept as written; §7's "As built" notes say what changed. Line
+references are to the checkout of 2026-10-22.
 
 **F1 — Nothing draws UI on the GPU.** `lx.gfx` composites `blit_command`s (textured or
 solid rectangles with a rectangular clip, opacity, tint; `renderer.cppm:19-56`). There is
@@ -699,7 +708,7 @@ Each phase ends with its gate from §3 green on the host in F8 (GL and CPU backe
 the Vulkan backend green under lavapipe for correctness only. Effort is a rough size for
 one focused developer; it is an ordering aid, not a commitment.
 
-### Phase 0 — Foundations and measurement first (≈1 week)
+### Phase 0 — Foundations and measurement first (≈1 week) — **done**
 
 - `lx.gfx:primitives`: the structs of §4.2, `static_assert`ed sizes, packing helpers
   (`f16`, premultiply once), and the overlap grid `order_grid` (§4.13).
@@ -715,7 +724,7 @@ one focused developer; it is an ordering aid, not a commitment.
   excluded by the default test presets, `ctest --preset bench` runs it; `tests/bench/baseline/<host>.json` committed.
 - Gate: G9 by `static_assert`; the bench prints and stores numbers.
 
-### Phase 1 — The primitive renderer (≈3 weeks)
+### Phase 1 — The primitive renderer (≈3 weeks) — **done**
 
 - `lx.gfx:ui_cpu` first (the reference: SDF per pixel, exact, slow is fine), then
   `:ui_vk` (7 pipelines, instance ring, `VkPipelineCache` on disk, timestamp queries),
@@ -758,7 +767,7 @@ which passes. Warm, the emit costs 18 ns per quad at 1 000–3 000 quads and 26 
 outgrows what the host leaves of the L3. The baseline was not refreshed with these
 numbers, so `scripts/ui-bench.sh` still warns while the gate fails in both.
 
-### Phase 2 — Text (≈3 weeks)
+### Phase 2 — Text (≈3 weeks) — **done**
 
 - `lx.text` partitions of §4.6; `text_node` emits `mono_sprite` runs from a retained
   `text_layout`; emoji as `poly_sprite`; `underline` for links and spell marks.
@@ -823,7 +832,7 @@ at load 0.1), one window 32 → 36–45 µs; GL render thread 719–831 → 698�
 5.99–6.04 → 5.91–6.05 ms; UI-thread `commit_frame` 16 → 23–26 µs. A title change costs
 ≈80 µs on the UI thread when its glyphs are new, 1–3 µs when they are cached.
 
-### Phase 3 — Layout, style, theme, components (≈2 weeks)
+### Phase 3 — Layout, style, theme, components (≈2 weeks) — **done** (G2 not met on this host)
 
 - `lx.layout:flex` with the per-node cache; `grow_node::grow_factor()` finally read.
 - `style` value + builder; `lx.ui:theme` binary format; `tools/lumen-theme` compiling
@@ -1137,7 +1146,7 @@ primitives (no close glyph on unhovered tabs, as Zed shows none); the `icons`,
 `components_states`, `components_gallery`, `menu_open`, `tooltip`, `modal`, `toast_stack`,
 `scroll_area` and `text_input` references were rewritten.
 
-### Phase 4 — The client runtime (≈3 weeks)
+### Phase 4 — The client runtime (≈3 weeks) — **next**
 
 - `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,
   `zwp_linux_dmabuf_v1` v5 feedback, `wp_linux_drm_syncobj_v1`, `wp_viewporter`,
@@ -1150,7 +1159,7 @@ primitives (no close glyph on unhovered tabs, as Zed shows none); the `icons`,
   `compositor.latency: present` lines the way `drag-smoke.sh` does.
 - Gate: G1, G5, G6, G7, G11.
 
-### Phase 5 — Adoption and deletion (≈2 weeks)
+### Phase 5 — Adoption and deletion (≈2 weeks) — not started
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;
   the background keeps its single-pixel-buffer and worker-rendered image paths.
