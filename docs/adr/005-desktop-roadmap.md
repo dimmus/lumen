@@ -1,5 +1,9 @@
-> **Status:** Proposed — where Lumen stands after ADR-004, and what it takes to become a
-> desktop shell people would choose
+> **Status:** Accepted, largely implemented. Phase 0 and Phase 1 are done; of Phase 2 only
+> color-management-v1 is open; Phase 3 is superseded by [ADR-010](010-gpu-ui-engine.md)
+> (Phases 0–3 of it done, the client runtime and shell adoption next); of Phase 4,
+> capture with portals, security-context and VRR are done, HDR metadata and Xwayland are
+> open. §1–§2 are the August 2026 snapshot this plan started from and are left as written;
+> the status of each step is marked in §3.
 
 # ADR-005: From render pipeline to desktop
 
@@ -234,7 +238,7 @@ devices and permission to open them. The honest test is `wev` under a real sessi
 has not been run. Treat Phase 0 as complete in construction and unproven in the field until
 someone types into it.
 
-### Phase 1 — Make it a desktop — **in progress**
+### Phase 1 — Make it a desktop — **DONE**
 
 5. [x] **`zlm_shell_v1` is advertised**, and the registry now lists nine globals rather
    than seven. The protocol was already generated and both sides scaffolded; only the
@@ -306,7 +310,7 @@ someone types into it.
    output 0 until D5, and `output_gone` is never sent), fullscreen. Since: drag-to-restore a
    maximized or snapped window, Windows 11's Super+arrow snapping with xdg tiled states, and
    edge snapping with a preview (ADR 011 Part 4, app-smoke group O).
-7. **ext-session-lock.** Security-critical and easy to get subtly wrong: the lock surface
+7. [x] **ext-session-lock.** Security-critical and easy to get subtly wrong: the lock surface
    must survive a crashing locker, and input must not leak to normal clients while locked.
    - [x] **ext_session_lock_manager_v1** (ADR 007 §2d): input leaves normal clients at the
      lock request, `locked` only after a locked frame reached the output (or nothing of the
@@ -320,7 +324,7 @@ someone types into it.
      and ibus run as ordinary clients; keys reach the input method's grab only while a
      focused text input is enabled, preedit and commits reach GTK 4 and foot, the candidate
      window sits at the cursor (app-smoke group M). The toolkit side (item 15) is separate.
-8. **xdg-decoration, xdg-activation, xdg-output, primary-selection.** The unglamorous set
+8. [x] **xdg-decoration, xdg-activation, xdg-output, primary-selection.** The unglamorous set
    that makes real applications behave.
    - [x] **xdg-decoration** (v2): foot and alacritty negotiate server-side and get a Lumen
      frame — title bar with the client's title (ellipsized when narrow), close button,
@@ -389,20 +393,33 @@ ext-workspace-v1; the panel's indicator switches them, Super+1…9 and friends, 
 sticky windows, hotplug keeps what is visible visible). Session lock — yes (step 7; the
 locker is an external client such as swaylock, started by the shell's `--lock-command`).
 
-### Phase 2 — Cash in the pipeline work
+### Phase 2 — Cash in the pipeline work — **mostly done**
 
 ADR-004 made these implementable; they are now mostly protocol code.
 
-9. **viewporter + wp-fractional-scale-v1** — D1 delivered `src`/`dst`, so this is
-   negotiation plus plumbing.
-10. **color-management-v1** — D2 delivered linear blending, PQ/HLG and 10-bit output. This
-    is the differentiator: almost nothing ships working HDR on Linux.
-11. **presentation-time, wp-fifo, wp-commit-timing** — D3 delivered the deadline model.
-12. **D5, the per-output frame loop** — required for multi-monitor, per-output scale and
+9. [x] **viewporter + wp-fractional-scale-v1** — D1 delivered `src`/`dst`, so this is
+   negotiation plus plumbing. Done in ADR-007 Part 1, with fractional output scale.
+10. [ ] **color-management-v1** — D2 delivered linear blending, PQ/HLG and 10-bit output. This
+    is the differentiator: almost nothing ships working HDR on Linux. Not started: the
+    compositor tracks an image description per surface and output internally
+    (`:protocol_managers`), but the protocol is not served.
+11. [x] **presentation-time, wp-fifo, wp-commit-timing** — D3 delivered the deadline model.
+    wp_presentation in ADR-007 Part 2; fifo-v1 and commit-timing-v1 (with
+    linux-drm-syncobj-v1 and the rest of the commit path) in ADR-009 Part 1.
+12. [x] **D5, the per-output frame loop** — required for multi-monitor, per-output scale and
     mixed refresh rates. Plan is in ADR-004's "Needs revisiting"; step 1 (grouping
-    per-output state into a struct) pays for itself alone.
+    per-output state into a struct) pays for itself alone. Done in ADR-008 Part 1: every
+    connected monitor has its own KMS pipeline and frame clock and flips on its own.
 
-### Phase 3 — A toolkit worth using
+### Phase 3 — A toolkit worth using — **superseded by [ADR-010](010-gpu-ui-engine.md)**
+
+ADR-010 replaced this list with a GPU UI engine and its own phases; its status header is the
+current state. In short: 13 is ADR-010 Phase 5 (not started; the retained tree and
+`lx.ui.builder` are still in the tree), 14 is done (ADR-010 Phase 2: UAX #14, bidi, fallback,
+colour emoji, subpixel positioning), 15 is half done (toolkit focus and keyboard navigation in
+ADR-010 Phase 3; IME in the toolkit waits for the client runtime, Phase 4, though the
+compositor side is done, Phase 1 step 7), 16 is open, and 17 has scrolling and motion
+(ADR-010 Phase 3) but not gestures.
 
 13. **Finish the declarative migration and delete the retained tree.** One paradigm.
 14. **Real text.** Line breaking (UAX #14), bidi (UAX #9), font fallback chains, colour
@@ -416,30 +433,43 @@ ADR-004 made these implementable; they are now mostly protocol code.
     is the cheapest it will ever be.
 17. **Scrolling, gestures, animation** driven by the frame clock D3 already provides.
 
-### Phase 4 — Differentiate
+### Phase 4 — Differentiate — **in progress**
 
-18. **HDR end to end** — the pipeline is ready; it needs KMS `HDR_OUTPUT_METADATA` and
-    `COLOR_ENCODING`, plus the protocol from step 10.
-19. **VRR / adaptive sync** — the deadline scheduler is the hard part and it exists.
-20. **ext-image-copy-capture + portal** — screencast and screenshot, the thing every
-    meeting needs.
-21. **wp-security-context and sandboxing** — per-client capability gating. Lumen's
-    privilege checker is already the right shape for it.
-22. **Xwayland**, rootless, for the long tail.
+18. [ ] **HDR end to end** — the pipeline is ready; it needs KMS `HDR_OUTPUT_METADATA` and
+    `COLOR_ENCODING`, plus the protocol from step 10. Not started: `lx.drm` knows the
+    properties only to reset them to neutral.
+19. [x] **VRR / adaptive sync** — the deadline scheduler is the hard part and it exists.
+    Done in ADR-008 Part 3 (`VRR_ENABLED` in modesets, a VRR frame clock, adaptive sync per
+    monitor through wlr-output-management and `outputs.toml`).
+20. [x] **ext-image-copy-capture + portal** — screencast and screenshot, the thing every
+    meeting needs. Done in ADR-009 Parts 4 and 5 (ext-image-copy-capture-v1, wlr-screencopy,
+    the capture indicator; xdg-desktop-portal-wlr for ScreenCast and
+    xdg-desktop-portal-lumen for Screenshot and PickColor).
+21. [x] **wp-security-context and sandboxing** — per-client capability gating. Lumen's
+    privilege checker is already the right shape for it. security-context-v1 is done in
+    ADR-009 Part 2, with a global filter for sandboxed clients.
+22. [ ] **Xwayland**, rootless, for the long tail. Not started: `lx.compositor.xwayland`
+    is a declarations-only stub.
 
 ### Cross-cutting, start now rather than later
 
-- **Input latency measurement.** Instrument end to end (event → present) and track it like
+- [x] **Input latency measurement.** Instrument end to end (event → present) and track it like
   the frame budgets already are. It is the number users feel and the one Lumen is currently
-  best positioned to win.
-- **An interaction test harness.** Golden images cannot test focus, drag, grabs or IME. A
+  best positioned to win. The compositor logs `compositor.latency` present lines, and
+  `scripts/drag-smoke.sh` joins them with injector timestamps.
+- [x] **An interaction test harness.** Golden images cannot test focus, drag, grabs or IME. A
   scripted Wayland client that drives real sequences is needed before Phase 0 lands, or none
-  of Phases 0–3 will have meaningful coverage.
-- **Finish D4's Vulkan 1.3 move** before the renderer grows more passes, not after.
+  of Phases 0–3 will have meaningful coverage. `lumen-probe` driven by `scripts/app-smoke.sh`
+  (and the drag, input, monitor, scale, session and tty smoke scripts beside it).
+- [ ] **Finish D4's Vulkan 1.3 move** before the renderer grows more passes, not after.
+  Still open: the instance asks for Vulkan 1.1 (ADR-004 §5 item 11).
 
 ---
 
 ## 4. What to do first
+
+*Written in August 2026, when no input worked; Phase 0 has since landed and this section is
+kept as the reasoning of the time.*
 
 **Phase 0, step 1–3.** Nothing else changes what Lumen *is*. Every remaining item either
 depends on input or is invisible without it, and the gap between "renders beautifully" and
