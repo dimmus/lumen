@@ -58,12 +58,7 @@ constexpr int k_list_row = 40;
 constexpr int k_list_foot = 30;
 constexpr int k_list_rows = 10;
 
-constexpr const char* k_category = "portal.overlay";
-
-template <typename... Args>
-void log_line(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_category, fmt, std::forward<Args>(args)...);
-}
+constexpr lx::trace::category log_overlay{"portal.overlay"};
 
 lx::rect2i unite(lx::rect2i a, lx::rect2i b) {
     if (a.width <= 0 || a.height <= 0)
@@ -359,7 +354,7 @@ void overlay::finish(overlay_result r) {
     if (done())
         return;
     result_ = r;
-    log_line(lx::trace::level::debug, "overlay result {}", static_cast<int>(r.what));
+    log_overlay.debug("overlay result {}", static_cast<int>(r.what));
 }
 
 void overlay::mark_all_dirty() {

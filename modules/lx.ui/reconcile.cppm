@@ -9,6 +9,12 @@ import :element;
 import :node;
 import :invalidate;
 
+namespace {
+
+constexpr lx::trace::category log_ui{"ui"};
+
+} // namespace
+
 export namespace lx::ui {
 
 struct reconcile_stats {
@@ -76,8 +82,7 @@ lx::ui::ui_node* lx::ui::reconciler::apply(ui_node* retained, child desired) {
     }
 
     if (!desired->construct) {
-        lx::trace::logger::global().log(lx::trace::level::warn, "ui",
-                                        "descriptor without a construct hook");
+        log_ui.warn("descriptor without a construct hook");
         return nullptr;
     }
 

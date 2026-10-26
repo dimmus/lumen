@@ -43,6 +43,12 @@ import :surface;
 import :text_input;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_ime{"compositor.ime"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -50,20 +56,6 @@ namespace lx::compositor::p0 {
 #if defined(LUMEN_HAS_TEXT_INPUT)
 
 namespace {
-
-[[nodiscard]] bool ime_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-void ime_log(const char* line) {
-    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.ime", line);
-}
-
-template <typename... Args>
-void ime_log(std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.ime", fmt,
-                                     std::forward<Args>(args)...);
-}
 
 [[nodiscard]] lx::compositor::text_input_relay* relay() {
     return g_p0_ctx ? g_p0_ctx->text_input : nullptr;
@@ -128,10 +120,11 @@ const struct zwp_text_input_v3_interface ti_impl = {
             if (!o || !relay())
                 return;
             const std::string_view s = text ? text : "";
-            if (s.size() > lx::compositor::k_ime_text_max && !o->truncation_logged && ime_debug()) {
+            if (s.size() > lx::compositor::k_ime_text_max && !o->truncation_logged &&
+                log_ime.enabled(lx::trace::level::debug)) {
                 o->truncation_logged = true;
-                ime_log("text input surrounding text of {} bytes cut to the protocol's 4000",
-                        s.size());
+                log_ime.debug("text input surrounding text of {} bytes cut to the protocol's 4000",
+                              s.size());
             }
             relay()->set_surrounding(o->record, s, cursor, anchor);
         },
@@ -207,10 +200,10 @@ void ev_enter(void*, void* ti, void* surface) {
     if (!can_send(ti) || !surface)
         return;
     zwp_text_input_v3_send_enter(static_cast<wl_resource*>(ti), static_cast<wl_resource*>(surface));
-    if (ime_debug()) {
-        ime_log("text input enter ti={} surface={}",
-                wl_resource_get_id(static_cast<wl_resource*>(ti)),
-                wl_resource_get_id(static_cast<wl_resource*>(surface)));
+    if (log_ime.enabled(lx::trace::level::debug)) {
+        log_ime.debug("text input enter ti={} surface={}",
+                      wl_resource_get_id(static_cast<wl_resource*>(ti)),
+                      wl_resource_get_id(static_cast<wl_resource*>(surface)));
     }
 }
 
@@ -218,8 +211,8 @@ void ev_leave(void*, void* ti, void* surface) {
     if (!can_send(ti) || !surface)
         return;
     zwp_text_input_v3_send_leave(static_cast<wl_resource*>(ti), static_cast<wl_resource*>(surface));
-    if (ime_debug()) {
-        ime_log("text input leave ti={}", wl_resource_get_id(static_cast<wl_resource*>(ti)));
+    if (log_ime.enabled(lx::trace::level::debug)) {
+        log_ime.debug("text input leave ti={}", wl_resource_get_id(static_cast<wl_resource*>(ti)));
     }
 }
 

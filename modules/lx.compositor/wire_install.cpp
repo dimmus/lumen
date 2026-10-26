@@ -459,9 +459,8 @@ void install_core(p0_protocol_context& ctx) {
     // content-update queue, so they are offered together; every client, sandboxed or not,
     // may use them.
     if (cu_poll_fd() < 0)
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.surface",
-                                        "readiness poller unavailable: fences are not waited "
-                                        "for before applying content updates");
+        log_surface.warn("readiness poller unavailable: fences are not waited "
+                         "for before applying content updates");
 #if defined(LUMEN_PROTOCOL_FIFO_V1)
     // fifo-v1: one update per refresh for a shown surface (Mesa's Vulkan FIFO present).
     ctx.server->add_global({.interface_name = "wp_fifo_manager_v1",

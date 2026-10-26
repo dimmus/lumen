@@ -14,6 +14,12 @@ import std;
 
 import :faces;
 
+namespace {
+
+constexpr lx::trace::category log_text{"text"};
+
+} // namespace
+
 export namespace lx::text {
 
 // ── Shaping and the shape cache (ADR-010 §4.6 `:shape`) ──────────────────────────
@@ -715,8 +721,7 @@ lx::result<lx::text::shaped_run> lx::text::shape_cache::miss_locked(face_cache& 
         ++counters_.overflows;
         if (config_.overflow == lx::runtime::overflow_action::warn_and_drop && !warned_) {
             warned_ = true;
-            lx::trace::logger::global().log(lx::trace::level::warn, "text",
-                                            "shape cache full: runs are shaped but not kept");
+            log_text.warn("shape cache full: runs are shaped but not kept");
         }
         return run;
     }

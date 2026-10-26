@@ -156,11 +156,7 @@ private:
 
 namespace {
 
-constexpr const char* k_dnd_category = "compositor.dnd";
-
-[[nodiscard]] bool dnd_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_dnd{"compositor.dnd"};
 
 } // namespace
 
@@ -348,8 +344,7 @@ void lx::compositor::dnd_grab::finish(dnd_end_reason why) {
     icon_ = {};
     if (cursor_)
         cursor_->clear_override();
-    if (dnd_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_dnd_category,
-                                         "dnd end reason={}", dnd_end_name(why));
+    if (log_dnd.enabled(lx::trace::level::debug)) {
+        log_dnd.debug("dnd end reason={}", dnd_end_name(why));
     }
 }

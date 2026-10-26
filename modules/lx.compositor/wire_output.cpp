@@ -50,7 +50,7 @@ namespace lx::compositor::p0 {
 
 namespace {
 
-constexpr const char* k_category = "compositor.output";
+constexpr lx::trace::category log_output{"compositor.output"};
 
 /// One bound wl_output: the output it stands for, by slot and id (a slot is reused by a
 /// later output; the id never is). Records exist only for live objects of live outputs — an
@@ -99,16 +99,6 @@ template <class T> void list_unlink(T*& head, T* n) {
     if (n->next)
         n->next->prev = n->prev;
     n->prev = n->next = nullptr;
-}
-
-void out_log(const char* line) {
-    lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
-}
-
-template <typename... Args>
-void out_log(std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_category, fmt,
-                                     std::forward<Args>(args)...);
 }
 
 lx::compositor::output_manager* outputs() {
@@ -217,9 +207,10 @@ void update_membership(surface_obj* s, std::uint32_t mask, int primary) {
                 wl_surface_send_leave(s->resource, r->resource);
             ++sent;
         }
-        if (surface_debug()) {
-            out_log("output {} surface={} output={} client={} resources={}",
-                    enter ? "enter" : "leave", s->id.id(), slot, wire_client_id(client), sent);
+        if (log_output.enabled(lx::trace::level::debug)) {
+            log_output.debug("output {} surface={} output={} client={} resources={}",
+                             enter ? "enter" : "leave", s->id.id(), slot, wire_client_id(client),
+                             sent);
         }
     }
     // Recomputed only while the surface is on an output: one that left them all keeps
@@ -253,9 +244,9 @@ void update_membership(surface_obj* s, std::uint32_t mask, int primary) {
     (void)scale;
     (void)transform;
 #endif
-    if (changed && surface_debug()) {
-        out_log("output preferred surface={} scale={} transform={}", s->id.id(), s->pref_scale,
-                s->pref_transform);
+    if (changed && log_output.enabled(lx::trace::level::debug)) {
+        log_output.debug("output preferred surface={} scale={} transform={}", s->id.id(),
+                         s->pref_scale, s->pref_transform);
     }
 }
 
@@ -349,12 +340,13 @@ const struct zxdg_output_manager_v1_interface xdg_output_manager_impl = {
             // Version 3: the atomic group closes with wl_output.done (wlroots' order).
             if (version >= 3)
                 send_output_done(output);
-            if (surface_debug()) {
+            if (log_output.enabled(lx::trace::level::debug)) {
                 const lx::rect2i l = logical_rect(o);
-                out_log("xdg-output create client={} output={} version={} x={} y={} w={} h={} "
-                        "name={}",
-                        wire_client_id(client), x->output->slot, version, l.x, l.y, l.width,
-                        l.height, o.name);
+                log_output.debug(
+                    "xdg-output create client={} output={} version={} x={} y={} w={} h={} "
+                    "name={}",
+                    wire_client_id(client), x->output->slot, version, l.x, l.y, l.width, l.height,
+                    o.name);
             }
         },
 };
@@ -438,8 +430,8 @@ void bind_output_ex(wayland::client_connection& client, unsigned id, int version
         wl_resource_set_implementation(native, &output_impl, nullptr, nullptr);
         if (live)
             wl_client_post_no_memory(wl_resource_get_client(native));
-        else if (surface_debug())
-            out_log("output bind inert (the output is gone)");
+        else if (log_output.enabled(lx::trace::level::debug))
+            log_output.debug("output bind inert (the output is gone)");
         return;
     }
     o->live = true;
@@ -467,9 +459,9 @@ void bind_output_ex(wayland::client_connection& client, unsigned id, int version
         wl_surface_send_enter(s.resource, native);
         ++replayed;
     }
-    if (surface_debug()) {
-        out_log("output bind client={} output={} version={} name={} replayed={}", client.id(),
-                o->slot, version, st.name, replayed);
+    if (log_output.enabled(lx::trace::level::debug)) {
+        log_output.debug("output bind client={} output={} version={} name={} replayed={}",
+                         client.id(), o->slot, version, st.name, replayed);
     }
 }
 
@@ -525,8 +517,8 @@ bool sync_globals() {
         if (g.live && (!live || om->slot_state(slot).id != g.id)) {
             g_p0_ctx->server->remove_global(g.handle, now);
             make_inert(slot, g.id);
-            if (surface_debug()) {
-                out_log("output global remove output={}", slot);
+            if (log_output.enabled(lx::trace::level::debug)) {
+                log_output.debug("output global remove output={}", slot);
             }
             g = {};
             changed = true;
@@ -541,8 +533,9 @@ bool sync_globals() {
                                                         .privileged = false,
                                                         .interface_desc = &wl_output_interface},
                                                        &bind_output_ex, &g);
-            if (surface_debug()) {
-                out_log("output global add output={} name={}", slot, om->slot_state(slot).name);
+            if (log_output.enabled(lx::trace::level::debug)) {
+                log_output.debug("output global add output={} name={}", slot,
+                                 om->slot_state(slot).name);
             }
             changed = true;
         }

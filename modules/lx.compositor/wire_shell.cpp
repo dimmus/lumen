@@ -34,6 +34,12 @@ import :input_router;
 import :session_lock;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_shell{"compositor.shell"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -79,11 +85,9 @@ const char* bridge_result_name(bridge_result r) {
 }
 
 void bridge_log(const char* request, lx::toplevel_id id, bridge_result r) {
-    if (!surface_debug())
+    if (!log_shell.enabled(lx::trace::level::debug))
         return;
-    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
-                                     "bridge request={} id={} result={}", request, id.id(),
-                                     bridge_result_name(r));
+    log_shell.debug("bridge request={} id={} result={}", request, id.id(), bridge_result_name(r));
 }
 
 /// Decodes the handle and classifies it; `ok` means "a mapped window, go ahead".
@@ -258,11 +262,10 @@ void shell_grab_key(struct wl_client* client, struct wl_resource* resource, uint
         refusal = g_p0_ctx->keys->add_grab(keysym, modifiers, flags, res);
     if (refusal != lx::compositor::key_grab_refusal::none)
         zlm_key_grab_v1_send_refused(res, static_cast<uint32_t>(refusal));
-    if (surface_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
-                                         "grab_key keysym=0x{:x} mods=0x{:x} flags=0x{:x} "
-                                         "result={}",
-                                         keysym, modifiers, flags, refusal_name(refusal));
+    if (log_shell.enabled(lx::trace::level::debug)) {
+        log_shell.debug("grab_key keysym=0x{:x} mods=0x{:x} flags=0x{:x} "
+                        "result={}",
+                        keysym, modifiers, flags, refusal_name(refusal));
     }
 }
 
@@ -392,10 +395,9 @@ bool shell_send_action(const char* action, const char* argument, unsigned time_m
                                  time_ms);
         told = true;
     }
-    if (surface_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
-                                         "action {} {} to the shell: {}", action ? action : "",
-                                         argument ? argument : "", told ? "sent" : "no v7 shell");
+    if (log_shell.enabled(lx::trace::level::debug)) {
+        log_shell.debug("action {} {} to the shell: {}", action ? action : "",
+                        argument ? argument : "", told ? "sent" : "no v7 shell");
     }
     return told;
 }
@@ -416,9 +418,8 @@ const struct zlm_held_action_v1_interface held_action_impl = {
 void held_action_destroyed(struct wl_resource* r) {
     if (g_p0_ctx && g_p0_ctx->keys && g_p0_ctx->keys->hold_owner() == r) {
         (void)g_p0_ctx->keys->end_hold();
-        if (surface_debug())
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.shell",
-                                            "held action ended by the shell");
+        if (log_shell.enabled(lx::trace::level::debug))
+            log_shell.debug("held action ended by the shell");
     }
 }
 
@@ -449,9 +450,8 @@ void* shell_send_held_action(const char* action, const char* argument, unsigned 
         wl_resource_set_implementation(hold, &held_action_impl, g_p0_ctx, &held_action_destroyed);
         zlm_shell_v1_send_held_action(res, hold, action ? action : "", argument ? argument : "",
                                       shell_key_serial(res), time_ms);
-        if (surface_debug()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
-                                             "held action {} to the shell", action ? action : "");
+        if (log_shell.enabled(lx::trace::level::debug)) {
+            log_shell.debug("held action {} to the shell", action ? action : "");
         }
         return hold;
     }
@@ -491,9 +491,8 @@ void shell_fire_key_grab(void* grab_resource, unsigned time_ms) {
         g_p0_ctx->input->serials().note(wl_resource_get_client(res), serial,
                                         lx::compositor::input_serial_kind::key_press);
     zlm_key_grab_v1_send_activated(res, serial, time_ms);
-    if (surface_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.shell",
-                                         "grab activated serial={}", serial);
+    if (log_shell.enabled(lx::trace::level::debug)) {
+        log_shell.debug("grab activated serial={}", serial);
     }
 }
 

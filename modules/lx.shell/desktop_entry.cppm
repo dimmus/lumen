@@ -189,17 +189,12 @@ struct exec_argv {
 
 namespace {
 
-constexpr const char* k_entry_category = "shell.apps";
-
-[[nodiscard]] bool entry_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_apps{"shell.apps"};
 
 void entry_log_debug(std::string_view file, const char* what) {
-    if (!entry_debug())
+    if (!log_apps.enabled(lx::trace::level::debug))
         return;
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_entry_category,
-                                     "desktop file {}: {}", file, what);
+    log_apps.debug("desktop file {}: {}", file, what);
 }
 
 [[nodiscard]] bool valid_utf8(std::string_view s) {
@@ -361,7 +356,7 @@ constexpr key_def k_keys[k_key_count] = {
 [[nodiscard]] bool parse_bool(std::string_view v, std::string_view file, const char* key) {
     if (v == "true")
         return true;
-    if (v != "false" && entry_debug()) {
+    if (v != "false" && log_apps.enabled(lx::trace::level::debug)) {
         char what[96];
         std::snprintf(what, sizeof(what), "%s is not true or false: read as false", key);
         entry_log_debug(file, what);

@@ -76,7 +76,7 @@ void note_syncobj_surfaces() {
 void log_timeline_error(const lx::error& err) {
     static unsigned suppressed = 0;
     if (suppressed++ % 600 == 0)
-        lx::trace::logger::global().log_error(err, "compositor.surface");
+        log_surface.error(err);
 }
 
 } // namespace

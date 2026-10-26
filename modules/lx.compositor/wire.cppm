@@ -550,19 +550,8 @@ inline bool client_dying(wl_client* client) {
            g_p0_ctx->server->find_client_by_native(client) == nullptr;
 }
 
-[[nodiscard]] inline bool surface_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-inline void surface_log(const char* line) {
-    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.surface", line);
-}
-
-template <typename... Args>
-void surface_log(std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.surface", fmt,
-                                     std::forward<Args>(args)...);
-}
+/// `compositor.surface`, which every wl_surface-facing unit logs to.
+inline constexpr lx::trace::category log_surface{"compositor.surface"};
 
 /// Every wl_surface record (wire_surface.cpp). Scanned by buffer and frame-callback
 /// destructors, which must drop references to a dying object.

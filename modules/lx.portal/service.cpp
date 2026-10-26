@@ -34,14 +34,9 @@ namespace lx::portal {
 
 namespace {
 
-constexpr const char* k_category = "portal";
+constexpr lx::trace::category log_portal{"portal"};
 constexpr int k_capture_timeout_ms = 3000;
 constexpr long k_private_max_age_s = 3600;
-
-template <typename... Args>
-void log_line(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_category, fmt, std::forward<Args>(args)...);
-}
 
 double now_ms() {
     timespec ts{};
@@ -61,19 +56,18 @@ std::string save_screenshot(const image& img, bool interactive) {
               "/Screenshots";
         stem = screenshot_stem(local);
         if (auto r = make_dirs(dir, 0755); !r.ok()) {
-            lx::trace::logger::global().log_error(r.get_error(), k_category);
+            log_portal.error(r.get_error());
             return {};
         }
     } else {
         const char* runtime = std::getenv("XDG_RUNTIME_DIR");
         if (!runtime || runtime[0] != '/') {
-            log_line(lx::trace::level::error,
-                     "XDG_RUNTIME_DIR is not set: nowhere private to save to");
+            log_portal.error("XDG_RUNTIME_DIR is not set: nowhere private to save to");
             return {};
         }
         dir = std::string(runtime) + "/lumen-portal";
         if (auto r = make_dirs(dir, 0700); !r.ok()) {
-            lx::trace::logger::global().log_error(r.get_error(), k_category);
+            log_portal.error(r.get_error());
             return {};
         }
         (void)prune_older(dir, "Screenshot-", k_private_max_age_s);
@@ -84,7 +78,7 @@ std::string save_screenshot(const image& img, bool interactive) {
     std::string path;
     lx::result<int> fd = create_unique(dir, stem, !interactive, path);
     if (!fd.ok()) {
-        lx::trace::logger::global().log_error(fd.get_error(), k_category);
+        log_portal.error(fd.get_error());
         return {};
     }
     const lx::result<void> wrote = write_png(fd.value(), img);
@@ -92,7 +86,7 @@ std::string save_screenshot(const image& img, bool interactive) {
     if (!wrote.ok() || !closed) {
         ::unlink(path.c_str());
         if (!wrote.ok())
-            lx::trace::logger::global().log_error(wrote.get_error(), k_category);
+            log_portal.error(wrote.get_error());
         return {};
     }
     return path;
@@ -234,7 +228,7 @@ int service::get_targets(sd_bus*, const char*, const char*, const char*, sd_bus_
 int service::on_name_lost(sd_bus_message* m, void* user, sd_bus_error*) {
     const char* name = nullptr;
     if (sd_bus_message_read(m, "s", &name) >= 0 && name && std::strcmp(name, k_bus_name) == 0) {
-        log_line(lx::trace::level::info, "bus name taken over by another instance; exiting");
+        log_portal.info("bus name taken over by another instance; exiting");
         static_cast<service*>(user)->quit_ = true;
     }
     return 0;
@@ -276,8 +270,8 @@ int service::accept(sd_bus_message* m, request_state::kind what) {
     sd_bus_message_exit_container(m);
 
     if (req_) {
-        log_line(lx::trace::level::warn, "{} from '{}' while another request runs: answered 2",
-                 what == request_state::kind::pick ? "PickColor" : "Screenshot", app_id);
+        log_portal.warn("{} from '{}' while another request runs: answered 2",
+                        what == request_state::kind::pick ? "PickColor" : "Screenshot", app_id);
         return sd_bus_reply_method_return(m, "ua{sv}", 2u, 0);
     }
     auto req = std::make_unique<request_state>();
@@ -294,9 +288,9 @@ int service::accept(sd_bus_message* m, request_state::kind what) {
         sd_bus_message_unref(req->call);
         return r;
     }
-    log_line(lx::trace::level::info, "{} app='{}' interactive={} target={}",
-             what == request_state::kind::pick ? "PickColor" : "Screenshot", app_id,
-             interactive ? 1 : 0, target);
+    log_portal.info("{} app='{}' interactive={} target={}",
+                    what == request_state::kind::pick ? "PickColor" : "Screenshot", app_id,
+                    interactive ? 1 : 0, target);
     req_ = std::move(req);
     start();
     return 1; // answered later (or already, by start)
@@ -313,7 +307,7 @@ int service::on_pick_color(sd_bus_message* m, void* user, sd_bus_error*) {
 int service::on_close(sd_bus_message* m, void* user, sd_bus_error*) {
     auto& s = *static_cast<service*>(user);
     if (s.req_ && s.req_->handle == sd_bus_message_get_path(m)) {
-        log_line(lx::trace::level::info, "request closed by the caller");
+        log_portal.info("request closed by the caller");
         s.req_->closed = true;
     }
     return sd_bus_reply_method_return(m, "");
@@ -335,9 +329,9 @@ void service::answer(unsigned response, const std::string& uri, const std::uint3
         r = sd_bus_reply_method_return(call, "ua{sv}", response == 0 ? 2u : response, 0);
     }
     if (r < 0)
-        log_line(lx::trace::level::warn, "could not answer the request: {}", std::strerror(-r));
-    log_line(lx::trace::level::info, "request answered {} in {:.0f} ms{}{}", response,
-             now_ms() - req_->started_ms, uri.empty() ? "" : " uri=", uri.c_str());
+        log_portal.warn("could not answer the request: {}", std::strerror(-r));
+    log_portal.info("request answered {} in {:.0f} ms{}{}", response, now_ms() - req_->started_ms,
+                    uri.empty() ? "" : " uri=", uri.c_str());
     sd_bus_message_unref(call);
     sd_bus_slot_unref(req_->slot);
     // The overlay before the connection it draws on.
@@ -357,21 +351,21 @@ void service::save_and_answer(const image& img, const char* what) {
         answer(2);
         return;
     }
-    log_line(lx::trace::level::info, "screenshot ({}) {}x{} written to {} in {:.0f} ms", what,
-             img.width, img.height, path.c_str(), now_ms() - t0);
+    log_portal.info("screenshot ({}) {}x{} written to {} in {:.0f} ms", what, img.width, img.height,
+                    path.c_str(), now_ms() - t0);
     answer(0, file_uri(path));
 }
 
 void service::start() {
     request_state& q = *req_;
     if (seat_session_locked()) {
-        log_line(lx::trace::level::info, "the session is locked: nothing is captured");
+        log_portal.info("the session is locked: nothing is captured");
         answer(2);
         return;
     }
     lx::result<std::unique_ptr<desktop>> wl = desktop::connect();
     if (!wl.ok()) {
-        lx::trace::logger::global().log_error(wl.get_error(), k_category);
+        log_portal.error(wl.get_error());
         answer(2);
         return;
     }
@@ -392,20 +386,20 @@ void service::start() {
             entries.push_back(std::move(e));
         }
         if (entries.empty()) {
-            log_line(lx::trace::level::warn, "window screenshot: no window to choose from");
+            log_portal.warn("window screenshot: no window to choose from");
             answer(2);
             return;
         }
         q.ov = std::make_unique<overlay>(*q.wl);
         if (auto r = q.ov->start_choose(std::move(entries), "Take a screenshot of a window"); !r.ok()) {
-            lx::trace::logger::global().log_error(r.get_error(), k_category);
+            log_portal.error(r.get_error());
             answer(2);
         }
         return;
     }
     lx::result<std::vector<output_shot>> shots = q.wl->capture_outputs(false, k_capture_timeout_ms);
     if (!shots.ok()) {
-        lx::trace::logger::global().log_error(shots.get_error(), k_category);
+        log_portal.error(shots.get_error());
         answer(2);
         return;
     }
@@ -419,7 +413,7 @@ void service::start() {
     const lx::result<void> started =
         q.what == request_state::kind::pick ? q.ov->start_pick(q.shots) : q.ov->start_select(q.shots);
     if (!started.ok()) {
-        lx::trace::logger::global().log_error(started.get_error(), k_category);
+        log_portal.error(started.get_error());
         answer(2);
     }
 }
@@ -431,12 +425,12 @@ void service::complete_overlay() {
     case overlay_result::kind::pending: return;
     case overlay_result::kind::cancelled: answer(1); return;
     case overlay_result::kind::failed:
-        log_line(lx::trace::level::warn, "overlay failed: {}", res.reason);
+        log_portal.warn("overlay failed: {}", res.reason);
         answer(2);
         return;
     case overlay_result::kind::colour: {
         const std::uint32_t c = res.colour;
-        log_line(lx::trace::level::info, "colour picked #{:06X}", c & 0xFFFFFFu);
+        log_portal.info("colour picked #{:06X}", c & 0xFFFFFFu);
         answer(0, {}, &c);
         return;
     }
@@ -451,7 +445,7 @@ void service::complete_overlay() {
         q.ov.reset();
         lx::result<image> img = q.wl->capture_toplevel(id, false, k_capture_timeout_ms);
         if (!img.ok()) {
-            lx::trace::logger::global().log_error(img.get_error(), k_category);
+            log_portal.error(img.get_error());
             answer(2);
             return;
         }
@@ -482,7 +476,7 @@ void service::after_events() {
     if (!req_ || !req_->wl)
         return;
     if (req_->wl->broken()) {
-        log_line(lx::trace::level::warn, "the Wayland connection broke during a request");
+        log_portal.warn("the Wayland connection broke during a request");
         answer(2);
         return;
     }
@@ -496,32 +490,29 @@ void service::after_events() {
 int service::run() {
     int r = sd_bus_open_user(&bus_);
     if (r < 0) {
-        log_line(lx::trace::level::error, "cannot connect to the session bus: {}",
-                 std::strerror(-r));
+        log_portal.error("cannot connect to the session bus: {}", std::strerror(-r));
         return 1;
     }
     r = sd_bus_add_object_vtable(bus_, &object_slot_, k_object_path, "org.freedesktop.impl.portal.Screenshot",
                                  k_screenshot_vtable, this);
     if (r < 0) {
-        log_line(lx::trace::level::error, "cannot export the Screenshot object: {}",
-                 std::strerror(-r));
+        log_portal.error("cannot export the Screenshot object: {}", std::strerror(-r));
         return 1;
     }
     r = sd_bus_match_signal(bus_, &match_slot_, "org.freedesktop.DBus", "/org/freedesktop/DBus",
                             "org.freedesktop.DBus", "NameLost", on_name_lost, this);
     if (r < 0)
-        log_line(lx::trace::level::warn, "cannot watch for losing the bus name: {}",
-                 std::strerror(-r));
+        log_portal.warn("cannot watch for losing the bus name: {}", std::strerror(-r));
     const uint64_t flags = SD_BUS_NAME_ALLOW_REPLACEMENT | (options_.replace ? SD_BUS_NAME_REPLACE_EXISTING : 0);
     r = sd_bus_request_name(bus_, k_bus_name, flags);
     if (r < 0) {
-        log_line(lx::trace::level::error, "cannot own {}: {}{}", k_bus_name, std::strerror(-r),
-                 options_.replace ? "" : " (another instance? -r replaces it)");
+        log_portal.error("cannot own {}: {}{}", k_bus_name, std::strerror(-r),
+                         options_.replace ? "" : " (another instance? -r replaces it)");
         return 1;
     }
-    log_line(lx::trace::level::info, "serving {} (Screenshot v{}, targets 0x{:x}) on display {}",
-             k_bus_name, k_screenshot_version, k_screenshot_targets,
-             std::getenv("WAYLAND_DISPLAY") ? std::getenv("WAYLAND_DISPLAY") : "(unset)");
+    log_portal.info("serving {} (Screenshot v{}, targets 0x{:x}) on display {}", k_bus_name,
+                    k_screenshot_version, k_screenshot_targets,
+                    std::getenv("WAYLAND_DISPLAY") ? std::getenv("WAYLAND_DISPLAY") : "(unset)");
 
     sigset_t mask;
     sigemptyset(&mask);
@@ -536,7 +527,7 @@ int service::run() {
         for (;;) {
             r = sd_bus_process(bus_, nullptr);
             if (r < 0) {
-                log_line(lx::trace::level::error, "D-Bus processing failed: {}", std::strerror(-r));
+                log_portal.error("D-Bus processing failed: {}", std::strerror(-r));
                 quit_ = true;
                 status = 1;
                 break;
@@ -574,7 +565,7 @@ int service::run() {
         if (fds[1].revents & POLLIN) {
             signalfd_siginfo si{};
             if (read(sfd, &si, sizeof si) > 0) {
-                log_line(lx::trace::level::info, "signal {}: exiting", si.ssi_signo);
+                log_portal.info("signal {}: exiting", si.ssi_signo);
                 quit_ = true;
             }
         }
@@ -599,7 +590,7 @@ int run_service(const service_options& options) {
 #else
 
 int run_service(const service_options&) {
-    lx::trace::logger::global().log_error(lx::not_implemented("lx::portal::run_service"), k_category);
+    log_portal.error(lx::not_implemented("lx::portal::run_service"));
     return 2;
 }
 
@@ -609,16 +600,16 @@ int run_chooser(std::string_view input, std::string& chosen) {
     std::vector<chooser_entry> entries = parse_chooser_input(input);
     if (seat_session_locked()) {
         // The list would sit under the lock screen; nothing is shared while locked.
-        log_line(lx::trace::level::info, "chooser: the session is locked: declined");
+        log_portal.info("chooser: the session is locked: declined");
         return 1;
     }
     if (entries.empty()) {
-        log_line(lx::trace::level::warn, "chooser: nothing to choose from");
+        log_portal.warn("chooser: nothing to choose from");
         return 1;
     }
     lx::result<std::unique_ptr<desktop>> wl = desktop::connect();
     if (!wl.ok()) {
-        lx::trace::logger::global().log_error(wl.get_error(), k_category);
+        log_portal.error(wl.get_error());
         return 2;
     }
     std::unique_ptr<desktop> d = std::move(wl.value());
@@ -639,13 +630,13 @@ int run_chooser(std::string_view input, std::string& chosen) {
     {
         overlay ov{*d};
         if (auto r = ov.start_choose(entries, "Choose what to share"); !r.ok()) {
-            lx::trace::logger::global().log_error(r.get_error(), k_category);
+            log_portal.error(r.get_error());
             return 2;
         }
         while (!ov.done()) {
             ov.update();
             if (!d->pump(-1)) {
-                log_line(lx::trace::level::warn, "chooser: the Wayland connection broke");
+                log_portal.warn("chooser: the Wayland connection broke");
                 return 2;
             }
         }
@@ -653,11 +644,11 @@ int run_chooser(std::string_view input, std::string& chosen) {
     }
     if (res.what != overlay_result::kind::choice || res.choice < 0 ||
         res.choice >= static_cast<int>(entries.size())) {
-        log_line(lx::trace::level::info, "chooser: declined");
+        log_portal.info("chooser: declined");
         return res.what == overlay_result::kind::failed ? 2 : 1;
     }
     chosen = entries[static_cast<std::size_t>(res.choice)].line;
-    log_line(lx::trace::level::info, "chooser: chose '{}'", chosen.c_str());
+    log_portal.info("chooser: chose '{}'", chosen.c_str());
     return 0;
 }
 

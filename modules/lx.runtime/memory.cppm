@@ -11,6 +11,12 @@ export module lx.runtime:memory;
 
 import std;
 
+namespace {
+
+constexpr lx::trace::category log_memory{"runtime.memory"};
+
+} // namespace
+
 export namespace lx::runtime {
 
 /// Per-subsystem bump arenas — reset each frame on UI/render/worker tick.
@@ -164,8 +170,7 @@ lx::runtime::memory_arena::memory_arena(unsigned capacity_bytes) {
     const unsigned page_size = page > 0 ? static_cast<unsigned>(page) : 4096u;
     // Round up to a whole page; refuse rather than wrap if the round-up overflows.
     if (want > 0xFFFFFFFFu - (page_size - 1)) {
-        lx::trace::logger::global().log(lx::trace::level::error, "runtime.memory",
-                                        "arena capacity too large to map");
+        log_memory.error("arena capacity too large to map");
         return;
     }
     const unsigned mapped = ((want + page_size - 1) / page_size) * page_size;
@@ -176,8 +181,7 @@ lx::runtime::memory_arena::memory_arena(unsigned capacity_bytes) {
         // Report zero capacity so allocate() refuses rather than handing out storage we
         // do not own. A caller that checks its result degrades; one that trusts a lied-about
         // capacity corrupts whatever follows the arena.
-        lx::trace::logger::global().log(lx::trace::level::error, "runtime.memory",
-                                        "arena mmap failed — arena has zero capacity");
+        log_memory.error("arena mmap failed — arena has zero capacity");
         return;
     }
 

@@ -37,6 +37,30 @@ module lx.compositor;
 
 import std;
 
+namespace {
+
+constexpr lx::trace::category log_compositor{"compositor"};
+constexpr lx::trace::category log_bindings{"compositor.bindings"};
+constexpr lx::trace::category log_capture{"compositor.capture"};
+constexpr lx::trace::category log_cursor{"compositor.cursor"};
+constexpr lx::trace::category log_drm{"compositor.drm"};
+constexpr lx::trace::category log_gfx{"compositor.gfx"};
+constexpr lx::trace::category log_hotplug{"compositor.hotplug"};
+constexpr lx::trace::category log_idle{"compositor.idle"};
+constexpr lx::trace::category log_input{"compositor.input"};
+constexpr lx::trace::category log_latency{"compositor.latency"};
+constexpr lx::trace::category log_lock{"compositor.lock"};
+constexpr lx::trace::category log_memory{"compositor.memory"};
+constexpr lx::trace::category log_output{"compositor.output"};
+constexpr lx::trace::category log_outputcfg{"compositor.outputcfg"};
+constexpr lx::trace::category log_power{"compositor.power"};
+constexpr lx::trace::category log_render{"compositor.render"};
+constexpr lx::trace::category log_session{"compositor.session"};
+constexpr lx::trace::category log_texture{"compositor.texture"};
+constexpr lx::trace::category log_config{"config"};
+
+} // namespace
+
 namespace lx::compositor::detail {
 
 struct compositor_impl;
@@ -1611,9 +1635,8 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
         case keybindings::hold_step::released:
             if (void* hold = keys_.end_hold(); hold && p0_.send_hold_released)
                 p0_.send_hold_released(hold, event.time_ms);
-            if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.bindings",
-                                                "held action released");
+            if (log_bindings.enabled(lx::trace::level::debug))
+                log_bindings.debug("held action released");
             break;
         case keybindings::hold_step::none: break;
         }
@@ -1634,11 +1657,9 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
                 info.held && keys_.shell_actions() && p0_.send_held_action) {
                 if (void* hold = p0_.send_held_action(info.name, "", event.time_ms)) {
                     keys_.begin_hold(b.keys.mods, hold);
-                    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-                        lx::trace::logger::global().logf(lx::trace::level::debug,
-                                                         "compositor.bindings",
-                                                         "held action {} begins (modifier 0x{:x})",
-                                                         info.name, keys_.hold_mods());
+                    if (log_bindings.enabled(lx::trace::level::debug))
+                        log_bindings.debug("held action {} begins (modifier 0x{:x})", info.name,
+                                           keys_.hold_mods());
                     return;
                 }
             }
@@ -1682,11 +1703,10 @@ void compositor_impl::on_input_key(const lx::input::key_event& event) {
 
 void compositor_impl::request_vt_switch(unsigned vt) {
     if (auto switched = logind_.switch_vt(vt); !switched) {
-        lx::trace::logger::global().log_error(switched.get_error(), "compositor.session");
+        log_session.error(switched.get_error());
         return;
     }
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
-                                     "VT switch to {:d} requested", vt);
+    log_session.info("VT switch to {:d} requested", vt);
 }
 
 void compositor_impl::note_committed_input(output_pipeline& p, bool content) {
@@ -1804,7 +1824,7 @@ unsigned long long monotonic_us() {
 } // namespace
 
 void compositor_impl::publish_commit_timing(output_pipeline& p, int fence_fd) {
-    if (lx::trace::logger::global().min_level() > lx::trace::level::debug)
+    if (!log_latency.enabled(lx::trace::level::debug))
         return;
     const int dup_fd = fence_fd >= 0 ? ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0) : -1;
     if (const int old = p.committed_fence_fd.exchange(dup_fd, std::memory_order_acq_rel); old >= 0)
@@ -1829,7 +1849,7 @@ void compositor_impl::note_present_latency(output_pipeline& p, unsigned long lon
     if (present_us < input_us)
         return; // clocks disagree (a driver without monotonic timestamps): no sample
     const unsigned long long latency_us = present_us - input_us;
-    if (lx::trace::logger::global().min_level() > lx::trace::level::debug)
+    if (!log_latency.enabled(lx::trace::level::debug))
         return;
     // A timing submitted after this flip landed belongs to a newer commit, picked up because
     // the flip handler raced it: report nothing rather than the wrong commit's breakdown.
@@ -1837,11 +1857,10 @@ void compositor_impl::note_present_latency(output_pipeline& p, unsigned long lon
         submit_us = 0;
         fence_us = 0;
     }
-    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.latency",
-                                     "present kind={} input_us={} present_us={} latency_us={} "
-                                     "submit_us={} fence_us={} output={}",
-                                     (packed & 1u) ? "content" : "cursor", input_us, present_us,
-                                     latency_us, submit_us, fence_us, p.slot);
+    log_latency.debug("present kind={} input_us={} present_us={} latency_us={} "
+                      "submit_us={} fence_us={} output={}",
+                      (packed & 1u) ? "content" : "cursor", input_us, present_us, latency_us,
+                      submit_us, fence_us, p.slot);
     latency_samples_.push_back(latency_us);
     if (latency_samples_.size() == k_latency_window)
         log_latency_summary();
@@ -1853,12 +1872,10 @@ void compositor_impl::log_outputs() const {
             continue;
         const output_state& o = outputs.slot_state(slot);
         const lx::rect2i l = o.logical_rect();
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
-                                         "output {} name={} mode={}x{} refresh_mhz={} scale={:g} "
-                                         "({}/120) logical={}x{}+{}+{} identifier=\"{}\"",
-                                         slot, o.name, o.mode.width, o.mode.height, o.refresh_mhz,
-                                         o.scale, std::lround(o.scale * 120.0), l.width, l.height,
-                                         l.x, l.y, o.identifier);
+        log_output.info("output {} name={} mode={}x{} refresh_mhz={} scale={:g} "
+                        "({}/120) logical={}x{}+{}+{} identifier=\"{}\"",
+                        slot, o.name, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
+                        std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y, o.identifier);
     }
 }
 
@@ -1974,9 +1991,7 @@ void compositor_impl::log_latency_summary() {
     const unsigned long long p50 = b[i50];
     const unsigned long long max = *std::max_element(b + i95, b + n);
     latency_samples_.clear();
-    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.latency",
-                                     "latency summary n={} p50_us={} p95_us={} max_us={}", n, p50,
-                                     p95, max);
+    log_latency.debug("latency summary n={} p50_us={} p95_us={} max_us={}", n, p50, p95, max);
 }
 
 void compositor_impl::on_input_modifiers(const lx::input::modifier_state& mods) {
@@ -2079,7 +2094,7 @@ void compositor_impl::prepare_cursor_plane(output_pipeline& p) {
         if (auto ok = p.kms->commit(test); ok) {
             p.cursor_tested = true;
         } else if (p.kms->last_failure_rejected_state()) {
-            lx::trace::logger::global().log_error(ok.get_error(), "compositor.cursor");
+            log_cursor.error(ok.get_error());
             fail_cursor_plane("TEST_ONLY commit rejected");
             p.cursor.set_visible(false);
         }
@@ -2091,8 +2106,7 @@ void compositor_impl::prepare_cursor_plane(output_pipeline& p) {
 void compositor_impl::fail_cursor_plane(const char* why) {
     if (cursor_hw_failed_.exchange(true, std::memory_order_acq_rel))
         return;
-    lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.cursor",
-                                     "cursor plane rejected: {} — falling back to software", why);
+    log_cursor.warn("cursor plane rejected: {} — falling back to software", why);
 }
 
 void compositor_impl::on_input_pointer_motion(const lx::input::pointer_motion_event& event) {
@@ -2254,10 +2268,8 @@ void compositor_impl::trace_texture_op(const char* op, unsigned texture_id, bool
     if (texture_trace_count_ >= k_texture_trace_limit)
         return;
     ++texture_trace_count_;
-    lx::trace::logger::global().logf(
-        lx::trace::level::info, "compositor.texture", "texture {} id={}{}{}", op, texture_id,
-        ok ? "" : " FAILED",
-        texture_trace_count_ == k_texture_trace_limit ? " (trace ends here)" : "");
+    log_texture.info("texture {} id={}{}{}", op, texture_id, ok ? "" : " FAILED",
+                     texture_trace_count_ == k_texture_trace_limit ? " (trace ends here)" : "");
 }
 
 void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
@@ -2270,8 +2282,7 @@ void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
     char* end = ids;
     for (unsigned i = 0; i < count && i < 4; ++i)
         end = std::format_to_n(end, ids + sizeof(ids) - 1 - end, " {}", blits[i].texture_id).out;
-    lx::trace::logger::global().logf(
-        lx::trace::level::warn, "compositor.render",
+    log_render.warn(
         "draw references an unregistered texture — nothing will be drawn. ids:{} ({} draws; "
         "backend={}). Reported once.",
         ids, count,
@@ -2317,7 +2328,7 @@ void compositor_impl::begin_input() {
         if (auto compiled = km.compile(keymap, keymap_error_, sizeof(keymap_error_));
             !compiled) {
             if (!configured)
-                lx::trace::logger::global().log_error(compiled.get_error(), "compositor.input");
+                log_input.error(compiled.get_error());
             // A configured layout that does not compile: the system default (reported with
             // the configuration's first generation).
             else {
@@ -2325,8 +2336,7 @@ void compositor_impl::begin_input() {
                     std::snprintf(keymap_error_, sizeof(keymap_error_),
                                   "xkbcommon gave no reason");
                 if (auto fallback = km.compile(); !fallback)
-                    lx::trace::logger::global().log_error(fallback.get_error(),
-                                                          "compositor.input");
+                    log_input.error(fallback.get_error());
             }
         } else {
             keymap_error_[0] = '\0';
@@ -2352,7 +2362,7 @@ void compositor_impl::finish_input() {
         // Not fatal. A compositor with no seat still composites — it is useful headless and
         // in CI — but say so plainly, because "nothing happens when I type" is otherwise a
         // long debugging session.
-        lx::trace::logger::global().log_error(opened.get_error(), "compositor.input");
+        log_input.error(opened.get_error());
         return;
     }
     input_devices_ = std::move(opened).value();
@@ -2381,10 +2391,9 @@ void compositor_impl::finish_input() {
     // which protocols it can drive — gestures need a touchpad, relative pointers a mouse.
     sink.device_added = [](const char* name, bool keyboard, bool pointer, bool touch, bool gesture,
                            void*) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.input",
-                                         "input device \"{}\":{}{}{}{}", name ? name : "?",
-                                         keyboard ? " keyboard" : "", pointer ? " pointer" : "",
-                                         touch ? " touch" : "", gesture ? " gesture" : "");
+        log_input.debug("input device \"{}\":{}{}{}{}", name ? name : "?",
+                        keyboard ? " keyboard" : "", pointer ? " pointer" : "",
+                        touch ? " touch" : "", gesture ? " gesture" : "");
     };
     // Touch is not routed to clients yet; it is still the user, and wakes the display.
     sink.touch = [](const lx::input::touch_event&, void* u) {
@@ -2394,21 +2403,19 @@ void compositor_impl::finish_input() {
     // Pointer devices get the configuration's libinput settings as they appear (and again
     // on a reload): class sections, then a [[input.device]] of that name.
     input_devices_.set_device_config(
-        [](void* u, const char* name, lx::input::device_class kind, lx::input::pointer_config& out) {
+        [](void* u, const char* name, lx::input::device_class kind,
+           lx::input::pointer_config& out) {
             out = pointer_config_of(static_cast<compositor_impl*>(u)->config_.current(), name, kind);
             return true;
         },
         [](void*, const char* name, lx::input::device_class kind,
            const lx::input::apply_report& r) {
-            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.input",
-                                             "input device \"{}\" ({}): {}", name ? name : "?",
-                                             lx::input::device_class_name(kind),
-                                             r.applied[0] ? r.applied : "nothing to set");
-            if (r.unsupported_count &&
-                lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.input",
-                                                 "input device \"{}\" does not support: {}",
-                                                 name ? name : "?", r.unsupported);
+            log_input.info("input device \"{}\" ({}): {}", name ? name : "?",
+                           lx::input::device_class_name(kind),
+                           r.applied[0] ? r.applied : "nothing to set");
+            if (r.unsupported_count && log_input.enabled(lx::trace::level::debug))
+                log_input.debug("input device \"{}\" does not support: {}", name ? name : "?",
+                                r.unsupported);
         },
         this);
 
@@ -2419,8 +2426,7 @@ void compositor_impl::finish_input() {
             fd, &compositor_impl::input_ready_callback);
         loop.add_source(input_fd_source.get());
         input_ready_ = true;
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.input",
-                                        "libinput seat opened");
+        log_input.info("libinput seat opened");
         // The seat's devices were added while it was assigned (on the opening thread):
         // their events wait in libinput's queue, which the fd does not signal. Taken now,
         // not at the first key press — the keyboard LEDs and the device count (health)
@@ -2441,8 +2447,7 @@ void compositor_impl::handle_memory_pressure(lx::runtime::memory_pressure level)
     if (level != lx::runtime::memory_pressure::normal)
         shm_pool_.trim();
     if (level == lx::runtime::memory_pressure::critical) {
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.memory",
-                                        "critical pressure — evicting caches");
+        log_memory.warn("critical pressure — evicting caches");
     }
 }
 
@@ -2527,12 +2532,11 @@ void compositor_impl::evaluate_tearing(std::uint32_t published) {
         else
             async_allowed_mask_ &= ~bit;
         if (st.wants_async && !st.card_capable && !async_unsupported_logged_ &&
-            lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+            log_gfx.enabled(lx::trace::level::debug)) {
             async_unsupported_logged_ = true;
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.gfx",
-                                            "tearing hint async on a fullscreen window: async "
-                                            "page flip unsupported by the card, presenting "
-                                            "with vsync");
+            log_gfx.debug("tearing hint async on a fullscreen window: async "
+                          "page flip unsupported by the card, presenting "
+                          "with vsync");
         }
     }
 }
@@ -2589,7 +2593,7 @@ void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) 
     std::vector<unsigned char> rgba(static_cast<std::size_t>(w) * h * 4u);
     if (auto read = gl_compositor_.read_back(target, rgba.data(), static_cast<unsigned>(rgba.size()));
         !read) {
-        lx::trace::logger::global().log_error(read.get_error(), "compositor.render");
+        log_render.error(read.get_error());
         return;
     }
     const char* dir = std::getenv("LUMEN_SCREENSHOT_DIR");
@@ -2602,8 +2606,7 @@ void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) 
                   screenshot_count_, outputs.slot_live(p.slot) ? o.name : "gone");
     std::FILE* f = std::fopen(path, "wb");
     if (!f) {
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                        "screenshot: cannot open the output file");
+        log_render.warn("screenshot: cannot open the output file");
         return;
     }
     std::fprintf(f, "P6\n%u %u\n255\n", w, h);
@@ -2611,9 +2614,7 @@ void compositor_impl::write_screenshot(const output_pipeline& p, unsigned slot) 
     for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i)
         std::fwrite(&rgba[i * 4u], 1, 3, f);
     std::fclose(f);
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.render",
-                                     "screenshot {}x{} written to {} (output {})", w, h, path,
-                                     p.slot);
+    log_render.info("screenshot {}x{} written to {} (output {})", w, h, path, p.slot);
 }
 
 void compositor_impl::refresh_capture_host() {
@@ -3135,8 +3136,7 @@ void compositor_impl::register_p0_globals() {
         if (gl_compositor_.supports_client_upload()) {
             p0_.shm_direct = &shm_direct_;
             p0_.shm_native_format = true;
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                            "shm: uploaded from client memory (no staging)");
+            log_gfx.info("shm: uploaded from client memory (no staging)");
         }
     } else {
         // Vulkan uploads whole RGBA images.
@@ -3236,17 +3236,15 @@ void compositor_impl::register_p0_globals() {
         p0_.syncobj_drm_fd = kms.card_fd();
         p0_.syncobj_supported = fence_out && gfx::drm_timeline_supported(kms.card_fd());
         p0_.async_flip_capable = kms.supports_async_flip();
-        lx::trace::logger::global().logf(
-            lx::trace::level::info, "compositor.gfx",
-            "explicit sync (linux-drm-syncobj-v1): {}; async page "
-            "flips (tearing-control-v1): {}",
-            p0_.syncobj_supported ? "offered"
-            : fence_out           ? "not offered (no timeline syncobjs on this card)"
-                                  : "not offered (composite exports no fence)",
-            p0_.async_flip_capable ? "available" : "unsupported by the card");
+        log_gfx.info("explicit sync (linux-drm-syncobj-v1): {}; async page "
+                     "flips (tearing-control-v1): {}",
+                     p0_.syncobj_supported ? "offered"
+                     : fence_out           ? "not offered (no timeline syncobjs on this card)"
+                                           : "not offered (composite exports no fence)",
+                     p0_.async_flip_capable ? "available" : "unsupported by the card");
     }
     if (auto installed = install_p0_protocols(p0_); !installed) {
-        lx::trace::logger::global().log_error(installed.get_error(), "compositor");
+        log_compositor.error(installed.get_error());
     }
     // The heads every zwlr_output_manager_v1 is told about from its first bind.
     mark_heads_dirty();
@@ -3276,8 +3274,7 @@ void compositor_impl::hold_shm_slot(unsigned texture_id, unsigned long long toke
     }
     // No room to track it: releasing now is wrong (the composite is about to read it), so
     // the slot leaks until the texture is forgotten. Say so rather than corrupt the frame.
-    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                    "shm slot table full — staging slot not tracked");
+    log_render.warn("shm slot table full — staging slot not tracked");
 }
 
 void compositor_impl::release_shm_slot(unsigned texture_id) {
@@ -3313,9 +3310,8 @@ void compositor_impl::begin_logout(const char* source) {
         wm_.request_close(rec.id);
         ++asked;
     });
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
-                                     "logout requested by {}: closing {} window{}", source, asked,
-                                     asked == 1 ? "" : "s");
+    log_session.info("logout requested by {}: closing {} window{}", source, asked,
+                     asked == 1 ? "" : "s");
 }
 
 void compositor_impl::advance_logout(lx::runtime::clock_time now_ns) {
@@ -3324,9 +3320,7 @@ void compositor_impl::advance_logout(lx::runtime::clock_time now_ns) {
     const unsigned left = toplevels.count();
     if (left > 0 && now_ns < logout_deadline_ns_)
         return;
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
-                                     "logout: stopping ({} window{} still open)", left,
-                                     left == 1 ? "" : "s");
+    log_session.info("logout: stopping ({} window{} still open)", left, left == 1 ? "" : "s");
     logout_active_ = false;
     loop.quit(0);
 }
@@ -3460,7 +3454,7 @@ void compositor_impl::start_session() {
             static_cast<compositor_impl*>(u)->begin_logout(source);
         };
         if (auto opened = control_.open(host); !opened) {
-            lx::trace::logger::global().log_error(opened.get_error(), "compositor.session");
+            log_session.error(opened.get_error());
         } else {
             if (cfg.control_socket) {
                 const char* runtime = std::getenv("XDG_RUNTIME_DIR");
@@ -3471,13 +3465,9 @@ void compositor_impl::start_session() {
                     std::snprintf(path, sizeof(path), "%s/%s.varlink",
                                   runtime && *runtime ? runtime : "/tmp", cfg.socket_name);
                 if (auto listening = control_.listen(path); !listening)
-                    lx::trace::logger::global().log_error(listening.get_error(),
-                                                          "compositor.session");
+                    log_session.error(listening.get_error());
                 else
-                    lx::trace::logger::global().logf(lx::trace::level::info,
-                                                     "compositor.session",
-                                                     "control socket {} ({})", path,
-                                                     k_control_interface);
+                    log_session.info("control socket {} ({})", path, k_control_interface);
             }
             control_source_ = std::make_unique<control_source>(*this);
             loop.add_source(control_source_.get());
@@ -3553,11 +3543,10 @@ void compositor_impl::start_session() {
     // Both calls are asynchronous; READY follows their replies (or 2 s).
     bool sent = false;
     if (!control_.event()) {
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.session",
-                                        "no event loop for the user bus: environment not "
-                                        "exported");
+        log_session.warn("no event loop for the user bus: environment not "
+                         "exported");
     } else if (auto opened = user_env_.open(control_.event()); !opened) {
-        lx::trace::logger::global().log_error(opened.get_error(), "compositor.session");
+        log_session.error(opened.get_error());
     } else {
         char display[96];
         char socket[300];
@@ -3594,7 +3583,7 @@ void compositor_impl::start_session() {
                 },
                 this);
             !exported) {
-            lx::trace::logger::global().log_error(exported.get_error(), "compositor.session");
+            log_session.error(exported.get_error());
         } else {
             sent = true;
             control_.dispatch(); // the calls leave now, not at the loop's first wake-up
@@ -3607,14 +3596,12 @@ void compositor_impl::start_session() {
 void compositor_impl::on_environment_exported(bool ok) {
     lx::trace::timeline_instant("startup", "env exported");
     if (ok)
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
-                                         "session environment exported: WAYLAND_DISPLAY={} "
-                                         "XDG_SESSION_TYPE=wayland",
-                                         cfg.socket_name);
+        log_session.info("session environment exported: WAYLAND_DISPLAY={} "
+                         "XDG_SESSION_TYPE=wayland",
+                         cfg.socket_name);
     else
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.session",
-                                        "the user manager refused the session environment "
-                                        "(or did not answer in 2 s)");
+        log_session.warn("the user manager refused the session environment "
+                         "(or did not answer in 2 s)");
     send_ready(ok ? nullptr : "environment export failed");
 }
 
@@ -3629,8 +3616,7 @@ void compositor_impl::send_ready(const char* why) {
     session::service_notifier::ready(status);
     lx::trace::timeline_instant("startup", "ready");
     if (session::service_notifier::listening())
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
-                                         "ready: {}", status);
+        log_session.info("ready: {}", status);
     // Windows that map before the shell's panel has reserved its strip are fitted into the
     // usable area once it has (or after 750 ms): only in a session, where the shell starts
     // after READY in parallel with autostart applications.
@@ -3650,8 +3636,7 @@ void compositor_impl::end_session() {
     // what the manager applies last.
     if (user_env_.exported() || user_env_.export_pending()) {
         user_env_.unset_now(1000);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.session",
-                                        "session environment unset");
+        log_session.info("session environment unset");
     }
     user_env_.close();
     control_.close();
@@ -3687,9 +3672,8 @@ void compositor_impl::maybe_ping_watchdog(lx::runtime::clock_time now) {
     if (!alive) {
         if (!watchdog_withheld_) {
             watchdog_withheld_ = true;
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.session",
-                                            "render thread stuck in a tick: watchdog ping "
-                                            "withheld");
+            log_session.warn("render thread stuck in a tick: watchdog ping "
+                             "withheld");
         }
         watchdog_next_ns_ = now + 250'000'000ll;
         return;
@@ -3717,8 +3701,7 @@ void compositor_impl::handle_reload_request() {
     // systemd's reload protocol (Type=notify-reload): RELOADING=1 now, READY=1 once the
     // generation is applied (finish_config_generation).
     session::service_notifier::reloading("Reloading the configuration");
-    lx::trace::logger::global().log(lx::trace::level::info, "config",
-                                    "reload (SIGHUP): reading the configuration again");
+    log_config.info("reload (SIGHUP): reading the configuration again");
     request_config_reload(reload_cause::sighup, ~0u);
 }
 
@@ -3959,9 +3942,8 @@ control_action_result compositor_impl::run_action(lx::config::action_id action, 
                 (void)wm_.quick_switch();
                 return control_action_result::ok;
             }
-            if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.bindings",
-                                                 "{}: no shell speaks zlm v7; dropped", info.name);
+            if (log_bindings.enabled(lx::trace::level::debug))
+                log_bindings.debug("{}: no shell speaks zlm v7; dropped", info.name);
             return control_action_result::shell_not_connected;
         }
         return control_action_result::ok;
@@ -4211,11 +4193,10 @@ void compositor_impl::finish_keymap_job() {
         keymap_error_[0] = '\0';
         keymap_default_ = false;
         const auto& km = seat.keymap();
-        lx::trace::logger::global().logf(lx::trace::level::info, "config",
-                                         "keymap: layout \"{}\" variant \"{}\" options \"{}\" "
-                                         "({} layouts, active {}; compiled in {} us)",
-                                         k.layout, k.variant, k.options, km.layout_count(),
-                                         km.layout_name(km.active_layout()), job->compile_us);
+        log_config.info("keymap: layout \"{}\" variant \"{}\" options \"{}\" "
+                        "({} layouts, active {}; compiled in {} us)",
+                        k.layout, k.variant, k.options, km.layout_count(),
+                        km.layout_name(km.active_layout()), job->compile_us);
     } else {
         std::snprintf(keymap_error_, sizeof(keymap_error_), "%s",
                       job->error[0] ? job->error : "xkbcommon gave no reason");
@@ -4273,10 +4254,9 @@ void compositor_impl::finish_cursor_job() {
             themes[i] = &cursor_themes_[i];
         cursor_.set_themes(themes, cursor_theme_scale120_, cursor_theme_count_);
         request_frame();
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.cursor",
-                                         "cursor theme={} size={} (configuration) from_theme={}",
-                                         cursor_themes_[0].name(), cursor_themes_[0].size(),
-                                         cursor_themes_[0].from_theme());
+        log_cursor.info("cursor theme={} size={} (configuration) from_theme={}",
+                        cursor_themes_[0].name(), cursor_themes_[0].size(),
+                        cursor_themes_[0].from_theme());
         if (cursor_theme_name_[0] && !cursor_themes_[0].from_theme())
             config_.diagnostics().addf(lxc::severity::warning, lxc::k_no_layer, 0, "cursor.theme",
                                        "cursor theme \"{}\" was not found; using {}",
@@ -4312,7 +4292,7 @@ void compositor_impl::export_cursor_environment() {
     if (auto r = user_env_.export_async(std::span<const std::string_view>{vars.data(), n}, 2000,
                                         [](void*, bool) {}, nullptr);
         !r)
-        lx::trace::logger::global().log_error(r.get_error(), "config");
+        log_config.error(r.get_error());
     else
         control_.dispatch();
 }
@@ -4354,22 +4334,19 @@ void compositor_impl::finish_config_generation() {
     for (const lxc::diagnostic& x : d.items()) {
         char line[1024]; // a path (up to 512) and the message
         lxc::format_diagnostic(x, config_.path_of(x.layer), true, line, sizeof(line));
-        lx::trace::logger::global().log(
-            x.sev == lxc::severity::error ? lx::trace::level::warn : lx::trace::level::info,
-            "config", line);
+        log_config.log(x.sev == lxc::severity::error ? lx::trace::level::warn
+                                                     : lx::trace::level::info,
+                       "{}", line);
     }
     if (config_.accepted_last())
-        lx::trace::logger::global().logf(lx::trace::level::info, "config",
-                                         "config: generation {} from {} ({} errors, {} "
-                                         "warnings; {} bindings)",
-                                         config_.generation(), config_.describe_source(),
-                                         d.errors(), d.warnings(), keys_.binding_count());
+        log_config.info("config: generation {} from {} ({} errors, {} "
+                        "warnings; {} bindings)",
+                        config_.generation(), config_.describe_source(), d.errors(), d.warnings(),
+                        keys_.binding_count());
     else
-        lx::trace::logger::global().logf(lx::trace::level::warn, "config",
-                                         "config: generation {} from {} rejected ({} errors); "
-                                         "the configuration in use stays",
-                                         config_.generation(), config_.describe_source(),
-                                         d.errors());
+        log_config.warn("config: generation {} from {} rejected ({} errors); "
+                        "the configuration in use stays",
+                        config_.generation(), config_.describe_source(), d.errors());
     // The shell: the new bytes when they changed, and the report.
     if (p0_.send_shell_config)
         send_config_to_shell(nullptr, config_.accepted_last() &&
@@ -4554,9 +4531,8 @@ void compositor_impl::cancel_hold(const char* why) {
         stop_binding_repeat();
     if (p0_.send_hold_cancelled)
         p0_.send_hold_cancelled(hold);
-    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.bindings",
-                                         "held action cancelled ({})", why);
+    if (log_bindings.enabled(lx::trace::level::debug))
+        log_bindings.debug("held action cancelled ({})", why);
 }
 
 wm_button_binding compositor_impl::on_button_binding(unsigned button, unsigned time_ms) {
@@ -4616,11 +4592,9 @@ void compositor_impl::end_placement_hold(const char* why) {
     for (const lx::toplevel_id id : placement_held_)
         if (wm_.fit_into_usable(id))
             ++moved;
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
-                                     "placement hold ended ({}): {} window{} mapped meanwhile, "
-                                     "{} moved into the usable area",
-                                     why, placement_held_.size(),
-                                     placement_held_.size() == 1 ? "" : "s", moved);
+    log_session.info("placement hold ended ({}): {} window{} mapped meanwhile, "
+                     "{} moved into the usable area",
+                     why, placement_held_.size(), placement_held_.size() == 1 ? "" : "s", moved);
     placement_held_.clear();
     rearm_session_timer();
 }
@@ -4634,8 +4608,7 @@ void compositor_impl::ensure_graphics_device() {
         const gfx::device_info info = graphics.info();
         headless_present_ = !info.supports_dmabuf_import;
         if (!graphics.vk_device()) {
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                            info.device_name);
+            log_gfx.info("{}", info.device_name);
         } else {
             // Which GPU composites, and whether it is the one that scans out: on a hybrid
             // or two-GPU machine anything but a node match means frames cross devices. A
@@ -4645,20 +4618,16 @@ void compositor_impl::ensure_graphics_device() {
                                  info.match == gfx::device_match::render_node;
             const char* tier = info.tier == gfx::gpu_tier::discrete ? "discrete" : "integrated";
             if (!drm_node_.present) {
-                lx::trace::logger::global().logf(lx::trace::level::info, "compositor.gfx",
-                                                 "Vulkan device {} ({}): no card to match",
-                                                 info.device_name, tier);
+                log_gfx.info("Vulkan device {} ({}): no card to match", info.device_name, tier);
             } else {
                 const bool software = info.is_software_rasterizer;
-                lx::trace::logger::global().logf(
-                    matched || software ? lx::trace::level::info : lx::trace::level::warn,
-                    "compositor.gfx", "Vulkan device {} ({}) for card {}:{}: {}{}{}",
-                    info.device_name, software ? "software" : tier, drm_node_.major,
-                    drm_node_.minor, matched ? "matched by " : "",
-                    gfx::device_match_name(info.match),
-                    matched    ? ""
-                    : software ? ", software rasterizer"
-                               : ", first hardware device composites");
+                log_gfx.log(matched || software ? lx::trace::level::info : lx::trace::level::warn,
+                            "Vulkan device {} ({}) for card {}:{}: {}{}{}", info.device_name,
+                            software ? "software" : tier, drm_node_.major, drm_node_.minor,
+                            matched ? "matched by " : "", gfx::device_match_name(info.match),
+                            matched    ? ""
+                            : software ? ", software rasterizer"
+                                       : ", first hardware device composites");
             }
         }
         if (kms.card_fd() >= 0) {
@@ -4666,7 +4635,7 @@ void compositor_impl::ensure_graphics_device() {
             graphics.syncobj().set_device(graphics.vk_device());
         }
     } else {
-        lx::trace::logger::global().log_error(dev.get_error(), "compositor.gfx");
+        log_gfx.error(dev.get_error());
         headless_present_ = true;
     }
 }
@@ -4693,8 +4662,7 @@ void compositor_impl::queue_forget(unsigned texture_id, unsigned retire_after_fr
     }
     // Out of room. Retiring now risks a snapshot that still draws it, so say so instead of
     // doing it silently — an unregistered-texture warning downstream would be the symptom.
-    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                    "deferred texture retirement table full — retiring early");
+    log_render.warn("deferred texture retirement table full — retiring early");
     apply_forget(texture_id);
 }
 
@@ -4746,9 +4714,8 @@ void compositor_impl::drain_texture_updates(unsigned frame) {
             // still holds; the cost is a frame that may show new pixels a frame early.
             if (!warned_deferred_full_) {
                 warned_deferred_full_ = true;
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                                "texture update deferral full — applying "
-                                                "ahead of its snapshot. Reported once.");
+                log_render.warn("texture update deferral full — applying "
+                                "ahead of its snapshot. Reported once.");
             }
             texture_update& oldest = deferred_updates_[deferred_head_];
             apply_texture_update(oldest);
@@ -4843,10 +4810,8 @@ void compositor_impl::apply_texture_update(texture_update& update) {
             shm_pool_.release(update.shm_pool_token);
             if (!reported_partial_fresh_ && gl_compositor_.partial_into_fresh() > 0) {
                 reported_partial_fresh_ = true;
-                lx::trace::logger::global().log(
-                    lx::trace::level::warn, "compositor.render",
-                    "partial shm upload into a texture with no prior content — staging "
-                    "bookkeeping disagrees with the GL slot (reported once)");
+                log_render.warn("partial shm upload into a texture with no prior content — staging "
+                                "bookkeeping disagrees with the GL slot (reported once)");
             }
         } else if (vulkan_present_) {
             applied = vk_compositor_.upload_rgba(update.texture_id, update.width,
@@ -4869,7 +4834,7 @@ void compositor_impl::apply_texture_update(texture_update& update) {
         break;
     }
     if (!applied)
-        lx::trace::logger::global().log_error(applied.get_error(), "compositor.render");
+        log_render.error(applied.get_error());
 
     if (update.kind == texture_update::op::shm)
         trace_texture_op("upload", update.texture_id, static_cast<bool>(applied));
@@ -4895,7 +4860,7 @@ lx::result<void> compositor_impl::setup_vulkan_present() {
             ui_vk_ = std::move(ui);
             lx::trace::timeline_instant("startup", "ui_vk ready");
         } else {
-            lx::trace::logger::global().log_error(ready.get_error(), "compositor.gfx");
+            log_gfx.error(ready.get_error());
         }
     }
     vulkan_present_ = true;
@@ -4962,20 +4927,19 @@ lx::result<void> compositor_impl::setup_gl_present() {
             ui_gl_ = std::move(ui);
             lx::trace::timeline_instant("startup", "ui_gl ready");
         } else {
-            lx::trace::logger::global().log_error(ready.get_error(), "compositor.gfx");
+            log_gfx.error(ready.get_error());
         }
     }
     if (!ui_gl_)
-        lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.gfx",
-                                         "GLES {}.{}: no UI primitive renderer — solid square "
-                                         "quads drawn as blits, other primitives dropped",
-                                         egl_.gles_major(), egl_.gles_minor());
+        log_gfx.warn("GLES {}.{}: no UI primitive renderer — solid square "
+                     "quads drawn as blits, other primitives dropped",
+                     egl_.gles_major(), egl_.gles_minor());
 
     gl_present_ = true;
     vulkan_present_ = false;
     cpu_present_ = false;
     headless_present_ = false;
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx", egl_.renderer());
+    log_gfx.info("{}", egl_.renderer());
     return {};
 }
 
@@ -4996,8 +4960,7 @@ lx::result<void> compositor_impl::create_targets(output_pipeline& p, bool scanou
             if (!created) {
                 if (i < 2)
                     return created.get_error();
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
-                                                "third scanout slot unavailable — double-buffered");
+                log_gfx.warn("third scanout slot unavailable — double-buffered");
                 break;
             }
             p.gl[i] = std::move(created).value();
@@ -5029,8 +4992,7 @@ lx::result<void> compositor_impl::create_targets(output_pipeline& p, bool scanou
             if (!created) {
                 if (i < 2) // fewer than two buffers cannot page-flip without tearing
                     return created.get_error();
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
-                                                "third scanout slot unavailable — double-buffered");
+                log_gfx.warn("third scanout slot unavailable — double-buffered");
                 break;
             }
             p.dumb[i] = std::move(created).value();
@@ -5039,8 +5001,7 @@ lx::result<void> compositor_impl::create_targets(output_pipeline& p, bool scanou
             if (!created) {
                 if (i == 0)
                     return created.get_error();
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.gfx",
-                                                "second scanout slot unavailable — single-buffer");
+                log_gfx.warn("second scanout slot unavailable — single-buffer");
                 break;
             }
             p.vk[i] = std::move(created).value();
@@ -5314,7 +5275,7 @@ lx::result<void> compositor_impl::create_pipelines() {
         for (auto& p : pipes_)
             if (p && (vulkan_present_ || gl_present_ || cpu_present_))
                 if (auto made = create_targets(*p, false); !made)
-                    lx::trace::logger::global().log_error(made.get_error(), "compositor.gfx");
+                    log_gfx.error(made.get_error());
         return {};
     }
 
@@ -5360,10 +5321,9 @@ lx::result<void> compositor_impl::create_pipelines() {
             if (o.follow_preferred || !o.preferred_mode.valid() ||
                 o.preferred_mode.same_timings(o.kms_mode))
                 continue;
-            lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.outputcfg",
-                                             "output {} {}: its configured mode {}x{} failed "
-                                             "TEST_ONLY — preferred mode instead",
-                                             slots[i], o.name, o.mode.width, o.mode.height);
+            log_outputcfg.warn("output {} {}: its configured mode {}x{} failed "
+                               "TEST_ONLY — preferred mode instead",
+                               slots[i], o.name, o.mode.width, o.mode.height);
             outputs.set_mode(slots[i], o.preferred_mode, true, false);
             output_pipeline& p = *pipes_[slots[i]];
             release_targets(p);
@@ -5382,10 +5342,9 @@ lx::result<void> compositor_impl::create_pipelines() {
     // Without master yet (a session starting in the background) TEST_ONLY cannot run; the
     // structural assignment is taken and the first modeset decides.
     if (!assigned) {
-        lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.drm",
-                                         "CRTC allocation failed for {} output{} (steps={} "
-                                         "tests={}) — trying without the test",
-                                         n, n == 1 ? "" : "s", r.steps, r.tests);
+        log_drm.warn("CRTC allocation failed for {} output{} (steps={} "
+                     "tests={}) — trying without the test",
+                     n, n == 1 ? "" : "s", r.steps, r.tests);
         if (!drm::assign_crtcs(in, r, nullptr, nullptr))
             return lx::make_error(lx::drm_err::no_crtc,
                                   "no CRTC assignment for the connected outputs");
@@ -5400,20 +5359,17 @@ lx::result<void> compositor_impl::create_pipelines() {
         p.kms->set_framebuffer(p.framebuffer(0, cpu_present_));
         p.presentation.bind_page_flip(*p.kms);
         p.presentation.set_handler(&compositor_impl::presentation_flip_handler, &p);
-        lx::trace::logger::global().logf(
-            lx::trace::level::info, "compositor.drm",
-            "output {} pipeline crtc={} (index {}) primary={} "
-            "connector={} mode={}x{}@{} cursor_plane={}",
-            p.slot, d.crtc_id, d.crtc_index, d.primary_plane_id, d.connector_id, o.kms_mode.width,
-            o.kms_mode.height, o.kms_mode.refresh_mhz,
-            r.cursor_plane[i] >= 0
-                ? static_cast<int>(kms.plane(static_cast<unsigned>(r.cursor_plane[i])).id)
-                : -1);
+        log_drm.info("output {} pipeline crtc={} (index {}) primary={} "
+                     "connector={} mode={}x{}@{} cursor_plane={}",
+                     p.slot, d.crtc_id, d.crtc_index, d.primary_plane_id, d.connector_id,
+                     o.kms_mode.width, o.kms_mode.height, o.kms_mode.refresh_mhz,
+                     r.cursor_plane[i] >= 0
+                         ? static_cast<int>(kms.plane(static_cast<unsigned>(r.cursor_plane[i])).id)
+                         : -1);
     }
     {
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.drm",
-                                         "CRTC allocation: {} output{}, {} TEST_ONLY, {} steps", n,
-                                         n == 1 ? "" : "s", r.tests, r.steps);
+        log_drm.info("CRTC allocation: {} output{}, {} TEST_ONLY, {} steps", n, n == 1 ? "" : "s",
+                     r.tests, r.steps);
     }
     return {};
 }
@@ -5707,33 +5663,30 @@ const char* pause_kind_name(session_pause_kind k) {
 
 void compositor_impl::on_session_events() {
     const std::size_t n = session_events_.size();
-    auto& log = lx::trace::logger::global();
     for (std::size_t i = 0; i < n; ++i) {
         const session_event ev = session_events_[i];
         switch (ev.what) {
         case session_event::kind::paused:
-            log.logf(lx::trace::level::debug, "compositor.session", "PauseDevice {}:{} type={}",
-                     ev.major, ev.minor, pause_kind_name(ev.pause));
+            log_session.debug("PauseDevice {}:{} type={}", ev.major, ev.minor,
+                              pause_kind_name(ev.pause));
             // evdev `pause`s (seats without VTs) are acknowledged after the batch, below.
             if (session_.is_drm(ev.major, ev.minor))
                 apply_session_actions(session_.on_device_paused(ev.major, ev.minor, ev.pause));
             break;
         case session_event::kind::resumed:
-            log.logf(lx::trace::level::debug, "compositor.session", "ResumeDevice {}:{}", ev.major,
-                     ev.minor);
+            log_session.debug("ResumeDevice {}:{}", ev.major, ev.minor);
             // evdev: we released every input device at the pause, so this is a leftover of
             // a race; the fd is sd-bus's and libinput re-takes its devices itself.
             if (session_.is_drm(ev.major, ev.minor))
                 apply_session_actions(session_.on_device_resumed(ev.major, ev.minor));
             break;
         case session_event::kind::active:
-            log.logf(lx::trace::level::debug, "compositor.session", "Active={}", ev.active);
+            log_session.debug("Active={}", ev.active);
             apply_session_actions(
                 session_.on_active_changed(ev.active, ev.active && kms.is_master()));
             break;
         case session_event::kind::vt_failed:
-            log.logf(lx::trace::level::warn, "compositor.session", "VT switch failed: {}",
-                     ev.error);
+            log_session.warn("VT switch failed: {}", ev.error);
             break;
         case session_event::kind::lock:
             on_logind_lock();
@@ -5772,19 +5725,15 @@ void compositor_impl::apply_session_actions(const session_actions& a) {
         wm_.set_suspend_reason(window_manager::suspend_vt, true);
     if (a.has(session_actions::log_paused)) {
         if (a.by_active)
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.session",
-                                            "session paused (active=false)");
+            log_session.info("session paused (active=false)");
         else
-            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
-                                             "session paused (drm={}:{} kind={})", drm_major_,
-                                             drm_minor_, pause_kind_name(a.kind));
+            log_session.info("session paused (drm={}:{} kind={})", drm_major_, drm_minor_,
+                             pause_kind_name(a.kind));
     }
     if (a.has(session_actions::log_display_lost))
-        lx::trace::logger::global().log(lx::trace::level::error, "compositor.session",
-                                        "DRM device removed — no display");
+        log_session.error("DRM device removed — no display");
     if (a.has(session_actions::log_resume_rejected))
-        lx::trace::logger::global().log(
-            lx::trace::level::error, "compositor.session",
+        log_session.error(
             "resume modeset rejected (the mode is no longer offered?) — the display stays off "
             "until the session is switched to again");
     if (a.has(session_actions::begin_resume))
@@ -5793,12 +5742,10 @@ void compositor_impl::apply_session_actions(const session_actions& a) {
         resume_input_after_pause();
     if (a.has(session_actions::complete_pause)) {
         logind_.complete_pause(a.ack_major, a.ack_minor);
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.session",
-                                         "PauseDeviceComplete {}:{}", a.ack_major, a.ack_minor);
+        log_session.debug("PauseDeviceComplete {}:{}", a.ack_major, a.ack_minor);
     }
     if (a.has(session_actions::log_resumed))
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.session",
-                                        "session resumed");
+        log_session.info("session resumed");
     // A lock under way when the VT went away is locked now (nothing of it is visible).
     advance_lock();
     wayland.flush();
@@ -5875,7 +5822,7 @@ void compositor_impl::resume_input_after_pause() {
         // Re-enumerates the seat and re-takes every device through logind; a device that
         // fails stays closed (libinput logs it).
         if (auto resumed = input_devices_.resume(); !resumed)
-            lx::trace::logger::global().log_error(resumed.get_error(), "compositor.input");
+            log_input.error(resumed.get_error());
         // The DEVICE_ADDED events are queued now; deliver them (and the LED updates).
         (void)input_devices_.dispatch();
     }
@@ -5992,8 +5939,7 @@ bool compositor_impl::on_user_activity() {
         apply_power_actions(s, outs_[s].power.wake(vt_away));
     }
     if (woke)
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.power",
-                                        "display woken by input");
+        log_power.info("display woken by input");
     return woke;
 }
 
@@ -6057,26 +6003,22 @@ void compositor_impl::apply_power_actions(unsigned slot, const power_actions& a)
         apply_power_actions(slot, o.power.on_flip_drained());
     if (a.has(power_actions::send_mode))
         notify_output_power(p0_, slot, a.mode_on);
-    auto& log = lx::trace::logger::global();
     if (a.has(power_actions::log_off))
-        log.logf(lx::trace::level::info, "compositor.power", "{} (output {} {})",
-                 (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0
-                     ? "display power off (session away: nothing to commit)"
-                     : "display power off (CRTC ACTIVE=0, cursor plane off)",
-                 slot, name);
+        log_power.info("{} (output {} {})",
+                       (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0
+                           ? "display power off (session away: nothing to commit)"
+                           : "display power off (CRTC ACTIVE=0, cursor plane off)",
+                       slot, name);
     if (a.has(power_actions::log_soft_blank))
-        log.logf(lx::trace::level::warn, "compositor.power",
-                 "display power off refused by the driver — showing black instead (no power "
-                 "saving) (output {} {})",
-                 slot, name);
+        log_power.warn("display power off refused by the driver — showing black instead (no power "
+                       "saving) (output {} {})",
+                       slot, name);
     if (a.has(power_actions::log_on))
-        log.logf(lx::trace::level::info, "compositor.power", "display power on (output {} {})",
-                 slot, name);
+        log_power.info("display power on (output {} {})", slot, name);
     if (a.has(power_actions::log_on_failed))
-        log.logf(lx::trace::level::error, "compositor.power",
-                 "display power on: the modeset was refused (the mode is no longer "
-                 "offered?) — output {} {} stays dark until the next input",
-                 slot, name);
+        log_power.error("display power on: the modeset was refused (the mode is no longer "
+                        "offered?) — output {} {} stays dark until the next input",
+                        slot, name);
     // A lock under way when the output went dark is locked now if nothing else shows.
     if (a.has(power_actions::log_off) || a.has(power_actions::log_soft_blank))
         note_lock_shown(slot);
@@ -6129,7 +6071,7 @@ power_off_outcome compositor_impl::run_power_off(unsigned slot, unsigned gen) {
         return power_off_outcome::deferred; // a VT switch raced the request
     if (!power_rejected_logged_) {
         power_rejected_logged_ = true;
-        lx::trace::logger::global().log_error(off.get_error(), "compositor.power");
+        log_power.error(off.get_error());
     }
     commit_black_frame(*p);
     return power_off_outcome::rejected;
@@ -6220,8 +6162,7 @@ void compositor_impl::release_sleep_delay(const char* why) {
         return;
     sleep_lock_deadline_ns_ = 0;
     logind_.release_sleep_inhibitor();
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.lock",
-                                     "sleep may proceed ({})", why);
+    log_lock.info("sleep may proceed ({})", why);
 }
 
 bool compositor_impl::output_dark(unsigned slot) const {
@@ -6349,16 +6290,13 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
     if (lock_.state() != logged_lock_state_) {
         const lock_state from = logged_lock_state_;
         logged_lock_state_ = lock_.state();
-        lx::trace::logger::global().logf(
-            logged_lock_state_ == lock_state::abandoned ? lx::trace::level::warn
-                                                        : lx::trace::level::info,
-            "compositor.lock", "session lock: {} -> {}", lock_state_name(from),
-            lock_state_name(logged_lock_state_));
+        log_lock.log(logged_lock_state_ == lock_state::abandoned ? lx::trace::level::warn
+                                                                 : lx::trace::level::info,
+                     "session lock: {} -> {}", lock_state_name(from),
+                     lock_state_name(logged_lock_state_));
         if (logged_lock_state_ == lock_state::abandoned)
-            lx::trace::logger::global().log(
-                lx::trace::level::warn, "compositor.lock",
-                "session lock abandoned (the locker exited) — staying locked until a new "
-                "locker takes over or logind unlocks");
+            log_lock.warn("session lock abandoned (the locker exited) — staying locked until a new "
+                          "locker takes over or logind unlocks");
     }
     // `locked` is what before-sleep locking waits for.
     if ((lock_.state() == lock_state::locked || lock_.state() == lock_state::abandoned ||
@@ -6373,14 +6311,12 @@ void compositor_impl::apply_lock_actions(const lock_actions& a) {
 void compositor_impl::on_logind_lock() {
     // loginctl lock-session, a lid policy: the shell starts its locker (Lumen ships none).
     if (lock_.state() != lock_state::unlocked) {
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock",
-                                        "logind Lock: already locked");
+        log_lock.info("logind Lock: already locked");
         return;
     }
     const bool told = p0_.notify_lock_requested && p0_.notify_lock_requested(0);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock",
-                                    told ? "logind Lock: shell asked to lock"
-                                         : "logind Lock: no shell to start a locker — ignored");
+    log_lock.info("{}", told ? "logind Lock: shell asked to lock"
+                             : "logind Lock: no shell to start a locker — ignored");
 }
 
 void compositor_impl::on_logind_unlock() {
@@ -6388,8 +6324,7 @@ void compositor_impl::on_logind_unlock() {
     // locker is gone (L2). A live locker is sent `finished`.
     if (lock_.state() == lock_state::unlocked)
         return;
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock",
-                                    "logind Unlock: unlocking the session");
+    log_lock.info("logind Unlock: unlocking the session");
     apply_lock_actions(lock_.force_unlock());
 }
 
@@ -6413,9 +6348,8 @@ void compositor_impl::on_prepare_for_sleep(bool start) {
         logind_.release_sleep_inhibitor();
         return;
     }
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.lock",
-                                    "system going to sleep: holding it until the session is "
-                                    "locked (at most 2 s)");
+    log_lock.info("system going to sleep: holding it until the session is "
+                  "locked (at most 2 s)");
     sleep_lock_deadline_ns_ = now_ns() + k_sleep_lock_wait_ns;
     rearm_lock_timer();
 }
@@ -6487,8 +6421,7 @@ void compositor_impl::post_output_op(const output_op& op) {
         if (ops_.size() >= k_max_ops) {
             // Bounded by the slots (one op in flight per slot and a few behind it): not
             // reachable by any sequence of uevents, which coalesce before they get here.
-            lx::trace::logger::global().log(lx::trace::level::error, "compositor.hotplug",
-                                            "output op queue full — op dropped");
+            log_hotplug.error("output op queue full — op dropped");
             return;
         }
         ops_.push_back(op);
@@ -6747,7 +6680,7 @@ void compositor_impl::render_add_output(const output_op& op) {
                 release_targets(*p);
                 p->mode = size;
                 if (auto targets = create_targets(*p, true); !targets) {
-                    lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+                    log_gfx.error(targets.get_error());
                     made = {};
                     continue;
                 }
@@ -6792,14 +6725,13 @@ void compositor_impl::render_add_output(const output_op& op) {
             }
             chosen = i;
             ok = true;
-            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.drm",
-                                             "output {} pipeline crtc={} (index {}) primary={} "
-                                             "connector={} mode={}x{}@{} cursor_plane={:d} "
-                                             "tests={}{}{}",
-                                             slot, d.crtc_id, d.crtc_index, d.primary_plane_id,
-                                             d.connector_id, m.width, m.height, m.refresh_mhz,
-                                             cursor_plane, tests, i > 0 ? " (fallback mode)" : "",
-                                             op.vrr ? (vrr ? " vrr" : " (vrr refused: off)") : "");
+            log_drm.info("output {} pipeline crtc={} (index {}) primary={} "
+                         "connector={} mode={}x{}@{} cursor_plane={:d} "
+                         "tests={}{}{}",
+                         slot, d.crtc_id, d.crtc_index, d.primary_plane_id, d.connector_id, m.width,
+                         m.height, m.refresh_mhz, cursor_plane, tests,
+                         i > 0 ? " (fallback mode)" : "",
+                         op.vrr ? (vrr ? " vrr" : " (vrr refused: off)") : "");
         }
         if (!ok)
             release_targets(*p);
@@ -6807,7 +6739,7 @@ void compositor_impl::render_add_output(const output_op& op) {
         p->mode = op.size;
         if (vulkan_present_ || gl_present_ || cpu_present_)
             if (auto targets = create_targets(*p, false); !targets)
-                lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+                log_gfx.error(targets.get_error());
     }
     output_pipeline* raw = p.get();
     if (ok)
@@ -6846,7 +6778,7 @@ void compositor_impl::render_test_mode(const output_op& op) {
             staged = std::make_unique<output_pipeline>();
             staged->mode = size;
             if (auto targets = create_targets(*staged, true); !targets) {
-                lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+                log_gfx.error(targets.get_error());
                 continue;
             }
         }
@@ -6929,7 +6861,7 @@ void compositor_impl::render_test_config(const config_test& t) {
         out = std::make_unique<output_pipeline>();
         out->mode = size;
         if (auto targets = create_targets(*out, true); !targets) {
-            lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+            log_gfx.error(targets.get_error());
             out.reset();
             return false;
         }
@@ -7059,7 +6991,7 @@ bool compositor_impl::apply_mode_switch(output_pipeline& p, unsigned frame) {
             fresh = std::make_unique<output_pipeline>();
             fresh->mode = size;
             if (auto targets = create_targets(*fresh, scanout); !targets) {
-                lx::trace::logger::global().log_error(targets.get_error(), "compositor.gfx");
+                log_gfx.error(targets.get_error());
                 p.switch_pending = false;
                 // Adaptive sync asked for with it still applies, by itself.
                 if (p.switch_vrr >= 0 && p.kms)
@@ -7125,11 +7057,9 @@ bool compositor_impl::apply_mode_switch(output_pipeline& p, unsigned frame) {
         p.apply_ticket = p.switch_ticket;
         p.switch_ticket = 0;
     }
-    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.drm",
-                                         "output {} switched to {}x{}@{} from frame {}", p.slot,
-                                         p.switch_mode.width, p.switch_mode.height,
-                                         p.switch_mode.refresh_mhz, frame);
+    if (log_drm.enabled(lx::trace::level::debug)) {
+        log_drm.debug("output {} switched to {}x{}@{} from frame {}", p.slot, p.switch_mode.width,
+                      p.switch_mode.height, p.switch_mode.refresh_mhz, frame);
     }
     return true;
 }
@@ -7155,7 +7085,7 @@ void compositor_impl::finish_retire(unsigned slot) {
         e.cursor = p->cursor.valid() ? &p->cursor : nullptr;
         lx::trace::scoped_span span{"render", "kms.disable"};
         if (auto off = drm::commit_modeset(kms, &e, 1, false); !off)
-            lx::trace::logger::global().log_error(off.get_error(), "compositor.drm");
+            log_drm.error(off.get_error());
     }
     if (p->kms) {
         // Nothing to give back to the console, and no event will be routed to it again.
@@ -7184,9 +7114,8 @@ void compositor_impl::on_retired(unsigned slot, unsigned gen) {
         slot_phase_[slot] = slot_phase::free;
         run_next_mgmt_job(); // a job may have waited for this slot
     }
-    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.hotplug",
-                                         "output {} pipeline retired", slot);
+    if (log_hotplug.enabled(lx::trace::level::debug)) {
+        log_hotplug.debug("output {} pipeline retired", slot);
     }
 }
 
@@ -7228,9 +7157,7 @@ void compositor_impl::apply_connector_scan(const drm::connector_scan& scan, bool
         op.gen = ++slot_gen_[s];
         op.connector_gone = e == nullptr;
         post_output_op(op);
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.hotplug",
-                                         "output {} add cancelled ({} gone again)", s,
-                                         pending_[s].probe.name);
+        log_hotplug.info("output {} add cancelled ({} gone again)", s, pending_[s].probe.name);
     }
     // A connector that failed is tried again once it changed (or was unplugged), and at every
     // resume (a failure may have been the VT switch racing the test).
@@ -7263,9 +7190,8 @@ void compositor_impl::apply_connector_scan(const drm::connector_scan& scan, bool
     if (ch.empty()) {
         // An identical scan (our own probe's detect, `udevadm trigger`, a same-layout
         // update): nothing moves, nobody is told (§B.7).
-        if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.hotplug",
-                                            "hotplug: no change");
+        if (log_hotplug.enabled(lx::trace::level::debug))
+            log_hotplug.debug("hotplug: no change");
         // A disabled monitor unplugged or plugged in changes no output, but the set of
         // connected monitors, whose setup may say otherwise.
         apply_connected_setup(scan);
@@ -7293,9 +7219,8 @@ void compositor_impl::apply_connector_scan(const drm::connector_scan& scan, bool
     // connected now say; a changed set of monitors applies its setup (ADR 008 §C.5).
     apply_connected_setup(scan);
     if (ch.dropped > 0)
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug",
-                                        "more connected monitors than output slots — the rest "
-                                        "stay off");
+        log_hotplug.warn("more connected monitors than output slots — the rest "
+                         "stay off");
     outputs_changed_now();
 }
 
@@ -7346,10 +7271,8 @@ int compositor_impl::add_output_from(const drm::connector_probe& e, const connec
     op.transform = static_cast<lx::buffer_transform>(pd.transform & 7u);
     slot_phase_[s] = slot_phase::adding;
     post_output_op(op);
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.hotplug",
-                                     "output {} connecting name={} preferred={}x{}@{} modes={}", s,
-                                     e.name, pd.modes[0].width, pd.modes[0].height,
-                                     pd.modes[0].refresh_mhz, e.mode_count);
+    log_hotplug.info("output {} connecting name={} preferred={}x{}@{} modes={}", s, e.name,
+                     pd.modes[0].width, pd.modes[0].height, pd.modes[0].refresh_mhz, e.mode_count);
     mark_heads_dirty();
     return slot;
 }
@@ -7383,10 +7306,9 @@ void compositor_impl::on_add_result(unsigned slot, unsigned gen, bool ok, unsign
             add_fallback_headless();
         if (failed_.size() < output_manager::k_max)
             failed_.push_back({pd.probe.connector_id, mode_list_hash(pd.probe)});
-        lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.hotplug",
-                                         "output {} not enabled: no CRTC, or none of its {} modes "
-                                         "passed TEST_ONLY — it stays off until it changes",
-                                         pd.probe.name, pd.mode_count);
+        log_hotplug.warn("output {} not enabled: no CRTC, or none of its {} modes "
+                         "passed TEST_ONLY — it stays off until it changes",
+                         pd.probe.name, pd.mode_count);
         return;
     }
     const drm::kms_mode& m = pd.modes[mode_index < pd.mode_count ? mode_index : 0];
@@ -7465,11 +7387,10 @@ void compositor_impl::on_add_result(unsigned slot, unsigned gen, bool ok, unsign
     mark_heads_dirty();
     const output_state& o = outputs.slot_state(slot);
     const lx::rect2i l = o.logical_rect();
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
-                                     "output {} added name={} identifier=\"{}\" mode={}x{}@{} "
-                                     "scale={:g} logical={}x{}+{}+{} windows_returned={}",
-                                     slot, o.name, o.identifier, o.mode.width, o.mode.height,
-                                     o.refresh_mhz, o.scale, l.width, l.height, l.x, l.y, back);
+    log_output.info("output {} added name={} identifier=\"{}\" mode={}x{}@{} "
+                    "scale={:g} logical={}x{}+{}+{} windows_returned={}",
+                    slot, o.name, o.identifier, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
+                    l.width, l.height, l.x, l.y, back);
     request_frame(1u << slot);
     run_next_mgmt_job();
 }
@@ -7514,10 +7435,9 @@ void compositor_impl::on_mode_tested(unsigned slot, unsigned gen, bool ok, unsig
         return;
     if (!ok) {
         const output_state& o = outputs.slot_state(slot);
-        lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.hotplug",
-                                         "output {} {}: no mode of its new list passed TEST_ONLY "
-                                         "— staying at {}x{}",
-                                         slot, o.name, o.mode.width, o.mode.height);
+        log_hotplug.warn("output {} {}: no mode of its new list passed TEST_ONLY "
+                         "— staying at {}x{}",
+                         slot, o.name, o.mode.width, o.mode.height);
         return;
     }
     const pending_output& pd = pending_[slot];
@@ -7549,9 +7469,8 @@ void compositor_impl::switch_output_mode(unsigned slot, const drm::kms_mode& mod
     }
     outputs.set_mode(slot, mode, follow, custom);
     outputs_changed_now();
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
-                                     "output {} mode {}x{}@{} (was {}x{}) — {}", slot, mode.width,
-                                     mode.height, mode.refresh_mhz, was.width, was.height, why);
+    log_output.info("output {} mode {}x{}@{} (was {}x{}) — {}", slot, mode.width, mode.height,
+                    mode.refresh_mhz, was.width, was.height, why);
     request_frame(1u << slot);
 }
 
@@ -7585,8 +7504,7 @@ void compositor_impl::add_fallback_headless() {
     // Windows stranded by an output that went while another was on its way, which then
     // failed to come up: the stand-in takes them in.
     (void)wm_.on_output_added(s);
-    lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
-                                     "output {} HEADLESS-1 stands in (no display connected)", s);
+    log_output.info("output {} HEADLESS-1 stands in (no display connected)", s);
 }
 
 void compositor_impl::remove_output(unsigned slot, bool connector_gone, const char* why) {
@@ -7670,24 +7588,20 @@ void compositor_impl::remove_output(unsigned slot, bool connector_gone, const ch
         wm_.set_suspend_reason(window_manager::suspend_power, live != 0 && dark == live);
     }
     advance_lock();
-    auto& log = lx::trace::logger::global();
     if (why)
-        log.logf(lx::trace::level::info, "compositor.output",
-                 "output {} disabled name={} identifier=\"{}\" windows_moved={} ({})", slot, name,
-                 identifier, moved, why);
+        log_output.info("output {} disabled name={} identifier=\"{}\" windows_moved={} ({})", slot,
+                        name, identifier, moved, why);
     else
-        log.logf(lx::trace::level::info, "compositor.output",
-                 "output {} removed name={} identifier=\"{}\" windows_moved={}{}", slot, name,
-                 identifier, moved, connector_gone ? " (connector gone)" : "");
+        log_output.info("output {} removed name={} identifier=\"{}\" windows_moved={}{}", slot,
+                        name, identifier, moved, connector_gone ? " (connector gone)" : "");
     mark_heads_dirty();
 }
 
 void compositor_impl::on_card_removed() {
     if (card_gone_.exchange(true, std::memory_order_acq_rel))
         return;
-    lx::trace::logger::global().log(lx::trace::level::error, "compositor.hotplug",
-                                    "DRM card removed — every display is gone; the session goes "
-                                    "on without one");
+    log_hotplug.error("DRM card removed — every display is gone; the session goes "
+                      "on without one");
     hotplug_.stop();
     for (unsigned s = 0; s < output_manager::k_max; ++s)
         if (outputs.slot_live(s) && outputs.slot_state(s).connector_id != 0)
@@ -7740,9 +7654,8 @@ void compositor_impl::sync_cursor_themes() {
         if (i == cursor_theme_count_)
             ++cursor_theme_count_;
         changed = true;
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.cursor",
-                                         "cursor theme={} size={} scale={}/120 (new output scale)",
-                                         cursor_themes_[i].name(), cursor_themes_[i].size(), s120);
+        log_cursor.info("cursor theme={} size={} scale={}/120 (new output scale)",
+                        cursor_themes_[i].name(), cursor_themes_[i].size(), s120);
     }
     if (!changed)
         return;
@@ -7984,16 +7897,14 @@ void compositor_impl::configure_outputs_at_start(const drm::connector_scan& scan
         const drm::connector_probe& e = scan.entries[entries[0]];
         set_connector_disabled(e.connector_id, false);
         (void)outputs.add_output(desc_from_probe(e, *e.preferred_mode()));
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.outputcfg",
-                                        "the persisted setup disables every monitor — enabling "
-                                        "the first");
+        log_outputcfg.warn("the persisted setup disables every monitor — enabling "
+                           "the first");
     }
     if (setup || outcfg_.config().monitor_count > 0) {
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.outputcfg",
-                                         "output configuration at start: {} monitor{}, setup {}, "
-                                         "{} disabled",
-                                         n, n == 1 ? "" : "s", setup ? "restored" : "new",
-                                         static_cast<unsigned>(disabled_connectors_.size()));
+        log_outputcfg.info("output configuration at start: {} monitor{}, setup {}, "
+                           "{} disabled",
+                           n, n == 1 ? "" : "s", setup ? "restored" : "new",
+                           static_cast<unsigned>(disabled_connectors_.size()));
     }
     if (outputs.count() == 0)
         (void)outputs.add_virtual("HEADLESS-1", {0, 0, 1920, 1080}, 60000);
@@ -8094,8 +8005,7 @@ void compositor_impl::apply_connected_setup(const drm::connector_scan& scan) {
         if (outputs.slot_live(slot))
             remove_output(slot, false, "disabled by the setup");
     if (setup)
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.outputcfg",
-                                        "connected monitors changed: their saved setup applied");
+        log_outputcfg.info("connected monitors changed: their saved setup applied");
     mark_heads_dirty();
 }
 
@@ -8680,13 +8590,11 @@ void compositor_impl::finish_mgmt_job(mgmt_result result, const char* why) {
     {
         char what[1024];
         describe_target(r.target, output_mgmt_heads(p0_), what, sizeof(what));
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.outputcfg",
-                                         "output configuration {} {}: {} ({})",
-                                         r.job.test ? "test" : "apply",
-                                         result == mgmt_result::succeeded ? "succeeded"
-                                         : result == mgmt_result::failed  ? "failed"
-                                                                          : "cancelled",
-                                         what[0] ? what : "-", why ? why : "");
+        log_outputcfg.info("output configuration {} {}: {} ({})", r.job.test ? "test" : "apply",
+                           result == mgmt_result::succeeded ? "succeeded"
+                           : result == mgmt_result::failed  ? "failed"
+                                                            : "cancelled",
+                           what[0] ? what : "-", why ? why : "");
     }
     r.active = false;
     r.waiting = 0;
@@ -8783,9 +8691,8 @@ void compositor_impl::outcfg_timer_callback() {
         } else if (r.waiting == 0) {
             self->complete_apply("an output it waited for went");
         } else {
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.outputcfg",
-                                            "apply: no modeset report within 3 s (an output is "
-                                            "waiting for its frame) — answered succeeded");
+            log_outputcfg.warn("apply: no modeset report within 3 s (an output is "
+                               "waiting for its frame) — answered succeeded");
             r.waiting = 0;
             self->complete_apply("modeset still pending");
         }
@@ -8819,9 +8726,8 @@ void compositor_impl::hotplug_timer_callback() {
     if (!active || !active->resume_probe_wait_)
         return;
     active->resume_probe_wait_ = false;
-    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug",
-                                    "VT resume: the connector probe took over 250 ms — resuming "
-                                    "with the outputs as they were");
+    log_hotplug.warn("VT resume: the connector probe took over 250 ms — resuming "
+                     "with the outputs as they were");
     active->finish_display_resume(active->resume_probe_gen_);
 }
 
@@ -8969,7 +8875,7 @@ void compositor_impl::render_loop() {
     // here, because every GL call from now on happens on this thread.
     if (gl_present_) {
         if (auto current = egl_.make_current(); !current) {
-            lx::trace::logger::global().log_error(current.get_error(), "compositor.gfx");
+            log_gfx.error(current.get_error());
             gl_present_ = false;
             headless_present_ = true;
         }
@@ -9060,7 +8966,7 @@ lx::result<void> compositor::start() {
     lx::trace::timeline_instant("startup", "start entered");
     if (!impl_) {
         const auto err = lx::invalid_argument("null impl");
-        lx::trace::logger::global().log_error(err, "compositor");
+        log_compositor.error(err);
         return err;
     }
 
@@ -9127,37 +9033,31 @@ lx::result<void> compositor::start() {
             if (opened) {
                 impl_->drm_via_logind_ = via_logind;
                 impl_->drm_start_inactive_ = via_logind && inactive;
-                lx::trace::logger::global().logf(
-                    lx::trace::level::info, "compositor.drm",
-                    "card {} ({}): {} connected of {} connectors{}", c.path,
-                    c.driver[0] ? c.driver : "?", c.connected, c.connectors,
-                    c.boot_vga ? ", boot VGA" : "");
+                log_drm.info("card {} ({}): {} connected of {} connectors{}", c.path,
+                             c.driver[0] ? c.driver : "?", c.connected, c.connectors,
+                             c.boot_vga ? ", boot VGA" : "");
             } else {
                 // A card logind gave us and we cannot use goes back, or it stays paused-ours.
                 if (via_logind && taken_dev != 0)
                     impl_->logind_.release_device(major(taken_dev), minor(taken_dev));
                 const lx::error err = opened.get_error();
-                lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.drm",
-                                                 "card {} ({}) not usable: {}", c.path,
-                                                 c.driver[0] ? c.driver : "?", err.message);
+                log_drm.warn("card {} ({}) not usable: {}", c.path, c.driver[0] ? c.driver : "?",
+                             err.message);
                 // No atomic modesetting is usually a module option away (nouveau before
                 // Linux 7.4): say what to do, not only what failed.
                 if (err.domain == lx::error_domain::drm &&
                     err.code == static_cast<int>(lx::drm_err::no_atomic))
-                    lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.drm",
-                                                     "card {} ({}): {}", c.path,
-                                                     c.driver[0] ? c.driver : "?",
-                                                     drm::no_atomic_hint(c.driver));
+                    log_drm.warn("card {} ({}): {}", c.path, c.driver[0] ? c.driver : "?",
+                                 drm::no_atomic_hint(c.driver));
             }
         }
         if (!opened) {
             // Each card's reason is logged above; this is the outcome.
-            lx::trace::logger::global().log_error(
-                cards.count == 0 ? opened.get_error()
-                                 : lx::make_error(lx::drm_err::open_failed,
-                                                  "no display device usable: running on a "
-                                                  "virtual output (HEADLESS-1), nothing on screen"),
-                "compositor.drm");
+            log_drm.error(cards.count == 0
+                              ? opened.get_error()
+                              : lx::make_error(lx::drm_err::open_failed,
+                                               "no display device usable: running on a "
+                                               "virtual output (HEADLESS-1), nothing on screen"));
         }
         if (opened) {
             impl_->kms = std::move(opened).value();
@@ -9178,16 +9078,12 @@ lx::result<void> compositor::start() {
                 }
             }
             if (impl_->drm_present_ && impl_->drm_start_inactive_) {
-                lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm",
-                                                "KMS device open, session inactive — scanout "
-                                                "starts when the session is switched to");
+                log_drm.info("KMS device open, session inactive — scanout "
+                             "starts when the session is switched to");
             } else if (impl_->drm_present_) {
-                lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm",
-                                                "KMS device open — page-flip present path");
+                log_drm.info("KMS device open — page-flip present path");
             } else if (impl_->kms.card_fd() >= 0) {
-                lx::trace::logger::global().log(
-                    lx::trace::level::warn, "compositor.drm",
-                    "card open without DRM master — scanout disabled (nested session)");
+                log_drm.warn("card open without DRM master — scanout disabled (nested session)");
             }
         }
     }
@@ -9221,14 +9117,13 @@ lx::result<void> compositor::start() {
             impl_->ensure_graphics_device();
         } else {
             impl_->headless_present_ = true;
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                            "no hardware Vulkan — Vulkan device not created");
+            log_gfx.info("no hardware Vulkan — Vulkan device not created");
         }
     }
 
     if (impl_->headless_present_) {
         if (auto hr = impl_->headless_.create(64, 64); !hr) {
-            lx::trace::logger::global().log_error(hr.get_error(), "compositor.gfx");
+            log_gfx.error(hr.get_error());
         }
     }
 
@@ -9281,10 +9176,9 @@ lx::result<void> compositor::start() {
             impl_->drm_present_) {
             present = impl_->setup_vulkan_present();
             if (present) {
-                lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                                "Vulkan composite path active");
+                log_gfx.info("Vulkan composite path active");
             } else if (!automatic) {
-                lx::trace::logger::global().log_error(present.get_error(), "compositor.gfx");
+                log_gfx.error(present.get_error());
             }
         }
 
@@ -9293,10 +9187,9 @@ lx::result<void> compositor::start() {
             if (present) {
                 // The context stays current here until the outputs' scanout targets exist
                 // (`create_pipelines`); then it moves to the render thread.
-                lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                                "GL composite path active (EGL/GLES on GBM)");
+                log_gfx.info("GL composite path active (EGL/GLES on GBM)");
             } else if (requested == present_backend::gl) {
-                lx::trace::logger::global().log_error(present.get_error(), "compositor.gfx");
+                log_gfx.error(present.get_error());
             }
         }
 
@@ -9305,10 +9198,9 @@ lx::result<void> compositor::start() {
             impl_->ensure_graphics_device();
             present = impl_->setup_cpu_present();
             if (present) {
-                lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                                "CPU composite path active");
+                log_gfx.info("CPU composite path active");
             } else if (requested == present_backend::cpu) {
-                lx::trace::logger::global().log_error(present.get_error(), "compositor.gfx");
+                log_gfx.error(present.get_error());
             }
         }
 
@@ -9318,20 +9210,19 @@ lx::result<void> compositor::start() {
             impl_->ensure_graphics_device();
             present = impl_->setup_vulkan_present();
             if (present) {
-                lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                                "Vulkan composite path active (no scanout)");
+                log_gfx.info("Vulkan composite path active (no scanout)");
             }
         }
 
         if (!present) {
-            lx::trace::logger::global().log_error(present.get_error(), "compositor.gfx");
+            log_gfx.error(present.get_error());
             impl_->headless_present_ = true;
             impl_->cpu_present_ = false;
             impl_->vulkan_present_ = false;
             impl_->gl_present_ = false;
             if (impl_->headless_.width() == 0) {
                 if (auto created = impl_->headless_.create(64, 64); !created)
-                    lx::trace::logger::global().log_error(created.get_error(), "compositor.gfx");
+                    log_gfx.error(created.get_error());
             }
         }
     }
@@ -9344,8 +9235,7 @@ lx::result<void> compositor::start() {
     if (impl_->gl_present_ && impl_->graphics.vk_device()) {
         impl_->graphics = gfx::device{};
         impl_->graphics.syncobj().set_drm_fd(impl_->kms.card_fd());
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.gfx",
-                                        "Vulkan device released (unused on the GL path)");
+        log_gfx.info("Vulkan device released (unused on the GL path)");
     }
 #if defined(__GLIBC__)
     // Start-up frees a lot (instance probing, a released device, driver set-up), and glibc
@@ -9412,7 +9302,7 @@ lx::result<void> compositor::start() {
         }
     }
     if (auto made = impl_->create_pipelines(); !made) {
-        lx::trace::logger::global().log_error(made.get_error(), "compositor.drm");
+        log_drm.error(made.get_error());
         if (impl_->drm_present_) {
             // No output can be driven: composite nowhere rather than fail every frame.
             for (auto& p : impl_->pipes_)
@@ -9431,18 +9321,17 @@ lx::result<void> compositor::start() {
         const output_state o0 = impl_->outputs.state(impl_->outputs.nth(0));
         const lx::rect2i g = o0.mode_rect();
         const lx::rect2i l = o0.logical_rect();
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.output",
-                                         "output 0 mode={}x{} refresh_mhz={} scale={:g} ({}/120) "
-                                         "logical={}x{}",
-                                         g.width, g.height, o0.refresh_mhz, o0.scale,
-                                         std::lround(o0.scale * 120.0), l.width, l.height);
+        log_output.info("output 0 mode={}x{} refresh_mhz={} scale={:g} ({}/120) "
+                        "logical={}x{}",
+                        g.width, g.height, o0.refresh_mhz, o0.scale, std::lround(o0.scale * 120.0),
+                        l.width, l.height);
     }
     impl_->log_outputs();
     impl_->output_generation_ = impl_->outputs.generation();
 
     lx::trace::timeline_instant("startup", "outputs ready");
     if (auto bound = impl_->wayland.bind(impl_->cfg.socket_name); !bound) {
-        lx::trace::logger::global().log_error(bound.get_error(), "compositor");
+        log_compositor.error(bound.get_error());
         return bound.get_error();
     }
 
@@ -9485,12 +9374,11 @@ lx::result<void> compositor::start() {
             }
             if (impl->cursor_themes_[i].max_dimension() > need)
                 need = impl->cursor_themes_[i].max_dimension();
-            lx::trace::logger::global().logf(
-                lx::trace::level::info, "compositor.cursor",
-                "cursor theme={} size={} scale={}/120 from_theme={} "
-                "builtin={}",
-                impl->cursor_themes_[i].name(), impl->cursor_themes_[i].size(), scales[i],
-                impl->cursor_themes_[i].from_theme(), impl->cursor_themes_[i].builtin());
+            log_cursor.info("cursor theme={} size={} scale={}/120 from_theme={} "
+                            "builtin={}",
+                            impl->cursor_themes_[i].name(), impl->cursor_themes_[i].size(),
+                            scales[i], impl->cursor_themes_[i].from_theme(),
+                            impl->cursor_themes_[i].builtin());
         }
         impl->cursor_theme_count_ = n;
         impl->cursor_base_px_ = base;
@@ -9530,19 +9418,15 @@ lx::result<void> compositor::start() {
                 why_software = "an output has no cursor plane";
         }
         if (!why_software && planes > 0) {
-            lx::trace::logger::global().logf(
-                lx::trace::level::info, "compositor.cursor",
-                "hardware cursor planes={} size={}x{} hotspot={}", planes, plane_size.width,
-                plane_size.height, impl->kms.cursor_hotspot_cap());
+            log_cursor.info("hardware cursor planes={} size={}x{} hotspot={}", planes,
+                            plane_size.width, plane_size.height, impl->kms.cursor_hotspot_cap());
         } else {
             // Software everywhere: the planes stay off (a cursor shown on some outputs by a
             // plane and on others by the scene would draw it twice where they meet).
             for (auto& p : impl->pipes_)
                 if (p && p->cursor.valid())
                     p->cursor = drm::kms_cursor_plane{};
-            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.cursor",
-                                             "software cursor: {}",
-                                             why_software ? why_software : "no cursor plane");
+            log_cursor.info("software cursor: {}", why_software ? why_software : "no cursor plane");
         }
 
         cursor_manager::setup setup{};
@@ -9590,7 +9474,7 @@ lx::result<void> compositor::start() {
     }
 
     if (auto installed = impl_->shell_bridge_.install(impl_->cfg.shell_binary_path); !installed) {
-        lx::trace::logger::global().log_error(installed.get_error(), "compositor");
+        log_compositor.error(installed.get_error());
         return installed.get_error();
     }
 
@@ -9680,14 +9564,12 @@ lx::result<void> compositor::start() {
         const bool worker = impl_->cfg.worker_thread_count > 0;
         if (auto monitor = impl_->hotplug_.start(impl_->kms, card, impl_->loop, worker, host);
             monitor) {
-            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.hotplug",
-                                             "hotplug: udev monitor on drm {}:{}",
-                                             impl_->drm_major_, impl_->drm_minor_);
+            log_hotplug.info("hotplug: udev monitor on drm {}:{}", impl_->drm_major_,
+                             impl_->drm_minor_);
         } else {
-            lx::trace::logger::global().log_error(monitor.get_error(), "compositor.hotplug");
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.hotplug",
-                                            "no hotplug monitor — connectors are probed again "
-                                            "only when the session resumes");
+            log_hotplug.error(monitor.get_error());
+            log_hotplug.warn("no hotplug monitor — connectors are probed again "
+                             "only when the session resumes");
             impl_->hotplug_.attach(impl_->kms, impl_->loop, worker, host);
         }
         impl_->hotplug_ready_ = true;
@@ -9754,7 +9636,7 @@ lx::result<void> compositor::start() {
             static_cast<detail::compositor_impl*>(u)->record_session_event(ev);
         };
         if (auto listening = impl_->logind_.set_listener(listener); !listening)
-            lx::trace::logger::global().log_error(listening.get_error(), "compositor.session");
+            log_session.error(listening.get_error());
         // Before-sleep locking: sleep waits (at most 2 s of ours) for the lock a shell starts
         // on lock_requested(sleep). Only the session's display server holds it.
         if (impl_->logind_.has_control())
@@ -9774,21 +9656,18 @@ lx::result<void> compositor::start() {
     // The pause/resume machine runs only where there is a display to lose. Starting while
     // the session is in the background pauses right away (input is held until the switch).
     {
-        lx::trace::logger::global().logf(
-            lx::trace::level::info, "compositor.session",
-            "session {} vt={} can_switch_vt={} active={} drm={}:{} found={} type={}",
-            impl_->logind_.session_id()[0] ? impl_->logind_.session_id() : "-",
-            impl_->logind_.vt_number(), impl_->logind_.can_switch_vt() ? 1 : 0,
-            impl_->logind_.is_active() ? 1 : 0, impl_->drm_major_, impl_->drm_minor_,
-            session::session_found_by_name(impl_->logind_.found_by()),
-            impl_->logind_.session_type()[0] ? impl_->logind_.session_type() : "-");
+        log_session.info("session {} vt={} can_switch_vt={} active={} drm={}:{} found={} type={}",
+                         impl_->logind_.session_id()[0] ? impl_->logind_.session_id() : "-",
+                         impl_->logind_.vt_number(), impl_->logind_.can_switch_vt() ? 1 : 0,
+                         impl_->logind_.is_active() ? 1 : 0, impl_->drm_major_, impl_->drm_minor_,
+                         session::session_found_by_name(impl_->logind_.found_by()),
+                         impl_->logind_.session_type()[0] ? impl_->logind_.session_type() : "-");
         impl_->apply_session_actions(impl_->session_.init(
             impl_->drm_present_, impl_->drm_major_, impl_->drm_minor_, impl_->drm_start_inactive_));
     }
 
     impl_->request_frame();
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor",
-                                    "threads: ui(main)+render+worker; frame clocks armed");
+    log_compositor.info("threads: ui(main)+render+worker; frame clocks armed");
 
     // After the socket is served: the control socket, the session environment, READY.
     impl_->apply_initial_config();
@@ -10061,10 +9940,9 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
                                         : detail::compositor_impl::k_callback_stall_ns);
             if (!kms_output || o.present_completed || stalled) {
                 if (stalled && !o.present_completed && kms_output) {
-                    lx::trace::logger::global().logf(lx::trace::level::warn, "compositor",
-                                                     "no present in 250ms on output {} — pacing "
-                                                     "frame callbacks by tick",
-                                                     slot);
+                    log_compositor.warn("no present in 250ms on output {} — pacing "
+                                        "frame callbacks by tick",
+                                        slot);
                 }
                 o.present_completed = false;
                 o.callback_release_ns = 0;
@@ -10184,8 +10062,7 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         // timeline as an instant, so a stutter can be told apart from a frame that had
         // nothing new.
         lx::trace::timeline_instant("ui", "publish_dropped");
-        lx::trace::logger::global().log(lx::trace::level::trace, "compositor",
-                                        "frame dropped (backpressure)");
+        log_compositor.trace("frame dropped (backpressure)");
     }
 
     // Idle inhibitors (I3): honoured while their surface was on screen on a lit output in
@@ -10196,9 +10073,8 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
         if (impl->idle_.set_inhibited(inhibited,
                                       static_cast<unsigned long long>(tick.timestamp_ns))) {
             impl->rearm_idle_timer();
-            if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.idle",
-                                                inhibited ? "idle inhibited=1" : "idle inhibited=0");
+            if (log_idle.enabled(lx::trace::level::debug))
+                log_idle.debug("{}", inhibited ? "idle inhibited=1" : "idle inhibited=0");
         }
     }
 
@@ -10293,11 +10169,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     }
     if (++impl->ui_budget_window_ >= detail::compositor_impl::k_budget_report_frames) {
         if (impl->ui_over_budget_ > 0) {
-            lx::trace::logger::global().logf(lx::trace::level::warn, "compositor",
-                                             "tick_ui over budget in recent frames ({} of {}, "
-                                             "worst {} us)",
-                                             impl->ui_over_budget_, impl->ui_budget_window_,
-                                             impl->ui_over_budget_max_us_);
+            log_compositor.warn("tick_ui over budget in recent frames ({} of {}, "
+                                "worst {} us)",
+                                impl->ui_over_budget_, impl->ui_budget_window_,
+                                impl->ui_over_budget_max_us_);
         }
         impl->ui_over_budget_ = 0;
         impl->ui_over_budget_max_us_ = 0;
@@ -10356,7 +10231,7 @@ void compositor::tick_render() {
             // refuses the resume for a CRTC left enabled without connectors.
             reread = true;
             if (auto again = impl->kms.enumerate_resources(); !again)
-                lx::trace::logger::global().log_error(again.get_error(), "compositor.drm");
+                log_drm.error(again.get_error());
         }
         impl->run_resume_procedure(*up, gen);
     }
@@ -10493,19 +10368,17 @@ void compositor::tick_render() {
 
     // One line per output that did something; an idle tick is silent. Checked before
     // formatting so the frame path pays nothing when debug is off.
-    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+    if (log_render.enabled(lx::trace::level::debug)) {
         for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
             const char* kind = commit_kinds[slot] ? commit_kinds[slot] : "none";
             if (!composited[slot] && kind[0] == 'n')
                 continue;
             const detail::output_pipeline* p = impl->pipes_[slot].get();
-            lx::trace::logger::global().logf(
-                lx::trace::level::debug, "compositor.render",
-                "frame={} composite={} rects={} area={} commit={} "
-                "render_us={} output={}",
-                p ? p->rendered_frame.load(std::memory_order_relaxed) : -1LL,
-                composited[slot] ? 1 : 0, rects[slot], areas[slot], kind,
-                p ? p->render_cost_us.load(std::memory_order_relaxed) : 0u, slot);
+            log_render.debug("frame={} composite={} rects={} area={} commit={} "
+                             "render_us={} output={}",
+                             p ? p->rendered_frame.load(std::memory_order_relaxed) : -1LL,
+                             composited[slot] ? 1 : 0, rects[slot], areas[slot], kind,
+                             p ? p->render_cost_us.load(std::memory_order_relaxed) : 0u, slot);
         }
     }
 }
@@ -10598,7 +10471,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                                        p.gl[back].width(), p.gl[back].height(), snapshot, region,
                                        &chrome_atlas_);
             if (!c) {
-                lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
+                log_render.error(c.get_error());
             } else {
                 drawn = true;
                 // This frame supersedes any uncommitted one, so its fence replaces that
@@ -10630,17 +10503,15 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             auto c = painter_.paint_cpu(cpu_compositor_, ui_cpu_.get(), target, snapshot, region,
                                         &chrome_atlas_);
             if (!c) {
-                lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
+                log_render.error(c.get_error());
             } else {
                 drawn = true;
                 const auto stats = c.value().composite;
                 if (stats.draws_skipped > 0 || c.value().ui.primitives_skipped > 0)
-                    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                                    "draw referenced an unregistered texture");
+                    log_render.warn("draw referenced an unregistered texture");
                 if (stats.draws_unsupported > 0)
-                    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                                    "draw format has no conversion to the "
-                                                    "scanout format — surface not shown");
+                    log_render.warn("draw format has no conversion to the "
+                                    "scanout format — surface not shown");
             }
         } else if (vulkan_present_) {
             // Vulkan repaints the whole target, which is correct for any buffer age. A frame
@@ -10649,7 +10520,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             auto c = painter_.paint_vk(vk_compositor_, ui_vk_.get(), p.vk[back], snapshot,
                                        &chrome_atlas_);
             if (!c) {
-                lx::trace::logger::global().log_error(c.get_error(), "compositor.render");
+                log_render.error(c.get_error());
             } else {
                 drawn = true;
                 p.discard_fence();
@@ -10770,7 +10641,7 @@ bool compositor_impl::capture_paint_cpu(void* user, const gfx::pixel_surface& ds
                                                 {blits, count}, offset, clear, region,
                                                 &c.chrome_atlas_);
     if (!painted)
-        lx::trace::logger::global().log_error(painted.get_error(), "compositor.capture");
+        log_capture.error(painted.get_error());
     return static_cast<bool>(painted);
 }
 
@@ -10784,7 +10655,7 @@ bool compositor_impl::capture_paint_gl(void* user, unsigned framebuffer, unsigne
                                                height, *ctx->snap, {blits, count}, offset, clear,
                                                region, &c.chrome_atlas_);
     if (!painted)
-        lx::trace::logger::global().log_error(painted.get_error(), "compositor.capture");
+        log_capture.error(painted.get_error());
     return static_cast<bool>(painted);
 }
 
@@ -10833,15 +10704,14 @@ void compositor_impl::catch_up_slots(output_pipeline& p) {
             continue;
         lx::trace::scoped_span span{"render", "catch_up_slot"};
         if (auto ok = gl_compositor_.copy_region(p.gl[front], p.gl[i], region); !ok) {
-            lx::trace::logger::global().log_error(ok.get_error(), "compositor.render");
+            log_render.error(ok.get_error());
             catch_up_failed_ = true;
             return;
         }
         p.slot_age[i].clear();
-        if (lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.render",
-                                             "slot catch-up output={} slot={} from={} area={}",
-                                             p.slot, i, front, area);
+        if (log_render.enabled(lx::trace::level::debug))
+            log_render.debug("slot catch-up output={} slot={} from={} area={}", p.slot, i, front,
+                             area);
     }
 }
 
@@ -10910,10 +10780,9 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
                 p.master_lost_since_ns = now;
             else if (now - p.master_lost_since_ns > 1'000'000'000 && !p.master_lost_reported) {
                 p.master_lost_reported = true;
-                lx::trace::logger::global().log_error(committed.get_error(), "compositor.drm");
-                lx::trace::logger::global().log(lx::trace::level::warn, "compositor.drm",
-                                                "DRM master lost and the session did not pause "
-                                                "(no logind?) — retrying every frame");
+                log_drm.error(committed.get_error());
+                log_drm.warn("DRM master lost and the session did not pause "
+                             "(no logind?) — retrying every frame");
             }
         } else if (committed) {
             p.master_lost_since_ns = 0;
@@ -10959,11 +10828,10 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
             // Expected; nothing to report.
         } else if (!committed && !p.drm_commit_failing) {
             p.drm_commit_failing = true;
-            lx::trace::logger::global().log_error(committed.get_error(), "compositor.drm");
+            log_drm.error(committed.get_error());
         } else if (committed && p.drm_commit_failing) {
             p.drm_commit_failing = false;
-            lx::trace::logger::global().log(lx::trace::level::info, "compositor.drm",
-                                            "atomic commit recovered");
+            log_drm.info("atomic commit recovered");
         }
         (void)composited;
         return kind;
@@ -10998,7 +10866,7 @@ const char* compositor_impl::commit_output(output_pipeline& p, unsigned slot, bo
         test.request_page_flip = false;
         test.test_only = true;
         if (!p.kms->commit(test) && p.kms->last_failure_rejected_state()) {
-            lx::trace::logger::global().log_error(committed.get_error(), "compositor.cursor");
+            log_cursor.error(committed.get_error());
             fail_cursor_plane("cursor-only commit rejected");
             p.cursor.set_visible(false);
         }
@@ -11055,11 +10923,10 @@ void compositor_impl::commit_pending_modesets(const char** kinds) {
     if (!committed && group[0]->kms->last_failure_rejected_state()) {
         // The combined state was refused: each output on its own, so one output the driver
         // cannot drive does not keep the others dark.
-        lx::trace::logger::global().log_error(committed.get_error(), "compositor.drm");
+        log_drm.error(committed.get_error());
         if (ready > 1)
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.drm",
-                                            "combined modeset refused — modesetting each output "
-                                            "on its own");
+            log_drm.warn("combined modeset refused — modesetting each output "
+                         "on its own");
         fallback = true;
     }
     for (unsigned i = 0; i < ready; ++i) {
@@ -11089,18 +10956,16 @@ void compositor_impl::commit_pending_modesets(const char** kinds) {
             note_committed_input(p, true);
             // A content commit that is also the modeset (the frame rides it).
             kinds[p.slot] = "content";
-            if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.drm",
-                                                 "modeset output={} frame={} outputs={}{}", p.slot,
-                                                 p.composited_frame, fallback ? 1u : ready,
-                                                 fallback ? " (alone)" : "");
+            if (log_drm.enabled(lx::trace::level::debug)) {
+                log_drm.debug("modeset output={} frame={} outputs={}{}", p.slot, p.composited_frame,
+                              fallback ? 1u : ready, fallback ? " (alone)" : "");
             }
         } else {
             kinds[p.slot] = lost ? "paused" : "failed";
             retract_commit_timing(p);
             if (!lost && !p.drm_commit_failing) {
                 p.drm_commit_failing = true;
-                lx::trace::logger::global().log_error(r.get_error(), "compositor.drm");
+                log_drm.error(r.get_error());
             }
         }
         if (p.apply_ticket) {

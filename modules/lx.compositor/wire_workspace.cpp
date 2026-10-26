@@ -56,7 +56,7 @@ namespace lx::compositor::p0 {
 
 namespace {
 
-constexpr const char* k_category = "compositor.workspace";
+constexpr lx::trace::category log_workspace{"compositor.workspace"};
 /// Requests one commit may carry; more are dropped (logged) — a client that sends hundreds of
 /// activations before a commit gets the first ones.
 constexpr unsigned k_max_pending = 32;
@@ -110,10 +110,6 @@ struct manager_obj {
 
 manager_obj* g_managers = nullptr;
 unsigned g_manager_count = 0;
-
-[[nodiscard]] bool ws_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
 
 unsigned long long text_hash(const char* s) {
     unsigned long long h = 1469598103934665603ull;
@@ -223,10 +219,9 @@ void queue(manager_obj* m, const pending_request& r) {
     if (!m || m->stopped)
         return;
     if (m->pending_count == k_max_pending) {
-        if (ws_debug())
-            lx::trace::logger::global().log(lx::trace::level::debug, k_category,
-                                            "ext-workspace: too many requests before commit; "
-                                            "dropped");
+        if (log_workspace.enabled(lx::trace::level::debug))
+            log_workspace.debug("ext-workspace: too many requests before commit; "
+                                "dropped");
         return;
     }
     m->pending[m->pending_count++] = r;
@@ -265,9 +260,8 @@ void run_pending(manager_obj* m) {
         return;
     // The model does not change behind the lock (W.6): a bar's click there is dropped.
     if (g_p0_ctx->lock && g_p0_ctx->lock->state() != lock_state::unlocked) {
-        if (ws_debug())
-            lx::trace::logger::global().log(lx::trace::level::debug, k_category,
-                                            "ext-workspace: commit while locked; ignored");
+        if (log_workspace.enabled(lx::trace::level::debug))
+            log_workspace.debug("ext-workspace: commit while locked; ignored");
         return;
     }
     pending_request reqs[k_max_pending];
@@ -516,11 +510,9 @@ void bind_workspace_manager(wayland::client_connection& client, unsigned id, int
     g_p0_ctx->wm->sync_workspace_outputs(true);
     (void)sync_manager(m, g_p0_ctx->wm->workspaces());
     finish_manager(m, true);
-    if (ws_debug())
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
-                                         "ext-workspace bind client={} version={} workspaces={}",
-                                         client.id(), version,
-                                         g_p0_ctx->wm->workspaces().count());
+    if (log_workspace.enabled(lx::trace::level::debug))
+        log_workspace.debug("ext-workspace bind client={} version={} workspaces={}", client.id(),
+                            version, g_p0_ctx->wm->workspaces().count());
 }
 
 void workspace_output_bound(wl_client* client, wl_resource* output, unsigned slot) {

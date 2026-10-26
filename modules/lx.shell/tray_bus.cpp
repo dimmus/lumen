@@ -24,7 +24,7 @@ import :user_bus;
 
 namespace {
 
-constexpr const char* k_tray_category = "shell.tray";
+constexpr lx::trace::category log_tray{"shell.tray"};
 constexpr const char* k_watcher_name = "org.kde.StatusNotifierWatcher";
 constexpr const char* k_watcher_path = "/StatusNotifierWatcher";
 constexpr const char* k_watcher_iface = "org.kde.StatusNotifierWatcher";
@@ -32,10 +32,6 @@ constexpr const char* k_item_iface = "org.kde.StatusNotifierItem";
 constexpr const char* k_menu_iface = "com.canonical.dbusmenu";
 constexpr unsigned k_menu_max_items = 256;
 constexpr unsigned k_menu_max_depth = 8;
-
-[[nodiscard]] bool tray_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
 
 } // namespace
 
@@ -272,9 +268,7 @@ struct lx::shell::tray_service::events {
         if (t.registry_.add_item(id)) {
             (void)sd_bus_emit_signal(static_cast<sd_bus*>(t.bus_), k_watcher_path, k_watcher_iface,
                                      "StatusNotifierItemRegistered", "s", id.c_str());
-            lx::trace::logger::global().logf(lx::trace::level::info, k_tray_category,
-                                             "tray: item registered {} (by {})", id,
-                                             sender ? sender : "?");
+            log_tray.info("tray: item registered {} (by {})", id, sender ? sender : "?");
             t.add_item(bus, path, false);
         }
         return sd_bus_reply_method_return(m, "");
@@ -318,10 +312,9 @@ struct lx::shell::tray_service::events {
     static int item_signal(sd_bus_message* m, void* data, sd_bus_error*) {
         auto* r = static_cast<item_rec*>(data);
         r->refresh = true;
-        if (tray_debug())
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_tray_category,
-                                             "tray: {} signals {}", r->service,
-                                             sd_bus_message_get_member(m) ? sd_bus_message_get_member(m) : "?");
+        if (log_tray.enabled(lx::trace::level::debug))
+            log_tray.debug("tray: {} signals {}", r->service,
+                           sd_bus_message_get_member(m) ? sd_bus_message_get_member(m) : "?");
         return 0;
     }
 
@@ -332,8 +325,7 @@ struct lx::shell::tray_service::events {
             return 0;
         if (new_owner && *new_owner)
             return 0;
-        lx::trace::logger::global().logf(lx::trace::level::info, k_tray_category,
-                                         "tray: item {} left the bus", r->service);
+        log_tray.info("tray: item {} left the bus", r->service);
         r->owner->remove_item(r, true);
         return 0;
     }
@@ -345,17 +337,15 @@ struct lx::shell::tray_service::events {
         if (sd_bus_message_is_method_error(m, nullptr)) {
             const sd_bus_error* e = sd_bus_message_get_error(m);
             if (!r->fetched) {
-                lx::trace::logger::global().logf(lx::trace::level::info, k_tray_category,
-                                                 "tray: item {} not reachable ({}): dropped",
-                                                 r->service, e && e->name ? e->name : "error");
+                log_tray.info("tray: item {} not reachable ({}): dropped", r->service,
+                              e && e->name ? e->name : "error");
                 t.remove_item(r, true);
             }
             return 0;
         }
         const bool first = !r->fetched;
         if (parse_properties(m, *r) < 0) {
-            lx::trace::logger::global().logf(lx::trace::level::warn, k_tray_category,
-                                             "tray: item {}: malformed properties", r->service);
+            log_tray.warn("tray: item {}: malformed properties", r->service);
             if (first) {
                 t.remove_item(r, true);
                 return 0;
@@ -365,16 +355,13 @@ struct lx::shell::tray_service::events {
         ++r->rev;
         ++t.rev_;
         if (first)
-            lx::trace::logger::global().logf(
-                lx::trace::level::info, k_tray_category,
-                "tray: item {} id=\"{}\" title=\"{}\" status={} icon={}{} menu={}", r->service, r->id,
-                r->title, r->status.empty() ? "?" : r->status,
-                r->icon_name.empty() ? "-" : r->icon_name,
-                r->icon.empty() ? "" : " (pixmap)", r->has_menu() ? r->menu_path : "-");
-        else if (tray_debug())
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_tray_category,
-                                             "tray: item {} updated status={} icon={}", r->service,
-                                             r->status, r->icon_name);
+            log_tray.info("tray: item {} id=\"{}\" title=\"{}\" status={} icon={}{} menu={}",
+                          r->service, r->id, r->title, r->status.empty() ? "?" : r->status,
+                          r->icon_name.empty() ? "-" : r->icon_name,
+                          r->icon.empty() ? "" : " (pixmap)", r->has_menu() ? r->menu_path : "-");
+        else if (log_tray.enabled(lx::trace::level::debug))
+            log_tray.debug("tray: item {} updated status={} icon={}", r->service, r->status,
+                           r->icon_name);
         if (r->refresh && !r->fetch_slot) {
             r->refresh = false;
             t.fetch(*r);
@@ -527,22 +514,18 @@ struct lx::shell::tray_service::events {
         void* user = t.layout_user_;
         if (sd_bus_message_is_method_error(m, nullptr)) {
             const sd_bus_error* e = sd_bus_message_get_error(m);
-            lx::trace::logger::global().logf(lx::trace::level::info, k_tray_category,
-                                             "tray: menu of item {}: {}", key,
-                                             e && e->name ? e->name : "error");
+            log_tray.info("tray: menu of item {}: {}", key, e && e->name ? e->name : "error");
             return 0;
         }
         menu_entry root{};
         unsigned revision = 0;
         if (!parse_dbusmenu_layout(m, root, &revision)) {
-            lx::trace::logger::global().logf(lx::trace::level::warn, k_tray_category,
-                                             "tray: menu of item {}: malformed layout", key);
+            log_tray.warn("tray: menu of item {}: malformed layout", key);
             return 0;
         }
-        if (tray_debug())
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_tray_category,
-                                             "tray: menu of item {} revision {} items {}", key,
-                                             revision, root.children.size());
+        if (log_tray.enabled(lx::trace::level::debug))
+            log_tray.debug("tray: menu of item {} revision {} items {}", key, revision,
+                           root.children.size());
         if (fn)
             fn(key, std::move(root.children), user);
         return 0;
@@ -557,10 +540,10 @@ struct lx::shell::tray_service::events {
     }
 
     static int ignore_reply(sd_bus_message* m, void*, sd_bus_error*) {
-        if (tray_debug() && sd_bus_message_is_method_error(m, nullptr)) {
+        if (log_tray.enabled(lx::trace::level::debug) &&
+            sd_bus_message_is_method_error(m, nullptr)) {
             const sd_bus_error* e = sd_bus_message_get_error(m);
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_tray_category,
-                                             "tray: call failed: {}", e && e->name ? e->name : "?");
+            log_tray.debug("tray: call failed: {}", e && e->name ? e->name : "?");
         }
         return 0;
     }
@@ -599,9 +582,7 @@ bool lx::shell::tray_service::attach_raw(void* b) {
     const int r = sd_bus_add_object_vtable(static_cast<sd_bus*>(b), &slot, k_watcher_path,
                                            k_watcher_iface, k_watcher_vtable, this);
     if (r < 0) {
-        lx::trace::logger::global().logf(lx::trace::level::warn, k_tray_category,
-                                         "tray: cannot export {}: {}", k_watcher_path,
-                                         std::strerror(-r));
+        log_tray.warn("tray: cannot export {}: {}", k_watcher_path, std::strerror(-r));
         return false;
     }
     bus_ = b;
@@ -761,8 +742,7 @@ void lx::shell::tray_service::go_local() {
     watcher_owned_ = true;
     (void)sd_bus_emit_signal(static_cast<sd_bus*>(bus_), k_watcher_path, k_watcher_iface,
                              "StatusNotifierHostRegistered", "");
-    lx::trace::logger::global().log(lx::trace::level::info, k_tray_category,
-                                    "tray: watcher and host (org.kde.StatusNotifierWatcher)");
+    log_tray.info("tray: watcher and host (org.kde.StatusNotifierWatcher)");
 }
 
 void lx::shell::tray_service::go_remote() {
@@ -800,8 +780,7 @@ void lx::shell::tray_service::go_remote() {
                                  "org.freedesktop.DBus.Properties", "Get", events::remote_items,
                                  this, "ss", k_watcher_iface, "RegisteredStatusNotifierItems") >= 0)
         remote_call_ = slot;
-    lx::trace::logger::global().log(lx::trace::level::info, k_tray_category,
-                                    "tray: another StatusNotifierWatcher runs: host only");
+    log_tray.info("tray: another StatusNotifierWatcher runs: host only");
 }
 
 void lx::shell::tray_service::activate(unsigned key, int x, int y, const char* token,
@@ -817,10 +796,9 @@ void lx::shell::tray_service::activate(unsigned key, int x, int y, const char* t
     (void)sd_bus_call_method_async(b, nullptr, r->bus.c_str(), r->path.c_str(), k_item_iface,
                                    secondary ? "SecondaryActivate" : "Activate",
                                    events::ignore_reply, nullptr, "ii", x, y);
-    lx::trace::logger::global().logf(lx::trace::level::info, k_tray_category,
-                                     "tray: {} {} x={} y={} token={}", r->service,
-                                     secondary ? "SecondaryActivate" : "Activate", x, y,
-                                     token && *token ? "yes" : "no");
+    log_tray.info("tray: {} {} x={} y={} token={}", r->service,
+                  secondary ? "SecondaryActivate" : "Activate", x, y,
+                  token && *token ? "yes" : "no");
 }
 
 void lx::shell::tray_service::context_menu(unsigned key, int x, int y) {
@@ -830,8 +808,7 @@ void lx::shell::tray_service::context_menu(unsigned key, int x, int y) {
     (void)sd_bus_call_method_async(static_cast<sd_bus*>(bus_), nullptr, r->bus.c_str(),
                                    r->path.c_str(), k_item_iface, "ContextMenu",
                                    events::ignore_reply, nullptr, "ii", x, y);
-    lx::trace::logger::global().logf(lx::trace::level::info, k_tray_category,
-                                     "tray: {} ContextMenu x={} y={}", r->service, x, y);
+    log_tray.info("tray: {} ContextMenu x={} y={}", r->service, x, y);
 }
 
 void lx::shell::tray_service::scroll(unsigned key, int delta, bool horizontal) {
@@ -919,8 +896,7 @@ void lx::shell::tray_service::menu_event(unsigned key, int id, const char* type)
         (void)sd_bus_call_async(b, nullptr, call, events::ignore_reply, nullptr, 0);
     sd_bus_message_unref(call);
     if (std::strcmp(type, "clicked") == 0)
-        lx::trace::logger::global().logf(lx::trace::level::info, k_tray_category,
-                                         "tray: {} menu Event id={} clicked", r->service, id);
+        log_tray.info("tray: {} menu Event id={} clicked", r->service, id);
 }
 
 void lx::shell::tray_service::menu_about_to_show(unsigned key, int id) {

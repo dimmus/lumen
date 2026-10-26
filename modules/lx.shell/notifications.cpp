@@ -20,7 +20,7 @@ import :notifications;
 
 namespace {
 
-constexpr const char* k_notify_category = "shell.notify";
+constexpr lx::trace::category log_notify{"shell.notify"};
 constexpr std::size_t k_max_markup = 8192;
 constexpr unsigned k_max_spans = 64;
 constexpr unsigned k_max_links = 16;
@@ -536,8 +536,7 @@ unsigned lx::shell::notification_center::notify(notify_request req, long long no
                         *merged = true;
                     if (!r->warned) {
                         r->warned = true;
-                        lx::trace::logger::global().logf(
-                            lx::trace::level::warn, k_notify_category,
+                        log_notify.warn(
                             "notify: {} sends more than {} notifications a second; the excess "
                             "replaces its newest",
                             req.sender, settings_.rate_limit);

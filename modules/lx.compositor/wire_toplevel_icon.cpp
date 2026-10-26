@@ -45,6 +45,12 @@ import :toplevel;
 import :toplevel_icon;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_icon{"compositor.icon"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -234,11 +240,10 @@ void manager_set_icon(struct wl_client*, struct wl_resource*, struct wl_resource
         g_p0_ctx->icons->unref(rec->icon_pending);
     rec->icon_pending = id;
     rec->icon_pending_set = true;
-    if (surface_debug()) {
+    if (log_icon.enabled(lx::trace::level::debug)) {
         const auto* e = g_p0_ctx->icons->get(id);
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.icon",
-                                         "icon staged toplevel={} name={} buffers={}", rec->id.id(),
-                                         e ? e->name : "", e ? e->count : 0u);
+        log_icon.debug("icon staged toplevel={} name={} buffers={}", rec->id.id(), e ? e->name : "",
+                       e ? e->count : 0u);
     }
 }
 
@@ -294,11 +299,10 @@ void toplevel_icon_commit(surface_obj* s) {
     rec->icon_pending_set = false;
     if (rec->mapped && s->ctx->shell)
         s->ctx->shell->emit_toplevel_icon(*rec);
-    if (surface_debug()) {
+    if (log_icon.enabled(lx::trace::level::debug)) {
         const auto* e = s->ctx->icons->get(rec->icon);
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.icon",
-                                         "icon applied toplevel={} name={} buffers={}",
-                                         rec->id.id(), e ? e->name : "", e ? e->count : 0u);
+        log_icon.debug("icon applied toplevel={} name={} buffers={}", rec->id.id(),
+                       e ? e->name : "", e ? e->count : 0u);
     }
 }
 

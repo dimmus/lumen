@@ -57,7 +57,7 @@ namespace lx::compositor::p0 {
 namespace {
 
 constexpr unsigned k_max_per_client = 16;
-constexpr const char* k_category = "compositor.inhibit";
+constexpr lx::trace::category log_inhibit{"compositor.inhibit"};
 
 struct inhibitor_obj {
     wl_resource* resource = nullptr;
@@ -82,11 +82,10 @@ bool locked() {
 }
 
 void inhibit_log(lx::trace::level lvl, const inhibitor_obj* i, const char* what) {
-    if (lvl == lx::trace::level::debug && !surface_debug())
+    if (lvl == lx::trace::level::debug && !log_inhibit.enabled(lx::trace::level::debug))
         return;
-    lx::trace::logger::global().logf(lvl, k_category, "shortcuts inhibitor client={} surface={} {}",
-                                     wire_client_id(i->client),
-                                     i->surface ? i->surface->id.id() : 0ull, what);
+    log_inhibit.log(lvl, "shortcuts inhibitor client={} surface={} {}", wire_client_id(i->client),
+                    i->surface ? i->surface->id.id() : 0ull, what);
 }
 
 /// Sends `active` to the inhibitor that comes into effect; one that leaves it just stops.

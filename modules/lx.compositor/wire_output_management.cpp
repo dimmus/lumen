@@ -62,7 +62,7 @@ namespace {
 
 #if defined(LUMEN_HAS_OUTPUT_MANAGEMENT)
 
-constexpr const char* k_category = "compositor.outputcfg";
+constexpr lx::trace::category log_outputcfg{"compositor.outputcfg"};
 
 struct manager_obj;
 struct head_obj;
@@ -152,10 +152,6 @@ template <class T> void unlink(T*& head, T* n) {
     if (n->next)
         n->next->prev = n->prev;
     n->prev = n->next = nullptr;
-}
-
-[[nodiscard]] bool debug_on() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
 }
 
 const mg::head_set& heads_now() {
@@ -552,10 +548,9 @@ void submit(struct wl_resource* r, bool test) {
         drop_config_heads(c);
         c->answered = true;
         zwlr_output_configuration_v1_send_cancelled(r);
-        if (debug_on()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
-                                             "{} cancelled: serial {}, current {}",
-                                             test ? "test" : "apply", c->cfg.serial, g.serial);
+        if (log_outputcfg.enabled(lx::trace::level::debug)) {
+            log_outputcfg.debug("{} cancelled: serial {}, current {}", test ? "test" : "apply",
+                                c->cfg.serial, g.serial);
         }
         return;
     case mg::submit_verdict::ok:
@@ -714,12 +709,10 @@ void lx::compositor::output_heads_changed(p0_protocol_context& ctx, const mgmt::
     for (manager_obj* m = g.managers; m; m = m->next)
         if (!client_dying(wl_resource_get_client(m->resource)))
             zwlr_output_manager_v1_send_done(m->resource, g.serial);
-    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
-                                         "heads done serial={} heads={} added={} removed={} "
-                                         "changed={}",
-                                         g.serial, heads.count, d.added_count, d.removed_count,
-                                         d.changed_count);
+    if (log_outputcfg.enabled(lx::trace::level::debug)) {
+        log_outputcfg.debug("heads done serial={} heads={} added={} removed={} "
+                            "changed={}",
+                            g.serial, heads.count, d.added_count, d.removed_count, d.changed_count);
     }
 #else
     (void)ctx;

@@ -456,7 +456,7 @@ int lx::shell::switcher_hit(const switcher_layout& l, double x, double y) {
 
 namespace {
 
-constexpr const char* k_switcher_category = "shell.switcher";
+constexpr lx::trace::category log_switcher{"shell.switcher"};
 constexpr std::uint32_t k_sw_bg = 0xFF1E1E22u; // the panel's colour
 constexpr std::uint32_t k_sw_selected = 0xFF3D6FB4u;
 constexpr std::uint32_t k_sw_tile = 0xFF5A5A66u;
@@ -467,11 +467,6 @@ constexpr lx::text::font_desc k_sw_font{"Sans", 11.f, lx::text::weight::normal,
                                         lx::text::style::normal};
 constexpr lx::text::font_desc k_sw_letter_font{"Sans", 26.f, lx::text::weight::bold,
                                                lx::text::style::normal};
-
-[[nodiscard]] bool switcher_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
 
 } // namespace
 
@@ -599,10 +594,9 @@ void lx::shell::switcher_view::draw(const switcher_model& m, const task_model& t
     canvas_.commit(surface_, bi, damage, nd);
     committed_ = next;
     ++frames_;
-    if (switcher_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_switcher_category,
-                                         "switcher: draw selection={} first={} damage={}",
-                                         m.selection(), layout_.first, nd);
+    if (log_switcher.enabled(lx::trace::level::debug)) {
+        log_switcher.debug("switcher: draw selection={} first={} damage={}", m.selection(),
+                           layout_.first, nd);
     }
 }
 
@@ -618,8 +612,7 @@ struct lx::shell::switcher_view::events {
         const int nh = h ? static_cast<int>(h) : v.layout_.height;
         if (nw != v.canvas_.width() || nh != v.canvas_.height() || !v.canvas_.allocated()) {
             if (!v.canvas_.allocate(v.g_.shm, nw, nh, "lumen-switcher")) {
-                lx::trace::logger::global().log(lx::trace::level::error, k_switcher_category,
-                                                "cannot allocate switcher buffers");
+                log_switcher.error("cannot allocate switcher buffers");
                 v.close();
                 return;
             }
@@ -679,10 +672,8 @@ bool lx::shell::switcher_view::open(void* output, int output_w, int output_h,
     configured_ = false;
     frames_ = 0;
     drawn_[0] = drawn_[1] = committed_ = {};
-    lx::trace::logger::global().logf(lx::trace::level::info, k_switcher_category,
-                                     "switcher: open ({} windows, {}x{}, {} column{})", m.count(),
-                                     layout_.width, layout_.height, layout_.columns,
-                                     layout_.columns == 1 ? "" : "s");
+    log_switcher.info("switcher: open ({} windows, {}x{}, {} column{})", m.count(), layout_.width,
+                      layout_.height, layout_.columns, layout_.columns == 1 ? "" : "s");
     return true;
 }
 
@@ -700,9 +691,7 @@ void lx::shell::switcher_view::close() {
     surface_ = nullptr;
     configured_ = false;
     drawn_[0] = drawn_[1] = committed_ = {};
-    lx::trace::logger::global().logf(lx::trace::level::info, k_switcher_category,
-                                     "switcher: close ({} frame{})", frames_,
-                                     frames_ == 1 ? "" : "s");
+    log_switcher.info("switcher: close ({} frame{})", frames_, frames_ == 1 ? "" : "s");
 }
 
 void lx::shell::switcher_view::after_dispatch(const switcher_model& m, const task_model& tasks) {

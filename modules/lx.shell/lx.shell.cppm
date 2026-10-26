@@ -76,6 +76,15 @@ export import :notify_view;
 export import :menu_popup;
 export import :tray;
 
+namespace {
+
+constexpr lx::trace::category log_config{"config"};
+constexpr lx::trace::category log_idle{"shell.idle"};
+constexpr lx::trace::category log_lock{"shell.lock"};
+constexpr lx::trace::category log_switcher{"shell.switcher"};
+
+} // namespace
+
 export namespace lx::shell {
 
 /// Which `shell_config` settings came from the command line (or LUMEN_BACKGROUND): those
@@ -503,32 +512,8 @@ module :private;
 
 namespace {
 
-constexpr const char* k_shell_category = "shell";
-[[maybe_unused]] constexpr const char* k_apps_category = "shell.apps";
-
-[[maybe_unused]] void shell_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, k_shell_category, line);
-}
-
-template <typename... Args>
-[[maybe_unused]] void shell_log(lx::trace::level lvl, std::format_string<Args...> fmt,
-                                Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_shell_category, fmt, std::forward<Args>(args)...);
-}
-
-[[maybe_unused]] void apps_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, k_apps_category, line);
-}
-
-template <typename... Args>
-[[maybe_unused]] void apps_log(lx::trace::level lvl, std::format_string<Args...> fmt,
-                               Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_apps_category, fmt, std::forward<Args>(args)...);
-}
-
-[[maybe_unused]] [[nodiscard]] bool shell_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_shell{"shell"};
+[[maybe_unused]] constexpr lx::trace::category log_apps{"shell.apps"};
 
 } // namespace
 
@@ -769,7 +754,7 @@ struct lx::shell::shell_app::events {
             return;
         }
         if (!a.xkb_.set_keymap(fd, size))
-            shell_log(lx::trace::level::warn, "keymap not usable: the launcher takes no typing");
+            log_shell.warn("keymap not usable: the launcher takes no typing");
     }
     static void kb_enter(void* data, wl_keyboard*, uint32_t, wl_surface* s, wl_array*) {
         auto& a = self(data);
@@ -890,17 +875,17 @@ const zwlr_output_power_v1_listener k_power_listener = {
 int describe_connection_error(wl_display* d, const char* when, bool logout_requested = false) {
     const int err = wl_display_get_error(d);
     if (logout_requested && err != EPROTO) {
-        shell_log(lx::trace::level::info, "session ended (logged out)");
+        log_shell.info("session ended (logged out)");
         return 0;
     }
     if (err == EPROTO) {
         const wl_interface* iface = nullptr;
         uint32_t id = 0;
         const uint32_t code = wl_display_get_protocol_error(d, &iface, &id);
-        shell_log(lx::trace::level::error, "{}: protocol error on {}#{}, code {}", when,
-                  iface ? iface->name : "?", id, code);
+        log_shell.error("{}: protocol error on {}#{}, code {}", when, iface ? iface->name : "?", id,
+                        code);
     } else {
-        shell_log(lx::trace::level::error, "{}: connection lost ({})", when, std::strerror(err));
+        log_shell.error("{}: connection lost ({})", when, std::strerror(err));
     }
     return 1;
 }
@@ -1099,25 +1084,23 @@ void lx::shell::shell_app::events::locked_idled(void* data, ext_idle_notificatio
 void lx::shell::shell_app::events::resumed(void* data, ext_idle_notification_v1*) {
     // Nothing to do: input already woke the outputs inside the compositor.
     self(data).idle_.on_resumed();
-    if (shell_debug())
-        lx::trace::logger::global().log(lx::trace::level::debug, "shell.idle", "resumed");
+    if (log_idle.enabled(lx::trace::level::debug))
+        log_idle.debug("resumed");
 }
 
 void lx::shell::shell_app::events::power_mode(void* data, zwlr_output_power_v1*, uint32_t mode) {
     auto& o = out(data);
     o.off = mode == ZWLR_OUTPUT_POWER_V1_MODE_OFF;
-    if (shell_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "shell.idle",
-                                         "output power {} ({})", o.off ? "off" : "on", o.connector);
+    if (log_idle.enabled(lx::trace::level::debug)) {
+        log_idle.debug("output power {} ({})", o.off ? "off" : "on", o.connector);
     }
 }
 
 void lx::shell::shell_app::events::power_failed(void* data, zwlr_output_power_v1* p) {
     auto& o = out(data);
-    lx::trace::logger::global().logf(lx::trace::level::warn, "shell.idle",
-                                     "output power control failed (output {} went?) — not blanked "
-                                     "any more",
-                                     o.connector);
+    log_idle.warn("output power control failed (output {} went?) — not blanked "
+                  "any more",
+                  o.connector);
     zwlr_output_power_v1_destroy(p);
     if (o.power == p)
         o.power = nullptr;
@@ -1132,7 +1115,7 @@ void lx::shell::shell_app::blank_outputs(const char* why) {
         any = any || (o->power && !o->off);
     if (!any)
         return; // already dark (the other timeout, or the lock's blank, came first)
-    lx::trace::logger::global().log(lx::trace::level::info, "shell.idle", why);
+    log_idle.info("{}", why);
     for (auto& o : outputs_)
         if (o->power && !o->off)
             zwlr_output_power_v1_set_mode(static_cast<zwlr_output_power_v1*>(o->power),
@@ -1163,18 +1146,16 @@ void lx::shell::shell_app::update_locked_notification() {
 
 void lx::shell::shell_app::setup_idle() {
     if (!config_.idle.enabled) {
-        lx::trace::logger::global().log(lx::trace::level::info, "shell.idle",
-                                        "idle policy none: an external daemon decides (e.g. "
-                                        "swayidle + wlopm)");
+        log_idle.info("idle policy none: an external daemon decides (e.g. "
+                      "swayidle + wlopm)");
         return;
     }
 #if defined(LUMEN_SHELL_IDLE)
     const unsigned timeout_ms = idle_.blank_timeout_ms(idle_notifier_ != nullptr,
                                                        power_manager_ != nullptr && !outputs_.empty());
     if (timeout_ms == 0) {
-        lx::trace::logger::global().logf(
-            lx::trace::level::info, "shell.idle", "no screen blanking:{}{}{}",
-            config_.idle.blank_after_s == 0 ? " --blank-after 0" : "",
+        log_idle.info(
+            "no screen blanking:{}{}{}", config_.idle.blank_after_s == 0 ? " --blank-after 0" : "",
             !idle_notifier_ ? " no ext_idle_notifier_v1" : "",
             !power_manager_ || outputs_.empty() ? " no zwlr_output_power_manager_v1" : "");
         return;
@@ -1190,13 +1171,10 @@ void lx::shell::shell_app::setup_idle() {
         ext_idle_notification_v1_add_listener(
             static_cast<ext_idle_notification_v1*>(idle_notification_), &k_idle_listener, this);
     }
-    lx::trace::logger::global().logf(lx::trace::level::info, "shell.idle",
-                                     "blanking the outputs after {} s without input",
-                                     config_.idle.blank_after_s);
+    log_idle.info("blanking the outputs after {} s without input", config_.idle.blank_after_s);
 #else
-    lx::trace::logger::global().log(lx::trace::level::info, "shell.idle",
-                                    "no screen blanking: built without ext-idle-notify / "
-                                    "wlr-output-power-management");
+    log_idle.info("no screen blanking: built without ext-idle-notify / "
+                  "wlr-output-power-management");
 #endif
 }
 
@@ -1276,7 +1254,7 @@ void lx::shell::shell_app::output_ready(output_record& o) {
                                       .single_pixel = single_pixel_},
                                      &config_.background, o.output, bg_notify_fd_);
             !made) {
-            lx::trace::logger::global().log_error(made.get_error(), k_shell_category);
+            log_shell.error(made.get_error());
             o.bg.reset();
         }
     }
@@ -1344,12 +1322,12 @@ void lx::shell::shell_app::output_ready(output_record& o) {
                                       .fractional = fractional_},
                                      bridge_, o.output);
         !created) {
-        lx::trace::logger::global().log_error(created.get_error(), k_shell_category);
+        log_shell.error(created.get_error());
         o.bar.reset();
         return;
     }
-    shell_log(lx::trace::level::info, "panel requested on output {} ({}x{}+{}+{})", o.connector,
-              o.logical.width, o.logical.height, o.logical.x, o.logical.y);
+    log_shell.info("panel requested on output {} ({}x{}+{}+{})", o.connector, o.logical.width,
+                   o.logical.height, o.logical.x, o.logical.y);
     if (desktop_started_)
         attach_widgets(o);
     outputs_moved();
@@ -1434,7 +1412,7 @@ void lx::shell::shell_app::remove_output(unsigned name) {
     for (auto it = outputs_.begin(); it != outputs_.end(); ++it) {
         if ((*it)->name != name)
             continue;
-        shell_log(lx::trace::level::info, "output {} removed: its panel goes", (*it)->connector);
+        log_shell.info("output {} removed: its panel goes", (*it)->connector);
         if (menu_output_ == name)
             menu_.close();
         if (tooltip_output_ == name) {
@@ -1484,7 +1462,7 @@ lx::shell::shell_app::output_record* lx::shell::shell_app::launcher_output() {
 }
 
 int lx::shell::shell_app::fail(const char* what) {
-    shell_log(lx::trace::level::error, what);
+    log_shell.error("{}", what);
     return 1;
 }
 
@@ -1689,8 +1667,7 @@ void lx::shell::shell_app::launch_locker(const char* why) {
         return;
     }
     idle_.note_locker_started(now_ns());
-    lx::trace::logger::global().logf(lx::trace::level::info, "shell.lock", "lock: starting {} ({})",
-                                     p->program, why);
+    log_lock.info("lock: starting {} ({})", p->program, why);
     // No activation token: a locker's surfaces take the keyboard as lock surfaces.
     start_launch(*p, nullptr);
 }
@@ -1716,8 +1693,7 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
         const long long delay = idle_.relaunch_delay(now_ns());
         if (delay < 0) {
             if (idle_.can_lock())
-                lx::trace::logger::global().log(
-                    lx::trace::level::error, "shell.lock",
+                log_lock.error(
                     "the locker keeps exiting: not starting it again — the session stays locked "
                     "(loginctl unlock-session unlocks it)");
         } else if (delay == 0) {
@@ -1741,8 +1717,7 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
 void lx::shell::shell_app::on_lock_requested(unsigned reason) {
     if (!idle_.on_lock_requested()) {
         if (!idle_.can_lock())
-            lx::trace::logger::global().log(lx::trace::level::info, "shell.lock",
-                                            "lock requested, but no --lock-command is set");
+            log_lock.info("lock requested, but no --lock-command is set");
         return;
     }
     launch_locker(reason == 1 ? "before sleep" : "logind Lock");
@@ -1798,11 +1773,11 @@ void lx::shell::shell_app::open_launcher() {
     const int w = o && o->logical.width > 0 ? o->logical.width : 1024;
     const int h = o && o->logical.height > 0 ? o->logical.height : 768;
     if (!launcher_.open(w, h, k_panel_height, o ? o->output : nullptr)) {
-        shell_log(lx::trace::level::warn, "launcher: cannot open");
+        log_shell.warn("launcher: cannot open");
         return;
     }
-    if (o && shell_debug()) {
-        shell_log(lx::trace::level::debug, "launcher on output {}", o->connector);
+    if (o && log_shell.enabled(lx::trace::level::debug)) {
+        log_shell.debug("launcher on output {}", o->connector);
     }
     set_apps_all(true);
     // A panel notice belongs to the closed launcher; the launcher has its own status row.
@@ -1857,10 +1832,10 @@ void lx::shell::shell_app::report_failure(const char* id, const char* name, laun
             return;
     warned_.emplace_back(id, f);
     if (unit && *unit)
-        apps_log(lx::trace::level::warn, "apps: {} ({}): {} ({}; journalctl --user -u '{}')", text,
-                 id, reason, detail ? detail : "", unit);
+        log_apps.warn("apps: {} ({}): {} ({}; journalctl --user -u '{}')", text, id, reason,
+                      detail ? detail : "", unit);
     else
-        apps_log(lx::trace::level::warn, "apps: {} ({})", text, id);
+        log_apps.warn("apps: {} ({})", text, id);
 }
 
 void lx::shell::shell_app::on_outcome(const launch_outcome& o) {
@@ -1870,11 +1845,11 @@ void lx::shell::shell_app::on_outcome(const launch_outcome& o) {
     }
     constexpr auto lvl = lx::trace::level::info;
     if (o.forked && o.unit[0])
-        apps_log(lvl, "apps: launched {} pid={} in {}", o.id, o.pid, o.unit);
+        log_apps.log(lvl, "apps: launched {} pid={} in {}", o.id, o.pid, o.unit);
     else if (o.forked)
-        apps_log(lvl, "apps: launched {} pid={} (double fork)", o.id, o.pid);
+        log_apps.log(lvl, "apps: launched {} pid={} (double fork)", o.id, o.pid);
     else
-        apps_log(lvl, "apps: launched {} as {}", o.id, o.unit);
+        log_apps.log(lvl, "apps: launched {} as {}", o.id, o.unit);
 }
 
 void lx::shell::shell_app::launch_entry(unsigned entry, unsigned serial) {
@@ -1998,9 +1973,8 @@ void lx::shell::shell_app::expire_tokens(long long now) {
         if (!t.token)
             continue;
         if (t.deadline_ns <= now) {
-            if (shell_debug())
-                apps_log(lx::trace::level::debug,
-                         "apps: no activation token within 100 ms: going on without one");
+            if (log_apps.enabled(lx::trace::level::debug))
+                log_apps.debug("apps: no activation token within 100 ms: going on without one");
             token_done(t, nullptr);
         } else if (!earliest || t.deadline_ns < earliest) {
             earliest = t.deadline_ns;
@@ -2015,9 +1989,8 @@ void lx::shell::shell_app::start_launch(const prepared_launch& p, const char* to
         display = std::getenv("WAYLAND_DISPLAY");
     if (!display || !*display)
         display = "wayland-0";
-    if (shell_debug()) {
-        apps_log(lx::trace::level::debug, "apps: starting {} ({}) token={}", p.id, p.program,
-                 token ? "yes" : "no");
+    if (log_apps.enabled(lx::trace::level::debug)) {
+        log_apps.debug("apps: starting {} ({}) token={}", p.id, p.program, token ? "yes" : "no");
     }
     apps_.start(p, token ? token : "", display);
 }
@@ -2119,13 +2092,12 @@ int lx::shell::shell_app::run() {
         return fail(line);
     }
     if (!seat_)
-        shell_log(lx::trace::level::warn, "no wl_seat: the panel takes no input");
+        log_shell.warn("no wl_seat: the panel takes no input");
     if (!activation_)
-        apps_log(lx::trace::level::info,
-                 "apps: no xdg_activation_v1: launched windows get no activation token");
+        log_apps.info("apps: no xdg_activation_v1: launched windows get no activation token");
 
     if (auto attached = bridge_.attach(shell_); !attached) {
-        lx::trace::logger::global().log_error(attached.get_error(), k_shell_category);
+        log_shell.error(attached.get_error());
         close(sfd);
         return 1;
     }
@@ -2187,7 +2159,7 @@ int lx::shell::shell_app::run() {
             (void)bridge_.grab_key(k_key_l, policy_bridge::k_mod_super,
                                    policy_bridge::k_grab_not_inhibitable, on_lock, this);
         }
-        shell_log(lx::trace::level::info, "key bindings: the compositor's (zlm v7 actions)");
+        log_shell.info("key bindings: the compositor's (zlm v7 actions)");
     } else if (bridge_.can_grab_keys()) {
         // zlm_shell_v1 v4..v6: the shell's own grabs. The Super tap is observed — the key still
         // reaches the focused window — and fires only when Super was pressed and released
@@ -2216,16 +2188,14 @@ int lx::shell::shell_app::run() {
         }
     } else {
         (void)bridge_.grab_key(0, 0, 0, nullptr, nullptr); // logs the absence once
-        shell_log(lx::trace::level::info, "launcher only from the panel (no key grabs)");
+        log_shell.info("launcher only from the panel (no key grabs)");
     }
     setup_idle();
     if (!bridge_.has_lock_state()) {
-        lx::trace::logger::global().log(lx::trace::level::info, "shell.lock",
-                                        "compositor below zlm_shell_v1 v5: no session-lock "
-                                        "integration");
+        log_lock.info("compositor below zlm_shell_v1 v5: no session-lock "
+                      "integration");
     } else if (idle_.can_lock()) {
-        lx::trace::logger::global().logf(
-            lx::trace::level::info, "shell.lock",
+        log_lock.info(
             "lock command: {} (Super+L, logind Lock, before sleep{})", idle_.config().lock_command,
             idle_.config().lock_on_blank && idle_.config().enabled && idle_.config().blank_after_s
                 ? ", before blanking"
@@ -2234,8 +2204,8 @@ int lx::shell::shell_app::run() {
     update_locked_notification(); // started behind a lock (a restart while locked)
     started_ = true;
     {
-        shell_log(lx::trace::level::info, "connected to {}; panel requested",
-                  config_.display ? config_.display : "$WAYLAND_DISPLAY");
+        log_shell.info("connected to {}; panel requested",
+                       config_.display ? config_.display : "$WAYLAND_DISPLAY");
     }
 
     int code = 0;
@@ -2290,7 +2260,7 @@ int lx::shell::shell_app::run() {
                 continue;
             // The compositor closed it (its output went), or a buffer could not be made:
             // that output goes without a panel; the others stay.
-            shell_log(lx::trace::level::warn, "panel on output {} closed", o->connector);
+            log_shell.warn("panel on output {} closed", o->connector);
             if (o->bar.get() == pointer_panel_) {
                 pointer_panel_ = nullptr;
                 pointer_target_ = pointer_target::none;
@@ -2352,7 +2322,7 @@ int lx::shell::shell_app::run() {
         if (n > 0 && (fds[1].revents & POLLIN)) {
             signalfd_siginfo si{};
             if (read(sfd, &si, sizeof(si)) == static_cast<ssize_t>(sizeof(si))) {
-                shell_log(lx::trace::level::info, "signal {}: exiting", si.ssi_signo);
+                log_shell.info("signal {}: exiting", si.ssi_signo);
                 break;
             }
         }
@@ -2498,9 +2468,9 @@ void lx::shell::shell_app::on_config(std::string_view bytes, unsigned generation
     lx::config::diagnostics diag{};
     if (!lx::config::parse_config(lx::config::split_layers(bytes), *next, diag,
                                   file_config_.get())) {
-        shell_log(lx::trace::level::warn, "configuration generation {} does not parse here; "
-                                          "keeping the one in use",
-                  generation);
+        log_shell.warn("configuration generation {} does not parse here; "
+                       "keeping the one in use",
+                       generation);
         return;
     }
     apply_config(*next);
@@ -2529,10 +2499,9 @@ void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
         file_lock_command_ = c.idle.lock_command;
         want.lock_command = file_lock_command_.empty() ? nullptr : file_lock_command_.c_str();
         if (!file_lock_command_.empty() && !command_found(file_lock_command_.c_str()))
-            lx::trace::logger::global().logf(lx::trace::level::warn, "config",
-                                             "idle.lock-command: \"{}\" is not found in PATH; "
-                                             "locking will fail",
-                                             file_lock_command_);
+            log_config.warn("idle.lock-command: \"{}\" is not found in PATH; "
+                            "locking will fail",
+                            file_lock_command_);
     }
     const auto same_str = [](const char* a, const char* b) {
         return std::strcmp(a ? a : "", b ? b : "") == 0;
@@ -2549,8 +2518,7 @@ void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
     else
         idle_.configure(want);
     if (idle_changed)
-        lx::trace::logger::global().logf(
-            lx::trace::level::info, "config",
+        log_config.info(
             "idle: policy {} blank-after {} s blank-locked-after {} s lock-command \"{}\"{}",
             want.enabled ? "shell" : "none", want.blank_after_s, want.blank_locked_after_s,
             want.lock_command ? want.lock_command : "",
@@ -2566,11 +2534,10 @@ void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
             config_.background_enabled = true;
         } else {
             ok = false;
-            lx::trace::logger::global().logf(lx::trace::level::warn, "config",
-                                             "background.spec: \"{}\" is not a background "
-                                             "(lumen, #RRGGBB, gradient:…, image:PATH, none); "
-                                             "keeping the one shown",
-                                             spec);
+            log_config.warn("background.spec: \"{}\" is not a background "
+                            "(lumen, #RRGGBB, gradient:…, image:PATH, none); "
+                            "keeping the one shown",
+                            spec);
         }
         if (ok) {
             file_background_ = c.background.spec;
@@ -2651,7 +2618,7 @@ void lx::shell::shell_app::on_config_done(unsigned generation, bool applied, uns
     std::snprintf(text, sizeof(text), "Lumen configuration%s: %u error%s, %u warning%s — %s%s",
                   applied ? "" : " not used", errors, errors == 1 ? "" : "s", warnings,
                   warnings == 1 ? "" : "s", where, first);
-    lx::trace::logger::global().logf(lx::trace::level::info, "config", "notice: {}", text);
+    log_config.info("notice: {}", text);
     // A notification once the server runs (replacing the previous one about the
     // configuration); the panel's notice before that.
     if (notifications_owned()) {
@@ -2687,8 +2654,8 @@ void lx::shell::shell_app::on_action(const char* action, const char* argument, u
         (void)notes_.dismiss_newest(now_ns());
     } else if (a == "notifications.dismiss-all") {
         (void)notes_.dismiss_all(now_ns());
-    } else if (shell_debug()) {
-        shell_log(lx::trace::level::debug, "action {}: not a shell action this version knows", a);
+    } else if (log_shell.enabled(lx::trace::level::debug)) {
+        log_shell.debug("action {}: not a shell action this version knows", a);
     }
 }
 
@@ -2737,16 +2704,14 @@ void lx::shell::shell_app::on_hold_begin(const char* action) {
     if (n == 0) {
         (void)switcher_.finish(false);
         bridge_.end_hold();
-        lx::trace::logger::global().logf(lx::trace::level::info, "shell.switcher",
-                                         "switcher: {}: no window to switch to", a);
+        log_switcher.info("switcher: {}: no window to switch to", a);
         return;
     }
     set_timer(t_switcher, switcher_.open_at());
-    if (shell_debug()) {
+    if (log_switcher.enabled(lx::trace::level::debug)) {
         const task_entry* e = bridge_.model().get(switcher_.selected());
-        lx::trace::logger::global().logf(lx::trace::level::debug, "shell.switcher",
-                                         "switcher: hold {} windows={} selection={} \"{}\"", a, n,
-                                         switcher_.selection(), e ? e->title : "");
+        log_switcher.debug("switcher: hold {} windows={} selection={} \"{}\"", a, n,
+                           switcher_.selection(), e ? e->title : "");
     }
 }
 
@@ -2787,10 +2752,9 @@ void lx::shell::shell_app::finish_switch(bool commit, const char* why) {
         bridge_.model().note_explicit_focus(h);
         bridge_.request_activate(h);
     }
-    lx::trace::logger::global().logf(lx::trace::level::info, "shell.switcher",
-                                     "switcher: {} ({}{}){}{}{}", e ? "activate" : "nothing",
-                                     why ? why : "-", shown ? ", shown" : ", never shown",
-                                     e ? " \"" : "", e ? e->title : "", e ? "\"" : "");
+    log_switcher.info("switcher: {} ({}{}){}{}{}", e ? "activate" : "nothing", why ? why : "-",
+                      shown ? ", shown" : ", never shown", e ? " \"" : "", e ? e->title : "",
+                      e ? "\"" : "");
 }
 
 void lx::shell::shell_app::quick_switch(std::string_view action) {
@@ -2811,13 +2775,12 @@ void lx::shell::shell_app::quick_switch(std::string_view action) {
 struct lx::shell::shell_app::events {};
 
 int lx::shell::shell_app::fail(const char* what) {
-    shell_log(lx::trace::level::error, what);
+    log_shell.error("{}", what);
     return 1;
 }
 
 int lx::shell::shell_app::run() {
-    lx::trace::logger::global().log_error(lx::not_implemented("lx::shell::shell_app::run"),
-                                          k_shell_category);
+    log_shell.error(lx::not_implemented("lx::shell::shell_app::run"));
     return 1;
 }
 

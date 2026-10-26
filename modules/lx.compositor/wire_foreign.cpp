@@ -93,17 +93,7 @@ struct imported_obj {
     imported_obj* next = nullptr;
 };
 
-constexpr const char* k_category = "compositor.foreign";
-
-void foreign_log(const char* line) {
-    lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
-}
-
-template <typename... Args>
-void foreign_log(std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_category, fmt,
-                                     std::forward<Args>(args)...);
-}
+constexpr lx::trace::category log_foreign{"compositor.foreign"};
 
 lx::compositor::foreign_registry* registry() { return g_p0_ctx ? g_p0_ctx->foreign : nullptr; }
 
@@ -225,9 +215,9 @@ void do_export(wl_client* client, wl_resource* manager, const wl_interface* ifac
         std::snprintf(handle, sizeof(handle), "%s", "0");
     // A handle is sent either way: an unregistered one imports as `destroyed`.
     send_handle(res, handle);
-    if (surface_debug()) {
-        foreign_log("export toplevel={} handle={:.8}… registered={}", rec ? rec->id.id() : 0ull,
-                    handle, e->reg ? 1 : 0);
+    if (log_foreign.enabled(lx::trace::level::debug)) {
+        log_foreign.debug("export toplevel={} handle={:.8}… registered={}",
+                          rec ? rec->id.id() : 0ull, handle, e->reg ? 1 : 0);
     }
 }
 
@@ -251,9 +241,9 @@ void do_import(wl_client* client, wl_resource* manager, const wl_interface* ifac
         link(e, i);
     else
         send_destroyed(i); // "If the handle is invalid, the destroyed event will be sent immediately"
-    if (surface_debug()) {
-        foreign_log("import handle={:.8}… result={}", handle ? handle : "",
-                    i->exported ? "ok" : "destroyed");
+    if (log_foreign.enabled(lx::trace::level::debug)) {
+        log_foreign.debug("import handle={:.8}… result={}", handle ? handle : "",
+                          i->exported ? "ok" : "destroyed");
     }
 }
 
@@ -269,7 +259,8 @@ bool do_set_parent_of(imported_obj* i, wl_resource* surface_res) {
     // as xdg_toplevel.set_parent, which is an error there; here the request is ignored).
     for (lx::toplevel_id at = e->toplevel; at;) {
         if (at == child->id) {
-            foreign_log("set_parent_of ignored: the window is the exported one or its ancestor");
+            log_foreign.debug(
+                "set_parent_of ignored: the window is the exported one or its ancestor");
             return true;
         }
         const auto* rec = g_p0_ctx->toplevels->find(at);
@@ -285,8 +276,8 @@ bool do_set_parent_of(imported_obj* i, wl_resource* surface_res) {
         else
             i->children[k_import_children - 1] = child->id; // the newest is remembered
     }
-    if (surface_debug()) {
-        foreign_log("set_parent_of child={} parent={}", child->id.id(), e->toplevel.id());
+    if (log_foreign.enabled(lx::trace::level::debug)) {
+        log_foreign.debug("set_parent_of child={} parent={}", child->id.id(), e->toplevel.id());
     }
     return true;
 }

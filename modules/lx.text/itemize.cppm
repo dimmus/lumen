@@ -22,6 +22,12 @@ import std;
 import :faces;
 import :shape;
 
+namespace {
+
+constexpr lx::trace::category log_text{"text"};
+
+} // namespace
+
 export namespace lx::text {
 
 // ── Itemization (ADR-010 §4.6 `:itemize`) ────────────────────────────────────────
@@ -675,9 +681,7 @@ lx::text::itemizer::itemize_locked(face_cache& faces, const itemize_request& req
             ++counters_.run_overflows;
             if (config_.overflow == lx::runtime::overflow_action::warn_and_drop && !warned_) {
                 warned_ = true;
-                lx::trace::logger::global().log(
-                    lx::trace::level::warn, "text",
-                    "itemize: run cap reached; the rest of a paragraph is one run");
+                log_text.warn("itemize: run cap reached; the rest of a paragraph is one run");
             }
             cur->end = offsets_[j];
             cur->char_end = j;

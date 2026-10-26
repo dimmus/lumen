@@ -32,6 +32,12 @@ import :toplevel;
 import :output;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_deco{"compositor.deco"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 
@@ -46,16 +52,6 @@ decoration_obj toplevel_decorations[256]{};
 decoration_obj* decoration_from(wl_resource* r) {
     auto* d = r ? static_cast<decoration_obj*>(wl_resource_get_user_data(r)) : nullptr;
     return d && d->used && d->resource == r ? d : nullptr;
-}
-
-void deco_log(const char* line) {
-    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.deco", line);
-}
-
-template <typename... Args>
-void deco_log(std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.deco", fmt,
-                                     std::forward<Args>(args)...);
 }
 
 void decoration_destroy_resource(wl_resource* r) {
@@ -75,8 +71,8 @@ void decoration_destroy_resource(wl_resource* r) {
             rec->deco_awaiting_configure = false;
             rec->desired.decoration = lx::compositor::decoration_mode::client;
             rec->last_sent.decoration = lx::compositor::decoration_mode::client;
-            if (surface_debug()) {
-                deco_log("decoration destroy id={}", rec->id.id());
+            if (log_deco.enabled(lx::trace::level::debug)) {
+                log_deco.debug("decoration destroy id={}", rec->id.id());
             }
         }
     }
@@ -90,11 +86,11 @@ void decoration_set_request(wl_resource* resource, lx::compositor::decoration_re
     if (!rec)
         return; // inert
     rec->deco_requested = req;
-    if (surface_debug()) {
-        deco_log("decoration request id={} mode={}", rec->id.id(),
-                 req == lx::compositor::decoration_request::server   ? "server"
-                 : req == lx::compositor::decoration_request::client ? "client"
-                                                                     : "unset");
+    if (log_deco.enabled(lx::trace::level::debug)) {
+        log_deco.debug("decoration request id={} mode={}", rec->id.id(),
+                       req == lx::compositor::decoration_request::server   ? "server"
+                       : req == lx::compositor::decoration_request::client ? "client"
+                                                                           : "unset");
     }
     if (d->ctx && d->ctx->wm)
         d->ctx->wm->on_decoration_request(rec->id, false);
@@ -175,8 +171,8 @@ const struct zxdg_decoration_manager_v1_interface decoration_manager_impl = {
             // switch back to client-side, decided at commit by the missing object, is
             // called off.
             rec->deco_awaiting_configure = version < 2;
-            if (surface_debug()) {
-                deco_log("decoration create id={} version={}", rec->id.id(), version);
+            if (log_deco.enabled(lx::trace::level::debug)) {
+                log_deco.debug("decoration create id={} version={}", rec->id.id(), version);
             }
             if (g_p0_ctx && g_p0_ctx->wm)
                 g_p0_ctx->wm->on_decoration_request(rec->id, true);

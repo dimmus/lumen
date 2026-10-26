@@ -72,7 +72,7 @@ namespace lx::compositor::p0 {
 namespace {
 
 constexpr unsigned k_max_per_client = 16;
-constexpr const char* k_category = "compositor.constraint";
+constexpr lx::trace::category log_constraint{"compositor.constraint"};
 /// Commits whose staged region or hint wait for their content update (queued behind a
 /// fence, a fifo barrier, a target time). More merge into the newest: applied with a later
 /// update, never an earlier one.
@@ -135,12 +135,11 @@ bool dirty = false;
 const char* kind_of(const constraint_obj* c) { return c->lock ? "lock" : "confine"; }
 
 void constraint_log(lx::trace::level lvl, const constraint_obj* c, const char* what) {
-    if (lvl == lx::trace::level::debug && !surface_debug())
+    if (lvl == lx::trace::level::debug && !log_constraint.enabled(lx::trace::level::debug))
         return;
-    lx::trace::logger::global().logf(lvl, k_category, "pointer {} client={} surface={} {} {}",
-                                     kind_of(c), wire_client_id(c->client),
-                                     c->surface ? c->surface->id.id() : 0ull,
-                                     c->persistent ? "persistent" : "oneshot", what);
+    log_constraint.log(lvl, "pointer {} client={} surface={} {} {}", kind_of(c),
+                       wire_client_id(c->client), c->surface ? c->surface->id.id() : 0ull,
+                       c->persistent ? "persistent" : "oneshot", what);
 }
 
 /// The surface's global origin (logical), from its scene node.

@@ -59,6 +59,14 @@ import :layer_shell;
 import :content_update;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_cursor{"compositor.cursor"};
+constexpr lx::trace::category log_render{"compositor.render"};
+constexpr lx::trace::category log_wm{"compositor.wm"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -606,14 +614,12 @@ void surface_set_input_region(struct wl_client*, struct wl_resource* resource,
     else
         s->pending.input = {};
     s->pending.input_set = true;
-    if (s->pending.input.approximated &&
-        lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+    if (s->pending.input.approximated && log_wm.enabled(lx::trace::level::debug)) {
         static bool reported = false;
         if (!reported) {
             reported = true;
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.wm",
-                                            "input region exceeds 16 rects — over-approximated "
-                                            "(accepts more input than asked). Reported once.");
+            log_wm.debug("input region exceeds 16 rects — over-approximated "
+                         "(accepts more input than asked). Reported once.");
         }
     }
 }
@@ -626,11 +632,11 @@ bool geometry_prechecks(surface_obj* s) {
     if (lx::compositor::check_buffer_scale(in) == lx::compositor::surface_size_error::none)
         return true;
     if (s->role == surface_role::none || s->role == surface_role::cursor) {
-        if (!s->invalid_size_logged && surface_debug()) {
+        if (!s->invalid_size_logged && log_surface.enabled(lx::trace::level::debug)) {
             s->invalid_size_logged = true;
-            surface_log("client bug: buffer {}x{} is not divisible by scale {} (surface={}, "
-                        "tolerated for this role)",
-                        in.buffer_w, in.buffer_h, in.scale, s->id.id());
+            log_surface.debug("client bug: buffer {}x{} is not divisible by scale {} (surface={}, "
+                              "tolerated for this role)",
+                              in.buffer_w, in.buffer_h, in.scale, s->id.id());
         }
         return true;
     }
@@ -645,7 +651,7 @@ void log_commit_failure(const lx::error& err) {
     static unsigned suppressed = 0;
     static constexpr unsigned k_report_interval = 600;
     if (suppressed++ % k_report_interval == 0)
-        lx::trace::logger::global().log_error(err, "compositor.surface");
+        log_surface.error(err);
 }
 
 /// A cursor-role surface's new content. The pixels are copied out at once (the cursor
@@ -682,11 +688,10 @@ void commit_cursor_surface(surface_obj* s) {
         // Recorded trade-off: a dma-buf or non-8888 cursor keeps the previous image —
         // reading one back for a 64x64 plane is not worth a GPU round trip.
         static bool reported = false;
-        if (!reported && lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
+        if (!reported && log_cursor.enabled(lx::trace::level::debug)) {
             reported = true;
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.cursor",
-                                            "cursor surface buffer is not ARGB/XRGB shm — "
-                                            "keeping the previous image");
+            log_cursor.debug("cursor surface buffer is not ARGB/XRGB shm — "
+                             "keeping the previous image");
         }
     }
     wl_buffer_send_release(buffer);
@@ -1133,11 +1138,12 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
         s->current_buffer_id = buf->id;
         s->current_texture = 0;
         s->ctx->surfaces->set_solid(s->id, buf->solid, geo.size, content_opaque(s));
-        if (surface_debug()) {
-            surface_log("surface solid surface={} rgba={:.3f},{:.3f},{:.3f},{:.3f} size={}x{} "
-                        "opaque={}",
-                        s->id.id(), buf->solid.r, buf->solid.g, buf->solid.b, buf->solid.a,
-                        geo.size.width, geo.size.height, content_opaque(s) ? 1 : 0);
+        if (log_surface.enabled(lx::trace::level::debug)) {
+            log_surface.debug(
+                "surface solid surface={} rgba={:.3f},{:.3f},{:.3f},{:.3f} size={}x{} "
+                "opaque={}",
+                s->id.id(), buf->solid.r, buf->solid.g, buf->solid.b, buf->solid.a, geo.size.width,
+                geo.size.height, content_opaque(s) ? 1 : 0);
         }
         wl_buffer_send_release(s->current.buffer);
         return;
@@ -1245,8 +1251,7 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
             static bool warned = false;
             if (!warned) {
                 warned = true;
-                lx::trace::logger::global().log(
-                    lx::trace::level::warn, "compositor.surface",
+                log_surface.warn(
                     "shm staging returned no buffer — the texture cannot be registered and "
                     "the surface will not be drawn. Reported once.");
             }
@@ -1321,8 +1326,7 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
             // The texture never received this content, so the next upload of the buffer
             // cannot assume it: restage it whole.
             buf->upload = {};
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render",
-                                            "texture update queue full — frame will lag");
+            log_render.warn("texture update queue full — frame will lag");
         }
     }
 
@@ -1383,9 +1387,9 @@ void apply_core(surface_obj* s) {
     // tearing hint the output policy; set_barrier raises the fifo barrier, dated with the
     // frame that first shows this update.
     if (c.alpha != s->alpha_current) {
-        if (surface_debug()) {
-            surface_log("surface alpha surface={} multiplier={:.4f}", s->id.id(),
-                        static_cast<double>(c.alpha) / 4294967295.0);
+        if (log_surface.enabled(lx::trace::level::debug)) {
+            log_surface.debug("surface alpha surface={} multiplier={:.4f}", s->id.id(),
+                              static_cast<double>(c.alpha) / 4294967295.0);
         }
         s->alpha_current = c.alpha;
         s->ctx->surfaces->set_alpha(s->id,
@@ -1395,15 +1399,15 @@ void apply_core(surface_obj* s) {
         s->content_type_current = c.content_type;
         s->ctx->surfaces->set_content_hint(s->id, static_cast<lx::compositor::content_hint>(
                                                       c.content_type <= 3 ? c.content_type : 0));
-        if (surface_debug()) {
+        if (log_surface.enabled(lx::trace::level::debug)) {
             static const char* const k_types[] = {"none", "photo", "video", "game"};
-            surface_log("surface content type surface={} type={}", s->id.id(),
-                        k_types[c.content_type <= 3 ? c.content_type : 0]);
+            log_surface.debug("surface content type surface={} type={}", s->id.id(),
+                              k_types[c.content_type <= 3 ? c.content_type : 0]);
         }
     }
-    if (c.tearing != s->tearing_current && surface_debug()) {
-        surface_log("surface presentation hint surface={} hint={}", s->id.id(),
-                    c.tearing == k_tearing_async ? "async" : "vsync");
+    if (c.tearing != s->tearing_current && log_surface.enabled(lx::trace::level::debug)) {
+        log_surface.debug("surface presentation hint surface={} hint={}", s->id.id(),
+                          c.tearing == k_tearing_async ? "async" : "vsync");
     }
     s->tearing_current = c.tearing;
     if (c.fifo_set) {
@@ -1450,19 +1454,20 @@ void apply_core(surface_obj* s) {
     const lx::compositor::surface_geometry geo = lx::compositor::compute_geometry(gin);
     const lx::size2i old_size = s->surface_size;
     s->surface_size = geo.size;
-    if (surface_debug() && (old_size.width != geo.size.width || old_size.height != geo.size.height ||
-                            s->logged_buffer.width != gin.buffer_w ||
-                            s->logged_buffer.height != gin.buffer_h)) {
+    if (log_surface.enabled(lx::trace::level::debug) &&
+        (old_size.width != geo.size.width || old_size.height != geo.size.height ||
+         s->logged_buffer.width != gin.buffer_w || s->logged_buffer.height != gin.buffer_h)) {
         s->logged_buffer = {gin.buffer_w, gin.buffer_h};
         // On a change only: what the client rendered against what it covers, which says
         // whether its draw is 1:1 at the output scale.
         const auto& vp = s->current.viewport;
-        surface_log("surface geometry surface={} buffer={}x{} scale={} transform={} "
-                    "src={}{:.2f},{:.2f},{:.2f}x{:.2f} dst={}{}x{} size={}x{}",
-                    s->id.id(), gin.buffer_w, gin.buffer_h, gin.scale,
-                    static_cast<int>(gin.transform), vp.has_src ? "" : "-", vp.src_x / 256.0,
-                    vp.src_y / 256.0, vp.src_w / 256.0, vp.src_h / 256.0, vp.has_dst ? "" : "-",
-                    vp.dst_w, vp.dst_h, geo.size.width, geo.size.height);
+        log_surface.debug("surface geometry surface={} buffer={}x{} scale={} transform={} "
+                          "src={}{:.2f},{:.2f},{:.2f}x{:.2f} dst={}{}x{} size={}x{}",
+                          s->id.id(), gin.buffer_w, gin.buffer_h, gin.scale,
+                          static_cast<int>(gin.transform), vp.has_src ? "" : "-", vp.src_x / 256.0,
+                          vp.src_y / 256.0, vp.src_w / 256.0, vp.src_h / 256.0,
+                          vp.has_dst ? "" : "-", vp.dst_w, vp.dst_h, geo.size.width,
+                          geo.size.height);
     }
 
     if (s->role == surface_role::cursor) {
@@ -1569,10 +1574,10 @@ void apply_cached(surface_obj* s, const char* cause, unsigned depth) {
         return;
     const lx::size2i size = s->surface_size;
     tree->set_has_buffer(s->id, s->has_content && !s->surface_size.empty());
-    if (s->role == surface_role::subsurface && surface_debug()) {
-        surface_log("subsurface apply surface={} parent={} cause={} buffer={} w={} h={}",
-                    s->id.id(), tree->parent_of(s->id).id(), cause, s->has_content ? 1 : 0,
-                    size.width, size.height);
+    if (s->role == surface_role::subsurface && log_surface.enabled(lx::trace::level::debug)) {
+        log_surface.debug("subsurface apply surface={} parent={} cause={} buffer={} w={} h={}",
+                          s->id.id(), tree->parent_of(s->id).id(), cause, s->has_content ? 1 : 0,
+                          size.width, size.height);
     }
     tree->apply_child_state(s->id);
     lx::surface_id kids[lx::compositor::k_tree_max_children + 1];
@@ -1694,11 +1699,12 @@ lx::compositor::cu_conditions cu_conditions_of(const surface_obj* s) {
 }
 
 void log_implicit_off(int err) {
-    if (!surface_debug())
+    if (!log_surface.enabled(lx::trace::level::debug))
         return;
-    surface_log("dma-buf EXPORT_SYNC_FILE unavailable (errno {}): implicit fences are waited for "
-                "by the GPU import, not before applying",
-                err);
+    log_surface.debug(
+        "dma-buf EXPORT_SYNC_FILE unavailable (errno {}): implicit fences are waited for "
+        "by the GPU import, not before applying",
+        err);
 }
 
 /// An explicit-sync acquire point that has not signalled yet: an eventfd armed with
@@ -1913,8 +1919,7 @@ void warn_overflow() {
     if (g_overflow_warned)
         return;
     g_overflow_warned = true;
-    lx::trace::logger::global().log(
-        lx::trace::level::warn, "compositor.surface",
+    log_surface.warn(
         "content-update queue full (a client far ahead of the display): its newest updates are "
         "merged, superseding frames rather than showing any early. Reported once.");
 }
@@ -2092,11 +2097,12 @@ bool commit_dcu(surface_obj* s, bool root_commit, const char* cause) {
                     s->ctx->cu_request_at(s->ctx->cu_user, static_cast<unsigned>(pace),
                                           rec.target_ns);
             }
-            if (surface_debug()) {
-                surface_log("content update queued surface={} cause={} depth={} waits={} fifo={} "
-                            "barrier={} target={} sealed={}",
-                            s->id.id(), cause, g_cu.depth(slot), rec.waits, rec.fifo_wait ? 1 : 0,
-                            s->fifo_barrier ? 1 : 0, rec.target_ns, nk);
+            if (log_surface.enabled(lx::trace::level::debug)) {
+                log_surface.debug(
+                    "content update queued surface={} cause={} depth={} waits={} fifo={} "
+                    "barrier={} target={} sealed={}",
+                    s->id.id(), cause, g_cu.depth(slot), rec.waits, rec.fifo_wait ? 1 : 0,
+                    s->fifo_barrier ? 1 : 0, rec.target_ns, nk);
             }
             return false;
         }
@@ -2108,8 +2114,7 @@ bool commit_dcu(surface_obj* s, bool root_commit, const char* cause) {
             // there is nowhere for it to wait: the client is past its share of the pool (the
             // reserve keeps room for any client that queues little), so it is the one that
             // goes — wlroots and Mutter answer an allocation failure the same way.
-            lx::trace::logger::global().log(
-                lx::trace::level::warn, "compositor.surface",
+            log_surface.warn(
                 "content-update queue full for an update waiting on its acquire point: "
                 "client disconnected (no_memory)");
             wl_client_post_no_memory(wl_resource_get_client(s->resource));
@@ -2291,13 +2296,13 @@ void surface_commit(struct wl_client*, struct wl_resource* resource) {
         // fifo-v1: "The constraint must be ignored if the surface is a subsurface in
         // synchronized mode."
         s->cached.fifo_wait = false;
-        if (surface_debug()) {
-            surface_log("subsurface commit surface={} mode=sync cached=1", s->id.id());
+        if (log_surface.enabled(lx::trace::level::debug)) {
+            log_surface.debug("subsurface commit surface={} mode=sync cached=1", s->id.id());
         }
         return;
     }
-    if (is_sub && surface_debug()) {
-        surface_log("subsurface commit surface={} mode=desync cached=0", s->id.id());
+    if (is_sub && log_surface.enabled(lx::trace::level::debug)) {
+        log_surface.debug("subsurface commit surface={} mode=desync cached=0", s->id.id());
     }
     if (commit_dcu(s, true, is_sub ? "desync-commit" : "commit"))
         finish_commit(s, true, "commit");
@@ -2607,7 +2612,7 @@ lx::compositor::content_queue& cu_queue() { return g_cu; }
 int cu_poll_fd() {
     if (g_poller.fd() < 0) {
         if (auto opened = g_poller.open(); !opened)
-            lx::trace::logger::global().log_error(opened.get_error(), "compositor.surface");
+            log_surface.error(opened.get_error());
     }
     return g_poller.fd();
 }

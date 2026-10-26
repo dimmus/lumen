@@ -18,6 +18,12 @@ import :invalidate;
 import :node;
 import :theme;
 
+namespace {
+
+constexpr lx::trace::category log_icon{"ui.icon"};
+
+} // namespace
+
 // ── Icons (ADR-010 §5.5) ───────────────────────────────────────────────────────────────
 //
 // Lumen bundles a subset of Lucide (ISC; assets/icons/lucide, the README there lists them
@@ -503,8 +509,7 @@ void lx::ui::icon_cache::run_job(void* raw) {
     const lx::runtime::task back{&icon_cache::land_job, j};
     for (unsigned attempt = 0; !j->state->executor->post(lx::runtime::affinity::ui, back); ++attempt) {
         if (attempt == 100000) {
-            lx::trace::logger::global().log(lx::trace::level::error, "ui.icon",
-                                            "icon_cache: UI strand full, raster lost");
+            log_icon.error("icon_cache: UI strand full, raster lost");
             return;
         }
         std::this_thread::yield();

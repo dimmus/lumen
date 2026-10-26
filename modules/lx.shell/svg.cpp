@@ -13,6 +13,12 @@ import lx.foundation;
 import lx.trace;
 
 namespace {
+
+constexpr lx::trace::category log_shell{"shell"};
+
+} // namespace
+
+namespace {
 #if defined(LUMEN_HAS_RSVG)
 /// The librsvg, cairo and GLib entry points the shell uses, from one dlopen'd handle
 /// (dlsym searches the library's own dependencies too, which is where cairo and GLib are).
@@ -37,9 +43,8 @@ const rsvg_api& api() {
         rsvg_api a{};
         void* lib = ::dlopen("librsvg-2.so.2", RTLD_NOW | RTLD_LOCAL);
         if (!lib) {
-            lx::trace::logger::global().log(lx::trace::level::warn, "shell",
-                                            "librsvg-2.so.2 cannot be loaded: SVG icons and "
-                                            "backgrounds are not drawn");
+            log_shell.warn("librsvg-2.so.2 cannot be loaded: SVG icons and "
+                           "backgrounds are not drawn");
             return a;
         }
         const auto sym = [lib]<class F>(F& slot, const char* name) {
@@ -55,9 +60,8 @@ const rsvg_api& api() {
                sym(a.surface_flush, "cairo_surface_flush") &&
                sym(a.surface_destroy, "cairo_surface_destroy");
         if (!a.ok)
-            lx::trace::logger::global().log(lx::trace::level::warn, "shell",
-                                            "librsvg lacks an entry point Lumen needs (2.52+): "
-                                            "SVG icons and backgrounds are not drawn");
+            log_shell.warn("librsvg lacks an entry point Lumen needs (2.52+): "
+                           "SVG icons and backgrounds are not drawn");
         return a;
     }();
     return loaded;

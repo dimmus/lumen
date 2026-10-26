@@ -221,9 +221,6 @@ private:
     /// not once per popup: the client would see an enter/leave pair for every level.
     void hold_focus() { ++focus_hold_; }
     void release_focus();
-    void log_line(const char* line) const;
-    template <typename... Args>
-    void log_line(std::format_string<Args...> fmt, Args&&... args) const;
 
     toplevel_manager* toplevels_ = nullptr;
     surface_manager* surfaces_ = nullptr;
@@ -249,11 +246,7 @@ private:
 
 namespace {
 
-constexpr const char* k_popup_category = "compositor.popup";
-
-[[nodiscard]] bool popup_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_popup{"compositor.popup"};
 
 [[nodiscard]] const char* axes(unsigned bits) {
     switch (bits & 3u) {
@@ -286,17 +279,6 @@ void lx::compositor::popup_manager::bind(toplevel_manager& toplevels, surface_ma
     surfaces_ = &surfaces;
     tree_ = &tree;
     layer_ = &popup_layer;
-}
-
-void lx::compositor::popup_manager::log_line(const char* line) const {
-    lx::trace::logger::global().log(lx::trace::level::debug, k_popup_category, line);
-}
-
-template <typename... Args>
-void lx::compositor::popup_manager::log_line(std::format_string<Args...> fmt,
-                                             Args&&... args) const {
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_popup_category, fmt,
-                                     std::forward<Args>(args)...);
 }
 
 int lx::compositor::popup_manager::slot_of(lx::surface_id surface) const {
@@ -337,9 +319,9 @@ lx::compositor::popup_manager::create(lx::surface_id surface, lx::client_id clie
         r.rules = rules;
         r.created_seq = next_seq_++;
         tree_->set_root_tag(surface, 0);
-        if (popup_debug()) {
-            log_line("popup create surface={} parent={} parent_kind={}", surface.id(), parent.id(),
-                     parent_kind_name(parent_kind));
+        if (log_popup.enabled(lx::trace::level::debug)) {
+            log_popup.debug("popup create surface={} parent={} parent_kind={}", surface.id(),
+                            parent.id(), parent_kind_name(parent_kind));
         }
         return create_error::none;
     }
@@ -384,8 +366,9 @@ bool lx::compositor::popup_manager::set_layer_parent(lx::surface_id popup, lx::s
     r->parent_kind = popup_parent_kind::layer;
     r->parent = layer;
     r->owner = {};
-    if (popup_debug()) {
-        log_line("popup parent surface={} parent={} parent_kind=layer", popup.id(), layer.id());
+    if (log_popup.enabled(lx::trace::level::debug)) {
+        log_popup.debug("popup parent surface={} parent={} parent_kind=layer", popup.id(),
+                        layer.id());
     }
     return true;
 }
@@ -464,14 +447,15 @@ void lx::compositor::popup_manager::send_place(popup_record& rec, const char* re
     rec.rel_sent = placed.rect;
     ops_.send_configure(rec.popup_res, rec.xdg_surface_res, placed.rect, serial, repositioned,
                         token);
-    if (popup_debug()) {
-        log_line("popup position surface={} parent={} x={} y={} w={} h={} anchor={} gravity={} "
-                 "adjust={} flipped={} slid={} resized={} constraint={},{},{}x{} serial={} "
-                 "reason={} token={}",
-                 rec.surface.id(), rec.parent.id(), placed.rect.x, placed.rect.y, placed.rect.width,
-                 placed.rect.height, rec.rules.anchor, rec.rules.gravity, rec.rules.adjustment,
-                 axes(placed.flipped), axes(placed.slid), axes(placed.resized), constraint.x,
-                 constraint.y, constraint.width, constraint.height, serial, reason, token);
+    if (log_popup.enabled(lx::trace::level::debug)) {
+        log_popup.debug(
+            "popup position surface={} parent={} x={} y={} w={} h={} anchor={} gravity={} "
+            "adjust={} flipped={} slid={} resized={} constraint={},{},{}x{} serial={} "
+            "reason={} token={}",
+            rec.surface.id(), rec.parent.id(), placed.rect.x, placed.rect.y, placed.rect.width,
+            placed.rect.height, rec.rules.anchor, rec.rules.gravity, rec.rules.adjustment,
+            axes(placed.flipped), axes(placed.slid), axes(placed.resized), constraint.x,
+            constraint.y, constraint.width, constraint.height, serial, reason, token);
     }
 }
 
@@ -494,8 +478,8 @@ lx::compositor::popup_manager::on_ack(lx::surface_id surface, unsigned serial) {
         r->sent_count -= popped;
         r->ack_unapplied = true;
         r->ever_acked = true;
-        if (popup_debug()) {
-            log_line("popup ack surface={} serial={}", surface.id(), serial);
+        if (log_popup.enabled(lx::trace::level::debug)) {
+            log_popup.debug("popup ack surface={} serial={}", surface.id(), serial);
         }
         return ack_result::ok;
     }
@@ -529,8 +513,9 @@ bool lx::compositor::popup_manager::place_root(popup_record& rec) {
 void lx::compositor::popup_manager::map(popup_record& rec) {
     lx::rect2i parent{};
     if (!parent_geometry(rec, parent)) {
-        if (popup_debug()) {
-            log_line("popup map-deferred surface={} reason=parent-unmapped", rec.surface.id());
+        if (log_popup.enabled(lx::trace::level::debug)) {
+            log_popup.debug("popup map-deferred surface={} reason=parent-unmapped",
+                            rec.surface.id());
         }
         return;
     }
@@ -538,17 +523,16 @@ void lx::compositor::popup_manager::map(popup_record& rec) {
     tree_->set_root_origin(rec.surface, {rec.origin.x - rec.geometry_offset.x,
                                          rec.origin.y - rec.geometry_offset.y});
     if (!layer_ || !tree_->map_root(rec.surface, *layer_, ~0u)) {
-        lx::trace::logger::global().log(lx::trace::level::warn, k_popup_category,
-                                        "popup map failed: popup layer full");
+        log_popup.warn("popup map failed: popup layer full");
         return;
     }
     rec.mapped = true;
     const int slot = slot_of(rec.surface);
     if (slot >= 0 && order_.size() < k_max)
         order_.push_back(static_cast<unsigned>(slot));
-    if (popup_debug()) {
-        log_line("popup map surface={} x={} y={} w={} h={}", rec.surface.id(), rec.origin.x,
-                 rec.origin.y, rec.rel.width, rec.rel.height);
+    if (log_popup.enabled(lx::trace::level::debug)) {
+        log_popup.debug("popup map surface={} x={} y={} w={} h={}", rec.surface.id(), rec.origin.x,
+                        rec.origin.y, rec.rel.width, rec.rel.height);
     }
     if (rec.grabbing)
         notify_focus();
@@ -569,8 +553,8 @@ void lx::compositor::popup_manager::unmap(popup_record& rec, const char* reason)
     const int slot = slot_of(rec.surface);
     if (slot >= 0)
         order_remove(static_cast<unsigned>(slot));
-    if (popup_debug()) {
-        log_line("popup unmap surface={} reason={}", rec.surface.id(), reason);
+    if (log_popup.enabled(lx::trace::level::debug)) {
+        log_popup.debug("popup unmap surface={} reason={}", rec.surface.id(), reason);
     }
     if (rec.grabbing)
         notify_focus();
@@ -698,8 +682,8 @@ lx::compositor::popup_manager::grab(lx::surface_id surface, bool serial_ok, bool
     if (!deny && grab_stack_.size() >= k_max_grab)
         deny = "stack-full";
     if (deny) {
-        if (popup_debug()) {
-            log_line("popup grab surface={} result=denied reason={}", surface.id(), deny);
+        if (log_popup.enabled(lx::trace::level::debug)) {
+            log_popup.debug("popup grab surface={} result=denied reason={}", surface.id(), deny);
         }
         dismiss_one(*r, "grab-denied");
         return grab_result::denied;
@@ -710,8 +694,8 @@ lx::compositor::popup_manager::grab(lx::surface_id surface, bool serial_ok, bool
     grab_stack_.push_back(surface);
     grab_client_ = r->client;
     r->grabbing = true;
-    if (popup_debug()) {
-        log_line("popup grab surface={} result=ok reason=-", surface.id());
+    if (log_popup.enabled(lx::trace::level::debug)) {
+        log_popup.debug("popup grab surface={} result=ok reason=-", surface.id());
     }
     notify_focus();
     return grab_result::ok;
@@ -730,8 +714,8 @@ void lx::compositor::popup_manager::dismiss_one(popup_record& rec, const char* r
     if (rec.dismissed)
         return;
     rec.dismissed = true;
-    if (popup_debug()) {
-        log_line("popup dismiss surface={} reason={}", rec.surface.id(), reason);
+    if (log_popup.enabled(lx::trace::level::debug)) {
+        log_popup.debug("popup dismiss surface={} reason={}", rec.surface.id(), reason);
     }
     // "At the same time the surface will be unmapped."
     const bool alive = !ops_.client_alive || ops_.client_alive(rec.client_native);
@@ -813,14 +797,14 @@ void lx::compositor::popup_manager::destroy(lx::surface_id surface) {
         const int slot = slot_of(surface);
         if (slot >= 0)
             order_remove(static_cast<unsigned>(slot));
-        if (popup_debug()) {
-            log_line("popup unmap surface={} reason=destroyed", surface.id());
+        if (log_popup.enabled(lx::trace::level::debug)) {
+            log_popup.debug("popup unmap surface={} reason=destroyed", surface.id());
         }
     }
     if (r->grabbing)
         stack_remove(surface);
-    if (popup_debug()) {
-        log_line("popup destroy surface={}", surface.id());
+    if (log_popup.enabled(lx::trace::level::debug)) {
+        log_popup.debug("popup destroy surface={}", surface.id());
     }
     index_.erase(surface.id());
     *r = {};

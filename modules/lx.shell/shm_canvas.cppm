@@ -191,7 +191,7 @@ private:
 
 namespace {
 
-constexpr const char* k_canvas_category = "shell.panel";
+constexpr lx::trace::category log_panel{"shell.panel"};
 
 [[nodiscard]] std::uint32_t mix(std::uint32_t over, std::uint32_t under, unsigned a /*0..255*/) {
     const unsigned ia = 255u - a;
@@ -353,9 +353,8 @@ bool lx::shell::shm_canvas::shape(const char* utf8, lx::text::font_desc font) {
     if (auto shaped = lx::text::shape_line(utf8, font, line_); !shaped) {
         if (!font_warned_) {
             font_warned_ = true;
-            lx::trace::logger::global().log_error(shaped.get_error(), k_canvas_category);
-            lx::trace::logger::global().log(lx::trace::level::warn, k_canvas_category,
-                                            "no text rendering: labels are not drawn");
+            log_panel.error(shaped.get_error());
+            log_panel.warn("no text rendering: labels are not drawn");
         }
         return false;
     }

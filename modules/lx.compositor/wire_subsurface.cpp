@@ -53,12 +53,12 @@ surface_obj* subsurface_surface(wl_resource* r) {
 }
 
 void subsurface_log_sync(const surface_obj* s) {
-    if (!surface_debug())
+    if (!log_surface.enabled(lx::trace::level::debug))
         return;
     const auto* tree = s->ctx->tree;
-    surface_log("subsurface sync surface={} mode={} effective={}", s->id.id(),
-                tree->sync_flag(s->id) ? "sync" : "desync",
-                tree->effectively_sync(s->id) ? "sync" : "desync");
+    log_surface.debug("subsurface sync surface={} mode={} effective={}", s->id.id(),
+                      tree->sync_flag(s->id) ? "sync" : "desync",
+                      tree->effectively_sync(s->id) ? "sync" : "desync");
 }
 
 void subsurface_place(wl_resource* resource, wl_resource* sibling_res, bool above) {
@@ -191,9 +191,9 @@ void subcompositor_get_subsurface(struct wl_client* client, struct wl_resource* 
     s->sub = o;
     s->role = surface_role::subsurface;
     wl_resource_set_implementation(res, &subsurface_impl, o, subsurface_destroy_resource);
-    if (surface_debug()) {
-        surface_log("subsurface create surface={} parent={} root={}", s->id.id(), p->id.id(),
-                    s->ctx->tree->root_of(s->id).id());
+    if (log_surface.enabled(lx::trace::level::debug)) {
+        log_surface.debug("subsurface create surface={} parent={} root={}", s->id.id(), p->id.id(),
+                          s->ctx->tree->root_of(s->id).id());
     }
 }
 

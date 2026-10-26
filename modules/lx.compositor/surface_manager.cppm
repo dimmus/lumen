@@ -10,6 +10,12 @@ export module lx.compositor:surface;
 
 import std;
 
+namespace {
+
+constexpr lx::trace::category log_surface{"compositor.surface"};
+
+} // namespace
+
 export namespace lx::compositor {
 
 /// What a surface shows (wp_content_type_v1, plus the compositor's own subsurface UI hint):
@@ -670,9 +676,8 @@ bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface,
         delete node;
         if (!warned_container_full_) {
             warned_container_full_ = true;
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.surface",
-                                            "scene container full — surface not drawn. "
-                                            "Reported once.");
+            log_surface.warn("scene container full — surface not drawn. "
+                             "Reported once.");
         }
         return false;
     }

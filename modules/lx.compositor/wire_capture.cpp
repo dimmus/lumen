@@ -80,6 +80,12 @@ import :capture_engine;
 import :content_update;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_capture{"compositor.capture"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -98,16 +104,6 @@ capture_session_table g_sessions{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<unsigned long long>(ts.tv_sec) * 1'000'000'000ull +
            static_cast<unsigned long long>(ts.tv_nsec);
-}
-
-void capture_log(const char* line) {
-    lx::trace::logger::global().log(lx::trace::level::debug, "compositor.capture", line);
-}
-
-template <typename... Args>
-void capture_log(std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.capture", fmt,
-                                     std::forward<Args>(args)...);
 }
 
 } // namespace
@@ -355,8 +351,8 @@ void stop_session(session_obj* so, const char* why) {
         if (so->resource)
             ext_image_copy_capture_session_v1_send_stopped(so->resource);
         so->stopped_sent = true;
-        if (surface_debug()) {
-            capture_log("session {} stopped ({})", so->handle, why);
+        if (log_capture.enabled(lx::trace::level::debug)) {
+            log_capture.debug("session {} stopped ({})", so->handle, why);
         }
     }
     release_view(so);
@@ -681,10 +677,10 @@ void send_ready(frame_obj* f, const capture_completion& meta) {
     }
     if (so && !f->curtain)
         so->last_ready_ns = mono_ns();
-    if (surface_debug() && so) {
-        capture_log("frame ready session={} serial={} damage={}{} frame={}{}", so->handle,
-                    f->serial, d.full ? "full/" : "", d.full ? 0u : d.count, meta.frame,
-                    f->curtain ? " curtain" : "");
+    if (log_capture.enabled(lx::trace::level::debug) && so) {
+        log_capture.debug("frame ready session={} serial={} damage={}{} frame={}{}", so->handle,
+                          f->serial, d.full ? "full/" : "", d.full ? 0u : d.count, meta.frame,
+                          f->curtain ? " curtain" : "");
     }
 }
 
@@ -1008,14 +1004,14 @@ void create_session(struct wl_client* client, struct wl_resource* manager, uint3
             send_constraints(so, cs->constraints);
         }
     }
-    if (surface_debug()) {
-        capture_log("session {} client={} kind={} paint_cursors={}{}{}", handle,
-                    wire_client_id(client),
-                    !src                                         ? "none"
-                    : src->kind == capture_source_kind::output   ? "output"
-                    : src->kind == capture_source_kind::toplevel ? "toplevel"
-                                                                 : "none",
-                    (options & 1u) ? 1 : 0, why ? " stopped: " : "", why ? why : "");
+    if (log_capture.enabled(lx::trace::level::debug)) {
+        log_capture.debug("session {} client={} kind={} paint_cursors={}{}{}", handle,
+                          wire_client_id(client),
+                          !src                                         ? "none"
+                          : src->kind == capture_source_kind::output   ? "output"
+                          : src->kind == capture_source_kind::toplevel ? "toplevel"
+                                                                       : "none",
+                          (options & 1u) ? 1 : 0, why ? " stopped: " : "", why ? why : "");
     }
     if (why)
         stop_session(so, why);
@@ -1490,8 +1486,7 @@ void lx::compositor::capture_tick(p0_protocol_context& ctx, unsigned frame, bool
     if (active != g_indicator) {
         g_indicator = active;
         shell_send_capture_state(active);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.capture",
-                                        active ? "screen capture active" : "screen capture idle");
+        log_capture.info("{}", active ? "screen capture active" : "screen capture idle");
     }
 #else
     (void)ctx;

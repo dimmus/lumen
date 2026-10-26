@@ -19,8 +19,8 @@ import lx.config;
 
 namespace {
 
-constexpr const char* k_desktop_category = "shell.notify";
-constexpr const char* k_tray_log = "shell.tray";
+constexpr lx::trace::category log_notify{"shell.notify"};
+constexpr lx::trace::category log_tray{"shell.tray"};
 constexpr const char* k_notifications_name = "org.freedesktop.Notifications";
 /// A tray item's tooltip appears after this much hovering (GNOME, KDE).
 constexpr long long k_tooltip_delay_ns = 500'000'000LL;
@@ -143,8 +143,7 @@ lx::shell::shell_app::output_record* lx::shell::shell_app::output_by_name(unsign
 
 void lx::shell::shell_app::save_state() {
     if (!state_path_.empty() && !save_shell_state(state_path_.c_str(), state_))
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_desktop_category,
-                                         "cannot write {}", state_path_);
+        log_notify.debug("cannot write {}", state_path_);
 }
 
 void lx::shell::shell_app::start_desktop_services() {
@@ -216,11 +215,9 @@ void lx::shell::shell_app::start_desktop_services() {
     for (auto& o : outputs_)
         if (o->bar)
             attach_widgets(*o);
-    lx::trace::logger::global().logf(lx::trace::level::info, k_desktop_category,
-                                     "notifications and tray on the user bus as {} (next id {}, "
-                                     "do not disturb {})",
-                                     bus_.unique_name(), notes_.next_id(),
-                                     notes_.dnd_manual() ? "on" : "off");
+    log_notify.info("notifications and tray on the user bus as {} (next id {}, "
+                    "do not disturb {})",
+                    bus_.unique_name(), notes_.next_id(), notes_.dnd_manual() ? "on" : "off");
 }
 
 void lx::shell::shell_app::stop_desktop_services() {
@@ -327,9 +324,8 @@ void lx::shell::shell_app::desktop_after_dispatch() {
     const bool dnd = notes_.dnd();
     if (dnd != dnd_seen_) {
         dnd_seen_ = dnd;
-        lx::trace::logger::global().logf(lx::trace::level::info, k_desktop_category,
-                                         "notifications: do not disturb {}{}", dnd ? "on" : "off",
-                                         dnd && !notes_.dnd_manual() ? " (screen captured)" : "");
+        log_notify.info("notifications: do not disturb {}{}", dnd ? "on" : "off",
+                        dnd && !notes_.dnd_manual() ? " (screen captured)" : "");
     }
     if (tray_.rev() != tray_rev_seen_ || notes_.rev() != notes_rev_seen_) {
         for (auto& out : outputs_)
@@ -499,10 +495,8 @@ void lx::shell::shell_app::post_internal(const char* summary, const char* body,
     r.expire_timeout = 0;
     const unsigned replaced = slot;
     slot = notes_.notify(std::move(r), now_ns());
-    lx::trace::logger::global().logf(lx::trace::level::info, k_desktop_category,
-                                     "notify id={}{} app=\"Lumen\" (the shell's own) summary=\"{}\"",
-                                     slot, replaced == slot ? " (replaced)" : "",
-                                     summary ? summary : "");
+    log_notify.info("notify id={}{} app=\"Lumen\" (the shell's own) summary=\"{}\"", slot,
+                    replaced == slot ? " (replaced)" : "", summary ? summary : "");
 }
 
 void lx::shell::shell_app::on_notify_click(const notify_click& c, unsigned serial) {
@@ -543,8 +537,7 @@ void lx::shell::shell_app::on_notify_click(const notify_click& c, unsigned seria
             report_failure("xdg-open", "a link", f, nullptr, 0, nullptr);
             return;
         }
-        lx::trace::logger::global().logf(lx::trace::level::info, k_desktop_category,
-                                         "notify id={} link opened", c.id);
+        log_notify.info("notify id={} link opened", c.id);
         begin_launch(std::move(p), serial, note_view_.surface());
         return;
     }
@@ -591,9 +584,7 @@ void lx::shell::shell_app::toggle_dnd(const char* why) {
     notes_.set_dnd(on, now_ns());
     state_.dnd = on;
     save_state();
-    lx::trace::logger::global().logf(lx::trace::level::info, k_desktop_category,
-                                     "notifications: do not disturb {} ({})", on ? "set" : "cleared",
-                                     why);
+    log_notify.info("notifications: do not disturb {} ({})", on ? "set" : "cleared", why);
 }
 
 void lx::shell::shell_app::open_history(output_record& o, const panel_widget_event& e) {
@@ -850,9 +841,8 @@ void lx::shell::shell_app::show_tooltip() {
                                : !it->title.empty()       ? it->title
                                                           : it->id;
     if (tooltip_.open(o->bar->layer(), tooltip_cell_, title, it->tooltip_text) &&
-        lx::trace::logger::global().min_level() <= lx::trace::level::debug)
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_tray_log,
-                                         "tray: tooltip \"{}\"", title);
+        log_tray.enabled(lx::trace::level::debug))
+        log_tray.debug("tray: tooltip \"{}\"", title);
 }
 
 #else // !LUMEN_SHELL_WAYLAND

@@ -79,6 +79,63 @@ private:
     bool use_default_sink_ = true;
 };
 
+/// A log category: the one way code outside `lx.trace` logs. Declare it once per file or
+/// partition, then log through the method named after the level:
+///
+///     constexpr lx::trace::category log_surface{"compositor.surface"};
+///     log_surface.debug("attach id={} w={}", id.id(), w);
+///     log_surface.error(err);
+///     if (log_surface.enabled(lx::trace::level::debug)) { ... }
+///
+/// The name must be a string literal (the timeline keeps the pointer), which the
+/// `consteval` constructor enforces. Formatting is `logger::logf`: `std::format` syntax
+/// checked at compile time, nothing built below the minimum level, no allocation. Text
+/// known only at run time goes through `"{}"`.
+class category {
+public:
+    consteval category(const char* name) noexcept : name_{name} {}
+
+    [[nodiscard]] constexpr const char* name() const noexcept { return name_; }
+    [[nodiscard]] bool enabled(level lvl) const noexcept {
+        return lvl >= logger::global().min_level();
+    }
+
+    /// For a level chosen at run time; otherwise use the method named after the level.
+    template <typename... Args>
+    void log(level lvl, std::format_string<Args...> fmt, Args&&... args) const {
+        logger::global().logf(lvl, name_, fmt, std::forward<Args>(args)...);
+    }
+    template <typename... Args>
+    void trace(std::format_string<Args...> fmt, Args&&... args) const {
+        log(level::trace, fmt, std::forward<Args>(args)...);
+    }
+    template <typename... Args>
+    void debug(std::format_string<Args...> fmt, Args&&... args) const {
+        log(level::debug, fmt, std::forward<Args>(args)...);
+    }
+    template <typename... Args>
+    void info(std::format_string<Args...> fmt, Args&&... args) const {
+        log(level::info, fmt, std::forward<Args>(args)...);
+    }
+    template <typename... Args>
+    void warn(std::format_string<Args...> fmt, Args&&... args) const {
+        log(level::warn, fmt, std::forward<Args>(args)...);
+    }
+    template <typename... Args>
+    void error(std::format_string<Args...> fmt, Args&&... args) const {
+        log(level::error, fmt, std::forward<Args>(args)...);
+    }
+    template <typename... Args>
+    void critical(std::format_string<Args...> fmt, Args&&... args) const {
+        log(level::critical, fmt, std::forward<Args>(args)...);
+    }
+    /// A failed `result`, logged once at the boundary that handles it.
+    void error(const lx::error& err) const { logger::global().log_error(err, name_); }
+
+private:
+    const char* name_;
+};
+
 /// A named interval on the calling thread: a trace-level log line pair when trace logging
 /// is on, and a slice in the timeline when one is recording. `category` and `name` must be
 /// string literals (the timeline stores the pointers). Costs one relaxed load when neither
@@ -124,9 +181,6 @@ bool timeline_flush();
 
 // `LX_TRACE_SCOPE(cat, name)`, a `scoped_span` for the rest of the block, is a macro and so
 // lives in `lx.trace/scope.hpp`: a named module exports no macros.
-
-void trace_event(level lvl, const char* category, const char* name,
-                 const char* key = nullptr, const char* value = nullptr);
 
 /// Default sink: `[LEVEL] category: message` on stderr. Used until `set_sink` overrides.
 void default_stderr_sink(level lvl, const char* category, const char* message, void* user);
@@ -200,14 +254,15 @@ void lx::trace::default_stderr_sink(level lvl, const char* category, const char*
 }
 
 lx::trace::logger& lx::trace::logger::global() {
-    static logger instance;
-    static bool initialized = false;
-    if (!initialized) {
-        instance.min_level_ = read_env_min_level();
-        instance.sink_ = default_stderr_sink;
-        instance.use_default_sink_ = true;
-        initialized = true;
-    }
+    // Set up in the static's initializer, which runs once even when two threads log first
+    // at the same time.
+    static logger instance = [] {
+        logger l;
+        l.min_level_ = read_env_min_level();
+        l.sink_ = default_stderr_sink;
+        l.use_default_sink_ = true;
+        return l;
+    }();
     return instance;
 }
 
@@ -526,16 +581,5 @@ lx::trace::scoped_span::~scoped_span() {
 #endif
     if (should_log(level::trace, logger::global().min_level())) {
         logger::global().logf(level::trace, category_, "~{}", name_);
-    }
-}
-
-void lx::trace::trace_event(level lvl, const char* category, const char* name,
-                            const char* key, const char* value) {
-    if (!should_log(lvl, logger::global().min_level())) return;
-    if (key && value) {
-        logger::global().logf(lvl, category ? category : "trace", "{} {}={}", name ? name : "", key,
-                              value);
-    } else {
-        logger::global().log(lvl, category ? category : "trace", name ? name : "");
     }
 }

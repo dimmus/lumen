@@ -44,12 +44,7 @@ namespace lx::portal {
 
 namespace {
 
-constexpr const char* k_category = "portal.wayland";
-
-template <typename... Args>
-void log_line(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_category, fmt, std::forward<Args>(args)...);
-}
+constexpr lx::trace::category log_wayland{"portal.wayland"};
 
 double now_ms() {
     timespec ts{};
@@ -579,14 +574,13 @@ lx::result<std::vector<output_shot>> desktop::capture_outputs(bool paint_cursor,
             s.pixels = upright(static_cast<const std::uint32_t*>(j->map), j->buffer_size.width,
                                j->buffer_size.height, j->buffer_size.width,
                                static_cast<lx::buffer_transform>(j->transform & 7));
-            log_line(lx::trace::level::debug,
-                     "captured output {} {}x{} transform={} layout={},{} {}x{}", s.name.c_str(),
-                     j->buffer_size.width, j->buffer_size.height, j->transform, s.logical.x,
-                     s.logical.y, s.logical.width, s.logical.height);
+            log_wayland.debug("captured output {} {}x{} transform={} layout={},{} {}x{}",
+                              s.name.c_str(), j->buffer_size.width, j->buffer_size.height,
+                              j->transform, s.logical.x, s.logical.y, s.logical.width,
+                              s.logical.height);
             shots.push_back(std::move(s));
         }
-        log_line(lx::trace::level::debug, "captured {} output(s) in {:.1f} ms", shots.size(),
-                 now_ms() - t0);
+        log_wayland.debug("captured {} output(s) in {:.1f} ms", shots.size(), now_ms() - t0);
     }
     for (capture_job* j : jobs)
         j->destroy();

@@ -342,7 +342,7 @@ bool lx::shell::workspace_view::take_changed() {
 
 namespace {
 
-constexpr const char* k_ws_category = "shell.workspaces";
+constexpr lx::trace::category log_workspaces{"shell.workspaces"};
 
 } // namespace
 
@@ -364,8 +364,7 @@ struct lx::shell::workspace_client::events {
             for (int i = 0; i < static_cast<int>(k_max_shell_workspaces); ++i)
                 if (c.view_.get(i))
                     ++n;
-            lx::trace::logger::global().logf(lx::trace::level::info, k_ws_category,
-                                             "ext-workspace: {} workspaces", n);
+            log_workspaces.info("ext-workspace: {} workspaces", n);
         }
     }
     static void finished(void* data, ext_workspace_manager_v1* m) {
@@ -494,8 +493,7 @@ void lx::shell::workspace_client::activate(int ws) {
         return;
     ext_workspace_handle_v1_activate(static_cast<ext_workspace_handle_v1*>(w->proxy));
     ext_workspace_manager_v1_commit(static_cast<ext_workspace_manager_v1*>(manager_));
-    lx::trace::logger::global().logf(lx::trace::level::info, k_ws_category,
-                                     "activate workspace {}", w->name);
+    log_workspaces.info("activate workspace {}", w->name);
 }
 
 void lx::shell::workspace_client::destroy() {

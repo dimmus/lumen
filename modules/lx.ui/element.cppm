@@ -8,6 +8,12 @@ export module lx.ui:element;
 
 import std;
 
+namespace {
+
+constexpr lx::trace::category log_ui{"ui"};
+
+} // namespace
+
 export namespace lx::ui {
 
 class ui_node;
@@ -163,7 +169,6 @@ private:
 
 } // namespace lx::ui
 
-
 namespace {
 /// UI affinity owns rebuilds, so a plain pointer is sufficient — there is never a
 /// concurrent rebuild on another thread.
@@ -210,8 +215,7 @@ void lx::ui::build_context::note_overflow() {
     if (overflowed_)
         return;
     overflowed_ = true;
-    lx::trace::logger::global().log(lx::trace::level::warn, "ui",
-                                    "UI frame arena exhausted — keeping previous tree");
+    log_ui.warn("UI frame arena exhausted — keeping previous tree");
 }
 
 lx::ui::build_context* lx::ui::build_context::current() { return g_current_build_context; }

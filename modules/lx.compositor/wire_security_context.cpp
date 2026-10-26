@@ -49,6 +49,12 @@ import lx.wayland.server;
 import lx.trace;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_wayland{"wayland"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_SECURITY_CONTEXT)
 
 namespace lx::compositor::p0 {
@@ -177,15 +183,14 @@ const struct wp_security_context_v1_interface context_impl = {
             if (!added) {
                 // No protocol error exists for it: connections on that socket are never
                 // accepted, and the engine sees them fail.
-                lx::trace::logger::global().log_error(added.get_error(), "wayland");
+                log_wayland.error(added.get_error());
                 return;
             }
-            lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
-                                             "security context listener: engine={} app_id={} "
-                                             "instance={}",
-                                             c->ctx.sandbox_engine[0] ? c->ctx.sandbox_engine : "-",
-                                             c->ctx.app_id[0] ? c->ctx.app_id : "-",
-                                             c->ctx.instance_id[0] ? c->ctx.instance_id : "-");
+            log_wayland.info("security context listener: engine={} app_id={} "
+                             "instance={}",
+                             c->ctx.sandbox_engine[0] ? c->ctx.sandbox_engine : "-",
+                             c->ctx.app_id[0] ? c->ctx.app_id : "-",
+                             c->ctx.instance_id[0] ? c->ctx.instance_id : "-");
         },
 };
 

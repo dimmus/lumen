@@ -18,6 +18,12 @@ import std;
 import :toplevel;
 import :toplevel_icon;
 
+namespace {
+
+constexpr lx::trace::category log_shell{"compositor.shell"};
+
+} // namespace
+
 export namespace lx::compositor {
 
 /// zlm_policy_bridge_v1.toplevel_flag bits.
@@ -289,9 +295,8 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
     if (bridge_ && bridge_ != resource) {
         // Only the configured shell binary gets here (the privilege check), so this is a
         // second instance of it: the newest wins and the old one's handles go inert.
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.shell",
-                                        "bridge replaced: a second shell bound "
-                                        "zlm_policy_bridge_v1; the previous one goes inert");
+        log_shell.warn("bridge replaced: a second shell bound "
+                       "zlm_policy_bridge_v1; the previous one goes inert");
         detach_all_handles();
     }
     bridge_ = resource;
@@ -364,12 +369,10 @@ void lx::compositor::shell_bridge::on_bridge_bound(void* resource, lx::toplevel_
         if (server_)
             if (auto* conn = server_->find_client_by_native(wl_resource_get_client(bridge)))
                 cid = conn->id();
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.shell",
-                                         "bridge bound client={} snapshot={} focus={} pid={} "
-                                         "binds={}",
-                                         cid, index,
-                                         rec && rec->shell_handle ? rec->id.id() : 0ull,
-                                         bridge_pid_, binds_);
+        log_shell.info("bridge bound client={} snapshot={} focus={} pid={} "
+                       "binds={}",
+                       cid, index, rec && rec->shell_handle ? rec->id.id() : 0ull, bridge_pid_,
+                       binds_);
     }
     if (bound_)
         bound_(bound_user_, wl_resource_get_client(bridge));
@@ -385,8 +388,7 @@ void lx::compositor::shell_bridge::on_bridge_destroyed(void* resource) {
     detach_all_handles();
     bridge_ = nullptr;
     bridge_pid_ = 0;
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.shell",
-                                    "bridge destroyed");
+    log_shell.info("bridge destroyed");
 }
 
 void lx::compositor::shell_bridge::emit_toplevel_created(toplevel_record& rec) {

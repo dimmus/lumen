@@ -61,6 +61,12 @@ import :viewport;
 import :session_lock;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_lock{"compositor.lock"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -72,19 +78,6 @@ namespace {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<unsigned long long>(ts.tv_sec) * 1'000'000'000ull +
            static_cast<unsigned long long>(ts.tv_nsec);
-}
-
-[[nodiscard]] bool lock_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-void lock_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, "compositor.lock", line);
-}
-
-template <typename... Args>
-void lock_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, "compositor.lock", fmt, std::forward<Args>(args)...);
 }
 
 [[nodiscard]] lx::compositor::session_lock* machine() {
@@ -158,10 +151,10 @@ void send_configure(lock_surface_obj* o, lx::size2i size) {
     ext_session_lock_surface_v1_send_configure(o->resource, serial,
                                                static_cast<uint32_t>(size.width > 0 ? size.width : 0),
                                                static_cast<uint32_t>(size.height > 0 ? size.height : 0));
-    if (lock_debug()) {
-        lock_log(
-            lx::trace::level::debug, "lock surface configure surface={} output={} {}x{} serial={}",
-            o->surface ? o->surface->id.id() : 0ull, o->output, size.width, size.height, serial);
+    if (log_lock.enabled(lx::trace::level::debug)) {
+        log_lock.debug("lock surface configure surface={} output={} {}x{} serial={}",
+                       o->surface ? o->surface->id.id() : 0ull, o->output, size.width, size.height,
+                       serial);
     }
 }
 
@@ -289,8 +282,8 @@ void lock_get_lock_surface(struct wl_client* client, struct wl_resource* lock_re
     // "On binding this interface the compositor will immediately send the first configure."
     send_configure(o, {r.width, r.height});
     {
-        lock_log(lx::trace::level::info, "lock surface create surface={} output={} {}x{}",
-                 s->id.id(), o->output, r.width, r.height);
+        log_lock.info("lock surface create surface={} output={} {}x{}", s->id.id(), o->output,
+                      r.width, r.height);
     }
 }
 
@@ -406,11 +399,10 @@ void lock_surface_committed(surface_obj* s) {
         // every node where it belongs; the tree sync that follows draws it.
         tree->set_root_origin(s->id, o->origin);
         if (!tree->map_root(s->id, *g_p0_ctx->lock_layer, ~0u)) {
-            lock_log(lx::trace::level::warn, "lock surface map failed: lock layer full");
+            log_lock.warn("lock surface map failed: lock layer full");
             return;
         }
-        lock_log(lx::trace::level::info, "lock surface map surface={} output={}", s->id.id(),
-                 o->output);
+        log_lock.info("lock surface map surface={} output={}", s->id.id(), o->output);
     }
     apply(m->content(o->record));
 }
@@ -446,8 +438,8 @@ void session_lock_outputs_changed() {
         lock_surface_obj* o = gone[i];
         if (lock_obj* lo = lock_from(static_cast<wl_resource*>(m->current())))
             lo->outputs_used &= ~(1u << o->output);
-        lock_log(lx::trace::level::info, "lock surface dropped surface={} output={} (output gone)",
-                 o->surface ? o->surface->id.id() : 0ull, o->output);
+        log_lock.info("lock surface dropped surface={} output={} (output gone)",
+                      o->surface ? o->surface->id.id() : 0ull, o->output);
         make_inert(o, true);
     }
     // Every lock surface of a live output follows its size (a new configure) and origin.
@@ -501,7 +493,7 @@ void session_lock_send_impl(const lx::compositor::lock_actions& a) {
         if (o && !o->finished_sent && !client_dying(wl_resource_get_client(r))) {
             o->finished_sent = true;
             ext_session_lock_v1_send_finished(r);
-            lock_log(lx::trace::level::info, "session lock: finished sent");
+            log_lock.info("session lock: finished sent");
         }
     }
     if (a.has(lx::compositor::lock_actions::send_locked) && a.lock) {

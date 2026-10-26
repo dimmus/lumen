@@ -295,9 +295,6 @@ private:
     void reset_after_unmap(layer_record& r);
     void mapped_add(unsigned level, unsigned slot);
     void mapped_remove(unsigned level, unsigned slot);
-    void log_line(const char* line) const;
-    template <typename... Args>
-    void log_line(std::format_string<Args...> fmt, Args&&... args) const;
 
     surface_manager* surfaces_ = nullptr;
     surface_tree* tree_ = nullptr;
@@ -332,11 +329,7 @@ private:
 
 namespace {
 
-constexpr const char* k_layer_category = "compositor.layer";
-
-[[nodiscard]] bool layer_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_layer{"compositor.layer"};
 
 [[nodiscard]] const char* level_name(unsigned level) {
     switch (level) {
@@ -531,16 +524,6 @@ void lx::compositor::layer_shell::bind(surface_manager& surfaces, surface_tree& 
         layers_[i] = layers[i];
 }
 
-void lx::compositor::layer_shell::log_line(const char* line) const {
-    lx::trace::logger::global().log(lx::trace::level::debug, k_layer_category, line);
-}
-
-template <typename... Args>
-void lx::compositor::layer_shell::log_line(std::format_string<Args...> fmt, Args&&... args) const {
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_layer_category, fmt,
-                                     std::forward<Args>(args)...);
-}
-
 bool lx::compositor::layer_shell::drawable(lx::surface_id surface) const {
     const layer_record* r = find(surface);
     return r && !r->closed;
@@ -575,9 +558,9 @@ lx::compositor::layer_shell::create(lx::surface_id surface, lx::client_id client
         r.created_seq = next_seq_++;
         all_.push_back(i);
         tree_->set_root_tag(surface, 0);
-        if (layer_debug()) {
-            log_line("layer create surface={} layer={} namespace={} output={}", surface.id(),
-                     level_name(layer), r.name_space, r.output);
+        if (log_layer.enabled(lx::trace::level::debug)) {
+            log_layer.debug("layer create surface={} layer={} namespace={} output={}", surface.id(),
+                            level_name(layer), r.name_space, r.output);
         }
         return create_error::none;
     }
@@ -599,8 +582,8 @@ lx::compositor::layer_shell::on_ack(lx::surface_id surface, unsigned serial) {
             r->sent[j - popped] = r->sent[j];
         r->sent_count -= popped;
         r->ever_acked = true;
-        if (layer_debug()) {
-            log_line("layer ack surface={} serial={}", surface.id(), serial);
+        if (log_layer.enabled(lx::trace::level::debug)) {
+            log_layer.debug("layer ack surface={} serial={}", surface.id(), serial);
         }
         return ack_result::ok;
     }
@@ -637,9 +620,9 @@ void lx::compositor::layer_shell::send_configure(layer_record& r, lx::size2i siz
     r.configured = true;
     r.last_configure = size;
     ops_.send_configure(r.layer_res, serial, size.width, size.height);
-    if (layer_debug()) {
-        log_line("layer configure surface={} serial={} w={} h={}", r.surface.id(), serial,
-                 size.width, size.height);
+    if (log_layer.enabled(lx::trace::level::debug)) {
+        log_layer.debug("layer configure surface={} serial={} w={} h={}", r.surface.id(), serial,
+                        size.width, size.height);
     }
 }
 
@@ -757,20 +740,21 @@ void lx::compositor::layer_shell::arrange_all(unsigned output, lx::surface_id co
                         host_.surface_moved(host_.user, r.surface);
                 }
                 const unsigned edge = out[k].zone_edge;
-                if (layer_debug() && (edge != r.logged_edge || r.current.zone != r.logged_zone)) {
+                if (log_layer.enabled(lx::trace::level::debug) &&
+                    (edge != r.logged_edge || r.current.zone != r.logged_zone)) {
                     r.logged_edge = edge;
                     r.logged_zone = r.current.zone;
-                    log_line("layer exclusive surface={} edge={} zone={}", r.surface.id(),
-                             edge_name(edge), r.current.zone);
+                    log_layer.debug("layer exclusive surface={} edge={} zone={}", r.surface.id(),
+                                    edge_name(edge), r.current.zone);
                 }
             }
         }
         if (!closed_any)
             break;
     }
-    if (layer_debug()) {
-        log_line("layer arrange output={} usable={},{},{}x{} surfaces={}", output, usable.x,
-                 usable.y, usable.width, usable.height, n);
+    if (log_layer.enabled(lx::trace::level::debug)) {
+        log_layer.debug("layer arrange output={} usable={},{},{}x{} surfaces={}", output, usable.x,
+                        usable.y, usable.width, usable.height, n);
     }
     if (!arranged_[output] || !same_rect(usable, usable_[output])) {
         arranged_[output] = true;
@@ -790,27 +774,23 @@ void lx::compositor::layer_shell::map(layer_record& r) {
     r.mapped_layer = level;
     if (r.output < k_max_outputs && held_[r.output].active && r.current.zone > 0) {
         held_[r.output] = {};
-        lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
-                                         "zone hold released on output {}: a new zone mapped",
-                                         r.output);
+        log_layer.info("zone hold released on output {}: a new zone mapped", r.output);
     }
     // Placed first (the tree only records the origin while unmapped), so mapping creates
     // every node where it belongs; the arrangement also counts the zone now that it maps.
     arrange_all(r.output, r.surface);
     if (!tree_->map_root(r.surface, *layer, ~0u)) {
         r.mapped = false;
-        lx::trace::logger::global().log(lx::trace::level::warn, k_layer_category,
-                                        "layer map failed: layer container full");
+        log_layer.warn("layer map failed: layer container full");
         arrange_all(r.output, lx::surface_id{});
         return;
     }
     mapped_add(level, static_cast<unsigned>(slot));
     {
-        lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
-                                         "layer map surface={} layer={} namespace={} x={} y={} "
-                                         "w={} h={}",
-                                         r.surface.id(), level_name(level), r.name_space, r.box.x,
-                                         r.box.y, r.box.width, r.box.height);
+        log_layer.info("layer map surface={} layer={} namespace={} x={} y={} "
+                       "w={} h={}",
+                       r.surface.id(), level_name(level), r.name_space, r.box.x, r.box.y,
+                       r.box.width, r.box.height);
     }
     if (host_.surface_mapped)
         host_.surface_mapped(host_.user, r.surface);
@@ -831,9 +811,7 @@ void lx::compositor::layer_shell::unmap(layer_record& r, const char* reason) {
         mapped_remove(r.mapped_layer, static_cast<unsigned>(slot));
     r.logged_edge = ~0u;
     {
-        lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
-                                         "layer unmap surface={} reason={}", r.surface.id(),
-                                         reason);
+        log_layer.info("layer unmap surface={} reason={}", r.surface.id(), reason);
     }
     if (host_.focus_changed)
         host_.focus_changed(host_.user);
@@ -857,8 +835,8 @@ void lx::compositor::layer_shell::close(layer_record& r, const char* reason) {
     if (r.closed)
         return;
     r.closed = true;
-    if (layer_debug()) {
-        log_line("layer closed surface={} reason={}", r.surface.id(), reason);
+    if (log_layer.enabled(lx::trace::level::debug)) {
+        log_layer.debug("layer closed surface={} reason={}", r.surface.id(), reason);
     }
     const bool alive = !ops_.client_alive || ops_.client_alive(r.client_native);
     if (alive && ops_.send_closed && r.layer_res)
@@ -962,10 +940,9 @@ void lx::compositor::layer_shell::hold_zone_of(const layer_record& r) {
     }
     const bool started = !zone_hold_active();
     h.active = true;
-    lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
-                                     "zone hold on output {}: top={} bottom={} left={} right={} "
-                                     "(the shell went without a logout)",
-                                     r.output, h.top, h.bottom, h.left, h.right);
+    log_layer.info("zone hold on output {}: top={} bottom={} left={} right={} "
+                   "(the shell went without a logout)",
+                   r.output, h.top, h.bottom, h.left, h.right);
     if (started && hold_started_)
         hold_started_(hold_started_user_);
 }
@@ -975,8 +952,7 @@ void lx::compositor::layer_shell::release_zone_hold() {
         if (!held_[o].active)
             continue;
         held_[o] = {};
-        lx::trace::logger::global().logf(lx::trace::level::info, k_layer_category,
-                                         "zone hold released on output {}", o);
+        log_layer.info("zone hold released on output {}", o);
         arrange_all(o, lx::surface_id{});
     }
 }

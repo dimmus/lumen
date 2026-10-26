@@ -898,7 +898,7 @@ unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx:
 
 namespace {
 
-constexpr const char* k_panel_category = "shell.panel";
+constexpr lx::trace::category log_panel{"shell.panel"};
 constexpr std::uint32_t k_bg = lx::shell::k_canvas_bg;
 constexpr std::uint32_t k_hover = 0xFF34343Au;
 constexpr std::uint32_t k_pressed = 0xFF2A2A30u;
@@ -916,19 +916,6 @@ constexpr lx::text::raster_color k_text_warning{0xF0, 0xB4, 0x5A, 0xFF};
 constexpr lx::text::font_desc k_panel_font{"Sans", 10.f, lx::text::weight::normal,
                                            lx::text::style::normal};
 constexpr int k_text_pad = 8;
-
-[[nodiscard]] bool panel_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-void panel_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, k_panel_category, line);
-}
-
-template <typename... Args>
-void panel_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_panel_category, fmt, std::forward<Args>(args)...);
-}
 
 [[nodiscard]] bool intersects(lx::rect2i a, int x, int w) {
     return w > 0 && x < a.x + a.width && x + w > a.x;
@@ -1197,25 +1184,24 @@ void lx::shell::panel::paint(int bi, const panel_layout& l, const lx::rect2i* re
 }
 
 void lx::shell::panel::log_layout(const panel_layout& l) const {
-    if (!panel_debug() || !bridge_)
+    if (!log_panel.enabled(lx::trace::level::debug) || !bridge_)
         return;
     for (unsigned i = 0; i < l.count; ++i) {
         const task_entry* e = bridge_->model().get(l.cells[i].task);
-        panel_log(lx::trace::level::debug, "layout idx={} x={} w={} handle={} title=\"{}\"", i,
-                  l.cells[i].x, l.cells[i].w, l.cells[i].task.index, e ? e->title : "");
+        log_panel.debug("layout idx={} x={} w={} handle={} title=\"{}\"", i, l.cells[i].x,
+                        l.cells[i].w, l.cells[i].task.index, e ? e->title : "");
     }
     if (l.hidden) {
-        panel_log(lx::trace::level::debug, "layout more={} x={}", l.hidden, l.more_x);
+        log_panel.debug("layout more={} x={}", l.hidden, l.more_x);
     }
     if (l.apps_w > 0) {
-        panel_log(lx::trace::level::debug, "layout apps x={} w={}", l.apps_x, l.apps_w);
+        log_panel.debug("layout apps x={} w={}", l.apps_x, l.apps_w);
     }
     for (unsigned i = 0; i < l.tray_count; ++i)
-        panel_log(lx::trace::level::debug, "layout tray key={} x={} w={} output={}", l.tray[i].key,
-                  l.tray[i].x, l.tray[i].w, output_name_);
+        log_panel.debug("layout tray key={} x={} w={} output={}", l.tray[i].key, l.tray[i].x,
+                        l.tray[i].w, output_name_);
     if (l.bell_w > 0)
-        panel_log(lx::trace::level::debug, "layout bell x={} w={} output={}", l.bell_x, l.bell_w,
-                  output_name_);
+        log_panel.debug("layout bell x={} w={} output={}", l.bell_x, l.bell_w, output_name_);
 }
 
 void lx::shell::panel::set_apps(bool shown, bool open) {
@@ -1437,11 +1423,11 @@ void lx::shell::panel::pointer_button(unsigned button, bool down, unsigned seria
             return;
         if (!logout_armed_) {
             logout_armed_ = true; // first click: "Confirm?"
-            panel_log(lx::trace::level::debug, "logout armed");
+            log_panel.debug("logout armed");
             return;
         }
         logout_armed_ = false;
-        panel_log(lx::trace::level::info, "logout requested");
+        log_panel.info("logout requested");
         bridge_->request_logout();
         return;
     }
@@ -1457,10 +1443,10 @@ void lx::shell::panel::pointer_button(unsigned button, bool down, unsigned seria
     dirty_ = true;
     if (!pressed || !(pressed == under) || !bridge_)
         return;
-    if (panel_debug()) {
+    if (log_panel.enabled(lx::trace::level::debug)) {
         const task_entry* e = bridge_->model().get(pressed);
-        panel_log(lx::trace::level::debug, "click idx={} handle={} title=\"{}\"", hit,
-                  pressed.index, e ? e->title : "");
+        log_panel.debug("click idx={} handle={} title=\"{}\"", hit, pressed.index,
+                        e ? e->title : "");
     }
     if (action_fn_)
         action_fn_(panel_action::task, 0, action_user_);
@@ -1486,7 +1472,7 @@ struct lx::shell::panel::events {
             p.width_ = nw;
             p.height_ = nh;
             p.resized_ = true;
-            panel_log(lx::trace::level::info, "configure serial={} w={} h={}", serial, nw, nh);
+            log_panel.info("configure serial={} w={} h={}", serial, nw, nh);
         }
         p.configured_ = true;
         // The ack takes effect with the next commit: make one even if nothing changed.
@@ -1494,7 +1480,7 @@ struct lx::shell::panel::events {
     }
     static void closed(void* data, zwlr_layer_surface_v1*) {
         self(data).closed_ = true;
-        panel_log(lx::trace::level::warn, "layer surface closed by the compositor");
+        log_panel.warn("layer surface closed by the compositor");
     }
 };
 
@@ -1591,7 +1577,7 @@ void lx::shell::panel::after_dispatch(unsigned changes) {
 void lx::shell::panel::draw(bool force) {
     if (resized_ || !canvas_.allocated()) {
         if (!canvas_.allocate(g_.shm, width_, height_, "lumen-panel")) {
-            panel_log(lx::trace::level::error, "cannot allocate panel buffers");
+            log_panel.error("cannot allocate panel buffers");
             closed_ = true;
             return;
         }
@@ -1660,8 +1646,8 @@ void lx::shell::panel::draw(bool force) {
         }
         if (std::strcmp(line, ws_logged_) != 0) {
             std::memcpy(ws_logged_, line, sizeof(line));
-            panel_log(lx::trace::level::info, "workspaces [{}] output={}",
-                      line[0] ? line : "-", output_name_[0] ? output_name_ : "?");
+            log_panel.info("workspaces [{}] output={}", line[0] ? line : "-",
+                           output_name_[0] ? output_name_ : "?");
         }
     }
 
@@ -1670,14 +1656,14 @@ void lx::shell::panel::draw(bool force) {
     dirty_ = false;
     must_commit_ = false;
 
-    if (panel_debug()) {
+    if (log_panel.enabled(lx::trace::level::debug)) {
         int focused = -1;
         for (unsigned i = 0; i < next_.count; ++i)
             if (next_.cells[i].flags & cell_focused)
                 focused = static_cast<int>(i);
-        panel_log(lx::trace::level::debug,
-                  "draw entries={} hidden={} focused={} damage={}{} repaint={} buffer={}",
-                  next_.count, next_.hidden, focused, nd, arrangement ? "(full)" : "", nr, bi);
+        log_panel.debug("draw entries={} hidden={} focused={} damage={}{} repaint={} buffer={}",
+                        next_.count, next_.hidden, focused, nd, arrangement ? "(full)" : "", nr,
+                        bi);
     }
 }
 

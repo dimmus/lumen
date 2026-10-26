@@ -110,11 +110,8 @@ private:
 } // namespace lx::compositor
 
 namespace {
-constexpr const char* k_category = "compositor.hotplug";
+constexpr lx::trace::category log_hotplug{"compositor.hotplug"};
 
-[[nodiscard]] bool debug_on() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
 } // namespace
 
 void lx::compositor::hotplug_controller::attach(lx::drm::kms_device& kms,
@@ -165,10 +162,9 @@ void lx::compositor::hotplug_controller::on_readable() {
         return;
     }
     ++batches_;
-    if (debug_on()) {
-        lx::trace::logger::global().logf(
-            lx::trace::level::debug, k_category, "hotplug: uevent connectors={}{}",
-            b.all_connectors ? "all" : "hinted", paused_ ? " (session away: owed)" : "");
+    if (log_hotplug.enabled(lx::trace::level::debug)) {
+        log_hotplug.debug("hotplug: uevent connectors={}{}", b.all_connectors ? "all" : "hinted",
+                          paused_ ? " (session away: owed)" : "");
     }
     if (paused_) {
         lx::drm::merge_hotplug(owed_, b);
@@ -233,13 +229,12 @@ void lx::compositor::hotplug_controller::finish() {
     if (!probe_ok_) {
         if (!logged_failure_) {
             logged_failure_ = true;
-            lx::trace::logger::global().log_error(probe_error_, k_category);
+            log_hotplug.error(probe_error_);
         }
     } else {
-        if (debug_on()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
-                                             "hotplug: probe connectors={} hint={} took={} us",
-                                             scan_->count, hint_, probe_us_);
+        if (log_hotplug.enabled(lx::trace::level::debug)) {
+            log_hotplug.debug("hotplug: probe connectors={} hint={} took={} us", scan_->count,
+                              hint_, probe_us_);
         }
         if (host_.scan_ready)
             host_.scan_ready(host_.user, *scan_, current_forced_);

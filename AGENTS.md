@@ -196,7 +196,7 @@ LX_TRY_ASSIGN(device, gfx::device_selector::select_best());
 return lx::make_error(lx::wayland_err::bind_failed, "failed to bind socket");
 
 // Log once at boundary, then return
-lx::trace::logger::global().log_error(err, "wayland");
+log_wayland.error(err);
 return err;
 ```
 
@@ -207,9 +207,14 @@ return err;
 ### 4.3 Logging
 
 - Default sink: stderr; override with `LUMEN_LOG` env (see errors-and-logging doc)
-- Formatted lines: `logger.logf(level, category, "id={} cause={}", …)` (`std::format` syntax,
-  checked at compile time, no allocation; a `bool` prints as `1`/`0`) — not `snprintf` into a
-  stack buffer. Scripts grep log lines: keep their text stable
+- One form everywhere: declare `constexpr lx::trace::category log_wm{"compositor.wm"};` once
+  per file (or `inline constexpr` in a shared partition) and log with the level's method:
+  `log_wm.debug("id={} cause={}", …)`, `log_wm.log(lvl, …)` for a run-time level,
+  `log_wm.error(err)` for a failed `result`, `log_wm.enabled(level::debug)` to skip debug-only
+  work. No `logger::global()` calls, `foo_log` forwarding helpers or `foo_debug()` checks
+- Messages are `std::format` strings checked at compile time (no allocation; a `bool` prints as
+  `1`/`0`; run-time text goes through `"{}"`) — not `snprintf` into a stack buffer. Scripts grep
+  log lines: keep their text stable
 - Categories: stable, grep-friendly (`compositor`, `compositor.render`, `wayland`, `drm`, `gfx`, `shell`)
 - **Frame hot path** (`tick_ui`, `tick_render`): only `LX_TRACE_SCOPE` / `trace` level — no `info`+ logs, no heap alloc, no sync I/O
 - Startup / errors: `info`, `warn`, `error` as appropriate
