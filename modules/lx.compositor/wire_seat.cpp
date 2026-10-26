@@ -57,7 +57,6 @@ struct keymap_source {
     if (cached.fd >= 0)
         return cached;
 
-#if !defined(_WIN32)
     // The real compiled keymap, from the same xkb state the compositor tracks modifiers
     // with. It used to be a hardcoded US string, which meant every client saw a US layout
     // whatever the user had configured, and the compositor's own idea of the keyboard did
@@ -89,7 +88,6 @@ struct keymap_source {
 
     cached.fd = std::move(fd).value().release();
     cached.size = size;
-#endif
     return cached;
 }
 

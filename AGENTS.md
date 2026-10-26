@@ -61,8 +61,8 @@ Measurements behind this split live in
 Re-measure before changing a default; the right backend is host-dependent and the numbers
 are not intuitive.
 
-**Target platform for implementation:** Linux (KMS, libinput, logind). Windows stubs in
-`unique_fd` exist for dev only — do not build platform logic around them.
+**Target platform for implementation:** Linux (KMS, libinput, logind) only. POSIX and Linux
+APIs are used directly; do not add `_WIN32` (or other non-Linux) branches or stubs.
 
 ---
 

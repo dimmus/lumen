@@ -8,12 +8,10 @@ module;
 #include <stdint.h>
 #include <stdlib.h>
 
-#if !defined(_WIN32)
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#endif
 
 #if defined(LUMEN_HAS_WAYLAND)
 #include <wayland-server.h>
@@ -289,11 +287,7 @@ private:
     bool bound_ = false;
     client_destroyed_fn client_destroyed_ = nullptr;
     void* client_destroyed_user_ = nullptr;
-#if defined(_WIN32)
-    char shell_binary_path_[260]{};
-#else
     char shell_binary_path_[PATH_MAX]{};
-#endif
 
 #if defined(LUMEN_HAS_WAYLAND)
     wl_display* display_ = nullptr;
@@ -348,7 +342,6 @@ bool lx::wayland::client_connection::sandboxed() {
     if (sandbox_ != 0)
         return sandbox_ == 2;
     sandbox_ = 1;
-#if !defined(_WIN32)
     // The peer's pid (SO_PEERCRED at connect) names a live process while its connection is
     // open. Flatpak puts /.flatpak-info at the root of every sandbox (xdg-desktop-portal
     // reads the same file to identify apps); a same-UID process may look into another's
@@ -365,7 +358,6 @@ bool lx::wayland::client_connection::sandboxed() {
                                              cred_.pid);
         }
     }
-#endif
     return sandbox_ == 2;
 }
 
@@ -791,11 +783,6 @@ void lx::wayland::server::add_global(global_descriptor desc, global_bind_fn bind
 
 bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
                                                   const char* global_name) const {
-#if defined(_WIN32)
-    (void)cred;
-    (void)global_name;
-    return false;
-#else
     const char* name = global_name ? global_name : "?";
     if (cred.uid != static_cast<unsigned>(::getuid())) {
         lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
@@ -833,15 +820,11 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
                                      name, cred.pid, have_exe ? exe : "(unknown)",
                                      shell_binary_path_);
     return false;
-#endif
 }
 
 void lx::wayland::server::set_shell_binary_path(const char* path) {
     if (!path || !path[0])
         path = "lumen-shell";
-#if defined(_WIN32)
-    std::snprintf(shell_binary_path_, sizeof(shell_binary_path_), "%s", path);
-#else
     char candidate[PATH_MAX]{};
     if (std::strchr(path, '/') == nullptr) {
         // Next to this executable: an installed or freshly built pair always matches.
@@ -869,7 +852,6 @@ void lx::wayland::server::set_shell_binary_path(const char* path) {
     }
     lx::trace::logger::global().logf(lx::trace::level::info, "wayland", "shell binary {}",
                                      shell_binary_path_);
-#endif
 }
 
 lx::wayland::client_connection* lx::wayland::server::find_client(unsigned id) {
@@ -912,9 +894,7 @@ lx::wayland::client_connection* lx::wayland::server::ensure_client(void* wl_clie
     slot.set_credentials(cred);
     slot.set_native(wl_client);
     slot.set_server(this);
-#if !defined(_WIN32)
     slot.set_privileged_shell(cred.uid == static_cast<unsigned>(::getuid()));
-#endif
 
 #if defined(LUMEN_HAS_WAYLAND)
     // A link stays where it is for its client's whole life: the listener is an element of
@@ -1092,10 +1072,8 @@ lx::result<void> lx::wayland::server::add_security_listener(int listen_fd, int c
 #else
     (void)context;
     (void)creator;
-#if !defined(_WIN32)
     ::close(listen_fd);
     ::close(close_fd);
-#endif
     return lx::not_implemented("lx::wayland::server::add_security_listener");
 #endif
 }

@@ -1,13 +1,11 @@
 module;
 
-#if !defined(_WIN32)
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/prctl.h>
 #include <sys/timerfd.h>
 #include <unistd.h>
-#endif
 #include <errno.h>
 #include <time.h>
 
@@ -220,16 +218,13 @@ static lx_runtime_loop_state& loop_state() {
 }
 
 namespace {
-#if !defined(_WIN32)
 // epoll user data for the loop's own descriptors; sources use their own address.
 char g_wake_token;
 char g_timer_token;
-#endif
 void wake_trampoline(void* loop) { static_cast<lx::runtime::event_loop*>(loop)->wake(); }
 } // namespace
 
 lx::runtime::event_loop::event_loop() {
-#if !defined(_WIN32)
     epoll_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
     wake_fd_ = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
     if (epoll_fd_ >= 0) {
@@ -251,7 +246,6 @@ lx::runtime::event_loop::event_loop() {
         if (timer_fd_ >= 0)
             (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, timer_fd_, &ev);
     }
-#endif
     // Work posted for the UI thread wakes this loop instead of waiting for a poll.
     ui_strand_.set_waker(&wake_trampoline, this);
     executor::global().register_strand(affinity::ui, &ui_strand_);
@@ -260,28 +254,23 @@ lx::runtime::event_loop::event_loop() {
 lx::runtime::event_loop::~event_loop() {
     executor::global().unregister_strand(affinity::ui);
     ui_strand_.set_waker(nullptr, nullptr);
-#if !defined(_WIN32)
     for (int* fd : {&timer_fd_, &wake_fd_, &epoll_fd_}) {
         if (*fd >= 0)
             ::close(*fd);
         *fd = -1;
     }
-#endif
 }
 
 void lx::runtime::event_loop::wake() {
-#if !defined(_WIN32)
     if (wake_fd_ >= 0) {
         const unsigned long long one = 1;
         (void)!::write(wake_fd_, &one, sizeof(one));
     }
-#endif
 }
 
 void lx::runtime::event_loop::set_after_dispatch(callback cb) { after_ = cb; }
 
 void lx::runtime::event_loop::arm_timer(clock_time deadline_ns) {
-#if !defined(_WIN32)
     if (timer_fd_ < 0 || deadline_ns == armed_ns_)
         return;
     itimerspec spec{};
@@ -293,9 +282,6 @@ void lx::runtime::event_loop::arm_timer(clock_time deadline_ns) {
     // nothing the loop does in between can make the timer late by its own duration.
     (void)::timerfd_settime(timer_fd_, TFD_TIMER_ABSTIME, &spec, nullptr);
     armed_ns_ = deadline_ns;
-#else
-    (void)deadline_ns;
-#endif
 }
 
 int lx::runtime::event_loop::run() {
@@ -304,7 +290,6 @@ int lx::runtime::event_loop::run() {
     // (and clears it) or leaves quit_pending_ for this exchange to find.
     if (quit_pending_.exchange(false))
         running_ = false;
-#if !defined(_WIN32)
     if (epoll_fd_ >= 0 && wake_fd_ >= 0 && (pwait2_ || timer_fd_ >= 0)) {
         // A timeout's expiry is subject to the thread's timer slack (50 µs by default; an
         // absolute timerfd had none). The frame clock is a deadline, so keep it tight.
@@ -385,7 +370,6 @@ int lx::runtime::event_loop::run() {
         quit_pending_ = false; // consumed by this run
         return exit_code_;
     }
-#endif
     while (running_) {
         drain_inbound();
         ui_strand_.drain();
@@ -441,24 +425,20 @@ void lx::runtime::event_loop::add_source(event_source* source) {
     if (!source || state.source_count >= k_max_event_sources)
         return;
     state.sources[state.source_count++] = source;
-#if !defined(_WIN32)
     if (const int fd = source->poll_fd(); fd >= 0 && epoll_fd_ >= 0) {
         epoll_event ev{};
         ev.events = EPOLLIN;
         ev.data.ptr = source;
         (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
     }
-#endif
 }
 
 void lx::runtime::event_loop::remove_source(event_source* source) {
     auto& state = loop_state();
     for (unsigned i = 0; i < state.source_count; ++i) {
         if (state.sources[i] == source) {
-#if !defined(_WIN32)
             if (const int fd = source->poll_fd(); fd >= 0 && epoll_fd_ >= 0)
                 (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_DEL, fd, nullptr);
-#endif
             state.sources[i] = state.sources[--state.source_count];
             return;
         }
@@ -558,7 +538,6 @@ bool lx::runtime::fd_source::prepare(clock_time& timeout) {
         return ready_;
     }
     ready_ = false;
-#if !defined(_WIN32)
     pollfd pfd{};
     pfd.fd = fd_;
     pfd.events = POLLIN;
@@ -567,7 +546,6 @@ bool lx::runtime::fd_source::prepare(clock_time& timeout) {
         timeout = 0;
         return true;
     }
-#endif
     // Not readable yet — wake periodically so the callback can still pump (Wayland).
     timeout = poll_interval_ns_;
     ready_ = true;

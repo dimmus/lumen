@@ -2,10 +2,8 @@ module;
 
 #include <stdint.h>
 
-#if !defined(_WIN32)
 #include <sys/mman.h>
 #include <unistd.h>
-#endif
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
@@ -901,11 +899,9 @@ lx::shell::policy_bridge::~policy_bridge() = default;
 #endif
 
 void lx::shell::policy_bridge::unmap_icons(icon_maps& m) {
-#if !defined(_WIN32)
     for (unsigned i = 0; i < m.count; ++i)
         if (m.images[i].pixels)
             ::munmap(const_cast<std::uint32_t*>(m.images[i].pixels), m.lengths[i]);
-#endif
     m = {};
 }
 

@@ -1,8 +1,6 @@
 module;
 
-#if !defined(_WIN32)
 #include <sys/mman.h>
-#endif
 #include <signal.h>
 #include <stddef.h>
 
@@ -1040,9 +1038,7 @@ lx::compositor::shm_upload_pool::~shm_upload_pool() {
 void lx::compositor::shm_upload_pool::unmap(block& b) {
     if (!b.data)
         return;
-#if !defined(_WIN32)
     ::munmap(b.data, static_cast<std::size_t>(b.size));
-#endif
     mapped_bytes_ -= b.size;
     b.data = nullptr;
     b.size = 0;
@@ -1080,15 +1076,11 @@ unsigned char* lx::compositor::shm_upload_pool::acquire(unsigned bytes,
     if (!best) {
         if (!empty)
             return nullptr; // every block in flight: the client is far ahead of the display
-#if !defined(_WIN32)
         void* mem = ::mmap(nullptr, static_cast<std::size_t>(size), PROT_READ | PROT_WRITE,
                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (mem == MAP_FAILED)
             return nullptr;
         empty->data = static_cast<unsigned char*>(mem);
-#else
-        return nullptr;
-#endif
         empty->size = size;
         mapped_bytes_ += size;
         best = empty;

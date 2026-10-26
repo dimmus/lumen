@@ -17,13 +17,11 @@ module;
 #define _GNU_SOURCE
 #endif
 
-#if !defined(_WIN32)
 #include <dirent.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
-#endif
 
 #if defined(LUMEN_HAS_PNG)
 #include <png.h>
@@ -127,13 +125,8 @@ namespace {
 constexpr const char* k_icon_category = "shell.icon";
 
 bool file_exists(const std::string& path) {
-#if !defined(_WIN32)
     struct stat st{};
     return ::stat(path.c_str(), &st) == 0 && S_ISREG(st.st_mode);
-#else
-    (void)path;
-    return false;
-#endif
 }
 
 /// A symbolic icon's file (icon-naming-spec: "-symbolic"; GTK's pre-rendered ".symbolic.png").
@@ -157,13 +150,8 @@ void recolour_symbolic(std::vector<std::uint32_t>& px) {
 }
 
 bool dir_exists(const std::string& path) {
-#if !defined(_WIN32)
     struct stat st{};
     return ::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode);
-#else
-    (void)path;
-    return false;
-#endif
 }
 
 // GTK's icon-theme.cache (gtk/gtkiconcache.c, written by gtk-update-icon-cache). Big-endian;
@@ -200,7 +188,6 @@ std::string_view cache_str(const unsigned char* c, std::size_t n, std::uint32_t 
 
 /// Maps `root`/icon-theme.cache when it is a version 1.0 cache no older than `root` itself.
 void map_icon_cache(const std::string& root, const unsigned char*& data, std::size_t& size) {
-#if !defined(_WIN32)
     struct stat dir{};
     if (::stat(root.c_str(), &dir) != 0)
         return;
@@ -221,9 +208,6 @@ void map_icon_cache(const std::string& root, const unsigned char*& data, std::si
         }
     }
     ::close(fd);
-#else
-    (void)root, (void)data, (void)size;
-#endif
 }
 
 /// `dir`'s index in the cache's directory list, -1 when the cache has no such directory.
@@ -400,10 +384,8 @@ bool lx::shell::icon_theme::can_svg() {
 }
 
 lx::shell::icon_theme::theme_root::~theme_root() {
-#if !defined(_WIN32)
     if (cache)
         ::munmap(const_cast<unsigned char*>(cache), cache_size);
-#endif
 }
 
 bool lx::shell::icon_theme::theme_root::has(std::size_t dir, const std::string& rel,
@@ -424,14 +406,12 @@ bool lx::shell::icon_theme::theme_root::has(std::size_t dir, const std::string& 
     }
     if (!listed[dir]) {
         listed[dir] = true;
-#if !defined(_WIN32)
         if (DIR* d = ::opendir((path + "/" + rel).c_str())) {
             while (const dirent* e = ::readdir(d))
                 if (e->d_name[0] != '.' && e->d_type != DT_DIR)
                     listing[dir].emplace_back(e->d_name);
             ::closedir(d);
         }
-#endif
         std::ranges::sort(listing[dir]);
     }
     std::string file;
@@ -682,7 +662,6 @@ std::string lx::shell::icon_theme::find_file(const char* name, int px) {
 }
 
 namespace {
-#if !defined(_WIN32)
 /// Rasterised SVG icons, kept across sessions in `$XDG_CACHE_HOME/lumen/icons`: one file per
 /// (source file, its modification time and size, pixel size), raw premultiplied ARGB words
 /// behind a 16-byte header. The panel's icons come from SVG for most applications, and
@@ -756,14 +735,12 @@ void icon_cache_write(const std::string& dir, const std::string& file, std::uint
     if (!ok || ::rename(tmp.c_str(), file.c_str()) != 0)
         (void)::unlink(tmp.c_str());
 }
-#endif
 } // namespace
 
 bool lx::shell::icon_theme::decode(const std::string& path, int px, std::vector<std::uint32_t>& out) {
     const bool svg = path.size() > 4 && path.compare(path.size() - 4, 4, ".svg") == 0;
     out.assign(static_cast<std::size_t>(px) * px, 0u);
     if (svg) {
-#if !defined(_WIN32)
         struct stat st{};
         const std::string dir = icon_cache_dir();
         const bool cacheable = !dir.empty() && ::stat(path.c_str(), &st) == 0;
@@ -773,16 +750,13 @@ bool lx::shell::icon_theme::decode(const std::string& path, int px, std::vector<
         const std::string file = dir + name;
         if (cacheable && icon_cache_read(file, key, px, out))
             return true;
-#endif
         // Premultiplied, native-endian 0xAARRGGBB (cairo's ARGB32): what the panel draws.
         svg_document doc;
         const bool ok = doc.open(path.c_str()) &&
                         doc.render(reinterpret_cast<unsigned char*>(out.data()), px, px, px * 4,
                                    {0.f, 0.f, static_cast<float>(px), static_cast<float>(px)});
-#if !defined(_WIN32)
         if (ok && cacheable)
             icon_cache_write(dir, file, key, px, out);
-#endif
         return ok;
     }
 #if defined(LUMEN_HAS_PNG)

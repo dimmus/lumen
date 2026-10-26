@@ -36,9 +36,7 @@ module;
 #endif
 #endif
 
-#if !defined(_WIN32)
 #include <unistd.h>
-#endif
 
 module lx.compositor;
 

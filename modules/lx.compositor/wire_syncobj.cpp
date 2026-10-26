@@ -43,9 +43,7 @@ module;
 #endif
 #endif
 
-#if !defined(_WIN32)
 #include <unistd.h>
-#endif
 #include <signal.h>
 
 module lx.compositor;
@@ -114,10 +112,8 @@ void sync_point_signal_after_composite(sync_point& p) {
         g_p0_ctx && g_p0_ctx->release_fences ? g_p0_ctx->release_fences->dup() : -1;
     if (auto r = g_timelines.signal_after(p.timeline, p.point, fence); !r)
         log_timeline_error(r.get_error());
-#if !defined(_WIN32)
     if (fence >= 0)
         ::close(fence);
-#endif
     sync_point_drop(p);
 }
 

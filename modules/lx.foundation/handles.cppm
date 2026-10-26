@@ -1,10 +1,6 @@
 module;
 
-#if defined(_WIN32)
-#include <io.h>
-#else
 #include <unistd.h>
-#endif
 
 export module lx.foundation:handles;
 
@@ -92,15 +88,8 @@ void lx::unique_fd::reset(int fd) {
     fd_ = fd;
 }
 void lx::unique_fd::close_fd() {
-#if defined(_WIN32)
-    if (fd_ >= 0) {
-        _close(fd_);
-        fd_ = -1;
-    }
-#else
     if (fd_ >= 0) {
         ::close(fd_);
         fd_ = -1;
     }
-#endif
 }
