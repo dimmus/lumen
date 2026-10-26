@@ -2,10 +2,8 @@ module;
 
 // Bodies of `:capture_engine`. See capture_engine.cppm for the model.
 
-#if !defined(_WIN32)
 #include <poll.h>
 #include <unistd.h>
-#endif
 
 module lx.compositor;
 
@@ -22,10 +20,8 @@ namespace lx::compositor {
 namespace {
 
 void close_fd(int& fd) {
-#if !defined(_WIN32)
     if (fd >= 0)
         ::close(fd);
-#endif
     fd = -1;
 }
 

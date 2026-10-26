@@ -7,14 +7,12 @@ module;
 #include <stdint.h>
 #include <stdlib.h>
 
-#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <time.h>
 #include <unistd.h>
-#endif
 
 #if defined(LUMEN_HAS_LOGIND)
 #include <systemd/sd-bus.h>
@@ -364,10 +362,8 @@ void lx::session::logind_session::release() {
     listener_ = {};
     session_id_buf_[0] = '\0';
     session_id_ = "";
-#if !defined(_WIN32)
     if (sleep_fd_ >= 0)
         ::close(sleep_fd_);
-#endif
     sleep_fd_ = -1;
 }
 
@@ -418,7 +414,7 @@ lx::session::session_choice lx::session::discover_session(const session_discover
 
 lx::session::session_discovery lx::session::system_session_discovery() {
     session_discovery d{};
-#if defined(LUMEN_HAS_LOGIND) && !defined(_WIN32)
+#if defined(LUMEN_HAS_LOGIND)
     d.uid = static_cast<unsigned>(::getuid());
     d.env_session_id = std::getenv("XDG_SESSION_ID");
     d.pid_session = [](void*, char* out, std::size_t size) {
@@ -587,7 +583,6 @@ lx::result<lx::session::logind_session> lx::session::logind_session::open() {
 
 lx::session::credentials lx::session::logind_session::peer_credentials(int socket_fd) const {
     credentials out{};
-#if !defined(_WIN32)
     if (socket_fd < 0)
         return out;
     ucred peer{};
@@ -597,9 +592,6 @@ lx::session::credentials lx::session::logind_session::peer_credentials(int socke
         out.uid = static_cast<unsigned>(peer.uid);
         out.gid = static_cast<unsigned>(peer.gid);
     }
-#else
-    (void)socket_fd;
-#endif
     return out;
 }
 
@@ -670,7 +662,6 @@ lx::result<lx::unique_fd> lx::session::logind_session::take_device(unsigned majo
 
 lx::result<lx::unique_fd> lx::session::logind_session::take_device_path(const char* path,
                                                                          bool* inactive) {
-#if !defined(_WIN32)
     if (!path || path[0] == '\0') {
         return lx::invalid_argument("null device path");
     }
@@ -688,11 +679,6 @@ lx::result<lx::unique_fd> lx::session::logind_session::take_device_path(const ch
         return lx::unique_fd{fd};
     }
     return lx::make_error(lx::io_err::permission_denied, "failed to open device path");
-#else
-    (void)path;
-    (void)inactive;
-    return lx::not_implemented("lx::session::logind_session::take_device_path");
-#endif
 }
 
 void lx::session::logind_session::release_device(unsigned major, unsigned minor) {
@@ -724,14 +710,10 @@ void lx::session::logind_session::send_release(unsigned major, unsigned minor) {
 }
 
 void lx::session::logind_session::release_device_fd(int fd) {
-#if !defined(_WIN32)
     struct stat st{};
     if (fd < 0 || ::fstat(fd, &st) != 0 || !S_ISCHR(st.st_mode))
         return;
     release_device(major(st.st_rdev), minor(st.st_rdev));
-#else
-    (void)fd;
-#endif
 }
 
 void lx::session::logind_session::complete_pause(unsigned major, unsigned minor) {
@@ -988,10 +970,8 @@ void lx::session::logind_session::take_sleep_inhibitor() {
 }
 
 void lx::session::logind_session::release_sleep_inhibitor() {
-#if !defined(_WIN32)
     if (sleep_fd_ >= 0)
         ::close(sleep_fd_);
-#endif
     sleep_fd_ = -1;
 }
 

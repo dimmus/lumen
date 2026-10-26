@@ -11,10 +11,8 @@ module;
 #include <xf86drm.h>
 #include <sys/eventfd.h>
 #endif
-#if !defined(_WIN32)
 #include <fcntl.h>
 #include <unistd.h>
-#endif
 #include <signal.h>
 
 module lx.gfx;
@@ -140,10 +138,8 @@ const drm_timeline_table::entry* drm_timeline_table::find(unsigned id) const {
 lx::result<unsigned> drm_timeline_table::import(int syncobj_fd) {
     unsigned handle = 0;
     const int r = ops_.fd_to_handle ? ops_.fd_to_handle(ops_.user, syncobj_fd, &handle) : -ENODEV;
-#if !defined(_WIN32)
     if (syncobj_fd >= 0)
         ::close(syncobj_fd);
-#endif
     if (r != 0)
         return timeline_error("drm timeline: not a syncobj fd");
     for (unsigned i = 1; i <= k_max; ++i) {
@@ -219,10 +215,8 @@ lx::result<void> drm_timeline_table::signal_after(unsigned id, unsigned long lon
 // ── release_fence_mailbox ──────────────────────────────────────────────────
 
 release_fence_mailbox::~release_fence_mailbox() {
-#if !defined(_WIN32)
     if (fd_ >= 0)
         ::close(fd_);
-#endif
 }
 
 void release_fence_mailbox::publish(int sync_file, unsigned frame) {
@@ -233,21 +227,15 @@ void release_fence_mailbox::publish(int sync_file, unsigned frame) {
         fd_ = sync_file;
         frame_ = frame;
     }
-#if !defined(_WIN32)
     if (old >= 0)
         ::close(old);
-#endif
 }
 
 int release_fence_mailbox::dup(unsigned* frame) const {
     std::lock_guard lock{mutex_};
     if (frame)
         *frame = frame_;
-#if !defined(_WIN32)
     return fd_ >= 0 ? ::fcntl(fd_, F_DUPFD_CLOEXEC, 0) : -1;
-#else
-    return -1;
-#endif
 }
 
 } // namespace lx::gfx

@@ -19,11 +19,9 @@ module;
 #endif
 #endif
 
-#if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
-#endif
 
 #if !defined(DRM_FORMAT_ARGB8888)
 #define DRM_FORMAT_ARGB8888 0x34325241u
@@ -184,7 +182,6 @@ int dmabuf_format_table_fd() {
     if (fd != -2)
         return fd;
     fd = -1;
-#if !defined(_WIN32)
     const int memfd = ::memfd_create("lumen-dmabuf-formats", MFD_CLOEXEC | MFD_ALLOW_SEALING);
     if (memfd < 0)
         return fd;
@@ -195,7 +192,6 @@ int dmabuf_format_table_fd() {
     }
     (void)::fcntl(memfd, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE | F_SEAL_SEAL);
     fd = memfd;
-#endif
     return fd;
 }
 
