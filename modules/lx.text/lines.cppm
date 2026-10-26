@@ -10,6 +10,12 @@ import :faces;
 import :shape;
 import :itemize;
 
+namespace {
+
+constexpr lx::trace::category log_text{"text"};
+
+} // namespace
+
 export namespace lx::text {
 
 // ── Lines and the retained layout (ADR-010 §4.6 `:lines`) ────────────────────────
@@ -767,8 +773,7 @@ bool lx::text::text_layout::over_cap(bool hit) const {
         return false;
     if (limits_.overflow == lx::runtime::overflow_action::warn_and_drop && !warned_) {
         warned_ = true;
-        lx::trace::logger::global().log(lx::trace::level::warn, "text",
-                                        "text_layout: a storage cap cut the text");
+        log_text.warn("text_layout: a storage cap cut the text");
     }
     return true;
 }

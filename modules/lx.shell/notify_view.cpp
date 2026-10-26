@@ -27,7 +27,7 @@ import :icon_theme;
 
 namespace {
 
-constexpr const char* k_view_category = "shell.notify";
+constexpr lx::trace::category log_notify{"shell.notify"};
 constexpr std::uint32_t k_card_bg = 0xFF24242Au;
 constexpr std::uint32_t k_card_hover_bg = 0xFF2C2C33u;
 constexpr std::uint32_t k_button_bg = 0xFF34343Au;
@@ -46,10 +46,6 @@ constexpr lx::text::font_desc k_button_font{"Sans", 10.f, lx::text::weight::norm
                                             lx::text::style::normal};
 constexpr lx::text::font_desc k_close_font{"Sans", 11.f, lx::text::weight::normal,
                                            lx::text::style::normal};
-
-[[nodiscard]] bool view_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
 
 [[nodiscard]] bool contains(lx::rect2i r, double x, double y) {
     return r.width > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
@@ -428,11 +424,9 @@ void lx::shell::notification_view::draw() {
     canvas_.commit(surface_, bi, &whole, 1);
     ++frames_;
     dirty_ = false;
-    if (view_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_view_category,
-                                         "notifications: draw cards={} more={} {}x{}",
-                                         layout_.count, layout_.more, layout_.width,
-                                         layout_.height);
+    if (log_notify.enabled(lx::trace::level::debug)) {
+        log_notify.debug("notifications: draw cards={} more={} {}x{}", layout_.count, layout_.more,
+                         layout_.width, layout_.height);
         // Where each card's parts are (surface coordinates): the smoke test clicks them.
         for (unsigned i = 0; i < layout_.count; ++i) {
             const card_layout& c = layout_.cards[i];
@@ -444,8 +438,7 @@ void lx::shell::notification_view::draw() {
                                        c.button[b].x, c.button[b].y, c.button[b].width,
                                        c.button[b].height)
                           .out;
-            lx::trace::logger::global().logf(
-                lx::trace::level::debug, k_view_category,
+            log_notify.debug(
                 "notifications: card id={} box={},{},{},{} close={},{},{},{} buttons={}", c.id,
                 c.box.x, c.box.y, c.box.width, c.box.height, c.close.x, c.close.y, c.close.width,
                 c.close.height, buttons[0] ? buttons : "-");
@@ -558,16 +551,14 @@ void lx::shell::notification_view::update(const notification_center& c, void* ou
         relayout();
         apply_size();
         wl_surface_commit(surface);
-        lx::trace::logger::global().logf(lx::trace::level::info, k_view_category,
-                                         "notifications: shown ({} card{}, {} layer)", n,
-                                         n == 1 ? "" : "s", overlay ? "overlay" : "top");
+        log_notify.info("notifications: shown ({} card{}, {} layer)", n, n == 1 ? "" : "s",
+                        overlay ? "overlay" : "top");
         return;
     }
     if (overlay != overlay_) {
         overlay_ = overlay;
-        lx::trace::logger::global().logf(lx::trace::level::info, k_view_category,
-                                         "notifications: {} layer (a critical one {})",
-                                         overlay ? "overlay" : "top", overlay ? "shown" : "gone");
+        log_notify.info("notifications: {} layer (a critical one {})", overlay ? "overlay" : "top",
+                        overlay ? "shown" : "gone");
         // zwlr_layer_surface_v1 v2: the layer changes with the next commit.
         if (zwlr_layer_surface_v1_get_version(static_cast<zwlr_layer_surface_v1*>(layer_)) >= 2)
             zwlr_layer_surface_v1_set_layer(static_cast<zwlr_layer_surface_v1*>(layer_),
@@ -603,9 +594,7 @@ void lx::shell::notification_view::close() {
     configured_ = false;
     hover_card_ = hover_part_ = -1;
     pressed_ = {};
-    lx::trace::logger::global().logf(lx::trace::level::info, k_view_category,
-                                     "notifications: hidden ({} frame{})", frames_,
-                                     frames_ == 1 ? "" : "s");
+    log_notify.info("notifications: hidden ({} frame{})", frames_, frames_ == 1 ? "" : "s");
 }
 
 void lx::shell::notification_view::after_dispatch() {
@@ -625,8 +614,7 @@ void lx::shell::notification_view::after_dispatch() {
         return;
     if (!canvas_.allocated() || canvas_.width() != conf_w_ || canvas_.height() != conf_h_) {
         if (!canvas_.allocate(g_.shm, conf_w_, conf_h_, "lumen-notifications")) {
-            lx::trace::logger::global().log(lx::trace::level::error, k_view_category,
-                                            "cannot allocate notification buffers");
+            log_notify.error("cannot allocate notification buffers");
             close();
             return;
         }

@@ -27,6 +27,12 @@ export module lx.wayland.server;
 
 import std;
 
+namespace {
+
+constexpr lx::trace::category log_wayland{"wayland"};
+
+} // namespace
+
 export namespace lx::wayland {
 
 struct unix_credentials {
@@ -352,10 +358,9 @@ bool lx::wayland::client_connection::sandboxed() {
         std::snprintf(path, sizeof(path), "/proc/%u/root/.flatpak-info", cred_.pid);
         if (::access(path, F_OK) == 0) {
             sandbox_ = 2;
-            lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
-                                             "client pid={} is sandboxed (Flatpak): session-wide "
-                                             "globals hidden",
-                                             cred_.pid);
+            log_wayland.info("client pid={} is sandboxed (Flatpak): session-wide "
+                             "globals hidden",
+                             cred_.pid);
         }
     }
     return sandbox_ == 2;
@@ -487,8 +492,8 @@ void lx::wayland::server::advertise_pending_globals() {
         auto* iface = static_cast<const struct wl_interface*>(g.desc.interface_desc);
         g.wl_global = wl_global_create(display_, iface, g.desc.version, &g, &global_bind_trampoline);
         if (!g.wl_global) {
-            lx::trace::logger::global().log_error(
-                lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"), "wayland");
+            log_wayland.error(
+                lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"));
         }
     }
 }
@@ -679,8 +684,8 @@ void lx::wayland::server::create_wl_global(global_entry& slot) {
         slot.wl_global =
             wl_global_create(display_, iface, slot.desc.version, &slot, &global_bind_trampoline);
         if (!slot.wl_global) {
-            lx::trace::logger::global().log_error(
-                lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"), "wayland");
+            log_wayland.error(
+                lx::make_error(lx::wayland_err::bind_failed, "wl_global_create failed"));
         }
     }
 #else
@@ -692,16 +697,13 @@ lx::wayland::global_handle lx::wayland::server::add_global_ex(global_descriptor 
                                                               global_bind_ex_fn bind_fn,
                                                               void* user) {
     if (!bind_fn || !desc.interface_desc) {
-        lx::trace::logger::global().log(lx::trace::level::warn, "wayland",
-                                        "add_global_ex without a bind function or interface");
+        log_wayland.warn("add_global_ex without a bind function or interface");
         return {};
     }
     const unsigned index = alloc_global_slot();
     if (index >= k_max_globals) {
-        lx::trace::logger::global().log_error(
-            lx::make_error(lx::wayland_err::bind_failed,
-                           "global table full — interface not advertised"),
-            "wayland");
+        log_wayland.error(lx::make_error(lx::wayland_err::bind_failed,
+                                         "global table full — interface not advertised"));
         return {};
     }
     auto& slot = globals_[index];
@@ -753,21 +755,17 @@ void lx::wayland::server::collect_globals(unsigned long long now_ns) {
 
 void lx::wayland::server::add_global(global_descriptor desc, global_bind_fn bind_fn) {
     if (!bind_fn) {
-        lx::trace::logger::global().log(lx::trace::level::warn, "wayland",
-                                        "add_global with null bind_fn — not advertised");
+        log_wayland.warn("add_global with null bind_fn — not advertised");
         return;
     }
     if (!desc.interface_desc) {
-        lx::trace::logger::global().log(lx::trace::level::warn, "wayland",
-                                        "add_global with null interface_desc — not advertised");
+        log_wayland.warn("add_global with null interface_desc — not advertised");
         return;
     }
     const unsigned index = alloc_global_slot();
     if (index >= k_max_globals) {
-        lx::trace::logger::global().log_error(
-            lx::make_error(lx::wayland_err::bind_failed,
-                           "global table full — interface not advertised"),
-            "wayland");
+        log_wayland.error(lx::make_error(lx::wayland_err::bind_failed,
+                                         "global table full — interface not advertised"));
         return;
     }
     auto& slot = globals_[index];
@@ -785,9 +783,8 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
                                                   const char* global_name) const {
     const char* name = global_name ? global_name : "?";
     if (cred.uid != static_cast<unsigned>(::getuid())) {
-        lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
-                                         "privileged global {} denied: client uid={} pid={}", name,
-                                         cred.uid, cred.pid);
+        log_wayland.warn("privileged global {} denied: client uid={} pid={}", name, cred.uid,
+                         cred.pid);
         return false;
     }
     // The peer's pid comes from SO_PEERCRED at connect, and the connection is still open,
@@ -814,11 +811,9 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
         have_exe ? exe : nullptr, nullptr);
     if (verdict == lx::session::privilege_result::allowed)
         return true;
-    lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
-                                     "privileged global {} denied: client pid={} exe={} is not "
-                                     "the shell binary {}",
-                                     name, cred.pid, have_exe ? exe : "(unknown)",
-                                     shell_binary_path_);
+    log_wayland.warn("privileged global {} denied: client pid={} exe={} is not "
+                     "the shell binary {}",
+                     name, cred.pid, have_exe ? exe : "(unknown)", shell_binary_path_);
     return false;
 }
 
@@ -844,14 +839,12 @@ void lx::wayland::server::set_shell_binary_path(const char* path) {
         // Kept as given: nothing can match it, so every privileged bind is denied (and
         // each denial names this path), rather than the check silently passing.
         std::snprintf(shell_binary_path_, sizeof(shell_binary_path_), "%s", candidate);
-        lx::trace::logger::global().logf(lx::trace::level::warn, "wayland",
-                                         "shell binary {} not found: zlm_shell_v1 binds will be "
-                                         "denied",
-                                         shell_binary_path_);
+        log_wayland.warn("shell binary {} not found: zlm_shell_v1 binds will be "
+                         "denied",
+                         shell_binary_path_);
         return;
     }
-    lx::trace::logger::global().logf(lx::trace::level::info, "wayland", "shell binary {}",
-                                     shell_binary_path_);
+    log_wayland.info("shell binary {}", shell_binary_path_);
 }
 
 lx::wayland::client_connection* lx::wayland::server::find_client(unsigned id) {
@@ -975,11 +968,10 @@ int lx::wayland::server::on_listener_closed(int, uint32_t, void* data) {
     server* srv = l ? l->owner : nullptr;
     if (!srv)
         return 0;
-    lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
-                                     "security context {}/{}: listener closed by the sandbox "
-                                     "engine",
-                                     l->context.sandbox_engine[0] ? l->context.sandbox_engine : "-",
-                                     l->context.app_id[0] ? l->context.app_id : "-");
+    log_wayland.info("security context {}/{}: listener closed by the sandbox "
+                     "engine",
+                     l->context.sandbox_engine[0] ? l->context.sandbox_engine : "-",
+                     l->context.app_id[0] ? l->context.app_id : "-");
     srv->drop_listener(*l);
     return 0;
 }
@@ -1012,19 +1004,16 @@ void lx::wayland::server::accept_sandboxed(security_listener& l) {
     client_connection* conn = ensure_client(client);
     if (!conn) {
         wl_client_destroy(client);
-        lx::trace::logger::global().log(lx::trace::level::warn, "wayland",
-                                        "sandboxed client refused: client table full");
+        log_wayland.warn("sandboxed client refused: client table full");
         return;
     }
     conn->context_ = l.context;
     conn->has_context_ = true;
     conn->sandbox_ = 2;
-    lx::trace::logger::global().logf(lx::trace::level::info, "wayland",
-                                     "client {} connected sandboxed (security context engine={} "
-                                     "app_id={}): session-wide globals hidden",
-                                     conn->id(),
-                                     l.context.sandbox_engine[0] ? l.context.sandbox_engine : "-",
-                                     l.context.app_id[0] ? l.context.app_id : "-");
+    log_wayland.info("client {} connected sandboxed (security context engine={} "
+                     "app_id={}): session-wide globals hidden",
+                     conn->id(), l.context.sandbox_engine[0] ? l.context.sandbox_engine : "-",
+                     l.context.app_id[0] ? l.context.app_id : "-");
 }
 #endif
 

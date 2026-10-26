@@ -23,7 +23,7 @@ namespace lx::compositor {
 
 namespace {
 
-constexpr const char* k_category = "compositor.outputcfg";
+constexpr lx::trace::category log_outputcfg{"compositor.outputcfg"};
 
 constexpr const char* k_transform_names[8] = {"normal",  "90",         "180",         "270",
                                               "flipped", "flipped-90", "flipped-180", "flipped-270"};
@@ -537,17 +537,15 @@ output_config_file::~output_config_file() {
 bool output_config_file::load() {
     if (!output_config_path(path_, sizeof(path_))) {
         path_[0] = '\0';
-        lx::trace::logger::global().log(lx::trace::level::info, k_category,
-                                        "output configuration is not persisted "
-                                        "(LUMEN_OUTPUT_CONFIG=0, or no home directory)");
+        log_outputcfg.info("output configuration is not persisted "
+                           "(LUMEN_OUTPUT_CONFIG=0, or no home directory)");
         return false;
     }
     const int fd = ::open(path_, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
         if (errno != ENOENT) {
-            lx::trace::logger::global().logf(lx::trace::level::warn, k_category,
-                                             "output configuration {} unreadable: {}", path_,
-                                             std::strerror(errno));
+            log_outputcfg.warn("output configuration {} unreadable: {}", path_,
+                               std::strerror(errno));
         }
         return true; // nothing remembered yet
     }
@@ -568,19 +566,16 @@ bool output_config_file::load() {
     if (!parse_output_config(text.data(), text.size(), *config_, err)) {
         *config_ = output_config{};
         bad_ = true;
-        lx::trace::logger::global().logf(lx::trace::level::warn, k_category,
-                                         "output configuration {}:{}: {} — ignored (it is renamed "
-                                         "to .bad at the next change)",
-                                         path_, err.line, err.message);
+        log_outputcfg.warn("output configuration {}:{}: {} — ignored (it is renamed "
+                           "to .bad at the next change)",
+                           path_, err.line, err.message);
         return true;
     }
     if (config_->dropped > 0)
-        lx::trace::logger::global().log(lx::trace::level::warn, k_category,
-                                        "output configuration: entries past 64 monitors or "
-                                        "setups were dropped");
-    lx::trace::logger::global().logf(lx::trace::level::info, k_category,
-                                     "output configuration {}: {} monitors, {} setups", path_,
-                                     config_->monitor_count, config_->setup_count);
+        log_outputcfg.warn("output configuration: entries past 64 monitors or "
+                           "setups were dropped");
+    log_outputcfg.info("output configuration {}: {} monitors, {} setups", path_,
+                       config_->monitor_count, config_->setup_count);
     return true;
 }
 
@@ -623,9 +618,8 @@ void output_config_file::write_task(void* self) { static_cast<output_config_file
 
 void output_config_file::write_now() {
     const auto report = [this](const char* what) {
-        lx::trace::logger::global().logf(lx::trace::level::error, k_category,
-                                         "output configuration {}: {} failed: {}", path_, what,
-                                         std::strerror(errno));
+        log_outputcfg.error("output configuration {}: {} failed: {}", path_, what,
+                            std::strerror(errno));
     };
     // The directory, made on demand (only the last level: $XDG_CONFIG_HOME exists).
     char dir[sizeof(path_)];

@@ -15,6 +15,12 @@ import lx.gfx;
 import lx.runtime;
 import lx.trace;
 
+namespace {
+
+constexpr lx::trace::category log_theme{"ui.theme"};
+
+} // namespace
+
 // ── Themes (ADR-010 §4.8, §5) ──────────────────────────────────────────────────────
 //
 // A theme is a compiled `.lxtheme` file: `tools/lumen-theme` turns a theme JSON in Zed's
@@ -947,7 +953,7 @@ const lx::ui::theme& lx::ui::theme::builtin(lx::ui::appearance a) {
             if (r)
                 t[i] = std::move(*r);
             else
-                lx::trace::logger::global().log_error(r.get_error(), "ui.theme");
+                log_theme.error(r.get_error());
         }
         return t;
     }();
@@ -1208,8 +1214,7 @@ bool lx::ui::theme_watcher::poll() {
     j.running = true;
     if (!j.executor->post(lx::runtime::affinity::worker, lx::runtime::task{&theme_watcher::run, &j})) {
         j.running = false;
-        lx::trace::logger::global().log(lx::trace::level::warn, "ui.theme",
-                                        "theme_watcher: worker strand full, reload skipped");
+        log_theme.warn("theme_watcher: worker strand full, reload skipped");
         return false;
     }
     ++stats_.posted;
@@ -1223,8 +1228,7 @@ void lx::ui::theme_watcher::run(void* raw) {
     const lx::runtime::task back{&theme_watcher::land, j};
     for (unsigned attempt = 0; !j->executor->post(lx::runtime::affinity::ui, back); ++attempt) {
         if (attempt == 100000) {
-            lx::trace::logger::global().log(lx::trace::level::error, "ui.theme",
-                                            "theme_watcher: UI strand full, reload lost");
+            log_theme.error("theme_watcher: UI strand full, reload lost");
             return;
         }
         std::this_thread::yield();
@@ -1243,12 +1247,11 @@ void lx::ui::theme_watcher::land(void* raw) {
     if (j->loaded && *j->loaded) {
         set_active_theme(std::move(**j->loaded));
         ++w->stats_.applied;
-        lx::trace::logger::global().logf(lx::trace::level::info, "ui.theme", "theme reloaded: {}",
-                                         active_theme().name());
+        log_theme.info("theme reloaded: {}", active_theme().name());
     } else {
         ++w->stats_.failed;
         if (j->loaded)
-            lx::trace::logger::global().log_error(j->loaded->get_error(), "ui.theme");
+            log_theme.error(j->loaded->get_error());
     }
     j->loaded.reset();
     if (w->again_) {

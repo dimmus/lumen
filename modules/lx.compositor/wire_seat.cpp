@@ -30,6 +30,12 @@ import :toplevel;
 import :output;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_seat{"compositor.seat"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -74,7 +80,7 @@ struct keymap_source {
             : &fallback;
     if (!keymap->valid()) {
         if (auto compiled = keymap->compile(); !compiled) {
-            lx::trace::logger::global().log_error(compiled.get_error(), "compositor.seat");
+            log_seat.error(compiled.get_error());
             return cached;
         }
     }
@@ -82,7 +88,7 @@ struct keymap_source {
     unsigned size = 0;
     auto fd = keymap->keymap_fd(size);
     if (!fd) {
-        lx::trace::logger::global().log_error(fd.get_error(), "compositor.seat");
+        log_seat.error(fd.get_error());
         return cached;
     }
 

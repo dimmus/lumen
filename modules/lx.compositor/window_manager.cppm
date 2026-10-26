@@ -28,6 +28,13 @@ import :liveness;
 import :activation;
 import :workspaces;
 
+namespace {
+
+constexpr lx::trace::category log_deco{"compositor.deco"};
+constexpr lx::trace::category log_layer{"compositor.layer"};
+
+} // namespace
+
 export namespace lx::compositor {
 
 /// Interactive grab kinds. One grab at a time, seat-wide.
@@ -965,11 +972,7 @@ void shift_anchors(toplevel_record& rec, int dx, int dy);
 
 namespace {
 
-constexpr const char* k_wm_category = "compositor.wm";
-
-[[nodiscard]] bool wm_debug_enabled() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_wm{"compositor.wm"};
 
 [[nodiscard]] lx::runtime::clock_time wm_now_ns() {
     return static_cast<lx::runtime::clock_time>(
@@ -1588,11 +1591,10 @@ void lx::compositor::window_manager::set_layers(layer_shell* layers) {
         // An on_demand surface that unmapped or lost its interactivity gives the keyboard
         // back.
         if (wm->layer_focus_ && !(wm->layers_ && wm->layers_->focusable(wm->layer_focus_))) {
-            if (wm_debug_enabled()) {
-                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.layer",
-                                                 "layer focus surface=0 interactivity=none "
-                                                 "cause=unmap previous={}",
-                                                 wm->layer_focus_.id());
+            if (log_layer.enabled(lx::trace::level::debug)) {
+                log_layer.debug("layer focus surface=0 interactivity=none "
+                                "cause=unmap previous={}",
+                                wm->layer_focus_.id());
             }
             wm->layer_focus_ = {};
         }
@@ -1611,11 +1613,10 @@ void lx::compositor::window_manager::set_layers(layer_shell* layers) {
             wm->layers_->mapped_level(wm->layer_focus_) > wm->layers_->mapped_level(surface))
             return;
         wm->layer_focus_ = surface;
-        if (wm_debug_enabled()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.layer",
-                                             "layer focus surface={} interactivity=on_demand "
-                                             "cause=map",
-                                             surface.id());
+        if (log_layer.enabled(lx::trace::level::debug)) {
+            log_layer.debug("layer focus surface={} interactivity=on_demand "
+                            "cause=map",
+                            surface.id());
         }
     };
     host.surface_moved = [](void* user, lx::surface_id surface) {
@@ -1786,10 +1787,8 @@ void lx::compositor::window_manager::set_parent(lx::toplevel_id id, lx::toplevel
     const bool was_modal = effective_modal(*toplevels_, *rec);
     rec->parent = parent;
     const bool modal = effective_modal(*toplevels_, *rec);
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "parent id={} parent={} modal={}", id.id(), parent.id(),
-                                         modal ? 1 : 0);
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("parent id={} parent={} modal={}", id.id(), parent.id(), modal ? 1 : 0);
     }
     if (!rec->mapped)
         return;
@@ -1812,10 +1811,8 @@ void lx::compositor::window_manager::set_modal(lx::toplevel_id id, bool modal) {
     const bool was = effective_modal(*toplevels_, *rec);
     rec->modal = modal;
     const bool now = effective_modal(*toplevels_, *rec);
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "modal id={} on={} effective={}", id.id(), modal ? 1 : 0,
-                                         now ? 1 : 0);
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("modal id={} on={} effective={}", id.id(), modal ? 1 : 0, now ? 1 : 0);
     }
     if (was == now)
         return;
@@ -1970,10 +1967,9 @@ unsigned lx::compositor::window_manager::evacuate_output(unsigned slot, int fall
     });
     if (moved > 0) {
         rehit_pending_ = true;
-        if (wm_debug_enabled()) {
-            lx::trace::logger::global().logf(
-                lx::trace::level::debug, k_wm_category, "evacuate output={} to={} windows={:d}{}",
-                slot, fallback, moved, fallback < 0 ? " (stranded until an output comes)" : "");
+        if (log_wm.enabled(lx::trace::level::debug)) {
+            log_wm.debug("evacuate output={} to={} windows={:d}{}", slot, fallback, moved,
+                         fallback < 0 ? " (stranded until an output comes)" : "");
         }
     }
     // Its workspaces (W.6): the active one's windows join what the fallback shows, the
@@ -2070,10 +2066,8 @@ bool lx::compositor::window_manager::move_to_output(lx::toplevel_id id, int dx, 
     update_visibility();
     flush_workspaces();
     rehit_pending_ = true;
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "move to output id={} from={} to={}", id.id(), from_slot,
-                                         best);
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("move to output id={} from={} to={}", id.id(), from_slot, best);
     }
     return true;
 }
@@ -2138,10 +2132,8 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
     });
     if (adopted > 0) {
         rehit_pending_ = true;
-        if (wm_debug_enabled()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                             "stranded windows taken in by output={} windows={}",
-                                             slot, adopted);
+        if (log_wm.enabled(lx::trace::level::debug)) {
+            log_wm.debug("stranded windows taken in by output={} windows={}", slot, adopted);
         }
     }
     if (!o.identifier[0]) {
@@ -2212,10 +2204,8 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
     });
     if (back > 0) {
         rehit_pending_ = true;
-        if (wm_debug_enabled()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                             "home output={} identifier=\"{}\" windows={}", slot,
-                                             o.identifier, back);
+        if (log_wm.enabled(lx::trace::level::debug)) {
+            log_wm.debug("home output={} identifier=\"{}\" windows={}", slot, o.identifier, back);
         }
     }
     workspaces_.settle(slot);
@@ -2229,10 +2219,9 @@ void lx::compositor::window_manager::on_usable_area_changed(unsigned slot, lx::r
         usable = output_area(static_cast<int>(slot));
     if (slot < output_manager::k_max && !rect_equal(usable, usable_logged_[slot])) {
         usable_logged_[slot] = usable;
-        if (wm_debug_enabled()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                             "usable area x={} y={} w={} h={} output={}", usable.x,
-                                             usable.y, usable.width, usable.height, slot);
+        if (log_wm.enabled(lx::trace::level::debug)) {
+            log_wm.debug("usable area x={} y={} w={} h={} output={}", usable.x, usable.y,
+                         usable.width, usable.height, slot);
         }
     }
     if (!toplevels_)
@@ -2311,10 +2300,8 @@ void lx::compositor::window_manager::set_maximized(lx::toplevel_id id, bool on,
     auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
     if (!rec)
         return;
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "maximize id={} on={} source={}", id.id(), on ? 1 : 0,
-                                         source ? source : "-");
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("maximize id={} on={} source={}", id.id(), on ? 1 : 0, source ? source : "-");
     }
     // Before the initial configure, that configure answers it.
     if (!rec->initial_configure_sent) {
@@ -2377,10 +2364,9 @@ void lx::compositor::window_manager::set_fullscreen(lx::toplevel_id id, bool on,
         return;
     if (output >= 0 && !(outputs_ && outputs_->slot_live(static_cast<unsigned>(output))))
         output = -1; // a wl_output whose output is gone: the window's own
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "fullscreen id={} on={} output={} source={}", id.id(),
-                                         on ? 1 : 0, output, source ? source : "-");
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("fullscreen id={} on={} output={} source={}", id.id(), on ? 1 : 0, output,
+                     source ? source : "-");
     }
     // Before the initial configure, that configure answers it.
     if (!rec->initial_configure_sent) {
@@ -2455,12 +2441,11 @@ void lx::compositor::window_manager::set_fullscreen(lx::toplevel_id id, bool on,
 
 void lx::compositor::window_manager::log_geometry(const toplevel_record& rec, const char* cause,
                                                   unsigned serial) const {
-    if (!wm_debug_enabled())
+    if (!log_wm.enabled(lx::trace::level::debug))
         return;
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                     "geometry id={} x={} y={} w={} h={} cause={} serial={}",
-                                     rec.id.id(), rec.geometry.x, rec.geometry.y,
-                                     rec.geometry.width, rec.geometry.height, cause, serial);
+    log_wm.debug("geometry id={} x={} y={} w={} h={} cause={} serial={}", rec.id.id(),
+                 rec.geometry.x, rec.geometry.y, rec.geometry.width, rec.geometry.height, cause,
+                 serial);
 }
 
 void lx::compositor::window_manager::send_configure(toplevel_record& rec,
@@ -2511,14 +2496,12 @@ void lx::compositor::window_manager::send_configure(toplevel_record& rec,
     if (send_deco) {
         rec.deco_configure_due = false;
         rec.deco_awaiting_configure = false;
-        if (wm_debug_enabled()) {
+        if (log_deco.enabled(lx::trace::level::debug)) {
             const char* req = rec.deco_requested == decoration_request::client   ? "client"
                               : rec.deco_requested == decoration_request::server ? "server"
                                                                                  : "unset";
-            lx::trace::logger::global().logf(
-                lx::trace::level::debug, "compositor.deco",
-                "decoration mode id={} requested={} sent={} serial={}", rec.id.id(), req,
-                c.decoration == decoration_mode::server ? "server" : "client", c.serial);
+            log_deco.debug("decoration mode id={} requested={} sent={} serial={}", rec.id.id(), req,
+                           c.decoration == decoration_mode::server ? "server" : "client", c.serial);
         }
     }
     toplevel_manager::on_sent(rec, c, now_ns);
@@ -2534,14 +2517,13 @@ void lx::compositor::window_manager::send_configure(toplevel_record& rec,
         rec.desired.anchor = {};
     }
 
-    if (wm_debug_enabled()) {
+    if (log_wm.enabled(lx::trace::level::debug)) {
         char states[64];
         format_states(c.states, states, sizeof(states));
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "configure id={} serial={} w={} h={} states={} edges={} "
-                                         "watchdog={}",
-                                         rec.id.id(), c.serial, c.size.width, c.size.height, states,
-                                         c.anchor_edges, watchdog ? 1 : 0);
+        log_wm.debug("configure id={} serial={} w={} h={} states={} edges={} "
+                     "watchdog={}",
+                     rec.id.id(), c.serial, c.size.width, c.size.height, states, c.anchor_edges,
+                     watchdog ? 1 : 0);
     }
 }
 
@@ -2679,14 +2661,12 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
     rec->decoration_current = mode;
     // Logged once the window is where this commit puts it (a first map places it).
     const auto log_apply = [&](const toplevel_record& r) {
-        if (!mode_changed || !wm_debug_enabled())
+        if (!mode_changed || !log_deco.enabled(lx::trace::level::debug))
             return;
         const lx::rect2i f = frame_rect(r.geometry, extents_of(r));
-        lx::trace::logger::global().logf(
-            lx::trace::level::debug, "compositor.deco",
-            "decoration apply id={} mode={} frame={},{},{}x{}", r.id.id(),
-            r.decoration_current == decoration_mode::server ? "server" : "client", f.x, f.y,
-            f.width, f.height);
+        log_deco.debug("decoration apply id={} mode={} frame={},{},{}x{}", r.id.id(),
+                       r.decoration_current == decoration_mode::server ? "server" : "client", f.x,
+                       f.y, f.width, f.height);
     };
 
     if (!rec->mapped) {
@@ -2783,16 +2763,14 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
     if (!tree_->map_root(rec.surface, *windows_layer_, ~0u) || !surfaces_->node(rec.surface)) {
         tree_->unmap_root(rec.surface);
         toplevels_->set_mapped(rec.id, false);
-        lx::trace::logger::global().log(lx::trace::level::warn, k_wm_category,
-                                        "map failed: no scene node for surface");
+        log_wm.warn("map failed: no scene node for surface");
         return;
     }
 
     {
-        lx::trace::logger::global().logf(lx::trace::level::info, k_wm_category,
-                                         "map id={} app_id={} x={} y={} w={} h={}", rec.id.id(),
-                                         rec.app_id ? rec.app_id : "", rec.geometry.x,
-                                         rec.geometry.y, rec.geometry.width, rec.geometry.height);
+        log_wm.info("map id={} app_id={} x={} y={} w={} h={}", rec.id.id(),
+                    rec.app_id ? rec.app_id : "", rec.geometry.x, rec.geometry.y,
+                    rec.geometry.width, rec.geometry.height);
     }
     log_geometry(rec, "map", 0);
     sync_decoration(rec);
@@ -2920,8 +2898,7 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     }
 
     {
-        lx::trace::logger::global().logf(lx::trace::level::info, k_wm_category,
-                                         "unmap id={} reason={}", id.id(), reason ? reason : "-");
+        log_wm.info("unmap id={} reason={}", id.id(), reason ? reason : "-");
     }
 
     // Focus falls to whatever is now on top — the stacking order is the only history kept.
@@ -3041,10 +3018,8 @@ void lx::compositor::window_manager::flush_configures(lx::runtime::clock_time no
         if (!rec.initial_configure_sent || !toplevel_manager::want_send(rec, now_ns))
             return;
         const bool watchdog = toplevel_manager::timed_out(rec, now_ns);
-        if (watchdog && wm_debug_enabled()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                             "configure watchdog id={} serial={}", rec.id.id(),
-                                             rec.last_sent.serial);
+        if (watchdog && log_wm.enabled(lx::trace::level::debug)) {
+            log_wm.debug("configure watchdog id={} serial={}", rec.id.id(), rec.last_sent.serial);
         }
         send_configure(rec, now_ns, false, watchdog);
         // A configure unanswered past the watchdog is the strongest hint of a hung client
@@ -3060,9 +3035,8 @@ void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
     // xdg-dialog-v1: a window with a modal dialog never takes the keyboard — the dialog does
     // (activation, the shell's request_activate, a click, a window mapping).
     if (const lx::toplevel_id b = modal_blocker(id); b) {
-        if (wm_debug_enabled()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                             "focus redirect id={} modal={}", id.id(), b.id());
+        if (log_wm.enabled(lx::trace::level::debug)) {
+            log_wm.debug("focus redirect id={} modal={}", id.id(), b.id());
         }
         id = b;
     }
@@ -3100,9 +3074,8 @@ void lx::compositor::window_manager::set_keyboard_focus(lx::toplevel_id id) {
                            ping_reason::activate);
     if (shell_)
         shell_->emit_focus_changed(rec);
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "focus keyboard id={}", id.id());
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("focus keyboard id={}", id.id());
     }
 }
 
@@ -3187,10 +3160,8 @@ void lx::compositor::window_manager::resolve_keyboard_focus() {
     if (!router_ || !seat_ || router_->chosen_keyboard_focus() == target)
         return;
     router_->set_keyboard_focus(target, *seat_);
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "focus keyboard-surface kind={} surface={}", kind,
-                                         surface.id());
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("focus keyboard-surface kind={} surface={}", kind, surface.id());
     }
 }
 
@@ -3371,32 +3342,30 @@ void lx::compositor::window_manager::set_pointer_focus(const wm_hit* hit) {
         else
             (void)router_->set_pointer_focus(nullptr, 0.0, 0.0, *seat_);
     }
-    if (!wm_debug_enabled())
+    if (!log_wm.enabled(lx::trace::level::debug))
         return;
-    auto& log = lx::trace::logger::global();
     constexpr auto lvl = lx::trace::level::debug;
     if (on_frame)
         // Deliberately not `focus pointer id=…`: no client has the pointer.
-        log.logf(lvl, k_wm_category, "focus pointer decoration id={} zone={}", hit->id.id(),
-                 deco_zone_name(hit->zone));
+        log_wm.log(lvl, "focus pointer decoration id={} zone={}", hit->id.id(),
+                   deco_zone_name(hit->zone));
     else if (hit && hit->owner == hit_owner::popup)
         // Deliberately not `focus pointer id=…`: the drag smoke counts those as windows.
-        log.logf(lvl, k_wm_category, "focus pointer popup surface={} sx={:.1f} sy={:.1f}",
-                 hit->surface.id(), hit->sx, hit->sy);
+        log_wm.log(lvl, "focus pointer popup surface={} sx={:.1f} sy={:.1f}", hit->surface.id(),
+                   hit->sx, hit->sy);
     else if (hit && hit->owner == hit_owner::layer)
-        log.logf(lvl, k_wm_category, "focus pointer layer surface={} sx={:.1f} sy={:.1f}",
-                 hit->surface.id(), hit->sx, hit->sy);
+        log_wm.log(lvl, "focus pointer layer surface={} sx={:.1f} sy={:.1f}", hit->surface.id(),
+                   hit->sx, hit->sy);
     else if (hit && hit->owner == hit_owner::ime_popup)
-        log.logf(lvl, k_wm_category, "focus pointer ime-popup surface={} sx={:.1f} sy={:.1f}",
-                 hit->surface.id(), hit->sx, hit->sy);
+        log_wm.log(lvl, "focus pointer ime-popup surface={} sx={:.1f} sy={:.1f}", hit->surface.id(),
+                   hit->sx, hit->sy);
     else if (hit)
-        log.logf(lvl, k_wm_category, "focus pointer id={} sx={:.1f} sy={:.1f}", hit->id.id(),
-                 hit->sx, hit->sy);
+        log_wm.log(lvl, "focus pointer id={} sx={:.1f} sy={:.1f}", hit->id.id(), hit->sx, hit->sy);
     else
-        log.log(lvl, k_wm_category, "focus pointer none");
+        log_wm.log(lvl, "focus pointer none");
     if (hit && !on_frame && hit->owner == hit_owner::toplevel && !(hit->surface == hit->root))
-        log.logf(lvl, k_wm_category, "focus pointer-surface surface={} root={}", hit->surface.id(),
-                 hit->root.id());
+        log_wm.log(lvl, "focus pointer-surface surface={} root={}", hit->surface.id(),
+                   hit->root.id());
 }
 
 void lx::compositor::window_manager::on_surface_unmapped(lx::surface_id surface) {
@@ -3623,24 +3592,22 @@ void lx::compositor::window_manager::on_pointer_button(
             if (pointer_owner_ == hit_owner::layer && pointer_root_ && router_->pointer_focus()) {
                 if (!(layer_focus_ == pointer_root_) && layers_->click_focusable(pointer_root_)) {
                     layer_focus_ = pointer_root_;
-                    if (wm_debug_enabled()) {
+                    if (log_layer.enabled(lx::trace::level::debug)) {
                         const layer_record* l = layers_->find(layer_focus_);
-                        lx::trace::logger::global().logf(
-                            lx::trace::level::debug, "compositor.layer",
-                            "layer focus surface={} interactivity={} "
-                            "cause=click",
-                            layer_focus_.id(),
-                            l && l->current.interactivity == 1 ? "exclusive" : "on_demand");
+                        log_layer.debug("layer focus surface={} interactivity={} "
+                                        "cause=click",
+                                        layer_focus_.id(),
+                                        l && l->current.interactivity == 1 ? "exclusive"
+                                                                           : "on_demand");
                     }
                     resolve_keyboard_focus();
                 }
             } else if (pointer_owner_ != hit_owner::popup &&
                        pointer_owner_ != hit_owner::ime_popup && layer_focus_) {
-                if (wm_debug_enabled()) {
-                    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.layer",
-                                                     "layer focus surface=0 interactivity=none "
-                                                     "cause=click previous={}",
-                                                     layer_focus_.id());
+                if (log_layer.enabled(lx::trace::level::debug)) {
+                    log_layer.debug("layer focus surface=0 interactivity=none "
+                                    "cause=click previous={}",
+                                    layer_focus_.id());
                 }
                 layer_focus_ = {};
                 resolve_keyboard_focus();
@@ -3656,10 +3623,8 @@ void lx::compositor::window_manager::on_pointer_button(
                 swallowed_mask_ |= bit;
                 set_keyboard_focus(b);
                 (void)raise(pointer_focus_);
-                if (wm_debug_enabled()) {
-                    lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                                     "modal press id={} dialog={}",
-                                                     pointer_focus_.id(), b.id());
+                if (log_wm.enabled(lx::trace::level::debug)) {
+                    log_wm.debug("modal press id={} dialog={}", pointer_focus_.id(), b.id());
                 }
                 return;
             }
@@ -3696,9 +3661,8 @@ void lx::compositor::window_manager::on_pointer_button(
             if (decorations_)
                 decorations_->set_button(id, over ? deco_button::hover : deco_button::normal);
             if (over) {
-                if (wm_debug_enabled()) {
-                    lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.deco",
-                                                     "decoration close id={}", id.id());
+                if (log_deco.enabled(lx::trace::level::debug)) {
+                    log_deco.debug("decoration close id={}", id.id());
                 }
                 request_close(id);
             }
@@ -3836,10 +3800,8 @@ void lx::compositor::window_manager::set_session_locked(bool locked) {
         else
             set_pointer_focus(nullptr);
     }
-    if (wm_debug_enabled())
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category,
-                                        locked ? "input locked (lock surfaces only)"
-                                               : "input unlocked");
+    if (log_wm.enabled(lx::trace::level::debug))
+        log_wm.debug("{}", locked ? "input locked (lock surfaces only)" : "input unlocked");
 }
 
 void lx::compositor::window_manager::lock_focus_changed() {
@@ -3936,10 +3898,9 @@ void lx::compositor::window_manager::drag_hit(unsigned time_ms, bool send_motion
 
 void lx::compositor::window_manager::decoration_press(
     lx::toplevel_id id, deco_zone zone, const lx::input::pointer_button_event& event) {
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.deco",
-                                         "decoration press id={} zone={} button={}", id.id(),
-                                         deco_zone_name(zone), event.evdev_code);
+    if (log_deco.enabled(lx::trace::level::debug)) {
+        log_deco.debug("decoration press id={} zone={} button={}", id.id(), deco_zone_name(zone),
+                       event.evdev_code);
     }
     constexpr unsigned k_btn_middle = 0x112;
     // Middle on the title lowers (the KWin and Mutter default). Without click-to-focus: a
@@ -3966,10 +3927,9 @@ void lx::compositor::window_manager::decoration_press(
             // Double click on the title toggles maximize (every desktop's default).
             const auto* rec = toplevels_->find(id);
             const bool maximized = rec && (rec->desired.states & tl_maximized) != 0;
-            if (wm_debug_enabled()) {
-                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.deco",
-                                                 "decoration double-click id={} maximize={}",
-                                                 id.id(), maximized ? 0 : 1);
+            if (log_deco.enabled(lx::trace::level::debug)) {
+                log_deco.debug("decoration double-click id={} maximize={}", id.id(),
+                               maximized ? 0 : 1);
             }
             set_maximized(id, !maximized, "decoration");
             return;
@@ -4019,11 +3979,10 @@ void lx::compositor::window_manager::on_decoration_request(lx::toplevel_id id, b
 
 void lx::compositor::window_manager::log_grab_reject(lx::toplevel_id id, grab_source source,
                                                      const char* reason) const {
-    if (!wm_debug_enabled())
+    if (!log_wm.enabled(lx::trace::level::debug))
         return;
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                     "grab rejected id={} source={} reason={}", id.id(),
-                                     grab_source_name(source), reason);
+    log_wm.debug("grab rejected id={} source={} reason={}", id.id(), grab_source_name(source),
+                 reason);
 }
 
 bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mode,
@@ -4107,15 +4066,12 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
         rec->desired.anchor = grab_.start;
     }
 
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "grab begin id={} mode={} edges={} source={} button={} "
-                                         "x={} y={} w={} h={}{}{}",
-                                         id.id(), grab_mode_name(mode), grab_.edges,
-                                         grab_source_name(source), button, grab_.start.x,
-                                         grab_.start.y, grab_.start.width, grab_.start.height,
-                                         keyboard ? " keyboard" : "",
-                                         grab_.restore_pending ? " restore-pending" : "");
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("grab begin id={} mode={} edges={} source={} button={} "
+                     "x={} y={} w={} h={}{}{}",
+                     id.id(), grab_mode_name(mode), grab_.edges, grab_source_name(source), button,
+                     grab_.start.x, grab_.start.y, grab_.start.width, grab_.start.height,
+                     keyboard ? " keyboard" : "", grab_.restore_pending ? " restore-pending" : "");
     }
     return true;
 }
@@ -4308,9 +4264,8 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
         configure_now(*rec);
         if (shell_)
             shell_->emit_toplevel_state(*rec);
-        lx::trace::logger::global().logf(lx::trace::level::info, k_wm_category,
-                                         "edge snap id={} zone={} output={}", g.toplevel.id(),
-                                         g.zone == k_snap_maximize ? 0x10u : g.zone, slot);
+        log_wm.info("edge snap id={} zone={} output={}", g.toplevel.id(),
+                    g.zone == k_snap_maximize ? 0x10u : g.zone, slot);
     } else if (live && g.mode == grab_mode::move && reason == grab_end_reason::escape &&
                restored) {
         // Escape after drag-to-restore puts the window back as it was (maximized or snapped,
@@ -4334,12 +4289,10 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
     if (cursor_)
         cursor_->clear_override();
 
-    if (wm_debug_enabled()) {
+    if (log_wm.enabled(lx::trace::level::debug)) {
         const lx::rect2i r = rec ? rec->geometry : g.start;
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "grab end id={} mode={} reason={} x={} y={} w={} h={}",
-                                         g.toplevel.id(), grab_mode_name(g.mode),
-                                         grab_end_name(reason), r.x, r.y, r.width, r.height);
+        log_wm.debug("grab end id={} mode={} reason={} x={} y={} w={} h={}", g.toplevel.id(),
+                     grab_mode_name(g.mode), grab_end_name(reason), r.x, r.y, r.width, r.height);
     }
     // The grab kept its window shown (`shown`); now its workspace decides again.
     update_visibility();
@@ -4379,10 +4332,8 @@ void lx::compositor::window_manager::sync_node_stacking(const toplevel_record& r
         decorations_->damage(rec.id);
     rehit_pending_ = true;
     stacking_dirty_ = true;
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "{} id={} index={}", verb, rec.id.id(),
-                                         toplevels_->stacking_index(rec.id));
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("{} id={} index={}", verb, rec.id.id(), toplevels_->stacking_index(rec.id));
     }
 }
 
@@ -4454,19 +4405,17 @@ void lx::compositor::window_manager::activate(lx::toplevel_id id) {
 
 namespace {
 
-constexpr const char* k_activation_category = "compositor.activation";
+constexpr lx::trace::category log_activation{"compositor.activation"};
 
-void log_activation(const char* token_prefix, const lx::compositor::toplevel_record& rec,
-                    lx::compositor::activation_result r, lx::compositor::activation_reason why,
-                    const char* cause) {
-    if (!wm_debug_enabled())
+void log_activation_result(const char* token_prefix, const lx::compositor::toplevel_record& rec,
+                           lx::compositor::activation_result r,
+                           lx::compositor::activation_reason why, const char* cause) {
+    if (!log_activation.enabled(lx::trace::level::debug))
         return;
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_activation_category,
-                                     "activate token={:.8} surface={} id={} result={} reason={}{}",
-                                     token_prefix && token_prefix[0] ? token_prefix : "-",
-                                     rec.surface.id(), rec.id.id(),
-                                     lx::compositor::activation_result_name(r),
-                                     lx::compositor::activation_reason_name(why), cause);
+    log_activation.debug("activate token={:.8} surface={} id={} result={} reason={}{}",
+                         token_prefix && token_prefix[0] ? token_prefix : "-", rec.surface.id(),
+                         rec.id.id(), lx::compositor::activation_result_name(r),
+                         lx::compositor::activation_reason_name(why), cause);
 }
 
 } // namespace
@@ -4550,13 +4499,13 @@ bool lx::compositor::window_manager::decide_activation_at_map(toplevel_record& r
     activation_reason token_reason{};
     const activation_result r = lx::compositor::decide_activation_at_map(
         activation_context_for(&rec, grant, rec.activation_requested_ns), why, token_reason);
-    if (wm_debug_enabled()) {
+    if (log_activation.enabled(lx::trace::level::debug)) {
         // The token's own verdict too when the map overrode it.
         char cause[48];
         std::snprintf(cause, sizeof(cause), " cause=map%s%s",
                       why != token_reason ? " refused=" : "",
                       why != token_reason ? activation_reason_name(token_reason) : "");
-        log_activation(grant ? grant->prefix : nullptr, rec, r, why, cause);
+        log_activation_result(grant ? grant->prefix : nullptr, rec, r, why, cause);
     }
     if (r != activation_result::urgent)
         return true;
@@ -4570,9 +4519,8 @@ void lx::compositor::window_manager::set_demands_attention(toplevel_record& rec,
     if (rec.demands_attention == on || (on && rec.id == keyboard_focus_))
         return;
     rec.demands_attention = on;
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_activation_category,
-                                         "urgent id={} on={}", rec.id.id(), on ? 1 : 0);
+    if (log_activation.enabled(lx::trace::level::debug)) {
+        log_activation.debug("urgent id={} on={}", rec.id.id(), on ? 1 : 0);
     }
     if (shell_)
         shell_->emit_toplevel_flags(rec);
@@ -4647,7 +4595,7 @@ void lx::compositor::window_manager::emit_stacking_order() {
 
 namespace {
 
-constexpr const char* k_ws_category = "compositor.workspace";
+constexpr lx::trace::category log_workspace{"compositor.workspace"};
 
 } // namespace
 
@@ -4828,12 +4776,10 @@ void lx::compositor::window_manager::apply_hidden(toplevel_record& rec, bool hid
     else
         rec.desired.states &= ~static_cast<unsigned>(tl_suspended);
     rehit_pending_ = true;
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_ws_category,
-                                         "window id={} {} workspace={} minimized={} sticky={}",
-                                         rec.id.id(), hide ? "hidden" : "shown",
-                                         rec.workspace.id(), rec.minimized ? 1 : 0,
-                                         rec.sticky ? 1 : 0);
+    if (log_workspace.enabled(lx::trace::level::debug)) {
+        log_workspace.debug("window id={} {} workspace={} minimized={} sticky={}", rec.id.id(),
+                            hide ? "hidden" : "shown", rec.workspace.id(), rec.minimized ? 1 : 0,
+                            rec.sticky ? 1 : 0);
     }
 }
 
@@ -4959,9 +4905,8 @@ bool lx::compositor::window_manager::switch_workspace(lx::workspace_id ws, const
         const char* out = outputs_ && outputs_->slot_live(static_cast<unsigned>(slot))
                               ? outputs_->slot_state(static_cast<unsigned>(slot)).name
                               : "-";
-        lx::trace::logger::global().logf(lx::trace::level::info, k_ws_category,
-                                         "workspace activate output={} name={} id={} source={}",
-                                         out, name, ws.id(), source ? source : "-");
+        log_workspace.info("workspace activate output={} name={} id={} source={}", out, name,
+                           ws.id(), source ? source : "-");
     }
     rehit_pending_ = true;
     flush_workspaces();
@@ -5031,11 +4976,9 @@ bool lx::compositor::window_manager::move_to_workspace(lx::toplevel_id id, lx::w
                 move_one(child);
             }
         });
-    lx::trace::logger::global().logf(lx::trace::level::info, k_ws_category,
-                                     "workspace move window id={} to={} id={} follow={} "
-                                     "source={}",
-                                     id.id(), w->name, ws.id(), follow ? 1 : 0,
-                                     source ? source : "-");
+    log_workspace.info("workspace move window id={} to={} id={} follow={} "
+                       "source={}",
+                       id.id(), w->name, ws.id(), follow ? 1 : 0, source ? source : "-");
     if (follow) {
         (void)switch_workspace(ws, source);
         set_keyboard_focus(id);
@@ -5080,8 +5023,7 @@ bool lx::compositor::window_manager::assign_workspace(lx::workspace_id ws, unsig
         flush_workspaces();
         return false;
     }
-    lx::trace::logger::global().logf(lx::trace::level::info, k_ws_category,
-                                     "workspace assign id={} output={}", ws.id(), slot);
+    log_workspace.info("workspace assign id={} output={}", ws.id(), slot);
     update_visibility();
     flush_workspaces();
     return true;
@@ -5095,10 +5037,9 @@ void lx::compositor::window_manager::set_minimized(lx::toplevel_id id, bool on,
         return;
     rec->minimized = on;
     ws_windows_changed_ = true;
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_ws_category,
-                                         "minimize id={} on={} source={}", id.id(), on ? 1 : 0,
-                                         source ? source : "-");
+    if (log_workspace.enabled(lx::trace::level::debug)) {
+        log_workspace.debug("minimize id={} on={} source={}", id.id(), on ? 1 : 0,
+                            source ? source : "-");
     }
     // A move or resize of it ends (it leaves the screen under the pointer).
     if (on && grab_.mode != grab_mode::none && grab_.toplevel == id) {
@@ -5131,9 +5072,8 @@ void lx::compositor::window_manager::set_sticky(lx::toplevel_id id, bool on) {
     ws_windows_changed_ = true;
     if (shell_)
         shell_->emit_toplevel_flags(*rec);
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_ws_category,
-                                         "sticky id={} on={}", id.id(), on ? 1 : 0);
+    if (log_workspace.enabled(lx::trace::level::debug)) {
+        log_workspace.debug("sticky id={} on={}", id.id(), on ? 1 : 0);
     }
     update_visibility();
     flush_workspaces();
@@ -5143,7 +5083,7 @@ void lx::compositor::window_manager::set_sticky(lx::toplevel_id id, bool on) {
 
 namespace {
 
-constexpr const char* k_snap_category = "compositor.snap";
+constexpr lx::trace::category log_snap{"compositor.snap"};
 
 [[nodiscard]] const char* snap_name(unsigned snap) {
     using namespace lx::compositor;
@@ -5249,9 +5189,8 @@ void lx::compositor::window_manager::set_snap(lx::toplevel_id id, unsigned snap,
     configure_now(*rec);
     if (shell_)
         shell_->emit_toplevel_state(*rec);
-    lx::trace::logger::global().logf(lx::trace::level::info, k_snap_category,
-                                     "snap id={} to={} output={} source={}", id.id(),
-                                     snap_name(snap), slot, source ? source : "-");
+    log_snap.info("snap id={} to={} output={} source={}", id.id(), snap_name(snap), slot,
+                  source ? source : "-");
 }
 
 bool lx::compositor::window_manager::snap_by_key(lx::toplevel_id id, snap_key key,
@@ -5333,10 +5272,9 @@ void lx::compositor::window_manager::show_snap_preview(unsigned zone, int slot) 
         scene_->note_damage(preview_.rect());
     preview_.show(r);
     scene_->note_damage(r);
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_snap_category,
-                                         "snap preview zone={} output={} x={} y={} w={} h={}",
-                                         snap_name(zone), slot, r.x, r.y, r.width, r.height);
+    if (log_snap.enabled(lx::trace::level::debug)) {
+        log_snap.debug("snap preview zone={} output={} x={} y={} w={} h={}", snap_name(zone), slot,
+                       r.x, r.y, r.width, r.height);
     }
 }
 
@@ -5346,9 +5284,8 @@ void lx::compositor::window_manager::hide_snap_preview() {
     if (scene_)
         scene_->note_damage(preview_.rect());
     preview_.hide();
-    if (wm_debug_enabled())
-        lx::trace::logger::global().log(lx::trace::level::debug, k_snap_category,
-                                        "snap preview hidden");
+    if (log_snap.enabled(lx::trace::level::debug))
+        log_snap.debug("snap preview hidden");
 }
 
 void lx::compositor::window_manager::update_edge_zone() {
@@ -5369,10 +5306,9 @@ void lx::compositor::window_manager::update_edge_zone() {
         show_snap_preview(zone, slot);
     else
         hide_snap_preview();
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_snap_category,
-                                         "edge zone id={} zone={} output={}", grab_.toplevel.id(),
-                                         snap_name(zone), slot);
+    if (log_snap.enabled(lx::trace::level::debug)) {
+        log_snap.debug("edge zone id={} zone={} output={}", grab_.toplevel.id(), snap_name(zone),
+                       slot);
     }
 }
 
@@ -5408,11 +5344,9 @@ void lx::compositor::window_manager::drag_restore(toplevel_record& rec) {
     grab_.start_y = grab_.now_y;
     if (shell_)
         shell_->emit_toplevel_state(rec);
-    lx::trace::logger::global().logf(lx::trace::level::info, k_snap_category,
-                                     "drag restore id={} from={} x={} y={} w={} h={}",
-                                     rec.id.id(), grab_.restored_max ? "maximized"
-                                                                     : snap_name(grab_.restored_snap),
-                                     at.x, at.y, size.width, size.height);
+    log_snap.info("drag restore id={} from={} x={} y={} w={} h={}", rec.id.id(),
+                  grab_.restored_max ? "maximized" : snap_name(grab_.restored_snap), at.x, at.y,
+                  size.width, size.height);
 }
 
 bool lx::compositor::window_manager::begin_keyboard_grab(lx::toplevel_id id, grab_mode mode) {
@@ -5434,8 +5368,7 @@ bool lx::compositor::window_manager::begin_keyboard_grab(lx::toplevel_id id, gra
     grab_.start_x = grab_.now_x = seat_->pointer_x();
     grab_.start_y = grab_.now_y = seat_->pointer_y();
     grab_.motion_pending = false;
-    lx::trace::logger::global().logf(lx::trace::level::info, k_snap_category,
-                                     "keyboard {} id={}", grab_mode_name(mode), id.id());
+    log_snap.info("keyboard {} id={}", grab_mode_name(mode), id.id());
     return true;
 }
 
@@ -5498,9 +5431,8 @@ bool lx::compositor::window_manager::quick_switch() {
     if (!found)
         return false;
     activate(found);
-    if (wm_debug_enabled()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_wm_category,
-                                         "quick switch id={} (no shell)", found.id());
+    if (log_wm.enabled(lx::trace::level::debug)) {
+        log_wm.debug("quick switch id={} (no shell)", found.id());
     }
     return true;
 }

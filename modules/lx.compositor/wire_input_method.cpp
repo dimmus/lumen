@@ -69,24 +69,17 @@ import :input_router;
 import :text_input;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_ime{"compositor.ime"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
 
 namespace {
-
-[[nodiscard]] bool ime_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-void ime_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, "compositor.ime", line);
-}
-
-template <typename... Args>
-void ime_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, "compositor.ime", fmt, std::forward<Args>(args)...);
-}
 
 [[nodiscard]] lx::compositor::text_input_relay* relay() {
     return g_p0_ctx ? g_p0_ctx->text_input : nullptr;
@@ -204,8 +197,8 @@ void im_grab_keyboard(struct wl_client* client, struct wl_resource* im_res, uint
         return; // inert: an unavailable input method grabs nothing
     // One grab per input method: a new one replaces the old (fcitx5 releases first anyway).
     if (im->grab) {
-        if (ime_debug())
-            ime_log(lx::trace::level::debug, "input method grab replaced");
+        if (log_ime.enabled(lx::trace::level::debug))
+            log_ime.debug("input method grab replaced");
         grab_detach(im->grab);
     }
     int fd = -1;
@@ -231,9 +224,9 @@ void im_grab_keyboard(struct wl_client* client, struct wl_resource* im_res, uint
                                                            delay);
     };
     g_p0_ctx->input->set_im_grab(ops, *g_p0_ctx->seat);
-    if (ime_debug()) {
-        ime_log(lx::trace::level::debug, "input method grab keyboard routing={}",
-                g_p0_ctx->input->im_routing_active() ? 1 : 0);
+    if (log_ime.enabled(lx::trace::level::debug)) {
+        log_ime.debug("input method grab keyboard routing={}",
+                      g_p0_ctx->input->im_routing_active() ? 1 : 0);
     }
 }
 
@@ -308,7 +301,7 @@ void im_destroy_resource(wl_resource* r) {
     if (auto* rl = relay())
         rl->remove_input_method(im->record);
     if (was_live)
-        ime_log(lx::trace::level::info, "input method gone");
+        log_ime.info("input method gone");
     delete im;
 }
 
@@ -334,10 +327,10 @@ const struct zwp_input_method_v2_interface im_impl = {
             auto* im = im_from(r);
             if (!im || !relay())
                 return;
-            if (ime_debug() && im->record.live && serial != im->record.dones) {
-                ime_log(lx::trace::level::debug,
-                        "input method commit serial={} stale (dones={}): dropped", serial,
-                        im->record.dones);
+            if (log_ime.enabled(lx::trace::level::debug) && im->record.live &&
+                serial != im->record.dones) {
+                log_ime.debug("input method commit serial={} stale (dones={}): dropped", serial,
+                              im->record.dones);
             }
             relay()->im_commit(im->record, serial);
         },
@@ -366,10 +359,10 @@ void manager_get_input_method(struct wl_client* client, struct wl_resource* mana
         // another input_method object associated with the same seat at the time of its
         // creation."
         zwp_input_method_v2_send_unavailable(res);
-        ime_log(lx::trace::level::info, "input method unavailable: the seat has one already");
+        log_ime.info("input method unavailable: the seat has one already");
         return;
     }
-    ime_log(lx::trace::level::info, "input method bound");
+    log_ime.info("input method bound");
 }
 
 const struct zwp_input_method_manager_v2_interface manager_impl = {
@@ -388,16 +381,16 @@ const struct zwp_input_method_manager_v2_interface manager_impl = {
 void ev_activate(void*, void* im) {
     if (auto* r = live(im)) {
         zwp_input_method_v2_send_activate(r);
-        if (ime_debug())
-            ime_log(lx::trace::level::debug, "input method activate");
+        if (log_ime.enabled(lx::trace::level::debug))
+            log_ime.debug("input method activate");
     }
 }
 
 void ev_deactivate(void*, void* im) {
     if (auto* r = live(im)) {
         zwp_input_method_v2_send_deactivate(r);
-        if (ime_debug())
-            ime_log(lx::trace::level::debug, "input method deactivate");
+        if (log_ime.enabled(lx::trace::level::debug))
+            log_ime.debug("input method deactivate");
     }
 }
 
@@ -446,16 +439,16 @@ void ev_popup_show(void*, void* popup, void* surface, lx::point2i origin) {
     tree->set_root_origin(s->id, origin);
     if (!tree->root_mapped(s->id)) {
         if (!tree->map_root(s->id, *g_p0_ctx->ime_popup_layer, ~0u)) {
-            ime_log(lx::trace::level::warn, "input popup map failed: layer full");
+            log_ime.warn("input popup map failed: layer full");
             return;
         }
     } else {
         tree->sync_scene(s->id, "ime-popup");
     }
-    if (ime_debug()) {
-        ime_log(lx::trace::level::debug, "ime popup show surface={} popup={} x={} y={} {}x{}",
-                s->id.id(), wl_resource_get_id(static_cast<wl_resource*>(popup)), origin.x,
-                origin.y, s->surface_size.width, s->surface_size.height);
+    if (log_ime.enabled(lx::trace::level::debug)) {
+        log_ime.debug("ime popup show surface={} popup={} x={} y={} {}x{}", s->id.id(),
+                      wl_resource_get_id(static_cast<wl_resource*>(popup)), origin.x, origin.y,
+                      s->surface_size.width, s->surface_size.height);
     }
 }
 
@@ -465,8 +458,8 @@ void ev_popup_hide(void*, void*, void* surface) {
     if (!s || !tree || !tree->root_mapped(s->id))
         return;
     tree->unmap_root(s->id);
-    if (ime_debug()) {
-        ime_log(lx::trace::level::debug, "ime popup hide surface={}", s->id.id());
+    if (log_ime.enabled(lx::trace::level::debug)) {
+        log_ime.debug("ime popup hide surface={}", s->id.id());
     }
 }
 
@@ -474,9 +467,9 @@ void ev_popup_rect(void*, void* popup, lx::rect2i rect) {
     if (auto* r = live(popup)) {
         zwp_input_popup_surface_v2_send_text_input_rectangle(r, rect.x, rect.y, rect.width,
                                                              rect.height);
-        if (ime_debug()) {
-            ime_log(lx::trace::level::debug, "ime popup text_input_rectangle {},{} {}x{}", rect.x,
-                    rect.y, rect.width, rect.height);
+        if (log_ime.enabled(lx::trace::level::debug)) {
+            log_ime.debug("ime popup text_input_rectangle {},{} {}x{}", rect.x, rect.y, rect.width,
+                          rect.height);
         }
     }
 }
@@ -578,9 +571,9 @@ void vk_keymap(struct wl_client*, struct wl_resource* r, uint32_t format, int32_
     if (!normalized) {
         // Warned once a run (a client cannot flood the log), debug after that.
         static bool warned = false;
-        if (!warned || ime_debug())
-            ime_log(warned ? lx::trace::level::debug : lx::trace::level::warn,
-                    "virtual keyboard keymap refused: it cannot be read or does not compile");
+        if (!warned || log_ime.enabled(lx::trace::level::debug))
+            log_ime.log(warned ? lx::trace::level::debug : lx::trace::level::warn,
+                        "virtual keyboard keymap refused: it cannot be read or does not compile");
         warned = true;
         return;
     }
@@ -595,9 +588,8 @@ void vk_keymap(struct wl_client*, struct wl_resource* r, uint32_t format, int32_
     vk->keymap.id = g_next_keymap_id;
     vk->keymap.fd = vk->fd.get();
     vk->keymap.size = out_size;
-    if (ime_debug()) {
-        ime_log(lx::trace::level::debug, "virtual keyboard keymap {} bytes differs from the seat's",
-                out_size);
+    if (log_ime.enabled(lx::trace::level::debug)) {
+        log_ime.debug("virtual keyboard keymap {} bytes differs from the seat's", out_size);
     }
 }
 

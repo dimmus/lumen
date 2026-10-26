@@ -1,6 +1,7 @@
 #include "lumen_test.hpp"
 
 import std;
+import lx.foundation;
 import lx.trace;
 
 #include "lx.trace/scope.hpp"
@@ -75,6 +76,45 @@ LUMEN_TEST(logf_truncates_long_lines) {
     LUMEN_CHECK(c.lines.size() == 1);
     LUMEN_CHECK(c.lines[0].size() == lx::trace::logger::k_max_line - 1);
     LUMEN_CHECK(c.lines[0].find_first_not_of('x') == std::string::npos);
+}
+
+namespace {
+
+struct leveled {
+    std::vector<std::pair<lx::trace::level, std::string>> lines;
+};
+
+void leveled_sink(lx::trace::level lvl, const char* category, const char* message, void* user) {
+    static_cast<leveled*>(user)->lines.emplace_back(lvl, std::string{category} + ": " + message);
+}
+
+constexpr lx::trace::category log_t{"t.cat"};
+
+} // namespace
+
+LUMEN_TEST(category_logs_at_the_method_level_under_its_name) {
+    leveled c;
+    const auto previous = lx::trace::logger::global().min_level();
+    lx::trace::logger::global().set_sink(leveled_sink, &c);
+    lx::trace::logger::global().set_min_level(lx::trace::level::info);
+    LUMEN_CHECK(!log_t.enabled(lx::trace::level::debug));
+    LUMEN_CHECK(log_t.enabled(lx::trace::level::warn));
+    log_t.debug("hidden {}", 1);
+    log_t.info("plain {{braces}}");
+    log_t.warn("id={} on={}", 7u, true);
+    log_t.log(lx::trace::level::error, "{}", "runtime text");
+    log_t.error(lx::invalid_argument("bad input"));
+    lx::trace::logger::global().set_sink(nullptr);
+    lx::trace::logger::global().set_min_level(previous);
+    LUMEN_CHECK(c.lines.size() == 4);
+    LUMEN_CHECK(c.lines[0].first == lx::trace::level::info);
+    LUMEN_CHECK(c.lines[0].second == "t.cat: plain {braces}");
+    LUMEN_CHECK(c.lines[1].first == lx::trace::level::warn);
+    LUMEN_CHECK(c.lines[1].second == "t.cat: id=7 on=1");
+    LUMEN_CHECK(c.lines[2].second == "t.cat: runtime text");
+    LUMEN_CHECK(c.lines[3].first == lx::trace::level::error);
+    LUMEN_CHECK(c.lines[3].second.starts_with("t.cat: "));
+    LUMEN_CHECK(c.lines[3].second.find("bad input") != std::string::npos);
 }
 
 // `##__LINE__` used to paste the token `__LINE__` itself, so a second scope in one block

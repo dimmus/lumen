@@ -670,7 +670,7 @@ lx::shell::xkb_keyboard::~xkb_keyboard() = default;
 
 namespace {
 
-constexpr const char* k_launcher_category = "shell.launcher";
+constexpr lx::trace::category log_launcher{"shell.launcher"};
 constexpr std::uint32_t k_lbg = 0xFF26262Bu;
 constexpr std::uint32_t k_lsearch = 0xFF1E1E22u;
 constexpr std::uint32_t k_lhover = 0xFF34343Au;
@@ -687,19 +687,6 @@ constexpr lx::text::font_desc k_lfont{"Sans", 10.f, lx::text::weight::normal,
 constexpr lx::text::font_desc k_lfont_search{"Sans", 11.f, lx::text::weight::normal,
                                              lx::text::style::normal};
 constexpr int k_lpad = 12;
-
-void launcher_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, k_launcher_category, line);
-}
-
-template <typename... Args>
-void launcher_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_launcher_category, fmt, std::forward<Args>(args)...);
-}
-
-[[nodiscard]] bool launcher_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
 
 } // namespace
 
@@ -909,8 +896,8 @@ void lx::shell::launcher::pointer_scroll_steps(int steps) {
 }
 
 void lx::shell::launcher::closed_by_itself(const char* why) {
-    if (launcher_debug()) {
-        launcher_log(lx::trace::level::debug, "launcher: close ({})", why);
+    if (log_launcher.enabled(lx::trace::level::debug)) {
+        log_launcher.debug("launcher: close ({})", why);
     }
     close();
     if (on_closed_)
@@ -933,7 +920,7 @@ struct lx::shell::launcher::events {
             l.committed_.width = 0;
             l.drawn_[0].width = l.drawn_[1].width = 0;
             if (!l.canvas_.allocate(l.g_.shm, nw, nh, "lumen-launcher")) {
-                launcher_log(lx::trace::level::error, "cannot allocate launcher buffers");
+                log_launcher.error("cannot allocate launcher buffers");
                 l.closed_by_itself("no buffers");
                 return;
             }
@@ -1011,8 +998,8 @@ bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, void* ou
     model_.set_rows(rows_);
     committed_.width = 0;
     dirty_ = true;
-    launcher_log(lx::trace::level::info, "launcher: open ({} applications, {}x{}, {} rows)",
-                 model_.count(), geo.width, geo.height, geo.rows);
+    log_launcher.info("launcher: open ({} applications, {}x{}, {} rows)", model_.count(), geo.width,
+                      geo.height, geo.rows);
     return true;
 }
 
@@ -1054,7 +1041,7 @@ void lx::shell::launcher::close() {
     committed_.width = 0;
     drawn_[0].width = drawn_[1].width = 0;
     model_.reset();
-    launcher_log(lx::trace::level::info, "launcher: close");
+    log_launcher.info("launcher: close");
 }
 
 void lx::shell::launcher::after_dispatch() {
@@ -1065,7 +1052,7 @@ void lx::shell::launcher::after_dispatch() {
         committed_.width = 0;
         drawn_[0].width = drawn_[1].width = 0;
         if (!canvas_.allocate(g_.shm, width_, height_, "lumen-launcher")) {
-            launcher_log(lx::trace::level::error, "cannot allocate launcher buffers");
+            log_launcher.error("cannot allocate launcher buffers");
             closed_by_itself("no buffers");
             return;
         }
@@ -1100,10 +1087,9 @@ void lx::shell::launcher::draw(bool force) {
     committed_ = next_;
     dirty_ = false;
     must_commit_ = false;
-    if (launcher_debug()) {
-        launcher_log(lx::trace::level::debug,
-                     "launcher: draw matches={} selection={} first={} damage={}", next_.total,
-                     model_.selection(), next_.first, nd);
+    if (log_launcher.enabled(lx::trace::level::debug)) {
+        log_launcher.debug("launcher: draw matches={} selection={} first={} damage={}", next_.total,
+                           model_.selection(), next_.first, nd);
     }
 }
 

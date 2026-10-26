@@ -17,6 +17,12 @@ import lx.trace;
 
 import :faces;
 
+namespace {
+
+constexpr lx::trace::category log_text{"text"};
+
+} // namespace
+
 export namespace lx::text {
 
 // ── Glyph raster into the atlas (ADR-010 §4.6 `:raster`) ─────────────────────────
@@ -409,8 +415,7 @@ lx::text::glyph_cache::get_locked(face_cache& faces, const glyph_key& key) {
                 ++counters_.overflows;
                 if (config_.overflow == lx::runtime::overflow_action::warn_and_drop && !warned_) {
                     warned_ = true;
-                    lx::trace::logger::global().log(lx::trace::level::warn, "text",
-                                                    "glyph_cache: set full, glyph not cached");
+                    log_text.warn("glyph_cache: set full, glyph not cached");
                 }
                 // The tile just written is not referenced by anything: give it back.
                 if (e.tile.valid())

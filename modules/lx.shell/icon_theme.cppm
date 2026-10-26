@@ -122,7 +122,7 @@ private:
 
 namespace {
 
-constexpr const char* k_icon_category = "shell.icon";
+constexpr lx::trace::category log_icon{"shell.icon"};
 
 bool file_exists(const std::string& path) {
     struct stat st{};
@@ -586,10 +586,8 @@ void lx::shell::icon_theme::load() {
     }
     if (theme_index* h = index_of("hicolor"))
         chain_.push_back(h);
-    lx::trace::logger::global().logf(lx::trace::level::info, k_icon_category,
-                                     "icon theme {} ({} themes in the chain; png={} svg={})",
-                                     theme_.c_str(), static_cast<unsigned>(chain_.size()),
-                                     can_png() ? 1 : 0, can_svg() ? 1 : 0);
+    log_icon.info("icon theme {} ({} themes in the chain; png={} svg={})", theme_.c_str(),
+                  static_cast<unsigned>(chain_.size()), can_png() ? 1 : 0, can_svg() ? 1 : 0);
 }
 
 std::string lx::shell::icon_theme::find_in(theme_index& t, const char* name, int px) {
@@ -813,11 +811,10 @@ const std::uint32_t* lx::shell::icon_theme::lookup(const char* name, int px) {
         entry.pixels.clear();
     else if (!entry.pixels.empty() && is_symbolic_file(file))
         recolour_symbolic(entry.pixels);
-    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        lx::trace::logger::global().logf(
-            lx::trace::level::debug, k_icon_category, "icon {} {}px -> {}{}", name, px,
-            file.empty() ? "(not found)" : file.c_str(),
-            !file.empty() && entry.pixels.empty() ? " (undecodable)" : "");
+    if (log_icon.enabled(lx::trace::level::debug)) {
+        log_icon.debug("icon {} {}px -> {}{}", name, px,
+                       file.empty() ? "(not found)" : file.c_str(),
+                       !file.empty() && entry.pixels.empty() ? " (undecodable)" : "");
     }
     if (cache_.size() >= k_cache) {
         auto* oldest = &cache_[0];

@@ -52,6 +52,12 @@ import :surface;
 import :idle;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_idle{"compositor.idle"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -63,19 +69,6 @@ namespace {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<unsigned long long>(ts.tv_sec) * 1'000'000'000ull +
            static_cast<unsigned long long>(ts.tv_nsec);
-}
-
-[[nodiscard]] bool idle_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-void idle_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, "compositor.idle", line);
-}
-
-template <typename... Args>
-void idle_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, "compositor.idle", fmt, std::forward<Args>(args)...);
 }
 
 /// The tracker's next deadline may have moved, or inhibition must be looked at again.
@@ -95,8 +88,8 @@ void send_idled(void*, void* resource) {
     if (client_dying(wl_resource_get_client(r)))
         return;
     ext_idle_notification_v1_send_idled(r);
-    if (idle_debug()) {
-        idle_log(lx::trace::level::debug, "idle notification idled id={}", wl_resource_get_id(r));
+    if (log_idle.enabled(lx::trace::level::debug)) {
+        log_idle.debug("idle notification idled id={}", wl_resource_get_id(r));
     }
 }
 
@@ -105,8 +98,8 @@ void send_resumed(void*, void* resource) {
     if (client_dying(wl_resource_get_client(r)))
         return;
     ext_idle_notification_v1_send_resumed(r);
-    if (idle_debug()) {
-        idle_log(lx::trace::level::debug, "idle notification resumed id={}", wl_resource_get_id(r));
+    if (log_idle.enabled(lx::trace::level::debug)) {
+        log_idle.debug("idle notification resumed id={}", wl_resource_get_id(r));
     }
 }
 
@@ -151,18 +144,16 @@ void create_notification(struct wl_client* client, struct wl_resource* notifier,
     if (!t->add(r, client, timeout_ms, obey, monotonic_ns(), sink())) {
         if (!g_warned_notify_full) {
             g_warned_notify_full = true;
-            idle_log(lx::trace::level::warn,
-                     "idle notification refused: the client's share (16) or the session's "
-                     "table (64) is full — no_memory (reported once)");
+            log_idle.warn("idle notification refused: the client's share (16) or the session's "
+                          "table (64) is full — no_memory (reported once)");
         }
         wl_client_post_no_memory(client);
         return;
     }
-    if (idle_debug()) {
-        idle_log(lx::trace::level::debug,
-                 "idle notification create id={} timeout_ms={} obey_inhibitors={} count={} "
-                 "inhibited={}",
-                 id, timeout_ms, obey ? 1 : 0, t->count(), t->inhibited() ? 1 : 0);
+    if (log_idle.enabled(lx::trace::level::debug)) {
+        log_idle.debug("idle notification create id={} timeout_ms={} obey_inhibitors={} count={} "
+                       "inhibited={}",
+                       id, timeout_ms, obey ? 1 : 0, t->count(), t->inhibited() ? 1 : 0);
     }
     changed();
 }
@@ -192,9 +183,9 @@ void inhibitor_destroy_resource(wl_resource* r) {
         const unsigned before = g_p0_ctx->inhibitors->count();
         g_p0_ctx->inhibitors->remove(r);
         if (g_p0_ctx->inhibitors->count() != before) {
-            if (idle_debug()) {
-                idle_log(lx::trace::level::debug, "idle inhibitor destroy id={} count={}",
-                         wl_resource_get_id(r), g_p0_ctx->inhibitors->count());
+            if (log_idle.enabled(lx::trace::level::debug)) {
+                log_idle.debug("idle inhibitor destroy id={} count={}", wl_resource_get_id(r),
+                               g_p0_ctx->inhibitors->count());
             }
             changed();
         }
@@ -221,16 +212,15 @@ void create_inhibitor(struct wl_client* client, struct wl_resource* manager, uin
     if (!set->add(r, client, s->id)) {
         if (!g_warned_inhibit_full) {
             g_warned_inhibit_full = true;
-            idle_log(lx::trace::level::warn,
-                     "idle inhibitor refused: the client's share (16) or the session's table "
-                     "(64) is full — no_memory (reported once)");
+            log_idle.warn("idle inhibitor refused: the client's share (16) or the session's table "
+                          "(64) is full — no_memory (reported once)");
         }
         wl_client_post_no_memory(client);
         return;
     }
-    if (idle_debug()) {
-        idle_log(lx::trace::level::debug, "idle inhibitor create id={} surface={} count={}", id,
-                 static_cast<unsigned long long>(s->id.id()), set->count());
+    if (log_idle.enabled(lx::trace::level::debug)) {
+        log_idle.debug("idle inhibitor create id={} surface={} count={}", id,
+                       static_cast<unsigned long long>(s->id.id()), set->count());
     }
     changed();
 }

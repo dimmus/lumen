@@ -26,7 +26,7 @@ import :shm_canvas;
 
 namespace {
 
-constexpr const char* k_menu_category = "shell.menu";
+constexpr lx::trace::category log_menu{"shell.menu"};
 constexpr std::uint32_t k_menu_bg = 0xFF24242Au;
 constexpr std::uint32_t k_menu_selected = 0xFF3D6FB4u;
 constexpr std::uint32_t k_menu_separator = 0xFF3A3A42u;
@@ -193,9 +193,8 @@ bool lx::shell::menu_popup::open(void* layer, lx::rect2i anchor, std::vector<men
         close();
         return false;
     }
-    lx::trace::logger::global().logf(lx::trace::level::info, k_menu_category,
-                                     "menu {}: open ({} items, {}x{})", name_, root_.size(),
-                                     level_[0].rows.width, level_[0].rows.height);
+    log_menu.info("menu {}: open ({} items, {}x{})", name_, root_.size(), level_[0].rows.width,
+                  level_[0].rows.height);
     return true;
 }
 
@@ -291,8 +290,7 @@ void lx::shell::menu_popup::close() {
     if (!is_open())
         return;
     close_from(0);
-    lx::trace::logger::global().logf(lx::trace::level::info, k_menu_category, "menu {}: closed",
-                                     name_);
+    log_menu.info("menu {}: closed", name_);
     root_.clear();
     const closed_fn fn = on_closed_;
     void* user = user_;
@@ -375,9 +373,7 @@ void lx::shell::menu_popup::activate(unsigned index, int row, unsigned serial) {
         return;
     }
     const int id = e.id;
-    lx::trace::logger::global().logf(lx::trace::level::info, k_menu_category,
-                                     "menu {}: activate id={} \"{}\"", name_, id,
-                                     menu_label(e.label));
+    log_menu.info("menu {}: activate id={} \"{}\"", name_, id, menu_label(e.label));
     const unsigned gen = generation_;
     if (on_activate_)
         on_activate_(id, user_);
@@ -494,8 +490,7 @@ void lx::shell::menu_popup::draw(level& l) {
     shm_canvas& c = l.canvas;
     if (!c.allocated() || c.width() != l.rows.width || c.height() != l.rows.height || c.take_rescale()) {
         if (!c.allocate(g_.shm, l.rows.width, l.rows.height, "lumen-menu")) {
-            lx::trace::logger::global().log(lx::trace::level::error, k_menu_category,
-                                            "cannot allocate menu buffers");
+            log_menu.error("cannot allocate menu buffers");
             close();
             return;
         }

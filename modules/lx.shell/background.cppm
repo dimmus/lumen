@@ -192,7 +192,7 @@ private:
 
 namespace {
 
-constexpr const char* k_bg_category = "shell.background";
+constexpr lx::trace::category log_background{"shell.background"};
 
 // ── colour ────────────────────────────────────────────────────────────────────
 
@@ -998,9 +998,7 @@ void lx::shell::background::finish_render() {
     job& j = *job_;
     j.thread.join();
     if (!j.ok)
-        lx::trace::logger::global().logf(lx::trace::level::warn, k_bg_category,
-                                         "cannot read background image {}: showing the default",
-                                         spec_->path);
+        log_background.warn("cannot read background image {}: showing the default", spec_->path);
     // The compositor maps the memory itself: ours goes now, theirs when it releases.
     munmap(j.data, j.size);
     j.data = nullptr;
@@ -1015,8 +1013,7 @@ void lx::shell::background::finish_render() {
     j.buffer = nullptr; // the release listener destroys it
     shown_pw_ = j.pw;
     shown_ph_ = j.ph;
-    lx::trace::logger::global().logf(lx::trace::level::info, k_bg_category,
-                                     "background {}x{} px, rendered in {:.1f} ms", j.pw, j.ph, j.ms);
+    log_background.info("background {}x{} px, rendered in {:.1f} ms", j.pw, j.ph, j.ms);
     shown_ = true;
     job_.reset();
 }

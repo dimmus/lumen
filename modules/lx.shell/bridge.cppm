@@ -241,20 +241,7 @@ private:
 
 namespace {
 
-constexpr const char* k_bridge_category = "shell.bridge";
-
-[[nodiscard]] bool bridge_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-void bridge_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, k_bridge_category, line);
-}
-
-template <typename... Args>
-void bridge_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_bridge_category, fmt, std::forward<Args>(args)...);
-}
+constexpr lx::trace::category log_bridge{"shell.bridge"};
 
 } // namespace
 
@@ -299,21 +286,21 @@ struct lx::shell::policy_bridge::events {
         b.caps_ = flags;
         b.caps_version_ = version;
         b.has_caps_ = true;
-        bridge_log(lx::trace::level::info, "capabilities flags=0x{:x} version={}", flags, version);
+        log_bridge.info("capabilities flags=0x{:x} version={}", flags, version);
     }
     static void session_ending(void* data, zlm_shell_v1*) {
         // Whoever started the logout, the disconnect that follows is the session ending.
         self(data).logout_requested_ = true;
-        bridge_log(lx::trace::level::info, "session ending");
+        log_bridge.info("session ending");
     }
     static void lock_state(void* data, zlm_shell_v1*, uint32_t state) {
         auto& b = self(data);
         const bool changed = b.lock_state_ != state;
         b.lock_state_ = state;
-        if (changed || bridge_debug()) {
+        if (changed || log_bridge.enabled(lx::trace::level::debug)) {
             static constexpr const char* k_names[] = {"unlocked", "locking", "locked",
                                                       "abandoned"};
-            bridge_log(lx::trace::level::info, "session lock {}", state < 4 ? k_names[state] : "?");
+            log_bridge.info("session lock {}", state < 4 ? k_names[state] : "?");
         }
         if (b.lock_state_fn_)
             b.lock_state_fn_(state, b.lock_user_);
@@ -323,7 +310,7 @@ struct lx::shell::policy_bridge::events {
         if (b.capture_active_ == (active != 0))
             return;
         b.capture_active_ = active != 0;
-        bridge_log(lx::trace::level::info, active ? "screen capture active" : "screen capture ended");
+        log_bridge.info("{}", active ? "screen capture active" : "screen capture ended");
     }
     // ── zlm_shell_v1 v7 ──
     static void config(void* data, zlm_shell_v1*, int32_t fd, uint32_t size, uint32_t generation) {
@@ -346,8 +333,7 @@ struct lx::shell::policy_bridge::events {
         if (fd >= 0)
             ::close(fd);
         b.config_lines_.clear();
-        bridge_log(lx::trace::level::info, "configuration generation {} ({} bytes)", generation,
-                   bytes.size());
+        log_bridge.info("configuration generation {} ({} bytes)", generation, bytes.size());
         if (b.config_fn_)
             b.config_fn_(bytes, generation, b.config_user_);
     }
@@ -368,8 +354,8 @@ struct lx::shell::policy_bridge::events {
     static void action(void* data, zlm_shell_v1*, const char* name, const char* argument,
                        uint32_t serial, uint32_t time) {
         auto& b = self(data);
-        if (bridge_debug())
-            bridge_log(lx::trace::level::debug, "action {} serial={}", name ? name : "", serial);
+        if (log_bridge.enabled(lx::trace::level::debug))
+            log_bridge.debug("action {} serial={}", name ? name : "", serial);
         if (b.action_fn_)
             b.action_fn_(name ? name : "", argument ? argument : "", serial, time, b.config_user_);
     }
@@ -381,9 +367,9 @@ struct lx::shell::policy_bridge::events {
         auto& b = self(data);
         if (hold != b.hold_)
             return;
-        if (bridge_debug())
-            bridge_log(lx::trace::level::debug, "hold key keysym=0x{:x} mods=0x{:x} binding={}",
-                       keysym, mods, binding ? binding : "");
+        if (log_bridge.enabled(lx::trace::level::debug))
+            log_bridge.debug("hold key keysym=0x{:x} mods=0x{:x} binding={}", keysym, mods,
+                             binding ? binding : "");
         if (b.hold_handlers_.key)
             b.hold_handlers_.key(keysym, mods, binding ? binding : "", serial, time,
                                  b.hold_handlers_.user);
@@ -396,8 +382,8 @@ struct lx::shell::policy_bridge::events {
         // Inert from now on: released before the handler, which may start nothing new on it.
         zlm_held_action_v1_destroy(hold);
         b.hold_ = nullptr;
-        if (bridge_debug())
-            bridge_log(lx::trace::level::debug, "hold released");
+        if (log_bridge.enabled(lx::trace::level::debug))
+            log_bridge.debug("hold released");
         if (b.hold_handlers_.released)
             b.hold_handlers_.released(serial, time, b.hold_handlers_.user);
     }
@@ -407,17 +393,17 @@ struct lx::shell::policy_bridge::events {
             return;
         zlm_held_action_v1_destroy(hold);
         b.hold_ = nullptr;
-        if (bridge_debug())
-            bridge_log(lx::trace::level::debug, "hold cancelled");
+        if (log_bridge.enabled(lx::trace::level::debug))
+            log_bridge.debug("hold cancelled");
         if (b.hold_handlers_.cancelled)
             b.hold_handlers_.cancelled(b.hold_handlers_.user);
     }
 
     static void lock_requested(void* data, zlm_shell_v1*, uint32_t reason) {
         auto& b = self(data);
-        bridge_log(lx::trace::level::info, reason == ZLM_SHELL_V1_LOCK_REASON_SLEEP
-                                               ? "lock requested (the system is going to sleep)"
-                                               : "lock requested (logind)");
+        log_bridge.info("{}", reason == ZLM_SHELL_V1_LOCK_REASON_SLEEP
+                                  ? "lock requested (the system is going to sleep)"
+                                  : "lock requested (logind)");
         if (b.lock_requested_fn_)
             b.lock_requested_fn_(reason, b.lock_user_);
     }
@@ -427,9 +413,8 @@ struct lx::shell::policy_bridge::events {
                                    uint32_t time) {
         auto* g = static_cast<key_grab*>(data);
         ++g->activations;
-        if (bridge_debug()) {
-            bridge_log(lx::trace::level::debug, "key grab activated keysym=0x{:x} serial={}",
-                       g->keysym, serial);
+        if (log_bridge.enabled(lx::trace::level::debug)) {
+            log_bridge.debug("key grab activated keysym=0x{:x} serial={}", g->keysym, serial);
         }
         if (g->fn)
             g->fn(serial, time, g->user);
@@ -437,8 +422,7 @@ struct lx::shell::policy_bridge::events {
     static void key_grab_refused(void* data, zlm_key_grab_v1*, uint32_t reason) {
         auto* g = static_cast<key_grab*>(data);
         g->refusal = reason;
-        bridge_log(lx::trace::level::warn, "key grab keysym=0x{:x} refused: {}", g->keysym,
-                   refusal_name(reason));
+        log_bridge.warn("key grab keysym=0x{:x} refused: {}", g->keysym, refusal_name(reason));
     }
 
     // ── zlm_policy_bridge_v1: snapshot ──
@@ -461,15 +445,14 @@ struct lx::shell::policy_bridge::events {
             b.model_.snapshot_add(t, app_id, title, state, {x, y, w, h}, stacking_index);
         if (!th) {
             // Table full: the window cannot be shown, and its handle is not kept.
-            bridge_log(lx::trace::level::warn, "snapshot: task table full, window dropped");
+            log_bridge.warn("snapshot: task table full, window dropped");
             zlm_toplevel_v1_destroy(t);
             return;
         }
         set_slot(t, th);
-        if (bridge_debug()) {
-            bridge_log(lx::trace::level::debug,
-                       "snapshot toplevel handle={} app_id={} title=\"{}\"", th.index,
-                       app_id ? app_id : "", title ? title : "");
+        if (log_bridge.enabled(lx::trace::level::debug)) {
+            log_bridge.debug("snapshot toplevel handle={} app_id={} title=\"{}\"", th.index,
+                             app_id ? app_id : "", title ? title : "");
         }
     }
     static void snapshot_output(void*, zlm_policy_bridge_v1*, wl_output*, const char*, int32_t,
@@ -477,7 +460,7 @@ struct lx::shell::policy_bridge::events {
     static void snapshot_done(void* data, zlm_policy_bridge_v1*) {
         auto& b = self(data);
         b.model_.end_snapshot();
-        bridge_log(lx::trace::level::info, "snapshot toplevels={}", b.model_.count());
+        log_bridge.info("snapshot toplevels={}", b.model_.count());
     }
 
     // ── zlm_policy_bridge_v1: deltas ──
@@ -486,14 +469,13 @@ struct lx::shell::policy_bridge::events {
         auto& b = self(data);
         const task_handle th = b.model_.add(t);
         if (!th) {
-            bridge_log(lx::trace::level::warn, "add: task table full, window dropped");
+            log_bridge.warn("add: task table full, window dropped");
             zlm_toplevel_v1_destroy(t);
             return;
         }
         set_slot(t, th);
-        if (bridge_debug()) {
-            bridge_log(lx::trace::level::debug, "add handle={} count={}", th.index,
-                       b.model_.count());
+        if (log_bridge.enabled(lx::trace::level::debug)) {
+            log_bridge.debug("add handle={} count={}", th.index, b.model_.count());
         }
     }
     static void toplevel_destroyed(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
@@ -502,9 +484,9 @@ struct lx::shell::policy_bridge::events {
         if (b.model_.get(th))
             unmap_icons(b.icons_[th.index]);
         const bool removed = b.model_.remove(th);
-        if (bridge_debug()) {
-            bridge_log(lx::trace::level::debug, "remove handle={} count={}",
-                       removed ? static_cast<int>(th.index) : -1, b.model_.count());
+        if (log_bridge.enabled(lx::trace::level::debug)) {
+            log_bridge.debug("remove handle={} count={}", removed ? static_cast<int>(th.index) : -1,
+                             b.model_.count());
         }
         // The compositor made the handle inert; the shell releases its reference.
         if (t)
@@ -515,13 +497,13 @@ struct lx::shell::policy_bridge::events {
         auto& b = self(data);
         const task_handle th = find(b, t);
         const unsigned changed = b.model_.set_state(th, app_id, title, state);
-        if ((changed & task_change_label) && bridge_debug()) {
+        if ((changed & task_change_label) && log_bridge.enabled(lx::trace::level::debug)) {
             const task_entry* e = b.model_.get(th);
-            bridge_log(lx::trace::level::debug, "title handle={} app_id={} title=\"{}\"", th.index,
-                       e ? e->app_id : "", e ? e->title : "");
+            log_bridge.debug("title handle={} app_id={} title=\"{}\"", th.index, e ? e->app_id : "",
+                             e ? e->title : "");
         }
-        if ((changed & task_change_state) && bridge_debug()) {
-            bridge_log(lx::trace::level::debug, "state handle={} state={}", th.index, state);
+        if ((changed & task_change_state) && log_bridge.enabled(lx::trace::level::debug)) {
+            log_bridge.debug("state handle={} state={}", th.index, state);
         }
     }
     static void toplevel_geometry(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
@@ -536,12 +518,12 @@ struct lx::shell::policy_bridge::events {
         clock_gettime(CLOCK_MONOTONIC, &ts);
         b.model_.set_focus(find(b, t), static_cast<long long>(ts.tv_sec) * 1'000'000'000LL +
                                            ts.tv_nsec);
-        if (bridge_debug()) {
+        if (log_bridge.enabled(lx::trace::level::debug)) {
             const task_handle f = b.model_.focused();
             if (f)
-                bridge_log(lx::trace::level::debug, "focus handle={}", f.index);
+                log_bridge.debug("focus handle={}", f.index);
             else
-                bridge_log(lx::trace::level::debug, "focus handle=none");
+                log_bridge.debug("focus handle=none");
         }
     }
     static void stacking_order_changed(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
@@ -554,8 +536,8 @@ struct lx::shell::policy_bridge::events {
                                uint32_t flags) {
         auto& b = self(data);
         const task_handle th = find(b, t);
-        if (b.model_.set_flags(th, flags) && bridge_debug()) {
-            bridge_log(lx::trace::level::debug, "flags handle={} flags={}", th.index, flags);
+        if (b.model_.set_flags(th, flags) && log_bridge.enabled(lx::trace::level::debug)) {
+            log_bridge.debug("flags handle={} flags={}", th.index, flags);
         }
     }
     // ── zlm_policy_bridge_v1 v6 ──
@@ -597,17 +579,18 @@ struct lx::shell::policy_bridge::events {
         b.icon_pending_ = {};
         b.icon_pending_task_ = {};
         (void)b.model_.set_icon(th, b.icon_pending_name_);
-        bridge_log(lx::trace::level::info, "icon handle={} name={} buffers={}", th.index,
-                   b.icon_pending_name_[0] ? b.icon_pending_name_ : "-", b.icons_[th.index].count);
+        log_bridge.info("icon handle={} name={} buffers={}", th.index,
+                        b.icon_pending_name_[0] ? b.icon_pending_name_ : "-",
+                        b.icons_[th.index].count);
     }
     static void toplevel_parent(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,
                                 zlm_toplevel_v1* parent) {
         auto& b = self(data);
         const task_handle th = find(b, t);
         const task_handle ph = find(b, parent);
-        if (b.model_.set_parent(th, ph) && bridge_debug()) {
-            bridge_log(lx::trace::level::debug, "parent handle={} parent={}", th.index,
-                       ph ? static_cast<int>(ph.index) : -1);
+        if (b.model_.set_parent(th, ph) && log_bridge.enabled(lx::trace::level::debug)) {
+            log_bridge.debug("parent handle={} parent={}", th.index,
+                             ph ? static_cast<int>(ph.index) : -1);
         }
     }
     // ── zlm_policy_bridge_v1 v7 ──
@@ -615,17 +598,16 @@ struct lx::shell::policy_bridge::events {
                                    ext_workspace_handle_v1* ws) {
         auto& b = self(data);
         const task_handle th = find(b, t);
-        if (b.model_.set_workspace(th, ws) && bridge_debug()) {
-            bridge_log(lx::trace::level::debug, "workspace handle={} workspace={}", th.index,
-                       static_cast<const void*>(ws));
+        if (b.model_.set_workspace(th, ws) && log_bridge.enabled(lx::trace::level::debug)) {
+            log_bridge.debug("workspace handle={} workspace={}", th.index,
+                             static_cast<const void*>(ws));
         }
     }
     static void bell(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t) {
         auto& b = self(data);
         const task_handle th = find(b, t);
         {
-            bridge_log(lx::trace::level::info, "bell handle={}",
-                       th ? static_cast<int>(th.index) : -1);
+            log_bridge.info("bell handle={}", th ? static_cast<int>(th.index) : -1);
         }
         if (b.bell_fn_)
             b.bell_fn_(th, b.bell_user_);
@@ -693,8 +675,8 @@ void lx::shell::policy_bridge::events::held_action(void* data, zlm_shell_v1*,
         zlm_held_action_v1_destroy(static_cast<zlm_held_action_v1*>(b.hold_));
     b.hold_ = hold;
     zlm_held_action_v1_add_listener(hold, &k_hold_listener, &b);
-    if (bridge_debug())
-        bridge_log(lx::trace::level::debug, "held action {} serial={}", name ? name : "", serial);
+    if (log_bridge.enabled(lx::trace::level::debug))
+        log_bridge.debug("held action {} serial={}", name ? name : "", serial);
     if (!b.hold_handlers_.begin) {
         b.end_hold();
         return;
@@ -812,9 +794,8 @@ lx::result<unsigned> lx::shell::policy_bridge::grab_key(unsigned keysym, unsigne
     if (!can_grab_keys()) {
         if (!told_no_grabs_) {
             told_no_grabs_ = true;
-            bridge_log(lx::trace::level::info,
-                       "compositor has no key grabs (v{}): no shell keybindings",
-                       shell_ ? wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) : 0u);
+            log_bridge.info("compositor has no key grabs (v{}): no shell keybindings",
+                            shell_ ? wl_proxy_get_version(static_cast<wl_proxy*>(shell_)) : 0u);
         }
         return lx::not_implemented("lx::shell::policy_bridge::grab_key");
     }

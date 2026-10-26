@@ -17,7 +17,7 @@ C++26 module API surface for future implementation. All modules live under `modu
 | [`lx.foundation`](../modules/lx.foundation/lx.foundation.cppm) | Core types, errors, handles, WM vocabulary; `sparse_slots<T, N>` (a fixed-capacity table whose 16-slot blocks are allocated on first write) | `point2i`, `rect2i`, `rect2f` (fractional source boxes), `result<T>`, `make_error`, `toplevel_id`, `toplevel_state`, `placement`, `sparse_slots` |
 | [`lx.foundation.error`](../modules/lx.foundation/error.cppm) | Error helpers | `format_error`, `LX_RETURN_IF_ERROR`, `*_err` codes |
 | [`lx.sync`](../modules/lx.sync/lx.sync.cppm) | Thread synchronization | `spsc_queue`, `handoff` |
-| [`lx.trace`](../modules/lx.trace/lx.trace.cppm) | Logging & tracing | `logger`, `log_error`, `LX_TRACE_SCOPE`, `LUMEN_LOG` |
+| [`lx.trace`](../modules/lx.trace/lx.trace.cppm) | Logging & tracing | `category` (`log_wm.debug(…)`, `.error(err)`, `.enabled(lvl)`), `logger` (sink, level), `LX_TRACE_SCOPE`, `LUMEN_LOG` |
 | [`lx.runtime`](../modules/lx.runtime/lx.runtime.cppm) | Event loop & bus | `event_loop`, `event_source`, `timer_source`, `event_bus` |
 | [`lx.runtime.executor`](../modules/lx.runtime/executor.cppm) | Thread routing | `executor`, `strand`, `affinity`, `assert_affinity` |
 | [`lx.runtime.memory`](../modules/lx.runtime/memory.cppm) | Memory strategy; `page_mapping`: zero-filled anonymous pages in small pages (no transparent huge pages), resident only where written, `discard` hands whole pages back — for sparse buffers such as atlas pages and cache arenas, which a heap block would not keep lazy | `memory_arena`, `page_mapping`, `memory_budget_coordinator`, `overflow_action` |

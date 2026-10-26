@@ -113,11 +113,7 @@ private:
 
 namespace {
 
-constexpr const char* k_liveness_category = "compositor.liveness";
-
-[[nodiscard]] bool liveness_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_liveness{"compositor.liveness"};
 
 [[nodiscard]] unsigned to_ms(lx::runtime::clock_time ns) {
     return ns <= 0 ? 0u : static_cast<unsigned>(ns / 1'000'000);
@@ -187,10 +183,9 @@ void lx::compositor::liveness_tracker::request(lx::client_id client, lx::runtime
     e->sent_ns = now;
     if (now + timeout_ns_ < next_deadline_)
         next_deadline_ = now + timeout_ns_;
-    if (liveness_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_liveness_category,
-                                         "ping client={} serial={} reason={}", client.id(), serial,
-                                         ping_reason_name(why));
+    if (log_liveness.enabled(lx::trace::level::debug)) {
+        log_liveness.debug("ping client={} serial={} reason={}", client.id(), serial,
+                           ping_reason_name(why));
     }
 }
 
@@ -202,10 +197,8 @@ void lx::compositor::liveness_tracker::on_pong(lx::client_id client, unsigned se
     const lx::runtime::clock_time rtt = now - e->sent_ns;
     e->serial = 0;
     e->last_pong_ns = now;
-    if (liveness_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_liveness_category,
-                                         "pong client={} serial={} rtt_ms={}", client.id(), serial,
-                                         to_ms(rtt));
+    if (log_liveness.enabled(lx::trace::level::debug)) {
+        log_liveness.debug("pong client={} serial={} rtt_ms={}", client.id(), serial, to_ms(rtt));
     }
     if (e->not_responding) {
         e->not_responding = false;
@@ -221,9 +214,8 @@ void lx::compositor::liveness_tracker::cancel(lx::client_id client, unsigned ser
         return;
     const bool awaited = !e->not_responding;
     e->serial = 0;
-    if (liveness_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_liveness_category,
-                                         "ping-cancel client={} serial={}", client.id(), serial);
+    if (log_liveness.enabled(lx::trace::level::debug)) {
+        log_liveness.debug("ping-cancel client={} serial={}", client.id(), serial);
     }
     if (e->not_responding) {
         e->not_responding = false;

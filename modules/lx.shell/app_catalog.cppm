@@ -140,19 +140,10 @@ private:
 
 namespace {
 
-constexpr const char* k_apps_category = "shell.apps";
+constexpr lx::trace::category log_apps{"shell.apps"};
 constexpr std::uint32_t k_dir_mask = IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO |
                                      IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF | IN_ONLYDIR;
 constexpr std::uint32_t k_parent_mask = IN_CREATE | IN_MOVED_TO | IN_ONLYDIR;
-
-void apps_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, k_apps_category, line);
-}
-
-template <typename... Args>
-void apps_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, k_apps_category, fmt, std::forward<Args>(args)...);
-}
 
 [[nodiscard]] bool starts_with(std::string_view s, std::string_view p) {
     return s.size() >= p.size() && s.compare(0, p.size(), p) == 0;
@@ -268,8 +259,8 @@ void lx::shell::app_catalog::read_entry(walk_state& w, int dirfd, const char* na
     close(fd);
     ++w.files;
     if (too_large) {
-        if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-            apps_log(lx::trace::level::debug, "desktop file {}: larger than 64 KiB: skipped", file);
+        if (log_apps.enabled(lx::trace::level::debug)) {
+            log_apps.debug("desktop file {}: larger than 64 KiB: skipped", file);
         }
         e.id = w.arena->store(id);
         e.file = w.arena->store(file);
@@ -399,10 +390,10 @@ void lx::shell::app_catalog::scan() {
     stats_.dirs = w.dirs;
     stats_.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
                     .count();
-    apps_log(lx::trace::level::info,
-             "apps: catalog {} entries, {} listed ({} files, {} dirs) in {:.2f} ms; terminal {}",
-             stats_.entries, stats_.listed, stats_.files, stats_.dirs, stats_.ms,
-             terminal_.found ? terminal_.source : "none");
+    log_apps.info(
+        "apps: catalog {} entries, {} listed ({} files, {} dirs) in {:.2f} ms; terminal {}",
+        stats_.entries, stats_.listed, stats_.files, stats_.dirs, stats_.ms,
+        terminal_.found ? terminal_.source : "none");
 }
 
 bool lx::shell::app_catalog::on_watch_readable() {
@@ -430,7 +421,7 @@ bool lx::shell::app_catalog::on_watch_readable() {
         }
     }
     if (became)
-        apps_log(lx::trace::level::debug, "apps: catalog stale");
+        log_apps.debug("apps: catalog stale");
     return became;
 }
 

@@ -11,7 +11,7 @@ Lumen separates **typed recoverable failures** (`lx::result<T>`) from **observab
 |--------|------|
 | `lx.foundation.result` | `error`, `error_domain`, `result<T>` |
 | `lx.foundation.error` | Helpers, domain codes, `LX_RETURN_IF_ERROR`, `format_error` |
-| `lx.trace` | Levels, categories, default stderr sink, spans, `log_error` |
+| `lx.trace` | Levels, `category` (the logging API), default stderr sink, spans, timeline |
 
 ## Error model
 
@@ -194,23 +194,32 @@ Use stable category strings (grep-friendly):
 | `portal` | xdg-desktop-portal-lumen (stderr; `run-desktop.sh` writes `portal-lumen.log`, and its `--choose` runs land in `xdpw.log`). `info`: `serving … (Screenshot v3, targets 0x7) on display <name>` once; per request `Screenshot app='<id>' interactive=<0|1> target=<n>` / `PickColor …`, `screenshot (<all outputs|output|area|window>) WxH written to <path> in <ms> ms`, `colour picked #RRGGBB`, `request answered <response> in <ms> ms[ uri=…]`, `the session is locked: nothing is captured`, `request closed by the caller`; the chooser: `chooser: chose '<line>'` / `chooser: declined`. `warn`: a request while another runs (answered 2), `overlay failed: …`, a broken Wayland connection. `log_error` at the boundary for a failed connection, capture (`wayland` domain: no capture global, `stopped`, timeout) or file (`io` domain) |
 | `portal.wayland` | The portal's Wayland side. `debug`: `captured output <name> WxH transform=<t> layout=x,y WxH` per output and `captured <n> output(s) in <ms> ms` per request |
 | `portal.overlay` | The portal's overlay and lists. `debug`: `overlay result <kind>` |
-| `error` | Default for `log_error()` |
 
 ### API examples
 
+Code logs through an `lx::trace::category`: one object per category string, declared once,
+with a method per level. It is the only logging form outside `lx.trace` itself — no
+per-file `foo_log` helpers, no `foo_debug()` level checks, no `logger::global()` calls.
+
 ```cpp
 import lx.trace;
-import lx.foundation.error;
+import lx.foundation;
 
-lx::trace::logger::global().log(
-    lx::trace::level::info, "compositor", "vsync timer armed");
+// Once per file, in an anonymous namespace; or once per module as `inline constexpr` in a
+// partition its units import (`log_surface` in lx.compositor:wire).
+constexpr lx::trace::category log_wm{"compositor.wm"};
 
-// Formatted lines: std::format syntax, checked against the arguments at compile time.
-lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.wm",
-                                 "geometry id={} x={} y={} cause={}", id.id(), g.x, g.y, cause);
+log_wm.info("vsync timer armed");
+log_wm.debug("geometry id={} x={} y={} cause={}", id.id(), g.x, g.y, cause);
+log_wm.log(changed ? lx::trace::level::info : lx::trace::level::debug, "focus id={}", id.id());
+log_wm.warn("{}", why);                 // text known only at run time
 
 if (auto r = comp.start(); !r)
-    lx::trace::logger::global().log_error(r.get_error(), "compositor");
+    log_wm.error(r.get_error());        // a failed result, logged once at the boundary
+
+if (log_wm.enabled(lx::trace::level::debug)) {
+    // work that only feeds a debug line
+}
 
 {
     LX_TRACE_SCOPE("compositor.render", "tick_render");
@@ -218,18 +227,22 @@ if (auto r = comp.start(); !r)
 }
 ```
 
-`logf` is the way to log a formatted line; do not build one with `snprintf` into a stack
-buffer. It returns before formatting when the level is filtered out, formats into a 4 KiB
-stack buffer (longer lines are truncated) and never allocates. The formatting itself is
-type-erased into `lx.trace` (`logger::vlog`), so a call site costs a compile-time format
-check and a few hundred bytes of code rather than an instantiation of `std::format`.
+Name the object `log_<last part of the category>` (`log_wm`, `log_surface`, `log_tray`); the
+constructor is `consteval`, so the name is always a string literal. Every message argument is
+a `std::format` string checked against the arguments at compile time — a literal brace is
+`{{`, and text that is not a literal goes through `"{}"`. Do not build a line with `snprintf`
+into a stack buffer. A call returns before formatting when the level is filtered out, formats
+into a 4 KiB stack buffer (longer lines are truncated) and never allocates. The formatting
+itself is type-erased into `lx.trace` (`logger::vlog`), so a call site costs a compile-time
+format check and a few hundred bytes of code rather than an instantiation of `std::format`.
 Two conventions differ from plain `std::format`, to keep lines as they were under `printf`:
 a `bool` argument prints as `1`/`0`, and a null `const char*` as `(null)`.
 
 Smoke scripts grep these lines, so a change to a format string is a change to an interface.
 
-Files with their own category keep a one-line helper (`dnd_log`, `bridge_log`, ...) with a
-`std::format_string` overload that forwards to `logf`.
+A helper that builds a domain message (`log_geometry`, `log_grab_reject`) is fine; one that
+only forwards to a category is not. `lx::trace::logger` stays as the layer under categories:
+the sink, the minimum level, and `vlog`.
 
 ### Frame-path rule
 
@@ -247,7 +260,7 @@ Recommended pattern at subsystem boundaries:
 lx::result<void> kms_device::open(const char* path) {
     // ... real open ...
     auto err = lx::make_error(lx::drm_err::open_failed, "cannot open DRM device");
-    lx::trace::logger::global().log_error(err, "drm");
+    log_drm.error(err);
     return err;
 }
 ```

@@ -2195,7 +2195,7 @@ All fallible APIs return **`lx::result<T>`**. Platform stubs return
 | Concern | Module | Behavior |
 |---------|--------|----------|
 | Typed errors | `lx.foundation.error` | Domains, codes, `LX_RETURN_IF_ERROR` |
-| Logging | `lx.trace` | stderr default, `LUMEN_LOG` env, `log_error()` |
+| Logging | `lx.trace` | `category` objects (`log_wm.debug(…)`), stderr default, `LUMEN_LOG` env |
 | Spans | `LX_TRACE_SCOPE` | Frame hot-path tracing at `trace` level |
 | Health | `lx.health` | Pulled on request (`lumen-ctl status`, `GetHealth`): parts, processes, memory, per-output pacing ([health.md](subsystems/health.md)) |
 

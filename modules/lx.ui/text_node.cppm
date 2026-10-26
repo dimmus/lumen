@@ -15,6 +15,12 @@ import :element;
 import :invalidate;
 import :node;
 
+namespace {
+
+constexpr lx::trace::category log_text{"ui.text"};
+
+} // namespace
+
 export namespace lx::ui {
 
 // ── Text blocks (ADR-010 §4.6, Phase 2) ─────────────────────────────────────────
@@ -421,8 +427,7 @@ void lx::ui::text_block_node::start_job() {
     // The worker strand is full: shape here rather than show stale text indefinitely.
     j.running = false;
     ++async_stats_.inline_fallbacks;
-    lx::trace::logger::global().log(lx::trace::level::warn, "ui.text",
-                                    "text_block: worker strand full, shaping inline");
+    log_text.warn("text_block: worker strand full, shaping inline");
     layout_.assign_inputs(j.next);
     shown_generation_ = async_generation_;
     placed_valid_ = false;
@@ -437,8 +442,7 @@ void lx::ui::text_block_node::run_job(void* raw) {
     const lx::runtime::task back{&text_block_node::land_job, j};
     for (unsigned attempt = 0; !j->executor->post(lx::runtime::affinity::ui, back); ++attempt) {
         if (attempt == 100000) {
-            lx::trace::logger::global().log(lx::trace::level::error, "ui.text",
-                                            "text_block: UI strand full, shape result lost");
+            log_text.error("text_block: UI strand full, shape result lost");
             return;
         }
         std::this_thread::yield();

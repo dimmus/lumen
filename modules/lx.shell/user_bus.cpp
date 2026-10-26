@@ -18,7 +18,7 @@ import :user_bus;
 
 namespace {
 
-constexpr const char* k_bus_category = "shell.bus";
+constexpr lx::trace::category log_bus{"shell.bus"};
 
 } // namespace
 
@@ -38,13 +38,13 @@ struct lx::shell::user_bus::events {
         if (s.state == st)
             return;
         s.state = st;
-        lx::trace::logger::global().logf(
-            st == name_state::failed ? lx::trace::level::warn : lx::trace::level::info,
-            k_bus_category, "bus name {}: {}", s.name,
-            st == name_state::owned    ? "owned"
-            : st == name_state::queued ? "queued (another owner has it; taken when it exits)"
-            : st == name_state::lost   ? "lost"
-                                       : "request failed");
+        log_bus.log(st == name_state::failed ? lx::trace::level::warn : lx::trace::level::info,
+                    "bus name {}: {}", s.name,
+                    st == name_state::owned ? "owned"
+                    : st == name_state::queued
+                        ? "queued (another owner has it; taken when it exits)"
+                    : st == name_state::lost ? "lost"
+                                             : "request failed");
         if (s.fn)
             s.fn(s.name, st, s.user);
     }
@@ -54,9 +54,7 @@ struct lx::shell::user_bus::events {
         s->call = sd_bus_slot_unref(static_cast<sd_bus_slot*>(s->call));
         if (sd_bus_message_is_method_error(m, nullptr)) {
             const sd_bus_error* e = sd_bus_message_get_error(m);
-            lx::trace::logger::global().logf(lx::trace::level::warn, k_bus_category,
-                                             "RequestName {}: {}", s->name,
-                                             e && e->message ? e->message : "error");
+            log_bus.warn("RequestName {}: {}", s->name, e && e->message ? e->message : "error");
             set_state(*s, name_state::failed);
             return 0;
         }
@@ -99,9 +97,7 @@ bool lx::shell::user_bus::open() {
     if (r < 0) {
         if (!told_unavailable_) {
             told_unavailable_ = true;
-            lx::trace::logger::global().logf(lx::trace::level::warn, k_bus_category,
-                                             "no user bus ({}): no notifications, no tray",
-                                             std::strerror(-r));
+            log_bus.warn("no user bus ({}): no notifications, no tray", std::strerror(-r));
         }
         return false;
     }
@@ -181,8 +177,7 @@ void lx::shell::user_bus::process() {
         if (r == 0)
             return;
         if (r < 0) {
-            lx::trace::logger::global().logf(lx::trace::level::warn, k_bus_category,
-                                             "user bus connection lost: {}", std::strerror(-r));
+            log_bus.warn("user bus connection lost: {}", std::strerror(-r));
             lost();
             return;
         }
@@ -217,8 +212,7 @@ bool lx::shell::user_bus::request_name(const char* name, name_fn fn, void* user)
     const int r = sd_bus_request_name_async(static_cast<sd_bus*>(bus_), &call, name,
                                             SD_BUS_NAME_QUEUE, events::requested, s);
     if (r < 0) {
-        lx::trace::logger::global().logf(lx::trace::level::warn, k_bus_category,
-                                         "RequestName {}: {}", name, std::strerror(-r));
+        log_bus.warn("RequestName {}: {}", name, std::strerror(-r));
         *s = {};
         return false;
     }
@@ -261,8 +255,7 @@ lx::shell::user_bus::~user_bus() = default;
 bool lx::shell::user_bus::open() {
     if (!told_unavailable_) {
         told_unavailable_ = true;
-        lx::trace::logger::global().log_error(lx::not_implemented("lx::shell::user_bus::open"),
-                                              k_bus_category);
+        log_bus.error(lx::not_implemented("lx::shell::user_bus::open"));
     }
     return false;
 }

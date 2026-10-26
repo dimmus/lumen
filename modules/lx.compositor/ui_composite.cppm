@@ -43,6 +43,12 @@ import lx.gfx;
 import lx.scene;
 import lx.trace;
 
+namespace {
+
+constexpr lx::trace::category log_render{"compositor.render"};
+
+} // namespace
+
 export namespace lx::compositor {
 
 /// The compositor's glyph atlas (ADR-010 §4.11): server-side frames' title text and close
@@ -318,10 +324,9 @@ void lx::compositor::frame_painter::note_drops(unsigned dropped) {
     if (drop_warned_)
         return;
     drop_warned_ = true;
-    lx::trace::logger::global().logf(lx::trace::level::warn, "compositor.render",
-                                     "no primitive renderer on this path: dropped={} "
-                                     "(solid square quads are drawn as blits)",
-                                     dropped);
+    log_render.warn("no primitive renderer on this path: dropped={} "
+                    "(solid square quads are drawn as blits)",
+                    dropped);
 }
 
 std::span<const lx::gfx::blit_command>

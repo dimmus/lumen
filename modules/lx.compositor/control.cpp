@@ -168,7 +168,7 @@ error TooManySubscribers ()
 
 #if defined(LUMEN_HAS_VARLINK)
 
-constexpr const char* k_category = "compositor.control";
+constexpr lx::trace::category log_control{"compositor.control"};
 
 // ── JSON (the function API: sd-json's builder macros are C compound literals) ───────────
 
@@ -607,8 +607,7 @@ struct control_server::impl {
             if (sub.stalled)
                 ++sub.backlog;
             if (sub.backlog >= k_max_backlog || sd_varlink_notify(link, o.v) < 0) {
-                lx::trace::logger::global().log(lx::trace::level::info, k_category,
-                                                "subscriber dropped: not reading");
+                log_control.info("subscriber dropped: not reading");
                 sub.link = nullptr;
                 sub.backlog = 0;
                 sub.stalled = false;
@@ -650,9 +649,7 @@ lx::result<void> control_server::open(control_host host) {
     unsigned line = 0;
     unsigned column = 0;
     if (sd_varlink_idl_parse(k_idl, &line, &column, &iface) < 0 || !iface) {
-        lx::trace::logger::global().logf(lx::trace::level::error, k_category,
-                                         "interface definition does not parse at {}:{}", line,
-                                         column);
+        log_control.error("interface definition does not parse at {}:{}", line, column);
         close();
         return lx::make_error(lx::io_err::not_found, "control interface does not parse");
     }

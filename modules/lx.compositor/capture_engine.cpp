@@ -15,6 +15,12 @@ import lx.trace;
 import :capture;
 import :capture_engine;
 
+namespace {
+
+constexpr lx::trace::category log_capture{"compositor.capture"};
+
+} // namespace
+
 namespace lx::compositor {
 
 namespace {
@@ -187,7 +193,7 @@ bool capture_renderer::ensure_gl() {
         return false;
     gl_tried_ = true;
     if (auto ok = gl_capture_.initialize(*egl_); !ok) {
-        lx::trace::logger::global().log_error(ok.get_error(), "compositor.capture");
+        log_capture.error(ok.get_error());
         return false;
     }
     return true;
@@ -348,8 +354,7 @@ void capture_renderer::complete(capture_channel& out, const capture_completion& 
     // Cannot happen with one frame per session; never leak the fence.
     capture_completion lost = c;
     close_fd(lost.fence_fd);
-    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.capture",
-                                    "completion queue full: a capture frame is lost");
+    log_capture.warn("completion queue full: a capture frame is lost");
 }
 
 void capture_renderer::flush(capture_channel& out) {
@@ -472,7 +477,7 @@ bool capture_renderer::paint_cursor_gl(unsigned framebuffer, lx::size2i size,
             up = gl_->upload_rgba(k_capture_cursor_texture, cursor.width, cursor.height, rgba.data());
         }
         if (!up) {
-            lx::trace::logger::global().log_error(up.get_error(), "compositor.capture");
+            log_capture.error(up.get_error());
             return false;
         }
         cursor_uploaded_gen_ = cursor.generation;
@@ -629,7 +634,7 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
                                                       job.target.offset, job.target.stride, w, h,
                                                       job.target.format, job.target.modifier);
             if (!dst) {
-                lx::trace::logger::global().log_error(dst.get_error(), "compositor.capture");
+                log_capture.error(dst.get_error());
                 fail(out, job, capture_failure::buffer_constraints);
                 return true;
             }
@@ -701,7 +706,7 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
                 dx = dy = 0;
             }
             if (auto r = gl_capture_.read_async(job.session, from, from_w, from_h, read); !r) {
-                lx::trace::logger::global().log_error(r.get_error(), "compositor.capture");
+                log_capture.error(r.get_error());
                 fail(out, job, capture_failure::unknown);
                 return true;
             }
@@ -767,7 +772,7 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
         const unsigned slot = static_cast<unsigned>(&st - sessions_);
         if (auto read = vk_->read_back_async(slot, *src.vk_target, region.rects, region.count);
             !read) {
-            lx::trace::logger::global().log_error(read.get_error(), "compositor.capture");
+            log_capture.error(read.get_error());
             fail(out, job, capture_failure::unknown);
             return true;
         }

@@ -47,6 +47,12 @@ import lx.wayland.server;
 import lx.trace;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_selection{"compositor.selection"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -94,12 +100,11 @@ void deliver(dc_device* d, xfer_family f, const char* cause) {
     xfer_source* src = xfer_selection_source(f);
     xfer_offer* o = src ? xfer_create_control_offer(d->client, d->resource, ops, f, src) : nullptr;
     ops.send_selection(d->resource, o ? o->resource : nullptr);
-    if (surface_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.selection",
-                                         "data-control offer proto={} kind={} client={} mimes={} "
-                                         "cause={}",
-                                         d->proto->name, family_name(f), wire_client_id(d->client),
-                                         o ? src->mimes.count() : 0u, cause);
+    if (log_selection.enabled(lx::trace::level::debug)) {
+        log_selection.debug("data-control offer proto={} kind={} client={} mimes={} "
+                            "cause={}",
+                            d->proto->name, family_name(f), wire_client_id(d->client),
+                            o ? src->mimes.count() : 0u, cause);
     }
 }
 

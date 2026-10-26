@@ -8,6 +8,12 @@ export module lx.runtime:executor;
 
 import std;
 
+namespace {
+
+[[maybe_unused]] constexpr lx::trace::category log_runtime{"runtime"}; // debug builds only
+
+} // namespace
+
 export namespace lx::runtime {
 
 /// Allocation-free type-erased callable — the unit of cross-thread work.
@@ -263,9 +269,7 @@ void lx::runtime::assert_affinity(affinity expected) {
         // Avoid heap/IO on the hot path beyond a single stderr write.
         const char* want = affinity_name(expected);
         const char* have = affinity_name(current_affinity());
-        lx::trace::logger::global().log(
-            lx::trace::level::error, "runtime",
-            "affinity violation");
+        log_runtime.error("affinity violation");
         (void)want;
         (void)have;
         std::abort();

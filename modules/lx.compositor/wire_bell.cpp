@@ -38,6 +38,12 @@ import :popup;
 import :session_lock;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_bell{"compositor.bell"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_HAS_SYSTEM_BELL)
 
 namespace lx::compositor::p0 {
@@ -126,14 +132,12 @@ void bell_ring(struct wl_client* client, struct wl_resource*, struct wl_resource
     else
         g_p0_ctx->shell->emit_bell(rec && rec->mapped ? rec : nullptr);
     // One line per ring at debug; a client that hits the limit is noted once at info.
-    if (surface_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.bell",
-                                         "bell client={} toplevel={} result={}", cid,
-                                         rec ? rec->id.id() : 0ull, result);
+    if (log_bell.enabled(lx::trace::level::debug)) {
+        log_bell.debug("bell client={} toplevel={} result={}", cid, rec ? rec->id.id() : 0ull,
+                       result);
     } else if (result[0] == 'r' && dropped_logged_client != cid) {
         dropped_logged_client = cid;
-        lx::trace::logger::global().logf(lx::trace::level::info, "compositor.bell",
-                                         "bell client={} rate-limited (4 per second)", cid);
+        log_bell.info("bell client={} rate-limited (4 per second)", cid);
     }
 }
 

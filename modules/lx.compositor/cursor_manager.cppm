@@ -11,6 +11,12 @@ import std;
 import :xcursor;
 import :input_router;
 
+namespace {
+
+constexpr lx::trace::category log_cursor{"compositor.cursor"};
+
+} // namespace
+
 export namespace lx::compositor {
 
 /// Texture id of the software cursor, outside the shm range (0x4000'0000 upward).
@@ -425,10 +431,6 @@ lx::rect2i lx::compositor::cursor_node::logical_rect() const {
 
 namespace {
 
-[[nodiscard]] bool cursor_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
 [[nodiscard]] bool rects_equal(lx::rect2i a, lx::rect2i b) {
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
 }
@@ -629,10 +631,9 @@ void lx::compositor::cursor_manager::on_client_surface_commit(lx::surface_id sur
         slot->has_content = false;
     } else if (width > k_cursor_max_px || height > k_cursor_max_px || stride_px < width) {
         static bool reported = false;
-        if (!reported && cursor_debug()) {
+        if (!reported && log_cursor.enabled(lx::trace::level::debug)) {
             reported = true;
-            lx::trace::logger::global().log(lx::trace::level::debug, "compositor.cursor",
-                                            "client cursor larger than 256x256 ignored");
+            log_cursor.debug("client cursor larger than 256x256 ignored");
         }
         return;
     } else {
@@ -712,8 +713,7 @@ void lx::compositor::cursor_manager::on_hardware_failed() {
     if (hw_failed_)
         return;
     hw_failed_ = true;
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor",
-                                    "software cursor: the cursor plane rejected the image");
+    log_cursor.info("software cursor: the cursor plane rejected the image");
     force_image_ = true;
     needs_resolve_ = true;
 }
@@ -842,11 +842,9 @@ void lx::compositor::cursor_manager::resolve() {
             set.generation = image_generation_;
             images_->publish();
         }
-        if (cursor_debug()) {
-            lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.cursor",
-                                             "cursor shape={} source={} hardware={}",
-                                             static_cast<unsigned>(shape), source,
-                                             frame_hardware_ ? 1 : 0);
+        if (log_cursor.enabled(lx::trace::level::debug)) {
+            log_cursor.debug("cursor shape={} source={} hardware={}", static_cast<unsigned>(shape),
+                             source, frame_hardware_ ? 1 : 0);
         }
     }
     frame_pending_ = true;

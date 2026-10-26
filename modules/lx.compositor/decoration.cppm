@@ -367,9 +367,6 @@ private:
     void damage_strips(const frame_node& n) const;
     void damage_title(const frame_node& n) const;
     void raster_title(slot& s);
-    void log(const char* line) const;
-    template <typename... Args>
-    void log(std::format_string<Args...> fmt, Args&&... args) const;
 
     surface_tree* tree_ = nullptr;
     scene::scene_graph* scene_ = nullptr;
@@ -390,11 +387,7 @@ private:
 
 namespace {
 
-constexpr const char* k_deco_category = "compositor.deco";
-
-[[nodiscard]] bool deco_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_deco{"compositor.deco"};
 
 [[nodiscard]] bool rect_eq(lx::rect2i a, lx::rect2i b) {
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
@@ -1066,17 +1059,6 @@ void lx::compositor::decoration_manager::bind(surface_tree& tree, scene::scene_g
     scene_ = &scene;
 }
 
-void lx::compositor::decoration_manager::log(const char* line) const {
-    lx::trace::logger::global().log(lx::trace::level::debug, k_deco_category, line);
-}
-
-template <typename... Args>
-void lx::compositor::decoration_manager::log(std::format_string<Args...> fmt,
-                                             Args&&... args) const {
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_deco_category, fmt,
-                                     std::forward<Args>(args)...);
-}
-
 lx::compositor::decoration_manager::slot*
 lx::compositor::decoration_manager::alloc(const toplevel_record& rec) {
     // By index: iteration skips blocks never allocated, where the free slots may be.
@@ -1157,9 +1139,8 @@ void lx::compositor::decoration_manager::sync(const toplevel_record& rec) {
             static bool warned = false;
             if (!warned) {
                 warned = true;
-                lx::trace::logger::global().log(lx::trace::level::warn, k_deco_category,
-                                                "decoration table full — frame not drawn. "
-                                                "Reported once.");
+                log_deco.warn("decoration table full — frame not drawn. "
+                              "Reported once.");
             }
             return;
         }
@@ -1219,8 +1200,8 @@ void lx::compositor::decoration_manager::set_active(lx::toplevel_id id) {
         s->node.active = true;
         damage_strips(s->node);
     }
-    if ((old || s) && deco_debug()) {
-        log("decoration active id={} previous={}", id.id(), previous.id());
+    if ((old || s) && log_deco.enabled(lx::trace::level::debug)) {
+        log_deco.debug("decoration active id={} previous={}", id.id(), previous.id());
     }
 }
 
@@ -1341,9 +1322,8 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
     const auto warn_no_text = [&] {
         if (!warned_no_text_) {
             warned_no_text_ = true;
-            lx::trace::logger::global().log(lx::trace::level::warn, k_deco_category,
-                                            "no title text: lx.text cannot shape (no font "
-                                            "face, or built without HarfBuzz). Reported once.");
+            log_deco.warn("no title text: lx.text cannot shape (no font "
+                          "face, or built without HarfBuzz). Reported once.");
         }
     };
     if (!text_) {
@@ -1390,14 +1370,15 @@ void lx::compositor::decoration_manager::raster_title(slot& s) {
             // What could be laid out is drawn; the rest is tried again at the next change.
             if (!warned_no_text_) {
                 warned_no_text_ = true;
-                lx::trace::logger::global().log_error(laid.get_error(), k_deco_category);
+                log_deco.error(laid.get_error());
             }
             damaged = true;
             continue;
         }
         damaged = damaged || laid.value();
-        if (laid.value() && deco_debug()) {
-            log("decoration title id={} scale={} width={} ellipsized={} title=\"{:.200}{}\"",
+        if (laid.value() && log_deco.enabled(lx::trace::level::debug)) {
+            log_deco.debug(
+                "decoration title id={} scale={} width={} ellipsized={} title=\"{:.200}{}\"",
                 s.id.id(), scale, run->width, run->ellipsized ? 1 : 0, s.title,
                 s.not_responding ? " (Not Responding)" : "");
         }

@@ -58,11 +58,7 @@ void activation_surface_destroyed(lx::surface_id surface) {
 
 namespace {
 
-constexpr const char* k_category = "compositor.activation";
-
-[[nodiscard]] bool activation_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
+constexpr lx::trace::category log_activation{"compositor.activation"};
 
 /// The frame ticks' clock (std::chrono::steady_clock): token ages compare with it.
 lx::runtime::clock_time steady_ns() {
@@ -151,8 +147,7 @@ void token_commit(wl_client* client, wl_resource* resource) {
         // No randomness: a token that matches nothing ("the compositor will provide an
         // invalid token").
         xdg_activation_token_v1_send_done(resource, "invalid");
-        lx::trace::logger::global().log(lx::trace::level::warn, k_category,
-                                        "token create failed: no randomness available");
+        log_activation.warn("token create failed: no randomness available");
         return;
     }
     t->grant.issuer = b->client;
@@ -176,13 +171,12 @@ void token_commit(wl_client* client, wl_resource* resource) {
     t->grant.refusal = why;
     xdg_activation_token_v1_send_done(resource, t->text);
 
-    if (activation_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
-                                         "token create client={} token={:.8} serial={} surface={} "
-                                         "app_id={} grantable={} reason={}",
-                                         b->client.id(), t->text, b->has_serial ? b->serial : 0u,
-                                         b->surface.id(), b->app_id[0] ? b->app_id : "-",
-                                         t->grant.grantable ? 1 : 0, activation_reason_name(why));
+    if (log_activation.enabled(lx::trace::level::debug)) {
+        log_activation.debug("token create client={} token={:.8} serial={} surface={} "
+                             "app_id={} grantable={} reason={}",
+                             b->client.id(), t->text, b->has_serial ? b->serial : 0u,
+                             b->surface.id(), b->app_id[0] ? b->app_id : "-",
+                             t->grant.grantable ? 1 : 0, activation_reason_name(why));
     }
 }
 
@@ -242,13 +236,12 @@ void activation_activate(wl_client*, wl_resource*, const char* token, wl_resourc
     activation_result r = activation_result::ignored;
     if (target && ctx->wm)
         r = ctx->wm->request_activation(target, t ? &t->grant : nullptr, now, why);
-    if (activation_debug()) {
+    if (log_activation.enabled(lx::trace::level::debug)) {
         char prefix[9];
         log_prefix(token, prefix);
-        lx::trace::logger::global().logf(lx::trace::level::debug, k_category,
-                                         "activate token={} surface={} id={} result={} reason={}",
-                                         prefix, s ? s->id.id() : 0ull, target.id(),
-                                         activation_result_name(r), activation_reason_name(why));
+        log_activation.debug("activate token={} surface={} id={} result={} reason={}", prefix,
+                             s ? s->id.id() : 0ull, target.id(), activation_result_name(r),
+                             activation_reason_name(why));
     }
     // Single use (KWin, Mutter, niri): presenting it for a window spends it, whatever the
     // outcome. Presented for no window, it stays.

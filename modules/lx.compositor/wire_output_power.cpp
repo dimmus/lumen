@@ -45,6 +45,12 @@ import lx.trace;
 import :output;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_power{"compositor.power"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -81,15 +87,6 @@ void unlink(power_obj* o) {
 power_obj* power_from(wl_resource* r) {
     auto* o = r ? static_cast<power_obj*>(wl_resource_get_user_data(r)) : nullptr;
     return o && o->resource == r ? o : nullptr;
-}
-
-void power_log(lx::trace::level lvl, const char* line) {
-    lx::trace::logger::global().log(lvl, "compositor.power", line);
-}
-
-template <typename... Args>
-void power_log(lx::trace::level lvl, std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lvl, "compositor.power", fmt, std::forward<Args>(args)...);
 }
 
 void make_failed(power_obj* o) {
@@ -130,9 +127,9 @@ void set_mode(struct wl_client*, struct wl_resource* r, uint32_t mode) {
         make_failed(o);
         return;
     }
-    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        power_log(lx::trace::level::debug, "set_mode output={} mode={} client_object={}", slot,
-                  mode == ZWLR_OUTPUT_POWER_V1_MODE_ON ? "on" : "off", wl_resource_get_id(r));
+    if (log_power.enabled(lx::trace::level::debug)) {
+        log_power.debug("set_mode output={} mode={} client_object={}", slot,
+                        mode == ZWLR_OUTPUT_POWER_V1_MODE_ON ? "on" : "off", wl_resource_get_id(r));
     }
     g_p0_ctx->set_output_power(g_p0_ctx->idle_user, static_cast<unsigned>(slot),
                                mode == ZWLR_OUTPUT_POWER_V1_MODE_ON);

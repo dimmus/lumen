@@ -48,6 +48,12 @@ import :output;
 import :presentation_feedback;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_presentation{"compositor.presentation"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -156,8 +162,7 @@ void presentation_feedback_request(struct wl_client* client, struct wl_resource*
             const unsigned long long now = monotonic_ns();
             if (g_overflow_warned_ns == 0 || now - g_overflow_warned_ns >= 60'000'000'000ull) {
                 g_overflow_warned_ns = now;
-                lx::trace::logger::global().log(
-                    lx::trace::level::warn, "compositor.presentation",
+                log_presentation.warn(
                     "presentation feedback table full — new feedback is discarded at once");
             }
         }
@@ -261,14 +266,12 @@ void lx::compositor::presentation_flipped(p0_protocol_context& ctx, unsigned fra
     p0::g_flip_output = -1;
     if (p0::g_counts.presented + p0::g_counts.discarded == 0)
         return;
-    if (lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.presentation",
-                                         "flip frame={} t={}.{:09} seq={} refresh_ns={} "
-                                         "flags=0x{:x} presented={} discarded={} output={}",
-                                         frame, info.timestamp_ns / 1'000'000'000ull,
-                                         info.timestamp_ns % 1'000'000'000ull, info.seq,
-                                         info.refresh_ns, info.flags, p0::g_counts.presented,
-                                         p0::g_counts.discarded, slot);
+    if (log_presentation.enabled(lx::trace::level::debug)) {
+        log_presentation.debug("flip frame={} t={}.{:09} seq={} refresh_ns={} "
+                               "flags=0x{:x} presented={} discarded={} output={}",
+                               frame, info.timestamp_ns / 1'000'000'000ull,
+                               info.timestamp_ns % 1'000'000'000ull, info.seq, info.refresh_ns,
+                               info.flags, p0::g_counts.presented, p0::g_counts.discarded, slot);
     }
     p0::g_counts = {};
 #else

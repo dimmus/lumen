@@ -311,10 +311,6 @@ private:
     void drop_one(entry& e, const char* reason);
     void bbox_walk(const entry& e, lx::point2i origin, unsigned depth, long long& x0,
                    long long& y0, long long& x1, long long& y1, bool& any) const;
-    void log_line(const char* category, const char* line) const;
-    template <typename... Args>
-    void log_line(const char* category, std::format_string<Args...> fmt, Args&&... args) const;
-    [[nodiscard]] bool debug() const;
 
     surface_manager* surfaces_ = nullptr;
     scene::scene_graph* scene_ = nullptr;
@@ -335,8 +331,8 @@ private:
 
 namespace {
 
-constexpr const char* k_surface_category = "compositor.surface";
-constexpr const char* k_scene_category = "compositor.scene";
+constexpr lx::trace::category log_surface{"compositor.surface"};
+constexpr lx::trace::category log_scene{"compositor.scene"};
 
 [[nodiscard]] bool rect_same(lx::rect2i a, lx::rect2i b) {
     return a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
@@ -369,21 +365,6 @@ constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
 } // namespace
 
 // ── lookup ─────────────────────────────────────────────────────────────────
-
-bool lx::compositor::surface_tree::debug() const {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-void lx::compositor::surface_tree::log_line(const char* category, const char* line) const {
-    lx::trace::logger::global().log(lx::trace::level::debug, category, line);
-}
-
-template <typename... Args>
-void lx::compositor::surface_tree::log_line(const char* category, std::format_string<Args...> fmt,
-                                            Args&&... args) const {
-    lx::trace::logger::global().logf(lx::trace::level::debug, category, fmt,
-                                     std::forward<Args>(args)...);
-}
 
 // ── membership ─────────────────────────────────────────────────────────────
 
@@ -422,8 +403,8 @@ void lx::compositor::surface_tree::drop_one(entry& e, const char* reason) {
     if (scene_)
         scene_->note_damage(surfaces_->node_rect(e.id));
     surfaces_->drop_node(e.id);
-    if (reason && e.parent && debug()) {
-        log_line(k_surface_category, "subsurface unmap surface={} reason={}", e.id.id(), reason);
+    if (reason && e.parent && log_surface.enabled(lx::trace::level::debug)) {
+        log_surface.debug("subsurface unmap surface={} reason={}", e.id.id(), reason);
     }
     if (unmap_hook_)
         unmap_hook_(unmap_user_, e.id);
@@ -689,9 +670,9 @@ void lx::compositor::surface_tree::apply_child_state(lx::surface_id parent) {
             continue;
         c->pos = c->pos_cached;
         changed = true;
-        if (debug()) {
-            log_line(k_surface_category, "subsurface position surface={} x={} y={}", cid.id(),
-                     c->pos.x, c->pos.y);
+        if (log_surface.enabled(lx::trace::level::debug)) {
+            log_surface.debug("subsurface position surface={} x={} y={}", cid.id(), c->pos.x,
+                              c->pos.y);
         }
     }
     if (p->order_cached_dirty) {
@@ -699,7 +680,7 @@ void lx::compositor::surface_tree::apply_child_state(lx::surface_id parent) {
         if (!p->order.same(p->order_cached)) {
             p->order = p->order_cached;
             changed = true;
-            if (debug()) {
+            if (log_surface.enabled(lx::trace::level::debug)) {
                 char order[480]{};
                 char* end = order;
                 char* const last = order + sizeof(order) - 1;
@@ -709,8 +690,7 @@ void lx::compositor::surface_tree::apply_child_state(lx::surface_id parent) {
                               : std::format_to_n(end, last - end, "{}{}", i ? "," : "",
                                                  p->order.ids[i].id())
                                     .out;
-                log_line(k_surface_category, "subsurface restack parent={} order={}",
-                         parent.id(), order);
+                log_surface.debug("subsurface restack parent={} order={}", parent.id(), order);
             }
         }
     }
@@ -839,9 +819,8 @@ bool lx::compositor::surface_tree::map_root(lx::surface_id root, scene::containe
     if (!layer.add(e->container)) {
         if (!warned_layer_full_) {
             warned_layer_full_ = true;
-            lx::trace::logger::global().log(lx::trace::level::warn, k_scene_category,
-                                            "scene layer full — window not drawn. Reported "
-                                            "once.");
+            log_scene.warn("scene layer full — window not drawn. Reported "
+                           "once.");
         }
         return false;
     }
@@ -1023,10 +1002,9 @@ void lx::compositor::surface_tree::sync_scene(lx::surface_id root, const char* c
                 scene_->note_damage(new_rect);
             }
         }
-        if (created && e->parent && debug()) {
-            log_line(k_surface_category, "subsurface map surface={} root={} x={} y={} w={} h={}",
-                     it.id.id(), root.id(), new_rect.x, new_rect.y, new_rect.width,
-                     new_rect.height);
+        if (created && e->parent && log_surface.enabled(lx::trace::level::debug)) {
+            log_surface.debug("subsurface map surface={} root={} x={} y={} w={} h={}", it.id.id(),
+                              root.id(), new_rect.x, new_rect.y, new_rect.width, new_rect.height);
         }
         const bool moved = created || !rect_same(e->last_rect, new_rect);
         if (moved)
@@ -1140,8 +1118,8 @@ void lx::compositor::surface_tree::set_root_dim(lx::surface_id root, bool dim) {
         n->set_tint(dim ? k_dim_tint : k_no_tint);
     }
     damage_root(root);
-    if (debug()) {
-        log_line(k_scene_category, "tree root={} dim={}", root.id(), dim ? 1 : 0);
+    if (log_surface.enabled(lx::trace::level::debug)) {
+        log_scene.debug("tree root={} dim={}", root.id(), dim ? 1 : 0);
     }
 }
 
@@ -1176,7 +1154,7 @@ bool lx::compositor::surface_tree::hit(lx::surface_id root, double gx, double gy
 }
 
 void lx::compositor::surface_tree::log_tree(lx::surface_id root, const char* cause) const {
-    if (!debug())
+    if (!log_surface.enabled(lx::trace::level::debug))
         return;
     const entry* e = find(root);
     if (!e)
@@ -1205,5 +1183,5 @@ void lx::compositor::surface_tree::log_tree(lx::surface_id root, const char* cau
     }
     if (written == 0 && n > 0 && static_cast<unsigned>(n) < sizeof(line) - 2)
         std::snprintf(line + n, sizeof(line) - static_cast<unsigned>(n), "-");
-    log_line(k_scene_category, line);
+    log_scene.debug("{}", line);
 }

@@ -34,6 +34,13 @@ import :toplevel;
 import :output;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_liveness{"compositor.liveness"};
+constexpr lx::trace::category log_wm{"compositor.wm"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 #if defined(LUMEN_HAS_PROTOCOL_GLUE)
 
@@ -421,10 +428,8 @@ const struct xdg_surface_interface xdg_surface_impl = {
                                        "ack_configure with a serial never sent");
                 return;
             }
-            if (result == ack::ok &&
-                lx::trace::logger::global().min_level() <= lx::trace::level::debug) {
-                lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.wm",
-                                                 "ack id={} serial={}", rec->id.id(), serial);
+            if (result == ack::ok && log_wm.enabled(lx::trace::level::debug)) {
+                log_wm.debug("ack id={} serial={}", rec->id.id(), serial);
             }
         },
 };
@@ -781,14 +786,11 @@ void liveness_changed(void* user, lx::client_id client, bool on, unsigned ms) {
     if (ctx->input && native)
         ctx->input->set_motion_muted(native, on,
                                      static_cast<unsigned>(steady_now_ns() / 1'000'000));
-    auto& log = lx::trace::logger::global();
     if (on)
-        log.logf(lx::trace::level::info, "compositor.liveness",
-                 "not-responding client={} pid={} after_ms={} toplevels={}", client.id(), pid, ms,
-                 toplevels);
+        log_liveness.info("not-responding client={} pid={} after_ms={} toplevels={}", client.id(),
+                          pid, ms, toplevels);
     else
-        log.logf(lx::trace::level::info, "compositor.liveness",
-                 "responsive client={} pid={} was_ms={}", client.id(), pid, ms);
+        log_liveness.info("responsive client={} pid={} was_ms={}", client.id(), pid, ms);
 }
 
 /// The router's user-input hook: a key or button press reached `client` — ping it if it is

@@ -24,6 +24,12 @@ import :style;
 import :text_node;
 import :theme;
 
+namespace {
+
+constexpr lx::trace::category log_ui{"ui"};
+
+} // namespace
+
 // ── Single-line text input (ADR-010 §5.6) ────────────────────────────────────────────────
 //
 // `text_input` edits UTF-8 in a fixed-capacity buffer — the app's (`text_buffer`, edited in
@@ -828,8 +834,7 @@ bool lx::ui::text_input_node::insert(std::string_view s) {
             return false;
         take = lx_ui_ti_cut(s, room);
         if (overflow_ == lx::runtime::overflow_action::warn_and_drop && rejected_ == 1)
-            lx::trace::logger::global().log(lx::trace::level::warn, "ui",
-                                            "text_input: an insertion was cut to the capacity");
+            log_ui.warn("text_input: an insertion was cut to the capacity");
         if (take == 0)
             return false;
     }

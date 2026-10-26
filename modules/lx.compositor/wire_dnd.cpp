@@ -55,7 +55,7 @@ namespace lx::compositor::p0 {
 
 namespace {
 
-constexpr const char* k_category = "compositor.dnd";
+constexpr lx::trace::category log_dnd{"compositor.dnd"};
 /// Data devices of one client a drag event goes to (a toolkit binds one per seat).
 constexpr unsigned k_max_target_devices = 8;
 
@@ -77,20 +77,6 @@ struct drag_state {
     unsigned user_action = 0;
 };
 drag_state drag{};
-
-[[nodiscard]] bool dnd_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
-}
-
-void dnd_log(const char* line) {
-    lx::trace::logger::global().log(lx::trace::level::debug, k_category, line);
-}
-
-template <typename... Args>
-void dnd_log(std::format_string<Args...> fmt, Args&&... args) {
-    lx::trace::logger::global().logf(lx::trace::level::debug, k_category, fmt,
-                                     std::forward<Args>(args)...);
-}
 
 unsigned res_id(wl_resource* r) { return r ? wl_resource_get_id(r) : 0; }
 
@@ -160,11 +146,11 @@ void renegotiate(xfer_source* src, xfer_offer* o) {
         src->action = a;
         if (v3(src->resource) && source_reachable(src))
             wl_data_source_send_action(src->resource, a);
-        if (dnd_debug()) {
+        if (log_dnd.enabled(lx::trace::level::debug)) {
             const bool offer3 = o && v3(o->resource);
-            dnd_log("dnd action action={} source={} offer={} preferred={} user={}", a,
-                    source_actions(src), o ? (offer3 ? o->actions : 1u) : 0u,
-                    o && offer3 ? o->preferred : 0u, src->dropped ? 0u : drag.user_action);
+            log_dnd.debug("dnd action action={} source={} offer={} preferred={} user={}", a,
+                          source_actions(src), o ? (offer3 ? o->actions : 1u) : 0u,
+                          o && offer3 ? o->preferred : 0u, src->dropped ? 0u : drag.user_action);
         }
     }
     if (drag.active)
@@ -225,17 +211,17 @@ void op_focus(void*, void* surface_res_ptr, double sx, double sy) {
                                       o ? o->resource : nullptr);
         }
     }
-    if (dnd_debug()) {
+    if (log_dnd.enabled(lx::trace::level::debug)) {
         if (drag.target_client)
-            dnd_log("dnd focus surface={} client={} sx={:.1f} sy={:.1f} offer={}",
-                    drag.target_id.id(), wire_client_id(client), sx, sy,
-                    res_id(drag.offer ? drag.offer->resource : nullptr));
+            log_dnd.debug("dnd focus surface={} client={} sx={:.1f} sy={:.1f} offer={}",
+                          drag.target_id.id(), wire_client_id(client), sx, sy,
+                          res_id(drag.offer ? drag.offer->resource : nullptr));
         else if (surface_res)
             // A surface whose client has no data device: not a target.
-            dnd_log("dnd focus none surface={} client={} devices=0", s ? s->id.id() : 0ull,
-                    wire_client_id(client));
+            log_dnd.debug("dnd focus none surface={} client={} devices=0", s ? s->id.id() : 0ull,
+                          wire_client_id(client));
         else
-            dnd_log("dnd focus none");
+            log_dnd.debug("dnd focus none");
     }
     // A drag without a source has nothing to negotiate: its client draws its own feedback,
     // and the pointer keeps the grab's shape.
@@ -273,8 +259,8 @@ void cancel_drag(const char* cause) {
     inert_drag_offers(src, nullptr);
     if (src && v3(src->resource) && source_reachable(src))
         wl_data_source_send_cancelled(src->resource);
-    if (src && dnd_debug()) {
-        dnd_log("dnd cancelled source={} cause={}", res_id(src->resource), cause);
+    if (src && log_dnd.enabled(lx::trace::level::debug)) {
+        log_dnd.debug("dnd cancelled source={} cause={}", res_id(src->resource), cause);
     }
     drag = {};
 }
@@ -324,12 +310,12 @@ bool op_drop(void*, lx::compositor::dnd_end_reason& why) {
                 wl_data_source_send_dnd_finished(src->resource);
         }
     }
-    if (dnd_debug()) {
+    if (log_dnd.enabled(lx::trace::level::debug)) {
         const char* mime = src && drag.accepted_mime >= 0
                                ? src->mimes.at(static_cast<unsigned>(drag.accepted_mime))
                                : nullptr;
-        dnd_log("dnd drop surface={} client={} action={} mime={:.96}", drag.target_id.id(),
-                wire_client_id(client), src ? src->action : 0u, mime ? mime : "-");
+        log_dnd.debug("dnd drop surface={} client={} action={} mime={:.96}", drag.target_id.id(),
+                      wire_client_id(client), src ? src->action : 0u, mime ? mime : "-");
     }
     // Then `leave` (wlroots, Mutter, Weston); the offer stays live for receive and finish.
     send_leave(client);
@@ -387,8 +373,8 @@ void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* orig
     auto* grab = g_p0_ctx->dnd;
     const char* reject = !wm || !grab ? "no-wm" : wm->validate_drag_serial(client, serial);
     if (reject) {
-        if (dnd_debug()) {
-            dnd_log("dnd start rejected client={} reason={}", wire_client_id(client), reject);
+        if (log_dnd.enabled(lx::trace::level::debug)) {
+            log_dnd.debug("dnd start rejected client={} reason={}", wire_client_id(client), reject);
         }
         // The client learns its drag will not happen (a version 2 source has no such
         // event: it was not replaced).
@@ -402,12 +388,12 @@ void dnd_start_drag(xfer_device* dev, wl_resource* source_res, wl_resource* orig
     drag.active = true;
     drag.source = src;
     drag.origin_client = client;
-    if (dnd_debug()) {
-        dnd_log("dnd start client={} source={} origin={} icon={} button={} actions={} mimes={}",
-                wire_client_id(client), res_id(src ? src->resource : nullptr),
-                origin ? origin->id.id() : 0ull, icon ? icon->id.id() : 0ull,
-                wm->last_press_button(), src ? source_actions(src) : 0u,
-                src ? src->mimes.count() : 0u);
+    if (log_dnd.enabled(lx::trace::level::debug)) {
+        log_dnd.debug(
+            "dnd start client={} source={} origin={} icon={} button={} actions={} mimes={}",
+            wire_client_id(client), res_id(src ? src->resource : nullptr),
+            origin ? origin->id.id() : 0ull, icon ? icon->id.id() : 0ull, wm->last_press_button(),
+            src ? source_actions(src) : 0u, src ? src->mimes.count() : 0u);
     }
     const lx::client_id origin_client =
         origin ? origin->client : lx::client_id{wire_client_id(client)};
@@ -441,9 +427,9 @@ void dnd_offer_accept(xfer_offer* o, uint32_t, const char* mime) {
     if (accepted == src->accepted)
         return;
     src->accepted = accepted;
-    if (dnd_debug()) {
-        dnd_log("dnd accept client={} mime={:.96}", wire_client_id(o->client),
-                accepted ? mime : "-");
+    if (log_dnd.enabled(lx::trace::level::debug)) {
+        log_dnd.debug("dnd accept client={} mime={:.96}", wire_client_id(o->client),
+                      accepted ? mime : "-");
     }
 }
 
@@ -504,8 +490,8 @@ void dnd_offer_finish(xfer_offer* o) {
     src->finished = true;
     if (v3(src->resource) && source_reachable(src))
         wl_data_source_send_dnd_finished(src->resource);
-    if (dnd_debug()) {
-        dnd_log("dnd finish client={} action={}", wire_client_id(o->client), src->action);
+    if (log_dnd.enabled(lx::trace::level::debug)) {
+        log_dnd.debug("dnd finish client={} action={}", wire_client_id(o->client), src->action);
     }
     xfer_inert_offer(o);
 }
@@ -538,9 +524,9 @@ void dnd_offer_destroyed(xfer_offer* o) {
     src->finished = true; // nothing more will come of it
     if (v3(src->resource) && source_reachable(src))
         wl_data_source_send_cancelled(src->resource);
-    if (dnd_debug()) {
-        dnd_log("dnd cancelled source={} cause={}", res_id(src->resource),
-                o->in_ask ? "ask-dismissed" : "offer-destroyed");
+    if (log_dnd.enabled(lx::trace::level::debug)) {
+        log_dnd.debug("dnd cancelled source={} cause={}", res_id(src->resource),
+                      o->in_ask ? "ask-dismissed" : "offer-destroyed");
     }
 }
 

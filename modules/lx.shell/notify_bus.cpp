@@ -21,7 +21,7 @@ import :notifications;
 
 namespace {
 
-constexpr const char* k_notify_bus_category = "shell.notify";
+constexpr lx::trace::category log_notify{"shell.notify"};
 constexpr const char* k_path = "/org/freedesktop/Notifications";
 constexpr const char* k_iface = "org.freedesktop.Notifications";
 constexpr unsigned k_max_actions = 16;
@@ -33,10 +33,6 @@ long long monotonic_ns() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<long long>(ts.tv_sec) * 1'000'000'000LL + ts.tv_nsec;
-}
-
-[[nodiscard]] bool notify_debug() {
-    return lx::trace::logger::global().min_level() <= lx::trace::level::debug;
 }
 
 std::string bounded(const char* s, std::size_t cap) {
@@ -153,10 +149,8 @@ struct lx::shell::notification_server::events {
                 if (e == image_data_error::none)
                     req.image = std::move(img);
                 else
-                    lx::trace::logger::global().logf(
-                        lx::trace::level::warn, k_notify_bus_category,
-                        "notify: {}'s {} ({}x{}, stride {}, {} channels): {}; ignored",
-                        req.app_name, key, w, h, stride, ch, image_data_error_text(e));
+                    log_notify.warn("notify: {}'s {} ({}x{}, stride {}, {} channels): {}; ignored",
+                                    req.app_name, key, w, h, stride, ch, image_data_error_text(e));
             }
             r = sd_bus_message_exit_container(m);
             if (r < 0)
@@ -247,18 +241,17 @@ struct lx::shell::notification_server::events {
         if (watch)
             s.watch_sender(sender);
         if (const notification* n = s.center_->find(id)) {
-            lx::trace::logger::global().logf(
-                lx::trace::level::info, k_notify_bus_category,
+            log_notify.info(
                 "notify id={}{} app=\"{}\" urgency={} timeout={} actions={}{}{} summary=\"{}\" "
                 "{}",
                 id, asked ? (asked == id ? " (replaced)" : " (replacement of an unknown id)") : "",
                 n->req.app_name,
-                urgency == notify_urgency::low ? "low"
+                urgency == notify_urgency::low        ? "low"
                 : urgency == notify_urgency::critical ? "critical"
                                                       : "normal",
                 n->req.expire_timeout, n->req.actions.size(), n->req.image.size ? " image" : "",
                 merged ? " merged" : "", n->req.summary,
-                n->in_popup ? (s.center_->locked() ? "queued (locked)" : "popup")
+                n->in_popup     ? (s.center_->locked() ? "queued (locked)" : "popup")
                 : n->in_history ? "history (do not disturb)"
                                 : "dropped");
         }
@@ -274,9 +267,8 @@ struct lx::shell::notification_server::events {
         if (!s.center_ || !s.center_->close(id, close_reason::closed, now(s))) {
             // "If the notification no longer exists, an empty D-BUS Error message is sent
             // back."
-            if (notify_debug())
-                lx::trace::logger::global().logf(lx::trace::level::debug, k_notify_bus_category,
-                                                 "CloseNotification {}: no such notification", id);
+            if (log_notify.enabled(lx::trace::level::debug))
+                log_notify.debug("CloseNotification {}: no such notification", id);
             return sd_bus_error_set_const(err, "org.freedesktop.Notifications.Error.NotFound",
                                           nullptr);
         }
@@ -295,10 +287,8 @@ struct lx::shell::notification_server::events {
         notification_server& s = *w->owner;
         if (s.center_)
             s.center_->sender_gone(w->name);
-        if (notify_debug())
-            lx::trace::logger::global().logf(lx::trace::level::debug, k_notify_bus_category,
-                                             "notify: {} left the bus: its actions are gone",
-                                             w->name);
+        if (log_notify.enabled(lx::trace::level::debug))
+            log_notify.debug("notify: {} left the bus: its actions are gone", w->name);
         s.changed_ = true;
         s.unwatch_idle_senders();
         return 0;
@@ -341,9 +331,7 @@ bool lx::shell::notification_server::attach(void* bus, notification_center& cent
     const int r = sd_bus_add_object_vtable(static_cast<sd_bus*>(bus), &slot, k_path, k_iface,
                                            k_notify_vtable, this);
     if (r < 0) {
-        lx::trace::logger::global().logf(lx::trace::level::warn, k_notify_bus_category,
-                                         "notifications: cannot export {}: {}", k_path,
-                                         std::strerror(-r));
+        log_notify.warn("notifications: cannot export {}: {}", k_path, std::strerror(-r));
         return false;
     }
     bus_ = bus;
@@ -367,13 +355,11 @@ void lx::shell::notification_server::emit_closed(unsigned id, close_reason reaso
         return;
     (void)sd_bus_emit_signal(static_cast<sd_bus*>(bus_), k_path, k_iface, "NotificationClosed",
                              "uu", id, static_cast<std::uint32_t>(reason));
-    lx::trace::logger::global().logf(lx::trace::level::info, k_notify_bus_category,
-                                     "notify id={} closed reason={} ({})", id,
-                                     static_cast<unsigned>(reason),
-                                     reason == close_reason::expired     ? "expired"
-                                     : reason == close_reason::dismissed ? "dismissed"
-                                     : reason == close_reason::closed    ? "CloseNotification"
-                                                                         : "undefined");
+    log_notify.info("notify id={} closed reason={} ({})", id, static_cast<unsigned>(reason),
+                    reason == close_reason::expired     ? "expired"
+                    : reason == close_reason::dismissed ? "dismissed"
+                    : reason == close_reason::closed    ? "CloseNotification"
+                                                        : "undefined");
 }
 
 void lx::shell::notification_server::action_invoked(unsigned id, const char* key, const char* token,
@@ -389,9 +375,8 @@ void lx::shell::notification_server::action_invoked(unsigned id, const char* key
                                      "ActivationToken", "us", id, token);
         (void)sd_bus_emit_signal(static_cast<sd_bus*>(bus_), k_path, k_iface, "ActionInvoked",
                                  "us", id, key ? key : "");
-        lx::trace::logger::global().logf(lx::trace::level::info, k_notify_bus_category,
-                                         "notify id={} action \"{}\" invoked token={}", id,
-                                         key ? key : "", token && *token ? "yes" : "no");
+        log_notify.info("notify id={} action \"{}\" invoked token={}", id, key ? key : "",
+                        token && *token ? "yes" : "no");
     }
     center_->finish_invoke(id, now);
     changed_ = true;

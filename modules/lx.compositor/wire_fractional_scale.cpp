@@ -41,6 +41,12 @@ import lx.trace;
 import :surface;
 import :wire;
 
+namespace {
+
+constexpr lx::trace::category log_scale{"compositor.scale"};
+
+} // namespace
+
 #if defined(LUMEN_HAS_WAYLAND)
 
 namespace lx::compositor::p0 {
@@ -69,10 +75,8 @@ void fractional_destroy_resource(wl_resource* r) {
 void send_preferred(surface_obj* s, std::uint32_t scale120) {
     s->pref_scale120 = scale120;
     wp_fractional_scale_v1_send_preferred_scale(s->fractional->resource, scale120);
-    if (surface_debug()) {
-        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.scale",
-                                         "fractional preferred surface={} scale120={}", s->id.id(),
-                                         scale120);
+    if (log_scale.enabled(lx::trace::level::debug)) {
+        log_scale.debug("fractional preferred surface={} scale120={}", s->id.id(), scale120);
     }
 }
 

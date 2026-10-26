@@ -9,6 +9,12 @@ export module lx.scene:snapshot;
 
 import std;
 
+namespace {
+
+constexpr lx::trace::category log_draw_list{"scene.draw_list"};
+
+} // namespace
+
 export namespace lx::scene {
 
 struct draw_command {
@@ -736,8 +742,7 @@ void lx::scene::draw_list::push_command(const draw_command& cmd, std::uint32_t o
     case lx::runtime::overflow_action::warn_and_drop:
         if (!cap_warned_) {
             cap_warned_ = true;
-            lx::trace::logger::global().log(lx::trace::level::warn, "scene.draw_list",
-                                            "draw command cap reached");
+            log_draw_list.warn("draw command cap reached");
         }
         [[fallthrough]];
     case lx::runtime::overflow_action::drop_newest:
@@ -756,8 +761,7 @@ bool lx::scene::draw_list::admit_primitive(lx::runtime::overflow_action overflow
     case lx::runtime::overflow_action::warn_and_drop:
         if (!primitive_cap_warned_) {
             primitive_cap_warned_ = true;
-            lx::trace::logger::global().log(lx::trace::level::warn, "scene.draw_list",
-                                            "primitive cap reached");
+            log_draw_list.warn("primitive cap reached");
         }
         [[fallthrough]];
     default:
@@ -1015,8 +1019,7 @@ void lx::scene::draw_list::batch_for_render() {
             if (batch_count_ >= lx::gfx::k_max_batches) {
                 if (!batch_cap_warned_) {
                     batch_cap_warned_ = true;
-                    lx::trace::logger::global().log(lx::trace::level::warn, "scene.draw_list",
-                                                    "batch cap reached");
+                    log_draw_list.warn("batch cap reached");
                 }
                 overflow_drops_ += sorted_count_ - i;
                 break;
