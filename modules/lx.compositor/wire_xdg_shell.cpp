@@ -781,14 +781,14 @@ void liveness_changed(void* user, lx::client_id client, bool on, unsigned ms) {
     if (ctx->input && native)
         ctx->input->set_motion_muted(native, on,
                                      static_cast<unsigned>(steady_now_ns() / 1'000'000));
-    char line[128];
+    auto& log = lx::trace::logger::global();
     if (on)
-        std::snprintf(line, sizeof(line), "not-responding client=%llu pid=%u after_ms=%u toplevels=%u",
-                      client.id(), pid, ms, toplevels);
+        log.logf(lx::trace::level::info, "compositor.liveness",
+                 "not-responding client={} pid={} after_ms={} toplevels={}", client.id(), pid, ms,
+                 toplevels);
     else
-        std::snprintf(line, sizeof(line), "responsive client=%llu pid=%u was_ms=%u", client.id(),
-                      pid, ms);
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.liveness", line);
+        log.logf(lx::trace::level::info, "compositor.liveness",
+                 "responsive client={} pid={} was_ms={}", client.id(), pid, ms);
 }
 
 /// The router's user-input hook: a key or button press reached `client` — ping it if it is

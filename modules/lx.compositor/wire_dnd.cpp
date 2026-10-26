@@ -226,19 +226,16 @@ void op_focus(void*, void* surface_res_ptr, double sx, double sy) {
         }
     }
     if (dnd_debug()) {
-        char line[160];
         if (drag.target_client)
-            std::snprintf(line, sizeof(line),
-                          "dnd focus surface=%llu client=%u sx=%.1f sy=%.1f offer=%u",
-                          drag.target_id.id(), wire_client_id(client), sx, sy,
-                          res_id(drag.offer ? drag.offer->resource : nullptr));
+            dnd_log("dnd focus surface={} client={} sx={:.1f} sy={:.1f} offer={}",
+                    drag.target_id.id(), wire_client_id(client), sx, sy,
+                    res_id(drag.offer ? drag.offer->resource : nullptr));
         else if (surface_res)
             // A surface whose client has no data device: not a target.
-            std::snprintf(line, sizeof(line), "dnd focus none surface=%llu client=%u devices=0",
-                          s ? s->id.id() : 0ull, wire_client_id(client));
+            dnd_log("dnd focus none surface={} client={} devices=0", s ? s->id.id() : 0ull,
+                    wire_client_id(client));
         else
-            std::snprintf(line, sizeof(line), "dnd focus none");
-        dnd_log(line);
+            dnd_log("dnd focus none");
     }
     // A drag without a source has nothing to negotiate: its client draws its own feedback,
     // and the pointer keeps the grab's shape.
