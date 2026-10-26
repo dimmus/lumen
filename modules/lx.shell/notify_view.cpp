@@ -437,15 +437,13 @@ void lx::shell::notification_view::draw() {
         for (unsigned i = 0; i < layout_.count; ++i) {
             const card_layout& c = layout_.cards[i];
             char buttons[160] = "";
-            unsigned n = 0;
-            for (unsigned b = 0; b < c.buttons && n < sizeof(buttons); ++b) {
-                const int w = std::snprintf(buttons + n, sizeof(buttons) - n, "%s%d,%d,%d,%d",
-                                            b ? ";" : "", c.button[b].x, c.button[b].y,
-                                            c.button[b].width, c.button[b].height);
-                if (w <= 0)
-                    break;
-                n += static_cast<unsigned>(w);
-            }
+            char* end = buttons;
+            char* const last = buttons + sizeof(buttons) - 1;
+            for (unsigned b = 0; b < c.buttons && end < last; ++b)
+                end = std::format_to_n(end, last - end, "{}{},{},{},{}", b ? ";" : "",
+                                       c.button[b].x, c.button[b].y, c.button[b].width,
+                                       c.button[b].height)
+                          .out;
             lx::trace::logger::global().logf(
                 lx::trace::level::debug, k_view_category,
                 "notifications: card id={} box={},{},{},{} close={},{},{},{} buttons={}", c.id,

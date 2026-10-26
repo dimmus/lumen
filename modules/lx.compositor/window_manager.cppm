@@ -3373,32 +3373,30 @@ void lx::compositor::window_manager::set_pointer_focus(const wm_hit* hit) {
     }
     if (!wm_debug_enabled())
         return;
-    char line[96];
+    auto& log = lx::trace::logger::global();
+    constexpr auto lvl = lx::trace::level::debug;
     if (on_frame)
         // Deliberately not `focus pointer id=…`: no client has the pointer.
-        std::snprintf(line, sizeof(line), "focus pointer decoration id=%llu zone=%s",
-                      hit->id.id(), deco_zone_name(hit->zone));
+        log.logf(lvl, k_wm_category, "focus pointer decoration id={} zone={}", hit->id.id(),
+                 deco_zone_name(hit->zone));
     else if (hit && hit->owner == hit_owner::popup)
         // Deliberately not `focus pointer id=…`: the drag smoke counts those as windows.
-        std::snprintf(line, sizeof(line), "focus pointer popup surface=%llu sx=%.1f sy=%.1f",
-                      hit->surface.id(), hit->sx, hit->sy);
+        log.logf(lvl, k_wm_category, "focus pointer popup surface={} sx={:.1f} sy={:.1f}",
+                 hit->surface.id(), hit->sx, hit->sy);
     else if (hit && hit->owner == hit_owner::layer)
-        std::snprintf(line, sizeof(line), "focus pointer layer surface=%llu sx=%.1f sy=%.1f",
-                      hit->surface.id(), hit->sx, hit->sy);
+        log.logf(lvl, k_wm_category, "focus pointer layer surface={} sx={:.1f} sy={:.1f}",
+                 hit->surface.id(), hit->sx, hit->sy);
     else if (hit && hit->owner == hit_owner::ime_popup)
-        std::snprintf(line, sizeof(line), "focus pointer ime-popup surface=%llu sx=%.1f sy=%.1f",
-                      hit->surface.id(), hit->sx, hit->sy);
+        log.logf(lvl, k_wm_category, "focus pointer ime-popup surface={} sx={:.1f} sy={:.1f}",
+                 hit->surface.id(), hit->sx, hit->sy);
     else if (hit)
-        std::snprintf(line, sizeof(line), "focus pointer id=%llu sx=%.1f sy=%.1f", hit->id.id(),
-                      hit->sx, hit->sy);
+        log.logf(lvl, k_wm_category, "focus pointer id={} sx={:.1f} sy={:.1f}", hit->id.id(),
+                 hit->sx, hit->sy);
     else
-        std::snprintf(line, sizeof(line), "focus pointer none");
-    lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
-    if (hit && !on_frame && hit->owner == hit_owner::toplevel && !(hit->surface == hit->root)) {
-        std::snprintf(line, sizeof(line), "focus pointer-surface surface=%llu root=%llu",
-                      hit->surface.id(), hit->root.id());
-        lx::trace::logger::global().log(lx::trace::level::debug, k_wm_category, line);
-    }
+        log.log(lvl, k_wm_category, "focus pointer none");
+    if (hit && !on_frame && hit->owner == hit_owner::toplevel && !(hit->surface == hit->root))
+        log.logf(lvl, k_wm_category, "focus pointer-surface surface={} root={}", hit->surface.id(),
+                 hit->root.id());
 }
 
 void lx::compositor::window_manager::on_surface_unmapped(lx::surface_id surface) {

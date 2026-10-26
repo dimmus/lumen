@@ -540,12 +540,10 @@ struct lx::shell::policy_bridge::events {
                                            ts.tv_nsec);
         if (bridge_debug()) {
             const task_handle f = b.model_.focused();
-            char line[64];
             if (f)
-                std::snprintf(line, sizeof(line), "focus handle=%u", f.index);
+                bridge_log(lx::trace::level::debug, "focus handle={}", f.index);
             else
-                std::snprintf(line, sizeof(line), "focus handle=none");
-            bridge_log(lx::trace::level::debug, line);
+                bridge_log(lx::trace::level::debug, "focus handle=none");
         }
     }
     static void stacking_order_changed(void* data, zlm_policy_bridge_v1*, zlm_toplevel_v1* t,

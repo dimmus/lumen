@@ -2266,23 +2266,19 @@ void compositor_impl::report_unregistered_draw(const gfx::blit_command* blits,
         return;
     reported_unregistered_ = true;
 
-    char detail[256];
-    unsigned written = 0;
-    written += static_cast<unsigned>(std::snprintf(
-        detail + written, sizeof(detail) - written,
-        "draw references an unregistered texture — nothing will be drawn. ids:"));
-    for (unsigned i = 0; i < count && i < 4 && written + 16 < sizeof(detail); ++i) {
-        written += static_cast<unsigned>(std::snprintf(detail + written,
-                                                       sizeof(detail) - written, " %u",
-                                                       blits[i].texture_id));
-    }
-    std::snprintf(detail + written, sizeof(detail) - written,
-                  " (%u draws; backend=%s). Reported once.", count,
-                  gl_present_    ? "gl"
-                  : cpu_present_ ? "cpu"
-                  : vulkan_present_ ? "vulkan"
-                                    : "headless");
-    lx::trace::logger::global().log(lx::trace::level::warn, "compositor.render", detail);
+    char ids[48]{}; // " <id>" for at most 4 ids
+    char* end = ids;
+    for (unsigned i = 0; i < count && i < 4; ++i)
+        end = std::format_to_n(end, ids + sizeof(ids) - 1 - end, " {}", blits[i].texture_id).out;
+    lx::trace::logger::global().logf(
+        lx::trace::level::warn, "compositor.render",
+        "draw references an unregistered texture — nothing will be drawn. ids:{} ({} draws; "
+        "backend={}). Reported once.",
+        ids, count,
+        gl_present_       ? "gl"
+        : cpu_present_    ? "cpu"
+        : vulkan_present_ ? "vulkan"
+                          : "headless");
 }
 
 void compositor_impl::begin_input() {
@@ -5711,45 +5707,33 @@ const char* pause_kind_name(session_pause_kind k) {
 
 void compositor_impl::on_session_events() {
     const std::size_t n = session_events_.size();
-    const bool debug = lx::trace::logger::global().min_level() <= lx::trace::level::debug;
+    auto& log = lx::trace::logger::global();
     for (std::size_t i = 0; i < n; ++i) {
         const session_event ev = session_events_[i];
-        char line[128];
         switch (ev.what) {
         case session_event::kind::paused:
-            if (debug) {
-                std::snprintf(line, sizeof(line), "PauseDevice %u:%u type=%s", ev.major, ev.minor,
-                              pause_kind_name(ev.pause));
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.session",
-                                                line);
-            }
+            log.logf(lx::trace::level::debug, "compositor.session", "PauseDevice {}:{} type={}",
+                     ev.major, ev.minor, pause_kind_name(ev.pause));
             // evdev `pause`s (seats without VTs) are acknowledged after the batch, below.
             if (session_.is_drm(ev.major, ev.minor))
                 apply_session_actions(session_.on_device_paused(ev.major, ev.minor, ev.pause));
             break;
         case session_event::kind::resumed:
-            if (debug) {
-                std::snprintf(line, sizeof(line), "ResumeDevice %u:%u", ev.major, ev.minor);
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.session",
-                                                line);
-            }
+            log.logf(lx::trace::level::debug, "compositor.session", "ResumeDevice {}:{}", ev.major,
+                     ev.minor);
             // evdev: we released every input device at the pause, so this is a leftover of
             // a race; the fd is sd-bus's and libinput re-takes its devices itself.
             if (session_.is_drm(ev.major, ev.minor))
                 apply_session_actions(session_.on_device_resumed(ev.major, ev.minor));
             break;
         case session_event::kind::active:
-            if (debug) {
-                std::snprintf(line, sizeof(line), "Active=%d", ev.active ? 1 : 0);
-                lx::trace::logger::global().log(lx::trace::level::debug, "compositor.session",
-                                                line);
-            }
+            log.logf(lx::trace::level::debug, "compositor.session", "Active={}", ev.active);
             apply_session_actions(
                 session_.on_active_changed(ev.active, ev.active && kms.is_master()));
             break;
         case session_event::kind::vt_failed:
-            std::snprintf(line, sizeof(line), "VT switch failed: %s", ev.error);
-            lx::trace::logger::global().log(lx::trace::level::warn, "compositor.session", line);
+            log.logf(lx::trace::level::warn, "compositor.session", "VT switch failed: {}",
+                     ev.error);
             break;
         case session_event::kind::lock:
             on_logind_lock();
@@ -5780,7 +5764,6 @@ void compositor_impl::on_session_events() {
 void compositor_impl::apply_session_actions(const session_actions& a) {
     if (a.empty())
         return;
-    char line[128];
     if (a.has(session_actions::stop_display))
         enter_display_pause(a.quiesce_gen);
     if (a.has(session_actions::suspend_input))
@@ -5789,11 +5772,12 @@ void compositor_impl::apply_session_actions(const session_actions& a) {
         wm_.set_suspend_reason(window_manager::suspend_vt, true);
     if (a.has(session_actions::log_paused)) {
         if (a.by_active)
-            std::snprintf(line, sizeof(line), "session paused (active=false)");
+            lx::trace::logger::global().log(lx::trace::level::info, "compositor.session",
+                                            "session paused (active=false)");
         else
-            std::snprintf(line, sizeof(line), "session paused (drm=%u:%u kind=%s)", drm_major_,
-                          drm_minor_, pause_kind_name(a.kind));
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.session", line);
+            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.session",
+                                             "session paused (drm={}:{} kind={})", drm_major_,
+                                             drm_minor_, pause_kind_name(a.kind));
     }
     if (a.has(session_actions::log_display_lost))
         lx::trace::logger::global().log(lx::trace::level::error, "compositor.session",
@@ -5809,8 +5793,8 @@ void compositor_impl::apply_session_actions(const session_actions& a) {
         resume_input_after_pause();
     if (a.has(session_actions::complete_pause)) {
         logind_.complete_pause(a.ack_major, a.ack_minor);
-        std::snprintf(line, sizeof(line), "PauseDeviceComplete %u:%u", a.ack_major, a.ack_minor);
-        lx::trace::logger::global().log(lx::trace::level::debug, "compositor.session", line);
+        lx::trace::logger::global().logf(lx::trace::level::debug, "compositor.session",
+                                         "PauseDeviceComplete {}:{}", a.ack_major, a.ack_minor);
     }
     if (a.has(session_actions::log_resumed))
         lx::trace::logger::global().log(lx::trace::level::info, "compositor.session",
@@ -6026,7 +6010,6 @@ void compositor_impl::apply_power_actions(unsigned slot, const power_actions& a)
         return;
     output_ui& o = outs_[slot];
     const std::uint32_t bit = 1u << slot;
-    char line[160];
     const char* name = outputs.slot_live(slot) ? outputs.slot_state(slot).name : "?";
     if (a.has(power_actions::gate)) {
         // This output stops as at a VT pause (A.3 step 3), but input stays live: it is what
@@ -6074,32 +6057,26 @@ void compositor_impl::apply_power_actions(unsigned slot, const power_actions& a)
         apply_power_actions(slot, o.power.on_flip_drained());
     if (a.has(power_actions::send_mode))
         notify_output_power(p0_, slot, a.mode_on);
-    if (a.has(power_actions::log_off)) {
-        std::snprintf(line, sizeof(line), "%s (output %u %s)",
-                      (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0
-                          ? "display power off (session away: nothing to commit)"
-                          : "display power off (CRTC ACTIVE=0, cursor plane off)",
-                      slot, name);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.power", line);
-    }
-    if (a.has(power_actions::log_soft_blank)) {
-        std::snprintf(line, sizeof(line),
-                      "display power off refused by the driver — showing black instead (no power "
-                      "saving) (output %u %s)",
-                      slot, name);
-        lx::trace::logger::global().log(lx::trace::level::warn, "compositor.power", line);
-    }
-    if (a.has(power_actions::log_on)) {
-        std::snprintf(line, sizeof(line), "display power on (output %u %s)", slot, name);
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.power", line);
-    }
-    if (a.has(power_actions::log_on_failed)) {
-        std::snprintf(line, sizeof(line),
-                      "display power on: the modeset was refused (the mode is no longer "
-                      "offered?) — output %u %s stays dark until the next input",
-                      slot, name);
-        lx::trace::logger::global().log(lx::trace::level::error, "compositor.power", line);
-    }
+    auto& log = lx::trace::logger::global();
+    if (a.has(power_actions::log_off))
+        log.logf(lx::trace::level::info, "compositor.power", "{} (output {} {})",
+                 (display_gate_.load(std::memory_order_relaxed) & gate_vt) != 0
+                     ? "display power off (session away: nothing to commit)"
+                     : "display power off (CRTC ACTIVE=0, cursor plane off)",
+                 slot, name);
+    if (a.has(power_actions::log_soft_blank))
+        log.logf(lx::trace::level::warn, "compositor.power",
+                 "display power off refused by the driver — showing black instead (no power "
+                 "saving) (output {} {})",
+                 slot, name);
+    if (a.has(power_actions::log_on))
+        log.logf(lx::trace::level::info, "compositor.power", "display power on (output {} {})",
+                 slot, name);
+    if (a.has(power_actions::log_on_failed))
+        log.logf(lx::trace::level::error, "compositor.power",
+                 "display power on: the modeset was refused (the mode is no longer "
+                 "offered?) — output {} {} stays dark until the next input",
+                 slot, name);
     // A lock under way when the output went dark is locked now if nothing else shows.
     if (a.has(power_actions::log_off) || a.has(power_actions::log_soft_blank))
         note_lock_shown(slot);
@@ -7693,14 +7670,15 @@ void compositor_impl::remove_output(unsigned slot, bool connector_gone, const ch
         wm_.set_suspend_reason(window_manager::suspend_power, live != 0 && dark == live);
     }
     advance_lock();
-    char line[320];
+    auto& log = lx::trace::logger::global();
     if (why)
-        std::snprintf(line, sizeof(line), "output %u disabled name=%s identifier=\"%s\" windows_moved=%u (%s)",
-                      slot, name, identifier, moved, why);
+        log.logf(lx::trace::level::info, "compositor.output",
+                 "output {} disabled name={} identifier=\"{}\" windows_moved={} ({})", slot, name,
+                 identifier, moved, why);
     else
-        std::snprintf(line, sizeof(line), "output %u removed name=%s identifier=\"%s\" windows_moved=%u%s",
-                      slot, name, identifier, moved, connector_gone ? " (connector gone)" : "");
-    lx::trace::logger::global().log(lx::trace::level::info, "compositor.output", line);
+        log.logf(lx::trace::level::info, "compositor.output",
+                 "output {} removed name={} identifier=\"{}\" windows_moved={}{}", slot, name,
+                 identifier, moved, connector_gone ? " (connector gone)" : "");
     mark_heads_dirty();
 }
 
@@ -9551,22 +9529,21 @@ lx::result<void> compositor::start() {
             else if (planes < pipelines)
                 why_software = "an output has no cursor plane";
         }
-        char line[160];
         if (!why_software && planes > 0) {
-            std::snprintf(line, sizeof(line),
-                          "hardware cursor planes=%u size=%dx%d hotspot=%d", planes,
-                          plane_size.width, plane_size.height,
-                          impl->kms.cursor_hotspot_cap() ? 1 : 0);
+            lx::trace::logger::global().logf(
+                lx::trace::level::info, "compositor.cursor",
+                "hardware cursor planes={} size={}x{} hotspot={}", planes, plane_size.width,
+                plane_size.height, impl->kms.cursor_hotspot_cap());
         } else {
             // Software everywhere: the planes stay off (a cursor shown on some outputs by a
             // plane and on others by the scene would draw it twice where they meet).
             for (auto& p : impl->pipes_)
                 if (p && p->cursor.valid())
                     p->cursor = drm::kms_cursor_plane{};
-            std::snprintf(line, sizeof(line), "software cursor: %s",
-                          why_software ? why_software : "no cursor plane");
+            lx::trace::logger::global().logf(lx::trace::level::info, "compositor.cursor",
+                                             "software cursor: {}",
+                                             why_software ? why_software : "no cursor plane");
         }
-        lx::trace::logger::global().log(lx::trace::level::info, "compositor.cursor", line);
 
         cursor_manager::setup setup{};
         for (unsigned i = 0; i < n; ++i) {

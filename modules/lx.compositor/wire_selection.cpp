@@ -522,16 +522,12 @@ void xfer_set_selection(xfer_device* dev, wl_resource* source_res, uint32_t seri
     if (src)
         src->role = source_role::selection;
     if (surface_debug()) {
-        char line[160];
         if (src)
-            std::snprintf(line, sizeof(line),
-                          "selection set kind=%s client=%u source=%u mimes=%u serial=%u",
-                          kind_name(f), wire_client_id(client), res_id(src->resource),
-                          src->mimes.count(), serial);
+            sel_log("selection set kind={} client={} source={} mimes={} serial={}", kind_name(f),
+                    wire_client_id(client), res_id(src->resource), src->mimes.count(), serial);
         else
-            std::snprintf(line, sizeof(line), "selection unset kind=%s client=%u serial=%u",
-                          kind_name(f), wire_client_id(client), serial);
-        sel_log(line);
+            sel_log("selection unset kind={} client={} serial={}", kind_name(f),
+                    wire_client_id(client), serial);
     }
     deliver_to_client(f, focus_client, "set");
     data_control_selection_changed(f);

@@ -700,21 +700,17 @@ void lx::compositor::surface_tree::apply_child_state(lx::surface_id parent) {
             p->order = p->order_cached;
             changed = true;
             if (debug()) {
-                char line[512];
-                int n = std::snprintf(line, sizeof(line), "subsurface restack parent=%llu order=",
-                                      parent.id());
-                for (unsigned i = 0; i < p->order.count && n > 0 &&
-                                     static_cast<unsigned>(n) < sizeof(line) - 24;
-                     ++i) {
-                    const int w =
-                        p->order.ids[i] == parent
-                            ? std::snprintf(line + n, sizeof(line) - n, "%sself", i ? "," : "")
-                            : std::snprintf(line + n, sizeof(line) - n, "%s%llu", i ? "," : "",
-                                            p->order.ids[i].id());
-                    if (w > 0)
-                        n += w;
-                }
-                log_line(k_surface_category, line);
+                char order[480]{};
+                char* end = order;
+                char* const last = order + sizeof(order) - 1;
+                for (unsigned i = 0; i < p->order.count && last - end > 24; ++i)
+                    end = p->order.ids[i] == parent
+                              ? std::format_to_n(end, last - end, "{}self", i ? "," : "").out
+                              : std::format_to_n(end, last - end, "{}{}", i ? "," : "",
+                                                 p->order.ids[i].id())
+                                    .out;
+                log_line(k_surface_category, "subsurface restack parent={} order={}",
+                         parent.id(), order);
             }
         }
     }

@@ -893,17 +893,15 @@ int describe_connection_error(wl_display* d, const char* when, bool logout_reque
         shell_log(lx::trace::level::info, "session ended (logged out)");
         return 0;
     }
-    char line[256];
     if (err == EPROTO) {
         const wl_interface* iface = nullptr;
         uint32_t id = 0;
         const uint32_t code = wl_display_get_protocol_error(d, &iface, &id);
-        std::snprintf(line, sizeof(line), "%s: protocol error on %s#%u, code %u", when,
-                      iface ? iface->name : "?", id, code);
+        shell_log(lx::trace::level::error, "{}: protocol error on {}#{}, code {}", when,
+                  iface ? iface->name : "?", id, code);
     } else {
-        std::snprintf(line, sizeof(line), "%s: connection lost (%s)", when, std::strerror(err));
+        shell_log(lx::trace::level::error, "{}: connection lost ({})", when, std::strerror(err));
     }
-    shell_log(lx::trace::level::error, line);
     return 1;
 }
 
@@ -1858,13 +1856,11 @@ void lx::shell::shell_app::report_failure(const char* id, const char* name, laun
         if (w.first == id && w.second == f)
             return;
     warned_.emplace_back(id, f);
-    char line[640];
     if (unit && *unit)
-        std::snprintf(line, sizeof(line), "apps: %s (%s): %s (%s; journalctl --user -u '%s')",
-                      text, id, reason, detail ? detail : "", unit);
+        apps_log(lx::trace::level::warn, "apps: {} ({}): {} ({}; journalctl --user -u '{}')", text,
+                 id, reason, detail ? detail : "", unit);
     else
-        std::snprintf(line, sizeof(line), "apps: %s (%s)", text, id);
-    apps_log(lx::trace::level::warn, line);
+        apps_log(lx::trace::level::warn, "apps: {} ({})", text, id);
 }
 
 void lx::shell::shell_app::on_outcome(const launch_outcome& o) {
@@ -1872,14 +1868,13 @@ void lx::shell::shell_app::on_outcome(const launch_outcome& o) {
         report_failure(o.id, o.name, o.failure, o.detail, o.error_number, o.unit);
         return;
     }
-    char line[400];
+    constexpr auto lvl = lx::trace::level::info;
     if (o.forked && o.unit[0])
-        std::snprintf(line, sizeof(line), "apps: launched %s pid=%d in %s", o.id, o.pid, o.unit);
+        apps_log(lvl, "apps: launched {} pid={} in {}", o.id, o.pid, o.unit);
     else if (o.forked)
-        std::snprintf(line, sizeof(line), "apps: launched %s pid=%d (double fork)", o.id, o.pid);
+        apps_log(lvl, "apps: launched {} pid={} (double fork)", o.id, o.pid);
     else
-        std::snprintf(line, sizeof(line), "apps: launched %s as %s", o.id, o.unit);
-    apps_log(lx::trace::level::info, line);
+        apps_log(lvl, "apps: launched {} as {}", o.id, o.unit);
 }
 
 void lx::shell::shell_app::launch_entry(unsigned entry, unsigned serial) {
