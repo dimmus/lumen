@@ -13,6 +13,7 @@ module;
 #endif
 
 import lx.foundation;
+import lx.trace;
 
 export module lx.input:keymap;
 
@@ -257,6 +258,8 @@ lx::input::keyboard_keymap& lx::input::keyboard_keymap::operator=(
 
 #if defined(LUMEN_HAS_INPUT)
 namespace {
+constexpr lx::trace::category log_input{"input"};
+
 struct xkb_error_capture {
     char* out = nullptr;
     unsigned cap = 0;
@@ -267,8 +270,12 @@ void capture_xkb_log(struct xkb_context* ctx, enum xkb_log_level level, const ch
     if (level > XKB_LOG_LEVEL_ERROR)
         return;
     if (!c || !c->out || c->cap == 0 || c->out[0]) {
-        // Not captured (or a later one): to stderr as xkbcommon would, errors only.
-        std::vfprintf(stderr, format, args);
+        // Not captured (or a later one): logged, errors only. xkbcommon hands a printf
+        // format, so this one line is built with vsnprintf.
+        char line[512];
+        std::vsnprintf(line, sizeof(line), format, args);
+        line[std::strcspn(line, "\n")] = '\0';
+        log_input.error("xkb: {}", line);
         return;
     }
     std::vsnprintf(c->out, c->cap, format, args);

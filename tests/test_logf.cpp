@@ -30,18 +30,16 @@ struct sink_guard {
     lx::trace::level previous_;
 };
 
+constexpr lx::trace::category log_t{"t"};
+
 } // namespace
 
 LUMEN_TEST(logf_formats_like_the_printf_lines_it_replaced) {
     capture c;
     sink_guard g{c, lx::trace::level::debug};
-    const auto& log = lx::trace::logger::global();
-    log.logf(lx::trace::level::debug, "t", "geometry id={} x={} w={} cause={} serial={}", 42ull, -3,
-             640u, "map", 7u);
-    log.logf(lx::trace::level::debug, "t", "flags=0x{:x} t={}.{:09} scale={:g} rgba={:.3f}", 0x2au,
-             12, 5'000'000, 1.5, 0.25);
-    log.logf(lx::trace::level::debug, "t", "token={:.8}… title=\"{:.4}\"", "abcdefghijk",
-             "Terminal");
+    log_t.debug("geometry id={} x={} w={} cause={} serial={}", 42ull, -3, 640u, "map", 7u);
+    log_t.debug("flags=0x{:x} t={}.{:09} scale={:g} rgba={:.3f}", 0x2au, 12, 5'000'000, 1.5, 0.25);
+    log_t.debug("token={:.8}… title=\"{:.4}\"", "abcdefghijk", "Terminal");
     LUMEN_CHECK(c.lines.size() == 3);
     LUMEN_CHECK(c.lines[0] == "geometry id=42 x=-3 w=640 cause=map serial=7");
     LUMEN_CHECK(c.lines[1] == "flags=0x2a t=12.005000000 scale=1.5 rgba=0.250");
@@ -53,8 +51,7 @@ LUMEN_TEST(logf_prints_bool_as_digit_and_null_string_as_null) {
     sink_guard g{c, lx::trace::level::debug};
     const char* none = nullptr;
     char name[16] = "HDMI-A-1";
-    lx::trace::logger::global().logf(lx::trace::level::info, "t", "on={} off={:d} src={} out={}",
-                                     true, false, none, name);
+    log_t.info("on={} off={:d} src={} out={}", true, false, none, name);
     LUMEN_CHECK(c.lines.size() == 1);
     LUMEN_CHECK(c.lines[0] == "on=1 off=0 src=(null) out=HDMI-A-1");
 }
@@ -62,8 +59,8 @@ LUMEN_TEST(logf_prints_bool_as_digit_and_null_string_as_null) {
 LUMEN_TEST(logf_skips_filtered_levels) {
     capture c;
     sink_guard g{c, lx::trace::level::info};
-    lx::trace::logger::global().logf(lx::trace::level::debug, "t", "hidden {}", 1);
-    lx::trace::logger::global().logf(lx::trace::level::warn, "t", "shown {}", 2);
+    log_t.debug("hidden {}", 1);
+    log_t.warn("shown {}", 2);
     LUMEN_CHECK(c.lines.size() == 1);
     LUMEN_CHECK(c.lines[0] == "shown 2");
 }
@@ -72,7 +69,7 @@ LUMEN_TEST(logf_truncates_long_lines) {
     capture c;
     sink_guard g{c, lx::trace::level::debug};
     const std::string big(3 * lx::trace::logger::k_max_line, 'x');
-    lx::trace::logger::global().logf(lx::trace::level::info, "t", "{}{}", big, "tail");
+    log_t.info("{}{}", big, "tail");
     LUMEN_CHECK(c.lines.size() == 1);
     LUMEN_CHECK(c.lines[0].size() == lx::trace::logger::k_max_line - 1);
     LUMEN_CHECK(c.lines[0].find_first_not_of('x') == std::string::npos);
@@ -88,7 +85,7 @@ void leveled_sink(lx::trace::level lvl, const char* category, const char* messag
     static_cast<leveled*>(user)->lines.emplace_back(lvl, std::string{category} + ": " + message);
 }
 
-constexpr lx::trace::category log_t{"t.cat"};
+constexpr lx::trace::category log_t_cat{"t.cat"};
 
 } // namespace
 
@@ -97,13 +94,13 @@ LUMEN_TEST(category_logs_at_the_method_level_under_its_name) {
     const auto previous = lx::trace::logger::global().min_level();
     lx::trace::logger::global().set_sink(leveled_sink, &c);
     lx::trace::logger::global().set_min_level(lx::trace::level::info);
-    LUMEN_CHECK(!log_t.enabled(lx::trace::level::debug));
-    LUMEN_CHECK(log_t.enabled(lx::trace::level::warn));
-    log_t.debug("hidden {}", 1);
-    log_t.info("plain {{braces}}");
-    log_t.warn("id={} on={}", 7u, true);
-    log_t.log(lx::trace::level::error, "{}", "runtime text");
-    log_t.error(lx::invalid_argument("bad input"));
+    LUMEN_CHECK(!log_t_cat.enabled(lx::trace::level::debug));
+    LUMEN_CHECK(log_t_cat.enabled(lx::trace::level::warn));
+    log_t_cat.debug("hidden {}", 1);
+    log_t_cat.info("plain {{braces}}");
+    log_t_cat.warn("id={} on={}", 7u, true);
+    log_t_cat.log(lx::trace::level::error, "{}", "runtime text");
+    log_t_cat.error(lx::invalid_argument("bad input"));
     lx::trace::logger::global().set_sink(nullptr);
     lx::trace::logger::global().set_min_level(previous);
     LUMEN_CHECK(c.lines.size() == 4);
