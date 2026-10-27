@@ -20,6 +20,16 @@ enum class wayland_err : int {
     dispatch_failed = 2,
     protocol_violation = 3,
     client_disconnected = 4,
+    /// Client side (lx.wayland.client): no compositor at the socket.
+    connect_failed = 5,
+    /// Client side: a global the caller needs (wl_compositor, wl_shm, xdg_wm_base, or the
+    /// one an extension object is made from) is not advertised.
+    missing_global = 6,
+    /// Client side: the connection died (EPIPE, the compositor exited, a protocol error
+    /// ended it); `display::protocol_error()` says which.
+    connection_lost = 7,
+    /// Client side: libwayland could not create a proxy (out of memory).
+    object_failed = 8,
 };
 
 enum class vulkan_err : int {

@@ -1254,8 +1254,14 @@ void lx::compositor::input_router::send_pointer_axis(
         }
 
         if (event.vertical != 0.0) {
+            // Notches: axis_value120 from v8 (which replaces axis_discrete there: "must
+            // not be sent" to a v8 client), axis_discrete for v5–7.
             if (event.vertical_discrete != 0.0 &&
-                version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION) {
+                version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
+                wl_pointer_send_axis_value120(p, WL_POINTER_AXIS_VERTICAL_SCROLL,
+                                              static_cast<int32_t>(event.vertical_discrete * 120.0));
+            } else if (event.vertical_discrete != 0.0 &&
+                       version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION) {
                 wl_pointer_send_axis_discrete(p, WL_POINTER_AXIS_VERTICAL_SCROLL,
                                               static_cast<int32_t>(event.vertical_discrete));
             }
@@ -1263,8 +1269,14 @@ void lx::compositor::input_router::send_pointer_axis(
                                  wl_fixed_from_double(event.vertical));
         }
         if (event.horizontal != 0.0) {
+            // Notches: axis_value120 from v8 (which replaces axis_discrete there: "must
+            // not be sent" to a v8 client), axis_discrete for v5–7.
             if (event.horizontal_discrete != 0.0 &&
-                version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION) {
+                version >= WL_POINTER_AXIS_VALUE120_SINCE_VERSION) {
+                wl_pointer_send_axis_value120(p, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
+                                              static_cast<int32_t>(event.horizontal_discrete * 120.0));
+            } else if (event.horizontal_discrete != 0.0 &&
+                       version >= WL_POINTER_AXIS_DISCRETE_SINCE_VERSION) {
                 wl_pointer_send_axis_discrete(p, WL_POINTER_AXIS_HORIZONTAL_SCROLL,
                                               static_cast<int32_t>(event.horizontal_discrete));
             }

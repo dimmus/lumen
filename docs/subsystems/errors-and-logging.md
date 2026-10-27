@@ -35,7 +35,7 @@ Each subsystem defines an `*_err` enum in `lx.foundation.error`:
 | Enum | Used by |
 |------|---------|
 | `io_err` | `lx.session`, sockets, file I/O |
-| `wayland_err` | `lx.wayland.server`, `lx.wayland.client` |
+| `wayland_err` | `lx.wayland.server` — `bind_failed`, `dispatch_failed`, `protocol_violation`, `client_disconnected`; `lx.wayland.client` — `connect_failed` (no compositor at the socket), `missing_global` (wl_compositor, wl_shm or xdg_wm_base absent, or the global an extension object needs), `connection_lost` (the connection died; `display::protocol_error()` names the interface, object and code, logged once), `object_failed` (libwayland could not make a proxy), and `dispatch_failed` / `protocol_violation` from the read protocol |
 | `vulkan_err` | `lx.gfx` |
 | `drm_err` | `lx.drm` — `open_failed`, `mode_invalid`, `page_flip_failed`, `sync_failed`, `probe_failed` (a connector probe ioctl failed), `no_crtc` (no CRTC or primary plane left for an output), `test_rejected` (the kernel refused a TEST_ONLY of a configuration), `monitor_failed` (the udev hotplug monitor could not be opened), `no_atomic` (the driver refused DRM_CLIENT_CAP_ATOMIC; `no_atomic_hint` says what to do) |
 | `protocol_err` | Wire protocol violations, `zlm_*` |

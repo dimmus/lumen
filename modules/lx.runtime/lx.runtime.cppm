@@ -36,6 +36,10 @@ public:
     /// through `on_readable`, so a source never has to poll for it.
     [[nodiscard]] virtual int poll_fd() const { return -1; }
     virtual void on_readable() {}
+    /// The FD became writable, after `event_loop::set_write_interest(this, true)`: a
+    /// non-blocking writer whose last write hit EAGAIN (a Wayland client's flush) waits for
+    /// room this way instead of spinning or dropping the queue.
+    virtual void on_writable() {}
 };
 
 class timer_source : public event_source {
@@ -116,6 +120,9 @@ public:
     [[nodiscard]] bool post(task cb);
     void add_source(event_source* source);
     void remove_source(event_source* source);
+    /// Also wait for `source`'s FD to become writable (`on_writable`) while `want` holds.
+    /// Level-triggered: a source clears it once its pending write went out.
+    void set_write_interest(event_source* source, bool want);
     /// Wakes a sleeping loop. Thread-safe and async-signal-safe (one eventfd write).
     void wake();
     /// Runs after every iteration that dispatched something — the place to flush what the
@@ -349,7 +356,12 @@ int lx::runtime::event_loop::run() {
                         armed_ns_ = -1; // fired: the next deadline must re-arm it
                     continue;
                 }
-                static_cast<event_source*>(tag)->on_readable();
+                auto* source = static_cast<event_source*>(tag);
+                if (events[i].events & EPOLLOUT)
+                    source->on_writable();
+                // Readable, hung up or in error: the source's read reports which.
+                if (events[i].events & ~static_cast<unsigned>(EPOLLOUT))
+                    source->on_readable();
             }
             if (!running_)
                 break;
@@ -443,6 +455,18 @@ void lx::runtime::event_loop::remove_source(event_source* source) {
             return;
         }
     }
+}
+
+void lx::runtime::event_loop::set_write_interest(event_source* source, bool want) {
+    if (!source || epoll_fd_ < 0)
+        return;
+    const int fd = source->poll_fd();
+    if (fd < 0)
+        return;
+    epoll_event ev{};
+    ev.events = EPOLLIN | (want ? EPOLLOUT : 0u);
+    ev.data.ptr = source;
+    (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_MOD, fd, &ev);
 }
 
 unsigned lx::runtime::event_loop::source_count() const {

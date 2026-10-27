@@ -1159,6 +1159,41 @@ primitives (no close glyph on unhovered tabs, as Zed shows none); the `icons`,
   `compositor.latency: present` lines the way `drag-smoke.sh` does.
 - Gate: G1, G5, G6, G7, G11.
 
+As built (stage 1, `lx.wayland.client`). The stub is replaced by a thin libwayland-client
+wrapper in six partitions (`:types`, `:display`, `:surface`, `:xdg`, `:seat`, `:dmabuf`;
+docs/api/README.md lists them), Platform layer on `lx.foundation` / `lx.runtime` /
+`lx.trace` only, no Wayland type exported. Objects are non-movable RAII (destroy request on
+destruction), listeners are static thunks over the proxy's user data, and every proxy is
+tagged so `surface::from_native` maps a `wl_surface` in an event back to its wrapper only
+when it is one. Globals bind at a capped version (wl_compositor 6, wl_shm 2, xdg_wm_base 7
+required — a missing one fails connect with `wayland_err::missing_global`; wl_seat 10,
+wl_output 4, decoration 2, linux-dmabuf 5, syncobj 1, viewporter 1, fractional-scale 1,
+presentation 2, text-input-v3 2, cursor-shape 2, single-pixel 1, xdg-activation 1,
+xdg-output 3 optional, absent ones named in one start-up line). Pointer events are folded per
+`wl_pointer.frame` (axis_discrete folded into value120), the keymap fd is compiled by
+xkbcommon (MAP_PRIVATE, the v7 rule), configure sequences are latched whole and acked by the
+owner, dmabuf feedback becomes one immutable snapshot per `done` (8 tranches × 512 entries,
+`warn_and_drop` past them; the two blocks swap, nothing is copied), presentation feedback
+keeps 8 slots per surface. `display_source` puts the connection on `lx::runtime::event_loop`
+the way GTK's GSource and calloop's WaylandSource do — prepare_read or dispatch what is queued,
+flush, read or cancel — and on a full socket waits for POLLOUT: the loop gained
+`set_write_interest` / `on_writable` for it (GTK 4 exits on that EAGAIN). New `wayland_err`
+codes `connect_failed`, `missing_global`, `connection_lost`, `object_failed`. The compositor
+now sends `axis_value120` to wl_pointer ≥ 8 instead of `axis_discrete`, which the protocol
+forbids there. Measured (`test_wayland_client`, 42 cases, in-process compositor on a
+1280×800@1.25 virtual output, load 1.2–3.8): connect with three roundtrips 1.6–14 ms; a
+steady frame-callback cycle (request, commit, flush, dispatch) 48–64 µs p50, 300–745 µs p95
+on the client thread, with **0 `operator new`** over 300 frames and libwayland's own 9
+`malloc` / 9 `free` per frame (a `wl_proxy` per callback and a `wl_closure` per message, as
+every libwayland toolkit pays; net 0); an idle connection on the loop wakes it 0 times in
+200 ms with 0 socket reads; a full socket answers `again` after 6 144 requests and drains.
+Under ASan + LSan the test is clean. The headless compositor advertises linux-dmabuf v5 with
+main device 0, a 2-entry table and one tranche, no `wp_linux_drm_syncobj_manager_v1` (no
+DRM device; vmwgfx has no timeline syncobjs either), so explicit sync is untested here.
+Deviation: the shell's hand-written bindings are not moved yet — the wrapper keeps
+`native()` / `native_global()` and a `global_handler` for extension globals (zlm_shell_v1,
+layer-shell) so they can move in Phase 5 with app-smoke as their check.
+
 ### Phase 5 — Adoption and deletion (≈2 weeks) — not started
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;

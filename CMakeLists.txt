@@ -80,8 +80,15 @@ if(TARGET lumen-protocol-glue)
     # Protocol handlers in lx.compositor include generated *-server-protocol.h
     target_include_directories(lx.wayland.server PUBLIC "${LUMEN_GENERATED_DIR}")
 endif()
+# The client side (ADR-010 Phase 4): a thin libwayland-client wrapper over the generated
+# client glue, xkbcommon for keymaps. Platform layer: lx.foundation / lx.runtime only.
 lumen_add_module_library(lx.wayland.client modules/lx.wayland.client
-    DEPENDS lx.runtime lx.wayland.protocols)
+    DEPENDS lx.runtime lx.trace)
+lumen_link_platform_parts(lx.wayland.client wayland_client xkb)
+if(TARGET lumen-protocol-glue AND WAYLAND_CLIENT_FOUND)
+    target_link_libraries(lx.wayland.client PRIVATE lumen-protocol-glue)
+    target_compile_definitions(lx.wayland.client PRIVATE LUMEN_HAS_PROTOCOL_GLUE=1)
+endif()
 
 # ── Graphics & UI ────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.gfx modules/lx.gfx
@@ -129,7 +136,7 @@ lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.ru
 lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
     DEPENDS lx.gfx lx.layout lx.scheduler lx.runtime lx.sync)
-lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.wayland.client lx.layout lx.a11y)
+lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.layout lx.a11y)
 # Compiled themes (ADR-010 §4.8) and bundled Lucide icons (§5.5): found in the build tree, an
 # install relative to the executable, or the configured install (LUMEN_THEME_DIR /
 # LUMEN_ICON_DIR override both). Icons are rasterised by librsvg, dlopen'd on first use as
@@ -171,10 +178,10 @@ lumen_add_module_library(lx.ui.builder modules/lx.ui.builder DEPENDS lx.ui)
 
 # ── Desktop ──────────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.shell.policy modules/lx.shell.policy
-    DEPENDS lx.wayland.client lx.wayland.protocols)
+    DEPENDS lx.foundation lx.wayland.protocols)
 lumen_add_module_library(lx.compositor modules/lx.compositor
     DEPENDS lx.wayland.server lx.gfx lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session lx.health lx.config)
-# lumen-shell talks libwayland-client directly (lx.wayland.client is still a stub): the
+# lumen-shell talks libwayland-client directly (it moves onto lx.wayland.client in Phase 5): the
 # zlm_shell_v1, wlr-layer-shell and cursor-shape client glue comes from lumen-protocol-glue.
 lumen_add_module_library(lx.shell modules/lx.shell
     DEPENDS lx.shell.policy lx.text lx.trace lx.config)
@@ -1111,6 +1118,16 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_window_protocols PRIVATE tests "${LUMEN_GENERATED_DIR}")
     add_test(NAME test_window_protocols COMMAND test_window_protocols)
     set_tests_properties(test_window_protocols PROPERTIES TIMEOUT 60)
+
+    # ADR-010 Phase 4: lx.wayland.client against the in-process compositor (virtual output at
+    # 1.25, a dispatch pump), with an input method on a second connection.
+    add_executable(test_wayland_client tests/test_wayland_client.cpp)
+    target_link_libraries(test_wayland_client PRIVATE lx.compositor lx.wayland.client)
+    lumen_apply_module_properties(test_wayland_client)
+    lumen_link_platform(test_wayland_client)
+    target_include_directories(test_wayland_client PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_wayland_client COMMAND test_wayland_client)
+    set_tests_properties(test_wayland_client PROPERTIES TIMEOUT 60)
 
     # Part C (design-app-compat-capture): pointer constraints, relative pointer, gestures —
     # in-process against a real compositor with injected relative motion and gestures.
