@@ -12,6 +12,7 @@ module;
 
 import lx.foundation;
 import lx.runtime;
+import lx.trace;
 
 export module lx.gfx:ui_gl;
 
@@ -23,6 +24,12 @@ import :damage;
 import :renderer;
 import :gl_renderer;
 import :ui_cpu;
+
+namespace {
+
+constexpr lx::trace::category log_gfx{"gfx"};
+
+} // namespace
 
 export namespace lx::gfx {
 
@@ -529,11 +536,12 @@ constexpr std::uint32_t k_binary_magic = 0x4C474250u; // "PBGL"
     GLint ok = GL_FALSE;
     glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
     if (!ok) {
-        // Kept for whoever debugs a driver: the log goes to stderr once, at start-up.
+        // Kept for whoever debugs a driver: the log is reported once, at start-up.
         char log[2048];
         GLsizei len = 0;
         glGetShaderInfoLog(shader, sizeof log, &len, log);
-        std::fprintf(stderr, "lx.gfx ui_gl: shader compile failed:\n%.*s\n", static_cast<int>(len), log);
+        log_gfx.error("ui_gl: shader compile failed:\n{}",
+                      std::string_view{log, static_cast<std::size_t>(len)});
         glDeleteShader(shader);
         return 0;
     }
@@ -735,8 +743,8 @@ lx::result<void> lx::gfx::ui_gl_renderer::build_program(program_index index) {
             char log[2048];
             GLsizei len = 0;
             glGetProgramInfoLog(prog, sizeof log, &len, log);
-            std::fprintf(stderr, "lx.gfx ui_gl: %s program failed to link:\n%.*s\n", src.name,
-                         static_cast<int>(len), log);
+            log_gfx.error("ui_gl: {} program failed to link:\n{}", src.name,
+                          std::string_view{log, static_cast<std::size_t>(len)});
             glDeleteProgram(prog);
             return lx::make_error(lx::gl_err::program_failed, "ui_gl program failed to link");
         }
