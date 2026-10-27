@@ -129,6 +129,10 @@ Compositor wires this in `compositor::start()` — see `compositor_impl::handle_
 | virtual-keyboard keymaps | one sealed memfd per virtual keyboard whose keymap differs from the seat's (the seat's is shared) | refused (logged, the keyboard keeps its previous keymap): larger than 4 MiB or not compiling |
 | Pending frame callbacks | 512 | answered at once (a dropped callback stalls its client) |
 | Visibility-pass scratch (`scene_graph`) | 4096 node pointers + flags, parallel to the draw list | fixed array, reused per frame |
+| `client_swapchain` images (lx.gfx:swapchain, a client window) | 3 per dma-buf swapchain, 2 per shm one; made on demand at the first acquire that finds none free | `acquire` returns none (the frame waits for a release); never grows |
+| `client_swapchain` images kept across a resize until released | 6 | `warn_and_drop`: the oldest is destroyed early, one `warn` per swapchain (the compositor holds its own reference to the memory) |
+| `client_swapchain` damage history (buffer age) | 4 frames × 16 rects | an older image repaints in full; a 17th rect merges the cheapest pair |
+| `format_choice` modifiers (from a feedback tranche) | 32 | dropped past the cap and counted (`modifiers_dropped`) |
 
 ---
 

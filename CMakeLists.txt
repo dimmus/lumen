@@ -92,7 +92,7 @@ endif()
 
 # ── Graphics & UI ────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.gfx modules/lx.gfx
-    DEPENDS lx.foundation lx.runtime)
+    DEPENDS lx.foundation lx.runtime lx.trace)
 lumen_compile_shaders(lx.gfx
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.vert"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.frag"
@@ -1129,6 +1129,24 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_wayland_client COMMAND test_wayland_client)
     set_tests_properties(test_wayland_client PROPERTIES TIMEOUT 60)
 
+    # ADR-010 Phase 4 stage 2: lx.gfx:swapchain's three tiers against the in-process
+    # compositor — golden frames read back from the compositor's side, buffer age, release,
+    # resize, explicit sync (a fake kernel timeline on GL), allocations and present cost.
+    if(LIBPNG_FOUND)
+        add_executable(test_client_swapchain tests/test_client_swapchain.cpp)
+        target_link_libraries(test_client_swapchain PRIVATE lx.compositor lx.wayland.client
+            lx.ui lx.scene lx.gfx lx.runtime lx.a11y ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_client_swapchain)
+        lumen_link_platform(test_client_swapchain)
+        target_include_directories(test_client_swapchain PRIVATE tests "${LUMEN_GENERATED_DIR}"
+            ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_client_swapchain PRIVATE
+            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui"
+            LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
+        add_test(NAME test_client_swapchain COMMAND test_client_swapchain)
+        set_tests_properties(test_client_swapchain PROPERTIES TIMEOUT 120)
+    endif()
+
     # Part C (design-app-compat-capture): pointer constraints, relative pointer, gestures —
     # in-process against a real compositor with injected relative motion and gestures.
     add_executable(test_pointer_protocols tests/test_pointer_protocols.cpp)
@@ -1342,6 +1360,11 @@ if(LUMEN_BUILD_TESTS)
     endif()
     set_tests_properties(test_health test_session_discovery
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+    if(TARGET test_client_swapchain)
+        # Its Vulkan tier brings up lavapipe: the ICD's teardown needs the Vulkan settings.
+        set_tests_properties(test_client_swapchain PROPERTIES ENVIRONMENT
+            "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    endif()
     if(TARGET test_ui_golden)
         # It brings up a Vulkan device (ui_vk): the ICD's threads and dlclose need the same
         # sanitizer settings as the other Vulkan tests.

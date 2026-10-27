@@ -37,6 +37,10 @@ public:
     shm_pool& operator=(const shm_pool&) = delete;
 
     [[nodiscard]] lx::result<void> create(display& d, std::size_t bytes);
+    /// A pool over memory the caller owns and has mapped (lx.gfx's shm swapchain: its memfd).
+    /// `fd` is borrowed (libwayland dups it on send); `data()` is null and `grow` only sends
+    /// wl_shm_pool.resize. The pool may be destroyed once its buffers exist.
+    [[nodiscard]] lx::result<void> create(display& d, int fd, std::size_t bytes);
     /// Grows the file, the mapping and the pool (wl_shm_pool.resize: never shrinks).
     [[nodiscard]] lx::result<void> grow(std::size_t bytes);
     void destroy();
@@ -50,6 +54,7 @@ private:
     std::byte* data_ = nullptr;
     std::size_t size_ = 0;
     int fd_ = -1;
+    bool external_ = false;
 };
 
 /// A wl_buffer with its release tracked: `busy()` from attach+commit until wl_buffer.release.

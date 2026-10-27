@@ -1194,6 +1194,66 @@ Deviation: the shell's hand-written bindings are not moved yet — the wrapper k
 `native()` / `native_global()` and a `global_handler` for extension globals (zlm_shell_v1,
 layer-shell) so they can move in Phase 5 with app-smoke as their check.
 
+As built (stage 2, the client pixel path: `lx.gfx:swapchain`). The swapchain lives in
+`lx.gfx`, not in `lx.app:swapchain` as §4.13 has it: allocation and the GPU targets are GBM,
+EGL and Vulkan objects, which may not leave `lx.gfx` (AGENTS.md §1.1). Its interface carries
+fds, fourcc, modifiers, dev_t, plane offsets / strides and `void*`; `lx.app` (stage 3) makes
+one wl_buffer per image when `swapchain_listener::on_image_created` says so, through
+`lx.wayland.client`, which `lx.gfx` never imports. `choose_client_format` takes the feedback's
+tranches in the compositor's order (scanout-flagged first when the surface feedback has one,
+the render device's only; XRGB then ARGB for opaque windows, ARGB for translucent ones, 2:10:10:10
+only when asked); `open_render_node` opens the main device's render node through
+`drmGetDeviceFromDevId`. `client_gpu` picks the tier with `present_backend::automatic`'s order
+and refusal rules — Vulkan on a hardware device whose DRM node (VK_EXT_physical_device_drm,
+`choose_physical_device`) is the render node, lavapipe refused before its device is made; else
+GLES 3.1 on GBM through `:gl_renderer`'s `egl_device`, a software `GL_RENDERER` refused; else
+wl_shm + `ui_cpu` — and a compositor that names no main device (the headless one) gets cpu.
+`LUMEN_UI_BACKEND` / `client_gpu_options::force` override it (logged); `allow_software` lets a
+test force lavapipe, labelled software. `client_swapchain` makes images on demand up to three
+(two for shm) — a compositor that releases promptly keeps fewer alive: against the in-process
+compositor the cpu tier never needed a second image and GL / Vulkan two — keeps buffer age per
+image (0 undefined; a four-frame damage history), hands out the free image with the newest
+content, never blocks (`acquire` returns none while every image is with the compositor),
+releases by wl_buffer.release or, with explicit sync, release points (`collect_releases`, an
+eventfd from DRM_IOCTL_SYNCOBJ_EVENTFD for the loop), and on `resize` destroys free images,
+keeps busy ones until released (six, then `warn_and_drop`) and counts one allocation per new
+size. GL: `gbm_bo_create_with_modifiers2` → `…_with_modifiers` → `gbm_bo_create` (logged), the
+EGLImage imported from the bo's own planes (so wrong export metadata fails on our side first),
+renderbuffer + FBO; explicit sync: the frame's native fence imported into the image's DRM
+syncobj at its acquire point (`drm_timeline_ops::import_sync_file`: a temporary syncobj, then a
+transfer; `create` / `handle_to_fd` added for the client's own syncobjs). Timelines are per
+image, not per window, as Mesa's WSI keeps them: the compositor releases in its order, not
+ours, and a timeline point waits for every earlier one. Vulkan: `VK_EXT_image_drm_format_modifier`
+images from the feedback's list filtered by `vkGetPhysicalDeviceImageFormatProperties2`
+(renderable, exportable as dma-buf), foreign-queue ownership barriers recorded once per image
+and submitted around `:ui_vk`'s draw, a timeline semaphore per image exported as an opaque fd
+that must be a DRM syncobj (what the compositor's `drm_timeline_table::import` takes); without
+that, implicit sync done properly: the frame's SYNC_FD into the dma-buf
+(`DMA_BUF_IOCTL_IMPORT_SYNC_FILE`) and the compositor's reads waited by the GPU on the next
+acquire (`EXPORT_SYNC_FILE`), CPU fence wait only as the logged last resort. `gfx::device::create`
+now enables the `timelineSemaphore` feature it advertised (the compositor's timeline pool used
+it without). cpu: one memfd per swapchain size, sealed against shrink and grow, `ui_cpu` drawing
+into the mapping; `lx.wayland.client::shm_pool` gained a borrowed-fd `create`. Measured
+(`test_client_swapchain`, 44 cases, in-process compositor on a 1280×800 virtual output, load
+0.1): three golden frames per tier read back from the compositor's side — the cpu tier through
+an ext-image-copy-capture output capture (max error 0), GL (SVGA3D, gbm path 2, LINEAR, the
+plane fd the compositor registered imported into a GL context of the test's) within 1/255,
+Vulkan (lavapipe, software) within 2/255; ages 0,0,0 then 3 (0,0 then 2 for shm) under
+round-robin release; a busy acquire returns in 0.1 µs; resize and a 30-size storm allocate once
+per size; 0 `operator new` per steady present on every tier (libwayland and the drivers'
+`malloc`s reported: 6 / 17 / 15 per frame for cpu / GL / Vulkan). Per-frame present cost at
+640×480, a 48×48 quad moving (two damage rects plus age): cpu p50 47 µs / p95 627 µs, GL p50
+559 µs / p95 3.8 ms (of which `:ui_gl`'s draw and flush 449 µs, the swapchain 55 µs; SVGA3D's
+submission dominates: on this host the CPU tier is ten times cheaper for small damage), Vulkan
+(lavapipe) p50 1.09 ms. The headless compositor offers linux-dmabuf v5 with main device 0 and
+one tranche (ARGB8888 / XRGB8888, LINEAR) and no syncobj manager; vmwgfx has no syncobjs at
+all and cannot mmap its dma-bufs. So explicit sync is proven against a fake kernel timeline
+(the real native fence, three real sync_files, the image busy until its release point and the
+eventfd waking), the wire half (set_acquire_point / set_release_point) is untested here, and the
+in-process compositor runs without a Vulkan driver in the test (lavapipe cannot import vmwgfx
+buffers; its bookkeeping import registers them as received). Deviation: a 17th damage rect
+merges the cheapest pair (`damage_region`), not the bounding box.
+
 ### Phase 5 — Adoption and deletion (≈2 weeks) — not started
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;

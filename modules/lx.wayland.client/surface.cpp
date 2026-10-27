@@ -121,11 +121,34 @@ lx::result<void> shm_pool::create(display& d, std::size_t bytes) {
     return {};
 }
 
+lx::result<void> shm_pool::create(display& d, int fd, std::size_t bytes) {
+    d.check_affinity();
+    if (pool_)
+        return lx::invalid_argument("lx::wayland::shm_pool::create: already created");
+    auto* shm = static_cast<wl_shm*>(d.native_global(global_kind::shm));
+    if (!shm || fd < 0 || bytes == 0 || bytes > static_cast<std::size_t>(INT32_MAX))
+        return lx::invalid_argument("lx::wayland::shm_pool::create: no wl_shm, fd or size");
+    pool_ = wl_shm_create_pool(shm, fd, static_cast<std::int32_t>(bytes));
+    if (!pool_)
+        return lx::make_error(lx::wayland_err::object_failed, "wl_shm.create_pool failed");
+    tag(pool_);
+    size_ = bytes;
+    external_ = true;
+    return {};
+}
+
 lx::result<void> shm_pool::grow(std::size_t bytes) {
     if (!pool_)
         return lx::invalid_argument("lx::wayland::shm_pool::grow: no pool");
     if (bytes <= size_)
         return {};
+    if (external_) {
+        if (bytes > static_cast<std::size_t>(INT32_MAX))
+            return lx::invalid_argument("lx::wayland::shm_pool::grow: size");
+        size_ = bytes;
+        wl_shm_pool_resize(pool_, static_cast<std::int32_t>(bytes));
+        return {};
+    }
     if (bytes > static_cast<std::size_t>(INT32_MAX) || ::ftruncate(fd_, static_cast<off_t>(bytes)) != 0)
         return lx::make_error(lx::wayland_err::object_failed, "growing the shm pool failed");
     void* p = ::mremap(data_, size_, bytes, MREMAP_MAYMOVE);
@@ -148,6 +171,7 @@ void shm_pool::destroy() {
     if (fd_ >= 0)
         ::close(fd_);
     fd_ = -1;
+    external_ = false;
 }
 
 // ── buffer ──
@@ -621,6 +645,9 @@ void surface::on_fractional_scale(std::uint32_t scale120) {
 
 shm_pool::~shm_pool() = default;
 lx::result<void> shm_pool::create(display&, std::size_t) {
+    return lx::not_implemented("lx::wayland::shm_pool::create");
+}
+lx::result<void> shm_pool::create(display&, int, std::size_t) {
     return lx::not_implemented("lx::wayland::shm_pool::create");
 }
 lx::result<void> shm_pool::grow(std::size_t) { return lx::not_implemented("lx::wayland::shm_pool::grow"); }

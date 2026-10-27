@@ -81,6 +81,17 @@ int real_import_sync_file(void* user, unsigned handle, unsigned long long point,
 }
 
 void real_destroy(void* user, unsigned handle) { (void)drmSyncobjDestroy(fd_of(user), handle); }
+
+int real_create(void* user, unsigned* handle) {
+    std::uint32_t h = 0;
+    const int r = drmSyncobjCreate(fd_of(user), 0, &h);
+    *handle = h;
+    return r != 0 ? -errno : 0;
+}
+
+int real_handle_to_fd(void* user, unsigned handle, int* fd) {
+    return drmSyncobjHandleToFD(fd_of(user), handle, fd) != 0 ? -errno : 0;
+}
 #endif
 
 } // namespace
@@ -96,6 +107,8 @@ drm_timeline_ops drm_timeline_ops_for(int drm_fd) {
     ops.signal = &real_signal;
     ops.import_sync_file = &real_import_sync_file;
     ops.destroy = &real_destroy;
+    ops.create = &real_create;
+    ops.handle_to_fd = &real_handle_to_fd;
     ops.user = reinterpret_cast<void*>(static_cast<long>(drm_fd));
 #else
     (void)drm_fd;

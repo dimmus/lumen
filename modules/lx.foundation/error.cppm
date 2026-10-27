@@ -37,6 +37,12 @@ enum class vulkan_err : int {
     device_lost = 1,
     out_of_memory = 2,
     import_failed = 3,
+    /// An image's memory, a semaphore or a fence could not be exported (dma-buf, opaque fd,
+    /// sync_file) — a client swapchain's handover to the compositor.
+    export_failed = 4,
+    /// The device lacks what the caller needs (an extension, a format or modifier, a
+    /// hardware device where a software one was refused).
+    unsupported = 5,
 };
 
 enum class gl_err : int {
@@ -51,6 +57,11 @@ enum class gl_err : int {
     import_failed = 4,
     /// `glGetError` reported a failure during a frame.
     draw_failed = 5,
+    /// The context or driver lacks what the caller needs (GLES 3.1, a software GL_RENDERER
+    /// where hardware is required, no format the compositor offers).
+    unsupported = 6,
+    /// A buffer's dma-buf planes or a frame's native fence could not be exported.
+    export_failed = 7,
 };
 
 enum class drm_err : int {

@@ -30,6 +30,7 @@ export import :atlas;
 export import :ui_cpu;
 export import :ui_gl;
 export import :ui_vk;
+export import :swapchain;
 
 export namespace lx::gfx {
 
@@ -550,8 +551,24 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         qci.queueCount = 1;
         qci.pQueuePriorities = &priority;
 
+        // VK_KHR_timeline_semaphore's semaphores are only valid with its feature enabled
+        // (the timeline pool, a client swapchain's acquire and release points).
+        VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline_features{};
+        timeline_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR;
+        bool timeline_enabled = false;
+        if (has_timeline) {
+            VkPhysicalDeviceFeatures2 features{};
+            features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+            features.pNext = &timeline_features;
+            vkGetPhysicalDeviceFeatures2(phys, &features);
+            timeline_enabled = timeline_features.timelineSemaphore == VK_TRUE;
+            timeline_features.pNext = nullptr;
+        }
+
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+        if (timeline_enabled)
+            dci.pNext = &timeline_features;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
         dci.enabledExtensionCount = enabled;
@@ -578,7 +595,7 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         d.info_.supports_dmabuf_export = true;
         d.info_.supports_drm_format_modifier = has_modifier;
         d.info_.supports_queue_family_foreign = has_foreign;
-        d.info_.supports_timeline_semaphore = has_timeline && has_ext_sem_fd;
+        d.info_.supports_timeline_semaphore = timeline_enabled && has_ext_sem_fd;
         d.info_.supports_external_semaphore_fd = has_ext_sem_fd;
 
         {
