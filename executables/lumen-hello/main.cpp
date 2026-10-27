@@ -2,8 +2,12 @@
 // org.lumen.hello, title "Hello Lumen", built from the §5.6 components (hello_ui.hpp) and
 // drawn with the default pixel tier.
 //
-//   lumen-hello [--backend cpu|gl|vulkan] [--socket NAME] [--theme one-dark|one-light|PATH]
-//               [--exit-after-first-present] [--frames N]
+//   lumen-hello [--backend cpu|gl|vulkan] [--allow-software-gpu] [--socket NAME]
+//               [--theme one-dark|one-light|PATH] [--exit-after-first-present] [--frames N]
+//
+// --allow-software-gpu lets a forced GPU tier run on a software device (lavapipe, llvmpipe),
+// which the automatic choice refuses: for parity and start-up measurements only (§8.3 S10's
+// Vulkan rows on a host without a hardware Vulkan driver).
 //
 // --exit-after-first-present prints the start-up timeline as one line and exits once the
 // first frame is presented (§8.3 S10 parses it; CLOCK_MONOTONIC µs; `exec` is LUMEN_EXEC_NS
@@ -30,6 +34,7 @@ namespace {
 
 struct args {
     lx::gfx::client_tier backend = lx::gfx::client_tier::none;
+    bool allow_software = false;
     const char* socket = nullptr;
     const char* theme = nullptr;
     bool exit_after_first_present = false;
@@ -38,8 +43,8 @@ struct args {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: lumen-hello [--backend cpu|gl|vulkan] [--socket NAME] [--theme NAME|PATH]\n"
-                 "                   [--exit-after-first-present] [--frames N]\n");
+                 "usage: lumen-hello [--backend cpu|gl|vulkan] [--allow-software-gpu] [--socket NAME]\n"
+                 "                   [--theme NAME|PATH] [--exit-after-first-present] [--frames N]\n");
 }
 
 [[nodiscard]] bool parse(int argc, char** argv, args& out) {
@@ -53,6 +58,8 @@ void usage() {
                 std::fprintf(stderr, "lumen-hello: unknown backend '%s'\n", v ? v : "");
                 return false;
             }
+        } else if (a == "--allow-software-gpu") {
+            out.allow_software = true;
         } else if (a == "--socket") {
             out.socket = value();
         } else if (a == "--theme") {
@@ -89,6 +96,7 @@ int main(int argc, char* argv[]) {
     if (!parse(argc, argv, a))
         return 2;
     app.config().backend = a.backend;
+    app.config().allow_software_gpu = a.allow_software;
     app.config().socket = a.socket;
     app.config().theme = a.theme;
     if (auto started = app.start(); !started) {

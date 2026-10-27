@@ -134,7 +134,7 @@ Compositor wires this in `compositor::start()` — see `compositor_impl::handle_
 | `client_swapchain` damage history (buffer age) | 4 frames × 16 rects | an older image repaints in full; a 17th rect merges the cheapest pair |
 | `format_choice` modifiers (from a feedback tranche) | 32 | dropped past the cap and counted (`modifiers_dropped`) |
 | `lx::app::window` wl_buffers (one per swapchain image, live and retired) | 9 (`k_swapchain_images` + `k_swapchain_retired`) | an image without a slot is logged and its frame fails (cannot happen: the swapchain's own caps are the same) |
-| `lx::app::window` frame ring (wp_presentation per committed frame: commit, start, presented time, refresh, sequence, flags, damage rects) | 256 | the oldest overwritten |
+| `lx::app::window` frame ring (per committed frame: commit, start, the UI thread's CPU time, stage times, buffer size, damage rects and px; wp_presentation's presented time, refresh, sequence, flags) | 256 | the oldest overwritten |
 | `lx::app::window` damage per frame (`damage_buffer` rects, the renderer's scissor rects) | 16 (`gfx::damage_region`, from lx.ui's 16-rect ledger) | a 17th rect merges the cheapest pair |
 | `lx::app::input_router` text-input state copy (the surrounding text last sent) | 4 KiB (`k_text_input_bytes`) | the text is cut there, as the protocol bounds it |
 | `lx::app` event sources (display, timerfd, frame source, release eventfd, theme watcher) | the loop's 32 | — (five per application) |

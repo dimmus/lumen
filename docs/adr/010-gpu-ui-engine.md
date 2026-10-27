@@ -3,9 +3,13 @@
 > `lx.text` rewrite with title bars on atlas glyphs (Phase 2), and flex layout, style, the
 > theme compiler, One Dark / One Light, Lucide icons and the §5.6 components with
 > `lumen-ui-gallery` (Phase 3). Gates G3, G4 and G10 pass; G2 is not met on the
-> development host (§7 Phase 3). Phase 4, the client runtime, is under way: `lx.wayland.client`
-> (stage 1), the client swapchain tiers (stage 2) and `lx.app`'s window, input and frame loop
-> with `lumen-hello` on the engine (stage 3) are built; the client-mode bench is next.
+> development host (§7 Phase 3). Phase 4, the client runtime, is done with gates open on this
+> host: `lx.wayland.client`, the client swapchain tiers, `lx.app`'s window, input and frame
+> loop with `lumen-hello` on the engine, and `lumen-ui-bench --client` with
+> `scripts/ui-bench.sh --e2e`. G1 and G5 pass on every tier; G7 passes on cpu and misses its
+> 150 ms cold budget on GL at p95 (p50 135 ms); G11's heap and reallocation rules pass and
+> its frame rule misses from host jitter (a fixed job misses the same way); G6 has a headless
+> proxy that passes, and its real number waits for the KMS run of `--e2e` (§7 Phase 4).
 > `lx.shell` still draws through `shm_canvas` until Phase 5. §2 is the tree as it stood before the
 > work began, §7 the order of work with an "As built" note per finished phase, §8 the
 > measurement that gates each step.
@@ -900,7 +904,9 @@ what the build compiles. The UI thread has one active theme and density; changin
 bumps `theme_generation`, on which `ui_root::tick` describes again, clears every measure cache
 and repaints everything; flex solves take the rem from the active theme (`ui_rem_px`, S2's
 solve costs unchanged). `theme_watcher` (inotify on the file's directory) reloads on the
-worker and applies on UI in every build type; hooking it to a client's event loop is Phase 4.
+worker and applies on UI in every build type; hooking it to a client's event loop is Phase 4
+(done there: `lx::application` watches the theme file on its loop and reloads on its worker,
+on by default in debug builds, `LUMEN_THEME_WATCH` overrides; §7 Phase 4 stage 3).
 
 `lx.ui:style` is the packed `style` with the builder above — 112 B, not ≈96: its 21 lengths
 (sizes, basis, gaps, padding, margin, insets) at 32 bits are 84 B alone; the flex enums pack
@@ -1106,7 +1112,8 @@ Deviations from this phase's plan, across its stages: the `style` is 112 B, not 
 licence) instead of a `one-dark.json` / `one-light.json` pair; icons live in `lx.ui:icon`, not
 `lx.gfx`, with librsvg dlopen'd; the flex engine has no `baseline` alignment and uses
 `aspect-ratio` only to fill a missing side, and grid is later; theme hot reload
-(`theme_watcher`) exists in every build type, its event-loop hook is Phase 4; the old
+(`theme_watcher`) exists in every build type, its event-loop hook is Phase 4 (now `lx.app`'s,
+with the worker that also runs `icon_cache::set_async`'s rasters); the old
 `widget*` focus manager was deleted, not ported (no callers); `text_block_node` does not read
 a style's text fields (the components pass colour and font); `ui_root` gained
 `emit_scope::damage`, which §4.9 did not plan; S2 ignores `--scale` (its sizes come from the
@@ -1147,7 +1154,7 @@ primitives (no close glyph on unhovered tabs, as Zed shows none); the `icons`,
 `components_states`, `components_gallery`, `menu_open`, `tooltip`, `modal`, `toast_stack`,
 `scroll_area` and `text_input` references were rewritten.
 
-### Phase 4 — The client runtime (≈3 weeks) — **next**
+### Phase 4 — The client runtime (≈3 weeks) — **done** (G7 cold on GL and G11's frame rule open on this host; G6 waits for the KMS run)
 
 - `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,
   `zwp_linux_dmabuf_v1` v5 feedback, `wp_linux_drm_syncobj_v1`, `wp_viewporter`,
@@ -1375,6 +1382,122 @@ callback (above); touch is a single pointer; per-surface dma-buf feedback (a sca
 is not used yet, nor is the swapchain re-created when feedback changes; a dma-buf the compositor
 refuses (`failed`) stops the window's drawing with one error rather than falling back to wl_shm.
 
+As built (stage 4: `lumen-ui-bench --client`, the e2e harness, the gates). The client-mode
+scenarios of §8.3 are `tests/bench_ui_client.cpp`, linked into `lumen-ui-bench` and reached with
+`--client` (the headless S1–S4 and their JSON are unchanged; a client record adds
+`"mode": "client"` and `"compositor"`). The orchestrator starts a headless compositor, runs every
+(tier, scenario) as a window in a child process of its own (lx.app's runtime and lx.ui's state are
+per process, and /proc/self/task must count only the window's threads), and S10 starts
+`lumen-hello` itself. The compositor is, by default, this binary in a `--compositor-host` role:
+`lx::compositor::compositor` with exactly what `lumen-compositor SOCK --virtual-outputs 1280x800
+--no-control --ping-timeout 0` configures (default configuration, `LUMEN_CONFIG=0`) under its own
+`run()` — its frame clocks, render thread and CPU composite — plus a command socket on which a
+window asks for injected pointer motion, buttons and keys (posted to the compositor's UI strand
+as a libinput event arrives) and for its toplevel record. `--compositor binary` runs the
+lumen-compositor binary itself, for S1 and S10 only: it takes no injected input or forced resize
+from outside. `compositor::inject_*` now start the frame clock after the event, as
+`input_ready_callback` does after a libinput dispatch: without it an injected resize grab's
+configure waited for the next unrelated tick (3 configures for 10 motions, measured), and with it
+every motion is one configure. Scenarios: S1 an empty window idle for 10 s (context switches over
+every thread from /proc/self/task, loop wakeups, timer expirations, socket reads, frame callbacks
+requested, commits, swapchain presents); S5 lx.ui's 1 000-row `list`, the compositor moving the
+pointer one row per refresh period (600 frames after 120); S7 30 interactive resizes 200 ms apart
+(Super + right drag, the default binding: the compositor's own configure path) of a window of
+wrapped text; S9 a button the pointer crosses every 4th of 125 Hz motions for 3 s, each hover
+transition joined to the first frame the window started after the injection (frames between
+transitions do not exist: a motion that changes no hover state draws nothing) and that frame's
+wp_presentation time; S10 ten `lumen-hello --exit-after-first-present` per tier with an empty and
+with a warm Lumen cache in a private `XDG_CACHE_HOME` (fontconfig's own cache linked in), exec
+stamped right before `execve` (`LUMEN_EXEC_NS`). G5 is counted per thread: `operator new` and
+`malloc` on the window's UI thread over the measured frames, and mallinfo2's in-use bytes
+(arena + mmapped: glibc moves a re-allocated buffer from one to the other) for the process. To
+attribute every number `lx::app::frame_record` gained the frame's stages (input flush, geometry,
+acquire, tick and its describe / reconcile / layout / emit, order, render, present), its UI-thread
+CPU time, buffer size and damage px. The CTest `bench_ui_client` (label `bench`, 6 s) runs S1 and
+S5 on cpu `--short` and fails on G1 or G5; `scripts/ui-bench.sh --client [--backend cpu|gl|vulkan]`
+stores and compares client rows (a stage fails on its p50 +30 % and warns on its p95 +25 %: on this
+VM one frame in twenty is slowed 5–10× by the host, so a client p95 sits on that edge — S5's frame
+p95 is 187 or 540 µs on the same tree). `scripts/ui-bench.sh --e2e` is S9 on the real display the
+way drag-smoke.sh runs: lumen-compositor on the KMS console at `LUMEN_LOG=debug`
+(`--join-seat-session` from SSH), `lumen-ui-bench --client --connect --scenario S9` on it (passive:
+it records its frames), `inject-input.py`'s new `hover` subcommand crossing the button through the
+kernel at 125 Hz, the input watcher (foreign input makes the run INVALID), and one join of the
+injector's records, the window's frames and the compositor's flips and `compositor.latency:
+present` lines (CLOCK_MONOTONIC throughout) — G6 is its median ≤ 1 period + 2 ms. It was not run
+here (it seizes the display); `--dry-run` prints the plan and runs the join on
+`tests/bench/e2e-sample/`, a headless `--record-e2e` run, where it reproduces the bench's own
+input → presented p50 and p95 to the µs and finds every presented time among the compositor's
+flips (CTest `ui_bench_e2e_dry_run`). An lx.app executable now links `--as-needed`: the module
+archives carry the compositor's platform libraries (libinput with libwacom, GLib and Lua, udev,
+libwayland-server), which `lumen-hello` mapped and relocated at every exec — 40 libraries to 30,
+`lumen-hello --help` 9.1 → 6.7 ms, and with it the cpu tier's warm start meets G7.
+
+Tier selection on this host: the headless compositor names no main device, so automatic picks cpu
+and every bench row forces its tier; GL is SVGA3D on /dev/dri/renderD128 (gbm path 2, LINEAR);
+Vulkan is lavapipe only, forced with `allow_software_gpu` and labelled `vulkan-software` (parity,
+never a gate: its G6/G7/G11 verdicts read "software"). The headless compositor offers
+linux-dmabuf v5 (main device 0, one tranche: ARGB8888 / XRGB8888 LINEAR) and no
+`wp_linux_drm_syncobj_manager_v1`, so every tier ran implicit sync: explicit sync on the wire is
+still untested. Its virtual output's flips carry no hw_clock, so it writes no
+`compositor.latency: present` lines: G6's compositor split exists only on KMS.
+
+Gates (load 0.1–0.3, client pinned to CPU 1, compositor to CPU 0; p50 / p95;
+`tests/bench/baseline/iritur-client-cpu.json`, `tests/bench/baseline/iritur-client-gl.json`,
+Vulkan from `tests/bench/results/iritur-client-vulkan/20261027-49e3406-dirty.json`, not a
+baseline):
+
+| Gate | Scenario | cpu | gl (SVGA3D) | vulkan (lavapipe, software) |
+|------|----------|-----|-------------|-----------------------------|
+| G1 | S1, 10 s idle | **pass**: 0 wakeups (1 switch of the UI thread, the measurement's own quit timer), 0 callbacks requested, 0 commits, 0 submits, 0 timer expirations, 0 socket reads | **pass**, same counts | pass, same counts (4 threads) |
+| G5 | S1, S5 (600 hover frames), S9 | **pass**: 0 `operator new`; 20 `malloc` per frame (libwayland), in-use delta 0 B | **pass**: 0; 43 `malloc` per frame (libwayland, Mesa), +64 B | pass: 0; 29 per frame, −16 B |
+| — | S5 hover frame (start → commit; tick, render); damage | 75 / 187 µs (21 / 55, 36 / 98); 1 rect (the two rows, merged), 0 measures, 0 arranges | 428 / 1 571 µs (21 / 122, 323 / 1 233) | 631 / 2 287 µs wall, 96 / 536 µs CPU |
+| G6 (proxy) | S9, headless | **pass**: 9.27 ms = 0.56 periods / 15.9 ms = 0.96, 93 of 93 transitions | **pass**: 8.62 ms = 0.52 / 16.1 ms | 8.80 ms / 16.3 ms |
+| G7 cold | S10, empty cache, exec → presented | **pass**: 40.8 / 44.8 ms (commit 32.3 ms) | **miss on p95**: 135 / 154 ms (commit 133 ms); runs of the same tree gave p95 139–156 ms | software: 156 / 667 ms |
+| G7 warm | S10, warm cache | **pass**: 22.2 / 28.4 ms (commit 12.5 ms) | n/a: no program-binary format on SVGA3D (`GL_NUM_PROGRAM_BINARY_FORMATS` 0); the warm runs reuse only the font matches: 108 / 121 ms | n/a: lavapipe keeps no pipelines in its VkPipelineCache (it writes a truncated header, which ui_vk refuses to store): 134 / 155 ms |
+| G11 | S7, 30 resizes | heap +256 B after the storm, 0 `operator new` during it, 30 reallocations for 30 sizes; frame p50 1.85 ms, max 5.5× it → **"jitter"** | heap +2 288 B, 0 `operator new`, 30 for 30; frame p50 0.87 ms, max 8.3× → **"jitter"** | heap +404 KB, all inside lavapipe / LLVM (heaptrack), 30 for 30 |
+
+G11's frame rule ("no frame > 2× median") is not met on this host and is not claimed: its slow
+frames are slowed in every stage at once (geometry, tick, emit and render each 5–10× on the same
+frame) with the UI thread's CPU time inflated alike — VMware reports no steal — and S7's control, a
+fixed CPU job of the median frame's cost at the same 200 ms cadence on the same CPU, misses the same
+way (max 2.2–8.8× its median), so the bench reports "jitter", which `ui-bench.sh` warns on. GL's
+cold start is CPU-bound (task-clock 112 ms of 128 ms): EGL on GBM 25–33 ms, the frame's two program
+compiles ≈ 60 ms at the first draw (Mesa keeps no shader cache for SVGA3D either), fontconfig's
+cold answers ≈ 25 ms. The headless S1–S4 rows were rerun at load 0.2 and not rebaselined: their p95s
+differ from `iritur-none.json` in both directions while an interleaved A/B against stage 3's binary
+gives the same p50 (S2 tick 91–95 µs, S3 emit 307–320 µs) and p95s that swing 480–550 µs in both.
+
+Stage 2 left open whether small-damage UI should prefer the CPU tier on hosts like this one. The
+client rows answer it in part: a hover frame (two 23 px rows) costs the UI thread 75 µs on cpu and
+428 µs on GL — SVGA3D's submission, not Lumen's encode (tick 21 µs on both) — while a full-window
+repaint at 640–880 px wide (S7) costs 1.85 ms on cpu and 0.87 ms on GL, and on a real display the
+CPU tier's wl_shm buffers cost the compositor an upload per frame (2.7 ms vs 0.1 ms for a
+dma-buf, §1). `automatic` keeps the compositor's order (hardware GL over CPU); a per-frame choice
+by damage size would need both tiers' buffers alive at once and is not taken.
+
+Deviations from Phase 4's plan, across its stages: the shell's hand-written bindings are not moved
+onto `lx.wayland.client` (it keeps `native()` / `native_global()` and a `global_handler` for
+extension globals so they move in Phase 5 with app-smoke as their check); there is no
+`lx.app:swapchain` partition — the swapchain is `lx.gfx:swapchain`, since its GBM, EGL and Vulkan
+objects may not leave lx.gfx; the buffer's age is repaint, not damage; from idle a frame does not
+wait for a frame callback; one window per UI thread; touch is a single pointer; per-surface dma-buf
+feedback (a scanout tranche) is not used and the swapchain is not re-created when feedback
+changes; a refused dma-buf stops the window's drawing with one error rather than falling back to
+`wl_shm`; a 17th damage rect merges the cheapest pair, not the bounding box;
+`lumen-ui-bench --client`'s default compositor is the bench's own host role on lx::compositor, not
+the lumen-compositor binary (which has no way in for injected input or a forced resize; it runs
+S1 and S10); S7's resizes are the compositor's interactive resize driven by injected
+Super + right drag; S9 headless is a proxy for G6, and G6 itself was not measured;
+`lumen-hello` gained `--allow-software-gpu` for S10's software Vulkan rows.
+
+Open: G6 on the KMS display (`scripts/ui-bench.sh --e2e`, built and dry-run only); G7 cold on GL —
+the candidate is compiling the first frame's programs on two threads in a shared context (two
+vCPUs here) and loading the GL and Vulkan libraries only once the tier is chosen; explicit sync
+on the wire (no syncobj manager headless, no timeline syncobjs on vmwgfx); the Vulkan tier on a
+hardware device (node matching, tiled modifiers, a warm pipeline cache: G7 warm can be measured
+there only); G11's frame rule and every client p95 on a host without this VM's jitter; the
+clipboard (`lx::app::clipboard`) is still a no-op.
+
 ### Phase 5 — Adoption and deletion (≈2 weeks) — not started
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;
@@ -1480,7 +1603,11 @@ asserts the `text.contrast` correction keeps the mean stem coverage within 3 %.
   meets that preset's exclude).
 - End-to-end (`--e2e`) reuses `scripts/inject-input.py` and the `--join-seat-session`
   machinery of `drag-smoke.sh`; both processes write Chrome traces on the same
-  `CLOCK_MONOTONIC`, merged into one Perfetto view per run.
+  `CLOCK_MONOTONIC`, merged into one Perfetto view per run. As built (Phase 4): the join is of
+  the injector's records, the window's frame records (`--frames-out`) and the compositor's log
+  lines rather than of traces; `--e2e --dry-run` checks it on a recorded headless sample
+  (`tests/bench/e2e-sample/`). `--client` runs the client rows (`lumen-ui-bench --client`) with
+  their own baselines, `tests/bench/baseline/<host>-client-<tier>.json`.
 
 ### 8.6 Comparison protocol
 

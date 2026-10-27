@@ -67,6 +67,7 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [44-workspace-model.mmd](44-workspace-model.mmd) | Sequence | Workspaces: a binding switches, visibility and focus follow, ext-workspace's diff and done, zlm v7 toplevel_workspace, the shell's indicator activating, hotplug (ADR 011 Part 3) |
 | [45-held-action-sequence.mmd](45-held-action-sequence.mmd) | Sequence | The window switcher's held action: Alt+Tab gives the shell a hold, presses go to it while Alt is down (the application keeps the keyboard), a quick release switches without drawing, Escape / lock cancel |
 | [46-notifications-tray-sequence.mmd](46-notifications-tray-sequence.mmd) | Sequence | Notifications and the tray: names on the user bus, Notify → a popup (or the lock queue, or the history under do-not-disturb), expiry and an action with its activation token, an item registering, its icon, Activate and its dbusmenu menu |
+| [47-client-frame-loop.mmd](47-client-frame-loop.mmd) | Sequence | An lx.app window's frame (ADR-010 §4.9, Phase 4): input coalesced to one hit test, geometry and swapchain resize, acquire and the image's age as repaint, the damage-scoped tick, the tier's draw and present, ack + attach + damage_buffer + syncobj points + frame callback + wp_presentation in one commit, the frame record; the idle rule |
 
 **Narrative architecture doc:** [../architecture.md](../architecture.md)
 

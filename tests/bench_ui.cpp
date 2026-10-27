@@ -1,4 +1,8 @@
-// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phases 0–3.
+// lumen-ui-bench — the UI engine's benchmark harness (ADR-010 §8), Phases 0–4.
+//
+// `--client` (Phase 4, tests/bench_ui_client.cpp) runs the client-mode scenarios S1, S5, S7, S9
+// and S10 as lx.app windows against a headless compositor it starts; everything below is the
+// headless mode, S1–S4 through lx.ui with no compositor, unchanged by it.
 //
 // The scenarios S1–S4 of §8.3 run against lx.ui's declarative core the way an application
 // uses it: descriptors reconciled onto retained nodes by `ui_root::tick`, nodes emitting
@@ -96,22 +100,30 @@ namespace {
 
 std::atomic<std::uint64_t> g_new_calls{0};
 std::atomic<std::uint64_t> g_new_bytes{0};
+/// The calling thread's own count: the client mode (tests/bench_ui_client.cpp) gates G5 on
+/// the UI thread, not on the worker's icon rasters or a driver's threads.
+__attribute__((tls_model("initial-exec"))) thread_local std::uint64_t g_thread_new_calls = 0;
 
 void* counted_alloc(std::size_t n) noexcept {
     g_new_calls.fetch_add(1, std::memory_order_relaxed);
     g_new_bytes.fetch_add(n, std::memory_order_relaxed);
+    ++g_thread_new_calls;
     return std::malloc(n > 0 ? n : 1);
 }
 
 void* counted_aligned_alloc(std::size_t n, std::align_val_t align) noexcept {
     g_new_calls.fetch_add(1, std::memory_order_relaxed);
     g_new_bytes.fetch_add(n, std::memory_order_relaxed);
+    ++g_thread_new_calls;
     const auto a = static_cast<std::size_t>(align);
     const std::size_t rounded = (n + a - 1) / a * a;
     return std::aligned_alloc(a, rounded > 0 ? rounded : a);
 }
 
 } // namespace
+
+/// `operator new` calls made by the calling thread so far (bench_ui_client.cpp).
+std::uint64_t bench_thread_new_calls() noexcept { return g_thread_new_calls; }
 
 void* operator new(std::size_t n) {
     if (void* p = counted_alloc(n))
@@ -2614,7 +2626,8 @@ void usage() {
         "                      [--warmup N] [--period-us US] [--json PATH] [--pin CPU|none]\n"
         "                      [--scale F] [--git SHA] [--preset NAME]\n"
         "                      [--gl-ring persistent|mapped] [--gl-fetch storage|attributes]\n"
-        "                      [--no-reshape] [--no-layout-solve] [--clock-every N]\n",
+        "                      [--no-reshape] [--no-layout-solve] [--clock-every N]\n"
+        "       lumen-ui-bench --client [...]   (S1 S5 S7 S9 S10 against a compositor: --client --help)\n",
         stderr);
 }
 
@@ -2845,7 +2858,13 @@ void* bench_thread(void* raw) {
 
 } // namespace
 
+/// The client mode (tests/bench_ui_client.cpp): `--client` and the roles it spawns.
+int bench_client_main(int argc, char** argv);
+[[nodiscard]] bool bench_client_mode(int argc, char** argv);
+
 int main(int argc, char** argv) {
+    if (bench_client_mode(argc, argv))
+        return bench_client_main(argc, argv);
     options opt{};
     if (!parse(argc, argv, opt))
         return 2;

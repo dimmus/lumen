@@ -117,6 +117,37 @@ struct frame_record {
     std::uint16_t damage_rects = 0;
     bool presented = false;
     bool discarded = false;
+    /// The buffer's size in device px.
+    std::uint16_t width = 0;
+    std::uint16_t height = 0;
+    /// Where the UI thread's time went (ns, §8.1's stages): geometry (a configure's size,
+    /// the scale, a swapchain resize and its new images and wl_buffers); acquire; the root's
+    /// tick and, inside it, describe / reconcile / layout / emit; `batch_for_render`
+    /// (order); the renderer's draw into the image (render: CPU raster, or GL / Vulkan
+    /// record and submit); the swapchain's present (sync export, flush). Commit − start
+    /// minus these is the input flush, the age and the wire requests.
+    /// The pointer motion this frame consumed: its hit test and the hover / leave events
+    /// (`input_router::flush_motion`), before anything else.
+    std::uint32_t input_ns = 0;
+    /// Device px reported as damage (the area of the damage_buffer rects).
+    std::uint32_t damage_px = 0;
+    std::uint32_t geometry_ns = 0;
+    /// The UI thread's CPU time from the frame's start to its commit
+    /// (CLOCK_THREAD_CPUTIME_ID): commit − start much above it is time the thread was not
+    /// running (preempted, or its vCPU descheduled by the host).
+    std::uint32_t cpu_ns = 0;
+    std::uint32_t acquire_ns = 0;
+    std::uint32_t tick_ns = 0;
+    std::uint32_t describe_ns = 0;
+    std::uint32_t reconcile_ns = 0;
+    std::uint32_t layout_ns = 0;
+    std::uint32_t emit_ns = 0;
+    std::uint32_t order_ns = 0;
+    std::uint32_t render_ns = 0;
+    std::uint32_t present_ns = 0;
+    /// Layout work in the tick: measure and arrange calls (`ui_layout_counters`).
+    std::uint32_t measures = 0;
+    std::uint32_t arranges = 0;
 };
 inline constexpr unsigned k_frame_ring = 256;
 
@@ -247,6 +278,8 @@ private:
     [[nodiscard]] buffer_slot* slot_of(std::uint32_t id);
     void collect_releases();
     [[nodiscard]] static std::uint64_t now_ns();
+    /// CLOCK_THREAD_CPUTIME_ID: what a frame cost the UI thread, preemption excluded.
+    [[nodiscard]] static std::uint64_t thread_cpu_ns();
 
     window_host* host_ = nullptr;
     window_options options_{};
@@ -294,6 +327,8 @@ private:
     /// The wp_linux_drm_syncobj_surface_v1 exists (explicit sync settled on).
     bool syncobj_ = false;
     std::uint64_t frame_start_ns_ = 0;
+    std::uint64_t frame_start_cpu_ns_ = 0;
+    std::uint64_t frame_input_ns_ = 0;
 
     frame_record ring_[k_frame_ring]{};
     std::uint64_t ring_next_ = 0;

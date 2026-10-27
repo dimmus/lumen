@@ -2,6 +2,8 @@ module;
 
 // Bodies of lx.app:window: open/close, the pixel path, configure and scale, the frame loop.
 
+#include <time.h>
+
 module lx.app;
 
 import std;
@@ -62,6 +64,13 @@ struct window::frame_source final : public lx::runtime::event_source {
 window::window() = default;
 
 window::~window() { close(); }
+
+std::uint64_t window::thread_cpu_ns() {
+    timespec ts{};
+    ::clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+    return static_cast<std::uint64_t>(ts.tv_sec) * 1'000'000'000ull +
+           static_cast<std::uint64_t>(ts.tv_nsec);
+}
 
 std::uint64_t window::now_ns() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -568,8 +577,10 @@ bool window::frame_due() const {
 void window::run_frame() {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     frame_start_ns_ = now_ns();
+    frame_start_cpu_ns_ = thread_cpu_ns();
     // The frame's one hit test: the latest pointer position.
     input_.flush_motion();
+    frame_input_ns_ = now_ns() - frame_start_ns_;
     if (!configure_pending_ && !scale_pending_ && !continuous_ && !root_->wants_frame())
         return;
     (void)draw();
@@ -598,12 +609,13 @@ void window::restore_damage() {
 bool window::draw() {
     // The first frame's stages, logged once at debug (§8.2 "Start-up": where G7's time goes).
     const bool first = stats_.frames == 0;
-    const std::uint64_t t_begin = first ? now_ns() : 0;
+    const std::uint64_t t_begin = now_ns();
     if (auto g = apply_geometry(); !g) {
         log_window.error(g.get_error());
         broken_ = true;
         return false;
     }
+    const std::uint64_t t_geometry = now_ns();
     auto acquired = swapchain_.acquire();
     if (!acquired) {
         log_window.error(acquired.get_error());
@@ -626,6 +638,7 @@ bool window::draw() {
         else
             log_window.error(e.get_error());
     }
+    const std::uint64_t t_acquired = now_ns();
     atlas_->begin_frame(++atlas_frame_);
 
     // What the image lacks: the damage of the frames since it was last drawn.
@@ -640,7 +653,8 @@ bool window::draw() {
     if (continuous_)
         root_->damage().add(root_->bounds());
 
-    const std::uint64_t t_ticking = first ? now_ns() : 0;
+    const std::uint64_t t_ticking = now_ns();
+    const lx::ui::layout_counters layout_before = lx::ui::ui_layout_counters();
     if (!root_->tick(*draws_)) {
         swapchain_.cancel(image);
         ++stats_.empty_ticks;
@@ -652,7 +666,9 @@ bool window::draw() {
         }
         return false;
     }
+    const std::uint64_t t_ticked = now_ns();
     draws_->batch_for_render();
+    const std::uint64_t t_ordered = now_ns();
 
     // Device damage: what changed (the compositor is told) and what is repainted.
     const lx::rect2i whole{0, 0, buffer_.width, buffer_.height};
@@ -671,7 +687,7 @@ bool window::draw() {
     change.clip(whole);
     repaint.clip(whole);
 
-    const std::uint64_t t_render = first ? now_ns() : 0;
+    const std::uint64_t t_render = now_ns();
     if (auto r = render(image, repaint); !r) {
         log_window.error(r.get_error());
         restore_damage();
@@ -680,6 +696,7 @@ bool window::draw() {
         broken_ = true;
         return false;
     }
+    const std::uint64_t t_rendered = now_ns();
     if (auto p = swapchain_.present(image, change); !p) {
         log_window.error(p.get_error());
         restore_damage();
@@ -688,6 +705,7 @@ bool window::draw() {
         broken_ = true;
         return false;
     }
+    const std::uint64_t t_presented = now_ns();
     buffer_slot* slot = slot_of(image.id);
     if (!slot) {
         log_window.error("swapchain image {} has no wl_buffer", image.id);
@@ -733,7 +751,32 @@ bool window::draw() {
     rec.commit_id = commit_id;
     rec.commit_ns = committed;
     rec.start_ns = frame_start_ns_;
+    rec.cpu_ns = static_cast<std::uint32_t>(
+        std::min<std::uint64_t>(thread_cpu_ns() - frame_start_cpu_ns_, 0xFFFF'FFFFu));
     rec.damage_rects = static_cast<std::uint16_t>(change.count);
+    rec.width = static_cast<std::uint16_t>(buffer_.width);
+    rec.height = static_cast<std::uint16_t>(buffer_.height);
+    {
+        const lx::ui::ui_root::stage_times st = root_->last_stage_times();
+        const auto ns32 = [](std::uint64_t ns) {
+            return static_cast<std::uint32_t>(std::min<std::uint64_t>(ns, 0xFFFF'FFFFu));
+        };
+        const lx::ui::layout_counters& lc = lx::ui::ui_layout_counters();
+        rec.input_ns = ns32(frame_input_ns_);
+        rec.damage_px = static_cast<std::uint32_t>(std::min<std::uint64_t>(change.area(), 0xFFFF'FFFFu));
+        rec.geometry_ns = ns32(t_geometry - t_begin);
+        rec.acquire_ns = ns32(t_acquired - t_geometry);
+        rec.tick_ns = ns32(t_ticked - t_ticking);
+        rec.describe_ns = ns32(st.describe);
+        rec.reconcile_ns = ns32(st.reconcile);
+        rec.layout_ns = ns32(st.layout);
+        rec.emit_ns = ns32(st.emit);
+        rec.order_ns = ns32(t_ordered - t_ticked);
+        rec.render_ns = ns32(t_rendered - t_render);
+        rec.present_ns = ns32(t_presented - t_rendered);
+        rec.measures = static_cast<std::uint32_t>(lc.measures - layout_before.measures);
+        rec.arranges = static_cast<std::uint32_t>(lc.arranges - layout_before.arranges);
+    }
     last_damage_ = change;
     stats_.last_damage_rects = change.count;
     stats_.last_repaint_rects = repaint.count;

@@ -265,6 +265,14 @@ Each app (ADR-010 §4.9–§4.10, Phase 4):
 - Input: `wl_pointer` (frames coalesced, one hit test per frame), `wl_keyboard` through xkb
   with client-side repeat, `zwp_text_input_v3` into the focused field, `wp_cursor_shape_v1`
 
+- Measured as a whole by `lumen-ui-bench --client` (ADR-010 §8.3 S1, S5, S7, S9, S10) against
+  a headless compositor, per tier (ADR-010 §7 Phase 4 "As built", stage 4): an idle window
+  wakes 0 times in 10 s; a hover frame allocates nothing on the UI thread; a resize storm keeps
+  the heap flat and allocates the swapchain once per size
+- An `lx.app` executable links with `--as-needed`: the module archives carry the compositor's
+  platform libraries (libinput, udev, libwayland-server), which a client never calls and would
+  otherwise map and relocate at every exec
+
 Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`. `lx.ui.builder` is kept compiling until
 ADR-010 Phase 5 deletes it; `lx.app` no longer imports it.
 
@@ -1847,7 +1855,9 @@ sequenceDiagram
 ```
 
 `lumen-hello --exit-after-first-present` prints these instants as one line (exec, connect,
-first configure, first commit, first presented; CLOCK_MONOTONIC µs) for ADR-010 §8.3 S10.
+first configure, first commit, first presented; CLOCK_MONOTONIC µs) for ADR-010 §8.3 S10,
+which `lumen-ui-bench --client` runs ten times per tier with an empty and a warm Lumen cache,
+`exec` stamped right before `execve` (`LUMEN_EXEC_NS`).
 
 ### 6.2 UI construction (declarative)
 

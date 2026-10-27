@@ -547,6 +547,17 @@ frame loop's (now, or at the callback it waits for); it never re-arms the timer 
 requested after the last frame's, nothing is submitted, the timerfd is disarmed and the loop
 blocks in `epoll_pwait2` with no timeout. `test_app_window` measures it: 2 s idle, 0 requests,
 0 commits, 0 timer expirations, 0 socket reads, one wakeup (the test's own quit timer).
+`lumen-ui-bench --client --scenario S1` measures it from outside the loop too: over 10 s idle
+the window's process switched once in total over all its threads (the quit timer's wake;
+`/proc/self/task/*/status`), with 0 frame callbacks requested, 0 commits, 0 GPU submits, 0
+timer expirations and 0 socket reads, on the cpu, gl and (lavapipe) vulkan tiers
+(`tests/bench/baseline/iritur-client-{cpu,gl}.json`).
+
+**Frame record.** Every committed frame leaves a `frame_record` in a 256-entry ring: start,
+commit, the UI thread's CPU time over the frame (`CLOCK_THREAD_CPUTIME_ID`), the stages
+(input flush, geometry, acquire, tick and its describe / reconcile / layout / emit, order,
+render, present) and, when wp_presentation answers, the presented time. The bench reads it;
+nothing on the frame path allocates for it.
 
 `event_loop::run` drains a wake token left from before it started (the `quit` that ended a
 previous run), which otherwise cost one spurious wakeup per run.
@@ -568,3 +579,4 @@ On single-core or kiosk targets, compositor may **merge** `ui + render + wayland
 - [22-thread-model.mmd](../uml/22-thread-model.mmd) — thread diagram
 - [24-executor-class.mmd](../uml/24-executor-class.mmd) — class diagram
 - [23-frame-handoff-sequence.mmd](../uml/23-frame-handoff-sequence.mmd) — frame sequence
+- [47-client-frame-loop.mmd](../uml/47-client-frame-loop.mmd) — an lx.app window's frame (client process)

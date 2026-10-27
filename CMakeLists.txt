@@ -224,6 +224,12 @@ endif()
 lumen_add_module_library(lx.app modules/lx.app
     DEPENDS lx.ui lx.scene lx.text lx.gfx lx.wayland.client lx.runtime lx.trace)
 lumen_link_platform_parts(lx.app xkb)
+# An application loads only the shared libraries it calls into: the module archives carry the
+# compositor's platform libraries (libinput and its libwacom / GLib / Lua, udev,
+# libwayland-server, libdisplay-info) as link dependencies, which an lx.app client never
+# references. Every library is mapped and relocated at exec, before main: 40 of them cost a
+# client ≈ 6 ms of its start-up on the development host (ADR-010 §7 Phase 4, S10).
+target_link_options(lx.app INTERFACE "LINKER:--as-needed")
 
 # Platform APIs must link on MODULE libraries (not only executables).
 lumen_link_platform_modules(
@@ -1004,17 +1010,34 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME bench_ui_composite COMMAND bench_ui_composite --frames 60 --warmup 10)
     set_tests_properties(bench_ui_composite PROPERTIES LABELS bench)
 
-    # ADR-010 §8: the UI engine's scenarios S1–S3 through lx.ui, a table and the JSON of
+    # ADR-010 §8: the UI engine's scenarios S1–S4 through lx.ui, a table and the JSON of
     # §8.5. scripts/ui-bench.sh drives it and keeps the baseline; here it only has to run.
     # Benches carry the `bench` label: the test presets exclude it, `ctest --preset bench` runs
     # them (a plain `-L bench` on top of another preset still meets its exclude).
-    add_executable(lumen-ui-bench tests/bench_ui.cpp)
-    target_link_libraries(lumen-ui-bench PRIVATE lx.ui lx.scene lx.gfx lx.runtime lx.trace)
+    # `--client` (tests/bench_ui_client.cpp, Phase 4) runs S1, S5, S7, S9 and S10 as lx.app
+    # windows against a headless compositor it starts (lx.compositor, in a child process) and
+    # starts lumen-hello for S10.
+    add_executable(lumen-ui-bench tests/bench_ui.cpp tests/bench_ui_client.cpp)
+    target_link_libraries(lumen-ui-bench PRIVATE lx.app lx.compositor lx.input lx.ui lx.scene
+        lx.gfx lx.runtime lx.trace)
     lumen_apply_module_properties(lumen-ui-bench)
     lumen_link_platform(lumen-ui-bench)
     target_include_directories(lumen-ui-bench PRIVATE tests)
+    add_dependencies(lumen-ui-bench lumen-hello)
     add_test(NAME bench_ui COMMAND lumen-ui-bench --scenario all --frames 120 --warmup 30)
     set_tests_properties(bench_ui PROPERTIES LABELS bench TIMEOUT 300)
+    # The client mode's short run: an idle window (G1) and the hover list (G5) on the CPU tier
+    # against the headless compositor; the exit status fails on either gate.
+    add_test(NAME bench_ui_client COMMAND lumen-ui-bench --client --short --scenario S1,S5
+        --tier cpu --gate G1,G5)
+    set_tests_properties(bench_ui_client PROPERTIES LABELS bench TIMEOUT 120)
+    # scripts/ui-bench.sh --e2e joins injector, window and compositor logs on the real display;
+    # its dry run prints the plan and checks the join on a recorded headless run
+    # (tests/bench/e2e-sample) against the numbers lumen-ui-bench computed for it.
+    add_test(NAME ui_bench_e2e_dry_run
+        COMMAND "${CMAKE_SOURCE_DIR}/scripts/ui-bench.sh" --e2e --dry-run --no-build)
+    set_tests_properties(ui_bench_e2e_dry_run PROPERTIES TIMEOUT 30
+        ENVIRONMENT "LUMEN_BUILD_DIR=${CMAKE_BINARY_DIR}")
 
     add_executable(test_headless_golden tests/test_headless_golden.cpp)
     target_link_libraries(test_headless_golden PRIVATE lx.gfx)

@@ -503,8 +503,8 @@ callers compile. It is superseded and should not gain new widgets:
 
 Still to build:
 
-- Driving `ime_target` from `zwp_text_input_v3` and the clipboard from `wl_data_device`
-  (ADR-010 Phase 4)
+- The clipboard from `wl_data_device` (`lx::app::clipboard` is still a no-op);
+  `ime_target` is driven from `zwp_text_input_v3` by `lx.app:input` (§11)
 - Grid containers (flex is `lx.ui:flex`, which reads `grow_node::grow_factor()`)
 - Feeding merged damage into `kms_damage_region`
 - A design-system layer (shell chrome: scaffold, rows, toolbars) as a separate module
@@ -562,3 +562,89 @@ given.
 | Status bar | `p(Base04)` around default buttons (30 px), `status_bar.background` | 30 px | yes |
 | Panel toolbar | `py(Base06)` around a `min_h_8` (32 px) row, 1 px rule below: 45 px, `toolbar.background` | 45 px | yes |
 | Focus ring | per component (some draw `border.focused`, many draw nothing) | a 1 px `border.focused` ring on every focusable control (focus-visible only) | no — deliberate (keyboard use is visible everywhere) |
+
+---
+
+## 11. The client runtime (`lx.app`, ADR-010 Phase 4)
+
+What turns a `ui_root` into a window on screen. One process, one UI thread running one
+`lx::runtime::event_loop`, one worker thread; a window per UI thread (lx.ui's ledger, overlays,
+timers and device scale are the thread's). threading.md "Client process" has the thread table,
+[UML 47](../uml/47-client-frame-loop.mmd) the frame.
+
+**Connection** (`lx.wayland.client`). A thin libwayland-client wrapper, no Wayland type
+exported. Globals bind at capped versions (wl_compositor 6, xdg_wm_base 7, linux-dmabuf 5,
+syncobj 1, fractional-scale 1, viewporter 1, presentation 2, text-input-v3 2, cursor-shape 2, …);
+a missing required one fails `connect` with `wayland_err::missing_global`. `display_source`
+puts the socket on the loop as GTK's GSource and calloop's WaylandSource do — prepare_read or
+dispatch what is queued, flush, read or cancel — and waits for POLLOUT on a full socket instead
+of failing (GTK 4 exits on that EAGAIN). Pointer events are folded per `wl_pointer.frame`;
+dma-buf feedback becomes one immutable snapshot per `done`.
+
+**Pixel path** (`lx.gfx:swapchain`, ADR-010 §4.10). `client_gpu` picks the tier the way the
+compositor picks its own: Vulkan on a hardware device whose DRM node is the compositor's main
+device, else GLES 3.1 on GBM (a software `GL_RENDERER` refused), else `wl_shm` + `ui_cpu`;
+`LUMEN_UI_BACKEND` / `settings::backend` force one, `allow_software_gpu` lets a test run
+lavapipe (labelled software). A compositor that names no main device (the headless one) gets
+cpu. `client_swapchain` makes up to three images (two for shm) on demand, keeps buffer age per
+image, never blocks in `acquire`, and releases by `wl_buffer.release` or, under explicit sync,
+by release points on per-image DRM timelines (an eventfd on the loop). `lx.app` makes one
+wl_buffer per image (dma-buf with the image's modifier, or shm over its memfd) in
+`swapchain_listener`. No Vulkan, EGL or GBM type crosses into `lx.app`.
+
+**Frame loop** (§4.9 with two measured refinements). From idle a frame is drawn in the
+iteration that raised it — no frame-callback round trip (Chromium's and GTK's choice: input on an
+idle window reaches the next refresh); every drawn commit requests the next callback, which is
+the throttle. The image's age enters as *repaint* (`ui_root::add_repaint`: emitted and
+scissored) but not as *damage*, so `damage_buffer` reports only what changed and the
+compositor's KMS damage stays exact. A configure is answered at once and acked right before the
+commit that has its size (frame-perfect). The ledger is cleared only by a successful commit.
+Each frame leaves a `frame_record` (stages in ns, the UI thread's CPU time, damage, and the
+wp_presentation time when it comes back).
+
+**Input** (`lx.app:input`). One hit test per frame over the latest pointer position (or before a
+button, axis or key); the cursor shape from the hovered node through `wp_cursor_shape_v1`, sent
+on change; `wl_keyboard` through xkb with repeat on the loop's timerfd; `zwp_text_input_v3`
+into the focused field's `ime_target`, state sent on change, `done` serials checked.
+
+**Idle rule** (G1). Nothing in the ledger, nothing animating, no UI timer ahead, no key held:
+no frame callback requested, no submit, the timerfd disarmed, `epoll` blocks with no timeout.
+
+**Allocation** (G5). A steady frame calls `operator new` 0 times on the UI thread on every tier;
+libwayland allocates a `wl_proxy` per callback and a closure per message (≈ 20 `malloc`s per
+hover frame on cpu, ≈ 43 with Mesa on gl), freed in the same frame (net 0 B; mallinfo2's
+in-use delta over 600 frames 0 B on cpu, +64 B on gl).
+
+**Measured** (`lumen-ui-bench --client`, a headless compositor on a 1280 × 800 60 Hz virtual
+output, client pinned to CPU 1 and compositor to CPU 0, load 0.1–0.3;
+`tests/bench/baseline/iritur-client-cpu.json`, `…-client-gl.json`; µs p50 / p95):
+
+| Scenario | cpu | gl (SVGA3D) | Gate |
+|----------|-----|-------------|------|
+| S1 idle 10 s: context switches, all threads | 0 (+1, the quit timer) | 0 (+1) | G1 pass |
+| S5 hover frame, start → commit | 75 / 187 | 428 / 1 571 | — |
+| S5 of which tick / render | 21 / 55, 36 / 98 | 21 / 122, 323 / 1 233 | — |
+| S5 damage, layout calls per frame | 1 rect (two rows merged), 0 measures | same | ≤ 2 rects pass |
+| S5 / S9 `operator new` per steady frame | 0 | 0 | G5 pass |
+| S7 30 resizes: sizes, reallocations, heap after | 30, 30, +256 B | 30, 30, +2 288 B | G11 "jitter" (below) |
+| S7 resize frame | 1 854 / 3 775 | 874 / 1 688 | — |
+| S9 input → presented (headless proxy) | 9.27 ms (0.56 periods) / 15.9 ms | 8.62 ms (0.52) / 16.1 ms | G6 proxy pass |
+| S10 exec → first presented, empty cache | 40.8 / 44.8 ms | 135 / 154 ms | G7 cold: pass / **miss on p95** |
+| S10 exec → first presented, warm cache | 22.2 / 28.4 ms | 108 / 121 ms (no program binaries) | G7 warm: pass / n/a |
+
+G11's frame rule (no frame over 2× the median) misses on this VM from the host: the slow frames
+are slowed uniformly in every stage, the UI thread's CPU time included, and a fixed CPU job at the
+same cadence on the same CPU misses the same way (S7's control: max 2.2–8.8× its median) — the
+bench reports that as "jitter", which is not a pass. GL start-up is CPU-bound (task-clock 112 ms of
+128 ms): EGL on GBM 25–33 ms and the frame's two program compiles ≈ 60 ms at the first draw, with
+no program-binary format on SVGA3D.
+
+How this compares (ADR-010 §6): GTK 4's frame clock shares the two loop rules — a frame from
+idle without waiting for a callback, the callback as the throttle — and folds `wl_pointer`
+frames; GPUI's Linux backend (Blade, Vulkan only) redraws the whole window each frame it draws;
+winit and smithay-client-toolkit leave rendering and damage to the application (a wgpu surface
+presents whole frames); Chromium's Ozone/Wayland uses the same callback throttle and
+per-frame wp_presentation feedback, and its LatencyInfo is the model for the frame record. Lumen
+adds a buffer age kept out of the reported damage, a measured idle of 0 wakeups over 10 s
+across every thread, a steady frame with no `operator new` (gated in CTest:
+`bench_ui_client`), and start-up measured from a stamp taken right before `execve`.

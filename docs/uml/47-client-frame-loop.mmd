@@ -1,0 +1,26 @@
+sequenceDiagram
+    participant C as lumen-compositor
+    participant D as lx.wayland.client (display_source)
+    participant W as lx.app::window (frame source)
+    participant R as lx.ui::ui_root
+    participant S as lx.gfx client_swapchain (cpu / gl / vulkan)
+    Note over D,S: one UI thread, one lx::runtime::event_loop (ADR-010 §4.9, §4.12; Phase 4)
+    C->>D: wl_pointer motion + frame (or a key, a text-input done, a configure)
+    D->>W: input_router keeps the latest position (no hit test yet)
+    Note over W: due now: work in the ledger and no frame callback outstanding<br/>(from idle the frame is drawn in this iteration, no round trip)
+    W->>R: flush_motion: one hit test, pointer_move → hover → ledger
+    W->>W: geometry: a pending configure's size, the preferred scale, swapchain resize
+    W->>S: acquire (none free: wait for a release, draw once; never blocks)
+    S-->>W: image + its age → ui_root::add_repaint (repaint, not damage)
+    W->>R: tick (emit_scope::damage): describe · reconcile · layout · emit
+    W->>W: draw_list::batch_for_render (order)
+    W->>S: ui_cpu / ui_gl / ui_vk draw, scissored per repaint rect
+    W->>S: present(image, damage): native fence / sync_file, or none on shm
+    W->>C: ack_configure (if this frame answers one), attach, damage_buffer × ≤ 16
+    W->>C: syncobj acquire/release points (explicit sync), frame callback, wp_presentation
+    W->>C: wl_surface.commit — the ledger is cleared only now
+    W->>W: frame_record: start, commit, per-stage ns, thread CPU ns, damage
+    C-->>D: wl_callback.done — work left: draw again; none: request nothing more
+    C-->>D: wp_presentation.presented (time, refresh, sequence) → frame_record
+    C-->>D: wl_buffer.release (or the release point signals the swapchain's eventfd)
+    Note over W: idle (G1): no ledger entry, no animation, no timer, no key held →<br/>no callback requested, nothing submitted, timerfd disarmed, epoll blocks with no timeout

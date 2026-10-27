@@ -38,6 +38,8 @@ compositor's debug log, which uses the same clock.
     sudo python3 -I scripts/inject-input.py key KEY_LEFTCTRL+KEY_LEFTSHIFT+KEY_C tap
     sudo python3 -I scripts/inject-input.py type lumen-1
     sudo python3 -I scripts/inject-input.py rel 10 -5 --count 20 --interval-ms 8   # mouse deltas
+    sudo python3 -I scripts/inject-input.py --output 1918x928 hover 960 480 880 480 --hz 125 \
+        --duration-s 3 --toggle-every 4      # across a button's edge: ui-bench.sh --e2e (S9)
     sudo python3 -I scripts/inject-input.py watch > seen.jsonl     # until SIGTERM
 
 `watch` records every input frame the kernel delivers on every /dev/input/event* node,
@@ -192,7 +194,7 @@ class Injector:
         sys.stdout.write(json.dumps(fields, separators=(",", ":")) + "\n")
         sys.stdout.flush()
 
-    def move(self, x, y, phase="move"):
+    def move(self, x, y, phase="move", **extra):
         if self.output is None:
             sys.exit("inject-input: the output size is unknown; pass --output WxH or "
                      "--compositor-log")
@@ -204,7 +206,7 @@ class Injector:
         t = now_us()
         os.write(self.pointer(), data)
         # The raw values written, so a watcher can tell these frames from foreign ones.
-        self.record("motion", t, x=round(x, 2), y=round(y, 2), phase=phase, ax=ax, ay=ay)
+        self.record("motion", t, x=round(x, 2), y=round(y, 2), phase=phase, ax=ax, ay=ay, **extra)
 
     def rel(self, dx, dy):
         """One relative motion frame (REL_X/REL_Y): what libinput reports as a mouse's motion,
@@ -425,6 +427,25 @@ def run_drag(inj, a):
             inj.key(KEYS[MODIFIERS[name]], False)
 
 
+def run_hover(inj, a):
+    """Motions at --hz for --duration-s (or --count of them), --toggle-every in a row on one
+    side of a button's edge and then on the other: OUT (x_out, y_out) first, then IN
+    (x_in, y_in), each a pixel right of the one before so every write is a real motion. Each
+    record carries `inside`, so a reader finds the hover transitions without the geometry
+    (ADR-010 §8.3 S9; lumen-ui-bench --client records its headless runs the same way)."""
+    period_ns = int(1e9 / a.hz)
+    count = a.count if a.count > 0 else max(1, int(round(a.duration_s * a.hz)))
+    toggle = max(1, a.toggle_every)
+    start = time.clock_gettime_ns(time.CLOCK_MONOTONIC) + 10_000_000
+    for i in range(count):
+        sleep_until(start + i * period_ns)
+        inside = (i // toggle) % 2 == 1
+        jitter = float(i % toggle)
+        x = (a.x_in if inside else a.x_out) + jitter
+        y = a.y_in if inside else a.y_out
+        inj.move(x, y, "hover", inside=inside)
+
+
 def run_watch():
     """Record every frame on every event node until SIGTERM/SIGINT."""
     fds = {}
@@ -544,6 +565,16 @@ def main():
     s.add_argument("--count", type=int, default=1, help="frames of this many notches")
     s.add_argument("--interval-ms", type=float, default=30.0, help="time between frames")
 
+    s = sub.add_parser("hover", help="motions across a button's edge at a fixed rate "
+                                     "(records carry `inside`)")
+    for name in ("x_in", "y_in", "x_out", "y_out"):
+        s.add_argument(name, type=float)
+    s.add_argument("--hz", type=float, default=125.0, help="motion rate")
+    s.add_argument("--duration-s", type=float, default=3.0)
+    s.add_argument("--count", type=int, default=0, help="motions (overrides --duration-s)")
+    s.add_argument("--toggle-every", type=int, default=4,
+                   help="motions on one side of the edge before crossing it")
+
     sub.add_parser("watch", help="record every frame on every event node until SIGTERM")
 
     a = p.parse_args()
@@ -569,6 +600,8 @@ def main():
             inj.move(a.x, a.y)
         elif a.cmd == "drag":
             run_drag(inj, a)
+        elif a.cmd == "hover":
+            run_hover(inj, a)
         elif a.cmd == "button":
             if a.action == "dblclick":
                 # Two clicks 170 ms apart: inside every toolkit's double-click time (GTK and
