@@ -298,6 +298,11 @@ int lx::runtime::event_loop::run() {
     if (quit_pending_.exchange(false))
         running_ = false;
     if (epoll_fd_ >= 0 && wake_fd_ >= 0 && (pwait2_ || timer_fd_ >= 0)) {
+        // A wake left from before this run — the `quit` that ended the previous one, a post
+        // while nothing ran — is answered by the drains at the top of the first iteration;
+        // left in the eventfd it would only cost a spurious wakeup.
+        unsigned long long stale = 0;
+        (void)!::read(wake_fd_, &stale, sizeof(stale));
         // A timeout's expiry is subject to the thread's timer slack (50 µs by default; an
         // absolute timerfd had none). The frame clock is a deadline, so keep it tight.
         if (pwait2_)

@@ -519,6 +519,38 @@ validated, kept ≤ 96², ≤ 4 body lines of ≤ 8 KiB markup) — never per fr
 lumen-compositor [socket-name] [-f fps] [--scale S] [--session] [--no-control]
 ```
 
+## Client process: lx.app (ADR-010 Phase 4)
+
+An application built on `lx.app` has one **UI thread** and one **worker thread**; there is no
+render thread in a client (ADR-010 §4.12: one window, one queue — a render thread is not
+justified until a submit costs more than 300 µs).
+
+| Thread | Runs | Wakes on |
+|--------|------|----------|
+| UI (`main`) | `lx::runtime::event_loop`: the display (`wayland::display_source`: prepare_read, flush, read or cancel), each window's frame source, describe / reconcile / layout / emit, record + submit on the window's tier (`ui_cpu` / `ui_gl` / `ui_vk`), commit | the display fd, one timerfd, the swapchain's release eventfd (explicit sync), the theme file's inotify fd (hot reload), the UI strand's eventfd |
+| worker (`lx-app-worker`) | `executor::global()`'s worker strand: icon rasters (`icon_cache::set_async`), theme reloads (`theme_watcher`), large-text shaping | the strand's waker (a condition variable); never on a period |
+
+**Frame loop** (§4.9). An event or a reducer leaves work in lx.ui's ledger; the window's
+frame source (an `event_source` with no fd, due when a frame should be drawn now) sees it in
+the same loop iteration. With no frame callback outstanding the frame is drawn at once; with
+one outstanding it waits for it — every drawn commit requests the next callback, which is the
+throttle. A configure or a preferred-scale change is answered at once. Pointer motion is
+coalesced: only the latest position is kept and hit-tested, once per frame, or before a
+button, axis or key.
+
+**Timer.** One timerfd, armed after each loop iteration at the earliest deadline anything
+needs — a held key's repeat (`wl_keyboard.repeat_info`), a UI timer still ahead (a tooltip's
+hover delay, a caret's blink) — and disarmed when nothing does. A UI timer already due is the
+frame loop's (now, or at the callback it waits for); it never re-arms the timer for the past.
+
+**Idle (G1).** No ledger entry, no animation, no timer, no key held: no frame callback is
+requested after the last frame's, nothing is submitted, the timerfd is disarmed and the loop
+blocks in `epoll_pwait2` with no timeout. `test_app_window` measures it: 2 s idle, 0 requests,
+0 commits, 0 timer expirations, 0 socket reads, one wakeup (the test's own quit timer).
+
+`event_loop::run` drains a wake token left from before it started (the `quit` that ended a
+previous run), which otherwise cost one spurious wakeup per run.
+
 ## Process-level vs thread-level
 
 | Level | Model |

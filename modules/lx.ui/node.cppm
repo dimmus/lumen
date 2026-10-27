@@ -147,14 +147,45 @@ struct shadow_style {
     bool inset = false;
 };
 
+// ── Device scale (ADR-010 §4.10) ──
+//
+// The UI lays out in logical pixels; a window on a 1.25 output renders into a buffer of
+// ceil(logical × 1.25) device pixels and `draw_scope` projects every primitive once, at
+// emission, as `scene::output_projection` does for the compositor's outputs. Each edge is
+// rounded to the nearest device pixel on its own, so two rects sharing a logical edge share
+// the device edge and the projection of an intersection is the intersection of the
+// projections. Lengths that are not edges scale exactly (radii, blur, spread), except border
+// widths, which snap to whole device pixels (at least 1) as Chromium and Firefox draw them:
+// a 1 px border stays one crisp device pixel at 1.25 instead of a 1.25 px smear. Text and
+// icons rasterise at device resolution and place their pixels in device space themselves
+// (`draw_scope::device_*`), so a glyph samples its tile 1:1 at any scale.
+
+/// The device scale the UI thread lays out and emits for (device px per logical px): what
+/// text and icons rasterise at. `ui_root::tick` sets it from the root's scale; 1 otherwise.
+/// UI affinity.
+[[nodiscard]] float ui_device_scale();
+void set_ui_device_scale(float scale);
+/// A logical coordinate in device pixels (nearest, halves up).
+[[nodiscard]] int project_coord(int v, float scale);
+/// A logical rect in device pixels, edge by edge (`project_coord`).
+[[nodiscard]] lx::rect2i project_rect(lx::rect2i r, float scale);
+/// The smallest logical rect whose projection covers device rect `r` (outward): how buffer
+/// damage enters the logical ledger.
+[[nodiscard]] lx::rect2i unproject_rect(lx::rect2i r, float scale);
+
 /// Draw-emission target. Nodes append `scene::draw_command`s (textured or solid surface
 /// draws) and ADR-010 primitives; they never rasterize. The clip/opacity/origin stack is
 /// applied on the way in so children cannot escape their parent's bounds: every emitter
 /// offsets by the origin, drops what the clip hides, writes the clip as the content mask,
 /// multiplies colours by the opacity and takes its order from the list's overlap grid.
+///
+/// Rects in, the clip and the origin are logical; at `scale` ≠ 1 every emitter projects to
+/// device pixels on the way out (the list, its grid and the instances are device pixels).
+/// The `device_*` emitters take device rects already offset (`device_rect`) for nodes that
+/// place their own pixels: glyph runs and icon rasters.
 class draw_scope {
 public:
-    draw_scope(lx::scene::draw_list& out, lx::rect2i clip);
+    draw_scope(lx::scene::draw_list& out, lx::rect2i clip, float scale = 1.f);
 
     void push_clip(lx::rect2i clip);
     /// `push_clip` of a rect in the node's layout space: offset by the origin first. A node
@@ -216,20 +247,47 @@ public:
     /// The offset every emitter adds to its bounds (the sum of `push_origin`s).
     [[nodiscard]] lx::point2i origin() const;
 
+    // ── Device space ──
+
+    /// Device px per logical px (1: the two are the same).
+    [[nodiscard]] float scale() const { return scale_; }
+    /// `local` offset by the origin and projected: where the scope draws it, device px.
+    [[nodiscard]] lx::rect2i device_rect(lx::rect2i local) const;
+    /// The clip in device px.
+    [[nodiscard]] lx::rect2i device_clip() const { return top().dclip; }
+    /// `device` (device px) misses the clip.
+    [[nodiscard]] bool device_culled(lx::rect2i device) const;
+    /// `sprite` over a device rect (a raster placed 1:1: an icon), identity params.
+    void device_sprite(lx::gfx::primitive_kind kind, std::uint8_t page, lx::rect2i device,
+                       lx::gfx::sprite_uv uv, lx::color color);
+    /// `group_order` over a device rect.
+    [[nodiscard]] std::uint32_t device_group_order(lx::rect2i device, std::uint32_t at_least = 0);
+    /// `glyph` (with an order) over a device rect.
+    void device_glyph(lx::gfx::primitive_kind kind, std::uint8_t page, lx::rect2i device,
+                      lx::gfx::sprite_uv uv, lx::gfx::packed_rgba color, std::uint32_t order);
+    /// `underline` over a device rect, `thickness` in device px.
+    void device_underline(lx::rect2i device, lx::color color, float thickness, bool wavy = false);
+
 private:
     struct frame {
-        lx::rect2i clip{};
+        /// The clip projected: what visibility is tested against and instances carry. First,
+        /// with the other fields every emitter reads, as the unscaled frame had them.
+        lx::rect2i dclip{};
         float opacity = 1.f;
         lx::point2i origin{};
-        /// `clip` as an instance writes it (x, y, w, h floats): converted once per push,
+        /// `dclip` as an instance writes it (x, y, w, h floats): converted once per push,
         /// not once per primitive.
         float clip_f[4]{};
+        /// Logical (what `clip()` answers and `culled` tests).
+        lx::rect2i clip{};
     };
 
     void push_frame(frame f);
-    /// Offsets `bounds` by the origin into `placed` and clips it into `visible`; false when
-    /// nothing of it is visible.
-    [[nodiscard]] bool place(lx::rect2i bounds, lx::rect2i& placed, lx::rect2i& visible) const;
+    /// Offsets `bounds` by the origin into `placed` (projected at a scale) and clips it into
+    /// `visible`; false when nothing of it is visible. Always inlined: it is every emitter's
+    /// first step (S3 measured the call at +12 % of its emit).
+    [[nodiscard]] [[gnu::always_inline]] bool place(lx::rect2i bounds, lx::rect2i& placed,
+                                                    lx::rect2i& visible) const;
     /// `glyph`'s common tail, `placed` and `visible` from `place`.
     void emit_glyph(lx::gfx::primitive_kind kind, std::uint8_t page, lx::rect2i placed,
                     lx::rect2i visible, lx::gfx::sprite_uv uv, lx::gfx::packed_rgba color,
@@ -237,8 +295,19 @@ private:
     /// `quad`'s common tail: `colour_scale` multiplies the packed colours (1: as they are).
     void emit_quad(lx::rect2i placed, lx::rect2i visible, const packed_quad_style& style,
                    float colour_scale);
+    /// `quad(bounds, packed)` at a device scale (out of line: the unscaled path stays lean).
+    [[gnu::noinline]] void quad_scaled(lx::rect2i bounds, const packed_quad_style& style);
+    /// `emit_quad` at a device scale: the radii and border widths projected first.
+    [[gnu::noinline]] void emit_quad_scaled(lx::rect2i placed, lx::rect2i visible,
+                                            const packed_quad_style& style, float colour_scale);
     [[nodiscard]] frame& top();
     [[nodiscard]] const frame& top() const;
+    /// `r` (logical, origin applied) in device px: `r` itself at scale 1.
+    [[nodiscard]] lx::rect2i to_device(lx::rect2i r) const {
+        return scaled_ ? project_rect(r, scale_) : r;
+    }
+    /// A logical length in device px (radii, blur, spread, thickness).
+    [[nodiscard]] float to_device(float v) const { return scaled_ ? v * scale_ : v; }
 
     static constexpr unsigned k_max_depth = 32;
 
@@ -246,6 +315,8 @@ private:
     frame stack_[k_max_depth]{};
     unsigned depth_ = 1;
     unsigned emitted_ = 0;
+    float scale_ = 1.f;
+    bool scaled_ = false;
 };
 
 class focus_manager;
@@ -399,6 +470,10 @@ public:
     /// How far the node paints outside its bounds, px on every side: a drop shadow's reach
     /// (3σ + spread + offset). Damage covers it (`ink_bounds`). Default 0.
     [[nodiscard]] virtual int ink_outset() const;
+    /// The pointer shape the node asks for while the pointer is over it; `automatic` defers
+    /// to its parent (`resolve_cursor`). A style's `cursor`, a control's `pointer`, a text
+    /// field's `text`.
+    [[nodiscard]] virtual cursor_style cursor() const;
 
     [[nodiscard]] virtual a11y::node accessibility_node() const;
 
@@ -583,6 +658,9 @@ export namespace lx::ui {
 [[nodiscard]] lx::rect2i ink_bounds(const ui_node& node);
 /// The same grown by `node`'s ink outset (`r` in its layout space).
 [[nodiscard]] lx::rect2i ink_rect(const ui_node& node, lx::rect2i r);
+/// The pointer shape over `node`: the first non-`automatic` `cursor()` from it up to the
+/// root, else `arrow` (also for no node: the pointer over nothing interactive).
+[[nodiscard]] cursor_style resolve_cursor(const ui_node* node);
 
 } // namespace lx::ui
 
@@ -654,11 +732,60 @@ lx::ui::packed_quad_style lx::ui::pack_quad_style(const quad_style& style, float
     return p;
 }
 
-lx::ui::draw_scope::draw_scope(lx::scene::draw_list& out, lx::rect2i clip) : out_{&out} {
+namespace {
+
+/// `ui_device_scale` (UI affinity: one per UI thread, as the ledger and the overlays are).
+thread_local float g_ui_device_scale = 1.f;
+
+/// A border width (device px) snapped to whole device pixels, at least one when nonzero.
+[[nodiscard]] float lx_ui_snap_border(float device_px) {
+    if (device_px <= 0.f)
+        return 0.f;
+    const float snapped = std::floor(device_px + 0.5f);
+    return snapped < 1.f ? 1.f : snapped;
+}
+
+} // namespace
+
+float lx::ui::ui_device_scale() { return g_ui_device_scale; }
+
+void lx::ui::set_ui_device_scale(float scale) { g_ui_device_scale = scale > 0.f ? scale : 1.f; }
+
+int lx::ui::project_coord(int v, float scale) {
+    if (scale == 1.f)
+        return v;
+    return static_cast<int>(std::floor(static_cast<double>(v) * static_cast<double>(scale) + 0.5));
+}
+
+lx::rect2i lx::ui::project_rect(lx::rect2i r, float scale) {
+    if (scale == 1.f)
+        return r;
+    const int x0 = project_coord(r.x, scale);
+    const int y0 = project_coord(r.y, scale);
+    const int x1 = project_coord(r.x + r.width, scale);
+    const int y1 = project_coord(r.y + r.height, scale);
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
+lx::rect2i lx::ui::unproject_rect(lx::rect2i r, float scale) {
+    if (scale == 1.f || scale <= 0.f)
+        return r;
+    const double s = scale;
+    const int x0 = static_cast<int>(std::floor(static_cast<double>(r.x) / s));
+    const int y0 = static_cast<int>(std::floor(static_cast<double>(r.y) / s));
+    const int x1 = static_cast<int>(std::ceil(static_cast<double>(r.x + r.width) / s));
+    const int y1 = static_cast<int>(std::ceil(static_cast<double>(r.y + r.height) / s));
+    return {x0, y0, x1 - x0, y1 - y0};
+}
+
+lx::ui::draw_scope::draw_scope(lx::scene::draw_list& out, lx::rect2i clip, float scale)
+    : out_{&out} {
     // Every emitter writes the list's overlap grid, which is UI affinity (ADR-010 §4.12).
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    stack_[0] = {clip, 1.f, {}, {}};
-    lx_ui_write_rect(stack_[0].clip_f, clip);
+    scale_ = scale > 0.f ? scale : 1.f;
+    scaled_ = scale_ != 1.f;
+    stack_[0] = {to_device(clip), 1.f, {}, {}, clip};
+    lx_ui_write_rect(stack_[0].clip_f, stack_[0].dclip);
 }
 
 void lx::ui::draw_scope::push_frame(frame f) {
@@ -677,7 +804,8 @@ const lx::ui::draw_scope::frame& lx::ui::draw_scope::top() const { return stack_
 void lx::ui::draw_scope::push_clip(lx::rect2i clip) {
     frame next = top();
     next.clip = lx_ui_intersect(next.clip, clip);
-    lx_ui_write_rect(next.clip_f, next.clip);
+    next.dclip = to_device(next.clip);
+    lx_ui_write_rect(next.clip_f, next.dclip);
     push_frame(next);
 }
 
@@ -708,10 +836,8 @@ void lx::ui::draw_scope::quad(lx::texture_id texture, lx::rect2i dst, lx::rect2i
     if (!out_)
         return;
     const frame& f = top();
-    lx::rect2i placed = dst;
-    placed.x += f.origin.x;
-    placed.y += f.origin.y;
-    const lx::rect2i visible = lx_ui_intersect(placed, f.clip);
+    const lx::rect2i placed = to_device({dst.x + f.origin.x, dst.y + f.origin.y, dst.width, dst.height});
+    const lx::rect2i visible = lx_ui_intersect(placed, f.dclip);
     if (visible.width <= 0 || visible.height <= 0)
         return;
 
@@ -719,7 +845,7 @@ void lx::ui::draw_scope::quad(lx::texture_id texture, lx::rect2i dst, lx::rect2i
     cmd.texture = texture;
     cmd.src = src;
     cmd.dst = placed;
-    cmd.clip = f.clip;
+    cmd.clip = f.dclip;
     cmd.tint = tint;
     cmd.opacity = f.opacity;
     cmd.sort_key = lx::draw_sort_key::make(1, out_->size());
@@ -731,10 +857,8 @@ void lx::ui::draw_scope::fill(lx::rect2i dst, lx::color color) {
     if (!out_)
         return;
     const frame& f = top();
-    lx::rect2i placed = dst;
-    placed.x += f.origin.x;
-    placed.y += f.origin.y;
-    const lx::rect2i visible = lx_ui_intersect(placed, f.clip);
+    const lx::rect2i placed = to_device({dst.x + f.origin.x, dst.y + f.origin.y, dst.width, dst.height});
+    const lx::rect2i visible = lx_ui_intersect(placed, f.dclip);
     if (visible.width <= 0 || visible.height <= 0)
         return;
 
@@ -743,7 +867,7 @@ void lx::ui::draw_scope::fill(lx::rect2i dst, lx::color color) {
     // here (ADR-010 §4.5), so `opacity` and `tint` stay neutral.
     lx::scene::draw_command cmd{};
     cmd.dst = placed;
-    cmd.clip = f.clip;
+    cmd.clip = f.dclip;
     cmd.sort_key = lx::draw_sort_key::make(1, out_->size());
     cmd.solid = true;
     const float a = color.a * f.opacity;
@@ -753,13 +877,13 @@ void lx::ui::draw_scope::fill(lx::rect2i dst, lx::color color) {
     ++emitted_;
 }
 
-bool lx::ui::draw_scope::place(lx::rect2i bounds, lx::rect2i& placed,
-                               lx::rect2i& visible) const {
+[[gnu::always_inline]] bool lx::ui::draw_scope::place(lx::rect2i bounds, lx::rect2i& placed,
+                                                      lx::rect2i& visible) const {
     const frame& f = top();
-    placed = bounds;
-    placed.x += f.origin.x;
-    placed.y += f.origin.y;
-    visible = lx_ui_intersect(placed, f.clip);
+    placed = {bounds.x + f.origin.x, bounds.y + f.origin.y, bounds.width, bounds.height};
+    if (scaled_) [[unlikely]]
+        placed = project_rect(placed, scale_);
+    visible = lx_ui_intersect(placed, f.dclip);
     return visible.width > 0 && visible.height > 0;
 }
 
@@ -769,15 +893,36 @@ void lx::ui::draw_scope::quad(lx::rect2i bounds, const quad_style& style) {
     if (!out_ || !place(bounds, placed, visible))
         return;
     // The scope opacity is folded in at packing, before the premultiply: no rescale after.
-    emit_quad(placed, visible, pack_quad_style(style, top().opacity), 1.f);
+    if (scaled_) [[unlikely]]
+        emit_quad_scaled(placed, visible, pack_quad_style(style, top().opacity), 1.f);
+    else
+        emit_quad(placed, visible, pack_quad_style(style, top().opacity), 1.f);
 }
 
 void lx::ui::draw_scope::quad(lx::rect2i bounds, const packed_quad_style& style) {
+    if (scaled_) [[unlikely]] {
+        quad_scaled(bounds, style);
+        return;
+    }
+    // The unscaled path, one test above what it was before scales existed: the hottest
+    // emitter (S3: 10 000 a frame).
+    if (!out_)
+        return;
+    const frame& f = top();
+    const lx::rect2i placed{bounds.x + f.origin.x, bounds.y + f.origin.y, bounds.width,
+                            bounds.height};
+    const lx::rect2i visible = lx_ui_intersect(placed, f.dclip);
+    if (visible.width <= 0 || visible.height <= 0)
+        return;
+    emit_quad(placed, visible, style, f.opacity);
+}
+
+void lx::ui::draw_scope::quad_scaled(lx::rect2i bounds, const packed_quad_style& style) {
     lx::rect2i placed{};
     lx::rect2i visible{};
     if (!out_ || !place(bounds, placed, visible))
         return;
-    emit_quad(placed, visible, style, top().opacity);
+    emit_quad_scaled(placed, visible, style, top().opacity);
 }
 
 void lx::ui::draw_scope::emit_quad(lx::rect2i placed, lx::rect2i visible,
@@ -818,32 +963,53 @@ void lx::ui::draw_scope::emit_quad(lx::rect2i placed, lx::rect2i visible,
     q->pad = 0;
 }
 
+void lx::ui::draw_scope::emit_quad_scaled(lx::rect2i placed, lx::rect2i visible,
+                                          const packed_quad_style& style, float colour_scale) {
+    // Radii scale exactly; border widths snap to whole device pixels. Out of line: the
+    // unscaled path (`emit_quad`) stays what it was.
+    packed_quad_style s = style;
+    for (unsigned i = 0; i < 4; ++i) {
+        s.radii[i] = lx::gfx::to_half(lx::gfx::from_half(style.radii[i]) * scale_);
+        s.border_widths[i] =
+            lx::gfx::to_half(lx_ui_snap_border(lx::gfx::from_half(style.border_widths[i]) * scale_));
+    }
+    emit_quad(placed, visible, s, colour_scale);
+}
+
 void lx::ui::draw_scope::shadow(lx::rect2i bounds, const shadow_style& style) {
     if (!out_)
         return;
     const frame& f = top();
-    lx::rect2i placed = bounds;
-    placed.x += f.origin.x;
-    placed.y += f.origin.y;
+    const lx::rect2i placed =
+        to_device({bounds.x + f.origin.x, bounds.y + f.origin.y, bounds.width, bounds.height});
+    const float sigma = to_device(style.blur_sigma);
+    const float spread = to_device(style.spread);
     // An outer shadow is visible wherever its blur reaches, not only under the box.
     lx::rect2i extent = placed;
     if (!style.inset) {
-        const float reach_px = 3.f * style.blur_sigma + style.spread;
+        const float reach_px = 3.f * sigma + spread;
         const int reach = reach_px > 0.f ? static_cast<int>(std::ceil(reach_px)) : 0;
         extent = {placed.x - reach, placed.y - reach, placed.width + 2 * reach,
                   placed.height + 2 * reach};
     }
-    const lx::rect2i visible = lx_ui_intersect(extent, f.clip);
+    const lx::rect2i visible = lx_ui_intersect(extent, f.dclip);
     if (visible.width <= 0 || visible.height <= 0)
         return;
 
     lx::gfx::shadow_instance s{};
     lx_ui_write_rect(s.bounds, placed);
-    lx_ui_write_rect(s.clip, f.clip);
-    lx_ui_write_half4(s.radii, style.corner_radii);
+    for (unsigned i = 0; i < 4; ++i)
+        s.clip[i] = f.clip_f[i];
+    if (scaled_) {
+        const float radii[4] = {style.corner_radii[0] * scale_, style.corner_radii[1] * scale_,
+                                style.corner_radii[2] * scale_, style.corner_radii[3] * scale_};
+        lx_ui_write_half4(s.radii, radii);
+    } else {
+        lx_ui_write_half4(s.radii, style.corner_radii);
+    }
     lx_ui_write_rgba(s.color, style.color, f.opacity);
-    s.sigma = style.blur_sigma;
-    s.spread = style.spread;
+    s.sigma = sigma;
+    s.spread = spread;
     s.flags = style.inset ? 1u : 0u;
     out_->push_shadow(s, visible, out_->orders().assign(visible));
     ++emitted_;
@@ -858,16 +1024,16 @@ void lx::ui::draw_scope::sprite(lx::gfx::primitive_kind kind, std::uint8_t page,
         kind != lx::gfx::primitive_kind::poly_sprite && kind != lx::gfx::primitive_kind::path)
         return;
     const frame& f = top();
-    lx::rect2i placed = bounds;
-    placed.x += f.origin.x;
-    placed.y += f.origin.y;
-    const lx::rect2i visible = lx_ui_intersect(placed, f.clip);
+    const lx::rect2i placed =
+        to_device({bounds.x + f.origin.x, bounds.y + f.origin.y, bounds.width, bounds.height});
+    const lx::rect2i visible = lx_ui_intersect(placed, f.dclip);
     if (visible.width <= 0 || visible.height <= 0)
         return;
 
     lx::gfx::sprite_instance s{};
     lx_ui_write_rect(s.bounds, placed);
-    lx_ui_write_rect(s.clip, f.clip);
+    for (unsigned i = 0; i < 4; ++i)
+        s.clip[i] = f.clip_f[i];
     s.uv[0] = uv.u0;
     s.uv[1] = uv.v0;
     s.uv[2] = uv.u1;
@@ -878,6 +1044,10 @@ void lx::ui::draw_scope::sprite(lx::gfx::primitive_kind kind, std::uint8_t page,
     if (kind == lx::gfx::primitive_kind::mono_sprite && params[0] == 0.f && params[1] == 0.f &&
         params[2] == 0.f && params[3] == 0.f)
         params = {1.f, 0.f, 0.f, 1.f};
+    // A poly sprite's params are corner radii: lengths, projected like a quad's.
+    if (scaled_ && kind == lx::gfx::primitive_kind::poly_sprite)
+        for (float& p : params)
+            p *= scale_;
     for (unsigned i = 0; i < 4; ++i)
         s.params[i] = lx::gfx::to_half(params[i]);
     out_->push_sprite(kind, page, s, visible, out_->orders().assign(visible));
@@ -886,24 +1056,10 @@ void lx::ui::draw_scope::sprite(lx::gfx::primitive_kind kind, std::uint8_t page,
 
 void lx::ui::draw_scope::underline(lx::rect2i bounds, lx::color color, float thickness,
                                    bool wavy) {
-    if (!out_)
-        return;
     const frame& f = top();
-    lx::rect2i placed = bounds;
-    placed.x += f.origin.x;
-    placed.y += f.origin.y;
-    const lx::rect2i visible = lx_ui_intersect(placed, f.clip);
-    if (visible.width <= 0 || visible.height <= 0)
-        return;
-
-    lx::gfx::underline_instance u{};
-    lx_ui_write_rect(u.bounds, placed);
-    lx_ui_write_rect(u.clip, f.clip);
-    lx_ui_write_rgba(u.color, color, f.opacity);
-    u.thickness = lx::gfx::to_half(thickness);
-    u.wavy = wavy ? 1 : 0;
-    out_->push_underline(u, visible, out_->orders().assign(visible));
-    ++emitted_;
+    device_underline(
+        to_device({bounds.x + f.origin.x, bounds.y + f.origin.y, bounds.width, bounds.height}),
+        color, to_device(thickness), wavy);
 }
 
 void lx::ui::draw_scope::glyph(lx::gfx::primitive_kind kind, std::uint8_t page,
@@ -949,7 +1105,8 @@ void lx::ui::draw_scope::emit_glyph(lx::gfx::primitive_kind kind, std::uint8_t p
     const frame& f = top();
     lx::gfx::sprite_instance s{};
     lx_ui_write_rect(s.bounds, placed);
-    lx_ui_write_rect(s.clip, f.clip);
+    for (unsigned i = 0; i < 4; ++i)
+        s.clip[i] = f.clip_f[i];
     s.uv[0] = uv.u0;
     s.uv[1] = uv.v0;
     s.uv[2] = uv.u1;
@@ -964,6 +1121,71 @@ void lx::ui::draw_scope::emit_glyph(lx::gfx::primitive_kind kind, std::uint8_t p
         s.params[3] = 0x3C00u;
     }
     out_->push_sprite(kind, page, s, visible, order);
+    ++emitted_;
+}
+
+lx::rect2i lx::ui::draw_scope::device_rect(lx::rect2i local) const {
+    const frame& f = top();
+    return to_device({local.x + f.origin.x, local.y + f.origin.y, local.width, local.height});
+}
+
+bool lx::ui::draw_scope::device_culled(lx::rect2i device) const {
+    const lx::rect2i v = lx_ui_intersect(device, top().dclip);
+    return v.width <= 0 || v.height <= 0;
+}
+
+void lx::ui::draw_scope::device_sprite(lx::gfx::primitive_kind kind, std::uint8_t page,
+                                       lx::rect2i device, lx::gfx::sprite_uv uv, lx::color color) {
+    if (!out_ || (kind != lx::gfx::primitive_kind::mono_sprite &&
+                  kind != lx::gfx::primitive_kind::poly_sprite))
+        return;
+    const frame& f = top();
+    const lx::rect2i visible = lx_ui_intersect(device, f.dclip);
+    if (visible.width <= 0 || visible.height <= 0)
+        return;
+    emit_glyph(kind, page, device, visible, uv,
+               lx::gfx::premultiplied_half(lx_ui_faded(color, f.opacity)),
+               out_->orders().assign(visible));
+}
+
+std::uint32_t lx::ui::draw_scope::device_group_order(lx::rect2i device, std::uint32_t at_least) {
+    if (!out_)
+        return 0;
+    const lx::rect2i visible = lx_ui_intersect(device, top().dclip);
+    if (visible.width <= 0 || visible.height <= 0)
+        return out_->orders().layer_base();
+    return out_->orders().assign(visible, at_least);
+}
+
+void lx::ui::draw_scope::device_glyph(lx::gfx::primitive_kind kind, std::uint8_t page,
+                                      lx::rect2i device, lx::gfx::sprite_uv uv,
+                                      lx::gfx::packed_rgba color, std::uint32_t order) {
+    if (!out_ || (kind != lx::gfx::primitive_kind::mono_sprite &&
+                  kind != lx::gfx::primitive_kind::poly_sprite))
+        return;
+    const lx::rect2i visible = lx_ui_intersect(device, top().dclip);
+    if (visible.width <= 0 || visible.height <= 0)
+        return;
+    emit_glyph(kind, page, device, visible, uv, color, order);
+}
+
+void lx::ui::draw_scope::device_underline(lx::rect2i device, lx::color color, float thickness,
+                                          bool wavy) {
+    if (!out_)
+        return;
+    const frame& f = top();
+    const lx::rect2i visible = lx_ui_intersect(device, f.dclip);
+    if (visible.width <= 0 || visible.height <= 0)
+        return;
+
+    lx::gfx::underline_instance u{};
+    lx_ui_write_rect(u.bounds, device);
+    for (unsigned i = 0; i < 4; ++i)
+        u.clip[i] = f.clip_f[i];
+    lx_ui_write_rgba(u.color, color, f.opacity);
+    u.thickness = lx::gfx::to_half(thickness);
+    u.wavy = wavy ? 1 : 0;
+    out_->push_underline(u, visible, out_->orders().assign(visible));
     ++emitted_;
 }
 
@@ -1419,6 +1641,15 @@ void lx::ui::detail::damage_node(const ui_node& node, lx::rect2i region) {
 }
 
 int lx::ui::ui_node::ink_outset() const { return 0; }
+
+lx::ui::cursor_style lx::ui::ui_node::cursor() const { return cursor_style::automatic; }
+
+lx::ui::cursor_style lx::ui::resolve_cursor(const ui_node* node) {
+    for (const ui_node* n = node; n; n = n->parent())
+        if (const cursor_style c = n->cursor(); c != cursor_style::automatic)
+            return c;
+    return cursor_style::arrow;
+}
 
 lx::rect2i lx::ui::ink_rect(const ui_node& node, lx::rect2i r) {
     const int o = node.ink_outset();

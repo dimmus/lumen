@@ -3,9 +3,10 @@
 > `lx.text` rewrite with title bars on atlas glyphs (Phase 2), and flex layout, style, the
 > theme compiler, One Dark / One Light, Lucide icons and the §5.6 components with
 > `lumen-ui-gallery` (Phase 3). Gates G3, G4 and G10 pass; G2 is not met on the
-> development host (§7 Phase 3). Next is Phase 4, the client runtime: `lx.wayland.client`
-> and `lx.app` are still stubs, so no client draws with the engine yet, and `lx.shell`
-> still draws through `shm_canvas` until Phase 5. §2 is the tree as it stood before the
+> development host (§7 Phase 3). Phase 4, the client runtime, is under way: `lx.wayland.client`
+> (stage 1), the client swapchain tiers (stage 2) and `lx.app`'s window, input and frame loop
+> with `lumen-hello` on the engine (stage 3) are built; the client-mode bench is next.
+> `lx.shell` still draws through `shm_canvas` until Phase 5. §2 is the tree as it stood before the
 > work began, §7 the order of work with an "As built" note per finished phase, §8 the
 > measurement that gates each step.
 
@@ -1253,6 +1254,126 @@ eventfd waking), the wire half (set_acquire_point / set_release_point) is untest
 in-process compositor runs without a Vulkan driver in the test (lavapipe cannot import vmwgfx
 buffers; its bookkeeping import registers them as received). Deviation: a 17th damage rect
 merges the cheapest pair (`damage_region`), not the bounding box.
+
+As built (stage 3, `lx.app`: window, input, the frame loop; `lumen-hello` on lx.ui). `lx.app`
+(Application layer on `lx.ui`, `lx.scene`, `lx.text`, `lx.gfx`, `lx.wayland.client`; no longer
+on `lx.ui.builder`, which nothing else imports and which stays compiling until Phase 5) is a
+facade with `:window` and `:input`, bodies in `application.cpp`, `window.cpp`, `input.cpp`.
+`lx::application` connects, loads the compiled theme (`settings::theme`, `LUMEN_THEME`, One
+Dark by default; the built-in copy when the file is missing), persists fontconfig's answers
+per program as lumen-shell does (the first frame's text does not wait for fontconfig: cold
+70 ms, then 3–4 ms of first-frame layout), runs one `lx::runtime::event_loop` and a worker
+thread draining the executor's worker strand — icon misses rasterise there
+(`icon_cache::set_async`), theme reloads load there (`theme_watcher`, on by default in debug
+builds, `LUMEN_THEME_WATCH` overrides) — woken by the strand's waker, never on a period. The
+loop waits on the display (`display_source`), one timerfd armed after each iteration at the
+earliest deadline anything needs (a held key's repeat, a UI timer still ahead) and disarmed
+otherwise, the swapchain's release eventfd under explicit sync, the theme's inotify fd. Each
+window is an event source due when a frame should be drawn now. `lx::app::window` makes the
+`wl_surface` and `xdg_toplevel` (server-side decorations requested), sends the initial commit
+before it initialises the tier (the configure travels while EGL or the Vulkan device starts),
+owns a `ui_root` with `emit_scope::damage`, the tier `client_gpu` picks (`settings::backend`
+forces one; a forced tier the host cannot run falls back to automatic, as GTK does with an
+unavailable GSK_RENDERER), one atlas with its glyph and icon caches, and one wl_buffer (and,
+under explicit sync, one imported timeline) per swapchain image, made and destroyed in
+`swapchain_listener`. The GL tier builds no program ahead: the first draw builds what its
+stream needs (≈ 1.8 MiB of driver memory per program on SVGA3D).
+
+The frame loop is §4.9's with two refinements, both measured. From idle a frame is drawn in
+the iteration that raised it, not after a frame-callback round trip (Chromium's and GTK's
+choice: input on an idle window reaches the next refresh, G6); every drawn commit requests the
+next callback, which is the throttle — with work left it draws again on the callback, with
+none it requests nothing more. And the buffer's age enters as repaint, not as damage:
+`ui_root::add_repaint` widens the emission clip and `frame_repaint` (what is rendered,
+scissored per rect) but not `frame_damage`, so `damage_buffer` reports only what changed and
+the compositor's KMS damage stays exact (§4.9's As-built note put the age into the ledger). A
+frame: geometry (a pending configure's size, the preferred scale), acquire (none free: wait for
+a release, then draw once), age → repaint, tick, `batch_for_render`, render inside the repaint
+region, present, ack the configure right before the commit (frame-perfect: the commit after an
+ack has the new size), attach, `damage_buffer` × ≤ 16 rects, syncobj points, frame callback,
+wp_presentation feedback (a 256-entry ring: commit, start, presented time, refresh, sequence,
+flags, rects), commit; a frame that fails puts its damage back in the ledger. A configure or a
+preferred-scale change is answered at once whatever callback is outstanding. `ui_root` gained
+`wants_frame` (the tick's own early-out, asked before a buffer is taken), `add_repaint` /
+`frame_repaint`, `set_scale` / `device_size`, `bounds`.
+
+Scale (fixing Phase 3's "components lay out at scale 1"). With wp_fractional_scale_v1 and
+wp_viewporter the buffer is ceil(logical × scale) and the viewport's destination the logical
+size; otherwise the integer preferred buffer scale (v6; before it, the outputs' largest). The UI
+lays out in logical px. `draw_scope` takes the scale and projects once at emission, each edge to
+the nearest device pixel on its own (shared edges stay shared, the projection of an
+intersection is the intersection of projections); radii, blur and spread scale exactly, border
+widths snap to whole device pixels (≥ 1), as Chromium and Firefox draw them. Text and icons
+rasterise at the device scale (`ui_device_scale`, set by the root's tick) and place their
+pixels in device space (`draw_scope::device_glyph` / `device_sprite` / `device_rect`), so a glyph
+samples its tile 1:1; `text_block_node` measures device sizes over the scale (rounded up) and
+follows a scale change itself (a reducer's subtree is not re-applied); the text field's caret
+and hit test convert with it. At scale 1 every path is what it was: the golden images, the
+gallery (bit for bit) and every lx.ui test pass unchanged. The scale costs S3 one branch per
+quad: emit p50 300–311 → 316–323 µs (+4–5 %, four interleaved pinned pairs of
+`lumen-ui-bench --scenario S3 --frames 2400` against this stage's parent, load 0.7–1.0) after
+`place` was forced inline and the scaled quad moved out of line (it measured +12 % before); S2
+is unchanged (tick p50 89–91 vs 91 µs).
+
+Input (`lx.app:input`): `wl_pointer` frames into `pointer_move` / `pointer_button` /
+`pointer_axis` / `pointer_leave`, the motion kept and hit-tested once per frame (or before a
+button, axis or key); detents (value120) scroll three lines of 1.25 rem, continuous axes their
+distance; the cursor shape from the hovered node's new `ui_node::cursor()` (a control's
+pointing hand, a field's I-beam, a style's `cursor`; `resolve_cursor`) through
+wp_cursor_shape_v1, sent only when it changes (without the global: logged once, no cursor
+surface); `wl_keyboard` through xkb (keysym → `lx::ui::key`, text from xkb, ctrl shortcuts from
+the keysym), modifiers mapped, repeat from `repeat_info` on the timerfd (v10's compositor-side
+`repeated` followed instead), the window's focus blurred on keyboard leave and given back on
+enter; zwp_text_input_v3 into the focused field's `ime_target` (state — surrounding text,
+caret, cursor rectangle — sent on change only; a `done` whose serial is not the commit count
+applied and its state held until one matches or the user's next key); touch as a pointer (the
+first point; a deviation: no multi-touch).
+
+`lumen-hello` is rewritten on it: 640 × 480 logical, `org.lumen.hello`, "Hello Lumen", a panel
+with a headline, a text field, a filled button with a tooltip counting its clicks through a
+reducer, a checkbox and a switch (`executables/lumen-hello/hello_ui.hpp`, shared with the test);
+`--backend cpu|gl|vulkan`, `--exit-after-first-present` (one grep-stable line: exec, connect,
+first configure, first commit, first presented, CLOCK_MONOTONIC µs; exec is `LUMEN_EXEC_NS` when
+a launcher sets it, else the application's construction), `--frames N` (whole-window repaints,
+frame time printed). `lx::runtime::event_loop::run` now drains a wake token left from before it
+started (a previous run's `quit`), which cost every run one spurious wakeup.
+
+Measured. `test_app_window` (51 checks: 26 on cpu, 25 on gl; the window in a child process —
+the runtime's source table and UI strand are per process — against the in-process compositor
+on two virtual outputs, 1× and 1.25×, with an input method on a second connection, load
+0.6–0.9): the first frame presented at 640 × 480 with the toplevel's title and app_id; a hover
+is one frame, one frame request, one damage rect (the button), the pointing-hand cursor; a click
+dispatches the reducer and the counter label repaints in one rect; typing inserts; preedit,
+commit_string and the state round trip work; key repeat at the compositor's 25 Hz / 600 ms
+repeats 8 times in 900 ms and disarms on release; **G1**: 2 s idle after the last frame — 0
+frame callbacks requested, 0 commits, 0 timer expirations, the timerfd disarmed, 0 socket reads,
+one wakeup (the test's own quit timer); on the 1.25 output the buffer is 800 × 600 with the
+viewport at 640 × 480 after one reallocation, all 157 sprites on whole device pixels sampled
+1:1, and the CPU image equal to `tests/golden/ui/app_hello_1_25.png` (exact); maximise,
+fullscreen, back and restore each reallocate once and the commit after each ack has the new
+size; **G5**: 0 `operator new` over the steady hover frames on cpu and on gl (libwayland's 22
+and, with Mesa's, 63 `malloc`s per frame, as every libwayland toolkit pays). Hover frame on the
+UI thread, frame start → commit: cpu p50 128 µs / p95 289 µs, gl p50 501 µs / p95 970 µs.
+Whole-window repaint at 640 × 480 (`lumen-hello --frames 240`, load 0.6): cpu p50 482–511 µs,
+gl 535–544 µs, p95 ≈ 4 ms on both (host). Start-up (`lumen-hello --exit-after-first-present`
+against a headless `lumen-compositor --virtual-outputs 1280x800`, six runs per tier, load 0.6,
+warm font matches; exec = the application's construction): cpu first commit 5.6–8.6 ms, first
+presented 11–19 ms (the compositor's 60 Hz tick is most of the gap) — **G7's 30 ms met** —; gl
+first presented 112–170 ms, of which EGL on GBM 35–60 ms and SVGA3D's program compile at the
+first draw ≈ 90 ms: G7's 150 ms cold met in five runs of six, its warm 30 ms not reachable here
+(GL_NUM_PROGRAM_BINARY_FORMATS = 0: no program binary cache exists on this host, so there is no
+warm case to measure). G6 and G11 are stage 4's (`lumen-ui-bench --client` S9 and S7). The
+headless compositor runs with no Vulkan driver loaded for the GL tier (lavapipe cannot import
+vmwgfx dma-bufs; with it, the import fails and the compositor drops the client).
+
+Deviations from this stage's plan: there is no `lx.app:swapchain` partition (the swapchain is
+`lx.gfx:swapchain`, stage 2); the shell's bindings stay hand-written (Phase 5, with app-smoke as
+their check); one window per UI thread — lx.ui's ledger, overlays, timers and device scale are
+the thread's, so the application routes seat events to the last window opened and warns at a
+second; the age is repaint, not damage (above); from idle a frame does not wait for a frame
+callback (above); touch is a single pointer; per-surface dma-buf feedback (a scanout tranche)
+is not used yet, nor is the swapchain re-created when feedback changes; a dma-buf the compositor
+refuses (`failed`) stops the window's drawing with one error rather than falling back to wl_shm.
 
 ### Phase 5 — Adoption and deletion (≈2 weeks) — not started
 

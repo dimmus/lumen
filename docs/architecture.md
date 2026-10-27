@@ -244,17 +244,29 @@ the workspaces, which the shell displays and switches through ext-workspace. Det
 
 ### 2.3 Application processes
 
-**Typical binary:** user app linked against `lx.app`  
-**Modules:** `lx.app`, `lx.ui`, `lx.ui.builder`, `lx.wayland.client`
+**Typical binary:** user app linked against `lx.app` (`lumen-hello` is the reference)  
+**Modules:** `lx.app` (`:window`, `:input`), `lx.ui`, `lx.gfx` (`:swapchain`, the UI
+renderers), `lx.wayland.client`
 
-Each app:
+Each app (ADR-010 §4.9–§4.10, Phase 4):
 
-- Connects to the compositor display
-- Creates `xdg_toplevel` + `wl_surface` for its windows
-- Uses `lx.ui` widgets; optional fluent builder API
-- Submits buffers (SHM during dev, dmabuf in production)
+- `lx::application` connects (`lx.wayland.client`), loads the compiled theme, runs one
+  `lx::runtime::event_loop` on the UI thread and a worker thread for icon rasters and theme
+  reloads (threading.md, "Client process")
+- `lx::app::window` creates the `wl_surface` + `xdg_toplevel` (server-side decorations
+  requested), owns an `lx::ui::ui_root`, and draws it on the pixel tier `lx::gfx::client_gpu`
+  picks the way the compositor picks its own (hardware Vulkan → hardware GL on GBM → CPU over
+  `wl_shm`) into a `client_swapchain` of dma-bufs (or shm), one wl_buffer per image
+- Frames follow lx.ui's damage ledger: drawn at once from idle, then throttled by the frame
+  callback; only the damage is repainted (scissored, buffer age) and reported
+  (`damage_buffer`); an idle window requests nothing and arms nothing
+- Fractional scale through `wp_fractional_scale_v1` + `wp_viewport` (the buffer at
+  ceil(logical × scale), the UI laid out in logical px and projected at emission)
+- Input: `wl_pointer` (frames coalesced, one hit test per frame), `wl_keyboard` through xkb
+  with client-side repeat, `zwp_text_input_v3` into the focused field, `wp_cursor_shape_v1`
 
-Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`.
+Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`. `lx.ui.builder` is kept compiling until
+ADR-010 Phase 5 deletes it; `lx.app` no longer imports it.
 
 ### 2.4 Portal processes
 
@@ -1821,11 +1833,21 @@ sequenceDiagram
     participant Comp as compositor
 
     Main->>App: application(argc, argv)
-    App->>WL: display::connect("lumen-0")
+    Main->>App: start()
+    App->>WL: display::connect(settings.socket)
     WL->>Comp: Wayland handshake
-    Comp-->>WL: globals (wl_compositor, xdg_wm_base, …)
+    Comp-->>WL: globals (wl_compositor, xdg_wm_base, linux-dmabuf feedback, …)
+    Main->>App: window::open(app, options)
+    App->>Comp: wl_surface + xdg_toplevel, initial commit (no buffer)
+    App->>App: client_gpu (tier), while the configure travels
+    Comp-->>App: xdg_toplevel.configure
+    App->>App: swapchain, ui_root tick, render
+    App->>Comp: ack_configure, attach, damage_buffer, frame, commit
     Main->>App: run() → event_loop
 ```
+
+`lumen-hello --exit-after-first-present` prints these instants as one line (exec, connect,
+first configure, first commit, first presented; CLOCK_MONOTONIC µs) for ADR-010 §8.3 S10.
 
 ### 6.2 UI construction (declarative)
 

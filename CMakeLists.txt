@@ -219,8 +219,11 @@ if(LUMEN_BUILD_XWAYLAND)
     lumen_add_module_library(lx.compositor.xwayland modules/lx.compositor.xwayland
         DEPENDS lx.wayland.server lx.foundation)
 endif()
+# ADR-010 Phase 4: the application runtime — the Wayland connection and event loop, windows
+# drawn with lx.ui through lx.gfx's client swapchain, input routing. Application layer.
 lumen_add_module_library(lx.app modules/lx.app
-    DEPENDS lx.ui.builder lx.wayland.client lx.runtime)
+    DEPENDS lx.ui lx.scene lx.text lx.gfx lx.wayland.client lx.runtime lx.trace)
+lumen_link_platform_parts(lx.app xkb)
 
 # Platform APIs must link on MODULE libraries (not only executables).
 lumen_link_platform_modules(
@@ -293,6 +296,7 @@ lumen_link_platform(lumen-input-probe)
 add_executable(lumen-hello executables/lumen-hello/main.cpp)
 target_link_libraries(lumen-hello PRIVATE lx.app)
 lumen_apply_module_properties(lumen-hello)
+lumen_check_executable_layers(lumen-hello lx.app)
 
 # Demo client: needs xdg-shell *client* glue, which the server-side codegen does not emit.
 if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
@@ -1145,6 +1149,23 @@ if(LUMEN_BUILD_TESTS)
             LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
         add_test(NAME test_client_swapchain COMMAND test_client_swapchain)
         set_tests_properties(test_client_swapchain PROPERTIES TIMEOUT 120)
+    endif()
+
+    # ADR-010 Phase 4 stage 3: lx.app's window (lumen-hello's tree) against the in-process
+    # compositor, the window in a child process: map, hover, click, typing, key repeat, idle,
+    # fractional scale with a golden image, resize, steady-frame allocations; cpu and gl.
+    if(LIBPNG_FOUND)
+        add_executable(test_app_window tests/test_app_window.cpp)
+        target_link_libraries(test_app_window PRIVATE lx.compositor lx.wayland.client lx.app
+            ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_app_window)
+        lumen_link_platform(test_app_window)
+        target_include_directories(test_app_window PRIVATE tests "${LUMEN_GENERATED_DIR}"
+            ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_app_window PRIVATE
+            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui")
+        add_test(NAME test_app_window COMMAND test_app_window)
+        set_tests_properties(test_app_window PROPERTIES TIMEOUT 180)
     endif()
 
     # Part C (design-app-compat-capture): pointer constraints, relative pointer, gestures —
