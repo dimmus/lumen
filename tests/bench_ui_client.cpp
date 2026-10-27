@@ -2647,6 +2647,12 @@ int orchestrate(const client_options& o) {
                 std::string text = read_file(result);
                 if (code != 0)
                     infra_failed = true;
+                if (text.empty() && code == 0 && o.connect && s == 3) {
+                    // S9 under --connect is passive (scripts/ui-bench.sh --e2e): it writes its
+                    // frames to --frames-out for the join and has no record of its own.
+                    std::printf("  %s [%s] passive: frames written for the e2e join\n", sid, tier);
+                    continue;
+                }
                 if (text.empty()) {
                     std::printf("  %s [%s] FAILED to report (exit %d)\n", sid, tier, code);
                     infra_failed = true;

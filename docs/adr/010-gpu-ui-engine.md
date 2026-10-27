@@ -8,8 +8,8 @@
 > loop with `lumen-hello` on the engine, and `lumen-ui-bench --client` with
 > `scripts/ui-bench.sh --e2e`. G1 and G5 pass on every tier; G7 passes on cpu and misses its
 > 150 ms cold budget on GL at p95 (p50 135 ms); G11's heap and reallocation rules pass and
-> its frame rule misses from host jitter (a fixed job misses the same way); G6 has a headless
-> proxy that passes, and its real number waits for the KMS run of `--e2e` (§7 Phase 4).
+> its frame rule misses from host jitter (a fixed job misses the same way); G6 passes on the
+> KMS display (`--e2e`, median 0.68–0.83 refresh periods against 1 period + 2 ms; §7 Phase 4).
 > `lx.shell` still draws through `shm_canvas` until Phase 5. §2 is the tree as it stood before the
 > work began, §7 the order of work with an "As built" note per finished phase, §8 the
 > measurement that gates each step.
@@ -1154,7 +1154,7 @@ primitives (no close glyph on unhovered tabs, as Zed shows none); the `icons`,
 `components_states`, `components_gallery`, `menu_open`, `tooltip`, `modal`, `toast_stack`,
 `scroll_area` and `text_input` references were rewritten.
 
-### Phase 4 — The client runtime (≈3 weeks) — **done** (G7 cold on GL and G11's frame rule open on this host; G6 waits for the KMS run)
+### Phase 4 — The client runtime (≈3 weeks) — **done** (G7 cold on GL and G11's frame rule open on this host)
 
 - `lx.wayland.client` as a thin libwayland-client wrapper (registry, `xdg_shell`,
   `zwp_linux_dmabuf_v1` v5 feedback, `wp_linux_drm_syncobj_v1`, `wp_viewporter`,
@@ -1544,10 +1544,20 @@ changes; a refused dma-buf stops the window's drawing with one error rather than
 the lumen-compositor binary (which has no way in for injected input or a forced resize; it runs
 S1 and S10); G5 is gated on `operator new` with libwayland's and the driver's `malloc` reported,
 not on `mallinfo2` (§3's row amended); S7's resizes are the compositor's interactive resize driven by injected
-Super + right drag; S9 headless is a proxy for G6, and G6 itself was not measured;
+Super + right drag; S9 headless is a proxy for G6, and G6 itself is the KMS run below;
 `lumen-hello` gained `--allow-software-gpu` for S10's software Vulkan rows.
 
-Open: G6 on the KMS display (`scripts/ui-bench.sh --e2e`, built and dry-run only); G7 cold on GL —
+G6 on the KMS display (`scripts/ui-bench.sh --e2e --join-seat-session`, run after the workflow
+from SSH; GL tier on the GL compositor, its dmabufs sampled in place; load 0.10; 93 of 93 hover
+transitions found among the compositor's flips): **pass**, two runs, input → presented median
+11.29 / 13.88 ms (0.68 / 0.83 periods), p95 22.97 / 21.10 ms (1.38 / 1.27 periods), against
+1 period + 2 ms = 18.67 ms; the client's input → commit is 0.9 ms of it and the compositor's
+newest input → content flip 4.4–5.2 ms, so the rest is waiting for the next vblank. The first
+live run found two faults the dry run could not: S9 under `--connect` wrote no record, so the
+bench exited 1, and the script's EXIT trap then stopped at a `wait` under `set -e` and left the
+compositor on the display; both are fixed.
+
+Open: G7 cold on GL —
 the candidate is compiling the first frame's programs on two threads in a shared context (two
 vCPUs here) and loading the GL and Vulkan libraries only once the tier is chosen; explicit sync
 on the wire (no syncobj manager headless, no timeline syncobjs on vmwgfx); the Vulkan tier on a

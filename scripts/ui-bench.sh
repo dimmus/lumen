@@ -377,14 +377,16 @@ if [[ "$e2e" -eq 1 ]]; then
   for f in compositor.log client.log client.json inject.jsonl watch.jsonl; do : > "${e2e_logs}/$f"; done
   COMP_PID=""; BENCH_PID=""; WATCH_PID=""
   e2e_cleanup() {
-    [[ -n "$BENCH_PID" ]] && { kill -TERM "$BENCH_PID" 2>/dev/null; wait "$BENCH_PID" 2>/dev/null; }
+    # Under set -e a failing wait (the pid already reaped) would end the trap here and leave
+    # the compositor holding the display: every step of the cleanup tolerates failure.
+    [[ -n "$BENCH_PID" ]] && { kill -TERM "$BENCH_PID" 2>/dev/null; wait "$BENCH_PID" 2>/dev/null || true; }
     if [[ -n "$COMP_PID" ]]; then
       kill -TERM "$COMP_PID" 2>/dev/null
       for _ in $(seq 1 50); do kill -0 "$COMP_PID" 2>/dev/null || break; sleep 0.1; done
       kill -0 "$COMP_PID" 2>/dev/null && kill -9 "$COMP_PID" 2>/dev/null
-      wait "$COMP_PID" 2>/dev/null
+      wait "$COMP_PID" 2>/dev/null || true
     fi
-    [[ -n "$WATCH_PID" ]] && { kill -TERM "$WATCH_PID" 2>/dev/null; wait "$WATCH_PID" 2>/dev/null; }
+    [[ -n "$WATCH_PID" ]] && { kill -TERM "$WATCH_PID" 2>/dev/null; wait "$WATCH_PID" 2>/dev/null || true; }
     BENCH_PID=""; COMP_PID=""; WATCH_PID=""
     rm -f "$SOCKET_PATH" "${SOCKET_PATH}.lock"
   }
@@ -426,9 +428,14 @@ if [[ "$e2e" -eq 1 ]]; then
   sudo -n python3 -I "$INJ" --pointer "$POINTER_DEV" --layout "${e2e_logs}/compositor.log" --tag S9 \
     hover $((WX + LX)) $((WY + LY)) $((WX + OX)) $((WY + OY)) --hz 125 --duration-s "$HOVER_S" \
     --toggle-every 4 >"${e2e_logs}/inject.jsonl"
-  wait "$BENCH_PID"; BENCH_PID=""
-  kill -TERM "$COMP_PID" 2>/dev/null; wait "$COMP_PID" 2>/dev/null; COMP_PID=""
-  kill -TERM "$WATCH_PID" 2>/dev/null; wait "$WATCH_PID" 2>/dev/null; WATCH_PID=""
+  bench_rc=0
+  wait "$BENCH_PID" || bench_rc=$?
+  BENCH_PID=""
+  kill -TERM "$COMP_PID" 2>/dev/null; wait "$COMP_PID" 2>/dev/null || true; COMP_PID=""
+  kill -TERM "$WATCH_PID" 2>/dev/null; wait "$WATCH_PID" 2>/dev/null || true; WATCH_PID=""
+  if (( bench_rc != 0 )); then
+    echo "FAIL: lumen-ui-bench exited ${bench_rc}"; cat "${e2e_logs}/client.log"; exit 2
+  fi
   echo "== S9 end to end (logs: ${e2e_logs#"$ROOT"/})"
   e2e_verdict "$e2e_logs" live "$POINTER_DEV" "$KEYBOARD_DEV"
   exit $?
