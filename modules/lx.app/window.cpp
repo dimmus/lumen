@@ -88,14 +88,21 @@ lx::result<void> window::open(window_host& host, const window_options& options) 
     if (!d.connected())
         return lx::make_error(lx::wayland_err::connect_failed,
                               "lx::app::window::open: the application is not connected");
+    // One window per application until lx.ui's per-thread state (ledger, overlays, timers,
+    // scale) is per window: a second is refused, not routed around.
+    if (auto admitted = host.host_attach(*this); !admitted)
+        return admitted;
     host_ = &host;
     options_ = options;
+    presentation_feedback_ = options.presentation_feedback;
     timeline_ = {};
     timeline_.opened_ns = now_ns();
     stats_ = {};
 
-    if (auto failed = surface_.create(d); !failed)
+    if (auto failed = surface_.create(d); !failed) {
+        close();
         return failed.get_error();
+    }
     surface_.set_handler(this);
     // Fractional scale needs both: the scale and a viewport to put the larger buffer in the
     // logical size (otherwise integer buffer_scale).
@@ -109,7 +116,7 @@ lx::result<void> window::open(window_host& host, const window_options& options) 
     to.app_id = options.app_id;
     to.server_side_decorations = options.server_side_decorations;
     if (auto made = toplevel_.create(d, surface_, to); !made) {
-        surface_.destroy();
+        close();
         return made;
     }
     toplevel_.set_handler(this);
@@ -137,7 +144,6 @@ lx::result<void> window::open(window_host& host, const window_options& options) 
     source_ = std::make_unique<frame_source>(*this);
     host.host_loop().add_source(source_.get());
     open_ = true;
-    host.host_attach(*this);
     // The initial commit (no buffer) goes out first: the compositor's first configure travels
     // while the GPU tier initialises (EGL / Vulkan device creation, tens of ms).
     (void)surface_.commit();
@@ -155,7 +161,8 @@ lx::result<void> window::open(window_host& host, const window_options& options) 
 }
 
 void window::close() {
-    if (host_ && open_)
+    // The host forgets the window (a no-op for one it never admitted).
+    if (host_)
         host_->host_detach(*this);
     if (host_ && source_)
         host_->host_loop().remove_source(source_.get());
@@ -174,6 +181,12 @@ void window::close() {
         b.buffer.destroy();
         b.timeline.destroy();
         b.id = 0;
+        b.pool_id = 0;
+    }
+    for (shm_pool_slot& p : pools_) {
+        p.pool.destroy();
+        p.id = 0;
+        p.refs = 0;
     }
     toplevel_.destroy();
     surface_.destroy();
@@ -191,6 +204,7 @@ void window::close() {
     configure_pending_ = false;
     scale_pending_ = false;
     waiting_release_ = false;
+    frame_requested_ns_ = 0;
     syncobj_ = false;
     broken_ = false;
     fractional_ = viewport_ = false;
@@ -228,6 +242,7 @@ lx::result<void> window::make_pixel_path() {
     lx::gfx::client_gpu_options o{};
     o.force = cfg.backend;
     o.allow_software = cfg.allow_software_gpu;
+    o.device_override = cfg.device_override;
     auto made = gpu_.create(feedback, o);
     if (!made && cfg.backend != lx::gfx::client_tier::none) {
         // A forced tier this host cannot run: the automatic choice, as GTK falls back from
@@ -298,8 +313,22 @@ lx::result<void> window::apply_geometry() {
         if (pending_cfg_.size.height > 0)
             size.height = pending_cfg_.size.height;
     }
-    size.width = std::max({size.width, options_.min_size.width, 1});
-    size.height = std::max({size.height, options_.min_size.height, 1});
+    // The minimum holds only where the compositor left the size to the client. A maximized
+    // or tiled size is the size (xdg-shell: anything else is invalid_surface_state), a
+    // fullscreen or resizing size the most the window may take — and the compositor may
+    // configure below set_min_size. The UI lays out inside it (clipped) rather than grow.
+    namespace wl = lx::wayland;
+    const std::uint32_t bounded_states = wl::state_maximized | wl::state_fullscreen |
+                                         wl::state_resizing | wl::state_tiled_left |
+                                         wl::state_tiled_right | wl::state_tiled_top |
+                                         wl::state_tiled_bottom;
+    const bool bounded = (pending_cfg_.states & bounded_states) != 0;
+    if (!bounded || pending_cfg_.size.width <= 0)
+        size.width = std::max(size.width, options_.min_size.width);
+    if (!bounded || pending_cfg_.size.height <= 0)
+        size.height = std::max(size.height, options_.min_size.height);
+    size.width = std::max(size.width, 1);
+    size.height = std::max(size.height, 1);
 
     // The scale: fractional (1/120) with a viewport, else the integer buffer scale.
     const std::uint32_t s120 = surface_.preferred_scale120();
@@ -422,14 +451,41 @@ void window::on_image_created(const lx::gfx::swapchain_image& image) {
     const lx::size2i size{static_cast<int>(image.width), static_cast<int>(image.height)};
     lx::result<void> made{};
     if (image.pixels.pixels) {
-        // wl_shm over the swapchain's memfd: a pool per image, gone once its buffer exists.
-        lx::wayland::shm_pool pool;
-        made = pool.create(d, image.planes[0].fd, image.pool_bytes);
-        if (made)
-            made = slot->buffer.create_shm(pool, image.planes[0].offset, size,
-                                           static_cast<std::int32_t>(image.planes[0].stride),
-                                           image.fourcc == lx::gfx::k_fourcc_xrgb8888 ? 1u : 0u);
-        pool.destroy();
+        // wl_shm over the swapchain's memfd: one pool per block (the compositor maps a pool
+        // once, for as long as its buffers live), kept while the block has images.
+        shm_pool_slot* pool = nullptr;
+        for (shm_pool_slot& p : pools_)
+            if (p.id == image.pool_id) {
+                pool = &p;
+                break;
+            }
+        if (!pool)
+            for (shm_pool_slot& p : pools_)
+                if (p.id == 0) {
+                    pool = &p;
+                    break;
+                }
+        if (!pool) {
+            made = lx::make_error(lx::wayland_err::object_failed,
+                                  "lx::app::window: no wl_shm_pool slot left");
+        } else {
+            if (pool->id == 0) {
+                made = pool->pool.create(d, image.planes[0].fd, image.pool_bytes);
+                if (made)
+                    pool->id = image.pool_id;
+            }
+            if (made)
+                made = slot->buffer.create_shm(pool->pool, image.planes[0].offset, size,
+                                               static_cast<std::int32_t>(image.planes[0].stride),
+                                               image.fourcc == lx::gfx::k_fourcc_xrgb8888 ? 1u : 0u);
+            if (made) {
+                ++pool->refs;
+                slot->pool_id = pool->id;
+            } else if (pool->refs == 0) {
+                pool->pool.destroy();
+                pool->id = 0;
+            }
+        }
     } else {
         lx::wayland::dmabuf_plane planes[4]{};
         for (unsigned p = 0; p < image.plane_count && p < 4; ++p)
@@ -453,7 +509,24 @@ void window::on_image_destroyed(std::uint32_t id) {
         slot->buffer.destroy();
         slot->timeline.destroy();
         slot->id = 0;
+        release_pool(slot->pool_id);
+        slot->pool_id = 0;
     }
+}
+
+void window::release_pool(std::uint32_t pool_id) {
+    if (pool_id == 0)
+        return;
+    for (shm_pool_slot& p : pools_)
+        if (p.id == pool_id) {
+            if (p.refs > 0)
+                --p.refs;
+            if (p.refs == 0) {
+                p.pool.destroy();
+                p.id = 0;
+            }
+            return;
+        }
 }
 
 void window::on_release(lx::wayland::buffer& b) {
@@ -554,6 +627,12 @@ std::uint64_t window::next_deadline_ns(std::uint64_t now) const {
     // for): arming the timer for the past would only spin.
     if (const std::uint64_t ui = root_->next_deadline_ns(); ui > now && (out == 0 || ui < out))
         out = ui;
+    // A configure held for the outstanding frame callback: answered by then at the latest.
+    if (configure_pending_ && configured_ && surface_.frame_pending()) {
+        const std::uint64_t held = frame_requested_ns_ + k_configure_wait_ns;
+        if (held > now && (out == 0 || held < out))
+            out = held;
+    }
     return out;
 }
 
@@ -564,7 +643,18 @@ void window::on_deadline(std::uint64_t now) { input_.on_repeat_due(now); }
 bool window::frame_due() const {
     if (!open_ || broken_ || waiting_release_)
         return false;
-    if (configure_pending_ || (configured_ && scale_pending_))
+    if (configure_pending_) {
+        // The first configure, or one that finds no frame callback outstanding, is answered
+        // at once. One that arrives while a callback is outstanding (a compositor configuring
+        // per pointer motion) waits for it, the newest replacing the older (only its serial
+        // is acked: xdg-shell allows it) — one resize per refresh, as GTK 4's frozen frame
+        // clock gives. A callback withheld past `k_configure_wait_ns` (an occluded surface)
+        // no longer holds it.
+        if (!configured_ || !surface_.frame_pending())
+            return true;
+        return now_ns() >= frame_requested_ns_ + k_configure_wait_ns;
+    }
+    if (configured_ && scale_pending_)
         return true;
     if (!configured_)
         return false;
@@ -631,12 +721,30 @@ bool window::draw() {
     }
     lx::gfx::swapchain_image& image = *acquired.value();
     if (swapchain_.explicit_sync() && !syncobj_) {
-        // Explicit sync settles with the first image (lx.gfx:swapchain); the syncobj surface
-        // exists from then on, and every commit with a buffer carries its two points.
-        if (auto e = surface_.enable_syncobj(); e)
+        // Explicit sync settles with the first image (lx.gfx:swapchain: it never downgrades
+        // after); the syncobj surface exists from then on, and every commit with a buffer
+        // carries its two points (linux-drm-syncobj: no_acquire_point / no_release_point).
+        if (auto e = surface_.enable_syncobj(); e) {
             syncobj_ = true;
-        else
+        } else {
+            // Releases come from the timeline, which the compositor would never signal.
             log_window.error(e.get_error());
+            swapchain_.cancel(image);
+            ++stats_.failures;
+            broken_ = true;
+            return false;
+        }
+    }
+    buffer_slot* slot = slot_of(image.id);
+    if (!slot || (syncobj_ && !slot->timeline.valid())) {
+        // No wl_buffer, or a buffer with no timeline on a syncobj surface: a commit would be
+        // a protocol error. Nothing was ticked yet: the ledger is untouched.
+        log_window.error("swapchain image {} has no {}", image.id,
+                         slot ? "syncobj timeline" : "wl_buffer");
+        swapchain_.cancel(image);
+        ++stats_.failures;
+        broken_ = true;
+        return false;
     }
     const std::uint64_t t_acquired = now_ns();
     atlas_->begin_frame(++atlas_frame_);
@@ -706,14 +814,6 @@ bool window::draw() {
         return false;
     }
     const std::uint64_t t_presented = now_ns();
-    buffer_slot* slot = slot_of(image.id);
-    if (!slot) {
-        log_window.error("swapchain image {} has no wl_buffer", image.id);
-        restore_damage();
-        ++stats_.failures;
-        broken_ = true;
-        return false;
-    }
     if (first && log_window.enabled(lx::trace::level::debug)) {
         const std::uint64_t t_end = now_ns();
         const lx::ui::ui_root::stage_times st = root_->last_stage_times();
@@ -729,16 +829,21 @@ bool window::draw() {
     surface_.attach(&slot->buffer);
     for (unsigned i = 0; i < change.count; ++i)
         surface_.damage_buffer(change.rects[i]);
-    if (syncobj_ && slot->timeline.valid()) {
+    if (syncobj_) {
         surface_.set_acquire_point(slot->timeline, image.acquire_point);
         surface_.set_release_point(slot->timeline, image.release_point);
     }
     // The next frame's throttle: it fires once; with nothing left to draw it asks for no more.
     if (!surface_.frame_pending()) {
         surface_.request_frame();
+        frame_requested_ns_ = now_ns();
         ++stats_.frame_requests;
     }
-    (void)surface_.request_presentation_feedback();
+    // Feedback only where something reads it: every frame when asked (the frame ring, the
+    // bench), else until the first frame is presented (the timeline). Each request is a
+    // proxy, its events and a delete_id.
+    if (presentation_feedback_ || timeline_.first_presented_ns == 0)
+        (void)surface_.request_presentation_feedback();
     const std::uint64_t commit_id = surface_.commit();
     const std::uint64_t committed = now_ns();
     ++stats_.commits;

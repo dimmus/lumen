@@ -466,6 +466,9 @@ private:
     unsigned count_ = 0;
     std::uint32_t fourcc_ = 0;
     bool explicit_ = false;
+    /// An image was made with a timeline: explicit sync is final (a later timeline failure
+    /// fails that image; the window's syncobj surface needs points on every commit).
+    bool explicit_settled_ = false;
     bool native_fence_ = false;
     bool warned_fence_ = false;
     std::uint32_t next_id_ = 1;

@@ -138,7 +138,7 @@ measure on similar scenes; §8.6 says how each comparison is run.
 | G2 | Steady frame, shell panel (≈300 nodes, one clock cell changes) | ≤ 150 µs UI-thread CPU; damage ≤ 1 rect, ≤ 2 % of the surface | A panel repaint today is a CPU `shm_canvas` cell repaint; the GPU path must not cost more CPU than that |
 | G3 | 10 000 animated rounded quads | ≤ 1.0 ms CPU (emit + order + encode); ≤ 8 draw calls; ≤ 800 KB instance upload | 80 B per quad; GPUI batches the same scene into a handful of draws |
 | G4 | 100 000-glyph text wall, scrolling | ≤ 2.0 ms CPU per frame; 0 shaping calls per frame after warm-up; ≤ 1 draw call per atlas page | Shaping and line layout are cached in retained nodes; scrolling moves sprites |
-| G5 | Heap allocations per steady frame | 0 (`heaptrack` flat over 10 000 frames; `mallinfo2` delta 0) | memory-management.md §7; the compositor's hot path is already arena-only |
+| G5 | Heap allocations per steady frame | 0 `operator new` on the UI thread — every allocation Lumen's own code makes (`heaptrack` flat over 10 000 frames); the C libraries' `malloc` (libwayland's closure per message, the GL driver's per submit) and `mallinfo2`'s in-use delta reported beside it, not gated (amended in Phase 4: they are libwayland's and Mesa's floor, paid by every toolkit on them, not the frame path's) | memory-management.md §7; the compositor's hot path is already arena-only |
 | G6 | Input → photon, hover highlight in the shell | median ≤ 1 refresh period + 2 ms | drag-smoke gates window moves at 1.5 periods + 4 ms; UI hover has less work |
 | G7 | Cold start → first frame, `lumen-hello` | ≤ 30 ms with a warm pipeline cache, ≤ 150 ms cold | The compositor's first frame is 106 ms (rendering-performance.md §6.2) |
 | G8 | Anonymous RSS, `lumen-shell` | ≤ 25 MB | Compositor RssAnon 19.1 MB; a client with one atlas page and one swapchain has less state |
@@ -1189,7 +1189,8 @@ flush, read or cancel — and on a full socket waits for POLLOUT: the loop gaine
 codes `connect_failed`, `missing_global`, `connection_lost`, `object_failed`. The compositor
 now sends `axis_value120` to wl_pointer ≥ 8 instead of `axis_discrete`, which the protocol
 forbids there. Measured (`test_wayland_client`, 42 cases, in-process compositor on a
-1280×800@1.25 virtual output, load 1.2–3.8): connect with three roundtrips 1.6–14 ms; a
+1280×800@1.25 virtual output, load 1.2–3.8): connect with three roundtrips 1.6–14 ms (two since
+the review fixes below); a
 steady frame-callback cycle (request, commit, flush, dispatch) 48–64 µs p50, 300–745 µs p95
 on the client thread, with **0 `operator new`** over 300 frames and libwayland's own 9
 `malloc` / 9 `free` per frame (a `wl_proxy` per callback and a `wl_closure` per message, as
@@ -1300,7 +1301,9 @@ region, present, ack the configure right before the commit (frame-perfect: the c
 ack has the new size), attach, `damage_buffer` × ≤ 16 rects, syncobj points, frame callback,
 wp_presentation feedback (a 256-entry ring: commit, start, presented time, refresh, sequence,
 flags, rects), commit; a frame that fails puts its damage back in the ledger. A configure or a
-preferred-scale change is answered at once whatever callback is outstanding. `ui_root` gained
+preferred-scale change is answered at once whatever callback is outstanding (since the review
+fixes below: a configure only when no callback is outstanding; one arriving while it is waits for
+it, ≤ 100 ms). `ui_root` gained
 `wants_frame` (the tick's own early-out, asked before a buffer is taken), `add_repaint` /
 `frame_repaint`, `set_scale` / `device_size`, `bounds`.
 
@@ -1376,8 +1379,8 @@ vmwgfx dma-bufs; with it, the import fails and the compositor drops the client).
 Deviations from this stage's plan: there is no `lx.app:swapchain` partition (the swapchain is
 `lx.gfx:swapchain`, stage 2); the shell's bindings stay hand-written (Phase 5, with app-smoke as
 their check); one window per UI thread — lx.ui's ledger, overlays, timers and device scale are
-the thread's, so the application routes seat events to the last window opened and warns at a
-second; the age is repaint, not damage (above); from idle a frame does not wait for a frame
+the thread's, so the application refuses a second open window (it first routed seat events to
+the newest and warned, which left the first deaf once the second closed); the age is repaint, not damage (above); from idle a frame does not wait for a frame
 callback (above); touch is a single pointer; per-surface dma-buf feedback (a scanout tranche)
 is not used yet, nor is the swapchain re-created when feedback changes; a dma-buf the compositor
 refuses (`failed`) stops the window's drawing with one error rather than falling back to wl_shm.
@@ -1449,7 +1452,7 @@ baseline):
 | Gate | Scenario | cpu | gl (SVGA3D) | vulkan (lavapipe, software) |
 |------|----------|-----|-------------|-----------------------------|
 | G1 | S1, 10 s idle | **pass**: 0 wakeups (1 switch of the UI thread, the measurement's own quit timer), 0 callbacks requested, 0 commits, 0 submits, 0 timer expirations, 0 socket reads | **pass**, same counts | pass, same counts (4 threads) |
-| G5 | S1, S5 (600 hover frames), S9 | **pass**: 0 `operator new`; 20 `malloc` per frame (libwayland), in-use delta 0 B | **pass**: 0; 43 `malloc` per frame (libwayland, Mesa), +64 B | pass: 0; 29 per frame, −16 B |
+| G5 (§3 as amended: `operator new`; `malloc` and in-use reported) | S1, S5 (600 hover frames), S9 | **pass**: 0 `operator new`; reported: 20 `malloc` per frame (libwayland), in-use delta 0 B | **pass**: 0; reported: 43 `malloc` per frame (libwayland, Mesa), +64 B | pass: 0; reported: 29 per frame, −16 B |
 | — | S5 hover frame (start → commit; tick, render); damage | 75 / 187 µs (21 / 55, 36 / 98); 1 rect (the two rows, merged), 0 measures, 0 arranges | 428 / 1 571 µs (21 / 122, 323 / 1 233) | 631 / 2 287 µs wall, 96 / 536 µs CPU |
 | G6 (proxy) | S9, headless | **pass**: 9.27 ms = 0.56 periods / 15.9 ms = 0.96, 93 of 93 transitions | **pass**: 8.62 ms = 0.52 / 16.1 ms | 8.80 ms / 16.3 ms |
 | G7 cold | S10, empty cache, exec → presented | **pass**: 40.8 / 44.8 ms (commit 32.3 ms) | **miss on p95**: 135 / 154 ms (commit 133 ms); runs of the same tree gave p95 139–156 ms | software: 156 / 667 ms |
@@ -1475,6 +1478,59 @@ CPU tier's wl_shm buffers cost the compositor an upload per frame (2.7 ms vs 0.1
 dma-buf, §1). `automatic` keeps the compositor's order (hardware GL over CPU); a per-frame choice
 by damage size would need both tiers' buffers alive at once and is not taken.
 
+As built (review fixes). A review of the four stages found, and this change fixes, the following;
+each behavioural fix has a test against the in-process headless compositor. *Protocol lifetimes:*
+`min_size` no longer raises a maximized, tiled, fullscreen or resizing configure's size
+(xdg-shell: the first two are the size — anything else is `invalid_surface_state` — the others
+a maximum; the compositor may configure below `set_min_size`): `test_app_window` reopens the
+window with a 1 400 × 900 minimum on the 1 280 × 800 output — maximized it is the configured
+1 280 × 772, fullscreen 1 280 × 800, restored 1 400 × 900 again. Explicit sync is final once an
+image went out with a timeline (`client_swapchain` no longer downgrades on a later image's
+timeline failure: that image fails), and a window never commits a buffer without both points on
+a syncobj surface — the frame fails before its tick instead (no syncobj manager headless: not
+exercisable here). The seat synthesises what the compositor will not send when
+`wl_seat.capabilities` drops a device or the seat goes: a keyboard focus loss (a held key's
+repeat stops), a pointer leave frame, a touch cancel; a leave of one surface and an enter of
+another in one `wl_pointer.frame` are two frames (the left surface hears its leave); a destroyed
+`surface` is dropped from every seat's focus, the frame being folded and every text input's
+focus (the display keeps intrusive lists of its surfaces and text inputs: no allocation), and the
+application routes pointer frames by target only (a null target is never the window's) and
+forgets its keyboard target when the window detaches. `display::roundtrip` / `dispatch` called
+inside the loop (a posted task, another source) cancel `display_source`'s prepared read first —
+libwayland's second reader on one thread waited for the first forever. *Architecture:* a second
+`window::open` on one application fails (`invalid_argument`); `app_stats::worker_wakes` is the
+worker's atomic, read in `stats()` (now by value); `global_handler` gained
+`on_output_added` (first `done`) / `on_output_changed` / `on_output_removed` (every surface
+leaves the output first: the compositor's leave would name a released `wl_output`) and
+`on_seat_added` / `on_seat_removed` — the shell's one panel per output can move onto it in
+Phase 5; `test_wayland_client` plugs and unplugs a monitor through `simulate_connector_scan`.
+`choose_client_format` fails with the tier-neutral `drm_err::no_format`. The package diagram
+(docs/uml/01-package-layers.mmd) follows the DEPENDS edges. The automatic-tier test asserts what
+this host must give (no hardware Vulkan device under the hardware-only probe, a hardware
+GL_RENDERER: gl) instead of a tautology. *Performance:* the client's Vulkan probe runs under
+`hardware_probe_scope`, as the compositor's does: against a headless lumen-compositor with the
+render node standing in for the main device (`lumen-hello --render-node`, 6 runs each, load
+0.2) choosing the pixel path took 28.3 ms median automatic, 35.4 ms with lavapipe loaded (the
+old probe) and 27.0 ms forced GL — the hardware-only probe costs ≈ 1 ms; S10 has an automatic
+row (`--tier auto`, the render node standing in): 20 runs, load 0.4 → 2.6, cold first presented
+127.3 / 149.6 ms (p50 / p95) against forced GL's 126.5 / 140.5 ms — G7 cold met by both, on the
+edge, run to run (another run: 138.0 / 151.1 vs 129.6 / 138.6). wp_presentation feedback is
+requested only where it is read (`window_options::presentation_feedback`, the bench's S5 / S7 /
+S9 and `lumen-hello --frames`; otherwise until the first frame is presented): the hover sweep's
+`malloc` per frame on the UI thread fell from 22 to 16 on cpu and from 63 to 57 on gl; S5 with
+feedback on stays 20.0 (cpu) and 42.9 (gl) per frame, in-use delta +0 B on both. A configure
+that arrives while a frame callback is outstanding waits for it (the newest replaces the older;
+at most 100 ms, against a compositor that withholds callbacks), as GTK 4's frozen frame clock
+does: S7 gained an 8 ms storm (G11-throttle: reallocations ≤ frames presented) — 30 motions
+gave 18 configures (the headless compositor already coalesces to its 60 Hz tick), 16 frames, 16
+reallocations, 16 presented on cpu and on gl: pass, but a compositor configuring faster than it
+presents was not available to show the difference. The default dma-buf feedback is requested as
+linux-dmabuf is bound, so connect is two roundtrips: 0.68–5.6 ms, median 1.1 ms over 5 runs
+(load 0.6–0.9). The cpu tier keeps one `wl_shm_pool` per shm block (the compositor maps a block
+once, not once per image). G5 is gated as §3 now reads (`operator new` = 0), the `malloc` floor
+and in-use delta reported in every verdict's detail. `ctest --preset release`: 107 of 107;
+`ctest --preset bench`: 5 of 5.
+
 Deviations from Phase 4's plan, across its stages: the shell's hand-written bindings are not moved
 onto `lx.wayland.client` (it keeps `native()` / `native_global()` and a `global_handler` for
 extension globals so they move in Phase 5 with app-smoke as their check); there is no
@@ -1486,7 +1542,8 @@ changes; a refused dma-buf stops the window's drawing with one error rather than
 `wl_shm`; a 17th damage rect merges the cheapest pair, not the bounding box;
 `lumen-ui-bench --client`'s default compositor is the bench's own host role on lx::compositor, not
 the lumen-compositor binary (which has no way in for injected input or a forced resize; it runs
-S1 and S10); S7's resizes are the compositor's interactive resize driven by injected
+S1 and S10); G5 is gated on `operator new` with libwayland's and the driver's `malloc` reported,
+not on `mallinfo2` (§3's row amended); S7's resizes are the compositor's interactive resize driven by injected
 Super + right drag; S9 headless is a proxy for G6, and G6 itself was not measured;
 `lumen-hello` gained `--allow-software-gpu` for S10's software Vulkan rows.
 

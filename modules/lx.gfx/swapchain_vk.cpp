@@ -118,13 +118,20 @@ lx::result<void> client_gpu::try_vulkan(bool forced, bool allow_software) {
     // A software device is refused before it is created where possible: lavapipe's device
     // costs ~28 MB of heap and its JIT. `probe_devices` makes an instance only.
     if (!(forced && allow_software)) {
-        const physical_device_list list = device_selector::probe_devices();
+        // As the compositor probes (compositor_impl's start-up): the loader skips software
+        // ICDs, so asking costs no lavapipe load (~15 of the probe's 20 ms on this VM).
+        // UI thread at window creation, before any thread of ours writes the environment.
+        physical_device_list list{};
+        {
+            const hardware_probe_scope hardware_only;
+            list = device_selector::probe_devices();
+        }
         bool hardware = false;
         for (unsigned i = 0; i < list.count; ++i)
             hardware = hardware || list.devices[i].kind != physical_device_kind::cpu;
         if (!hardware) {
             refuse(client_tier::vulkan, list.count ? "software Vulkan device (lavapipe)"
-                                                   : "no Vulkan device");
+                                                   : "no hardware Vulkan device");
             return vk_error(lx::vulkan_err::unsupported, "no hardware Vulkan device");
         }
     }
@@ -484,6 +491,12 @@ lx::result<void> client_swapchain::make_vk(slot& s) {
         } else {
             if (sem_fd >= 0)
                 ::close(sem_fd);
+            if (explicit_settled_)
+                // Images on the wire already carry timelines (a syncobj surface exists):
+                // every commit needs its points, so this image fails rather than downgrade.
+                return vk_error(lx::vulkan_err::export_failed,
+                                "timeline semaphore for a new image not exportable as a DRM "
+                                "syncobj (explicit sync settled)");
             log_swapchain_vk.info("explicit sync unavailable on Vulkan (the timeline semaphore "
                                   "is not exportable as a DRM syncobj): implicit sync");
             explicit_ = false;

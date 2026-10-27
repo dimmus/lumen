@@ -112,7 +112,7 @@ lx::result<format_choice> choose_client_format(const client_feedback& feedback,
             }
         }
     }
-    return lx::make_error(lx::gl_err::unsupported,
+    return lx::make_error(lx::drm_err::no_format,
                           "no feedback tranche offers ARGB8888/XRGB8888 for the device");
 }
 
@@ -306,6 +306,7 @@ lx::result<void> client_swapchain::create(client_gpu& gpu, const swapchain_optio
     const bool kernel = options.timeline.fd_to_handle != nullptr || gpu.timeline_syncobj();
     explicit_ = dmabuf && options.explicit_sync && kernel && ops_.query && ops_.eventfd &&
                 ops_.fd_to_handle;
+    explicit_settled_ = false;
     if (gpu.tier() == client_tier::gl) {
         auto* egl = gpu.egl();
         native_fence_ = egl && egl->supports_native_fence() && !options.disable_native_fence;
@@ -366,6 +367,7 @@ void client_swapchain::destroy() {
     tier_ = client_tier::none;
     gpu_ = nullptr;
     explicit_ = false;
+    explicit_settled_ = false;
     frame_ = 0;
     last_presented_ = nullptr;
     for (auto& f : history_frame_)
@@ -399,8 +401,10 @@ lx::result<void> client_swapchain::make_image(slot& s, unsigned index) {
         s = slot{};
         return made.get_error();
     }
-    if (explicit_ && s.timeline.get() >= 0)
+    if (explicit_ && s.timeline.get() >= 0) {
         s.image.timeline_fd = s.timeline.get();
+        explicit_settled_ = true; // from here on explicit sync never downgrades
+    }
     s.state = slot_state::free;
     ++stats_.images_created;
     if (listener_)

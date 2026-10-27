@@ -271,6 +271,17 @@ void seat::update_devices() {
             wl_pointer_add_listener(pointer_, &k_pointer_listener, this);
         }
     } else if (!(caps_ & seat_pointer) && pointer_) {
+        // The device goes without a leave: what was pending is delivered, then the leave the
+        // compositor will never send (hover must not stick).
+        flush_pointer_frame();
+        if (pointer_focus_) {
+            pointer_frame f{};
+            f.mask = pointer_frame::has_leave;
+            f.target = pointer_focus_;
+            pointer_focus_ = nullptr;
+            if (handler_)
+                handler_->on_pointer(*this, f);
+        }
         if (cursor_shape_)
             wp_cursor_shape_device_v1_destroy(cursor_shape_);
         cursor_shape_ = nullptr;
@@ -289,6 +300,13 @@ void seat::update_devices() {
             wl_keyboard_add_listener(keyboard_, &k_keyboard_listener, this);
         }
     } else if (!(caps_ & seat_keyboard) && keyboard_) {
+        // No wl_keyboard.leave or key release will come: the focus loss is synthesised, so a
+        // held key's repeat stops.
+        if (surface* had = keyboard_focus_) {
+            keyboard_focus_ = nullptr;
+            if (handler_)
+                handler_->on_keyboard_focus(*this, had, 0, false);
+        }
         if (release_requests)
             wl_keyboard_release(keyboard_);
         else
@@ -303,6 +321,13 @@ void seat::update_devices() {
             wl_touch_add_listener(touch_, &k_touch_listener, this);
         }
     } else if (!(caps_ & seat_touch) && touch_) {
+        // Points still down end as the protocol's cancel.
+        if (touch_points_ > 0 && handler_) {
+            touch_event e{};
+            e.type = touch_event::kind::cancel;
+            handler_->on_touch(*this, e);
+        }
+        touch_points_ = 0;
         if (release_requests)
             wl_touch_release(touch_);
         else
@@ -355,11 +380,15 @@ void seat::flush_pointer_frame() {
 }
 
 void seat::on_pointer_enter(std::uint32_t serial, void* wl_surface, double x, double y) {
-    // A leave and an enter in one frame are one transition; a second enter is a new frame.
-    if (frame_.mask & pointer_frame::has_enter)
+    // A leave and an enter of the same surface in one frame are one transition; a leave of
+    // another surface (moving between two of the client's) is delivered as its own frame
+    // first, so the left surface hears it; a second enter is a new frame.
+    surface* entered = surface_of(wl_surface);
+    if ((frame_.mask & pointer_frame::has_enter) ||
+        ((frame_.mask & pointer_frame::has_leave) && frame_.target != entered))
         flush_pointer_frame();
     enter_serial_ = serial;
-    pointer_focus_ = surface_of(wl_surface);
+    pointer_focus_ = entered;
     frame_.mask |= pointer_frame::has_enter;
     frame_.target = pointer_focus_;
     frame_.serial = serial;
@@ -439,6 +468,18 @@ void seat::on_pointer_axis_relative_direction(std::uint32_t axis, std::uint32_t 
     const unsigned i = axis == WL_POINTER_AXIS_HORIZONTAL_SCROLL ? 1u : 0u;
     frame_.mask |= pointer_frame::has_axis_relative_direction;
     frame_.direction[i] = direction;
+}
+
+void seat::forget_surface(const surface* s) {
+    if (!s)
+        return;
+    if (pointer_focus_ == s)
+        pointer_focus_ = nullptr;
+    if (keyboard_focus_ == s)
+        keyboard_focus_ = nullptr;
+    // A frame still being folded for it: its target is unknown from now on (routers drop it).
+    if (frame_.target == s)
+        frame_.target = nullptr;
 }
 
 // Keyboard.
@@ -584,8 +625,14 @@ void seat::on_repeat_info(std::int32_t rate, std::int32_t delay) {
 }
 
 void seat::on_touch(const touch_event& e) {
-    if (e.type == touch_event::kind::down)
+    if (e.type == touch_event::kind::down) {
         input_serial_ = e.serial;
+        ++touch_points_;
+    } else if (e.type == touch_event::kind::up && touch_points_ > 0) {
+        --touch_points_;
+    } else if (e.type == touch_event::kind::cancel) {
+        touch_points_ = 0;
+    }
     if (handler_)
         handler_->on_touch(*this, e);
 }
@@ -606,6 +653,8 @@ lx::result<void> text_input::create(display& d, seat& s) {
     proxy_ = zwp_text_input_manager_v3_get_text_input(manager, static_cast<wl_seat*>(s.native()));
     if (!proxy_)
         return lx::make_error(lx::wayland_err::object_failed, "get_text_input failed");
+    display_ = &d;
+    d.link_text_input(this);
     version_ = zwp_text_input_v3_get_version(proxy_);
     wl_proxy_set_tag(reinterpret_cast<wl_proxy*>(proxy_), &lx_wlc_tag);
     zwp_text_input_v3_add_listener(proxy_, &k_text_input_listener, this);
@@ -614,6 +663,9 @@ lx::result<void> text_input::create(display& d, seat& s) {
 }
 
 void text_input::destroy() {
+    if (display_ && linked_)
+        display_->unlink_text_input(this);
+    display_ = nullptr;
     if (proxy_)
         zwp_text_input_v3_destroy(proxy_);
     proxy_ = nullptr;
@@ -696,6 +748,11 @@ void text_input::commit() {
     zwp_text_input_v3_commit(proxy_);
     ++commits_;
     enabled_ = pending_enabled_;
+}
+
+void text_input::forget_surface(const surface* s) {
+    if (s && focus_ == s)
+        focus_ = nullptr;
 }
 
 void text_input::on_enter(void* wl_surface) {
@@ -791,6 +848,7 @@ void seat::on_modifiers(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32
                         std::uint32_t) {}
 void seat::on_repeat_info(std::int32_t, std::int32_t) {}
 void seat::on_touch(const touch_event&) {}
+void seat::forget_surface(const surface*) {}
 
 text_input::~text_input() = default;
 lx::result<void> text_input::create(display&, seat&) {
@@ -807,6 +865,7 @@ void text_input::set_available_actions(std::span<const std::uint32_t>) {}
 void text_input::show_input_panel() {}
 void text_input::hide_input_panel() {}
 void text_input::commit() {}
+void text_input::forget_surface(const surface*) {}
 void text_input::on_enter(void*) {}
 void text_input::on_leave(void*) {}
 void text_input::on_preedit(const char* text, std::int32_t, std::int32_t) {

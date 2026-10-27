@@ -759,8 +759,10 @@ void pure_cases() {
           other && other->device == 0xfff01 && other->modifiers[0] == 0x200000000000001ull, "");
     const client_tranche none[] = {{0xfff00, false, other_formats}};
     auto missing = choose_client_format({0xfff01, none}, {.opaque = false});
-    check("format: no tranche for the device is gl_err::unsupported",
-          !missing && missing.get_error().code == static_cast<int>(lx::gl_err::unsupported), "");
+    check("format: no tranche for the device is drm_err::no_format (tier-neutral)",
+          !missing && missing.get_error().domain == lx::error_domain::drm &&
+              missing.get_error().code == static_cast<int>(lx::drm_err::no_format),
+          "");
     check("tier names parse (LUMEN_UI_BACKEND)",
           parse_client_tier("vulkan") == client_tier::vulkan &&
               parse_client_tier("gl") == client_tier::gl &&
@@ -1391,17 +1393,58 @@ void run_cases() {
     const std::uint64_t render_dev = node ? node.value().dev : 0;
     if (node)
         measure(std::format("render node {} dev {:#x}", node.value().path, render_dev));
-    {
-        // What a window on a compositor that names this node would get: Vulkan refused
-        // (lavapipe is software), then GL on the hardware GL_RENDERER.
+    if (render_dev) {
+        // What a window on a compositor that names this node gets, against what this host
+        // has: hardware Vulkan devices (the probe the client makes, software ICDs skipped)
+        // and whether forced GL finds a hardware GL_RENDERER (forced without allow_software
+        // refuses a software one).
+        lx::gfx::physical_device_list probed{};
+        {
+            const lx::gfx::hardware_probe_scope hardware_only;
+            probed = lx::gfx::device_selector::probe_devices();
+        }
+        unsigned vk_hardware = 0;
+        for (unsigned i = 0; i < probed.count; ++i)
+            vk_hardware += probed.devices[i].kind != lx::gfx::physical_device_kind::cpu ? 1u : 0u;
+        bool gl_hardware = false;
+        std::string gl_name;
+        {
+            lx::gfx::client_gpu glp;
+            gl_hardware = glp.create(feedback, {.force = lx::gfx::client_tier::gl,
+                                                .read_environment = false,
+                                                .device_override = render_dev})
+                              .ok() &&
+                          !glp.software();
+            gl_name = glp.name();
+        }
         lx::gfx::client_gpu gpu;
         auto made = gpu.create(feedback, {.read_environment = false, .device_override = render_dev});
-        check("automatic on the render node: vulkan refused when software, gl taken when hardware",
-              made && (gpu.tier() != lx::gfx::client_tier::vulkan || !gpu.software()),
-              std::format("tier {} ({}){}; vulkan: {}; gl: {}", lx::gfx::client_tier_name(gpu.tier()),
-                          gpu.name(), gpu.software() ? " software" : "",
-                          gpu.refusal(lx::gfx::client_tier::vulkan),
-                          gpu.refusal(lx::gfx::client_tier::gl)));
+        const std::string detail =
+            std::format("tier {} ({}){}; {} hardware Vulkan device(s); forced GL {} ({}); "
+                        "vulkan: {}; gl: {}",
+                        lx::gfx::client_tier_name(gpu.tier()), gpu.name(),
+                        gpu.software() ? " software" : "", vk_hardware,
+                        gl_hardware ? "hardware" : "refused or software", gl_name,
+                        gpu.refusal(lx::gfx::client_tier::vulkan),
+                        gpu.refusal(lx::gfx::client_tier::gl));
+        if (vk_hardware > 0) {
+            // Which device owns the node is the selector's to say: not determinable here.
+            skip("automatic on the render node", "a hardware Vulkan device exists: " + detail);
+        } else if (gl_hardware) {
+            check("automatic on the render node: no hardware Vulkan → vulkan refused; hardware "
+                  "GL_RENDERER → gl",
+                  made && gpu.tier() == lx::gfx::client_tier::gl && !gpu.software() &&
+                      std::strlen(gpu.refusal(lx::gfx::client_tier::vulkan)) > 0,
+                  detail);
+        } else {
+            check("automatic on the render node: no hardware Vulkan or GL → cpu, both refused",
+                  made && gpu.tier() == lx::gfx::client_tier::cpu &&
+                      std::strlen(gpu.refusal(lx::gfx::client_tier::vulkan)) > 0 &&
+                      std::strlen(gpu.refusal(lx::gfx::client_tier::gl)) > 0,
+                  detail);
+        }
+    } else {
+        skip("automatic on the render node", "no render node");
     }
 
     // The tiers, each forced (the override a test or bench uses).

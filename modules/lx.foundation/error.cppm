@@ -83,6 +83,9 @@ enum class drm_err : int {
     /// The driver offers no atomic modesetting (DRM_CLIENT_CAP_ATOMIC refused), which the
     /// KMS path requires (`lx::drm::no_atomic_hint` says what to do about it).
     no_atomic = 10,
+    /// The compositor's dma-buf feedback offers no fourcc / modifier a client can allocate
+    /// on its device (`lx::gfx::choose_client_format`, whichever GPU tier asks).
+    no_format = 11,
 };
 
 enum class protocol_err : int {

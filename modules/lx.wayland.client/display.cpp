@@ -227,6 +227,7 @@ void output::release() {
     }
     proxy_ = nullptr;
     info_ = {};
+    announced_ = false;
 }
 
 void output::on_geometry(std::int32_t x, std::int32_t y, std::int32_t pw, std::int32_t ph,
@@ -260,7 +261,11 @@ void output::on_description(const char* description) {
     copy_string(info_.description, sizeof(info_.description), description);
 }
 
-void output::on_done() { info_.done = true; }
+void output::on_done() {
+    info_.done = true;
+    if (display_)
+        display_->on_output_done(*this);
+}
 
 void output::on_logical_position(std::int32_t x, std::int32_t y) {
     info_.logical.x = x;
@@ -284,6 +289,7 @@ lx::result<void> display::connect(const connect_options& options) {
     affinity_ = options.affinity;
     check_affinity();
     track_outputs_ = options.track_outputs;
+    want_feedback_ = options.default_dmabuf_feedback;
     error_ = {};
     error_logged_ = false;
     for (unsigned i = 0; i < k_global_kinds; ++i) {
@@ -335,14 +341,8 @@ lx::result<void> display::connect(const connect_options& options) {
         used = std::min(sizeof(missing) - 1, used + static_cast<std::size_t>(r.size));
     }
 
-    if (options.default_dmabuf_feedback && version(global_kind::dmabuf) >= 4) {
-        feedback_ = std::make_unique<dmabuf_feedback>();
-        if (auto made = feedback_->create(*this); !made) {
-            feedback_.reset();
-        } else if (wl_display_roundtrip(display_) < 0) {
-            return fail(lx::wayland_err::dispatch_failed, "feedback roundtrip failed");
-        }
-    }
+    // The default dma-buf feedback was requested as linux-dmabuf was bound (roundtrip 1):
+    // its format table, tranches and done arrived in roundtrip 2, no third one.
     log_wl.info("connected: wl_compositor v{} xdg_wm_base v{} wl_seat×{} wl_output×{} "
                 "linux-dmabuf v{} syncobj v{} fractional-scale v{} presentation v{} "
                 "text-input v{}; absent: {}",
@@ -369,9 +369,32 @@ lx::result<void> display::fail(lx::wayland_err code, const char* what) {
 void display::disconnect() {
     if (!display_)
         return;
+    if (source_ && source_->prepared_) {
+        wl_display_cancel_read(display_);
+        source_->prepared_ = false;
+    }
     feedback_.reset();
-    for (auto& s : seats_)
+    // The connection is ending at the owner's request: no focus loss is synthesised to
+    // handlers that may be gone already, and surfaces or text inputs still alive (a misuse:
+    // they should go first) no longer point here.
+    for (auto& s : seats_) {
+        s.set_handler(nullptr);
         s.release();
+    }
+    for (surface* s = surfaces_; s;) {
+        surface* next = s->next_;
+        s->linked_ = false;
+        s->next_ = s->prev_ = nullptr;
+        s = next;
+    }
+    surfaces_ = nullptr;
+    for (text_input* t = text_inputs_; t;) {
+        text_input* next = t->next_;
+        t->linked_ = false;
+        t->next_ = t->prev_ = nullptr;
+        t = next;
+    }
+    text_inputs_ = nullptr;
     for (auto& o : outputs_)
         o.release();
     for (unsigned i = 0; i < k_global_kinds; ++i) {
@@ -467,6 +490,7 @@ lx::result<int> display::dispatch(int timeout_ms) {
     check_affinity();
     if (!display_)
         return lx::make_error(lx::wayland_err::connection_lost, "not connected");
+    release_source_read();
     if (wl_display_prepare_read(display_) != 0)
         return dispatch_pending();
     pollfd pfd{wl_display_get_fd(display_), POLLIN, 0};
@@ -505,6 +529,7 @@ lx::result<void> display::roundtrip() {
     check_affinity();
     if (!display_)
         return lx::make_error(lx::wayland_err::connection_lost, "not connected");
+    release_source_read();
     if (wl_display_roundtrip(display_) < 0) {
         note_error();
         return lx::make_error(error_.display_errno == EPROTO ? lx::wayland_err::protocol_violation
@@ -547,6 +572,14 @@ void display::on_global(std::uint32_t name, const char* interface, std::uint32_t
             for (auto& o : outputs_)
                 o.bind_xdg_output(p);
             break;
+        case global_kind::dmabuf:
+            // The default feedback now: its events come with the next roundtrip's.
+            if (want_feedback_ && v >= 4 && !feedback_) {
+                feedback_ = std::make_unique<dmabuf_feedback>();
+                if (auto made = feedback_->create(*this); !made)
+                    feedback_.reset();
+            }
+            break;
         default: break;
         }
         return;
@@ -557,8 +590,11 @@ void display::on_global(std::uint32_t name, const char* interface, std::uint32_t
                 continue;
             auto* p = static_cast<wl_seat*>(wl_registry_bind(
                 registry_, name, &wl_seat_interface, std::min<std::uint32_t>(version, k_seat_cap)));
-            if (p)
+            if (p) {
                 s.bind(this, p, name, std::min<std::uint32_t>(version, k_seat_cap));
+                if (global_handler_)
+                    global_handler_->on_seat_added(*this, s);
+            }
             return;
         }
         ++dropped_globals_;
@@ -587,11 +623,20 @@ void display::on_global(std::uint32_t name, const char* interface, std::uint32_t
 void display::on_global_remove(std::uint32_t name) {
     for (auto& s : seats_)
         if (s.bound() && s.global_name() == name) {
-            s.release();
+            s.release(); // its devices' focus loss first (seat::release)
+            if (global_handler_)
+                global_handler_->on_seat_removed(*this, s);
             return;
         }
     for (auto& o : outputs_)
         if (o.bound() && o.info().global_name == name) {
+            const unsigned slot = slot_of(o);
+            // Every surface leaves it now: the compositor's wl_surface.leave would name a
+            // wl_output already released (null), and the slot is reused.
+            for (surface* s = surfaces_; s; s = s->next_)
+                s->forget_output(slot);
+            if (o.announced_ && global_handler_)
+                global_handler_->on_output_removed(*this, slot);
             o.release();
             return;
         }
@@ -622,6 +667,21 @@ void display::on_ping(std::uint32_t serial) {
 }
 
 void display::on_presentation_clock(std::uint32_t clock) { presentation_clock_ = clock; }
+
+unsigned display::slot_of(const output& o) const {
+    return static_cast<unsigned>(&o - outputs_);
+}
+
+void display::on_output_done(output& o) {
+    const bool added = !o.announced_;
+    o.announced_ = true;
+    if (!global_handler_)
+        return;
+    if (added)
+        global_handler_->on_output_added(*this, slot_of(o));
+    else
+        global_handler_->on_output_changed(*this, slot_of(o));
+}
 
 const output* display::output_at(unsigned slot) const {
     return slot < k_max_outputs && outputs_[slot].bound() ? &outputs_[slot] : nullptr;
@@ -694,6 +754,8 @@ void display::on_global_remove(std::uint32_t) {}
 void display::on_shm_format(std::uint32_t) {}
 void display::on_ping(std::uint32_t) {}
 void display::on_presentation_clock(std::uint32_t) {}
+unsigned display::slot_of(const output&) const { return ~0u; }
+void display::on_output_done(output&) {}
 const output* display::output_at(unsigned) const { return nullptr; }
 unsigned display::output_slot(const void*) const { return ~0u; }
 unsigned display::output_count() const { return 0; }
@@ -701,6 +763,64 @@ seat* display::default_seat() { return nullptr; }
 seat* display::seat_at(unsigned) { return nullptr; }
 
 #endif // LX_WLC_REAL
+
+// ── object lists (no libwayland call) ──
+
+void display::link_surface(surface* s) {
+    s->linked_ = true;
+    s->prev_ = nullptr;
+    s->next_ = surfaces_;
+    if (surfaces_)
+        surfaces_->prev_ = s;
+    surfaces_ = s;
+}
+
+void display::unlink_surface(surface* s) {
+    if (!s->linked_)
+        return;
+    s->linked_ = false;
+    if (s->prev_)
+        s->prev_->next_ = s->next_;
+    else if (surfaces_ == s)
+        surfaces_ = s->next_;
+    if (s->next_)
+        s->next_->prev_ = s->prev_;
+    s->next_ = s->prev_ = nullptr;
+    // Nothing may name it once it is gone.
+    for (auto& seat : seats_)
+        seat.forget_surface(s);
+    for (text_input* t = text_inputs_; t; t = t->next_)
+        t->forget_surface(s);
+}
+
+void display::link_text_input(text_input* t) {
+    t->linked_ = true;
+    t->prev_ = nullptr;
+    t->next_ = text_inputs_;
+    if (text_inputs_)
+        text_inputs_->prev_ = t;
+    text_inputs_ = t;
+}
+
+void display::unlink_text_input(text_input* t) {
+    if (!t->linked_)
+        return;
+    t->linked_ = false;
+    if (t->prev_)
+        t->prev_->next_ = t->next_;
+    else if (text_inputs_ == t)
+        text_inputs_ = t->next_;
+    if (t->next_)
+        t->next_->prev_ = t->prev_;
+    t->next_ = t->prev_ = nullptr;
+}
+
+void display::release_source_read() {
+    if (source_ && source_->prepared_) {
+        cancel_read();
+        source_->prepared_ = false;
+    }
+}
 
 // ── display_source (plain libwayland calls go through display, so no #if) ──
 
@@ -715,6 +835,7 @@ void display_source::attach() {
         return;
     loop_.add_source(this);
     attached_ = true;
+    display_.source_ = this;
 }
 
 void display_source::detach() {
@@ -726,6 +847,8 @@ void display_source::detach() {
         loop_.remove_source(this);
     attached_ = false;
     want_write_ = false;
+    if (display_.source_ == this)
+        display_.source_ = nullptr;
 }
 
 int display_source::poll_fd() const { return display_.fd(); }

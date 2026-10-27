@@ -23,6 +23,8 @@ import :dmabuf;
 
 export namespace lx::wayland {
 
+class display_source;
+
 struct connect_options {
     /// A socket name or absolute path. Null: WAYLAND_SOCKET (an inherited fd), then
     /// WAYLAND_DISPLAY, then "wayland-0" — what wl_display_connect does.
@@ -60,11 +62,14 @@ public:
     void on_logical_size(std::int32_t w, std::int32_t h);
 
 private:
+    friend class display;
     display* display_ = nullptr;
     wl_output* proxy_ = nullptr;
     zxdg_output_v1* xdg_ = nullptr;
     std::uint32_t version_ = 0;
     output_info info_{};
+    /// `global_handler::on_output_added` was raised (its first done).
+    bool announced_ = false;
 };
 
 /// The client connection. Non-movable: libwayland's listeners hold its address. UI
@@ -86,8 +91,8 @@ public:
     display& operator=(const display&) = delete;
 
     /// Connects, binds the globals (two roundtrips: the registry, then the state the bound
-    /// globals send at once — output modes, seat capabilities, xdg_wm_base's first ping)
-    /// and fails with `wayland_err::bind_failed` when wl_compositor, wl_shm or xdg_wm_base
+    /// globals send at once — output modes, seat capabilities, xdg_wm_base's first ping, the
+    /// default dma-buf feedback, requested as linux-dmabuf is bound) and fails with `wayland_err::bind_failed` when wl_compositor, wl_shm or xdg_wm_base
     /// is missing. Missing optional globals are logged once at info and left absent.
     [[nodiscard]] lx::result<void> connect(const connect_options& options = {});
     /// Destroys every proxy this display bound and closes the connection.
@@ -116,6 +121,11 @@ public:
     /// Flush, wait at most `timeout_ms` (-1: forever) for events, read and dispatch them —
     /// one blocking iteration for simple loops and tests. The count dispatched.
     [[nodiscard]] lx::result<int> dispatch(int timeout_ms);
+    /// `dispatch` and `roundtrip` read the socket themselves. Called from inside an
+    /// lx::runtime loop the attached `display_source` holds a prepared read across (a UI
+    /// strand task, another source's dispatch), they first cancel that read — libwayland's
+    /// second reader on one thread would wait for the first forever — and the source
+    /// prepares again on the loop's next iteration.
     [[nodiscard]] lx::result<void> roundtrip();
 
     /// The connection's error (none while healthy). A protocol error is logged once, with
@@ -163,6 +173,16 @@ public:
     /// Asserts the dispatching affinity (debug builds).
     void check_affinity() const;
 
+    // Object lifecycle (surface, text_input and display_source call these).
+    /// Every surface and text input made from this display, intrusively listed (no
+    /// allocation): an output going clears its bit from every surface, a surface being
+    /// destroyed is dropped from every seat's and text input's focus.
+    void link_surface(surface* s);
+    void unlink_surface(surface* s);
+    void link_text_input(text_input* t);
+    void unlink_text_input(text_input* t);
+    void on_output_done(output& o);
+
     // Registry entry points (listener thunks).
     void on_global(std::uint32_t name, const char* interface, std::uint32_t version);
     void on_global_remove(std::uint32_t name);
@@ -171,8 +191,12 @@ public:
     void on_presentation_clock(std::uint32_t clock);
 
 private:
+    friend class display_source;
     lx::result<void> fail(lx::wayland_err code, const char* what);
     void note_error();
+    /// Cancels the attached display_source's prepared read (see `roundtrip`).
+    void release_source_read();
+    [[nodiscard]] unsigned slot_of(const output& o) const;
 
     wl_display* display_ = nullptr;
     wl_registry* registry_ = nullptr;
@@ -182,6 +206,9 @@ private:
     seat seats_[k_max_seats]{};
     std::unique_ptr<dmabuf_feedback> feedback_{};
     global_handler* global_handler_ = nullptr;
+    display_source* source_ = nullptr;
+    surface* surfaces_ = nullptr;
+    text_input* text_inputs_ = nullptr;
     protocol_error_info error_{};
     lx::runtime::affinity affinity_ = lx::runtime::affinity::ui;
     std::uint32_t shm_formats_ = 0;
@@ -190,6 +217,7 @@ private:
     unsigned pings_ = 0;
     unsigned dropped_globals_ = 0;
     bool track_outputs_ = true;
+    bool want_feedback_ = true;
     bool error_logged_ = false;
 };
 
@@ -221,6 +249,7 @@ public:
     [[nodiscard]] unsigned long long reads() const { return reads_; }
 
 private:
+    friend class display;
     void fail();
 
     display& display_;

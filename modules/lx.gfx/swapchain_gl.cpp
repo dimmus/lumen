@@ -266,6 +266,10 @@ lx::result<void> client_swapchain::make_gl(slot& s) {
 
     if (explicit_) {
         if (auto t = make_timeline(s); !t) {
+            // Once an image went out with a timeline the syncobj surface exists, and every
+            // commit must carry points: this image fails instead (the window stops drawing).
+            if (explicit_settled_)
+                return t.get_error();
             log_swapchain_gl.warn("explicit sync: {} — implicit sync from here on",
                                   t.get_error().message);
             explicit_ = false;

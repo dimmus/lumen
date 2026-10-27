@@ -196,6 +196,8 @@ public:
     void on_preferred_transform(std::uint32_t transform);
     void on_fractional_scale(std::uint32_t scale120);
     void on_frame_done(std::uint32_t time_ms);
+    /// Output slot `slot` is going (the display calls this): left at once, the handler told.
+    void forget_output(unsigned slot);
 
     struct feedback_slot {
         surface* owner = nullptr;
@@ -207,9 +209,14 @@ public:
     void on_feedback(feedback_slot& slot, const presentation_event* presented);
 
 private:
+    friend class display;
     void set_region(bool opaque, std::span<const rect2i> rects);
 
     display* display_ = nullptr;
+    /// The display's list of surfaces (intrusive: no allocation).
+    surface* next_ = nullptr;
+    surface* prev_ = nullptr;
+    bool linked_ = false;
     wl_surface* proxy_ = nullptr;
     wl_callback* frame_ = nullptr;
     wp_viewport* viewport_ = nullptr;

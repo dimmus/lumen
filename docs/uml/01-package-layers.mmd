@@ -46,14 +46,17 @@ flowchart TB
         FOUND["lx::foundation"]
     end
 
-    APP --> UIB
+    APP --> UI
+    APP --> GFX
+    APP --> SCENE
+    APP --> WLC
     APP --> RT
     UI --> SCENE
     UI --> TEXT
     UIB --> UI
     SHELL --> POLICY
     SHELL --> TEXT
-    POLICY --> WLC
+    POLICY --> WLPROT
     COMP --> WLS
     COMP --> SCENE
     COMP --> SCHED
@@ -66,7 +69,7 @@ flowchart TB
     SCENE --> LAYOUT
     SCENE --> SCHED
     WLS --> WLPROT
-    WLC --> WLPROT
+    WLC --> RT
     INPUT --> RT
     DRM --> RT
     SESSION --> RT

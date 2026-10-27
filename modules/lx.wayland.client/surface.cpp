@@ -330,6 +330,7 @@ lx::result<void> surface::create(display& d) {
     if (!proxy_)
         return lx::make_error(lx::wayland_err::object_failed, "create_surface failed");
     display_ = &d;
+    d.link_surface(this);
     version_ = wl_surface_get_version(proxy_);
     tag(proxy_);
     wl_surface_add_listener(proxy_, &k_surface_listener, this);
@@ -344,6 +345,11 @@ lx::result<void> surface::create(display& d) {
 }
 
 void surface::destroy() {
+    // Out of the display's list, and out of every seat's and text input's focus: events
+    // still in flight for the wl_surface arrive with no target, never this object's.
+    if (display_ && linked_)
+        display_->unlink_surface(this);
+    outputs_ = 0;
     for (auto& f : feedback_) {
         if (f.proxy)
             wp_presentation_feedback_destroy(f.proxy);
@@ -614,6 +620,14 @@ void surface::on_enter(void* wl_output) {
         handler_->on_output(*this, slot, true);
 }
 
+void surface::forget_output(unsigned slot) {
+    if (slot >= 32 || !(outputs_ & (1u << slot)))
+        return;
+    outputs_ &= ~(1u << slot);
+    if (handler_)
+        handler_->on_output(*this, slot, false);
+}
+
 void surface::on_leave(void* wl_output) {
     const unsigned slot = display_ ? display_->output_slot(wl_output) : ~0u;
     if (slot >= 32)
@@ -702,6 +716,7 @@ void surface::set_release_point(syncobj_timeline&, std::uint64_t) {}
 std::uint32_t surface::preferred_scale120() const { return 120; }
 void surface::on_enter(void*) {}
 void surface::on_leave(void*) {}
+void surface::forget_output(unsigned) {}
 void surface::on_preferred_buffer_scale(std::int32_t) {}
 void surface::on_preferred_transform(std::uint32_t) {}
 void surface::on_fractional_scale(std::uint32_t) {}

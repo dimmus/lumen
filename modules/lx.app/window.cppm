@@ -15,9 +15,13 @@ module;
 // render inside the repaint region (each rect scissored), present it (sync exported), ack the
 // configure it answers, attach, damage_buffer × what changed (≤ 16 rects), set the syncobj
 // points, request the next frame callback and presentation feedback, commit. The ledger is
-// cleared only by that commit: a frame that fails puts its damage back. A configure (and a
-// preferred-scale change) is answered at once, whatever callback is outstanding: the commit
-// right after its ack has its size (frame-perfect resize).
+// cleared only by that commit: a frame that fails puts its damage back. A configure that finds
+// no frame callback outstanding (and a preferred-scale change, always) is answered at once;
+// one that arrives while a callback is outstanding waits for it, the newest replacing the
+// older, so a compositor configuring per pointer motion gets one resize per refresh (GTK 4's
+// frozen frame clock). The commit right after an ack has its size (frame-perfect resize).
+// A maximized or tiled configure's size is the window's; a fullscreen or resizing one's is
+// its maximum; `min_size` holds only where the compositor leaves the size to the client.
 //
 // Idle (G1): an empty ledger, nothing animating, no timer due, no key held → no frame callback
 // is requested after the last frame's, nothing is submitted, no timer is armed, and the loop
@@ -63,6 +67,10 @@ struct settings {
     lx::gfx::client_tier backend = lx::gfx::client_tier::none;
     /// Let a forced tier run on a software device (lavapipe, llvmpipe): tests only.
     bool allow_software_gpu = false;
+    /// A render node's dev_t to choose the tier on instead of the compositor's main device
+    /// (a headless compositor names none: the bench's automatic-tier start-up row). 0: the
+    /// compositor's.
+    std::uint64_t device_override = 0;
     /// Rasterise icon misses on the worker thread (else on the UI thread, synchronously).
     bool async_icons = true;
 };
@@ -79,8 +87,9 @@ public:
     [[nodiscard]] virtual lx::runtime::executor* host_worker() = 0;
     /// The window asks to be closed (xdg_toplevel.close): the application decides.
     virtual void host_close_requested(window& w) = 0;
-    /// The window opened / is closing: seat events and deadlines are routed to it.
-    virtual void host_attach(window& w) = 0;
+    /// The window opens (refused: the open fails with the error) / is closing (a no-op for a
+    /// window never admitted): seat events and deadlines are routed to it.
+    [[nodiscard]] virtual lx::result<void> host_attach(window& w) = 0;
     virtual void host_detach(window& w) = 0;
 
 protected:
@@ -92,6 +101,8 @@ struct window_options {
     const char* app_id = "org.lumen.app";
     /// Logical px, used when the compositor's first configure leaves the size to the client.
     lx::size2i size{640, 480};
+    /// xdg_toplevel.set_min_size, and the floor of a size the client picks. Never above a
+    /// maximized, tiled, fullscreen or resizing configure's size (xdg-shell).
     lx::size2i min_size{};
     /// The UI. Required.
     lx::ui::describe_fn describe = nullptr;
@@ -100,6 +111,10 @@ struct window_options {
     bool opaque = true;
     /// The UI arena (descriptors, per frame).
     std::size_t arena_bytes = 512 * 1024;
+    /// wp_presentation feedback for every frame (the frame ring's presented times,
+    /// `stats().presented`). Off: only until the first frame is presented (the timeline's
+    /// `first_presented_ns`) — each request is a proxy, its events and a delete_id.
+    bool presentation_feedback = false;
 };
 
 /// One committed frame's wp_presentation feedback, for the bench (§8.3 S9). CLOCK_MONOTONIC
@@ -191,7 +206,9 @@ public:
     window& operator=(const window&) = delete;
 
     /// Creates the surface and the toplevel, picks the pixel tier and adds the frame source
-    /// to the host's loop. The first frame is drawn when the first configure arrives.
+    /// to the host's loop. The first frame is drawn when the first configure arrives. Fails
+    /// (invalid_argument) while another window of the host is open: one window per UI
+    /// thread, since lx.ui's ledger, overlays, timers and scale are the thread's.
     [[nodiscard]] lx::result<void> open(window_host& host, const window_options& options);
     void close();
     [[nodiscard]] bool is_open() const { return open_; }
@@ -225,6 +242,8 @@ public:
 
     /// Draw every frame (whole window damaged) while true — `lumen-hello --frames`.
     void set_continuous(bool on) { continuous_ = on; }
+    /// `window_options::presentation_feedback`, from the next frame.
+    void set_presentation_feedback(bool on) { presentation_feedback_ = on; }
     /// The earliest deadline the application must wake for (a held key's repeat, a UI timer
     /// still ahead of `now_ns`); 0: none.
     [[nodiscard]] std::uint64_t next_deadline_ns(std::uint64_t now_ns) const;
@@ -261,11 +280,23 @@ private:
     struct frame_source;
     struct buffer_slot {
         std::uint32_t id = 0;
+        /// The wl_shm_pool (`pools_`) the buffer was made from; 0: a dma-buf.
+        std::uint32_t pool_id = 0;
         lx::wayland::buffer buffer{};
         lx::wayland::syncobj_timeline timeline{};
     };
+    /// One wl_shm_pool per swapchain shm block (`swapchain_image::pool_id`), alive while
+    /// the block has images.
+    struct shm_pool_slot {
+        std::uint32_t id = 0;
+        unsigned refs = 0;
+        lx::wayland::shm_pool pool{};
+    };
     static constexpr unsigned k_buffer_slots =
         lx::gfx::k_swapchain_images + lx::gfx::k_swapchain_retired;
+    static constexpr unsigned k_shm_pools = 1 + lx::gfx::k_swapchain_retired;
+    /// The longest a configure waits for an outstanding frame callback.
+    static constexpr std::uint64_t k_configure_wait_ns = 100'000'000;
 
     [[nodiscard]] lx::result<void> make_pixel_path();
     /// Applies a pending configure and scale: bounds, scale, viewport, swapchain size.
@@ -276,6 +307,7 @@ private:
     [[nodiscard]] lx::result<void> render(lx::gfx::swapchain_image& image,
                                           const lx::gfx::damage_region& repaint);
     [[nodiscard]] buffer_slot* slot_of(std::uint32_t id);
+    void release_pool(std::uint32_t pool_id);
     void collect_releases();
     [[nodiscard]] static std::uint64_t now_ns();
     /// CLOCK_THREAD_CPUTIME_ID: what a frame cost the UI thread, preemption excluded.
@@ -307,6 +339,7 @@ private:
     std::unique_ptr<frame_source> source_{};
     std::unique_ptr<lx::runtime::fd_source> release_source_{};
     buffer_slot buffers_[k_buffer_slots]{};
+    shm_pool_slot pools_[k_shm_pools]{};
     const lx::gfx::swapchain_image* last_image_ = nullptr;
 
     // configure and scale
@@ -324,6 +357,9 @@ private:
 
     bool waiting_release_ = false;
     bool continuous_ = false;
+    bool presentation_feedback_ = false;
+    /// When the outstanding frame callback was requested (a held configure's limit).
+    std::uint64_t frame_requested_ns_ = 0;
     /// The wp_linux_drm_syncobj_surface_v1 exists (explicit sync settled on).
     bool syncobj_ = false;
     std::uint64_t frame_start_ns_ = 0;

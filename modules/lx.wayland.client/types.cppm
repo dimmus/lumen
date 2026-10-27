@@ -263,7 +263,9 @@ struct pointer_frame {
     };
     std::uint32_t mask = 0;
     /// The surface the pointer is over (after an enter in this frame: the entered one;
-    /// after a leave: the one it left). Null over a surface this wrapper did not create.
+    /// after a leave: the one it left; a leave of one surface and an enter of another are
+    /// two frames). Null over a surface this wrapper did not create or has destroyed since:
+    /// route by target, never treat null as one's own.
     surface* target = nullptr;
     /// enter or button serial.
     std::uint32_t serial = 0;
@@ -478,7 +480,9 @@ struct dmabuf_plane {
 };
 
 /// Unknown globals (an extension the caller binds itself: the shell's zlm_shell_v1,
-/// layer-shell) and removals, with the registry as `void*` (wl_registry*).
+/// layer-shell) and removals, with the registry as `void*` (wl_registry*); and the outputs
+/// and seats the display tracks coming and going (hotplug: one panel per output). Set it
+/// before `connect` to hear the ones bound there.
 class global_handler {
 public:
     virtual ~global_handler() = default;
@@ -492,6 +496,32 @@ public:
     virtual void on_global_remove(display& d, std::uint32_t name) {
         (void)d;
         (void)name;
+    }
+    /// Output slot `slot` (`display::output_at`) is complete: its first wl_output.done.
+    virtual void on_output_added(display& d, unsigned slot) {
+        (void)d;
+        (void)slot;
+    }
+    /// A later wl_output.done: its mode, scale, position or name changed.
+    virtual void on_output_changed(display& d, unsigned slot) {
+        (void)d;
+        (void)slot;
+    }
+    /// The output's global is going: `output_at(slot)` is still valid during the call, every
+    /// surface has left it (`surface_handler::on_output`), and the slot is free after.
+    virtual void on_output_removed(display& d, unsigned slot) {
+        (void)d;
+        (void)slot;
+    }
+    /// A wl_seat was bound (its capabilities follow) / its global is going (its devices are
+    /// already released, their focus lost).
+    virtual void on_seat_added(display& d, seat& s) {
+        (void)d;
+        (void)s;
+    }
+    virtual void on_seat_removed(display& d, seat& s) {
+        (void)d;
+        (void)s;
     }
 };
 

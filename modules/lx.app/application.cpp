@@ -123,7 +123,8 @@ struct application::worker_thread {
                 if (!running)
                     return;
             }
-            ++app.stats_.worker_wakes;
+            // The worker's own counter: app_stats is the UI thread's (read in `stats()`).
+            wakes.fetch_add(1, std::memory_order_relaxed);
             lx::runtime::executor::global().drain(lx::runtime::affinity::worker);
         }
     }
@@ -133,6 +134,7 @@ struct application::worker_thread {
     std::condition_variable cv{};
     bool pending = false;
     bool running = true;
+    std::atomic<std::uint64_t> wakes{0};
     std::thread thread{};
 };
 
@@ -270,6 +272,12 @@ int application::run() {
 
 void application::quit(int code) { loop_.quit(code); }
 
+app_stats application::stats() const {
+    app_stats out = stats_;
+    out.worker_wakes = worker_ ? worker_->wakes.load(std::memory_order_relaxed) : 0;
+    return out;
+}
+
 std::uint64_t application::armed_deadline_ns() const { return timer_ ? timer_->armed : 0; }
 
 unsigned long long application::display_reads() const {
@@ -297,21 +305,29 @@ void application::host_close_requested(window& w) {
         quit(0);
 }
 
-void application::host_attach(window& w) {
+lx::result<void> application::host_attach(window& w) {
     if (window_ && window_ != &w)
-        log_app.warn("a second window: lx.ui keeps one tree per UI thread; seat events go to the newest");
+        return lx::invalid_argument("lx::app::window::open: the application has a window open "
+                                    "(lx.ui keeps one tree per UI thread)");
     window_ = &w;
+    return {};
 }
 
 void application::host_detach(window& w) {
-    if (window_ == &w)
-        window_ = nullptr;
+    if (window_ != &w)
+        return;
+    window_ = nullptr;
+    // The keyboard focus named the window's surface: a surface reopened at the same address
+    // must not inherit it before its own enter.
+    keyboard_target_ = nullptr;
 }
 
 // ── seat routing ──
 
 void application::on_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) {
-    if (window_ && (!f.target || f.target == &window_->surface()))
+    // By target only: a null target is a surface this process does not know (destroyed, or
+    // another library's) — never the window's.
+    if (window_ && f.target == &window_->surface())
         window_->route_pointer(s, f);
 }
 

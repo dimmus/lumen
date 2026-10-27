@@ -81,7 +81,8 @@ public:
     [[nodiscard]] settings& config() { return settings_; }
     [[nodiscard]] clipboard& clipboard_service() { return clipboard_; }
     [[nodiscard]] lx::wayland::display& display() { return display_; }
-    [[nodiscard]] const app_stats& stats() const { return stats_; }
+    /// A copy: `worker_wakes` is the worker thread's counter, read here.
+    [[nodiscard]] app_stats stats() const;
     [[nodiscard]] const app_timeline& timeline() const { return timeline_; }
     /// The timerfd's armed deadline (0: disarmed).
     [[nodiscard]] std::uint64_t armed_deadline_ns() const;
@@ -101,7 +102,7 @@ public:
     [[nodiscard]] const settings& host_settings() const override { return settings_; }
     [[nodiscard]] lx::runtime::executor* host_worker() override;
     void host_close_requested(window& w) override;
-    void host_attach(window& w) override;
+    [[nodiscard]] lx::result<void> host_attach(window& w) override;
     void host_detach(window& w) override;
 
     // seat_handler: routed to the window whose surface the event names.

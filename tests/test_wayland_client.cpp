@@ -31,11 +31,14 @@
 #endif
 #include <stdint.h>
 
+#include "scan_builder.hpp"
+
 import std;
 import lx.foundation;
 import lx.runtime;
 import lx.scheduler;
 import lx.input;
+import lx.drm;
 import lx.compositor;
 import lx.wayland.client;
 
@@ -272,6 +275,8 @@ struct window_log final : lx::wayland::toplevel_handler, lx::wayland::surface_ha
     unsigned scale_events = 0;
     bool scale_before_configure = false;
     unsigned outputs_entered = 0;
+    unsigned outputs_left = 0;
+    unsigned last_left = ~0u;
     std::vector<lx::wayland::presentation_event> presented;
 
     void on_configure(lx::wayland::toplevel&, const lx::wayland::toplevel_configure& c) override {
@@ -285,8 +290,12 @@ struct window_log final : lx::wayland::toplevel_handler, lx::wayland::surface_ha
             scale_before_configure = configures == 0;
         scale120 = s;
     }
-    void on_output(lx::wayland::surface&, unsigned, bool entered) override {
+    void on_output(lx::wayland::surface&, unsigned slot, bool entered) override {
         outputs_entered += entered ? 1u : 0u;
+        if (!entered) {
+            ++outputs_left;
+            last_left = slot;
+        }
     }
     void on_presentation(lx::wayland::surface&, const lx::wayland::presentation_event& e) override {
         presented.push_back(e);
@@ -299,6 +308,8 @@ struct input_log final : lx::wayland::seat_handler {
     std::vector<lx::wayland::pointer_frame> frames;
     std::vector<lx::wayland::key_event> keys;
     unsigned focus_in = 0;
+    unsigned focus_out = 0;
+    lx::wayland::surface* focus_out_target = nullptr;
     std::uint32_t modifiers = 0;
     std::int32_t rate = -1;
 
@@ -307,9 +318,13 @@ struct input_log final : lx::wayland::seat_handler {
         frames.push_back(f);
     }
     void on_keymap(lx::wayland::seat&) override { ++keymaps; }
-    void on_keyboard_focus(lx::wayland::seat&, lx::wayland::surface*, std::uint32_t,
+    void on_keyboard_focus(lx::wayland::seat&, lx::wayland::surface* target, std::uint32_t,
                            bool entered) override {
         focus_in += entered ? 1u : 0u;
+        if (!entered) {
+            ++focus_out;
+            focus_out_target = target;
+        }
     }
     void on_key(lx::wayland::seat&, const lx::wayland::key_event& e) override { keys.push_back(e); }
     void on_modifiers(lx::wayland::seat&, std::uint32_t m) override { modifiers = m; }
@@ -415,7 +430,8 @@ void run_cases() {
     auto connected = d.connect({.name = k_socket});
     const double connect_ms = now_ms() - t_connect;
     check("connect: private socket, required globals bound", connected.ok() && d.connected(),
-          connected ? std::format("{:.2f} ms incl. 3 roundtrips", connect_ms)
+          connected ? std::format("{:.2f} ms incl. 2 roundtrips (the dma-buf feedback in the second)",
+                                  connect_ms)
                     : lx::format_error(connected.get_error()));
     if (!connected)
         return;
@@ -855,6 +871,157 @@ void run_cases() {
         (void)d.roundtrip();
     }
 
+    // ── seat: sequences the wrapper must deliver whole ──
+    // The listener entry points are what libwayland's thunks call: driving them sends the
+    // exact sequences — a leave and an enter of two of the client's surfaces in one
+    // wl_pointer.frame, events for a surface destroyed since (libwayland passes NULL for its
+    // proxy), devices dropped by wl_seat.capabilities while they have focus.
+    {
+        using pf = lx::wayland::pointer_frame;
+        lx::wayland::surface s3;
+        const bool made = s3.create(d).ok();
+        // The pointer is on `s` (the pointer section).
+        in.frames.clear();
+        seat->on_pointer_leave(9001, s.native());
+        seat->on_pointer_enter(9002, s3.native(), 5.0, 6.0);
+        seat->on_pointer_frame();
+        const auto two = in.frames;
+        check("pointer: leave(A) + enter(B) in one wl_pointer.frame are two frames — A hears its leave",
+              made && two.size() == 2 && two[0].mask == pf::has_leave && two[0].target == &s &&
+                  (two[1].mask & pf::has_enter) && !(two[1].mask & pf::has_leave) &&
+                  two[1].target == &s3 && seat->pointer_focus() == &s3,
+              std::format("{} frame(s): {:#x}→{} then {:#x}→{}", two.size(),
+                          two.empty() ? 0u : two[0].mask,
+                          two.empty() ? "?" : two[0].target == &s ? "A" : "other",
+                          two.size() < 2 ? 0u : two[1].mask,
+                          two.size() < 2 ? "?" : two[1].target == &s3 ? "B" : "other"));
+        // B destroyed while it has the pointer: the seat forgets it; what is still in flight
+        // for its wl_surface names no target.
+        s3.destroy();
+        const bool forgotten = seat->pointer_focus() == nullptr;
+        in.frames.clear();
+        seat->on_pointer_motion(1, 7.0, 8.0);
+        seat->on_pointer_frame();
+        seat->on_pointer_leave(9003, nullptr);
+        seat->on_pointer_frame();
+        bool no_target = in.frames.size() == 2;
+        for (const auto& f : in.frames)
+            no_target = no_target && f.target == nullptr;
+        check("surface: destroyed with the pointer on it — the seat forgets it, later frames have no target",
+              forgotten && no_target,
+              std::format("focus forgotten {}, {} frame(s), all without target {}", forgotten,
+                          in.frames.size(), no_target));
+        // Back on `s`, as the compositor has it.
+        seat->on_pointer_enter(9004, s.native(), 100.0, 50.0);
+        seat->on_pointer_frame();
+
+        // wl_seat.capabilities without keyboard and pointer while both have focus on `s`.
+        lx::wayland::surface* had_keyboard = seat->keyboard_focus();
+        const std::uint32_t caps = seat->capabilities();
+        const unsigned out0 = in.focus_out;
+        in.frames.clear();
+        seat->on_capabilities(caps & ~(lx::wayland::seat_keyboard | lx::wayland::seat_pointer));
+        const auto gone = in.frames;
+        check("seat: keyboard and pointer dropped while focused — focus loss and a leave frame "
+              "synthesised (a held key's repeat stops, hover does not stick)",
+              had_keyboard == &s && in.focus_out == out0 + 1 && in.focus_out_target == &s &&
+                  seat->keyboard_focus() == nullptr && gone.size() == 1 &&
+                  gone[0].mask == pf::has_leave && gone[0].target == &s &&
+                  seat->pointer_focus() == nullptr,
+              std::format("keyboard focus was {}, {} focus loss(es) on {}, {} pointer frame(s) "
+                          "mask {:#x}",
+                          had_keyboard == &s ? "ours" : "other", in.focus_out - out0,
+                          in.focus_out_target == &s ? "ours" : "other", gone.size(),
+                          gone.empty() ? 0u : gone[0].mask));
+        seat->on_capabilities(caps);
+        const bool back = d.roundtrip().ok() && seat->native_pointer() != nullptr && !d.failed();
+        check("seat: the devices come back with the capabilities", back,
+              std::format("caps {:#x}", seat->capabilities()));
+    }
+
+    // ── outputs: hotplug through the compositor's connector scan ──
+    {
+        struct output_log final : lx::wayland::global_handler {
+            std::vector<unsigned> added, changed, removed;
+            bool removed_valid = false;
+            void on_output_added(lx::wayland::display&, unsigned slot) override {
+                added.push_back(slot);
+            }
+            void on_output_changed(lx::wayland::display&, unsigned slot) override {
+                changed.push_back(slot);
+            }
+            void on_output_removed(lx::wayland::display& dd, unsigned slot) override {
+                removed.push_back(slot);
+                removed_valid = dd.output_at(slot) != nullptr;
+            }
+        } ol{};
+        d.set_global_handler(&ol);
+        const unsigned outputs0 = d.output_count();
+        lx::drm::connector_scan scan{};
+        scan_builder::connector(scan, 44, "Virtual-1", true, {scan_builder::mode(1024, 768)});
+        {
+            std::lock_guard<std::mutex> hold(*g_lock);
+            g_comp->simulate_connector_scan(scan);
+            g_comp->wayland().flush();
+        }
+        const bool added = pump(d, [&] {
+            tick();
+            return !ol.added.empty();
+        });
+        const unsigned slot = added ? ol.added.back() : ~0u;
+        const lx::wayland::output* o = added ? d.output_at(slot) : nullptr;
+        check("outputs: a connected monitor is a new slot, announced at its first done",
+              added && o && d.output_count() == outputs0 + 1 && o->info().mode.width == 1024 &&
+                  o->info().mode.height == 768,
+              o ? std::format("slot {} {} {}x{}", slot, o->info().name, o->info().mode.width,
+                              o->info().mode.height)
+                : "not announced");
+        // The toplevel onto it, so a surface is on the output that goes.
+        bool on_it = false;
+        if (added) {
+            const auto r = record(app_id);
+            {
+                // Restored first: a maximized window stays where it is maximized.
+                std::lock_guard<std::mutex> hold(*g_lock);
+                g_comp->windows().set_maximized(r.id, false, "test");
+                (void)g_comp->windows().move_to_output(r.id, 1, 0);
+                g_comp->wayland().flush();
+            }
+            on_it = pump(d, [&] {
+                tick();
+                return (s.outputs() & (1u << slot)) != 0;
+            });
+        }
+        const unsigned left0 = w.outputs_left;
+        scan_builder::connector(scan, 44, "Virtual-1", false);
+        {
+            std::lock_guard<std::mutex> hold(*g_lock);
+            g_comp->simulate_connector_scan(scan);
+            g_comp->wayland().flush();
+        }
+        const bool removed = pump(d, [&] {
+            tick();
+            return !ol.removed.empty();
+        });
+        check("outputs: an unplugged monitor is removed — surfaces leave it first, the slot is "
+              "valid during the call and free after",
+              added && removed && ol.removed.back() == slot && ol.removed_valid &&
+                  d.output_at(slot) == nullptr && d.output_count() == outputs0 &&
+                  !(s.outputs() & (1u << slot)) &&
+                  (!on_it || (w.outputs_left > left0 && w.last_left == slot)),
+              std::format("removed {} slot {} (valid in the call {}), surface was on it {}, "
+                          "left {} time(s), mask now {:#x}",
+                          removed, removed ? ol.removed.back() : ~0u, ol.removed_valid, on_it,
+                          w.outputs_left - left0, s.outputs()));
+        if (!on_it)
+            skip("outputs: the surface's mask on removal", "the window did not move to the new output");
+        d.set_global_handler(nullptr);
+        for (int i = 0; i < 5; ++i) {
+            tick();
+            (void)d.dispatch(10);
+        }
+    }
+
     // ── a full socket: flush says `again`, and the read protocol waits for POLLOUT ──
     {
         lx::wayland::display d2;
@@ -1115,6 +1282,38 @@ int event_loop_client() {
     report("event loop: frame callback requested and answered through display_source",
            w.frames == f0 + 1 && src.reads() > reads0 && !died,
            std::format("{} callback(s), {} socket read(s)", w.frames - f0, src.reads() - reads0));
+    // display::roundtrip from inside the loop: a posted task runs after every source was
+    // prepared (the display's read is prepared) and before any is checked. libwayland's
+    // second reader on this thread would wait for the first forever; the display cancels
+    // the source's read first.
+    bool tripped = false;
+    (void)loop.post(lx::runtime::task{[&] {
+        tripped = d.roundtrip().ok();
+        loop.quit(0);
+    }});
+    quit.schedule_at(loop.now() + 3'000'000'000);
+    loop.add_source(&quit);
+    (void)loop.run();
+    loop.remove_source(&quit);
+    const unsigned f1 = w.frames;
+    s.request_frame();
+    s.damage_buffer({0, 0, 4, 4});
+    (void)s.commit();
+    lx::runtime::timer_source poll_after{
+        2'000'000, lx::runtime::callback{[&] {
+            if (w.frames > f1)
+                loop.quit(0);
+        }}};
+    loop.add_source(&poll_after);
+    quit.schedule_at(loop.now() + 3'000'000'000);
+    loop.add_source(&quit);
+    (void)loop.run();
+    loop.remove_source(&poll_after);
+    loop.remove_source(&quit);
+    report("event loop: display::roundtrip from a posted task with the source's read prepared — "
+           "no deadlock, the source reads on after",
+           tripped && w.frames > f1 && !died,
+           std::format("roundtrip {}, {} callback(s) after", tripped, w.frames - f1));
     src.detach();
     top.destroy();
     b.destroy();

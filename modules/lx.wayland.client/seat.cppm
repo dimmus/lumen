@@ -90,6 +90,9 @@ public:
                       std::uint32_t locked, std::uint32_t group);
     void on_repeat_info(std::int32_t rate, std::int32_t delay);
     void on_touch(const touch_event& e);
+    /// `s` is being destroyed (`surface::destroy`, through the display): focus and a frame
+    /// being folded for it are dropped, never delivered with a dangling target.
+    void forget_surface(const surface* s);
 
     /// Pointer events of frames that were never closed by `frame` (a wl_pointer < 5 has no
     /// frames: each event is delivered alone).
@@ -112,6 +115,8 @@ private:
     std::uint32_t caps_ = 0;
     std::uint32_t enter_serial_ = 0;
     std::uint32_t input_serial_ = 0;
+    /// Touch points down (a cancel is synthesised if the device goes with some).
+    unsigned touch_points_ = 0;
     surface* pointer_focus_ = nullptr;
     surface* keyboard_focus_ = nullptr;
     pointer_frame frame_{};
@@ -173,9 +178,17 @@ public:
     void on_delete_surrounding(std::uint32_t before, std::uint32_t after);
     void on_done(std::uint32_t serial);
     void on_action(std::uint32_t action, std::uint32_t serial);
+    /// `s` is being destroyed: the focus is dropped (the display calls this).
+    void forget_surface(const surface* s);
 
 private:
+    friend class display;
     zwp_text_input_v3* proxy_ = nullptr;
+    display* display_ = nullptr;
+    /// The display's list of text inputs (intrusive: no allocation).
+    text_input* next_ = nullptr;
+    text_input* prev_ = nullptr;
+    bool linked_ = false;
     text_input_handler* handler_ = nullptr;
     surface* focus_ = nullptr;
     std::uint32_t version_ = 0;

@@ -21,6 +21,7 @@
 // the UI thread's frame time (callback or event → commit) and exits.
 
 #include <stdio.h>
+#include <sys/stat.h>
 
 import std;
 import lx.foundation;
@@ -39,12 +40,15 @@ struct args {
     const char* theme = nullptr;
     bool exit_after_first_present = false;
     unsigned frames = 0;
+    std::uint64_t render_node = 0;
 };
 
 void usage() {
     std::fprintf(stderr,
                  "usage: lumen-hello [--backend cpu|gl|vulkan] [--allow-software-gpu] [--socket NAME]\n"
-                 "                   [--theme NAME|PATH] [--exit-after-first-present] [--frames N]\n");
+                 "                   [--theme NAME|PATH] [--exit-after-first-present] [--frames N]\n"
+                 "                   [--render-node PATH]  (choose the tier on that node, not the\n"
+                 "                   compositor's main device: a headless compositor names none)\n");
 }
 
 [[nodiscard]] bool parse(int argc, char** argv, args& out) {
@@ -66,6 +70,14 @@ void usage() {
             out.theme = value();
         } else if (a == "--exit-after-first-present") {
             out.exit_after_first_present = true;
+        } else if (a == "--render-node") {
+            const char* v = value();
+            struct stat st{};
+            if (!v || ::stat(v, &st) != 0 || !S_ISCHR(st.st_mode)) {
+                std::fprintf(stderr, "lumen-hello: no device node '%s'\n", v ? v : "");
+                return false;
+            }
+            out.render_node = static_cast<std::uint64_t>(st.st_rdev);
         } else if (a == "--frames") {
             const char* v = value();
             out.frames = v ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0;
@@ -97,6 +109,7 @@ int main(int argc, char* argv[]) {
         return 2;
     app.config().backend = a.backend;
     app.config().allow_software_gpu = a.allow_software;
+    app.config().device_override = a.render_node;
     app.config().socket = a.socket;
     app.config().theme = a.theme;
     if (auto started = app.start(); !started) {
@@ -111,6 +124,8 @@ int main(int argc, char* argv[]) {
     o.size = {640, 480};
     o.min_size = {360, 320};
     o.describe = &hello::describe;
+    // --frames reports presented frames: feedback for each (else only the first frame's).
+    o.presentation_feedback = a.frames > 0;
     lx::app::window w;
     if (auto opened = w.open(app, o); !opened) {
         std::fprintf(stderr, "lumen-hello: %s\n", lx::format_error(opened.get_error()));

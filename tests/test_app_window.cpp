@@ -50,6 +50,7 @@ import lx.compositor;
 import lx.scene;
 import lx.ui;
 import lx.app;
+import lx.wayland.client;
 
 #include "../executables/lumen-hello/hello_ui.hpp"
 
@@ -679,6 +680,18 @@ int client_main(const char* tier_name, int fd) {
                             (t.first_commit_ns - at.exec_ns) / 1e6,
                             (t.first_presented_ns - at.exec_ns) / 1e6));
     }
+    // One window per application: a second open is refused, and the first keeps its input
+    // (everything below runs on it).
+    {
+        lx::app::window second;
+        lx::app::window_options o2 = o;
+        o2.title = "second";
+        auto refused = second.open(app, o2);
+        check("one window per application: a second open() is refused (invalid_argument)",
+              !refused && refused.get_error().domain == lx::error_domain::invalid_argument &&
+                  !second.is_open() && w.is_open(),
+              refused ? "opened" : lx::format_error(refused.get_error()));
+    }
     // The pointer off the window (output 0's corner), the UI settled.
     (void)parent.call("gmove 4 4");
     (void)settle(app, w);
@@ -691,6 +704,9 @@ int client_main(const char* tier_name, int fd) {
 
     // ── fractional scale: the window moved to the 1.25 output ──
     if (want == lx::gfx::client_tier::cpu || want == lx::gfx::client_tier::gl) {
+        // The checks wait for the new scale's frame to be presented: feedback per frame here
+        // (the default asks only for the first frame's).
+        w.set_presentation_feedback(true);
         const std::uint64_t realloc0 = w.stats().reallocations;
         const std::uint64_t presented0 = w.stats().presented;
         const std::string moved = parent.call("output 1");
@@ -741,6 +757,7 @@ int client_main(const char* tier_name, int fd) {
                           w.buffer_size().height));
         (void)parent.call("gmove 4 4");
         (void)settle(app, w);
+        w.set_presentation_feedback(false);
     }
 
     const lx::rect2i button = bounds_of(hello::k_button);
@@ -1028,17 +1045,102 @@ int client_main(const char* tier_name, int fd) {
                                 us.size(), us[us.size() / 2], us[us.size() * 95 / 100],
                                 w.input().stats().motions, w.input().stats().motions_coalesced,
                                 w.input().stats().hit_tests));
-        // Presentation feedback ring: presented frames have times.
+        // wp_presentation: by default only until the first frame is presented — the sweep's
+        // frames asked for none; asked for, every frame is recorded with its presentation.
+        unsigned sweep_presented = 0;
+        for (unsigned i = n > frames ? n - static_cast<unsigned>(frames) : 0; i < n; ++i)
+            sweep_presented += w.frame_at(i).presented ? 1u : 0u;
+        check("wp_presentation: off by default after the first presented frame (no feedback "
+              "for the sweep's frames)",
+              frames >= 10 && sweep_presented == 0,
+              std::format("{} of {} sweep frames carry a presentation", sweep_presented, frames));
+        w.set_presentation_feedback(true);
+        const std::uint64_t p0 = w.stats().presented;
+        const std::uint64_t f0 = w.stats().frames;
+        for (unsigned i = 0; i < 4; ++i) {
+            const lx::point2i p = (i % 2) ? b : a;
+            (void)parent.call(std::format("move {} {}", p.x, p.y));
+            run_for(app, 80);
+        }
+        (void)settle(app, w);
+        run_for(app, 100);
         unsigned presented = 0;
         for (unsigned i = 0; i < w.frame_count(); ++i)
             presented += w.frame_at(i).presented ? 1u : 0u;
-        check("wp_presentation: committed frames are recorded with their presentation",
-              presented > 0 && w.stats().presented > 0,
-              std::format("{} of {} ring frames presented, {} discarded", presented, w.frame_count(),
+        check("wp_presentation: asked for, committed frames are recorded with their presentation",
+              w.stats().frames > f0 && w.stats().presented > p0 && presented > 0,
+              std::format("{} frames, {} presented ({} in the ring), {} discarded",
+                          w.stats().frames - f0, w.stats().presented - p0, presented,
                           w.stats().discarded));
+        w.set_presentation_feedback(false);
     }
 
     w.close();
+    // Closed: the seat names the destroyed surface nowhere (events in flight for it arrive
+    // with no target and are not routed into a window reopened on the same object).
+    if (lx::wayland::seat* seat = app.display().default_seat())
+        check("close: the seat forgets the window's surface (pointer and keyboard focus)",
+              seat->pointer_focus() == nullptr && seat->keyboard_focus() == nullptr,
+              std::format("pointer focus {} keyboard focus {}", seat->pointer_focus() ? "set" : "none",
+                          seat->keyboard_focus() ? "set" : "none"));
+
+    // ── min_size against the configure's states (xdg-shell): the same window object
+    // reopened with a minimum larger than the output ──
+    {
+        lx::app::window_options om = o;
+        om.min_size = {1400, 900};
+        if (auto opened = w.open(app, om); !opened) {
+            check("min_size: the window reopens", false, lx::format_error(opened.get_error()));
+        } else {
+            const bool presented =
+                app.run_until([&] { return w.timeline().first_presented_ns != 0; }, 5000);
+            const lx::size2i free_size = w.logical_size();
+            check("min_size: a size the client picks is at least the minimum",
+                  presented && free_size.width >= 1400 && free_size.height >= 900,
+                  std::format("{}×{}", free_size.width, free_size.height));
+            struct step {
+                const char* cmd;
+                const char* what;
+                bool exact; ///< maximized: the size is the size; fullscreen: at most it
+            };
+            const step steps[] = {{"maximize 1", "maximized: the configured size, below the minimum", true},
+                                  {"fullscreen 1", "fullscreen: within the configured size", false}};
+            for (const step& st : steps) {
+                const std::uint64_t acks0 = w.stats().acks;
+                const std::uint64_t frames0 = w.stats().frames;
+                (void)parent.call(st.cmd);
+                const bool drawn = app.run_until(
+                    [&] { return w.stats().acks > acks0 && w.stats().frames > frames0 && !w.frame_due(); },
+                    3000);
+                run_for(app, 60);
+                const lx::size2i cfg = w.toplevel().last_configure().size;
+                const lx::size2i now = w.logical_size();
+                const record_reply rec = query_record(parent);
+                const bool fits = st.exact ? now.width == cfg.width && now.height == cfg.height
+                                           : now.width <= cfg.width && now.height <= cfg.height;
+                check(std::format("min_size {}", st.what).c_str(),
+                      drawn && cfg.width > 0 && cfg.height > 0 && fits && cfg.width < 1400 &&
+                          rec.geometry.width == now.width && rec.geometry.height == now.height,
+                      std::format("configured {}×{} window {}×{} record {}×{}", cfg.width,
+                                  cfg.height, now.width, now.height, rec.geometry.width,
+                                  rec.geometry.height));
+            }
+            (void)parent.call("fullscreen 0");
+            (void)settle(app, w);
+            const std::uint64_t acks0 = w.stats().acks;
+            (void)parent.call("maximize 0");
+            (void)app.run_until([&] { return w.stats().acks > acks0 && !w.frame_due(); }, 3000);
+            run_for(app, 60);
+            const lx::size2i back = w.logical_size();
+            check("min_size: restored (no bounding state), the minimum holds again",
+                  back.width >= 1400 && back.height >= 900,
+                  std::format("{}×{} (configured {}×{}, states {:#x})", back.width, back.height,
+                              w.toplevel().last_configure().size.width,
+                              w.toplevel().last_configure().size.height,
+                              w.toplevel().last_configure().states));
+            w.close();
+        }
+    }
     std::printf("  [%s] %d checks, %d failed\n", g_tier, g_ran, g_failed);
     return g_failed;
 }

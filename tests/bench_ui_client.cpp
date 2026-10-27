@@ -45,15 +45,21 @@
 //        window started after it, median and p95, in refresh periods. Headless this is a proxy
 //        for G6 (a timer-driven virtual output, no scanout); the real number comes from
 //        `scripts/ui-bench.sh --e2e` on the KMS display.
+//        An 8 ms variant follows (shrinking back): reallocations must not exceed the frames
+//        presented (G11-throttle: configures held for the frame callback).
 //   S10  `lumen-hello --exit-after-first-present` ×`--s10-runs` per tier with an empty Lumen
 //        cache (cold: no font matches, no pipeline cache) and with a warm one: exec → first
 //        commit and → first presented (LUMEN_EXEC_NS taken right before execve) — G7. GL keeps
 //        no program binaries on a driver with GL_NUM_PROGRAM_BINARY_FORMATS = 0: its warm row
-//        is the font matches only, and says so.
+//        is the font matches only, and says so. `--tier auto` times the automatic choice with
+//        the render node standing in for the main device the headless compositor does not
+//        name (`lumen-hello --render-node`): the path a KMS session takes.
 //
 // Every steady scenario (S1, S5, S9) counts `operator new` and `malloc` on the window's UI
-// thread over its measured window (G5 wants `operator new` 0; libwayland's per-message
-// mallocs are reported, net), and mallinfo2's in-use delta for the process.
+// thread over its measured window, and mallinfo2's in-use delta for the process. G5's verdict
+// is `operator new` = 0 — every allocation Lumen's own code makes (ADR-010 §3 as amended);
+// the malloc count (libwayland's closure per message, Mesa's per submit) and the in-use delta
+// are reported beside it, not gated: they are the C libraries' floor, not Lumen's frame path.
 //
 // Tiers: cpu always; gl when /dev/dri/renderD128 exists; vulkan on whatever device lx.gfx finds
 // — on a host with only lavapipe the rows are labelled software (driver "vulkan-software"):
@@ -1492,7 +1498,8 @@ int run_s5(const run_args& a, lx::application& app, lx::app::window& w, std::FIL
     const unsigned frames = static_cast<unsigned>(log.frames.size());
     result_writer rw{};
     rw.gate("G5", heap.news == 0 ? "pass" : "fail",
-            "%llu operator new on the UI thread over %u hover frames (%llu malloc, net heap %+lld B)",
+            "%llu operator new on the UI thread over %u hover frames (gated); %llu malloc, process "
+            "in-use %+lld B (libwayland and the driver: reported, not gated)",
             static_cast<unsigned long long>(heap.news), frames,
             static_cast<unsigned long long>(heap.mallocs), heap.heap);
     rw.gate("damage", max_rects <= 2 && frames > 0 ? "pass" : "fail",
@@ -1609,6 +1616,34 @@ int run_s7(const run_args& a, lx::application& app, lx::app::window& w, std::FIL
     // The noise floor: the storm's cadence with a fixed job of the median frame's CPU time.
     const control_result control =
         run_control(static_cast<u64>(sc.p50 * 1000.0), a.storm, 200'000);
+
+    // The same storm at 8 ms (two motions per 60 Hz refresh), shrinking back: a compositor
+    // that configures per motion must cost one reallocation and repaint per refresh, not per
+    // configure — configures that arrive while a frame callback is outstanding wait for it.
+    // Reallocations are gated against the frames the compositor presented over the storm.
+    u64 fast_configures = 0, fast_acks = 0, fast_reallocs = 0, fast_frames = 0;
+    u64 fast_presented = 0, fast_discarded = 0;
+    bool fast_done = false;
+    {
+        run_for(app, 200);
+        (void)settle(app, w);
+        const geometry g2 = query_geometry(h);
+        const lx::app::window_stats fa = w.stats();
+        std::snprintf(cmd, sizeof cmd, "storm %.1f %.1f -8 -6 %u 8000 -",
+                      g2.rect.x + g2.rect.width * 0.75, g2.rect.y + g2.rect.height * 0.75, a.storm);
+        h.send(cmd);
+        fast_done = g2.ok && run_until_reply(app, w, h, reply, sizeof reply,
+                                             static_cast<int>(a.storm * 8 + 5000));
+        (void)settle(app, w);
+        run_for(app, 200); // the last frames' presentation feedback
+        const lx::app::window_stats fb = w.stats();
+        fast_configures = fb.configures - fa.configures;
+        fast_acks = fb.acks - fa.acks;
+        fast_reallocs = fb.reallocations - fa.reallocations;
+        fast_frames = fb.frames - fa.frames;
+        fast_presented = fb.presented - fa.presented;
+        fast_discarded = fb.discarded - fa.discarded;
+    }
     // Heap flat: what the process holds after the storm and a settle, against before it.
     // 64 KiB is the tolerance for allocator slack (a size class's partial page), not for growth
     // proportional to the resizes: 30 resizes of a leak would be far above it.
@@ -1629,6 +1664,15 @@ int run_s7(const run_args& a, lx::application& app, lx::app::window& w, std::FIL
                           : rest_ok && !jank                ? "pass"
                           : rest_ok && jank && control.jank ? "jitter"
                                                             : "fail";
+    rw.gate("G11-throttle",
+            fast_done && fast_configures > 0 && fast_reallocs <= fast_presented ? "pass" : "fail",
+            "%u resizes 8 ms apart: %llu configures, %llu acks, %llu frames drawn, %llu presented "
+            "(%llu discarded), %llu reallocations (<= presented)",
+            a.storm, static_cast<unsigned long long>(fast_configures),
+            static_cast<unsigned long long>(fast_acks), static_cast<unsigned long long>(fast_frames),
+            static_cast<unsigned long long>(fast_presented),
+            static_cast<unsigned long long>(fast_discarded),
+            static_cast<unsigned long long>(fast_reallocs));
     rw.gate("G11", verdict,
             "%llu configures, %u sizes, %llu reallocations; frame p50 %.1f us, max %.1f us "
             "(%.2fx, %u over 2x); UI-thread CPU p50 %.1f us, max %.1f us (%.2fx, %u over 2x); "
@@ -1668,17 +1712,29 @@ int run_s7(const run_args& a, lx::application& app, lx::app::window& w, std::FIL
                  rss_anon_kb());
     std::fprintf(f,
                  "    \"client\": {\"control\": {\"work_us\": %.1f, \"p50\": %.1f, \"p95\": %.1f, "
-                 "\"max\": %.1f, \"over_2x\": %u, \"jobs\": %u, \"gap_us\": 200000}},\n",
+                 "\"max\": %.1f, \"over_2x\": %u, \"jobs\": %u, \"gap_us\": 200000}, "
+                 "\"fast_storm\": {\"gap_us\": 8000, \"configures\": %llu, \"acks\": %llu, "
+                 "\"frames\": %llu, \"presented\": %llu, \"discarded\": %llu, "
+                 "\"reallocations\": %llu}},\n",
                  sc.p50, control.wall.p50, control.wall.p95, control.wall.max, control.over,
-                 control.wall.samples);
+                 control.wall.samples, static_cast<unsigned long long>(fast_configures),
+                 static_cast<unsigned long long>(fast_acks),
+                 static_cast<unsigned long long>(fast_frames),
+                 static_cast<unsigned long long>(fast_presented),
+                 static_cast<unsigned long long>(fast_discarded),
+                 static_cast<unsigned long long>(fast_reallocs));
     write_gates(f, rw);
     if (a.record_dir) {
         const std::string frames_path = std::string(a.record_dir) + "/s7-frames.json";
         write_frames_json(frames_path.c_str(), w, log.frames, {}, g.rect);
     }
-    std::printf("  S7 [%s] %llu configures → %u sizes, %llu reallocations, %zu frames\n", a.tier,
-                static_cast<unsigned long long>(configures), sizes,
-                static_cast<unsigned long long>(reallocations), log.frames.size());
+    std::printf("  S7 [%s] %llu configures → %u sizes, %llu reallocations, %zu frames; 8 ms storm: "
+                "%llu configures, %llu reallocations, %llu presented\n",
+                a.tier, static_cast<unsigned long long>(configures), sizes,
+                static_cast<unsigned long long>(reallocations), log.frames.size(),
+                static_cast<unsigned long long>(fast_configures),
+                static_cast<unsigned long long>(fast_reallocs),
+                static_cast<unsigned long long>(fast_presented));
     print_frames(log.frames);
     print_gates(a, rw);
     return 0;
@@ -1802,7 +1858,8 @@ int run_s9(const run_args& a, lx::application& app, lx::app::window& w, std::FIL
             lat.p50 / 1000.0, lat.p50 / period_us, lat.p95 / 1000.0, lat.p95 / period_us,
             samples.size(), transitions, budget_us / 1000.0);
     rw.gate("G5", heap.news == 0 ? "pass" : "fail",
-            "%llu operator new on the UI thread over %zu hover frames (%llu malloc)",
+            "%llu operator new on the UI thread over %zu hover frames (gated); %llu malloc "
+            "(libwayland and the driver: reported, not gated)",
             static_cast<unsigned long long>(heap.news), log.frames.size(),
             static_cast<unsigned long long>(heap.mallocs));
 
@@ -1871,6 +1928,10 @@ int client_run_main(const run_args& a) {
     o.app_id = k_app_id;
     o.size = ws.size;
     o.describe = ws.describe;
+    // S5, S7 and S9 read every frame's wp_presentation time (commit → present, presented
+    // frames, input → photon): feedback per frame, which the default window asks only for
+    // its first. Their malloc counts include it.
+    o.presentation_feedback = true;
     lx::app::window w;
     if (auto opened = w.open(app, o); !opened) {
         write_skip(a, lx::format_error(opened.get_error()));
@@ -2236,6 +2297,14 @@ struct startup_run {
     }
     if (std::strcmp(tier, "vulkan") == 0)
         args.push_back("--allow-software-gpu");
+    // Automatic as on a KMS session: the headless compositor names no main device (its
+    // automatic is cpu, nothing to time), so the render node stands in for it — the hardware
+    // Vulkan probe, its refusal, then EGL on GBM, as lumen-hello starts on the real display.
+    struct stat node{};
+    if (std::strcmp(tier, "auto") == 0 && ::stat("/dev/dri/renderD128", &node) == 0) {
+        args.push_back("--render-node");
+        args.push_back("/dev/dri/renderD128");
+    }
     std::vector<char*> argv;
     for (const std::string& s : args)
         argv.push_back(const_cast<char*>(s.c_str()));
@@ -2356,12 +2425,14 @@ struct startup_run {
     }
     remove_tree(cache);
     const double load_after = load1();
+    // `auto` is judged as the tier it resolved to (gl on SVGA3D: no program-binary cache).
+    const char* resolved = std::strcmp(tier, "auto") == 0 && got_tier[0] ? got_tier : tier;
     const bool software = std::strcmp(tier, "vulkan") == 0; // lavapipe is the only Vulkan here
     const summary cc = summarize(cold_commit), cp = summarize(cold_present);
     const summary wc = summarize(warm_commit), wp = summarize(warm_present);
-    const bool warm_gpu_cache = std::strcmp(tier, "vulkan") == 0   ? pipeline_cache
-                                : std::strcmp(tier, "gl") == 0     ? program_cache
-                                                                   : true;
+    const bool warm_gpu_cache = std::strcmp(resolved, "vulkan") == 0   ? pipeline_cache
+                                : std::strcmp(resolved, "gl") == 0     ? program_cache
+                                                                       : true;
     // G7: ≤ 150 ms cold, ≤ 30 ms warm (first presented; p95, as §8.1 judges).
     // A software device's start-up is a CPU's JIT, not a GPU driver's: no G7 verdict.
     const char* cold_v = software            ? "software"
@@ -2418,7 +2489,7 @@ struct startup_run {
                   "budget 30 ms; %s\"}\n  }\n",
                   cold_v, warm_v, cp.p50 / 1000.0, cp.p95 / 1000.0, cc.p50 / 1000.0, cp.samples,
                   wp.p50 / 1000.0, wp.p95 / 1000.0, wc.p50 / 1000.0,
-                  std::strcmp(tier, "gl") == 0 && !program_cache
+                  std::strcmp(resolved, "gl") == 0 && !program_cache
                       ? "no GL program binary cache on this driver (GL_NUM_PROGRAM_BINARY_FORMATS 0): "
                         "the warm runs reuse the font matches only"
                   : std::strcmp(tier, "vulkan") == 0
