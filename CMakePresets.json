@@ -13,8 +13,7 @@
       "binaryDir": "${sourceDir}/build/${presetName}",
       "cacheVariables": {
         "CMAKE_CXX_COMPILER": "clang++",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
-        "LUMEN_PROTOCOLS_P1": "ON"
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     },
     {

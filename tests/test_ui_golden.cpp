@@ -1187,13 +1187,35 @@ LUMEN_TEST(vk_atlas_dirty_rects_upload) {
         return;
     const lx::gfx::vk_context ctx = vk->device.context();
     fixture fx{};
-    // A renderer that has seen no atlas: every page goes up whole.
-    lx::gfx::ui_vk_renderer r{};
-    LUMEN_CHECK(static_cast<bool>(r.initialize(ctx)));
     const ui_golden::golden_case& c = ui_golden::cases()[7]; // sprites: R8 and RGBA8 pages
-    std::vector<std::uint32_t> first;
     lx::gfx::ui_vk_draw_stats stats{};
+    // With host image copy, a renderer's new pages are written by the host, whole, in
+    // place: no queue copy, no transient staging, the same pixels as the staged path below.
+    std::vector<std::uint32_t> hosted;
+    {
+        lx::gfx::ui_vk_renderer h{};
+        LUMEN_CHECK(static_cast<bool>(h.initialize(ctx)));
+        LUMEN_CHECK(render_vk(h, ctx, c, fx.tiles, *fx.atlas, hosted, full_region(), &stats));
+        std::printf("    first frame, host image copy: %u pages from the host, %u queue copies\n",
+                    stats.atlas_host_copies, stats.atlas_copies);
+        if (stats.atlas_host_copies > 0) {
+            LUMEN_CHECK(stats.atlas_host_copies >= 2 && stats.atlas_copies == 0 &&
+                        !stats.atlas_transient);
+            LUMEN_CHECK(ui_golden::compare_xrgb(c, hosted.data(), c.width,
+                                                ui_golden::k_tolerance_vs_cpu).ok());
+        }
+        h.shutdown();
+    }
+
+    // A renderer that has seen no atlas, staging: every page goes up whole.
+    lx::gfx::ui_vk_renderer r{};
+    lx::gfx::ui_vk_options staged{};
+    staged.host_image_copy = false;
+    LUMEN_CHECK(static_cast<bool>(r.initialize(ctx, staged)));
+    std::vector<std::uint32_t> first;
     LUMEN_CHECK(render_vk(r, ctx, c, fx.tiles, *fx.atlas, first, full_region(), &stats));
+    LUMEN_CHECK(stats.atlas_host_copies == 0);
+    LUMEN_CHECK(hosted == first);
     std::printf("    first frame: %u copies, %u regions, %llu bytes%s\n", stats.atlas_copies,
                 stats.atlas_uploads, static_cast<unsigned long long>(stats.atlas_upload_bytes),
                 stats.atlas_transient ? ", transient staging" : "");
@@ -1389,7 +1411,8 @@ LUMEN_TEST(vk_failed_frame_keeps_the_atlas_dirty) {
     r.set_surface_compositor(nullptr);
     auto drawn = r.draw(*target, stream, fx.atlas.get(), full_region(), lx::color::rgb(0, 0, 0));
     LUMEN_CHECK(static_cast<bool>(drawn));
-    LUMEN_CHECK(drawn && drawn->atlas_copies >= 1 && drawn->primitives_skipped == 1);
+    LUMEN_CHECK(drawn && drawn->atlas_copies + drawn->atlas_host_copies >= 1 &&
+                drawn->primitives_skipped == 1);
     LUMEN_CHECK(fx.atlas->dirty_rects(page).empty() && !fx.atlas->dirty_full(page));
     std::vector<std::uint32_t> px(40 * 24, 0u);
     LUMEN_CHECK(static_cast<bool>(target->read_back(px)));

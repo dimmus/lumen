@@ -231,8 +231,7 @@ ext-workspace's bind and the snapshot.
 `zlm_shell_v1.get_workspace_manager`, `zlm_workspace_manager_v1`, `zlm_workspace_v1` and
 `snapshot_workspace` are deprecated: never implemented, superseded by the above. The
 `workspace` argument of `snapshot_toplevel` / `toplevel_created` stays null. Because zlm now
-names `ext_workspace_handle_v1`, ext-workspace-v1 is a P0 protocol (the zlm glue links its
-interface tables).
+names `ext_workspace_handle_v1`, the zlm glue links ext-workspace-v1's interface tables.
 
 ### Version 7: held actions (the window switcher)
 
@@ -379,8 +378,12 @@ connection with the display's `implementation` error ("privileged global denied"
 compositor warns with both paths:
 `privileged global zlm_shell_v1 denied: client pid=<pid> exe=<path> is not the shell binary <path>`.
 
-The pid is the one `SO_PEERCRED` recorded at connect; the connection is still open, so
-the process is alive and its pid cannot have been reused. This is the check KWin applies
+The pid is the one `SO_PEERCRED` recorded at connect. The open connection does not keep
+that process alive (a child can hold it), so the read is confirmed through the peer's pidfd
+(`SO_PEERPIDFD`, Linux 6.5, kept per client): it must still name a process that has not
+exited (a zombie has) afterwards, or the bind is refused
+(`privileged global zlm_shell_v1 denied: client pid=<pid> has exited, …`). Kernels without
+`SO_PEERPIDFD` take the pid alone. This is the check KWin applies
 to its restricted interfaces. It is not a boundary against a same-UID process that can
 ptrace the shell — nothing at this layer is — but it stops any other same-UID client from
 binding the shell's global and replacing its bridge. A second instance of the real shell

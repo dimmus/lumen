@@ -476,17 +476,19 @@ flowchart LR
 | `lx.compositor.wire` (internal) | The libwayland glue, one translation unit per protocol area: `wire_surface.cpp` (wl_compositor, wl_surface, wl_region, frame callbacks, the commit), `wire_subsurface.cpp`, `wire_buffer.cpp` (wl_buffer tracking, shm staging, texture retirement), `wire_xdg_shell.cpp` (xdg_wm_base, xdg_surface, xdg_toplevel, xdg_positioner, the window manager's wire ops), `wire_xdg_popup.cpp`, `wire_decoration.cpp`, `wire_layer_shell.cpp`, `wire_dmabuf.cpp`, `wire_seat.cpp`, `wire_cursor_shape.cpp`, `wire_shell.cpp` (zlm_shell_v1, policy bridge), `wire_output.cpp` (wl_output, xdg-output, wl_surface.enter/leave and the preferred buffer scale/transform), `wire_selection.cpp` (the selection model both selection families share), `wire_data_device.cpp` (wl_data_*), `wire_primary_selection.cpp` (zwp_primary_selection_*_v1), `wire_dnd.cpp` (start_drag, drag offers and action negotiation), `wire_activation.cpp` (xdg_activation_v1: token builders, the grant decision at commit, `activate`), `wire_idle.cpp` (ext_idle_notifier_v1, zwp_idle_inhibit_manager_v1), `wire_output_power.cpp` (zwlr_output_power_manager_v1), `wire_output_management.cpp` (zwlr_output_manager_v1: heads, modes, configurations), `wire_session_lock.cpp` (ext_session_lock_manager_v1, lock objects, lock surfaces), `wire_text_input.cpp` (zwp_text_input_manager_v3, text inputs and the events the relay sends them), `wire_input_method.cpp` (zwp_input_method_manager_v2, input-method popups and keyboard grabs, zwp_virtual_keyboard_manager_v1, the relay's installation), the commit-path add-ons — `wire_fifo.cpp` (wp_fifo_v1, wp_commit_timer_v1, and the add-on object plumbing they all share), `wire_tearing.cpp` (wp_tearing_control_v1, wp_content_type_v1), `wire_single_pixel.cpp` (wp_single_pixel_buffer_manager_v1, wp_alpha_modifier_v1), `wire_syncobj.cpp` (wp_linux_drm_syncobj_manager_v1: timelines, acquire/release points, the commit checks) —, the window and session protocols — `wire_dialog.cpp` (xdg_wm_dialog_v1), `wire_toplevel_icon.cpp` (xdg_toplevel_icon_manager_v1), `wire_bell.cpp` (xdg_system_bell_v1), `wire_foreign.cpp` (zxdg_exporter/importer v2 and v1), `wire_shortcuts_inhibit.cpp` (zwp_keyboard_shortcuts_inhibit_manager_v1), `wire_data_control.cpp` (ext_data_control_manager_v1, zwlr_data_control_manager_v1 v2), `wire_security_context.cpp` (wp_security_context_manager_v1), `wire_pointer_constraints.cpp` (zwp_pointer_constraints_v1), `wire_relative_pointer.cpp` (zwp_relative_pointer_manager_v1), `wire_gestures.cpp` (zwp_pointer_gestures_v1 v3) —, screen capture — `wire_foreign_toplevel.cpp` (ext_foreign_toplevel_list_v1, and the shell bridge's toplevel observer), `wire_capture.cpp` (the two ext_image_capture_source managers, ext_image_copy_capture_manager_v1 sessions and frames, zwlr_screencopy_manager_v1 v3 on the same core, the capture tick and completions), `wire_capture_cursor.cpp` (ext_image_copy_capture_cursor_session_v1) —, `wire_workspace.cpp` (ext_workspace_manager_v1: groups, workspace handles, the per-manager diff, commit) — and `wire_install.cpp` (every global, in registry order, and the `:protocols_p0` entry points). The implementation partition `:wire` (`wire.cppm`, not exported) holds the wire object records and what more than one unit uses; everything else stays in each unit's anonymous namespace. The Wayland-free state stays in the partitions above. UI affinity |
 | `lx.scene` | Scene graph (layers bottom→top: layer-shell background and bottom, windows — per-window tree containers —, layer-shell top and overlay, popups, drag icon, session-lock surfaces, cursor), a clear colour per snapshot (the lock's solid colour), multi-rect damage (`gfx::damage_region`), a per-node tint (the not-responding dim), `build_draw_list_into`. Views 0–15 are the outputs; views 16–23 are *capture views* (`output_view_config::root`: one window's tree container projected into a capture client's buffer, with their own damage and snapshot buffers) |
 | `lx.scene.snapshot` | Triple-buffered handoff (v2: index swap, back-pressure policy) |
-| `lx.gfx` | Vulkan device, swapchain, dmabuf import, render pass |
+| `lx.gfx` | Vulkan 1.3 device, swapchain, dmabuf import, composite passes (dynamic rendering) |
 | `lx.gfx.gl_renderer` | EGL/GLES composite on GBM — the accelerated path on drivers with no Vulkan driver (vmwgfx/SVGA3D and similar); `composite_into` composites into any framebuffer (a capture target), optionally without clearing and without a fence |
 | `lx.gfx.gl_capture` | Screen capture's GL objects (ES 3.0): a client's dma-buf as a framebuffer (imported once per wl_buffer, LRU of 32), `glBlitFramebuffer` of damage rects (and crops), offscreen framebuffers over LINEAR GBM buffers read off the render thread (`read_bo`), asynchronous read-backs into pixel-pack buffers behind a native fence and their copy-out where there is no GBM buffer, the curtain clear |
 | `lx.gfx.cpu_renderer` | Software composite into a CPU-writable scanout buffer; chosen when no hardware renderer is available ([rendering-performance.md](subsystems/rendering-performance.md) §1.2) |
 | `lx.gfx.import_cache` | LRU reuse of VkImage imports; per-client entry cap |
 | `lx.gfx.swapchain` | A client window's pixel path (ADR-010 §4.10): the render node from the dma-buf feedback's main device, the tier in the compositor's `automatic` order and refusal rules (hardware Vulkan on the render node → hardware GLES 3.1 on GBM → wl_shm + `ui_cpu`), and a swapchain of three dma-buf images (two shm) with buffer age, non-blocking acquire, release by wl_buffer.release or linux-drm-syncobj release points, explicit sync per image (GL native fence → DRM syncobj; Vulkan timeline semaphore as a syncobj), reallocation once per size. API-type-free: lx.app maps the images onto wl_buffers through `lx.wayland.client`; `lx.gfx` never imports it. UI affinity in a client |
-| `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries, `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
+| `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries (with a deadline hint), `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
+| `lx.gfx.fence_deadline` | dma-fence deadline hints (`SYNC_IOC_SET_DEADLINE`, Linux 6.4) on composite and client sync_files; probed by use, off for good after ENOTTY |
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
 | `lx.runtime.memory` | Per-subsystem arenas, pressure coordinator, overflow policies |
+| `lx.runtime.psi` | Kernel memory pressure (PSI) triggers and decay; `psi_monitor` feeds them to the coordinator on the UI loop |
 | `lx.input` + `seat_manager` | libinput → pointer/keyboard events (ms wire time plus µs CLOCK_MONOTONIC time for latency) → `lx.compositor.wm` decides focus |
-| `lx.drm` + `lx.drm.atomic` | Connector probe (`connector_scan`, EDID identity via `:edid`; a worker may run it), CRTC/plane allocation (`:crtc_alloc`, pure, TEST_ONLY-checked), one `kms_pipeline` per CRTC (atomic page flips, KMS damage blobs, power-off), combined multi-output `commit_modeset` (TEST_ONLY of another mode, disabling a removed output, VRR_ENABLED), per-device flip-event routing, dumb scanout buffers, the udev hotplug monitor (`:uevent`), CVT custom modes (`:modes`) |
+| `lx.drm` + `lx.drm.atomic` | Connector probe (`connector_scan`, EDID identity via `:edid`; a worker may run it), CRTC/plane allocation (`:crtc_alloc`, pure, TEST_ONLY-checked), one `kms_pipeline` per CRTC (atomic page flips, KMS damage blobs, power-off), combined multi-output `commit_modeset` (TEST_ONLY of another mode, disabling a removed output, VRR_ENABLED), per-device flip-event routing, dumb scanout buffers, framebuffer hand-over at exit (CLOSEFB), the udev hotplug monitor (`:uevent`), CVT custom modes (`:modes`), GPU memory from DRM fdinfo for the health report (`:fdinfo`) |
 | `lx.scheduler.presentation` | Page-flip bridge: flip time, vblank sequence, the commit's frame tag |
 | `lx.compositor.presentation_feedback` | wp_presentation bookkeeping: sampled → flipped → presented / discarded |
 | `lx.compositor.idle` | ext-idle-notify notifications (lazy single timer, real input only) and idle-inhibitor objects, Wayland-free. UI affinity |
@@ -706,7 +708,7 @@ commit; doing that later is `xdg_wm_base.invalid_popup_parent` (the spec names n
 ### Selections: clipboard and primary
 
 `wl_data_device_manager` (v4; v3 without libwayland's `release`) and
-`zwp_primary_selection_device_manager_v1` (v1, a P1 protocol built only when its glue is
+`zwp_primary_selection_device_manager_v1` (v1, built only when its glue is
 generated) share one model in `wire_selection.cpp`; each family's unit only marshals. There
 is one selection per seat and family, owned by a source.
 
@@ -1355,6 +1357,22 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
   generation), the first commits after it are one combined modeset of every lit output, and
   the state machine gets one result: the worst over the outputs (one refused modeset is a
   refused resume).
+- **Exit (hand-over to the next master).** The scanout framebuffers are let go of with
+  `DRM_IOCTL_MODE_CLOSEFB` (Linux 6.8; `drm::fb_release::close`), not RMFB: RMFB of the
+  framebuffer a primary plane scans out turns its CRTC off, a black frame between Lumen and
+  whoever comes next; CLOSEFB leaves it on screen until the next commit. Each pipeline then
+  puts back, while it holds master, the console CRTC state it saved at its first modeset —
+  a direct switch from the last frame to the console. A previous master's framebuffer that
+  was itself closed is gone by then, so that restore fails and the frame stays for the next
+  master (a display manager's greeter) to take over without a flash. A CRTC the console had
+  nothing on is turned off, as RMFB left it: the kernel's fbdev does not restore the console
+  at the card's last close (measured on Linux 7.2, vmwgfx), so a frame left there would stay.
+  The cursor plane's framebuffers are still removed — a frozen pointer over the console or
+  the next master's first frames is wrong, and a cursor plane going off leaves its CRTC lit.
+  Runtime releases (a retired output, the old mode's targets after a switch, staged targets)
+  keep RMFB: those framebuffers are off screen or must leave it. Without CLOSEFB (EINVAL or
+  ENOTTY: an older kernel) the release falls back to RMFB, the old behaviour; which one the
+  kernel has is probed at open and logged once ("framebuffer hand-over at exit").
 
 ### Key bindings
 
@@ -2052,7 +2070,7 @@ is deferred indefinitely unless a concrete need appears.
 
 ```mermaid
 flowchart LR
-    CRED["SO_PEERCRED on connect"]
+    CRED["SO_PEERCRED + SO_PEERPIDFD on connect"]
     PATH["shell binary path check"]
     CHK["lx.session.privilege_checker"]
     ALLOW["allow_privileged_global()"]
@@ -2069,7 +2087,7 @@ dialogs, then xdg-desktop-portal-lumen or -wlr; § Portals); the capture globals
 from them (below).
 
 The binary check is real: `allow_privileged_global()` reads the peer's `/proc/<pid>/exe`
-(the pid `SO_PEERCRED` recorded; the connection keeps it alive) and
+(the pid `SO_PEERCRED` recorded at connect) and
 `privilege_checker::check_shell_bind` compares it with the configured shell binary
 (`lumen-compositor --shell PATH`; by default `lumen-shell` next to the compositor's own
 executable, resolved once with `realpath`). A mismatch is refused with the display's
@@ -2077,6 +2095,21 @@ executable, resolved once with `realpath`). A mismatch is refused with the displ
 bind `zlm_shell_v1` and replace the shell's bridge. KWin restricts its privileged
 interfaces the same way. It is not a defence against a same-UID process that can ptrace the
 shell. See [shell-state-sync.md](subsystems/shell-state-sync.md) § Privilege model.
+
+An open connection does not keep its peer alive — a child may hold it after the connecting
+process exits, and the pid can then be reused by any process, the shell binary included.
+So each client also keeps a pidfd for its peer (`SO_PEERPIDFD`, Linux 6.5, taken when the
+client is registered; it names the process the kernel recorded at connect however late it
+is asked, and is closed when the client goes). Every `/proc/<pid>` answer — the executable
+here, `.flatpak-info` below — is read through the pid and then confirmed: the pidfd must
+not poll readable, which it does once the peer's thread group has exited, zombie included,
+so the pid was never free in between. The checks fail closed while a pidfd is held: a
+zombie, or a peer whose leader thread has exited while others run, has already released its
+root and executable, so the unreadable `/proc/<pid>/exe` refuses the shell global and the
+unopenable `/proc/<pid>/root` (opened first, `.flatpak-info` then looked up inside it) counts
+as sandboxed — as does a peer that has exited. On a kernel without `SO_PEERPIDFD` (probed
+once at start and logged) the pid is taken alone, as before, and a failed sandbox lookup
+counts as not sandboxed.
 
 Window rules (`zlm_window_rules_v1`) load from `$XDG_CONFIG_HOME/lumen/window-rules.toml`.
 

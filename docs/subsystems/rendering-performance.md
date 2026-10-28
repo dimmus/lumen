@@ -58,7 +58,7 @@ Chosen **once at startup**, in `compositor::start`, from `config::present`:
 
 | `present_backend` | Composite | Scanout buffer |
 |-------------------|-----------|----------------|
-| `vulkan` | `gfx::vulkan_compositor` — GPU render pass | Vulkan image exported as dma-buf → `drm::kms_framebuffer` |
+| `vulkan` | `gfx::vulkan_compositor` — GPU composite (Vulkan 1.3, dynamic rendering) | Vulkan image exported as dma-buf → `drm::kms_framebuffer` |
 | `gl` | `gfx::gl_compositor` — GLES 2 quads via EGL on GBM | `gbm_bo` (SCANOUT\|RENDERING) → `EGLImage` → FBO, exported → `drm::kms_framebuffer` |
 | `cpu` | `gfx::cpu_compositor` — damage-limited row blitter | `drm::kms_dumb_framebuffer` (CREATE_DUMB + mmap) |
 | `automatic` (default) | hardware Vulkan → hardware GL → CPU; no KMS → headless | |
@@ -67,6 +67,19 @@ Chosen **once at startup**, in `compositor::start`, from `config::present`:
 (`VK_PHYSICAL_DEVICE_TYPE_CPU` — llvmpipe, SwiftShader) and, for GL,
 `egl_device::is_software_renderer()` (`GL_RENDERER` naming llvmpipe/softpipe/swrast). Each
 backend declines itself rather than accepting a downgrade.
+
+**Vulkan floor: 1.3** (ADR-004 D4). Instances ask for 1.3, and a physical device that reports
+less is not listed (`device_selector::probe_devices`, `device::create`): to `automatic` it is
+"no hardware Vulkan", and GL composites. That is NVK on Kepler, PowerVR, panvk on Bifrost and
+possibly hasvk — all of which have GL drivers; RADV, ANV, NVK (Maxwell+), NVIDIA (Turing+),
+turnip and panvk (Valhall) report 1.4, v3dv 1.3. In exchange every pass is dynamic rendering
+(`vkCmdBeginRendering` — no `VkRenderPass`, no `VkFramebuffer`, pipelines made for a format),
+every barrier synchronization2, and timeline semaphores core. For comparison, wlroots' Vulkan
+renderer is built on render passes, and KWin and Mutter composite on GL. This changes how a
+frame is recorded, not the work in it: on lavapipe (the only Vulkan on the measuring host)
+`bench_composite --vk` and `lumen-ui-bench --backend vulkan` read the same before and after
+within run-to-run noise (S4 record + submit p50 40–48 µs before, 38–41 µs after, 2026-10-28).
+A hardware number needs RADV or ANV.
 
 **Which GPU.** The Vulkan device is the one behind the KMS card, not the first one the
 loader lists. `compositor::start` opens the card (`drm::find_cards`), passes its dev_t to
@@ -192,6 +205,38 @@ Without `EGL_ANDROID_native_fence_sync` the composite falls back to `glFinish`. 
 unsynchronised would show a partly-drawn frame, so the stall is the correct fallback — it is
 not optional.
 
+### Fence deadline hints
+
+A GPU that idles between frames ramps its clock up only after it has been busy for a while,
+so a frame submitted to a cold GPU can miss its vblank even though the work fits. dma-fence
+deadlines (Linux 6.4) tell the driver when a fence is needed: i915/xe waitboost a fence whose
+deadline is near, msm boosts its devfreq; a driver without a `set_deadline` hook accepts the
+hint and ignores it. Lumen hints two kinds of fence (`lx.gfx:fence_deadline`):
+
+| Fence | Deadline | Where |
+|-------|----------|-------|
+| The composite's sync_file (GL native fence, Vulkan), which becomes `IN_FENCE_FD` | The vblank the tick that built the frame aimed at (`output_ui::aim_ns`, published to render in `output_pipeline::fence_deadline_ns`) | Render, right after the composite — at submission, before the commit |
+| A client's implicit-sync dma-buf fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` snapshot) | The start of the repaint that would latch the update on its pace output (`repaint_scheduler::next_start`, via `cu_latch`) — the fence is needed by the latch, not by the vblank after | UI, in the commit, only for a fence still pending |
+| A client's explicit-sync acquire point | The same latch time | UI: `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE` on the zero-timeout query the commit already makes — no extra ioctl |
+
+A hidden surface (shown on no lit output) gets no hint: its GPU is not hurried for a frame
+nobody sees. The kernel's atomic helper also sets the vblank deadline on `IN_FENCE_FD` when
+the commit runs; Lumen's hint lands earlier, while the composite executes, and covers a frame
+composited behind a pending flip whose commit waits a tick.
+
+**Cost and fallback.** One ioctl per hinted sync_file, no allocation, no log on the frame
+path. Support is probed by use: the first `ENOTTY` from `SYNC_IOC_SET_DEADLINE` (a kernel
+before 6.4) turns hints off for that thread's instance for good, and a timeline query whose
+`WAIT_DEADLINE` flag is refused (`EINVAL`) is repeated without it and never sent with it
+again — the behaviour is then exactly what it was without hints. Availability is logged once,
+at debug, under `gfx` when it is first known.
+
+**On vmwgfx** (this project's measurement host, kernel 7.2) the ioctl is accepted
+and has no effect: SVGA3D fences have no deadline hook and the host's GPU clocks are not the
+guest's to raise. There is nothing to measure there; the plumbing is covered by
+`test_fence_deadline` (the real ioctl on a udmabuf sync_file where `/dev/udmabuf` is
+accessible, and ENOTTY on a non-sync_file) and the fallbacks by fakes.
+
 ### GL composite properties
 
 | Property | Behavior |
@@ -206,7 +251,7 @@ not optional.
 | State changes | Scissor, scissor test and blend are set only when they change, and the program only when consecutive draws differ (linear-light or identity). Mesa does not drop a redundant call: on SVGA3D a repeated `glScissor` cost 1.7 µs per draw, a changed one 4 µs, a scissor-test toggle 7 µs and a blend toggle 2.6 µs; 50 draws against 16 damage strips went from 0.77 to 0.62 ms of submission |
 | Blending | `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` — sources are premultiplied |
 | Sampling | The source box (float, wp_viewport) and the buffer transform as an affine basis in three uniforms (`gfx::source_basis_for`, shared with Vulkan and CPU); UVs `highp` where the fragment stage has it (mediump cannot address texels past ~2048); `GL_LINEAR` throughout — a 1:1 draw on whole pixels samples texel centres exactly; a half-texel clamp keeps crops from bleeding |
-| GPU sync | `EGL_ANDROID_native_fence_sync` → sync_file → `atomic_commit_request::in_fence_fd`; `glFinish` only as fallback |
+| GPU sync | `EGL_ANDROID_native_fence_sync` → sync_file (deadline-hinted to its vblank) → `atomic_commit_request::in_fence_fd`; `glFinish` only as fallback |
 
 **Modules:** `lx.gfx.gl_renderer` — `egl_device`, `gl_scanout_target`, `gl_compositor`
 
@@ -250,6 +295,18 @@ way a full ring dropped it: the buffer is released and the texture keeps its pre
 content until the next commit. The cap only bounds a render thread that has stopped
 draining. Without it the pool would grow with every commit. The first block is always
 granted, so one update larger than the cap still goes through.
+
+On Vulkan the pool's block then goes into the texture one of two ways. With
+`VK_EXT_host_image_copy` usable for RGBA8 (`host_image_copier`: the format supports host
+transfer, the copy can target SHADER_READ_ONLY_OPTIMAL, and the driver reports
+`optimalDeviceAccess`, i.e. host-transfer usage costs no compression), `upload_rgba` writes
+the image from the host — no second copy into a staging buffer, no queue copy, no submit,
+and the 16 MiB staging ring is never allocated. Otherwise the ring and a
+`vkCmdCopyBufferToImage`, as before (the ring now made on the first such upload). Either way
+`upload_rgba` first waits for the frames in flight, so the host write adds no wait of its
+own. `bench_composite` prints both (`-- Vulkan shm upload --`); lavapipe numbers say nothing
+about a discrete GPU, where the host write crosses PCIe into ReBAR memory instead of the
+copy engine reading host memory.
 
 Vulkan used a shared `shm_staging_ring` until the pool took its place. The ring's slots
 grew to the largest buffer they had carried and were never returned, so 57 MB stayed
@@ -919,6 +976,15 @@ The only Vulkan on the F8 host is lavapipe, a CPU device: these are **lavapipe n
 correctness only**. Pipeline creation for the five pipelines is 42–65 ms cold and the same
 warm: lavapipe keeps nothing in a `VkPipelineCache` (its data is a truncated 20-byte header,
 which `ui_vk` does not write to disk), so the warm start is untested on a caching driver.
+Since the 1.3 floor the pipelines are made for a format, so one set per format serves
+`ui_vk`'s own pass and the compositor's linear pass, and there is no framebuffer per
+attachment (before, a fifth attachment evicted one and waited for the ring). The same
+persisted cache now holds the compositor's composite and encode pipelines:
+`compositor::setup_vulkan_present` makes `ui_vk` first and passes `pipeline_cache()` to
+`vulkan_compositor::initialize`. On lavapipe neither shows in a number — it caches nothing,
+and compositor start-up with the shared cache measured the same as with none (2026-10-28,
+cold and warm, Mesa's shader cache on and off). The gain is for drivers whose
+`VkPipelineCache` holds binaries (RADV, ANV, NVIDIA) and is unmeasured until run there.
 `lumen-ui-bench --backend vulkan` runs every scenario (S3: one draw, 800 080 instance bytes,
 `submit` p50 ≈ 0.17 ms, `gpu` ≈ 60 ms of llvmpipe shading per full 1919×1080 frame); its rows
 are labelled `vulkan-software` and scripts/ui-bench.sh neither compares them nor makes them a
@@ -1301,6 +1367,10 @@ the resume's modesets turn them off with every connector the kernel has on them.
   then its targets and pipeline go. Retires run before the adds of the same batch, and an
   add waits (≤ 1 s) while a retiring CRTC is still lit, so a new output is allocated and
   tested with the CRTCs and bandwidth of the gone ones free.
+- **Exit** hands the scanout framebuffers over with CLOSEFB (Linux 6.8; RMFB before it):
+  the last frame stays on screen until the console's CRTC state is put back or the next
+  master commits, instead of a black frame between (architecture.md § Session
+  pause/resume). Nothing changes per frame; runtime releases keep RMFB.
 - **Zero work when nothing changes**: without a uevent nothing runs (the netlink socket is
   filtered to drm in the kernel); a uevent whose probe matches the outputs (an identical
   layout, our own probe's detect) costs one worker probe (≈ 0.6 ms of ioctls on vmwgfx) and

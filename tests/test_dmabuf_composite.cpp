@@ -220,6 +220,65 @@ LUMEN_TEST(shm_upload_reaches_composited_output) {
     LUMEN_CHECK(right[2] > 200 && right[1] < 60 && right[0] < 60);
 }
 
+// The two upload paths: the host writing the image (VK_EXT_host_image_copy, where the
+// device has it) and the staging ring with a queue copy (the capability masked) composite
+// to the same pixels — a second upload over the first included.
+LUMEN_TEST(shm_upload_host_copy_matches_staging) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    lx::gfx::host_image_copier probe{};
+    const bool host = probe.init(gpu.device.context(), 37u /* VK_FORMAT_R8G8B8A8_UNORM */);
+    std::printf("    host image copy %s\n", host ? "usable" : "not usable here: both runs stage");
+
+    std::vector<unsigned char> first(k_width * k_height * 4u);
+    std::vector<unsigned char> second(k_width * k_height * 4u);
+    for (unsigned i = 0; i < k_width * k_height; ++i) {
+        const unsigned x = i % k_width;
+        const unsigned y = i / k_width;
+        first[i * 4u + 0] = static_cast<unsigned char>(x * 4u);
+        first[i * 4u + 1] = static_cast<unsigned char>(y * 4u);
+        first[i * 4u + 2] = 0x80u;
+        first[i * 4u + 3] = 255u;
+        second[i * 4u + 0] = static_cast<unsigned char>(255u - y * 4u);
+        second[i * 4u + 1] = static_cast<unsigned char>(x * 3u);
+        second[i * 4u + 2] = static_cast<unsigned char>((x ^ y) * 4u);
+        second[i * 4u + 3] = 255u;
+    }
+    const auto run = [&](lx::gfx::vk_context ctx, std::vector<unsigned char>& out) {
+        lx::gfx::vulkan_compositor comp;
+        if (!comp.initialize(ctx))
+            return false;
+        auto target = lx::gfx::render_target::create(ctx, k_width, k_height);
+        if (!target)
+            return false;
+        constexpr unsigned id = 0x4000'0002u;
+        lx::gfx::blit_command cmd{};
+        cmd.texture_id = id;
+        cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+        cmd.opacity = 1.f;
+        cmd.blend = lx::blend_mode::opaque;
+        bool ok = comp.upload_rgba(id, k_width, k_height, first.data()).has_value() &&
+                  composite_owned(comp, *target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1) &&
+                  comp.upload_rgba(id, k_width, k_height, second.data()).has_value() &&
+                  composite_owned(comp, *target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+        out.assign(k_width * k_height * 4u, 0u);
+        ok = ok && comp.read_back(*target, out.data(), static_cast<unsigned>(out.size()));
+        comp.shutdown();
+        return ok;
+    };
+    std::vector<unsigned char> via_host;
+    std::vector<unsigned char> via_staging;
+    LUMEN_CHECK(run(gpu.device.context(), via_host));
+    lx::gfx::vk_context staged = gpu.device.context();
+    staged.supports_host_image_copy = false;
+    LUMEN_CHECK(run(staged, via_staging));
+    LUMEN_CHECK(via_host == via_staging);
+    // The second upload is what shows: a texel the first one did not have.
+    const unsigned char* px = via_host.data() + ((10u * k_width) + 20u) * 4u;
+    LUMEN_CHECK(px[0] != 0u || px[1] != 0u || px[2] != 0u);
+}
+
 // The one that matters: a real dma-buf, imported through the real importer.
 LUMEN_TEST(dmabuf_import_reaches_composited_output) {
 #if defined(LUMEN_HAS_DRM)

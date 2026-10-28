@@ -35,7 +35,8 @@ export namespace lx::gfx {
 // shaders/ui/vk_*.glsl) and embedded in the binary.
 //
 // Device. The `vk_context` the compositor's `vulkan_compositor` uses (`device::context()`):
-// Vulkan 1.1, no feature or extension beyond what `device::create` enables. The renderer
+// Vulkan 1.3 with dynamic rendering and synchronization2, no feature or extension beyond
+// what `device::create` enables. The renderer
 // has its own command pool, command buffers and fences on the context's queue family; the
 // queue is shared, so `draw` runs on the thread that submits to it (render in the
 // compositor, ui in a client — ADR-010 §4.12). A CPU device (lavapipe) is accepted and
@@ -59,11 +60,12 @@ export namespace lx::gfx {
 // changed since the slot last drew — after that slot's fence, so never under the GPU.
 //
 // Pipelines. Five, one per program of `:ui_gl` — shadow, quad, mono sprite (also `path`),
-// poly sprite, underline — created for a colour format and a render pass of it (loadOp
-// LOAD, the attachment in COLOR_ATTACHMENT_OPTIMAL before and after), cached per format
-// (`k_ui_vk_pipeline_sets`; render pass compatibility is the format). `surface` primitives
-// go through the compositor's composite pipeline (`vulkan_compositor::record_blits`), made
-// for the same pass. All of them come out of one VkPipelineCache persisted at
+// poly sprite, underline — created for one colour attachment of a format (dynamic
+// rendering: no render pass, no framebuffer), cached per format (`k_ui_vk_pipeline_sets`).
+// The same set serves our own pass (loadOp LOAD, the attachment in COLOR_ATTACHMENT_OPTIMAL
+// before and after) and the compositor's linear pass. `surface` primitives go through the
+// compositor's composite pipeline (`vulkan_compositor::record_blits`), made for the same
+// format. All of them come out of one VkPipelineCache persisted at
 // $XDG_CACHE_HOME/lumen/pipeline-cache-<pipelineCacheUUID>.bin: read at `initialize` when its
 // header (vendor, device, pipelineCacheUUID) matches the device, written (temporary + rename)
 // when creating pipelines grew it, and at `shutdown` if it is still unwritten — never when
@@ -74,14 +76,19 @@ export namespace lx::gfx {
 // (ADR-010 §4.5): the CPU's premultiplied source-over, one byte rounding per primitive.
 //
 // Atlas. One device-local image per created page (R8 for 0–3, RGBA8 for 4–5), sized to the
-// page. Before the render pass, each page with dirty rects gets one vkCmdCopyBufferToImage
+// page. Before the pass, each page with dirty rects gets one vkCmdCopyBufferToImage
 // with one region per rect, from the frame slot's staging range (`k_ui_vk_staging_bytes`,
 // host-coherent, mapped once), between a barrier into TRANSFER_DST and one back to
 // SHADER_READ_ONLY. A page that grew is a new image, uploaded whole (an image another frame
 // may still sample is destroyed after waiting for the ring's fences — page growth, not the
 // frame path). An upload larger than the slot's staging range — whole pages, after growth or
 // for an atlas the renderer has not seen — goes through a buffer made for that frame and
-// freed when its slot comes round again (`draw_stats::atlas_transient`). Nothing waits for
+// freed when its slot comes round again (`draw_stats::atlas_transient`) — except a page image
+// made since the last submitted frame, which no frame can be sampling: with
+// VK_EXT_host_image_copy (`host_image_copier`) the host writes it whole, with no staging
+// and no queue copy (`draw_stats::atlas_host_copies`) — a client's first frame uploads its
+// pages this way. Pages in use keep the queue copy (a host write would have to wait for the
+// frames in flight). Nothing waits for
 // the queue to go idle. The atlas's dirty lists are cleared, and a new page image counted as
 // holding its contents, only once the frame that uploads them is submitted: a frame that
 // fails before its submit records copies that never run, so the next draw uploads the same
@@ -89,7 +96,7 @@ export namespace lx::gfx {
 // inside the pass is still ended and submitted, so its copies and the compositor's acquires
 // (`prepare_blits`) execute as their CPU-side state says they did.
 //
-// Damage. One render pass over the whole attachment; per damage rect: the scissor, a
+// Damage. One pass (vkCmdBeginRendering) over the whole attachment; per damage rect: the scissor, a
 // vkCmdClearAttachments of the rect (when a clear colour is given), then every batch whose
 // bounds meet the rect — `ui_gl_renderer`'s order and skip rule.
 //
@@ -107,8 +114,6 @@ inline constexpr unsigned k_ui_vk_staging_bytes = 1u << 20u;
 inline constexpr unsigned k_ui_vk_page_slots = 8;
 /// Colour formats with a pipeline set at once; another evicts the oldest.
 inline constexpr unsigned k_ui_vk_pipeline_sets = 4;
-/// Framebuffers kept (one per attachment: a client's swapchain images, the tests' targets).
-inline constexpr unsigned k_ui_vk_framebuffers = 4;
 /// Copy regions per page per frame (ADR-010 §4.12's upload list); more dirty rects than this
 /// upload the page whole.
 inline constexpr unsigned k_ui_vk_upload_regions = 256;
@@ -125,6 +130,9 @@ static_assert(k_atlas_pages <= k_ui_vk_page_slots);
 struct ui_vk_options {
     bool pipeline_cache = true; ///< read / write the on-disk VkPipelineCache
     bool timestamps = true;     ///< timestamp queries for `wait_gpu_time`
+    /// New atlas pages written by the host (VK_EXT_host_image_copy) when the device can;
+    /// off: staged and copied on the queue like every other upload.
+    bool host_image_copy = true;
     /// The attachment format `initialize` builds the pipelines for (others are built on first
     /// use): a VkFormat, `k_ui_vk_rgba8_unorm` or `k_ui_vk_bgra8_unorm`.
     std::uint32_t format = k_ui_vk_rgba8_unorm;
@@ -147,7 +155,7 @@ struct ui_vk_caps {
 /// Pipeline setup: cold (an empty cache) or warm (the cache file read at `initialize`).
 struct ui_vk_setup_stats {
     std::uint64_t module_ns = 0;   ///< shader modules (CLOCK_MONOTONIC)
-    std::uint64_t pipeline_ns = 0; ///< every pipeline set made so far: render pass + pipelines
+    std::uint64_t pipeline_ns = 0; ///< every pipeline set made so far
     unsigned pipeline_sets = 0;
     unsigned pipelines = 0;
     std::uint64_t cache_bytes_loaded = 0; ///< 0: no file, or a rejected one
@@ -169,6 +177,7 @@ struct ui_vk_draw_stats {
     unsigned atlas_copies = 0;        ///< vkCmdCopyBufferToImage calls (one per page uploaded)
     std::uint64_t atlas_upload_bytes = 0;
     bool atlas_transient = false;     ///< the upload outgrew the slot's staging range
+    unsigned atlas_host_copies = 0;   ///< new pages written whole by the host (no staging)
     unsigned slot = 0;                ///< ring slot of this frame
     std::uint64_t slot_wait_ns = 0;   ///< waiting for the slot's previous fence
 };
@@ -215,16 +224,13 @@ struct ui_vk_gpu_time {
 
 /// A colour attachment to draw into: the image and a 2D colour view of it, `format` a
 /// VkFormat with a UNORM blend (`k_ui_vk_rgba8_unorm`, `k_ui_vk_bgra8_unorm`). The image is in
-/// VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL before a draw and is left there. `serial` names the
-/// attachment for the framebuffer cache: unique per image view over the renderer's life (a
-/// view handle can be reused once destroyed; a serial is not).
+/// VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL before a draw and is left there.
 struct ui_vk_attachment {
     void* image = nullptr;
     void* view = nullptr;
     unsigned width = 0;
     unsigned height = 0;
     std::uint32_t format = k_ui_vk_rgba8_unorm;
-    std::uint64_t serial = 0;
 };
 
 /// An offscreen colour image the tests and the bench draw into (encoded values, no sRGB
@@ -247,7 +253,7 @@ public:
     [[nodiscard]] unsigned width() const { return width_; }
     [[nodiscard]] unsigned height() const { return height_; }
     [[nodiscard]] ui_vk_attachment attachment() const {
-        return {image_, view_, width_, height_, format_, serial_};
+        return {image_, view_, width_, height_, format_};
     }
 
     /// Reads the target back as XRGB8888 / ARGB8888 words (B, G, R, A in memory), rows top
@@ -266,7 +272,6 @@ private:
     unsigned width_ = 0;
     unsigned height_ = 0;
     std::uint32_t format_ = k_ui_vk_rgba8_unorm;
-    std::uint64_t serial_ = 0;
 };
 
 class ui_vk_renderer {
@@ -288,6 +293,10 @@ public:
     [[nodiscard]] bool ready() const { return ready_; }
     [[nodiscard]] const ui_vk_caps& caps() const { return caps_; }
     [[nodiscard]] const ui_vk_setup_stats& setup_stats() const { return setup_; }
+    /// The VkPipelineCache every pipeline of this renderer is made through, read from disk at
+    /// `initialize` and written back as it grows (null before `initialize`). Pipelines made
+    /// through it by others (`vulkan_compositor::initialize`) are persisted with it.
+    [[nodiscard]] void* pipeline_cache() const { return pipeline_cache_; }
 
     /// Where `surface` refs' textures are registered (same device). Borrowed; null skips
     /// surfaces (counted in `primitives_skipped`). Lifetime: the compositor's descriptor sets
@@ -355,19 +364,7 @@ private:
     enum pipeline_index : unsigned { p_shadow, p_quad, p_mono, p_poly, p_underline, p_count };
     struct pipeline_set {
         std::uint32_t format = 0;
-        void* render_pass = nullptr;
         void* pipelines[p_count]{};
-        /// Made for a pass the caller owns (the compositor's linear pass): not destroyed here,
-        /// no framebuffer of ours uses it.
-        bool external = false;
-    };
-    struct framebuffer_entry {
-        std::uint64_t serial = 0;
-        void* view = nullptr;
-        void* render_pass = nullptr;
-        void* framebuffer = nullptr;
-        unsigned width = 0;
-        unsigned height = 0;
     };
     struct page_image {
         void* image = nullptr;
@@ -380,12 +377,9 @@ private:
         void* memory = nullptr;
     };
 
-    /// The pipeline set for `format`, made for our own LOAD pass, or, with `external_pass`, for
-    /// that pass (any format the blend supports: the compositor's R16G16B16A16_SFLOAT).
-    [[nodiscard]] lx::result<unsigned> ensure_pipelines(std::uint32_t format,
-                                                        void* external_pass = nullptr);
-    [[nodiscard]] lx::result<void*> ensure_framebuffer(const ui_vk_attachment& target,
-                                                       void* render_pass);
+    /// The pipeline set for one colour attachment of `format` (dynamic rendering): ours, or
+    /// the compositor's linear pass (R16G16B16A16_SFLOAT).
+    [[nodiscard]] lx::result<unsigned> ensure_pipelines(std::uint32_t format);
     [[nodiscard]] lx::result<void> upload_atlas(atlas& a, void* command_buffer, unsigned slot,
                                                 ui_vk_draw_stats& stats);
     [[nodiscard]] lx::result<void> create_page(unsigned page, unsigned size, bool r8);
@@ -430,13 +424,17 @@ private:
     std::size_t cache_bytes_saved_ = 0; ///< the cache's size when last read or written
     pipeline_set pipeline_sets_[k_ui_vk_pipeline_sets]{};
     unsigned next_pipeline_set_ = 0;
-    framebuffer_entry framebuffers_[k_ui_vk_framebuffers]{};
-    unsigned next_framebuffer_ = 0;
     page_image pages_[k_atlas_pages]{};
     const atlas* atlas_seen_ = nullptr;
     /// A page image made and not yet uploaded by a submitted frame: its next upload is whole,
     /// from UNDEFINED.
     bool page_whole_pending_[k_atlas_pages]{};
+    /// A page image made since the last submitted frame: nothing samples it, the host may
+    /// write it (`host_r8_`, `host_rgba_`).
+    bool page_fresh_[k_atlas_pages]{};
+    /// Host image copy per page format; not usable: pages are staged.
+    host_image_copier host_r8_{};
+    host_image_copier host_rgba_{};
     /// Pages this frame's `upload_atlas` recorded: their dirty lists are cleared at submit.
     bool page_uploaded_[k_atlas_pages]{};
     lx::runtime::affinity owner_ = lx::runtime::affinity::any;
@@ -640,11 +638,14 @@ static_assert(sizeof(push_block) == 16);
     return ok;
 }
 
+/// One image barrier (synchronization2).
 inline void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to,
-                          VkAccessFlags src_access, VkAccessFlags dst_access,
-                          VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage) {
-    VkImageMemoryBarrier b{};
-    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                          VkAccessFlags2 src_access, VkAccessFlags2 dst_access,
+                          VkPipelineStageFlags2 src_stage, VkPipelineStageFlags2 dst_stage) {
+    VkImageMemoryBarrier2 b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    b.srcStageMask = src_stage;
+    b.dstStageMask = dst_stage;
     b.oldLayout = from;
     b.newLayout = to;
     b.srcAccessMask = src_access;
@@ -655,7 +656,29 @@ inline void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from,
     b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     b.subresourceRange.levelCount = 1;
     b.subresourceRange.layerCount = 1;
-    vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &dep);
+}
+
+/// A memory dependency (synchronization2): what orders our pass against the frames and
+/// copies around it.
+inline void memory_barrier(VkCommandBuffer cb, VkPipelineStageFlags2 src_stage,
+                           VkAccessFlags2 src_access, VkPipelineStageFlags2 dst_stage,
+                           VkAccessFlags2 dst_access) {
+    VkMemoryBarrier2 b{};
+    b.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER_2;
+    b.srcStageMask = src_stage;
+    b.srcAccessMask = src_access;
+    b.dstStageMask = dst_stage;
+    b.dstAccessMask = dst_access;
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.memoryBarrierCount = 1;
+    dep.pMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &dep);
 }
 
 /// A command buffer for set-up work (target creation, read-back, the dummy page): its own
@@ -756,54 +779,6 @@ private:
            std::memcmp(data.data() + 16, props.pipelineCacheUUID, VK_UUID_SIZE) == 0;
 }
 
-/// The UI pipelines' render pass for one colour attachment of `format`: the attachment's
-/// contents kept (loadOp LOAD — a damage rect is all that is drawn), COLOR_ATTACHMENT_OPTIMAL
-/// before and after. Its writes wait for the previous frame's and for a read-back's copy.
-[[nodiscard]] inline VkRenderPass make_render_pass(VkDevice dev, VkFormat format) {
-    VkAttachmentDescription color{};
-    color.format = format;
-    color.samples = VK_SAMPLE_COUNT_1_BIT;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    color.finalLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    VkAttachmentReference ref{};
-    ref.attachment = 0;
-    ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &ref;
-    VkSubpassDependency deps[2]{};
-    deps[0].srcSubpass = VK_SUBPASS_EXTERNAL;
-    deps[0].dstSubpass = 0;
-    deps[0].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    deps[0].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
-    deps[0].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[0].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    deps[1].srcSubpass = 0;
-    deps[1].dstSubpass = VK_SUBPASS_EXTERNAL;
-    deps[1].srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    deps[1].srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    deps[1].dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    deps[1].dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                            VK_ACCESS_TRANSFER_READ_BIT;
-    VkRenderPassCreateInfo rpci{};
-    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rpci.attachmentCount = 1;
-    rpci.pAttachments = &color;
-    rpci.subpassCount = 1;
-    rpci.pSubpasses = &subpass;
-    rpci.dependencyCount = 2;
-    rpci.pDependencies = deps;
-    VkRenderPass pass = VK_NULL_HANDLE;
-    if (vkCreateRenderPass(dev, &rpci, nullptr, &pass) != VK_SUCCESS)
-        return VK_NULL_HANDLE;
-    return pass;
-}
-
 [[nodiscard]] inline bool supported_format(std::uint32_t format) {
     return format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_B8G8R8A8_UNORM;
 }
@@ -813,13 +788,6 @@ private:
 } // namespace lx::gfx::ui_vk_detail
 
 // ── ui_vk_target ────────────────────────────────────────────────────────────────
-
-namespace {
-
-/// Framebuffer-cache names for `ui_vk_target`s: never reused within a process.
-std::atomic<std::uint64_t> g_ui_vk_target_serial{1};
-
-} // namespace
 
 lx::gfx::ui_vk_target::~ui_vk_target() { destroy(); }
 
@@ -836,13 +804,11 @@ lx::gfx::ui_vk_target& lx::gfx::ui_vk_target::operator=(ui_vk_target&& other) no
     width_ = other.width_;
     height_ = other.height_;
     format_ = other.format_;
-    serial_ = other.serial_;
     other.image_ = nullptr;
     other.memory_ = nullptr;
     other.view_ = nullptr;
     other.width_ = 0;
     other.height_ = 0;
-    other.serial_ = 0;
     return *this;
 }
 
@@ -879,7 +845,6 @@ lx::result<lx::gfx::ui_vk_target> lx::gfx::ui_vk_target::create(const vk_context
     t.width_ = width;
     t.height_ = height;
     t.format_ = format;
-    t.serial_ = g_ui_vk_target_serial.fetch_add(1, std::memory_order_relaxed);
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
@@ -1036,6 +1001,10 @@ lx::result<void> lx::gfx::ui_vk_renderer::initialize(const vk_context& ctx,
     options_ = options;
     caps_ = {};
     setup_ = {};
+    if (options.host_image_copy) {
+        host_r8_.init(ctx_, static_cast<unsigned>(VK_FORMAT_R8_UNORM));
+        host_rgba_.init(ctx_, static_cast<unsigned>(VK_FORMAT_R8G8B8A8_UNORM));
+    }
     auto dev = static_cast<VkDevice>(ctx.device);
     auto phys = static_cast<VkPhysicalDevice>(ctx.physical_device);
     const auto fail = [this](lx::error e) {
@@ -1369,16 +1338,10 @@ void lx::gfx::ui_vk_renderer::shutdown() {
         save_pipeline_cache();
         for (unsigned i = 0; i < k_ui_vk_ring_slots; ++i)
             free_transient(i);
-        for (framebuffer_entry& f : framebuffers_)
-            if (f.framebuffer)
-                vkDestroyFramebuffer(dev, static_cast<VkFramebuffer>(f.framebuffer), nullptr);
-        for (pipeline_set& set : pipeline_sets_) {
+        for (pipeline_set& set : pipeline_sets_)
             for (void* p : set.pipelines)
                 if (p)
                     vkDestroyPipeline(dev, static_cast<VkPipeline>(p), nullptr);
-            if (set.render_pass && !set.external)
-                vkDestroyRenderPass(dev, static_cast<VkRenderPass>(set.render_pass), nullptr);
-        }
         for (page_image& p : pages_)
             destroy_page(p);
         if (pipeline_cache_)
@@ -1453,11 +1416,12 @@ void lx::gfx::ui_vk_renderer::shutdown() {
     for (pipeline_set& set : pipeline_sets_)
         set = {};
     next_pipeline_set_ = 0;
-    for (framebuffer_entry& f : framebuffers_)
-        f = {};
-    next_framebuffer_ = 0;
     for (page_image& p : pages_)
         p = {};
+    for (bool& f : page_fresh_)
+        f = false;
+    host_r8_ = {};
+    host_rgba_ = {};
     atlas_seen_ = nullptr;
     timed_slot_ = -1;
     ready_ = false;
@@ -1503,43 +1467,33 @@ void lx::gfx::ui_vk_renderer::save_pipeline_cache() {
 #endif
 }
 
-lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t format,
-                                                               void* external_pass) {
+lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t format) {
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
     using namespace ui_vk_detail;
     for (unsigned i = 0; i < k_ui_vk_pipeline_sets; ++i) {
         const pipeline_set& p = pipeline_sets_[i];
-        if (p.render_pass && p.format == format && p.external == (external_pass != nullptr) &&
-            (!external_pass || p.render_pass == external_pass))
+        if (p.pipelines[0] && p.format == format)
             return i;
     }
-    if (!external_pass && !supported_format(format))
-        return lx::invalid_argument("ui_vk_renderer: unsupported attachment format");
     auto dev = static_cast<VkDevice>(ctx_.device);
     const unsigned index = next_pipeline_set_;
     next_pipeline_set_ = (next_pipeline_set_ + 1u) % k_ui_vk_pipeline_sets;
     pipeline_set& set = pipeline_sets_[index];
-    if (set.render_pass) {
+    if (set.pipelines[0]) {
         // A fifth format: the oldest goes, after the frames that may use it.
         wait_slots();
-        for (framebuffer_entry& f : framebuffers_)
-            if (f.framebuffer && f.render_pass == set.render_pass) {
-                vkDestroyFramebuffer(dev, static_cast<VkFramebuffer>(f.framebuffer), nullptr);
-                f = {};
-            }
         for (void* p : set.pipelines)
             if (p)
                 vkDestroyPipeline(dev, static_cast<VkPipeline>(p), nullptr);
-        if (!set.external)
-            vkDestroyRenderPass(dev, static_cast<VkRenderPass>(set.render_pass), nullptr);
         set = {};
     }
 
     const std::uint64_t t0 = now_ns();
-    VkRenderPass pass = external_pass ? static_cast<VkRenderPass>(external_pass)
-                                      : make_render_pass(dev, static_cast<VkFormat>(format));
-    if (!pass)
-        return vk_fail("ui_vk: vkCreateRenderPass failed");
+    const auto vk_format = static_cast<VkFormat>(format);
+    VkPipelineRenderingCreateInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &vk_format;
 
     VkPipelineVertexInputStateCreateInfo vertex_input{};
     vertex_input.sType = VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO;
@@ -1591,6 +1545,7 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
         }
         VkGraphicsPipelineCreateInfo& g = infos[i];
         g.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+        g.pNext = &rendering;
         g.stageCount = 2;
         g.pStages = stages[i];
         g.pVertexInputState = &vertex_input;
@@ -1601,8 +1556,6 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
         g.pColorBlendState = &blend_state;
         g.pDynamicState = &dynamic;
         g.layout = static_cast<VkPipelineLayout>(pipeline_layout_);
-        g.renderPass = pass;
-        g.subpass = 0;
         g.basePipelineIndex = -1;
     }
     VkPipeline made[p_count]{};
@@ -1611,16 +1564,12 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
         for (VkPipeline p : made)
             if (p)
                 vkDestroyPipeline(dev, p, nullptr);
-        if (!external_pass)
-            vkDestroyRenderPass(dev, pass, nullptr);
         return vk_fail("ui_vk: vkCreateGraphicsPipelines failed");
     }
     setup_.pipeline_ns += now_ns() - t0;
     ++setup_.pipeline_sets;
     setup_.pipelines += p_count;
     set.format = format;
-    set.render_pass = pass;
-    set.external = external_pass != nullptr;
     for (unsigned i = 0; i < p_count; ++i)
         set.pipelines[i] = made[i];
     // New pipelines grew the cache: keep them for the next start.
@@ -1628,45 +1577,7 @@ lx::result<unsigned> lx::gfx::ui_vk_renderer::ensure_pipelines(std::uint32_t for
     return index;
 #else
     (void)format;
-    (void)external_pass;
     return lx::not_implemented("lx::gfx::ui_vk_renderer::ensure_pipelines");
-#endif
-}
-
-lx::result<void*> lx::gfx::ui_vk_renderer::ensure_framebuffer(const ui_vk_attachment& target,
-                                                              void* render_pass) {
-#if defined(LUMEN_HAS_VULKAN)
-    for (const framebuffer_entry& f : framebuffers_)
-        if (f.framebuffer && f.serial == target.serial && f.view == target.view &&
-            f.render_pass == render_pass && f.width == target.width && f.height == target.height)
-            return f.framebuffer;
-    auto dev = static_cast<VkDevice>(ctx_.device);
-    framebuffer_entry& slot = framebuffers_[next_framebuffer_];
-    next_framebuffer_ = (next_framebuffer_ + 1u) % k_ui_vk_framebuffers;
-    if (slot.framebuffer) {
-        // Evicted: the frames in flight may still use it.
-        wait_slots();
-        vkDestroyFramebuffer(dev, static_cast<VkFramebuffer>(slot.framebuffer), nullptr);
-        slot = {};
-    }
-    auto view = static_cast<VkImageView>(target.view);
-    VkFramebufferCreateInfo fbci{};
-    fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fbci.renderPass = static_cast<VkRenderPass>(render_pass);
-    fbci.attachmentCount = 1;
-    fbci.pAttachments = &view;
-    fbci.width = target.width;
-    fbci.height = target.height;
-    fbci.layers = 1;
-    VkFramebuffer fb = VK_NULL_HANDLE;
-    if (vkCreateFramebuffer(dev, &fbci, nullptr, &fb) != VK_SUCCESS)
-        return ui_vk_detail::vk_fail("ui_vk: vkCreateFramebuffer failed");
-    slot = {target.serial, target.view, render_pass, fb, target.width, target.height};
-    return static_cast<void*>(fb);
-#else
-    (void)target;
-    (void)render_pass;
-    return lx::not_implemented("lx::gfx::ui_vk_renderer::ensure_framebuffer");
 #endif
 }
 
@@ -1697,13 +1608,16 @@ lx::result<void> lx::gfx::ui_vk_renderer::create_page(unsigned page, unsigned si
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkImageView view = VK_NULL_HANDLE;
+    const host_image_copier& host = r8 ? host_r8_ : host_rgba_;
     if (!ui_vk_detail::make_image(static_cast<VkDevice>(ctx_.device),
                                   static_cast<VkPhysicalDevice>(ctx_.physical_device),
                                   r8 ? VK_FORMAT_R8_UNORM : VK_FORMAT_R8G8B8A8_UNORM, size, size,
-                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+                                  VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                                      static_cast<VkImageUsageFlags>(host.usage()),
                                   image, memory, view))
         return ui_vk_detail::vk_oom("ui_vk: atlas page image creation failed");
     p = {image, memory, view, size};
+    page_fresh_[page] = true;
     // Every set points at the new view before it next draws.
     ++page_generation_;
     return {};
@@ -1777,6 +1691,21 @@ lx::result<void> lx::gfx::ui_vk_renderer::upload_atlas(atlas& a, void* command_b
             if (auto made = create_page(i, view.size, view.format == atlas_format::r8); !made)
                 return made.get_error();
             page_whole_pending_[i] = true;
+        }
+        const host_image_copier& host = view.format == atlas_format::r8 ? host_r8_ : host_rgba_;
+        if (page_fresh_[i] && host.usable()) {
+            // No frame samples this image yet: the host writes it whole, in place.
+            if (auto prepared = host.prepare(pages_[i].image); !prepared)
+                return prepared.get_error();
+            if (auto copied = host.copy(pages_[i].image, view.pixels, view.stride / bpt,
+                                        {0, 0, static_cast<int>(view.size),
+                                         static_cast<int>(view.size)});
+                !copied)
+                return copied.get_error();
+            stats.atlas_upload_bytes += static_cast<std::uint64_t>(view.size) * view.size * bpt;
+            ++stats.atlas_host_copies;
+            page_uploaded_[i] = true; // dirty list cleared once the frame is submitted
+            continue;
         }
         const std::span<const lx::rect2i> dirty = a.dirty_rects(i);
         whole[i] = page_whole_pending_[i] || fresh_atlas || a.dirty_full(i) ||
@@ -1900,9 +1829,10 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     lx::runtime::assert_affinity(owner_);
     if (!ready_)
         return lx::not_implemented("lx::gfx::ui_vk_renderer::draw");
-    if (!target.image || !target.view || target.width == 0 || target.height == 0 ||
-        target.serial == 0)
+    if (!target.image || !target.view || target.width == 0 || target.height == 0)
         return lx::invalid_argument("ui_vk_renderer::draw: invalid attachment");
+    if (!ui_vk_detail::supported_format(target.format))
+        return lx::invalid_argument("ui_vk_renderer: unsupported attachment format");
 
     ui_vk_draw_stats stats{};
     const lx::rect2i full{0, 0, static_cast<int>(target.width), static_cast<int>(target.height)};
@@ -1924,9 +1854,6 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     if (!pipelines)
         return pipelines.get_error();
     const pipeline_set& set = pipeline_sets_[*pipelines];
-    auto framebuffer = ensure_framebuffer(target, set.render_pass);
-    if (!framebuffer)
-        return framebuffer.get_error();
 
     auto dev = static_cast<VkDevice>(ctx_.device);
     // The slot: wait (rarely) for the frame three back that used it.
@@ -1995,12 +1922,26 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     if (set_generation_[slot] != page_generation_)
         write_page_descriptors(slot);
 
-    VkRenderPassBeginInfo rpbi{};
-    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpbi.renderPass = static_cast<VkRenderPass>(set.render_pass);
-    rpbi.framebuffer = static_cast<VkFramebuffer>(*framebuffer);
-    rpbi.renderArea.extent = {target.width, target.height};
-    vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+    // The attachment's contents are kept (LOAD — a damage rect is all that is drawn); its
+    // writes wait for the previous frame's and for a read-back's copy.
+    ui_vk_detail::memory_barrier(
+        cb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_2_TRANSFER_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRenderingAttachmentInfo color{};
+    color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color.imageView = static_cast<VkImageView>(target.view);
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    VkRenderingInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    rendering.renderArea.extent = {target.width, target.height};
+    rendering.layerCount = 1;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachments = &color;
+    vkCmdBeginRendering(cb, &rendering);
     VkViewport viewport{};
     viewport.width = static_cast<float>(target.width);
     viewport.height = static_cast<float>(target.height);
@@ -2047,8 +1988,8 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
                     }
                     // The compositor's pipeline and set: ours are bound again after.
                     auto drawn = compositor_->record_blits(
-                        cb, set.render_pass, target.format, pipeline_cache_, target.width,
-                        target.height, &stream.surfaces[index], 1, rect, true);
+                        cb, target.format, pipeline_cache_, target.width, target.height,
+                        &stream.surfaces[index], 1, rect, true);
                     bound_pipeline = -1;
                     set_bound = false;
                     vkCmdSetViewport(cb, 0, 1, &viewport);
@@ -2094,7 +2035,13 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
             ++stats.draw_calls;
         }
     }
-    vkCmdEndRenderPass(cb);
+    vkCmdEndRendering(cb);
+    // What reads the attachment next (the next frame, a read-back's copy) waits for its writes.
+    ui_vk_detail::memory_barrier(
+        cb, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT |
+            VK_ACCESS_2_TRANSFER_READ_BIT);
     if (timed)
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, qp, 2 * slot + 1);
     // Never submitted: the compositor's acquires recorded above did not happen, so the next
@@ -2120,6 +2067,9 @@ lx::result<lx::gfx::ui_vk_draw_stats> lx::gfx::ui_vk_renderer::draw(
     }
     submitted_[slot] = true;
     ++frame_;
+    // A submitted frame's descriptors name every page: none is fresh any more.
+    for (bool& f : page_fresh_)
+        f = false;
     if (atlas) {
         for (unsigned i = 0; i < k_atlas_pages; ++i)
             if (page_uploaded_[i]) {
@@ -2224,7 +2174,7 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
     // This slot's page descriptors and the pipelines made for the compositor's pass.
     if (set_generation_[slot] != page_generation_)
         write_page_descriptors(slot);
-    auto pipelines = ensure_pipelines(frame->vk_format, frame->render_pass);
+    auto pipelines = ensure_pipelines(frame->vk_format);
     if (!pipelines) {
         abandon();
         return pipelines.get_error();
@@ -2271,10 +2221,9 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
                         continue;
                     }
                     // Decoded into linear light (`encoded` false), as `composite` draws them.
-                    auto drawn = compositor.record_blits(cb, frame->render_pass, frame->vk_format,
-                                                         pipeline_cache_, frame->width,
-                                                         frame->height, &stream.surfaces[index], 1,
-                                                         rect, false);
+                    auto drawn = compositor.record_blits(cb, frame->vk_format, pipeline_cache_,
+                                                         frame->width, frame->height,
+                                                         &stream.surfaces[index], 1, rect, false);
                     bound_pipeline = -1;
                     set_bound = false;
                     vkCmdSetViewport(cb, 0, 1, &viewport);
@@ -2343,6 +2292,9 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
         (void)vkQueueWaitIdle(static_cast<VkQueue>(ctx_.queue));
     }
     ++frame_;
+    // A submitted frame's descriptors name every page: none is fresh any more.
+    for (bool& f : page_fresh_)
+        f = false;
     if (atlas) {
         // The dirty lists were cleared when their rects were copied (above, under the lock).
         for (unsigned i = 0; i < k_atlas_pages; ++i)

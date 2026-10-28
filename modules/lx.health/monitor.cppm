@@ -111,6 +111,8 @@ struct health_inputs {
     unsigned import_cache_capacity = 0;
     unsigned long long staging_bytes = 0;
     unsigned long long staging_budget = 0;
+    /// GPU memory from DRM fdinfo (`lx::drm::read_gpu_memory`), copied into the report.
+    gpu_memory_status gpu{};
     /// The render thread's figures (import cache, staging) are known (it answered).
     bool render_figures = false;
 

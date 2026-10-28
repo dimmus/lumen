@@ -1,5 +1,13 @@
 module;
 
+#include <poll.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#ifndef SO_PEERPIDFD
+#define SO_PEERPIDFD 77 // Linux 6.5
+#endif
+
 import lx.foundation;
 import lx.runtime;
 
@@ -30,6 +38,8 @@ enum class privilege_result {
 };
 
 /// Validates privileged zlm_shell_v1 access (SO_PEERCRED + binary path + optional portal).
+/// The caller reads the binary path through the peer's pid and confirms the pid still names
+/// the peer (`pidfd_alive`) before asking.
 class privilege_checker {
 public:
     explicit privilege_checker(shell_verification config = {});
@@ -50,6 +60,23 @@ public:
 private:
     shell_verification config_{};
 };
+
+/// SO_PEERPIDFD (Linux 6.5): a pidfd for the process that connected `socket_fd`. Unlike the
+/// number SO_PEERCRED reports, it keeps naming that process after it exits: a pid read for
+/// the peer can be confirmed with `pidfd_alive` afterwards. Fails when the kernel lacks the
+/// option (see `peer_pidfd_supported`) or — before Linux 6.16 — when the peer has exited.
+[[nodiscard]] lx::result<lx::unique_fd> peer_pidfd(int socket_fd);
+
+/// The kernel hands out peer pidfds: SO_PEERPIDFD on a fresh socketpair, whose peer is this
+/// process, succeeds; false before Linux 6.5 (ENOPROTOOPT). Probes on each call.
+[[nodiscard]] bool peer_pidfd_supported();
+
+/// The process `pidfd` refers to has not exited: the pidfd does not poll readable, which it
+/// does once the whole thread group is gone (Linux 5.3) — a zombie included, so its /proc
+/// entry, whose root and executable are already released, never counts as the peer's. A
+/// group whose leader alone has exited still counts as running; its /proc/<pid> root and
+/// exe are gone too, so a caller must treat a failed read as a refusal.
+[[nodiscard]] bool pidfd_alive(int pidfd);
 
 } // namespace lx::session
 
@@ -83,4 +110,29 @@ lx::session::privilege_checker::check_global(const credentials& peer,
 
 const lx::session::shell_verification& lx::session::privilege_checker::config() const {
     return config_;
+}
+
+lx::result<lx::unique_fd> lx::session::peer_pidfd(int socket_fd) {
+    int fd = -1;
+    socklen_t len = sizeof(fd);
+    if (::getsockopt(socket_fd, SOL_SOCKET, SO_PEERPIDFD, &fd, &len) != 0 || fd < 0)
+        return lx::make_error(lx::io_err::not_found, "SO_PEERPIDFD: no pidfd for the peer");
+    return lx::unique_fd{fd};
+}
+
+bool lx::session::peer_pidfd_supported() {
+    int sv[2];
+    if (::socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sv) != 0)
+        return false;
+    const bool ok = peer_pidfd(sv[0]).has_value();
+    ::close(sv[0]);
+    ::close(sv[1]);
+    return ok;
+}
+
+bool lx::session::pidfd_alive(int pidfd) {
+    if (pidfd < 0)
+        return false;
+    pollfd p{.fd = pidfd, .events = POLLIN, .revents = 0};
+    return ::poll(&p, 1, 0) == 0;
 }

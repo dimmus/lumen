@@ -9,15 +9,6 @@ set(LUMEN_PROTOCOL_GLUE_HEADERS "")
 
 find_program(LUMEN_PYTHON3 python3 python REQUIRED)
 
-set(_LUMEN_PROTOCOL_PRIORITIES "P0")
-if(LUMEN_PROTOCOLS_P1)
-    list(APPEND _LUMEN_PROTOCOL_PRIORITIES "P1")
-endif()
-if(LUMEN_PROTOCOLS_P2)
-    list(APPEND _LUMEN_PROTOCOL_PRIORITIES "P2")
-endif()
-list(JOIN _LUMEN_PROTOCOL_PRIORITIES "," _LUMEN_PRIORITY_CSV)
-
 # Generate typed C++ modules (wl-scanner-cpp). Glue C sources are listed by the
 # generated CMake (protocol_manifest.py) so list append happens at file scope.
 function(lumen_generate_protocol xml_path output_module output_var)
@@ -89,7 +80,6 @@ execute_process(
         --root "${CMAKE_SOURCE_DIR}"
         --manifest "${LUMEN_PROTOCOL_MANIFEST}"
         --cmake-out "${LUMEN_GENERATED_PROTOCOLS_CMAKE}"
-        --priorities "${_LUMEN_PRIORITY_CSV}"
     RESULT_VARIABLE _LUMEN_MANIFEST_RESULT
 )
 if(NOT _LUMEN_MANIFEST_RESULT EQUAL 0)

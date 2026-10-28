@@ -368,8 +368,6 @@ systemctl --user reload lumen-compositor   # SIGHUP: re-read the configuration
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `LUMEN_PROTOCOLS_P1` | ON | Generate P1 upstream protocols |
-| `LUMEN_PROTOCOLS_P2` | OFF | Generate P2 upstream protocols |
 | `LUMEN_VULKAN_VALIDATION` | OFF | Vulkan validation layers |
 | `LUMEN_BUILD_PORTAL` | ON | xdg-desktop-portal-lumen (needs libsystemd and wayland-client) |
 

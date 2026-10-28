@@ -6,6 +6,7 @@
 // lifecycle lets a dma-buf (and its explicit-sync release point) go.
 #include "lumen_test.hpp"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/eventfd.h>
 #include <unistd.h>
@@ -211,6 +212,9 @@ struct fake_kernel {
     int last_eventfd = -1;
     unsigned long long last_signal = 0;
     int last_sync_file = -2;
+    bool refuse_deadline = false;            // a kernel before 6.4: WAIT_DEADLINE is EINVAL
+    unsigned queries = 0;
+    unsigned long long last_deadline = 0;
 };
 
 lx::gfx::drm_timeline_ops fake_ops(fake_kernel& k) {
@@ -222,8 +226,14 @@ lx::gfx::drm_timeline_ops fake_ops(fake_kernel& k) {
         *h = static_cast<fake_kernel*>(u)->next_handle++;
         return 0;
     };
-    ops.query = [](void* u, unsigned, unsigned long long point, bool* done) {
-        *done = static_cast<fake_kernel*>(u)->signalled_upto >= point;
+    ops.query = [](void* u, unsigned, unsigned long long point, unsigned long long deadline,
+                   bool* done) {
+        auto* k = static_cast<fake_kernel*>(u);
+        ++k->queries;
+        k->last_deadline = deadline;
+        if (deadline && k->refuse_deadline)
+            return -EINVAL;
+        *done = k->signalled_upto >= point;
         return 0;
     };
     ops.eventfd = [](void* u, unsigned, unsigned long long, int efd) {
@@ -290,6 +300,26 @@ LUMEN_TEST(timeline_acquire_query_watch_and_release_with_fence) {
     k.last_sync_file = -2;
     LUMEN_CHECK(static_cast<bool>(t.signal_after(id, 10, -1)));
     LUMEN_CHECK(k.last_sync_file == -2 && k.last_signal == 10);
+}
+
+LUMEN_TEST(timeline_query_carries_the_deadline_until_the_kernel_refuses_it) {
+    fake_kernel k;
+    lx::gfx::drm_timeline_table t;
+    t.bind(fake_ops(k));
+    const unsigned id = t.import(::eventfd(0, EFD_CLOEXEC)).value();
+    k.signalled_upto = 4;
+    LUMEN_CHECK(!t.signalled(id, 5, 123'000).value());
+    LUMEN_CHECK(k.queries == 1 && k.last_deadline == 123'000 && t.deadline_hints());
+    LUMEN_CHECK(t.signalled(id, 4).value() && k.last_deadline == 0); // no deadline: none sent
+    // An older kernel: the hinted query is refused, the plain one answers — once; after it
+    // no query carries a deadline.
+    k.refuse_deadline = true;
+    k.queries = 0;
+    LUMEN_CHECK(!t.signalled(id, 5, 456'000).value());
+    LUMEN_CHECK(k.queries == 2 && k.last_deadline == 0 && !t.deadline_hints());
+    k.queries = 0;
+    LUMEN_CHECK(t.signalled(id, 4, 789'000).value());
+    LUMEN_CHECK(k.queries == 1 && k.last_deadline == 0);
 }
 
 LUMEN_TEST(release_fence_mailbox_keeps_the_newest_and_dups) {

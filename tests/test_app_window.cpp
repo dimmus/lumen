@@ -1,5 +1,5 @@
 // lx.app against a real compositor (ADR-010 §7 Phase 4, stage 3): lumen-hello's window
-// (executables/lumen-hello/hello_ui.hpp) mapped, presented, hovered, clicked, typed into,
+// (executables/lumen-hello/hello_ui.cppm) mapped, presented, hovered, clicked, typed into,
 // resized, moved to a 1.25 output, and left idle.
 //
 // The compositor runs in this process (lx::compositor::compositor on a private socket, two
@@ -51,8 +51,7 @@ import lx.scene;
 import lx.ui;
 import lx.app;
 import lx.wayland.client;
-
-#include "../executables/lumen-hello/hello_ui.hpp"
+import lumen.hello.ui;
 
 #ifndef LUMEN_UI_GOLDEN_DIR
 #define LUMEN_UI_GOLDEN_DIR "tests/golden/ui"

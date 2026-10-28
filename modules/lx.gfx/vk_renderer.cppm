@@ -30,10 +30,42 @@ struct vk_context {
     /// VK_KHR_external_semaphore_fd. Lets a frame's completion be exported as a sync_file
     /// the atomic commit waits on, instead of the render thread blocking on the GPU.
     bool supports_external_semaphore_fd = false;
+    /// VK_EXT_host_image_copy enabled (`host_image_copier`).
+    bool supports_host_image_copy = false;
+    /// VK_EXT_memory_priority enabled: what is shown is allocated at the highest priority.
+    bool supports_memory_priority = false;
 
     [[nodiscard]] bool valid() const {
         return device && physical_device && queue && command_pool;
     }
+};
+
+/// Uploads written by the host straight into an image (VK_EXT_host_image_copy): no staging
+/// buffer, no queue copy, no submit. Only for an image no submitted frame may be sampling —
+/// the caller has waited for those frames, or the image is new. Used when the device enables
+/// the extension, `vk_format` (optimal tiling, sampled) supports host transfer, a copy can
+/// target SHADER_READ_ONLY_OPTIMAL, and the driver reports that host-transfer usage keeps
+/// the GPU's own access optimal (`optimalDeviceAccess`: no lost compression); otherwise the
+/// caller stages as before.
+class host_image_copier {
+public:
+    /// Decides for `vk_format` (a VkFormat). False: not usable, stage instead.
+    bool init(const vk_context& ctx, unsigned vk_format);
+    [[nodiscard]] bool usable() const { return copy_ != nullptr; }
+    /// The image usage to add at creation (VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT); 0 when not
+    /// usable.
+    [[nodiscard]] unsigned usage() const;
+    /// A new image (UNDEFINED) into SHADER_READ_ONLY_OPTIMAL, on the host.
+    [[nodiscard]] lx::result<void> prepare(void* image) const;
+    /// Writes `region` of an image in SHADER_READ_ONLY_OPTIMAL from `pixels` — rows
+    /// `row_texels` texels apart (0: tightly packed), the region's first texel first.
+    [[nodiscard]] lx::result<void> copy(void* image, const void* pixels, unsigned row_texels,
+                                        lx::rect2i region) const;
+
+private:
+    void* device_ = nullptr;
+    void* copy_ = nullptr;       ///< PFN_vkCopyMemoryToImageEXT
+    void* transition_ = nullptr; ///< PFN_vkTransitionImageLayoutEXT
 };
 
 /// GPU composite target whose memory is exportable as a dmabuf, so the same image the
@@ -106,14 +138,21 @@ public:
     vulkan_compositor(const vulkan_compositor&) = delete;
     vulkan_compositor& operator=(const vulkan_compositor&) = delete;
 
-    [[nodiscard]] lx::result<void> initialize(const vk_context& ctx);
+    /// `pipeline_cache`: a VkPipelineCache the composite and encode pipelines are made
+    /// through (`ui_vk_renderer::pipeline_cache`, persisted on disk), or null. Borrowed: it
+    /// must outlive this compositor's pipeline creation (`initialize`, the first frame of
+    /// each scanout format).
+    [[nodiscard]] lx::result<void> initialize(const vk_context& ctx,
+                                              void* pipeline_cache = nullptr);
     void shutdown();
     [[nodiscard]] bool ready() const { return pipeline_ != nullptr; }
 
     /// Make a dmabuf-imported client image samplable under `image.image_id`.
     [[nodiscard]] lx::result<void> bind_imported(const imported_image& image);
 
-    /// Upload shared-memory pixels (tightly packed RGBA8) under `texture_id`.
+    /// Upload shared-memory pixels (tightly packed RGBA8) under `texture_id`. With
+    /// `host_image_copier` usable the host writes the image (after the frames in flight,
+    /// which this waits for either way); otherwise a staging ring and a queue copy.
     [[nodiscard]] lx::result<void> upload_rgba(unsigned texture_id, unsigned width,
                                                unsigned height, const unsigned char* rgba);
 
@@ -145,18 +184,18 @@ public:
     [[nodiscard]] lx::transfer_function output_transfer() const { return output_transfer_; }
 
     /// ADR-010 §4.4: `surface` primitives in a UI stream (`:ui_vk`) are this compositor's
-    /// draws, recorded into the UI renderer's own render pass. `prepare_blits` records, on
-    /// `command_buffer` and outside any render pass, what `composite` records before its own:
+    /// draws, recorded into the UI renderer's own pass. `prepare_blits` records, on
+    /// `command_buffer` and outside any pass, what `composite` records before its own:
     /// the acquire of freshly imported client images; and it makes the 1×1 texture a solid
     /// draw binds when `cmds` has one (an upload submitted on its own, once). Call it before
     /// beginning the pass `record_blits` draws in.
     [[nodiscard]] lx::result<void> prepare_blits(void* command_buffer, const blit_command* cmds,
                                                  unsigned count);
-    /// Records `cmds` into the render pass the caller has begun on `command_buffer` — one
-    /// colour attachment of `vk_format` (a VkFormat), `width` × `height` — with the composite
-    /// shaders in a pipeline made for a pass compatible with `render_pass` (one per format,
-    /// cached; `pipeline_cache` is a VkPipelineCache or null), scissored to `scissor` and each
-    /// draw's clip. `encoded`: the attachment holds encoded values (a UI target, ADR-010
+    /// Records `cmds` into the rendering the caller has begun on `command_buffer` (dynamic
+    /// rendering) — one colour attachment of `vk_format` (a VkFormat), `width` × `height` —
+    /// with the composite shaders in a pipeline made for that format (one per format, cached;
+    /// `pipeline_cache` is a VkPipelineCache or null), scissored to `scissor` and each draw's
+    /// clip. `encoded`: the attachment holds encoded values (a UI target, ADR-010
     /// §4.5), so texels are not decoded to linear light — tint and opacity scale the encoded
     /// values, as `gl_compositor` and `cpu_compositor::blend` do. Leaves its pipeline and
     /// descriptor set bound: the caller binds its own again.
@@ -167,9 +206,9 @@ public:
     /// `forget_texture`, `upload_rgba` over it and `bind_imported` of another image under its
     /// id first call every registered external user's `wait` (`add_external_user`). On this
     /// compositor's own frame (`begin_linear_frame`) its fences cover them, as for
-    /// `composite`. A pass of this compositor's own (`render_pass` its linear pass) draws with
-    /// its own composite pipeline.
-    [[nodiscard]] lx::result<composite_stats> record_blits(void* command_buffer, void* render_pass,
+    /// `composite`. The linear format (this compositor's own pass) draws with its own
+    /// composite pipeline.
+    [[nodiscard]] lx::result<composite_stats> record_blits(void* command_buffer,
                                                            unsigned vk_format, void* pipeline_cache,
                                                            unsigned width, unsigned height,
                                                            const blit_command* cmds, unsigned count,
@@ -204,9 +243,8 @@ public:
     /// records its own work.
     struct linear_frame {
         void* command_buffer = nullptr;
-        /// The linear pass `begin_linear_pass` begins: one R16G16B16A16_SFLOAT attachment,
-        /// linear light. Pipelines made for it are compatible with every frame's.
-        void* render_pass = nullptr;
+        /// The linear pass `begin_linear_pass` begins: one attachment of this format
+        /// (R16G16B16A16_SFLOAT, linear light).
         unsigned vk_format = 0;
         unsigned width = 0;
         unsigned height = 0;
@@ -217,10 +255,10 @@ public:
         unsigned rect_count = 0;
     };
     /// `composite`'s set-up for `target` — the linear intermediate, the encode pipeline, the
-    /// framebuffer, the solid texture when `cmds` has a solid draw — then waits for the frame
+    /// solid texture when `cmds` has a solid draw — then waits for the frame
     /// slot, begins its command buffer and records the acquires of fresh imports. The caller
     /// records its work outside the pass (atlas copies), then `begin_linear_pass`, its draws
-    /// (`record_blits` with `render_pass` for surfaces), then `end_linear_frame`; on an
+    /// (`record_blits` with `vk_format` for surfaces), then `end_linear_frame`; on an
     /// error in between, `abandon_linear_frame`. `region`, `changed`, `previous`: as
     /// `composite_region` (null `region`: the whole target, as `composite`).
     [[nodiscard]] lx::result<linear_frame>
@@ -304,7 +342,9 @@ private:
     /// Begins the composite pass on `command_buffer` per the plan: cleared whole, or loaded.
     void begin_composite_pass(void* command_buffer, unsigned width, unsigned height,
                               lx::color clear);
-    /// Records the encode pass into the current framebuffer per the plan.
+    /// Ends it, and hands the intermediate to the encode pass (SHADER_READ_ONLY_OPTIMAL).
+    void end_composite_pass(void* command_buffer);
+    /// Records the encode pass into the current target per the plan.
     void record_encode_pass(void* command_buffer, const render_target& target);
     /// Inside a loaded composite pass: clears `rect` to the pass's clear colour and
     /// scissors to it.
@@ -329,8 +369,10 @@ private:
     static constexpr unsigned k_solid_texture_id = 0xFFFF'FFFEu;
     [[nodiscard]] int alloc_texture(unsigned id);
     void destroy_texture(texture_slot& slot);
-    [[nodiscard]] lx::result<void> ensure_framebuffer(const render_target& target);
+    /// Makes `target` the current one (`targets_`).
+    void track_target(const render_target& target);
     [[nodiscard]] lx::result<void> create_descriptor(texture_slot& slot);
+    /// Made on the first staged upload: never when every upload is a host copy.
     [[nodiscard]] lx::result<void> ensure_staging_ring(unsigned need_bytes);
     /// Submits the recorded slot. When `out_fence_fd` is non-null and the device can
     /// export sync_files, the submit signals a semaphore exported into `*out_fence_fd` and
@@ -342,9 +384,8 @@ private:
     /// any resource a queued command buffer might reference.
     void wait_all_slots_idle();
 
-    /// `record_blits`' pipelines, one per attachment format (a pipeline is compatible with
-    /// every render pass compatible with the one it was made for: one colour attachment of
-    /// the format). Fixed: a fifth format evicts the first.
+    /// `record_blits`' pipelines, one per attachment format (dynamic rendering: a pipeline
+    /// is made for one colour attachment of a format). Fixed: a fifth format evicts the first.
     static constexpr unsigned k_pass_pipelines = 4;
     struct pass_pipeline {
         unsigned format = 0;
@@ -353,7 +394,7 @@ private:
         void* opaque_pipeline = nullptr;
     };
     pass_pipeline pass_pipelines_[k_pass_pipelines]{};
-    /// Records the acquire of every imported image not yet acquired (outside a render pass).
+    /// Records the acquire of every imported image not yet acquired (outside a pass).
     void record_acquires(void* command_buffer);
     /// Shared by `composite` and `prepare_blits`: the 1×1 texture solid draws bind.
     [[nodiscard]] lx::result<void> ensure_solid_texture(const blit_command* cmds, unsigned count);
@@ -375,7 +416,8 @@ private:
     static constexpr unsigned k_staging_ring_bytes = 16u * 1024u * 1024u;
 
     vk_context ctx_{};
-    void* render_pass_ = nullptr;
+    void* pipeline_cache_ = nullptr;
+    host_image_copier host_copy_{};
     void* pipeline_ = nullptr;
     /// `pipeline_` with blending off, for `blend_mode::opaque` draws, as GL and CPU draw them:
     /// a source of alpha 1 replaces the destination either way (src·1 + dst·0 is exact), so
@@ -399,17 +441,16 @@ private:
     unsigned staging_capacity_ = 0;
     unsigned staging_offset_ = 0;
 
-    /// One framebuffer per render target. A double-buffered scanout alternates targets
-    /// every frame, so a single-entry cache would destroy and recreate it per frame.
-    static constexpr unsigned k_max_framebuffers = 4;
-    struct framebuffer_slot {
-        void* framebuffer = nullptr;
-        void* image = nullptr;
+    /// The render targets drawn into lately (VkImage), and whether each was written: a
+    /// double-buffered scanout alternates two per output. A fifth evicts the first, which
+    /// is then encoded whole again.
+    static constexpr unsigned k_max_targets = 4;
+    struct target_slot {
+        const void* image = nullptr;
         /// A frame was submitted into it: what it holds outside a region is kept.
         bool written = false;
     };
-    framebuffer_slot framebuffers_[k_max_framebuffers]{};
-    void* framebuffer_ = nullptr;
+    target_slot targets_[k_max_targets]{};
 
     /// Linear-light intermediates. The composite pass blends into one; the encode pass reads
     /// it and writes the scanout buffer. One per target size, so outputs of different sizes
@@ -424,7 +465,6 @@ private:
         void* image = nullptr;
         void* memory = nullptr;
         void* view = nullptr;
-        void* framebuffer = nullptr;
         /// The encode pass's set, pointed at `view`. Its own, allocated with the pool: a frame
         /// in flight for one size must not see it re-pointed at another's.
         void* encode_set = nullptr;
@@ -454,16 +494,8 @@ private:
     bool frame_chained_ = false;
     /// The composite pass's clear value (linear light) for `begin_linear_rect`.
     float pass_clear_[4]{};
-    /// The current framebuffer's `framebuffers_` entry.
-    unsigned framebuffer_index_ = 0;
-    /// The composite pass that loads the intermediate (SHADER_READ_ONLY_OPTIMAL in and
-    /// out), compatible with `render_pass_`: a damage frame's.
-    void* load_render_pass_ = nullptr;
-
-    void* encode_render_pass_ = nullptr;
-    /// The encode pass that loads the target (GENERAL in and out), compatible with
-    /// `encode_render_pass_`: a region's.
-    void* encode_load_render_pass_ = nullptr;
+    /// The current target's `targets_` entry.
+    unsigned target_index_ = 0;
     void* encode_pipeline_ = nullptr;
     void* encode_pipeline_layout_ = nullptr;
     void* encode_set_layout_ = nullptr;
@@ -715,11 +747,60 @@ VkShaderModule create_shader(VkDevice dev, const uint32_t* code, std::size_t byt
     return module_handle;
 }
 
+/// One image barrier (synchronization2): a layout transition, or with `from == to` an
+/// ordering of the image's accesses alone.
+void image_barrier(VkCommandBuffer cb, VkImage image, VkImageLayout from, VkImageLayout to,
+                   VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                   VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
+    VkImageMemoryBarrier2 b{};
+    b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    b.srcStageMask = src_stage;
+    b.srcAccessMask = src_access;
+    b.dstStageMask = dst_stage;
+    b.dstAccessMask = dst_access;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = image;
+    b.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    b.subresourceRange.levelCount = 1;
+    b.subresourceRange.layerCount = 1;
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &dep);
+}
+
+/// Begins dynamic rendering into `view` (COLOR_ATTACHMENT_OPTIMAL) over `area`: cleared to
+/// `clear` when given, else loaded (`load`) or left undefined.
+void begin_rendering(VkCommandBuffer cb, VkImageView view, VkRect2D area,
+                     const VkClearValue* clear, bool load) {
+    VkRenderingAttachmentInfo color{};
+    color.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO;
+    color.imageView = view;
+    color.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+    color.loadOp = clear ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                   : load ? VK_ATTACHMENT_LOAD_OP_LOAD
+                          : VK_ATTACHMENT_LOAD_OP_DONT_CARE;
+    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    if (clear)
+        color.clearValue = *clear;
+    VkRenderingInfo ri{};
+    ri.sType = VK_STRUCTURE_TYPE_RENDERING_INFO;
+    ri.renderArea = area;
+    ri.layerCount = 1;
+    ri.colorAttachmentCount = 1;
+    ri.pColorAttachments = &color;
+    vkCmdBeginRendering(cb, &ri);
+}
+
 /// The composite pipeline (composite.vert/.frag, premultiplied source-over — or no blending
-/// when `blend` is false, for opaque draws — viewport and scissor dynamic) for
-/// `render_pass`'s one colour attachment. Null on failure.
+/// when `blend` is false, for opaque draws — viewport and scissor dynamic) for one colour
+/// attachment of `format` (dynamic rendering). Null on failure.
 VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_layout,
-                                     VkRenderPass render_pass, VkPipelineCache cache,
+                                     VkFormat format, VkPipelineCache cache,
                                      bool blend = true) {
     VkShaderModule vert = create_shader(dev, k_composite_vert_spv, sizeof(k_composite_vert_spv));
     VkShaderModule frag = create_shader(dev, k_composite_frag_spv, sizeof(k_composite_frag_spv));
@@ -788,8 +869,14 @@ VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_lay
     dynamic.dynamicStateCount = 2;
     dynamic.pDynamicStates = dynamic_states;
 
+    VkPipelineRenderingCreateInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &format;
+
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpci.pNext = &rendering;
     gpci.stageCount = 2;
     gpci.pStages = stages;
     gpci.pVertexInputState = &vertex_input;
@@ -800,8 +887,6 @@ VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_lay
     gpci.pColorBlendState = &blend_state;
     gpci.pDynamicState = &dynamic;
     gpci.layout = pipeline_layout;
-    gpci.renderPass = render_pass;
-    gpci.subpass = 0;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult pipeline_result =
@@ -816,6 +901,137 @@ VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_lay
 } // namespace
 
 #endif
+
+bool lx::gfx::host_image_copier::init(const vk_context& ctx, unsigned vk_format) {
+    *this = {};
+#if defined(LUMEN_HAS_VULKAN)
+    if (!ctx.valid() || !ctx.supports_host_image_copy)
+        return false;
+    auto dev = static_cast<VkDevice>(ctx.device);
+    auto phys = static_cast<VkPhysicalDevice>(ctx.physical_device);
+    const auto format = static_cast<VkFormat>(vk_format);
+
+    VkFormatProperties3 props3{};
+    props3.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3;
+    VkFormatProperties2 props{};
+    props.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+    props.pNext = &props3;
+    vkGetPhysicalDeviceFormatProperties2(phys, format, &props);
+    if (!(props3.optimalTilingFeatures & VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT))
+        return false;
+
+    // The image as uploads make it, with host transfer added: still supported, and still as
+    // fast for the GPU to sample.
+    VkPhysicalDeviceImageFormatInfo2 info{};
+    info.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+    info.format = format;
+    info.type = VK_IMAGE_TYPE_2D;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                 VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+    VkHostImageCopyDevicePerformanceQueryEXT perf{};
+    perf.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_COPY_DEVICE_PERFORMANCE_QUERY_EXT;
+    VkImageFormatProperties2 image_props{};
+    image_props.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+    image_props.pNext = &perf;
+    if (vkGetPhysicalDeviceImageFormatProperties2(phys, &info, &image_props) != VK_SUCCESS ||
+        perf.optimalDeviceAccess != VK_TRUE)
+        return false;
+
+    // The copy writes the image in the layout it is sampled in, so no transition per upload.
+    VkImageLayout layouts[64]{};
+    VkPhysicalDeviceHostImageCopyPropertiesEXT copy_props{};
+    copy_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT;
+    copy_props.copyDstLayoutCount = 64;
+    copy_props.pCopyDstLayouts = layouts;
+    VkPhysicalDeviceProperties2 dev_props{};
+    dev_props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    dev_props.pNext = &copy_props;
+    vkGetPhysicalDeviceProperties2(phys, &dev_props);
+    const std::span dst{layouts, std::min<std::size_t>(copy_props.copyDstLayoutCount, 64)};
+    if (std::ranges::find(dst, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) == dst.end())
+        return false;
+
+    auto copy = vkGetDeviceProcAddr(dev, "vkCopyMemoryToImageEXT");
+    auto transition = vkGetDeviceProcAddr(dev, "vkTransitionImageLayoutEXT");
+    if (!copy || !transition)
+        return false;
+    device_ = dev;
+    copy_ = reinterpret_cast<void*>(copy);
+    transition_ = reinterpret_cast<void*>(transition);
+    return true;
+#else
+    (void)ctx;
+    (void)vk_format;
+    return false;
+#endif
+}
+
+unsigned lx::gfx::host_image_copier::usage() const {
+#if defined(LUMEN_HAS_VULKAN)
+    return usable() ? static_cast<unsigned>(VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT) : 0u;
+#else
+    return 0u;
+#endif
+}
+
+lx::result<void> lx::gfx::host_image_copier::prepare(void* image) const {
+#if defined(LUMEN_HAS_VULKAN)
+    if (!usable() || !image)
+        return lx::not_implemented("lx::gfx::host_image_copier::prepare");
+    VkHostImageLayoutTransitionInfoEXT t{};
+    t.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT;
+    t.image = static_cast<VkImage>(image);
+    t.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    t.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    t.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    t.subresourceRange.levelCount = 1;
+    t.subresourceRange.layerCount = 1;
+    const auto fn = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(transition_);
+    if (fn(static_cast<VkDevice>(device_), 1, &t) != VK_SUCCESS)
+        return vk_error("vkTransitionImageLayoutEXT failed");
+    return {};
+#else
+    (void)image;
+    return lx::not_implemented("lx::gfx::host_image_copier::prepare");
+#endif
+}
+
+lx::result<void> lx::gfx::host_image_copier::copy(void* image, const void* pixels,
+                                                  unsigned row_texels,
+                                                  lx::rect2i region) const {
+#if defined(LUMEN_HAS_VULKAN)
+    if (!usable() || !image || !pixels)
+        return lx::not_implemented("lx::gfx::host_image_copier::copy");
+    if (region.width <= 0 || region.height <= 0 || region.x < 0 || region.y < 0)
+        return lx::invalid_argument("host_image_copier::copy: empty region");
+    VkMemoryToImageCopyEXT r{};
+    r.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT;
+    r.pHostPointer = pixels;
+    r.memoryRowLength = row_texels;
+    r.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    r.imageSubresource.layerCount = 1;
+    r.imageOffset = {region.x, region.y, 0};
+    r.imageExtent = {static_cast<uint32_t>(region.width), static_cast<uint32_t>(region.height),
+                     1};
+    VkCopyMemoryToImageInfoEXT info{};
+    info.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT;
+    info.dstImage = static_cast<VkImage>(image);
+    info.dstImageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    info.regionCount = 1;
+    info.pRegions = &r;
+    const auto fn = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(copy_);
+    if (fn(static_cast<VkDevice>(device_), &info) != VK_SUCCESS)
+        return vk_error("vkCopyMemoryToImageEXT failed");
+    return {};
+#else
+    (void)image;
+    (void)pixels;
+    (void)row_texels;
+    (void)region;
+    return lx::not_implemented("lx::gfx::host_image_copier::copy");
+#endif
+}
 
 lx::gfx::render_target::~render_target() { destroy(); }
 
@@ -925,6 +1141,12 @@ lx::result<lx::gfx::render_target> lx::gfx::render_target::create(const vk_conte
     dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
     dedicated.image = image;
     dedicated.pNext = &export_info;
+    // What is scanned out is the last thing an oversubscribed GPU should evict.
+    VkMemoryPriorityAllocateInfoEXT priority{};
+    priority.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
+    priority.priority = 1.f;
+    if (ctx.supports_memory_priority)
+        export_info.pNext = &priority;
 
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -1096,71 +1318,16 @@ void lx::gfx::vulkan_compositor::forget_texture(unsigned id) {
         destroy_texture(textures_[static_cast<unsigned>(slot)]);
 }
 
-lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
+lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx,
+                                                        void* pipeline_cache) {
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
     if (!ctx.valid())
         return lx::not_implemented("lx::gfx::vulkan_compositor::initialize");
     shutdown();
     ctx_ = ctx;
+    pipeline_cache_ = pipeline_cache;
 
     auto dev = static_cast<VkDevice>(ctx_.device);
-
-    VkAttachmentDescription color{};
-    color.format = k_linear_format;
-    color.samples = VK_SAMPLE_COUNT_1_BIT;
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    // The encode pass samples this next, so hand it over already readable — that transition
-    // is exactly what a render pass final layout is for, and saves an explicit barrier.
-    color.finalLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-
-    VkAttachmentReference color_ref{};
-    color_ref.attachment = 0;
-    color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &color_ref;
-
-    // The previous frame's encode pass may still be sampling this intermediate and its
-    // composite pass writing it: this frame's writes wait for both. Both composite passes
-    // carry it (render pass compatibility wants their dependencies identical).
-    VkSubpassDependency pass_dep{};
-    pass_dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-    pass_dep.dstSubpass = 0;
-    pass_dep.srcStageMask =
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    pass_dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    pass_dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    pass_dep.dstAccessMask =
-        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-    VkRenderPassCreateInfo rpci{};
-    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rpci.attachmentCount = 1;
-    rpci.pAttachments = &color;
-    rpci.subpassCount = 1;
-    rpci.pSubpasses = &subpass;
-    rpci.dependencyCount = 1;
-    rpci.pDependencies = &pass_dep;
-
-    VkRenderPass render_pass = VK_NULL_HANDLE;
-    if (vkCreateRenderPass(dev, &rpci, nullptr, &render_pass) != VK_SUCCESS)
-        return vk_error("vkCreateRenderPass failed");
-    render_pass_ = render_pass;
-
-    // A damage frame's: the intermediate keeps the previous frame (LOAD), left readable by
-    // the pass before.
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    color.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    VkRenderPass load_pass = VK_NULL_HANDLE;
-    if (vkCreateRenderPass(dev, &rpci, nullptr, &load_pass) != VK_SUCCESS)
-        return vk_error("load vkCreateRenderPass failed");
-    load_render_pass_ = load_pass;
 
     VkSamplerCreateInfo sci{};
     sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -1250,13 +1417,14 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
         return vk_error("vkCreatePipelineLayout failed");
     pipeline_layout_ = pipeline_layout;
 
+    const auto cache = static_cast<VkPipelineCache>(pipeline_cache_);
     VkPipeline pipeline =
-        create_composite_pipeline(dev, pipeline_layout, render_pass, VK_NULL_HANDLE);
+        create_composite_pipeline(dev, pipeline_layout, k_linear_format, cache);
     if (!pipeline)
         return vk_error("composite pipeline creation failed");
     pipeline_ = pipeline;
     VkPipeline opaque_pipeline =
-        create_composite_pipeline(dev, pipeline_layout, render_pass, VK_NULL_HANDLE, false);
+        create_composite_pipeline(dev, pipeline_layout, k_linear_format, cache, false);
     if (!opaque_pipeline)
         return vk_error("composite pipeline creation failed");
     opaque_pipeline_ = opaque_pipeline;
@@ -1308,8 +1476,9 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
         }
     }
 
-    if (auto staging = ensure_staging_ring(k_staging_ring_bytes); !staging)
-        return staging.get_error();
+    // Uploads write shm textures from the host when the device can; the staging ring then
+    // never exists.
+    host_copy_.init(ctx_, static_cast<unsigned>(VK_FORMAT_R8G8B8A8_UNORM));
 
     return {};
 #else
@@ -1337,11 +1506,6 @@ void lx::gfx::vulkan_compositor::shutdown() {
         for (unsigned i = 0; i < k_max_textures; ++i) {
             if (textures_[i].used)
                 destroy_texture(textures_[i]);
-        }
-        for (unsigned i = 0; i < k_max_framebuffers; ++i) {
-            if (framebuffers_[i].framebuffer)
-                vkDestroyFramebuffer(dev, static_cast<VkFramebuffer>(framebuffers_[i].framebuffer),
-                                     nullptr);
         }
         for (unsigned i = 0; i < k_frame_slots; ++i) {
             if (fences_[i])
@@ -1399,15 +1563,10 @@ void lx::gfx::vulkan_compositor::shutdown() {
                 dev, static_cast<VkDescriptorSetLayout>(descriptor_layout_), nullptr);
         if (sampler_)
             vkDestroySampler(dev, static_cast<VkSampler>(sampler_), nullptr);
-        if (render_pass_)
-            vkDestroyRenderPass(dev, static_cast<VkRenderPass>(render_pass_), nullptr);
-        if (load_render_pass_)
-            vkDestroyRenderPass(dev, static_cast<VkRenderPass>(load_render_pass_), nullptr);
     }
 #endif
-    framebuffer_ = nullptr;
-    for (unsigned i = 0; i < k_max_framebuffers; ++i)
-        framebuffers_[i] = {};
+    for (target_slot& t : targets_)
+        t = {};
     for (unsigned i = 0; i < k_frame_slots; ++i) {
         fences_[i] = nullptr;
         command_buffers_[i] = nullptr;
@@ -1426,8 +1585,8 @@ void lx::gfx::vulkan_compositor::shutdown() {
     descriptor_pool_ = nullptr;
     descriptor_layout_ = nullptr;
     sampler_ = nullptr;
-    render_pass_ = nullptr;
-    load_render_pass_ = nullptr;
+    pipeline_cache_ = nullptr;
+    host_copy_ = {};
     ctx_ = {};
 }
 
@@ -1573,7 +1732,8 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
         ici.arrayLayers = 1;
         ici.samples = VK_SAMPLE_COUNT_1_BIT;
         ici.tiling = VK_IMAGE_TILING_OPTIMAL;
-        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                    static_cast<VkImageUsageFlags>(host_copy_.usage());
         ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
@@ -1631,6 +1791,18 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
             return described.get_error();
     }
 
+    if (host_copy_.usable()) {
+        // Every frame that could sample the image is complete (waited for above): the host
+        // writes it in place — no staging copy of the pixels, no queue copy, no submit.
+        if (!slot.layout_ready) {
+            if (auto prepared = host_copy_.prepare(slot.image); !prepared)
+                return prepared.get_error();
+            slot.layout_ready = true;
+        }
+        return host_copy_.copy(slot.image, rgba, 0,
+                               {0, 0, static_cast<int>(width), static_cast<int>(height)});
+    }
+
     const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4u;
     if (auto staged = ensure_staging_ring(k_staging_ring_bytes); !staged)
         return staged.get_error();
@@ -1672,19 +1844,9 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cb, &begin);
 
-    VkImageMemoryBarrier to_transfer{};
-    to_transfer.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    to_transfer.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    to_transfer.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_transfer.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_transfer.image = static_cast<VkImage>(slot.image);
-    to_transfer.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    to_transfer.subresourceRange.levelCount = 1;
-    to_transfer.subresourceRange.layerCount = 1;
-    to_transfer.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,
-                         0, nullptr, 0, nullptr, 1, &to_transfer);
+    image_barrier(cb, static_cast<VkImage>(slot.image), VK_IMAGE_LAYOUT_UNDEFINED,
+                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
 
     VkBufferImageCopy copy{};
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -1695,14 +1857,10 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
                            static_cast<VkImage>(slot.image),
                            VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
 
-    VkImageMemoryBarrier to_sample = to_transfer;
-    to_sample.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    to_sample.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    to_sample.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_sample.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                         &to_sample);
+    image_barrier(cb, static_cast<VkImage>(slot.image), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
     vkEndCommandBuffer(cb);
 
@@ -1860,17 +2018,11 @@ void lx::gfx::vulkan_compositor::destroy_encode_pipeline() {
     if (encode_pipeline_layout_)
         vkDestroyPipelineLayout(dev, static_cast<VkPipelineLayout>(encode_pipeline_layout_),
                                 nullptr);
-    if (encode_render_pass_)
-        vkDestroyRenderPass(dev, static_cast<VkRenderPass>(encode_render_pass_), nullptr);
-    if (encode_load_render_pass_)
-        vkDestroyRenderPass(dev, static_cast<VkRenderPass>(encode_load_render_pass_), nullptr);
     // The encode sets come from descriptor_pool_ and die with it; encode_set_layout_ is
     // destroyed in shutdown() alongside the other layouts.
 #endif
     encode_pipeline_ = nullptr;
     encode_pipeline_layout_ = nullptr;
-    encode_render_pass_ = nullptr;
-    encode_load_render_pass_ = nullptr;
     encode_ready_ = false;
 }
 
@@ -1886,66 +2038,6 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_encode_pipeline(lx::pixel_fo
     wait_all_slots_idle();
     destroy_encode_pipeline();
     encode_format_ = format;
-
-    VkAttachmentDescription color{};
-    color.format = vk_scanout_format(format);
-    color.samples = VK_SAMPLE_COUNT_1_BIT;
-    // The encode pass covers every pixel with a fullscreen triangle, so nothing needs
-    // clearing first — DONT_CARE saves a full write of the scanout buffer per frame.
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
-    color.stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE;
-    color.stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE;
-    color.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    // GENERAL, not PRESENT_SRC: the consumer is KMS via dmabuf, not a Vulkan swapchain.
-    color.finalLayout = VK_IMAGE_LAYOUT_GENERAL;
-
-    VkAttachmentReference color_ref{};
-    color_ref.attachment = 0;
-    color_ref.layout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-
-    VkSubpassDescription subpass{};
-    subpass.pipelineBindPoint = VK_PIPELINE_BIND_POINT_GRAPHICS;
-    subpass.colorAttachmentCount = 1;
-    subpass.pColorAttachments = &color_ref;
-
-    // The composite pass writes the intermediate and this pass samples it. Without this
-    // the read may be scheduled against a write that has not landed.
-    // The region pass also loads the target, ordered after its last write (a frame three
-    // back) or read (a capture's copy out of it); both passes carry the one dependency
-    // (render pass compatibility wants them identical).
-    VkSubpassDependency dep{};
-    dep.srcSubpass = VK_SUBPASS_EXTERNAL;
-    dep.dstSubpass = 0;
-    dep.srcStageMask =
-        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
-    dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dep.dstStageMask =
-        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
-    dep.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-
-    VkRenderPassCreateInfo rpci{};
-    rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
-    rpci.attachmentCount = 1;
-    rpci.pAttachments = &color;
-    rpci.subpassCount = 1;
-    rpci.pSubpasses = &subpass;
-    rpci.dependencyCount = 1;
-    rpci.pDependencies = &dep;
-
-    VkRenderPass pass = VK_NULL_HANDLE;
-    if (vkCreateRenderPass(dev, &rpci, nullptr, &pass) != VK_SUCCESS)
-        return vk_error("encode vkCreateRenderPass failed");
-    encode_render_pass_ = pass;
-
-    // A region's: the target keeps what it holds outside the region (LOAD from GENERAL).
-    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
-    color.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
-    VkRenderPass load_pass = VK_NULL_HANDLE;
-    if (vkCreateRenderPass(dev, &rpci, nullptr, &load_pass) != VK_SUCCESS)
-        return vk_error("encode load vkCreateRenderPass failed");
-    encode_load_render_pass_ = load_pass;
 
     VkPushConstantRange push_range{};
     push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -2024,8 +2116,15 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_encode_pipeline(lx::pixel_fo
     dynamic.dynamicStateCount = 2;
     dynamic.pDynamicStates = dynamic_states;
 
+    const VkFormat scanout_format = vk_scanout_format(format);
+    VkPipelineRenderingCreateInfo rendering{};
+    rendering.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
+    rendering.colorAttachmentCount = 1;
+    rendering.pColorAttachmentFormats = &scanout_format;
+
     VkGraphicsPipelineCreateInfo gpci{};
     gpci.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
+    gpci.pNext = &rendering;
     gpci.stageCount = 2;
     gpci.pStages = stages;
     gpci.pVertexInputState = &vertex_input;
@@ -2036,11 +2135,11 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_encode_pipeline(lx::pixel_fo
     gpci.pColorBlendState = &blend_state;
     gpci.pDynamicState = &dynamic;
     gpci.layout = layout;
-    gpci.renderPass = pass;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
     const VkResult created =
-        vkCreateGraphicsPipelines(dev, VK_NULL_HANDLE, 1, &gpci, nullptr, &pipeline);
+        vkCreateGraphicsPipelines(dev, static_cast<VkPipelineCache>(pipeline_cache_), 1, &gpci,
+                                  nullptr, &pipeline);
     vkDestroyShaderModule(dev, vert, nullptr);
     vkDestroyShaderModule(dev, frag, nullptr);
     if (created != VK_SUCCESS)
@@ -2060,8 +2159,6 @@ void lx::gfx::vulkan_compositor::destroy_linear_target(linear_target& t) {
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev)
         return;
-    if (t.framebuffer)
-        vkDestroyFramebuffer(dev, static_cast<VkFramebuffer>(t.framebuffer), nullptr);
     if (t.view)
         vkDestroyImageView(dev, static_cast<VkImageView>(t.view), nullptr);
     if (t.image)
@@ -2069,7 +2166,6 @@ void lx::gfx::vulkan_compositor::destroy_linear_target(linear_target& t) {
     if (t.memory)
         vkFreeMemory(dev, static_cast<VkDeviceMemory>(t.memory), nullptr);
 #endif
-    t.framebuffer = nullptr;
     t.view = nullptr;
     t.image = nullptr;
     t.memory = nullptr;
@@ -2085,7 +2181,7 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
                                                                   bool chained) {
 #if defined(LUMEN_HAS_VULKAN)
     auto dev = static_cast<VkDevice>(ctx_.device);
-    if (!dev || !render_pass_ || width == 0 || height == 0)
+    if (!dev || !pipeline_ || width == 0 || height == 0)
         return lx::not_implemented("lx::gfx::vulkan_compositor::ensure_linear_target");
 
     ++linear_frame_;
@@ -2187,8 +2283,13 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
         return vk_error("no device-local memory type for the linear intermediate");
     }
 
+    // Every frame is composited through it: as high a priority as the scanout targets.
+    VkMemoryPriorityAllocateInfoEXT priority{};
+    priority.sType = VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT;
+    priority.priority = 1.f;
     VkMemoryAllocateInfo mai{};
     mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    mai.pNext = ctx_.supports_memory_priority ? &priority : nullptr;
     mai.allocationSize = req.size;
     mai.memoryTypeIndex = type_index;
 
@@ -2222,23 +2323,6 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
         return vk_error("linear intermediate vkCreateImageView failed");
     }
     t.view = view;
-
-    VkFramebufferCreateInfo fbci{};
-    fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fbci.renderPass = static_cast<VkRenderPass>(render_pass_);
-    fbci.attachmentCount = 1;
-    fbci.pAttachments = &view;
-    fbci.width = width;
-    fbci.height = height;
-    fbci.layers = 1;
-
-    VkFramebuffer fb = VK_NULL_HANDLE;
-    if (vkCreateFramebuffer(dev, &fbci, nullptr, &fb) != VK_SUCCESS) {
-        destroy_linear_target(t);
-        linear_ = nullptr;
-        return vk_error("linear intermediate vkCreateFramebuffer failed");
-    }
-    t.framebuffer = fb;
     t.width = width;
     t.height = height;
     t.last_used = linear_frame_;
@@ -2271,54 +2355,21 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
 #endif
 }
 
-lx::result<void> lx::gfx::vulkan_compositor::ensure_framebuffer(const render_target& target) {
-#if defined(LUMEN_HAS_VULKAN)
-    auto dev = static_cast<VkDevice>(ctx_.device);
-    // The scanout framebuffer belongs to the encode pass — the composite pass renders into
-    // the linear intermediate and never touches the target directly.
-    if (!dev || !encode_render_pass_ || !target.valid())
-        return lx::not_implemented("lx::gfx::vulkan_compositor::ensure_framebuffer");
-
+void lx::gfx::vulkan_compositor::track_target(const render_target& target) {
     int free_slot = -1;
-    for (unsigned i = 0; i < k_max_framebuffers; ++i) {
-        if (framebuffers_[i].framebuffer && framebuffers_[i].image == target.vk_image()) {
-            framebuffer_ = framebuffers_[i].framebuffer;
-            framebuffer_index_ = i;
-            return {};
+    for (unsigned i = 0; i < k_max_targets; ++i) {
+        if (targets_[i].image == target.vk_image()) {
+            target_index_ = i;
+            return;
         }
-        if (!framebuffers_[i].framebuffer && free_slot < 0)
+        if (!targets_[i].image && free_slot < 0)
             free_slot = static_cast<int>(i);
     }
-
-    if (free_slot < 0) {
-        // More distinct targets than slots: evict the first rather than grow unbounded.
-        vkDestroyFramebuffer(dev, static_cast<VkFramebuffer>(framebuffers_[0].framebuffer),
-                             nullptr);
-        framebuffers_[0] = {};
+    // More distinct targets than slots: evict the first rather than grow unbounded.
+    if (free_slot < 0)
         free_slot = 0;
-    }
-
-    VkImageView attachment = static_cast<VkImageView>(target.vk_image_view());
-    VkFramebufferCreateInfo fbci{};
-    fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
-    fbci.renderPass = static_cast<VkRenderPass>(encode_render_pass_);
-    fbci.attachmentCount = 1;
-    fbci.pAttachments = &attachment;
-    fbci.width = target.width();
-    fbci.height = target.height();
-    fbci.layers = 1;
-
-    VkFramebuffer framebuffer = VK_NULL_HANDLE;
-    if (vkCreateFramebuffer(dev, &fbci, nullptr, &framebuffer) != VK_SUCCESS)
-        return vk_error("vkCreateFramebuffer failed");
-    framebuffers_[static_cast<unsigned>(free_slot)] = {framebuffer, target.vk_image()};
-    framebuffer_ = framebuffer;
-    framebuffer_index_ = static_cast<unsigned>(free_slot);
-    return {};
-#else
-    (void)target;
-    return lx::not_implemented("lx::gfx::vulkan_compositor::ensure_framebuffer");
-#endif
+    targets_[static_cast<unsigned>(free_slot)] = {target.vk_image(), false};
+    target_index_ = static_cast<unsigned>(free_slot);
 }
 
 void lx::gfx::vulkan_compositor::plan_frame(const render_target& target,
@@ -2347,7 +2398,7 @@ void lx::gfx::vulkan_compositor::plan_frame(const render_target& target,
     pass_full_ = !continues || fill(*changed, pass_rects_, pass_count_);
     if (pass_full_)
         pass_count_ = 0;
-    encode_full_ = !region || !framebuffers_[framebuffer_index_].written;
+    encode_full_ = !region || !targets_[target_index_].written;
     if (!encode_full_) {
         // What the composite pass changes is encoded too, whatever the caller's region says.
         damage_region encode = *region;
@@ -2363,7 +2414,7 @@ void lx::gfx::vulkan_compositor::plan_frame(const render_target& target,
 }
 
 void lx::gfx::vulkan_compositor::finish_frame(const render_target& target) {
-    framebuffers_[framebuffer_index_].written = true;
+    targets_[target_index_].written = true;
     if (!frame_chained_ || !linear_)
         return;
     // One intermediate per target: an older one naming it (a handle reused) is stale.
@@ -2386,27 +2437,33 @@ void lx::gfx::vulkan_compositor::begin_composite_pass(void* command_buffer, unsi
     for (unsigned i = 0; i < 4; ++i)
         pass_clear_[i] = clear_value.color.float32[i];
 
-    VkRenderPassBeginInfo rpbi{};
-    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpbi.framebuffer = static_cast<VkFramebuffer>(linear_->framebuffer);
+    // The previous frame's encode pass may still be sampling this intermediate and its
+    // composite pass writing it: this frame's writes wait for both. A whole pass clears it
+    // (what it held is not needed); a damage pass keeps the previous frame, left readable by
+    // the pass before (`end_composite_pass`).
+    image_barrier(cb, static_cast<VkImage>(linear_->image),
+                  pass_full_ ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRect2D area{};
     if (pass_full_) {
-        rpbi.renderPass = static_cast<VkRenderPass>(render_pass_);
-        rpbi.renderArea.extent = {width, height};
-        rpbi.clearValueCount = 1;
-        rpbi.pClearValues = &clear_value;
+        area.extent = {width, height};
     } else {
         // Loaded: the rects are cleared one by one as they are drawn (`clear_pass_rect`).
         // No rect (nothing changed): an empty pass over one pixel.
-        damage_region area{};
+        damage_region rects{};
         for (unsigned i = 0; i < pass_count_; ++i)
-            area.rects[area.count++] = pass_rects_[i];
-        const lx::rect2i box = pass_count_ > 0 ? area.bounds() : lx::rect2i{0, 0, 1, 1};
-        rpbi.renderPass = static_cast<VkRenderPass>(load_render_pass_);
-        rpbi.renderArea.offset = {box.x, box.y};
-        rpbi.renderArea.extent = {static_cast<unsigned>(box.width),
-                                  static_cast<unsigned>(box.height)};
+            rects.rects[rects.count++] = pass_rects_[i];
+        const lx::rect2i box = pass_count_ > 0 ? rects.bounds() : lx::rect2i{0, 0, 1, 1};
+        area.offset = {box.x, box.y};
+        area.extent = {static_cast<unsigned>(box.width), static_cast<unsigned>(box.height)};
     }
-    vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+    begin_rendering(cb, static_cast<VkImageView>(linear_->view), area,
+                    pass_full_ ? &clear_value : nullptr, true);
 
     VkViewport viewport{};
     viewport.width = static_cast<float>(width);
@@ -2421,6 +2478,22 @@ void lx::gfx::vulkan_compositor::begin_composite_pass(void* command_buffer, unsi
     (void)width;
     (void)height;
     (void)clear;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::end_composite_pass(void* command_buffer) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    vkCmdEndRendering(cb);
+    // The encode pass samples it next: its writes land before that read.
+    image_barrier(cb, static_cast<VkImage>(linear_->image),
+                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+#else
+    (void)command_buffer;
 #endif
 }
 
@@ -2449,32 +2522,37 @@ void lx::gfx::vulkan_compositor::record_encode_pass(void* command_buffer,
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
     // ── Encode pass ────────────────────────────────────────────────────────────────
     //
-    // The composite pass left the intermediate holding blended linear light, already in
-    // SHADER_READ_ONLY_OPTIMAL via its final layout. This converts it into the display's
-    // transfer function and writes the scanout buffer. A fullscreen triangle, no blending,
-    // and the render pass's subpass dependency orders the sample after the write. A region
-    // is the same triangle once per rect, scissored to it, over a target that keeps the
-    // rest (loaded).
+    // The composite pass left the intermediate holding blended linear light, readable
+    // (`end_composite_pass`). This converts it into the display's transfer function and
+    // writes the scanout buffer. A fullscreen triangle, no blending. A region is the same
+    // triangle once per rect, scissored to it, over a target that keeps the rest (loaded).
     if (!encode_full_ && encode_count_ == 0)
         return; // nothing of the target to write
     auto cb = static_cast<VkCommandBuffer>(command_buffer);
-    VkRenderPassBeginInfo encode_rpbi{};
-    encode_rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    encode_rpbi.framebuffer = static_cast<VkFramebuffer>(framebuffer_);
+    auto image = static_cast<VkImage>(target.vk_image());
+    // Ordered after the target's last write (a frame three back) or read (a capture's copy
+    // out of it). The encode covers every pixel it writes, so a whole one need not keep what
+    // the target held (DONT_CARE: no full read of the scanout buffer).
+    image_barrier(cb, image, encode_full_ ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_GENERAL,
+                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRect2D area{};
     if (encode_full_) {
-        encode_rpbi.renderPass = static_cast<VkRenderPass>(encode_render_pass_);
-        encode_rpbi.renderArea.extent = {target.width(), target.height()};
+        area.extent = {target.width(), target.height()};
     } else {
-        damage_region area{};
+        damage_region rects{};
         for (unsigned i = 0; i < encode_count_; ++i)
-            area.rects[area.count++] = encode_rects_[i];
-        const lx::rect2i box = area.bounds();
-        encode_rpbi.renderPass = static_cast<VkRenderPass>(encode_load_render_pass_);
-        encode_rpbi.renderArea.offset = {box.x, box.y};
-        encode_rpbi.renderArea.extent = {static_cast<unsigned>(box.width),
-                                         static_cast<unsigned>(box.height)};
+            rects.rects[rects.count++] = encode_rects_[i];
+        const lx::rect2i box = rects.bounds();
+        area.offset = {box.x, box.y};
+        area.extent = {static_cast<unsigned>(box.width), static_cast<unsigned>(box.height)};
     }
-    vkCmdBeginRenderPass(cb, &encode_rpbi, VK_SUBPASS_CONTENTS_INLINE);
+    begin_rendering(cb, static_cast<VkImageView>(target.vk_image_view()), area, nullptr,
+                    !encode_full_);
 
     VkViewport viewport{};
     viewport.width = static_cast<float>(target.width());
@@ -2504,7 +2582,15 @@ void lx::gfx::vulkan_compositor::record_encode_pass(void* command_buffer,
         vkCmdSetScissor(cb, 0, 1, &scissor);
         vkCmdDraw(cb, 3, 1, 0, 0);
     }
-    vkCmdEndRenderPass(cb);
+    vkCmdEndRendering(cb);
+    // GENERAL, not PRESENT_SRC: the consumer is KMS via dmabuf, not a Vulkan swapchain. A
+    // capture's copy, or the next frame into it, waits on these stages.
+    image_barrier(cb, image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT |
+                      VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT,
+                  VK_ACCESS_2_NONE);
 #else
     (void)command_buffer;
     (void)target;
@@ -2544,8 +2630,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
         return linear.get_error();
     if (auto encode = ensure_encode_pipeline(target.format()); !encode)
         return encode.get_error();
-    if (auto framebuffer = ensure_framebuffer(target); !framebuffer)
-        return framebuffer.get_error();
+    track_target(target);
 
     // A solid draw needs some bound descriptor set (see `k_solid_texture_id`).
     if (auto solid = ensure_solid_texture(cmds, count); !solid)
@@ -2665,7 +2750,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
         }
     }
 
-    vkCmdEndRenderPass(cb);
+    end_composite_pass(cb);
     record_encode_pass(cb, target);
     vkEndCommandBuffer(cb);
 
@@ -2698,8 +2783,10 @@ void lx::gfx::vulkan_compositor::record_acquires(void* command_buffer) {
         if (!slot.used || slot.layout_ready || !slot.image || slot.owns_image)
             continue;
 
-        VkImageMemoryBarrier acquire{};
-        acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        VkImageMemoryBarrier2 acquire{};
+        acquire.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        acquire.dstStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+        acquire.dstAccessMask = VK_ACCESS_2_SHADER_SAMPLED_READ_BIT;
         acquire.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         acquire.newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
         acquire.srcQueueFamilyIndex = ctx_.supports_queue_family_foreign
@@ -2712,10 +2799,11 @@ void lx::gfx::vulkan_compositor::record_acquires(void* command_buffer) {
         acquire.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         acquire.subresourceRange.levelCount = 1;
         acquire.subresourceRange.layerCount = 1;
-        acquire.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
-        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                             VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, nullptr, 0, nullptr, 1,
-                             &acquire);
+        VkDependencyInfo dep{};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &acquire;
+        vkCmdPipelineBarrier2(cb, &dep);
         slot.layout_ready = true;
         // Undone by `abandon_prepared_blits` when this command buffer is never submitted.
         if (acquired_count_ < k_max_textures)
@@ -2758,20 +2846,21 @@ lx::result<void> lx::gfx::vulkan_compositor::prepare_blits(void* command_buffer,
 }
 
 lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
-    void* command_buffer, void* render_pass, unsigned vk_format, void* pipeline_cache,
-    unsigned width, unsigned height, const blit_command* cmds, unsigned count,
-    lx::rect2i scissor, bool encoded) {
+    void* command_buffer, unsigned vk_format, void* pipeline_cache, unsigned width,
+    unsigned height, const blit_command* cmds, unsigned count, lx::rect2i scissor,
+    bool encoded) {
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
-    if (!ready() || !command_buffer || !render_pass)
+    if (!ready() || !command_buffer)
         return lx::not_implemented("lx::gfx::vulkan_compositor::record_blits");
     if (width == 0 || height == 0)
         return lx::invalid_argument("record_blits into an empty attachment");
     auto dev = static_cast<VkDevice>(ctx_.device);
 
-    // The pipeline for this attachment format, made once; this compositor's own linear pass
-    // draws with its composite pipeline.
-    void* pipeline = render_pass == render_pass_ ? pipeline_ : nullptr;
-    void* opaque_pipeline = render_pass == render_pass_ ? opaque_pipeline_ : nullptr;
+    // The pipeline for this attachment format, made once; the linear format draws with this
+    // compositor's own composite pipeline.
+    const bool linear = vk_format == static_cast<unsigned>(k_linear_format);
+    void* pipeline = linear ? pipeline_ : nullptr;
+    void* opaque_pipeline = linear ? opaque_pipeline_ : nullptr;
     for (const pass_pipeline& p : pass_pipelines_)
         if (!pipeline && p.pipeline && p.format == vk_format) {
             pipeline = p.pipeline;
@@ -2782,11 +2871,11 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
     const bool external = command_buffer != linear_cb_;
     if (!pipeline) {
         VkPipeline made = create_composite_pipeline(
-            dev, static_cast<VkPipelineLayout>(pipeline_layout_),
-            static_cast<VkRenderPass>(render_pass), static_cast<VkPipelineCache>(pipeline_cache));
+            dev, static_cast<VkPipelineLayout>(pipeline_layout_), static_cast<VkFormat>(vk_format),
+            static_cast<VkPipelineCache>(pipeline_cache));
         VkPipeline made_opaque =
             made ? create_composite_pipeline(dev, static_cast<VkPipelineLayout>(pipeline_layout_),
-                                             static_cast<VkRenderPass>(render_pass),
+                                             static_cast<VkFormat>(vk_format),
                                              static_cast<VkPipelineCache>(pipeline_cache), false)
                  : VK_NULL_HANDLE;
         if (!made_opaque) {
@@ -2899,7 +2988,6 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
     return stats;
 #else
     (void)command_buffer;
-    (void)render_pass;
     (void)vk_format;
     (void)pipeline_cache;
     (void)width;
@@ -2934,8 +3022,7 @@ lx::gfx::vulkan_compositor::begin_linear_frame(render_target& target, const blit
         return linear.get_error();
     if (auto encode = ensure_encode_pipeline(target.format()); !encode)
         return encode.get_error();
-    if (auto framebuffer = ensure_framebuffer(target); !framebuffer)
-        return framebuffer.get_error();
+    track_target(target);
     if (auto solid = ensure_solid_texture(cmds, count); !solid)
         return solid.get_error();
 
@@ -2963,7 +3050,6 @@ lx::gfx::vulkan_compositor::begin_linear_frame(render_target& target, const blit
     record_acquires(cb);
     linear_frame f{};
     f.command_buffer = cb;
-    f.render_pass = render_pass_;
     f.vk_format = static_cast<unsigned>(k_linear_format);
     f.width = target.width();
     f.height = target.height();
@@ -3008,7 +3094,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_fram
     const render_target& target = *linear_target_;
     if (!linear_pass_open_)
         begin_linear_pass(lx::color::rgb(0.f, 0.f, 0.f));
-    vkCmdEndRenderPass(cb);
+    end_composite_pass(cb);
     linear_pass_open_ = false;
 
     // The encode pass, as `composite` records it: the intermediate (left in
@@ -3045,7 +3131,7 @@ void lx::gfx::vulkan_compositor::abandon_linear_frame() {
     if (linear_cb_) {
         auto cb = static_cast<VkCommandBuffer>(linear_cb_);
         if (linear_pass_open_)
-            vkCmdEndRenderPass(cb);
+            vkCmdEndRendering(cb);
         (void)vkEndCommandBuffer(cb);
     }
 #endif
@@ -3119,20 +3205,11 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& targ
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cb, &begin);
 
-    VkImageMemoryBarrier to_src{};
-    to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    to_src.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_src.image = static_cast<VkImage>(target.vk_image());
-    to_src.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    to_src.subresourceRange.levelCount = 1;
-    to_src.subresourceRange.layerCount = 1;
-    to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
+    image_barrier(cb, static_cast<VkImage>(target.vk_image()), VK_IMAGE_LAYOUT_GENERAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                  VK_ACCESS_2_TRANSFER_READ_BIT);
 
     VkBufferImageCopy copy{};
     copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -3141,13 +3218,10 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& targ
     vkCmdCopyImageToBuffer(cb, static_cast<VkImage>(target.vk_image()),
                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging, 1, &copy);
 
-    VkImageMemoryBarrier back = to_src;
-    back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    back.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    back.dstAccessMask = 0;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                         0, 0, nullptr, 0, nullptr, 1, &back);
+    image_barrier(cb, static_cast<VkImage>(target.vk_image()),
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_NONE,
+                  VK_ACCESS_2_NONE);
 
     vkEndCommandBuffer(cb);
 
@@ -3290,20 +3364,11 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back_async(unsigned slot,
     vkBeginCommandBuffer(cb, &begin);
 
     // After the composites that wrote the target (earlier submissions on this queue).
-    VkImageMemoryBarrier to_src{};
-    to_src.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    to_src.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-    to_src.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    to_src.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_src.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    to_src.image = static_cast<VkImage>(target.vk_image());
-    to_src.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    to_src.subresourceRange.levelCount = 1;
-    to_src.subresourceRange.layerCount = 1;
-    to_src.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    to_src.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-                         VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &to_src);
+    image_barrier(cb, static_cast<VkImage>(target.vk_image()), VK_IMAGE_LAYOUT_GENERAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_COPY_BIT,
+                  VK_ACCESS_2_TRANSFER_READ_BIT);
 
     // Only the rects asked for, each at its own place in the buffer.
     constexpr unsigned k_max_regions = 32;
@@ -3338,24 +3403,38 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back_async(unsigned slot,
 
     // Back for the next composite, which must not write the image before this read is done
     // (no CPU wait orders them any more).
-    VkImageMemoryBarrier back = to_src;
+    VkImageMemoryBarrier2 back{};
+    back.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+    back.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    back.dstStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+    back.dstAccessMask =
+        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
     back.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     back.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    back.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    back.dstAccessMask = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    back.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    back.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    back.image = static_cast<VkImage>(target.vk_image());
+    back.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    back.subresourceRange.levelCount = 1;
+    back.subresourceRange.layerCount = 1;
     // And the copy's writes made visible to the host that reads the mapping.
-    VkBufferMemoryBarrier to_host{};
-    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    to_host.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    to_host.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+    VkBufferMemoryBarrier2 to_host{};
+    to_host.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2;
+    to_host.srcStageMask = VK_PIPELINE_STAGE_2_COPY_BIT;
+    to_host.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
+    to_host.dstStageMask = VK_PIPELINE_STAGE_2_HOST_BIT;
+    to_host.dstAccessMask = VK_ACCESS_2_HOST_READ_BIT;
     to_host.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_host.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     to_host.buffer = static_cast<VkBuffer>(rb.buffer);
     to_host.size = VK_WHOLE_SIZE;
-    vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                             VK_PIPELINE_STAGE_HOST_BIT,
-                         0, 0, nullptr, 1, &to_host, 1, &back);
+    VkDependencyInfo dep{};
+    dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+    dep.bufferMemoryBarrierCount = 1;
+    dep.pBufferMemoryBarriers = &to_host;
+    dep.imageMemoryBarrierCount = 1;
+    dep.pImageMemoryBarriers = &back;
+    vkCmdPipelineBarrier2(cb, &dep);
     vkEndCommandBuffer(cb);
 
     VkSubmitInfo submit{};

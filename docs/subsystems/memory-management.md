@@ -33,20 +33,59 @@ memory_budget_coordinator
   ├── render_arena  (default 8 MiB, reset each tick_render)
   ├── worker_arena  (default 4 MiB)
   ├── cold_arena    (default 512 KiB — protocol parsing, etc.)
-  └── staging       (not an arena: the compositor's shm pixel staging, reported each
-                     tick_ui against staging_budget_bytes, default 64 MiB)
+  ├── staging       (not an arena: the compositor's shm pixel staging, reported each
+  │                  tick_ui against staging_budget_bytes, default 64 MiB)
+  └── gpu           (not an arena: device-local memory in KiB, the Vulkan device's use
+                     against VK_EXT_memory_budget's budget, read by render once a second)
 ```
 
 ### Pressure levels
 
 | Level | Trigger (default) | Compositor response |
 |-------|-------------------|---------------------|
-| `normal` | Every pool < 75% | None |
+| `normal` | Every pool < 75% and no kernel pressure | None |
 | `moderate` | Fullest pool ≥ 75% | Evict 25% import cache LRU; unmap every spare staging block |
+| `moderate` | PSI `some 150000 2000000`: some task stalled on memory ≥ 150 ms of a 2 s window (7.5 %) | As above |
 | `critical` | Fullest pool ≥ 90% | Evict 50% cache, flush pending releases, evict surface pool; unmap spare staging |
+| `critical` | PSI `full 100000 2000000`: every non-idle task stalled at once ≥ 100 ms of 2 s (5 %) | As above |
 
 The fullest pool decides, not the sum of all pools: summing let a large budget dilute a
 pool that was actually full (a 64 MiB staging budget would hide a 100 % used frame arena).
+
+The coordinator keeps the pools' level and the kernel's (`on_external_pressure`) apart and
+reports the higher; the handler runs when that changes. Neither overwrites the other: the
+pools are re-evaluated every frame, which used to drop an external report a frame after it
+came.
+
+### Kernel pressure (PSI)
+
+`lx::runtime::psi_monitor` (`lx.runtime`, partition `:psi` for the logic) feeds the kernel's
+pressure stall information (Documentation/accounting/psi.rst) into the coordinator. The
+compositor starts it in `compositor::start()`, on the UI loop, where the handler runs.
+
+- **Which file.** `$MEMORY_PRESSURE_WATCH` when systemd sets it (`/dev/null`: off); else the
+  compositor's own cgroup (`/proc/self/cgroup` → `/sys/fs/cgroup/<path>/memory.pressure`);
+  else `/proc/pressure/memory`. The cgroup comes first: PSI is hierarchical, so it shows a
+  stall of any compositor thread whatever the cause (a system short of memory, a
+  `MemoryHigh=` on the service, `session.slice` or the user slice), and not other cgroups
+  stalling against their own limits, which dropping the compositor's caches cannot relieve.
+  As a user service (`deploy/systemd`) the file is the user's to write; a login shell's
+  `session-N.scope` file is root's, so a compositor started from a tty uses the system file.
+- **Triggers.** One open file per trigger (a second write to the same file is `EBUSY`); the
+  string is written with its NUL (the kernel overwrites the last byte it is given). Without
+  `CAP_SYS_RESOURCE` the kernel (6.5+) accepts only windows that are multiples of 2 s, up to
+  10 s — 1 s and 3 s are `EINVAL` — so both use 2 s. The fds wait for `EPOLLPRI`
+  (`event_source::poll_priority`): a PSI file always polls readable.
+- **Decay.** A trigger fires at most once per window and nothing reports pressure ending.
+  Each level holds until its own trigger has not fired for 10 s, then steps down only as far
+  as the file's `avg10` still supports (`full` ≥ 5 % keeps critical, `some` ≥ 7.5 % keeps
+  moderate) and checks again 10 s later. `some` triggers that go on after a `full` burst
+  hold moderate, not critical, so a later `full` burst is a change and evicts again.
+  Unreadable averages decay to normal.
+- **Without PSI** (no file, no write access, a kernel before 6.5 refusing a user's trigger,
+  `psi=0`): one `info` line at start-up, and pressure comes from the pools alone. A trigger
+  that reports faster than its window (its cgroup gone) is dropped with one `warn` rather
+  than spin the UI thread.
 
 ### Pixel staging
 
@@ -157,13 +196,56 @@ gfx::import_cache_config{
 
 When a client exceeds its quota, LRU eviction runs **within that client** before rejecting new imports.
 
-### GPU budget monitor
+### GPU budget and priority
 
-**Module:** `lx.gfx.gpu_budget` — `VK_EXT_memory_budget` scaffold
+With `VK_EXT_memory_budget` (`device_info::supports_memory_budget`), the render thread reads
+`device::memory_budget()` once a second while the Vulkan backend composites: this process's
+use of the device-local heaps and the budget the driver gives it (the heaps less what other
+processes hold). The UI tick reports the pair as `memory_pool::gpu`, so a GPU that a game
+fills raises `moderate` at 75 % and `critical` at 90 % like any full pool, with the same
+response. A per-client byte cap is not implemented.
 
-- `query()` → `gpu_memory_stats` (total / used / budget bytes)
-- `client_within_budget()` — per-client byte cap (default 256 MiB)
-- `track_client_usage()` / `untrack_client()`
+With `VK_EXT_memory_priority` (`supports_memory_priority`), the scanout targets and the
+linear intermediates are allocated at priority 1.0 and everything else at the default 0.5:
+when device-local memory is oversubscribed, the driver evicts client textures (or another
+process's memory) before the frames being shown. RADV and NVIDIA honour priorities; a
+driver that ignores them loses nothing.
+
+`VK_EXT_host_image_copy` (`supports_host_image_copy`) removes staging memory: shm uploads
+and new atlas pages are written by the host when the format allows it without costing the
+GPU's access (`host_image_copier`), and the compositor's 16 MiB staging ring is then never
+allocated (it is made on the first staged upload, not at start-up, either way).
+
+`VK_EXT_memory_budget` sees only Vulkan allocations, so the GL and CPU backends report
+nothing to `memory_pool::gpu`; what the health report shows comes from DRM fdinfo instead
+(below).
+
+### GPU memory from DRM fdinfo
+
+**Module:** `lx.drm:fdinfo` — `read_gpu_memory()`, pure `parse_fdinfo()` / `add_fdinfo_client()`
+
+A driver implementing drm-usage-stats (`Documentation/gpu/drm-usage-stats.rst`, Linux 5.19+)
+prints, in `/proc/<pid>/fdinfo/<fd>` of every open DRM file, `drm-driver`, `drm-client-id`
+and per memory region `drm-total-`, `drm-shared-`, `drm-resident-`, `drm-purgeable-`,
+`drm-active-<region>` (legacy: `drm-memory-<region>`, read as resident), in bytes, KiB or
+MiB. `drm-total-cycles-<engine>` (6.11+, xe) shares the memory prefix but is an engine
+counter, so it is skipped. That covers every backend — Vulkan, GL, and the render-node fd Mesa opens itself —
+which is why it lives in `lx.drm` (DRM uAPI read from `/proc`: no graphics API, no libdrm)
+rather than next to the Vulkan budget in `lx.gfx`.
+
+| Step | What |
+|------|------|
+| Walk | `/proc/self/fdinfo/*`; an fd that is not a DRM character device (major 226) is skipped on `fstat` alone — dmabufs, sockets and memfds never have their fdinfo read |
+| Keep | texts with `drm-driver`; up to 8 regions (more are counted as dropped) |
+| Dedupe | by `drm-client-id`: a dup'd fd is the same client. The card fd and Mesa's render node are different clients and are summed |
+| Sum | per region and figure; a figure no client prints stays absent. A second driver's regions (two GPUs) are kept apart as `<driver>:<region>` |
+
+Only for a health request (`lumen-ctl status` / `health`, `GetHealth`, the 2 s re-evaluation
+while `lumen-ctl monitor` is subscribed): never per frame. The compositor says once at start-up
+whether a driver reports (`compositor.memory`). A buffer shared between two of the
+compositor's own clients counts in both (`drm-shared-` says how much is shared). vmwgfx
+prints no usage stats (kernel 7.2: only `pos`, `flags`, `mnt_id`, `ino`), so on it the report
+has no GPU figures. No level is judged from them: the kernel states no budget.
 
 ### Compositor surface pool
 
@@ -297,7 +379,9 @@ Hot path (`tick_ui` / `tick_render`) uses arenas; cold path uses fixed pools whe
 | Concern | Module |
 |---------|--------|
 | Arenas + pressure | `lx.runtime.memory` |
-| GPU budget | `lx.gfx.gpu_budget` |
+| Kernel pressure (PSI) | `lx.runtime` (`psi_monitor`), `lx.runtime.psi` |
+| GPU budget (Vulkan) | `lx.gfx` (`device::memory_budget`) → `memory_pool::gpu` |
+| GPU memory (DRM fdinfo, every backend) | `lx.drm:fdinfo` |
 | Import cache LRU + per-client | `lx.gfx.import_cache` |
 | Surface pool | `lx.gfx.surface_pool` |
 | Buffer lifetime | `lx.compositor.buffer_lifecycle` |
@@ -333,8 +417,9 @@ lx::compositor::config cfg{
 | **M0** | Memory coordinator + overflow policies | ✅ |
 | **M1** | Per-client import limits + pressure eviction | ✅ |
 | **M2** | Buffer lifecycle tracker | ✅ API |
-| **M3** | GPU budget query (`VK_EXT_memory_budget`) | ✅ stub |
+| **M3** | GPU budget query (`VK_EXT_memory_budget`) | ✅ Vulkan backend (`memory_pool::gpu`) |
 | **M4** | Surface pool + scanout pin | ✅ stub |
+| **M5** | GPU memory per region from DRM fdinfo in the health report | ✅ |
 | **P0** | Real `wl_buffer.release` + measured RSS tests | Runtime |
 
 ---
