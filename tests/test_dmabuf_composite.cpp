@@ -55,8 +55,10 @@ void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsign
 
 struct gpu_fixture {
     lx::gfx::device device{};
-    lx::gfx::vulkan_compositor compositor{};
+    // Declared before the compositor, destroyed after it: the compositor's destructor waits
+    // for the frames it submitted, which render into the target.
     lx::gfx::render_target target{};
+    lx::gfx::vulkan_compositor compositor{};
     bool usable = false;
 };
 
@@ -673,7 +675,10 @@ LUMEN_TEST(composite_into_a_ten_bit_scanout_target) {
         std::printf("SKIP: no 10-bit render target: %s\n", wide.get_error().message);
         return;
     }
-    auto target = std::move(wide).value();
+    // In the fixture's slot (its 8-bit target never drew): destroyed after the compositor
+    // waits for the frame that renders into it.
+    gpu.target = std::move(wide).value();
+    lx::gfx::render_target& target = gpu.target;
     LUMEN_CHECK(target.format() == lx::pixel_format::xrgb2101010);
 
     constexpr unsigned texture_id = 0x4000'0030u;
