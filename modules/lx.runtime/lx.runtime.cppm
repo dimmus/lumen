@@ -1,5 +1,6 @@
 module;
 
+#include <fcntl.h>
 #include <poll.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -19,6 +20,7 @@ import std;
 
 export import :executor;
 export import :memory;
+export import :psi;
 
 export namespace lx::runtime {
 
@@ -35,6 +37,9 @@ public:
     /// A file descriptor the loop should wait on (epoll), or -1. Readiness is reported
     /// through `on_readable`, so a source never has to poll for it.
     [[nodiscard]] virtual int poll_fd() const { return -1; }
+    /// Wait for `poll_fd` to signal an exceptional condition (EPOLLPRI), not to be readable.
+    /// For files that are always readable and report events that way: PSI triggers.
+    [[nodiscard]] virtual bool poll_priority() const { return false; }
     virtual void on_readable() {}
 };
 
@@ -152,6 +157,73 @@ private:
     unsigned long long wakeups_ = 0;
     class strand ui_strand_{affinity::ui};
     lx::sync::spsc_queue<task, k_strand_queue_depth> inbound_{};
+};
+
+// ── Kernel memory pressure (UI thread) ──────────────────────────────────────
+
+/// Feeds the kernel's memory pressure (PSI) into a `memory_budget_coordinator`: a "some"
+/// trigger makes it moderate, a "full" trigger critical, and the level decays once the
+/// triggers stay quiet (`psi_pressure_state`). Runs on the loop's thread — the UI affinity,
+/// where the coordinator's handler runs. Lumen's own pool usage still counts: the
+/// coordinator keeps the higher of the two.
+class psi_monitor {
+public:
+    psi_monitor() = default;
+    ~psi_monitor();
+
+    psi_monitor(const psi_monitor&) = delete;
+    psi_monitor& operator=(const psi_monitor&) = delete;
+
+    /// Opens the pressure file, arms both triggers and adds them to `loop`. Logs the outcome
+    /// once. Fails where the kernel has no PSI or refuses the triggers (no file, no write
+    /// access, a kernel before 6.5 that takes no trigger from a user); the caller then runs
+    /// on pool usage alone.
+    [[nodiscard]] lx::result<void> start(event_loop& loop, memory_budget_coordinator& memory,
+                                         psi_config config = {});
+    void stop();
+
+    [[nodiscard]] bool active() const { return loop_ != nullptr; }
+    /// The pressure file the triggers are on, "" while not active.
+    [[nodiscard]] std::string_view path() const { return path_.data(); }
+    [[nodiscard]] memory_pressure level() const { return state_.level(); }
+
+private:
+    class trigger_source final : public event_source {
+    public:
+        bool prepare(clock_time& timeout) override;
+        bool check() override { return ready_; }
+        bool dispatch() override;
+        [[nodiscard]] int poll_fd() const override { return fd_.get(); }
+        [[nodiscard]] bool poll_priority() const override { return true; }
+        void on_readable() override { ready_ = true; }
+
+        psi_monitor* owner_ = nullptr;
+        memory_pressure level_ = memory_pressure::moderate;
+        lx::unique_fd fd_{};
+        long long last_ns_ = 0;
+        unsigned strikes_ = 0;
+        bool ready_ = false;
+    };
+    class decay_source final : public event_source {
+    public:
+        bool prepare(clock_time& timeout) override;
+        bool check() override;
+        bool dispatch() override;
+
+        psi_monitor* owner_ = nullptr;
+    };
+
+    void on_trigger(trigger_source& source);
+    void on_quiet();
+
+    event_loop* loop_ = nullptr;
+    memory_budget_coordinator* memory_ = nullptr;
+    psi_config config_{};
+    psi_pressure_state state_{};
+    trigger_source moderate_{};
+    trigger_source critical_{};
+    decay_source decay_{};
+    std::array<char, 256> path_{};
 };
 
 // ── Typed event bus (UI thread only) ────────────────────────────────────────
@@ -427,7 +499,7 @@ void lx::runtime::event_loop::add_source(event_source* source) {
     state.sources[state.source_count++] = source;
     if (const int fd = source->poll_fd(); fd >= 0 && epoll_fd_ >= 0) {
         epoll_event ev{};
-        ev.events = EPOLLIN;
+        ev.events = source->poll_priority() ? EPOLLPRI : EPOLLIN;
         ev.data.ptr = source;
         (void)::epoll_ctl(epoll_fd_, EPOLL_CTL_ADD, fd, &ev);
     }
@@ -568,3 +640,234 @@ void lx::runtime::subscription<Event>::cancel() { id_ = 0; }
 
 template<typename Event>
 bool lx::runtime::subscription<Event>::active() const { return id_ != 0; }
+
+// ── psi_monitor ─────────────────────────────────────────────────────────────
+
+namespace {
+
+constexpr lx::trace::category log_psi{"runtime.psi"};
+
+const char* pressure_name(lx::runtime::memory_pressure level) {
+    switch (level) {
+    case lx::runtime::memory_pressure::moderate: return "moderate";
+    case lx::runtime::memory_pressure::critical: return "critical";
+    default: return "normal";
+    }
+}
+
+/// Opens `path` once per trigger (a PSI file holds one trigger per open file: a second
+/// write is EBUSY) and writes the trigger. 0, or the errno of the first failure.
+int open_psi_trigger(const char* path, std::span<const char> trigger, lx::unique_fd& out) {
+    lx::unique_fd fd{::open(path, O_RDWR | O_NONBLOCK | O_CLOEXEC)};
+    if (fd.get() < 0)
+        return errno;
+    if (::write(fd.get(), trigger.data(), trigger.size()) < 0)
+        return errno;
+    out = std::move(fd);
+    return 0;
+}
+
+} // namespace
+
+lx::runtime::psi_monitor::~psi_monitor() { stop(); }
+
+lx::result<void> lx::runtime::psi_monitor::start(event_loop& loop,
+                                                 memory_budget_coordinator& memory,
+                                                 psi_config config) {
+    stop();
+    std::array<char, 48> some{};
+    std::array<char, 48> full{};
+    const std::size_t some_len =
+        format_psi_trigger(some, false, config.moderate_some_us, config.window_us);
+    const std::size_t full_len =
+        format_psi_trigger(full, true, config.critical_full_us, config.window_us);
+    if (some_len == 0 || full_len == 0)
+        return lx::invalid_argument("psi_monitor: stall longer than its window");
+
+    // Which pressure, in order:
+    //  1. $MEMORY_PRESSURE_WATCH — systemd's protocol (MemoryPressureWatch=, on by default
+    //     for units with memory accounting): the file it names, or "/dev/null" for off. It
+    //     names the unit's own memory.pressure. Its MEMORY_PRESSURE_WRITE trigger is not
+    //     used: Lumen needs two levels, so two triggers of its own.
+    //  2. The compositor's own cgroup. PSI is hierarchical: a stall of any compositor thread
+    //     shows there whatever caused it — a system short of memory, or a MemoryHigh= on
+    //     the service, session.slice or the user's slice — and stalls that freeing its
+    //     caches cannot relieve do not. /proc/pressure/memory counts every cgroup stalling
+    //     against its own limit (a build in a MemoryHigh= unit, a container): reacting to
+    //     that would drop imports and re-import them every window, for nobody's benefit.
+    //     As a user service (deploy/systemd: session.slice in the user manager's delegated
+    //     tree) the file is the user's to write.
+    //  3. /proc/pressure/memory, where the cgroup's file is not ours to write (a login
+    //     shell's session-N.scope is root's) or there is no cgroup v2: a coarser signal is
+    //     better than none.
+    std::array<std::array<char, 256>, 3> candidates{};
+    unsigned count = 0;
+    if (const char* watch = std::getenv("MEMORY_PRESSURE_WATCH")) {
+        if (watch[0] == '\0' || std::string_view{watch} == "/dev/null") {
+            log_psi.info("kernel memory pressure off (MEMORY_PRESSURE_WATCH={}): pool usage "
+                         "only", watch);
+            return lx::make_error(lx::io_err::not_found, "psi_monitor: turned off");
+        }
+        auto r = std::format_to_n(candidates[count].data(), candidates[count].size() - 1, "{}",
+                                  watch);
+        *r.out = '\0';
+        ++count;
+    }
+    {
+        std::array<char, 1024> text{};
+        lx::unique_fd fd{::open("/proc/self/cgroup", O_RDONLY | O_CLOEXEC)};
+        const long n = fd.get() >= 0 ? ::read(fd.get(), text.data(), text.size() - 1) : -1;
+        const std::string_view cgroup =
+            n > 0 ? cgroup_v2_path(std::string_view{text.data(), static_cast<std::size_t>(n)})
+                  : std::string_view{};
+        if (cgroup.size() > 1) { // "/" is the root: the same counters as /proc/pressure
+            auto r = std::format_to_n(candidates[count].data(), candidates[count].size() - 1,
+                                      "/sys/fs/cgroup{}/memory.pressure", cgroup);
+            *r.out = '\0';
+            ++count;
+        }
+    }
+    std::ranges::copy(std::string_view{"/proc/pressure/memory"}, candidates[count].data());
+    ++count;
+
+    int first_err = 0;
+    const char* first_path = "";
+    for (unsigned i = 0; i < count; ++i) {
+        const char* path = candidates[i].data();
+        int err = open_psi_trigger(path, std::span{some.data(), some_len}, moderate_.fd_);
+        if (err == 0)
+            err = open_psi_trigger(path, std::span{full.data(), full_len}, critical_.fd_);
+        if (err == 0) {
+            std::ranges::copy(candidates[i], path_.begin());
+            break;
+        }
+        moderate_.fd_.reset();
+        critical_.fd_.reset();
+        // ENOENT: no PSI (CONFIG_PSI=n) or no such cgroup file; EACCES: not ours to write;
+        // EPERM/EINVAL: a kernel that takes no trigger from a user, or not this window;
+        // EOPNOTSUPP: booted with psi=0.
+        log_psi.debug("{}: {}", path, std::strerror(err));
+        if (first_err == 0) {
+            first_err = err;
+            first_path = path;
+        }
+    }
+    if (moderate_.fd_.get() < 0) {
+        log_psi.info("kernel memory pressure unavailable ({}: {}): pool usage only", first_path,
+                     std::strerror(first_err));
+        return lx::make_error(first_err == ENOENT ? lx::io_err::not_found
+                                                  : lx::io_err::permission_denied,
+                              "psi_monitor: no pressure file takes a trigger");
+    }
+
+    loop_ = &loop;
+    memory_ = &memory;
+    config_ = config;
+    state_ = psi_pressure_state{config};
+    moderate_.owner_ = this;
+    moderate_.level_ = memory_pressure::moderate;
+    critical_.owner_ = this;
+    critical_.level_ = memory_pressure::critical;
+    decay_.owner_ = this;
+    loop.add_source(&moderate_);
+    loop.add_source(&critical_);
+    loop.add_source(&decay_);
+    log_psi.info("kernel memory pressure: {} (some {} ms → moderate, full {} ms → critical, "
+                 "per {} s)",
+                 path(), config.moderate_some_us / 1000, config.critical_full_us / 1000,
+                 config.window_us / 1'000'000);
+    return {};
+}
+
+void lx::runtime::psi_monitor::stop() {
+    if (loop_) {
+        loop_->remove_source(&decay_);
+        loop_->remove_source(&critical_);
+        loop_->remove_source(&moderate_);
+    }
+    if (memory_ && state_.level() != memory_pressure::normal)
+        memory_->on_external_pressure(memory_pressure::normal);
+    loop_ = nullptr;
+    memory_ = nullptr;
+    state_ = psi_pressure_state{config_};
+    for (trigger_source* t : {&moderate_, &critical_}) {
+        t->fd_.reset();
+        t->last_ns_ = 0;
+        t->strikes_ = 0;
+        t->ready_ = false;
+    }
+    path_[0] = '\0';
+}
+
+void lx::runtime::psi_monitor::on_trigger(trigger_source& source) {
+    const memory_pressure prev = state_.level();
+    const memory_pressure level = state_.on_trigger(source.level_, lx_runtime_phase_now());
+    if (level == prev)
+        return;
+    log_psi.info("kernel memory pressure {}", pressure_name(level));
+    memory_->on_external_pressure(level);
+}
+
+void lx::runtime::psi_monitor::on_quiet() {
+    // Either trigger's file reads the whole pressure file (from offset 0, whatever the
+    // trigger did). A failed read decays to normal: averages that cannot be read keep
+    // nothing up.
+    std::array<char, 256> text{};
+    const long n = ::pread(moderate_.fd_.get(), text.data(), text.size() - 1, 0);
+    const psi_averages avg =
+        n > 0 ? parse_psi_averages(std::string_view{text.data(), static_cast<std::size_t>(n)})
+              : psi_averages{};
+    const memory_pressure prev = state_.level();
+    const memory_pressure level = state_.on_quiet(lx_runtime_phase_now(), avg);
+    if (level == prev)
+        return;
+    log_psi.info("kernel memory pressure {} (some avg10 {}.{:02} %, full avg10 {}.{:02} %)",
+                 pressure_name(level), avg.some_avg10 / 100, avg.some_avg10 % 100,
+                 avg.full_avg10 / 100, avg.full_avg10 % 100);
+    memory_->on_external_pressure(level);
+}
+
+bool lx::runtime::psi_monitor::trigger_source::prepare(clock_time& timeout) {
+    timeout = -1; // readiness comes from the loop's epoll
+    return ready_;
+}
+
+bool lx::runtime::psi_monitor::trigger_source::dispatch() {
+    ready_ = false;
+    // The kernel reports a trigger at most once per window. One that keeps reporting much
+    // sooner is broken — a trigger whose cgroup went away polls as EPOLLERR for good — and
+    // would spin the UI thread: give PSI up rather than that.
+    const long long now = lx_runtime_phase_now();
+    const long long window_ns = static_cast<long long>(owner_->config_.window_us) * 1000;
+    strikes_ = last_ns_ != 0 && now - last_ns_ < window_ns / 2 ? strikes_ + 1 : 0;
+    last_ns_ = now;
+    if (strikes_ >= 4) {
+        log_psi.warn("{}: trigger reports faster than its window; kernel memory pressure off",
+                     owner_->path());
+        owner_->stop();
+        return true;
+    }
+    owner_->on_trigger(*this);
+    return true;
+}
+
+bool lx::runtime::psi_monitor::decay_source::prepare(clock_time& timeout) {
+    const long long deadline = owner_->state_.deadline();
+    if (deadline < 0) {
+        timeout = -1;
+        return false;
+    }
+    const long long left = deadline - lx_runtime_phase_now();
+    timeout = left > 0 ? left : 0;
+    return left <= 0;
+}
+
+bool lx::runtime::psi_monitor::decay_source::check() {
+    const long long deadline = owner_->state_.deadline();
+    return deadline >= 0 && lx_runtime_phase_now() >= deadline;
+}
+
+bool lx::runtime::psi_monitor::decay_source::dispatch() {
+    owner_->on_quiet();
+    return true;
+}

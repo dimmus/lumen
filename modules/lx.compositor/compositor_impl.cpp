@@ -1111,6 +1111,8 @@ struct compositor_impl {
     /// curtains; completions handed to UI.
     void run_capture_render();
     std::unique_ptr<runtime::event_source> logind_source{};
+    /// Kernel memory pressure (PSI) into memory_. After loop and memory_: destroyed first.
+    runtime::psi_monitor psi_{};
 
     /// The frame clocks run only while there is something to do. An output whose two
     /// consecutive ticks find nothing for it — no damage, no frame of it the render thread
@@ -9652,6 +9654,9 @@ lx::result<void> compositor::start() {
     impl_->start_threads();
 
     impl_->memory_.set_pressure_handler(&detail::compositor_impl::on_memory_pressure, impl_);
+    // UI affinity, like the handler. Without PSI (it logs why, once) pressure comes from
+    // Lumen's own pools alone.
+    (void)impl_->psi_.start(impl_->loop, impl_->memory_);
 
     // The pause/resume machine runs only where there is a display to lose. Starting while
     // the session is in the background pauses right away (input is held until the switch).

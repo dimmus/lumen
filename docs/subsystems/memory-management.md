@@ -41,12 +41,47 @@ memory_budget_coordinator
 
 | Level | Trigger (default) | Compositor response |
 |-------|-------------------|---------------------|
-| `normal` | Every pool < 75% | None |
+| `normal` | Every pool < 75% and no kernel pressure | None |
 | `moderate` | Fullest pool ≥ 75% | Evict 25% import cache LRU; unmap every spare staging block |
+| `moderate` | PSI `some 150000 2000000`: some task stalled on memory ≥ 150 ms of a 2 s window (7.5 %) | As above |
 | `critical` | Fullest pool ≥ 90% | Evict 50% cache, flush pending releases, evict surface pool; unmap spare staging |
+| `critical` | PSI `full 100000 2000000`: every non-idle task stalled at once ≥ 100 ms of 2 s (5 %) | As above |
 
 The fullest pool decides, not the sum of all pools: summing let a large budget dilute a
 pool that was actually full (a 64 MiB staging budget would hide a 100 % used frame arena).
+
+The coordinator keeps the pools' level and the kernel's (`on_external_pressure`) apart and
+reports the higher; the handler runs when that changes. Neither overwrites the other: the
+pools are re-evaluated every frame, which used to drop an external report a frame after it
+came.
+
+### Kernel pressure (PSI)
+
+`lx::runtime::psi_monitor` (`lx.runtime`, partition `:psi` for the logic) feeds the kernel's
+pressure stall information (Documentation/accounting/psi.rst) into the coordinator. The
+compositor starts it in `compositor::start()`, on the UI loop, where the handler runs.
+
+- **Which file.** `$MEMORY_PRESSURE_WATCH` when systemd sets it (`/dev/null`: off); else the
+  compositor's own cgroup (`/proc/self/cgroup` → `/sys/fs/cgroup/<path>/memory.pressure`);
+  else `/proc/pressure/memory`. The cgroup comes first: PSI is hierarchical, so it shows a
+  stall of any compositor thread whatever the cause (a system short of memory, a
+  `MemoryHigh=` on the service, `session.slice` or the user slice), and not other cgroups
+  stalling against their own limits, which dropping the compositor's caches cannot relieve.
+  As a user service (`deploy/systemd`) the file is the user's to write; a login shell's
+  `session-N.scope` file is root's, so a compositor started from a tty uses the system file.
+- **Triggers.** One open file per trigger (a second write to the same file is `EBUSY`); the
+  string is written with its NUL (the kernel overwrites the last byte it is given). Without
+  `CAP_SYS_RESOURCE` the kernel (6.5+) accepts only windows that are multiples of 2 s, up to
+  10 s — 1 s and 3 s are `EINVAL` — so both use 2 s. The fds wait for `EPOLLPRI`
+  (`event_source::poll_priority`): a PSI file always polls readable.
+- **Decay.** A trigger fires at most once per window and nothing reports pressure ending.
+  The level holds until neither trigger has fired for 10 s, then steps down only as far as
+  the file's `avg10` still supports (`full` ≥ 5 % keeps critical, `some` ≥ 7.5 % keeps
+  moderate) and checks again 10 s later. Unreadable averages decay to normal.
+- **Without PSI** (no file, no write access, a kernel before 6.5 refusing a user's trigger,
+  `psi=0`): one `info` line at start-up, and pressure comes from the pools alone. A trigger
+  that reports faster than its window (its cgroup gone) is dropped with one `warn` rather
+  than spin the UI thread.
 
 ### Pixel staging
 
@@ -288,6 +323,7 @@ Hot path (`tick_ui` / `tick_render`) uses arenas; cold path uses fixed pools whe
 | Concern | Module |
 |---------|--------|
 | Arenas + pressure | `lx.runtime.memory` |
+| Kernel pressure (PSI) | `lx.runtime` (`psi_monitor`), `lx.runtime.psi` |
 | GPU budget | `lx.gfx.gpu_budget` |
 | Import cache LRU + per-client | `lx.gfx.import_cache` |
 | Surface pool | `lx.gfx.surface_pool` |
