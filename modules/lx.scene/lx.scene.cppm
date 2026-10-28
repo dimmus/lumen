@@ -69,11 +69,17 @@ struct output_projection {
 /// The visibility pass, run once per published frame on draws in paint order (bottom
 /// first), before they are batched: walks them top-down keeping up to eight opaque rects
 /// (the largest, when more are found) seeded from opaque draws — `blend_mode::opaque`,
-/// opacity and tint alpha 1, no linear transform — and marks a draw `occluded` when it lies
-/// fully inside one of them, or entirely outside `output` (when that is not empty). Every
-/// backend skips occluded draws; the pixels are identical, so damage and buffer age are
-/// untouched. `shown[i]`, when given, receives whether draw `i` reaches the screen (not
-/// occluded). Returns the number of draws marked. O(draws × 8), no allocation.
+/// opacity and tint alpha 1, no linear transform — and from the `opaque_rects` of a blended
+/// draw at full alpha (a partial opaque region). A draw they cover in part gets its
+/// visible part — its clipped rect minus each of them, largest first, as long as that stays
+/// within `gfx::k_max_visible_rects` disjoint rects (`draw_command::visible`; an occluder
+/// that would split it further, or narrow a part while hiding under a quarter of its width,
+/// is skipped, so the part kept only ever over-covers); a draw
+/// they cover wholly, or that lies entirely outside `output` (when that is not empty), is
+/// marked `occluded`. Every backend skips occluded draws and confines the others to their
+/// visible rects; the pixels are identical, so damage and buffer age are untouched.
+/// `shown[i]`, when given, receives whether draw `i` reaches the screen (not occluded).
+/// Returns the number of draws marked. O(draws × 8 × 4), no allocation.
 unsigned mark_occlusion(std::span<draw_command> draws, lx::rect2i output, bool* shown);
 /// The same pass over a draw list that carries UI primitives (ADR-010 §4.11; the first
 /// `k_max_draw_commands` draws). A quad that is a solid rectangle on whole pixels
@@ -210,6 +216,11 @@ public:
     /// must blend, never be drawn as black.
     void set_opaque(bool opaque);
     [[nodiscard]] bool opaque() const;
+    /// Rects (in the bounds' space) the content is opaque in although it is not opaque as a
+    /// whole — the part of the opaque region inside the surface. The draw still blends; what
+    /// lies wholly under one of them is occluded (`draw_command::opaque_rects`). The first
+    /// `k_max_opaque_rects` are kept. No damage: no pixel changes.
+    void set_opaque_rects(std::span<const lx::rect2i> rects);
     /// The content is one premultiplied, encoded colour (`wp_single_pixel_buffer_v1`)
     /// rather than a texture: the node emits a solid draw of its bounds (no sampling, no
     /// upload). `solid` false returns to the attached image.
@@ -246,6 +257,8 @@ private:
     bool opaque_ = false;
     bool solid_ = false;
     lx::color solid_color_ = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+    lx::rect2i opaque_rects_[k_max_opaque_rects]{};
+    unsigned opaque_rect_count_ = 0;
 };
 
 class scene_graph {
@@ -548,6 +561,14 @@ void lx::scene::surface_node::set_opaque(bool opaque) {
     }
 }
 bool lx::scene::surface_node::opaque() const { return opaque_; }
+void lx::scene::surface_node::set_opaque_rects(std::span<const lx::rect2i> rects) {
+    opaque_rect_count_ = 0;
+    for (const lx::rect2i& r : rects) {
+        if (opaque_rect_count_ == k_max_opaque_rects)
+            break;
+        opaque_rects_[opaque_rect_count_++] = r;
+    }
+}
 void lx::scene::surface_node::set_solid(bool solid, lx::color color) {
     solid_ = solid;
     solid_color_ = color;
@@ -611,6 +632,37 @@ void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx
     // Blend from content, not from opacity: an ARGB buffer at opacity 1 still has to blend.
     cmd.blend = opaque_ && opacity() >= 1.f && tint_.a >= 1.f ? lx::blend_mode::opaque
                                             : lx::blend_mode::premultiplied;
+    // A partial opaque region, for the visibility pass: on a 1:1 draw at full alpha each
+    // rect becomes the output pixels whose texels lie wholly inside it — edges at the
+    // surface-to-dst ratio, start ceiled and end floored, so a fractional scale rounds
+    // inwards. A resampled draw's filter reaches past a rect's edge: it seeds nothing.
+    if (opaque_rect_count_ > 0 && !solid_ && !cmd.scaled && opacity() >= 1.f &&
+        tint_.a >= 1.f && bounds().width > 0 && bounds().height > 0) {
+        const long long bw = b.width;
+        const long long bh = b.height;
+        // dst the size of the bounds (scale 1, the common case): no division.
+        const bool same = cmd.dst.width == b.width && cmd.dst.height == b.height;
+        for (unsigned k = 0; k < opaque_rect_count_; ++k) {
+            const lx::rect2i& r = opaque_rects_[k];
+            const long long u0 = std::max<long long>(r.x - b.x, 0);
+            const long long v0 = std::max<long long>(r.y - b.y, 0);
+            const long long u1 =
+                std::min<long long>(static_cast<long long>(r.x) - b.x + r.width, bw);
+            const long long v1 =
+                std::min<long long>(static_cast<long long>(r.y) - b.y + r.height, bh);
+            if (u1 <= u0 || v1 <= v0)
+                continue;
+            const long long x0 = same ? u0 : (u0 * cmd.dst.width + bw - 1) / bw;
+            const long long y0 = same ? v0 : (v0 * cmd.dst.height + bh - 1) / bh;
+            const long long x1 = same ? u1 : u1 * cmd.dst.width / bw;
+            const long long y1 = same ? v1 : v1 * cmd.dst.height / bh;
+            if (x1 <= x0 || y1 <= y0)
+                continue;
+            cmd.opaque_rects[cmd.opaque_rect_count++] = {
+                cmd.dst.x + static_cast<int>(x0), cmd.dst.y + static_cast<int>(y0),
+                static_cast<int>(x1 - x0), static_cast<int>(y1 - y0)};
+        }
+    }
     cmd.sort_key = lx::draw_sort_key::make(0, out.size());
     out.push(cmd);
 }
@@ -845,12 +897,37 @@ namespace {
            inner.y + inner.height <= outer.y + outer.height;
 }
 
+/// `v` minus `o` as up to four disjoint rects (the bands above and below `o`, then the
+/// parts left and right of it), written to `out`. Returns their count; `v` itself (1) when
+/// the two do not meet.
+[[nodiscard]] unsigned subtract(lx::rect2i v, lx::rect2i o, lx::rect2i out[4]) {
+    const lx::rect2i i = intersect(v, o);
+    if (i.width <= 0 || i.height <= 0) {
+        out[0] = v;
+        return 1;
+    }
+    unsigned n = 0;
+    if (i.y > v.y)
+        out[n++] = {v.x, v.y, v.width, i.y - v.y};
+    if (i.y + i.height < v.y + v.height)
+        out[n++] = {v.x, i.y + i.height, v.width, v.y + v.height - i.y - i.height};
+    if (i.x > v.x)
+        out[n++] = {v.x, i.y, i.x - v.x, i.height};
+    if (i.x + i.width < v.x + v.width)
+        out[n++] = {i.x + i.width, i.y, v.x + v.width - i.x - i.width, i.height};
+    return n;
+}
+
+/// At full opacity and tint, placed by translation only: content of full alpha stays so.
+[[nodiscard]] bool full_alpha_translation(const lx::scene::draw_command& d) {
+    return d.opacity >= 1.f && d.tint.a >= 1.f && d.transform.m0 == 1.f &&
+           d.transform.m1 == 0.f && d.transform.m2 == 0.f && d.transform.m3 == 1.f;
+}
+
 /// Covers every pixel of its (clipped) dst with full alpha: opaque blending of a buffer
 /// whose content is opaque, at full opacity and tint, placed by translation only.
 [[nodiscard]] bool covers_opaquely(const lx::scene::draw_command& d) {
-    return d.blend == lx::blend_mode::opaque && d.opacity >= 1.f && d.tint.a >= 1.f &&
-           d.transform.m0 == 1.f && d.transform.m1 == 0.f && d.transform.m2 == 0.f &&
-           d.transform.m3 == 1.f;
+    return d.blend == lx::blend_mode::opaque && full_alpha_translation(d);
 }
 
 /// The pixels a quad covers at full coverage, if it may occlude (see `mark_occlusion`).
@@ -873,6 +950,8 @@ unsigned lx_scene_mark_occlusion(std::span<lx::scene::draw_command> draws,
                                  bool* shown) {
     using lx::scene::draw_command;
     constexpr unsigned k_max_occluders = 8;
+    constexpr unsigned k_max_visible = lx::gfx::k_max_visible_rects;
+    // Largest first: they hide the most, so they are tried first.
     lx::rect2i occluders[k_max_occluders]{};
     long long areas[k_max_occluders]{};
     unsigned n = 0;
@@ -880,21 +959,16 @@ unsigned lx_scene_mark_occlusion(std::span<lx::scene::draw_command> draws,
     const bool bounded = output.width > 0 && output.height > 0;
     const auto add_occluder = [&](lx::rect2i r) {
         const long long area = static_cast<long long>(r.width) * r.height;
-        if (n < k_max_occluders) {
-            occluders[n] = r;
-            areas[n] = area;
-            ++n;
+        // Full: the eight largest are kept — the smallest (last) gives way to a larger one.
+        if (n == k_max_occluders && area <= areas[n - 1])
             return;
+        unsigned k = n < k_max_occluders ? n++ : n - 1;
+        for (; k > 0 && areas[k - 1] < area; --k) {
+            occluders[k] = occluders[k - 1];
+            areas[k] = areas[k - 1];
         }
-        // Full: the eight largest are kept — they hide the most.
-        unsigned smallest = 0;
-        for (unsigned k = 1; k < n; ++k)
-            if (areas[k] < areas[smallest])
-                smallest = k;
-        if (area > areas[smallest]) {
-            occluders[smallest] = r;
-            areas[smallest] = area;
-        }
+        occluders[k] = r;
+        areas[k] = area;
     };
     // Primitives above draw `i` are those pushed after it: walked top-down beside the draws.
     std::size_t prim = prims.size() < prim_pos.size() ? prims.size() : prim_pos.size();
@@ -916,20 +990,74 @@ unsigned lx_scene_mark_occlusion(std::span<lx::scene::draw_command> draws,
             r = intersect(r, d.clip);
         if (bounded)
             r = intersect(r, output);
+        // The visible part: `r` minus each occluder that meets it, as long as what is left
+        // stays within `k_max_visible` disjoint rects (an occluder that would split it
+        // further is not subtracted — the part kept is never smaller than what shows).
+        // A part is cut short of its full width only when the occluder hides at least a
+        // quarter of it: a narrower cut costs the CPU backend more in split rows than it
+        // saves (a 300 px menu over a 1920 px window: +4-6 %; break-even near 1/4).
+        // Nothing left: occluded.
+        lx::rect2i vis[k_max_visible]{r};
+        unsigned vis_n = 1;
+        bool cut = false;
         bool on_screen = r.width > 0 && r.height > 0;
-        for (unsigned k = 0; on_screen && k < n; ++k)
-            if (inside(r, occluders[k]))
+        for (unsigned k = 0; on_screen && k < n; ++k) {
+            if (inside(r, occluders[k])) {
                 on_screen = false;
+                break;
+            }
+            const lx::rect2i hit = intersect(r, occluders[k]);
+            if (hit.width <= 0 || hit.height <= 0)
+                continue;
+            lx::rect2i next[k_max_visible]{};
+            unsigned next_n = 0;
+            bool fits = true;
+            bool changed = false;
+            for (unsigned v = 0; v < vis_n && fits; ++v) {
+                lx::rect2i parts[4]{vis[v]};
+                unsigned m = 1;
+                const lx::rect2i part_hit = intersect(vis[v], occluders[k]);
+                if (part_hit.width > 0 && part_hit.height > 0 &&
+                    (part_hit.width == vis[v].width ||
+                     static_cast<long long>(part_hit.width) * 4 >= vis[v].width)) {
+                    m = subtract(vis[v], occluders[k], parts);
+                    changed = true;
+                }
+                if (next_n + m > k_max_visible)
+                    fits = false;
+                for (unsigned p = 0; p < m && fits; ++p)
+                    next[next_n++] = parts[p];
+            }
+            if (!fits || !changed)
+                continue;
+            for (unsigned v = 0; v < next_n; ++v)
+                vis[v] = next[v];
+            vis_n = next_n;
+            cut = true;
+            on_screen = vis_n > 0;
+        }
         d.occluded = !on_screen;
+        d.visible_count = on_screen && cut ? vis_n : 0;
+        for (unsigned v = 0; v < d.visible_count; ++v)
+            d.visible[v] = vis[v];
         if (shown)
             shown[i] = on_screen;
         if (!on_screen) {
             ++marked;
             continue;
         }
-        if (!covers_opaquely(d))
+        if (covers_opaquely(d)) {
+            add_occluder(r);
             continue;
-        add_occluder(r);
+        }
+        // A blended draw with a partial opaque region: its opaque rects, clipped as `r` is.
+        if (d.opaque_rect_count == 0 || !full_alpha_translation(d))
+            continue;
+        for (unsigned k = 0; k < d.opaque_rect_count && k < lx::scene::k_max_opaque_rects; ++k) {
+            const lx::rect2i o = intersect(d.opaque_rects[k], r);
+            if (o.width > 0 && o.height > 0)
+                add_occluder(o);
+        }
     }
     return marked;
 }
@@ -990,6 +1118,9 @@ void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot)
         d[i].dst = lx::gfx::transform_rect(d[i].dst, t, c.width, c.height);
         if (d[i].clip.width > 0 && d[i].clip.height > 0)
             d[i].clip = lx::gfx::transform_rect(d[i].clip, t, c.width, c.height);
+        for (unsigned k = 0; k < d[i].opaque_rect_count; ++k)
+            d[i].opaque_rects[k] =
+                lx::gfx::transform_rect(d[i].opaque_rects[k], t, c.width, c.height);
         d[i].buffer_xform = lx::gfx::compose_output_transform(d[i].buffer_xform, t);
     }
     out.transform_primitives(t, c);

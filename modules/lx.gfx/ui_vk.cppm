@@ -185,6 +185,12 @@ struct ui_vk_composite_options {
     /// after the ring-slot and composite-slot fence waits, never across them — so a writer
     /// on another thread never waits for the GPU.
     std::mutex* atlas_mutex = nullptr;
+    /// As `vulkan_compositor::composite_region`: the target pixels the frame writes, what
+    /// changed since the frame encoded into `previous`, and that target. Null `region`: the
+    /// whole target, no chain (as `vulkan_compositor::composite`).
+    const damage_region* region = nullptr;
+    const damage_region* changed = nullptr;
+    const render_target* previous = nullptr;
 };
 
 /// One compositor frame drawn by `ui_vk_renderer::composite`: the UI renderer's side (instances,
@@ -325,8 +331,10 @@ public:
     /// decodes them), primitive batches through this renderer's pipelines made for that pass,
     /// with instance colours converted to premultiplied linear light and `mono_sprite`
     /// coverage raised to `options.text_contrast` (the push constant's linear flag; shaders/ui
-    /// `lx_instance_color`, `lx_text_coverage`). The whole target is drawn (Vulkan repaints
-    /// every frame) and cleared to `clear` first. The ring slot is fenced by an empty submit
+    /// `lx_instance_color`, `lx_text_coverage`). The pass covers the whole target, cleared to
+    /// `clear` first, or — continuing a chain (`options.region`) — each changed rect in turn,
+    /// cleared and then drawn through (batches meeting it), as `draw` does per damage rect;
+    /// the encode pass writes `options.region`. The ring slot is fenced by an empty submit
     /// after the compositor's. The atlas's dirty lists are cleared as their rects are copied
     /// into staging (under `options.atlas_mutex` when given, which is held for nothing else);
     /// on an error nothing is submitted, the compositor's acquires are un-marked and the pages
@@ -2168,7 +2176,8 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
     free_transient(slot);
     // The compositor's frame (it waits for its own slot's fence) before the atlas is locked.
     auto frame = compositor.begin_linear_frame(target, stream.surfaces.data(),
-                                               static_cast<unsigned>(stream.surfaces.size()));
+                                               static_cast<unsigned>(stream.surfaces.size()),
+                                               options.region, options.changed, options.previous);
     if (!frame)
         return frame.get_error();
     auto cb = static_cast<VkCommandBuffer>(frame->command_buffer);
@@ -2228,77 +2237,89 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
     viewport.width = static_cast<float>(frame->width);
     viewport.height = static_cast<float>(frame->height);
     viewport.maxDepth = 1.f;
-    VkRect2D scissor{};
-    scissor.extent = {frame->width, frame->height};
     auto layout = static_cast<VkPipelineLayout>(pipeline_layout_);
     auto descriptor_set = static_cast<VkDescriptorSet>(sets_[slot]);
     int bound_pipeline = -1;
     bool set_bound = false;
-    stats.rects = 1;
     const std::size_t batch_total =
         stream.batches.size() < k_max_batches ? stream.batches.size() : k_max_batches;
-    for (std::size_t b = 0; b < batch_total; ++b) {
-        const batch& bt = stream.batches[b];
-        if (!ui_encode::meets(bt.bounds, full)) {
-            ++stats.batches_skipped;
-            continue;
-        }
-        ++stats.batches_drawn;
-        if (bt.kind == primitive_kind::surface) {
-            const std::size_t end = static_cast<std::size_t>(bt.first) + bt.count;
-            for (std::size_t i = bt.first; i < end && i < stream.refs.size(); ++i) {
-                const std::uint32_t index = stream.refs[i].index;
-                if (index >= stream.surfaces.size()) {
-                    ++stats.primitives_skipped;
-                    continue;
-                }
-                // Decoded into linear light (`encoded` false), as `composite` draws them.
-                auto drawn = compositor.record_blits(cb, frame->render_pass, frame->vk_format,
-                                                     pipeline_cache_, frame->width, frame->height,
-                                                     &stream.surfaces[index], 1, full, false);
-                bound_pipeline = -1;
-                set_bound = false;
-                vkCmdSetViewport(cb, 0, 1, &viewport);
-                vkCmdSetScissor(cb, 0, 1, &scissor);
-                if (!drawn) {
-                    abandon();
-                    return drawn.get_error();
-                }
-                stats.draw_calls += drawn->draws_submitted;
-                out.composite.draws_submitted += drawn->draws_submitted;
-                out.composite.draws_skipped += drawn->draws_skipped;
-                out.composite.draws_culled += drawn->draws_culled;
+    // The whole target once, or each changed rect: cleared (`begin_linear_rect`), then every
+    // batch meeting it, scissored to it.
+    const unsigned passes = frame->full ? 1u : frame->rect_count;
+    stats.rects = passes;
+    for (unsigned n = 0; n < passes; ++n) {
+        const lx::rect2i rect = frame->full ? full : frame->rects[n];
+        compositor.begin_linear_rect(rect);
+        VkRect2D scissor{};
+        scissor.offset = {rect.x, rect.y};
+        scissor.extent = {static_cast<std::uint32_t>(rect.width),
+                          static_cast<std::uint32_t>(rect.height)};
+        vkCmdSetScissor(cb, 0, 1, &scissor);
+        for (std::size_t b = 0; b < batch_total; ++b) {
+            const batch& bt = stream.batches[b];
+            if (!ui_encode::meets(bt.bounds, rect)) {
+                ++stats.batches_skipped;
+                continue;
             }
-            continue;
+            ++stats.batches_drawn;
+            if (bt.kind == primitive_kind::surface) {
+                const std::size_t end = static_cast<std::size_t>(bt.first) + bt.count;
+                for (std::size_t i = bt.first; i < end && i < stream.refs.size(); ++i) {
+                    const std::uint32_t index = stream.refs[i].index;
+                    if (index >= stream.surfaces.size()) {
+                        ++stats.primitives_skipped;
+                        continue;
+                    }
+                    // Decoded into linear light (`encoded` false), as `composite` draws them.
+                    auto drawn = compositor.record_blits(cb, frame->render_pass, frame->vk_format,
+                                                         pipeline_cache_, frame->width,
+                                                         frame->height, &stream.surfaces[index], 1,
+                                                         rect, false);
+                    bound_pipeline = -1;
+                    set_bound = false;
+                    vkCmdSetViewport(cb, 0, 1, &viewport);
+                    vkCmdSetScissor(cb, 0, 1, &scissor);
+                    if (!drawn) {
+                        abandon();
+                        return drawn.get_error();
+                    }
+                    stats.draw_calls += drawn->draws_submitted;
+                    out.composite.draws_submitted += drawn->draws_submitted;
+                    out.composite.draws_skipped += drawn->draws_skipped;
+                    out.composite.draws_culled += drawn->draws_culled;
+                }
+                continue;
+            }
+            const std::uint32_t count = batch_count_[b];
+            if (count == 0)
+                continue;
+            unsigned index = p_quad;
+            switch (bt.kind) {
+            case primitive_kind::shadow: index = p_shadow; break;
+            case primitive_kind::quad: index = p_quad; break;
+            case primitive_kind::mono_sprite:
+            case primitive_kind::path: index = p_mono; break;
+            case primitive_kind::poly_sprite: index = p_poly; break;
+            case primitive_kind::underline: index = p_underline; break;
+            case primitive_kind::surface: break;
+            }
+            if (bound_pipeline != static_cast<int>(index)) {
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  static_cast<VkPipeline>(set.pipelines[index]));
+                bound_pipeline = static_cast<int>(index);
+            }
+            if (!set_bound) {
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
+                                        &descriptor_set, 0, nullptr);
+                set_bound = true;
+            }
+            const push_block push{batch_word_[b], bt.page, 1u, options.text_contrast};
+            vkCmdPushConstants(cb, layout,
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof push, &push);
+            vkCmdDraw(cb, 6, count, 0, 0);
+            ++stats.draw_calls;
         }
-        const std::uint32_t count = batch_count_[b];
-        if (count == 0)
-            continue;
-        unsigned index = p_quad;
-        switch (bt.kind) {
-        case primitive_kind::shadow: index = p_shadow; break;
-        case primitive_kind::quad: index = p_quad; break;
-        case primitive_kind::mono_sprite:
-        case primitive_kind::path: index = p_mono; break;
-        case primitive_kind::poly_sprite: index = p_poly; break;
-        case primitive_kind::underline: index = p_underline; break;
-        case primitive_kind::surface: break;
-        }
-        if (bound_pipeline != static_cast<int>(index)) {
-            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                              static_cast<VkPipeline>(set.pipelines[index]));
-            bound_pipeline = static_cast<int>(index);
-        }
-        if (!set_bound) {
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1,
-                                    &descriptor_set, 0, nullptr);
-            set_bound = true;
-        }
-        const push_block push{batch_word_[b], bt.page, 1u, options.text_contrast};
-        vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof push, &push);
-        vkCmdDraw(cb, 6, count, 0, 0);
-        ++stats.draw_calls;
     }
 
     auto ended = compositor.end_linear_frame();

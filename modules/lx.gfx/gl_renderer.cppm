@@ -1514,23 +1514,46 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 if (cmd.dst.y + cmd.dst.height < sy1) sy1 = cmd.dst.y + cmd.dst.height;
                 scissored = true;
             }
-            if (scissored) {
-                if (sx0 < 0) sx0 = 0;
-                if (sy0 < 0) sy0 = 0;
-                if (sx1 > static_cast<int>(width)) sx1 = static_cast<int>(width);
-                if (sy1 > static_cast<int>(height)) sy1 = static_cast<int>(height);
-                if (sx1 <= sx0 || sy1 <= sy0) {
+            if (sx0 < 0) sx0 = 0;
+            if (sy0 < 0) sy0 = 0;
+            if (sx1 > static_cast<int>(width)) sx1 = static_cast<int>(width);
+            if (sy1 > static_cast<int>(height)) sy1 = static_cast<int>(height);
+            if (sx1 <= sx0 || sy1 <= sy0) {
+                ++stats.draws_culled;
+                continue;
+            }
+            // A draw the visibility pass found partly covered is drawn once per visible rect,
+            // each scissored to it ∩ the scissor above. The rects are disjoint, so no pixel
+            // blends twice; the fragments drawn are the same, only fewer.
+            lx::rect2i parts[k_max_visible_rects];
+            unsigned part_count = 1;
+            parts[0] = {sx0, sy0, sx1 - sx0, sy1 - sy0};
+            if (cmd.visible_count > 0) {
+                part_count = 0;
+                for (unsigned k = 0; k < cmd.visible_count && k < k_max_visible_rects; ++k) {
+                    const lx::rect2i& v = cmd.visible[k];
+                    const int x0 = std::max(sx0, v.x);
+                    const int y0 = std::max(sy0, v.y);
+                    const int x1 = std::min(sx1, v.x + v.width);
+                    const int y1 = std::min(sy1, v.y + v.height);
+                    if (x1 > x0 && y1 > y0)
+                        parts[part_count++] = {x0, y0, x1 - x0, y1 - y0};
+                }
+                if (part_count == 0) {
                     ++stats.draws_culled;
                     continue;
                 }
-                set_scissor(true, {sx0, sy0, sx1 - sx0, sy1 - sy0});
-            } else {
-                set_scissor(false, {});
+                scissored = true;
             }
+            if (!scissored)
+                set_scissor(false, {});
 
             if (solid_clear) {
                 glClearColor(cmd.solid_color.r, cmd.solid_color.g, cmd.solid_color.b, 1.f);
-                glClear(GL_COLOR_BUFFER_BIT);
+                for (unsigned p = 0; p < part_count; ++p) {
+                    set_scissor(true, parts[p]);
+                    glClear(GL_COLOR_BUFFER_BIT);
+                }
                 ++stats.draws_submitted;
                 continue;
             }
@@ -1610,7 +1633,11 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 glUniform1f(prog.alpha_one,
                             slot_ptr && slot_ptr->name_opaque[slot_ptr->current] ? 1.f : 0.f);
 
-            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            for (unsigned p = 0; p < part_count; ++p) {
+                if (scissored)
+                    set_scissor(true, parts[p]);
+                glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+            }
             ++stats.draws_submitted;
         }
     }

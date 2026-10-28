@@ -621,6 +621,97 @@ LUMEN_TEST(cpu_composite_skips_draws_of_zero_alpha) {
     LUMEN_CHECK((dst.at(0, 0) & 0x00FFFFFFu) == 0u);
 }
 
+// ── Visible rects (`blit_command::visible`): fewer pixels written, the same values ──
+
+namespace {
+
+/// Premultiplied gradient words, translucent ones with alpha rising left to right.
+image gradient(unsigned w, unsigned h, lx::fourcc f, unsigned seed, bool translucent) {
+    image img{w, h, f};
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < w; ++x) {
+            const unsigned a = translucent ? 64u + (x * 191u) / (w - 1u) : 255u;
+            const unsigned r = ((x * 37u + seed * 11u) % 256u) * a / 255u;
+            const unsigned g = ((y * 53u + seed * 29u) % 256u) * a / 255u;
+            const unsigned bl = (((x ^ y) * 23u + seed) % 256u) * a / 255u;
+            img.at(x, y) = (a << 24) | (r << 16) | (g << 8) | bl;
+        }
+    return img;
+}
+
+/// A scaled wallpaper; a translucent scaled window and a translucent solid, both partly
+/// under an opaque window; a turned translucent draw beside it; a cursor on top. With
+/// `cut`, each draw the opaque window covers in part carries its visible rects — the
+/// wallpaper exactly what shows, the solid an over-cover (it may draw more, never less).
+void visible_scene(lx::gfx::blit_command out[6], bool cut) {
+    out[0] = quad(1, {0, 0, 64, 48});
+    out[0].scaled = true;
+    out[1] = quad(2, {8, 6, 40, 30}, lx::blend_mode::premultiplied, 0.75f);
+    out[1].scaled = true;
+    out[2] = {};
+    out[2].solid = true;
+    out[2].solid_color = lx::color::rgb(0.2f, 0.f, 0.3f, 0.5f);
+    out[2].dst = {30, 30, 30, 12};
+    out[3] = quad(4, {2, 30, 12, 16}, lx::blend_mode::premultiplied);
+    out[3].buffer_xform = lx::buffer_transform::rotate_90;
+    out[3].scaled = true;
+    out[4] = quad(3, {20, 14, 24, 20});
+    out[5] = quad(5, {40, 30, 8, 8}, lx::blend_mode::premultiplied);
+    if (!cut)
+        return;
+    const lx::rect2i wall[4] = {{0, 0, 64, 14}, {0, 34, 64, 14}, {0, 14, 20, 20}, {44, 14, 20, 20}};
+    const lx::rect2i win[4] = {{8, 6, 40, 8}, {8, 34, 40, 2}, {8, 14, 12, 20}, {44, 14, 4, 20}};
+    const lx::rect2i solid[2] = {{30, 32, 30, 10}, {44, 30, 16, 2}};
+    for (unsigned k = 0; k < 4; ++k) {
+        out[0].visible[k] = wall[k];
+        out[1].visible[k] = win[k];
+    }
+    out[0].visible_count = 4;
+    out[1].visible_count = 4;
+    out[2].visible[0] = solid[0];
+    out[2].visible[1] = solid[1];
+    out[2].visible_count = 2;
+}
+
+} // namespace
+
+LUMEN_TEST(cpu_composite_visible_rects_match_whole_draws) {
+    image wall = gradient(16, 16, k_xrgb, 1, false);
+    image win = gradient(20, 16, k_argb, 3, true);
+    image opaque = gradient(24, 20, k_xrgb, 2, false);
+    image turned = gradient(16, 12, k_argb, 5, true);
+    image cursor = gradient(8, 8, k_argb, 4, true);
+    for (const unsigned workers : {0u, 2u}) {
+        lx::gfx::cpu_compositor comp;
+        comp.set_worker_threads(workers);
+        LUMEN_CHECK(comp.register_texture(1, wall.surface()) && comp.register_texture(2, win.surface()) &&
+                    comp.register_texture(3, opaque.surface()) &&
+                    comp.register_texture(4, turned.surface()) &&
+                    comp.register_texture(5, cursor.surface()));
+        lx::gfx::blit_command whole[6]{};
+        lx::gfx::blit_command cut[6]{};
+        visible_scene(whole, false);
+        visible_scene(cut, true);
+        const lx::color clear = lx::color::rgb(0.05f, 0.1f, 0.15f);
+        image want{64, 48, k_xrgb};
+        image got{64, 48, k_xrgb};
+        auto a = comp.composite(want.surface(), clear, whole, 6, {});
+        auto b = comp.composite(got.surface(), clear, cut, 6, {});
+        LUMEN_CHECK(a && b && got.pixels == want.pixels);
+        // Fewer bytes: the wallpaper and the window skip what the opaque window covers.
+        LUMEN_CHECK(a && b && b.value().bytes_written < a.value().bytes_written);
+        // Damage rects cut across the visible rects: still the same pixels.
+        lx::gfx::damage_region damage{};
+        damage.add({5, 5, 30, 20});
+        damage.add({38, 26, 20, 18});
+        image want_d = want;
+        image got_d = want;
+        auto c = comp.composite_region(want_d.surface(), clear, whole, 6, damage);
+        auto d = comp.composite_region(got_d.surface(), clear, cut, 6, damage);
+        LUMEN_CHECK(c && d && got_d.pixels == want_d.pixels);
+    }
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

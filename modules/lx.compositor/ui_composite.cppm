@@ -157,15 +157,19 @@ public:
                                                        const scene::immutable_frame_snapshot& snap,
                                                        const gfx::damage_region& region,
                                                        chrome_atlas* atlas = nullptr);
-    /// The Vulkan compositor's frame into `target` (the whole of it: Vulkan repaints every
-    /// frame). A snapshot with primitives and a ready `ui` goes through
-    /// `ui_vk_renderer::composite` — the stream inside the compositor's linear pass, glyph
-    /// coverage through `text_contrast`; otherwise `composite` of the draws as blits, exactly
-    /// as before (a frame with primitives and no `ui`: lowered).
+    /// The Vulkan compositor's frame into `target`: the whole of it, or — given `region` —
+    /// `vulkan_compositor::composite_region`'s (`region` the target pixels to write,
+    /// `changed` what changed since the frame in `previous`). A snapshot with primitives and
+    /// a ready `ui` goes through `ui_vk_renderer::composite` — the stream inside the
+    /// compositor's linear pass, glyph coverage through `text_contrast`; otherwise the draws
+    /// as blits (a frame with primitives and no `ui`: lowered).
     [[nodiscard]] lx::result<vk_paint_result>
     paint_vk(gfx::vulkan_compositor& compositor, gfx::ui_vk_renderer* ui,
              gfx::render_target& target, const scene::immutable_frame_snapshot& snap,
-             chrome_atlas* atlas = nullptr, float text_contrast = gfx::k_text_contrast_dark);
+             chrome_atlas* atlas = nullptr, float text_contrast = gfx::k_text_contrast_dark,
+             const gfx::damage_region* region = nullptr,
+             const gfx::damage_region* changed = nullptr,
+             const gfx::render_target* previous = nullptr);
     /// The headless dump (`headless_backend`, RGB, no primitive renderer): the stream walked
     /// in order — surfaces and solid square quads as `frame_renderer` draws blits, mono
     /// sprites blended from the atlas (nearest), anything else dropped and counted. A snapshot
@@ -294,6 +298,9 @@ lx::compositor::frame_painter::surfaces(const scene::immutable_frame_snapshot& s
         b.src_space = cmd.src_space;
         b.scaled = cmd.scaled;
         b.occluded = cmd.occluded;
+        b.visible_count = cmd.visible_count;
+        for (unsigned k = 0; k < cmd.visible_count; ++k)
+            b.visible[k] = cmd.visible[k];
         b.solid = cmd.solid;
         b.solid_color = cmd.solid_color;
     }
@@ -439,13 +446,20 @@ lx::result<lx::compositor::gl_paint_result> lx::compositor::frame_painter::paint
 
 lx::result<lx::compositor::vk_paint_result> lx::compositor::frame_painter::paint_vk(
     gfx::vulkan_compositor& compositor, gfx::ui_vk_renderer* ui, gfx::render_target& target,
-    const scene::immutable_frame_snapshot& snap, chrome_atlas* atlas, float text_contrast) {
+    const scene::immutable_frame_snapshot& snap, chrome_atlas* atlas, float text_contrast,
+    const gfx::damage_region* region, const gfx::damage_region* changed,
+    const gfx::render_target* previous) {
     vk_paint_result out{};
     if (!has_primitives(snap) || !ui || !ui->ready()) {
         const bool lowered = has_primitives(snap);
         const auto blits = flattened(snap, &out.paint);
-        auto c = compositor.composite(target, snap.clear_color(), blits.data(),
-                                      static_cast<unsigned>(blits.size()));
+        gfx::damage_region all{};
+        all.set_full();
+        auto c = region ? compositor.composite_region(target, snap.clear_color(), blits.data(),
+                                                      static_cast<unsigned>(blits.size()), *region,
+                                                      changed ? *changed : all, previous)
+                        : compositor.composite(target, snap.clear_color(), blits.data(),
+                                               static_cast<unsigned>(blits.size()));
         if (!c)
             return c.get_error();
         out.composite = c.value();
@@ -455,6 +469,9 @@ lx::result<lx::compositor::vk_paint_result> lx::compositor::frame_painter::paint
     (void)surfaces(snap);
     gfx::ui_vk_composite_options options{};
     options.text_contrast = text_contrast;
+    options.region = region;
+    options.changed = changed;
+    options.previous = previous;
     gfx::atlas* pages = nullptr;
     if (atlas && uses_atlas(snap)) {
         // Locked by the renderer around its atlas reads only, never across its fence waits:
