@@ -22,8 +22,11 @@ export namespace lx::runtime {
 /// Per-subsystem bump arenas — reset each frame on UI/render/worker tick.
 /// `staging` is not an arena: it is the compositor's pixel staging (shm copies waiting for
 /// or backing an upload), reported against `memory_budget_config::staging_budget_bytes`.
-enum class memory_pool { ui, render, worker, cold, staging };
-inline constexpr unsigned k_memory_pool_count = 5;
+/// `gpu` is not an arena either: device-local memory in KiB, the Vulkan device's use against
+/// the budget its driver reports (VK_EXT_memory_budget: the heap less what other processes
+/// hold), so a GPU that another process fills raises pressure like a full arena.
+enum class memory_pool { ui, render, worker, cold, staging, gpu };
+inline constexpr unsigned k_memory_pool_count = 6;
 
 enum class memory_pressure { normal, moderate, critical };
 

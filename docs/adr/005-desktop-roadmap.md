@@ -461,8 +461,9 @@ compositor side is done, Phase 1 step 7), 16 is open, and 17 has scrolling and m
   scripted Wayland client that drives real sequences is needed before Phase 0 lands, or none
   of Phases 0–3 will have meaningful coverage. `lumen-probe` driven by `scripts/app-smoke.sh`
   (and the drag, input, monitor, scale, session and tty smoke scripts beside it).
-- [ ] **Finish D4's Vulkan 1.3 move** before the renderer grows more passes, not after.
-  Still open: the instance asks for Vulkan 1.1 (ADR-004 §5 item 11).
+- [x] **Finish D4's Vulkan 1.3 move** before the renderer grows more passes, not after.
+  Vulkan 1.3 is the floor, with dynamic rendering and synchronization2 (ADR-004 D4 status,
+  2026-10-28).
 
 ---
 

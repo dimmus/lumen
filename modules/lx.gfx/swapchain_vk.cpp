@@ -544,14 +544,16 @@ lx::result<void> client_swapchain::make_vk(slot& s) {
     const std::uint32_t local = vk_foreign_ ? ours : VK_QUEUE_FAMILY_IGNORED;
     const auto record = [&](VkCommandBuffer cb, VkImageLayout from, VkImageLayout to,
                             std::uint32_t src_family, std::uint32_t dst_family,
-                            VkPipelineStageFlags src_stage, VkAccessFlags src_access,
-                            VkPipelineStageFlags dst_stage, VkAccessFlags dst_access) {
+                            VkPipelineStageFlags2 src_stage, VkAccessFlags2 src_access,
+                            VkPipelineStageFlags2 dst_stage, VkAccessFlags2 dst_access) {
         VkCommandBufferBeginInfo bi{};
         bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
         if (vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS)
             return false;
-        VkImageMemoryBarrier b{};
-        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        VkImageMemoryBarrier2 b{};
+        b.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2;
+        b.srcStageMask = src_stage;
+        b.dstStageMask = dst_stage;
         b.srcAccessMask = src_access;
         b.dstAccessMask = dst_access;
         b.oldLayout = from;
@@ -560,21 +562,25 @@ lx::result<void> client_swapchain::make_vk(slot& s) {
         b.dstQueueFamilyIndex = dst_family;
         b.image = image;
         b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        vkCmdPipelineBarrier(cb, src_stage, dst_stage, 0, 0, nullptr, 0, nullptr, 1, &b);
+        VkDependencyInfo dep{};
+        dep.sType = VK_STRUCTURE_TYPE_DEPENDENCY_INFO;
+        dep.imageMemoryBarrierCount = 1;
+        dep.pImageMemoryBarriers = &b;
+        vkCmdPipelineBarrier2(cb, &dep);
         return vkEndCommandBuffer(cb) == VK_SUCCESS;
     };
-    constexpr VkAccessFlags color = VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                    VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    constexpr VkAccessFlags2 color =
+        VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT;
+    constexpr VkPipelineStageFlags2 attachment = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
     const bool recorded =
         record(cbs[0], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-               VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-               0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, color) &&
+               VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, VK_PIPELINE_STAGE_2_NONE,
+               VK_ACCESS_2_NONE, attachment, color) &&
         record(cbs[1], VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, foreign,
-               local, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, 0,
-               VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, color) &&
+               local, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, attachment, color) &&
         record(cbs[2], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL, local,
-               foreign, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-               VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0);
+               foreign, attachment, VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+               VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE);
     if (!recorded)
         return vk_error(lx::vulkan_err::out_of_memory, "recording the ownership barriers");
 
@@ -583,7 +589,6 @@ lx::result<void> client_swapchain::make_vk(slot& s) {
     s.image.vk.width = width_;
     s.image.vk.height = height_;
     s.image.vk.format = k_ui_vk_bgra8_unorm;
-    s.image.vk.serial = s.image.id;
     return {};
 #else
     (void)s;

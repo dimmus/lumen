@@ -355,6 +355,31 @@ this project has already excluded by being Vulkan-first and dmabuf-modifier-depe
 driver coverage is thinner than descriptor indexing. Recommend descriptor indexing now,
 descriptor buffer behind a capability check later.
 
+**Status (2026-10-28): the 1.3 baseline is in.** Instances ask for `VK_API_VERSION_1_3`; a
+physical device below 1.3 is not listed by `device_selector::probe_devices` or used by
+`device::create`, so to `present_backend::automatic` it is "no hardware Vulkan" and the
+compositor falls to GL (AGENTS.md §1.1). Timeline semaphores, dynamic rendering and
+synchronization2 are enabled as core features (`VkPhysicalDeviceVulkan12Features` /
+`13Features`, required by 1.3, so not queried); `VK_KHR_timeline_semaphore` and
+`VK_KHR_image_format_list` are no longer enabled as extensions. `:vk_renderer`, `:ui_vk` and
+the client swapchain have no `VkRenderPass` or `VkFramebuffer` left: each pass is
+`vkCmdBeginRendering` behind explicit `vkCmdPipelineBarrier2` transitions, pipelines are made
+for an attachment format (`VkPipelineRenderingCreateInfo`), so one pipeline set per format
+serves every pass of that format — `:ui_vk` no longer builds a second set for the
+compositor's linear pass, and neither cache of framebuffers (nor `:ui_vk`'s eviction stall
+when a fifth attachment arrived) exists. Who loses Vulkan: devices whose driver stops below
+1.3 — NVK on Kepler, PowerVR, panvk on Bifrost, possibly hasvk (Gen7/8 Intel) — all of which
+have GL drivers. RADV, ANV, NVK (Maxwell+), NVIDIA (Turing+), turnip and panvk (Valhall) are
+at 1.4, v3dv at 1.3. Still open from this decision: a dedicated transfer queue,
+timeline-driven frame slots in place of fences, and batched/bindless draws. Optional and
+used where the device has them: `VK_EXT_host_image_copy` (shm uploads, and new atlas pages,
+written by the host — `host_image_copier`, gated on `optimalDeviceAccess`),
+`VK_EXT_memory_budget` (`memory_pool::gpu` in the memory coordinator) and
+`VK_EXT_memory_priority` (scanout targets and intermediates at the top priority). Correct on
+lavapipe; their cost and gain are unmeasured until a RADV/ANV/NVIDIA run (`bench_composite`
+prints the upload both ways). Not done: push descriptors in place of the per-texture set
+pool.
+
 ### D5 — Make the frame loop per-output from the start
 
 **Decision:** `tick_render` iterates outputs; scanout targets, damage, timing, and KMS
@@ -430,12 +455,9 @@ reads like a scheduling note.
   carrying an output index costs little now and becomes a rewrite once the pipeline has
   twenty stages.
 
-- **D4's remainder: the Vulkan 1.3 baseline and draw batching.** `apiVersion` is still
-  `VK_API_VERSION_1_1` with legacy render passes and framebuffers. Moving to 1.3 core buys
-  dynamic rendering (deleting the render-pass and framebuffer plumbing outright),
-  synchronization2, and timeline semaphores without extensions — but it is a rewrite of the
-  two passes D2 just added, so it wants doing deliberately rather than alongside them.
-  Still one queue, so staging uploads serialise against composite; and still one draw call,
+- **D4's remainder: draw batching and the queue.** The 1.3 baseline itself is done (D4
+  status above: dynamic rendering, synchronization2, core timeline semaphores). Still one
+  queue, so staging uploads serialise against composite; and still one draw call,
   descriptor bind and push-constant per quad, which is fine for a handful of surfaces and
   not for a text-heavy panel emitting hundreds.
 - **`LUMEN_VULKAN_VALIDATION` is a no-op.** The option defines a macro that no module
@@ -524,9 +546,9 @@ Follow-on from the above:
     it instead of the render thread waiting on the GPU. That was the item's whole point —
     the CPU and GPU could not overlap at all before, so a frame cost the sum of both rather
     than the larger. The Vulkan backend now matches the contract the GL one already had.
-    **Not done:** the Vulkan 1.3 baseline itself (still 1.1), dynamic rendering,
-    synchronization2, a dedicated transfer queue, and batched/instanced draws — see
-    "Needs revisiting".
+    The Vulkan 1.3 baseline — dynamic rendering, synchronization2, core timeline semaphores —
+    followed on 2026-10-28 (D4 status). **Not done:** a dedicated transfer queue and
+    batched/instanced draws — see "Needs revisiting".
 12. [ ] **D5 — not started.** Deliberately: it is the one item here that cannot be done in
     a useful partial state. Half a per-output frame loop has ambiguous ownership of flip
     state — which output's flip is pending, which slot is on screen — and that is worse

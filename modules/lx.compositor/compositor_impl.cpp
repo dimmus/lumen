@@ -358,6 +358,12 @@ struct compositor_impl {
     gfx::dmabuf_import_cache import_cache;
     buffer_lifecycle_tracker buffer_lifecycle_;
     runtime::memory_budget_coordinator memory_{};
+    /// Device-local use and budget in KiB (VK_EXT_memory_budget): written by render once a
+    /// second, reported by the UI tick as `memory_pool::gpu`. 0 budget: not known.
+    std::atomic<std::uint32_t> gpu_used_kib_{0};
+    std::atomic<std::uint32_t> gpu_budget_kib_{0};
+    /// Render affinity: when the budget was last read.
+    std::chrono::steady_clock::time_point gpu_budget_read_{};
     output_manager outputs{};
     seat_manager seats{};
     input_router input_router_{};
@@ -4920,21 +4926,24 @@ void compositor_impl::apply_texture_update(texture_update& update) {
 lx::result<void> compositor_impl::setup_vulkan_present() {
     if (!graphics.info().supports_dmabuf_import)
         return lx::not_implemented("lx::compositor::setup_vulkan_present");
-    if (auto initialized = vk_compositor_.initialize(graphics.context()); !initialized)
-        return initialized.get_error();
     // UI primitives (ADR-010 §4.11) recorded inside the composite's linear pass; pipelines
     // for that pass are made on the first frame that has primitives. Without it frames with
-    // primitives are lowered to blits.
-    {
-        auto ui = std::make_unique<gfx::ui_vk_renderer>();
-        if (auto ready = ui->initialize(graphics.context()); ready) {
-            // From here on only the render thread draws with it (ADR-010 §4.12).
-            ui->set_owner_affinity(runtime::affinity::render);
-            ui_vk_ = std::move(ui);
-            lx::trace::timeline_instant("startup", "ui_vk ready");
-        } else {
-            log_gfx.error(ready.get_error());
-        }
+    // primitives are lowered to blits. Made first: its pipeline cache, persisted on disk, is
+    // the one the composite and encode pipelines are made through too.
+    std::unique_ptr<gfx::ui_vk_renderer> ui = std::make_unique<gfx::ui_vk_renderer>();
+    if (auto ready = ui->initialize(graphics.context()); !ready) {
+        log_gfx.error(ready.get_error());
+        ui.reset();
+    }
+    if (auto initialized =
+            vk_compositor_.initialize(graphics.context(), ui ? ui->pipeline_cache() : nullptr);
+        !initialized)
+        return initialized.get_error();
+    if (ui) {
+        // From here on only the render thread draws with it (ADR-010 §4.12).
+        ui->set_owner_affinity(runtime::affinity::render);
+        ui_vk_ = std::move(ui);
+        lx::trace::timeline_instant("startup", "ui_vk ready");
     }
     vulkan_present_ = true;
     headless_present_ = false;
@@ -9962,6 +9971,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
             staged > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<unsigned>(staged);
         impl->memory_.report_usage(lx::runtime::memory_pool::staging, clamped, 0);
     }
+    if (const std::uint32_t budget = impl->gpu_budget_kib_.load(std::memory_order_relaxed);
+        budget > 0)
+        impl->memory_.report_usage(lx::runtime::memory_pool::gpu,
+                                   impl->gpu_used_kib_.load(std::memory_order_relaxed), budget);
     impl->memory_.tick(tick.frame_index);
     impl->memory_.reset_frame_arenas(lx::runtime::memory_pool::ui);
 
@@ -10337,6 +10350,20 @@ void compositor::tick_render() {
                                                           impl->cfg.import_cache};
             impl->pipeline_cache_ = gfx::pipeline_cache{};
             impl->frame_renderer_.set_pipeline_cache(&impl->pipeline_cache_);
+        }
+    }
+    // The device-local budget (a driver query, so once a second) for the UI tick's memory
+    // coordinator: what the Vulkan backend holds against what the driver says it may.
+    if (impl->vulkan_present_ && impl->graphics.info().supports_memory_budget) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - impl->gpu_budget_read_ >= std::chrono::seconds{1}) {
+            impl->gpu_budget_read_ = now;
+            const gfx::device_memory_budget b = impl->graphics.memory_budget();
+            const auto kib = [](std::uint64_t bytes) {
+                return static_cast<std::uint32_t>(std::min<std::uint64_t>(bytes >> 10u, 0xFFFFFFFFu));
+            };
+            impl->gpu_used_kib_.store(kib(b.used_bytes), std::memory_order_relaxed);
+            impl->gpu_budget_kib_.store(kib(b.budget_bytes), std::memory_order_relaxed);
         }
     }
 

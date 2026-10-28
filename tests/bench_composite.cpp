@@ -661,6 +661,61 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
     (void)scene.root().remove(&wallpaper);
 }
 
+/// A whole-output shm upload on Vulkan (`vulkan_compositor::upload_rgba`), both ways: the
+/// host writing the image (VK_EXT_host_image_copy) and the staging ring plus a queue copy.
+/// Each upload waits for the frames in flight first (as the compositor's does), so the time
+/// is the render thread's; the last upload's GPU copy is waited for at the end.
+void bench_vk_upload(unsigned width, unsigned height, int iters, bool on_software) {
+    auto selected = lx::gfx::device_selector::select_best();
+    if (!selected)
+        return;
+    auto device = std::move(selected).value();
+    if (!device.context().valid() || (device.info().is_software_rasterizer && !on_software))
+        return;
+    const lx::gfx::vk_context ctx = device.context();
+    lx::gfx::host_image_copier probe{};
+    const bool host = probe.init(ctx, 37u /* VK_FORMAT_R8G8B8A8_UNORM */);
+    std::printf("  -- Vulkan shm upload (%ux%u, %s) --\n", width, height,
+                !device.info().supports_host_image_copy
+                    ? "no VK_EXT_host_image_copy"
+                    : host ? "host image copy usable"
+                           : "host image copy not usable for RGBA8 (format, layout or "
+                             "optimalDeviceAccess)");
+    std::vector<unsigned char> px(static_cast<std::size_t>(width) * height * 4u, 0x60);
+    const auto run = [&](const char* label, lx::gfx::vk_context c) {
+        lx::gfx::vulkan_compositor comp;
+        if (!comp.initialize(c))
+            return;
+        static const unsigned char k_one[4] = {0, 0, 0, 255};
+        if (!comp.upload_rgba(1, width, height, px.data()))
+            return; // the image made, outside the timing
+        rusage r0{};
+        ::getrusage(RUSAGE_SELF, &r0);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i) {
+            px[static_cast<std::size_t>(i) * 4u % px.size()] = static_cast<unsigned char>(i);
+            if (!comp.upload_rgba(1, width, height, px.data()))
+                return;
+        }
+        (void)comp.upload_rgba(2, 1, 1, k_one); // waits for the last copy
+        const double wall = ms_since(t0) / iters;
+        rusage r1{};
+        ::getrusage(RUSAGE_SELF, &r1);
+        const auto cpu_us = [](const rusage& r) {
+            return (r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1e6 + r.ru_utime.tv_usec +
+                   r.ru_stime.tv_usec;
+        };
+        std::printf("  %-42s %7.3f ms  (cpu %.2f ms)\n", label, wall,
+                    (cpu_us(r1) - cpu_us(r0)) / 1e3 / iters);
+        comp.shutdown();
+    };
+    if (host)
+        run("upload, host image copy", ctx);
+    lx::gfx::vk_context staged = ctx;
+    staged.supports_host_image_copy = false;
+    run("upload, staging ring + queue copy", staged);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -730,6 +785,7 @@ int main(int argc, char** argv) {
 
     bench_gl(width, height, k_iters);
     bench_vk(width, height, k_iters / 2, vk_on_software);
+    bench_vk_upload(width, height, k_iters, vk_on_software);
     bench_vk_damage(width, height, k_iters, vk_on_software);
     {
         const int w = static_cast<int>(width);

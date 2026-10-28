@@ -238,7 +238,7 @@ instanced draw per run. For the shell panel this is typically 4–6 draws; the g
 
 | | Vulkan (`:ui_vk`) | GLES 3.1 (`:ui_gl`) | CPU (`:ui_cpu`) |
 |--|--------------------|----------------------|------------------|
-| Floor | Vulkan 1.1 (the compositor's current target; move to 1.3 with ADR-005's D4) | GLES 3.1 — instancing, SSBO, `f16` attributes; the host exposes 3.1 on SVGA3D. GLES 2 hosts get the CPU renderer for UI (the compositor's GLES 2 blit path is untouched) | Row-band pool already in `cpu_renderer` |
+| Floor | Vulkan 1.3 (ADR-004 D4): dynamic rendering, synchronization2, core timeline semaphores | GLES 3.1 — instancing, SSBO, `f16` attributes; the host exposes 3.1 on SVGA3D. GLES 2 hosts get the CPU renderer for UI (the compositor's GLES 2 blit path is untouched) | Row-band pool already in `cpu_renderer` |
 | Instances | One host-visible, persistently mapped ring: 3 slots × 2 MB, all kinds packed, `firstInstance` per batch; `vkCmdDraw(6, n, 0, base)` | Same ring in a `GL_SHADER_STORAGE_BUFFER` (3.1) read by `gl_InstanceID`; `glDrawArraysInstanced` | Not applicable: the stream is rasterised directly within damage rects, SDF per pixel for quads/shadows, nearest/bilinear for sprites |
 | Pipelines | 7, one layout: set 0 = globals UBO + 16-entry sampler array (atlas pages); push constant = instance base. `VkPipelineCache` persisted to `$XDG_CACHE_HOME/lumen/pipeline-cache-<pipelineCacheUUID>.bin`, replacing the key table in `renderer.cppm` | 7 programs, uniform block for globals, `GL_TEXTURE_2D_ARRAY` per atlas format; program binaries cached with `GL_OES_get_program_binary` | — |
 | Surfaces | Descriptor set per imported image as today | `EGLImage` per buffer as today | As today |
@@ -258,10 +258,16 @@ of its own; the pipelines are five (`path` shares mono's, as in `:ui_gl`) plus t
 compositor's composite pipeline for `surface`, made for the UI pass by
 `vulkan_compositor::record_blits`; the sampler array has 8 entries (`k_atlas_pages` = 6 used,
 the rest a 1×1 dummy), indexed through a switch because the compositor's device does not
-enable `shaderSampledImageArrayDynamicIndexing`; at Vulkan 1.1 the "dynamic rendering-style
-load" is a render pass with loadOp LOAD and a `vkCmdClearAttachments` per damage rect; the
-timestamps bracket the frame, not each kind. The GLSL is one set of files (shaders/ui/*.glsl)
-that `:ui_gl` compiles at run time and `:ui_vk` at build time. `renderer.cppm`'s key table
+enable `shaderSampledImageArrayDynamicIndexing`; the damage pass is `vkCmdBeginRendering`
+with loadOp LOAD and a `vkCmdClearAttachments` per damage rect (a render pass until the 1.3
+floor, 2026-10-28); the timestamps bracket the frame, not each kind. The GLSL is one set of files (shaders/ui/*.glsl)
+that `:ui_gl` compiles at run time and `:ui_vk` at build time. Pipelines are made for an
+attachment format (`VkPipelineRenderingCreateInfo`), not a render pass: one set per format
+serves `:ui_vk`'s own pass and the compositor's linear pass alike, and no framebuffer is kept
+per attachment. The persisted `VkPipelineCache` is `vulkan_compositor`'s too: the compositor
+makes `:ui_vk` first and creates its composite and encode pipelines through
+`ui_vk_renderer::pipeline_cache()`, so the file holds every pipeline the compositor makes.
+`renderer.cppm`'s key table
 stays: the compositor's `frame_renderer` still uses it. The compositor's `upload_rgba` still
 waits on its frame slots — the staging ring belongs to `:ui_vk` and has not been moved under
 the compositor's shm uploads yet. The atlas's dirty lists (and a new page image's "uploaded"
@@ -1585,8 +1591,8 @@ Taken only when S-scenario numbers justify them, in this order of expected value
 subtree emit caching (skip re-emitting clean subtrees; measure on S5 with 10 000 rows),
 LCD subpixel text via dual-source blending, 4× MSAA or analytic coverage for `path`,
 Oklab gradients, descriptor indexing for surfaces, worker-thread shaping threshold tuning,
-Vulkan 1.3 dynamic rendering (with ADR-005 D4), a render thread for clients if S3 shows a
-submit cost worth hiding.
+a render thread for clients if S3 shows a submit cost worth hiding. (Vulkan 1.3 dynamic
+rendering, listed here first, came with ADR-004 D4 on 2026-10-28.)
 
 ---
 
