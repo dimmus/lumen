@@ -26,8 +26,9 @@ constexpr unsigned k_width = 64;
 constexpr unsigned k_height = 64;
 
 /// Left half opaque red, right half opaque blue, in little-endian XRGB8888 as a Wayland
-/// client would write it.
-void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsigned stride) {
+/// client would write it, with `x` in the undefined fourth byte.
+void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsigned stride,
+                  unsigned char x = 255u) {
     for (unsigned y = 0; y < height; ++y) {
         for (unsigned x = 0; x < width; ++x) {
             unsigned char* px = pixels + y * stride + x * 4u;
@@ -35,7 +36,7 @@ void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsign
             px[0] = left ? 0u : 255u;   // B
             px[1] = 0u;                 // G
             px[2] = left ? 255u : 0u;   // R
-            px[3] = 255u;               // X/A
+            px[3] = x;                  // X/A
         }
     }
 }
@@ -101,7 +102,7 @@ struct dumb_dmabuf {
     bool valid = false;
 };
 
-dumb_dmabuf make_dumb_dmabuf() {
+dumb_dmabuf make_dumb_dmabuf(unsigned char x = 255u) {
     dumb_dmabuf out{};
 
     for (const char* path : {"/dev/dri/card0", "/dev/dri/card1"}) {
@@ -133,7 +134,7 @@ dumb_dmabuf make_dumb_dmabuf() {
                                                      static_cast<off_t>(map.offset)));
     if (pixels == MAP_FAILED)
         return out;
-    fill_pattern(pixels, k_width, k_height, out.stride);
+    fill_pattern(pixels, k_width, k_height, out.stride, x);
     ::munmap(pixels, create.size);
 
     int export_fd = -1;
@@ -275,6 +276,67 @@ LUMEN_TEST(dmabuf_import_reaches_composited_output) {
     const auto* right = readback + ((k_height / 2u) * k_width + (3u * k_width) / 4u) * 4u;
 
     // Red on the left, blue on the right — exactly the pattern written into the dma-buf.
+    LUMEN_CHECK(left[0] > 200 && left[1] < 60 && left[2] < 60);
+    LUMEN_CHECK(right[2] > 200 && right[1] < 60 && right[0] < 60);
+
+    gpu.device.dmabuf().release(image);
+#else
+    std::printf("SKIP: built without libdrm\n");
+#endif
+}
+
+// XRGB's fourth byte is undefined: a client may leave it zero. Sampled as alpha, a blended
+// draw would add the clear colour under it; it must read as one, as on GL and CPU.
+LUMEN_TEST(xrgb_dmabuf_ignores_its_x_byte) {
+#if defined(LUMEN_HAS_DRM)
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    auto source = make_dumb_dmabuf(0u);
+    if (!source.valid) {
+        std::printf("SKIP: no dumb-buffer dma-buf available on this host\n");
+        return;
+    }
+
+    lx::gfx::dmabuf_desc desc{};
+    desc.width = k_width;
+    desc.height = k_height;
+    desc.format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+    desc.plane_count = 1;
+    desc.planes[0].stride = source.stride;
+    desc.planes[0].offset = 0;
+    desc.planes[0].modifier = lx::gfx::modifier_linear;
+    desc.planes[0].fd.reset(::dup(source.dmabuf.get()));
+    LUMEN_CHECK(desc.planes[0].fd.get() >= 0);
+
+    auto imported = gpu.device.dmabuf().import(desc);
+    if (!imported) {
+        std::printf("SKIP: driver refused the dma-buf import: %s\n",
+                    imported.get_error().message);
+        return;
+    }
+    auto image = std::move(imported).value();
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.bind_imported(image)));
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = image.image_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.opacity = 1.f;
+    cmd.blend = lx::blend_mode::premultiplied;
+
+    auto stats =
+        composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 1.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                           sizeof(readback))));
+    const auto* left = readback + ((k_height / 2u) * k_width + k_width / 4u) * 4u;
+    const auto* right = readback + ((k_height / 2u) * k_width + (3u * k_width) / 4u) * 4u;
+
+    // Red and blue exactly as written: no green from the clear underneath.
     LUMEN_CHECK(left[0] > 200 && left[1] < 60 && left[2] < 60);
     LUMEN_CHECK(right[2] > 200 && right[1] < 60 && right[0] < 60);
 
@@ -687,6 +749,426 @@ LUMEN_TEST(solid_draw_reaches_composited_output_without_a_texture) {
     // Premultiplied white at 0.5 over black: linear 0.5 encodes to ~188.
     const unsigned char* right = readback + ((k_height / 2u) * k_width + k_width * 3u / 4u) * 4u;
     LUMEN_CHECK(right[1] > 176u && right[1] < 200u);
+}
+
+// ── Outputs of different sizes ──────────────────────────────────────────────────────
+//
+// One compositor draws every output. Each size keeps its own linear intermediate: drawing
+// alternately into two sizes must neither reallocate it per frame nor change a pixel.
+
+namespace {
+
+[[nodiscard]] lx::gfx::blit_command fullscreen_blit(unsigned texture_id,
+                                                    const lx::gfx::render_target& t) {
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(t.width()), static_cast<int>(t.height())};
+    cmd.blend = lx::blend_mode::opaque;
+    cmd.opacity = 1.f;
+    return cmd;
+}
+
+} // namespace
+
+LUMEN_TEST(alternating_target_sizes_keep_their_linear_intermediates) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    constexpr unsigned k_small_w = 40;
+    constexpr unsigned k_small_h = 24;
+    auto made = lx::gfx::render_target::create(gpu.device.context(), k_small_w, k_small_h);
+    if (!made) {
+        std::printf("SKIP: no second render target: %s\n", made.get_error().message);
+        return;
+    }
+    auto small = std::move(made).value();
+
+    constexpr unsigned texture_id = 0x4000'0050u;
+    if (!upload_split_texture(gpu, texture_id))
+        return;
+
+    lx::gfx::render_target* targets[2] = {&gpu.target, &small};
+    std::vector<unsigned char> first[2];
+    const unsigned before = gpu.compositor.linear_allocations();
+    for (unsigned round = 0; round < 4; ++round) {
+        for (unsigned i = 0; i < 2; ++i) {
+            lx::gfx::render_target& t = *targets[i];
+            const lx::gfx::blit_command cmd = fullscreen_blit(texture_id, t);
+            auto stats = composite_owned(gpu.compositor, t, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+            LUMEN_CHECK(static_cast<bool>(stats));
+            LUMEN_CHECK(stats.value().draws_submitted == 1);
+            // One intermediate per size, made by its first frame and never again.
+            LUMEN_CHECK(gpu.compositor.linear_allocations() == before + (round == 0 ? i + 1 : 2));
+
+            std::vector<unsigned char> px(t.width() * t.height() * 4u);
+            LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(
+                t, px.data(), static_cast<unsigned>(px.size()))));
+            const unsigned y = t.height() / 2u;
+            const unsigned char* left = px.data() + (y * t.width() + t.width() / 4u) * 4u;
+            const unsigned char* right = px.data() + (y * t.width() + t.width() * 3u / 4u) * 4u;
+            LUMEN_CHECK(left[0] > 200u && left[1] < 60u && left[2] < 60u);
+            LUMEN_CHECK(right[2] > 200u && right[1] < 60u && right[0] < 60u);
+            // Every later frame is the first one, byte for byte.
+            if (round == 0)
+                first[i] = std::move(px);
+            else
+                LUMEN_CHECK(px == first[i]);
+        }
+    }
+}
+
+// An intermediate whose size has not been drawn for a while (its output went away or
+// changed mode) is freed, not kept for good: drawing that size again makes a new one.
+LUMEN_TEST(idle_linear_intermediate_is_freed) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    auto made = lx::gfx::render_target::create(gpu.device.context(), 8, 8);
+    if (!made) {
+        std::printf("SKIP: no second render target: %s\n", made.get_error().message);
+        return;
+    }
+    auto tiny = std::move(made).value();
+
+    lx::gfx::blit_command cmd{};
+    cmd.solid = true;
+    cmd.solid_color = lx::color::rgb(0.f, 1.f, 0.f, 1.f);
+    cmd.dst = {0, 0, 8, 8};
+    cmd.blend = lx::blend_mode::opaque;
+
+    const unsigned before = gpu.compositor.linear_allocations();
+    LUMEN_CHECK(static_cast<bool>(
+        composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1)));
+    for (unsigned i = 0; i < 700; ++i)
+        LUMEN_CHECK(static_cast<bool>(
+            composite_owned(gpu.compositor, tiny, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1)));
+    LUMEN_CHECK(gpu.compositor.linear_allocations() == before + 2);
+    LUMEN_CHECK(static_cast<bool>(
+        composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1)));
+    LUMEN_CHECK(gpu.compositor.linear_allocations() == before + 3);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                            sizeof(readback))));
+    LUMEN_CHECK(readback[1] > 240u && readback[0] < 16u && readback[2] < 16u);
+}
+
+// ── Damage-limited frames ───────────────────────────────────────────────────────────
+//
+// `composite_region` composites only the frame's damage into the persistent intermediate
+// and encodes damage plus the slot's age into the target. Every frame must equal a full
+// repaint of the same scene, byte for byte: windows moving over a scaled wallpaper, a
+// translucent one over an opaque one, a translucent solid, a clipped draw, three scanout
+// slots in rotation with their ages, a chain broken in the middle (a whole-target black
+// frame, as the compositor's power-off fallback draws, into another slot), and a second
+// output of the same size drawing its own chain in between.
+
+namespace {
+
+constexpr unsigned k_dmg_w = 96;
+constexpr unsigned k_dmg_h = 72;
+
+[[nodiscard]] std::vector<unsigned char> gradient_rgba(unsigned w, unsigned h, unsigned seed,
+                                                       bool translucent) {
+    std::vector<unsigned char> px(static_cast<std::size_t>(w) * h * 4u);
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < w; ++x) {
+            unsigned char* p = px.data() + (static_cast<std::size_t>(y) * w + x) * 4u;
+            const unsigned a = translucent ? 64u + (x * 191u) / (w - 1u) : 255u;
+            // Premultiplied: no channel above alpha.
+            p[0] = static_cast<unsigned char>(((x * 37u + seed * 11u) % 256u) * a / 255u);
+            p[1] = static_cast<unsigned char>(((y * 53u + seed * 29u) % 256u) * a / 255u);
+            p[2] = static_cast<unsigned char>((((x ^ y) * 23u + seed) % 256u) * a / 255u);
+            p[3] = static_cast<unsigned char>(a);
+        }
+    return px;
+}
+
+struct dmg_scene {
+    lx::gfx::blit_command cmds[5]{};
+    unsigned count = 5;
+};
+
+[[nodiscard]] bool upload_dmg_textures(lx::gfx::vulkan_compositor& comp) {
+    const auto wall = gradient_rgba(16, 16, 1, false);
+    const auto a = gradient_rgba(24, 20, 2, false);
+    const auto b = gradient_rgba(20, 16, 3, true);
+    const auto cursor = gradient_rgba(8, 8, 4, true);
+    return comp.upload_rgba(0x4000'0100u, 16, 16, wall.data()) &&
+           comp.upload_rgba(0x4000'0101u, 24, 20, a.data()) &&
+           comp.upload_rgba(0x4000'0102u, 20, 16, b.data()) &&
+           comp.upload_rgba(0x4000'0103u, 8, 8, cursor.data());
+}
+
+/// Frame `i` of the scene: the wallpaper (not reaching the bottom), window A (opaque, moving right, clipped every
+/// third frame), window B (translucent, scaled, moving left over A), a translucent solid
+/// and a cursor.
+[[nodiscard]] dmg_scene dmg_frame(unsigned i) {
+    dmg_scene s{};
+    auto& wall = s.cmds[0];
+    wall.texture_id = 0x4000'0100u;
+    wall.dst = {0, 0, static_cast<int>(k_dmg_w), 52}; // the clear shows below it
+    wall.blend = lx::blend_mode::opaque;
+    wall.scaled = true;
+    auto& a = s.cmds[1];
+    a.texture_id = 0x4000'0101u;
+    a.dst = {4 + static_cast<int>(i) * 5, 10, 24, 20};
+    a.blend = lx::blend_mode::opaque;
+    if (i % 3 == 2)
+        a.clip = {a.dst.x + 3, 12, 15, 30};
+    auto& b = s.cmds[2];
+    b.texture_id = 0x4000'0102u;
+    b.dst = {60 - static_cast<int>(i) * 4, 18, 30, 24};
+    b.scaled = true;
+    b.opacity = 0.75f;
+    auto& solid = s.cmds[3];
+    solid.solid = true;
+    solid.solid_color = lx::color::rgb(0.2f, 0.f, 0.3f, 0.5f);
+    solid.dst = {50, 44 + static_cast<int>(i % 4), 30, 10};
+    auto& cursor = s.cmds[4];
+    cursor.texture_id = 0x4000'0103u;
+    cursor.dst = {10 + static_cast<int>(i) * 3, 50 - static_cast<int>(i) * 2, 8, 8};
+    return s;
+}
+
+/// What moved between two frames: each draw's old and new rect where it changed.
+[[nodiscard]] lx::gfx::damage_region dmg_changed(const dmg_scene& from, const dmg_scene& to) {
+    lx::gfx::damage_region d{};
+    for (unsigned k = 0; k < to.count; ++k) {
+        const auto& x = from.cmds[k];
+        const auto& y = to.cmds[k];
+        if (x.dst.x != y.dst.x || x.dst.y != y.dst.y || x.clip.width != y.clip.width ||
+            x.clip.x != y.clip.x) {
+            d.add(x.dst);
+            d.add(y.dst);
+        }
+    }
+    d.clip({0, 0, static_cast<int>(k_dmg_w), static_cast<int>(k_dmg_h)});
+    return d;
+}
+
+[[nodiscard]] std::vector<unsigned char> read_rgba(lx::gfx::vulkan_compositor& comp,
+                                                   const lx::gfx::render_target& t) {
+    std::vector<unsigned char> px(t.width() * t.height() * 4u);
+    if (!comp.read_back(t, px.data(), static_cast<unsigned>(px.size())))
+        px.clear();
+    return px;
+}
+
+} // namespace
+
+LUMEN_TEST(damage_limited_frames_match_a_full_repaint) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    lx::gfx::vulkan_compositor ref{};
+    if (!ref.initialize(gpu.device.context())) {
+        std::printf("SKIP: no second compositor\n");
+        return;
+    }
+    lx::gfx::render_target slots[3]{};
+    lx::gfx::render_target other{};
+    lx::gfx::render_target ref_target{};
+    for (auto* t : {&slots[0], &slots[1], &slots[2], &other, &ref_target}) {
+        auto made = lx::gfx::render_target::create(gpu.device.context(), k_dmg_w, k_dmg_h);
+        if (!made) {
+            std::printf("SKIP: no render target: %s\n", made.get_error().message);
+            return;
+        }
+        *t = std::move(made).value();
+    }
+    LUMEN_CHECK(upload_dmg_textures(gpu.compositor));
+    LUMEN_CHECK(upload_dmg_textures(ref));
+    const lx::color clear = lx::color::rgb(0.05f, 0.1f, 0.15f);
+
+    lx::gfx::damage_region age[3]{};
+    for (auto& a : age)
+        a.set_full();
+    const lx::gfx::render_target* previous = nullptr;
+    dmg_scene last = dmg_frame(0);
+    const lx::gfx::render_target* other_previous = nullptr;
+    dmg_scene other_last = dmg_frame(13);
+    bool partial_seen = false;
+    for (unsigned i = 0; i < 14; ++i) {
+        const dmg_scene scene = dmg_frame(i);
+        lx::gfx::damage_region changed{};
+        if (i == 0)
+            changed.set_full();
+        else
+            changed = dmg_changed(last, scene);
+        const unsigned back = i % 3u;
+        if (i == 8) {
+            // The chain broken: a black frame into another slot, every slot's age full. After
+            // the second output's frame, so it takes this output's intermediate (the older).
+            auto black = gpu.compositor.composite(slots[(back + 1u) % 3u],
+                                                  lx::color::rgb(0.f, 0.f, 0.f), nullptr, 0);
+            LUMEN_CHECK(static_cast<bool>(black));
+            if (black && black.value().out_fence_fd >= 0)
+                ::close(black.value().out_fence_fd);
+            for (auto& a : age)
+                a.set_full();
+        }
+        lx::gfx::damage_region region = changed;
+        region.add_region(age[back]);
+        auto drawn = gpu.compositor.composite_region(slots[back], clear, scene.cmds, scene.count,
+                                                     region, changed, previous);
+        LUMEN_CHECK(static_cast<bool>(drawn));
+        if (!drawn)
+            return;
+        if (drawn.value().out_fence_fd >= 0)
+            ::close(drawn.value().out_fence_fd);
+        if (drawn.value().draws_culled > 0)
+            partial_seen = true; // a draw met no damage rect: the pass was limited
+        for (unsigned s = 0; s < 3; ++s)
+            if (s != back)
+                age[s].add_region(changed);
+        age[back].clear();
+        previous = &slots[back];
+        last = scene;
+
+        auto r = composite_owned(ref, ref_target, clear, scene.cmds, scene.count);
+        LUMEN_CHECK(static_cast<bool>(r));
+        const auto want = read_rgba(ref, ref_target);
+        const auto got = read_rgba(gpu.compositor, slots[back]);
+        LUMEN_CHECK(!want.empty() && got == want);
+
+        // A second output of the same size, its own chain (one slot), every other frame.
+        if (i % 2 == 1) {
+            const dmg_scene o = dmg_frame(13 - i);
+            lx::gfx::damage_region ochanged = dmg_changed(other_last, o);
+            if (!other_previous)
+                ochanged.set_full();
+            auto od = gpu.compositor.composite_region(other, clear, o.cmds, o.count, ochanged,
+                                                      ochanged, other_previous);
+            LUMEN_CHECK(static_cast<bool>(od));
+            if (od && od.value().out_fence_fd >= 0)
+                ::close(od.value().out_fence_fd);
+            other_previous = &other;
+            other_last = o;
+            auto ro = composite_owned(ref, ref_target, clear, o.cmds, o.count);
+            LUMEN_CHECK(static_cast<bool>(ro));
+            const auto owant = read_rgba(ref, ref_target);
+            LUMEN_CHECK(!owant.empty() && read_rgba(gpu.compositor, other) == owant);
+        }
+    }
+    LUMEN_CHECK(partial_seen);
+    // The second output took an intermediate of its own rather than breaking the first
+    // output's chain every other frame.
+    LUMEN_CHECK(gpu.compositor.linear_allocations() == 2);
+    ref.shutdown();
+}
+
+// `blend_mode::opaque` draws take a pipeline without blending (as GL and CPU draw them).
+// Content of alpha 1 replaces the destination either way: every byte must match the same
+// frame drawn with every draw blended.
+LUMEN_TEST(opaque_draws_without_blending_match_blended_ones) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    lx::gfx::render_target blended{};
+    lx::gfx::render_target plain{};
+    for (auto* t : {&blended, &plain}) {
+        auto made = lx::gfx::render_target::create(gpu.device.context(), k_dmg_w, k_dmg_h);
+        if (!made) {
+            std::printf("SKIP: no render target: %s\n", made.get_error().message);
+            return;
+        }
+        *t = std::move(made).value();
+    }
+    LUMEN_CHECK(upload_dmg_textures(gpu.compositor));
+    const lx::color clear = lx::color::rgb(0.05f, 0.1f, 0.15f);
+    for (unsigned i = 0; i < 4; ++i) {
+        dmg_scene s = dmg_frame(i);
+        // An opaque solid too (a single-pixel buffer of alpha 1).
+        s.cmds[3].solid_color = lx::color::rgb(0.2f, 0.f, 0.3f, 1.f);
+        s.cmds[3].blend = lx::blend_mode::opaque;
+        dmg_scene all_blended = s;
+        unsigned opaque = 0;
+        for (unsigned k = 0; k < all_blended.count; ++k) {
+            opaque += all_blended.cmds[k].blend == lx::blend_mode::opaque ? 1u : 0u;
+            all_blended.cmds[k].blend = lx::blend_mode::premultiplied;
+        }
+        LUMEN_CHECK(opaque == 3);
+        LUMEN_CHECK(static_cast<bool>(
+            composite_owned(gpu.compositor, plain, clear, s.cmds, s.count)));
+        LUMEN_CHECK(static_cast<bool>(composite_owned(gpu.compositor, blended, clear,
+                                                      all_blended.cmds, all_blended.count)));
+        const auto want = read_rgba(gpu.compositor, blended);
+        LUMEN_CHECK(!want.empty() && read_rgba(gpu.compositor, plain) == want);
+    }
+    // It is another pipeline: a translucent draw marked opaque replaces what is under it.
+    const dmg_scene s = dmg_frame(0);
+    dmg_scene marked = s;
+    marked.cmds[2].blend = lx::blend_mode::opaque;
+    LUMEN_CHECK(static_cast<bool>(
+        composite_owned(gpu.compositor, plain, clear, marked.cmds, marked.count)));
+    LUMEN_CHECK(static_cast<bool>(composite_owned(gpu.compositor, blended, clear, s.cmds, s.count)));
+    const auto want = read_rgba(gpu.compositor, blended);
+    LUMEN_CHECK(!want.empty() && read_rgba(gpu.compositor, plain) != want);
+}
+
+LUMEN_TEST(visible_rects_match_whole_draws) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    lx::gfx::render_target whole_t{};
+    lx::gfx::render_target cut_t{};
+    for (auto* t : {&whole_t, &cut_t}) {
+        auto made = lx::gfx::render_target::create(gpu.device.context(), k_dmg_w, k_dmg_h);
+        if (!made) {
+            std::printf("SKIP: no render target: %s\n", made.get_error().message);
+            return;
+        }
+        *t = std::move(made).value();
+    }
+    LUMEN_CHECK(upload_dmg_textures(gpu.compositor));
+    // A scaled wallpaper; a translucent scaled window and a translucent solid, both partly
+    // under an opaque window; a cursor on top. The cut copy draws only the visible rects
+    // (the solid's an over-cover: it may draw more than shows, never less).
+    lx::gfx::blit_command whole[5]{};
+    whole[0].texture_id = 0x4000'0100u;
+    whole[0].dst = {0, 0, 64, 48};
+    whole[0].blend = lx::blend_mode::opaque;
+    whole[0].scaled = true;
+    whole[1].texture_id = 0x4000'0102u;
+    whole[1].dst = {8, 6, 40, 30};
+    whole[1].opacity = 0.75f;
+    whole[1].scaled = true;
+    whole[2].solid = true;
+    whole[2].solid_color = lx::color::rgb(0.2f, 0.f, 0.3f, 0.5f);
+    whole[2].dst = {30, 30, 30, 12};
+    whole[3].texture_id = 0x4000'0101u;
+    whole[3].dst = {20, 14, 24, 20};
+    whole[3].blend = lx::blend_mode::opaque;
+    whole[4].texture_id = 0x4000'0103u;
+    whole[4].dst = {40, 30, 8, 8};
+    lx::gfx::blit_command cut[5]{};
+    for (unsigned i = 0; i < 5; ++i)
+        cut[i] = whole[i];
+    const lx::rect2i wall_vis[4] = {{0, 0, 64, 14}, {0, 34, 64, 14}, {0, 14, 20, 20}, {44, 14, 20, 20}};
+    const lx::rect2i win_vis[4] = {{8, 6, 40, 8}, {8, 34, 40, 2}, {8, 14, 12, 20}, {44, 14, 4, 20}};
+    for (unsigned k = 0; k < 4; ++k) {
+        cut[0].visible[k] = wall_vis[k];
+        cut[1].visible[k] = win_vis[k];
+    }
+    cut[0].visible_count = 4;
+    cut[1].visible_count = 4;
+    cut[2].visible[0] = {30, 32, 30, 10};
+    cut[2].visible[1] = {44, 30, 16, 2};
+    cut[2].visible_count = 2;
+    const lx::color clear = lx::color::rgb(0.05f, 0.1f, 0.15f);
+    auto a = composite_owned(gpu.compositor, whole_t, clear, whole, 5);
+    auto b = composite_owned(gpu.compositor, cut_t, clear, cut, 5);
+    LUMEN_CHECK(a && b && a.value().draws_submitted == 5 && b.value().draws_submitted == 5);
+    const auto want = read_rgba(gpu.compositor, whole_t);
+    LUMEN_CHECK(!want.empty() && read_rgba(gpu.compositor, cut_t) == want);
+    // A draw none of whose visible rects reach the target's pixels is not recorded.
+    cut[1].visible[0] = {200, 200, 4, 4};
+    cut[1].visible_count = 1;
+    auto c = composite_owned(gpu.compositor, cut_t, clear, cut, 5);
+    LUMEN_CHECK(c && c.value().draws_culled == 1 && c.value().draws_submitted == 4);
+    // Waited for before the targets go.
+    LUMEN_CHECK(!read_rgba(gpu.compositor, cut_t).empty());
 }
 
 int main(int argc, char** argv) {

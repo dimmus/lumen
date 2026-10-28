@@ -36,6 +36,20 @@ output transfer function is applied **once** at the end of the render pass (befo
 KMS scanout or swapchain present). This prevents the sRGB-in-linear-space blending
 errors common in legacy compositors.
 
+On Vulkan the blend target is an R16G16B16A16_SFLOAT intermediate (8 B/px, 66 MiB at 4K)
+that the encode pass reads into the scanout buffer. The one `vulkan_compositor` draws every
+output, so it keeps one intermediate (with its framebuffer and encode descriptor set) **per
+target size**, up to four: an output's scanout slots share one, a second output of the same
+size takes its own while one of the four is free (the intermediate holds its output's newest
+frame, see "Damage: multi-rect, buffer age, idle skip" in §3), and outputs of different
+sizes no longer free and reallocate it — after draining the GPU — each time they alternate.
+An intermediate unused for 600 frames (its output gone or resized) is freed; a fifth size
+evicts the least recently used. Measured on lavapipe, 1918×928 alternating with 1278×618
+(`bench_composite --vk`, 5 runs, medians): before, 2,800 page faults and +4.4 ms CPU per
+composite over the same-size cases; after, 0 faults and no excess (CPU 122.4 → 118.3 ms
+per composite). `test_dmabuf_composite` asserts one allocation per size and identical
+pixels across alternations.
+
 ---
 
 ## 1.2 Present backend selection
@@ -236,6 +250,7 @@ actually failed.
 | Property | Behavior |
 |----------|----------|
 | Occlusion cull | Topmost opaque draw covering the damage rect skips the clear **and** every draw beneath it |
+| Visible rects | A draw the visibility pass found partly covered writes only its visible rects; a part starting mid-row steps from the row's start as the whole draw would, so its pixels are bit-identical |
 | Fast path | Identity (whole-texel source the size of dst, normal transform) + opaque + compatible format → row `memcpy` |
 | Translucent formats | An ARGB window at full opacity is mostly opaque pixels: each run of them is copied, only the rest blended, and a fully opaque pixel never decodes (the 8-bit round trip is exact). A fullscreen such window: 15 → 4 ms |
 | Conversion | Fused into the blit (`copy` / `swap_rb`); no separate pass |
@@ -349,8 +364,19 @@ format without alpha (`XRGB8888`, `XBGR8888`, …), or an opaque region covering
 buffer — and the node opacity is 1. Everything else blends (premultiplied). Blending used
 to be chosen from opacity alone, which drew every ARGB client's transparent pixels (GTK
 shadows, rounded corners, CSD borders) as black. The CPU occlusion cull and `memcpy` fast
-path still apply to XRGB and fully opaque ARGB windows. Opaque-region sub-rects (splitting a
-draw into an opaque and a blended part) are a follow-up.
+path still apply to XRGB and fully opaque ARGB windows. A partial opaque region (a CSD
+window's body inside its shadow and rounded corners) leaves the draw blended but seeds the
+visibility pass (§ Occlusion culling) and clips the draws under it to what shows; drawing
+its opaque part without blending is a follow-up.
+
+Vulkan draws `blend_mode::opaque` with a second composite pipeline that has blending off, as
+GL and CPU already did (the frame switches pipeline only where the blend changes; descriptor
+sets, push constants and dynamic state stay bound). A source of alpha 1 replaces the
+destination either way (src·1 + dst·0 is exact), so the pixels are byte-identical
+(`opaque_draws_without_blending_match_blended_ones`) and the F16 destination is not read.
+Measured on lavapipe (`bench_composite 1920 1080 --vk`, 5 runs, median CPU per frame): whole
+target, full damage 231.4 → 207.2 ms; one opaque fullscreen draw 188.5 → 177.5 ms. An XRGB
+dma-buf is still sampled through a B8G8R8A8 view, so its X byte is its alpha on both paths.
 
 **Opacity is applied once.** The node's opacity (alpha-modifier-v1) rides
 `draw_command::opacity` only; every backend multiplies it with the tint's alpha. The scene
@@ -596,7 +622,7 @@ FB_DAMAGE_CLIPS takes.
 | Composite | `frame damage ∪ age(slot)`: each of the three scanout slots records what it missed since it was last drawn into. Without this a damage-limited composite into a slot two frames old leaves ghost trails behind a moving window |
 | GL | `gl_compositor::composite_region` — state set once, then per rect: scissor, clear, draw only the draws whose dst meets the rect; one fence per frame |
 | CPU | `cpu_compositor::composite_region` — the existing per-rect path (with its occlusion cull) once per rect |
-| Vulkan | Full repaint whenever anything is damaged — correct for any buffer age |
+| Vulkan | `vulkan_compositor::composite_region` (and `ui_vk_renderer::composite` with `region`): the linear intermediate is persistent and holds the output's newest complete frame, so the composite pass loads it and redraws only this frame's damage — per rect: clear, then every draw (batch) meeting the rect, scissored to it — while the encode pass writes `damage ∪ age(slot)` into the target (loaded, one scissored triangle per rect). The chain is checked, not assumed: the intermediate records the target its frame went into, and anything else (first frame, new or resized intermediate, a whole-target `composite` such as the power-off black frame, a failed frame, device re-init) composites the whole target; a target not yet written is encoded whole. Pixels equal a full repaint byte for byte (`test_dmabuf_composite` `damage_limited_frames_match_a_full_repaint`, `test_deco_titles` `vk_damage_limited_titles_match_a_full_repaint`). lavapipe, 1920×1080, 3 slots (`bench_composite --vk`, 5 runs, medians [range]): a 64×64 cursor moving 125.1 [120.0–131.2] → 1.86 [1.54–2.30] ms per frame (CPU 232.6 → 1.8 ms), one terminal line 122.9 [121.2–126.2] → 3.31 [3.04–3.58] ms (CPU 231.2 → 4.6 ms), full damage 126.4 [121.7–128.9] → 123.5 [122.8–125.7] ms (CPU 231.9 → 233.3 ms, within the run-to-run spread) |
 | KMS | Every rect since the last successful commit, as separate FB_DAMAGE_CLIPS: the plane's previous framebuffer predates this frame |
 
 A tick whose snapshot carries no damage composites nothing and commits nothing. On this
@@ -652,14 +678,63 @@ multiplies per draw in `project_node`, none per pixel; nothing allocates.
   full alpha: `blend_mode::opaque` (a format without alpha or an opaque region over the whole
   buffer), opacity and tint alpha 1, translation only. A UI quad that is a solid square on
   whole pixels at alpha 1 (a decoration fill) seeds one too, at its place in paint order; no
-  primitive is ever marked (§6, UI primitives in the compositor). When more are found the
-  eight largest stay. A draw inside one of them, or outside the output, is marked
+  primitive is ever marked (§6, UI primitives in the compositor). A blended draw at full
+  alpha seeds its `opaque_rects` (see below). When more are found the eight largest stay. A draw inside one of them, or outside the output, is marked
   `occluded`; GL, Vulkan and CPU skip it (`draws_culled`). The pixels are identical, so damage and buffer age are
   untouched — what is saved is the GPU fill of windows under a maximized one.
-- Cost: O(draws × 8) compares per published frame, a parallel `scene_node*`/`bool` scratch
-  array of `k_max_draw_commands` in the scene graph (no allocation), one virtual call per
-  on-screen node. Conservative by construction: overlaps the eight rects cannot express count
-  as visible.
+- **Partial opaque regions.** ARGB clients with an opaque region that excludes shadow margins
+  and rounded corners (GTK 3/4, libadwaita, Firefox) used to occlude nothing. `wire_surface`
+  now passes the region's two largest rects, clipped to the surface (none for an
+  over-approximated region), through `surface_manager` to `surface_node::set_opaque_rects`;
+  the node projects them into `draw_command::opaque_rects` on a 1:1 draw at full opacity and
+  tint (start ceiled, end floored at the surface-to-dst ratio, so a fractional scale rounds
+  inwards; a turned output turns them with the draw; a resampled or solid draw seeds none),
+  and the pass seeds them clipped like the draw's own rect. Two, because the pass hides a
+  draw only inside one rect: past the body and one corner-trimmed strip, a rounded region's
+  rects are a radius tall and hide nothing window-sized. A whole-surface opaque surface is
+  unchanged (its `dst` seeds, no rects). Measured (`bench_composite 1920 1080 --vk`, five
+  stacked GTK-style CSD windows over a wallpaper, two under the top window's body, 5 runs,
+  median [range]): draws culled 0 → 2, pixels drawn 4.98 M → 4.38 M (−12 %); CPU composite
+  39.2 [38.6–40.1] → 36.6 [34.7–37.6] ms; GL on SVGA3D, fence waited, 7.67 [7.53–7.79] →
+  7.05 [6.88–7.15] ms; Vulkan on lavapipe (with the no-blend pipeline) 170.0 → 146.1 ms.
+  UI cost: list build plus pass 0.40 → 0.52 µs, the pass alone 0.05 → 0.13 µs per frame.
+  Covered windows also get the throttled frame callbacks below.
+- **Visible rects (partly covered draws).** A draw the rects cover only in part used to be
+  drawn whole (wlroots clips each node to its visible region). The pass now subtracts them
+  from its clipped rect, largest first, and stores what is left inline as up to
+  `gfx::k_max_visible_rects` (4) disjoint rects (`draw_command::visible`, copied to
+  `blit_command::visible`); a rect that would split it into more is skipped, so the part kept
+  only over-covers, and a draw nothing is left of — a wallpaper under two tiled halves — is
+  `occluded`. A cut that narrows a part's rows is made only when it hides at least a quarter
+  of the part's width: below that, splitting each row costs the CPU path more than the pixels
+  it saves (a 300x400 menu over a fullscreen window, 1-thread composite 1.69 ms whole vs
+  1.77 ms cut; break-even near 480 of 1920 px, whatever the height). GL, Vulkan and CPU draw
+  it once per visible rect as one more scissor (same uniforms / push constants), so the
+  pixels are bit-identical; nothing is reordered. Measured (`bench_composite 1920 1080 --vk`,
+  3 interleaved runs, median, before → after; GL on SVGA3D and Vulkan on lavapipe fence
+  waited, CPU one thread; the 20-window row from 6 interleaved pairs against the same draws
+  drawn whole):
+
+  | Scene | Pixels drawn | CPU ms | GL ms | Vulkan ms |
+  |-------|-------------|--------|-------|-----------|
+  | 5 stacked CSD windows | 4.38 M → 2.62 M (−40 %) | 31.7 → 15.1 | 6.65 → 4.73 | 143 → 107 |
+  | 3 cascaded opaque | 3.71 M → 2.40 M (−35 %) | 30.2 → 19.9 | 6.04 → 5.02 | 105 → 101 |
+  | 6 cascaded opaque | 5.27 M → 2.96 M (−44 %) | 30.6 → 20.8 | 8.54 → 5.56 | 109 → 105 |
+  | 4 cascaded CSD | 4.55 M → 2.81 M (−38 %) | 34.6 → 24.0 | 6.86 → 4.97 | 137 → 102 |
+  | maximised under a panel | 4.15 M → 2.07 M (−50 %) | 30.9 → 2.4 | 6.70 → 4.31 | 103 → 92 |
+  | two tiled halves | 4.15 M → 2.07 M (−50 %) | 29.5 → 2.5 | 6.84 → 4.11 | 100 → 93 |
+  | fullscreen window + small opaque menu | 2.19 M (drawn whole) | 1.61 → 1.64 (same draws) | 4.62 | 94 |
+  | 20 cascaded windows, CSD and opaque | 7.68 M → 4.41 M (−43 %) | 39.3 → 32.3 | 9.36 → 7.87 | 137 → 139 |
+
+  Lavapipe gains little on opaque cascades (its fixed full-target encode pass dominates), and
+  on a stack of 20 cascaded windows the many thin scissored parts cost it slightly more than
+  the fill they save (+1.5 %; +7–12 % before the quarter-width rule). `automatic` never picks
+  lavapipe. The pass costs 0.05–0.13 → 0.07–0.54 µs per frame on the first six scenes and
+  about 3–4 µs at 21 draws (the 20-window stack).
+- Cost: O(draws × 8 × 4) rect operations per published frame, a parallel
+  `scene_node*`/`bool` scratch array of `k_max_draw_commands` in the scene graph (no
+  allocation), one virtual call per on-screen node. Conservative by construction: overlaps
+  the eight rects cannot express count as visible.
 - Each surface node with a draw on screen records the frame; `surface_node::visible_in(f)`
   is an O(1) compare. **Presentation feedback** samples by it (a covered surface's update is
   not "shown"), and **frame callbacks** are paced by it: surfaces on screen in the last
@@ -900,7 +975,8 @@ frame:
   starts (`ui_gl` programs from the binary cache, warmed with one quad on SVGA3D).
 - **Vulkan** records the stream inside `vulkan_compositor`'s linear F16 pass
   (`ui_vk_renderer::composite`, Phase 2): the compositor begins its frame and records its
-  acquires, `:ui_vk` its atlas copies, the pass is begun, `surface` refs go through
+  acquires, `:ui_vk` its atlas copies, the pass is begun (whole, or per damage rect — see
+  the damage table), `surface` refs go through
   `record_blits` with the compositor's own composite pipeline (decoded as `composite` decodes
   them), primitive batches through `:ui_vk` pipelines made for that pass, then the encode
   pass and one submit; an empty submit after it fences `:ui_vk`'s ring slot. In the pass a

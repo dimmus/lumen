@@ -17,6 +17,13 @@ constexpr lx::trace::category log_draw_list{"scene.draw_list"};
 
 export namespace lx::scene {
 
+/// Opaque rects a blended draw may carry for the visibility pass (`draw_command::opaque_rects`).
+/// Two: the pass hides a draw only when it lies wholly inside one rect, so beyond the largest
+/// two of a rounded window's region (GTK's three bands: the body, and corner-trimmed strips
+/// one radius tall) a rect hides nothing window-sized — and every rect competes for the
+/// pass's eight occluder slots.
+inline constexpr unsigned k_max_opaque_rects = 2;
+
 struct draw_command {
     lx::texture_id texture{};
     /// Source box in buffer pixels, before `buffer_xform` (wl_surface + wp_viewport). Empty
@@ -40,10 +47,20 @@ struct draw_command {
     /// Fully covered by an opaque draw above it, or entirely off the output: every backend
     /// skips it (identical pixels). Set by the scene's visibility pass (`mark_occlusion`).
     bool occluded = false;
+    /// Partly covered: the visible part as up to `gfx::k_max_visible_rects` disjoint rects
+    /// (output pixels, inside the clipped `dst`), which every backend confines the draw to.
+    /// Zero: the whole draw. Set by the visibility pass, as `occluded` is.
+    lx::rect2i visible[lx::gfx::k_max_visible_rects]{};
+    unsigned visible_count = 0;
     /// A solid colour, no texture (`wp_single_pixel_buffer_v1`): `solid_color` premultiplied
     /// and encoded; `texture` is empty. See `gfx::blit_command::solid`.
     bool solid = false;
     lx::color solid_color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+    /// Rects inside `dst` (output pixels) the content covers with full alpha although the
+    /// draw blends: a partial opaque region (`surface_node::set_opaque_rects`). Read by the
+    /// visibility pass only, which seeds them as occluders as it does an opaque draw's `dst`.
+    lx::rect2i opaque_rects[k_max_opaque_rects]{};
+    unsigned opaque_rect_count = 0;
 };
 
 inline constexpr unsigned k_initial_draw_commands = 256;

@@ -4282,7 +4282,7 @@ if "B6" in scen and scen["B6"]["id"]:
 DMODE = re.compile(r"compositor\.deco: decoration mode id=(\d+) requested=(\w+) sent=(\w+) serial=(\d+)")
 DAPPLY = re.compile(r"compositor\.deco: decoration apply id=(\d+) mode=(\w+) frame=(-?\d+),(-?\d+),(\d+)x(\d+)")
 DPRESS = re.compile(r"compositor\.deco: decoration press id=(\d+) zone=(\w+) button=(\d+)")
-DTITLE = re.compile(r"compositor\.deco: decoration title id=(\d+) width=(\d+) ellipsized=(\d) title=\"(.*)\"$")
+DTITLE = re.compile(r"compositor\.deco: decoration title id=(\d+) scale=\d+ width=(\d+) ellipsized=(\d) title=\"(.*)\"$")
 FPOINT = re.compile(r"compositor\.wm: focus pointer (?:id=(\d+)|decoration id=(\d+) zone=(\w+)|none)")
 UNMAP = re.compile(r"compositor\.wm: unmap id=(\d+) ")
 
@@ -5353,7 +5353,7 @@ if any(n in scen for n in ("A1", "B6", "C1-server", "F1", "G11", "H5", "I3", "J6
 NOTRESP = re.compile(r"compositor\.liveness: not-responding client=(\d+) pid=(\d+) after_ms=(\d+) toplevels=(\d+)")
 RESP = re.compile(r"compositor\.liveness: responsive client=(\d+) pid=(\d+) was_ms=(\d+)")
 PING = re.compile(r"compositor\.liveness: ping client=(\d+) serial=(\d+) reason=(\w+)")
-DECOTITLE = re.compile(r'compositor\.deco: decoration title id=(\d+) width=\d+ ellipsized=\d title="(.*)"$')
+DECOTITLE = re.compile(r'compositor\.deco: decoration title id=(\d+) scale=\d+ width=\d+ ellipsized=\d title="(.*)"$')
 DIM = re.compile(r"compositor\.scene: tree root=(\d+) dim=(\d)")
 MAPID = re.compile(r"compositor\.wm: map id=(\d+) app_id=(\S+) ")
 

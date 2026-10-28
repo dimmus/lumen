@@ -10609,11 +10609,15 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                                     "scanout format — surface not shown");
             }
         } else if (vulkan_present_) {
-            // Vulkan repaints the whole target, which is correct for any buffer age. A frame
-            // with primitives (the chrome) records them inside the linear pass through
-            // `:ui_vk`; one without is the blit composite it always was.
+            // As GL, the target gets `region`; the linear intermediate keeps the newest frame
+            // (the one in `capture_front`'s slot), so only this frame's damage is composited
+            // into it. A frame with primitives (the chrome) records them inside the linear
+            // pass through `:ui_vk`; one without is the blit composite.
+            const gfx::render_target* previous =
+                p.capture_front >= 0 ? &p.vk[p.capture_front] : nullptr;
             auto c = painter_.paint_vk(vk_compositor_, ui_vk_.get(), p.vk[back], snapshot,
-                                       &chrome_atlas_);
+                                       &chrome_atlas_, gfx::k_text_contrast_dark, &region,
+                                       &frame_damage, previous);
             if (!c) {
                 log_render.error(c.get_error());
             } else {

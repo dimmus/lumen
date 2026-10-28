@@ -756,10 +756,38 @@ void remember_cursor_candidate(surface_obj* s) {
 
 /// Opaque content, for blending: a format without alpha, or an opaque region covering the
 /// whole surface (the region is surface-local, so it is compared with the logical size).
-/// Sub-rect opaque regions (split draws) are a follow-up.
 [[nodiscard]] bool content_opaque(const surface_obj* s) {
     return s->format_opaque ||
            region_covers(s->opaque_current, s->surface_size.width, s->surface_size.height);
+}
+
+/// Content that is not opaque as a whole but has an opaque region (a CSD window's body
+/// inside its shadow and rounded corners): the region's largest rects clipped to the
+/// surface, largest first, for the visibility pass to hide what lies under them. None for an
+/// over-approximated region, as `region_covers`.
+using opaque_rect_set = lx::rect2i[lx::scene::k_max_opaque_rects];
+[[nodiscard]] unsigned partial_opaque_rects(const surface_obj* s, opaque_rect_set& out) {
+    const lx::compositor::input_region& region = s->opaque_current;
+    const int w = s->surface_size.width;
+    const int h = s->surface_size.height;
+    if (content_opaque(s) || region.infinite || region.approximated || w <= 0 || h <= 0)
+        return 0;
+    constexpr unsigned k_keep = lx::scene::k_max_opaque_rects;
+    const auto area = [](lx::rect2i r) { return static_cast<long long>(r.width) * r.height; };
+    unsigned n = 0;
+    for (unsigned i = 0; i < region.count; ++i) {
+        const lx::rect2i c = lx::compositor::clip_to(region.rects[i], w, h);
+        if (c.width <= 0 || c.height <= 0)
+            continue;
+        if (n == k_keep && area(c) <= area(out[n - 1]))
+            continue;
+        // Kept sorted by area, largest first: the smallest makes room.
+        unsigned at = n < k_keep ? n++ : n - 1;
+        for (; at > 0 && area(out[at - 1]) < area(c); --at)
+            out[at] = out[at - 1];
+        out[at] = c;
+    }
+    return n;
 }
 
 /// Content on this surface is drawn (once mapped), so a buffer must be imported and staged
@@ -1183,6 +1211,7 @@ void import_current_buffer(surface_obj* s, const update_damage& damage,
     commit.buffer = buf->id;
     commit.client = s->client;
     commit.opaque = content_opaque(s);
+    commit.opaque_rect_count = partial_opaque_rects(s, commit.opaque_rects);
     commit.surface_size = geo.size;
     commit.src = geo.src;
     commit.transform = geo.transform;
@@ -1484,8 +1513,11 @@ void apply_core(surface_obj* s) {
         if (s->has_content && !new_buffer) {
             s->ctx->surfaces->set_geometry(s->id, geo.size, geo.src, geo.transform);
             if (opaque_changed || old_size.width != geo.size.width ||
-                old_size.height != geo.size.height)
-                s->ctx->surfaces->set_opaque(s->id, content_opaque(s));
+                old_size.height != geo.size.height) {
+                opaque_rect_set rects{};
+                const unsigned count = partial_opaque_rects(s, rects);
+                s->ctx->surfaces->set_opaque(s->id, content_opaque(s), {rects, count});
+            }
         }
         return;
     }

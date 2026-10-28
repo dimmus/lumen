@@ -611,6 +611,10 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
                 b.clip.x -= crop.x;
                 b.clip.y -= crop.y;
             }
+            for (unsigned k = 0; k < b.visible_count; ++k) {
+                b.visible[k].x -= crop.x;
+                b.visible[k].y -= crop.y;
+            }
         }
         return scratch.data();
     };

@@ -52,6 +52,11 @@ struct surface_commit {
     /// The content has no translucent pixel: a format without alpha, or an opaque region
     /// covering the buffer. False (blend) unless the protocol layer proves it.
     bool opaque = false;
+    /// Content that is not `opaque` as a whole: the largest rects of its opaque region inside
+    /// the surface (surface-local), which hide what lies wholly under them
+    /// (`scene::surface_node::set_opaque_rects`).
+    lx::rect2i opaque_rects[lx::scene::k_max_opaque_rects]{};
+    unsigned opaque_rect_count = 0;
 };
 
 /// A wl_surface input region: the exact rect set from wl_region add/subtract, in fixed
@@ -234,9 +239,10 @@ public:
     /// Removes the node from its container and deletes it. Notes no damage — the caller
     /// knows what it unmapped.
     void drop_node(lx::surface_id surface);
-    /// Content opacity (see `surface_commit::opaque`); pushed into the node, damaging it
-    /// when the blend changes.
-    void set_opaque(lx::surface_id surface, bool opaque);
+    /// Content opacity (see `surface_commit::opaque`, `opaque_rects`); pushed into the node,
+    /// damaging it when the blend changes.
+    void set_opaque(lx::surface_id surface, bool opaque,
+                    std::span<const lx::rect2i> opaque_rects = {});
     /// Something under a still pointer may have changed: a node appeared, went away,
     /// moved or changed size. The window manager re-hit-tests once per tick on it.
     void note_layout_changed() { layout_changed_ = true; }
@@ -283,6 +289,8 @@ private:
         lx::scene::container_node* node_parent = nullptr;
         input_region input{};
         bool opaque = false;
+        lx::rect2i opaque_rects[lx::scene::k_max_opaque_rects]{};
+        unsigned opaque_rect_count = 0;
         bool override_redirect = false;
         bool used = false;
     };
@@ -519,6 +527,9 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
     entry.transform = commit.transform;
     const bool opacity_changed = entry.opaque != commit.opaque;
     entry.opaque = commit.opaque;
+    entry.opaque_rect_count = 0;
+    for (unsigned i = 0; i < commit.opaque_rect_count && i < lx::scene::k_max_opaque_rects; ++i)
+        entry.opaque_rects[entry.opaque_rect_count++] = commit.opaque_rects[i];
 
     // Only a mapped surface has a node. Its bounds are the surface (logical) — never the
     // damage rect, which for a partial redraw is a fraction of the window — and its damage
@@ -529,6 +540,7 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
         if (was_solid)
             entry.node->set_solid(false, {});
         entry.node->set_opaque(entry.opaque);
+        entry.node->set_opaque_rects({entry.opaque_rects, entry.opaque_rect_count});
         entry.node->set_bounds({0, 0, entry.surface_size.width, entry.surface_size.height});
         entry.node->set_content(entry.src, entry.transform);
         if (scene_) {
@@ -700,6 +712,7 @@ bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface,
     node->attach(entry.image);
     node->set_solid(entry.solid, entry.solid_color);
     node->set_opaque(entry.opaque);
+    node->set_opaque_rects({entry.opaque_rects, entry.opaque_rect_count});
     node->set_bounds({0, 0, entry.surface_size.width, entry.surface_size.height});
     node->set_content(entry.src, entry.transform);
     if (entry.alpha < 1.f)
@@ -725,11 +738,19 @@ void lx::compositor::surface_manager::drop_node(lx::surface_id surface) {
     layout_changed_ = true;
 }
 
-void lx::compositor::surface_manager::set_opaque(lx::surface_id surface, bool opaque) {
+void lx::compositor::surface_manager::set_opaque(lx::surface_id surface, bool opaque,
+                                                 std::span<const lx::rect2i> opaque_rects) {
     const int slot = find_surface(surface);
     if (slot < 0)
         return;
     auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    entry.opaque_rect_count = 0;
+    for (const lx::rect2i& r : opaque_rects)
+        if (entry.opaque_rect_count < lx::scene::k_max_opaque_rects)
+            entry.opaque_rects[entry.opaque_rect_count++] = r;
+    // The rects change no pixel, only what the visibility pass may hide: no damage.
+    if (entry.node)
+        entry.node->set_opaque_rects({entry.opaque_rects, entry.opaque_rect_count});
     if (entry.opaque == opaque)
         return;
     entry.opaque = opaque;
@@ -811,6 +832,7 @@ void lx::compositor::surface_manager::set_solid(lx::surface_id surface, lx::colo
     e.src = {};
     e.transform = lx::buffer_transform::normal;
     e.opaque = opaque;
+    e.opaque_rect_count = 0; // a solid draw seeds no opaque rects
     if (!e.node || !changed)
         return;
     const lx::point2i o = e.node->origin();
