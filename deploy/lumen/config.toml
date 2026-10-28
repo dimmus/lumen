@@ -109,11 +109,6 @@ history = 50            # entries kept in the panel's notification list (0: none
 # Do not disturb: a middle click on the panel's bell, its list's first entry, or a binding to
 # "notifications.toggle-dnd" (also "notifications.dismiss", "notifications.dismiss-all").
 
-[compositor]
-realtime = "auto"       # auto: the render thread asks for real-time scheduling (rtkit when
-                        # the compositor may not set it itself), else high priority and
-                        # latency hints; off: leave thread scheduling alone (start-up only)
-
 [general]
 default-bindings = true # false: start from no bindings (Lumen's own keys remain:
                         # Ctrl+Alt+F1…F12, Ctrl+Alt+BackSpace, Super+Escape)

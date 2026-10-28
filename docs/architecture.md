@@ -485,7 +485,6 @@ flowchart LR
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
 | `lx.runtime.memory` | Per-subsystem arenas, pressure coordinator, overflow policies |
 | `lx.runtime.psi` | Kernel memory pressure (PSI) triggers and decay; `psi_monitor` feeds them to the coordinator on the UI loop |
-| `lx.runtime.sched` | Render and UI thread scheduling tiers (real-time, nice, EEVDF slice / uclamp.min) with RLIMIT_RTTIME and reset-on-fork; rtkit as the broker via `lx.session.rtkit` |
 | `lx.input` + `seat_manager` | libinput → pointer/keyboard events (ms wire time plus µs CLOCK_MONOTONIC time for latency) → `lx.compositor.wm` decides focus |
 | `lx.drm` + `lx.drm.atomic` | Connector probe (`connector_scan`, EDID identity via `:edid`; a worker may run it), CRTC/plane allocation (`:crtc_alloc`, pure, TEST_ONLY-checked), one `kms_pipeline` per CRTC (atomic page flips, KMS damage blobs, power-off), combined multi-output `commit_modeset` (TEST_ONLY of another mode, disabling a removed output, VRR_ENABLED), per-device flip-event routing, dumb scanout buffers, framebuffer hand-over at exit (CLOSEFB), the udev hotplug monitor (`:uevent`), CVT custom modes (`:modes`), GPU memory from DRM fdinfo for the health report (`:fdinfo`) |
 | `lx.scheduler.presentation` | Page-flip bridge: flip time, vblank sequence, the commit's frame tag |

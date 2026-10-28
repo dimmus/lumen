@@ -329,58 +329,6 @@ probe 18–31 ms, input open 15–25 ms and the cursor theme 5–14 ms left the 
 input in parallel against serial, 8 interleaved runs each: socket 75 vs 92 ms, first client
 frame 114 vs 126 ms.
 
-### Thread scheduling
-
-Under load a plain SCHED_OTHER thread waits its turn behind every other runnable task, and a
-frame that waits misses its vblank. Once the threads have started, `compositor::start`
-raises the render and UI threads (`compositor_impl::apply_thread_scheduling`, UI thread; the
-render thread publishes its tid as it starts). `runtime::apply_thread_sched` (`lx.runtime:sched`,
-pure over injected calls) walks the tiers best first and keeps the first one granted;
-`kernel_sched_ops` are the syscalls, `lx.session::rtkit_client` the broker. One info line per
-thread says what it got (category `compositor.sched`; the refusals at debug).
-
-| Tier | How | Render | UI (dispatch) |
-|------|-----|--------|---------------|
-| real-time | SCHED_RR 1 with the process's own CAP_SYS_NICE / RLIMIT_RTPRIO, else rtkit `MakeThreadRealtimeWithPID` (within its `MaxRealtimePriority`) | yes | **never** |
-| high priority | nice −10 with `setpriority`, else rtkit `MakeThreadHighPriorityWithPID` (not below its `MinNiceLevel`) | when not real-time | yes |
-| latency hints | `sched_setattr` keeping policy and nice: EEVDF slice 0.5 ms (`sched_runtime`, 6.12+) and `uclamp.min` 512 (5.3+) | slice and uclamp.min | slice only |
-
-- **Which thread goes real-time.** Render work is bounded per frame (composite, present). The
-  UI thread runs whatever clients send, config reloads, I/O: a flood there would be a
-  real-time thread starving the machine, and RLIMIT_RTTIME would then end the session. So
-  UI goes as far as high priority (Mutter likewise keeps only its KMS thread real-time). The
-  worker, the start-up helpers and driver threads stay as they are.
-- **SCHED_RR, priority 1.** The lowest real-time priority is above every SCHED_OTHER task,
-  which is the point, and below everything that chose a priority on purpose (PipeWire's
-  rtkit 20, IRQ threads at 50). RR over FIFO: it is what rtkit grants anyway, and a thread
-  of equal priority still gets a turn. KWin does the same (`SCHED_RR | SCHED_RESET_ON_FORK`,
-  the minimum priority).
-- **RLIMIT_RTTIME first.** Before real-time is asked for (by either route) the hard limit is
-  set to 200 ms (rtkit's default `RTTimeUSecMax`, lower if rtkit's is lower; a lower one
-  already set is kept) and the soft limit to half of it; nothing is asked if that fails.
-  A SIGXCPU handler (the soft limit) drops every real-time thread back to SCHED_OTHER — one
-  line on stderr, async-signal-safe — before the hard limit's SIGKILL; the process-wide
-  signal is why the guard knows the threads. The limit counts only real-time CPU time
-  without a blocking call: the render thread blocks every frame.
-- **SCHED_RESET_ON_FORK on every raised thread**, set before anything else (nothing above
-  the hints is asked for without it): threads and processes started from them begin at
-  SCHED_OTHER, nice 0, the default slice and no clamp (checked on 7.2: the slice and uclamp
-  reset too). The compositor starts no processes itself; Mesa and other libraries start
-  threads.
-- **No hints on a real-time thread.** A uclamp.min would lower the full clock RT tasks get
-  by default; the slice is a fair-class parameter.
-- **What an unprivileged process may set** (tried on Linux 7.2): `uclamp.min` up and down
-  and `sched_runtime` (clamped to 0.1–100 ms) on its own threads; negative nice and any RT
-  policy are EPERM. Before 6.12 `sched_runtime` is ignored for SCHED_OTHER and reads back
-  0, so the outcome reports slice 0; without `CONFIG_UCLAMP_TASK` the clamp is dropped and
-  the slice still applied.
-
-`compositor.realtime = "off"` (config, read at start-up) leaves both threads as the process
-started. rtkit is reached on a private system-bus connection, only when the kernel refused,
-with a 1 s timeout, and closed at the end of start-up. Measured on the vmwgfx VM
-(RLIMIT_RTPRIO 0, no rtkit): both threads get latency hints — render slice 500 µs and
-uclamp.min 512, UI slice 500 µs.
-
 **Frame callbacks are released on a timer (UI).** After a flip, an output's callbacks are
 held until its next repaint start minus what its clients recently took to answer (peak of
 the last 8, plus 1.5 ms) and released by `callback_timer_`, a one-shot UI `timer_source`;

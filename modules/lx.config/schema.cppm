@@ -158,14 +158,6 @@ struct notification_settings {
     int history = 50;
 };
 
-/// `auto`: the render and UI threads ask for real-time, high priority or latency hints,
-/// whichever the kernel or rtkit grants (threading.md, "Thread scheduling"); `off`: their
-/// scheduling is left as the process started.
-enum class realtime_mode : unsigned char { automatic, off };
-struct compositor_settings {
-    realtime_mode realtime = realtime_mode::automatic;
-};
-
 // ── Bindings ──
 
 enum binding_option : unsigned char {
@@ -206,7 +198,6 @@ struct config_snapshot {
     idle_settings idle{};
     background_settings background{};
     notification_settings notifications{};
-    compositor_settings compositor{};
     bool default_bindings = true;
     /// Effective: the defaults (unless `default_bindings` is false) with the files' bindings
     /// over them.
@@ -298,7 +289,6 @@ constexpr const char* k_focus_modes[] = {"click", "sloppy"};
 constexpr const char* k_workspace_modes[] = {"dynamic", "static"};
 constexpr const char* k_switcher_scopes[] = {"workspace", "all"};
 constexpr const char* k_idle_policies[] = {"shell", "none"};
-constexpr const char* k_realtime_modes[] = {"auto", "off"};
 constexpr const char* k_positions[] = {"top-right", "top-center", "top-left", "bottom-right",
                                        "bottom-left"};
 
@@ -402,9 +392,6 @@ const key_desc k_keys[] = {
      LX_FIELD(notifications.dnd_while_sharing)},
     {"notifications", "history", value_kind::integer, k_s, k_live, 0, 500, nullptr, 0, 0,
      LX_FIELD(notifications.history)},
-    // [compositor]
-    {"compositor", "realtime", value_kind::enumeration, k_c, reload_class::start, 0, 0,
-     k_realtime_modes, count_of(k_realtime_modes), 0, LX_FIELD(compositor.realtime)},
     // [general]
     {"general", "default-bindings", value_kind::boolean, k_c, k_live, 0, 0, nullptr, 0, 0,
      LX_FIELD(default_bindings)},
@@ -443,8 +430,8 @@ const pointer_key_desc k_pointer_keys[] = {
 constexpr const char* k_sections[] = {
     "input",      "input.keyboard", "input.touchpad", "input.mouse",   "input.trackpoint",
     "input.device", "cursor",       "focus",          "windows",       "workspaces",
-    "switcher",   "idle",           "background",     "notifications", "compositor",
-    "general",    "bindings",
+    "switcher",   "idle",           "background",     "notifications", "general",
+    "bindings",
 };
 
 using enum lx::config::action_id;
