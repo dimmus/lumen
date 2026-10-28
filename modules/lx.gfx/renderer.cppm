@@ -8,6 +8,9 @@ import :headless;
 
 export namespace lx::gfx {
 
+/// Disjoint rects a partly covered draw is confined to (`blit_command::visible`).
+inline constexpr unsigned k_max_visible_rects = 4;
+
 /// One quad handed to a present backend.
 ///
 /// This mirrors `scene::draw_command`. It used to carry four of its thirteen fields, and
@@ -46,6 +49,12 @@ struct blit_command {
     bool scaled = false;
     /// Covered by an opaque draw above it: skipped (identical pixels).
     bool occluded = false;
+    /// The part the opaque draws above leave visible, when they cover some of it: up to
+    /// `k_max_visible_rects` disjoint rects in target pixels, inside the clipped `dst`
+    /// (`scene::draw_command::visible`). Zero: the whole draw. A backend draws only inside
+    /// them, as one more scissor — the same pixels, less fill.
+    lx::rect2i visible[k_max_visible_rects]{};
+    unsigned visible_count = 0;
     /// A solid colour instead of a texture (`wp_single_pixel_buffer_v1`): `texture_id` is 0,
     /// `src` is ignored and every pixel of `dst` is `solid_color` — premultiplied and
     /// encoded like a texel, then tinted, faded and blended like one. No texture exists and

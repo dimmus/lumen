@@ -11,6 +11,7 @@ export module lx.gfx:vk_renderer;
 
 import std;
 
+import :damage;
 import :dmabuf;
 import :renderer;
 
@@ -118,9 +119,25 @@ public:
 
     void forget_texture(unsigned texture_id);
 
+    /// The whole of `target`: every pixel composited and encoded. Starts no chain: the
+    /// intermediate it leaves is not continued from (`composite_region`).
     [[nodiscard]] lx::result<composite_stats> composite(render_target& target, lx::color clear,
                                                          const blit_command* cmds,
                                                          unsigned count);
+    /// `gl_compositor::composite_region` for Vulkan: only `region` of `target` is written —
+    /// this frame's damage plus what `target` missed since it was last drawn (its buffer
+    /// age). The linear intermediate is persistent and holds the newest complete frame of a
+    /// chain: when `previous` is the target the chain's last frame went into, the composite
+    /// pass redraws only `changed` (what changed since that frame) into it, each rect
+    /// cleared and then drawn through, scissored to the rect, draws meeting no rect skipped.
+    /// Otherwise (the first frame, `previous` null, a new or resized intermediate, another
+    /// chain drew into it since, a failed frame) the composite pass covers the whole
+    /// target. A target this compositor has not written yet is encoded whole. Pixels are
+    /// those of a full repaint: each pixel sees the same clear and draws in the same order.
+    [[nodiscard]] lx::result<composite_stats>
+    composite_region(render_target& target, lx::color clear, const blit_command* cmds,
+                     unsigned count, const damage_region& region, const damage_region& changed,
+                     const render_target* previous);
 
     /// Transfer function the encode pass writes the scanout buffer in. sRGB for an ordinary
     /// display; PQ or HLG for an HDR one.
@@ -193,25 +210,41 @@ public:
         unsigned vk_format = 0;
         unsigned width = 0;
         unsigned height = 0;
+        /// Where the pass draws: the whole target, else `rects[0..rect_count)` — each one
+        /// begun with `begin_linear_rect`, then drawn through scissored to it.
+        bool full = true;
+        const lx::rect2i* rects = nullptr;
+        unsigned rect_count = 0;
     };
     /// `composite`'s set-up for `target` — the linear intermediate, the encode pipeline, the
     /// framebuffer, the solid texture when `cmds` has a solid draw — then waits for the frame
     /// slot, begins its command buffer and records the acquires of fresh imports. The caller
     /// records its work outside the pass (atlas copies), then `begin_linear_pass`, its draws
     /// (`record_blits` with `render_pass` for surfaces), then `end_linear_frame`; on an
-    /// error in between, `abandon_linear_frame`.
-    [[nodiscard]] lx::result<linear_frame> begin_linear_frame(render_target& target,
-                                                              const blit_command* cmds,
-                                                              unsigned count);
-    /// Begins the linear pass, cleared to `clear` (encoded, decoded here as `composite`
-    /// does), with the full-target viewport and scissor set.
+    /// error in between, `abandon_linear_frame`. `region`, `changed`, `previous`: as
+    /// `composite_region` (null `region`: the whole target, as `composite`).
+    [[nodiscard]] lx::result<linear_frame>
+    begin_linear_frame(render_target& target, const blit_command* cmds, unsigned count,
+                       const damage_region* region = nullptr,
+                       const damage_region* changed = nullptr,
+                       const render_target* previous = nullptr);
+    /// Begins the linear pass, with the full-target viewport and scissor set. A whole-target
+    /// pass is cleared to `clear` (encoded, decoded here as `composite` does); a damage pass
+    /// clears each rect as `begin_linear_rect` begins it.
     void begin_linear_pass(lx::color clear);
+    /// A damage pass (`linear_frame::full` false): scissors to `rect` and clears it to the
+    /// pass's clear colour. Draws for the rect follow. Nothing for a whole-target pass.
+    void begin_linear_rect(lx::rect2i rect);
     /// Ends the pass, records the encode pass into the target, ends and submits the command
     /// buffer as `composite` does (the out fence exported when the device can). On failure
     /// the frame is abandoned (its acquires un-marked) and nothing was submitted.
     [[nodiscard]] lx::result<composite_stats> end_linear_frame();
     /// Ends the command buffer unsubmitted and un-marks its acquires.
     void abandon_linear_frame();
+
+    /// Linear intermediates allocated so far. One per target size in use, kept across frames:
+    /// a test asserts that outputs of different sizes do not reallocate each other's.
+    [[nodiscard]] unsigned linear_allocations() const { return linear_allocations_; }
 
     /// Copy the target back into tightly packed RGBA8 for golden-image verification.
     /// Synchronous (it waits for the GPU): tests and one-off reads only, never per frame.
@@ -253,13 +286,40 @@ private:
         bool external_use = false;
     };
 
-    /// Creates or resizes the linear-light intermediate the composite pass renders into.
-    [[nodiscard]] lx::result<void> ensure_linear_target(unsigned width, unsigned height);
+    /// Makes `linear_` the linear-light intermediate of this size the composite pass renders
+    /// into: the one holding the frame encoded into `previous` (a VkImage) when there is one,
+    /// else one kept for this size that no chain continues from, else — for a `chained`
+    /// frame, while a slot is free — a new one (a second output of the same size), else
+    /// the least recently used of this size, else a new one (`linear_targets_`).
+    [[nodiscard]] lx::result<void> ensure_linear_target(unsigned width, unsigned height,
+                                                        const void* previous, bool chained);
+    /// After the ensure_* calls: where this frame's composite and encode passes draw
+    /// (`pass_*`, `encode_*`, see `composite_region`). The intermediate holds no complete
+    /// frame until the frame is submitted (`finish_frame`).
+    void plan_frame(const render_target& target, const damage_region* region,
+                    const damage_region* changed, const render_target* previous, bool chained);
+    /// After a successful submit: the target is written, and a chained frame's
+    /// intermediate holds it complete.
+    void finish_frame(const render_target& target);
+    /// Begins the composite pass on `command_buffer` per the plan: cleared whole, or loaded.
+    void begin_composite_pass(void* command_buffer, unsigned width, unsigned height,
+                              lx::color clear);
+    /// Records the encode pass into the current framebuffer per the plan.
+    void record_encode_pass(void* command_buffer, const render_target& target);
+    /// Inside a loaded composite pass: clears `rect` to the pass's clear colour and
+    /// scissors to it.
+    void clear_pass_rect(void* command_buffer, lx::rect2i rect);
+    /// `composite` (`chained` false: starts no chain) and `composite_region`.
+    [[nodiscard]] lx::result<composite_stats>
+    composite_frame(render_target& target, lx::color clear, const blit_command* cmds,
+                    unsigned count, const damage_region& region, const damage_region& changed,
+                    const render_target* previous, bool chained);
     /// Creates the encode pass and pipeline for a scanout format, reusing them while the
     /// format is unchanged. Recreated on a format change — switching an output between 8
     /// and 10 bits is rare, and caching one of each is not worth the bookkeeping.
     [[nodiscard]] lx::result<void> ensure_encode_pipeline(lx::pixel_format format);
-    void destroy_linear_target();
+    struct linear_target;
+    void destroy_linear_target(linear_target& t);
     void destroy_encode_pipeline();
 
     [[nodiscard]] int find_texture(unsigned id) const;
@@ -289,6 +349,8 @@ private:
     struct pass_pipeline {
         unsigned format = 0;
         void* pipeline = nullptr;
+        /// The same without blending, for `blend_mode::opaque` draws (`opaque_pipeline_`).
+        void* opaque_pipeline = nullptr;
     };
     pass_pipeline pass_pipelines_[k_pass_pipelines]{};
     /// Records the acquire of every imported image not yet acquired (outside a render pass).
@@ -315,6 +377,10 @@ private:
     vk_context ctx_{};
     void* render_pass_ = nullptr;
     void* pipeline_ = nullptr;
+    /// `pipeline_` with blending off, for `blend_mode::opaque` draws, as GL and CPU draw them:
+    /// a source of alpha 1 replaces the destination either way (src·1 + dst·0 is exact), so
+    /// the pixels are the same and the destination is not read.
+    void* opaque_pipeline_ = nullptr;
     void* pipeline_layout_ = nullptr;
     void* descriptor_layout_ = nullptr;
     void* descriptor_pool_ = nullptr;
@@ -339,24 +405,68 @@ private:
     struct framebuffer_slot {
         void* framebuffer = nullptr;
         void* image = nullptr;
+        /// A frame was submitted into it: what it holds outside a region is kept.
+        bool written = false;
     };
     framebuffer_slot framebuffers_[k_max_framebuffers]{};
     void* framebuffer_ = nullptr;
 
-    /// Linear-light intermediate. The composite pass blends into this; the encode pass
-    /// reads it and writes the scanout buffer.
-    void* linear_image_ = nullptr;
-    void* linear_memory_ = nullptr;
-    void* linear_view_ = nullptr;
-    void* linear_framebuffer_ = nullptr;
-    unsigned linear_width_ = 0;
-    unsigned linear_height_ = 0;
+    /// Linear-light intermediates. The composite pass blends into one; the encode pass reads
+    /// it and writes the scanout buffer. One per target size, so outputs of different sizes
+    /// sharing this compositor do not reallocate (and drain the GPU) every time they alternate;
+    /// an output's targets share one, which keeps its newest frame (`content`), and a second
+    /// output of the same size gets its own while a slot is free. Freed once unused for
+    /// `k_linear_idle_frames` frames (an output gone or resized); a fifth size evicts the least
+    /// recently used.
+    static constexpr unsigned k_linear_targets = 4;
+    static constexpr std::uint64_t k_linear_idle_frames = 600;
+    struct linear_target {
+        void* image = nullptr;
+        void* memory = nullptr;
+        void* view = nullptr;
+        void* framebuffer = nullptr;
+        /// The encode pass's set, pointed at `view`. Its own, allocated with the pool: a frame
+        /// in flight for one size must not see it re-pointed at another's.
+        void* encode_set = nullptr;
+        unsigned width = 0;
+        unsigned height = 0;
+        /// `linear_frame_` of the last frame drawn into it.
+        std::uint64_t last_used = 0;
+        /// The target (VkImage) the complete frame it holds was encoded into, by a chained
+        /// frame; null: nothing continues from it. Unique among the intermediates.
+        const void* content = nullptr;
+    };
+    linear_target linear_targets_[k_linear_targets]{};
+    /// The current frame's (`ensure_linear_target`).
+    linear_target* linear_ = nullptr;
+    std::uint64_t linear_frame_ = 0;
+    unsigned linear_allocations_ = 0;
+
+    /// The frame being recorded (`plan_frame`): the composite pass covers the whole target
+    /// or `pass_rects_`, the encode pass the whole target or `encode_rects_`. A chained
+    /// frame leaves its intermediate continuable (`linear_target::content`).
+    bool pass_full_ = true;
+    lx::rect2i pass_rects_[k_damage_rects]{};
+    unsigned pass_count_ = 0;
+    bool encode_full_ = true;
+    lx::rect2i encode_rects_[k_damage_rects]{};
+    unsigned encode_count_ = 0;
+    bool frame_chained_ = false;
+    /// The composite pass's clear value (linear light) for `begin_linear_rect`.
+    float pass_clear_[4]{};
+    /// The current framebuffer's `framebuffers_` entry.
+    unsigned framebuffer_index_ = 0;
+    /// The composite pass that loads the intermediate (SHADER_READ_ONLY_OPTIMAL in and
+    /// out), compatible with `render_pass_`: a damage frame's.
+    void* load_render_pass_ = nullptr;
 
     void* encode_render_pass_ = nullptr;
+    /// The encode pass that loads the target (GENERAL in and out), compatible with
+    /// `encode_render_pass_`: a region's.
+    void* encode_load_render_pass_ = nullptr;
     void* encode_pipeline_ = nullptr;
     void* encode_pipeline_layout_ = nullptr;
     void* encode_set_layout_ = nullptr;
-    void* encode_set_ = nullptr;
     lx::pixel_format encode_format_ = lx::pixel_format::xrgb8888;
     bool encode_ready_ = false;
 
@@ -461,6 +571,32 @@ constexpr VkFormat k_linear_format = VK_FORMAT_R16G16B16A16_SFLOAT;
 }
 
 constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_UNORM;
+
+/// The scissors a draw is recorded with: `scissor` (non-empty), or for a draw the
+/// visibility pass found partly covered (`blit_command::visible`) each visible rect ∩
+/// `scissor` that is not empty. Written to `out`; returns their count (0: nothing to draw).
+[[nodiscard]] unsigned visible_scissors(const lx::gfx::blit_command& cmd, lx::rect2i scissor,
+                                        VkRect2D out[lx::gfx::k_max_visible_rects]) {
+    const auto put = [](VkRect2D& r, int x0, int y0, int x1, int y1) {
+        r.offset = {x0, y0};
+        r.extent = {static_cast<unsigned>(x1 - x0), static_cast<unsigned>(y1 - y0)};
+    };
+    if (cmd.visible_count == 0) {
+        put(out[0], scissor.x, scissor.y, scissor.x + scissor.width, scissor.y + scissor.height);
+        return 1;
+    }
+    unsigned n = 0;
+    for (unsigned k = 0; k < cmd.visible_count && k < lx::gfx::k_max_visible_rects; ++k) {
+        const lx::rect2i& v = cmd.visible[k];
+        const int x0 = std::max(scissor.x, v.x);
+        const int y0 = std::max(scissor.y, v.y);
+        const int x1 = std::min(scissor.x + scissor.width, v.x + v.width);
+        const int y1 = std::min(scissor.y + scissor.height, v.y + v.height);
+        if (x1 > x0 && y1 > y0)
+            put(out[n++], x0, y0, x1, y1);
+    }
+    return n;
+}
 
 /// One blit's push constants: destination, the source box as a basis with its half-texel
 /// sampling bounds (`tex_w` × `tex_h`: the sampled texture; 0 for a solid draw), tint,
@@ -579,10 +715,12 @@ VkShaderModule create_shader(VkDevice dev, const uint32_t* code, std::size_t byt
     return module_handle;
 }
 
-/// The composite pipeline (composite.vert/.frag, premultiplied source-over, viewport and
-/// scissor dynamic) for `render_pass`'s one colour attachment. Null on failure.
+/// The composite pipeline (composite.vert/.frag, premultiplied source-over — or no blending
+/// when `blend` is false, for opaque draws — viewport and scissor dynamic) for
+/// `render_pass`'s one colour attachment. Null on failure.
 VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_layout,
-                                     VkRenderPass render_pass, VkPipelineCache cache) {
+                                     VkRenderPass render_pass, VkPipelineCache cache,
+                                     bool blend = true) {
     VkShaderModule vert = create_shader(dev, k_composite_vert_spv, sizeof(k_composite_vert_spv));
     VkShaderModule frag = create_shader(dev, k_composite_frag_spv, sizeof(k_composite_frag_spv));
     if (!vert || !frag) {
@@ -627,21 +765,21 @@ VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_lay
     multisample.sType = VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO;
     multisample.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
 
-    VkPipelineColorBlendAttachmentState blend{};
-    blend.blendEnable = VK_TRUE;
-    blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
-    blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend.colorBlendOp = VK_BLEND_OP_ADD;
-    blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
-    blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
-    blend.alphaBlendOp = VK_BLEND_OP_ADD;
-    blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
-                           VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendAttachmentState attachment_blend{};
+    attachment_blend.blendEnable = blend ? VK_TRUE : VK_FALSE;
+    attachment_blend.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    attachment_blend.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    attachment_blend.colorBlendOp = VK_BLEND_OP_ADD;
+    attachment_blend.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE;
+    attachment_blend.dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+    attachment_blend.alphaBlendOp = VK_BLEND_OP_ADD;
+    attachment_blend.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT |
+                                      VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
 
     VkPipelineColorBlendStateCreateInfo blend_state{};
     blend_state.sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO;
     blend_state.attachmentCount = 1;
-    blend_state.pAttachments = &blend;
+    blend_state.pAttachments = &attachment_blend;
 
     const VkDynamicState dynamic_states[2] = {VK_DYNAMIC_STATE_VIEWPORT,
                                               VK_DYNAMIC_STATE_SCISSOR};
@@ -988,17 +1126,41 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
     subpass.colorAttachmentCount = 1;
     subpass.pColorAttachments = &color_ref;
 
+    // The previous frame's encode pass may still be sampling this intermediate and its
+    // composite pass writing it: this frame's writes wait for both. Both composite passes
+    // carry it (render pass compatibility wants their dependencies identical).
+    VkSubpassDependency pass_dep{};
+    pass_dep.srcSubpass = VK_SUBPASS_EXTERNAL;
+    pass_dep.dstSubpass = 0;
+    pass_dep.srcStageMask =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
+    pass_dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+    pass_dep.dstStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    pass_dep.dstAccessMask =
+        VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+
     VkRenderPassCreateInfo rpci{};
     rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
     rpci.attachmentCount = 1;
     rpci.pAttachments = &color;
     rpci.subpassCount = 1;
     rpci.pSubpasses = &subpass;
+    rpci.dependencyCount = 1;
+    rpci.pDependencies = &pass_dep;
 
     VkRenderPass render_pass = VK_NULL_HANDLE;
     if (vkCreateRenderPass(dev, &rpci, nullptr, &render_pass) != VK_SUCCESS)
         return vk_error("vkCreateRenderPass failed");
     render_pass_ = render_pass;
+
+    // A damage frame's: the intermediate keeps the previous frame (LOAD), left readable by
+    // the pass before.
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.initialLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    VkRenderPass load_pass = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(dev, &rpci, nullptr, &load_pass) != VK_SUCCESS)
+        return vk_error("load vkCreateRenderPass failed");
+    load_render_pass_ = load_pass;
 
     VkSamplerCreateInfo sci{};
     sci.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -1034,12 +1196,12 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
     // create or destroy descriptor objects.
     VkDescriptorPoolSize pool_size{};
     pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    pool_size.descriptorCount = k_max_textures + 1;
+    pool_size.descriptorCount = k_max_textures + k_linear_targets;
 
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpci.maxSets = k_max_textures + 1; // +1 for the encode pass's own set
+    dpci.maxSets = k_max_textures + k_linear_targets; // + the encode pass's sets
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &pool_size;
 
@@ -1048,24 +1210,28 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
         return vk_error("vkCreateDescriptorPool failed");
     descriptor_pool_ = descriptor_pool;
 
-    // The encode pass samples one image — the linear intermediate — so it needs its own
-    // layout and a single set, allocated once here and re-pointed whenever the
-    // intermediate is resized.
+    // The encode pass samples one image — a linear intermediate — so it needs its own
+    // layout and one set per intermediate, allocated once here and pointed at it when the
+    // intermediate is made.
     VkDescriptorSetLayout encode_layout = VK_NULL_HANDLE;
     if (vkCreateDescriptorSetLayout(dev, &dlci, nullptr, &encode_layout) != VK_SUCCESS)
         return vk_error("encode vkCreateDescriptorSetLayout failed");
     encode_set_layout_ = encode_layout;
 
+    VkDescriptorSetLayout encode_layouts[k_linear_targets]{};
+    for (VkDescriptorSetLayout& l : encode_layouts)
+        l = encode_layout;
     VkDescriptorSetAllocateInfo dsai{};
     dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
     dsai.descriptorPool = descriptor_pool;
-    dsai.descriptorSetCount = 1;
-    dsai.pSetLayouts = &encode_layout;
+    dsai.descriptorSetCount = k_linear_targets;
+    dsai.pSetLayouts = encode_layouts;
 
-    VkDescriptorSet encode_set = VK_NULL_HANDLE;
-    if (vkAllocateDescriptorSets(dev, &dsai, &encode_set) != VK_SUCCESS)
+    VkDescriptorSet encode_sets[k_linear_targets]{};
+    if (vkAllocateDescriptorSets(dev, &dsai, encode_sets) != VK_SUCCESS)
         return vk_error("encode vkAllocateDescriptorSets failed");
-    encode_set_ = encode_set;
+    for (unsigned i = 0; i < k_linear_targets; ++i)
+        linear_targets_[i].encode_set = encode_sets[i];
 
     VkPushConstantRange push_range{};
     push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1089,6 +1255,11 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx) {
     if (!pipeline)
         return vk_error("composite pipeline creation failed");
     pipeline_ = pipeline;
+    VkPipeline opaque_pipeline =
+        create_composite_pipeline(dev, pipeline_layout, render_pass, VK_NULL_HANDLE, false);
+    if (!opaque_pipeline)
+        return vk_error("composite pipeline creation failed");
+    opaque_pipeline_ = opaque_pipeline;
 
     VkCommandBufferAllocateInfo cbai{};
     cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -1197,18 +1368,26 @@ void lx::gfx::vulkan_compositor::shutdown() {
             read_back_free(i);
 
         destroy_encode_pipeline();
-        destroy_linear_target();
+        for (linear_target& t : linear_targets_) {
+            destroy_linear_target(t);
+            t.encode_set = nullptr; // freed with the pool below
+        }
+        linear_ = nullptr;
         if (encode_set_layout_)
             vkDestroyDescriptorSetLayout(dev, static_cast<VkDescriptorSetLayout>(encode_set_layout_),
                                          nullptr);
         encode_set_layout_ = nullptr;
-        encode_set_ = nullptr; // freed with the pool below
 
-        for (pass_pipeline& p : pass_pipelines_)
+        for (pass_pipeline& p : pass_pipelines_) {
             if (p.pipeline)
                 vkDestroyPipeline(dev, static_cast<VkPipeline>(p.pipeline), nullptr);
+            if (p.opaque_pipeline)
+                vkDestroyPipeline(dev, static_cast<VkPipeline>(p.opaque_pipeline), nullptr);
+        }
         if (pipeline_)
             vkDestroyPipeline(dev, static_cast<VkPipeline>(pipeline_), nullptr);
+        if (opaque_pipeline_)
+            vkDestroyPipeline(dev, static_cast<VkPipeline>(opaque_pipeline_), nullptr);
         if (pipeline_layout_)
             vkDestroyPipelineLayout(dev, static_cast<VkPipelineLayout>(pipeline_layout_),
                                     nullptr);
@@ -1222,6 +1401,8 @@ void lx::gfx::vulkan_compositor::shutdown() {
             vkDestroySampler(dev, static_cast<VkSampler>(sampler_), nullptr);
         if (render_pass_)
             vkDestroyRenderPass(dev, static_cast<VkRenderPass>(render_pass_), nullptr);
+        if (load_render_pass_)
+            vkDestroyRenderPass(dev, static_cast<VkRenderPass>(load_render_pass_), nullptr);
     }
 #endif
     framebuffer_ = nullptr;
@@ -1238,6 +1419,7 @@ void lx::gfx::vulkan_compositor::shutdown() {
     staging_offset_ = 0;
     submit_slot_ = 0;
     pipeline_ = nullptr;
+    opaque_pipeline_ = nullptr;
     for (pass_pipeline& p : pass_pipelines_)
         p = {};
     pipeline_layout_ = nullptr;
@@ -1245,6 +1427,7 @@ void lx::gfx::vulkan_compositor::shutdown() {
     descriptor_layout_ = nullptr;
     sampler_ = nullptr;
     render_pass_ = nullptr;
+    load_render_pass_ = nullptr;
     ctx_ = {};
 }
 
@@ -1327,6 +1510,9 @@ lx::result<void> lx::gfx::vulkan_compositor::bind_imported(const imported_image&
     vci.format = image.format == static_cast<lx::fourcc>(lx::pixel_format::rgba8888)
                      ? VK_FORMAT_R8G8B8A8_UNORM
                      : VK_FORMAT_B8G8R8A8_UNORM;
+    // XRGB's fourth byte is undefined, not transparency: sample it as one, as GL does.
+    if (image.format == static_cast<lx::fourcc>(lx::pixel_format::xrgb8888))
+        vci.components.a = VK_COMPONENT_SWIZZLE_ONE;
     vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     vci.subresourceRange.levelCount = 1;
     vci.subresourceRange.layerCount = 1;
@@ -1676,12 +1862,15 @@ void lx::gfx::vulkan_compositor::destroy_encode_pipeline() {
                                 nullptr);
     if (encode_render_pass_)
         vkDestroyRenderPass(dev, static_cast<VkRenderPass>(encode_render_pass_), nullptr);
-    // encode_set_ comes from descriptor_pool_ and dies with it; encode_set_layout_ is
+    if (encode_load_render_pass_)
+        vkDestroyRenderPass(dev, static_cast<VkRenderPass>(encode_load_render_pass_), nullptr);
+    // The encode sets come from descriptor_pool_ and die with it; encode_set_layout_ is
     // destroyed in shutdown() alongside the other layouts.
 #endif
     encode_pipeline_ = nullptr;
     encode_pipeline_layout_ = nullptr;
     encode_render_pass_ = nullptr;
+    encode_load_render_pass_ = nullptr;
     encode_ready_ = false;
 }
 
@@ -1722,13 +1911,19 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_encode_pipeline(lx::pixel_fo
 
     // The composite pass writes the intermediate and this pass samples it. Without this
     // the read may be scheduled against a write that has not landed.
+    // The region pass also loads the target, ordered after its last write (a frame three
+    // back) or read (a capture's copy out of it); both passes carry the one dependency
+    // (render pass compatibility wants them identical).
     VkSubpassDependency dep{};
     dep.srcSubpass = VK_SUBPASS_EXTERNAL;
     dep.dstSubpass = 0;
-    dep.srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.srcStageMask =
+        VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     dep.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-    dep.dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
-    dep.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    dep.dstStageMask =
+        VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+    dep.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                        VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
 
     VkRenderPassCreateInfo rpci{};
     rpci.sType = VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO;
@@ -1743,6 +1938,14 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_encode_pipeline(lx::pixel_fo
     if (vkCreateRenderPass(dev, &rpci, nullptr, &pass) != VK_SUCCESS)
         return vk_error("encode vkCreateRenderPass failed");
     encode_render_pass_ = pass;
+
+    // A region's: the target keeps what it holds outside the region (LOAD from GENERAL).
+    color.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    color.initialLayout = VK_IMAGE_LAYOUT_GENERAL;
+    VkRenderPass load_pass = VK_NULL_HANDLE;
+    if (vkCreateRenderPass(dev, &rpci, nullptr, &load_pass) != VK_SUCCESS)
+        return vk_error("encode load vkCreateRenderPass failed");
+    encode_load_render_pass_ = load_pass;
 
     VkPushConstantRange push_range{};
     push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
@@ -1852,41 +2055,93 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_encode_pipeline(lx::pixel_fo
 #endif
 }
 
-void lx::gfx::vulkan_compositor::destroy_linear_target() {
+void lx::gfx::vulkan_compositor::destroy_linear_target(linear_target& t) {
 #if defined(LUMEN_HAS_VULKAN)
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev)
         return;
-    if (linear_framebuffer_)
-        vkDestroyFramebuffer(dev, static_cast<VkFramebuffer>(linear_framebuffer_), nullptr);
-    if (linear_view_)
-        vkDestroyImageView(dev, static_cast<VkImageView>(linear_view_), nullptr);
-    if (linear_image_)
-        vkDestroyImage(dev, static_cast<VkImage>(linear_image_), nullptr);
-    if (linear_memory_)
-        vkFreeMemory(dev, static_cast<VkDeviceMemory>(linear_memory_), nullptr);
+    if (t.framebuffer)
+        vkDestroyFramebuffer(dev, static_cast<VkFramebuffer>(t.framebuffer), nullptr);
+    if (t.view)
+        vkDestroyImageView(dev, static_cast<VkImageView>(t.view), nullptr);
+    if (t.image)
+        vkDestroyImage(dev, static_cast<VkImage>(t.image), nullptr);
+    if (t.memory)
+        vkFreeMemory(dev, static_cast<VkDeviceMemory>(t.memory), nullptr);
 #endif
-    linear_framebuffer_ = nullptr;
-    linear_view_ = nullptr;
-    linear_image_ = nullptr;
-    linear_memory_ = nullptr;
-    linear_width_ = 0;
-    linear_height_ = 0;
+    t.framebuffer = nullptr;
+    t.view = nullptr;
+    t.image = nullptr;
+    t.memory = nullptr;
+    t.width = 0;
+    t.height = 0;
+    t.last_used = 0;
+    t.content = nullptr;
 }
 
 lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width,
-                                                                  unsigned height) {
+                                                                  unsigned height,
+                                                                  const void* previous,
+                                                                  bool chained) {
 #if defined(LUMEN_HAS_VULKAN)
-    if (linear_image_ && linear_width_ == width && linear_height_ == height)
-        return {};
-
     auto dev = static_cast<VkDevice>(ctx_.device);
     if (!dev || !render_pass_ || width == 0 || height == 0)
         return lx::not_implemented("lx::gfx::vulkan_compositor::ensure_linear_target");
 
-    // Any in-flight frame may still be sampling the old one.
+    ++linear_frame_;
+    const auto idle = [this](const linear_target& t) {
+        return t.image && linear_frame_ - t.last_used > k_linear_idle_frames;
+    };
+    linear_target* found = nullptr;
+    linear_target* same = nullptr;
+    bool any_idle = false;
+    bool any_free = false;
+    for (linear_target& t : linear_targets_) {
+        if (t.image && t.width == width && t.height == height) {
+            if (previous && t.content == previous)
+                found = &t; // the chain's own
+            else if (!same || (same->content && !t.content) ||
+                     (!same->content == !t.content && t.last_used < same->last_used))
+                same = &t;
+        } else {
+            any_free = any_free || !t.image;
+            any_idle = any_idle || idle(t);
+        }
+    }
+    // Another chain's (an output of the same size): a chained frame takes a slot of its own
+    // while there is one, so both outputs keep continuing.
+    if (!found && same && (!chained || !same->content || !any_free))
+        found = same;
+    if (found && !any_idle) {
+        found->last_used = linear_frame_;
+        linear_ = found;
+        return {};
+    }
+
+    // Any in-flight frame may still be sampling what is freed or re-pointed below.
     wait_all_slots_idle();
-    destroy_linear_target();
+    // Unused for long: its output is gone or was resized.
+    for (linear_target& t : linear_targets_)
+        if (&t != found && idle(t))
+            destroy_linear_target(t);
+    if (found) {
+        found->last_used = linear_frame_;
+        linear_ = found;
+        return {};
+    }
+
+    // A size not kept: an empty slot, else the least recently used one.
+    linear_target* slot = &linear_targets_[0];
+    for (linear_target& t : linear_targets_) {
+        if (!t.image) {
+            slot = &t;
+            break;
+        }
+        if (t.last_used < slot->last_used)
+            slot = &t;
+    }
+    linear_target& t = *slot;
+    destroy_linear_target(t);
 
     VkImageCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -1904,9 +2159,11 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
     ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkImage image = VK_NULL_HANDLE;
-    if (vkCreateImage(dev, &ici, nullptr, &image) != VK_SUCCESS)
+    if (vkCreateImage(dev, &ici, nullptr, &image) != VK_SUCCESS) {
+        linear_ = nullptr;
         return vk_error("linear intermediate vkCreateImage failed");
-    linear_image_ = image;
+    }
+    t.image = image;
 
     VkMemoryRequirements req{};
     vkGetImageMemoryRequirements(dev, image, &req);
@@ -1925,7 +2182,8 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
         }
     }
     if (type_index == UINT32_MAX) {
-        destroy_linear_target();
+        destroy_linear_target(t);
+        linear_ = nullptr;
         return vk_error("no device-local memory type for the linear intermediate");
     }
 
@@ -1936,13 +2194,15 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
 
     VkDeviceMemory memory = VK_NULL_HANDLE;
     if (vkAllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS) {
-        destroy_linear_target();
+        destroy_linear_target(t);
+        linear_ = nullptr;
         return vk_error("linear intermediate vkAllocateMemory failed");
     }
-    linear_memory_ = memory;
+    t.memory = memory;
 
     if (vkBindImageMemory(dev, image, memory, 0) != VK_SUCCESS) {
-        destroy_linear_target();
+        destroy_linear_target(t);
+        linear_ = nullptr;
         return vk_error("linear intermediate vkBindImageMemory failed");
     }
 
@@ -1957,10 +2217,11 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
 
     VkImageView view = VK_NULL_HANDLE;
     if (vkCreateImageView(dev, &vci, nullptr, &view) != VK_SUCCESS) {
-        destroy_linear_target();
+        destroy_linear_target(t);
+        linear_ = nullptr;
         return vk_error("linear intermediate vkCreateImageView failed");
     }
-    linear_view_ = view;
+    t.view = view;
 
     VkFramebufferCreateInfo fbci{};
     fbci.sType = VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO;
@@ -1973,15 +2234,19 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
 
     VkFramebuffer fb = VK_NULL_HANDLE;
     if (vkCreateFramebuffer(dev, &fbci, nullptr, &fb) != VK_SUCCESS) {
-        destroy_linear_target();
+        destroy_linear_target(t);
+        linear_ = nullptr;
         return vk_error("linear intermediate vkCreateFramebuffer failed");
     }
-    linear_framebuffer_ = fb;
-    linear_width_ = width;
-    linear_height_ = height;
+    t.framebuffer = fb;
+    t.width = width;
+    t.height = height;
+    t.last_used = linear_frame_;
+    linear_ = &t;
+    ++linear_allocations_;
 
     // Point the encode pass's sampler at the new image.
-    if (encode_set_) {
+    if (t.encode_set) {
         VkDescriptorImageInfo info{};
         info.sampler = static_cast<VkSampler>(sampler_);
         info.imageView = view;
@@ -1989,7 +2254,7 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
 
         VkWriteDescriptorSet write{};
         write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write.dstSet = static_cast<VkDescriptorSet>(encode_set_);
+        write.dstSet = static_cast<VkDescriptorSet>(t.encode_set);
         write.dstBinding = 0;
         write.descriptorCount = 1;
         write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
@@ -2000,6 +2265,8 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_linear_target(unsigned width
 #else
     (void)width;
     (void)height;
+    (void)previous;
+    (void)chained;
     return lx::not_implemented("lx::gfx::vulkan_compositor::ensure_linear_target");
 #endif
 }
@@ -2016,6 +2283,7 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_framebuffer(const render_tar
     for (unsigned i = 0; i < k_max_framebuffers; ++i) {
         if (framebuffers_[i].framebuffer && framebuffers_[i].image == target.vk_image()) {
             framebuffer_ = framebuffers_[i].framebuffer;
+            framebuffer_index_ = i;
             return {};
         }
         if (!framebuffers_[i].framebuffer && free_slot < 0)
@@ -2045,6 +2313,7 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_framebuffer(const render_tar
         return vk_error("vkCreateFramebuffer failed");
     framebuffers_[static_cast<unsigned>(free_slot)] = {framebuffer, target.vk_image()};
     framebuffer_ = framebuffer;
+    framebuffer_index_ = static_cast<unsigned>(free_slot);
     return {};
 #else
     (void)target;
@@ -2052,17 +2321,226 @@ lx::result<void> lx::gfx::vulkan_compositor::ensure_framebuffer(const render_tar
 #endif
 }
 
+void lx::gfx::vulkan_compositor::plan_frame(const render_target& target,
+                                            const damage_region* region,
+                                            const damage_region* changed,
+                                            const render_target* previous, bool chained) {
+    const lx::rect2i bounds{0, 0, static_cast<int>(target.width()),
+                            static_cast<int>(target.height())};
+    // Rects of `d` inside the target; true when it is the whole target.
+    const auto fill = [&](const damage_region& d, lx::rect2i* out, unsigned& n) {
+        n = 0;
+        if (d.full)
+            return true;
+        for (unsigned i = 0; i < d.count; ++i) {
+            const lx::rect2i r = detail::damage_intersect(d.rects[i], bounds);
+            if (detail::damage_rect_empty(r))
+                continue;
+            if (r.width == bounds.width && r.height == bounds.height)
+                return true;
+            out[n++] = r;
+        }
+        return false;
+    };
+    const bool continues = region && changed && previous && linear_->content &&
+                           linear_->content == previous->vk_image();
+    pass_full_ = !continues || fill(*changed, pass_rects_, pass_count_);
+    if (pass_full_)
+        pass_count_ = 0;
+    encode_full_ = !region || !framebuffers_[framebuffer_index_].written;
+    if (!encode_full_) {
+        // What the composite pass changes is encoded too, whatever the caller's region says.
+        damage_region encode = *region;
+        if (changed)
+            encode.add_region(*changed);
+        encode_full_ = fill(encode, encode_rects_, encode_count_);
+    }
+    if (encode_full_)
+        encode_count_ = 0;
+    frame_chained_ = chained;
+    // Until this frame is submitted, nothing continues from what the intermediate holds.
+    linear_->content = nullptr;
+}
+
+void lx::gfx::vulkan_compositor::finish_frame(const render_target& target) {
+    framebuffers_[framebuffer_index_].written = true;
+    if (!frame_chained_ || !linear_)
+        return;
+    // One intermediate per target: an older one naming it (a handle reused) is stale.
+    for (linear_target& t : linear_targets_)
+        if (t.content == target.vk_image())
+            t.content = nullptr;
+    linear_->content = target.vk_image();
+}
+
+void lx::gfx::vulkan_compositor::begin_composite_pass(void* command_buffer, unsigned width,
+                                                      unsigned height, lx::color clear) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    // The attachment holds linear light, so the clear colour has to be decoded too —
+    // clearing with the encoded value would make the background the wrong brightness.
+    VkClearValue clear_value{};
+    clear_value.color = {{lx::to_linear(clear.r, clear.encoding),
+                          lx::to_linear(clear.g, clear.encoding),
+                          lx::to_linear(clear.b, clear.encoding), clear.a}};
+    for (unsigned i = 0; i < 4; ++i)
+        pass_clear_[i] = clear_value.color.float32[i];
+
+    VkRenderPassBeginInfo rpbi{};
+    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    rpbi.framebuffer = static_cast<VkFramebuffer>(linear_->framebuffer);
+    if (pass_full_) {
+        rpbi.renderPass = static_cast<VkRenderPass>(render_pass_);
+        rpbi.renderArea.extent = {width, height};
+        rpbi.clearValueCount = 1;
+        rpbi.pClearValues = &clear_value;
+    } else {
+        // Loaded: the rects are cleared one by one as they are drawn (`clear_pass_rect`).
+        // No rect (nothing changed): an empty pass over one pixel.
+        damage_region area{};
+        for (unsigned i = 0; i < pass_count_; ++i)
+            area.rects[area.count++] = pass_rects_[i];
+        const lx::rect2i box = pass_count_ > 0 ? area.bounds() : lx::rect2i{0, 0, 1, 1};
+        rpbi.renderPass = static_cast<VkRenderPass>(load_render_pass_);
+        rpbi.renderArea.offset = {box.x, box.y};
+        rpbi.renderArea.extent = {static_cast<unsigned>(box.width),
+                                  static_cast<unsigned>(box.height)};
+    }
+    vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(width);
+    viewport.height = static_cast<float>(height);
+    viewport.maxDepth = 1.f;
+    vkCmdSetViewport(cb, 0, 1, &viewport);
+    VkRect2D scissor{};
+    scissor.extent = {width, height};
+    vkCmdSetScissor(cb, 0, 1, &scissor);
+#else
+    (void)command_buffer;
+    (void)width;
+    (void)height;
+    (void)clear;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::clear_pass_rect(void* command_buffer, lx::rect2i rect) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    VkClearAttachment ca{};
+    ca.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    ca.colorAttachment = 0;
+    for (unsigned i = 0; i < 4; ++i)
+        ca.clearValue.color.float32[i] = pass_clear_[i];
+    VkClearRect cr{};
+    cr.rect.offset = {rect.x, rect.y};
+    cr.rect.extent = {static_cast<unsigned>(rect.width), static_cast<unsigned>(rect.height)};
+    cr.layerCount = 1;
+    vkCmdClearAttachments(cb, 1, &ca, 1, &cr);
+    vkCmdSetScissor(cb, 0, 1, &cr.rect);
+#else
+    (void)command_buffer;
+    (void)rect;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::record_encode_pass(void* command_buffer,
+                                                    const render_target& target) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    // ── Encode pass ────────────────────────────────────────────────────────────────
+    //
+    // The composite pass left the intermediate holding blended linear light, already in
+    // SHADER_READ_ONLY_OPTIMAL via its final layout. This converts it into the display's
+    // transfer function and writes the scanout buffer. A fullscreen triangle, no blending,
+    // and the render pass's subpass dependency orders the sample after the write. A region
+    // is the same triangle once per rect, scissored to it, over a target that keeps the
+    // rest (loaded).
+    if (!encode_full_ && encode_count_ == 0)
+        return; // nothing of the target to write
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    VkRenderPassBeginInfo encode_rpbi{};
+    encode_rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+    encode_rpbi.framebuffer = static_cast<VkFramebuffer>(framebuffer_);
+    if (encode_full_) {
+        encode_rpbi.renderPass = static_cast<VkRenderPass>(encode_render_pass_);
+        encode_rpbi.renderArea.extent = {target.width(), target.height()};
+    } else {
+        damage_region area{};
+        for (unsigned i = 0; i < encode_count_; ++i)
+            area.rects[area.count++] = encode_rects_[i];
+        const lx::rect2i box = area.bounds();
+        encode_rpbi.renderPass = static_cast<VkRenderPass>(encode_load_render_pass_);
+        encode_rpbi.renderArea.offset = {box.x, box.y};
+        encode_rpbi.renderArea.extent = {static_cast<unsigned>(box.width),
+                                         static_cast<unsigned>(box.height)};
+    }
+    vkCmdBeginRenderPass(cb, &encode_rpbi, VK_SUBPASS_CONTENTS_INLINE);
+
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(target.width());
+    viewport.height = static_cast<float>(target.height());
+    viewport.maxDepth = 1.f;
+    vkCmdSetViewport(cb, 0, 1, &viewport);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      static_cast<VkPipeline>(encode_pipeline_));
+    auto encode_set = static_cast<VkDescriptorSet>(linear_->encode_set);
+    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                            static_cast<VkPipelineLayout>(encode_pipeline_layout_), 0, 1,
+                            &encode_set, 0, nullptr);
+    encode_push epush{};
+    epush.transfer = transfer_slot(output_transfer_);
+    vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(encode_pipeline_layout_),
+                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(epush), &epush);
+    const unsigned passes = encode_full_ ? 1u : encode_count_;
+    for (unsigned i = 0; i < passes; ++i) {
+        VkRect2D scissor{};
+        if (encode_full_) {
+            scissor.extent = {target.width(), target.height()};
+        } else {
+            const lx::rect2i r = encode_rects_[i];
+            scissor.offset = {r.x, r.y};
+            scissor.extent = {static_cast<unsigned>(r.width), static_cast<unsigned>(r.height)};
+        }
+        vkCmdSetScissor(cb, 0, 1, &scissor);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+    }
+    vkCmdEndRenderPass(cb);
+#else
+    (void)command_buffer;
+    (void)target;
+#endif
+}
+
 lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
     render_target& target, lx::color clear, const blit_command* cmds, unsigned count) {
+    damage_region all{};
+    all.set_full();
+    return composite_frame(target, clear, cmds, count, all, all, nullptr, false);
+}
+
+lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_region(
+    render_target& target, lx::color clear, const blit_command* cmds, unsigned count,
+    const damage_region& region, const damage_region& changed, const render_target* previous) {
+    return composite_frame(target, clear, cmds, count, region, changed, previous, true);
+}
+
+lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame(
+    render_target& target, lx::color clear, const blit_command* cmds, unsigned count,
+    const damage_region& region, const damage_region& changed, const render_target* previous,
+    bool chained) {
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::composite");
     if (!target.valid()) {
         return lx::invalid_argument("composite into an invalid render target");
     }
+    if (region.empty() && changed.empty())
+        return composite_stats{};
     // Composite renders into a linear-light intermediate; a second pass encodes that into
     // the scanout buffer. Both are sized to the target and rebuilt only when it changes.
-    if (auto linear = ensure_linear_target(target.width(), target.height()); !linear)
+    if (auto linear = ensure_linear_target(target.width(), target.height(),
+                                           previous ? previous->vk_image() : nullptr, chained);
+        !linear)
         return linear.get_error();
     if (auto encode = ensure_encode_pipeline(target.format()); !encode)
         return encode.get_error();
@@ -2080,6 +2558,8 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
         return vk_error("vkWaitForFences timed out reclaiming composite slot");
     vkResetFences(static_cast<VkDevice>(ctx_.device), 1, &fence);
 
+    plan_frame(target, &region, &changed, previous, chained);
+
     auto cb = static_cast<VkCommandBuffer>(command_buffers_[slot]);
     vkResetCommandBuffer(cb, 0);
 
@@ -2089,143 +2569,119 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite(
     vkBeginCommandBuffer(cb, &begin);
 
     record_acquires(cb);
-
-    // The attachment holds linear light, so the clear colour has to be decoded too —
-    // clearing with the encoded value would make the background the wrong brightness.
-    VkClearValue clear_value{};
-    clear_value.color = {{lx::to_linear(clear.r, clear.encoding),
-                          lx::to_linear(clear.g, clear.encoding),
-                          lx::to_linear(clear.b, clear.encoding), clear.a}};
-
-    VkRenderPassBeginInfo rpbi{};
-    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpbi.renderPass = static_cast<VkRenderPass>(render_pass_);
-    rpbi.framebuffer = static_cast<VkFramebuffer>(linear_framebuffer_);
-    rpbi.renderArea.extent = {target.width(), target.height()};
-    rpbi.clearValueCount = 1;
-    rpbi.pClearValues = &clear_value;
-    vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-
-    VkViewport viewport{};
-    viewport.width = static_cast<float>(target.width());
-    viewport.height = static_cast<float>(target.height());
-    viewport.maxDepth = 1.f;
-    vkCmdSetViewport(cb, 0, 1, &viewport);
-
-    VkRect2D scissor{};
-    scissor.extent = {target.width(), target.height()};
-    vkCmdSetScissor(cb, 0, 1, &scissor);
-
+    begin_composite_pass(cb, target.width(), target.height(), clear);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, static_cast<VkPipeline>(pipeline_));
+    void* bound_pipeline = pipeline_;
 
+    const int max_x = static_cast<int>(target.width());
+    const int max_y = static_cast<int>(target.height());
     composite_stats stats{};
     void* bound_set = nullptr;
-    for (unsigned i = 0; i < count && cmds; ++i) {
-        const auto& cmd = cmds[i];
-        if (cmd.occluded || draw_invisible(cmd)) {
-            ++stats.draws_culled;
-            continue;
-        }
-        // A solid draw samples nothing: any set will do, the frame's current one first.
-        const int index =
-            find_texture(cmd.solid ? (bound_set ? 0u : k_solid_texture_id) : cmd.texture_id);
-        if (index < 0 && !(cmd.solid && bound_set)) {
-            ++stats.draws_skipped;
-            continue;
-        }
-        const texture_slot* slot_ptr =
-            index >= 0 && !cmd.solid ? &textures_[static_cast<unsigned>(index)] : nullptr;
-        void* want_set = index >= 0 ? textures_[static_cast<unsigned>(index)].descriptor_set
-                                    : bound_set;
-        if (!want_set) {
-            ++stats.draws_skipped;
-            continue;
-        }
-        if (want_set != bound_set) {
-            auto set = static_cast<VkDescriptorSet>(want_set);
-            vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                    static_cast<VkPipelineLayout>(pipeline_layout_), 0, 1, &set,
-                                    0, nullptr);
-            bound_set = want_set;
-        }
+    // One pass over the draws per rect (the whole target: one), each rect cleared first —
+    // so rects that overlap redraw their overlap from the clear, never blend it twice.
+    const unsigned passes = pass_full_ ? 1u : pass_count_;
+    for (unsigned pass = 0; pass < passes; ++pass) {
+        const lx::rect2i area = pass_full_ ? lx::rect2i{0, 0, max_x, max_y} : pass_rects_[pass];
+        if (!pass_full_)
+            clear_pass_rect(cb, area);
+        for (unsigned i = 0; i < count && cmds; ++i) {
+            const auto& cmd = cmds[i];
+            if (cmd.occluded || draw_invisible(cmd)) {
+                ++stats.draws_culled;
+                continue;
+            }
+            // A solid draw samples nothing: any set will do, the frame's current one first.
+            const int index =
+                find_texture(cmd.solid ? (bound_set ? 0u : k_solid_texture_id) : cmd.texture_id);
+            if (index < 0 && !(cmd.solid && bound_set)) {
+                ++stats.draws_skipped;
+                continue;
+            }
+            const texture_slot* slot_ptr =
+                index >= 0 && !cmd.solid ? &textures_[static_cast<unsigned>(index)] : nullptr;
+            void* want_set = index >= 0 ? textures_[static_cast<unsigned>(index)].descriptor_set
+                                        : bound_set;
+            if (!want_set) {
+                ++stats.draws_skipped;
+                continue;
+            }
 
-        // Clip is a scissor, which costs nothing extra here — the pipeline already
-        // declares scissor as dynamic state. An empty clip means unclipped.
-        VkRect2D draw_scissor = scissor;
-        if (cmd.clip.width > 0 && cmd.clip.height > 0) {
-            const int x0 = cmd.clip.x > 0 ? cmd.clip.x : 0;
-            const int y0 = cmd.clip.y > 0 ? cmd.clip.y : 0;
-            const int x1 = cmd.clip.x + cmd.clip.width;
-            const int y1 = cmd.clip.y + cmd.clip.height;
-            const int max_x = static_cast<int>(target.width());
-            const int max_y = static_cast<int>(target.height());
-            const int cx1 = x1 < max_x ? x1 : max_x;
-            const int cy1 = y1 < max_y ? y1 : max_y;
-            if (cx1 <= x0 || cy1 <= y0) {
+            // Clip is a scissor, which costs nothing extra here — the pipeline already
+            // declares scissor as dynamic state. An empty clip means unclipped. A damage
+            // rect is one more scissor, and a draw whose quad (exactly `dst`) misses it is
+            // not recorded.
+            int x0 = area.x;
+            int y0 = area.y;
+            int x1 = area.x + area.width;
+            int y1 = area.y + area.height;
+            if (cmd.clip.width > 0 && cmd.clip.height > 0) {
+                x0 = std::max(x0, cmd.clip.x);
+                y0 = std::max(y0, cmd.clip.y);
+                x1 = std::min(x1, cmd.clip.x + cmd.clip.width);
+                y1 = std::min(y1, cmd.clip.y + cmd.clip.height);
+            }
+            if (x1 <= x0 || y1 <= y0 ||
+                (!pass_full_ &&
+                 (std::max(x0, cmd.dst.x) >= std::min(x1, cmd.dst.x + cmd.dst.width) ||
+                  std::max(y0, cmd.dst.y) >= std::min(y1, cmd.dst.y + cmd.dst.height)))) {
                 ++stats.draws_culled;
                 continue; // clipped away entirely
             }
-            draw_scissor.offset = {x0, y0};
-            draw_scissor.extent = {static_cast<unsigned>(cx1 - x0),
-                                   static_cast<unsigned>(cy1 - y0)};
+            // Partly covered (the visibility pass): one scissored draw per visible rect.
+            VkRect2D parts[k_max_visible_rects]{};
+            const unsigned part_count = visible_scissors(cmd, {x0, y0, x1 - x0, y1 - y0}, parts);
+            if (part_count == 0) {
+                ++stats.draws_culled;
+                continue;
+            }
+            if (want_set != bound_set) {
+                auto set = static_cast<VkDescriptorSet>(want_set);
+                vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                        static_cast<VkPipelineLayout>(pipeline_layout_), 0, 1,
+                                        &set, 0, nullptr);
+                bound_set = want_set;
+            }
+            // Bound sets, push constants and dynamic state survive the switch: one layout.
+            void* want_pipeline =
+                cmd.blend == lx::blend_mode::opaque ? opaque_pipeline_ : pipeline_;
+            if (want_pipeline != bound_pipeline) {
+                vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                  static_cast<VkPipeline>(want_pipeline));
+                bound_pipeline = want_pipeline;
+            }
+            const quad_push push = make_quad_push(
+                cmd, slot_ptr ? slot_ptr->width : 0u, slot_ptr ? slot_ptr->height : 0u,
+                target.width(), target.height(), transfer_slot(cmd.src_transfer));
+
+            vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(push), &push);
+
+            for (unsigned p = 0; p < part_count; ++p) {
+                vkCmdSetScissor(cb, 0, 1, &parts[p]);
+                vkCmdDraw(cb, 6, 1, 0, 0);
+            }
+            ++stats.draws_submitted;
         }
-        vkCmdSetScissor(cb, 0, 1, &draw_scissor);
-
-        const quad_push push =
-            make_quad_push(cmd, slot_ptr ? slot_ptr->width : 0u, slot_ptr ? slot_ptr->height : 0u,
-                           target.width(), target.height(), transfer_slot(cmd.src_transfer));
-
-        vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof(push), &push);
-
-        vkCmdDraw(cb, 6, 1, 0, 0);
-        ++stats.draws_submitted;
     }
 
     vkCmdEndRenderPass(cb);
-
-    // ── Encode pass ────────────────────────────────────────────────────────────────
-    //
-    // The composite pass left the intermediate holding blended linear light, already in
-    // SHADER_READ_ONLY_OPTIMAL via its final layout. This converts it into the display's
-    // transfer function and writes the scanout buffer. A fullscreen triangle, no blending,
-    // and the render pass's subpass dependency orders the sample after the write.
-    VkRenderPassBeginInfo encode_rpbi{};
-    encode_rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    encode_rpbi.renderPass = static_cast<VkRenderPass>(encode_render_pass_);
-    encode_rpbi.framebuffer = static_cast<VkFramebuffer>(framebuffer_);
-    encode_rpbi.renderArea.extent = {target.width(), target.height()};
-    vkCmdBeginRenderPass(cb, &encode_rpbi, VK_SUBPASS_CONTENTS_INLINE);
-
-    vkCmdSetViewport(cb, 0, 1, &viewport);
-    vkCmdSetScissor(cb, 0, 1, &scissor);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      static_cast<VkPipeline>(encode_pipeline_));
-
-    auto encode_set = static_cast<VkDescriptorSet>(encode_set_);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            static_cast<VkPipelineLayout>(encode_pipeline_layout_), 0, 1,
-                            &encode_set, 0, nullptr);
-
-    encode_push epush{};
-    epush.transfer = transfer_slot(output_transfer_);
-    vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(encode_pipeline_layout_),
-                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(epush), &epush);
-
-    vkCmdDraw(cb, 3, 1, 0, 0);
-    vkCmdEndRenderPass(cb);
-
+    record_encode_pass(cb, target);
     vkEndCommandBuffer(cb);
 
     if (auto submitted = submit_current_slot(true, &stats.out_fence_fd); !submitted)
         return submitted.get_error();
+    finish_frame(target);
     return stats;
 #else
     (void)target;
     (void)clear;
     (void)cmds;
     (void)count;
+    (void)region;
+    (void)changed;
+    (void)previous;
+    (void)chained;
     return lx::not_implemented("lx::gfx::vulkan_compositor::composite");
 #endif
 }
@@ -2315,9 +2771,12 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
     // The pipeline for this attachment format, made once; this compositor's own linear pass
     // draws with its composite pipeline.
     void* pipeline = render_pass == render_pass_ ? pipeline_ : nullptr;
+    void* opaque_pipeline = render_pass == render_pass_ ? opaque_pipeline_ : nullptr;
     for (const pass_pipeline& p : pass_pipelines_)
-        if (!pipeline && p.pipeline && p.format == vk_format)
+        if (!pipeline && p.pipeline && p.format == vk_format) {
             pipeline = p.pipeline;
+            opaque_pipeline = p.opaque_pipeline;
+        }
     // Another command buffer than this compositor's frame: its textures are marked as an
     // external user's until the users are waited for.
     const bool external = command_buffer != linear_cb_;
@@ -2325,8 +2784,16 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
         VkPipeline made = create_composite_pipeline(
             dev, static_cast<VkPipelineLayout>(pipeline_layout_),
             static_cast<VkRenderPass>(render_pass), static_cast<VkPipelineCache>(pipeline_cache));
-        if (!made)
+        VkPipeline made_opaque =
+            made ? create_composite_pipeline(dev, static_cast<VkPipelineLayout>(pipeline_layout_),
+                                             static_cast<VkRenderPass>(render_pass),
+                                             static_cast<VkPipelineCache>(pipeline_cache), false)
+                 : VK_NULL_HANDLE;
+        if (!made_opaque) {
+            if (made)
+                vkDestroyPipeline(dev, made, nullptr);
             return vk_error("record_blits pipeline creation failed");
+        }
         unsigned slot = 0;
         while (slot < k_pass_pipelines && pass_pipelines_[slot].pipeline)
             ++slot;
@@ -2334,15 +2801,19 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
             // Evicted: whatever recorded it may still be in flight.
             (void)vkDeviceWaitIdle(dev);
             vkDestroyPipeline(dev, static_cast<VkPipeline>(pass_pipelines_[0].pipeline), nullptr);
+            vkDestroyPipeline(dev, static_cast<VkPipeline>(pass_pipelines_[0].opaque_pipeline),
+                              nullptr);
             slot = 0;
         }
-        pass_pipelines_[slot] = {vk_format, made};
+        pass_pipelines_[slot] = {vk_format, made, made_opaque};
         pipeline = made;
+        opaque_pipeline = made_opaque;
     }
 
     composite_stats stats{};
     auto cb = static_cast<VkCommandBuffer>(command_buffer);
     vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, static_cast<VkPipeline>(pipeline));
+    void* bound_pipeline = pipeline;
     VkViewport viewport{};
     viewport.width = static_cast<float>(width);
     viewport.height = static_cast<float>(height);
@@ -2388,6 +2859,13 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
             ++stats.draws_culled;
             continue;
         }
+        // As `composite`: one scissored draw per visible rect of a partly covered draw.
+        VkRect2D parts[k_max_visible_rects]{};
+        const unsigned part_count = visible_scissors(cmd, clip, parts);
+        if (part_count == 0) {
+            ++stats.draws_culled;
+            continue;
+        }
         if (want_set != bound_set) {
             auto set = static_cast<VkDescriptorSet>(want_set);
             vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -2397,10 +2875,13 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
         }
         if (external && index >= 0)
             textures_[static_cast<unsigned>(index)].external_use = true;
-        VkRect2D rect{};
-        rect.offset = {clip.x, clip.y};
-        rect.extent = {static_cast<unsigned>(clip.width), static_cast<unsigned>(clip.height)};
-        vkCmdSetScissor(cb, 0, 1, &rect);
+        // As `composite`: opaque draws without blending, sets and push ranges kept bound.
+        void* want_pipeline = cmd.blend == lx::blend_mode::opaque ? opaque_pipeline : pipeline;
+        if (want_pipeline != bound_pipeline) {
+            vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                              static_cast<VkPipeline>(want_pipeline));
+            bound_pipeline = want_pipeline;
+        }
         // Encoded target: transfer slot 0 ("linear") is the identity — the texel's encoded
         // values blend as they are.
         const quad_push push =
@@ -2409,7 +2890,10 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
         vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
                            VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
                            sizeof(push), &push);
-        vkCmdDraw(cb, 6, 1, 0, 0);
+        for (unsigned p = 0; p < part_count; ++p) {
+            vkCmdSetScissor(cb, 0, 1, &parts[p]);
+            vkCmdDraw(cb, 6, 1, 0, 0);
+        }
         ++stats.draws_submitted;
     }
     return stats;
@@ -2430,7 +2914,9 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
 
 lx::result<lx::gfx::vulkan_compositor::linear_frame>
 lx::gfx::vulkan_compositor::begin_linear_frame(render_target& target, const blit_command* cmds,
-                                               unsigned count) {
+                                               unsigned count, const damage_region* region,
+                                               const damage_region* changed,
+                                               const render_target* previous) {
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::begin_linear_frame");
@@ -2440,8 +2926,11 @@ lx::gfx::vulkan_compositor::begin_linear_frame(render_target& target, const blit
         abandon_linear_frame(); // a frame begun and never ended: dropped
     // As `composite`: the intermediate, the encode pipeline and the framebuffer, rebuilt only
     // when the target changes; the solid texture before the slot is taken (it is an upload of
-    // its own).
-    if (auto linear = ensure_linear_target(target.width(), target.height()); !linear)
+    // its own). A region makes the frame part of a chain, as `composite_region`.
+    if (auto linear = ensure_linear_target(target.width(), target.height(),
+                                           previous ? previous->vk_image() : nullptr,
+                                           region != nullptr);
+        !linear)
         return linear.get_error();
     if (auto encode = ensure_encode_pipeline(target.format()); !encode)
         return encode.get_error();
@@ -2464,6 +2953,10 @@ lx::gfx::vulkan_compositor::begin_linear_frame(render_target& target, const blit
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS)
         return vk_error("vkBeginCommandBuffer failed");
+    damage_region all{};
+    all.set_full();
+    plan_frame(target, region ? region : &all, region ? changed : nullptr, previous,
+               region != nullptr);
     linear_cb_ = cb;
     linear_target_ = &target;
     linear_pass_open_ = false;
@@ -2474,11 +2967,17 @@ lx::gfx::vulkan_compositor::begin_linear_frame(render_target& target, const blit
     f.vk_format = static_cast<unsigned>(k_linear_format);
     f.width = target.width();
     f.height = target.height();
+    f.full = pass_full_;
+    f.rects = pass_rects_;
+    f.rect_count = pass_count_;
     return f;
 #else
     (void)target;
     (void)cmds;
     (void)count;
+    (void)region;
+    (void)changed;
+    (void)previous;
     return lx::not_implemented("lx::gfx::vulkan_compositor::begin_linear_frame");
 #endif
 }
@@ -2487,34 +2986,18 @@ void lx::gfx::vulkan_compositor::begin_linear_pass(lx::color clear) {
 #if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
     if (!linear_cb_ || !linear_target_ || linear_pass_open_)
         return;
-    auto cb = static_cast<VkCommandBuffer>(linear_cb_);
-    const unsigned w = linear_target_->width();
-    const unsigned h = linear_target_->height();
     // As `composite`: the attachment holds linear light, so the clear is decoded.
-    VkClearValue clear_value{};
-    clear_value.color = {{lx::to_linear(clear.r, clear.encoding),
-                          lx::to_linear(clear.g, clear.encoding),
-                          lx::to_linear(clear.b, clear.encoding), clear.a}};
-    VkRenderPassBeginInfo rpbi{};
-    rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    rpbi.renderPass = static_cast<VkRenderPass>(render_pass_);
-    rpbi.framebuffer = static_cast<VkFramebuffer>(linear_framebuffer_);
-    rpbi.renderArea.extent = {w, h};
-    rpbi.clearValueCount = 1;
-    rpbi.pClearValues = &clear_value;
-    vkCmdBeginRenderPass(cb, &rpbi, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport viewport{};
-    viewport.width = static_cast<float>(w);
-    viewport.height = static_cast<float>(h);
-    viewport.maxDepth = 1.f;
-    vkCmdSetViewport(cb, 0, 1, &viewport);
-    VkRect2D scissor{};
-    scissor.extent = {w, h};
-    vkCmdSetScissor(cb, 0, 1, &scissor);
+    begin_composite_pass(linear_cb_, linear_target_->width(), linear_target_->height(), clear);
     linear_pass_open_ = true;
 #else
     (void)clear;
 #endif
+}
+
+void lx::gfx::vulkan_compositor::begin_linear_rect(lx::rect2i rect) {
+    if (!linear_cb_ || !linear_pass_open_ || pass_full_)
+        return;
+    clear_pass_rect(linear_cb_, rect);
 }
 
 lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_frame() {
@@ -2530,32 +3013,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_fram
 
     // The encode pass, as `composite` records it: the intermediate (left in
     // SHADER_READ_ONLY_OPTIMAL by the pass) into the scanout target's transfer function.
-    VkRenderPassBeginInfo encode_rpbi{};
-    encode_rpbi.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-    encode_rpbi.renderPass = static_cast<VkRenderPass>(encode_render_pass_);
-    encode_rpbi.framebuffer = static_cast<VkFramebuffer>(framebuffer_);
-    encode_rpbi.renderArea.extent = {target.width(), target.height()};
-    vkCmdBeginRenderPass(cb, &encode_rpbi, VK_SUBPASS_CONTENTS_INLINE);
-    VkViewport viewport{};
-    viewport.width = static_cast<float>(target.width());
-    viewport.height = static_cast<float>(target.height());
-    viewport.maxDepth = 1.f;
-    vkCmdSetViewport(cb, 0, 1, &viewport);
-    VkRect2D scissor{};
-    scissor.extent = {target.width(), target.height()};
-    vkCmdSetScissor(cb, 0, 1, &scissor);
-    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                      static_cast<VkPipeline>(encode_pipeline_));
-    auto encode_set = static_cast<VkDescriptorSet>(encode_set_);
-    vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                            static_cast<VkPipelineLayout>(encode_pipeline_layout_), 0, 1,
-                            &encode_set, 0, nullptr);
-    encode_push epush{};
-    epush.transfer = transfer_slot(output_transfer_);
-    vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(encode_pipeline_layout_),
-                       VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(epush), &epush);
-    vkCmdDraw(cb, 3, 1, 0, 0);
-    vkCmdEndRenderPass(cb);
+    record_encode_pass(cb, target);
 
     linear_cb_ = nullptr;
     linear_target_ = nullptr;
@@ -2575,6 +3033,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_fram
         return submitted.get_error();
     }
     acquired_count_ = 0;
+    finish_frame(target);
     return stats;
 #else
     return lx::not_implemented("lx::gfx::vulkan_compositor::end_linear_frame");

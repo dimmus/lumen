@@ -771,6 +771,93 @@ lx::gfx::blit_command solid_cmd(lx::rect2i dst, lx::color c, float opacity = 1.f
 }
 } // namespace
 
+// ── Visible rects (`blit_command::visible`): fewer fragments, the same pixels ────
+
+namespace {
+
+/// Premultiplied RGBA gradient bytes, translucent ones with alpha rising left to right.
+std::vector<unsigned char> gradient(unsigned w, unsigned h, unsigned seed, bool translucent) {
+    std::vector<unsigned char> px(static_cast<std::size_t>(w) * h * 4u);
+    for (unsigned y = 0; y < h; ++y)
+        for (unsigned x = 0; x < w; ++x) {
+            unsigned char* p = px.data() + (static_cast<std::size_t>(y) * w + x) * 4u;
+            const unsigned a = translucent ? 64u + (x * 191u) / (w - 1u) : 255u;
+            p[0] = static_cast<unsigned char>(((x * 37u + seed * 11u) % 256u) * a / 255u);
+            p[1] = static_cast<unsigned char>(((y * 53u + seed * 29u) % 256u) * a / 255u);
+            p[2] = static_cast<unsigned char>((((x ^ y) * 23u + seed) % 256u) * a / 255u);
+            p[3] = static_cast<unsigned char>(a);
+        }
+    return px;
+}
+
+} // namespace
+
+LUMEN_TEST(gl_composite_visible_rects_match_whole_draws) {
+    auto* device = shared_device();
+    if (!device)
+        return;
+    constexpr unsigned W = 64, H = 48;
+    auto target = lx::gfx::gl_scanout_target::create(*device, W, H, k_xrgb);
+    LUMEN_CHECK(static_cast<bool>(target));
+    lx::gfx::gl_compositor comp;
+    LUMEN_CHECK(static_cast<bool>(comp.initialize(*device)));
+    const auto wall = gradient(16, 16, 1, false);
+    const auto win = gradient(20, 16, 3, true);
+    const auto opaque = gradient(24, 20, 2, false);
+    const auto cursor = gradient(8, 8, 4, true);
+    LUMEN_CHECK(comp.upload_rgba(1, 16, 16, wall.data()) && comp.upload_rgba(2, 20, 16, win.data()) &&
+                comp.upload_rgba(3, 24, 20, opaque.data()) &&
+                comp.upload_rgba(5, 8, 8, cursor.data()));
+    // A scaled wallpaper; a translucent scaled window, a translucent solid and an opaque
+    // solid (a clear), all partly under an opaque window; a cursor on top.
+    lx::gfx::blit_command whole[6] = {quad(1, {0, 0, 64, 48}),
+                                      quad(2, {8, 6, 40, 30}, lx::blend_mode::premultiplied, 0.75f),
+                                      solid_cmd({30, 30, 30, 12}, lx::color::rgb(0.2f, 0.f, 0.3f, 0.5f)),
+                                      solid_cmd({2, 2, 24, 16}, lx::color::rgb(0.9f, 0.4f, 0.1f)),
+                                      quad(3, {20, 14, 24, 20}),
+                                      quad(5, {40, 30, 8, 8}, lx::blend_mode::premultiplied)};
+    whole[0].scaled = true;
+    whole[1].scaled = true;
+    lx::gfx::blit_command cut[6]{};
+    for (unsigned i = 0; i < 6; ++i)
+        cut[i] = whole[i];
+    const lx::rect2i wall_vis[4] = {{0, 0, 64, 14}, {0, 34, 64, 14}, {0, 14, 20, 20}, {44, 14, 20, 20}};
+    const lx::rect2i win_vis[4] = {{8, 6, 40, 8}, {8, 34, 40, 2}, {8, 14, 12, 20}, {44, 14, 4, 20}};
+    for (unsigned k = 0; k < 4; ++k) {
+        cut[0].visible[k] = wall_vis[k];
+        cut[1].visible[k] = win_vis[k];
+    }
+    cut[0].visible_count = 4;
+    cut[1].visible_count = 4;
+    // An over-cover is allowed (it may draw more than shows, never less).
+    cut[2].visible[0] = {30, 32, 30, 10};
+    cut[2].visible[1] = {44, 30, 16, 2};
+    cut[2].visible_count = 2;
+    cut[3].visible[0] = {2, 2, 24, 12};
+    cut[3].visible[1] = {2, 14, 18, 4};
+    cut[3].visible_count = 2;
+    const lx::color clear = lx::color::rgb(0.05f, 0.1f, 0.15f);
+    std::vector<unsigned char> want(static_cast<std::size_t>(W) * H * 4);
+    std::vector<unsigned char> got(want.size());
+    for (const lx::rect2i damage : {lx::rect2i{}, lx::rect2i{5, 5, 40, 26}}) {
+        // Each case starts from the same whole frame, so a damaged pass is compared alone.
+        for (auto* cmds : {whole, cut}) {
+            if (damage.width > 0) {
+                auto full = comp.composite(target.value(), clear, whole, 6, {});
+                LUMEN_CHECK(static_cast<bool>(full));
+                close_fence(full);
+            }
+            auto drawn = comp.composite(target.value(), clear, cmds, 6, damage);
+            LUMEN_CHECK(static_cast<bool>(drawn) && drawn.value().draws_submitted == 6);
+            close_fence(drawn);
+            auto& out = cmds == whole ? want : got;
+            LUMEN_CHECK(static_cast<bool>(
+                comp.read_back(target.value(), out.data(), static_cast<unsigned>(out.size()))));
+        }
+        LUMEN_CHECK(got == want);
+    }
+}
+
 LUMEN_TEST(gl_composite_solid_draws_clear_and_shader_paths) {
     auto* device = shared_device();
     if (!device)

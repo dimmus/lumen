@@ -564,10 +564,27 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         const auto& cmd = job.cmds[i];
         if (cmd.occluded || draw_invisible(cmd))
             continue;
+        // A draw the visibility pass found partly covered is drawn only inside its visible
+        // rects (disjoint, so nothing blends twice). Each pixel is computed as for the whole
+        // draw: the parts change which pixels are written, never their values.
+        lx::rect2i parts[k_max_visible_rects];
+        unsigned part_count = 1;
+        parts[0] = band_rect;
+        if (cmd.visible_count > 0) {
+            part_count = 0;
+            for (unsigned k = 0; k < cmd.visible_count && k < k_max_visible_rects; ++k) {
+                const lx::rect2i v = intersect(cmd.visible[k], band_rect);
+                if (v.width > 0 && v.height > 0)
+                    parts[part_count++] = v;
+            }
+        }
         if (cmd.solid) {
-            bytes += fill_solid(dst, cmd, band_rect);
+            for (unsigned p = 0; p < part_count; ++p)
+                bytes += fill_solid(dst, cmd, parts[p]);
             continue;
         }
+        if (part_count == 0)
+            continue;
         const int index = job.self->find(cmd.texture_id);
         if (index < 0)
             continue;
@@ -639,40 +656,45 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
             // A fullscreen such window went from 15 to about 4 ms.
             const bool blend_runs = needs_blend && !fill_alpha && !tinted &&
                                     conv == convert_op::copy && opacity_255 == 255u;
-            const unsigned sx0 = static_cast<unsigned>(sub.x + (area.x - cmd.dst.x));
-            for (int row = 0; row < area.height; ++row) {
-                const unsigned sy = static_cast<unsigned>(sub.y + (area.y - cmd.dst.y) + row);
-                const auto* src_row = reinterpret_cast<const std::uint32_t*>(
-                    src.pixels + static_cast<std::size_t>(sy) * src.stride);
-                auto* dst_row = reinterpret_cast<std::uint32_t*>(
-                                    dst.pixels +
-                                    static_cast<std::size_t>(area.y + row) * dst.stride) +
-                                area.x;
-                if (memcpy_rows) {
-                    std::memcpy(dst_row, src_row + sx0,
-                                static_cast<std::size_t>(area.width) * 4u);
-                    continue;
-                }
-                if (blend_runs) {
-                    const std::uint32_t* s = src_row + sx0;
-                    for (int x = 0; x < area.width;) {
-                        int end = x;
-                        while (end < area.width && (s[end] >> 24) == 0xFFu)
-                            ++end;
-                        if (end > x) {
-                            std::memcpy(dst_row + x, s + x, static_cast<std::size_t>(end - x) * 4u);
-                            x = end;
-                            continue;
-                        }
-                        dst_row[x] = blend_over_linear(s[x], dst_row[x], 255u);
-                        ++x;
+            for (unsigned p = 0; p < part_count; ++p) {
+                const lx::rect2i part = intersect(area, parts[p]);
+                const unsigned sx0 = static_cast<unsigned>(sub.x + (part.x - cmd.dst.x));
+                for (int row = 0; row < part.height; ++row) {
+                    const unsigned sy = static_cast<unsigned>(sub.y + (part.y - cmd.dst.y) + row);
+                    const auto* src_row = reinterpret_cast<const std::uint32_t*>(
+                        src.pixels + static_cast<std::size_t>(sy) * src.stride);
+                    auto* dst_row = reinterpret_cast<std::uint32_t*>(
+                                        dst.pixels +
+                                        static_cast<std::size_t>(part.y + row) * dst.stride) +
+                                    part.x;
+                    if (memcpy_rows) {
+                        std::memcpy(dst_row, src_row + sx0,
+                                    static_cast<std::size_t>(part.width) * 4u);
+                        continue;
                     }
-                    continue;
+                    if (blend_runs) {
+                        const std::uint32_t* s = src_row + sx0;
+                        for (int x = 0; x < part.width;) {
+                            int end = x;
+                            while (end < part.width && (s[end] >> 24) == 0xFFu)
+                                ++end;
+                            if (end > x) {
+                                std::memcpy(dst_row + x, s + x,
+                                            static_cast<std::size_t>(end - x) * 4u);
+                                x = end;
+                                continue;
+                            }
+                            dst_row[x] = blend_over_linear(s[x], dst_row[x], 255u);
+                            ++x;
+                        }
+                        continue;
+                    }
+                    for (int x = 0; x < part.width; ++x)
+                        finish(src_row[sx0 + static_cast<unsigned>(x)], dst_row[x]);
                 }
-                for (int x = 0; x < area.width; ++x)
-                    finish(src_row[sx0 + static_cast<unsigned>(x)], dst_row[x]);
+                if (part.width > 0 && part.height > 0)
+                    bytes += static_cast<unsigned long long>(part.height) * part.width * 4ull;
             }
-            bytes += static_cast<unsigned long long>(area.height) * area.width * 4ull;
             continue;
         }
 
@@ -722,44 +744,54 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
             return reinterpret_cast<const std::uint32_t*>(
                 src.pixels + static_cast<std::size_t>(ty) * src.stride)[tx];
         };
-        for (int row = 0; row < area.height; ++row) {
-            auto* dst_row = reinterpret_cast<std::uint32_t*>(
-                                dst.pixels + static_cast<std::size_t>(area.y + row) * dst.stride) +
-                            area.x;
-            const double py = (area.y + row - cmd.dst.y) + 0.5;
-            const double px = (area.x - cmd.dst.x) + 0.5;
-            long long fs = std::llround((ox + px * ax + py * bx - centre) * k_one);
-            long long ft = std::llround((oy + px * ay + py * by - centre) * k_one);
-            for (int x = 0; x < area.width; ++x, fs += step_x, ft += step_y) {
-                std::uint32_t pixel = 0;
-                if (nearest) {
-                    pixel = texel(static_cast<int>(fs >> 16), static_cast<int>(ft >> 16));
-                } else {
-                    const int ix = static_cast<int>(fs >> 16);
-                    const int iy = static_cast<int>(ft >> 16);
-                    const unsigned wx = static_cast<unsigned>((fs >> 8) & 0xFF);
-                    const unsigned wy = static_cast<unsigned>((ft >> 8) & 0xFF);
-                    const std::uint32_t p00 = texel(ix, iy);
-                    const std::uint32_t p10 = texel(ix + 1, iy);
-                    const std::uint32_t p01 = texel(ix, iy + 1);
-                    const std::uint32_t p11 = texel(ix + 1, iy + 1);
-                    const unsigned w00 = (256u - wx) * (256u - wy);
-                    const unsigned w10 = wx * (256u - wy);
-                    const unsigned w01 = (256u - wx) * wy;
-                    const unsigned w11 = wx * wy;
-                    for (unsigned shift = 0; shift < 32; shift += 8) {
-                        const unsigned c = (((p00 >> shift) & 0xFFu) * w00 +
-                                            ((p10 >> shift) & 0xFFu) * w10 +
-                                            ((p01 >> shift) & 0xFFu) * w01 +
-                                            ((p11 >> shift) & 0xFFu) * w11 + 32768u) >>
-                                           16;
-                        pixel |= (c > 255u ? 255u : c) << shift;
+        for (unsigned p = 0; p < part_count; ++p) {
+            const lx::rect2i part = intersect(area, parts[p]);
+            for (int row = 0; row < part.height; ++row) {
+                auto* dst_row =
+                    reinterpret_cast<std::uint32_t*>(
+                        dst.pixels + static_cast<std::size_t>(part.y + row) * dst.stride) +
+                    part.x;
+                // Stepped from the start of `area`'s row, as when the whole row is drawn: the
+                // 16.16 steps accumulate the same rounding, so a part's pixels are bit-identical.
+                const double py = (part.y + row - cmd.dst.y) + 0.5;
+                const double px = (area.x - cmd.dst.x) + 0.5;
+                const long long skip = part.x - area.x;
+                long long fs =
+                    std::llround((ox + px * ax + py * bx - centre) * k_one) + skip * step_x;
+                long long ft =
+                    std::llround((oy + px * ay + py * by - centre) * k_one) + skip * step_y;
+                for (int x = 0; x < part.width; ++x, fs += step_x, ft += step_y) {
+                    std::uint32_t pixel = 0;
+                    if (nearest) {
+                        pixel = texel(static_cast<int>(fs >> 16), static_cast<int>(ft >> 16));
+                    } else {
+                        const int ix = static_cast<int>(fs >> 16);
+                        const int iy = static_cast<int>(ft >> 16);
+                        const unsigned wx = static_cast<unsigned>((fs >> 8) & 0xFF);
+                        const unsigned wy = static_cast<unsigned>((ft >> 8) & 0xFF);
+                        const std::uint32_t p00 = texel(ix, iy);
+                        const std::uint32_t p10 = texel(ix + 1, iy);
+                        const std::uint32_t p01 = texel(ix, iy + 1);
+                        const std::uint32_t p11 = texel(ix + 1, iy + 1);
+                        const unsigned w00 = (256u - wx) * (256u - wy);
+                        const unsigned w10 = wx * (256u - wy);
+                        const unsigned w01 = (256u - wx) * wy;
+                        const unsigned w11 = wx * wy;
+                        for (unsigned shift = 0; shift < 32; shift += 8) {
+                            const unsigned c = (((p00 >> shift) & 0xFFu) * w00 +
+                                                ((p10 >> shift) & 0xFFu) * w10 +
+                                                ((p01 >> shift) & 0xFFu) * w01 +
+                                                ((p11 >> shift) & 0xFFu) * w11 + 32768u) >>
+                                               16;
+                            pixel |= (c > 255u ? 255u : c) << shift;
+                        }
                     }
+                    finish(pixel, dst_row[x]);
                 }
-                finish(pixel, dst_row[x]);
             }
+            if (part.width > 0 && part.height > 0)
+                bytes += static_cast<unsigned long long>(part.height) * part.width * 4ull;
         }
-        bytes += static_cast<unsigned long long>(area.height) * area.width * 4ull;
     }
 
     job.bytes.fetch_add(bytes, std::memory_order_relaxed);

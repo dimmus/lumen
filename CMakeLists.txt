@@ -995,7 +995,7 @@ if(LUMEN_BUILD_TESTS)
     set_tests_properties(bench_frame PROPERTIES LABELS bench)
 
     add_executable(bench_composite tests/bench_composite.cpp)
-    target_link_libraries(bench_composite PRIVATE lx.gfx)
+    target_link_libraries(bench_composite PRIVATE lx.gfx lx.scene lx.runtime)
     lumen_apply_module_properties(bench_composite)
     target_include_directories(bench_composite PRIVATE tests)
     add_test(NAME bench_composite COMMAND bench_composite)

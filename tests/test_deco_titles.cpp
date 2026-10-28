@@ -1082,6 +1082,110 @@ LUMEN_TEST(vk_compositor_waits_for_external_users) {
     ui.wait_idle();
 }
 
+// The titled desktop drawn as the compositor draws an output on Vulkan: three scanout slots
+// in rotation, each frame's region its damage plus the slot's age, only the damage
+// composited into the persistent intermediate (titles, fills and surfaces through the UI
+// renderer's linear pass, one rect at a time). Every frame equals a full repaint of the
+// same snapshot by a compositor of its own, byte for byte.
+LUMEN_TEST(vk_damage_limited_titles_match_a_full_repaint) {
+    vk_env* v = shared_vk();
+    if (!v)
+        return;
+    lx::gfx::vulkan_compositor ref{};
+    lx::gfx::ui_vk_renderer ref_ui{};
+    if (!ref.initialize(v->device.context()) || !ref_ui.initialize(v->device.context())) {
+        std::printf("    SKIP: no second compositor\n");
+        return;
+    }
+    const std::vector<unsigned char> atlas = rgba_of(deco_atlas());
+    LUMEN_CHECK(static_cast<bool>(ref.upload_rgba(lx::compositor::k_deco_atlas_texture_id,
+                                                  lx::compositor::k_deco_atlas_size,
+                                                  lx::compositor::k_deco_atlas_size, atlas.data())));
+    lx::gfx::render_target slots[3]{};
+    lx::gfx::render_target ref_target{};
+    for (auto* t : {&slots[0], &slots[1], &slots[2], &ref_target}) {
+        auto made = lx::gfx::render_target::create(v->device.context(), k_w, k_h);
+        if (!made) {
+            std::printf("    SKIP: %s\n", made.get_error().message);
+            return;
+        }
+        *t = std::move(made).value();
+    }
+    const auto read = [](lx::gfx::vulkan_compositor& c, const lx::gfx::render_target& t) {
+        std::vector<unsigned char> px(static_cast<std::size_t>(k_w * k_h) * 4u);
+        LUMEN_CHECK(static_cast<bool>(c.read_back(t, px.data(), static_cast<unsigned>(px.size()))));
+        return px;
+    };
+    const auto frame_rect = [](const lx::rect2i g) {
+        return lx::rect2i{g.x - 8, g.y - 40, g.width + 16, g.height + 48}; // title bar, borders
+    };
+
+    desktop d{k_windows};
+    lx::compositor::frame_painter painter;
+    lx::compositor::frame_painter ref_painter;
+    lx::gfx::damage_region age[3]{};
+    for (auto& a : age)
+        a.set_full();
+    const lx::gfx::render_target* previous = nullptr;
+    unsigned partial = 0;
+    for (unsigned i = 0; i < 10; ++i) {
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        if (i == 0) {
+            d.scene->note_full_damage_output(0);
+        } else if (i % 3 == 1) {
+            // Window 0 (the terminal) moves right: its frame and surface, old and new place.
+            const lx::rect2i old = d.frames[0]->geometry;
+            d.frames[0]->geometry.x += 6;
+            d.windows[0]->set_transform({d.frames[0]->geometry.x, d.frames[0]->geometry.y});
+            d.scene->note_damage(frame_rect(old));
+            d.scene->note_damage(frame_rect(d.frames[0]->geometry));
+        } else if (i % 3 == 2) {
+            // Window 2 recoloured.
+            d.windows[2]->set_solid(true, i % 2 ? lx::color::rgb(0.6f, 0.2f, 0.1f)
+                                                : lx::color::rgb(0.1f, 0.5f, 0.3f));
+            d.scene->note_damage(k_windows[2].geometry);
+        } else {
+            // Window 1's close button hovered / not.
+            d.frames[1]->button = i % 2 ? deco_button::normal : deco_button::hover;
+            d.scene->note_damage(frame_rect(k_windows[1].geometry));
+        }
+        LUMEN_CHECK(d.scene->commit_frame(0, ++d.frame_index));
+        lx::runtime::set_current_affinity(lx::runtime::affinity::render);
+        const auto& snap = d.scene->acquire_render_snapshot(0);
+
+        lx::gfx::damage_region changed = snap.damage_rects();
+        changed.clip({0, 0, k_w, k_h});
+        const unsigned back = i % 3u;
+        lx::gfx::damage_region region = changed;
+        region.add_region(age[back]);
+        region.clip({0, 0, k_w, k_h});
+        auto p = painter.paint_vk(v->comp, &v->ui, slots[back], snap, &env().atlas,
+                                  lx::gfx::k_text_contrast_dark, &region, &changed, previous);
+        LUMEN_CHECK(p && p->paint.stream && p->ui.primitives_skipped == 0 &&
+                    p->composite.draws_skipped == 0);
+        if (p && p->composite.out_fence_fd >= 0)
+            ::close(p->composite.out_fence_fd);
+        if (p && !changed.full)
+            partial += p->ui.batches_skipped > 0 ? 1u : 0u; // a batch met no damage rect
+        auto r = ref_painter.paint_vk(ref, &ref_ui, ref_target, snap, &env().atlas);
+        LUMEN_CHECK(static_cast<bool>(r));
+        if (r && r->composite.out_fence_fd >= 0)
+            ::close(r->composite.out_fence_fd);
+        d.release(snap);
+        for (unsigned s = 0; s < 3; ++s)
+            if (s != back)
+                age[s].add_region(changed);
+        age[back].clear();
+        previous = &slots[back];
+        LUMEN_CHECK(read(v->comp, slots[back]) == read(ref, ref_target));
+    }
+    std::printf("    %u of 9 damage frames limited to their rects\n", partial);
+    LUMEN_CHECK(partial > 0);
+    ref_ui.wait_idle();
+    ref_ui.shutdown();
+    ref.shutdown();
+}
+
 // Last: with LUMEN_VULKAN_VALIDATION=1, the validation layer's log holds no error.
 LUMEN_TEST(vk_validation_clean) {
     if (!g_vk_validation_requested)
