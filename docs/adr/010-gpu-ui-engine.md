@@ -1581,8 +1581,22 @@ non-blocking pipe on the loop, so a paste stays synchronous. `test_app_window` c
 cpu and gl tiers against an ext-data-control-v1 client in the parent (a clipboard manager's
 view): ctrl+c sets the selection with the marker, that client reads the copied text, its own
 selection arrives and ctrl+v pastes it, and a 200 KB copy is written whole as the pipe drains.
-G1's idle check right after shows no wakeup added. Not taken: the primary selection and drag
-and drop.
+G1's idle check right after shows no wakeup added.
+
+The primary selection and drag and drop of text, done (2026-10-28), on the same service: `:data`
+serves either selection kind (`zwp_primary_selection_device_v1` beside `wl_data_device`) and
+the clipboard device's drags. A field's settled selection (a press released, a double or triple
+press, a key) is the primary selection; the middle button pastes it where it goes down (a new
+`pointer_kind::middle`, walked up the ancestors like a secondary press). A press inside the
+selection dragged 8 px starts a drag (copy and move, no icon); the window's press is cancelled
+(`ui_root::pointer_cancel`), and a move deletes the text once the destination finished. Our
+windows take drops through `drop_target` (`ui_root::drop_motion` / `drop_text`): the field marks
+where the text would land, the offer is accepted only while a target takes text, our own drag
+prefers move and another client's copy. `test_app_window` checks, on both tiers: a selection
+published as the primary and read by the data-control client; that client's primary pasted by
+a middle click at the text's start; a word dragged to the field's end and moved there (our drag,
+our drop, the data through the pipe); a drag let go outside the window cancelled with the text
+kept; and G1's idle check after. Not taken: dragging anything but text, a drag icon, `ask`.
 
 Tried for G7 on GL (2026-10-28), not kept. Building the two programs ahead on a helper thread
 in a shared EGL context, from the moment the tier was chosen, so they compiled during the

@@ -18,7 +18,8 @@
     defined(LUMEN_PROTOCOL_PRESENTATION_TIME) &&                                                 \
     defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3) && defined(LUMEN_PROTOCOL_CURSOR_SHAPE_V1) &&  \
     defined(LUMEN_PROTOCOL_SINGLE_PIXEL_BUFFER_V1) && defined(LUMEN_PROTOCOL_XDG_ACTIVATION_V1) && \
-    defined(LUMEN_PROTOCOL_XDG_OUTPUT_UNSTABLE_V1)
+    defined(LUMEN_PROTOCOL_XDG_OUTPUT_UNSTABLE_V1) &&                                             \
+    defined(LUMEN_PROTOCOL_PRIMARY_SELECTION_UNSTABLE_V1)
 #define LX_WLC_REAL 1
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
@@ -33,6 +34,7 @@
 #include "single-pixel-buffer-v1-client-protocol.h"
 #include "xdg-activation-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
+#include "primary-selection-unstable-v1-client-protocol.h"
 // Every proxy this wrapper creates carries this tag (wl_proxy_set_tag), so a wl_surface in
 // an event maps back to its lx::wayland::surface only when it is one of ours.
 inline const char* const lx_wlc_tag = "lx.wayland.client";
@@ -44,9 +46,6 @@ struct wl_registry;
 struct wl_output;
 struct wl_seat;
 struct zxdg_output_v1;
-struct wl_data_device;
-struct wl_data_offer;
-struct wl_data_source;
 #endif
 
 #if defined(LUMEN_HAS_XKBCOMMON)

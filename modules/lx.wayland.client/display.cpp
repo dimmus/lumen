@@ -43,6 +43,7 @@ constexpr global_desc k_globals[k_global_kinds] = {
     {"xdg_activation_v1", 1, false},
     {"zxdg_output_manager_v1", 3, false},
     {"wl_data_device_manager", 3, false},
+    {"zwp_primary_selection_device_manager_v1", 1, false},
 };
 
 constexpr unsigned k_seat_cap = 10;
@@ -82,6 +83,7 @@ const wl_interface* interface_of(global_kind k) {
     case global_kind::activation: return &xdg_activation_v1_interface;
     case global_kind::xdg_output: return &zxdg_output_manager_v1_interface;
     case global_kind::data_device_manager: return &wl_data_device_manager_interface;
+    case global_kind::primary_selection: return &zwp_primary_selection_device_manager_v1_interface;
     case global_kind::count: break;
     }
     return nullptr;
@@ -132,6 +134,10 @@ void destroy_global(global_kind k, void* p, std::uint32_t version) {
     case global_kind::data_device_manager:
         // v3 has no release request for the manager itself.
         wl_data_device_manager_destroy(static_cast<wl_data_device_manager*>(p));
+        break;
+    case global_kind::primary_selection:
+        zwp_primary_selection_device_manager_v1_destroy(
+            static_cast<zwp_primary_selection_device_manager_v1*>(p));
         break;
     case global_kind::count: break;
     }

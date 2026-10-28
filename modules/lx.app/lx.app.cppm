@@ -53,7 +53,9 @@ struct app_timeline {
     std::uint64_t connect_ns = 0;
 };
 
-class application final : public window_host, public lx::wayland::seat_handler {
+class application final : public window_host,
+                          public transfer_host,
+                          public lx::wayland::seat_handler {
 public:
     application(int argc, char* argv[]);
     ~application();
@@ -100,6 +102,10 @@ public:
     void host_close_requested(window& w) override;
     [[nodiscard]] lx::result<void> host_attach(window& w) override;
     void host_detach(window& w) override;
+
+    // transfer_host
+    [[nodiscard]] lx::ui::ui_root* host_root_of(const lx::wayland::surface* s) override;
+    [[nodiscard]] lx::wayland::surface* host_drag_origin() override;
 
     // seat_handler: routed to the window whose surface the event names.
     void on_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) override;

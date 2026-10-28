@@ -1911,6 +1911,46 @@ LUMEN_TEST(text_input_edits_by_grapheme_and_word) {
     click(r, on_world);
     LUMEN_CHECK(t.selection_begin() == 6 && t.selection_end() == 11);
     (void)h.tick();
+
+    // The settled selection is the primary selection (the process's own here: no lx.app).
+    LUMEN_CHECK(std::strcmp(clipboard::global().primary_selection(), "world") == 0);
+    const auto at_index = [&](std::uint32_t i) {
+        const lx::text::caret_pos c = t.text_node().layout().caret(i);
+        return lx::point2i{t.text_node().bounds().x + ((c.x + 32) >> 6), mid};
+    };
+    // A press inside the selection dragged past the threshold drags it out; with nothing to
+    // start a drag it selects from there instead, settling the new primary on release.
+    LUMEN_CHECK(!drag_service::global().active());
+    (void)r.pointer_move(at_index(10));
+    (void)r.pointer_button(mouse_button::left, true);
+    LUMEN_CHECK(t.selection_begin() == 6 && t.selection_end() == 11); // not yet: maybe a click
+    (void)r.pointer_move({area.x + 1, mid});
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(t.anchor() == 6 && t.caret() == 0 && !t.dragging());
+    LUMEN_CHECK(std::strcmp(clipboard::global().primary_selection(), "hello ") == 0);
+    (void)h.tick();
+    // A press inside the selection released in place is a click: the caret goes there.
+    (void)r.pointer_move(at_index(2));
+    (void)r.pointer_button(mouse_button::left, true);
+    (void)r.pointer_button(mouse_button::left, false);
+    LUMEN_CHECK(t.caret() == 2 && !t.has_selection());
+    LUMEN_CHECK(std::strcmp(clipboard::global().primary_selection(), "hello ") == 0);
+    (void)h.tick();
+    // The middle button pastes the primary selection where it goes down.
+    clipboard::global().set_primary_selection("XY");
+    (void)r.pointer_move({area.x + area.width - 2, mid});
+    (void)r.pointer_button(mouse_button::middle, true);
+    (void)r.pointer_button(mouse_button::middle, false);
+    LUMEN_CHECK(text_is(t, "hello worldXY") && t.caret() == 13);
+    (void)h.tick();
+    // A drag over the field marks where it would land; dropped, the text goes there selected.
+    LUMEN_CHECK(r.drop_motion(at_index(5)) && t.drop_index() == 5);
+    LUMEN_CHECK(r.drop_text(at_index(5), "++") && text_is(t, "hello++ worldXY"));
+    LUMEN_CHECK(t.selection_begin() == 5 && t.selection_end() == 7 &&
+                t.drop_index() == text_input_node::k_no_drop);
+    LUMEN_CHECK(!r.drop_motion({area.x + 1, area.y + area.height + 40})); // below the field
+    r.drop_leave();
+    (void)h.tick();
 }
 
 LUMEN_TEST(text_input_ime_preedit_and_commit) {

@@ -105,6 +105,17 @@ public:
     /// Falls back to the tree's `on_mouse` when no interactive node is there.
     bool pointer_button(mouse_button b, bool pressed);
     void pointer_leave();
+    /// The pointer was taken from the window with a button down (a drag started): the
+    /// pressed node is let go without a release or a click.
+    void pointer_cancel();
+    /// Drag and drop of text over the window (lx.app's data device), surface coordinates:
+    /// the drop target under `at` (the node there, then its ancestors) shows where the text
+    /// would land. False when nothing there takes text.
+    bool drop_motion(lx::point2i at);
+    /// The drag left the window or ended: the target's mark goes.
+    void drop_leave();
+    /// Dropped at `at`: the target under it inserts `utf8`. False when nothing took it.
+    bool drop_text(lx::point2i at, std::string_view utf8);
     /// A key: Escape dismisses the topmost overlay that takes it; tab moves the focus, others
     /// go to the focused node and its ancestors, then to the tree's `on_key`.
     bool key(key_event event);
@@ -456,11 +467,12 @@ bool lx::ui::ui_root::pointer_button(mouse_button b, bool pressed) {
     // occluding overlay (a modal) takes it.
     if (pressed && overlays.press(at))
         return true;
-    if (pressed && b == mouse_button::right) {
+    if (pressed && (b == mouse_button::right || b == mouse_button::middle)) {
         // A secondary press: the node under the pointer, then its ancestors (a context
-        // menu's area opens its menu there).
+        // menu's area opens its menu there); a middle one the same way (a text field
+        // pastes the primary selection).
         pointer_event e{};
-        e.kind = pointer_kind::secondary;
+        e.kind = b == mouse_button::right ? pointer_kind::secondary : pointer_kind::middle;
         e.at = at;
         e.button = b;
         e.modifiers = pointer_.modifiers();
@@ -485,6 +497,48 @@ bool lx::ui::ui_root::pointer_button(mouse_button b, bool pressed) {
 }
 
 void lx::ui::ui_root::pointer_leave() { pointer_.leave(); }
+
+void lx::ui::ui_root::pointer_cancel() { pointer_.cancel_press(); }
+
+namespace {
+/// The drop target at `at`: the node there, then its ancestors, up to a layer.
+lx::ui::drop_target* lx_ui_drop_target_at(lx::ui::pointer_state& pointer, lx::ui::ui_node* root,
+                                          lx::point2i at) {
+    for (lx::ui::ui_node* n = pointer.resolve(root, at, false); n; n = n->parent()) {
+        if (lx::ui::drop_target* t = n->as_drop_target())
+            return t;
+        if (n->has_flag(lx::ui::node_flag::layer))
+            break;
+    }
+    return nullptr;
+}
+} // namespace
+
+bool lx::ui::ui_root::drop_motion(lx::point2i at) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    drop_target* t = root_ ? lx_ui_drop_target_at(pointer_, root_, at) : nullptr;
+    drop_target* was = current_drop_target();
+    if (was && was != t)
+        was->drop_leave();
+    const bool takes = t && t->drop_hover(at);
+    if (t && !takes)
+        t->drop_leave();
+    set_current_drop_target(takes ? t : nullptr);
+    return takes;
+}
+
+void lx::ui::ui_root::drop_leave() {
+    if (drop_target* was = current_drop_target())
+        was->drop_leave();
+    set_current_drop_target(nullptr);
+}
+
+bool lx::ui::ui_root::drop_text(lx::point2i at, std::string_view utf8) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    drop_leave();
+    drop_target* t = root_ ? lx_ui_drop_target_at(pointer_, root_, at) : nullptr;
+    return t && t->drop_text(at, utf8);
+}
 
 bool lx::ui::ui_root::pointer_axis(float dx, float dy) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);

@@ -68,6 +68,9 @@ enum class pointer_kind : unsigned char {
     /// The secondary (right) button went down over the node: offered up the ancestors (a
     /// context menu's area takes it).
     secondary,
+    /// The middle button went down over the node: offered up the ancestors (a text field
+    /// pastes the primary selection there).
+    middle,
 };
 
 struct pointer_event {

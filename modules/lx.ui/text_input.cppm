@@ -42,7 +42,13 @@ constexpr lx::trace::category log_ui{"ui"};
 // paragraph's direction (in a right-to-left paragraph left moves forward); the caret is drawn
 // where `text_layout::caret` puts the position — the Phase 2 hit testing, bidi-correct at a
 // direction boundary. Ctrl+c / x / v go through `clipboard::global()`; ctrl+a selects all;
-// enter calls `on_submit`.
+// enter calls `on_submit`. A selection, once it settles (a press released, a double or
+// triple press, a key), becomes the primary selection; the middle button pastes the primary
+// selection where it is pressed, without moving the focus. A press inside the selection
+// and a drag past `k_ti_drag_px` drags the selected text out (`drag_service`: a move deletes
+// it here once the destination took it); a press there released without moving places the
+// caret. Text dragged over the field shows a caret where it would land, and dropped there
+// is inserted and selected — not inside the text being dragged out of this field.
 //
 // IME: `ime_target` is what text-input-v3 will drive in Phase 4. One `ime_update` is one
 // `done` event's batch, applied in the protocol's order — `delete_surrounding_text`, then
@@ -152,7 +158,10 @@ struct text_input_props {
     const char* name = nullptr;
 };
 
-class text_input_node final : public ui_node, public ime_target {
+class text_input_node final : public ui_node,
+                              public ime_target,
+                              public drag_source,
+                              public drop_target {
 public:
     [[nodiscard]] static element_type_id static_type();
     [[nodiscard]] element_type_id type() const override;
@@ -178,6 +187,18 @@ public:
     [[nodiscard]] cursor_style cursor() const override {
         return has_flag(node_flag::disabled) ? cursor_style::arrow : cursor_style::text;
     }
+
+    [[nodiscard]] drop_target* as_drop_target() override;
+    // drag_source, drop_target
+    void on_drag_end(bool moved) override;
+    bool drop_hover(lx::point2i at) override;
+    void drop_leave() override;
+    bool drop_text(lx::point2i at, std::string_view utf8) override;
+    /// Its selection is being dragged out.
+    [[nodiscard]] bool dragging() const { return dragging_; }
+    /// Where a drag over it would land (`k_no_drop`: none).
+    static constexpr std::uint32_t k_no_drop = ~0u;
+    [[nodiscard]] std::uint32_t drop_index() const { return drop_index_; }
 
     void ime_apply(const ime_update& update) override;
     void ime_reset() override;
@@ -229,6 +250,10 @@ private:
     void keep_caret_visible();
     void restart_blink();
     void copy_selection() const;
+    /// The selection as the primary selection, when it is new (UI affinity).
+    void publish_primary();
+    /// The caret's rect at `index` of the text.
+    [[nodiscard]] lx::rect2i caret_rect_at(std::uint32_t index) const;
     void resolve_paint();
 
     text_block_node* text_ = nullptr;
@@ -249,7 +274,19 @@ private:
     bool caret_on_ = true;
     bool was_focused_ = false;
     bool selecting_ = false;
+    /// A press inside the selection, waiting to become a drag or a click.
+    bool drag_pending_ = false;
+    bool dragging_ = false;
     bool applied_ = false;
+    lx::point2i press_at_{};
+    /// The range being dragged out (shifted by a drop into it before), the drop mark.
+    std::uint32_t drag_begin_ = 0;
+    std::uint32_t drag_end_ = 0;
+    std::uint32_t drop_index_ = k_no_drop;
+    /// Edits so far, and the selection last published as the primary (at that count).
+    std::uint64_t edits_ = 0;
+    std::uint64_t published_edits_ = ~0ull;
+    std::uint32_t published_[2]{~0u, ~0u};
     std::uint64_t generation_ = 0;
     lx::ui::style layout_{};
     lx::layout::flex_style flex_{};
@@ -306,8 +343,13 @@ constexpr int k_ti_min_w = 192;
 constexpr float k_ti_line = 1.2f; // editor.rs: `line_height: relative(1.2)`
 constexpr int k_ti_caret_w = 2; // CursorShape::Bar
 
-/// The copied text clipboard::set_text points at (it keeps the pointer). UI affinity.
+/// The copied text clipboard::set_text points at (it keeps the pointer), the published
+/// primary selection, and the text being dragged out. UI affinity.
 char g_ti_clipboard[lx::ui::k_text_input_capacity + 1]{};
+char g_ti_primary[lx::ui::k_text_input_capacity + 1]{};
+char g_ti_drag[lx::ui::k_text_input_capacity + 1]{};
+/// How far a press inside the selection moves before it drags (GTK's dnd threshold).
+constexpr int k_ti_drag_px = 8;
 
 [[nodiscard]] bool lx_ui_ti_continuation(char c) {
     return (static_cast<unsigned char>(c) & 0xC0u) == 0x80u;
@@ -418,7 +460,10 @@ lx::ui::text_input_node::text_input_node() {
     adopt(text_);
 }
 
-lx::ui::text_input_node::~text_input_node() = default;
+lx::ui::text_input_node::~text_input_node() {
+    drag_service::global().forget(*this);
+    forget_drop_target(*this);
+}
 
 char* lx::ui::text_input_node::data() { return buffer_ ? buffer_->storage.data() : own_; }
 const char* lx::ui::text_input_node::data() const { return buffer_ ? buffer_->storage.data() : own_; }
@@ -626,12 +671,16 @@ int lx::ui::text_input_node::text_x() const {
 }
 
 lx::rect2i lx::ui::text_input_node::caret_rect() const {
-    const lx::text::text_layout& l = text_->layout();
     std::uint32_t at = caret_;
     if (preedit_size_ && preedit_cursor_[0] >= 0)
         at = caret_ + static_cast<std::uint32_t>(preedit_cursor_[0]);
     else if (preedit_size_)
         at = caret_ + preedit_size_;
+    return caret_rect_at(at);
+}
+
+lx::rect2i lx::ui::text_input_node::caret_rect_at(std::uint32_t at) const {
+    const lx::text::text_layout& l = text_->layout();
     const bool empty = size() == 0 && preedit_size_ == 0;
     const lx::text::caret_pos cp = empty ? lx::text::caret_pos{} : l.caret(at);
     const lx::rect2i tb = text_->bounds();
@@ -735,10 +784,16 @@ void lx::ui::text_input_node::emit(draw_scope& out) const {
     out.push_origin({tx - tb.x, 0});
     text_->emit(out);
     out.pop();
-    if (caret_visible()) {
+    if (caret_visible() && drop_index_ == k_no_drop) {
         quad_style q{};
         q.background = th.color(tok::player0_cursor);
         out.quad(caret_rect(), q);
+    }
+    if (drop_index_ != k_no_drop) {
+        // Where a drag over the field would land, in place of the caret.
+        quad_style q{};
+        q.background = th.color(tok::player0_cursor);
+        out.quad(caret_rect_at(std::min(drop_index_, size())), q);
     }
     out.pop();
 }
@@ -787,6 +842,10 @@ void lx::ui::text_input_node::caret_moved(bool keep_blink) {
     keep_caret_visible();
     if (!keep_blink)
         restart_blink();
+    // A selection made by keys or set by the app; one a press is still making waits for
+    // the release.
+    if (!selecting_ && !drag_pending_)
+        publish_primary();
     // The caret and the selection live in the field: repaint it (a few hundred px²).
     invalidate_paint(*this);
 }
@@ -807,6 +866,7 @@ void lx::ui::text_input_node::set_selection(std::uint32_t anchor, std::uint32_t 
 void lx::ui::text_input_node::select_all() { set_selection(0, size()); }
 
 void lx::ui::text_input_node::changed() {
+    ++edits_;
     sync_text();
     restart_blink();
     // The text block marked the layout (its width); the arrange keeps the caret in view.
@@ -874,6 +934,23 @@ void lx::ui::text_input_node::copy_selection() const {
     std::memcpy(g_ti_clipboard, t.data(), n);
     g_ti_clipboard[n] = '\0';
     clipboard::global().set_text(g_ti_clipboard);
+}
+
+void lx::ui::text_input_node::publish_primary() {
+    if (!has_selection())
+        return; // X11's rule: an emptied selection leaves the primary as it was
+    const std::uint32_t b = selection_begin();
+    const std::uint32_t e = selection_end();
+    if (published_[0] == b && published_[1] == e && published_edits_ == edits_)
+        return;
+    published_[0] = b;
+    published_[1] = e;
+    published_edits_ = edits_;
+    const std::string_view t = text().substr(b, e - b);
+    const std::size_t n = std::min(t.size(), sizeof(g_ti_primary) - 1);
+    std::memcpy(g_ti_primary, t.data(), n);
+    g_ti_primary[n] = '\0';
+    clipboard::global().set_primary_selection(g_ti_primary);
 }
 
 bool lx::ui::text_input_node::on_focus_key(key_event e, focus_manager&) {
@@ -980,6 +1057,15 @@ bool lx::ui::text_input_node::on_pointer(const pointer_event& e) {
     switch (e.kind) {
     case pointer_kind::press: {
         const std::uint32_t at = index_at(p);
+        drag_pending_ = false;
+        if (e.clicks == 1 && !(e.modifiers & k_mod_shift) && has_selection() &&
+            at >= selection_begin() && at < selection_end() && !dragging_) {
+            // Inside the selection: a drag of it, or (released in place) a click.
+            drag_pending_ = true;
+            press_at_ = e.at;
+            selecting_ = false;
+            return true;
+        }
         if (e.clicks >= 3) {
             set_selection(0, size());
         } else if (e.clicks == 2) {
@@ -994,16 +1080,121 @@ bool lx::ui::text_input_node::on_pointer(const pointer_event& e) {
         return true;
     }
     case pointer_kind::drag:
+        if (drag_pending_) {
+            const int dx = e.at.x - press_at_.x;
+            const int dy = e.at.y - press_at_.y;
+            if (dx * dx + dy * dy < k_ti_drag_px * k_ti_drag_px)
+                return true;
+            drag_pending_ = false;
+            const std::string_view t =
+                text().substr(selection_begin(), selection_end() - selection_begin());
+            const std::size_t n = std::min(t.size(), sizeof(g_ti_drag) - 1);
+            std::memcpy(g_ti_drag, t.data(), n);
+            g_ti_drag[n] = '\0';
+            drag_begin_ = selection_begin();
+            drag_end_ = selection_end();
+            dragging_ = true;
+            if (drag_service::global().start_text(g_ti_drag, *this))
+                return true;
+            // Nowhere to drag to (no data device): the press selects from here instead.
+            dragging_ = false;
+            selecting_ = true;
+        }
         if (!selecting_)
             return false;
         move_to(index_at(p), true);
         return true;
     case pointer_kind::release:
+        if (drag_pending_) {
+            drag_pending_ = false;
+            move_to(index_at(p), false);
+        }
         selecting_ = false;
+        publish_primary();
         return true;
+    case pointer_kind::middle: {
+        // The primary selection, pasted where the button went down (X11's rule): the caret
+        // moves there and nothing selected is replaced.
+        const char* t = clipboard::global().primary_selection();
+        if (!t || !t[0])
+            return true;
+        move_to(index_at(p), false);
+        (void)insert(t);
+        return true;
+    }
     default:
         return false;
     }
+}
+
+lx::ui::drop_target* lx::ui::text_input_node::as_drop_target() {
+    return has_flag(node_flag::disabled) ? nullptr : this;
+}
+
+void lx::ui::text_input_node::on_drag_end(bool moved) {
+    if (!dragging_)
+        return;
+    dragging_ = false;
+    if (!moved)
+        return;
+    // A move: the dragged text goes. A drop into this field before it shifted it; the caret
+    // (after the dropped text) keeps its place in what remains.
+    const std::uint32_t b = std::min(drag_begin_, size());
+    const std::uint32_t e = std::min(drag_end_, size());
+    std::uint32_t c = caret_;
+    std::uint32_t a = anchor_;
+    const auto shift = [&](std::uint32_t i) { return i >= e ? i - (e - b) : (i > b ? b : i); };
+    c = shift(c);
+    a = shift(a);
+    erase(b, e);
+    caret_ = std::min(c, size());
+    anchor_ = std::min(a, size());
+    changed();
+    caret_moved();
+}
+
+bool lx::ui::text_input_node::drop_hover(lx::point2i at) {
+    if (has_flag(node_flag::disabled))
+        return false;
+    const std::uint32_t i = index_at(local_point(*this, at));
+    // Not into the text being dragged out of this field.
+    if (dragging_ && i > drag_begin_ && i < drag_end_) {
+        drop_leave();
+        return false;
+    }
+    if (i != drop_index_) {
+        drop_index_ = i;
+        invalidate_paint(*this);
+    }
+    return true;
+}
+
+void lx::ui::text_input_node::drop_leave() {
+    if (drop_index_ == k_no_drop)
+        return;
+    drop_index_ = k_no_drop;
+    invalidate_paint(*this);
+}
+
+bool lx::ui::text_input_node::drop_text(lx::point2i at, std::string_view utf8) {
+    drop_leave();
+    if (has_flag(node_flag::disabled) || utf8.empty())
+        return false;
+    const std::uint32_t i = index_at(local_point(*this, at));
+    if (dragging_ && i > drag_begin_ && i < drag_end_)
+        return false;
+    const std::uint32_t before = size();
+    caret_ = anchor_ = i;
+    if (!insert(utf8))
+        return false;
+    const std::uint32_t added = size() - before;
+    // Dropped ahead of the text being dragged out of this field: that text moved right.
+    if (dragging_ && i <= drag_begin_) {
+        drag_begin_ += added;
+        drag_end_ += added;
+    }
+    set_selection(i, i + added);
+    return true;
 }
 
 void lx::ui::text_input_node::on_interaction_changed() {
