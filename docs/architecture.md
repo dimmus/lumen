@@ -2004,7 +2004,7 @@ is deferred indefinitely unless a concrete need appears.
 
 ```mermaid
 flowchart LR
-    CRED["SO_PEERCRED on connect"]
+    CRED["SO_PEERCRED + SO_PEERPIDFD on connect"]
     PATH["shell binary path check"]
     CHK["lx.session.privilege_checker"]
     ALLOW["allow_privileged_global()"]
@@ -2021,7 +2021,7 @@ dialogs, then xdg-desktop-portal-lumen or -wlr; § Portals); the capture globals
 from them (below).
 
 The binary check is real: `allow_privileged_global()` reads the peer's `/proc/<pid>/exe`
-(the pid `SO_PEERCRED` recorded; the connection keeps it alive) and
+(the pid `SO_PEERCRED` recorded at connect) and
 `privilege_checker::check_shell_bind` compares it with the configured shell binary
 (`lumen-compositor --shell PATH`; by default `lumen-shell` next to the compositor's own
 executable, resolved once with `realpath`). A mismatch is refused with the display's
@@ -2029,6 +2029,17 @@ executable, resolved once with `realpath`). A mismatch is refused with the displ
 bind `zlm_shell_v1` and replace the shell's bridge. KWin restricts its privileged
 interfaces the same way. It is not a defence against a same-UID process that can ptrace the
 shell. See [shell-state-sync.md](subsystems/shell-state-sync.md) § Privilege model.
+
+An open connection does not keep its peer alive — a child may hold it after the connecting
+process exits, and the pid can then be reused by any process, the shell binary included.
+So each client also keeps a pidfd for its peer (`SO_PEERPIDFD`, Linux 6.5, taken when the
+client is registered; it names the process the kernel recorded at connect however late it
+is asked, and is closed when the client goes). Every `/proc/<pid>` answer — the executable
+here, `.flatpak-info` below — is read through the pid and then confirmed: the pidfd must
+still name a running process (`pidfd_send_signal` with signal 0), so the pid was never free
+in between. A peer that has exited is refused the shell global and counts as sandboxed. On a
+kernel without `SO_PEERPIDFD` (probed once at start and logged) the pid is taken alone, as
+before.
 
 Window rules (`zlm_window_rules_v1`) load from `$XDG_CONFIG_HOME/lumen/window-rules.toml`.
 

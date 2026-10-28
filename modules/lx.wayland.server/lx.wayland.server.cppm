@@ -31,6 +31,21 @@ namespace {
 
 constexpr lx::trace::category log_wayland{"wayland"};
 
+/// Whether the kernel gives out peer pidfds (SO_PEERPIDFD, Linux 6.5): probed once per
+/// process, at the first bind, and logged then.
+bool peer_pidfds() {
+    static const bool supported = [] {
+        const bool ok = lx::session::peer_pidfd_supported();
+        if (ok)
+            log_wayland.info("client pidfds: SO_PEERPIDFD, /proc/<pid> checks race-free");
+        else
+            log_wayland.info("client pidfds unavailable (SO_PEERPIDFD, Linux 6.5): "
+                             "/proc/<pid> checks use the SO_PEERCRED pid alone");
+        return ok;
+    }();
+    return supported;
+}
+
 } // namespace
 
 export namespace lx::wayland {
@@ -39,6 +54,13 @@ struct unix_credentials {
     unsigned pid = 0;
     unsigned uid = 0;
     unsigned gid = 0;
+    /// The peer's pidfd (SO_PEERPIDFD at connect), owned by its `client_connection`; -1
+    /// without one. An answer read through `/proc/<pid>` counts only if this still names a
+    /// running process afterwards — otherwise the pid may be another process's by now.
+    int pidfd = -1;
+    /// The kernel has SO_PEERPIDFD but gave no pidfd: the peer had already exited, so no
+    /// `/proc/<pid>` answer is its. With neither (kernels before 6.5) the pid is taken alone.
+    bool peer_gone = false;
 };
 
 class client_connection;
@@ -101,6 +123,7 @@ private:
 
     unsigned id_ = 0;
     unix_credentials cred_{};
+    lx::unique_fd pidfd_; ///< closed when the client leaves the table
     void* native_ = nullptr; // wl_client*
     server* server_ = nullptr;
     bool privileged_shell_ = false;
@@ -330,7 +353,11 @@ private:
 module :private;
 
 unsigned lx::wayland::client_connection::id() const { return id_; }
-lx::wayland::unix_credentials lx::wayland::client_connection::credentials() const { return cred_; }
+lx::wayland::unix_credentials lx::wayland::client_connection::credentials() const {
+    unix_credentials out = cred_;
+    out.pidfd = pidfd_.get();
+    return out;
+}
 bool lx::wayland::client_connection::is_privileged_shell() const { return privileged_shell_; }
 void* lx::wayland::client_connection::native() const { return native_; }
 lx::wayland::server* lx::wayland::client_connection::owning_server() const { return server_; }
@@ -342,21 +369,38 @@ void lx::wayland::client_connection::set_privileged_shell(bool privileged) {
     privileged_shell_ = privileged;
 }
 
+namespace {
+/// An answer just read through `/proc/<cred.pid>` is about the peer: its pidfd still names a
+/// running process, so the pid was never free to be reused in between.
+bool peer_confirmed(const lx::wayland::unix_credentials& cred) {
+    if (cred.pidfd >= 0)
+        return lx::session::pidfd_alive(cred.pidfd);
+    return !cred.peer_gone;
+}
+} // namespace
+
 bool lx::wayland::client_connection::sandboxed() {
     if (has_context_)
         return true;
     if (sandbox_ != 0)
         return sandbox_ == 2;
     sandbox_ = 1;
-    // The peer's pid (SO_PEERCRED at connect) names a live process while its connection is
-    // open. Flatpak puts /.flatpak-info at the root of every sandbox (xdg-desktop-portal
-    // reads the same file to identify apps); a same-UID process may look into another's
-    // root. A failed lookup other than "no such file" (the process is gone, /proc hidden)
-    // counts as not sandboxed: the global stays as it was before filters existed.
+    // Flatpak puts /.flatpak-info at the root of every sandbox (xdg-desktop-portal reads
+    // the same file to identify apps); a same-UID process may look into another's root. The
+    // peer's pid (SO_PEERCRED at connect) can be reused once the peer exits — its connection
+    // may live on in a child — so the answer is confirmed through its pidfd: a peer that is
+    // gone counts as sandboxed. A failed lookup otherwise (/proc hidden) counts as not
+    // sandboxed: the global stays as it was before filters existed.
     if (cred_.pid != 0) {
         char path[64];
         std::snprintf(path, sizeof(path), "/proc/%u/root/.flatpak-info", cred_.pid);
-        if (::access(path, F_OK) == 0) {
+        const bool found = ::access(path, F_OK) == 0;
+        if (!peer_confirmed(credentials())) {
+            sandbox_ = 2;
+            log_wayland.info("client pid={} exited before its sandbox check: treated as "
+                             "sandboxed",
+                             cred_.pid);
+        } else if (found) {
             sandbox_ = 2;
             log_wayland.info("client pid={} is sandboxed (Flatpak): session-wide "
                              "globals hidden",
@@ -532,6 +576,7 @@ lx::result<void> lx::wayland::server::bind_libwayland(const char* socket_name) {
 
     wl_display_init_shm(display_);
     wl_display_set_global_filter(display_, &global_filter, this);
+    (void)peer_pidfds();
 
     const char* runtime = std::getenv("XDG_RUNTIME_DIR");
     if (runtime && runtime[0] != '\0')
@@ -787,8 +832,10 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
                          cred.pid);
         return false;
     }
-    // The peer's pid comes from SO_PEERCRED at connect, and the connection is still open,
-    // so the process is alive and the pid cannot have been reused. Same check as KWin's
+    // The peer's pid comes from SO_PEERCRED at connect. An open connection does not keep
+    // that process alive (a child may hold it), so after the read its pidfd must still name
+    // a running process — then the pid was never free to be reused, and the executable is
+    // the peer's. Without SO_PEERPIDFD the pid is taken alone. Same check as KWin's
     // restricted interfaces (it reads /proc/<pid>/exe too). It is not a boundary against a
     // same-UID attacker that can ptrace the shell — nothing at this layer is.
     char exe[PATH_MAX]{};
@@ -801,6 +848,12 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
             exe[n] = '\0';
             have_exe = true;
         }
+    }
+    if (!peer_confirmed(cred)) {
+        log_wayland.warn("privileged global {} denied: client pid={} has exited, its pid may "
+                         "name another process",
+                         name, cred.pid);
+        return false;
     }
     const lx::session::privilege_checker checker{
         {.expected_uid = static_cast<unsigned>(::getuid()),
@@ -880,11 +933,24 @@ lx::wayland::client_connection* lx::wayland::server::ensure_client(void* wl_clie
     cred.pid = static_cast<unsigned>(pid);
     cred.uid = static_cast<unsigned>(uid);
     cred.gid = static_cast<unsigned>(gid);
+    // The pidfd names the process the kernel recorded at connect, however late it is asked.
+    lx::unique_fd pidfd;
+    if (peer_pidfds()) {
+        auto fd =
+            lx::session::peer_pidfd(wl_client_get_fd(static_cast<struct wl_client*>(wl_client)));
+        if (fd)
+            pidfd = std::move(*fd);
+        else
+            cred.peer_gone = true;
+    }
 #endif
 
     auto& slot = clients_[client_count_++];
     slot.set_id(next_client_id_++);
     slot.set_credentials(cred);
+#if defined(LUMEN_HAS_WAYLAND)
+    slot.pidfd_ = std::move(pidfd);
+#endif
     slot.set_native(wl_client);
     slot.set_server(this);
     slot.set_privileged_shell(cred.uid == static_cast<unsigned>(::getuid()));

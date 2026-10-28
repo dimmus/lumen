@@ -572,6 +572,15 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_session_discovery PRIVATE tests)
     add_test(NAME test_session_discovery COMMAND test_session_discovery)
 
+    # Client identification through peer pidfds (SO_PEERPIDFD): the privileged-shell and
+    # sandbox checks against an exited peer, and the SO_PEERCRED-only fallback.
+    add_executable(test_peer_pidfd tests/test_peer_pidfd.cpp)
+    target_link_libraries(test_peer_pidfd PRIVATE lx.wayland.server)
+    lumen_apply_module_properties(test_peer_pidfd)
+    lumen_link_platform(test_peer_pidfd)
+    target_include_directories(test_peer_pidfd PRIVATE tests)
+    add_test(NAME test_peer_pidfd COMMAND test_peer_pidfd)
+
     if(LUMEN_HAS_VARLINK)
         add_executable(test_control tests/test_control.cpp)
         target_link_libraries(test_control PRIVATE lx.compositor)
