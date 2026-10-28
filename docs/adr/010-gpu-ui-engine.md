@@ -1571,6 +1571,18 @@ hardware device (node matching, tiled modifiers, a warm pipeline cache: G7 warm 
 there only); G11's frame rule and every client p95 on a host without this VM's jitter; the
 clipboard (`lx::app::clipboard`) is still a no-op.
 
+Tried for G7 on GL (2026-10-28), not kept. Building the two programs ahead on a helper thread
+in a shared EGL context, from the moment the tier was chosen, so they compiled during the
+configure, the swapchain and the first tick. `lumen-hello`'s first frame on SVGA3D spends
+55–62 ms of its 58–66 ms render in `glCompileShader` / `glLinkProgram` (the first draw's
+driver variant is the other ≈ 4 ms), so the overlap was worth up to the tick's 18 ms. It
+lost: with the client on one CPU, cold went from ≈ 149 to ≈ 161 ms (the helper competes with
+the thread it frees, and its context costs time to make). Unpinned against the bench's
+in-process compositor, cold went from 131–135 to 133–139 ms p50 and warm from 113–115 to
+129–133 ms, since the compositor is busy on the other CPU while the client starts. The cold
+start is the driver's: EGL on GBM ≈ 27 ms, the two compiles ≈ 60 ms, and fontconfig ≈ 16 ms on
+a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
+
 ### Phase 5 — Adoption and deletion (≈2 weeks) — not started
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;
@@ -1668,9 +1680,21 @@ asserts the `text.contrast` correction keeps the mean stem coverage within 3 %.
 - `scripts/ui-bench.sh [--backend gl|cpu|vulkan] [--e2e] [--compare baseline.json]`
   builds release, runs every scenario on every available backend, stores results under
   `tests/bench/results/<host>-<driver>/<date>-<sha>.json`, and compares against
-  `tests/bench/baseline/<host>-<driver>.json`: **fail** on p95 regressions above 10 % for
+  `tests/bench/baseline/<host>-<driver>.json`: **fail** on p50 regressions above 25 % for
   any stage, on any steady-frame allocation, on a draw-call count above the scenario's
-  cap, or on a golden diff; **warn** at 5 %. Updating a baseline is a deliberate commit.
+  cap, or on a golden diff; **warn** on a p50 above 10 % or a p95 above 25 %. Updating a
+  baseline is a deliberate commit. As amended (2026-10-28): the headless rows failed on a p95
+  10 % over until then, and on this VM that gate failed on noise in every run. Interleaved
+  runs of Phase 3's binary and main's (`setarch -R`, CPU 1, three rounds each) gave the same
+  p50 on every S1–S3 stage, while either binary's p95 moved 40 % and more from one run to the
+  next (S2 tick 555–931 µs). A p50 is steadier — S2 tick 88.7–92.6 µs — but not steady
+  enough for 10 %: one binary run twice back to back moved S4's frame p50 14 % and S2's
+  reconcile 18 %. The client rows have failed on p50 since Phase 4 for the same reason. A
+  stored p50 also drifts with the host: S3's `update`, 10 000 xorshift steps unchanged since
+  Phase 3, read 69.7 µs in Phase 3's baseline and 79–83 µs in both binaries on 2026-10-28.
+  So the stored gate catches regressions of about a quarter and up; a change is vetted
+  finer by an interleaved A/B against its base binary, and the baseline is refreshed when
+  such an A/B shows the host, not the code, moved — as `iritur-none.json` was that day.
 - CTest: label `bench`; the default test presets exclude it; `ctest --preset bench` runs
   the headless rows in under two minutes (a `-L bench` on top of another preset still
   meets that preset's exclude).
