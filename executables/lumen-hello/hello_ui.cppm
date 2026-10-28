@@ -1,10 +1,13 @@
 // lumen-hello's window, built only from ADR-010 §5.6 components: a panel with a headline, a
 // text field, a filled button that counts its clicks through a reducer (with a tooltip), a
-// checkbox and a switch. Shared with tests/test_app_window.cpp, which drives this very tree
-// through a compositor. Include after `import lx.ui;` and `import std;`.
-#pragma once
+// checkbox and a switch. A module of its own so tests/test_app_window.cpp drives this very
+// tree through a compositor.
+export module lumen.hello.ui;
 
-namespace hello {
+import std;
+import lx.ui;
+
+export namespace hello {
 
 /// The form's state: one reducer holds it, so a click re-describes the form's subtree and
 /// the reconcile repaints only what changed (the counter label).
@@ -16,7 +19,7 @@ struct form_state {
 
 enum class form_action : unsigned char { click, toggle_check, toggle_switch };
 
-inline void reduce(form_state& s, const form_action& a) {
+void reduce(form_state& s, const form_action& a) {
     switch (a) {
     case form_action::click: ++s.clicks; break;
     case form_action::toggle_check: s.checked = !s.checked; break;
@@ -34,7 +37,7 @@ inline constexpr lx::ui::element_key k_checkbox = 0x6865'0004;
 inline constexpr lx::ui::element_key k_switch = 0x6865'0005;
 inline constexpr lx::ui::element_key k_form = 0x6865'0006;
 
-inline lx::ui::child build_form(const form_state& s, form_host& host) {
+lx::ui::child build_form(const form_state& s, form_host& host) {
     using namespace lx::ui;
     const child row[2] = {
         button("Increment")
@@ -63,7 +66,7 @@ inline lx::ui::child build_form(const form_state& s, form_host& host) {
     return div(style{}.flex_col().gap(sp::b16), kids);
 }
 
-inline lx::ui::child describe(lx::ui::build_context&) {
+lx::ui::child describe(lx::ui::build_context&) {
     using namespace lx::ui;
     const child body[3] = {
         headline("Hello Lumen").size(headline_size::large),

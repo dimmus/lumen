@@ -5,8 +5,10 @@ find_package(PkgConfig QUIET)
 
 if(PkgConfig_FOUND)
     pkg_check_modules(WAYLAND QUIET wayland-server wayland-client)
-    # A Wayland client alone (lumen-shell): libwayland-client without the server.
+    # A Wayland client alone (lumen-shell): libwayland-client without the server, and the
+    # server alone (lx.wayland.server, lx.compositor): a compositor is not a client.
     pkg_check_modules(WAYLAND_CLIENT QUIET wayland-client)
+    pkg_check_modules(WAYLAND_SERVER QUIET wayland-server)
     pkg_check_modules(WAYLAND_SCANNER QUIET wayland-scanner)
     pkg_check_modules(LIBDRM QUIET libdrm)
     # libdisplay-info parses EDID into the make/model/serial a monitor is identified by
@@ -245,7 +247,16 @@ endfunction()
 #   text            HarfBuzz, FreeType, fontconfig  LUMEN_HAS_TEXT
 #                   fribidi                         LUMEN_HAS_FRIBIDI
 #                   libunibreak                     LUMEN_HAS_UNIBREAK
-#   systemd         libsystemd (sd-bus)        LUMEN_HAS_LOGIND
+#   systemd         libsystemd (sd-bus)        LUMEN_HAS_LOGIND (+ LUMEN_HAS_VARLINK)
+#   wayland_server  libwayland-server          LUMEN_HAS_WAYLAND
+#   vulkan          the Vulkan loader          LUMEN_HAS_VULKAN
+#   drm             libdrm                     LUMEN_HAS_DRM
+#   display_info    libdisplay-info            LUMEN_HAS_DISPLAY_INFO
+#   udev            libudev                    LUMEN_HAS_UDEV
+#   input           libinput + xkbcommon       LUMEN_HAS_INPUT (+ LUMEN_HAS_LIBINPUT_3FG_DRAG)
+#   egl             EGL, GLESv2, GBM           LUMEN_HAS_EGL
+# Module libraries are static, so a PRIVATE link still reaches every executable that imports
+# them: each module takes exactly the parts whose LUMEN_HAS_* its sources test.
 function(lumen_link_platform_parts target)
     foreach(part IN LISTS ARGN)
         if(part STREQUAL "wayland_client")
@@ -272,21 +283,57 @@ function(lumen_link_platform_parts target)
                 target_include_directories(${target} PRIVATE ${LIBSYSTEMD_INCLUDE_DIRS})
                 target_link_libraries(${target} PRIVATE ${LIBSYSTEMD_LIBRARIES})
                 target_compile_definitions(${target} PRIVATE LUMEN_HAS_LOGIND=1)
+                if(LUMEN_HAS_VARLINK)
+                    target_compile_definitions(${target} PRIVATE LUMEN_HAS_VARLINK=1)
+                endif()
+            endif()
+        elseif(part STREQUAL "wayland_server")
+            if(WAYLAND_SERVER_FOUND)
+                target_include_directories(${target} PRIVATE ${WAYLAND_SERVER_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${WAYLAND_SERVER_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_WAYLAND=1)
+            endif()
+        elseif(part STREQUAL "vulkan")
+            if(Vulkan_FOUND)
+                target_link_libraries(${target} PRIVATE Vulkan::Vulkan)
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_VULKAN=1)
+            endif()
+        elseif(part STREQUAL "drm")
+            if(LIBDRM_FOUND)
+                target_include_directories(${target} PRIVATE ${LIBDRM_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${LIBDRM_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_DRM=1)
+            endif()
+        elseif(part STREQUAL "display_info")
+            if(LIBDISPLAYINFO_FOUND)
+                target_include_directories(${target} PRIVATE ${LIBDISPLAYINFO_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${LIBDISPLAYINFO_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_DISPLAY_INFO=1)
+            endif()
+        elseif(part STREQUAL "udev")
+            if(LIBUDEV_FOUND)
+                target_include_directories(${target} PRIVATE ${LIBUDEV_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${LIBUDEV_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_UDEV=1)
+            endif()
+        elseif(part STREQUAL "input")
+            if(LIBINPUT_FOUND AND XKBCOMMON_FOUND)
+                target_include_directories(${target} PRIVATE ${LIBINPUT_INCLUDE_DIRS}
+                                                             ${XKBCOMMON_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${LIBINPUT_LIBRARIES} ${XKBCOMMON_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_INPUT=1)
+                if(LIBINPUT_libinput_VERSION VERSION_GREATER_EQUAL 1.28)
+                    target_compile_definitions(${target} PRIVATE LUMEN_HAS_LIBINPUT_3FG_DRAG=1)
+                endif()
+            endif()
+        elseif(part STREQUAL "egl")
+            if(LIBEGL_FOUND)
+                target_include_directories(${target} PRIVATE ${LIBEGL_INCLUDE_DIRS})
+                target_link_libraries(${target} PRIVATE ${LIBEGL_LIBRARIES})
+                target_compile_definitions(${target} PRIVATE LUMEN_HAS_EGL=1)
             endif()
         else()
             message(FATAL_ERROR "lumen_link_platform_parts: unknown part '${part}'")
-        endif()
-    endforeach()
-endfunction()
-
-# Link platform deps into module libraries that call platform APIs directly.
-# Prefer this over linking platform only to executables.
-function(lumen_link_platform_modules)
-    foreach(target IN LISTS ARGN)
-        if(TARGET ${target})
-            lumen_link_platform(${target})
-        else()
-            message(WARNING "lumen_link_platform_modules: unknown target '${target}'")
         endif()
     endforeach()
 endfunction()

@@ -231,22 +231,22 @@ lumen_link_platform_parts(lx.app xkb)
 # client ≈ 6 ms of its start-up on the development host (ADR-010 §7 Phase 4, S10).
 target_link_options(lx.app INTERFACE "LINKER:--as-needed")
 
-# Platform APIs must link on MODULE libraries (not only executables).
-lumen_link_platform_modules(
-    lx.wayland.server
-    lx.gfx
-    lx.drm
-    lx.input
-    lx.session
-    lx.compositor
-)
+# Platform APIs link on the module libraries that call them, each with only the parts whose
+# LUMEN_HAS_* its sources test: the archives are static, so whatever a module links reaches
+# every executable importing it (lumen-shell imports lx.gfx through lx.text, and took
+# libinput with its libwacom / GLib / Lua, udev, libwayland-server and libdisplay-info).
+lumen_link_platform_parts(lx.wayland.server wayland_server)
+lumen_link_platform_parts(lx.gfx vulkan drm egl)
+lumen_link_platform_parts(lx.drm drm display_info udev)
+lumen_link_platform_parts(lx.input input)
+lumen_link_platform_parts(lx.session systemd)
+lumen_link_platform_parts(lx.compositor wayland_server drm systemd)
 
 # ── Executables ──────────────────────────────────────────────────────────────
 add_executable(lumen-compositor executables/lumen-compositor/main.cpp)
 target_link_libraries(lumen-compositor PRIVATE lx.compositor)
 lumen_apply_module_properties(lumen-compositor)
 lumen_check_executable_layers(lumen-compositor lx.compositor)
-lumen_link_platform(lumen-compositor)
 
 add_executable(lumen-shell executables/lumen-shell/main.cpp)
 target_link_libraries(lumen-shell PRIVATE lx.shell)
@@ -299,8 +299,14 @@ target_link_libraries(lumen-input-probe PRIVATE lx.input lx.session lx.trace)
 lumen_apply_module_properties(lumen-input-probe)
 lumen_link_platform(lumen-input-probe)
 
+# lumen-hello's window tree, a module of its own: test_app_window drives the same tree.
+add_library(lumen-hello-ui)
+target_sources(lumen-hello-ui PUBLIC FILE_SET CXX_MODULES TYPE CXX_MODULES
+    BASE_DIRS ${CMAKE_SOURCE_DIR} FILES executables/lumen-hello/hello_ui.cppm)
+target_link_libraries(lumen-hello-ui PUBLIC lx.ui)
+lumen_apply_module_properties(lumen-hello-ui)
 add_executable(lumen-hello executables/lumen-hello/main.cpp)
-target_link_libraries(lumen-hello PRIVATE lx.app)
+target_link_libraries(lumen-hello PRIVATE lx.app lumen-hello-ui)
 lumen_apply_module_properties(lumen-hello)
 lumen_check_executable_layers(lumen-hello lx.app)
 
@@ -1180,7 +1186,7 @@ if(LUMEN_BUILD_TESTS)
     if(LIBPNG_FOUND)
         add_executable(test_app_window tests/test_app_window.cpp)
         target_link_libraries(test_app_window PRIVATE lx.compositor lx.wayland.client lx.app
-            ${LIBPNG_LINK_LIBRARIES})
+            lumen-hello-ui ${LIBPNG_LINK_LIBRARIES})
         lumen_apply_module_properties(test_app_window)
         lumen_link_platform(test_app_window)
         target_include_directories(test_app_window PRIVATE tests "${LUMEN_GENERATED_DIR}"

@@ -168,10 +168,10 @@ so this side's implicit wait sees it.
 
 ## Related protocols
 
-- `linux-dmabuf-v1` (P0) — buffer submission
-- `linux-drm-syncobj-v1` (P0) — explicit sync
-- `wp_presentation` (P1) — frame timing feedback
-- `wp_viewporter`, `wp_fractional_scale_v1` (P1) — source crop, destination size, scale
+- `linux-dmabuf-v1` — buffer submission
+- `linux-drm-syncobj-v1` — explicit sync
+- `wp_presentation` — frame timing feedback
+- `wp_viewporter`, `wp_fractional_scale_v1` — source crop, destination size, scale
 
 ## Code stubs
 
