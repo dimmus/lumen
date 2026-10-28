@@ -6,7 +6,6 @@ import lx.layout;
 import lx.text;
 import lx.runtime;
 import lx.gfx;
-import lx.wayland.client;
 import lx.a11y;
 
 export module lx.ui;

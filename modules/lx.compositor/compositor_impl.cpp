@@ -9866,6 +9866,9 @@ void compositor::inject_key(const lx::input::key_event& event) {
     impl_->on_input_key(event);
     if (mods_changed)
         impl_->on_input_modifiers(seat.keymap().modifiers());
+    // As `input_ready_callback` after a libinput dispatch: what the event changed (a grab's
+    // configure, a cursor move, focus) is served by the next tick, started now.
+    impl_->request_frame();
 }
 
 void compositor::inject_pointer_motion(const lx::input::pointer_motion_event& event) {
@@ -9883,6 +9886,7 @@ void compositor::inject_pointer_motion(const lx::input::pointer_motion_event& ev
     }
     seat.set_pointer_position(event.x, event.y);
     impl_->on_input_pointer_motion(e);
+    impl_->request_frame();
 }
 
 void compositor::inject_pointer_relative(double dx, double dy, double dx_unaccel,
@@ -9901,16 +9905,21 @@ void compositor::inject_pointer_relative(double dx, double dy, double dx_unaccel
     e.x = seat.pointer_x();
     e.y = seat.pointer_y();
     impl_->on_input_pointer_motion(e);
+    impl_->request_frame();
 }
 
 void compositor::inject_gesture(const lx::input::gesture_event& event) {
-    if (impl_)
-        impl_->on_input_gesture(event);
+    if (!impl_)
+        return;
+    impl_->on_input_gesture(event);
+    impl_->request_frame();
 }
 
 void compositor::inject_pointer_button(const lx::input::pointer_button_event& event) {
-    if (impl_)
-        impl_->on_input_pointer_button(event);
+    if (!impl_)
+        return;
+    impl_->on_input_pointer_button(event);
+    impl_->request_frame();
 }
 
 void compositor::simulate_connector_scan(const lx::drm::connector_scan& scan) {

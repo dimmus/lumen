@@ -197,6 +197,11 @@ public:
     /// Metadata-only copy for callers that must not take plane FD ownership. The import
     /// path must not use this — an FD-less desc cannot be imported.
     [[nodiscard]] lx::gfx::dmabuf_desc extract_dmabuf_desc(lx::buffer_id buffer) const;
+    /// The dma-buf of `surface`'s current buffer as the compositor registered it — the plane
+    /// fds it received, their offsets, strides and modifier — or null (no surface, an shm
+    /// buffer). For tests that read back what the compositor samples. UI affinity; valid until
+    /// the surface's next commit.
+    [[nodiscard]] const lx::gfx::dmabuf_desc* current_dmabuf(lx::surface_id surface) const;
     void attach_imported(lx::surface_id surface, lx::gfx::imported_image image);
     void destroy(lx::surface_id surface);
     void set_override_redirect(lx::surface_id surface, bool value);
@@ -552,6 +557,17 @@ lx::result<void> lx::compositor::surface_manager::on_commit(surface_commit commi
     }
 
     return {};
+}
+
+const lx::gfx::dmabuf_desc* lx::compositor::surface_manager::current_dmabuf(
+    lx::surface_id surface) const {
+    const int slot = find_surface(surface);
+    if (slot < 0)
+        return nullptr;
+    const int b = find_buffer(surfaces_[static_cast<unsigned>(slot)].buffer);
+    if (b < 0 || buffers_[static_cast<unsigned>(b)].kind != buffer_kind::dmabuf)
+        return nullptr;
+    return &buffers_[static_cast<unsigned>(b)].desc;
 }
 
 lx::gfx::dmabuf_desc lx::compositor::surface_manager::extract_dmabuf_desc(lx::buffer_id buffer) const {

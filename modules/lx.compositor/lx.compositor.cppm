@@ -199,8 +199,10 @@ public:
     void tick_ui(scheduler::frame_tick tick);
     void tick_render();
 
-    /// Virtual input for headless tests: each runs the same path a libinput event takes
-    /// (window manager, router, serials, focus). UI affinity. A key updates the keymap
+    /// Virtual input for headless tests and the client bench: each runs the same path a
+    /// libinput event takes (window manager, router, serials, focus) and, as a libinput
+    /// dispatch does, then starts the frame clock so a grab's configure or a cursor move is
+    /// served by the next tick. UI affinity. A key updates the keymap
     /// state and the held keys first and sends the modifiers it changes after, exactly as
     /// the seat does; a motion puts the pointer at (`x`, `y`) in global coordinates.
     void inject_key(const lx::input::key_event& event);

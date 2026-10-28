@@ -36,11 +36,14 @@ export namespace lx::ui {
 // from `arrange` (the bounds' width over the scale) when the block wraps; `measure` asks the
 // layout at the constraint's width (unbounded at `layout::constraints`' 99 999).
 //
-// Coordinates: the node's bounds are device pixels (what `draw_scope` takes); the layout is
-// laid out at `scale` (its 26.6 units are device pixels too); `font.size_pt` and the logical
-// max width are scaled by it. Glyphs are rasterised at size × scale, placed by
-// `text::glyph_pen` — x on a quarter pixel (the subpixel variant), y on a whole pixel — so a
-// glyph sprite always lands 1:1 on whole pixels and samples its tile exactly.
+// Coordinates: the node's bounds are layout pixels (what `draw_scope` takes, logical in a
+// scaled window); the layout is laid out at the raster scale — the props' `scale` × the UI's
+// device scale (`ui_device_scale`, ADR-010 §4.10) — so its 26.6 units are device pixels;
+// `font.size_pt` and the logical max width are scaled by it, and `measure` answers device
+// sizes over the device scale (rounded up). Glyphs are rasterised at size × raster scale,
+// placed by `text::glyph_pen` — x on a quarter pixel (the subpixel variant), y on a whole
+// pixel — from the block's projected origin (`draw_scope::device_rect`), so a glyph sprite
+// always lands 1:1 on whole device pixels and samples its tile exactly at any scale.
 //
 // Emission does no per-glyph work for a line outside the scope's clip: lines are stacked
 // top to bottom, so the visible ones are found by a binary search over their tops (widened
@@ -167,6 +170,11 @@ public:
     void emit(draw_scope& out) const override;
 
     [[nodiscard]] const lx::text::text_layout& layout() const { return layout_; }
+    /// The UI device scale the layout is laid out at (`ui_device_scale` when it last
+    /// measured, arranged or drew): its 26.6 units are layout px × this.
+    [[nodiscard]] float device_scale() const { return ui_scale_; }
+    /// A length of the layout's (device px) in layout px, rounded up.
+    [[nodiscard]] int to_layout_px(int device_px) const;
     [[nodiscard]] text_emit_stats last_emit() const { return stats_; }
     [[nodiscard]] text_async_stats async_stats() const;
 
@@ -183,15 +191,21 @@ private:
     void land();
     static void run_job(void* job);
     static void land_job(void* job);
-    /// The layout's max width (logical px) for a device-pixel width; 0 is unbounded.
-    [[nodiscard]] float logical_width(int device_px) const;
+    /// The layout's max width (its logical units) for a width in layout px; 0 is unbounded.
+    [[nodiscard]] float logical_width(int width_px) const;
+    /// Follows a change of `ui_device_scale` since the layout was set up (a reducer's
+    /// subtree is not re-applied when the root's scale moves).
+    void sync_scale() const;
     /// UI affinity: a face the layout's runs name is gone from the face cache. Reshapes —
     /// inline on the next frame, or through another worker job for off-thread text.
     void faces_evicted();
 
     mutable lx::text::text_layout layout_{};
     lx::color color_ = lx::color::rgb(1.f, 1.f, 1.f);
-    float scale_ = 1.f;
+    /// The raster scale: the props' scale × the UI's device scale.
+    mutable float scale_ = 1.f;
+    float prop_scale_ = 1.f;
+    mutable float ui_scale_ = 1.f;
     bool wraps_ = true;
     lx::text::glyph_hinting hinting_ = lx::text::glyph_hinting::none;
     lx::text::glyph_cache* glyphs_ = nullptr;
@@ -322,7 +336,9 @@ bool lx::ui::text_block_node::apply(const text_block_props& p) {
         p.color.a != color_.a)
         invalidate_paint(*this);
     color_ = p.color;
-    scale_ = p.scale > 0.f ? p.scale : 1.f;
+    prop_scale_ = p.scale > 0.f ? p.scale : 1.f;
+    ui_scale_ = ui_device_scale();
+    scale_ = prop_scale_ * ui_scale_;
     wraps_ = p.wrap == lx::text::text_wrap::word;
     hinting_ = p.hinting;
     glyphs_ = p.context.glyphs;
@@ -485,10 +501,32 @@ lx::ui::text_async_stats lx::ui::text_block_node::async_stats() const {
     return s;
 }
 
-float lx::ui::text_block_node::logical_width(int device_px) const {
-    if (!wraps_ || device_px <= 0 || device_px >= 99999)
+float lx::ui::text_block_node::logical_width(int width_px) const {
+    if (!wraps_ || width_px <= 0 || width_px >= 99999)
         return 0.f;
-    return static_cast<float>(device_px) / scale_;
+    // Layout px → the layout's own logical units: device px over the raster scale, which
+    // is the props' scale (the UI's device scale cancels).
+    return static_cast<float>(width_px) / prop_scale_;
+}
+
+void lx::ui::text_block_node::sync_scale() const {
+    const float s = ui_device_scale();
+    if (s == ui_scale_)
+        return;
+    // The window moved to an output of another scale: lay the text out (and rasterise it)
+    // at the new device scale. `ui_root` relays the whole tree out when its scale changes.
+    ui_scale_ = s;
+    scale_ = prop_scale_ * ui_scale_;
+    layout_.set_scale(scale_);
+    placed_valid_ = false;
+}
+
+int lx::ui::text_block_node::to_layout_px(int device_px) const {
+    if (ui_scale_ == 1.f)
+        return device_px;
+    // Up, so the box holds every device pixel of the text (the tolerance absorbs the float
+    // error of an exact multiple).
+    return static_cast<int>(std::ceil(static_cast<double>(device_px) / ui_scale_ - 1e-4));
 }
 
 void lx::ui::text_block_node::faces_evicted() {
@@ -505,13 +543,15 @@ void lx::ui::text_block_node::faces_evicted() {
 }
 
 lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint hint) const {
+    sync_scale();
     // A measure wraps the layout at the width it asks about; `emit` puts the bounds' width
     // back, since a parent may measure after it arranged (a cached arrange is not re-run).
     int width = c.max.width;
     if (hint == size_hint::min && wraps_)
-        width = std::min(width, std::max(layout_.min_content_width(), 1));
+        width = std::min(width, std::max(to_layout_px(layout_.min_content_width()), 1));
     layout_.set_max_width(logical_width(width));
     lx::size2i out = layout_.bounding_size();
+    out = {to_layout_px(out.width), to_layout_px(out.height)};
     if (out.width < c.min.width)
         out.width = c.min.width;
     if (out.height < c.min.height)
@@ -527,6 +567,7 @@ lx::size2i lx::ui::text_block_node::measure(lx::layout::constraints c, size_hint
 }
 
 void lx::ui::text_block_node::arrange(lx::rect2i bounds) {
+    sync_scale();
     bounds_ = bounds;
     layout_.set_max_width(logical_width(bounds.width));
     layout_dirty_ = false;
@@ -536,6 +577,7 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     stats_ = {};
     if (!visible_ || !glyphs_)
         return;
+    sync_scale();
     layout_.set_max_width(logical_width(bounds_.width));
     // Lay out now, before the face lock below: the queries lock the engine lazily.
     if (!layout_.update())
@@ -547,10 +589,13 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
 
     // The clip in the layout's space (26.6 from its top), widened by an em for ink outside
     // the line boxes.
-    const lx::rect2i clip = out.clip();
-    const lx::point2i origin = out.origin();
+    // Device space: the layout's units are device pixels (it is laid out at the device
+    // scale), placed from the block's projected origin, so every glyph lands on whole device
+    // pixels and samples its tile 1:1 at any scale.
+    const lx::rect2i clip = out.device_clip();
+    const lx::rect2i dbounds = out.device_rect(bounds_);
     const std::int32_t em = layout_.size_26_6();
-    const std::int64_t top_px = static_cast<std::int64_t>(clip.y) - origin.y - bounds_.y;
+    const std::int64_t top_px = static_cast<std::int64_t>(clip.y) - dbounds.y;
     const std::int64_t clip_top = top_px * 64 - em;
     const std::int64_t clip_bottom = (top_px + clip.height) * 64 + em;
     // Across: the lines start at most the overflow left of the bounds (end-aligned text wider
@@ -558,11 +603,11 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     // block wholly beside the clip — a label outside a frame's damage — looks at no glyph.
     {
         const std::int64_t text_w = (static_cast<std::int64_t>(layout_.width()) + 63) / 64;
-        const std::int64_t over = std::max<std::int64_t>(text_w - bounds_.width, 0);
+        const std::int64_t over = std::max<std::int64_t>(text_w - dbounds.width, 0);
         const std::int64_t em_px = (static_cast<std::int64_t>(em) + 63) / 64;
-        const std::int64_t left = static_cast<std::int64_t>(origin.x) + bounds_.x - over - em_px;
+        const std::int64_t left = static_cast<std::int64_t>(dbounds.x) - over - em_px;
         const std::int64_t right =
-            static_cast<std::int64_t>(origin.x) + bounds_.x + bounds_.width + over + em_px;
+            static_cast<std::int64_t>(dbounds.x) + dbounds.width + over + em_px;
         if (right <= clip.x || left >= static_cast<std::int64_t>(clip.x) + clip.width)
             return;
     }
@@ -587,7 +632,7 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     const lx::gfx::packed_rgba white = lx_ui_text_pack(lx::color::rgb(1.f, 1.f, 1.f), opacity);
     const lx::text::glyph_hinting hinting = lx::text::effective_hinting(hinting_, scale_);
     const std::span<const lx::text::text_attr> attrs = layout_.attrs();
-    const lx::point2i at{bounds_.x, bounds_.y};
+    const lx::point2i at{dbounds.x, dbounds.y};
     lx::gfx::atlas& atlas = glyphs_->atlas();
     const std::uint32_t atlas_frame = static_cast<std::uint32_t>(atlas.frame());
     // A run's face was evicted from the face cache since the shape pass.
@@ -619,11 +664,11 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
     const auto flush = [&] {
         if (pending_count == 0)
             return;
-        const std::uint32_t order = out.group_order(pending_union, next_order);
+        const std::uint32_t order = out.device_group_order(pending_union, next_order);
         next_order = order + 1;
         for (unsigned i = 0; i < pending_count; ++i) {
             const lx_ui_pending_glyph& g = pending[i];
-            out.glyph(g.kind, g.page, g.box, g.uv, g.color, order);
+            out.device_glyph(g.kind, g.page, g.box, g.uv, g.color, order);
         }
         pending_count = 0;
         pending_union = {};
@@ -764,11 +809,11 @@ void lx::ui::text_block_node::emit(draw_scope& out) const {
             const lx::color c = span_color ? lx_ui_text_rgba(attr->color) : color_;
             if (wavy) {
                 // Amplitude and thickness t: the curve fills 3t around its centre line.
-                out.underline({at.x + x0, at.y + y_top - thick, x1 - x0, 3 * thick}, c,
-                              static_cast<float>(thick), true);
+                out.device_underline({at.x + x0, at.y + y_top - thick, x1 - x0, 3 * thick}, c,
+                                     static_cast<float>(thick), true);
             } else {
-                out.underline({at.x + x0, at.y + y_top, x1 - x0, thick}, c,
-                              static_cast<float>(thick));
+                out.device_underline({at.x + x0, at.y + y_top, x1 - x0, thick}, c,
+                                     static_cast<float>(thick));
             }
             ++stats_.underlines;
         }

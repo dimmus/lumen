@@ -143,7 +143,7 @@ Runs **three logical threads** (see [threading.md](subsystems/threading.md)):
 `:desktop_entry`, `:app_catalog`, `:app_launch`, `:background`, `:workspaces`, `:switcher`,
 `:user_bus`, `:notifications`, `:notify_view`, `:menu_popup`, `:tray`, `:icon_theme`,
 `:svg`), `lx.shell.policy`, `lx.text`;
-libwayland-client directly (`lx.wayland.client` is still a stub), xkbcommon for the
+libwayland-client directly (its bindings move onto `lx.wayland.client` in ADR-010 Phase 5), xkbcommon for the
 launcher's keyboard, sd-bus for the user bus (launching, notifications, the tray), librsvg
 by `dlopen` on the first SVG not in the icon cache. It links only the platform parts it
 uses (`lumen_link_platform_parts`), not the compositor's DRM, GBM, EGL, Vulkan and input
@@ -244,17 +244,37 @@ the workspaces, which the shell displays and switches through ext-workspace. Det
 
 ### 2.3 Application processes
 
-**Typical binary:** user app linked against `lx.app`  
-**Modules:** `lx.app`, `lx.ui`, `lx.ui.builder`, `lx.wayland.client`
+**Typical binary:** user app linked against `lx.app` (`lumen-hello` is the reference)  
+**Modules:** `lx.app` (`:window`, `:input`), `lx.ui`, `lx.gfx` (`:swapchain`, the UI
+renderers), `lx.wayland.client`
 
-Each app:
+Each app (ADR-010 §4.9–§4.10, Phase 4):
 
-- Connects to the compositor display
-- Creates `xdg_toplevel` + `wl_surface` for its windows
-- Uses `lx.ui` widgets; optional fluent builder API
-- Submits buffers (SHM during dev, dmabuf in production)
+- `lx::application` connects (`lx.wayland.client`), loads the compiled theme, runs one
+  `lx::runtime::event_loop` on the UI thread and a worker thread for icon rasters and theme
+  reloads (threading.md, "Client process")
+- `lx::app::window` creates the `wl_surface` + `xdg_toplevel` (server-side decorations
+  requested), owns an `lx::ui::ui_root`, and draws it on the pixel tier `lx::gfx::client_gpu`
+  picks the way the compositor picks its own (hardware Vulkan → hardware GL on GBM → CPU over
+  `wl_shm`) into a `client_swapchain` of dma-bufs (or shm), one wl_buffer per image
+- Frames follow lx.ui's damage ledger: drawn at once from idle, then throttled by the frame
+  callback; only the damage is repainted (scissored, buffer age) and reported
+  (`damage_buffer`); an idle window requests nothing and arms nothing
+- Fractional scale through `wp_fractional_scale_v1` + `wp_viewport` (the buffer at
+  ceil(logical × scale), the UI laid out in logical px and projected at emission)
+- Input: `wl_pointer` (frames coalesced, one hit test per frame), `wl_keyboard` through xkb
+  with client-side repeat, `zwp_text_input_v3` into the focused field, `wp_cursor_shape_v1`
 
-Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`.
+- Measured as a whole by `lumen-ui-bench --client` (ADR-010 §8.3 S1, S5, S7, S9, S10) against
+  a headless compositor, per tier (ADR-010 §7 Phase 4 "As built", stage 4): an idle window
+  wakes 0 times in 10 s; a hover frame allocates nothing on the UI thread; a resize storm keeps
+  the heap flat and allocates the swapchain once per size
+- An `lx.app` executable links with `--as-needed`: the module archives carry the compositor's
+  platform libraries (libinput, udev, libwayland-server), which a client never calls and would
+  otherwise map and relocate at every exec
+
+Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`. `lx.ui.builder` is kept compiling until
+ADR-010 Phase 5 deletes it; `lx.app` no longer imports it.
 
 ### 2.4 Portal processes
 
@@ -459,6 +479,7 @@ flowchart LR
 | `lx.gfx.gl_capture` | Screen capture's GL objects (ES 3.0): a client's dma-buf as a framebuffer (imported once per wl_buffer, LRU of 32), `glBlitFramebuffer` of damage rects (and crops), offscreen framebuffers over LINEAR GBM buffers read off the render thread (`read_bo`), asynchronous read-backs into pixel-pack buffers behind a native fence and their copy-out where there is no GBM buffer, the curtain clear |
 | `lx.gfx.cpu_renderer` | Software composite into a CPU-writable scanout buffer; chosen when no hardware renderer is available ([rendering-performance.md](subsystems/rendering-performance.md) §1.2) |
 | `lx.gfx.import_cache` | LRU reuse of VkImage imports; per-client entry cap |
+| `lx.gfx.swapchain` | A client window's pixel path (ADR-010 §4.10): the render node from the dma-buf feedback's main device, the tier in the compositor's `automatic` order and refusal rules (hardware Vulkan on the render node → hardware GLES 3.1 on GBM → wl_shm + `ui_cpu`), and a swapchain of three dma-buf images (two shm) with buffer age, non-blocking acquire, release by wl_buffer.release or linux-drm-syncobj release points, explicit sync per image (GL native fence → DRM syncobj; Vulkan timeline semaphore as a syncobj), reallocation once per size. API-type-free: lx.app maps the images onto wl_buffers through `lx.wayland.client`; `lx.gfx` never imports it. UI affinity in a client |
 | `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries (with a deadline hint), `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
 | `lx.gfx.fence_deadline` | dma-fence deadline hints (`SYNC_IOC_SET_DEADLINE`, Linux 6.4) on composite and client sync_files; probed by use, off for good after ENOTTY |
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
@@ -1839,11 +1860,23 @@ sequenceDiagram
     participant Comp as compositor
 
     Main->>App: application(argc, argv)
-    App->>WL: display::connect("lumen-0")
+    Main->>App: start()
+    App->>WL: display::connect(settings.socket)
     WL->>Comp: Wayland handshake
-    Comp-->>WL: globals (wl_compositor, xdg_wm_base, …)
+    Comp-->>WL: globals (wl_compositor, xdg_wm_base, linux-dmabuf feedback, …)
+    Main->>App: window::open(app, options)
+    App->>Comp: wl_surface + xdg_toplevel, initial commit (no buffer)
+    App->>App: client_gpu (tier), while the configure travels
+    Comp-->>App: xdg_toplevel.configure
+    App->>App: swapchain, ui_root tick, render
+    App->>Comp: ack_configure, attach, damage_buffer, frame, commit
     Main->>App: run() → event_loop
 ```
+
+`lumen-hello --exit-after-first-present` prints these instants as one line (exec, connect,
+first configure, first commit, first presented; CLOCK_MONOTONIC µs) for ADR-010 §8.3 S10,
+which `lumen-ui-bench --client` runs ten times per tier with an empty and a warm Lumen cache,
+`exec` stamped right before `execve` (`LUMEN_EXEC_NS`).
 
 ### 6.2 UI construction (declarative)
 

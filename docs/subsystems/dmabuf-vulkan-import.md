@@ -137,6 +137,19 @@ constants (`src_uv` = origin and +x, `uv_dy` = +y), CPU by inverse mapping. A dm
 at a fractional output scale that renders `round(size·scale)` pixels is drawn 1:1 from its
 imported image — no intermediate copy, no resampling (ADR 007).
 
+## The producing side: Lumen's own clients
+
+Lumen's clients allocate what this path imports through `lx.gfx:swapchain` (ADR-010 §4.10):
+the render node of the feedback's main device, a fourcc and modifier list from its tranches
+(`choose_client_format`), and per window a swapchain of three dma-buf images — GBM bos drawn
+by GLES 3.1, or Vulkan images with `VK_EXT_image_drm_format_modifier` exported as dma-bufs —
+or two shm images on the CPU tier. A re-committed image is the same `(client, buffer,
+modifier)` key, so the import cache hits. Explicit sync is per image: a DRM syncobj timeline
+(GL: the frame's native fence imported at the acquire point; Vulkan: a timeline semaphore
+exported as the syncobj), which `drm_timeline_table::import` takes as any client's. Without
+it the Vulkan tier attaches its frame fence to the dma-buf (`DMA_BUF_IOCTL_IMPORT_SYNC_FILE`),
+so this side's implicit wait sees it.
+
 ## Error handling
 
 | Condition | Action |

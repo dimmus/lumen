@@ -1,0 +1,41 @@
+[
+  {
+    "host": {"kernel": "7.2.10-fastvm", "cpus": 2, "cpu": "Intel(R) Pentium(R) Gold G6405 CPU @ 4.10GHz", "arch": "x86_64", "hostname": "iritur"},
+    "driver": "cpu",
+    "git": "49e3406-dirty",
+    "preset": "release",
+    "mode": "client",
+    "compositor": "host",
+    "scenario": "S9",
+    "title": "lumen-ui-bench S9: hover a button at 125 Hz",
+    "backend": "cpu",
+    "frames": 94,
+    "warmup": 120,
+    "load": {"before": 0.03, "after": 0.11},
+    "window": {"tier": "cpu", "software": false, "gpu": "cpu", "logical": [640, 480], "buffer": [640, 480], "scale": 1.000, "explicit_sync": false, "images": 2},
+    "stages": {
+      "frame": {"p50": 109.387, "p95": 376.088, "p99": 2210.068, "max": 2210.068, "samples": 94},
+      "frame_cpu": {"p50": 109.040, "p95": 421.255, "p99": 1996.241, "max": 1996.241, "samples": 94},
+      "input": {"p50": 7.607, "p95": 31.394, "p99": 124.550, "max": 124.550, "samples": 94},
+      "geometry": {"p50": 0.832, "p95": 1.396, "p99": 1.744, "max": 1.744, "samples": 94},
+      "acquire": {"p50": 0.405, "p95": 0.731, "p99": 102.465, "max": 102.465, "samples": 94},
+      "tick": {"p50": 9.644, "p95": 21.951, "p99": 60.720, "max": 60.720, "samples": 94},
+      "describe": {"p50": 0.000, "p95": 0.000, "p99": 0.000, "max": 0.000, "samples": 94},
+      "reconcile": {"p50": 0.000, "p95": 0.000, "p99": 0.000, "max": 0.000, "samples": 94},
+      "layout": {"p50": 1.261, "p95": 2.074, "p99": 6.666, "max": 6.666, "samples": 94},
+      "emit": {"p50": 6.902, "p95": 17.414, "p99": 58.519, "max": 58.519, "samples": 94},
+      "order": {"p50": 0.540, "p95": 1.445, "p99": 50.464, "max": 50.464, "samples": 94},
+      "render": {"p50": 87.756, "p95": 314.709, "p99": 1963.880, "max": 1963.880, "samples": 94},
+      "present": {"p50": 0.233, "p95": 0.842, "p99": 52.146, "max": 52.146, "samples": 94},
+      "commit_to_present": {"p50": 8553.443, "p95": 15043.451, "p99": 15790.859, "max": 15790.859, "samples": 94},
+      "input_to_frame_start": {"p50": 200.359, "p95": 1003.723, "p99": 2194.757, "max": 2194.757, "samples": 93},
+      "input_to_commit": {"p50": 322.872, "p95": 1438.897, "p99": 3387.380, "max": 3387.380, "samples": 93},
+      "input_to_present": {"p50": 8905.987, "p95": 15435.747, "p99": 16152.192, "max": 16152.192, "samples": 93}
+    },
+    "counters": {"motions": 375, "transitions": 93, "samples": 93, "frames": 94, "refresh_ns": 16666667, "seconds": 3.21},
+    "memory": {"allocations": 0, "allocations_per_steady_frame": 0.000000, "malloc_calls": 2630, "mallinfo2_in_use_delta": 0, "rss_anon_kb": 4612},
+    "client": {"latency_periods": {"p50": 0.534, "p95": 0.926}, "g6_budget_us": 18666.7, "proxy": true, "button": [160, 224, 320, 32]},
+    "gates": {"G6-proxy": "pass", "G5": "pass"},
+    "gate_details": {"G6-proxy": "headless proxy (virtual output, timer flips): input → presented median 8.91 ms (0.53 periods), p95 15.44 ms (0.93 periods), 93 of 93 transitions; budget 1 period + 2 ms = 18.67 ms", "G5": "0 operator new on the UI thread over 94 hover frames (2630 malloc)"}
+  }
+]

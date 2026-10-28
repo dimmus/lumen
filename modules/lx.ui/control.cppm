@@ -171,6 +171,9 @@ public:
     /// Damages the bounds; a hover or press ending closes a tooltip child.
     void on_interaction_changed() override;
     [[nodiscard]] a11y::node accessibility_node() const override;
+    /// GPUI's `ButtonLike`: the pointing hand over an enabled control, the arrow over a
+    /// disabled one.
+    [[nodiscard]] cursor_style cursor() const override;
 
     /// Which box `emit` paints now: 0 rest, 1 hover, 2 pressed.
     [[nodiscard]] unsigned paint_state() const;
@@ -577,6 +580,12 @@ void lx::ui::control_node::on_interaction_changed() {
         if (overlay_node* tip = child_overlay(*this, overlay_kind::tooltip))
             tip->close();
     ui_node::on_interaction_changed();
+}
+
+lx::ui::cursor_style lx::ui::control_node::cursor() const {
+    if (!has_flag(node_flag::interactive))
+        return cursor_style::automatic;
+    return has_flag(node_flag::disabled) ? cursor_style::arrow : cursor_style::pointer;
 }
 
 lx::a11y::node lx::ui::control_node::accessibility_node() const {

@@ -50,7 +50,18 @@ public:
     ui_root& operator=(const ui_root&) = delete;
 
     void set_describer(describe_fn fn);
+    /// The window's rect in logical px (what the tree lays out in and hit-tests against).
     void set_bounds(lx::rect2i bounds);
+    [[nodiscard]] lx::rect2i bounds() const { return bounds_; }
+    /// Device px per logical px (ADR-010 §4.10: a window on a 1.25 output renders at 1.25).
+    /// The tree keeps laying out in logical px; `draw_scope` projects at emission, text and
+    /// icons rasterise at the device scale. A change lays out, rasterises and repaints
+    /// everything on the next tick. 1 by default.
+    void set_scale(float scale);
+    [[nodiscard]] float scale() const { return scale_; }
+    /// The draw list's extent: the bounds' far corner projected (the buffer a client renders
+    /// the frame into is at least this).
+    [[nodiscard]] lx::size2i device_size() const;
     /// `emit_scope::full` by default.
     void set_emit_scope(emit_scope scope) { emit_scope_ = scope; }
     [[nodiscard]] emit_scope emit_scope_mode() const { return emit_scope_; }
@@ -66,6 +77,17 @@ public:
     /// the next tick. A client whose commit fails puts `frame_damage` back (§4.9: the
     /// ledger is cleared only by a successful commit).
     bool tick(lx::scene::draw_list& draws);
+
+    /// Whether `tick` would produce a frame now: a describe or bounds owed, a theme or scale
+    /// change, a non-empty ledger, a dirty layout, a reducer waiting, or a timer due. What a
+    /// client's frame loop asks before it takes a buffer (§4.9's idle rule).
+    [[nodiscard]] bool wants_frame() const;
+
+    /// Logical rects the next produced frame must repaint although nothing in them changed:
+    /// a reused buffer's stale area (its age, §4.9). They widen the emission clip and
+    /// `frame_repaint`, never `frame_damage` (what changed, which the compositor is told),
+    /// and do not by themselves make a frame. Consumed by the next `tick`, produced or not.
+    void add_repaint(lx::rect2i region);
 
     [[nodiscard]] ui_node* tree() const;
     [[nodiscard]] damage_ledger& damage();
@@ -98,8 +120,11 @@ public:
     /// such as a tooltip's hover delay); 0: nothing pending. An animation asks for frames
     /// through the ledger instead.
     [[nodiscard]] std::uint64_t next_deadline_ns() const;
-    /// The damage the last frame `tick` produced repaints (see `tick`).
+    /// The damage the last frame `tick` produced repaints (see `tick`): what changed.
     [[nodiscard]] const damage_ledger& frame_damage() const { return frame_damage_; }
+    /// What the last produced frame emitted for: `frame_damage` ∪ the `add_repaint` rects,
+    /// or the bounds when `frame_damage` has no rect (a first frame, an animation tick).
+    [[nodiscard]] const damage_ledger& frame_repaint() const { return frame_repaint_; }
 
     /// `CLOCK_MONOTONIC` nanoseconds each stage of the last frame `tick` produced took:
     /// what `lumen-ui-bench` attributes per stage (ADR-010 §8.1; the spans carry the same
@@ -125,6 +150,11 @@ private:
     lx::rect2i bounds_{};
     stage_times stage_times_{};
     damage_ledger frame_damage_{};
+    damage_ledger frame_repaint_{};
+    damage_ledger repaint_{};
+    float scale_ = 1.f;
+    /// The scale the tree was last laid out at.
+    float laid_out_scale_ = 1.f;
     focus_manager focus_{};
     pointer_state pointer_{};
     /// The `theme_generation` the tree was last resolved under.
@@ -173,6 +203,32 @@ void lx::ui::ui_root::set_describer(describe_fn fn) {
 void lx::ui::ui_root::set_bounds(lx::rect2i bounds) {
     bounds_ = bounds;
     dirty_ = true;
+}
+
+void lx::ui::ui_root::set_scale(float scale) { scale_ = scale > 0.f ? scale : 1.f; }
+
+lx::size2i lx::ui::ui_root::device_size() const {
+    return {project_coord(bounds_.x + bounds_.width, scale_),
+            project_coord(bounds_.y + bounds_.height, scale_)};
+}
+
+void lx::ui::ui_root::add_repaint(lx::rect2i region) { repaint_.add(region); }
+
+bool lx::ui::ui_root::wants_frame() const {
+    if (!arena_ || !describe_)
+        return false;
+    if (dirty_ || !root_ || theme_generation() != theme_generation_ || scale_ != laid_out_scale_)
+        return true;
+    if (!ui_damage().empty() || root_->layout_dirty() || reducers_pending())
+        return true;
+    const std::uint64_t deadline = ui_timers().next_deadline();
+    if (deadline == 0)
+        return false;
+    const auto now = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+    return deadline <= now;
 }
 
 lx::ui::damage_ledger& lx::ui::ui_root::damage() { return ui_damage(); }
@@ -232,9 +288,14 @@ void lx_ui_mark_tree_dirty(lx::ui::ui_node& node) {
 
 bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
-    if (!arena_ || !describe_)
+    if (!arena_ || !describe_) {
+        repaint_.clear(); // the buffer-age repaint is this tick's, produced or not
         return false;
+    }
 
+    // Text and icons measure and rasterise at the root's device scale.
+    if (scale_ != 1.f || ui_device_scale() != 1.f)
+        set_ui_device_scale(scale_);
     const lx_ui_frame_scope frame_clock{};
     // Timers due by this frame's time run first: what they invalidate is this frame's.
     (void)ui_timers().fire_due(ui_now_ns());
@@ -251,8 +312,21 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
             ledger.request(invalidation::paint);
         }
     }
-    if (!dirty_ && root_ && ledger.empty() && !root_->layout_dirty())
+    // A new device scale: every text block and icon rasterises again at it (their sizes
+    // round differently), so lay out and repaint everything, as for a theme.
+    if (scale_ != laid_out_scale_) {
+        laid_out_scale_ = scale_;
+        dirty_ = true;
+        if (root_) {
+            lx_ui_mark_tree_dirty(*root_);
+            ledger.add(bounds_);
+            ledger.request(invalidation::paint);
+        }
+    }
+    if (!dirty_ && root_ && ledger.empty() && !root_->layout_dirty()) {
+        repaint_.clear();
         return false;
+    }
 
     // Take what this frame answers now, so a request raised while it is built is not lost.
     // Fixed-size copies: no allocation.
@@ -302,6 +376,7 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
     if (!root_) {
         // No frame: whatever was asked is still owed.
         lx_ui_fold(ledger, frame_damage_);
+        repaint_.clear();
         return false;
     }
 
@@ -339,12 +414,21 @@ bool lx::ui::ui_root::tick(lx::scene::draw_list& draws) {
     {
         lx::trace::scoped_span span{"ui", "ui.emit"};
         // The list is rebuilt from scratch each tick; appending would grow it without
-        // bound. The overlap grid covers the pixels the tree can reach.
-        draws.begin({bounds_.x + bounds_.width, bounds_.y + bounds_.height});
+        // bound. The overlap grid covers the device pixels the tree can reach.
+        draws.begin(device_size());
+        // What this frame paints: the changes, and what the consumer's buffer lacks.
+        frame_repaint_ = frame_damage_;
+        if (frame_damage_.count() == 0) {
+            frame_repaint_.add(bounds_);
+        } else {
+            for (unsigned i = 0; i < repaint_.count(); ++i)
+                frame_repaint_.add(lx_ui_clip_to(bounds_, repaint_.rects()[i]));
+        }
+        repaint_.clear();
         lx::rect2i clip = bounds_;
         if (emit_scope_ == emit_scope::damage && frame_damage_.count() > 0)
-            clip = lx_ui_clip_to(bounds_, frame_damage_.union_bounds());
-        draw_scope scope_out{draws, clip};
+            clip = lx_ui_clip_to(bounds_, frame_repaint_.union_bounds());
+        draw_scope scope_out{draws, clip, scale_};
         root_->emit(scope_out);
         // GPUI's deferred draw: the overlays over everything, in the order they opened.
         overlays.emit(scope_out);

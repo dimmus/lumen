@@ -218,11 +218,14 @@ public:
     [[nodiscard]] lx::size2i measure(lx::layout::constraints c, size_hint hint) const override;
     void emit(draw_scope& out) const override;
 
+    /// The icon's size in layout px (its raster at a device scale of 1).
     [[nodiscard]] unsigned device_px() const { return device_px_; }
 
 private:
     icon id_ = icon::circle;
     unsigned device_px_ = k_icon_px;
+    /// `size_px` × the props' scale, layout px: × `ui_device_scale` is the raster.
+    float size_ = static_cast<float>(k_icon_px);
     lx::color color_{};
     std::uint64_t generation_ = 0;
     tok token_ = tok::icon;
@@ -585,6 +588,7 @@ bool lx::ui::icon_node::apply(const icon_props& props) {
         invalidate_paint(*this);
     id_ = props.id;
     device_px_ = px;
+    size_ = props.size_px * scale;
     cache_ = props.cache;
     token_ = props.color;
     generation_ = generation;
@@ -601,15 +605,23 @@ lx::size2i lx::ui::icon_node::measure(lx::layout::constraints c, size_hint) cons
 void lx::ui::icon_node::emit(draw_scope& out) const {
     if (!visible_ || !cache_ || color_.a <= 0.f)
         return;
-    const int s = static_cast<int>(device_px_);
-    const lx::rect2i at{bounds_.x + (bounds_.width - s) / 2, bounds_.y + (bounds_.height - s) / 2, s, s};
+    // Rasterised at the device scale (ADR-010 §4.10) and centred in the projected bounds on
+    // whole device pixels: the tile is sampled 1:1 at any scale.
+    const float device = out.scale();
+    const unsigned raster =
+        device == 1.f ? device_px_
+                      : static_cast<unsigned>(std::clamp<long>(std::lround(size_ * device), 1,
+                                                               icon_cache::k_max_px));
+    const int s = static_cast<int>(raster);
+    const lx::rect2i box = out.device_rect(bounds_);
+    const lx::rect2i at{box.x + (box.width - s) / 2, box.y + (box.height - s) / 2, s, s};
     // Outside the clip (a frame's damage): no cache lookup, no atlas stamp.
-    if (out.culled(at))
+    if (out.device_culled(at))
         return;
     lx::gfx::atlas_tile tile{};
-    if (!cache_->place(id_, device_px_, tile, surface_rect(*this, bounds_)))
+    if (!cache_->place(id_, raster, tile, surface_rect(*this, bounds_)))
         return;
-    out.sprite(lx::gfx::primitive_kind::mono_sprite, tile.page, at, tile.uv(), color_);
+    out.device_sprite(lx::gfx::primitive_kind::mono_sprite, tile.page, at, tile.uv(), color_);
 }
 
 lx::ui::child lx::ui::icon_view(icon id, icon_cache* cache, float size_px, tok color, float scale) {
