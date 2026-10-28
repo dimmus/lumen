@@ -28,6 +28,7 @@ export import :card;
 export import :cursor;
 export import :crtc_alloc;
 export import :edid;
+export import :fdinfo;
 export import :uevent;
 export import :modes;
 

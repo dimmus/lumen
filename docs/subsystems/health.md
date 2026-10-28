@@ -19,7 +19,7 @@ session, memory, and how well each output keeps its frame pace — aggregated in
 |------|-----------|
 | Know which parts work, which fell back, which are stubs | `part_status` with a level, a detail line and `implemented` |
 | Track the multi-process session | `process_status` for the compositor and the shell (pid, connected, bind count) |
-| Memory visibility | pressure, RSS, import cache, staging against its budget |
+| Memory visibility | pressure, RSS, import cache, staging against its budget, GPU memory per region (DRM fdinfo) |
 | Speed | per output: presented frames, frames that missed their vblank, misses among the last 128 |
 | **No cost when nobody asks** | pulled: the report is built at request time from state the compositor keeps anyway |
 | No upward deps | `lx.health` is pure (Runtime layer); the compositor fills `health_inputs` |
@@ -30,7 +30,8 @@ session, memory, and how well each output keeps its frame pace — aggregated in
 
 ```
 lx.health
-├── types    — level, part_status, process_status, memory_status, speed_status, health_report
+├── types    — level, part_status, process_status, memory_status (gpu_memory_status,
+│              gpu_region_status), speed_status, health_report
 └── monitor  — miss_ring, health_thresholds, display_path, output_input, health_inputs,
                evaluate(), read_rss_kib()
 ```
@@ -96,6 +97,12 @@ Pressure from `memory_budget_coordinator` (normal ok, moderate degraded, critica
 RSS from `/proc/self/statm`; staging bytes against `staging_budget_bytes`; import cache
 occupancy (full: degraded).
 
+GPU memory, on every backend, from DRM fdinfo (`lx::drm::read_gpu_memory`,
+[memory-management.md](memory-management.md) §4): the reporting driver, how many DRM clients
+(the card fd, Mesa's render node) and per region the total, resident, shared, purgeable and
+active bytes the driver prints. Informational — no level comes from it. Empty when the
+driver prints no usage stats (vmwgfx).
+
 ### Speed (per output)
 
 Each content flip is counted as presented; it **missed** when it landed half a refresh
@@ -113,7 +120,8 @@ alongside.
 Nothing runs per frame or on a timer for health. On `GetHealth` the compositor (UI thread)
 posts a task to the render thread, which reads its own figures (import cache, last render
 tick, render ticks over budget) and posts them back; the UI thread adds what it owns —
-readiness of every part, logind, the shell bridge, memory pressure and staging, each
+readiness of every part, logind, the shell bridge, memory pressure and staging, GPU memory
+from DRM fdinfo (a walk of `/proc/self/fdinfo`, reading only DRM files), each
 output's presented/missed counts and ring — and calls `lx::health::evaluate`. The control
 socket answers with the report. A render thread that does not answer within 500 ms is
 reported `critical` (the request is also a liveness probe of that thread).
@@ -127,9 +135,9 @@ a `health` event when the overall level changes; with no subscriber it never eva
 
 | Way | What |
 |-----|------|
-| `io.lumen.Compositor.GetHealth` | the report as JSON (types `Health`, `Part`, `Process`, `Memory`, `Speed`; `varlinkctl introspect $LUMEN_SOCKET`) |
-| `lumen-ctl status` | a summary: version, backend, uptime, overall level, whatever is not ok, the processes, memory, each output; plus the session's systemd units (active state, restarts). Exit 0 ok, 1 degraded, 2 critical, 3 not running |
-| `lumen-ctl health` | every part, with tick times and budget counters; `--json` for the raw report |
+| `io.lumen.Compositor.GetHealth` | the report as JSON (types `Health`, `Part`, `Process`, `Memory`, `GpuRegion`, `Speed`; `varlinkctl introspect $LUMEN_SOCKET`). `Memory.gpu_driver` is absent when no driver reports; a `GpuRegion` figure the driver does not print is absent |
+| `lumen-ctl status` | a summary: version, backend, uptime, overall level, whatever is not ok, the processes, memory (with what each GPU region holds), each output; plus the session's systemd units (active state, restarts). Exit 0 ok, 1 degraded, 2 critical, 3 not running |
+| `lumen-ctl health` | every part, with tick times and budget counters, and a line per GPU region with every figure; `--json` for the raw report |
 | `io.lumen.Compositor.Subscribe` | `health` events on level changes |
 
 ---
@@ -151,6 +159,7 @@ a `health` event when the overall level changes; with no subscriber it never eva
 | **H1** | Real readiness facts | ✅ from the compositor's state at request time |
 | **H2** | RSS and PIDs | ✅ `/proc/self/statm`, peer credentials of the shell's connection |
 | **H3** | Exporter and `lumen-ctl` | ✅ Varlink control socket (`GetHealth`, `Subscribe`) |
+| **H3.1** | GPU memory on every backend | ✅ DRM fdinfo (`lx.drm:fdinfo`) |
 | **H4** | Shell self-report over the policy bridge | Future |
 
 ---

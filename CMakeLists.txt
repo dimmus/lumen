@@ -1239,6 +1239,13 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_uevent_parse PRIVATE tests)
     add_test(NAME test_uevent_parse COMMAND test_uevent_parse)
 
+    add_executable(test_drm_fdinfo tests/test_drm_fdinfo.cpp)
+    target_link_libraries(test_drm_fdinfo PRIVATE lx.drm)
+    lumen_apply_module_properties(test_drm_fdinfo)
+    lumen_link_platform(test_drm_fdinfo)
+    target_include_directories(test_drm_fdinfo PRIVATE tests)
+    add_test(NAME test_drm_fdinfo COMMAND test_drm_fdinfo)
+
     add_executable(test_card_select tests/test_card_select.cpp)
     target_link_libraries(test_card_select PRIVATE lx.drm)
     lumen_apply_module_properties(test_card_select)

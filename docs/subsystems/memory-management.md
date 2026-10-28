@@ -193,6 +193,35 @@ When a client exceeds its quota, LRU eviction runs **within that client** before
 - `client_within_budget()` — per-client byte cap (default 256 MiB)
 - `track_client_usage()` / `untrack_client()`
 
+`VK_EXT_memory_budget` sees only Vulkan allocations, so the GL and CPU backends would report
+nothing; what the health report shows comes from DRM fdinfo instead (below).
+
+### GPU memory from DRM fdinfo
+
+**Module:** `lx.drm:fdinfo` — `read_gpu_memory()`, pure `parse_fdinfo()` / `add_fdinfo_client()`
+
+A driver implementing drm-usage-stats (`Documentation/gpu/drm-usage-stats.rst`, Linux 5.19+)
+prints, in `/proc/<pid>/fdinfo/<fd>` of every open DRM file, `drm-driver`, `drm-client-id`
+and per memory region `drm-total-`, `drm-shared-`, `drm-resident-`, `drm-purgeable-`,
+`drm-active-<region>` (legacy: `drm-memory-<region>`, read as resident), in bytes, KiB or
+MiB. That covers every backend — Vulkan, GL, and the render-node fd Mesa opens itself —
+which is why it lives in `lx.drm` (DRM uAPI read from `/proc`: no graphics API, no libdrm)
+rather than next to the Vulkan budget in `lx.gfx`.
+
+| Step | What |
+|------|------|
+| Walk | `/proc/self/fdinfo/*`; an fd that is not a DRM character device (major 226) is skipped on `fstat` alone — dmabufs, sockets and memfds never have their fdinfo read |
+| Keep | texts with `drm-driver`; up to 8 regions (more are counted as dropped) |
+| Dedupe | by `drm-client-id`: a dup'd fd is the same client. The card fd and Mesa's render node are different clients and are summed |
+| Sum | per region and figure; a figure no client prints stays absent. A second driver's regions (two GPUs) are kept apart as `<driver>:<region>` |
+
+Only for a health request (`lumen-ctl status` / `health`, `GetHealth`, the 2 s re-evaluation
+while `lumen-ctl monitor` is subscribed): never per frame. The compositor says once at start-up
+whether a driver reports (`compositor.memory`). A buffer shared between two of the
+compositor's own clients counts in both (`drm-shared-` says how much is shared). vmwgfx
+prints no usage stats (kernel 7.2: only `pos`, `flags`, `mnt_id`, `ino`), so on it the report
+has no GPU figures. No level is judged from them: the kernel states no budget.
+
 ### Compositor surface pool
 
 **Module:** `lx.gfx.surface_pool` — reuse compositor-owned VkImages for chrome/effects.
@@ -327,6 +356,7 @@ Hot path (`tick_ui` / `tick_render`) uses arenas; cold path uses fixed pools whe
 | Arenas + pressure | `lx.runtime.memory` |
 | Kernel pressure (PSI) | `lx.runtime` (`psi_monitor`), `lx.runtime.psi` |
 | GPU budget | `lx.gfx.gpu_budget` |
+| GPU memory (DRM fdinfo, every backend) | `lx.drm:fdinfo` |
 | Import cache LRU + per-client | `lx.gfx.import_cache` |
 | Surface pool | `lx.gfx.surface_pool` |
 | Buffer lifetime | `lx.compositor.buffer_lifecycle` |
@@ -364,6 +394,7 @@ lx::compositor::config cfg{
 | **M2** | Buffer lifecycle tracker | ✅ API |
 | **M3** | GPU budget query (`VK_EXT_memory_budget`) | ✅ stub |
 | **M4** | Surface pool + scanout pin | ✅ stub |
+| **M5** | GPU memory per region from DRM fdinfo in the health report | ✅ |
 | **P0** | Real `wl_buffer.release` + measured RSS tests | Runtime |
 
 ---

@@ -3272,6 +3272,14 @@ void compositor_impl::register_p0_globals() {
                                            : "not offered (composite exports no fence)",
                      p0_.async_flip_capable ? "available" : "unsupported by the card");
     }
+    // GPU memory in the health report comes from DRM fdinfo, read on request; said once here
+    // because a driver either prints usage stats or never does.
+    if (const lx::drm::gpu_memory gpu = lx::drm::read_gpu_memory(); gpu.driver[0] != '\0')
+        log_memory.info("GPU memory: DRM fdinfo of {} ({} client{}, {} region{})", gpu.driver,
+                        gpu.clients, gpu.clients == 1 ? "" : "s", gpu.regions.size(),
+                        gpu.regions.size() == 1 ? "" : "s");
+    else
+        log_memory.info("GPU memory: not reported (no DRM file with usage stats in fdinfo)");
     if (auto installed = install_p0_protocols(p0_); !installed) {
         log_compositor.error(installed.get_error());
     }
@@ -3360,6 +3368,31 @@ namespace {
 
 const char* backend_name(bool gl, bool cpu, bool vulkan) {
     return gl ? "gl" : cpu ? "cpu" : vulkan ? "vulkan" : "headless";
+}
+
+lx::health::gpu_memory_status gpu_memory_for_health() {
+    const lx::drm::gpu_memory gpu = lx::drm::read_gpu_memory();
+    lx::health::gpu_memory_status out{};
+    out.driver.set(gpu.driver);
+    out.clients = gpu.clients;
+    for (const lx::drm::gpu_region& r : gpu.regions) {
+        if (out.regions.size() == out.regions.capacity())
+            break;
+        lx::health::gpu_region_status g{};
+        g.name.set(r.name);
+        g.total = r.total;
+        g.shared = r.shared;
+        g.resident = r.resident;
+        g.purgeable = r.purgeable;
+        g.active = r.active;
+        g.has_total = r.has_total;
+        g.has_shared = r.has_shared;
+        g.has_resident = r.has_resident;
+        g.has_purgeable = r.has_purgeable;
+        g.has_active = r.has_active;
+        out.regions.push_back(g);
+    }
+    return out;
 }
 
 const char* state_name(lx::toplevel_state s) {
@@ -3803,6 +3836,7 @@ void compositor_impl::answer_health(unsigned token, bool render_answered, unsign
     in.render_figures = render_answered;
     in.staging_bytes = shm_store_.bytes_held() + shm_pool_.bytes_mapped();
     in.staging_budget = memory_.config().staging_budget_bytes;
+    in.gpu = gpu_memory_for_health();
     in.last_tick_ui_us = budget_.last_tick_ui_us();
     in.last_tick_render_us = render_us;
     in.ui_over_budget = budget_.ui_over_total();
