@@ -706,7 +706,7 @@ commit; doing that later is `xdg_wm_base.invalid_popup_parent` (the spec names n
 ### Selections: clipboard and primary
 
 `wl_data_device_manager` (v4; v3 without libwayland's `release`) and
-`zwp_primary_selection_device_manager_v1` (v1, a P1 protocol built only when its glue is
+`zwp_primary_selection_device_manager_v1` (v1, built only when its glue is
 generated) share one model in `wire_selection.cpp`; each family's unit only marshals. There
 is one selection per seat and family, owned by a source.
 

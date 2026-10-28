@@ -231,8 +231,7 @@ ext-workspace's bind and the snapshot.
 `zlm_shell_v1.get_workspace_manager`, `zlm_workspace_manager_v1`, `zlm_workspace_v1` and
 `snapshot_workspace` are deprecated: never implemented, superseded by the above. The
 `workspace` argument of `snapshot_toplevel` / `toplevel_created` stays null. Because zlm now
-names `ext_workspace_handle_v1`, ext-workspace-v1 is a P0 protocol (the zlm glue links its
-interface tables).
+names `ext_workspace_handle_v1`, the zlm glue links ext-workspace-v1's interface tables.
 
 ### Version 7: held actions (the window switcher)
 

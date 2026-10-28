@@ -35,7 +35,7 @@ Key design points:
 
 - **ext-workspace-v1 is required by zlm** — v7's `toplevel_workspace` names an
   `ext_workspace_handle_v1`, so the zlm glue links ext-workspace's interface tables and
-  ext-workspace-v1 is a P0 protocol in `manifest.toml` (fetched by `fetch-protocols.sh` like
+  ext-workspace-v1 is a protocol in `manifest.toml` (fetched by `fetch-protocols.sh` like
   the other staging protocols). The compositor serves it to every unsandboxed client; the
   shell's workspace indicator is one of them.
 - **`zlm_toplevel_v1`** — compositor-owned handle (shell never uses client `xdg_toplevel`)
@@ -67,14 +67,14 @@ Outputs per protocol:
 ./scripts/fetch-protocols.sh   # reads manifest.toml via protocol_manifest.py
 ```
 
-See `manifest.toml` for the P0–P2 matrix. P0/P1 codegen is enabled via CMake options
-`LUMEN_PROTOCOLS_P1`, `LUMEN_PROTOCOLS_P2`. The protocols of the app-compatibility and
-capture work (ADR 009) are P1: the commit-path ones (fifo, commit-timing, tearing-control,
+Every protocol in `manifest.toml` is generated; code that serves or speaks one tests its
+`LUMEN_PROTOCOL_<XML_STEM>` definition, so a protocol whose XML was not fetched builds out.
+The protocols of the app-compatibility and capture work (ADR 009): the commit-path ones (fifo, commit-timing, tearing-control,
 content-type, single-pixel-buffer, alpha-modifier — served since Part 1), the window and
 session ones (xdg-dialog, xdg-toplevel-icon, xdg-system-bell, xdg-foreign v1 and v2,
 keyboard-shortcuts-inhibit, ext-data-control and wlr-data-control v2, security-context —
 served since Part 2), the pointer ones (pointer-constraints, relative-pointer,
-pointer-gestures v3 — P1 from the start, served since Part 3), and the capture ones
+pointer-gestures v3 — served since Part 3), and the capture ones
 (ext-foreign-toplevel-list, ext-image-capture-source, ext-image-copy-capture and
 wlr-screencopy v3 — served since Part 4).
 
