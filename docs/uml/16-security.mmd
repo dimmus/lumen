@@ -1,7 +1,7 @@
 flowchart TB
     subgraph Traditional["Default: Unix permissions"]
         SOCK["Wayland socket session dir"]
-        CRED["SO_PEERCRED UID/GID/PID"]
+        CRED["SO_PEERCRED UID/GID/PID<br/>SO_PEERPIDFD confirms /proc/pid reads"]
         RULES["Window rules by app_id / path"]
         SOCK --> CRED --> RULES
     end

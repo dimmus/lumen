@@ -52,6 +52,18 @@ type Part (name: string, level: string, implemented: bool, detail: ?string)
 # One process of the session (compositor, shell). pid is absent while not running.
 type Process (role: string, pid: ?int, connected: bool, binds: int, level: string)
 
+# GPU memory one region holds, in bytes, summed over the compositor's DRM clients (DRM
+# fdinfo, drm-usage-stats). A figure the driver does not print is absent.
+type GpuRegion (
+  name: string,
+  total: ?int,
+  shared: ?int,
+  resident: ?int,
+  purgeable: ?int,
+  active: ?int
+)
+
+# gpu_driver is absent when no DRM file reports usage stats (the driver prints none).
 type Memory (
   level: string,
   pressure: string,
@@ -59,7 +71,10 @@ type Memory (
   import_cache_used: int,
   import_cache_capacity: int,
   staging_bytes: int,
-  staging_budget: int
+  staging_budget: int,
+  gpu_driver: ?string,
+  gpu_clients: int,
+  gpu: []GpuRegion
 )
 
 # Frame pacing of one output. missed_recent counts misses among the last recent_frames
@@ -288,6 +303,27 @@ void health_json(json& h, const lx::health::health_report& r) {
     mem.num("import_cache_capacity", r.memory.import_cache_capacity);
     mem.unum("staging_bytes", r.memory.staging_bytes);
     mem.unum("staging_budget", r.memory.staging_budget);
+    const lx::health::gpu_memory_status& gpu = r.memory.gpu;
+    if (!gpu.driver.empty())
+        mem.str("gpu_driver", gpu.driver.c_str());
+    mem.num("gpu_clients", gpu.clients);
+    json regions;
+    for (const auto& g : gpu.regions) {
+        json o;
+        o.str("name", g.name.c_str());
+        if (g.has_total)
+            o.unum("total", g.total);
+        if (g.has_shared)
+            o.unum("shared", g.shared);
+        if (g.has_resident)
+            o.unum("resident", g.resident);
+        if (g.has_purgeable)
+            o.unum("purgeable", g.purgeable);
+        if (g.has_active)
+            o.unum("active", g.active);
+        regions.append(o);
+    }
+    mem.set_array("gpu", regions);
     h.set("memory", mem);
     json speed;
     for (const auto& s : r.speed) {

@@ -595,6 +595,15 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_session_discovery PRIVATE tests)
     add_test(NAME test_session_discovery COMMAND test_session_discovery)
 
+    # Client identification through peer pidfds (SO_PEERPIDFD): the privileged-shell and
+    # sandbox checks against an exited peer, and the SO_PEERCRED-only fallback.
+    add_executable(test_peer_pidfd tests/test_peer_pidfd.cpp)
+    target_link_libraries(test_peer_pidfd PRIVATE lx.wayland.server)
+    lumen_apply_module_properties(test_peer_pidfd)
+    lumen_link_platform(test_peer_pidfd)
+    target_include_directories(test_peer_pidfd PRIVATE tests)
+    add_test(NAME test_peer_pidfd COMMAND test_peer_pidfd)
+
     if(LUMEN_HAS_VARLINK)
         add_executable(test_control tests/test_control.cpp)
         target_link_libraries(test_control PRIVATE lx.compositor)
@@ -937,6 +946,12 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_runtime_memory PRIVATE tests)
     add_test(NAME test_runtime_memory COMMAND test_runtime_memory)
 
+    add_executable(test_runtime_psi tests/test_runtime_psi.cpp)
+    target_link_libraries(test_runtime_psi PRIVATE lx.runtime)
+    lumen_apply_module_properties(test_runtime_psi)
+    target_include_directories(test_runtime_psi PRIVATE tests)
+    add_test(NAME test_runtime_psi COMMAND test_runtime_psi)
+
     add_executable(test_input_keymap tests/test_input_keymap.cpp)
     target_link_libraries(test_input_keymap PRIVATE lx.input)
     lumen_apply_module_properties(test_input_keymap)
@@ -970,6 +985,12 @@ if(LUMEN_BUILD_TESTS)
     lumen_apply_module_properties(test_import_cache)
     target_include_directories(test_import_cache PRIVATE tests)
     add_test(NAME test_import_cache COMMAND test_import_cache)
+
+    add_executable(test_fence_deadline tests/test_fence_deadline.cpp)
+    target_link_libraries(test_fence_deadline PRIVATE lx.gfx)
+    lumen_apply_module_properties(test_fence_deadline)
+    target_include_directories(test_fence_deadline PRIVATE tests)
+    add_test(NAME test_fence_deadline COMMAND test_fence_deadline)
 
     add_executable(test_device_select tests/test_device_select.cpp)
     target_link_libraries(test_device_select PRIVATE lx.gfx)
@@ -1297,6 +1318,13 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_uevent_parse PRIVATE tests)
     add_test(NAME test_uevent_parse COMMAND test_uevent_parse)
 
+    add_executable(test_drm_fdinfo tests/test_drm_fdinfo.cpp)
+    target_link_libraries(test_drm_fdinfo PRIVATE lx.drm)
+    lumen_apply_module_properties(test_drm_fdinfo)
+    lumen_link_platform(test_drm_fdinfo)
+    target_include_directories(test_drm_fdinfo PRIVATE tests)
+    add_test(NAME test_drm_fdinfo COMMAND test_drm_fdinfo)
+
     add_executable(test_card_select tests/test_card_select.cpp)
     target_link_libraries(test_card_select PRIVATE lx.drm)
     lumen_apply_module_properties(test_card_select)
@@ -1431,7 +1459,7 @@ if(LUMEN_BUILD_TESTS)
         test_dnd_grab test_output_membership test_liveness
         test_activation_policy
         test_import_cache bench_frame
-        test_runtime_memory test_runtime_task test_cpu_composite test_repaint_schedule test_frame_clocks test_input_keymap
+        test_runtime_memory test_runtime_psi test_runtime_task test_cpu_composite test_repaint_schedule test_frame_clocks test_input_keymap
         test_headless_golden test_text_shaping test_protocol_bind test_protocol_conformance
         test_output_contract test_multi_output_contract test_hotplug_contract
         test_output_management_contract

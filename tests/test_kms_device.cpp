@@ -1,5 +1,6 @@
 // DRM/KMS device enumeration smoke test. Uses the host card when accessible;
 // otherwise verifies typed errors (never silent success).
+#include <errno.h>
 #include <stdio.h>
 
 import std;
@@ -92,6 +93,66 @@ int check_neutral_values() {
 }
 } // namespace
 
+// CLOSEFB falls back to RMFB only where the kernel predates it (EINVAL from the DRM core,
+// ENOTTY); a missing framebuffer or a lost device is a failure, not a reason to retry.
+int check_closefb_fallback() {
+    using lx::drm::closefb_unsupported;
+    int failures = 0;
+    const auto expect = [&](bool got, bool want, const char* what) {
+        if (got != want) {
+            std::fprintf(stderr, "FAIL: %s\n", what);
+            ++failures;
+        }
+    };
+    expect(closefb_unsupported(EINVAL), true, "EINVAL: kernel before 6.8");
+    expect(closefb_unsupported(ENOTTY), true, "ENOTTY: no DRM ioctls");
+    expect(closefb_unsupported(ENOENT), false, "ENOENT: no such framebuffer");
+    expect(closefb_unsupported(ENODEV), false, "ENODEV: device gone");
+    expect(closefb_unsupported(EACCES), false, "EACCES");
+    expect(closefb_unsupported(0), false, "no error");
+    using lx::drm::fb_release;
+    using lx::drm::fb_released;
+    expect(lx::drm::release_framebuffer(-1, 7, fb_release::close) == fb_released::failed, true,
+           "no card fd");
+    expect(lx::drm::release_framebuffer(0, 0, fb_release::remove) == fb_released::failed, true,
+           "framebuffer 0");
+    // Released before anything was made: nothing to report.
+    lx::drm::kms_dumb_framebuffer empty{};
+    expect(empty.hand_over() == fb_released::failed, true, "empty framebuffer hand-over");
+    if (failures == 0)
+        std::printf("closefb fallback selection: ok\n");
+    return failures;
+}
+
+// On the host card (no master needed): a hand-over closes where the kernel has CLOSEFB and
+// removes where it does not, and either way the framebuffer is gone afterwards.
+int check_hand_over(const lx::drm::kms_device& dev) {
+    using lx::drm::fb_released;
+    auto made = lx::drm::kms_dumb_framebuffer::create(
+        dev, 64, 64, static_cast<lx::fourcc>(lx::pixel_format::xrgb8888));
+    if (!made) {
+        std::printf("dumb framebuffer unavailable: hand-over not exercised\n");
+        return 0;
+    }
+    auto fb = static_cast<decltype(made)&&>(made).value();
+    const unsigned id = fb.id();
+    const fb_released done = fb.hand_over();
+    const fb_released want = dev.supports_closefb() ? fb_released::closed : fb_released::removed;
+    if (done != want || fb.valid()) {
+        std::fprintf(stderr, "FAIL: hand-over gave %d, want %d (closefb %d)\n",
+                     static_cast<int>(done), static_cast<int>(want), dev.supports_closefb());
+        return 1;
+    }
+    // On no plane, a closed framebuffer is freed at once: its id is unknown now.
+    if (lx::drm::release_framebuffer(dev.card_fd(), id, lx::drm::fb_release::close) !=
+        fb_released::failed) {
+        std::fprintf(stderr, "FAIL: framebuffer %u still exists after its hand-over\n", id);
+        return 1;
+    }
+    std::printf("framebuffer hand-over: %s\n", dev.supports_closefb() ? "CLOSEFB" : "RMFB");
+    return 0;
+}
+
 // Probing needs a KMS fd: anything else is a typed error, never an empty success.
 int check_probe_errors() {
     lx::drm::kms_device none{};
@@ -155,6 +216,8 @@ int main() {
     if (check_neutral_values() != 0)
         return 1;
     if (check_probe_errors() != 0)
+        return 1;
+    if (check_closefb_fallback() != 0)
         return 1;
     auto opened = lx::drm::kms_device::open("/dev/dri/card0");
     if (!opened) {
@@ -220,5 +283,5 @@ int main() {
         return 1;
     }
     std::printf("commit_modeset argument validation ok\n");
-    return 0;
+    return check_hand_over(dev);
 }

@@ -157,6 +157,7 @@ health_report evaluate(const health_inputs& in, const health_thresholds& t) {
         m.import_cache_capacity = in.import_cache_capacity;
         m.staging_bytes = in.staging_bytes;
         m.staging_budget = in.staging_budget;
+        m.gpu = in.gpu;
         m.lvl = in.memory_pressure == 0   ? level::ok
                 : in.memory_pressure == 1 ? level::degraded
                                           : level::critical;

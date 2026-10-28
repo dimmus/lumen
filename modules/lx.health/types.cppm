@@ -74,6 +74,33 @@ struct process_status {
     level lvl = level::unknown;
 };
 
+/// GPU memory one region holds, summed over the compositor's DRM clients (DRM fdinfo,
+/// drm-usage-stats: every backend's memory, Mesa's own render-node fd included). Bytes; a
+/// figure the driver does not print has its `has_` flag clear.
+struct gpu_region_status {
+    text<32> name{};
+    unsigned long long total = 0;
+    unsigned long long shared = 0;
+    unsigned long long resident = 0;
+    unsigned long long purgeable = 0;
+    unsigned long long active = 0;
+    bool has_total = false;
+    bool has_shared = false;
+    bool has_resident = false;
+    bool has_purgeable = false;
+    bool has_active = false;
+};
+
+struct gpu_memory_status {
+    static constexpr unsigned k_max_regions = 8;
+    /// The DRM driver that reports; empty when none does (vmwgfx prints no usage stats; no
+    /// DRM file open at all with virtual outputs on the CPU backend).
+    text<32> driver{};
+    /// Distinct DRM clients (open files) summed: the card fd, Mesa's render node.
+    unsigned clients = 0;
+    std::inplace_vector<gpu_region_status, k_max_regions> regions{};
+};
+
 struct memory_status {
     /// "normal", "moderate", "critical" (`runtime::memory_pressure`).
     const char* pressure = "normal";
@@ -83,6 +110,8 @@ struct memory_status {
     unsigned long long staging_bytes = 0;
     /// 0: no budget configured.
     unsigned long long staging_budget = 0;
+    /// Informational: no level is judged from it (the driver states no budget).
+    gpu_memory_status gpu{};
     level lvl = level::unknown;
 };
 
