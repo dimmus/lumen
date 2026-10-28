@@ -1,15 +1,11 @@
 module;
 
-#include <errno.h>
+#include <poll.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 #ifndef SO_PEERPIDFD
 #define SO_PEERPIDFD 77 // Linux 6.5
-#endif
-#ifndef SYS_pidfd_send_signal
-#define SYS_pidfd_send_signal 424 // Linux 5.1
 #endif
 
 import lx.foundation;
@@ -75,8 +71,11 @@ private:
 /// process, succeeds; false before Linux 6.5 (ENOPROTOOPT). Probes on each call.
 [[nodiscard]] bool peer_pidfd_supported();
 
-/// The process `pidfd` refers to has not exited (signal 0 through pidfd_send_signal; EPERM
-/// still means it exists). A zombie counts as running: it holds its pid until reaped.
+/// The process `pidfd` refers to has not exited: the pidfd does not poll readable, which it
+/// does once the whole thread group is gone (Linux 5.3) — a zombie included, so its /proc
+/// entry, whose root and executable are already released, never counts as the peer's. A
+/// group whose leader alone has exited still counts as running; its /proc/<pid> root and
+/// exe are gone too, so a caller must treat a failed read as a refusal.
 [[nodiscard]] bool pidfd_alive(int pidfd);
 
 } // namespace lx::session
@@ -134,5 +133,6 @@ bool lx::session::peer_pidfd_supported() {
 bool lx::session::pidfd_alive(int pidfd) {
     if (pidfd < 0)
         return false;
-    return ::syscall(SYS_pidfd_send_signal, pidfd, 0, nullptr, 0) == 0 || errno == EPERM;
+    pollfd p{.fd = pidfd, .events = POLLIN, .revents = 0};
+    return ::poll(&p, 1, 0) == 0;
 }

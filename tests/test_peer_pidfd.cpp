@@ -1,12 +1,16 @@
 // Race-free client identification: a peer's pidfd (SO_PEERPIDFD, Linux 6.5) taken at
 // connect, and the /proc/<pid> answers of the privileged-shell and sandbox checks confirmed
 // through it. A peer that exited is denied even when its pid names a live process with the
-// right executable; without a pidfd (older kernels) the SO_PEERCRED pid is taken alone.
+// right executable; a zombie peer, or one whose leader thread exited, is denied and counts as
+// sandboxed; without a pidfd (older kernels) the SO_PEERCRED pid is taken alone.
 // In-process AF_UNIX sockets only: no display, no root.
+#include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -39,12 +43,21 @@ int pidfd_pid(int pidfd) {
     return pid;
 }
 
+int g_child_sock = -1;
+
+void* child_reader(void*) {
+    char byte = 0;
+    (void)::read(g_child_sock, &byte, 1);
+    ::_exit(0);
+}
+
 /// A connection accepted from a forked child, which waits until `release` and then exits.
+/// With `leader_exits` the child's main thread exits at once and another thread waits.
 struct child_peer {
     pid_t pid = -1;
     int conn = -1; ///< the server side of the child's connection
 
-    child_peer() {
+    explicit child_peer(bool leader_exits = false) {
         const int listener = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         LUMEN_CHECK(listener >= 0);
         sockaddr_un addr{};
@@ -61,21 +74,49 @@ struct child_peer {
             const int s = ::socket(AF_UNIX, SOCK_STREAM, 0);
             if (s < 0 || ::connect(s, reinterpret_cast<sockaddr*>(&addr), len) != 0)
                 ::_exit(1);
-            char byte = 0;
-            (void)::read(s, &byte, 1);
-            ::_exit(0);
+            g_child_sock = s;
+            if (leader_exits) {
+                pthread_t t;
+                if (::pthread_create(&t, nullptr, child_reader, nullptr) != 0)
+                    ::_exit(1);
+                // SYS_exit ends this thread alone, without pthread_exit's unwinding.
+                ::syscall(SYS_exit, 0);
+            }
+            child_reader(nullptr);
         }
         conn = ::accept4(listener, nullptr, nullptr, SOCK_CLOEXEC);
         ::close(listener);
         LUMEN_CHECK(conn >= 0);
     }
-    /// The child exits and is reaped: its pid is free to be reused from here on.
-    void release() {
+    /// The child exits but is not reaped: a zombie, still holding its pid.
+    void exit_unreaped() {
         const char byte = 1;
         LUMEN_CHECK(::write(conn, &byte, 1) == 1);
+        siginfo_t info{};
+        LUMEN_CHECK(::waitid(P_PID, static_cast<id_t>(pid), &info, WEXITED | WNOWAIT) == 0);
+    }
+    void reap() {
         int status = 0;
         LUMEN_CHECK(::waitpid(pid, &status, 0) == pid);
         LUMEN_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    /// The child exits and is reaped: its pid is free to be reused from here on.
+    void release() {
+        exit_unreaped();
+        reap();
+    }
+    /// Waits until the child's /proc root is released (its leader thread has exited).
+    [[nodiscard]] bool wait_root_gone() const {
+        char path[64];
+        std::snprintf(path, sizeof(path), "/proc/%d/root", static_cast<int>(pid));
+        for (int i = 0; i < 2000; ++i) {
+            const int fd = ::open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+            if (fd < 0)
+                return true;
+            ::close(fd);
+            ::usleep(1000);
+        }
+        return false;
     }
 };
 
@@ -118,7 +159,10 @@ LUMEN_TEST(exited_peer_pidfd_is_not_alive) {
     LUMEN_CHECK(fd.has_value());
     LUMEN_CHECK(pidfd_pid(fd->get()) == static_cast<int>(child.pid));
     LUMEN_CHECK(lx::session::pidfd_alive(fd->get()));
-    child.release();
+    // A zombie holds its pid but has exited: its /proc root and executable are gone.
+    child.exit_unreaped();
+    LUMEN_CHECK(!lx::session::pidfd_alive(fd->get()));
+    child.reap();
     // The pidfd keeps naming the child, which no longer runs.
     LUMEN_CHECK(!lx::session::pidfd_alive(fd->get()));
     ::close(child.conn);
@@ -193,6 +237,61 @@ LUMEN_TEST(client_whose_peer_exited_is_denied) {
         LUMEN_CHECK(conn->sandboxed());
     }
     LUMEN_CHECK(!srv.allow_privileged_global(cred, "zlm_shell_v1"));
+    wl_client_destroy(client);
+}
+
+LUMEN_TEST(zombie_peer_is_sandboxed_and_denied) {
+    if (!lx::session::peer_pidfd_supported()) {
+        std::printf("  SKIP  SO_PEERPIDFD unsupported (Linux < 6.5)\n");
+        return;
+    }
+    lx::wayland::server srv;
+    LUMEN_CHECK(srv.bind_socketless().has_value());
+    set_self_as_shell(srv);
+    auto* display = static_cast<wl_display*>(srv.native_display());
+
+    // The peer exits and its parent never reaps it, while a child keeps the connection.
+    child_peer child;
+    wl_client* client = wl_client_create(display, child.conn);
+    LUMEN_CHECK(client != nullptr);
+    child.exit_unreaped();
+    auto* conn = srv.ensure_client(client);
+    LUMEN_CHECK(conn != nullptr);
+    const auto cred = conn->credentials();
+    LUMEN_CHECK(cred.pid == static_cast<unsigned>(child.pid));
+    LUMEN_CHECK(cred.pidfd >= 0 || cred.peer_gone);
+    LUMEN_CHECK(conn->sandboxed());
+    LUMEN_CHECK(!srv.allow_privileged_global(cred, "zlm_shell_v1"));
+    wl_client_destroy(client);
+    child.reap();
+}
+
+LUMEN_TEST(peer_whose_leader_exited_is_sandboxed_and_denied) {
+    if (!lx::session::peer_pidfd_supported()) {
+        std::printf("  SKIP  SO_PEERPIDFD unsupported (Linux < 6.5)\n");
+        return;
+    }
+    lx::wayland::server srv;
+    LUMEN_CHECK(srv.bind_socketless().has_value());
+    set_self_as_shell(srv);
+    auto* display = static_cast<wl_display*>(srv.native_display());
+
+    // The peer's main thread exits while another thread keeps the connection: the group
+    // still runs, but the leader's /proc root and executable are released.
+    child_peer child{true};
+    LUMEN_CHECK(child.wait_root_gone());
+    wl_client* client = wl_client_create(display, child.conn);
+    LUMEN_CHECK(client != nullptr);
+    auto* conn = srv.ensure_client(client);
+    LUMEN_CHECK(conn != nullptr);
+    const auto cred = conn->credentials();
+    LUMEN_CHECK(cred.pid == static_cast<unsigned>(child.pid));
+    LUMEN_CHECK(cred.pidfd >= 0);
+    // The pidfd alone confirms the peer here; the unreadable root has to refuse.
+    LUMEN_CHECK(lx::session::pidfd_alive(cred.pidfd));
+    LUMEN_CHECK(conn->sandboxed());
+    LUMEN_CHECK(!srv.allow_privileged_global(cred, "zlm_shell_v1"));
+    child.release();
     wl_client_destroy(client);
 }
 #endif

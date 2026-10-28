@@ -2036,10 +2036,14 @@ So each client also keeps a pidfd for its peer (`SO_PEERPIDFD`, Linux 6.5, taken
 client is registered; it names the process the kernel recorded at connect however late it
 is asked, and is closed when the client goes). Every `/proc/<pid>` answer — the executable
 here, `.flatpak-info` below — is read through the pid and then confirmed: the pidfd must
-still name a running process (`pidfd_send_signal` with signal 0), so the pid was never free
-in between. A peer that has exited is refused the shell global and counts as sandboxed. On a
-kernel without `SO_PEERPIDFD` (probed once at start and logged) the pid is taken alone, as
-before.
+not poll readable, which it does once the peer's thread group has exited, zombie included,
+so the pid was never free in between. The checks fail closed while a pidfd is held: a
+zombie, or a peer whose leader thread has exited while others run, has already released its
+root and executable, so the unreadable `/proc/<pid>/exe` refuses the shell global and the
+unopenable `/proc/<pid>/root` (opened first, `.flatpak-info` then looked up inside it) counts
+as sandboxed — as does a peer that has exited. On a kernel without `SO_PEERPIDFD` (probed
+once at start and logged) the pid is taken alone, as before, and a failed sandbox lookup
+counts as not sandboxed.
 
 Window rules (`zlm_window_rules_v1`) load from `$XDG_CONFIG_HOME/lumen/window-rules.toml`.
 

@@ -371,7 +371,8 @@ void lx::wayland::client_connection::set_privileged_shell(bool privileged) {
 
 namespace {
 /// An answer just read through `/proc/<cred.pid>` is about the peer: its pidfd still names a
-/// running process, so the pid was never free to be reused in between.
+/// process that has not exited (`pidfd_alive`: not a zombie either), so the pid was never
+/// free to be reused in between.
 bool peer_confirmed(const lx::wayland::unix_credentials& cred) {
     if (cred.pidfd >= 0)
         return lx::session::pidfd_alive(cred.pidfd);
@@ -388,24 +389,42 @@ bool lx::wayland::client_connection::sandboxed() {
     // Flatpak puts /.flatpak-info at the root of every sandbox (xdg-desktop-portal reads
     // the same file to identify apps); a same-UID process may look into another's root. The
     // peer's pid (SO_PEERCRED at connect) can be reused once the peer exits — its connection
-    // may live on in a child — so the answer is confirmed through its pidfd: a peer that is
-    // gone counts as sandboxed. A failed lookup otherwise (/proc hidden) counts as not
+    // may live on in a child — so with a pidfd the root is opened first and then confirmed
+    // through it, and the file looked up in that root. A root that cannot be opened (the
+    // peer is a zombie, its leader exited, it is not dumpable) or a peer that is gone counts
+    // as sandboxed. Without a pidfd (kernels before 6.5) a failed lookup counts as not
     // sandboxed: the global stays as it was before filters existed.
-    if (cred_.pid != 0) {
-        char path[64];
-        std::snprintf(path, sizeof(path), "/proc/%u/root/.flatpak-info", cred_.pid);
-        const bool found = ::access(path, F_OK) == 0;
-        if (!peer_confirmed(credentials())) {
+    if (cred_.pid == 0)
+        return false;
+    const auto cred = credentials();
+    char path[64];
+    bool found = false;
+    if (cred.pidfd >= 0) {
+        std::snprintf(path, sizeof(path), "/proc/%u/root", cred_.pid);
+        const lx::unique_fd root{::open(path, O_PATH | O_DIRECTORY | O_CLOEXEC)};
+        if (root.get() < 0 || !peer_confirmed(cred)) {
             sandbox_ = 2;
-            log_wayland.info("client pid={} exited before its sandbox check: treated as "
-                             "sandboxed",
+            log_wayland.info("client pid={} has no readable root or has exited before its "
+                             "sandbox check: treated as sandboxed",
                              cred_.pid);
-        } else if (found) {
-            sandbox_ = 2;
-            log_wayland.info("client pid={} is sandboxed (Flatpak): session-wide "
-                             "globals hidden",
-                             cred_.pid);
+            return true;
         }
+        found = ::faccessat(root.get(), ".flatpak-info", F_OK, 0) == 0;
+    } else if (cred.peer_gone) {
+        sandbox_ = 2;
+        log_wayland.info("client pid={} exited before its sandbox check: treated as "
+                         "sandboxed",
+                         cred_.pid);
+        return true;
+    } else {
+        std::snprintf(path, sizeof(path), "/proc/%u/root/.flatpak-info", cred_.pid);
+        found = ::access(path, F_OK) == 0;
+    }
+    if (found) {
+        sandbox_ = 2;
+        log_wayland.info("client pid={} is sandboxed (Flatpak): session-wide "
+                         "globals hidden",
+                         cred_.pid);
     }
     return sandbox_ == 2;
 }
@@ -835,7 +854,8 @@ bool lx::wayland::server::allow_privileged_global(const unix_credentials& cred,
     // The peer's pid comes from SO_PEERCRED at connect. An open connection does not keep
     // that process alive (a child may hold it), so after the read its pidfd must still name
     // a running process — then the pid was never free to be reused, and the executable is
-    // the peer's. Without SO_PEERPIDFD the pid is taken alone. Same check as KWin's
+    // the peer's. An executable that cannot be read (a zombie, a group whose leader exited)
+    // is a refusal too. Without SO_PEERPIDFD the pid is taken alone. Same check as KWin's
     // restricted interfaces (it reads /proc/<pid>/exe too). It is not a boundary against a
     // same-UID attacker that can ptrace the shell — nothing at this layer is.
     char exe[PATH_MAX]{};

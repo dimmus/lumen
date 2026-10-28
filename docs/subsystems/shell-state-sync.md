@@ -381,8 +381,8 @@ compositor warns with both paths:
 
 The pid is the one `SO_PEERCRED` recorded at connect. The open connection does not keep
 that process alive (a child can hold it), so the read is confirmed through the peer's pidfd
-(`SO_PEERPIDFD`, Linux 6.5, kept per client): it must still name a running process
-afterwards, or the bind is refused
+(`SO_PEERPIDFD`, Linux 6.5, kept per client): it must still name a process that has not
+exited (a zombie has) afterwards, or the bind is refused
 (`privileged global zlm_shell_v1 denied: client pid=<pid> has exited, …`). Kernels without
 `SO_PEERPIDFD` take the pid alone. This is the check KWin applies
 to its restricted interfaces. It is not a boundary against a same-UID process that can
