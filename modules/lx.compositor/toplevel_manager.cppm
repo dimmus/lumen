@@ -274,6 +274,23 @@ struct toplevel_record {
     bool workspace_dirty = false;
     /// With `home_identifier`: the 1-based position its workspace had on that output.
     unsigned home_workspace = 0;
+
+    // ── tiling (ADR 012) ──
+    /// Placed by its workspace's master-stack layout (T3); the window manager's decision,
+    /// made in `flush_tiling`.
+    bool tiled = false;
+    /// The user took it out of the layout (window.float-toggle, a resize).
+    bool floating = false;
+    /// Its place in the layout order: smaller first, the first ones the masters.
+    long long tile_order = 0;
+    /// The workspace it is laid out on: `workspace` once mapped; before that, the one its
+    /// initial configure placed it on (T4).
+    lx::workspace_id tile_workspace{};
+    /// The frame rect the layout gave it last.
+    lx::rect2i tile{};
+    /// Its geometry before it joined the layout, restored when it leaves (`float_set`).
+    lx::rect2i float_geometry{};
+    bool float_set = false;
     unsigned wire_id = 0;           ///< zlm_toplevel_v1 Wayland object id (P0)
     bool override_redirect = false; ///< XWayland / OR windows — no decorations, fixed stacking
     unsigned net_wm_type = 0;       ///< _NET_WM_WINDOW_TYPE atom value (XWayland bridge)
@@ -684,4 +701,8 @@ void lx::compositor::toplevel_manager::reset_for_remap(toplevel_record& rec) {
     rec.hidden = false;
     rec.workspace = {};
     rec.workspace_dirty = false;
+    rec.tiled = false;
+    rec.floating = false;
+    rec.tile_workspace = {};
+    rec.float_set = false;
 }

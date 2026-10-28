@@ -91,6 +91,12 @@ compositor matches every key and runs the shell's actions through zlm_shell_v1 v
 | Super+Left / Right | Snap the focused window to the left / right half; again: a quarter with Super+Up/Down, the half of the next monitor, or back (`window.snap-left/right`, Windows 11's rules) | compositor |
 | Super+Up / Down | Maximize / restore or minimize; from a half, its top / bottom quarter (`window.snap-up/down`) | compositor |
 | Alt+F7 / Alt+F8 | Move / resize the focused window with the arrow keys (Ctrl: 1 px steps) or the mouse; Return applies, Escape cancels (`window.move-keyboard`, `window.resize-keyboard`) | compositor |
+| Super+T | Tile the focused output's workspace (master-stack), or stack it again (`layout.toggle`) | compositor |
+| Super+J / K | On a tiled workspace: focus the next / previous window of the layout (`layout.focus-next/-previous`) | compositor |
+| Super+Shift+J / K | … swap the focused window with the next / previous one (`layout.swap-next/-previous`) | compositor |
+| Super+Shift+Return | … swap the focused window with the master (`layout.promote`) | compositor |
+| Super+equal / minus, Super+I / D | … widen / narrow the master column, one more / fewer window in it (`layout.master-grow/-shrink`, `layout.master-more/-fewer`) | compositor |
+| Super+Shift+Space | … take the focused window out of the layout, or put it back (`window.float-toggle`) | compositor |
 | Super+Escape | Turn the focused window's shortcuts inhibitor off (and on again) and release its pointer lock or confinement: a VM viewer, remote desktop or game that took the desktop's shortcuts or the pointer gives them back | compositor (only when that window inhibits or constrains the pointer; never inhibitable) |
 
 A window that inhibits shortcuts (keyboard-shortcuts-inhibit: virt-viewer, remote desktops)
@@ -112,6 +118,15 @@ a quarter; to the top: maximized), with a preview of where it goes while you hol
 dragging a maximized or snapped window away restores its size under the pointer
 (`[windows]` in `config.toml`). Snapped windows tell applications they are tiled, so GTK
 draws them without shadows and rounded corners.
+
+A workspace can **tile** instead (Super+T, or `[tiling] layout = "master-stack"` for every
+workspace): the first window takes the master column on the left (55 % of the width), the
+others share the stack on the right, with 8 px gaps (`[tiling]`). A new window opens at the
+end of the stack already at its tile's size; closing or minimizing a window closes the gap.
+Dialogs, fixed-size windows and windows you float (Super+Shift+Space) stay floating above
+the tiles; maximize and fullscreen work as usual, and the window returns to its tile. Drag a
+tile onto another to swap them; resizing a tile with the mouse floats it. Tiled windows tell
+applications they are tiled, as snapped ones do. Design: [ADR 012](adr/012-master-stack-tiling.md).
 
 lumen-shell is the session's **notification server** (`org.freedesktop.Notifications`,
 specification 1.2) and its **system tray** (`StatusNotifierItem`, as KDE, waybar and
@@ -355,7 +370,6 @@ systemctl --user reload lumen-compositor   # SIGHUP: re-read the configuration
 |--------|---------|-------------|
 | `LUMEN_PROTOCOLS_P1` | ON | Generate P1 upstream protocols |
 | `LUMEN_PROTOCOLS_P2` | OFF | Generate P2 upstream protocols |
-| `LUMEN_ENABLE_TILING_PLUGIN` | ON | Tiling plugin compile flag |
 | `LUMEN_VULKAN_VALIDATION` | OFF | Vulkan validation layers |
 | `LUMEN_BUILD_PORTAL` | ON | xdg-desktop-portal-lumen (needs libsystemd and wayland-client) |
 
@@ -376,7 +390,7 @@ systemctl --user reload lumen-compositor   # SIGHUP: re-read the configuration
 | Desktop (portal) | `lx.portal` (xdg-desktop-portal-lumen) |
 
 - **Multi-process:** compositor, shell, apps
-- **Stacking-first WM** with optional tiling plugin (`PolicyRegistry`)
+- **Stacking-first WM** with an optional master-stack tiling layout per workspace (`[tiling]`, Super+T; [ADR 012](adr/012-master-stack-tiling.md))
 - **State sync:** compositor → shell snapshot + delta (`zlm_policy_bridge_v1`)
 - **First-class threading:** `lx.sync`, `lx.runtime.executor`, immutable double-buffered frames ([docs/subsystems/threading.md](subsystems/threading.md))
 - **Errors & logging:** `lx.foundation.error`, `lx.trace` ([docs/subsystems/errors-and-logging.md](subsystems/errors-and-logging.md))

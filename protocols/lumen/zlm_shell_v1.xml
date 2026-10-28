@@ -35,7 +35,7 @@
 
     <enum name="capability">
       <description summary="compositor capability flags sent on bind"/>
-      <entry name="tiling" value="0x1" summary="tiling plugin supported"/>
+      <entry name="tiling" value="0x1" summary="reserved: tiling is the compositor's (ADR 012), not sent"/>
       <entry name="workspace_drag" value="0x4"/>
       <entry name="explicit_sync" value="0x10"/>
     </enum>
@@ -434,7 +434,8 @@
   <interface name="zlm_policy_bridge_v1" version="7">
     <description summary="window management policy bridge">
       Shell sends placement intent; compositor executes geometry, focus, and
-      stacking. Stacking is default; tiling is an optional shell plugin.
+      stacking. Stacking is default; a workspace may tile (master-stack), which the
+      compositor executes from its configuration and key bindings.
       On bind the compositor sends a snapshot_* event batch, then delta events.
     </description>
 

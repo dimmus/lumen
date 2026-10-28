@@ -194,6 +194,18 @@ void test_defaults() {
               up->action == cfg::action_id::window_snap_up && down &&
               down->action == cfg::action_id::window_snap_down,
           "Super+arrows snap");
+    // ADR 012: tiling is off by default; its keys are bound.
+    const auto* super_t = find_binding(d, "Super+T");
+    const auto* float_key = find_binding(d, "Super+Shift+space");
+    const auto* super_j = find_binding(d, "Super+J");
+    check(d.tiling.layout == cfg::tiling_layout::floating && d.tiling.master_ratio == 0.55 &&
+              d.tiling.master_count == 1 && d.tiling.gaps == 8 && super_t &&
+              super_t->action == cfg::action_id::layout_toggle && float_key &&
+              float_key->action == cfg::action_id::window_float_toggle && super_j &&
+              super_j->action == cfg::action_id::layout_focus_next &&
+              cfg::find_action("layout.promote") &&
+              cfg::find_action("layout.promote")->owner == cfg::action_owner::compositor,
+          "[tiling]: floating by default; Super+T, Super+Shift+space, Super+J bound");
     const auto* f7 = find_binding(d, "Alt+F7");
     const auto* f8 = find_binding(d, "Alt+F8");
     check(f7 && f7->action == cfg::action_id::window_move_keyboard && f8 &&
@@ -297,6 +309,11 @@ lock-command = "swaylock -f"
 spec = "#203040"
 [notifications]
 position = "bottom-left"
+[tiling]
+layout = "master-stack"
+master-ratio = 0.6
+master-count = 2
+gaps = 0
 )");
     check(p.ok && p.d.empty(), "valid values: no diagnostic");
     dump(p.d);
@@ -324,6 +341,9 @@ position = "bottom-left"
           "idle");
     check(p.c.notifications.position == cfg::notification_position::bottom_left, "an enum word");
     check(std::strcmp(p.c.background.spec, "#203040") == 0, "background spec");
+    check(p.c.tiling.layout == cfg::tiling_layout::master_stack && p.c.tiling.master_ratio == 0.6 &&
+              p.c.tiling.master_count == 2 && p.c.tiling.gaps == 0,
+          "tiling: layout, ratio, count, gaps");
 }
 
 void test_bad_values() {

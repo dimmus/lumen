@@ -26,7 +26,7 @@ enum config_change : unsigned {
     cfg_focus = 1u << 4,    ///< [focus]
     cfg_bindings = 1u << 5, ///< [bindings], general.default-bindings, idle.lock-command
     cfg_shell = 1u << 6,    ///< a key the shell applies
-    cfg_windows = 1u << 7,  ///< [windows]
+    cfg_windows = 1u << 7,  ///< [windows], [tiling]
     cfg_workspaces = 1u << 8,
 };
 

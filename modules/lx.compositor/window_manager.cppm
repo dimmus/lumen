@@ -27,6 +27,7 @@ import :dnd;
 import :liveness;
 import :activation;
 import :workspaces;
+import :tiling;
 
 namespace {
 
@@ -344,6 +345,37 @@ public:
     /// keyboard is activated (a usable quick switch while the shell restarts). False when
     /// there is none.
     bool quick_switch();
+
+    // ── Tiling: master-stack per workspace (ADR 012) ──
+
+    /// config.toml [tiling]. The first call, and one that changes the layout, the ratio or
+    /// the count, applies them to every workspace (T8); `gaps` applies at once.
+    void set_tiling_config(const tiling_config& c);
+    [[nodiscard]] const tiling_config& tiling() const { return tiling_; }
+    /// layout.toggle: output `slot`'s active workspace (-1: the focused output's) between
+    /// floating and master-stack. False without one.
+    bool toggle_layout(int slot, const char* source);
+    /// window.float-toggle: a tiled window leaves the layout, a floated one on a master-stack
+    /// workspace joins it again (T3). False when it changes nothing.
+    bool toggle_floating(lx::toplevel_id id);
+    /// layout.focus-next / -previous (`dir` ±1): the next window in the focused workspace's
+    /// layout order, wrapping; the first master when the keyboard is elsewhere.
+    bool focus_tiled(int dir);
+    /// layout.swap-next / -previous: `id` changes places with its neighbour in the order.
+    bool swap_tiled(lx::toplevel_id id, int dir);
+    /// layout.promote: `id` changes places with the first master (the first master, with the
+    /// window after it).
+    bool promote_tiled(lx::toplevel_id id);
+    /// layout.master-grow / -shrink (`ratio_delta`) and layout.master-more / -fewer
+    /// (`count_delta`) on the focused output's active workspace. False when nothing changed.
+    bool adjust_master(double ratio_delta, int count_delta);
+    /// The tiled windows of workspace `ws` in layout order, into `out`; returns how many.
+    unsigned tiled_windows(lx::workspace_id ws, std::span<lx::toplevel_id> out) const;
+    /// Lays out the master-stack workspaces again when membership, order, parameters or an
+    /// area changed since the last call (T5): one configure per window whose tile changed
+    /// size, a move for one whose tile only moved. From the end of every operation
+    /// (`flush_workspaces`) and the tick; nothing to do costs one test.
+    void flush_tiling();
 
     // ── Workspaces, minimize, sticky (design-session-and-wm Part W) ──
 
@@ -785,6 +817,19 @@ private:
     [[nodiscard]] unsigned open_edges(int slot, double x, double y) const;
     /// A keyboard grab's arrow key: the pointer moves `dx`, `dy` (logical px).
     void keyboard_grab_step(int dx, int dy);
+    // ── tiling ──
+    /// `rec` belongs in workspace `ws`'s layout (T3), mapped or not.
+    [[nodiscard]] bool tiles_on(const toplevel_record& rec, lx::workspace_id ws) const;
+    /// Puts `rec`'s desired configure at frame rect `frame` (tiled states, the place);
+    /// moves it without a configure when only the place changed. With `send`, the configure
+    /// goes out now when none is in flight (once the initial one went).
+    void aim_tile(toplevel_record& rec, lx::rect2i frame, bool send);
+    /// `rec` joins the layout: its floating geometry kept, a snap cleared.
+    void join_tiling(toplevel_record& rec);
+    /// `rec` leaves the layout: tiled states cleared, its floating geometry back.
+    void leave_tiling(toplevel_record& rec);
+    /// The workspace the layout actions act on: the focused output's active one.
+    [[nodiscard]] lx::workspace_id focused_workspace() const;
 
     toplevel_manager* toplevels_ = nullptr;
     surface_manager* surfaces_ = nullptr;
@@ -884,6 +929,13 @@ private:
     bool preview_staged_ = false;
     void (*warp_)(void* user, double x, double y) = nullptr;
     void* warp_user_ = nullptr;
+    // ── tiling (ADR 012) ──
+    tiling_config tiling_{};
+    bool tiling_set_ = false;
+    /// Membership, order, parameters or an area changed: `flush_tiling` has work.
+    bool tiling_dirty_ = false;
+    /// The last `tile_order` handed out (a window joining goes after every other).
+    long long tile_seq_ = 0;
 };
 
 // ── Pure helpers (exported for tests) ──────────────────────────────────────
@@ -986,6 +1038,9 @@ constexpr lx::trace::category log_wm{"compositor.wm"};
 }
 
 [[nodiscard]] bool rect_empty(lx::rect2i r) { return r.width <= 0 || r.height <= 0; }
+[[nodiscard]] bool rect_contains(lx::rect2i r, double x, double y) {
+    return x >= r.x && y >= r.y && x < r.x + r.width && y < r.y + r.height;
+}
 
 /// Comma list of the state bits, for the configure log line.
 void format_states(unsigned states, char* out, unsigned cap) {
@@ -1786,6 +1841,7 @@ void lx::compositor::window_manager::set_parent(lx::toplevel_id id, lx::toplevel
         return;
     const bool was_modal = effective_modal(*toplevels_, *rec);
     rec->parent = parent;
+    tiling_dirty_ = true;
     const bool modal = effective_modal(*toplevels_, *rec);
     if (log_wm.enabled(lx::trace::level::debug)) {
         log_wm.debug("parent id={} parent={} modal={}", id.id(), parent.id(), modal ? 1 : 0);
@@ -1890,6 +1946,7 @@ void lx::compositor::window_manager::on_output_changed() {
     // An output that went without `evacuate_output` (a path that never had windows to
     // move) takes its workspaces with it; outputs that came get theirs in on_output_added.
     sync_workspace_outputs(false);
+    tiling_dirty_ = true;
     if (layers_)
         layers_->arrange(); // reports each changed usable area through the host
     else if (outputs_)
@@ -1931,6 +1988,7 @@ unsigned lx::compositor::window_manager::evacuate_output(unsigned slot, int fall
     const lx::rect2i from = usable_area(static_cast<int>(slot));
     const lx::rect2i out = output_area(static_cast<int>(slot));
     unsigned moved = 0;
+    tiling_dirty_ = true;
     toplevels_->for_each_mut([&](toplevel_record& rec) {
         if (!rec.mapped) {
             // Placed there, not shown yet: placed on the fallback instead (none: placed
@@ -2107,6 +2165,7 @@ unsigned lx::compositor::window_manager::on_output_added(unsigned slot) {
     const lx::rect2i out = output_area(static_cast<int>(slot));
     const lx::rect2i usable = usable_area(static_cast<int>(slot));
     unsigned back = 0;
+    tiling_dirty_ = true;
     // Its workspaces (W.6): those that waited with no output left, else its own coming back
     // from where they were appended (their windows move with them) — then, below, windows
     // that were merged go to a workspace at their old position, and `settle` makes the
@@ -2227,6 +2286,7 @@ void lx::compositor::window_manager::on_usable_area_changed(unsigned slot, lx::r
     if (!toplevels_)
         return;
     rehit_pending_ = true;
+    tiling_dirty_ = true;
     // The output a window belongs to here: where a placing configure not yet answered takes
     // it (a window sent home by a hotplug moments ago, before the new output's panel maps),
     // else where it is drawn.
@@ -2335,7 +2395,11 @@ void lx::compositor::window_manager::set_maximized(lx::toplevel_id id, bool on,
     } else if (!on && is_max) {
         rec->desired.states &= ~static_cast<unsigned>(tl_maximized | tl_tiled_all);
         rec->snap = 0;
-        if (rec->restore_set) {
+        if (rec->tiled) {
+            // Back in the slot it kept (ADR 012 T3).
+            rec->restore_set = false;
+            aim_tile(*rec, rec->tile, false);
+        } else if (rec->restore_set) {
             // Back where it was — kept reachable if the usable area changed meanwhile (a
             // panel appeared over the old title bar), as a move would be.
             const frame_extents ext = extents_for(rec->desired.decoration, false);
@@ -2415,6 +2479,8 @@ void lx::compositor::window_manager::set_fullscreen(lx::toplevel_id id, bool on,
             rec->desired.size = {area.width - ext.left - ext.right, area.height - ext.top - ext.bottom};
             rec->desired.place = true;
             rec->desired.place_at = {area.x + ext.left, area.y + ext.top};
+        } else if (rec->tiled) {
+            aim_tile(*rec, rec->tile, false);
         } else if (rec->fullscreen_snap) {
             aim_snap(*rec, rec->fullscreen_snap, slot);
             rec->snap = rec->fullscreen_snap;
@@ -2573,6 +2639,23 @@ void lx::compositor::window_manager::on_initial_commit(lx::toplevel_id id) {
         rec->desired.size = {area.width, area.height};
         rec->desired.place = true;
         rec->desired.place_at = {area.x, area.y};
+    }
+    // ADR 012 T4: a window that will tile is counted in its workspace's layout now, so this
+    // configure carries its tile and the commit answering it maps it there.
+    if (rec->output >= 0) {
+        // Workspaces made at start-up only matter here when they would start tiled.
+        const auto slot = static_cast<unsigned>(rec->output);
+        if (!workspaces_.active(slot) && tiling_.layout == workspace_layout::master_stack)
+            sync_workspace_outputs(true);
+        if (const lx::workspace_id ws = workspaces_.active(slot); ws && tiles_on(*rec, ws)) {
+            rec->tile_workspace = ws;
+            rec->tile_order = ++tile_seq_;
+            tiling_dirty_ = true;
+            flush_tiling();
+            rec = toplevels_->find_mut(id);
+            if (!rec)
+                return;
+        }
     }
     send_configure(*rec, wm_now_ns(), true, false);
     rec->initial_configure_sent = true;
@@ -2793,6 +2876,7 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
         }
         if (!shown(rec))
             apply_hidden(rec, true);
+        tiling_dirty_ = true;
     }
 
     const lx::toplevel_id id = rec.id;
@@ -2860,6 +2944,10 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     leave_workspace(*rec);
     rec->workspace_dirty = false;
     workspaces_.forget_window(id);
+    // Out of its layout (the others close the gap); nothing is sent to a window that went.
+    rec->tiled = false;
+    rec->tile_workspace = {};
+    tiling_dirty_ = true;
     if (rec->hidden) {
         rec->hidden = false;
         if (auto* box = tree_->container(rec->surface))
@@ -2957,6 +3045,8 @@ void lx::compositor::window_manager::on_destroyed(lx::toplevel_id id) {
     }
     if (ops_.toplevel_destroyed)
         ops_.toplevel_destroyed(ops_.user, id);
+    if (const auto* rec = toplevels_->find(id); rec && rec->tile_workspace)
+        tiling_dirty_ = true;
     toplevels_->destroy(id);
 }
 
@@ -2986,6 +3076,8 @@ void lx::compositor::window_manager::on_tick(lx::runtime::clock_time now_ns) {
     // The drag icon likewise: once per tick, in the snapshot that carries the pointer.
     if (dnd_)
         dnd_->on_tick();
+    // A change no operation flushed (an area, an output): laid out before the configures go.
+    flush_tiling();
     flush_configures(now_ns);
     // O(1) unless a ping deadline passed; the focused client is pinged every 10 s.
     if (liveness_) {
@@ -2995,7 +3087,8 @@ void lx::compositor::window_manager::on_tick(lx::runtime::clock_time now_ns) {
 }
 
 bool lx::compositor::window_manager::needs_tick() const {
-    if (rehit_pending_ || stacking_dirty_ || (grab_.mode != grab_mode::none && grab_.motion_pending))
+    if (rehit_pending_ || stacking_dirty_ || tiling_dirty_ ||
+        (grab_.mode != grab_mode::none && grab_.motion_pending))
         return true;
     if (surfaces_ && surfaces_->layout_changed())
         return true;
@@ -4022,6 +4115,15 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
     // A move or resize ends any popup grab: menus do not travel with an interactive grab.
     if (popups_ && popups_->grab_active())
         popups_->dismiss_all("wm-grab");
+    // A resize of a tiled window floats it where it is (dwm's Mod+right-drag, ADR 012 T6);
+    // the others close the gap once the grab has begun.
+    const bool floated = mode == grab_mode::resize && rec->tiled;
+    if (floated) {
+        rec->floating = true;
+        rec->float_set = false;
+        leave_tiling(*rec);
+        tiling_dirty_ = true;
+    }
 
     grab_ = {};
     grab_.mode = mode;
@@ -4073,6 +4175,8 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
                      grab_.start.x, grab_.start.y, grab_.start.width, grab_.start.height,
                      keyboard ? " keyboard" : "", grab_.restore_pending ? " restore-pending" : "");
     }
+    if (floated)
+        flush_tiling();
     return true;
 }
 
@@ -4216,6 +4320,33 @@ void lx::compositor::window_manager::end_grab(grab_end_reason reason) {
     // output's active workspace — also when the workspace was switched during the drag.
     if (rec && rec->mapped && g.mode == grab_mode::move && reason == grab_end_reason::release)
         rec->output = window_output(*rec); // the output it was dropped on
+    if (rec && rec->tiled && rec->mapped && g.mode == grab_mode::move) {
+        // ADR 012 T6: dropped on another tile of its workspace, the two change places;
+        // anywhere else it goes back to its tile (or, on another output's floating
+        // workspace, stays where it was dropped).
+        if (reason == grab_end_reason::release) {
+            toplevel_record* target = nullptr;
+            toplevels_->for_each_mut([&](toplevel_record& t) {
+                if (!target && t.tiled && t.id != rec->id && t.mapped && !t.minimized &&
+                    t.tile_workspace == rec->tile_workspace &&
+                    rect_contains(t.tile, g.now_x, g.now_y))
+                    target = &t;
+            });
+            if (target) {
+                std::swap(target->tile_order, rec->tile_order);
+                log_wm.info("tile swap id={} with={}", rec->id.id(), target->id.id());
+            }
+            const int slot = window_output(*rec);
+            const lx::workspace_id ws = slot >= 0
+                                            ? workspaces_.active(static_cast<unsigned>(slot))
+                                            : lx::workspace_id{};
+            const workspace_record* w = workspaces_.find(ws);
+            if (!target && ws != rec->workspace &&
+                !(w && w->layout == workspace_layout::master_stack))
+                rec->float_set = false;
+        }
+        tiling_dirty_ = true;
+    }
     if (rec && rec->mapped && !rec->sticky && g.mode == grab_mode::move &&
         reason == grab_end_reason::release) {
         const int slot = window_output(*rec);
@@ -4614,6 +4745,7 @@ lx::compositor::workspace_sink lx::compositor::window_manager::sink() {
             r.workspace_dirty = true;
             wm->ws_dirty_ = true;
         });
+        wm->tiling_dirty_ = true;
     };
     s.workspace_moved = [](void* u, lx::workspace_id ws, int from, int to) {
         auto* wm = static_cast<window_manager*>(u);
@@ -4627,6 +4759,7 @@ lx::compositor::workspace_sink lx::compositor::window_manager::sink() {
                 wm->relocate_window(r, area, to);
         });
         wm->rehit_pending_ = true;
+        wm->tiling_dirty_ = true;
     };
     return s;
 }
@@ -4727,6 +4860,7 @@ void lx::compositor::window_manager::join_workspace(toplevel_record& rec, lx::wo
         workspaces_.window_added(ws);
     rec.workspace_dirty = true;
     ws_dirty_ = true;
+    tiling_dirty_ = true;
 }
 
 void lx::compositor::window_manager::leave_workspace(toplevel_record& rec) {
@@ -4736,6 +4870,7 @@ void lx::compositor::window_manager::leave_workspace(toplevel_record& rec) {
     rec.workspace = {};
     rec.workspace_dirty = true;
     ws_dirty_ = true;
+    tiling_dirty_ = true;
     workspaces_.window_removed(was);
 }
 
@@ -4865,6 +5000,7 @@ void lx::compositor::window_manager::recompute_urgent() {
 void lx::compositor::window_manager::flush_workspaces() {
     if (ws_batch_ > 0)
         return;
+    flush_tiling();
     send_visibility_configures();
     recompute_urgent();
     const bool model_changed = workspaces_.generation() != ws_generation_seen_;
@@ -5037,6 +5173,7 @@ void lx::compositor::window_manager::set_minimized(lx::toplevel_id id, bool on,
         return;
     rec->minimized = on;
     ws_windows_changed_ = true;
+    tiling_dirty_ = true;
     if (log_workspace.enabled(lx::trace::level::debug)) {
         log_workspace.debug("minimize id={} on={} source={}", id.id(), on ? 1 : 0,
                             source ? source : "-");
@@ -5070,6 +5207,7 @@ void lx::compositor::window_manager::set_sticky(lx::toplevel_id id, bool on) {
     rec->workspace_dirty = true;
     ws_dirty_ = true;
     ws_windows_changed_ = true;
+    tiling_dirty_ = true;
     if (shell_)
         shell_->emit_toplevel_flags(*rec);
     if (log_workspace.enabled(lx::trace::level::debug)) {
@@ -5147,8 +5285,9 @@ void lx::compositor::window_manager::aim_snap(toplevel_record& rec, unsigned sna
 void lx::compositor::window_manager::set_snap(lx::toplevel_id id, unsigned snap, int slot,
                                               const char* source) {
     auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    // A tiled window's place is its layout's (ADR 012 T6).
     if (!rec || !rec->mapped || !rec->initial_configure_sent ||
-        (rec->desired.states & tl_fullscreen))
+        (rec->desired.states & tl_fullscreen) || rec->tiled)
         return;
     if (grab_.mode != grab_mode::none && grab_.toplevel == id) {
         end_grab(grab_end_reason::release);
@@ -5200,6 +5339,9 @@ bool lx::compositor::window_manager::snap_by_key(lx::toplevel_id id, snap_key ke
         return false;
     const bool max = (rec->desired.states & tl_maximized) != 0;
     const snap_step st = next_snap(rec->snap, max, key);
+    // Tiled: Up maximizes and Down minimizes as for any window; a half is the layout's.
+    if (rec->tiled && st.move == snap_move::snap)
+        return false;
     switch (st.move) {
     case snap_move::none: return false;
     case snap_move::minimize: set_minimized(id, true, source); return true;
@@ -5291,7 +5433,9 @@ void lx::compositor::window_manager::hide_snap_preview() {
 void lx::compositor::window_manager::update_edge_zone() {
     unsigned zone = 0;
     int slot = -1;
-    if (window_cfg_.edge_snap && grab_.mode == grab_mode::move && !grab_.restore_pending) {
+    const auto* moving = toplevels_ ? toplevels_->find(grab_.toplevel) : nullptr;
+    if (window_cfg_.edge_snap && grab_.mode == grab_mode::move && !grab_.restore_pending &&
+        !(moving && moving->tiled)) {
         slot = pointer_output();
         if (slot >= 0)
             zone = edge_snap_zone(output_area(slot), grab_.now_x, grab_.now_y,
@@ -5434,5 +5578,350 @@ bool lx::compositor::window_manager::quick_switch() {
     if (log_wm.enabled(lx::trace::level::debug)) {
         log_wm.debug("quick switch id={} (no shell)", found.id());
     }
+    return true;
+}
+
+// ── Tiling: master-stack per workspace (ADR 012) ───────────────────────────────
+
+namespace {
+
+constexpr lx::trace::category log_tile{"compositor.tile"};
+
+} // namespace
+
+void lx::compositor::window_manager::set_tiling_config(const tiling_config& c) {
+    const bool params = !tiling_set_ || c.layout != tiling_.layout ||
+                        c.master_count != tiling_.master_count ||
+                        c.master_ratio != tiling_.master_ratio;
+    tiling_ = c;
+    tiling_.gaps = std::clamp(c.gaps, 0, 64);
+    tiling_set_ = true;
+    workspaces_.set_layout_defaults(tiling_, params);
+    tiling_dirty_ = true;
+    flush_workspaces();
+}
+
+bool lx::compositor::window_manager::tiles_on(const toplevel_record& rec,
+                                              lx::workspace_id ws) const {
+    const workspace_record* w = workspaces_.find(ws);
+    if (!w || w->layout != workspace_layout::master_stack || w->output < 0)
+        return false;
+    // Dialogs, transients and fixed-size windows float (dwm, sway, Hyprland), and so does
+    // what the user floated or pinned to every workspace.
+    const bool fixed = rec.min_size.width > 0 && rec.min_size.height > 0 &&
+                       rec.min_size.width == rec.max_size.width &&
+                       rec.min_size.height == rec.max_size.height;
+    return !rec.floating && !rec.parent && !rec.sticky && !rec.minimized && !fixed &&
+           !rec.override_redirect && !rec.stranded;
+}
+
+lx::workspace_id lx::compositor::window_manager::focused_workspace() const {
+    const int slot = focused_output();
+    return slot >= 0 ? workspaces_.active(static_cast<unsigned>(slot)) : lx::workspace_id{};
+}
+
+void lx::compositor::window_manager::join_tiling(toplevel_record& rec) {
+    // What it goes back to when it leaves: its normal geometry (a snapped or maximized
+    // window's is kept in `restore`).
+    rec.float_set = false;
+    if (rec.mapped) {
+        if (rec.snap || (rec.desired.states & tl_maximized)) {
+            rec.float_geometry = rec.restore;
+            rec.float_set = rec.restore_set;
+        } else if (rec.state == lx::toplevel_state::normal) {
+            rec.float_geometry = rec.geometry;
+            rec.float_set = true;
+        }
+    }
+    if (rec.snap) {
+        rec.snap = 0;
+        rec.restore_set = false;
+    }
+    rec.tiled = true;
+    if (rec.mapped && shell_)
+        shell_->emit_toplevel_state(rec);
+}
+
+void lx::compositor::window_manager::leave_tiling(toplevel_record& rec) {
+    rec.tiled = false;
+    rec.desired.states &= ~static_cast<unsigned>(tl_tiled_all);
+    if (rec.desired.states & (tl_maximized | tl_fullscreen)) {
+        // Unmaximized later, it goes where it floated.
+        rec.restore = rec.float_geometry;
+        rec.restore_set = rec.float_set;
+    } else if (rec.mapped && rec.float_set) {
+        const frame_extents ext = extents_for(rec.desired.decoration, false);
+        const lx::point2i p = constrain_on_output(usable_area(window_output(rec)),
+                                                  frame_rect(rec.float_geometry, ext));
+        rec.desired.size = {rec.float_geometry.width, rec.float_geometry.height};
+        rec.desired.place = true;
+        rec.desired.place_at = {p.x + ext.left, p.y + ext.top};
+        rec.desired.anchor_edges = 0;
+    }
+    rec.float_set = false;
+    rec.configure_due = true;
+    if (rec.initial_configure_sent)
+        configure_now(rec);
+    if (rec.mapped && shell_)
+        shell_->emit_toplevel_state(rec);
+}
+
+void lx::compositor::window_manager::aim_tile(toplevel_record& rec, lx::rect2i frame,
+                                              bool send) {
+    rec.tile = frame;
+    // Maximized or fullscreen over the layout: the slot is kept, the state wins (T3).
+    if (rec.desired.states & (tl_maximized | tl_fullscreen))
+        return;
+    // Moved by the user right now: its tile waits for the drop.
+    if (grab_.mode != grab_mode::none && grab_.toplevel == rec.id)
+        return;
+    const frame_extents ext = extents_for(rec.desired.decoration, false);
+    const lx::rect2i g{frame.x + ext.left, frame.y + ext.top,
+                       std::max(frame.width - ext.left - ext.right, 1),
+                       std::max(frame.height - ext.top - ext.bottom, 1)};
+    const bool tiled_states = (rec.desired.states & tl_tiled_all) == tl_tiled_all;
+    // A placing configure still unanswered: does it take the window here or elsewhere?
+    bool inflight_here = false;
+    bool inflight_elsewhere = false;
+    for (unsigned i = 0; i < rec.sent_count; ++i) {
+        if (!rec.sent[i].place)
+            continue;
+        if (rec.sent[i].place_at.x == g.x && rec.sent[i].place_at.y == g.y)
+            inflight_here = true;
+        else
+            inflight_elsewhere = true;
+    }
+    if (tiled_states && rec.desired.size.width == g.width &&
+        rec.desired.size.height == g.height && !inflight_elsewhere) {
+        // The size it has, or has been asked for: at most a move (T5).
+        if (rec.desired.place) {
+            rec.desired.place_at = {g.x, g.y};
+            return;
+        }
+        if (rec.mapped && !inflight_here && (rec.geometry.x != g.x || rec.geometry.y != g.y))
+            move_window(rec, {g.x, g.y}, "tile");
+        return;
+    }
+    rec.desired.states |= tl_tiled_all;
+    rec.desired.size = {g.width, g.height};
+    rec.desired.place = true;
+    rec.desired.place_at = {g.x, g.y};
+    rec.desired.anchor_edges = 0;
+    rec.desired.anchor = {};
+    rec.configure_due = true;
+    if (send && rec.initial_configure_sent)
+        configure_now(rec);
+    if (log_tile.enabled(lx::trace::level::debug)) {
+        log_tile.debug("tile id={} x={} y={} w={} h={}", rec.id.id(), g.x, g.y, g.width,
+                       g.height);
+    }
+}
+
+void lx::compositor::window_manager::flush_tiling() {
+    if (!tiling_dirty_ || !toplevels_)
+        return;
+    tiling_dirty_ = false;
+    lx::trace::scoped_span span{"compositor.wm", "flush_tiling"};
+    struct entry {
+        lx::workspace_id ws{};
+        long long order = 0;
+        lx::toplevel_id id{};
+    };
+    // Fixed arrays: a flush runs on changes only, and never allocates.
+    entry items[toplevel_manager::k_max];
+    unsigned n = 0;
+    lx::toplevel_id leaving[toplevel_manager::k_max];
+    unsigned left = 0;
+    toplevels_->for_each_mut([&](toplevel_record& r) {
+        // Mapped, its workspace; before the map, the one its initial configure tiled it on.
+        const lx::workspace_id ws = r.mapped ? r.workspace : r.tile_workspace;
+        if (!ws || !tiles_on(r, ws)) {
+            // Minimized: it keeps its state and gives up its place; back, it goes last.
+            if (r.tiled && !r.minimized && left < toplevel_manager::k_max)
+                leaving[left++] = r.id;
+            r.tile_workspace = {};
+            return;
+        }
+        if (r.tile_workspace != ws) {
+            r.tile_workspace = ws;
+            r.tile_order = ++tile_seq_;
+        }
+        if (!r.tiled)
+            join_tiling(r);
+        if (n < toplevel_manager::k_max)
+            items[n++] = {ws, r.tile_order, r.id};
+    });
+    for (unsigned i = 0; i < left; ++i)
+        if (auto* r = toplevels_->find_mut(leaving[i]))
+            leave_tiling(*r);
+    std::sort(items, items + n, [](const entry& a, const entry& b) {
+        return a.ws.id() != b.ws.id() ? a.ws.id() < b.ws.id() : a.order < b.order;
+    });
+    lx::rect2i tiles[toplevel_manager::k_max];
+    for (unsigned i = 0; i < n;) {
+        unsigned j = i;
+        while (j < n && items[j].ws == items[i].ws)
+            ++j;
+        const workspace_record* w = workspaces_.find(items[i].ws);
+        if (w && w->output >= 0) {
+            const unsigned count = j - i;
+            master_stack_layout(usable_area(w->output), w->master_count, w->master_ratio,
+                                tiling_.gaps, std::span<lx::rect2i>(tiles, count));
+            for (unsigned k = 0; k < count; ++k)
+                if (auto* r = toplevels_->find_mut(items[i + k].id))
+                    aim_tile(*r, tiles[k], true);
+        }
+        i = j;
+    }
+    rehit_pending_ = true;
+}
+
+unsigned lx::compositor::window_manager::tiled_windows(lx::workspace_id ws,
+                                                       std::span<lx::toplevel_id> out) const {
+    if (!toplevels_ || !ws)
+        return 0;
+    struct entry {
+        long long order = 0;
+        lx::toplevel_id id{};
+    };
+    entry items[toplevel_manager::k_max];
+    unsigned n = 0;
+    toplevels_->for_each([&](const toplevel_record& r) {
+        if (r.tiled && r.mapped && !r.minimized && r.tile_workspace == ws &&
+            n < toplevel_manager::k_max)
+            items[n++] = {r.tile_order, r.id};
+    });
+    std::sort(items, items + n, [](const entry& a, const entry& b) { return a.order < b.order; });
+    const auto count = std::min<unsigned>(n, static_cast<unsigned>(out.size()));
+    for (unsigned i = 0; i < count; ++i)
+        out[i] = items[i].id;
+    return count;
+}
+
+bool lx::compositor::window_manager::toggle_layout(int slot, const char* source) {
+    if (slot < 0)
+        slot = focused_output();
+    if (slot < 0)
+        return false;
+    const lx::workspace_id ws = workspaces_.active(static_cast<unsigned>(slot));
+    const workspace_record* w = workspaces_.find(ws);
+    if (!w)
+        return false;
+    const workspace_layout to = w->layout == workspace_layout::master_stack
+                                    ? workspace_layout::floating
+                                    : workspace_layout::master_stack;
+    (void)workspaces_.set_layout(ws, to, w->master_count, w->master_ratio);
+    log_tile.info("layout workspace={} output={} layout={} source={}", ws.id(), slot,
+                  layout_name(to), source ? source : "-");
+    tiling_dirty_ = true;
+    flush_workspaces();
+    return true;
+}
+
+bool lx::compositor::window_manager::toggle_floating(lx::toplevel_id id) {
+    flush_tiling();
+    auto* rec = toplevels_ ? toplevels_->find_mut(id) : nullptr;
+    if (!rec || !rec->mapped)
+        return false;
+    const workspace_record* w = workspaces_.find(rec->workspace);
+    if (!w || w->layout != workspace_layout::master_stack)
+        return false;
+    if (rec->tiled) {
+        rec->floating = true;
+    } else if (rec->floating) {
+        rec->floating = false;
+    } else {
+        return false; // a dialog, a fixed-size window: it floats by its nature
+    }
+    const bool floated = rec->floating;
+    log_tile.info("float id={} on={}", id.id(), floated ? 1 : 0);
+    tiling_dirty_ = true;
+    flush_workspaces();
+    if (floated)
+        (void)raise(id);
+    return true;
+}
+
+bool lx::compositor::window_manager::focus_tiled(int dir) {
+    flush_tiling();
+    lx::toplevel_id order[toplevel_manager::k_max];
+    const unsigned n = tiled_windows(focused_workspace(), order);
+    if (n == 0)
+        return false;
+    unsigned at = n;
+    for (unsigned i = 0; i < n; ++i)
+        if (order[i] == keyboard_focus_)
+            at = i;
+    const unsigned to = at == n ? 0u
+                                : static_cast<unsigned>((static_cast<int>(at) + dir +
+                                                         static_cast<int>(n)) %
+                                                        static_cast<int>(n));
+    if (order[to] == keyboard_focus_)
+        return false;
+    activate(order[to]);
+    return true;
+}
+
+bool lx::compositor::window_manager::swap_tiled(lx::toplevel_id id, int dir) {
+    flush_tiling();
+    const auto* rec = toplevels_ ? toplevels_->find(id) : nullptr;
+    if (!rec || !rec->tiled)
+        return false;
+    lx::toplevel_id order[toplevel_manager::k_max];
+    const unsigned n = tiled_windows(rec->tile_workspace, order);
+    unsigned at = n;
+    for (unsigned i = 0; i < n; ++i)
+        if (order[i] == id)
+            at = i;
+    if (n < 2 || at == n)
+        return false;
+    const unsigned to = static_cast<unsigned>((static_cast<int>(at) + dir + static_cast<int>(n)) %
+                                              static_cast<int>(n));
+    auto* a = toplevels_->find_mut(order[at]);
+    auto* b = toplevels_->find_mut(order[to]);
+    std::swap(a->tile_order, b->tile_order);
+    tiling_dirty_ = true;
+    flush_workspaces();
+    return true;
+}
+
+bool lx::compositor::window_manager::promote_tiled(lx::toplevel_id id) {
+    flush_tiling();
+    const auto* rec = toplevels_ ? toplevels_->find(id) : nullptr;
+    if (!rec || !rec->tiled)
+        return false;
+    lx::toplevel_id order[toplevel_manager::k_max];
+    const unsigned n = tiled_windows(rec->tile_workspace, order);
+    if (n < 2)
+        return false;
+    // dwm's zoom: the first master changes places with the focused window, or, when that is
+    // the first master, with the window after it.
+    const lx::toplevel_id other = order[0] == id ? order[1] : order[0];
+    auto* a = toplevels_->find_mut(id);
+    auto* b = toplevels_->find_mut(other);
+    std::swap(a->tile_order, b->tile_order);
+    tiling_dirty_ = true;
+    flush_workspaces();
+    return true;
+}
+
+bool lx::compositor::window_manager::adjust_master(double ratio_delta, int count_delta) {
+    const lx::workspace_id ws = focused_workspace();
+    const workspace_record* w = workspaces_.find(ws);
+    if (!w || w->layout != workspace_layout::master_stack)
+        return false;
+    const double ratio =
+        std::clamp(w->master_ratio + ratio_delta, k_master_ratio_min, k_master_ratio_max);
+    const int count = std::clamp(static_cast<int>(w->master_count) + count_delta, 0,
+                                 static_cast<int>(k_master_count_max));
+    // Within a rounding step of the old ratio is no change (0.1 + 0.05 − 0.05).
+    if (std::abs(ratio - w->master_ratio) < 1e-9 && count == static_cast<int>(w->master_count))
+        return false;
+    (void)workspaces_.set_layout(ws, w->layout, static_cast<unsigned>(count), ratio);
+    if (log_tile.enabled(lx::trace::level::debug)) {
+        log_tile.debug("master workspace={} ratio={} count={}", ws.id(), ratio, count);
+    }
+    tiling_dirty_ = true;
+    flush_workspaces();
     return true;
 }

@@ -628,6 +628,55 @@ LUMEN_TEST(wm_drag_restore_keeps_the_pointer_on_the_title_bar) {
     LUMEN_CHECK(q.y == 833 - 299 && q.x == 100 - static_cast<int>(std::lround(100.0 / 1920 * 800)));
 }
 
+// ── master-stack tiling (ADR 012) ────────────────────────────────────────────
+
+LUMEN_TEST(wm_master_stack_layout_splits_without_losing_pixels) {
+    using namespace lx::compositor;
+    const lx::rect2i area{0, 0, 1280, 720};
+    lx::rect2i t[5]{};
+    // One window: the area less the margin.
+    master_stack_layout(area, 1, 0.55, 8, std::span<lx::rect2i>(t, 1));
+    LUMEN_CHECK(same(t[0], {8, 8, 1264, 704}));
+    // Two: the master takes 0.55 of the width between the margins less the inner gap.
+    master_stack_layout(area, 1, 0.55, 8, std::span<lx::rect2i>(t, 2));
+    LUMEN_CHECK(same(t[0], {8, 8, 691, 704}));
+    LUMEN_CHECK(same(t[1], {707, 8, 565, 704}));
+    LUMEN_CHECK(t[1].x + t[1].width == 1280 - 8);
+    // Three stack windows in 721 px: no pixel lost, the gaps exact, the last at the margin.
+    master_stack_layout({0, 0, 1000, 721}, 1, 0.5, 8, std::span<lx::rect2i>(t, 4));
+    LUMEN_CHECK(t[1].y == 8 && t[2].y == t[1].y + t[1].height + 8 &&
+                t[3].y == t[2].y + t[2].height + 8);
+    LUMEN_CHECK(t[3].y + t[3].height == 721 - 8);
+    LUMEN_CHECK(t[1].height + t[2].height + t[3].height == 721 - 16 - 16);
+    // No gaps: tiles touch.
+    master_stack_layout(area, 1, 0.5, 0, std::span<lx::rect2i>(t, 3));
+    LUMEN_CHECK(same(t[0], {0, 0, 640, 720}) && same(t[1], {640, 0, 640, 360}) &&
+                same(t[2], {640, 360, 640, 360}));
+}
+
+LUMEN_TEST(wm_master_stack_layout_count_and_ratio_edges) {
+    using namespace lx::compositor;
+    const lx::rect2i area{100, 50, 1000, 600};
+    lx::rect2i t[3]{};
+    // Every window a master: one column across the whole width.
+    master_stack_layout(area, 3, 0.55, 0, std::span<lx::rect2i>(t, 3));
+    LUMEN_CHECK(same(t[0], {100, 50, 1000, 200}) && same(t[2], {100, 450, 1000, 200}));
+    // No masters: the stack takes the width.
+    master_stack_layout(area, 0, 0.55, 0, std::span<lx::rect2i>(t, 2));
+    LUMEN_CHECK(same(t[0], {100, 50, 1000, 300}) && same(t[1], {100, 350, 1000, 300}));
+    // Two masters, one stack window.
+    master_stack_layout(area, 2, 0.6, 0, std::span<lx::rect2i>(t, 3));
+    LUMEN_CHECK(same(t[0], {100, 50, 600, 300}) && same(t[1], {100, 350, 600, 300}) &&
+                same(t[2], {700, 50, 400, 600}));
+    // The ratio is clamped to [0.1, 0.9].
+    master_stack_layout(area, 1, 2.0, 0, std::span<lx::rect2i>(t, 2));
+    LUMEN_CHECK(t[0].width == 900 && t[1].width == 100);
+    // An area smaller than its margins: laid out without them, every rect at least 1x1.
+    master_stack_layout({0, 0, 10, 10}, 1, 0.5, 8, std::span<lx::rect2i>(t, 3));
+    for (const lx::rect2i& r : t)
+        LUMEN_CHECK(r.width >= 1 && r.height >= 1);
+}
+
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
 }

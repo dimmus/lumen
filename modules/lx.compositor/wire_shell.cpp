@@ -531,8 +531,8 @@ void bind_shell(wayland::client_connection& client, unsigned id, int version) {
             break;
         }
     }
-    // "Sent immediately after bind". No optional capability is implemented yet (tiling
-    // plugin, workspace drag, explicit sync), so the flags are empty.
+    // "Sent immediately after bind". No optional capability is implemented yet (workspace
+    // drag, explicit sync; tiling is the compositor's own, ADR 012), so the flags are empty.
     // shell_protocol_version: the zlm family's version this compositor implements (2:
     // toplevel_flags; 3: request_logout; 4: grab_key; 5: lock_state, lock_requested; 6:
     // icons, parents, bell, capture_state, not_inhibitable grabs; 7: config, actions, held

@@ -1,5 +1,4 @@
 option(LUMEN_BUILD_PORTAL "Build xdg-desktop-portal-lumen (needs libsystemd, wayland-client; libpng for files)" ON)
-option(LUMEN_ENABLE_TILING_PLUGIN "Build tiling WM plugin (dlopen)" ON)
 option(LUMEN_VULKAN_VALIDATION "Enable Vulkan validation layers" OFF)
 option(LUMEN_PROTOCOLS_P1 "Generate and enable P1 Wayland protocols" ON)
 option(LUMEN_PROTOCOLS_P2 "Generate and enable P2 Wayland protocols" OFF)
@@ -27,10 +26,6 @@ endif()
 
 if(LUMEN_VULKAN_VALIDATION)
     add_compile_definitions(LUMEN_VULKAN_VALIDATION=1)
-endif()
-
-if(LUMEN_ENABLE_TILING_PLUGIN)
-    add_compile_definitions(LUMEN_ENABLE_TILING_PLUGIN=1)
 endif()
 
 if(LUMEN_BUILD_XWAYLAND)

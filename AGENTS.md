@@ -17,7 +17,7 @@ Lumen is a **greenfield Linux desktop stack** — not a port of EFL/Qt/GTK.
 | Display | **Wayland-only** | Add X11, XWayland-first paths, or Win32 display code in core modules |
 | Rendering | **Vulkan-first, multi-backend** — see §1.1 | Add a backend outside `lx.gfx`; make GL or CPU the default on hardware with a working Vulkan driver; Skia-without-Vulkan as compositor backend |
 | Processes | **Multi-process** | Merge compositor + shell into one binary |
-| WM model | **Stacking-first**, optional tiling **plugin** | Make tiling the default or hard-code only tiling |
+| WM model | **Stacking-first**, optional master-stack tiling per workspace (compositor, [ADR 012](docs/adr/012-master-stack-tiling.md)) | Make tiling the default or hard-code only tiling |
 | Threading | **UI / render / worker** affinities + immutable snapshots | Share mutable scene graph across threads |
 | Buffers | **dmabuf → GPU import**, explicit sync | SHM-only compositor path in production code |
 | Security | **Unix session UID** default; Flatpak optional | Expose `zlm_shell_v1` to all clients |
@@ -347,7 +347,7 @@ modules/
 ├── lx.ui/             widgets, style, theme.compile
 ├── lx.compositor/     compositor + surface, toplevel, shell_bridge, cursor, output
 ├── lx.shell/          shell + bridge
-├── lx.shell.policy/   stacking/tiling policies
+├── lx.shell.policy/   stacking policy
 ├── lx.app/            application framework
 └── lx.portal/         xdg-desktop-portal-lumen: Screenshot/PickColor backend (LUMEN_BUILD_PORTAL)
 

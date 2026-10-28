@@ -75,6 +75,12 @@ edge-snap-corner = 64   # logical pixels along an edge that make a corner (quart
 snap-preview = true     # show where the window will go while dragging
 drag-restore = true     # dragging a maximized or snapped window restores its size
 
+[tiling]                # master-stack, per workspace: Super+T tiles the workspace or stacks it
+layout = "floating"     # floating | master-stack: the layout every workspace starts with
+master-ratio = 0.55     # the master column's share of the width, 0.1..0.9 (Super+equal/minus)
+master-count = 1        # windows in the master column, 0..16 (Super+I / Super+D)
+gaps = 8                # logical pixels around and between the tiles, 0..64
+
 [workspaces]            # per output; Super+1…9 switch, Super+Shift+1…9 move the window there
 mode = "dynamic"        # dynamic (one empty workspace always last, empty ones go) | static
 count = 4               # static only: workspaces per output, 1..16
@@ -166,3 +172,14 @@ default-bindings = true # false: start from no bindings (Lumen's own keys remain
 "Super+Down" = "window.snap-down"
 "Alt+F7" = "window.move-keyboard"
 "Alt+F8" = "window.resize-keyboard"
+"Super+T" = "layout.toggle"
+"Super+Shift+space" = "window.float-toggle"
+"Super+J" = "layout.focus-next"
+"Super+K" = "layout.focus-previous"
+"Super+Shift+J" = "layout.swap-next"
+"Super+Shift+K" = "layout.swap-previous"
+"Super+Shift+Return" = "layout.promote"
+"Super+equal" = "layout.master-grow"
+"Super+minus" = "layout.master-shrink"
+"Super+I" = "layout.master-more"
+"Super+D" = "layout.master-fewer"

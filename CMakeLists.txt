@@ -1138,6 +1138,15 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_ext_workspace COMMAND test_ext_workspace)
     set_tests_properties(test_ext_workspace PROPERTIES TIMEOUT 60)
 
+    # ADR 012: master-stack tiling per workspace, in-process as above.
+    add_executable(test_tiling tests/test_tiling.cpp)
+    target_link_libraries(test_tiling PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_tiling)
+    lumen_link_platform(test_tiling)
+    target_include_directories(test_tiling PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_tiling COMMAND test_tiling)
+    set_tests_properties(test_tiling PROPERTIES TIMEOUT 60)
+
     add_executable(test_window_protocols tests/test_window_protocols.cpp)
     target_link_libraries(test_window_protocols PRIVATE lx.compositor)
     lumen_apply_module_properties(test_window_protocols)

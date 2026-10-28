@@ -14,7 +14,7 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | Rendering | Vulkan-first (discrete + integrated) |
 | Processes | Multi-process (compositor, shell, apps) |
 | UI | Scene graph core + fluent builder widgets + compiled themes |
-| WM | Stacking-first, optional tiling plugin |
+| WM | Stacking-first, optional master-stack tiling per workspace (compositor) |
 | Security | Unix permissions default, optional Flatpak portal |
 
 ## Diagram index
@@ -32,7 +32,7 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [09-wayland-protocols.mmd](09-wayland-protocols.mmd) | Package | Protocol layer stack |
 | [10-protocol-dispatch.mmd](10-protocol-dispatch.mmd) | Class | libwayland-backed Wayland server seam |
 | [11-lumen-private-protocols.mmd](11-lumen-private-protocols.mmd) | Class | zlm_* DE protocols |
-| [12-window-management.mmd](12-window-management.mmd) | Class | Stacking-first + tiling plugin |
+| [12-window-management.mmd](12-window-management.mmd) | Class | Stacking-first + master-stack tiling |
 | [13-state-machines.mmd](13-state-machines.mmd) | State | Surface, Seat, Widget, ZlmToplevel, Session pause/resume, Display power, Session lock |
 | [14-fluent-builder.mmd](14-fluent-builder.mmd) | Class | Fluent builder API |
 | [15-dual-gpu.mmd](15-dual-gpu.mmd) | Class | Discrete vs integrated render paths |

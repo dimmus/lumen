@@ -35,7 +35,8 @@ Design goals:
   All three live in `lx.gfx` behind `compositor::config::present`
   ([rendering-performance.md](subsystems/rendering-performance.md) §1.2, [AGENTS.md](../AGENTS.md) §1.1)
 - **Multi-process** — compositor owns display; shell and apps are clients
-- **Stacking-first WM** — optional tiling plugin via `lx.shell.policy`
+- **Stacking-first WM** — an optional master-stack tiling layout per workspace, executed by
+  the compositor (`lx.compositor:tiling`, [ADR 012](adr/012-master-stack-tiling.md))
 - **First-class threading** — UI / render / worker affinities with immutable frame handoff
 - **Zero-copy where possible** — dmabuf → Vulkan import, explicit sync via drm-syncobj
 - **Performance pipeline** — snapshot v2, direct scanout, import cache, hot-path budgets ([rendering-performance.md](subsystems/rendering-performance.md))
@@ -455,6 +456,7 @@ flowchart LR
 | `lx.compositor.layer_shell` | wlr-layer-shell, Wayland-free: layer-surface records, the configure/ack flow, arrangement against the output (`arrange_layers`, pure) and the usable area its exclusive zones leave, keyboard-interactivity queries; each layer surface's tree container sits in one of the four layer-shell scene containers. UI affinity |
 | `lx.compositor.decoration` | Server-side frames (xdg-decoration), Wayland-free: frame extents and hit zones, the shared atlas, the frame scene node (underlay of the window's tree container; its fills are UI quad primitives), titles shaped by `lx.text` and drawn as `mono_sprite`s from the compositor's `chrome_atlas` (`chrome_text`), the close × an atlas glyph per scale. UI affinity |
 | `lx.compositor.ui_composite` | How a backend draws a snapshot (ADR-010 §4.11): the draws as blits when it carries no UI primitive (the path unchanged), its sorted stream through `lx.gfx:ui_cpu` / `:ui_gl` when it does, on Vulkan inside the compositor's linear pass through `lx.gfx:ui_vk` (`paint_vk`); screen-capture re-composites through the CPU and GL primitive renderers (`paint_cpu_capture`, `paint_gl_capture`); the stream lowered to blits only where there is no primitive renderer (GLES 2, Vulkan without a ready `ui_vk`), which drops titles. Render affinity |
+| `lx.compositor.tiling` | Master-stack tiling (ADR 012), pure: `master_stack_layout` (frame rects for a window count, master count, ratio and gaps), `workspace_layout`, `tiling_config`. The window manager applies it (`flush_tiling`) |
 | `lx.compositor.workspaces` | The workspace model, Wayland-free and pure (bodies in `workspaces.cpp`): every output's ordered workspaces and its active one, dynamic (one empty last, empty inactive ones go) or static, focus memory, urgency, hotplug (merge, append, return, strand), `assign`; tells the window manager when windows or a workspace move (`workspace_sink`). 64 workspaces, 16 per output. UI affinity |
 | `lx.compositor.shell_bridge` | Creates `zlm_toplevel_v1` handles; emits snapshot/deltas (created, destroyed, state — `modal` for an effectively modal dialog, `minimized` —, geometry, focus, flags — `sticky` from v7 —; v6: icon with its memfds, parent, bell; v7: `toplevel_workspace` with the shell's ext-workspace handle) on `zlm_policy_bridge_v1`; receives WM requests |
 | `lx.compositor.toplevel_icon` | xdg-toplevel-icon-v1's icon store, Wayland-free: a set_icon snapshot (name + up to four buffers, edge ≤ 256, nearest the panel's 32 px first) copied into sealed memfds, refcounted by the toplevel records, 128 icons and 16 MiB of pixels at most. UI affinity |
@@ -1456,6 +1458,22 @@ it and is its only caller, and each window's membership is `toplevel_record::wor
   active again. With no output, workspaces wait for the next.
 - **Control.** `lumen-ctl workspaces`, `ListWorkspaces`, workspace fields in `ListWindows` /
   `ListOutputs`, `workspace` events in `Subscribe`.
+
+### Tiling
+
+([ADR 012](adr/012-master-stack-tiling.md).) Each workspace record carries a layout —
+`floating` (stacking, the default) or `master-stack` — with its master count and ratio
+(`[tiling]` sets what workspaces start with; `layout.toggle`, Super+T, flips one). The layout
+is a pure function, `master_stack_layout` in `:tiling` (dwm's `tile`: masters left, the
+stack right, `gaps` around and between, no pixel lost). `window_manager::flush_tiling` applies
+it after every operation that changes membership, order, parameters or an area (from
+`flush_workspaces` and the tick): one configure with the size, the place and all four xdg
+`tiled_*` states per window whose tile changed size, a move for one whose tile only moved.
+Dialogs, fixed-size, sticky and user-floated windows float; minimized ones give up their
+place; maximized and fullscreen ones keep it. A window that will tile is laid out at its
+initial commit, so its first configure carries its tile and it maps in place. The order is
+`toplevel_record::tile_order`; a dragged tile dropped on another swaps with it, a resized one
+floats. The shell sees tiled windows as `toplevel_state.tiled`.
 
 ### Snapping and the window switcher
 
