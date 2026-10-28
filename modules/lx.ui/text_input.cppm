@@ -174,6 +174,10 @@ public:
     void on_interaction_changed() override;
     void on_timer(std::uint32_t tag) override;
     [[nodiscard]] a11y::node accessibility_node() const override;
+    /// The I-beam (an arrow while disabled).
+    [[nodiscard]] cursor_style cursor() const override {
+        return has_flag(node_flag::disabled) ? cursor_style::arrow : cursor_style::text;
+    }
 
     void ime_apply(const ime_update& update) override;
     void ime_reset() override;
@@ -363,7 +367,19 @@ char g_ti_clipboard[lx::ui::k_text_input_capacity + 1]{};
     return 4;
 }
 
-[[nodiscard]] int lx_ui_ti_px(std::int32_t v26_6) { return (v26_6 + 32) >> 6; }
+/// Layout px in the field's layout's 26.6 units (device px at the UI's device `scale`).
+[[nodiscard]] std::int32_t lx_ui_ti_units(int px, float scale) {
+    if (scale == 1.f)
+        return px * 64;
+    return static_cast<std::int32_t>(std::lround(static_cast<double>(px) * 64.0 * scale));
+}
+
+/// A 26.6 position of the field's layout (device px at the UI's device `scale`) in layout px.
+[[nodiscard]] int lx_ui_ti_px(std::int32_t v26_6, float scale) {
+    if (scale == 1.f)
+        return (v26_6 + 32) >> 6;
+    return static_cast<int>(std::lround(static_cast<double>(v26_6) / (64.0 * scale)));
+}
 
 [[nodiscard]] const char* lx_ui_ti_family() {
     const char* f = lx::ui::active_theme().fonts().ui_family;
@@ -619,7 +635,7 @@ lx::rect2i lx::ui::text_input_node::caret_rect() const {
     const bool empty = size() == 0 && preedit_size_ == 0;
     const lx::text::caret_pos cp = empty ? lx::text::caret_pos{} : l.caret(at);
     const lx::rect2i tb = text_->bounds();
-    int x = text_x() + lx_ui_ti_px(cp.x);
+    int x = text_x() + lx_ui_ti_px(cp.x, text_->device_scale());
     if (empty)
         x = rtl() ? text_area().x + text_area().width - k_ti_caret_w : text_area().x;
     // The bar straddles the position, nudged inside the field at its edges.
@@ -644,7 +660,7 @@ void lx::ui::text_input_node::keep_caret_visible() {
     }
     const lx::text::text_layout& l = text_->layout();
     std::uint32_t at = caret_ + (preedit_cursor_[0] >= 0 ? static_cast<std::uint32_t>(preedit_cursor_[0]) : preedit_size_);
-    const int cx = lx_ui_ti_px(l.caret(at).x);
+    const int cx = lx_ui_ti_px(l.caret(at).x, text_->device_scale());
     int s = scroll_x_;
     if (cx - s < 0)
         s = cx;
@@ -689,8 +705,8 @@ void lx::ui::text_input_node::emit(draw_scope& out) const {
         for (const lx::text::layout_cluster& c : l.clusters()) {
             if (c.begin < a || c.end > b || c.end <= c.begin)
                 continue;
-            const int p0 = lx_ui_ti_px(l.caret(c.begin).x);
-            const int p1 = lx_ui_ti_px(l.caret(c.end, true).x);
+            const int p0 = lx_ui_ti_px(l.caret(c.begin).x, text_->device_scale());
+            const int p1 = lx_ui_ti_px(l.caret(c.end, true).x, text_->device_scale());
             int lo = std::min(p0, p1);
             int hi = std::max(p0, p1);
             bool merged = false;
@@ -950,7 +966,8 @@ std::uint32_t lx::ui::text_input_node::index_at(lx::point2i local, bool* upstrea
         return 0;
     const lx::rect2i tb = text_->bounds();
     const lx::text::text_hit h =
-        text_->layout().hit_test((local.x - text_x()) * 64, (local.y - tb.y) * 64);
+        text_->layout().hit_test(lx_ui_ti_units(local.x - text_x(), text_->device_scale()),
+                                 lx_ui_ti_units(local.y - tb.y, text_->device_scale()));
     if (upstream)
         *upstream = h.upstream;
     return std::min(h.index, size());

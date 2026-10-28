@@ -1,7 +1,6 @@
 module;
 
 import lx.foundation;
-import lx.wayland.client;
 import lx.wayland.protocols;
 
 export module lx.shell.policy;

@@ -80,8 +80,15 @@ if(TARGET lumen-protocol-glue)
     # Protocol handlers in lx.compositor include generated *-server-protocol.h
     target_include_directories(lx.wayland.server PUBLIC "${LUMEN_GENERATED_DIR}")
 endif()
+# The client side (ADR-010 Phase 4): a thin libwayland-client wrapper over the generated
+# client glue, xkbcommon for keymaps. Platform layer: lx.foundation / lx.runtime only.
 lumen_add_module_library(lx.wayland.client modules/lx.wayland.client
-    DEPENDS lx.runtime lx.wayland.protocols)
+    DEPENDS lx.runtime lx.trace)
+lumen_link_platform_parts(lx.wayland.client wayland_client xkb)
+if(TARGET lumen-protocol-glue AND WAYLAND_CLIENT_FOUND)
+    target_link_libraries(lx.wayland.client PRIVATE lumen-protocol-glue)
+    target_compile_definitions(lx.wayland.client PRIVATE LUMEN_HAS_PROTOCOL_GLUE=1)
+endif()
 
 # ── Graphics & UI ────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.gfx modules/lx.gfx
@@ -129,7 +136,7 @@ lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.ru
 lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
     DEPENDS lx.gfx lx.layout lx.scheduler lx.runtime lx.sync)
-lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.wayland.client lx.layout lx.a11y)
+lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.layout lx.a11y)
 # Compiled themes (ADR-010 §4.8) and bundled Lucide icons (§5.5): found in the build tree, an
 # install relative to the executable, or the configured install (LUMEN_THEME_DIR /
 # LUMEN_ICON_DIR override both). Icons are rasterised by librsvg, dlopen'd on first use as
@@ -171,10 +178,10 @@ lumen_add_module_library(lx.ui.builder modules/lx.ui.builder DEPENDS lx.ui)
 
 # ── Desktop ──────────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.shell.policy modules/lx.shell.policy
-    DEPENDS lx.wayland.client lx.wayland.protocols)
+    DEPENDS lx.foundation lx.wayland.protocols)
 lumen_add_module_library(lx.compositor modules/lx.compositor
     DEPENDS lx.wayland.server lx.gfx lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session lx.health lx.config)
-# lumen-shell talks libwayland-client directly (lx.wayland.client is still a stub): the
+# lumen-shell talks libwayland-client directly (it moves onto lx.wayland.client in Phase 5): the
 # zlm_shell_v1, wlr-layer-shell and cursor-shape client glue comes from lumen-protocol-glue.
 lumen_add_module_library(lx.shell modules/lx.shell
     DEPENDS lx.shell.policy lx.text lx.trace lx.config)
@@ -212,8 +219,17 @@ if(LUMEN_BUILD_XWAYLAND)
     lumen_add_module_library(lx.compositor.xwayland modules/lx.compositor.xwayland
         DEPENDS lx.wayland.server lx.foundation)
 endif()
+# ADR-010 Phase 4: the application runtime — the Wayland connection and event loop, windows
+# drawn with lx.ui through lx.gfx's client swapchain, input routing. Application layer.
 lumen_add_module_library(lx.app modules/lx.app
-    DEPENDS lx.ui.builder lx.wayland.client lx.runtime)
+    DEPENDS lx.ui lx.scene lx.text lx.gfx lx.wayland.client lx.runtime lx.trace)
+lumen_link_platform_parts(lx.app xkb)
+# An application loads only the shared libraries it calls into: the module archives carry the
+# compositor's platform libraries (libinput and its libwacom / GLib / Lua, udev,
+# libwayland-server, libdisplay-info) as link dependencies, which an lx.app client never
+# references. Every library is mapped and relocated at exec, before main: 40 of them cost a
+# client ≈ 6 ms of its start-up on the development host (ADR-010 §7 Phase 4, S10).
+target_link_options(lx.app INTERFACE "LINKER:--as-needed")
 
 # Platform APIs must link on MODULE libraries (not only executables).
 lumen_link_platform_modules(
@@ -286,6 +302,7 @@ lumen_link_platform(lumen-input-probe)
 add_executable(lumen-hello executables/lumen-hello/main.cpp)
 target_link_libraries(lumen-hello PRIVATE lx.app)
 lumen_apply_module_properties(lumen-hello)
+lumen_check_executable_layers(lumen-hello lx.app)
 
 # Demo client: needs xdg-shell *client* glue, which the server-side codegen does not emit.
 if(WAYLAND_FOUND AND LUMEN_HAS_WAYLAND_SCANNER)
@@ -993,17 +1010,34 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME bench_ui_composite COMMAND bench_ui_composite --frames 60 --warmup 10)
     set_tests_properties(bench_ui_composite PROPERTIES LABELS bench)
 
-    # ADR-010 §8: the UI engine's scenarios S1–S3 through lx.ui, a table and the JSON of
+    # ADR-010 §8: the UI engine's scenarios S1–S4 through lx.ui, a table and the JSON of
     # §8.5. scripts/ui-bench.sh drives it and keeps the baseline; here it only has to run.
     # Benches carry the `bench` label: the test presets exclude it, `ctest --preset bench` runs
     # them (a plain `-L bench` on top of another preset still meets its exclude).
-    add_executable(lumen-ui-bench tests/bench_ui.cpp)
-    target_link_libraries(lumen-ui-bench PRIVATE lx.ui lx.scene lx.gfx lx.runtime lx.trace)
+    # `--client` (tests/bench_ui_client.cpp, Phase 4) runs S1, S5, S7, S9 and S10 as lx.app
+    # windows against a headless compositor it starts (lx.compositor, in a child process) and
+    # starts lumen-hello for S10.
+    add_executable(lumen-ui-bench tests/bench_ui.cpp tests/bench_ui_client.cpp)
+    target_link_libraries(lumen-ui-bench PRIVATE lx.app lx.compositor lx.input lx.ui lx.scene
+        lx.gfx lx.runtime lx.trace)
     lumen_apply_module_properties(lumen-ui-bench)
     lumen_link_platform(lumen-ui-bench)
     target_include_directories(lumen-ui-bench PRIVATE tests)
+    add_dependencies(lumen-ui-bench lumen-hello)
     add_test(NAME bench_ui COMMAND lumen-ui-bench --scenario all --frames 120 --warmup 30)
     set_tests_properties(bench_ui PROPERTIES LABELS bench TIMEOUT 300)
+    # The client mode's short run: an idle window (G1) and the hover list (G5) on the CPU tier
+    # against the headless compositor; the exit status fails on either gate.
+    add_test(NAME bench_ui_client COMMAND lumen-ui-bench --client --short --scenario S1,S5
+        --tier cpu --gate G1,G5)
+    set_tests_properties(bench_ui_client PROPERTIES LABELS bench TIMEOUT 120)
+    # scripts/ui-bench.sh --e2e joins injector, window and compositor logs on the real display;
+    # its dry run prints the plan and checks the join on a recorded headless run
+    # (tests/bench/e2e-sample) against the numbers lumen-ui-bench computed for it.
+    add_test(NAME ui_bench_e2e_dry_run
+        COMMAND "${CMAKE_SOURCE_DIR}/scripts/ui-bench.sh" --e2e --dry-run --no-build)
+    set_tests_properties(ui_bench_e2e_dry_run PROPERTIES TIMEOUT 30
+        ENVIRONMENT "LUMEN_BUILD_DIR=${CMAKE_BINARY_DIR}")
 
     add_executable(test_headless_golden tests/test_headless_golden.cpp)
     target_link_libraries(test_headless_golden PRIVATE lx.gfx)
@@ -1111,6 +1145,51 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_window_protocols PRIVATE tests "${LUMEN_GENERATED_DIR}")
     add_test(NAME test_window_protocols COMMAND test_window_protocols)
     set_tests_properties(test_window_protocols PROPERTIES TIMEOUT 60)
+
+    # ADR-010 Phase 4: lx.wayland.client against the in-process compositor (virtual output at
+    # 1.25, a dispatch pump), with an input method on a second connection.
+    add_executable(test_wayland_client tests/test_wayland_client.cpp)
+    target_link_libraries(test_wayland_client PRIVATE lx.compositor lx.wayland.client)
+    lumen_apply_module_properties(test_wayland_client)
+    lumen_link_platform(test_wayland_client)
+    target_include_directories(test_wayland_client PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_wayland_client COMMAND test_wayland_client)
+    set_tests_properties(test_wayland_client PROPERTIES TIMEOUT 60)
+
+    # ADR-010 Phase 4 stage 2: lx.gfx:swapchain's three tiers against the in-process
+    # compositor — golden frames read back from the compositor's side, buffer age, release,
+    # resize, explicit sync (a fake kernel timeline on GL), allocations and present cost.
+    if(LIBPNG_FOUND)
+        add_executable(test_client_swapchain tests/test_client_swapchain.cpp)
+        target_link_libraries(test_client_swapchain PRIVATE lx.compositor lx.wayland.client
+            lx.ui lx.scene lx.gfx lx.runtime lx.a11y ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_client_swapchain)
+        lumen_link_platform(test_client_swapchain)
+        target_include_directories(test_client_swapchain PRIVATE tests "${LUMEN_GENERATED_DIR}"
+            ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_client_swapchain PRIVATE
+            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui"
+            LUMEN_TEST_FONT_DIR="${CMAKE_SOURCE_DIR}/tests/fonts")
+        add_test(NAME test_client_swapchain COMMAND test_client_swapchain)
+        set_tests_properties(test_client_swapchain PROPERTIES TIMEOUT 120)
+    endif()
+
+    # ADR-010 Phase 4 stage 3: lx.app's window (lumen-hello's tree) against the in-process
+    # compositor, the window in a child process: map, hover, click, typing, key repeat, idle,
+    # fractional scale with a golden image, resize, steady-frame allocations; cpu and gl.
+    if(LIBPNG_FOUND)
+        add_executable(test_app_window tests/test_app_window.cpp)
+        target_link_libraries(test_app_window PRIVATE lx.compositor lx.wayland.client lx.app
+            ${LIBPNG_LINK_LIBRARIES})
+        lumen_apply_module_properties(test_app_window)
+        lumen_link_platform(test_app_window)
+        target_include_directories(test_app_window PRIVATE tests "${LUMEN_GENERATED_DIR}"
+            ${LIBPNG_INCLUDE_DIRS})
+        target_compile_definitions(test_app_window PRIVATE
+            LUMEN_UI_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/golden/ui")
+        add_test(NAME test_app_window COMMAND test_app_window)
+        set_tests_properties(test_app_window PROPERTIES TIMEOUT 180)
+    endif()
 
     # Part C (design-app-compat-capture): pointer constraints, relative pointer, gestures —
     # in-process against a real compositor with injected relative motion and gestures.
@@ -1325,6 +1404,11 @@ if(LUMEN_BUILD_TESTS)
     endif()
     set_tests_properties(test_health test_session_discovery
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
+    if(TARGET test_client_swapchain)
+        # Its Vulkan tier brings up lavapipe: the ICD's teardown needs the Vulkan settings.
+        set_tests_properties(test_client_swapchain PROPERTIES ENVIRONMENT
+            "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
+    endif()
     if(TARGET test_ui_golden)
         # It brings up a Vulkan device (ui_vk): the ICD's threads and dlclose need the same
         # sanitizer settings as the other Vulkan tests.

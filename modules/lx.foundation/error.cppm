@@ -20,6 +20,16 @@ enum class wayland_err : int {
     dispatch_failed = 2,
     protocol_violation = 3,
     client_disconnected = 4,
+    /// Client side (lx.wayland.client): no compositor at the socket.
+    connect_failed = 5,
+    /// Client side: a global the caller needs (wl_compositor, wl_shm, xdg_wm_base, or the
+    /// one an extension object is made from) is not advertised.
+    missing_global = 6,
+    /// Client side: the connection died (EPIPE, the compositor exited, a protocol error
+    /// ended it); `display::protocol_error()` says which.
+    connection_lost = 7,
+    /// Client side: libwayland could not create a proxy (out of memory).
+    object_failed = 8,
 };
 
 enum class vulkan_err : int {
@@ -27,6 +37,12 @@ enum class vulkan_err : int {
     device_lost = 1,
     out_of_memory = 2,
     import_failed = 3,
+    /// An image's memory, a semaphore or a fence could not be exported (dma-buf, opaque fd,
+    /// sync_file) — a client swapchain's handover to the compositor.
+    export_failed = 4,
+    /// The device lacks what the caller needs (an extension, a format or modifier, a
+    /// hardware device where a software one was refused).
+    unsupported = 5,
 };
 
 enum class gl_err : int {
@@ -41,6 +57,11 @@ enum class gl_err : int {
     import_failed = 4,
     /// `glGetError` reported a failure during a frame.
     draw_failed = 5,
+    /// The context or driver lacks what the caller needs (GLES 3.1, a software GL_RENDERER
+    /// where hardware is required, no format the compositor offers).
+    unsupported = 6,
+    /// A buffer's dma-buf planes or a frame's native fence could not be exported.
+    export_failed = 7,
 };
 
 enum class drm_err : int {
@@ -62,6 +83,9 @@ enum class drm_err : int {
     /// The driver offers no atomic modesetting (DRM_CLIENT_CAP_ATOMIC refused), which the
     /// KMS path requires (`lx::drm::no_atomic_hint` says what to do about it).
     no_atomic = 10,
+    /// The compositor's dma-buf feedback offers no fourcc / modifier a client can allocate
+    /// on its device (`lx::gfx::choose_client_format`, whichever GPU tier asks).
+    no_format = 11,
 };
 
 enum class protocol_err : int {

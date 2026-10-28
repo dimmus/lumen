@@ -20,6 +20,8 @@ compile_commands.json
 /monitor-smoke-logs/
 # ... and from scripts/scale-smoke.sh
 /scale-smoke-logs/
+# ... and from scripts/ui-bench.sh --e2e
+/ui-e2e-logs/
 lumen-input-probe.log
 
 # IDE

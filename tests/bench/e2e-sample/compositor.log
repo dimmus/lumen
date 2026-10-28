@@ -1,0 +1,268 @@
+[INFO] compositor.gfx: headless
+[INFO] compositor.gfx: CPU composite path active
+[INFO] compositor.output: output 0 mode=1280x800 refresh_mhz=60000 scale=1 (120/120) logical=1280x800
+[INFO] compositor.output: output 0 name=HEADLESS-1 mode=1280x800 refresh_mhz=60000 scale=1 (120/120) logical=1280x800+0+0 identifier="connector:HEADLESS-1"
+[INFO] compositor.cursor: cursor theme=default size=24 scale=120/120 from_theme=36 builtin=0
+[INFO] compositor.cursor: software cursor: no KMS scanout
+[DEBUG] compositor.output: output global add output=0 name=HEADLESS-1
+[DEBUG] compositor.outputcfg: heads done serial=1 heads=1 added=1 removed=0 changed=0
+[INFO] compositor.input: libinput seat opened
+[INFO] wayland: shell binary <build>/lumen-shell
+[DEBUG] compositor.layer: layer arrange output=0 usable=0,0,1280x800 surfaces=0
+[DEBUG] compositor.wm: usable area x=0 y=0 w=1280 h=800 output=0
+[INFO] compositor.session: session - vt=0 can_switch_vt=0 active=0 drm=0:0 found=none type=-
+[INFO] compositor: threads: ui(main)+render+worker; frame clocks armed
+[INFO] config: config: generation 1 from (none: LUMEN_CONFIG=0) (0 errors, 0 warnings; 46 bindings)
+[DEBUG] compositor.cursor: cursor shape=1 source=default hardware=0
+[INFO] compositor.texture: texture upload id=2147483392
+[DEBUG] compositor.output: output bind client=1 output=0 version=4 name=HEADLESS-1 replayed=0
+[DEBUG] compositor.output: xdg-output create client=1 output=0 version=3 x=0 y=0 w=1280 h=800 name=HEADLESS-1
+[DEBUG] compositor.scale: fractional preferred surface=1 scale120=120
+[DEBUG] compositor.deco: decoration create id=1 version=2
+[DEBUG] compositor.deco: decoration request id=1 mode=server
+[DEBUG] compositor.deco: decoration mode id=1 requested=server sent=server serial=1
+[DEBUG] compositor.wm: configure id=1 serial=1 w=0 h=0 states=activated edges=0 watchdog=0
+[DEBUG] compositor.wm: ack id=1 serial=1
+[DEBUG] compositor.surface: surface geometry surface=1 buffer=640x480 scale=1 transform=0 src=-0.00,0.00,0.00x0.00 dst=640x480 size=640x480
+[DEBUG] compositor.output: output enter surface=1 output=0 client=1 resources=1
+[DEBUG] compositor.scene: tree root=1 kind=toplevel id=1 cause=map nodes=1*@320,174,640x480
+[INFO] compositor.wm: map id=1 app_id=org.lumen.bench x=320 y=174 w=640 h=480
+[DEBUG] compositor.wm: geometry id=1 x=320 y=174 w=640 h=480 cause=map serial=0
+[DEBUG] compositor.deco: decoration active id=1 previous=0
+[DEBUG] compositor.wm: focus keyboard-surface kind=toplevel surface=1
+[DEBUG] compositor.wm: focus keyboard id=1
+[DEBUG] compositor.deco: decoration apply id=1 mode=server frame=319,145,642x510
+[DEBUG] compositor.wm: focus pointer id=1 sx=320.0 sy=226.0
+[DEBUG] compositor.deco: decoration title id=1 scale=1 width=339 ellipsized=0 title="lumen-ui-bench S9: hover a button at 125 Hz"
+[DEBUG] compositor.presentation: flip frame=3 t=16337.865380946 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[INFO] compositor.texture: texture upload id=1073741824
+[INFO] compositor.texture: texture upload id=2147483136
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=4 t=16337.879346146 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[INFO] compositor.texture: texture upload id=1073741824
+[INFO] compositor.texture: texture upload id=2147483392
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=5 t=16337.895792139 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[INFO] compositor.texture: texture upload id=1073741824
+[INFO] compositor.texture: texture upload id=2147483392
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=11 t=16338.141827510 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[INFO] compositor.texture: texture upload id=1073741824
+[INFO] compositor.texture: texture upload id=2147483392
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=13 t=16338.173930632 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[INFO] compositor.texture: texture upload id=1073741824
+[INFO] compositor.texture: texture upload id=2147483392
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=15 t=16338.204431415 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[INFO] compositor.texture: texture upload id=1073741824
+[INFO] compositor.texture: texture upload id=2147483392
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=17 t=16338.235633262 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[INFO] compositor.texture: texture upload id=1073741824
+[INFO] compositor.texture: texture upload id=2147483392
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=19 t=16338.267032785 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[INFO] compositor.texture: texture upload id=1073741824 (trace ends here)
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=21 t=16338.298341928 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=23 t=16338.330174900 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=25 t=16338.360913665 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=27 t=16338.392233373 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=32 t=16338.534349500 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=34 t=16338.565325496 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=36 t=16338.596677133 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=38 t=16338.628101169 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=40 t=16338.659697928 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=42 t=16338.690623215 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=44 t=16338.722685244 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=46 t=16338.754315721 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=48 t=16338.784828075 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=50 t=16338.816409733 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=52 t=16338.847401882 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=54 t=16338.879145987 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=56 t=16338.911202368 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=58 t=16338.943112597 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=60 t=16338.973353929 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=62 t=16339.004825172 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=64 t=16339.035339126 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=66 t=16339.067379736 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=68 t=16339.098583029 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=70 t=16339.129880582 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=72 t=16339.160804491 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=74 t=16339.192475705 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=76 t=16339.223518045 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=79 t=16339.270488809 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=81 t=16339.301699747 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=83 t=16339.333161958 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=85 t=16339.364909033 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=87 t=16339.396462015 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=89 t=16339.427735260 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=91 t=16339.458732974 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=93 t=16339.489975027 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=95 t=16339.521492435 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=97 t=16339.552538263 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=99 t=16339.584323654 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=101 t=16339.615164623 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=103 t=16339.646729573 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=105 t=16339.678472393 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=107 t=16339.709189569 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=109 t=16339.741379525 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=111 t=16339.771552381 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=113 t=16339.803478682 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=115 t=16339.835381728 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=117 t=16339.866163148 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=119 t=16339.897333873 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=121 t=16339.928340923 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=123 t=16339.959619983 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=125 t=16339.991067170 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=128 t=16340.038282335 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=130 t=16340.070290478 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=132 t=16340.101804298 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=134 t=16340.132268068 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=136 t=16340.163353557 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=138 t=16340.194633955 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=140 t=16340.226397397 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=142 t=16340.257239738 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=144 t=16340.288926399 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=146 t=16340.320513001 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=148 t=16340.351600329 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=150 t=16340.383006833 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=152 t=16340.414118806 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=154 t=16340.446165750 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=156 t=16340.477323648 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=158 t=16340.509395809 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=160 t=16340.540124046 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=162 t=16340.571409703 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=164 t=16340.602247206 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=166 t=16340.633932381 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=168 t=16340.664643768 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=170 t=16340.696726983 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=172 t=16340.727465017 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=175 t=16340.774746192 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=177 t=16340.806539381 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=179 t=16340.837466637 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=181 t=16340.868429140 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=183 t=16340.900401559 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=185 t=16340.931480064 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=187 t=16340.962660175 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=189 t=16340.993775652 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=191 t=16341.024858657 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=193 t=16341.056807194 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=195 t=16341.088160881 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=197 t=16341.119615215 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=199 t=16341.150302201 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=201 t=16341.182581155 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=203 t=16341.213460915 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=205 t=16341.244570094 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=207 t=16341.276529976 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=209 t=16341.307803778 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=211 t=16341.339564347 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=213 t=16341.370076880 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=215 t=16341.401452783 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=217 t=16341.433116621 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=1 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=219 t=16341.463600353 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.cursor: cursor shape=4 source=client-shape hardware=0
+[DEBUG] compositor.presentation: flip frame=221 t=16341.494887453 seq=0 refresh_ns=16666667 flags=0x0 presented=1 discarded=0 output=0
+[DEBUG] compositor.wm: focus pointer none
+[DEBUG] compositor.scene: tree root=1 kind=toplevel id=1 cause=unmap nodes=-
+[INFO] compositor.wm: unmap id=1 reason=destroyed
+[DEBUG] compositor.deco: decoration active id=0 previous=1
+[DEBUG] compositor.wm: focus keyboard id=0
+[DEBUG] compositor.cursor: cursor shape=1 source=default hardware=0

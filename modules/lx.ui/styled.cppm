@@ -87,6 +87,7 @@ public:
     [[nodiscard]] const lx::layout::flex_style* flex_item_style() const override;
     /// The elevation's shadows' reach.
     [[nodiscard]] int ink_outset() const override;
+    [[nodiscard]] cursor_style cursor() const override { return style_.cursor_kind; }
 
     [[nodiscard]] const lx::ui::style& value() const { return style_; }
     [[nodiscard]] const resolved_paint& paint() const { return paint_; }

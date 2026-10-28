@@ -31,6 +31,10 @@ struct drm_timeline_ops {
                             int sync_file) = nullptr;
     void (*destroy)(void* user, unsigned handle) = nullptr;
     void* user = nullptr;
+    /// Client side (a window's swapchain, lx.gfx:swapchain): a new syncobj, and an fd for it
+    /// to send to the compositor (wp_linux_drm_syncobj_manager_v1.import_timeline).
+    int (*create)(void* user, unsigned* handle) = nullptr;
+    int (*handle_to_fd)(void* user, unsigned handle, int* fd) = nullptr;
 };
 
 /// The real ops on `drm_fd` (borrowed). Empty ops without libdrm.

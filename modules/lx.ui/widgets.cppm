@@ -6,7 +6,6 @@ import lx.layout;
 import lx.text;
 import lx.runtime;
 import lx.gfx;
-import lx.wayland.client;
 import lx.a11y;
 
 export module lx.ui:widgets;
@@ -146,13 +145,10 @@ public:
     void close();
     void set_resizable(bool resizable);
 
-    [[nodiscard]] lx::wayland::surface* native_surface();
-
 private:
     const char* title_ = "";
     widget* content_ = nullptr;
     bool resizable_ = true;
-    lx::wayland::surface native_{};
 };
 
 } // namespace lx::ui
@@ -262,4 +258,3 @@ void lx::ui::window::set_content(widget* w) { content_ = w; }
 void lx::ui::window::show() {}
 void lx::ui::window::close() {}
 void lx::ui::window::set_resizable(bool r) { resizable_ = r; }
-lx::wayland::surface* lx::ui::window::native_surface() { return &native_; }
