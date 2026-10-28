@@ -21,8 +21,11 @@ export namespace lx::gfx {
 /// a fake in tests). Each returns 0 or a negative errno.
 struct drm_timeline_ops {
     int (*fd_to_handle)(void* user, int syncobj_fd, unsigned* handle) = nullptr;
-    /// `*signalled` = whether `point` has signalled (never blocks).
-    int (*query)(void* user, unsigned handle, unsigned long long point, bool* signalled) = nullptr;
+    /// `*signalled` = whether `point` has signalled (never blocks). `deadline_ns` (0: none):
+    /// a dma-fence deadline hint on its fence (DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE, Linux
+    /// 6.4; an older kernel refuses the flag with -EINVAL).
+    int (*query)(void* user, unsigned handle, unsigned long long point,
+                 unsigned long long deadline_ns, bool* signalled) = nullptr;
     /// Makes `eventfd` readable once `point` has signalled (DRM_IOCTL_SYNCOBJ_EVENTFD, flags 0).
     int (*eventfd)(void* user, unsigned handle, unsigned long long point, int eventfd) = nullptr;
     int (*signal)(void* user, unsigned handle, unsigned long long point) = nullptr;
@@ -62,7 +65,11 @@ public:
     void unref(unsigned id);
     [[nodiscard]] unsigned live() const { return live_; }
 
-    [[nodiscard]] lx::result<bool> signalled(unsigned id, unsigned long long point) const;
+    /// `deadline_ns` (CLOCK_MONOTONIC, 0: none) hints when the point is needed, on the
+    /// same query. A kernel that refuses the hint is asked again without it, and not again.
+    [[nodiscard]] lx::result<bool> signalled(unsigned id, unsigned long long point,
+                                             unsigned long long deadline_ns = 0) const;
+    [[nodiscard]] bool deadline_hints() const { return !deadline_off_; }
     [[nodiscard]] lx::result<void> notify(unsigned id, unsigned long long point, int eventfd) const;
     [[nodiscard]] lx::result<void> signal(unsigned id, unsigned long long point) const;
     /// Signals `point` when `sync_file` does (`sync_file` borrowed). Without a fence (-1) the
@@ -79,6 +86,8 @@ private:
     drm_timeline_ops ops_{};
     entry entries_[k_max + 1]{};
     unsigned live_ = 0;
+    /// The kernel refused WAIT_DEADLINE: queries go without a hint.
+    mutable bool deadline_off_ = false;
 };
 
 /// The newest composite fence (a sync_file) of a frame that sampled an explicit-sync

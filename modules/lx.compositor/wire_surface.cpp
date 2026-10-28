@@ -1545,6 +1545,8 @@ unsigned g_applying_cu = 0;
 /// waited for, the GPU waits implicitly in the import instead.
 bool g_implicit_off = false;
 bool g_overflow_warned = false;
+/// Deadline hints on the implicit fences exported above (UI affinity; off after ENOTTY).
+lx::gfx::fence_deadline g_fence_deadline{"client buffer"};
 
 unsigned sealed_record_of(unsigned dcu, unsigned surface) {
     for (unsigned c = g_cu.at(dcu).first_child; c; c = g_cu.at(c).next_sibling)
@@ -1698,6 +1700,28 @@ lx::compositor::cu_conditions cu_conditions_of(const surface_obj* s) {
     return c;
 }
 
+/// When the fences of an update of `root` are needed: the start of the repaint that would
+/// latch it on its pace output (the dma-fence deadline hint, `cu_latch`); 0 — no hint — when
+/// it is not shown, so a hidden window's GPU is not hurried; and none without a `root`. Worked
+/// out on first use: an update with nothing pending never needs it.
+struct fence_deadline_of {
+    const surface_obj* root = nullptr;
+    unsigned long long ns = ~0ull;
+
+    unsigned long long get() {
+        if (ns != ~0ull)
+            return ns;
+        ns = 0;
+        if (root && root->ctx->cu_latch &&
+            (surface_shown_mask(root->id) & root->ctx->lit_mask)) {
+            const int pace = surface_pace_output(root->id);
+            if (pace >= 0)
+                ns = root->ctx->cu_latch(root->ctx->cu_user, static_cast<unsigned>(pace));
+        }
+        return ns;
+    }
+};
+
 void log_implicit_off(int err) {
     if (!log_surface.enabled(lx::trace::level::debug))
         return;
@@ -1709,13 +1733,14 @@ void log_implicit_off(int err) {
 
 /// An explicit-sync acquire point that has not signalled yet: an eventfd armed with
 /// DRM_IOCTL_SYNCOBJ_EVENTFD (-1: it has signalled, or the query failed — nothing better to
-/// wait on). `lost`: it has not signalled and no eventfd could be armed.
-int acquire_wait_fd(const sync_point& p, bool& lost) {
+/// wait on). `lost`: it has not signalled and no eventfd could be armed. The query carries
+/// the deadline hint.
+int acquire_wait_fd(const sync_point& p, bool& lost, fence_deadline_of& deadline) {
 #if defined(__linux__)
     lx::gfx::drm_timeline_table* tl = syncobj_timelines();
     if (!p.timeline || !tl)
         return -1;
-    auto done = tl->signalled(p.timeline, p.point);
+    auto done = tl->signalled(p.timeline, p.point, deadline.get());
     if (!done || done.value())
         return -1;
     const int efd = ::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -1727,6 +1752,7 @@ int acquire_wait_fd(const sync_point& p, bool& lost) {
 #else
     (void)p;
     (void)lost;
+    (void)deadline;
 #endif
     return -1;
 }
@@ -1738,10 +1764,10 @@ int acquire_wait_fd(const sync_point& p, bool& lost) {
 /// (no room left in `fds`, no eventfd) sets `lost` — the update must then not apply until
 /// it is found signalled. Otherwise, for a dma-buf: its write fences — one poll() per
 /// distinct plane (the common, already-signalled case), a sync_file snapshot
-/// (DMA_BUF_IOCTL_EXPORT_SYNC_FILE) of those still pending; one that does not fit is
-/// waited for by the GPU import instead.
+/// (DMA_BUF_IOCTL_EXPORT_SYNC_FILE) of those still pending, deadline-hinted; one that does
+/// not fit is waited for by the GPU import instead.
 unsigned fence_waits(const surface_pending& st, int* fds, bool* acquire, unsigned cap,
-                     bool& lost) {
+                     bool& lost, fence_deadline_of& deadline) {
     if (!st.buffer_set || !st.buffer)
         return 0;
     unsigned n = 0;
@@ -1749,7 +1775,7 @@ unsigned fence_waits(const surface_pending& st, int* fds, bool* acquire, unsigne
     if (st.acquire.timeline) {
         if (cap == 0) {
             bool unused = false;
-            const int efd = acquire_wait_fd(st.acquire, unused);
+            const int efd = acquire_wait_fd(st.acquire, unused, deadline);
             if (efd >= 0 || unused) {
                 if (efd >= 0)
                     ::close(efd);
@@ -1757,7 +1783,7 @@ unsigned fence_waits(const surface_pending& st, int* fds, bool* acquire, unsigne
             }
             return 0;
         }
-        const int efd = acquire_wait_fd(st.acquire, lost);
+        const int efd = acquire_wait_fd(st.acquire, lost, deadline);
         if (efd < 0)
             return 0;
         fds[n] = efd;
@@ -1795,6 +1821,7 @@ unsigned fence_waits(const surface_pending& st, int* fds, bool* acquire, unsigne
             }
             return n;
         }
+        (void)g_fence_deadline.hint(req.fd, deadline.get());
         fds[n] = req.fd;
         acquire[n] = false;
         ++n;
@@ -1805,6 +1832,7 @@ unsigned fence_waits(const surface_pending& st, int* fds, bool* acquire, unsigne
     (void)acquire;
     (void)cap;
     (void)lost;
+    (void)deadline;
 #endif
     return n;
 }
@@ -1871,7 +1899,8 @@ void cu_recheck() {
         bool armed = g_poller.available() >= n;
         for (unsigned k = 0; armed && k < n; ++k) {
             bool lost = false;
-            const int efd = acquire_wait_fd(points[k], lost);
+            fence_deadline_of hinted_at_commit{}; // no second hint
+            const int efd = acquire_wait_fd(points[k], lost, hinted_at_commit);
             if (efd < 0) {
                 armed = !lost; // signalled meanwhile
                 continue;
@@ -2030,9 +2059,10 @@ bool commit_dcu(surface_obj* s, bool root_commit, const char* cause) {
     int fds[16];
     bool acquire[16];
     bool lost = false;
-    unsigned nfd = fence_waits(s->cached, fds, acquire, 16, lost);
+    fence_deadline_of deadline{s};
+    unsigned nfd = fence_waits(s->cached, fds, acquire, 16, lost, deadline);
     for (unsigned k = 0; k < nk; ++k)
-        nfd += fence_waits(kids[k]->cached, fds + nfd, acquire + nfd, 16 - nfd, lost);
+        nfd += fence_waits(kids[k]->cached, fds + nfd, acquire + nfd, 16 - nfd, lost, deadline);
     // An unsignalled explicit-sync acquire point among them: the update cannot apply before
     // it signals, whatever else happens.
     bool explicit_wait = lost;

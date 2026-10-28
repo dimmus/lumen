@@ -954,6 +954,12 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_import_cache PRIVATE tests)
     add_test(NAME test_import_cache COMMAND test_import_cache)
 
+    add_executable(test_fence_deadline tests/test_fence_deadline.cpp)
+    target_link_libraries(test_fence_deadline PRIVATE lx.gfx)
+    lumen_apply_module_properties(test_fence_deadline)
+    target_include_directories(test_fence_deadline PRIVATE tests)
+    add_test(NAME test_fence_deadline COMMAND test_fence_deadline)
+
     add_executable(test_device_select tests/test_device_select.cpp)
     target_link_libraries(test_device_select PRIVATE lx.gfx)
     lumen_apply_module_properties(test_device_select)

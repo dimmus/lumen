@@ -178,6 +178,38 @@ Without `EGL_ANDROID_native_fence_sync` the composite falls back to `glFinish`. 
 unsynchronised would show a partly-drawn frame, so the stall is the correct fallback — it is
 not optional.
 
+### Fence deadline hints
+
+A GPU that idles between frames ramps its clock up only after it has been busy for a while,
+so a frame submitted to a cold GPU can miss its vblank even though the work fits. dma-fence
+deadlines (Linux 6.4) tell the driver when a fence is needed: i915/xe waitboost a fence whose
+deadline is near, msm boosts its devfreq; a driver without a `set_deadline` hook accepts the
+hint and ignores it. Lumen hints two kinds of fence (`lx.gfx:fence_deadline`):
+
+| Fence | Deadline | Where |
+|-------|----------|-------|
+| The composite's sync_file (GL native fence, Vulkan), which becomes `IN_FENCE_FD` | The vblank the tick that built the frame aimed at (`output_ui::aim_ns`, published to render in `output_pipeline::fence_deadline_ns`) | Render, right after the composite — at submission, before the commit |
+| A client's implicit-sync dma-buf fence (`DMA_BUF_IOCTL_EXPORT_SYNC_FILE` snapshot) | The start of the repaint that would latch the update on its pace output (`repaint_scheduler::next_start`, via `cu_latch`) — the fence is needed by the latch, not by the vblank after | UI, in the commit, only for a fence still pending |
+| A client's explicit-sync acquire point | The same latch time | UI: `DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE` on the zero-timeout query the commit already makes — no extra ioctl |
+
+A hidden surface (shown on no lit output) gets no hint: its GPU is not hurried for a frame
+nobody sees. The kernel's atomic helper also sets the vblank deadline on `IN_FENCE_FD` when
+the commit runs; Lumen's hint lands earlier, while the composite executes, and covers a frame
+composited behind a pending flip whose commit waits a tick.
+
+**Cost and fallback.** One ioctl per hinted sync_file, no allocation, no log on the frame
+path. Support is probed by use: the first `ENOTTY` from `SYNC_IOC_SET_DEADLINE` (a kernel
+before 6.4) turns hints off for that thread's instance for good, and a timeline query whose
+`WAIT_DEADLINE` flag is refused (`EINVAL`) is repeated without it and never sent with it
+again — the behaviour is then exactly what it was without hints. Availability is logged once,
+at debug, under `gfx` when it is first known.
+
+**On vmwgfx** (this project's measurement host, kernel 7.2) the ioctl is accepted
+and has no effect: SVGA3D fences have no deadline hook and the host's GPU clocks are not the
+guest's to raise. There is nothing to measure there; the plumbing is covered by
+`test_fence_deadline` (the real ioctl on a udmabuf sync_file where `/dev/udmabuf` is
+accessible, and ENOTTY on a non-sync_file) and the fallbacks by fakes.
+
 ### GL composite properties
 
 | Property | Behavior |
@@ -192,7 +224,7 @@ not optional.
 | State changes | Scissor, scissor test and blend are set only when they change, and the program only when consecutive draws differ (linear-light or identity). Mesa does not drop a redundant call: on SVGA3D a repeated `glScissor` cost 1.7 µs per draw, a changed one 4 µs, a scissor-test toggle 7 µs and a blend toggle 2.6 µs; 50 draws against 16 damage strips went from 0.77 to 0.62 ms of submission |
 | Blending | `GL_ONE, GL_ONE_MINUS_SRC_ALPHA` — sources are premultiplied |
 | Sampling | The source box (float, wp_viewport) and the buffer transform as an affine basis in three uniforms (`gfx::source_basis_for`, shared with Vulkan and CPU); UVs `highp` where the fragment stage has it (mediump cannot address texels past ~2048); `GL_LINEAR` throughout — a 1:1 draw on whole pixels samples texel centres exactly; a half-texel clamp keeps crops from bleeding |
-| GPU sync | `EGL_ANDROID_native_fence_sync` → sync_file → `atomic_commit_request::in_fence_fd`; `glFinish` only as fallback |
+| GPU sync | `EGL_ANDROID_native_fence_sync` → sync_file (deadline-hinted to its vblank) → `atomic_commit_request::in_fence_fd`; `glFinish` only as fallback |
 
 **Modules:** `lx.gfx.gl_renderer` — `egl_device`, `gl_scanout_target`, `gl_compositor`
 

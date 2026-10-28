@@ -20,11 +20,14 @@ module lx.gfx;
 import std;
 
 import lx.foundation;
+import lx.trace;
 import :drm_timeline;
 
 namespace lx::gfx {
 
 namespace {
+
+constexpr lx::trace::category log_timeline{"gfx"};
 
 lx::error timeline_error(const char* message) {
     return lx::make_error(lx::drm_err::timeline_failed, message);
@@ -40,13 +43,33 @@ int real_fd_to_handle(void* user, int syncobj_fd, unsigned* handle) {
     return r != 0 ? -errno : 0;
 }
 
-int real_query(void* user, unsigned handle, unsigned long long point, bool* signalled) {
+/// DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT's argument with `deadline_nsec` (Linux 6.4), declared
+/// here so older uapi headers build; an older kernel copies the prefix it knows.
+struct timeline_wait_args {
+    std::uint64_t handles;
+    std::uint64_t points;
+    std::int64_t timeout_nsec;
+    std::uint32_t count_handles;
+    std::uint32_t flags;
+    std::uint32_t first_signaled;
+    std::uint32_t pad;
+    std::uint64_t deadline_nsec;
+};
+constexpr std::uint32_t k_wait_deadline = 1u << 3; // DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE
+
+int real_query(void* user, unsigned handle, unsigned long long point,
+               unsigned long long deadline_ns, bool* signalled) {
     std::uint32_t h = handle;
     std::uint64_t p = point;
     // Timeout 0 with WAIT_FOR_SUBMIT: an unmaterialized point is "not yet", not an error.
-    const int r = drmSyncobjTimelineWait(fd_of(user), &h, &p, 1, 0,
-                                         DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, nullptr);
-    if (r == 0) {
+    // The deadline is set on the point's fence before the (zero) wait.
+    timeline_wait_args args{};
+    args.handles = reinterpret_cast<std::uintptr_t>(&h);
+    args.points = reinterpret_cast<std::uintptr_t>(&p);
+    args.count_handles = 1;
+    args.flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT | (deadline_ns ? k_wait_deadline : 0);
+    args.deadline_nsec = deadline_ns;
+    if (drmIoctl(fd_of(user), DRM_IOWR(0xCA, timeline_wait_args), &args) == 0) {
         *signalled = true;
         return 0;
     }
@@ -171,12 +194,25 @@ void drm_timeline_table::unref(unsigned id) {
     --live_;
 }
 
-lx::result<bool> drm_timeline_table::signalled(unsigned id, unsigned long long point) const {
+lx::result<bool> drm_timeline_table::signalled(unsigned id, unsigned long long point,
+                                               unsigned long long deadline_ns) const {
     const entry* e = find(id);
     if (!e || !ops_.query)
         return timeline_error("drm timeline: unknown timeline");
     bool done = false;
-    if (ops_.query(ops_.user, e->handle, point, &done) != 0)
+    const bool hint = deadline_ns != 0 && !deadline_off_;
+    int r = ops_.query(ops_.user, e->handle, point, hint ? deadline_ns : 0, &done);
+    if (r == -EINVAL && hint) {
+        // Before Linux 6.4 WAIT_DEADLINE is an unknown flag. Answered without it, it was the
+        // flag that was refused: no more hints.
+        r = ops_.query(ops_.user, e->handle, point, 0, &done);
+        if (r == 0) {
+            deadline_off_ = true;
+            log_timeline.debug("syncobj WAIT_DEADLINE refused (Linux < 6.4): acquire points "
+                               "are not deadline-hinted");
+        }
+    }
+    if (r != 0)
         return timeline_error("drm timeline: point query failed");
     return done;
 }

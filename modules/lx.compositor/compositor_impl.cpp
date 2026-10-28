@@ -129,6 +129,9 @@ struct output_pipeline {
     /// A composited frame is not committed yet (read by UI before it answers frame
     /// callbacks on an idle tick).
     std::atomic<bool> frame_outstanding{false};
+    /// UI → render: the vblank the newest tick serving this output aimed at
+    /// (`output_ui::aim_ns`) — the deadline hint of the composite fence of its frame.
+    std::atomic<lx::runtime::clock_time> fence_deadline_ns{0};
     /// The plane passed a TEST_ONLY commit with an image on it.
     bool cursor_tested = false;
     /// A content commit has gone through since the last modeset need (the CRTC is ours).
@@ -530,6 +533,8 @@ struct compositor_impl {
     std::unique_ptr<gfx::ui_cpu_renderer> ui_cpu_{};
     gfx::egl_device egl_{};
     gfx::gl_compositor gl_compositor_{};
+    /// Render affinity. Deadline hints on the composite fences that become IN_FENCE_FD.
+    gfx::fence_deadline composite_deadline_{"composite"};
     /// The GL path's primitive renderer, made with the backend when the context is GLES 3.1
     /// (`setup_gl_present`); null on GLES 2, where primitives are lowered to blits.
     std::unique_ptr<gfx::ui_gl_renderer> ui_gl_{};
@@ -1544,6 +1549,14 @@ struct compositor_impl {
         const int dup = ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
         if (dup >= 0)
             release_fences_.publish(dup, frame);
+    }
+    /// Render: the frame just composited into `p` is needed by the vblank its tick aimed at —
+    /// hinted on its fence at submission, ahead of the commit (one ioctl, none once the
+    /// kernel lacks it). The kernel's atomic helper hints the same fence at the commit.
+    void hint_composite_deadline(const output_pipeline& p) {
+        const lx::runtime::clock_time at = p.fence_deadline_ns.load(std::memory_order_relaxed);
+        if (at > 0)
+            (void)composite_deadline_.hint(p.composited_fence, static_cast<unsigned long long>(at));
     }
     static void drm_fd_callback();
     static void housekeeping_callback();
@@ -3166,6 +3179,14 @@ void compositor_impl::register_p0_globals() {
             return static_cast<unsigned long long>(c.next_deadline(now));
         return static_cast<unsigned long long>(
             c.next_deadline(now + c.estimate_ns() + scheduler::repaint_scheduler::k_margin_ns));
+    };
+    // dma-fence deadline hints on client buffer fences: what an update committed now needs
+    // its fences by is the start of the repaint that latches it, not the vblank after.
+    p0_.cu_latch = [](void* u, unsigned slot) -> unsigned long long {
+        auto* self = static_cast<compositor_impl*>(u);
+        if (slot >= output_manager::k_max || !self->clocks_.live(slot))
+            return 0;
+        return static_cast<unsigned long long>(self->clocks_.clock(slot).next_start(now_ns()));
     };
     p0_.cu_request_at = [](void* u, unsigned slot, unsigned long long target) {
         auto* self = static_cast<compositor_impl*>(u);
@@ -8849,6 +8870,9 @@ void compositor_impl::on_vsync(std::uint32_t forced, bool housekeeping) {
         const unsigned slot = static_cast<unsigned>(std::countr_zero(m));
         outs_[slot].aim_ns = clocks_.clock(slot).next_deadline(tick.timestamp_ns);
         outs_[slot].aim_frame = tick.frame_index;
+        if (outs_[slot].pipe)
+            outs_[slot].pipe->fence_deadline_ns.store(outs_[slot].aim_ns,
+                                                      std::memory_order_relaxed);
     }
     in_vsync_ = true;
     tick_quiet_mask_ = 0;
@@ -10483,6 +10507,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 // frame's — which is dropped rather than leaked.
                 p.discard_fence();
                 p.composited_fence = c.value().composite.out_fence_fd;
+                hint_composite_deadline(p);
                 publish_release_fence(p.composited_fence, idx);
                 if (c.value().composite.draws_skipped > 0) {
                     const auto blits = painter_.surfaces(snapshot);
@@ -10530,6 +10555,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 drawn = true;
                 p.discard_fence();
                 p.composited_fence = c.value().composite.out_fence_fd;
+                hint_composite_deadline(p);
                 publish_release_fence(p.composited_fence, idx);
                 if (c.value().composite.draws_skipped > 0) {
                     const auto blits = painter_.surfaces(snapshot);

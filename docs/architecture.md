@@ -459,7 +459,8 @@ flowchart LR
 | `lx.gfx.gl_capture` | Screen capture's GL objects (ES 3.0): a client's dma-buf as a framebuffer (imported once per wl_buffer, LRU of 32), `glBlitFramebuffer` of damage rects (and crops), offscreen framebuffers over LINEAR GBM buffers read off the render thread (`read_bo`), asynchronous read-backs into pixel-pack buffers behind a native fence and their copy-out where there is no GBM buffer, the curtain clear |
 | `lx.gfx.cpu_renderer` | Software composite into a CPU-writable scanout buffer; chosen when no hardware renderer is available ([rendering-performance.md](subsystems/rendering-performance.md) §1.2) |
 | `lx.gfx.import_cache` | LRU reuse of VkImage imports; per-client entry cap |
-| `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries, `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
+| `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries (with a deadline hint), `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
+| `lx.gfx.fence_deadline` | dma-fence deadline hints (`SYNC_IOC_SET_DEADLINE`, Linux 6.4) on composite and client sync_files; probed by use, off for good after ENOTTY |
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
 | `lx.runtime.memory` | Per-subsystem arenas, pressure coordinator, overflow policies |
 | `lx.runtime.psi` | Kernel memory pressure (PSI) triggers and decay; `psi_monitor` feeds them to the coordinator on the UI loop |
