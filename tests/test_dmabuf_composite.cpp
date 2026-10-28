@@ -26,8 +26,9 @@ constexpr unsigned k_width = 64;
 constexpr unsigned k_height = 64;
 
 /// Left half opaque red, right half opaque blue, in little-endian XRGB8888 as a Wayland
-/// client would write it.
-void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsigned stride) {
+/// client would write it, with `x` in the undefined fourth byte.
+void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsigned stride,
+                  unsigned char x = 255u) {
     for (unsigned y = 0; y < height; ++y) {
         for (unsigned x = 0; x < width; ++x) {
             unsigned char* px = pixels + y * stride + x * 4u;
@@ -35,7 +36,7 @@ void fill_pattern(unsigned char* pixels, unsigned width, unsigned height, unsign
             px[0] = left ? 0u : 255u;   // B
             px[1] = 0u;                 // G
             px[2] = left ? 255u : 0u;   // R
-            px[3] = 255u;               // X/A
+            px[3] = x;                  // X/A
         }
     }
 }
@@ -101,7 +102,7 @@ struct dumb_dmabuf {
     bool valid = false;
 };
 
-dumb_dmabuf make_dumb_dmabuf() {
+dumb_dmabuf make_dumb_dmabuf(unsigned char x = 255u) {
     dumb_dmabuf out{};
 
     for (const char* path : {"/dev/dri/card0", "/dev/dri/card1"}) {
@@ -133,7 +134,7 @@ dumb_dmabuf make_dumb_dmabuf() {
                                                      static_cast<off_t>(map.offset)));
     if (pixels == MAP_FAILED)
         return out;
-    fill_pattern(pixels, k_width, k_height, out.stride);
+    fill_pattern(pixels, k_width, k_height, out.stride, x);
     ::munmap(pixels, create.size);
 
     int export_fd = -1;
@@ -275,6 +276,67 @@ LUMEN_TEST(dmabuf_import_reaches_composited_output) {
     const auto* right = readback + ((k_height / 2u) * k_width + (3u * k_width) / 4u) * 4u;
 
     // Red on the left, blue on the right — exactly the pattern written into the dma-buf.
+    LUMEN_CHECK(left[0] > 200 && left[1] < 60 && left[2] < 60);
+    LUMEN_CHECK(right[2] > 200 && right[1] < 60 && right[0] < 60);
+
+    gpu.device.dmabuf().release(image);
+#else
+    std::printf("SKIP: built without libdrm\n");
+#endif
+}
+
+// XRGB's fourth byte is undefined: a client may leave it zero. Sampled as alpha, a blended
+// draw would add the clear colour under it; it must read as one, as on GL and CPU.
+LUMEN_TEST(xrgb_dmabuf_ignores_its_x_byte) {
+#if defined(LUMEN_HAS_DRM)
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+
+    auto source = make_dumb_dmabuf(0u);
+    if (!source.valid) {
+        std::printf("SKIP: no dumb-buffer dma-buf available on this host\n");
+        return;
+    }
+
+    lx::gfx::dmabuf_desc desc{};
+    desc.width = k_width;
+    desc.height = k_height;
+    desc.format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
+    desc.plane_count = 1;
+    desc.planes[0].stride = source.stride;
+    desc.planes[0].offset = 0;
+    desc.planes[0].modifier = lx::gfx::modifier_linear;
+    desc.planes[0].fd.reset(::dup(source.dmabuf.get()));
+    LUMEN_CHECK(desc.planes[0].fd.get() >= 0);
+
+    auto imported = gpu.device.dmabuf().import(desc);
+    if (!imported) {
+        std::printf("SKIP: driver refused the dma-buf import: %s\n",
+                    imported.get_error().message);
+        return;
+    }
+    auto image = std::move(imported).value();
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.bind_imported(image)));
+
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = image.image_id;
+    cmd.dst = {0, 0, static_cast<int>(k_width), static_cast<int>(k_height)};
+    cmd.opacity = 1.f;
+    cmd.blend = lx::blend_mode::premultiplied;
+
+    auto stats =
+        composite_owned(gpu.compositor, gpu.target, lx::color::rgb(0.f, 1.f, 0.f), &cmd, 1);
+    LUMEN_CHECK(static_cast<bool>(stats));
+    LUMEN_CHECK(stats.value().draws_submitted == 1);
+
+    unsigned char readback[k_width * k_height * 4]{};
+    LUMEN_CHECK(static_cast<bool>(gpu.compositor.read_back(gpu.target, readback,
+                                                           sizeof(readback))));
+    const auto* left = readback + ((k_height / 2u) * k_width + k_width / 4u) * 4u;
+    const auto* right = readback + ((k_height / 2u) * k_width + (3u * k_width) / 4u) * 4u;
+
+    // Red and blue exactly as written: no green from the clear underneath.
     LUMEN_CHECK(left[0] > 200 && left[1] < 60 && left[2] < 60);
     LUMEN_CHECK(right[2] > 200 && right[1] < 60 && right[0] < 60);
 
