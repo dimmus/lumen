@@ -162,6 +162,7 @@ application::~application() {
     if (display_source_)
         display_source_->detach();
     display_source_.reset();
+    clipboard_.stop();
     stop_worker();
     if (lx::wayland::seat* s = display_.default_seat())
         s->set_handler(nullptr);
@@ -192,6 +193,8 @@ lx::result<void> application::start() {
     timeline_.connect_ns = mono_ns();
     if (lx::wayland::seat* s = display_.default_seat())
         s->set_handler(this);
+    // Without it a copy stays in this process (logged); a failure is not the app's end.
+    (void)clipboard_.start(display_, loop_);
 
     // The worker: icon rasters and theme reloads (the only work posted to it here).
     bool watch = false;
@@ -358,8 +361,5 @@ void application::on_touch(lx::wayland::seat& s, const lx::wayland::touch_event&
     if (window_ && (!e.target || e.target == &window_->surface()))
         window_->route_touch(s, e);
 }
-
-void clipboard::set_text(const char*) {}
-const char* clipboard::text() const { return ""; }
 
 } // namespace lx::app

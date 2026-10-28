@@ -44,6 +44,9 @@ struct wl_registry;
 struct wl_output;
 struct wl_seat;
 struct zxdg_output_v1;
+struct wl_data_device;
+struct wl_data_offer;
+struct wl_data_source;
 #endif
 
 #if defined(LUMEN_HAS_XKBCOMMON)
