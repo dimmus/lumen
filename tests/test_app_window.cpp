@@ -302,6 +302,9 @@ struct dc_client {
     std::vector<std::string> pending_mimes;
     ext_data_control_offer_v1* selection = nullptr;
     std::vector<std::string> mimes;
+    /// The primary selection's offer and types.
+    ext_data_control_offer_v1* primary = nullptr;
+    std::vector<std::string> primary_mimes;
     ext_data_control_source_v1* source = nullptr;
     std::string source_text;
     unsigned sends = 0;
@@ -336,8 +339,11 @@ const ext_data_control_device_v1_listener k_dc_device_listener = {
     },
     [](void*, ext_data_control_device_v1*) {},
     [](void* d, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
-        if (o && o != static_cast<dc_client*>(d)->selection)
-            ext_data_control_offer_v1_destroy(o);
+        auto* c = static_cast<dc_client*>(d);
+        if (c->primary && c->primary != o)
+            ext_data_control_offer_v1_destroy(c->primary);
+        c->primary = o;
+        c->primary_mimes = o == c->pending ? c->pending_mimes : std::vector<std::string>{};
     }};
 
 const ext_data_control_source_v1_listener k_dc_source_listener = {
@@ -488,22 +494,37 @@ std::string serve(const std::string& line) {
 #else
         reply = "fail no input method";
 #endif
+    } else if (cmd == "mbutton") {
+        int p = 0;
+        in >> p;
+        lx::input::pointer_button_event b{};
+        b.which = lx::input::button::middle;
+        b.evdev_code = 0x112; // BTN_MIDDLE
+        b.pressed = p != 0;
+        g_comp->inject_pointer_button(b);
     } else if (cmd == "dc_selection" || cmd == "dc_read" || cmd == "dc_result" ||
                cmd == "dc_result_sum" || cmd == "dc_set") {
 #if defined(LUMEN_TEST_DC)
         if (!g_dc.device) {
             reply = "fail no data control";
         } else if (cmd == "dc_selection") {
-            // "ok <count>|<mime>|<mime>…"
-            reply = std::format("ok {}", g_dc.selection ? g_dc.mimes.size() : 0u);
-            for (const std::string& m : g_dc.mimes)
+            // "ok <count>|<mime>|<mime>…"; `dc_selection primary`: the primary selection's.
+            std::string which;
+            in >> which;
+            const bool prim = which == "primary";
+            const auto& mimes = prim ? g_dc.primary_mimes : g_dc.mimes;
+            reply = std::format("ok {}", (prim ? g_dc.primary : g_dc.selection) ? mimes.size() : 0u);
+            for (const std::string& m : mimes)
                 reply += "|" + m;
         } else if (cmd == "dc_read") {
+            std::string which;
+            in >> which;
+            ext_data_control_offer_v1* from = which == "primary" ? g_dc.primary : g_dc.selection;
             int fds[2] = {-1, -1};
-            if (!g_dc.selection || ::pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
+            if (!from || ::pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
                 reply = "fail no selection";
             } else {
-                ext_data_control_offer_v1_receive(g_dc.selection, "text/plain;charset=utf-8", fds[1]);
+                ext_data_control_offer_v1_receive(from, "text/plain;charset=utf-8", fds[1]);
                 wl_display_flush(g_dc.display);
                 ::close(fds[1]);
                 if (g_dc.read_fd >= 0)
@@ -521,14 +542,18 @@ std::string serve(const std::string& line) {
                 h = (h ^ static_cast<unsigned char>(c)) * 0x100000001B3ull;
             reply = std::format("ok {} {} {}", g_dc.read_done ? 1 : 0, g_dc.read_text.size(), h);
         } else {
-            std::string text;
-            in >> text;
+            // `dc_set TEXT [primary]`
+            std::string text, which;
+            in >> text >> which;
             g_dc.source_text = text;
             g_dc.source = ext_data_control_manager_v1_create_data_source(g_dc.manager);
             ext_data_control_source_v1_add_listener(g_dc.source, &k_dc_source_listener, &g_dc);
             ext_data_control_source_v1_offer(g_dc.source, "text/plain;charset=utf-8");
             ext_data_control_source_v1_offer(g_dc.source, "text/plain");
-            ext_data_control_device_v1_set_selection(g_dc.device, g_dc.source);
+            if (which == "primary")
+                ext_data_control_device_v1_set_primary_selection(g_dc.device, g_dc.source);
+            else
+                ext_data_control_device_v1_set_selection(g_dc.device, g_dc.source);
             wl_display_flush(g_dc.display);
         }
 #else
@@ -1188,6 +1213,131 @@ int client_main(const char* tier_name, int fd) {
                   whole && sum == std::format("ok 1 {} {}", big.size(), want) &&
                       std::string_view{clip.text()} == big && clip.stats().sends > b0.sends,
                   std::format("reply '{}' (want {} bytes, hash {})", sum, big.size(), want));
+        }
+    }
+
+    // ── the primary selection: what is selected is offered; the middle button pastes ──
+    {
+        lx::app::clipboard& clip = app.clipboard_service();
+        const auto prim = lx::ui::clipboard_kind::primary;
+        if (!clip.active(prim)) {
+            skip("primary selection", "no zwp_primary_selection_device_manager_v1");
+        } else if (parent.call("dc_selection primary").rfind("ok", 0) != 0) {
+            skip("primary selection", "no ext-data-control in the parent");
+        } else {
+            const lx::app::clipboard_stats p0 = clip.stats(prim);
+            (void)parent.call("key 29 1"); // ctrl+a selects all: the selection settles
+            (void)parent.call("key 30 1");
+            (void)parent.call("key 30 0");
+            (void)parent.call("key 29 0");
+            const std::string selected{field->text()};
+            const bool set = app.run_until([&] { return clip.stats(prim).copies > p0.copies; }, 2000);
+            run_for(app, 50);
+            const std::string r = parent.call("dc_selection primary");
+            (void)parent.call("dc_read primary");
+            std::string read;
+            const bool got = app.run_until(
+                [&] {
+                    const std::string res = parent.call("dc_result");
+                    if (res.rfind("ok 1|", 0) != 0)
+                        return false;
+                    read = res.substr(5);
+                    return true;
+                },
+                2000);
+            check("primary: a field's selection becomes the primary selection, read by another client",
+                  set && r.find(std::string{"|"} + clip.own_mime()) != std::string::npos && got &&
+                      read == selected,
+                  std::format("published {} selection '{}' read '{}' (selected '{}')",
+                              clip.stats(prim).copies - p0.copies, r, read, selected));
+
+            const std::string theirs = "prim-\xe2\x9c\x93"; // prim-✓
+            (void)parent.call("dc_set " + theirs + " primary");
+            const bool arrived = app.run_until(
+                [&] { return clip.stats(prim).reads > p0.reads && !clip.reading(prim); }, 2000);
+            // The middle button at the text's start: pasted there, the field's text kept.
+            const lx::rect2i area = field->text_area();
+            (void)parent.call(std::format("move {} {}", area.x + 1, area.y + area.height / 2));
+            const std::string before{field->text()};
+            (void)parent.call("mbutton 1");
+            (void)parent.call("mbutton 0");
+            const bool pasted =
+                app.run_until([&] { return field->text() == theirs + before; }, 2000);
+            check("primary: another client's primary selection is read, and the middle button "
+                  "pastes it where it is pressed",
+                  arrived && std::string_view{clip.primary_text()} == theirs && pasted,
+                  std::format("reads {} primary '{}' text '{}' (was '{}')",
+                              clip.stats(prim).reads - p0.reads, clip.primary_text(),
+                              field->text(), before));
+        }
+    }
+
+    // ── drag and drop: a word dragged to the end of the field moves there ──
+    {
+        lx::app::clipboard& clip = app.clipboard_service();
+        if (!clip.active()) {
+            skip("drag and drop", "no wl_data_device_manager");
+        } else {
+            field->select_all();
+            (void)field->insert("hello world");
+            field->set_selection(0, 5); // "hello"
+            (void)settle(app, w);
+            const lx::app::drag_stats d0 = clip.drags();
+            const lx::rect2i area = field->text_area();
+            const int y = area.y + area.height / 2;
+            // Press inside "hello", then past the drag threshold to the end of the text.
+            (void)parent.call(std::format("move {} {}", area.x + 8, y));
+            (void)parent.call("button 1");
+            run_for(app, 30);
+            for (int x = area.x + 24; x <= area.x + area.width - 4; x += 16) {
+                (void)parent.call(std::format("move {} {}", x, y));
+                run_for(app, 20);
+            }
+            (void)parent.call(std::format("move {} {}", area.x + area.width - 4, y));
+            run_for(app, 30);
+            const bool entered = clip.drags().entered > d0.entered;
+            (void)parent.call("button 0");
+            const bool moved = app.run_until(
+                [&] { return clip.drags().moved > d0.moved || clip.drags().cancelled > d0.cancelled; },
+                3000);
+            run_for(app, 50);
+            check("drag and drop: a word dragged within the field — our drag, our drop, a move",
+                  moved && entered && clip.drags().started == d0.started + 1 &&
+                      clip.drags().drops == d0.drops + 1 && clip.drags().moved == d0.moved + 1 &&
+                      field->text() == " worldhello" && !field->dragging() &&
+                      field->drop_index() == lx::ui::text_input_node::k_no_drop,
+                  std::format("started {} entered {} drops {} refused {} moved {} copied {} "
+                              "cancelled {} sends {} text '{}'",
+                              clip.drags().started - d0.started, clip.drags().entered - d0.entered,
+                              clip.drags().drops - d0.drops, clip.drags().refused - d0.refused,
+                              clip.drags().moved - d0.moved, clip.drags().copied - d0.copied,
+                              clip.drags().cancelled - d0.cancelled, clip.drags().sends - d0.sends,
+                              field->text()));
+
+            // Dragged out of the window and let go where no client is: cancelled, nothing goes.
+            field->set_selection(1, 6); // "world"
+            (void)settle(app, w);
+            const lx::app::drag_stats d1 = clip.drags();
+            const std::string kept{field->text()};
+            (void)parent.call(std::format("move {} {}", area.x + 14, y));
+            (void)parent.call("button 1");
+            run_for(app, 30);
+            (void)parent.call(std::format("move {} {}", area.x + 40, y));
+            run_for(app, 30);
+            (void)parent.call("gmove 4 4"); // output 0's corner: no window there
+            run_for(app, 30);
+            (void)parent.call("button 0");
+            const bool ended = app.run_until(
+                [&] { return clip.drags().cancelled > d1.cancelled || clip.drags().moved > d1.moved; }, 3000);
+            run_for(app, 50);
+            check("drag and drop: let go where nothing takes it, the drag is cancelled and the "
+                  "text stays",
+                  ended && clip.drags().started == d1.started + 1 &&
+                      clip.drags().cancelled == d1.cancelled + 1 && clip.drags().moved == d1.moved &&
+                      field->text() == kept && !field->dragging(),
+                  std::format("started {} cancelled {} moved {} text '{}' (was '{}')",
+                              clip.drags().started - d1.started, clip.drags().cancelled - d1.cancelled,
+                              clip.drags().moved - d1.moved, field->text(), kept));
         }
     }
 

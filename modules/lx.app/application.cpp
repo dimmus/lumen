@@ -194,7 +194,7 @@ lx::result<void> application::start() {
     if (lx::wayland::seat* s = display_.default_seat())
         s->set_handler(this);
     // Without it a copy stays in this process (logged); a failure is not the app's end.
-    (void)clipboard_.start(display_, loop_);
+    (void)clipboard_.start(display_, loop_, this);
 
     // The worker: icon rasters and theme reloads (the only work posted to it here).
     bool watch = false;
@@ -299,6 +299,18 @@ void application::after_dispatch() {
 void application::on_deadline() {
     if (window_)
         window_->on_deadline(mono_ns());
+}
+
+lx::ui::ui_root* application::host_root_of(const lx::wayland::surface* s) {
+    return window_ && s && &window_->surface() == s ? &window_->root() : nullptr;
+}
+
+lx::wayland::surface* application::host_drag_origin() {
+    // The window the pointer is in: a drag starts from a press there.
+    lx::wayland::seat* s = display_.default_seat();
+    if (!window_ || !s || s->pointer_focus() != &window_->surface())
+        return nullptr;
+    return &window_->surface();
 }
 
 void application::host_close_requested(window& w) {

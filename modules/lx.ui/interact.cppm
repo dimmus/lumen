@@ -216,6 +216,9 @@ public:
     bool move(ui_node* root, lx::point2i at);
     /// The pointer left the surface: nothing is hovered (a press stays until its release).
     void leave();
+    /// The press ends without a release or a click: the pointer was taken from the window
+    /// (a drag started from the pressed node; the compositor holds the button now).
+    void cancel_press();
     /// A button press or release at the last position. Left press: the hovered node is
     /// pressed, the focus moves to it without a ring; left release over the node it pressed:
     /// `activate`. True when an interactive node took it.
@@ -531,6 +534,15 @@ bool lx::ui::pointer_state::move(ui_node* root, lx::point2i at) {
 void lx::ui::pointer_state::leave() {
     inside_ = false;
     set_hovered(nullptr);
+}
+
+void lx::ui::pointer_state::cancel_press() {
+    ui_node* target = pressed_;
+    if (!target)
+        return;
+    pressed_ = nullptr;
+    target->set_flag(node_flag::pressed, false);
+    target->on_interaction_changed();
 }
 
 bool lx::ui::pointer_state::button(ui_node* root, mouse_button b, bool down,
