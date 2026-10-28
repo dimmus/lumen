@@ -75,9 +75,11 @@ compositor starts it in `compositor::start()`, on the UI loop, where the handler
   10 s — 1 s and 3 s are `EINVAL` — so both use 2 s. The fds wait for `EPOLLPRI`
   (`event_source::poll_priority`): a PSI file always polls readable.
 - **Decay.** A trigger fires at most once per window and nothing reports pressure ending.
-  The level holds until neither trigger has fired for 10 s, then steps down only as far as
-  the file's `avg10` still supports (`full` ≥ 5 % keeps critical, `some` ≥ 7.5 % keeps
-  moderate) and checks again 10 s later. Unreadable averages decay to normal.
+  Each level holds until its own trigger has not fired for 10 s, then steps down only as far
+  as the file's `avg10` still supports (`full` ≥ 5 % keeps critical, `some` ≥ 7.5 % keeps
+  moderate) and checks again 10 s later. `some` triggers that go on after a `full` burst
+  hold moderate, not critical, so a later `full` burst is a change and evicts again.
+  Unreadable averages decay to normal.
 - **Without PSI** (no file, no write access, a kernel before 6.5 refusing a user's trigger,
   `psi=0`): one `info` line at start-up, and pressure comes from the pools alone. A trigger
   that reports faster than its window (its cgroup gone) is dropped with one `warn` rather

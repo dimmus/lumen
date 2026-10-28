@@ -53,28 +53,37 @@ struct psi_averages {
 [[nodiscard]] std::string_view cgroup_v2_path(std::string_view proc_self_cgroup);
 
 /// The level kernel pressure holds between triggers. A trigger only says a window went over
-/// its threshold — nothing reports the pressure ending — so the level stays until the
-/// triggers have been quiet for `quiet_ns`, and then steps down only as far as avg10 allows:
+/// its threshold — nothing reports the pressure ending — so a level stays until its own
+/// trigger has been quiet for `quiet_ns`, and then steps down only as far as avg10 allows:
 /// a burst that has passed decays, a stall that goes on just under the trigger does not.
+/// Each level keeps its own quiet period, so "some" triggers that go on after a "full" burst
+/// hold moderate but do not hold critical.
 class psi_pressure_state {
 public:
     explicit psi_pressure_state(psi_config config = {}) : config_{config} {}
 
-    /// A trigger for `level` fired: raises the level (never lowers it — a "some" trigger
-    /// during critical pressure only says it goes on) and restarts the quiet period.
+    /// A trigger for `level` fired: raises the level (never lowers it) and restarts that
+    /// level's quiet period only — a "some" trigger during critical pressure does not delay
+    /// the check of "full".
     memory_pressure on_trigger(memory_pressure level, long long now_ns);
-    /// The quiet period ended: the level drops to what `avg` still supports, never rises
-    /// (triggers raise). Averages that could not be read decay to normal.
+    /// The current level's quiet period ended: the level drops to what `avg` still supports,
+    /// never below a level whose own trigger fired within its quiet period, and never rises
+    /// (triggers raise). Averages that could not be read support nothing.
     memory_pressure on_quiet(long long now_ns, const psi_averages& avg);
 
-    /// When `on_quiet` is due, -1 at normal.
-    [[nodiscard]] long long deadline() const { return deadline_ns_; }
+    /// When `on_quiet` is due for the current level, -1 at normal.
+    [[nodiscard]] long long deadline() const {
+        return level_ == memory_pressure::critical   ? critical_check_ns_
+               : level_ == memory_pressure::moderate ? moderate_check_ns_
+                                                     : -1;
+    }
     [[nodiscard]] memory_pressure level() const { return level_; }
 
 private:
     psi_config config_{};
     memory_pressure level_ = memory_pressure::normal;
-    long long deadline_ns_ = -1;
+    long long critical_check_ns_ = -1; ///< last "full" trigger + quiet_ns
+    long long moderate_check_ns_ = -1; ///< last "some" trigger + quiet_ns
 };
 
 } // namespace lx::runtime
@@ -154,16 +163,19 @@ std::string_view lx::runtime::cgroup_v2_path(std::string_view text) {
 
 lx::runtime::memory_pressure lx::runtime::psi_pressure_state::on_trigger(memory_pressure level,
                                                                          long long now_ns) {
+    if (level == memory_pressure::critical)
+        critical_check_ns_ = now_ns + config_.quiet_ns;
+    else if (level == memory_pressure::moderate)
+        moderate_check_ns_ = now_ns + config_.quiet_ns;
     level_ = max_pressure(level_, level);
-    if (level_ != memory_pressure::normal)
-        deadline_ns_ = now_ns + config_.quiet_ns;
     return level_;
 }
 
 lx::runtime::memory_pressure lx::runtime::psi_pressure_state::on_quiet(long long now_ns,
                                                                        const psi_averages& avg) {
     // avg10 decays over about 10 s, so a burst that has stopped falls under the trigger's
-    // own share within a quiet period or two; pressure that goes on keeps the level.
+    // own share within a quiet period or two; pressure that goes on keeps the level. A
+    // trigger still inside its quiet period is evidence of its own.
     memory_pressure supported = memory_pressure::normal;
     if (avg.valid) {
         if (avg.full_avg10 >= psi_share_hundredths(config_.critical_full_us, config_.window_us))
@@ -172,8 +184,22 @@ lx::runtime::memory_pressure lx::runtime::psi_pressure_state::on_quiet(long long
                  psi_share_hundredths(config_.moderate_some_us, config_.window_us))
             supported = memory_pressure::moderate;
     }
+    if (moderate_check_ns_ > now_ns)
+        supported = max_pressure(supported, memory_pressure::moderate);
+    if (critical_check_ns_ > now_ns)
+        supported = memory_pressure::critical;
     if (static_cast<unsigned>(supported) < static_cast<unsigned>(level_))
         level_ = supported;
-    deadline_ns_ = level_ == memory_pressure::normal ? -1 : now_ns + config_.quiet_ns;
+
+    // The level that stays is checked again a quiet period from now, unless its trigger
+    // already set a later check; levels above it have nothing left to check.
+    if (level_ != memory_pressure::critical)
+        critical_check_ns_ = -1;
+    if (level_ == memory_pressure::normal)
+        moderate_check_ns_ = -1;
+    long long& check =
+        level_ == memory_pressure::critical ? critical_check_ns_ : moderate_check_ns_;
+    if (level_ != memory_pressure::normal && check <= now_ns)
+        check = now_ns + config_.quiet_ns;
     return level_;
 }

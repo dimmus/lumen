@@ -76,9 +76,40 @@ LUMEN_TEST(psi_level_rises_on_triggers_and_waits_out_a_quiet_period) {
     LUMEN_CHECK(state.on_trigger(memory_pressure::moderate, 100) == memory_pressure::moderate);
     LUMEN_CHECK(state.deadline() == 110);
     LUMEN_CHECK(state.on_trigger(memory_pressure::critical, 105) == memory_pressure::critical);
-    // A "some" trigger during critical pressure does not lower it, but says it goes on.
+    LUMEN_CHECK(state.deadline() == 115);
+    // A "some" trigger during critical pressure does not lower it, nor delay its check.
     LUMEN_CHECK(state.on_trigger(memory_pressure::moderate, 108) == memory_pressure::critical);
-    LUMEN_CHECK(state.deadline() == 118);
+    LUMEN_CHECK(state.deadline() == 115);
+    // An early check changes nothing: "full" fired within its quiet period.
+    LUMEN_CHECK(state.on_quiet(112, {}) == memory_pressure::critical);
+    LUMEN_CHECK(state.deadline() == 115);
+}
+
+// A short "full" burst, then "some" pressure that goes on: the "some" triggers keep
+// moderate but critical steps down once "full" has been quiet, so a later "full" burst is
+// a change again and runs the critical eviction once more.
+LUMEN_TEST(psi_some_triggers_do_not_hold_critical) {
+    lx::runtime::psi_config cfg{};
+    cfg.quiet_ns = 10;
+    lx::runtime::psi_pressure_state state{cfg};
+    (void)state.on_trigger(memory_pressure::critical, 0);
+    for (long long t = 2; t <= 10; t += 2)
+        LUMEN_CHECK(state.on_trigger(memory_pressure::moderate, t) == memory_pressure::critical);
+    LUMEN_CHECK(state.deadline() == 10);
+
+    // "full" avg10 gone; "some" avg10 below its share too, but its trigger fired at 10.
+    const lx::runtime::psi_averages avg{.some_avg10 = 500, .full_avg10 = 100, .valid = true};
+    LUMEN_CHECK(state.on_quiet(10, avg) == memory_pressure::moderate);
+    LUMEN_CHECK(state.deadline() == 20); // the last "some" trigger's quiet period
+
+    LUMEN_CHECK(state.on_trigger(memory_pressure::moderate, 12) == memory_pressure::moderate);
+    LUMEN_CHECK(state.deadline() == 22);
+    LUMEN_CHECK(state.on_trigger(memory_pressure::critical, 14) == memory_pressure::critical);
+    LUMEN_CHECK(state.deadline() == 24);
+
+    // Both quiet: down as far as the averages allow, straight to normal.
+    LUMEN_CHECK(state.on_quiet(24, avg) == memory_pressure::normal);
+    LUMEN_CHECK(state.deadline() == -1);
 }
 
 LUMEN_TEST(psi_level_decays_only_as_far_as_avg10_allows) {
