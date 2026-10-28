@@ -3,6 +3,8 @@
 import std;
 import lx.foundation;
 
+#include "lx.foundation/propagate.hpp"
+
 LUMEN_TEST(result_ok_int) {
     lx::result<int> r{42};
     LUMEN_CHECK(r.ok());
@@ -104,6 +106,39 @@ LUMEN_TEST(sparse_slots_iterates_the_allocated_blocks) {
     for (const auto& r : empty)
         none += r.used ? 1u : 1u;
     LUMEN_CHECK(none == 0);
+}
+
+namespace {
+
+lx::result<int> parse_digit(char c) {
+    if (c < '0' || c > '9')
+        return lx::invalid_argument("not a digit");
+    return c - '0';
+}
+
+lx::result<int> sum_digits(char a, char b) {
+    int x = 0;
+    int y = 0;
+    LX_TRY_ASSIGN(x, parse_digit(a));
+    LX_TRY_ASSIGN(y, parse_digit(b));
+    return x + y;
+}
+
+lx::result<void> check_digit(char c) {
+    LX_RETURN_IF_ERROR(parse_digit(c)); // a result<int> failure out of a result<void>
+    return {};
+}
+
+} // namespace
+
+LUMEN_TEST(propagation_macros_pass_values_and_return_errors) {
+    auto ok = sum_digits('3', '4');
+    LUMEN_CHECK(ok.ok() && ok.value() == 7);
+    auto bad = sum_digits('3', 'x');
+    LUMEN_CHECK(!bad.ok());
+    LUMEN_CHECK(bad.get_error().domain == lx::error_domain::invalid_argument);
+    LUMEN_CHECK(check_digit('5').ok());
+    LUMEN_CHECK(!check_digit('z').ok());
 }
 
 int main(int argc, char** argv) {

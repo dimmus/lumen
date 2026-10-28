@@ -2227,13 +2227,13 @@ All fallible APIs return **`lx::result<T>`**. Platform stubs return
 
 | Concern | Module | Behavior |
 |---------|--------|----------|
-| Typed errors | `lx.foundation.error` | Domains, codes, `LX_RETURN_IF_ERROR` |
+| Typed errors | `lx.foundation:error` | Domains, codes; `LX_RETURN_IF_ERROR` via `lx.foundation/propagate.hpp` |
 | Logging | `lx.trace` | `category` objects (`log_wm.debug(…)`), stderr default, `LUMEN_LOG` env |
 | Spans | `LX_TRACE_SCOPE` | Frame hot-path tracing at `trace` level |
 | Health | `lx.health` | Pulled on request (`lumen-ctl status`, `GetHealth`): parts, processes, memory, per-output pacing ([health.md](subsystems/health.md)) |
 
 Orchestration boundaries (e.g. `compositor::start()`) log failures once via
-`log_error` before returning. See [errors-and-logging.md](subsystems/errors-and-logging.md).
+their category's `error(err)` before returning. See [errors-and-logging.md](subsystems/errors-and-logging.md).
 
 ---
 

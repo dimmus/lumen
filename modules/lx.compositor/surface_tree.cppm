@@ -1118,7 +1118,7 @@ void lx::compositor::surface_tree::set_root_dim(lx::surface_id root, bool dim) {
         n->set_tint(dim ? k_dim_tint : k_no_tint);
     }
     damage_root(root);
-    if (log_surface.enabled(lx::trace::level::debug)) {
+    if (log_scene.enabled(lx::trace::level::debug)) {
         log_scene.debug("tree root={} dim={}", root.id(), dim ? 1 : 0);
     }
 }
@@ -1154,34 +1154,35 @@ bool lx::compositor::surface_tree::hit(lx::surface_id root, double gx, double gy
 }
 
 void lx::compositor::surface_tree::log_tree(lx::surface_id root, const char* cause) const {
-    if (!log_surface.enabled(lx::trace::level::debug))
+    if (!log_scene.enabled(lx::trace::level::debug))
         return;
     const entry* e = find(root);
     if (!e)
         return;
-    // Fixed storage: up to 256 nodes at ~40 bytes each.
+    // Fixed storage: up to 256 nodes at ~40 bytes each. The node list has no fixed arity, so
+    // the line is assembled here with format_to_n and logged whole.
     static char line[12288];
-    int n = std::snprintf(line, sizeof(line), "tree root=%llu kind=%s id=%llu cause=%s nodes=",
-                          root.id(), kind_name(e->kind), e->tag, cause ? cause : "-");
+    char* const end = line + sizeof(line) - 1;
+    char* at =
+        std::format_to_n(line, end - line, "tree root={} kind={} id={} cause={} nodes=", root.id(),
+                         kind_name(e->kind), e->tag, cause ? cause : "-")
+            .out;
     unsigned written = 0;
     if (e->root_mapped && e->container && surfaces_) {
-        for (unsigned i = 0; i < e->container->child_count() && n > 0 &&
-                             static_cast<unsigned>(n) < sizeof(line) - 64;
-             ++i) {
+        for (unsigned i = 0; i < e->container->child_count() && at < end - 64; ++i) {
             scene::scene_node* node = e->container->child_at(i);
             if (!node || node == e->underlay || node->kind() != scene::node_kind::surface)
                 continue;
             const lx::surface_id sid = static_cast<scene::surface_node*>(node)->surface();
             const lx::rect2i r = surfaces_->node_rect(sid);
-            const int w = std::snprintf(line + n, sizeof(line) - static_cast<unsigned>(n),
-                                        "%s%llu%s@%d,%d,%dx%d", written ? ";" : "", sid.id(),
-                                        sid == root ? "*" : "", r.x, r.y, r.width, r.height);
-            if (w > 0)
-                n += w;
+            at = std::format_to_n(at, end - at, "{}{}{}@{},{},{}x{}", written ? ";" : "", sid.id(),
+                                  sid == root ? "*" : "", r.x, r.y, r.width, r.height)
+                     .out;
             ++written;
         }
     }
-    if (written == 0 && n > 0 && static_cast<unsigned>(n) < sizeof(line) - 2)
-        std::snprintf(line + n, sizeof(line) - static_cast<unsigned>(n), "-");
+    if (written == 0 && at < end)
+        *at++ = '-';
+    *at = '\0';
     log_scene.debug("{}", line);
 }

@@ -39,7 +39,7 @@ if(XKBCOMMON_FOUND)
 endif()
 
 # ── Platform ─────────────────────────────────────────────────────────────────
-lumen_add_module_library(lx.input modules/lx.input DEPENDS lx.runtime)
+lumen_add_module_library(lx.input modules/lx.input DEPENDS lx.runtime lx.trace)
 lumen_add_module_library(lx.drm modules/lx.drm DEPENDS lx.runtime)
 lumen_add_module_library(lx.session modules/lx.session DEPENDS lx.runtime)
 lumen_add_module_library(lx.scheduler modules/lx.scheduler DEPENDS lx.runtime lx.drm)
@@ -295,7 +295,7 @@ configure_file("${CMAKE_SOURCE_DIR}/deploy/wayland-sessions/lumen.desktop.in"
 # Diagnostic: exercises lx.input alone, so "typing does nothing" can be narrowed to
 # permissions, devices, translation or routing instead of testing all four at once.
 add_executable(lumen-input-probe executables/lumen-input-probe/main.cpp)
-target_link_libraries(lumen-input-probe PRIVATE lx.input lx.session)
+target_link_libraries(lumen-input-probe PRIVATE lx.input lx.session lx.trace)
 lumen_apply_module_properties(lumen-input-probe)
 lumen_link_platform(lumen-input-probe)
 

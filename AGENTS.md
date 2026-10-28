@@ -152,13 +152,13 @@ snapshot/executor handoff patterns.
 |-----------|-------------------|
 | Platform API not wired yet | `lx::not_implemented("fully::qualified::name")` |
 | Invalid input | `lx::invalid_argument("…")` |
-| Real subsystem failure | `make_error(drm_err::open_failed, msg)` (domain follows from the enum) + `log_error` at boundary |
+| Real subsystem failure | `make_error(drm_err::open_failed, msg)` (domain follows from the enum) + `log_<area>.error(err)` at boundary |
 | Offline UI demo only | `lx::ui::window::create` may succeed with empty window |
 
 **Never** return `{}` success from platform/integration `result<T>` stubs.
 
 When replacing a stub, remove `not_implemented` and use proper domain error codes
-(`wayland_err`, `drm_err`, `vulkan_err`, `gl_err`, etc. from `lx.foundation.error`).
+(`wayland_err`, `drm_err`, `vulkan_err`, `gl_err`, etc. from `lx.foundation:error`).
 
 ---
 
@@ -185,6 +185,8 @@ When replacing a stub, remove `not_implemented` and use proper domain error code
 ```cpp
 import lx.foundation;
 import lx.trace;
+
+#include "lx.foundation/propagate.hpp" // LX_RETURN_IF_ERROR, LX_TRY_ASSIGN
 
 // Propagate
 LX_RETURN_IF_ERROR(subsystem.open());

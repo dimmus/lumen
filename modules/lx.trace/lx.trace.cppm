@@ -23,6 +23,8 @@ enum class level { trace, debug, info, warn, error, critical };
 
 using log_fn = void (*)(level lvl, const char* category, const char* message, void* user);
 
+/// The sink and the minimum level under every `category`. Code logs through a category;
+/// this is for configuring where lines go and which are kept.
 class logger {
 public:
     static logger& global();
@@ -31,6 +33,14 @@ public:
     void set_sink(log_fn fn, void* user = nullptr);
     void set_min_level(level min_level);
     [[nodiscard]] level min_level() const;
+
+    /// Longest line a sink receives; longer ones are truncated.
+    static constexpr std::size_t k_max_line = 4096;
+
+private:
+    // Lines are written through a `category`; the raw entry points stay inside lx.trace.
+    friend class category;
+    friend class scoped_span;
 
     void log(level lvl, const char* category, const char* message) const;
     void log_error(const lx::error& err, const char* category = "error") const;
@@ -53,9 +63,6 @@ public:
     void vlog(level lvl, const char* category, std::string_view fmt,
               std::format_args args) const noexcept;
 
-    static constexpr std::size_t k_max_line = 4096;
-
-private:
     template <typename T>
     static decltype(auto) log_arg(const T& v) {
         if constexpr (std::is_same_v<T, bool>)
@@ -190,6 +197,8 @@ void default_stderr_sink(level lvl, const char* category, const char* message, v
 module :private;
 
 namespace {
+
+constexpr lx::trace::category log_trace{"trace"};
 
 const char* level_name(lx::trace::level lvl) {
     switch (lvl) {
@@ -429,15 +438,14 @@ void lx::trace::timeline_start_from_env() {
     void* mem = ::mmap(nullptr, cap * sizeof(tl_event), PROT_READ | PROT_WRITE,
                        MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (mem == MAP_FAILED) {
-        logger::global().log(level::error, "trace", "timeline: buffer mapping failed");
+        log_trace.error("timeline: buffer mapping failed");
         return;
     }
     s.events = static_cast<tl_event*>(mem);
     s.capacity = cap;
     std::snprintf(s.path, sizeof(s.path), "%s", path);
     s.on.store(true, std::memory_order_release);
-    logger::global().logf(level::info, "trace", "timeline recording to {} (up to {} events)",
-                          s.path, cap);
+    log_trace.info("timeline recording to {} (up to {} events)", s.path, cap);
 #endif
 }
 
@@ -498,7 +506,7 @@ bool lx::trace::timeline_flush() {
         return false;
     std::FILE* f = std::fopen(s.path, "w");
     if (!f) {
-        logger::global().log(level::error, "trace", "timeline: cannot open the output file");
+        log_trace.error("timeline: cannot open the output file");
         return false;
     }
     const int pid = static_cast<int>(::getpid());
@@ -550,9 +558,9 @@ bool lx::trace::timeline_flush() {
     }
     std::fputs("\n]}\n", f);
     const bool ok = std::fclose(f) == 0;
-    logger::global().logf(ok ? level::info : level::error, "trace",
-                          "timeline: {} events written to {} ({} dropped: buffer full)", n, s.path,
-                          s.dropped.load(std::memory_order_relaxed));
+    log_trace.log(ok ? level::info : level::error,
+                  "timeline: {} events written to {} ({} dropped: buffer full)", n, s.path,
+                  s.dropped.load(std::memory_order_relaxed));
     ::munmap(s.events, s.capacity * sizeof(tl_event));
     s.events = nullptr;
     s.capacity = 0;

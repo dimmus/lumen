@@ -3,14 +3,14 @@
 # Errors and Logging
 
 Lumen separates **typed recoverable failures** (`lx::result<T>`) from **observability**
-(`lx::trace`). Both are first-class at the API layer; implementations land during P0.
+(`lx::trace`). Both are first-class at the API layer.
 
 ## Modules
 
 | Module | Role |
 |--------|------|
-| `lx.foundation.result` | `error`, `error_domain`, `result<T>` |
-| `lx.foundation.error` | Helpers, domain codes, `LX_RETURN_IF_ERROR`, `format_error` |
+| `lx.foundation:result` | `error`, `error_domain`, `result<T>` |
+| `lx.foundation:error` | Helpers, domain codes, `format_error`; `LX_RETURN_IF_ERROR` / `LX_TRY_ASSIGN` in `lx.foundation/propagate.hpp` |
 | `lx.trace` | Levels, `category` (the logging API), default stderr sink, spans, timeline |
 
 ## Error model
@@ -30,14 +30,14 @@ struct error {
 
 ### Domain codes
 
-Each subsystem defines an `*_err` enum in `lx.foundation.error`:
+Each subsystem defines an `*_err` enum in `lx.foundation:error`:
 
 | Enum | Used by |
 |------|---------|
 | `io_err` | `lx.session`, sockets, file I/O |
 | `wayland_err` | `lx.wayland.server` — `bind_failed`, `dispatch_failed`, `protocol_violation`, `client_disconnected`; `lx.wayland.client` — `connect_failed` (no compositor at the socket), `missing_global` (wl_compositor, wl_shm or xdg_wm_base absent, or the global an extension object needs), `connection_lost` (the connection died; `display::protocol_error()` names the interface, object and code, logged once), `object_failed` (libwayland could not make a proxy), and `dispatch_failed` / `protocol_violation` from the read protocol |
 | `vulkan_err` | `lx.gfx` — `device_lost`, `out_of_memory`, `import_failed`; `export_failed` (a client swapchain image's dma-buf, a semaphore's opaque fd or sync_file could not be exported), `unsupported` (no hardware device where a software one is refused, no renderable and exportable modifier, a missing extension) |
-| `gl_err` | `lx.gfx` — `no_context`, `program_failed`, `target_failed`, `import_failed`, `draw_failed`; `unsupported` (a software `GL_RENDERER` where hardware is required, below GLES 3.1, no feedback tranche with ARGB8888/XRGB8888 for the device), `export_failed` (a gbm_bo's planes or a frame's native fence could not be exported) |
+| `gl_err` | `lx.gfx` GL path — `no_context` (EGL display, context or a required extension missing), `program_failed` (shader compile or program link), `target_failed` (GBM, EGLImage or FBO), `import_failed` (a client buffer that cannot be sampled), `draw_failed` (`glGetError` during a frame); `unsupported` (a software `GL_RENDERER` where hardware is required, below GLES 3.1, no feedback tranche with ARGB8888/XRGB8888 for the device), `export_failed` (a gbm_bo's planes or a frame's native fence could not be exported) |
 | `drm_err` | `lx.drm` — `open_failed`, `mode_invalid`, `page_flip_failed`, `sync_failed`, `probe_failed` (a connector probe ioctl failed), `no_crtc` (no CRTC or primary plane left for an output), `test_rejected` (the kernel refused a TEST_ONLY of a configuration), `monitor_failed` (the udev hotplug monitor could not be opened), `no_atomic` (the driver refused DRM_CLIENT_CAP_ATOMIC; `no_atomic_hint` says what to do), `timeline_failed` (a DRM timeline syncobj operation failed), `no_format` (the compositor's dma-buf feedback offers no fourcc / modifier a client can allocate on its device: `lx::gfx::choose_client_format`, for every GPU tier; a window then falls back to wl_shm) |
 | `protocol_err` | Wire protocol violations, `zlm_*` |
 | `ui_err` | `lx.ui` — `theme_format` (a compiled theme that is truncated, has the wrong magic, a table out of bounds or a bad checksum), `theme_version` (another format version or token set: recompile it), `theme_source` (theme JSON that is not JSON or not a Zed theme family; the compiler keeps the byte offset), `icon_raster` (an icon librsvg could not render, or no librsvg) |
@@ -55,7 +55,10 @@ return lx::make_error(lx::wayland_err::bind_failed, "failed to bind socket");
 ### Propagation helpers
 
 ```cpp
-import lx.foundation.error;
+import std;
+import lx.foundation;
+
+#include "lx.foundation/propagate.hpp" // macros: a named module exports none
 
 lx::result<void> open_all() {
     LX_RETURN_IF_ERROR(lx::drm::kms_device::open());
@@ -89,7 +92,7 @@ These return empty objects without touching the platform — **not** `not_implem
 | `lx::ui::window::create` | `lumen-hello` offline UI demo |
 | `lx::ui::window_builder::build` | Delegates to `window::create` |
 
-All other `result<T>` platform/integration entry points return `not_implemented` until P0 lands.
+Every other `result<T>` platform/integration entry point either does its work or returns `not_implemented`.
 
 Replace placeholders with real implementations or `not_implemented` as each module enters P0.
 
@@ -168,7 +171,7 @@ Use stable category strings (grep-friendly):
 | `compositor.capture` | Screen capture (ADR 009 Part 4). `info`: `screen capture active` / `screen capture idle` (the privacy indicator: a session not owned by the shell delivered a frame in the last 2 s, or none has). `debug`: `session <n> client=… kind=output\|toplevel\|none paint_cursors=0\|1[ stopped: <why>]` (created; a session over the limits, or of a gone source, is stopped at once), `session <n> stopped (<why>)` (`source gone` — an output unplugged or a window gone, `window unmapped`, `no capture view` — all eight window views in use; at creation also `session limit`, `no capture backend`, `window capture needs the GL or CPU backend`), `frame ready session=… serial=… damage=[full/]<rects> frame=<scene frame>[ curtain]` per delivered frame — debug, never per composite. `warn`: `completion queue full: a capture frame is lost` (cannot happen with one frame per session). `error` once at the render boundary when the GL capture objects fail (`gl_err::no_context` without ES 3.0, a dma-buf the driver refuses as a render target, a read-back that fails): the frame fails `unknown` and the session lives on. Client mistakes are protocol errors (`duplicate_frame`, `no_buffer`, `invalid_buffer_damage`, `already_captured`, `invalid_option`, `duplicate_session`; screencopy `already_used`, `invalid_buffer`), not logs |
 | `compositor.control` | The control socket's stream, `info`: `subscriber dropped: not reading` (64 events sent while its socket stayed full after a dispatch; a burst queued within one UI iteration is not counted). Method errors are replies (`io.lumen.Compositor.UnknownAction`, `InvalidArgument`, `ShellNotConnected`, `SessionLocked`, `TooManySubscribers`; `org.varlink.service.InvalidParameter` before a handler runs), not log lines |
 | `compositor.input` (devices) | `debug`: `input device "<libinput name>": keyboard pointer touch gesture` (the capabilities it has), once per device as it appears |
-| `wayland` (security context) | `info`: `security context listener: engine=… app_id=… instance=…` (commit), `client <id> connected sandboxed (security context engine=… app_id=…): session-wide globals hidden`, `security context <engine>/<app>: listener closed by the sandbox engine`. `warn`: `sandboxed client refused: client table full`. `error` (log_error at the boundary): a listener the table cannot take (`bind_failed`: the protocol has no error for it, the engine's connections are never accepted) |
+| `wayland` (security context) | `info`: `security context listener: engine=… app_id=… instance=…` (commit), `client <id> connected sandboxed (security context engine=… app_id=…): session-wide globals hidden`, `security context <engine>/<app>: listener closed by the sandbox engine`. `warn`: `sandboxed client refused: client table full`. `error` (`.error(err)` at the boundary): a listener the table cannot take (`bind_failed`: the protocol has no error for it, the engine's connections are never accepted) |
 | `shell.icon` / `shell.bridge` (v6) | lumen-shell. `info`: `icon theme <name> (<n> themes in the chain; png=0\|1 svg=0\|1)` once, `icon handle=… name=… buffers=…`, `bell handle=…`, `screen capture active\|ended`. `debug`: `icon <name> <px>px -> <file>\|(not found)[ (undecodable)]` once per (name, size) — results are cached |
 | `compositor.dnd` | Drag-and-drop, `debug`: `dnd start client=… source=<wl id, 0 for none> origin=<surface> icon=<surface, 0 for none> button=<evdev> actions=… mimes=…`, `dnd start rejected client=… reason=serial\|no-button\|grab-active\|dnd-active`, `dnd focus surface=… client=… sx=… sy=… offer=<wl id, 0 for none>` / `dnd focus none[ surface=… client=… devices=0]` (a target change, never per motion), `dnd accept client=… mime=<type or ->` (on change), `dnd action action=… source=<mask> offer=<mask> preferred=… user=…` (on change), `dnd drop surface=… client=… action=… mime=…`, `dnd end reason=drop\|no_target\|not_accepted\|no_action\|escape\|source_destroyed\|client_gone`, `dnd finish client=… action=…`, `dnd cancelled source=… cause=<an end reason>\|offer-destroyed\|ask-dismissed`. Never per motion: motion is one `wl_data_device.motion` per device and nothing else |
 | `compositor.liveness` | xdg_wm_base ping/pong. `info`: `not-responding client=… pid=… after_ms=… toplevels=…` (a ping went unanswered past the timeout; its toplevels are marked), `responsive client=… pid=… was_ms=…` (it answered, or destroyed the xdg_wm_base of the ping). `debug`: `ping client=… serial=… reason=activate\|press\|key\|watchdog\|periodic`, `pong client=… serial=… rtt_ms=…`, `ping-cancel client=… serial=…` (the xdg_wm_base it went out on was destroyed before the pong). At most one ping per client per 2 s; never per frame or motion. The compositor never kills a client: "not responding" is shown (title suffix, dim, the shell's flag) and nothing else |
@@ -176,10 +179,25 @@ Use stable category strings (grep-friendly):
 | `compositor.activation` | xdg-activation, `debug`: `token create client=… token=<first 8 of 32> serial=<0 when none> surface=<requester, 0 for none> app_id=<or -> grantable=0\|1 reason=ok\|no_serial\|invalid_serial\|not_focused` (at xdg_activation_token_v1.commit), `activate token=<first 8> surface=… id=<toplevel, 0 for none> result=granted\|urgent\|pending\|ignored reason=ok\|already_focused\|no_serial\|invalid_serial\|not_focused\|unknown_token\|expired\|user_moved_on\|not_toplevel\|nothing_focused\|new_window[ cause=map[ refused=<the token's own reason>]]` (one per request, and one more at map for a window that presented its token before mapping; `refused=` when the map overrode the token's verdict), `urgent id=… on=0\|1` (`demands_attention` changed). `warn`: `token create failed: no randomness available` (getrandom and /dev/urandom both failed; the client gets a token that matches nothing). Tokens are capabilities: only 8 of their 32 characters are ever logged |
 | `compositor.scene` | Surface-tree scene sync, `debug`: one `tree root=… kind=toplevel\|popup\|layer\|dnd_icon id=<toplevel> cause=map\|commit\|move\|unmap\|… nodes=<sid>[*]@<x>,<y>,<w>x<h>;…` whenever a window's drawn surfaces changed — every node in paint order with its global rect, the root marked `*`. The app smoke judges frame-perfectness from these lines. `tree root=… dim=0\|1` when a tree is dimmed or undimmed (its client stopped or resumed answering pings) |
 | `compositor.latency` | Input-to-present latency, `debug` only. `present kind=content\|cursor input_us=… present_us=… latency_us=… submit_us=… fence_us=…` per present whose commit changed what the pointer shows (position, image, visibility), timed from the newest libinput event it reflects (µs, CLOCK_MONOTONIC) to the KMS flip timestamp. `submit_us` is when that commit's ioctl was issued and `fence_us` when the composite's sync_file signalled (kernel fence timestamp; 0 for no fence, a cursor-only commit, or a timing that cannot belong to this flip), which splits a present into compositor, GPU and display time; `latency summary n=… p50_us=… p95_us=… max_us=…` every 600 samples and at exit. On a virtual GPU the host draws the pointer, so "present" is the guest flip, not photons |
+| `compositor.gfx` | The composite backend, at start. `info`: which path runs — `Vulkan composite path active[ (no scanout)]`, `GL composite path active (EGL/GLES on GBM)`, `CPU composite path active` — with the renderer or device name, `no hardware Vulkan — Vulkan device not created`, `Vulkan device <name> (<id>): no card to match`, `Vulkan device released (unused on the GL path)`, `shm: uploaded from client memory (no staging)`, `explicit sync (linux-drm-syncobj-v1): …; async page flips (tearing-control-v1): …`. `warn`: `second scanout slot unavailable — single-buffer`, `third scanout slot unavailable — double-buffered`, `GLES <maj>.<min>: no UI primitive renderer — solid square quads drawn as blits, other primitives dropped`. `error`: a backend that fails to start, allocate targets or present (`vulkan_err`, `gl_err`), once at the boundary |
+| `compositor.texture` | `info`: `texture upload\|import\|retire-applied id=<n>[ FAILED]` for the first 16 texture operations of a run, then `(trace ends here)` |
+| `compositor.memory` | `warn`: `critical pressure — evicting caches` (the memory-budget coordinator reached `critical`) |
+| `compositor.seat` | `error`: the seat's keymap failed to compile or to export as a memfd (`.error(err)`; clients then get no keymap) |
 | `wayland` | Protocol dispatch. `info` once at start: `shell binary <canonical path>` (the only executable allowed to bind `zlm_shell_v1`); `warn` `shell binary … not found: zlm_shell_v1 binds will be denied`; `warn` per refused privileged bind: `privileged global zlm_shell_v1 denied: client pid=… exe=<path> is not the shell binary <path>` (or `… client uid=… pid=…` for another user) |
-| `drm` | KMS page-flip |
-| `gfx` | Device/import |
+| `gfx` | Device/import. `error`: `ui_gl: shader compile failed:` / `ui_gl: <name> program failed to link:` followed by the driver's info log (once, at start-up) |
 | `gfx.swapchain` | A client window's pixel path (`lx.gfx:swapchain`, ADR-010 §4.10). `info` once per window: `client tier <vulkan\|gl\|cpu>: <device> on <node> (<the device asked for\|the first render node\|no node>) — vulkan: <taken\|refusal> gl: <taken\|refusal> explicit sync: <timeline syncobjs\|none>`; `client tier forced: <tier> (settings\|LUMEN_UI_BACKEND[, software allowed])`; `explicit sync unavailable …: implicit sync and wl_buffer.release` (GL without a native fence or syncobj export, Vulkan whose timeline semaphore is not a DRM syncobj, a render node without timeline syncobjs); `gbm: no modifier allocation, gbm_bo_create with the <linear\|implicit> modifier`. `warn` (once): `LUMEN_UI_BACKEND=…: not vulkan, gl or cpu — ignored`, `native fence export failed: glFinish and a CPU-signalled acquire point`, `no sync_file for the dma-buf …: the frame's fence is waited on the CPU before commit`, `SYNCOBJ_EVENTFD failed: release points are polled per acquire`, `<n> resized images still with the compositor: destroying the oldest before its release`. Nothing per frame |
+| `input` | lx.input. `error`: `xkb: <xkbcommon's message>` for a keymap error no caller captured |
+| `probe` | lumen-input-probe's report (its sink prints it bare, to the terminal and its log file; lines from other categories get `[LEVEL] category:`) |
+| `runtime` | `error` (debug builds): `affinity violation` (a call on the wrong thread affinity; `assert_affinity`) |
+| `runtime.memory` | `error`: `arena capacity too large to map`, `arena mmap failed — arena has zero capacity` |
+| `scene.draw_list` | `warn`: `draw command cap reached`, `primitive cap reached`, `batch cap reached` (the rest of that frame's draws are dropped) |
+| `text` | lx.text caps. `warn`: `shape cache full: runs are shaped but not kept`, `glyph_cache: set full, glyph not cached`, `itemize: run cap reached; the rest of a paragraph is one run`, `text_layout: a storage cap cut the text` |
+| `trace` | lx.trace's timeline. `info`: `timeline recording to <path> (up to <n> events)`, `timeline: <n> events written to <path> (<d> dropped: buffer full)`. `error`: `timeline: buffer mapping failed`, `timeline: cannot open the output file` |
+| `ui` | lx.ui. `warn`: `UI frame arena exhausted — keeping previous tree`, `descriptor without a construct hook`, `text_input: an insertion was cut to the capacity` |
+| `ui.icon` | `warn`: `librsvg-2.so.2 cannot be loaded: icons are not drawn`, `librsvg lacks an entry point Lumen needs (2.52+): …`. `error`: `icon_cache: UI strand full, raster lost` |
+| `ui.text` | `warn`: `text_block: worker strand full, shaping inline`. `error`: `text_block: UI strand full, shape result lost` |
+| `ui.theme` | `info`: `theme reloaded: <path>`. `warn`: `theme_watcher: worker strand full, reload skipped`. `error`: `theme_watcher: UI strand full, reload lost`, a theme that does not load (`ui_err`) |
+| `shell.background` | `info`: `background <w>x<h> px, rendered in <ms> ms`. `warn`: `cannot read background image <path>: showing the default` |
 | `shell` | `lumen-shell` lifecycle. `info`: `connected to <display>; panel requested`, `signal <n>: exiting`, `launcher only from the panel (no key grabs)` (a compositor below zlm_shell_v1 v4). `error` (then exit 1): `zlm_shell_v1 bind rejected (…): protocol error on <iface>#<id>, code <c>`, `missing globals: …`, `compositor gone: …`, `panel closed; …` |
 | `shell.bridge` | lumen-shell's task model from `zlm_policy_bridge_v1`. `info`: `capabilities flags=0x… version=…`, `snapshot toplevels=<n>`. `debug`: `snapshot toplevel handle=<slot> app_id=… title="…"`, `add handle=<slot> count=<n>`, `remove handle=<slot> count=<n>`, `title handle=<slot> app_id=… title="…"`, `state handle=<slot> state=<n>`, `focus handle=<slot>\|none`, `flags handle=<slot> flags=<toplevel_flag bits>` (zlm v2: 1 not responding, 2 demands attention; on change), `key grab activated keysym=0x… serial=<n>` (zlm v4). `info` once: `compositor has no key grabs (v<n>): no shell keybindings` (bound below v4). `warn`: `key grab keysym=0x… refused: reserved by the compositor\|already taken\|invalid`. Geometry and stacking deltas are stored, never logged (geometry arrives once per frame during a move) |
 | `shell.panel` | lumen-shell's panel. `info`: `configure serial=… w= h=` when its size changes. `debug`: `layout idx=<i> x=<x> w=<w> handle=<slot> title="…"` (each entry, whenever the arrangement changes), `draw entries=<n> hidden=<k> focused=<i\|-1> damage=<rects>[(full)] repaint=<rects> buffer=<0\|1>` (one per commit: rects damaged against the last commit, rects repainted in that buffer), `click idx=<i> handle=<slot> title="…"` (a click that sends raise + activate). `info` `workspaces [1* 2+ 3!] output=<name>` when what its workspace indicator shows changes (`*` active, `+` occupied, `!` urgent). Never per motion event: hover redraws only when the entry under the pointer changes |
@@ -193,7 +211,7 @@ Use stable category strings (grep-friendly):
 | `shell.idle` | lumen-shell's idle policy. `info` once at start: `blanking the outputs after <s> s without input`, or `no screen blanking: …` (why: `--blank-after 0`, a missing global), or `idle policy none: an external daemon decides …`; `info`: `idle for <s> s: powering the outputs off`. `warn`: `output power control failed (the output went?) …`. `debug`: `resumed`, `output power on\|off` |
 | `shell.lock` | lumen-shell's lock policy. `info` once at start: `lock command: <cmd> (Super+L, logind Lock, before sleep[, before blanking])` or `compositor below zlm_shell_v1 v5: no session-lock integration`; `info`: `lock: starting <path> (<why>)` (`Super+L`, `logind Lock`, `before sleep`, `idle`, `the locker exited`, `relaunch after the locker exited`), `lock requested, but no --lock-command is set`. `error`: `the locker keeps exiting: not starting it again — the session stays locked (loginctl unlock-session unlocks it)`. `shell.idle` adds `locked: powering the outputs off`, `locked and idle for <s> s: …`, `idle: no lock within 5 s — powering the outputs off anyway`; `shell.bridge` logs `session lock <state>` and `lock requested (logind\|the system is going to sleep)` |
 | `shell.apps` | The application catalog and launching. `info`: `apps: catalog <n> entries, <m> listed (<files> files, <dirs> dirs) in <ms> ms; terminal <source>` (each scan: after the panel's first frame, then on launcher open when stale), `apps: launched <id> as app-lumen-<id>@<random>.service` (the start job finished `done`), `apps: launched <id> pid=<pid> in app-lumen-<id>-<random>.scope` (systemd < 250) or `apps: launched <id> pid=<pid> (double fork)`, `apps: systemd --user <version>: one transient scope per launch (no ExitType=cgroup before 250)` once (at `debug` for 250 and later: `… one transient service per launch`), `apps: systemd --user refused the service properties — launching into transient scopes` once, `apps: systemd --user unavailable (<why>) — launching with double fork (not resource-tracked)` once. `warn`, once per (desktop ID, reason) per catalog generation: `apps: Could not start <Name>: <reason> (<id>)`, with `journalctl --user -u '<unit>'` for a failed start job. `debug`: `apps: catalog stale`, `apps: starting <id> (<program>) token=yes\|no`, `apps: StartTransientUnit <unit>: <error>: <message>`, `apps: scope <unit>: <result>`, `apps: <id>: scope not ready in time — started outside it for now`, per-file parse skips (`desktop file <path>: <why>`) |
-| `portal` | xdg-desktop-portal-lumen (stderr; `run-desktop.sh` writes `portal-lumen.log`, and its `--choose` runs land in `xdpw.log`). `info`: `serving … (Screenshot v3, targets 0x7) on display <name>` once; per request `Screenshot app='<id>' interactive=<0|1> target=<n>` / `PickColor …`, `screenshot (<all outputs|output|area|window>) WxH written to <path> in <ms> ms`, `colour picked #RRGGBB`, `request answered <response> in <ms> ms[ uri=…]`, `the session is locked: nothing is captured`, `request closed by the caller`; the chooser: `chooser: chose '<line>'` / `chooser: declined`. `warn`: a request while another runs (answered 2), `overlay failed: …`, a broken Wayland connection. `log_error` at the boundary for a failed connection, capture (`wayland` domain: no capture global, `stopped`, timeout) or file (`io` domain) |
+| `portal` | xdg-desktop-portal-lumen (stderr; `run-desktop.sh` writes `portal-lumen.log`, and its `--choose` runs land in `xdpw.log`). `info`: `serving … (Screenshot v3, targets 0x7) on display <name>` once; per request `Screenshot app='<id>' interactive=<0|1> target=<n>` / `PickColor …`, `screenshot (<all outputs|output|area|window>) WxH written to <path> in <ms> ms`, `colour picked #RRGGBB`, `request answered <response> in <ms> ms[ uri=…]`, `the session is locked: nothing is captured`, `request closed by the caller`; the chooser: `chooser: chose '<line>'` / `chooser: declined`. `warn`: a request while another runs (answered 2), `overlay failed: …`, a broken Wayland connection. `.error(err)` at the boundary for a failed connection, capture (`wayland` domain: no capture global, `stopped`, timeout) or file (`io` domain) |
 | `portal.wayland` | The portal's Wayland side. `debug`: `captured output <name> WxH transform=<t> layout=x,y WxH` per output and `captured <n> output(s) in <ms> ms` per request |
 | `portal.overlay` | The portal's overlay and lists. `debug`: `overlay result <kind>` |
 
@@ -206,6 +224,8 @@ per-file `foo_log` helpers, no `foo_debug()` level checks, no `logger::global()`
 ```cpp
 import lx.trace;
 import lx.foundation;
+
+#include "lx.trace/scope.hpp" // LX_TRACE_SCOPE: a named module exports no macros
 
 // Once per file, in an anonymous namespace; or once per module as `inline constexpr` in a
 // partition its units import (`log_surface` in lx.compositor:wire).
@@ -244,7 +264,22 @@ Smoke scripts grep these lines, so a change to a format string is a change to an
 
 A helper that builds a domain message (`log_geometry`, `log_grab_reject`) is fine; one that
 only forwards to a category is not. `lx::trace::logger` stays as the layer under categories:
-the sink, the minimum level, and `vlog`.
+its public side is the sink and the minimum level (`set_sink`, `set_min_level`); its raw
+`log`/`logf`/`log_error` are private to `category` and `scoped_span`, so a call site cannot
+bypass the category. A tool that owns its output installs a sink instead of printing:
+`lumen-input-probe` routes every line — its report and lx.input's own — to the terminal and
+its timestamped log file that way.
+
+### Timeline
+
+`LUMEN_TRACE_FILE=<path>` records a Perfetto-readable timeline of a compositor run (Chrome
+trace-event JSON; ui.perfetto.dev and trace_processor load it): every `LX_TRACE_SCOPE` span,
+`timeline_counter` samples and `timeline_instant` events, with thread names from
+`name_thread`. `compositor::start` calls `timeline_start_from_env`; events go into one
+preallocated buffer (`LUMEN_TRACE_EVENTS` caps it, default 2,000,000) with a lock-free append
+and no allocation, and `timeline_flush` writes the file once the threads have stopped.
+Timestamps are CLOCK_MONOTONIC, the clock of `perf record -k mono` and KMS. Off, a span costs
+one relaxed load. The `trace` category reports the recording (see the table).
 
 ### Frame-path rule
 
@@ -275,7 +310,6 @@ where the failure is handled.
 - Journald sink (`sd_journal_send`)
 - Structured fields (key/value) on `logger`
 - Wayland protocol error bridge in `lx.wayland.server`
-- Trace export (Chrome trace format) from `scoped_span` timestamps
 - CI: fail tests when `critical` is emitted
 
 ## Related docs
