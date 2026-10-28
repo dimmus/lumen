@@ -1,6 +1,6 @@
 flowchart TB
     subgraph Process["Single Lumen process (compositor or app)"]
-        subgraph UIThread["UI affinity thread"]
+        subgraph UIThread["UI affinity thread (compositor: nice and EEVDF slice when granted, never real-time)"]
             EL["event_loop"]
             STRAND_UI["strand ui"]
             SCENE_MUT["scene_graph mutate"]
@@ -9,7 +9,7 @@ flowchart TB
             STRAND_UI --> SCENE_MUT --> WIDGETS
         end
 
-        subgraph RenderThread["Render affinity thread"]
+        subgraph RenderThread["Render affinity thread (compositor: SCHED_RR when granted, else nice, slice, uclamp.min)"]
             STRAND_R["strand render"]
             SNAP_READ["snapshot_buffer.acquire"]
             VK["Vulkan record/submit"]

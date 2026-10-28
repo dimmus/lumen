@@ -21,6 +21,7 @@ import std;
 export import :executor;
 export import :memory;
 export import :psi;
+export import :sched;
 
 export namespace lx::runtime {
 

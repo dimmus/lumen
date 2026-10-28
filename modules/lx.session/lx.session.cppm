@@ -28,6 +28,7 @@ import std;
 
 export import :privilege;
 export import :user_session;
+export import :rtkit;
 
 export namespace lx::session {
 

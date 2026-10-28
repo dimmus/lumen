@@ -55,6 +55,7 @@ constexpr lx::trace::category log_output{"compositor.output"};
 constexpr lx::trace::category log_outputcfg{"compositor.outputcfg"};
 constexpr lx::trace::category log_power{"compositor.power"};
 constexpr lx::trace::category log_render{"compositor.render"};
+constexpr lx::trace::category log_sched{"compositor.sched"};
 constexpr lx::trace::category log_session{"compositor.session"};
 constexpr lx::trace::category log_texture{"compositor.texture"};
 constexpr lx::trace::category log_config{"config"};
@@ -1204,6 +1205,11 @@ struct compositor_impl {
 
     std::thread render_thread{};
     std::thread worker_thread{};
+    /// The render thread's kernel tid, published as it starts (0 until then).
+    std::atomic<int> render_tid_{0};
+    /// Once, after the threads start: the render and UI threads' CPU scheduling
+    /// (`compositor.realtime`; threading.md, "Thread scheduling").
+    void apply_thread_scheduling();
 
     std::mutex render_mutex{};
     std::condition_variable render_cv{};
@@ -8896,6 +8902,8 @@ void compositor_impl::on_vsync(std::uint32_t forced, bool housekeeping) {
 void compositor_impl::render_loop() {
     scheduler::frame_scheduler::affinity_scope scope{scheduler::thread_affinity::render};
     lx::trace::name_thread("lx-render");
+    render_tid_.store(runtime::current_tid(), std::memory_order_release);
+    render_tid_.notify_all();
 
     // The GL context was built on the UI thread during start() and released there; claim it
     // here, because every GL call from now on happens on this thread.
@@ -8934,6 +8942,58 @@ void compositor_impl::render_loop() {
     for (auto& p : pipes_)
         if (p)
             p->discard_fence();
+}
+
+namespace {
+
+const char* sched_refusal(int err) {
+    return err == 0 ? "-" : err == ENOENT ? "not available" : std::strerror(err);
+}
+
+void log_thread_sched(const char* thread, const runtime::sched_outcome& o) {
+    const char* via = o.via == runtime::sched_via::broker ? "rtkit" : "own privilege";
+    if (o.tier == runtime::sched_tier::realtime) {
+        log_sched.info("{} thread: real-time (SCHED_RR {}, {}; RLIMIT_RTTIME {} ms)", thread,
+                       o.priority, via, o.rttime_us / 1000);
+        return;
+    }
+    if (o.tier == runtime::sched_tier::high_priority)
+        log_sched.info("{} thread: high priority (nice {}, {}); slice {} us, uclamp.min {}", thread,
+                       o.priority, via, o.slice_us, o.util_min);
+    else
+        log_sched.info("{} thread: {} (slice {} us, uclamp.min {})", thread,
+                       runtime::sched_tier_name(o.tier), o.slice_us, o.util_min);
+    log_sched.debug("{} thread refused: real-time {}, nice {}, rtkit {}, hints {}", thread,
+                    sched_refusal(o.realtime_error), sched_refusal(o.nice_error),
+                    sched_refusal(o.broker_error), sched_refusal(o.hints_error));
+}
+
+} // namespace
+
+void compositor_impl::apply_thread_scheduling() {
+    if (config_.current().compositor.realtime == lx::config::realtime_mode::off) {
+        log_sched.info("thread scheduling left as started (compositor.realtime = \"off\")");
+        return;
+    }
+    // The render thread publishes its tid first thing; this waits microseconds at most.
+    int render_tid = render_tid_.load(std::memory_order_acquire);
+    while (threads_started.load(std::memory_order_acquire) && render_tid == 0) {
+        render_tid_.wait(0, std::memory_order_acquire);
+        render_tid = render_tid_.load(std::memory_order_acquire);
+    }
+    // Asked only when the kernel refuses; its connection closes at the end of this call.
+    lx::session::rtkit_client rtkit{};
+    const runtime::sched_ops ops = runtime::kernel_sched_ops();
+    const runtime::sched_broker broker = rtkit.broker();
+    if (render_tid != 0) {
+        runtime::sched_request req{};
+        req.role = runtime::thread_role::render;
+        log_thread_sched("render", runtime::apply_thread_sched(req, render_tid, ops, broker));
+    }
+    // The UI thread dispatches whatever clients send: high priority at most, never RT.
+    runtime::sched_request req{};
+    req.role = runtime::thread_role::dispatch;
+    log_thread_sched("ui", runtime::apply_thread_sched(req, runtime::current_tid(), ops, broker));
 }
 
 void compositor_impl::worker_loop() {
@@ -9676,6 +9736,7 @@ lx::result<void> compositor::start() {
     impl_->loop.set_after_dispatch(&detail::compositor_impl::after_dispatch_callback);
 
     impl_->start_threads();
+    impl_->apply_thread_scheduling();
 
     impl_->memory_.set_pressure_handler(&detail::compositor_impl::on_memory_pressure, impl_);
     // UI affinity, like the handler. Without PSI (it logs why, once) pressure comes from
