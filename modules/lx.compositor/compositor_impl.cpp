@@ -3895,7 +3895,9 @@ void compositor_impl::fill_control_window(const toplevel_record& rec, control_wi
         std::snprintf(out.output, sizeof(out.output), "%s",
                       outputs.slot_state(static_cast<unsigned>(rec.output)).name);
     // Snapped to a half or a quarter (design-session-and-wm K.3): "tiled", as the shell sees it.
-    out.state = rec.snap && rec.state == lx::toplevel_state::normal ? "tiled" : state_name(rec.state);
+    out.state = (rec.snap || rec.tiled) && rec.state == lx::toplevel_state::normal
+                    ? "tiled"
+                    : state_name(rec.state);
     out.focused = rec.id == wm_.keyboard_focus();
     out.minimized = rec.minimized;
     out.sticky = rec.sticky;
@@ -4044,6 +4046,18 @@ control_action_result compositor_impl::run_action(lx::config::action_id action, 
     case workspace_switch: (void)wm_.switch_to_index(argument); return control_action_result::ok;
     case workspace_next: (void)wm_.switch_relative(1); return control_action_result::ok;
     case workspace_previous: (void)wm_.switch_relative(-1); return control_action_result::ok;
+    // The layout's (ADR 012 T7): the focused output's active workspace.
+    case layout_toggle: (void)wm_.toggle_layout(-1, source); return control_action_result::ok;
+    case layout_focus_next: (void)wm_.focus_tiled(1); return control_action_result::ok;
+    case layout_focus_previous: (void)wm_.focus_tiled(-1); return control_action_result::ok;
+    case layout_master_grow:
+        (void)wm_.adjust_master(k_master_ratio_step, 0);
+        return control_action_result::ok;
+    case layout_master_shrink:
+        (void)wm_.adjust_master(-k_master_ratio_step, 0);
+        return control_action_result::ok;
+    case layout_master_more: (void)wm_.adjust_master(0.0, 1); return control_action_result::ok;
+    case layout_master_fewer: (void)wm_.adjust_master(0.0, -1); return control_action_result::ok;
     default: break;
     }
     const lx::toplevel_id id = wm_.keyboard_focus();
@@ -4066,6 +4080,10 @@ control_action_result compositor_impl::run_action(lx::config::action_id action, 
     case window_move_to_output_down: (void)wm_.move_to_output(id, 0, 1); break;
     case window_minimize: wm_.set_minimized(id, true, source); break;
     case window_sticky_toggle: wm_.set_sticky(id, !rec->sticky); break;
+    case window_float_toggle: (void)wm_.toggle_floating(id); break;
+    case layout_swap_next: (void)wm_.swap_tiled(id, 1); break;
+    case layout_swap_previous: (void)wm_.swap_tiled(id, -1); break;
+    case layout_promote: (void)wm_.promote_tiled(id); break;
     // Snapping and keyboard move/resize (design-session-and-wm Part K).
     case window_snap_left: (void)wm_.snap_by_key(id, snap_key::left, source); break;
     case window_snap_right: (void)wm_.snap_by_key(id, snap_key::right, source); break;
@@ -4396,6 +4414,13 @@ void compositor_impl::apply_window_config() {
                            .edge_snap_corner = w.edge_snap_corner,
                            .snap_preview = w.snap_preview,
                            .drag_restore = w.drag_restore});
+    const auto& t = config_.current().tiling;
+    wm_.set_tiling_config({.layout = t.layout == lx::config::tiling_layout::master_stack
+                                         ? workspace_layout::master_stack
+                                         : workspace_layout::floating,
+                           .master_ratio = t.master_ratio,
+                           .master_count = static_cast<unsigned>(t.master_count),
+                           .gaps = t.gaps});
 }
 
 void compositor_impl::apply_focus_policy() {

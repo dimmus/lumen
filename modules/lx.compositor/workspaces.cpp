@@ -47,6 +47,9 @@ workspace_record* workspace_model::create(int slot) {
         w = {};
         w.id = lx::workspace_id{next_id_++};
         w.output = slot;
+        w.layout = layout_defaults_.layout;
+        w.master_count = layout_defaults_.master_count;
+        w.master_ratio = layout_defaults_.master_ratio;
         changed();
         return &w;
     }
@@ -615,6 +618,33 @@ void workspace_model::clear_home(lx::workspace_id id) {
         w->home[0] = '\0';
         w->home_index = 0;
     }
+}
+
+void workspace_model::set_layout_defaults(const tiling_config& c, bool all) {
+    layout_defaults_ = c;
+    layout_defaults_.master_count = std::min(c.master_count, k_master_count_max);
+    layout_defaults_.master_ratio = std::clamp(c.master_ratio, k_master_ratio_min,
+                                               k_master_ratio_max);
+    if (!all)
+        return;
+    for (unsigned i = 0; i < k_max_workspaces; ++i) {
+        if (!used_slots_[i])
+            continue;
+        records_[i].layout = layout_defaults_.layout;
+        records_[i].master_count = layout_defaults_.master_count;
+        records_[i].master_ratio = layout_defaults_.master_ratio;
+    }
+}
+
+bool workspace_model::set_layout(lx::workspace_id id, workspace_layout layout,
+                                 unsigned master_count, double master_ratio) {
+    workspace_record* w = find_mut(id);
+    if (!w)
+        return false;
+    w->layout = layout;
+    w->master_count = std::min(master_count, k_master_count_max);
+    w->master_ratio = std::clamp(master_ratio, k_master_ratio_min, k_master_ratio_max);
+    return true;
 }
 
 } // namespace lx::compositor

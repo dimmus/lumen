@@ -515,8 +515,8 @@ unsigned lx::compositor::shell_bridge::wire_state_of(const toplevel_record& rec)
         return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_MINIMIZED;
     if (rec.state == lx::toplevel_state::normal && toplevels_ && effective_modal(*toplevels_, rec))
         return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_MODAL;
-    // Snapped to a half or a quarter (design-session-and-wm K.3).
-    if (rec.state == lx::toplevel_state::normal && rec.snap)
+    // Snapped to a half or a quarter (design-session-and-wm K.3), or in a layout (ADR 012).
+    if (rec.state == lx::toplevel_state::normal && (rec.snap || rec.tiled))
         return ZLM_POLICY_BRIDGE_V1_TOPLEVEL_STATE_TILED;
     return wire_state(rec.state);
 #else

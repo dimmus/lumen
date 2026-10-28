@@ -4,7 +4,6 @@ classDiagram
     class PolicyRegistry {
         +instance() PolicyRegistry&
         +active() WindowManagerPolicy&
-        +load_tiling_plugin(path) bool
     }
 
     class WindowManagerPolicy {
@@ -15,11 +14,25 @@ classDiagram
     }
 
     class StackingPolicy
-    class TilingPolicy {
-        <<optional plugin>>
+
+    class WindowManager {
+        <<compositor>>
+        +set_tiling_config(tiling_config)
+        +toggle_layout(slot)
+        +toggle_floating(toplevel)
+        +flush_tiling()
+    }
+    class WorkspaceRecord {
+        layout
+        master_count
+        master_ratio
+    }
+    class Tiling {
+        <<pure>>
+        +master_stack_layout(area, master_count, ratio, gaps, out)
     }
 
     WindowManagerPolicy <|-- StackingPolicy
-    WindowManagerPolicy <|-- TilingPolicy
     PolicyRegistry --> StackingPolicy
-    PolicyRegistry ..> TilingPolicy
+    WindowManager --> WorkspaceRecord : layout per workspace
+    WindowManager ..> Tiling : ADR 012

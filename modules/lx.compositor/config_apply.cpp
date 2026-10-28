@@ -68,7 +68,9 @@ unsigned diff_config(const cfg::config_snapshot& a, const cfg::config_snapshot& 
     if (!same_bindings(a, b) || a.default_bindings != b.default_bindings ||
         (a.idle.lock_command[0] != 0) != (b.idle.lock_command[0] != 0))
         c |= cfg_bindings;
-    if (std::memcmp(&a.windows, &b.windows, sizeof(a.windows)) != 0)
+    if (std::memcmp(&a.windows, &b.windows, sizeof(a.windows)) != 0 ||
+        a.tiling.layout != b.tiling.layout || a.tiling.master_ratio != b.tiling.master_ratio ||
+        a.tiling.master_count != b.tiling.master_count || a.tiling.gaps != b.tiling.gaps)
         c |= cfg_windows;
     if (a.workspaces.mode != b.workspaces.mode || a.workspaces.count != b.workspaces.count ||
         a.workspaces.name_count != b.workspaces.name_count ||

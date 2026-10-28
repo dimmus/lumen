@@ -110,6 +110,15 @@ struct window_settings {
     bool drag_restore = true;
 };
 
+/// [tiling] (ADR 012 T8).
+enum class tiling_layout : unsigned char { floating, master_stack };
+struct tiling_settings {
+    tiling_layout layout = tiling_layout::floating;
+    double master_ratio = 0.55;
+    int master_count = 1;
+    int gaps = 8;
+};
+
 enum class workspace_mode : unsigned char { dynamic, fixed };
 struct workspace_settings {
     static constexpr unsigned k_max_names = 16;
@@ -193,6 +202,7 @@ struct config_snapshot {
     cursor_settings cursor{};
     focus_settings focus{};
     window_settings windows{};
+    tiling_settings tiling{};
     workspace_settings workspaces{};
     switcher_settings switcher{};
     idle_settings idle{};
@@ -287,6 +297,7 @@ constexpr const char* k_click_methods[] = {"default", "button-areas", "clickfing
 constexpr const char* k_accel_profiles[] = {"default", "adaptive", "flat"};
 constexpr const char* k_focus_modes[] = {"click", "sloppy"};
 constexpr const char* k_workspace_modes[] = {"dynamic", "static"};
+constexpr const char* k_tiling_layouts[] = {"floating", "master-stack"};
 constexpr const char* k_switcher_scopes[] = {"workspace", "all"};
 constexpr const char* k_idle_policies[] = {"shell", "none"};
 constexpr const char* k_positions[] = {"top-right", "top-center", "top-left", "bottom-right",
@@ -345,6 +356,15 @@ const key_desc k_keys[] = {
      LX_FIELD(windows.snap_preview)},
     {"windows", "drag-restore", value_kind::boolean, k_c, k_live, 0, 0, nullptr, 0, 0,
      LX_FIELD(windows.drag_restore)},
+    // [tiling]
+    {"tiling", "layout", value_kind::enumeration, k_c, k_live, 0, 0, k_tiling_layouts,
+     count_of(k_tiling_layouts), 0, LX_FIELD(tiling.layout)},
+    {"tiling", "master-ratio", value_kind::number, k_c, k_live, 0.1, 0.9, nullptr, 0, 0,
+     LX_FIELD(tiling.master_ratio)},
+    {"tiling", "master-count", value_kind::integer, k_c, k_live, 0, 16, nullptr, 0, 0,
+     LX_FIELD(tiling.master_count)},
+    {"tiling", "gaps", value_kind::integer, k_c, k_live, 0, 64, nullptr, 0, 0,
+     LX_FIELD(tiling.gaps)},
     // [workspaces]
     {"workspaces", "mode", value_kind::enumeration, k_c, k_live, 0, 0, k_workspace_modes,
      count_of(k_workspace_modes), 0, LX_FIELD(workspaces.mode)},
@@ -429,9 +449,9 @@ const pointer_key_desc k_pointer_keys[] = {
 
 constexpr const char* k_sections[] = {
     "input",      "input.keyboard", "input.touchpad", "input.mouse",   "input.trackpoint",
-    "input.device", "cursor",       "focus",          "windows",       "workspaces",
-    "switcher",   "idle",           "background",     "notifications", "general",
-    "bindings",
+    "input.device", "cursor",       "focus",          "windows",       "tiling",
+    "workspaces", "switcher",       "idle",           "background",    "notifications",
+    "general",    "bindings",
 };
 
 using enum lx::config::action_id;
@@ -492,6 +512,19 @@ constexpr default_binding k_default_bindings[] = {
     {"Super+Down", window_snap_down, 0, 0},
     {"Alt+F7", window_move_keyboard, 0, 0},
     {"Alt+F8", window_resize_keyboard, 0, 0},
+    // Tiling (ADR 012 T7): dwm's keys, where Lumen has not given them away (Super+H
+    // minimizes, Super+L locks, Super+Return is the terminal); i3's and sway's float toggle.
+    {"Super+T", layout_toggle, 0, 0},
+    {"Super+Shift+space", window_float_toggle, 0, 0},
+    {"Super+J", layout_focus_next, 0, 0},
+    {"Super+K", layout_focus_previous, 0, 0},
+    {"Super+Shift+J", layout_swap_next, 0, 0},
+    {"Super+Shift+K", layout_swap_previous, 0, 0},
+    {"Super+Shift+Return", layout_promote, 0, 0},
+    {"Super+equal", layout_master_grow, 0, 0},
+    {"Super+minus", layout_master_shrink, 0, 0},
+    {"Super+I", layout_master_more, 0, 0},
+    {"Super+D", layout_master_fewer, 0, 0},
 };
 
 } // namespace

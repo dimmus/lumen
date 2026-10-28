@@ -11,7 +11,7 @@ Implemented in `zlm_policy_bridge_v1` (`protocols/lumen/zlm_shell_v1.xml`):
 
 | Phase | Events |
 |-------|--------|
-| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no tiling plugin, workspace drag or explicit sync yet; version 7), then (v5) `zlm_shell_v1.lock_state`, (v6) `capture_state`, (v7) `config` → `config_diagnostic`* → `config_done` |
+| Bind | `zlm_shell_v1.capabilities(flags, shell_protocol_version)`, sent immediately after the bind (flags 0 today: no workspace drag or explicit sync yet, and tiling is the compositor's, ADR 012; version 7), then (v5) `zlm_shell_v1.lock_state`, (v6) `capture_state`, (v7) `config` → `config_diagnostic`* → `config_done` |
 | Initial sync | `snapshot_begin` → (`snapshot_toplevel` [→ `toplevel_flags`] [→ `toplevel_workspace` (v7)])* → (v6, per toplevel: [`toplevel_icon` → `toplevel_icon_buffer`* → `toplevel_icon_done`] [→ `toplevel_parent`])* → `snapshot_done` → `focus_changed` |
 | Runtime deltas | `toplevel_created` (→ `toplevel_state`, `toplevel_geometry` [, `toplevel_flags`] [, icon] [, `toplevel_parent`]), `toplevel_destroyed`, `toplevel_state`, `toplevel_geometry`, `toplevel_flags` (v2), `focus_changed`, `stacking_order_changed`, (v6) the icon group, `toplevel_parent`, `bell`, (v7) `toplevel_workspace` |
 

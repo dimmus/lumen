@@ -30,6 +30,8 @@ import lx.foundation;
 
 import std;
 
+import :tiling;
+
 export namespace lx::compositor {
 
 inline constexpr unsigned k_max_workspaces = 64;
@@ -76,6 +78,10 @@ struct workspace_record {
     /// While an output returns (`output_added` … `settle`): the 1-based position the
     /// workspace had there; 0 otherwise.
     unsigned origin_index = 0;
+    /// Its layout and the master-stack parameters (ADR 012 T1).
+    workspace_layout layout = workspace_layout::floating;
+    unsigned master_count = 1;
+    double master_ratio = 0.55;
 };
 
 struct workspace_group {
@@ -177,6 +183,12 @@ public:
     void set_urgent(lx::workspace_id id, bool on);
     /// The user placed `id` (it no longer goes back to an output it was moved off).
     void clear_home(lx::workspace_id id);
+    /// [tiling] (T8): the layout and parameters new workspaces start with; with `all`, every
+    /// workspace takes them now.
+    void set_layout_defaults(const tiling_config& c, bool all);
+    /// `id`'s layout and parameters (clamped). False when unknown.
+    bool set_layout(lx::workspace_id id, workspace_layout layout, unsigned master_count,
+                    double master_ratio);
 
 private:
     [[nodiscard]] workspace_record* find_mut(lx::workspace_id id);
@@ -211,6 +223,7 @@ private:
     };
     gone_output gone_[k_gone_outputs]{};
     unsigned gone_next_ = 0;
+    tiling_config layout_defaults_{};
     unsigned generation_ = 1;
 };
 

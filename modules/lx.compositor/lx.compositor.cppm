@@ -29,6 +29,7 @@ export import :hotplug;
 export import :protocols_p0;
 export import :wm;
 export import :workspaces;
+export import :tiling;
 export import :positioner;
 export import :popup;
 export import :decoration;
@@ -79,7 +80,6 @@ struct config {
     /// looked up next to the compositor's own binary, so the default is the lumen-shell
     /// installed or built alongside it; resolved to a canonical path at start.
     const char* shell_binary_path = "lumen-shell";
-    bool enable_tiling = false;
     bool privileged_shell_only = true;
     double target_fps = 60.0;
     unsigned worker_thread_count = 1;
