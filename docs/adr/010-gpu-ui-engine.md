@@ -1571,6 +1571,19 @@ hardware device (node matching, tiled modifiers, a warm pipeline cache: G7 warm 
 there only); G11's frame rule and every client p95 on a host without this VM's jitter; the
 clipboard (`lx::app::clipboard`) is still a no-op.
 
+The clipboard, done (2026-10-28): `lx.wayland.client:data` (`data_device`, `data_offer`,
+`data_source`; wl_data_device_manager bound at v3) and `lx.app:clipboard` behind
+`lx::ui::clipboard::global()`, which gained a sink for copies and `set_system_text` for what
+arrives. A copy becomes the seat's selection at the last input serial, offered as UTF-8 under
+the freedesktop and X11 text names plus a per-process marker type that keeps our own selection
+from being read back. Another client's selection is read as soon as it is offered, through a
+non-blocking pipe on the loop, so a paste stays synchronous. `test_app_window` checks it on the
+cpu and gl tiers against an ext-data-control-v1 client in the parent (a clipboard manager's
+view): ctrl+c sets the selection with the marker, that client reads the copied text, its own
+selection arrives and ctrl+v pastes it, and a 200 KB copy is written whole as the pipe drains.
+G1's idle check right after shows no wakeup added. Not taken: the primary selection and drag
+and drop.
+
 Tried for G7 on GL (2026-10-28), not kept. Building the two programs ahead on a helper thread
 in a shared EGL context, from the moment the tier was chosen, so they compiled during the
 configure, the swapchain and the first tick. `lumen-hello`'s first frame on SVGA3D spends

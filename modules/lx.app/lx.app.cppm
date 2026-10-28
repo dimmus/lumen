@@ -29,14 +29,9 @@ import lx.wayland.client;
 
 export import :input;
 export import :window;
+export import :clipboard;
 
 export namespace lx::app {
-
-class clipboard {
-public:
-    void set_text(const char* text);
-    [[nodiscard]] const char* text() const;
-};
 
 /// What the application's loop did (tests: G1's idle window counts these).
 struct app_stats {
@@ -79,6 +74,7 @@ public:
 
     [[nodiscard]] lx::runtime::event_loop& event_loop() { return loop_; }
     [[nodiscard]] settings& config() { return settings_; }
+    /// The Wayland clipboard behind lx.ui's (started with the connection).
     [[nodiscard]] clipboard& clipboard_service() { return clipboard_; }
     [[nodiscard]] lx::wayland::display& display() { return display_; }
     /// A copy: `worker_wakes` is the worker thread's counter, read here.

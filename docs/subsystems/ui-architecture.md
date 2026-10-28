@@ -503,8 +503,9 @@ callers compile. It is superseded and should not gain new widgets:
 
 Still to build:
 
-- The clipboard from `wl_data_device` (`lx::app::clipboard` is still a no-op);
-  `ime_target` is driven from `zwp_text_input_v3` by `lx.app:input` (§11)
+- The primary selection (`zwp_primary_selection_v1`; `clipboard::set_primary_selection` is
+  the process's own) and drag and drop. The clipboard itself is `wl_data_device` through
+  `lx.app:clipboard`; `ime_target` is driven from `zwp_text_input_v3` by `lx.app:input` (§11)
 - Grid containers (flex is `lx.ui:flex`, which reads `grow_node::grow_factor()`)
 - Feeding merged damage into `kms_damage_region`
 - A design-system layer (shell chrome: scaffold, rows, toolbars) as a separate module

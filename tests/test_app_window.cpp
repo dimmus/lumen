@@ -39,6 +39,11 @@
 #include "input-method-unstable-v2-client-protocol.h"
 #define LUMEN_TEST_IM 1
 #endif
+#if defined(LUMEN_HAS_WAYLAND) && defined(LUMEN_PROTOCOL_EXT_DATA_CONTROL_V1)
+#include <wayland-client.h>
+#include "ext-data-control-v1-client-protocol.h"
+#define LUMEN_TEST_DC 1
+#endif
 
 import std;
 import lx.foundation;
@@ -280,6 +285,129 @@ void ime_pump() {
 }
 #endif
 
+// ── a clipboard manager: an ext-data-control-v1 client of the parent's ──
+//
+// It sees the seat's selection without keyboard focus — what the child copies — and sets
+// one for the child to paste, the way a clipboard manager restores a selection.
+
+#if defined(LUMEN_TEST_DC)
+struct dc_client {
+    wl_display* display = nullptr;
+    wl_registry* registry = nullptr;
+    wl_seat* seat = nullptr;
+    ext_data_control_manager_v1* manager = nullptr;
+    ext_data_control_device_v1* device = nullptr;
+    /// The offer being announced, and the selection's with its types.
+    ext_data_control_offer_v1* pending = nullptr;
+    std::vector<std::string> pending_mimes;
+    ext_data_control_offer_v1* selection = nullptr;
+    std::vector<std::string> mimes;
+    ext_data_control_source_v1* source = nullptr;
+    std::string source_text;
+    unsigned sends = 0;
+    /// A receive in progress: its read end, what came, whether it ended.
+    int read_fd = -1;
+    std::string read_text;
+    bool read_done = false;
+};
+
+dc_client g_dc{};
+
+const ext_data_control_offer_v1_listener k_dc_offer_listener = {
+    [](void* d, ext_data_control_offer_v1* o, const char* mime) {
+        auto* c = static_cast<dc_client*>(d);
+        if (o == c->pending)
+            c->pending_mimes.emplace_back(mime);
+    }};
+
+const ext_data_control_device_v1_listener k_dc_device_listener = {
+    [](void* d, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
+        auto* c = static_cast<dc_client*>(d);
+        c->pending = o;
+        c->pending_mimes.clear();
+        ext_data_control_offer_v1_add_listener(o, &k_dc_offer_listener, c);
+    },
+    [](void* d, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
+        auto* c = static_cast<dc_client*>(d);
+        if (c->selection && c->selection != o)
+            ext_data_control_offer_v1_destroy(c->selection);
+        c->selection = o;
+        c->mimes = o == c->pending ? c->pending_mimes : std::vector<std::string>{};
+    },
+    [](void*, ext_data_control_device_v1*) {},
+    [](void* d, ext_data_control_device_v1*, ext_data_control_offer_v1* o) {
+        if (o && o != static_cast<dc_client*>(d)->selection)
+            ext_data_control_offer_v1_destroy(o);
+    }};
+
+const ext_data_control_source_v1_listener k_dc_source_listener = {
+    [](void* d, ext_data_control_source_v1*, const char*, int32_t fd) {
+        auto* c = static_cast<dc_client*>(d);
+        ++c->sends;
+        (void)!::write(fd, c->source_text.data(), c->source_text.size());
+        ::close(fd);
+    },
+    [](void* d, ext_data_control_source_v1* src) {
+        auto* c = static_cast<dc_client*>(d);
+        if (c->source == src)
+            c->source = nullptr;
+        ext_data_control_source_v1_destroy(src);
+    }};
+
+bool dc_connect(dc_client& c) {
+    c.display = wl_display_connect(k_socket);
+    if (!c.display)
+        return false;
+    static const wl_registry_listener rl = {
+        [](void* data, wl_registry* r, uint32_t name, const char* iface, uint32_t) {
+            auto* c = static_cast<dc_client*>(data);
+            if (std::strcmp(iface, wl_seat_interface.name) == 0 && !c->seat)
+                c->seat = static_cast<wl_seat*>(wl_registry_bind(r, name, &wl_seat_interface, 1));
+            else if (std::strcmp(iface, ext_data_control_manager_v1_interface.name) == 0)
+                c->manager = static_cast<ext_data_control_manager_v1*>(
+                    wl_registry_bind(r, name, &ext_data_control_manager_v1_interface, 1));
+        },
+        [](void*, wl_registry*, uint32_t) {}};
+    c.registry = wl_display_get_registry(c.display);
+    wl_registry_add_listener(c.registry, &rl, &c);
+    if (wl_display_roundtrip(c.display) < 0 || !c.seat || !c.manager)
+        return false;
+    c.device = ext_data_control_manager_v1_get_data_device(c.manager, c.seat);
+    ext_data_control_device_v1_add_listener(c.device, &k_dc_device_listener, &c);
+    wl_display_flush(c.display);
+    return true;
+}
+
+/// Reads and dispatches what the compositor sent (non-blocking), and what a receive wrote.
+void dc_pump() {
+    if (!g_dc.display)
+        return;
+    while (wl_display_prepare_read(g_dc.display) != 0)
+        (void)wl_display_dispatch_pending(g_dc.display);
+    (void)wl_display_flush(g_dc.display);
+    pollfd pf{wl_display_get_fd(g_dc.display), POLLIN, 0};
+    if (::poll(&pf, 1, 0) > 0 && (pf.revents & POLLIN))
+        (void)wl_display_read_events(g_dc.display);
+    else
+        wl_display_cancel_read(g_dc.display);
+    (void)wl_display_dispatch_pending(g_dc.display);
+    while (g_dc.read_fd >= 0) {
+        char buf[4096];
+        const ssize_t n = ::read(g_dc.read_fd, buf, sizeof(buf));
+        if (n > 0) {
+            g_dc.read_text.append(buf, static_cast<std::size_t>(n));
+            continue;
+        }
+        if (n == 0 || errno != EAGAIN) {
+            ::close(g_dc.read_fd);
+            g_dc.read_fd = -1;
+            g_dc.read_done = n == 0;
+        }
+        break;
+    }
+}
+#endif
+
 void inject_move(double x, double y) {
     lx::input::pointer_motion_event m{};
     m.x = x;
@@ -360,6 +488,52 @@ std::string serve(const std::string& line) {
 #else
         reply = "fail no input method";
 #endif
+    } else if (cmd == "dc_selection" || cmd == "dc_read" || cmd == "dc_result" ||
+               cmd == "dc_result_sum" || cmd == "dc_set") {
+#if defined(LUMEN_TEST_DC)
+        if (!g_dc.device) {
+            reply = "fail no data control";
+        } else if (cmd == "dc_selection") {
+            // "ok <count>|<mime>|<mime>…"
+            reply = std::format("ok {}", g_dc.selection ? g_dc.mimes.size() : 0u);
+            for (const std::string& m : g_dc.mimes)
+                reply += "|" + m;
+        } else if (cmd == "dc_read") {
+            int fds[2] = {-1, -1};
+            if (!g_dc.selection || ::pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0) {
+                reply = "fail no selection";
+            } else {
+                ext_data_control_offer_v1_receive(g_dc.selection, "text/plain;charset=utf-8", fds[1]);
+                wl_display_flush(g_dc.display);
+                ::close(fds[1]);
+                if (g_dc.read_fd >= 0)
+                    ::close(g_dc.read_fd);
+                g_dc.read_fd = fds[0];
+                g_dc.read_text.clear();
+                g_dc.read_done = false;
+            }
+        } else if (cmd == "dc_result") {
+            reply = std::format("ok {}|{}", g_dc.read_done ? 1 : 0, g_dc.read_text);
+        } else if (cmd == "dc_result_sum") {
+            // A large read: its length and FNV-1a, not its text (the link carries 512 bytes).
+            std::uint64_t h = 0xCBF29CE484222325ull;
+            for (const char c : g_dc.read_text)
+                h = (h ^ static_cast<unsigned char>(c)) * 0x100000001B3ull;
+            reply = std::format("ok {} {} {}", g_dc.read_done ? 1 : 0, g_dc.read_text.size(), h);
+        } else {
+            std::string text;
+            in >> text;
+            g_dc.source_text = text;
+            g_dc.source = ext_data_control_manager_v1_create_data_source(g_dc.manager);
+            ext_data_control_source_v1_add_listener(g_dc.source, &k_dc_source_listener, &g_dc);
+            ext_data_control_source_v1_offer(g_dc.source, "text/plain;charset=utf-8");
+            ext_data_control_source_v1_offer(g_dc.source, "text/plain");
+            ext_data_control_device_v1_set_selection(g_dc.device, g_dc.source);
+            wl_display_flush(g_dc.display);
+        }
+#else
+        reply = "fail no data control";
+#endif
     } else if (cmd == "output") {
         int dx = 0;
         in >> dx;
@@ -422,6 +596,9 @@ int run_child(const char* tier) {
         }
 #if defined(LUMEN_TEST_IM)
         ime_pump();
+#endif
+#if defined(LUMEN_TEST_DC)
+        dc_pump();
 #endif
     }
     ::close(sv[0]);
@@ -922,6 +1099,98 @@ int client_main(const char* tier_name, int fd) {
                           w.input().repeat_deadline_ns(), released, after));
     }
 
+    // ── the clipboard: a copy becomes the seat's selection, another client's is pasted ──
+    {
+        lx::app::clipboard& clip = app.clipboard_service();
+        const auto chord = [&](unsigned key) { // with KEY_LEFTCTRL (29)
+            (void)parent.call("key 29 1");
+            (void)parent.call(std::format("key {} 1", key));
+            (void)parent.call(std::format("key {} 0", key));
+            (void)parent.call("key 29 0");
+        };
+        const auto selection_mimes = [&] {
+            const std::string r = parent.call("dc_selection");
+            return r.rfind("ok ", 0) == 0 ? r.substr(3) : std::string{};
+        };
+        if (!clip.active()) {
+            skip("clipboard", "no wl_data_device_manager");
+        } else if (parent.call("dc_selection").rfind("ok", 0) != 0) {
+            skip("clipboard", "no ext-data-control in the parent");
+        } else {
+            const std::string copied{field->text()};
+            const lx::app::clipboard_stats c0 = clip.stats();
+            chord(30); // ctrl+a: select all
+            chord(46); // ctrl+c
+            const bool set = app.run_until([&] { return clip.stats().copies > c0.copies; }, 2000);
+            run_for(app, 50);
+            const std::string mimes = selection_mimes();
+            check("clipboard: ctrl+c sets the selection — UTF-8 text under the usual names, "
+                  "this process's own marker; it comes back to us unread",
+                  set && mimes.find("|text/plain;charset=utf-8") != std::string::npos &&
+                      mimes.find("|UTF8_STRING") != std::string::npos &&
+                      mimes.find(std::string{"|"} + clip.own_mime()) != std::string::npos &&
+                      clip.stats().own_offers > c0.own_offers && clip.stats().cancelled == c0.cancelled,
+                  std::format("copies {} own offers {} cancelled {} selection '{}'",
+                              clip.stats().copies - c0.copies, clip.stats().own_offers - c0.own_offers,
+                              clip.stats().cancelled - c0.cancelled, mimes));
+
+            (void)parent.call("dc_read");
+            std::string read;
+            const bool got = app.run_until(
+                [&] {
+                    const std::string r = parent.call("dc_result");
+                    if (r.rfind("ok 1|", 0) != 0)
+                        return false;
+                    read = r.substr(5);
+                    return true;
+                },
+                2000);
+            check("clipboard: another client reads what was copied (the send written on the loop)",
+                  got && read == copied && clip.stats().sends > c0.sends,
+                  std::format("read '{}' (copied '{}') sends {}", read, copied,
+                              clip.stats().sends - c0.sends));
+
+            const std::string theirs = "parent-\xe2\x9c\x93"; // parent-✓
+            (void)parent.call("dc_set " + theirs);
+            const bool arrived = app.run_until(
+                [&] { return clip.stats().reads > c0.reads && !clip.reading(); }, 2000);
+            check("clipboard: another client's selection is read as it is offered (and is what a "
+                  "paste takes; ours was cancelled)",
+                  arrived && std::string_view{clip.text()} == theirs &&
+                      clip.stats().cancelled > c0.cancelled,
+                  std::format("reads {} text '{}' cancelled {}", clip.stats().reads - c0.reads,
+                              clip.text(), clip.stats().cancelled - c0.cancelled));
+
+            chord(47); // ctrl+v over the selection (still all of it)
+            const bool pasted = app.run_until([&] { return field->text() == theirs; }, 2000);
+            check("clipboard: ctrl+v replaces the selection with the pasted text",
+                  pasted, std::format("text '{}'", field->text()));
+
+            // A copy larger than a pipe holds (64 KiB): the send waits on the loop for room.
+            std::string big(200'000, 'x');
+            for (std::size_t i = 0; i < big.size(); i += 97)
+                big[i] = static_cast<char>('a' + i % 26);
+            std::uint64_t want = 0xCBF29CE484222325ull;
+            for (const char c : big)
+                want = (want ^ static_cast<unsigned char>(c)) * 0x100000001B3ull;
+            const lx::app::clipboard_stats b0 = clip.stats();
+            clip.set_text(big.c_str());
+            (void)app.run_until([&] { return selection_mimes().find(clip.own_mime()) != std::string::npos; }, 2000);
+            (void)parent.call("dc_read");
+            std::string sum;
+            const bool whole = app.run_until(
+                [&] {
+                    sum = parent.call("dc_result_sum");
+                    return sum.rfind("ok 1 ", 0) == 0;
+                },
+                3000);
+            check("clipboard: a 200 KB copy reaches the reader whole, written as the pipe drains",
+                  whole && sum == std::format("ok 1 {} {}", big.size(), want) &&
+                      std::string_view{clip.text()} == big && clip.stats().sends > b0.sends,
+                  std::format("reply '{}' (want {} bytes, hash {})", sum, big.size(), want));
+        }
+    }
+
     // ── idle (G1): 2 s after the last frame — nothing requested, committed, armed or woken ──
     {
         // The focus off the field (its caret blinks while focused) onto the button by Tab,
@@ -1189,6 +1458,10 @@ int main(int argc, char** argv) {
 #if defined(LUMEN_TEST_IM)
     if (!ime_connect(g_ime))
         std::printf("  SKIP  no zwp_input_method_manager_v2: text-input-v3 is not driven\n");
+#endif
+#if defined(LUMEN_TEST_DC)
+    if (!dc_connect(g_dc))
+        std::printf("  SKIP  no ext_data_control_manager_v1: the clipboard is not driven\n");
 #endif
 
     int failed = 0;

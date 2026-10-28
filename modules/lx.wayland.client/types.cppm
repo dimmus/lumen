@@ -21,6 +21,9 @@ class toplevel;
 class popup;
 class text_input;
 class dmabuf_feedback;
+class data_device;
+class data_offer;
+class data_source;
 
 /// The globals the client runtime binds, each at a capped version it implements (the
 /// bound version is `min(advertised, cap)`; `display::global(kind)` reports both).
@@ -40,6 +43,7 @@ enum class global_kind : unsigned {
     single_pixel,     ///< wp_single_pixel_buffer_manager_v1, cap 1.
     activation,       ///< xdg_activation_v1, cap 1.
     xdg_output,       ///< zxdg_output_manager_v1, cap 3.
+    data_device_manager, ///< wl_data_device_manager, cap 3 (wl_data_device.release).
     count,
 };
 inline constexpr unsigned k_global_kinds = static_cast<unsigned>(global_kind::count);
@@ -416,6 +420,27 @@ public:
         (void)action;
         (void)serial;
     }
+};
+
+// ── data transfer (wl_data_device: the clipboard) ──
+
+class data_device_handler {
+public:
+    virtual ~data_device_handler() = default;
+    /// The selection changed: `offer` is what another client (or this one) offers, valid
+    /// until the next selection or the device's destruction; null when there is none. Sent
+    /// to the client with keyboard focus, on entering it and on every change while it has it.
+    virtual void on_selection(data_device& d, data_offer* offer) = 0;
+};
+
+class data_source_handler {
+public:
+    virtual ~data_source_handler() = default;
+    /// A client asked for the data as `mime`: write it to `fd` and close it. The handler owns
+    /// `fd` (it is closed for it only if there is no handler).
+    virtual void on_send(data_source& s, const char* mime, int fd) = 0;
+    /// The source was replaced, refused or its selection cleared: it will send no more.
+    virtual void on_cancelled(data_source& s) = 0;
 };
 
 // ── dmabuf feedback (zwp_linux_dmabuf_feedback_v1) ──
