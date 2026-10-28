@@ -231,6 +231,16 @@ struct output_pipeline {
     [[nodiscard]] unsigned framebuffer(unsigned i, bool cpu) const {
         return cpu ? dumb[i].id() : fb[i].id();
     }
+    /// Exit: lets go of every scanout framebuffer, the previous mode's too while its switch
+    /// has not flipped, without taking the one on screen off its plane (CLOSEFB, Linux 6.8).
+    void hand_over_targets() {
+        for (unsigned i = 0; i < k_slots; ++i) {
+            (void)fb[i].hand_over();
+            (void)dumb[i].hand_over();
+        }
+        if (graveyard)
+            graveyard->hand_over_targets();
+    }
 };
 
 /// UI's per-output state (ADR 008 M6, M14, M15). UI affinity.
@@ -1268,9 +1278,15 @@ struct compositor_impl {
             if (u.dmabuf_fd >= 0)
                 ::close(u.dmabuf_fd);
         }
-        // Pipelines before the device they restore the console's CRTCs through.
-        for (auto& p : pipes_)
+        // Pipelines before the device they restore the console's CRTCs through. Their
+        // framebuffers are closed, not removed: the last frame stays on screen until the
+        // console's CRTC state is put back or the next master commits, with no black frame
+        // between (RMFB of a primary plane's framebuffer turns its CRTC off).
+        for (auto& p : pipes_) {
+            if (p)
+                p->hand_over_targets();
             p.reset();
+        }
         // Retired pipelines whose hand-over to UI never ran (the loop stopped first).
         for (auto& t : in_transit_)
             delete t.exchange(nullptr);
@@ -9202,6 +9218,12 @@ lx::result<void> compositor::start() {
                              "starts when the session is switched to");
             } else if (impl_->drm_present_) {
                 log_drm.info("KMS device open — page-flip present path");
+            }
+            if (impl_->drm_present_) {
+                log_drm.info("framebuffer hand-over at exit: {}",
+                             impl_->kms.supports_closefb()
+                                 ? "CLOSEFB (no black frame between masters)"
+                                 : "RMFB (kernel before 6.8: the display blanks first)");
             } else if (impl_->kms.card_fd() >= 0) {
                 log_drm.warn("card open without DRM master — scanout disabled (nested session)");
             }

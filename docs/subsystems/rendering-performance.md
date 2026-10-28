@@ -1257,6 +1257,10 @@ the resume's modesets turn them off with every connector the kernel has on them.
   then its targets and pipeline go. Retires run before the adds of the same batch, and an
   add waits (≤ 1 s) while a retiring CRTC is still lit, so a new output is allocated and
   tested with the CRTCs and bandwidth of the gone ones free.
+- **Exit** hands the scanout framebuffers over with CLOSEFB (Linux 6.8; RMFB before it):
+  the last frame stays on screen until the console's CRTC state is put back or the next
+  master commits, instead of a black frame between (architecture.md § Session
+  pause/resume). Nothing changes per frame; runtime releases keep RMFB.
 - **Zero work when nothing changes**: without a uevent nothing runs (the netlink socket is
   filtered to drm in the kernel); a uevent whose probe matches the outputs (an identical
   layout, our own probe's detect) costs one worker probe (≈ 0.6 ms of ioctls on vmwgfx) and

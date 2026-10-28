@@ -466,7 +466,7 @@ flowchart LR
 | `lx.runtime.psi` | Kernel memory pressure (PSI) triggers and decay; `psi_monitor` feeds them to the coordinator on the UI loop |
 | `lx.runtime.sched` | Render and UI thread scheduling tiers (real-time, nice, EEVDF slice / uclamp.min) with RLIMIT_RTTIME and reset-on-fork; rtkit as the broker via `lx.session.rtkit` |
 | `lx.input` + `seat_manager` | libinput → pointer/keyboard events (ms wire time plus µs CLOCK_MONOTONIC time for latency) → `lx.compositor.wm` decides focus |
-| `lx.drm` + `lx.drm.atomic` | Connector probe (`connector_scan`, EDID identity via `:edid`; a worker may run it), CRTC/plane allocation (`:crtc_alloc`, pure, TEST_ONLY-checked), one `kms_pipeline` per CRTC (atomic page flips, KMS damage blobs, power-off), combined multi-output `commit_modeset` (TEST_ONLY of another mode, disabling a removed output, VRR_ENABLED), per-device flip-event routing, dumb scanout buffers, the udev hotplug monitor (`:uevent`), CVT custom modes (`:modes`), GPU memory from DRM fdinfo for the health report (`:fdinfo`) |
+| `lx.drm` + `lx.drm.atomic` | Connector probe (`connector_scan`, EDID identity via `:edid`; a worker may run it), CRTC/plane allocation (`:crtc_alloc`, pure, TEST_ONLY-checked), one `kms_pipeline` per CRTC (atomic page flips, KMS damage blobs, power-off), combined multi-output `commit_modeset` (TEST_ONLY of another mode, disabling a removed output, VRR_ENABLED), per-device flip-event routing, dumb scanout buffers, framebuffer hand-over at exit (CLOSEFB), the udev hotplug monitor (`:uevent`), CVT custom modes (`:modes`), GPU memory from DRM fdinfo for the health report (`:fdinfo`) |
 | `lx.scheduler.presentation` | Page-flip bridge: flip time, vblank sequence, the commit's frame tag |
 | `lx.compositor.presentation_feedback` | wp_presentation bookkeeping: sampled → flipped → presented / discarded |
 | `lx.compositor.idle` | ext-idle-notify notifications (lazy single timer, real input only) and idle-inhibitor objects, Wayland-free. UI affinity |
@@ -1335,6 +1335,22 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
   generation), the first commits after it are one combined modeset of every lit output, and
   the state machine gets one result: the worst over the outputs (one refused modeset is a
   refused resume).
+- **Exit (hand-over to the next master).** The scanout framebuffers are let go of with
+  `DRM_IOCTL_MODE_CLOSEFB` (Linux 6.8; `drm::fb_release::close`), not RMFB: RMFB of the
+  framebuffer a primary plane scans out turns its CRTC off, a black frame between Lumen and
+  whoever comes next; CLOSEFB leaves it on screen until the next commit. Each pipeline then
+  puts back, while it holds master, the console CRTC state it saved at its first modeset —
+  a direct switch from the last frame to the console. A previous master's framebuffer that
+  was itself closed is gone by then, so that restore fails and the frame stays for the next
+  master (a display manager's greeter) to take over without a flash. A CRTC the console had
+  nothing on is turned off, as RMFB left it: the kernel's fbdev does not restore the console
+  at the card's last close (measured on Linux 7.2, vmwgfx), so a frame left there would stay.
+  The cursor plane's framebuffers are still removed — a frozen pointer over the console or
+  the next master's first frames is wrong, and a cursor plane going off leaves its CRTC lit.
+  Runtime releases (a retired output, the old mode's targets after a switch, staged targets)
+  keep RMFB: those framebuffers are off screen or must leave it. Without CLOSEFB (EINVAL or
+  ENOTTY: an older kernel) the release falls back to RMFB, the old behaviour; which one the
+  kernel has is probed at open and logged once ("framebuffer hand-over at exit").
 
 ### Key bindings
 

@@ -1,7 +1,6 @@
 module;
 
 #if defined(LUMEN_HAS_DRM)
-#include <errno.h>
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -12,7 +11,16 @@ module;
 #ifndef DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT
 #define DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT 6
 #endif
+// Linux 6.8 uapi too, with its argument (`struct drm_mode_closefb`: fb_id, pad).
+#ifndef DRM_IOCTL_MODE_CLOSEFB
+struct lx_drm_mode_closefb {
+    uint32_t fb_id;
+    uint32_t pad;
+};
+#define DRM_IOCTL_MODE_CLOSEFB DRM_IOWR(0xD0, struct lx_drm_mode_closefb)
 #endif
+#endif
+#include <errno.h>
 #include <stdint.h>
 #include <stddef.h>
 
@@ -223,6 +231,10 @@ public:
     /// cursor plane from atomic clients that have not set it.
     [[nodiscard]] bool cursor_hotspot_cap() const { return cursor_hotspot_cap_; }
 
+    /// The kernel has DRM_IOCTL_MODE_CLOSEFB (Linux 6.8; `fb_release::close`). Asked once, at
+    /// open.
+    [[nodiscard]] bool supports_closefb() const { return closefb_; }
+
     /// The thread that owns the flip handlers (UI): drains the card fd once (it is
     /// nonblocking, so this never waits), routes every flip event to the pipeline whose CRTC
     /// it names, and reports blocking modesets' completions. An event from before a
@@ -262,7 +274,29 @@ private:
     unsigned combined_seq_ = 0;
     std::atomic<unsigned> stale_crtcs_{0};
     bool cursor_hotspot_cap_ = false;
+    bool closefb_ = false;
 };
+
+/// How a framebuffer goes when Lumen lets go of it.
+enum class fb_release : unsigned char {
+    /// DRM_IOCTL_MODE_RMFB: a plane still scanning it out is turned off — a primary plane
+    /// with its CRTC (a black flash). For framebuffers never on screen or that must leave it.
+    remove,
+    /// DRM_IOCTL_MODE_CLOSEFB (Linux 6.8): only our handle goes; a plane scanning it out
+    /// keeps it until the next commit, ours or the next DRM master's — a hand-over without a
+    /// black frame. RMFB on a kernel without it.
+    close,
+};
+
+/// What `release_framebuffer` did.
+enum class fb_released : unsigned char { closed, removed, failed };
+
+/// A CLOSEFB that failed with `err` met a kernel without the ioctl (before 6.8 the DRM core
+/// answers an unknown ioctl with EINVAL; ENOTTY for a node without DRM ioctls): RMFB instead.
+[[nodiscard]] bool closefb_unsupported(int err);
+
+/// Lets go of framebuffer `fb_id` of `card_fd` as `how` says. Needs no DRM master.
+[[nodiscard]] fb_released release_framebuffer(int card_fd, unsigned fb_id, fb_release how);
 
 
 /// A scanout framebuffer backed by an imported dma-buf — the object that lets the
@@ -288,8 +322,12 @@ public:
     [[nodiscard]] unsigned width() const { return width_; }
     [[nodiscard]] unsigned height() const { return height_; }
 
+    /// Lets go of it now without taking it off a plane (`fb_release::close`): the exit's
+    /// hand-over. Destruction removes it (`fb_release::remove`).
+    [[nodiscard]] fb_released hand_over() { return release(fb_release::close); }
+
 private:
-    void release();
+    fb_released release(fb_release how = fb_release::remove);
 
     int card_fd_ = -1;
     unsigned fb_id_ = 0;
@@ -336,8 +374,11 @@ public:
     /// Mapped, write-combining pixels. Null until `create` succeeds.
     [[nodiscard]] unsigned char* pixels() const { return pixels_; }
 
+    /// As `kms_framebuffer::hand_over`.
+    [[nodiscard]] fb_released hand_over() { return release(fb_release::close); }
+
 private:
-    void release();
+    fb_released release(fb_release how = fb_release::remove);
 
     int card_fd_ = -1;
     unsigned fb_id_ = 0;
@@ -426,10 +467,12 @@ lx::drm::kms_device& lx::drm::kms_device::operator=(kms_device&& other) noexcept
     stale_crtcs_.store(other.stale_crtcs_.load(std::memory_order_relaxed),
                        std::memory_order_relaxed);
     cursor_hotspot_cap_ = other.cursor_hotspot_cap_;
+    closefb_ = other.closefb_;
     other.crtc_count_ = 0;
     other.plane_count_ = 0;
     other.stale_crtcs_.store(0, std::memory_order_relaxed);
     other.cursor_hotspot_cap_ = false;
+    other.closefb_ = false;
     return *this;
 }
 
@@ -440,6 +483,7 @@ void lx::drm::kms_device::release() {
     scan_.reset();
     stale_crtcs_.store(0, std::memory_order_relaxed);
     cursor_hotspot_cap_ = false;
+    closefb_ = false;
     for (auto& p : pipelines_)
         p.store(nullptr, std::memory_order_relaxed);
 }
@@ -465,6 +509,10 @@ lx::result<void> lx::drm::kms_device::init_from_fd() {
     // clients that do, because the host draws the pointer and needs the hotspot to place
     // it. Other drivers reject the cap, which is expected and harmless.
     cursor_hotspot_cap_ = drmSetClientCap(fd, DRM_CLIENT_CAP_CURSOR_PLANE_HOTSPOT, 1) == 0;
+    // No framebuffer has id 0: a kernel with CLOSEFB looks it up and answers ENOENT, an
+    // older one has no such ioctl.
+    std::uint32_t closefb_probe[2] = {0, 0};
+    closefb_ = drmIoctl(fd, DRM_IOCTL_MODE_CLOSEFB, closefb_probe) != 0 && errno == ENOENT;
     if (auto enumerated = enumerate_resources(); !enumerated)
         return enumerated;
     scan_ = std::make_unique<connector_scan>();
@@ -929,20 +977,48 @@ lx::drm::kms_framebuffer& lx::drm::kms_framebuffer::operator=(kms_framebuffer&& 
     return *this;
 }
 
-void lx::drm::kms_framebuffer::release() {
+bool lx::drm::closefb_unsupported(int err) { return err == EINVAL || err == ENOTTY; }
+
+lx::drm::fb_released lx::drm::release_framebuffer(int card_fd, unsigned fb_id, fb_release how) {
+#if defined(LUMEN_HAS_DRM)
+    if (card_fd < 0 || fb_id == 0)
+        return fb_released::failed;
+    if (how == fb_release::close) {
+        // `struct drm_mode_closefb`: fb_id, pad (must be 0).
+        std::uint32_t arg[2] = {fb_id, 0};
+        if (drmIoctl(card_fd, DRM_IOCTL_MODE_CLOSEFB, arg) == 0)
+            return fb_released::closed;
+        if (!closefb_unsupported(errno))
+            return fb_released::failed;
+    }
+    return drmModeRmFB(card_fd, fb_id) == 0 ? fb_released::removed : fb_released::failed;
+#else
+    (void)card_fd;
+    (void)fb_id;
+    (void)how;
+    return fb_released::failed;
+#endif
+}
+
+lx::drm::fb_released lx::drm::kms_framebuffer::release(fb_release how) {
+    fb_released done = fb_released::failed;
 #if defined(LUMEN_HAS_DRM)
     if (card_fd_ >= 0) {
         if (fb_id_ != 0)
-            (void)drmModeRmFB(card_fd_, fb_id_);
+            done = release_framebuffer(card_fd_, fb_id_, how);
+        // A framebuffer left on a plane holds its own reference to the buffer.
         if (gem_handle_ != 0)
             (void)drmCloseBufferHandle(card_fd_, gem_handle_);
     }
+#else
+    (void)how;
 #endif
     card_fd_ = -1;
     fb_id_ = 0;
     gem_handle_ = 0;
     width_ = 0;
     height_ = 0;
+    return done;
 }
 
 lx::result<lx::drm::kms_framebuffer> lx::drm::kms_framebuffer::import_dmabuf(
@@ -1029,14 +1105,17 @@ lx::drm::kms_dumb_framebuffer& lx::drm::kms_dumb_framebuffer::operator=(
     return *this;
 }
 
-void lx::drm::kms_dumb_framebuffer::release() {
+lx::drm::fb_released lx::drm::kms_dumb_framebuffer::release(fb_release how) {
+    fb_released done = fb_released::failed;
 #if defined(LUMEN_HAS_DRM)
     if (pixels_ && size_ > 0)
         munmap(pixels_, size_);
     if (card_fd_ >= 0 && fb_id_ != 0)
-        drmModeRmFB(card_fd_, fb_id_);
+        done = release_framebuffer(card_fd_, fb_id_, how);
     if (card_fd_ >= 0 && gem_handle_ != 0)
         drmModeDestroyDumbBuffer(card_fd_, gem_handle_);
+#else
+    (void)how;
 #endif
     card_fd_ = -1;
     fb_id_ = 0;
@@ -1047,6 +1126,7 @@ void lx::drm::kms_dumb_framebuffer::release() {
     size_ = 0;
     format_ = 0;
     pixels_ = nullptr;
+    return done;
 }
 
 lx::result<lx::drm::kms_dumb_framebuffer> lx::drm::kms_dumb_framebuffer::create(
@@ -1316,11 +1396,18 @@ lx::drm::kms_pipeline::~kms_pipeline() {
         if (saved_crtc_ && drmIsMaster(fd)) {
             auto* saved = static_cast<drmModeCrtc*>(saved_crtc_);
             uint32_t connector = saved_connector_;
-            // buffer_id 0 means the console had nothing attached; leave the CRTC off rather
-            // than pointing it at a framebuffer that is about to be destroyed.
+            // The compositor closes its framebuffers (`fb_release::close`): the last frame
+            // stays on screen until this puts the console's back — no black frame between.
+            // A previous master's closed framebuffer is gone once ours replaced it, so that
+            // restore fails and the frame stays for the next master to take over (a display
+            // manager's greeter). buffer_id 0 means the console had nothing attached, so the
+            // CRTC goes off as RMFB left it: nothing says another master will replace the
+            // frame, and fbdev does not restore at the card's last close (Linux 7.2).
             if (saved->buffer_id && saved->mode_valid && connector) {
                 (void)drmModeSetCrtc(fd, saved->crtc_id, saved->buffer_id, saved->x, saved->y,
                                      &connector, 1, &saved->mode);
+            } else {
+                (void)drmModeSetCrtc(fd, saved->crtc_id, 0, 0, 0, nullptr, 0, nullptr);
             }
         }
         if (mode_blob_id_)
