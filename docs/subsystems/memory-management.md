@@ -33,8 +33,10 @@ memory_budget_coordinator
   ├── render_arena  (default 8 MiB, reset each tick_render)
   ├── worker_arena  (default 4 MiB)
   ├── cold_arena    (default 512 KiB — protocol parsing, etc.)
-  └── staging       (not an arena: the compositor's shm pixel staging, reported each
-                     tick_ui against staging_budget_bytes, default 64 MiB)
+  ├── staging       (not an arena: the compositor's shm pixel staging, reported each
+  │                  tick_ui against staging_budget_bytes, default 64 MiB)
+  └── gpu           (not an arena: device-local memory in KiB, the Vulkan device's use
+                     against VK_EXT_memory_budget's budget, read by render once a second)
 ```
 
 ### Pressure levels
@@ -157,13 +159,25 @@ gfx::import_cache_config{
 
 When a client exceeds its quota, LRU eviction runs **within that client** before rejecting new imports.
 
-### GPU budget monitor
+### GPU budget and priority
 
-**Module:** `lx.gfx.gpu_budget` — `VK_EXT_memory_budget` scaffold
+With `VK_EXT_memory_budget` (`device_info::supports_memory_budget`), the render thread reads
+`device::memory_budget()` once a second while the Vulkan backend composites: this process's
+use of the device-local heaps and the budget the driver gives it (the heaps less what other
+processes hold). The UI tick reports the pair as `memory_pool::gpu`, so a GPU that a game
+fills raises `moderate` at 75 % and `critical` at 90 % like any full pool, with the same
+response. A per-client byte cap is not implemented.
 
-- `query()` → `gpu_memory_stats` (total / used / budget bytes)
-- `client_within_budget()` — per-client byte cap (default 256 MiB)
-- `track_client_usage()` / `untrack_client()`
+With `VK_EXT_memory_priority` (`supports_memory_priority`), the scanout targets and the
+linear intermediates are allocated at priority 1.0 and everything else at the default 0.5:
+when device-local memory is oversubscribed, the driver evicts client textures (or another
+process's memory) before the frames being shown. RADV and NVIDIA honour priorities; a
+driver that ignores them loses nothing.
+
+`VK_EXT_host_image_copy` (`supports_host_image_copy`) removes staging memory: shm uploads
+and new atlas pages are written by the host when the format allows it without costing the
+GPU's access (`host_image_copier`), and the compositor's 16 MiB staging ring is then never
+allocated (it is made on the first staged upload, not at start-up, either way).
 
 ### Compositor surface pool
 

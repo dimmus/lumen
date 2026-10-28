@@ -137,6 +137,15 @@ struct device_info {
     /// VK_EXT_queue_family_foreign — lets imported client buffers be acquired from the
     /// foreign queue family instead of an unsynchronised layout transition.
     bool supports_queue_family_foreign = false;
+    /// VK_EXT_host_image_copy with its feature enabled: uploads may write images from the
+    /// host (`host_image_copier`) instead of through a staging buffer and a queue copy.
+    bool supports_host_image_copy = false;
+    /// VK_EXT_memory_budget: `device::memory_budget` reports the driver's budget.
+    bool supports_memory_budget = false;
+    /// VK_EXT_memory_priority with its feature enabled: scanout targets and the linear
+    /// intermediates are allocated at the highest priority, so an oversubscribed GPU evicts
+    /// client textures (or another process's memory) before the frames being shown.
+    bool supports_memory_priority = false;
     /// `VK_PHYSICAL_DEVICE_TYPE_CPU` — the "GPU" is a software rasterizer (llvmpipe,
     /// SwiftShader). Vulkan still works, but every composite is CPU work reached through
     /// an upload and a tiling pass, so the present path should prefer `cpu_compositor`.
@@ -149,6 +158,14 @@ struct device_info {
     device_match match = device_match::no_card;
     drm_node primary_node{};
     drm_node render_node{};
+};
+
+/// Device-local memory (every DEVICE_LOCAL heap) as VK_EXT_memory_budget reports it: what
+/// this process uses and what the driver suggests it may use (other processes' use and the
+/// heap size taken into account). Zero without the extension.
+struct device_memory_budget {
+    std::uint64_t used_bytes = 0;
+    std::uint64_t budget_bytes = 0;
 };
 
 class device {
@@ -177,6 +194,10 @@ public:
 
     /// Handles bundled for the renderer partition.
     [[nodiscard]] vk_context context() const;
+
+    /// The device-local budget now (a driver query: once a second, not per frame). The
+    /// thread that owns the device (render in the compositor).
+    [[nodiscard]] device_memory_budget memory_budget() const;
 
 private:
 #if defined(LUMEN_HAS_VULKAN)
@@ -358,9 +379,12 @@ int lx_gfx_pick_graphics_family(VkPhysicalDevice phys) {
     return -1;
 }
 
-/// The device's type and, with VK_EXT_physical_device_drm, its DRM nodes. The extension's
-/// properties are read through `vkGetPhysicalDeviceProperties2`, core in Vulkan 1.1: the
-/// instances here ask for 1.1, and a 1.0 device is described without nodes.
+/// Lumen's Vulkan floor (ADR-004 D4): dynamic rendering, synchronization2 and timeline
+/// semaphores are core and always enabled. A device below it is not listed — to the
+/// selector it does not exist, so `present_backend::automatic` falls to GL on it.
+constexpr uint32_t k_vulkan_api_floor = VK_API_VERSION_1_3;
+
+/// The device's type and, with VK_EXT_physical_device_drm, its DRM nodes.
 lx::gfx::physical_device_desc lx_gfx_describe(VkPhysicalDevice phys) {
     static_assert(static_cast<int>(lx::gfx::physical_device_kind::other) ==
                   VK_PHYSICAL_DEVICE_TYPE_OTHER);
@@ -377,8 +401,6 @@ lx::gfx::physical_device_desc lx_gfx_describe(VkPhysicalDevice phys) {
     vkGetPhysicalDeviceProperties(phys, &props);
     if (props.deviceType <= VK_PHYSICAL_DEVICE_TYPE_CPU)
         d.kind = static_cast<lx::gfx::physical_device_kind>(props.deviceType);
-    if (props.apiVersion < VK_API_VERSION_1_1)
-        return d;
 
     uint32_t ext_count = 0;
     if (vkEnumerateDeviceExtensionProperties(phys, nullptr, &ext_count, nullptr) != VK_SUCCESS)
@@ -407,16 +429,24 @@ lx::gfx::physical_device_desc lx_gfx_describe(VkPhysicalDevice phys) {
     return d;
 }
 
-/// The instance's physical devices in enumeration order, at most `k_max_physical_devices`,
-/// with `list` describing each.
+/// The instance's physical devices at `k_vulkan_api_floor` or above, in enumeration order,
+/// at most `k_max_physical_devices`, with `list` describing each.
 void lx_gfx_enumerate(VkInstance instance,
                       VkPhysicalDevice (&devices)[lx::gfx::k_max_physical_devices],
                       lx::gfx::physical_device_list& list) {
     uint32_t n = lx::gfx::k_max_physical_devices;
     const VkResult r = vkEnumeratePhysicalDevices(instance, &n, devices);
-    list.count = (r == VK_SUCCESS || r == VK_INCOMPLETE) ? n : 0;
-    for (unsigned i = 0; i < list.count; ++i)
-        list.devices[i] = lx_gfx_describe(devices[i]);
+    list.count = 0;
+    if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+        return;
+    for (uint32_t i = 0; i < n; ++i) {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(devices[i], &props);
+        if (props.apiVersion < k_vulkan_api_floor)
+            continue;
+        devices[list.count] = devices[i];
+        list.devices[list.count++] = lx_gfx_describe(devices[i]);
+    }
 }
 
 } // namespace
@@ -461,7 +491,7 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         app.applicationVersion = VK_MAKE_VERSION(0, 3, 0);
         app.pEngineName = "lumen";
         app.engineVersion = VK_MAKE_VERSION(0, 3, 0);
-        app.apiVersion = VK_API_VERSION_1_1;
+        app.apiVersion = k_vulkan_api_floor;
 
         VkInstanceCreateInfo ici{};
         ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
@@ -480,7 +510,8 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         lx_gfx_enumerate(instance, devices, described);
         if (described.count == 0) {
             d.destroy_vulkan();
-            return lx::make_error(lx::vulkan_err::device_lost, "no Vulkan physical devices");
+            return lx::make_error(lx::vulkan_err::unsupported,
+                                  "no Vulkan 1.3 physical device");
         }
         const device_choice choice = choose_physical_device(described, info.card);
         const physical_device_desc& chosen = described.devices[choice.index];
@@ -517,11 +548,10 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         };
         const bool has_ext_mem = has(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
         const bool has_dmabuf = has(VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
-        const bool has_modifier = has(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME) &&
-                                  has(VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME);
+        const bool has_modifier = has(VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
         const bool has_foreign = has(VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
-        const bool has_timeline = has(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME);
         const bool has_ext_sem_fd = has(VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME);
+        const bool has_budget = has(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
         if (!has_ext_mem || !has_dmabuf) {
             d.destroy_vulkan();
@@ -529,20 +559,18 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
                                   "device lacks dma-buf external memory extensions");
         }
 
-        const char* extensions[8]{};
+        const char* extensions[12]{};
         uint32_t enabled = 0;
         extensions[enabled++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
         extensions[enabled++] = VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
-        if (has_modifier) {
-            extensions[enabled++] = VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME;
+        if (has_modifier)
             extensions[enabled++] = VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
-        }
         if (has_foreign)
             extensions[enabled++] = VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
-        if (has_timeline)
-            extensions[enabled++] = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME;
         if (has_ext_sem_fd)
             extensions[enabled++] = VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME;
+        if (has_budget)
+            extensions[enabled++] = VK_EXT_MEMORY_BUDGET_EXTENSION_NAME;
 
         float priority = 1.f;
         VkDeviceQueueCreateInfo qci{};
@@ -551,24 +579,63 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         qci.queueCount = 1;
         qci.pQueuePriorities = &priority;
 
-        // VK_KHR_timeline_semaphore's semaphores are only valid with its feature enabled
-        // (the timeline pool, a client swapchain's acquire and release points).
-        VkPhysicalDeviceTimelineSemaphoreFeaturesKHR timeline_features{};
-        timeline_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES_KHR;
-        bool timeline_enabled = false;
-        if (has_timeline) {
-            VkPhysicalDeviceFeatures2 features{};
-            features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-            features.pNext = &timeline_features;
-            vkGetPhysicalDeviceFeatures2(phys, &features);
-            timeline_enabled = timeline_features.timelineSemaphore == VK_TRUE;
-            timeline_features.pNext = nullptr;
+        // Required features of Vulkan 1.3 (the floor), so enabled without asking: timeline
+        // semaphores (the timeline pool, a client swapchain's acquire and release points),
+        // dynamic rendering and synchronization2 (every pass and barrier of `:vk_renderer`
+        // and `:ui_vk`).
+        VkPhysicalDeviceVulkan13Features features13{};
+        features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
+        features13.dynamicRendering = VK_TRUE;
+        features13.synchronization2 = VK_TRUE;
+        VkPhysicalDeviceVulkan12Features features12{};
+        features12.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+        features12.pNext = &features13;
+        features12.timelineSemaphore = VK_TRUE;
+
+        // Optional: host image copy (uploads without staging) and memory priority (what is
+        // shown survives oversubscription). Each only with its extension and its feature.
+        VkPhysicalDeviceHostImageCopyFeaturesEXT host_copy{};
+        host_copy.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
+        VkPhysicalDeviceMemoryPriorityFeaturesEXT priority_features{};
+        priority_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT;
+        {
+            const bool has_host_copy = has(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+            const bool has_priority = has(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+            void* chain = nullptr;
+            if (has_priority) {
+                priority_features.pNext = chain;
+                chain = &priority_features;
+            }
+            if (has_host_copy) {
+                host_copy.pNext = chain;
+                chain = &host_copy;
+            }
+            if (chain) {
+                VkPhysicalDeviceFeatures2 query{};
+                query.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                query.pNext = chain;
+                vkGetPhysicalDeviceFeatures2(phys, &query);
+            }
+            host_copy.pNext = nullptr;
+            priority_features.pNext = nullptr;
+            chain = nullptr;
+            if (has_priority && priority_features.memoryPriority == VK_TRUE) {
+                extensions[enabled++] = VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME;
+                d.info_.supports_memory_priority = true;
+                chain = &priority_features;
+            }
+            if (has_host_copy && host_copy.hostImageCopy == VK_TRUE) {
+                extensions[enabled++] = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME;
+                d.info_.supports_host_image_copy = true;
+                host_copy.pNext = chain;
+                chain = &host_copy;
+            }
+            features13.pNext = chain;
         }
 
         VkDeviceCreateInfo dci{};
         dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-        if (timeline_enabled)
-            dci.pNext = &timeline_features;
+        dci.pNext = &features12;
         dci.queueCreateInfoCount = 1;
         dci.pQueueCreateInfos = &qci;
         dci.enabledExtensionCount = enabled;
@@ -595,8 +662,9 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
         d.info_.supports_dmabuf_export = true;
         d.info_.supports_drm_format_modifier = has_modifier;
         d.info_.supports_queue_family_foreign = has_foreign;
-        d.info_.supports_timeline_semaphore = timeline_enabled && has_ext_sem_fd;
+        d.info_.supports_timeline_semaphore = has_ext_sem_fd;
         d.info_.supports_external_semaphore_fd = has_ext_sem_fd;
+        d.info_.supports_memory_budget = has_budget;
 
         {
             VkPhysicalDeviceProperties props{};
@@ -629,6 +697,9 @@ lx::result<lx::gfx::device> lx::gfx::device::create(device_info info) {
     d.info_.supports_dmabuf_export = false;
     d.info_.supports_drm_format_modifier = false;
     d.info_.supports_queue_family_foreign = false;
+    d.info_.supports_host_image_copy = false;
+    d.info_.supports_memory_budget = false;
+    d.info_.supports_memory_priority = false;
     if (!d.info_.device_name || d.info_.device_name[0] == '\0')
         d.info_.device_name = "headless";
     d.dmabuf_ = dmabuf_importer{nullptr, nullptr};
@@ -665,7 +736,31 @@ lx::gfx::vk_context lx::gfx::device::context() const {
     ctx.queue_family = queue_family_;
     ctx.supports_queue_family_foreign = info_.supports_queue_family_foreign;
     ctx.supports_external_semaphore_fd = info_.supports_external_semaphore_fd;
+    ctx.supports_host_image_copy = info_.supports_host_image_copy;
+    ctx.supports_memory_priority = info_.supports_memory_priority;
     return ctx;
+}
+
+lx::gfx::device_memory_budget lx::gfx::device::memory_budget() const {
+    device_memory_budget b{};
+#if defined(LUMEN_HAS_VULKAN)
+    if (!physical_ || !info_.supports_memory_budget)
+        return b;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+    VkPhysicalDeviceMemoryProperties2 props{};
+    props.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
+    props.pNext = &budget;
+    vkGetPhysicalDeviceMemoryProperties2(physical_, &props);
+    const VkPhysicalDeviceMemoryProperties& m = props.memoryProperties;
+    for (uint32_t h = 0; h < m.memoryHeapCount && h < VK_MAX_MEMORY_HEAPS; ++h) {
+        if (!(m.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT))
+            continue;
+        b.used_bytes += budget.heapUsage[h];
+        b.budget_bytes += budget.heapBudget[h];
+    }
+#endif
+    return b;
 }
 
 lx::result<lx::gfx::device> lx::gfx::device_selector::select_best(drm_node card) {
@@ -703,7 +798,7 @@ lx::gfx::physical_device_list lx::gfx::device_selector::probe_devices() {
     VkApplicationInfo app{};
     app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app.pApplicationName = "lumen";
-    app.apiVersion = VK_API_VERSION_1_1;
+    app.apiVersion = k_vulkan_api_floor;
     VkInstanceCreateInfo ici{};
     ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     ici.pApplicationInfo = &app;
