@@ -286,6 +286,55 @@ std::string duration(long long ms) {
     return buf;
 }
 
+/// Bytes in the largest unit that keeps three significant digits: "512 MiB", "1.50 GiB".
+std::string bytes_text(long long b) {
+    char buf[32];
+    if (b >= (1ll << 30))
+        std::snprintf(buf, sizeof(buf), "%.2f GiB", static_cast<double>(b) / (1ll << 30));
+    else if (b >= (1ll << 20))
+        std::snprintf(buf, sizeof(buf), "%lld MiB", b >> 20);
+    else if (b >= (1ll << 10))
+        std::snprintf(buf, sizeof(buf), "%lld KiB", b >> 10);
+    else
+        std::snprintf(buf, sizeof(buf), "%lld B", b);
+    return buf;
+}
+
+/// GPU memory per region (DRM fdinfo): in the memory line, what each region holds (resident,
+/// else total); with `full`, every figure the driver prints on a line per region.
+void print_gpu_memory(sd_json_variant* m, bool full) {
+    sd_json_variant* regions = field(m, "gpu");
+    if (!full) {
+        for (std::size_t i = 0; i < count(regions); ++i) {
+            sd_json_variant* r = sd_json_variant_by_index(regions, i);
+            const long long held = num(r, "resident", num(r, "total", -1));
+            if (held >= 0)
+                std::printf(", GPU %s %s", str(r, "name"), bytes_text(held).c_str());
+        }
+        return;
+    }
+    if (!field(m, "gpu_driver")) {
+        std::printf("  %-13s %-9s not reported by the DRM driver (no usage stats in fdinfo)\n",
+                    "gpu", "-");
+        return;
+    }
+    const long long clients = num(m, "gpu_clients");
+    std::printf("  %-13s %-9s %lld DRM client%s\n", "gpu", str(m, "gpu_driver"), clients,
+                clients == 1 ? "" : "s");
+    for (std::size_t i = 0; i < count(regions); ++i) {
+        sd_json_variant* r = sd_json_variant_by_index(regions, i);
+        std::printf("    %-11s", str(r, "name"));
+        const char* sep = " ";
+        for (const char* figure : {"total", "resident", "shared", "purgeable", "active"}) {
+            if (!field(r, figure))
+                continue;
+            std::printf("%s%s %s", sep, figure, bytes_text(num(r, figure)).c_str());
+            sep = ", ";
+        }
+        std::printf("\n");
+    }
+}
+
 void print_health(sd_json_variant* h, bool full) {
     sd_json_variant* parts = field(h, "parts");
     for (std::size_t i = 0; i < count(parts); ++i) {
@@ -312,7 +361,10 @@ void print_health(sd_json_variant* h, bool full) {
     if (num(m, "import_cache_capacity") > 0)
         std::printf(", import cache %lld/%lld", num(m, "import_cache_used"),
                     num(m, "import_cache_capacity"));
+    print_gpu_memory(m, false);
     std::printf("\n");
+    if (full)
+        print_gpu_memory(m, true);
     sd_json_variant* speed = field(h, "speed");
     for (std::size_t i = 0; i < count(speed); ++i) {
         sd_json_variant* s = sd_json_variant_by_index(speed, i);

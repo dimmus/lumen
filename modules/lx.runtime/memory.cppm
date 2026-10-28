@@ -30,6 +30,11 @@ inline constexpr unsigned k_memory_pool_count = 6;
 
 enum class memory_pressure { normal, moderate, critical };
 
+/// The more severe of two levels.
+[[nodiscard]] constexpr memory_pressure max_pressure(memory_pressure a, memory_pressure b) {
+    return static_cast<unsigned>(a) >= static_cast<unsigned>(b) ? a : b;
+}
+
 /// Action when a fixed-capacity structure is full.
 enum class overflow_action {
     reject,       ///< Return error / skip push
@@ -139,6 +144,9 @@ public:
 
     void set_pressure_handler(memory_pressure_handler handler, void* user_data = nullptr);
     void report_usage(memory_pool pool, unsigned used_bytes, unsigned capacity_bytes);
+    /// Sets the level an outside source (the kernel's PSI, `psi_monitor`) reports; `normal`
+    /// withdraws it. Combined with the pools' own level — the higher wins — so neither
+    /// overwrites the other.
     void on_external_pressure(memory_pressure level);
 
     [[nodiscard]] memory_pressure current_pressure() const;
@@ -149,6 +157,7 @@ public:
 
 private:
     void evaluate_pressure();
+    void apply_pressure();
 
     memory_budget_config config_{};
     memory_arena ui_arena_{};
@@ -157,7 +166,9 @@ private:
     memory_arena cold_arena_{};
     memory_pressure_handler handler_ = nullptr;
     void* handler_user_ = nullptr;
-    memory_pressure pressure_ = memory_pressure::normal;
+    memory_pressure pressure_ = memory_pressure::normal; ///< max(internal_, external_)
+    memory_pressure internal_ = memory_pressure::normal; ///< from the fullest pool
+    memory_pressure external_ = memory_pressure::normal; ///< from on_external_pressure
     unsigned frame_index_ = 0;
     unsigned pool_used_[k_memory_pool_count]{};
     unsigned pool_capacity_[k_memory_pool_count]{};
@@ -373,9 +384,16 @@ void lx::runtime::memory_budget_coordinator::report_usage(memory_pool pool,
 }
 
 void lx::runtime::memory_budget_coordinator::on_external_pressure(memory_pressure level) {
-    if (static_cast<unsigned>(level) > static_cast<unsigned>(pressure_))
-        pressure_ = level;
-    if (handler_) handler_(pressure_, handler_user_);
+    external_ = level;
+    apply_pressure();
+}
+
+void lx::runtime::memory_budget_coordinator::apply_pressure() {
+    // Each source keeps its own level: the pools are re-evaluated every frame, and writing
+    // their verdict over the shared one would drop the kernel's report a frame after it came.
+    const memory_pressure prev = pressure_;
+    pressure_ = max_pressure(internal_, external_);
+    if (pressure_ != prev && handler_) handler_(pressure_, handler_user_);
 }
 
 void lx::runtime::memory_budget_coordinator::evaluate_pressure() {
@@ -396,15 +414,13 @@ void lx::runtime::memory_budget_coordinator::evaluate_pressure() {
     }
     if (!any) return;
 
-    const memory_pressure prev = pressure_;
     if (pct >= config_.pressure_critical_used_pct)
-        pressure_ = memory_pressure::critical;
+        internal_ = memory_pressure::critical;
     else if (pct >= config_.pressure_moderate_used_pct)
-        pressure_ = memory_pressure::moderate;
+        internal_ = memory_pressure::moderate;
     else
-        pressure_ = memory_pressure::normal;
-
-    if (pressure_ != prev && handler_) handler_(pressure_, handler_user_);
+        internal_ = memory_pressure::normal;
+    apply_pressure();
 }
 
 lx::runtime::memory_pressure lx::runtime::memory_budget_coordinator::current_pressure() const {

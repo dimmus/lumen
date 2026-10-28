@@ -475,7 +475,9 @@ bool client_swapchain::release_signalled(const slot& s) const {
     if (!s.timeline_handle || !ops_.query || s.image.release_point == 0)
         return false;
     bool done = false;
-    return ops_.query(ops_.user, s.timeline_handle, s.image.release_point, &done) == 0 && done;
+    // No deadline: the client only polls its own release points.
+    return ops_.query(ops_.user, s.timeline_handle, s.image.release_point, 0, &done) == 0 &&
+           done;
 }
 
 lx::result<swapchain_image*> client_swapchain::acquire() {

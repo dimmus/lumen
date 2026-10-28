@@ -651,6 +651,10 @@ struct p0_protocol_context {
     /// clock's prediction; `cu_in_tick` while a tick builds that output's frame). Null:
     /// unknown, commit-timing targets count as reached.
     unsigned long long (*cu_predict)(void* user, unsigned slot) = nullptr;
+    /// When an update committed now must be ready to join a frame of output `slot`: the
+    /// start of the next repaint that latches content (CLOCK_MONOTONIC ns) — the dma-fence
+    /// deadline hint of its buffer fences. 0 or null: unknown, no hint.
+    unsigned long long (*cu_latch)(void* user, unsigned slot) = nullptr;
     /// Arms output `slot`'s clock for the tick that presents at or after `target_ns`.
     void (*cu_request_at)(void* user, unsigned slot, unsigned long long target_ns) = nullptr;
     void* cu_user = nullptr;

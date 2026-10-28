@@ -129,6 +129,9 @@ struct output_pipeline {
     /// A composited frame is not committed yet (read by UI before it answers frame
     /// callbacks on an idle tick).
     std::atomic<bool> frame_outstanding{false};
+    /// UI → render: the vblank the newest tick serving this output aimed at
+    /// (`output_ui::aim_ns`) — the deadline hint of the composite fence of its frame.
+    std::atomic<lx::runtime::clock_time> fence_deadline_ns{0};
     /// The plane passed a TEST_ONLY commit with an image on it.
     bool cursor_tested = false;
     /// A content commit has gone through since the last modeset need (the CRTC is ours).
@@ -226,6 +229,16 @@ struct output_pipeline {
     }
     [[nodiscard]] unsigned framebuffer(unsigned i, bool cpu) const {
         return cpu ? dumb[i].id() : fb[i].id();
+    }
+    /// Exit: lets go of every scanout framebuffer, the previous mode's too while its switch
+    /// has not flipped, without taking the one on screen off its plane (CLOSEFB, Linux 6.8).
+    void hand_over_targets() {
+        for (unsigned i = 0; i < k_slots; ++i) {
+            (void)fb[i].hand_over();
+            (void)dumb[i].hand_over();
+        }
+        if (graveyard)
+            graveyard->hand_over_targets();
     }
 };
 
@@ -536,6 +549,8 @@ struct compositor_impl {
     std::unique_ptr<gfx::ui_cpu_renderer> ui_cpu_{};
     gfx::egl_device egl_{};
     gfx::gl_compositor gl_compositor_{};
+    /// Render affinity. Deadline hints on the composite fences that become IN_FENCE_FD.
+    gfx::fence_deadline composite_deadline_{"composite"};
     /// The GL path's primitive renderer, made with the backend when the context is GLES 3.1
     /// (`setup_gl_present`); null on GLES 2, where primitives are lowered to blits.
     std::unique_ptr<gfx::ui_gl_renderer> ui_gl_{};
@@ -1117,6 +1132,8 @@ struct compositor_impl {
     /// curtains; completions handed to UI.
     void run_capture_render();
     std::unique_ptr<runtime::event_source> logind_source{};
+    /// Kernel memory pressure (PSI) into memory_. After loop and memory_: destroyed first.
+    runtime::psi_monitor psi_{};
 
     /// The frame clocks run only while there is something to do. An output whose two
     /// consecutive ticks find nothing for it — no damage, no frame of it the render thread
@@ -1261,9 +1278,15 @@ struct compositor_impl {
             if (u.dmabuf_fd >= 0)
                 ::close(u.dmabuf_fd);
         }
-        // Pipelines before the device they restore the console's CRTCs through.
-        for (auto& p : pipes_)
+        // Pipelines before the device they restore the console's CRTCs through. Their
+        // framebuffers are closed, not removed: the last frame stays on screen until the
+        // console's CRTC state is put back or the next master commits, with no black frame
+        // between (RMFB of a primary plane's framebuffer turns its CRTC off).
+        for (auto& p : pipes_) {
+            if (p)
+                p->hand_over_targets();
             p.reset();
+        }
         // Retired pipelines whose hand-over to UI never ran (the loop stopped first).
         for (auto& t : in_transit_)
             delete t.exchange(nullptr);
@@ -1548,6 +1571,14 @@ struct compositor_impl {
         const int dup = ::fcntl(fence_fd, F_DUPFD_CLOEXEC, 0);
         if (dup >= 0)
             release_fences_.publish(dup, frame);
+    }
+    /// Render: the frame just composited into `p` is needed by the vblank its tick aimed at —
+    /// hinted on its fence at submission, ahead of the commit (one ioctl, none once the
+    /// kernel lacks it). The kernel's atomic helper hints the same fence at the commit.
+    void hint_composite_deadline(const output_pipeline& p) {
+        const lx::runtime::clock_time at = p.fence_deadline_ns.load(std::memory_order_relaxed);
+        if (at > 0)
+            (void)composite_deadline_.hint(p.composited_fence, static_cast<unsigned long long>(at));
     }
     static void drm_fd_callback();
     static void housekeeping_callback();
@@ -3171,6 +3202,14 @@ void compositor_impl::register_p0_globals() {
         return static_cast<unsigned long long>(
             c.next_deadline(now + c.estimate_ns() + scheduler::repaint_scheduler::k_margin_ns));
     };
+    // dma-fence deadline hints on client buffer fences: what an update committed now needs
+    // its fences by is the start of the repaint that latches it, not the vblank after.
+    p0_.cu_latch = [](void* u, unsigned slot) -> unsigned long long {
+        auto* self = static_cast<compositor_impl*>(u);
+        if (slot >= output_manager::k_max || !self->clocks_.live(slot))
+            return 0;
+        return static_cast<unsigned long long>(self->clocks_.clock(slot).next_start(now_ns()));
+    };
     p0_.cu_request_at = [](void* u, unsigned slot, unsigned long long target) {
         auto* self = static_cast<compositor_impl*>(u);
         if (!self->vsync_timer || self->display_gate_.load(std::memory_order_relaxed) != 0)
@@ -3249,6 +3288,14 @@ void compositor_impl::register_p0_globals() {
                                            : "not offered (composite exports no fence)",
                      p0_.async_flip_capable ? "available" : "unsupported by the card");
     }
+    // GPU memory in the health report comes from DRM fdinfo, read on request; said once here
+    // because a driver either prints usage stats or never does.
+    if (const lx::drm::gpu_memory gpu = lx::drm::read_gpu_memory(); gpu.driver[0] != '\0')
+        log_memory.info("GPU memory: DRM fdinfo of {} ({} client{}, {} region{})", gpu.driver,
+                        gpu.clients, gpu.clients == 1 ? "" : "s", gpu.regions.size(),
+                        gpu.regions.size() == 1 ? "" : "s");
+    else
+        log_memory.info("GPU memory: not reported (no DRM file with usage stats in fdinfo)");
     if (auto installed = install_p0_protocols(p0_); !installed) {
         log_compositor.error(installed.get_error());
     }
@@ -3337,6 +3384,31 @@ namespace {
 
 const char* backend_name(bool gl, bool cpu, bool vulkan) {
     return gl ? "gl" : cpu ? "cpu" : vulkan ? "vulkan" : "headless";
+}
+
+lx::health::gpu_memory_status gpu_memory_for_health() {
+    const lx::drm::gpu_memory gpu = lx::drm::read_gpu_memory();
+    lx::health::gpu_memory_status out{};
+    out.driver.set(gpu.driver);
+    out.clients = gpu.clients;
+    for (const lx::drm::gpu_region& r : gpu.regions) {
+        if (out.regions.size() == out.regions.capacity())
+            break;
+        lx::health::gpu_region_status g{};
+        g.name.set(r.name);
+        g.total = r.total;
+        g.shared = r.shared;
+        g.resident = r.resident;
+        g.purgeable = r.purgeable;
+        g.active = r.active;
+        g.has_total = r.has_total;
+        g.has_shared = r.has_shared;
+        g.has_resident = r.has_resident;
+        g.has_purgeable = r.has_purgeable;
+        g.has_active = r.has_active;
+        out.regions.push_back(g);
+    }
+    return out;
 }
 
 const char* state_name(lx::toplevel_state s) {
@@ -3780,6 +3852,7 @@ void compositor_impl::answer_health(unsigned token, bool render_answered, unsign
     in.render_figures = render_answered;
     in.staging_bytes = shm_store_.bytes_held() + shm_pool_.bytes_mapped();
     in.staging_budget = memory_.config().staging_budget_bytes;
+    in.gpu = gpu_memory_for_health();
     in.last_tick_ui_us = budget_.last_tick_ui_us();
     in.last_tick_render_us = render_us;
     in.ui_over_budget = budget_.ui_over_total();
@@ -8856,6 +8929,9 @@ void compositor_impl::on_vsync(std::uint32_t forced, bool housekeeping) {
         const unsigned slot = static_cast<unsigned>(std::countr_zero(m));
         outs_[slot].aim_ns = clocks_.clock(slot).next_deadline(tick.timestamp_ns);
         outs_[slot].aim_frame = tick.frame_index;
+        if (outs_[slot].pipe)
+            outs_[slot].pipe->fence_deadline_ns.store(outs_[slot].aim_ns,
+                                                      std::memory_order_relaxed);
     }
     in_vsync_ = true;
     tick_quiet_mask_ = 0;
@@ -9091,6 +9167,12 @@ lx::result<void> compositor::start() {
                              "starts when the session is switched to");
             } else if (impl_->drm_present_) {
                 log_drm.info("KMS device open — page-flip present path");
+            }
+            if (impl_->drm_present_) {
+                log_drm.info("framebuffer hand-over at exit: {}",
+                             impl_->kms.supports_closefb()
+                                 ? "CLOSEFB (no black frame between masters)"
+                                 : "RMFB (kernel before 6.8: the display blanks first)");
             } else if (impl_->kms.card_fd() >= 0) {
                 log_drm.warn("card open without DRM master — scanout disabled (nested session)");
             }
@@ -9661,6 +9743,9 @@ lx::result<void> compositor::start() {
     impl_->start_threads();
 
     impl_->memory_.set_pressure_handler(&detail::compositor_impl::on_memory_pressure, impl_);
+    // UI affinity, like the handler. Without PSI (it logs why, once) pressure comes from
+    // Lumen's own pools alone.
+    (void)impl_->psi_.start(impl_->loop, impl_->memory_);
 
     // The pause/resume machine runs only where there is a display to lose. Starting while
     // the session is in the background pauses right away (input is held until the switch).
@@ -10514,6 +10599,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 // frame's — which is dropped rather than leaked.
                 p.discard_fence();
                 p.composited_fence = c.value().composite.out_fence_fd;
+                hint_composite_deadline(p);
                 publish_release_fence(p.composited_fence, idx);
                 if (c.value().composite.draws_skipped > 0) {
                     const auto blits = painter_.surfaces(snapshot);
@@ -10565,6 +10651,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 drawn = true;
                 p.discard_fence();
                 p.composited_fence = c.value().composite.out_fence_fd;
+                hint_composite_deadline(p);
                 publish_release_fence(p.composited_fence, idx);
                 if (c.value().composite.draws_skipped > 0) {
                     const auto blits = painter_.surfaces(snapshot);

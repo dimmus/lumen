@@ -58,6 +58,15 @@ samples (or waits on) a buffer the client's GPU is still writing:
    already signalled is the norm (always on vmwgfx) — else `DMA_BUF_IOCTL_EXPORT_SYNC_FILE`
    with `DMA_BUF_SYNC_READ` (a snapshot of the write fences) watched by the poller.
 
+Both carry a **deadline hint** (Linux 6.4) when the surface is shown: the start of the repaint
+that would latch the update on its pace output, so a driver that honours it (i915/xe, msm)
+clocks the client's GPU up in time to make that frame. Explicit sync sets it on the acquire
+query itself (`DRM_SYNCOBJ_WAIT_FLAGS_WAIT_DEADLINE`, no extra ioctl; a point not yet
+submitted has no fence to hint); implicit sync with `SYNC_IOC_SET_DEADLINE` on the exported
+sync_file — one ioctl, and only for a fence still pending. An older kernel refuses each once
+and is not asked again. See [rendering-performance.md](rendering-performance.md) §1.2
+"Fence deadline hints"; on vmwgfx the hint is accepted and changes nothing.
+
 `wl_buffer.release` is still sent in both cases, by the same rule: a dma-buf on screen is
 held until a newer commit replaces it (as in wlroots, Mutter and KWin). See
 [threading.md](threading.md) for the
@@ -168,10 +177,10 @@ so this side's implicit wait sees it.
 
 ## Related protocols
 
-- `linux-dmabuf-v1` (P0) — buffer submission
-- `linux-drm-syncobj-v1` (P0) — explicit sync
-- `wp_presentation` (P1) — frame timing feedback
-- `wp_viewporter`, `wp_fractional_scale_v1` (P1) — source crop, destination size, scale
+- `linux-dmabuf-v1` — buffer submission
+- `linux-drm-syncobj-v1` — explicit sync
+- `wp_presentation` — frame timing feedback
+- `wp_viewporter`, `wp_fractional_scale_v1` — source crop, destination size, scale
 
 ## Code stubs
 

@@ -1347,7 +1347,7 @@ first point; a deviation: no multi-touch).
 
 `lumen-hello` is rewritten on it: 640 × 480 logical, `org.lumen.hello`, "Hello Lumen", a panel
 with a headline, a text field, a filled button with a tooltip counting its clicks through a
-reducer, a checkbox and a switch (`executables/lumen-hello/hello_ui.hpp`, shared with the test);
+reducer, a checkbox and a switch (module `lumen.hello.ui`, `executables/lumen-hello/hello_ui.cppm`, shared with the test);
 `--backend cpu|gl|vulkan`, `--exit-after-first-present` (one grep-stable line: exec, connect,
 first configure, first commit, first presented, CLOCK_MONOTONIC µs; exec is `LUMEN_EXEC_NS` when
 a launcher sets it, else the application's construction), `--frames N` (whole-window repaints,

@@ -1,8 +1,6 @@
 option(LUMEN_BUILD_PORTAL "Build xdg-desktop-portal-lumen (needs libsystemd, wayland-client; libpng for files)" ON)
 option(LUMEN_ENABLE_TILING_PLUGIN "Build tiling WM plugin (dlopen)" ON)
 option(LUMEN_VULKAN_VALIDATION "Enable Vulkan validation layers" OFF)
-option(LUMEN_PROTOCOLS_P1 "Generate and enable P1 Wayland protocols" ON)
-option(LUMEN_PROTOCOLS_P2 "Generate and enable P2 Wayland protocols" OFF)
 option(LUMEN_BUILD_TESTS "Build unit / stress tests" ON)
 option(LUMEN_BUILD_XWAYLAND "Build optional rootless XWayland bridge module" OFF)
 option(LUMEN_BUILD_FUZZERS "Build libFuzzer targets (clang only)" OFF)

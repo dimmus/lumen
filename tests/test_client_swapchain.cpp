@@ -811,7 +811,8 @@ struct fake_timeline {
             *h = 1;
             return 0;
         };
-        o.query = [](void* u, unsigned h, unsigned long long point, bool* done) {
+        o.query = [](void* u, unsigned h, unsigned long long point, unsigned long long,
+                     bool* done) {
             *done = of(u)->objs[h].signalled >= point;
             return 0;
         };

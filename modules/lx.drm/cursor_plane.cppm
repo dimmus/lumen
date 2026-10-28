@@ -178,7 +178,9 @@ lx::drm::kms_cursor_plane& lx::drm::kms_cursor_plane::operator=(kms_cursor_plane
 void lx::drm::kms_cursor_plane::release() {
 #if defined(LUMEN_HAS_DRM)
     // Removing a framebuffer the plane still scans out makes the kernel disable the plane,
-    // so tearing down here also takes the pointer off the screen.
+    // so tearing down here also takes the pointer off the screen. RMFB, not the exit's
+    // CLOSEFB: a pointer frozen where it was would sit over the console or the next master's
+    // first frames, and turning a cursor plane off leaves its CRTC lit (no flash).
     for (auto& b : fbs_) {
         if (b.map && b.size)
             munmap(b.map, static_cast<size_t>(b.size));

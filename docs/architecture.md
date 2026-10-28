@@ -480,11 +480,13 @@ flowchart LR
 | `lx.gfx.cpu_renderer` | Software composite into a CPU-writable scanout buffer; chosen when no hardware renderer is available ([rendering-performance.md](subsystems/rendering-performance.md) §1.2) |
 | `lx.gfx.import_cache` | LRU reuse of VkImage imports; per-client entry cap |
 | `lx.gfx.swapchain` | A client window's pixel path (ADR-010 §4.10): the render node from the dma-buf feedback's main device, the tier in the compositor's `automatic` order and refusal rules (hardware Vulkan on the render node → hardware GLES 3.1 on GBM → wl_shm + `ui_cpu`), and a swapchain of three dma-buf images (two shm) with buffer age, non-blocking acquire, release by wl_buffer.release or linux-drm-syncobj release points, explicit sync per image (GL native fence → DRM syncobj; Vulkan timeline semaphore as a syncobj), reallocation once per size. API-type-free: lx.app maps the images onto wl_buffers through `lx.wayland.client`; `lx.gfx` never imports it. UI affinity in a client |
-| `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries, `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
+| `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries (with a deadline hint), `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
+| `lx.gfx.fence_deadline` | dma-fence deadline hints (`SYNC_IOC_SET_DEADLINE`, Linux 6.4) on composite and client sync_files; probed by use, off for good after ENOTTY |
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
 | `lx.runtime.memory` | Per-subsystem arenas, pressure coordinator, overflow policies |
+| `lx.runtime.psi` | Kernel memory pressure (PSI) triggers and decay; `psi_monitor` feeds them to the coordinator on the UI loop |
 | `lx.input` + `seat_manager` | libinput → pointer/keyboard events (ms wire time plus µs CLOCK_MONOTONIC time for latency) → `lx.compositor.wm` decides focus |
-| `lx.drm` + `lx.drm.atomic` | Connector probe (`connector_scan`, EDID identity via `:edid`; a worker may run it), CRTC/plane allocation (`:crtc_alloc`, pure, TEST_ONLY-checked), one `kms_pipeline` per CRTC (atomic page flips, KMS damage blobs, power-off), combined multi-output `commit_modeset` (TEST_ONLY of another mode, disabling a removed output, VRR_ENABLED), per-device flip-event routing, dumb scanout buffers, the udev hotplug monitor (`:uevent`), CVT custom modes (`:modes`) |
+| `lx.drm` + `lx.drm.atomic` | Connector probe (`connector_scan`, EDID identity via `:edid`; a worker may run it), CRTC/plane allocation (`:crtc_alloc`, pure, TEST_ONLY-checked), one `kms_pipeline` per CRTC (atomic page flips, KMS damage blobs, power-off), combined multi-output `commit_modeset` (TEST_ONLY of another mode, disabling a removed output, VRR_ENABLED), per-device flip-event routing, dumb scanout buffers, framebuffer hand-over at exit (CLOSEFB), the udev hotplug monitor (`:uevent`), CVT custom modes (`:modes`), GPU memory from DRM fdinfo for the health report (`:fdinfo`) |
 | `lx.scheduler.presentation` | Page-flip bridge: flip time, vblank sequence, the commit's frame tag |
 | `lx.compositor.presentation_feedback` | wp_presentation bookkeeping: sampled → flipped → presented / discarded |
 | `lx.compositor.idle` | ext-idle-notify notifications (lazy single timer, real input only) and idle-inhibitor objects, Wayland-free. UI affinity |
@@ -704,7 +706,7 @@ commit; doing that later is `xdg_wm_base.invalid_popup_parent` (the spec names n
 ### Selections: clipboard and primary
 
 `wl_data_device_manager` (v4; v3 without libwayland's `release`) and
-`zwp_primary_selection_device_manager_v1` (v1, a P1 protocol built only when its glue is
+`zwp_primary_selection_device_manager_v1` (v1, built only when its glue is
 generated) share one model in `wire_selection.cpp`; each family's unit only marshals. There
 is one selection per seat and family, owned by a source.
 
@@ -1353,6 +1355,22 @@ state machine, `:session_state` (`active → paused → resuming → active`, pl
   generation), the first commits after it are one combined modeset of every lit output, and
   the state machine gets one result: the worst over the outputs (one refused modeset is a
   refused resume).
+- **Exit (hand-over to the next master).** The scanout framebuffers are let go of with
+  `DRM_IOCTL_MODE_CLOSEFB` (Linux 6.8; `drm::fb_release::close`), not RMFB: RMFB of the
+  framebuffer a primary plane scans out turns its CRTC off, a black frame between Lumen and
+  whoever comes next; CLOSEFB leaves it on screen until the next commit. Each pipeline then
+  puts back, while it holds master, the console CRTC state it saved at its first modeset —
+  a direct switch from the last frame to the console. A previous master's framebuffer that
+  was itself closed is gone by then, so that restore fails and the frame stays for the next
+  master (a display manager's greeter) to take over without a flash. A CRTC the console had
+  nothing on is turned off, as RMFB left it: the kernel's fbdev does not restore the console
+  at the card's last close (measured on Linux 7.2, vmwgfx), so a frame left there would stay.
+  The cursor plane's framebuffers are still removed — a frozen pointer over the console or
+  the next master's first frames is wrong, and a cursor plane going off leaves its CRTC lit.
+  Runtime releases (a retired output, the old mode's targets after a switch, staged targets)
+  keep RMFB: those framebuffers are off screen or must leave it. Without CLOSEFB (EINVAL or
+  ENOTTY: an older kernel) the release falls back to RMFB, the old behaviour; which one the
+  kernel has is probed at open and logged once ("framebuffer hand-over at exit").
 
 ### Key bindings
 
@@ -2034,7 +2052,7 @@ is deferred indefinitely unless a concrete need appears.
 
 ```mermaid
 flowchart LR
-    CRED["SO_PEERCRED on connect"]
+    CRED["SO_PEERCRED + SO_PEERPIDFD on connect"]
     PATH["shell binary path check"]
     CHK["lx.session.privilege_checker"]
     ALLOW["allow_privileged_global()"]
@@ -2051,7 +2069,7 @@ dialogs, then xdg-desktop-portal-lumen or -wlr; § Portals); the capture globals
 from them (below).
 
 The binary check is real: `allow_privileged_global()` reads the peer's `/proc/<pid>/exe`
-(the pid `SO_PEERCRED` recorded; the connection keeps it alive) and
+(the pid `SO_PEERCRED` recorded at connect) and
 `privilege_checker::check_shell_bind` compares it with the configured shell binary
 (`lumen-compositor --shell PATH`; by default `lumen-shell` next to the compositor's own
 executable, resolved once with `realpath`). A mismatch is refused with the display's
@@ -2059,6 +2077,21 @@ executable, resolved once with `realpath`). A mismatch is refused with the displ
 bind `zlm_shell_v1` and replace the shell's bridge. KWin restricts its privileged
 interfaces the same way. It is not a defence against a same-UID process that can ptrace the
 shell. See [shell-state-sync.md](subsystems/shell-state-sync.md) § Privilege model.
+
+An open connection does not keep its peer alive — a child may hold it after the connecting
+process exits, and the pid can then be reused by any process, the shell binary included.
+So each client also keeps a pidfd for its peer (`SO_PEERPIDFD`, Linux 6.5, taken when the
+client is registered; it names the process the kernel recorded at connect however late it
+is asked, and is closed when the client goes). Every `/proc/<pid>` answer — the executable
+here, `.flatpak-info` below — is read through the pid and then confirmed: the pidfd must
+not poll readable, which it does once the peer's thread group has exited, zombie included,
+so the pid was never free in between. The checks fail closed while a pidfd is held: a
+zombie, or a peer whose leader thread has exited while others run, has already released its
+root and executable, so the unreadable `/proc/<pid>/exe` refuses the shell global and the
+unopenable `/proc/<pid>/root` (opened first, `.flatpak-info` then looked up inside it) counts
+as sandboxed — as does a peer that has exited. On a kernel without `SO_PEERPIDFD` (probed
+once at start and logged) the pid is taken alone, as before, and a failed sandbox lookup
+counts as not sandboxed.
 
 Window rules (`zlm_window_rules_v1`) load from `$XDG_CONFIG_HOME/lumen/window-rules.toml`.
 

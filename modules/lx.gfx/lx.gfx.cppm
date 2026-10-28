@@ -18,6 +18,7 @@ export import :primitives;
 export import :dmabuf;
 export import :syncobj;
 export import :drm_timeline;
+export import :fence_deadline;
 export import :semaphore_pool;
 export import :import_cache;
 export import :headless;

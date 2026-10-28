@@ -1,11 +1,14 @@
 flowchart TD
     COORD[memory_budget_coordinator.tick]
-    EVAL{pressure level?}
+    PSI[psi_monitor: PSI some/full trigger, avg10 decay]
+    EXT[on_external_pressure]
+    EVAL{"pressure level? max(pools, kernel)"}
     IC[import_cache.on_memory_pressure]
     BL[buffer_lifecycle.on_memory_pressure]
     SP[surface_pool.evict_on_pressure]
     DROP[drop frames / reduce quality flag]
 
     COORD --> EVAL
+    PSI --> EXT --> EVAL
     EVAL -->|moderate| IC
     EVAL -->|critical| IC --> BL --> SP --> DROP
