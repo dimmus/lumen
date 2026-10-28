@@ -204,7 +204,8 @@ A driver implementing drm-usage-stats (`Documentation/gpu/drm-usage-stats.rst`, 
 prints, in `/proc/<pid>/fdinfo/<fd>` of every open DRM file, `drm-driver`, `drm-client-id`
 and per memory region `drm-total-`, `drm-shared-`, `drm-resident-`, `drm-purgeable-`,
 `drm-active-<region>` (legacy: `drm-memory-<region>`, read as resident), in bytes, KiB or
-MiB. That covers every backend — Vulkan, GL, and the render-node fd Mesa opens itself —
+MiB. `drm-total-cycles-<engine>` (6.11+, xe) shares the memory prefix but is an engine
+counter, so it is skipped. That covers every backend — Vulkan, GL, and the render-node fd Mesa opens itself —
 which is why it lives in `lx.drm` (DRM uAPI read from `/proc`: no graphics API, no libdrm)
 rather than next to the Vulkan budget in `lx.gfx`.
 

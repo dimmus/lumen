@@ -95,6 +95,27 @@ LUMEN_TEST(fdinfo_skips_junk) {
     LUMEN_CHECK(sys && !sys->has_total && sys->has_resident && sys->resident == 2ull << 30);
 }
 
+LUMEN_TEST(fdinfo_xe_cycles_are_not_regions) {
+    // xe on 6.11+: engine cycle counters after the memory lines; drm-total-cycles- shares
+    // the memory prefix but is no region.
+    const fdinfo_client c = parse_fdinfo("drm-driver:\txe\n"
+                                         "drm-client-id:\t9\n"
+                                         "drm-total-system:\t4 KiB\n"
+                                         "drm-resident-system:\t4 KiB\n"
+                                         "drm-total-vram0:\t8 MiB\n"
+                                         "drm-cycles-rcs:\t3660000000\n"
+                                         "drm-total-cycles-rcs:\t3660000000\n"
+                                         "drm-cycles-bcs:\t0\n"
+                                         "drm-total-cycles-bcs:\t3660000000\n"
+                                         "drm-engine-capacity-ccs:\t4\n"
+                                         "drm-total-cycles-ccs:\t3660000000\n");
+    LUMEN_CHECK(c.regions.size() == 2);
+    LUMEN_CHECK(c.regions_dropped == 0);
+    LUMEN_CHECK(region(c.regions, "system") != nullptr);
+    LUMEN_CHECK(region(c.regions, "vram0") != nullptr);
+    LUMEN_CHECK(region(c.regions, "cycles-rcs") == nullptr);
+}
+
 LUMEN_TEST(fdinfo_not_drm) {
     // vmwgfx (no usage stats) and any other fd: no driver, nothing to add.
     const fdinfo_client c = parse_fdinfo("pos:\t0\nflags:\t02100002\nmnt_id:\t25\nino:\t223\n");

@@ -182,6 +182,10 @@ lx::drm::fdinfo_client lx::drm::parse_fdinfo(std::string_view text) {
             }
             continue;
         }
+        // drm-total-cycles-<engine> (6.11+, xe) is an engine counter that shares the
+        // memory prefix, not a region.
+        if (key.starts_with("drm-total-cycles-"))
+            continue;
         struct prefix {
             std::string_view text;
             int figure;
