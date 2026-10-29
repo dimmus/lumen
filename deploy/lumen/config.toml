@@ -81,6 +81,13 @@ master-ratio = 0.55     # the master column's share of the width, 0.1..0.9 (Supe
 master-count = 1        # windows in the master column, 0..16 (Super+I / Super+D)
 gaps = 8                # logical pixels around and between the tiles, 0..64
 
+[animations]            # window animations: open/close fade, minimize, workspace slide, and
+                        # maximize / snap / tile moves; every value rides a damped spring
+enabled = false         # off: windows change at once
+stiffness = 800         # spring stiffness, 50..5000: higher is faster (800 settles a
+                        # 1000 px move in about 0.4 s)
+damping-ratio = 1.0     # 0.3..2.0: 1 = no overshoot (critically damped), < 1 bounces
+
 [workspaces]            # per output; Super+1…9 switch, Super+Shift+1…9 move the window there
 mode = "dynamic"        # dynamic (one empty workspace always last, empty ones go) | static
 count = 4               # static only: workspaces per output, 1..16
@@ -103,6 +110,10 @@ lock-on-blank = true    # lock before blanking (with a lock-command)
 [background]            # lumen-shell
 spec = "lumen"          # lumen | #RRGGBB | gradient:#RRGGBB:#RRGGBB[:DEG] |
                         # image:PATH[:fill|fit|center|stretch|tile] | none
+
+[panel]                 # lumen-shell
+blur = false            # translucent over a blur of what is behind it (where the compositor
+                        # offers blur: GL ES 3 or Vulkan, not the CPU path)
 
 [notifications]         # lumen-shell's org.freedesktop.Notifications server
 position = "top-right"  # top-right | top-center | top-left | bottom-right | bottom-left

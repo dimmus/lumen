@@ -2642,6 +2642,7 @@ int usage() {
                  "       lumen-probe solid [--rgba R,G,B,A] [--alpha F] [--content-type T]\n"
                  "         [--size WxH] [--exit-after S]\n"
                  "       lumen-probe tearing [--exit-after S]\n"
+                 "       lumen-probe blur [--size WxH] [--region X,Y,W,H] [--exit-after S]\n"
                  "       lumen-probe dialog [--no-modal] | icon [--name N] [--sizes 16,32] |\n"
                  "         bell [--count N] [--null] | foreign-export [--v1] |\n"
                  "         foreign-import --handle H [--v1] [--modal] | shortcuts-inhibit |\n"
@@ -2684,7 +2685,7 @@ int main(int argc, char** argv) {
     // The commit-path protocols (fifo, commit-timing, single-pixel, alpha, content type,
     // tearing) have their own window and connection (lumen-probe-compat.cpp).
     if (argc >= 2 && (std::strcmp(argv[1], "timing") == 0 || std::strcmp(argv[1], "solid") == 0 ||
-                      std::strcmp(argv[1], "tearing") == 0))
+                      std::strcmp(argv[1], "tearing") == 0 || std::strcmp(argv[1], "blur") == 0))
         return compat_main(argc, argv);
     // The window and session protocols (dialog, icon, bell, xdg-foreign, shortcuts inhibit,
     // data control, security context): lumen-probe-window.cpp.

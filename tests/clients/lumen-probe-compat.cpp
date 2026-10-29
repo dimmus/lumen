@@ -20,6 +20,11 @@
 //   lumen-probe tearing [--exit-after S]
 //       A fullscreen single-pixel window with wp_tearing_control_v1 hint async. Prints
 //       `tearing mapped hint=async`.
+//   lumen-probe blur [--size WxH] [--region X,Y,W,H] [--exit-after S]
+//       ext-background-effect-v1: a window of 4 px black and white vertical stripes with a
+//       transparent subsurface over `--region` (default: the middle half) whose blur region
+//       is all of it — what shows there is the stripes blurred, everything else sharp.
+//       Prints `blur mapped caps=C size=WxH region=X,Y,W,H` (C: the manager's capabilities).
 
 #include <cerrno>
 #include <cmath>
@@ -48,6 +53,10 @@
 #include "tearing-control-v1-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #define PROBE_HAS_COMPAT 1
+#endif
+#if defined(PROBE_HAS_COMPAT) && defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#include "ext-background-effect-v1-client-protocol.h"
+#define PROBE_HAS_BLUR 1
 #endif
 
 int compat_main(int argc, char** argv);
@@ -78,6 +87,11 @@ struct globals {
     wp_content_type_manager_v1* content = nullptr;
     wp_tearing_control_manager_v1* tearing = nullptr;
     wp_viewporter* viewporter = nullptr;
+    wl_subcompositor* subcompositor = nullptr;
+#if defined(PROBE_HAS_BLUR)
+    ext_background_effect_manager_v1* effect = nullptr;
+    uint32_t effect_caps = 0;
+#endif
     uint32_t clock_id = ~0u;
 } g;
 
@@ -120,6 +134,17 @@ void on_global(void*, wl_registry* r, uint32_t name, const char* iface, uint32_t
             r, name, &wp_tearing_control_manager_v1_interface, 1);
     else if (!std::strcmp(iface, wp_viewporter_interface.name))
         g.viewporter = bind<wp_viewporter>(r, name, &wp_viewporter_interface, 1);
+    else if (!std::strcmp(iface, wl_subcompositor_interface.name))
+        g.subcompositor = bind<wl_subcompositor>(r, name, &wl_subcompositor_interface, 1);
+#if defined(PROBE_HAS_BLUR)
+    else if (!std::strcmp(iface, ext_background_effect_manager_v1_interface.name)) {
+        static const ext_background_effect_manager_v1_listener l = {
+            [](void*, ext_background_effect_manager_v1*, uint32_t caps) { g.effect_caps = caps; }};
+        g.effect = bind<ext_background_effect_manager_v1>(
+            r, name, &ext_background_effect_manager_v1_interface, 1);
+        ext_background_effect_manager_v1_add_listener(g.effect, &l, nullptr);
+    }
+#endif
 }
 
 const wl_registry_listener registry_listener = {on_global,
@@ -259,6 +284,7 @@ struct wp_presentation_feedback* request_feedback(feedback* f) {
 }
 
 struct options {
+    int region[4] = {-1, -1, -1, -1};
     int frames = 120;
     int timed = 20;
     double step_ms = 55.0;
@@ -466,6 +492,78 @@ int run_solid(const options& o, bool tearing_mode) {
     return 0;
 }
 
+#if defined(PROBE_HAS_BLUR)
+/// One shm buffer of `w` × `h` in `format`, filled by `px(x, y)`.
+template <typename Fn>
+wl_buffer* shm_image(int w, int h, uint32_t format, Fn px) {
+    const size_t stride = static_cast<size_t>(w) * 4u;
+    const size_t size = stride * static_cast<size_t>(h);
+    const int fd = memfd_create("lumen-probe-blur", MFD_CLOEXEC);
+    if (fd < 0 || ftruncate(fd, static_cast<off_t>(size)) != 0)
+        return nullptr;
+    void* mem = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (mem == MAP_FAILED) {
+        close(fd);
+        return nullptr;
+    }
+    auto* p = static_cast<uint32_t*>(mem);
+    for (int y = 0; y < h; ++y)
+        for (int x = 0; x < w; ++x)
+            p[static_cast<size_t>(y) * static_cast<size_t>(w) + static_cast<size_t>(x)] = px(x, y);
+    munmap(mem, size);
+    wl_shm_pool* pool = wl_shm_create_pool(g.shm, fd, static_cast<int>(size));
+    wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, w, h, static_cast<int>(stride), format);
+    wl_shm_pool_destroy(pool);
+    close(fd);
+    return b;
+}
+
+int run_blur(const options& o) {
+    if (!g.effect || !g.subcompositor) {
+        std::printf("blur missing globals\n");
+        return 1;
+    }
+    make_window("lumen-probe-blur", o.w, o.h, false);
+    const int w = g_win.width;
+    const int h = g_win.height;
+    int rx = o.region[0], ry = o.region[1], rw = o.region[2], rh = o.region[3];
+    if (rw <= 0 || rh <= 0) {
+        rx = w / 4;
+        ry = h / 4;
+        rw = w / 2;
+        rh = h / 2;
+    }
+    wl_surface* child = wl_compositor_create_surface(g.compositor);
+    wl_subsurface* sub = wl_subcompositor_get_subsurface(g.subcompositor, child, g_win.surface);
+    wl_subsurface_set_position(sub, rx, ry);
+    ext_background_effect_surface_v1* effect =
+        ext_background_effect_manager_v1_get_background_effect(g.effect, child);
+    wl_region* region = wl_compositor_create_region(g.compositor);
+    wl_region_add(region, 0, 0, rw, rh);
+    ext_background_effect_surface_v1_set_blur_region(effect, region);
+    wl_region_destroy(region);
+    wl_buffer* clear = shm_image(rw, rh, WL_SHM_FORMAT_ARGB8888, [](int, int) { return 0u; });
+    wl_surface_attach(child, clear, 0, 0);
+    wl_surface_damage_buffer(child, 0, 0, rw, rh);
+    wl_surface_commit(child); // synchronized: applied with the parent's commit
+    wl_buffer* stripes = shm_image(w, h, WL_SHM_FORMAT_XRGB8888, [](int x, int) {
+        return (x / 4) % 2 ? 0xFFFFFFFFu : 0xFF000000u;
+    });
+    wl_surface_attach(g_win.surface, stripes, 0, 0);
+    wl_surface_damage_buffer(g_win.surface, 0, 0, w, h);
+    wl_surface_commit(g_win.surface);
+    wl_display_roundtrip(g.display);
+    std::printf("blur mapped caps=%u size=%dx%d region=%d,%d,%d,%d\n", g.effect_caps, w, h, rx,
+                ry, rw, rh);
+    std::fflush(stdout);
+    const double end = now_s() + o.exit_after;
+    while (!g_stop && now_s() < end)
+        if (!pump(100))
+            break;
+    return 0;
+}
+#endif
+
 } // namespace
 
 int compat_main(int argc, char** argv) {
@@ -479,6 +577,10 @@ int compat_main(int argc, char** argv) {
         else if (!std::strcmp(a, "--step") && v) { o.step_ms = std::atof(v); ++i; }
         else if (!std::strcmp(a, "--size") && v && std::sscanf(v, "%dx%d", &o.w, &o.h) == 2) ++i;
         else if (!std::strcmp(a, "--exit-after") && v) { o.exit_after = std::atof(v); ++i; }
+        else if (!std::strcmp(a, "--region") && v &&
+                 std::sscanf(v, "%d,%d,%d,%d", &o.region[0], &o.region[1], &o.region[2],
+                             &o.region[3]) == 4)
+            ++i;
         else if (!std::strcmp(a, "--alpha") && v) { o.alpha = std::atof(v); ++i; }
         else if (!std::strcmp(a, "--rgba") && v &&
                  std::sscanf(v, "%u,%u,%u,%u", &o.rgba[0], &o.rgba[1], &o.rgba[2], &o.rgba[3]) == 4)
@@ -517,6 +619,10 @@ int compat_main(int argc, char** argv) {
         rc = run_solid(o, false);
     else if (!std::strcmp(mode, "tearing"))
         rc = run_solid(o, true);
+#if defined(PROBE_HAS_BLUR)
+    else if (!std::strcmp(mode, "blur"))
+        rc = run_blur(o);
+#endif
     if (wl_display_get_error(g.display))
         std::printf("protocol error %d\n", wl_display_get_error(g.display));
     wl_display_disconnect(g.display);

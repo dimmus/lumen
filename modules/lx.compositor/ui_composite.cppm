@@ -303,6 +303,13 @@ lx::compositor::frame_painter::surfaces(const scene::immutable_frame_snapshot& s
             b.visible[k] = cmd.visible[k];
         b.solid = cmd.solid;
         b.solid_color = cmd.solid_color;
+        if (cmd.color.active)
+            b.color = cmd.color;
+        if (cmd.blur) {
+            b.blur = true;
+            b.blur_source = cmd.blur_source;
+            b.blur_box = cmd.blur_box;
+        }
     }
     blit_count_ = n;
     return {out, n};

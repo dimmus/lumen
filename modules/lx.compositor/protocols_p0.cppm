@@ -550,6 +550,11 @@ struct p0_protocol_context {
     /// belong to the next snapshot); a dropped publish leaves it, since its damage — and so
     /// its visibility — carries forward. Every queued texture update is stamped with it.
     unsigned building_frame = 0;
+    /// UI affinity. Window animations are on: a texture retirement is queued at the next
+    /// tick rather than at once (`flush_deferred_retires`), so a closing window's ghost made
+    /// later in the same dispatch can still hold it (a null-buffer commit retires before
+    /// the window unmaps). Off: retirements are queued at once, as they always were.
+    bool defer_retire = false;
     /// Monotonic time of the current UI tick, for staging-pool idle tracking.
     unsigned long long now_ns = 0;
     /// UI affinity. Per output view (slot): the newest published frame, and the views that
@@ -670,6 +675,13 @@ struct p0_protocol_context {
     /// tearing-control-v1: whether async page flips can happen on some output at all (the
     /// hint is stored either way).
     bool async_flip_capable = false;
+    /// ext-background-effect-v1: the composite backend blurs (GL ES 3, Vulkan; not the CPU
+    /// path): the capability the global announces, and whether blur regions reach the scene.
+    bool background_blur = false;
+    /// wp_color_manager_v1: the composite backend draws colour-managed surfaces (Vulkan with
+    /// room for the push block, GL with fragment highp, the CPU path): parametric
+    /// descriptions are offered. Without it the global offers the outputs' description only.
+    bool color_management = false;
 
     // ── window and session protocols (design-app-compat-capture Part B) ──
     /// xdg-toplevel-icon-v1's icon store, owned by the compositor (null: the global is not
@@ -800,6 +812,10 @@ void release_wl_buffer_resource(void* wl_buffer_resource, void* user_data);
 /// signalled after the newest composite fence, or only dropped (its client is gone).
 void release_sync_point(unsigned timeline, unsigned long long point, bool signal,
                         void* user_data);
+
+/// Queues the texture retirements `p0_protocol_context::defer_retire` held back: the start
+/// of each tick, and when window animations are turned off. UI affinity.
+void flush_deferred_retires(p0_protocol_context& ctx);
 
 // ── content-update queue (wire_surface.cpp) ──
 /// The readiness poller's epoll fd (-1 before install): the compositor watches it as one

@@ -2282,6 +2282,7 @@ lx::result<lx::gfx::ui_vk_composite_stats> lx::gfx::ui_vk_renderer::composite(
         return ended.get_error();
     }
     out.composite.out_fence_fd = ended->out_fence_fd;
+    out.composite.gpu_serial = ended->gpu_serial;
     // This slot's instances, staging range and page descriptors are free once the compositor's
     // frame is: an empty submit signals the slot's fence after it.
     vkResetFences(dev, 1, &fence);

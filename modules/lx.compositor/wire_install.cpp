@@ -99,6 +99,12 @@ module;
 #if defined(LUMEN_PROTOCOL_ALPHA_MODIFIER_V1)
 #include "alpha-modifier-v1-server-protocol.h"
 #endif
+#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#include "ext-background-effect-v1-server-protocol.h"
+#endif
+#if defined(LUMEN_PROTOCOL_COLOR_MANAGEMENT_V1)
+#include "color-management-v1-server-protocol.h"
+#endif
 #if defined(LUMEN_PROTOCOL_LINUX_DRM_SYNCOBJ_V1)
 #include "linux-drm-syncobj-v1-server-protocol.h"
 #endif
@@ -196,6 +202,23 @@ void focus_surface_changed(void* user, void* surface, void* client, void* destro
 /// The router's pointer-focus hook: a constraint holds only on the pointer-focus surface.
 void pointer_focus_changed(void*) { pointer_constraints_reevaluate(); }
 
+/// A closing window's ghost holds (or lets go of) a texture of `surface`: its retirement and
+/// the release of the dma-buf behind it wait (`window_manager::make_ghost`).
+bool wire_hold_content(void* user, lx::surface_id surface, unsigned texture, bool hold) {
+    auto* ctx = static_cast<p0_protocol_context*>(user);
+    if (!hold) {
+        release_texture(texture);
+        if (ctx && ctx->lifecycle)
+            ctx->lifecycle->release_hold(surface);
+        return true;
+    }
+    if (!hold_texture(texture))
+        return false;
+    if (ctx && ctx->lifecycle)
+        ctx->lifecycle->hold(surface);
+    return true;
+}
+
 /// The window manager's hook before a toplevel record goes: what the wire keyed by it.
 void wire_toplevel_destroyed(void* user, lx::toplevel_id id) {
     auto* ctx = static_cast<p0_protocol_context*>(user);
@@ -287,6 +310,7 @@ void install_core(p0_protocol_context& ctx) {
         ctx.notify_lock_requested = &shell_send_lock_requested;
         ops.last_user_serial = &wm_last_user_serial;
         ops.toplevel_destroyed = &wire_toplevel_destroyed;
+        ops.hold_content = &wire_hold_content;
         ops.user = &ctx;
         ctx.wm->set_protocol_ops(ops);
     }
@@ -507,6 +531,23 @@ void install_core(p0_protocol_context& ctx) {
                             .privileged = false,
                             .interface_desc = &wp_alpha_modifier_v1_interface},
                            &bind_alpha_modifier);
+#endif
+#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+    // Blur regions; the capability is what the backend can do (none on the CPU path).
+    ctx.server->add_global({.interface_name = "ext_background_effect_manager_v1",
+                            .version = 1,
+                            .privileged = false,
+                            .interface_desc = &ext_background_effect_manager_v1_interface},
+                           &bind_background_effect_manager);
+#endif
+#if defined(LUMEN_PROTOCOL_COLOR_MANAGEMENT_V1)
+    // Colour management: always the outputs' description; parametric descriptions where the
+    // composite backend draws them (`color_management`, wire_color_management.cpp).
+    ctx.server->add_global({.interface_name = "wp_color_manager_v1",
+                            .version = 3,
+                            .privileged = false,
+                            .interface_desc = &wp_color_manager_v1_interface},
+                           &bind_color_manager);
 #endif
 #if defined(LUMEN_PROTOCOL_LINUX_DRM_SYNCOBJ_V1)
     // Explicit sync: only where a client can use it correctly (timeline syncobjs, the
@@ -820,6 +861,13 @@ void lx::compositor::content_updates_poll(p0_protocol_context& ctx) {
     (void)ctx;
 #if defined(LUMEN_HAS_WAYLAND)
     p0::cu_poll();
+#endif
+}
+
+void lx::compositor::flush_deferred_retires(p0_protocol_context& ctx) {
+    (void)ctx;
+#if defined(LUMEN_HAS_WAYLAND)
+    p0::flush_deferred_retires();
 #endif
 }
 

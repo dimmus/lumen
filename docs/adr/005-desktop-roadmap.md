@@ -400,9 +400,11 @@ ADR-004 made these implementable; they are now mostly protocol code.
 9. [x] **viewporter + wp-fractional-scale-v1** — D1 delivered `src`/`dst`, so this is
    negotiation plus plumbing. Done in ADR-007 Part 1, with fractional output scale.
 10. [ ] **color-management-v1** — D2 delivered linear blending, PQ/HLG and 10-bit output. This
-    is the differentiator: almost nothing ships working HDR on Linux. Not started: the
-    compositor tracks an image description per surface and output internally
-    (`:protocol_managers`), but the protocol is not served.
+    is the differentiator: almost nothing ships working HDR on Linux. Served (version 3):
+    parametric descriptions — PQ, gamma 2.2, power curves, extended linear, sRGB; ten named
+    primaries and custom ones; luminances and mastering metadata — drawn by all three backends
+    into SDR outputs, HDR content tone mapped (rendering-performance.md "Colour management").
+    Open: HDR output (item 18), ICC, Windows-scRGB (needs float client buffers).
 11. [x] **presentation-time, wp-fifo, wp-commit-timing** — D3 delivered the deadline model.
     wp_presentation in ADR-007 Part 2; fifo-v1 and commit-timing-v1 (with
     linux-drm-syncobj-v1 and the rest of the commit path) in ADR-009 Part 1.

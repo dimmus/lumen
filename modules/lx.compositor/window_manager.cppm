@@ -28,6 +28,7 @@ import :liveness;
 import :activation;
 import :workspaces;
 import :tiling;
+import :window_animation;
 
 namespace {
 
@@ -132,6 +133,11 @@ struct wm_protocol_ops {
     /// The record of `id` is about to go (any of its three objects was destroyed): what the
     /// wire keyed by it lets go — its icon references, its xdg-foreign exports.
     void (*toplevel_destroyed)(void* user, lx::toplevel_id id) = nullptr;
+    /// A closing window's ghost (window animations) draws `texture` of `surface` after the
+    /// surface's content is gone (`hold`), until it no longer does (`!hold`): the texture's
+    /// retirement and the release of the dma-buf it samples wait for that. False when the
+    /// hold cannot be taken (the window then closes without its animation).
+    bool (*hold_content)(void* user, lx::surface_id surface, unsigned texture, bool hold) = nullptr;
     void* user = nullptr;
 };
 
@@ -517,6 +523,15 @@ public:
     /// Sends every desired configure the single-in-flight rule allows.
     void flush_configures(lx::runtime::clock_time now_ns);
 
+    // ── Window animations (config.toml [animations], `:window_animation`) ──
+
+    /// Off (the default): every motion ends at once and nothing animates.
+    void set_animation_config(const animation_config& c);
+    [[nodiscard]] const window_animator& animations() const { return anim_; }
+    /// Once per tick, after `on_tick` and before the scene is published: the motions at
+    /// `now_ns`, the frame's predicted presentation. Nothing to do costs one test.
+    void tick_animations(lx::runtime::clock_time now_ns) { anim_.tick(now_ns); }
+
     /// The window manager's toplevel focus decision (activation, the shell's focus_changed).
     /// The surface that actually receives keys follows from `resolve_keyboard_focus`.
     void set_keyboard_focus(lx::toplevel_id id);
@@ -830,6 +845,22 @@ private:
     void leave_tiling(toplevel_record& rec);
     /// The workspace the layout actions act on: the focused output's active one.
     [[nodiscard]] lx::workspace_id focused_workspace() const;
+    // ── window animations ──
+    /// What `rec`'s motions are measured against: its frame, and everything it draws.
+    [[nodiscard]] window_rest rest_of(const toplevel_record& rec) const;
+    /// A copy of what the mapped window `rec` draws (its frame, its surfaces), at the place
+    /// of its tree container in the window layer, its content held (`hold_content`); null
+    /// when it cannot be made. For its close animation.
+    [[nodiscard]] scene::container_node* make_ghost(const toplevel_record& rec);
+    /// The animator is done with a ghost: out of the layer, holds released, freed.
+    void free_ghost(scene::container_node* box);
+    /// The animator's largest output scale (its settle threshold is half a pixel there).
+    void sync_animation_scale();
+    /// A visibility change `apply_hidden` makes: animated when it is the workspace switch or
+    /// the minimize under way (the box stays visible until a hide motion ends). False: the
+    /// caller sets the box's visibility at once.
+    [[nodiscard]] bool animate_visibility(toplevel_record& rec, scene::container_node& box,
+                                          bool hide);
 
     toplevel_manager* toplevels_ = nullptr;
     surface_manager* surfaces_ = nullptr;
@@ -858,6 +889,25 @@ private:
     /// Buttons whose press never reached a client (the Super binding, presses during a
     /// grab): their release must not reach one either.
     std::uint64_t swallowed_mask_ = 0;
+    // ── window animations ──
+    /// A closing window's ghost: its own anchor container with copies of the frame and the
+    /// surface nodes the window drew (the copies sample the held textures), and the title the
+    /// frame copy draws.
+    struct window_ghost {
+        scene::container_node box{};
+        frame_node frame{};
+        title_text title{};
+        std::vector<std::unique_ptr<scene::surface_node>> nodes{};
+    };
+    window_animator anim_{};
+    std::unique_ptr<window_ghost> ghosts_[window_animator::k_max]{};
+    /// `update_visibility` is running for a workspace switch on output `anim_switch_slot_`
+    /// (-1: none); windows there slide `anim_switch_dx_` logical px (its sign the direction
+    /// the new workspace comes from).
+    int anim_switch_slot_ = -1;
+    double anim_switch_dx_ = 0.0;
+    /// `update_visibility` is running for the minimize (or unminimize) of this window.
+    lx::toplevel_id anim_minimize_{};
     /// Escape pressed to cancel a grab: its release is withheld too.
     bool swallowed_escape_ = false;
     /// `suspend_reason` bits held: while any is, windows carry `tl_suspended`.
@@ -1594,6 +1644,20 @@ void lx::compositor::window_manager::bind(toplevel_manager& toplevels, surface_m
     seat_ = &seat;
     shell_ = &shell;
     outputs_ = &outputs;
+    anim_.bind(
+        scene,
+        [](void* user, lx::toplevel_id id, window_rest& out) {
+            auto* wm = static_cast<window_manager*>(user);
+            const toplevel_record* rec = wm->toplevels_ ? wm->toplevels_->find(id) : nullptr;
+            if (!rec || !rec->mapped)
+                return false;
+            out = wm->rest_of(*rec);
+            return true;
+        },
+        [](void* user, lx::toplevel_id, scene::container_node* ghost) {
+            static_cast<window_manager*>(user)->free_ghost(ghost);
+        },
+        this);
 }
 
 void lx::compositor::window_manager::set_popups(popup_manager* popups) {
@@ -1757,6 +1821,9 @@ void lx::compositor::window_manager::sync_fullscreen(toplevel_record& rec, bool 
     const bool full = rec.state == lx::toplevel_state::fullscreen;
     if (full == was_fullscreen || !fullscreen_layer_ || !tree_ || !windows_layer_)
         return;
+    // Fullscreen is not animated: a motion of it ends at its rest.
+    if (anim_.active())
+        anim_.stop(rec.id);
     if (full) {
         // Above the top layer-shell layer (a panel) and every window, under the overlay
         // layer and popups (sway).
@@ -1946,6 +2013,8 @@ void lx::compositor::window_manager::on_output_changed() {
     // An output that went without `evacuate_output` (a path that never had windows to
     // move) takes its workspaces with it; outputs that came get theirs in on_output_added.
     sync_workspace_outputs(false);
+    if (anim_.enabled())
+        sync_animation_scale();
     tiling_dirty_ = true;
     if (layers_)
         layers_->arrange(); // reports each changed usable area through the host
@@ -2670,6 +2739,8 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
         return;
 
     const lx::rect2i previous = rec->geometry;
+    // The frame before this commit: what a placement animates from.
+    const lx::rect2i previous_frame = frame_rect(rec->geometry, extents_of(*rec));
     if (info.has_buffer)
         rec->surface_size = info.surface_size;
     // Clamped to the whole tree, not the root buffer: a CSD title bar drawn as a subsurface
@@ -2785,6 +2856,16 @@ void lx::compositor::window_manager::on_toplevel_commit(lx::toplevel_id id,
         sync_backdrops();
     sync_decoration(*rec);
     log_apply(*rec);
+    // Window animations: a placement the window manager made (maximize, restore, snap, a
+    // tile) moves there visually from where it was shown. Never under a grab (the pointer
+    // drives it: drag-to-restore), never fullscreen.
+    if (placed && anim_.enabled() && !fullscreen_changed && !rec->hidden &&
+        rec->state != lx::toplevel_state::fullscreen &&
+        !(grab_.mode != grab_mode::none && grab_.toplevel == id)) {
+        const window_rest rest = rest_of(*rec);
+        if (!rect_equal(previous_frame, rest.frame))
+            (void)anim_.geometry(id, tree_->container(rec->surface), previous_frame, rest);
+    }
     if (state_changed && shell_)
         shell_->emit_toplevel_state(*rec);
     if (!rect_equal(previous, rec->geometry)) {
@@ -2910,6 +2991,15 @@ void lx::compositor::window_manager::map(toplevel_record& rec, bool placed) {
         keep_modals_above(now->parent);
     if (const lx::toplevel_id b = modal_blocker(keyboard_focus_); b)
         set_keyboard_focus(b);
+    // Window animations: it fades in (one that maps hidden, or fullscreen, does not). A ghost
+    // of its last unmap goes either way: its holds are per surface, and the content this map
+    // shows may release the buffer the ghost still samples.
+    if (anim_.enabled()) {
+        anim_.end_ghost(id);
+        if (const toplevel_record* now = toplevels_->find(id);
+            now && now->mapped && !now->hidden && now->state != lx::toplevel_state::fullscreen)
+            (void)anim_.open(id, tree_->container(now->surface), rest_of(*now));
+    }
     rehit_pending_ = true;
     stacking_dirty_ = true;
     flush_workspaces();
@@ -2935,6 +3025,23 @@ void lx::compositor::window_manager::on_unmap(lx::toplevel_id id, const char* re
     // Its popups go first (popup_done, top-down): none may stay on screen without it.
     if (popups_)
         popups_->on_parent_unmapped(rec->surface, "parent-unmapped");
+    // Window animations: what it drew fades out as a ghost, taking over any motion it had;
+    // without one its motion ends with it.
+    if (anim_.enabled() && rec->state != lx::toplevel_state::fullscreen) {
+        const window_rest rest = rest_of(*rec);
+        // An older ghost (it remapped unanimated, hidden or fullscreen) lets go of its holds
+        // first: they are per surface, and the new ghost takes its own.
+        anim_.end_ghost(id);
+        scene::container_node* ghost = make_ghost(*rec);
+        if (ghost && !anim_.close(id, ghost, rest)) {
+            free_ghost(ghost);
+            ghost = nullptr;
+        }
+        if (!ghost)
+            anim_.stop(id);
+    } else if (anim_.active()) {
+        anim_.stop(id);
+    }
     // Every node of the window goes (each damaged); the unmap hook moves pointer focus off
     // any of them that had it.
     tree_->unmap_root(rec->surface);
@@ -3087,6 +3194,9 @@ void lx::compositor::window_manager::on_tick(lx::runtime::clock_time now_ns) {
 }
 
 bool lx::compositor::window_manager::needs_tick() const {
+    // A window animates: frames run until it settles, and stop then.
+    if (anim_.active())
+        return true;
     if (rehit_pending_ || stacking_dirty_ || tiling_dirty_ ||
         (grab_.mode != grab_mode::none && grab_.motion_pending))
         return true;
@@ -4115,6 +4225,9 @@ bool lx::compositor::window_manager::begin_grab(lx::toplevel_id id, grab_mode mo
     // A move or resize ends any popup grab: menus do not travel with an interactive grab.
     if (popups_ && popups_->grab_active())
         popups_->dismiss_all("wm-grab");
+    // The pointer drives the window from here: an animation of it ends where it was going.
+    if (anim_.active())
+        anim_.stop(id);
     // A resize of a tiled window floats it where it is (dwm's Mod+right-drag, ADR 012 T6);
     // the others close the gap once the grab has begun.
     const bool floated = mode == grab_mode::resize && rec->tiled;
@@ -4454,6 +4567,24 @@ void lx::compositor::window_manager::sync_node_stacking(const toplevel_record& r
             if (i++ < at && !(other.state == lx::toplevel_state::fullscreen && fullscreen_layer_))
                 ++below;
         });
+        // Closing windows' ghosts stay where they were among the windows: past `below`
+        // windows, counting no ghost.
+        if (anim_.active()) {
+            unsigned index = 0;
+            unsigned seen = 0;
+            for (unsigned k = 0; k < windows_layer_->child_count(); ++k) {
+                const scene::scene_node* n = windows_layer_->child_at(k);
+                if (n == box)
+                    continue;
+                if (!anim_.is_ghost(n)) {
+                    if (seen == below)
+                        break;
+                    ++seen;
+                }
+                ++index;
+            }
+            below = index;
+        }
         (void)windows_layer_->move_to(box, below);
     }
     // Everything that changed lies inside the restacked window's node rects: it now covers,
@@ -4879,7 +5010,9 @@ void lx::compositor::window_manager::apply_hidden(toplevel_record& rec, bool hid
     ws_windows_changed_ = true;
     ws_configures_due_ = true;
     if (tree_) {
-        if (auto* box = tree_->container(rec.surface))
+        // A workspace switch or a minimize animates: a hidden box stays visible until its
+        // motion ends.
+        if (auto* box = tree_->container(rec.surface); box && !animate_visibility(rec, *box, hide))
             box->set_visible(!hide);
         // Its rects repaint: uncovered (what is under it shows) or covered again. A hidden
         // window's commits damage capture views only (surface_manager), so nothing of it
@@ -4959,6 +5092,8 @@ bool lx::compositor::window_manager::reveal(toplevel_record& rec, bool switch_ok
                                             const char* source) {
     if (!rec.mapped)
         return false;
+    // An unminimize animates (window animations).
+    const bool unminimized = rec.minimized;
     if (rec.minimized) {
         rec.minimized = false;
         ws_windows_changed_ = true;
@@ -4972,7 +5107,10 @@ bool lx::compositor::window_manager::reveal(toplevel_record& rec, bool switch_ok
         }
         (void)switch_workspace(rec.workspace, source);
     }
+    if (unminimized)
+        anim_minimize_ = rec.id;
     update_visibility();
+    anim_minimize_ = {};
     return !rec.hidden;
 }
 
@@ -5031,11 +5169,35 @@ bool lx::compositor::window_manager::switch_workspace(lx::workspace_id ws, const
     const int slot = w->output;
     char name[k_workspace_name_bytes];
     std::snprintf(name, sizeof(name), "%s", w->name);
+    // Window animations: the new workspace comes in from the side it lies on (a later one
+    // from the right), the old one goes out the other way. Read before `activate`, which may
+    // drop the old one (dynamic: empty).
+    double slide = 0.0;
+    if (anim_.enabled()) {
+        const workspace_group& grp = workspaces_.group(static_cast<unsigned>(slot));
+        const lx::workspace_id was = workspaces_.active(static_cast<unsigned>(slot));
+        int from = -1;
+        int to = -1;
+        for (unsigned k = 0; k < grp.count; ++k) {
+            if (grp.order[k] == was)
+                from = static_cast<int>(k);
+            if (grp.order[k] == ws)
+                to = static_cast<int>(k);
+        }
+        if (from >= 0 && to >= 0 && from != to)
+            slide = static_cast<double>(output_area(slot).width) * (to > from ? 1.0 : -1.0);
+    }
     if (!workspaces_.activate(ws)) {
         flush_workspaces();
         return false;
     }
+    if (slide != 0.0) {
+        anim_switch_slot_ = slot;
+        anim_switch_dx_ = slide;
+    }
     update_visibility();
+    anim_switch_slot_ = -1;
+    anim_switch_dx_ = 0.0;
     focus_after_switch(slot);
     {
         const char* out = outputs_ && outputs_->slot_live(static_cast<unsigned>(slot))
@@ -5187,7 +5349,9 @@ void lx::compositor::window_manager::set_minimized(lx::toplevel_id id, bool on,
     }
     if (shell_)
         shell_->emit_toplevel_state(*rec);
+    anim_minimize_ = id;
     update_visibility();
+    anim_minimize_ = {};
     flush_workspaces();
 }
 
@@ -5698,8 +5862,14 @@ void lx::compositor::window_manager::aim_tile(toplevel_record& rec, lx::rect2i f
             rec.desired.place_at = {g.x, g.y};
             return;
         }
-        if (rec.mapped && !inflight_here && (rec.geometry.x != g.x || rec.geometry.y != g.y))
+        if (rec.mapped && !inflight_here && (rec.geometry.x != g.x || rec.geometry.y != g.y)) {
+            const lx::rect2i was = frame_rect(rec.geometry, extents_of(rec));
             move_window(rec, {g.x, g.y}, "tile");
+            // Window animations: the tile moves there visually.
+            if (anim_.enabled() && !rec.hidden &&
+                !(grab_.mode != grab_mode::none && grab_.toplevel == rec.id))
+                (void)anim_.geometry(rec.id, tree_->container(rec.surface), was, rest_of(rec));
+        }
         return;
     }
     rec.desired.states |= tl_tiled_all;
@@ -5923,5 +6093,197 @@ bool lx::compositor::window_manager::adjust_master(double ratio_delta, int count
     }
     tiling_dirty_ = true;
     flush_workspaces();
+    return true;
+}
+
+// ── Window animations ──────────────────────────────────────────────────────
+
+void lx::compositor::window_manager::set_animation_config(const animation_config& c) {
+    // Turned off: every motion ends now (a ghost is handed back to `free_ghost`).
+    anim_.set_config(c);
+    sync_animation_scale();
+}
+
+void lx::compositor::window_manager::sync_animation_scale() {
+    double scale = 1.0;
+    if (outputs_)
+        for (unsigned s = 0; s < output_manager::k_max; ++s)
+            if (outputs_->slot_live(s) && outputs_->slot_state(s).scale > scale)
+                scale = outputs_->slot_state(s).scale;
+    anim_.set_pixel_scale(scale);
+}
+
+lx::compositor::window_rest
+lx::compositor::window_manager::rest_of(const toplevel_record& rec) const {
+    window_rest r{};
+    r.frame = frame_rect(rec.geometry, extents_of(rec));
+    r.bounds = r.frame;
+    if (!tree_)
+        return r;
+    // Everything the tree draws (a CSD shadow reaches past the window geometry).
+    const lx::rect2i t = tree_->subtree_bbox(rec.surface);
+    if (t.width <= 0 || t.height <= 0)
+        return r;
+    const lx::point2i o = tree_->root_origin(rec.surface);
+    const int x0 = std::min(r.bounds.x, o.x + t.x);
+    const int y0 = std::min(r.bounds.y, o.y + t.y);
+    const int x1 = std::max(r.bounds.x + r.bounds.width, o.x + t.x + t.width);
+    const int y1 = std::max(r.bounds.y + r.bounds.height, o.y + t.y + t.height);
+    r.bounds = {x0, y0, x1 - x0, y1 - y0};
+    return r;
+}
+
+lx::scene::container_node*
+lx::compositor::window_manager::make_ghost(const toplevel_record& rec) {
+    if (!tree_ || !surfaces_ || !windows_layer_ || !ops_.hold_content)
+        return nullptr;
+    scene::container_node* box = tree_->container(rec.surface);
+    if (!box || !box->is_visible())
+        return nullptr;
+    // Its place in the window layer (a fullscreen window's tree is not there: no ghost).
+    unsigned at = ~0u;
+    for (unsigned i = 0; i < windows_layer_->child_count(); ++i)
+        if (windows_layer_->child_at(i) == box) {
+            at = i;
+            break;
+        }
+    unsigned slot = window_animator::k_max;
+    for (unsigned i = 0; i < window_animator::k_max; ++i)
+        if (!ghosts_[i]) {
+            slot = i;
+            break;
+        }
+    if (at == ~0u || slot == window_animator::k_max)
+        return nullptr;
+    // The tree's surface nodes (the frame reports `surface` too, so it is told apart by
+    // pointer).
+    const scene::scene_node* known[k_tree_max_surfaces];
+    unsigned known_count = 0;
+    tree_->for_each_preorder(rec.surface, [&](lx::surface_id s) {
+        if (known_count < k_tree_max_surfaces)
+            if (const scene::surface_node* n = surfaces_->node(s))
+                known[known_count++] = n;
+        return true;
+    });
+    const auto is_surface = [&](const scene::scene_node* n) {
+        for (unsigned k = 0; k < known_count; ++k)
+            if (known[k] == n)
+                return true;
+        return false;
+    };
+    const frame_node* frame = decorations_ ? decorations_->node(rec.id) : nullptr;
+
+    auto g = std::make_unique<window_ghost>();
+    g->box.set_anchor(true);
+    g->box.set_transform(box->origin(), box->scale(), box->opacity());
+    g->nodes.reserve(box->child_count());
+    const auto release = [&] {
+        for (const auto& n : g->nodes)
+            if (n->texture())
+                (void)ops_.hold_content(ops_.user, n->surface(),
+                                        static_cast<unsigned>(n->texture().id()), false);
+    };
+    for (unsigned i = 0; i < box->child_count(); ++i) {
+        const scene::scene_node* n = box->child_at(i);
+        if (frame && n == frame) {
+            frame_node& f = g->frame;
+            f.set_transform(frame->origin(), frame->scale(), frame->opacity());
+            f.set_tint(frame->tint());
+            f.set_visible(frame->is_visible());
+            f.geometry = frame->geometry;
+            f.extents = frame->extents;
+            f.shown = frame->shown;
+            f.active = frame->active;
+            f.button = deco_button::normal;
+            f.text = frame->text;
+            f.dimmed = frame->dimmed;
+            f.atlas_ready = frame->atlas_ready;
+            if (frame->title) {
+                g->title = *frame->title;
+                f.title = &g->title;
+            }
+            if (!g->box.add(&g->frame)) {
+                release();
+                return nullptr;
+            }
+            continue;
+        }
+        if (!is_surface(n))
+            continue;
+        const auto* src = static_cast<const scene::surface_node*>(n);
+        const unsigned tex = static_cast<unsigned>(src->texture().id());
+        if (tex != 0 && !ops_.hold_content(ops_.user, src->surface(), tex, true)) {
+            release();
+            return nullptr;
+        }
+        auto copy = std::make_unique<scene::surface_node>(src->surface());
+        copy->attach(src->image());
+        copy->set_solid(src->solid(), src->solid_color());
+        copy->set_opaque(src->opaque());
+        copy->set_blur_region(src->blur_region());
+        copy->set_color(src->color());
+        copy->set_bounds(src->bounds());
+        copy->set_content(src->source(), src->buffer_transform());
+        copy->set_transform(src->origin(), src->scale(), src->opacity());
+        copy->set_tint(src->tint());
+        copy->set_visible(src->is_visible());
+        scene::surface_node* raw = copy.get();
+        g->nodes.push_back(std::move(copy));
+        if (!g->box.add(raw)) {
+            release();
+            return nullptr;
+        }
+    }
+    // Where the window was: above what was under it, below what was over it (the window's
+    // own container goes right after).
+    if (!windows_layer_->add(&g->box)) {
+        release();
+        return nullptr;
+    }
+    (void)windows_layer_->move_to(&g->box, at);
+    ghosts_[slot] = std::move(g);
+    return &ghosts_[slot]->box;
+}
+
+void lx::compositor::window_manager::free_ghost(scene::container_node* box) {
+    for (auto& g : ghosts_) {
+        if (!g || &g->box != box)
+            continue;
+        if (windows_layer_)
+            (void)windows_layer_->remove(&g->box);
+        for (const auto& n : g->nodes)
+            if (n->texture() && ops_.hold_content)
+                (void)ops_.hold_content(ops_.user, n->surface(),
+                                        static_cast<unsigned>(n->texture().id()), false);
+        g.reset();
+        return;
+    }
+}
+
+bool lx::compositor::window_manager::animate_visibility(toplevel_record& rec,
+                                                        scene::container_node& box, bool hide) {
+    if (!anim_.enabled())
+        return false;
+    window_motion how = window_motion::open;
+    int view = -1;
+    double distance = 0.0;
+    // A fullscreen window's tree is in the fullscreen layer, over its backdrop: not animated.
+    const bool animatable = rec.state != lx::toplevel_state::fullscreen;
+    if (animatable && anim_minimize_ && anim_minimize_ == rec.id) {
+        how = hide ? window_motion::minimize : window_motion::restore;
+    } else if (animatable && anim_switch_slot_ >= 0 && !rec.sticky &&
+               window_output(rec) == anim_switch_slot_) {
+        how = hide ? window_motion::slide_out : window_motion::slide_in;
+        view = anim_switch_slot_;
+        distance = hide ? -anim_switch_dx_ : anim_switch_dx_;
+    } else {
+        anim_.stop(rec.id);
+        return false;
+    }
+    const window_rest r = rest_of(rec);
+    if (hide)
+        return anim_.hide(rec.id, &box, r, how, view, distance);
+    box.set_visible(true);
+    (void)anim_.show(rec.id, &box, r, how, view, distance);
     return true;
 }

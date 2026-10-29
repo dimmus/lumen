@@ -25,7 +25,8 @@ Third-party clients and toolkits expect standard protocols.
   (`wire_install.cpp`, one `wire_*.cpp` per protocol area: xdg-decoration, wlr-layer-shell,
   xdg-output, cursor-shape, xdg-activation, viewporter, fractional-scale, presentation-time,
   idle-notify, idle-inhibit, output-power, session-lock, text-input, input-method,
-  virtual-keyboard, …), each served in
+  virtual-keyboard, ext-background-effect (`wire_background_effect.cpp`), color-management
+  (`wire_color_management.cpp`), …), each served in
   full; `protocol_managers` keeps only unadvertised placeholder state for protocols not yet
   implemented, and loses each entry when its protocol lands.
 - Docs and manifest list standards as the public surface; private XML is gated by session UID.

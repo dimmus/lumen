@@ -8,6 +8,7 @@ import std;
 
 import :renderer;
 import :damage;
+import :color;
 
 export namespace lx::gfx {
 
@@ -440,6 +441,63 @@ struct srgb_tables {
     return (a << 24) | (c2 << 16) | (g << 8) | c0;
 }
 
+/// One premultiplied word (destination channel order, `rgba`: red in the low byte) through a
+/// draw's colour transform (wp_color_manager_v1): unpremultiplied, decoded (`lut[v]` is
+/// E(v / 255), exact for an opaque texel; a translucent one decodes its straight value
+/// itself), into the working space and tone mapped (`apply_color_transform`'s maths),
+/// clamped to the output's range, sRGB-encoded through the blend tables and premultiplied
+/// again. Alpha is coverage and passes through. Out of line: inlined into `run_band`'s
+/// per-pixel `finish`, it slowed every draw without a transform (channel swap 1 thread
+/// 4.6 -> 5.7 ms at 1080p).
+[[nodiscard, gnu::noinline]] inline std::uint32_t color_convert(std::uint32_t pixel, const color_transform& t,
+                                                 const float* lut, bool rgba) {
+    const unsigned a = pixel >> 24;
+    if (a == 0)
+        return pixel;
+    const unsigned r_shift = rgba ? 0u : 16u;
+    const unsigned b_shift = rgba ? 16u : 0u;
+    const unsigned c[3] = {(pixel >> r_shift) & 0xFFu, (pixel >> 8) & 0xFFu,
+                           (pixel >> b_shift) & 0xFFu};
+    float e[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        if (a == 255u) {
+            e[i] = lut[c[i]];
+        } else {
+            const float v = static_cast<float>(c[i] < a ? c[i] : a) / static_cast<float>(a);
+            e[i] = decode_channel(v, t.tf, t.power);
+        }
+    }
+    float lin[3];
+    for (unsigned r = 0; r < 3; ++r)
+        lin[r] = t.matrix[r * 3] * e[0] + t.matrix[r * 3 + 1] * e[1] + t.matrix[r * 3 + 2] * e[2];
+    if (t.peak > 1.f) {
+        const float k = tone_map_scale(std::max(lin[0], std::max(lin[1], lin[2])), t.peak);
+        for (float& v : lin)
+            v *= k;
+    }
+    const srgb_tables& tab = tables();
+    unsigned out[3];
+    for (unsigned i = 0; i < 3; ++i) {
+        const float v = lin[i] < 0.f ? 0.f : (lin[i] > 1.f ? 1.f : lin[i]);
+        const unsigned enc = tab.to_srgb[static_cast<unsigned>(v * static_cast<float>(k_linear_max) + 0.5f)];
+        out[i] = (enc * a + 127u) / 255u;
+    }
+    return (a << 24) | (out[0] << r_shift) | (out[1] << 8) | (out[2] << b_shift);
+}
+
+/// A colour-managed solid draw's colour (premultiplied, encoded, as `solid_color`) through
+/// its transform: what `fill_solid` then fills with, the transform done once per draw.
+[[nodiscard]] inline lx::color color_convert_solid(lx::color c, const color_transform& t) {
+    if (!(c.a > 0.f))
+        return c;
+    const float in[3] = {c.r / c.a, c.g / c.a, c.b / c.a};
+    float lin[3];
+    apply_color_transform(t, in, lin);
+    for (float& v : lin)
+        v = lx::linear_to_srgb(v < 0.f ? 0.f : (v > 1.f ? 1.f : v)) * c.a;
+    return lx::color::rgb(lin[0], lin[1], lin[2], c.a);
+}
+
 /// A solid draw (`blit_command::solid`) over `band`: one premultiplied word built once,
 /// then a span fill when it is opaque and untinted (no destination read — the scanout
 /// mapping is write-combining), else a per-pixel source-over. Returns bytes written.
@@ -578,6 +636,14 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
                     parts[part_count++] = v;
             }
         }
+        if (cmd.solid && cmd.color.active) {
+            blit_command converted = cmd;
+            converted.solid_color = color_convert_solid(cmd.solid_color, cmd.color);
+            converted.color = {};
+            for (unsigned p = 0; p < part_count; ++p)
+                bytes += fill_solid(dst, converted, parts[p]);
+            continue;
+        }
         if (cmd.solid) {
             for (unsigned p = 0; p < part_count; ++p)
                 bytes += fill_solid(dst, cmd, parts[p]);
@@ -626,14 +692,30 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         const bool needs_blend = cmd.blend != lx::blend_mode::opaque &&
                                  (has_alpha_channel(src.format) || opacity_255 < 255u);
         const bool fill_alpha = has_alpha_channel(dst.format) && !has_alpha_channel(src.format);
+        // A colour-managed draw (wp_color_manager_v1): every texel through its transform,
+        // the decode of opaque ones from a table made here.
+        const bool cm = cmd.color.active;
+        float cm_lut[256];
+        if (cm) {
+            for (unsigned v = 0; v < 256; ++v)
+                cm_lut[v] = decode_channel(static_cast<float>(v) / 255.f, cmd.color.tf,
+                                           cmd.color.power);
+        }
+        const bool dst_rgba = is_rgba_order(dst.format);
+        const bool cm_or_tint = cm || tinted;
 
         const auto finish = [&](std::uint32_t pixel, std::uint32_t& out) {
             if (conv == convert_op::swap_rb)
                 pixel = swap_rb_word(pixel);
             if (fill_alpha)
                 pixel |= 0xFF000000u;
-            if (tinted)
-                pixel = apply_tint(pixel, tint_c0, tint_g, tint_c2, 255u);
+            // One test per pixel for both (the common draw has neither).
+            if (cm_or_tint) {
+                if (cm)
+                    pixel = color_convert(pixel, cmd.color, cm_lut, dst_rgba);
+                if (tinted)
+                    pixel = apply_tint(pixel, tint_c0, tint_g, tint_c2, 255u);
+            }
             out = needs_blend ? blend_over_linear(pixel, out, opacity_255) : pixel;
         };
 
@@ -649,12 +731,12 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         const bool identity = whole_texels && cmd.buffer_xform == lx::buffer_transform::normal &&
                               sub.width == cmd.dst.width && sub.height == cmd.dst.height;
         if (identity) {
-            const bool memcpy_rows = !needs_blend && !fill_alpha && !tinted &&
+            const bool memcpy_rows = !needs_blend && !fill_alpha && !tinted && !cm &&
                                      conv == convert_op::copy;
             // A translucent-format window at full opacity is mostly opaque pixels (all but
             // its shadow and rounded corners): copy each opaque run, blend only the rest.
             // A fullscreen such window went from 15 to about 4 ms.
-            const bool blend_runs = needs_blend && !fill_alpha && !tinted &&
+            const bool blend_runs = needs_blend && !fill_alpha && !tinted && !cm &&
                                     conv == convert_op::copy && opacity_255 == 255u;
             for (unsigned p = 0; p < part_count; ++p) {
                 const lx::rect2i part = intersect(area, parts[p]);

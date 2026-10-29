@@ -1186,6 +1186,50 @@ LUMEN_TEST(vk_damage_limited_titles_match_a_full_repaint) {
     ref.shutdown();
 }
 
+// GPU timing on a frame with primitives (`begin_linear_frame` … `end_linear_frame`, the UI
+// stream recorded in the linear pass): the frame is timed, its composite and encode passes
+// come back non-zero and inside the frame's wall time, and its pixels are the untimed frame's.
+// Under the validation run this also checks the query pool's reset/write/read sequence.
+LUMEN_TEST(vk_gpu_timing_times_the_linear_pass) {
+    vk_env* v = shared_vk();
+    if (!v)
+        return;
+    if (!v->comp.gpu_timing_supported()) {
+        std::printf("    SKIP: queue family has no timestamps\n");
+        return;
+    }
+    desktop d{k_windows, 1.0};
+    lx::compositor::vk_paint_result res{};
+    const std::vector<std::uint32_t> untimed = paint_vk(*v, d, &res);
+    LUMEN_CHECK(res.paint.stream && res.composite.gpu_serial == 0);
+    lx::gfx::composite_gpu_time t[lx::gfx::vulkan_compositor::k_gpu_times]{};
+    LUMEN_CHECK(v->comp.take_gpu_times(t, lx::gfx::vulkan_compositor::k_gpu_times) == 0);
+    v->comp.set_gpu_timing(true);
+    for (int i = 0; i < 3; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        // Read back inside: the frame has finished when this returns.
+        const std::vector<std::uint32_t> timed = paint_vk(*v, d, &res);
+        const auto wall_ns = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0)
+                .count());
+        LUMEN_CHECK(res.paint.stream && res.composite.gpu_serial != 0);
+        LUMEN_CHECK(timed == untimed);
+        const unsigned n = v->comp.take_gpu_times(t, lx::gfx::vulkan_compositor::k_gpu_times);
+        LUMEN_CHECK(n == 1);
+        if (n != 1)
+            continue;
+        std::printf("    frame %d: composite %.3f ms, encode %.3f ms, wall %.3f ms\n", i,
+                    t[0].composite_ns / 1e6, t[0].encode_ns / 1e6, wall_ns / 1e6);
+        LUMEN_CHECK(t[0].serial == res.composite.gpu_serial);
+        LUMEN_CHECK(t[0].composite_ns > 0 && t[0].encode_ns > 0);
+        LUMEN_CHECK(t[0].composite_ns + t[0].encode_ns <= wall_ns);
+    }
+    v->comp.set_gpu_timing(false);
+    (void)paint_vk(*v, d, &res);
+    LUMEN_CHECK(res.composite.gpu_serial == 0);
+    LUMEN_CHECK(v->comp.take_gpu_times(t, lx::gfx::vulkan_compositor::k_gpu_times) == 0);
+}
+
 // Last: with LUMEN_VULKAN_VALIDATION=1, the validation layer's log holds no error.
 LUMEN_TEST(vk_validation_clean) {
     if (!g_vk_validation_requested)

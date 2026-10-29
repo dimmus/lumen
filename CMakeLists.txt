@@ -96,8 +96,10 @@ lumen_add_module_library(lx.gfx modules/lx.gfx
 lumen_compile_shaders(lx.gfx
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.vert"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/composite_cm.frag"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.vert"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/encode.frag"
+    "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/blur.frag"
     # ADR-010 UI primitives (lx.gfx:ui_vk); their code is shaders/ui/*.glsl, shared with ui_gl.
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_quad.vert"
     "${CMAKE_SOURCE_DIR}/modules/lx.gfx/shaders/ui_quad.frag"
@@ -603,6 +605,13 @@ if(LUMEN_BUILD_TESTS)
     lumen_link_platform(test_peer_pidfd)
     target_include_directories(test_peer_pidfd PRIVATE tests)
     add_test(NAME test_peer_pidfd COMMAND test_peer_pidfd)
+
+    add_executable(test_fd_limit tests/test_fd_limit.cpp)
+    target_link_libraries(test_fd_limit PRIVATE lx.session)
+    lumen_apply_module_properties(test_fd_limit)
+    lumen_link_platform(test_fd_limit)
+    target_include_directories(test_fd_limit PRIVATE tests)
+    add_test(NAME test_fd_limit COMMAND test_fd_limit)
 
     if(LUMEN_HAS_VARLINK)
         add_executable(test_control tests/test_control.cpp)
@@ -1174,6 +1183,16 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_tiling COMMAND test_tiling)
     set_tests_properties(test_tiling PROPERTIES TIMEOUT 60)
 
+    # Window animations ([animations]): the spring, the scene's mapping, the ghost's buffer
+    # hold, and in-process every frame of open / close / slide / minimize / maximize.
+    add_executable(test_window_animations tests/test_window_animations.cpp)
+    target_link_libraries(test_window_animations PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_window_animations)
+    lumen_link_platform(test_window_animations)
+    target_include_directories(test_window_animations PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_window_animations COMMAND test_window_animations)
+    set_tests_properties(test_window_animations PROPERTIES TIMEOUT 60)
+
     add_executable(test_window_protocols tests/test_window_protocols.cpp)
     target_link_libraries(test_window_protocols PRIVATE lx.compositor)
     lumen_apply_module_properties(test_window_protocols)
@@ -1350,6 +1369,40 @@ if(LUMEN_BUILD_TESTS)
         add_test(NAME ${t} COMMAND ${t})
     endforeach()
 
+    # ext-background-effect-v1: the GL and Vulkan blur against a reference computed in the
+    # test, the planner's cache, the scene's blur draws (GL skips without a render node).
+    add_executable(test_backdrop_blur tests/test_backdrop_blur.cpp)
+    target_link_libraries(test_backdrop_blur PRIVATE lx.gfx lx.scene)
+    lumen_apply_module_properties(test_backdrop_blur)
+    lumen_link_platform(test_backdrop_blur)
+    target_include_directories(test_backdrop_blur PRIVATE tests)
+    add_test(NAME test_backdrop_blur COMMAND test_backdrop_blur)
+    set_tests_properties(test_backdrop_blur PROPERTIES TIMEOUT 120)
+    if(LUMEN_VK_VALIDATION_LAYER)
+        # The Vulkan cases again under VK_LAYER_KHRONOS_validation, which must log nothing.
+        add_test(NAME test_backdrop_blur_vk_validation
+                 COMMAND test_backdrop_blur --filter=vulkan)
+        set_tests_properties(test_backdrop_blur_vk_validation PROPERTIES TIMEOUT 120 ENVIRONMENT
+            "LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
+    endif()
+
+    # wp_color_manager_v1: every backend's colour transform against a reference computed in
+    # the test (CPU always; GL skips without a render node; Vulkan on lavapipe here).
+    add_executable(test_color_management tests/test_color_management.cpp)
+    target_link_libraries(test_color_management PRIVATE lx.gfx lx.scene)
+    lumen_apply_module_properties(test_color_management)
+    lumen_link_platform(test_color_management)
+    target_include_directories(test_color_management PRIVATE tests)
+    add_test(NAME test_color_management COMMAND test_color_management)
+    set_tests_properties(test_color_management PROPERTIES TIMEOUT 120)
+    if(LUMEN_VK_VALIDATION_LAYER)
+        add_test(NAME test_color_management_vk_validation
+                 COMMAND test_color_management --filter=vulkan)
+        set_tests_properties(test_color_management_vk_validation PROPERTIES TIMEOUT 120
+            ENVIRONMENT
+            "LUMEN_VULKAN_VALIDATION=1;LUMEN_VK_VALIDATION_LAYER=${LUMEN_VK_VALIDATION_LAYER}")
+    endif()
+
     add_executable(test_dmabuf_composite tests/test_dmabuf_composite.cpp)
     target_link_libraries(test_dmabuf_composite PRIVATE lx.gfx)
     lumen_apply_module_properties(test_dmabuf_composite)
@@ -1445,7 +1498,7 @@ if(LUMEN_BUILD_TESTS)
     if(TARGET test_control)
         set_tests_properties(test_control PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
     endif()
-    set_tests_properties(test_health test_session_discovery
+    set_tests_properties(test_health test_session_discovery test_fd_limit
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
     if(TARGET test_client_swapchain)
         # Its Vulkan tier brings up lavapipe: the ICD's teardown needs the Vulkan settings.

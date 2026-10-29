@@ -70,7 +70,10 @@ unsigned diff_config(const cfg::config_snapshot& a, const cfg::config_snapshot& 
         c |= cfg_bindings;
     if (std::memcmp(&a.windows, &b.windows, sizeof(a.windows)) != 0 ||
         a.tiling.layout != b.tiling.layout || a.tiling.master_ratio != b.tiling.master_ratio ||
-        a.tiling.master_count != b.tiling.master_count || a.tiling.gaps != b.tiling.gaps)
+        a.tiling.master_count != b.tiling.master_count || a.tiling.gaps != b.tiling.gaps ||
+        a.animations.enabled != b.animations.enabled ||
+        a.animations.stiffness != b.animations.stiffness ||
+        a.animations.damping_ratio != b.animations.damping_ratio)
         c |= cfg_windows;
     if (a.workspaces.mode != b.workspaces.mode || a.workspaces.count != b.workspaces.count ||
         a.workspaces.name_count != b.workspaces.name_count ||

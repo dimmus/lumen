@@ -119,6 +119,14 @@ struct tiling_settings {
     int gaps = 8;
 };
 
+/// [animations]: window animations (open, close, minimize, workspace switch, placement), off
+/// by default. Every value rides a damped spring of this stiffness and damping ratio.
+struct animation_settings {
+    bool enabled = false;
+    double stiffness = 800.0;
+    double damping_ratio = 1.0;
+};
+
 enum class workspace_mode : unsigned char { dynamic, fixed };
 struct workspace_settings {
     static constexpr unsigned k_max_names = 16;
@@ -148,6 +156,12 @@ struct idle_settings {
 
 struct background_settings {
     char spec[512] = "lumen";
+};
+
+/// lumen-shell's panel (ext-background-effect-v1): translucent over a blur of what is behind
+/// it, where the compositor offers blur. Off: opaque, as always.
+struct panel_settings {
+    bool blur = false;
 };
 
 enum class notification_position : unsigned char {
@@ -203,10 +217,12 @@ struct config_snapshot {
     focus_settings focus{};
     window_settings windows{};
     tiling_settings tiling{};
+    animation_settings animations{};
     workspace_settings workspaces{};
     switcher_settings switcher{};
     idle_settings idle{};
     background_settings background{};
+    panel_settings panel{};
     notification_settings notifications{};
     bool default_bindings = true;
     /// Effective: the defaults (unless `default_bindings` is false) with the files' bindings
@@ -365,6 +381,13 @@ const key_desc k_keys[] = {
      LX_FIELD(tiling.master_count)},
     {"tiling", "gaps", value_kind::integer, k_c, k_live, 0, 64, nullptr, 0, 0,
      LX_FIELD(tiling.gaps)},
+    // [animations]
+    {"animations", "enabled", value_kind::boolean, k_c, k_live, 0, 0, nullptr, 0, 0,
+     LX_FIELD(animations.enabled)},
+    {"animations", "stiffness", value_kind::number, k_c, k_live, 50.0, 5000.0, nullptr, 0, 0,
+     LX_FIELD(animations.stiffness)},
+    {"animations", "damping-ratio", value_kind::number, k_c, k_live, 0.3, 2.0, nullptr, 0, 0,
+     LX_FIELD(animations.damping_ratio)},
     // [workspaces]
     {"workspaces", "mode", value_kind::enumeration, k_c, k_live, 0, 0, k_workspace_modes,
      count_of(k_workspace_modes), 0, LX_FIELD(workspaces.mode)},
@@ -397,6 +420,8 @@ const key_desc k_keys[] = {
     // [background]
     {"background", "spec", value_kind::string, k_s, k_live, 0, 0, nullptr, 0, 512,
      LX_FIELD(background.spec)},
+    // [panel]
+    {"panel", "blur", value_kind::boolean, k_s, k_live, 0, 0, nullptr, 0, 0, LX_FIELD(panel.blur)},
     // [notifications]
     {"notifications", "position", value_kind::enumeration, k_s, k_live, 0, 0, k_positions,
      count_of(k_positions), 0, LX_FIELD(notifications.position)},
@@ -450,8 +475,8 @@ const pointer_key_desc k_pointer_keys[] = {
 constexpr const char* k_sections[] = {
     "input",      "input.keyboard", "input.touchpad", "input.mouse",   "input.trackpoint",
     "input.device", "cursor",       "focus",          "windows",       "tiling",
-    "workspaces", "switcher",       "idle",           "background",    "notifications",
-    "general",    "bindings",
+    "animations", "workspaces",     "switcher",       "idle",          "background",
+    "panel",      "notifications",  "general",        "bindings",
 };
 
 using enum lx::config::action_id;

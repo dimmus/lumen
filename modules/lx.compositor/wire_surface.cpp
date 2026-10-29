@@ -790,6 +790,82 @@ using opaque_rect_set = lx::rect2i[lx::scene::k_max_opaque_rects];
     return n;
 }
 
+/// The applied blur region (ext-background-effect-v1) clipped to the surface — "clipped by
+/// the compositor to the surface size" — as disjoint rects, each blurred once: a wl_region's
+/// rects may overlap, and a pixel under two blur draws would be blurred twice. A region that
+/// needs more than `k_max_blur_rects` (or an over-approximated one) is blurred over its
+/// bounds — the protocol leaves the blur to compositor policy.
+using blur_rect_set = lx::rect2i[lx::scene::surface_node::k_max_blur_rects];
+[[nodiscard]] unsigned blur_rects(const surface_obj* s, blur_rect_set& out) {
+    const lx::compositor::input_region& region = s->blur_current;
+    const int w = s->surface_size.width;
+    const int h = s->surface_size.height;
+    if (region.infinite || w <= 0 || h <= 0)
+        return 0;
+    constexpr unsigned k_keep = lx::scene::surface_node::k_max_blur_rects;
+    unsigned n = 0;
+    bool overflow = region.approximated;
+    lx::rect2i bounds{};
+    for (unsigned i = 0; i < region.count; ++i) {
+        const lx::rect2i c = lx::compositor::clip_to(region.rects[i], w, h);
+        if (c.width <= 0 || c.height <= 0)
+            continue;
+        bounds = bounds.width > 0
+                     ? lx::rect2i{std::min(bounds.x, c.x), std::min(bounds.y, c.y),
+                                  std::max(bounds.x + bounds.width, c.x + c.width) -
+                                      std::min(bounds.x, c.x),
+                                  std::max(bounds.y + bounds.height, c.y + c.height) -
+                                      std::min(bounds.y, c.y)}
+                     : c;
+        if (overflow)
+            continue;
+        // `c` minus every rect kept so far, piece by piece (a cut leaves at most four).
+        lx::rect2i pieces[4 * k_keep]{c};
+        unsigned count = 1;
+        for (unsigned k = 0; k < n && count > 0 && !overflow; ++k) {
+            const lx::rect2i o = out[k];
+            lx::rect2i next[4 * k_keep]{};
+            unsigned m = 0;
+            for (unsigned p = 0; p < count && !overflow; ++p) {
+                const lx::rect2i r = pieces[p];
+                const int x0 = std::max(r.x, o.x), y0 = std::max(r.y, o.y);
+                const int x1 = std::min(r.x + r.width, o.x + o.width);
+                const int y1 = std::min(r.y + r.height, o.y + o.height);
+                lx::rect2i cut[4]{};
+                unsigned q = 0;
+                if (x1 <= x0 || y1 <= y0) {
+                    cut[q++] = r;
+                } else {
+                    if (y0 > r.y)
+                        cut[q++] = {r.x, r.y, r.width, y0 - r.y};
+                    if (y1 < r.y + r.height)
+                        cut[q++] = {r.x, y1, r.width, r.y + r.height - y1};
+                    if (x0 > r.x)
+                        cut[q++] = {r.x, y0, x0 - r.x, y1 - y0};
+                    if (x1 < r.x + r.width)
+                        cut[q++] = {x1, y0, r.x + r.width - x1, y1 - y0};
+                }
+                if (m + q > 4 * k_keep)
+                    overflow = true;
+                for (unsigned t = 0; t < q && !overflow; ++t)
+                    next[m++] = cut[t];
+            }
+            for (unsigned t = 0; t < m; ++t)
+                pieces[t] = next[t];
+            count = m;
+        }
+        if (n + count > k_keep)
+            overflow = true;
+        for (unsigned p = 0; p < count && !overflow; ++p)
+            out[n++] = pieces[p];
+    }
+    if (overflow && bounds.width > 0) {
+        out[0] = bounds;
+        return 1;
+    }
+    return n;
+}
+
 /// Content on this surface is drawn (once mapped), so a buffer must be imported and staged
 /// when it is applied — whether or not the surface is mapped yet: a subsurface committed
 /// before its parent maps has to show the moment the parent does. See `keeps_content` for
@@ -1120,6 +1196,15 @@ void merge_state(surface_obj* s, surface_pending& p, surface_pending& c) {
         c.opaque = p.opaque;
         c.opaque_set = true;
     }
+    if (p.blur_set) {
+        c.blur = p.blur;
+        c.blur_set = true;
+    }
+    if (p.color_set) {
+        c.color = p.color;
+        c.color_has = p.color_has;
+        c.color_set = true;
+    }
     p.buffer = nullptr;
     p.buffer_set = false;
     p.dx = 0;
@@ -1128,6 +1213,8 @@ void merge_state(surface_obj* s, surface_pending& p, surface_pending& c) {
     p.damage_buffer.clear();
     p.input_set = false;
     p.opaque_set = false;
+    p.blur_set = false;
+    p.color_set = false;
 }
 
 void merge_pending_into_cached(surface_obj* s) {
@@ -1475,6 +1562,27 @@ void apply_core(surface_obj* s) {
     const bool opaque_changed = c.opaque_set;
     if (c.opaque_set)
         s->opaque_current = c.opaque;
+    const bool blur_changed = c.blur_set;
+    if (c.blur_set)
+        s->blur_current = c.blur;
+    // wp_color_manager_v1: the description reaches the scene as the surface's transform
+    // (validated when it was made, so it always has one).
+    if (c.color_set && (c.color_has != s->color_has_current ||
+                        (c.color_has && !(c.color == s->color_current)))) {
+        s->color_has_current = c.color_has;
+        s->color_current = c.color_has ? c.color : lx::gfx::color_description{};
+        lx::gfx::color_transform t{};
+        if (c.color_has && !lx::gfx::make_color_transform(s->color_current, t))
+            t = {};
+        s->ctx->surfaces->set_color(s->id, t);
+        if (log_surface.enabled(lx::trace::level::debug)) {
+            log_surface.debug("surface color surface={} description={} tf={} transform={} "
+                              "peak={:.3f}",
+                              s->id.id(), c.color_has ? 1 : 0,
+                              static_cast<int>(s->color_current.tf), t.active ? 1 : 0,
+                              static_cast<double>(t.peak));
+        }
+    }
     c = {};
     s->has_cached = false;
 
@@ -1497,6 +1605,22 @@ void apply_core(surface_obj* s) {
                           vp.src_y / 256.0, vp.src_w / 256.0, vp.src_h / 256.0,
                           vp.has_dst ? "" : "-", vp.dst_w, vp.dst_h, geo.size.width,
                           geo.size.height);
+    }
+
+    // The blur region is clipped to the surface: re-clipped when either changes.
+    if (s->ctx->background_blur &&
+        (blur_changed || ((old_size.width != geo.size.width || old_size.height != geo.size.height) &&
+                          s->blur_current.count > 0))) {
+        blur_rect_set rects{};
+        const unsigned count = blur_rects(s, rects);
+        s->ctx->surfaces->set_blur_region(s->id, {rects, count});
+        if (log_surface.enabled(lx::trace::level::debug)) {
+            long long area = 0;
+            for (unsigned i = 0; i < count; ++i)
+                area += static_cast<long long>(rects[i].width) * rects[i].height;
+            log_surface.debug("surface blur region surface={} rects={} area={}", s->id.id(),
+                              count, area);
+        }
     }
 
     if (s->role == surface_role::cursor) {
@@ -2481,6 +2605,7 @@ void compositor_create_surface(struct wl_client* client, struct wl_resource* res
     s->id = next_surface_id();
     s->client = client_handle(*conn);
     s->opaque_current.reset_empty(); // wl_surface: the initial opaque region is empty
+    s->blur_current.reset_empty();   // ext-background-effect-v1: "the initial value is empty"
     wl_resource_set_implementation(s->resource, &surface_impl, s, surface_destroy_resource);
     // Registered for O(1) id → resource lookups (subsurface trees name surfaces by id) and
     // as a tree member. Both tables match this one's size, so this only fails when the

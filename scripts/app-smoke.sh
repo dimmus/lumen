@@ -269,6 +269,10 @@
 #        and on a card without async flips the compositor says so and presents with vsync
 #     T6 weston-simple-egl (GL client, dma-buf with implicit fences): frames keep coming;
 #        reports how often an update had to wait for its buffer's fences
+#     T7 lumen-probe blur (ext-background-effect-v1): a window of 4 px black/white stripes
+#        under a transparent subsurface whose blur region is all of it — the capability is
+#        blur, the region reaches the compositor, and a screenshot shows the stripes blurred
+#        to an even grey inside the region and untouched, exactly black or white, outside it
 #   U  window protocols (design-app-compat-capture Part B; lumen-shell runs for U and V)
 #     U1 lumen-probe dialog: a modal child (xdg-dialog-v1) maps centred on its parent; a click
 #        on the parent is consumed (the probe sees no button) and the dialog keeps the keyboard
@@ -2493,6 +2497,25 @@ if want T; then
   else
     finish skipped=1
   fi
+
+  # T7 — ext-background-effect-v1: a blurred region over stripes, and its pixels.
+  begin T7
+  start_client probe-t7 "$PROBE" blur --size 480x360 --region 120,100,240,160 --exit-after 30
+  T7_PID=$LAST_PID
+  T7_ID=$(wait_map lumen-probe 5) && settle "$T7_ID"
+  SHOT=""
+  if (( T7_ID > 0 )); then
+    sleep 0.3
+    N0=$(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG")
+    kill -USR1 "$COMP_PID" 2>/dev/null
+    for _ in $(seq 1 40); do
+      (( $(grep -c "screenshot [0-9]*x[0-9]* written to " "$COMP_LOG") > N0 )) && break
+      sleep 0.1
+    done
+    SHOT=$(grep -oE "screenshot [0-9]+x[0-9]+ written to \S+" "$COMP_LOG" | tail -1 | sed 's/.* to //')
+  fi
+  stop_client "$T7_PID"; forget_client "$T7_PID"
+  finish id="${T7_ID:-0}" shot="\"${SHOT}\""
   SCEN=park; inject move 20 $((OUT_H - 20))
 fi
 
@@ -6182,6 +6205,42 @@ if s is not None:
         record("T6 weston-simple-egl: dma-buf frames keep coming (implicit fences checked)", ok,
                f"commits={n} rate={rate:.1f}/s; dma-buf params requests={dmabuf}; updates that "
                f"waited for their buffer's fences={len(waited)}")
+
+s = scen.get("T7")
+if s is not None:
+    tid = s["id"]
+    rg = list(rng(s))
+    out = read("probe-t7.log")
+    mapped = [l for l in out if l.startswith("blur mapped")]
+    caps = mapped[-1].split("caps=")[1].split()[0] if mapped else "?"
+    region = [comp[i] for i in rg if "compositor.surface: surface blur region " in comp[i]]
+    g = geometry_at(tid, s["comp"][1]) if tid else None
+    img = ppm(s.get("shot", "")) if s.get("shot") else None
+    detail_px, px_ok = "no screenshot", False
+    if img and g:
+        w, h, px = img
+        x, y = g[0], g[1]
+        def grey(u, v):
+            return px[(v * w + u) * 3 + 1]
+        # Inside the region (120,100 240x160 of the window): the stripes' mean, evenly (GL
+        # blends encoded values: ~128; a linear-light backend: ~188).
+        inside = [grey(x + u, y + v) for v in range(108, 252, 9) for u in range(128, 352, 7)
+                  if 0 <= x + u < w and 0 <= y + v < h]
+        # Outside it, in the window: the stripes themselves, untouched — up to the region's edge.
+        edge = [(u, v) for v in range(110, 250, 20) for u in (116, 117, 118, 119, 360, 361, 362, 363)] + \
+               [(u, v) for u in range(130, 350, 20) for v in (96, 97, 98, 99, 260, 261, 262, 263)]
+        outside = [(grey(x + u, y + v), 255 if (u // 4) % 2 else 0) for u, v in edge
+                   if 0 <= x + u < w and 0 <= y + v < h]
+        even = bool(inside) and max(inside) - min(inside) <= 8 and 110 <= min(inside) and max(inside) <= 200
+        sharp = bool(outside) and all(a == b for a, b in outside)
+        px_ok = even and sharp
+        detail_px = (f"inside {len(inside)} samples {min(inside) if inside else '-'}..{max(inside) if inside else '-'}; "
+                     f"outside {sum(1 for a, b in outside if a == b)}/{len(outside)} exact stripes")
+    ok = caps == "1" and bool(region) and "rects=1" in region[-1] and "area=38400" in region[-1] and px_ok
+    record("T7 ext-background-effect-v1: blur offered, the region applied, stripes blurred inside "
+           "and untouched outside", ok,
+           f"caps={caps}; {region[-1].split('compositor.surface: ')[-1] if region else 'no region line'}; "
+           f"geometry={g}; {detail_px}")
 
 # ── U: dialogs, icons, bell, xdg-foreign (design-app-compat-capture Part B) ──
 SHUV = read("shell-uv.log")

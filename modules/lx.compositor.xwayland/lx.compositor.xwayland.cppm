@@ -8,6 +8,8 @@ export module lx.compositor.xwayland;
 export namespace lx::compositor::xwayland {
 
 /// Rootless XWayland client launcher — optional, off by default (`LUMEN_BUILD_XWAYLAND`).
+/// The compositor's RLIMIT_NOFILE is raised; Xwayland gets the start limit back
+/// (`lx::session::fd_limit::restore_in_child` between fork and exec).
 class bridge {
 public:
     [[nodiscard]] lx::result<void> start(wayland::server& server, const char* display = ":1");

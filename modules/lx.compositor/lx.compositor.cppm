@@ -30,6 +30,7 @@ export import :protocols_p0;
 export import :wm;
 export import :workspaces;
 export import :tiling;
+export import :window_animation;
 export import :positioner;
 export import :popup;
 export import :decoration;

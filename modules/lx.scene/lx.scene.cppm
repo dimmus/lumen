@@ -91,6 +91,18 @@ unsigned mark_occlusion(std::span<draw_command> draws, lx::rect2i output, bool* 
 /// takes the span overload's path unchanged.
 unsigned mark_occlusion(draw_list& list, lx::rect2i output, bool* shown);
 
+/// What the blur of region `source` of `list` reads (ext-background-effect-v1), hashed:
+/// everything painted before the region's first blur draw — in paint order, the sorted
+/// stream's when the list has one — that reaches `footprint` and is drawn at all: a draw's
+/// geometry, opacity, tint, blending, visible rects and content (texture id, content serial,
+/// solid colour; a lower region's blur draw by `lower[its source]`), a primitive's instance
+/// bytes, and the clear colour. Equal signatures paint the same backdrop, so the region's
+/// blur is reused (`gfx::blur_planner`). Render affinity on an acquired snapshot; O(draws +
+/// primitives), no allocation.
+[[nodiscard]] std::uint64_t blur_backdrop_signature(const draw_list& list, unsigned source,
+                                                    lx::rect2i footprint, lx::color clear,
+                                                    std::span<const std::uint64_t> lower);
+
 /// What `emit_draws` needs to place a node: the output projection, and the logical point
 /// its tree rounds edges relative to (a window's root surface origin) when it has one.
 struct emit_context {
@@ -110,6 +122,34 @@ struct output_view_config {
     /// The subtree the view draws (null: the whole scene). A capture view names one window's
     /// tree container: what is above or below the window never reaches its pixels.
     const class scene_node* root = nullptr;
+};
+
+/// A window's visual transform while it animates (the compositor's window animations,
+/// config.toml `[animations]`): every draw its anchor container's subtree emits on an output
+/// view is mapped by `p' = to + (p − from) · scale` — `from` and `to` logical points,
+/// projected like everything else, the scale applied in that view's pixels — and drawn at
+/// `opacity` times its own (`draw_list::animate_range`, after the subtree is emitted).
+/// Layout, hit-testing, the nodes' damage and the client never see it, and capture views
+/// draw where it ends: at rest, or nothing of a `leaving` one. An inactive one costs one test
+/// per anchor container.
+struct node_animation {
+    bool active = false;
+    double from_x = 0.0;
+    double from_y = 0.0;
+    double to_x = 0.0;
+    double to_y = 0.0;
+    double scale_x = 1.0;
+    double scale_y = 1.0;
+    float opacity = 1.f;
+    /// The one output view it applies on (a workspace slide on that output); -1: every
+    /// output view.
+    int view = -1;
+    /// With `view`: the other output views draw nothing of the subtree (it is leaving that
+    /// output's workspace); otherwise they draw it at rest.
+    bool elsewhere_hidden = false;
+    /// It ends gone (a closing window's ghost, a window minimizing or sliding off its
+    /// workspace): capture views draw nothing of the subtree.
+    bool leaving = false;
 };
 
 class scene_node {
@@ -183,10 +223,15 @@ public:
     /// surfaces and frame land on the pixel grid together.
     void set_anchor(bool anchor) { anchor_ = anchor; }
     [[nodiscard]] bool anchor() const { return anchor_; }
+    /// An anchor container's visual transform (`node_animation`; inactive by default). UI
+    /// affinity; the caller damages what it moves.
+    void set_animation(const node_animation& a) { animation_ = a; }
+    [[nodiscard]] const node_animation& animation() const { return animation_; }
 
 private:
     lx::layout::flex_node layout_{};
     bool anchor_ = false;
+    node_animation animation_{};
     scene_node* children_[128]{};
     unsigned count_ = 0;
     lx::runtime::overflow_action child_overflow_ = lx::runtime::overflow_action::drop_newest;
@@ -227,6 +272,21 @@ public:
     void set_solid(bool solid, lx::color color);
     [[nodiscard]] bool solid() const { return solid_; }
     [[nodiscard]] lx::color solid_color() const { return solid_color_; }
+    /// The surface's blur region (ext-background-effect-v1): disjoint rects in the bounds'
+    /// space, the first `k_max_blur_rects` kept (the caller merges a larger region). On an
+    /// output view, each becomes a blur draw (`draw_command::blur`) under the surface's own,
+    /// at its opacity and tint; empty: none. Capture views draw no blur. The caller damages
+    /// what changed.
+    static constexpr unsigned k_max_blur_rects = 8;
+    void set_blur_region(std::span<const lx::rect2i> rects);
+    [[nodiscard]] unsigned blur_rect_count() const { return blur_rect_count_; }
+    [[nodiscard]] std::span<const lx::rect2i> blur_region() const {
+        return {blur_rects_, blur_rect_count_};
+    }
+    /// The surface's colour transform (wp_color_manager_v1, `gfx::color_transform`): every
+    /// draw of it carries it. Inactive by default. The caller damages what changed.
+    void set_color(const lx::gfx::color_transform& color);
+    [[nodiscard]] const lx::gfx::color_transform& color() const { return color_; }
     using scene_node::emit_draws;
     void emit_draws(draw_list& out, const emit_context& ctx) const override;
     void on_shown(unsigned frame, unsigned view) override {
@@ -259,6 +319,10 @@ private:
     lx::color solid_color_ = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
     lx::rect2i opaque_rects_[k_max_opaque_rects]{};
     unsigned opaque_rect_count_ = 0;
+    lx::rect2i blur_rects_[k_max_blur_rects]{};
+    unsigned blur_rect_count_ = 0;
+    lx::gfx::color_transform color_{};
+    std::uint32_t content_serial_ = 0;
 };
 
 class scene_graph {
@@ -359,6 +423,8 @@ private:
         unsigned last_culled = 0;
     };
     void emit_node(scene_node* node, draw_list& out, const emit_context& ctx);
+    /// An anchor container whose `node_animation` is active: its subtree, mapped.
+    void emit_animated(container_node& box, draw_list& out, const emit_context& ctx);
     [[nodiscard]] view& ensure_view(unsigned slot);
 
     container_node root_{};
@@ -540,8 +606,12 @@ void lx::scene::surface_node::attach(lx::gfx::imported_image img) {
     image_ = img;
     texture_ = lx::texture_id{img.image_id};
     dirty_ = true;
+    ++content_serial_;
 }
-void lx::scene::surface_node::set_source_damage(lx::rect2i) { dirty_ = true; }
+void lx::scene::surface_node::set_source_damage(lx::rect2i) {
+    dirty_ = true;
+    ++content_serial_;
+}
 void lx::scene::surface_node::set_bounds(lx::rect2i b) {
     bounds_ = b;
     dirty_ = true;
@@ -573,6 +643,7 @@ void lx::scene::surface_node::set_solid(bool solid, lx::color color) {
     solid_ = solid;
     solid_color_ = color;
     dirty_ = true;
+    ++content_serial_;
 }
 
 void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx) const {
@@ -624,6 +695,9 @@ void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx
                      sh != static_cast<float>(cmd.dst.height);
     }
     cmd.transform = lx::transform2d::translate(cmd.dst.x, cmd.dst.y);
+    cmd.content = content_serial_;
+    if (color_.active)
+        cmd.color = color_;
     // Opacity rides `opacity` alone: every backend multiplies it with the tint's alpha, so
     // folding it into the tint as well (as this once did) faded a translucent node twice —
     // alpha-modifier-v1 at one half came out at one quarter.
@@ -663,8 +737,78 @@ void lx::scene::surface_node::emit_draws(draw_list& out, const emit_context& ctx
                 static_cast<int>(x1 - x0), static_cast<int>(y1 - y0)};
         }
     }
+    // The blur region, under the surface: one draw per rect, in output pixels (edges at the
+    // surface-to-dst ratio, rounded), all naming the region's bounds and this frame's number
+    // for it. Output views only — a capture view shows the window, not what is behind it.
+    if (blur_rect_count_ > 0 && ctx.view < k_output_views && bounds().width > 0 &&
+        bounds().height > 0) {
+        const long long bw = b.width;
+        const long long bh = b.height;
+        const bool same = cmd.dst.width == b.width && cmd.dst.height == b.height;
+        const auto map = [&](long long v, long long full, int to) {
+            return same ? v : (v * to + full / 2) / full;
+        };
+        lx::rect2i rects[k_max_blur_rects]{};
+        unsigned count = 0;
+        lx::rect2i box{};
+        for (unsigned k = 0; k < blur_rect_count_; ++k) {
+            const lx::rect2i& r = blur_rects_[k];
+            const long long u0 = std::max<long long>(r.x - b.x, 0);
+            const long long v0 = std::max<long long>(r.y - b.y, 0);
+            const long long u1 = std::min<long long>(static_cast<long long>(r.x) - b.x + r.width, bw);
+            const long long v1 = std::min<long long>(static_cast<long long>(r.y) - b.y + r.height, bh);
+            if (u1 <= u0 || v1 <= v0)
+                continue;
+            const long long x0 = map(u0, bw, cmd.dst.width);
+            const long long y0 = map(v0, bh, cmd.dst.height);
+            const long long x1 = map(u1, bw, cmd.dst.width);
+            const long long y1 = map(v1, bh, cmd.dst.height);
+            if (x1 <= x0 || y1 <= y0)
+                continue;
+            const lx::rect2i d{cmd.dst.x + static_cast<int>(x0), cmd.dst.y + static_cast<int>(y0),
+                               static_cast<int>(x1 - x0), static_cast<int>(y1 - y0)};
+            box = box.width > 0 ? lx::rect2i{std::min(box.x, d.x), std::min(box.y, d.y),
+                                             std::max(box.x + box.width, d.x + d.width) -
+                                                 std::min(box.x, d.x),
+                                             std::max(box.y + box.height, d.y + d.height) -
+                                                 std::min(box.y, d.y)}
+                                : d;
+            rects[count++] = d;
+        }
+        if (count > 0) {
+            // The box first: a stream orders a blur draw by the region's footprint.
+            draw_command blur{};
+            blur.blur = true;
+            blur.blur_box = box;
+            blur.blur_source = out.next_blur_source();
+            blur.clip = cmd.clip;
+            blur.opacity = cmd.opacity;
+            blur.tint = cmd.tint;
+            blur.blend = lx::blend_mode::premultiplied;
+            for (unsigned k = 0; k < count; ++k) {
+                blur.dst = rects[k];
+                blur.transform = lx::transform2d::translate(rects[k].x, rects[k].y);
+                blur.sort_key = lx::draw_sort_key::make(0, out.size());
+                out.push(blur);
+            }
+        }
+    }
     cmd.sort_key = lx::draw_sort_key::make(0, out.size());
     out.push(cmd);
+}
+
+void lx::scene::surface_node::set_color(const lx::gfx::color_transform& color) {
+    if (color_ == color)
+        return;
+    color_ = color;
+    dirty_ = true;
+}
+
+void lx::scene::surface_node::set_blur_region(std::span<const lx::rect2i> rects) {
+    blur_rect_count_ = 0;
+    for (const lx::rect2i& r : rects)
+        if (blur_rect_count_ < k_max_blur_rects && r.width > 0 && r.height > 0)
+            blur_rects_[blur_rect_count_++] = r;
 }
 
 lx::scene::scene_graph::scene_graph() {
@@ -864,6 +1008,10 @@ void lx::scene::scene_graph::emit_node(scene_node* node, draw_list& out,
             emit_context inner = ctx;
             inner.anchor = container->origin();
             inner.anchored = true;
+            if (container->animation().active) [[unlikely]] {
+                emit_animated(*container, out, inner);
+                return;
+            }
             for (unsigned i = 0; i < container->child_count(); ++i)
                 emit_node(container->child_at(i), out, inner);
             return;
@@ -1046,6 +1194,27 @@ unsigned lx_scene_mark_occlusion(std::span<lx::scene::draw_command> draws,
             ++marked;
             continue;
         }
+        if (d.blur) {
+            // A backdrop blur reads what is under it across its footprint: nothing above it
+            // may hide a draw there. Its own pixels are what the blur makes: no occluder.
+            lx::rect2i f = d.blur_box;
+            if (bounded)
+                f = lx::gfx::blur_footprint(f, output.width, output.height);
+            else
+                f = {f.x - lx::gfx::k_blur_margin, f.y - lx::gfx::k_blur_margin,
+                     f.width + 2 * lx::gfx::k_blur_margin, f.height + 2 * lx::gfx::k_blur_margin};
+            unsigned kept = 0;
+            for (unsigned k = 0; k < n; ++k) {
+                const lx::rect2i hit = intersect(occluders[k], f);
+                if (hit.width > 0 && hit.height > 0)
+                    continue;
+                occluders[kept] = occluders[k];
+                areas[kept] = areas[k];
+                ++kept;
+            }
+            n = kept;
+            continue;
+        }
         if (covers_opaquely(d)) {
             add_occluder(r);
             continue;
@@ -1063,6 +1232,192 @@ unsigned lx_scene_mark_occlusion(std::span<lx::scene::draw_command> draws,
 }
 
 } // namespace
+
+void lx::scene::scene_graph::emit_animated(container_node& box, draw_list& out,
+                                           const emit_context& ctx) {
+    const node_animation& a = box.animation();
+    // Capture views draw where it ends (at rest, or nothing of one leaving); a confined
+    // animation, on its view only.
+    const bool capture = ctx.view >= k_output_views;
+    const bool here = !capture && (a.view < 0 || static_cast<unsigned>(a.view) == ctx.view);
+    if (capture ? a.leaving : !here && a.view >= 0 && a.elsewhere_hidden)
+        return;
+    const unsigned first_draw = out.size();
+    const unsigned first_primitive = out.primitive_count();
+    for (unsigned i = 0; i < box.child_count(); ++i)
+        emit_node(box.child_at(i), out, ctx);
+    if (!here)
+        return;
+    // Logical `p' = to + (p - from) * s` in this view's pixels: P(p') = P(to) + (P(p) - P(from)) * s,
+    // with P(p) = (p - origin) * scale (the content space the emitters drew in).
+    const output_projection& p = ctx.projection;
+    const double fx = (a.from_x - p.origin.x) * p.scale;
+    const double fy = (a.from_y - p.origin.y) * p.scale;
+    const double tx = (a.to_x - p.origin.x) * p.scale;
+    const double ty = (a.to_y - p.origin.y) * p.scale;
+    draw_xform x{};
+    x.scale_x = a.scale_x;
+    x.scale_y = a.scale_y;
+    x.offset_x = tx - a.scale_x * fx;
+    x.offset_y = ty - a.scale_y * fy;
+    x.opacity = a.opacity;
+    out.animate_range(first_draw, first_primitive, x);
+}
+
+namespace {
+
+/// FNV-1a, 64-bit: the backdrop signature's hash (a cache key, not a security boundary).
+struct lx_scene_hash {
+    std::uint64_t h = 1469598103934665603ull;
+    void bytes(const void* p, std::size_t n) {
+        const auto* b = static_cast<const unsigned char*>(p);
+        for (std::size_t i = 0; i < n; ++i) {
+            h ^= b[i];
+            h *= 1099511628211ull;
+        }
+    }
+    template <typename T>
+    void value(const T& v) {
+        bytes(&v, sizeof v);
+    }
+    void rect(lx::rect2i r) {
+        value(r.x);
+        value(r.y);
+        value(r.width);
+        value(r.height);
+    }
+    void color(lx::color c) {
+        value(c.r);
+        value(c.g);
+        value(c.b);
+        value(c.a);
+    }
+};
+
+[[nodiscard]] bool lx_scene_meets(lx::rect2i a, lx::rect2i b) {
+    return a.width > 0 && a.height > 0 && b.width > 0 && b.height > 0 && a.x < b.x + b.width &&
+           b.x < a.x + a.width && a.y < b.y + b.height && b.y < a.y + a.height;
+}
+
+} // namespace
+
+std::uint64_t lx::scene::blur_backdrop_signature(const draw_list& list, unsigned source,
+                                                 lx::rect2i footprint, lx::color clear,
+                                                 std::span<const std::uint64_t> lower) {
+    lx_scene_hash h{};
+    h.color(clear);
+    h.rect(footprint);
+    const draw_command* d = list.data();
+    const unsigned n = list.size();
+    // True once the region itself is reached: what follows is above it.
+    const auto surface = [&](unsigned i) {
+        const draw_command& c = d[i];
+        if (c.blur && c.blur_source == source)
+            return true;
+        if (c.occluded || !(c.opacity * c.tint.a > 0.f))
+            return false;
+        lx::rect2i r = c.dst;
+        if (c.clip.width > 0 && c.clip.height > 0)
+            r = intersect(r, c.clip);
+        if (!lx_scene_meets(r, footprint))
+            return false;
+        h.value(c.texture.id());
+        h.value(c.content);
+        h.rect(c.dst);
+        h.value(c.src.x);
+        h.value(c.src.y);
+        h.value(c.src.width);
+        h.value(c.src.height);
+        h.rect(c.clip);
+        h.color(c.tint);
+        h.value(c.opacity);
+        h.value(c.blend);
+        h.value(c.buffer_xform);
+        h.value(c.src_space);
+        h.value(c.image_desc);
+        if (c.color.active) {
+            h.value(c.color.tf);
+            h.value(c.color.power);
+            h.value(c.color.peak);
+            for (const float m : c.color.matrix)
+                h.value(m);
+        }
+        h.value(c.solid);
+        h.color(c.solid_color);
+        h.value(c.visible_count);
+        for (unsigned v = 0; v < c.visible_count && v < lx::gfx::k_max_visible_rects; ++v)
+            h.rect(c.visible[v]);
+        if (c.blur) {
+            h.rect(c.blur_box);
+            h.value(c.blur_source < lower.size() ? lower[c.blur_source] : 0ull);
+        }
+        return false;
+    };
+    const auto refs = list.refs();
+    if (refs.empty()) {
+        for (unsigned i = 0; i < n; ++i)
+            if (surface(i))
+                break;
+        return h.h;
+    }
+    const auto quads = list.quad_instances();
+    const auto shadows = list.shadow_instances();
+    const auto sprites = list.sprite_instances();
+    const auto underlines = list.underline_instances();
+    for (const lx::gfx::primitive_ref& r : refs) {
+        const void* inst = nullptr;
+        std::size_t size = 0;
+        const float* b = nullptr;
+        switch (r.kind) {
+        case lx::gfx::primitive_kind::surface:
+            if (r.index < n && surface(r.index))
+                return h.h;
+            continue;
+        case lx::gfx::primitive_kind::quad:
+            if (r.index < quads.size()) {
+                inst = &quads[r.index];
+                size = sizeof quads[r.index];
+                b = quads[r.index].bounds;
+            }
+            break;
+        case lx::gfx::primitive_kind::shadow:
+            if (r.index < shadows.size()) {
+                inst = &shadows[r.index];
+                size = sizeof shadows[r.index];
+                b = shadows[r.index].bounds;
+            }
+            break;
+        case lx::gfx::primitive_kind::underline:
+            if (r.index < underlines.size()) {
+                inst = &underlines[r.index];
+                size = sizeof underlines[r.index];
+                b = underlines[r.index].bounds;
+            }
+            break;
+        case lx::gfx::primitive_kind::mono_sprite:
+        case lx::gfx::primitive_kind::poly_sprite:
+        case lx::gfx::primitive_kind::path:
+            if (r.index < sprites.size()) {
+                inst = &sprites[r.index];
+                size = sizeof sprites[r.index];
+                b = sprites[r.index].bounds;
+            }
+            break;
+        }
+        if (!inst)
+            continue;
+        const int x0 = static_cast<int>(std::floor(b[0]));
+        const int y0 = static_cast<int>(std::floor(b[1]));
+        const int x1 = static_cast<int>(std::ceil(b[0] + b[2]));
+        const int y1 = static_cast<int>(std::ceil(b[1] + b[3]));
+        if (!lx_scene_meets({x0, y0, x1 - x0, y1 - y0}, footprint))
+            continue;
+        h.value(r.kind);
+        h.value(r.page);
+        h.bytes(inst, size);
+    }
+    return h.h;
+}
 
 unsigned lx::scene::mark_occlusion(std::span<draw_command> draws, lx::rect2i output, bool* shown) {
     return lx_scene_mark_occlusion(draws, {}, {}, {}, output, shown);
@@ -1121,6 +1476,8 @@ void lx::scene::scene_graph::build_draw_list_into(draw_list& out, unsigned slot)
         for (unsigned k = 0; k < d[i].opaque_rect_count; ++k)
             d[i].opaque_rects[k] =
                 lx::gfx::transform_rect(d[i].opaque_rects[k], t, c.width, c.height);
+        if (d[i].blur)
+            d[i].blur_box = lx::gfx::transform_rect(d[i].blur_box, t, c.width, c.height);
         d[i].buffer_xform = lx::gfx::compose_output_transform(d[i].buffer_xform, t);
     }
     out.transform_primitives(t, c);
