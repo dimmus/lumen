@@ -3197,8 +3197,10 @@ void compositor_impl::register_p0_globals() {
             log_gfx.info("shm: uploaded from client memory (no staging)");
         }
     } else {
-        // Vulkan uploads whole RGBA images.
+        // Vulkan uploads RGBA regions the way GL does: the damage since the buffer was last
+        // uploaded, staged at its own size, not the whole image per commit.
         p0_.shm_pool = &shm_pool_;
+        p0_.shm_regions = true;
         p0_.shm_store = nullptr;
         p0_.shm_native_format = false;
     }
@@ -4955,8 +4957,10 @@ void compositor_impl::apply_texture_update(texture_update& update) {
                                 "bookkeeping disagrees with the GL slot (reported once)");
             }
         } else if (vulkan_present_) {
-            applied = vk_compositor_.upload_rgba(update.texture_id, update.width,
-                                                 update.height, update.pixels);
+            // The damaged region, packed at its width; only its rects are copied.
+            applied = vk_compositor_.upload_rgba(
+                update.texture_id, update.width, update.height, update.pixels, update.region,
+                std::span<const lx::rect2i>{update.rects.rects, update.rects.count});
             // The upload copied the pixels into the renderer's own staging.
             shm_pool_.release(update.shm_pool_token);
         } else {
