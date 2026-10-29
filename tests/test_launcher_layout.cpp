@@ -21,7 +21,7 @@ using lx::shell::launcher_view;
 
 constexpr unsigned k_backspace = 0xff08, k_return = 0xff0d, k_escape = 0xff1b, k_down = 0xff54,
                    k_up = 0xff52, k_page_down = 0xff56, k_end = 0xff57, k_home = 0xff50,
-                   k_tab = 0xff09, k_left_tab = 0xfe20;
+                   k_tab = 0xff09, k_left_tab = 0xfe20, k_menu = 0xff67, k_f10 = 0xffc7;
 
 std::string g_root;
 
@@ -180,6 +180,10 @@ LUMEN_TEST(model_typing_selection_and_keys) {
     // Foot by prefix first, then Firefox (which contains "fo").
     LUMEN_CHECK(m.count() == 2 && name_of(cat, m.selected_entry()) == "Foot");
     LUMEN_CHECK(m.key(k_return, nullptr, false, false) == launcher_key_result::launch);
+    // The selected application's menu: Menu, Shift+F10 (F10 alone is nothing).
+    LUMEN_CHECK(m.key(k_menu, nullptr, false, false) == launcher_key_result::menu);
+    LUMEN_CHECK(m.key(k_f10, nullptr, false, true) == launcher_key_result::menu);
+    LUMEN_CHECK(m.key(k_f10, nullptr, false, false) == launcher_key_result::ignored);
     // Control characters and Ctrl+letters are not text.
     LUMEN_CHECK(m.key('a', "\x01", false, false) == launcher_key_result::ignored);
     LUMEN_CHECK(m.key('x', "x", true, false) == launcher_key_result::ignored);
@@ -198,6 +202,7 @@ LUMEN_TEST(model_typing_selection_and_keys) {
     (void)m.key('z', "z", false, false);
     LUMEN_CHECK(m.count() == 0);
     LUMEN_CHECK(m.key(k_return, nullptr, false, false) == launcher_key_result::ignored);
+    LUMEN_CHECK(m.key(k_menu, nullptr, false, false) == launcher_key_result::ignored);
     (void)m.key('u', "u", true, false);
     LUMEN_CHECK(m.query()[0] == '\0' && m.count() == 22);
     // Escape: clears a query, closes when it is empty.

@@ -1,6 +1,8 @@
 // lumen-shell's app launching: the launch environment, unit names, terminal composition,
-// pre-launch checks, and the double-fork fallback run for real (session, parent, signal
-// mask, inherited fds of the launched process).
+// pre-launch checks, the double-fork fallback run for real (session, parent, signal
+// mask, inherited fds of the launched process), and the GPU an app is started on
+// (PrefersNonDefaultGPU: switcheroo-control's variables, answered over a socketpair, or
+// DRI_PRIME=1).
 #include "lumen_test.hpp"
 
 #include <errno.h>
@@ -11,8 +13,13 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+#if defined(LUMEN_HAS_LOGIND)
+#include <systemd/sd-bus.h>
+#endif
 
 import std;
 import lx.foundation;
@@ -107,6 +114,86 @@ LUMEN_TEST(launch_env_drops_sets_and_keeps) {
     LUMEN_CHECK(std::strcmp(out.get("WAYLAND_DISPLAY"), "wayland-0") == 0);
 }
 
+LUMEN_TEST(launch_env_takes_the_gpu_variables_last) {
+    const char* env[] = {"PATH=/usr/bin", "DRI_PRIME=0", "LANG=C", nullptr};
+    const std::vector<std::string> extra = {"DRI_PRIME=pci-0000_01_00_0", "DRI_PRIME=1",
+                                            "WAYLAND_DISPLAY=elsewhere", "NOEQUALS",
+                                            "__NV_PRIME_RENDER_OFFLOAD=1"};
+    lx::shell::launch_env out;
+    lx::shell::build_launch_env(env, {"lumen-7", {}, extra}, out);
+    // The shell's DRI_PRIME is replaced, a repeated name keeps its first value, and what
+    // the launch environment sets itself cannot be overridden.
+    unsigned prime = 0;
+    for (const std::string& v : out.vars)
+        prime += v.starts_with("DRI_PRIME=") ? 1u : 0u;
+    LUMEN_CHECK(prime == 1 && std::strcmp(out.get("DRI_PRIME"), "pci-0000_01_00_0") == 0);
+    LUMEN_CHECK(std::strcmp(out.get("WAYLAND_DISPLAY"), "lumen-7") == 0);
+    LUMEN_CHECK(std::strcmp(out.get("__NV_PRIME_RENDER_OFFLOAD"), "1") == 0);
+    LUMEN_CHECK(!out.get("NOEQUALS") && std::strcmp(out.get("LANG"), "C") == 0);
+    // Without extra variables the shell's own value stays.
+    lx::shell::build_launch_env(env, {"lumen-7", {}}, out);
+    LUMEN_CHECK(std::strcmp(out.get("DRI_PRIME"), "0") == 0);
+}
+
+LUMEN_TEST(offload_env_with_and_without_switcheroo) {
+    using lx::shell::switcheroo_gpu;
+    std::vector<std::string> env;
+    // No switcheroo-control: the render nodes decide, DRI_PRIME=1 with two or more.
+    LUMEN_CHECK(!lx::shell::choose_offload_env(nullptr, 0, env) && env.empty());
+    LUMEN_CHECK(!lx::shell::choose_offload_env(nullptr, 1, env) && env.empty());
+    LUMEN_CHECK(lx::shell::choose_offload_env(nullptr, 2, env) && env.size() == 1 &&
+                env[0] == "DRI_PRIME=1");
+    // switcheroo-control decides when it answers: one GPU, nothing (whatever the nodes).
+    const switcheroo_gpu intel{
+        "Intel HD Graphics 5500", {"DRI_PRIME", "pci-0000_00_02_0"}, true, false};
+    const switcheroo_gpu nouveau{
+        "NVIDIA GM107M [GeForce GTX 950M]", {"DRI_PRIME", "pci-0000_01_00_0"}, false, true};
+    std::vector<switcheroo_gpu> gpus{intel};
+    LUMEN_CHECK(!lx::shell::choose_offload_env(&gpus, 3, env) && env.empty());
+    // The notebook: the Intel GPU is the default; the GeForce's variables.
+    gpus = {intel, nouveau};
+    LUMEN_CHECK(lx::shell::choose_offload_env(&gpus, 2, env) && env.size() == 1 &&
+                env[0] == "DRI_PRIME=pci-0000_01_00_0");
+    // The NVIDIA driver's PRIME render offload: every pair, in order.
+    const switcheroo_gpu nvidia{"NVIDIA",
+                                {"__GLX_VENDOR_LIBRARY_NAME", "nvidia", "__NV_PRIME_RENDER_OFFLOAD",
+                                 "1", "__VK_LAYER_NV_optimus", "NVIDIA_only"},
+                                false,
+                                true};
+    gpus = {intel, nvidia};
+    LUMEN_CHECK(lx::shell::choose_offload_env(&gpus, 2, env) && env.size() == 3 &&
+                env[0] == "__GLX_VENDOR_LIBRARY_NAME=nvidia" &&
+                env[1] == "__NV_PRIME_RENDER_OFFLOAD=1" &&
+                env[2] == "__VK_LAYER_NV_optimus=NVIDIA_only");
+    // Several non-default GPUs: a discrete one before the first listed; without Discrete
+    // (older switcheroo-control) the first non-default one.
+    const switcheroo_gpu igpu2{"Other", {"DRI_PRIME", "pci-0000_05_00_0"}, false, false};
+    gpus = {intel, igpu2, nouveau};
+    LUMEN_CHECK(lx::shell::choose_offload_env(&gpus, 3, env) &&
+                env[0] == "DRI_PRIME=pci-0000_01_00_0");
+    switcheroo_gpu old_nouveau = nouveau;
+    old_nouveau.discrete = false;
+    gpus = {intel, igpu2, old_nouveau};
+    LUMEN_CHECK(lx::shell::choose_offload_env(&gpus, 3, env) &&
+                env[0] == "DRI_PRIME=pci-0000_05_00_0");
+    // No usable Environment on any non-default GPU (missing, a lone name): DRI_PRIME=1.
+    gpus = {intel, {"x", {}, false, true}, {"y", {"DRI_PRIME"}, false, false}};
+    LUMEN_CHECK(lx::shell::choose_offload_env(&gpus, 2, env) && env.size() == 1 &&
+                env[0] == "DRI_PRIME=1");
+}
+
+LUMEN_TEST(render_nodes_are_counted) {
+    char tmpl[] = "/tmp/lumen-dri-XXXXXX";
+    LUMEN_CHECK(mkdtemp(tmpl) != nullptr);
+    const std::string dir = tmpl;
+    LUMEN_CHECK(lx::shell::count_render_nodes(dir.c_str()) == 0);
+    for (const char* n : {"card0", "card1", "renderD128", "renderD129", "by-path"})
+        write_file(dir + "/" + n, "", 0644);
+    LUMEN_CHECK(lx::shell::count_render_nodes(dir.c_str()) == 2);
+    LUMEN_CHECK(lx::shell::count_render_nodes((dir + "/missing").c_str()) == 0);
+    (void)std::system(("rm -rf '" + dir + "'").c_str());
+}
+
 LUMEN_TEST(unit_names_escape_and_cap_length) {
     const unsigned char rnd[16] = {0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef,
                                    0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0xff};
@@ -178,6 +265,11 @@ LUMEN_TEST(terminal_argv_composition_and_prechecks) {
                "[Desktop Entry]\nType=Application\nName=Vim\nExec=vim %F\nTerminal=true\n"
                "Path=/nonexistent-dir\n",
                0644);
+    write_file(g_root + "/bin/game", "#!/bin/sh\n", 0755);
+    write_file(g_root + "/applications/game.desktop",
+               "[Desktop Entry]\nType=Application\nName=Game\nExec=game\n"
+               "PrefersNonDefaultGPU=true\n",
+               0644);
     write_file(g_root + "/applications/gone.desktop",
                "[Desktop Entry]\nType=Application\nName=Gone\nExec=/nonexistent/x\n", 0644);
     write_file(g_root + "/applications/foot.desktop",
@@ -200,6 +292,10 @@ LUMEN_TEST(terminal_argv_composition_and_prechecks) {
     LUMEN_CHECK(std::string_view(p.program) == g_root + "/bin/foot");
     LUMEN_CHECK(std::strcmp(p.id, "vim") == 0 && std::strcmp(p.name, "Vim") == 0);
     LUMEN_CHECK(std::strcmp(p.workdir, "/home/u") == 0); // Path missing: $HOME
+    LUMEN_CHECK(!p.non_default_gpu);
+    LUMEN_CHECK(lx::shell::prepare_entry_launch(*cat.find("game.desktop"), cat, "/home/u", p) ==
+                lx::shell::launch_failure::none);
+    LUMEN_CHECK(p.non_default_gpu && std::strcmp(p.id, "game") == 0);
     const auto* foot = cat.find("foot.desktop");
     LUMEN_CHECK(lx::shell::prepare_entry_launch(*foot, cat, "/home/u", p) ==
                 lx::shell::launch_failure::none);
@@ -207,7 +303,7 @@ LUMEN_TEST(terminal_argv_composition_and_prechecks) {
     LUMEN_CHECK(std::string_view(p.source_path).ends_with("/applications/foot.desktop"));
     LUMEN_CHECK(lx::shell::prepare_terminal_launch(cat, "/home/u", p) ==
                 lx::shell::launch_failure::none);
-    LUMEN_CHECK(std::strcmp(p.id, "foot") == 0 && p.argv.argc == 1);
+    LUMEN_CHECK(std::strcmp(p.id, "foot") == 0 && p.argv.argc == 1 && !p.non_default_gpu);
     // The copy re-points argv into its own buffer.
     LUMEN_CHECK(p.argv.argv[0] >= p.argv.buf && p.argv.argv[0] < p.argv.buf + sizeof(p.argv.buf));
     const auto* gone = cat.find("gone.desktop");
@@ -237,14 +333,17 @@ LUMEN_TEST(double_fork_fallback_detaches_for_real) {
     // The helper records what a launched app would see, then becomes `sleep` so its
     // inherited state (signal mask, fds) can be read from /proc while it lingers.
     const std::string helper = g_root + "/helper";
-    write_file(helper,
-               "#!/bin/sh\n"
-               "{ echo \"pid=$$\"; echo \"ppid=$PPID\";"
-               "  echo \"sid=$(ps -o sid= -p $$ | tr -d ' ')\"; echo \"pgid=$(ps -o pgid= -p $$ | tr -d ' ')\";"
-               "  echo \"wd=$(pwd)\"; echo \"wl=$WAYLAND_DISPLAY\"; echo \"tok=$XDG_ACTIVATION_TOKEN\";"
-               "  echo \"display=${DISPLAY-unset}\"; } > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"\n"
-               "exec sleep 2\n",
-               0755);
+    write_file(
+        helper,
+        "#!/bin/sh\n"
+        "{ echo \"pid=$$\"; echo \"ppid=$PPID\";"
+        "  echo \"sid=$(ps -o sid= -p $$ | tr -d ' ')\"; echo \"pgid=$(ps -o pgid= -p $$ | tr -d ' "
+        "')\";"
+        "  echo \"wd=$(pwd)\"; echo \"wl=$WAYLAND_DISPLAY\"; echo \"tok=$XDG_ACTIVATION_TOKEN\";"
+        "  echo \"display=${DISPLAY-unset}\"; echo \"prime=${DRI_PRIME-unset}\";"
+        "} > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"\n"
+        "exec sleep 2\n",
+        0755);
     // The test blocks a signal and holds an extra fd, as lumen-shell does (signalfd).
     sigset_t block;
     sigemptyset(&block);
@@ -266,6 +365,10 @@ LUMEN_TEST(double_fork_fallback_detaches_for_real) {
     std::snprintf(p.id, sizeof(p.id), "helper");
     std::snprintf(p.name, sizeof(p.name), "Helper");
     std::snprintf(p.workdir, sizeof(p.workdir), "%s", g_root.c_str());
+    // Two GPUs without switcheroo-control: a non-default-GPU launch gets DRI_PRIME=1.
+    l.probe_gpus(2, nullptr);
+    LUMEN_CHECK(l.offload_available() && !l.offload_from_switcheroo());
+    p.non_default_gpu = true;
     l.start(p, "tok-1", "lumen-test");
     LUMEN_CHECK(wait_outcome(l, log, 1));
     LUMEN_CHECK(log.last.failure == lx::shell::launch_failure::none && log.last.forked);
@@ -305,6 +408,8 @@ LUMEN_TEST(double_fork_fallback_detaches_for_real) {
     LUMEN_CHECK(r.find("wl=lumen-test\n") != std::string::npos);
     LUMEN_CHECK(r.find("tok=tok-1\n") != std::string::npos);
     LUMEN_CHECK(r.find("display=unset\n") != std::string::npos);
+    LUMEN_CHECK(r.find("prime=1\n") != std::string::npos);
+    p.non_default_gpu = false;
 
     // execve failing: the errno comes back.
     std::snprintf(p.program, sizeof(p.program), "%s/not-there", g_root.c_str());
@@ -352,6 +457,23 @@ LUMEN_TEST(systemd_transient_service_reports_done_and_failed) {
                 log.last.detail);
     LUMEN_CHECK(log.last.failure == lx::shell::launch_failure::start_failed);
     LUMEN_CHECK(std::strcmp(log.last.detail, "failed") == 0);
+
+    // A non-default-GPU launch: the variables are in the unit's environment.
+    char tmpl[] = "/tmp/lumen-unit-XXXXXX";
+    LUMEN_CHECK(mkdtemp(tmpl) != nullptr);
+    const std::string out = std::string{tmpl} + "/prime";
+    l.probe_gpus(2, nullptr);
+    p.argv.clear();
+    LUMEN_CHECK(p.argv.push("sh") && p.argv.push("-c") &&
+                p.argv.push("echo \"$DRI_PRIME\" > \"$0\"") && p.argv.push(out));
+    std::snprintf(p.program, sizeof(p.program), "/bin/sh");
+    p.non_default_gpu = true;
+    l.start(p, {}, "lumen-test");
+    LUMEN_CHECK(wait_outcome(l, log, 3));
+    LUMEN_CHECK(log.last.failure == lx::shell::launch_failure::none);
+    LUMEN_CHECK(wait_for_file(out) && read_file(out) == "1\n");
+    p.non_default_gpu = false;
+    (void)std::system(("rm -rf '" + std::string{tmpl} + "'").c_str());
 }
 
 // The scope path (systemd < 250, or LUMEN_SHELL_LAUNCH=scope) for real: the process is
@@ -404,6 +526,149 @@ LUMEN_TEST(systemd_scope_holds_the_process_until_it_is_in_its_scope) {
     LUMEN_CHECK(l.pending() == 0);
     (void)std::system(("rm -rf '" + g_root + "'").c_str());
 }
+
+#if defined(LUMEN_HAS_LOGIND)
+
+namespace {
+
+// switcheroo-control's side: net.hadess.SwitcherooControl.GPUs, as the service builds it
+// (Name, Environment, Default, Discrete; plus a key the reader must skip).
+struct fake_switcheroo {
+    std::vector<lx::shell::switcheroo_gpu> gpus;
+    unsigned asked = 0;
+};
+
+int get_gpus(sd_bus*, const char*, const char*, const char*, sd_bus_message* reply, void* user,
+             sd_bus_error*) {
+    auto& f = *static_cast<fake_switcheroo*>(user);
+    ++f.asked;
+    int r = sd_bus_message_open_container(reply, 'a', "a{sv}");
+    for (const auto& g : f.gpus) {
+        r = r < 0 ? r : sd_bus_message_open_container(reply, 'a', "{sv}");
+        r = r < 0 ? r : sd_bus_message_append(reply, "{sv}", "Name", "s", g.name.c_str());
+        r = r < 0 ? r : sd_bus_message_open_container(reply, 'e', "sv");
+        r = r < 0 ? r : sd_bus_message_append(reply, "s", "Environment");
+        r = r < 0 ? r : sd_bus_message_open_container(reply, 'v', "as");
+        r = r < 0 ? r : sd_bus_message_open_container(reply, 'a', "s");
+        for (const std::string& v : g.environment)
+            r = r < 0 ? r : sd_bus_message_append(reply, "s", v.c_str());
+        r = r < 0 ? r : sd_bus_message_close_container(reply);
+        r = r < 0 ? r : sd_bus_message_close_container(reply);
+        r = r < 0 ? r : sd_bus_message_close_container(reply);
+        r = r < 0 ? r : sd_bus_message_append(reply, "{sv}", "Default", "b", g.is_default);
+        r = r < 0 ? r : sd_bus_message_append(reply, "{sv}", "Discrete", "b", g.discrete);
+        r = r < 0 ? r : sd_bus_message_append(reply, "{sv}", "X-Future", "u", 7u);
+        r = r < 0 ? r : sd_bus_message_close_container(reply);
+    }
+    return r < 0 ? r : sd_bus_message_close_container(reply);
+}
+
+const sd_bus_vtable k_switcheroo_vtable[] = {
+    SD_BUS_VTABLE_START(0),
+    SD_BUS_PROPERTY("GPUs", "aa{sv}", get_gpus, 0, SD_BUS_VTABLE_PROPERTY_CONST),
+    SD_BUS_VTABLE_END,
+};
+
+/// A system bus on a socketpair: the launcher holds the client end.
+struct fake_system_bus {
+    sd_bus* server = nullptr;
+    sd_bus* client = nullptr;
+    sd_bus_slot* object = nullptr;
+    fake_switcheroo service;
+    explicit fake_system_bus(bool with_switcheroo) {
+        int fds[2];
+        LUMEN_CHECK(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, fds) == 0);
+        sd_id128_t id{};
+        (void)sd_id128_randomize(&id);
+        sd_bus_new(&server);
+        sd_bus_set_fd(server, fds[0], fds[0]);
+        sd_bus_set_server(server, 1, id);
+        sd_bus_start(server);
+        sd_bus_new(&client);
+        sd_bus_set_fd(client, fds[1], fds[1]);
+        sd_bus_start(client);
+        if (with_switcheroo)
+            LUMEN_CHECK(sd_bus_add_object_vtable(server, &object, "/net/hadess/SwitcherooControl",
+                                                 "net.hadess.SwitcherooControl",
+                                                 k_switcheroo_vtable, &service) >= 0);
+    }
+    ~fake_system_bus() {
+        sd_bus_slot_unref(object);
+        sd_bus_flush_close_unref(client);
+        sd_bus_flush_close_unref(server);
+    }
+    /// Runs both ends until `done` (or a while: the answer is in by then).
+    template <class F>
+    bool pump(lx::shell::app_launcher& l, F done) {
+        for (int i = 0; i < 500; ++i) {
+            while (sd_bus_process(server, nullptr) > 0) {
+            }
+            l.dispatch({});
+            if (done())
+                return true;
+            usleep(1000);
+        }
+        return false;
+    }
+};
+
+} // namespace
+
+LUMEN_TEST(switcheroo_answer_picks_the_gpu_variables) {
+    using lx::shell::switcheroo_gpu;
+    // The notebook: Intel HD 5500 (default, drives the display), GeForce GTX 950M on NVK.
+    fake_system_bus bus(true);
+    bus.service.gpus = {
+        {"Intel Corporation HD Graphics 5500", {"DRI_PRIME", "pci-0000_00_02_0"}, true, false},
+        {"NVIDIA Corporation GM107M [GeForce GTX 950M]",
+         {"DRI_PRIME", "pci-0000_0a_00_0"},
+         false,
+         true},
+    };
+    lx::shell::app_launcher l;
+    l.probe_gpus(2, bus.client);
+    // Until the answer: DRI_PRIME=1.
+    LUMEN_CHECK(l.offload_available() && !l.offload_from_switcheroo() &&
+                l.offload_env().front() == "DRI_PRIME=1");
+    LUMEN_CHECK(bus.pump(l, [&] { return l.offload_from_switcheroo(); }));
+    LUMEN_CHECK(bus.service.asked == 1);
+    LUMEN_CHECK(l.offload_env().size() == 1 &&
+                l.offload_env().front() == "DRI_PRIME=pci-0000_0a_00_0");
+    // The poll set has the system bus while it is open.
+    pollfd fds[lx::shell::app_launcher::k_max_poll];
+    int timeout = -1;
+    LUMEN_CHECK(l.poll_fds(fds, lx::shell::app_launcher::k_max_poll, timeout) == 1 &&
+                fds[0].fd == sd_bus_get_fd(bus.client));
+}
+
+LUMEN_TEST(switcheroo_reader_and_its_one_gpu_answer) {
+    // switcheroo-control knows better than the render nodes (one may be vgem, a display-only
+    // device): one GPU in its answer, nothing to offload to.
+    fake_system_bus bus(true);
+    bus.service.gpus = {{"Intel", {"DRI_PRIME", "pci-0000_00_02_0"}, true, false}};
+    lx::shell::app_launcher l;
+    l.probe_gpus(2, bus.client);
+    LUMEN_CHECK(bus.pump(l, [&] { return l.offload_from_switcheroo(); }));
+    LUMEN_CHECK(!l.offload_available() && l.offload_env().empty());
+}
+
+LUMEN_TEST(no_switcheroo_falls_back_to_dri_prime) {
+    // Nothing at the path (on a real bus: ServiceUnknown): the error is the answer.
+    fake_system_bus bus(false);
+    lx::shell::app_launcher l;
+    l.probe_gpus(2, bus.client);
+    (void)bus.pump(l, [] { return false; });
+    LUMEN_CHECK(l.offload_available() && !l.offload_from_switcheroo());
+    LUMEN_CHECK(l.offload_env().size() == 1 && l.offload_env().front() == "DRI_PRIME=1");
+    // One GPU: no system bus at all, nothing to offload to.
+    l.probe_gpus(1, bus.client);
+    pollfd fds[lx::shell::app_launcher::k_max_poll];
+    int timeout = -1;
+    LUMEN_CHECK(!l.offload_available() &&
+                l.poll_fds(fds, lx::shell::app_launcher::k_max_poll, timeout) == 0);
+}
+
+#endif // LUMEN_HAS_LOGIND
 
 int main(int argc, char** argv) {
     return lumen_test::run_all(argc, argv);
