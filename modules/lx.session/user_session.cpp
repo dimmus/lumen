@@ -1,6 +1,7 @@
 module;
 
 #include <stdlib.h>
+#include <sys/resource.h>
 #include <time.h>
 
 #if defined(LUMEN_HAS_LOGIND)
@@ -93,6 +94,38 @@ void service_notifier::watchdog_ping() {
 #if defined(LUMEN_HAS_LOGIND)
     (void)sd_notify(0, "WATCHDOG=1");
 #endif
+}
+
+// ── RLIMIT_NOFILE ────────────────────────────────────────────────────────────
+
+namespace {
+// Written once by `raise` before any child exists; read after fork, where only the
+// async-signal-safe setrlimit may run.
+rlimit g_nofile_start{};
+bool g_nofile_raised = false;
+} // namespace
+
+lx::result<fd_limit::change> fd_limit::raise() {
+    if (g_nofile_raised)
+        return change{g_nofile_start.rlim_cur, g_nofile_start.rlim_max};
+    rlimit lim{};
+    if (::getrlimit(RLIMIT_NOFILE, &lim) != 0)
+        return lx::make_error(lx::io_err::permission_denied, "getrlimit(RLIMIT_NOFILE) failed");
+    // Linux caps the hard limit at fs.nr_open, so it is never RLIM_INFINITY here.
+    if (lim.rlim_cur >= lim.rlim_max)
+        return change{lim.rlim_cur, lim.rlim_cur};
+    const rlimit start = lim;
+    lim.rlim_cur = lim.rlim_max;
+    if (::setrlimit(RLIMIT_NOFILE, &lim) != 0)
+        return lx::make_error(lx::io_err::permission_denied, "setrlimit(RLIMIT_NOFILE) failed");
+    g_nofile_start = start;
+    g_nofile_raised = true;
+    return change{start.rlim_cur, lim.rlim_cur};
+}
+
+void fd_limit::restore_in_child() noexcept {
+    if (g_nofile_raised)
+        (void)::setrlimit(RLIMIT_NOFILE, &g_nofile_start);
 }
 
 // ── The session environment ──────────────────────────────────────────────────

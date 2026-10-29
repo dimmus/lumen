@@ -119,6 +119,15 @@ struct surface_pending {
     lx::compositor::input_region input{};
     bool opaque_set = false;
     lx::compositor::input_region opaque{};
+    /// ext_background_effect_surface_v1.set_blur_region (copied the same way; null and the
+    /// object's destruction set it empty).
+    bool blur_set = false;
+    lx::compositor::input_region blur{};
+    /// wp_color_management_surface_v1.set_image_description / unset (copy semantics: the
+    /// description itself; `color_has` false: none, sRGB). Sticky like scale once set.
+    bool color_set = false;
+    bool color_has = false;
+    lx::gfx::color_description color{};
     /// The wl_surface.commit that made this update (the newest one merged into it):
     /// double-buffered state another object stages for a commit (a pointer constraint's
     /// region) applies with the update that carries that commit.
@@ -218,6 +227,10 @@ struct surface_obj {
     surface_addon* content_type_ctl = nullptr;
     surface_addon* alpha_ctl = nullptr;
     surface_addon* syncobj = nullptr;
+    /// ext_background_effect_surface_v1 (wire_background_effect.cpp).
+    surface_addon* background_effect = nullptr;
+    /// wp_color_management_surface_v1 (wire_color_management.cpp).
+    surface_addon* color_mgmt = nullptr;
     /// fifo-v1: the barrier, set when an update with set_barrier applied, and the frame that
     /// first showed that update (cleared after the next latch of its pace output).
     bool fifo_barrier = false;
@@ -239,6 +252,11 @@ struct surface_obj {
     /// Applied input region (infinite by default) and opaque region (empty by default).
     lx::compositor::input_region input_current{};
     lx::compositor::input_region opaque_current{};
+    /// Applied blur region (ext-background-effect-v1; empty by default).
+    lx::compositor::input_region blur_current{};
+    /// Applied image description (wp_color_manager_v1; none by default: sRGB).
+    bool color_has_current = false;
+    lx::gfx::color_description color_current{};
     /// Output membership (wire_output.cpp): one bit per output slot this surface's node
     /// overlaps — what wl_surface.enter/leave have told the client.
     std::uint32_t outputs = 0;
@@ -561,6 +579,12 @@ extern surface_obj surfaces[k_max_surfaces];
 
 buffer_obj* alloc_buffer();
 void retire_texture(unsigned texture_id);
+/// A closing window's ghost draws `texture_id` (window animations): its retirement waits
+/// until the last `release_texture`. False when the table of held textures is full.
+bool hold_texture(unsigned texture_id);
+void release_texture(unsigned texture_id);
+/// Queues the retirements `defer_retire` held back (called at the start of each tick).
+void flush_deferred_retires();
 void destroy_buffer(buffer_obj* b);
 lx::fourcc shm_format_to_fourcc(uint32_t shm_format);
 lx::fourcc staged_shm_format(wl_shm_buffer* shm);
@@ -701,7 +725,13 @@ void bind_content_type_manager(wayland::client_connection& client, unsigned id, 
 void bind_single_pixel_buffer_manager(wayland::client_connection& client, unsigned id,
                                       int version);
 void bind_alpha_modifier(wayland::client_connection& client, unsigned id, int version);
+/// ext_background_effect_manager_v1 (wire_background_effect.cpp): blur regions.
+void bind_background_effect_manager(wayland::client_connection& client, unsigned id,
+                                    int version);
 void bind_syncobj_manager(wayland::client_connection& client, unsigned id, int version);
+/// wp_color_manager_v1 (wire_color_management.cpp): image descriptions, colour-managed
+/// surfaces.
+void bind_color_manager(wayland::client_connection& client, unsigned id, int version);
 /// A wl_surface is going: every add-on object of it goes inert.
 void surface_addons_destroyed(surface_obj* s);
 /// Creates the add-on resource for `s` and links it into `*slot` (wire_fifo.cpp). Null

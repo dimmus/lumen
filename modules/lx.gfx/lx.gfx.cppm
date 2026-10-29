@@ -14,6 +14,7 @@ export module lx.gfx;
 import std;
 
 export import :damage;
+export import :color;
 export import :primitives;
 export import :dmabuf;
 export import :syncobj;

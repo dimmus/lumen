@@ -10,10 +10,18 @@ import lx.foundation;
 export module lx.gfx:vk_renderer;
 
 import std;
+import lx.trace;
 
 import :damage;
 import :dmabuf;
 import :renderer;
+import :color;
+
+namespace {
+
+[[maybe_unused]] constexpr lx::trace::category log_vk{"gfx"};
+
+} // namespace
 
 export namespace lx::gfx {
 
@@ -127,6 +135,22 @@ struct composite_stats {
     /// `in_fence_fd` or close it. Leaking it leaks a file descriptor per frame. Mirrors
     /// `gl_composite_stats::out_fence_fd` so the present path treats both backends alike.
     int out_fence_fd = -1;
+    /// Non-zero when the frame was timed (`vulkan_compositor::set_gpu_timing`): its GPU time
+    /// comes out of `vulkan_compositor::take_gpu_times` under this serial once its fence
+    /// has signalled.
+    std::uint64_t gpu_serial = 0;
+};
+
+/// One timed frame's GPU time (`vulkan_compositor::set_gpu_timing`), from timestamps written
+/// at the top of its command buffer, after its composite pass and after its encode pass.
+struct composite_gpu_time {
+    /// `composite_stats::gpu_serial` of the frame.
+    std::uint64_t serial = 0;
+    /// Top of the command buffer to the end of the composite pass: the acquires of fresh
+    /// imports, a UI stream's atlas copies (`begin_linear_frame`), the composite pass.
+    std::uint64_t composite_ns = 0;
+    /// The encode pass into the scanout target.
+    std::uint64_t encode_ns = 0;
 };
 
 /// Records and submits the compositor's textured-quad pass.
@@ -280,6 +304,21 @@ public:
     /// Ends the command buffer unsubmitted and un-marks its acquires.
     void abandon_linear_frame();
 
+    // ── GPU timing ──────────────────────────────────────────────────────────────────
+
+    /// Timestamp queries around each frame's composite and encode passes (`composite`,
+    /// `composite_region`, a linear frame). Off by default; off, nothing is recorded or read.
+    /// No effect where the queue family has no valid timestamp bits or the device reports no
+    /// timestamp period (`gpu_timing_supported`). Render affinity, as every frame call.
+    void set_gpu_timing(bool on) { timing_ = on; }
+    [[nodiscard]] bool gpu_timing_supported() const { return query_pool_ != nullptr; }
+    /// Timed frames read and not yet taken; a newer one past this drops the oldest.
+    static constexpr unsigned k_gpu_times = 4;
+    /// Never waits: the timed frames whose fences have signalled and that were not taken yet,
+    /// oldest first, at most `capacity` (the rest stay for the next call). A frame slot's
+    /// times are also read when the slot is reused, which waited for its fence anyway.
+    [[nodiscard]] unsigned take_gpu_times(composite_gpu_time* out, unsigned capacity);
+
     /// Linear intermediates allocated so far. One per target size in use, kept across frames:
     /// a test asserts that outputs of different sizes do not reallocate each other's.
     [[nodiscard]] unsigned linear_allocations() const { return linear_allocations_; }
@@ -305,6 +344,43 @@ public:
                                                       unsigned long long timeout_ns) const;
     /// Render thread: frees `slot` (its capture session ended). Waits for its read first.
     void read_back_free(unsigned slot);
+
+    // ── Backdrop blur (ext-background-effect-v1) ──────────────────────────────────
+
+    /// Outputs with their own blur cache (the compositor's output slots).
+    static constexpr unsigned k_blur_outputs = 16;
+    [[nodiscard]] bool supports_blur() const;
+
+    // ── Colour management (wp_color_manager_v1) ───────────────────────────────────
+
+    /// Draws with an active `blit_command::color` are drawn through their transform
+    /// (composite_cm.frag, a pipeline of its own made on the first such draw): the device
+    /// takes the 160 bytes of push constants it needs. False: such draws are drawn as sRGB.
+    [[nodiscard]] bool supports_color_management() const;
+    /// As `gl_compositor::begin_blur_frame`: opens output `output`'s blur frame (the next
+    /// `composite_region`, or linear frame, of its target), planning it — `damage` may grow,
+    /// and the return says whether a region is blurred again, in which case the composite's
+    /// region and `changed` go through `isolate_blur` (`damage` already has). A stale region
+    /// is blurred inside the frame's own linear pass (the pass is ended, the levels drawn,
+    /// the pass resumed), in a pass rect holding its whole footprint; a draw into any other
+    /// command buffer skips blur draws. Levels (half the footprint, 16-bit float, a few
+    /// images per region) are made on first use.
+    [[nodiscard]] bool begin_blur_frame(unsigned output, std::span<const blur_source> sources,
+                                        damage_region& damage, int width, int height);
+    void end_blur_frame() { blur_current_ = -1; }
+    /// As `gl_compositor::isolate_blur`.
+    void isolate_blur(damage_region& region) const {
+        if (blur_current_ >= 0)
+            blur_outputs_[static_cast<unsigned>(blur_current_)].plan.isolate(region);
+    }
+    /// Frees output `output`'s blur levels (waits for the frames in flight first).
+    void release_blur(unsigned output);
+    [[nodiscard]] bool blur_in_use(unsigned output) const {
+        return output < k_blur_outputs && blur_outputs_[output].used;
+    }
+    /// Regions blurred so far (each a level 0 and its passes); a cached one drawn again is
+    /// not counted. For tests and benchmarks.
+    [[nodiscard]] unsigned long long blur_runs() const { return blur_runs_; }
 
 private:
     static constexpr unsigned k_max_textures = 256;
@@ -383,6 +459,14 @@ private:
     /// Blocks until every submitted frame slot has completed. Required before destroying
     /// any resource a queued command buffer might reference.
     void wait_all_slots_idle();
+    /// Right after the current slot's command buffer was begun: whether this frame is timed
+    /// (`set_gpu_timing`), and if so its timestamps reset and the first one written.
+    void begin_timing(void* command_buffer);
+    /// Timestamp `which` (1: after the composite pass, 2: after the encode pass) of a timed
+    /// frame; nothing for an untimed one.
+    void write_timestamp(void* command_buffer, unsigned which);
+    /// Reads `slot`'s timestamps (its fence has signalled) into `gpu_done_`.
+    void read_timing(unsigned slot);
 
     /// `record_blits`' pipelines, one per attachment format (dynamic rendering: a pipeline
     /// is made for one colour attachment of a format). Fixed: a fifth format evicts the first.
@@ -392,8 +476,54 @@ private:
         void* pipeline = nullptr;
         /// The same without blending, for `blend_mode::opaque` draws (`opaque_pipeline_`).
         void* opaque_pipeline = nullptr;
+        /// The colour-managed pair (`cm_pipeline_`), made on the format's first such draw.
+        void* cm_pipeline = nullptr;
+        void* cm_opaque_pipeline = nullptr;
     };
     pass_pipeline pass_pipelines_[k_pass_pipelines]{};
+
+    struct blur_level {
+        void* image = nullptr;
+        void* memory = nullptr;
+        void* view = nullptr;
+        /// Sampled through the composite layout (the next pass, and level 0 by its draws).
+        void* set = nullptr;
+        /// Allocated texels (≥ the level's size, rounded up: a resizing region does not
+        /// reallocate — and wait for the GPU — every frame).
+        int width = 0;
+        int height = 0;
+    };
+    struct blur_entry {
+        blur_level levels[k_blur_levels]{};
+    };
+    struct blur_output {
+        blur_planner plan{};
+        blur_entry entries[k_max_blur_sources]{};
+        bool used = false;
+    };
+    /// Descriptor sets the pool holds for blur levels, beyond the textures'.
+    static constexpr unsigned k_blur_sets = 64;
+    /// Records blur draw `cmd` inside the open linear pass on `command_buffer`, scissored to
+    /// `area` (∩ clip, visible): its region's level 0, blurred first when it is stale (only
+    /// when `own_pass`: this compositor's frame with its pass open, and `area` holds the whole
+    /// footprint — culled otherwise, `blur_planner::isolate`). The binding trackers are
+    /// reset when the blur ran (the pass was ended and resumed).
+    void record_blur(void* command_buffer, const blit_command& cmd, lx::rect2i area,
+                     unsigned target_w, unsigned target_h, bool own_pass, void*& bound_pipeline,
+                     void*& bound_set, composite_stats& stats);
+    [[nodiscard]] bool ensure_blur_pipeline();
+    [[nodiscard]] bool ensure_blur_levels(blur_entry& e, lx::rect2i footprint);
+    void destroy_blur_entry(blur_entry& e);
+    void run_blur(void* command_buffer, const blur_entry& e, lx::rect2i footprint);
+    blur_output blur_outputs_[k_blur_outputs]{};
+    int blur_current_ = -1;
+    unsigned long long blur_runs_ = 0;
+    void* blur_pipeline_ = nullptr;
+    void* blur_layout_ = nullptr;
+    bool blur_failed_ = false;
+    unsigned blur_sets_used_ = 0;
+    /// The open composite pass's render area: where a pass ended for a blur resumes.
+    lx::rect2i pass_area_{};
     /// Records the acquire of every imported image not yet acquired (outside a pass).
     void record_acquires(void* command_buffer);
     /// Shared by `composite` and `prepare_blits`: the 1×1 texture solid draws bind.
@@ -423,6 +553,16 @@ private:
     /// a source of alpha 1 replaces the destination either way (src·1 + dst·0 is exact), so
     /// the pixels are the same and the destination is not read.
     void* opaque_pipeline_ = nullptr;
+    /// composite_cm.frag's pipelines for the linear format (blending, opaque): made on the
+    /// first colour-managed draw, never for a desktop without one. `cm_push_` says the
+    /// layout's push range holds `quad_push_cm`; `cm_failed_` that making them failed.
+    void* cm_pipeline_ = nullptr;
+    void* cm_opaque_pipeline_ = nullptr;
+    bool cm_push_ = false;
+    bool cm_failed_ = false;
+    /// The colour-managed pipeline pair for `format` (the linear format's own, or a pass
+    /// pipeline's), made when missing. False when they cannot be made.
+    [[nodiscard]] bool ensure_cm_pipelines(unsigned vk_format, void*& blend, void*& opaque);
     void* pipeline_layout_ = nullptr;
     void* descriptor_layout_ = nullptr;
     void* descriptor_pool_ = nullptr;
@@ -435,6 +575,22 @@ private:
     void* slot_semaphores_[k_frame_slots]{};
     bool can_export_fence_ = false;
     unsigned submit_slot_ = 0;
+
+    /// GPU timing: `k_timestamps` per frame slot in one pool, made at `initialize` when the
+    /// queue family has valid timestamp bits.
+    static constexpr unsigned k_timestamps = 3;
+    void* query_pool_ = nullptr;
+    unsigned timestamp_bits_ = 0;
+    double timestamp_period_ns_ = 0.0;
+    bool timing_ = false;
+    /// The command buffer recorded for the slot wrote timestamps: set by every frame's
+    /// `begin_timing`, cleared by the other recordings of a slot (an upload, a read-back).
+    bool slot_timed_[k_frame_slots]{};
+    /// Serial of the timed frame submitted in the slot whose times are not read yet; 0: none.
+    std::uint64_t slot_serial_[k_frame_slots]{};
+    std::uint64_t gpu_serial_ = 0;
+    composite_gpu_time gpu_done_[k_gpu_times]{};
+    unsigned gpu_done_count_ = 0;
     void* staging_buffer_ = nullptr;
     void* staging_memory_ = nullptr;
     unsigned char* staging_mapped_ = nullptr;
@@ -552,6 +708,44 @@ struct quad_push {
     float solid[4]{0.f, 0.f, 0.f, 0.f};
 };
 static_assert(sizeof(quad_push) == 112, "quad_push must match composite.vert/.frag");
+
+/// composite_cm.frag's block: `quad_push`, then the colour transform's matrix rows with the
+/// power exponent (m0.w), the content peak (m1.w) and the encoded-target flag (m2.w).
+struct quad_push_cm {
+    quad_push base{};
+    float m0[4]{1.f, 0.f, 0.f, 2.2f};
+    float m1[4]{0.f, 1.f, 0.f, 1.f};
+    float m2[4]{0.f, 0.f, 1.f, 0.f};
+};
+static_assert(sizeof(quad_push_cm) == 160, "quad_push_cm must match composite_cm.frag");
+
+/// composite_cm.frag's decode selector: 0 ext_linear, 1 sRGB, 2 power, 3 PQ.
+[[nodiscard]] inline int color_slot(lx::gfx::color_tf tf) {
+    switch (tf) {
+    case lx::gfx::color_tf::ext_linear: return 0;
+    case lx::gfx::color_tf::power: return 2;
+    case lx::gfx::color_tf::st2084_pq: return 3;
+    case lx::gfx::color_tf::srgb:
+    default: return 1;
+    }
+}
+
+/// A colour-managed draw's push constants: `base` with the transform of `cmd.color`.
+[[nodiscard]] quad_push_cm make_quad_push_cm(const quad_push& base,
+                                             const lx::gfx::color_transform& t, bool encoded) {
+    quad_push_cm push{};
+    push.base = base;
+    push.base.transfer = color_slot(t.tf);
+    for (unsigned c = 0; c < 3; ++c) {
+        push.m0[c] = t.matrix[c];
+        push.m1[c] = t.matrix[3 + c];
+        push.m2[c] = t.matrix[6 + c];
+    }
+    push.m0[3] = t.power;
+    push.m1[3] = t.peak;
+    push.m2[3] = encoded ? 1.f : 0.f;
+    return push;
+}
 
 /// Mirrors the `encode_push` block in encode.frag.
 struct encode_push {
@@ -734,6 +928,12 @@ constexpr uint32_t k_encode_vert_spv[] =
 constexpr uint32_t k_encode_frag_spv[] =
 #include "shaders/encode.frag.spv.h"
     ;
+constexpr uint32_t k_blur_frag_spv[] =
+#include "shaders/blur.frag.spv.h"
+    ;
+constexpr uint32_t k_composite_cm_frag_spv[] =
+#include "shaders/composite_cm.frag.spv.h"
+    ;
     ;
 
 VkShaderModule create_shader(VkDevice dev, const uint32_t* code, std::size_t bytes) {
@@ -798,12 +998,19 @@ void begin_rendering(VkCommandBuffer cb, VkImageView view, VkRect2D area,
 
 /// The composite pipeline (composite.vert/.frag, premultiplied source-over — or no blending
 /// when `blend` is false, for opaque draws — viewport and scissor dynamic) for one colour
-/// attachment of `format` (dynamic rendering). Null on failure.
+/// attachment of `format` (dynamic rendering). Null on failure. `blur` makes the blur passes'
+/// pipeline instead (encode.vert's fullscreen triangle, blur.frag; pass `blend` false);
+/// `color` the colour-managed one (composite_cm.frag, `quad_push_cm`).
 VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_layout,
                                      VkFormat format, VkPipelineCache cache,
-                                     bool blend = true) {
-    VkShaderModule vert = create_shader(dev, k_composite_vert_spv, sizeof(k_composite_vert_spv));
-    VkShaderModule frag = create_shader(dev, k_composite_frag_spv, sizeof(k_composite_frag_spv));
+                                     bool blend = true, bool blur = false, bool color = false) {
+    VkShaderModule vert =
+        blur ? create_shader(dev, k_encode_vert_spv, sizeof(k_encode_vert_spv))
+             : create_shader(dev, k_composite_vert_spv, sizeof(k_composite_vert_spv));
+    VkShaderModule frag =
+        blur    ? create_shader(dev, k_blur_frag_spv, sizeof(k_blur_frag_spv))
+        : color ? create_shader(dev, k_composite_cm_frag_spv, sizeof(k_composite_cm_frag_spv))
+                : create_shader(dev, k_composite_frag_spv, sizeof(k_composite_frag_spv));
     if (!vert || !frag) {
         if (vert)
             vkDestroyShaderModule(dev, vert, nullptr);
@@ -1270,6 +1477,94 @@ void lx::gfx::vulkan_compositor::wait_all_slots_idle() {
 #endif
 }
 
+void lx::gfx::vulkan_compositor::begin_timing(void* command_buffer) {
+    const unsigned slot = submit_slot_;
+    slot_timed_[slot] = timing_ && query_pool_ != nullptr;
+#if defined(LUMEN_HAS_VULKAN)
+    if (!slot_timed_[slot])
+        return;
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    auto qp = static_cast<VkQueryPool>(query_pool_);
+    vkCmdResetQueryPool(cb, qp, k_timestamps * slot, k_timestamps);
+    vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, qp, k_timestamps * slot);
+#else
+    (void)command_buffer;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::write_timestamp(void* command_buffer, unsigned which) {
+#if defined(LUMEN_HAS_VULKAN)
+    const unsigned slot = submit_slot_;
+    if (!slot_timed_[slot])
+        return;
+    // Bottom of pipe: written once everything recorded before it has finished.
+    vkCmdWriteTimestamp(static_cast<VkCommandBuffer>(command_buffer),
+                        VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                        static_cast<VkQueryPool>(query_pool_), k_timestamps * slot + which);
+#else
+    (void)command_buffer;
+    (void)which;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::read_timing(unsigned slot) {
+    const std::uint64_t serial = slot_serial_[slot];
+    slot_serial_[slot] = 0;
+#if defined(LUMEN_HAS_VULKAN)
+    std::uint64_t ticks[k_timestamps]{};
+    // No WAIT bit: the slot's fence has signalled, so the results are available; anything
+    // else (VK_NOT_READY, a lost device) drops this frame's time rather than blocking.
+    if (!query_pool_ ||
+        vkGetQueryPoolResults(static_cast<VkDevice>(ctx_.device),
+                              static_cast<VkQueryPool>(query_pool_), k_timestamps * slot,
+                              k_timestamps, sizeof ticks, ticks, sizeof ticks[0],
+                              VK_QUERY_RESULT_64_BIT) != VK_SUCCESS)
+        return;
+    const std::uint64_t mask = timestamp_bits_ >= 64 ? ~0ull : ((1ull << timestamp_bits_) - 1ull);
+    const auto ns = [&](std::uint64_t from, std::uint64_t to) {
+        return static_cast<std::uint64_t>(static_cast<double>((to - from) & mask) *
+                                          timestamp_period_ns_);
+    };
+    if (gpu_done_count_ == k_gpu_times) {
+        // Not taken in time: the oldest goes.
+        for (unsigned i = 1; i < k_gpu_times; ++i)
+            gpu_done_[i - 1] = gpu_done_[i];
+        --gpu_done_count_;
+    }
+    gpu_done_[gpu_done_count_++] = {serial, ns(ticks[0], ticks[1]), ns(ticks[1], ticks[2])};
+#else
+    (void)serial;
+#endif
+}
+
+unsigned lx::gfx::vulkan_compositor::take_gpu_times(composite_gpu_time* out, unsigned capacity) {
+#if defined(LUMEN_HAS_VULKAN)
+    // Slots whose frame has finished, oldest first. A fence still unsignalled is left for a
+    // later call: nothing here waits.
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    for (unsigned pass = 0; pass < k_frame_slots; ++pass) {
+        int oldest = -1;
+        for (unsigned i = 0; i < k_frame_slots; ++i)
+            if (slot_serial_[i] != 0 &&
+                (oldest < 0 || slot_serial_[i] < slot_serial_[static_cast<unsigned>(oldest)]))
+                oldest = static_cast<int>(i);
+        if (oldest < 0)
+            break;
+        const auto i = static_cast<unsigned>(oldest);
+        if (vkGetFenceStatus(dev, static_cast<VkFence>(fences_[i])) != VK_SUCCESS)
+            break; // the queue completes in order: a newer frame is not done either
+        read_timing(i);
+    }
+#endif
+    const unsigned n = capacity < gpu_done_count_ ? capacity : gpu_done_count_;
+    for (unsigned i = 0; i < n; ++i)
+        out[i] = gpu_done_[i];
+    for (unsigned i = n; i < gpu_done_count_; ++i)
+        gpu_done_[i - n] = gpu_done_[i];
+    gpu_done_count_ -= n;
+    return n;
+}
+
 void lx::gfx::vulkan_compositor::wait_external(const texture_slot& slot) {
     if (!slot.external_use)
         return;
@@ -1363,12 +1658,13 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx,
     // create or destroy descriptor objects.
     VkDescriptorPoolSize pool_size{};
     pool_size.type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    pool_size.descriptorCount = k_max_textures + k_linear_targets;
+    pool_size.descriptorCount = k_max_textures + k_linear_targets + k_blur_sets;
 
     VkDescriptorPoolCreateInfo dpci{};
     dpci.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     dpci.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    dpci.maxSets = k_max_textures + k_linear_targets; // + the encode pass's sets
+    // + the encode pass's sets, + blur levels' (made on first use).
+    dpci.maxSets = k_max_textures + k_linear_targets + k_blur_sets;
     dpci.poolSizeCount = 1;
     dpci.pPoolSizes = &pool_size;
 
@@ -1400,10 +1696,18 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx,
     for (unsigned i = 0; i < k_linear_targets; ++i)
         linear_targets_[i].encode_set = encode_sets[i];
 
+    // Room for a colour-managed draw's block (`quad_push_cm`) where the device has it: one
+    // layout for both, so switching between the pipelines keeps sets and push state bound.
+    // An ordinary draw still pushes its 112 bytes.
+    {
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(static_cast<VkPhysicalDevice>(ctx_.physical_device), &props);
+        cm_push_ = props.limits.maxPushConstantsSize >= sizeof(quad_push_cm);
+    }
     VkPushConstantRange push_range{};
     push_range.stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     push_range.offset = 0;
-    push_range.size = sizeof(quad_push);
+    push_range.size = cm_push_ ? sizeof(quad_push_cm) : sizeof(quad_push);
 
     VkPipelineLayoutCreateInfo plci{};
     plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
@@ -1476,6 +1780,31 @@ lx::result<void> lx::gfx::vulkan_compositor::initialize(const vk_context& ctx,
         }
     }
 
+    // GPU timing (`set_gpu_timing`): one pool for every slot's timestamps, made once here.
+    // Optional: without timestamp bits on the queue family, frames are simply not timed.
+    {
+        auto phys = static_cast<VkPhysicalDevice>(ctx_.physical_device);
+        VkPhysicalDeviceProperties props{};
+        vkGetPhysicalDeviceProperties(phys, &props);
+        std::uint32_t families = 0;
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &families, nullptr);
+        VkQueueFamilyProperties family_props[16]{};
+        families = families > 16 ? 16 : families;
+        vkGetPhysicalDeviceQueueFamilyProperties(phys, &families, family_props);
+        timestamp_bits_ =
+            ctx_.queue_family < families ? family_props[ctx_.queue_family].timestampValidBits : 0u;
+        timestamp_period_ns_ = static_cast<double>(props.limits.timestampPeriod);
+        if (timestamp_bits_ > 0 && timestamp_period_ns_ > 0.0) {
+            VkQueryPoolCreateInfo qci{};
+            qci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qci.queryCount = k_timestamps * k_frame_slots;
+            VkQueryPool qp = VK_NULL_HANDLE;
+            if (vkCreateQueryPool(dev, &qci, nullptr, &qp) == VK_SUCCESS)
+                query_pool_ = qp;
+        }
+    }
+
     // Uploads write shm textures from the host when the device can; the staging ring then
     // never exists.
     host_copy_.init(ctx_, static_cast<unsigned>(VK_FORMAT_R8G8B8A8_UNORM));
@@ -1528,8 +1857,27 @@ void lx::gfx::vulkan_compositor::shutdown() {
             slot_semaphores_[i] = nullptr;
         }
         can_export_fence_ = false;
+        if (query_pool_)
+            vkDestroyQueryPool(dev, static_cast<VkQueryPool>(query_pool_), nullptr);
+        query_pool_ = nullptr;
+        for (unsigned i = 0; i < k_frame_slots; ++i) {
+            slot_timed_[i] = false;
+            slot_serial_[i] = 0;
+        }
+        gpu_done_count_ = 0;
         for (unsigned i = 0; i < k_readback_slots; ++i)
             read_back_free(i);
+
+        for (unsigned o = 0; o < k_blur_outputs; ++o)
+            release_blur(o);
+        blur_current_ = -1;
+        if (blur_pipeline_)
+            vkDestroyPipeline(dev, static_cast<VkPipeline>(blur_pipeline_), nullptr);
+        blur_pipeline_ = nullptr;
+        if (blur_layout_)
+            vkDestroyPipelineLayout(dev, static_cast<VkPipelineLayout>(blur_layout_), nullptr);
+        blur_layout_ = nullptr;
+        blur_failed_ = false;
 
         destroy_encode_pipeline();
         for (linear_target& t : linear_targets_) {
@@ -1547,11 +1895,19 @@ void lx::gfx::vulkan_compositor::shutdown() {
                 vkDestroyPipeline(dev, static_cast<VkPipeline>(p.pipeline), nullptr);
             if (p.opaque_pipeline)
                 vkDestroyPipeline(dev, static_cast<VkPipeline>(p.opaque_pipeline), nullptr);
+            if (p.cm_pipeline)
+                vkDestroyPipeline(dev, static_cast<VkPipeline>(p.cm_pipeline), nullptr);
+            if (p.cm_opaque_pipeline)
+                vkDestroyPipeline(dev, static_cast<VkPipeline>(p.cm_opaque_pipeline), nullptr);
         }
         if (pipeline_)
             vkDestroyPipeline(dev, static_cast<VkPipeline>(pipeline_), nullptr);
         if (opaque_pipeline_)
             vkDestroyPipeline(dev, static_cast<VkPipeline>(opaque_pipeline_), nullptr);
+        if (cm_pipeline_)
+            vkDestroyPipeline(dev, static_cast<VkPipeline>(cm_pipeline_), nullptr);
+        if (cm_opaque_pipeline_)
+            vkDestroyPipeline(dev, static_cast<VkPipeline>(cm_opaque_pipeline_), nullptr);
         if (pipeline_layout_)
             vkDestroyPipelineLayout(dev, static_cast<VkPipelineLayout>(pipeline_layout_),
                                     nullptr);
@@ -1579,6 +1935,10 @@ void lx::gfx::vulkan_compositor::shutdown() {
     submit_slot_ = 0;
     pipeline_ = nullptr;
     opaque_pipeline_ = nullptr;
+    cm_pipeline_ = nullptr;
+    cm_opaque_pipeline_ = nullptr;
+    cm_push_ = false;
+    cm_failed_ = false;
     for (pass_pipeline& p : pass_pipelines_)
         p = {};
     pipeline_layout_ = nullptr;
@@ -1838,6 +2198,7 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
         return vk_error("vkWaitForFences timed out reclaiming upload slot");
     vkResetFences(dev, 1, &fence);
     vkResetCommandBuffer(cb, 0);
+    slot_timed_[frame_slot] = false; // an upload is not a frame
 
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1957,6 +2318,13 @@ lx::result<void> lx::gfx::vulkan_compositor::submit_current_slot(bool wait_for_c
     if (!dev || !queue || !cb || !fence)
         return lx::not_implemented("lx::gfx::vulkan_compositor::submit_current_slot");
 
+    // The slot's previous timed frame has finished (every caller waited for the slot's fence
+    // before recording it again): its times are read before this submit resets them.
+    if (slot_serial_[slot] != 0)
+        read_timing(slot);
+    const bool timed = slot_timed_[slot];
+    slot_timed_[slot] = false;
+
     // Export the frame's completion only when the caller wants it and the device can. The
     // signal has to be requested at submit time, so this decides before the submit.
     const bool want_export = out_fence_fd != nullptr && can_export_fence_ &&
@@ -1973,6 +2341,8 @@ lx::result<void> lx::gfx::vulkan_compositor::submit_current_slot(bool wait_for_c
     }
     if (vkQueueSubmit(queue, 1, &submit, fence) != VK_SUCCESS)
         return vk_error("vkQueueSubmit failed");
+    if (timed)
+        slot_serial_[slot] = ++gpu_serial_;
 
     bool exported = false;
     if (want_export) {
@@ -2462,6 +2832,8 @@ void lx::gfx::vulkan_compositor::begin_composite_pass(void* command_buffer, unsi
         area.offset = {box.x, box.y};
         area.extent = {static_cast<unsigned>(box.width), static_cast<unsigned>(box.height)};
     }
+    pass_area_ = {area.offset.x, area.offset.y, static_cast<int>(area.extent.width),
+                  static_cast<int>(area.extent.height)};
     begin_rendering(cb, static_cast<VkImageView>(linear_->view), area,
                     pass_full_ ? &clear_value : nullptr, true);
 
@@ -2652,6 +3024,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     vkBeginCommandBuffer(cb, &begin);
+    begin_timing(cb);
 
     record_acquires(cb);
     begin_composite_pass(cb, target.width(), target.height(), clear);
@@ -2673,6 +3046,11 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
             const auto& cmd = cmds[i];
             if (cmd.occluded || draw_invisible(cmd)) {
                 ++stats.draws_culled;
+                continue;
+            }
+            if (cmd.blur) {
+                record_blur(cb, cmd, area, target.width(), target.height(), true,
+                            bound_pipeline, bound_set, stats);
                 continue;
             }
             // A solid draw samples nothing: any set will do, the frame's current one first.
@@ -2727,8 +3105,13 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
                 bound_set = want_set;
             }
             // Bound sets, push constants and dynamic state survive the switch: one layout.
+            // A colour-managed draw (wp_color_manager_v1) takes composite_cm.frag's pair.
+            const bool cm = cmd.color.active && supports_color_management() &&
+                            ensure_cm_pipelines(static_cast<unsigned>(k_linear_format),
+                                                cm_pipeline_, cm_opaque_pipeline_);
             void* want_pipeline =
-                cmd.blend == lx::blend_mode::opaque ? opaque_pipeline_ : pipeline_;
+                cm ? (cmd.blend == lx::blend_mode::opaque ? cm_opaque_pipeline_ : cm_pipeline_)
+                   : (cmd.blend == lx::blend_mode::opaque ? opaque_pipeline_ : pipeline_);
             if (want_pipeline != bound_pipeline) {
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                   static_cast<VkPipeline>(want_pipeline));
@@ -2738,9 +3121,16 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
                 cmd, slot_ptr ? slot_ptr->width : 0u, slot_ptr ? slot_ptr->height : 0u,
                 target.width(), target.height(), transfer_slot(cmd.src_transfer));
 
-            vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
-                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                               sizeof(push), &push);
+            if (cm) {
+                const quad_push_cm cpush = make_quad_push_cm(push, cmd.color, false);
+                vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                   sizeof(cpush), &cpush);
+            } else {
+                vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
+                                   VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                                   sizeof(push), &push);
+            }
 
             for (unsigned p = 0; p < part_count; ++p) {
                 vkCmdSetScissor(cb, 0, 1, &parts[p]);
@@ -2751,11 +3141,14 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
     }
 
     end_composite_pass(cb);
+    write_timestamp(cb, 1);
     record_encode_pass(cb, target);
+    write_timestamp(cb, 2);
     vkEndCommandBuffer(cb);
 
     if (auto submitted = submit_current_slot(true, &stats.out_fence_fd); !submitted)
         return submitted.get_error();
+    stats.gpu_serial = slot_serial_[slot];
     finish_frame(target);
     return stats;
 #else
@@ -2892,9 +3285,15 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
             vkDestroyPipeline(dev, static_cast<VkPipeline>(pass_pipelines_[0].pipeline), nullptr);
             vkDestroyPipeline(dev, static_cast<VkPipeline>(pass_pipelines_[0].opaque_pipeline),
                               nullptr);
+            if (pass_pipelines_[0].cm_pipeline)
+                vkDestroyPipeline(dev, static_cast<VkPipeline>(pass_pipelines_[0].cm_pipeline),
+                                  nullptr);
+            if (pass_pipelines_[0].cm_opaque_pipeline)
+                vkDestroyPipeline(
+                    dev, static_cast<VkPipeline>(pass_pipelines_[0].cm_opaque_pipeline), nullptr);
             slot = 0;
         }
-        pass_pipelines_[slot] = {vk_format, made, made_opaque};
+        pass_pipelines_[slot] = {vk_format, made, made_opaque, nullptr, nullptr};
         pipeline = made;
         opaque_pipeline = made_opaque;
     }
@@ -2914,6 +3313,17 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
         const blit_command& cmd = cmds[i];
         if (cmd.occluded || draw_invisible(cmd)) {
             ++stats.draws_culled;
+            continue;
+        }
+        if (cmd.blur) {
+            // Only into the linear pass (`:ui_vk`'s frame); its own command buffer may blur.
+            if (!linear) {
+                ++stats.draws_culled;
+                continue;
+            }
+            record_blur(cb, cmd, scissor, width, height, !external && linear_pass_open_,
+                        bound_pipeline, bound_set, stats);
+            vkCmdSetViewport(cb, 0, 1, &viewport);
             continue;
         }
         // As `composite`: a solid draw samples nothing, any set will do.
@@ -2964,8 +3374,28 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
         }
         if (external && index >= 0)
             textures_[static_cast<unsigned>(index)].external_use = true;
-        // As `composite`: opaque draws without blending, sets and push ranges kept bound.
-        void* want_pipeline = cmd.blend == lx::blend_mode::opaque ? opaque_pipeline : pipeline;
+        // As `composite`: opaque draws without blending, sets and push ranges kept bound;
+        // a colour-managed draw through the format's composite_cm.frag pair (on an encoded
+        // target it encodes its result itself).
+        void* cm_blend = nullptr;
+        void* cm_opaque = nullptr;
+        bool cm = false;
+        if (cmd.color.active && supports_color_management()) {
+            if (linear) {
+                cm = ensure_cm_pipelines(vk_format, cm_pipeline_, cm_opaque_pipeline_);
+                cm_blend = cm_pipeline_;
+                cm_opaque = cm_opaque_pipeline_;
+            } else {
+                for (pass_pipeline& p : pass_pipelines_)
+                    if (!cm && p.pipeline && p.format == vk_format) {
+                        cm = ensure_cm_pipelines(vk_format, p.cm_pipeline, p.cm_opaque_pipeline);
+                        cm_blend = p.cm_pipeline;
+                        cm_opaque = p.cm_opaque_pipeline;
+                    }
+            }
+        }
+        void* want_pipeline = cm ? (cmd.blend == lx::blend_mode::opaque ? cm_opaque : cm_blend)
+                                 : (cmd.blend == lx::blend_mode::opaque ? opaque_pipeline : pipeline);
         if (want_pipeline != bound_pipeline) {
             vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                               static_cast<VkPipeline>(want_pipeline));
@@ -2976,9 +3406,16 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
         const quad_push push =
             make_quad_push(cmd, slot_ptr ? slot_ptr->width : 0u, slot_ptr ? slot_ptr->height : 0u,
                            width, height, encoded ? 0 : transfer_slot(cmd.src_transfer));
-        vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
-                           VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
-                           sizeof(push), &push);
+        if (cm) {
+            const quad_push_cm cpush = make_quad_push_cm(push, cmd.color, encoded);
+            vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(cpush), &cpush);
+        } else {
+            vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
+                               VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0,
+                               sizeof(push), &push);
+        }
         for (unsigned p = 0; p < part_count; ++p) {
             vkCmdSetScissor(cb, 0, 1, &parts[p]);
             vkCmdDraw(cb, 6, 1, 0, 0);
@@ -2997,6 +3434,493 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
     (void)scissor;
     (void)encoded;
     return lx::not_implemented("lx::gfx::vulkan_compositor::record_blits");
+#endif
+}
+
+bool lx::gfx::vulkan_compositor::supports_color_management() const {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    return ready() && cm_push_ && !cm_failed_;
+#else
+    return false;
+#endif
+}
+
+bool lx::gfx::vulkan_compositor::ensure_cm_pipelines(unsigned vk_format, void*& blend,
+                                                     void*& opaque) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    if (blend && opaque)
+        return true;
+    if (cm_failed_)
+        return false;
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    const auto layout = static_cast<VkPipelineLayout>(pipeline_layout_);
+    const auto cache = static_cast<VkPipelineCache>(pipeline_cache_);
+    VkPipeline b = create_composite_pipeline(dev, layout, static_cast<VkFormat>(vk_format), cache,
+                                             true, false, true);
+    VkPipeline o = b ? create_composite_pipeline(dev, layout, static_cast<VkFormat>(vk_format),
+                                                 cache, false, false, true)
+                     : VK_NULL_HANDLE;
+    if (!o) {
+        if (b)
+            vkDestroyPipeline(dev, b, nullptr);
+        // Colour-managed draws are drawn as sRGB from here on; never retried per frame.
+        cm_failed_ = true;
+        log_vk.error(vk_error("colour-managed composite pipeline creation failed"));
+        return false;
+    }
+    blend = b;
+    opaque = o;
+    return true;
+#else
+    (void)vk_format;
+    (void)blend;
+    (void)opaque;
+    return false;
+#endif
+}
+
+bool lx::gfx::vulkan_compositor::supports_blur() const {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    return ready() && !blur_failed_;
+#else
+    return false;
+#endif
+}
+
+bool lx::gfx::vulkan_compositor::begin_blur_frame(unsigned output,
+                                                  std::span<const blur_source> sources,
+                                                  damage_region& damage, int width, int height) {
+    blur_current_ = -1;
+    if (!supports_blur() || output >= k_blur_outputs || sources.empty())
+        return false;
+    blur_output& o = blur_outputs_[output];
+    o.used = true;
+    blur_current_ = static_cast<int>(output);
+    const bool again = o.plan.plan(sources, damage, width, height);
+    // Levels are made (or remade, after waiting for the frames in flight) here, before the
+    // frame's command buffer is begun — never while it is being recorded.
+    for (unsigned k = 0; k < o.plan.count(); ++k)
+        if (o.plan.pending(k) && sources[k].visible)
+            (void)(ensure_blur_pipeline() && ensure_blur_levels(o.entries[k], o.plan.footprint(k)));
+    return again;
+}
+
+void lx::gfx::vulkan_compositor::destroy_blur_entry(blur_entry& e) {
+#if defined(LUMEN_HAS_VULKAN)
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    for (blur_level& l : e.levels) {
+        if (dev) {
+            if (l.set) {
+                auto set = static_cast<VkDescriptorSet>(l.set);
+                (void)vkFreeDescriptorSets(dev, static_cast<VkDescriptorPool>(descriptor_pool_), 1,
+                                           &set);
+                --blur_sets_used_;
+            }
+            if (l.view)
+                vkDestroyImageView(dev, static_cast<VkImageView>(l.view), nullptr);
+            if (l.image)
+                vkDestroyImage(dev, static_cast<VkImage>(l.image), nullptr);
+            if (l.memory)
+                vkFreeMemory(dev, static_cast<VkDeviceMemory>(l.memory), nullptr);
+        }
+        l = {};
+    }
+#else
+    (void)e;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::release_blur(unsigned output) {
+    if (output >= k_blur_outputs || !blur_outputs_[output].used)
+        return;
+    blur_output& o = blur_outputs_[output];
+    // Rare (an output stops blurring, or goes): whatever is in flight may sample its levels.
+    bool any = false;
+    for (const blur_entry& e : o.entries)
+        any = any || e.levels[0].image;
+    if (any)
+        wait_all_slots_idle();
+    for (blur_entry& e : o.entries)
+        destroy_blur_entry(e);
+    o.plan.reset();
+    o.used = false;
+    if (blur_current_ == static_cast<int>(output))
+        blur_current_ = -1;
+}
+
+bool lx::gfx::vulkan_compositor::ensure_blur_pipeline() {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    if (blur_pipeline_)
+        return true;
+    if (blur_failed_)
+        return false;
+    // Made on the first blur, not at start-up: a session nobody blurs in builds nothing.
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    VkPushConstantRange push_range{};
+    push_range.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
+    push_range.size = 32;
+    auto set_layout = static_cast<VkDescriptorSetLayout>(descriptor_layout_);
+    VkPipelineLayoutCreateInfo plci{};
+    plci.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    plci.setLayoutCount = 1;
+    plci.pSetLayouts = &set_layout;
+    plci.pushConstantRangeCount = 1;
+    plci.pPushConstantRanges = &push_range;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    if (vkCreatePipelineLayout(dev, &plci, nullptr, &layout) == VK_SUCCESS) {
+        blur_layout_ = layout;
+        blur_pipeline_ = create_composite_pipeline(
+            dev, layout, k_linear_format, static_cast<VkPipelineCache>(pipeline_cache_), false,
+            true);
+    }
+    if (!blur_pipeline_) {
+        blur_failed_ = true;
+        if (blur_layout_)
+            vkDestroyPipelineLayout(dev, static_cast<VkPipelineLayout>(blur_layout_), nullptr);
+        blur_layout_ = nullptr;
+        log_vk.warn("backdrop blur pipeline creation failed: blur regions are not drawn");
+        return false;
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool lx::gfx::vulkan_compositor::ensure_blur_levels(blur_entry& e, lx::rect2i footprint) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    bool waited = false;
+    for (unsigned k = 0; k < k_blur_levels; ++k) {
+        const lx::size2i want = blur_level_size(footprint, k);
+        if (want.width <= 0 || want.height <= 0)
+            return false;
+        blur_level& l = e.levels[k];
+        // Rounded up (with a texel to spare, which the draws' source box may reach), and kept
+        // unless far too large: a region resizing with its window reallocates now and then.
+        if (l.image && want.width < l.width && want.height < l.height &&
+            l.width <= 2 * want.width + 64 && l.height <= 2 * want.height + 64)
+            continue;
+        if (l.image && !waited) {
+            wait_all_slots_idle();
+            waited = true;
+        }
+        // The image goes; its descriptor set stays, to be pointed at the new one.
+        if (l.view)
+            vkDestroyImageView(dev, static_cast<VkImageView>(l.view), nullptr);
+        if (l.image)
+            vkDestroyImage(dev, static_cast<VkImage>(l.image), nullptr);
+        if (l.memory)
+            vkFreeMemory(dev, static_cast<VkDeviceMemory>(l.memory), nullptr);
+        l.view = nullptr;
+        l.image = nullptr;
+        l.memory = nullptr;
+        const int aw = (want.width + 1 + 31) & ~31;
+        const int ah = (want.height + 1 + 31) & ~31;
+
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = k_linear_format;
+        ici.extent = {static_cast<unsigned>(aw), static_cast<unsigned>(ah), 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage image = VK_NULL_HANDLE;
+        bool ok = vkCreateImage(dev, &ici, nullptr, &image) == VK_SUCCESS;
+        l.image = image;
+        VkMemoryRequirements req{};
+        int type = -1;
+        if (ok) {
+            vkGetImageMemoryRequirements(dev, image, &req);
+            type = find_memory_type(static_cast<VkPhysicalDevice>(ctx_.physical_device),
+                                    req.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            ok = type >= 0;
+        }
+        if (ok) {
+            VkMemoryAllocateInfo mai{};
+            mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            mai.allocationSize = req.size;
+            mai.memoryTypeIndex = static_cast<uint32_t>(type);
+            VkDeviceMemory memory = VK_NULL_HANDLE;
+            ok = vkAllocateMemory(dev, &mai, nullptr, &memory) == VK_SUCCESS;
+            l.memory = memory;
+            ok = ok && vkBindImageMemory(dev, image, memory, 0) == VK_SUCCESS;
+        }
+        if (ok) {
+            VkImageViewCreateInfo vci{};
+            vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            vci.image = image;
+            vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            vci.format = k_linear_format;
+            vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            vci.subresourceRange.levelCount = 1;
+            vci.subresourceRange.layerCount = 1;
+            VkImageView view = VK_NULL_HANDLE;
+            ok = vkCreateImageView(dev, &vci, nullptr, &view) == VK_SUCCESS;
+            l.view = view;
+        }
+        if (ok && !l.set) {
+            if (blur_sets_used_ >= k_blur_sets) {
+                ok = false;
+            } else {
+                auto layout = static_cast<VkDescriptorSetLayout>(descriptor_layout_);
+                VkDescriptorSetAllocateInfo dsai{};
+                dsai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
+                dsai.descriptorPool = static_cast<VkDescriptorPool>(descriptor_pool_);
+                dsai.descriptorSetCount = 1;
+                dsai.pSetLayouts = &layout;
+                VkDescriptorSet s = VK_NULL_HANDLE;
+                ok = vkAllocateDescriptorSets(dev, &dsai, &s) == VK_SUCCESS;
+                if (ok) {
+                    l.set = s;
+                    ++blur_sets_used_;
+                }
+            }
+        }
+        if (ok) {
+            VkDescriptorImageInfo info{};
+            info.sampler = static_cast<VkSampler>(sampler_);
+            info.imageView = static_cast<VkImageView>(l.view);
+            info.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = static_cast<VkDescriptorSet>(l.set);
+            write.dstBinding = 0;
+            write.descriptorCount = 1;
+            write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+            write.pImageInfo = &info;
+            vkUpdateDescriptorSets(dev, 1, &write, 0, nullptr);
+        }
+        l.width = aw;
+        l.height = ah;
+        if (!ok) {
+            if (!waited)
+                wait_all_slots_idle();
+            destroy_blur_entry(e);
+            return false;
+        }
+    }
+    return true;
+#else
+    (void)e;
+    (void)footprint;
+    return false;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::run_blur(void* command_buffer, const blur_entry& e,
+                                          lx::rect2i footprint) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    struct blur_push {
+        float valid[2];
+        float inv_size[2];
+        float origin[2];
+        float offset;
+        int mode;
+    };
+    static_assert(sizeof(blur_push) == 32, "blur_push must match blur.frag");
+    // The pass so far is the backdrop: ended, and read as the source of level 0.
+    vkCmdEndRendering(cb);
+    auto linear_image = static_cast<VkImage>(linear_->image);
+    image_barrier(cb, linear_image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, static_cast<VkPipeline>(blur_pipeline_));
+    auto layout = static_cast<VkPipelineLayout>(blur_layout_);
+    const auto pass = [&](unsigned to, void* source_set, lx::size2i valid, int alloc_w,
+                          int alloc_h, int mode) {
+        const blur_level& dst = e.levels[to];
+        // One texel past the level's size too (there is always room): a tap clamped to the
+        // last valid texel centre still weighs its neighbour by zero, and an uninitialised
+        // half float there may be a NaN, which zero does not cancel.
+        lx::size2i size = blur_level_size(footprint, to);
+        size.width = std::min(size.width + 1, dst.width);
+        size.height = std::min(size.height + 1, dst.height);
+        // Whatever it held is replaced; earlier passes (and frames) may still sample it.
+        image_barrier(cb, static_cast<VkImage>(dst.image), VK_IMAGE_LAYOUT_UNDEFINED,
+                      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                          VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+        VkRect2D area{};
+        area.extent = {static_cast<unsigned>(size.width), static_cast<unsigned>(size.height)};
+        begin_rendering(cb, static_cast<VkImageView>(dst.view), area, nullptr, false);
+        VkViewport viewport{};
+        viewport.width = static_cast<float>(size.width);
+        viewport.height = static_cast<float>(size.height);
+        viewport.maxDepth = 1.f;
+        vkCmdSetViewport(cb, 0, 1, &viewport);
+        vkCmdSetScissor(cb, 0, 1, &area);
+        auto set = static_cast<VkDescriptorSet>(source_set);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, 0, 1, &set, 0,
+                                nullptr);
+        blur_push push{};
+        push.valid[0] = static_cast<float>(valid.width);
+        push.valid[1] = static_cast<float>(valid.height);
+        push.inv_size[0] = 1.f / static_cast<float>(alloc_w);
+        push.inv_size[1] = 1.f / static_cast<float>(alloc_h);
+        push.origin[0] = static_cast<float>(footprint.x);
+        push.origin[1] = static_cast<float>(footprint.y);
+        push.offset = k_blur_radius;
+        push.mode = mode;
+        vkCmdPushConstants(cb, layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof push, &push);
+        vkCmdDraw(cb, 3, 1, 0, 0);
+        vkCmdEndRendering(cb);
+        image_barrier(cb, static_cast<VkImage>(dst.image), VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                      VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                      VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    };
+    // Level 0 from the intermediate (its encode set samples it through the same layout).
+    pass(0, linear_->encode_set,
+         {static_cast<int>(linear_->width), static_cast<int>(linear_->height)},
+         static_cast<int>(linear_->width), static_cast<int>(linear_->height), 0);
+    for (unsigned l = 1; l < k_blur_levels; ++l)
+        pass(l, e.levels[l - 1].set, blur_level_size(footprint, l - 1), e.levels[l - 1].width,
+             e.levels[l - 1].height, 1);
+    for (unsigned l = k_blur_levels - 1; l > 0; --l)
+        pass(l - 1, e.levels[l].set, blur_level_size(footprint, l), e.levels[l].width,
+             e.levels[l].height, 2);
+    // The pass resumes over what it held, at the same area.
+    image_barrier(cb, linear_image, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT |
+                      VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                  VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                  VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+    VkRect2D area{};
+    area.offset = {pass_area_.x, pass_area_.y};
+    area.extent = {static_cast<unsigned>(pass_area_.width),
+                   static_cast<unsigned>(pass_area_.height)};
+    begin_rendering(cb, static_cast<VkImageView>(linear_->view), area, nullptr, true);
+    VkViewport viewport{};
+    viewport.width = static_cast<float>(linear_->width);
+    viewport.height = static_cast<float>(linear_->height);
+    viewport.maxDepth = 1.f;
+    vkCmdSetViewport(cb, 0, 1, &viewport);
+#else
+    (void)command_buffer;
+    (void)e;
+    (void)footprint;
+#endif
+}
+
+void lx::gfx::vulkan_compositor::record_blur(void* command_buffer, const blit_command& cmd,
+                                             lx::rect2i area, unsigned target_w,
+                                             unsigned target_h, bool own_pass,
+                                             void*& bound_pipeline, void*& bound_set,
+                                             composite_stats& stats) {
+#if defined(LUMEN_HAS_VULKAN) && defined(LUMEN_HAS_SHADERS)
+    auto cb = static_cast<VkCommandBuffer>(command_buffer);
+    if (blur_current_ < 0) {
+        ++stats.draws_culled;
+        return;
+    }
+    // As any draw: the area ∩ clip, culled when dst misses it, once per visible rect.
+    int x0 = area.x;
+    int y0 = area.y;
+    int x1 = area.x + area.width;
+    int y1 = area.y + area.height;
+    if (cmd.clip.width > 0 && cmd.clip.height > 0) {
+        x0 = std::max(x0, cmd.clip.x);
+        y0 = std::max(y0, cmd.clip.y);
+        x1 = std::min(x1, cmd.clip.x + cmd.clip.width);
+        y1 = std::min(y1, cmd.clip.y + cmd.clip.height);
+    }
+    x0 = std::max(x0, cmd.dst.x);
+    y0 = std::max(y0, cmd.dst.y);
+    x1 = std::min(x1, cmd.dst.x + cmd.dst.width);
+    y1 = std::min(y1, cmd.dst.y + cmd.dst.height);
+    if (x1 <= x0 || y1 <= y0 || x0 < 0 || y0 < 0) {
+        ++stats.draws_culled;
+        return;
+    }
+    VkRect2D parts[k_max_visible_rects]{};
+    const unsigned part_count = visible_scissors(cmd, {x0, y0, x1 - x0, y1 - y0}, parts);
+    blur_output& o = blur_outputs_[static_cast<unsigned>(blur_current_)];
+    const unsigned k = cmd.blur_source;
+    const lx::rect2i footprint = o.plan.footprint_for(k, cmd.blur_box);
+    if (part_count == 0 || footprint.width <= 0 || footprint.height <= 0 || !linear_) {
+        ++stats.draws_culled;
+        return;
+    }
+    blur_entry& e = o.entries[k];
+    const lx::size2i valid = blur_level_size(footprint, 0);
+    if (o.plan.pending(k)) {
+        // Made by `begin_blur_frame` when the region was seen visible.
+        if (!own_pass || !detail::damage_contains(area, footprint) || !blur_pipeline_ ||
+            !e.levels[k_blur_levels - 1].set ||
+            e.levels[0].width <= valid.width || e.levels[0].height <= valid.height) {
+            ++stats.draws_culled;
+            return;
+        }
+        run_blur(cb, e, footprint);
+        o.plan.done(k);
+        ++blur_runs_;
+        bound_pipeline = nullptr;
+        bound_set = nullptr;
+
+    } else if (!e.levels[0].set || e.levels[0].width <= valid.width ||
+               e.levels[0].height <= valid.height) {
+        ++stats.draws_culled;
+        return;
+    }
+    if (bound_pipeline != pipeline_) {
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, static_cast<VkPipeline>(pipeline_));
+        bound_pipeline = pipeline_;
+    }
+    if (bound_set != e.levels[0].set) {
+        auto set = static_cast<VkDescriptorSet>(e.levels[0].set);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                static_cast<VkPipelineLayout>(pipeline_layout_), 0, 1, &set, 0,
+                                nullptr);
+        bound_set = e.levels[0].set;
+    }
+    // Level 0 holds the footprint at half resolution, in linear light: a pixel's centre
+    // samples it at (p − footprint origin) / 2, clamped to its valid texels.
+    blit_command s = cmd;
+    s.blur = false;
+    s.src = {0.5f * static_cast<float>(cmd.dst.x - footprint.x),
+             0.5f * static_cast<float>(cmd.dst.y - footprint.y),
+             0.5f * static_cast<float>(cmd.dst.width), 0.5f * static_cast<float>(cmd.dst.height)};
+    s.buffer_xform = lx::buffer_transform::normal;
+    const auto aw = static_cast<unsigned>(e.levels[0].width);
+    const auto ah = static_cast<unsigned>(e.levels[0].height);
+    quad_push push = make_quad_push(s, aw, ah, target_w, target_h, 0);
+    push.src_bounds[0] = 0.5f / static_cast<float>(aw);
+    push.src_bounds[1] = 0.5f / static_cast<float>(ah);
+    push.src_bounds[2] = (static_cast<float>(valid.width) - 0.5f) / static_cast<float>(aw);
+    push.src_bounds[3] = (static_cast<float>(valid.height) - 0.5f) / static_cast<float>(ah);
+    vkCmdPushConstants(cb, static_cast<VkPipelineLayout>(pipeline_layout_),
+                       VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(push),
+                       &push);
+    for (unsigned p = 0; p < part_count; ++p) {
+        vkCmdSetScissor(cb, 0, 1, &parts[p]);
+        vkCmdDraw(cb, 6, 1, 0, 0);
+    }
+    ++stats.draws_submitted;
+#else
+    (void)command_buffer;
+    (void)cmd;
+    (void)area;
+    (void)target_w;
+    (void)target_h;
+    (void)own_pass;
+    (void)bound_pipeline;
+    (void)bound_set;
+    ++stats.draws_culled;
 #endif
 }
 
@@ -3040,6 +3964,7 @@ lx::gfx::vulkan_compositor::begin_linear_frame(render_target& target, const blit
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     if (vkBeginCommandBuffer(cb, &begin) != VK_SUCCESS)
         return vk_error("vkBeginCommandBuffer failed");
+    begin_timing(cb);
     damage_region all{};
     all.set_full();
     plan_frame(target, region ? region : &all, region ? changed : nullptr, previous,
@@ -3095,11 +4020,13 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_fram
     if (!linear_pass_open_)
         begin_linear_pass(lx::color::rgb(0.f, 0.f, 0.f));
     end_composite_pass(cb);
+    write_timestamp(cb, 1);
     linear_pass_open_ = false;
 
     // The encode pass, as `composite` records it: the intermediate (left in
     // SHADER_READ_ONLY_OPTIMAL by the pass) into the scanout target's transfer function.
     record_encode_pass(cb, target);
+    write_timestamp(cb, 2);
 
     linear_cb_ = nullptr;
     linear_target_ = nullptr;
@@ -3107,7 +4034,8 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_fram
         abandon_prepared_blits();
         return vk_error("vkEndCommandBuffer failed");
     }
-    auto fence = static_cast<VkFence>(fences_[submit_slot_]);
+    const unsigned slot = submit_slot_;
+    auto fence = static_cast<VkFence>(fences_[slot]);
     vkResetFences(static_cast<VkDevice>(ctx_.device), 1, &fence);
     composite_stats stats{};
     if (auto submitted = submit_current_slot(true, &stats.out_fence_fd); !submitted) {
@@ -3119,6 +4047,7 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::end_linear_fram
         return submitted.get_error();
     }
     acquired_count_ = 0;
+    stats.gpu_serial = slot_serial_[slot];
     finish_frame(target);
     return stats;
 #else
@@ -3199,6 +4128,7 @@ lx::result<void> lx::gfx::vulkan_compositor::read_back(const render_target& targ
 
     auto cb = static_cast<VkCommandBuffer>(command_buffers_[frame_slot]);
     vkResetCommandBuffer(cb, 0);
+    slot_timed_[frame_slot] = false; // a read is not a frame
 
     VkCommandBufferBeginInfo begin{};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;

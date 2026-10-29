@@ -6,10 +6,18 @@
 // makes one. This prints the cost of each so the difference is a number rather than a
 // claim — run it on the machine in question.
 //
-//   bench_composite [width height] [--vk]
+//   bench_composite [width height] [--vk] [--gpu-timing] [--hash] [--animate]
 //
 // --vk: the Vulkan cases on a software rasterizer too (lavapipe takes ~0.1 s a frame at the
 // default size, too slow for every CTest run); a hardware Vulkan device always runs them.
+// --gpu-timing: the Vulkan cases time each frame on the GPU (`set_gpu_timing`: timestamps
+// around the composite and encode passes) and append the mean; the other numbers are the
+// timing's overhead when compared with a run without it.
+// --hash: each scene's composited frame is read back and its FNV-1a hash printed per
+// backend, so two builds can be compared pixel for pixel (no timing in it).
+// --animate: the top window of each scene is drawn as one frame of a window animation
+// ([animations]: its tree container's `node_animation`, 0.95 of its size about its centre
+// at opacity 0.6): what an animating frame costs every backend.
 
 #include <fcntl.h>
 #include <poll.h>
@@ -33,6 +41,50 @@ volatile std::uint32_t sink = 0;
 double ms_since(std::chrono::steady_clock::time_point t0) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
+
+/// --hash: print each scene's frame hash per backend.
+bool g_hash = false;
+/// --animate: the top window of each scene mid-animation.
+bool g_animate = false;
+
+/// FNV-1a over `n` bytes.
+std::uint64_t fnv1a(const unsigned char* p, std::size_t n) {
+    std::uint64_t h = 1469598103934665603ull;
+    for (std::size_t i = 0; i < n; ++i) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+/// --gpu-timing.
+bool g_gpu_timing = false;
+
+/// GPU time of a Vulkan case's frames (`vulkan_compositor::take_gpu_times`), summed.
+struct gpu_times {
+    double composite_ms = 0.0;
+    double encode_ms = 0.0;
+    unsigned frames = 0;
+    void take(lx::gfx::vulkan_compositor& comp) {
+        lx::gfx::composite_gpu_time t[lx::gfx::vulkan_compositor::k_gpu_times]{};
+        const unsigned n = comp.take_gpu_times(t, lx::gfx::vulkan_compositor::k_gpu_times);
+        for (unsigned i = 0; i < n; ++i) {
+            composite_ms += static_cast<double>(t[i].composite_ns) / 1e6;
+            encode_ms += static_cast<double>(t[i].encode_ns) / 1e6;
+            ++frames;
+        }
+    }
+    /// Ends the line: the mean per frame with --gpu-timing, nothing more without.
+    void print() const {
+        if (g_gpu_timing && frames > 0)
+            std::printf("  gpu %.3f ms (composite %.3f, encode %.3f; %u frames)",
+                        (composite_ms + encode_ms) / frames, composite_ms / frames,
+                        encode_ms / frames, frames);
+        else if (g_gpu_timing)
+            std::printf("  gpu n/a");
+        std::printf("\n");
+    }
+};
 
 /// The swizzle the Vulkan ingest path runs on every commit, for comparison.
 void convert_to_rgba(const std::uint32_t* src, std::uint32_t* dst, std::size_t pixels) {
@@ -172,6 +224,7 @@ void bench_vk(unsigned width, unsigned height, int iters, bool on_software) {
     lx::gfx::vulkan_compositor comp;
     if (!comp.initialize(device.context()))
         return;
+    comp.set_gpu_timing(g_gpu_timing);
     std::vector<unsigned char> px(256u * 256u * 4u, 0x40);
     if (!comp.upload_rgba(1, 256, 256, px.data()))
         return;
@@ -191,6 +244,7 @@ void bench_vk(unsigned width, unsigned height, int iters, bool on_software) {
                          lx::gfx::render_target& y) {
         lx::gfx::render_target* targets[2] = {&x, &y};
         double call_ms = 0.0;
+        gpu_times gpu{};
         const auto draw = [&](int i) {
             lx::gfx::render_target& t = *targets[i & 1];
             lx::gfx::blit_command cmd{};
@@ -206,10 +260,13 @@ void bench_vk(unsigned width, unsigned height, int iters, bool on_software) {
                 (void)::poll(&pfd, 1, 1000);
                 ::close(stats.value().out_fence_fd);
             }
+            if (g_gpu_timing)
+                gpu.take(comp);
         };
         draw(0);
         draw(1);
         call_ms = 0.0;
+        gpu = {};
         rusage r0{};
         ::getrusage(RUSAGE_SELF, &r0);
         const auto t0 = std::chrono::steady_clock::now();
@@ -224,9 +281,12 @@ void bench_vk(unsigned width, unsigned height, int iters, bool on_software) {
         };
         // Render-thread time is the composite call (set-up, record, submit); wall adds the
         // fence wait. Faults: a reallocated intermediate is faulted in again by its clear.
-        std::printf("  %-42s %7.3f ms  (call %.3f ms, cpu %.1f ms, %ld faults)\n", label, wall,
+        if (g_gpu_timing)
+            gpu.take(comp);
+        std::printf("  %-42s %7.3f ms  (call %.3f ms, cpu %.1f ms, %ld faults)", label, wall,
                     call_ms / iters, (cpu_us(r1) - cpu_us(r0)) / 1e3 / iters,
                     (r1.ru_minflt - r0.ru_minflt) / iters);
+        gpu.print();
     };
     run("composite, 2 targets same size", a0.value(), a1.value());
     run("composite, 2 targets same size (2/3)", b0.value(), b1.value());
@@ -250,6 +310,7 @@ void bench_vk_damage(unsigned width, unsigned height, int iters, bool on_softwar
     lx::gfx::vulkan_compositor comp;
     if (!comp.initialize(device.context()))
         return;
+    comp.set_gpu_timing(g_gpu_timing);
     std::vector<unsigned char> px(256u * 256u * 4u, 0x60);
     for (std::size_t i = 3; i < px.size(); i += 4)
         px[i] = 0xFF;
@@ -291,6 +352,7 @@ void bench_vk_damage(unsigned width, unsigned height, int iters, bool on_softwar
         for (auto& a : age)
             a.set_full();
         unsigned long long area = 0;
+        gpu_times gpu{};
         const auto frame = [&](int i) {
             const unsigned back = static_cast<unsigned>(i) % 3u;
             lx::gfx::damage_region changed{};
@@ -321,6 +383,8 @@ void bench_vk_damage(unsigned width, unsigned height, int iters, bool on_softwar
                 (void)::poll(&pfd, 1, 1000);
                 ::close(stats.value().out_fence_fd);
             }
+            if (g_gpu_timing)
+                gpu.take(comp);
             for (unsigned s = 0; s < 3; ++s)
                 if (s != back)
                     age[s].add_region(changed);
@@ -329,6 +393,7 @@ void bench_vk_damage(unsigned width, unsigned height, int iters, bool on_softwar
         for (int i = 0; i < 3; ++i)
             frame(i);
         area = 0;
+        gpu = {};
         rusage r0{};
         ::getrusage(RUSAGE_SELF, &r0);
         const auto t0 = std::chrono::steady_clock::now();
@@ -341,8 +406,11 @@ void bench_vk_damage(unsigned width, unsigned height, int iters, bool on_softwar
             return (r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1e6 + r.ru_utime.tv_usec +
                    r.ru_stime.tv_usec;
         };
-        std::printf("  %-42s %7.3f ms  (cpu %.2f ms, region %llu px)\n", label, wall,
+        if (g_gpu_timing)
+            gpu.take(comp);
+        std::printf("  %-42s %7.3f ms  (cpu %.2f ms, region %llu px)", label, wall,
                     (cpu_us(r1) - cpu_us(r0)) / 1e3 / iters, area / static_cast<unsigned>(iters));
+        gpu.print();
     };
     run("whole target (composite), full damage", kind::full, true);
     run("frame, full damage", kind::full, false);
@@ -468,6 +536,9 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
         wallpaper.set_opaque(true);
     }
     std::vector<std::unique_ptr<lx::scene::surface_node>> nodes;
+    // --animate: the top window inside its own tree container (an anchor), mid-animation.
+    lx::scene::container_node animated{};
+    animated.set_anchor(true);
     (void)scene.root().add(&wallpaper);
     for (unsigned i = 0; i < k_windows; ++i) {
         auto node = std::make_unique<lx::scene::surface_node>(lx::surface_id{10 + i});
@@ -489,7 +560,23 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
         } else {
             node->set_opaque(true);
         }
-        (void)scene.root().add(node.get());
+        if (g_animate && i + 1 == k_windows) {
+            const lx::rect2i c = windows[i].content;
+            animated.set_transform(node->origin());
+            lx::scene::node_animation a{};
+            a.active = true;
+            a.from_x = c.x;
+            a.from_y = c.y;
+            a.scale_x = a.scale_y = 0.95;
+            a.to_x = c.x + c.width * 0.025;
+            a.to_y = c.y + c.height * 0.025;
+            a.opacity = 0.6f;
+            animated.set_animation(a);
+            (void)animated.add(node.get());
+            (void)scene.root().add(&animated);
+        } else {
+            (void)scene.root().add(node.get());
+        }
         nodes.push_back(std::move(node));
     }
 
@@ -575,6 +662,10 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
                                      {});
             std::printf("  CPU composite, 1 thread                    %7.3f ms\n",
                         ms_since(t0) / iters);
+            if (g_hash)
+                std::printf("  hash cpu %016llx\n",
+                            static_cast<unsigned long long>(fnv1a(
+                                reinterpret_cast<const unsigned char*>(dst.data()), dst.size() * 4)));
         }
     }
 
@@ -607,6 +698,13 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
                     draw();
                 std::printf("  GL composite, fence waited                 %7.3f ms\n",
                             ms_since(t0) / iters);
+                if (g_hash) {
+                    std::vector<unsigned char> px(static_cast<std::size_t>(width) * height * 4);
+                    if (comp.read_back(target.value(), px.data(),
+                                       static_cast<unsigned>(px.size())))
+                        std::printf("  hash gl  %016llx\n",
+                                    static_cast<unsigned long long>(fnv1a(px.data(), px.size())));
+                }
             }
             comp.shutdown();
         }
@@ -619,6 +717,8 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
         lx::gfx::vulkan_compositor comp;
         if ((!device.info().is_software_rasterizer || vk_on_software) &&
             comp.initialize(device.context())) {
+            comp.set_gpu_timing(g_gpu_timing);
+            gpu_times gpu{};
             bool ok = comp.upload_rgba(k_wallpaper_id, k_wallpaper_px, k_wallpaper_px,
                                        wall_rgba.data())
                           .has_value();
@@ -634,8 +734,11 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
                         (void)::poll(&pfd, 1, 1000);
                         ::close(stats.value().out_fence_fd);
                     }
+                    if (g_gpu_timing)
+                        gpu.take(comp);
                 };
                 draw();
+                gpu = {};
                 rusage r0{};
                 ::getrusage(RUSAGE_SELF, &r0);
                 t0 = std::chrono::steady_clock::now();
@@ -649,15 +752,28 @@ void bench_occlusion(const char* name, std::span<const csd_window> windows, unsi
                     return (r.ru_utime.tv_sec + r.ru_stime.tv_sec) * 1e6 + r.ru_utime.tv_usec +
                            r.ru_stime.tv_usec;
                 };
-                std::printf("  Vulkan composite, fence waited             %7.3f ms  (cpu %.1f ms)\n",
+                if (g_gpu_timing)
+                    gpu.take(comp);
+                std::printf("  Vulkan composite, fence waited             %7.3f ms  (cpu %.1f ms)",
                             wall, (cpu_us(r1) - cpu_us(r0)) / 1e3 / vk_iters);
+                gpu.print();
+                if (g_hash) {
+                    std::vector<unsigned char> px(static_cast<std::size_t>(width) * height * 4);
+                    if (comp.read_back(target.value(), px.data(),
+                                       static_cast<unsigned>(px.size())))
+                        std::printf("  hash vk  %016llx\n",
+                                    static_cast<unsigned long long>(fnv1a(px.data(), px.size())));
+                }
             }
             comp.shutdown();
         }
     }
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
-    for (auto& node : nodes)
+    for (auto& node : nodes) {
         (void)scene.root().remove(node.get());
+        (void)animated.remove(node.get());
+    }
+    (void)scene.root().remove(&animated);
     (void)scene.root().remove(&wallpaper);
 }
 
@@ -718,13 +834,327 @@ void bench_vk_upload(unsigned width, unsigned height, int iters, bool on_softwar
 
 } // namespace
 
+/// --blur: what a panel-sized backdrop blur (ext-background-effect-v1) costs per frame — a
+/// 32 px panel blurring a full-screen window, fence waited, on GL and (with --vk) Vulkan. Each
+/// case against the same frame without the blur draw: a full repaint and a panel-only update
+/// with the cached blur, and with the backdrop changing every frame (blurred again, the
+/// frame grown to the footprint); and one text row of the window updated far from the
+/// panel while the window's commits leave the backdrop stale (the row stays its own rect,
+/// the footprint is redrawn beside it). Never runs without the flag, so the default output
+/// stays what it was.
+bool g_blur = false;
+
+template <typename Comp, typename Composite>
+void blur_cases(const char* backend, Comp& comp, Composite composite, unsigned width,
+                unsigned height, int iters) {
+    const int w = static_cast<int>(width);
+    const int h = static_cast<int>(height);
+    const lx::rect2i panel{0, 0, w, 32};
+    lx::gfx::blit_command window{};
+    window.texture_id = 1;
+    window.dst = {0, 0, w, h};
+    window.blend = lx::blend_mode::opaque;
+    lx::gfx::blit_command blur{};
+    blur.blur = true;
+    blur.dst = panel;
+    blur.blur_box = panel;
+    blur.blend = lx::blend_mode::premultiplied;
+    lx::gfx::blit_command overlay{};
+    overlay.solid = true;
+    overlay.solid_color = lx::color::rgb(0.08f, 0.08f, 0.09f, 0.72f);
+    overlay.dst = panel;
+    overlay.blend = lx::blend_mode::premultiplied;
+    const lx::gfx::blit_command with[3] = {window, blur, overlay};
+    const lx::gfx::blit_command without[2] = {window, overlay};
+    lx::gfx::blur_source src{panel, true, 1};
+    enum class damage { clock, full, row };
+    const auto run = [&](const char* label, bool blurred, bool changing, damage where) {
+        unsigned long long area = 0;
+        const auto frame = [&](int i) {
+            lx::gfx::damage_region d{};
+            if (where == damage::full)
+                d.set_full();
+            else if (where == damage::clock)
+                d.add({w - 200, 4, 120, 24}); // the panel's clock
+            else
+                d.add({w / 4, h / 2, w / 2, 16}); // one text row of the window, far below
+            if (changing) {
+                // The window under the panel committed: its content serial is in the
+                // backdrop's signature. Beside the row, it moves under the footprint.
+                src.backdrop = 1000u + static_cast<unsigned>(i);
+                if (where != damage::row)
+                    d.add({100 + (i % 2) * 8, 40, 64, 40});
+            }
+            if (blurred)
+                (void)comp.begin_blur_frame(0, src, d, w, h);
+            composite(blurred ? with : without, blurred ? 3u : 2u, d);
+            if (blurred)
+                comp.end_blur_frame();
+            area = d.full ? static_cast<unsigned long long>(w) * h : d.area();
+        };
+        frame(0);
+        frame(1);
+        const unsigned long long runs0 = comp.blur_runs();
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i)
+            frame(2 + i);
+        std::printf("  %s %-44s %7.3f ms  (blurred %llu of %d, %llu px)\n", backend, label,
+                    ms_since(t0) / iters, comp.blur_runs() - runs0, iters, area);
+    };
+    run("full repaint, no blur draw", false, false, damage::full);
+    run("full repaint, cached blur", true, false, damage::full);
+    run("full repaint, backdrop changing (blurred again)", true, true, damage::full);
+    run("panel update, no blur draw", false, false, damage::clock);
+    run("panel update, cached blur", true, false, damage::clock);
+    run("panel update + backdrop changing (blurred again)", true, true, damage::clock);
+    run("backdrop changing, no blur draw", false, true, damage::clock);
+    run("window row update, no blur draw", false, true, damage::row);
+    run("window row update, backdrop stale (blurred again)", true, true, damage::row);
+    comp.release_blur(0);
+}
+
+void bench_blur(unsigned width, unsigned height, int iters, bool vk_on_software) {
+    const lx::rect2i f = lx::gfx::blur_footprint({0, 0, static_cast<int>(width), 32},
+                                                 static_cast<int>(width), static_cast<int>(height));
+    unsigned long long texels = 0;
+    for (unsigned k = 0; k < lx::gfx::k_blur_levels; ++k) {
+        const lx::size2i l = lx::gfx::blur_level_size(f, k);
+        texels += static_cast<unsigned long long>(l.width) * l.height;
+    }
+    std::printf("  -- backdrop blur, a %ux32 panel: footprint %dx%d, levels %llu texels "
+                "(GL %.2f MiB, Vulkan %.2f MiB) --\n",
+                width, f.width, f.height, texels, texels * 4 / 1048576.0, texels * 8 / 1048576.0);
+    std::vector<unsigned char> px(static_cast<std::size_t>(width) * height * 4);
+    for (unsigned y = 0; y < height; ++y)
+        for (unsigned x = 0; x < width; ++x) {
+            unsigned char* p = &px[(static_cast<std::size_t>(y) * width + x) * 4];
+            p[0] = static_cast<unsigned char>(x * 3);
+            p[1] = static_cast<unsigned char>(y * 5);
+            p[2] = ((x / 16 + y / 16) % 2) ? 220 : 40;
+            p[3] = 255;
+        }
+    const auto wait = [](int fd) {
+        if (fd >= 0) {
+            pollfd pfd{fd, POLLIN, 0};
+            (void)::poll(&pfd, 1, 1000);
+            ::close(fd);
+        }
+    };
+    if (const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); fd >= 0) {
+        auto device = lx::gfx::egl_device::create(fd);
+        if (device && !device.value().is_software_renderer()) {
+            auto& dev = device.value();
+            auto target = lx::gfx::gl_scanout_target::create(dev, width, height, k_xrgb);
+            lx::gfx::gl_compositor comp;
+            if (target && comp.initialize(dev) && comp.supports_blur() &&
+                comp.upload_rgba(1, width, height, px.data())) {
+                struct gl_comp {
+                    lx::gfx::gl_compositor& c;
+                    unsigned fb;
+                    bool begin_blur_frame(unsigned o, const lx::gfx::blur_source& s,
+                                          lx::gfx::damage_region& d, int w, int h) {
+                        return c.begin_blur_frame(o, fb, {&s, 1}, d, w, h);
+                    }
+                    void end_blur_frame() { c.end_blur_frame(); }
+                    void release_blur(unsigned o) { c.release_blur(o); }
+                    unsigned long long blur_runs() const { return c.blur_runs(); }
+                } g{comp, target.value().framebuffer()};
+                blur_cases("GL    ", g,
+                           [&](const lx::gfx::blit_command* cmds, unsigned n,
+                               const lx::gfx::damage_region& d) {
+                               auto st = comp.composite_region(target.value(),
+                                                               lx::color::rgb(0.f, 0.f, 0.f),
+                                                               cmds, n, d);
+                               if (st)
+                                   wait(st.value().out_fence_fd);
+                           },
+                           width, height, iters);
+            }
+            comp.shutdown();
+        }
+        ::close(fd);
+    }
+    if (auto selected = lx::gfx::device_selector::select_best()) {
+        auto device = std::move(selected).value();
+        lx::gfx::vulkan_compositor comp;
+        if ((!device.info().is_software_rasterizer || vk_on_software) &&
+            comp.initialize(device.context()) && comp.supports_blur() &&
+            comp.upload_rgba(1, width, height, px.data())) {
+            auto target = lx::gfx::render_target::create(device.context(), width, height);
+            if (target) {
+                struct vk_comp {
+                    lx::gfx::vulkan_compositor& c;
+                    bool begin_blur_frame(unsigned o, const lx::gfx::blur_source& s,
+                                          lx::gfx::damage_region& d, int w, int h) {
+                        return c.begin_blur_frame(o, {&s, 1}, d, w, h);
+                    }
+                    void end_blur_frame() { c.end_blur_frame(); }
+                    void release_blur(unsigned o) { c.release_blur(o); }
+                    unsigned long long blur_runs() const { return c.blur_runs(); }
+                } v{comp};
+                blur_cases("Vulkan", v,
+                           [&](const lx::gfx::blit_command* cmds, unsigned n,
+                               const lx::gfx::damage_region& d) {
+                               auto st = comp.composite_region(target.value(),
+                                                               lx::color::rgb(0.f, 0.f, 0.f),
+                                                               cmds, n, d, d, &target.value());
+                               if (st)
+                                   wait(st.value().out_fence_fd);
+                           },
+                           width, height, iters / 4 > 0 ? iters / 4 : 1);
+            }
+        }
+        comp.shutdown();
+    }
+}
+
+/// `--color`: what a colour-managed surface (wp_color_manager_v1) costs. A full-screen
+/// window repainted whole, undescribed and then described three ways — gamma 2.2 sRGB (a
+/// decode curve, identity matrix), the sRGB curve on BT.2020 (a matrix) and PQ BT.2020 at
+/// its defaults (curve, matrix and tone mapping) — on each backend: CPU (1 and 4 threads),
+/// GL (fence waited) and Vulkan (fence waited; `--vk` for a software device). Never runs
+/// without the flag, so the default output stays what it was.
+bool g_color = false;
+
+void bench_color(unsigned width, unsigned height, int iters, bool vk_on_software) {
+    std::printf("  -- colour-managed surface (wp_color_manager_v1), full repaint --\n");
+    std::vector<std::uint32_t> words(static_cast<std::size_t>(width) * height);
+    std::vector<unsigned char> rgba(words.size() * 4);
+    for (unsigned y = 0; y < height; ++y)
+        for (unsigned x = 0; x < width; ++x) {
+            const std::size_t i = static_cast<std::size_t>(y) * width + x;
+            const unsigned r = (x * 3) & 0xFF, g = (y * 5) & 0xFF, b = ((x / 16 + y / 16) % 2) ? 220 : 40;
+            words[i] = 0xFF000000u | (r << 16) | (g << 8) | b;
+            rgba[i * 4] = static_cast<unsigned char>(r);
+            rgba[i * 4 + 1] = static_cast<unsigned char>(g);
+            rgba[i * 4 + 2] = static_cast<unsigned char>(b);
+            rgba[i * 4 + 3] = 255;
+        }
+    struct variant {
+        const char* label;
+        lx::gfx::color_transform t;
+    };
+    variant variants[4] = {{"undescribed (sRGB)", {}}, {"gamma 2.2 sRGB", {}},
+                           {"sRGB curve BT.2020", {}}, {"PQ BT.2020", {}}};
+    {
+        lx::gfx::color_description g22{};
+        g22.tf = lx::gfx::color_tf::power;
+        lx::gfx::color_description wide{};
+        wide.primaries = lx::gfx::primaries_of(lx::gfx::named_primaries::bt2020);
+        lx::gfx::color_description pq = wide;
+        pq.tf = lx::gfx::color_tf::st2084_pq;
+        lx::gfx::set_default_luminances(pq);
+        (void)lx::gfx::make_color_transform(g22, variants[1].t);
+        (void)lx::gfx::make_color_transform(wide, variants[2].t);
+        (void)lx::gfx::make_color_transform(pq, variants[3].t);
+    }
+    const auto draw = [&](const variant& v) {
+        lx::gfx::blit_command cmd{};
+        cmd.texture_id = 1;
+        cmd.dst = {0, 0, static_cast<int>(width), static_cast<int>(height)};
+        cmd.blend = lx::blend_mode::opaque;
+        cmd.color = v.t;
+        return cmd;
+    };
+    const auto timed = [&](const char* backend, const variant& v, auto&& frame) {
+        const lx::gfx::blit_command cmd = draw(v);
+        frame(cmd); // warm: pipelines, programs, page faults
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < iters; ++i)
+            frame(cmd);
+        std::printf("  %s %-24s %8.3f ms\n", backend, v.label, ms_since(t0) / iters);
+    };
+    for (const unsigned workers : {0u, 3u}) {
+        std::vector<std::uint32_t> dst(words.size(), 0u);
+        lx::gfx::cpu_compositor comp;
+        comp.set_worker_threads(workers);
+        if (!comp.register_texture(1, surface_of(words, width, height, k_xrgb)))
+            break;
+        const auto out = surface_of(dst, width, height, k_xrgb);
+        for (const variant& v : variants)
+            timed(workers ? "CPU 4t " : "CPU 1t ", v, [&](const lx::gfx::blit_command& c) {
+                (void)comp.composite(out, lx::color::rgb(0.f, 0.f, 0.f), &c, 1, {});
+            });
+    }
+    const auto wait = [](int fd) {
+        if (fd >= 0) {
+            pollfd pfd{fd, POLLIN, 0};
+            (void)::poll(&pfd, 1, 1000);
+            ::close(fd);
+        }
+    };
+    if (const int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC); fd >= 0) {
+        auto device = lx::gfx::egl_device::create(fd);
+        if (device && !device.value().is_software_renderer()) {
+            auto& dev = device.value();
+            auto target = lx::gfx::gl_scanout_target::create(dev, width, height, k_xrgb);
+            lx::gfx::gl_compositor comp;
+            if (target && comp.initialize(dev) && comp.supports_color_management() &&
+                comp.upload_rgba(1, width, height, rgba.data())) {
+                for (const variant& v : variants)
+                    timed("GL     ", v, [&](const lx::gfx::blit_command& c) {
+                        auto st = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f), &c,
+                                                 1, {});
+                        if (st)
+                            wait(st.value().out_fence_fd);
+                    });
+            }
+            comp.shutdown();
+        }
+        ::close(fd);
+    }
+    if (auto selected = lx::gfx::device_selector::select_best()) {
+        auto device = std::move(selected).value();
+        lx::gfx::vulkan_compositor comp;
+        if ((!device.info().is_software_rasterizer || vk_on_software) &&
+            comp.initialize(device.context()) && comp.supports_color_management() &&
+            comp.upload_rgba(1, width, height, rgba.data())) {
+            auto target = lx::gfx::render_target::create(device.context(), width, height);
+            if (target) {
+                for (const variant& v : variants)
+                    timed("Vulkan ", v, [&](const lx::gfx::blit_command& c) {
+                        auto st = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f),
+                                                 &c, 1);
+                        if (st)
+                            wait(st.value().out_fence_fd);
+                    });
+            }
+        }
+        comp.shutdown();
+    }
+}
+
 int main(int argc, char** argv) {
     unsigned width = 1918;
     unsigned height = 928;
     bool vk_on_software = false;
-    if (argc >= 2 && std::strcmp(argv[argc - 1], "--vk") == 0) {
-        vk_on_software = true;
-        --argc;
+    for (bool more = true; more && argc >= 2;) {
+        more = false;
+        if (std::strcmp(argv[argc - 1], "--vk") == 0) {
+            vk_on_software = true;
+            --argc;
+            more = true;
+        } else if (std::strcmp(argv[argc - 1], "--gpu-timing") == 0) {
+            g_gpu_timing = true;
+            --argc;
+            more = true;
+        } else if (std::strcmp(argv[argc - 1], "--hash") == 0) {
+            g_hash = true;
+            --argc;
+            more = true;
+        } else if (std::strcmp(argv[argc - 1], "--animate") == 0) {
+            g_animate = true;
+            --argc;
+            more = true;
+        } else if (std::strcmp(argv[argc - 1], "--blur") == 0) {
+            g_blur = true;
+            --argc;
+            more = true;
+        } else if (std::strcmp(argv[argc - 1], "--color") == 0) {
+            g_color = true;
+            --argc;
+            more = true;
+        }
     }
     if (argc >= 3) {
         const int w = std::atoi(argv[1]);
@@ -783,6 +1213,16 @@ int main(int argc, char** argv) {
     std::printf("  composite, channel swap, 4 threads          %7.3f ms\n",
                 bench_composite(width, height, k_rgba, 3, k_iters));
 
+    if (g_color) {
+        // Alone, as --blur.
+        bench_color(width, height, k_iters, vk_on_software);
+        return 0;
+    }
+    if (g_blur) {
+        // Alone: the blur's cost is what this run is for.
+        bench_blur(width, height, k_iters, vk_on_software);
+        return 0;
+    }
     bench_gl(width, height, k_iters);
     bench_vk(width, height, k_iters / 2, vk_on_software);
     bench_vk_upload(width, height, k_iters, vk_on_software);

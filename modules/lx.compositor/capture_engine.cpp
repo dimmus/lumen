@@ -615,6 +615,8 @@ bool capture_renderer::run_output(capture_job& job, const capture_frame_source& 
                 b.visible[k].x -= crop.x;
                 b.visible[k].y -= crop.y;
             }
+            b.blur_box.x -= crop.x;
+            b.blur_box.y -= crop.y;
         }
         return scratch.data();
     };

@@ -4,7 +4,10 @@ import lx.foundation;
 
 export module lx.gfx:renderer;
 
+import std;
 import :headless;
+import :damage;
+import :color;
 
 export namespace lx::gfx {
 
@@ -44,6 +47,10 @@ struct blit_command {
     /// light before blending, because alpha blending is a weighted average of light and
     /// averaging encoded values darkens edges.
     lx::transfer_function src_transfer = lx::transfer_function::srgb;
+    /// wp_color_manager_v1: how the source's colour maps into the composite's working space
+    /// (`color_transform`, "Colour management" in color.cppm). Inactive — the default, and
+    /// every sRGB surface — is the ordinary path above: the same shaders and pixels.
+    color_transform color{};
     /// The draw resamples (`dst` is not the transformed source size, or the crop is off
     /// whole texels). A 1:1 draw on whole pixels samples texel centres exactly.
     bool scaled = false;
@@ -62,6 +69,16 @@ struct blit_command {
     /// has one.
     bool solid = false;
     lx::color solid_color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+    /// A backdrop blur (ext-background-effect-v1): no texture; `dst` (inside `clip` and
+    /// `visible`, as any draw) shows what the draws before it put in the target, blurred
+    /// (`blur_planner`, "Backdrop blur" in rendering-performance.md), faded by opacity × tint
+    /// alpha over what is there. `blur_box` is the bounds of the surface's blur region in
+    /// target pixels, the same for every rect of it; `blur_source` numbers the frame's
+    /// regions in draw order. Drawn only by a backend that `supports_blur` while a blur
+    /// frame is open (`begin_blur_frame`); anywhere else it is skipped as culled.
+    bool blur = false;
+    unsigned blur_source = 0;
+    lx::rect2i blur_box{};
 };
 
 /// A draw whose effective alpha (opacity × tint alpha) is zero changes no pixel: every
@@ -70,6 +87,144 @@ struct blit_command {
 [[nodiscard]] inline bool draw_invisible(const blit_command& cmd) {
     return !(cmd.opacity * cmd.tint.a > 0.f);
 }
+
+// ── Backdrop blur (ext-background-effect-v1) ───────────────────────────────────
+//
+// A dual-Kawase blur (Bjørge, "Bandwidth-efficient rendering", SIGGRAPH 2015; scenefx's
+// blur passes) run at half resolution. For a blur region with bounds B on a target:
+//
+//   footprint F   B grown by `k_blur_margin` on every side, clipped to the target, its
+//                 origin and size even (`blur_footprint`). Everything the blurred pixels
+//                 of B depend on lies inside F.
+//   level 0       F at half resolution: texel (i, j) is the target sampled bilinearly at
+//                 F's pixel corner (2i + 1, 2j + 1) — the mean of that 2×2 block.
+//   down 1..n     level k from level k−1: centre c = 2·(i + ½, j + ½) in level k−1
+//                 texels, (4·S(c) + S(c ± (r, r)) + S(c ± (r, −r))) / 8.
+//   up n..1       level k−1 from level k: c = (i + ½, j + ½) / 2 in level k texels, h = r/2,
+//                 (S(c ± (2h, 0)) + S(c ± (0, 2h)) + 2·S(c ± (h, h)) + 2·S(c ± (h, −h))) / 12.
+//   draw          each pixel of the region samples level 0 bilinearly at its centre.
+//
+// S is a bilinear sample clamped to the level's texel centres (clamp to edge), `n` =
+// `k_blur_passes`, `r` = `k_blur_radius`. Every level has `blur_level_size` texels. With
+// n = 3 and r = 1 the result is a blur of σ ≈ 15 output pixels whose support (29 level-0
+// texels, 60 output pixels) lies inside the 64 pixel margin, so the pixels of B never see
+// F's edge except where F meets the target's.
+
+inline constexpr unsigned k_blur_passes = 3;
+inline constexpr float k_blur_radius = 1.f;
+inline constexpr int k_blur_margin = 64;
+inline constexpr unsigned k_blur_levels = k_blur_passes + 1;
+/// Blur regions one output frame may hold; more are not blurred (drawn as culled).
+inline constexpr unsigned k_max_blur_sources = 8;
+
+/// The footprint of a blur region with bounds `box` on a `width` × `height` target (see
+/// above); empty when nothing of it is on the target.
+[[nodiscard]] constexpr lx::rect2i blur_footprint(lx::rect2i box, int width, int height) {
+    if (box.width <= 0 || box.height <= 0 || width < 2 || height < 2)
+        return {};
+    long long x0 = static_cast<long long>(box.x) - k_blur_margin;
+    long long y0 = static_cast<long long>(box.y) - k_blur_margin;
+    long long x1 = static_cast<long long>(box.x) + box.width + k_blur_margin;
+    long long y1 = static_cast<long long>(box.y) + box.height + k_blur_margin;
+    x0 = x0 < 0 ? 0 : x0;
+    y0 = y0 < 0 ? 0 : y0;
+    x1 = x1 > width ? width : x1;
+    y1 = y1 > height ? height : y1;
+    x0 &= ~1ll;
+    y0 &= ~1ll;
+    if (x1 - x0 < 2 || y1 - y0 < 2)
+        return {};
+    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>((x1 - x0) & ~1ll),
+            static_cast<int>((y1 - y0) & ~1ll)};
+}
+
+/// Texels of blur level `level` (0: half the footprint) for footprint `footprint`.
+[[nodiscard]] constexpr lx::size2i blur_level_size(lx::rect2i footprint, unsigned level) {
+    int w = footprint.width / 2;
+    int h = footprint.height / 2;
+    for (unsigned k = 0; k < level; ++k) {
+        w = (w + 1) / 2;
+        h = (h + 1) / 2;
+    }
+    return {w, h};
+}
+
+/// One blur region of an output's frame: its bounds in target pixels (`blit_command::
+/// blur_box`), whether any of its draws reaches the screen (not occluded), and a signature
+/// of what is painted under its footprint before it (`scene::blur_backdrop_signature`).
+struct blur_source {
+    lx::rect2i box{};
+    bool visible = false;
+    std::uint64_t backdrop = 0;
+};
+
+/// What an output knows about the blurs it last drew (render affinity; one per output in
+/// each backend). A blurred level 0 is kept per region and drawn again, without blurring,
+/// as long as the content behind it is the same (umbriel's cached background blur): its
+/// backdrop signature — every draw and primitive painted under the footprint before the
+/// region, with its content serial — and its bounds unchanged. The region's own surface,
+/// and whatever is above it, may change freely: a panel redrawing its clock draws the
+/// cached blur under the new pixels.
+///
+/// A stale region whose draws reach the screen is blurred again in the frame that draws it,
+/// from the target itself, at the point of the blur draw: `plan` adds its footprint to the
+/// frame's damage and gives it a rect of its own (`isolate`), so the composite redraws the
+/// whole footprint in a single pass and every draw before the blur draw is in place when it
+/// is read. Rects away from the footprint stay as they are: a text row of a window under a
+/// blurred panel is still a row, beside the footprint. The blurred pixels changed, so the
+/// damage reported for the frame covers them. A backend blurs a stale region only in a pass
+/// whose rect holds the whole footprint, and culls its draw in any other.
+class blur_planner {
+public:
+    /// Before compositing a frame whose draws hold blur draws: `sources` in `blur_source`
+    /// order (at most `k_max_blur_sources` used), the frame's `damage` (what changed since
+    /// the previous frame of this output), the target's size. Returns whether a region is
+    /// blurred again in this frame — `damage` then holds its footprint, isolated.
+    [[nodiscard]] bool plan(std::span<const blur_source> sources, damage_region& damage, int width,
+                            int height);
+    /// The region to composite (the damage of `plan`, with whatever else is folded in — the
+    /// buffer age): each footprint blurred again in this frame and every rect meeting it
+    /// become their bounds, repeated until that rect meets no other. Other rects are kept.
+    void isolate(damage_region& region) const;
+    [[nodiscard]] unsigned count() const { return count_; }
+    [[nodiscard]] lx::rect2i footprint(unsigned k) const {
+        return k < count_ ? entries_[k].footprint : lx::rect2i{};
+    }
+    /// Region `k`'s footprint where a draw naming `blur_box` meets it: the planned one, moved
+    /// as far as the draw's box was (a screen capture's crop moves every draw of a frame).
+    [[nodiscard]] lx::rect2i footprint_for(unsigned k, lx::rect2i blur_box) const {
+        if (k >= count_)
+            return {};
+        lx::rect2i f = entries_[k].footprint;
+        f.x += blur_box.x - entries_[k].box.x;
+        f.y += blur_box.y - entries_[k].box.y;
+        return f;
+    }
+    /// Region `k` is blurred when it is drawn in this frame (it is stale).
+    [[nodiscard]] bool pending(unsigned k) const { return k < count_ && entries_[k].pending; }
+    /// The backend blurred region `k` into its level 0: drawn from that, until it is stale.
+    void done(unsigned k) {
+        if (k < count_) {
+            entries_[k].pending = false;
+            entries_[k].cached = true;
+        }
+    }
+    /// Nothing is cached any more (the backend dropped its levels).
+    void reset();
+
+private:
+    struct entry {
+        lx::rect2i box{};
+        lx::rect2i footprint{};
+        std::uint64_t backdrop = 0;
+        bool cached = false;
+        bool pending = false;
+        /// Pending and drawn in this frame: its footprint is blurred again (`isolate`).
+        bool again = false;
+    };
+    entry entries_[k_max_blur_sources]{};
+    unsigned count_ = 0;
+};
 
 /// Where a draw's top-left, +x and +y directions land in its source box, in the box's own
 /// normalized coordinates (0..1 across the box): the source point of normalized
@@ -235,6 +390,68 @@ unsigned lx::gfx::pipeline_cache::acquire(unsigned blend_key, unsigned format_ke
 
 void lx::gfx::pipeline_cache::clear() { count_ = 0; }
 
+bool lx::gfx::blur_planner::plan(std::span<const blur_source> sources, damage_region& damage,
+                                 int width, int height) {
+    const unsigned n = static_cast<unsigned>(
+        sources.size() < k_max_blur_sources ? sources.size() : k_max_blur_sources);
+    bool any = false;
+    for (unsigned k = 0; k < n; ++k) {
+        entry& e = entries_[k];
+        const lx::rect2i box = sources[k].box;
+        const lx::rect2i f = blur_footprint(box, width, height);
+        const bool moved = k >= count_ || e.box.x != box.x || e.box.y != box.y ||
+                           e.box.width != box.width || e.box.height != box.height ||
+                           e.footprint.x != f.x || e.footprint.y != f.y ||
+                           e.footprint.width != f.width || e.footprint.height != f.height;
+        if (moved || e.backdrop != sources[k].backdrop)
+            e.cached = false;
+        e.box = box;
+        e.footprint = f;
+        e.backdrop = sources[k].backdrop;
+        e.pending = !e.cached && !detail::damage_rect_empty(f);
+        e.again = e.pending && sources[k].visible;
+        any = any || e.again;
+    }
+    count_ = n;
+    if (any)
+        isolate(damage);
+    return any;
+}
+
+void lx::gfx::blur_planner::isolate(damage_region& region) const {
+    using namespace lx::gfx::detail;
+    if (region.full)
+        return;
+    for (unsigned k = 0; k < count_; ++k) {
+        if (!entries_[k].again)
+            continue;
+        // Now in some rect (merged or appended), so the pass below removes at least one and
+        // the grown rect always fits back.
+        region.add(entries_[k].footprint);
+        lx::rect2i grown = entries_[k].footprint;
+        for (bool met = true; met;) {
+            met = false;
+            unsigned kept = 0;
+            for (unsigned i = 0; i < region.count; ++i) {
+                if (!damage_rect_empty(damage_intersect(region.rects[i], grown))) {
+                    grown = damage_bbox(grown, region.rects[i]);
+                    met = true;
+                } else {
+                    region.rects[kept++] = region.rects[i];
+                }
+            }
+            region.count = kept;
+        }
+        region.rects[region.count++] = grown;
+    }
+}
+
+void lx::gfx::blur_planner::reset() {
+    for (entry& e : entries_)
+        e = {};
+    count_ = 0;
+}
+
 void lx::gfx::frame_renderer::set_pipeline_cache(pipeline_cache* cache) { pipelines_ = cache; }
 
 lx::result<void> lx::gfx::frame_renderer::draw_to_headless(const blit_command* cmds,
@@ -250,7 +467,7 @@ lx::result<void> lx::gfx::frame_renderer::draw_to_headless(const blit_command* c
         if (pipelines_) {
             (void)pipelines_->acquire(static_cast<unsigned>(cmd.blend), 0);
         }
-        if (cmd.occluded || draw_invisible(cmd))
+        if (cmd.occluded || cmd.blur || draw_invisible(cmd))
             continue;
         if (cmd.solid) {
             const float k = cmd.opacity * cmd.tint.a;

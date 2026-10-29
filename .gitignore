@@ -22,6 +22,8 @@ compile_commands.json
 /scale-smoke-logs/
 # ... and from scripts/ui-bench.sh --e2e
 /ui-e2e-logs/
+# ... and from scripts/vkmark-bench.sh
+/vkmark-bench-logs/
 lumen-input-probe.log
 
 # IDE

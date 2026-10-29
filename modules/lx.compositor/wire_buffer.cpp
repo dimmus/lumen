@@ -53,6 +53,28 @@ buffer_obj* alloc_buffer() {
     return nullptr;
 }
 
+namespace {
+
+/// Textures closing windows' ghosts still draw (window animations), with how many ghosts
+/// hold each and whether a retirement waits for the last of them.
+struct texture_hold {
+    unsigned id = 0;
+    unsigned count = 0;
+    bool retire = false;
+};
+constexpr unsigned k_max_texture_holds = 128;
+texture_hold g_texture_holds[k_max_texture_holds]{};
+/// Entries of `g_texture_holds` in use: none (always, with animations off) costs one test.
+unsigned g_texture_hold_count = 0;
+/// Retirements held back until the next tick (`p0_protocol_context::defer_retire`).
+constexpr unsigned k_max_deferred_retires = 64;
+unsigned g_deferred_retires[k_max_deferred_retires]{};
+unsigned g_deferred_count = 0;
+
+void retire_texture_now(unsigned texture_id);
+
+} // namespace
+
 /// Queues a dated retirement for a texture.
 ///
 /// Dated, because queue order alone is not enough: a snapshot published while the texture
@@ -60,6 +82,80 @@ buffer_obj* alloc_buffer() {
 /// one frame conservative costs a frame of texture memory; being one frame early drops a
 /// texture out from under a draw.
 void retire_texture(unsigned texture_id) {
+    if (!g_p0_ctx || !g_p0_ctx->textures || texture_id == 0)
+        return;
+    // A ghost holds it: retired when the ghost lets go.
+    if (g_texture_hold_count > 0)
+        for (texture_hold& h : g_texture_holds)
+            if (h.count > 0 && h.id == texture_id) {
+                h.retire = true;
+                return;
+            }
+    if (g_p0_ctx->defer_retire && g_deferred_count < k_max_deferred_retires) {
+        g_deferred_retires[g_deferred_count++] = texture_id;
+        return;
+    }
+    retire_texture_now(texture_id);
+}
+
+bool hold_texture(unsigned texture_id) {
+    if (texture_id == 0)
+        return true;
+    // A retirement asked for in this dispatch, not queued yet, becomes the hold's.
+    bool retire = false;
+    for (unsigned i = 0; i < g_deferred_count;) {
+        if (g_deferred_retires[i] == texture_id) {
+            g_deferred_retires[i] = g_deferred_retires[--g_deferred_count];
+            retire = true;
+        } else {
+            ++i;
+        }
+    }
+    texture_hold* free_slot = nullptr;
+    for (texture_hold& h : g_texture_holds) {
+        if (h.count > 0 && h.id == texture_id) {
+            ++h.count;
+            h.retire = h.retire || retire;
+            return true;
+        }
+        if (h.count == 0 && !free_slot)
+            free_slot = &h;
+    }
+    if (!free_slot) {
+        if (retire)
+            retire_texture_now(texture_id);
+        return false;
+    }
+    *free_slot = {texture_id, 1, retire};
+    ++g_texture_hold_count;
+    return true;
+}
+
+void release_texture(unsigned texture_id) {
+    for (texture_hold& h : g_texture_holds) {
+        if (h.count == 0 || h.id != texture_id)
+            continue;
+        if (--h.count == 0) {
+            const bool retire = h.retire;
+            h = {};
+            --g_texture_hold_count;
+            if (retire)
+                retire_texture(texture_id);
+        }
+        return;
+    }
+}
+
+void flush_deferred_retires() {
+    const unsigned n = g_deferred_count;
+    g_deferred_count = 0;
+    for (unsigned i = 0; i < n; ++i)
+        retire_texture_now(g_deferred_retires[i]);
+}
+
+namespace {
+
+void retire_texture_now(unsigned texture_id) {
     if (!g_p0_ctx || !g_p0_ctx->textures || texture_id == 0)
         return;
     texture_update forget{};
@@ -75,6 +171,8 @@ void retire_texture(unsigned texture_id) {
     if (g_p0_ctx->headless)
         g_p0_ctx->headless->forget_texture(texture_id);
 }
+
+} // namespace
 
 namespace {
 

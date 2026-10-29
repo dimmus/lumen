@@ -85,7 +85,6 @@ lx::result<void> lx::compositor::protocol_managers::install(wayland::server& ser
         {"zwp_relative_pointer_manager_v1", 1, false},
         {"wp_cursor_shape_manager_v1", 1, false},
         {"wp_security_context_manager_v1", 1, false},
-        {"wp_color_manager_v1", 1, false},
         {"ext_session_management_manager_v1", 1, false},
     };
 

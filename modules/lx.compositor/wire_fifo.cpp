@@ -86,15 +86,15 @@ void addon_free(surface_addon* a) {
 }
 
 void surface_addons_destroyed(surface_obj* s) {
-    surface_addon* addons[] = {s->fifo,  s->timer,     s->tearing_ctl, s->content_type_ctl,
-                               s->alpha_ctl, s->syncobj};
+    surface_addon* addons[] = {s->fifo,      s->timer,   s->tearing_ctl,       s->content_type_ctl,
+                               s->alpha_ctl, s->syncobj, s->background_effect, s->color_mgmt};
     for (surface_addon* a : addons)
         if (a) {
             a->surface = nullptr;
             a->slot = nullptr;
         }
     s->fifo = s->timer = s->tearing_ctl = s->content_type_ctl = s->alpha_ctl = s->syncobj =
-        nullptr;
+        s->background_effect = s->color_mgmt = nullptr;
 }
 
 namespace {

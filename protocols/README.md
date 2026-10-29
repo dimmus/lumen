@@ -76,7 +76,12 @@ keyboard-shortcuts-inhibit, ext-data-control and wlr-data-control v2, security-c
 served since Part 2), the pointer ones (pointer-constraints, relative-pointer,
 pointer-gestures v3 — served since Part 3), and the capture ones
 (ext-foreign-toplevel-list, ext-image-capture-source, ext-image-copy-capture and
-wlr-screencopy v3 — served since Part 4).
+wlr-screencopy v3 — served since Part 4). ext-background-effect-v1 (blur regions,
+rendering-performance.md "Backdrop blur") is served with the blur capability where the
+composite backend draws it (GL ES 3, Vulkan) and none on the CPU path. color-management-v1
+(wp_color_manager_v1 version 3, rendering-performance.md "Colour management") offers
+parametric image descriptions where the backend draws them (Vulkan, GL with highp, CPU) and
+the outputs' SDR sRGB description always; ICC and Windows-scRGB are not offered.
 
 Sources: `[upstream]` (wayland, wayland-protocols at `wayland_protocols_tag`), `[wlr]`
 (wlr-protocols), and `[wlroots]` — wlroots' own `protocol/` directory at a release tag

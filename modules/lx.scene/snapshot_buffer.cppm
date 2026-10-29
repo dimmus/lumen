@@ -38,6 +38,9 @@ struct draw_command {
     lx::blend_mode blend = lx::blend_mode::premultiplied;
     lx::color_space src_space = lx::color_space::srgb;
     lx::image_description_id image_desc{};
+    /// wp_color_manager_v1: the surface's colour transform (`gfx::blit_command::color`);
+    /// inactive for every surface without a description.
+    lx::gfx::color_transform color{};
     lx::buffer_transform buffer_xform = lx::buffer_transform::normal;
     float scale = 1.f;
     lx::draw_sort_key sort_key{};
@@ -61,6 +64,27 @@ struct draw_command {
     /// visibility pass only, which seeds them as occluders as it does an opaque draw's `dst`.
     lx::rect2i opaque_rects[k_max_opaque_rects]{};
     unsigned opaque_rect_count = 0;
+    /// A backdrop blur of one rect of a surface's blur region (ext-background-effect-v1):
+    /// no texture, `dst` the rect. `blur_box` is the region's bounds and `blur_source` its
+    /// number in the frame (`draw_list::next_blur_source`); see `gfx::blit_command::blur`.
+    /// Never an occluder; draws under it near its footprint are not occluded by draws
+    /// above it (`mark_occlusion`), since it reads them.
+    bool blur = false;
+    unsigned blur_source = 0;
+    lx::rect2i blur_box{};
+    /// The emitting node's content serial: changes whenever the pixels its texture holds may
+    /// have (a commit, even of the same buffer). Read by `blur_backdrop_signature` only.
+    std::uint32_t content = 0;
+};
+
+/// The map `draw_list::animate_range` applies: `p' = scale · p + offset` per axis in output
+/// pixels (scale > 0), and an opacity multiplier.
+struct draw_xform {
+    double scale_x = 1.0;
+    double scale_y = 1.0;
+    double offset_x = 0.0;
+    double offset_y = 0.0;
+    float opacity = 1.f;
 };
 
 inline constexpr unsigned k_initial_draw_commands = 256;
@@ -168,6 +192,10 @@ public:
     /// (no primitive, no order taken: the compositor's scene) is only sorted — `refs()` and
     /// `batches()` stay empty, the backends read the draw commands.
     void batch_for_render();
+    /// Blur regions emitted this frame (`draw_command::blur_source` of the next one, which
+    /// this takes): 0 for a frame without blur draws, all a backend needs to check.
+    [[nodiscard]] unsigned next_blur_source() { return blur_sources_++; }
+    [[nodiscard]] unsigned blur_source_count() const { return blur_sources_; }
     [[nodiscard]] unsigned size() const;
     [[nodiscard]] const draw_command* data() const;
     [[nodiscard]] draw_command* data();
@@ -226,6 +254,16 @@ public:
     /// sprite's tile and an underline's direction are not turned (Phase 2 text). UI affinity,
     /// before `batch_for_render`; no allocation.
     void transform_primitives(lx::buffer_transform t, lx::size2i content);
+    /// Maps every draw and primitive pushed since there were `first_draw` draws and
+    /// `first_primitive` primitives through `x` (an animating window, `node_animation`): a
+    /// draw's rect and clip edge by edge, rounded, so draws that tiled still tile and a
+    /// translation keeps a draw 1:1; `scaled` when its size changed; opacity multiplied (an
+    /// opaque draw below 1 blends); partial opaque regions dropped. A primitive's bounds and
+    /// clip exactly, its radii, border widths, blur and thickness scaled, its colours
+    /// multiplied. With a primitive stream the range takes its orders again from the mapped
+    /// rects, in push order — where it now overlaps decides. UI affinity, before
+    /// `batch_for_render`; no allocation.
+    void animate_range(unsigned first_draw, unsigned first_primitive, const draw_xform& x);
 
 private:
     friend class snapshot_buffer;
@@ -271,6 +309,7 @@ private:
     std::uint32_t* cmd_orders_ = nullptr;
     unsigned capacity_ = 0;
     unsigned count_ = 0;
+    unsigned blur_sources_ = 0;
     unsigned overflow_drops_ = 0;
     bool cap_warned_ = false;
     bool primitive_cap_warned_ = false;
@@ -506,6 +545,19 @@ namespace {
     return {x0, y0, x1 - x0, y1 - y0};
 }
 
+/// The rect a draw takes its stream order from: its clipped rect — or, for a backdrop blur,
+/// its region's footprint: everything under any of it sorts before the blur draw (it reads
+/// them), and nothing emitted above it sorts in between.
+[[nodiscard]] lx::rect2i lx_scene_order_rect(const lx::scene::draw_command& cmd, lx::size2i view) {
+    if (!cmd.blur) [[likely]]
+        return lx_scene_clipped(cmd.dst, cmd.clip);
+    const lx::rect2i b = cmd.blur_box;
+    const int m = lx::gfx::k_blur_margin;
+    if (view.width > 0 && view.height > 0)
+        return lx::gfx::blur_footprint(b, view.width, view.height);
+    return {b.x - m, b.y - m, b.width + 2 * m, b.height + 2 * m};
+}
+
 /// Sorts `n` keys whose low 16 bits are their own position (unique, ascending in input
 /// order) by an LSD radix sort over the bytes above those 16 bits, ping-ponging between
 /// `keys` and `swap`, and writes the refs and bounds at those positions in sorted order to
@@ -677,6 +729,7 @@ void lx::scene::draw_list::ensure_batch_capacity(unsigned need) {
 
 void lx::scene::draw_list::clear_lists() {
     count_ = 0;
+    blur_sources_ = 0;
     // A cap warns once per overflow, not once per frame while it lasts (ADR-010 §4.4): the
     // warnings re-arm only after a frame that dropped nothing. Every drop is still counted.
     if (overflow_drops_ == 0) {
@@ -714,13 +767,13 @@ void lx::scene::draw_list::assign_pending_orders() {
     for (unsigned i = 0; i < count_; ++i) {
         const draw_command& cmd = commands_[i];
         if (cmd_orders_[i] == k_order_unassigned)
-            cmd_orders_[i] = orders_.assign(lx_scene_clipped(cmd.dst, cmd.clip));
+            cmd_orders_[i] = orders_.assign(lx_scene_order_rect(cmd, orders_.view()));
     }
 }
 
 void lx::scene::draw_list::push(draw_command cmd, lx::runtime::overflow_action overflow) {
     if (stream_live_) {
-        push_command(cmd, orders_.assign(lx_scene_clipped(cmd.dst, cmd.clip)), overflow);
+        push_command(cmd, orders_.assign(lx_scene_order_rect(cmd, orders_.view())), overflow);
         return;
     }
     orders_pending_ = true;
@@ -938,7 +991,7 @@ void lx::scene::draw_list::batch_for_render() {
         const draw_command& cmd = commands_[i];
         const lx::rect2i r = lx_scene_clipped(cmd.dst, cmd.clip);
         if (cmd_orders_[i] == k_order_unassigned)
-            cmd_orders_[i] = orders_.assign(r);
+            cmd_orders_[i] = orders_.assign(cmd.blur ? lx_scene_order_rect(cmd, orders_.view()) : r);
         ensure_ref_capacity(ref_count_ + 1);
         refs_[ref_count_] = {cmd_orders_[i], lx::gfx::primitive_kind::surface, 0, 0, i};
         ref_bounds_[ref_count_] = r;
@@ -1225,6 +1278,157 @@ void lx::scene::draw_list::transform_primitives(lx::buffer_transform t, lx::size
     }
     for (unsigned i = 0; i < primitive_count_; ++i)
         ref_bounds_[i] = lx::gfx::transform_rect(ref_bounds_[i], t, w, h);
+}
+
+namespace {
+
+[[nodiscard]] lx::rect2i lx_scene_xform_rect(lx::rect2i r, const lx::scene::draw_xform& x) {
+    const long x0 = std::lround(x.scale_x * r.x + x.offset_x);
+    const long y0 = std::lround(x.scale_y * r.y + x.offset_y);
+    const long x1 =
+        std::lround(x.scale_x * (static_cast<double>(r.x) + r.width) + x.offset_x);
+    const long y1 =
+        std::lround(x.scale_y * (static_cast<double>(r.y) + r.height) + x.offset_y);
+    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 > x0 ? x1 - x0 : 0),
+            static_cast<int>(y1 > y0 ? y1 - y0 : 0)};
+}
+
+void lx_scene_xform_rectf(float* r, const lx::scene::draw_xform& x) {
+    r[0] = static_cast<float>(x.scale_x * r[0] + x.offset_x);
+    r[1] = static_cast<float>(x.scale_y * r[1] + x.offset_y);
+    r[2] = static_cast<float>(x.scale_x * r[2]);
+    r[3] = static_cast<float>(x.scale_y * r[3]);
+}
+
+void lx_scene_scale_halves(std::uint16_t* v, unsigned n, double s) {
+    for (unsigned k = 0; k < n; ++k)
+        v[k] = lx::gfx::to_half(static_cast<float>(lx::gfx::from_half(v[k]) * s));
+}
+
+/// The integer rect that contains the mapped rect (bounds: outward).
+[[nodiscard]] lx::rect2i lx_scene_xform_bounds(lx::rect2i r, const lx::scene::draw_xform& x) {
+    if (r.width <= 0 || r.height <= 0)
+        return r;
+    const double x0 = std::floor(x.scale_x * r.x + x.offset_x);
+    const double y0 = std::floor(x.scale_y * r.y + x.offset_y);
+    const double x1 = std::ceil(x.scale_x * (static_cast<double>(r.x) + r.width) + x.offset_x);
+    const double y1 = std::ceil(x.scale_y * (static_cast<double>(r.y) + r.height) + x.offset_y);
+    return {static_cast<int>(x0), static_cast<int>(y0), static_cast<int>(x1 - x0),
+            static_cast<int>(y1 - y0)};
+}
+
+} // namespace
+
+void lx::scene::draw_list::animate_range(unsigned first_draw, unsigned first_primitive,
+                                         const draw_xform& x) {
+    const bool fade = x.opacity < 1.f;
+    for (unsigned i = first_draw; i < count_; ++i) {
+        draw_command& c = commands_[i];
+        const lx::rect2i d = lx_scene_xform_rect(c.dst, x);
+        const bool at_dst = c.transform.m0 == 1.f && c.transform.m1 == 0.f &&
+                            c.transform.m2 == 0.f && c.transform.m3 == 1.f &&
+                            c.transform.tx == static_cast<float>(c.dst.x) &&
+                            c.transform.ty == static_cast<float>(c.dst.y);
+        // A solid colour is the same at any size: it never resamples.
+        if (!c.solid && (d.width != c.dst.width || d.height != c.dst.height))
+            c.scaled = true;
+        c.dst = d;
+        if (at_dst)
+            c.transform = lx::transform2d::translate(d.x, d.y);
+        if (c.clip.width > 0 && c.clip.height > 0) {
+            c.clip = lx_scene_xform_rect(c.clip, x);
+            // Mapped to nothing: a 1×1 clip off the draw keeps it drawing nothing.
+            if (c.clip.width <= 0 || c.clip.height <= 0)
+                c.clip = {d.x - 2, d.y - 2, 1, 1};
+        }
+        c.opacity *= x.opacity;
+        if (fade && c.blend == lx::blend_mode::opaque)
+            c.blend = lx::blend_mode::premultiplied;
+        c.opaque_rect_count = 0;
+        if (c.blur)
+            c.blur_box = lx_scene_xform_rect(c.blur_box, x);
+    }
+    const double s = x.scale_x < x.scale_y ? x.scale_x : x.scale_y;
+    const double op = x.opacity;
+    for (unsigned i = first_primitive; i < primitive_count_; ++i) {
+        const lx::gfx::primitive_ref& r = refs_[i];
+        switch (r.kind) {
+        case lx::gfx::primitive_kind::quad: {
+            lx::gfx::quad_instance& q = quads_.items[r.index];
+            lx_scene_xform_rectf(q.bounds, x);
+            if (q.clip[2] > 0.f && q.clip[3] > 0.f)
+                lx_scene_xform_rectf(q.clip, x);
+            lx_scene_scale_halves(q.radii, 4, s);
+            // top, right, bottom, left
+            lx_scene_scale_halves(&q.border_widths[0], 1, x.scale_y);
+            lx_scene_scale_halves(&q.border_widths[1], 1, x.scale_x);
+            lx_scene_scale_halves(&q.border_widths[2], 1, x.scale_y);
+            lx_scene_scale_halves(&q.border_widths[3], 1, x.scale_x);
+            if (fade) {
+                lx_scene_scale_halves(q.background, 4, op);
+                lx_scene_scale_halves(q.background_end, 4, op);
+                lx_scene_scale_halves(q.border_color, 4, op);
+            }
+            break;
+        }
+        case lx::gfx::primitive_kind::shadow: {
+            lx::gfx::shadow_instance& sh = shadows_.items[r.index];
+            lx_scene_xform_rectf(sh.bounds, x);
+            if (sh.clip[2] > 0.f && sh.clip[3] > 0.f)
+                lx_scene_xform_rectf(sh.clip, x);
+            lx_scene_scale_halves(sh.radii, 4, s);
+            sh.sigma = static_cast<float>(sh.sigma * s);
+            sh.spread = static_cast<float>(sh.spread * s);
+            if (fade)
+                lx_scene_scale_halves(sh.color, 4, op);
+            break;
+        }
+        case lx::gfx::primitive_kind::mono_sprite:
+        case lx::gfx::primitive_kind::poly_sprite:
+        case lx::gfx::primitive_kind::path: {
+            lx::gfx::sprite_instance& sp = sprites_.items[r.index];
+            lx_scene_xform_rectf(sp.bounds, x);
+            if (sp.clip[2] > 0.f && sp.clip[3] > 0.f)
+                lx_scene_xform_rectf(sp.clip, x);
+            // A poly sprite's params are its corner radii (a mono sprite's, a rotation).
+            if (r.kind == lx::gfx::primitive_kind::poly_sprite)
+                lx_scene_scale_halves(sp.params, 4, s);
+            if (fade)
+                lx_scene_scale_halves(sp.color, 4, op);
+            break;
+        }
+        case lx::gfx::primitive_kind::underline: {
+            lx::gfx::underline_instance& u = underlines_.items[r.index];
+            lx_scene_xform_rectf(u.bounds, x);
+            if (u.clip[2] > 0.f && u.clip[3] > 0.f)
+                lx_scene_xform_rectf(u.clip, x);
+            lx_scene_scale_halves(&u.thickness, 1, x.scale_y);
+            if (fade)
+                lx_scene_scale_halves(u.color, 4, op);
+            break;
+        }
+        default:
+            break;
+        }
+        ref_bounds_[i] = lx_scene_xform_bounds(ref_bounds_[i], x);
+    }
+    if (!stream_live_)
+        return;
+    // Orders again, in push order (primitive `i` came after `ref_draw_pos_[i]` draws), from
+    // where the range now lies. The cells still hold what it had where it was: that only
+    // ever raises an order, which never paints anything under what it was emitted above.
+    unsigned c = first_draw;
+    const auto reorder = [&](unsigned k) {
+        if (cmd_orders_[k] != k_order_unassigned)
+            cmd_orders_[k] = orders_.assign(lx_scene_order_rect(commands_[k], orders_.view()));
+    };
+    for (unsigned i = first_primitive; i < primitive_count_; ++i) {
+        for (; c < count_ && c < ref_draw_pos_[i]; ++c)
+            reorder(c);
+        refs_[i].order = orders_.assign(ref_bounds_[i]);
+    }
+    for (; c < count_; ++c)
+        reorder(c);
 }
 
 unsigned lx::scene::draw_list::size() const { return count_; }

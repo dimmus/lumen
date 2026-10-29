@@ -16,10 +16,18 @@ import lx.foundation;
 export module lx.gfx:gl_renderer;
 
 import std;
+import lx.trace;
 
 import :renderer;
 import :dmabuf;
 import :damage;
+import :color;
+
+namespace {
+
+[[maybe_unused]] constexpr lx::trace::category log_gl{"gfx"};
+
+} // namespace
 
 export namespace lx::gfx {
 
@@ -277,6 +285,52 @@ public:
     [[nodiscard]] lx::result<void> read_back(const gl_scanout_target& target, unsigned char* rgba,
                                              unsigned capacity);
 
+    // ── Backdrop blur (ext-background-effect-v1) ──────────────────────────────────
+
+    /// Outputs with their own blur cache (the compositor's output slots).
+    static constexpr unsigned k_blur_outputs = 16;
+    /// Blur draws need glBlitFramebuffer to read the target (OpenGL ES 3.0).
+    [[nodiscard]] bool supports_blur() const { return ready() && target_copy_; }
+
+    // ── Colour management (wp_color_manager_v1) ───────────────────────────────────
+
+    /// Draws with an active `blit_command::color` are drawn through their transform (a third
+    /// program, LUMEN_COLOR, built on the first such draw): the fragment stage has highp,
+    /// which PQ needs. Blending stays in the encoded space this backend blends in. False:
+    /// such draws are drawn as sRGB.
+    [[nodiscard]] bool supports_color_management() const {
+        return ready() && color_highp_ && !color_failed_;
+    }
+    /// Opens the blur frame of output `output`, whose composite draws into `framebuffer`
+    /// (`width` × `height`) and holds blur draws: plans it (`blur_planner::plan`, which may
+    /// grow `damage`) and makes the frame's blur draws resolve against the output's cache —
+    /// a stale region is blurred from `framebuffer` where its first draw is reached, in a
+    /// pass whose rect holds its whole footprint, then kept. Returns whether a region is
+    /// blurred again (the composite region, `damage` with the buffer age folded in, then goes
+    /// through `isolate_blur`). Until `end_blur_frame`, a composite into any other
+    /// framebuffer draws cached regions only.
+    /// Allocates the output's blur levels on first use (half the footprint, a few textures
+    /// per region); nothing at all happens on a frame without blur draws.
+    [[nodiscard]] bool begin_blur_frame(unsigned output, unsigned framebuffer,
+                                        std::span<const blur_source> sources,
+                                        damage_region& damage, int width, int height);
+    void end_blur_frame();
+    /// The open blur frame's `blur_planner::isolate`: every footprint blurred again in a rect
+    /// of `region` that no other rect meets.
+    void isolate_blur(damage_region& region) const {
+        if (blur_current_ >= 0)
+            blur_outputs_[static_cast<unsigned>(blur_current_)].plan.isolate(region);
+    }
+    /// Frees output `output`'s blur levels (its frames hold no blur draw any more, or it is
+    /// gone).
+    void release_blur(unsigned output);
+    [[nodiscard]] bool blur_in_use(unsigned output) const {
+        return output < k_blur_outputs && blur_outputs_[output].used;
+    }
+    /// Regions blurred so far (each a level 0 and its passes); a cached one drawn again is
+    /// not counted. For tests and benchmarks.
+    [[nodiscard]] unsigned long long blur_runs() const { return blur_runs_; }
+
 private:
     struct texture_slot {
         unsigned id = 0;
@@ -333,14 +387,67 @@ private:
         int use_solid = -1;
         int solid_texel = -1;
         int sampler = -1;
+        /// LUMEN_COLOR only: the transform's matrix and (power, peak).
+        int color_matrix = -1;
+        int color_params = -1;
     };
     /// [0] decodes to linear light, tints and re-encodes; [1] is the identity variant for
     /// an sRGB source without a colour tint, the common case (LUMEN_IDENTITY in the shader).
     static constexpr unsigned k_program_linear = 0;
     static constexpr unsigned k_program_identity = 1;
+    static constexpr unsigned k_program_count = 2;
+    /// `color_program_` as the bound program (k_program_count means none is bound).
+    static constexpr unsigned k_program_color = k_program_count + 1;
+
+    struct blur_level {
+        unsigned texture = 0;
+        unsigned framebuffer = 0;
+        /// Allocated texels (≥ the level's size: rounded up so a region resizing does not
+        /// reallocate every frame).
+        int width = 0;
+        int height = 0;
+    };
+    struct blur_entry {
+        blur_level levels[k_blur_levels]{};
+    };
+    struct blur_output {
+        blur_planner plan{};
+        blur_entry entries[k_max_blur_sources]{};
+        bool used = false;
+    };
+    struct blur_program {
+        unsigned id = 0;
+        int sampler = -1;
+        int valid = -1;
+        int inv_size = -1;
+        int offset = -1;
+    };
+    /// The frame's blur draw `cmd` resolved against the open blur frame: blurred from
+    /// `framebuffer` first when its region is stale (`ran` set: the GL state the composite
+    /// set is gone), else its cached level 0. Null: not drawable here (no blur frame, another
+    /// framebuffer for a stale region, or a pass rect `pass` — empty: the whole target — that
+    /// does not hold the stale region's footprint, out of resources).
+    [[nodiscard]] const blur_entry* blur_draw(const blit_command& cmd, unsigned framebuffer,
+                                              lx::rect2i pass, lx::rect2i& footprint, bool& ran);
+    [[nodiscard]] bool ensure_blur_programs();
+    [[nodiscard]] bool ensure_blur_levels(blur_entry& e, lx::rect2i footprint);
+    void destroy_blur_entry(blur_entry& e);
+    void run_blur(const blur_entry& e, unsigned framebuffer, lx::rect2i footprint);
 
     egl_device* device_ = nullptr;
     composite_program programs_[2]{};
+    /// The colour-managed program (`supports_color_management`), built on its first draw:
+    /// outside `programs_`, so a frame without such a draw never touches it.
+    composite_program color_program_{};
+    bool color_highp_ = false;
+    bool color_failed_ = false;
+    [[nodiscard]] bool ensure_color_program();
+    blur_output blur_outputs_[k_blur_outputs]{};
+    blur_program blur_programs_[2]{};
+    bool blur_programs_failed_ = false;
+    int blur_current_ = -1;
+    unsigned long long blur_runs_ = 0;
+    unsigned blur_framebuffer_ = 0;
     unsigned partial_into_fresh_ = 0;
     unsigned vertex_buffer_ = 0;
     bool bgra_ = false;
@@ -391,14 +498,20 @@ void main() {
 }
 )";
 
-// Compiled twice: as is, and with LUMEN_IDENTITY defined (see gl_compositor::initialize).
+// Compiled twice: as is, and with LUMEN_IDENTITY defined (see gl_compositor::initialize);
+// a third time with LUMEN_COLOR on the first colour-managed draw (`ensure_color_program`),
+// in highp, which only that variant needs (PQ's exponents).
 constexpr const char* k_fragment_shader = R"(
 #ifdef GL_FRAGMENT_PRECISION_HIGH
 #define UV_PRECISION highp
 #else
 #define UV_PRECISION mediump
 #endif
+#if defined(LUMEN_COLOR) && defined(GL_FRAGMENT_PRECISION_HIGH)
+precision highp float;
+#else
 precision mediump float;
+#endif
 varying UV_PRECISION vec2 uv;
 uniform sampler2D surface;
 uniform float opacity;
@@ -430,13 +543,57 @@ vec3 linear_to_srgb(vec3 v) {
     return lo * (1.0 - pick) + hi * pick;
 }
 
+#ifdef LUMEN_COLOR
+// wp_color_manager_v1 ("Colour management" in lx.gfx color.cppm, composite_cm.frag):
+// `transfer` 0 ext_linear, 1 sRGB, 2 power (exponent color_params.x), 3 PQ; the matrix
+// takes the decoded light to BT.709 relative to the output's white; above the content peak
+// color_params.y > 1 the tone curve (lx::gfx::tone_map_scale) compresses highlights.
+uniform mat3 color_matrix;
+uniform vec3 color_params;
+
+vec3 pq_to_linear(vec3 v) {
+    float m1 = 2610.0 / 16384.0;
+    float m2 = 2523.0 / 4096.0 * 128.0;
+    float c1 = 3424.0 / 4096.0;
+    float c2 = 2413.0 / 4096.0 * 32.0;
+    float c3 = 2392.0 / 4096.0 * 32.0;
+    vec3 e = pow(max(v, vec3(0.0)), vec3(1.0 / m2));
+    vec3 num = max(e - c1, vec3(0.0));
+    vec3 den = max(c2 - c3 * e, vec3(1e-6));
+    return pow(num / den, vec3(1.0 / m1));
+}
+#endif
+
 void main() {
     // Clamp to the source rectangle. Linear filtering samples between texel centers, so a
     // magnified crop would otherwise read texels from outside its own source rect.
     UV_PRECISION vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
     vec4 texel = use_solid > 0.5 ? solid_texel : texture2D(surface, s);
     texel.a = max(texel.a, alpha_one);
-#ifdef LUMEN_IDENTITY
+#if defined(LUMEN_COLOR)
+    vec3 straight = texel.a > 0.0 ? texel.rgb / texel.a : texel.rgb;
+    vec3 e = srgb_to_linear(straight);
+    if (transfer == 0)
+        e = straight;
+    else if (transfer == 2)
+        e = sign(straight) * pow(abs(straight), vec3(color_params.x));
+    else if (transfer == 3)
+        e = pq_to_linear(straight);
+    vec3 lin = color_matrix * e;
+    if (color_params.y > 1.0) {
+        float knee = 0.8; // lx::gfx::k_tone_knee
+        float x = max(lin.r, max(lin.g, lin.b));
+        if (x > knee) {
+            float w = (color_params.y - knee) / (1.0 - knee);
+            float t = (x - knee) / (1.0 - knee);
+            float y = knee + (1.0 - knee) * (t * (1.0 + t / (w * w)) / (1.0 + t));
+            lin *= y / x;
+        }
+    }
+    float alpha = texel.a * opacity * tint.a;
+    vec3 shaded = linear_to_srgb(clamp(lin * tint.rgb, 0.0, 1.0));
+    gl_FragColor = vec4(shaded * alpha, alpha);
+#elif defined(LUMEN_IDENTITY)
     // An sRGB source without a colour tint: decoding and re-encoding is the identity, so
     // opacity and tint alpha only scale the premultiplied texel. This skips the six pow()
     // below, most of the shader's cost: a fullscreen draw on SVGA3D went from 5.5 to 3 ms.
@@ -459,6 +616,53 @@ void main() {
     float alpha = texel.a * opacity * tint.a;
     vec3 shaded = linear_to_srgb(lin * tint.rgb);
     gl_FragColor = vec4(shaded * alpha, alpha);
+#endif
+}
+)";
+
+/// Backdrop blur (renderer.cppm "Backdrop blur"): one fullscreen quad per level, the unit
+/// quad of the composite drawn over the whole viewport.
+constexpr const char* k_blur_vertex_shader = R"(#version 100
+attribute vec2 corner;
+void main() {
+    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+// The down pass, or with LUMEN_BLUR_UP defined the up pass. `valid` is the source level's
+// size in texels, `inv_size` one over its allocated size: every tap is clamped to the
+// valid texel centres (clamp to edge on the level, whatever the texture holds past it).
+// gl_FragCoord is the destination texel's centre; row 0 of a texture-backed framebuffer is
+// row 0 of the texture, so no flip.
+constexpr const char* k_blur_fragment_shader = R"(
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform sampler2D source;
+uniform vec2 valid;
+uniform vec2 inv_size;
+uniform float offset;
+
+vec4 tap(vec2 p) {
+    return texture2D(source, clamp(p, vec2(0.5), valid - vec2(0.5)) * inv_size);
+}
+
+void main() {
+#ifdef LUMEN_BLUR_UP
+    vec2 c = gl_FragCoord.xy * 0.5;
+    float h = offset * 0.5;
+    vec4 sum = tap(c + vec2(-2.0 * h, 0.0)) + tap(c + vec2(2.0 * h, 0.0)) +
+               tap(c + vec2(0.0, -2.0 * h)) + tap(c + vec2(0.0, 2.0 * h));
+    sum += 2.0 * (tap(c + vec2(-h, -h)) + tap(c + vec2(h, h)) + tap(c + vec2(h, -h)) +
+                  tap(c + vec2(-h, h)));
+    gl_FragColor = sum / 12.0;
+#else
+    vec2 c = gl_FragCoord.xy * 2.0;
+    vec4 sum = 4.0 * tap(c) + tap(c + vec2(-offset, -offset)) + tap(c + vec2(offset, offset)) +
+               tap(c + vec2(offset, -offset)) + tap(c + vec2(-offset, offset));
+    gl_FragColor = sum / 8.0;
 #endif
 }
 )";
@@ -941,6 +1145,14 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
     }
     glDeleteShader(vertex);
 
+    // Colour management needs highp in the fragment stage (PQ); GLES 2 makes it optional.
+    {
+        GLint range[2] = {0, 0};
+        GLint precision = 0;
+        glGetShaderPrecisionFormat(GL_FRAGMENT_SHADER, GL_HIGH_FLOAT, range, &precision);
+        color_highp_ = precision >= 23;
+    }
+
     const char* gl_ext = reinterpret_cast<const char*>(glGetString(GL_EXTENSIONS));
     bgra_ = detail::egl_has_extension(gl_ext, "GL_EXT_texture_format_BGRA8888");
     unpack_subimage_ = detail::egl_has_extension(gl_ext, "GL_EXT_unpack_subimage");
@@ -966,6 +1178,11 @@ lx::result<void> lx::gfx::gl_compositor::initialize(egl_device& device) {
 
 void lx::gfx::gl_compositor::shutdown() {
 #if defined(LUMEN_HAS_EGL)
+    for (unsigned o = 0; o < k_blur_outputs; ++o)
+        release_blur(o);
+    for (blur_program& p : blur_programs_)
+        if (p.id)
+            glDeleteProgram(p.id);
     for (auto& slot : textures_) {
         if (slot.used)
             destroy_slot(slot);
@@ -975,10 +1192,20 @@ void lx::gfx::gl_compositor::shutdown() {
     for (composite_program& p : programs_)
         if (p.id)
             glDeleteProgram(p.id);
+    if (color_program_.id)
+        glDeleteProgram(color_program_.id);
 #endif
     vertex_buffer_ = 0;
     for (composite_program& p : programs_)
         p = {};
+    color_program_ = {};
+    color_highp_ = false;
+    color_failed_ = false;
+    for (blur_program& p : blur_programs_)
+        p = {};
+    blur_programs_failed_ = false;
+    blur_current_ = -1;
+    blur_framebuffer_ = 0;
     device_ = nullptr;
 }
 
@@ -1385,6 +1612,10 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     // Uniforms belong to a program: the per-frame ones are set in both. Whether a program
     // replaces the sample with `solid_texel` is then changed only when it changes.
     bool solid_bound[2] = {false, false};
+    // The colour-managed program (`ensure_color_program`): its per-frame uniforms are set the
+    // first time a draw of this call uses it, so a frame without one does not touch it.
+    bool color_frame_set = false;
+    bool color_solid = false;
     for (const composite_program& p : programs_) {
         glUseProgram(p.id);
         if (p.sampler >= 0)
@@ -1430,6 +1661,10 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
         blend_on = on;
     };
 
+    // A blur draw's level 0 as a texture slot, and its footprint (filled only for one).
+    texture_slot blur_slot{};
+    lx::rect2i blur_fp{};
+
     const unsigned passes = rect_count > 0 ? rect_count : 1u;
     for (unsigned pass = 0; pass < passes; ++pass) {
         const bool has_damage = rect_count > 0;
@@ -1457,7 +1692,7 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             }
             const texture_slot* slot_ptr = nullptr;
             unsigned name = 0;
-            if (!cmd.solid) {
+            if (!cmd.solid && !cmd.blur) {
                 const int index = find(cmd.texture_id);
                 if (index < 0) {
                     ++stats.draws_skipped;
@@ -1503,7 +1738,8 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             // An opaque, untinted solid colour is a clear of its rect: no shader, no
             // blending, no fragment work beyond the fill (wlroots draws such rects with a
             // clear too). The clear ignores the quad, so its scissor must be dst itself.
-            const bool solid_clear = cmd.solid && cmd.blend == lx::blend_mode::opaque &&
+            const bool solid_clear = cmd.solid && !cmd.color.active &&
+                                     cmd.blend == lx::blend_mode::opaque &&
                                      cmd.opacity >= 1.f && cmd.tint.r >= 1.f &&
                                      cmd.tint.g >= 1.f && cmd.tint.b >= 1.f &&
                                      cmd.tint.a >= 1.f && cmd.solid_color.a >= 1.f;
@@ -1558,21 +1794,76 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 continue;
             }
 
+            // A backdrop blur samples its region's level 0, blurred first when the region is
+            // stale — which leaves none of the state set for this composite.
+            if (cmd.blur) {
+                bool ran = false;
+                const blur_entry* e = blur_draw(cmd, framebuffer, damage, blur_fp, ran);
+                if (!e) {
+                    ++stats.draws_culled;
+                    continue;
+                }
+                if (ran) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+                    glViewport(0, 0, width, height);
+                    glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer_);
+                    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+                    glActiveTexture(GL_TEXTURE0);
+                    bound = k_program_count;
+                    scissor_on = false;
+                    scissor_rect = {0, 0, -1, -1};
+                    blend_on = false;
+                }
+                blur_slot.names[0] = e->levels[0].texture;
+                blur_slot.current = 0;
+                blur_slot.width = static_cast<unsigned>(e->levels[0].width);
+                blur_slot.height = static_cast<unsigned>(e->levels[0].height);
+                blur_slot.name_opaque[0] = true;
+                slot_ptr = &blur_slot;
+                name = blur_slot.names[0];
+            }
+
             set_blend(cmd.blend != lx::blend_mode::opaque);
 
             const int transfer = cmd.src_transfer == lx::transfer_function::linear    ? 0
                                  : cmd.src_transfer == lx::transfer_function::gamma22 ? 2
                                                                                       : 1;
-            const unsigned want = transfer == 1 && cmd.tint.r == 1.f && cmd.tint.g == 1.f &&
+            // A colour-managed draw (wp_color_manager_v1) through LUMEN_COLOR.
+            const bool cm = cmd.color.active && !cmd.blur && supports_color_management() &&
+                            ensure_color_program();
+            const unsigned want = cm ? k_program_color
+                                  : transfer == 1 && cmd.tint.r == 1.f && cmd.tint.g == 1.f &&
                                           cmd.tint.b == 1.f
                                       ? k_program_identity
                                       : k_program_linear;
             if (want != bound) {
-                glUseProgram(programs_[want].id);
+                glUseProgram(cm ? color_program_.id : programs_[want].id);
                 bound = want;
             }
-            const composite_program& prog = programs_[bound];
-            if (cmd.solid != solid_bound[bound]) {
+            const composite_program& prog = cm ? color_program_ : programs_[bound];
+            if (cm) {
+                if (!color_frame_set) {
+                    color_frame_set = true;
+                    if (prog.sampler >= 0)
+                        glUniform1i(prog.sampler, 0);
+                    if (prog.target >= 0)
+                        glUniform2f(prog.target, static_cast<float>(width),
+                                    static_cast<float>(height));
+                    color_solid = !cmd.solid;
+                }
+                if (cmd.solid != color_solid) {
+                    color_solid = cmd.solid;
+                    if (prog.use_solid >= 0)
+                        glUniform1f(prog.use_solid, cmd.solid ? 1.f : 0.f);
+                }
+                // GLES 2 takes the matrix column-major only (transpose must be false).
+                const float* m = cmd.color.matrix;
+                const float cols[9] = {m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]};
+                if (prog.color_matrix >= 0)
+                    glUniformMatrix3fv(prog.color_matrix, 1, GL_FALSE, cols);
+                if (prog.color_params >= 0)
+                    glUniform3f(prog.color_params, cmd.color.power, cmd.color.peak, 0.f);
+            } else if (cmd.solid != solid_bound[bound]) {
                 solid_bound[bound] = cmd.solid;
                 if (prog.use_solid >= 0)
                     glUniform1f(prog.use_solid, cmd.solid ? 1.f : 0.f);
@@ -1596,7 +1887,21 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             // draw filters linearly (wlroots, KWin).
             float u0 = 0.f, v0 = 0.f, du = 1.f, dv = 1.f;
             float u_lo = 0.f, v_lo = 0.f, u_hi = 1.f, v_hi = 1.f;
-            if (slot_ptr && slot_ptr->width > 0 && slot_ptr->height > 0) {
+            if (cmd.blur) {
+                // Level 0 holds the footprint at half resolution: a target pixel's centre
+                // samples it at (p − footprint origin) / 2, clamped to its valid texels.
+                const float tw = static_cast<float>(blur_slot.width);
+                const float th = static_cast<float>(blur_slot.height);
+                const lx::size2i valid = blur_level_size(blur_fp, 0);
+                u0 = 0.5f * static_cast<float>(cmd.dst.x - blur_fp.x) / tw;
+                v0 = 0.5f * static_cast<float>(cmd.dst.y - blur_fp.y) / th;
+                du = 0.5f * static_cast<float>(cmd.dst.width) / tw;
+                dv = 0.5f * static_cast<float>(cmd.dst.height) / th;
+                u_lo = 0.5f / tw;
+                v_lo = 0.5f / th;
+                u_hi = (static_cast<float>(valid.width) - 0.5f) / tw;
+                v_hi = (static_cast<float>(valid.height) - 0.5f) / th;
+            } else if (slot_ptr && slot_ptr->width > 0 && slot_ptr->height > 0) {
                 const texture_slot& slot = *slot_ptr;
                 const float tw = static_cast<float>(slot.width);
                 const float th = static_cast<float>(slot.height);
@@ -1628,7 +1933,12 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             if (prog.tint >= 0)
                 glUniform4f(prog.tint, cmd.tint.r, cmd.tint.g, cmd.tint.b, cmd.tint.a);
             if (prog.transfer >= 0)
-                glUniform1i(prog.transfer, transfer);
+                glUniform1i(prog.transfer,
+                            cm ? (cmd.color.tf == color_tf::ext_linear  ? 0
+                                  : cmd.color.tf == color_tf::power     ? 2
+                                  : cmd.color.tf == color_tf::st2084_pq ? 3
+                                                                        : 1)
+                               : transfer);
             if (prog.alpha_one >= 0)
                 glUniform1f(prog.alpha_one,
                             slot_ptr && slot_ptr->name_opaque[slot_ptr->current] ? 1.f : 0.f);
@@ -1683,6 +1993,300 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     (void)flush;
     return lx::not_implemented("lx::gfx::gl_compositor::composite");
 #endif
+}
+
+bool lx::gfx::gl_compositor::begin_blur_frame(unsigned output, unsigned framebuffer,
+                                              std::span<const blur_source> sources,
+                                              damage_region& damage, int width, int height) {
+    blur_current_ = -1;
+    blur_framebuffer_ = 0;
+    if (!supports_blur() || output >= k_blur_outputs || sources.empty())
+        return false;
+    blur_output& o = blur_outputs_[output];
+    o.used = true;
+    blur_current_ = static_cast<int>(output);
+    blur_framebuffer_ = framebuffer;
+    const bool again = o.plan.plan(sources, damage, width, height);
+    // Levels are made (or resized) here, not in the middle of the composite.
+    for (unsigned k = 0; k < o.plan.count(); ++k)
+        if (o.plan.pending(k) && sources[k].visible)
+            (void)(ensure_blur_programs() && ensure_blur_levels(o.entries[k], o.plan.footprint(k)));
+    return again;
+}
+
+void lx::gfx::gl_compositor::end_blur_frame() {
+    blur_current_ = -1;
+    blur_framebuffer_ = 0;
+}
+
+void lx::gfx::gl_compositor::destroy_blur_entry(blur_entry& e) {
+#if defined(LUMEN_HAS_EGL)
+    for (blur_level& l : e.levels) {
+        if (l.framebuffer)
+            glDeleteFramebuffers(1, &l.framebuffer);
+        if (l.texture)
+            glDeleteTextures(1, &l.texture);
+        l = {};
+    }
+#else
+    (void)e;
+#endif
+}
+
+void lx::gfx::gl_compositor::release_blur(unsigned output) {
+    if (output >= k_blur_outputs || !blur_outputs_[output].used)
+        return;
+    blur_output& o = blur_outputs_[output];
+    for (blur_entry& e : o.entries)
+        destroy_blur_entry(e);
+    o.plan.reset();
+    o.used = false;
+    if (blur_current_ == static_cast<int>(output))
+        end_blur_frame();
+}
+
+bool lx::gfx::gl_compositor::ensure_color_program() {
+#if defined(LUMEN_HAS_EGL)
+    if (color_program_.id)
+        return true;
+    if (color_failed_)
+        return false;
+    // Built on the first colour-managed draw, not at start-up (as the blur programs).
+    const GLuint vertex = detail::compile_shader(GL_VERTEX_SHADER, detail::k_vertex_shader);
+    const GLuint fragment = vertex ? detail::compile_shader(GL_FRAGMENT_SHADER,
+                                                            detail::k_fragment_shader,
+                                                            "#define LUMEN_COLOR 1\n")
+                                   : 0u;
+    GLuint program = 0;
+    if (vertex && fragment) {
+        program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glBindAttribLocation(program, 0, "corner");
+        glLinkProgram(program);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            glDeleteProgram(program);
+            program = 0;
+        }
+    }
+    if (vertex)
+        glDeleteShader(vertex);
+    if (fragment)
+        glDeleteShader(fragment);
+    if (!program) {
+        color_failed_ = true;
+        log_gl.warn("colour-managed composite program failed to build: such surfaces are drawn "
+                    "as sRGB");
+        return false;
+    }
+    composite_program& p = color_program_;
+    p.id = program;
+    p.rect = glGetUniformLocation(program, "rect");
+    p.target = glGetUniformLocation(program, "target");
+    p.opacity = glGetUniformLocation(program, "opacity");
+    p.uv_origin_dx = glGetUniformLocation(program, "uv_origin_dx");
+    p.uv_dy = glGetUniformLocation(program, "uv_dy");
+    p.tint = glGetUniformLocation(program, "tint");
+    p.src_bounds = glGetUniformLocation(program, "src_bounds");
+    p.transfer = glGetUniformLocation(program, "transfer");
+    p.alpha_one = glGetUniformLocation(program, "alpha_one");
+    p.use_solid = glGetUniformLocation(program, "use_solid");
+    p.solid_texel = glGetUniformLocation(program, "solid_texel");
+    p.sampler = glGetUniformLocation(program, "surface");
+    p.color_matrix = glGetUniformLocation(program, "color_matrix");
+    p.color_params = glGetUniformLocation(program, "color_params");
+    return true;
+#else
+    return false;
+#endif
+}
+
+bool lx::gfx::gl_compositor::ensure_blur_programs() {
+#if defined(LUMEN_HAS_EGL)
+    if (blur_programs_[0].id && blur_programs_[1].id)
+        return true;
+    if (blur_programs_failed_)
+        return false;
+    // Built on the first blur, not at start-up: a session nobody blurs in compiles nothing.
+    const GLuint vertex = detail::compile_shader(GL_VERTEX_SHADER, detail::k_blur_vertex_shader);
+    bool ok = vertex != 0;
+    for (unsigned v = 0; v < 2 && ok; ++v) {
+        const GLuint fragment = detail::compile_shader(
+            GL_FRAGMENT_SHADER, detail::k_blur_fragment_shader,
+            v == 1 ? "#define LUMEN_BLUR_UP 1\n" : "\n");
+        if (!fragment) {
+            ok = false;
+            break;
+        }
+        const GLuint program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glBindAttribLocation(program, 0, "corner");
+        glLinkProgram(program);
+        glDeleteShader(fragment);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            glDeleteProgram(program);
+            ok = false;
+            break;
+        }
+        blur_program& p = blur_programs_[v];
+        p.id = program;
+        p.sampler = glGetUniformLocation(program, "source");
+        p.valid = glGetUniformLocation(program, "valid");
+        p.inv_size = glGetUniformLocation(program, "inv_size");
+        p.offset = glGetUniformLocation(program, "offset");
+    }
+    if (vertex)
+        glDeleteShader(vertex);
+    if (!ok) {
+        for (blur_program& p : blur_programs_) {
+            if (p.id)
+                glDeleteProgram(p.id);
+            p = {};
+        }
+        blur_programs_failed_ = true;
+        log_gl.warn("backdrop blur programs failed to build: blur regions are not drawn");
+    }
+    return ok;
+#else
+    return false;
+#endif
+}
+
+bool lx::gfx::gl_compositor::ensure_blur_levels(blur_entry& e, lx::rect2i footprint) {
+#if defined(LUMEN_HAS_EGL)
+    for (unsigned k = 0; k < k_blur_levels; ++k) {
+        const lx::size2i want = blur_level_size(footprint, k);
+        if (want.width <= 0 || want.height <= 0)
+            return false;
+        blur_level& l = e.levels[k];
+        // Rounded up to 32 texels with one to spare, and kept unless it is far too large: a
+        // region resizing with its window reallocates now and then, not on every frame.
+        const bool fits = l.texture && want.width < l.width && want.height < l.height &&
+                          l.width <= 2 * want.width + 64 && l.height <= 2 * want.height + 64;
+        if (fits)
+            continue;
+        const int aw = (want.width + 1 + 31) & ~31;
+        const int ah = (want.height + 1 + 31) & ~31;
+        if (!l.texture)
+            glGenTextures(1, &l.texture);
+        glBindTexture(GL_TEXTURE_2D, l.texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, aw, ah, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindTexture(GL_TEXTURE_2D, 0);
+        if (!l.framebuffer)
+            glGenFramebuffers(1, &l.framebuffer);
+        glBindFramebuffer(GL_FRAMEBUFFER, l.framebuffer);
+        glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, l.texture, 0);
+        const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        l.width = aw;
+        l.height = ah;
+        if (status != GL_FRAMEBUFFER_COMPLETE) {
+            destroy_blur_entry(e);
+            return false;
+        }
+    }
+    return true;
+#else
+    (void)e;
+    (void)footprint;
+    return false;
+#endif
+}
+
+void lx::gfx::gl_compositor::run_blur(const blur_entry& e, unsigned framebuffer,
+                                      lx::rect2i footprint) {
+#if defined(LUMEN_HAS_EGL)
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    // Level 0: the footprint halved by the blit's linear filter — at an exact 2:1 each
+    // texel is sampled at the corner its 2×2 block shares, the block's mean.
+    const lx::size2i l0 = blur_level_size(footprint, 0);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, e.levels[0].framebuffer);
+    glBlitFramebuffer(footprint.x, footprint.y, footprint.x + footprint.width,
+                      footprint.y + footprint.height, 0, 0, l0.width, l0.height,
+                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
+    glBindBuffer(GL_ARRAY_BUFFER, vertex_buffer_);
+    glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, nullptr);
+    glActiveTexture(GL_TEXTURE0);
+    const auto pass = [&](const blur_program& p, unsigned from, unsigned to) {
+        const lx::size2i src = blur_level_size(footprint, from);
+        const lx::size2i dst = blur_level_size(footprint, to);
+        glBindFramebuffer(GL_FRAMEBUFFER, e.levels[to].framebuffer);
+        glViewport(0, 0, dst.width, dst.height);
+        glBindTexture(GL_TEXTURE_2D, e.levels[from].texture);
+        if (p.valid >= 0)
+            glUniform2f(p.valid, static_cast<float>(src.width), static_cast<float>(src.height));
+        if (p.inv_size >= 0)
+            glUniform2f(p.inv_size, 1.f / static_cast<float>(e.levels[from].width),
+                        1.f / static_cast<float>(e.levels[from].height));
+        glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+    };
+    for (unsigned k = 0; k < 2; ++k) {
+        const blur_program& p = blur_programs_[k];
+        glUseProgram(p.id);
+        if (p.sampler >= 0)
+            glUniform1i(p.sampler, 0);
+        if (p.offset >= 0)
+            glUniform1f(p.offset, k_blur_radius);
+        if (k == 0) {
+            for (unsigned l = 1; l < k_blur_levels; ++l)
+                pass(p, l - 1, l);
+        } else {
+            for (unsigned l = k_blur_levels - 1; l > 0; --l)
+                pass(p, l, l - 1);
+        }
+    }
+    glBindTexture(GL_TEXTURE_2D, 0);
+#else
+    (void)e;
+    (void)framebuffer;
+    (void)footprint;
+#endif
+}
+
+const lx::gfx::gl_compositor::blur_entry*
+lx::gfx::gl_compositor::blur_draw(const blit_command& cmd, unsigned framebuffer,
+                                  lx::rect2i pass, lx::rect2i& footprint, bool& ran) {
+    ran = false;
+    if (blur_current_ < 0)
+        return nullptr;
+    blur_output& o = blur_outputs_[static_cast<unsigned>(blur_current_)];
+    const unsigned k = cmd.blur_source;
+    footprint = o.plan.footprint_for(k, cmd.blur_box);
+    if (footprint.width <= 0 || footprint.height <= 0)
+        return nullptr;
+    blur_entry& e = o.entries[k];
+    const lx::size2i valid = blur_level_size(footprint, 0);
+    if (o.plan.pending(k)) {
+        // Only the output's own composite holds the footprint's backdrop to blur, and only
+        // in a pass that redraws all of it (`blur_planner::isolate`); the levels were made
+        // by `begin_blur_frame` when the region was seen visible.
+        if (framebuffer != blur_framebuffer_ ||
+            (!detail::damage_rect_empty(pass) && !detail::damage_contains(pass, footprint)) ||
+            !blur_programs_[1].id ||
+            !e.levels[k_blur_levels - 1].framebuffer || e.levels[0].width <= valid.width ||
+            e.levels[0].height <= valid.height)
+            return nullptr;
+        run_blur(e, framebuffer, footprint);
+        o.plan.done(k);
+        ++blur_runs_;
+        ran = true;
+        return &e;
+    }
+    if (!e.levels[0].texture || e.levels[0].width <= valid.width ||
+        e.levels[0].height <= valid.height)
+        return nullptr;
+    return &e;
 }
 
 lx::result<int> lx::gfx::gl_compositor::fence_frame() {

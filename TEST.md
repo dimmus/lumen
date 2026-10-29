@@ -583,6 +583,48 @@ and the denylist, exact restore after a clean and a crashed compositor, a value 
 escaped left alone, a second session and an inactive VT refused, `--cleanup`, the fallback
 without a user manager and its autostart, the login-shell re-exec).
 
+Backdrop blur (ext-background-effect-v1): `test_backdrop_blur` checks the GL (render node;
+skipped on a software GL) and Vulkan (lavapipe here) blur against the dual-Kawase chain
+computed in the test from its definition — blit and primitive-stream frames, odd sizes and
+regions on the target's edges, nothing outside the region changed, the cached blur the same
+pixels — plus the planner (blurred again only when the backdrop signature or the bounds
+change; the footprint isolated in a rect grown over the rects meeting it, far rects kept; a
+stale blur culled in a pass that does not hold its footprint), the scene's blur draws, the
+visibility pass and the signature; `test_backdrop_blur_vk_validation` repeats the Vulkan cases
+under VK_LAYER_KHRONOS_validation (no message allowed). `test_protocol_conformance` has the
+protocol errors, the capabilities event and the region reaching the scene; app-smoke T7 a live
+window (`lumen-probe blur`): stripes blurred to an even grey inside the region, exact outside.
+The cost: `bench_composite 1920 1080 --blur [--vk]` (rendering-performance.md "Backdrop blur").
+
+Colour management (wp_color_manager_v1): `test_color_management` draws a 256-cell image (216
+opaque colours, 40 translucent greys) under eight descriptions — PQ BT.2020 at its defaults
+and with max_cll 1000, SDR in a PQ container, gamma 2.2, extended linear, the sRGB curve on
+BT.2020, a 2.6 power on DCI-P3 (Bradford), gamma 2.2 Display P3 with headroom — on the CPU,
+GL (render node) and Vulkan (lavapipe) backends, blit and UI-stream frames, and compares every
+pixel with a reference computed in the test from the definitions (matrices from the
+chromaticities, Bradford, the curves, the anchor and the tone curve; within 1 level), plus the
+matrices against ITU-R BT.2087, the tone curve's properties and an sRGB description drawing
+the very bytes of an undescribed surface; `test_color_management_vk_validation` repeats the
+Vulkan cases under the validation layer. `test_protocol_conformance` has what is offered per
+version, the outputs' description and its information, a PQ description reaching the scene at
+the commit and leaving it on unset, and every protocol error. The cost:
+`bench_composite 1920 1080 --color [--vk]`.
+
+# vkmark on Lumen: commit path, stutter, panel cost (manual bench, ~3.5 min; not in ctest)
+./scripts/vkmark-bench.sh --join-seat-session [--modes bare,panel,shell] [--size 800x600]
+
+This script starts its own compositor at LUMEN_LOG=debug for each mode, the same way
+drag-smoke does: `bare` has no shell, `panel` is `lumen-shell --no-background`, and `shell` is
+the panel plus the background. In each mode vkmark runs twice: `--present-mode immediate`
+(the commit → release path: vkmark's FPS) and `--present-mode fifo` (stutter: the interval
+spread between presented frames, from the flip lines, and frames later than 1.5 refresh
+periods). The summary compares damage, draws, render_us and compositor CPU time with `bare`.
+On a host without a hardware Vulkan driver, vkmark runs on lavapipe, and the numbers only
+compare runs on that host. The baseline and how to read it are in
+docs/subsystems/rendering-performance.md ("A real client, end to end: vkmark"). Exit codes:
+0 done (possibly with warnings), 1 a run failed, 2 could not run. Logs are in
+vkmark-bench-logs/.
+
 # Sanitizers
 cmake --preset asan && cmake --build --preset asan && ctest --preset asan
 cmake --preset tsan && cmake --build --preset tsan && ctest --preset tsan

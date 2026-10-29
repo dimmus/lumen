@@ -34,7 +34,9 @@ All GPU compositing runs in **linear light** (`transfer_function::linear`). Surf
 colors are decoded using each draw command's `src_space` and tagged `encoding`; the
 output transfer function is applied **once** at the end of the render pass (before
 KMS scanout or swapchain present). This prevents the sRGB-in-linear-space blending
-errors common in legacy compositors.
+errors common in legacy compositors. A surface with an image description
+(wp_color_manager_v1) is decoded and converted by its own transform — "Colour management" in
+§3.
 
 On Vulkan the blend target is an R16G16B16A16_SFLOAT intermediate (8 B/px, 66 MiB at 4K)
 that the encode pass reads into the scanout buffer. The one `vulkan_compositor` draws every
@@ -236,6 +238,122 @@ and has no effect: SVGA3D fences have no deadline hook and the host's GPU clocks
 guest's to raise. There is nothing to measure there; the plumbing is covered by
 `test_fence_deadline` (the real ioctl on a udmabuf sync_file where `/dev/udmabuf` is
 accessible, and ENOTTY on a non-sync_file) and the fallbacks by fakes.
+
+### GPU time of a Vulkan composite
+
+While `compositor.render` logs at debug, the Vulkan composite times every frame on the GPU
+(`vulkan_compositor::set_gpu_timing`); at any other level nothing is recorded, read or logged,
+and the command buffers are the ones they were. Three timestamps per frame: the top of the
+command buffer, after the composite pass and after the encode pass — so the line splits the
+frame into `composite_us` (acquires of fresh imports, a UI stream's atlas copies, the
+composite pass) and `encode_us` (the linear intermediate into the scanout target), which is
+the split a damage or encode change needs measured. A blit frame and a linear frame with UI
+primitives (`begin_linear_frame` … `end_linear_frame`) are timed alike.
+
+- **Pool:** one `VK_QUERY_TYPE_TIMESTAMP` pool of 3 × 2 queries (the two frame slots), made at
+  `initialize` when the queue family has `timestampValidBits` and the device a
+  `timestampPeriod`; no per-frame create or destroy. Each timed frame resets its slot's three
+  queries inside its own command buffer.
+- **No stall:** results are read without `VK_QUERY_RESULT_WAIT_BIT`, and only from a slot whose
+  fence has signalled — polled once per render tick (`take_gpu_times`, `vkGetFenceStatus`), or
+  when the slot is recorded again, which waited for that fence anyway. A frame is usually
+  reported on the next tick; on lavapipe, whose sync_file export completes the work first, in
+  the same one.
+- **Log:** `compositor.render: gpu frame=F composite_us=… encode_us=… output=N`, `frame=` being
+  that output's `frame=` line. The black frame of a refused power-off is timed but not
+  listed.
+
+This is not the `gpu` of the latency split (`compositor.latency`, drag-smoke's `g`): that one
+is the composite's sync_file signal time minus the commit — how long KMS still waited for the
+GPU — and comes from the same exported fence on GL and Vulkan. The timestamps are the frame's
+own execution time, queueing behind other GPU work excluded, and they exist where the split
+has nothing: a device that cannot export a sync_file (the render thread blocks, and the GPU
+time hides inside `render_us`). On lavapipe the exported sync_file is an already-signalled
+stub with a boot-time timestamp, so the split's `gpu` is 0 there, never a measurement. GL
+composites are not timed this way.
+
+**Measured** (lavapipe, 1920×1080, `bench_composite --vk` without and with `--gpu-timing`, 3
+runs each, medians): timing off is the baseline within noise on every line (composite full
+frames 97.1 vs 98.0 ms, cursor frame 2.12 vs 2.00, terminal line 3.62 vs 3.56). Timing on,
+full frames are within noise (110.9 vs 111.9 ms) and the GPU time covers 99 % of the wall time,
+as it must on a CPU rasteriser; small damage frames cost +0.6 ms (cursor 2.63, terminal line
+4.22 ms), lavapipe flushing its rasteriser at each bottom-of-pipe timestamp — on a GPU a
+timestamp is a write by the command processor. The split shows where lavapipe's time goes:
+encode is 46 % of a full frame (50.6 of 110.5 ms). `test_dmabuf_composite`
+(`gpu_timing_reports_each_frames_passes`) and `test_deco_titles` (`vk_gpu_timing_times_the_linear_pass`,
+also under the validation layer) check that both passes report non-zero time no longer than
+the frame's wall time and that a timed frame's pixels equal an untimed one's.
+
+### A real client, end to end: vkmark
+
+`scripts/vkmark-bench.sh --join-seat-session` (manual, not in ctest; about 3.5 minutes, and it
+takes the display) runs vkmark as a Wayland client on the KMS console, each mode with its own
+compositor at `LUMEN_LOG=debug`: `bare` (no shell), `panel` (`lumen-shell --no-background`) and
+`shell` (panel and the built-in background). Per mode, two vkmark runs on an 800×600 window:
+
+- **`--present-mode immediate`** (clear, cube, texture, desktop; 5 s each). vkmark commits as
+  fast as buffers come back, so its FPS is what the commit → upload/import →
+  `wl_buffer.release` path sustains. Composites stay at one per refresh at most; newer
+  commits replace older ones in between.
+- **`--present-mode fifo`** (clear and cube; 10 s each, both well inside a refresh period for
+  the client). Stutter is the spread of the intervals between presented frames, from the
+  `compositor.presentation: flip` lines: mean, stddev, p99, and `late`, the frames shown more
+  than 1.5 refresh periods after the previous one.
+
+vkmark's output is timestamped as it is written (it prints a scene's name when the scene
+starts and its FPS when the scene ends), so every flip and `compositor.render` line is
+attributed to a scene. The first 0.5 s of each scene is left out. The compositor's CPU time
+is sampled from `/proc` at the same moments. A static panel or background must add nothing
+to a frame that changed only vkmark's window. The summary compares `panel` and `shell` with
+`bare` and warns when the damage (`rects`, `area`) or the `draws` per composite differ, or
+when the panel redrew during a scene. It also prints render_us and CPU time per frame for
+each mode. Results go to `vkmark-bench-logs/summary.{txt,json}`.
+
+**Baseline** on this host. vkmark runs on lavapipe (software Vulkan): its WSI hands the
+compositor shm buffers, which are uploaded on the GL path (SVGA3D, 1918×928 at 60 Hz). Use
+the numbers only to compare runs of the script on the same host. Each value is the median of
+3 runs on main 7ef5039; `cpu/frame` is the compositor's CPU time, all threads, per vkmark
+frame.
+
+```
+immediate        FPS (bare/panel/shell)  composites/s        render_us p50       cpu/frame µs
+  clear          94 / 88 / 89            31* / 59 / 59       1713 / 1417 / 1373  1233 / 1838 / 1679
+  cube           88 / 85 / 85            59 / 57 / 57        1549 / 1556 / 1514  1708 / 1748 / 1659
+  texture        74 / 75 / 75            56 / 57 / 57        1378 / 1362 / 1343  1604 / 1652 / 1633
+  desktop        68 / 68 / 68            57 / 55 / 55        1074 / 1069 / 1085  1724 / 1638 / 1683
+fifo             FPS   interval mean / sd / p99 ms   late per ~570 frames  render_us p50 / p95
+  clear  bare    56    17.7 / 3.1 / 31.3             15                    1106 / 4482
+         panel   57    17.6 / 3.1 / 31.2             12                    1109 / 3887
+         shell   56    17.7 / 2.8 / 30.8             12                    1121 / 3265
+  cube   bare    57    17.5 / 3.2 / 31.5             18                    1185 / 4276
+         panel   56    17.7 / 3.2 / 31.3             17                    1152 / 4290
+         shell   56    17.6 / 3.2 / 31.6             15                    1159 / 4502
+```
+
+\* Composites locked to every other refresh in that scene: the open issue below.
+
+What this shows:
+
+- **The panel and the background cost nothing per frame.** In every scene, mode and run,
+  each composite was one rect of 480 000 px (the window) and one draw: the panel and
+  background draws are culled outside the damage. The panel never redrew during a scene, and
+  render_us and CPU per frame are within run-to-run noise of `bare`.
+- **Stutter is not the shell's.** In fifo mode about 2–3 % of frames are late in all three
+  modes (56–57 of 60 shown per second, p99 two refresh periods). The p95 render_us of 3–4.5 ms
+  is the SVGA3D upload and composite. The emulated vblank's flip timestamps also jitter
+  (intervals of 11–23 ms between consecutive flips).
+- **Open issue: under an immediate-mode flood, composites sometimes lock to every other
+  refresh.** Here every composite takes every second snapshot (the `frame=` index steps by 2),
+  so the rate halves to about 31 per second. render_us is about 1.7 ms, so the composite cost is
+  not the cause. When it happens it holds for the whole scene. It has been seen in all three modes, and
+  before and after the `draws=` change. Over 7 runs it hit `clear`, the first scene, in 12 of
+  21 cases, and `cube` once. vkmark's FPS goes up then (91–95), because buffers come back
+  sooner when fewer frames are uploaded.
+
+`compositor.render`'s `draws=` field (the draws the backend reported submitting) was added for
+this comparison. With debug logging on, the numbers above did not change outside noise
+(3 runs after the change against the 3 before). With debug logging off, nothing is formatted
+or logged.
 
 ### GL composite properties
 
@@ -797,6 +915,275 @@ clients, `render_us` from the `compositor.render` debug line:
 |--------|------------------------------------|------------------------------|
 | Hardware plane | 211 µs / 3.0 ms, `composite=0 commit=cursor` on every frame | 26 ticks / 3 s |
 | Software (`LUMEN_CURSOR=software`) | 675 µs / 9.9 ms, `composite=1` (≈1.9 kpx) every frame | 42 ticks / 3 s |
+
+### Window animations
+
+Off by default (`[animations] enabled`, user-guide). On, a window opens fading in from 0.9 of
+its size and closes fading out to it, minimizes and comes back the same way, the windows of a
+workspace slide with a switch on their output, and a placement the window manager makes —
+maximize, restore, snap, a tile — moves and resizes the window there instead of jumping.
+
+**Visual only.** The window manager's geometry, hit-testing, configures and the client never
+see a motion: the client is configured for its final size at once, and its new buffer is what
+is drawn, resampled into the in-between rect. A motion is a `scene::node_animation` on the
+window's tree container — `p' = to + (p − from) · scale` and an opacity — that
+`scene_graph::emit_node` applies to the draws the subtree has just emitted
+(`draw_list::animate_range`): surface draws edge by edge with rounding (draws that tiled still
+tile; a translation stays 1:1, so a slide never resamples), primitives (a server-side frame)
+exactly, with radii, borders and colours scaled. With a primitive stream the range takes its
+orders again from where it now lies, so nothing emitted later sorts under it. An inactive
+`node_animation` costs one test per window: with animations off the scene, the draws and the
+pixels are those of the build before them (`bench_composite --hash`: every frame hash, draw,
+cull and pixel count identical, CPU, GL and lavapipe).
+
+**Springs, not curves.** Every value — the visual rect's four offsets from the rest frame, the
+scale, the opacity, a slide's offset — is a damped spring of unit mass (`stiffness`, default
+800: ω₀ ≈ 28.3 rad/s; `damping-ratio`, default 1: critically damped), evaluated in closed form
+from the instant it was released (`spring_step`), so a frame's pose depends on its time alone,
+and a retarget mid-flight continues from the shown state at its velocity. Time is the frame's
+**predicted presentation**: the next vblank of the first served output's phase-locked clock
+(§6.1), never earlier than the last. A value stops — landing exactly on its target — at the
+first frame whose remaining reach `√(x² + v²/ω₀²)` (its energy as a displacement: nothing it
+does later goes further) is under **half an output pixel** (opacity: 1/255; scale: half a
+pixel at the window's corners). An open or close at the defaults is 18 frames (300 ms at
+60 Hz), a 1280 px slide 23.
+
+**Frames only while something moves.** `window_manager::needs_tick` is true while a motion
+runs; when the last one settles its rest is damaged once and the frame clock stops. Measured
+live (GL, vmwgfx, 60 Hz, `compositor.render` frame lines): opening lumen-square 18 frames,
+then **0 in 3 s** idle; closing it 18, then 0; weston-simple-egl killed (its ghost holding the
+dma-buf) 18, then 0, no warning. Off: 1 frame each.
+
+**Scoped to the window.** An animation changes only its own window's draws: it never turns
+culling, damage or anything else off for the scene or another output. A workspace slide is
+confined to the output view of the workspace (`node_animation::view`): there it moves 1:1,
+on any other output a leaving window is not drawn and an entering one is drawn at rest.
+Capture views (screenshots, screencasts) draw where a motion ends: an arriving window at rest,
+nothing of a leaving one (`node_animation::leaving`: a closing window's ghost, a window
+minimizing or sliding off its workspace), so a capture never shows a closed window or two
+workspaces at once; they are damaged when a window starts or stops leaving. Damage is the old
+and new visual bounds (the frame and everything the tree draws, mapped, a pixel wider), on that
+output only for a slide.
+
+**Closing: a ghost.** At unmap the window manager copies the window's frame (with its title
+run) and surface nodes into a container of its own at the window's place in the window layer
+(`make_ghost`; restacking skips ghosts), which fades out and is freed when the motion ends.
+The copies draw the textures the surfaces showed: `hold_content` keeps each texture's dated
+retirement waiting (retirements are queued at the next tick while animations are on, so a
+null-buffer commit that retires before the unmap is still caught) and keeps its dma-buf
+*current* in `buffer_lifecycle_tracker` (`hold` / `release_hold`) — never released to the
+client, never evicted from the import cache — until the ghost lets go; then it is released
+once the frames that sampled it have completed, as at any detach. Holds are per surface: a
+window that unmaps again while an older ghost of it still fades ends that ghost first, and a
+held buffer the surface commits again is the surface's once more (the hold ending never
+releases what is on screen).
+
+**Never against the pointer.** A grab on a window ends its motion at once (`begin_grab`), and
+no placement animates while one runs — drag-to-restore follows the pointer, interactive
+resize stays frame-perfect (`drag-smoke.sh` with animations on: PASS, `h` all committed sizes
+matched, window-move latency median 11.8 ms as off). Fullscreen is not animated.
+
+**What an animating frame costs** (`bench_composite 1920 1080 --animate`: each scene's top
+window at 0.95 of its size, opacity 0.6 — resampled, blended, and no longer hiding what is
+under it), medians of 3, against the same scenes at rest:
+
+| Scene | GL (SVGA3D), fence waited | CPU, 1 thread |
+|-------|---------------------------|---------------|
+| stacked CSD windows | 4.3 → 6.9 ms | 17.2 → 70.1 ms |
+| 3 cascaded opaque windows | 4.8 → 5.6 ms | 22.8 → 47.3 ms |
+| 6 cascaded opaque windows | 5.4 → 6.2 ms | 22.9 → 44.7 ms |
+| 4 cascaded CSD windows | 5.3 → 6.2 ms | 26.4 → 51.6 ms |
+| maximised window under a panel | 4.5 → 5.1 ms | 3.4 → 4.9 ms |
+| two tiled halves | 4.6 → 5.7 ms | 5.0 → 52.4 ms |
+| fullscreen + small opaque menu | 4.7 → 4.8 ms | 2.5 → 5.4 ms |
+
+On a GPU it is a fraction of a millisecond to 2.6 ms for the length of the motion. On the CPU
+backend a large resampled window costs 20–50 ms a frame: animations are not for hosts whose
+only renderer is the CPU. Lavapipe (Vulkan on the CPU): +5–15 % (113–150 ms a frame either
+way). Nothing allocates per frame: the motions are a fixed table of 64, the ghosts' copies are
+made at the unmap.
+
+### Backdrop blur (ext-background-effect-v1)
+
+A client names a region of its surface (`ext_background_effect_surface_v1.set_blur_region`,
+double-buffered, copied at the request); what is behind that region is shown blurred. The
+global announces `blur` where the composite backend draws it — GL ES 3 (it needs
+`glBlitFramebuffer`) and Vulkan — and no capability on the CPU path, which accepts regions and
+ignores them (there is no CPU blur: one would have to be measured cheap enough first, and the
+CPU path already spends 2–25 ms a frame compositing). lumen-shell's panel asks for it
+with `[panel] blur = true` (off by default: an opaque panel, as before).
+
+**The region.** Clipped to the surface and made disjoint at commit (a wl_region's rects may
+overlap, and a pixel under two blur draws would be blurred twice); up to eight rects, more
+blur over the region's bounds. On output views the surface node emits one blur draw per rect
+under its own draw (`draw_command::blur`, the region's bounds `blur_box`, the frame's number
+for it `blur_source`), at the surface's opacity and tint, moved and faded with an animating
+window; capture views emit none (a window capture is the window, not what is behind it).
+
+**The blur** (`lx.gfx:renderer` states it exactly): dual Kawase (Bjørge, SIGGRAPH 2015; the
+passes scenefx uses) at half resolution. The region's *footprint* is its bounds grown by 64 px
+and clipped to the target, origin and size even. Level 0 is the footprint halved — each texel
+the mean of its 2×2 block (GL: a 2:1 `glBlitFramebuffer` with linear filtering; Vulkan: a
+bilinear tap at the block corner of the linear F16 intermediate) — then three down passes (4
+centre + 4 diagonal taps, ÷8) and three up passes (4 axis + 2 × 4 diagonal taps, ÷12) at radius
+1, every tap clamped to its level's texels; each pixel of the region samples level 0
+bilinearly. That is a blur of σ ≈ 15 output pixels whose support (29 level-0 texels, 60 px)
+fits inside the margin, so the region's pixels never see the footprint's edge except where it
+meets the screen's (edge extension there). Levels are RGBA8 on GL (blended in the encoded
+space, as GL composites) and 16-bit float in linear light on Vulkan. A Vulkan level is drawn
+one texel past its size: a tap clamped to the last texel centre still weighs its neighbour by
+zero, and an uninitialised half float there can be a NaN, which zero does not cancel.
+
+**Where it runs.** In the frame that draws the region, at the point of its first blur draw,
+from the target itself: everything painted before the blur draw is the backdrop, primitives
+(server-side title bars) included — on GL the stream path's surface runs go through the same
+`composite_into`, on Vulkan `record_blits` ends the linear pass, draws the levels and resumes
+it. In a primitive stream a blur draw takes its order from its footprint, so what is under any
+of it sorts before it and nothing emitted above it sorts in between. Levels are made per
+output and region on first use (rounded up, so a resizing region does not reallocate every
+frame), freed when the output's frames hold no blur draw any more; on a 1920-wide output a
+32 px panel's levels are 61 200 texels (0.23 MiB on GL, 0.47 MiB on Vulkan) — not four
+full-size buffers per output.
+
+**The cache** (umbriel's background blur cache, `gfx::blur_planner`). A region's blurred level 0
+is kept and drawn again — no passes, no target read — while its *backdrop signature* holds:
+everything painted under its footprint before it, in paint order, hashed with each draw's
+geometry, opacity, tint, blending, visible rects and content serial (bumped on every commit,
+even of the same buffer), a primitive's instance bytes and a lower region's own signature
+(`scene::blur_backdrop_signature`), plus the clear colour and the region's bounds. The region's
+own surface and whatever is above it may change freely: a panel redrawing its clock draws the
+cached blur under its new pixels.
+
+**Damage.** A stale region whose draws reach the screen (not occluded, opacity × tint alpha
+above zero) adds its footprint to the frame's damage, and the footprint gets a rect of its own
+(`blur_planner::isolate`, on the damage and again on the region with the buffer age folded
+in): it and every rect meeting it become their bounds, repeated until that rect meets no other.
+The whole footprint is then redrawn in one pass before the blur draw reads it, and the blurred
+pixels are reported changed; rects away from it are composited as they were. A backend blurs a
+stale region only in a pass whose rect holds its whole footprint and culls the draw in any
+other, so a split footprint is never read half redrawn. A fresh region changes no pixel by
+itself. Blur draws are drawn inside their region only (scissored like any draw), so the blur
+never leaks across the region's edges.
+
+The cost that remains: a window under the footprint that commits makes the region stale (its
+content serial is in the signature) even when its damage is far below, so each such commit
+redraws the footprint beside its own damage. Live, foot maximised under a `[panel] blur` panel
+on a 1918×928 output, one text row rewritten every 0.2 s: 780 px per frame with the blur off,
+184 908 px with it on (the 1918×96 footprint plus the row, two rects). Collapsing the frame
+to its bounds instead, as the first version did, composited 1 122 030 px per frame.
+
+**Visibility.** A blur draw is never an occluder (its pixels are what the blur makes), and
+once the visibility pass reaches a visible one it drops every occluder above it that meets its
+footprint: a draw under the footprint is drawn although a window above the region hides it,
+because the blur reads it. A region wholly covered by an opaque draw is occluded like any draw
+and not blurred. Other outputs are untouched: the blur state is per output, and a frame
+without blur draws runs none of this (the backend sees `draw_list::blur_source_count() == 0`).
+
+**Not drawn.** A screen capture's re-composite (only when the software pointer must be left
+out) draws the cached blur on GL and none on Vulkan (capture command buffers are not the
+frame's linear pass); a window capture shows no blur; the CPU path offers none.
+
+Measured (`bench_composite 1920 1080 --blur --vk`, medians of 4; a full-screen textured window
+under a 1920×32 panel blur with a 72 % overlay, fence waited; "blurred again": the backdrop
+changes under the footprint every frame; "window row update": a 960×16 row of the window far
+below the panel, its commit leaving the backdrop stale):
+
+| Case | GL, SVGA3D | Vulkan, lavapipe |
+|------|-----------:|-----------------:|
+| full repaint, no blur draw | 4.44 ms | 98.3 ms |
+| full repaint, cached blur | 4.58 ms | 100.1 ms |
+| full repaint, blurred again | 5.65 ms | 114.4 ms |
+| panel update (120×24), no blur draw | 1.94 ms | 1.19 ms |
+| panel update, cached blur | 1.91 ms | 1.23 ms |
+| panel update + backdrop moving, blurred again (frame grown to the 1920×96 footprint) | 3.42 ms | 24.4 ms |
+| backdrop moving, no blur draw | 1.97 ms | 1.47 ms |
+| window row update, no blur draw (15 360 px) | 1.65 ms | 1.23 ms |
+| window row update, blurred again (row + footprint, 199 680 px) | 3.38 ms | 23.7 ms |
+| the same, frame collapsed to its bounds (first version, 1 067 520 px) | 5.38 ms | 65.0 ms |
+
+So a cached panel blur costs nothing measurable, and blurring it again about 1.2 ms on SVGA3D
+(+1.5 ms over a small update, most of it redrawing the 1920×96 footprint); lavapipe pays for
+its rasteriser (the pass ended and resumed flushes its tiles). Off path — no surface asking —
+the frame hashes and draw/cull counts of every `bench_composite` scene are identical to the
+tree without the feature, and the timings within run-to-run noise. Correctness:
+`test_backdrop_blur` against the chain computed in the test from its definition (GL within 2
+levels, Vulkan within 1, blit and stream paths; nothing outside the region changes; the cached
+blur is the same pixels), the planner, the scene's draws, the visibility pass and the
+signature; `test_protocol_conformance` (errors, the capability, the region reaching the scene);
+app-smoke T7 (a live window's stripes blurred to an even grey inside the region, exact
+outside it).
+
+### Colour management (wp_color_manager_v1)
+
+A client may say what its pixels mean — an image description: transfer function, primaries,
+luminances — and every backend then draws that surface through one per-draw transform into
+the composite's **working space**: linear light, BT.709 primaries, D65, 1.0 = the output's
+reference white, unbounded (negative is outside BT.709, above 1 a highlight). The maths lives
+once, in `lx.gfx:color` (`color.cppm`); the shaders and the CPU path follow it.
+
+| Step | What | |
+|------|------|---|
+| E | decode | piecewise sRGB (`compound_power_2_4`, version 1's `srgb`); a power curve V^γ mirrored through 0 (`gamma22` is γ = 2.2, `set_tf_power` any γ in [1, 10]); `ext_linear` unbounded; ST 2084 PQ in units of 10 000 cd/m² |
+| M | 3 × 3, linear light | source primaries → XYZ (built from the chromaticity columns, so CIE XYZ's own y = 0 primaries work) → Bradford from the source white to D65 → BT.709; times the anchor s |
+| s | luminance anchor | (L − min) / (ref − min): PQ s = 10 000 / (ref − min) (L = min + 10 000·E), everything else s = (max − min) / (ref − min). sRGB's defaults (0.2 / 80 / 80) give s = 1; PQ's (0.005 / 10 000 / 203) put 203 cd/m² at 1.0 |
+| T | tone map | when the content can exceed the output's white: peak P from max_cll, else the mastering maximum, else the primary maximum, anchored the same way and capped by what the signal can encode. On the largest channel x, identity up to the knee k = 0.8; above it t = (x − k)/(1 − k) goes through the extended Reinhard f(t) = t·(1 + t/w²)/(1 + t), w = (P − k)/(1 − k), y = k + (1 − k)·f(t); all three channels scale by y/x (hue kept). Continuous with slope 1 at the knee, monotonic, P lands exactly on 1.0, so nothing below the content's own peak clips. PQ at its defaults (P = 49.3) puts reference white at 0.9; content declared no brighter than its reference white (max_cll = ref: SDR in a PQ container, as Chromium sends it) is not tone mapped |
+
+What is outside the output's gamut after M (negative channels) is clipped per channel by the
+encode, as everywhere else; what is above the content's declared peak (a description lying
+about its range) clips at white. A surface without a description is sRGB, and so is one whose
+transform works out as the identity (sRGB curve, BT.709, no headroom): `color_transform::active`
+is false and the draw takes the ordinary path — the same shader, the same pixels.
+
+**Backends.** Vulkan: a draw with an active transform binds composite_cm.frag (the composite
+shader plus E, M, T; made with its opaque twin on the first such draw, per attachment format)
+and pushes 160 bytes instead of 112 — the matrix rows with γ, P and an "encode here" flag for
+encoded UI targets; one pipeline layout with a 160-byte range serves both, where the device has
+it (`maxPushConstantsSize` ≥ 160 — every desktop driver; otherwise not offered). GL: a third
+program, LUMEN_COLOR, in highp (PQ's exponents), built on the first such draw and outside the
+per-frame uniform loop of the two ordinary programs; offered when the fragment stage has highp.
+It blends in the encoded space the GL backend always blends in. CPU: the draw's texels go
+through `color_convert` (a 256-entry decode table per draw for opaque texels, the curve itself
+for translucent ones, the blend tables to encode); a solid colour is converted once. All three
+draw blit and UI-stream frames, and screen captures, through the same code.
+
+**Protocol** (`wire_color_management.cpp`, color-management-v1 version 3). Offered where the
+backend draws it: the perceptual intent; features parametric, set_primaries, set_tf_power,
+set_luminances, set_mastering_display_primaries, windows_bt2100; gamma22, ext_linear,
+st2084_pq, compound_power_2_4 (srgb to version 1); all ten named primaries of version 1.
+Without a capable backend (headless) only the intent and the outputs' description. Every
+output is SDR sRGB (BT.709, compound_power_2_4, 0.2 / 80 / 80 cd/m²); it is what each surface's
+feedback prefers, and it never changes. Descriptions are plain values copied into the pending
+state (double-buffered with wl_surface.commit, cached for synchronized subsurfaces), validated
+and turned into a transform when made; degenerate primaries fail the description, not the
+client.
+
+**Not done.** HDR output: the KMS half (HDR_OUTPUT_METADATA, Colorspace, 10-bit scanout), a PQ
+encode and a working space relative to an HDR output's white — every output stays SDR, so
+image_description_changed is never sent. ICC profiles (no parser). Windows-scRGB: every client
+buffer format Lumen accepts is 8-bit (ARGB/XRGB8888, shm and dma-buf), so no buffer could carry
+its range; PQ content arrives in 8 bits (it decodes correctly, with the banding 8-bit PQ has).
+HLG, BT.1886, extended target volumes and the other rendering intents are not offered.
+
+**Cost** (`bench_composite 1920 1080 --color --vk`, a full-screen opaque window repainted
+whole, fence waited, medians of 3; GL on SVGA3D, Vulkan on lavapipe):
+
+| Backend | undescribed | gamma 2.2 sRGB | sRGB curve, BT.2020 | PQ BT.2020 (tone mapped) |
+|---------|-------------|----------------|---------------------|--------------------------|
+| GL | 4.46 ms | 8.54 ms | 8.70 ms | 8.96 ms |
+| Vulkan | 97.7 ms | 98.2 ms | 99.0 ms | 128.2 ms |
+| CPU, 1 thread | 1.88 ms | 37.7 ms | 34.7 ms | 64.9 ms |
+| CPU, 4 threads | 2.37 ms | 24.9 ms | 24.1 ms | 43.6 ms |
+
+A described surface pays for its curve: on GL what the identity program saves an undescribed
+one (the pow()s; SVGA3D emulates the shader on the host); on lavapipe little but PQ's
+exponents; on the CPU path a float transform per pixel (16–30 ns), where an undescribed opaque
+window is a row copy. Only the described surface's own pixels pay. Off path — no client
+describing anything — every `bench_composite` scene's frame hashes and draw/cull counts are
+those of the tree without the feature (3 interleaved pairs, and 3 Vulkan pairs on lavapipe)
+and the timings within run-to-run noise; the protocol adds nothing per frame. On the CPU path
+`color_convert` stays out of line and shares the per-pixel test with the tint: inlined into
+the pixel loop it slowed undescribed draws too (channel swap, 1 thread: 4.6 → 5.7 ms, 6
+interleaved pairs; 4.6–4.8 ms again once out of line, 16 pairs).
 
 ---
 

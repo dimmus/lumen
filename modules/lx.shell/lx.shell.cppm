@@ -31,6 +31,10 @@ module;
 #define LUMEN_SHELL_SINGLE_PIXEL 1
 #endif
 #endif
+#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#include "ext-background-effect-v1-client-protocol.h"
+#define LUMEN_SHELL_BACKGROUND_EFFECT 1
+#endif
 #if defined(LUMEN_PROTOCOL_EXT_IDLE_NOTIFY_V1) && \
     defined(LUMEN_PROTOCOL_WLR_OUTPUT_POWER_MANAGEMENT_UNSTABLE_V1)
 #include "ext-idle-notify-v1-client-protocol.h"
@@ -416,6 +420,21 @@ private:
     void* viewporter_ = nullptr;   // wp_viewporter*
     void* fractional_ = nullptr;   // wp_fractional_scale_manager_v1*
     void* single_pixel_ = nullptr; // wp_single_pixel_buffer_manager_v1*
+    /// ext_background_effect_manager_v1* and whether it offers blur (its capabilities).
+    void* background_effect_ = nullptr;
+    bool blur_offered_ = false;
+    /// config.toml `[panel] blur`: the panels translucent over a blur, where offered.
+    bool panel_blur_ = false;
+    /// The manager handed to the panels: null unless both of the above.
+    [[nodiscard]] void* panel_blur_manager() const {
+        return panel_blur_ && blur_offered_ ? background_effect_ : nullptr;
+    }
+    /// Every panel as `panel_blur_manager` says (the key or the capability changed).
+    void update_panel_blur() {
+        for (auto& o : outputs_)
+            if (o->bar)
+                o->bar->set_blur(panel_blur_manager());
+    }
     /// Written by a finished background render (`background::after_dispatch` then).
     int bg_notify_fd_ = -1;
     void* idle_notifier_ = nullptr;      // ext_idle_notifier_v1*
@@ -987,6 +1006,25 @@ void lx::shell::shell_app::events::global(void* data, wl_registry* reg, uint32_t
         a.viewporter_ = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
     } else if (std::strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
         a.fractional_ = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
+#if defined(LUMEN_SHELL_BACKGROUND_EFFECT)
+    } else if (std::strcmp(iface, ext_background_effect_manager_v1_interface.name) == 0) {
+        // The panels' blur (`[panel] blur`); what it offers comes with the bind.
+        a.background_effect_ =
+            wl_registry_bind(reg, name, &ext_background_effect_manager_v1_interface, 1);
+        static const ext_background_effect_manager_v1_listener k_effect_listener = {
+            .capabilities = [](void* data, ext_background_effect_manager_v1*, uint32_t flags) {
+                // May come after the configuration: the panels follow it either way.
+                auto& app = *static_cast<shell_app*>(data);
+                app.blur_offered_ = (flags & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR) != 0;
+                if (app.panel_blur_ && !app.blur_offered_)
+                    log_config.info("panel.blur: the compositor offers no blur here; the "
+                                    "panel stays opaque");
+                app.update_panel_blur();
+            }};
+        ext_background_effect_manager_v1_add_listener(
+            static_cast<ext_background_effect_manager_v1*>(a.background_effect_),
+            &k_effect_listener, &a);
+#endif
 #if defined(LUMEN_SHELL_SINGLE_PIXEL)
     } else if (std::strcmp(iface, wp_single_pixel_buffer_manager_v1_interface.name) == 0) {
         // A colour background is one pixel the viewport stretches: nothing to render or hold.
@@ -1319,7 +1357,8 @@ void lx::shell::shell_app::output_ready(output_record& o) {
                                       .shm = shm_,
                                       .layer_shell = layer_shell_,
                                       .viewporter = viewporter_,
-                                      .fractional = fractional_},
+                                      .fractional = fractional_,
+                                      .background_effect = panel_blur_manager()},
                                      bridge_, o.output);
         !created) {
         log_shell.error(created.get_error());
@@ -2396,6 +2435,13 @@ void lx::shell::shell_app::teardown() {
 #endif
     if (cursor_shape_)
         wp_cursor_shape_manager_v1_destroy(static_cast<wp_cursor_shape_manager_v1*>(cursor_shape_));
+#if defined(LUMEN_SHELL_BACKGROUND_EFFECT)
+    // The panels' effect objects stay valid without it (they go with the panels).
+    if (background_effect_)
+        ext_background_effect_manager_v1_destroy(
+            static_cast<ext_background_effect_manager_v1*>(background_effect_));
+    background_effect_ = nullptr;
+#endif
     if (wm_base_)
         xdg_wm_base_destroy(static_cast<xdg_wm_base*>(wm_base_));
     wm_base_ = nullptr;
@@ -2544,6 +2590,11 @@ void lx::shell::shell_app::apply_config(const lx::config::config_snapshot& c) {
             if (started_)
                 rebuild_backgrounds();
         }
+    }
+    // ── panel ──
+    if (c.panel.blur != panel_blur_) {
+        panel_blur_ = c.panel.blur;
+        update_panel_blur();
     }
 }
 
