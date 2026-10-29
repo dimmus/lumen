@@ -119,6 +119,8 @@ type Output (
   mode_height: int,
   refresh_mhz: int,
   scale: float,
+  # The scale clients render at (HiDPI supersampling); equals scale unless set.
+  render_scale: float,
   transform: string,
   active_workspace: ?string
 )
@@ -466,6 +468,7 @@ struct control_server::impl {
             j.num("mode_height", o.mode_height);
             j.num("refresh_mhz", o.refresh_mhz);
             j.real("scale", o.scale);
+            j.real("render_scale", o.render_scale);
             j.str("transform", o.transform);
             if (o.active_workspace[0])
                 j.str("active_workspace", o.active_workspace);

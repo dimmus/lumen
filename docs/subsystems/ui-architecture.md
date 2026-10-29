@@ -618,7 +618,7 @@ in-use delta over 600 frames 0 B on cpu, +64 B on gl).
 
 **Measured** (`lumen-ui-bench --client`, a headless compositor on a 1280 × 800 60 Hz virtual
 output, client pinned to CPU 1 and compositor to CPU 0, load 0.1–0.3;
-`tests/bench/baseline/iritur-client-cpu.json`, `…-client-gl.json`; µs p50 / p95):
+`tests/bench/baseline/iritur-168b7c-client-cpu.json`, `…-client-gl.json`; µs p50 / p95):
 
 | Scenario | cpu | gl (SVGA3D) | Gate |
 |----------|-----|-------------|------|

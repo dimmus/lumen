@@ -1209,6 +1209,20 @@ struct compositor_impl {
     void finish_input();
     std::thread input_open_thread_{};
     std::optional<lx::result<lx::input::input_manager>> input_opened_{};
+    /// Where opening the seat spent its time, logged once by `finish_input`: the keymap
+    /// compile, libinput's seat assignment, and the device opens inside it (logind
+    /// TakeDevice or the direct open), the slowest named. Written by the opening thread
+    /// before the join and by the UI thread after it (hotplug, resume), never both at once.
+    struct input_open_timing {
+        double keymap_ms = 0;
+        double libinput_ms = 0;
+        double devices_ms = 0;
+        unsigned devices = 0;
+        double slowest_ms = 0;
+        char slowest[64]{};
+    } input_timing_{};
+    /// One device open slower than this is named in a warning, whenever it happens.
+    static constexpr double k_slow_device_open_ms = 250.0;
     /// Render affinity. A draw whose texture was never registered means the commit path and
     /// the render path disagree, and the screen stays black. Reporting only that it
     /// happened is not actionable — this reports the ids involved, once, because it
@@ -1468,6 +1482,9 @@ struct compositor_impl {
     void apply_focus_policy();
     /// config.toml [windows]: edge snapping, its preview, drag-to-restore (Part K).
     void apply_window_config();
+    /// config.toml [[output]]: the render scale rules. A changed render scale re-sends the
+    /// client hints (the outputs' generation moves).
+    void apply_output_config();
     void apply_repeat();
     /// zlm v7 config + diagnostics + done to `shell_resource` (null: every v7 shell).
     void send_config_to_shell(void* shell_resource, bool with_bytes);
@@ -1931,9 +1948,10 @@ void compositor_impl::log_outputs() const {
         const output_state& o = outputs.slot_state(slot);
         const lx::rect2i l = o.logical_rect();
         log_output.info("output {} name={} mode={}x{} refresh_mhz={} scale={:g} "
-                        "({}/120) logical={}x{}+{}+{} identifier=\"{}\"",
+                        "({}/120) logical={}x{}+{}+{} render_scale={:g} identifier=\"{}\"",
                         slot, o.name, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
-                        std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y, o.identifier);
+                        std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y,
+                        o.effective_render_scale(), o.identifier);
     }
 }
 
@@ -2358,12 +2376,37 @@ void compositor_impl::begin_input() {
     provider.user = this;
     provider.open_device = [](const char* path, int flags, void* user) -> int {
         auto* self = static_cast<compositor_impl*>(user);
+        const auto t0 = std::chrono::steady_clock::now();
+        int fd = -1;
+        bool via_logind = false;
         if (self) {
-            if (auto taken = self->logind_.take_device_path(path); taken)
-                return std::move(taken).value().release();
+            if (auto taken = self->logind_.take_device_path(path); taken) {
+                fd = std::move(taken).value().release();
+                via_logind = true;
+            }
         }
-        const int fd = ::open(path, flags | O_CLOEXEC);
-        return fd < 0 ? -errno : fd;
+        if (fd < 0) {
+            fd = ::open(path, flags | O_CLOEXEC);
+            if (fd < 0)
+                fd = -errno;
+        }
+        if (self) {
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                    .count();
+            input_open_timing& t = self->input_timing_;
+            t.devices_ms += ms;
+            ++t.devices;
+            if (ms > t.slowest_ms) {
+                t.slowest_ms = ms;
+                std::snprintf(t.slowest, sizeof t.slowest, "%s", path ? path : "?");
+            }
+            // A device that stalls the seat (start-up waits for it) is named every time.
+            if (ms > k_slow_device_open_ms)
+                log_input.warn("opening {} took {:.0f} ms ({})", path ? path : "?", ms,
+                               via_logind ? "logind TakeDevice" : "direct open after TakeDevice failed");
+        }
+        return fd;
     };
     // Every device libinput closes — at suspend, on unplug, at exit — goes back to logind:
     // without ReleaseDevice the TakeDevice of a resume fails with "Device already taken".
@@ -2380,6 +2423,7 @@ void compositor_impl::begin_input() {
     const bool configured = keymap.layout || keymap.variant || keymap.options || keymap.model ||
                             keymap.rules;
     input_open_thread_ = std::thread([this, provider, keymap, num_lock, configured] {
+        const auto t0 = std::chrono::steady_clock::now();
         // Compile a keymap regardless of whether devices open. Clients are told the layout
         // at bind time, and a compositor that never found a keyboard still has to answer it.
         lx::input::keyboard_keymap km;
@@ -2401,8 +2445,15 @@ void compositor_impl::begin_input() {
         }
         if (num_lock)
             (void)km.set_num_lock(true);
+        const auto t1 = std::chrono::steady_clock::now();
+        lx::trace::timeline_instant("startup", "input keymap compiled");
         input_opened_.emplace(
             lx::input::input_manager::open(provider, "seat0", keymap, num_lock, &km));
+        lx::trace::timeline_instant("startup", "input seat assigned");
+        input_timing_.keymap_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        input_timing_.libinput_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
+                .count();
         // Not taken (no seat): the keymap the device-less compositor still answers with.
         if (km.valid())
             input_devices_.default_seat().keymap() = std::move(km);
@@ -2416,6 +2467,13 @@ void compositor_impl::finish_input() {
         return;
     auto opened = std::move(*input_opened_);
     input_opened_.reset();
+    {
+        const input_open_timing& t = input_timing_;
+        log_input.info("seat open took {:.0f} ms: keymap {:.0f} ms, libinput {:.0f} ms of which "
+                       "{} device opens {:.0f} ms (slowest {} {:.0f} ms)",
+                       t.keymap_ms + t.libinput_ms, t.keymap_ms, t.libinput_ms, t.devices,
+                       t.devices_ms, t.slowest[0] ? t.slowest : "-", t.slowest_ms);
+    }
     if (!opened) {
         // Not fatal. A compositor with no seat still composites — it is useful headless and
         // in CI — but say so plainly, because "nothing happens when I type" is otherwise a
@@ -3197,8 +3255,10 @@ void compositor_impl::register_p0_globals() {
             log_gfx.info("shm: uploaded from client memory (no staging)");
         }
     } else {
-        // Vulkan uploads whole RGBA images.
+        // Vulkan uploads RGBA regions the way GL does: the damage since the buffer was last
+        // uploaded, staged at its own size, not the whole image per commit.
         p0_.shm_pool = &shm_pool_;
+        p0_.shm_regions = true;
         p0_.shm_store = nullptr;
         p0_.shm_native_format = false;
     }
@@ -3519,6 +3579,7 @@ void compositor_impl::start_session() {
                 c.mode_height = o.mode.height;
                 c.refresh_mhz = o.refresh_mhz;
                 c.scale = o.scale;
+                c.render_scale = o.effective_render_scale();
                 static constexpr const char* k_transforms[] = {
                     "normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180",
                     "flipped-270"};
@@ -4146,6 +4207,25 @@ void compositor_impl::load_initial_config() {
     (void)config_.reload(true);
     std::snprintf(cursor_theme_name_, sizeof(cursor_theme_name_), "%s",
                   config_.current().cursor.theme);
+    // Before any output exists: each takes its render scale as it is added.
+    apply_output_config();
+}
+
+void compositor_impl::apply_output_config() {
+    const auto& list = config_.current().outputs;
+    std::array<render_scale_rule, output_manager::k_max> rules{};
+    unsigned n = 0;
+    for (const auto& o : list) {
+        if (n == rules.size())
+            break;
+        std::snprintf(rules[n].match, sizeof(rules[n].match), "%s", o.name);
+        rules[n].scale = o.render_scale;
+        ++n;
+    }
+    const unsigned before = outputs.generation();
+    outputs.set_render_scale_rules(rules.data(), n);
+    if (outputs.generation() != before)
+        outputs_changed_now();
 }
 
 void compositor_impl::apply_initial_config() {
@@ -4239,6 +4319,8 @@ void compositor_impl::run_config_reload(bool force) {
             apply_window_config();
         if (r.changes & cfg_workspaces)
             apply_workspace_config();
+        if (r.changes & cfg_outputs)
+            apply_output_config();
         if (r.changes & cfg_bindings)
             install_bindings();
         // Unchanged but still failing: compiled again, which reports it again (or applies it
@@ -4955,8 +5037,10 @@ void compositor_impl::apply_texture_update(texture_update& update) {
                                 "bookkeeping disagrees with the GL slot (reported once)");
             }
         } else if (vulkan_present_) {
-            applied = vk_compositor_.upload_rgba(update.texture_id, update.width,
-                                                 update.height, update.pixels);
+            // The damaged region, packed at its width; only its rects are copied.
+            applied = vk_compositor_.upload_rgba(
+                update.texture_id, update.width, update.height, update.pixels, update.region,
+                std::span<const lx::rect2i>{update.rects.rects, update.rects.count});
             // The upload copied the pixels into the renderer's own staging.
             shm_pool_.release(update.shm_pool_token);
         } else {
@@ -5603,25 +5687,36 @@ void compositor_impl::on_output_flip(output_pipeline& p, const scheduler::presen
     // from the kernel's flip timestamp when it is on our clock and plausibly recent;
     // otherwise from `now`, which is within the 1 ms loop pump of the flip because flips
     // are drained there.
-    if (vsync_timer) {
-        const auto now = now_ns();
-        scheduler::repaint_scheduler& clock = clocks_.clock(slot);
-        clock.observe_repaint(budget_.last_tick_ui_us(),
-                              p.render_cost_us.load(std::memory_order_relaxed));
-        auto flip_ns = now;
-        if (fb.hw_clock && fb.actual_present_ns > 0 && fb.actual_present_ns <= now &&
-            now - fb.actual_present_ns < clock.refresh_period())
-            flip_ns = fb.actual_present_ns;
-        clocks_.on_present(slot, flip_ns, now);
-        rearm_frame_timer();
-    }
-
     // Taken on every flip, sampled or not, so the dup'd fence is always closed.
     const unsigned long long submit_us = p.committed_submit_us.exchange(0, std::memory_order_acq_rel);
     unsigned long long fence_us = 0;
     if (const int fd = p.committed_fence_fd.exchange(-1, std::memory_order_acq_rel); fd >= 0) {
         fence_us = sync_file_signal_us(fd);
         ::close(fd);
+    }
+
+    if (vsync_timer) {
+        const auto now = now_ns();
+        scheduler::repaint_scheduler& clock = clocks_.clock(slot);
+        // The repaint's cost is what the frame needs before the flip: the UI and render
+        // threads' CPU time plus what the GPU did after the submit (its composite, and any
+        // wait on a client's fence), read from the composite fence's signal time. CPU time
+        // alone aimed a 0.35 ms repaint 1.35 ms before the vblank, and on an HD 5500 the
+        // GPU's share then made two FIFO frames in three a refresh late (Mutter's and KWin's
+        // frame clocks add the GPU time too). A tail longer than a period is not a repaint
+        // cost but a stall, and is left out.
+        unsigned gpu_tail_us = 0;
+        const auto period_us = static_cast<unsigned long long>(clock.refresh_period() / 1000);
+        if (submit_us > 0 && fence_us > submit_us && fence_us - submit_us < period_us)
+            gpu_tail_us = static_cast<unsigned>(fence_us - submit_us);
+        clock.observe_repaint(budget_.last_tick_ui_us(),
+                              p.render_cost_us.load(std::memory_order_relaxed) + gpu_tail_us);
+        auto flip_ns = now;
+        if (fb.hw_clock && fb.actual_present_ns > 0 && fb.actual_present_ns <= now &&
+            now - fb.actual_present_ns < clock.refresh_period())
+            flip_ns = fb.actual_present_ns;
+        clocks_.on_present(slot, flip_ns, now);
+        rearm_frame_timer();
     }
     lx::trace::timeline_instant("kms", "flip");
     if (fb.hw_clock)
@@ -9425,6 +9520,20 @@ lx::result<void> compositor::start() {
                 continue;
             *eq = '\0';
             impl_->outputs.set_scale_override(tok, std::strtod(eq + 1, nullptr));
+        }
+    }
+    // `--render-scale S`, `--output-render-scale NAME=S` (config.toml [[output]] may override
+    // them, output_manager.cppm "Render scale").
+    impl_->outputs.set_default_render_scale(impl_->cfg.render_scale);
+    if (const char* spec = impl_->cfg.output_render_scales; spec && *spec) {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf), "%s", spec);
+        for (char* tok = std::strtok(buf, ","); tok; tok = std::strtok(nullptr, ",")) {
+            char* eq = std::strchr(tok, '=');
+            if (!eq)
+                continue;
+            *eq = '\0';
+            impl_->outputs.set_render_scale_override(tok, std::strtod(eq + 1, nullptr));
         }
     }
     // The persisted output configuration (ADR 008 §C.5), read before the first modeset so

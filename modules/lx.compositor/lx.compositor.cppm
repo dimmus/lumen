@@ -102,6 +102,15 @@ struct config {
     /// Per-connector scales over `output_scale` (`--output-scale NAME=S`, repeatable):
     /// "NAME=S[,NAME=S...]".
     const char* output_scales = nullptr;
+    /// The scale clients render at (`--render-scale`), for every output: HiDPI supersampling —
+    /// 2 on a scale-1 output has clients draw twice the pixels, which the compositor samples
+    /// down. Geometry and wl_output.scale stay the output scale's. 0 (the default): follow
+    /// the output scale. 0.25–4, rounded to n/120. config.toml's [[output]] render-scale
+    /// overrides it.
+    double render_scale = 0.0;
+    /// Per-connector render scales (`--output-render-scale NAME=S`, repeatable):
+    /// "NAME=S[,NAME=S...]".
+    const char* output_render_scales = nullptr;
     /// Virtual outputs instead of the KMS display (`--virtual-outputs`, headless and
     /// multi-output protocol tests; no card is opened when set): "WxH[@S][,WxH[@S]...]",
     /// laid out left to right, each with its own frame clock. Null: the display's

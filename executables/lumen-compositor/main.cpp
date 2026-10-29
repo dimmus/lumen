@@ -31,6 +31,7 @@ void on_screenshot(int) {
 int main(int argc, char* argv[]) {
     lx::compositor::config cfg{};
     static char output_scales[512] = {};
+    static char output_render_scales[512] = {};
     // lumen-ctl and run-desktop.sh talk to the compositor here ($XDG_RUNTIME_DIR/<socket>.varlink).
     cfg.control_socket = true;
 
@@ -85,6 +86,35 @@ int main(int argc, char* argv[]) {
             std::strcat(output_scales, spec);
             cfg.output_scales = output_scales;
             ++i;
+        } else if (std::strcmp(arg, "--render-scale") == 0) {
+            // The scale clients render at on every output (HiDPI supersampling), sampled
+            // down to the output scale: 0.25 .. 4, rounded to n/120.
+            char* end = nullptr;
+            const double scale = i + 1 < argc ? std::strtod(argv[i + 1], &end) : 0.0;
+            if (!(scale >= 0.25 && scale <= 4.0) || !end || *end != '\0') {
+                std::fprintf(stderr, "lumen-compositor: --render-scale S (0.25 .. 4, e.g. 2)\n");
+                return 2;
+            }
+            cfg.render_scale = scale;
+            ++i;
+        } else if (std::strcmp(arg, "--output-render-scale") == 0) {
+            // One connector's render scale over --render-scale: NAME=S (repeatable).
+            const char* spec = i + 1 < argc ? argv[i + 1] : nullptr;
+            const char* eq = spec ? std::strchr(spec, '=') : nullptr;
+            char* end = nullptr;
+            const double scale = eq ? std::strtod(eq + 1, &end) : 0.0;
+            if (!eq || eq == spec || !(scale >= 0.25 && scale <= 4.0) || !end || *end != '\0' ||
+                std::strlen(output_render_scales) + std::strlen(spec) + 2 >
+                    sizeof(output_render_scales)) {
+                std::fprintf(stderr,
+                             "lumen-compositor: --output-render-scale NAME=S (0.25 .. 4)\n");
+                return 2;
+            }
+            if (output_render_scales[0])
+                std::strcat(output_render_scales, ",");
+            std::strcat(output_render_scales, spec);
+            cfg.output_render_scales = output_render_scales;
+            ++i;
         } else if (std::strcmp(arg, "--virtual-outputs") == 0) {
             // Without a KMS display: WxH[@S][,WxH[@S]...] virtual outputs (tests).
             if (i + 1 >= argc) {
@@ -104,12 +134,15 @@ int main(int argc, char* argv[]) {
                 "usage: lumen-compositor [SOCKET] [-f FPS] [--session] [--no-control]\n"
                 "                        [--decorations=server|client] [--ping-timeout MS]\n"
                 "                        [--scale S] [--output-scale NAME=S]\n"
+                "                        [--render-scale S] [--output-render-scale NAME=S]\n"
                 "                        [--virtual-outputs WxH[@S][,...]] [--shell PATH]\n"
                 "  SOCKET          Wayland socket name (default lumen-0)\n"
                 "  --session       the session's display server under systemd\n"
                 "                  (lumen-compositor.service): exports the session environment\n"
                 "                  to the user manager, then sends READY=1\n"
                 "  --no-control    no control socket ($XDG_RUNTIME_DIR/SOCKET.varlink, lumen-ctl)\n"
+                "  --render-scale  the scale clients render at (supersampling: 2 on a scale-1\n"
+                "                  output), sampled down to the output scale; 0.25 .. 4\n"
                 "Signals: SIGTERM/SIGINT stop, SIGHUP reloads the configuration, SIGUSR1 writes\n"
                 "a screenshot of the next frame.\n"
                 "Configuration: $XDG_CONFIG_HOME/lumen/config.toml over\n"
