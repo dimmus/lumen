@@ -29,14 +29,9 @@ import lx.wayland.client;
 
 export import :input;
 export import :window;
+export import :clipboard;
 
 export namespace lx::app {
-
-class clipboard {
-public:
-    void set_text(const char* text);
-    [[nodiscard]] const char* text() const;
-};
 
 /// What the application's loop did (tests: G1's idle window counts these).
 struct app_stats {
@@ -58,7 +53,9 @@ struct app_timeline {
     std::uint64_t connect_ns = 0;
 };
 
-class application final : public window_host, public lx::wayland::seat_handler {
+class application final : public window_host,
+                          public transfer_host,
+                          public lx::wayland::seat_handler {
 public:
     application(int argc, char* argv[]);
     ~application();
@@ -79,6 +76,7 @@ public:
 
     [[nodiscard]] lx::runtime::event_loop& event_loop() { return loop_; }
     [[nodiscard]] settings& config() { return settings_; }
+    /// The Wayland clipboard behind lx.ui's (started with the connection).
     [[nodiscard]] clipboard& clipboard_service() { return clipboard_; }
     [[nodiscard]] lx::wayland::display& display() { return display_; }
     /// A copy: `worker_wakes` is the worker thread's counter, read here.
@@ -104,6 +102,10 @@ public:
     void host_close_requested(window& w) override;
     [[nodiscard]] lx::result<void> host_attach(window& w) override;
     void host_detach(window& w) override;
+
+    // transfer_host
+    [[nodiscard]] lx::ui::ui_root* host_root_of(const lx::wayland::surface* s) override;
+    [[nodiscard]] lx::wayland::surface* host_drag_origin() override;
 
     // seat_handler: routed to the window whose surface the event names.
     void on_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) override;

@@ -401,6 +401,29 @@ protected:
     ~scroll_target() = default;
 };
 
+/// A node text can be dropped on (drag and drop from this or another client; lx.app's data
+/// device drives it through `ui_root::drop_motion` / `drop_text`). Points are surface
+/// coordinates. UI affinity.
+class drop_target {
+public:
+    /// The drag is over the node at `at`: show where it would land; false when the node
+    /// takes no text there (nothing is shown).
+    virtual bool drop_hover(lx::point2i at) = 0;
+    /// The drag left the node, or ended: the mark goes.
+    virtual void drop_leave() = 0;
+    /// Dropped at `at`: inserts `utf8`; false when refused.
+    virtual bool drop_text(lx::point2i at, std::string_view utf8) = 0;
+
+protected:
+    ~drop_target() = default;
+};
+
+/// The drop target a drag is over (null: none). A target going away calls
+/// `forget_drop_target` so the pointer never dangles. UI affinity.
+[[nodiscard]] drop_target* current_drop_target();
+void set_current_drop_target(drop_target* target);
+void forget_drop_target(drop_target& target);
+
 class ui_node {
 public:
     virtual ~ui_node();
@@ -466,6 +489,8 @@ public:
                                               lx::rect2i& clip) const;
     /// The node as a scroll container, for its scrollbars; null when it is not one.
     [[nodiscard]] virtual scroll_target* as_scroll_target();
+    /// The node as a drop target for dragged text; null when it is not one.
+    [[nodiscard]] virtual drop_target* as_drop_target();
     [[nodiscard]] virtual hit_result hit_test(lx::point2i p) const;
     /// How far the node paints outside its bounds, px on every side: a drop shadow's reach
     /// (3σ + spread + offset). Damage covers it (`ink_bounds`). Default 0.
@@ -1569,6 +1594,18 @@ bool lx::ui::ui_node::child_viewport(const ui_node&, lx::point2i&, lx::rect2i&) 
 }
 
 lx::ui::scroll_target* lx::ui::ui_node::as_scroll_target() { return nullptr; }
+lx::ui::drop_target* lx::ui::ui_node::as_drop_target() { return nullptr; }
+
+namespace {
+lx::ui::drop_target* g_drop_target = nullptr;
+} // namespace
+
+lx::ui::drop_target* lx::ui::current_drop_target() { return g_drop_target; }
+void lx::ui::set_current_drop_target(drop_target* target) { g_drop_target = target; }
+void lx::ui::forget_drop_target(drop_target& target) {
+    if (g_drop_target == &target)
+        g_drop_target = nullptr;
+}
 
 namespace {
 /// Live viewport nodes (UI affinity): none, and nothing is mapped.

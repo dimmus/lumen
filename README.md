@@ -27,9 +27,9 @@ C++26.
 - **Secure by default.** The privileged shell protocol binds only from the configured shell
   binary; Flatpak apps see no capture, clipboard-control, layer-shell or output-management
   globals.
-- **A complete desktop.** Panel, launcher, Alt+Tab, dynamic workspaces, edge snapping,
-  notifications, system tray, idle and lock, input methods (fcitx5, ibus) and portals for
-  screenshots, screencasts and colour picking.
+- **A complete desktop.** Panel, launcher, Alt+Tab, dynamic workspaces, edge snapping and
+  optional master-stack tiling per workspace, notifications, system tray, idle and lock,
+  input methods (fcitx5, ibus) and portals for screenshots, screencasts and colour picking.
 - **Real monitors.** Hotplug, pixel-exact fractional scaling, adaptive sync, VT switching,
   wlr-randr and kanshi, setups remembered per set of monitors.
 - **About 50 Wayland protocols**, from xdg-shell to linux-drm-syncobj, ext-image-copy-capture

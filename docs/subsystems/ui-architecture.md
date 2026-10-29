@@ -503,7 +503,8 @@ callers compile. It is superseded and should not gain new widgets:
 
 Still to build:
 
-- The clipboard from `wl_data_device` (`lx::app::clipboard` is still a no-op);
+- Drag and drop of anything but text, a drag icon, and the `ask` action (a menu at the drop).
+  The clipboard, the primary selection and text drag and drop are `lx.app:clipboard`;
   `ime_target` is driven from `zwp_text_input_v3` by `lx.app:input` (§11)
 - Grid containers (flex is `lx.ui:flex`, which reads `grow_node::grow_factor()`)
 - Feeding merged damage into `kms_damage_region`

@@ -1571,6 +1571,45 @@ hardware device (node matching, tiled modifiers, a warm pipeline cache: G7 warm 
 there only); G11's frame rule and every client p95 on a host without this VM's jitter; the
 clipboard (`lx::app::clipboard`) is still a no-op.
 
+The clipboard, done (2026-10-28): `lx.wayland.client:data` (`data_device`, `data_offer`,
+`data_source`; wl_data_device_manager bound at v3) and `lx.app:clipboard` behind
+`lx::ui::clipboard::global()`, which gained a sink for copies and `set_system_text` for what
+arrives. A copy becomes the seat's selection at the last input serial, offered as UTF-8 under
+the freedesktop and X11 text names plus a per-process marker type that keeps our own selection
+from being read back. Another client's selection is read as soon as it is offered, through a
+non-blocking pipe on the loop, so a paste stays synchronous. `test_app_window` checks it on the
+cpu and gl tiers against an ext-data-control-v1 client in the parent (a clipboard manager's
+view): ctrl+c sets the selection with the marker, that client reads the copied text, its own
+selection arrives and ctrl+v pastes it, and a 200 KB copy is written whole as the pipe drains.
+G1's idle check right after shows no wakeup added.
+
+The primary selection and drag and drop of text, done (2026-10-28), on the same service: `:data`
+serves either selection kind (`zwp_primary_selection_device_v1` beside `wl_data_device`) and
+the clipboard device's drags. A field's settled selection (a press released, a double or triple
+press, a key) is the primary selection; the middle button pastes it where it goes down (a new
+`pointer_kind::middle`, walked up the ancestors like a secondary press). A press inside the
+selection dragged 8 px starts a drag (copy and move, no icon); the window's press is cancelled
+(`ui_root::pointer_cancel`), and a move deletes the text once the destination finished. Our
+windows take drops through `drop_target` (`ui_root::drop_motion` / `drop_text`): the field marks
+where the text would land, the offer is accepted only while a target takes text, our own drag
+prefers move and another client's copy. `test_app_window` checks, on both tiers: a selection
+published as the primary and read by the data-control client; that client's primary pasted by
+a middle click at the text's start; a word dragged to the field's end and moved there (our drag,
+our drop, the data through the pipe); a drag let go outside the window cancelled with the text
+kept; and G1's idle check after. Not taken: dragging anything but text, a drag icon, `ask`.
+
+Tried for G7 on GL (2026-10-28), not kept. Building the two programs ahead on a helper thread
+in a shared EGL context, from the moment the tier was chosen, so they compiled during the
+configure, the swapchain and the first tick. `lumen-hello`'s first frame on SVGA3D spends
+55–62 ms of its 58–66 ms render in `glCompileShader` / `glLinkProgram` (the first draw's
+driver variant is the other ≈ 4 ms), so the overlap was worth up to the tick's 18 ms. It
+lost: with the client on one CPU, cold went from ≈ 149 to ≈ 161 ms (the helper competes with
+the thread it frees, and its context costs time to make). Unpinned against the bench's
+in-process compositor, cold went from 131–135 to 133–139 ms p50 and warm from 113–115 to
+129–133 ms, since the compositor is busy on the other CPU while the client starts. The cold
+start is the driver's: EGL on GBM ≈ 27 ms, the two compiles ≈ 60 ms, and fontconfig ≈ 16 ms on
+a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
+
 ### Phase 5 — Adoption and deletion (≈2 weeks) — not started
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;
@@ -1668,9 +1707,21 @@ asserts the `text.contrast` correction keeps the mean stem coverage within 3 %.
 - `scripts/ui-bench.sh [--backend gl|cpu|vulkan] [--e2e] [--compare baseline.json]`
   builds release, runs every scenario on every available backend, stores results under
   `tests/bench/results/<host>-<driver>/<date>-<sha>.json`, and compares against
-  `tests/bench/baseline/<host>-<driver>.json`: **fail** on p95 regressions above 10 % for
+  `tests/bench/baseline/<host>-<driver>.json`: **fail** on p50 regressions above 25 % for
   any stage, on any steady-frame allocation, on a draw-call count above the scenario's
-  cap, or on a golden diff; **warn** at 5 %. Updating a baseline is a deliberate commit.
+  cap, or on a golden diff; **warn** on a p50 above 10 % or a p95 above 25 %. Updating a
+  baseline is a deliberate commit. As amended (2026-10-28): the headless rows failed on a p95
+  10 % over until then, and on this VM that gate failed on noise in every run. Interleaved
+  runs of Phase 3's binary and main's (`setarch -R`, CPU 1, three rounds each) gave the same
+  p50 on every S1–S3 stage, while either binary's p95 moved 40 % and more from one run to the
+  next (S2 tick 555–931 µs). A p50 is steadier — S2 tick 88.7–92.6 µs — but not steady
+  enough for 10 %: one binary run twice back to back moved S4's frame p50 14 % and S2's
+  reconcile 18 %. The client rows have failed on p50 since Phase 4 for the same reason. A
+  stored p50 also drifts with the host: S3's `update`, 10 000 xorshift steps unchanged since
+  Phase 3, read 69.7 µs in Phase 3's baseline and 79–83 µs in both binaries on 2026-10-28.
+  So the stored gate catches regressions of about a quarter and up; a change is vetted
+  finer by an interleaved A/B against its base binary, and the baseline is refreshed when
+  such an A/B shows the host, not the code, moved — as `iritur-none.json` was that day.
 - CTest: label `bench`; the default test presets exclude it; `ctest --preset bench` runs
   the headless rows in under two minutes (a `-L bench` on top of another preset still
   meets that preset's exclude).

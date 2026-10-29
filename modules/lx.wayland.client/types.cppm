@@ -21,6 +21,9 @@ class toplevel;
 class popup;
 class text_input;
 class dmabuf_feedback;
+class data_device;
+class data_offer;
+class data_source;
 
 /// The globals the client runtime binds, each at a capped version it implements (the
 /// bound version is `min(advertised, cap)`; `display::global(kind)` reports both).
@@ -40,6 +43,8 @@ enum class global_kind : unsigned {
     single_pixel,     ///< wp_single_pixel_buffer_manager_v1, cap 1.
     activation,       ///< xdg_activation_v1, cap 1.
     xdg_output,       ///< zxdg_output_manager_v1, cap 3.
+    data_device_manager, ///< wl_data_device_manager, cap 3 (wl_data_device.release).
+    primary_selection,   ///< zwp_primary_selection_device_manager_v1, cap 1.
     count,
 };
 inline constexpr unsigned k_global_kinds = static_cast<unsigned>(global_kind::count);
@@ -416,6 +421,57 @@ public:
         (void)action;
         (void)serial;
     }
+};
+
+// ── data transfer (wl_data_device: the clipboard and drag and drop; the primary selection) ──
+
+/// Which selection a data device, offer or source serves: the clipboard (wl_data_device,
+/// which also carries drag and drop) or the primary selection (zwp_primary_selection_v1:
+/// what is selected, pasted with the middle button).
+enum class selection_kind : std::uint8_t { clipboard, primary };
+
+/// wl_data_device_manager.dnd_action bits.
+inline constexpr std::uint32_t k_dnd_none = 0;
+inline constexpr std::uint32_t k_dnd_copy = 1;
+inline constexpr std::uint32_t k_dnd_move = 2;
+inline constexpr std::uint32_t k_dnd_ask = 4;
+
+class data_device_handler {
+public:
+    virtual ~data_device_handler() = default;
+    /// The selection changed: `offer` is what another client (or this one) offers, valid
+    /// until the next selection or the device's destruction; null when there is none. Sent
+    /// to the client with keyboard focus, on entering it and on every change while it has it.
+    virtual void on_selection(data_device& d, data_offer* offer) = 0;
+    /// A drag entered `target` (one of this client's surfaces; null if it is not one) at
+    /// surface-local (x, y). `offer` is the drag's (null for a drag within another client,
+    /// which has no data to offer); `serial` is what `data_offer::accept` answers with.
+    virtual void on_drag_enter(data_device& d, data_offer* offer, surface* target, double x,
+                               double y, std::uint32_t serial) {
+        (void)d, (void)offer, (void)target, (void)x, (void)y, (void)serial;
+    }
+    virtual void on_drag_motion(data_device& d, double x, double y) { (void)d, (void)x, (void)y; }
+    /// The drag left (or was cancelled over us): its offer is gone.
+    virtual void on_drag_leave(data_device& d) { (void)d; }
+    /// Dropped here: `offer` stays until `data_device::finish_drop`.
+    virtual void on_drop(data_device& d, data_offer* offer) { (void)d, (void)offer; }
+};
+
+class data_source_handler {
+public:
+    virtual ~data_source_handler() = default;
+    /// A client asked for the data as `mime`: write it to `fd` and close it. The handler owns
+    /// `fd` (it is closed for it only if there is no handler).
+    virtual void on_send(data_source& s, const char* mime, int fd) = 0;
+    /// The source was replaced, refused, its selection cleared, or its drag not dropped
+    /// anywhere that took it: it will send no more.
+    virtual void on_cancelled(data_source& s) = 0;
+    /// Drag and drop: the target accepts `mime` (null: nothing), the action chosen so far,
+    /// the drop done (data may still be read), the target done with it.
+    virtual void on_target(data_source& s, const char* mime) { (void)s, (void)mime; }
+    virtual void on_action(data_source& s, std::uint32_t action) { (void)s, (void)action; }
+    virtual void on_drop_performed(data_source& s) { (void)s; }
+    virtual void on_dnd_finished(data_source& s) { (void)s; }
 };
 
 // ── dmabuf feedback (zwp_linux_dmabuf_feedback_v1) ──

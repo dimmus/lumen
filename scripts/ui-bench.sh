@@ -11,15 +11,20 @@
 # the JSON under tests/bench/results/<hostname>-<driver>/<YYYYMMDD>-<sha>.json and compares
 # it with tests/bench/baseline/<hostname>-<driver>.json:
 #
-#   FAIL           a stage's p95 more than 10 % above the baseline's — and at least
+#   FAIL           a stage's p50 more than 25 % above the baseline's — and at least
 #                  ABS_FLOOR_US slower: a sub-microsecond stage jitters by more than 10 %
-#                  on its own; any heap allocation or non-zero mallinfo2 delta in a steady
-#                  frame of any scenario (G5); more batches than the scenario's cap (S2, S3,
+#                  on its own. Not its p95: on this VM a frame woken from sleep stalls for
+#                  100–450 us one time in twenty, so one binary's p95 moves 40 % and more
+#                  between runs; its p50 moves 3 % typically and up to 14–18 %, so a smaller
+#                  regression is found by an interleaved A/B against the base binary; any heap
+#                  allocation or non-zero mallinfo2 delta in a steady frame of any
+#                  scenario (G5); more batches than the scenario's cap (S2, S3,
 #                  S4: 8); a gate the bench judged `fail` that the baseline passed (or has no
 #                  verdict for); a stage whose sample count went from zero to non-zero or
 #                  back (S1 producing frames, say); a scenario, stage or gate of the
 #                  baseline missing from the run
-#   WARN           a stage's p95 more than 5 % above the baseline's; a gate with too few
+#   WARN           a stage's p50 more than 10 % or its p95 more than 25 % above the
+#                  baseline's (each at least ABS_FLOOR_US slower); a gate with too few
 #                  samples to judge (`insufficient`); a gate that fails in the run and in
 #                  the baseline (an open gate: never silent); a scenario the baseline lacks
 #
@@ -665,7 +670,9 @@ import json
 import sys
 
 new_path, ref_path, floor = sys.argv[1], sys.argv[2], float(sys.argv[3])
-FAIL_PCT, WARN_PCT = 10.0, 5.0
+# A stage fails on its p50 and warns on its p95, as the client rows do (above): the same
+# binary's p95 moves 40 % and more between runs on this host, its p50 3 % and at most 18 %.
+P50_FAIL_PCT, P50_WARN_PCT, P95_WARN_PCT = 25.0, 10.0, 25.0
 BATCH_CAPS = {"S2": 8, "S3": 8, "S4": 8}
 
 with open(new_path) as f:
@@ -724,11 +731,14 @@ for r in new:
             continue
         delta = st["p95"] - bs["p95"]
         pct = 100.0 * delta / bs["p95"]
-        line = f"{sid:3} {name:18} p95 {bs['p95']:10.3f} -> {st['p95']:10.3f} us  {pct:+7.1f} %"
-        if delta >= floor and pct > FAIL_PCT:
+        d50 = st["p50"] - bs["p50"]
+        pct50 = 100.0 * d50 / bs["p50"] if bs["p50"] > 0 else 0.0
+        line = (f"{sid:3} {name:18} p50 {bs['p50']:9.3f} -> {st['p50']:9.3f} us {pct50:+6.1f} %, "
+                f"p95 {bs['p95']:9.3f} -> {st['p95']:9.3f} us {pct:+6.1f} %")
+        if d50 >= floor and pct50 > P50_FAIL_PCT:
             fails.append(line)
             print("  FAIL " + line)
-        elif delta >= floor and pct > WARN_PCT:
+        elif (d50 >= floor and pct50 > P50_WARN_PCT) or (delta >= floor and pct > P95_WARN_PCT):
             warns.append(line)
             print("  WARN " + line)
         else:

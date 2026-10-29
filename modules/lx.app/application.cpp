@@ -162,6 +162,7 @@ application::~application() {
     if (display_source_)
         display_source_->detach();
     display_source_.reset();
+    clipboard_.stop();
     stop_worker();
     if (lx::wayland::seat* s = display_.default_seat())
         s->set_handler(nullptr);
@@ -192,6 +193,8 @@ lx::result<void> application::start() {
     timeline_.connect_ns = mono_ns();
     if (lx::wayland::seat* s = display_.default_seat())
         s->set_handler(this);
+    // Without it a copy stays in this process (logged); a failure is not the app's end.
+    (void)clipboard_.start(display_, loop_, this);
 
     // The worker: icon rasters and theme reloads (the only work posted to it here).
     bool watch = false;
@@ -298,6 +301,18 @@ void application::on_deadline() {
         window_->on_deadline(mono_ns());
 }
 
+lx::ui::ui_root* application::host_root_of(const lx::wayland::surface* s) {
+    return window_ && s && &window_->surface() == s ? &window_->root() : nullptr;
+}
+
+lx::wayland::surface* application::host_drag_origin() {
+    // The window the pointer is in: a drag starts from a press there.
+    lx::wayland::seat* s = display_.default_seat();
+    if (!window_ || !s || s->pointer_focus() != &window_->surface())
+        return nullptr;
+    return &window_->surface();
+}
+
 void application::host_close_requested(window& w) {
     if (close_fn_)
         close_fn_(close_user_, w);
@@ -358,8 +373,5 @@ void application::on_touch(lx::wayland::seat& s, const lx::wayland::touch_event&
     if (window_ && (!e.target || e.target == &window_->surface()))
         window_->route_touch(s, e);
 }
-
-void clipboard::set_text(const char*) {}
-const char* clipboard::text() const { return ""; }
 
 } // namespace lx::app
