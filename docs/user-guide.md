@@ -190,7 +190,8 @@ outlives both — with its output in the journal:
 `--decorations=server|client`, `--shell PATH`, `--scale S` — the output scale, fractional
 allowed (`1.25`, `1.5`, `2`; rounded to n/120, the unit `wp_fractional_scale_v1` speaks;
 default: 2 on a HiDPI panel, else 1), `--output-scale NAME=S` — one output's scale
-(repeatable, e.g. `--output-scale DP-2=1.5`), `--virtual-outputs WxH[@S],…` — virtual
+(repeatable, e.g. `--output-scale DP-2=1.5`), `--render-scale S` and
+`--output-render-scale NAME=S` — the scale clients render at (below), `--virtual-outputs WxH[@S],…` — virtual
 outputs instead of the display (tests; no card is opened), and `--ping-timeout MS` — how
 long a client may leave an `xdg_wm_base.ping` unanswered before it is shown as not
 responding (title suffix, dimmed window, the shell's flag; it is never killed). Default
@@ -219,7 +220,35 @@ At a fractional scale, clients that speak `wp_fractional_scale_v1` + `wp_viewpor
 (foot, GTK 4, Qt 6, Chromium, Firefox, lumen-shell) render at the output's pixel density
 and are drawn 1:1, pixel-exact; others render at the integer ceiling and are scaled down.
 `scripts/scale-smoke.sh --join-seat-session` checks this on the console at 1.25, 1.5, 1.75
-and 2 from screenshots of the composited frame. Debug aid: `kill -USR1 <lumen-compositor>`
+and 2 from screenshots of the composited frame.
+
+**Render scale (HiDPI supersampling).** An output's `render-scale` is the scale clients are
+asked to render at; the compositor samples their buffers down to the output's own scale, as
+macOS does with its "looks like" resolutions. On a low-density or non-RGB-subpixel panel,
+`render-scale = 2` at scale 1 gives text and fine lines the sharpness of a 2x panel's
+glyphs averaged down, without moving or resizing anything: logical geometry,
+`wl_output.scale` and xdg-output stay those of the scale, and only the hints change —
+`wp_fractional_scale_v1.preferred_scale` (the render scale) and
+`wl_surface.preferred_buffer_scale` (its ceiling). Clients that speak neither render at 1
+as before. Set it in config.toml (applied live, on save or `lumen-ctl reload`):
+
+```toml
+[[output]]
+name = "eDP-1"          # a connector, a monitor ("make model serial"), or "*" for all
+render-scale = 2        # 0.25 .. 4; unset: follow the output scale
+```
+
+or with `--render-scale S` (every output) and `--output-render-scale NAME=S`. The most
+specific setting wins — an `[[output]]` naming the output, then `--output-render-scale`,
+then `[[output]] name = "*"`, then `--render-scale` — config.toml first at equal
+specificity. Below the scale it is honoured too (undersampling: cheaper for a weak GPU,
+softer). `lumen-ctl outputs` shows it where it differs from the scale. Shrinking uses an
+area filter (every texel under a pixel, weighted by coverage), so a non-integer ratio — a
+render scale of 2 on a 1.5 output — does not shimmer as bilinear sampling would; exactly 2:1
+costs the compositor nothing extra. What it costs: clients draw and keep render-scale² as
+many pixels (4x at 2 over 1), and their buffers are never shown 1:1, so a fullscreen one
+cannot be put on a plane directly. The cursor keeps the output scale (the cursor plane shows
+it 1:1). Measurements: `docs/subsystems/rendering-performance.md` "Render scale". Debug aid: `kill -USR1 <lumen-compositor>`
 writes the next fully repainted frame as a PPM to `$LUMEN_SCREENSHOT_DIR` (default
 `$XDG_RUNTIME_DIR`), GL path.
 
@@ -373,7 +402,8 @@ Problems are logged (`config` category), shown as a notification, printed by `lu
 and `lumen-ctl config check [FILE]` validates a file without a session. `LUMEN_CONFIG=PATH`
 uses only that file, `LUMEN_CONFIG=0` none. lumen-shell's command-line options override the
 `[idle]` and `[background]` keys. Outputs are configured in `outputs.toml` (written by
-`wlr-randr`/`kanshi` applies), not here.
+`wlr-randr`/`kanshi` applies), not here — except an output's render scale, `[[output]]`
+`render-scale` (see "Render scale" above).
 
 `lumen-ctl` controls the running session over its Varlink socket
 (`$XDG_RUNTIME_DIR/<display>.varlink`, this user only; `varlinkctl introspect` describes it):

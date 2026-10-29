@@ -10,7 +10,7 @@
 //               exit 0 ok, 1 degraded, 2 critical, 3 not running
 //   health      the full health report (every part, process, output)
 //   version     compositor version, zlm_shell_v1 version, composite backend
-//   outputs     the outputs: name, mode, position, scale
+//   outputs     the outputs: name, mode, position, scale, render scale (when set)
 //   windows     the windows: id, app id, title, state, output, geometry
 //   workspaces  every output's workspaces (output, position, name, active, windows)
 //   reload      re-read the configuration; prints what was wrong (exit 1: rejected)
@@ -435,12 +435,18 @@ int cmd_list(connection& c, const char* method, const char* key) {
     for (std::size_t i = 0; i < n; ++i) {
         sd_json_variant* e = sd_json_variant_by_index(arr, i);
         if (std::strcmp(key, "outputs") == 0) {
-            std::printf("%s  %lldx%lld@%.3f Hz  at %lld,%lld  logical %lldx%lld  scale %g  %s"
+            // The render scale only where it differs (supersampling or undersampling).
+            const double scale = real(e, "scale", 1.0);
+            const double render = real(e, "render_scale", scale);
+            char rs[32] = "";
+            if (render != scale)
+                std::snprintf(rs, sizeof(rs), "  render-scale %g", render);
+            std::printf("%s  %lldx%lld@%.3f Hz  at %lld,%lld  logical %lldx%lld  scale %g%s  %s"
                         "  workspace %s\n"
                         "    %s\n",
                         str(e, "name"), num(e, "mode_width"), num(e, "mode_height"),
                         static_cast<double>(num(e, "refresh_mhz")) / 1000.0, num(e, "x"),
-                        num(e, "y"), num(e, "width"), num(e, "height"), real(e, "scale", 1.0),
+                        num(e, "y"), num(e, "width"), num(e, "height"), scale, rs,
                         str(e, "transform"), str(e, "active_workspace", "-"),
                         str(e, "description"));
         } else if (std::strcmp(key, "windows") == 0) {

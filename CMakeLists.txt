@@ -1013,6 +1013,16 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_cpu_composite PRIVATE tests)
     add_test(NAME test_cpu_composite COMMAND test_cpu_composite)
 
+    # Downsampling a supersampled (render_scale) buffer on the CPU, GL and Vulkan backends;
+    # each one it cannot bring up is skipped.
+    add_executable(test_downsample tests/test_downsample.cpp)
+    target_link_libraries(test_downsample PRIVATE lx.gfx)
+    lumen_apply_module_properties(test_downsample)
+    lumen_link_platform(test_downsample)
+    target_include_directories(test_downsample PRIVATE tests)
+    add_test(NAME test_downsample COMMAND test_downsample)
+    set_tests_properties(test_downsample PROPERTIES TIMEOUT 120)
+
     add_executable(test_gl_composite tests/test_gl_composite.cpp)
     target_link_libraries(test_gl_composite PRIVATE lx.gfx)
     lumen_apply_module_properties(test_gl_composite)
@@ -1287,6 +1297,14 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_multi_output_contract COMMAND test_multi_output_contract)
     set_tests_properties(test_multi_output_contract PROPERTIES TIMEOUT 30)
 
+    add_executable(test_render_scale tests/test_render_scale.cpp)
+    target_link_libraries(test_render_scale PRIVATE lx.compositor)
+    lumen_apply_module_properties(test_render_scale)
+    lumen_link_platform(test_render_scale)
+    target_include_directories(test_render_scale PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_render_scale COMMAND test_render_scale)
+    set_tests_properties(test_render_scale PROPERTIES TIMEOUT 30)
+
     add_executable(test_hotplug_contract tests/test_hotplug_contract.cpp)
     target_link_libraries(test_hotplug_contract PRIVATE lx.compositor)
     lumen_apply_module_properties(test_hotplug_contract)
@@ -1523,7 +1541,7 @@ if(LUMEN_BUILD_TESTS)
         test_import_cache bench_frame
         test_runtime_memory test_runtime_psi test_runtime_task test_cpu_composite test_repaint_schedule test_frame_clocks test_input_keymap
         test_headless_golden test_text_shaping test_protocol_bind test_protocol_conformance
-        test_output_contract test_multi_output_contract test_hotplug_contract
+        test_output_contract test_multi_output_contract test_hotplug_contract test_render_scale
         test_output_management_contract
         test_task_model test_shell_bridge
         test_desktop_entry test_app_catalog test_app_launch test_launcher_layout test_background
@@ -1540,7 +1558,7 @@ if(LUMEN_BUILD_TESTS)
         set_tests_properties(ui_gallery PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
     endif()
 
-    set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout
+    set_tests_properties(test_dmabuf_composite test_kms_vulkan_scanout test_downsample
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")
     if(TARGET test_deco_titles)
         set_tests_properties(test_deco_titles PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV_VULKAN_ICD}")

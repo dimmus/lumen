@@ -1482,6 +1482,9 @@ struct compositor_impl {
     void apply_focus_policy();
     /// config.toml [windows]: edge snapping, its preview, drag-to-restore (Part K).
     void apply_window_config();
+    /// config.toml [[output]]: the render scale rules. A changed render scale re-sends the
+    /// client hints (the outputs' generation moves).
+    void apply_output_config();
     void apply_repeat();
     /// zlm v7 config + diagnostics + done to `shell_resource` (null: every v7 shell).
     void send_config_to_shell(void* shell_resource, bool with_bytes);
@@ -1945,9 +1948,10 @@ void compositor_impl::log_outputs() const {
         const output_state& o = outputs.slot_state(slot);
         const lx::rect2i l = o.logical_rect();
         log_output.info("output {} name={} mode={}x{} refresh_mhz={} scale={:g} "
-                        "({}/120) logical={}x{}+{}+{} identifier=\"{}\"",
+                        "({}/120) logical={}x{}+{}+{} render_scale={:g} identifier=\"{}\"",
                         slot, o.name, o.mode.width, o.mode.height, o.refresh_mhz, o.scale,
-                        std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y, o.identifier);
+                        std::lround(o.scale * 120.0), l.width, l.height, l.x, l.y,
+                        o.effective_render_scale(), o.identifier);
     }
 }
 
@@ -3575,6 +3579,7 @@ void compositor_impl::start_session() {
                 c.mode_height = o.mode.height;
                 c.refresh_mhz = o.refresh_mhz;
                 c.scale = o.scale;
+                c.render_scale = o.effective_render_scale();
                 static constexpr const char* k_transforms[] = {
                     "normal", "90", "180", "270", "flipped", "flipped-90", "flipped-180",
                     "flipped-270"};
@@ -4202,6 +4207,25 @@ void compositor_impl::load_initial_config() {
     (void)config_.reload(true);
     std::snprintf(cursor_theme_name_, sizeof(cursor_theme_name_), "%s",
                   config_.current().cursor.theme);
+    // Before any output exists: each takes its render scale as it is added.
+    apply_output_config();
+}
+
+void compositor_impl::apply_output_config() {
+    const auto& list = config_.current().outputs;
+    std::array<render_scale_rule, output_manager::k_max> rules{};
+    unsigned n = 0;
+    for (const auto& o : list) {
+        if (n == rules.size())
+            break;
+        std::snprintf(rules[n].match, sizeof(rules[n].match), "%s", o.name);
+        rules[n].scale = o.render_scale;
+        ++n;
+    }
+    const unsigned before = outputs.generation();
+    outputs.set_render_scale_rules(rules.data(), n);
+    if (outputs.generation() != before)
+        outputs_changed_now();
 }
 
 void compositor_impl::apply_initial_config() {
@@ -4295,6 +4319,8 @@ void compositor_impl::run_config_reload(bool force) {
             apply_window_config();
         if (r.changes & cfg_workspaces)
             apply_workspace_config();
+        if (r.changes & cfg_outputs)
+            apply_output_config();
         if (r.changes & cfg_bindings)
             install_bindings();
         // Unchanged but still failing: compiled again, which reports it again (or applies it
@@ -9494,6 +9520,20 @@ lx::result<void> compositor::start() {
                 continue;
             *eq = '\0';
             impl_->outputs.set_scale_override(tok, std::strtod(eq + 1, nullptr));
+        }
+    }
+    // `--render-scale S`, `--output-render-scale NAME=S` (config.toml [[output]] may override
+    // them, output_manager.cppm "Render scale").
+    impl_->outputs.set_default_render_scale(impl_->cfg.render_scale);
+    if (const char* spec = impl_->cfg.output_render_scales; spec && *spec) {
+        char buf[512];
+        std::snprintf(buf, sizeof(buf), "%s", spec);
+        for (char* tok = std::strtok(buf, ","); tok; tok = std::strtok(nullptr, ",")) {
+            char* eq = std::strchr(tok, '=');
+            if (!eq)
+                continue;
+            *eq = '\0';
+            impl_->outputs.set_render_scale_override(tok, std::strtod(eq + 1, nullptr));
         }
     }
     // The persisted output configuration (ADR 008 §C.5), read before the first modeset so

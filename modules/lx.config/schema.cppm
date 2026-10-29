@@ -181,6 +181,18 @@ struct notification_settings {
     int history = 50;
 };
 
+/// [[output]]: one output's settings, by connector name ("DP-2"), monitor identifier ("make
+/// model serial", outputs.toml's key) or "*" for every output. Mode, scale,
+/// position and transform are the output-management clients' (wlr-randr, kanshi) and
+/// outputs.toml's, not this file's.
+struct output_override {
+    char name[208]{};
+    /// The scale clients render at (HiDPI supersampling); 0: not set, the output scale.
+    double render_scale = 0.0;
+    unsigned layer = 0;
+    unsigned line = 0;
+};
+
 // ── Bindings ──
 
 enum binding_option : unsigned char {
@@ -205,6 +217,7 @@ struct binding {
 
 inline constexpr unsigned k_max_bindings = 128;
 inline constexpr unsigned k_max_devices = 16;
+inline constexpr unsigned k_max_outputs = 16;
 
 struct config_snapshot {
     int version = 1;
@@ -213,6 +226,7 @@ struct config_snapshot {
     pointer_settings mouse{};
     pointer_settings trackpoint{};
     std::inplace_vector<device_override, k_max_devices> devices{};
+    std::inplace_vector<output_override, k_max_outputs> outputs{};
     cursor_settings cursor{};
     focus_settings focus{};
     window_settings windows{};

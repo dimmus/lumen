@@ -710,7 +710,9 @@ struct quad_push {
     float src_bounds[4]{0.f, 0.f, 1.f, 1.f};
     /// Transfer function to decode the sampled texel with. Matches `transfer_slot`.
     int transfer = 1;
-    float pad1 = 0.f;
+    /// 1: the draw shrinks its source, and samples it through the area filter
+    /// (`downsample_footprint_for`, downsample.glsl); 0: one bilinear tap.
+    int downsample = 0;
     float uv_dy[2]{0.f, 1.f};
     /// Premultiplied, encoded colour of a solid draw.
     float solid[4]{0.f, 0.f, 0.f, 0.f};
@@ -882,6 +884,11 @@ constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_UNORM;
             push.src_bounds[1] = v_lo;
             push.src_bounds[2] = u_hi;
             push.src_bounds[3] = v_hi;
+            if (!cmd.solid)
+                push.downsample =
+                    lx::gfx::downsample_footprint_for(box, cmd.dst, cmd.buffer_xform).active()
+                        ? 1
+                        : 0;
         }
         const lx::gfx::source_basis b = lx::gfx::source_basis_for(cmd.buffer_xform);
         push.src_uv[0] = u0 + b.origin[0] * du;
