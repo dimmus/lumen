@@ -24,7 +24,8 @@ Lumen is a greenfield Linux desktop stack built in **C++26** with **Clang**:
 | **Compositor** (`lumen-compositor`) | Wayland display server, input routing, surface composition, Vulkan present |
 | **Shell** (`lumen-shell`) | Desktop chrome — panel, workspaces, window management UI |
 | **UI library** (`lx.ui`) | Declarative UI engine (ADR-010): components, layout and primitives for apps and shell |
-| **App framework** (`lx.app`) | Event loop, settings, clipboard for third-party apps |
+| **UI host** (`lx.ui.host`) | lx.ui on Wayland surfaces (ADR-010 Phase 5): one context per UI thread (client_gpu, renderer, atlas and caches, theme, timer, seat routing) driving surfaces of any role — toplevel, layer surface, popup, subsurface |
+| **App framework** (`lx.app`) | Event loop, settings, clipboard and windows (lx.ui.host toplevels) for third-party apps |
 
 Design goals:
 
@@ -94,8 +95,9 @@ flowchart TB
 
     subgraph Apps["user applications"]
         APP["lx.app"]
-        UI_A["lx.ui widgets"]
-        APP --> UI_A
+        UIH_A["lx.ui.host"]
+        UI_A["lx.ui"]
+        APP --> UIH_A --> UI_A
     end
 
     Shell -->|"Wayland client + zlm_shell_v1 + wlr-layer-shell"| WLS
@@ -246,18 +248,23 @@ the workspaces, which the shell displays and switches through ext-workspace. Det
 ### 2.3 Application processes
 
 **Typical binary:** user app linked against `lx.app` (`lumen-hello` is the reference)  
-**Modules:** `lx.app` (`:window`, `:input`), `lx.ui`, `lx.gfx` (`:swapchain`, the UI
-renderers), `lx.wayland.client`
+**Modules:** `lx.app` (`:window`, `:input`, `:clipboard`), `lx.ui.host` (`:context`,
+`:surface`, `:input`, `:roles`), `lx.ui`, `lx.gfx` (`:swapchain`, the UI renderers),
+`lx.wayland.client`
 
 Each app (ADR-010 §4.9–§4.10, Phase 4):
 
-- `lx::application` connects (`lx.wayland.client`), loads the compiled theme, runs one
-  `lx::runtime::event_loop` on the UI thread and a worker thread for icon rasters and theme
-  reloads (threading.md, "Client process")
-- `lx::app::window` creates the `wl_surface` + `xdg_toplevel` (server-side decorations
-  requested), owns an `lx::ui::ui_root`, and draws it on the pixel tier `lx::gfx::client_gpu`
-  picks the way the compositor picks its own (hardware Vulkan → hardware GL on GBM → CPU over
-  `wl_shm`) into a `client_swapchain` of dma-bufs (or shm), one wl_buffer per image
+- `lx::application` connects (`lx.wayland.client`), runs one `lx::runtime::event_loop` on
+  the UI thread and starts an `lx::ui::host::context` on it: the compiled theme, a worker
+  thread for icon rasters and theme reloads, one timerfd, the seat routing, and the pixel
+  path every window shares — one `lx::gfx::client_gpu` on the tier it picks the way the
+  compositor picks its own (hardware Vulkan → hardware GL on GBM → CPU over `wl_shm`), one
+  renderer, one atlas with its glyph and icon caches (threading.md, "Client process")
+- `lx::app::window` is an `lx::ui::host::surface` with the `xdg_toplevel` role (server-side
+  decorations requested): its own `wl_surface`, `lx::ui::ui_root` on its own
+  `lx::ui::ui_context`, and `client_swapchain` of dma-bufs (or shm), one wl_buffer per image.
+  An app may open several (ADR-010 Phase 5); each costs its root, swapchain and buffers, not
+  another GPU context or cache set
 - Frames follow lx.ui's damage ledger: drawn at once from idle, then throttled by the frame
   callback; only the damage is repainted (scissored, buffer age) and reported
   (`damage_buffer`); an idle window requests nothing and arms nothing
@@ -274,8 +281,10 @@ Each app (ADR-010 §4.9–§4.10, Phase 4):
   platform libraries (libinput, udev, libwayland-server), which a client never calls and would
   otherwise map and relocate at every exec
 
-Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`. `lx.app` builds on `lx.ui` directly (the
-`lx.ui.builder` fluent API was deleted in ADR-010 Phase 5).
+Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`. `lx.app` builds on `lx.ui.host` and
+`lx.ui` (the `lx.ui.builder` fluent API was deleted in ADR-010 Phase 5); the shell and the
+portal's overlay move onto `lx.ui.host` with layer surfaces and popups in the later Phase 5
+stages.
 
 ### 2.4 Portal processes
 
@@ -301,7 +310,9 @@ Shared WM vocabulary (`lx::toplevel_state`, `lx::placement`) lives in
 `lx.foundation` so the compositor can describe toplevel state without depending
 on `lx.shell.policy`. Policy implementations stay in the desktop layer.
 `lx.ui` is also desktop-layer: shell and apps both consume it; only
-`lx.app` sits above.
+`lx.app` sits above. `lx.ui.host` (lx.ui on Wayland surfaces: the per-thread context and the
+role-agnostic surfaces) is desktop-layer too, so the shell and the portal can build on it
+without depending on the application framework.
 
 
 ```mermaid
@@ -315,6 +326,7 @@ flowchart TB
         SHB["lx.shell:bridge / task_model / panel / launcher / switcher / app_catalog / app_launch / user_bus / notifications / notify_view / menu_popup / tray"]
         SHP["lx.shell.policy"]
         UI["lx.ui"]
+        UIH["lx.ui.host (context, surface, roles)"]
         PORTAL["lx.portal (xdg-desktop-portal-lumen)"]
     end
 
@@ -356,8 +368,11 @@ flowchart TB
         FOUND["lx.foundation / error / handles"]
     end
 
-    APP --> UI
-    APP --> WLC
+    APP --> UIH
+    UIH --> UI
+    UIH --> WLC
+    SH -.->|"Phase 5, P5-6 on"| UIH
+    PORTAL -.->|"Phase 5, P5-9"| UIH
     SH --> SHB
     SH --> SHP --> WLC
     SH --> TEXT
@@ -391,7 +406,7 @@ flowchart TB
 | **Platform** | OS / kernel / Wayland wire | `server::bind`, `kms_device::open`, protocols |
 | **Graphics** | Vulkan RHI, text, layout (`lx.text` rasterises glyphs into `lx.gfx:atlas`, so it depends on `lx.gfx`; `lx.layout:flex` is the UI's flexbox, on `lx.foundation` only) | `dmabuf_importer`, `solve_flex`, `scene_graph` |
 | **Compositor** | Display server integration | `tick_ui` / `tick_render`, `shell_bridge` |
-| **Desktop** | WM policy, shell UI, shared widget toolkit | `policy_bridge`, `stacking_policy`, `lx.ui` |
+| **Desktop** | WM policy, shell UI, shared widget toolkit and its Wayland host | `policy_bridge`, `stacking_policy`, `lx.ui`, `lx::ui::host::context` / `surface` |
 | **Application** | End-user programs on the app framework | `lx::application`, `lx::app::window` |
 
 ---
@@ -481,7 +496,7 @@ flowchart LR
 | `lx.gfx.gl_capture` | Screen capture's GL objects (ES 3.0): a client's dma-buf as a framebuffer (imported once per wl_buffer, LRU of 32), `glBlitFramebuffer` of damage rects (and crops), offscreen framebuffers over LINEAR GBM buffers read off the render thread (`read_bo`), asynchronous read-backs into pixel-pack buffers behind a native fence and their copy-out where there is no GBM buffer, the curtain clear |
 | `lx.gfx.cpu_renderer` | Software composite into a CPU-writable scanout buffer; chosen when no hardware renderer is available ([rendering-performance.md](subsystems/rendering-performance.md) §1.2) |
 | `lx.gfx.import_cache` | LRU reuse of VkImage imports; per-client entry cap |
-| `lx.gfx.swapchain` | A client window's pixel path (ADR-010 §4.10): the render node from the dma-buf feedback's main device, the tier in the compositor's `automatic` order and refusal rules (hardware Vulkan on the render node → hardware GLES 3.1 on GBM → wl_shm + `ui_cpu`), and a swapchain of three dma-buf images (two shm) with buffer age, non-blocking acquire, release by wl_buffer.release or linux-drm-syncobj release points, explicit sync per image (GL native fence → DRM syncobj; Vulkan timeline semaphore as a syncobj), reallocation once per size. API-type-free: lx.app maps the images onto wl_buffers through `lx.wayland.client`; `lx.gfx` never imports it. UI affinity in a client |
+| `lx.gfx.swapchain` | A client window's pixel path (ADR-010 §4.10): the render node from the dma-buf feedback's main device, the tier in the compositor's `automatic` order and refusal rules (hardware Vulkan on the render node → hardware GLES 3.1 on GBM → wl_shm + `ui_cpu`), and a swapchain of three dma-buf images (two shm) with buffer age, non-blocking acquire, release by wl_buffer.release or linux-drm-syncobj release points, explicit sync per image (GL native fence → DRM syncobj; Vulkan timeline semaphore as a syncobj), reallocation once per size. API-type-free: lx.ui.host maps the images onto wl_buffers through `lx.wayland.client`; `lx.gfx` never imports it. UI affinity in a client |
 | `lx.gfx.drm_timeline` | DRM timeline syncobjs for explicit sync behind an ops table (real libdrm ops; a fake in tests): imported timelines (refcounted: points outlive their objects), point queries (with a deadline hint), `DRM_IOCTL_SYNCOBJ_EVENTFD`, signal, signal-after-sync_file; the support probe; the release-fence mailbox (render's newest composite fence for release points) |
 | `lx.gfx.fence_deadline` | dma-fence deadline hints (`SYNC_IOC_SET_DEADLINE`, Linux 6.4) on composite and client sync_files; probed by use, off for good after ENOTTY |
 | `lx.compositor.buffer_lifecycle` | import → release → wl_buffer.release loop |
@@ -1912,9 +1927,10 @@ sequenceDiagram
     App->>WL: display::connect(settings.socket)
     WL->>Comp: Wayland handshake
     Comp-->>WL: globals (wl_compositor, xdg_wm_base, linux-dmabuf feedback, …)
+    App->>App: lx.ui.host context: theme, caches, worker, timer, seat
     Main->>App: window::open(app, options)
     App->>Comp: wl_surface + xdg_toplevel, initial commit (no buffer)
-    App->>App: client_gpu (tier), while the configure travels
+    App->>App: the context's client_gpu (tier; first window only), while the configure travels
     Comp-->>App: xdg_toplevel.configure
     App->>App: swapchain, ui_root tick, render
     App->>Comp: ack_configure, attach, damage_buffer, frame, commit

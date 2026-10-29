@@ -26,6 +26,9 @@ set(LUMEN_LAYER_lx.a11y 5)
 # Widget toolkit is shared by shell (desktop) and apps — same layer as shell,
 # not above it, so lx.shell → lx.ui is not an upward edge.
 set(LUMEN_LAYER_lx.ui 5)
+# lx.ui on Wayland surfaces (context, surfaces, roles): what lx.app, lx.shell and lx.portal
+# draw with — the same layer, so none of their edges to it points up.
+set(LUMEN_LAYER_lx.ui.host 5)
 set(LUMEN_LAYER_lx.app 6)
 set(LUMEN_LAYER_lx.portal 5)
 

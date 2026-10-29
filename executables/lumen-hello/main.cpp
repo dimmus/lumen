@@ -4,6 +4,7 @@
 //
 //   lumen-hello [--backend cpu|gl|vulkan] [--allow-software-gpu] [--socket NAME]
 //               [--theme one-dark|one-light|PATH] [--exit-after-first-present] [--frames N]
+//               [--windows N]
 //
 // --allow-software-gpu lets a forced GPU tier run on a software device (lavapipe, llvmpipe),
 // which the automatic choice refuses: for parity and start-up measurements only (§8.3 S10's
@@ -19,6 +20,10 @@
 //
 // --frames N repaints the whole window every frame until N frames are presented, then prints
 // the UI thread's frame time (callback or event → commit) and exits.
+//
+// --windows N opens N windows (default 1) on the one application context (shared client_gpu,
+// renderer, atlas and caches): the marginal cost of a surface (ADR-010 §7 Phase 5). The other
+// options act on the first window; closing any window quits.
 //
 // Those two lines and --help are the program's output, on stdout; failures are logged through
 // the `hello` category (stderr, LUMEN_LOG).
@@ -43,12 +48,14 @@ struct args {
     const char* theme = nullptr;
     bool exit_after_first_present = false;
     unsigned frames = 0;
+    unsigned windows = 1;
     std::uint64_t render_node = 0;
 };
 
 void usage() {
     std::println("usage: lumen-hello [--backend cpu|gl|vulkan] [--allow-software-gpu] [--socket NAME]\n"
                  "                   [--theme NAME|PATH] [--exit-after-first-present] [--frames N]\n"
+                 "                   [--windows N]  (N windows on one application context)\n"
                  "                   [--render-node PATH]  (choose the tier on that node, not the\n"
                  "                   compositor's main device: a headless compositor names none)");
 }
@@ -80,6 +87,14 @@ void usage() {
                 return false;
             }
             out.render_node = static_cast<std::uint64_t>(st.st_rdev);
+        } else if (a == "--windows") {
+            const char* v = value();
+            const unsigned long n = v ? std::strtoul(v, nullptr, 10) : 0;
+            if (n < 1 || n > lx::application::k_max_windows) {
+                log_hello.error("--windows takes 1 to {}", lx::application::k_max_windows);
+                return false;
+            }
+            out.windows = static_cast<unsigned>(n);
         } else if (a == "--frames") {
             const char* v = value();
             out.frames = v ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0;
@@ -134,6 +149,18 @@ int main(int argc, char* argv[]) {
         return 1;
     }
     w.set_continuous(a.frames > 0);
+    // The other windows: the same UI, each its own surface and root on the shared context.
+    std::vector<std::unique_ptr<lx::app::window>> more;
+    for (unsigned i = 1; i < a.windows; ++i) {
+        auto extra = std::make_unique<lx::app::window>();
+        lx::app::window_options oi = o;
+        oi.presentation_feedback = false;
+        if (auto opened = extra->open(app, oi); !opened) {
+            log_hello.error(opened.get_error());
+            return 1;
+        }
+        more.push_back(std::move(extra));
+    }
 
     if (a.exit_after_first_present) {
         const bool presented =

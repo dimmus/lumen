@@ -1,21 +1,22 @@
 module;
 
 // lx.app — the application runtime of ADR-010 Phase 4: one Wayland connection
-// (lx.wayland.client), one lx::runtime::event_loop on the UI thread, and the windows drawn
-// with the engine (`:window`, `:input`).
+// (lx.wayland.client), one lx::runtime::event_loop on the UI thread, an lx.ui.host context
+// over them, and the windows drawn with the engine (`:window`, `:input`) — as many as the app
+// opens (Phase 5), each an lx.ui.host surface with the xdg_toplevel role.
 //
 // The loop waits in epoll on: the display (`wayland::display_source`: prepare_read, flush,
-// read or cancel — GTK's GSource and calloop's WaylandSource); a timerfd armed only while
-// something needs a wake-up — a held key's repeat or a UI timer (a tooltip's delay, a caret's
-// blink) — at that deadline, never on a period; the swapchain's release eventfd under
-// explicit sync; and the theme file's inotify descriptor when hot reload is on. Each window is
-// an event source of its own that is due when its frame loop wants a frame. An idle
-// application has nothing armed and blocks with no timeout (G1). Work posted from the worker
-// thread (icon rasters, a theme reload) lands on the loop's UI strand.
+// read or cancel — GTK's GSource and calloop's WaylandSource); the context's timerfd, armed
+// only while something needs a wake-up — a held key's repeat or a UI timer (a tooltip's
+// delay, a caret's blink) — at that deadline, never on a period; the swapchains' release
+// eventfds under explicit sync; and the theme file's inotify descriptor when hot reload is on.
+// Each window is an event source of its own that is due when its frame loop wants a frame. An
+// idle application has nothing armed and blocks with no timeout (G1). Work posted from the
+// worker thread (icon rasters, a theme reload) lands on the loop's UI strand.
 //
-// The worker thread drains `lx::runtime::executor::global()`'s worker strand, woken by the
-// strand's waker (no polling); it starts with the application when async icons or theme
-// reload need it.
+// The context's worker thread drains `lx::runtime::executor::global()`'s worker strand, woken
+// by the strand's waker (no polling); it starts with the application when async icons or
+// theme reload need it.
 
 export module lx.app;
 
@@ -25,6 +26,7 @@ import lx.foundation;
 import lx.gfx;
 import lx.runtime;
 import lx.ui;
+import lx.ui.host;
 import lx.wayland.client;
 
 export import :input;
@@ -53,17 +55,18 @@ struct app_timeline {
     std::uint64_t connect_ns = 0;
 };
 
-class application final : public window_host,
-                          public transfer_host,
-                          public lx::wayland::seat_handler {
+class application final : public window_host, public transfer_host {
 public:
+    /// Windows one application holds open at once.
+    static constexpr unsigned k_max_windows = lx::ui::host::context::k_max_surfaces;
+
     application(int argc, char* argv[]);
     ~application();
     application(const application&) = delete;
     application& operator=(const application&) = delete;
 
-    /// Connects (`settings::socket`), loads the theme, starts the worker thread and puts the
-    /// display on the loop. Called by `run` when not yet done; call it first to open windows
+    /// Connects (`settings::socket`), starts the context (the theme, the worker thread, the
+    /// timer, the seat) and puts the display on the loop. Called by `run` when not yet done; call it first to open windows
     /// before running. UI affinity (it sets the calling thread's).
     [[nodiscard]] lx::result<void> start();
     /// Runs the loop until `quit` (or the connection dies: exit code 1).
@@ -79,6 +82,10 @@ public:
     /// The Wayland clipboard behind lx.ui's (started with the connection).
     [[nodiscard]] clipboard& clipboard_service() { return clipboard_; }
     [[nodiscard]] lx::wayland::display& display() { return display_; }
+    /// The lx.ui.host context the windows share (started by `start`).
+    [[nodiscard]] lx::ui::host::context& context() { return context_; }
+    /// Windows open now.
+    [[nodiscard]] unsigned window_count() const { return window_count_; }
     /// A copy: `worker_wakes` is the worker thread's counter, read here.
     [[nodiscard]] app_stats stats() const;
     [[nodiscard]] const app_timeline& timeline() const { return timeline_; }
@@ -99,6 +106,7 @@ public:
     [[nodiscard]] lx::runtime::event_loop& host_loop() override { return loop_; }
     [[nodiscard]] const settings& host_settings() const override { return settings_; }
     [[nodiscard]] lx::runtime::executor* host_worker() override;
+    [[nodiscard]] lx::ui::host::context& host_context() override { return context_; }
     void host_close_requested(window& w) override;
     [[nodiscard]] lx::result<void> host_attach(window& w) override;
     void host_detach(window& w) override;
@@ -107,38 +115,17 @@ public:
     [[nodiscard]] lx::ui::ui_root* host_root_of(const lx::wayland::surface* s) override;
     [[nodiscard]] lx::wayland::surface* host_drag_origin() override;
 
-    // seat_handler: routed to the window whose surface the event names.
-    void on_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) override;
-    void on_keyboard_focus(lx::wayland::seat& s, lx::wayland::surface* target, std::uint32_t serial,
-                           bool entered) override;
-    void on_key(lx::wayland::seat& s, const lx::wayland::key_event& e) override;
-    void on_modifiers(lx::wayland::seat& s, std::uint32_t modifiers) override;
-    void on_repeat_info(lx::wayland::seat& s, std::int32_t rate, std::int32_t delay_ms) override;
-    void on_touch(lx::wayland::seat& s, const lx::wayland::touch_event& e) override;
-
 private:
-    struct deadline_source;
-    struct worker_thread;
-
-    void after_dispatch();
-    void on_deadline();
-    void load_theme();
-    void stop_worker();
-
     lx::runtime::event_loop loop_{};
     settings settings_{};
     clipboard clipboard_{};
     lx::wayland::display display_{};
     std::unique_ptr<lx::wayland::display_source> display_source_{};
-    std::unique_ptr<deadline_source> timer_{};
-    std::unique_ptr<worker_thread> worker_{};
-    lx::ui::theme_watcher watcher_{};
-    std::unique_ptr<lx::runtime::fd_source> watcher_source_{};
-    window* window_ = nullptr;
-    lx::wayland::surface* keyboard_target_ = nullptr;
+    lx::ui::host::context context_{};
+    window* windows_[k_max_windows]{};
+    unsigned window_count_ = 0;
     void (*close_fn_)(void*, window&) = nullptr;
     void* close_user_ = nullptr;
-    app_stats stats_{};
     app_timeline timeline_{};
     int argc_ = 0;
     char** argv_ = nullptr;

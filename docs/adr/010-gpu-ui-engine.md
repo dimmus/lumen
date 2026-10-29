@@ -582,7 +582,9 @@ ledger (16), overlap grid, instance ring, atlas upload list (≤ 256 regions).
 | `lx.scene` (`draw_list` of primitives, one overlap grid per list) | Compositor | `lx.gfx` |
 | `lx.ui:style`, `:theme`, `:draw_scope`, `:components`, `:text_node` | Desktop | `lx.scene`, `lx.text`, `lx.layout` |
 | `lx.wayland.client` (real), `lx.app:window`, `:swapchain`, `:input` | Platform / Application | `lx.gfx` (through `lx.scene`), `lx.ui` |
-| `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui` |
+| `lx.ui.host` (`:context`, `:surface`, `:input`, `:roles`; Phase 5) — lx.ui on Wayland surfaces: one context per UI thread, surfaces of any role | Desktop | `lx.ui`, `lx.scene`, `lx.text`, `lx.gfx`, `lx.wayland.client`, `lx.runtime`, `lx.trace` |
+| `lx.app` (Phase 5: on `lx.ui.host`; `:input` re-exports its router) | Application | `lx.ui.host`, `lx.ui` |
+| `lx.shell` (panel, launcher on `lx.ui`) | Desktop | `lx.ui`, `lx.ui.host` (from Phase 5's shell stages) |
 | `tools/lumen-theme` | tool | the `lx.ui` facade (its `:theme`, `:theme_compile` and `:theme_defaults` partitions; see Phase 3's deviations) |
 
 The overlap grid (`order_grid`) is a geometry utility with no scene dependency, so it lives
@@ -1711,6 +1713,49 @@ a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
   gl — `sizeof(display)` grows by 40 B (one global slot) on `main`'s stack, which crosses a
   stack page in one environment size of eight (equal in the other seven); start-up to connect
   and to the first configure at parity inside each A/B's spread.
+- `lx.ui.host`: one context per UI thread, role-agnostic surfaces; lx.app rebased onto it.
+  **Done** (§4.13; api/README.md "lx.ui.host"): a layer-5 module — `:context` (ONE
+  `client_gpu`, renderer, atlas, glyph and icon cache per UI thread, the theme, the worker, one
+  timerfd at the earliest deadline over its surfaces, the seat router with one
+  `zwp_text_input_v3` per seat, the last press serial for popup grabs), `:surface` (moved from
+  lx.app's window: its own `ui_root` on its own `ui_context`, swapchain, frame loop, scale,
+  opaque / input regions; the frame ring opt-in), `:input` (moved from lx.app) and `:roles`
+  (toplevel, layer surface with keyboard interactivity and layer switchable live, popup on a
+  toplevel / popup / layer parent with a grab, desynchronized subsurface). lx.app's window is a
+  surface with the toplevel role; its public API is unchanged and an application may open up
+  to 32 windows (the one-window refusal is gone). lx.ui gains `image(atlas, tile, size_px)`
+  (one `poly_sprite` 1:1 on whole device pixels) and `text_block_node::attr_at` (the span
+  under a point). `lumen-hello --windows N` measures a surface's marginal cost. As GDK
+  (GdkSurface + GdkToplevel / GdkPopup) and QtWaylandClient (QWaylandWindow + a pluggable
+  shell integration, what layer-shell-qt plugs into) do, one connection-wide context drives
+  every surface; the roles are Qt's pluggable seam, not GTK 4's closed pair that
+  gtk4-layer-shell must interpose on; GPUI shares its renderer and atlas per window kind the
+  same way. `test_ui_host` (cpu and gl) covers two toplevels on one context (pointer by
+  target, keys to the focused one, modifiers on a focus change, own pixels on cpu, both idle),
+  a panel configured 1280 × 32 with zone 32 and keyboard interactivity switched live, a
+  grabbing popup on it dismissed by a click on another client, an alpha subsurface above a
+  toplevel, a surface destroyed mid-frame (its fds closed, unmapped, the others drawing),
+  pointer identity of the shared gpu, atlas and glyph cache, and 0 `operator new` over 300
+  frames of two surfaces drawn together (GL: the shared ring's slot waits recorded,
+  ≈ 13 ms and 2 ms over 300 frames). Measured against the stage's base (lumen-hello against
+  one headless compositor, interleaved, 5 runs each, `setarch -R`, pinned, load 0.04–0.6):
+  RssAnon 4508 → 4504 kB cpu, 27016–27020 → 27008–27016 kB gl, idle context switches 0;
+  `lumen-ui-bench --client` S1 G1 / G5 equal (1 switch in 10 s), S5 frame p50 78.2 → 80.6 µs
+  cpu and 408.5 → 407.5 µs gl (8 extra GL rounds: the tier is bimodal on both builds), S7
+  frame p50 1876 → 1896 µs cpu and 918 → 896 µs gl, 0 storm allocations, 30 reallocations;
+  S10 exec → first presented p50 40.95 → 40.9 ms cold and 25.65 → 25.2 ms warm (cpu, 6 × 20
+  start-ups). A surface's marginal RssAnon: ≈ 290–300 kB on cpu (2nd 284, 3rd 296, 4th
+  300 kB; 13 surfaces 297 kB each) and ≈ 200–210 kB on gl (2nd 196, 3rd 208, 4th 208 kB;
+  13 surfaces 207 kB each). Found on the way: with transparent huge pages `always`, the
+  surfaces' 512 KiB arenas, mapped side by side, merged into a region whose 2 MiB-aligned
+  stretch faulted in whole (+2 MiB at the 6th surface, +4 MiB at 13), so `memory_arena` maps
+  with `MADV_NOHUGEPAGE` as `page_mapping` already did (the compositor's RssAnon equal or
+  lower). Deviations: `image` takes the atlas and a tile id (a stable handle) rather than an
+  `atlas_tile` (a position that moves on a rebuild), and lays out at the tile's size over the
+  device scale; the context makes its caches with the first surface; lx.app's window keeps
+  its frame ring in itself (`surface_options::frame_ring`), as before; the gl tier's "no
+  corruption" check is the absence of failures over 300 frames, since the headless compositor
+  cannot read GL buffers back on this host (the cpu tier's pixels are compared).
 - Docs: `docs/subsystems/ui-engine.md` (this design as current), ui-architecture.md §9
   rewritten, rendering-performance.md gains a UI section with the measured tables,
   api/README.md and architecture.md §3 for the new partitions, UML for the client frame

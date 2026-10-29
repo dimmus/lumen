@@ -520,11 +520,22 @@ validated, kept ≤ 96², ≤ 4 body lines of ≤ 8 KiB markup) — never per fr
 lumen-compositor [socket-name] [-f fps] [--scale S] [--session] [--no-control]
 ```
 
-## Client process: lx.app (ADR-010 Phase 4)
+## Client process: lx.app and lx.ui.host (ADR-010 Phase 4, Phase 5)
 
 An application built on `lx.app` has one **UI thread** and one **worker thread**; there is no
-render thread in a client (ADR-010 §4.12: one window, one queue — a render thread is not
-justified until a submit costs more than 300 µs).
+render thread in a client (ADR-010 §4.12: one queue — a render thread is not justified until a
+submit costs more than 300 µs).
+
+**One UI thread, N surfaces (Phase 5).** The UI thread runs one `lx::ui::host::context`
+(`lx.ui.host:context`), and every surface of the process — an app's windows, later the shell's
+panel, menus and notifications — is an `lx::ui::host::surface` on it. Shared on the thread: one
+`client_gpu` (one render node fd, one EGL context or VkDevice), one renderer, one atlas with its
+glyph and icon caches, the timerfd, the seat router. Per surface: its `ui_root` on its own
+`ui_context` (damage, overlays, timers, reducers), its swapchain and frame source. Surfaces due
+in the same iteration draw one after the other on the shared context (GL: `acquire` makes the
+one EGL context current; the instance ring's slots are fenced, `surface_stats::slot_wait_ns`
+records any wait). The worker thread is the context's, made only when async icons or theme
+reload need it (the shell runs none).
 
 | Thread | Runs | Wakes on |
 |--------|------|----------|
@@ -539,14 +550,15 @@ throttle. A configure or a preferred-scale change is answered at once. Pointer m
 coalesced: only the latest position is kept and hit-tested, once per frame, or before a
 button, axis or key.
 
-**Timer.** One timerfd, armed after each loop iteration at the earliest deadline anything
-needs — a held key's repeat (`wl_keyboard.repeat_info`), a UI timer still ahead (a tooltip's
+**Timer.** One timerfd per context, armed after each loop iteration at the earliest deadline
+any surface needs — a held key's repeat (`wl_keyboard.repeat_info`), a UI timer still ahead (a tooltip's
 hover delay, a caret's blink) — and disarmed when nothing does. A UI timer already due is the
 frame loop's (now, or at the callback it waits for); it never re-arms the timer for the past.
 
-**Idle (G1).** No ledger entry, no animation, no timer, no key held: no frame callback is
-requested after the last frame's, nothing is submitted, the timerfd is disarmed and the loop
-blocks in `epoll_pwait2` with no timeout. `test_app_window` measures it: 2 s idle, 0 requests,
+**Idle (G1).** Per surface: no ledger entry, no animation, no timer, no key held — no frame
+callback is requested after the last frame's, nothing is submitted; with every surface idle
+the timerfd is disarmed and the loop blocks in `epoll_pwait2` with no timeout (`test_ui_host`:
+two toplevels, 0 requests and 0 commits over 1 s). `test_app_window` measures it: 2 s idle, 0 requests,
 0 commits, 0 timer expirations, 0 socket reads, one wakeup (the test's own quit timer).
 `lumen-ui-bench --client --scenario S1` measures it from outside the loop too: over 10 s idle
 the window's process switched once in total over all its threads (the quit timer's wake;
@@ -554,7 +566,8 @@ the window's process switched once in total over all its threads (the quit timer
 timer expirations and 0 socket reads, on the cpu, gl and (lavapipe) vulkan tiers
 (`tests/bench/baseline/iritur-client-{cpu,gl}.json`).
 
-**Frame record.** Every committed frame leaves a `frame_record` in a 256-entry ring: start,
+**Frame record.** With `surface_options::frame_records` (lx.app's windows; ≈ 30 KiB, off for
+the shell's surfaces) every committed frame leaves a `frame_record` in a 256-entry ring: start,
 commit, the UI thread's CPU time over the frame (`CLOCK_THREAD_CPUTIME_ID`), the stages
 (input flush, geometry, acquire, tick and its describe / reconcile / layout / emit, order,
 render, present) and, when wp_presentation answers, the presented time. The bench reads it;
@@ -580,4 +593,5 @@ On single-core or kiosk targets, compositor may **merge** `ui + render + wayland
 - [22-thread-model.mmd](../uml/22-thread-model.mmd) — thread diagram
 - [24-executor-class.mmd](../uml/24-executor-class.mmd) — class diagram
 - [23-frame-handoff-sequence.mmd](../uml/23-frame-handoff-sequence.mmd) — frame sequence
-- [47-client-frame-loop.mmd](../uml/47-client-frame-loop.mmd) — an lx.app window's frame (client process)
+- [47-client-frame-loop.mmd](../uml/47-client-frame-loop.mmd) — a client surface's frame (client process)
+- [48-client-swapchain.mmd](../uml/48-client-swapchain.mmd) — a client surface's pixel path: tiers, an image's life, sync points

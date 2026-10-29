@@ -220,11 +220,17 @@ if(LUMEN_BUILD_XWAYLAND)
     lumen_add_module_library(lx.compositor.xwayland modules/lx.compositor.xwayland
         DEPENDS lx.wayland.server lx.foundation)
 endif()
-# ADR-010 Phase 4: the application runtime — the Wayland connection and event loop, windows
-# drawn with lx.ui through lx.gfx's client swapchain, input routing. Application layer.
-lumen_add_module_library(lx.app modules/lx.app
+# ADR-010 Phase 5: lx.ui on Wayland surfaces — one context per UI thread (client_gpu,
+# renderer, atlas and caches, theme, worker, timer, seat routing) driving surfaces of any role
+# (xdg_toplevel, wlr layer surface, xdg_popup, wl_subsurface). Desktop layer: lx.app, lx.shell
+# and lx.portal build on it.
+lumen_add_module_library(lx.ui.host modules/lx.ui.host
     DEPENDS lx.ui lx.scene lx.text lx.gfx lx.wayland.client lx.runtime lx.trace)
-lumen_link_platform_parts(lx.app xkb)
+lumen_link_platform_parts(lx.ui.host xkb)
+# ADR-010 Phase 4: the application runtime — the Wayland connection and event loop, windows
+# (lx.ui.host surfaces with the toplevel role), the clipboard. Application layer.
+lumen_add_module_library(lx.app modules/lx.app
+    DEPENDS lx.ui.host lx.ui lx.scene lx.text lx.gfx lx.wayland.client lx.runtime lx.trace)
 # An application loads only the shared libraries it calls into: the module archives carry the
 # compositor's platform libraries (libinput and its libwacom / GLib / Lua, udev,
 # libwayland-server, libdisplay-info) as link dependencies, which an lx.app client never
@@ -1263,6 +1269,17 @@ if(LUMEN_BUILD_TESTS)
         add_test(NAME test_app_window COMMAND test_app_window)
         set_tests_properties(test_app_window PROPERTIES TIMEOUT 180)
     endif()
+
+    # ADR-010 Phase 5: lx.ui.host — one context driving two toplevels, a layer-shell panel, a
+    # popup on it and an alpha subsurface against the in-process compositor (the client in a
+    # child process): routing, sharing, idle, steady-frame allocations; cpu and gl.
+    add_executable(test_ui_host tests/test_ui_host.cpp)
+    target_link_libraries(test_ui_host PRIVATE lx.compositor lx.wayland.client lx.ui.host)
+    lumen_apply_module_properties(test_ui_host)
+    lumen_link_platform(test_ui_host)
+    target_include_directories(test_ui_host PRIVATE tests "${LUMEN_GENERATED_DIR}")
+    add_test(NAME test_ui_host COMMAND test_ui_host)
+    set_tests_properties(test_ui_host PROPERTIES TIMEOUT 180)
 
     # Part C (design-app-compat-capture): pointer constraints, relative pointer, gestures —
     # in-process against a real compositor with injected relative motion and gestures.

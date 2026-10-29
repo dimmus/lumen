@@ -204,7 +204,9 @@ struct record_view {
 record_view find_record() {
     record_view out{};
     g_comp->toplevels().for_each([&](const lx::compositor::toplevel_record& r) {
-        if (r.app_id && std::strcmp(r.app_id, k_app_id) == 0 && r.id.id() > out.id.id()) {
+        // The newest mapped window of the app (a closed second window's record may linger).
+        if (r.app_id && std::strcmp(r.app_id, k_app_id) == 0 &&
+            ((r.mapped && !out.mapped) || (r.mapped == out.mapped && r.id.id() > out.id.id()))) {
             out.id = r.id;
             out.geometry = r.geometry;
             out.mapped = r.mapped;
@@ -881,17 +883,32 @@ int client_main(const char* tier_name, int fd) {
                             (t.first_commit_ns - at.exec_ns) / 1e6,
                             (t.first_presented_ns - at.exec_ns) / 1e6));
     }
-    // One window per application: a second open is refused, and the first keeps its input
+    // Several windows per application (Phase 5): a second opens on the same context — the
+    // same client_gpu and atlas — and draws; closed again, the first keeps its input
     // (everything below runs on it).
     {
         lx::app::window second;
         lx::app::window_options o2 = o;
         o2.title = "second";
-        auto refused = second.open(app, o2);
-        check("one window per application: a second open() is refused (invalid_argument)",
-              !refused && refused.get_error().domain == lx::error_domain::invalid_argument &&
-                  !second.is_open() && w.is_open(),
-              refused ? "opened" : lx::format_error(refused.get_error()));
+        o2.size = {320, 240};
+        auto opened = second.open(app, o2);
+        const bool presented =
+            opened && app.run_until([&] { return second.timeline().first_presented_ns != 0; }, 5000);
+        check("two windows per application: a second opens, draws and shares the first's "
+              "client_gpu and atlas",
+              opened && presented && app.window_count() == 2 && &second.gpu() == &w.gpu() &&
+                  &second.atlas() == &w.atlas() && second.tier() == w.tier() && w.is_open(),
+              opened ? std::format("presented {} windows {} same gpu {} same atlas {}", presented,
+                                   app.window_count(), &second.gpu() == &w.gpu(),
+                                   &second.atlas() == &w.atlas())
+                     : lx::format_error(opened.get_error()));
+        second.close();
+        // Its destruction on the wire before the commands below name "the window".
+        (void)app.display().flush();
+        run_for(app, 60);
+        check("two windows per application: the second closed, one window left",
+              app.window_count() == 1 && w.is_open() && !second.is_open(),
+              std::format("windows {}", app.window_count()));
     }
     // The pointer off the window (output 0's corner), the UI settled.
     (void)parent.call("gmove 4 4");
@@ -922,10 +939,12 @@ int client_main(const char* tier_name, int fd) {
               moved == "ok" && scaled && w.buffer_size().width == 800 && w.buffer_size().height == 600 &&
                   w.viewport_destination().width == 640 && w.viewport_destination().height == 480 &&
                   w.buffer_scale() == 1 && rec.geometry.width == 640 && rec.geometry.height == 480,
-              std::format("{} scale {} buffer {}×{} viewport {}×{} buffer_scale {} record {}×{}",
+              std::format("{} scale {} buffer {}×{} viewport {}×{} buffer_scale {} record {}×{} "
+                          "(preferred {}/120, outputs {:#x})",
                           moved, w.scale(), w.buffer_size().width, w.buffer_size().height,
                           w.viewport_destination().width, w.viewport_destination().height,
-                          w.buffer_scale(), rec.geometry.width, rec.geometry.height));
+                          w.buffer_scale(), rec.geometry.width, rec.geometry.height,
+                          w.surface().preferred_scale120(), w.surface().outputs()));
         check("fractional 1.25: one swapchain reallocation for the new size",
               w.stats().reallocations == realloc0 + 1,
               std::format("{} reallocation(s)", w.stats().reallocations - realloc0));

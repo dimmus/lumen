@@ -377,6 +377,14 @@ private:
 /// A round avatar showing an RGBA atlas image.
 [[nodiscard]] avatar_builder avatar(lx::gfx::atlas& atlas, lx::gfx::atlas_tile_id image);
 
+// ── image ──
+
+/// An RGBA atlas image shown 1:1: one `poly_sprite` of the tile's `size_px` device pixels,
+/// placed on whole device pixels (no resampling). It lays out at `size_px` over the UI
+/// device scale (logical px, rounded up). A notification's or an app's picture.
+[[nodiscard]] child image(lx::gfx::atlas& atlas, lx::gfx::atlas_tile_id tile, lx::size2i size_px,
+                          element_key key = 0);
+
 // ── key bindings (keybinding.rs, keybinding_hint.rs) ──
 
 /// One keystroke as Zed spells it on Linux: modifiers and key joined by '-' ("Ctrl-S").
@@ -1100,6 +1108,18 @@ lx::ui::avatar_builder lx::ui::avatar(const char* initials) {
 
 lx::ui::avatar_builder lx::ui::avatar(lx::gfx::atlas& atlas, lx::gfx::atlas_tile_id image) {
     return avatar_builder{nullptr, &atlas, image};
+}
+
+// ── image ──
+
+lx::ui::child lx::ui::image(lx::gfx::atlas& atlas, lx::gfx::atlas_tile_id tile, lx::size2i size_px,
+                            element_key key) {
+    const float scale = ui_device_scale();
+    const float w = std::ceil(static_cast<float>(size_px.width) / scale - 1e-4f);
+    const float h = std::ceil(static_cast<float>(size_px.height) / scale - 1e-4f);
+    child content = describe<image_node, image_props>({&atlas, tile, 0.f, true});
+    return lx_ui_box(style{}.flex_none().w(lx::layout::px(w)).h(lx::layout::px(h)), control_paint{},
+                     {&content, 1u}, key);
 }
 
 // ── key bindings ──

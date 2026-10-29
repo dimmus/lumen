@@ -2636,6 +2636,84 @@ LUMEN_TEST(a_rebuild_the_frame_arena_cannot_hold_is_retried) {
     LUMEN_CHECK(host->child_at(0)->child_count() == 60);
 }
 
+// ── image(): an atlas picture drawn 1:1; text_block_node::attr_at: the span under a point ──
+
+namespace {
+
+lx::gfx::atlas_tile_id g_picture{};
+const lx::text::text_attr g_link_spans[2] = {
+    {.begin = 0, .end = 5, .weight = lx::text::weight::bold},
+    {.begin = 6, .end = 10, .color = 0x3D6FB4FFu, .underline = lx::text::text_underline::single,
+     .tag = 7},
+};
+
+child describe_picture(build_context&) {
+    const child kids[1] = {image(env().atlas, g_picture, {20, 12})};
+    return div(style{}.flex_col().items_start().p(px(4.f)), kids);
+}
+
+child describe_links(build_context&) {
+    text_block_props p{};
+    p.text = "plain link";
+    p.attrs = g_link_spans;
+    p.context = active_ui_resources().text;
+    const child kids[1] = {text_block(p)};
+    return div(style{}.flex_col().items_start(), kids);
+}
+
+} // namespace
+
+LUMEN_TEST(image_draws_its_tile_one_to_one) {
+    (void)env();
+    std::vector<std::uint8_t> rgba(20u * 12u * 4u, 0xFF);
+    auto tile = env().atlas.insert(lx::gfx::atlas_format::rgba8, 20, 12, rgba, 20u * 4u);
+    LUMEN_CHECK(tile.ok());
+    g_picture = tile.value();
+    for (const float scale : {1.f, 1.25f, 2.f}) {
+        harness h{describe_picture, {0, 0, 200, 100}};
+        h.root.set_scale(scale);
+        (void)h.tick();
+        unsigned sprites = 0;
+        bool exact = false;
+        for (const lx::gfx::sprite_instance& sp : h.list->sprite_instances()) {
+            ++sprites;
+            exact = sp.bounds[2] == 20.f && sp.bounds[3] == 12.f &&
+                    sp.bounds[0] == std::floor(sp.bounds[0]) && sp.bounds[1] == std::floor(sp.bounds[1]) &&
+                    sp.uv[2] - sp.uv[0] == 20 && sp.uv[3] - sp.uv[1] == 12;
+        }
+        LUMEN_CHECK(sprites == 1 && exact);
+        // Laid out at the tile's size in logical px (rounded up), at the 4 px padding.
+        ui_node* n = find_type(h.root.tree(), image_node::static_type());
+        LUMEN_CHECK(n != nullptr);
+        const int w = static_cast<int>(std::ceil(20.f / scale - 1e-4f));
+        LUMEN_CHECK(n->bounds().width == w || n->parent()->bounds().width == w);
+    }
+    env().atlas.release(g_picture);
+}
+
+LUMEN_TEST(text_attr_at_names_the_span_under_a_point) {
+    harness h{describe_links, {0, 0, 400, 100}};
+    ui_node* n = find_type(h.root.tree(), text_block_node::static_type());
+    LUMEN_CHECK(n != nullptr);
+    const auto& t = *static_cast<text_block_node*>(n);
+    const lx::text::text_layout& l = t.layout();
+    LUMEN_CHECK(!l.lines().empty());
+    // The run of each span: its middle hits it; the space between them (no span) and below
+    // the last line hit none.
+    int first = -2, second = -2;
+    for (const lx::text::layout_run& run : l.runs()) {
+        const int mid = static_cast<int>((run.x + run.width / 2) / 64);
+        const int got = t.attr_at({mid, 4});
+        if (run.begin == 0)
+            first = got;
+        else if (run.begin == 6)
+            second = got;
+    }
+    LUMEN_CHECK(first == 0 && second == 1);
+    LUMEN_CHECK(t.attr_at({2, n->bounds().height + 20}) == -1);
+    LUMEN_CHECK(t.attr_at({-5, 4}) == -1);
+}
+
 int main(int argc, char** argv) {
     lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     const int status = lumen_test::run_all(argc, argv);

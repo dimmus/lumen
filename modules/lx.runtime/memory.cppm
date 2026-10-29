@@ -199,6 +199,11 @@ lx::runtime::memory_arena::memory_arena(unsigned capacity_bytes) {
         return;
     }
 
+    // Sparse by design, as page_mapping's buffers are: a frame touches the arena only up to
+    // its high-water mark. With transparent huge pages set to `always`, arenas mapped side by
+    // side (one per UI surface) merge into one region and the first write into a 2 MiB-aligned
+    // stretch of it faults in a whole huge page — 2 MiB resident for a few KiB used.
+    (void)::madvise(base, static_cast<std::size_t>(mapped), MADV_NOHUGEPAGE);
     storage_ = static_cast<unsigned char*>(base);
     mapped_bytes_ = mapped;
     capacity_ = mapped;
