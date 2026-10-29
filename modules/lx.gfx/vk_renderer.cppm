@@ -150,11 +150,19 @@ public:
     /// Make a dmabuf-imported client image samplable under `image.image_id`.
     [[nodiscard]] lx::result<void> bind_imported(const imported_image& image);
 
-    /// Upload shared-memory pixels (tightly packed RGBA8) under `texture_id`. With
-    /// `host_image_copier` usable the host writes the image (after the frames in flight,
-    /// which this waits for either way); otherwise a staging ring and a queue copy.
+    /// Upload shared-memory pixels (RGBA8) under `texture_id`. With `host_image_copier`
+    /// usable the host writes the image (after the frames in flight, which this waits for
+    /// either way); otherwise a staging ring and a queue copy, in as many submissions as
+    /// the ring needs, so no image is too large for it.
+    ///
+    /// `rgba` carries `region` of the `width` x `height` image, packed at the region's
+    /// width; an empty region is the whole image. Only `rects` (inside `region`; empty: the
+    /// region as one) are copied, so a typing terminal rewrites a line, not the window. A
+    /// partial region keeps the rest of the image, which an earlier upload wrote.
     [[nodiscard]] lx::result<void> upload_rgba(unsigned texture_id, unsigned width,
-                                               unsigned height, const unsigned char* rgba);
+                                               unsigned height, const unsigned char* rgba,
+                                               lx::rect2i region = {},
+                                               std::span<const lx::rect2i> rects = {});
 
     void forget_texture(unsigned texture_id);
 
@@ -1690,13 +1698,34 @@ lx::result<void> lx::gfx::vulkan_compositor::bind_imported(const imported_image&
 
 lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, unsigned width,
                                                           unsigned height,
-                                                          const unsigned char* rgba) {
+                                                          const unsigned char* rgba,
+                                                          lx::rect2i region,
+                                                          std::span<const lx::rect2i> rects) {
 #if defined(LUMEN_HAS_VULKAN)
     if (!ready())
         return lx::not_implemented("lx::gfx::vulkan_compositor::upload_rgba");
     if (texture_id == 0 || width == 0 || height == 0 || !rgba) {
         return lx::invalid_argument("upload_rgba with empty source");
     }
+    const lx::rect2i full{0, 0, static_cast<int>(width), static_cast<int>(height)};
+    const lx::rect2i area = region.width > 0 && region.height > 0 ? region : full;
+    if (area.x < 0 || area.y < 0 || area.x + area.width > full.width ||
+        area.y + area.height > full.height) {
+        return lx::invalid_argument("upload_rgba region outside the image");
+    }
+    if (rects.empty())
+        rects = {&area, 1};
+    for (const lx::rect2i& r : rects) {
+        if (r.width <= 0 || r.height <= 0 || r.x < area.x || r.y < area.y ||
+            r.x + r.width > area.x + area.width || r.y + r.height > area.y + area.height) {
+            return lx::invalid_argument("upload_rgba rect outside its region");
+        }
+    }
+    const std::size_t src_stride = static_cast<std::size_t>(area.width) * 4u;
+    const auto source = [&](const lx::rect2i& r) {
+        return rgba + static_cast<std::size_t>(r.y - area.y) * src_stride +
+               static_cast<std::size_t>(r.x - area.x) * 4u;
+    };
 
     // Present no longer blocks, so the frame this reads may still be in flight. Read-back
     // is for tests and screenshots and is explicitly not on the frame path, so waiting here
@@ -1799,73 +1828,117 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
                 return prepared.get_error();
             slot.layout_ready = true;
         }
-        return host_copy_.copy(slot.image, rgba, 0,
-                               {0, 0, static_cast<int>(width), static_cast<int>(height)});
+        for (const lx::rect2i& r : rects) {
+            if (auto copied = host_copy_.copy(slot.image, source(r),
+                                              static_cast<unsigned>(area.width), r);
+                !copied)
+                return copied.get_error();
+        }
+        return {};
     }
 
-    const VkDeviceSize bytes = static_cast<VkDeviceSize>(width) * height * 4u;
     if (auto staged = ensure_staging_ring(k_staging_ring_bytes); !staged)
         return staged.get_error();
+    // Every submission is complete (waited for above), so nothing reads the ring: this
+    // upload has all of it. One larger than the ring — a HiDPI background or fullscreen shm
+    // window, 23 MiB at 3200x1800 — goes in row bands, a submission each, waited for
+    // before the ring is rewritten; a damaged line is one band.
+    staging_offset_ = 0;
 
-    if (bytes > staging_capacity_) {
-        return lx::make_error(lx::vulkan_err::import_failed,
-                              "upload exceeds staging ring capacity");
-    }
-    if (staging_offset_ + bytes > staging_capacity_) {
-        // Wrapping reuses memory an earlier submission may still be reading, and only the
-        // slot fences tell us when that is done. Drain them before rewinding.
-        VkFence all[k_frame_slots]{};
-        unsigned pending = 0;
-        for (unsigned i = 0; i < k_frame_slots; ++i) {
-            if (fences_[i])
-                all[pending++] = static_cast<VkFence>(fences_[i]);
+    const bool whole = rects.size() == 1 && rects[0].x == 0 && rects[0].y == 0 &&
+                       rects[0].width == full.width && rects[0].height == full.height;
+    // A whole-image write need not keep the old content; a partial one must.
+    VkImageLayout from = slot.layout_ready && !whole ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+                                                     : VK_IMAGE_LAYOUT_UNDEFINED;
+    constexpr unsigned k_band_copies = 32;
+    VkBufferImageCopy copies[k_band_copies]{};
+    unsigned count = 0;
+    VkCommandBuffer cb = VK_NULL_HANDLE;
+    const auto image = static_cast<VkImage>(slot.image);
+
+    const auto begin_band = [&]() -> lx::result<void> {
+        cb = static_cast<VkCommandBuffer>(command_buffers_[submit_slot_]);
+        auto fence = static_cast<VkFence>(fences_[submit_slot_]);
+        // Fences start signaled, so the first use of each slot does not block.
+        if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+            return vk_error("vkWaitForFences timed out reclaiming upload slot");
+        vkResetFences(dev, 1, &fence);
+        vkResetCommandBuffer(cb, 0);
+        VkCommandBufferBeginInfo begin{};
+        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        vkBeginCommandBuffer(cb, &begin);
+        image_barrier(cb, image, from, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COPY_BIT,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        return {};
+    };
+    // `wait`: the next band rewrites the ring from its start, so this one must have read it.
+    const auto end_band = [&](bool wait) -> lx::result<void> {
+        if (count > 0)
+            vkCmdCopyBufferToImage(cb, static_cast<VkBuffer>(staging_buffer_), image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, count, copies);
+        image_barrier(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                      VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                      VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                      VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        vkEndCommandBuffer(cb);
+        count = 0;
+        cb = VK_NULL_HANDLE;
+        // Later bands keep what this one wrote.
+        from = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        if (auto submitted = submit_current_slot(wait); !submitted)
+            return submitted.get_error();
+        if (wait)
+            staging_offset_ = 0;
+        return {};
+    };
+
+    for (const lx::rect2i& r : rects) {
+        const std::size_t row_bytes = static_cast<std::size_t>(r.width) * 4u;
+        if (row_bytes > staging_capacity_)
+            return lx::make_error(lx::vulkan_err::import_failed, "upload row exceeds staging ring");
+        const unsigned char* src = source(r);
+        int y = r.y;
+        while (y < r.y + r.height) {
+            if (!cb) {
+                if (auto begun = begin_band(); !begun)
+                    return begun.get_error();
+            }
+            const std::size_t free_bytes =
+                staging_offset_ < staging_capacity_ ? staging_capacity_ - staging_offset_ : 0;
+            const int rows = static_cast<int>(
+                std::min<std::size_t>(free_bytes / row_bytes, static_cast<std::size_t>(r.y + r.height - y)));
+            if (rows == 0 || count == k_band_copies) {
+                if (auto ended = end_band(true); !ended)
+                    return ended.get_error();
+                continue;
+            }
+            unsigned char* dst = staging_mapped_ + staging_offset_;
+            if (row_bytes == src_stride) {
+                std::memcpy(dst, src, row_bytes * static_cast<std::size_t>(rows));
+            } else {
+                for (int i = 0; i < rows; ++i)
+                    std::memcpy(dst + row_bytes * static_cast<std::size_t>(i),
+                                src + src_stride * static_cast<std::size_t>(i), row_bytes);
+            }
+            VkBufferImageCopy& c = copies[count++];
+            c = {};
+            c.bufferOffset = staging_offset_;
+            c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            c.imageSubresource.layerCount = 1;
+            c.imageOffset = {r.x, y, 0};
+            c.imageExtent = {static_cast<uint32_t>(r.width), static_cast<uint32_t>(rows), 1};
+            staging_offset_ = static_cast<unsigned>(
+                (staging_offset_ + row_bytes * static_cast<std::size_t>(rows) + 255u) & ~std::size_t{255});
+            src += src_stride * static_cast<std::size_t>(rows);
+            y += rows;
         }
-        if (pending > 0 &&
-            vkWaitForFences(dev, pending, all, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
-            return vk_error("vkWaitForFences timed out rewinding staging ring");
-        staging_offset_ = 0;
     }
-
-    const VkDeviceSize ring_offset = static_cast<VkDeviceSize>(staging_offset_);
-    std::memcpy(staging_mapped_ + staging_offset_, rgba, static_cast<std::size_t>(bytes));
-    staging_offset_ = static_cast<unsigned>((staging_offset_ + bytes + 255u) & ~255u);
-
-    const unsigned frame_slot = submit_slot_;
-    auto cb = static_cast<VkCommandBuffer>(command_buffers_[frame_slot]);
-    auto fence = static_cast<VkFence>(fences_[frame_slot]);
-    // Fences start signaled, so the first use of each slot does not block.
-    if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
-        return vk_error("vkWaitForFences timed out reclaiming upload slot");
-    vkResetFences(dev, 1, &fence);
-    vkResetCommandBuffer(cb, 0);
-
-    VkCommandBufferBeginInfo begin{};
-    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cb, &begin);
-
-    image_barrier(cb, static_cast<VkImage>(slot.image), VK_IMAGE_LAYOUT_UNDEFINED,
-                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE, VK_ACCESS_2_NONE,
-                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-
-    VkBufferImageCopy copy{};
-    copy.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    copy.imageSubresource.layerCount = 1;
-    copy.imageExtent = {width, height, 1};
-    copy.bufferOffset = ring_offset;
-    vkCmdCopyBufferToImage(cb, static_cast<VkBuffer>(staging_buffer_),
-                           static_cast<VkImage>(slot.image),
-                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
-
-    image_barrier(cb, static_cast<VkImage>(slot.image), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
-                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-
-    vkEndCommandBuffer(cb);
-
-    if (auto submitted = submit_current_slot(false); !submitted)
-        return submitted.get_error();
+    if (cb) {
+        if (auto ended = end_band(false); !ended)
+            return ended.get_error();
+    }
 
     slot.layout_ready = true;
     return {};
@@ -1874,6 +1947,8 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
     (void)width;
     (void)height;
     (void)rgba;
+    (void)region;
+    (void)rects;
     return lx::not_implemented("lx::gfx::vulkan_compositor::upload_rgba");
 #endif
 }

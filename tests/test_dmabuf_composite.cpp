@@ -281,6 +281,73 @@ LUMEN_TEST(shm_upload_host_copy_matches_staging) {
     LUMEN_CHECK(px[0] != 0u || px[1] != 0u || px[2] != 0u);
 }
 
+// An image larger than the 16 MiB staging ring (a 3200x1800 background was refused: "upload
+// exceeds staging ring capacity") goes in bands; a partial update copies only its rects and
+// keeps the rest. Both composite to what one whole upload of the expected image does, on the
+// staging path and the host-copy path alike.
+LUMEN_TEST(shm_upload_oversized_and_partial_regions) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    constexpr unsigned w = 2400, h = 1800; // 17.3 MB of RGBA
+    std::vector<unsigned char> base(std::size_t{w} * h * 4u);
+    for (std::size_t i = 0; i < std::size_t{w} * h; ++i) {
+        base[i * 4u + 0] = static_cast<unsigned char>(i % w);
+        base[i * 4u + 1] = static_cast<unsigned char>(i / w);
+        base[i * 4u + 2] = static_cast<unsigned char>((i % w) ^ (i / w));
+        base[i * 4u + 3] = 255u;
+    }
+    // A damaged region with two rects in it; the region's pixels between them are stale on
+    // purpose (zero), so a copy outside the rects would show.
+    const lx::rect2i region{100, 1500, 900, 200};
+    const lx::rect2i rects[2] = {{100, 1500, 300, 40}, {700, 1650, 300, 50}};
+    std::vector<unsigned char> packed(std::size_t{900} * 200 * 4u, 0u);
+    std::vector<unsigned char> expected = base;
+    for (const lx::rect2i& r : rects) {
+        for (int y = r.y; y < r.y + r.height; ++y) {
+            for (int x = r.x; x < r.x + r.width; ++x) {
+                const unsigned char px[4] = {static_cast<unsigned char>(255 - x % 256), 0x40,
+                                             static_cast<unsigned char>(y % 256), 255};
+                std::memcpy(packed.data() + (std::size_t(y - region.y) * 900 + (x - region.x)) * 4u,
+                            px, 4);
+                std::memcpy(expected.data() + (std::size_t(y) * w + x) * 4u, px, 4);
+            }
+        }
+    }
+    const auto run = [&](lx::gfx::vk_context ctx, bool partial, std::vector<unsigned char>& out) {
+        lx::gfx::vulkan_compositor comp;
+        if (!comp.initialize(ctx))
+            return false;
+        auto target = lx::gfx::render_target::create(ctx, w, h);
+        if (!target)
+            return false;
+        constexpr unsigned id = 0x4000'0003u;
+        lx::gfx::blit_command cmd{};
+        cmd.texture_id = id;
+        cmd.dst = {0, 0, static_cast<int>(w), static_cast<int>(h)};
+        cmd.opacity = 1.f;
+        cmd.blend = lx::blend_mode::opaque;
+        bool ok = partial ? comp.upload_rgba(id, w, h, base.data()).has_value() &&
+                                comp.upload_rgba(id, w, h, packed.data(), region, rects).has_value()
+                          : comp.upload_rgba(id, w, h, expected.data()).has_value();
+        ok = ok && composite_owned(comp, *target, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1);
+        out.assign(std::size_t{w} * h * 4u, 0u);
+        ok = ok && comp.read_back(*target, out.data(), static_cast<unsigned>(out.size()));
+        comp.shutdown();
+        return ok;
+    };
+    lx::gfx::vk_context staged = gpu.device.context();
+    staged.supports_host_image_copy = false;
+    std::vector<unsigned char> reference;
+    std::vector<unsigned char> banded;
+    LUMEN_CHECK(run(staged, false, reference));
+    LUMEN_CHECK(run(staged, true, banded));
+    LUMEN_CHECK(reference == banded);
+    std::vector<unsigned char> host;
+    LUMEN_CHECK(run(gpu.device.context(), true, host));
+    LUMEN_CHECK(reference == host);
+}
+
 // The one that matters: a real dma-buf, imported through the real importer.
 LUMEN_TEST(dmabuf_import_reaches_composited_output) {
 #if defined(LUMEN_HAS_DRM)
