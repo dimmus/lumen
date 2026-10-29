@@ -211,11 +211,21 @@ lx::result<void> lx::compositor::buffer_lifecycle_tracker::on_import(
     lx::client_id client, lx::surface_id surface, lx::buffer_id buffer,
     const gfx::import_cache_key& key, void* wl_buffer) {
     // Whatever else the surface showed is superseded by this buffer (a ghost's hold aside).
+    // One that no submitted frame was tagged with (imported or attached, not in flight) was
+    // never sampled — no snapshot names it — so it goes back to the client now, as wlroots,
+    // KWin and Mutter release a buffer replaced before it was latched. Waiting for the next
+    // frame to complete instead held every buffer a fast client committed between two
+    // refreshes for a whole refresh: vkmark's immediate mode stalled at ~1.5 frames per
+    // composite (90 FPS at 60 Hz on an HD 5500).
     for (unsigned i = 0; i < count_; ++i)
         if (records_[i].surface == surface && records_[i].buffer != buffer) {
             if (!records_[i].held)
                 records_[i].current = false;
             records_[i].detached = false;
+            const auto st = records_[i].state;
+            if (!records_[i].held && (st == buffer_lifecycle_state::imported ||
+                                      st == buffer_lifecycle_state::attached))
+                release_record(i);
         }
     // Re-committing the same buffer refreshes the existing record. A *different* buffer
     // gets its own record: the previously attached one may still be in flight, and

@@ -5661,25 +5661,36 @@ void compositor_impl::on_output_flip(output_pipeline& p, const scheduler::presen
     // from the kernel's flip timestamp when it is on our clock and plausibly recent;
     // otherwise from `now`, which is within the 1 ms loop pump of the flip because flips
     // are drained there.
-    if (vsync_timer) {
-        const auto now = now_ns();
-        scheduler::repaint_scheduler& clock = clocks_.clock(slot);
-        clock.observe_repaint(budget_.last_tick_ui_us(),
-                              p.render_cost_us.load(std::memory_order_relaxed));
-        auto flip_ns = now;
-        if (fb.hw_clock && fb.actual_present_ns > 0 && fb.actual_present_ns <= now &&
-            now - fb.actual_present_ns < clock.refresh_period())
-            flip_ns = fb.actual_present_ns;
-        clocks_.on_present(slot, flip_ns, now);
-        rearm_frame_timer();
-    }
-
     // Taken on every flip, sampled or not, so the dup'd fence is always closed.
     const unsigned long long submit_us = p.committed_submit_us.exchange(0, std::memory_order_acq_rel);
     unsigned long long fence_us = 0;
     if (const int fd = p.committed_fence_fd.exchange(-1, std::memory_order_acq_rel); fd >= 0) {
         fence_us = sync_file_signal_us(fd);
         ::close(fd);
+    }
+
+    if (vsync_timer) {
+        const auto now = now_ns();
+        scheduler::repaint_scheduler& clock = clocks_.clock(slot);
+        // The repaint's cost is what the frame needs before the flip: the UI and render
+        // threads' CPU time plus what the GPU did after the submit (its composite, and any
+        // wait on a client's fence), read from the composite fence's signal time. CPU time
+        // alone aimed a 0.35 ms repaint 1.35 ms before the vblank, and on an HD 5500 the
+        // GPU's share then made two FIFO frames in three a refresh late (Mutter's and KWin's
+        // frame clocks add the GPU time too). A tail longer than a period is not a repaint
+        // cost but a stall, and is left out.
+        unsigned gpu_tail_us = 0;
+        const auto period_us = static_cast<unsigned long long>(clock.refresh_period() / 1000);
+        if (submit_us > 0 && fence_us > submit_us && fence_us - submit_us < period_us)
+            gpu_tail_us = static_cast<unsigned>(fence_us - submit_us);
+        clock.observe_repaint(budget_.last_tick_ui_us(),
+                              p.render_cost_us.load(std::memory_order_relaxed) + gpu_tail_us);
+        auto flip_ns = now;
+        if (fb.hw_clock && fb.actual_present_ns > 0 && fb.actual_present_ns <= now &&
+            now - fb.actual_present_ns < clock.refresh_period())
+            flip_ns = fb.actual_present_ns;
+        clocks_.on_present(slot, flip_ns, now);
+        rearm_frame_timer();
     }
     lx::trace::timeline_instant("kms", "flip");
     if (fb.hw_clock)
