@@ -1209,6 +1209,20 @@ struct compositor_impl {
     void finish_input();
     std::thread input_open_thread_{};
     std::optional<lx::result<lx::input::input_manager>> input_opened_{};
+    /// Where opening the seat spent its time, logged once by `finish_input`: the keymap
+    /// compile, libinput's seat assignment, and the device opens inside it (logind
+    /// TakeDevice or the direct open), the slowest named. Written by the opening thread
+    /// before the join and by the UI thread after it (hotplug, resume), never both at once.
+    struct input_open_timing {
+        double keymap_ms = 0;
+        double libinput_ms = 0;
+        double devices_ms = 0;
+        unsigned devices = 0;
+        double slowest_ms = 0;
+        char slowest[64]{};
+    } input_timing_{};
+    /// One device open slower than this is named in a warning, whenever it happens.
+    static constexpr double k_slow_device_open_ms = 250.0;
     /// Render affinity. A draw whose texture was never registered means the commit path and
     /// the render path disagree, and the screen stays black. Reporting only that it
     /// happened is not actionable — this reports the ids involved, once, because it
@@ -2358,12 +2372,37 @@ void compositor_impl::begin_input() {
     provider.user = this;
     provider.open_device = [](const char* path, int flags, void* user) -> int {
         auto* self = static_cast<compositor_impl*>(user);
+        const auto t0 = std::chrono::steady_clock::now();
+        int fd = -1;
+        bool via_logind = false;
         if (self) {
-            if (auto taken = self->logind_.take_device_path(path); taken)
-                return std::move(taken).value().release();
+            if (auto taken = self->logind_.take_device_path(path); taken) {
+                fd = std::move(taken).value().release();
+                via_logind = true;
+            }
         }
-        const int fd = ::open(path, flags | O_CLOEXEC);
-        return fd < 0 ? -errno : fd;
+        if (fd < 0) {
+            fd = ::open(path, flags | O_CLOEXEC);
+            if (fd < 0)
+                fd = -errno;
+        }
+        if (self) {
+            const double ms =
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0)
+                    .count();
+            input_open_timing& t = self->input_timing_;
+            t.devices_ms += ms;
+            ++t.devices;
+            if (ms > t.slowest_ms) {
+                t.slowest_ms = ms;
+                std::snprintf(t.slowest, sizeof t.slowest, "%s", path ? path : "?");
+            }
+            // A device that stalls the seat (start-up waits for it) is named every time.
+            if (ms > k_slow_device_open_ms)
+                log_input.warn("opening {} took {:.0f} ms ({})", path ? path : "?", ms,
+                               via_logind ? "logind TakeDevice" : "direct open after TakeDevice failed");
+        }
+        return fd;
     };
     // Every device libinput closes — at suspend, on unplug, at exit — goes back to logind:
     // without ReleaseDevice the TakeDevice of a resume fails with "Device already taken".
@@ -2380,6 +2419,7 @@ void compositor_impl::begin_input() {
     const bool configured = keymap.layout || keymap.variant || keymap.options || keymap.model ||
                             keymap.rules;
     input_open_thread_ = std::thread([this, provider, keymap, num_lock, configured] {
+        const auto t0 = std::chrono::steady_clock::now();
         // Compile a keymap regardless of whether devices open. Clients are told the layout
         // at bind time, and a compositor that never found a keyboard still has to answer it.
         lx::input::keyboard_keymap km;
@@ -2401,8 +2441,15 @@ void compositor_impl::begin_input() {
         }
         if (num_lock)
             (void)km.set_num_lock(true);
+        const auto t1 = std::chrono::steady_clock::now();
+        lx::trace::timeline_instant("startup", "input keymap compiled");
         input_opened_.emplace(
             lx::input::input_manager::open(provider, "seat0", keymap, num_lock, &km));
+        lx::trace::timeline_instant("startup", "input seat assigned");
+        input_timing_.keymap_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        input_timing_.libinput_ms =
+            std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1)
+                .count();
         // Not taken (no seat): the keymap the device-less compositor still answers with.
         if (km.valid())
             input_devices_.default_seat().keymap() = std::move(km);
@@ -2416,6 +2463,13 @@ void compositor_impl::finish_input() {
         return;
     auto opened = std::move(*input_opened_);
     input_opened_.reset();
+    {
+        const input_open_timing& t = input_timing_;
+        log_input.info("seat open took {:.0f} ms: keymap {:.0f} ms, libinput {:.0f} ms of which "
+                       "{} device opens {:.0f} ms (slowest {} {:.0f} ms)",
+                       t.keymap_ms + t.libinput_ms, t.keymap_ms, t.libinput_ms, t.devices,
+                       t.devices_ms, t.slowest[0] ? t.slowest : "-", t.slowest_ms);
+    }
     if (!opened) {
         // Not fatal. A compositor with no seat still composites — it is useful headless and
         // in CI — but say so plainly, because "nothing happens when I type" is otherwise a
