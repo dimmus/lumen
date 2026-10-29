@@ -787,7 +787,7 @@ numbers, so `scripts/ui-bench.sh` still warns while the gate fails in both.
 - Title bars switch to atlas glyphs. `lx.shell`'s `shm_canvas::text` is left until Phase 5.
 - Gate: G4 (S4) on GL; `test_text_raster` and `test_text_shaping` extended, not replaced.
 
-As built (S4 and G4; `lumen-ui-bench --scenario S4`, tests/bench/baseline/iritur-none.json):
+As built (S4 and G4; `lumen-ui-bench --scenario S4`, tests/bench/baseline/iritur-168b7c-none.json):
 S4 is one `text_block_node` holding 2 000 seeded lines of 50 glyphs (Latin / Cyrillic / Arabic
 words, IBM Plex Sans 14 px, line height φ, Arabic from the host's DejaVu Sans fallback; 139 375
 B, 99 771 glyphs, 7.9 MB of layout) under a scroll node that moves its origin 3 px a frame at
@@ -1073,7 +1073,7 @@ frame — and damages **1 rect of 1 357 px, 0.065 % of the surface**. Between cl
 root produces nothing. With `emit_scope::damage` (§4.9) a clock frame walks 7 nodes and emits
 10 primitives in 2 batches. Measured (`lumen-ui-bench --scenario S2 --frames 36000`, 600 clock
 frames per run at the bench's 1 ms frame clock, `setarch -R`, pinned to CPU 1; load 0.04–0.45;
-`tests/bench/baseline/iritur-none.json`, rebaselined at load 0.31, holds one of them):
+`tests/bench/baseline/iritur-168b7c-none.json`, rebaselined at load 0.31, holds one of them):
 
 | G2 sum (update + tick + order + encode) | p50 | p95 | Stages, p50 |
 |---|---|---|---|
@@ -1451,8 +1451,8 @@ still untested. Its virtual output's flips carry no hw_clock, so it writes no
 `compositor.latency: present` lines: G6's compositor split exists only on KMS.
 
 Gates (load 0.1–0.3, client pinned to CPU 1, compositor to CPU 0; p50 / p95;
-`tests/bench/baseline/iritur-client-cpu.json`, `tests/bench/baseline/iritur-client-gl.json`,
-Vulkan from `tests/bench/results/iritur-client-vulkan/20261027-49e3406-dirty.json`, not a
+`tests/bench/baseline/iritur-168b7c-client-cpu.json`, `tests/bench/baseline/iritur-168b7c-client-gl.json`,
+Vulkan from `tests/bench/results/iritur-168b7c-client-vulkan/20261027-49e3406-dirty.json`, not a
 baseline):
 
 | Gate | Scenario | cpu | gl (SVGA3D) | vulkan (lavapipe, software) |
@@ -1473,7 +1473,7 @@ way (max 2.2–8.8× its median), so the bench reports "jitter", which `ui-bench
 cold start is CPU-bound (task-clock 112 ms of 128 ms): EGL on GBM 25–33 ms, the frame's two program
 compiles ≈ 60 ms at the first draw (Mesa keeps no shader cache for SVGA3D either), fontconfig's
 cold answers ≈ 25 ms. The headless S1–S4 rows were rerun at load 0.2 and not rebaselined: their p95s
-differ from `iritur-none.json` in both directions while an interleaved A/B against stage 3's binary
+differ from `iritur-168b7c-none.json` in both directions while an interleaved A/B against stage 3's binary
 gives the same p50 (S2 tick 91–95 µs, S3 emit 307–320 µs) and p95s that swing 480–550 µs in both.
 
 Stage 2 left open whether small-damage UI should prefer the CPU tier on hosts like this one. The
@@ -1721,7 +1721,7 @@ asserts the `text.contrast` correction keeps the mean stem coverage within 3 %.
   Phase 3, read 69.7 µs in Phase 3's baseline and 79–83 µs in both binaries on 2026-10-28.
   So the stored gate catches regressions of about a quarter and up; a change is vetted
   finer by an interleaved A/B against its base binary, and the baseline is refreshed when
-  such an A/B shows the host, not the code, moved — as `iritur-none.json` was that day.
+  such an A/B shows the host, not the code, moved — as `iritur-168b7c-none.json` was that day.
 - CTest: label `bench`; the default test presets exclude it; `ctest --preset bench` runs
   the headless rows in under two minutes (a `-L bench` on top of another preset still
   meets that preset's exclude).
