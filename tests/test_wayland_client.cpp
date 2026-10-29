@@ -6,7 +6,10 @@
 // presence, fractional scale, text-input-v3 against an input method on a second connection,
 // the keymap and xkb state, pointer frames from the compositor's virtual input, the
 // lx::runtime::event_loop source (no wakeups while idle), disconnect, and the allocation
-// count of a steady frame-callback loop.
+// count of a steady frame-callback loop; wlr-layer-shell (a panel's configure and exclusive
+// zone, set_layer, on_demand keyboard focus, a grabbing popup on a layer parent, `closed`
+// when its output is unplugged) and a subsurface composited above, then below, its parent
+// (read back with wlr-screencopy).
 //
 // Allocation counting: operator new and (outside sanitizer builds) malloc are counted on the
 // client thread only, while the test is inside client calls — the compositor runs in the
@@ -28,7 +31,12 @@
 #include <wayland-client.h>
 #include "input-method-unstable-v2-client-protocol.h"
 #define LUMEN_TEST_WLC 1
+#if defined(LUMEN_PROTOCOL_WLR_SCREENCOPY_UNSTABLE_V1)
+#include "wlr-screencopy-unstable-v1-client-protocol.h"
+#define LUMEN_TEST_SCREENCOPY 1
 #endif
+#endif
+#include <sys/mman.h>
 #include <stdint.h>
 
 #include "scan_builder.hpp"
@@ -364,6 +372,175 @@ bool make_shm(lx::wayland::shm_pool& pool, lx::wayland::buffer& b, std::size_t o
         px[i] = argb;
     return b.create_shm(pool, offset, size, size.width * 4, 0).ok();
 }
+
+struct layer_log final : lx::wayland::layer_handler {
+    unsigned configures = 0;
+    unsigned closes = 0;
+    lx::wayland::layer_configure last{};
+    void on_configure(lx::wayland::layer_surface&, const lx::wayland::layer_configure& c) override {
+        ++configures;
+        last = c;
+    }
+    void on_closed(lx::wayland::layer_surface&) override { ++closes; }
+};
+
+struct popup_events final : lx::wayland::popup_handler {
+    unsigned configures = 0;
+    unsigned dones = 0;
+    lx::wayland::popup_configure last{};
+    void on_configure(lx::wayland::popup&, const lx::wayland::popup_configure& c) override {
+        ++configures;
+        last = c;
+    }
+    void on_done(lx::wayland::popup&) override { ++dones; }
+};
+
+/// The serial of the last button press on `target` the seat delivered, 0 if none.
+std::uint32_t press_serial(const input_log& in, const lx::wayland::surface* target) {
+    std::uint32_t serial = 0;
+    for (const auto& f : in.frames)
+        if ((f.mask & lx::wayland::pointer_frame::has_button) && f.pressed && f.target == target)
+            serial = f.serial;
+    return serial;
+}
+
+/// One click (move, press, release) at a global logical point.
+void click_at(double x, double y) {
+    inject_move(x, y);
+    inject_left(true);
+    inject_left(false);
+}
+
+#if defined(LUMEN_TEST_SCREENCOPY)
+// ── output read-back: a raw libwayland client on wlr-screencopy (the composite on the CPU) ──
+
+struct screen_reader {
+    wl_display* display = nullptr;
+    wl_registry* registry = nullptr;
+    wl_shm* shm = nullptr;
+    wl_output* output = nullptr;
+    zwlr_screencopy_manager_v1* manager = nullptr;
+};
+
+struct screen_frame {
+    std::uint32_t format = ~0u;
+    int width = 0;
+    int height = 0;
+    int stride = 0;
+    bool buffer_done = false;
+    bool ready = false;
+    bool failed = false;
+};
+
+const zwlr_screencopy_frame_v1_listener k_screen_frame_listener = {
+    .buffer =
+        [](void* d, zwlr_screencopy_frame_v1*, uint32_t format, uint32_t w, uint32_t h,
+           uint32_t stride) {
+            auto* f = static_cast<screen_frame*>(d);
+            f->format = format;
+            f->width = static_cast<int>(w);
+            f->height = static_cast<int>(h);
+            f->stride = static_cast<int>(stride);
+        },
+    .flags = [](void*, zwlr_screencopy_frame_v1*, uint32_t) {},
+    .ready = [](void* d, zwlr_screencopy_frame_v1*, uint32_t, uint32_t,
+                uint32_t) { static_cast<screen_frame*>(d)->ready = true; },
+    .failed = [](void* d, zwlr_screencopy_frame_v1*) { static_cast<screen_frame*>(d)->failed = true; },
+    .damage = [](void*, zwlr_screencopy_frame_v1*, uint32_t, uint32_t, uint32_t, uint32_t) {},
+    .linux_dmabuf = [](void*, zwlr_screencopy_frame_v1*, uint32_t, uint32_t, uint32_t) {},
+    .buffer_done = [](void* d, zwlr_screencopy_frame_v1*) {
+        static_cast<screen_frame*>(d)->buffer_done = true;
+    },
+};
+
+bool screen_connect(screen_reader& r) {
+    r.display = wl_display_connect(k_socket);
+    if (!r.display)
+        return false;
+    static const wl_registry_listener rl = {
+        [](void* data, wl_registry* reg, uint32_t name, const char* iface, uint32_t) {
+            auto* r = static_cast<screen_reader*>(data);
+            if (std::strcmp(iface, wl_shm_interface.name) == 0 && !r->shm)
+                r->shm = static_cast<wl_shm*>(wl_registry_bind(reg, name, &wl_shm_interface, 1));
+            else if (std::strcmp(iface, wl_output_interface.name) == 0 && !r->output)
+                r->output = static_cast<wl_output*>(wl_registry_bind(reg, name, &wl_output_interface, 1));
+            else if (std::strcmp(iface, zwlr_screencopy_manager_v1_interface.name) == 0)
+                r->manager = static_cast<zwlr_screencopy_manager_v1*>(
+                    wl_registry_bind(reg, name, &zwlr_screencopy_manager_v1_interface, 3));
+        },
+        [](void*, wl_registry*, uint32_t) {}};
+    r.registry = wl_display_get_registry(r.display);
+    wl_registry_add_listener(r.registry, &rl, &r);
+    return wl_display_roundtrip(r.display) >= 0 && r.shm && r.output && r.manager;
+}
+
+void screen_disconnect(screen_reader& r) {
+    if (r.manager)
+        zwlr_screencopy_manager_v1_destroy(r.manager);
+    if (r.output)
+        wl_output_destroy(r.output);
+    if (r.shm)
+        wl_shm_destroy(r.shm);
+    if (r.registry)
+        wl_registry_destroy(r.registry);
+    if (r.display)
+        wl_display_disconnect(r.display);
+    r = {};
+}
+
+/// The first output composited now, as 0x00RRGGBB per physical pixel; empty on failure.
+std::vector<std::uint32_t> screen_read(screen_reader& r, int& width, int& height) {
+    std::vector<std::uint32_t> out;
+    screen_frame f{};
+    zwlr_screencopy_frame_v1* frame = zwlr_screencopy_manager_v1_capture_output(r.manager, 0, r.output);
+    zwlr_screencopy_frame_v1_add_listener(frame, &k_screen_frame_listener, &f);
+    (void)wl_display_roundtrip(r.display);
+    const std::size_t bytes = std::size_t(f.stride) * std::size_t(f.height);
+    const int fd = bytes ? ::memfd_create("lumen-test-screen", MFD_CLOEXEC) : -1;
+    void* map = MAP_FAILED;
+    if (fd >= 0 && ::ftruncate(fd, static_cast<off_t>(bytes)) == 0)
+        map = ::mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map != MAP_FAILED && f.format == WL_SHM_FORMAT_XRGB8888) {
+        wl_shm_pool* pool = wl_shm_create_pool(r.shm, fd, static_cast<int32_t>(bytes));
+        wl_buffer* b = wl_shm_pool_create_buffer(pool, 0, f.width, f.height, f.stride, f.format);
+        zwlr_screencopy_frame_v1_copy(frame, b);
+        for (int i = 0; i < 50 && !f.ready && !f.failed; ++i) {
+            (void)wl_display_roundtrip(r.display);
+            tick();
+            (void)wl_display_roundtrip(r.display);
+        }
+        if (f.ready) {
+            width = f.width;
+            height = f.height;
+            out.resize(std::size_t(f.width) * std::size_t(f.height));
+            for (int y = 0; y < f.height; ++y)
+                std::memcpy(out.data() + std::size_t(y) * std::size_t(f.width),
+                            static_cast<const std::byte*>(map) + std::size_t(y) * std::size_t(f.stride),
+                            std::size_t(f.width) * 4);
+        }
+        wl_buffer_destroy(b);
+        wl_shm_pool_destroy(pool);
+    }
+    zwlr_screencopy_frame_v1_destroy(frame);
+    (void)wl_display_roundtrip(r.display);
+    if (map != MAP_FAILED)
+        ::munmap(map, bytes);
+    if (fd >= 0)
+        ::close(fd);
+    return out;
+}
+
+/// Whether two 0x00RRGGBB colours are within `tol` per channel.
+bool near_rgb(std::uint32_t a, std::uint32_t b, int tol = 2) {
+    for (int sh = 0; sh <= 16; sh += 8) {
+        const int ca = static_cast<int>((a >> sh) & 0xFFu);
+        const int cb = static_cast<int>((b >> sh) & 0xFFu);
+        if (ca - cb > tol || cb - ca > tol)
+            return false;
+    }
+    return true;
+}
+#endif // LUMEN_TEST_SCREENCOPY
 
 // ── the input method: a raw libwayland client, as fcitx5 would be ──
 
@@ -871,6 +1048,292 @@ void run_cases() {
         (void)d.roundtrip();
     }
 
+    // ── a subsurface: composited above its parent, then below it ──
+    {
+        lx::wayland::surface cs;
+        lx::wayland::subsurface sub;
+        lx::wayland::shm_pool cpool;
+        lx::wayland::buffer cb;
+        constexpr std::uint32_t k_green = 0xFF00C000u;
+        bool made = cs.create(d).ok() && sub.create(d, cs, s).ok() &&
+                    cpool.create(d, 40 * 40 * 4).ok() && make_shm(cpool, cb, 0, {40, 40}, k_green);
+        lx::wayland::subsurface bad;
+        const auto self = bad.create(d, s, s);
+        sub.set_position({10, 10});
+        cs.attach(&cb);
+        cs.damage_buffer({0, 0, 40, 40});
+        cs.commit();  // synchronized: cached until the parent's commit
+        s.commit();   // applies the child's state and its position
+        made = made && d.roundtrip().ok();
+        tick();
+        made = made && d.roundtrip().ok() && !d.failed();
+        const auto g = record(app_id).geometry;
+#if defined(LUMEN_TEST_SCREENCOPY)
+        screen_reader reader{};
+        const bool reading = screen_connect(reader);
+        int sw = 0, sh = 0;
+        // Logical → the 1.25-scale output's pixels, inside each area (no edge pixels).
+        const auto at = [&](const std::vector<std::uint32_t>& px, int lx_, int ly_) -> std::uint32_t {
+            const int x = static_cast<int>((g.x + lx_) * 1.25);
+            const int y = static_cast<int>((g.y + ly_) * 1.25);
+            return x >= 0 && y >= 0 && x < sw && y < sh ? px[std::size_t(y) * std::size_t(sw) + std::size_t(x)]
+                                                        : 0xDEADu;
+        };
+        const auto above = reading ? screen_read(reader, sw, sh) : std::vector<std::uint32_t>{};
+        const bool ok_above = !above.empty() && near_rgb(at(above, 30, 30), 0x00C000u) &&
+                              near_rgb(at(above, 5, 5), 0x996633u) &&
+                              near_rgb(at(above, 70, 70), 0x996633u);
+        check("subsurface: set_position(10, 10) composites the child above its parent",
+              made && ok_above && sub.synchronized() && !self,
+              std::format("{}x{} read, child centre {:#08x}, parent {:#08x} / {:#08x}; child == "
+                          "parent refused {}",
+                          sw, sh, above.empty() ? 0u : at(above, 30, 30),
+                          above.empty() ? 0u : at(above, 5, 5), above.empty() ? 0u : at(above, 70, 70),
+                          !self));
+        sub.place_below(s);
+        s.commit();
+        (void)d.roundtrip();
+        tick();
+        (void)d.roundtrip();
+        const auto below = reading ? screen_read(reader, sw, sh) : std::vector<std::uint32_t>{};
+        check("subsurface: place_below(parent) hides it under the opaque parent",
+              !below.empty() && near_rgb(at(below, 30, 30), 0x996633u) && !d.failed(),
+              std::format("child centre now {:#08x}", below.empty() ? 0u : at(below, 30, 30)));
+        if (reading)
+            screen_disconnect(reader);
+        else
+            skip("subsurface: composite read-back", "no wlr-screencopy on the compositor");
+#else
+        check("subsurface: created, positioned, committed through the parent",
+              made && sub.synchronized() && !self, "no wlr-screencopy glue: not read back");
+#endif
+        sub.destroy();
+        s.commit();
+        cs.destroy();
+        cb.destroy();
+        cpool.destroy();
+        (void)d.roundtrip();
+        tick();
+    }
+
+    // ── wlr-layer-shell: a panel, its zone, set_layer, on_demand focus, a popup on it ──
+    if (!d.has(gk::layer_shell)) {
+        skip("layer: every case", "no zwlr_layer_shell_v1 (or its glue was not built)");
+    } else {
+        const lx::wayland::output* o0 = d.output_at(0);
+        const lx::rect2i out0 = o0 ? o0->info().logical : lx::rect2i{};
+        // Another client's window: where a click outside the popup's client lands (a press
+        // on the popup client's own surfaces does not end its grab — xdg_popup.grab).
+        const char* other_id = "lumen.test.wlclient.other";
+        lx::wayland::display d2;
+        window_log w2{};
+        lx::wayland::surface s2;
+        lx::wayland::toplevel t2;
+        lx::wayland::shm_pool pool2;
+        lx::wayland::buffer b2;
+        bool other = d2.connect({.name = k_socket, .track_outputs = false,
+                                 .default_dmabuf_feedback = false})
+                         .ok() &&
+                     s2.create(d2).ok() && t2.create(d2, s2, {.app_id = other_id}).ok();
+        t2.set_handler(&w2);
+        s2.commit();
+        other = other && pump(d2, [&] { return w2.configures >= 1; });
+        t2.ack_configure(w2.last.serial);
+        other = other && pool2.create(d2, 64 * 64 * 4).ok() &&
+                make_shm(pool2, b2, 0, {64, 64}, 0xFF206040u);
+        s2.attach(&b2);
+        s2.damage_buffer({0, 0, 64, 64});
+        s2.commit();
+        other = other && d2.roundtrip().ok();
+        tick();
+        other = other && d2.roundtrip().ok();
+        const auto og = record(other_id).geometry;
+
+        // Bound on demand: advertised, not bound until the first layer surface.
+        const bool lazy = d.global(gk::layer_shell).on_demand &&
+                          d.global(gk::layer_shell).bound == 0 &&
+                          d.native_global(gk::layer_shell) == nullptr;
+        layer_log pl{};
+        lx::wayland::surface ps;
+        lx::wayland::layer_surface panel;
+        lx::wayland::shm_pool lpool;
+        lx::wayland::buffer pbuf, obuf, mbuf;
+        // The panel (out0.width × 32), the overlapping surface (200 × 100), the menu (120 × 80).
+        const std::size_t panel_bytes = std::size_t(out0.width) * 32 * 4;
+        bool made = lpool.create(d, panel_bytes + 200 * 100 * 4 + 120 * 80 * 4).ok() &&
+                    ps.create(d).ok() &&
+                    panel.create(d, ps, {.output_slot = 0, .level = lx::wayland::layer::top,
+                                         .name_space = "panel"})
+                        .ok();
+        panel.set_handler(&pl);
+        panel.set_size({0, 32});
+        panel.set_anchor(lx::wayland::anchor_top | lx::wayland::anchor_left |
+                         lx::wayland::anchor_right);
+        panel.set_exclusive_zone(32);
+        const bool demand = panel.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::on_demand);
+        const bool edge = panel.set_exclusive_edge(lx::wayland::anchor_top);
+        ps.commit(); // the initial commit: no buffer
+        made = made && pump(d, [&] { return pl.configures >= 1; });
+        check("layer: zwlr_layer_shell_v1 bound (v5) by the first layer surface, not at connect; "
+              "a top panel anchored top|left|right, 0×32, zone 32 is configured to the output's "
+              "width × 32",
+              made && lazy && d.global(gk::layer_shell).bound == 5 &&
+                  d.native_global(gk::layer_shell) != nullptr && panel.version() == 5 && demand && edge &&
+                  pl.last.initial && pl.last.size.width == out0.width && pl.last.size.height == 32 &&
+                  panel.configure_pending(),
+              std::format("unbound at connect {}, v{} configure {} {}x{} (output {}x{}) on_demand {} "
+                          "edge {}",
+                          lazy, d.global(gk::layer_shell).bound, pl.configures, pl.last.size.width,
+                          pl.last.size.height, out0.width, out0.height, demand, edge));
+        panel.ack_configure(pl.last.serial);
+        made = made && make_shm(lpool, pbuf, 0, pl.last.size, 0xFF202830u);
+        ps.attach(&pbuf);
+        ps.damage_buffer({0, 0, pl.last.size.width, pl.last.size.height});
+        ps.commit();
+        made = made && d.roundtrip().ok();
+        tick();
+        made = made && d.roundtrip().ok();
+        lx::rect2i usable{};
+        {
+            std::lock_guard<std::mutex> hold(*g_lock);
+            usable = g_comp->windows().usable_area(-1);
+        }
+        check("layer: mapped, the compositor's usable area starts below the zone (y = 32)",
+              made && !panel.configure_pending() && usable.y == out0.y + 32 &&
+                  usable.height == out0.height - 32 && usable.width == out0.width && !d.failed(),
+              std::format("usable {}x{}+{}+{}", usable.width, usable.height, usable.x, usable.y));
+
+        // A second top surface over the panel's left end, mapped later: it is on top until the
+        // panel moves to the overlay layer.
+        layer_log ol{};
+        lx::wayland::surface os;
+        lx::wayland::layer_surface over;
+        bool omade = os.create(d).ok() &&
+                     over.create(d, os, {.output_slot = 0, .level = lx::wayland::layer::top,
+                                         .name_space = "osd"})
+                         .ok();
+        over.set_handler(&ol);
+        over.set_size({200, 100});
+        over.set_anchor(lx::wayland::anchor_top | lx::wayland::anchor_left);
+        over.set_exclusive_zone(-1); // over the panel's zone, not below it
+        os.commit();
+        omade = omade && pump(d, [&] { return ol.configures >= 1; });
+        over.ack_configure(ol.last.serial);
+        omade = omade && make_shm(lpool, obuf, panel_bytes, {200, 100}, 0xFF805020u);
+        os.attach(&obuf);
+        os.damage_buffer({0, 0, 200, 100});
+        os.commit();
+        omade = omade && d.roundtrip().ok();
+        tick();
+        omade = omade && d.roundtrip().ok();
+        inject_move(out0.x + 50.0, out0.y + 10.0);
+        (void)d.roundtrip();
+        const bool over_first = seat->pointer_focus() == &os;
+        const bool moved = panel.set_layer(lx::wayland::layer::overlay);
+        ps.commit();
+        (void)d.roundtrip();
+        tick();
+        (void)d.roundtrip();
+        inject_move(out0.x + 52.0, out0.y + 12.0);
+        (void)d.roundtrip();
+        check("layer: set_layer top → overlay is honoured (the panel is now above a later top "
+              "surface under the pointer)",
+              omade && over_first && moved && seat->pointer_focus() == &ps && !d.failed(),
+              std::format("before: pointer on {}, after: on {}",
+                          over_first ? "the later top surface" : "other",
+                          seat->pointer_focus() == &ps   ? "the panel"
+                          : seat->pointer_focus() == &os ? "the later top surface"
+                                                         : "other"));
+
+        // on_demand: a click on a window (the other client's, which it raises) takes the
+        // keyboard, a click on the panel takes it back. It took it when it mapped (on the top
+        // and overlay layers, as in sway).
+        const bool panel_on_map = seat->keyboard_focus() == &ps;
+        click_at(og.x + og.width / 2.0, og.y + og.height / 2.0);
+        (void)d2.roundtrip();
+        (void)d.roundtrip();
+        const bool window_had = other && seat->keyboard_focus() == nullptr;
+        in.frames.clear();
+        click_at(out0.x + 400.0, out0.y + 16.0);
+        (void)d.roundtrip();
+        const std::uint32_t serial = press_serial(in, &ps);
+        check("layer: keyboard on_demand — focused on map, lost to a click on a window, a click "
+              "on the panel gives it back",
+              panel_on_map && window_had && seat->keyboard_focus() == &ps && serial != 0,
+              std::format("on map {}, window took it {}, now on {}, press serial {}", panel_on_map,
+                          window_had,
+                          seat->keyboard_focus() == &ps ? "the panel" : "other", serial));
+
+        // A menu on the panel: xdg_popup with a null parent, adopted by the layer surface,
+        // grabbing with the press serial; a click outside dismisses it.
+        popup_events mp{};
+        lx::wayland::surface ms;
+        lx::wayland::popup menu;
+        lx::wayland::positioner_desc where{};
+        where.size = {120, 80};
+        where.anchor_rect = {400, 0, 10, 32};
+        where.anchor = 6;  // bottom_left
+        where.gravity = 8; // bottom_right
+        bool mmade = ms.create(d).ok() && menu.create(d, ms, panel, where).ok();
+        menu.set_handler(&mp);
+        menu.grab(*seat, serial);
+        ms.commit();
+        mmade = mmade && pump(d, [&] { return mp.configures >= 1; });
+        menu.ack_configure(mp.last.serial);
+        mmade = mmade && make_shm(lpool, mbuf, panel_bytes + 200 * 100 * 4, {120, 80}, 0xFF303030u);
+        ms.attach(&mbuf);
+        ms.damage_buffer({0, 0, 120, 80});
+        ms.commit();
+        mmade = mmade && d.roundtrip().ok();
+        tick();
+        mmade = mmade && d.roundtrip().ok();
+        const bool open = mmade && !menu.dismissed() && mp.dones == 0 && !d.failed();
+        check("layer: a popup on the panel (get_popup before its initial commit) with a grab maps "
+              "below its anchor",
+              open && mp.last.initial && mp.last.geometry.x == 400 && mp.last.geometry.y == 32 &&
+                  mp.last.geometry.width == 120 && mp.last.geometry.height == 80,
+              std::format("configures {} geometry {}x{}+{}+{} dismissed {} failed {}",
+                          mp.configures, mp.last.geometry.width, mp.last.geometry.height,
+                          mp.last.geometry.x, mp.last.geometry.y, menu.dismissed(), d.failed()));
+        click_at(og.x + og.width / 2.0, og.y + og.height / 2.0);
+        (void)d2.roundtrip();
+        const bool done = pump(d, [&] { return mp.dones > 0; });
+        check("layer: a click on another client's window dismisses the grabbing popup (popup_done)",
+              other && og.width == 64 && open && done && menu.dismissed() && mp.dones == 1,
+              std::format("other window {}x{}+{}+{}, {} popup_done", og.width, og.height, og.x,
+                          og.y, mp.dones));
+        t2.destroy();
+        b2.destroy();
+        pool2.destroy();
+        s2.destroy();
+        d2.disconnect();
+
+        menu.destroy();
+        ms.destroy();
+        over.destroy();
+        os.destroy();
+        panel.destroy();
+        ps.destroy();
+        mbuf.destroy();
+        obuf.destroy();
+        pbuf.destroy();
+        lpool.destroy();
+        (void)d.roundtrip();
+        tick();
+        (void)d.roundtrip();
+        {
+            std::lock_guard<std::mutex> hold(*g_lock);
+            usable = g_comp->windows().usable_area(-1);
+        }
+        check("layer: destroyed — the zone goes back to the windows",
+              usable.y == out0.y && usable.height == out0.height && pl.closes == 0 && !d.failed(),
+              std::format("usable {}x{}+{}+{}", usable.width, usable.height, usable.x, usable.y));
+        // The maximised toplevel was resized for the zone and back: ack where it ended.
+        (void)pump(d, [] { return false; }, 5);
+        if (w.last.serial && w.last.serial != top.acked_serial())
+            top.ack_configure(w.last.serial);
+    }
+
     // ── seat: sequences the wrapper must deliver whole ──
     // The listener entry points are what libwayland's thunks call: driving them sends the
     // exact sequences — a leave and an enter of two of the client's surfaces in one
@@ -992,6 +1455,24 @@ void run_cases() {
                 return (s.outputs() & (1u << slot)) != 0;
             });
         }
+        // A layer surface on the new output (configured, not mapped): `closed` when it goes.
+        layer_log hl{};
+        lx::wayland::surface hs;
+        lx::wayland::layer_surface wall;
+        const bool layered = added && d.has(gk::layer_shell) && hs.create(d).ok() &&
+                             wall.create(d, hs, {.output_slot = slot,
+                                                 .level = lx::wayland::layer::background,
+                                                 .name_space = "wallpaper"})
+                                 .ok();
+        if (layered) {
+            wall.set_handler(&hl);
+            wall.set_anchor(lx::wayland::anchor_top | lx::wayland::anchor_bottom |
+                            lx::wayland::anchor_left | lx::wayland::anchor_right);
+            wall.set_exclusive_zone(-1);
+            hs.commit();
+            (void)pump(d, [&] { return hl.configures >= 1; });
+            wall.ack_configure(hl.last.serial);
+        }
         const unsigned left0 = w.outputs_left;
         scan_builder::connector(scan, 44, "Virtual-1", false);
         {
@@ -1015,6 +1496,19 @@ void run_cases() {
                           w.outputs_left - left0, s.outputs()));
         if (!on_it)
             skip("outputs: the surface's mask on removal", "the window did not move to the new output");
+        if (layered) {
+            (void)pump(d, [&] { return hl.closes > 0; }, 20);
+            check("layer: on_closed fires when its output is unplugged",
+                  hl.configures >= 1 && hl.last.size.width == 1024 && hl.last.size.height == 768 &&
+                      hl.closes == 1 && wall.closed() && !d.failed(),
+                  std::format("configured {}x{}, {} closed", hl.last.size.width,
+                              hl.last.size.height, hl.closes));
+            wall.destroy();
+            hs.destroy();
+        } else if (d.has(gk::layer_shell)) {
+            check("layer: on_closed fires when its output is unplugged", false,
+                  "no layer surface on the new output");
+        }
         d.set_global_handler(nullptr);
         for (int i = 0; i < 5; ++i) {
             tick();

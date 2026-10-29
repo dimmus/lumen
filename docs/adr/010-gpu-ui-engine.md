@@ -1691,6 +1691,26 @@ a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
   cpu, 523 → 512 µs GL; S4 91.1 → 89.5 µs cpu, 134 → 132 µs GL — parity, inside each A/B's
   spread; counters identical, 0 allocations per steady frame (G5's GL `mallinfo2` delta of
   112–288 B is the driver's, on both builds).
+- `lx.wayland.client` for the shell and the host: layer surfaces, popups on layer parents,
+  subsurfaces. **Done**: `:layer` (`layer_surface` with `layer_handler`, gated on
+  wlr-layer-shell's glue alone — `not_implemented` without it, `test_wayland_client_nolayer`
+  builds that way and runs against the compositor), `popup::create` on a `layer_surface`
+  (`xdg_surface.get_popup` without a parent, then `zwlr_layer_surface_v1.get_popup`), and
+  `subsurface` in `:surface`. The layer shell (cap 5) is bound by the first layer surface, not
+  at connect, so an application window binds nothing new; a setter the bound version lacks
+  (`set_layer` < 2, `on_demand` < 4, `set_exclusive_edge` < 5) is not sent and returns false.
+  `test_wayland_client` covers the panel's configure (output width × 32) and zone (usable area
+  from y = 32), `set_layer` top → overlay, on_demand focus on map and on click, a grabbing
+  popup on the panel dismissed by a click on another client's window, `closed` on unplug, and
+  a subsurface composited above, then below, its parent (read back with wlr-screencopy).
+  Deviations: the objects follow the module's existing form (default-constructed, member
+  `create` returning `result<void>`, `set_handler`) rather than a static factory returning
+  `unique_ptr`; the output is a slot (`~0u`: the compositor's choice). Measured against the
+  stage's base (lumen-hello against one headless compositor, interleaved, 8 runs each,
+  `setarch -R`, pinned, load 0.29–0.66): RssAnon 4504 → 4508 kB on cpu, 27006 → 27012 kB on
+  gl — `sizeof(display)` grows by 40 B (one global slot) on `main`'s stack, which crosses a
+  stack page in one environment size of eight (equal in the other seven); start-up to connect
+  and to the first configure at parity inside each A/B's spread.
 - Docs: `docs/subsystems/ui-engine.md` (this design as current), ui-architecture.md §9
   rewritten, rendering-performance.md gains a UI section with the measured tables,
   api/README.md and architecture.md §3 for the new partitions, UML for the client frame

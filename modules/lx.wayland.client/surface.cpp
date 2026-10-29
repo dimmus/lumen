@@ -655,6 +655,65 @@ void surface::on_fractional_scale(std::uint32_t scale120) {
         handler_->on_preferred_scale(*this, scale120);
 }
 
+// ── subsurface ──
+
+subsurface::~subsurface() { destroy(); }
+
+lx::result<void> subsurface::create(display& d, surface& child, surface& parent) {
+    d.check_affinity();
+    if (proxy_)
+        return lx::invalid_argument("lx::wayland::subsurface::create: already created");
+    auto* sub = static_cast<wl_subcompositor*>(d.native_global(global_kind::subcompositor));
+    if (!sub)
+        return lx::make_error(lx::wayland_err::missing_global, "wl_subcompositor is not bound");
+    if (!child.valid() || !parent.valid() || &child == &parent)
+        return lx::invalid_argument("lx::wayland::subsurface::create: two created surfaces needed");
+    proxy_ = wl_subcompositor_get_subsurface(sub, static_cast<wl_surface*>(child.native()),
+                                             static_cast<wl_surface*>(parent.native()));
+    if (!proxy_)
+        return lx::make_error(lx::wayland_err::object_failed, "get_subsurface failed");
+    tag(proxy_);
+    child_ = &child;
+    parent_ = &parent;
+    sync_ = true;
+    return {};
+}
+
+void subsurface::destroy() {
+    if (proxy_)
+        wl_subsurface_destroy(proxy_);
+    proxy_ = nullptr;
+    child_ = nullptr;
+    parent_ = nullptr;
+}
+
+void subsurface::set_position(point2i at) {
+    if (proxy_)
+        wl_subsurface_set_position(proxy_, at.x, at.y);
+}
+
+void subsurface::place_above(surface& sibling) {
+    if (proxy_ && sibling.valid())
+        wl_subsurface_place_above(proxy_, static_cast<wl_surface*>(sibling.native()));
+}
+
+void subsurface::place_below(surface& sibling) {
+    if (proxy_ && sibling.valid())
+        wl_subsurface_place_below(proxy_, static_cast<wl_surface*>(sibling.native()));
+}
+
+void subsurface::set_sync() {
+    if (proxy_)
+        wl_subsurface_set_sync(proxy_);
+    sync_ = true;
+}
+
+void subsurface::set_desync() {
+    if (proxy_)
+        wl_subsurface_set_desync(proxy_);
+    sync_ = false;
+}
+
 #else // !LX_WLC_REAL
 
 shm_pool::~shm_pool() = default;
@@ -720,6 +779,16 @@ void surface::forget_output(unsigned) {}
 void surface::on_preferred_buffer_scale(std::int32_t) {}
 void surface::on_preferred_transform(std::uint32_t) {}
 void surface::on_fractional_scale(std::uint32_t) {}
+subsurface::~subsurface() = default;
+lx::result<void> subsurface::create(display&, surface&, surface&) {
+    return lx::not_implemented("lx::wayland::subsurface::create");
+}
+void subsurface::destroy() {}
+void subsurface::set_position(point2i) {}
+void subsurface::place_above(surface&) {}
+void subsurface::place_below(surface&) {}
+void subsurface::set_sync() { sync_ = true; }
+void subsurface::set_desync() { sync_ = false; }
 
 #endif // LX_WLC_REAL
 

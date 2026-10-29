@@ -4,9 +4,11 @@ module;
 // (wl_shm pools, linux-dmabuf, single-pixel), damage_buffer, scale and transform, regions,
 // the frame callback (requested only on demand, one outstanding), wp_viewport,
 // wp_fractional_scale_v1, wp_presentation feedback per commit, and the
-// wp_linux_drm_syncobj_v1 acquire / release points. Bodies in surface.cpp.
+// wp_linux_drm_syncobj_v1 acquire / release points; and wl_subsurface, which composites one
+// surface inside another. Bodies in surface.cpp.
 
 struct wl_surface;
+struct wl_subsurface;
 struct wl_buffer;
 struct wl_shm_pool;
 struct wl_callback;
@@ -232,6 +234,49 @@ private:
     std::int32_t buffer_scale_pref_ = 1;
     std::uint32_t transform_pref_ = 0;
     feedback_slot feedback_[k_max_feedback]{};
+};
+
+/// A wl_subsurface: `child` composited as part of `parent`, at a position relative to it and
+/// above it until restacked — a separately updated region (video, a large image, a canvas)
+/// inside a window, a panel or a popup, without a second role. Synchronized as created: the
+/// child's commits are cached and applied with the parent's next commit (atomic resizes);
+/// `set_desync` lets the child update on its own. Position and stacking are parent state,
+/// applied by the parent's next commit too. Non-movable. Destroy it before either surface
+/// (the child then unmaps at the parent's next commit).
+class subsurface {
+public:
+    subsurface() = default;
+    ~subsurface();
+    subsurface(const subsurface&) = delete;
+    subsurface& operator=(const subsurface&) = delete;
+
+    /// wl_subcompositor.get_subsurface. `wayland_err::missing_global` without
+    /// wl_subcompositor; invalid_argument for a surface not created, or `child` == `parent`.
+    /// The compositor posts a protocol error if `child` already has a role or is an
+    /// ancestor of `parent`.
+    [[nodiscard]] lx::result<void> create(display& d, surface& child, surface& parent);
+    void destroy();
+    [[nodiscard]] bool valid() const { return proxy_ != nullptr; }
+    [[nodiscard]] surface* child() const { return child_; }
+    [[nodiscard]] surface* parent() const { return parent_; }
+
+    /// The child's top-left in the parent's surface-local, logical coordinates.
+    void set_position(point2i at);
+    /// Directly above / below `sibling`: the parent or another subsurface's surface of the
+    /// same parent.
+    void place_above(surface& sibling);
+    void place_below(surface& sibling);
+    void set_sync();
+    void set_desync();
+    /// As set here (an ancestor that is synchronized still makes the child effectively so).
+    [[nodiscard]] bool synchronized() const { return sync_; }
+    [[nodiscard]] void* native() const { return proxy_; }
+
+private:
+    wl_subsurface* proxy_ = nullptr;
+    surface* child_ = nullptr;
+    surface* parent_ = nullptr;
+    bool sync_ = true;
 };
 
 } // namespace lx::wayland

@@ -4,7 +4,8 @@
 //
 // LX_WLC_REAL is 1 when libwayland-client and every protocol the wrapper speaks were built
 // (LUMEN_PROTOCOL_<XML_STEM> from the manifest); otherwise the implementation compiles to
-// not_implemented stubs, so the build succeeds with any subset present.
+// not_implemented stubs, so the build succeeds with any subset present. LX_WLC_LAYER is
+// wlr-layer-shell's own gate (below).
 #pragma once
 
 #include <errno.h>
@@ -46,6 +47,22 @@ struct wl_registry;
 struct wl_output;
 struct wl_seat;
 struct zxdg_output_v1;
+#endif
+
+// wlr-layer-shell (lx.wayland.client:layer) has its own gate and is not part of LX_WLC_REAL:
+// built without its glue, only the layer surface and a popup on one return not_implemented,
+// and the rest of the wrapper stays real. Its generated header names a parameter
+// `namespace`, so it is included with that word renamed (as lx.shell does).
+#if LX_WLC_REAL && defined(LUMEN_PROTOCOL_WLR_LAYER_SHELL_UNSTABLE_V1)
+#define LX_WLC_LAYER 1
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wkeyword-macro"
+#define namespace name_space
+#include "wlr-layer-shell-unstable-v1-client-protocol.h"
+#undef namespace
+#pragma clang diagnostic pop
+#else
+#define LX_WLC_LAYER 0
 #endif
 
 #if defined(LUMEN_HAS_XKBCOMMON)

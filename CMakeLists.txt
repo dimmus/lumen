@@ -1210,6 +1210,25 @@ if(LUMEN_BUILD_TESTS)
     add_test(NAME test_wayland_client COMMAND test_wayland_client)
     set_tests_properties(test_wayland_client PROPERTIES TIMEOUT 60)
 
+    # lx.wayland.client without wlr-layer-shell's glue: the units with a layer gate compiled
+    # again with its protocol macro undefined (the linker takes them before the library's) —
+    # the not_implemented paths compile, link and run, and the rest of the wrapper is real.
+    if(TARGET lumen-protocol-glue AND WAYLAND_CLIENT_FOUND)
+        add_executable(test_wayland_client_nolayer tests/test_wayland_client_nolayer.cpp
+            modules/lx.wayland.client/display.cpp modules/lx.wayland.client/layer.cpp
+            modules/lx.wayland.client/xdg.cpp)
+        target_link_libraries(test_wayland_client_nolayer PRIVATE lx.compositor lx.wayland.client
+            lumen-protocol-glue)
+        lumen_apply_module_properties(test_wayland_client_nolayer)
+        lumen_link_platform(test_wayland_client_nolayer)
+        lumen_link_platform_parts(test_wayland_client_nolayer wayland_client xkb)
+        target_compile_definitions(test_wayland_client_nolayer PRIVATE LUMEN_HAS_PROTOCOL_GLUE=1)
+        target_compile_options(test_wayland_client_nolayer PRIVATE
+            -ULUMEN_PROTOCOL_WLR_LAYER_SHELL_UNSTABLE_V1)
+        add_test(NAME test_wayland_client_nolayer COMMAND test_wayland_client_nolayer)
+        set_tests_properties(test_wayland_client_nolayer PROPERTIES TIMEOUT 30)
+    endif()
+
     # ADR-010 Phase 4 stage 2: lx.gfx:swapchain's three tiers against the in-process
     # compositor — golden frames read back from the compositor's side, buffer age, release,
     # resize, explicit sync (a fake kernel timeline on GL), allocations and present cost.

@@ -307,12 +307,33 @@ popup::~popup() { destroy(); }
 
 lx::result<void> popup::create(display& d, surface& s, toplevel& parent,
                                const positioner_desc& where) {
+    if (!parent.native_xdg_surface())
+        return lx::invalid_argument("lx::wayland::popup::create: parent toplevel not created");
     return create_on(d, s, parent.native_xdg_surface(), where);
 }
 
 lx::result<void> popup::create(display& d, surface& s, popup& parent,
                                const positioner_desc& where) {
+    if (!parent.native_xdg_surface())
+        return lx::invalid_argument("lx::wayland::popup::create: parent popup not created");
     return create_on(d, s, parent.native_xdg_surface(), where);
+}
+
+lx::result<void> popup::create(display& d, surface& s, layer_surface& parent,
+                               const positioner_desc& where) {
+#if LX_WLC_LAYER
+    if (!parent.valid())
+        return lx::invalid_argument("lx::wayland::popup::create: parent layer surface not created");
+    if (auto made = create_on(d, s, nullptr, where); !made)
+        return made;
+    // "Created via xdg_surface::get_popup with the parent set to NULL, and this request must
+    // be invoked before committing the popup's initial state."
+    zwlr_layer_surface_v1_get_popup(static_cast<zwlr_layer_surface_v1*>(parent.native()), popup_);
+    return {};
+#else
+    (void)d, (void)s, (void)parent, (void)where;
+    return lx::not_implemented("lx::wayland::popup::create");
+#endif
 }
 
 lx::result<void> popup::create_on(display& d, surface& s, void* parent_xdg,
@@ -321,8 +342,8 @@ lx::result<void> popup::create_on(display& d, surface& s, void* parent_xdg,
     if (popup_)
         return lx::invalid_argument("lx::wayland::popup::create: already created");
     auto* wm = static_cast<xdg_wm_base*>(d.native_global(global_kind::xdg_wm_base));
-    if (!wm || !s.valid() || !parent_xdg)
-        return lx::invalid_argument("lx::wayland::popup::create: no xdg_wm_base, surface or parent");
+    if (!wm || !s.valid())
+        return lx::invalid_argument("lx::wayland::popup::create: no xdg_wm_base or surface");
     display_ = &d;
     surface_ = &s;
     xdg_surface_ = xdg_wm_base_get_xdg_surface(wm, static_cast<wl_surface*>(s.native()));
@@ -437,6 +458,9 @@ lx::result<void> popup::create(display&, surface&, toplevel&, const positioner_d
     return lx::not_implemented("lx::wayland::popup::create");
 }
 lx::result<void> popup::create(display&, surface&, popup&, const positioner_desc&) {
+    return lx::not_implemented("lx::wayland::popup::create");
+}
+lx::result<void> popup::create(display&, surface&, layer_surface&, const positioner_desc&) {
     return lx::not_implemented("lx::wayland::popup::create");
 }
 lx::result<void> popup::create_on(display&, surface&, void*, const positioner_desc&) {

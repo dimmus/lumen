@@ -137,13 +137,21 @@ public:
     [[nodiscard]] const global_info& global(global_kind k) const {
         return globals_[static_cast<unsigned>(k)];
     }
-    /// Bound version, 0 when absent.
-    [[nodiscard]] std::uint32_t version(global_kind k) const { return global(k).bound; }
+    /// Bound version, 0 when absent. A global bound on demand (`global_info::on_demand`)
+    /// reports the version it is or will be bound at while it is advertised.
+    [[nodiscard]] std::uint32_t version(global_kind k) const {
+        const global_info& g = global(k);
+        return g.bound ? g.bound : g.on_demand && g.name ? std::min(g.advertised, g.cap) : 0u;
+    }
     [[nodiscard]] bool has(global_kind k) const { return version(k) != 0; }
-    /// The bound proxy (wl_compositor*, xdg_wm_base*, ...) as `void*`; null when absent.
+    /// The bound proxy (wl_compositor*, xdg_wm_base*, ...) as `void*`; null when absent or
+    /// (on demand) not bound yet.
     [[nodiscard]] void* native_global(global_kind k) const {
         return proxies_[static_cast<unsigned>(k)];
     }
+    /// Binds an on-demand global the first time it is needed (idempotent: the proxy); null
+    /// when it is not advertised or its glue was not built.
+    [[nodiscard]] void* bind_on_demand(global_kind k);
     [[nodiscard]] void* native() const { return display_; }
     [[nodiscard]] void* native_registry() const { return registry_; }
     /// Unknown globals and removals go here (extensions the caller binds itself).
