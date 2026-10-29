@@ -16,6 +16,10 @@ module;
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 #undef namespace
 #pragma clang diagnostic pop
+#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#include "ext-background-effect-v1-client-protocol.h"
+#define LUMEN_SHELL_BACKGROUND_EFFECT 1
+#endif
 #endif
 
 import lx.foundation;
@@ -299,6 +303,10 @@ struct panel_globals {
     /// Optional: with both, the panel renders at the output's fractional scale.
     void* viewporter = nullptr;  // wp_viewporter
     void* fractional = nullptr;  // wp_fractional_scale_manager_v1
+    /// ext_background_effect_manager_v1 when the panel is to be translucent over a blur of
+    /// what is behind it (config.toml `[panel] blur`, and the compositor offers blur); null:
+    /// opaque.
+    void* background_effect = nullptr;
 };
 
 /// What a click on the panel asks the shell for (the panel itself only raises and
@@ -419,6 +427,10 @@ public:
     /// Keyboard interactivity on_demand while one of its menus is open (the menu's grab
     /// then takes the keyboard), none otherwise. Committed at once.
     void set_menu_keyboard(bool on);
+    /// Translucent over a blur of what is behind it (`manager`: the
+    /// ext_background_effect_manager_v1) or opaque (null): new buffers and a full repaint at
+    /// the next draw when it changes.
+    void set_blur(void* manager);
     /// The compositor closed the layer surface (its output went away) or a buffer could
     /// not be made: the shell should exit and be restarted.
     [[nodiscard]] bool closed() const { return closed_; }
@@ -471,8 +483,15 @@ private:
     void paint_tray(int bi, const panel_layout& l, unsigned i);
     void paint_bell(int bi, const panel_layout& l);
     void log_layout(const panel_layout& l) const;
+    /// Makes the surface what `g_.background_effect` says: the blur object, its region and
+    /// premultiplied buffers, or opaque (opaque region, XRGB) without one.
+    void apply_blur();
 
     panel_globals g_{};
+    /// ext_background_effect_surface_v1* while blurred.
+    void* effect_ = nullptr;
+    /// The panel's background: opaque, or translucent (premultiplied) over the blur.
+    std::uint32_t bg_ = lx::shell::k_canvas_bg;
     policy_bridge* bridge_ = nullptr;
     void* surface_ = nullptr; // wl_surface*
     void* layer_ = nullptr;   // zwlr_layer_surface_v1*
@@ -899,7 +918,8 @@ unsigned lx::shell::panel_diff(const panel_layout& a, const panel_layout& b, lx:
 namespace {
 
 constexpr lx::trace::category log_panel{"shell.panel"};
-constexpr std::uint32_t k_bg = lx::shell::k_canvas_bg;
+/// The background over a blur (`[panel] blur`): the opaque one at 72 %, premultiplied.
+[[maybe_unused]] constexpr std::uint32_t k_panel_translucent_bg = 0xB8161619u;
 constexpr std::uint32_t k_hover = 0xFF34343Au;
 constexpr std::uint32_t k_pressed = 0xFF2A2A30u;
 constexpr std::uint32_t k_focused = 0xFF3D6FB4u;
@@ -926,8 +946,8 @@ constexpr int k_text_pad = 8;
 void lx::shell::panel::paint_cell(int bi, const panel_layout& l, unsigned i) {
     const panel_cell& c = l.cells[i];
     const lx::rect2i box{c.x, l.cell_y, c.w, l.cell_h};
-    canvas_.fill(bi, box, k_bg);
-    std::uint32_t bgc = k_bg;
+    canvas_.fill(bi, box, bg_);
+    std::uint32_t bgc = bg_;
     if (c.flags & cell_pressed)
         bgc = k_pressed;
     else if (c.flags & cell_focused)
@@ -936,8 +956,8 @@ void lx::shell::panel::paint_cell(int bi, const panel_layout& l, unsigned i) {
         bgc = k_attention;
     else if (c.flags & cell_hover)
         bgc = k_hover;
-    if (bgc != k_bg)
-        canvas_.fill_rounded(bi, box, bgc, k_bg);
+    if (bgc != bg_)
+        canvas_.fill_rounded(bi, box, bgc, bg_);
     const task_entry* e = bridge_ ? bridge_->model().get(c.task) : nullptr;
     const char* label = "";
     if (e)
@@ -978,8 +998,8 @@ void lx::shell::panel::paint_ws(int bi, const panel_layout& l, unsigned i) {
         return;
     const panel_ws_cell& c = l.ws[i];
     const lx::rect2i box{c.x, l.cell_y, c.w, l.cell_h};
-    canvas_.fill(bi, box, k_bg);
-    std::uint32_t bgc = k_bg;
+    canvas_.fill(bi, box, bg_);
+    std::uint32_t bgc = bg_;
     if (c.flags & ws_cell_pressed)
         bgc = k_pressed;
     else if (c.flags & ws_cell_active)
@@ -988,8 +1008,8 @@ void lx::shell::panel::paint_ws(int bi, const panel_layout& l, unsigned i) {
         bgc = k_attention;
     else if (c.flags & ws_cell_hover)
         bgc = k_hover;
-    if (bgc != k_bg)
-        canvas_.fill_rounded(bi, box, bgc, k_bg);
+    if (bgc != bg_)
+        canvas_.fill_rounded(bi, box, bgc, bg_);
     const char* name = i < ws_input_.count ? ws_input_.items[i].name : "";
     const int tw = canvas_.text_width(name, k_panel_font);
     const int tx = tw > 0 && tw < c.w ? c.x + (c.w - tw) / 2 : c.x + 4;
@@ -1019,16 +1039,16 @@ void lx::shell::panel::paint_logout(int bi, const panel_layout& l) {
     if (l.logout_w <= 0)
         return;
     const lx::rect2i box{l.logout_x, l.cell_y, l.logout_w, l.cell_h};
-    canvas_.fill(bi, box, k_bg);
-    std::uint32_t bgc = k_bg;
+    canvas_.fill(bi, box, bg_);
+    std::uint32_t bgc = bg_;
     if (l.logout_flags & logout_pressed)
         bgc = k_pressed;
     else if (l.logout_flags & logout_armed)
         bgc = k_danger;
     else if (l.logout_flags & logout_hover)
         bgc = k_hover;
-    if (bgc != k_bg)
-        canvas_.fill_rounded(bi, box, bgc, k_bg);
+    if (bgc != bg_)
+        canvas_.fill_rounded(bi, box, bgc, bg_);
     const bool armed = (l.logout_flags & logout_armed) != 0;
     (void)canvas_.text(bi, {l.logout_x + k_text_pad, l.cell_y, l.logout_w - 2 * k_text_pad, l.cell_h},
                        armed ? "Confirm?" : "Log out", armed ? k_text_focused : k_text_more,
@@ -1039,16 +1059,16 @@ void lx::shell::panel::paint_apps(int bi, const panel_layout& l) {
     if (l.apps_w <= 0)
         return;
     const lx::rect2i box{l.apps_x, l.cell_y, l.apps_w, l.cell_h};
-    canvas_.fill(bi, box, k_bg);
-    std::uint32_t bgc = k_bg;
+    canvas_.fill(bi, box, bg_);
+    std::uint32_t bgc = bg_;
     if (l.apps_flags & apps_pressed)
         bgc = k_pressed;
     else if (l.apps_flags & apps_open)
         bgc = k_focused;
     else if (l.apps_flags & apps_hover)
         bgc = k_hover;
-    if (bgc != k_bg)
-        canvas_.fill_rounded(bi, box, bgc, k_bg);
+    if (bgc != bg_)
+        canvas_.fill_rounded(bi, box, bgc, bg_);
     (void)canvas_.text(bi, {l.apps_x + k_text_pad, l.cell_y, l.apps_w - 2 * k_text_pad, l.cell_h},
                        "Apps", (l.apps_flags & apps_open) ? k_text_focused : k_text, k_panel_font);
 }
@@ -1057,7 +1077,7 @@ void lx::shell::panel::paint_notice(int bi, const panel_layout& l) {
     if (l.notice_w <= 0)
         return;
     const lx::rect2i box{l.notice_x, l.cell_y, l.notice_w, l.cell_h};
-    canvas_.fill(bi, box, k_bg);
+    canvas_.fill(bi, box, bg_);
     (void)canvas_.text(bi, {l.notice_x + k_text_pad, l.cell_y, l.notice_w - 2 * k_text_pad, l.cell_h},
                        notice_, k_text_warning, k_panel_font);
 }
@@ -1066,10 +1086,10 @@ void lx::shell::panel::paint_capture(int bi, const panel_layout& l) {
     if (l.capture_w <= 0)
         return;
     const lx::rect2i box{l.capture_x, l.cell_y, l.capture_w, l.cell_h};
-    canvas_.fill(bi, box, k_bg);
+    canvas_.fill(bi, box, bg_);
     const lx::rect2i dot{l.capture_x + (l.capture_w - k_capture_dot) / 2,
                          l.cell_y + (l.cell_h - k_capture_dot) / 2, k_capture_dot, k_capture_dot};
-    canvas_.fill_rounded(bi, dot, k_capture_red, k_bg, k_capture_dot / 2);
+    canvas_.fill_rounded(bi, dot, k_capture_red, bg_, k_capture_dot / 2);
 }
 
 void lx::shell::panel::paint_tray(int bi, const panel_layout& l, unsigned i) {
@@ -1077,14 +1097,14 @@ void lx::shell::panel::paint_tray(int bi, const panel_layout& l, unsigned i) {
         return;
     const panel_tray_cell& c = l.tray[i];
     const lx::rect2i box{c.x, l.cell_y, c.w, l.cell_h};
-    canvas_.fill(bi, box, k_bg);
-    std::uint32_t bgc = k_bg;
+    canvas_.fill(bi, box, bg_);
+    std::uint32_t bgc = bg_;
     if (c.flags & cell_pressed)
         bgc = k_pressed;
     else if (c.flags & cell_hover)
         bgc = k_hover;
-    if (bgc != k_bg)
-        canvas_.fill_rounded(bi, box, bgc, k_bg);
+    if (bgc != bg_)
+        canvas_.fill_rounded(bi, box, bgc, bg_);
     const lx::rect2i icon_box{c.x + (c.w - k_tray_icon) / 2, l.cell_y + (l.cell_h - k_tray_icon) / 2,
                               k_tray_icon, k_tray_icon};
     const int px = canvas_.pixel_rect(icon_box).width;
@@ -1108,14 +1128,14 @@ void lx::shell::panel::paint_bell(int bi, const panel_layout& l) {
     if (l.bell_w <= 0)
         return;
     const lx::rect2i box{l.bell_x, l.cell_y, l.bell_w, l.cell_h};
-    canvas_.fill(bi, box, k_bg);
-    std::uint32_t bgc = k_bg;
+    canvas_.fill(bi, box, bg_);
+    std::uint32_t bgc = bg_;
     if (l.bell_flags & bell_flag_pressed)
         bgc = k_pressed;
     else if (l.bell_flags & bell_flag_hover)
         bgc = k_hover;
-    if (bgc != k_bg)
-        canvas_.fill_rounded(bi, box, bgc, k_bg);
+    if (bgc != bg_)
+        canvas_.fill_rounded(bi, box, bgc, bg_);
     const bool dnd = (l.bell_flags & bell_flag_dnd) != 0;
     const std::uint32_t fg = dnd ? 0xFF8C8C94u : 0xFFE6E6E6u;
     // A bell in a 16 px box: the dome, its rim, the clapper.
@@ -1148,7 +1168,7 @@ void lx::shell::panel::paint(int bi, const panel_layout& l, const lx::rect2i* re
         const lx::rect2i& rect = rects[r];
         if (rect.width == l.width && rect.height == l.height) {
             // Everything: background, every cell, the "+k" label.
-            canvas_.fill(bi, rect, k_bg);
+            canvas_.fill(bi, rect, bg_);
             paint_apps(bi, l);
             for (unsigned i = 0; i < l.ws_count; ++i)
                 paint_ws(bi, l, i);
@@ -1518,14 +1538,59 @@ lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& 
     zwlr_layer_surface_v1_set_exclusive_zone(layer, k_panel_height);
     zwlr_layer_surface_v1_set_keyboard_interactivity(
         layer, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    apply_blur();
+    wl_surface_commit(surface); // initial commit: no buffer, asks for a configure
+    return {};
+}
+
+void lx::shell::panel::apply_blur() {
+    auto* surface = static_cast<wl_surface*>(surface_);
+#if defined(LUMEN_SHELL_BACKGROUND_EFFECT)
+    if (g_.background_effect && !effect_) {
+        // Translucent over a blur of everything behind it: premultiplied buffers, no opaque
+        // region, the whole surface the blur region (the compositor clips it).
+        auto* effect = ext_background_effect_manager_v1_get_background_effect(
+            static_cast<ext_background_effect_manager_v1*>(g_.background_effect), surface);
+        if (auto* region = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
+            wl_region_add(region, 0, 0, 1 << 30, 1 << 30);
+            ext_background_effect_surface_v1_set_blur_region(effect, region);
+            wl_region_destroy(region);
+        }
+        wl_surface_set_opaque_region(surface, nullptr);
+        effect_ = effect;
+        canvas_.set_alpha(true);
+        bg_ = k_panel_translucent_bg;
+        return;
+    }
+    if (!g_.background_effect && effect_) {
+        ext_background_effect_surface_v1_destroy(
+            static_cast<ext_background_effect_surface_v1*>(effect_));
+        effect_ = nullptr;
+    }
+#endif
+    if (effect_)
+        return;
+    canvas_.set_alpha(false);
+    bg_ = lx::shell::k_canvas_bg;
     // The panel is opaque everywhere: the compositor may skip blending and what is under it.
     if (auto* region = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
         wl_region_add(region, 0, 0, 1 << 30, 1 << 30);
         wl_surface_set_opaque_region(surface, region);
         wl_region_destroy(region);
     }
-    wl_surface_commit(surface); // initial commit: no buffer, asks for a configure
-    return {};
+}
+
+void lx::shell::panel::set_blur(void* manager) {
+    if (manager == g_.background_effect)
+        return;
+    g_.background_effect = manager;
+    if (!surface_)
+        return;
+    apply_blur();
+    // Buffers of the other format, everything repainted, committed with the new region.
+    resized_ = true;
+    must_commit_ = true;
+    dirty_ = true;
 }
 
 void lx::shell::panel::after_dispatch() {
@@ -1684,6 +1749,12 @@ void lx::shell::panel::set_menu_keyboard(bool on) {
 void lx::shell::panel::destroy() {
     canvas_.free();
     canvas_.release_scale(); // before the wl_surface it extends
+#if defined(LUMEN_SHELL_BACKGROUND_EFFECT)
+    if (effect_)
+        ext_background_effect_surface_v1_destroy(
+            static_cast<ext_background_effect_surface_v1*>(effect_));
+#endif
+    effect_ = nullptr;
     if (layer_)
         zwlr_layer_surface_v1_destroy(static_cast<zwlr_layer_surface_v1*>(layer_));
     layer_ = nullptr;
@@ -1702,6 +1773,8 @@ lx::result<void> lx::shell::panel::create(panel_globals, policy_bridge&, void*) 
 }
 void lx::shell::panel::destroy() {}
 void lx::shell::panel::set_menu_keyboard(bool) {}
+void lx::shell::panel::set_blur(void*) {}
+void lx::shell::panel::apply_blur() {}
 void lx::shell::panel::after_dispatch() {}
 void lx::shell::panel::after_dispatch(unsigned) {}
 void lx::shell::panel::draw(bool) {}

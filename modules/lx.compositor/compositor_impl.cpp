@@ -544,6 +544,19 @@ struct compositor_impl {
     /// no benefit.
     frame_painter painter_{};
     gfx::vulkan_compositor vk_compositor_{};
+    /// Render affinity. While `compositor.render` logs at debug, `vk_compositor_` times each
+    /// frame on the GPU (timestamps; nothing is recorded otherwise): the output and frame of
+    /// each timed composite, by its serial, until its time is read (`log_vk_gpu_times`).
+    struct vk_gpu_frame {
+        std::uint64_t serial = 0;
+        long long frame = 0;
+        unsigned slot = 0;
+    };
+    static constexpr unsigned k_vk_gpu_frames = 8;
+    vk_gpu_frame vk_gpu_frames_[k_vk_gpu_frames]{};
+    unsigned vk_gpu_next_ = 0;
+    /// Render affinity. One `gpu` debug line per timed composite whose fence has signalled.
+    void log_vk_gpu_times();
     gfx::cpu_compositor cpu_compositor_{};
     /// The CPU path's primitive renderer, made with the backend (`setup_cpu_present`).
     std::unique_ptr<gfx::ui_cpu_renderer> ui_cpu_{};
@@ -1527,10 +1540,18 @@ struct compositor_impl {
     /// UI, at start: the pipelines' cursor planes.
     void create_cursor_planes(unsigned need_px);
     /// Render. Composites output `p` from `snapshot` (its view's, acquired) and releases
-    /// it; true when it drew.
+    /// it; true when it drew. `rects`, `area` and `submitted` (the draws the backend
+    /// submitted) are for the debug line.
     bool composite_output(output_pipeline& p, unsigned slot,
                           const scene::immutable_frame_snapshot& snapshot, unsigned& rects,
-                          unsigned long long& area);
+                          unsigned long long& area, unsigned& submitted);
+    /// Render, in `composite_output`: opens the backend's blur frame for a snapshot with
+    /// blur draws (ext-background-effect-v1) — `frame_damage` may grow, `again` says the
+    /// composite region must go through the backend's `isolate_blur` — and returns true; for
+    /// one without, frees the output's blur levels if it had any and returns false.
+    bool blur_frame(output_pipeline& p, unsigned slot, unsigned back,
+                    const scene::immutable_frame_snapshot& snapshot,
+                    gfx::damage_region& frame_damage, bool& again);
     /// Render. Commits `p`'s composited frame (and its cursor), or a cursor-only commit.
     const char* commit_output(output_pipeline& p, unsigned slot, bool composited);
     /// Render, once `p` has composited nothing for `k_catch_up_idle_ns` with nothing in
@@ -3276,6 +3297,14 @@ void compositor_impl::register_p0_globals() {
     p0_.warp_pointer = [](void* u, double x, double y) {
         static_cast<compositor_impl*>(u)->warp_pointer(x, y);
     };
+    // ext-background-effect-v1: blur where the backend draws it (GL ES 3, Vulkan).
+    p0_.background_blur = (gl_present_ && gl_compositor_.supports_blur()) ||
+                          (vulkan_present_ && vk_compositor_.supports_blur());
+    // wp_color_manager_v1: parametric descriptions where the backend draws them (all three
+    // can; Vulkan needs room for the push block, GL highp in the fragment stage).
+    p0_.color_management = (gl_present_ && gl_compositor_.supports_color_management()) ||
+                           (vulkan_present_ && vk_compositor_.supports_color_management()) ||
+                           cpu_present_;
     if (drm_present_) {
         const bool fence_out = (gl_present_ && egl_.supports_native_fence()) || vulkan_present_;
         p0_.syncobj_drm_fd = kms.card_fd();
@@ -4421,6 +4450,14 @@ void compositor_impl::apply_window_config() {
                            .master_ratio = t.master_ratio,
                            .master_count = static_cast<unsigned>(t.master_count),
                            .gaps = t.gaps});
+    const auto& a = config_.current().animations;
+    // Retirements wait for the next tick while a ghost may still claim them (window
+    // animations); off, they go at once as before.
+    p0_.defer_retire = a.enabled;
+    if (!a.enabled)
+        flush_deferred_retires(p0_);
+    wm_.set_animation_config(
+        {.enabled = a.enabled, .stiffness = a.stiffness, .damping_ratio = a.damping_ratio});
 }
 
 void compositor_impl::apply_focus_policy() {
@@ -7203,6 +7240,10 @@ void compositor_impl::finish_retire(unsigned slot) {
     p->staged.reset();
     p->graveyard.reset();
     release_targets(*p);
+    if (gl_present_)
+        gl_compositor_.release_blur(slot);
+    else if (vulkan_present_)
+        vk_compositor_.release_blur(slot);
     p->cursor = drm::kms_cursor_plane{};
     const unsigned gen = p->retire_gen;
     // Destroyed on UI: the thread draining KMS events may hold it until its dispatch returns.
@@ -9080,6 +9121,16 @@ lx::result<void> compositor::start() {
         return err;
     }
 
+    // Two or more descriptors per client: at the 1024 a user service starts with, about the
+    // 500th client cannot connect (libwayland then retries the accept in a busy loop). This
+    // process starts no children; one that does calls `session::fd_limit::restore_in_child`
+    // between fork and exec.
+    if (auto nofile = session::fd_limit::raise(); nofile)
+        log_session.info("RLIMIT_NOFILE soft limit {} -> {}", nofile.value().before,
+                         nofile.value().after);
+    else
+        log_session.warn("RLIMIT_NOFILE not raised: {}", nofile.get_error().message);
+
     impl_->scheduler_.set_target_fps(impl_->cfg.target_fps);
     // Title bars' faces from the last run's fontconfig answers: the first decorated window
     // does not wait 15–40 ms on the UI thread for fontconfig to start.
@@ -9981,6 +10032,10 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     impl->p0_.building_frame = tick.frame_index;
     impl->budget_.begin_frame(tick.frame_index);
     impl->p0_.now_ns = static_cast<unsigned long long>(tick.timestamp_ns);
+    // Texture retirements window animations held back since the last tick (a closing
+    // window's ghost had its chance to keep them): queued now.
+    if (impl->p0_.defer_retire)
+        flush_deferred_retires(impl->p0_);
     impl->advance_logout(tick.timestamp_ns);
     // Output heads changed since the last loop iteration (tests drive ticks without the loop).
     impl->flush_output_heads();
@@ -10096,6 +10151,20 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     {
         lx::trace::scoped_span wm_span{"ui", "wm.on_tick"};
         impl->wm_.on_tick(tick.timestamp_ns);
+    }
+    // Window animations, posed for when this frame is predicted to reach the display: the
+    // next vblank of the first served output's phase-locked clock (the tick's own time
+    // without one — tests drive ticks directly). Nothing animating costs one test.
+    if (impl->wm_.animations().active()) {
+        lx::trace::scoped_span anim_span{"ui", "animations"};
+        lx::runtime::clock_time present = tick.timestamp_ns;
+        if (impl->in_vsync_)
+            for (unsigned slot = 0; slot < output_manager::k_max; ++slot)
+                if ((served & (1u << slot)) && impl->clocks_.live(slot)) {
+                    present = impl->clocks_.clock(slot).next_deadline(tick.timestamp_ns);
+                    break;
+                }
+        impl->wm_.tick_animations(present);
     }
     // Frames: the atlas on first use and changed titles, rasterized once per tick however
     // many set_title requests arrived — in this tick's snapshot, with the geometry they fit.
@@ -10439,6 +10508,7 @@ void compositor::tick_render() {
     bool composited[output_manager::k_max]{};
     unsigned rects[output_manager::k_max]{};
     unsigned long long areas[output_manager::k_max]{};
+    unsigned draws[output_manager::k_max]{};
     unsigned frames[output_manager::k_max]{};
     for (unsigned i = 0; i < n; ++i) {
         if (!impl->pipes_[order[i]]) {
@@ -10466,7 +10536,8 @@ void compositor::tick_render() {
         }
         const auto t_out = std::chrono::steady_clock::now();
         composited[p.slot] =
-            impl->composite_output(p, p.slot, *snaps[p.slot], rects[p.slot], areas[p.slot]);
+            impl->composite_output(p, p.slot, *snaps[p.slot], rects[p.slot], areas[p.slot],
+                                   draws[p.slot]);
         frames[p.slot] = static_cast<unsigned>(p.rendered_frame.load(std::memory_order_relaxed));
         p.render_cost_us.store(static_cast<unsigned>(
                                    std::chrono::duration_cast<std::chrono::microseconds>(
@@ -10515,21 +10586,40 @@ void compositor::tick_render() {
     // One line per output that did something; an idle tick is silent. Checked before
     // formatting so the frame path pays nothing when debug is off.
     if (log_render.enabled(lx::trace::level::debug)) {
+        if (impl->vulkan_present_)
+            impl->log_vk_gpu_times();
         for (unsigned slot = 0; slot < output_manager::k_max; ++slot) {
             const char* kind = commit_kinds[slot] ? commit_kinds[slot] : "none";
             if (!composited[slot] && kind[0] == 'n')
                 continue;
             const detail::output_pipeline* p = impl->pipes_[slot].get();
             log_render.debug("frame={} composite={} rects={} area={} commit={} "
-                             "render_us={} output={}",
+                             "render_us={} output={} draws={}",
                              p ? p->rendered_frame.load(std::memory_order_relaxed) : -1LL,
                              composited[slot] ? 1 : 0, rects[slot], areas[slot], kind,
-                             p ? p->render_cost_us.load(std::memory_order_relaxed) : 0u, slot);
+                             p ? p->render_cost_us.load(std::memory_order_relaxed) : 0u, slot,
+                             draws[slot]);
         }
     }
 }
 
 namespace detail {
+
+void compositor_impl::log_vk_gpu_times() {
+    // Frames composited by an earlier tick, typically: this tick's are still on the GPU.
+    gfx::composite_gpu_time times[gfx::vulkan_compositor::k_gpu_times]{};
+    const unsigned n = vk_compositor_.take_gpu_times(times, gfx::vulkan_compositor::k_gpu_times);
+    for (unsigned i = 0; i < n; ++i) {
+        // A composite that is not a snapshot's frame (`commit_black_frame`) is not listed.
+        for (const vk_gpu_frame& f : vk_gpu_frames_) {
+            if (f.serial != times[i].serial)
+                continue;
+            log_render.debug("gpu frame={} composite_us={} encode_us={} output={}", f.frame,
+                             times[i].composite_ns / 1000u, times[i].encode_ns / 1000u, f.slot);
+            break;
+        }
+    }
+}
 
 long long compositor_impl::compute_low_water() const {
     long long low = -1;
@@ -10560,9 +10650,11 @@ long long compositor_impl::compute_low_water() const {
 
 bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                                        const scene::immutable_frame_snapshot& snapshot,
-                                       unsigned& rects, unsigned long long& area) {
+                                       unsigned& rects, unsigned long long& area,
+                                       unsigned& submitted) {
     rects = 0;
     area = 0;
+    submitted = 0;
     const unsigned idx = snapshot.frame_index();
     const auto& draws = snapshot.draws();
     {
@@ -10608,9 +10700,21 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
         // Buffer age: the slot about to be drawn into also missed every frame composited
         // since it was last used, so its region is this frame's damage plus that.
         const unsigned back = p.back_slot();
+        // Backdrop blur (ext-background-effect-v1): a frame with blur draws plans its regions
+        // first — a stale one grows the damage to its footprint, which is composited in a
+        // rect of its own with the rects that meet it (`gfx::blur_planner::isolate`); other
+        // rects stay as they are. A frame without any does nothing here.
+        bool blur_again = false;
+        const bool blur_open = blur_frame(p, slot, back, snapshot, frame_damage, blur_again);
         gfx::damage_region region = frame_damage;
         region.add_region(p.slot_age[back]);
         region.clip(p.scanout_rect);
+        if (blur_again) {
+            if (gl_present_)
+                gl_compositor_.isolate_blur(region);
+            else
+                vk_compositor_.isolate_blur(region);
+        }
         lx::trace::scoped_span composite_span{"render", "composite"};
         if (gl_present_) {
             auto c = painter_.paint_gl(gl_compositor_, ui_gl_.get(), p.gl[back].framebuffer(),
@@ -10620,6 +10724,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 log_render.error(c.get_error());
             } else {
                 drawn = true;
+                submitted = c.value().composite.draws_submitted;
                 // This frame supersedes any uncommitted one, so its fence replaces that
                 // frame's — which is dropped rather than leaked.
                 p.discard_fence();
@@ -10654,6 +10759,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             } else {
                 drawn = true;
                 const auto stats = c.value().composite;
+                submitted = stats.draws_submitted;
                 if (stats.draws_skipped > 0 || c.value().ui.primitives_skipped > 0)
                     log_render.warn("draw referenced an unregistered texture");
                 if (stats.draws_unsupported > 0)
@@ -10667,6 +10773,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             // pass through `:ui_vk`; one without is the blit composite.
             const gfx::render_target* previous =
                 p.capture_front >= 0 ? &p.vk[p.capture_front] : nullptr;
+            vk_compositor_.set_gpu_timing(log_render.enabled(lx::trace::level::debug));
             auto c = painter_.paint_vk(vk_compositor_, ui_vk_.get(), p.vk[back], snapshot,
                                        &chrome_atlas_, gfx::k_text_contrast_dark, &region,
                                        &frame_damage, previous);
@@ -10674,6 +10781,11 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 log_render.error(c.get_error());
             } else {
                 drawn = true;
+                submitted = c.value().composite.draws_submitted;
+                if (const std::uint64_t serial = c.value().composite.gpu_serial; serial != 0) {
+                    vk_gpu_frames_[vk_gpu_next_] = {serial, static_cast<long long>(idx), slot};
+                    vk_gpu_next_ = (vk_gpu_next_ + 1u) % k_vk_gpu_frames;
+                }
                 p.discard_fence();
                 p.composited_fence = c.value().composite.out_fence_fd;
                 hint_composite_deadline(p);
@@ -10725,6 +10837,12 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
             // Not drawn: try again next tick rather than lose it.
             p.missed.add_region(frame_damage);
         }
+        if (blur_open) {
+            if (gl_present_)
+                gl_compositor_.end_blur_frame();
+            else
+                vk_compositor_.end_blur_frame();
+        }
     } else if (!p.scanout() && cpu_present_ && !p.kms) {
         // A virtual output on the CPU path: nothing is shown, so nothing is composited here —
         // a screen capture composites this frame's draws into its own buffer.
@@ -10763,6 +10881,53 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
     p.rendered_frame.store(static_cast<long long>(idx), std::memory_order_release);
     scene.release_render_frame(slot, snapshot);
     return drawn;
+}
+
+bool compositor_impl::blur_frame(output_pipeline& p, unsigned slot, unsigned back,
+                                 const scene::immutable_frame_snapshot& snapshot,
+                                 gfx::damage_region& frame_damage, bool& again) {
+    again = false;
+    const scene::draw_list& draws = snapshot.draws();
+    const unsigned count = draws.blur_source_count();
+    if (count == 0) {
+        // No blur draw on this output any more: its levels go.
+        if (gl_present_ && gl_compositor_.blur_in_use(slot))
+            gl_compositor_.release_blur(slot);
+        else if (vulkan_present_ && vk_compositor_.blur_in_use(slot))
+            vk_compositor_.release_blur(slot);
+        return false;
+    }
+    if (!gl_present_ && !vulkan_present_)
+        return false;
+    gfx::blur_source sources[gfx::k_max_blur_sources]{};
+    const unsigned n = count < gfx::k_max_blur_sources ? count : gfx::k_max_blur_sources;
+    for (unsigned i = 0; i < draws.size(); ++i) {
+        const scene::draw_command& d = draws.data()[i];
+        if (!d.blur || d.blur_source >= n)
+            continue;
+        sources[d.blur_source].box = d.blur_box;
+        // Drawn: not occluded, and not culled as invisible (`gfx::draw_invisible`) before
+        // its blur would run — an unseen region stays stale and adds no damage.
+        sources[d.blur_source].visible = sources[d.blur_source].visible ||
+                                         (!d.occluded && d.opacity * d.tint.a > 0.f);
+    }
+    const int w = static_cast<int>(gl_present_ ? p.gl[back].width() : p.vk[back].width());
+    const int h = static_cast<int>(gl_present_ ? p.gl[back].height() : p.vk[back].height());
+    // What each region's blur reads, bottom first (a lower region is part of a higher one's
+    // backdrop): unchanged, its cached blur is drawn again.
+    std::uint64_t backdrops[gfx::k_max_blur_sources]{};
+    for (unsigned k = 0; k < n; ++k) {
+        backdrops[k] = scene::blur_backdrop_signature(
+            draws, k, gfx::blur_footprint(sources[k].box, w, h), snapshot.clear_color(),
+            {backdrops, k});
+        sources[k].backdrop = backdrops[k];
+    }
+    if (gl_present_)
+        again = gl_compositor_.begin_blur_frame(slot, p.gl[back].framebuffer(), {sources, n},
+                                                frame_damage, w, h);
+    else
+        again = vk_compositor_.begin_blur_frame(slot, {sources, n}, frame_damage, w, h);
+    return true;
 }
 
 void compositor_impl::capture_paint_for(capture_frame_source& src, capture_paint_ctx& ctx,

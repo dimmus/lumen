@@ -33,6 +33,26 @@ struct service_notifier {
     static void watchdog_ping();
 };
 
+/// RLIMIT_NOFILE. A display server holds several descriptors per client (the connection,
+/// dma-buf planes, sync files, keymaps, data offers), and the soft limit a systemd user
+/// service starts with is 1024 (DefaultLimitNOFILESoft): the server cannot accept the next
+/// client long before the hard limit. `raise` lifts the soft limit to the hard one for this
+/// process; `restore_in_child` puts back the limit it started with in a child between fork
+/// and exec, so a program that still uses select(2) is not handed descriptors >= 1024.
+struct fd_limit {
+    struct change {
+        unsigned long long before = 0; ///< soft limit the process started with
+        unsigned long long after = 0;  ///< soft limit now (the hard limit once raised)
+    };
+    /// Raises the soft limit to the hard limit and remembers the one the process started
+    /// with. Call once at start-up, before any thread or child exists; a second call
+    /// answers the same `before`.
+    [[nodiscard]] static lx::result<change> raise();
+    /// The soft limit `raise` started from, back on this process. Between fork and exec
+    /// (async-signal-safe: one setrlimit); a no-op when `raise` did not change it.
+    static void restore_in_child() noexcept;
+};
+
 /// The session environment on the user bus: org.freedesktop.systemd1.Manager.SetEnvironment
 /// and UnsetEnvironment, and org.freedesktop.DBus.UpdateActivationEnvironment. UI affinity.
 /// The bus is attached to an sd-event loop the caller owns (the control socket's), so its

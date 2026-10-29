@@ -304,8 +304,10 @@ void lx::shell::shm_canvas::blit(int bi, lx::rect2i logical, const std::uint32_t
             const unsigned rr = ((s >> 16) & 0xFFu) + (((d >> 16) & 0xFFu) * ia + 127u) / 255u;
             const unsigned gg = ((s >> 8) & 0xFFu) + (((d >> 8) & 0xFFu) * ia + 127u) / 255u;
             const unsigned bb = (s & 0xFFu) + ((d & 0xFFu) * ia + 127u) / 255u;
-            row[tx] = 0xFF000000u | ((rr > 255 ? 255 : rr) << 16) | ((gg > 255 ? 255 : gg) << 8) |
-                      (bb > 255 ? 255 : bb);
+            // Over a translucent pixel (premultiplied buffers) the alpha blends too.
+            const unsigned aa = alpha_ ? a + ((d >> 24) * ia + 127u) / 255u : 255u;
+            row[tx] = ((aa > 255 ? 255 : aa) << 24) | ((rr > 255 ? 255 : rr) << 16) |
+                      ((gg > 255 ? 255 : gg) << 8) | (bb > 255 ? 255 : bb);
         }
     }
 }

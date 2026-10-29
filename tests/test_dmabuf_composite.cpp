@@ -7,6 +7,7 @@
 #include "lumen_test.hpp"
 
 #include <fcntl.h>
+#include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -774,6 +775,98 @@ LUMEN_TEST(composite_exports_a_sync_file_when_supported) {
     LUMEN_CHECK(static_cast<bool>(stats));
     LUMEN_CHECK(stats.value().out_fence_fd >= 0);
     ::close(stats.value().out_fence_fd);
+}
+
+// GPU timing (`set_gpu_timing`): off, a frame is not timed and nothing is reported; on, each
+// frame's composite and encode passes come back once its fence has signalled, each non-zero
+// and together no longer than the frame took from the composite call to its fence (the
+// timestamps run inside that interval), and the pixels are those of an untimed frame.
+LUMEN_TEST(gpu_timing_reports_each_frames_passes) {
+    gpu_fixture gpu{};
+    if (!setup_gpu(gpu))
+        return;
+    if (!gpu.compositor.gpu_timing_supported()) {
+        std::printf("SKIP: queue family has no timestamps\n");
+        return;
+    }
+    constexpr unsigned texture_id = 0x4000'0050u;
+    if (!upload_split_texture(gpu, texture_id))
+        return;
+    constexpr unsigned k_size = 512;
+    auto made = lx::gfx::render_target::create(gpu.device.context(), k_size, k_size);
+    LUMEN_CHECK(static_cast<bool>(made));
+    if (!made)
+        return;
+    lx::gfx::render_target target = std::move(made).value();
+    lx::gfx::blit_command cmd{};
+    cmd.texture_id = texture_id;
+    cmd.dst = {0, 0, static_cast<int>(k_size), static_cast<int>(k_size)};
+    cmd.scaled = true;
+    cmd.opacity = 0.75f;
+    const lx::color clear = lx::color::rgb(0.f, 0.2f, 0.f);
+    lx::gfx::composite_gpu_time times[lx::gfx::vulkan_compositor::k_gpu_times]{};
+    const auto read = [&] {
+        std::vector<unsigned char> px(k_size * k_size * 4u);
+        LUMEN_CHECK(static_cast<bool>(
+            gpu.compositor.read_back(target, px.data(), static_cast<unsigned>(px.size()))));
+        return px;
+    };
+
+    // Off (the default).
+    auto untimed = composite_owned(gpu.compositor, target, clear, &cmd, 1);
+    LUMEN_CHECK(untimed && untimed.value().gpu_serial == 0);
+    const std::vector<unsigned char> reference = read();
+    LUMEN_CHECK(gpu.compositor.take_gpu_times(times, 4) == 0);
+
+    // On: four frames, each waited for through its sync_file (or the composite blocked).
+    gpu.compositor.set_gpu_timing(true);
+    constexpr unsigned k_frames = 4;
+    std::uint64_t serials[k_frames]{};
+    std::uint64_t wall_ns[k_frames]{};
+    for (unsigned i = 0; i < k_frames; ++i) {
+        const auto t0 = std::chrono::steady_clock::now();
+        auto c = gpu.compositor.composite(target, clear, &cmd, 1);
+        LUMEN_CHECK(static_cast<bool>(c));
+        if (!c)
+            return;
+        if (c.value().out_fence_fd >= 0) {
+            pollfd pfd{c.value().out_fence_fd, POLLIN, 0};
+            LUMEN_CHECK(::poll(&pfd, 1, 5000) == 1);
+            ::close(c.value().out_fence_fd);
+        }
+        wall_ns[i] = static_cast<std::uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count());
+        serials[i] = c.value().gpu_serial;
+        LUMEN_CHECK(serials[i] != 0 && (i == 0 || serials[i] > serials[i - 1]));
+    }
+    // The sync_file signals with the work; the VkFence the results wait for may trail it.
+    unsigned got = 0;
+    lx::gfx::composite_gpu_time all[k_frames]{};
+    for (int tries = 0; tries < 1000 && got < k_frames; ++tries) {
+        got += gpu.compositor.take_gpu_times(all + got, k_frames - got);
+        if (got < k_frames)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    LUMEN_CHECK(got == k_frames);
+    for (unsigned i = 0; i < got && i < k_frames; ++i) {
+        const std::uint64_t gpu_ns = all[i].composite_ns + all[i].encode_ns;
+        std::printf("    frame %u: composite %.3f ms, encode %.3f ms, wall %.3f ms\n", i,
+                    all[i].composite_ns / 1e6, all[i].encode_ns / 1e6, wall_ns[i] / 1e6);
+        LUMEN_CHECK(all[i].serial == serials[i]);
+        LUMEN_CHECK(all[i].composite_ns > 0 && all[i].encode_ns > 0);
+        LUMEN_CHECK(gpu_ns <= wall_ns[i]);
+    }
+    LUMEN_CHECK(read() == reference);
+    LUMEN_CHECK(gpu.compositor.take_gpu_times(times, 4) == 0);
+
+    // Off again: untimed.
+    gpu.compositor.set_gpu_timing(false);
+    auto again = composite_owned(gpu.compositor, target, clear, &cmd, 1);
+    LUMEN_CHECK(again && again.value().gpu_serial == 0);
+    LUMEN_CHECK(read() == reference);
+    LUMEN_CHECK(gpu.compositor.take_gpu_times(times, 4) == 0);
 }
 
 // ── solid draws (wp_single_pixel_buffer_v1) ────────────────────────────────

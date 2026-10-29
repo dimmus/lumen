@@ -68,6 +68,14 @@
 #include "ext-session-lock-v1-client-protocol.h"
 #define LUMEN_TEST_SESSION_LOCK 1
 #endif
+#if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
+#include "ext-background-effect-v1-client-protocol.h"
+#define LUMEN_TEST_BACKGROUND_EFFECT 1
+#endif
+#if defined(LUMEN_PROTOCOL_COLOR_MANAGEMENT_V1)
+#include "color-management-v1-client-protocol.h"
+#define LUMEN_TEST_COLOR_MANAGEMENT 1
+#endif
 #if defined(LUMEN_PROTOCOL_TEXT_INPUT_UNSTABLE_V3) && \
     defined(LUMEN_PROTOCOL_INPUT_METHOD_UNSTABLE_V2) && \
     defined(LUMEN_PROTOCOL_VIRTUAL_KEYBOARD_UNSTABLE_V1)
@@ -87,6 +95,7 @@ import lx.foundation;
 import lx.runtime;
 import lx.scheduler;
 import lx.input;
+import lx.gfx;
 import lx.compositor;
 
 #if !defined(LUMEN_HAS_WAYLAND) || !defined(LUMEN_HAS_PROTOCOL_GLUE)
@@ -3860,6 +3869,547 @@ int main() {
         check("single-pixel + viewport + alpha + content type reach the scene", ok, detail);
         if (c.display)
             wl_display_disconnect(c.display);
+    }
+#endif
+
+#if defined(LUMEN_TEST_BACKGROUND_EFFECT)
+    // ── ext-background-effect-v1: the global, its capabilities, a region, every error ──
+    expect("background-effect: second object for a surface", "ext_background_effect_manager_v1",
+           EXT_BACKGROUND_EFFECT_MANAGER_V1_ERROR_BACKGROUND_EFFECT_EXISTS, [](client& c) {
+               auto* m = static_cast<ext_background_effect_manager_v1*>(
+                   bind_global(c, &ext_background_effect_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               (void)ext_background_effect_manager_v1_get_background_effect(m, s);
+               (void)ext_background_effect_manager_v1_get_background_effect(m, s);
+           });
+    expect("background-effect: set_blur_region after the surface is gone",
+           "ext_background_effect_surface_v1",
+           EXT_BACKGROUND_EFFECT_SURFACE_V1_ERROR_SURFACE_DESTROYED, [](client& c) {
+               auto* m = static_cast<ext_background_effect_manager_v1*>(
+                   bind_global(c, &ext_background_effect_manager_v1_interface, 1));
+               wl_surface* s = wl_compositor_create_surface(c.compositor);
+               ext_background_effect_surface_v1* e =
+                   ext_background_effect_manager_v1_get_background_effect(m, s);
+               wl_surface_destroy(s);
+               ext_background_effect_surface_v1_set_blur_region(e, nullptr);
+           });
+    {
+        // Bound: the capabilities arrive with the bind. A window with a region of two
+        // overlapping rects: where the backend blurs, the node holds it clipped and made
+        // disjoint (3 rects, the overlap once); where it does not (capabilities 0), nothing
+        // reaches the scene. Destroying the object drops the region at the next commit.
+        client c{};
+        bool ok = connect(c);
+        std::string detail;
+        auto* m = ok ? static_cast<ext_background_effect_manager_v1*>(
+                           bind_global(c, &ext_background_effect_manager_v1_interface, 1))
+                     : nullptr;
+        struct caps_seen {
+            bool got = false;
+            uint32_t flags = 0;
+        } caps{};
+        static const ext_background_effect_manager_v1_listener listener = {
+            .capabilities = [](void* data, ext_background_effect_manager_v1*, uint32_t flags) {
+                auto* cs = static_cast<caps_seen*>(data);
+                cs->got = true;
+                cs->flags = flags;
+            }};
+        if (m) {
+            ext_background_effect_manager_v1_add_listener(m, &listener, &caps);
+            (void)wl_display_roundtrip(c.display);
+        }
+        ok = ok && m && caps.got;
+        detail = std::string("capabilities ") + (caps.got ? std::to_string(caps.flags) : "none");
+#if defined(LUMEN_TEST_VIEWPORTER)
+        auto* spb = ok ? static_cast<wp_single_pixel_buffer_manager_v1*>(
+                             bind_global(c, &wp_single_pixel_buffer_manager_v1_interface, 1))
+                       : nullptr;
+        if (ok && spb && c.viewporter) {
+            window w{};
+            map_window(c, w);
+            wp_viewport* v = wp_viewporter_get_viewport(c.viewporter, w.surface);
+            wp_viewport_set_destination(v, 200, 150);
+            ext_background_effect_surface_v1* e =
+                ext_background_effect_manager_v1_get_background_effect(m, w.surface);
+            wl_region* r = wl_compositor_create_region(c.compositor);
+            wl_region_add(r, 0, 0, 100, 50);
+            wl_region_add(r, 50, 25, 100, 50);
+            wl_region_add(r, 150, 140, 100, 100); // clipped to the surface: 50 x 10
+            ext_background_effect_surface_v1_set_blur_region(e, r);
+            wl_region_destroy(r); // copy semantics
+            wl_buffer* px = wp_single_pixel_buffer_manager_v1_create_u32_rgba_buffer(
+                spb, 0x10000000u, 0x20000000u, 0x30000000u, 0x80000000u);
+            wl_surface_attach(w.surface, px, 0, 0);
+            wl_surface_damage_buffer(w.surface, 0, 0, 1, 1);
+            wl_surface_commit(w.surface);
+            ok = wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0 &&
+                 wl_display_get_error(c.display) == 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            const auto region_of = [&]() {
+                std::lock_guard<std::mutex> hold(dispatch_lock);
+                for (unsigned long long id = 1; id < 4096; ++id) {
+                    const auto* n = comp.surfaces().node(lx::surface_id{id});
+                    if (n && n->solid() && n->solid_color().a > 0.49f && n->solid_color().a < 0.51f &&
+                        n->solid_color().r > 0.06f && n->solid_color().r < 0.07f)
+                        return static_cast<int>(n->blur_rect_count());
+                }
+                return -1;
+            };
+            const int count = region_of();
+            const bool blur = (caps.flags & EXT_BACKGROUND_EFFECT_MANAGER_V1_CAPABILITY_BLUR) != 0;
+            ok = ok && count == (blur ? 4 : 0);
+            detail += ", node rects " + std::to_string(count);
+            ext_background_effect_surface_v1_destroy(e);
+            wl_surface_commit(w.surface);
+            ok = ok && wl_display_roundtrip(c.display) >= 0 && wl_display_roundtrip(c.display) >= 0;
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+            const int after = region_of();
+            ok = ok && after == 0;
+            detail += ", after destroy " + std::to_string(after);
+        } else {
+            ok = false;
+            detail += ", no single-pixel/viewporter";
+        }
+#endif
+        check("background-effect: capabilities on bind, the region reaches the scene only "
+              "where the backend blurs",
+              ok, detail);
+        if (c.display)
+            wl_display_disconnect(c.display);
+    }
+#endif
+
+#if defined(LUMEN_TEST_COLOR_MANAGEMENT)
+    // ── wp_color_manager_v1: what is offered, descriptions, surfaces, outputs, every error ──
+    {
+        struct cm_state {
+            std::vector<uint32_t> intents, features, tfs, primaries;
+            bool done = false;
+        };
+        struct desc_state {
+            bool ready = false;
+            bool failed = false;
+            uint32_t cause = ~0u;
+            uint64_t identity = 0;
+        };
+        struct info_state {
+            std::vector<std::string> events;
+            int32_t prim[8]{};
+            uint32_t tf = 0;
+            uint32_t lum[3]{};
+            bool done = false;
+        };
+        static const wp_color_manager_v1_listener cm_listener = {
+            .supported_intent = [](void* d, wp_color_manager_v1*,
+                                   uint32_t v) { static_cast<cm_state*>(d)->intents.push_back(v); },
+            .supported_feature = [](void* d, wp_color_manager_v1*,
+                                    uint32_t v) { static_cast<cm_state*>(d)->features.push_back(v); },
+            .supported_tf_named = [](void* d, wp_color_manager_v1*,
+                                     uint32_t v) { static_cast<cm_state*>(d)->tfs.push_back(v); },
+            .supported_primaries_named =
+                [](void* d, wp_color_manager_v1*, uint32_t v) {
+                    static_cast<cm_state*>(d)->primaries.push_back(v);
+                },
+            .done = [](void* d, wp_color_manager_v1*) { static_cast<cm_state*>(d)->done = true; },
+        };
+        static const wp_image_description_v1_listener desc_listener = {
+            .failed =
+                [](void* d, wp_image_description_v1*, uint32_t cause, const char*) {
+                    static_cast<desc_state*>(d)->failed = true;
+                    static_cast<desc_state*>(d)->cause = cause;
+                },
+            .ready =
+                [](void* d, wp_image_description_v1*, uint32_t id) {
+                    static_cast<desc_state*>(d)->ready = true;
+                    static_cast<desc_state*>(d)->identity = id;
+                },
+            .ready2 =
+                [](void* d, wp_image_description_v1*, uint32_t hi, uint32_t lo) {
+                    static_cast<desc_state*>(d)->ready = true;
+                    static_cast<desc_state*>(d)->identity = (uint64_t{hi} << 32) | lo;
+                },
+        };
+        static const wp_image_description_info_v1_listener info_listener = {
+            .done = [](void* d, wp_image_description_info_v1*) {
+                static_cast<info_state*>(d)->done = true;
+            },
+            .icc_file = [](void* d, wp_image_description_info_v1*, int32_t fd, uint32_t) {
+                static_cast<info_state*>(d)->events.push_back("icc_file");
+                close(fd);
+            },
+            .primaries =
+                [](void* d, wp_image_description_info_v1*, int32_t a, int32_t b, int32_t c2,
+                   int32_t d2, int32_t e, int32_t f, int32_t g, int32_t h) {
+                    auto* i = static_cast<info_state*>(d);
+                    i->events.push_back("primaries");
+                    const int32_t v[8] = {a, b, c2, d2, e, f, g, h};
+                    std::copy(v, v + 8, i->prim);
+                },
+            .primaries_named = [](void* d, wp_image_description_info_v1*,
+                                  uint32_t) { static_cast<info_state*>(d)->events.push_back("primaries_named"); },
+            .tf_power = [](void* d, wp_image_description_info_v1*,
+                           uint32_t) { static_cast<info_state*>(d)->events.push_back("tf_power"); },
+            .tf_named =
+                [](void* d, wp_image_description_info_v1*, uint32_t tf) {
+                    static_cast<info_state*>(d)->events.push_back("tf_named");
+                    static_cast<info_state*>(d)->tf = tf;
+                },
+            .luminances =
+                [](void* d, wp_image_description_info_v1*, uint32_t a, uint32_t b, uint32_t c2) {
+                    auto* i = static_cast<info_state*>(d);
+                    i->events.push_back("luminances");
+                    i->lum[0] = a;
+                    i->lum[1] = b;
+                    i->lum[2] = c2;
+                },
+            .target_primaries =
+                [](void* d, wp_image_description_info_v1*, int32_t, int32_t, int32_t, int32_t,
+                   int32_t, int32_t, int32_t, int32_t) {
+                    static_cast<info_state*>(d)->events.push_back("target_primaries");
+                },
+            .target_luminance = [](void* d, wp_image_description_info_v1*, uint32_t,
+                                   uint32_t) { static_cast<info_state*>(d)->events.push_back("target_luminance"); },
+            .target_max_cll = [](void* d, wp_image_description_info_v1*,
+                                 uint32_t) { static_cast<info_state*>(d)->events.push_back("target_max_cll"); },
+            .target_max_fall = [](void* d, wp_image_description_info_v1*,
+                                  uint32_t) { static_cast<info_state*>(d)->events.push_back("target_max_fall"); },
+        };
+        const auto bind_cm = [](client& c, uint32_t version, cm_state& st) {
+            auto* m = static_cast<wp_color_manager_v1*>(
+                bind_global(c, &wp_color_manager_v1_interface, version));
+            if (m) {
+                wp_color_manager_v1_add_listener(m, &cm_listener, &st);
+                (void)wl_display_roundtrip(c.display);
+            }
+            return m;
+        };
+        const auto has = [](const std::vector<uint32_t>& v, uint32_t x) {
+            return std::find(v.begin(), v.end(), x) != v.end();
+        };
+
+        // What is offered, at version 3 and at version 1 (`srgb` there, no windows_bt2100).
+        client c{};
+        bool ok = connect(c);
+        cm_state st{};
+        wp_color_manager_v1* m = ok ? bind_cm(c, 3, st) : nullptr;
+        ok = ok && m && st.done && has(st.intents, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL) &&
+             st.intents.size() == 1;
+        const bool parametric = has(st.features, WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC);
+        if (parametric) {
+            const std::vector<uint32_t> want_f{WP_COLOR_MANAGER_V1_FEATURE_PARAMETRIC,
+                                               WP_COLOR_MANAGER_V1_FEATURE_SET_PRIMARIES,
+                                               WP_COLOR_MANAGER_V1_FEATURE_SET_TF_POWER,
+                                               WP_COLOR_MANAGER_V1_FEATURE_SET_LUMINANCES,
+                                               WP_COLOR_MANAGER_V1_FEATURE_SET_MASTERING_DISPLAY_PRIMARIES,
+                                               WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_BT2100};
+            const std::vector<uint32_t> want_tf{WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22,
+                                                WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_EXT_LINEAR,
+                                                WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ,
+                                                WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_COMPOUND_POWER_2_4};
+            ok = ok && st.features == want_f && st.tfs == want_tf && st.primaries.size() == 10;
+        }
+        check("color-management: version 3 offers the perceptual intent and, where the backend "
+              "draws them, parametric descriptions",
+              ok,
+              "features " + std::to_string(st.features.size()) + ", tfs " +
+                  std::to_string(st.tfs.size()) + ", primaries " + std::to_string(st.primaries.size()) +
+                  (parametric ? "" : " (backend draws no colour management)"));
+        {
+            client c1{};
+            cm_state s1{};
+            bool ok1 = connect(c1) && bind_cm(c1, 1, s1) && s1.done;
+            if (parametric)
+                ok1 = ok1 && has(s1.tfs, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB) &&
+                      !has(s1.tfs, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_COMPOUND_POWER_2_4) &&
+                      !has(s1.features, WP_COLOR_MANAGER_V1_FEATURE_WINDOWS_BT2100);
+            check("color-management: version 1 gets srgb, not its version 2 successor", ok1,
+                  "tfs " + std::to_string(s1.tfs.size()));
+            if (c1.display)
+                wl_display_disconnect(c1.display);
+        }
+
+        // The output's description: ready with an identity, its information sRGB.
+        if (ok && c.output_name) {
+            auto* out = static_cast<wl_output*>(
+                wl_registry_bind(c.registry, c.output_name, &wl_output_interface, 1));
+            wp_color_management_output_v1* co = wp_color_manager_v1_get_output(m, out);
+            wp_image_description_v1* od = wp_color_management_output_v1_get_image_description(co);
+            desc_state ods{};
+            wp_image_description_v1_add_listener(od, &desc_listener, &ods);
+            (void)wl_display_roundtrip(c.display);
+            info_state info{};
+            if (ods.ready) {
+                wp_image_description_info_v1* i = wp_image_description_v1_get_information(od);
+                wp_image_description_info_v1_add_listener(i, &info_listener, &info);
+                (void)wl_display_roundtrip(c.display);
+            }
+            const std::vector<std::string> want{"primaries", "primaries_named", "tf_named",
+                                                "luminances", "target_primaries",
+                                                "target_luminance"};
+            const bool out_ok = ods.ready && ods.identity != 0 && info.done && info.events == want &&
+                                info.prim[0] == 640000 && info.prim[7] == 329000 &&
+                                info.tf == WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_COMPOUND_POWER_2_4 &&
+                                info.lum[0] == 2000 && info.lum[1] == 80 && info.lum[2] == 80;
+            // The feedback's preferred description is the output's (same identity).
+            window w{};
+            map_window(c, w);
+            wp_color_management_surface_feedback_v1* fb =
+                wp_color_manager_v1_get_surface_feedback(m, w.surface);
+            wp_image_description_v1* pd = wp_color_management_surface_feedback_v1_get_preferred(fb);
+            desc_state pds{};
+            wp_image_description_v1_add_listener(pd, &desc_listener, &pds);
+            (void)wl_display_roundtrip(c.display);
+            check("color-management: the output's description is sRGB, and preferred",
+                  out_ok && pds.ready && pds.identity == ods.identity,
+                  "ready " + std::to_string(ods.ready) + ", events " +
+                      std::to_string(info.events.size()) + ", tf " + std::to_string(info.tf) +
+                      ", preferred identity " + std::to_string(pds.identity) + " / " +
+                      std::to_string(ods.identity));
+
+            if (parametric) {
+                // A PQ BT.2020 description with every optional property: ready, a new identity.
+                wp_image_description_creator_params_v1* p =
+                    wp_color_manager_v1_create_parametric_creator(m);
+                wp_image_description_creator_params_v1_set_tf_named(
+                    p, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+                wp_image_description_creator_params_v1_set_primaries_named(
+                    p, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+                wp_image_description_creator_params_v1_set_luminances(p, 50, 10000, 203);
+                wp_image_description_creator_params_v1_set_mastering_display_primaries(
+                    p, 680000, 320000, 265000, 690000, 150000, 60000, 312700, 329000);
+                wp_image_description_creator_params_v1_set_mastering_luminance(p, 50, 1000);
+                wp_image_description_creator_params_v1_set_max_cll(p, 1000);
+                wp_image_description_creator_params_v1_set_max_fall(p, 400);
+                wp_image_description_v1* hd = wp_image_description_creator_params_v1_create(p);
+                desc_state hds{};
+                wp_image_description_v1_add_listener(hd, &desc_listener, &hds);
+                // Degenerate (collinear) primaries: failed, not an error.
+                wp_image_description_creator_params_v1* q =
+                    wp_color_manager_v1_create_parametric_creator(m);
+                wp_image_description_creator_params_v1_set_tf_named(
+                    q, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22);
+                wp_image_description_creator_params_v1_set_primaries(q, 100000, 100000, 200000, 200000,
+                                                                     300000, 300000, 312700, 329000);
+                wp_image_description_v1* bd = wp_image_description_creator_params_v1_create(q);
+                desc_state bds{};
+                wp_image_description_v1_add_listener(bd, &desc_listener, &bds);
+                (void)wl_display_roundtrip(c.display);
+                const bool made = hds.ready && hds.identity != 0 && hds.identity != ods.identity &&
+                                  bds.failed && bds.cause == WP_IMAGE_DESCRIPTION_V1_CAUSE_UNSUPPORTED;
+
+                // Set on the window: the scene node gets the transform at the commit (and
+                // not before); destroying the description object right after changes nothing.
+                wp_color_management_surface_v1* cs = wp_color_manager_v1_get_surface(m, w.surface);
+                wp_color_management_surface_v1_set_image_description(
+                    cs, hd, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+                wp_image_description_v1_destroy(hd);
+                (void)wl_display_roundtrip(c.display);
+                const auto node_color = [&]() {
+                    std::lock_guard<std::mutex> hold(dispatch_lock);
+                    lx::gfx::color_transform t{};
+                    unsigned found = 0;
+                    for (unsigned long long id = 1; id < 4096; ++id) {
+                        const auto* n = comp.surfaces().node(lx::surface_id{id});
+                        if (n && n->color().active) {
+                            t = n->color();
+                            ++found;
+                        }
+                    }
+                    return std::pair{found, t};
+                };
+                const auto before = node_color();
+                wl_surface_commit(w.surface);
+                (void)wl_display_roundtrip(c.display);
+                (void)wl_display_roundtrip(c.display);
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                const auto after = node_color();
+                // max_cll 1000 at reference 203 over black 0.005: the peak (1000 − 0.005) /
+                // (203 − 0.005).
+                const bool applied = before.first == 0 && after.first == 1 &&
+                                     after.second.tf == lx::gfx::color_tf::st2084_pq &&
+                                     std::fabs(after.second.peak - (1000.0 - 0.005) / (203.0 - 0.005)) < 1e-3;
+                // Unset: back to sRGB at the next commit.
+                wp_color_management_surface_v1_unset_image_description(cs);
+                wl_surface_commit(w.surface);
+                (void)wl_display_roundtrip(c.display);
+                (void)wl_display_roundtrip(c.display);
+                std::this_thread::sleep_for(std::chrono::milliseconds(30));
+                const auto unset = node_color();
+                // windows_bt2100 (version 3): ready.
+                wp_image_description_v1* wd = wp_color_manager_v1_create_windows_bt2100(m);
+                desc_state wds{};
+                wp_image_description_v1_add_listener(wd, &desc_listener, &wds);
+                (void)wl_display_roundtrip(c.display);
+                check("color-management: a parametric PQ description reaches the scene at the "
+                      "commit, unset leaves it, degenerate primaries fail",
+                      made && applied && unset.first == 0 && wds.ready &&
+                          wl_display_get_error(c.display) == 0,
+                      "ready " + std::to_string(hds.ready) + ", degenerate failed " +
+                          std::to_string(bds.failed) + ", nodes before/after/unset " +
+                          std::to_string(before.first) + "/" + std::to_string(after.first) + "/" +
+                          std::to_string(unset.first) + ", peak " +
+                          std::to_string(after.second.peak) + ", bt2100 " +
+                          std::to_string(wds.ready));
+            }
+        } else {
+            check("color-management: the output's description is sRGB, and preferred", false,
+                  ok ? "no wl_output global" : "not bound");
+        }
+        if (c.display)
+            wl_display_disconnect(c.display);
+
+        if (parametric) {
+            const auto creator = [](client& k) {
+                auto* mm = static_cast<wp_color_manager_v1*>(
+                    bind_global(k, &wp_color_manager_v1_interface, 3));
+                return wp_color_manager_v1_create_parametric_creator(mm);
+            };
+            expect("color-management: second get_surface for a surface", "wp_color_manager_v1",
+                   WP_COLOR_MANAGER_V1_ERROR_SURFACE_EXISTS, [](client& k) {
+                       auto* mm = static_cast<wp_color_manager_v1*>(
+                           bind_global(k, &wp_color_manager_v1_interface, 3));
+                       wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       (void)wp_color_manager_v1_get_surface(mm, s);
+                       (void)wp_color_manager_v1_get_surface(mm, s);
+                   });
+            expect("color-management: ICC creator is not offered", "wp_color_manager_v1",
+                   WP_COLOR_MANAGER_V1_ERROR_UNSUPPORTED_FEATURE, [](client& k) {
+                       auto* mm = static_cast<wp_color_manager_v1*>(
+                           bind_global(k, &wp_color_manager_v1_interface, 3));
+                       (void)wp_color_manager_v1_create_icc_creator(mm);
+                   });
+            expect("color-management: Windows-scRGB is not offered", "wp_color_manager_v1",
+                   WP_COLOR_MANAGER_V1_ERROR_UNSUPPORTED_FEATURE, [](client& k) {
+                       auto* mm = static_cast<wp_color_manager_v1*>(
+                           bind_global(k, &wp_color_manager_v1_interface, 3));
+                       (void)wp_color_manager_v1_create_windows_scrgb(mm);
+                   });
+            expect("color-management: transfer function set twice",
+                   "wp_image_description_creator_params_v1",
+                   WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_ALREADY_SET, [creator](client& k) {
+                       auto* p = creator(k);
+                       wp_image_description_creator_params_v1_set_tf_named(
+                           p, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22);
+                       wp_image_description_creator_params_v1_set_tf_power(p, 24000);
+                   });
+            expect("color-management: a transfer function not offered (bt1886)",
+                   "wp_image_description_creator_params_v1",
+                   WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_TF, [creator](client& k) {
+                       wp_image_description_creator_params_v1_set_tf_named(
+                           creator(k), WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_BT1886);
+                   });
+            expect("color-management: srgb is deprecated at version 3",
+                   "wp_image_description_creator_params_v1",
+                   WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_TF, [creator](client& k) {
+                       wp_image_description_creator_params_v1_set_tf_named(
+                           creator(k), WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_SRGB);
+                   });
+            expect("color-management: power exponent below 1",
+                   "wp_image_description_creator_params_v1",
+                   WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_TF, [creator](client& k) {
+                       wp_image_description_creator_params_v1_set_tf_power(creator(k), 9999);
+                   });
+            expect("color-management: unnamed primaries", "wp_image_description_creator_params_v1",
+                   WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_PRIMARIES_NAMED,
+                   [creator](client& k) {
+                       wp_image_description_creator_params_v1_set_primaries_named(creator(k), 11);
+                   });
+            expect("color-management: reference white below the minimum",
+                   "wp_image_description_creator_params_v1",
+                   WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_LUMINANCE,
+                   [creator](client& k) {
+                       wp_image_description_creator_params_v1_set_luminances(creator(k), 20000, 80, 1);
+                   });
+            expect("color-management: max_fall above max_cll",
+                   // `create` is a destructor: the proxy is gone client-side.
+                   "[destroyed]",
+                   WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INVALID_LUMINANCE,
+                   [creator](client& k) {
+                       auto* p = creator(k);
+                       wp_image_description_creator_params_v1_set_tf_named(
+                           p, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_ST2084_PQ);
+                       wp_image_description_creator_params_v1_set_primaries_named(
+                           p, WP_COLOR_MANAGER_V1_PRIMARIES_BT2020);
+                       wp_image_description_creator_params_v1_set_max_cll(p, 400);
+                       wp_image_description_creator_params_v1_set_max_fall(p, 500);
+                       (void)wp_image_description_creator_params_v1_create(p);
+                   });
+            expect("color-management: create without primaries",
+                   // `create` is a destructor: the proxy is gone client-side.
+                   "[destroyed]",
+                   WP_IMAGE_DESCRIPTION_CREATOR_PARAMS_V1_ERROR_INCOMPLETE_SET, [creator](client& k) {
+                       auto* p = creator(k);
+                       wp_image_description_creator_params_v1_set_tf_named(
+                           p, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22);
+                       (void)wp_image_description_creator_params_v1_create(p);
+                   });
+            expect("color-management: information on a client's own description",
+                   "wp_image_description_v1", WP_IMAGE_DESCRIPTION_V1_ERROR_NO_INFORMATION,
+                   [creator](client& k) {
+                       auto* p = creator(k);
+                       wp_image_description_creator_params_v1_set_tf_named(
+                           p, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22);
+                       wp_image_description_creator_params_v1_set_primaries_named(
+                           p, WP_COLOR_MANAGER_V1_PRIMARIES_DISPLAY_P3);
+                       wp_image_description_v1* d = wp_image_description_creator_params_v1_create(p);
+                       (void)wl_display_roundtrip(k.display);
+                       (void)wp_image_description_v1_get_information(d);
+                   });
+            expect("color-management: a description that failed is not ready",
+                   "wp_color_management_surface_v1",
+                   WP_COLOR_MANAGEMENT_SURFACE_V1_ERROR_IMAGE_DESCRIPTION, [creator](client& k) {
+                       auto* mm = static_cast<wp_color_manager_v1*>(
+                           bind_global(k, &wp_color_manager_v1_interface, 3));
+                       auto* p = creator(k);
+                       wp_image_description_creator_params_v1_set_tf_named(
+                           p, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22);
+                       wp_image_description_creator_params_v1_set_primaries(
+                           p, 100000, 100000, 200000, 200000, 300000, 300000, 312700, 329000);
+                       wp_image_description_v1* d = wp_image_description_creator_params_v1_create(p);
+                       (void)wl_display_roundtrip(k.display);
+                       wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       wp_color_management_surface_v1* cs = wp_color_manager_v1_get_surface(mm, s);
+                       wp_color_management_surface_v1_set_image_description(
+                           cs, d, WP_COLOR_MANAGER_V1_RENDER_INTENT_PERCEPTUAL);
+                   });
+            expect("color-management: an intent not offered", "wp_color_management_surface_v1",
+                   WP_COLOR_MANAGEMENT_SURFACE_V1_ERROR_RENDER_INTENT, [creator](client& k) {
+                       auto* mm = static_cast<wp_color_manager_v1*>(
+                           bind_global(k, &wp_color_manager_v1_interface, 3));
+                       auto* p = creator(k);
+                       wp_image_description_creator_params_v1_set_tf_named(
+                           p, WP_COLOR_MANAGER_V1_TRANSFER_FUNCTION_GAMMA22);
+                       wp_image_description_creator_params_v1_set_primaries_named(
+                           p, WP_COLOR_MANAGER_V1_PRIMARIES_SRGB);
+                       wp_image_description_v1* d = wp_image_description_creator_params_v1_create(p);
+                       (void)wl_display_roundtrip(k.display);
+                       wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       wp_color_management_surface_v1* cs = wp_color_manager_v1_get_surface(mm, s);
+                       wp_color_management_surface_v1_set_image_description(
+                           cs, d, WP_COLOR_MANAGER_V1_RENDER_INTENT_RELATIVE);
+                   });
+            expect("color-management: set_image_description after the surface is gone",
+                   "wp_color_management_surface_v1", WP_COLOR_MANAGEMENT_SURFACE_V1_ERROR_INERT,
+                   [](client& k) {
+                       auto* mm = static_cast<wp_color_manager_v1*>(
+                           bind_global(k, &wp_color_manager_v1_interface, 3));
+                       wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       wp_color_management_surface_v1* cs = wp_color_manager_v1_get_surface(mm, s);
+                       wl_surface_destroy(s);
+                       wp_color_management_surface_v1_unset_image_description(cs);
+                   });
+            expect("color-management: get_preferred after the surface is gone",
+                   "wp_color_management_surface_feedback_v1",
+                   WP_COLOR_MANAGEMENT_SURFACE_FEEDBACK_V1_ERROR_INERT, [](client& k) {
+                       auto* mm = static_cast<wp_color_manager_v1*>(
+                           bind_global(k, &wp_color_manager_v1_interface, 3));
+                       wl_surface* s = wl_compositor_create_surface(k.compositor);
+                       wp_color_management_surface_feedback_v1* f =
+                           wp_color_manager_v1_get_surface_feedback(mm, s);
+                       wl_surface_destroy(s);
+                       (void)wp_color_management_surface_feedback_v1_get_preferred(f);
+                   });
+        }
     }
 #endif
 

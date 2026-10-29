@@ -35,6 +35,10 @@ struct buffer_lifecycle_record {
     /// (timeline 0: none), signalled when the record is released.
     unsigned sync_timeline = 0;
     unsigned long long sync_point = 0;
+    /// Was current until the last `on_detach` of its surface: what `hold` keeps.
+    bool detached = false;
+    /// A closing window's ghost still draws it (`hold`): current until `release_hold`.
+    bool held = false;
 };
 
 using wl_buffer_release_fn = void (*)(void* wl_buffer_resource, void* user_data);
@@ -70,6 +74,15 @@ public:
     /// `surface` stops showing the dma-buf it has (a new buffer, a null attach, the
     /// surface's end): its records are released once the frames tagged on them complete.
     void on_detach(lx::surface_id surface);
+    /// A closing window's ghost (window animations) keeps drawing what `surface` showed last
+    /// although the surface no longer shows it (a null attach, its end): the dma-buf that was
+    /// current before its last `on_detach` stays current — sampled, never released — until
+    /// `release_hold`. A later commit of another buffer does not supersede it either; the
+    /// same buffer committed again is the surface's once more (no longer held).
+    void hold(lx::surface_id surface);
+    /// The ghost is gone: what `hold` kept is released once the frames that sample it have
+    /// completed, as `on_detach` would have.
+    void release_hold(lx::surface_id surface);
     void on_present(lx::surface_id surface, unsigned frame_index);
     void on_render_done(lx::surface_id surface, unsigned frame_index);
 
@@ -187,6 +200,8 @@ void lx::compositor::buffer_lifecycle_tracker::release_record(unsigned i) {
     rec.sync_timeline = 0;
     rec.sync_point = 0;
     rec.current = false;
+    rec.detached = false;
+    rec.held = false;
     if (cache_)
         cache_->release(rec.cache_key);
     rec.state = buffer_lifecycle_state::released;
@@ -195,10 +210,13 @@ void lx::compositor::buffer_lifecycle_tracker::release_record(unsigned i) {
 lx::result<void> lx::compositor::buffer_lifecycle_tracker::on_import(
     lx::client_id client, lx::surface_id surface, lx::buffer_id buffer,
     const gfx::import_cache_key& key, void* wl_buffer) {
-    // Whatever else the surface showed is superseded by this buffer.
+    // Whatever else the surface showed is superseded by this buffer (a ghost's hold aside).
     for (unsigned i = 0; i < count_; ++i)
-        if (records_[i].surface == surface && records_[i].buffer != buffer)
-            records_[i].current = false;
+        if (records_[i].surface == surface && records_[i].buffer != buffer) {
+            if (!records_[i].held)
+                records_[i].current = false;
+            records_[i].detached = false;
+        }
     // Re-committing the same buffer refreshes the existing record. A *different* buffer
     // gets its own record: the previously attached one may still be in flight, and
     // dropping its wl_buffer here would mean the client never receives its release.
@@ -208,6 +226,9 @@ lx::result<void> lx::compositor::buffer_lifecycle_tracker::on_import(
         rec.cache_key = key;
         rec.wl_buffer = wl_buffer;
         rec.current = true;
+        // The surface shows it again: no ghost's hold may end it while it is on screen.
+        rec.held = false;
+        rec.detached = false;
         // In flight already, it stays so (tagged with the frames that sample it); fresh
         // content goes out with the next published frame.
         if (rec.state != buffer_lifecycle_state::in_flight)
@@ -242,8 +263,33 @@ void lx::compositor::buffer_lifecycle_tracker::on_attach(lx::surface_id surface)
 
 void lx::compositor::buffer_lifecycle_tracker::on_detach(lx::surface_id surface) {
     for (unsigned i = 0; i < count_; ++i)
-        if (records_[i].surface == surface)
-            records_[i].current = false;
+        if (records_[i].surface == surface) {
+            records_[i].detached = records_[i].current;
+            if (!records_[i].held)
+                records_[i].current = false;
+        }
+}
+
+void lx::compositor::buffer_lifecycle_tracker::hold(lx::surface_id surface) {
+    for (unsigned i = 0; i < count_; ++i) {
+        auto& rec = records_[i];
+        if (rec.surface != surface || rec.state == buffer_lifecycle_state::none ||
+            rec.state == buffer_lifecycle_state::released || !(rec.current || rec.detached))
+            continue;
+        rec.held = true;
+        rec.current = true;
+    }
+}
+
+void lx::compositor::buffer_lifecycle_tracker::release_hold(lx::surface_id surface) {
+    for (unsigned i = 0; i < count_; ++i) {
+        auto& rec = records_[i];
+        if (rec.surface != surface || !rec.held)
+            continue;
+        rec.held = false;
+        rec.current = false;
+        rec.detached = false;
+    }
 }
 
 void lx::compositor::buffer_lifecycle_tracker::on_present(lx::surface_id surface,

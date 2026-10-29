@@ -128,6 +128,35 @@ the tiles; maximize and fullscreen work as usual, and the window returns to its 
 tile onto another to swap them; resizing a tile with the mouse floats it. Tiled windows tell
 applications they are tiled, as snapped ones do. Design: [ADR 012](adr/012-master-stack-tiling.md).
 
+**Window animations** are off by default. With `[animations] enabled = true` a window fades in
+from slightly smaller when it opens and fades out when it closes, minimizing and restoring do
+the same, the windows of a workspace slide aside when you switch to another (the later
+workspace comes in from the right), and maximize, restore, snapping and tiling move and
+resize the window to its new place instead of jumping. Everything rides a damped spring:
+`stiffness` (50–5000, default 800) sets how fast, `damping-ratio` (0.3–2.0, default 1.0) how
+it settles — 1 arrives without overshoot, lower values bounce. Moving or resizing a window
+with the mouse is never animated (the window stays under the pointer), nor is fullscreen;
+applications see their final size at once, the animation is only what is drawn. An idle
+desktop draws nothing once an animation has settled.
+
+```toml
+[animations]
+enabled = true
+stiffness = 800
+damping-ratio = 1.0
+```
+
+**Blur behind translucent surfaces.** Applications that ask for it (ext-background-effect-v1,
+as KDE's and newer toolkits' translucent windows and panels do) get what is behind the part of
+their window they name blurred, when the compositor draws on the GPU (GL ES 3 or Vulkan; the
+CPU path offers no blur and draws such windows unblurred). The shell's own panel stays opaque
+unless you turn it translucent over a blur of what is behind it:
+
+```toml
+[panel]
+blur = true
+```
+
 lumen-shell is the session's **notification server** (`org.freedesktop.Notifications`,
 specification 1.2) and its **system tray** (`StatusNotifierItem`, as KDE, waybar and
 libappindicator use it). Notifications pop up at the top right of the output you work on
@@ -316,7 +345,7 @@ default (installed as `share/lumen/config.toml`): keyboard layouts, variants, op
 repeat; touchpad, mouse and trackpoint settings (tap, natural scrolling, acceleration
 profile and speed, left-handed, disable-while-typing, scroll factor; per device with
 `[[input.device]]`); cursor theme and size; click or sloppy focus; the shell's idle and lock
-policy, background, window switcher and notifications (position, timeouts by urgency,
+policy, background, panel blur, window switcher and notifications (position, timeouts by urgency,
 popups shown at once, do not disturb while sharing, history size); and `[bindings]`:
 
 ```toml

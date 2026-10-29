@@ -243,6 +243,14 @@ public:
     /// damaging it when the blend changes.
     void set_opaque(lx::surface_id surface, bool opaque,
                     std::span<const lx::rect2i> opaque_rects = {});
+    /// The surface's blur region (ext-background-effect-v1): disjoint surface-local rects,
+    /// at most `scene::surface_node::k_max_blur_rects`; empty: none. Pushed into the node
+    /// (`surface_node::set_blur_region`), damaging the surface when it changes.
+    void set_blur_region(lx::surface_id surface, std::span<const lx::rect2i> rects);
+    /// The surface's colour transform (wp_color_manager_v1, `gfx::color_transform`; inactive:
+    /// none). Pushed into the node (`surface_node::set_color`), damaging the surface when it
+    /// changes.
+    void set_color(lx::surface_id surface, const lx::gfx::color_transform& color);
     /// Something under a still pointer may have changed: a node appeared, went away,
     /// moved or changed size. The window manager re-hit-tests once per tick on it.
     void note_layout_changed() { layout_changed_ = true; }
@@ -291,6 +299,9 @@ private:
         bool opaque = false;
         lx::rect2i opaque_rects[lx::scene::k_max_opaque_rects]{};
         unsigned opaque_rect_count = 0;
+        lx::rect2i blur_rects[lx::scene::surface_node::k_max_blur_rects]{};
+        unsigned blur_rect_count = 0;
+        lx::gfx::color_transform color{};
         bool override_redirect = false;
         bool used = false;
     };
@@ -713,6 +724,8 @@ bool lx::compositor::surface_manager::ensure_node(lx::surface_id surface,
     node->set_solid(entry.solid, entry.solid_color);
     node->set_opaque(entry.opaque);
     node->set_opaque_rects({entry.opaque_rects, entry.opaque_rect_count});
+    node->set_blur_region({entry.blur_rects, entry.blur_rect_count});
+    node->set_color(entry.color);
     node->set_bounds({0, 0, entry.surface_size.width, entry.surface_size.height});
     node->set_content(entry.src, entry.transform);
     if (entry.alpha < 1.f)
@@ -760,6 +773,48 @@ void lx::compositor::surface_manager::set_opaque(lx::surface_id surface, bool op
     // Blending changes every pixel the node covers that is not fully opaque.
     if (scene_)
         note_content_damage(entry, node_rect(surface), resample_margin(entry));
+}
+
+void lx::compositor::surface_manager::set_blur_region(lx::surface_id surface,
+                                                      std::span<const lx::rect2i> rects) {
+    const int slot = find_surface(surface);
+    if (slot < 0)
+        return;
+    auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    constexpr unsigned k_max = lx::scene::surface_node::k_max_blur_rects;
+    bool same = rects.size() == entry.blur_rect_count;
+    for (unsigned i = 0; same && i < entry.blur_rect_count; ++i) {
+        const lx::rect2i a = entry.blur_rects[i];
+        const lx::rect2i b = rects[i];
+        same = a.x == b.x && a.y == b.y && a.width == b.width && a.height == b.height;
+    }
+    if (same)
+        return;
+    entry.blur_rect_count = 0;
+    for (const lx::rect2i& r : rects)
+        if (entry.blur_rect_count < k_max)
+            entry.blur_rects[entry.blur_rect_count++] = r;
+    if (!entry.node)
+        return;
+    entry.node->set_blur_region({entry.blur_rects, entry.blur_rect_count});
+    // What lies under the surface shows blurred, or no longer does: its whole rect changes.
+    note_content_damage(entry, node_rect(surface), resample_margin(entry));
+}
+
+void lx::compositor::surface_manager::set_color(lx::surface_id surface,
+                                                const lx::gfx::color_transform& color) {
+    const int slot = find_surface(surface);
+    if (slot < 0)
+        return;
+    auto& entry = surfaces_[static_cast<unsigned>(slot)];
+    if (entry.color == color)
+        return;
+    entry.color = color;
+    if (!entry.node)
+        return;
+    entry.node->set_color(color);
+    // Every pixel the surface covers is drawn through the new transform.
+    note_content_damage(entry, node_rect(surface), resample_margin(entry));
 }
 
 lx::scene::surface_node* lx::compositor::surface_manager::node(lx::surface_id surface) const {
