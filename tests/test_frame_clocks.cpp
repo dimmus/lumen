@@ -156,6 +156,29 @@ LUMEN_TEST(frame_clocks_flips_without_vblank_never_tick_faster_than_the_refresh)
     LUMEN_CHECK(min_gap >= k_60 - frame_clocks::k_coalesce_ns);
 }
 
+LUMEN_TEST(frame_clocks_without_flips_tick_at_the_refresh) {
+    // A clock no flip ever phases (a virtual output, or a compositor that could not take
+    // the display): ticks a refresh apart, not a refresh less the coalescing slack — which
+    // ran a 59.982 Hz output at 63.8 Hz (15.67 ms) under vkmark.
+    constexpr long long k_5998 = 16'671'669;
+    frame_clocks c{};
+    c.set_live(0, true, k_5998);
+    const long long t0 = 3'000 * k_ms;
+    (void)c.request(0b1, t0);
+    long long first = 0, last = 0;
+    unsigned ticks = 0;
+    for (long long t = c.next_wakeup(); ticks < 600; t = c.next_wakeup()) {
+        if (c.take_due(t) != 0b1)
+            continue;
+        if (!first)
+            first = t;
+        last = t;
+        ++ticks;
+    }
+    LUMEN_CHECK(ticks == 600);
+    LUMEN_CHECK(last - first == 599 * k_5998);
+}
+
 LUMEN_TEST(frame_clocks_adaptive_sync_starts_on_demand) {
     // With adaptive sync (ADR 008 §C.4) there is no vblank phase: a repaint starts as soon as
     // it can land one period (the mode's highest rate) after the last flip.
