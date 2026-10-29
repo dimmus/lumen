@@ -13,6 +13,7 @@ import lx.layout;
 import lx.runtime;
 import lx.trace;
 
+import :context;
 import :element;
 import :invalidate;
 import :node;
@@ -40,8 +41,9 @@ constexpr lx::trace::category log_icon{"ui.icon"};
 // drawn at a size (counted in `rasterized`; a steady frame never misses). With `set_async`,
 // a miss is rasterised on the worker affinity instead (a pool of four jobs, their buffers
 // allocated with the cache) and the coverage written into the atlas on the UI strand, which
-// damages the bounds of every icon that asked for it meanwhile; the icon draws nothing until
-// then (ADR §4.12).
+// damages the bounds of every icon that asked for it meanwhile, each in the ledger of the
+// root that asked (its `ui_context`, up to four per job; one destroyed meanwhile is skipped);
+// the icon draws nothing until then (ADR §4.12).
 //
 // Placement (ADR §4.13): this partition is in lx.ui rather than lx.gfx because the icon set,
 // its files and the tint tokens are the UI's, and librsvg is loaded with dlopen on the first
@@ -138,6 +140,9 @@ struct icon_cache_counters {
     std::uint64_t rerasterized = 0; ///< of `rasterized`: tiles the atlas had evicted
     std::uint64_t async_posted = 0;
     std::uint64_t async_landed = 0;
+    /// Roots past a job's `k_job_waiters` asking for the same raster (`overflow_action::
+    /// reject`): their bounds are not damaged when it lands.
+    std::uint64_t async_waiters_rejected = 0;
 };
 
 /// (icon, device px) → an R8 atlas tile. UI affinity (it writes the atlas).
@@ -146,6 +151,8 @@ public:
     static constexpr unsigned k_capacity = 256;
     static constexpr unsigned k_max_px = 128;
     static constexpr unsigned k_async_jobs = 4;
+    /// Contexts (roots) one raster in flight damages when it lands.
+    static constexpr unsigned k_job_waiters = 4;
 
     /// `dir`: the SVG directory (null: `icon_dir()`).
     explicit icon_cache(lx::gfx::atlas& atlas, const char* dir = nullptr);
@@ -155,7 +162,8 @@ public:
 
     /// The tile of `id` at `size_px` device pixels, stamped used this atlas frame. A miss
     /// rasterises it now, or with `set_async` posts it to the worker and answers false until
-    /// it lands, then damages `pending_damage` (the asking node's bounds). False for an icon
+    /// it lands, then damages `pending_damage` (the asking node's bounds) in the current
+    /// context's ledger (`active_context`, lx.ui:context). False for an icon
     /// that cannot be drawn (no librsvg, a failed raster: tried again after 120 frames).
     [[nodiscard]] bool place(icon id, unsigned size_px, lx::gfx::atlas_tile& out,
                              lx::rect2i pending_damage = {});
@@ -177,14 +185,17 @@ private:
         entry_state state = entry_state::empty;
         lx::gfx::atlas_tile_id tile{};
         std::uint64_t stamp = 0;  ///< atlas frame of the last use or failure
-        lx::rect2i damage{};      ///< pending: bounds to repaint when it lands
     };
     struct async_job;
     struct async_state;
 
     [[nodiscard]] entry* find_or_claim(icon id, unsigned size);
     [[nodiscard]] lx::result<lx::gfx::atlas_tile_id> raster_now(entry& e);
-    void post(entry& e);
+    void post(entry& e, lx::rect2i damage);
+    /// The job rastering `e` (pending), or null.
+    [[nodiscard]] async_job* job_for(const entry& e) const;
+    /// The current context asks `j` to damage `damage` when it lands.
+    void add_waiter(async_job& j, lx::rect2i damage);
     static void run_job(void* job);
     static void land_job(void* job);
     void land(async_job& j);
@@ -327,10 +338,19 @@ const char* lx::ui::icon_dir() {
 // ── icon_cache ──
 
 struct lx::ui::icon_cache::async_job {
+    /// A root waiting for the raster: its context (checked alive by serial at the landing)
+    /// and the union of the bounds it asked from.
+    struct waiter {
+        ui_context* ctx = nullptr;
+        std::uint64_t serial = 0;
+        lx::rect2i damage{};
+    };
     char path[768]{};
     std::uint8_t coverage[k_max_px * k_max_px]{};
     lx::result<void> outcome{};
     async_state* state = nullptr;
+    waiter waiters[k_job_waiters]{};
+    unsigned waiter_count = 0;
     icon id = icon::count;
     std::uint16_t size = 0;
     bool busy = false;
@@ -455,22 +475,14 @@ bool lx::ui::icon_cache::place(icon id, unsigned size_px, lx::gfx::atlas_tile& o
             return false;
         break;
     case entry_state::pending:
-        e->damage = e->damage.width > 0 ? lx::rect2i{std::min(e->damage.x, pending_damage.x),
-                                                     std::min(e->damage.y, pending_damage.y),
-                                                     std::max(e->damage.x + e->damage.width,
-                                                              pending_damage.x + pending_damage.width) -
-                                                         std::min(e->damage.x, pending_damage.x),
-                                                     std::max(e->damage.y + e->damage.height,
-                                                              pending_damage.y + pending_damage.height) -
-                                                         std::min(e->damage.y, pending_damage.y)}
-                                        : pending_damage;
+        if (async_job* j = job_for(*e))
+            add_waiter(*j, pending_damage);
         return false;
     case entry_state::empty: break;
     }
     ++counters_.misses;
     if (executor_ && async_) {
-        e->damage = pending_damage;
-        post(*e);
+        post(*e, pending_damage);
         return false;
     }
     if (!get(id, size_px))
@@ -478,7 +490,38 @@ bool lx::ui::icon_cache::place(icon id, unsigned size_px, lx::gfx::atlas_tile& o
     return atlas_->use(e->tile, out);
 }
 
-void lx::ui::icon_cache::post(entry& e) {
+lx::ui::icon_cache::async_job* lx::ui::icon_cache::job_for(const entry& e) const {
+    if (!async_)
+        return nullptr;
+    for (async_job& j : async_->jobs)
+        if (j.busy && j.id == e.id && j.size == e.size)
+            return &j;
+    return nullptr;
+}
+
+void lx::ui::icon_cache::add_waiter(async_job& j, lx::rect2i damage) {
+    ui_context& ctx = active_context();
+    for (unsigned i = 0; i < j.waiter_count; ++i) {
+        async_job::waiter& w = j.waiters[i];
+        if (w.ctx != &ctx || w.serial != ctx.serial())
+            continue;
+        const lx::rect2i d = w.damage;
+        w.damage = d.width > 0 ? lx::rect2i{std::min(d.x, damage.x), std::min(d.y, damage.y),
+                                            std::max(d.x + d.width, damage.x + damage.width) -
+                                                std::min(d.x, damage.x),
+                                            std::max(d.y + d.height, damage.y + damage.height) -
+                                                std::min(d.y, damage.y)}
+                               : damage;
+        return;
+    }
+    if (j.waiter_count == k_job_waiters) {
+        ++counters_.async_waiters_rejected; // overflow_action::reject
+        return;
+    }
+    j.waiters[j.waiter_count++] = {&ctx, ctx.serial(), damage};
+}
+
+void lx::ui::icon_cache::post(entry& e, lx::rect2i damage) {
     async_job* free_job = nullptr;
     for (async_job& j : async_->jobs)
         if (!j.busy) {
@@ -495,6 +538,8 @@ void lx::ui::icon_cache::post(entry& e) {
     j.id = e.id;
     j.size = e.size;
     j.busy = true;
+    j.waiter_count = 0;
+    add_waiter(j, damage);
     e.state = entry_state::pending;
     if (!async_->executor->post(lx::runtime::affinity::worker, lx::runtime::task{&icon_cache::run_job, &j})) {
         j.busy = false;
@@ -557,11 +602,17 @@ void lx::ui::icon_cache::land(async_job& j) {
     e->state = entry_state::ready;
     e->tile = *tile;
     ++counters_.rasterized;
-    damage_ledger& ledger = ui_damage();
-    if (e->damage.width > 0 && e->damage.height > 0)
-        ledger.add(e->damage);
-    ledger.request(invalidation::paint);
-    e->damage = {};
+    // Each root that asked repaints where it asked from; one destroyed meanwhile is skipped.
+    for (unsigned i = 0; i < j.waiter_count; ++i) {
+        const async_job::waiter& w = j.waiters[i];
+        if (!context_alive(w.ctx, w.serial))
+            continue;
+        damage_ledger& ledger = w.ctx->damage();
+        if (w.damage.width > 0 && w.damage.height > 0)
+            ledger.add(w.damage);
+        ledger.request(invalidation::paint);
+    }
+    j.waiter_count = 0;
 }
 
 // ── icon_node ──

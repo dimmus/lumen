@@ -28,6 +28,9 @@ export import :decorator;
 // ADR-010 §4.7: flex containers over lx.layout:flex.
 export import :flex;
 export import :reducer;
+// ADR-010 §7 Phase 5: a ui_context per ui_root (damage, overlays, timers, reducers), so
+// several roots share one UI thread.
+export import :context;
 export import :root;
 // ADR-010 Phase 2: a retained text layout drawn as atlas glyph sprites.
 export import :text_node;

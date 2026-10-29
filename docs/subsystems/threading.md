@@ -11,6 +11,7 @@ Lumen v0.3 integrates multithreading at the API layer via **`lx.sync`**, **`lx.r
 | Resource | Owner thread | Notes |
 |----------|--------------|-------|
 | `ui_node` tree (`ui_root`) | **UI** (`affinity::ui`) | Never touch from worker/render |
+| lx.ui per-root state (`ui_context`: damage ledger, overlays, timers, reducer queue) | **UI**, one per `ui_root` | Several roots share a UI thread; a root's entry points scope its context, and an invalidation from outside (a posted task, an icon landing) finds its root through `ui_node::parent()` and the thread's root table. The text and icon caches (`ui_resources`), the device scale and the frame clock stay per thread, shared by its roots |
 | `scene_graph` mutation | **UI** | `mark_dirty`, `commit_frame` |
 | `immutable_frame_snapshot` | **Render** (read-only) | Acquired after UI `commit_frame` |
 | `draw_list` build (scratch) | **UI** | Published via `snapshot_buffer` |
@@ -530,7 +531,7 @@ justified until a submit costs more than 300 µs).
 | UI (`main`) | `lx::runtime::event_loop`: the display (`wayland::display_source`: prepare_read, flush, read or cancel), each window's frame source, describe / reconcile / layout / emit, record + submit on the window's tier (`ui_cpu` / `ui_gl` / `ui_vk`), commit | the display fd, one timerfd, the swapchain's release eventfd (explicit sync), the theme file's inotify fd (hot reload), the UI strand's eventfd |
 | worker (`lx-app-worker`) | `executor::global()`'s worker strand: icon rasters (`icon_cache::set_async`), theme reloads (`theme_watcher`), large-text shaping | the strand's waker (a condition variable); never on a period |
 
-**Frame loop** (§4.9). An event or a reducer leaves work in lx.ui's ledger; the window's
+**Frame loop** (§4.9). An event or a reducer leaves work in the root's ledger (its `ui_context`); the window's
 frame source (an `event_source` with no fd, due when a frame should be drawn now) sees it in
 the same loop iteration. With no frame callback outstanding the frame is drawn at once; with
 one outstanding it waits for it — every drawn commit requests the next callback, which is the

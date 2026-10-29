@@ -27,9 +27,10 @@ import :theme;
 // so describing an event handler allocates nothing and needs no destructor.
 //
 // Time: `ui_now_ns()` is the frame clock — the time `ui_root::tick` latched for the frame it is
-// building, else CLOCK_MONOTONIC (`set_ui_clock` replaces it in tests). `ui_timers()` is the UI
-// thread's fixed timer table (32 entries, `overflow_action::reject`): a due timer calls its
-// node's `on_timer` at the start of the next tick, and `ui_root::next_deadline_ns` tells the
+// building, else CLOCK_MONOTONIC (`set_ui_clock` replaces it in tests). `ui_timers()` is the
+// current root's fixed timer table (its `ui_context`'s; 32 entries, `overflow_action::reject`):
+// a due timer calls its node's `on_timer` at the start of that root's next tick, and
+// `ui_root::next_deadline_ns` tells the
 // event loop when to wake — a delay requests no frames while it waits (G1). Hover intent (the
 // 500 ms before a tooltip, §5.5) is such a timer, set for nodes that ask for it
 // (`node_flag::hover_intent`).
@@ -138,7 +139,7 @@ float animate(const ui_node& node, const transition& t);
 inline constexpr std::uint32_t k_timer_hover_intent = 1;
 inline constexpr std::uint32_t k_timer_user = 256;
 
-/// The UI thread's deadlines for nodes: (node, tag) → when. Fixed capacity
+/// A root's deadlines for its nodes (one per `ui_context`): (node, tag) → when. Fixed capacity
 /// (`overflow_action::reject`: `schedule` says false and counts it); a node that dies takes
 /// its timers with it.
 class timer_queue final : public node_observer {
@@ -173,6 +174,8 @@ private:
     std::uint64_t rejected_ = 0;
 };
 
+/// The current context's timers (lx.ui:context): the innermost `context_scope`'s, else the
+/// thread default's.
 [[nodiscard]] timer_queue& ui_timers();
 
 // ── Pointer ──
@@ -257,6 +260,12 @@ void draw_focus_ring(draw_scope& out, lx::rect2i bounds, const float (&radii)[4]
                      float width = 1.f);
 
 } // namespace lx::ui
+
+namespace lx::ui::detail {
+/// The timers of `node`'s context (`context_of`; the current one when no root draws it).
+/// Defined in :context.
+[[nodiscard]] timer_queue& timers_of(const ui_node& node);
+} // namespace lx::ui::detail
 
 // ── implementation ──────────────────────────────────────────────────────────────────
 
@@ -359,9 +368,10 @@ bool lx::ui::transition::running(std::uint64_t now_ns) const {
 float lx::ui::animate(const ui_node& node, const transition& t) {
     const std::uint64_t now = ui_now_ns();
     if (t.running(now)) {
-        damage_ledger& ledger = ui_damage();
-        ledger.add(surface_rect(node, ink_bounds(node)));
-        ledger.request(invalidation::animate);
+        if (damage_ledger* ledger = detail::damage_of(node)) {
+            ledger->add(surface_rect(node, ink_bounds(node)));
+            ledger->request(invalidation::animate);
+        }
     }
     return t.value(now);
 }
@@ -434,12 +444,6 @@ std::uint64_t lx::ui::timer_queue::next_deadline() const {
 
 void lx::ui::timer_queue::node_destroyed(ui_node& node) { cancel_all(node); }
 
-lx::ui::timer_queue& lx::ui::ui_timers() {
-    // Never destroyed: nodes may outlive any static they could be torn down with.
-    static timer_queue* const q = new timer_queue{};
-    return *q;
-}
-
 // ── pointer ──
 
 namespace {
@@ -497,7 +501,7 @@ void lx::ui::pointer_state::set_hovered(ui_node* node) {
     if (ui_node* old = hovered_) {
         old->set_flag(node_flag::hovered, false);
         if (old->has_flag(node_flag::hover_intent))
-            ui_timers().cancel(*old, k_timer_hover_intent);
+            detail::timers_of(*old).cancel(*old, k_timer_hover_intent);
         old->on_interaction_changed();
     }
     hovered_ = node;
@@ -505,8 +509,8 @@ void lx::ui::pointer_state::set_hovered(ui_node* node) {
         node->mark_referenced();
         node->set_flag(node_flag::hovered, true);
         if (node->has_flag(node_flag::hover_intent))
-            (void)ui_timers().schedule(*node, k_timer_hover_intent,
-                                       std::uint64_t{k_hover_intent_ms} * 1000000ull);
+            (void)detail::timers_of(*node).schedule(*node, k_timer_hover_intent,
+                                                    std::uint64_t{k_hover_intent_ms} * 1000000ull);
         node->on_interaction_changed();
     }
 }

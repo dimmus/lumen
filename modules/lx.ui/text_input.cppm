@@ -834,8 +834,8 @@ std::uint32_t lx::ui::text_input_node::word_step(std::uint32_t index, bool forwa
 void lx::ui::text_input_node::restart_blink() {
     caret_on_ = true;
     if (has_flag(node_flag::focused))
-        (void)ui_timers().schedule(*this, k_timer_caret_blink,
-                                   std::uint64_t{k_caret_blink_ms} * 1'000'000ull);
+        (void)detail::timers_of(*this).schedule(*this, k_timer_caret_blink,
+                                                std::uint64_t{k_caret_blink_ms} * 1'000'000ull);
 }
 
 void lx::ui::text_input_node::caret_moved(bool keep_blink) {
@@ -1205,7 +1205,7 @@ void lx::ui::text_input_node::on_interaction_changed() {
             restart_blink();
         } else {
             // Unfocused: the blink stops (no timer, no frames); the preedit goes.
-            ui_timers().cancel(*this, k_timer_caret_blink);
+            detail::timers_of(*this).cancel(*this, k_timer_caret_blink);
             caret_on_ = true;
             if (preedit_size_) {
                 preedit_size_ = 0;
@@ -1222,8 +1222,8 @@ void lx::ui::text_input_node::on_timer(std::uint32_t tag) {
         return;
     caret_on_ = !caret_on_;
     detail::damage_node(*this, caret_rect());
-    (void)ui_timers().schedule(*this, k_timer_caret_blink,
-                               std::uint64_t{k_caret_blink_ms} * 1'000'000ull);
+    (void)detail::timers_of(*this).schedule(*this, k_timer_caret_blink,
+                                            std::uint64_t{k_caret_blink_ms} * 1'000'000ull);
 }
 
 void lx::ui::text_input_node::ime_apply(const ime_update& u) {

@@ -1430,6 +1430,15 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_ui_reconcile PRIVATE tests)
     add_test(NAME test_ui_reconcile COMMAND test_ui_reconcile)
 
+    # ADR-010 §7 Phase 5: several ui_roots on one UI thread, a ui_context each — damage,
+    # overlays, timers and reducers per root; posted and icon-landing damage reach their root.
+    add_executable(test_ui_multi_root tests/test_ui_multi_root.cpp)
+    target_link_libraries(test_ui_multi_root PRIVATE lx.ui lx.scene lx.gfx lx.text lx.runtime lx.a11y)
+    lumen_apply_module_properties(test_ui_multi_root)
+    lumen_link_platform(test_ui_multi_root)
+    target_include_directories(test_ui_multi_root PRIVATE tests)
+    add_test(NAME test_ui_multi_root COMMAND test_ui_multi_root)
+
     # ADR-010 §7 Phase 3: focus over the retained tree, reducers wired into the root, pointer
     # state and motion, and §5.6's basic components against Zed's sizes and tokens.
     add_executable(test_ui_components tests/test_ui_components.cpp)
@@ -1530,7 +1539,7 @@ if(LUMEN_BUILD_TESTS)
         test_kms_device test_kms_vkms test_crtc_alloc test_output_layout
         test_uevent_parse test_output_scan_diff test_output_policy test_window_migration
         test_cvt test_output_management test_output_config_store
-        test_ui_reconcile test_ui_theme test_layout_flex test_gl_composite bench_composite bench_ui
+        test_ui_reconcile test_ui_multi_root test_ui_theme test_layout_flex test_gl_composite bench_composite bench_ui
         PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")
     if(TEST test_ui_components)
         set_tests_properties(test_ui_components PROPERTIES ENVIRONMENT "${LUMEN_SANITIZER_ENV}")

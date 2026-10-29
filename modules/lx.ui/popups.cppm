@@ -590,9 +590,9 @@ bool lx::ui::toast_node::apply(const toast_props& p) {
         remaining_ns_ = std::uint64_t{p.duration_ms} * 1'000'000ull;
         if (p.duration_ms) {
             deadline_ns_ = ui_now_ns() + remaining_ns_;
-            (void)ui_timers().schedule(*this, k_timer_toast, remaining_ns_);
+            (void)detail::timers_of(*this).schedule(*this, k_timer_toast, remaining_ns_);
         } else {
-            ui_timers().cancel(*this, k_timer_toast);
+            detail::timers_of(*this).cancel(*this, k_timer_toast);
         }
     }
     return false;
@@ -661,7 +661,7 @@ void lx::ui::toast_node::dismiss() {
     if (dismissed_)
         return;
     dismissed_ = true;
-    ui_timers().cancel(*this, k_timer_toast);
+    detail::timers_of(*this).cancel(*this, k_timer_toast);
     invalidate_layout(*this);
     if (props_.on_dismiss)
         props_.on_dismiss(props_.value);
@@ -678,11 +678,11 @@ void lx::ui::toast_node::on_interaction_changed() {
         if (has_flag(node_flag::hovered)) {
             // Paused: what is left waits for the pointer to leave.
             remaining_ns_ = deadline_ns_ > now ? deadline_ns_ - now : 0;
-            ui_timers().cancel(*this, k_timer_toast);
+            detail::timers_of(*this).cancel(*this, k_timer_toast);
         } else {
             remaining_ns_ = std::max<std::uint64_t>(remaining_ns_, std::uint64_t{k_toast_resume_ms} * 1'000'000ull);
             deadline_ns_ = now + remaining_ns_;
-            (void)ui_timers().schedule(*this, k_timer_toast, remaining_ns_);
+            (void)detail::timers_of(*this).schedule(*this, k_timer_toast, remaining_ns_);
         }
     }
     // A toast's look does not follow the hover: nothing to repaint.

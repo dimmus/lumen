@@ -558,7 +558,7 @@ bool lx::ui::control_node::activate() {
     if (!has_flag(node_flag::interactive) || has_flag(node_flag::disabled))
         return false;
     ++activations_;
-    ui_overlays().note_activation(*this);
+    detail::overlays_of(*this).note_activation(*this);
     if (overlay_node* sub = child_overlay(*this, overlay_kind::menu)) {
         (void)sub->open();
         return true;
@@ -572,7 +572,7 @@ void lx::ui::control_node::on_timer(std::uint32_t tag) {
     if (tag != k_timer_hover_intent || !has_flag(node_flag::hovered))
         return;
     if (overlay_node* tip = child_overlay(*this, overlay_kind::tooltip))
-        (void)tip->open_at(ui_overlays().pointer());
+        (void)tip->open_at(detail::overlays_of(*this).pointer());
 }
 
 void lx::ui::control_node::on_interaction_changed() {

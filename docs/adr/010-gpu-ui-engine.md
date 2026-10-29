@@ -1670,6 +1670,27 @@ a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
   the higher one 3 runs in 4 and this one 1 in 4; without, the reverse), its heap allocations
   are the same (heaptrack peak 75.31 vs 75.29 MB, in-use heap equal per state), and it is
   pages of buffers both builds allocate being touched.
+- `lx.ui` multi-root: a `ui_context` per `ui_root`. **Done** (`lx.ui:context`; ui-architecture.md
+  "Several roots on one thread"): the damage ledger, overlay layer, timers and reducer queue
+  that were thread globals are one root's (≈1.4 KiB, no heap); a root's entry points scope its
+  context, and an invalidation from outside every scope finds its root by walking `parent()` to
+  the tree's root and a 32-entry thread table (no node field: `sizeof(ui_node)` stays 64 B;
+  `sizeof(ui_root)` 1232 → 1240 B). Async icon rasters damage each asking root still alive.
+  `ui_root(arena)` uses the thread-default context, so lx.app, the bench and the goldens are
+  unchanged; lx.app keeps its one-window refusal until `lx.ui.host`. Thread-wide by design:
+  the caches, the device scale, the frame clock, the percent base, the layout counters, the
+  text input's statics and the drop target. Deviations: the table's overflow uses
+  `overflow_action::warn_and_drop` (the enum has no `log_and_drop`); a node in no registered
+  tree keeps the thread default while a root uses it or none lives (a bare tree in a test),
+  and is dropped and counted (`layout_counters::damage_dropped`) only when every live root
+  has its own context; a destroyed root's icon waiters are skipped at the landing by the
+  context's serial rather than cancelled by `~ui_root`. `test_ui_multi_root` covers press,
+  tooltip timer, reducer, overlay hit test, posted damage, a late icon and G1 per root.
+  Measured against the stage's base (interleaved, 6 runs each, `setarch -R`, pinned, load
+  0.56–1.2): lumen-ui-bench tick p50 S2 95.2 → 93.3 µs cpu, 95.4 → 94.7 µs GL; S3 406 → 403 µs
+  cpu, 523 → 512 µs GL; S4 91.1 → 89.5 µs cpu, 134 → 132 µs GL — parity, inside each A/B's
+  spread; counters identical, 0 allocations per steady frame (G5's GL `mallinfo2` delta of
+  112–288 B is the driver's, on both builds).
 - Docs: `docs/subsystems/ui-engine.md` (this design as current), ui-architecture.md §9
   rewritten, rendering-performance.md gains a UI section with the measured tables,
   api/README.md and architecture.md §3 for the new partitions, UML for the client frame

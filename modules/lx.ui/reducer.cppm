@@ -14,6 +14,30 @@ import :reconcile;
 import :invalidate;
 
 export namespace lx::ui {
+class reducer_host;
+} // namespace lx::ui
+
+namespace lx::ui::detail {
+
+/// A context's reducers owing a rebuild, oldest first (intrusive: no allocation, no cap), and
+/// the ledger their rebuild requests go to (lx.ui:context; one per `ui_context`).
+struct reducer_queue {
+    reducer_host* head = nullptr;
+    reducer_host* tail = nullptr;
+    damage_ledger* ledger = nullptr;
+};
+
+/// The current context's queue (defined in :context).
+[[nodiscard]] reducer_queue& active_reducers();
+/// The queue of `node`'s context (`context_of`), or null: no root draws it (counted in
+/// `layout_counters::damage_dropped`). Defined in :context.
+[[nodiscard]] reducer_queue* reducers_of(const ui_node& node);
+/// Unlinks every reducer of `queue` (its context is going).
+void drain_reducers(reducer_queue& queue);
+
+} // namespace lx::ui::detail
+
+export namespace lx::ui {
 
 /// The non-template half of `reducer_node`: a node whose subtree is described by its own
 /// build function from its own state, and rebuilt by `ui_root` on the frame after a dispatch
@@ -23,8 +47,9 @@ export namespace lx::ui {
 /// The reconciler leaves a reducer's children alone (`node_flag::opaque_children`): an
 /// enclosing describe that reaches the reducer re-applies its props and nothing below, so
 /// the subtree and its state survive any rebuild of the tree around it. A reducer with a
-/// rebuild owed sits in the UI thread's pending list (intrusive: no allocation, no cap);
-/// `rebuild_pending_reducers` drains it, including reducers a rebuild constructs.
+/// rebuild owed sits in its root's pending list (its `ui_context`'s; intrusive: no
+/// allocation, no cap); `rebuild_pending_reducers` drains the current one, including
+/// reducers a rebuild constructs.
 class reducer_host : public ui_node {
 public:
     ~reducer_host() override;
@@ -46,19 +71,22 @@ protected:
 
 private:
     friend unsigned rebuild_pending_reducers(build_context& ctx, reconciler& rec);
+    friend void detail::drain_reducers(detail::reducer_queue& queue);
     void unlink();
 
     reducer_host* prev_pending_ = nullptr;
     reducer_host* next_pending_ = nullptr;
+    /// The queue it is in while `pending_`.
+    detail::reducer_queue* queue_ = nullptr;
     bool pending_ = false;
 };
 
-/// Rebuilds every reducer that asked since the last call, and every reducer those rebuilds
-/// construct, in request order. UI affinity, inside the frame's build scope (`ui_root::tick`
-/// calls it after the describe). Returns how many rebuilt.
+/// Rebuilds every reducer of the current context that asked since the last call, and every
+/// reducer those rebuilds construct, in request order. UI affinity, inside the frame's build
+/// scope (`ui_root::tick` calls it after the describe). Returns how many rebuilt.
 unsigned rebuild_pending_reducers(build_context& ctx, reconciler& rec);
 
-/// Whether any reducer is waiting for a rebuild.
+/// Whether a reducer of the current context is waiting for a rebuild.
 [[nodiscard]] bool reducers_pending();
 
 /// Host for a piece of screen state.
@@ -191,12 +219,6 @@ template<typename State, typename Action>
 
 } // namespace lx::ui
 
-namespace {
-/// The UI thread's reducers owing a rebuild, oldest first (UI affinity).
-lx::ui::reducer_host* g_pending_head = nullptr;
-lx::ui::reducer_host* g_pending_tail = nullptr;
-} // namespace
-
 lx::ui::reducer_host::reducer_host() { set_flag(node_flag::opaque_children, true); }
 
 lx::ui::reducer_host::~reducer_host() { unlink(); }
@@ -204,31 +226,43 @@ lx::ui::reducer_host::~reducer_host() { unlink(); }
 void lx::ui::reducer_host::unlink() {
     if (!pending_)
         return;
+    detail::reducer_queue& q = *queue_;
     if (prev_pending_)
         prev_pending_->next_pending_ = next_pending_;
     else
-        g_pending_head = next_pending_;
+        q.head = next_pending_;
     if (next_pending_)
         next_pending_->prev_pending_ = prev_pending_;
     else
-        g_pending_tail = prev_pending_;
+        q.tail = prev_pending_;
     prev_pending_ = next_pending_ = nullptr;
+    queue_ = nullptr;
     pending_ = false;
 }
 
 void lx::ui::reducer_host::request_rebuild() {
     lx::runtime::assert_affinity(lx::runtime::affinity::ui);
     if (!pending_) {
+        // The current root's queue inside a scope; else the one of the root this is in.
+        detail::reducer_queue* q = detail::reducers_of(*this);
+        if (!q)
+            return; // no root draws it (counted)
         pending_ = true;
-        prev_pending_ = g_pending_tail;
+        queue_ = q;
+        prev_pending_ = q->tail;
         next_pending_ = nullptr;
-        if (g_pending_tail)
-            g_pending_tail->next_pending_ = this;
+        if (q->tail)
+            q->tail->next_pending_ = this;
         else
-            g_pending_head = this;
-        g_pending_tail = this;
+            q->head = this;
+        q->tail = this;
     }
-    ui_damage().request(invalidation::rebuild);
+    queue_->ledger->request(invalidation::rebuild);
+}
+
+void lx::ui::detail::drain_reducers(reducer_queue& queue) {
+    while (reducer_host* h = queue.head)
+        h->unlink();
 }
 
 unsigned lx::ui::rebuild_pending_reducers(build_context& ctx, reconciler& rec) {
@@ -242,7 +276,8 @@ unsigned lx::ui::rebuild_pending_reducers(build_context& ctx, reconciler& rec) {
     // happen: it is queued again and the loop stops (the arena stays exhausted this frame),
     // the rest waiting with it for the next frame's fresh arena. One that overflowed an arena
     // nothing else had used yet never fits: it is dropped (`note_overflow` logged it).
-    while (reducer_host* h = g_pending_head) {
+    detail::reducer_queue& queue = detail::active_reducers();
+    while (reducer_host* h = queue.head) {
         if (rebuilt == k_max_rebuilds_per_frame || ctx.overflowed())
             break;
         const unsigned used = ctx.used_bytes();
@@ -258,4 +293,4 @@ unsigned lx::ui::rebuild_pending_reducers(build_context& ctx, reconciler& rec) {
     return rebuilt;
 }
 
-bool lx::ui::reducers_pending() { return g_pending_head != nullptr; }
+bool lx::ui::reducers_pending() { return detail::active_reducers().head != nullptr; }

@@ -66,15 +66,20 @@ void invalidate_layout(ui_node& node);
 /// Ask for a frame tick while an animation is in flight.
 void invalidate_animate(ui_node& node);
 
-/// The ledger the invalidate_* helpers write into. UI affinity only.
+/// The current context's ledger (lx.ui:context): the innermost `context_scope`'s — a root's,
+/// inside its tick and input entry points — else the thread default's. UI affinity only.
 [[nodiscard]] damage_ledger& ui_damage();
 
 } // namespace lx::ui
 
+namespace lx::ui::detail {
+/// The ledger `node`'s invalidations go to (`context_of`, lx.ui:context), or null: no root
+/// draws it (counted in `layout_counters::damage_dropped`).
+[[nodiscard]] damage_ledger* damage_of(const ui_node& node);
+} // namespace lx::ui::detail
+
 
 namespace {
-
-lx::ui::damage_ledger g_ui_damage{};
 
 [[nodiscard]] lx::rect2i lx_ui_union(lx::rect2i a, lx::rect2i b) {
     if (a.width <= 0 || a.height <= 0)
@@ -178,10 +183,6 @@ void lx::ui::damage_ledger::clear() {
     flags_ = 0;
 }
 
-lx::ui::damage_ledger& lx::ui::ui_damage() { return g_ui_damage; }
-
-void lx::ui::detail::damage_rect(lx::rect2i region) { g_ui_damage.add(region); }
-
 lx::ui::ui_node* lx::ui::root_of(ui_node& node) {
     ui_node* cursor = &node;
     while (cursor->parent() != nullptr)
@@ -189,25 +190,31 @@ lx::ui::ui_node* lx::ui::root_of(ui_node& node) {
     return cursor;
 }
 
-void lx::ui::invalidate_paint(ui_node& node) { ui_damage().add(surface_rect(node, ink_bounds(node))); }
+void lx::ui::invalidate_paint(ui_node& node) {
+    if (damage_ledger* d = detail::damage_of(node))
+        d->add(surface_rect(node, ink_bounds(node)));
+}
 
 void lx::ui::invalidate_paint(ui_node& node, lx::rect2i region) {
     lx::rect2i placed = region;
     const lx::rect2i b = node.bounds();
     placed.x += b.x;
     placed.y += b.y;
-    ui_damage().add(surface_rect(node, placed));
+    if (damage_ledger* d = detail::damage_of(node))
+        d->add(surface_rect(node, placed));
 }
 
 void lx::ui::invalidate_layout(ui_node& node) {
     node.mark_layout_dirty();
     // Damage the pre-layout bounds now; the post-layout bounds are added by the root
     // after arrange, so a resize repaints both the vacated and the newly covered area.
-    ui_damage().add(surface_rect(node, ink_bounds(node)));
-    ui_damage().request(invalidation::layout);
+    if (damage_ledger* d = detail::damage_of(node)) {
+        d->add(surface_rect(node, ink_bounds(node)));
+        d->request(invalidation::layout);
+    }
 }
 
 void lx::ui::invalidate_animate(ui_node& node) {
-    (void)node;
-    ui_damage().request(invalidation::animate);
+    if (damage_ledger* d = detail::damage_of(node))
+        d->request(invalidation::animate);
 }

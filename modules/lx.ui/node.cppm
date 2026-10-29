@@ -45,6 +45,9 @@ struct layout_counters {
     std::uint64_t measure_uncached = 0;
     std::uint64_t arranges = 0;
     std::uint64_t arrange_skips = 0;
+    /// Invalidations outside any root's scope whose node is in no registered tree, while
+    /// every live root has its own context (lx.ui:context): no root draws them.
+    std::uint64_t damage_dropped = 0;
     void (*on_measure)(const ui_node& node) = nullptr;
     void (*on_arrange)(const ui_node& node) = nullptr;
 };
@@ -653,9 +656,12 @@ template<typename NodeT, typename PropsT>
 } // namespace lx::ui
 
 namespace lx::ui::detail {
-/// Adds `region` to the UI thread's damage ledger (`ui_damage`, defined in :invalidate,
+/// Adds `region` to the current context's damage ledger (`ui_damage`; defined in :context,
 /// which this partition cannot import).
 void damage_rect(lx::rect2i region);
+/// Adds `region` (surface coordinates) to the ledger of `node`'s context (`context_of`):
+/// the current scope's, else its tree's root's (defined in :context).
+void damage_rect_of(const ui_node& node, lx::rect2i region);
 /// Adds `region` of `node`'s layout space, mapped to the surface (`surface_rect`).
 void damage_node(const ui_node& node, lx::rect2i region);
 /// Live nodes that override `child_viewport` with an offset (scroll containers) register
@@ -1670,7 +1676,7 @@ lx::point2i lx::ui::local_point(const ui_node& node, lx::point2i surface) {
 }
 
 void lx::ui::detail::damage_node(const ui_node& node, lx::rect2i region) {
-    damage_rect(surface_rect(node, region));
+    damage_rect_of(node, surface_rect(node, region));
 }
 
 int lx::ui::ui_node::ink_outset() const { return 0; }
