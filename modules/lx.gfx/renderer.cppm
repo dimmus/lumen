@@ -347,6 +347,54 @@ struct source_basis {
     return {x0, y0, x1 - x0, y1 - y0};
 }
 
+/// Downsampling (HiDPI supersampling — a client rendering at a render scale above the output
+/// scale — and integer-scale clients on a fractional output). Bilinear sampling reads the
+/// 2×2 texels around one point, so a draw that shrinks its source by more than a texel per
+/// pixel weighs each pixel's footprint by where the pixel happens to fall: at 8:5 a
+/// one-texel stroke comes out black or 60 % grey depending on its phase, and fine content
+/// (text) shimmers as it moves. Such a draw uses the area (box) filter instead: each pixel is
+/// the average of the source texels under its footprint, weighted by how much of each it
+/// covers (cairo's GOOD filter shrinks with a box filter too), and the exact 2×2 average at
+/// 2:1. On the GPUs each pair of neighbouring texels along an axis is one bilinear tap placed
+/// at their coverage ratio, so a footprint of up to `k_max_downsample` texels per axis takes
+/// at most 3×3 taps and a 2:1 footprint one (bilinear sampling itself). The CPU path weighs
+/// the texels directly. Other draws sample exactly as before.
+inline constexpr float k_max_downsample = 4.f;
+
+/// A draw's footprint per destination pixel, in source texels along the source's own axes
+/// (u: the buffer's x, v: its y).
+struct downsample_footprint {
+    float u = 1.f;
+    float v = 1.f;
+    /// More than a texel per pixel along either axis (1/64 texel of slack, so a fractional
+    /// output's rounded logical size does not turn 1:1 into a filtered draw).
+    [[nodiscard]] constexpr bool active() const {
+        return u > 1.f + 1.f / 64.f || v > 1.f + 1.f / 64.f;
+    }
+};
+
+/// The footprint of drawing source box `box` (texture pixels) into `dst` through buffer
+/// transform `t`, each axis at most `k_max_downsample`. A 90° transform crosses the axes:
+/// the box's width then spans `dst.height`. An axis shrunk exactly 2:1 from a whole texel
+/// counts as 1: every pixel centre lands on a texel corner there, where the one bilinear
+/// tap already is the 2×2 average — so a render scale of 2 on a scale-1 output (the common
+/// case) is drawn as it always was, at no extra cost.
+[[nodiscard]] constexpr downsample_footprint downsample_footprint_for(lx::rect2f box,
+                                                                      lx::rect2i dst,
+                                                                      lx::buffer_transform t) {
+    if (dst.width <= 0 || dst.height <= 0)
+        return {};
+    const bool quarter = (static_cast<unsigned>(t) & 1u) != 0;
+    const auto axis = [](float size, int span, float origin) {
+        const float f = size / static_cast<float>(span);
+        if (f == 2.f && origin == static_cast<float>(static_cast<long long>(origin)))
+            return 1.f;
+        return f < k_max_downsample ? f : k_max_downsample;
+    };
+    return {axis(box.width, quarter ? dst.height : dst.width, box.x),
+            axis(box.height, quarter ? dst.width : dst.height, box.y)};
+}
+
 class pipeline_cache {
 public:
     [[nodiscard]] unsigned acquire(unsigned blend_key, unsigned format_key);

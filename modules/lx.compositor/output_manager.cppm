@@ -38,6 +38,10 @@ struct output_state {
     lx::size2i mode{};
     /// Output scale, n/120 (`representable_scale`). Logical size = mode / scale.
     double scale = 1.0;
+    /// The scale clients are asked to render at (HiDPI supersampling, macOS-style), n/120;
+    /// 0: follow `scale`. Their buffers are sampled down (or up) to this output's `scale`
+    /// raster; geometry, wl_output.scale and xdg_output stay those of `scale`.
+    double render_scale = 0.0;
     present_mode present = present_mode::auto_select;
     bool supports_kms_damage = false;
     /// wl_output.name / zxdg_output_v1.name: the connector name ("Virtual-1", "DP-2"), or
@@ -103,7 +107,24 @@ struct output_state {
     [[nodiscard]] lx::rect2i logical_rect() const;
     /// The output's own pixels: `{0, 0, mode}`.
     [[nodiscard]] lx::rect2i mode_rect() const { return {0, 0, mode.width, mode.height}; }
+    /// What clients on this output are hinted to render at: `render_scale`, else `scale`.
+    [[nodiscard]] double effective_render_scale() const {
+        return render_scale > 0.0 ? render_scale : scale;
+    }
 };
+
+/// A render scale chosen in the configuration file (`[[output]]` in config.toml): `match` is
+/// a connector name ("DP-2"), a monitor identifier ("make model serial") or "*" for every
+/// output; `scale` 0 follows the output scale.
+struct render_scale_rule {
+    char match[208]{};
+    double scale = 0.0;
+};
+
+/// The render scale range (umbriel's): below 0.25 nothing is legible, above 4 a 4K panel's
+/// clients would render 16K buffers.
+inline constexpr double k_min_render_scale = 0.25;
+inline constexpr double k_max_render_scale = 4.0;
 
 /// What a new output is made of (`output_manager::add_output`).
 struct output_desc {
@@ -205,6 +226,27 @@ public:
     /// A scale for one connector by name (`--output-scale NAME=S`), over the default. At most
     /// `k_max` names.
     void set_scale_override(const char* name, double scale);
+
+    // ── Render scale (HiDPI supersampling) ──
+    //
+    // Which rule gives an output its render scale, most specific first, and at the same
+    // specificity the configuration file before the command line (it is the one that can
+    // change while Lumen runs): an `[[output]]` naming its connector or monitor, then
+    // `--output-render-scale NAME=S`, then `[[output]] name = "*"`, then `--render-scale S`;
+    // with none, it follows the output scale. Clamped to [k_min_render_scale,
+    // k_max_render_scale] and rounded to n/120.
+
+    /// `--render-scale S` (0: none).
+    void set_default_render_scale(double scale);
+    /// `--output-render-scale NAME=S`. At most `k_max` names.
+    void set_render_scale_override(const char* name, double scale);
+    /// The configuration file's rules (replacing the previous ones; at most `k_max`). Every
+    /// live output is resolved again: `generation` moves when a render scale changed, so the
+    /// next `outputs_changed` re-sends the client hints.
+    void set_render_scale_rules(const render_scale_rule* rules, unsigned count);
+    /// Sets one output's render scale directly (tests); 0 follows its scale. Moves
+    /// `generation` on a change. The next rule change resolves it again.
+    void set_render_scale(lx::output_id output, double render_scale);
     /// wl_output transform of `output` (0..7): the logical size turns with it; the layout
     /// runs again.
     void set_transform(lx::output_id output, unsigned transform);
@@ -277,6 +319,7 @@ public:
 private:
     void recount();
     [[nodiscard]] double scale_for(const char* name, int w, int h, int phys_w, int phys_h) const;
+    [[nodiscard]] double render_scale_for(const output_state& o) const;
     void make_identity(output_state& o, bool edid);
 
     output_state outputs_[k_max]{};
@@ -294,6 +337,11 @@ private:
     };
     scale_override overrides_[k_max]{};
     unsigned override_count_ = 0;
+    double default_render_scale_ = 0.0;
+    scale_override render_overrides_[k_max]{};
+    unsigned render_override_count_ = 0;
+    render_scale_rule render_rules_[k_max]{};
+    unsigned render_rule_count_ = 0;
     lx::gfx::gpu_tier gpu_tier_ = lx::gfx::gpu_tier::integrated;
 };
 
@@ -315,13 +363,16 @@ private:
 [[nodiscard]] int pace_output(const output_manager& outputs, std::uint32_t shown_mask,
                               lx::rect2i rect);
 /// wl_surface.preferred_buffer_scale for a surface on the outputs in `mask`: the ceiling of
-/// the largest scale among them (wlroots, KWin), so the content is sharp on every output it
-/// shows on; 1 when it is on none.
-[[nodiscard]] int preferred_buffer_scale(const output_manager& outputs, std::uint32_t mask);
+/// the largest render scale among them (wlroots, KWin), so the content is sharp on every
+/// output it shows on; 1 when it is on none. `render` false: the output scales instead
+/// (cursor surfaces, which the cursor plane shows 1:1).
+[[nodiscard]] int preferred_buffer_scale(const output_manager& outputs, std::uint32_t mask,
+                                         bool render = true);
 /// wp_fractional_scale_v1.preferred_scale for a surface on the outputs in `mask`: the
-/// largest scale among them in 120ths (wlroots' scene uses the maximum too); 120 when it is
-/// on none.
-[[nodiscard]] unsigned preferred_scale_120(const output_manager& outputs, std::uint32_t mask);
+/// largest render scale among them in 120ths (wlroots' scene uses the maximum too); 120 when
+/// it is on none. `render` as for `preferred_buffer_scale`.
+[[nodiscard]] unsigned preferred_scale_120(const output_manager& outputs, std::uint32_t mask,
+                                           bool render = true);
 /// wl_surface.preferred_buffer_transform: the primary output's transform, normal (0) when
 /// there is none.
 [[nodiscard]] unsigned preferred_buffer_transform(const output_manager& outputs, int primary);
@@ -498,6 +549,79 @@ void lx::compositor::output_manager::set_scale_override(const char* name, double
     copy_str(overrides_[override_count_].name, sizeof(overrides_[0].name), name);
     overrides_[override_count_].scale = representable_scale(scale);
     ++override_count_;
+}
+
+namespace {
+[[nodiscard]] double clamp_render_scale(double s) {
+    if (!(s > 0.0))
+        return 0.0;
+    return lx::compositor::representable_scale(
+        std::clamp(s, lx::compositor::k_min_render_scale, lx::compositor::k_max_render_scale));
+}
+} // namespace
+
+void lx::compositor::output_manager::set_default_render_scale(double scale) {
+    default_render_scale_ = clamp_render_scale(scale);
+    for (unsigned s = 0; s < k_max; ++s)
+        if (live_[s])
+            set_render_scale(outputs_[s].id, render_scale_for(outputs_[s]));
+}
+
+void lx::compositor::output_manager::set_render_scale_override(const char* name, double scale) {
+    if (!name || !*name || !(scale > 0.0))
+        return;
+    unsigned i = 0;
+    while (i < render_override_count_ && std::strcmp(render_overrides_[i].name, name) != 0)
+        ++i;
+    if (i == render_override_count_) {
+        if (render_override_count_ >= k_max)
+            return;
+        copy_str(render_overrides_[i].name, sizeof(render_overrides_[0].name), name);
+        ++render_override_count_;
+    }
+    render_overrides_[i].scale = clamp_render_scale(scale);
+    for (unsigned s = 0; s < k_max; ++s)
+        if (live_[s])
+            set_render_scale(outputs_[s].id, render_scale_for(outputs_[s]));
+}
+
+void lx::compositor::output_manager::set_render_scale_rules(const render_scale_rule* rules,
+                                                            unsigned count) {
+    render_rule_count_ = 0;
+    for (unsigned i = 0; rules && i < count && render_rule_count_ < k_max; ++i) {
+        if (!rules[i].match[0])
+            continue;
+        render_scale_rule& r = render_rules_[render_rule_count_++];
+        copy_str(r.match, sizeof(r.match), rules[i].match);
+        r.scale = clamp_render_scale(rules[i].scale);
+    }
+    for (unsigned s = 0; s < k_max; ++s)
+        if (live_[s])
+            set_render_scale(outputs_[s].id, render_scale_for(outputs_[s]));
+}
+
+void lx::compositor::output_manager::set_render_scale(lx::output_id output, double requested) {
+    const int s = slot_of(output);
+    const double render_scale = clamp_render_scale(requested);
+    if (s < 0 || outputs_[s].render_scale == render_scale)
+        return;
+    // Only the hints move: no geometry, so the layout generation stays.
+    outputs_[s].render_scale = render_scale;
+    ++generation_;
+}
+
+double lx::compositor::output_manager::render_scale_for(const output_state& o) const {
+    for (unsigned i = 0; i < render_rule_count_; ++i)
+        if (std::strcmp(render_rules_[i].match, o.name) == 0 ||
+            std::strcmp(render_rules_[i].match, o.identifier) == 0)
+            return render_rules_[i].scale;
+    for (unsigned i = 0; i < render_override_count_; ++i)
+        if (std::strcmp(render_overrides_[i].name, o.name) == 0)
+            return render_overrides_[i].scale;
+    for (unsigned i = 0; i < render_rule_count_; ++i)
+        if (std::strcmp(render_rules_[i].match, "*") == 0)
+            return render_rules_[i].scale;
+    return default_render_scale_;
 }
 
 double lx::compositor::output_manager::scale_for(const char* name, int w, int h, int phys_w,
@@ -689,6 +813,7 @@ int lx::compositor::output_manager::add_output(const output_desc& d, int slot) {
         o.follow_preferred = d.follow_preferred;
         o.custom_mode = d.custom_mode;
         make_identity(o, d.edid);
+        o.render_scale = render_scale_for(o);
         outputs_[s] = o;
         live_[s] = true;
         ++generation_;
@@ -928,18 +1053,23 @@ int lx::compositor::pace_output(const output_manager& outputs, std::uint32_t sho
 
 namespace {
 
-[[nodiscard]] double max_scale(const lx::compositor::output_manager& outputs, std::uint32_t mask) {
+[[nodiscard]] double max_scale(const lx::compositor::output_manager& outputs, std::uint32_t mask,
+                               bool render) {
     double best = 0.0;
-    for (unsigned s = 0; s < lx::compositor::output_manager::k_max; ++s)
-        if ((mask & (1u << s)) && outputs.slot_live(s) && outputs.slot_state(s).scale > best)
-            best = outputs.slot_state(s).scale;
+    for (unsigned s = 0; s < lx::compositor::output_manager::k_max; ++s) {
+        if (!(mask & (1u << s)) || !outputs.slot_live(s))
+            continue;
+        const auto& o = outputs.slot_state(s);
+        best = std::max(best, render ? o.effective_render_scale() : o.scale);
+    }
     return best;
 }
 
 } // namespace
 
-int lx::compositor::preferred_buffer_scale(const output_manager& outputs, std::uint32_t mask) {
-    const double best = max_scale(outputs, mask);
+int lx::compositor::preferred_buffer_scale(const output_manager& outputs, std::uint32_t mask,
+                                           bool render) {
+    const double best = max_scale(outputs, mask, render);
     if (!(best > 0.0))
         return 1;
     // Scales are n/120, so the ceiling is exact without an epsilon.
@@ -947,8 +1077,9 @@ int lx::compositor::preferred_buffer_scale(const output_manager& outputs, std::u
     return c < 1 ? 1 : c;
 }
 
-unsigned lx::compositor::preferred_scale_120(const output_manager& outputs, std::uint32_t mask) {
-    const double best = max_scale(outputs, mask);
+unsigned lx::compositor::preferred_scale_120(const output_manager& outputs, std::uint32_t mask,
+                                             bool render) {
+    const double best = max_scale(outputs, mask, render);
     if (!(best > 0.0))
         return 120;
     const long n = std::lround(best * 120.0);

@@ -820,6 +820,59 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
         const long long step_y = std::llround(ay * k_one);
         // Bilinear samples at (s − ½): texel centres sit on half-integers.
         const double centre = nearest ? 0.0 : 0.5;
+        // A draw that shrinks its source by more than a texel per pixel takes the area filter
+        // (renderer.cppm "Downsampling"): every texel under the pixel's footprint, weighted
+        // by its coverage — directly, where the GPU paths pair texels into bilinear taps. Per
+        // source axis the footprint in 16.16 texels (0: that axis is sampled bilinearly) and
+        // 256·65536/footprint, which turns a 16.16 coverage into an 8-bit weight.
+        const downsample_footprint ds = downsample_footprint_for(box, cmd.dst, cmd.buffer_xform);
+        const bool area_filter = !nearest && ds.active();
+        const auto footprint = [&](float f) -> long long {
+            return area_filter && f > 1.f + 1.f / 64.f ? std::llround(f * k_one) : 0;
+        };
+        const long long foot_u = footprint(ds.u);
+        const long long foot_v = footprint(ds.v);
+        const std::uint32_t inv_u = foot_u ? static_cast<std::uint32_t>((256ll << 32) / foot_u / 65536) : 0;
+        const std::uint32_t inv_v = foot_v ? static_cast<std::uint32_t>((256ll << 32) / foot_v / 65536) : 0;
+        // The texels one axis of a pixel reads and their 8-bit weights, summing to 256: from
+        // `k0`, the coverage of [c − f/2, c + f/2] (at most 5 texels), or bilinear's two
+        // around c − ½ when `f` is 0. `c`: the sample position, in texel-edge coordinates.
+        // Two axes' weights multiply to 65536 in all, so a pixel is one shift, no division.
+        struct axis_span {
+            int k0 = 0;
+            unsigned n = 0;
+            std::uint32_t w[6]{};
+        };
+        const auto span_of = [](long long c, long long f, std::uint32_t inv, axis_span& sp) {
+            if (f == 0) {
+                const long long p = c - 32768;
+                const auto t = static_cast<std::uint32_t>((p >> 8) & 0xFF);
+                sp.k0 = static_cast<int>(p >> 16);
+                sp.n = 2;
+                sp.w[0] = 256u - t;
+                sp.w[1] = t;
+                return;
+            }
+            const long long a = c - f / 2;
+            const long long b = a + f;
+            sp.k0 = static_cast<int>(a >> 16);
+            sp.n = 0;
+            std::uint32_t sum = 0;
+            unsigned big = 0;
+            for (long long k = static_cast<long long>(sp.k0) * 65536; k < b && sp.n < 6;
+                 k += 65536) {
+                const long long lo = k > a ? k : a;
+                const long long hi = k + 65536 < b ? k + 65536 : b;
+                const auto cover = static_cast<std::uint32_t>(hi > lo ? hi - lo : 0);
+                const std::uint32_t w = (cover * inv + 32768u) >> 16;
+                if (w > sp.w[big])
+                    big = sp.n;
+                sp.w[sp.n++] = w;
+                sum += w;
+            }
+            // Rounding leaves the sum a unit or two off 256: the largest weight takes it.
+            sp.w[big] += 256u - sum;
+        };
         const auto texel = [&](int tx, int ty) {
             tx = tx < tx_lo ? tx_lo : (tx > tx_hi ? tx_hi : tx);
             ty = ty < ty_lo ? ty_lo : (ty > ty_hi ? ty_hi : ty);
@@ -842,10 +895,39 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
                     std::llround((ox + px * ax + py * bx - centre) * k_one) + skip * step_x;
                 long long ft =
                     std::llround((oy + px * ay + py * by - centre) * k_one) + skip * step_y;
+                axis_span su{}, sv{};
                 for (int x = 0; x < part.width; ++x, fs += step_x, ft += step_y) {
                     std::uint32_t pixel = 0;
                     if (nearest) {
                         pixel = texel(static_cast<int>(fs >> 16), static_cast<int>(ft >> 16));
+                    } else if (area_filter) {
+                        // fs, ft are the bilinear sample positions (centre − ½). An axis that
+                        // does not step along the row (step 0) keeps its span from the row's
+                        // first pixel.
+                        if (x == 0 || step_x != 0)
+                            span_of(fs + 32768, foot_u, inv_u, su);
+                        if (x == 0 || step_y != 0)
+                            span_of(ft + 32768, foot_v, inv_v, sv);
+                        std::uint32_t acc[4]{};
+                        for (unsigned j = 0; j < sv.n; ++j) {
+                            if (!sv.w[j])
+                                continue;
+                            for (unsigned i = 0; i < su.n; ++i) {
+                                const std::uint32_t w = su.w[i] * sv.w[j];
+                                if (!w)
+                                    continue;
+                                const std::uint32_t t =
+                                    texel(su.k0 + static_cast<int>(i), sv.k0 + static_cast<int>(j));
+                                acc[0] += (t & 0xFFu) * w;
+                                acc[1] += ((t >> 8) & 0xFFu) * w;
+                                acc[2] += ((t >> 16) & 0xFFu) * w;
+                                acc[3] += (t >> 24) * w;
+                            }
+                        }
+                        for (unsigned c = 0; c < 4; ++c) {
+                            const std::uint32_t v = (acc[c] + 32768u) >> 16;
+                            pixel |= (v > 255u ? 255u : v) << (c * 8u);
+                        }
                     } else {
                         const int ix = static_cast<int>(fs >> 16);
                         const int iy = static_cast<int>(ft >> 16);

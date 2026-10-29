@@ -812,6 +812,121 @@ multiplies per draw in `project_node`, none per pixel; nothing allocates.
   turned rect of a whole-pixel rect is whole pixels. The cursor plane's image is turned
   once per image change on render, not per motion.
 
+### Render scale: HiDPI supersampling and the area filter
+
+An output's render scale (`output_state::render_scale`; config.toml `[[output]]
+render-scale`, `--render-scale`, `--output-render-scale NAME=S`; user guide "Render scale")
+is the scale clients are hinted to render at — `wp_fractional_scale_v1.preferred_scale`
+the largest render scale of the outputs a surface is on, `wl_surface.preferred_buffer_scale`
+its ceiling (`preferred_scale_120` / `preferred_buffer_scale` in `:output`, the only place
+either is derived). Nothing else moves: the layout, `wl_output.scale`, xdg-output and the
+scene's projection stay the output scale's, so a supersampled surface is an ordinary
+resampled draw — its buffer is render/scale times the size of the output-pixel rect it is
+drawn into. A change moves `output_manager::generation` but not `layout_generation`:
+`outputs_changed` re-derives every surface's hints (sent only where they changed) and no
+`wl_output` event, view or clock is touched. Cursor surfaces are hinted the output scale —
+the cursor plane shows a buffer 1:1 — and so are the compositor's own pixels (titles,
+xcursor themes), drawn at the output scale as before. A window capture is taken at the
+window's render scale (`window_scale` follows the hint), so it gets the sharp buffer.
+Lumen does not scan client buffers out directly yet; when it does, a buffer at a render
+scale that is not the output's fails the size check like any resampled buffer.
+
+**The filter.** A shrinking draw sampled bilinearly reads 2×2 texels around one point of a
+footprint wider than a texel: content is weighted by where each pixel happens to land, and
+fine strokes alias and shimmer as they move. umbriel's render_scale (noctalia-dev/umbriel
+PR 573) changes no renderer: its buffers are sampled as any scaled buffer is. Lumen draws every draw that
+shrinks its source by more than a texel per pixel with the area (box) filter on all three
+backends (`gfx::downsample_footprint_for` decides, per draw):
+
+- **Vulkan** (`downsample.glsl`, included by `composite.frag` and `composite_cm.frag`): one
+  push-constant flag (the former padding word: the block stays 112 bytes), the footprint
+  derived in the shader from the basis already pushed. Along each source axis, each pair of
+  neighbouring texels is one bilinear tap placed at the ratio of their coverage and weighted
+  by its sum: exactly the box filter, at most 3×3 taps for a footprint of up to 4 texels per
+  axis (`k_max_downsample`), one tap at 2:1.
+- **GL**: the same in GLSL ES 1.00, as separate programs (`LUMEN_DOWNSAMPLE` variants of the
+  linear, identity and colour-managed programs) built on the first downscaled draw — not a
+  branch on a uniform, which Mesa specialises per draw on SVGA3D (the identity variant's lesson), so a frame without
+  such a draw runs exactly the programs it ran before.
+- **CPU**: the texels under the footprint weighted by their exact 16.16 coverage, one
+  rounding per channel.
+
+An axis shrunk exactly 2:1 from a whole texel is not filtered: every pixel centre lands on
+a texel corner there, where one bilinear tap already is the 2×2 average. The common case —
+render scale 2 on a scale-1 output — therefore costs the compositor what any 2:1 draw always
+did. Magnified and 1:1 draws are untouched (`test_downsample` checks both on every backend,
+and `bench_composite --hash` frames are identical to main's on cpu, GL and Vulkan).
+
+Measured (`test_downsample`, dev VM: cpu, SVGA3D GL, lavapipe Vulkan), a text-like pattern
+of 1- and 2-texel strokes against the exact area filter, worst over four sub-texel shifts,
+RMS / largest error of 255:
+
+| Ratio | Bilinear (before) | Area filter |
+|-------|-------------------|-------------|
+| 4:3 (render 2 on a 1.5 output) | 10.2 / 33 | ≤ 0.33 / 1.0 |
+| 8:5 (render 2 on 1.25) | 24.0 / 102 | ≤ 0.36 / 1.2 |
+| 2:1 (render 2 on 1) | 0.35 / 0.5 | unchanged (no filter needed) |
+| 3:1 | 83.5 / 220 | ≤ 0.28 / 1.0 |
+| 4:1 | 55.2 / 184 | ≤ 0.46 / 1.1 |
+
+The bilinear error moves with the content's phase (shimmer, the spread of the per-shift
+RMS: 2.7 at 8:5, 11.7 at 4:1); the filter's spread is ≤ 0.06.
+
+**Cost.** Clients pay first: a render scale r over the scale s draws and keeps (r/s)² as
+many pixels (4x at 2 over 1) — their render time, buffer memory, and for shm clients the
+compositor's upload of every damaged byte, which grows the same way. The composite of a
+2:1 draw costs what it did (no filter). A non-integer ratio pays the filter, per pixel of a
+redrawn downscaled surface; `bench_composite --downsample` (a fullscreen 1918×928 draw,
+dev VM, interleaved A/B against main, two runs each, ms):
+
+| Backend | 1:1 | 2:1 | 4:3 bilinear → area | 8:5 bilinear → area |
+|---------|-----|-----|---------------------|---------------------|
+| GL (SVGA3D) | 3.9–4.4 | 5.0–5.3 | 4.1–4.3 → 9.7–11.6 | 4.3–5.1 → 10.6–11.7 |
+| CPU, 1 thread | 1.5–3.1 | 25–33 | 24–25 → 69–82 | 25–36 → 65–101 |
+| Vulkan (lavapipe) | 86–145 | 87–112 | 87–151 → 126–129 | 87–114 → 151–199 |
+
+The GL filter is fetch-bound: at ratios up to 2 it reads at most 2×2 bilinear taps, the
+floor for an exact box, and a branch-free four-fetch variant measured the same. This cost
+also reaches what predates render scales: an integer-only client on a fractional output
+(rendering at the ceiling, 2 on a 1.5 output) is a 4:3 downscale and now takes the filter.
+
+End to end on the dev VM's console (GL compositor on SVGA3D, a 1918×928 output at scale
+1), `lumen-hello --frames 300` repainting its whole 640×480 window every frame, render
+scale 1 vs 2, two interleaved runs each (p50s; the client's frame time is callback → commit
+on its UI thread):
+
+| Client tier | Buffer | Client frame p50 | Client CPU / frame | Compositor render_us p50 | fps |
+|-------------|--------|------------------|--------------------|--------------------------|-----|
+| GL (dmabuf), render 1 | 640×480 | 0.55–0.81 ms | 2.1–2.4 ms | 630–823 | 57 |
+| GL (dmabuf), render 2 | 1280×960 | 0.59–0.60 ms | 2.5–2.9 ms | 737–754 | 55–57 |
+| CPU (shm), render 1 | 640×480 | 0.52 ms | 2.0–2.1 ms | 1078–1084 | 57 |
+| CPU (shm), render 2 | 1280×960 | 2.3–2.4 ms | 3.7–3.9 ms | 1672–1718 | 53–54 |
+
+A GPU client's composite is unchanged (a dmabuf sampled 2:1: no upload, no filter); its
+own CPU grows ~0.4 ms a frame and its GPU work — not visible to the frame clock here —
+with the 4x pixels. A CPU-tier client's raster grows 4.5x and the compositor's shm upload
+adds ~0.6 ms a frame. Buffers: 1.2 → 4.9 MiB each. foot streaming text into a 896×592
+window (shm) showed the same shape: its buffer 1792×1184 at render scale 2 (1344×888 drawn
+at 4:3 through the filter on a 1.5 output), compositor render_us p50 1.4 → 4.6 ms at 1x,
+dominated by the upload. On hardware with a real GPU the upload and the filter shrink; the
+client's render_scale² stays.
+
+**Compared.** macOS renders a HiDPI "looks like" mode into a backing store at twice the
+logical size and resamples the whole composited frame to the panel once per frame — every
+pixel, the desktop's own drawing included, and a second full-frame pass. Mutter's
+`scale-monitor-framebuffer` puts monitor framebuffers in physical pixels and, since
+wp_fractional_scale_v1, has clients render at the exact (fractional) scale; integer-only
+clients render at the ceiling and are scaled down, which is supersampling by necessity, not a
+setting, and there is no way to ask clients for more than the monitor scale. KWin is the
+same: fractional clients at the scale, legacy ones at the ceiling. umbriel's render_scale is
+the setting Lumen follows (per output, clients hinted through both protocols, geometry
+unchanged, mirrors publishing no hints — Lumen's captures never hint at all). Where Lumen
+goes further: the area filter on every backend, measured against the exact box filter, so
+a non-integer ratio does not shimmer; no extra
+full-frame pass, unlike macOS — each surface is filtered as it is composited, damage stays
+partial and the compositor's own pixels are drawn at the output's resolution directly; the
+2:1 case free; applied live on a configuration reload; the cursor kept at the output scale.
+
 ### Occlusion culling and frame-callback throttling (the visibility pass)
 
 `scene_graph::commit_frame` runs one top-down pass over the draws of each published frame

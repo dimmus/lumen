@@ -390,6 +390,9 @@ private:
         /// LUMEN_COLOR only: the transform's matrix and (power, peak).
         int color_matrix = -1;
         int color_params = -1;
+        /// LUMEN_DOWNSAMPLE only: the texture's size and the footprint, in texels.
+        int ds_size = -1;
+        int ds_footprint = -1;
     };
     /// [0] decodes to linear light, tints and re-encodes; [1] is the identity variant for
     /// an sRGB source without a colour tint, the common case (LUMEN_IDENTITY in the shader).
@@ -398,6 +401,8 @@ private:
     static constexpr unsigned k_program_count = 2;
     /// `color_program_` as the bound program (k_program_count means none is bound).
     static constexpr unsigned k_program_color = k_program_count + 1;
+    /// `downsample_programs_[i]` as the bound program: k_program_downsample + i.
+    static constexpr unsigned k_program_downsample = k_program_color + 1;
 
     struct blur_level {
         unsigned texture = 0;
@@ -442,6 +447,13 @@ private:
     bool color_highp_ = false;
     bool color_failed_ = false;
     [[nodiscard]] bool ensure_color_program();
+    /// The downsampling variants (renderer.cppm "Downsampling", LUMEN_DOWNSAMPLE) of the
+    /// linear [0], identity [1] and colour-managed [2] programs, each built on its first
+    /// downsampled draw — a separate program, not a branch: 1:1 draws keep theirs. Null when
+    /// it cannot be built (the draw then samples once, as before).
+    composite_program downsample_programs_[3]{};
+    bool downsample_failed_[3]{};
+    [[nodiscard]] composite_program* ensure_downsample_program(unsigned variant);
     blur_output blur_outputs_[k_blur_outputs]{};
     blur_program blur_programs_[2]{};
     bool blur_programs_failed_ = false;
@@ -528,6 +540,68 @@ uniform float alpha_one;
 uniform float use_solid;
 uniform vec4 solid_texel;
 
+#ifdef LUMEN_DOWNSAMPLE
+// The area filter of a draw that shrinks its source (renderer.cppm "Downsampling";
+// downsample.glsl is the Vulkan twin, written for GLSL ES 1.00 here: no arrays out of
+// functions, so the 3×3 taps are unrolled). `ds_size`: the texture in texels;
+// `ds_footprint`: texels per target pixel along its u and v axes (at most 4).
+uniform UV_PRECISION vec2 ds_size;
+uniform UV_PRECISION vec2 ds_footprint;
+
+// Texels k and k + 1 of footprint [a, b] as one bilinear tap: (position, coverage).
+UV_PRECISION vec2 area_tap(UV_PRECISION float a, UV_PRECISION float b, UV_PRECISION float k) {
+    UV_PRECISION float wa = clamp(min(k + 1.0, b) - max(k, a), 0.0, 1.0);
+    UV_PRECISION float wb = clamp(min(k + 2.0, b) - max(k + 1.0, a), 0.0, 1.0);
+    UV_PRECISION float w = wa + wb;
+    return vec2(k + 0.5 + (w > 0.0 ? wb / w : 0.0), w);
+}
+
+void axis_taps(UV_PRECISION float c, UV_PRECISION float f, out UV_PRECISION vec2 t0,
+               out UV_PRECISION vec2 t1, out UV_PRECISION vec2 t2) {
+    if (f <= 1.015625) {
+        t0 = vec2(c, 1.0);
+        t1 = vec2(0.0);
+        t2 = vec2(0.0);
+        return;
+    }
+    UV_PRECISION float a = c - 0.5 * f;
+    UV_PRECISION float b = c + 0.5 * f;
+    UV_PRECISION float k = floor(a);
+    t0 = area_tap(a, b, k);
+    t1 = area_tap(a, b, k + 2.0);
+    t2 = area_tap(a, b, k + 4.0);
+}
+
+void add_tap(inout UV_PRECISION vec4 sum, UV_PRECISION vec2 u, UV_PRECISION vec2 v) {
+    if (u.y > 0.0 && v.y > 0.0)
+        sum += texture2D(surface, clamp(vec2(u.x, v.x) / ds_size, src_bounds.xy, src_bounds.zw)) *
+               (u.y * v.y);
+}
+
+vec4 sample_source(UV_PRECISION vec2 uv) {
+    UV_PRECISION vec2 c = uv * ds_size;
+    UV_PRECISION vec2 u0, u1, u2, v0, v1, v2;
+    axis_taps(c.x, ds_footprint.x, u0, u1, u2);
+    axis_taps(c.y, ds_footprint.y, v0, v1, v2);
+    // highp where there is one: mediump (fp16) cannot hold the weighted sum to 1/255.
+    UV_PRECISION vec4 sum = vec4(0.0);
+    add_tap(sum, u0, v0);
+    add_tap(sum, u1, v0);
+    add_tap(sum, u2, v0);
+    add_tap(sum, u0, v1);
+    add_tap(sum, u1, v1);
+    add_tap(sum, u2, v1);
+    add_tap(sum, u0, v2);
+    add_tap(sum, u1, v2);
+    add_tap(sum, u2, v2);
+    return sum / ((u0.y + u1.y + u2.y) * (v0.y + v1.y + v2.y));
+}
+#else
+vec4 sample_source(UV_PRECISION vec2 uv) {
+    return texture2D(surface, clamp(uv, src_bounds.xy, src_bounds.zw));
+}
+#endif
+
 vec3 srgb_to_linear(vec3 v) {
     // GLSL ES 1.00 has no mix(genType, genType, bvec), so branch per channel arithmetically.
     vec3 lo = v / 12.92;
@@ -565,10 +639,10 @@ vec3 pq_to_linear(vec3 v) {
 #endif
 
 void main() {
-    // Clamp to the source rectangle. Linear filtering samples between texel centers, so a
-    // magnified crop would otherwise read texels from outside its own source rect.
-    UV_PRECISION vec2 s = clamp(uv, src_bounds.xy, src_bounds.zw);
-    vec4 texel = use_solid > 0.5 ? solid_texel : texture2D(surface, s);
+    // Clamped to the source rectangle (in sample_source). Linear filtering samples between
+    // texel centers, so a magnified crop would otherwise read texels from outside its own
+    // source rect.
+    vec4 texel = use_solid > 0.5 ? solid_texel : sample_source(uv);
     texel.a = max(texel.a, alpha_one);
 #if defined(LUMEN_COLOR)
     vec3 straight = texel.a > 0.0 ? texel.rgb / texel.a : texel.rgb;
@@ -1194,6 +1268,9 @@ void lx::gfx::gl_compositor::shutdown() {
             glDeleteProgram(p.id);
     if (color_program_.id)
         glDeleteProgram(color_program_.id);
+    for (composite_program& p : downsample_programs_)
+        if (p.id)
+            glDeleteProgram(p.id);
 #endif
     vertex_buffer_ = 0;
     for (composite_program& p : programs_)
@@ -1201,6 +1278,10 @@ void lx::gfx::gl_compositor::shutdown() {
     color_program_ = {};
     color_highp_ = false;
     color_failed_ = false;
+    for (unsigned i = 0; i < 3; ++i) {
+        downsample_programs_[i] = {};
+        downsample_failed_[i] = false;
+    }
     for (blur_program& p : blur_programs_)
         p = {};
     blur_programs_failed_ = false;
@@ -1616,6 +1697,8 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
     // first time a draw of this call uses it, so a frame without one does not touch it.
     bool color_frame_set = false;
     bool color_solid = false;
+    // The downsampling programs whose per-frame uniform (target) is set (bit per variant).
+    unsigned downsample_frame_set = 0;
     for (const composite_program& p : programs_) {
         glUseProgram(p.id);
         if (p.sampler >= 0)
@@ -1831,17 +1914,47 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             // A colour-managed draw (wp_color_manager_v1) through LUMEN_COLOR.
             const bool cm = cmd.color.active && !cmd.blur && supports_color_management() &&
                             ensure_color_program();
-            const unsigned want = cm ? k_program_color
+            const unsigned base = cm ? k_program_color
                                   : transfer == 1 && cmd.tint.r == 1.f && cmd.tint.g == 1.f &&
                                           cmd.tint.b == 1.f
                                       ? k_program_identity
                                       : k_program_linear;
+            // A draw that shrinks its source by more than a texel per pixel takes the
+            // downsampling variant of its program (renderer.cppm "Downsampling").
+            downsample_footprint ds{};
+            if (!cmd.solid && !cmd.blur && slot_ptr && slot_ptr->width > 0 && slot_ptr->height > 0)
+                ds = downsample_footprint_for(
+                    effective_source(cmd.src, slot_ptr->width, slot_ptr->height), cmd.dst,
+                    cmd.buffer_xform);
+            const unsigned ds_variant = cm ? 2u : base;
+            composite_program* ds_prog = ds.active() ? ensure_downsample_program(ds_variant) : nullptr;
+            const unsigned want = ds_prog ? k_program_downsample + ds_variant : base;
             if (want != bound) {
-                glUseProgram(cm ? color_program_.id : programs_[want].id);
+                glUseProgram(ds_prog ? ds_prog->id : cm ? color_program_.id : programs_[want].id);
                 bound = want;
             }
-            const composite_program& prog = cm ? color_program_ : programs_[bound];
-            if (cm) {
+            const composite_program& prog = ds_prog ? *ds_prog : cm ? color_program_ : programs_[bound];
+            if (ds_prog) {
+                if (!(downsample_frame_set & (1u << ds_variant))) {
+                    downsample_frame_set |= 1u << ds_variant;
+                    if (prog.target >= 0)
+                        glUniform2f(prog.target, static_cast<float>(width),
+                                    static_cast<float>(height));
+                }
+                if (cm) {
+                    const float* m = cmd.color.matrix;
+                    const float cols[9] = {m[0], m[3], m[6], m[1], m[4], m[7], m[2], m[5], m[8]};
+                    if (prog.color_matrix >= 0)
+                        glUniformMatrix3fv(prog.color_matrix, 1, GL_FALSE, cols);
+                    if (prog.color_params >= 0)
+                        glUniform3f(prog.color_params, cmd.color.power, cmd.color.peak, 0.f);
+                }
+                if (prog.ds_size >= 0)
+                    glUniform2f(prog.ds_size, static_cast<float>(slot_ptr->width),
+                                static_cast<float>(slot_ptr->height));
+                if (prog.ds_footprint >= 0)
+                    glUniform2f(prog.ds_footprint, ds.u, ds.v);
+            } else if (cm) {
                 if (!color_frame_set) {
                     color_frame_set = true;
                     if (prog.sampler >= 0)
@@ -2100,6 +2213,82 @@ bool lx::gfx::gl_compositor::ensure_color_program() {
     return true;
 #else
     return false;
+#endif
+}
+
+lx::gfx::gl_compositor::composite_program*
+lx::gfx::gl_compositor::ensure_downsample_program(unsigned variant) {
+#if defined(LUMEN_HAS_EGL)
+    if (variant >= 3)
+        return nullptr;
+    composite_program& p = downsample_programs_[variant];
+    if (p.id)
+        return &p;
+    if (downsample_failed_[variant])
+        return nullptr;
+    static constexpr const char* k_prefixes[3] = {
+        "#define LUMEN_DOWNSAMPLE 1\n",
+        "#define LUMEN_DOWNSAMPLE 1\n#define LUMEN_IDENTITY 1\n",
+        "#define LUMEN_DOWNSAMPLE 1\n#define LUMEN_COLOR 1\n",
+    };
+    const GLuint vertex = detail::compile_shader(GL_VERTEX_SHADER, detail::k_vertex_shader);
+    const GLuint fragment = vertex ? detail::compile_shader(GL_FRAGMENT_SHADER,
+                                                            detail::k_fragment_shader,
+                                                            k_prefixes[variant])
+                                   : 0u;
+    GLuint program = 0;
+    if (vertex && fragment) {
+        program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glBindAttribLocation(program, 0, "corner");
+        glLinkProgram(program);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            glDeleteProgram(program);
+            program = 0;
+        }
+    }
+    if (vertex)
+        glDeleteShader(vertex);
+    if (fragment)
+        glDeleteShader(fragment);
+    if (!program) {
+        downsample_failed_[variant] = true;
+        log_gl.warn("downsampling composite program {} failed to build: downscaled surfaces "
+                    "are sampled once per pixel",
+                    variant);
+        return nullptr;
+    }
+    p.id = program;
+    p.rect = glGetUniformLocation(program, "rect");
+    p.target = glGetUniformLocation(program, "target");
+    p.opacity = glGetUniformLocation(program, "opacity");
+    p.uv_origin_dx = glGetUniformLocation(program, "uv_origin_dx");
+    p.uv_dy = glGetUniformLocation(program, "uv_dy");
+    p.tint = glGetUniformLocation(program, "tint");
+    p.src_bounds = glGetUniformLocation(program, "src_bounds");
+    p.transfer = glGetUniformLocation(program, "transfer");
+    p.alpha_one = glGetUniformLocation(program, "alpha_one");
+    p.use_solid = glGetUniformLocation(program, "use_solid");
+    p.solid_texel = glGetUniformLocation(program, "solid_texel");
+    p.sampler = glGetUniformLocation(program, "surface");
+    p.color_matrix = glGetUniformLocation(program, "color_matrix");
+    p.color_params = glGetUniformLocation(program, "color_params");
+    p.ds_size = glGetUniformLocation(program, "ds_size");
+    p.ds_footprint = glGetUniformLocation(program, "ds_footprint");
+    // What never changes for it: texture unit 0, and never a solid draw (those have no
+    // footprint to filter).
+    glUseProgram(program);
+    if (p.sampler >= 0)
+        glUniform1i(p.sampler, 0);
+    if (p.use_solid >= 0)
+        glUniform1f(p.use_solid, 0.f);
+    return &p;
+#else
+    (void)variant;
+    return nullptr;
 #endif
 }
 

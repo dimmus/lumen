@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // Composite pass, colour-managed draws (wp_color_manager_v1): composite.frag plus the draw's
 // colour transform into the working space — linear light, BT.709 primaries, 1.0 = the
@@ -23,7 +24,7 @@ layout(push_constant) uniform quad_push {
     vec4 tint;
     vec4 src_bounds;
     int transfer;
-    float pad1;
+    int downsample;
     vec2 uv_dy;
     vec4 solid;
     vec4 m0;
@@ -35,6 +36,8 @@ layout(set = 0, binding = 0) uniform sampler2D surface_texture;
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
+
+#include "downsample.glsl"
 
 const float k_knee = 0.8; // lx::gfx::k_tone_knee
 
@@ -68,8 +71,11 @@ vec3 decode(vec3 v) {
 }
 
 void main() {
-    vec2 uv = clamp(v_uv, push.src_bounds.xy, push.src_bounds.zw);
-    vec4 texel = push.use_solid > 0.5 ? push.solid : texture(surface_texture, uv);
+    vec4 texel = push.use_solid > 0.5
+                     ? push.solid
+                     : sample_source(surface_texture, v_uv, push.src_bounds,
+                                     push.src_uv.zw / push.dst.z, push.uv_dy / push.dst.w,
+                                     push.downsample);
 
     // Transfer functions are defined on the straight signal, as in composite.frag.
     vec3 straight = texel.a > 0.0 ? texel.rgb / texel.a : texel.rgb;
