@@ -192,6 +192,9 @@ void lx::shell::shell_app::start_desktop_services() {
                },
                this);
     tooltip_.init(mg);
+    // The GPUs (switcheroo-control on the system bus with more than one), whatever the user
+    // bus does.
+    apps_.probe_gpus();
     if (!bus_.open())
         return;
     // Launches go over the same connection (one fd in the poll set).
@@ -712,8 +715,45 @@ void lx::shell::shell_app::on_menu_activate(int id) {
             note_server_.action_invoked(note, key.c_str(), nullptr, now);
         return;
     }
+    case menu_kind::launcher: {
+        const unsigned entry = launcher_menu_entry_;
+        const bool current = launcher_menu_gen_ == catalog_.generation();
+        // The menu goes before the launcher it hangs from (`launch_entry` closes it).
+        menu_.close();
+        if (id == 1 && current && launcher_.is_open())
+            launch_entry(entry,
+                         last_press_serial_ > last_key_serial_ ? last_press_serial_
+                                                               : last_key_serial_,
+                         true);
+        return;
+    }
     case menu_kind::none: return;
     }
+}
+
+void lx::shell::shell_app::open_launcher_menu(unsigned entry, lx::rect2i anchor, unsigned serial) {
+    const desktop_entry* e = catalog_.entry(entry);
+    if (!e || !launcher_.layer() || !apps_.offload_available())
+        return; // one GPU: nothing to choose, no menu
+    std::vector<menu_entry> items;
+    menu_entry gpu{};
+    // GNOME Shell's wording: the item names the GPU the entry would not get by default.
+    gpu.label = e->prefers_non_default_gpu ? "Launch using _Integrated Graphics Card"
+                                           : "Launch using _Discrete Graphics Card";
+    gpu.id = 1;
+    items.push_back(std::move(gpu));
+    tooltip_.close();
+    // Another menu's close handler runs before this one is marked as current.
+    menu_.close();
+    menu_kind_ = menu_kind::launcher;
+    launcher_menu_entry_ = entry;
+    launcher_menu_gen_ = catalog_.generation();
+    if (!menu_.open(
+            launcher_.layer(), anchor, std::move(items), serial,
+            [](int id, void* user) { static_cast<shell_app*>(user)->on_menu_activate(id); },
+            [](void* user) { static_cast<shell_app*>(user)->on_menu_closed(); }, nullptr, this,
+            "launcher"))
+        menu_kind_ = menu_kind::none;
 }
 
 void lx::shell::shell_app::on_menu_closed() {
@@ -725,9 +765,12 @@ void lx::shell::shell_app::on_menu_closed() {
         o->bar->set_menu_keyboard(false);
     if (pointer_target_ == pointer_target::menu)
         pointer_target_ = pointer_target::none;
+    const bool launcher = menu_kind_ == menu_kind::launcher;
     menu_kind_ = menu_kind::none;
     menu_key_ = 0;
     menu_actions_.clear();
+    if (launcher)
+        launcher_menu_closed();
 }
 
 // ── The tray ─────────────────────────────────────────────────────────────────

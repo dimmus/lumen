@@ -186,6 +186,20 @@ outlives both — with its output in the journal:
 `app-lumen-<id>-<random>.scope`, instead. Without systemd --user (or with
 `LUMEN_SHELL_LAUNCH=fork`) it is started by double fork + `setsid`.
 
+On a machine with more than one GPU (a notebook with integrated and discrete graphics), an
+application whose desktop entry says `PrefersNonDefaultGPU=true` (or KDE's
+`X-KDE-RunOnDiscreteGpu=true`) is started on the GPU that does not drive the display; the
+compositor and every other application stay on the one that does. A right click on an
+application in the launcher (or the Menu key, or Shift+F10) offers **Launch using Discrete
+Graphics Card** — **Launch using Integrated Graphics Card** for an entry that prefers the
+other GPU — as GNOME Shell does; with one GPU there is no such menu. The variables that pick
+the GPU come from switcheroo-control (`net.hadess.SwitcherooControl` on the system bus;
+`DRI_PRIME=pci-…` for Mesa drivers, the NVIDIA driver's PRIME render offload variables for
+it), as in GNOME and KDE; without it, `DRI_PRIME=1`, which Mesa's OpenGL drivers and its
+Vulkan device-select layer both honour. They go into the application's unit
+(`systemctl --user show -p Environment 'app-lumen-<id>@*'`), and `shell.apps` logs the
+choice at start-up and each launch that uses it.
+
 `lumen-compositor` options: `[socket-name]`, `-f FPS` (frame clock without a display mode),
 `--decorations=server|client`, `--shell PATH`, `--scale S` — the output scale, fractional
 allowed (`1.25`, `1.5`, `2`; rounded to n/120, the unit `wp_fractional_scale_v1` speaks;
