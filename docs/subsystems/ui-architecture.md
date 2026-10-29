@@ -331,7 +331,7 @@ The flex container is **`flex_node`** (`lx.ui:flex`, `flex(style, children)`), a
 `layout::flex_style` over `lx.layout:flex`: the CSS flexbox subset Taffy gives GPUI
 (direction, wrap, justify / align content, items and self, gaps, grow / shrink / basis,
 min / max, margin with `auto`, padding, border, `position: absolute` with insets, overflow;
-lengths px, rem, percent, auto). `box()` is a flex column or row with a gap. Text wraps at
+lengths px, rem, percent, auto). Text wraps at
 the width the container gives it and shrinks to its longest word. Counts of what a pass did
 are in `ui_layout_counters()`.
 
@@ -377,9 +377,9 @@ tree's took 55 µs (`lumen-ui-bench --scenario S2`). `test_ui_components`'
 `damage_scoped_emit_repaints_the_damage_exactly` checks that the kept pixels with the damage
 repainted from the scoped list equal a full redraw.
 
-> The previous `widget::paint(lx::gfx::render_pass&)` signature is superseded. `render_pass`
-> was an empty placeholder class, so nothing painted through it could ever reach the
-> screen. See §9.
+> `ui_node::emit(draw_scope&)` is the only paint entry point. The old
+> `widget::paint(lx::gfx::render_pass&)` and its empty `render_pass` were deleted in ADR-010
+> Phase 5. See §9.
 
 ### Text emission (ADR-010 §4.6, Phase 2)
 
@@ -485,21 +485,24 @@ text input and the menus, modals, toasts and tooltips (`:overlay`, `:scroll`, `:
 `toast_stack`, `scroll_area` and `text_input` golden images. Flex layout (`:flex`)
 is covered by `tests/test_layout_flex.cpp`; styles, themes, styled boxes and icons
 (`:style`, `:theme`, `:theme.compile`, `:styled`, `:icon`) by `tests/test_ui_theme.cpp` and
-the `styled_surfaces` / `icons` golden images. The old string-keyed `style_ref` survives only
-for `:widgets` and `lx.ui.builder`, and reads nothing. Every §5.6 component in its states is
+the `styled_surfaces` / `icons` golden images. Every §5.6 component in its states is
 drawn by `lumen-ui-gallery` (§10); `lumen-ui-bench --scenario S2` is a shell panel built from
 them (ADR-010 §8.3, gate G2).
 
-The legacy retained-widget API (`:widgets`, `:widget_node`) is still exported so existing
-callers compile. It is superseded and should not gain new widgets:
+ADR-010 Phase 5 deleted the legacy retained-widget API (ADR-005 F7, step 13): one paradigm
+remains. What went, and what replaced it:
 
-| Legacy | Replacement |
-|--------|-------------|
-| `widget` base with raw `widget*` children | `ui_node` with owned children + reconciliation |
-| `widget::paint(gfx::render_pass&)` | `ui_node::emit(draw_scope&)` |
+| Deleted | Replacement |
+|---------|-------------|
+| `:widgets` (`widget` base with raw `widget*` children; `window::create` that succeeded with nothing) | `ui_node` with owned children + reconciliation; `lx::app::window` |
+| `widget::paint(gfx::render_pass&)` and `gfx::render_pass` | `ui_node::emit(draw_scope&)` |
 | `widget::invalidate()` (no-op) | `invalidate_paint` / `invalidate_layout` |
 | `widget::preferred_size(constraints)` | `measure(constraints, size_hint)` |
+| `:widget_node` (`scene::node_kind::widget`) | the client's `draw_list` from `ui_root::tick` |
+| `:widgets_decl` (`box()`, placeholder-bar `text()`, `button(label, fn, colour)`) | `flex()` / `div(style)`, `label()`, `button()` |
+| the string-keyed `style_ref` / `style_property` / `state` (16 B in every `ui_node`) | the packed `style` value |
 | `lx.ui.builder` fluent builders | `operator|` decorators |
+| lx.layout's old `flex_node` / `grid_node` / `layout_engine`, `scene::container_node::layout()` and `scene_graph::update` | `lx.layout:flex` through `lx.ui:flex` |
 
 Still to build:
 

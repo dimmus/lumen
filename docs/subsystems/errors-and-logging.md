@@ -83,18 +83,13 @@ lx::result<lx::gfx::device> pick_device() {
 | Invalid caller input | `lx::invalid_argument("...")` |
 | Real failure | Domain-specific code + message |
 
-### Intentional placeholder success (offline dev only)
+### No placeholder success
 
-These return empty objects without touching the platform — **not** `not_implemented`:
-
-| API | Reason |
-|-----|--------|
-| `lx::ui::window::create` | `lumen-hello` offline UI demo |
-| `lx::ui::window_builder::build` | Delegates to `window::create` |
-
-Every other `result<T>` platform/integration entry point either does its work or returns `not_implemented`.
-
-Replace placeholders with real implementations or `not_implemented` as each module enters P0.
+The last two entry points that returned an empty object without touching the platform,
+`lx::ui::window::create` and `lx::ui::window_builder::build` (the retained `:widgets` tree and
+lx.ui.builder), were deleted in ADR-010 Phase 5; `lumen-hello` is an `lx::app::window`. Every
+`result<T>` platform/integration entry point either does its work or returns
+`not_implemented`.
 
 ### Internal vs client-visible errors
 

@@ -10,8 +10,8 @@ Lumen v0.3 integrates multithreading at the API layer via **`lx.sync`**, **`lx.r
 
 | Resource | Owner thread | Notes |
 |----------|--------------|-------|
-| `widget` tree | **UI** (`affinity::ui`) | Never touch from worker/render |
-| `scene_graph` mutation | **UI** | `update`, `mark_dirty`, `commit_frame` |
+| `ui_node` tree (`ui_root`) | **UI** (`affinity::ui`) | Never touch from worker/render |
+| `scene_graph` mutation | **UI** | `mark_dirty`, `commit_frame` |
 | `immutable_frame_snapshot` | **Render** (read-only) | Acquired after UI `commit_frame` |
 | `draw_list` build (scratch) | **UI** | Published via `snapshot_buffer` |
 | Vulkan record/submit | **Render** | One recording thread per queue |

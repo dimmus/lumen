@@ -413,7 +413,7 @@ systemctl --user reload lumen-compositor   # SIGHUP: re-read the configuration
 | Platform | `lx.wayland.*`, `lx.input`, `lx.drm`, `lx.session` |
 | Graphics | `lx.gfx`, `lx.text`, `lx.layout`, `lx.scene` |
 | Desktop | `lx.compositor`, `lx.compositor.*`, `lx.shell`, `lx.shell.*`, `lx.ui` |
-| Apps | `lx.app`, `lx.ui.builder` |
+| Apps | `lx.app` |
 | Desktop (portal) | `lx.portal` (xdg-desktop-portal-lumen) |
 
 - **Multi-process:** compositor, shell, apps

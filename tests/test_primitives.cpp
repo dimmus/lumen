@@ -1010,13 +1010,21 @@ LUMEN_TEST(draw_scope_orders_overlapping_emits_above_each_other) {
 
 namespace {
 
+/// A filled column from the start edge: its fill is the frame's first (solid) draw.
+lx::ui::child filled_column(lx::ui::child content) {
+    lx::layout::flex_style column{};
+    column.direction = lx::layout::flex_direction::column;
+    column.align_items = lx::layout::item_align::flex_start;
+    const lx::ui::child items[1] = {content};
+    return lx::ui::flex(column, items, lx::color::rgb(0.1f, 0.1f, 0.1f));
+}
+
 lx::ui::child describe_panel(lx::ui::build_context&) {
-    return lx::ui::box(lx::color::rgb(0.1f, 0.1f, 0.1f),
-                       lx::ui::button("ok", nullptr, lx::color::rgb(0.2f, 0.3f, 0.5f)));
+    return filled_column(lx::ui::button("ok"));
 }
 
 lx::ui::child describe_panel_without_button(lx::ui::build_context&) {
-    return lx::ui::box(lx::color::rgb(0.1f, 0.1f, 0.1f), lx::ui::text("ok"));
+    return filled_column(lx::ui::label("ok"));
 }
 
 /// Asks for `frames` more frames from its own emit, as an animation does.

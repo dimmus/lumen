@@ -2,7 +2,6 @@ flowchart TB
     subgraph Apps["Application Layer"]
         APP["lx::app"]
         UI["lx::ui"]
-        UIB["lx::ui.builder"]
     end
 
     subgraph Desktop["Desktop Layer"]
@@ -53,7 +52,7 @@ flowchart TB
     APP --> RT
     UI --> SCENE
     UI --> TEXT
-    UIB --> UI
+    UI --> LAYOUT
     SHELL --> POLICY
     SHELL --> TEXT
     POLICY --> WLPROT
@@ -66,7 +65,6 @@ flowchart TB
     COMP --> CONFIG
     SHELL --> CONFIG
     SCENE --> GFX
-    SCENE --> LAYOUT
     SCENE --> SCHED
     WLS --> WLPROT
     WLC --> RT

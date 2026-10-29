@@ -1610,12 +1610,19 @@ in-process compositor, cold went from 131–135 to 133–139 ms p50 and warm fro
 start is the driver's: EGL on GBM ≈ 27 ms, the two compiles ≈ 60 ms, and fontconfig ≈ 16 ms on
 a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
 
-### Phase 5 — Adoption and deletion (≈2 weeks) — not started
+### Phase 5 — Adoption and deletion (≈2 weeks) — in progress
 
 - `lx.shell` panel, launcher and the portal overlay on `lx.ui`; `shm_canvas` deleted;
   the background keeps its single-pixel-buffer and worker-rendered image paths.
 - Delete `lx.ui:widgets`, `:widget_node`, `lx.ui.builder` and `gfx::render_pass`
-  (ADR-005 F7, step 13); `lx.app` no longer imports the builder.
+  (ADR-005 F7, step 13); `lx.app` no longer imports the builder. **Done**, with
+  `:widgets_decl` (its `box` / placeholder `text` / `button`; S1 and the tests that used them
+  now build from `flex` / `div` / `label` / `button`, so S1's node and primitive counts
+  changed deliberately), the string-keyed `style_ref` (`sizeof(ui_node)` 80 → 64 B), the
+  `scene::node_kind::widget` kind, and lx.layout's old `flex_node` / `grid_node` /
+  `layout_engine` with `container_node::layout()` and `scene_graph::update` (an empty
+  1920 × 1080 solve every compositor tick; `sizeof(container_node)` 1744 → 1176 B). No pixel
+  changed (`test_ui_golden`); lumen-ui-bench S2–S4 p50 equal or lower on cpu and gl.
 - Compositor decorations fully on primitives; `compositor_impl` passes the stream through.
 - Docs: `docs/subsystems/ui-engine.md` (this design as current), ui-architecture.md §9
   rewritten, rendering-performance.md gains a UI section with the measured tables,

@@ -435,13 +435,8 @@ struct summary {
 constexpr lx::color k_background = tok(0x28, 0x2c, 0x33);         // background
 constexpr lx::color k_surface = tok(0x2f, 0x34, 0x3e);            // elevated_surface.background
 constexpr lx::color k_border = tok(0x36, 0x3c, 0x46);             // border
-constexpr lx::color k_element = tok(0x2f, 0x34, 0x3e);            // element.background
-constexpr lx::color k_title_bar = tok(0x3b, 0x41, 0x4d);          // title_bar.background
 constexpr lx::color k_text = tok(0xc8, 0xcc, 0xd4);               // text
-constexpr lx::color k_text_muted = tok(0x87, 0x8a, 0x98);         // text.muted
-constexpr lx::color k_accent = tok(0x74, 0xad, 0xe8);             // text.accent
 constexpr lx::color k_shadow = tok(0x00, 0x00, 0x00, 0.40f);      // §5.2 elevation
-constexpr lx::color k_none = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
 
 // ── Scene nodes ─────────────────────────────────────────────────────────────────
 //
@@ -648,11 +643,18 @@ struct scenario_spec {
     return static_cast<int>(std::lround(static_cast<float>(px) * scale));
 }
 
-// S1 — an idle window: a frame with a shadow, a title row and a body of stock widgets
-// (`box`, `text`, `button` emit solid surface draws; the frame emits a shadow and a quad).
-// Built once; nothing invalidates afterwards, so `ui_root::tick` must do nothing.
+// S1 — an idle window: a frame with a shadow, a title row and a body of stock components
+// (`label` and `button` of lx.ui:components in `div` rows, real text in the bundled font; the
+// frame emits a shadow and a quad). Built once; nothing invalidates afterwards, so
+// `ui_root::tick` must do nothing.
 
 struct s1_scene {
+    // Declared in dependency order: the glyph cache goes before the atlas it writes.
+    std::unique_ptr<lx::text::face_cache> faces{};
+    std::unique_ptr<lx::text::shape_cache> shapes{};
+    std::unique_ptr<lx::text::itemizer> items{};
+    std::unique_ptr<lx::gfx::atlas> atlas{};
+    std::unique_ptr<lx::text::glyph_cache> glyphs{};
     float scale = 1.f;
 };
 
@@ -661,26 +663,27 @@ s1_scene g_s1{};
 [[nodiscard]] child describe_s1(lx::ui::build_context&) {
     using namespace lx::ui;
     const float sc = g_s1.scale;
+    const dim gap = px(8.f * sc);
 
-    child title_items[4] = {
-        text("lumen-hello", k_text),
-        button("min", nullptr, k_element),
-        button("max", nullptr, k_element),
-        button("close", nullptr, k_element),
+    const child title_items[4] = {
+        label("lumen-hello").single_line(),
+        button("min"),
+        button("max"),
+        button("close"),
     };
-    child title = with_children(describe<box_node, box_props>({k_title_bar, true, scaled(8, sc)}),
-                                title_items);
+    const child title = div(style{}.flex_row().items_center().gap(gap).px(gap)
+                                .bg(tok::title_bar_background),
+                            title_items);
 
-    child body_items[3] = {
-        text("Hello from the declarative tree", k_text),
-        text("nothing changes after the first frame", k_text_muted),
-        button("OK", nullptr, k_accent),
+    const child body_items[3] = {
+        label("Hello from the declarative tree"),
+        label("nothing changes after the first frame").color(tok::text_muted),
+        button("OK").style(button_style::filled),
     };
-    child body = with_children(describe<box_node, box_props>({k_none, false, scaled(8, sc)}),
-                               body_items);
+    const child body = div(style{}.flex_col().items_start().gap(gap).p(gap), body_items);
 
-    child column_items[2] = {title, body};
-    child column = with_children(describe<box_node, box_props>({k_none, false, 0}), column_items);
+    const child column_items[2] = {title, body};
+    const child column = div(style{}.flex_col().size_full(), column_items);
 
     card_props frame{};
     frame.style.background = k_background;
@@ -697,14 +700,45 @@ s1_scene g_s1{};
     return with_children(describe<card_node, card_props>(frame), {&column, 1u});
 }
 
+/// S1's text resources go once its run is over.
+void release_s1() {
+    lx::ui::set_ui_resources({});
+    g_s1.glyphs.reset(); // before the atlas it writes
+    g_s1 = {};
+}
+
+/// The compiled theme the build writes (tools/lumen-theme), else the copy compiled in; what
+/// it activated.
+[[nodiscard]] const char* activate_bench_theme() {
+    if (auto t = lx::ui::load_theme_file("one-dark")) {
+        lx::ui::set_active_theme(std::move(t).value());
+        return "one-dark.lxtheme";
+    }
+    lx::ui::set_active_builtin_theme(lx::ui::appearance::dark);
+    return "built-in (one-dark.lxtheme not found)";
+}
+
 [[nodiscard]] scenario_spec make_s1(const options& opt) {
+    g_s1.glyphs.reset(); // before the atlas it writes
+    g_s1 = {};
     g_s1.scale = opt.scale;
+    g_s1.faces = std::make_unique<lx::text::face_cache>();
+    g_s1.shapes = std::make_unique<lx::text::shape_cache>();
+    g_s1.items = std::make_unique<lx::text::itemizer>();
+    g_s1.atlas = std::make_unique<lx::gfx::atlas>();
+    g_s1.glyphs = std::make_unique<lx::text::glyph_cache>(*g_s1.atlas);
+    (void)activate_bench_theme();
+    lx::ui::ui_resources r{};
+    r.text = {{g_s1.faces.get(), g_s1.shapes.get(), g_s1.items.get()}, g_s1.glyphs.get(), nullptr};
+    lx::ui::set_ui_resources(r);
+
     scenario_spec s{};
     s.id = "S1";
     s.title = "idle window";
     s.view = {0, 0, scaled(640, opt.scale), scaled(480, opt.scale)};
     s.arena_bytes = 64 * 1024;
     s.describe = describe_s1;
+    s.atlas = g_s1.atlas.get();
     return s;
 }
 
@@ -993,14 +1027,7 @@ void s2_text_frame(const lx::scene::draw_list& draws, bool clear_dirty, text_fra
     g_s2.glyphs = std::make_unique<lx::text::glyph_cache>(*g_s2.atlas);
     g_s2.icons = std::make_unique<lx::ui::icon_cache>(*g_s2.atlas);
 
-    // The compiled theme the build writes (tools/lumen-theme), else the copy compiled in.
-    if (auto t = lx::ui::load_theme_file("one-dark")) {
-        lx::ui::set_active_theme(std::move(t).value());
-        g_s2.theme_source = "one-dark.lxtheme";
-    } else {
-        lx::ui::set_active_builtin_theme(lx::ui::appearance::dark);
-        g_s2.theme_source = "built-in (one-dark.lxtheme not found)";
-    }
+    g_s2.theme_source = activate_bench_theme();
     lx::ui::ui_resources r{};
     r.text = {g_s2.engine(), g_s2.glyphs.get(), nullptr};
     r.icons = g_s2.icons.get();
@@ -2821,6 +2848,8 @@ void* bench_thread(void* raw) {
         if (i == 1 && !opt.frames_given)
             run.frames = k_s2_default_frames;
         job.results[job.count] = run_scenario(spec, run);
+        if (i == 0)
+            release_s1(); // its text caches are not the next scenario's memory
         print_table(job.results[job.count]);
         if (i == 3 && opt.reshape) {
             measure_reshape();

@@ -10182,10 +10182,6 @@ void compositor::tick_ui(scheduler::frame_tick tick) {
     }
 
     scheduler().on_vsync(tick);
-    {
-        lx::trace::scoped_span scene_span{"ui", "scene.update"};
-        scene().update(tick.delta_seconds);
-    }
 
     // Publish the served outputs that have something new: each view is built with its own
     // projection and damage (M3), and a view with nothing new publishes nothing — its last

@@ -134,10 +134,10 @@ target_compile_definitions(lx.text PRIVATE
     LUMEN_FONT_DIR_BUILD="${CMAKE_SOURCE_DIR}/assets/fonts"
     LUMEN_FONT_DIR_INSTALL_RELATIVE="${CMAKE_INSTALL_DATADIR}/lumen/fonts"
     LUMEN_FONT_DIR_INSTALL="${CMAKE_INSTALL_FULL_DATADIR}/lumen/fonts")
-lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation lx.runtime)
+lumen_add_module_library(lx.layout modules/lx.layout DEPENDS lx.foundation)
 lumen_add_module_library(lx.a11y modules/lx.a11y DEPENDS lx.foundation)
 lumen_add_module_library(lx.scene modules/lx.scene
-    DEPENDS lx.gfx lx.layout lx.scheduler lx.runtime lx.sync)
+    DEPENDS lx.gfx lx.scheduler lx.runtime lx.sync)
 lumen_add_module_library(lx.ui modules/lx.ui DEPENDS lx.scene lx.text lx.runtime lx.gfx lx.layout lx.a11y)
 # Compiled themes (ADR-010 §4.8) and bundled Lucide icons (§5.5): found in the build tree, an
 # install relative to the executable, or the configured install (LUMEN_THEME_DIR /
@@ -176,7 +176,6 @@ add_custom_command(
     COMMENT "Compiling the bundled themes (One Dark, One Light)"
     VERBATIM)
 add_custom_target(lumen-themes ALL DEPENDS ${LUMEN_THEME_OUTPUTS})
-lumen_add_module_library(lx.ui.builder modules/lx.ui.builder DEPENDS lx.ui)
 
 # ── Desktop ──────────────────────────────────────────────────────────────────
 lumen_add_module_library(lx.shell.policy modules/lx.shell.policy

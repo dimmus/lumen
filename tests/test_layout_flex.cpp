@@ -661,10 +661,9 @@ LUMEN_TEST(grow_decorator_flexes_in_a_flex_node) {
 
 namespace {
 
-lx::ui::child describe_box_column(lx::ui::build_context&) {
+lx::ui::child describe_gap_column(lx::ui::build_context&) {
     lx::ui::child items[3] = {label("one"), label("three"), label("two")};
-    return lx::ui::with_children(
-        lx::ui::describe<lx::ui::box_node, lx::ui::box_props>({{}, false, 4}), items);
+    return lx::ui::flex(style("flex-direction:column;align-items:flex-start;row-gap:4px"), items);
 }
 
 lx::ui::child describe_sizing_min(lx::ui::build_context&) {
@@ -677,14 +676,14 @@ lx::ui::child describe_sizing_min(lx::ui::build_context&) {
 
 } // namespace
 
-LUMEN_TEST(box_is_a_flex_column_and_sizing_is_read) {
-    // box(): a column from the start edge, children at their content size, `gap` apart:
+LUMEN_TEST(flex_column_with_gap_measures_children) {
+    // A column from the start edge, children at their content size, 4 px apart:
     // 21 × 14 at y 0, 35 × 14 at 18, 21 × 14 at 36.
-    ui_harness h{describe_box_column, {0, 0, 200, 100}};
+    ui_harness h{describe_gap_column, {0, 0, 200, 100}};
     LUMEN_CHECK(same(h.node({0}).bounds(), {0, 0, 21, 14}));
     LUMEN_CHECK(same(h.node({1}).bounds(), {0, 18, 35, 14}));
     LUMEN_CHECK(same(h.node({2}).bounds(), {0, 36, 21, 14}));
-    // box's measure is the flex column's content size: widest 35, 3 × 14 + 2 × 4 = 50.
+    // The column's measure is its content size: widest 35, 3 × 14 + 2 × 4 = 50.
     const lx::size2i m = h.root.tree()->measure({{0, 0}, {200, 100}}, lx::ui::size_hint::preferred);
     LUMEN_CHECK(m.width == 35 && m.height == 50);
 

@@ -13,7 +13,7 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | Display | Wayland-only |
 | Rendering | Vulkan-first (discrete + integrated) |
 | Processes | Multi-process (compositor, shell, apps) |
-| UI | Scene graph core + fluent builder widgets + compiled themes |
+| UI | Declarative UI engine (ADR-010): components, flex layout, primitives, compiled themes |
 | WM | Stacking-first, optional master-stack tiling per workspace (compositor) |
 | Security | Unix permissions default, optional Flatpak portal |
 
@@ -25,8 +25,7 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [02-component-deployment.mmd](02-component-deployment.mmd) | Component | Processes and kernel interfaces |
 | [03-runtime-events.mmd](03-runtime-events.mmd) | Class | Event loop and event bus |
 | [04-scene-graph.mmd](04-scene-graph.mmd) | Class | Scene graph and Vulkan draw path |
-| [05-layout.mmd](05-layout.mmd) | Class | Incremental layout engine |
-| [06-ui-toolkit.mmd](06-ui-toolkit.mmd) | Class | Widgets and compiled themes |
+| [05-layout.mmd](05-layout.mmd) | Class | Flex layout: lx.layout:flex under lx.ui's containers, the measure cache |
 | [07-compositor-shell.mmd](07-compositor-shell.mmd) | Class | Compositor vs shell policy split |
 | [08-frame-sequence.mmd](08-frame-sequence.mmd) | Sequence | One-frame hot path |
 | [09-wayland-protocols.mmd](09-wayland-protocols.mmd) | Package | Protocol layer stack |
@@ -34,7 +33,6 @@ Codename for the Linux windowing system, desktop environment, and UI library sta
 | [11-lumen-private-protocols.mmd](11-lumen-private-protocols.mmd) | Class | zlm_* DE protocols |
 | [12-window-management.mmd](12-window-management.mmd) | Class | Stacking-first + master-stack tiling |
 | [13-state-machines.mmd](13-state-machines.mmd) | State | Surface, Seat, Widget, ZlmToplevel, Session pause/resume, Display power, Session lock |
-| [14-fluent-builder.mmd](14-fluent-builder.mmd) | Class | Fluent builder API |
 | [15-dual-gpu.mmd](15-dual-gpu.mmd) | Class | Discrete vs integrated render paths |
 | [16-security.mmd](16-security.mmd) | Component | Unix creds; sandboxed clients (security-context listeners, the global filter); capture for sandboxed apps only through the portals |
 | [17-systemd-deployment.mmd](17-systemd-deployment.mmd) | Deployment | The login session: lumen-session, the compositor bound to graphical-session.target, the shell supervised by systemd, XDG autostart, the control socket and lumen-ctl, each launched app a transient service, the portals with the exported session environment (ADR 011) |

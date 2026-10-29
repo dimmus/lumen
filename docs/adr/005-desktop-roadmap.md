@@ -416,8 +416,10 @@ ADR-004 made these implementable; they are now mostly protocol code.
 ### Phase 3 — A toolkit worth using — **superseded by [ADR-010](010-gpu-ui-engine.md)**
 
 ADR-010 replaced this list with a GPU UI engine and its own phases; its status header is the
-current state. In short: 13 is ADR-010 Phase 5 (not started; the retained tree and
-`lx.ui.builder` are still in the tree), 14 is done (ADR-010 Phase 2: UAX #14, bidi, fallback,
+current state. In short: 13 is done in ADR-010 Phase 5 (the retained `:widgets` tree,
+`:widget_node`, `:widgets_decl`, `lx.ui.builder`, `gfx::render_pass` and the string-keyed
+`style_ref` are deleted: one paradigm; the shell's adoption of lx.ui is Phase 5's later
+stages), 14 is done (ADR-010 Phase 2: UAX #14, bidi, fallback,
 colour emoji, subpixel positioning), 15 is half done (toolkit focus and keyboard navigation in
 ADR-010 Phase 3; IME in the toolkit waits for the client runtime, Phase 4, though the
 compositor side is done, Phase 1 step 7), 16 is open, and 17 has scrolling and motion

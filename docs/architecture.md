@@ -23,7 +23,7 @@ Lumen is a greenfield Linux desktop stack built in **C++26** with **Clang**:
 |-----------|------|
 | **Compositor** (`lumen-compositor`) | Wayland display server, input routing, surface composition, Vulkan present |
 | **Shell** (`lumen-shell`) | Desktop chrome — panel, workspaces, window management UI |
-| **UI library** (`lx.ui`, `lx.ui.builder`) | Widget toolkit + fluent builders for apps and shell |
+| **UI library** (`lx.ui`) | Declarative UI engine (ADR-010): components, layout and primitives for apps and shell |
 | **App framework** (`lx.app`) | Event loop, settings, clipboard for third-party apps |
 
 Design goals:
@@ -274,8 +274,8 @@ Each app (ADR-010 §4.9–§4.10, Phase 4):
   platform libraries (libinput, udev, libwayland-server), which a client never calls and would
   otherwise map and relocate at every exec
 
-Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`. `lx.ui.builder` is kept compiling until
-ADR-010 Phase 5 deletes it; `lx.app` no longer imports it.
+Apps never see `zlm_shell_v1` or `zlm_toplevel_v1`. `lx.app` builds on `lx.ui` directly (the
+`lx.ui.builder` fluent API was deleted in ADR-010 Phase 5).
 
 ### 2.4 Portal processes
 
@@ -301,14 +301,13 @@ Shared WM vocabulary (`lx::toplevel_state`, `lx::placement`) lives in
 `lx.foundation` so the compositor can describe toplevel state without depending
 on `lx.shell.policy`. Policy implementations stay in the desktop layer.
 `lx.ui` is also desktop-layer: shell and apps both consume it; only
-`lx.ui.builder` / `lx.app` sit above.
+`lx.app` sits above.
 
 
 ```mermaid
 flowchart TB
     subgraph L6["Application layer"]
         APP["lx.app"]
-        UIB["lx.ui.builder"]
     end
 
     subgraph L5["Desktop layer"]
@@ -357,7 +356,7 @@ flowchart TB
         FOUND["lx.foundation / error / handles"]
     end
 
-    APP --> UIB --> UI
+    APP --> UI
     APP --> WLC
     SH --> SHB
     SH --> SHP --> WLC
@@ -393,7 +392,7 @@ flowchart TB
 | **Graphics** | Vulkan RHI, text, layout (`lx.text` rasterises glyphs into `lx.gfx:atlas`, so it depends on `lx.gfx`; `lx.layout:flex` is the UI's flexbox, on `lx.foundation` only) | `dmabuf_importer`, `solve_flex`, `scene_graph` |
 | **Compositor** | Display server integration | `tick_ui` / `tick_render`, `shell_bridge` |
 | **Desktop** | WM policy, shell UI, shared widget toolkit | `policy_bridge`, `stacking_policy`, `lx.ui` |
-| **Application** | End-user programs + fluent builders | `lx::application`, `make_window()` |
+| **Application** | End-user programs on the app framework | `lx::application`, `lx::app::window` |
 
 ---
 
@@ -1946,8 +1945,9 @@ Internally: `window` owns or wraps a `xdg_toplevel` + `wl_surface`; retained nod
 measure/arrange and then **emit draw commands** into the scene graph — they never
 rasterize. Commits go to the compositor on the UI thread.
 
-The `lx.ui.builder` fluent API is superseded by decorators; see
-[ui-architecture.md](subsystems/ui-architecture.md) §9 for migration status.
+The retained `:widgets` tree and the `lx.ui.builder` fluent API are gone (ADR-010 Phase 5):
+components and decorators are the one API; see
+[ui-architecture.md](subsystems/ui-architecture.md) §9.
 
 ### 6.3 Frame commit (client → screen)
 
@@ -1989,7 +1989,7 @@ Golden rule: **UI mutates, render reads immutable snapshots.**
 ┌──────────────── UI thread (affinity::ui) ─────────────────┐
 │  event_loop → vsync → tick_ui()                         │
 │    wayland.dispatch()                                   │
-│    scene.update() → build_draw_list_into(write_slot)    │
+│    build_draw_list_into(write_slot)                     │
 │    scene.commit_frame() → snapshot_buffer.publish()     │
 └────────────────────────────┬──────────────────────────────┘
                              │ atomic index swap

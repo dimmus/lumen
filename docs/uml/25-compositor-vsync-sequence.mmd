@@ -11,7 +11,7 @@ sequenceDiagram
     loop each wakeup (earliest start among running clocks)
         Timer->>UI: on_vsync()
         UI->>FC: take_due(now): outputs due within 1 ms
-        UI->>UI: wayland.dispatch + scene.update
+        UI->>UI: wayland.dispatch + wm / decoration / cursor ticks
         UI->>SB: commit_frame(slot, frame) for each due output with damage
         UI->>CV: render_mask |= published; notify render_pending
         CV->>RT: wake

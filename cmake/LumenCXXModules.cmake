@@ -26,7 +26,6 @@ set(LUMEN_LAYER_lx.a11y 5)
 # Widget toolkit is shared by shell (desktop) and apps — same layer as shell,
 # not above it, so lx.shell → lx.ui is not an upward edge.
 set(LUMEN_LAYER_lx.ui 5)
-set(LUMEN_LAYER_lx.ui.builder 6)
 set(LUMEN_LAYER_lx.app 6)
 set(LUMEN_LAYER_lx.portal 5)
 
@@ -128,8 +127,8 @@ function(lumen_check_executable_layers target)
                 if(DEFINED LUMEN_LAYER_${_root})
                     if(LUMEN_LAYER_${_dep} GREATER LUMEN_LAYER_${_root})
                         message(FATAL_ERROR
-                            "Executable layer violation: ${target} links ${ _root } (L${LUMEN_LAYER_${_root}}) "
-                            "through ${ _dep } (L${LUMEN_LAYER_${_dep}})")
+                            "Executable layer violation: ${target} links ${_root} (L${LUMEN_LAYER_${_root}}) "
+                            "through ${_dep} (L${LUMEN_LAYER_${_dep}})")
                     endif()
                 endif()
             endforeach()

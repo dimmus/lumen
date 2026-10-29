@@ -575,9 +575,6 @@ public:
     void set_visible(bool visible);
     [[nodiscard]] bool visible() const;
 
-    void set_style(style_ref style);
-    [[nodiscard]] style_ref style() const;
-
     [[nodiscard]] lx::rect2i bounds() const;
 
     /// Layout must run again before the next emit: clears this node's measure cache and
@@ -600,7 +597,6 @@ protected:
     unsigned child_capacity_ = 0;
     element_key key_ = 0;
     lx::rect2i bounds_{};
-    style_ref style_{};
     bool visible_ = true;
     bool layout_dirty_ = true;
     /// `node_flag` bits, in what was padding.
@@ -1876,8 +1872,6 @@ void lx::ui::ui_node::set_key(element_key key) { key_ = key; }
 lx::ui::element_key lx::ui::ui_node::key() const { return key_; }
 void lx::ui::ui_node::set_visible(bool visible) { visible_ = visible; }
 bool lx::ui::ui_node::visible() const { return visible_; }
-void lx::ui::ui_node::set_style(style_ref style) { style_ = style; }
-lx::ui::style_ref lx::ui::ui_node::style() const { return style_; }
 lx::rect2i lx::ui::ui_node::bounds() const { return bounds_; }
 
 void lx::ui::ui_node::mark_layout_dirty() {
