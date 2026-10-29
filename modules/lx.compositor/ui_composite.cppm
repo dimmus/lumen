@@ -17,10 +17,12 @@ module;
 //     draw the same stream into the capture buffer (`paint_cpu_capture`, `paint_gl_capture`),
 //     the headless dump walks it in order (`paint_headless`).
 //   - A path with no primitive renderer (GLES 2, or Vulkan whose `ui_vk` did not come up)
-//     takes the stream lowered to blits (`gfx::lower_to_blits`): solid square quads become
-//     solid blits, everything else is dropped, counted and warned about once per run of
-//     frames that drop. The compositor binds no chrome atlas on such a path, so frames
-//     carry no title glyphs there and keep the decoration atlas's close-button blit.
+//     takes the stream lowered to blits (`gfx::lower_to_blits`): solid square and rounded
+//     quads become solid blits (a rounded one with its corner radius), mono sprites coverage
+//     blits from the chrome atlas's R8 pages — which the backend holds as textures
+//     (`sync_atlas`, before the composite, under the atlas's lock) — and everything else is
+//     dropped, counted and warned about once per run of frames that drop. Server-side frames
+//     (fills, the close button's circle, the title and the ×) are drawn on every path.
 //
 // Colour. A primitive's colour is premultiplied and sRGB-encoded (ADR-010 §4.5), and the CPU
 // and GL compositors' UI renderers blend it in that encoded space, as in a client window;
@@ -136,6 +138,21 @@ public:
     flattened(const scene::immutable_frame_snapshot& snap, frame_paint_stats* stats = nullptr);
     /// The snapshot's stream over the blits `surfaces(snap)` last built.
     [[nodiscard]] gfx::ui_stream stream(const scene::immutable_frame_snapshot& snap) const;
+    /// The blits `surfaces` last built (every paint builds them for its snapshot): what a
+    /// caller reporting on the frame just painted reads, without converting it again.
+    [[nodiscard]] std::span<const gfx::blit_command> last_surfaces() const {
+        return {blits_, blit_count_};
+    }
+    /// The lowered path's glyphs: when `snap`'s stream draws from an atlas, `atlas`'s R8 pages
+    /// brought up to date in the backend (`gl_compositor::sync_atlas`,
+    /// `vulkan_compositor::sync_atlas`) under the atlas's lock — what `flattened`'s coverage
+    /// blits sample. `paint_gl` / `paint_vk` call it on their lowered branch; a screen capture
+    /// that composites `flattened` itself calls it first. A failure is logged once and the
+    /// glyphs are left out.
+    void sync_atlas(gfx::gl_compositor& compositor, const scene::immutable_frame_snapshot& snap,
+                    chrome_atlas* atlas);
+    void sync_atlas(gfx::vulkan_compositor& compositor, const scene::immutable_frame_snapshot& snap,
+                    chrome_atlas* atlas);
 
     /// The CPU compositor's frame into `target`, restricted to `region`. `ui` null: the
     /// lowered path for frames with primitives. `atlas`: where the stream's sprites are
@@ -216,6 +233,9 @@ private:
     std::vector<gfx::sprite_instance> moved_sprites_{};
     std::vector<gfx::underline_instance> moved_underlines_{};
     std::vector<gfx::batch> moved_batches_{};
+    /// `paint_headless`: one row of a rounded quad's coverage at a time.
+    std::uint8_t row_coverage_[256]{};
+    bool sync_warned_ = false;
 
     gfx::blit_command* blits_ = nullptr;
     unsigned blit_capacity_ = 0;
@@ -357,10 +377,34 @@ lx::compositor::frame_painter::flattened(const scene::immutable_frame_snapshot& 
     note_drops(lower.dropped);
     if (stats) {
         stats->primitives = snap.draws().primitive_count();
-        stats->lowered = lower.lowered;
+        stats->lowered = lower.lowered + lower.sprites;
         stats->dropped = lower.dropped;
     }
     return {out, n};
+}
+
+void lx::compositor::frame_painter::sync_atlas(gfx::gl_compositor& compositor,
+                                               const scene::immutable_frame_snapshot& snap,
+                                               chrome_atlas* atlas) {
+    if (!atlas || !uses_atlas(snap))
+        return;
+    const std::lock_guard<std::mutex> lock{atlas->mutex()};
+    if (auto r = compositor.sync_atlas(atlas->atlas()); !r && !sync_warned_) {
+        sync_warned_ = true;
+        log_render.error(r.get_error());
+    }
+}
+
+void lx::compositor::frame_painter::sync_atlas(gfx::vulkan_compositor& compositor,
+                                               const scene::immutable_frame_snapshot& snap,
+                                               chrome_atlas* atlas) {
+    if (!atlas || !uses_atlas(snap))
+        return;
+    const std::lock_guard<std::mutex> lock{atlas->mutex()};
+    if (auto r = compositor.sync_atlas(atlas->atlas()); !r && !sync_warned_) {
+        sync_warned_ = true;
+        log_render.error(r.get_error());
+    }
 }
 
 lx::result<lx::compositor::cpu_paint_result> lx::compositor::frame_painter::paint_cpu(
@@ -409,6 +453,8 @@ lx::result<lx::compositor::gl_paint_result> lx::compositor::frame_painter::paint
     gl_paint_result out{};
     if (!has_primitives(snap) || !ui || !ui->ready()) {
         const bool lowered = has_primitives(snap);
+        if (lowered)
+            sync_atlas(compositor, snap, atlas);
         const auto blits = flattened(snap, &out.paint);
         auto c = compositor.composite_into(framebuffer, width, height, snap.clear_color(),
                                            blits.data(), static_cast<unsigned>(blits.size()),
@@ -459,6 +505,8 @@ lx::result<lx::compositor::vk_paint_result> lx::compositor::frame_painter::paint
     vk_paint_result out{};
     if (!has_primitives(snap) || !ui || !ui->ready()) {
         const bool lowered = has_primitives(snap);
+        if (lowered)
+            sync_atlas(compositor, snap, atlas);
         const auto blits = flattened(snap, &out.paint);
         gfx::damage_region all{};
         all.set_full();
@@ -525,10 +573,34 @@ void lx::compositor::frame_painter::paint_headless(gfx::frame_renderer& renderer
             one.refs = {&ref, 1};
             gfx::blit_command b{};
             gfx::ui_lower_stats st{};
-            if (gfx::lower_to_blits(one, &b, 1, st) == 1)
-                (void)renderer.draw_to_headless(&b, 1, target);
-            else
+            if (gfx::lower_to_blits(one, &b, 1, st) != 1) {
                 ++dropped;
+            } else if (b.corner_radius != 0) {
+                // A rounded fill: `:ui_cpu`'s quad coverage, a row (of at most 256 pixels) at
+                // a time, blended as a mono sprite's.
+                const float hx = 0.5f * static_cast<float>(b.dst.width);
+                const float hy = 0.5f * static_cast<float>(b.dst.height);
+                const float r = b.corner_radius_px();
+                for (int y = 0; y < b.dst.height; ++y)
+                    for (int x0 = 0; x0 < b.dst.width; x0 += 256) {
+                        const int n = std::min(256, b.dst.width - x0);
+                        for (int i = 0; i < n; ++i) {
+                            const float qx = std::fabs(static_cast<float>(x0 + i) + 0.5f - hx) - hx + r;
+                            const float qy = std::fabs(static_cast<float>(y) + 0.5f - hy) - hy + r;
+                            const float ox = qx > 0.f ? qx : 0.f;
+                            const float oy = qy > 0.f ? qy : 0.f;
+                            const float d = std::sqrt(ox * ox + oy * oy) +
+                                            std::min(std::max(qx, qy), 0.f) - r;
+                            const float a = std::clamp(0.5f - d, 0.f, 1.f);
+                            row_coverage_[i] = static_cast<std::uint8_t>(a * 255.f + 0.5f);
+                        }
+                        (void)target.blend_coverage({b.dst.x + x0, b.dst.y + y, n, 1}, b.clip,
+                                                    row_coverage_, static_cast<unsigned>(n),
+                                                    static_cast<unsigned>(n), 1u, b.solid_color);
+                    }
+            } else {
+                (void)renderer.draw_to_headless(&b, 1, target);
+            }
             break;
         }
         case gfx::primitive_kind::mono_sprite: {

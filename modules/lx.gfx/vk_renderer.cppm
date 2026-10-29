@@ -16,6 +16,7 @@ import :damage;
 import :dmabuf;
 import :renderer;
 import :color;
+import :atlas;
 
 namespace {
 
@@ -181,6 +182,14 @@ public:
                                                unsigned height, const unsigned char* rgba);
 
     void forget_texture(unsigned texture_id);
+
+    /// The R8 pages of `a` as textures `atlas_page_texture(p)` (R8_UNORM), for the coverage
+    /// blits `lower_to_blits` makes of mono sprites when no `:ui_vk` renders the stream: a
+    /// page not seen at its size goes up whole, otherwise its dirty rects in one copy; the
+    /// dirty lists are cleared. Waits for the frames in flight before it writes (an upload
+    /// happens when a title's glyphs are new, never on a steady frame). The caller holds
+    /// whatever lock guards `a`'s pages.
+    [[nodiscard]] lx::result<void> sync_atlas(atlas& a);
 
     /// The whole of `target`: every pixel composited and encoded. Starts no chain: the
     /// intermediate it leaves is not continued from (`composite_region`).
@@ -526,6 +535,12 @@ private:
     lx::rect2i pass_area_{};
     /// Records the acquire of every imported image not yet acquired (outside a pass).
     void record_acquires(void* command_buffer);
+    /// `sync_atlas`'s upload of one page: `rects` (empty: the whole page) of `view` into
+    /// texture `texture_id`, made (or remade at a new size) as an R8 image first.
+    [[nodiscard]] lx::result<void> upload_coverage(unsigned texture_id, const atlas_page_view& view,
+                                                   std::span<const lx::rect2i> rects);
+    /// The atlas `sync_atlas` last uploaded from (compared, never dereferenced).
+    const void* atlas_seen_ = nullptr;
     /// Shared by `composite` and `prepare_blits`: the 1×1 texture solid draws bind.
     [[nodiscard]] lx::result<void> ensure_solid_texture(const blit_command* cmds, unsigned count);
     /// Before destroying or rewriting texture `slot`: when an external user recorded it, waits
@@ -558,6 +573,11 @@ private:
     /// layout's push range holds `quad_push_cm`; `cm_failed_` that making them failed.
     void* cm_pipeline_ = nullptr;
     void* cm_opaque_pipeline_ = nullptr;
+    /// composite.frag with `k_lowered` (blending; lowered draws never are opaque), for the
+    /// linear format: made on the first coverage or rounded draw, never on a host where
+    /// `:ui_vk` draws the stream. `lowered_failed_`: making it failed (such draws skipped).
+    void* lowered_pipeline_ = nullptr;
+    bool lowered_failed_ = false;
     bool cm_push_ = false;
     bool cm_failed_ = false;
     /// The colour-managed pipeline pair for `format` (the linear format's own, or a pass
@@ -689,7 +709,8 @@ struct quad_push {
     float dst[4]{};
     float target[2]{};
     float opacity = 1.f;
-    /// 1: a solid draw — `solid` replaces the sample (`blit_command::solid`).
+    /// 1: a solid draw — `solid` replaces the sample (`blit_command::solid`); 2: a coverage
+    /// draw — `solid` × the sample's red (`blit_command::coverage`).
     float use_solid = 0.f;
     /// The source box as an affine basis in normalized texture coordinates: where the
     /// destination's top-left lands (u, v) and its +x direction (du, dv); `uv_dy` is the +y
@@ -702,7 +723,8 @@ struct quad_push {
     float src_bounds[4]{0.f, 0.f, 1.f, 1.f};
     /// Transfer function to decode the sampled texel with. Matches `transfer_slot`.
     int transfer = 1;
-    float pad1 = 0.f;
+    /// A rounded solid's corner radius (`blit_command::corner_radius`); 0: square.
+    float radius = 0.f;
     float uv_dy[2]{0.f, 1.f};
     /// Premultiplied, encoded colour of a solid draw.
     float solid[4]{0.f, 0.f, 0.f, 0.f};
@@ -838,12 +860,14 @@ constexpr VkFormat k_target_format = VK_FORMAT_B8G8R8A8_UNORM;
     push.target[0] = static_cast<float>(target_w);
     push.target[1] = static_cast<float>(target_h);
     push.opacity = cmd.opacity;
-    if (cmd.solid) {
-        push.use_solid = 1.f;
+    if (cmd.solid || cmd.coverage) {
+        push.use_solid = cmd.coverage ? 2.f : 1.f;
         push.solid[0] = cmd.solid_color.r;
         push.solid[1] = cmd.solid_color.g;
         push.solid[2] = cmd.solid_color.b;
         push.solid[3] = cmd.solid_color.a;
+        if (cmd.solid)
+            push.radius = cmd.corner_radius_px();
     }
 
     // Source box in normalized coordinates (empty src: the whole texture), turned by
@@ -1000,10 +1024,12 @@ void begin_rendering(VkCommandBuffer cb, VkImageView view, VkRect2D area,
 /// when `blend` is false, for opaque draws — viewport and scissor dynamic) for one colour
 /// attachment of `format` (dynamic rendering). Null on failure. `blur` makes the blur passes'
 /// pipeline instead (encode.vert's fullscreen triangle, blur.frag; pass `blend` false);
-/// `color` the colour-managed one (composite_cm.frag, `quad_push_cm`).
+/// `color` the colour-managed one (composite_cm.frag, `quad_push_cm`); `lowered` composite.frag
+/// with `k_lowered` set (coverage and rounded solid blits).
 VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_layout,
                                      VkFormat format, VkPipelineCache cache,
-                                     bool blend = true, bool blur = false, bool color = false) {
+                                     bool blend = true, bool blur = false, bool color = false,
+                                     bool lowered = false) {
     VkShaderModule vert =
         blur ? create_shader(dev, k_encode_vert_spv, sizeof(k_encode_vert_spv))
              : create_shader(dev, k_composite_vert_spv, sizeof(k_composite_vert_spv));
@@ -1028,6 +1054,16 @@ VkPipeline create_composite_pipeline(VkDevice dev, VkPipelineLayout pipeline_lay
     stages[1].stage = VK_SHADER_STAGE_FRAGMENT_BIT;
     stages[1].module = frag;
     stages[1].pName = "main";
+
+    const VkBool32 lowered_value = VK_TRUE;
+    const VkSpecializationMapEntry lowered_entry{0, 0, sizeof(VkBool32)};
+    VkSpecializationInfo lowered_info{};
+    lowered_info.mapEntryCount = 1;
+    lowered_info.pMapEntries = &lowered_entry;
+    lowered_info.dataSize = sizeof(VkBool32);
+    lowered_info.pData = &lowered_value;
+    if (lowered && !blur && !color)
+        stages[1].pSpecializationInfo = &lowered_info;
 
     // Quad corners come from gl_VertexIndex, so there is no vertex input state.
     VkPipelineVertexInputStateCreateInfo vertex_input{};
@@ -1904,6 +1940,8 @@ void lx::gfx::vulkan_compositor::shutdown() {
             vkDestroyPipeline(dev, static_cast<VkPipeline>(pipeline_), nullptr);
         if (opaque_pipeline_)
             vkDestroyPipeline(dev, static_cast<VkPipeline>(opaque_pipeline_), nullptr);
+        if (lowered_pipeline_)
+            vkDestroyPipeline(dev, static_cast<VkPipeline>(lowered_pipeline_), nullptr);
         if (cm_pipeline_)
             vkDestroyPipeline(dev, static_cast<VkPipeline>(cm_pipeline_), nullptr);
         if (cm_opaque_pipeline_)
@@ -1935,6 +1973,8 @@ void lx::gfx::vulkan_compositor::shutdown() {
     submit_slot_ = 0;
     pipeline_ = nullptr;
     opaque_pipeline_ = nullptr;
+    lowered_pipeline_ = nullptr;
+    lowered_failed_ = false;
     cm_pipeline_ = nullptr;
     cm_opaque_pipeline_ = nullptr;
     cm_push_ = false;
@@ -2236,6 +2276,190 @@ lx::result<void> lx::gfx::vulkan_compositor::upload_rgba(unsigned texture_id, un
     (void)height;
     (void)rgba;
     return lx::not_implemented("lx::gfx::vulkan_compositor::upload_rgba");
+#endif
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::sync_atlas(atlas& a) {
+#if defined(LUMEN_HAS_VULKAN)
+    if (!ready())
+        return lx::not_implemented("lx::gfx::vulkan_compositor::sync_atlas");
+    const bool fresh_atlas = atlas_seen_ != &a;
+    atlas_seen_ = &a;
+    for (unsigned p = 0; p < k_atlas_r8_pages; ++p) {
+        const atlas_page_view view = a.page(p);
+        if (!view.valid() || view.format != atlas_format::r8)
+            continue;
+        const int index = find_texture(atlas_page_texture(p));
+        const bool whole = fresh_atlas || a.dirty_full(p) || index < 0 ||
+                           textures_[static_cast<unsigned>(index)].width != view.size;
+        const std::span<const lx::rect2i> dirty = a.dirty_rects(p);
+        if (!whole && dirty.empty())
+            continue;
+        if (auto up = upload_coverage(atlas_page_texture(p), view,
+                                      whole ? std::span<const lx::rect2i>{} : dirty);
+            !up)
+            return up.get_error();
+        a.clear_dirty(p);
+    }
+    return {};
+#else
+    (void)a;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::sync_atlas");
+#endif
+}
+
+lx::result<void> lx::gfx::vulkan_compositor::upload_coverage(unsigned texture_id,
+                                                             const atlas_page_view& view,
+                                                             std::span<const lx::rect2i> rects) {
+#if defined(LUMEN_HAS_VULKAN)
+    auto dev = static_cast<VkDevice>(ctx_.device);
+    auto phys = static_cast<VkPhysicalDevice>(ctx_.physical_device);
+    // Every frame that may sample the page is complete before it is written (and the staging
+    // ring is free from the start).
+    wait_all_slots_idle();
+    const int index = alloc_texture(texture_id);
+    if (index < 0)
+        return lx::make_error(lx::vulkan_err::import_failed, "texture table full");
+    auto& slot = textures_[static_cast<unsigned>(index)];
+    wait_external(slot);
+    if (slot.image && slot.width != view.size) {
+        destroy_texture(slot);
+        slot.id = texture_id;
+        slot.used = true;
+    }
+    if (!slot.image) {
+        VkImageCreateInfo ici{};
+        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        ici.imageType = VK_IMAGE_TYPE_2D;
+        ici.format = VK_FORMAT_R8_UNORM;
+        ici.extent = {view.size, view.size, 1};
+        ici.mipLevels = 1;
+        ici.arrayLayers = 1;
+        ici.samples = VK_SAMPLE_COUNT_1_BIT;
+        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
+        ici.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage image = VK_NULL_HANDLE;
+        if (vkCreateImage(dev, &ici, nullptr, &image) != VK_SUCCESS)
+            return vk_error("atlas page vkCreateImage failed");
+        VkMemoryRequirements reqs{};
+        vkGetImageMemoryRequirements(dev, image, &reqs);
+        const int type_index =
+            find_memory_type(phys, reqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        if (type_index < 0) {
+            vkDestroyImage(dev, image, nullptr);
+            return vk_error("no device-local memory type for an atlas page");
+        }
+        VkMemoryAllocateInfo mai{};
+        mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+        mai.allocationSize = reqs.size;
+        mai.memoryTypeIndex = static_cast<uint32_t>(type_index);
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        if (vkAllocateMemory(dev, &mai, nullptr, &memory) != VK_SUCCESS) {
+            vkDestroyImage(dev, image, nullptr);
+            return vk_error("atlas page vkAllocateMemory failed");
+        }
+        if (vkBindImageMemory(dev, image, memory, 0) != VK_SUCCESS) {
+            vkFreeMemory(dev, memory, nullptr);
+            vkDestroyImage(dev, image, nullptr);
+            return vk_error("atlas page vkBindImageMemory failed");
+        }
+        slot.image = image;
+        slot.memory = memory;
+        slot.width = slot.height = view.size;
+        slot.owns_image = true;
+        slot.layout_ready = false;
+        VkImageViewCreateInfo vci{};
+        vci.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+        vci.image = image;
+        vci.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format = VK_FORMAT_R8_UNORM;
+        vci.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        vci.subresourceRange.levelCount = 1;
+        vci.subresourceRange.layerCount = 1;
+        VkImageView image_view = VK_NULL_HANDLE;
+        if (vkCreateImageView(dev, &vci, nullptr, &image_view) != VK_SUCCESS)
+            return vk_error("atlas page vkCreateImageView failed");
+        slot.view = image_view;
+        if (auto described = create_descriptor(slot); !described)
+            return described.get_error();
+    }
+    // A new image is written whole; one region per dirty rect otherwise (a full dirty list is
+    // the page dirty whole, which the caller passes as no rects).
+    static constexpr unsigned k_regions = 64;
+    const lx::rect2i whole_page{0, 0, static_cast<int>(view.size), static_cast<int>(view.size)};
+    const bool whole = !slot.layout_ready || rects.empty() || rects.size() > k_regions;
+    const std::span<const lx::rect2i> parts = whole ? std::span<const lx::rect2i>{&whole_page, 1} : rects;
+    VkDeviceSize bytes = 0;
+    for (const lx::rect2i& r : parts)
+        bytes += static_cast<VkDeviceSize>(r.width > 0 ? r.width : 0) * (r.height > 0 ? r.height : 0);
+    if (auto staged = ensure_staging_ring(k_staging_ring_bytes); !staged)
+        return staged.get_error();
+    if (bytes > staging_capacity_)
+        return lx::make_error(lx::vulkan_err::import_failed, "atlas page exceeds the staging ring");
+    // Idle above: nothing reads the ring.
+    staging_offset_ = 0;
+    VkBufferImageCopy regions[k_regions]{};
+    unsigned region_count = 0;
+    VkDeviceSize offset = 0;
+    for (const lx::rect2i& r : parts) {
+        if (r.width <= 0 || r.height <= 0 || r.x < 0 || r.y < 0 ||
+            static_cast<unsigned>(r.x + r.width) > view.size ||
+            static_cast<unsigned>(r.y + r.height) > view.size)
+            continue;
+        for (int y = 0; y < r.height; ++y)
+            std::memcpy(staging_mapped_ + offset + static_cast<std::size_t>(y) * r.width,
+                        view.pixels + static_cast<std::size_t>(r.y + y) * view.stride + r.x,
+                        static_cast<std::size_t>(r.width));
+        VkBufferImageCopy& c = regions[region_count++];
+        c.bufferOffset = offset;
+        c.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        c.imageSubresource.layerCount = 1;
+        c.imageOffset = {r.x, r.y, 0};
+        c.imageExtent = {static_cast<uint32_t>(r.width), static_cast<uint32_t>(r.height), 1};
+        offset += static_cast<VkDeviceSize>(r.width) * r.height;
+    }
+    staging_offset_ = static_cast<unsigned>((offset + 255u) & ~VkDeviceSize{255u});
+    if (region_count == 0)
+        return {};
+
+    const unsigned frame_slot = submit_slot_;
+    auto cb = static_cast<VkCommandBuffer>(command_buffers_[frame_slot]);
+    auto fence = static_cast<VkFence>(fences_[frame_slot]);
+    if (vkWaitForFences(dev, 1, &fence, VK_TRUE, 1'000'000'000ull) != VK_SUCCESS)
+        return vk_error("vkWaitForFences timed out reclaiming upload slot");
+    vkResetFences(dev, 1, &fence);
+    vkResetCommandBuffer(cb, 0);
+    slot_timed_[frame_slot] = false; // an upload is not a frame
+    VkCommandBufferBeginInfo begin{};
+    begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkBeginCommandBuffer(cb, &begin);
+    // A partial update keeps the rest of the page: from its sampled layout, not UNDEFINED.
+    image_barrier(cb, static_cast<VkImage>(slot.image),
+                  whole ? VK_IMAGE_LAYOUT_UNDEFINED : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  whole ? VK_PIPELINE_STAGE_2_NONE : VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  whole ? VK_ACCESS_2_NONE : VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    vkCmdCopyBufferToImage(cb, static_cast<VkBuffer>(staging_buffer_),
+                           static_cast<VkImage>(slot.image), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           region_count, regions);
+    image_barrier(cb, static_cast<VkImage>(slot.image), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_PIPELINE_STAGE_2_COPY_BIT,
+                  VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    vkEndCommandBuffer(cb);
+    if (auto submitted = submit_current_slot(false); !submitted)
+        return submitted.get_error();
+    slot.layout_ready = true;
+    return {};
+#else
+    (void)texture_id;
+    (void)view;
+    (void)rects;
+    return lx::not_implemented("lx::gfx::vulkan_compositor::upload_coverage");
 #endif
 }
 
@@ -3109,9 +3333,24 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::composite_frame
             const bool cm = cmd.color.active && supports_color_management() &&
                             ensure_cm_pipelines(static_cast<unsigned>(k_linear_format),
                                                 cm_pipeline_, cm_opaque_pipeline_);
+            // A lowered primitive through composite.frag's `k_lowered` pipeline, made now if
+            // this is the first.
+            const bool lowered = cmd.coverage || (cmd.solid && cmd.corner_radius != 0);
+            if (lowered && !lowered_pipeline_ && !lowered_failed_) {
+                lowered_pipeline_ = create_composite_pipeline(
+                    static_cast<VkDevice>(ctx_.device),
+                    static_cast<VkPipelineLayout>(pipeline_layout_), k_linear_format,
+                    static_cast<VkPipelineCache>(pipeline_cache_), true, false, false, true);
+                lowered_failed_ = lowered_pipeline_ == nullptr;
+            }
+            if (lowered && !lowered_pipeline_) {
+                ++stats.draws_skipped;
+                continue;
+            }
             void* want_pipeline =
-                cm ? (cmd.blend == lx::blend_mode::opaque ? cm_opaque_pipeline_ : cm_pipeline_)
-                   : (cmd.blend == lx::blend_mode::opaque ? opaque_pipeline_ : pipeline_);
+                lowered ? lowered_pipeline_
+                : cm    ? (cmd.blend == lx::blend_mode::opaque ? cm_opaque_pipeline_ : cm_pipeline_)
+                        : (cmd.blend == lx::blend_mode::opaque ? opaque_pipeline_ : pipeline_);
             if (want_pipeline != bound_pipeline) {
                 vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                   static_cast<VkPipeline>(want_pipeline));
@@ -3374,6 +3613,12 @@ lx::result<lx::gfx::composite_stats> lx::gfx::vulkan_compositor::record_blits(
         }
         if (external && index >= 0)
             textures_[static_cast<unsigned>(index)].external_use = true;
+        // Lowered primitives belong to this compositor's own frames (`composite`): a stream
+        // recorded here is drawn by the UI renderer, which never lowers.
+        if (cmd.coverage || (cmd.solid && cmd.corner_radius != 0)) {
+            ++stats.draws_skipped;
+            continue;
+        }
         // As `composite`: opaque draws without blending, sets and push ranges kept bound;
         // a colour-managed draw through the format's composite_cm.frag pair (on an encoded
         // target it encodes its result itself).

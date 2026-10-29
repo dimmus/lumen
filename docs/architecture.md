@@ -661,10 +661,13 @@ records them inside its linear pass through `ui_vk`) and as solid blits where th
 from the compositor's glyph atlas (`chrome_atlas`, one per process, keyed by size × scale), laid
 out again only when the title changes, its ellipsis cut moves or the window's output scales
 change — a focus change only recolours the sprites; the close × is an atlas glyph per scale
-(with a circle blit on hover). Screen captures re-composite the same stream through the CPU and
-GL primitive renderers. Only GLES 2, or Vulkan whose `ui_vk` did not come up, lowers the stream
-to blits: the compositor binds no chrome atlas there, so those frames draw no title and keep the
-decoration atlas's close-button blit. Damage is the frame's strips, never the client area.
+(rasterised as soon as a scale is seen) and the hover circle a quad of radius half its side.
+A frame draws from its first frame: nothing is staged for it. Screen captures re-composite the
+same stream through the CPU and GL primitive renderers. GLES 2, or Vulkan whose `ui_vk` did not
+come up, lowers the stream to blits (`gfx::lower_to_blits`): fills and the circle as solid
+blits, the title and the × as coverage blits from the chrome atlas's R8 pages, which the backend
+keeps as textures (`sync_atlas`) — every path draws the same frame. The snap preview and the
+fullscreen backdrop are solid draws. Damage is the frame's strips, never the client area.
 
 The hit test checks a window's surfaces first, then its frame's zones (close button, title,
 then resize bands that extend 8 px outside the visible border, corners within 20 px).

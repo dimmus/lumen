@@ -578,10 +578,16 @@ struct compositor_impl {
         const scene::immutable_frame_snapshot* snap = nullptr;
     };
     /// Sets `src.paint` (and `src.blits` to the frame's draws in draw order, what its stream
-    /// indexes) when `snap` has primitives and this backend has a UI renderer; `ctx` must
-    /// outlive the capture call.
-    void capture_paint_for(capture_frame_source& src, capture_paint_ctx& ctx,
-                           const scene::immutable_frame_snapshot& snap);
+    /// indexes) when `snap` has primitives and this backend has a UI renderer, and returns
+    /// true; `ctx` must outlive the capture call. False: nothing set.
+    [[nodiscard]] bool capture_paint_for(capture_frame_source& src, capture_paint_ctx& ctx,
+                                         const scene::immutable_frame_snapshot& snap);
+    /// What a capture of `snap` composites: the stream through the backend's UI renderer
+    /// (`capture_paint_for`), else the draws — the stream lowered to blits where it has
+    /// primitives (`frame_painter::flattened`, the glyph pages synced first on GL). The
+    /// lowering runs only on the path that draws it.
+    void capture_draws(capture_frame_source& src, capture_paint_ctx& ctx,
+                       const scene::immutable_frame_snapshot& snap);
     static bool capture_paint_cpu(void* user, const gfx::pixel_surface& dst, lx::color clear,
                                   const gfx::blit_command* blits, unsigned count,
                                   lx::point2i offset, const gfx::damage_region& region);
@@ -2787,12 +2793,9 @@ void compositor_impl::run_capture_render() {
             // needs them to leave the software pointer out.
             snap = &scene.acquire_render_snapshot(p.slot);
             drain_texture_updates(snap->frame_index());
-            const auto blits = painter_.flattened(*snap);
-            src.blits = blits.data();
-            src.blit_count = static_cast<unsigned>(blits.size());
             src.clear = snap->clear_color();
-            // Its UI stream (title glyphs) through the backend's primitive renderer.
-            capture_paint_for(src, paint_ctx, *snap);
+            // Its UI stream (title glyphs) through the backend's primitive renderer, or lowered.
+            capture_draws(src, paint_ctx, *snap);
         }
         if (gl_present_)
             src.gl_framebuffer = p.gl[p.capture_front].framebuffer();
@@ -2815,15 +2818,12 @@ void compositor_impl::run_capture_render() {
         drain_texture_updates(snap.frame_index());
         // The window's frame included: its stream (title glyphs) through the backend's
         // primitive renderer, or lowered to blits where there is none.
-        const auto blits = painter_.flattened(snap);
         capture_frame_source src{};
         src.frame = snap.frame_index();
         src.time_ns = static_cast<unsigned long long>(now_ns());
-        src.blits = blits.data();
-        src.blit_count = static_cast<unsigned>(blits.size());
         src.clear = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
         capture_paint_ctx paint_ctx{};
-        capture_paint_for(src, paint_ctx, snap);
+        capture_draws(src, paint_ctx, snap);
         // The pointer over the window, at the view's projection.
         if (jobs[i].paint_cursors && cursor_cur_.visible) {
             const unsigned scale120 = static_cast<unsigned>(std::lround(jobs[i].scale * 120.0));
@@ -3035,17 +3035,11 @@ void compositor_impl::register_p0_globals() {
     wm_.set_layers(&layers_);
     p0_.layers = &layers_;
     decorations_.bind(tree_, scene);
-    {
-        // Titles and the close glyph are atlas sprites only where the present path has a
-        // primitive renderer to draw them (CPU, GLES 3.1, a ready ui_vk; the headless dump
-        // walks mono sprites itself). GLES 2, or Vulkan whose ui_vk did not come up, lowers
-        // the stream to blits and would drop them: there the frames keep the decoration
-        // atlas's close-button blit and draw no title.
-        const bool sprites = cpu_present_ || headless_present_ ||
-                             (gl_present_ && ui_gl_ && ui_gl_->ready()) ||
-                             (vulkan_present_ && ui_vk_ && ui_vk_->ready());
-        decorations_.bind_chrome(sprites ? &chrome_atlas_ : nullptr);
-    }
+    // Titles and the close glyph are atlas sprites on every path: the primitive renderers
+    // (CPU, GLES 3.1, a ready ui_vk) draw them, the headless dump walks mono sprites itself,
+    // and GLES 2 or Vulkan whose ui_vk did not come up lowers them to coverage blits from the
+    // atlas's pages (`frame_painter::sync_atlas`).
+    decorations_.bind_chrome(&chrome_atlas_);
     wm_.set_decorations(&decorations_);
     p0_.decorations = &decorations_;
     p0_.server_side_decorations = cfg.server_side_decorations;
@@ -10728,7 +10722,8 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 hint_composite_deadline(p);
                 publish_release_fence(p.composited_fence, idx);
                 if (c.value().composite.draws_skipped > 0) {
-                    const auto blits = painter_.surfaces(snapshot);
+                    // The frame's draws, as the paint converted them (no second conversion).
+                    const auto blits = painter_.last_surfaces();
                     report_unregistered_draw(blits.data(), static_cast<unsigned>(blits.size()));
                 }
                 // A requested debug screenshot of a fully repainted frame of this output.
@@ -10787,7 +10782,8 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 hint_composite_deadline(p);
                 publish_release_fence(p.composited_fence, idx);
                 if (c.value().composite.draws_skipped > 0) {
-                    const auto blits = painter_.surfaces(snapshot);
+                    // The frame's draws, as the paint converted them (no second conversion).
+                    const auto blits = painter_.last_surfaces();
                     report_unregistered_draw(blits.data(), static_cast<unsigned>(blits.size()));
                 }
             }
@@ -10816,9 +10812,6 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 src.frame = idx;
                 src.time_ns = p.capture_front_ns;
                 src.size = p.mode;
-                const auto blits = painter_.flattened(snapshot);
-                src.blits = blits.data();
-                src.blit_count = static_cast<unsigned>(blits.size());
                 src.clear = snapshot.clear_color();
                 if (gl_present_)
                     src.gl_framebuffer = p.gl[back].framebuffer();
@@ -10826,7 +10819,7 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                     src.vk_target = &p.vk[back];
                 src.cursor = capture_cursor_for(p);
                 capture_paint_ctx paint_ctx{};
-                capture_paint_for(src, paint_ctx, snapshot);
+                capture_draws(src, paint_ctx, snapshot);
                 capture_renderer_.output_composited(slot, frame_damage, src, capture_channel_);
             }
         } else {
@@ -10851,13 +10844,10 @@ bool compositor_impl::composite_output(output_pipeline& p, unsigned slot,
                 src.frame = idx;
                 src.time_ns = p.capture_front_ns;
                 src.size = p.mode;
-                const auto blits = painter_.flattened(snapshot);
-                src.blits = blits.data();
-                src.blit_count = static_cast<unsigned>(blits.size());
                 src.clear = snapshot.clear_color();
                 src.cursor = capture_cursor_for(p);
                 capture_paint_ctx paint_ctx{};
-                capture_paint_for(src, paint_ctx, snapshot);
+                capture_draws(src, paint_ctx, snapshot);
                 gfx::damage_region d = frame_damage;
                 d.clip({0, 0, p.mode.width, p.mode.height});
                 capture_renderer_.output_composited(slot, d, src, capture_channel_);
@@ -10926,14 +10916,27 @@ bool compositor_impl::blur_frame(output_pipeline& p, unsigned slot, unsigned bac
     return true;
 }
 
-void compositor_impl::capture_paint_for(capture_frame_source& src, capture_paint_ctx& ctx,
+void compositor_impl::capture_draws(capture_frame_source& src, capture_paint_ctx& ctx,
+                                    const scene::immutable_frame_snapshot& snap) {
+    if (capture_paint_for(src, ctx, snap))
+        return;
+    // No UI renderer here (GLES 2, Vulkan), or nothing but surfaces: the draws, lowered when
+    // they carry primitives — the glyphs' pages up to date first (GL re-composites them).
+    if (gl_present_ && frame_painter::has_primitives(snap))
+        painter_.sync_atlas(gl_compositor_, snap, &chrome_atlas_);
+    const auto blits = painter_.flattened(snap);
+    src.blits = blits.data();
+    src.blit_count = static_cast<unsigned>(blits.size());
+}
+
+bool compositor_impl::capture_paint_for(capture_frame_source& src, capture_paint_ctx& ctx,
                                         const scene::immutable_frame_snapshot& snap) {
     if (!frame_painter::has_primitives(snap))
-        return;
+        return false;
     const bool cpu = cpu_present_ && ui_cpu_;
     const bool gl = gl_present_ && ui_gl_ && ui_gl_->ready();
     if (!cpu && !gl)
-        return; // GLES 2: the lowered blits already in `src`
+        return false; // GLES 2: the caller lowers the stream
     ctx.impl = this;
     ctx.snap = &snap;
     // The draws in draw order: what the stream's surface refs index.
@@ -10943,6 +10946,7 @@ void compositor_impl::capture_paint_for(capture_frame_source& src, capture_paint
     src.paint.user = &ctx;
     src.paint.cpu = cpu ? &compositor_impl::capture_paint_cpu : nullptr;
     src.paint.gl = gl ? &compositor_impl::capture_paint_gl : nullptr;
+    return true;
 }
 
 bool compositor_impl::capture_paint_cpu(void* user, const gfx::pixel_surface& dst, lx::color clear,

@@ -5,7 +5,9 @@
 //     and GL primitive renderers and draws what the lowered path (GLES 2, Vulkan, capture)
 //     draws, within G10 on GL;
 //   - only opaque square quads occlude, and primitives are never culled;
-//   - a turned output's primitives land where its draws do, with radii and borders turned.
+//   - a turned output's primitives land where its draws do, with radii and borders turned;
+//   - the snap preview and the fullscreen backdrop, solid draws since Phase 5, draw the
+//     pixels the 1×1 textures they stretched drew, on the CPU and on GL.
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -52,12 +54,10 @@ int max_diff(const image& a, const std::vector<std::uint32_t>& b, std::size_t* w
     return worst;
 }
 
-/// The window's texture (premultiplied ARGB words, a translucent band at the bottom) and
-/// the decoration atlas, as the CPU path registers them.
+/// The window's texture (premultiplied ARGB words, a translucent band at the bottom), as the
+/// CPU path registers it.
 struct textures {
     std::vector<std::uint32_t> window = std::vector<std::uint32_t>(k_tex * k_tex);
-    std::vector<std::uint32_t> atlas =
-        std::vector<std::uint32_t>(lx::compositor::k_deco_atlas_size * lx::compositor::k_deco_atlas_size);
     textures() {
         for (int y = 0; y < k_tex; ++y)
             for (int x = 0; x < k_tex; ++x) {
@@ -67,7 +67,6 @@ struct textures {
                 const std::uint32_t b = (96u * a) / 255u;
                 window[static_cast<std::size_t>(y * k_tex + x)] = (a << 24) | (r << 16) | (g << 8) | b;
             }
-        lx::compositor::build_deco_atlas(atlas.data());
     }
     void register_cpu(lx::gfx::cpu_compositor& c) {
         lx::gfx::pixel_surface s{};
@@ -76,10 +75,6 @@ struct textures {
         s.stride = k_tex * 4u;
         s.format = static_cast<lx::fourcc>(lx::pixel_format::argb8888);
         LUMEN_CHECK(static_cast<bool>(c.register_texture(k_window_texture, s)));
-        s.pixels = reinterpret_cast<unsigned char*>(atlas.data());
-        s.width = s.height = lx::compositor::k_deco_atlas_size;
-        s.stride = lx::compositor::k_deco_atlas_size * 4u;
-        LUMEN_CHECK(static_cast<bool>(c.register_texture(lx::compositor::k_deco_atlas_texture_id, s)));
     }
     /// RGBA bytes of premultiplied ARGB words.
     static std::vector<unsigned char> rgba(const std::vector<std::uint32_t>& words) {
@@ -101,7 +96,6 @@ struct desktop {
     lx::scene::surface_node window{lx::surface_id{7}};
     lx::scene::surface_node solid{lx::surface_id{8}};
     lx::compositor::frame_node frame{};
-    bool atlas_ready = true;
     unsigned frame_index = 0;
 
     explicit desktop(bool decorated, lx::buffer_transform t = lx::buffer_transform::normal) {
@@ -117,7 +111,6 @@ struct desktop {
             frame.extents = lx::compositor::extents_for(lx::compositor::decoration_mode::server, false);
             frame.shown = true;
             frame.active = true;
-            frame.atlas_ready = &atlas_ready;
             (void)scene.root().add(&frame);
         }
         lx::gfx::imported_image img{};
@@ -424,12 +417,7 @@ LUMEN_TEST(gl_decorated_frame_matches_cpu_and_the_gles2_lowering) {
         LUMEN_CHECK(ui_ready);
         textures tex{};
         const auto window_rgba = textures::rgba(tex.window);
-        const auto atlas_rgba = textures::rgba(tex.atlas);
         LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(k_window_texture, k_tex, k_tex, window_rgba.data())));
-        LUMEN_CHECK(static_cast<bool>(comp.upload_rgba(lx::compositor::k_deco_atlas_texture_id,
-                                                       lx::compositor::k_deco_atlas_size,
-                                                       lx::compositor::k_deco_atlas_size,
-                                                       atlas_rgba.data())));
         lx::gfx::cpu_compositor cpu;
         tex.register_cpu(cpu);
         lx::gfx::ui_cpu_renderer cpu_ui;
@@ -480,6 +468,169 @@ LUMEN_TEST(gl_decorated_frame_matches_cpu_and_the_gles2_lowering) {
         LUMEN_CHECK(painter.dropped_primitives() == 0);
     }
     ::close(fd);
+}
+
+// ── Compositor chrome as solid draws (Phase 5) ───────────────────────────────────────
+
+namespace {
+
+/// The window under a shown snap preview (translucent: it blends) or fullscreen backdrop.
+struct chrome_scene {
+    lx::scene::scene_graph scene{};
+    lx::scene::surface_node window{lx::surface_id{7}};
+    lx::compositor::snap_preview preview{};
+    lx::compositor::fullscreen_backdrop backdrop{};
+    unsigned frame_index = 0;
+    explicit chrome_scene(bool backdrop_shown) {
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        lx::scene::output_view_config v{};
+        v.logical = {0, 0, k_w, k_h};
+        v.projection = {{0, 0}, 1.0, {k_w, k_h}};
+        scene.set_output_view(0, v);
+        lx::gfx::imported_image img{};
+        img.width = k_tex;
+        img.height = k_tex;
+        img.image_id = k_window_texture;
+        window.attach(img);
+        window.set_bounds({0, 0, k_tex, k_tex});
+        window.set_transform({30, 40});
+        (void)scene.root().add(&window);
+        if (backdrop_shown) {
+            backdrop.show({20, 10, 200, 150});
+            (void)scene.root().add(&backdrop);
+        } else {
+            preview.show({50, 30, 150, 120}); // over the window's right part and its band
+            (void)scene.root().add(&preview);
+        }
+    }
+    const lx::scene::immutable_frame_snapshot& publish() {
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        scene.note_full_damage_output(0);
+        LUMEN_CHECK(scene.commit_frame(0, ++frame_index));
+        lx::runtime::set_current_affinity(lx::runtime::affinity::render);
+        return scene.acquire_render_snapshot(0);
+    }
+    void release(const lx::scene::immutable_frame_snapshot& s) {
+        scene.release_render_frame(0, s);
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+    }
+};
+
+constexpr unsigned k_fill_texture = 0x7FFF'FD01u;
+constexpr unsigned k_border_texture = 0x7FFF'FD02u;
+constexpr unsigned k_black_texture = 0x7FFF'FD00u;
+
+/// The draws as they were before Phase 5: each solid draw the stretch of a 1×1 texture holding
+/// its colour (`snap_preview::k_fill` / `k_border`, opaque black), nearest, untinted.
+std::vector<lx::gfx::blit_command> as_texel_blits(std::span<const lx::gfx::blit_command> now) {
+    std::vector<lx::gfx::blit_command> out(now.begin(), now.end());
+    for (lx::gfx::blit_command& b : out) {
+        if (!b.solid)
+            continue;
+        b.solid = false;
+        b.texture_id = b.blend == lx::blend_mode::opaque ? k_black_texture
+                       : b.solid_color.a > 0.5f          ? k_border_texture
+                                                         : k_fill_texture;
+        b.src = {0.f, 0.f, 1.f, 1.f};
+        b.scaled = false;
+        b.solid_color = lx::color::rgb(0.f, 0.f, 0.f, 0.f);
+    }
+    return out;
+}
+
+const std::uint32_t k_texels[3] = {lx::compositor::snap_preview::k_fill,
+                                   lx::compositor::snap_preview::k_border, 0xFF000000u};
+const unsigned k_texel_ids[3] = {k_fill_texture, k_border_texture, k_black_texture};
+
+} // namespace
+
+LUMEN_TEST(snap_preview_and_backdrop_draw_the_pixels_of_their_old_textures) {
+    textures tex{};
+    lx::gfx::cpu_compositor comp;
+    tex.register_cpu(comp);
+    std::uint32_t texels[3] = {k_texels[0], k_texels[1], k_texels[2]};
+    for (unsigned i = 0; i < 3; ++i) {
+        lx::gfx::pixel_surface s{};
+        s.pixels = reinterpret_cast<unsigned char*>(&texels[i]);
+        s.width = s.height = 1;
+        s.stride = 4;
+        s.format = static_cast<lx::fourcc>(lx::pixel_format::argb8888);
+        LUMEN_CHECK(static_cast<bool>(comp.register_texture(k_texel_ids[i], s)));
+    }
+    lx::gfx::ui_cpu_renderer ui;
+    std::optional<lx::gfx::egl_device> device{};
+    int fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    if (fd >= 0) {
+        auto made = lx::gfx::egl_device::create(fd);
+        if (made && !made->is_software_renderer())
+            device.emplace(std::move(made).value());
+        else
+            std::printf("    (gl skip: no hardware GLES)\n");
+    }
+    std::optional<lx::gfx::gl_compositor> gl{};
+    if (device) {
+        gl.emplace();
+        LUMEN_CHECK(static_cast<bool>(gl->initialize(*device)));
+        const auto window_rgba = textures::rgba(tex.window);
+        LUMEN_CHECK(static_cast<bool>(gl->upload_rgba(k_window_texture, k_tex, k_tex, window_rgba.data())));
+        for (unsigned i = 0; i < 3; ++i) {
+            const std::vector<std::uint32_t> one{k_texels[i]};
+            LUMEN_CHECK(static_cast<bool>(gl->upload_rgba(k_texel_ids[i], 1, 1, textures::rgba(one).data())));
+        }
+    }
+    for (const bool backdrop : {false, true}) {
+        chrome_scene d{backdrop};
+        lx::compositor::frame_painter painter;
+        const auto& snap = d.publish();
+        // No texture any more: solid draws only, beside the window's.
+        unsigned solids = 0;
+        for (unsigned i = 0; i < snap.draws().size(); ++i)
+            solids += snap.draws().data()[i].solid ? 1u : 0u;
+        LUMEN_CHECK(solids == (backdrop ? 1u : 5u));
+        const auto blits = painter.surfaces(snap);
+        const std::vector<lx::gfx::blit_command> before = as_texel_blits(blits);
+        image now{};
+        auto p = painter.paint_cpu(comp, &ui, now.surface(), snap, full_region());
+        LUMEN_CHECK(static_cast<bool>(p) && !p->paint.stream && p->composite.draws_skipped == 0);
+        image then{};
+        LUMEN_CHECK(static_cast<bool>(comp.composite_region(then.surface(), snap.clear_color(), before.data(),
+                                                            static_cast<unsigned>(before.size()),
+                                                            full_region())));
+        std::size_t where = 0;
+        const int cpu_diff = max_diff(then, now.px, &where);
+        std::printf("    %s cpu: max channel error %d/255 vs the 1x1 textures\n",
+                    backdrop ? "backdrop" : "snap preview", cpu_diff);
+        LUMEN_CHECK(cpu_diff == 0);
+        if (gl) {
+            auto target = lx::gfx::ui_gl_target::create(k_w, k_h);
+            LUMEN_CHECK(static_cast<bool>(target));
+            const auto read = [&]() {
+                std::vector<std::uint32_t> px(static_cast<std::size_t>(k_w * k_h));
+                LUMEN_CHECK(static_cast<bool>(target->read_back(px)));
+                return px;
+            };
+            auto g = painter.paint_gl(*gl, nullptr, target->framebuffer(), k_w, k_h, snap, full_region());
+            LUMEN_CHECK(static_cast<bool>(g));
+            if (g && g->composite.out_fence_fd >= 0)
+                ::close(g->composite.out_fence_fd);
+            image gl_now{};
+            gl_now.px = read();
+            auto r = gl->composite_into(target->framebuffer(), k_w, k_h, snap.clear_color(), before.data(),
+                                        static_cast<unsigned>(before.size()), full_region(), true, true);
+            LUMEN_CHECK(static_cast<bool>(r));
+            if (r && r->out_fence_fd >= 0)
+                ::close(r->out_fence_fd);
+            const int gl_diff = max_diff(gl_now, read(), &where);
+            std::printf("    %s gl: max channel error %d/255 vs the 1x1 textures\n",
+                        backdrop ? "backdrop" : "snap preview", gl_diff);
+            LUMEN_CHECK(gl_diff == 0);
+        }
+        d.release(snap);
+    }
+    gl.reset();
+    device.reset();
+    if (fd >= 0)
+        ::close(fd);
 }
 
 int main(int argc, char** argv) {

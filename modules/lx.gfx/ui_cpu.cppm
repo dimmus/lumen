@@ -193,7 +193,8 @@ private:
 /// What `lower_to_blits` did with a stream.
 struct ui_lower_stats {
     unsigned surfaces = 0; ///< `surface` refs copied
-    unsigned lowered = 0;  ///< quads turned into solid blits
+    unsigned lowered = 0;  ///< quads turned into solid blits (square or rounded)
+    unsigned sprites = 0;  ///< mono sprites turned into coverage blits
     unsigned dropped = 0;  ///< primitives with no blit equivalent: counted, not drawn
     unsigned overflow = 0; ///< refs past `capacity`
 };
@@ -204,14 +205,29 @@ struct ui_lower_stats {
 /// colour at full coverage: a `blit_command::solid` draws the same pixels.
 [[nodiscard]] bool quad_lowers_to_blit(const quad_instance& q);
 
+/// True when `q` is a solid rounded rectangle on whole pixels: what `quad_lowers_to_blit`
+/// asks except the radii, which are equal at the four corners (any value, 0 included). A
+/// `blit_command::solid` with `corner_radius` (the radius clamped to half the shorter side,
+/// as `:ui_cpu` clamps it) covers the same pixels with the same coverage.
+[[nodiscard]] bool quad_lowers_to_round_blit(const quad_instance& q);
+
 /// The stream as `blit_command`s in its sorted order, for a path with no primitive renderer
-/// (the compositor's GLES 2 and Vulkan composites, screen capture's re-composites, the
-/// headless dump): a `surface` ref is copied from `stream.surfaces`; a quad that
-/// `quad_lowers_to_blit` becomes a solid blit of its premultiplied encoded colour
-/// (`blend_mode::opaque` at alpha 1, else premultiplied source-over in the backend's own
-/// blend space); every other primitive is dropped and counted in `stats.dropped`. Writes at
-/// most `capacity` commands (the rest counted in `stats.overflow`) and returns how many. No
-/// allocation; any affinity (it reads the stream only).
+/// (the compositor's GLES 2 and Vulkan-without-`:ui_vk` composites, screen capture's
+/// re-composites there, the headless dump):
+///   - a `surface` ref is copied from `stream.surfaces`;
+///   - a quad that `quad_lowers_to_blit` becomes a solid blit of its premultiplied encoded
+///     colour (`blend_mode::opaque` at alpha 1, else premultiplied source-over in the
+///     backend's own blend space); one that `quad_lowers_to_round_blit` (a circle, a rounded
+///     button) the same with `corner_radius`, always premultiplied source-over;
+///   - a `mono_sprite` on an R8 page, unturned (flags bits 1–3 zero) with a whole-pixel clip,
+///     becomes a coverage blit (`blit_command::coverage`) of its colour from page texture
+///     `atlas_page_texture(page)`, the tile its `src`: at 1:1 on whole pixels `dst` is its
+///     bounds (texel centres sampled exactly); otherwise `dst` is the bounds grown to whole
+///     pixels and the tile resampled into it (`scaled`);
+///   - every other primitive (shadows, underlines, borders, gradients, unequal radii, poly
+///     sprites, paths) is dropped and counted in `stats.dropped`.
+/// Writes at most `capacity` commands (the rest counted in `stats.overflow`) and returns how
+/// many. No allocation; any affinity (it reads the stream only).
 [[nodiscard]] unsigned lower_to_blits(const ui_stream& stream, blit_command* out,
                                       unsigned capacity, ui_lower_stats& stats);
 
@@ -1497,6 +1513,16 @@ bool lx::gfx::quad_lowers_to_blit(const quad_instance& q) {
     return q.bounds[2] > 0.f && q.bounds[3] > 0.f;
 }
 
+bool lx::gfx::quad_lowers_to_round_blit(const quad_instance& q) {
+    for (unsigned k = 1; k < 4; ++k)
+        if ((q.radii[k] & 0x7FFFu) != (q.radii[0] & 0x7FFFu))
+            return false;
+    quad_instance square = q;
+    for (std::uint16_t& r : square.radii)
+        r = 0;
+    return quad_lowers_to_blit(square);
+}
+
 unsigned lx::gfx::lower_to_blits(const ui_stream& stream, blit_command* out, unsigned capacity,
                                  ui_lower_stats& stats) {
     unsigned n = 0;
@@ -1515,23 +1541,81 @@ unsigned lx::gfx::lower_to_blits(const ui_stream& stream, blit_command* out, uns
                 ++stats.surfaces;
             break;
         case primitive_kind::quad: {
-            if (ref.index >= stream.quads.size() || !quad_lowers_to_blit(stream.quads[ref.index])) {
+            if (ref.index >= stream.quads.size()) {
                 ++stats.dropped;
                 break;
             }
             const quad_instance& q = stream.quads[ref.index];
+            const bool square = quad_lowers_to_blit(q);
+            if (!square && !quad_lowers_to_round_blit(q)) {
+                ++stats.dropped;
+                break;
+            }
             blit_command c{};
             c.solid = true;
             c.solid_color = lx::color::rgb(from_half(q.background[0]), from_half(q.background[1]),
                                            from_half(q.background[2]), from_half(q.background[3]));
-            c.blend = c.solid_color.a >= 1.f ? lx::blend_mode::opaque : lx::blend_mode::premultiplied;
+            c.blend = square && c.solid_color.a >= 1.f ? lx::blend_mode::opaque
+                                                       : lx::blend_mode::premultiplied;
             c.dst = {static_cast<int>(q.bounds[0]), static_cast<int>(q.bounds[1]),
                      static_cast<int>(q.bounds[2]), static_cast<int>(q.bounds[3])};
+            if (!square) {
+                // `:ui_cpu`'s clamp: [0, min(h.x, h.y)].
+                const float r = from_half(q.radii[0]);
+                const float h = 0.5f * std::min(q.bounds[2], q.bounds[3]);
+                c.corner_radius = to_half(r < 0.f ? 0.f : (r > h ? h : r));
+            }
             if (q.clip[2] > 0.f && q.clip[3] > 0.f)
                 c.clip = {static_cast<int>(q.clip[0]), static_cast<int>(q.clip[1]),
                           static_cast<int>(q.clip[2]), static_cast<int>(q.clip[3])};
             if (put(c))
                 ++stats.lowered;
+            break;
+        }
+        case primitive_kind::mono_sprite: {
+            if (ref.index >= stream.sprites.size()) {
+                ++stats.dropped;
+                break;
+            }
+            const sprite_instance& sp = stream.sprites[ref.index];
+            const auto whole = [](float v) { return v == std::floor(v) && v > -1e9f && v < 1e9f; };
+            const bool clipped = sp.clip[2] > 0.f && sp.clip[3] > 0.f;
+            const unsigned tw = sp.uv[2] > sp.uv[0] ? static_cast<unsigned>(sp.uv[2] - sp.uv[0]) : 0u;
+            const unsigned th = sp.uv[3] > sp.uv[1] ? static_cast<unsigned>(sp.uv[3] - sp.uv[1]) : 0u;
+            if (sp.page >= k_atlas_r8_pages || (sp.flags & 0x0Eu) != 0 || tw == 0 || th == 0 ||
+                !(sp.bounds[2] > 0.f) || !(sp.bounds[3] > 0.f) ||
+                (clipped && !(whole(sp.clip[0]) && whole(sp.clip[1]) && whole(sp.clip[2]) &&
+                              whole(sp.clip[3])))) {
+                ++stats.dropped;
+                break;
+            }
+            blit_command c{};
+            c.coverage = true;
+            c.texture_id = atlas_page_texture(sp.page);
+            c.src = {static_cast<float>(sp.uv[0]), static_cast<float>(sp.uv[1]),
+                     static_cast<float>(tw), static_cast<float>(th)};
+            c.solid_color = lx::color::rgb(from_half(sp.color[0]), from_half(sp.color[1]),
+                                           from_half(sp.color[2]), from_half(sp.color[3]));
+            c.blend = lx::blend_mode::premultiplied;
+            const bool one_to_one = whole(sp.bounds[0]) && whole(sp.bounds[1]) &&
+                                    sp.bounds[2] == static_cast<float>(tw) &&
+                                    sp.bounds[3] == static_cast<float>(th);
+            if (one_to_one) {
+                c.dst = {static_cast<int>(sp.bounds[0]), static_cast<int>(sp.bounds[1]),
+                         static_cast<int>(tw), static_cast<int>(th)};
+            } else {
+                const int x0 = static_cast<int>(std::floor(sp.bounds[0]));
+                const int y0 = static_cast<int>(std::floor(sp.bounds[1]));
+                const int x1 = static_cast<int>(std::ceil(sp.bounds[0] + sp.bounds[2]));
+                const int y1 = static_cast<int>(std::ceil(sp.bounds[1] + sp.bounds[3]));
+                c.dst = {x0, y0, x1 - x0, y1 - y0};
+                c.scaled = true;
+            }
+            if (clipped)
+                c.clip = {static_cast<int>(sp.clip[0]), static_cast<int>(sp.clip[1]),
+                          static_cast<int>(sp.clip[2]), static_cast<int>(sp.clip[3])};
+            if (put(c))
+                ++stats.sprites;
             break;
         }
         default:

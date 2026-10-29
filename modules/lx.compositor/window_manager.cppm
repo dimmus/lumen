@@ -240,11 +240,9 @@ public:
     ~fullscreen_backdrop() override;
     [[nodiscard]] scene::node_kind kind() const override;
     using scene::scene_node::emit_draws;
+    /// One opaque black solid draw (`draw_command::solid`): no texture, nothing staged, and
+    /// an untinted opaque solid is a scissored clear on GL.
     void emit_draws(scene::draw_list& out, const scene::emit_context& ctx) const override;
-    /// Texture id of the 1×1 opaque black image it draws scaled. Its own: the decoration
-    /// atlas is 0x7FFF'FE00 (the two shared it, so a fullscreen window's backdrop replaced the
-    /// server-side frames' atlas).
-    static constexpr unsigned k_texture_id = 0x7FFF'FD00u;
     void show(lx::rect2i logical);
     void hide();
     [[nodiscard]] bool shown() const { return shown_; }
@@ -257,17 +255,20 @@ private:
 
 /// The edge-snap preview (design-session-and-wm K.4): where a dragged window will go if it is
 /// dropped now — a translucent accent rect with a 1 px border, in its own layer between the
-/// windows and the top layer-shell layer (so in output captures, never in a window's). Two
-/// 1×1 premultiplied textures stretched: five draws while shown, none otherwise; damaged
-/// only when it appears, moves or goes.
+/// windows and the top layer-shell layer (so in output captures, never in a window's). Five
+/// solid draws (`draw_command::solid`, premultiplied colours: the fill and the four border
+/// strips) while shown, none otherwise — no texture; damaged only when it appears, moves or
+/// goes.
 class snap_preview final : public scene::scene_node {
 public:
     ~snap_preview() override;
     [[nodiscard]] scene::node_kind kind() const override;
     using scene::scene_node::emit_draws;
     void emit_draws(scene::draw_list& out, const scene::emit_context& ctx) const override;
-    static constexpr unsigned k_fill_texture = 0x7FFF'FD01u;
-    static constexpr unsigned k_border_texture = 0x7FFF'FD02u;
+    /// The panel's accent (#3d6fb4): a quarter of it over what is beneath, the border at 80 %
+    /// — premultiplied ARGB, the texels the 1×1 textures it once stretched held.
+    static constexpr std::uint32_t k_fill = 0x400F1C2Du;
+    static constexpr std::uint32_t k_border = 0xCC315990u;
     void show(lx::rect2i logical);
     void hide();
     [[nodiscard]] bool shown() const { return shown_; }
@@ -723,7 +724,6 @@ public:
             for (auto& b : backdrops_)
                 (void)layer->add(&b);
     }
-    void set_texture_ops(compositor_texture_ops ops) { tex_ops_ = ops; }
     /// The edge-snap preview's rect while it is shown (none: empty).
     [[nodiscard]] lx::rect2i snap_preview_rect() const;
     /// The frame the compositor draws around `rec` in its current state (none: client-side).
@@ -929,8 +929,6 @@ private:
     /// Last usable area logged per output (`usable area …` on change only).
     lx::rect2i usable_logged_[output_manager::k_max]{};
     scene::container_node* fullscreen_layer_ = nullptr;
-    compositor_texture_ops tex_ops_{};
-    bool backdrop_staged_ = false;
     fullscreen_backdrop backdrops_[output_manager::k_max]{};
     /// The frame zone with pointer focus (none: the focus, if any, is a client surface).
     deco_zone pointer_zone_ = deco_zone::none;
@@ -976,7 +974,6 @@ private:
     wm_window_config window_cfg_{};
     scene::container_node* snap_preview_layer_ = nullptr;
     snap_preview preview_{};
-    bool preview_staged_ = false;
     void (*warp_)(void* user, double x, double y) = nullptr;
     void* warp_user_ = nullptr;
     // ── tiling (ADR 012) ──
@@ -1546,15 +1543,14 @@ void lx::compositor::fullscreen_backdrop::emit_draws(scene::draw_list& out,
     if (!shown_ || rect_.width <= 0 || rect_.height <= 0)
         return;
     scene::draw_command cmd{};
-    cmd.texture = lx::texture_id{k_texture_id};
+    cmd.solid = true;
+    cmd.solid_color = lx::color::rgb(0.f, 0.f, 0.f, 1.f);
     cmd.dst = scene::project_node(ctx.projection, {rect_.x, rect_.y}, {rect_.x, rect_.y},
                                   {rect_.width, rect_.height});
     if (ctx.projection.size.width > 0 && ctx.projection.size.height > 0 &&
         (cmd.dst.x >= ctx.projection.size.width || cmd.dst.y >= ctx.projection.size.height ||
          cmd.dst.x + cmd.dst.width <= 0 || cmd.dst.y + cmd.dst.height <= 0))
         return; // another output's
-    cmd.src = lx::rect2f{0.f, 0.f, 1.f, 1.f};
-    cmd.scaled = false; // one texel: nearest is exact
     cmd.opacity = 1.f;
     cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
     // Opaque: whatever is under it on this output is occluded and never composited.
@@ -1586,9 +1582,14 @@ void lx::compositor::snap_preview::emit_draws(scene::draw_list& out,
                                               const scene::emit_context& ctx) const {
     if (!shown_ || rect_.width <= 2 || rect_.height <= 2)
         return;
-    const auto push = [&](unsigned texture, lx::rect2i r) {
+    const auto push = [&](std::uint32_t argb, lx::rect2i r) {
         scene::draw_command cmd{};
-        cmd.texture = lx::texture_id{texture};
+        cmd.solid = true;
+        // Premultiplied, encoded: the texel's bytes as they are.
+        cmd.solid_color = lx::color::rgb(static_cast<float>((argb >> 16) & 0xFFu) / 255.f,
+                                         static_cast<float>((argb >> 8) & 0xFFu) / 255.f,
+                                         static_cast<float>(argb & 0xFFu) / 255.f,
+                                         static_cast<float>(argb >> 24) / 255.f);
         cmd.dst = scene::project_node(ctx.projection, {r.x, r.y}, {r.x, r.y}, {r.width, r.height});
         if (cmd.dst.width <= 0 || cmd.dst.height <= 0)
             return;
@@ -1596,8 +1597,6 @@ void lx::compositor::snap_preview::emit_draws(scene::draw_list& out,
             (cmd.dst.x >= ctx.projection.size.width || cmd.dst.y >= ctx.projection.size.height ||
              cmd.dst.x + cmd.dst.width <= 0 || cmd.dst.y + cmd.dst.height <= 0))
             return; // another output's
-        cmd.src = lx::rect2f{0.f, 0.f, 1.f, 1.f};
-        cmd.scaled = false; // one texel: nearest is exact
         cmd.opacity = 1.f;
         cmd.tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
         cmd.blend = lx::blend_mode::premultiplied;
@@ -1605,11 +1604,11 @@ void lx::compositor::snap_preview::emit_draws(scene::draw_list& out,
         out.push(cmd);
     };
     const lx::rect2i r = rect_;
-    push(k_fill_texture, {r.x + 1, r.y + 1, r.width - 2, r.height - 2});
-    push(k_border_texture, {r.x, r.y, r.width, 1});
-    push(k_border_texture, {r.x, r.y + r.height - 1, r.width, 1});
-    push(k_border_texture, {r.x, r.y + 1, 1, r.height - 2});
-    push(k_border_texture, {r.x + r.width - 1, r.y + 1, 1, r.height - 2});
+    push(k_fill, {r.x + 1, r.y + 1, r.width - 2, r.height - 2});
+    push(k_border, {r.x, r.y, r.width, 1});
+    push(k_border, {r.x, r.y + r.height - 1, r.width, 1});
+    push(k_border, {r.x, r.y + 1, 1, r.height - 2});
+    push(k_border, {r.x + r.width - 1, r.y + 1, 1, r.height - 2});
 }
 
 void lx::compositor::snap_preview::show(lx::rect2i logical) {
@@ -1798,12 +1797,6 @@ void lx::compositor::window_manager::sync_backdrops() {
             const lx::rect2i area = output_area(static_cast<int>(s));
             if (b.shown() && rect_equal(b.rect(), area))
                 continue;
-            if (!backdrop_staged_ && tex_ops_.stage) {
-                const std::uint32_t black = 0xFF000000u;
-                backdrop_staged_ =
-                    tex_ops_.stage(tex_ops_.user, fullscreen_backdrop::k_texture_id, &black, 1, 1, 1,
-                                   1, 1);
-            }
             if (b.shown() && scene_)
                 scene_->note_damage(b.rect());
             b.show(area);
@@ -5561,15 +5554,6 @@ unsigned lx::compositor::window_manager::open_edges(int slot, double x, double y
 void lx::compositor::window_manager::show_snap_preview(unsigned zone, int slot) {
     if (!snap_preview_layer_ || !scene_)
         return;
-    if (!preview_staged_ && tex_ops_.stage) {
-        // The panel's accent (#3d6fb4): a quarter of it over what is beneath, the border
-        // at 80 % — premultiplied.
-        const std::uint32_t fill = 0x400F1C2Du;
-        const std::uint32_t border = 0xCC315990u;
-        preview_staged_ =
-            tex_ops_.stage(tex_ops_.user, snap_preview::k_fill_texture, &fill, 1, 1, 1, 1, 1) &&
-            tex_ops_.stage(tex_ops_.user, snap_preview::k_border_texture, &border, 1, 1, 1, 1, 1);
-    }
     const lx::rect2i area = usable_area(slot);
     const lx::rect2i r = zone == k_snap_maximize ? area : snap_frame(area, zone);
     if (preview_.shown() && rect_equal(preview_.rect(), r))
@@ -6197,7 +6181,6 @@ lx::compositor::window_manager::make_ghost(const toplevel_record& rec) {
             f.button = deco_button::normal;
             f.text = frame->text;
             f.dimmed = frame->dimmed;
-            f.atlas_ready = frame->atlas_ready;
             if (frame->title) {
                 g->title = *frame->title;
                 f.title = &g->title;

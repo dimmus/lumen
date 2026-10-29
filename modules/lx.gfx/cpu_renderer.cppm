@@ -498,6 +498,13 @@ struct srgb_tables {
     return lx::color::rgb(lin[0], lin[1], lin[2], c.a);
 }
 
+/// A lowered primitive (`blit_command::coverage`, a rounded `corner_radius` solid): this
+/// compositor's frames with primitives go through `:ui_cpu`, so it never draws one — it is
+/// counted unsupported and skipped.
+[[nodiscard]] inline bool lowered_shape(const blit_command& cmd) {
+    return cmd.coverage || (cmd.solid && cmd.corner_radius != 0);
+}
+
 /// A solid draw (`blit_command::solid`) over `band`: one premultiplied word built once,
 /// then a span fill when it is opaque and untinted (no destination read — the scanout
 /// mapping is write-combining), else a per-pixel source-over. Returns bytes written.
@@ -620,7 +627,7 @@ void lx::gfx::cpu_compositor::run_band(void* user, unsigned band, unsigned band_
 
     for (unsigned i = job.first_cmd; i < job.count; ++i) {
         const auto& cmd = job.cmds[i];
-        if (cmd.occluded || draw_invisible(cmd))
+        if (cmd.occluded || draw_invisible(cmd) || lowered_shape(cmd))
             continue;
         // A draw the visibility pass found partly covered is drawn only inside its visible
         // rects (disjoint, so nothing blends twice). Each pixel is computed as for the whole
@@ -913,6 +920,10 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite(
 
     for (unsigned i = 0; i < count && cmds; ++i) {
         const auto& cmd = cmds[i];
+        if (lowered_shape(cmd)) {
+            ++stats.draws_unsupported;
+            continue;
+        }
         if (cmd.solid) {
             if (i < first_cmd || cmd.occluded || draw_invisible(cmd))
                 ++stats.draws_culled;
@@ -1005,7 +1016,7 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::composite_regi
 bool lx::gfx::cpu_compositor::covers_opaquely(const blit_command& cmd, lx::fourcc dst_format,
                                               lx::rect2i area) const {
     using namespace lx::gfx::detail;
-    if (cmd.occluded || draw_invisible(cmd))
+    if (cmd.occluded || draw_invisible(cmd) || lowered_shape(cmd))
         return false;
     if (cmd.solid)
         return cmd.opacity >= 1.f && cmd.tint.a >= 1.f && cmd.solid_color.a >= 1.f &&
@@ -1042,6 +1053,8 @@ lx::result<lx::gfx::cpu_composite_stats> lx::gfx::cpu_compositor::blend(const pi
         const auto& cmd = cmds[i];
         if (cmd.occluded || draw_invisible(cmd)) {
             ++stats.draws_culled;
+        } else if (lowered_shape(cmd)) {
+            ++stats.draws_unsupported;
         } else if (cmd.solid) {
             ++stats.draws_submitted;
         } else if (const int index = find(cmd.texture_id); index < 0) {

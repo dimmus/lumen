@@ -34,13 +34,22 @@ inline constexpr int k_deco_corner = 20;
 /// Space kept free on each side of the title text.
 inline constexpr int k_deco_title_padding = 10;
 
-/// The shared atlas (swatches, close glyph, button circles). Outside the shm range
-/// (0x4000'0000 upward) and apart from the cursor's id.
-inline constexpr unsigned k_deco_atlas_texture_id = 0x7FFF'FE00u;
-inline constexpr unsigned k_deco_atlas_size = 64;
-/// The close glyph's edge at scale 1 (its swatch in the decoration atlas, the tile in the
-/// compositor's text atlas).
+/// The close glyph's edge at scale 1 (its tile in the compositor's text atlas).
 inline constexpr int k_deco_close_glyph = 10;
+/// The close button's hover / pressed circle: its diameter at scale 1, centred in the button.
+inline constexpr int k_deco_close_circle = 20;
+
+// Palette (sRGB, straight). Fills are drawn as these bytes (dimmed by `deco_fill_color`'s rule
+// for a not-responding window).
+inline constexpr std::uint32_t k_deco_title_active = 0x303033u;
+inline constexpr std::uint32_t k_deco_title_inactive = 0x48484Cu;
+inline constexpr std::uint32_t k_deco_border_active = 0x1B1B1Du;
+inline constexpr std::uint32_t k_deco_border_inactive = 0x2C2C30u;
+inline constexpr std::uint32_t k_deco_button_hover = 0xE0443Eu;
+inline constexpr std::uint32_t k_deco_button_pressed = 0xB8322Du;
+/// The close glyph's colours, and the title text's (active, inactive).
+inline constexpr std::uint32_t k_deco_glyph_light = 0xF2F2F2u;
+inline constexpr std::uint32_t k_deco_glyph_dim = 0xA8A8ACu;
 
 /// Visible frame around the client's window geometry.
 struct frame_extents {
@@ -92,35 +101,11 @@ enum class deco_zone : unsigned char {
 /// Width left for the title text in a frame `geometry_width` wide.
 [[nodiscard]] int title_text_room(int geometry_width);
 
-// ── Atlas ──────────────────────────────────────────────────────────────────
-
-/// Where each piece sits in the 64x64 atlas. Fills sample a swatch's centre 2x2
-/// (`swatch_centre`), stretched over the target: the GL path's half-texel inset keeps
-/// linear filtering inside the swatch and CPU nearest sampling is exact, so the colour is
-/// the baked one on every backend (no tint, whose semantics differ between backends).
-namespace deco_atlas {
-inline constexpr lx::rect2i title_active{0, 0, 4, 4};
-inline constexpr lx::rect2i title_inactive{4, 0, 4, 4};
-inline constexpr lx::rect2i border_active{8, 0, 4, 4};
-inline constexpr lx::rect2i border_inactive{12, 0, 4, 4};
-inline constexpr lx::rect2i close_light{0, 8, 10, 10};
-inline constexpr lx::rect2i close_dim{16, 8, 10, 10};
-inline constexpr lx::rect2i circle_hover{0, 24, 20, 20};
-inline constexpr lx::rect2i circle_pressed{24, 24, 20, 20};
-} // namespace deco_atlas
-
-[[nodiscard]] constexpr lx::rect2i swatch_centre(lx::rect2i swatch) {
-    return {swatch.x + 1, swatch.y + 1, 2, 2};
-}
-
-/// Fills `out` (k_deco_atlas_size², premultiplied ARGB) with the atlas: colour swatches, the
-/// close glyph (analytic anti-aliasing, 1.5 px strokes) and the button circles.
-void build_deco_atlas(std::uint32_t* out);
+// ── Close glyph ────────────────────────────────────────────────────────────
 
 /// The close glyph's coverage at `scale` (`size` = round(10 × scale) texels square, R8, `size`
-/// bytes per row): the "×" of `build_deco_atlas` — two diagonals, 1.5 px strokes, analytic
-/// anti-aliasing — drawn for that scale rather than resampled. At scale 1 its bytes are the
-/// alpha of the atlas swatch.
+/// bytes per row): an "×" — two diagonals from (1.5, 1.5) to (8.5, 8.5) of the 10 px box, a
+/// 1.5 px stroke, analytic anti-aliasing — drawn for that scale rather than resampled.
 void build_close_coverage(double scale, int size, std::uint8_t* out);
 
 // ── Title text (ADR-010 §4.11) ─────────────────────────────────────────────
@@ -244,17 +229,18 @@ private:
 enum class deco_button : unsigned char { normal, hover, pressed };
 
 /// The frame of one window: the underlay of its tree container, so it restacks with the
-/// window and paints below its surfaces. The four border fills and the title fill are UI
-/// primitives (ADR-010 §4.11: radius-0 solid quads, the palette's colours, the projected
-/// rects the swatch blits had); the title text and the close glyph are `mono_sprite`s from the
-/// compositor's text atlas (`text`), drawn 1:1 on an output whose scale the title was
-/// rasterised for (the manager keeps one run per output scale the frame is on) and resampled
-/// from the largest run elsewhere; the button's hover / pressed circle stays a blit of the
-/// decoration atlas. A dimmed frame's fills and glyphs carry the dim already applied, the way
-/// `cpu_compositor` tints an encoded byte (`(c · 166) >> 8` for 0.65) — the pixels the tinted
-/// swatch blit had on the CPU backend, and one colour rule on every backend. Without `text`
-/// (a node built by hand) the close glyph is the decoration atlas's blit and no title is
-/// drawn.
+/// window and paints below its surfaces. Drawn with UI primitives only (ADR-010 §4.11): the
+/// four border fills and the title fill are radius-0 solid quads in the palette's colours;
+/// the close button's hover / pressed circle is one quad whose radius is half its side; the
+/// title text and the close glyph are `mono_sprite`s from the compositor's text atlas
+/// (`text`), drawn 1:1 on an output whose scale the title was rasterised for (the manager
+/// keeps one run per output scale the frame is on) and resampled from the largest run
+/// elsewhere. Every path draws them: the primitive renderers (CPU, GLES 3.1, `:ui_vk`) as
+/// they are, a path without one through `gfx::lower_to_blits` (a rounded solid blit, coverage
+/// blits from the atlas's pages). A frame draws from the first frame it is shown. A dimmed
+/// frame's fills and glyphs carry the dim already applied, the way `cpu_compositor` tints an
+/// encoded byte (`(c · 166) >> 8` for 0.65) — one colour rule on every backend. Without
+/// `text` (a node built by hand) no title or close glyph is drawn.
 class frame_node final : public scene::scene_node {
 public:
     ~frame_node() override;
@@ -272,13 +258,11 @@ public:
     /// The window's title, laid out per output scale (the manager's); null: no title.
     const title_text* title = nullptr;
     /// The compositor's text atlas the title and close glyphs are tiles of; null: no glyph
-    /// sprites (the close glyph falls back to the decoration atlas's blit).
+    /// sprites.
     chrome_text* text = nullptr;
     /// The client stopped answering pings: the frame is drawn through the same grey tint
     /// as the window's surfaces.
     bool dimmed = false;
-    /// The atlas has been staged; nothing is drawn before (no draw of an unknown texture).
-    const bool* atlas_ready = nullptr;
 };
 
 // ── Manager ────────────────────────────────────────────────────────────────
@@ -294,9 +278,9 @@ public:
     static constexpr unsigned k_max = toplevel_manager::k_max;
 
     void bind(surface_tree& tree, scene::scene_graph& scene);
-    void set_texture_ops(compositor_texture_ops ops) { ops_ = ops; }
     /// The compositor's text atlas the titles and close glyphs are rasterised into (the render
-    /// thread's UI renderer draws from it). Without one no title is drawn.
+    /// thread's UI renderer, or the lowered path's backend, draws from it). Without one no
+    /// title or close glyph is drawn.
     void bind_chrome(chrome_atlas* atlas);
     [[nodiscard]] chrome_text* text() { return text_.get(); }
 
@@ -318,8 +302,8 @@ public:
     void damage(lx::toplevel_id id);
     /// The toplevel record is going: frame off the tree, textures retired, slot freed.
     void on_destroyed(lx::toplevel_id id, lx::surface_id root);
-    /// Once per frame tick, before the scene is published: stages the atlas the first time a
-    /// frame is shown, rasterizes changed titles.
+    /// Once per frame tick, before the scene is published: advances the text atlas's frame and
+    /// rasterizes changed titles.
     void on_tick();
     /// The scale titles of new frames are rasterized at (text at 10 pt × scale, in output
     /// pixels) until their outputs are known.
@@ -328,7 +312,9 @@ public:
     void set_window_scale(lx::toplevel_id id, double scale);
     /// The scales of the outputs window `id`'s frame is on: its title is laid out at each
     /// (the first `k_title_scales` distinct ones), drawn 1:1 on every one of them. A change
-    /// lays it out again at the next `on_tick` (at most once a tick however often it moves).
+    /// lays it out again at the next `on_tick` (at most once a tick however often it moves);
+    /// the close glyph of a scale not rasterised yet is rasterised here, at once, so the next
+    /// frame published has it.
     void set_window_scales(lx::toplevel_id id, std::span<const double> scales);
 
     [[nodiscard]] bool shown(lx::toplevel_id id) const;
@@ -367,15 +353,16 @@ private:
     void damage_strips(const frame_node& n) const;
     void damage_title(const frame_node& n) const;
     void raster_title(slot& s);
+    /// The close glyph at each of `s`'s scales, rasterised now where it is missing (or was
+    /// evicted).
+    void ensure_close(const slot& s);
 
     surface_tree* tree_ = nullptr;
     scene::scene_graph* scene_ = nullptr;
-    compositor_texture_ops ops_{};
     /// Allocated 16 slots at a time (`lx::sparse_slots`): a slot holds its frame node and a
     /// 256-byte title, and the whole table was resident from start-up.
     lx::sparse_slots<slot, k_max> slots_{};
     lx::toplevel_id active_{};
-    bool atlas_ready_ = false;
     bool any_dirty_ = false;
     bool warned_no_text_ = false;
     std::unique_ptr<chrome_text> text_{};
@@ -396,19 +383,6 @@ constexpr lx::trace::category log_deco{"compositor.deco"};
 [[nodiscard]] bool in_rect(lx::rect2i r, double x, double y) {
     return x >= r.x && y >= r.y && x < static_cast<double>(r.x) + r.width &&
            y < static_cast<double>(r.y) + r.height;
-}
-
-/// Premultiplied ARGB from straight sRGB components and a coverage in [0, 1].
-[[nodiscard]] std::uint32_t premul(std::uint32_t rgb, double coverage) {
-    if (coverage <= 0.0)
-        return 0u;
-    if (coverage > 1.0)
-        coverage = 1.0;
-    const auto ch = [&](unsigned shift) {
-        return static_cast<std::uint32_t>(((rgb >> shift) & 0xFFu) * coverage + 0.5);
-    };
-    const auto a = static_cast<std::uint32_t>(255.0 * coverage + 0.5);
-    return (a << 24) | (ch(16) << 16) | (ch(8) << 8) | ch(0);
 }
 
 /// Distance from (px, py) to the segment (ax, ay)–(bx, by).
@@ -433,23 +407,20 @@ constexpr lx::trace::category log_deco{"compositor.deco"};
     return 0.75 * scale + 0.5 - d;
 }
 
-// Palette (sRGB).
-constexpr std::uint32_t k_title_active = 0x303033u;
-constexpr std::uint32_t k_title_inactive = 0x48484Cu;
-constexpr std::uint32_t k_border_active = 0x1B1B1Du;
-constexpr std::uint32_t k_border_inactive = 0x2C2C30u;
-constexpr std::uint32_t k_button_hover = 0xE0443Eu;
-constexpr std::uint32_t k_button_pressed = 0xB8322Du;
-/// The close glyph's colours, and the title text's (active, inactive).
-constexpr std::uint32_t k_glyph_light = 0xF2F2F2u;
-constexpr std::uint32_t k_glyph_dim = 0xA8A8ACu;
+using lx::compositor::k_deco_border_active;
+using lx::compositor::k_deco_border_inactive;
+using lx::compositor::k_deco_button_hover;
+using lx::compositor::k_deco_button_pressed;
+using lx::compositor::k_deco_glyph_dim;
+using lx::compositor::k_deco_glyph_light;
+using lx::compositor::k_deco_title_active;
+using lx::compositor::k_deco_title_inactive;
 
 /// Appended to the title of a window whose client does not answer pings (KWin's wording).
 constexpr const char* k_not_responding_suffix = " (Not Responding)";
 /// The tint of a not-responding window, as `surface_tree::set_root_dim` uses for its
 /// surfaces.
 constexpr lx::color k_dim_tint = lx::color::rgb(0.65f, 0.65f, 0.65f, 1.f);
-constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
 
 /// A fill colour of the palette as a frame's quad carries it: the sRGB bytes as encoded
 /// values (the compositor's primitives blend in the backend's encoded space, ADR-010 §4.5),
@@ -464,24 +435,6 @@ constexpr lx::color k_no_tint = lx::color::rgb(1.f, 1.f, 1.f, 1.f);
         return static_cast<float>(v) / 255.f;
     };
     return lx::color::rgb(channel(16), channel(8), channel(0), 1.f);
-}
-
-void push_draw(lx::scene::draw_list& out, unsigned texture, lx::rect2i src, lx::rect2i dst,
-               lx::rect2i clip, lx::blend_mode blend, lx::color tint = k_no_tint,
-               bool scaled = false) {
-    if (dst.width <= 0 || dst.height <= 0)
-        return;
-    lx::scene::draw_command cmd{};
-    cmd.texture = lx::texture_id{texture};
-    cmd.src = src;
-    cmd.dst = dst;
-    cmd.scaled = scaled;
-    cmd.clip = clip;
-    cmd.opacity = 1.f;
-    cmd.tint = tint;
-    cmd.blend = blend;
-    cmd.sort_key = lx::draw_sort_key::make(0, out.size());
-    out.push(cmd);
 }
 
 } // namespace
@@ -619,51 +572,11 @@ const char* lx::compositor::deco_zone_name(deco_zone zone) {
     return "none";
 }
 
-void lx::compositor::build_deco_atlas(std::uint32_t* out) {
-    const unsigned n = k_deco_atlas_size;
-    for (unsigned i = 0; i < n * n; ++i)
-        out[i] = 0u;
-    const auto fill = [&](lx::rect2i r, std::uint32_t rgb) {
-        for (int y = r.y; y < r.y + r.height; ++y)
-            for (int x = r.x; x < r.x + r.width; ++x)
-                out[static_cast<unsigned>(y) * n + static_cast<unsigned>(x)] = premul(rgb, 1.0);
-    };
-    fill(deco_atlas::title_active, k_title_active);
-    fill(deco_atlas::title_inactive, k_title_inactive);
-    fill(deco_atlas::border_active, k_border_active);
-    fill(deco_atlas::border_inactive, k_border_inactive);
-
-    // "×": two diagonals with a 1.5 px stroke, coverage from the pixel centre's distance to
-    // the stroke's centre line (a 1 px linear ramp at the edge).
-    const auto glyph = [&](lx::rect2i r, std::uint32_t rgb) {
-        for (int y = 0; y < r.height; ++y)
-            for (int x = 0; x < r.width; ++x)
-                out[static_cast<unsigned>(r.y + y) * n + static_cast<unsigned>(r.x + x)] =
-                    premul(rgb, close_coverage(1.0, x, y));
-    };
-    glyph(deco_atlas::close_light, k_glyph_light);
-    glyph(deco_atlas::close_dim, k_glyph_dim);
-
-    const auto circle = [&](lx::rect2i r, std::uint32_t rgb) {
-        const double c = r.width / 2.0;
-        for (int y = 0; y < r.height; ++y)
-            for (int x = 0; x < r.width; ++x) {
-                const double dx = x + 0.5 - c, dy = y + 0.5 - c;
-                const double cov = c + 0.5 - std::sqrt(dx * dx + dy * dy);
-                out[static_cast<unsigned>(r.y + y) * n + static_cast<unsigned>(r.x + x)] =
-                    premul(rgb, cov);
-            }
-    };
-    circle(deco_atlas::circle_hover, k_button_hover);
-    circle(deco_atlas::circle_pressed, k_button_pressed);
-}
-
 void lx::compositor::build_close_coverage(double scale, int size, std::uint8_t* out) {
     for (int y = 0; y < size; ++y)
         for (int x = 0; x < size; ++x) {
             double cov = close_coverage(scale, x, y);
             cov = cov < 0.0 ? 0.0 : (cov > 1.0 ? 1.0 : cov);
-            // The atlas swatch's alpha byte (`premul`'s rounding).
             out[static_cast<std::size_t>(y) * static_cast<std::size_t>(size) +
                 static_cast<std::size_t>(x)] = static_cast<std::uint8_t>(255.0 * cov + 0.5);
         }
@@ -876,7 +789,7 @@ lx::scene::node_kind lx::compositor::frame_node::kind() const {
 
 void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
                                            const scene::emit_context& ctx) const {
-    if (!shown || !atlas_ready || !*atlas_ready || geometry.width <= 0 || geometry.height <= 0)
+    if (!shown || geometry.width <= 0 || geometry.height <= 0)
         return;
     const lx::rect2i g = geometry;
     const lx::point2i anchor = ctx.anchored ? ctx.anchor : lx::point2i{g.x, g.y};
@@ -885,18 +798,12 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
             return lx::rect2i{};
         return scene::project_node(ctx.projection, anchor, {r.x, r.y}, {r.width, r.height});
     };
-    const auto push_draw = [&](lx::scene::draw_list& list, unsigned texture, lx::rect2i src,
-                               lx::rect2i dst, lx::rect2i clip, lx::blend_mode blend,
-                               lx::color tint) {
-        ::push_draw(list, texture, src, project(dst), project(clip), blend, tint);
-    };
     const lx::rect2i f = frame_rect(g, extents);
-    const lx::color tint = dimmed ? k_dim_tint : k_no_tint;
-    const unsigned atlas = k_deco_atlas_texture_id;
     // The solid fills: one opaque quad per rect, ordered in the frame's paint order (the
     // first starts the list's primitive stream; the surfaces after it take their orders at
-    // push, above it).
-    const auto push_fill = [&](lx::rect2i logical, std::uint32_t rgb) {
+    // push, above it). `round`: the corner radius of every corner (the button's circle).
+    const auto push_fill = [&](lx::rect2i logical, std::uint32_t rgb, bool round = false,
+                               lx::rect2i clip = {}) {
         const lx::rect2i r = project(logical);
         if (r.width <= 0 || r.height <= 0)
             return;
@@ -911,9 +818,21 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         q.background[1] = q.background_end[1] = bg.g;
         q.background[2] = q.background_end[2] = bg.b;
         q.background[3] = q.background_end[3] = bg.a;
+        if (round) {
+            const std::uint16_t radius =
+                lx::gfx::to_half(0.5f * static_cast<float>(std::min(r.width, r.height)));
+            for (std::uint16_t& v : q.radii)
+                v = radius;
+        }
+        if (clip.width > 0 && clip.height > 0) {
+            q.clip[0] = static_cast<float>(clip.x);
+            q.clip[1] = static_cast<float>(clip.y);
+            q.clip[2] = static_cast<float>(clip.width);
+            q.clip[3] = static_cast<float>(clip.height);
+        }
         out.push_quad(q, r, out.orders().assign(r));
     };
-    const std::uint32_t border = active ? k_border_active : k_border_inactive;
+    const std::uint32_t border = active ? k_deco_border_active : k_deco_border_inactive;
     // Borders: left and right full height, top and bottom between them.
     if (extents.left > 0)
         push_fill({f.x, f.y, extents.left, f.height}, border);
@@ -925,7 +844,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         push_fill({g.x, g.y + g.height, g.width, extents.bottom}, border);
 
     const lx::rect2i title = title_rect(g);
-    push_fill(title, active ? k_title_active : k_title_inactive);
+    push_fill(title, active ? k_deco_title_active : k_deco_title_inactive);
     const double vs = ctx.projection.scale > 0.0 ? ctx.projection.scale : 1.0;
     const lx::rect2i bar = project(title);
 
@@ -994,7 +913,7 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
             // them, and the batch stays one draw per page.
             const std::uint32_t order = out.orders().assign(span);
             const gfx::packed_rgba fg = gfx::premultiplied_half(
-                deco_fill_color(active ? k_glyph_light : k_glyph_dim, dimmed));
+                deco_fill_color(active ? k_deco_glyph_light : k_deco_glyph_dim, dimmed));
             const gfx::packed_rgba white = gfx::premultiplied_half(
                 deco_fill_color(0xFFFFFFu, dimmed));
             bool stale = false;
@@ -1021,12 +940,12 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
 
     const lx::rect2i close = close_rect(g);
     if (button != deco_button::normal) {
-        const lx::rect2i c =
-            button == deco_button::pressed ? deco_atlas::circle_pressed : deco_atlas::circle_hover;
-        push_draw(out, atlas, c,
-                  {close.x + (close.width - c.width) / 2, close.y + (close.height - c.height) / 2,
-                   c.width, c.height},
-                  title, lx::blend_mode::premultiplied, tint);
+        // One quad, its radius half its side: a circle at any scale, anti-aliased by the
+        // primitive renderer (or the lowered path's rounded blit).
+        const int d = k_deco_close_circle;
+        push_fill({close.x + (close.width - d) / 2, close.y + (close.height - d) / 2, d, d},
+                  button == deco_button::pressed ? k_deco_button_pressed : k_deco_button_hover,
+                  true, bar);
     }
     const bool light = button != deco_button::normal || active;
     if (const close_glyph* cg = text ? text->find_close(vs) : nullptr) {
@@ -1038,18 +957,13 @@ void lx::compositor::frame_node::emit_draws(scene::draw_list& out,
         const lx::rect2i at{static_cast<int>(box[0]), static_cast<int>(box[1]), cg->size, cg->size};
         if (!push_glyph(cg->tile, false, box, bar,
                         gfx::premultiplied_half(
-                            deco_fill_color(light ? k_glyph_light : k_glyph_dim, dimmed)),
+                            deco_fill_color(light ? k_deco_glyph_light : k_deco_glyph_dim, dimmed)),
                         out.orders().assign(at)))
             text->note_stale();
-        return;
     }
-    // Not rasterised for this scale (yet: the manager does at its next tick), or no text
-    // atlas: the decoration atlas's glyph.
-    const lx::rect2i glyph = light ? deco_atlas::close_light : deco_atlas::close_dim;
-    push_draw(out, atlas, glyph,
-              {close.x + (close.width - glyph.width) / 2,
-               close.y + (close.height - glyph.height) / 2, glyph.width, glyph.height},
-              title, lx::blend_mode::premultiplied, tint);
+    // Not rasterised for this scale: the manager rasterises it when it learns the scale
+    // (`set_window_scales`), before the frame is published, so a managed frame never gets
+    // here; a node built by hand without `text` draws no glyph.
 }
 
 // ── decoration_manager ─────────────────────────────────────────────────────
@@ -1090,7 +1004,7 @@ lx::compositor::decoration_manager::alloc(const toplevel_record& rec) {
         s.node.button = deco_button::normal;
         s.node.title = &s.text;
         s.node.text = text_.get();
-        s.node.atlas_ready = &atlas_ready_;
+        ensure_close(s);
         return &s;
     }
     return nullptr;
@@ -1264,6 +1178,8 @@ void lx::compositor::decoration_manager::bind_chrome(chrome_atlas* atlas) {
     for (auto& s : slots_) {
         s.node.text = text_.get();
         s.title_changed = true;
+        if (s.used)
+            ensure_close(s);
     }
     any_dirty_ = true;
 }
@@ -1309,9 +1225,20 @@ void lx::compositor::decoration_manager::set_window_scales(lx::toplevel_id id,
     for (unsigned i = 0; i < k_title_scales; ++i)
         s->scales[i] = i < n ? want[i] : 0.0;
     s->scale_count = n;
+    // The × of a scale first seen, now: the next frame published draws it.
+    ensure_close(*s);
     // Runs of the scales kept stay as they are; the new ones are laid out at the next tick.
     s->refit = true;
     any_dirty_ = true;
+}
+
+void lx::compositor::decoration_manager::ensure_close(const slot& s) {
+    if (!text_)
+        return;
+    // `close` looks the tile up (an evicted one is rasterised again) and rasterises a missing
+    // one: a few hundred bytes of coverage, once per scale.
+    for (unsigned i = 0; i < s.scale_count; ++i)
+        (void)text_->close(s.scales[i]);
 }
 
 void lx::compositor::decoration_manager::raster_title(slot& s) {
@@ -1404,26 +1331,6 @@ void lx::compositor::decoration_manager::on_tick() {
                     damage_title(s.node);
                 }
             any_dirty_ = true;
-        }
-    }
-    if (!atlas_ready_) {
-        bool any_shown = false;
-        for (const auto& s : slots_)
-            any_shown = any_shown || (s.used && s.node.shown);
-        if (any_shown && ops_.stage) {
-            // Generated once, lazily: by the first decorated map the present backend and its
-            // staging are up. 16 KiB on the stack, once per process.
-            std::uint32_t atlas[k_deco_atlas_size * k_deco_atlas_size];
-            build_deco_atlas(atlas);
-            if (ops_.stage(ops_.user, k_deco_atlas_texture_id, atlas, k_deco_atlas_size,
-                           k_deco_atlas_size, k_deco_atlas_size, k_deco_atlas_size,
-                           k_deco_atlas_size)) {
-                atlas_ready_ = true;
-                // Frames shown before now drew nothing: their pixels are new.
-                for (const auto& s : slots_)
-                    if (s.used)
-                        damage_strips(s.node);
-            }
         }
     }
     if (!any_dirty_)

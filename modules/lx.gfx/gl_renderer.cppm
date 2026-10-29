@@ -22,6 +22,7 @@ import :renderer;
 import :dmabuf;
 import :damage;
 import :color;
+import :atlas;
 
 namespace {
 
@@ -59,8 +60,10 @@ public:
     egl_device& operator=(egl_device&& other) noexcept;
 
     /// `drm_fd` is borrowed — a card node with DRM master, or a render node. The caller
-    /// keeps ownership and must outlive this device.
-    [[nodiscard]] static lx::result<egl_device> create(int drm_fd);
+    /// keeps ownership and must outlive this device. `gles2`: ask for the GLES 2 context a
+    /// driver without GLES 3 gives (the driver may still hand out a newer, compatible one:
+    /// `gles_major` says what it is) — what tests of that path run on.
+    [[nodiscard]] static lx::result<egl_device> create(int drm_fd, bool gles2 = false);
 
     /// Binds the context to the calling thread. The GL backend is single-threaded by
     /// construction: everything after this must run on the render affinity.
@@ -230,6 +233,14 @@ public:
     [[nodiscard]] lx::result<void> import_dmabuf(unsigned texture_id, const dmabuf_desc& desc);
 
     void forget_texture(unsigned texture_id);
+
+    /// The R8 pages of `a` as textures `atlas_page_texture(p)` (GL_LUMINANCE, a GLES 2 core
+    /// format), for the coverage blits `lower_to_blits` makes of mono sprites on a path with
+    /// no primitive renderer (a GLES 2 context): a page not seen at its size goes up whole,
+    /// otherwise only its dirty rects; the dirty lists are cleared. Another atlas than last
+    /// time goes up whole. The caller holds whatever lock guards `a`'s pages. Nothing to do
+    /// costs one pass over the page table.
+    [[nodiscard]] lx::result<void> sync_atlas(atlas& a);
     /// Partial uploads that landed in a name without prior content (should stay 0).
     [[nodiscard]] unsigned partial_into_fresh() const { return partial_into_fresh_; }
 
@@ -387,6 +398,10 @@ private:
         int use_solid = -1;
         int solid_texel = -1;
         int sampler = -1;
+        /// The shape program only: coverage from the texture's first channel, and the
+        /// rounded box (half width, half height, radius).
+        int use_coverage = -1;
+        int shape = -1;
         /// LUMEN_COLOR only: the transform's matrix and (power, peak).
         int color_matrix = -1;
         int color_params = -1;
@@ -398,6 +413,8 @@ private:
     static constexpr unsigned k_program_count = 2;
     /// `color_program_` as the bound program (k_program_count means none is bound).
     static constexpr unsigned k_program_color = k_program_count + 1;
+    /// `shape_program_` as the bound program.
+    static constexpr unsigned k_program_shape = k_program_count + 2;
 
     struct blur_level {
         unsigned texture = 0;
@@ -442,6 +459,14 @@ private:
     bool color_highp_ = false;
     bool color_failed_ = false;
     [[nodiscard]] bool ensure_color_program();
+    /// Lowered primitives (`blit_command::coverage`, a rounded `corner_radius` solid): their
+    /// own program, built on the first such draw, so no other draw pays for the rounded-box
+    /// distance or the coverage sample.
+    composite_program shape_program_{};
+    bool shape_failed_ = false;
+    [[nodiscard]] bool ensure_shape_program();
+    /// The atlas `sync_atlas` last uploaded from (compared, never dereferenced).
+    const void* atlas_seen_ = nullptr;
     blur_output blur_outputs_[k_blur_outputs]{};
     blur_program blur_programs_[2]{};
     bool blur_programs_failed_ = false;
@@ -620,6 +645,58 @@ void main() {
 }
 )";
 
+/// Lowered primitives (`lower_to_blits`): the composite's quad with the pixel's place inside
+/// `rect` as well, for the rounded-box distance.
+constexpr const char* k_shape_vertex_shader = R"(#version 100
+attribute vec2 corner;
+uniform vec4 rect;
+uniform vec2 target;
+uniform vec4 uv_origin_dx;
+uniform vec2 uv_dy;
+varying highp vec2 uv;
+varying highp vec2 local;
+void main() {
+    uv = uv_origin_dx.xy + corner.x * uv_origin_dx.zw + corner.y * uv_dy;
+    local = corner * rect.zw;
+    vec2 px = rect.xy + corner * rect.zw;
+    gl_Position = vec4((px / target) * 2.0 - 1.0, 0.0, 1.0);
+}
+)";
+
+/// `solid_texel` (premultiplied, encoded) × the coverage of a glyph-atlas texel
+/// (`use_coverage`, GL_LUMINANCE: its first channel) × `:ui_cpu`'s quad coverage of the
+/// rounded box (`shape`: half size, radius; radius 0 is the whole rect) — saturate(½ − d) at
+/// the pixel centre — then the identity program's tint and opacity. Blended in the encoded
+/// space, as every draw of this backend and `:ui_cpu`'s primitives are.
+constexpr const char* k_shape_fragment_shader = R"(#version 100
+#ifdef GL_FRAGMENT_PRECISION_HIGH
+#define UV_PRECISION highp
+#else
+#define UV_PRECISION mediump
+#endif
+precision mediump float;
+varying UV_PRECISION vec2 uv;
+varying UV_PRECISION vec2 local;
+uniform sampler2D surface;
+uniform float opacity;
+uniform vec4 tint;
+uniform UV_PRECISION vec4 src_bounds;
+uniform vec4 solid_texel;
+uniform float use_coverage;
+uniform UV_PRECISION vec4 shape;
+void main() {
+    vec4 c = solid_texel;
+    if (use_coverage > 0.5)
+        c *= texture2D(surface, clamp(uv, src_bounds.xy, src_bounds.zw)).r;
+    if (shape.z > 0.0) {
+        UV_PRECISION vec2 q = abs(local - shape.xy) - shape.xy + shape.z;
+        UV_PRECISION float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - shape.z;
+        c *= clamp(0.5 - d, 0.0, 1.0);
+    }
+    gl_FragColor = vec4(c.rgb * tint.rgb, c.a) * (opacity * tint.a);
+}
+)";
+
 /// Backdrop blur (renderer.cppm "Backdrop blur"): one fullscreen quad per level, the unit
 /// quad of the composite drawn over the whole viewport.
 constexpr const char* k_blur_vertex_shader = R"(#version 100
@@ -769,7 +846,7 @@ void lx::gfx::egl_device::destroy() {
     gles_minor_ = 0;
 }
 
-lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
+lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd, bool gles2) {
 #if defined(LUMEN_HAS_EGL)
     if (drm_fd < 0) {
         return lx::invalid_argument("egl_device::create needs an open DRM fd");
@@ -832,7 +909,7 @@ lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
     EGLContext ctx = EGL_NO_CONTEXT;
     {
         EGLConfig config = EGL_NO_CONFIG_KHR;
-        if (no_config || choose(k_es3_bit, config)) {
+        if (!gles2 && (no_config || choose(k_es3_bit, config))) {
             static const EGLint es31_attrs[] = {EGL_CONTEXT_MAJOR_VERSION, 3,
                                                 EGL_CONTEXT_MINOR_VERSION, 1, EGL_NONE};
             ctx = eglCreateContext(dpy, config, EGL_NO_CONTEXT, es31_attrs);
@@ -855,6 +932,7 @@ lx::result<lx::gfx::egl_device> lx::gfx::egl_device::create(int drm_fd) {
     return device;
 #else
     (void)drm_fd;
+    (void)gles2;
     return lx::not_implemented("lx::gfx::egl_device::create");
 #endif
 }
@@ -1194,11 +1272,16 @@ void lx::gfx::gl_compositor::shutdown() {
             glDeleteProgram(p.id);
     if (color_program_.id)
         glDeleteProgram(color_program_.id);
+    if (shape_program_.id)
+        glDeleteProgram(shape_program_.id);
 #endif
     vertex_buffer_ = 0;
     for (composite_program& p : programs_)
         p = {};
     color_program_ = {};
+    shape_program_ = {};
+    shape_failed_ = false;
+    atlas_seen_ = nullptr;
     color_highp_ = false;
     color_failed_ = false;
     for (blur_program& p : blur_programs_)
@@ -1738,7 +1821,7 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             // An opaque, untinted solid colour is a clear of its rect: no shader, no
             // blending, no fragment work beyond the fill (wlroots draws such rects with a
             // clear too). The clear ignores the quad, so its scissor must be dst itself.
-            const bool solid_clear = cmd.solid && !cmd.color.active &&
+            const bool solid_clear = cmd.solid && !cmd.color.active && cmd.corner_radius == 0 &&
                                      cmd.blend == lx::blend_mode::opaque &&
                                      cmd.opacity >= 1.f && cmd.tint.r >= 1.f &&
                                      cmd.tint.g >= 1.f && cmd.tint.b >= 1.f &&
@@ -1828,20 +1911,43 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
             const int transfer = cmd.src_transfer == lx::transfer_function::linear    ? 0
                                  : cmd.src_transfer == lx::transfer_function::gamma22 ? 2
                                                                                       : 1;
+            // A lowered primitive (a glyph's coverage, a rounded solid) through its own
+            // program; one that cannot be built is skipped and counted.
+            const bool shape = cmd.coverage || (cmd.solid && cmd.corner_radius != 0);
+            if (shape && !ensure_shape_program()) {
+                ++stats.draws_skipped;
+                continue;
+            }
             // A colour-managed draw (wp_color_manager_v1) through LUMEN_COLOR.
-            const bool cm = cmd.color.active && !cmd.blur && supports_color_management() &&
+            const bool cm = !shape && cmd.color.active && !cmd.blur && supports_color_management() &&
                             ensure_color_program();
-            const unsigned want = cm ? k_program_color
+            const unsigned want = shape ? k_program_shape
+                                  : cm  ? k_program_color
                                   : transfer == 1 && cmd.tint.r == 1.f && cmd.tint.g == 1.f &&
                                           cmd.tint.b == 1.f
                                       ? k_program_identity
                                       : k_program_linear;
             if (want != bound) {
-                glUseProgram(cm ? color_program_.id : programs_[want].id);
+                glUseProgram(shape ? shape_program_.id : cm ? color_program_.id : programs_[want].id);
                 bound = want;
+                if (shape) {
+                    // Per-frame uniforms, set again on every switch (cheap: a few a frame).
+                    if (shape_program_.sampler >= 0)
+                        glUniform1i(shape_program_.sampler, 0);
+                    if (shape_program_.target >= 0)
+                        glUniform2f(shape_program_.target, static_cast<float>(width),
+                                    static_cast<float>(height));
+                }
             }
-            const composite_program& prog = cm ? color_program_ : programs_[bound];
-            if (cm) {
+            const composite_program& prog = shape ? shape_program_ : cm ? color_program_ : programs_[bound];
+            if (shape) {
+                if (prog.use_coverage >= 0)
+                    glUniform1f(prog.use_coverage, cmd.coverage ? 1.f : 0.f);
+                if (prog.shape >= 0)
+                    glUniform4f(prog.shape, 0.5f * static_cast<float>(cmd.dst.width),
+                                0.5f * static_cast<float>(cmd.dst.height),
+                                cmd.coverage ? 0.f : cmd.corner_radius_px(), 0.f);
+            } else if (cm) {
                 if (!color_frame_set) {
                     color_frame_set = true;
                     if (prog.sampler >= 0)
@@ -1868,13 +1974,13 @@ lx::result<lx::gfx::gl_composite_stats> lx::gfx::gl_compositor::composite_rects(
                 if (prog.use_solid >= 0)
                     glUniform1f(prog.use_solid, cmd.solid ? 1.f : 0.f);
             }
-            if (cmd.solid) {
+            if (cmd.solid || cmd.coverage) {
                 if (prog.solid_texel >= 0)
                     glUniform4f(prog.solid_texel, cmd.solid_color.r, cmd.solid_color.g,
                                 cmd.solid_color.b, cmd.solid_color.a);
-            } else {
-                glBindTexture(GL_TEXTURE_2D, name);
             }
+            if (!cmd.solid)
+                glBindTexture(GL_TEXTURE_2D, name);
             if (prog.rect >= 0) {
                 glUniform4f(prog.rect, static_cast<float>(cmd.dst.x), static_cast<float>(cmd.dst.y),
                             static_cast<float>(cmd.dst.width), static_cast<float>(cmd.dst.height));
@@ -2100,6 +2206,150 @@ bool lx::gfx::gl_compositor::ensure_color_program() {
     return true;
 #else
     return false;
+#endif
+}
+
+bool lx::gfx::gl_compositor::ensure_shape_program() {
+#if defined(LUMEN_HAS_EGL)
+    if (shape_program_.id)
+        return true;
+    if (shape_failed_)
+        return false;
+    const GLuint vertex = detail::compile_shader(GL_VERTEX_SHADER, detail::k_shape_vertex_shader);
+    const GLuint fragment =
+        vertex ? detail::compile_shader(GL_FRAGMENT_SHADER, detail::k_shape_fragment_shader) : 0u;
+    GLuint program = 0;
+    if (vertex && fragment) {
+        program = glCreateProgram();
+        glAttachShader(program, vertex);
+        glAttachShader(program, fragment);
+        glBindAttribLocation(program, 0, "corner");
+        glLinkProgram(program);
+        GLint linked = GL_FALSE;
+        glGetProgramiv(program, GL_LINK_STATUS, &linked);
+        if (!linked) {
+            glDeleteProgram(program);
+            program = 0;
+        }
+    }
+    if (vertex)
+        glDeleteShader(vertex);
+    if (fragment)
+        glDeleteShader(fragment);
+    if (!program) {
+        shape_failed_ = true;
+        log_gl.warn("lowered-primitive program failed to build: glyphs and rounded fills of "
+                    "frames with primitives are not drawn on this path");
+        return false;
+    }
+    composite_program& p = shape_program_;
+    p.id = program;
+    p.rect = glGetUniformLocation(program, "rect");
+    p.target = glGetUniformLocation(program, "target");
+    p.opacity = glGetUniformLocation(program, "opacity");
+    p.uv_origin_dx = glGetUniformLocation(program, "uv_origin_dx");
+    p.uv_dy = glGetUniformLocation(program, "uv_dy");
+    p.tint = glGetUniformLocation(program, "tint");
+    p.src_bounds = glGetUniformLocation(program, "src_bounds");
+    p.solid_texel = glGetUniformLocation(program, "solid_texel");
+    p.sampler = glGetUniformLocation(program, "surface");
+    p.use_coverage = glGetUniformLocation(program, "use_coverage");
+    p.shape = glGetUniformLocation(program, "shape");
+    return true;
+#else
+    return false;
+#endif
+}
+
+lx::result<void> lx::gfx::gl_compositor::sync_atlas(atlas& a) {
+#if defined(LUMEN_HAS_EGL)
+    if (!ready())
+        return lx::not_implemented("lx::gfx::gl_compositor::sync_atlas");
+    const bool fresh_atlas = atlas_seen_ != &a;
+    atlas_seen_ = &a;
+    // GLES 2 has no GL_UNPACK_ROW_LENGTH without GL_EXT_unpack_subimage (ES 3 has it): a rect
+    // is then sent a row at a time, from the page's own memory either way — no staging copy.
+    const bool row_length = unpack_subimage_ || target_copy_;
+    bool unpack_set = false;
+    for (unsigned p = 0; p < k_atlas_r8_pages; ++p) {
+        const atlas_page_view view = a.page(p);
+        if (!view.valid() || view.format != atlas_format::r8)
+            continue;
+        const unsigned id = atlas_page_texture(p);
+        int index = find(id);
+        bool whole = fresh_atlas || a.dirty_full(p) || index < 0 ||
+                     textures_[static_cast<unsigned>(index)].width != view.size;
+        const std::span<const lx::rect2i> dirty = a.dirty_rects(p);
+        if (!whole && dirty.empty())
+            continue;
+        if (!unpack_set) {
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+            unpack_set = true;
+        }
+        glActiveTexture(GL_TEXTURE0);
+        if (index < 0)
+            index = alloc(id);
+        if (index < 0)
+            return lx::invalid_argument("gl texture table full");
+        texture_slot& slot = textures_[static_cast<unsigned>(index)];
+        if (slot.width != view.size || !slot.names[0]) {
+            if (!slot.names[0])
+                glGenTextures(1, &slot.names[0]);
+            if (!slot.names[0])
+                return lx::make_error(lx::gl_err::import_failed, "glGenTextures failed");
+            glBindTexture(GL_TEXTURE_2D, slot.names[0]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_LUMINANCE, static_cast<GLsizei>(view.size),
+                         static_cast<GLsizei>(view.size), 0, GL_LUMINANCE, GL_UNSIGNED_BYTE,
+                         nullptr);
+            slot.current = 0;
+            slot.width = slot.height = view.size;
+            slot.name_width[0] = slot.name_height[0] = view.size;
+            slot.name_format[0] = GL_LUMINANCE;
+            whole = true;
+        } else {
+            glBindTexture(GL_TEXTURE_2D, slot.names[0]);
+        }
+        const auto send = [&](lx::rect2i r) {
+            const std::uint8_t* first = view.pixels + static_cast<std::size_t>(r.y) * view.stride +
+                                        static_cast<std::size_t>(r.x);
+            if (row_length || static_cast<unsigned>(r.width) == view.stride) {
+                if (row_length)
+                    glPixelStorei(GL_UNPACK_ROW_LENGTH, static_cast<GLint>(view.stride));
+                glTexSubImage2D(GL_TEXTURE_2D, 0, r.x, r.y, r.width, r.height, GL_LUMINANCE,
+                                GL_UNSIGNED_BYTE, first);
+                return;
+            }
+            for (int y = 0; y < r.height; ++y)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, r.x, r.y + y, r.width, 1, GL_LUMINANCE,
+                                GL_UNSIGNED_BYTE, first + static_cast<std::size_t>(y) * view.stride);
+        };
+        if (whole) {
+            send({0, 0, static_cast<int>(view.size), static_cast<int>(view.size)});
+        } else {
+            for (const lx::rect2i& r : dirty)
+                if (r.width > 0 && r.height > 0 && r.x >= 0 && r.y >= 0 &&
+                    static_cast<unsigned>(r.x + r.width) <= view.size &&
+                    static_cast<unsigned>(r.y + r.height) <= view.size)
+                    send(r);
+        }
+        a.clear_dirty(p);
+    }
+    if (unpack_set) {
+        if (row_length)
+            glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    if (glGetError() != GL_NO_ERROR)
+        return lx::make_error(lx::gl_err::import_failed, "GL error uploading the glyph atlas");
+    return {};
+#else
+    (void)a;
+    return lx::not_implemented("lx::gfx::gl_compositor::sync_atlas");
 #endif
 }
 

@@ -13,6 +13,11 @@
 // also give the UI thread's `commit_frame` (the decorated scene has a primitive stream:
 // every draw takes an order from the overlap grid and the refs are sorted and batched).
 //
+// Two more cases (Phase 5): a hover change of one close button (its circle drawn, then not,
+// on alternate frames, damage the button only) and the render thread's per-frame
+// draw_command → blit_command conversion (`frame_painter::surfaces`) timed alone at 16, 64
+// and 256 surface draws, beside the full composite of the same frame.
+//
 //   bench_ui_composite [--frames N] [--warmup N] [--backend cpu|gl|all]
 
 #include <fcntl.h>
@@ -54,7 +59,6 @@ struct scene_setup {
     lx::scene::surface_node background{lx::surface_id{1}};
     std::vector<std::unique_ptr<lx::scene::surface_node>> windows;
     std::vector<std::unique_ptr<lx::compositor::frame_node>> frames;
-    bool atlas_ready = true;
     unsigned frame_index = 0;
 
     explicit scene_setup(bool decorated) {
@@ -75,7 +79,6 @@ struct scene_setup {
                 f->extents = lx::compositor::extents_for(lx::compositor::decoration_mode::server, false);
                 f->shown = true;
                 f->active = i + 1 == k_windows;
-                f->atlas_ready = &atlas_ready;
                 auto t = std::make_unique<lx::compositor::title_text>();
                 char title[64];
                 std::snprintf(title, sizeof title, "Window %u - Lumen Terminal: ~/src/lumen", i);
@@ -112,12 +115,74 @@ struct scene_setup {
         lx::runtime::set_current_affinity(lx::runtime::affinity::render);
         return scene.acquire_render_snapshot(0);
     }
+    /// A hover change: window 2's close button hovered on odd frames, normal on even ones,
+    /// the button's rect damaged (what `decoration_manager::set_button` does).
+    const lx::scene::immutable_frame_snapshot& publish_hover() {
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        lx::compositor::frame_node& f = *frames[2];
+        f.button = f.button == lx::compositor::deco_button::normal ? lx::compositor::deco_button::hover
+                                                                    : lx::compositor::deco_button::normal;
+        scene.note_damage(lx::compositor::close_rect(f.geometry));
+        (void)scene.commit_frame(0, ++frame_index);
+        lx::runtime::set_current_affinity(lx::runtime::affinity::render);
+        return scene.acquire_render_snapshot(0);
+    }
     void release(const lx::scene::immutable_frame_snapshot& s) {
         scene.release_render_frame(0, s);
         lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     }
     [[nodiscard]] static lx::rect2i window_rect(unsigned i) {
         return {120 + static_cast<int>(i) * 220, 140 + static_cast<int>(i % 3) * 180, k_win_w, k_win_h};
+    }
+};
+
+/// `n` surface draws over a solid background: 96x64 tiles of the windows' textures, laid out
+/// in a grid with overlap, as the per-frame conversion sees a busy desktop's draw list.
+struct tiles_setup {
+    lx::scene::scene_graph scene{};
+    lx::scene::surface_node background{lx::surface_id{1}};
+    std::vector<std::unique_ptr<lx::scene::surface_node>> tiles;
+    /// A container holds 128 children: the tiles go 64 to a group.
+    std::vector<std::unique_ptr<lx::scene::container_node>> groups;
+    unsigned frame_index = 0;
+
+    explicit tiles_setup(unsigned n) {
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        lx::scene::output_view_config v{};
+        v.logical = {0, 0, k_w, k_h};
+        v.projection = {{0, 0}, 1.0, {k_w, k_h}};
+        scene.set_output_view(0, v);
+        background.set_bounds({0, 0, k_w, k_h});
+        background.set_solid(true, lx::color::rgb(0.1f, 0.12f, 0.15f, 1.f));
+        (void)scene.root().add(&background);
+        for (unsigned i = 1; i < n; ++i) {
+            auto t = std::make_unique<lx::scene::surface_node>(lx::surface_id{100 + i});
+            lx::gfx::imported_image img{};
+            img.width = k_win_w;
+            img.height = k_win_h;
+            img.image_id = k_texture_base + i % k_windows;
+            t->attach(img);
+            t->set_bounds({0, 0, 96, 64});
+            t->set_transform({static_cast<int>((i * 73u) % static_cast<unsigned>(k_w - 96)),
+                              static_cast<int>((i * 41u) % static_cast<unsigned>(k_h - 64))});
+            if ((i - 1) % 64 == 0) {
+                groups.push_back(std::make_unique<lx::scene::container_node>());
+                (void)scene.root().add(groups.back().get());
+            }
+            (void)groups.back()->add(t.get());
+            tiles.push_back(std::move(t));
+        }
+    }
+    const lx::scene::immutable_frame_snapshot& publish() {
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
+        scene.note_full_damage_output(0);
+        (void)scene.commit_frame(0, ++frame_index);
+        lx::runtime::set_current_affinity(lx::runtime::affinity::render);
+        return scene.acquire_render_snapshot(0);
+    }
+    void release(const lx::scene::immutable_frame_snapshot& s) {
+        scene.release_render_frame(0, s);
+        lx::runtime::set_current_affinity(lx::runtime::affinity::ui);
     }
 };
 
@@ -179,8 +244,6 @@ int main(int argc, char** argv) {
     std::vector<std::vector<std::uint32_t>> textures;
     for (unsigned i = 0; i < k_windows; ++i)
         textures.push_back(window_pixels(i));
-    std::vector<std::uint32_t> atlas(lx::compositor::k_deco_atlas_size * lx::compositor::k_deco_atlas_size);
-    lx::compositor::build_deco_atlas(atlas.data());
     std::printf("bench_ui_composite: %dx%d, %u windows of %dx%d, %u frames (+%u warm-up)\n", k_w, k_h,
                 k_windows, k_win_w, k_win_h, frames, warmup);
 
@@ -195,12 +258,6 @@ int main(int argc, char** argv) {
             s.format = static_cast<lx::fourcc>(lx::pixel_format::xrgb8888);
             (void)comp.register_texture(k_texture_base + i, s);
         }
-        lx::gfx::pixel_surface a{};
-        a.pixels = reinterpret_cast<unsigned char*>(atlas.data());
-        a.width = a.height = lx::compositor::k_deco_atlas_size;
-        a.stride = lx::compositor::k_deco_atlas_size * 4u;
-        a.format = static_cast<lx::fourcc>(lx::pixel_format::argb8888);
-        (void)comp.register_texture(lx::compositor::k_deco_atlas_texture_id, a);
         lx::gfx::ui_cpu_renderer ui;
         std::vector<std::uint32_t> target(static_cast<std::size_t>(k_w * k_h));
         lx::gfx::pixel_surface t{};
@@ -235,6 +292,50 @@ int main(int argc, char** argv) {
                             "%.1f us p50 %.1f us p95)\n",
                             bt.p50, bt.p95);
             }
+        {
+            scene_setup s{true};
+            lx::compositor::frame_painter painter;
+            {
+                const auto& snap = s.publish(true);
+                (void)painter.paint_cpu(comp, &ui, t, snap, snap.damage_rects(), &chrome().atlas);
+                s.release(snap);
+            }
+            std::vector<double> times;
+            for (unsigned f = 0; f < frames + warmup; ++f) {
+                const auto& snap = s.publish_hover();
+                const auto t0 = std::chrono::steady_clock::now();
+                (void)painter.paint_cpu(comp, &ui, t, snap, snap.damage_rects(), &chrome().atlas);
+                const double us = us_since(t0);
+                if (f >= warmup)
+                    times.push_back(us);
+                s.release(snap);
+            }
+            row("cpu", "decorated", "hover", summarize(times), {}, false, painter.stream_frames());
+        }
+        for (const unsigned n : {16u, 64u, 256u}) {
+            tiles_setup s{n};
+            lx::compositor::frame_painter painter;
+            std::vector<double> conv, total;
+            for (unsigned f = 0; f < frames + warmup; ++f) {
+                const auto& snap = s.publish();
+                const auto t0 = std::chrono::steady_clock::now();
+                const auto blits = painter.surfaces(snap);
+                const double ns = 1000.0 * us_since(t0);
+                const auto t1 = std::chrono::steady_clock::now();
+                (void)painter.paint_cpu(comp, &ui, t, snap, snap.damage_rects(), &chrome().atlas);
+                const double us = us_since(t1);
+                if (f >= warmup && blits.size() == n) {
+                    conv.push_back(ns);
+                    total.push_back(us);
+                }
+                s.release(snap);
+            }
+            const stats c = summarize(conv);
+            const stats tt = summarize(total);
+            std::printf("cpu  surfaces()  %3u draws  %8.0f ns p50 %8.0f ns p95 | composite %8.1f us p50 "
+                        "(%.2f %%)\n",
+                        n, c.p50, c.p95, tt.p50, tt.p50 > 0 ? c.p50 / (10.0 * tt.p50) : 0.0);
+        }
     }
 
     if (backend == "gl" || backend == "all") {
@@ -268,8 +369,6 @@ int main(int argc, char** argv) {
             };
             for (unsigned i = 0; i < k_windows; ++i)
                 (void)comp.upload_rgba(k_texture_base + i, k_win_w, k_win_h, rgba(textures[i]).data());
-            (void)comp.upload_rgba(lx::compositor::k_deco_atlas_texture_id, lx::compositor::k_deco_atlas_size,
-                                   lx::compositor::k_deco_atlas_size, rgba(atlas).data());
             lx::gfx::ui_gl_renderer ui;
             const bool ui_ready = static_cast<bool>(ui.initialize());
             if (!ui_ready)
@@ -305,6 +404,65 @@ int main(int argc, char** argv) {
                     row("gl", decorated ? "decorated" : "undecorated", full ? "full" : "window",
                         summarize(submit), summarize(total), true, painter.stream_frames());
                 }
+            const auto fenced = [&](lx::compositor::frame_painter& painter,
+                                    const lx::scene::immutable_frame_snapshot& snap, double& submit_us) {
+                const auto t0 = std::chrono::steady_clock::now();
+                auto p = painter.paint_gl(comp, ui_ready ? &ui : nullptr, target->framebuffer(), k_w, k_h,
+                                          snap, snap.damage_rects(), &chrome().atlas);
+                submit_us = us_since(t0);
+                if (p && p->composite.out_fence_fd >= 0) {
+                    pollfd pfd{p->composite.out_fence_fd, POLLIN, 0};
+                    (void)::poll(&pfd, 1, 1000);
+                    ::close(p->composite.out_fence_fd);
+                }
+                return us_since(t0);
+            };
+            {
+                scene_setup s{true};
+                lx::compositor::frame_painter painter;
+                {
+                    double ignored = 0;
+                    const auto& snap = s.publish(true);
+                    (void)fenced(painter, snap, ignored);
+                    s.release(snap);
+                }
+                std::vector<double> submit, total;
+                for (unsigned f = 0; f < frames + warmup; ++f) {
+                    const auto& snap = s.publish_hover();
+                    double us = 0;
+                    const double all = fenced(painter, snap, us);
+                    if (f >= warmup) {
+                        submit.push_back(us);
+                        total.push_back(all);
+                    }
+                    s.release(snap);
+                }
+                row("gl", "decorated", "hover", summarize(submit), summarize(total), true,
+                    painter.stream_frames());
+            }
+            for (const unsigned n : {16u, 64u, 256u}) {
+                tiles_setup s{n};
+                lx::compositor::frame_painter painter;
+                std::vector<double> conv, total;
+                for (unsigned f = 0; f < frames + warmup; ++f) {
+                    const auto& snap = s.publish();
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const auto blits = painter.surfaces(snap);
+                    const double ns = 1000.0 * us_since(t0);
+                    double us = 0;
+                    (void)fenced(painter, snap, us);
+                    if (f >= warmup && blits.size() == n) {
+                        conv.push_back(ns);
+                        total.push_back(us);
+                    }
+                    s.release(snap);
+                }
+                const stats c = summarize(conv);
+                const stats tt = summarize(total);
+                std::printf("gl   surfaces()  %3u draws  %8.0f ns p50 %8.0f ns p95 | composite %8.1f us p50 "
+                            "(%.2f %%)\n",
+                            n, c.p50, c.p95, tt.p50, tt.p50 > 0 ? c.p50 / (10.0 * tt.p50) : 0.0);
+            }
         }
         // The device (and its fd) live until exit: the context must outlive the GL objects
         // above, and nothing follows.

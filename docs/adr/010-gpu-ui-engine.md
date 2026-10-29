@@ -527,6 +527,33 @@ compositor, Vulkan (lavapipe) within 1/255 outside the text and 9/255 on glyph e
 stem weight +1.5 %; render-thread cost on CPU +3–5 % for a full repaint, GL unchanged within
 noise; no frame allocates.
 
+As built in Phase 5 (rendering-performance.md "Server-side frames: primitives only", §6 "UI
+primitives in the compositor"): `frame_node` draws quads and `mono_sprite`s only — the hover /
+pressed circle is a quad of radius half its side, the × always the atlas glyph, rasterised as
+soon as `decoration_manager::set_window_scales` (or the first framing) sees a scale. The 64x64
+decoration atlas, its staging and the `atlas_ready` gate that kept a shown frame blank until
+then are deleted: a frame draws from its first snapshot. The snap preview and the fullscreen
+backdrop are `draw_command::solid` (their 1×1 textures deleted), pixel-identical on CPU and GL.
+The lowering path keeps the frame whole instead of keeping the decoration atlas for it (the
+owner's choice over the default the plan proposed): `lower_to_blits` turns a quad with four
+equal radii into a solid blit with `blit_command::corner_radius` and an unturned mono sprite
+into a coverage blit (`blit_command::coverage`) from the atlas's R8 page, which the GL
+(GL_LUMINANCE, a `#version 100` program built on the first such draw) and Vulkan (R8_UNORM,
+the composite shader's `use_solid` 2 and `radius`) backends keep as textures
+(`sync_atlas`); against GLES 3.1's primitive path GLES 2 is 0/255 everywhere and lavapipe
+Vulkan 0/255 away from anti-aliased edges (`test_deco_titles`). Capture re-composites lower the
+stream only when the backend has no UI renderer; `report_unregistered_draw` reads the frame's
+converted draws (`frame_painter::last_surfaces`) instead of converting them again.
+
+Deviation — the per-frame `draw_command` → `blit_command` conversion stays. The sentence above
+asks `compositor_impl` to stop it; Phase 5 measured it first (`bench_ui_composite`, interleaved
+A/B, 6 runs each, `setarch -R`, pinned): `frame_painter::surfaces` costs 0.74 µs p50 for 16
+surface draws, 2.1 µs for 64 and 7.8 µs for 256 on the render thread — 0.03 % of the CPU
+composite of the same 256-draw frame (28.7 ms) and 0.74 % of the GL composite's submit
+(1.25 ms), under the 2 % that would justify a shared `draw_command` / `blit_command` struct
+(which needs `scene::draw_command` to embed `gfx::blit_command` and every reader of either to
+change). Measured, not taken.
+
 ### 4.12 Threads and allocation
 
 | Work | Affinity | Allocation |
@@ -1624,6 +1651,25 @@ a first run without persisted matches; Lumen's own code is ≈ 5 ms of it.
   1920 × 1080 solve every compositor tick; `sizeof(container_node)` 1744 → 1176 B). No pixel
   changed (`test_ui_golden`); lumen-ui-bench S2–S4 p50 equal or lower on cpu and gl.
 - Compositor decorations fully on primitives; `compositor_impl` passes the stream through.
+  **Done** (§4.11 "As built in Phase 5"): frames draw quads and mono sprites only, from their
+  first frame, on every path — the paths without a primitive renderer through an extended
+  `lower_to_blits` (rounded solid and coverage blits) rather than a decoration atlas, which is
+  deleted; the snap preview and fullscreen backdrop are solid draws; captures lower only where
+  nothing draws the stream. Deviations: the per-frame draw → blit conversion stays (measured
+  at < 1 % of the composite, §4.11); no frame shadow and no rounded window corner on
+  server-side frames — a visual change with no gate, rounded corners already reverted once
+  (PR #63) — left out of Phase 5; the compositor's memory with four decorated windows was
+  measured with `foot` (which asks for server-side decorations; `lumen-square` asks for none).
+  Measured against the stage's base (interleaved, 6 runs each, `setarch -R`, pinned, load
+  0.8–1.4): `bench_ui_composite` render p50 at parity on CPU and GL in every row (decorated
+  full 2169 → 1971 µs CPU, 830 → 820 µs GL; hover repaint 4.8 → 4.8 µs CPU, 621 → 614 µs GL),
+  no frame allocates (`steady_titled_frame_allocates_nothing`), chrome `draw_command`s per
+  frame 0 on a primitive path (a hovered button was 1). The headless lavapipe compositor with
+  four idle `foot` windows settles in one of two RssAnon states, ≈50 MB or ≈61 MB, on both
+  builds: which one is set by start-up timing (with info logging on, the base build lands in
+  the higher one 3 runs in 4 and this one 1 in 4; without, the reverse), its heap allocations
+  are the same (heaptrack peak 75.31 vs 75.29 MB, in-use heap equal per state), and it is
+  pages of buffers both builds allocate being touched.
 - Docs: `docs/subsystems/ui-engine.md` (this design as current), ui-architecture.md §9
   rewritten, rendering-performance.md gains a UI section with the measured tables,
   api/README.md and architecture.md §3 for the new partitions, UML for the client frame

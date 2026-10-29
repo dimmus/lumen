@@ -241,10 +241,6 @@ void install_core(p0_protocol_context& ctx) {
         ops.user = &ctx;
         if (ctx.cursor)
             ctx.cursor->set_texture_ops(ops);
-        if (ctx.decorations)
-            ctx.decorations->set_texture_ops(ops);
-        if (ctx.wm)
-            ctx.wm->set_texture_ops(ops); // the fullscreen backdrop
     }
     ctx.server->add_global({.interface_name = "wl_compositor",
                             .version = 6,

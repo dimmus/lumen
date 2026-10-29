@@ -7,12 +7,12 @@ layout(push_constant) uniform quad_push {
     vec4 dst;      // x, y, width, height in target pixels
     vec2 target;   // target size in pixels
     float opacity;
-    float use_solid; // 1: a solid draw, `solid` replaces the sample
+    float use_solid; // 1: a solid draw, `solid` replaces the sample; 2: `solid` × the sample's red (a glyph's coverage)
     vec4 src_uv;   // the source box as a basis: top-left (xy) and +x direction (zw)
     vec4 tint;
     vec4 src_bounds;
     int transfer;
-    float pad1;
+    float radius;     // a rounded solid: the corner radius of `dst` (0: square)
     vec2 uv_dy;    // +y direction of the source basis
     vec4 solid;      // premultiplied, encoded colour of a solid draw
 } push;
