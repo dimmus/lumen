@@ -322,6 +322,7 @@ lx::result<void> display::connect(const connect_options& options) {
     want_feedback_ = options.default_dmabuf_feedback;
     error_ = {};
     error_logged_ = false;
+    expect_hangup_ = false;
     for (unsigned i = 0; i < k_global_kinds; ++i) {
         globals_[i] = {};
         globals_[i].interface = k_globals[i].interface;
@@ -460,7 +461,7 @@ void display::note_error() {
         if (e == EPROTO)
             log_wl.error("protocol error: {}@{} code {}", error_.interface, error_.object_id,
                          error_.code);
-        else
+        else if (!expect_hangup_)
             log_wl.error("connection lost: {}", std::strerror(e));
     }
 }

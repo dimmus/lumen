@@ -6,12 +6,6 @@ module;
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wkeyword-macro"
-#define namespace name_space
-#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#undef namespace
-#pragma clang diagnostic pop
 #endif
 
 module lx.shell;
@@ -20,6 +14,7 @@ import std;
 import lx.foundation;
 import lx.text;
 import lx.trace;
+import lx.wayland.client;
 import :notifications;
 import :notify_view;
 import :shm_canvas;
@@ -448,44 +443,35 @@ void lx::shell::notification_view::draw() {
 
 #if defined(LUMEN_SHELL_WAYLAND)
 
-struct lx::shell::notification_view::events {
-    static notification_view& self(void* data) { return *static_cast<notification_view*>(data); }
-    static void configure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial, uint32_t w,
-                          uint32_t h) {
-        auto& v = self(data);
-        zwlr_layer_surface_v1_ack_configure(layer, serial);
-        v.conf_w_ = w ? static_cast<int>(w) : v.want_w_;
-        v.conf_h_ = h ? static_cast<int>(h) : v.want_h_;
-        v.configured_ = true;
-        v.dirty_ = true;
-    }
-    static void closed(void* data, zwlr_layer_surface_v1*) {
-        // Its output went: shown again on another one at the next update.
-        self(data).close();
-    }
-};
+struct lx::shell::notification_view::events {};
+
+void lx::shell::notification_view::on_configure(lx::wayland::layer_surface& layer,
+                                                const lx::wayland::layer_configure& c) {
+    layer.ack_configure(c.serial);
+    conf_w_ = c.size.width ? c.size.width : want_w_;
+    conf_h_ = c.size.height ? c.size.height : want_h_;
+    configured_ = true;
+    dirty_ = true;
+}
+
+void lx::shell::notification_view::on_closed(lx::wayland::layer_surface&) {
+    // Its output went: shown again on another one at the next update.
+    close();
+}
 
 namespace {
 
-const zwlr_layer_surface_v1_listener k_notify_layer_listener = {
-    .configure = lx::shell::notification_view::events::configure,
-    .closed = lx::shell::notification_view::events::closed,
-};
-
-uint32_t anchor_of(lx::shell::notify_position p) {
+std::uint32_t anchor_of(lx::shell::notify_position p) {
     using lx::shell::notify_position;
+    using namespace lx::wayland;
     switch (p) {
-    case notify_position::top_right:
-        return ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
-    case notify_position::top_center: return ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP;
-    case notify_position::top_left:
-        return ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT;
-    case notify_position::bottom_right:
-        return ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
-    case notify_position::bottom_left:
-        return ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT;
+    case notify_position::top_right: return anchor_top | anchor_right;
+    case notify_position::top_center: return anchor_top;
+    case notify_position::top_left: return anchor_top | anchor_left;
+    case notify_position::bottom_right: return anchor_bottom | anchor_right;
+    case notify_position::bottom_left: return anchor_bottom | anchor_left;
     }
-    return ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT;
+    return anchor_top | anchor_right;
 }
 
 } // namespace
@@ -505,7 +491,7 @@ void lx::shell::notification_view::set_position(notify_position p) {
     center_rev_ = 0;
 }
 
-void lx::shell::notification_view::update(const notification_center& c, void* output) {
+void lx::shell::notification_view::update(const notification_center& c, unsigned output) {
     center_ = &c;
     const notification* shown[k_max_cards];
     const unsigned n = c.shown(shown, k_max_cards);
@@ -522,29 +508,32 @@ void lx::shell::notification_view::update(const notification_center& c, void* ou
         return;
     center_rev_ = c.rev();
     if (!surface_) {
-        if (!g_.compositor || !g_.layer_shell || !g_.shm)
+        if (!g_.display || !g_.compositor || !g_.shm)
             return;
-        auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
-        if (!surface)
+        if (!wl_surface_.create(*g_.display))
             return;
-        surface_ = surface;
+        if (auto made = wl_layer_.create(
+                *g_.display, wl_surface_,
+                {.output_slot = output,
+                 .level = overlay ? lx::wayland::layer::overlay : lx::wayland::layer::top,
+                 .name_space = "lumen-notifications"});
+            !made) {
+            log_notify.error(made.get_error());
+            wl_surface_.destroy();
+            return;
+        }
+        wl_layer_.set_handler(this);
+        surface_ = wl_surface_.native();
+        layer_ = wl_layer_.native();
+        auto* surface = static_cast<wl_surface*>(surface_);
         output_ = output;
         overlay_ = overlay;
-        auto* layer = zwlr_layer_shell_v1_get_layer_surface(
-            static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,
-            static_cast<wl_output*>(output),
-            overlay ? ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY : ZWLR_LAYER_SHELL_V1_LAYER_TOP,
-            "lumen-notifications");
-        layer_ = layer;
-        zwlr_layer_surface_v1_add_listener(layer, &k_notify_layer_listener, this);
         canvas_.attach_scale(g_.viewporter, g_.fractional, surface);
-        zwlr_layer_surface_v1_set_anchor(layer, anchor_of(position_));
-        zwlr_layer_surface_v1_set_margin(layer, k_notify_margin, k_notify_margin,
-                                         k_notify_margin, k_notify_margin);
+        wl_layer_.set_anchor(anchor_of(position_));
+        wl_layer_.set_margin(k_notify_margin, k_notify_margin, k_notify_margin, k_notify_margin);
         // 0: kept clear of the panel's zone, reserving nothing.
-        zwlr_layer_surface_v1_set_exclusive_zone(layer, 0);
-        zwlr_layer_surface_v1_set_keyboard_interactivity(
-            layer, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+        wl_layer_.set_exclusive_zone(0);
+        (void)wl_layer_.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::none);
         configured_ = false;
         conf_w_ = conf_h_ = want_w_ = want_h_ = 0;
         frames_ = 0;
@@ -559,11 +548,8 @@ void lx::shell::notification_view::update(const notification_center& c, void* ou
         overlay_ = overlay;
         log_notify.info("notifications: {} layer (a critical one {})", overlay ? "overlay" : "top",
                         overlay ? "shown" : "gone");
-        // zwlr_layer_surface_v1 v2: the layer changes with the next commit.
-        if (zwlr_layer_surface_v1_get_version(static_cast<zwlr_layer_surface_v1*>(layer_)) >= 2)
-            zwlr_layer_surface_v1_set_layer(static_cast<zwlr_layer_surface_v1*>(layer_),
-                                            overlay ? ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY
-                                                    : ZWLR_LAYER_SHELL_V1_LAYER_TOP);
+        // zwlr_layer_surface_v1 v2: the layer changes with the next commit (not sent below).
+        (void)wl_layer_.set_layer(overlay ? lx::wayland::layer::overlay : lx::wayland::layer::top);
     }
     relayout();
     if (layout_.width != want_w_ || layout_.height != want_h_) {
@@ -575,8 +561,7 @@ void lx::shell::notification_view::update(const notification_center& c, void* ou
 void lx::shell::notification_view::apply_size() {
     want_w_ = layout_.width;
     want_h_ = layout_.height > 0 ? layout_.height : 1;
-    zwlr_layer_surface_v1_set_size(static_cast<zwlr_layer_surface_v1*>(layer_),
-                                   static_cast<uint32_t>(want_w_), static_cast<uint32_t>(want_h_));
+    wl_layer_.set_size({want_w_, want_h_});
 }
 
 void lx::shell::notification_view::close() {
@@ -585,12 +570,11 @@ void lx::shell::notification_view::close() {
     canvas_.free();
     canvas_.release_scale();
     (void)canvas_.take_rescale();
-    if (layer_)
-        zwlr_layer_surface_v1_destroy(static_cast<zwlr_layer_surface_v1*>(layer_));
+    wl_layer_.destroy();
     layer_ = nullptr;
-    wl_surface_destroy(static_cast<wl_surface*>(surface_));
+    wl_surface_.destroy();
     surface_ = nullptr;
-    output_ = nullptr;
+    output_ = ~0u;
     configured_ = false;
     hover_card_ = hover_part_ = -1;
     pressed_ = {};
@@ -653,7 +637,10 @@ void lx::shell::notification_view::init(notify_globals g, notify_icon_fn icons, 
     user_ = user;
 }
 void lx::shell::notification_view::set_position(notify_position p) { position_ = p; }
-void lx::shell::notification_view::update(const notification_center& c, void*) { center_ = &c; }
+void lx::shell::notification_view::on_configure(lx::wayland::layer_surface&,
+                                                const lx::wayland::layer_configure&) {}
+void lx::shell::notification_view::on_closed(lx::wayland::layer_surface&) {}
+void lx::shell::notification_view::update(const notification_center& c, unsigned) { center_ = &c; }
 void lx::shell::notification_view::apply_size() {}
 void lx::shell::notification_view::close() {}
 void lx::shell::notification_view::after_dispatch() {}

@@ -17,6 +17,7 @@ module;
 
 import lx.foundation;
 import lx.text;
+import lx.wayland.client;
 
 export module lx.shell:menu_popup;
 
@@ -68,6 +69,8 @@ void layout_menu(const std::vector<menu_entry>& items, int (*text_width)(const c
                  void* user, menu_rows& out);
 
 struct menu_globals {
+    /// The connection the popups' wl_surfaces come from (the pointer routes to them by it).
+    lx::wayland::display* display = nullptr;
     void* compositor = nullptr; // wl_compositor
     void* shm = nullptr;        // wl_shm
     void* wm_base = nullptr;    // xdg_wm_base
@@ -123,7 +126,8 @@ private:
     friend struct events;
     struct level {
         menu_popup* owner = nullptr;
-        void* surface = nullptr;  // wl_surface*
+        lx::wayland::surface wl{};
+        void* surface = nullptr;  // wl_surface* (wl.native() while open)
         void* xdg = nullptr;      // xdg_surface*
         void* popup = nullptr;    // xdg_popup*
         std::vector<menu_entry>* items = nullptr;
@@ -183,6 +187,7 @@ private:
     void draw();
     menu_globals g_{};
     shm_canvas canvas_{};
+    lx::wayland::surface wl_{};
     std::string title_{};
     lx::text::wrapped_text text_{};
     std::string body_{};

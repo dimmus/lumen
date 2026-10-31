@@ -19,6 +19,7 @@ module;
 
 import lx.foundation;
 import lx.text;
+import lx.wayland.client;
 
 export module lx.shell:notify_view;
 
@@ -85,9 +86,10 @@ void layout_notifications(const notification* const* shown, unsigned n, unsigned
 unsigned notify_button_actions(const notification& n, int* out, unsigned cap);
 
 struct notify_globals {
+    /// The connection its wl_surface and layer surface (v2+: set_layer) come from.
+    lx::wayland::display* display = nullptr;
     void* compositor = nullptr;  // wl_compositor
     void* shm = nullptr;         // wl_shm
-    void* layer_shell = nullptr; // zwlr_layer_shell_v1 (v2+: set_layer)
     void* viewporter = nullptr;  // wp_viewporter
     void* fractional = nullptr;  // wp_fractional_scale_manager_v1
 };
@@ -106,18 +108,19 @@ struct notify_click {
     lx::rect2i anchor{};
 };
 
-class notification_view {
+class notification_view : private lx::wayland::layer_handler {
 public:
     notification_view() = default;
-    ~notification_view();
+    ~notification_view() override;
     notification_view(const notification_view&) = delete;
     notification_view& operator=(const notification_view&) = delete;
 
     void init(notify_globals g, notify_icon_fn icons, void* user);
     void set_position(notify_position p);
-    /// Shows `c`'s popups on `output` (wl_output*; another output moves the stack there), or
-    /// closes the surface when there are none. Cheap when nothing changed (its rev).
-    void update(const notification_center& c, void* output);
+    /// Shows `c`'s popups on output slot `output_slot` (`display::output_at`; another output
+    /// moves the stack there; ~0u: the compositor picks), or closes the surface when there
+    /// are none. Cheap when nothing changed (its rev).
+    void update(const notification_center& c, unsigned output_slot);
     void close();
     [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
     [[nodiscard]] void* surface() const { return surface_; }
@@ -158,6 +161,8 @@ private:
         /// 0 body, 1 close, 2+i button i, 10+p link piece p.
         int part = -1;
     };
+    void on_configure(lx::wayland::layer_surface& l, const lx::wayland::layer_configure& c) override;
+    void on_closed(lx::wayland::layer_surface& l) override;
     [[nodiscard]] hit hit_at(double x, double y) const;
     card_cache* cache_for(const notification& n);
     void relayout();
@@ -173,9 +178,11 @@ private:
     shm_canvas canvas_{};
     notify_layout layout_{};
     std::vector<std::unique_ptr<card_cache>> cache_;
-    void* output_ = nullptr;
-    void* surface_ = nullptr; // wl_surface*
-    void* layer_ = nullptr;   // zwlr_layer_surface_v1*
+    unsigned output_ = ~0u;
+    lx::wayland::surface wl_surface_{};
+    lx::wayland::layer_surface wl_layer_{};
+    void* surface_ = nullptr; // wl_surface* (wl_surface_.native() while open)
+    void* layer_ = nullptr;   // zwlr_layer_surface_v1* (wl_layer_.native())
     unsigned center_rev_ = 0;
     bool overlay_ = false;
     bool configured_ = false;

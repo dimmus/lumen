@@ -54,6 +54,7 @@ import lx.runtime;
 import lx.compositor;
 import lx.input;
 import lx.shell;
+import lx.wayland.client;
 import lx.config;
 
 // From wayland-server.h, which cannot share a translation unit with the client headers.
@@ -326,16 +327,22 @@ int main() {
     check(model.get(h_one)->geometry.width == 200 && model.get(h_one)->geometry.height == 150,
           "snapshot carries the window geometry");
 
-    // The panel draws the snapshot on its layer surface.
+    // The panel draws the snapshot on its layer surface, through the views' own
+    // lx.wayland.client connection (its globals: one connection per proxy set).
+    static lx::wayland::display panel_display;
+    check(static_cast<bool>(panel_display.connect({.name = k_socket, .track_outputs = false})),
+          "the panel's lx.wayland.client connection connects");
     static lx::shell::panel panel;
-    check(sh.layer_shell && static_cast<bool>(panel.create({.compositor = sh.compositor,
-                                                            .shm = sh.shm,
-                                                            .layer_shell = sh.layer_shell},
-                                                           bridge)),
+    check(static_cast<bool>(panel.create({.display = &panel_display,
+                                          .compositor = panel_display.native_global(
+                                              lx::wayland::global_kind::compositor),
+                                          .shm =
+                                              panel_display.native_global(lx::wayland::global_kind::shm)},
+                                         bridge, ~0u)),
           "panel layer surface created");
-    (void)wl_display_roundtrip(sh.display); // configure
-    panel.after_dispatch();                 // ack + first commit
-    (void)wl_display_roundtrip(sh.display);
+    (void)panel_display.roundtrip(); // configure
+    panel.after_dispatch();          // ack + first commit
+    (void)panel_display.roundtrip();
     const auto& drawn = panel.committed();
     check(drawn.width > 0 && drawn.height == lx::shell::k_panel_height && drawn.count == 2,
           "panel committed a full-width 32 px row of two entries");

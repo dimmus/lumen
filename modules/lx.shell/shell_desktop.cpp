@@ -16,6 +16,7 @@ import std;
 import lx.foundation;
 import lx.trace;
 import lx.config;
+import lx.wayland.client;
 
 namespace {
 
@@ -171,11 +172,12 @@ void lx::shell::shell_app::start_desktop_services() {
         apply_notify_config(*file_config_);
     else
         apply_notify_config(lx::config::default_config());
-    note_view_.init({.compositor = compositor_,
-                     .shm = shm_,
-                     .layer_shell = layer_shell_,
-                     .viewporter = viewporter_,
-                     .fractional = fractional_},
+    note_view_.init({.display = client_.connected() ? &client_ : nullptr,
+                     .compositor = client_.native_global(lx::wayland::global_kind::compositor),
+                     .shm = client_.native_global(lx::wayland::global_kind::shm),
+                     .viewporter = client_.native_global(lx::wayland::global_kind::viewporter),
+                     .fractional =
+                         client_.native_global(lx::wayland::global_kind::fractional_scale)},
                     [](const notification& n, int px, void* user) {
                         return static_cast<shell_app*>(user)->notification_icon(n, px);
                     },
@@ -313,7 +315,7 @@ void lx::shell::shell_app::desktop_after_dispatch() {
     if (notes_.shown(shown, 1) == 0)
         notify_output_ = 0;
     output_record* o = notes_.shown(shown, 1) ? notify_output() : nullptr;
-    note_view_.update(notes_, o ? o->output : nullptr);
+    note_view_.update(notes_, o ? client_slot(*o) : ~0u);
     if (!note_view_.is_open()) {
         // Gone under the pointer (its last card dismissed): no leave comes for a destroyed
         // surface, and a hover left set would stop every timer.

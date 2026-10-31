@@ -132,6 +132,9 @@ public:
     /// its interface, object and code, when it is first seen.
     [[nodiscard]] const protocol_error_info& protocol_error() const { return error_; }
     [[nodiscard]] bool failed() const { return error_.display_errno != 0; }
+    /// The owner expects the compositor to hang up (it asked to end the session): a lost
+    /// connection is then not logged as an error; a protocol error still is.
+    void expect_hangup() { expect_hangup_ = true; }
 
     // ── globals ──
     [[nodiscard]] const global_info& global(global_kind k) const {
@@ -227,6 +230,7 @@ private:
     bool track_outputs_ = true;
     bool want_feedback_ = true;
     bool error_logged_ = false;
+    bool expect_hangup_ = false;
 };
 
 /// The display as an lx::runtime::event_loop source, the way GTK's GSource and calloop's

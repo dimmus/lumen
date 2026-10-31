@@ -29,17 +29,12 @@ module;
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wkeyword-macro"
-#define namespace name_space
-#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#undef namespace
-#pragma clang diagnostic pop
 #endif
 
 import lx.foundation;
 import lx.text;
 import lx.trace;
+import lx.wayland.client;
 
 export module lx.shell:switcher;
 
@@ -181,9 +176,10 @@ struct switcher_layout {
 // ── The view ──────────────────────────────────────────────────────────────────
 
 struct switcher_globals {
+    /// The connection its wl_surface and layer surface come from.
+    lx::wayland::display* display = nullptr;
     void* compositor = nullptr;  // wl_compositor
     void* shm = nullptr;         // wl_shm
-    void* layer_shell = nullptr; // zwlr_layer_shell_v1
     void* viewporter = nullptr;  // wp_viewporter (with fractional: sharp at any scale)
     void* fractional = nullptr;  // wp_fractional_scale_manager_v1
 };
@@ -196,16 +192,17 @@ using switcher_icon_fn = const std::uint32_t* (*)(task_handle h, const task_entr
 /// The switcher's surface: an overlay-layer surface centred on one output, no keyboard
 /// interactivity (the hold has the keys), placed over panels (exclusive zone -1). It exists
 /// only while shown: open creates it and its buffers, close frees them.
-class switcher_view {
+class switcher_view : private lx::wayland::layer_handler {
 public:
     switcher_view() = default;
-    ~switcher_view();
+    ~switcher_view() override;
     switcher_view(const switcher_view&) = delete;
     switcher_view& operator=(const switcher_view&) = delete;
 
     void init(switcher_globals g, switcher_icon_fn icons, void* user);
-    /// Opens on `output` (wl_output*) of `output_w`×`output_h` logical px for `m`'s list.
-    bool open(void* output, int output_w, int output_h, const switcher_model& m);
+    /// Opens on output slot `output_slot` (`display::output_at`; ~0u: the compositor picks)
+    /// of `output_w`×`output_h` logical px for `m`'s list.
+    bool open(unsigned output_slot, int output_w, int output_h, const switcher_model& m);
     void close();
     [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
     [[nodiscard]] void* surface() const { return surface_; }
@@ -231,6 +228,8 @@ private:
         unsigned title_rev = 0;
         task_handle selected{};
     };
+    void on_configure(lx::wayland::layer_surface& l, const lx::wayland::layer_configure& c) override;
+    void on_closed(lx::wayland::layer_surface& l) override;
     void draw(const switcher_model& m, const task_model& tasks, bool force);
     void paint_cell(int bi, const switcher_model& m, const task_model& tasks, unsigned i,
                     bool selected);
@@ -245,8 +244,9 @@ private:
     int output_h_ = 0;
     drawn_state drawn_[2]{};
     drawn_state committed_{};
-    void* surface_ = nullptr; // wl_surface*
-    void* layer_ = nullptr;   // zwlr_layer_surface_v1*
+    lx::wayland::surface wl_surface_{};
+    lx::wayland::layer_surface wl_layer_{};
+    void* surface_ = nullptr; // wl_surface* (wl_surface_.native() while open)
     bool configured_ = false;
     unsigned frames_ = 0;
 };
@@ -602,65 +602,58 @@ void lx::shell::switcher_view::draw(const switcher_model& m, const task_model& t
 
 #if defined(LUMEN_SHELL_WAYLAND)
 
-struct lx::shell::switcher_view::events {
-    static switcher_view& self(void* data) { return *static_cast<switcher_view*>(data); }
-    static void configure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial, uint32_t w,
-                          uint32_t h) {
-        auto& v = self(data);
-        zwlr_layer_surface_v1_ack_configure(layer, serial);
-        const int nw = w ? static_cast<int>(w) : v.layout_.width;
-        const int nh = h ? static_cast<int>(h) : v.layout_.height;
-        if (nw != v.canvas_.width() || nh != v.canvas_.height() || !v.canvas_.allocated()) {
-            if (!v.canvas_.allocate(v.g_.shm, nw, nh, "lumen-switcher")) {
-                log_switcher.error("cannot allocate switcher buffers");
-                v.close();
-                return;
-            }
-            (void)v.canvas_.take_rescale();
-            v.drawn_[0] = v.drawn_[1] = v.committed_ = {};
+struct lx::shell::switcher_view::events {};
+
+void lx::shell::switcher_view::on_configure(lx::wayland::layer_surface& layer,
+                                            const lx::wayland::layer_configure& c) {
+    layer.ack_configure(c.serial);
+    const int nw = c.size.width ? c.size.width : layout_.width;
+    const int nh = c.size.height ? c.size.height : layout_.height;
+    if (nw != canvas_.width() || nh != canvas_.height() || !canvas_.allocated()) {
+        if (!canvas_.allocate(g_.shm, nw, nh, "lumen-switcher")) {
+            log_switcher.error("cannot allocate switcher buffers");
+            close();
+            return;
         }
-        v.configured_ = true;
+        (void)canvas_.take_rescale();
+        drawn_[0] = drawn_[1] = committed_ = {};
     }
-    static void closed(void* data, zwlr_layer_surface_v1*) {
-        // Its output went: the switch goes on without the view.
-        self(data).close();
-    }
-};
+    configured_ = true;
+}
 
-namespace {
+void lx::shell::switcher_view::on_closed(lx::wayland::layer_surface&) {
+    // Its output went: the switch goes on without the view.
+    close();
+}
 
-const zwlr_layer_surface_v1_listener k_switcher_layer_listener = {
-    .configure = lx::shell::switcher_view::events::configure,
-    .closed = lx::shell::switcher_view::events::closed,
-};
-
-} // namespace
-
-bool lx::shell::switcher_view::open(void* output, int output_w, int output_h,
+bool lx::shell::switcher_view::open(unsigned output_slot, int output_w, int output_h,
                                     const switcher_model& m) {
     if (is_open())
         return true;
-    if (!g_.compositor || !g_.layer_shell || !g_.shm || m.count() == 0)
+    if (!g_.display || !g_.compositor || !g_.shm || m.count() == 0)
         return false;
     output_w_ = output_w > 0 ? output_w : 1024;
     output_h_ = output_h > 0 ? output_h : 768;
     layout_ = layout_switcher(m.count(), m.selection(), output_w_, output_h_);
-    auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
-    if (!surface)
+    if (!wl_surface_.create(*g_.display))
         return false;
-    surface_ = surface;
-    auto* layer = zwlr_layer_shell_v1_get_layer_surface(
-        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,
-        static_cast<wl_output*>(output), ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "lumen-switcher");
-    layer_ = layer;
-    zwlr_layer_surface_v1_add_listener(layer, &k_switcher_layer_listener, this);
+    if (auto made = wl_layer_.create(*g_.display, wl_surface_,
+                                     {.output_slot = output_slot,
+                                      .level = lx::wayland::layer::overlay,
+                                      .name_space = "lumen-switcher"});
+        !made) {
+        log_switcher.error(made.get_error());
+        wl_surface_.destroy();
+        return false;
+    }
+    wl_layer_.set_handler(this);
+    surface_ = wl_surface_.native();
+    auto* surface = static_cast<wl_surface*>(surface_);
     canvas_.attach_scale(g_.viewporter, g_.fractional, surface);
     // No anchor: centred on the output. Zone -1: over panels, whatever they reserve.
-    zwlr_layer_surface_v1_set_size(layer, static_cast<uint32_t>(layout_.width),
-                                   static_cast<uint32_t>(layout_.height));
-    zwlr_layer_surface_v1_set_exclusive_zone(layer, -1);
-    zwlr_layer_surface_v1_set_keyboard_interactivity(
-        layer, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    wl_layer_.set_size({layout_.width, layout_.height});
+    wl_layer_.set_exclusive_zone(-1);
+    (void)wl_layer_.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::none);
     if (auto* region = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
         // Opaque inside the rounded corners: what is under it need not be drawn.
         wl_region_add(region, k_sw_radius, 0, layout_.width - 2 * k_sw_radius, layout_.height);
@@ -683,11 +676,8 @@ void lx::shell::switcher_view::close() {
     canvas_.free();
     canvas_.release_scale(); // before the wl_surface it extends
     (void)canvas_.take_rescale();
-    if (layer_)
-        zwlr_layer_surface_v1_destroy(static_cast<zwlr_layer_surface_v1*>(layer_));
-    layer_ = nullptr;
-    if (surface_)
-        wl_surface_destroy(static_cast<wl_surface*>(surface_));
+    wl_layer_.destroy();
+    wl_surface_.destroy();
     surface_ = nullptr;
     configured_ = false;
     drawn_[0] = drawn_[1] = committed_ = {};
@@ -716,7 +706,9 @@ void lx::shell::switcher_view::after_dispatch(const switcher_model& m, const tas
 #else // !LUMEN_SHELL_WAYLAND
 
 struct lx::shell::switcher_view::events {};
-bool lx::shell::switcher_view::open(void*, int, int, const switcher_model&) { return false; }
+void lx::shell::switcher_view::on_configure(lx::wayland::layer_surface&, const lx::wayland::layer_configure&) {}
+void lx::shell::switcher_view::on_closed(lx::wayland::layer_surface&) {}
+bool lx::shell::switcher_view::open(unsigned, int, int, const switcher_model&) { return false; }
 void lx::shell::switcher_view::close() {}
 void lx::shell::switcher_view::after_dispatch(const switcher_model&, const task_model&) {}
 

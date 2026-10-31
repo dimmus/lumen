@@ -8,14 +8,6 @@ module;
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
-// wayland-scanner names an argument `namespace`, a C++ keyword (Wayfire renames it the same
-// way).
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wkeyword-macro"
-#define namespace name_space
-#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#undef namespace
-#pragma clang diagnostic pop
 #if defined(LUMEN_PROTOCOL_EXT_BACKGROUND_EFFECT_V1)
 #include "ext-background-effect-v1-client-protocol.h"
 #define LUMEN_SHELL_BACKGROUND_EFFECT 1
@@ -25,6 +17,7 @@ module;
 import lx.foundation;
 import lx.text;
 import lx.trace;
+import lx.wayland.client;
 
 export module lx.shell:panel;
 
@@ -297,9 +290,11 @@ unsigned panel_diff(const panel_layout& from, const panel_layout& to, lx::rect2i
 
 /// Globals the panel draws through (all `void*`: no Wayland type is exported).
 struct panel_globals {
+    /// The connection: its wl_surface and layer surface come from it (the layer shell is
+    /// bound by the first layer surface).
+    lx::wayland::display* display = nullptr;
     void* compositor = nullptr;  // wl_compositor (v4+: damage_buffer)
     void* shm = nullptr;         // wl_shm
-    void* layer_shell = nullptr; // zwlr_layer_shell_v1
     /// Optional: with both, the panel renders at the output's fractional scale.
     void* viewporter = nullptr;  // wp_viewporter
     void* fractional = nullptr;  // wp_fractional_scale_manager_v1
@@ -371,17 +366,17 @@ struct panel_widget_event {
 /// motion and configures only mark the panel dirty; `after_dispatch()` draws at most once
 /// per frame callback, repainting in its buffer only the cells that differ from what that
 /// buffer holds and damaging only the cells that differ from the last commit.
-class panel {
+class panel : private lx::wayland::layer_handler {
 public:
     panel() = default;
-    ~panel();
+    ~panel() override;
     panel(const panel&) = delete;
     panel& operator=(const panel&) = delete;
 
-    /// Creates the layer surface on `output` (wl_output*; null: the compositor picks) and
-    /// sends its initial commit.
+    /// Creates the layer surface on output slot `output_slot` (`display::output_at`; ~0u:
+    /// the compositor picks) and sends its initial commit.
     [[nodiscard]] lx::result<void> create(panel_globals globals, policy_bridge& bridge,
-                                          void* output = nullptr);
+                                          unsigned output_slot = ~0u);
     void destroy();
     /// Call after every dispatch: consumes model changes and draws if needed. With several
     /// panels the shell takes the model's changes once and hands them to each
@@ -471,6 +466,8 @@ public:
 private:
     friend struct events;
 
+    void on_configure(lx::wayland::layer_surface& l, const lx::wayland::layer_configure& c) override;
+    void on_closed(lx::wayland::layer_surface& l) override;
     void draw(bool force);
     void paint(int bi, const panel_layout& l, const lx::rect2i* rects, unsigned n);
     void paint_cell(int bi, const panel_layout& l, unsigned i);
@@ -493,8 +490,10 @@ private:
     /// The panel's background: opaque, or translucent (premultiplied) over the blur.
     std::uint32_t bg_ = lx::shell::k_canvas_bg;
     policy_bridge* bridge_ = nullptr;
-    void* surface_ = nullptr; // wl_surface*
-    void* layer_ = nullptr;   // zwlr_layer_surface_v1*
+    lx::wayland::surface wl_surface_{};
+    lx::wayland::layer_surface wl_layer_{};
+    void* surface_ = nullptr; // wl_surface* (wl_surface_.native() while created)
+    void* layer_ = nullptr;   // zwlr_layer_surface_v1* (wl_layer_.native())
     shm_canvas canvas_{};
     panel_layout drawn_[2]{}; // what each buffer's pixels show
     int width_ = 0;
@@ -1478,68 +1477,58 @@ void lx::shell::panel::pointer_button(unsigned button, bool down, unsigned seria
 
 #if defined(LUMEN_SHELL_WAYLAND)
 
-struct lx::shell::panel::events {
-    static panel& self(void* data) { return *static_cast<panel*>(data); }
+struct lx::shell::panel::events {};
 
-    // ── zwlr_layer_surface_v1 ──
-    static void configure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial,
-                          uint32_t w, uint32_t h) {
-        auto& p = self(data);
-        zwlr_layer_surface_v1_ack_configure(layer, serial);
-        const int nw = static_cast<int>(w);
-        const int nh = h ? static_cast<int>(h) : k_panel_height;
-        if (!p.configured_ || nw != p.width_ || nh != p.height_) {
-            p.width_ = nw;
-            p.height_ = nh;
-            p.resized_ = true;
-            log_panel.info("configure serial={} w={} h={}", serial, nw, nh);
-        }
-        p.configured_ = true;
-        // The ack takes effect with the next commit: make one even if nothing changed.
-        p.must_commit_ = true;
+void lx::shell::panel::on_configure(lx::wayland::layer_surface& l,
+                                    const lx::wayland::layer_configure& c) {
+    l.ack_configure(c.serial);
+    const int nw = c.size.width;
+    const int nh = c.size.height ? c.size.height : k_panel_height;
+    if (!configured_ || nw != width_ || nh != height_) {
+        width_ = nw;
+        height_ = nh;
+        resized_ = true;
+        log_panel.info("configure serial={} w={} h={}", c.serial, nw, nh);
     }
-    static void closed(void* data, zwlr_layer_surface_v1*) {
-        self(data).closed_ = true;
-        log_panel.warn("layer surface closed by the compositor");
-    }
-};
+    configured_ = true;
+    // The ack takes effect with the next commit: make one even if nothing changed.
+    must_commit_ = true;
+}
 
-namespace {
-
-const zwlr_layer_surface_v1_listener k_layer_listener = {
-    .configure = lx::shell::panel::events::configure,
-    .closed = lx::shell::panel::events::closed,
-};
-
-} // namespace
+void lx::shell::panel::on_closed(lx::wayland::layer_surface&) {
+    closed_ = true;
+    log_panel.warn("layer surface closed by the compositor");
+}
 
 lx::result<void> lx::shell::panel::create(panel_globals globals, policy_bridge& bridge,
-                                          void* output) {
-    if (!globals.compositor || !globals.shm || !globals.layer_shell)
-        return lx::invalid_argument("panel needs wl_compositor, wl_shm and zwlr_layer_shell_v1");
+                                          unsigned output_slot) {
+    if (!globals.display || !globals.compositor || !globals.shm)
+        return lx::invalid_argument("panel needs the display, wl_compositor and wl_shm");
     g_ = globals;
     bridge_ = &bridge;
-    auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
-    if (!surface)
-        return lx::make_error(lx::wayland_err::bind_failed, "wl_compositor.create_surface failed");
-    surface_ = surface;
-    auto* layer = zwlr_layer_shell_v1_get_layer_surface(
-        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,
-        static_cast<wl_output*>(output), ZWLR_LAYER_SHELL_V1_LAYER_TOP, "lumen-panel");
-    layer_ = layer;
-    zwlr_layer_surface_v1_add_listener(layer, &k_layer_listener, this);
+    if (auto made = wl_surface_.create(*g_.display); !made)
+        return made.get_error();
+    if (auto made = wl_layer_.create(*g_.display, wl_surface_,
+                                     {.output_slot = output_slot,
+                                      .level = lx::wayland::layer::top,
+                                      .name_space = "lumen-panel"});
+        !made) {
+        wl_surface_.destroy();
+        return made.get_error();
+    }
+    wl_layer_.set_handler(this);
+    surface_ = wl_surface_.native();
+    layer_ = wl_layer_.native();
     // Rendered at the output's pixel density (wp_fractional_scale_v1), shown at its logical
     // size: the first preferred scale arrives with the object, before the first configure.
-    canvas_.attach_scale(g_.viewporter, g_.fractional, surface);
-    zwlr_layer_surface_v1_set_anchor(layer, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                                ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
-                                                ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT);
-    zwlr_layer_surface_v1_set_size(layer, 0, k_panel_height);
-    zwlr_layer_surface_v1_set_exclusive_zone(layer, k_panel_height);
-    zwlr_layer_surface_v1_set_keyboard_interactivity(
-        layer, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    canvas_.attach_scale(g_.viewporter, g_.fractional, surface_);
+    wl_layer_.set_anchor(lx::wayland::anchor_top | lx::wayland::anchor_left |
+                         lx::wayland::anchor_right);
+    wl_layer_.set_size({0, k_panel_height});
+    wl_layer_.set_exclusive_zone(k_panel_height);
+    (void)wl_layer_.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::none);
     apply_blur();
-    wl_surface_commit(surface); // initial commit: no buffer, asks for a configure
+    wl_surface_commit(static_cast<wl_surface*>(surface_)); // initial commit: no buffer, asks for a configure
     return {};
 }
 
@@ -1737,12 +1726,10 @@ void lx::shell::panel::set_menu_keyboard(bool on) {
         return;
     menu_keyboard_ = on;
     // on_demand is layer-shell v4's; below it the menu takes the pointer only.
-    if (zwlr_layer_surface_v1_get_version(static_cast<zwlr_layer_surface_v1*>(layer_)) < 4)
+    if (wl_layer_.version() < 4)
         return;
-    zwlr_layer_surface_v1_set_keyboard_interactivity(
-        static_cast<zwlr_layer_surface_v1*>(layer_),
-        on ? ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND
-           : ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+    (void)wl_layer_.set_keyboard_interactivity(on ? lx::wayland::keyboard_interactivity::on_demand
+                                                  : lx::wayland::keyboard_interactivity::none);
     wl_surface_commit(static_cast<wl_surface*>(surface_));
 }
 
@@ -1755,11 +1742,9 @@ void lx::shell::panel::destroy() {
             static_cast<ext_background_effect_surface_v1*>(effect_));
 #endif
     effect_ = nullptr;
-    if (layer_)
-        zwlr_layer_surface_v1_destroy(static_cast<zwlr_layer_surface_v1*>(layer_));
+    wl_layer_.destroy();
     layer_ = nullptr;
-    if (surface_)
-        wl_surface_destroy(static_cast<wl_surface*>(surface_));
+    wl_surface_.destroy();
     surface_ = nullptr;
     bridge_ = nullptr;
 }
@@ -1768,7 +1753,9 @@ void lx::shell::panel::destroy() {
 
 struct lx::shell::panel::events {};
 
-lx::result<void> lx::shell::panel::create(panel_globals, policy_bridge&, void*) {
+void lx::shell::panel::on_configure(lx::wayland::layer_surface&, const lx::wayland::layer_configure&) {}
+void lx::shell::panel::on_closed(lx::wayland::layer_surface&) {}
+lx::result<void> lx::shell::panel::create(panel_globals, policy_bridge&, unsigned) {
     return lx::not_implemented("lx::shell::panel::create");
 }
 void lx::shell::panel::destroy() {}

@@ -8,23 +8,12 @@ module;
 
 #if defined(LUMEN_SHELL_WAYLAND)
 #include <wayland-client.h>
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wkeyword-macro"
-#define namespace name_space
-#include "wlr-layer-shell-unstable-v1-client-protocol.h"
-#undef namespace
-#pragma clang diagnostic pop
-#endif
-
-#if defined(LUMEN_HAS_XKBCOMMON)
-#include <sys/mman.h>
-#include <unistd.h>
-#include <xkbcommon/xkbcommon.h>
 #endif
 
 import lx.foundation;
 import lx.text;
 import lx.trace;
+import lx.wayland.client;
 
 export module lx.shell:launcher;
 
@@ -162,47 +151,24 @@ private:
     unsigned rows_ = k_launcher_min_rows;
 };
 
-// ── Keyboard (xkbcommon) ──────────────────────────────────────────────────────
+// ── Keyboard ──────────────────────────────────────────────────────────────────
 
-/// One translated key press.
+/// One translated key press: the keysym and text of a key under the seat's keymap and
+/// modifiers (lx::wayland::seat compiles the keymap; without xkbcommon no key translates
+/// and the launcher is pointer-only).
 struct key_press {
     unsigned keysym = 0;
     char utf8[16]{};
     bool repeats = false;
 };
 
-/// The shell's wl_keyboard state: the compositor's keymap and modifier state. Without
-/// LUMEN_HAS_XKBCOMMON every key is ignored (the launcher is then pointer-only).
-class xkb_keyboard {
-public:
-    xkb_keyboard() = default;
-    ~xkb_keyboard();
-    xkb_keyboard(const xkb_keyboard&) = delete;
-    xkb_keyboard& operator=(const xkb_keyboard&) = delete;
-
-    /// wl_keyboard.keymap (XKB_V1). Takes ownership of `fd`.
-    bool set_keymap(int fd, std::uint32_t size);
-    void update_mods(std::uint32_t depressed, std::uint32_t latched, std::uint32_t locked,
-                     std::uint32_t group);
-    /// A key press (`code` is the evdev code, as wl_keyboard.key sends it).
-    [[nodiscard]] bool press(std::uint32_t code, key_press& out) const;
-    [[nodiscard]] bool ctrl() const;
-    [[nodiscard]] bool shift() const;
-    [[nodiscard]] bool alt() const;
-    [[nodiscard]] bool ready() const { return state_ != nullptr; }
-
-private:
-    void* ctx_ = nullptr;    // xkb_context*
-    void* keymap_ = nullptr; // xkb_keymap*
-    void* state_ = nullptr;  // xkb_state*
-};
-
 // ── The launcher ──────────────────────────────────────────────────────────────
 
 struct launcher_globals {
+    /// The connection its wl_surface and layer surface come from.
+    lx::wayland::display* display = nullptr;
     void* compositor = nullptr;  // wl_compositor
     void* shm = nullptr;         // wl_shm
-    void* layer_shell = nullptr; // zwlr_layer_shell_v1
     /// Optional: with both, the launcher renders at the output's fractional scale.
     void* viewporter = nullptr;  // wp_viewporter
     void* fractional = nullptr;  // wp_fractional_scale_manager_v1
@@ -214,10 +180,10 @@ struct launcher_globals {
 /// surface and its buffers, close frees them, so an idle shell holds no launcher memory.
 /// Closes on Escape (with an empty query), on its toggle, on launch, and when it loses
 /// the keyboard (a click elsewhere, a window taking focus).
-class launcher {
+class launcher : private lx::wayland::layer_handler {
 public:
     launcher() = default;
-    ~launcher();
+    ~launcher() override;
     launcher(const launcher&) = delete;
     launcher& operator=(const launcher&) = delete;
 
@@ -231,9 +197,9 @@ public:
 
     void init(launcher_globals g, app_catalog& catalog, launch_fn on_launch, closed_fn on_closed,
               void* user);
-    /// Opens on `output` (wl_output*; null: the compositor picks), `output_w`×`output_h`
-    /// logical; false when it cannot.
-    bool open(int output_w, int output_h, int panel_h, void* output = nullptr);
+    /// Opens on output slot `output_slot` (`display::output_at`; ~0u: the compositor picks),
+    /// `output_w`×`output_h` logical; false when it cannot.
+    bool open(int output_w, int output_h, int panel_h, unsigned output_slot = ~0u);
     void close();
     /// While closed: paints the frame `open` would show first (same size, `scale120`) into
     /// memory that is never shown, then frees it. The first open's frame then finds its text
@@ -243,7 +209,7 @@ public:
     [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
     [[nodiscard]] void* surface() const { return surface_; }
     /// zwlr_layer_surface_v1* while open (a menu's parent).
-    [[nodiscard]] void* layer() const { return layer_; }
+    [[nodiscard]] void* layer() const { return wl_layer_.native(); }
     /// Rows get a menu (null: none; the handler gets `init`'s `user`).
     void set_menu_handler(menu_fn fn) { on_menu_ = fn; }
     [[nodiscard]] launcher_model& model() { return model_; }
@@ -269,6 +235,8 @@ public:
 
 private:
     friend struct events;
+    void on_configure(lx::wayland::layer_surface& l, const lx::wayland::layer_configure& c) override;
+    void on_closed(lx::wayland::layer_surface& l) override;
     void draw(bool force);
     void paint(int bi, const launcher_layout& l, const lx::rect2i* rects, unsigned n);
     void paint_search(int bi, const launcher_layout& l);
@@ -288,8 +256,9 @@ private:
     launcher_layout drawn_[2]{};
     launcher_layout committed_{};
     launcher_layout next_{};
-    void* surface_ = nullptr; // wl_surface*
-    void* layer_ = nullptr;   // zwlr_layer_surface_v1*
+    lx::wayland::surface wl_surface_{};
+    lx::wayland::layer_surface wl_layer_{};
+    void* surface_ = nullptr; // wl_surface* (wl_surface_.native() while open)
     int width_ = 0;
     int height_ = 0;
     unsigned rows_ = k_launcher_min_rows;
@@ -589,97 +558,6 @@ lx::shell::launcher_key_result lx::shell::launcher_model::key(unsigned sym, cons
     return launcher_key_result::changed;
 }
 
-// ── Keyboard ─────────────────────────────────────────────────────────────────
-
-#if defined(LUMEN_HAS_XKBCOMMON)
-
-bool lx::shell::xkb_keyboard::set_keymap(int fd, std::uint32_t size) {
-    void* map = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (map == MAP_FAILED)
-        return false;
-    if (!ctx_)
-        ctx_ = xkb_context_new(XKB_CONTEXT_NO_FLAGS);
-    xkb_keymap* km = ctx_ ? xkb_keymap_new_from_string(static_cast<xkb_context*>(ctx_),
-                                                       static_cast<const char*>(map),
-                                                       XKB_KEYMAP_FORMAT_TEXT_V1,
-                                                       XKB_KEYMAP_COMPILE_NO_FLAGS)
-                          : nullptr;
-    munmap(map, size);
-    if (!km)
-        return false;
-    xkb_state* st = xkb_state_new(km);
-    if (!st) {
-        xkb_keymap_unref(km);
-        return false;
-    }
-    if (state_)
-        xkb_state_unref(static_cast<xkb_state*>(state_));
-    if (keymap_)
-        xkb_keymap_unref(static_cast<xkb_keymap*>(keymap_));
-    keymap_ = km;
-    state_ = st;
-    return true;
-}
-
-void lx::shell::xkb_keyboard::update_mods(std::uint32_t depressed, std::uint32_t latched,
-                                          std::uint32_t locked, std::uint32_t group) {
-    if (state_)
-        xkb_state_update_mask(static_cast<xkb_state*>(state_), depressed, latched, locked, 0, 0,
-                              group);
-}
-
-bool lx::shell::xkb_keyboard::press(std::uint32_t code, key_press& out) const {
-    if (!state_)
-        return false;
-    auto* st = static_cast<xkb_state*>(state_);
-    const xkb_keycode_t kc = code + 8;
-    out.keysym = xkb_state_key_get_one_sym(st, kc);
-    out.utf8[0] = '\0';
-    (void)xkb_state_key_get_utf8(st, kc, out.utf8, sizeof(out.utf8));
-    out.repeats = xkb_keymap_key_repeats(static_cast<xkb_keymap*>(keymap_), kc) != 0;
-    return out.keysym != XKB_KEY_NoSymbol;
-}
-
-bool lx::shell::xkb_keyboard::ctrl() const {
-    return state_ && xkb_state_mod_name_is_active(static_cast<xkb_state*>(state_),
-                                                  XKB_MOD_NAME_CTRL, XKB_STATE_MODS_EFFECTIVE) > 0;
-}
-bool lx::shell::xkb_keyboard::shift() const {
-    return state_ && xkb_state_mod_name_is_active(static_cast<xkb_state*>(state_),
-                                                  XKB_MOD_NAME_SHIFT, XKB_STATE_MODS_EFFECTIVE) > 0;
-}
-bool lx::shell::xkb_keyboard::alt() const {
-    return state_ && xkb_state_mod_name_is_active(static_cast<xkb_state*>(state_),
-                                                  XKB_MOD_NAME_ALT, XKB_STATE_MODS_EFFECTIVE) > 0;
-}
-
-lx::shell::xkb_keyboard::~xkb_keyboard() {
-    if (state_)
-        xkb_state_unref(static_cast<xkb_state*>(state_));
-    if (keymap_)
-        xkb_keymap_unref(static_cast<xkb_keymap*>(keymap_));
-    if (ctx_)
-        xkb_context_unref(static_cast<xkb_context*>(ctx_));
-}
-
-#else
-
-bool lx::shell::xkb_keyboard::set_keymap(int fd, std::uint32_t) {
-    if (fd >= 0)
-        ::close(fd);
-    return false;
-}
-void lx::shell::xkb_keyboard::update_mods(std::uint32_t, std::uint32_t, std::uint32_t,
-                                          std::uint32_t) {}
-bool lx::shell::xkb_keyboard::press(std::uint32_t, key_press&) const { return false; }
-bool lx::shell::xkb_keyboard::ctrl() const { return false; }
-bool lx::shell::xkb_keyboard::shift() const { return false; }
-bool lx::shell::xkb_keyboard::alt() const { return false; }
-lx::shell::xkb_keyboard::~xkb_keyboard() = default;
-
-#endif
-
 // ── Drawing ──────────────────────────────────────────────────────────────────
 
 namespace {
@@ -946,43 +824,33 @@ void lx::shell::launcher::closed_by_itself(const char* why) {
 
 #if defined(LUMEN_SHELL_WAYLAND)
 
-struct lx::shell::launcher::events {
-    static launcher& self(void* data) { return *static_cast<launcher*>(data); }
-    static void configure(void* data, zwlr_layer_surface_v1* layer, uint32_t serial, uint32_t w,
-                          uint32_t h) {
-        auto& l = self(data);
-        zwlr_layer_surface_v1_ack_configure(layer, serial);
-        const int nw = w ? static_cast<int>(w) : l.width_;
-        const int nh = h ? static_cast<int>(h) : l.height_;
-        if (nw != l.width_ || nh != l.height_ || !l.canvas_.allocated()) {
-            l.width_ = nw;
-            l.height_ = nh;
-            l.committed_.width = 0;
-            l.drawn_[0].width = l.drawn_[1].width = 0;
-            if (!l.canvas_.allocate(l.g_.shm, nw, nh, "lumen-launcher")) {
-                log_launcher.error("cannot allocate launcher buffers");
-                l.closed_by_itself("no buffers");
-                return;
-            }
-            // Allocated at the scale known now (it arrives before the first configure).
-            (void)l.canvas_.take_rescale();
+struct lx::shell::launcher::events {};
+
+void lx::shell::launcher::on_configure(lx::wayland::layer_surface& layer,
+                                       const lx::wayland::layer_configure& c) {
+    layer.ack_configure(c.serial);
+    const int nw = c.size.width ? c.size.width : width_;
+    const int nh = c.size.height ? c.size.height : height_;
+    if (nw != width_ || nh != height_ || !canvas_.allocated()) {
+        width_ = nw;
+        height_ = nh;
+        committed_.width = 0;
+        drawn_[0].width = drawn_[1].width = 0;
+        if (!canvas_.allocate(g_.shm, nw, nh, "lumen-launcher")) {
+            log_launcher.error("cannot allocate launcher buffers");
+            closed_by_itself("no buffers");
+            return;
         }
-        l.configured_ = true;
-        l.must_commit_ = true;
+        // Allocated at the scale known now (it arrives before the first configure).
+        (void)canvas_.take_rescale();
     }
-    static void closed(void* data, zwlr_layer_surface_v1*) {
-        self(data).closed_by_itself("closed by the compositor");
-    }
-};
+    configured_ = true;
+    must_commit_ = true;
+}
 
-namespace {
-
-const zwlr_layer_surface_v1_listener k_launcher_layer_listener = {
-    .configure = lx::shell::launcher::events::configure,
-    .closed = lx::shell::launcher::events::closed,
-};
-
-} // namespace
+void lx::shell::launcher::on_closed(lx::wayland::layer_surface&) {
+    closed_by_itself("closed by the compositor");
+}
 
 void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_fn on_launch,
                                closed_fn on_closed, void* user) {
@@ -994,31 +862,33 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
     model_.bind(&catalog);
 }
 
-bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, void* output) {
+bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, unsigned output_slot) {
     if (is_open())
         return true;
-    if (!g_.compositor || !g_.layer_shell || !g_.shm || output_w <= 0)
+    if (!g_.display || !g_.compositor || !g_.shm || output_w <= 0)
         return false;
     const launcher_geometry geo = launcher_size(output_w, output_h > 0 ? output_h : 600, panel_h);
-    auto* surface = wl_compositor_create_surface(static_cast<wl_compositor*>(g_.compositor));
-    if (!surface)
+    if (!wl_surface_.create(*g_.display))
         return false;
-    surface_ = surface;
-    auto* layer = zwlr_layer_shell_v1_get_layer_surface(
-        static_cast<zwlr_layer_shell_v1*>(g_.layer_shell), surface,
-        static_cast<wl_output*>(output), ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY, "lumen-launcher");
-    layer_ = layer;
-    zwlr_layer_surface_v1_add_listener(layer, &k_launcher_layer_listener, this);
+    if (auto made = wl_layer_.create(*g_.display, wl_surface_,
+                                     {.output_slot = output_slot,
+                                      .level = lx::wayland::layer::overlay,
+                                      .name_space = "lumen-launcher"});
+        !made) {
+        log_launcher.error(made.get_error());
+        wl_surface_.destroy();
+        return false;
+    }
+    wl_layer_.set_handler(this);
+    surface_ = wl_surface_.native();
+    auto* surface = static_cast<wl_surface*>(surface_);
     canvas_.attach_scale(g_.viewporter, g_.fractional, surface);
-    zwlr_layer_surface_v1_set_anchor(layer, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
-                                                ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
-    zwlr_layer_surface_v1_set_size(layer, static_cast<uint32_t>(geo.width),
-                                   static_cast<uint32_t>(geo.height));
+    wl_layer_.set_anchor(lx::wayland::anchor_top | lx::wayland::anchor_left);
+    wl_layer_.set_size({geo.width, geo.height});
     // Zone 0: placed beneath the panel's exclusive zone, reserving none of its own.
-    zwlr_layer_surface_v1_set_exclusive_zone(layer, 0);
-    zwlr_layer_surface_v1_set_margin(layer, k_launcher_margin, 0, 0, k_launcher_margin);
-    zwlr_layer_surface_v1_set_keyboard_interactivity(
-        layer, ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_ON_DEMAND);
+    wl_layer_.set_exclusive_zone(0);
+    wl_layer_.set_margin(k_launcher_margin, 0, 0, k_launcher_margin);
+    (void)wl_layer_.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::on_demand);
     if (auto* region = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
         wl_region_add(region, 0, 0, geo.width, geo.height);
         wl_surface_set_opaque_region(surface, region);
@@ -1070,11 +940,8 @@ void lx::shell::launcher::close() {
     canvas_.free(); // ~1.9 MB at 420×560: an idle shell holds none of it
     canvas_.release_scale(); // before the wl_surface it extends
     (void)canvas_.take_rescale();
-    if (layer_)
-        zwlr_layer_surface_v1_destroy(static_cast<zwlr_layer_surface_v1*>(layer_));
-    layer_ = nullptr;
-    if (surface_)
-        wl_surface_destroy(static_cast<wl_surface*>(surface_));
+    wl_layer_.destroy();
+    wl_surface_.destroy();
     surface_ = nullptr;
     configured_ = false;
     had_keyboard_ = false;
@@ -1145,7 +1012,9 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
     user_ = user;
     model_.bind(&catalog);
 }
-bool lx::shell::launcher::open(int, int, int, void*) { return false; }
+void lx::shell::launcher::on_configure(lx::wayland::layer_surface&, const lx::wayland::layer_configure&) {}
+void lx::shell::launcher::on_closed(lx::wayland::layer_surface&) {}
+bool lx::shell::launcher::open(int, int, int, unsigned) { return false; }
 void lx::shell::launcher::close() {}
 void lx::shell::launcher::prepare(int, int, int, unsigned) {}
 void lx::shell::launcher::after_dispatch() {}

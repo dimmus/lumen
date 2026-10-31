@@ -182,10 +182,12 @@ lumen_add_module_library(lx.shell.policy modules/lx.shell.policy
     DEPENDS lx.foundation lx.wayland.protocols)
 lumen_add_module_library(lx.compositor modules/lx.compositor
     DEPENDS lx.wayland.server lx.gfx lx.text lx.scene lx.scheduler lx.input lx.drm lx.runtime lx.sync lx.trace lx.session lx.health lx.config)
-# lumen-shell talks libwayland-client directly (it moves onto lx.wayland.client in Phase 5): the
-# zlm_shell_v1, wlr-layer-shell and cursor-shape client glue comes from lumen-protocol-glue.
+# lumen-shell's connection, registry, outputs, seat and surfaces are lx.wayland.client's and its
+# loop is lx::runtime::event_loop (ADR-010 Phase 5). The extension globals it binds itself
+# (zlm_shell_v1, ext-workspace, ext-idle-notify, wlr-output-power, ext-background-effect) and
+# the requests on them come from lumen-protocol-glue.
 lumen_add_module_library(lx.shell modules/lx.shell
-    DEPENDS lx.shell.policy lx.text lx.trace lx.config)
+    DEPENDS lx.shell.policy lx.text lx.trace lx.config lx.wayland.client lx.runtime)
 lumen_link_platform_parts(lx.shell wayland_client xkb text systemd)
 if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
     target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
