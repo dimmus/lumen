@@ -222,7 +222,15 @@ private:
     void toggle_launcher();
     void open_launcher();
     void close_launcher();
-    void launch_entry(unsigned entry, unsigned serial);
+    /// `other_gpu`: the launcher menu's choice, the GPU the entry would not get by default.
+    void launch_entry(unsigned entry, unsigned serial, bool other_gpu = false);
+    /// A launcher row's menu (a right click, the Menu key): with a second GPU, GNOME's
+    /// "Launch using Discrete Graphics Card" (or "Integrated", for an entry that prefers
+    /// the non-default GPU).
+    void open_launcher_menu(unsigned entry, lx::rect2i anchor, unsigned serial);
+    /// The launcher menu closed without a launch: the launcher stays if the keyboard came
+    /// back to it (Escape, a click outside), else it closes as on any keyboard leave.
+    void launcher_menu_closed();
     void launch_terminal(unsigned serial);
     void begin_launch(std::unique_ptr<prepared_launch> p, unsigned serial, void* surface);
     /// An xdg-activation token for the input `serial` on `surface`, handed to `t`'s purpose
@@ -493,8 +501,15 @@ private:
     lx::rect2i tooltip_cell_{};
     /// What the open menu is for: a tray item's (its key), the history, a notification's
     /// further actions (its id); and on which output's panel.
-    enum class menu_kind : unsigned char { none, tray, history, actions };
+    enum class menu_kind : unsigned char { none, tray, history, actions, launcher };
     menu_kind menu_kind_ = menu_kind::none;
+    /// The launcher menu's entry and the catalog generation it belongs to.
+    unsigned launcher_menu_entry_ = 0;
+    unsigned launcher_menu_gen_ = 0;
+    /// Whether the launcher has the keyboard (a menu over it takes it for a while), and the
+    /// wl_callback* of the round trip after its menu closed that tells whether it came back.
+    bool launcher_kb_ = false;
+    void* launcher_refocus_ = nullptr;
     unsigned menu_key_ = 0;
     unsigned menu_output_ = 0;
     /// A tray menu asked for (its layout on the way): the item, the panel, the cell, the
@@ -777,14 +792,20 @@ struct lx::shell::shell_app::events {
     }
     static void kb_enter(void* data, wl_keyboard*, uint32_t, wl_surface* s, wl_array*) {
         auto& a = self(data);
-        if (s && s == a.launcher_.surface())
+        if (s && s == a.launcher_.surface()) {
+            a.launcher_kb_ = true;
             a.launcher_.keyboard_enter();
+        }
     }
     static void kb_leave(void* data, wl_keyboard*, uint32_t, wl_surface* s) {
         auto& a = self(data);
         a.set_timer(t_repeat, 0);
         a.repeat_code_ = 0;
         if (s && s == a.launcher_.surface()) {
+            a.launcher_kb_ = false;
+            // Its own menu took the keyboard: the launcher stays (`launcher_menu_closed`).
+            if (a.menu_kind_ == menu_kind::launcher)
+                return;
             a.launcher_.keyboard_leave();
             if (!a.launcher_.is_open())
                 a.set_apps_all(false);
@@ -1825,11 +1846,40 @@ void lx::shell::shell_app::open_launcher() {
 }
 
 void lx::shell::shell_app::close_launcher() {
+    // A menu over the launcher goes first: a popup does not outlive its parent.
+    if (menu_kind_ == menu_kind::launcher)
+        menu_.close();
     launcher_.close();
     set_apps_all(false);
     repeat_code_ = 0;
     set_timer(t_repeat, 0);
     set_timer(t_debounce, 0);
+}
+
+void lx::shell::shell_app::launcher_menu_closed() {
+    if (!launcher_.is_open() || launcher_kb_ || launcher_refocus_)
+        return;
+    // The compositor gives the keyboard back to the launcher when the menu goes (Escape, a
+    // click outside) unless something else took it (a window activated meanwhile). Its
+    // enter, if any, comes before the answer to a round trip sent now.
+    static constexpr wl_callback_listener k_refocus = {
+        .done =
+            [](void* data, wl_callback* cb, uint32_t) {
+                auto& a = *static_cast<shell_app*>(data);
+                wl_callback_destroy(cb);
+                a.launcher_refocus_ = nullptr;
+                if (a.launcher_.is_open() && !a.launcher_kb_ && a.menu_kind_ == menu_kind::none) {
+                    a.launcher_.keyboard_leave();
+                    if (!a.launcher_.is_open())
+                        a.set_apps_all(false);
+                }
+            },
+    };
+    auto* cb = wl_display_sync(static_cast<wl_display*>(display_));
+    if (!cb)
+        return;
+    wl_callback_add_listener(cb, &k_refocus, this);
+    launcher_refocus_ = cb;
 }
 
 void lx::shell::shell_app::toggle_launcher() {
@@ -1891,13 +1941,15 @@ void lx::shell::shell_app::on_outcome(const launch_outcome& o) {
         log_apps.log(lvl, "apps: launched {} as {}", o.id, o.unit);
 }
 
-void lx::shell::shell_app::launch_entry(unsigned entry, unsigned serial) {
+void lx::shell::shell_app::launch_entry(unsigned entry, unsigned serial, bool other_gpu) {
     const desktop_entry* e = catalog_.entry(entry);
     if (!e)
         return;
     const char* home = std::getenv("HOME");
     auto p = std::make_unique<prepared_launch>();
     const launch_failure f = prepare_entry_launch(*e, catalog_, home ? home : "/", *p);
+    if (other_gpu)
+        p->non_default_gpu = !p->non_default_gpu;
     if (f != launch_failure::none) {
         char id[128];
         std::snprintf(id, sizeof(id), "%.*s", static_cast<int>(e->id.size()), e->id.data());
@@ -2162,11 +2214,16 @@ int lx::shell::shell_app::run() {
                    },
                    [](void* user) {
                        auto& a = *static_cast<shell_app*>(user);
+                       if (a.menu_kind_ == menu_kind::launcher)
+                           a.menu_.close();
                        a.set_apps_all(false);
                        a.repeat_code_ = 0;
                        a.set_timer(t_repeat, 0);
                    },
                    this);
+    launcher_.set_menu_handler([](unsigned entry, lx::rect2i anchor, unsigned serial, void* user) {
+        static_cast<shell_app*>(user)->open_launcher_menu(entry, anchor, serial);
+    });
     // The visual bell (zlm v6) flashes over windows through overlay layer surfaces.
     bell_.init({.compositor = compositor_,
                 .shm = shm_,
@@ -2406,6 +2463,9 @@ void lx::shell::shell_app::teardown() {
         t.launch.reset();
     }
     stop_desktop_services();
+    if (launcher_refocus_)
+        wl_callback_destroy(static_cast<wl_callback*>(launcher_refocus_));
+    launcher_refocus_ = nullptr;
     launcher_.close();
     switcher_view_.close();
     bell_.destroy_all();

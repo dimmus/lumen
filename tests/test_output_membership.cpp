@@ -13,6 +13,7 @@ using lx::compositor::outputs_for_rect;
 using lx::compositor::preferred_buffer_scale;
 using lx::compositor::preferred_buffer_transform;
 using lx::compositor::primary_output_for_rect;
+using lx::compositor::render_scale_rule;
 
 namespace {
 /// Three outputs in a row, laid out in logical units: 1920x1080 at scale 1 (logical
@@ -139,6 +140,62 @@ LUMEN_TEST(headless_output_without_connectors) {
     LUMEN_CHECK(o.name[0] == 'H' && std::strcmp(o.name, "HEADLESS-1") == 0);
     LUMEN_CHECK(std::strcmp(o.identifier, "connector:HEADLESS-1") == 0);
     LUMEN_CHECK(m.count() == 1 && m.slot_of(m.nth(0)) == 0);
+}
+
+// Render scale (HiDPI supersampling): the hints follow it, the geometry does not; the most
+// specific rule wins, config.toml before the command line at the same specificity.
+LUMEN_TEST(render_scale_drives_the_hints_not_the_geometry) {
+    output_manager m;
+    LUMEN_CHECK(m.add_virtual("V-1", {0, 0, 1920, 1080}, 60000, 1.0) == 0);
+    LUMEN_CHECK(m.add_virtual("V-2", {1920, 0, 1920, 1080}, 60000, 1.5) == 1);
+    const lx::output_id a = m.nth(0), b = m.nth(1);
+    // Unset: follows the scale.
+    LUMEN_CHECK(m.state(a).render_scale == 0.0 && m.state(a).effective_render_scale() == 1.0);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 1u) == 120);
+    const unsigned gen = m.generation(), layout = m.layout_generation();
+    m.set_render_scale(a, 2.0);
+    // Hints move (generation), the layout does not.
+    LUMEN_CHECK(m.generation() == gen + 1 && m.layout_generation() == layout);
+    LUMEN_CHECK(m.logical_rect(a).width == 1920 && m.state(a).scale == 1.0);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 1u) == 240);
+    LUMEN_CHECK(preferred_buffer_scale(m, 1u) == 2);
+    // A cursor surface (render = false) keeps the output scale.
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 1u, false) == 120);
+    LUMEN_CHECK(preferred_buffer_scale(m, 1u, false) == 1);
+    // Across outputs the largest render scale wins: 2 over V-2's 1.5.
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 0b11u) == 240);
+    // Below the scale is honoured (undersampling), clamped to 0.25..4 and rounded to n/120.
+    m.set_render_scale(a, 0.5);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 1u) == 60);
+    LUMEN_CHECK(preferred_buffer_scale(m, 1u) == 1);
+    m.set_render_scale(a, 9.0);
+    LUMEN_CHECK(m.state(a).render_scale == 4.0);
+    m.set_render_scale(a, 1.3337);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 1u) == 160);
+    m.set_render_scale(a, 0.0);
+    LUMEN_CHECK(lx::compositor::preferred_scale_120(m, 1u) == 120);
+
+    // Precedence: --render-scale < [[output]] "*" < --output-render-scale NAME < [[output]] NAME.
+    m.set_default_render_scale(1.25);
+    LUMEN_CHECK(m.state(a).render_scale == 1.25 && m.state(b).render_scale == 1.25);
+    render_scale_rule star{};
+    std::snprintf(star.match, sizeof(star.match), "*");
+    star.scale = 2.0;
+    m.set_render_scale_rules(&star, 1);
+    LUMEN_CHECK(m.state(a).render_scale == 2.0 && m.state(b).render_scale == 2.0);
+    m.set_render_scale_override("V-2", 3.0);
+    LUMEN_CHECK(m.state(a).render_scale == 2.0 && m.state(b).render_scale == 3.0);
+    render_scale_rule rules[2]{star, {}};
+    std::snprintf(rules[1].match, sizeof(rules[1].match), "%s", m.state(b).identifier);
+    rules[1].scale = 1.75;
+    m.set_render_scale_rules(rules, 2);
+    LUMEN_CHECK(m.state(b).render_scale == 1.75);
+    // A new output takes its rule as it is added; a removed rule falls back.
+    LUMEN_CHECK(m.add_virtual("V-3", {3840, 0, 800, 600}, 60000, 1.0) == 2);
+    LUMEN_CHECK(m.state(m.nth(2)).render_scale == 2.0);
+    m.set_render_scale_rules(nullptr, 0);
+    LUMEN_CHECK(m.state(a).render_scale == 1.25 && m.state(b).render_scale == 3.0 &&
+                m.state(m.nth(2)).render_scale == 1.25);
 }
 
 int main(int argc, char** argv) { return lumen_test::run_all(argc, argv); }

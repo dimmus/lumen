@@ -564,7 +564,7 @@ two toplevels, 0 requests and 0 commits over 1 s). `test_app_window` measures it
 the window's process switched once in total over all its threads (the quit timer's wake;
 `/proc/self/task/*/status`), with 0 frame callbacks requested, 0 commits, 0 GPU submits, 0
 timer expirations and 0 socket reads, on the cpu, gl and (lavapipe) vulkan tiers
-(`tests/bench/baseline/iritur-client-{cpu,gl}.json`).
+(`tests/bench/baseline/iritur-168b7c-client-{cpu,gl}.json`).
 
 **Frame record.** With `surface_options::frame_records` (lx.app's windows; ≈ 30 KiB, off for
 the shell's surfaces) every committed frame leaves a `frame_record` in a 256-entry ring: start,

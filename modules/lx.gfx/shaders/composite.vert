@@ -12,7 +12,7 @@ layout(push_constant) uniform quad_push {
     vec4 tint;
     vec4 src_bounds;
     int transfer;
-    float radius;     // a rounded solid: the corner radius of `dst` (0: square)
+    int downsample;
     vec2 uv_dy;    // +y direction of the source basis
     vec4 solid;      // premultiplied, encoded colour of a solid draw
 } push;

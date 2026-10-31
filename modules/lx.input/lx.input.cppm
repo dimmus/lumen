@@ -6,6 +6,7 @@ module;
 #include <libinput.h>
 #include <libudev.h>
 #include <linux/input-event-codes.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -354,7 +355,32 @@ void lx::input::seat::note_key(unsigned evdev_keycode, bool pressed) {
 
 namespace {
 
+/// udev tagged `path` an accelerometer (ID_INPUT_ACCELEROMETER, 60-input-id.rules).
+[[nodiscard]] bool lx_is_accelerometer(const char* path) {
+    struct stat st{};
+    if (!path || ::stat(path, &st) != 0 || !S_ISCHR(st.st_mode))
+        return false;
+    udev* u = udev_new();
+    if (!u)
+        return false;
+    bool accelerometer = false;
+    if (udev_device* d = udev_device_new_from_devnum(u, 'c', st.st_rdev)) {
+        const char* v = udev_device_get_property_value(d, "ID_INPUT_ACCELEROMETER");
+        accelerometer = v && v[0] == '1';
+        udev_device_unref(d);
+    }
+    udev_unref(u);
+    return accelerometer;
+}
+
 int lx_open_restricted(const char* path, int flags, void* user) {
+    // libinput opens every evdev node of the seat and only then drops an accelerometer
+    // ("device is an accelerometer, ignoring"): it never drives one. Opening one can be
+    // slow in the kernel — HP's lis3lv02d DriveGuard sensor took 7.8 s, nearly all of a
+    // notebook's start-up, and a VT switch back or a resume reopens it — so it is refused
+    // before it is opened, as a node that went away. The seat ends up with the same devices.
+    if (lx_is_accelerometer(path))
+        return -ENODEV;
     auto* provider = static_cast<lx::input::device_provider*>(user);
     if (provider && provider->open_device)
         return provider->open_device(path, flags, provider->user);

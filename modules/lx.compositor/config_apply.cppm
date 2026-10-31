@@ -28,6 +28,7 @@ enum config_change : unsigned {
     cfg_shell = 1u << 6,    ///< a key the shell applies
     cfg_windows = 1u << 7,  ///< [windows], [tiling], [animations]
     cfg_workspaces = 1u << 8,
+    cfg_outputs = 1u << 9, ///< [[output]]
 };
 
 [[nodiscard]] unsigned diff_config(const lx::config::config_snapshot& a,

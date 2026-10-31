@@ -329,9 +329,14 @@ std::uint32_t lx::scheduler::frame_clocks::take_due(lx::runtime::clock_time now)
         // The following start: past the deadline this tick aims at, and never sooner than
         // one period after this one. When the repaint estimate exceeds a period (a slow
         // frame, a screenshot read back) `next_start` runs flat out (`now`): without the
-        // floor every tick would be due again a millisecond later.
+        // floor every tick would be due again a millisecond later. A clock its display's
+        // flips phase keeps a millisecond of slack for a timer that fires a little early;
+        // one that never flips (a virtual output, a compositor that could not take the
+        // display) has nothing else pacing it, so the slack would be its cadence — a period
+        // less a millisecond, 63.8 Hz for a 59.98 Hz mode.
+        const lx::runtime::clock_time slack = clocks_[s].has_presented() ? k_coalesce_ns : 0;
         const lx::runtime::clock_time floor =
-            next_start_[s] + clocks_[s].refresh_period() - k_coalesce_ns;
+            next_start_[s] + clocks_[s].refresh_period() - slack;
         auto next = clocks_[s].next_start(now + k_coalesce_ns);
         if (next < floor)
             next = floor;

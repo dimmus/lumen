@@ -8,8 +8,10 @@
 # software GL_RENDERER; `vulkan`: the Vulkan renderer, the same two stages — on a CPU device
 # such as lavapipe it runs, but the rows say "vulkan-software" and are stored only: never
 # compared, never a baseline), stores
-# the JSON under tests/bench/results/<hostname>-<driver>/<YYYYMMDD>-<sha>.json and compares
-# it with tests/bench/baseline/<hostname>-<driver>.json:
+# the JSON under tests/bench/results/<machine>-<driver>/<YYYYMMDD>-<sha>.json and compares
+# it with tests/bench/baseline/<machine>-<driver>.json, where <machine> is the hostname and a
+# digest of the CPU model and count (two hosts may share a name: the dev VM and a notebook
+# are both "iritur"); a baseline recorded on another CPU is never compared:
 #
 #   FAIL           a stage's p50 more than 25 % above the baseline's — and at least
 #                  ABS_FLOOR_US slower: a sub-microsecond stage jitters by more than 10 %
@@ -37,7 +39,7 @@
 #
 # Options:
 #   --backend B         the backend to measure: none (default), cpu, gl or vulkan; each has its own
-#                       baseline, tests/bench/baseline/<hostname>-<backend>.json
+#                       baseline, tests/bench/baseline/<machine>-<backend>.json
 #   --frames N          measured frames for every scenario (default: S1 600, S2 36000, S3 1800,
 #                       S4 1800 at the bench's 1 ms frame clock; S2 changes its clock every
 #                       60th frame, so 36000 is the 600 produced frames §8.1 takes a p95 over)
@@ -47,8 +49,8 @@
 #   --client            the client scenarios instead (S1 S5 S7 S9 S10, `lumen-ui-bench --client`):
 #                       lx.app windows against a headless compositor the bench starts, on the
 #                       tier --backend names (cpu by default; gl, vulkan); results under
-#                       tests/bench/results/<hostname>-client-<tier>/, baseline
-#                       tests/bench/baseline/<hostname>-client-<tier>.json
+#                       tests/bench/results/<machine>-client-<tier>/, baseline
+#                       tests/bench/baseline/<machine>-client-<tier>.json
 #   --short             with --client: the quick run (120 frames, 3 s idle, 3 start-ups, 10 resizes)
 #   --e2e               S9 on the real display (ADR-010 §8.5): lumen-compositor on the KMS console
 #                       at LUMEN_LOG=debug, `lumen-ui-bench --client --connect --scenario S9` on it,
@@ -473,7 +475,41 @@ if [[ "$build_type" != "Release" ]]; then
 fi
 preset="$(basename "$BUILD")"
 
-host="$(uname -n)"
+# The machine a baseline belongs to. A hostname is not one: the dev VM (2-core Pentium G6405)
+# and a notebook (4-core i7-5500U) are both "iritur", and the notebook was judged against the
+# VM's numbers. The key adds a digest of the CPU model and count, the fields every result
+# records under "host" (the bench reads the same /proc/cpuinfo line and sysconf).
+cpu_model="$(sed -n 's/^model name[[:space:]]*: //p' /proc/cpuinfo | head -1)"
+host="$(uname -n)-$(printf '%s|%s' "$cpu_model" "$(getconf _NPROCESSORS_ONLN)" | sha1sum | cut -c1-6)"
+# `same_machine NEW REF`: 0 when REF was recorded on the CPU model and count NEW was.
+same_machine() {
+  python3 -I - "$1" "$2" <<'PY2'
+import json
+import sys
+
+def host(path):
+    rows = [r for r in json.load(open(path)) if "skipped" not in r]
+    h = rows[0].get("host", {}) if rows else {}
+    return h.get("cpu"), h.get("cpus")
+
+new, ref = host(sys.argv[1]), host(sys.argv[2])
+if new != ref:
+    print(f"   recorded on {ref[0]} ({ref[1]} CPUs); this run: {new[0]} ({new[1]} CPUs)")
+    sys.exit(1)
+PY2
+}
+# Whether to compare against REF: a baseline of another machine is skipped (exit 1), an
+# explicit --compare file is compared with a note.
+machine_check() { # NEW REF
+  same_machine "$1" "$2" && return 0
+  if [[ -n "$compare" ]]; then
+    echo "NOTE: --compare ${2#"$ROOT"/} is another machine's: the numbers differ by host, not code"
+    return 0
+  fi
+  echo "== ${2#"$ROOT"/} belongs to another machine: not compared"
+  echo "   (--update-baseline records this machine's: ${baseline#"$ROOT"/})"
+  return 1
+}
 sha="$(git -C "$ROOT" rev-parse --short HEAD)"
 dirty=""
 if [[ -n "$(git -C "$ROOT" status --porcelain --untracked-files=no 2>/dev/null)" ]]; then
@@ -515,7 +551,7 @@ print(int(any(r.get("driver", "").endswith("-software") for r in json.load(open(
   ref="$baseline"
   [[ -n "$compare" ]] && ref="$compare"
   status=0
-  if [[ -f "$ref" ]]; then
+  if [[ -f "$ref" ]] && machine_check "$out" "$ref"; then
     echo
     echo "== compare against ${ref#"$ROOT"/}"
     # Client rows run through a compositor and the host's scheduler on both sides. On this VM
@@ -583,7 +619,7 @@ for f_ in fails:
 print(f"== {len(fails)} failure(s), {len(warns)} warning(s)")
 sys.exit(1 if fails else 0)
 PY
-  else
+  elif [[ ! -f "$ref" ]]; then
     echo
     echo "== no baseline at ${ref#"$ROOT"/}: nothing to compare (run with --update-baseline to create it)"
   fi
@@ -662,7 +698,7 @@ if [[ -n "$compare" ]]; then
 fi
 
 status=0
-if [[ -f "$ref" ]]; then
+if [[ -f "$ref" ]] && machine_check "$out" "$ref"; then
   echo
   echo "== compare against ${ref#"$ROOT"/}"
   python3 -I - "$out" "$ref" "$ABS_FLOOR_US" <<'PY' || status=$?
@@ -751,7 +787,7 @@ for f_ in fails:
 print(f"== {len(fails)} failure(s), {len(warns)} warning(s)")
 sys.exit(1 if fails else 0)
 PY
-else
+elif [[ ! -f "$ref" ]]; then
   echo
   echo "== no baseline at ${ref#"$ROOT"/}: nothing to compare (run with --update-baseline to create it)"
 fi

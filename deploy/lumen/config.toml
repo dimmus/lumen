@@ -58,6 +58,15 @@ scroll-factor = 1.0
 # name = "Logitech USB Receiver"
 # accel-speed = -0.3
 
+# Per output, by connector ("DP-2"), monitor ("make model serial") or "*" for every one.
+# Mode, scale, position and transform are wlr-randr's / kanshi's (outputs.toml), not here.
+# render-scale: the scale clients render at, sampled down to the output's (HiDPI
+# supersampling, as macOS does): 2 on a scale-1 monitor gives sharper text for 4x the
+# client pixels. 0.25 .. 4; unset follows the output scale.
+# [[output]]
+# name = "*"
+# render-scale = 2
+
 [cursor]
 theme = ""              # "" = $XCURSOR_THEME, else "default"
 size = 0                # logical pixels; 0 = $XCURSOR_SIZE, else 24

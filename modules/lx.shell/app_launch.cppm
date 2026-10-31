@@ -10,6 +10,7 @@ module;
 #include <stdint.h>
 #include <time.h>
 
+#include <dirent.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/random.h>
@@ -80,8 +81,9 @@ enum class launch_failure : unsigned char {
 
 /// The environment a launched app gets (§B.5): the shell's, minus DISPLAY, LUMEN_*,
 /// inherited activation tokens and per-service systemd variables; plus WAYLAND_DISPLAY,
-/// XDG_SESSION_TYPE=wayland, XDG_CURRENT_DESKTOP (kept, or Lumen) and the token as
-/// XDG_ACTIVATION_TOKEN and DESKTOP_STARTUP_ID.
+/// XDG_SESSION_TYPE=wayland, XDG_CURRENT_DESKTOP (kept, or Lumen), the token as
+/// XDG_ACTIVATION_TOKEN and DESKTOP_STARTUP_ID, and `extra` (NAME=VALUE, replacing the
+/// shell's value of the same name: the GPU offload variables).
 struct launch_env {
     std::vector<std::string> vars;
     std::vector<const char*> envp;
@@ -92,9 +94,41 @@ struct launch_env {
 struct launch_env_context {
     std::string_view wayland_display;
     std::string_view token;
+    std::span<const std::string> extra = {};
 };
 void build_launch_env(const char* const* environ, const launch_env_context& ctx,
                       launch_env& out);
+
+// ── Starting an app on another GPU ───────────────────────────────────────────
+//
+// An entry with PrefersNonDefaultGPU=true, or one the user starts with "Launch using
+// Discrete Graphics Card", gets the variables that select a GPU other than the default
+// (the boot VGA device, which drives the display and runs the compositor; only the app
+// moves). As GNOME Shell and KDE do: switcheroo-control's GPUs property, when the service
+// is on the system bus, names each GPU's variables (DRI_PRIME=pci-…, or the NVIDIA
+// driver's PRIME render offload variables); without it, DRI_PRIME=1, which Mesa's GL
+// drivers and its Vulkan device-select layer both honour. With one GPU nothing is set.
+
+/// One GPU as switcheroo-control describes it (an element of its GPUs property).
+struct switcheroo_gpu {
+    std::string name;
+    /// NAME, VALUE, NAME, VALUE, … (the Environment key's flat list).
+    std::vector<std::string> environment;
+    bool is_default = false;
+    bool discrete = false;
+};
+/// Reads a GPUs value (aa{sv}) at the current position of `msg` (sd_bus_message*): Name,
+/// Environment, Default and Discrete of each; other keys skipped. False when malformed.
+[[nodiscard]] bool read_switcheroo_gpus(void* msg, std::vector<switcheroo_gpu>& out);
+/// The render nodes (renderD*) in `dir` (/dev/dri): how many GPUs can render.
+[[nodiscard]] unsigned count_render_nodes(const char* dir);
+/// The NAME=VALUE variables that start an app on a non-default GPU, into `out`; false (and
+/// `out` empty) when there is none. `gpus` is switcheroo-control's answer, null without
+/// one: then more than one render node means DRI_PRIME=1. With an answer, it decides: two
+/// or more GPUs, the first non-default discrete one's Environment, else the first
+/// non-default one's (GNOME Shell's choice); DRI_PRIME=1 when none has an Environment.
+[[nodiscard]] bool choose_offload_env(const std::vector<switcheroo_gpu>* gpus,
+                                      unsigned render_nodes, std::vector<std::string>& out);
 
 /// `id` escaped for a unit name: every byte outside [A-Za-z0-9:_.] becomes \xNN ('-'
 /// included: it separates the name's parts). Returns the length written (NUL-terminated,
@@ -145,6 +179,9 @@ struct prepared_launch {
     /// The desktop file ("" for a raw command): the unit's SourcePath.
     char source_path[PATH_MAX]{};
     char workdir[PATH_MAX]{};
+    /// Start it on a non-default GPU (when there is one): the entry's PrefersNonDefaultGPU,
+    /// or the launcher's GPU menu item.
+    bool non_default_gpu = false;
 };
 
 /// Pre-launch checks and composition for an entry: Exec expanded, argv[0] resolved in
@@ -183,7 +220,8 @@ class app_launcher {
 public:
     using outcome_fn = void (*)(const launch_outcome& outcome, void* user);
     static constexpr unsigned k_max_pending = 16;
-    static constexpr unsigned k_max_poll = 1 + k_max_pending;
+    /// The user bus (unless shared), the system bus (GPU offload), the pending pipes.
+    static constexpr unsigned k_max_poll = 2 + k_max_pending;
     /// Scope path: the longest a launched process waits before execve for systemd to move
     /// it into its scope. Past it the app starts anyway (moved whenever systemd gets to it).
     static constexpr std::uint64_t k_scope_hold_us = 1'000'000;
@@ -227,6 +265,22 @@ public:
     [[nodiscard]] systemd_launch_mode systemd_mode() const { return mode_; }
     /// Launches whose outcome is not known yet.
     [[nodiscard]] unsigned pending() const;
+
+    /// Counts the GPUs (render nodes in /dev/dri) and, with more than one, asks
+    /// switcheroo-control on the system bus for their variables — without waiting:
+    /// DRI_PRIME=1 until it answers, and for good when it is not there. Its GPUs are
+    /// followed while the shell runs (PropertiesChanged, the service starting or going).
+    /// One GPU: nothing is opened. Called once, after the first panel frame.
+    void probe_gpus();
+    /// Tests: `render_nodes` as given, and `system_bus` (sd_bus*, referenced; null: none)
+    /// in place of the system bus.
+    void probe_gpus(unsigned render_nodes, void* system_bus);
+    /// Whether a launch can go to a non-default GPU (the launcher's menu item).
+    [[nodiscard]] bool offload_available() const { return !offload_env_.empty(); }
+    /// The variables a `non_default_gpu` launch gets (empty: none).
+    [[nodiscard]] const std::vector<std::string>& offload_env() const { return offload_env_; }
+    /// Whether switcheroo-control's answer is the one in use.
+    [[nodiscard]] bool offload_from_switcheroo() const { return have_switcheroo_; }
 
     struct events;
 
@@ -275,6 +329,16 @@ private:
     static void release_hold(pending_pipe& pp);
     /// Ends scope holds and NoReply graces that are due.
     void run_deadlines();
+    /// The extra launch variables of `p`: the offload ones when it asks for them.
+    [[nodiscard]] std::span<const std::string> gpu_env(const prepared_launch& p) const {
+        return p.non_default_gpu ? std::span<const std::string>{offload_env_}
+                                 : std::span<const std::string>{};
+    }
+    /// Asks switcheroo-control for its GPUs (a reply replaces the offload variables).
+    void query_switcheroo();
+    /// switcheroo-control's GPUs, or null without it: the offload variables follow.
+    void set_switcheroo(const std::vector<switcheroo_gpu>* gpus);
+    void close_system_bus();
     void systemd_gone(const char* why);
     void report(const launch_outcome& o);
     void finish_pipe(pending_pipe& pp);
@@ -291,6 +355,15 @@ private:
     bool no_systemd_ = false;
     bool told_fallback_ = false;
     systemd_launch_mode mode_ = systemd_launch_mode::service;
+    /// GPU offload: the render nodes counted, the system bus (only with two or more) and
+    /// its slots, the variables a non-default-GPU launch gets.
+    unsigned render_nodes_ = 0;
+    void* system_bus_ = nullptr; // sd_bus*
+    void* gpus_slot_ = nullptr;  // sd_bus_slot*: the Get call in flight
+    void* gpus_changed_slot_ = nullptr;
+    void* switcheroo_owner_slot_ = nullptr;
+    bool have_switcheroo_ = false;
+    std::vector<std::string> offload_env_{};
     pending_unit units_[k_max_pending]{};
     pending_pipe pipes_[k_max_pending]{};
 };
@@ -402,11 +475,17 @@ void lx::shell::build_launch_env(const char* const* env, const launch_env_contex
                                  launch_env& out) {
     out.vars.clear();
     out.envp.clear();
+    auto overridden = [&](std::string_view name) {
+        for (const std::string& x : ctx.extra)
+            if (name_of(x) == name)
+                return true;
+        return false;
+    };
     bool have_desktop = false;
     for (const char* const* e = env; e && *e; ++e) {
         const std::string_view kv{*e};
         const std::string_view name = name_of(kv);
-        if (name.size() == kv.size() || name.empty() || dropped(name))
+        if (name.size() == kv.size() || name.empty() || dropped(name) || overridden(name))
             continue;
         if (name == "XDG_CURRENT_DESKTOP")
             have_desktop = kv.size() > name.size() + 1;
@@ -424,10 +503,58 @@ void lx::shell::build_launch_env(const char* const* env, const launch_env_contex
         out.vars.emplace_back(std::string("XDG_ACTIVATION_TOKEN=").append(ctx.token));
         out.vars.emplace_back(std::string("DESKTOP_STARTUP_ID=").append(ctx.token));
     }
+    // The GPU variables last; a name the shell set is replaced, the session's own are not.
+    for (std::size_t i = 0; i < ctx.extra.size(); ++i) {
+        const std::string_view name = name_of(ctx.extra[i]);
+        bool repeated = false;
+        for (std::size_t j = 0; j < i; ++j)
+            repeated = repeated || name_of(ctx.extra[j]) == name;
+        if (!name.empty() && name.size() < ctx.extra[i].size() && !dropped(name) && !repeated)
+            out.vars.push_back(ctx.extra[i]);
+    }
     out.envp.reserve(out.vars.size() + 1);
     for (const std::string& v : out.vars)
         out.envp.push_back(v.c_str());
     out.envp.push_back(nullptr);
+}
+
+// ── GPU offload ──
+
+unsigned lx::shell::count_render_nodes(const char* dir) {
+    DIR* d = opendir(dir);
+    if (!d)
+        return 0;
+    unsigned n = 0;
+    while (const dirent* e = readdir(d))
+        n += std::string_view{e->d_name}.starts_with("renderD") ? 1u : 0u;
+    closedir(d);
+    return n;
+}
+
+bool lx::shell::choose_offload_env(const std::vector<switcheroo_gpu>* gpus, unsigned render_nodes,
+                                   std::vector<std::string>& out) {
+    out.clear();
+    if (gpus) {
+        if (gpus->size() < 2)
+            return false;
+        const switcheroo_gpu* pick = nullptr;
+        for (const switcheroo_gpu& g : *gpus)
+            if (!g.is_default && g.environment.size() >= 2 &&
+                (!pick || (g.discrete && !pick->discrete)))
+                pick = &g;
+        if (pick) {
+            for (std::size_t i = 0; i + 1 < pick->environment.size(); i += 2)
+                if (!pick->environment[i].empty() &&
+                    pick->environment[i].find('=') == std::string::npos)
+                    out.push_back(pick->environment[i] + '=' + pick->environment[i + 1]);
+            if (!out.empty())
+                return true;
+        }
+    } else if (render_nodes < 2) {
+        return false;
+    }
+    out.emplace_back("DRI_PRIME=1");
+    return true;
 }
 
 // ── Unit names ──
@@ -557,6 +684,7 @@ lx::shell::launch_failure lx::shell::prepare_terminal_launch(const app_catalog& 
     copy_str(out.name, sizeof(out.name), out.id);
     out.source_path[0] = '\0';
     set_workdir({}, home, out.workdir);
+    out.non_default_gpu = false;
     return launch_failure::none;
 }
 
@@ -571,6 +699,7 @@ lx::shell::launch_failure lx::shell::prepare_entry_launch(const desktop_entry& e
     copy_str(out.name, sizeof(out.name), e.name);
     copy_str(out.source_path, sizeof(out.source_path), e.file);
     set_workdir(e.path, home, out.workdir);
+    out.non_default_gpu = e.prefers_non_default_gpu;
     const std::string_view path_env = cat.config().path_env;
     if (!e.terminal) {
         if (!resolve_program(app.argv[0], path_env, out.program))
@@ -605,6 +734,26 @@ lx::shell::launch_failure lx::shell::prepare_entry_launch(const desktop_entry& e
 }
 
 // ── Launcher ──
+
+void lx::shell::app_launcher::set_switcheroo(const std::vector<switcheroo_gpu>* gpus) {
+    const bool had = have_switcheroo_;
+    std::vector<std::string> before = std::move(offload_env_);
+    have_switcheroo_ = gpus != nullptr;
+    (void)choose_offload_env(gpus, render_nodes_, offload_env_);
+    if (offload_env_ == before && had == have_switcheroo_)
+        return;
+    const unsigned count = gpus ? static_cast<unsigned>(gpus->size()) : render_nodes_;
+    if (offload_env_.empty()) {
+        if (count > 1 || !before.empty())
+            log_apps.info("apps: {} GPU(s): no other GPU to start apps on", count);
+        return;
+    }
+    std::string vars;
+    for (const std::string& v : offload_env_)
+        vars.append(vars.empty() ? "" : " ").append(v);
+    log_apps.info("apps: {} GPUs: apps that prefer the non-default one get {} ({})", count, vars,
+                  have_switcheroo_ ? "switcheroo-control" : "no switcheroo-control");
+}
 
 void lx::shell::app_launcher::configure_from_env() {
     const char* m = std::getenv("LUMEN_SHELL_LAUNCH");
@@ -673,6 +822,9 @@ unsigned lx::shell::app_launcher::pending() const {
 
 void lx::shell::app_launcher::start(const prepared_launch& p, std::string_view token,
                                     std::string_view display) {
+    if (p.non_default_gpu && !offload_env_.empty())
+        log_apps.info("apps: {} on the non-default GPU ({}{})", p.id, offload_env_.front(),
+                      offload_env_.size() > 1 ? ", …" : "");
     if (method_ != launch_method::fork && !no_systemd_ && open_bus()) {
         const systemd_launch_mode mode =
             method_ == launch_method::scope ? systemd_launch_mode::scope : mode_;
@@ -735,7 +887,7 @@ void lx::shell::app_launcher::start_fork(const prepared_launch& p, std::string_v
         }
     // Everything the children use is prepared here: after fork they only make syscalls.
     launch_env env;
-    build_launch_env(environ, {display, token}, env);
+    build_launch_env(environ, {display, token, gpu_env(p)}, env);
     int fds[2];
     if (!slot || pipe2(fds, O_CLOEXEC) != 0) {
         o.failure = launch_failure::spawn_error;
@@ -869,8 +1021,10 @@ void lx::shell::app_launcher::run_deadlines() {
 unsigned lx::shell::app_launcher::poll_fds(pollfd* out, unsigned cap, int& timeout_ms) const {
     unsigned n = 0;
 #if defined(LUMEN_HAS_LOGIND)
-    if (bus_ && !shared_bus_ && n < cap) {
-        auto* bus = static_cast<sd_bus*>(bus_);
+    auto add_bus = [&](void* b) {
+        if (!b || n >= cap)
+            return;
+        auto* bus = static_cast<sd_bus*>(b);
         const int fd = sd_bus_get_fd(bus);
         const int ev = sd_bus_get_events(bus);
         if (fd >= 0 && ev >= 0) {
@@ -887,7 +1041,10 @@ unsigned lx::shell::app_launcher::poll_fds(pollfd* out, unsigned cap, int& timeo
                     timeout_ms = t;
             }
         }
-    }
+    };
+    if (!shared_bus_)
+        add_bus(bus_);
+    add_bus(system_bus_);
 #endif
     std::uint64_t next = UINT64_MAX;
     for (const auto& pp : pipes_)
@@ -921,6 +1078,21 @@ void lx::shell::app_launcher::dispatch(std::span<const pollfd> fds) {
                 if (r < 0) {
                     log_apps.warn("apps: user bus failed: {}", std::strerror(-r));
                     bus_lost();
+                }
+                break;
+            }
+        }
+    }
+    if (system_bus_) {
+        auto* bus = static_cast<sd_bus*>(system_bus_);
+        for (int guard = 0; guard < 64; ++guard) {
+            const int r = sd_bus_process(bus, nullptr);
+            if (r <= 0) {
+                if (r < 0) {
+                    // Without the system bus switcheroo-control's answer cannot be followed:
+                    // what it said last stays, as GNOME's cached proxy property would.
+                    log_apps.warn("apps: system bus failed: {}", std::strerror(-r));
+                    close_system_bus();
                 }
                 break;
             }
@@ -1113,7 +1285,202 @@ struct lx::shell::app_launcher::events {
         }
         return 0;
     }
+
+    // ── switcheroo-control (system bus) ──
+
+    static int gpus_read(sd_bus_message* m, void* user, sd_bus_error*) {
+        auto* l = static_cast<app_launcher*>(user);
+        l->gpus_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(l->gpus_slot_));
+        if (const sd_bus_error* err = sd_bus_message_get_error(m)) {
+            // Not installed or not running (ServiceUnknown, NameHasNoOwner): DRI_PRIME.
+            if (!l->have_switcheroo_ && !l->offload_env_.empty())
+                log_apps.info("apps: {} GPUs, no switcheroo-control ({}): apps that prefer the "
+                              "non-default one get {}",
+                              l->render_nodes_, err->name ? err->name : "?",
+                              l->offload_env_.front());
+            l->set_switcheroo(nullptr);
+            return 0;
+        }
+        std::vector<switcheroo_gpu> gpus;
+        if (sd_bus_message_enter_container(m, 'v', "aa{sv}") <= 0 ||
+            !read_switcheroo_gpus(m, gpus)) {
+            log_apps.warn("apps: switcheroo-control's GPUs are not aa{{sv}}: using DRI_PRIME");
+            l->set_switcheroo(nullptr);
+            return 0;
+        }
+        l->set_switcheroo(&gpus);
+        return 0;
+    }
+
+    static int gpus_changed(sd_bus_message* m, void* user, sd_bus_error*) {
+        // PropertiesChanged(s interface, a{sv} changed, as invalidated): asked again when
+        // GPUs is among either (a GPU came or went).
+        const char* iface = nullptr;
+        if (sd_bus_message_read(m, "s", &iface) < 0)
+            return 0;
+        bool gpus = false;
+        if (sd_bus_message_enter_container(m, 'a', "{sv}") > 0) {
+            while (sd_bus_message_enter_container(m, 'e', "sv") > 0) {
+                const char* key = nullptr;
+                if (sd_bus_message_read(m, "s", &key) < 0 || sd_bus_message_skip(m, "v") < 0)
+                    return 0;
+                gpus = gpus || std::strcmp(key, "GPUs") == 0;
+                (void)sd_bus_message_exit_container(m);
+            }
+            (void)sd_bus_message_exit_container(m);
+        }
+        const char* name = nullptr;
+        if (sd_bus_message_enter_container(m, 'a', "s") > 0) {
+            while (sd_bus_message_read(m, "s", &name) > 0)
+                gpus = gpus || std::strcmp(name, "GPUs") == 0;
+            (void)sd_bus_message_exit_container(m);
+        }
+        if (gpus)
+            static_cast<app_launcher*>(user)->query_switcheroo();
+        return 0;
+    }
+
+    static int switcheroo_owner(sd_bus_message* m, void* user, sd_bus_error*) {
+        // NameOwnerChanged(name, old, new) for net.hadess.SwitcherooControl only (arg0).
+        const char *name = nullptr, *before = nullptr, *after = nullptr;
+        if (sd_bus_message_read(m, "sss", &name, &before, &after) < 0)
+            return 0;
+        auto* l = static_cast<app_launcher*>(user);
+        if (after && *after)
+            l->query_switcheroo();
+        else
+            l->set_switcheroo(nullptr);
+        return 0;
+    }
 };
+
+bool lx::shell::read_switcheroo_gpus(void* msg, std::vector<switcheroo_gpu>& out) {
+    static constexpr std::size_t k_max_gpus = 16;
+    auto* m = static_cast<sd_bus_message*>(msg);
+    out.clear();
+    if (sd_bus_message_enter_container(m, 'a', "a{sv}") <= 0)
+        return false;
+    for (;;) {
+        int r = sd_bus_message_enter_container(m, 'a', "{sv}");
+        if (r < 0)
+            return false;
+        if (r == 0)
+            break;
+        switcheroo_gpu g;
+        while ((r = sd_bus_message_enter_container(m, 'e', "sv")) > 0) {
+            const char* key = nullptr;
+            if (sd_bus_message_read(m, "s", &key) < 0)
+                return false;
+            const std::string_view k{key};
+            const char* type = nullptr;
+            if (sd_bus_message_peek_type(m, nullptr, &type) < 0 || !type)
+                return false;
+            const std::string_view t{type};
+            if (k == "Name" && t == "s") {
+                const char* v = nullptr;
+                if (sd_bus_message_read(m, "v", "s", &v) < 0)
+                    return false;
+                g.name = v;
+            } else if ((k == "Default" || k == "Discrete") && t == "b") {
+                int v = 0;
+                if (sd_bus_message_read(m, "v", "b", &v) < 0)
+                    return false;
+                (k == "Default" ? g.is_default : g.discrete) = v != 0;
+            } else if (k == "Environment" && t == "as") {
+                if (sd_bus_message_enter_container(m, 'v', "as") <= 0 ||
+                    sd_bus_message_enter_container(m, 'a', "s") <= 0)
+                    return false;
+                const char* v = nullptr;
+                while ((r = sd_bus_message_read(m, "s", &v)) > 0)
+                    if (g.environment.size() < 64)
+                        g.environment.emplace_back(v);
+                if (r < 0 || sd_bus_message_exit_container(m) < 0 ||
+                    sd_bus_message_exit_container(m) < 0)
+                    return false;
+            } else if (sd_bus_message_skip(m, "v") < 0) {
+                return false;
+            }
+            if (sd_bus_message_exit_container(m) < 0)
+                return false;
+        }
+        if (r < 0 || sd_bus_message_exit_container(m) < 0)
+            return false;
+        if (out.size() < k_max_gpus)
+            out.push_back(std::move(g));
+    }
+    return sd_bus_message_exit_container(m) >= 0;
+}
+
+void lx::shell::app_launcher::probe_gpus() {
+    const unsigned nodes = count_render_nodes("/dev/dri");
+    if (nodes < 2) {
+        probe_gpus(nodes, nullptr);
+        log_apps.debug("apps: {} render node(s): no GPU to offload to", nodes);
+        return;
+    }
+    sd_bus* bus = nullptr;
+    if (const int r = sd_bus_open_system_with_description(&bus, "lumen-shell-gpu"); r < 0) {
+        log_apps.info("apps: {} GPUs, no system bus ({}): DRI_PRIME=1 for the non-default one",
+                      nodes, std::strerror(-r));
+        probe_gpus(nodes, nullptr);
+        return;
+    }
+    probe_gpus(nodes, bus);
+    sd_bus_unref(bus); // probe_gpus took its own reference
+}
+
+void lx::shell::app_launcher::probe_gpus(unsigned render_nodes, void* system_bus) {
+    close_system_bus();
+    render_nodes_ = render_nodes;
+    if (!system_bus || render_nodes < 2) {
+        set_switcheroo(nullptr);
+        return;
+    }
+    // Until switcheroo-control answers (or when it turns out not to be there): DRI_PRIME=1.
+    have_switcheroo_ = false;
+    (void)choose_offload_env(nullptr, render_nodes, offload_env_);
+    auto* bus = sd_bus_ref(static_cast<sd_bus*>(system_bus));
+    system_bus_ = bus;
+    // Matched before asking, so a change between the answer and the match is not missed.
+    // The rules name switcheroo alone: the shell wakes for nothing else on the system bus.
+    sd_bus_slot* slot = nullptr;
+    if (sd_bus_add_match_async(bus, &slot,
+                               "type='signal',sender='net.hadess.SwitcherooControl',"
+                               "path='/net/hadess/SwitcherooControl',"
+                               "interface='org.freedesktop.DBus.Properties',"
+                               "member='PropertiesChanged',arg0='net.hadess.SwitcherooControl'",
+                               events::gpus_changed, nullptr, this) >= 0)
+        gpus_changed_slot_ = slot;
+    slot = nullptr;
+    if (sd_bus_add_match_async(bus, &slot,
+                               "type='signal',sender='org.freedesktop.DBus',"
+                               "path='/org/freedesktop/DBus',interface='org.freedesktop.DBus',"
+                               "member='NameOwnerChanged',arg0='net.hadess.SwitcherooControl'",
+                               events::switcheroo_owner, nullptr, this) >= 0)
+        switcheroo_owner_slot_ = slot;
+    query_switcheroo();
+}
+
+void lx::shell::app_launcher::query_switcheroo() {
+    if (!system_bus_)
+        return;
+    gpus_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(gpus_slot_));
+    sd_bus_slot* slot = nullptr;
+    if (sd_bus_call_method_async(static_cast<sd_bus*>(system_bus_), &slot,
+                                 "net.hadess.SwitcherooControl", "/net/hadess/SwitcherooControl",
+                                 "org.freedesktop.DBus.Properties", "Get", events::gpus_read, this,
+                                 "ss", "net.hadess.SwitcherooControl", "GPUs") >= 0)
+        gpus_slot_ = slot;
+}
+
+void lx::shell::app_launcher::close_system_bus() {
+    gpus_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(gpus_slot_));
+    gpus_changed_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(gpus_changed_slot_));
+    switcheroo_owner_slot_ = sd_bus_slot_unref(static_cast<sd_bus_slot*>(switcheroo_owner_slot_));
+    if (system_bus_)
+        sd_bus_flush_close_unref(static_cast<sd_bus*>(system_bus_));
+    system_bus_ = nullptr;
+}
 
 bool lx::shell::app_launcher::open_bus() {
     if (bus_)
@@ -1173,7 +1540,7 @@ bool lx::shell::app_launcher::start_unit(const prepared_launch& p, std::string_v
     (void)make_unit_name(p.id, rnd, unit);
 
     launch_env env;
-    build_launch_env(environ, {display, token}, env);
+    build_launch_env(environ, {display, token, gpu_env(p)}, env);
     auto* bus = static_cast<sd_bus*>(bus_);
     sd_bus_message* m = nullptr;
     int r = sd_bus_message_new_method_call(bus, &m, "org.freedesktop.systemd1",
@@ -1320,6 +1687,7 @@ lx::shell::app_launcher::~app_launcher() {
         sd_bus_slot_unref(static_cast<sd_bus_slot*>(sub_slot_));
     if (version_slot_)
         sd_bus_slot_unref(static_cast<sd_bus_slot*>(version_slot_));
+    close_system_bus();
     if (bus_ && shared_bus_)
         sd_bus_unref(static_cast<sd_bus*>(bus_));
     else if (bus_)
@@ -1377,6 +1745,19 @@ bool lx::shell::app_launcher::start_unit(const prepared_launch&, std::string_vie
     return open_bus();
 }
 void lx::shell::app_launcher::register_scope(pending_pipe& pp, int) { release_hold(pp); }
+bool lx::shell::read_switcheroo_gpus(void*, std::vector<switcheroo_gpu>& out) {
+    out.clear();
+    return false;
+}
+void lx::shell::app_launcher::probe_gpus() {
+    probe_gpus(count_render_nodes("/dev/dri"), nullptr);
+}
+void lx::shell::app_launcher::probe_gpus(unsigned render_nodes, void*) {
+    render_nodes_ = render_nodes;
+    set_switcheroo(nullptr);
+}
+void lx::shell::app_launcher::query_switcheroo() {}
+void lx::shell::app_launcher::close_system_bus() {}
 lx::shell::app_launcher::~app_launcher() {
     for (auto& pp : pipes_) {
         release_hold(pp);

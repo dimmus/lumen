@@ -149,6 +149,26 @@ LUMEN_TEST(booleans_hidden_and_nodisplay) {
     LUMEN_CHECK(e.listed());
 }
 
+LUMEN_TEST(prefers_non_default_gpu_and_the_kde_key) {
+    auto e = parse("[Desktop Entry]\nType=Application\nName=n\nExec=a\n");
+    LUMEN_CHECK(e.listed() && !e.prefers_non_default_gpu);
+    e = parse("[Desktop Entry]\nType=Application\nName=n\nExec=a\nPrefersNonDefaultGPU=true\n");
+    LUMEN_CHECK(e.listed() && e.prefers_non_default_gpu);
+    e = parse("[Desktop Entry]\nType=Application\nName=n\nExec=a\nPrefersNonDefaultGPU=false\n");
+    LUMEN_CHECK(!e.prefers_non_default_gpu);
+    e = parse("[Desktop Entry]\nType=Application\nName=n\nExec=a\nPrefersNonDefaultGPU=1\n");
+    LUMEN_CHECK(!e.prefers_non_default_gpu); // only "true" is true
+    e = parse("[Desktop Entry]\nType=Application\nName=n\nExec=a\nX-KDE-RunOnDiscreteGpu=true\n");
+    LUMEN_CHECK(e.prefers_non_default_gpu);
+    // Either key is enough; an action group's copy of it is not the entry's.
+    e = parse("[Desktop Entry]\nType=Application\nName=n\nExec=a\nPrefersNonDefaultGPU=false\n"
+              "X-KDE-RunOnDiscreteGpu=true\n");
+    LUMEN_CHECK(e.prefers_non_default_gpu);
+    e = parse("[Desktop Entry]\nType=Application\nName=n\nExec=a\nActions=x;\n"
+              "[Desktop Action x]\nName=x\nExec=b\nPrefersNonDefaultGPU=true\n");
+    LUMEN_CHECK(e.listed() && !e.prefers_non_default_gpu);
+}
+
 LUMEN_TEST(only_show_in_and_not_show_in_against_several_desktops) {
     const env two; // GNOME:Lumen
     auto e = parse("[Desktop Entry]\nType=Application\nName=n\nExec=a\nOnlyShowIn=KDE;Lumen;\n", two);

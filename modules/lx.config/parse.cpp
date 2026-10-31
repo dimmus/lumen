@@ -25,7 +25,7 @@ namespace lx::config {
 
 namespace {
 
-enum class section_kind : unsigned char { top, generic, pointer, device, bindings, unknown };
+enum class section_kind : unsigned char { top, generic, pointer, device, output, bindings, unknown };
 
 struct user_binding {
     binding b{};
@@ -58,6 +58,8 @@ struct parse_state {
     unsigned ptr_kind = 0;
     bool device_open = false;
     device_override device{};
+    bool output_open = false;
+    output_override output{};
     inline_state in{};
     std::inplace_vector<user_binding, k_max_bindings>* user = nullptr;
     /// Combinations bound in this layer (duplicates are warned).
@@ -363,6 +365,64 @@ void finish_device(parse_state& st) {
     st.out->devices.push_back(st.device);
 }
 
+// ── Outputs ──
+
+void finish_output(parse_state& st) {
+    if (!st.output_open)
+        return;
+    st.output_open = false;
+    if (!st.output.name[0]) {
+        st.diag->add(severity::error, st.layer, st.output.line, "output",
+                     "an [[output]] needs a name (a connector, a monitor identifier or \"*\"); "
+                     "ignored");
+        return;
+    }
+    for (output_override& o : st.out->outputs) {
+        if (std::strcmp(o.name, st.output.name) != 0)
+            continue;
+        // The same output in another layer (or twice): its keys over the earlier ones.
+        if (st.output.render_scale > 0.0)
+            o.render_scale = st.output.render_scale;
+        o.layer = st.output.layer;
+        o.line = st.output.line;
+        return;
+    }
+    if (st.out->outputs.size() == k_max_outputs) {
+        st.diag->addf(severity::error, st.layer, st.output.line, "output",
+                      "more than {} [[output]] entries; \"{}\" ignored", k_max_outputs,
+                      st.output.name);
+        return;
+    }
+    st.out->outputs.push_back(st.output);
+}
+
+void on_output(parse_state& st, const char* key, const toml::value& v) {
+    if (std::strcmp(key, "name") == 0) {
+        if (v.type != toml::value::kind::string || !*v.str ||
+            std::strlen(v.str) >= sizeof(st.output.name)) {
+            st.diag->add(severity::error, st.layer, st.line, "output.name",
+                         "must be a connector name (\"DP-2\"), a monitor identifier "
+                         "(\"make model serial\") or \"*\"");
+            return;
+        }
+        std::snprintf(st.output.name, sizeof(st.output.name), "%s", v.str);
+        return;
+    }
+    if (std::strcmp(key, "render-scale") == 0) {
+        const field_ref f{value_kind::number, 0.25, 4.0, nullptr, 0, 0};
+        double scale = 0.0;
+        char why[160];
+        if (store_value(f, v, &scale, why, sizeof(why))) {
+            st.output.render_scale = scale;
+            return;
+        }
+        st.diag->addf(severity::error, st.layer, st.line, "output.render-scale",
+                      "{}; the output scale is used", why);
+        return;
+    }
+    unknown_key(st, key, edit_distance(key, "render-scale", 2) <= 2 ? "render-scale" : nullptr);
+}
+
 // ── Bindings ──
 
 void add_binding(parse_state& st, const char* key_text, unsigned line, const char* action_text,
@@ -494,6 +554,7 @@ bool on_table(void* user, const char* name, bool array, toml::parse_error& err) 
     auto& st = *static_cast<parse_state*>(user);
     st.line = err.line;
     finish_device(st);
+    finish_output(st);
     st.ptr = nullptr;
     std::snprintf(st.section, sizeof(st.section), "%s", name);
     const std::string_view n{name};
@@ -506,6 +567,14 @@ bool on_table(void* user, const char* name, bool array, toml::parse_error& err) 
             st.device.line = err.line;
             return true;
         }
+        if (n == "output") {
+            st.kind = section_kind::output;
+            st.output_open = true;
+            st.output = output_override{};
+            st.output.layer = st.layer;
+            st.output.line = err.line;
+            return true;
+        }
         st.kind = section_kind::unknown;
         st.diag->addf(severity::warning, st.layer, err.line, name,
                       "[[{}]] is not a known array of tables; its keys are ignored", name);
@@ -515,6 +584,12 @@ bool on_table(void* user, const char* name, bool array, toml::parse_error& err) 
         st.kind = section_kind::unknown;
         st.diag->add(severity::error, st.layer, err.line, name,
                      "per-device settings are [[input.device]] (an array of tables); ignored");
+        return true;
+    }
+    if (n == "output") {
+        st.kind = section_kind::unknown;
+        st.diag->add(severity::error, st.layer, err.line, name,
+                     "per-output settings are [[output]] (an array of tables); ignored");
         return true;
     }
     if (n == "input.touchpad" || n == "input.mouse" || n == "input.trackpoint") {
@@ -710,6 +785,7 @@ bool on_key_value(void* user, const char* key, const toml::value& v, toml::parse
         st.ptr_name = "device";
         on_pointer(st, st.device.settings, k_pointer_fields_all, key, v, nullptr);
         return true;
+    case section_kind::output: on_output(st, key, v); return true;
     case section_kind::bindings:
         if (v.type != toml::value::kind::string) {
             char fk[96];
@@ -846,6 +922,7 @@ bool parse_config(const config_text& text, config_snapshot& out, diagnostics& di
             return false;
         }
         finish_device(st);
+        finish_output(st);
     }
     // The bindings: the defaults (unless turned off), then every file's over them.
     if (!cfg->default_bindings)

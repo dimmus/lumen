@@ -116,7 +116,8 @@ unsigned launcher_diff(const launcher_layout& from, const launcher_layout& to, l
 
 // ── Launcher model (pure) ─────────────────────────────────────────────────────
 
-enum class launcher_key_result : unsigned char { ignored, changed, launch, close };
+/// `menu`: the selected application's menu (the Menu key, Shift+F10).
+enum class launcher_key_result : unsigned char { ignored, changed, launch, close, menu };
 
 /// Query, matches, selection and scroll. Keys are xkb keysyms plus the UTF-8 they produce.
 class launcher_model {
@@ -224,6 +225,9 @@ public:
     using launch_fn = void (*)(unsigned entry, unsigned serial, void* user);
     /// The launcher closed by itself (Escape, keyboard leave, the compositor).
     using closed_fn = void (*)(void* user);
+    /// Entry `entry`'s menu is asked for (a right click on its row, the Menu key), to open
+    /// under `anchor` (the row, in the launcher's surface); `serial` is the input event.
+    using menu_fn = void (*)(unsigned entry, lx::rect2i anchor, unsigned serial, void* user);
 
     void init(launcher_globals g, app_catalog& catalog, launch_fn on_launch, closed_fn on_closed,
               void* user);
@@ -238,6 +242,10 @@ public:
     void prepare(int output_w, int output_h, int panel_h, unsigned scale120);
     [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
     [[nodiscard]] void* surface() const { return surface_; }
+    /// zwlr_layer_surface_v1* while open (a menu's parent).
+    [[nodiscard]] void* layer() const { return layer_; }
+    /// Rows get a menu (null: none; the handler gets `init`'s `user`).
+    void set_menu_handler(menu_fn fn) { on_menu_ = fn; }
     [[nodiscard]] launcher_model& model() { return model_; }
     /// Shows `text` in the status row until the query changes; null clears it.
     void set_notice(const char* text);
@@ -273,6 +281,7 @@ private:
     app_catalog* catalog_ = nullptr;
     launch_fn on_launch_ = nullptr;
     closed_fn on_closed_ = nullptr;
+    menu_fn on_menu_ = nullptr;
     void* user_ = nullptr;
     launcher_model model_{};
     shm_canvas canvas_{};
@@ -428,6 +437,7 @@ constexpr unsigned k_xk_backspace = 0xff08, k_xk_tab = 0xff09, k_xk_return = 0xf
                    k_xk_end = 0xff57, k_xk_kp_enter = 0xff8d, k_xk_kp_home = 0xff95,
                    k_xk_kp_up = 0xff97, k_xk_kp_down = 0xff99, k_xk_kp_page_up = 0xff9a,
                    k_xk_kp_page_down = 0xff9b, k_xk_kp_end = 0xff9c, k_xk_iso_left_tab = 0xfe20;
+constexpr unsigned k_xk_menu = 0xff67, k_xk_f10 = 0xffc7;
 
 } // namespace
 
@@ -492,6 +502,10 @@ lx::shell::launcher_key_result lx::shell::launcher_model::key(unsigned sym, cons
     switch (sym) {
     case k_xk_return:
     case k_xk_kp_enter: return count_ ? launcher_key_result::launch : launcher_key_result::ignored;
+    case k_xk_menu:
+        return count_ ? launcher_key_result::menu : launcher_key_result::ignored;
+    case k_xk_f10:
+        return count_ && shift ? launcher_key_result::menu : launcher_key_result::ignored;
     case k_xk_escape:
         if (query_len_ == 0)
             return launcher_key_result::close;
@@ -833,6 +847,17 @@ void lx::shell::launcher::key(unsigned serial, const key_press& k, bool ctrl, bo
             on_launch_(static_cast<unsigned>(e), serial, user_);
         return;
     }
+    case launcher_key_result::menu: {
+        // The selection is on the page (the model scrolls to it); its row is the anchor.
+        const int e = model_.selected_entry();
+        const unsigned sel = model_.selection();
+        if (e < 0 || !on_menu_ || sel < committed_.first ||
+            sel - committed_.first >= committed_.rows)
+            return;
+        on_menu_(static_cast<unsigned>(e), launcher_row_rect(committed_, sel - committed_.first),
+                 serial, user_);
+        return;
+    }
     }
 }
 
@@ -864,10 +889,25 @@ void lx::shell::launcher::pointer_motion(double x, double y) {
 }
 
 void lx::shell::launcher::pointer_button(unsigned serial, unsigned button, bool down) {
-    constexpr unsigned k_btn_left = 0x110;
-    if (button != k_btn_left || !is_open())
+    constexpr unsigned k_btn_left = 0x110, k_btn_right = 0x111;
+    if (!is_open())
         return;
     const int h = launcher_hit(committed_, pointer_x_, pointer_y_);
+    if (button == k_btn_right) {
+        // The menu opens on the press, which its grab cites; the row becomes the selection.
+        if (!down || h < 0 || !on_menu_)
+            return;
+        model_.select(static_cast<unsigned>(h));
+        dirty_ = true;
+        const int e = model_.entry_at(static_cast<unsigned>(h));
+        if (e >= 0 && static_cast<unsigned>(h) >= committed_.first)
+            on_menu_(static_cast<unsigned>(e),
+                     launcher_row_rect(committed_, static_cast<unsigned>(h) - committed_.first),
+                     serial, user_);
+        return;
+    }
+    if (button != k_btn_left)
+        return;
     if (down) {
         pressed_ = h;
         press_serial_ = serial;

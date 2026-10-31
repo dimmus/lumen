@@ -39,6 +39,8 @@ struct control_output {
     int mode_width = 0, mode_height = 0;
     unsigned refresh_mhz = 0;
     double scale = 1.0;
+    /// What clients are hinted to render at (the scale when no render scale is set).
+    double render_scale = 1.0;
     const char* transform = "normal";
     /// The name of its active workspace ("" none).
     char active_workspace[32]{};

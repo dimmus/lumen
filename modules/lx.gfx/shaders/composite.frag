@@ -1,4 +1,5 @@
 #version 450
+#extension GL_GOOGLE_include_directive : require
 
 // Composite pass. Writes premultiplied **linear light** into a float attachment, so the
 // fixed-function blender averages light rather than encoded values — alpha blending is a
@@ -17,9 +18,10 @@ layout(push_constant) uniform quad_push {
     vec4 tint;
     vec4 src_bounds;  // u_lo, v_lo, u_hi, v_hi — half-texel inset sampling bounds
     int transfer;     // 0 linear, 1 sRGB, 2 gamma 2.2, 3 PQ, 4 HLG
-    float radius;     // a rounded solid: the corner radius of `dst` (0: square)
+    int downsample;   // 1: the area filter (downsample.glsl)
     vec2 uv_dy;
     vec4 solid;      // premultiplied, encoded colour of a solid draw
+    float radius;     // a rounded solid: the corner radius of `dst` (0: square)
 } push;
 
 layout(set = 0, binding = 0) uniform sampler2D surface_texture;
@@ -31,6 +33,8 @@ layout(constant_id = 0) const bool k_lowered = false;
 
 layout(location = 0) in vec2 v_uv;
 layout(location = 0) out vec4 out_color;
+
+#include "downsample.glsl"
 
 vec3 srgb_to_linear(vec3 v) {
     return mix(v / 12.92, pow((max(v, vec3(0.0)) + 0.055) / 1.055, vec3(2.4)),
@@ -67,15 +71,22 @@ vec3 decode(vec3 v) {
 }
 
 void main() {
-    // Clamp to the source rectangle. Linear filtering samples between texel centers, so
-    // a magnified crop would otherwise read texels from outside its own source rect.
-    vec2 uv = clamp(v_uv, push.src_bounds.xy, push.src_bounds.zw);
-    // A solid draw (wp_single_pixel_buffer_v1) takes the colour a 1x1 texture would hold
-    // and goes through the same decode, tint and opacity. A lowered glyph (`use_solid` 2)
-    // is that colour times the coverage its R8 atlas page holds.
-    vec4 texel = k_lowered && push.use_solid > 1.5 ? push.solid * texture(surface_texture, uv).r
-               : push.use_solid > 0.5                ? push.solid
-                                                     : texture(surface_texture, uv);
+    // Clamped to the source rectangle (in sample_source). Linear filtering samples between
+    // texel centers, so a magnified crop would otherwise read texels from outside its own
+    // source rect. A solid draw (wp_single_pixel_buffer_v1) takes the colour a 1x1 texture
+    // would hold and goes through the same decode, tint and opacity. A lowered glyph
+    // (`use_solid` 2) is that colour times the coverage its R8 atlas page holds.
+    vec4 texel = k_lowered && push.use_solid > 1.5
+                     ? push.solid *
+                           sample_source(surface_texture, v_uv, push.src_bounds,
+                                         push.src_uv.zw / push.dst.z, push.uv_dy / push.dst.w,
+                                         push.downsample)
+                               .r
+                     : push.use_solid > 0.5
+                           ? push.solid
+                           : sample_source(surface_texture, v_uv, push.src_bounds,
+                                           push.src_uv.zw / push.dst.z, push.uv_dy / push.dst.w,
+                                           push.downsample);
     // A lowered rounded solid: `:ui_cpu`'s quad coverage, saturate(1/2 - d) of the
     // rounded-box distance at the pixel centre.
     if (k_lowered && push.radius > 0.0) {

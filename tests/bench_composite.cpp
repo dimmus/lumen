@@ -6,7 +6,7 @@
 // makes one. This prints the cost of each so the difference is a number rather than a
 // claim — run it on the machine in question.
 //
-//   bench_composite [width height] [--vk] [--gpu-timing] [--hash] [--animate]
+//   bench_composite [width height] [--vk] [--gpu-timing] [--hash] [--animate] [--downsample]
 //
 // --vk: the Vulkan cases on a software rasterizer too (lavapipe takes ~0.1 s a frame at the
 // default size, too slow for every CTest run); a hardware Vulkan device always runs them.
@@ -15,6 +15,9 @@
 // timing's overhead when compared with a run without it.
 // --hash: each scene's composited frame is read back and its FNV-1a hash printed per
 // backend, so two builds can be compared pixel for pixel (no timing in it).
+// --downsample: a fullscreen draw of a buffer 1, 2, 4/3 and 8/5 times the output's size (a
+// render scale over the output scale: rendering-performance.md "Render scale") on each
+// backend — what the area filter costs over one bilinear tap.
 // --animate: the top window of each scene is drawn as one frame of a window animation
 // ([animations]: its tree container's `node_animation`, 0.95 of its size about its centre
 // at opacity 0.6): what an animating frame costs every backend.
@@ -1014,6 +1017,100 @@ void bench_blur(unsigned width, unsigned height, int iters, bool vk_on_software)
 /// its defaults (curve, matrix and tone mapping) — on each backend: CPU (1 and 4 threads),
 /// GL (fence waited) and Vulkan (fence waited; `--vk` for a software device). Never runs
 /// without the flag, so the default output stays what it was.
+bool g_downsample = false;
+
+void bench_downsample(unsigned width, unsigned height, int iters, bool vk_on_software) {
+    std::printf("  -- downsampled fullscreen surface (render scale over the output scale) --\n");
+    struct ratio {
+        const char* label;
+        unsigned num, den;
+    };
+    const ratio ratios[] = {{"1:1", 1, 1}, {"2:1 (render 2, scale 1)", 2, 1},
+                            {"4:3 (render 2, scale 1.5)", 4, 3},
+                            {"8:5 (render 2, scale 1.25)", 8, 5}};
+    const auto wait = [](int fd) {
+        if (fd >= 0) {
+            pollfd pfd{fd, POLLIN, 0};
+            (void)::poll(&pfd, 1, 1000);
+            ::close(fd);
+        }
+    };
+    const int gl_fd = ::open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    std::optional<lx::gfx::egl_device> gl_device;
+    if (gl_fd >= 0)
+        if (auto d = lx::gfx::egl_device::create(gl_fd); d && !d.value().is_software_renderer())
+            gl_device.emplace(std::move(d).value());
+    const bool gl_ok = gl_device.has_value();
+    lx::gfx::device vk_device{};
+    bool vk_ok = false;
+    if (auto selected = lx::gfx::device_selector::select_best()) {
+        vk_device = std::move(selected).value();
+        vk_ok = !vk_device.info().is_software_rasterizer || vk_on_software;
+    }
+    for (const ratio& r : ratios) {
+        const unsigned sw = width * r.num / r.den, sh = height * r.num / r.den;
+        std::vector<std::uint32_t> words(static_cast<std::size_t>(sw) * sh);
+        std::vector<unsigned char> rgba(words.size() * 4);
+        for (unsigned y = 0; y < sh; ++y)
+            for (unsigned x = 0; x < sw; ++x) {
+                const std::size_t i = static_cast<std::size_t>(y) * sw + x;
+                const unsigned v = ((x % 7) == 0 || (y % 5) == 0) ? 20u : 235u; // text-like strokes
+                words[i] = 0xFF000000u | (v * 0x010101u);
+                rgba[i * 4] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = static_cast<unsigned char>(v);
+                rgba[i * 4 + 3] = 255;
+            }
+        lx::gfx::blit_command cmd{};
+        cmd.texture_id = 1;
+        cmd.dst = {0, 0, static_cast<int>(width), static_cast<int>(height)};
+        cmd.blend = lx::blend_mode::opaque;
+        const auto timed = [&](const char* backend, auto&& frame) {
+            frame(); // warm: programs, pipelines, page faults
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < iters; ++i)
+                frame();
+            std::printf("  %s %-28s %8.3f ms\n", backend, r.label, ms_since(t0) / iters);
+        };
+        {
+            std::vector<std::uint32_t> dst(static_cast<std::size_t>(width) * height, 0u);
+            lx::gfx::cpu_compositor comp;
+            if (comp.register_texture(1, surface_of(words, sw, sh, k_xrgb))) {
+                const auto out = surface_of(dst, width, height, k_xrgb);
+                timed("CPU 1t ", [&] {
+                    (void)comp.composite(out, lx::color::rgb(0.f, 0.f, 0.f), &cmd, 1, {});
+                });
+            }
+        }
+        if (gl_ok) {
+            auto& dev = *gl_device;
+            auto target = lx::gfx::gl_scanout_target::create(dev, width, height, k_xrgb);
+            lx::gfx::gl_compositor comp;
+            if (target && comp.initialize(dev) && comp.upload_rgba(1, sw, sh, rgba.data()))
+                timed("GL     ", [&] {
+                    auto st = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f), &cmd,
+                                             1, {});
+                    if (st)
+                        wait(st.value().out_fence_fd);
+                });
+            comp.shutdown();
+        }
+        if (vk_ok) {
+            lx::gfx::vulkan_compositor comp;
+            if (comp.initialize(vk_device.context()) && comp.upload_rgba(1, sw, sh, rgba.data())) {
+                if (auto target = lx::gfx::render_target::create(vk_device.context(), width, height))
+                    timed("Vulkan ", [&] {
+                        auto st = comp.composite(target.value(), lx::color::rgb(0.f, 0.f, 0.f),
+                                                 &cmd, 1);
+                        if (st)
+                            wait(st.value().out_fence_fd);
+                    });
+            }
+            comp.shutdown();
+        }
+    }
+    if (gl_fd >= 0)
+        ::close(gl_fd);
+}
+
 bool g_color = false;
 
 void bench_color(unsigned width, unsigned height, int iters, bool vk_on_software) {
@@ -1154,6 +1251,10 @@ int main(int argc, char** argv) {
             g_color = true;
             --argc;
             more = true;
+        } else if (std::strcmp(argv[argc - 1], "--downsample") == 0) {
+            g_downsample = true;
+            --argc;
+            more = true;
         }
     }
     if (argc >= 3) {
@@ -1213,6 +1314,11 @@ int main(int argc, char** argv) {
     std::printf("  composite, channel swap, 4 threads          %7.3f ms\n",
                 bench_composite(width, height, k_rgba, 3, k_iters));
 
+    if (g_downsample) {
+        // Alone, as --blur.
+        bench_downsample(width, height, k_iters, vk_on_software);
+        return 0;
+    }
     if (g_color) {
         // Alone, as --blur.
         bench_color(width, height, k_iters, vk_on_software);

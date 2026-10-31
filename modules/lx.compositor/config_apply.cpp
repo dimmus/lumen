@@ -81,6 +81,12 @@ unsigned diff_config(const cfg::config_snapshot& a, const cfg::config_snapshot& 
         a.workspaces.switch_on_activate != b.workspaces.switch_on_activate ||
         a.workspaces.move_follows != b.workspaces.move_follows)
         c |= cfg_workspaces;
+    bool outputs = a.outputs.size() != b.outputs.size();
+    for (std::size_t i = 0; !outputs && i < a.outputs.size(); ++i)
+        outputs = std::strcmp(a.outputs[i].name, b.outputs[i].name) != 0 ||
+                  a.outputs[i].render_scale != b.outputs[i].render_scale;
+    if (outputs)
+        c |= cfg_outputs;
     if (a.idle.policy != b.idle.policy || a.idle.blank_after != b.idle.blank_after ||
         a.idle.blank_locked_after != b.idle.blank_locked_after ||
         std::strcmp(a.idle.lock_command, b.idle.lock_command) ||

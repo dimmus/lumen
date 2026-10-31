@@ -122,6 +122,9 @@ struct desktop_entry {
     bool no_display = false;
     bool hidden = false;
     bool dbus_activatable = false;
+    /// PrefersNonDefaultGPU=true (spec 1.4), or KDE's older X-KDE-RunOnDiscreteGpu=true:
+    /// started on a GPU other than the default when there is one (`:app_launch`).
+    bool prefers_non_default_gpu = false;
     entry_skip skip = entry_skip::invalid_file;
 
     [[nodiscard]] bool listed() const { return skip == entry_skip::none; }
@@ -316,6 +319,8 @@ enum key_id : unsigned {
     k_startup_wm_class,
     k_dbus_activatable,
     k_terminal_arg_exec,
+    k_prefers_non_default_gpu,
+    k_run_on_discrete_gpu,
     k_key_count,
 };
 
@@ -344,6 +349,8 @@ constexpr key_def k_keys[k_key_count] = {
     {"StartupWMClass", false, false},
     {"DBusActivatable", false, false},
     {"X-TerminalArgExec", false, false},
+    {"PrefersNonDefaultGPU", false, false},
+    {"X-KDE-RunOnDiscreteGpu", false, false},
 };
 
 [[nodiscard]] int find_key(std::string_view k) {
@@ -896,6 +903,11 @@ void lx::shell::parse_desktop_entry(std::string_view text, std::string_view id,
     out.hidden = rank[k_hidden] != INT_MAX && parse_bool(value[k_hidden], file, "Hidden");
     out.dbus_activatable = rank[k_dbus_activatable] != INT_MAX &&
                            parse_bool(value[k_dbus_activatable], file, "DBusActivatable");
+    out.prefers_non_default_gpu =
+        (rank[k_prefers_non_default_gpu] != INT_MAX &&
+         parse_bool(value[k_prefers_non_default_gpu], file, "PrefersNonDefaultGPU")) ||
+        (rank[k_run_on_discrete_gpu] != INT_MAX &&
+         parse_bool(value[k_run_on_discrete_gpu], file, "X-KDE-RunOnDiscreteGpu"));
     out.name_fold = fold(out.name, arena);
     out.generic_fold = fold(out.generic_name, arena);
     out.keywords_fold = fold(out.keywords, arena);

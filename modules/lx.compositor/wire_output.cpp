@@ -218,15 +218,18 @@ void update_membership(surface_obj* s, std::uint32_t mask, int primary) {
     auto* om = outputs();
     if (!om || mask == 0)
         return;
+    // Clients render at the outputs' render scale (supersampling); a cursor surface at the
+    // output scale, so the cursor plane can show its buffer 1:1.
+    const bool render = s->role != surface_role::cursor;
     if (wl_resource_get_version(s->resource) < 6) {
-        fractional_scale_update(s, lx::compositor::preferred_scale_120(*om, mask));
+        fractional_scale_update(s, lx::compositor::preferred_scale_120(*om, mask, render));
         return;
     }
     // wp_fractional_scale_v1 first (a client with both uses the fractional value and
     // ignores the integer one), then the wl_surface v6 events.
     if (!s->destroying)
-        fractional_scale_update(s, lx::compositor::preferred_scale_120(*om, mask));
-    const int scale = lx::compositor::preferred_buffer_scale(*om, mask);
+        fractional_scale_update(s, lx::compositor::preferred_scale_120(*om, mask, render));
+    const int scale = lx::compositor::preferred_buffer_scale(*om, mask, render);
     const unsigned transform = lx::compositor::preferred_buffer_transform(*om, primary);
     bool changed = false;
 #if defined(WL_SURFACE_PREFERRED_BUFFER_SCALE_SINCE_VERSION)
@@ -370,7 +373,8 @@ std::uint32_t expected_scale_120(const surface_obj* s) {
     if (!om)
         return 120;
     if (s && s->outputs)
-        return lx::compositor::preferred_scale_120(*om, s->outputs);
+        return lx::compositor::preferred_scale_120(*om, s->outputs,
+                                                   s->role != surface_role::cursor);
     // A subsurface shows where its parent does.
     if (s && g_p0_ctx && g_p0_ctx->tree) {
         const surface_obj* p = surface_by_id(g_p0_ctx->tree->parent_of(s->id));

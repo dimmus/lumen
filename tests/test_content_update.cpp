@@ -463,6 +463,26 @@ LUMEN_TEST(lifecycle_keeps_a_current_dmabuf_until_a_newer_commit_supersedes_it) 
     LUMEN_CHECK(!r.tracker.has_unreleased_frames());
 }
 
+LUMEN_TEST(lifecycle_releases_a_buffer_superseded_before_any_frame_at_once) {
+    // A client committing faster than the display (vkmark --present-mode immediate): a
+    // buffer replaced before a frame was submitted was never sampled, so it goes back at the
+    // next commit, not after the next frame completes.
+    lifecycle_rig r;
+    int buf_c = 0;
+    r.commit(1, 10, &g_buf_a);
+    r.commit(1, 11, &g_buf_b);
+    LUMEN_CHECK(r.released.size() == 1 && r.released[0] == &g_buf_a);
+    r.commit(1, 12, &buf_c);
+    LUMEN_CHECK(r.released.size() == 2 && r.released[1] == &g_buf_b);
+    // The newest is the surface's content: a frame samples it, and it stays until a newer
+    // commit and that frame's completion.
+    r.tracker.on_frame_submitted(7);
+    r.commit(1, 10, &g_buf_a);
+    LUMEN_CHECK(r.released.size() == 2);
+    (void)r.tracker.retire_completed_frames(7);
+    LUMEN_CHECK(r.released.size() == 3 && r.released[2] == &buf_c);
+}
+
 LUMEN_TEST(lifecycle_recommit_of_the_current_buffer_keeps_it) {
     lifecycle_rig r;
     r.commit(1, 10, &g_buf_a);
