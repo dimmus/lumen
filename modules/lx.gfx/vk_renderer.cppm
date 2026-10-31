@@ -745,6 +745,7 @@ struct quad_push {
     /// Trailing pads: 16-byte total so `quad_push_cm`'s matrix rows stay 16-byte aligned.
     float pad2 = 0.f;
     float pad3 = 0.f;
+    float pad4 = 0.f;
 };
 static_assert(sizeof(quad_push) == 128, "quad_push must match composite.vert/.frag");
 
