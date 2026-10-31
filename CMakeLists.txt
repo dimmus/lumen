@@ -187,7 +187,7 @@ lumen_add_module_library(lx.compositor modules/lx.compositor
 # (zlm_shell_v1, ext-workspace, ext-idle-notify, wlr-output-power, ext-background-effect) and
 # the requests on them come from lumen-protocol-glue.
 lumen_add_module_library(lx.shell modules/lx.shell
-    DEPENDS lx.shell.policy lx.text lx.trace lx.config lx.wayland.client lx.runtime)
+    DEPENDS lx.shell.policy lx.text lx.trace lx.config lx.wayland.client lx.runtime lx.ui.host)
 lumen_link_platform_parts(lx.shell wayland_client xkb text systemd)
 if(TARGET lumen-protocol-glue AND WAYLAND_FOUND)
     target_link_libraries(lx.shell PRIVATE lumen-protocol-glue)
@@ -1168,7 +1168,7 @@ if(LUMEN_BUILD_TESTS)
     # Compositor and lx.shell's bridge in one process: the shell side of zlm_policy_bridge_v1
     # against the real server side, with the privilege check configured to accept this binary.
     add_executable(test_shell_bridge tests/test_shell_bridge.cpp)
-    target_link_libraries(test_shell_bridge PRIVATE lx.compositor lx.shell)
+    target_link_libraries(test_shell_bridge PRIVATE lx.compositor lx.shell lx.ui.host)
     lumen_apply_module_properties(test_shell_bridge)
     lumen_link_platform(test_shell_bridge)
     target_include_directories(test_shell_bridge PRIVATE tests "${LUMEN_GENERATED_DIR}")

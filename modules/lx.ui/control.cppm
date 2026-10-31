@@ -145,7 +145,7 @@ struct control_props {
     bool nav_wrap = true;
 };
 
-class control_node final : public ui_node {
+class control_node : public ui_node {
 public:
     [[nodiscard]] static element_type_id static_type();
     [[nodiscard]] element_type_id type() const override;

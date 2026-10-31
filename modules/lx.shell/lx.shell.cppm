@@ -58,8 +58,10 @@ import lx.foundation;
 import lx.shell.policy;
 import lx.trace;
 import lx.config;
+import lx.runtime;
 import lx.text;
 import lx.wayland.client;
+import lx.ui.host;
 
 export module lx.shell;
 
@@ -453,6 +455,11 @@ private:
     /// The views' connection (lx.wayland.client): its own socket, dispatched alongside the
     /// raw one — the launcher, panels, background, switcher and bell draw through it.
     lx::wayland::display client_{};
+    /// The UI host context on it (ADR-010 Phase 5 P5-6): one per UI thread, the panel's
+    /// surface joins it. Its loop is never run: the shell's own loop drives the panels'
+    /// frames through `panel::after_dispatch`.
+    lx::runtime::event_loop ui_loop_{};
+    lx::ui::host::context ui_host_{};
     void* display_ = nullptr;      // wl_display*
     void* registry_ = nullptr;     // wl_registry*
     void* compositor_ = nullptr;   // wl_compositor*
@@ -1516,14 +1523,7 @@ void lx::shell::shell_app::output_ready(output_record& o) {
                           return static_cast<shell_app*>(user)->resolve_icon(h, e, px);
                       },
                       this});
-    if (auto created = o.bar->create({.display = client_.connected() ? &client_ : nullptr,
-                                      .compositor =
-                                          client_.native_global(lx::wayland::global_kind::compositor),
-                                      .shm = client_.native_global(lx::wayland::global_kind::shm),
-                                      .viewporter =
-                                          client_.native_global(lx::wayland::global_kind::viewporter),
-                                      .fractional = client_.native_global(
-                                          lx::wayland::global_kind::fractional_scale),
+    if (auto created = o.bar->create({.ui = ui_host_.started() ? &ui_host_ : nullptr,
                                       .background_effect = panel_blur_manager()},
                                      bridge_, client_slot(o));
         !created) {
@@ -2311,6 +2311,15 @@ int lx::shell::shell_app::run() {
         close(sfd);
         return fail("lx.wayland.client connection failed");
     }
+    // The UI host context on it: the panel is an lx.ui tree on a layer surface there
+    // (ADR-010 Phase 5 P5-6). Its loop is never run — the shell's own loop drives the
+    // panels' frames; the theme loads at start (a panel paints with whatever is active).
+    if (auto started = ui_host_.start(client_, ui_loop_, {.watch_theme = 0, .async_icons = false});
+        !started) {
+        log_shell.error(started.get_error());
+        close(sfd);
+        return fail("lx.ui.host context failed to start");
+    }
     auto* reg = wl_display_get_registry(d);
     registry_ = reg;
     wl_registry_add_listener(reg, &k_registry_listener, this);
@@ -2458,7 +2467,8 @@ int lx::shell::shell_app::run() {
     }
 
     int code = 0;
-    constexpr unsigned k_fixed = 6;
+    // fds[0..5] and the views' connection (the panels' input and frames travel on it).
+    constexpr unsigned k_fixed = 7;
     pollfd fds[k_fixed + app_launcher::k_max_poll];
     for (;;) {
         // The canonical libwayland client loop: dispatch what is queued, flush, then
@@ -2543,6 +2553,9 @@ int lx::shell::shell_app::run() {
         fds[4] = {bg_notify_fd_, POLLIN, 0};
         // The user bus (once open): asleep unless a message comes or a call's reply is due.
         fds[5] = {bus_.fd(), bus_.events(), 0};
+        // The views' connection: a pointer frame over a panel must wake the loop, not wait
+        // for the next event on the raw one.
+        fds[6] = {client_.connected() ? client_.fd() : -1, POLLIN, 0};
         int timeout_ms = bus_.timeout_ms();
         const unsigned na = apps_.poll_fds(fds + k_fixed, app_launcher::k_max_poll, timeout_ms);
         timespec ts{};
@@ -2689,6 +2702,7 @@ void lx::shell::shell_app::teardown() {
         wl_registry_destroy(static_cast<wl_registry*>(registry_));
     (void)wl_display_flush(d);
     wl_display_disconnect(d);
+    ui_host_.stop();
     client_.disconnect();
     display_ = registry_ = compositor_ = shm_ = seat_ = layer_shell_ = shell_ = cursor_shape_ =
         xdg_output_manager_ = activation_ = pointer_ = keyboard_ = cursor_device_ = viewporter_ =
