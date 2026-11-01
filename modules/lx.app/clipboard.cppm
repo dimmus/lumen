@@ -140,7 +140,22 @@ private:
     };
 
     static void sink(void* user, lx::ui::clipboard_kind kind, const char* utf8);
-    static bool start_drag(void* user, const char* utf8);
+    static bool start_drag(void* user, const lx::ui::drag_payload& payload);
+    /// The drag's files as the uri-list body (an `on_send` for `text/uri-list`).
+    [[nodiscard]] std::string drag_uri_list() const {
+        std::vector<std::string_view> views;
+        views.reserve(drag_uris_.size());
+        for (const std::string& u : drag_uris_)
+            views.emplace_back(u);
+        return lx::ui::format_uri_list(views);
+    }
+    /// The dropped offer negotiated `ask`, the target took the drop, and the user has
+    /// answered: the chosen action goes to the offer and the drop is finished.
+    void choose_dnd_action(std::uint32_t action);
+    /// A drag icon: `argb` (premultiplied 0xAARRGGBB, `w`×`h`) into a shm buffer on a
+    /// plain surface that follows the pointer for the drag's length (the device's
+    /// version 2+; without one the pointer itself shows the drag). Kept for reuse.
+    void set_drag_icon(const std::uint32_t* argb, unsigned w, unsigned h);
     [[nodiscard]] channel& channel_of(lx::ui::clipboard_kind kind) {
         return channels_[kind == lx::ui::clipboard_kind::primary ? 1 : 0];
     }
@@ -170,18 +185,28 @@ private:
     // Our drag: its source, text, and the action the compositor chose.
     lx::wayland::data_source drag_source_{};
     std::string drag_text_{};
+    std::vector<std::string> drag_uris_{};
+    void* icon_surface_ = nullptr;
+    void* icon_pool_ = nullptr;
+    void* icon_buffer_ = nullptr;
+    unsigned icon_w_ = 0, icon_h_ = 0;
     std::uint32_t drag_action_ = lx::wayland::k_dnd_none;
     // A drag over our windows: its offer, the UI under it, where, the type it would be read as.
     lx::wayland::data_offer* drag_offer_ = nullptr;
     lx::ui::ui_root* drag_root_ = nullptr;
     lx::point2i drag_at_{};
     const char* drag_mime_ = nullptr;
+    [[nodiscard]] const std::vector<std::string>& drag_uris() const { return drag_uris_; }
     std::uint32_t drag_serial_ = 0;
     int drag_accepting_ = -1; ///< what the offer was last told: -1 nothing yet, 0 no, 1 yes
     // A drop being read: where it goes.
     reader* drop_reader_ = nullptr; ///< owned
     lx::ui::ui_root* drop_root_ = nullptr;
     lx::point2i drop_at_{};
+    /// The dropped offer negotiated `ask` (the target's answer finishes it).
+    bool drop_ask_ = false;
+    /// A dropped offer read as `text/uri-list` rather than text.
+    bool drop_uris_ = false;
     char own_mime_[48]{};
     drag_stats drag_stats_{};
 };

@@ -1516,6 +1516,30 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_layout_flex PRIVATE tests)
     add_test(NAME test_layout_flex COMMAND test_layout_flex)
 
+    # lx.layout:grid's solver and lx.ui's grid container (ADR-010 Phase 5 "grid containers").
+    add_executable(test_layout_grid tests/test_layout_grid.cpp)
+    target_link_libraries(test_layout_grid PRIVATE lx.ui lx.layout lx.scene lx.runtime)
+    lumen_apply_module_properties(test_layout_grid)
+    lumen_link_platform(test_layout_grid)
+    target_include_directories(test_layout_grid PRIVATE tests)
+    add_test(NAME test_layout_grid COMMAND test_layout_grid)
+
+    # The drag payload's uri-list helpers (lx.ui:clipboard).
+    add_executable(test_clipboard_payload tests/test_clipboard_payload.cpp)
+    target_link_libraries(test_clipboard_payload PRIVATE lx.ui lx.runtime)
+    lumen_apply_module_properties(test_clipboard_payload)
+    lumen_link_platform(test_clipboard_payload)
+    target_include_directories(test_clipboard_payload PRIVATE tests)
+    add_test(NAME test_clipboard_payload COMMAND test_clipboard_payload)
+
+    # The chrome layer's palette and components (ui-architecture §9's design-system item).
+    add_executable(test_ui_chrome tests/test_ui_chrome.cpp)
+    target_link_libraries(test_ui_chrome PRIVATE lx.ui lx.layout lx.scene lx.runtime)
+    lumen_apply_module_properties(test_ui_chrome)
+    lumen_link_platform(test_ui_chrome)
+    target_include_directories(test_ui_chrome PRIVATE tests)
+    add_test(NAME test_ui_chrome COMMAND test_ui_chrome)
+
     add_executable(test_kms_vkms tests/test_kms_vkms.cpp)
     target_link_libraries(test_kms_vkms PRIVATE lx.drm)
     lumen_apply_module_properties(test_kms_vkms)

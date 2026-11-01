@@ -7,6 +7,7 @@ export module lx.layout;
 // ADR-010 §4.7: the flexbox engine lx.ui's containers use (`:flex`), the size constraints
 // its measure contract passes down, and the alignment lx.ui's `align` decorator takes.
 export import :flex;
+export import :grid;
 
 export namespace lx::layout {
 

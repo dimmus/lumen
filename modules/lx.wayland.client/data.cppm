@@ -141,9 +141,12 @@ public:
     [[nodiscard]] data_offer* selection() const { return selection_; }
 
     /// Starts dragging `source` from `origin` (a clipboard device): `serial` is the press of
-    /// the button still held (the compositor refuses another, cancelling the source). No
-    /// icon: the pointer shows the drag.
-    void start_drag(data_source& source, surface& origin, std::uint32_t serial);
+    /// the button still held (the compositor refuses another, cancelling the source).
+    /// `icon` — a plain wl_surface with a buffer already attached and committed — follows
+    /// the pointer for the drag's length (the device's version 2+; null: the pointer
+    /// itself shows the drag).
+    void start_drag(data_source& source, surface& origin, std::uint32_t serial,
+                    surface* icon = nullptr);
     /// The drag over this client's surfaces (null: none) and the dropped offer being read.
     [[nodiscard]] data_offer* drag_offer() const { return drag_; }
     [[nodiscard]] data_offer* dropped_offer() const { return dropped_; }

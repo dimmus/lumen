@@ -416,6 +416,24 @@ public:
     virtual void drop_leave() = 0;
     /// Dropped at `at`: inserts `utf8`; false when refused.
     virtual bool drop_text(lx::point2i at, std::string_view utf8) = 0;
+    /// Dropped at `at`: takes the files (the `text/uri-list` URIs as they came); false
+    /// when the node takes none. Default: refused.
+    virtual bool drop_files(lx::point2i at, std::span<const std::string_view> uris) {
+        (void)at;
+        (void)uris;
+        return false;
+    }
+    /// The dropped offer negotiated `ask`: the target shows its copy / move / link menu
+    /// and answers through `drag_service::choose_dnd_action` (the offer stays open until
+    /// then). False: the target does not ask — the default action is taken. Default:
+    /// false.
+    virtual bool drop_ask(lx::point2i at, std::span<const std::string_view> uris,
+                          std::uint32_t actions) {
+        (void)at;
+        (void)uris;
+        (void)actions;
+        return false;
+    }
 
 protected:
     ~drop_target() = default;
@@ -475,6 +493,9 @@ public:
     /// The node's style as a flex item, read by its parent flex container: null for CSS's
     /// initial values (`flex: 0 1 auto`, auto sizes and margins).
     [[nodiscard]] virtual const layout::flex_style* flex_item_style() const;
+    /// Where a grid container places this item (null: auto-placed, row-major). The
+    /// `placed` decorator supplies one; every other node is auto.
+    [[nodiscard]] virtual const lx::layout::grid_placement* grid_placement() const;
     /// Pass 3. Appends draw commands for this node and its children.
     virtual void emit(draw_scope& out) const;
 
@@ -1713,6 +1734,7 @@ lx::size2i lx::ui::ui_node::measure_content(layout::constraints c, size_hint hin
     return measure(c, hint);
 }
 
+const lx::layout::grid_placement* lx::ui::ui_node::grid_placement() const { return nullptr; }
 const lx::layout::flex_style* lx::ui::ui_node::flex_item_style() const {
     return nullptr;
 }
