@@ -370,6 +370,10 @@ private:
     void on_hold_begin(const char* action, unsigned input_time_ms);
     /// A key press during the hold (the compositor diverted it from the focused window).
     void on_hold_key(unsigned keysym, unsigned mods, const char* binding);
+    /// The switcher's cells, as the view's tree forwards them: hover (from the second cell
+    /// on) selects, a press and its release on one cell pick it and end the switch.
+    void on_switcher_cell_hover(unsigned entry);
+    void on_switcher_cell_pick(unsigned entry, bool pressed);
     /// Ends the switch: the selection activated when `commit`, the hold and the view gone.
     /// `why` is logged.
     void finish_switch(bool commit, const char* why);
@@ -451,11 +455,12 @@ private:
     /// The window switcher: the hold's list and selection, and its view.
     switcher_model switcher_{};
     switcher_view switcher_view_{};
-    /// Where the pointer entered the switcher: it selects only once it has moved (a pointer
-    /// that happens to be where the view appears selects nothing).
-    double switcher_ptr_x_ = 0.0;
-    double switcher_ptr_y_ = 0.0;
-    bool switcher_ptr_moved_ = false;
+    /// The switcher's cells (the tree's interactive nodes forward them): the pointer's first
+    /// landing selects nothing — hovering selects only from the second cell on (GNOME's rule,
+    /// a pointer that happens to be where the view appears stays put) — and a press and its
+    /// release on one cell pick it.
+    bool switcher_hover_seen_ = false;
+    int switcher_pressed_ = -1;
     std::vector<std::unique_ptr<output_record>> outputs_{};
     /// The panels exist (after the setup): an output bound later gets its panel at its done.
     bool panels_enabled_ = false;
@@ -849,11 +854,6 @@ struct lx::shell::shell_app::events {
         } else if (s && s == a.launcher_.surface()) {
             a.pointer_target_ = pointer_target::launcher;
             a.launcher_.pointer_enter(px, py);
-        } else if (s && s == a.switcher_view_.surface()) {
-            a.pointer_target_ = pointer_target::switcher;
-            a.switcher_ptr_x_ = px;
-            a.switcher_ptr_y_ = py;
-            a.switcher_ptr_moved_ = false;
         } else {
             a.pointer_target_ = pointer_target::none;
         }
@@ -886,12 +886,6 @@ struct lx::shell::shell_app::events {
         else if (a.pointer_target_ == pointer_target::notify) {
             a.note_view_.pointer_motion(px, py);
             a.notes_.set_hover(a.note_view_.hovered(), now_ns());
-        } else if (a.pointer_target_ == pointer_target::switcher && a.switcher_.active()) {
-            // Hovering selects (GNOME), once the pointer has really moved.
-            const double dx = px - a.switcher_ptr_x_, dy = py - a.switcher_ptr_y_;
-            a.switcher_ptr_moved_ = a.switcher_ptr_moved_ || dx * dx + dy * dy > 9.0;
-            if (const int i = a.switcher_view_.entry_at(px, py); i >= 0 && a.switcher_ptr_moved_)
-                a.switcher_.select(static_cast<unsigned>(i));
         }
     }
     static void ptr_button(void* data, wl_pointer*, uint32_t serial, uint32_t, uint32_t button,
@@ -910,13 +904,6 @@ struct lx::shell::shell_app::events {
                 a.on_notify_click(c, a.last_press_serial_);
         } else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_button(serial, button, down);
-        else if (a.pointer_target_ == pointer_target::switcher && down && a.switcher_.active()) {
-            // A click picks the window under it (or the selection) and ends the switch.
-            if (const int i = a.switcher_view_.entry_at(a.switcher_ptr_x_, a.switcher_ptr_y_);
-                i >= 0 && !a.switcher_ptr_moved_)
-                a.switcher_.select(static_cast<unsigned>(i));
-            a.finish_switch(true, "click");
-        }
     }
     static void ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value) {
         auto& a = self(data);
@@ -2000,11 +1987,6 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
         } else if (surf && surf == a.launcher_.surface()) {
             a.pointer_target_ = pointer_target::launcher;
             a.launcher_.pointer_enter(f.x, f.y);
-        } else if (surf && surf == a.switcher_view_.surface()) {
-            a.pointer_target_ = pointer_target::switcher;
-            a.switcher_ptr_x_ = f.x;
-            a.switcher_ptr_y_ = f.y;
-            a.switcher_ptr_moved_ = false;
         } else {
             a.pointer_target_ = pointer_target::none;
         }
@@ -2028,12 +2010,6 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
         else if (a.pointer_target_ == pointer_target::notify) {
             a.note_view_.pointer_motion(f.x, f.y);
             a.notes_.set_hover(a.note_view_.hovered(), now_ns());
-        } else if (a.pointer_target_ == pointer_target::switcher && a.switcher_.active()) {
-            // Hovering selects (GNOME), once the pointer has really moved.
-            const double dx = f.x - a.switcher_ptr_x_, dy = f.y - a.switcher_ptr_y_;
-            a.switcher_ptr_moved_ = a.switcher_ptr_moved_ || dx * dx + dy * dy > 9.0;
-            if (const int i = a.switcher_view_.entry_at(f.x, f.y); i >= 0 && a.switcher_ptr_moved_)
-                a.switcher_.select(static_cast<unsigned>(i));
         }
     }
     if (f.mask & pf::has_button) {
@@ -2048,13 +2024,6 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
                 a.on_notify_click(c, a.last_press_serial_);
         } else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_button(f.serial, f.button, down);
-        else if (a.pointer_target_ == pointer_target::switcher && down && a.switcher_.active()) {
-            // A click picks the window under it (or the selection) and ends the switch.
-            if (const int i = a.switcher_view_.entry_at(a.switcher_ptr_x_, a.switcher_ptr_y_);
-                i >= 0 && !a.switcher_ptr_moved_)
-                a.switcher_.select(static_cast<unsigned>(i));
-            a.finish_switch(true, "click");
-        }
     }
     if (f.mask & (pf::has_axis | pf::has_axis_value120)) {
         if (a.pointer_target_ != pointer_target::launcher)
@@ -2582,16 +2551,21 @@ int lx::shell::shell_app::run() {
                 .viewporter = client_.native_global(lx::wayland::global_kind::viewporter)});
     bridge_.set_bell_handler(
         [](task_handle h, void* user) { static_cast<shell_app*>(user)->on_bell(h); }, this);
-    switcher_view_.init({.display = client_.connected() ? &client_ : nullptr,
-                         .compositor = client_.native_global(lx::wayland::global_kind::compositor),
-                         .shm = client_.native_global(lx::wayland::global_kind::shm),
-                         .viewporter = client_.native_global(lx::wayland::global_kind::viewporter),
-                         .fractional =
-                             client_.native_global(lx::wayland::global_kind::fractional_scale)},
+    switcher_view_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr},
                         [](task_handle h, const task_entry& e, int px, void* user) {
                             return static_cast<shell_app*>(user)->resolve_icon(h, e, px);
                         },
                         this);
+    // The switcher's cells forward their pointer input (the ui host's seat router): hover
+    // selects from the second cell on, a press and release on one pick it.
+    switcher_view_.set_input({.hover = [](unsigned entry, void* user) {
+                                  static_cast<shell_app*>(user)->on_switcher_cell_hover(entry);
+                              },
+                              .pick = [](unsigned entry, bool pressed, void* user) {
+                                  static_cast<shell_app*>(user)->on_switcher_cell_pick(entry,
+                                                                                       pressed);
+                              },
+                              .user = this});
     // Shell keybindings. With zlm v7 the compositor matches them (config.toml [bindings]) and
     // sends actions; the shell grabs nothing — except Super+L for a lock command given on
     // the command line that the configuration does not know (the compositor binds shell.lock
@@ -3199,6 +3173,8 @@ void lx::shell::shell_app::on_hold_begin(const char* action, unsigned input_time
         return;
     }
     switcher_hold_ns_ = hold_ns;
+    switcher_hover_seen_ = false;
+    switcher_pressed_ = -1;
     set_timer(t_switcher, switcher_.open_at());
     if (log_switcher.enabled(lx::trace::level::debug)) {
         const task_entry* e = bridge_.model().get(switcher_.selected());
@@ -3210,6 +3186,32 @@ void lx::shell::shell_app::on_hold_begin(const char* action, unsigned input_time
             switcher_.selection(), e ? e->title : "",
             (now_ns() - static_cast<long long>(input_time_ms) * 1000000LL) / 1000000LL);
     }
+}
+
+void lx::shell::shell_app::on_switcher_cell_hover(unsigned entry) {
+    if (!switcher_.active())
+        return;
+    // The pointer's first landing (the cell it happened to appear over) selects nothing;
+    // a hover on a second cell means it really moved (GNOME's rule).
+    if (!switcher_hover_seen_) {
+        switcher_hover_seen_ = true;
+        return;
+    }
+    switcher_.select(entry);
+}
+
+void lx::shell::shell_app::on_switcher_cell_pick(unsigned entry, bool pressed) {
+    if (!switcher_.active())
+        return;
+    if (pressed) {
+        switcher_pressed_ = static_cast<int>(entry);
+        return;
+    }
+    if (switcher_pressed_ != static_cast<int>(entry))
+        return; // the press began elsewhere: no pick
+    switcher_pressed_ = -1;
+    switcher_.select(entry);
+    finish_switch(true, "click");
 }
 
 void lx::shell::shell_app::on_hold_key(unsigned keysym, unsigned mods, const char* binding) {
@@ -3246,8 +3248,6 @@ void lx::shell::shell_app::finish_switch(bool commit, const char* why) {
     set_timer(t_switcher, 0);
     bridge_.end_hold(); // nothing when the compositor already ended it
     switcher_view_.close();
-    if (pointer_target_ == pointer_target::switcher)
-        pointer_target_ = pointer_target::none;
     const task_entry* e = bridge_.model().get(h);
     if (e) {
         // Chosen explicitly: it is the most recent window however briefly it stays focused.
