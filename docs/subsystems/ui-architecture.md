@@ -561,7 +561,10 @@ Still to build:
   `FB_DAMAGE_CLIPS` on every atomic commit since ADR-008's real-monitor work
   (`commit_output` in compositor_impl.cpp; exercised by every smoke run's commits)
 - A design-system layer (shell chrome: scaffold, rows, toolbars) as a separate module
-  above `lx.ui`, keeping primitives and opinionated components apart
+  above `lx.ui`, keeping primitives and opinionated components apart — **started**:
+  `lx.ui:chrome` holds the shared palette (the values the canvas views drew, named) and
+  the first components (row, toolbar); the full split out of `lx.ui` into its own module
+  is the remaining step
 
 ---
 

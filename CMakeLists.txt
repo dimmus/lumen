@@ -1532,6 +1532,14 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_clipboard_payload PRIVATE tests)
     add_test(NAME test_clipboard_payload COMMAND test_clipboard_payload)
 
+    # The chrome layer's palette and components (ui-architecture §9's design-system item).
+    add_executable(test_ui_chrome tests/test_ui_chrome.cpp)
+    target_link_libraries(test_ui_chrome PRIVATE lx.ui lx.layout lx.scene lx.runtime)
+    lumen_apply_module_properties(test_ui_chrome)
+    lumen_link_platform(test_ui_chrome)
+    target_include_directories(test_ui_chrome PRIVATE tests)
+    add_test(NAME test_ui_chrome COMMAND test_ui_chrome)
+
     add_executable(test_kms_vkms tests/test_kms_vkms.cpp)
     target_link_libraries(test_kms_vkms PRIVATE lx.drm)
     lumen_apply_module_properties(test_kms_vkms)
