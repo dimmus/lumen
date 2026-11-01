@@ -552,8 +552,14 @@ Still to build:
 - Drag and drop of anything but text, a drag icon, and the `ask` action (a menu at the drop).
   The clipboard, the primary selection and text drag and drop are `lx.app:clipboard`;
   `ime_target` is driven from `zwp_text_input_v3` by `lx.app:input` (§11)
-- Grid containers (flex is `lx.ui:flex`, which reads `grow_node::grow_factor()`)
-- Feeding merged damage into `kms_damage_region`
+- Grid containers — **done**: `lx.layout:grid` (explicit column tracks × explicit or
+  auto-flow rows; fixed, percent, auto and fr sizes; sparse row-major placement, explicit
+  cells, spans) and `lx.ui:grid` (`grid_node`, the `placed` decorator,
+  `ui_node::grid_placement()`), covered by `tests/test_layout_grid.cpp`
+- Feeding merged damage into `kms_damage_region` — **done, was stale**: the composite's
+  frame damage (missed frames + snapshot rects) has flowed through `kms_pending` into
+  `FB_DAMAGE_CLIPS` on every atomic commit since ADR-008's real-monitor work
+  (`commit_output` in compositor_impl.cpp; exercised by every smoke run's commits)
 - A design-system layer (shell chrome: scaffold, rows, toolbars) as a separate module
   above `lx.ui`, keeping primitives and opinionated components apart
 

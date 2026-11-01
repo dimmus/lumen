@@ -475,6 +475,9 @@ public:
     /// The node's style as a flex item, read by its parent flex container: null for CSS's
     /// initial values (`flex: 0 1 auto`, auto sizes and margins).
     [[nodiscard]] virtual const layout::flex_style* flex_item_style() const;
+    /// Where a grid container places this item (null: auto-placed, row-major). The
+    /// `placed` decorator supplies one; every other node is auto.
+    [[nodiscard]] virtual const lx::layout::grid_placement* grid_placement() const;
     /// Pass 3. Appends draw commands for this node and its children.
     virtual void emit(draw_scope& out) const;
 
@@ -1713,6 +1716,7 @@ lx::size2i lx::ui::ui_node::measure_content(layout::constraints c, size_hint hin
     return measure(c, hint);
 }
 
+const lx::layout::grid_placement* lx::ui::ui_node::grid_placement() const { return nullptr; }
 const lx::layout::flex_style* lx::ui::ui_node::flex_item_style() const {
     return nullptr;
 }

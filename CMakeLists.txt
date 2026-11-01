@@ -1516,6 +1516,14 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_layout_flex PRIVATE tests)
     add_test(NAME test_layout_flex COMMAND test_layout_flex)
 
+    # lx.layout:grid's solver and lx.ui's grid container (ADR-010 Phase 5 "grid containers").
+    add_executable(test_layout_grid tests/test_layout_grid.cpp)
+    target_link_libraries(test_layout_grid PRIVATE lx.ui lx.layout lx.scene lx.runtime)
+    lumen_apply_module_properties(test_layout_grid)
+    lumen_link_platform(test_layout_grid)
+    target_include_directories(test_layout_grid PRIVATE tests)
+    add_test(NAME test_layout_grid COMMAND test_layout_grid)
+
     add_executable(test_kms_vkms tests/test_kms_vkms.cpp)
     target_link_libraries(test_kms_vkms PRIVATE lx.drm)
     lumen_apply_module_properties(test_kms_vkms)
