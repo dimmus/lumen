@@ -151,6 +151,8 @@ public:
     }
     /// zwlr_layer_surface_v1* (a menu's parent).
     [[nodiscard]] void* layer() const { return role_.valid() ? role_.layer().native() : nullptr; }
+    /// The layer role (a menu's xdg_popup parent).
+    [[nodiscard]] lx::ui::host::layer_role& popup_parent() { return role_; }
     [[nodiscard]] const notify_layout& layout() const { return layout_; }
     /// Re-describes what changed and runs the surface's frame loop.
     void after_dispatch();

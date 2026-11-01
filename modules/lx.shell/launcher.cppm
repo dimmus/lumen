@@ -217,6 +217,8 @@ public:
     }
     /// zwlr_layer_surface_v1* while open (a menu's parent).
     [[nodiscard]] void* layer() const { return role_.valid() ? role_.layer().native() : nullptr; }
+    /// The layer role (a menu's xdg_popup parent).
+    [[nodiscard]] lx::ui::host::layer_role& popup_parent() { return role_; }
     /// Rows get a menu (null: none; the handler gets `init`'s `user`).
     void set_menu_handler(menu_fn fn) { on_menu_ = fn; }
     /// True when the keyboard's leaving must not close the launcher (its own menu took it);
