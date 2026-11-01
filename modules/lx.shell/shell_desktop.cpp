@@ -188,24 +188,14 @@ void lx::shell::shell_app::start_desktop_services() {
                               a.notes_.set_hover(over, now_ns());
                           },
                           .user = this});
-    // The menus and tooltips are xdg_popups of the panels: their surfaces come from the
-    // views' connection (lx.wayland.client), like every other view's (P5-6) — the raw
-    // connection's globals mean nothing to them, and a popup of a panel's layer surface
-    // must be its client.
-    lx::wayland::seat* menu_seat = client_.connected() ? client_.default_seat() : nullptr;
-    const menu_globals mg{.display = client_.connected() ? &client_ : nullptr,
-                          .compositor = client_.native_global(lx::wayland::global_kind::compositor),
-                          .shm = client_.native_global(lx::wayland::global_kind::shm),
-                          .wm_base = client_.native_global(lx::wayland::global_kind::xdg_wm_base),
-                          .seat = menu_seat ? menu_seat->native() : nullptr,
-                          .viewporter = client_.native_global(lx::wayland::global_kind::viewporter),
-                          .fractional = client_.native_global(lx::wayland::global_kind::fractional_scale)};
-    menu_.init(mg,
+    // The menus and tooltips are xdg_popups of the views' layer surfaces on the shell's
+    // lx.ui.host context (P5-8); the popup of a panel's layer surface must be its client.
+    menu_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr},
                [](const char* name, int px, void* user) {
                    return static_cast<shell_app*>(user)->image_icon(name, px);
                },
                this);
-    tooltip_.init(mg);
+    tooltip_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr});
     // The GPUs (switcheroo-control on the system bus with more than one), whatever the user
     // bus does.
     apps_.probe_gpus();
@@ -558,7 +548,7 @@ void lx::shell::shell_app::on_notify_click(const notify_click& c, unsigned seria
     }
     case notify_click::kind::more: {
         const notification* n = notes_.find(c.id);
-        if (!n || !note_view_.layer())
+        if (!n || !note_view_.popup_parent().valid())
             return;
         // The actions that did not fit, in a menu under the button.
         std::vector<menu_entry> items;
@@ -585,7 +575,7 @@ void lx::shell::shell_app::on_notify_click(const notify_click& c, unsigned seria
         menu_key_ = c.id;
         menu_output_ = notify_output_;
         (void)menu_.open(
-            note_view_.layer(), c.anchor, std::move(items), serial,
+            note_view_.popup_parent(), c.anchor, std::move(items), serial,
             [](int id, void* user) { static_cast<shell_app*>(user)->on_menu_activate(id); },
             [](void* user) { static_cast<shell_app*>(user)->on_menu_closed(); },
             nullptr, this, "notification-actions");
@@ -603,7 +593,7 @@ void lx::shell::shell_app::toggle_dnd(const char* why) {
 }
 
 void lx::shell::shell_app::open_history(output_record& o, const panel_widget_event& e) {
-    if (!o.bar || !o.bar->layer())
+    if (!o.bar || !o.bar->popup_parent().valid())
         return;
     std::vector<menu_entry> items;
     menu_actions_.clear();
@@ -680,7 +670,7 @@ void lx::shell::shell_app::open_history(output_record& o, const panel_widget_eve
     menu_key_ = 0;
     menu_output_ = o.name;
     if (!menu_.open(
-            o.bar->layer(), e.cell, std::move(items), e.serial,
+            o.bar->popup_parent(), e.cell, std::move(items), e.serial,
             [](int id, void* user) { static_cast<shell_app*>(user)->on_menu_activate(id); },
             [](void* user) { static_cast<shell_app*>(user)->on_menu_closed(); }, nullptr, this,
             "notification-history")) {
@@ -745,7 +735,7 @@ void lx::shell::shell_app::on_menu_activate(int id) {
 
 void lx::shell::shell_app::open_launcher_menu(unsigned entry, lx::rect2i anchor, unsigned serial) {
     const desktop_entry* e = catalog_.entry(entry);
-    if (!e || !launcher_.layer() || !apps_.offload_available())
+    if (!e || !launcher_.popup_parent().valid() || !apps_.offload_available())
         return; // one GPU: nothing to choose, no menu
     std::vector<menu_entry> items;
     menu_entry gpu{};
@@ -761,7 +751,7 @@ void lx::shell::shell_app::open_launcher_menu(unsigned entry, lx::rect2i anchor,
     launcher_menu_entry_ = entry;
     launcher_menu_gen_ = catalog_.generation();
     if (!menu_.open(
-            launcher_.layer(), anchor, std::move(items), serial,
+            launcher_.popup_parent(), anchor, std::move(items), serial,
             [](int id, void* user) { static_cast<shell_app*>(user)->on_menu_activate(id); },
             [](void* user) { static_cast<shell_app*>(user)->on_menu_closed(); }, nullptr, this,
             "launcher"))
@@ -797,14 +787,14 @@ void lx::shell::shell_app::open_tray_menu(unsigned key, std::vector<menu_entry> 
         return; // asked for something else since
     pending_menu_key_ = 0;
     output_record* o = output_by_name(pending_menu_output_);
-    if (!o || !o->bar || !o->bar->layer() || items.empty() || !tray_.find(key))
+    if (!o || !o->bar || !o->bar->popup_parent().valid() || items.empty() || !tray_.find(key))
         return;
     o->bar->set_menu_keyboard(true);
     menu_kind_ = menu_kind::tray;
     menu_key_ = key;
     menu_output_ = o->name;
     if (!menu_.open(
-            o->bar->layer(), pending_menu_cell_, std::move(items), pending_menu_serial_,
+            o->bar->popup_parent(), pending_menu_cell_, std::move(items), pending_menu_serial_,
             [](int id, void* user) { static_cast<shell_app*>(user)->on_menu_activate(id); },
             [](void* user) { static_cast<shell_app*>(user)->on_menu_closed(); },
             [](int id, void* user) {
@@ -890,12 +880,12 @@ void lx::shell::shell_app::on_widget(const panel_widget_event& e, output_record&
 void lx::shell::shell_app::show_tooltip() {
     const tray_item* it = tray_.find(tooltip_key_);
     output_record* o = output_by_name(tooltip_output_);
-    if (!it || !o || !o->bar || !o->bar->layer() || menu_.is_open())
+    if (!it || !o || !o->bar || !o->bar->popup_parent().valid() || menu_.is_open())
         return;
     const std::string& title = !it->tooltip_title.empty() ? it->tooltip_title
                                : !it->title.empty()       ? it->title
                                                           : it->id;
-    if (tooltip_.open(o->bar->layer(), tooltip_cell_, title, it->tooltip_text) &&
+    if (tooltip_.open(o->bar->popup_parent(), tooltip_cell_, title, it->tooltip_text) &&
         log_tray.enabled(lx::trace::level::debug))
         log_tray.debug("tray: tooltip \"{}\"", title);
 }

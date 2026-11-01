@@ -69,7 +69,6 @@ import std;
 
 export import :task_model;
 export import :bridge;
-export import :shm_canvas;
 export import :svg;
 export import :icon_theme;
 export import :visual_bell;
@@ -86,6 +85,7 @@ export import :user_bus;
 export import :notifications;
 export import :notify_view;
 export import :menu_popup;
+export import :view_ui;
 export import :tray;
 
 namespace {
@@ -825,10 +825,7 @@ struct lx::shell::shell_app::events {
                 WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT);
         const double px = wl_fixed_to_double(x), py = wl_fixed_to_double(y);
         a.pointer_surface_ = s;
-        if (s && a.menu_.owns(s)) {
-            a.pointer_target_ = pointer_target::menu;
-            a.menu_.pointer_enter(s, px, py);
-        } else if (output_record* o = s ? a.output_of_panel_surface(s) : nullptr) {
+        if (output_record* o = s ? a.output_of_panel_surface(s) : nullptr) {
             a.pointer_target_ = pointer_target::panel;
             a.pointer_panel_ = o->bar.get();
             a.last_panel_output_ = o->name;
@@ -837,12 +834,10 @@ struct lx::shell::shell_app::events {
             a.pointer_target_ = pointer_target::none;
         }
     }
-    static void ptr_leave(void* data, wl_pointer*, uint32_t, wl_surface* s) {
+    static void ptr_leave(void* data, wl_pointer*, uint32_t, wl_surface*) {
         auto& a = self(data);
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_leave();
-        else if (a.pointer_target_ == pointer_target::menu)
-            a.menu_.pointer_leave(s);
         a.pointer_surface_ = nullptr;
         a.pointer_panel_ = nullptr;
         a.pointer_target_ = pointer_target::none;
@@ -852,8 +847,6 @@ struct lx::shell::shell_app::events {
         const double px = wl_fixed_to_double(x), py = wl_fixed_to_double(y);
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_motion(px, py);
-        else if (a.pointer_target_ == pointer_target::menu)
-            a.menu_.pointer_motion(a.pointer_surface_, px, py);
     }
     static void ptr_button(void* data, wl_pointer*, uint32_t serial, uint32_t, uint32_t button,
                            uint32_t state) {
@@ -863,8 +856,6 @@ struct lx::shell::shell_app::events {
             a.last_press_serial_ = serial;
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_button(button, down, serial);
-        else if (a.pointer_target_ == pointer_target::menu)
-            a.menu_.pointer_button(a.pointer_surface_, button, down, serial);
     }
     static void ptr_axis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {
         // Continuous scroll reached the launcher only (the wheel's discrete notches are the
@@ -1858,14 +1849,9 @@ void lx::shell::shell_app::on_lock_requested(unsigned reason) {
 
 // ── Keyboard ──
 
-void lx::shell::shell_app::on_key(unsigned serial, unsigned code, bool pressed) {
-    // The launcher's keys arrive through its ui tree (P5-7); the raw keyboard is the
-    // menus' only (a menu that grabbed the keyboard from its panel's surface).
-    if (!menu_.is_open())
-        return;
-    key_press k{};
-    if (pressed && xkb_.press(code, k))
-        menu_.key(k.keysym, k.utf8, serial);
+void lx::shell::shell_app::on_key(unsigned, unsigned, bool) {
+    // Every view's keys arrive through its ui tree (P5-7, P5-8); the raw keyboard routes
+    // nothing.
 }
 
 // ── The canvas views' seat input (the ui host's unrouted frames; P5-6) ──────────────
@@ -1875,31 +1861,10 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
     auto& a = *app;
     using pf = lx::wayland::pointer_frame;
     void* surf = f.target ? f.target->native() : nullptr;
-    if (f.mask & pf::has_enter) {
-        a.pointer_surface_ = surf;
-        if (surf && a.menu_.owns(surf)) {
-            a.pointer_target_ = pointer_target::menu;
-            a.menu_.pointer_enter(surf, f.x, f.y);
-        } else {
-            a.pointer_target_ = pointer_target::none;
-        }
-    } else if (f.mask & pf::has_leave) {
-        if (a.pointer_target_ == pointer_target::menu)
-            a.menu_.pointer_leave(surf);
-        a.pointer_surface_ = nullptr;
-        a.pointer_target_ = pointer_target::none;
-    }
-    if (f.mask & pf::has_motion) {
-        if (a.pointer_target_ == pointer_target::menu)
-            a.menu_.pointer_motion(surf, f.x, f.y);
-    }
-    if (f.mask & pf::has_button) {
-        const bool down = f.pressed;
-        if (down)
-            a.last_press_serial_ = f.serial;
-        if (a.pointer_target_ == pointer_target::menu)
-            a.menu_.pointer_button(surf, f.button, down, f.serial);
-    }
+    // Every canvas view but nothing else is left: the menus' popups are host surfaces now
+    // (P5-8), routed by the context.
+    (void)s;
+    (void)app;
 }
 
 void lx::shell::shell_app::view_input::on_unrouted_keyboard_focus(
@@ -1915,13 +1880,9 @@ void lx::shell::shell_app::view_input::on_unrouted_keyboard_focus(
 
 void lx::shell::shell_app::view_input::on_unrouted_key(lx::wayland::seat& s,
                                                        const lx::wayland::key_event& e) {
+    // Nothing routes here any more: the menus' popups are host surfaces (P5-8).
     (void)s;
-    auto& a = *app;
-    if (e.state != lx::wayland::key_state::pressed)
-        return;
-    a.last_key_serial_ = e.serial;
-    if (a.menu_.is_open())
-        a.menu_.key(e.keysym, e.utf8, e.serial);
+    (void)e;
 }
 
 // ── Launching ──

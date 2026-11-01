@@ -433,6 +433,8 @@ public:
     [[nodiscard]] void* layer() const {
         return role_.valid() ? role_.layer().native() : nullptr;
     }
+    /// The layer role (a menu's or tooltip's xdg_popup parent).
+    [[nodiscard]] lx::ui::host::layer_role& popup_parent() { return role_; }
     /// Keyboard interactivity on_demand while one of its menus is open (the menu's grab
     /// then takes the keyboard), none otherwise. Committed at once.
     void set_menu_keyboard(bool on);

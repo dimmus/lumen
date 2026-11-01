@@ -277,6 +277,14 @@ public:
         keyboard_focus_fn_ = fn;
         keyboard_focus_user_ = user;
     }
+    /// Raw seat pointer frames for this surface, beside the tree's routing (the engine
+    /// turns them into hover changes; a view whose dynamic content follows the pointer —
+    /// the portal's pick swatch — reads the positions here). UI affinity.
+    void set_pointer_observer(void (*fn)(const lx::wayland::pointer_frame& f, void* user),
+                              void* user) {
+        pointer_fn_ = fn;
+        pointer_user_ = user;
+    }
     /// `surface_options::presentation_feedback`, from the next frame.
     void set_presentation_feedback(bool on) { presentation_feedback_ = on; }
     /// The earliest deadline the context must wake for (a held key's repeat, a UI timer
@@ -286,7 +294,11 @@ public:
     void on_deadline(std::uint64_t now_ns);
 
     // ── seat events for this surface (the context routes them) ──
-    void route_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) { input_.on_pointer(s, f); }
+    void route_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) {
+        if (pointer_fn_)
+            pointer_fn_(f, pointer_user_);
+        input_.on_pointer(s, f);
+    }
     void route_keyboard_focus(lx::wayland::seat& s, bool entered) {
         input_.on_keyboard_focus(s, entered);
         if (keyboard_focus_fn_)
@@ -391,6 +403,8 @@ private:
     bool presentation_feedback_ = false;
     void (*keyboard_focus_fn_)(bool entered, void* user) = nullptr;
     void* keyboard_focus_user_ = nullptr;
+    void (*pointer_fn_)(const lx::wayland::pointer_frame& f, void* user) = nullptr;
+    void* pointer_user_ = nullptr;
     /// When the outstanding frame callback was requested (a held configure's limit).
     std::uint64_t frame_requested_ns_ = 0;
     /// The wp_linux_drm_syncobj_surface_v1 exists (explicit sync settled on).

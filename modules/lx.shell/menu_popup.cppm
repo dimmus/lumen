@@ -2,28 +2,37 @@ module;
 
 // Popup menus and tooltips of lumen-shell (design-session-and-wm N.4, N.6): the tray's
 // com.canonical.dbusmenu menus, the notification history and a notification's extra
-// actions. Each is an xdg_popup of a layer surface (zwlr_layer_surface_v1.get_popup), a
-// submenu an xdg_popup of its parent menu, every level with an explicit grab on the click's
-// serial — so a click anywhere else closes it (popup_done) and, while the parent layer
-// surface is keyboard-interactive, the keyboard goes to the topmost level: arrows, Return,
-// Space, Escape, Left/Right for submenus and the mnemonic letters ("_Open": O, underlined).
-// The parent surface's owner makes it `on_demand` while a menu is open (the panel takes no
-// keyboard otherwise).
+// actions. Each is an xdg_popup of a layer surface, a submenu an xdg_popup of its parent
+// menu, every level with an explicit grab on the click's serial — so a click anywhere else
+// closes it (popup_done) and, while the parent layer surface is keyboard-interactive, the
+// keyboard goes to the topmost level: arrows, Return, Space, Escape, Left/Right for
+// submenus and the mnemonic letters ("_Open": O, underlined). The parent surface's owner
+// makes it `on_demand` while a menu is open (the panel takes no keyboard otherwise).
 //
-// The tooltip is an xdg_popup without a grab and with an empty input region.
+// The levels are lx.ui trees on lx.ui.host surfaces with a popup role (ADR-010 Phase 5
+// P5-8): the same layout_menu geometry, the canvas's exact palette (view_ui's literal
+// boxes), the rows the tree's interactive nodes — hovering selects (and opens a submenu's
+// row), a release activates, the keyboard is the focused root's and goes through the same
+// key handling as before. The grab focuses the popup surface, and the context's seat router
+// routes what it sends into that level's tree. The tooltip is a popup without a grab and
+// with an empty input region.
 //
 // No Wayland or D-Bus type crosses this interface. Shell thread only; the surfaces exist
 // only while open; nothing runs while closed.
 
 import lx.foundation;
+import lx.gfx;
+import lx.layout;
 import lx.text;
+import lx.ui;
+import lx.ui.host;
 import lx.wayland.client;
 
 export module lx.shell:menu_popup;
 
 import std;
 
-import :shm_canvas;
+import :view_ui;
 
 export namespace lx::shell {
 
@@ -69,14 +78,8 @@ void layout_menu(const std::vector<menu_entry>& items, int (*text_width)(const c
                  void* user, menu_rows& out);
 
 struct menu_globals {
-    /// The connection the popups' wl_surfaces come from (the pointer routes to them by it).
-    lx::wayland::display* display = nullptr;
-    void* compositor = nullptr; // wl_compositor
-    void* shm = nullptr;        // wl_shm
-    void* wm_base = nullptr;    // xdg_wm_base
-    void* seat = nullptr;       // wl_seat
-    void* viewporter = nullptr; // wp_viewporter
-    void* fractional = nullptr; // wp_fractional_scale_manager_v1
+    /// The shell's lx.ui.host context (null: no menu can open).
+    lx::ui::host::context* ui = nullptr;
 };
 
 using menu_icon_fn = const std::uint32_t* (*)(const char* name, int px, void* user);
@@ -96,64 +99,79 @@ public:
     menu_popup& operator=(const menu_popup&) = delete;
 
     void init(menu_globals g, menu_icon_fn icons, void* user);
-    /// Opens `items` under `anchor` (the parent surface's coordinates) of the layer surface
-    /// `layer` (zwlr_layer_surface_v1*), grabbing with `serial` (a button press on that
-    /// surface). A menu already open is closed first.
-    bool open(void* layer, lx::rect2i anchor, std::vector<menu_entry> items, unsigned serial,
-              activate_fn on_activate, closed_fn on_closed, submenu_fn on_submenu, void* user,
-              const char* name);
+    /// Opens `items` under `anchor` (the parent surface's coordinates) of the parent layer
+    /// surface's role, grabbing with `serial` (a button press on that surface). A menu
+    /// already open is closed first.
+    bool open(lx::ui::host::layer_role& layer, lx::rect2i anchor, std::vector<menu_entry> items,
+              unsigned serial, activate_fn on_activate, closed_fn on_closed, submenu_fn on_submenu,
+              void* user, const char* name);
     /// Closes every level (`on_closed` runs).
     void close();
     [[nodiscard]] bool is_open() const { return levels_ > 0; }
-    /// Whether `surface` (wl_surface*) is one of its levels.
-    [[nodiscard]] bool owns(void* surface) const;
     /// The items changed while open (dbusmenu LayoutUpdated): submenus close, the root is
     /// redrawn with the new items at its size (rows that do not fit are dropped).
     void replace_items(std::vector<menu_entry> items);
-
-    // ── Input, routed here by the shell ──
-    void pointer_enter(void* surface, double x, double y);
-    void pointer_leave(void* surface);
-    void pointer_motion(void* surface, double x, double y);
-    void pointer_button(void* surface, unsigned button, bool pressed, unsigned serial);
-    /// A key press while open (keysym; `utf8` for mnemonics), `serial` for submenu grabs.
-    void key(unsigned keysym, const char* utf8, unsigned serial);
+    /// Redraws what changed (the shell's loop, once per dispatch).
     void after_dispatch();
 
-    struct events;
-
 private:
-    friend struct events;
+    friend lx::ui::child menu_describe(lx::ui::build_context& ctx);
+    friend class menu_root_node;
+    /// One open level: its surface, popup role and tree.
     struct level {
-        menu_popup* owner = nullptr;
-        lx::wayland::surface wl{};
-        void* surface = nullptr;  // wl_surface* (wl.native() while open)
-        void* xdg = nullptr;      // xdg_surface*
-        void* popup = nullptr;    // xdg_popup*
+        lx::ui::host::surface surface{};
+        lx::ui::host::popup_role role{};
         std::vector<menu_entry>* items = nullptr;
         menu_rows rows{};
-        shm_canvas canvas{};
         int selected = -1;
-        bool configured = false;
         bool dirty = false;
-        /// The row of the parent level this submenu hangs from.
-        int parent_row = -1;
     };
-    bool open_level(unsigned index, void* parent_xdg, void* parent_layer, lx::rect2i anchor,
+    /// A row's stable identity for the tree's callbacks.
+    struct row_ref {
+        menu_popup* self = nullptr;
+        unsigned index = 0;
+        int row = -1;
+    };
+    /// The root's: the tree's focused node forwards the level's keys.
+    struct root_ref {
+        menu_popup* self = nullptr;
+        unsigned index = 0;
+    };
+    /// An icon's atlas tile, resolved once at a size.
+    struct icon_slot {
+        char name[64]{};
+        int px = 0;
+        lx::gfx::atlas_tile_id tile{};
+    };
+
+    bool open_level(unsigned index, lx::ui::host::popup_role* parent_popup,
+                    lx::ui::host::layer_role* parent_layer, lx::rect2i anchor,
                     std::vector<menu_entry>* items, unsigned serial, bool submenu);
     void close_from(unsigned index);
-    void draw(level& l);
+    void describe_level(unsigned index);
+    [[nodiscard]] lx::ui::child build_ui(unsigned index);
     void activate(unsigned index, int row, unsigned serial);
-    /// The level a surface belongs to, or -1.
-    [[nodiscard]] int level_of(void* surface) const;
     void select(unsigned index, int row);
     int step(const level& l, int from, int dir) const;
+    void key(unsigned index, unsigned keysym, const char* utf8, unsigned serial);
+    [[nodiscard]] lx::gfx::atlas_tile_id icon_tile(unsigned level_index, const char* name, int px);
+    void on_row_hover(const row_ref& ref, bool hovered);
+    void on_row_event(const row_ref& ref, const lx::ui::pointer_event& e);
+    void on_root_key(unsigned index, const lx::ui::key_event& e);
+    void on_level_key_focus(unsigned index, bool entered);
 
     menu_globals g_{};
     menu_icon_fn icons_ = nullptr;
     void* icons_user_ = nullptr;
+    /// The describe frame's attrs scratch (a span into it is copied by the text's apply,
+    /// which runs within the same describe).
+    std::vector<lx::text::text_attr> mnemonic_scratch_{};
     std::vector<menu_entry> root_{};
     level level_[k_menu_max_levels]{};
+    row_ref row_refs_[k_menu_max_levels][k_menu_max_rows]{};
+    root_ref root_refs_[k_menu_max_levels]{};
+    static constexpr unsigned k_icon_slots = 32;
+    icon_slot icon_slots_[k_menu_max_levels][k_icon_slots]{};
     unsigned levels_ = 0;
     activate_fn on_activate_ = nullptr;
     closed_fn on_closed_ = nullptr;
@@ -162,9 +180,11 @@ private:
     unsigned last_serial_ = 0;
     /// Bumped by every `open`: an activation handler that opened another menu keeps it.
     unsigned generation_ = 0;
-    int pointer_level_ = -1;
     char name_[32]{};
 };
+
+/// The levels' describing function (the surface's frame loop calls it inside `run_frame`).
+[[nodiscard]] lx::ui::child menu_describe(lx::ui::build_context& ctx);
 
 /// A tooltip: an xdg_popup of a layer surface, no grab, no input. Up to four lines.
 class tooltip_popup {
@@ -175,29 +195,31 @@ public:
     tooltip_popup& operator=(const tooltip_popup&) = delete;
 
     void init(menu_globals g) { g_ = g; }
-    bool open(void* layer, lx::rect2i anchor, std::string_view title, std::string_view text);
+    bool open(lx::ui::host::layer_role& layer, lx::rect2i anchor, std::string_view title,
+              std::string_view text);
     void close();
-    [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
+    [[nodiscard]] bool is_open() const { return surface_.valid(); }
     void after_dispatch();
 
-    struct events;
-
 private:
-    friend struct events;
-    void draw();
+    friend lx::ui::child tooltip_describe(lx::ui::build_context& ctx);
+    [[nodiscard]] lx::ui::child build_ui();
+    void request_draw();
+
     menu_globals g_{};
-    shm_canvas canvas_{};
-    lx::wayland::surface wl_{};
+    lx::ui::host::surface surface_{};
+    lx::ui::host::popup_role role_{};
+    /// The describe frame's attrs scratch (see `menu_popup`).
+    std::vector<lx::text::text_attr> mnemonic_scratch_{};
     std::string title_{};
     lx::text::wrapped_text text_{};
     std::string body_{};
     int width_ = 0;
     int height_ = 0;
-    void* surface_ = nullptr;
-    void* xdg_ = nullptr;
-    void* popup_ = nullptr;
-    bool configured_ = false;
     bool drawn_ = false;
 };
+
+/// The tooltip's describing function.
+[[nodiscard]] lx::ui::child tooltip_describe(lx::ui::build_context& ctx);
 
 } // namespace lx::shell

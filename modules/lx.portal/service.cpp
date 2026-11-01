@@ -538,7 +538,7 @@ int service::run() {
         if (quit_)
             break;
         after_events();
-        pollfd fds[3]{};
+        pollfd fds[4]{};
         nfds_t n = 0;
         fds[n++] = {sd_bus_get_fd(bus_), static_cast<short>(sd_bus_get_events(bus_)), 0};
         fds[n++] = {sfd, POLLIN, 0};
@@ -549,6 +549,26 @@ int service::run() {
         } else if (req_ && req_->wl) {
             after_events(); // broken: answers 2
             continue;
+        }
+        // The overlay's ui connection (its surfaces' frames and input): flushed here, its
+        // fd polled beside the raw one.
+        bool with_ui = false;
+        if (req_ && req_->ov) {
+            if (!req_->ov->pump_ui()) {
+                after_events();
+                continue;
+            }
+            const int ufd = req_->ov->ui_fd();
+            if (ufd >= 0) {
+                fds[n++] = {ufd, POLLIN, 0};
+                with_ui = true;
+            }
+            // What pump_ui just dispatched (a configure, a frame callback) may need a
+            // frame before the sleep — and the frame's commit a flush after that: with
+            // nothing else waking the poll, both are the difference between an overlay
+            // and a deadlock.
+            after_events();
+            (void)req_->ov->pump_ui();
         }
         uint64_t usec = UINT64_MAX;
         int timeout = -1;
@@ -571,6 +591,10 @@ int service::run() {
         }
         if (with_wl && (fds[2].revents & (POLLIN | POLLHUP | POLLERR))) {
             (void)req_->wl->dispatch_readable();
+            after_events();
+        }
+        if (with_ui && (fds[3].revents & (POLLIN | POLLHUP | POLLERR))) {
+            (void)req_->ov->pump_ui();
             after_events();
         }
     }
@@ -635,7 +659,7 @@ int run_chooser(std::string_view input, std::string& chosen) {
         }
         while (!ov.done()) {
             ov.update();
-            if (!d->pump(-1)) {
+            if (!ov.pump(-1)) {
                 log_portal.warn("chooser: the Wayland connection broke");
                 return 2;
             }
