@@ -26,6 +26,31 @@ timing, import caching, GPU resource pooling, and hot-path CPU budgets.
 | Video/game priority | `content_hint` on `surface_commit` → scanout evaluation |
 | Color-correct compositing | Linear-light workspace; encode once at output |
 
+### Measured: UI (ADR-010 Phase 5, 2026-11-01)
+
+The engine's own rows, this host (VMware SVGA3D, GL the automatic client tier, 2 vCPUs).
+The full table with sources lives in [ui-engine.md](ui-engine.md) §3; what moved each row:
+
+- **G1 (idle)** — the host's idle rule (no frame callback requested, nothing submitted):
+  lumen-shell made 0 context switches in 10 s idle with a panel, a notification history
+  and a tray item (app-smoke N8; it was 1 compositor main-thread switch).
+- **G5 (no steady-frame allocation)** — `test_app_window` counts 0 `operator new` over
+  hover frames on cpu and gl (the ~57 mallocs/frame are libwayland's and Mesa's).
+- **G6 (input→photon)** — drag-smoke g: window-move median 9.6–13.1 ms, p95 17.6–21.7 ms
+  on this host (the max is the SVGA3D flip stall the WARNs carry); cursor-hover median
+  8.8–9.6 ms.
+- **G8 (shell memory)** — RssAnon 23.8 MB fresh, 28.4 MB idle with three window entries
+  and a history. The ≤ 25 MB figure was set when the shell was expected to pin the cpu
+  tier; the shell rides the automatic tier (Vulkan → GL → CPU) like any client, which on
+  this host is GL — accepted, recorded in ADR-010's G8 row.
+- **First panel** — 3.7–8.0 ms of shell work (geometry + swapchain + first tick); the
+  submit→present leg is the host's 25–89 ms SVGA3D flip stall, not client time.
+- **Panel redraw** — 213–309 µs of shell CPU per hover-switched frame (gate 314 µs,
+  schedstat over 240 alternated hovers).
+
+`lumen-ui-bench` S1–S4 rows are per-machine JSON under `tests/bench/results/` compared
+against `tests/bench/baseline/` (§8.1's rules); they are not repeated here.
+
 ---
 
 ## 1.1 Color compositing space

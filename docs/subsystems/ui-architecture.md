@@ -530,6 +530,23 @@ remains. What went, and what replaced it:
 | `lx.ui.builder` fluent builders | `operator|` decorators |
 | lx.layout's old `flex_node` / `grid_node` / `layout_engine`, `scene::container_node::layout()` and `scene_graph::update` | `lx.layout:flex` through `lx.ui:flex` |
 
+The Phase 5 adoption moved every consumer onto the engine, one surface at a time, each
+behind its smoke gate (`lx.ui.host` from Phase 4 runs them all; the compositor's chrome is
+primitives, `shm_canvas` deleted): `lx.app`'s windows (multiple per app), then the shell —
+the panel, the switcher, the notification stack, the launcher, the menus and the tooltip,
+each an `lx.ui.host` surface described into the engine with the same geometry and palette
+it had on the shm canvas (`lx.shell:view_ui`'s literal-colour boxes; the smoke suites pin
+them pixel for pixel), keys through the tree (the launcher's root takes the focused
+keyboard, the menus' grabs route the popup's), pointer input through the seat router — and
+the portal's overlay on its own connection. What the engine gained for them: a keyboard
+focus observer and a raw pointer observer on `lx.ui.host:surface` (the launcher's
+close-on-focus-loss; the pick swatch follows the pointer), and the two-connection drive
+rule — dispatch, then act on it, then flush, before any poll that has nothing inbound
+waiting (a configure answered by the next loop round deadlocks: the compositor waits for
+the ack, the ack sits in the queue). Measured in
+[rendering-performance.md §1](rendering-performance.md#1-design-goals) ("Measured: UI")
+and [ui-engine.md](ui-engine.md) §3–§4 (the engine comparison).
+
 Still to build:
 
 - Drag and drop of anything but text, a drag icon, and the `ask` action (a menu at the drop).

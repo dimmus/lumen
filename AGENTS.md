@@ -322,6 +322,10 @@ client wl_surface.commit
 - **Present mode:** discrete → mailbox, integrated → fifo_relaxed (unless overridden)
 - **Hot path:** respect `hot_path_budget`; warn on exceed, no `info`+ logs per frame
 
+UI engine invariants (ADR-010 Phase 5): primitive stream and instance ring are
+fixed-capacity; a steady UI frame allocates nothing; idle windows request no frame
+callback; themes are compiled, not parsed at runtime.
+
 See [docs/subsystems/rendering-performance.md](docs/subsystems/rendering-performance.md).
 
 ---
