@@ -1524,6 +1524,14 @@ if(LUMEN_BUILD_TESTS)
     target_include_directories(test_layout_grid PRIVATE tests)
     add_test(NAME test_layout_grid COMMAND test_layout_grid)
 
+    # The drag payload's uri-list helpers (lx.ui:clipboard).
+    add_executable(test_clipboard_payload tests/test_clipboard_payload.cpp)
+    target_link_libraries(test_clipboard_payload PRIVATE lx.ui lx.runtime)
+    lumen_apply_module_properties(test_clipboard_payload)
+    lumen_link_platform(test_clipboard_payload)
+    target_include_directories(test_clipboard_payload PRIVATE tests)
+    add_test(NAME test_clipboard_payload COMMAND test_clipboard_payload)
+
     add_executable(test_kms_vkms tests/test_kms_vkms.cpp)
     target_link_libraries(test_kms_vkms PRIVATE lx.drm)
     lumen_apply_module_properties(test_kms_vkms)

@@ -8,6 +8,10 @@ module;
 #include <signal.h>
 #include <unistd.h>
 
+#if defined(LUMEN_HAS_WAYLAND)
+#include <wayland-client.h>
+#endif
+
 module lx.app;
 
 import std;
@@ -28,6 +32,8 @@ constexpr lx::trace::category log_clip{"app.clipboard"};
 /// ask for those). Every one carries the same UTF-8 bytes.
 constexpr const char* k_offered[] = {"text/plain;charset=utf-8", "UTF8_STRING", "text/plain",
                                      "TEXT", "STRING"};
+
+constexpr const char* k_uri_list = "text/uri-list";
 
 /// What a selection or a drop is read as, in order of preference.
 constexpr const char* k_wanted[] = {"text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "TEXT",
@@ -246,6 +252,11 @@ lx::result<void> clipboard::start(lx::wayland::display& d, lx::runtime::event_lo
     lx::ui::clipboard::global().set_sink(&clipboard::sink, this);
     if (channels_[0].device.valid() && host_)
         lx::ui::drag_service::global().set_starter(&clipboard::start_drag, this);
+        lx::ui::drag_service::global().set_chooser(
+            [](void* user, std::uint32_t action) {
+                static_cast<clipboard*>(user)->choose_dnd_action(action);
+            },
+            this);
     // A paste target may close its end before the text is written: EPIPE, not a signal
     // that ends the process (as GIO does, only when nobody chose a disposition).
     struct sigaction now{};
@@ -349,7 +360,10 @@ void clipboard::on_send(lx::wayland::data_source& s, const char* mime, int fd) {
     }
     if (&s == &drag_source_) {
         ++drag_stats_.sends;
-        (void)write(fd, drag_text_);
+        if (std::strcmp(mime, k_uri_list) == 0)
+            (void)write(fd, drag_uri_list());
+        else
+            (void)write(fd, drag_text_);
         return;
     }
     channel* c = channel_of(s);
@@ -421,13 +435,83 @@ void clipboard::on_dnd_finished(lx::wayland::data_source& s) {
     end_drag(moved);
 }
 
+void clipboard::set_drag_icon(const std::uint32_t* argb, unsigned w, unsigned h) {
+#if defined(LUMEN_HAS_WAYLAND)
+    if (!display_ || !argb || w == 0 || h == 0 || w > 512 || h > 512)
+        return;
+    void* compositor = display_->native_global(lx::wayland::global_kind::compositor);
+    void* shm = display_->native_global(lx::wayland::global_kind::shm);
+    if (!compositor || !shm)
+        return;
+    const std::size_t bytes = static_cast<std::size_t>(w) * static_cast<std::size_t>(h) * 4;
+    const int fds[2] = {-1, -1};
+    if (::pipe(fds) != 0)
+        return;
+    const auto* bytes_ptr = reinterpret_cast<const std::uint8_t*>(argb);
+    std::size_t off = 0;
+    while (off < bytes) {
+        const ssize_t n = ::write(fds[1], bytes_ptr + off, bytes - off);
+        if (n <= 0)
+            break;
+        off += static_cast<std::size_t>(n);
+    }
+    ::close(fds[1]);
+    if (off != written_total) {
+        ::close(fds[0]);
+        return;
+    }
+    auto* pool = wl_shm_create_pool(static_cast<wl_shm*>(shm), fds[0],
+                                    static_cast<std::int32_t>(bytes));
+    ::close(fds[0]);
+    if (!pool)
+        return;
+    auto* buffer = wl_shm_pool_create_buffer(
+        pool, 0, static_cast<std::int32_t>(w), static_cast<std::int32_t>(h),
+        static_cast<std::int32_t>(w * 4), WL_SHM_FORMAT_ARGB8888);
+    wl_shm_pool_destroy(pool);
+    if (!buffer)
+        return;
+    if (!icon_surface_) {
+        auto* surface =
+            wl_compositor_create_surface(static_cast<wl_compositor*>(compositor));
+        icon_surface_ = surface;
+    }
+    wl_surface_attach(static_cast<wl_surface*>(icon_surface_), buffer, 0, 0);
+    wl_surface_damage_buffer(static_cast<wl_surface*>(icon_surface_), 0, 0, INT32_MAX,
+                             INT32_MAX);
+    wl_surface_commit(static_cast<wl_surface*>(icon_surface_));
+    wl_buffer_destroy(buffer);
+    icon_w_ = w;
+    icon_h_ = h;
+#endif
+}
+
 void clipboard::end_drag(bool moved) {
     drag_source_.destroy();
     drag_action_ = lx::wayland::k_dnd_none;
+#if defined(LUMEN_HAS_WAYLAND)
+    if (icon_surface_ && display_) {
+        // The drag is over: the icon surface detaches its buffer (the compositor drops
+        // the pointer-following role with the drag) and is kept for the next drag.
+        wl_surface_attach(static_cast<wl_surface*>(icon_surface_), nullptr, 0, 0);
+        wl_surface_commit(static_cast<wl_surface*>(icon_surface_));
+    }
+#endif
     lx::ui::drag_service::global().end(moved);
 }
 
-bool clipboard::start_drag(void* user, const char* utf8) {
+void clipboard::choose_dnd_action(std::uint32_t action) {
+    if (drag_offer_ && drop_ask_) {
+        // The target's half of the `ask` handshake: the chosen action as the preference
+        // (wl_data_offer.set_actions), then the drop is finished as taken.
+        drag_offer_->set_actions(action, action);
+        channels_[0].device.finish_drop(true);
+        drop_ask_ = false;
+        drag_offer_ = nullptr;
+    }
+}
+
+bool clipboard::start_drag(void* user, const lx::ui::drag_payload& payload) {
     auto* self = static_cast<clipboard*>(user);
     channel& c = self->channel_of(lx::ui::clipboard_kind::clipboard);
     lx::wayland::surface* origin = self->host_ ? self->host_->host_drag_origin() : nullptr;
@@ -443,12 +527,21 @@ bool clipboard::start_drag(void* user, const char* utf8) {
     self->drag_source_.set_handler(self);
     for (const char* m : k_offered)
         self->drag_source_.offer(m);
+    if (!payload.uris.empty()) {
+        self->drag_source_.offer(k_uri_list);
+        self->drag_uris_.assign(payload.uris.begin(), payload.uris.end());
+    } else {
+        self->drag_uris_.clear();
+    }
     self->drag_source_.offer(self->own_mime_);
-    self->drag_source_.set_actions(lx::wayland::k_dnd_copy | lx::wayland::k_dnd_move);
-    self->drag_text_ = utf8 ? utf8 : "";
+    self->drag_source_.set_actions(
+        lx::wayland::k_dnd_copy | lx::wayland::k_dnd_move |
+        (payload.ask ? lx::wayland::k_dnd_ask : lx::wayland::k_dnd_none));
+    self->drag_text_ = payload.text ? payload.text : "";
     self->drag_action_ = lx::wayland::k_dnd_none;
     // The press that started it: the button is still held (the compositor's rule).
-    c.device.start_drag(self->drag_source_, *origin, s->last_input_serial());
+    c.device.start_drag(self->drag_source_, *origin, s->last_input_serial(),
+                        static_cast<lx::wayland::surface*>(self->icon_surface_));
     ++self->drag_stats_.started;
     // The compositor holds the pointer now: the press here ends without a click.
     root->pointer_cancel();
@@ -523,12 +616,27 @@ void clipboard::finish_read(reader& r, bool ok) {
         stop_reader(c->pending);
         return;
     }
-    // A drop: inserted where it was dropped, then the offer is done.
+    // A drop: delivered where it was dropped (files or text), then the offer is done.
     bool taken = false;
-    if (ok && drop_root_)
-        taken = drop_root_->drop_text(drop_at_, sanitize_utf8(r.data));
+    if (ok && drop_root_) {
+        if (drop_uris_) {
+            const auto uris = lx::ui::parse_uri_list(sanitize_utf8(r.data));
+            std::vector<std::string_view> views;
+            views.reserve(uris.size());
+            for (const std::string& u : uris)
+                views.emplace_back(u);
+            if (drop_ask_)
+                taken = drop_root_->drop_ask(drop_at_, views, drag_offer_->action());
+            else
+                taken = drop_root_->drop_files(drop_at_, views);
+        } else {
+            taken = drop_root_->drop_text(drop_at_, sanitize_utf8(r.data));
+        }
+    }
     ++(taken ? drag_stats_.drops : drag_stats_.refused);
-    channels_[0].device.finish_drop(taken);
+    if (!drop_ask_)
+        channels_[0].device.finish_drop(taken);
+    // An ask drop stays open: the target's answer arrives through `choose_dnd_action`.
     drop_root_ = nullptr;
     stop_reader(drop_reader_);
 }
@@ -546,6 +654,8 @@ void clipboard::on_drag_enter(lx::wayland::data_device& d, lx::wayland::data_off
     drag_root_ = host_ ? host_->host_root_of(target) : nullptr;
     drag_serial_ = serial;
     drag_mime_ = offer ? wanted_mime(*offer) : nullptr;
+    drop_uris_ = offer && offer->has_mime(k_uri_list);
+    drop_ask_ = offer && offer->action() == lx::wayland::k_dnd_ask;
     drag_at_ = {static_cast<int>(std::floor(x)), static_cast<int>(std::floor(y))};
     update_drop();
 }

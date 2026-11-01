@@ -127,6 +127,12 @@ public:
     void drop_leave();
     /// Dropped at `at`: the target under it inserts `utf8`. False when nothing took it.
     bool drop_text(lx::point2i at, std::string_view utf8);
+    /// Files dropped at `at` (a `text/uri-list` offer): the target under `at`, else false.
+    bool drop_files(lx::point2i at, std::span<const std::string_view> uris);
+    /// The dropped offer negotiated `ask`: the target decides (and answers through
+    /// `drag_service::choose_dnd_action`); false when nothing under `at` asks.
+    bool drop_ask(lx::point2i at, std::span<const std::string_view> uris,
+                  std::uint32_t actions);
     /// A key: Escape dismisses the topmost overlay that takes it; tab moves the focus, others
     /// go to the focused node and its ancestors, then to the tree's `on_key`.
     bool key(key_event event);
@@ -576,6 +582,23 @@ bool lx::ui::ui_root::drop_text(lx::point2i at, std::string_view utf8) {
     drop_leave();
     drop_target* t = root_ ? lx_ui_drop_target_at(pointer_, root_, at) : nullptr;
     return t && t->drop_text(at, utf8);
+}
+
+bool lx::ui::ui_root::drop_files(lx::point2i at, std::span<const std::string_view> uris) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    const context_scope scope{*context_};
+    drop_leave();
+    drop_target* t = root_ ? lx_ui_drop_target_at(pointer_, root_, at) : nullptr;
+    return t && t->drop_files(at, uris);
+}
+
+bool lx::ui::ui_root::drop_ask(lx::point2i at, std::span<const std::string_view> uris,
+                               std::uint32_t actions) {
+    lx::runtime::assert_affinity(lx::runtime::affinity::ui);
+    const context_scope scope{*context_};
+    drop_leave();
+    drop_target* t = root_ ? lx_ui_drop_target_at(pointer_, root_, at) : nullptr;
+    return t && t->drop_ask(at, uris, actions);
 }
 
 bool lx::ui::ui_root::pointer_axis(float dx, float dy) {

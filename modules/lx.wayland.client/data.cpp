@@ -359,12 +359,17 @@ void data_device::set_selection(data_source* source, std::uint32_t serial) {
             static_cast<zwp_primary_selection_source_v1*>(src), serial);
 }
 
-void data_device::start_drag(data_source& source, surface& origin, std::uint32_t serial) {
+void data_device::start_drag(data_source& source, surface& origin, std::uint32_t serial,
+                             surface* icon) {
     if (!proxy_ || !clip(kind_) || !source.valid() || source.kind() != kind_)
         return;
+    if (icon && wl_data_device_get_version(static_cast<wl_data_device*>(proxy_)) < 2)
+        icon = nullptr; // v1 has no icon parameter: the pointer shows the drag
     wl_data_device_start_drag(static_cast<wl_data_device*>(proxy_),
                               static_cast<wl_data_source*>(source.native()),
-                              static_cast<wl_surface*>(origin.native()), nullptr, serial);
+                              static_cast<wl_surface*>(origin.native()),
+                              icon ? static_cast<wl_surface*>(icon->native()) : nullptr,
+                              serial);
 }
 
 void data_device::finish_drop(bool taken) {
