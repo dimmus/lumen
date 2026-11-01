@@ -200,7 +200,6 @@ private:
     friend struct events;
     friend struct view_input;
     enum timer_slot : unsigned {
-        t_repeat,
         t_notice,
         t_debounce,
         t_token,
@@ -527,16 +526,6 @@ private:
     pointer_target pointer_target_ = pointer_target::none;
     bool axis_discrete_seen_ = false;
     double axis_accum_ = 0.0;
-    // Key repeat (wl_keyboard.repeat_info; rate 0 = none). The press being repeated is the
-    // view connection's translation of it (the raw seat's keymap never arrives: it has no
-    // surface to focus, P5-6).
-    int repeat_rate_ = 25;
-    int repeat_delay_ = 600;
-    unsigned repeat_code_ = 0;
-    unsigned repeat_serial_ = 0;
-    key_press repeat_press_{};
-    bool repeat_ctrl_ = false;
-    bool repeat_shift_ = false;
     unsigned last_key_serial_ = 0;
     view_input view_input_{};
     /// When the switcher's hold began (its open delay is measured from here).
@@ -578,9 +567,6 @@ private:
     /// The launcher menu's entry and the catalog generation it belongs to.
     unsigned launcher_menu_entry_ = 0;
     unsigned launcher_menu_gen_ = 0;
-    /// Whether the launcher has the keyboard (a menu over it takes it for a while), and the
-    /// wl_callback* of the round trip after its menu closed that tells whether it came back.
-    bool launcher_kb_ = false;
     void* launcher_refocus_ = nullptr;
     unsigned menu_key_ = 0;
     unsigned menu_output_ = 0;
@@ -847,9 +833,6 @@ struct lx::shell::shell_app::events {
             a.pointer_panel_ = o->bar.get();
             a.last_panel_output_ = o->name;
             a.pointer_panel_->pointer_enter(px, py);
-        } else if (s && s == a.launcher_.surface()) {
-            a.pointer_target_ = pointer_target::launcher;
-            a.launcher_.pointer_enter(px, py);
         } else {
             a.pointer_target_ = pointer_target::none;
         }
@@ -858,8 +841,6 @@ struct lx::shell::shell_app::events {
         auto& a = self(data);
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_leave();
-        else if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_leave();
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_leave(s);
         a.pointer_surface_ = nullptr;
@@ -871,8 +852,6 @@ struct lx::shell::shell_app::events {
         const double px = wl_fixed_to_double(x), py = wl_fixed_to_double(y);
         if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_motion(px, py);
-        else if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_motion(px, py);
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_motion(a.pointer_surface_, px, py);
     }
@@ -886,21 +865,10 @@ struct lx::shell::shell_app::events {
             a.pointer_panel_->pointer_button(button, down, serial);
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_button(a.pointer_surface_, button, down, serial);
-        else if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_button(serial, button, down);
     }
-    static void ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value) {
-        auto& a = self(data);
-        if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL || a.axis_discrete_seen_ ||
-            a.pointer_target_ != pointer_target::launcher)
-            return;
-        // Continuous scrolling (touchpads): one row per row height of motion.
-        a.axis_accum_ += wl_fixed_to_double(value);
-        const int rows = static_cast<int>(a.axis_accum_ / (k_launcher_row_h * 3));
-        if (rows) {
-            a.axis_accum_ -= rows * (k_launcher_row_h * 3);
-            a.launcher_.pointer_scroll_steps(rows);
-        }
+    static void ptr_axis(void*, wl_pointer*, uint32_t, uint32_t, wl_fixed_t) {
+        // Continuous scroll reached the launcher only (the wheel's discrete notches are the
+        // panel's); the launcher scrolls through its ui tree now (P5-7).
     }
     static void ptr_frame(void* data, wl_pointer*) { self(data).axis_discrete_seen_ = false; }
     static void ptr_axis_source(void*, wl_pointer*, uint32_t) {}
@@ -912,13 +880,12 @@ struct lx::shell::shell_app::events {
         if (axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
             return;
         a.axis_discrete_seen_ = true;
-        if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_scroll_steps(discrete);
-        else if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
+        if (a.pointer_target_ == pointer_target::panel && a.pointer_panel_)
             a.pointer_panel_->pointer_scroll(discrete);
     }
 
-    // ── wl_keyboard: only the launcher ever has keyboard focus ──
+    // ── wl_keyboard: the raw seat's keymap only (the menus' canvas views translate on the
+    //    views' connection; the launcher's keyboard is its ui host surface's, P5-7) ──
     static void kb_keymap(void* data, wl_keyboard*, uint32_t format, int32_t fd, uint32_t size) {
         auto& a = self(data);
         if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1) {
@@ -926,29 +893,13 @@ struct lx::shell::shell_app::events {
             return;
         }
         if (!a.xkb_.set_keymap(fd, size))
-            log_shell.warn("keymap not usable: the launcher takes no typing");
+            log_shell.warn("keymap not usable");
     }
-    static void kb_enter(void* data, wl_keyboard*, uint32_t, wl_surface* s, wl_array*) {
-        auto& a = self(data);
-        if (s && s == a.launcher_.surface()) {
-            a.launcher_kb_ = true;
-            a.launcher_.keyboard_enter();
-        }
-    }
-    static void kb_leave(void* data, wl_keyboard*, uint32_t, wl_surface* s) {
-        auto& a = self(data);
-        a.set_timer(t_repeat, 0);
-        a.repeat_code_ = 0;
-        if (s && s == a.launcher_.surface()) {
-            a.launcher_kb_ = false;
-            // Its own menu took the keyboard: the launcher stays (`launcher_menu_closed`).
-            if (a.menu_kind_ == menu_kind::launcher)
-                return;
-            a.launcher_.keyboard_leave();
-            if (!a.launcher_.is_open())
-                a.set_apps_all(false);
-        }
-    }
+    static void kb_enter(void*, wl_keyboard*, uint32_t, wl_surface*, wl_array*) {}
+    static void kb_leave(void*, wl_keyboard*, uint32_t, wl_surface*) {}
+    // The raw seat repeats nothing (the ui host's router repeats into the trees, P5-7); the
+    // slot must exist — libwayland aborts on a NULL listener entry.
+    static void kb_repeat(void*, wl_keyboard*, int32_t, int32_t) {}
     static void kb_key(void* data, wl_keyboard*, uint32_t serial, uint32_t, uint32_t key,
                        uint32_t state) {
         self(data).on_key(serial, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
@@ -956,10 +907,6 @@ struct lx::shell::shell_app::events {
     static void kb_modifiers(void* data, wl_keyboard*, uint32_t, uint32_t dep, uint32_t lat,
                              uint32_t lock, uint32_t group) {
         self(data).xkb_.update_mods(dep, lat, lock, group);
-    }
-    static void kb_repeat(void* data, wl_keyboard*, int32_t rate, int32_t delay) {
-        self(data).repeat_rate_ = rate;
-        self(data).repeat_delay_ = delay;
     }
 
 #if defined(LUMEN_SHELL_ACTIVATION)
@@ -1227,7 +1174,6 @@ void lx::shell::shell_app::events::seat_caps(void* data, wl_seat* seat, uint32_t
     } else if (!has_kb && a.keyboard_) {
         release_keyboard(a.keyboard_);
         a.keyboard_ = nullptr;
-        a.set_timer(t_repeat, 0);
     }
 }
 
@@ -1692,14 +1638,6 @@ void lx::shell::shell_app::on_timer() {
     std::uint64_t expirations = 0;
     (void)!read(timer_fd_, &expirations, sizeof(expirations));
     const long long now = now_ns();
-    if (deadline_[t_repeat] && deadline_[t_repeat] <= now) {
-        deadline_[t_repeat] = 0;
-        if (repeat_code_ && launcher_.is_open() && repeat_rate_ > 0) {
-            // The held press as the views' connection translated it (see repeat_press_).
-            launcher_.key(repeat_serial_, repeat_press_, repeat_ctrl_, repeat_shift_);
-            deadline_[t_repeat] = now + 1000000000LL / repeat_rate_;
-        }
-    }
     if (deadline_[t_notice] && deadline_[t_notice] <= now) {
         deadline_[t_notice] = 0;
         set_notice_all(nullptr);
@@ -1883,8 +1821,6 @@ void lx::shell::shell_app::on_lock_state(unsigned state) {
         tooltip_.close();
         set_timer(t_tooltip, 0);
         pointer_target_ = pointer_target::none;
-        repeat_code_ = 0;
-        set_timer(t_repeat, 0);
     }
     if (s == shell_lock::abandoned) {
         const long long delay = idle_.relaunch_delay(now_ns());
@@ -1923,33 +1859,13 @@ void lx::shell::shell_app::on_lock_requested(unsigned reason) {
 // ── Keyboard ──
 
 void lx::shell::shell_app::on_key(unsigned serial, unsigned code, bool pressed) {
-    if (!pressed) {
-        if (code == repeat_code_) {
-            repeat_code_ = 0;
-            set_timer(t_repeat, 0);
-        }
+    // The launcher's keys arrive through its ui tree (P5-7); the raw keyboard is the
+    // menus' only (a menu that grabbed the keyboard from its panel's surface).
+    if (!menu_.is_open())
         return;
-    }
-    last_key_serial_ = serial;
     key_press k{};
-    if (menu_.is_open()) {
-        if (xkb_.press(code, k))
-            menu_.key(k.keysym, k.utf8, serial);
-        return;
-    }
-    if (!launcher_.is_open() || !xkb_.press(code, k))
-        return;
-    launcher_.key(serial, k, xkb_.ctrl(), xkb_.shift());
-    if (k.repeats && repeat_rate_ > 0 && launcher_.is_open()) {
-        repeat_code_ = code;
-        repeat_serial_ = serial;
-        set_timer(t_repeat, now_ns() + static_cast<long long>(repeat_delay_) * 1000000LL);
-    } else {
-        repeat_code_ = 0;
-        set_timer(t_repeat, 0);
-    }
-    if (!launcher_.is_open())
-        set_apps_all(false);
+    if (pressed && xkb_.press(code, k))
+        menu_.key(k.keysym, k.utf8, serial);
 }
 
 // ── The canvas views' seat input (the ui host's unrouted frames; P5-6) ──────────────
@@ -1964,24 +1880,17 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
         if (surf && a.menu_.owns(surf)) {
             a.pointer_target_ = pointer_target::menu;
             a.menu_.pointer_enter(surf, f.x, f.y);
-        } else if (surf && surf == a.launcher_.surface()) {
-            a.pointer_target_ = pointer_target::launcher;
-            a.launcher_.pointer_enter(f.x, f.y);
         } else {
             a.pointer_target_ = pointer_target::none;
         }
     } else if (f.mask & pf::has_leave) {
-        if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_leave();
-        else if (a.pointer_target_ == pointer_target::menu)
+        if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_leave(surf);
         a.pointer_surface_ = nullptr;
         a.pointer_target_ = pointer_target::none;
     }
     if (f.mask & pf::has_motion) {
-        if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_motion(f.x, f.y);
-        else if (a.pointer_target_ == pointer_target::menu)
+        if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_motion(surf, f.x, f.y);
     }
     if (f.mask & pf::has_button) {
@@ -1990,94 +1899,29 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
             a.last_press_serial_ = f.serial;
         if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_button(surf, f.button, down, f.serial);
-        else if (a.pointer_target_ == pointer_target::launcher)
-            a.launcher_.pointer_button(f.serial, f.button, down);
-    }
-    if (f.mask & (pf::has_axis | pf::has_axis_value120)) {
-        if (a.pointer_target_ != pointer_target::launcher)
-            return;
-        if ((f.mask & pf::has_axis_value120) && f.value120[0] != 0) {
-            // Detents: one row per three detents' worth, as the continuous path's notch.
-            a.launcher_.pointer_scroll_steps(f.value120[0] / 120);
-        } else if (!(f.mask & pf::has_axis_value120)) {
-            // Continuous (touchpad): one row per row height of motion.
-            a.axis_accum_ += f.axis_value[0];
-            const int rows = static_cast<int>(a.axis_accum_ / (k_launcher_row_h * 3));
-            if (rows) {
-                a.axis_accum_ -= rows * (k_launcher_row_h * 3);
-                a.launcher_.pointer_scroll_steps(rows);
-            }
-        }
     }
 }
 
 void lx::shell::shell_app::view_input::on_unrouted_keyboard_focus(
     lx::wayland::seat& s, lx::wayland::surface* target, std::uint32_t serial, bool entered) {
+    // The launcher's keyboard focus is its ui host surface's now (P5-7: the surface's own
+    // focus handler closes it when the keyboard leaves, unless its menu took it); the
+    // unrouted focus is a canvas view's — the menus'.
     (void)s;
+    (void)target;
     (void)serial;
-    auto& a = *app;
-    void* surf = target ? target->native() : nullptr;
-    const bool launcher_focus = surf && surf == a.launcher_.surface();
-    if (!entered) {
-        a.set_timer(t_repeat, 0);
-        a.repeat_code_ = 0;
-        if (launcher_focus) {
-            a.launcher_kb_ = false;
-            // Its own menu took the keyboard: the launcher stays (`launcher_menu_closed`).
-            if (a.menu_kind_ == menu_kind::launcher)
-                return;
-            a.launcher_.keyboard_leave();
-            if (!a.launcher_.is_open())
-                a.set_apps_all(false);
-        }
-        return;
-    }
-    if (launcher_focus) {
-        a.launcher_kb_ = true;
-        a.launcher_.keyboard_enter();
-    }
+    (void)entered;
 }
 
 void lx::shell::shell_app::view_input::on_unrouted_key(lx::wayland::seat& s,
                                                        const lx::wayland::key_event& e) {
+    (void)s;
     auto& a = *app;
-    if (e.state != lx::wayland::key_state::pressed) {
-        if (e.key == a.repeat_code_) {
-            a.repeat_code_ = 0;
-            a.set_timer(t_repeat, 0);
-        }
+    if (e.state != lx::wayland::key_state::pressed)
         return;
-    }
     a.last_key_serial_ = e.serial;
-    key_press k{};
-    k.keysym = e.keysym;
-    std::memcpy(k.utf8, e.utf8, sizeof(k.utf8));
-    k.repeats = e.repeats;
-    const bool ctrl = (e.modifiers & lx::wayland::mod_ctrl) != 0;
-    const bool shift = (e.modifiers & lx::wayland::mod_shift) != 0;
-    if (a.menu_.is_open()) {
-        a.menu_.key(k.keysym, k.utf8, e.serial);
-        return;
-    }
-    if (!a.launcher_.is_open())
-        return;
-    a.launcher_.key(e.serial, k, ctrl, shift);
-    if (k.repeats && a.launcher_.is_open()) {
-        const int rate = s.repeat_rate();
-        if (rate <= 0)
-            return;
-        a.repeat_rate_ = rate;
-        a.repeat_delay_ = s.repeat_delay_ms();
-        a.repeat_code_ = e.key;
-        a.repeat_serial_ = e.serial;
-        a.repeat_press_ = k;
-        a.repeat_ctrl_ = ctrl;
-        a.repeat_shift_ = shift;
-        a.set_timer(t_repeat, now_ns() + static_cast<long long>(a.repeat_delay_) * 1000000LL);
-    } else {
-        a.repeat_code_ = 0;
-        a.set_timer(t_repeat, 0);
-    }
+    if (a.menu_.is_open())
+        a.menu_.key(e.keysym, e.utf8, e.serial);
 }
 
 // ── Launching ──
@@ -2116,13 +1960,11 @@ void lx::shell::shell_app::close_launcher() {
         menu_.close();
     launcher_.close();
     set_apps_all(false);
-    repeat_code_ = 0;
-    set_timer(t_repeat, 0);
     set_timer(t_debounce, 0);
 }
 
 void lx::shell::shell_app::launcher_menu_closed() {
-    if (!launcher_.is_open() || launcher_kb_ || launcher_refocus_)
+    if (!launcher_.is_open() || launcher_.keyboard_present() || launcher_refocus_)
         return;
     // The compositor gives the keyboard back to the launcher when the menu goes (Escape, a
     // click outside) unless something else took it (a window activated meanwhile). Its
@@ -2133,10 +1975,9 @@ void lx::shell::shell_app::launcher_menu_closed() {
                 auto& a = *static_cast<shell_app*>(data);
                 wl_callback_destroy(cb);
                 a.launcher_refocus_ = nullptr;
-                if (a.launcher_.is_open() && !a.launcher_kb_ && a.menu_kind_ == menu_kind::none) {
-                    a.launcher_.keyboard_leave();
-                    if (!a.launcher_.is_open())
-                        a.set_apps_all(false);
+                if (a.launcher_.is_open() && !a.launcher_.keyboard_present() &&
+                    a.menu_kind_ == menu_kind::none) {
+                    a.close_launcher();
                 }
             },
     };
@@ -2491,11 +2332,7 @@ int lx::shell::shell_app::run() {
     apps_.set_outcome_handler(
         [](const launch_outcome& o, void* user) { static_cast<shell_app*>(user)->on_outcome(o); },
         this);
-    launcher_.init({.display = client_.connected() ? &client_ : nullptr,
-                    .compositor = client_.native_global(lx::wayland::global_kind::compositor),
-                    .shm = client_.native_global(lx::wayland::global_kind::shm),
-                    .viewporter = client_.native_global(lx::wayland::global_kind::viewporter),
-                    .fractional = client_.native_global(lx::wayland::global_kind::fractional_scale)},
+    launcher_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr},
                    catalog_,
                    [](unsigned entry, unsigned serial, void* user) {
                        static_cast<shell_app*>(user)->launch_entry(entry, serial);
@@ -2505,12 +2342,16 @@ int lx::shell::shell_app::run() {
                        if (a.menu_kind_ == menu_kind::launcher)
                            a.menu_.close();
                        a.set_apps_all(false);
-                       a.repeat_code_ = 0;
-                       a.set_timer(t_repeat, 0);
                    },
                    this);
     launcher_.set_menu_handler([](unsigned entry, lx::rect2i anchor, unsigned serial, void* user) {
         static_cast<shell_app*>(user)->open_launcher_menu(entry, anchor, serial);
+    });
+    // The keyboard's leaving the launcher must not close it while its own menu has it (the
+    // popup grabs, and returns the keyboard when it is done).
+    launcher_.set_keyboard_stay([](void* user) {
+        auto& a = *static_cast<shell_app*>(user);
+        return a.menu_kind_ == menu_kind::launcher && a.menu_.is_open();
     });
     // The visual bell (zlm v6) flashes over windows through overlay layer surfaces.
     bell_.init({.display = client_.connected() ? &client_ : nullptr,

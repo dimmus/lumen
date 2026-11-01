@@ -271,6 +271,12 @@ public:
 
     /// Draw every frame (whole surface damaged) while true — `lumen-hello --frames`.
     void set_continuous(bool on) { continuous_ = on; }
+    /// The keyboard focus entered or left this surface (the context's seat router). The
+    /// launcher closes when it loses the keyboard to anything else (Kickoff's rule).
+    void set_keyboard_focus_handler(void (*fn)(bool entered, void* user), void* user) {
+        keyboard_focus_fn_ = fn;
+        keyboard_focus_user_ = user;
+    }
     /// `surface_options::presentation_feedback`, from the next frame.
     void set_presentation_feedback(bool on) { presentation_feedback_ = on; }
     /// The earliest deadline the context must wake for (a held key's repeat, a UI timer
@@ -281,7 +287,11 @@ public:
 
     // ── seat events for this surface (the context routes them) ──
     void route_pointer(lx::wayland::seat& s, const lx::wayland::pointer_frame& f) { input_.on_pointer(s, f); }
-    void route_keyboard_focus(lx::wayland::seat& s, bool entered) { input_.on_keyboard_focus(s, entered); }
+    void route_keyboard_focus(lx::wayland::seat& s, bool entered) {
+        input_.on_keyboard_focus(s, entered);
+        if (keyboard_focus_fn_)
+            keyboard_focus_fn_(entered, keyboard_focus_user_);
+    }
     void route_key(lx::wayland::seat& s, const lx::wayland::key_event& e) { input_.on_key(s, e); }
     void route_modifiers(lx::wayland::seat& s, std::uint32_t m) { input_.on_modifiers(s, m); }
     void route_repeat_info(lx::wayland::seat& s, std::int32_t r, std::int32_t d) { input_.on_repeat_info(s, r, d); }
@@ -379,6 +389,8 @@ private:
     bool waiting_release_ = false;
     bool continuous_ = false;
     bool presentation_feedback_ = false;
+    void (*keyboard_focus_fn_)(bool entered, void* user) = nullptr;
+    void* keyboard_focus_user_ = nullptr;
     /// When the outstanding frame callback was requested (a held configure's limit).
     std::uint64_t frame_requested_ns_ = 0;
     /// The wp_linux_drm_syncobj_surface_v1 exists (explicit sync settled on).

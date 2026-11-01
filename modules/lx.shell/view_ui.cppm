@@ -31,7 +31,9 @@ struct shell_box_props {
     void* user = nullptr;
 };
 
-class shell_box_node final : public lx::ui::control_node {
+/// A control whose boxes are literal colours. Not final: a view's root extends it to take
+/// its tree's keys or wheel (the launcher's).
+class shell_box_node : public lx::ui::control_node {
 public:
     [[nodiscard]] static lx::ui::element_type_id static_type() {
         static const lx::ui::element_type_id id = lx::ui::next_element_type_id();

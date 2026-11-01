@@ -11,8 +11,11 @@ module;
 #endif
 
 import lx.foundation;
+import lx.layout;
 import lx.text;
 import lx.trace;
+import lx.ui;
+import lx.ui.host;
 import lx.wayland.client;
 
 export module lx.shell:launcher;
@@ -21,7 +24,7 @@ import std;
 
 import :desktop_entry;
 import :app_catalog;
-import :shm_canvas;
+import :view_ui;
 
 export namespace lx::shell {
 
@@ -165,25 +168,28 @@ struct key_press {
 // ── The launcher ──────────────────────────────────────────────────────────────
 
 struct launcher_globals {
-    /// The connection its wl_surface and layer surface come from.
-    lx::wayland::display* display = nullptr;
-    void* compositor = nullptr;  // wl_compositor
-    void* shm = nullptr;         // wl_shm
-    /// Optional: with both, the launcher renders at the output's fractional scale.
-    void* viewporter = nullptr;  // wp_viewporter
-    void* fractional = nullptr;  // wp_fractional_scale_manager_v1
+    /// The shell's lx.ui.host context (null: the launcher cannot be created).
+    lx::ui::host::context* ui = nullptr;
 };
 
 /// The application launcher: an overlay-layer surface under the panel's left end
 /// (keyboard on_demand — the compositor focuses it on map), with a search field, the
 /// matching applications and a status row. It exists only while open: open creates the
-/// surface and its buffers, close frees them, so an idle shell holds no launcher memory.
-/// Closes on Escape (with an empty query), on its toggle, on launch, and when it loses
-/// the keyboard (a click elsewhere, a window taking focus).
-class launcher : private lx::wayland::layer_handler {
+/// surface, close frees it, so an idle shell holds no launcher memory. Closes on Escape
+/// (with an empty query), on its toggle, on launch, and when it loses the keyboard (a
+/// click elsewhere, a window taking focus).
+///
+/// The view is an lx.ui tree on an lx.ui.host surface (ADR-010 Phase 5 P5-7): the same
+/// `layout_launcher` geometry, described into the engine's retained tree with the canvas's
+/// exact palette (view_ui's literal boxes). The root is the tree's focused node — every key
+/// arrives at it and goes through the model's own key handling (editing, the arrows, the
+/// word shortcuts), so the semantics are the canvas's; the rows are the tree's interactive
+/// nodes (hover and press ride the engine's states, a release on the pressed row launches,
+/// a right press opens its menu), and the wheel scrolls the page.
+class launcher {
 public:
     launcher() = default;
-    ~launcher() override;
+    ~launcher();
     launcher(const launcher&) = delete;
     launcher& operator=(const launcher&) = delete;
 
@@ -201,79 +207,87 @@ public:
     /// `output_w`×`output_h` logical; false when it cannot.
     bool open(int output_w, int output_h, int panel_h, unsigned output_slot = ~0u);
     void close();
-    /// While closed: paints the frame `open` would show first (same size, `scale120`) into
-    /// memory that is never shown, then frees it. The first open's frame then finds its text
-    /// shaped and its glyphs rasterised, as every later open does, rather than doing that
-    /// work between the key press and the frame.
+    /// While closed: nothing to warm — the glyphs and their atlas pages are the context's,
+    /// shared with the panel that has already shaped them (P5-7); a no-op kept for the
+    /// shell's start-up path.
     void prepare(int output_w, int output_h, int panel_h, unsigned scale120);
-    [[nodiscard]] bool is_open() const { return surface_ != nullptr; }
-    [[nodiscard]] void* surface() const { return surface_; }
+    [[nodiscard]] bool is_open() const { return surface_.valid(); }
+    [[nodiscard]] void* surface() const {
+        return surface_.valid() ? surface_.wl().native() : nullptr;
+    }
     /// zwlr_layer_surface_v1* while open (a menu's parent).
-    [[nodiscard]] void* layer() const { return wl_layer_.native(); }
+    [[nodiscard]] void* layer() const { return role_.valid() ? role_.layer().native() : nullptr; }
     /// Rows get a menu (null: none; the handler gets `init`'s `user`).
     void set_menu_handler(menu_fn fn) { on_menu_ = fn; }
+    /// True when the keyboard's leaving must not close the launcher (its own menu took it);
+    /// asked at the leave, `init`'s `user`.
+    void set_keyboard_stay(bool (*fn)(void* user)) { keyboard_stay_ = fn; }
+    /// The keyboard is on the launcher's surface right now (its menu may have taken it: the
+    /// shell's refocus check asks after the menu goes).
+    [[nodiscard]] bool keyboard_present() const { return had_keyboard_; }
     [[nodiscard]] launcher_model& model() { return model_; }
     /// Shows `text` in the status row until the query changes; null clears it.
     void set_notice(const char* text);
     /// The catalog was rescanned: re-rank.
     void catalog_changed();
-    /// Draws if something changed and the last frame was shown.
+    /// Re-describes what changed and runs the surface's frame loop.
     void after_dispatch();
 
-    // ── Input, routed here by the shell ──
-    void keyboard_enter();
-    void keyboard_leave();
-    void key(unsigned serial, const key_press& k, bool ctrl, bool shift);
-    void pointer_enter(double x, double y);
-    void pointer_leave();
-    void pointer_motion(double x, double y);
-    void pointer_button(unsigned serial, unsigned button, bool pressed);
-    /// Wheel notches (positive: down).
-    void pointer_scroll_steps(int steps);
-
-    struct events;
-
 private:
-    friend struct events;
-    void on_configure(lx::wayland::layer_surface& l, const lx::wayland::layer_configure& c) override;
-    void on_closed(lx::wayland::layer_surface& l) override;
-    void draw(bool force);
-    void paint(int bi, const launcher_layout& l, const lx::rect2i* rects, unsigned n);
-    void paint_search(int bi, const launcher_layout& l);
-    void paint_row(int bi, const launcher_layout& l, unsigned i);
-    void paint_status(int bi, const launcher_layout& l);
+    /// The root's stable identity for the tree's callbacks.
+    struct root_ref {
+        launcher* self = nullptr;
+    };
+    /// A row's: `match` is the model's match index (the entry follows from it).
+    struct row_ref {
+        launcher* self = nullptr;
+        unsigned match = 0;
+    };
+
+    friend lx::ui::child launcher_describe(lx::ui::build_context& ctx);
+    friend class launcher_root_node;
+    [[nodiscard]] lx::ui::child build_ui();
     void make_view(launcher_view& v) const;
+    void request_repaint();
     void closed_by_itself(const char* why);
+    // The tree's forwarded input (the root and the rows).
+    void on_root_key(const lx::ui::key_event& e);
+    void on_root_pointer(const lx::ui::pointer_event& e);
+    void on_row_event(const row_ref& ref, const lx::ui::pointer_event& e);
+    void on_row_hover(const row_ref& ref, bool hovered);
+    void on_keyboard_focus(bool entered);
+    void launch_selected(unsigned serial);
+    void menu_for(unsigned match, unsigned serial);
 
     launcher_globals g_{};
     app_catalog* catalog_ = nullptr;
     launch_fn on_launch_ = nullptr;
     closed_fn on_closed_ = nullptr;
     menu_fn on_menu_ = nullptr;
+    bool (*keyboard_stay_)(void* user) = nullptr;
     void* user_ = nullptr;
     launcher_model model_{};
-    shm_canvas canvas_{};
-    launcher_layout drawn_[2]{};
-    launcher_layout committed_{};
-    launcher_layout next_{};
-    lx::wayland::surface wl_surface_{};
-    lx::wayland::layer_surface wl_layer_{};
-    void* surface_ = nullptr; // wl_surface* (wl_surface_.native() while open)
+    lx::ui::host::surface surface_{};
+    lx::ui::host::layer_role role_{};
+    launcher_view layout_view_{};
+    launcher_layout layout_{};
     int width_ = 0;
     int height_ = 0;
     unsigned rows_ = k_launcher_min_rows;
-    bool configured_ = false;
-    bool must_commit_ = false;
     bool dirty_ = false;
     bool had_keyboard_ = false;
-    double pointer_x_ = -1.0;
-    double pointer_y_ = -1.0;
-    int hover_ = -1;
+    /// The row the left press began on (a release on it launches); its serial.
     int pressed_ = -1;
     unsigned press_serial_ = 0;
+    root_ref root_ref_{};
+    row_ref row_refs_[k_launcher_max_rows]{};
     char notice_[192]{};
     unsigned notice_rev_ = 0;
 };
+
+/// The launcher's describing function (the surface's frame loop calls it inside
+/// `run_frame`; `launcher::after_dispatch` holds the guard that names the view).
+[[nodiscard]] lx::ui::child launcher_describe(lx::ui::build_context& ctx);
 
 } // namespace lx::shell
 
@@ -558,7 +572,8 @@ lx::shell::launcher_key_result lx::shell::launcher_model::key(unsigned sym, cons
     return launcher_key_result::changed;
 }
 
-// ── Drawing ──────────────────────────────────────────────────────────────────
+
+// ── Drawing: the launcher as an lx.ui tree ────────────────────────────────────
 
 namespace {
 
@@ -569,114 +584,115 @@ constexpr std::uint32_t k_lhover = 0xFF34343Au;
 constexpr std::uint32_t k_lpressed = 0xFF2A2A30u;
 constexpr std::uint32_t k_lselected = 0xFF3D6FB4u;
 constexpr std::uint32_t k_lcaret = 0xFFE6E6E6u;
-constexpr lx::text::raster_color k_ltext{0xE6, 0xE6, 0xE6, 0xFF};
-constexpr lx::text::raster_color k_ltext_selected{0xFF, 0xFF, 0xFF, 0xFF};
-constexpr lx::text::raster_color k_ltext_dim{0xA8, 0xA8, 0xAC, 0xFF};
-constexpr lx::text::raster_color k_ltext_dim_selected{0xD0, 0xDC, 0xEE, 0xFF};
-constexpr lx::text::raster_color k_ltext_warning{0xF0, 0xB4, 0x5A, 0xFF};
+constexpr std::uint32_t k_ltext = 0xFFE6E6E6u;
+constexpr std::uint32_t k_ltext_selected = 0xFFFFFFFFu;
+constexpr std::uint32_t k_ltext_dim = 0xFFA8A8ACu;
+constexpr std::uint32_t k_ltext_dim_selected = 0xFFD0DCEEu;
+constexpr std::uint32_t k_ltext_warning = 0xFFF0B45Au;
 constexpr lx::text::font_desc k_lfont{"Sans", 10.f, lx::text::weight::normal,
                                       lx::text::style::normal};
 constexpr lx::text::font_desc k_lfont_search{"Sans", 11.f, lx::text::weight::normal,
                                              lx::text::style::normal};
 constexpr int k_lpad = 12;
 
+lx::shell::launcher* g_describing = nullptr;
+struct describing_guard {
+    explicit describing_guard(lx::shell::launcher* v) : previous_{g_describing} {
+        g_describing = v;
+    }
+    ~describing_guard() { g_describing = previous_; }
+    describing_guard(const describing_guard&) = delete;
+    describing_guard& operator=(const describing_guard&) = delete;
+
+private:
+    lx::shell::launcher* previous_;
+};
+
+[[nodiscard]] lx::ui::style at(lx::rect2i r) {
+    return lx::ui::style{}
+        .absolute()
+        .top(lx::layout::px(static_cast<float>(r.y)))
+        .left(lx::layout::px(static_cast<float>(r.x)))
+        .w(lx::layout::px(static_cast<float>(r.width)))
+        .h(lx::layout::px(static_cast<float>(r.height)));
+}
+
+/// One line of text in the launcher's fonts.
+[[nodiscard]] lx::ui::child launcher_text(const char* text, std::uint32_t argb,
+                                          const lx::text::font_desc& font,
+                                          lx::ui::element_key key) {
+    lx::ui::text_block_props t{};
+    t.text = text;
+    t.font = font;
+    t.color = lx::shell::shell_color(argb);
+    t.wrap = lx::text::text_wrap::none;
+    t.context = lx::ui::active_ui_resources().text;
+    return lx::ui::text_block(t, key);
+}
+
+/// The text's width at `scale`, as the canvas measured it for the generic-name fit.
+[[nodiscard]] int launcher_text_width(const char* text, const lx::text::font_desc& font,
+                                      float scale) {
+    lx::text::font_desc f = font;
+    f.size_pt = static_cast<float>(f.size_pt * scale);
+    lx::text::shaped_line line{};
+    if (!lx::text::shape_line(text, f, line))
+        return 0;
+    return static_cast<int>(std::ceil(line.width_px / scale));
+}
+
 } // namespace
 
-void lx::shell::launcher::paint_search(int bi, const launcher_layout& l) {
-    const lx::rect2i box = launcher_search_rect(l);
-    canvas_.fill(bi, box, k_lsearch);
-    const char* q = model_.query();
-    const int x0 = k_lpad;
-    const int pw = canvas_.text_width("\xE2\x80\xBA", k_lfont_search);
-    (void)canvas_.text(bi, {x0, 0, 16, k_launcher_search_h}, "\xE2\x80\xBA", k_ltext_dim,
-                       k_lfont_search);
-    const int tx = x0 + (pw > 0 ? pw : 8) + 8;
-    const int tw = l.width - tx - k_lpad;
-    if (!q[0]) {
-        (void)canvas_.text(bi, {tx, 0, tw, k_launcher_search_h}, "Type to search", k_ltext_dim,
-                           k_lfont_search);
-        canvas_.fill(bi, {tx - 1, 12, 2, k_launcher_search_h - 24}, k_lcaret);
-        return;
-    }
-    (void)canvas_.text(bi, {tx, 0, tw, k_launcher_search_h}, q, k_ltext, k_lfont_search);
-    int qw = canvas_.text_width(q, k_lfont_search);
-    qw = qw < 0 ? 0 : (qw > tw - 2 ? tw - 2 : qw);
-    // A static caret after the text: no blinking, so no timer.
-    canvas_.fill(bi, {tx + qw + 1, 12, 2, k_launcher_search_h - 24}, k_lcaret);
-}
+namespace lx::shell {
 
-void lx::shell::launcher::paint_row(int bi, const launcher_layout& l, unsigned i) {
-    const lx::rect2i box = launcher_row_rect(l, i);
-    canvas_.fill(bi, box, k_lbg);
-    const launcher_row& r = l.row[i];
-    const desktop_entry* e = catalog_ && r.entry != ~0u ? catalog_->entry(r.entry) : nullptr;
-    if (!e)
-        return;
-    const lx::rect2i cell{box.x + 4, box.y + 2, box.width - 8, box.height - 4};
-    std::uint32_t bgc = k_lbg;
-    if (r.flags & row_pressed)
-        bgc = k_lpressed;
-    else if (r.flags & row_selected)
-        bgc = k_lselected;
-    else if (r.flags & row_hover)
-        bgc = k_lhover;
-    if (bgc != k_lbg)
-        canvas_.fill_rounded(bi, cell, bgc, k_lbg);
-    const bool sel = (r.flags & row_selected) != 0;
-    const int inner_x = cell.x + 8;
-    const int inner_w = cell.width - 16;
-    int name_w = inner_w;
-    int gw = 0;
-    if (!e->generic_name.empty() && e->generic_name != e->name) {
-        gw = canvas_.text_width(e->generic_name.data(), k_lfont);
-        const int nw = canvas_.text_width(e->name.data(), k_lfont);
-        // GenericName right-aligned and dimmed, only when both fit whole.
-        if (gw > 0 && nw > 0 && nw + 24 + gw <= inner_w)
-            name_w = inner_w - gw - 24;
-        else
-            gw = 0;
-    }
-    // The name first: it is what the canvas shaped last.
-    (void)canvas_.text(bi, {inner_x, cell.y, name_w, cell.height}, e->name.data(),
-                       sel ? k_ltext_selected : k_ltext, k_lfont);
-    if (gw > 0)
-        (void)canvas_.text(bi, {inner_x + inner_w - gw, cell.y, gw, cell.height},
-                           e->generic_name.data(), sel ? k_ltext_dim_selected : k_ltext_dim,
-                           k_lfont, shm_canvas::align::right);
-}
+/// The root: the launcher's background, and the tree's focused node — every key the
+/// surface's keyboard produces goes through it into the model's own handling, and the
+/// wheel over whatever no row took scrolls the page.
+struct launcher_root_props {
+    shell_box_props box{};
+    launcher* self = nullptr;
+};
 
-void lx::shell::launcher::paint_status(int bi, const launcher_layout& l) {
-    const lx::rect2i box = launcher_status_rect(l);
-    canvas_.fill(bi, box, k_lsearch);
-    char line[224];
-    if (l.notice) {
-        (void)canvas_.text(bi, {k_lpad, box.y, l.width - 2 * k_lpad, box.height}, notice_,
-                           k_ltext_warning, k_lfont);
-        return;
+class launcher_root_node final : public shell_box_node {
+public:
+    [[nodiscard]] static lx::ui::element_type_id static_type() {
+        static const lx::ui::element_type_id id = lx::ui::next_element_type_id();
+        return id;
     }
-    std::snprintf(line, sizeof(line), l.total == 1 ? "%u application" : "%u applications", l.total);
-    (void)canvas_.text(bi, {k_lpad, box.y, l.width - 2 * k_lpad, box.height}, line, k_ltext_dim,
-                       k_lfont);
-}
+    [[nodiscard]] lx::ui::element_type_id type() const override { return static_type(); }
+    [[nodiscard]] const char* type_name() const override { return "launcher_root"; }
 
-void lx::shell::launcher::paint(int bi, const launcher_layout& l, const lx::rect2i* rects,
-                                unsigned n) {
-    for (unsigned r = 0; r < n; ++r) {
-        const lx::rect2i& rect = rects[r];
-        const bool whole = rect.width == l.width && rect.height == l.height;
-        if (whole || rect.y < k_launcher_search_h)
-            paint_search(bi, l);
-        for (unsigned i = 0; i < l.rows; ++i) {
-            const lx::rect2i rr = launcher_row_rect(l, i);
-            if (whole || (rect.y < rr.y + rr.height && rect.y + rect.height > rr.y))
-                paint_row(bi, l, i);
-        }
-        const lx::rect2i sr = launcher_status_rect(l);
-        if (whole || rect.y + rect.height > sr.y)
-            paint_status(bi, l);
-        if (whole)
-            return;
+    bool apply(const launcher_root_props& p) {
+        self_ = p.self;
+        return shell_box_node::apply(p.box);
     }
+
+    bool on_focus_key(lx::ui::key_event event, lx::ui::focus_manager& focus) override {
+        (void)focus;
+        if (self_)
+            self_->on_root_key(event);
+        return true; // the launcher owns every key while it has the keyboard
+    }
+
+    bool on_pointer(const lx::ui::pointer_event& e) override {
+        if (self_)
+            self_->on_root_pointer(e);
+        return shell_box_node::on_pointer(e);
+    }
+
+private:
+    launcher* self_ = nullptr;
+};
+
+} // namespace lx::shell
+
+namespace {
+
+} // namespace
+
+lx::ui::child lx::shell::launcher_describe(lx::ui::build_context&) {
+    lx::shell::launcher* v = g_describing;
+    return v ? v->build_ui() : nullptr;
 }
 
 void lx::shell::launcher::make_view(launcher_view& v) const {
@@ -684,12 +700,181 @@ void lx::shell::launcher::make_view(launcher_view& v) const {
     v.count = model_.count();
     v.selection = model_.selection();
     v.first = model_.first();
-    v.hover = hover_;
+    v.hover = -1; // the engine's hover states paint it now
     v.pressed = pressed_;
     v.query_rev = model_.query_rev();
     v.notice_rev = notice_rev_;
     v.notice = notice_[0] != '\0';
     v.catalog_gen = catalog_ ? catalog_->generation() : 0;
+}
+
+lx::ui::child lx::shell::launcher::build_ui() {
+    make_view(layout_view_);
+    layout_launcher(layout_view_, width_, height_, rows_, layout_);
+
+    const unsigned first = layout_.first;
+    lx::ui::child kids[3 + k_launcher_max_rows];
+    unsigned n = 0;
+
+    // The search row: the prompt, the query (or the placeholder) and a static caret after
+    // it — no blinking, so no timer (as the canvas drew it).
+    {
+        const char* q = model_.query();
+        lx::ui::child search[3];
+        unsigned s = 0;
+        search[s++] = launcher_text("\xE2\x80\xBA", k_ltext_dim, k_lfont_search, 0x8100u);
+        const int pw = launcher_text_width("\xE2\x80\xBA", k_lfont_search, 1.f);
+        const int tx = k_lpad + (pw > 0 ? pw : 8) + 8;
+        const int tw = layout_.width - tx - k_lpad;
+        lx::ui::child caret{};
+        if (!q[0]) {
+            search[s++] = launcher_text("Type to search", k_ltext_dim, k_lfont_search, 0x8101u);
+            lx::ui::quad_style c{};
+            c.background = shell_color(k_lcaret);
+            lx::shell::shell_box_props cb{};
+            cb.control.layout = lx::ui::style{}
+                                    .absolute()
+                                    .top(lx::layout::px(12.f))
+                                    .left(lx::layout::px(static_cast<float>(tx - 1)))
+                                    .w(lx::layout::px(2.f))
+                                    .h(lx::layout::px(static_cast<float>(k_launcher_search_h - 24)));
+            cb.rest = c;
+            search[s++] = lx::shell::shell_box(cb, {}, 0x8102u);
+        } else {
+            search[s++] = launcher_text(q, k_ltext, k_lfont_search, 0x8103u);
+            int qw = launcher_text_width(q, k_lfont_search, 1.f);
+            qw = qw < 0 ? 0 : (qw > tw - 2 ? tw - 2 : qw);
+            lx::ui::quad_style c{};
+            c.background = shell_color(k_lcaret);
+            lx::shell::shell_box_props cb{};
+            cb.control.layout = lx::ui::style{}
+                                    .absolute()
+                                    .top(lx::layout::px(12.f))
+                                    .left(lx::layout::px(static_cast<float>(tx + qw + 1)))
+                                    .w(lx::layout::px(2.f))
+                                    .h(lx::layout::px(static_cast<float>(k_launcher_search_h - 24)));
+            cb.rest = c;
+            search[s++] = lx::shell::shell_box(cb, {}, 0x8104u);
+        }
+        lx::ui::quad_style sb{};
+        sb.background = shell_color(k_lsearch);
+        lx::shell::shell_box_props box{};
+        box.control.layout = at(launcher_search_rect(layout_));
+        box.rest = sb;
+        kids[n++] = lx::shell::shell_box(box, {search, s}, 0x8105u);
+    }
+
+    // A page of rows: each an interactive cell (hover and press are the engine's states;
+    // the selection is the model's), the name and — when both fit whole — the dimmed
+    // generic name right-aligned.
+    for (unsigned i = 0; i < layout_.rows; ++i) {
+        const launcher_row& r = layout_.row[i];
+        const lx::rect2i box = launcher_row_rect(layout_, i);
+        const lx::rect2i cell{box.x + 4, box.y + 2, box.width - 8, box.height - 4};
+        row_refs_[i] = {this, first + i};
+        const desktop_entry* e =
+            catalog_ && r.entry != ~0u ? catalog_->entry(r.entry) : nullptr;
+        if (!e) {
+            lx::shell::shell_box_props empty{};
+            empty.control.layout = at(cell);
+            kids[n++] = lx::shell::shell_box(empty, {}, 0x8200'0000u + i);
+            continue;
+        }
+        const bool sel = (r.flags & row_selected) != 0;
+        const int inner_x = cell.x + 8;
+        const int inner_w = cell.width - 16;
+        int name_w = inner_w;
+        int gw = 0;
+        if (!e->generic_name.empty() && e->generic_name != e->name) {
+            gw = launcher_text_width(e->generic_name.data(), k_lfont, 1.f);
+            const int nw = launcher_text_width(e->name.data(), k_lfont, 1.f);
+            // GenericName right-aligned and dimmed, only when both fit whole.
+            if (gw > 0 && nw > 0 && nw + 24 + gw <= inner_w)
+                name_w = inner_w - gw - 24;
+            else
+                gw = 0;
+        }
+        lx::ui::child inside[3];
+        unsigned m = 0;
+        inside[m++] = launcher_text(e->name.data(), sel ? k_ltext_selected : k_ltext, k_lfont,
+                                    0x8201'0000u + i);
+        if (gw > 0) {
+            lx::ui::text_block_props t{};
+            t.text = e->generic_name.data();
+            t.font = k_lfont;
+            t.color = shell_color(sel ? k_ltext_dim_selected : k_ltext_dim);
+            t.wrap = lx::text::text_wrap::none;
+            t.align = lx::text::text_align::end;
+            t.context = lx::ui::active_ui_resources().text;
+            inside[m++] = lx::ui::text_block(t, 0x8202'0000u + i);
+        }
+        lx::shell::shell_box_props row{};
+        row.control.layout = at(cell).flex_row().items_center().overflow_hidden();
+        row.control.interactive = true;
+        // Pressed over selected over hover, as the canvas painted (the engine's states).
+        lx::ui::quad_style sel_q{}, hover_q{}, press_q{};
+        sel_q.background = shell_color(k_lselected);
+        hover_q.background = shell_color(k_lhover);
+        press_q.background = shell_color(k_lpressed);
+        for (float& cr : sel_q.corner_radii)
+            cr = 4.f;
+        for (float& cr : hover_q.corner_radii)
+            cr = 4.f;
+        for (float& cr : press_q.corner_radii)
+            cr = 4.f;
+        if (sel) {
+            row.rest = sel_q;
+            row.hover = sel_q;
+        } else {
+            row.hover = hover_q;
+        }
+        row.active = press_q;
+        row.notify = [](void* user, bool hovered) {
+            static_cast<row_ref*>(user)->self->on_row_hover(*static_cast<row_ref*>(user),
+                                                             hovered);
+        };
+        row.event = [](void* user, const lx::ui::pointer_event& e) {
+            static_cast<row_ref*>(user)->self->on_row_event(*static_cast<row_ref*>(user), e);
+        };
+        row.user = &row_refs_[i];
+        kids[n++] = lx::shell::shell_box(row, {inside, m}, 0x8203'0000u + i);
+    }
+
+    // The status row: the notice until the query changes, else the count.
+    {
+        char line[224];
+        const char* text = line;
+        if (layout_.notice) {
+            text = notice_;
+        } else {
+            std::snprintf(line, sizeof(line),
+                          layout_.total == 1 ? "%u application" : "%u applications",
+                          layout_.total);
+        }
+        const lx::ui::child status_text[1] = {launcher_text(
+            text, layout_.notice ? k_ltext_warning : k_ltext_dim, k_lfont, 0x8300u)};
+        lx::ui::quad_style sb{};
+        sb.background = shell_color(k_lsearch);
+        lx::shell::shell_box_props box{};
+        box.control.layout = at(launcher_status_rect(layout_));
+        box.rest = sb;
+        kids[n++] = lx::shell::shell_box(box, status_text, 0x8301u);
+    }
+
+    // The root: the launcher's background over everything, focused (every key is the
+    // model's), the wheel over the page scrolls it.
+    launcher_root_props root{};
+    root.box.control.layout = lx::ui::style{}
+                                  .w(lx::layout::percent(100.f))
+                                  .h(lx::layout::percent(100.f));
+    root.box.control.focusable = true;
+    lx::ui::quad_style bg{};
+    bg.background = shell_color(k_lbg);
+    root.box.rest = bg;
+    root.self = this;
+    root_ref_ = {this};
+    return lx::ui::with_children(
+        lx::ui::describe<launcher_root_node, launcher_root_props>(root, 0x8000u), {kids, n});
 }
 
 void lx::shell::launcher::set_notice(const char* text) {
@@ -703,15 +888,65 @@ void lx::shell::launcher::set_notice(const char* text) {
 
 void lx::shell::launcher::catalog_changed() {
     model_.refresh();
-    hover_ = pressed_ = -1;
     dirty_ = true;
 }
 
-void lx::shell::launcher::key(unsigned serial, const key_press& k, bool ctrl, bool shift) {
-    if (!is_open())
+// ── Input, forwarded from the tree ────────────────────────────────────────────
+
+void lx::shell::launcher::on_root_key(const lx::ui::key_event& e) {
+    if (!is_open() || !e.pressed)
         return;
+    // The keysyms the model knows, from the engine's key event: the named keys, the
+    // keypad's enter, the Menu key and F10 by their Linux keycodes, a character's
+    // codepoint as the printable keysym.
+    unsigned sym = 0;
+    char utf8[16]{};
+    const unsigned kc = e.keycode;
+    switch (e.key) {
+    case lx::ui::key::enter: sym = kc == 96 ? 0xff8d : 0xff0d; break;
+    case lx::ui::key::escape: sym = 0xff1b; break;
+    case lx::ui::key::up: sym = 0xff52; break;
+    case lx::ui::key::down: sym = 0xff54; break;
+    case lx::ui::key::tab: sym = 0xff09; break;
+    case lx::ui::key::page_up: sym = 0xff55; break;
+    case lx::ui::key::page_down: sym = 0xff56; break;
+    case lx::ui::key::home: sym = 0xff50; break;
+    case lx::ui::key::end: sym = 0xff57; break;
+    case lx::ui::key::backspace: sym = 0xff08; break;
+    default:
+        if (kc == 139)
+            sym = 0xff67; // Menu
+        else if (kc == 76)
+            sym = 0xffc7; // F10
+        else if (e.codepoint >= 0x20 && e.codepoint != 0x7f) {
+            sym = e.codepoint < 0x80 ? e.codepoint : 0;
+            char* out = utf8;
+            char32_t cp = e.codepoint;
+            if (cp < 0x80) {
+                *out++ = static_cast<char>(cp);
+            } else if (cp < 0x800) {
+                *out++ = static_cast<char>(0xC0 | (cp >> 6));
+                *out++ = static_cast<char>(0x80 | (cp & 0x3F));
+            } else if (cp < 0x10000) {
+                *out++ = static_cast<char>(0xE0 | (cp >> 12));
+                *out++ = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                *out++ = static_cast<char>(0x80 | (cp & 0x3F));
+            } else {
+                *out++ = static_cast<char>(0xF0 | (cp >> 18));
+                *out++ = static_cast<char>(0x80 | ((cp >> 12) & 0x3F));
+                *out++ = static_cast<char>(0x80 | ((cp >> 6) & 0x3F));
+                *out++ = static_cast<char>(0x80 | (cp & 0x3F));
+            }
+        }
+        break;
+    }
+    if (!sym && !utf8[0])
+        return;
+    const bool ctrl = (e.modifiers & lx::ui::k_mod_ctrl) != 0;
+    const bool shift = (e.modifiers & lx::ui::k_mod_shift) != 0;
     const unsigned rev = model_.query_rev();
-    switch (model_.key(k.keysym, k.utf8, ctrl, shift)) {
+    const unsigned serial = g_.ui ? g_.ui->last_press_serial() : 0u;
+    switch (model_.key(sym, utf8, ctrl, shift)) {
     case launcher_key_result::ignored: return;
     case launcher_key_result::changed:
         if (model_.query_rev() != rev && notice_[0])
@@ -719,138 +954,104 @@ void lx::shell::launcher::key(unsigned serial, const key_press& k, bool ctrl, bo
         dirty_ = true;
         return;
     case launcher_key_result::close: closed_by_itself("escape"); return;
-    case launcher_key_result::launch: {
-        const int e = model_.selected_entry();
-        if (e >= 0 && on_launch_)
-            on_launch_(static_cast<unsigned>(e), serial, user_);
-        return;
-    }
-    case launcher_key_result::menu: {
-        // The selection is on the page (the model scrolls to it); its row is the anchor.
-        const int e = model_.selected_entry();
-        const unsigned sel = model_.selection();
-        if (e < 0 || !on_menu_ || sel < committed_.first ||
-            sel - committed_.first >= committed_.rows)
-            return;
-        on_menu_(static_cast<unsigned>(e), launcher_row_rect(committed_, sel - committed_.first),
-                 serial, user_);
-        return;
-    }
+    case launcher_key_result::launch: launch_selected(serial); return;
+    case launcher_key_result::menu: menu_for(model_.selection(), serial); return;
     }
 }
 
-void lx::shell::launcher::keyboard_enter() { had_keyboard_ = true; }
+void lx::shell::launcher::launch_selected(unsigned serial) {
+    const int e = model_.selected_entry();
+    if (e >= 0 && on_launch_)
+        on_launch_(static_cast<unsigned>(e), serial, user_);
+}
 
-void lx::shell::launcher::keyboard_leave() {
-    // Kickoff's close-on-deactivate: a click elsewhere or a window taking the keyboard.
-    if (is_open() && had_keyboard_)
+void lx::shell::launcher::menu_for(unsigned match, unsigned serial) {
+    // The selection is on the page (the model scrolls to it); its row is the anchor.
+    const int e = model_.entry_at(match);
+    if (e < 0 || !on_menu_ || match < layout_.first || match - layout_.first >= layout_.rows)
+        return;
+    on_menu_(static_cast<unsigned>(e), launcher_row_rect(layout_, match - layout_.first), serial,
+             user_);
+}
+
+void lx::shell::launcher::on_root_pointer(const lx::ui::pointer_event& e) {
+    // The wheel over whatever no row took: notches of three rows, as the shell's axis
+    // handler always scrolled it (the rows re-judge the hover against the new page).
+    if (e.kind != lx::ui::pointer_kind::wheel || e.dy == 0.f)
+        return;
+    model_.scroll((e.dy > 0.f ? 1 : -1) * 3);
+    dirty_ = true;
+}
+
+void lx::shell::launcher::on_row_hover(const row_ref& ref, bool hovered) {
+    (void)ref;
+    (void)hovered;
+    // Hover paints itself (the engine's states); the model selects on the press.
+}
+
+void lx::shell::launcher::on_row_event(const row_ref& ref, const lx::ui::pointer_event& e) {
+    const bool left = e.button == lx::ui::mouse_button::left;
+    switch (e.kind) {
+    case lx::ui::pointer_kind::press:
+        if (!left)
+            return;
+        pressed_ = static_cast<int>(ref.match);
+        press_serial_ = g_.ui ? g_.ui->last_press_serial() : 0u;
+        model_.select(ref.match);
+        dirty_ = true;
+        return;
+    case lx::ui::pointer_kind::release:
+        if (!left)
+            return;
+        if (pressed_ == static_cast<int>(ref.match)) {
+            const unsigned serial = press_serial_;
+            pressed_ = -1;
+            dirty_ = true;
+            const int entry = model_.entry_at(ref.match);
+            // The press is the triggering event: its serial is the one a token may cite.
+            if (entry >= 0 && on_launch_)
+                on_launch_(static_cast<unsigned>(entry), serial, user_);
+        } else {
+            pressed_ = -1;
+        }
+        return;
+    // The menu opens on the press, which its grab cites; the row becomes the selection.
+    case lx::ui::pointer_kind::secondary: {
+        model_.select(ref.match);
+        dirty_ = true;
+        menu_for(ref.match, g_.ui ? g_.ui->last_press_serial() : 0u);
+        return;
+    }
+    default: return;
+    }
+}
+
+void lx::shell::launcher::on_keyboard_focus(bool entered) {
+    if (entered) {
+        had_keyboard_ = true;
+        // The tree's keys are the focused node's, and nothing is focused until something
+        // focuses it: the root takes it on the keyboard's arrival (programmatic — no ring).
+        if (lx::ui::ui_node* tree = surface_.valid() ? surface_.root().tree() : nullptr)
+            (void)surface_.root().focus().focus(*tree, lx::ui::focus_cause::programmatic);
+        return;
+    }
+    const bool had = had_keyboard_;
+    had_keyboard_ = false;
+    // Kickoff's close-on-deactivate: a click elsewhere or a window taking the keyboard —
+    // unless the launcher's own menu took it (its popup grabs, and returns it when done).
+    if (is_open() && had && !(keyboard_stay_ && keyboard_stay_(user_)))
         closed_by_itself("keyboard leave");
 }
 
-void lx::shell::launcher::pointer_enter(double x, double y) { pointer_motion(x, y); }
-
-void lx::shell::launcher::pointer_leave() {
-    if (hover_ >= 0 || pressed_ >= 0)
-        dirty_ = true;
-    hover_ = pressed_ = -1;
-    pointer_x_ = pointer_y_ = -1.0;
-}
-
-void lx::shell::launcher::pointer_motion(double x, double y) {
-    pointer_x_ = x;
-    pointer_y_ = y;
-    const int h = launcher_hit(committed_, x, y);
-    if (h != hover_) {
-        hover_ = h;
-        dirty_ = true;
-    }
-}
-
-void lx::shell::launcher::pointer_button(unsigned serial, unsigned button, bool down) {
-    constexpr unsigned k_btn_left = 0x110, k_btn_right = 0x111;
-    if (!is_open())
-        return;
-    const int h = launcher_hit(committed_, pointer_x_, pointer_y_);
-    if (button == k_btn_right) {
-        // The menu opens on the press, which its grab cites; the row becomes the selection.
-        if (!down || h < 0 || !on_menu_)
-            return;
-        model_.select(static_cast<unsigned>(h));
-        dirty_ = true;
-        const int e = model_.entry_at(static_cast<unsigned>(h));
-        if (e >= 0 && static_cast<unsigned>(h) >= committed_.first)
-            on_menu_(static_cast<unsigned>(e),
-                     launcher_row_rect(committed_, static_cast<unsigned>(h) - committed_.first),
-                     serial, user_);
-        return;
-    }
-    if (button != k_btn_left)
-        return;
-    if (down) {
-        pressed_ = h;
-        press_serial_ = serial;
-        if (h >= 0)
-            model_.select(static_cast<unsigned>(h));
-        dirty_ = true;
-        return;
-    }
-    const int p = pressed_;
-    pressed_ = -1;
-    dirty_ = true;
-    if (p >= 0 && p == h) {
-        const int e = model_.entry_at(static_cast<unsigned>(p));
-        // The press is the triggering event: its serial is the one a token may cite.
-        if (e >= 0 && on_launch_)
-            on_launch_(static_cast<unsigned>(e), press_serial_, user_);
-    }
-}
-
-void lx::shell::launcher::pointer_scroll_steps(int steps) {
-    if (!is_open() || steps == 0)
-        return;
-    model_.scroll(steps * 3);
-    hover_ = -1; // re-judged at the next motion against the new page
-    dirty_ = true;
-}
-
 void lx::shell::launcher::closed_by_itself(const char* why) {
-    if (log_launcher.enabled(lx::trace::level::debug)) {
+    if (log_launcher.enabled(lx::trace::level::debug))
         log_launcher.debug("launcher: close ({})", why);
-    }
     close();
     if (on_closed_)
         on_closed_(user_);
 }
 
 #if defined(LUMEN_SHELL_WAYLAND)
-
-struct lx::shell::launcher::events {};
-
-void lx::shell::launcher::on_configure(lx::wayland::layer_surface& layer,
-                                       const lx::wayland::layer_configure& c) {
-    layer.ack_configure(c.serial);
-    const int nw = c.size.width ? c.size.width : width_;
-    const int nh = c.size.height ? c.size.height : height_;
-    if (nw != width_ || nh != height_ || !canvas_.allocated()) {
-        width_ = nw;
-        height_ = nh;
-        committed_.width = 0;
-        drawn_[0].width = drawn_[1].width = 0;
-        if (!canvas_.allocate(g_.shm, nw, nh, "lumen-launcher")) {
-            log_launcher.error("cannot allocate launcher buffers");
-            closed_by_itself("no buffers");
-            return;
-        }
-        // Allocated at the scale known now (it arrives before the first configure).
-        (void)canvas_.take_rescale();
-    }
-    configured_ = true;
-    must_commit_ = true;
-}
-
-void lx::shell::launcher::on_closed(lx::wayland::layer_surface&) {
-    closed_by_itself("closed by the compositor");
-}
 
 void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_fn on_launch,
                                closed_fn on_closed, void* user) {
@@ -865,144 +1066,109 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
 bool lx::shell::launcher::open(int output_w, int output_h, int panel_h, unsigned output_slot) {
     if (is_open())
         return true;
-    if (!g_.display || !g_.compositor || !g_.shm || output_w <= 0)
+    if (!g_.ui || !g_.ui->started() || output_w <= 0)
         return false;
     const launcher_geometry geo = launcher_size(output_w, output_h > 0 ? output_h : 600, panel_h);
-    if (!wl_surface_.create(*g_.display))
-        return false;
-    if (auto made = wl_layer_.create(*g_.display, wl_surface_,
-                                     {.output_slot = output_slot,
-                                      .level = lx::wayland::layer::overlay,
-                                      .name_space = "lumen-launcher"});
-        !made) {
+    lx::ui::host::surface_options so{};
+    so.describe = &launcher_describe;
+    so.size = {geo.width, geo.height};
+    so.opaque = true; // a solid panel of colour, as the canvas's opaque region said
+    so.frame_records = false;
+    if (auto made = surface_.create(*g_.ui, so); !made) {
         log_launcher.error(made.get_error());
-        wl_surface_.destroy();
         return false;
     }
-    wl_layer_.set_handler(this);
-    surface_ = wl_surface_.native();
-    auto* surface = static_cast<wl_surface*>(surface_);
-    canvas_.attach_scale(g_.viewporter, g_.fractional, surface);
-    wl_layer_.set_anchor(lx::wayland::anchor_top | lx::wayland::anchor_left);
-    wl_layer_.set_size({geo.width, geo.height});
+    lx::ui::host::layer_role_options lo{};
+    lo.layer.output_slot = output_slot;
+    lo.layer.level = lx::wayland::layer::overlay;
+    lo.layer.name_space = "lumen-launcher";
+    lo.size = {geo.width, geo.height};
+    lo.anchor = lx::wayland::anchor_top | lx::wayland::anchor_left;
     // Zone 0: placed beneath the panel's exclusive zone, reserving none of its own.
-    wl_layer_.set_exclusive_zone(0);
-    wl_layer_.set_margin(k_launcher_margin, 0, 0, k_launcher_margin);
-    (void)wl_layer_.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::on_demand);
-    if (auto* region = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
-        wl_region_add(region, 0, 0, geo.width, geo.height);
-        wl_surface_set_opaque_region(surface, region);
-        wl_region_destroy(region);
+    lo.exclusive_zone = 0;
+    lo.margin[0] = k_launcher_margin; // top
+    lo.margin[3] = k_launcher_margin; // left
+    lo.keyboard = lx::wayland::keyboard_interactivity::on_demand;
+    if (auto made = role_.create(surface_, lo); !made) {
+        log_launcher.error(made.get_error());
+        surface_.destroy();
+        return false;
     }
-    wl_surface_commit(surface);
+    role_.set_closed_handler(
+        [](void* user) {
+            static_cast<launcher*>(user)->closed_by_itself("closed by the compositor");
+        },
+        this);
+    surface_.set_keyboard_focus_handler(
+        [](bool entered, void* user) { static_cast<launcher*>(user)->on_keyboard_focus(entered); },
+        this);
+    if (auto shown = surface_.show(); !shown) {
+        log_launcher.error(shown.get_error());
+        role_.destroy();
+        surface_.destroy();
+        return false;
+    }
     width_ = geo.width;
     height_ = geo.height;
     rows_ = geo.rows;
-    configured_ = false;
-    must_commit_ = false;
     had_keyboard_ = false;
-    hover_ = pressed_ = -1;
+    pressed_ = -1;
     notice_[0] = '\0';
     ++notice_rev_;
     model_.reset();
     model_.set_rows(rows_);
-    committed_.width = 0;
+    layout_ = {};
     dirty_ = true;
-    log_launcher.info("launcher: open ({} applications, {}x{}, {} rows)", model_.count(), geo.width,
-                      geo.height, geo.rows);
+    log_launcher.info("launcher: open ({} applications, {}x{}, {} rows)", model_.count(),
+                      geo.width, geo.height, geo.rows);
     return true;
 }
 
-void lx::shell::launcher::prepare(int output_w, int output_h, int panel_h, unsigned scale120) {
-    if (is_open() || !catalog_ || output_w <= 0)
-        return;
-    const launcher_geometry geo = launcher_size(output_w, output_h > 0 ? output_h : 600, panel_h);
-    if (!canvas_.allocate_offscreen(geo.width, geo.height, scale120))
-        return;
-    width_ = geo.width;
-    height_ = geo.height;
-    rows_ = geo.rows;
-    model_.reset();
-    model_.set_rows(rows_);
-    launcher_view v;
-    make_view(v);
-    launcher_layout first{};
-    layout_launcher(v, width_, height_, rows_, first);
-    const lx::rect2i whole{0, 0, first.width, first.height};
-    paint(0, first, &whole, 1);
-    canvas_.free();
-    model_.reset();
+void lx::shell::launcher::prepare(int, int, int, unsigned) {
+    // Nothing to warm: the glyphs and their atlas pages are the context's, shared with the
+    // panel and the notification stack that have already shaped these fonts.
 }
 
 void lx::shell::launcher::close() {
     if (!is_open())
         return;
-    canvas_.free(); // ~1.9 MB at 420×560: an idle shell holds none of it
-    canvas_.release_scale(); // before the wl_surface it extends
-    (void)canvas_.take_rescale();
-    wl_layer_.destroy();
-    wl_surface_.destroy();
-    surface_ = nullptr;
-    configured_ = false;
+    role_.destroy();
+    surface_.destroy(); // the swapchain with it: an idle shell holds none of it
     had_keyboard_ = false;
-    committed_.width = 0;
-    drawn_[0].width = drawn_[1].width = 0;
+    pressed_ = -1;
+    layout_ = {};
     model_.reset();
     log_launcher.info("launcher: close");
 }
 
-void lx::shell::launcher::after_dispatch() {
-    if (!is_open() || !configured_)
+void lx::shell::launcher::request_repaint() {
+    if (!surface_.valid())
         return;
-    if (canvas_.take_rescale()) {
-        // A new preferred scale: new buffers at the same logical size, all repainted.
-        committed_.width = 0;
-        drawn_[0].width = drawn_[1].width = 0;
-        if (!canvas_.allocate(g_.shm, width_, height_, "lumen-launcher")) {
-            log_launcher.error("cannot allocate launcher buffers");
-            closed_by_itself("no buffers");
-            return;
-        }
-        must_commit_ = true;
-    }
-    if (must_commit_) {
-        draw(true);
-        return;
-    }
-    if (dirty_ && !canvas_.frame_pending())
-        draw(false);
+    surface_.root().set_describer(&launcher_describe);
+    surface_.root().add_repaint({0, 0, width_, height_});
 }
 
-void lx::shell::launcher::draw(bool force) {
-    const int bi = canvas_.acquire();
-    if (bi < 0)
-        return; // a release re-runs this (dirty_ / must_commit_ stay set)
-    launcher_view v;
-    make_view(v);
-    layout_launcher(v, width_, height_, rows_, next_);
-    lx::rect2i damage[k_launcher_max_rows + 2];
-    const unsigned nd = launcher_diff(committed_, next_, damage, k_launcher_max_rows + 2);
-    if (nd == 0 && !force) {
-        dirty_ = false;
+void lx::shell::launcher::after_dispatch() {
+    if (!is_open())
         return;
+    if (dirty_) {
+        request_repaint();
+        dirty_ = false;
     }
-    lx::rect2i repaint[k_launcher_max_rows + 2];
-    const unsigned nr = launcher_diff(drawn_[bi], next_, repaint, k_launcher_max_rows + 2);
-    paint(bi, next_, repaint, nr);
-    drawn_[bi] = next_;
-    canvas_.commit(surface_, bi, damage, nd);
-    committed_ = next_;
-    dirty_ = false;
-    must_commit_ = false;
-    if (log_launcher.enabled(lx::trace::level::debug)) {
-        log_launcher.debug("launcher: draw matches={} selection={} first={} damage={}", next_.total,
-                           model_.selection(), next_.first, nd);
+    // The surface's frame loop: a frame when its frame callback allows one and the ledger
+    // has work (our repaint, the engine's hover damage, a configure).
+    if (surface_.frame_due()) {
+        describing_guard guard{this};
+        surface_.run_frame();
+        if (log_launcher.enabled(lx::trace::level::debug) && surface_.stats().frames > 0)
+            log_launcher.debug("launcher: draw matches={} selection={} first={} damage={}",
+                               layout_.total, model_.selection(), layout_.first,
+                               surface_.stats().last_damage_rects);
     }
 }
 
 #else // !LUMEN_SHELL_WAYLAND
 
-struct lx::shell::launcher::events {};
 void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_fn on_launch,
                                closed_fn on_closed, void* user) {
     g_ = g;
@@ -1012,13 +1178,19 @@ void lx::shell::launcher::init(launcher_globals g, app_catalog& catalog, launch_
     user_ = user;
     model_.bind(&catalog);
 }
-void lx::shell::launcher::on_configure(lx::wayland::layer_surface&, const lx::wayland::layer_configure&) {}
-void lx::shell::launcher::on_closed(lx::wayland::layer_surface&) {}
 bool lx::shell::launcher::open(int, int, int, unsigned) { return false; }
 void lx::shell::launcher::close() {}
 void lx::shell::launcher::prepare(int, int, int, unsigned) {}
 void lx::shell::launcher::after_dispatch() {}
-void lx::shell::launcher::draw(bool) {}
+lx::ui::child lx::shell::launcher::build_ui() { return nullptr; }
+void lx::shell::launcher::on_root_key(const lx::ui::key_event&) {}
+void lx::shell::launcher::on_root_pointer(const lx::ui::pointer_event&) {}
+void lx::shell::launcher::on_row_event(const row_ref&, const lx::ui::pointer_event&) {}
+void lx::shell::launcher::on_row_hover(const row_ref&, bool) {}
+void lx::shell::launcher::on_keyboard_focus(bool) {}
+void lx::shell::launcher::launch_selected(unsigned) {}
+void lx::shell::launcher::menu_for(unsigned, unsigned) {}
+void lx::shell::launcher::closed_by_itself(const char*) {}
 
 #endif
 
