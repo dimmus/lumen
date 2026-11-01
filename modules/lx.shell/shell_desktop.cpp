@@ -172,16 +172,22 @@ void lx::shell::shell_app::start_desktop_services() {
         apply_notify_config(*file_config_);
     else
         apply_notify_config(lx::config::default_config());
-    note_view_.init({.display = client_.connected() ? &client_ : nullptr,
-                     .compositor = client_.native_global(lx::wayland::global_kind::compositor),
-                     .shm = client_.native_global(lx::wayland::global_kind::shm),
-                     .viewporter = client_.native_global(lx::wayland::global_kind::viewporter),
-                     .fractional =
-                         client_.native_global(lx::wayland::global_kind::fractional_scale)},
+    note_view_.init({.ui = ui_host_.started() ? &ui_host_ : nullptr},
                     [](const notification& n, int px, void* user) {
                         return static_cast<shell_app*>(user)->notification_icon(n, px);
                     },
                     this);
+    // The stack's parts, as the tree forwards them: a completed click (the same decisions
+    // the canvas made — default action, invoke, link, more, dismiss), and the pointer
+    // arriving on or leaving a card (the stack's timers pause while it is over one).
+    note_view_.set_input({.click = [](const notify_click& c, unsigned serial, void* user) {
+                              static_cast<shell_app*>(user)->on_notify_click(c, serial);
+                          },
+                          .hover = [](bool over, void* user) {
+                              auto& a = *static_cast<shell_app*>(user);
+                              a.notes_.set_hover(over, now_ns());
+                          },
+                          .user = this});
     // The menus and tooltips are xdg_popups of the panels: their surfaces come from the
     // views' connection (lx.wayland.client), like every other view's (P5-6) — the raw
     // connection's globals mean nothing to them, and a popup of a panel's layer surface
@@ -326,8 +332,6 @@ void lx::shell::shell_app::desktop_after_dispatch() {
         // Gone under the pointer (its last card dismissed): no leave comes for a destroyed
         // surface, and a hover left set would stop every timer.
         notes_.set_hover(false, now);
-        if (pointer_target_ == pointer_target::notify)
-            pointer_target_ = pointer_target::none;
     }
     note_view_.after_dispatch();
     menu_.after_dispatch();

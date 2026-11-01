@@ -262,7 +262,7 @@ private:
     [[nodiscard]] lx::ui::child build_ui();
     [[nodiscard]] lx::gfx::atlas_tile_id icon_tile(unsigned cell, task_handle task, unsigned rev,
                                                    const std::uint32_t* pixels, int px);
-    static void cell_notify(void* user);
+    static void cell_notify(void* user, bool hovered);
     static void cell_event(void* user, const lx::ui::pointer_event& e);
     void on_layer_closed();
 
@@ -781,9 +781,9 @@ lx::ui::child lx::shell::switcher_view::build_ui() {
     return shell_box(root, {placed, total}, 0x5000u);
 }
 
-void lx::shell::switcher_view::cell_notify(void* user) {
+void lx::shell::switcher_view::cell_notify(void* user, bool hovered) {
     const cell_ref& ref = *static_cast<cell_ref*>(user);
-    if (ref.view && ref.view->input_.hover)
+    if (ref.view && ref.view->input_.hover && hovered)
         ref.view->input_.hover(ref.entry, ref.view->input_.user);
 }
 

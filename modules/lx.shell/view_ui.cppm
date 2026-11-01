@@ -24,8 +24,8 @@ struct shell_box_props {
     lx::ui::quad_style rest{};
     lx::ui::quad_style hover{};
     lx::ui::quad_style active{};
-    /// Hover or press changed on the box.
-    void (*notify)(void* user) = nullptr;
+    /// Hover changed on the box (`hovered`: on or off; a press counts as hover).
+    void (*notify)(void* user, bool hovered) = nullptr;
     /// A pointer event on the box.
     void (*event)(void* user, const lx::ui::pointer_event& e) = nullptr;
     void* user = nullptr;
@@ -57,7 +57,8 @@ public:
     void on_interaction_changed() override {
         lx::ui::control_node::on_interaction_changed();
         if (props_.notify)
-            props_.notify(props_.user);
+            props_.notify(props_.user, has_flag(lx::ui::node_flag::hovered) ||
+                                           has_flag(lx::ui::node_flag::pressed));
     }
 
     bool on_pointer(const lx::ui::pointer_event& e) override {

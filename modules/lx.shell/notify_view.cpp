@@ -4,21 +4,25 @@ module;
 
 #include <stdint.h>
 
-#if defined(LUMEN_SHELL_WAYLAND)
-#include <wayland-client.h>
-#endif
-
 module lx.shell;
 
 import std;
 import lx.foundation;
+import lx.gfx;
+import lx.layout;
 import lx.text;
 import lx.trace;
+import lx.ui;
+import lx.ui.host;
 import lx.wayland.client;
 import :notifications;
 import :notify_view;
-import :shm_canvas;
+import :view_ui;
 import :icon_theme;
+
+#if defined(LUMEN_SHELL_WAYLAND)
+#include <wayland-client.h>
+#endif
 
 namespace {
 
@@ -29,10 +33,10 @@ constexpr std::uint32_t k_button_bg = 0xFF34343Au;
 constexpr std::uint32_t k_button_hover = 0xFF3D6FB4u;
 constexpr std::uint32_t k_critical = 0xFFE0312Bu;
 constexpr std::uint32_t k_more_bg = 0xFF24242Au;
-constexpr lx::text::raster_color k_summary_color{0xF4, 0xF4, 0xF6, 0xFF};
-constexpr lx::text::raster_color k_body_color{0xC8, 0xC8, 0xCE, 0xFF};
-constexpr lx::text::raster_color k_link_color{0x8A, 0xB4, 0xF8, 0xFF};
-constexpr lx::text::raster_color k_dim_color{0x9A, 0x9A, 0xA2, 0xFF};
+constexpr std::uint32_t k_summary_color = 0xFFF4F4F6u;
+constexpr std::uint32_t k_body_color = 0xFFC8C8CEu;
+constexpr std::uint32_t k_link_color = 0xFF8AB4F8u;
+constexpr std::uint32_t k_dim_color = 0xFF9A9AA2u;
 constexpr lx::text::font_desc k_summary_font{"Sans", 11.f, lx::text::weight::bold,
                                              lx::text::style::normal};
 constexpr lx::text::font_desc k_body_font{"Sans", 10.f, lx::text::weight::normal,
@@ -42,17 +46,96 @@ constexpr lx::text::font_desc k_button_font{"Sans", 10.f, lx::text::weight::norm
 constexpr lx::text::font_desc k_close_font{"Sans", 11.f, lx::text::weight::normal,
                                            lx::text::style::normal};
 
+lx::shell::notification_view* g_describing = nullptr;
+struct describing_guard {
+    explicit describing_guard(lx::shell::notification_view* v) : previous_{g_describing} {
+        g_describing = v;
+    }
+    ~describing_guard() { g_describing = previous_; }
+    describing_guard(const describing_guard&) = delete;
+    describing_guard& operator=(const describing_guard&) = delete;
+
+private:
+    lx::shell::notification_view* previous_;
+};
+
+} // namespace
+
+lx::ui::child lx::shell::notify_describe(lx::ui::build_context&) {
+    lx::shell::notification_view* v = g_describing;
+    return v ? v->build_ui() : nullptr;
+}
+
+namespace {
+
 [[nodiscard]] bool contains(lx::rect2i r, double x, double y) {
     return r.width > 0 && x >= r.x && x < r.x + r.width && y >= r.y && y < r.y + r.height;
 }
 
-lx::text::raster_color body_color(int, std::uint16_t tag, void*) {
-    return tag > 0 ? k_link_color : k_body_color;
+/// One line of text in the stack's fonts, clipped to its box.
+[[nodiscard]] lx::ui::child notify_text(const char* text, std::uint32_t argb,
+                                        const lx::text::font_desc& font,
+                                        lx::ui::element_key key) {
+    lx::ui::text_block_props t{};
+    t.text = text;
+    t.font = font;
+    t.color = lx::shell::shell_color(argb);
+    t.wrap = lx::text::text_wrap::none;
+    t.context = lx::ui::active_ui_resources().text;
+    return lx::ui::text_block(t, key);
+}
+
+/// A literal rounded box over `children` at an absolute rect (view_ui's).
+[[nodiscard]] lx::ui::child notify_quad(lx::ui::style layout, std::uint32_t fill, int radius,
+                                        std::span<const lx::ui::child> children,
+                                        lx::ui::element_key key) {
+    lx::shell::shell_box_props p{};
+    p.control.layout = layout;
+    if (fill) {
+        lx::ui::quad_style q{};
+        q.background = lx::shell::shell_color(fill);
+        for (float& r : q.corner_radii)
+            r = static_cast<float>(radius);
+        p.rest = q;
+    }
+    return lx::shell::shell_box(p, children, key);
+}
+
+[[nodiscard]] lx::ui::style at(lx::rect2i r) {
+    return lx::ui::style{}
+        .absolute()
+        .top(lx::layout::px(static_cast<float>(r.y)))
+        .left(lx::layout::px(static_cast<float>(r.x)))
+        .w(lx::layout::px(static_cast<float>(r.width)))
+        .h(lx::layout::px(static_cast<float>(r.height)));
+}
+
+/// The markup spans as the text_block's attrs: a link's tag carries its colour.
+[[nodiscard]] std::span<const lx::text::text_attr> body_attrs(
+    const lx::shell::rich_text& body, std::vector<lx::text::text_attr>& out) {
+    out.clear();
+    out.reserve(body.spans.size());
+    for (const lx::text::text_span& s : body.spans) {
+        lx::text::text_attr a{};
+        a.begin = s.begin;
+        a.end = s.end;
+        a.weight = s.weight;
+        a.style = s.style;
+        a.underline = s.underline ? lx::text::text_underline::single
+                                  : lx::text::text_underline::none;
+        if (s.tag > 0) {
+            a.color = k_link_color & 0xFFFFFFu; // sRGB 0xRRGGBBAA, straight alpha
+            a.role = lx::text::span_role::link;
+        }
+        a.tag = s.tag;
+        out.push_back(a);
+    }
+    return {out};
 }
 
 } // namespace
 
-// ── Layout ───────────────────────────────────────────────────────────────────
+// ── Layout (unchanged; pure) ─────────────────────────────────────────────────
 
 unsigned lx::shell::notify_button_actions(const notification& n, int* out, unsigned cap) {
     unsigned count = 0;
@@ -169,7 +252,31 @@ void lx::shell::layout_notifications(const notification* const* shown, unsigned 
 
 // ── The view ─────────────────────────────────────────────────────────────────
 
-lx::shell::notification_view::card_cache* lx::shell::notification_view::cache_for(const notification& n) {
+namespace {
+
+[[nodiscard]] std::uint32_t anchor_of(lx::shell::notify_position p) {
+    using lx::shell::notify_position;
+    using namespace lx::wayland;
+    switch (p) {
+    case notify_position::top_right: return anchor_top | anchor_right;
+    case notify_position::top_center: return anchor_top;
+    case notify_position::top_left: return anchor_top | anchor_left;
+    case notify_position::bottom_right: return anchor_bottom | anchor_right;
+    case notify_position::bottom_left: return anchor_bottom | anchor_left;
+    }
+    return anchor_top | anchor_right;
+}
+
+} // namespace
+
+void lx::shell::notification_view::init(notify_globals g, notify_icon_fn icons, void* user) {
+    g_ = g;
+    icons_ = icons;
+    user_ = user;
+}
+
+lx::shell::notification_view::card_cache* lx::shell::notification_view::cache_for(
+    const notification& n) {
     card_cache* c = nullptr;
     for (auto& e : cache_)
         if (e->id == n.id)
@@ -200,13 +307,22 @@ void lx::shell::notification_view::relayout() {
         [](const notification& note, int width, void* user) {
             auto& v = *static_cast<notification_view*>(user);
             card_cache& c = *v.cache_for(note);
-            const double s = v.canvas_.scale_factor();
+            const double s = v.surface_.valid() ? v.surface_.scale() : 1.0;
             if (c.rev != note.rev || c.width != width || c.scale != s) {
                 c.rev = note.rev;
                 c.width = width;
                 c.scale = s;
-                c.body_h = v.canvas_.wrap(note.body.text, note.body.spans, k_body_font, width,
-                                          k_card_body_lines, c.body);
+                // As the canvas wrapped: the font and the width at device pixels, the height
+                // back to logical (the text_block lays out at logical and scales itself).
+                lx::text::font_desc font = k_body_font;
+                font.size_pt = static_cast<float>(font.size_pt * s);
+                c.body_h = 0;
+                if (!note.body.text.empty() &&
+                    lx::text::wrap_text(note.body.text, note.body.spans, font,
+                                        static_cast<int>(width * s), k_card_body_lines, c.body) &&
+                    c.body.line_count > 0)
+                    c.body_h = static_cast<int>(
+                        std::ceil(static_cast<int>(c.body.line_count) * c.body.line_height_px / s));
                 c.image.clear();
                 c.image_px = 0;
             }
@@ -217,11 +333,124 @@ void lx::shell::notification_view::relayout() {
             auto& v = *static_cast<notification_view*>(user);
             if (note.req.image.size > 0)
                 return true;
-            const int px = v.canvas_.pixel_rect({0, 0, k_card_icon, k_card_icon}).width;
+            const int px = static_cast<int>(std::lround(k_card_icon * (v.surface_.valid()
+                                                                           ? v.surface_.scale()
+                                                                           : 1.f)));
             return v.icons_ && v.icons_(note, px, v.user_) != nullptr;
         },
         layout_);
     dirty_ = true;
+}
+
+void lx::shell::notification_view::set_position(notify_position p) {
+    if (p == position_)
+        return;
+    position_ = p;
+    close(); // made again where it now belongs at the next update
+}
+
+#if defined(LUMEN_SHELL_WAYLAND)
+
+void lx::shell::notification_view::update(const notification_center& c, unsigned output_slot) {
+    center_ = &c;
+    const notification* shown[1];
+    const unsigned n = c.shown(shown, 1);
+    if (n == 0) {
+        if (is_open())
+            close();
+        center_rev_ = c.rev();
+        return;
+    }
+    if (is_open() && output_slot != output_)
+        close();
+    const bool overlay = c.critical_shown();
+    if (is_open() && c.rev() == center_rev_ && overlay == overlay_)
+        return;
+    center_rev_ = c.rev();
+    if (!is_open()) {
+        if (!g_.ui || !g_.ui->started())
+            return;
+        relayout();
+        lx::ui::host::surface_options so{};
+        so.describe = &notify_describe;
+        so.size = {layout_.width, layout_.height > 0 ? layout_.height : 1};
+        // Alpha cards over whatever is beneath; no opaque region.
+        so.opaque = false;
+        so.frame_records = false;
+        if (auto made = surface_.create(*g_.ui, so); !made) {
+            log_notify.error(made.get_error());
+            return;
+        }
+        lx::ui::host::layer_role_options lo{};
+        lo.layer.output_slot = output_slot;
+        lo.layer.level = overlay ? lx::wayland::layer::overlay : lx::wayland::layer::top;
+        lo.layer.name_space = "lumen-notifications";
+        lo.size = so.size;
+        lo.anchor = anchor_of(position_);
+        for (std::int32_t& m : lo.margin)
+            m = k_notify_margin;
+        // 0: kept clear of the panel's zone, reserving nothing.
+        lo.exclusive_zone = 0;
+        lo.keyboard = lx::wayland::keyboard_interactivity::none;
+        if (auto made = role_.create(surface_, lo); !made) {
+            log_notify.error(made.get_error());
+            surface_.destroy();
+            return;
+        }
+        role_.set_closed_handler(
+            [](void* user) { static_cast<notification_view*>(user)->on_layer_closed(); }, this);
+        if (auto shown_ok = surface_.show(); !shown_ok) {
+            log_notify.error(shown_ok.get_error());
+            role_.destroy();
+            surface_.destroy();
+            return;
+        }
+        output_ = output_slot;
+        overlay_ = overlay;
+        want_w_ = so.size.width;
+        want_h_ = so.size.height;
+        drawn_w_ = drawn_h_ = 0;
+        dirty_ = true;
+        log_notify.info("notifications: shown ({} card{}, {} layer)", n, n == 1 ? "" : "s",
+                        overlay ? "overlay" : "top");
+        return;
+    }
+    if (overlay != overlay_) {
+        overlay_ = overlay;
+        log_notify.info("notifications: {} layer (a critical one {})", overlay ? "overlay" : "top",
+                        overlay ? "shown" : "gone");
+        // zwlr_layer_surface_v1 v2: the layer changes with the next commit (not sent below).
+        (void)role_.set_layer(overlay ? lx::wayland::layer::overlay : lx::wayland::layer::top);
+    }
+    relayout();
+    if (layout_.width != want_w_ || layout_.height != want_h_)
+        apply_size();
+}
+
+void lx::shell::notification_view::apply_size() {
+    want_w_ = layout_.width;
+    want_h_ = layout_.height > 0 ? layout_.height : 1;
+    role_.layer().set_size({want_w_, want_h_});
+    surface_.commit_state(); // the configure that answers resizes the surface
+}
+
+void lx::shell::notification_view::close() {
+    if (!is_open())
+        return;
+    const unsigned frames = static_cast<unsigned>(surface_.stats().frames);
+    role_.destroy();
+    surface_.destroy();
+    output_ = ~0u;
+    hover_card_ = hover_part_ = -1;
+    pressed_ = {};
+    drawn_w_ = drawn_h_ = 0;
+    dirty_ = false;
+    log_notify.info("notifications: hidden ({} frame{})", frames, frames == 1 ? "" : "s");
+}
+
+void lx::shell::notification_view::on_layer_closed() {
+    // Its output went: shown again on another one at the next update.
+    close();
 }
 
 lx::shell::notification_view::hit lx::shell::notification_view::hit_at(double x, double y) const {
@@ -244,7 +473,10 @@ lx::shell::notification_view::hit lx::shell::notification_view::hit_at(double x,
         if (contains(c.body, x, y)) {
             for (const auto& e : cache_)
                 if (e->id == c.id) {
-                    const int p = canvas_.wrapped_hit(e->body, x - c.body.x, y - c.body.y);
+                    const double s = e->scale > 0.0 ? e->scale : 1.0;
+                    const int p = lx::text::wrapped_piece_at(
+                        e->body, static_cast<int>((x - c.body.x) * s),
+                        static_cast<int>((y - c.body.y) * s));
                     const notification* n = center_ ? center_->find(c.id) : nullptr;
                     if (p >= 0 && n && e->body.pieces[p].span < n->body.spans.size() &&
                         n->body.spans[e->body.pieces[p].span].tag > 0)
@@ -256,56 +488,70 @@ lx::shell::notification_view::hit lx::shell::notification_view::hit_at(double x,
     return h;
 }
 
-void lx::shell::notification_view::pointer_enter(double x, double y) { pointer_motion(x, y); }
-
-void lx::shell::notification_view::pointer_leave() {
-    pointer_x_ = pointer_y_ = -1.0;
-    if (hover_card_ >= 0 || hover_part_ >= 0)
+void lx::shell::notification_view::on_part_hover(const part_ref& ref, bool hovered) {
+    // The pointer's part changed: what is on screen follows (the card's and the buttons'
+    // backgrounds ride the engine's hover states; the ×'s colour is ours).
+    if (hovered) {
+        if (ref.card != hover_card_ || ref.part != hover_part_) {
+            hover_card_ = ref.card;
+            hover_part_ = ref.part;
+            dirty_ = true;
+        }
+    } else if (ref.card == hover_card_ && ref.part == hover_part_) {
+        hover_card_ = -1;
+        hover_part_ = -1;
+        pressed_ = {};
         dirty_ = true;
-    hover_card_ = hover_part_ = -1;
-    pressed_ = {};
+    }
+    if (input_.hover)
+        input_.hover(hover_card_ >= 0, input_.user);
 }
 
-void lx::shell::notification_view::pointer_motion(double x, double y) {
-    pointer_x_ = x;
-    pointer_y_ = y;
-    const hit h = hit_at(x, y);
-    // Only a change of part repaints (hover feedback), never per motion event.
-    const int part = h.part >= 10 ? 10 : h.part;
-    if (h.card != hover_card_ || part != hover_part_) {
-        hover_card_ = h.card;
-        hover_part_ = part;
-        dirty_ = true;
+void lx::shell::notification_view::on_part_event(const part_ref& ref, const lx::ui::pointer_event& e) {
+    pointer_x_ = e.at.x;
+    pointer_y_ = e.at.y;
+    switch (e.kind) {
+    case lx::ui::pointer_kind::press:
+        pressed_ = hit_at(e.at.x, e.at.y);
+        break;
+    case lx::ui::pointer_kind::release:
+        if (e.button == lx::ui::mouse_button::left) {
+            const hit h = hit_at(e.at.x, e.at.y);
+            finish_click(ref.card, h.card, h.part, pressed_.card, pressed_.part, 0x110);
+        }
+        pressed_ = {};
+        break;
+    // The engine delivers non-left buttons on their press only: dismiss at once.
+    case lx::ui::pointer_kind::secondary:
+        finish_click(ref.card, ref.card, ref.part, ref.card, ref.part, 0x111);
+        break;
+    case lx::ui::pointer_kind::middle:
+        finish_click(ref.card, ref.card, ref.part, ref.card, ref.part, 0x112);
+        break;
+    default:
+        break;
     }
 }
 
-lx::shell::notify_click lx::shell::notification_view::pointer_button(unsigned button, bool down) {
-    notify_click out{};
-    if (down) {
-        pressed_ = hit_at(pointer_x_, pointer_y_);
-        return out;
-    }
-    const hit h = hit_at(pointer_x_, pointer_y_);
-    const hit p = pressed_;
-    pressed_ = {};
-    if (h.card < 0 || h.card != p.card || !center_)
-        return out;
-    const card_layout& c = layout_.cards[h.card];
+void lx::shell::notification_view::finish_click(int card, int hit_card, int part, int press_card,
+                                                int press_part, unsigned button) {
+    if (card < 0 || card != hit_card || card != press_card || part != press_part || !center_)
+        return;
+    const card_layout& c = layout_.cards[card];
     const notification* n = center_->find(c.id);
     if (!n)
-        return out;
+        return;
+    notify_click out{};
     out.id = c.id;
     constexpr unsigned k_left = 0x110, k_right = 0x111, k_middle = 0x112;
     if (button == k_right || button == k_middle) {
         out.what = notify_click::kind::dismiss;
-        return out;
-    }
-    if (button != k_left || h.part != p.part)
-        return out;
-    if (h.part == 1) {
+    } else if (button != k_left || part < 0) {
+        return;
+    } else if (part == 1) {
         out.what = notify_click::kind::dismiss;
-    } else if (h.part >= 2 && h.part < 2 + static_cast<int>(k_card_buttons)) {
-        const unsigned b = static_cast<unsigned>(h.part - 2);
+    } else if (part >= 2 && part < 2 + static_cast<int>(k_card_buttons)) {
+        const unsigned b = static_cast<unsigned>(part - 2);
         const int a = c.button_action[b];
         if (a < 0) {
             out.what = notify_click::kind::more;
@@ -314,10 +560,10 @@ lx::shell::notify_click lx::shell::notification_view::pointer_button(unsigned bu
             out.what = notify_click::kind::invoke;
             out.arg = n->req.actions[static_cast<unsigned>(a)].key;
         }
-    } else if (h.part >= 10) {
+    } else if (part >= 10) {
         for (const auto& e : cache_)
             if (e->id == c.id) {
-                const unsigned piece = static_cast<unsigned>(h.part - 10);
+                const unsigned piece = static_cast<unsigned>(part - 10);
                 const unsigned span = e->body.pieces[piece].span;
                 const unsigned tag = span < n->body.spans.size() ? n->body.spans[span].tag : 0u;
                 if (tag > 0 && tag - 1 < n->body.links.size()) {
@@ -337,92 +583,18 @@ lx::shell::notify_click lx::shell::notification_view::pointer_button(unsigned bu
             out.what = notify_click::kind::dismiss;
         }
     }
-    return out;
+    if (out.what == notify_click::kind::none)
+        return;
+    if (input_.click)
+        input_.click(out, g_.ui ? g_.ui->last_press_serial() : 0u, input_.user);
 }
 
-void lx::shell::notification_view::paint_card(int bi, const card_layout& c, const notification& n) {
-    const bool hovered = hover_card_ >= 0 && layout_.cards[hover_card_].id == c.id;
-    const std::uint32_t bg = hovered ? k_card_hover_bg : k_card_bg;
-    canvas_.fill_rounded(bi, c.box, bg, 0u, k_card_radius);
-    if (c.critical)
-        canvas_.fill(bi, {c.box.x, c.box.y + k_card_radius, 4, c.box.height - 2 * k_card_radius},
-                     k_critical);
-    card_cache* cache = nullptr;
-    for (auto& e : cache_)
-        if (e->id == c.id)
-            cache = e.get();
-    if (c.has_icon) {
-        const int px = canvas_.pixel_rect(c.icon).width;
-        const std::uint32_t* pixels = nullptr;
-        if (n.req.image.size > 0 && cache) {
-            if (cache->image_px != px) {
-                cache->image.assign(static_cast<std::size_t>(px) * static_cast<std::size_t>(px), 0u);
-                resample_icon(n.req.image.pixels.data(), n.req.image.size, cache->image.data(), px);
-                cache->image_px = px;
-            }
-            pixels = cache->image.data();
-        } else if (icons_) {
-            pixels = icons_(n, px, user_);
-        }
-        if (pixels)
-            canvas_.blit(bi, c.icon, pixels, px);
-    }
-    if (c.summary.width > 0)
-        (void)canvas_.text(bi, c.summary, n.req.summary.c_str(), k_summary_color, k_summary_font);
-    // The close button: dim, brighter (and a disc behind it) under the pointer.
-    const bool close_hover = hovered && hover_part_ == 1;
-    if (close_hover)
-        canvas_.fill_rounded(bi, c.close, k_button_bg, bg, k_card_close / 2);
-    {
-        const char* x = "\xC3\x97"; // ×
-        const int tw = canvas_.text_width(x, k_close_font);
-        const int tx = c.close.x + (tw > 0 && tw < c.close.width ? (c.close.width - tw) / 2 : 4);
-        (void)canvas_.text(bi, {tx, c.close.y, c.close.x + c.close.width - tx, c.close.height}, x,
-                           close_hover ? k_summary_color : k_dim_color, k_close_font);
-    }
-    if (c.body.width > 0 && cache)
-        canvas_.draw_wrapped(bi, c.body, n.body.text, n.body.spans, cache->body, k_body_font,
-                             &body_color, nullptr);
-    for (unsigned b = 0; b < c.buttons; ++b) {
-        const lx::rect2i& r = c.button[b];
-        const bool on = hovered && hover_part_ == 2 + static_cast<int>(b);
-        canvas_.fill_rounded(bi, r, on ? k_button_hover : k_button_bg, bg, 6);
-        const int a = c.button_action[b];
-        const char* label = a < 0 ? "More\xE2\x80\xA6"
-                                  : n.req.actions[static_cast<unsigned>(a)].label.c_str();
-        const int tw = canvas_.text_width(label, k_button_font);
-        const int tx = tw > 0 && tw < r.width - 12 ? r.x + (r.width - tw) / 2 : r.x + 6;
-        (void)canvas_.text(bi, {tx, r.y, r.x + r.width - 6 - tx, r.height}, label, k_summary_color,
-                           k_button_font);
-    }
-}
-
-void lx::shell::notification_view::draw() {
-    const int bi = canvas_.acquire();
-    if (bi < 0)
-        return; // a release re-runs this
-    canvas_.clear(bi);
-    for (unsigned i = 0; i < layout_.count; ++i)
-        if (const notification* n = center_ ? center_->find(layout_.cards[i].id) : nullptr)
-            paint_card(bi, layout_.cards[i], *n);
-    if (layout_.more > 0) {
-        const lx::rect2i& r = layout_.more_box;
-        canvas_.fill_rounded(bi, r, k_more_bg, 0u, r.height / 2);
-        char text[32];
-        std::snprintf(text, sizeof(text), "+%u more", layout_.more);
-        const int tw = canvas_.text_width(text, k_button_font);
-        const int tx = tw > 0 && tw < r.width ? r.x + (r.width - tw) / 2 : r.x + 8;
-        (void)canvas_.text(bi, {tx, r.y, r.x + r.width - tx, r.height}, text, k_body_color,
-                           k_button_font);
-    }
-    const lx::rect2i whole{0, 0, layout_.width, layout_.height};
-    canvas_.commit(surface_, bi, &whole, 1);
-    ++frames_;
-    dirty_ = false;
+lx::ui::child lx::shell::notification_view::build_ui() {
+    // The `draw cards=…` line and each card's parts, as the canvas logged them: the smoke
+    // test clicks the parts from these (n_card parses them).
     if (log_notify.enabled(lx::trace::level::debug)) {
         log_notify.debug("notifications: draw cards={} more={} {}x{}", layout_.count, layout_.more,
                          layout_.width, layout_.height);
-        // Where each card's parts are (surface coordinates): the smoke test clicks them.
         for (unsigned i = 0; i < layout_.count; ++i) {
             const card_layout& c = layout_.cards[i];
             char buttons[160] = "";
@@ -439,211 +611,233 @@ void lx::shell::notification_view::draw() {
                 c.close.height, buttons[0] ? buttons : "-");
         }
     }
-}
 
-#if defined(LUMEN_SHELL_WAYLAND)
+    const float scale = surface_.valid() ? surface_.scale() : 1.f;
+    const int icon_px = static_cast<int>(std::lround(k_card_icon * scale));
+    lx::ui::child cards[k_max_cards + 1];
+    unsigned n = 0;
 
-struct lx::shell::notification_view::events {};
+    for (unsigned i = 0; i < layout_.count && n < k_max_cards; ++i) {
+        const card_layout& c = layout_.cards[i];
+        const notification* note = center_ ? center_->find(c.id) : nullptr;
+        if (!note)
+            continue;
+        part_ref* const refs = part_refs_ + i * k_parts_per_card;
+        lx::ui::child parts[3 + k_card_buttons];
+        unsigned p = 0;
 
-void lx::shell::notification_view::on_configure(lx::wayland::layer_surface& layer,
-                                                const lx::wayland::layer_configure& c) {
-    layer.ack_configure(c.serial);
-    conf_w_ = c.size.width ? c.size.width : want_w_;
-    conf_h_ = c.size.height ? c.size.height : want_h_;
-    configured_ = true;
-    dirty_ = true;
-}
-
-void lx::shell::notification_view::on_closed(lx::wayland::layer_surface&) {
-    // Its output went: shown again on another one at the next update.
-    close();
-}
-
-namespace {
-
-std::uint32_t anchor_of(lx::shell::notify_position p) {
-    using lx::shell::notify_position;
-    using namespace lx::wayland;
-    switch (p) {
-    case notify_position::top_right: return anchor_top | anchor_right;
-    case notify_position::top_center: return anchor_top;
-    case notify_position::top_left: return anchor_top | anchor_left;
-    case notify_position::bottom_right: return anchor_bottom | anchor_right;
-    case notify_position::bottom_left: return anchor_bottom | anchor_left;
-    }
-    return anchor_top | anchor_right;
-}
-
-} // namespace
-
-void lx::shell::notification_view::init(notify_globals g, notify_icon_fn icons, void* user) {
-    g_ = g;
-    icons_ = icons;
-    user_ = user;
-    canvas_.set_alpha(true);
-}
-
-void lx::shell::notification_view::set_position(notify_position p) {
-    if (p == position_)
-        return;
-    position_ = p;
-    close(); // made again where it now belongs at the next update
-    center_rev_ = 0;
-}
-
-void lx::shell::notification_view::update(const notification_center& c, unsigned output) {
-    center_ = &c;
-    const notification* shown[k_max_cards];
-    const unsigned n = c.shown(shown, k_max_cards);
-    if (n == 0) {
-        if (surface_)
-            close();
-        center_rev_ = c.rev();
-        return;
-    }
-    if (surface_ && output != output_)
-        close();
-    const bool overlay = c.critical_shown();
-    if (surface_ && c.rev() == center_rev_ && overlay == overlay_)
-        return;
-    center_rev_ = c.rev();
-    if (!surface_) {
-        if (!g_.display || !g_.compositor || !g_.shm)
-            return;
-        if (!wl_surface_.create(*g_.display))
-            return;
-        if (auto made = wl_layer_.create(
-                *g_.display, wl_surface_,
-                {.output_slot = output,
-                 .level = overlay ? lx::wayland::layer::overlay : lx::wayland::layer::top,
-                 .name_space = "lumen-notifications"});
-            !made) {
-            log_notify.error(made.get_error());
-            wl_surface_.destroy();
-            return;
+        // The critical stripe down the left edge.
+        if (c.critical)
+            parts[p++] = notify_quad(at({c.box.x, c.box.y + k_card_radius, 4,
+                                         c.box.height - 2 * k_card_radius}),
+                                     k_critical, 0, {}, 0x6100'0000u + i);
+        // The icon: the notification's own image-data resampled, else the resolver's.
+        if (c.has_icon) {
+            const std::uint32_t* pixels = nullptr;
+            card_cache* cache = nullptr;
+            for (const auto& e : cache_)
+                if (e->id == c.id)
+                    cache = e.get();
+            if (note->req.image.size > 0 && cache) {
+                if (cache->image_px != icon_px) {
+                    cache->image.assign(static_cast<std::size_t>(icon_px) *
+                                            static_cast<std::size_t>(icon_px),
+                                        0u);
+                    resample_icon(note->req.image.pixels.data(), note->req.image.size,
+                                  cache->image.data(), icon_px);
+                    cache->image_px = icon_px;
+                }
+                pixels = cache->image.data();
+            } else if (icons_) {
+                pixels = icons_(*note, icon_px, user_);
+            }
+            if (pixels && surface_.valid()) {
+                std::uint8_t rgba[64 * 64 * 4];
+                for (int k = 0; k < icon_px * icon_px; ++k) {
+                    const std::uint32_t v = pixels[k];
+                    rgba[k * 4 + 0] = static_cast<std::uint8_t>((v >> 16) & 0xFF);
+                    rgba[k * 4 + 1] = static_cast<std::uint8_t>((v >> 8) & 0xFF);
+                    rgba[k * 4 + 2] = static_cast<std::uint8_t>(v & 0xFF);
+                    rgba[k * 4 + 3] = static_cast<std::uint8_t>((v >> 24) & 0xFF);
+                }
+                if (auto tile = surface_.atlas().insert(
+                        lx::gfx::atlas_format::rgba8, static_cast<unsigned>(icon_px),
+                        static_cast<unsigned>(icon_px),
+                        std::span<const std::uint8_t>{rgba,
+                                                      static_cast<std::size_t>(icon_px * icon_px * 4)},
+                        static_cast<unsigned>(icon_px * 4)))
+                    parts[p++] = lx::ui::image(surface_.atlas(), tile.value(), {icon_px, icon_px},
+                                               0x6101'0000u + i);
+            }
         }
-        wl_layer_.set_handler(this);
-        surface_ = wl_surface_.native();
-        layer_ = wl_layer_.native();
-        auto* surface = static_cast<wl_surface*>(surface_);
-        output_ = output;
-        overlay_ = overlay;
-        canvas_.attach_scale(g_.viewporter, g_.fractional, surface);
-        wl_layer_.set_anchor(anchor_of(position_));
-        wl_layer_.set_margin(k_notify_margin, k_notify_margin, k_notify_margin, k_notify_margin);
-        // 0: kept clear of the panel's zone, reserving nothing.
-        wl_layer_.set_exclusive_zone(0);
-        (void)wl_layer_.set_keyboard_interactivity(lx::wayland::keyboard_interactivity::none);
-        configured_ = false;
-        conf_w_ = conf_h_ = want_w_ = want_h_ = 0;
-        frames_ = 0;
-        relayout();
-        apply_size();
-        wl_surface_commit(surface);
-        log_notify.info("notifications: shown ({} card{}, {} layer)", n, n == 1 ? "" : "s",
-                        overlay ? "overlay" : "top");
-        return;
+        // The summary, one bold line.
+        if (c.summary.width > 0)
+            parts[p++] = notify_text(note->req.summary.c_str(), k_summary_color, k_summary_font,
+                                     0x6102'0000u + i);
+        // The close button: dim ×, brighter under the pointer (its disc is the hover quad).
+        {
+            refs[1] = {this, static_cast<int>(i), 1};
+            const bool close_hover = hover_card_ == static_cast<int>(i) && hover_part_ == 1;
+            lx::shell::shell_box_props close{};
+            close.control.layout = at(c.close).flex_row().items_center().justify_center();
+            close.control.interactive = true;
+            lx::ui::quad_style disc{};
+            disc.background = shell_color(k_button_bg);
+            for (float& r : disc.corner_radii)
+                r = static_cast<float>(k_card_close / 2);
+            close.hover = disc;
+            close.notify = [](void* user, bool hovered) {
+                static_cast<part_ref*>(user)->view->on_part_hover(*static_cast<part_ref*>(user),
+                                                                  hovered);
+            };
+            close.event = [](void* user, const lx::ui::pointer_event& e) {
+                static_cast<part_ref*>(user)->view->on_part_event(*static_cast<part_ref*>(user), e);
+            };
+            close.user = &refs[1];
+            const lx::ui::child x[1] = {notify_text("\xC3\x97", close_hover ? k_summary_color
+                                                                           : k_dim_color,
+                                                    k_close_font, 0x6103'0000u + i)};
+            parts[p++] = lx::shell::shell_box(close, x, 0x6103'1000u + i);
+        }
+        // The body: the markup as attrs, links coloured, wrapped to the card's lines.
+        if (c.body.width > 0) {
+            std::vector<lx::text::text_attr> attrs;
+            lx::ui::text_block_props t{};
+            t.text = note->body.text.c_str();
+            t.font = k_body_font;
+            t.color = shell_color(k_body_color);
+            t.wrap = lx::text::text_wrap::word;
+            t.max_lines = k_card_body_lines;
+            t.attrs = body_attrs(note->body, attrs);
+            t.context = lx::ui::active_ui_resources().text;
+            parts[p++] = lx::ui::text_block(t, 0x6104'0000u + i);
+        }
+        // The card's box: interactive (the body's clicks are its default action), its
+        // background the engine's hover state.
+        {
+            refs[0] = {this, static_cast<int>(i), 0};
+            lx::shell::shell_box_props card{};
+            card.control.layout = at(c.box);
+            card.control.interactive = true;
+            lx::ui::quad_style rest{}, hover{};
+            rest.background = shell_color(k_card_bg);
+            hover.background = shell_color(k_card_hover_bg);
+            for (float& r : rest.corner_radii)
+                r = static_cast<float>(k_card_radius);
+            for (float& r : hover.corner_radii)
+                r = static_cast<float>(k_card_radius);
+            card.rest = rest;
+            card.hover = hover;
+            card.notify = [](void* user, bool hovered) {
+                static_cast<part_ref*>(user)->view->on_part_hover(*static_cast<part_ref*>(user),
+                                                                  hovered);
+            };
+            card.event = [](void* user, const lx::ui::pointer_event& e) {
+                static_cast<part_ref*>(user)->view->on_part_event(*static_cast<part_ref*>(user), e);
+            };
+            card.user = &refs[0];
+            // The buttons above the card's background (their own interactive boxes).
+            lx::ui::child inside[3 + k_card_buttons];
+            unsigned m = 0;
+            for (unsigned b = 0; b < c.buttons; ++b) {
+                refs[2 + b] = {this, static_cast<int>(i), 2 + static_cast<int>(b)};
+                const int a = c.button_action[b];
+                const char* label = a < 0 ? "More\xE2\x80\xA6"
+                                          : note->req.actions[static_cast<unsigned>(a)].label.c_str();
+                lx::shell::shell_box_props button{};
+                button.control.layout = at(c.button[b]).flex_row().items_center().justify_center();
+                button.control.interactive = true;
+                lx::ui::quad_style rest_b{}, hover_b{};
+                rest_b.background = shell_color(k_button_bg);
+                hover_b.background = shell_color(k_button_hover);
+                for (float& r : rest_b.corner_radii)
+                    r = 6.f;
+                for (float& r : hover_b.corner_radii)
+                    r = 6.f;
+                button.rest = rest_b;
+                button.hover = hover_b;
+                button.notify = [](void* user, bool hovered) {
+                    static_cast<part_ref*>(user)->view->on_part_hover(*static_cast<part_ref*>(user),
+                                                                      hovered);
+                };
+                button.event = [](void* user, const lx::ui::pointer_event& e) {
+                    static_cast<part_ref*>(user)->view->on_part_event(*static_cast<part_ref*>(user),
+                                                                      e);
+                };
+                button.user = &refs[2 + b];
+                const lx::ui::child text[1] = {
+                    notify_text(label, k_summary_color, k_button_font, 0x6105'0000u + i * 8 + b)};
+                inside[m++] = lx::shell::shell_box(button, text, 0x6105'1000u + i * 8 + b);
+            }
+            for (unsigned k = 0; k < p; ++k)
+                inside[m++] = parts[k];
+            cards[n++] = lx::shell::shell_box(card, {inside, m}, 0x6100'1000u + i);
+        }
     }
-    if (overlay != overlay_) {
-        overlay_ = overlay;
-        log_notify.info("notifications: {} layer (a critical one {})", overlay ? "overlay" : "top",
-                        overlay ? "shown" : "gone");
-        // zwlr_layer_surface_v1 v2: the layer changes with the next commit (not sent below).
-        (void)wl_layer_.set_layer(overlay ? lx::wayland::layer::overlay : lx::wayland::layer::top);
+
+    // The "+n more" line under the waiting ones (a label; the canvas took no clicks on it).
+    if (layout_.more > 0) {
+        char text[32];
+        std::snprintf(text, sizeof(text), "+%u more", layout_.more);
+        const lx::ui::child line[1] = {notify_text(text, k_body_color, k_button_font, 0x6200u)};
+        lx::ui::quad_style q{};
+        q.background = shell_color(k_more_bg);
+        for (float& r : q.corner_radii)
+            r = static_cast<float>(layout_.more_box.height / 2);
+        lx::shell::shell_box_props more{};
+        more.control.layout = at(layout_.more_box).flex_row().items_center().justify_center();
+        more.rest = q;
+        cards[n++] = lx::shell::shell_box(more, line, 0x6201u);
     }
-    relayout();
-    if (layout_.width != want_w_ || layout_.height != want_h_) {
-        apply_size();
-        wl_surface_commit(static_cast<wl_surface*>(surface_));
-    }
+
+    // The root: nothing over the cards (clicks between them go through — the input region).
+    lx::shell::shell_box_props root_props{};
+    root_props.control.layout = lx::ui::style{}
+                                    .w(lx::layout::percent(100.f))
+                                    .h(lx::layout::percent(100.f));
+    return lx::shell::shell_box(root_props, {cards, n}, 0x6000u);
 }
 
-void lx::shell::notification_view::apply_size() {
-    want_w_ = layout_.width;
-    want_h_ = layout_.height > 0 ? layout_.height : 1;
-    wl_layer_.set_size({want_w_, want_h_});
-}
-
-void lx::shell::notification_view::close() {
-    if (!surface_)
+void lx::shell::notification_view::request_repaint() {
+    if (!surface_.valid())
         return;
-    canvas_.free();
-    canvas_.release_scale();
-    (void)canvas_.take_rescale();
-    wl_layer_.destroy();
-    layer_ = nullptr;
-    wl_surface_.destroy();
-    surface_ = nullptr;
-    output_ = ~0u;
-    configured_ = false;
-    hover_card_ = hover_part_ = -1;
-    pressed_ = {};
-    log_notify.info("notifications: hidden ({} frame{})", frames_, frames_ == 1 ? "" : "s");
+    surface_.root().set_describer(&notify_describe);
+    surface_.root().add_repaint({0, 0, layout_.width, layout_.height});
 }
 
 void lx::shell::notification_view::after_dispatch() {
-    if (!surface_ || !configured_)
+    if (!surface_.valid())
         return;
-    if (canvas_.take_rescale()) {
-        // Another preferred scale: the bodies wrap again at the new pixel size.
-        for (auto& c : cache_)
-            c->rev = 0;
-        relayout();
-        canvas_.free();
-    }
-    // Draw at the size configured for the current layout only.
-    if (conf_w_ != layout_.width || conf_h_ != (layout_.height > 0 ? layout_.height : 1))
-        return;
-    if (!dirty_ || canvas_.frame_pending())
-        return;
-    if (!canvas_.allocated() || canvas_.width() != conf_w_ || canvas_.height() != conf_h_) {
-        if (!canvas_.allocate(g_.shm, conf_w_, conf_h_, "lumen-notifications")) {
-            log_notify.error("cannot allocate notification buffers");
-            close();
-            return;
+    // Draw at the size the tree last described; a pending configure redraws at its own size.
+    if (dirty_ || layout_.width != drawn_w_ || layout_.height != drawn_h_) {
+        // The input region is the cards (clicks between them reach what is beneath).
+        if (layout_.width != drawn_w_ || layout_.height != drawn_h_) {
+            lx::rect2i input[k_max_cards];
+            unsigned n = 0;
+            for (unsigned i = 0; i < layout_.count; ++i)
+                input[n++] = layout_.cards[i].box;
+            surface_.set_input_region({input, n});
+            drawn_w_ = layout_.width;
+            drawn_h_ = layout_.height;
         }
+        request_repaint();
+        dirty_ = false;
     }
-    auto* surface = static_cast<wl_surface*>(surface_);
-    // Input and opaque regions: the cards (clicks between them go through).
-    if (auto* input = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
-        for (unsigned i = 0; i < layout_.count; ++i) {
-            const lx::rect2i& b = layout_.cards[i].box;
-            wl_region_add(input, b.x, b.y, b.width, b.height);
-        }
-        if (layout_.more)
-            wl_region_add(input, layout_.more_box.x, layout_.more_box.y, layout_.more_box.width,
-                          layout_.more_box.height);
-        wl_surface_set_input_region(surface, input);
-        wl_region_destroy(input);
+    // The surface's frame loop: a frame when its frame callback allows one and the ledger
+    // has work (our repaint, the engine's hover damage, a configure).
+    if (surface_.frame_due()) {
+        describing_guard guard{this};
+        surface_.run_frame();
     }
-    if (auto* opaque = wl_compositor_create_region(static_cast<wl_compositor*>(g_.compositor))) {
-        for (unsigned i = 0; i < layout_.count; ++i) {
-            const lx::rect2i& b = layout_.cards[i].box;
-            wl_region_add(opaque, b.x + k_card_radius, b.y, b.width - 2 * k_card_radius, b.height);
-            wl_region_add(opaque, b.x, b.y + k_card_radius, b.width, b.height - 2 * k_card_radius);
-        }
-        wl_surface_set_opaque_region(surface, opaque);
-        wl_region_destroy(opaque);
-    }
-    draw();
 }
 
 #else // !LUMEN_SHELL_WAYLAND
 
-struct lx::shell::notification_view::events {};
-void lx::shell::notification_view::init(notify_globals g, notify_icon_fn icons, void* user) {
-    g_ = g;
-    icons_ = icons;
-    user_ = user;
-}
-void lx::shell::notification_view::set_position(notify_position p) { position_ = p; }
-void lx::shell::notification_view::on_configure(lx::wayland::layer_surface&,
-                                                const lx::wayland::layer_configure&) {}
-void lx::shell::notification_view::on_closed(lx::wayland::layer_surface&) {}
-void lx::shell::notification_view::update(const notification_center& c, unsigned) { center_ = &c; }
-void lx::shell::notification_view::apply_size() {}
+void lx::shell::notification_view::update(const notification_center&, unsigned) {}
 void lx::shell::notification_view::close() {}
 void lx::shell::notification_view::after_dispatch() {}
+lx::ui::child lx::shell::notification_view::build_ui() { return nullptr; }
+void lx::shell::notification_view::on_layer_closed() {}
 
 #endif
 

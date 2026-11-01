@@ -842,10 +842,6 @@ struct lx::shell::shell_app::events {
         if (s && a.menu_.owns(s)) {
             a.pointer_target_ = pointer_target::menu;
             a.menu_.pointer_enter(s, px, py);
-        } else if (s && s == a.note_view_.surface()) {
-            a.pointer_target_ = pointer_target::notify;
-            a.note_view_.pointer_enter(px, py);
-            a.notes_.set_hover(a.note_view_.hovered(), now_ns());
         } else if (output_record* o = s ? a.output_of_panel_surface(s) : nullptr) {
             a.pointer_target_ = pointer_target::panel;
             a.pointer_panel_ = o->bar.get();
@@ -866,10 +862,6 @@ struct lx::shell::shell_app::events {
             a.launcher_.pointer_leave();
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_leave(s);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            a.note_view_.pointer_leave();
-            a.notes_.set_hover(false, now_ns());
-        }
         a.pointer_surface_ = nullptr;
         a.pointer_panel_ = nullptr;
         a.pointer_target_ = pointer_target::none;
@@ -883,10 +875,6 @@ struct lx::shell::shell_app::events {
             a.launcher_.pointer_motion(px, py);
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_motion(a.pointer_surface_, px, py);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            a.note_view_.pointer_motion(px, py);
-            a.notes_.set_hover(a.note_view_.hovered(), now_ns());
-        }
     }
     static void ptr_button(void* data, wl_pointer*, uint32_t serial, uint32_t, uint32_t button,
                            uint32_t state) {
@@ -898,11 +886,7 @@ struct lx::shell::shell_app::events {
             a.pointer_panel_->pointer_button(button, down, serial);
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_button(a.pointer_surface_, button, down, serial);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            const notify_click c = a.note_view_.pointer_button(button, down);
-            if (c.what != notify_click::kind::none)
-                a.on_notify_click(c, a.last_press_serial_);
-        } else if (a.pointer_target_ == pointer_target::launcher)
+        else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_button(serial, button, down);
     }
     static void ptr_axis(void* data, wl_pointer*, uint32_t, uint32_t axis, wl_fixed_t value) {
@@ -1980,10 +1964,6 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
         if (surf && a.menu_.owns(surf)) {
             a.pointer_target_ = pointer_target::menu;
             a.menu_.pointer_enter(surf, f.x, f.y);
-        } else if (surf && surf == a.note_view_.surface()) {
-            a.pointer_target_ = pointer_target::notify;
-            a.note_view_.pointer_enter(f.x, f.y);
-            a.notes_.set_hover(a.note_view_.hovered(), now_ns());
         } else if (surf && surf == a.launcher_.surface()) {
             a.pointer_target_ = pointer_target::launcher;
             a.launcher_.pointer_enter(f.x, f.y);
@@ -1995,10 +1975,6 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
             a.launcher_.pointer_leave();
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_leave(surf);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            a.note_view_.pointer_leave();
-            a.notes_.set_hover(false, now_ns());
-        }
         a.pointer_surface_ = nullptr;
         a.pointer_target_ = pointer_target::none;
     }
@@ -2007,10 +1983,6 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
             a.launcher_.pointer_motion(f.x, f.y);
         else if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_motion(surf, f.x, f.y);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            a.note_view_.pointer_motion(f.x, f.y);
-            a.notes_.set_hover(a.note_view_.hovered(), now_ns());
-        }
     }
     if (f.mask & pf::has_button) {
         const bool down = f.pressed;
@@ -2018,11 +1990,7 @@ void lx::shell::shell_app::view_input::on_unrouted_pointer(lx::wayland::seat& s,
             a.last_press_serial_ = f.serial;
         if (a.pointer_target_ == pointer_target::menu)
             a.menu_.pointer_button(surf, f.button, down, f.serial);
-        else if (a.pointer_target_ == pointer_target::notify) {
-            const notify_click c = a.note_view_.pointer_button(f.button, down);
-            if (c.what != notify_click::kind::none)
-                a.on_notify_click(c, a.last_press_serial_);
-        } else if (a.pointer_target_ == pointer_target::launcher)
+        else if (a.pointer_target_ == pointer_target::launcher)
             a.launcher_.pointer_button(f.serial, f.button, down);
     }
     if (f.mask & (pf::has_axis | pf::has_axis_value120)) {
