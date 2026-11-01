@@ -65,15 +65,24 @@ idle after mapping (the §8.6 protocol; scripts: `/proc/PID/stat`, `status`, `sm
 | GPUI | not comparable here | — | — | — | — |
 | Slint / Qt Quick / Flutter | not installed | — | — | — | — |
 
-On the "Presents" column: the compositor's `compositor.latency` line — its commit→flip
-correlation — is emitted along `wp_presentation` feedback, which Lumen's own clients
-request (drag-smoke's gate g is built on it). All three compared engines produced none in
-their windows. That is a statement about this measurement, not about the engines: the
-commit rate of any client is observable from the compositor side regardless (it sees every
-`wl_surface.commit`), and GDK's Wayland backend implements presentation-time upstream —
-whether GTK4 asked and Lumen's logging did not fire for it is unverified (a wire check is
-the follow-up). Input→present for a black-box client is the one row that genuinely needs
-the client's cooperation.
+On the "Presents" column, checked at the wire (§8.6's protocol as written was wrong twice
+over):
+
+- `compositor.latency: present` is **not** client feedback at all — it is the compositor's
+  own input→present for frames *it* composited in response to input (`note_present_latency`
+  reads the input timestamp its pipeline packed at commit). The idle measurement windows
+  contained no input, so every row read 0, Lumen's included: the column measured nothing.
+- GTK4 **does bind** `wp_presentation` (v1, from both GDK and its EGL layer,
+  `clock_id(CLOCK_MONOTONIC)`) — but never created a per-surface feedback object in 8 s of
+  running, so no per-frame correlation happens from its side either.
+- The commit-rate row is not currently logged per client at all (`surface geometry` fires
+  on size change only — one line for GTK's whole run). A small compositor addition — a
+  per-client commit counter, logged or served like the latency summary — would make §8.6's
+  commit-rate row complete for every engine, and its input→present rows would need the
+  same anchoring the compositor already does for itself.
+
+So the comparable rows across engines today are CPU, memory and idle behaviour; the
+pacing rows await that compositor addition.
 
 What is not comparable, per engine: GPUI needs a hardware Vulkan device this host lacks
 (ADR-010 §8.6 keeps it for the hardware-Vulkan host); GTK4's gallery animates by design,

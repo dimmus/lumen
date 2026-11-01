@@ -1883,10 +1883,14 @@ asserts the `text.contrast` correction keeps the mean stem coverage within 3 %.
 ### 8.6 Comparison protocol
 
 The same scenes in other engines, on this host, observed from outside the process so no
-engine is instrumented differently: process CPU time from `/proc/PID/stat`, RssAnon,
-context switches at idle, commit rate and present latency from the compositor's own
-`compositor.latency` debug lines (it sees every client the same way), and start-up as
-the launcher's `exec` timestamp to that client's first `surface.apply` span in the
+engine is instrumented differently: process CPU time from `/proc/PID/stat`, RssAnon and
+context switches at idle from `/proc`. (Correction, 2026-11-01, after the first run:
+`compositor.latency` is the compositor's own input→present for input-driven composites —
+not per-client feedback, and silent without input. A per-client commit counter in the
+compositor would make the commit-rate row observable for every engine; per-client
+present latency needs `wp_presentation` feedback, which a black-box engine may not
+request — GTK 4 binds it but created no feedback objects in its measured window.) Start-up
+is the launcher's `exec` timestamp to that client's first `surface.apply` span in the
 compositor's Chrome trace (both on `CLOCK_MONOTONIC`).
 
 | Engine | Scenes | How |
