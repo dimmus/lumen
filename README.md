@@ -27,6 +27,12 @@ C++26.
 - **Secure by default.** The privileged shell protocol binds only from the configured shell
   binary; Flatpak apps see no capture, clipboard-control, layer-shell or output-management
   globals.
+- **A UI engine of its own.** The panel, launcher, Alt+Tab switcher, notifications, tray
+  menus, tooltips and the portal's dialogs are drawn by Lumen's own declarative,
+  retained-mode UI engine — descriptors reconciled onto a node tree, damage-scoped GPU
+  primitives, text shaped off-thread, themes compiled at load, client-side key repeat —
+  no widget toolkit, no shared-memory canvases. An idle shell makes zero context switches;
+  a panel redraw costs ~250 µs of CPU. [The engine, measured](docs/subsystems/ui-engine.md)
 - **A complete desktop.** Panel, launcher, Alt+Tab, dynamic workspaces, edge snapping and
   optional master-stack tiling per workspace, notifications, system tray, idle and lock,
   input methods (fcitx5, ibus) and portals for screenshots, screencasts and colour picking.
@@ -53,6 +59,8 @@ Super+Return a terminal.
 - [User guide](docs/user-guide.md) — building and testing, key bindings, the shell, monitors,
   protocols, login session, configuration, `lumen-ctl`
 - [Architecture](docs/architecture.md) — processes, module layers, frame pipeline
+- [The UI engine](docs/subsystems/ui-engine.md) — `lx.ui` and `lx.ui.host` as built, measured,
+  and compared
 - [API reference](docs/api/README.md) · [ADRs](docs/adr) · [Agent rules](AGENTS.md)
 
 ## License
